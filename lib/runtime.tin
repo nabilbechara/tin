@@ -48,6 +48,7 @@ const ctxWords = 32
 
 const chunkSize = 4194304
 const bigAlloc = 262144
+const maxAlloc = 70368744177664 // 2^46 bytes: no single allocation may ask for more
 const slabSize = 1048576
 
 shared var rtArgc i64
@@ -196,7 +197,13 @@ func rt_alloc_slow(n i64) i64 {
 		}
 	}
 	if n >= bigAlloc {
+		if n > maxAlloc {
+			rt_panic("allocation size out of range")
+		}
 		b := calloc(1, n+16)
+		if b == 0 {
+			rt_panic("out of memory")
+		}
 		b[0] = c[ctxPoolExtra]
 		c[ctxPoolExtra] = b
 		return b + 16
@@ -288,7 +295,13 @@ func rt_class_size(k i64) i64 {
 func rt_ingot_alloc(n i64) i64 {
 	k := rt_ingot_class(n + 8)
 	if k < 0 {
+		if n > maxAlloc {
+			rt_panic("allocation size out of range")
+		}
 		b := calloc(1, n+8)
+		if b == 0 {
+			rt_panic("out of memory")
+		}
 		b[0] = -1
 		return b + 8
 	}
@@ -629,8 +642,14 @@ func rt_utf8(s str, i i64) i64 {
 // ---- slices ----
 
 func rt_slice_make(n i64, c i64, esz i64) i64 {
+	if n < 0 {
+		rt_panic("make: negative length")
+	}
 	if c < n {
 		c = n
+	}
+	if c > maxAlloc/esz {
+		rt_panic("make: size out of range")
 	}
 	ingot := __ctx()[ctxIngot]
 	h := rt_region_alloc(ingot, 32)
@@ -683,6 +702,9 @@ func rt_slice_grow(s i64, need i64, esz i64) {
 	c := s[1] * 2
 	if c < 8 {
 		c = 8
+	}
+	if need < 0 || need > maxAlloc/esz {
+		rt_panic("append: size out of range")
 	}
 	for c < need {
 		c *= 2
