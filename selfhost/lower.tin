@@ -524,6 +524,9 @@ fn chk_binary(e, want) {
     let t = unify(l, r, want);
     if is_cmp_op(op) {
         let ordered = !streq(op, "==") && !streq(op, "!=");
+        if !ordered && kind_of(t) == K_STRUCT && t[TY_ENUM] && !ck_legacy {
+            return lower_enum_eq(e, op, l, r, t);
+        }
         if kind_of(t) == K_STRING {
             lower_str_cmp(e, op, l, r);
             if ck_legacy {
@@ -580,6 +583,125 @@ fn chk_binary(e, want) {
         err_at(pos, "division by zero");
     }
     return t;
+}
+
+// enum_incomparable returns a payload type of enum t without value equality (slices, maps,
+// structs, funcs, optionals), or 0 when every variant compares by value.
+fn enum_incomparable(t) {
+    let fs = t[TY_FIELDS];
+    let i = 1;
+    while i < fs[VEC_LEN] {
+        let ft = field_type(t, i);
+        let k = kind_of(ft);
+        if k == K_STRUCT && ft[TY_ENUM] {
+            if ft != t {
+                let inner = enum_incomparable(ft);
+                if inner {
+                    return inner;
+                }
+            }
+        } else if !(is_integer_t(ft) || is_float_t(ft) || k == K_BOOL || k == K_STRING || k == K_ERROR) {
+            return ft;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+var enum_eq_types;
+var enum_eq_fns;
+
+// lower_enum_eq compares two enum values by value (same variant, equal fields) through a
+// generated eq function per enum, so recursive enums compare without expanding forever.
+fn lower_enum_eq(e, op, l, r, t) {
+    let pos = e[N_POS];
+    let bad = enum_incomparable(t);
+    if bad {
+        let u = err_begin(pos);
+        buf_str(u, "cannot compare ");
+        type_name(u, t);
+        buf_str(u, " values: a variant holds ");
+        type_name(u, bad);
+        buf_str(u, ", which has no value equality");
+        err_end(u);
+        return ty_bool;
+    }
+    let x = call_fn(pos, enum_eq_fn(t), args2(l, r), ty_bool);
+    if streq(op, "!=") {
+        let n = node_new(EX_UNARY, pos);
+        n[UN_OP] = "!";
+        n[UN_X] = x;
+        n[N_TYPE] = ty_bool;
+        x = n;
+    }
+    replace_node(e, x);
+    return ty_bool;
+}
+
+fn enum_eq_fn(t) {
+    if !enum_eq_types {
+        enum_eq_types = vec_new();
+        enum_eq_fns = vec_new();
+    }
+    let i = 0;
+    while i < enum_eq_types[VEC_LEN] {
+        if vec_get(enum_eq_types, i) == t {
+            return vec_get(enum_eq_fns, i);
+        }
+        i = i + 1;
+    }
+    let names = vec_new();
+    vec_push(names, "a");
+    vec_push(names, "b");
+    let types = vec_new();
+    vec_push(types, t);
+    vec_push(types, t);
+    let rts = vec_new();
+    vec_push(rts, ty_bool);
+    let f = lifted_fn("eq", names, types, rts);
+    vec_push(enum_eq_types, t);
+    vec_push(enum_eq_fns, f);
+    let saved_fn = ck_fn;
+    let saved_legacy = ck_legacy;
+    ck_fn = f;
+    ck_legacy = 0;
+    let pos = 0;
+    let ls = vec_get(f[F_LOCALS], 0);
+    let rs = vec_get(f[F_LOCALS], 1);
+    let tag0 = field_offset(t, 0);
+    let x = mk_bin(pos, "==", mk_mem(pos, sym_ref_node(pos, ls), 0, 0, tag0, ty_int), mk_mem(pos, sym_ref_node(pos, rs), 0, 0, tag0, ty_int), ty_bool);
+    let vs = t[TY_ENUM];
+    let vi = 0;
+    while vi < vs[VEC_LEN] {
+        let v = vec_get(vs, vi);
+        let fe = 0;
+        let k = 0;
+        while k < vec_get(v, 2) {
+            let fi = vec_get(v, 1) + k;
+            let ft = field_type(t, fi);
+            let a = mk_mem(pos, sym_ref_node(pos, ls), 0, 0, field_offset(t, fi), ft);
+            let b = mk_mem(pos, sym_ref_node(pos, rs), 0, 0, field_offset(t, fi), ft);
+            let c = binary_new(pos, "==", a, b);
+            chk(c, ty_bool);
+            if fe {
+                fe = mk_bin(pos, "&&", fe, c, ty_bool);
+            } else {
+                fe = c;
+            }
+            k = k + 1;
+        }
+        if fe {
+            let other = mk_bin(pos, "!=", mk_mem(pos, sym_ref_node(pos, ls), 0, 0, tag0, ty_int), mk_int(pos, vi, ty_int), ty_bool);
+            x = mk_bin(pos, "&&", x, mk_bin(pos, "||", other, fe, ty_bool), ty_bool);
+        }
+        vi = vi + 1;
+    }
+    let ret = node_new(ST_RETURN, pos);
+    ret[RET_VALUE] = x;
+    vec_push(f[F_BODY][BLK_STMTS], ret);
+    ck_fn = saved_fn;
+    ck_legacy = saved_legacy;
+    return f;
 }
 
 fn is_const_zero(e) {
@@ -794,10 +916,122 @@ fn type_pkg(t) {
     return str_slice(n, i);
 }
 
+// enum_type_of returns the enum type x names (Shape, geo.Shape, Option[i64]), or 0.
+fn enum_type_of(x) {
+    let t = 0;
+    if x[N_KIND] == EX_IDENT {
+        if lookup_name_local(x[ID_NAME]) || import_pkg(x[ID_NAME]) {
+            return 0;
+        }
+        let s = lookup_name(x[ID_NAME]);
+        if s {
+            return 0;
+        }
+        t = find_type_name(x[ID_NAME]);
+    } else if x[N_KIND] == EX_SELECT {
+        let px = x[SEL_X];
+        if px[N_KIND] != EX_IDENT || lookup_name_local(px[ID_NAME]) || !import_pkg(px[ID_NAME]) {
+            return 0;
+        }
+        t = find_type(str_cat3(import_pkg(px[ID_NAME]), ".", x[SEL_NAME]));
+    } else if x[N_KIND] == EX_INDEX {
+        // Option[i64].Some(3): only when the base names a type, not a value.
+        let base = x[IX_X];
+        if base[N_KIND] != EX_IDENT || lookup_name_local(base[ID_NAME]) || lookup_name(base[ID_NAME]) || !(find_generic(base[ID_NAME]) || (load8(ck_pkg) != 0 && find_generic(qual(ck_pkg, base[ID_NAME])))) {
+            return 0;
+        }
+        let gtx = expr_to_tx(x);
+        if gtx {
+            t = resolve_type(gtx);
+        }
+    }
+    if t && kind_of(t) == K_STRUCT && t[TY_ENUM] {
+        return t;
+    }
+    return 0;
+}
+
+// enum_variant is the index of variant name in enum t, or -1.
+fn enum_variant(t, name) {
+    let vs = t[TY_ENUM];
+    let i = 0;
+    while i < vs[VEC_LEN] {
+        if streq(vec_get(vec_get(vs, i), 0), name) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// enum_construct builds Shape.Circle(2.0): a tagged object whose other variants' fields
+// hold their zero values.
+fn enum_construct(e, t, name, args) {
+    let pos = e[N_POS];
+    let vi = enum_variant(t, name);
+    if vi < 0 {
+        let u = err_begin(pos);
+        type_name(u, t);
+        buf_str(u, " has no variant ");
+        buf_str(u, name);
+        err_end(u);
+        return t;
+    }
+    if is_private(name) && foreign_type(t) {
+        private_use(pos, "variant", name, type_pkg(t));
+    }
+    let v = vec_get(t[TY_ENUM], vi);
+    let first = vec_get(v, 1);
+    let nf = vec_get(v, 2);
+    if args[VEC_LEN] != nf {
+        let u = err_begin(pos);
+        type_name(u, t);
+        buf_byte(u, '.');
+        buf_str(u, name);
+        buf_str(u, " takes ");
+        buf_int(u, nf);
+        if nf == 1 {
+            buf_str(u, " value, got ");
+        } else {
+            buf_str(u, " values, got ");
+        }
+        buf_int(u, args[VEC_LEN]);
+        err_end(u);
+        return t;
+    }
+    let stmts = vec_new();
+    let obj = temp(pos, rt_call(pos, "rt_alloc", args1(mk_int(pos, t[TY_SIZE], ty_int)), t), t);
+    vec_push(stmts, obj);
+    vec_push(stmts, assign_stmt(pos, field_store(pos, sym_ref_node(pos, obj[LET_SYM]), t, 0), mk_int(pos, vi, ty_int)));
+    let total = t[TY_FIELDS][VEC_LEN];
+    let i = 1;
+    while i < total {
+        if i >= first && i < first + nf {
+            let a = vec_get(args, i - first);
+            unwrap_mut(a);
+            let ft = field_type(t, i);
+            let at = chk(a, ft);
+            check_assignable(a, at, ft);
+            if is_untyped(at) {
+                reconvert(a, ft);
+            }
+            vec_push(stmts, assign_stmt(pos, field_store(pos, sym_ref_node(pos, obj[LET_SYM]), t, i), a));
+        }
+        // Other variants' fields stay empty: only a switch on the tag can reach them.
+        i = i + 1;
+    }
+    replace_node(e, mk_seq(pos, stmts, sym_ref_node(pos, obj[LET_SYM]), 0));
+    return t;
+}
+
 fn chk_select(e, want) {
     let pos = e[N_POS];
     let x = e[SEL_X];
     let name = e[SEL_NAME];
+    let et = enum_type_of(x);
+    if et {
+        return enum_construct(e, et, name, vec_new());
+    }
     if x[N_KIND] == EX_IDENT && !lookup_name_local(x[ID_NAME]) {
         let pkg = import_pkg(x[ID_NAME]);
         if pkg {
@@ -822,6 +1056,10 @@ fn chk_select(e, want) {
     let xt = chk(x, 0);
     if kind_of(xt) == K_OPT {
         err_type(pos, "cannot use a field of optional ", xt, " before checking it against nil");
+        return ty_int;
+    }
+    if kind_of(xt) == K_STRUCT && xt[TY_ENUM] {
+        err_type(pos, "an enum's data is read with switch, not as a field of ", xt, "");
         return ty_int;
     }
     if kind_of(xt) == K_STRUCT {
@@ -893,6 +1131,10 @@ fn chk_composite(e, want) {
     let keys = e[CL_KEYS];
     let stmts = vec_new();
     let k = kind_of(t);
+    if k == K_STRUCT && t[TY_ENUM] {
+        err_type(pos, "build an enum with one of its variants (", t, ".Variant(...)), not a composite literal");
+        return t;
+    }
     if k == K_STRUCT {
         let nf = t[TY_FIELDS][VEC_LEN];
         let obj = temp(pos, rt_call(pos, "rt_alloc", args1(mk_int(pos, t[TY_SIZE], ty_int)), t), t);
@@ -1219,6 +1461,10 @@ fn chk_call(e, want) {
     if callee[N_KIND] == EX_SELECT {
         let x = callee[SEL_X];
         let m = callee[SEL_NAME];
+        let et = enum_type_of(x);
+        if et {
+            return enum_construct(e, et, m, e[CALL_ARGS]);
+        }
         if x[N_KIND] == EX_IDENT && !lookup_name_local(x[ID_NAME]) && import_pkg(x[ID_NAME]) {
             let pkg = import_pkg(x[ID_NAME]);
             if streq(pkg, "say") && is_say_func(m) {
@@ -1825,7 +2071,56 @@ fn argo_fn(pos, t) {
     vec_push(f[F_LOCALS], b);
     vec_push(f[F_LOCALS], x);
     let body = f[F_BODY][BLK_STMTS];
-    if k == K_STRUCT {
+    if k == K_STRUCT && t[TY_ENUM] {
+        // "Name" for a variant without data, {"Name":{"field":...}} for one with data.
+        let vs = t[TY_ENUM];
+        let vi = 0;
+        while vi < vs[VEC_LEN] {
+            let v = vec_get(vs, vi);
+            let ifs = node_new(ST_IF, pos);
+            ifs[IF_COND] = mk_bin(pos, "==", mk_mem(pos, sym_ref_node(pos, x), 0, 0, field_offset(t, 0), ty_int), mk_int(pos, vi, ty_int), ty_bool);
+            ifs[IF_THEN] = empty_block(pos);
+            let vb = ifs[IF_THEN][BLK_STMTS];
+            let vn = vec_get(v, 0);
+            let nfv = vec_get(v, 2);
+            let head = buf_new();
+            if nfv == 0 {
+                buf_byte(head, '"');
+                buf_str(head, vn);
+                buf_byte(head, '"');
+                buf_byte(head, 0);
+                argo_raw(pos, vb, b, head[VEC_DATA]);
+            } else {
+                buf_str(head, "{\"");
+                buf_str(head, vn);
+                buf_str(head, "\":");
+                buf_byte(head, 0);
+                argo_raw(pos, vb, b, head[VEC_DATA]);
+                let kk = 0;
+                while kk < nfv {
+                    let fi2 = vec_get(v, 1) + kk;
+                    let full = vec_get(vec_get(t[TY_FIELDS], fi2), 0);
+                    let piece = buf_new();
+                    if kk == 0 {
+                        buf_byte(piece, '{');
+                    } else {
+                        buf_byte(piece, ',');
+                    }
+                    buf_byte(piece, '"');
+                    buf_str(piece, full + strlen(vn) + 1);
+                    buf_str(piece, "\":");
+                    buf_byte(piece, 0);
+                    argo_raw(pos, vb, b, piece[VEC_DATA]);
+                    let ft2 = field_type(t, fi2);
+                    argo_emit(pos, vb, b, mk_mem(pos, sym_ref_node(pos, x), 0, 0, field_offset(t, fi2), ft2), ft2);
+                    kk = kk + 1;
+                }
+                argo_raw(pos, vb, b, "}}");
+            }
+            vec_push(body, ifs);
+            vi = vi + 1;
+        }
+    } else if k == K_STRUCT {
         let nf = t[TY_FIELDS][VEC_LEN];
         let fi = 0;
         let lead = "{";
@@ -2013,6 +2308,9 @@ fn argo_new(pos, body, t) {
     if k != K_STRUCT {
         return mk_int(pos, 0, t);
     }
+    if t[TY_ENUM] {
+        return enum_zero(pos, body, t);
+    }
     let obj = temp(pos, rt_call(pos, "rt_alloc", args1(mk_int(pos, t[TY_SIZE], ty_int)), t), t);
     vec_push(body, obj);
     let fi = 0;
@@ -2024,6 +2322,49 @@ fn argo_new(pos, body, t) {
         }
         fi = fi + 1;
     }
+    return sym_ref_node(pos, obj[LET_SYM]);
+}
+
+var enum_zeroing;  // enums whose zero value is being built (a recursion guard)
+
+// enum_zero is an enum's zero value: its first variant without data, else variant 0 with
+// zero fields (an enum whose every variant holds itself has no finite zero value).
+fn enum_zero(pos, body, t) {
+    if !enum_zeroing {
+        enum_zeroing = vec_new();
+    }
+    let vs = t[TY_ENUM];
+    let vi = 0;
+    while vi < vs[VEC_LEN] && vec_get(vec_get(vs, vi), 2) > 0 {
+        vi = vi + 1;
+    }
+    if vi == vs[VEC_LEN] {
+        vi = 0;
+    }
+    let obj = temp(pos, rt_call(pos, "rt_alloc", args1(mk_int(pos, t[TY_SIZE], ty_int)), t), t);
+    vec_push(body, obj);
+    vec_push(body, assign_stmt(pos, field_store(pos, sym_ref_node(pos, obj[LET_SYM]), t, 0), mk_int(pos, vi, ty_int)));
+    let v = vec_get(vs, vi);
+    let i = 0;
+    while i < enum_zeroing[VEC_LEN] {
+        if vec_get(enum_zeroing, i) == t {
+            err_type(pos, "enum ", t, " has no zero value: give it a variant without data");
+            return sym_ref_node(pos, obj[LET_SYM]);
+        }
+        i = i + 1;
+    }
+    vec_push(enum_zeroing, t);
+    let k = 0;
+    while k < vec_get(v, 2) {
+        let fi = vec_get(v, 1) + k;
+        let ft = field_type(t, fi);
+        let fk = kind_of(ft);
+        if fk == K_STRING || fk == K_SLICE || fk == K_MAP || fk == K_STRUCT {
+            vec_push(body, assign_stmt(pos, field_store(pos, sym_ref_node(pos, obj[LET_SYM]), t, fi), argo_new(pos, body, ft)));
+        }
+        k = k + 1;
+    }
+    enum_zeroing[VEC_LEN] = enum_zeroing[VEC_LEN] - 1;
     return sym_ref_node(pos, obj[LET_SYM]);
 }
 
@@ -2114,6 +2455,122 @@ fn argo_more(pos, body, p, close) {
     vec_push(body, ifs);
 }
 
+// argo_denum decodes into enum x: renum gives the variant name (and whether it came as
+// {"Name": payload}); the tag is set and the payload's fields are read by name.
+fn argo_denum(pos, body, p, x, t) {
+    let cm = node_new(ST_CALLMULTI, pos);
+    cm[CM_CALL] = call_fn(pos, argo_lib(pos, "argo.renum"), args1(sym_ref_node(pos, p)), ty_void);
+    let nm = declare_local(pos, "$", ty_string);
+    let boxed = declare_local(pos, "$", ty_bool);
+    cm[CM_SYMS] = vec_new();
+    vec_push(cm[CM_SYMS], nm);
+    vec_push(cm[CM_SYMS], boxed);
+    vec_push(body, cm);
+    argo_err_return(pos, body, p);
+    let vs = t[TY_ENUM];
+    let first = 0;
+    let last = 0;
+    let vi = 0;
+    while vi < vs[VEC_LEN] {
+        let v = vec_get(vs, vi);
+        let vn = vec_get(v, 0);
+        let nfv = vec_get(v, 2);
+        let br = node_new(ST_IF, pos);
+        br[IF_COND] = rt_call(pos, "rt_str_eq", args2(sym_ref_node(pos, nm), lit_string(pos, vn)), ty_bool);
+        br[IF_THEN] = empty_block(pos);
+        let bb = br[IF_THEN][BLK_STMTS];
+        vec_push(bb, assign_stmt(pos, field_store(pos, sym_ref_node(pos, x), t, 0), mk_int(pos, vi, ty_int)));
+        let z = 0;
+        while z < nfv {
+            let zf = vec_get(v, 1) + z;
+            let zt = field_type(t, zf);
+            let zk = kind_of(zt);
+            if zk == K_STRING || zk == K_SLICE || zk == K_MAP || zk == K_STRUCT {
+                vec_push(bb, assign_stmt(pos, field_store(pos, sym_ref_node(pos, x), t, zf), argo_new(pos, bb, zt)));
+            }
+            z = z + 1;
+        }
+        if nfv == 0 {
+            // A bare "Name"; {"Name": anything} skips the payload.
+            let ib = node_new(ST_IF, pos);
+            ib[IF_COND] = sym_ref_node(pos, boxed);
+            ib[IF_THEN] = empty_block(pos);
+            vec_push(ib[IF_THEN][BLK_STMTS], expr_stmt(call_fn(pos, argo_lib(pos, "argo.rskip"), args1(sym_ref_node(pos, p)), ty_void)));
+            vec_push(ib[IF_THEN][BLK_STMTS], expr_stmt(call_fn(pos, argo_lib(pos, "argo.rclose"), args1(sym_ref_node(pos, p)), ty_void)));
+            vec_push(bb, ib);
+        } else {
+            let nb = node_new(ST_IF, pos);
+            nb[IF_COND] = mk_unot(pos, sym_ref_node(pos, boxed));
+            nb[IF_THEN] = empty_block(pos);
+            vec_push(nb[IF_THEN][BLK_STMTS], expr_stmt(call_fn(pos, argo_lib(pos, "argo.rvariant"), args2(sym_ref_node(pos, p), sym_ref_node(pos, nm)), ty_void)));
+            vec_push(nb[IF_THEN][BLK_STMTS], node_new(ST_RETURN, pos));
+            vec_push(bb, nb);
+            let ob = node_new(ST_IF, pos);
+            ob[IF_COND] = argo_rd(pos, p, "argo.robj", ty_bool);
+            ob[IF_THEN] = empty_block(pos);
+            let w = forever(pos);
+            vec_push(ob[IF_THEN][BLK_STMTS], w);
+            let wb = w[WH_BODY][BLK_STMTS];
+            let key = temp(pos, argo_rd(pos, p, "argo.rkey", ty_string), ty_string);
+            vec_push(wb, key);
+            argo_err_return(pos, wb, p);
+            let chain = 0;
+            let lastf = 0;
+            let kk = 0;
+            while kk < nfv {
+                let fi = vec_get(v, 1) + kk;
+                let full = vec_get(vec_get(t[TY_FIELDS], fi), 0);
+                let ft = field_type(t, fi);
+                let fb = node_new(ST_IF, pos);
+                fb[IF_COND] = rt_call(pos, "rt_str_eq", args2(sym_ref_node(pos, key[LET_SYM]), lit_string(pos, full + strlen(vn) + 1)), ty_bool);
+                fb[IF_THEN] = empty_block(pos);
+                let fbb = fb[IF_THEN][BLK_STMTS];
+                let fk = kind_of(ft);
+                if fk == K_STRUCT || fk == K_SLICE || fk == K_MAP {
+                    let df = argo_dfn(pos, ft);
+                    if df {
+                        vec_push(fbb, expr_stmt(call_fn(pos, df, args2(sym_ref_node(pos, p), mk_mem(pos, sym_ref_node(pos, x), 0, 0, field_offset(t, fi), ft)), ty_void)));
+                    }
+                } else {
+                    let val = argo_value(pos, fbb, p, ft);
+                    if val {
+                        vec_push(fbb, assign_stmt(pos, field_store(pos, sym_ref_node(pos, x), t, fi), val));
+                    }
+                }
+                if lastf {
+                    let eb = empty_block(pos);
+                    vec_push(eb[BLK_STMTS], fb);
+                    lastf[IF_ELSE] = eb;
+                } else {
+                    chain = fb;
+                }
+                lastf = fb;
+                kk = kk + 1;
+            }
+            let sb = empty_block(pos);
+            vec_push(sb[BLK_STMTS], expr_stmt(call_fn(pos, argo_lib(pos, "argo.rskip"), args1(sym_ref_node(pos, p)), ty_void)));
+            lastf[IF_ELSE] = sb;
+            vec_push(wb, chain);
+            argo_more(pos, wb, p, '}');
+            vec_push(bb, ob);
+            vec_push(bb, expr_stmt(call_fn(pos, argo_lib(pos, "argo.rclose"), args1(sym_ref_node(pos, p)), ty_void)));
+        }
+        if last {
+            let eb2 = empty_block(pos);
+            vec_push(eb2[BLK_STMTS], br);
+            last[IF_ELSE] = eb2;
+        } else {
+            first = br;
+        }
+        last = br;
+        vi = vi + 1;
+    }
+    let unk = empty_block(pos);
+    vec_push(unk[BLK_STMTS], expr_stmt(call_fn(pos, argo_lib(pos, "argo.rvariant"), args2(sym_ref_node(pos, p), sym_ref_node(pos, nm)), ty_void)));
+    last[IF_ELSE] = unk;
+    vec_push(body, first);
+}
+
 // argo_dfn returns (generating on first use) argo$dN(p mut argo.Parser, x mut T), which
 // fills x from the JSON value at p.
 fn argo_dfn(pos, t) {
@@ -2172,7 +2629,9 @@ fn argo_dfn(pos, t) {
     vec_push(f[F_LOCALS], p);
     vec_push(f[F_LOCALS], x);
     let body = f[F_BODY][BLK_STMTS];
-    if k == K_STRUCT {
+    if k == K_STRUCT && t[TY_ENUM] {
+        argo_denum(pos, body, p, x, t);
+    } else if k == K_STRUCT {
         let ifs = node_new(ST_IF, pos);
         ifs[IF_COND] = mk_unot(pos, argo_rd(pos, p, "argo.robj", ty_bool));
         ifs[IF_THEN] = empty_block(pos);
@@ -2302,6 +2761,8 @@ fn say_arg(a, prefix) {
             suffix = "slt";
         } else if ek == K_INT {
             return rt_call(pos, str_cat3(prefix, "slint", ""), args3(a, mk_int(pos, type_width(et), ty_int), mk_int(pos, et[TY_SIGNED], ty_int)), ty_void);
+        } else if ek == K_STRUCT && et[TY_ENUM] {
+            return say_enum_slice(a, t, prefix);
         } else {
             suffix = "slp";
         }
@@ -2335,6 +2796,9 @@ fn say_arg(a, prefix) {
 
 // say_struct prints {a b c} by formatting each field in turn (nil optionals print <nil>).
 fn say_struct(a, t, prefix) {
+    if t[TY_ENUM] {
+        return say_enum(a, t, prefix);
+    }
     let pos = a[N_POS];
     let stmts = vec_new();
     let obj = temp(pos, mk_conv(pos, a, CV_SAME, ty_int), ty_int);
@@ -2366,6 +2830,149 @@ fn say_struct(a, t, prefix) {
     vec_push(stmts, nonnil);
     vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "argend", ""), vec_new(), ty_void)));
     return mk_seq(pos, stmts, mk_int(pos, 0, ty_int), ty_void);
+}
+
+var say_enum_keys;  // [type, prefix] of each generated enum printer
+var say_enum_fns;
+
+// lifted_fn starts a generated function name$N with params (names, types) and results.
+fn lifted_fn(base, names, types, rtypes) {
+    lifted_count = lifted_count + 1;
+    let f = fn_new(0, base);
+    let nb = buf_new();
+    buf_str(nb, base);
+    buf_byte(nb, '$');
+    buf_int(nb, lifted_count);
+    buf_byte(nb, 0);
+    f[F_QNAME] = nb[VEC_DATA];
+    f[F_NAME] = nb[VEC_DATA];
+    f[F_LIFTED] = 2;
+    f[F_LOCALS] = vec_new();
+    let i = 0;
+    while i < names[VEC_LEN] {
+        vec_push(f[F_PARAMS], vec_get(names, i));
+        vec_push(f[F_PTYPES], vec_get(types, i));
+        vec_push(f[F_MUTS], 0);
+        let ps = sym_new(SYM_LOCAL, vec_get(names, i), 0);
+        ps[S_TYPE] = vec_get(types, i);
+        ps[S_SLOT] = i;
+        vec_push(f[F_LOCALS], ps);
+        i = i + 1;
+    }
+    f[F_SLOTS] = names[VEC_LEN];
+    f[F_RTYPES] = rtypes;
+    f[F_TYPE] = func_of(f[F_PTYPES], f[F_RTYPES], 0);
+    f[F_BODY] = empty_block(0);
+    vec_push(prog_fns, f);
+    return f;
+}
+
+// say_enum prints a variant like Circle(2) or Rect(3 4), and a variant without data as its
+// name, through a generated printer per enum (so recursive enums print without expanding
+// forever).
+fn say_enum(a, t, prefix) {
+    let pos = a[N_POS];
+    let stmts = vec_new();
+    vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "argsep", ""), vec_new(), ty_void)));
+    vec_push(stmts, expr_stmt(call_fn(pos, say_enum_fn(t, prefix), args1(a), ty_void)));
+    vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "argend", ""), vec_new(), ty_void)));
+    return mk_seq(pos, stmts, mk_int(pos, 0, ty_int), ty_void);
+}
+
+// say_enum_slice prints [A B C] with each element through its enum's printer.
+fn say_enum_slice(a, t, prefix) {
+    let pos = a[N_POS];
+    let et = t[TY_ELEM];
+    let stmts = vec_new();
+    vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "argsep", ""), vec_new(), ty_void)));
+    let sl = temp(pos, a, t);
+    vec_push(stmts, sl);
+    let n = temp(pos, mk_hdr(pos, sym_ref_node(pos, sl[LET_SYM]), 0), ty_int);
+    vec_push(stmts, n);
+    vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, "[")), ty_void)));
+    let j = declare_local(pos, "$", ty_int);
+    vec_push(stmts, let_stmt(pos, j, mk_int(pos, 0, ty_int)));
+    let w = node_new(ST_WHILE, pos);
+    w[WH_COND] = mk_bin(pos, "<", sym_ref_node(pos, j), sym_ref_node(pos, n[LET_SYM]), ty_bool);
+    w[WH_POST] = assign_stmt(pos, sym_ref_node(pos, j), mk_bin(pos, "+", sym_ref_node(pos, j), mk_int(pos, 1, ty_int), ty_int));
+    let wb = empty_block(pos);
+    w[WH_BODY] = wb;
+    let sep = node_new(ST_IF, pos);
+    sep[IF_COND] = mk_bin(pos, ">", sym_ref_node(pos, j), mk_int(pos, 0, ty_int), ty_bool);
+    sep[IF_THEN] = empty_block(pos);
+    vec_push(sep[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, " ")), ty_void)));
+    vec_push(wb[BLK_STMTS], sep);
+    let el = mk_elem(pos, sym_ref_node(pos, sl[LET_SYM]), sym_ref_node(pos, j), et, 0);
+    el[ELEM_SAFE] = 1;
+    vec_push(wb[BLK_STMTS], expr_stmt(call_fn(pos, say_enum_fn(et, prefix), args1(el), ty_void)));
+    vec_push(stmts, w);
+    vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, "]")), ty_void)));
+    vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "argend", ""), vec_new(), ty_void)));
+    return mk_seq(pos, stmts, mk_int(pos, 0, ty_int), ty_void);
+}
+
+fn say_enum_fn(t, prefix) {
+    if !say_enum_keys {
+        say_enum_keys = vec_new();
+        say_enum_fns = vec_new();
+    }
+    let i = 0;
+    while i < say_enum_keys[VEC_LEN] {
+        let kp = vec_get(say_enum_keys, i);
+        if vec_get(kp, 0) == t && streq(vec_get(kp, 1), prefix) {
+            return vec_get(say_enum_fns, i);
+        }
+        i = i + 1;
+    }
+    let names = vec_new();
+    vec_push(names, "x");
+    let types = vec_new();
+    vec_push(types, t);
+    let f = lifted_fn("say", names, types, vec_new());
+    let kp2 = vec_new();
+    vec_push(kp2, t);
+    vec_push(kp2, prefix);
+    vec_push(say_enum_keys, kp2);
+    vec_push(say_enum_fns, f);
+    let saved_fn = ck_fn;
+    ck_fn = f;
+    let pos = 0;
+    let x = vec_get(f[F_LOCALS], 0);
+    let body = f[F_BODY][BLK_STMTS];
+    let vs = t[TY_ENUM];
+    let vi = 0;
+    while vi < vs[VEC_LEN] {
+        let v = vec_get(vs, vi);
+        let ifs = node_new(ST_IF, pos);
+        ifs[IF_COND] = mk_bin(pos, "==", mk_mem(pos, sym_ref_node(pos, x), 0, 0, field_offset(t, 0), ty_int), mk_int(pos, vi, ty_int), ty_bool);
+        ifs[IF_THEN] = empty_block(pos);
+        let b = ifs[IF_THEN][BLK_STMTS];
+        vec_push(b, expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, vec_get(v, 0))), ty_void)));
+        let nf = vec_get(v, 2);
+        if nf > 0 {
+            vec_push(b, expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, "(")), ty_void)));
+            let k = 0;
+            while k < nf {
+                if k > 0 {
+                    vec_push(b, expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, " ")), ty_void)));
+                }
+                let fi = vec_get(v, 1) + k;
+                let ft = field_type(t, fi);
+                let fv = mk_mem(pos, sym_ref_node(pos, x), 0, 0, field_offset(t, fi), ft);
+                if kind_of(ft) == K_STRUCT && ft[TY_ENUM] {
+                    vec_push(b, expr_stmt(call_fn(pos, say_enum_fn(ft, prefix), args1(fv), ty_void)));
+                } else {
+                    vec_push(b, expr_stmt(say_arg(fv, prefix)));
+                }
+                k = k + 1;
+            }
+            vec_push(b, expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, ")")), ty_void)));
+        }
+        vec_push(body, ifs);
+        vi = vi + 1;
+    }
+    ck_fn = saved_fn;
+    return f;
 }
 
 fn lit_string(pos, s) {

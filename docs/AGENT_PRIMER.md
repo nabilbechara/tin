@@ -55,6 +55,9 @@ the compiler: write a minimal repro to notes/compiler_bugs_NAME.md and work arou
   no quotes inside {...}; `raw` backquote strings do not interpolate.
 - for i := 0; i < n; i++ {}, for cond {}, for {}, for i, x := range slice/str/map {}, switch x { case a, b: }.
   Methods: `func (p Point) Name() str`. Multiple returns. Composite literals T{F: v}, []T{...}, map[K]V{...}.
+- Enums: `type Shape enum { Circle(r f64), Rect(w, h f64), Empty }`, built as `Shape.Circle(2)`, read with
+  `switch s { case Circle(r): ... case Rect(w, h): ... case Empty: ... }` (every variant or default; no
+  field access). `==` by value; print as `Rect(3 4)`; JSON `{"Rect":{"w":3,"h":4}}` / `"Empty"`.
 - Generics: `func Max[T i64 | f64 | str](a T, b T) T`, `func Map[T any, U any](xs []T, f func(T) U) []U`,
   `type Stack[T any] struct { items []T }` with `func (s mut Stack[T]) Push(x T)`; `Max(1, 2)` (inferred)
   or `Max[i64](1, 2)`. Fully specialized; `var zero T` is the zero value. Constraints: any, comparable,

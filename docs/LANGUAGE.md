@@ -188,6 +188,50 @@ p := Point{1, 2, "a", []str{}, nil}   // positional, every field in order
 - `p.X` reads a field, `p.X = 3` writes it (see `mut` in section 5).
 - `new(T)` is `T{}`.
 
+### Enums
+
+An enum is a value that is one of several variants, each with its own data:
+
+```go
+type Shape enum {
+	Circle(r f64)
+	Rect(w, h f64)
+	Named(name str, inner Shape)  // enums may hold themselves (trees)
+	Empty
+}
+type Color enum { Red, Green, Blue }
+type Option[T any] enum { Some(v T), None }
+
+s := Shape.Rect(3, 4)
+c := Color.Red
+o := Option[i64].Some(7)
+
+switch s {                        // must handle every variant, or have default
+case Circle(r):
+	area = 3.14159 * r * r
+case Rect(w, h):
+	area = w * h
+case Named(_, inner):             // _ skips a value
+	area = 0
+case Empty:
+	area = 0
+}
+```
+
+- A variant's data is read only through `switch`: there is no `s.r`, and no composite
+  literal `Shape{...}`. A case either binds every value of one variant, or lists several
+  variants that bind nothing (`case Green, Blue:`). A `switch` that misses a variant
+  without a `default` is a compile error naming the missing ones; one whose every branch
+  returns ends the function.
+- `==` compares by value (same variant, equal data) when all the data compares by value
+  (numbers, bools, strs, such enums); an enum holding a slice, map, struct or func cannot
+  be compared.
+- Printing gives `Rect(3 4)` / `Red`; JSON (argo) is `{"Rect":{"w":3,"h":4}}` for a variant
+  with data and `"Red"` for one without, both ways.
+- The zero value (for example next to a fault) is the first variant without data.
+- Enums are references underneath, like structs: `keep` copies them, and the region check
+  treats their data like struct fields. Variants follow the export rule.
+
 ### Strings
 
 - `len(s)` is the byte length; `s[i]` is a `u8` (bounds checked); `s[lo:hi]` is a
@@ -882,7 +926,9 @@ ExternDecl    = "extern" "func" ident "(" [ Param { "," Param } ] [ "," "..." ] 
 
 Type          = TypeName [ TypeArgs ] | "[" "]" Type | "[" expr "]" Type
               | "map" "[" Type "]" Type | "?" Type | "func" ParamTypes [ Results ]
-              | "struct" "{" { identList Type ";" } "}" .
+              | "struct" "{" { identList Type ";" } "}"
+              | "enum" "{" Variant { ( "," | ";" ) Variant } "}" .
+Variant       = ident [ "(" [ identList Type { "," identList Type } ] ")" ] .
 ParamTypes    = "(" [ [ ident ] [ "mut" ] Type { "," [ ident ] [ "mut" ] Type } ] ")" .
 TypeName      = ident | ident "." ident .
 TypeArgs      = "[" Type { "," Type } "]" .
@@ -964,6 +1010,7 @@ has no package clause). See [COMPILER.md](COMPILER.md) for how the compiler is w
 | closures capture variables | function literals cannot capture locals |
 | `defer` in loops, `recover` | defer outside loops only; no recover |
 | `fmt.Println` | `say.Line` (formatting by static type) |
+| interfaces for sum types | `enum` with exhaustive `switch` |
 | exported = capitalized | the same rule, enforced for names, methods and fields |
 | `f(&x)` to let a callee modify x | `f(mut x)` for a `mut` parameter |
 | `for range ch`, `select`, labels, `goto`, `fallthrough` | not available |

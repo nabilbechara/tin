@@ -1,0 +1,108 @@
+package main
+
+import "argo"
+import "say"
+
+type Shape enum {
+	Circle(r f64)
+	Rect(w, h f64)
+	Named(name str, inner Shape)
+	Empty
+}
+
+type Color enum { Red, Green, Blue }
+
+type Option[T any] enum {
+	Some(v T)
+	None
+}
+
+type Event struct {
+	Id    i64
+	Color Color
+	Shape Shape
+	Tags  []str
+}
+
+type Reply enum {
+	Json(body Event)
+	Text(code i64, body str)
+	Many(items []Shape)
+}
+
+var kept []Shape = []Shape{}
+
+func area(s Shape) f64 {
+	switch s {
+	case Circle(r):
+		return 3.0 * r * r
+	case Rect(w, h):
+		return w * h
+	case Named(_, inner):
+		return area(inner)
+	case Empty:
+		return 0
+	}
+}
+
+func color_name(c Color) str {
+	switch c {
+	case Red:
+		return "red"
+	case Green, Blue:
+		return "cool"
+	}
+}
+
+func first[T any](xs []T) Option[T] {
+	if len(xs) == 0 {
+		return Option[T].None
+	}
+	return Option[T].Some(xs[0])
+}
+
+func remember(s Shape) {
+	kept = append(kept, keep(s))
+}
+
+func main() {
+	shapes := []Shape{Shape.Circle(2), Shape.Rect(3, 4), Shape.Named("box", Shape.Rect(1, 2)), Shape.Empty}
+	for _, s := range shapes {
+		say.Line(s, area(s))
+	}
+	say.Line(color_name(Color.Red), color_name(Color.Blue), Color.Green)
+	a := Shape.Rect(3, 4)
+	say.Line(a == Shape.Rect(3, 4), a != Shape.Rect(3, 4), a == Shape.Rect(4, 3), Shape.Empty == Shape.Empty)
+	say.Line(Shape.Named("x", Shape.Circle(1)) == Shape.Named("x", Shape.Circle(1)), Shape.Named("x", Shape.Circle(1)) == Shape.Named("y", Shape.Circle(1)))
+	say.Line("interp {a} and {Color.Blue}")
+	o := first([]i64{7, 8})
+	switch o {
+	case Some(v):
+		say.Line("some", v)
+	case None:
+		say.Line("none")
+	}
+	say.Line(first([]str{}), first([]str{"q"}))
+	remember(Shape.Named(say.Fmt("n%d", 5), Shape.Circle(3)))
+	say.Line(kept[0])
+	switch Shape.Circle(1) {
+	case Rect(w, h):
+		say.Line("rect", w, h)
+	default:
+		say.Line("not a rect")
+	}
+	ev := Event{Id: 1, Color: Color.Blue, Shape: Shape.Named("n", Shape.Rect(2, 3)), Tags: []str{"x"}}
+	b := make([]u8, 0, 256)
+	argo.Put(mut b, ev)
+	argo.Put(mut b, []Reply{Reply.Text(404, "missing"), Reply.Json(ev), Reply.Many([]Shape{Shape.Empty, Shape.Circle(1.5)})})
+	say.Line(str(b))
+	back := Event{Id: 0, Color: Color.Red, Shape: Shape.Empty, Tags: []str{}}
+	err := argo.Get(`{"Id":9,"Color":"Green","Shape":{"Named":{"name":"z","inner":{"Circle":{"r":2.5}}}},"Tags":["t"]}`, mut back)
+	say.Line(err, back.Id, back.Color, back.Shape, back.Tags)
+	var rs []Reply = []Reply{}
+	err2 := argo.Get(`[{"Text":{"code":200,"body":"ok"}},{"Many":{"items":["Empty",{"Rect":{"w":1,"h":2}}]}}]`, mut rs)
+	say.Line(err2, len(rs), rs[0], rs[1])
+	c := Color.Red
+	say.Line(argo.Get(`"Purple"`, mut c), c)
+	say.Line(argo.Get(`{"Circle":{"r":1}}`, mut c))
+}

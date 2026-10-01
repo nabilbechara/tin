@@ -350,6 +350,7 @@ fn resolve_fields(st, tx) {
         i = i + 1;
     }
     st[TY_FIELDS] = fs;
+    st[TY_ENUM] = tx[TX_B];
 }
 
 // ---- declarations ----
@@ -2556,6 +2557,25 @@ fn range_bind(pos, target, value, t, define) {
 // lower_switch turns a switch into an if-chain inside a block that break can leave.
 fn lower_switch(s) {
     let pos = s[N_POS];
+    if s[SW_TAG] && s[SW_INIT] {
+        // switch init; x { ... }  is  { init; switch x { ... } }.
+        let blk = empty_block(pos);
+        vec_push(blk[BLK_STMTS], s[SW_INIT]);
+        let inner = node_new(ST_SWITCH, pos);
+        inner[SW_TAG] = s[SW_TAG];
+        inner[SW_CASES] = s[SW_CASES];
+        vec_push(blk[BLK_STMTS], inner);
+        replace_node(s, blk);
+        check_scoped(s);
+        return;
+    }
+    if s[SW_TAG] {
+        let tt = chk(s[SW_TAG], 0);
+        if kind_of(tt) == K_STRUCT && tt[TY_ENUM] {
+            lower_enum_switch(s, tt);
+            return;
+        }
+    }
     let out = empty_block(pos);
     if s[SW_INIT] {
         vec_push(out[BLK_STMTS], s[SW_INIT]);
@@ -2638,6 +2658,214 @@ fn lower_switch(s) {
     check_scoped(body);
     ck_breaks = ck_breaks - 1;
     pop_scope();
+}
+
+// enum_pattern reads a case pattern: Variant, Variant(a, b) or Shape.Variant(a, b). It
+// returns [name, binding names] or 0.
+fn enum_pattern(e) {
+    let r = vec_new();
+    let names = vec_new();
+    let k = e[N_KIND];
+    if k == EX_IDENT {
+        vec_push(r, e[ID_NAME]);
+    } else if k == EX_SELECT {
+        vec_push(r, e[SEL_NAME]);
+    } else if k == EX_CALL {
+        if e[CALL_NAME] {
+            vec_push(r, e[CALL_NAME]);
+        } else if e[CALL_CALLEE] && e[CALL_CALLEE][N_KIND] == EX_SELECT {
+            vec_push(r, e[CALL_CALLEE][SEL_NAME]);
+        } else {
+            return 0;
+        }
+        let args = e[CALL_ARGS];
+        let i = 0;
+        while i < args[VEC_LEN] {
+            let a = vec_get(args, i);
+            if a[N_KIND] != EX_IDENT {
+                return 0;
+            }
+            vec_push(names, a[ID_NAME]);
+            i = i + 1;
+        }
+    } else {
+        return 0;
+    }
+    vec_push(r, names);
+    return r;
+}
+
+// lower_enum_switch compiles switch s { case Circle(r): ... } on an enum: one branch per
+// variant tag, binding the variant's fields; every variant must be covered (or default).
+fn lower_enum_switch(s, t) {
+    let pos = s[N_POS];
+    let vs = t[TY_ENUM];
+    let out = empty_block(pos);
+    push_scope();
+    let tmp = temp(pos, s[SW_TAG], t);
+    vec_push(out[BLK_STMTS], tmp);
+    let w = node_new(ST_WHILE, pos);
+    w[WH_ONCE] = 1;
+    w[WH_COND] = mk_int(pos, 1, ty_bool);
+    let body = empty_block(pos);
+    w[WH_BODY] = body;
+    let seen = vec_filled(vs[VEC_LEN], 0);
+    let first = 0;
+    let last = 0;
+    let deflt = 0;
+    let cases = s[SW_CASES];
+    let i = 0;
+    while i < cases[VEC_LEN] {
+        let c = vec_get(cases, i);
+        let exprs = vec_get(c, 0);
+        let blk = vec_get(c, 1);
+        if !exprs {
+            deflt = blk;
+        } else {
+            let cond = 0;
+            let binds = vec_new();
+            let j = 0;
+            while j < exprs[VEC_LEN] {
+                let e = vec_get(exprs, j);
+                let pat = enum_pattern(e);
+                if !pat {
+                    err_type(e[N_POS], "a case of a switch on ", t, " is a variant, like Name or Name(a, b)");
+                    pop_scope();
+                    return;
+                }
+                let vi = enum_variant(t, vec_get(pat, 0));
+                if vi < 0 {
+                    let u = err_begin(e[N_POS]);
+                    type_name(u, t);
+                    buf_str(u, " has no variant ");
+                    buf_str(u, vec_get(pat, 0));
+                    err_end(u);
+                    pop_scope();
+                    return;
+                }
+                if vec_get(seen, vi) {
+                    err_quoted(e[N_POS], "variant ", vec_get(pat, 0), " is already handled by an earlier case");
+                }
+                seen[VEC_DATA][vi] = 1;
+                let v = vec_get(vs, vi);
+                let names = vec_get(pat, 1);
+                if names[VEC_LEN] > 0 {
+                    if exprs[VEC_LEN] > 1 {
+                        err_at(e[N_POS], "a case that binds a variant's values lists only that variant");
+                    } else if names[VEC_LEN] != vec_get(v, 2) {
+                        let u = err_begin(e[N_POS]);
+                        buf_str(u, vec_get(pat, 0));
+                        buf_str(u, " has ");
+                        buf_int(u, vec_get(v, 2));
+                        buf_str(u, " values, the case binds ");
+                        buf_int(u, names[VEC_LEN]);
+                        err_end(u);
+                    } else {
+                        let k = 0;
+                        while k < names[VEC_LEN] {
+                            let nm = vec_get(names, k);
+                            if !streq(nm, "_") {
+                                let fi = vec_get(v, 1) + k;
+                                let l = node_new(ST_LET, e[N_POS]);
+                                l[LET_NAME] = nm;
+                                l[LET_INIT] = mk_mem(e[N_POS], sym_ref_node(pos, tmp[LET_SYM]), 0, 0, field_offset(t, fi), field_type(t, fi));
+                                vec_push(binds, l);
+                            }
+                            k = k + 1;
+                        }
+                    }
+                }
+                let tagv = mk_mem(e[N_POS], sym_ref_node(pos, tmp[LET_SYM]), 0, 0, field_offset(t, 0), ty_int);
+                let ce = mk_bin(e[N_POS], "==", tagv, mk_int(e[N_POS], vi, ty_int), ty_bool);
+                if cond {
+                    cond = mk_bin(e[N_POS], "||", cond, ce, ty_bool);
+                } else {
+                    cond = ce;
+                }
+                j = j + 1;
+            }
+            if binds[VEC_LEN] > 0 {
+                let st = blk[BLK_STMTS];
+                let k2 = 0;
+                while k2 < st[VEC_LEN] {
+                    vec_push(binds, vec_get(st, k2));
+                    k2 = k2 + 1;
+                }
+                blk[BLK_STMTS] = binds;
+            }
+            let ifs = node_new(ST_IF, blk[N_POS]);
+            ifs[IF_COND] = cond;
+            ifs[IF_THEN] = blk;
+            if last {
+                last[IF_ELSE] = ifs;
+            } else {
+                first = ifs;
+            }
+            last = ifs;
+        }
+        i = i + 1;
+    }
+    if !deflt {
+        let missing = buf_new();
+        let n = 0;
+        let m = 0;
+        while m < vs[VEC_LEN] {
+            if !vec_get(seen, m) {
+                if n > 0 {
+                    buf_str(missing, ", ");
+                }
+                buf_str(missing, vec_get(vec_get(vs, m), 0));
+                n = n + 1;
+            }
+            m = m + 1;
+        }
+        if n > 0 {
+            let u = err_begin(pos);
+            buf_str(u, "switch on ");
+            type_name(u, t);
+            buf_str(u, " does not handle ");
+            buf_byte(missing, 0);
+            buf_str(u, missing[VEC_DATA]);
+            buf_str(u, " (add the cases, or a default)");
+            err_end(u);
+        }
+    } else if last {
+        last[IF_ELSE] = deflt;
+    } else {
+        first = deflt;
+    }
+    if first {
+        vec_push(body[BLK_STMTS], first);
+    }
+    vec_push(out[BLK_STMTS], w);
+    // Every variant handled and every branch returns: nothing runs after the switch.
+    let all_return = first != 0;
+    let ci = 0;
+    while ci < cases[VEC_LEN] {
+        if !ends_in_return(vec_get(vec_get(cases, ci), 1)[BLK_STMTS]) {
+            all_return = 0;
+        }
+        ci = ci + 1;
+    }
+    replace_node(s, out);
+    ck_breaks = ck_breaks + 1;
+    check_scoped(body);
+    ck_breaks = ck_breaks - 1;
+    pop_scope();
+    if all_return && (deflt || all_seen(seen)) {
+        vec_push(s[BLK_STMTS], expr_stmt(rt_call(pos, "rt_panic", args1(lit_string(pos, "unreachable enum switch")), ty_void)));
+    }
+}
+
+fn all_seen(seen) {
+    let i = 0;
+    while i < seen[VEC_LEN] {
+        if !vec_get(seen, i) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 1;
 }
 
 // lower_go starts a thread running a call: the arguments are evaluated now and handed
@@ -3012,6 +3240,31 @@ fn keep_fn(t) {
             keep_each(pos, body, out[LET_SYM], et);
         }
         ret[RET_VALUE] = sym_ref_node(pos, out[LET_SYM]);
+    } else if k == K_STRUCT && t[TY_ENUM] {
+        // Copy the object, then keep only the active variant's references.
+        let out = temp(pos, rt_call(pos, "rt_keep_raw", args2(sym_ref_node(pos, x), mk_int(pos, t[TY_SIZE], ty_int)), t), t);
+        vec_push(body, out);
+        let vs = t[TY_ENUM];
+        let vi = 0;
+        while vi < vs[VEC_LEN] {
+            let v = vec_get(vs, vi);
+            let ifs = node_new(ST_IF, pos);
+            ifs[IF_COND] = mk_bin(pos, "==", mk_mem(pos, sym_ref_node(pos, out[LET_SYM]), 0, 0, field_offset(t, 0), ty_int), mk_int(pos, vi, ty_int), ty_bool);
+            ifs[IF_THEN] = empty_block(pos);
+            let kk = 0;
+            while kk < vec_get(v, 2) {
+                let fi = vec_get(v, 1) + kk;
+                let ft = field_type(t, fi);
+                if is_ref(ft) && kind_of(ft) != K_FUNC {
+                    let src = mk_mem(pos, sym_ref_node(pos, out[LET_SYM]), 0, 0, field_offset(t, fi), ft);
+                    vec_push(ifs[IF_THEN][BLK_STMTS], assign_stmt(pos, field_store(pos, sym_ref_node(pos, out[LET_SYM]), t, fi), keep_call(pos, keep_fn(ft), src, ft)));
+                }
+                kk = kk + 1;
+            }
+            vec_push(body, ifs);
+            vi = vi + 1;
+        }
+        ret[RET_VALUE] = sym_ref_node(pos, out[LET_SYM]);
     } else if k == K_STRUCT {
         let out = temp(pos, rt_call(pos, "rt_keep_raw", args2(sym_ref_node(pos, x), mk_int(pos, t[TY_SIZE], ty_int)), t), t);
         vec_push(body, out);
@@ -3098,7 +3351,17 @@ fn type_cycle(t, path) {
     let i = 0;
     while i < path[VEC_LEN] {
         if vec_get(path, i) == t {
-            return 1;
+            // Enum values are built bottom-up and never change, so a cycle made only of
+            // enums (a tree) cannot loop; one through a struct, slice or map can.
+            let j = i;
+            while j < path[VEC_LEN] {
+                let pj = vec_get(path, j);
+                if !(kind_of(pj) == K_STRUCT && pj[TY_ENUM]) {
+                    return 1;
+                }
+                j = j + 1;
+            }
+            return 0;
         }
         i = i + 1;
     }

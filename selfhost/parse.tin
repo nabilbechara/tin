@@ -633,6 +633,10 @@ fn parse_type() {
         p_next();
         return parse_struct_body(pos);
     }
+    if p_word("enum") && tok_is(p_peek2(), "{") && !p_legacy {
+        p_next();
+        return parse_enum_body(pos);
+    }
     let t = p_expect_ident();
     if streq(t[T_TEXT], "chan") {
         let c = node_new(TX_CHAN, pos);
@@ -691,6 +695,69 @@ fn parse_tparams(names, cons) {
 }
 
 // parse_struct_body reads { a, b int; c string } into a vec of [name, type expr].
+// parse_enum_body reads enum { A(x T, y U), B, C }: a struct underneath, with a hidden tag
+// field ($tag, the variant's index) and each variant's fields named Variant.field.
+fn parse_enum_body(pos) {
+    let st = node_new(TX_STRUCT, pos);
+    let fields = vec_new();
+    let variants = vec_new();
+    let tag = vec_new();
+    vec_push(tag, "$tag");
+    let tt = node_new(TX_NAME, pos);
+    tt[TX_B] = "i64";
+    vec_push(tag, tt);
+    vec_push(fields, tag);
+    p_expect("{");
+    while !p_is("}") {
+        if p_is(";") || p_is(",") {
+            p_next();
+            continue;
+        }
+        let vname = p_expect_ident()[T_TEXT];
+        let first = fields[VEC_LEN];
+        if p_is("(") {
+            p_next();
+            let pending = vec_new();
+            while !p_is(")") {
+                vec_push(pending, p_expect_ident()[T_TEXT]);
+                if p_is(",") {
+                    p_next();
+                    continue;
+                }
+                let ty = parse_type();
+                let i = 0;
+                while i < pending[VEC_LEN] {
+                    let f = vec_new();
+                    vec_push(f, str_cat3(vname, ".", vec_get(pending, i)));
+                    vec_push(f, ty);
+                    vec_push(fields, f);
+                    i = i + 1;
+                }
+                pending = vec_new();
+                if p_is(",") {
+                    p_next();
+                }
+            }
+            if pending[VEC_LEN] > 0 {
+                p_fail(pos, "an enum variant's fields need types: Variant(name Type, ...)");
+            }
+            p_next();
+        }
+        let v = vec_new();
+        vec_push(v, vname);
+        vec_push(v, first);
+        vec_push(v, fields[VEC_LEN] - first);
+        vec_push(variants, v);
+    }
+    p_next();
+    if variants[VEC_LEN] == 0 {
+        p_fail(pos, "an enum needs at least one variant");
+    }
+    st[TX_A] = fields;
+    st[TX_B] = variants;
+    return st;
+}
+
 fn parse_struct_body(pos) {
     let st = node_new(TX_STRUCT, pos);
     let fields = vec_new();
