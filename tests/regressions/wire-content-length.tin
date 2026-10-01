@@ -1,0 +1,110 @@
+package main
+
+import "hearth"
+import "mint"
+import "relay"
+import "say"
+import "wire"
+
+// reply is the raw response the test server sends for path; it closes the connection after it.
+func reply(path str) str {
+	if path == "/huge" {
+		// Announces 64 GiB and sends 3 bytes: the client must not reserve the announced size.
+		return "HTTP/1.1 200 OK\r\nContent-Length: 68719476736\r\n\r\nabc"
+	}
+	if path == "/digits" {
+		return "HTTP/1.1 200 OK\r\nContent-Length: 1234567890123456789012345\r\n\r\nabc"
+	}
+	if path == "/conflict" {
+		return "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 5\r\n\r\nabcde"
+	}
+	if path == "/same" {
+		return "HTTP/1.1 200 OK\r\nContent-Length: 3\r\ncontent-length: 3\r\n\r\nabc"
+	}
+	if path == "/list" {
+		return "HTTP/1.1 200 OK\r\nContent-Length: 3, 3\r\n\r\nabc"
+	}
+	if path == "/both" {
+		return "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n"
+	}
+	if path == "/short" {
+		return "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc"
+	}
+	if path == "/spaces" {
+		return "HTTP/1.1 200 OK\r\nContent-Length:  4 \r\n\r\nabcd"
+	}
+	if path == "/large" {
+		b := make([]u8, 0, 300000)
+		for i := 0; i < 300000; i++ {
+			b = append(b, u8('a'+i%26))
+		}
+		return "HTTP/1.1 200 OK\r\nContent-Length: 300000\r\n\r\n" + str(b)
+	}
+	return "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nbye"
+}
+
+func serve(l wire.Listener) fault {
+	for {
+		c := try l.Accept()
+		req := make([]u8, 0, 1024)
+		for {
+			_, err := c.Read(req, 1024)
+			if err != nil {
+				return err
+			}
+			s := str(req)
+			if len(s) >= 4 && s[len(s)-4:] == "\r\n\r\n" {
+				break
+			}
+		}
+		s := str(req)
+		sp := 4
+		for sp < len(s) && s[sp] != ' ' {
+			sp++
+		}
+		path := s[4:sp]
+		_ = c.Write(reply(path)) == nil
+		c.Close()
+		if path == "/stop" {
+			return nil
+		}
+	}
+}
+
+func show(err fault) str {
+	if err == nil {
+		return "nil"
+	}
+	return say.Str(err)
+}
+
+func worker(id i64) {
+	if id == 1 {
+		l, err := wire.Listen("127.0.0.1:0")
+		if err != nil {
+			say.Line("listen", err)
+			return
+		}
+		relay.Send(0, mint.Itoa(l.Port()))
+		e2 := serve(l)
+		if e2 != nil {
+			say.Line("serve error", e2)
+		}
+		l.Close()
+		return
+	}
+	_, port := relay.Recv()
+	base := "http://127.0.0.1:" + port
+	for _, p := range []str{"/huge", "/digits", "/conflict", "/same", "/list", "/both", "/short", "/spaces", "/large", "/stop"} {
+		r, err := wire.Get(base + p)
+		body := r.Body
+		if len(body) > 8 {
+			body = say.Fmt("%d bytes ending %s", len(body), body[len(body)-3:])
+		}
+		say.Line(p, r.Status, say.Fmt("%q", body), show(err))
+	}
+}
+
+func main() {
+	hearth.Run(2, worker)
+}
