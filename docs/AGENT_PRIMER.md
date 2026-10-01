@@ -87,6 +87,11 @@ sift(sort/search) cairn(containers) gauge(math) dice(random) stamp(non-crypto ha
 HMAC, base64, hex) ore(bytes) flume(buffered I/O) herald(logging) crucible(testing). Signatures:
 docs/STDLIB.md.
 
+## Tests in your own packages
+Go style: `NAME_test.tin` next to the code (same package), `func TestX(t mut crucible.T)` with
+`crucible.Equal(mut t, "label", got, want)`, `t.True`, `t.NoFault`, `t.HasFault`, `t.Error(msg)`;
+`func BenchmarkX(b mut crucible.B)` loops `b.N` times. Run with `tin test ./dir` (`-bench` too).
+
 ## Verification standard
 For every function, write an equivalent Go program (stdlib only) under bench/ref/NAME/ (its own
 `package main` file; run with `go run`) that prints the same lines for the same inputs, and diff the

@@ -30,7 +30,8 @@ moving or deleting the tree breaks it.
 | `tin run A.tin B.tin -- ARGS` | compile several files as one program and run it |
 | `tin build FILE.tin... [-o OUT] [--target T]` | write an executable (default name: the first file without `.tin`) |
 | `tin asm FILE.tin...` | print the generated ARM64 assembly (clang syntax) |
-| `tin test` | run the strict test suite (`tools/v2test.sh`) |
+| `tin test [-bench] [DIR]` | build DIR (default `.`) with its `*_test.tin` files and run every `TestXxx(t mut crucible.T)`, then `BenchmarkXxx(b mut crucible.B)` with `-bench`; exit status 1 when a test fails (see §5.1) |
+| `tin suite` | run the compiler's strict test suite (`tools/v2test.sh`) |
 | `tin bootstrap` | rebuild the compiler with itself; the binaries must be identical |
 | `tin version` | version and compiler checksum |
 
@@ -87,6 +88,36 @@ passes.
 | HTTP conformance | `bench/http/conformance` | 26 edge cases against a running server: `bin/conformance -addr 127.0.0.1:9180 -pid PID` |
 | x86-64 encoder | `tools/x64fuzz` | `tools/x64fuzz/run.sh [COUNT] [SEED]`: random instructions vs `x86_64-linux-gnu-objdump` |
 | stdlib vs Go | `bench/ref/NAME/main.go` | the same cases written with Go's library; outputs diffed (see notes/stdlib_verified.md) |
+
+### 5.1 Testing your own code: `*_test.tin`
+
+```tin
+// geo_test.tin, next to geo.tin (same package; private names are visible)
+package geo
+
+import "crucible"
+
+func TestArea(t mut crucible.T) {
+	crucible.Equal(mut t, "2x3", Area(2, 3), 6)   // any comparable type
+	t.True("clamp", clampPos(-1) == 0)
+	t.NoFault("parse", err)
+	if t.Failed() {
+		t.Log("printed only when the test fails")
+	}
+}
+
+func BenchmarkArea(b mut crucible.B) {
+	for i := 0; i < b.N; i++ {
+		Area(i, 3)
+	}
+}
+```
+
+`tin test ./geo` prints `--- PASS: TestArea` / `--- FAIL: ...` with the failure messages,
+then `PASS: N tests` or `FAIL: ...` (exit status 1). `tin test -bench ./geo` also runs each
+benchmark, doubling `b.N` until it takes a second, and prints ns/op. `*_test.tin` files are
+never part of a normal build or import. Underneath, `tin test` writes a runner calling each
+test through `crucible.Run` and compiles the package with `tinc -entry pkg.TinTestMain`.
 
 Adding a strict test: write `tests/v2/NAME.tin` with deterministic output (no times,
 addresses or map-order dependence beyond what sorting hides), run it, check every line

@@ -5,7 +5,8 @@
 #   tin run FILE.tin... [-- ARGS]   compile and run several files as one program
 #   tin build FILE.tin... [-o OUT] [--target T]  write an executable (T: darwin-arm64, linux-arm64)
 #   tin asm FILE.tin...             print the generated ARM64 assembly
-#   tin test                        run the strict test suite (tests/v2)
+#   tin test [-bench] [DIR]         run DIR's *_test.tin tests (TestXxx, BenchmarkXxx)
+#   tin suite                       run the compiler's strict test suite (tests/v2)
 #   tin bootstrap                   rebuild the compiler with itself and check the fixed point
 #   tin version
 set -e
@@ -67,13 +68,53 @@ case $1 in
     shift
     if legacy "$@"; then "$tinc" -S "$root/lib/std.tin" "$@"; else "$tinc" -S "$@"; fi ;;
   test)
+    # tin test [-bench] [DIR]: build DIR's package with its *_test.tin files and a generated
+    # runner, then run every TestXxx(t mut crucible.T) (and BenchmarkXxx with -bench).
+    shift; bench=0; dir=
+    for a do
+      case $a in
+        -bench) bench=1 ;;
+        -*) echo "tin: test: unknown option $a" >&2; exit 2 ;;
+        *) [ -z "$dir" ] || { echo "tin: test: one directory at a time" >&2; exit 2; }; dir=$a ;;
+      esac
+    done
+    [ -n "$dir" ] || dir=.
+    [ -d "$dir" ] || { echo "tin: test: $dir is not a directory" >&2; exit 2; }
+    set --
+    for f in "$dir"/*.tin; do [ -f "$f" ] && set -- "$@" "$f"; done
+    tests=0
+    for f do case $f in *_test.tin) tests=1 ;; esac; done
+    [ "$tests" = 1 ] || { echo "tin: test: no *_test.tin files in $dir"; exit 0; }
+    first=
+    for f do case $f in *_test.tin) [ -n "$first" ] || first=$f ;; esac; done
+    pkg=$(sed -n 's/^package[[:space:]]\{1,\}\([A-Za-z_][A-Za-z0-9_]*\).*/\1/p' "$first" | head -n 1)
+    [ -n "$pkg" ] || { echo "tin: test: $first has no package clause" >&2; exit 2; }
+    runner=$cache/tintest.$$.tin; exe=$cache/tintest.$$; trap 'rm -f "$exe" "$runner"' EXIT
+    {
+      echo "package $pkg"
+      echo 'import "crucible"'
+      echo 'func TinTestMain() {'
+      for f do
+        case $f in *_test.tin)
+          sed -n 's/^func \(Test[A-Za-z0-9_]*\)(t mut crucible\.T).*/	crucible.Run("\1", \1)/p' "$f"
+          [ "$bench" = 1 ] && sed -n 's/^func \(Benchmark[A-Za-z0-9_]*\)(b mut crucible\.B).*/	crucible.RunBench("\1", \1)/p' "$f" ;;
+        esac
+      done
+      echo '	crucible.Finish()'
+      echo '}'
+    } > "$runner"
+    entry=TinTestMain
+    [ "$pkg" = main ] || entry=$pkg.TinTestMain
+    "$tinc" -entry "$entry" -o "$exe" "$@" "$runner"
+    "$exe" ;;
+  suite)
     "$root/tools/v2test.sh" "$tinc" ;;
   bootstrap)
     make -s -C "$root" bootstrap ;;
   version|-v|--version)
     echo "tin 0.2 (self-hosted, arm64-darwin, compiler $(cksum < "$tinc" | cut -d' ' -f1))" ;;
   ""|help|-h|--help)
-    sed -n '2,11p' "$self" | sed 's/^# \{0,1\}//' ;;
+    sed -n '2,12p' "$self" | sed 's/^# \{0,1\}//' ;;
   *.tin)
     f=$1; shift
     exe=$cache/run.$$; trap 'rm -f "$exe"' EXIT

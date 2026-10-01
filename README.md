@@ -51,7 +51,8 @@ func main() {
 make install                  # build bin/tinc from the seed and put `tin` on the PATH
 tin examples/api.tin          # compile and run
 tin build app.tin -o app      # native executable
-tin test                      # strict test suite (tests/v2, outputs checked)
+tin test ./mypkg               # run mypkg's *_test.tin tests (Go style)
+tin suite                     # the compiler's strict test suite (tests/v2)
 make test                     # everything: strict suite + legacy suites in 3 modes
 make bootstrap                # tinc rebuilds itself twice; the binaries must be identical
 ```

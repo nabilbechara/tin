@@ -681,3 +681,16 @@ crucible.Done()
 - `Checks() i64`: Checks is the number of checks run so far.
 - `Done()`: Done prints "ok N checks" or every failure, and exits with status 1 if any failed.
 - `Bench(label str, n i64, f func(i64))`: Bench runs f(i) for i in [0, n) and prints the time per call.
+- `type T struct`: T is one running test: checks record failures in it, and the test continues.
+- `type B struct`: B is one running benchmark: run the measured code b.N times.
+- `(t mut T) Error(msg str)`: Error marks the test failed with msg (it keeps running).
+- `(t mut T) Log(msg str)`: Log records msg; it is printed only if the test fails.
+- `(t T) Failed() bool`: Failed reports whether the test has failed so far.
+- `(t mut T) True(label str, cond bool)`: True fails the test with label unless cond holds.
+- `(t mut T) False(label str, cond bool)`: False fails the test with label if cond holds.
+- `(t mut T) NoFault(label str, err fault)`: NoFault fails the test if err is not nil.
+- `(t mut T) HasFault(label str, err fault)`: HasFault fails the test if err is nil.
+- `Equal[V comparable](t mut T, label str, got V, want V)`: Equal fails the test unless got == want; both are printed on failure.
+- `Run(name str, f func(mut T))`: Run runs one test and prints its result like go test -v.
+- `RunBench(name str, f func(mut B))`: RunBench runs one benchmark with b.N doubling until it takes at least 1 s, then prints the time per operation.
+- `Finish()`: Finish prints PASS or FAIL and exits with status 1 when a test failed.
