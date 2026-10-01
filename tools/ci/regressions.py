@@ -54,8 +54,8 @@ def limits():
         resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 * 1024,) * 2)
 
 
-def run_case(case, compiler, work):
-    target = case.get('target')
+def run_case(case, compiler, work, cross=None, docker=None):
+    target = case.get('target') or cross
     exe = work / Path(case['source']).stem
     command = [str(compiler)] + (['-target', target] if target else [])
     command += ['-o', str(exe), 'tests/regressions/' + case['source']]
@@ -63,6 +63,12 @@ def run_case(case, compiler, work):
     actual = {'phase': 'compile', 'exit': code, 'stdout': stdout.decode(errors='replace'), 'stderr': stderr.decode(errors='replace')}
     if code != 0 or case['expected']['phase'] == 'compile':
         return actual
+    if docker:
+        # Cross-built cases run in a container of the target with the same limits.
+        command = ['docker', 'run', '--rm', '--platform', target.replace('-', '/'), '-v', str(work) + ':/work',
+                   '-w', '/work', docker, 'sh', '-c', 'ulimit -c 0; ulimit -v 524288; exec timeout 20 /work/' + exe.name]
+        code, stdout, stderr = execute(command, timeout=60)
+        return {'phase': 'run', 'exit': code, 'stdout': stdout.decode(errors='replace'), 'stderr': stderr.decode(errors='replace')}
     try:
         result = subprocess.run([str(exe)], cwd=ROOT, capture_output=True, timeout=20, preexec_fn=limits)
         return {'phase': 'run', 'exit': result.returncode, 'stdout': result.stdout.decode(errors='replace'), 'stderr': result.stderr.decode(errors='replace')}
@@ -91,7 +97,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--compiler', default='bin/tinc')
     parser.add_argument('--audit', action='store_true')
+    parser.add_argument('--target', help='Cross-build cases without their own target for this target')
+    parser.add_argument('--docker', help='Execute cross-built cases in this Linux image')
     args = parser.parse_args()
+    if args.docker and not args.target:
+        parser.error('--docker requires --target')
+    platform = 'linux' if args.docker else sys.platform
     cases = load_cases()
     if args.audit:
         audit(cases)
@@ -101,10 +112,12 @@ def main():
     results = []
     with tempfile.TemporaryDirectory(prefix='regressions-', dir=out) as work:
         for case in cases:
-            if case.get("platform", sys.platform) != sys.platform:
+            if case.get("platform", platform) != platform:
                 print(f'SKIP {case["source"]}: runs on {case["platform"]}')
                 continue
-            actual = run_case(case, Path(args.compiler).resolve(), Path(work))
+            own = 'target' in case
+            actual = run_case(case, Path(args.compiler).resolve(), Path(work),
+                              None if own else args.target, None if own else args.docker)
             status = classify(case, actual)
             print(f'{status} {case["source"]} (#{case["issue"]})')
             if status in ('FAIL', 'XPASS'):
@@ -112,7 +125,7 @@ def main():
                 if status == 'XPASS':
                     print('Fix detected: keep this test and remove known_failure from its manifest entry.')
             results.append({'source': case['source'], 'issue': case['issue'], 'status': status, 'actual': actual})
-    (out / 'regressions.json').write_text(json.dumps(results, indent=2) + '\n')
+    (out / ('regressions-' + args.target + '.json' if args.target else 'regressions.json')).write_text(json.dumps(results, indent=2) + '\n')
     summary = '\n'.join(f'- {r["status"]}: `{r["source"]}` ([#{r["issue"]}](https://github.com/yasserreslan/tin/issues/{r["issue"]}))' for r in results)
     if os.environ.get('GITHUB_STEP_SUMMARY'):
         with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as f:

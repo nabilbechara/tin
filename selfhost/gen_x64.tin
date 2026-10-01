@@ -28,6 +28,7 @@ var cmp_unord;      // x_gen_compare result: 1 when unordered means false, 2 whe
 var x_syms;         // symbol table: id -> sym_ref word (memory operands only hold 32 bits)
 var x_fn_labels;    // function index -> entry label
 var x_nstack;       // stack parameters of the current function
+var x_div_label;    // the current function's divide-by-zero stub, once used
 
 fn x_label(l) {
     emit1(X_LABEL, l);
@@ -245,15 +246,29 @@ fn x_shift(op, dst, a, b) {
     emit1(op, dst);
 }
 
-// x_divide emits dst = a / b (or a % b with rem) through rdx:rax, giving 0 for a zero divisor
-// (the remainder is then a) and the wrapped result for the most negative value / -1, as
-// the arm64 instructions do.
+// x_div_stub is the label of the current function's divide-by-zero panic stub.
+fn x_div_stub() {
+    if !x_div_label {
+        x_div_label = new_label();
+    }
+    return x_div_label;
+}
+
+// x_divide emits dst = a / b (or a % b with rem) through rdx:rax, panicking on a zero divisor
+// in strict code (legacy code gets 0, or a for the remainder) and giving the wrapped result
+// for the most negative value / -1, as the arm64 instructions do.
 fn x_divide(dst, a, b, unsigned, rem) {
     if b == RAX || b == RDX {
         x_mov(RCX, b);
         b = RCX;
     }
-    let zero_l = new_label();
+    let strict = !cur_gen_fn[F_LEGACY];
+    let zero_l = 0;
+    if strict {
+        zero_l = x_div_stub();
+    } else {
+        zero_l = new_label();
+    }
     let done_l = new_label();
     let neg_l = 0;
     if !unsigned {
@@ -287,11 +302,13 @@ fn x_divide(dst, a, b, unsigned, rem) {
         }
         emit1(X_JMP, done_l);
     }
-    x_label(zero_l);
-    if rem {
-        x_mov(dst, a);
-    } else {
-        x_load_imm(dst, 0);
+    if !strict {
+        x_label(zero_l);
+        if rem {
+            x_mov(dst, a);
+        } else {
+            x_load_imm(dst, 0);
+        }
     }
     x_label(done_l);
 }
@@ -382,6 +399,8 @@ fn x_binary_const(op, dst, l, c) {
         } else if c == -1 {
             x_mov(dst, l);
             emit1(X_NEG, dst);
+        } else if c == 0 && !cur_gen_fn[F_LEGACY] {
+            emit1(X_JMP, x_div_stub());
         } else if c == 0 {
             x_load_imm(dst, 0);
         } else if k > 0 {
@@ -400,6 +419,8 @@ fn x_binary_const(op, dst, l, c) {
         let k = pow2_log(m);
         if m == 1 {
             x_load_imm(dst, 0);
+        } else if c == 0 && !cur_gen_fn[F_LEGACY] {
+            emit1(X_JMP, x_div_stub());
         } else if c == 0 {
             x_mov(dst, l);
         } else if k > 0 {
@@ -2157,6 +2178,7 @@ fn x_entry_moves(f) {
 fn x_gen_fn(f) {
     cur_gen_fn = f;
     trap_label = 0;
+    x_div_label = 0;
     trap_sites = vec_new();
     if getenv("TINC_TRACE") {
         let tb = buf_new();
@@ -2189,6 +2211,16 @@ fn x_gen_fn(f) {
         if bf {
             emit1(X_CALL, x_sym(SK_FN, bf[F_INDEX]));
             bf[F_USED] = 1;
+        }
+    }
+    if x_div_label {
+        // The cold path every zero divisor in strict code jumps to (realigned like the stubs below).
+        x_label(x_div_label);
+        emit2(X_ANDI, RSP, -16);
+        let df = find_fn("rt_div_fail");
+        if df {
+            emit1(X_CALL, x_sym(SK_FN, df[F_INDEX]));
+            df[F_USED] = 1;
         }
     }
     // Per-site stubs: the index and length go through the stack into rdi/rsi (any registers),

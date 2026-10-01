@@ -22,10 +22,12 @@ Files: `selfhost/asm_x64.tin` (encoder, fuzzed against objdump: `tools/x64fuzz/r
 - Every spill slot is 16 bytes (`sub rsp,16; mov [rsp],r`), so rsp is 16-byte aligned at every
   call without tracking. Frame: `push rbp; mov rbp,rsp; sub rsp,frame`; slots at [rbp-8(i+1)],
   saved registers below them; frameless leaves when nothing needs saving.
-- Division (x_divide): `x / 0 == 0`, `x % 0 == x`, `MIN / -1 == MIN` via explicit checks
-  before idiv/div (the legacy semantics). Float compares: `<`/`<=` use swapped `ucomisd` with
-  ja/jae, `==`/`!=` add a parity check, so NaN compares like Go. cmov if-conversion for
-  integer selects only.
+- Division (x_divide): a zero divisor in strict code jumps to the function's cold stub
+  (`x_div_label`, realigns rsp, calls `rt_div_fail`); legacy code keeps `x / 0 == 0`,
+  `x % 0 == x`. `MIN / -1 == MIN` via an explicit check before idiv. A constant zero divisor
+  left by inlining is not folded (`is_const`), so it reaches the stub too.
+- Float compares: `<`/`<=` use swapped `ucomisd` with ja/jae, `==`/`!=` add a parity check,
+  so NaN compares like Go. cmov if-conversion for integer selects only.
 - Bounds checks: `cmp idx, len; jae stub`; per-site cold stubs pass index and length through the
   stack into rdi/rsi, realign rsp and call `rt_bounds_fail2`.
 - Symbols in instructions are indices into `x_syms` (sym_ref words; the packed memory operand only
@@ -60,15 +62,8 @@ Files: `selfhost/asm_x64.tin` (encoder, fuzzed against objdump: `tools/x64fuzz/r
 
 ## Unverified / open
 
-- The div-by-zero semantics change (coordinator, after these runs): strict code must PANIC on
-  `/ 0` and `% 0` via `rt_div_fail` (one cold stub per function, skipped when
-  `cur_gen_fn[F_LEGACY]`; constant-zero divisor jumps unconditionally). NOT YET MIRRORED in
-  gen_x64.tin: `x_divide` still yields 0 / x for a zero divisor in all code. To mirror: add
-  `var x_div_label`, reset it in `x_gen_fn`, in `x_divide` replace the `test b,b; je zero_l`
-  path with `test b,b; je x_div_label` when `!cur_gen_fn[F_LEGACY]` (keep zero_l for legacy),
-  in `x_binary_const` for c == 0 in strict code emit `jmp x_div_label`, and at the end of
-  `x_gen_fn` (next to trap_label) emit `x_label(x_div_label); call rt_div_fail` (find_fn, set
-  F_USED). MIN / -1 == MIN stays.
+- Strict division by zero panics like arm64 (#13), covered by the `div-*`/`rem-*` cases in
+  tests/regressions; `tools/x64fuzz/linuxtest_amd64.sh` now also runs those cases in the container.
 - The three failures above (cairn, lever, 7+-argument calls). Likely area: the stack-argument
   path in `x_gen_call` (slot offsets `16*i + callee_slot + 8*j`) and/or stack parameters in
   `x_entry_moves` ([rbp+16+8k]); `lever.Str` crashing with 3 args suggests something else too
