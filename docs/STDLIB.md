@@ -60,8 +60,8 @@ func main() {
 
 - `type Req struct`: Req is the request being served. Its strings live in the request pool: keep() them to store them anywhere long-lived.
 - `type Out struct`: Out is the response being built. Body is the response body; the status defaults to 200 and the content type to text/plain.
-- `Serve(addr str, h func(Req, Out)) fault`: Serve listens on addr (":8080", "127.0.0.1:8080") and serves h on every core. It returns only if the server cannot start. TIN_CORES overrides the number of cores.
-- `ServeN(addr str, n i64, h func(Req, Out)) fault`: ServeN is Serve on exactly n cores.
+- `Serve(addr str, h func(Req, mut Out)) fault`: Serve listens on addr (":8080", "127.0.0.1:8080") and serves h on every core. It returns only if the server cannot start. TIN_CORES overrides the number of cores.
+- `ServeN(addr str, n i64, h func(Req, mut Out)) fault`: ServeN is Serve on exactly n cores.
 - `(q Req) Header(name str) str`: Header returns the value of the request header name (any case), or "".
 - `(q Req) Body() str`: Body returns the request body.
 - `(q Req) Param(name str) str`: Param returns query parameter name, %-decoded, or "".
@@ -82,6 +82,7 @@ Package hearth runs a program on every core: one thread per core, each with its 
 - `ID() i64`: ID is the current core's number: 0 for the main core.
 - `Run(n i64, entry func(i64))`: Run starts entry(i) on cores 1..n-1, runs entry(0) here, then waits for every core. Before starting it sizes the request pools to the memory limit and decides whether cores pin themselves to CPUs (only when they map one-to-one onto the allowed CPUs, or TIN_PIN=1).
 - `PoolChunk() i64`: PoolChunk is the request pool chunk size in bytes each core uses (after pool_tune).
+- `PoolCapacity() i64`: PoolCapacity is the usable size in bytes of this core's current base pool chunk (0 before its first request allocation).
 - `Reset()`: Reset ends the current request: the core's pool is emptied for the next one.
 
 ## relay

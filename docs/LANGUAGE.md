@@ -200,7 +200,7 @@ p := Point{1, 2, "a", []str{}, nil}   // positional, every field in order
 ### Function values
 
 ```go
-type Handler func(anvil.Req, anvil.Out)
+type Handler func(anvil.Req, mut anvil.Out)
 func double(x i64) i64 { return 2 * x }
 f := double
 g := func(x i64) i64 { return x + 1 }  // a literal; it cannot capture local variables
@@ -209,6 +209,13 @@ say.Line(f(3), g(3))
 
 Function literals are lifted to top-level functions: they may use their parameters and
 globals, not the enclosing function's locals.
+
+A `mut` parameter is part of a function's type: `func put(b mut Box)` has type
+`func(mut Box)`, which is not `func(Box)`. A call through a function value is checked like a
+direct one: an argument for a `mut` parameter must be modifiable, and because the callee is
+unknown, the compiler assumes it may store request memory there, so passing long-lived
+memory (a global, or anything reachable from one) to a `mut` parameter of a function value is
+a compile error. Call the function directly, or pass request-owned memory.
 
 ### Conversions
 
@@ -226,7 +233,7 @@ There are no implicit conversions between types. Convert explicitly:
 
 ### Named types
 
-`type Celsius f64`, `type IDs []i64`, `type Handler func(Req, Out)` declare new names;
+`type Celsius f64`, `type IDs []i64`, `type Handler func(Req, mut Out)` declare new names;
 a named type converts to and from its underlying type explicitly.
 
 ---
@@ -814,8 +821,9 @@ Results       = Type | "(" Type { "," Type } ")" .
 ExternDecl    = "extern" "func" ident "(" [ Param { "," Param } ] [ "," "..." ] ")" [ Results ] .
 
 Type          = TypeName [ TypeArgs ] | "[" "]" Type | "[" expr "]" Type
-              | "map" "[" Type "]" Type | "?" Type | "func" TypeList [ Results ]
+              | "map" "[" Type "]" Type | "?" Type | "func" ParamTypes [ Results ]
               | "struct" "{" { identList Type ";" } "}" .
+ParamTypes    = "(" [ [ ident ] [ "mut" ] Type { "," [ ident ] [ "mut" ] Type } ] ")" .
 TypeName      = ident | ident "." ident .
 TypeArgs      = "[" Type { "," Type } "]" .
 

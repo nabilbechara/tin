@@ -354,6 +354,31 @@ fn rg_call(e) {
     let pos = e[N_POS];
     if e[CALL_CALLEE] {
         rg_expr(e[CALL_CALLEE]);
+        // The callee is unknown: a mut argument may be modified and may receive request memory.
+        let ct = e[CALL_CALLEE][N_TYPE];
+        let mask = 0;
+        if ct && ct[TY_KIND] == K_FUNC {
+            mask = ct[TY_KEY];
+        }
+        i = 0;
+        while i < n && i < 63 {
+            if (mask & (1 << i)) != 0 {
+                if rg_report && (vec_get(b, i) & (RG_INGOT | RG_UNK)) != 0 {
+                    let m = err_begin(pos);
+                    buf_str(m, "a call through a function value may store request memory into its mut argument ");
+                    buf_int(m, i + 1);
+                    buf_str(m, ", which may be long-lived: call the function directly or pass request-owned memory");
+                    err_end(m);
+                    let saved = rg_report;
+                    rg_report = 0;
+                    rg_store(vec_get(b, i), RG_EMB, pos, 0);
+                    rg_report = saved;
+                } else {
+                    rg_store(vec_get(b, i), RG_EMB, pos, 0);
+                }
+            }
+            i = i + 1;
+        }
         if has_ptr(e[N_TYPE]) {
             return RG_UNK | RG_EMB;
         }
