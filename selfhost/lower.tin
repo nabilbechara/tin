@@ -739,10 +739,245 @@ fn mk_mem(pos, base, index, scale, off, t) {
     return n;
 }
 
+// ---- map keys: struct and enum keys are encoded to bytes, so they compare by value ----
+
+fn key_composite(t) {
+    return kind_of(t) == K_STRUCT;
+}
+
+// map_str_keys reports whether a map with key type kt keeps str keys inside.
+fn map_str_keys(kt) {
+    return kind_of(kt) == K_STRING || key_composite(kt);
+}
+
+// key_in is key e as the word the runtime stores (bits, a str, or an encoded struct/enum).
+fn key_in(e, kt) {
+    if !key_composite(kt) {
+        return to_bits(e);
+    }
+    let pos = e[N_POS];
+    let stmts = vec_new();
+    let b = temp(pos, rt_call(pos, "rt_kb_new", vec_new(), ty_int), ty_int);
+    vec_push(stmts, b);
+    vec_push(stmts, assign_stmt(pos, sym_ref_node(pos, b[LET_SYM]), call_fn(pos, key_enc_fn(kt), args2(sym_ref_node(pos, b[LET_SYM]), e), ty_int)));
+    return mk_seq(pos, stmts, rt_call(pos, "rt_kb_done", args1(sym_ref_node(pos, b[LET_SYM])), ty_string), ty_string);
+}
+
+// key_out turns a stored key word back into a key of type kt.
+fn key_out(e, kt) {
+    if !key_composite(kt) {
+        return from_bits(e, kt);
+    }
+    let pos = e[N_POS];
+    let stmts = vec_new();
+    vec_push(stmts, expr_stmt(rt_call(pos, "rt_kd_begin", vec_new(), ty_void)));
+    return mk_seq(pos, stmts, call_fn(pos, key_dec_fn(kt), args1(mk_conv(pos, e, CV_SAME, ty_string)), kt), kt);
+}
+
+// map_set_call stores v under key k in map m.
+fn map_set_call(pos, m, k, v, kt) {
+    if key_composite(kt) {
+        return rt_call(pos, "rt_map_setk", args3(m, key_in(k, kt), to_bits(v)), ty_void);
+    }
+    return rt_call(pos, "rt_map_set", args3(m, to_bits(k), to_bits(v)), ty_void);
+}
+
+// key_valid reports whether t can be a map key: str, numbers, bool, or structs and enums
+// made of those (compared by value).
+fn key_valid(t, path) {
+    let k = kind_of(t);
+    if k == K_STRING || k == K_BOOL || is_integer_t(t) || is_float_t(t) {
+        return 1;
+    }
+    if k != K_STRUCT {
+        return 0;
+    }
+    let i = 0;
+    while i < path[VEC_LEN] {
+        if vec_get(path, i) == t {
+            return t[TY_ENUM] != 0;
+        }
+        i = i + 1;
+    }
+    vec_push(path, t);
+    let ok = 1;
+    let fi = 0;
+    while fi < t[TY_FIELDS][VEC_LEN] && ok {
+        ok = key_valid(field_type(t, fi), path);
+        fi = fi + 1;
+    }
+    path[VEC_LEN] = path[VEC_LEN] - 1;
+    return ok;
+}
+
+var key_enc_types;
+var key_enc_fns;
+var key_dec_types;
+var key_dec_fns;
+
+// key_enc_fn returns keyenc$N(b, x) b: x's bytes appended to byte slice b.
+fn key_enc_fn(t) {
+    if !key_enc_types {
+        key_enc_types = vec_new();
+        key_enc_fns = vec_new();
+    }
+    let i = 0;
+    while i < key_enc_types[VEC_LEN] {
+        if vec_get(key_enc_types, i) == t {
+            return vec_get(key_enc_fns, i);
+        }
+        i = i + 1;
+    }
+    let names = vec_new();
+    vec_push(names, "b");
+    vec_push(names, "x");
+    let types = vec_new();
+    vec_push(types, ty_int);
+    vec_push(types, t);
+    let rts = vec_new();
+    vec_push(rts, ty_int);
+    let f = lifted_fn("keyenc", names, types, rts);
+    vec_push(key_enc_types, t);
+    vec_push(key_enc_fns, f);
+    let saved_fn = ck_fn;
+    ck_fn = f;
+    let pos = 0;
+    let b = vec_get(f[F_LOCALS], 0);
+    let x = vec_get(f[F_LOCALS], 1);
+    let body = f[F_BODY][BLK_STMTS];
+    if t[TY_ENUM] {
+        key_enc_field(pos, body, b, x, t, 0);
+        let vs = t[TY_ENUM];
+        let vi = 0;
+        while vi < vs[VEC_LEN] {
+            let v = vec_get(vs, vi);
+            let ifs = node_new(ST_IF, pos);
+            ifs[IF_COND] = mk_bin(pos, "==", mk_mem(pos, sym_ref_node(pos, x), 0, 0, field_offset(t, 0), ty_int), mk_int(pos, vi, ty_int), ty_bool);
+            ifs[IF_THEN] = empty_block(pos);
+            let k = 0;
+            while k < vec_get(v, 2) {
+                key_enc_field(pos, ifs[IF_THEN][BLK_STMTS], b, x, t, vec_get(v, 1) + k);
+                k = k + 1;
+            }
+            vec_push(body, ifs);
+            vi = vi + 1;
+        }
+    } else {
+        let fi = 0;
+        while fi < t[TY_FIELDS][VEC_LEN] {
+            key_enc_field(pos, body, b, x, t, fi);
+            fi = fi + 1;
+        }
+    }
+    let ret = node_new(ST_RETURN, pos);
+    ret[RET_VALUE] = sym_ref_node(pos, b);
+    vec_push(body, ret);
+    ck_fn = saved_fn;
+    return f;
+}
+
+// key_enc_field appends `b = <field fi of x, encoded>` to body.
+fn key_enc_field(pos, body, b, x, t, fi) {
+    let ft = field_type(t, fi);
+    let fv = mk_mem(pos, sym_ref_node(pos, x), 0, 0, field_offset(t, fi), ft);
+    let k = kind_of(ft);
+    let nb = 0;
+    if k == K_BOOL {
+        nb = rt_call(pos, "rt_kb_word", args2(sym_ref_node(pos, b), mk_conv(pos, fv, CV_SAME, ty_int)), ty_int);
+    } else if k == K_STRING {
+        nb = rt_call(pos, "rt_kb_str", args2(sym_ref_node(pos, b), fv), ty_int);
+    } else if is_float_t(ft) {
+        nb = rt_call(pos, "rt_kb_word", args2(sym_ref_node(pos, b), mk_conv(pos, fv, CV_F2BITS, ty_int)), ty_int);
+    } else if k == K_STRUCT {
+        nb = call_fn(pos, key_enc_fn(ft), args2(sym_ref_node(pos, b), fv), ty_int);
+    } else {
+        nb = rt_call(pos, "rt_kb_word", args2(sym_ref_node(pos, b), mk_conv(pos, fv, CV_INT, ty_int)), ty_int);
+    }
+    vec_push(body, assign_stmt(pos, sym_ref_node(pos, b), nb));
+}
+
+// key_dec_fn returns keydec$N(s) T: the key encoded in s, read from rt_kd's offset.
+fn key_dec_fn(t) {
+    if !key_dec_types {
+        key_dec_types = vec_new();
+        key_dec_fns = vec_new();
+    }
+    let i = 0;
+    while i < key_dec_types[VEC_LEN] {
+        if vec_get(key_dec_types, i) == t {
+            return vec_get(key_dec_fns, i);
+        }
+        i = i + 1;
+    }
+    let names = vec_new();
+    vec_push(names, "s");
+    let types = vec_new();
+    vec_push(types, ty_string);
+    let rts = vec_new();
+    vec_push(rts, t);
+    let f = lifted_fn("keydec", names, types, rts);
+    vec_push(key_dec_types, t);
+    vec_push(key_dec_fns, f);
+    let saved_fn = ck_fn;
+    ck_fn = f;
+    let pos = 0;
+    let s = vec_get(f[F_LOCALS], 0);
+    let body = f[F_BODY][BLK_STMTS];
+    let obj = temp(pos, rt_call(pos, "rt_alloc", args1(mk_int(pos, t[TY_SIZE], ty_int)), t), t);
+    vec_push(body, obj);
+    if t[TY_ENUM] {
+        key_dec_field(pos, body, s, obj[LET_SYM], t, 0);
+        let vs = t[TY_ENUM];
+        let vi = 0;
+        while vi < vs[VEC_LEN] {
+            let v = vec_get(vs, vi);
+            let ifs = node_new(ST_IF, pos);
+            ifs[IF_COND] = mk_bin(pos, "==", mk_mem(pos, sym_ref_node(pos, obj[LET_SYM]), 0, 0, field_offset(t, 0), ty_int), mk_int(pos, vi, ty_int), ty_bool);
+            ifs[IF_THEN] = empty_block(pos);
+            let k = 0;
+            while k < vec_get(v, 2) {
+                key_dec_field(pos, ifs[IF_THEN][BLK_STMTS], s, obj[LET_SYM], t, vec_get(v, 1) + k);
+                k = k + 1;
+            }
+            vec_push(body, ifs);
+            vi = vi + 1;
+        }
+    } else {
+        let fi = 0;
+        while fi < t[TY_FIELDS][VEC_LEN] {
+            key_dec_field(pos, body, s, obj[LET_SYM], t, fi);
+            fi = fi + 1;
+        }
+    }
+    let ret = node_new(ST_RETURN, pos);
+    ret[RET_VALUE] = sym_ref_node(pos, obj[LET_SYM]);
+    vec_push(body, ret);
+    ck_fn = saved_fn;
+    return f;
+}
+
+fn key_dec_field(pos, body, s, obj, t, fi) {
+    let ft = field_type(t, fi);
+    let k = kind_of(ft);
+    let v = 0;
+    if k == K_BOOL {
+        v = mk_conv(pos, rt_call(pos, "rt_kd_word", args1(sym_ref_node(pos, s)), ty_int), CV_SAME, ft);
+    } else if k == K_STRING {
+        v = rt_call(pos, "rt_kd_str", args1(sym_ref_node(pos, s)), ty_string);
+    } else if is_float_t(ft) {
+        v = mk_conv(pos, rt_call(pos, "rt_kd_word", args1(sym_ref_node(pos, s)), ty_int), CV_BITS2F, ft);
+    } else if k == K_STRUCT {
+        v = call_fn(pos, key_dec_fn(ft), args1(sym_ref_node(pos, s)), ft);
+    } else {
+        v = mk_conv(pos, rt_call(pos, "rt_kd_word", args1(sym_ref_node(pos, s)), ty_int), CV_INT, ft);
+    }
+    vec_push(body, assign_stmt(pos, field_store(pos, sym_ref_node(pos, obj), t, fi), v));
+}
+
 // map_read is m[k]: a missing key reads as the value type's zero, and a str, slice, map
 // or struct zero is a real (never nil) value.
 fn map_read(pos, m, k, vt) {
-    let get = from_bits(rt_call(pos, "rt_map_get", args2(m, to_bits(k)), ty_int), vt);
+    let get = from_bits(rt_call(pos, "rt_map_get", args2(m, key_in(k, m[N_TYPE][TY_KEY])), ty_int), vt);
     let vk = kind_of(vt);
     if ck_legacy || !(vk == K_STRING || vk == K_SLICE || vk == K_MAP || vk == K_STRUCT) {
         return get;
@@ -1207,7 +1442,7 @@ fn chk_composite(e, want) {
         return t;
     }
     if k == K_MAP {
-        let m = temp(pos, rt_call(pos, "rt_map_make", args1(mk_int(pos, kind_of(t[TY_KEY]) == K_STRING, ty_int)), t), t);
+        let m = temp(pos, rt_call(pos, "rt_map_make", args1(mk_int(pos, map_str_keys(t[TY_KEY]), ty_int)), t), t);
         vec_push(stmts, m);
         let i = 0;
         while i < elems[VEC_LEN] {
@@ -1227,7 +1462,7 @@ fn chk_composite(e, want) {
             if is_untyped(vt) {
                 reconvert(v, t[TY_ELEM]);
             }
-            vec_push(stmts, expr_stmt(rt_call(pos, "rt_map_set", args3(sym_ref_node(pos, m[LET_SYM]), to_bits(key), to_bits(v)), ty_void)));
+            vec_push(stmts, expr_stmt(map_set_call(pos, sym_ref_node(pos, m[LET_SYM]), key, v, t[TY_KEY])));
             i = i + 1;
         }
         replace_node(e, mk_seq(pos, stmts, sym_ref_node(pos, m[LET_SYM]), 0));
@@ -1749,7 +1984,7 @@ fn chk_builtin(e, name, want) {
             return t;
         }
         if k == K_MAP {
-            replace_node(e, rt_call(pos, "rt_map_make", args1(mk_int(pos, kind_of(t[TY_KEY]) == K_STRING, ty_int)), t));
+            replace_node(e, rt_call(pos, "rt_map_make", args1(mk_int(pos, map_str_keys(t[TY_KEY]), ty_int)), t));
             return t;
         }
         err_type(pos, "cannot make ", t, "");
@@ -1803,7 +2038,7 @@ fn chk_builtin(e, name, want) {
         if is_untyped(kt) {
             reconvert(vec_get(args, 1), mt[TY_KEY]);
         }
-        replace_node(e, rt_call(pos, "rt_map_del", args2(arg0(e), to_bits(vec_get(args, 1))), ty_void));
+        replace_node(e, rt_call(pos, "rt_map_del", args2(arg0(e), key_in(vec_get(args, 1), mt[TY_KEY])), ty_void));
         return ty_void;
     }
     if streq(name, "copy") {
@@ -2303,7 +2538,7 @@ fn argo_new(pos, body, t) {
         return rt_call(pos, "rt_slice_make", args3(mk_int(pos, 0, ty_int), mk_int(pos, 0, ty_int), mk_int(pos, elem_size(t), ty_int)), t);
     }
     if k == K_MAP {
-        return rt_call(pos, "rt_map_make", args1(mk_int(pos, kind_of(t[TY_KEY]) == K_STRING, ty_int)), t);
+        return rt_call(pos, "rt_map_make", args1(mk_int(pos, map_str_keys(t[TY_KEY]), ty_int)), t);
     }
     if k != K_STRUCT {
         return mk_int(pos, 0, t);
@@ -2772,6 +3007,8 @@ fn say_arg(a, prefix) {
             st = t[TY_ELEM];
         }
         return say_struct(a, st, prefix);
+    } else if k == K_MAP && key_composite(t[TY_KEY]) {
+        return say_map_keyed(a, t, prefix);
     } else if k == K_MAP {
         let kk = kind_of(t[TY_KEY]) == K_STRING;
         let vk = 0;
@@ -2875,6 +3112,52 @@ fn say_enum(a, t, prefix) {
     let stmts = vec_new();
     vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "argsep", ""), vec_new(), ty_void)));
     vec_push(stmts, expr_stmt(call_fn(pos, say_enum_fn(t, prefix), args1(a), ty_void)));
+    vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "argend", ""), vec_new(), ty_void)));
+    return mk_seq(pos, stmts, mk_int(pos, 0, ty_int), ty_void);
+}
+
+// say_map_keyed prints a map with struct or enum keys as map[k:v ...] in insertion order.
+fn say_map_keyed(a, t, prefix) {
+    let pos = a[N_POS];
+    let stmts = vec_new();
+    vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "argsep", ""), vec_new(), ty_void)));
+    let m = temp(pos, a, t);
+    vec_push(stmts, m);
+    let n = temp(pos, rt_call(pos, "rt_map_slots", args1(sym_ref_node(pos, m[LET_SYM])), ty_int), ty_int);
+    vec_push(stmts, n);
+    let first = declare_local(pos, "$", ty_bool);
+    vec_push(stmts, let_stmt(pos, first, mk_int(pos, 1, ty_bool)));
+    vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, "map[")), ty_void)));
+    let j = declare_local(pos, "$", ty_int);
+    vec_push(stmts, let_stmt(pos, j, mk_int(pos, 0, ty_int)));
+    let w = node_new(ST_WHILE, pos);
+    w[WH_COND] = mk_bin(pos, "<", sym_ref_node(pos, j), sym_ref_node(pos, n[LET_SYM]), ty_bool);
+    w[WH_POST] = assign_stmt(pos, sym_ref_node(pos, j), mk_bin(pos, "+", sym_ref_node(pos, j), mk_int(pos, 1, ty_int), ty_int));
+    let wb = empty_block(pos);
+    w[WH_BODY] = wb;
+    let live = node_new(ST_IF, pos);
+    live[IF_COND] = rt_call(pos, "rt_map_live", args2(sym_ref_node(pos, m[LET_SYM]), sym_ref_node(pos, j)), ty_bool);
+    live[IF_THEN] = empty_block(pos);
+    let lb = live[IF_THEN][BLK_STMTS];
+    let sep = node_new(ST_IF, pos);
+    sep[IF_COND] = mk_unot(pos, sym_ref_node(pos, first));
+    sep[IF_THEN] = empty_block(pos);
+    vec_push(sep[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, " ")), ty_void)));
+    vec_push(lb, sep);
+    vec_push(lb, assign_stmt(pos, sym_ref_node(pos, first), mk_int(pos, 0, ty_bool)));
+    let kt = t[TY_KEY];
+    let kv = key_out(rt_call(pos, "rt_map_key", args2(sym_ref_node(pos, m[LET_SYM]), sym_ref_node(pos, j)), ty_int), kt);
+    if kt[TY_ENUM] {
+        vec_push(lb, expr_stmt(call_fn(pos, say_enum_fn(kt, prefix), args1(kv), ty_void)));
+    } else {
+        vec_push(lb, expr_stmt(say_struct(kv, kt, prefix)));
+    }
+    vec_push(lb, expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, ":")), ty_void)));
+    let vv = from_bits(rt_call(pos, "rt_map_val", args2(sym_ref_node(pos, m[LET_SYM]), sym_ref_node(pos, j)), ty_int), t[TY_ELEM]);
+    vec_push(lb, expr_stmt(say_arg(vv, prefix)));
+    vec_push(wb[BLK_STMTS], live);
+    vec_push(stmts, w);
+    vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, "]")), ty_void)));
     vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "argend", ""), vec_new(), ty_void)));
     return mk_seq(pos, stmts, mk_int(pos, 0, ty_int), ty_void);
 }

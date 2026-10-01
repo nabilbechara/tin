@@ -530,6 +530,12 @@ Package sift sorts and searches slices (like Go's sort and slices); without gene
 - `IndexInts(xs []i64, x i64) i64`: IndexInts returns the index of the first x in xs, or -1.
 - `ContainsStr(xs []str, x str) bool`: ContainsStr reports whether x occurs in xs.
 - `EqualInts(a []i64, b []i64) bool`: EqualInts reports whether a and b have the same length and elements.
+- `Keys[K any, V any](m map[K]V) []K`: Keys returns m's keys in insertion order.
+- `Values[K any, V any](m map[K]V) []V`: Values returns m's values in insertion order.
+- `SortedKeys[K i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | str, V any](m map[K]V) []K`: SortedKeys returns m's keys sorted ascending.
+- `Map[T any, U any](xs []T, f func(T) U) []U`: Map returns f applied to each element of xs.
+- `Filter[T any](xs []T, keep func(T) bool) []T`: Filter returns the elements of xs for which keep returns true, in order.
+- `Reduce[T any, A any](xs []T, start A, f func(A, T) A) A`: Reduce folds xs into one value: f(f(f(start, x0), x1), ...).
 
 ## cairn
 

@@ -245,7 +245,11 @@ fn resolve_type(tx) {
         return slice_of(resolve_type(tx[TX_A + (k == TX_ARRAY)]));
     }
     if k == TX_MAP {
-        return map_of(resolve_type(tx[TX_A]), resolve_type(tx[TX_B]));
+        let mkt = resolve_type(tx[TX_A]);
+        if !ck_legacy && !key_valid(mkt, vec_new()) {
+            err_type(tx[N_POS], "a map key must compare by value (str, numbers, bool, or structs and enums of those), not ", mkt, "");
+        }
+        return map_of(mkt, resolve_type(tx[TX_B]));
     }
     if k == TX_PTR {
         return resolve_type(tx[TX_A]);
@@ -1876,7 +1880,7 @@ fn check_assign(s) {
             if is_untyped(vt) {
                 reconvert(v, xt[TY_ELEM]);
             }
-            let store = rt_call(s[N_POS], "rt_map_set", args3(tx, to_bits(ti), to_bits(v)), ty_void);
+            let store = map_set_call(s[N_POS], tx, ti, v, xt[TY_KEY]);
             store[CALL_STORE] = 1;
             replace_node(s, expr_stmt(store));
             return;
@@ -2473,7 +2477,7 @@ fn lower_range(s) {
         live[IF_THEN] = skip;
         vec_push(pre, live);
         if key {
-            let kv = from_bits(rt_call(pos, "rt_map_key", args2(sym_ref_node(pos, ss), sym_ref_node(pos, i)), ty_int), xt[TY_KEY]);
+            let kv = key_out(rt_call(pos, "rt_map_key", args2(sym_ref_node(pos, ss), sym_ref_node(pos, i)), ty_int), xt[TY_KEY]);
             vec_push(pre, range_bind(pos, key, kv, xt[TY_KEY], s[RG_DEFINE]));
         }
         if val {
@@ -3296,13 +3300,21 @@ fn keep_fn(t) {
         live[IF_THEN] = empty_block(pos);
         let kv = from_bits(rt_call(pos, "rt_map_key", args2(sym_ref_node(pos, x), sym_ref_node(pos, j)), ty_int), t[TY_KEY]);
         let vv = from_bits(rt_call(pos, "rt_map_val", args2(sym_ref_node(pos, x), sym_ref_node(pos, j)), ty_int), t[TY_ELEM]);
-        if is_ref(t[TY_KEY]) {
+        let kc = key_composite(t[TY_KEY]);
+        if kc {
+            // An encoded key: rt_map_setk copies its bytes into the kept map.
+            kv = from_bits(rt_call(pos, "rt_map_key", args2(sym_ref_node(pos, x), sym_ref_node(pos, j)), ty_int), ty_string);
+        } else if is_ref(t[TY_KEY]) {
             kv = keep_call(pos, keep_fn(t[TY_KEY]), kv, t[TY_KEY]);
         }
         if is_ref(t[TY_ELEM]) && kind_of(t[TY_ELEM]) != K_FUNC {
             vv = keep_call(pos, keep_fn(t[TY_ELEM]), vv, t[TY_ELEM]);
         }
-        vec_push(live[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, "rt_map_set", args3(sym_ref_node(pos, out[LET_SYM]), to_bits(kv), to_bits(vv)), ty_void)));
+        let setname = "rt_map_set";
+        if kc {
+            setname = "rt_map_setk";
+        }
+        vec_push(live[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, setname, args3(sym_ref_node(pos, out[LET_SYM]), to_bits(kv), to_bits(vv)), ty_void)));
         vec_push(wb[BLK_STMTS], live);
         vec_push(body, w);
         ret[RET_VALUE] = sym_ref_node(pos, out[LET_SYM]);

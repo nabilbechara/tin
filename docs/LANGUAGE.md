@@ -166,8 +166,17 @@ Use `keep(x)` (a deep copy into long-lived memory) or explicit copies (`copy`,
 - `m[k]` reads (a missing key reads as V's zero value: 0, `""`, an empty slice, a new
   empty struct or map); `v, ok := m[k]` also reports presence; `m[k] = v` writes;
   `m[k] += 1` updates; `delete(m, k)` removes; `len(m)` counts.
-- `for k, v := range m` iterates in table order (not sorted, not random).
-- Keys are `str` or integer types.
+- `for k, v := range m` iterates in **insertion order**: a new key goes last, updating a
+  key keeps its place, and deleting then re-adding moves it to the end. JSON output and
+  `sift.Keys` / `sift.Values` follow the same order; printing a map sorts str and number
+  keys like Go.
+- Keys are `str`, integers, `bool`, `f64` (by bits), or structs and enums made only of
+  those, which hash and compare **by value**. A struct key is copied in, so changing the
+  original afterwards does not change the map. Slices, maps, funcs, optionals and faults
+  cannot be keys (compile error).
+- `sift.Keys(m)`, `sift.Values(m)`, `sift.SortedKeys(m)` return the keys or values as a
+  slice; `sift.Map(xs, f)`, `sift.Filter(xs, keep)` and `sift.Reduce(xs, start, f)` work on
+  any slice.
 
 ### Structs
 

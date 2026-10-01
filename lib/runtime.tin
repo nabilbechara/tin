@@ -822,33 +822,43 @@ func rt_copy_str(dst i64, s str) i64 {
 
 // ---- maps ----
 //
-// Open addressing with linear probing and Fibonacci hashing. Header words: count, cap,
-// keys, values, control bytes (0 empty, 1 full, 2 deleted), str keys?, shift,
-// tombstones, cached str hashes.
+// Insertion-ordered: entries are appended to arrays (keys, values, cached str hashes, a
+// live byte each) and found through an open-addressing index of entry numbers (0 empty,
+// -1 deleted, else entry+1) with Fibonacci hashing and linear probing. The index has twice
+// as many slots as there are entries, so it is never more than half full. Header words:
+// count, index slots, keys, values, index, str keys?, shift, index tombstones, hashes,
+// ingot, entries used, entry capacity, live bytes.
 
 func rt_map_make(isstr i64) i64 {
 	ingot := __ctx()[ctxIngot]
-	m := rt_region_alloc(ingot, 80)
+	m := rt_region_alloc(ingot, 104)
 	m[5] = isstr
 	m[9] = ingot
 	rt_map_init(m, 8)
 	return m
 }
 
-func rt_map_init(m i64, c i64) {
-	m[1] = c
-	m[2] = rt_region_alloc(m[9], c*8)
-	m[3] = rt_region_alloc(m[9], c*8)
-	m[4] = rt_region_alloc(m[9], c)
+// rt_map_init gives m room for ec entries (an index of 2*ec slots), empty.
+func rt_map_init(m i64, ec i64) {
+	ic := ec * 2
+	m[0] = 0
+	m[1] = ic
+	m[2] = rt_region_alloc(m[9], ec*8)
+	m[3] = rt_region_alloc(m[9], ec*8)
+	m[4] = rt_region_alloc(m[9], ic*8)
 	shift := 64
-	for x := c; x > 1; x >>= 1 {
+	for x := ic; x > 1; x >>= 1 {
 		shift--
 	}
 	m[6] = shift
 	m[7] = 0
+	m[8] = 0
 	if m[5] != 0 {
-		m[8] = rt_region_alloc(m[9], c*8)
+		m[8] = rt_region_alloc(m[9], ec*8)
 	}
+	m[10] = 0
+	m[11] = ec
+	m[12] = rt_region_alloc(m[9], ec)
 }
 
 func rt_hash_str(s str) i64 {
@@ -874,37 +884,58 @@ func rt_hash_str(s str) i64 {
 	return h
 }
 
-// rt_map_find returns the slot holding key k, or -1.
-func rt_map_find(m i64, k i64) i64 {
-	mask := m[1] - 1
-	ctrl := m[4]
-	keys := m[2]
+// rt_map_hash is key k's hash: the str hash, or the integer times the golden ratio.
+func rt_map_hash(m i64, k i64) i64 {
 	if m[5] != 0 {
-		h := rt_hash_str(cast(str, k))
-		hashes := m[8]
-		i := lsr(h, m[6])
+		return rt_hash_str(cast(str, k))
+	}
+	return k * 0x9E3779B97F4A7C15
+}
+
+// An index slot holds 0 (empty), -1 (deleted) or fp<<32 | entry+1, fp being 31 hash bits,
+// so a probe compares keys only when the fingerprints match.
+func rt_map_fp(h i64) i64 {
+	return (h & 0x7fffffff) << 32
+}
+
+// rt_map_slot returns the index slot holding key k (hash h), or -1.
+func rt_map_slot(m i64, k i64, h i64) i64 {
+	mask := m[1] - 1
+	idx := m[4]
+	keys := m[2]
+	fp := rt_map_fp(h)
+	i := lsr(h, m[6])
+	if m[5] != 0 {
 		for {
-			c := load8(ctrl + i)
-			if c == 0 {
+			v := idx[i]
+			if v == 0 {
 				return -1
 			}
-			if c == 1 && hashes[i] == h && rt_str_eq(cast(str, keys[i]), cast(str, k)) {
+			if v > 0 && v&-4294967296 == fp && rt_str_eq(cast(str, keys[(v&0xffffffff)-1]), cast(str, k)) {
 				return i
 			}
 			i = (i + 1) & mask
 		}
 	}
-	i := lsr(k*0x9E3779B97F4A7C15, m[6])
 	for {
-		c := load8(ctrl + i)
-		if c == 0 {
+		v := idx[i]
+		if v == 0 {
 			return -1
 		}
-		if c == 1 && keys[i] == k {
+		if v > 0 && v&-4294967296 == fp && keys[(v&0xffffffff)-1] == k {
 			return i
 		}
 		i = (i + 1) & mask
 	}
+}
+
+// rt_map_find returns the entry holding key k, or -1.
+func rt_map_find(m i64, k i64) i64 {
+	s := rt_map_slot(m, k, rt_map_hash(m, k))
+	if s < 0 {
+		return -1
+	}
+	return (m[4][s] & 0xffffffff) - 1
 }
 
 func rt_map_get(m i64, k i64) i64 {
@@ -913,123 +944,221 @@ func rt_map_get(m i64, k i64) i64 {
 		c[ctxFound] = 0
 		return 0
 	}
-	i := rt_map_find(m, k)
-	if i < 0 {
+	h := k * 0x9E3779B97F4A7C15
+	if m[5] != 0 {
+		h = rt_hash_str(cast(str, k))
+	}
+	sl := rt_map_slot(m, k, h)
+	if sl < 0 {
 		c[ctxFound] = 0
 		return 0
 	}
 	c[ctxFound] = 1
-	return m[3][i]
+	return m[3][(m[4][sl]&0xffffffff)-1]
 }
 
 func rt_map_found() bool {
 	return __ctx()[ctxFound] != 0
 }
 
+// rt_map_index puts entry e (hash h) into the first free or deleted index slot.
+func rt_map_index(m i64, e i64, h i64) {
+	mask := m[1] - 1
+	idx := m[4]
+	i := lsr(h, m[6])
+	for idx[i] > 0 {
+		i = (i + 1) & mask
+	}
+	if idx[i] < 0 {
+		m[7]--
+	}
+	idx[i] = rt_map_fp(h) | (e + 1)
+}
+
+// rt_map_grow rebuilds m with room for twice its live entries, keeping their order.
 func rt_map_grow(m i64) {
-	oc := m[1]
 	okeys := m[2]
 	ovals := m[3]
-	octrl := m[4]
-	nc := oc
-	if (m[0]+1)*2 > oc {
-		nc = oc * 2
-	}
+	oidx := m[4]
 	ohashes := m[8]
-	rt_map_init(m, nc)
-	m[0] = 0
-	for i := 0; i < oc; i++ {
-		if load8(octrl+i) == 1 {
-			rt_map_insert(m, okeys[i], ovals[i])
+	olive := m[12]
+	used := m[10]
+	n := m[0]
+	ec := 8
+	for ec < (n+1)*2 {
+		ec *= 2
+	}
+	rt_map_init(m, ec)
+	for j := 0; j < used; j++ {
+		if load8(olive+j) == 1 {
+			e := m[10]
+			m[2][e] = okeys[j]
+			m[3][e] = ovals[j]
+			store8(m[12]+e, 1)
+			h := 0
+			if m[5] != 0 {
+				h = ohashes[j]
+				m[8][e] = h
+			} else {
+				h = rt_map_hash(m, okeys[j])
+			}
+			rt_map_index(m, e, h)
+			m[10] = e + 1
 		}
 	}
-	// Map tables are never shared, so a long-lived map frees the old one.
+	m[0] = n
+	// Map tables are never shared, so a long-lived map frees the old ones.
 	if m[9] != 0 {
 		rt_ingot_free(okeys)
 		rt_ingot_free(ovals)
-		rt_ingot_free(octrl)
-		rt_ingot_free(ohashes)
-	}
-}
-
-// rt_map_insert stores k, v, assuming the table has room and k is absent or present.
-func rt_map_insert(m i64, k i64, v i64) {
-	mask := m[1] - 1
-	ctrl := m[4]
-	keys := m[2]
-	h := 0
-	i := 0
-	if m[5] != 0 {
-		h = rt_hash_str(cast(str, k))
-		i = lsr(h, m[6])
-	} else {
-		i = lsr(k*0x9E3779B97F4A7C15, m[6])
-	}
-	free := -1
-	for {
-		c := load8(ctrl + i)
-		if c == 0 {
-			break
+		rt_ingot_free(oidx)
+		rt_ingot_free(olive)
+		if ohashes != 0 {
+			rt_ingot_free(ohashes)
 		}
-		if c == 2 {
-			if free < 0 {
-				free = i
-			}
-		} else if m[5] != 0 {
-			if m[8][i] == h && rt_str_eq(cast(str, keys[i]), cast(str, k)) {
-				m[3][i] = v
-				return
-			}
-		} else if keys[i] == k {
-			m[3][i] = v
-			return
-		}
-		i = (i + 1) & mask
 	}
-	if free >= 0 {
-		i = free
-		m[7]--
-	}
-	store8(ctrl+i, 1)
-	keys[i] = k
-	m[3][i] = v
-	if m[5] != 0 {
-		m[8][i] = h
-	}
-	m[0]++
 }
 
 func rt_map_set(m i64, k i64, v i64) {
 	if m == 0 {
 		rt_panic("assignment to entry in nil map")
 	}
-	if (m[0]+m[7]+1)*4 > m[1]*3 {
+	if m[10] == m[11] {
 		rt_map_grow(m)
 	}
-	rt_map_insert(m, k, v)
+	h := rt_map_hash(m, k)
+	fp := rt_map_fp(h)
+	mask := m[1] - 1
+	idx := m[4]
+	keys := m[2]
+	str_keys := m[5] != 0
+	i := lsr(h, m[6])
+	tomb := -1
+	for {
+		x := idx[i]
+		if x == 0 {
+			break
+		}
+		if x < 0 {
+			if tomb < 0 {
+				tomb = i
+			}
+		} else if x&-4294967296 == fp {
+			e0 := (x & 0xffffffff) - 1
+			if (str_keys && rt_str_eq(cast(str, keys[e0]), cast(str, k))) || (!str_keys && keys[e0] == k) {
+				m[3][e0] = v
+				return
+			}
+		}
+		i = (i + 1) & mask
+	}
+	if tomb >= 0 {
+		i = tomb
+		m[7]--
+	}
+	e := m[10]
+	keys[e] = k
+	m[3][e] = v
+	store8(m[12]+e, 1)
+	if str_keys {
+		m[8][e] = h
+	}
+	m[10] = e + 1
+	m[0]++
+	idx[i] = fp | (e + 1)
+}
+
+// rt_map_setk is rt_map_set for a key encoded as a str (a struct or enum key): the key's
+// bytes are copied into the map's own region, so the map never refers to the caller's.
+func rt_map_setk(m i64, k str, v i64) {
+	if m == 0 {
+		rt_panic("assignment to entry in nil map")
+	}
+	if rt_map_find(m, cast(i64, k)) < 0 {
+		n := len(k)
+		p := rt_region_alloc(m[9], n+9)
+		p[0] = n
+		memcpy(p+8, cast(i64, k)+8, n)
+		k = cast(str, p)
+	}
+	rt_map_set(m, cast(i64, k), v)
+}
+
+// ---- map keys encoded as bytes (struct and enum keys compare by value) ----
+
+var kdOff i64 // per core: where rt_kd_* reads next
+
+func rt_kb_new() i64 {
+	return rt_slice_make(0, 32, 1)
+}
+
+// rt_kb_word appends v's 8 bytes to byte slice b.
+func rt_kb_word(b i64, v i64) i64 {
+	if b[0]+8 > b[1] {
+		rt_slice_grow(b, b[0]+8, 1)
+	}
+	(b[2] + b[0])[0] = v
+	b[0] += 8
+	return b
+}
+
+// rt_kb_str appends s's length and bytes to byte slice b.
+func rt_kb_str(b i64, s str) i64 {
+	n := len(s)
+	b = rt_kb_word(b, n)
+	if b[0]+n > b[1] {
+		rt_slice_grow(b, b[0]+n, 1)
+	}
+	memcpy(b[2]+b[0], cast(i64, s)+8, n)
+	b[0] += n
+	return b
+}
+
+func rt_kb_done(b i64) str {
+	return rt_str_from_raw(b[2], b[0])
+}
+
+func rt_kd_begin() {
+	kdOff = 0
+}
+
+func rt_kd_word(s str) i64 {
+	v := (cast(i64, s) + 8 + kdOff)[0]
+	kdOff += 8
+	return v
+}
+
+func rt_kd_str(s str) str {
+	n := rt_kd_word(s)
+	r := rt_str_from_raw(cast(i64, s)+8+kdOff, n)
+	kdOff += n
+	return r
 }
 
 func rt_map_del(m i64, k i64) {
 	if m == 0 {
 		return
 	}
-	i := rt_map_find(m, k)
-	if i >= 0 {
-		store8(m[4]+i, 2)
+	s := rt_map_slot(m, k, rt_map_hash(m, k))
+	if s >= 0 {
+		e := (m[4][s] & 0xffffffff) - 1
+		store8(m[12]+e, 0)
+		m[4][s] = -1
 		m[0]--
 		m[7]++
 	}
 }
 
+// rt_map_slots is how many entries a range over m walks (live and deleted, in order).
 func rt_map_slots(m i64) i64 {
 	if m == 0 {
 		return 0
 	}
-	return m[1]
+	return m[10]
 }
 
 func rt_map_live(m i64, i i64) bool {
-	return load8(m[4]+i) == 1
+	return load8(m[12]+i) == 1
 }
 
 func rt_map_key(m i64, i i64) i64 {
@@ -1939,7 +2068,7 @@ func rt_keep_slice(s i64, esz i64) i64 {
 }
 
 func rt_keep_map_new(m i64) i64 {
-	k := rt_ingot_alloc(80)
+	k := rt_ingot_alloc(104)
 	k[5] = m[5]
 	k[9] = 1
 	rt_map_init(k, 8)

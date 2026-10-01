@@ -22,7 +22,7 @@ the compiler: write a minimal repro to notes/compiler_bugs_NAME.md and work arou
   `import "NAME"`, called as `NAME.Func`). `import "./geom"` imports a local file or directory
   package. Capitalized names, methods and fields are exported; lower-case ones are private to their package.
 - Types: i8 i16 i32 i64 u8 u16 u32 u64, f64, bool, str (immutable bytes), [N]T arrays, []T (reference
-  header; append mutates it in place and returns it), map[K]V (K = str or integer), struct (reference,
+  header; append mutates it in place and returns it), map[K]V (K = str, ints, bool, f64, or structs/enums of those, by value; insertion-ordered), struct (reference,
   never nil; == compares identity), ?T optional (may be nil), fault (error; nil = ok), func(...) values
   (top-level functions or literals without captures).
 - No implicit conversions: i64(x), u8(x), f64(x), str(c) for a rune/byte, str(bytes []u8). Untyped
