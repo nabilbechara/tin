@@ -41,18 +41,12 @@ Files: `selfhost/asm_x64.tin` (encoder, fuzzed against objdump: `tools/x64fuzz/r
 
 1. Legacy program (lib/std.tin + fn main calling puts): REACHED. argc/argv/exit code correct.
 2. tests/v2/hello.tin: REACHED (output identical to hello.out).
-3. tests/v2 on amd64 (`tools/x64fuzz/linuxtest_amd64.sh`, with `TIN_ROOT` pointing at a copy of
-   the tree with `notes/patch_x64_runtime.md` + `notes/patch_x64_seal.md` applied):
-   27 of 31 pass (cores defer dice fixes fixes2 flume gauge generics glyph hearth hello herald
-   json jsonget mint ore regions relay seal sift stamp syntax tide trail twine wire zeros).
+3. tests/v2 on amd64 (`tools/x64fuzz/linuxtest_amd64.sh`): every test and every
+   tests/regressions case passes (after #1, #13, #14, #12). The cairn, lever and quarry failures
+   were not stack arguments: `x_gen_elem_addr` set `mm_scale` before generating the index, and an
+   index containing another access (`s[len(s)-1]`) reset it to 1 (#12, `nested-index.tin`).
    Legacy tests/*.tin: 13 of 13 pass after the argument-order fix (optimizer's `deep_calls`
-   needs left-to-right evaluation of effectful arguments; verified only on the old binary's
-   failure, rerun is part of "next steps").
-   FAILING: `cairn` (segfault), `lever` (segfault; `lever.Str("name", ...)` alone crashes, see
-   scratch micro test b), `quarry` (one value: `names[len(names)-1]` as the 7th argument of
-   say.Line prints names[6] instead of the last element: a 7+-argument call / stack-argument
-   bug, micro test c with 7- and 8-argument functions also segfaults), `seal` passes only with
-   the seal patch.
+   needs left-to-right evaluation of effectful arguments).
 4. Self-hosting: REACHED. `bin/tinc -target linux-amd64 -o tinc_amd64 $(make -s print-SELF_LINUX)`
    (0.14 s on the Mac), then in the container tinc_amd64 rebuilt itself to s2 and s2 to s3:
    s2 == s3 == tinc_amd64 byte for byte (587384 bytes). The compiler never needs the failing
@@ -64,10 +58,8 @@ Files: `selfhost/asm_x64.tin` (encoder, fuzzed against objdump: `tools/x64fuzz/r
 
 - Strict division by zero panics like arm64 (#13), covered by the `div-*`/`rem-*` cases in
   tests/regressions; `tools/x64fuzz/linuxtest_amd64.sh` now also runs those cases in the container.
-- The three failures above (cairn, lever, 7+-argument calls). Likely area: the stack-argument
-  path in `x_gen_call` (slot offsets `16*i + callee_slot + 8*j`) and/or stack parameters in
-  `x_entry_moves` ([rbp+16+8k]); `lever.Str` crashing with 3 args suggests something else too
-  (struct return / `register` with many fields?). Debug with gdb: build an image once with
+- Address and compare state (`mm_*`, `cmp_unord`) is set only after the subexpressions are
+  generated, since those may reset the globals. Debug crashes with gdb: build an image once with
   `docker run --platform linux/amd64 --name b tin-debian-amd64 sh -c 'apt-get update -qq && apt-get install -y -qq gdb' && docker commit b x64dbg:local && docker rm b`
   then `docker run --rm --platform linux/amd64 -v DIR:/w x64dbg:local gdb -batch -ex run -ex bt /w/prog`.
 - A compiler running on Linux x86-64 defaults to linux-amd64 (#15; `host_is_x64` reads

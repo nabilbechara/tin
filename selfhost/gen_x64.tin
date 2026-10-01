@@ -734,9 +734,10 @@ fn x_gen_compare(e, d) {
     let l = e[BIN_L];
     let r = e[BIN_R];
     let op = e[BIN_OP];
-    cmp_unord = 0;
     if e_fp(l) || e_fp(r) {
         x_gen_pair(l, r, d);
+        // Set after the operands, which may contain comparisons of their own.
+        cmp_unord = 0;
         if streq(op, "<") || streq(op, "<=") {
             emit2(X_UCOMISD, pr, pl);
         } else {
@@ -773,6 +774,7 @@ fn x_gen_compare(e, d) {
         emit2(X_CMP, pl, pr);
     }
     cmp_cc = cc;
+    cmp_unord = 0;
 }
 
 fn x_gen_index_load(e, dst, d) {
@@ -910,16 +912,17 @@ fn x_gen_mem_addr(e, d) {
         off = off + const_val(ix) * scale;
         ix = 0;
     }
-    mm_index = -1;
-    mm_scale = 1;
+    // The address parts are set last: the index and length may contain other accesses.
+    let mi = -1;
+    let ms = 1;
     if ix {
         let idx = x_gen_val(ix, next_depth(base, d));
         if e[MEM_LEN] {
             x_bounds_check(idx, e[MEM_LEN], next_depth(idx, next_depth(base, d)));
         }
         if x_scale_ok(scale) {
-            mm_index = idx;
-            mm_scale = scale;
+            mi = idx;
+            ms = scale;
         } else {
             emit3(X_IMUL_RRI, XSCR, idx, scale);
             emit2(X_ADD, XSCR, base);
@@ -927,6 +930,8 @@ fn x_gen_mem_addr(e, d) {
         }
     }
     mm_base = base;
+    mm_index = mi;
+    mm_scale = ms;
     mm_off = off;
 }
 
@@ -955,7 +960,6 @@ fn x_gen_elem_addr(e, d) {
     if e[ELEM_STR] {
         first = 8;
     }
-    mm_scale = size;
     if is_const(ix) {
         let c = const_val(ix);
         if !e[ELEM_SAFE] {
@@ -970,6 +974,7 @@ fn x_gen_elem_addr(e, d) {
             mm_base = XSCR;
         }
         mm_index = -1;
+        mm_scale = size;
         mm_off = first + c * size;
         return;
     }
@@ -985,7 +990,9 @@ fn x_gen_elem_addr(e, d) {
         x_ld(XSCR, x_mem1(h, 16), 3);
         mm_base = XSCR;
     }
+    // Set after generating the index, which may itself be an element or field access.
     mm_index = idx;
+    mm_scale = size;
     mm_off = first;
 }
 
