@@ -29,6 +29,7 @@ Generated from the comments in `lib/*.tin` by `tools/gendoc.py`.
 | [crucible](#crucible) | testing helpers (testing) |
 | [redis](#redis) | Redis client (go-redis) |
 | [mysql](#mysql) | MySQL client (database/sql with go-sql-driver/mysql) |
+| [websocket](#websocket) | WebSocket server and client (gorilla/websocket) |
 
 ## say
 
@@ -66,6 +67,7 @@ func main() {
 - `ServeN(addr str, n i64, h func(Req, mut Out)) !`: ServeN is Serve on exactly n cores.
 - `Deadline(ms i64)`: Deadline makes every request's waits (tide.Wait, client calls) fail with "deadline exceeded" once ms have passed since the request started (0: no deadline; call before Serve). TIN_DEADLINE_MS sets it too; the default is 30000.
 - `(q Req) Header(name str) str`: Header returns the value of the request header name (any case), or "".
+- `(q Req) Hijack() !i64`: Hijack takes the request's connection out of HTTP for a protocol of its own (the websocket package uses it): the responses before this request are written, the core stops reading the connection and the request's deadline no longer applies. It returns the non-blocking descriptor, for the caller's I/O until the handler returns; then anvil closes it. The handler's Out is not sent.
 - `(q Req) Body() str`: Body returns the request body.
 - `(q Req) Param(name str) str`: Param returns query parameter name, %-decoded, or "".
 - `(w mut Out) Status(code i64)`: Status sets the response status code.
@@ -765,3 +767,31 @@ for _, r := range rows.Rows {
 - `(t mut Tx) Exec(q query) !Result`: Exec runs a statement in the transaction.
 - `(t mut Tx) Commit() !`: Commit makes the transaction's changes permanent.
 - `(t mut Tx) Rollback() !`: Rollback undoes the transaction's changes.
+
+## websocket
+
+Package websocket is the WebSocket protocol (RFC 6455): Accept upgrades an anvil request, Dial connects to a server. Messages are text or binary; pings are answered and fragments joined inside Read. Inside a request task a Read waits without blocking the core, so one core holds many idle connections.
+
+```go
+func handle(q anvil.Req, w mut anvil.Out) {
+	ws := websocket.Accept(q, mut w) catch _ { return }
+	for {
+		m := ws.Read() catch _ { return }
+		ws.WriteText("echo: {m.Data}") catch _ { return }
+	}
+}
+```
+
+- `type Message struct`: Message is one complete message.
+- `type Conn struct`: Conn is a WebSocket connection.
+- `Accept(q anvil.Req, w mut anvil.Out) !Conn`: Accept completes the opening handshake for request q and takes over its connection. A request that is not a WebSocket handshake gets a 400 (426 for another version) in w and fails. The connection closes when the handler returns.
+- `Dial(url str) !Conn`: Dial connects to a ws:// URL ("ws://host:port/path").
+- `(c Conn) SetTimeout(ns i64)`: SetTimeout limits every later read and write to ns nanoseconds (0: no limit).
+- `(c Conn) SetMaxMessage(n i64)`: SetMaxMessage sets the largest message Read accepts (default 16 MiB); a bigger one closes the connection with 1009.
+- `(c Conn) WriteText(s str) !`: WriteText sends s as a text message.
+- `(c Conn) WriteBinary(b []u8) !`: WriteBinary sends b as a binary message.
+- `(c Conn) Ping() !`: Ping sends a ping; the peer's pong is consumed by Read.
+- `(c Conn) CloseWith(code i64, reason str) !`: CloseWith sends a close frame with code and reason; the connection then only drains.
+- `(c Conn) Close()`: Close sends a normal close (1000) and, for a client, closes the connection.
+- `IsClosed(err fault) bool`: IsClosed reports whether err is the normal end of a connection: the peer closed it.
+- `(c Conn) Read() !Message`: Read returns the next message; it answers pings and joins fragments on the way. When the peer closes, it answers the close and fails with "websocket: closed (code)".

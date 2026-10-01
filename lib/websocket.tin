@@ -1,0 +1,567 @@
+// Package websocket is the WebSocket protocol (RFC 6455): Accept upgrades an anvil request,
+// Dial connects to a server. Messages are text or binary; pings are answered and
+// fragments joined inside Read. Inside a request task a Read waits without blocking the
+// core, so one core holds many idle connections.
+//
+//	func handle(q anvil.Req, w mut anvil.Out) {
+//		ws := websocket.Accept(q, mut w) catch _ { return }
+//		for {
+//			m := ws.Read() catch _ { return }
+//			ws.WriteText("echo: {m.Data}") catch _ { return }
+//		}
+//	}
+package websocket
+
+import "anvil"
+import "glyph"
+import "say"
+import "seal"
+import "twine"
+import "wire"
+
+extern func close(fd i64) i64
+extern func strerror(e i64) i64
+
+// Message is one complete message.
+type Message struct {
+	Text bool // a text message (valid UTF-8); otherwise binary
+	Data str
+}
+
+// Conn is a WebSocket connection.
+type Conn struct {
+	open bool // false for the zero Conn
+	st   i64
+}
+
+// The connection's state, in malloc'd memory: it outlives the calls that use it.
+const sFd = 0
+const sClient = 1  // we are the client: our frames are masked, the server's are not
+const sBuf = 2     // bytes read and not yet used, from sS to sE
+const sS = 3
+const sE = 4
+const sCap = 5
+const sClosed = 6  // a close frame was sent
+const sTimeout = 7 // ns a read or write may wait (0: no limit)
+const sWriting = 8 // a task is writing a frame: others wait their turn
+const sOwnFd = 9   // Close closes the descriptor (Dial); anvil closes Accept's
+const sMax = 10    // the largest message accepted
+const stWords = 11
+
+const guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+const opCont = 0
+const opText = 1
+const opBinary = 2
+const opClose = 8
+const opPing = 9
+const opPong = 10
+
+func new_state(fd i64, client bool) i64 {
+	st := calloc(stWords, 8)
+	st[sFd] = fd
+	st[sClient] = i64(client)
+	st[sCap] = 16384
+	st[sBuf] = malloc(st[sCap])
+	st[sMax] = 16 << 20
+	return st
+}
+
+func accept_key(key str) str {
+	return seal.B64(seal.Sha1(key + guid))
+}
+
+func has_token(v str, tok str) bool {
+	for _, part := range twine.Split(v, ",") {
+		if twine.EqualFold(twine.TrimSpace(part), tok) {
+			return true
+		}
+	}
+	return false
+}
+
+// Accept completes the opening handshake for request q and takes over its connection. A
+// request that is not a WebSocket handshake gets a 400 (426 for another version) in w and
+// fails. The connection closes when the handler returns.
+func Accept(q anvil.Req, w mut anvil.Out) !Conn {
+	key := q.Header("Sec-WebSocket-Key")
+	if q.Method != "GET" || !has_token(q.Header("Upgrade"), "websocket") || !has_token(q.Header("Connection"), "upgrade") || key == "" {
+		w.Status(400)
+		w.Text("not a websocket handshake")
+		fail "websocket: not a websocket handshake"
+	}
+	if q.Header("Sec-WebSocket-Version") != "13" {
+		w.Status(426)
+		w.Head("Sec-WebSocket-Version", "13")
+		w.Text("websocket version 13 only")
+		fail "websocket: unsupported version"
+	}
+	raw := seal.B64Decode(key) catch _ { []u8{} }
+	if len(raw) != 16 {
+		w.Status(400)
+		w.Text("bad Sec-WebSocket-Key")
+		fail "websocket: bad Sec-WebSocket-Key"
+	}
+	fd := try q.Hijack()
+	st := new_state(fd, false)
+	c := Conn{open: true, st: st}
+	err := c.write_all("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept_key(key)}\r\n\r\n")
+	if err != nil {
+		c.release()
+		fail err
+	}
+	return c
+}
+
+// Dial connects to a ws:// URL ("ws://host:port/path").
+func Dial(url str) !Conn {
+	if !twine.HasPrefix(url, "ws://") {
+		fail "websocket: only ws:// URLs (no TLS)"
+	}
+	rest := url[5:]
+	slash := twine.IndexByte(rest, '/')
+	host := rest
+	path := "/"
+	if slash >= 0 {
+		host = rest[:slash]
+		path = rest[slash:]
+	}
+	addr := host
+	if twine.IndexByte(host, ':') < 0 {
+		addr = host + ":80"
+	}
+	wc := try wire.Dial(addr)
+	st := new_state(wc.Fd(), true)
+	st[sOwnFd] = 1
+	c := Conn{open: true, st: st}
+	key := seal.B64(seal.RandomBytes(16))
+	err := c.write_all("GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+	if err != nil {
+		c.release()
+		fail err
+	}
+	// Read the response head; what follows it is the first frames.
+	for {
+		end := find_head_end(st)
+		if end >= 0 {
+			head := rt_str_from_raw(st[sBuf]+st[sS], end)
+			st[sS] += end + 4
+			lines := twine.Split(head, "\r\n")
+			if len(lines) == 0 || !twine.HasPrefix(lines[0], "HTTP/1.1 101") {
+				c.release()
+				first := ""
+				if len(lines) > 0 {
+					first = lines[0]
+				}
+				fail "websocket: the server refused the upgrade: {first}"
+			}
+			got := ""
+			for _, ln := range lines[1:] {
+				colon := twine.IndexByte(ln, ':')
+				if colon > 0 && twine.EqualFold(ln[:colon], "Sec-WebSocket-Accept") {
+					got = twine.TrimSpace(ln[colon+1:])
+				}
+			}
+			if got != accept_key(key) {
+				c.release()
+				fail "websocket: bad Sec-WebSocket-Accept"
+			}
+			return c
+		}
+		if st[sE]-st[sS] > 16384 {
+			c.release()
+			fail "websocket: response head too large"
+		}
+		rerr := c.fill()
+		if rerr != nil {
+			c.release()
+			fail rerr
+		}
+	}
+}
+
+func find_head_end(st i64) i64 {
+	p := st[sBuf] + st[sS]
+	n := st[sE] - st[sS]
+	for i := 0; i+3 < n; i++ {
+		if load8(p+i) == '\r' && load8(p+i+1) == '\n' && load8(p+i+2) == '\r' && load8(p+i+3) == '\n' {
+			return i
+		}
+	}
+	return -1
+}
+
+func (c Conn) release() {
+	st := c.st
+	if st[sOwnFd] != 0 && st[sFd] >= 0 {
+		close(st[sFd])
+		st[sFd] = -1
+	}
+	if st[sBuf] != 0 {
+		free(st[sBuf])
+		st[sBuf] = 0
+	}
+}
+
+// SetTimeout limits every later read and write to ns nanoseconds (0: no limit).
+func (c Conn) SetTimeout(ns i64) {
+	c.st[sTimeout] = ns
+}
+
+// SetMaxMessage sets the largest message Read accepts (default 16 MiB); a bigger one
+// closes the connection with 1009.
+func (c Conn) SetMaxMessage(n i64) {
+	c.st[sMax] = n
+}
+
+func os_msg(what str, e i64) str {
+	m := strerror(e)
+	return "websocket: {what}: {rt_str_from_raw(m, strlen(m))}"
+}
+
+func wait_fail(r i64) str {
+	if r == waitDeadline {
+		return "deadline exceeded"
+	}
+	return "websocket: timed out"
+}
+
+func (c Conn) write_raw(p i64, n i64) ! {
+	st := c.st
+	if st[sBuf] == 0 {
+		fail "websocket: the connection is closed"
+	}
+	for n > 0 {
+		k := write(st[sFd], p, n)
+		if k > 0 {
+			p += k
+			n -= k
+			continue
+		}
+		e := rt_errno()
+		if e == EINTR {
+			continue
+		}
+		if e != EAGAIN {
+			fail os_msg("write", e)
+		}
+		r := rt_task_wait(st[sFd], 2, st[sTimeout])
+		if r != waitReady {
+			fail wait_fail(r)
+		}
+	}
+}
+
+func (c Conn) write_all(s str) ! {
+	return try c.write_raw(cast(i64, s)+8, len(s))
+}
+
+// fill reads more bytes into the buffer.
+func (c Conn) fill() ! {
+	st := c.st
+	if st[sBuf] == 0 {
+		fail "websocket: the connection is closed"
+	}
+	if st[sS] > 0 && st[sS] == st[sE] {
+		st[sS] = 0
+		st[sE] = 0
+	}
+	if st[sE] == st[sCap] {
+		if st[sS] > 0 {
+			memmove(st[sBuf], st[sBuf]+st[sS], st[sE]-st[sS])
+			st[sE] -= st[sS]
+			st[sS] = 0
+		} else {
+			st[sCap] *= 2
+			st[sBuf] = realloc(st[sBuf], st[sCap])
+		}
+	}
+	for {
+		k := read(st[sFd], st[sBuf]+st[sE], st[sCap]-st[sE])
+		if k > 0 {
+			st[sE] += k
+			return
+		}
+		if k == 0 {
+			fail "websocket: closed (the peer went away)"
+		}
+		e := rt_errno()
+		if e == EINTR {
+			continue
+		}
+		if e != EAGAIN {
+			fail os_msg("read", e)
+		}
+		r := rt_task_wait(st[sFd], 1, st[sTimeout])
+		if r != waitReady {
+			fail wait_fail(r)
+		}
+	}
+}
+
+// need makes sure n bytes are buffered.
+func (c Conn) need(n i64) ! {
+	st := c.st
+	if st[sS]+n > st[sCap] {
+		memmove(st[sBuf], st[sBuf]+st[sS], st[sE]-st[sS])
+		st[sE] -= st[sS]
+		st[sS] = 0
+		if n > st[sCap] {
+			st[sCap] = n + 4096
+			st[sBuf] = realloc(st[sBuf], st[sCap])
+		}
+	}
+	for st[sE]-st[sS] < n {
+		try c.fill()
+	}
+}
+
+// frame sends one frame (the writer's turn is taken by the caller).
+func (c Conn) frame(op i64, p i64, n i64) ! {
+	st := c.st
+	hdr := calloc(2, 8)
+	h := 0
+	store8(hdr, 0x80|op)
+	mask := 0
+	if st[sClient] != 0 {
+		mask = 0x80
+	}
+	if n < 126 {
+		store8(hdr+1, mask|n)
+		h = 2
+	} else if n < 65536 {
+		store8(hdr+1, mask|126)
+		store8(hdr+2, n>>8)
+		store8(hdr+3, n)
+		h = 4
+	} else {
+		store8(hdr+1, mask|127)
+		for i := 0; i < 8; i++ {
+			store8(hdr+2+i, n>>(8*(7-i)))
+		}
+		h = 10
+	}
+	if st[sClient] == 0 {
+		err := c.write_raw(hdr, h)
+		free(hdr)
+		if err != nil {
+			fail err
+		}
+		return try c.write_raw(p, n)
+	}
+	// A client masks its payload with a fresh key.
+	key := seal.RandomBytes(4)
+	for i := 0; i < 4; i++ {
+		store8(hdr+h+i, i64(key[i]))
+	}
+	h += 4
+	body := malloc(n + 1)
+	for i := 0; i < n; i++ {
+		store8(body+i, i64(load8(p+i))^i64(key[i%4]))
+	}
+	err := c.write_raw(hdr, h)
+	free(hdr)
+	if err == nil {
+		err = c.write_raw(body, n)
+	}
+	free(body)
+	if err != nil {
+		fail err
+	}
+}
+
+// send takes the writer's turn (tasks on one core may share a Conn), sends, gives it back.
+func (c Conn) send(op i64, p i64, n i64) ! {
+	st := c.st
+	if !c.open {
+		fail "websocket: the connection is not open"
+	}
+	for st[sWriting] != 0 {
+		rt_task_defer()
+	}
+	if st[sClosed] != 0 && op != opClose {
+		fail "websocket: the connection is closing"
+	}
+	st[sWriting] = 1
+	err := c.frame(op, p, n)
+	st[sWriting] = 0
+	if err != nil {
+		fail err
+	}
+}
+
+// WriteText sends s as a text message.
+func (c Conn) WriteText(s str) ! {
+	return try c.send(opText, cast(i64, s)+8, len(s))
+}
+
+// WriteBinary sends b as a binary message.
+func (c Conn) WriteBinary(b []u8) ! {
+	return try c.send(opBinary, cast(i64, b)[2], len(b))
+}
+
+// Ping sends a ping; the peer's pong is consumed by Read.
+func (c Conn) Ping() ! {
+	return try c.send(opPing, 0, 0)
+}
+
+func close_payload(code i64, reason str) str {
+	b := make([]u8, 0, 2+len(reason))
+	b = append(b, u8(code>>8), u8(code))
+	for i := 0; i < len(reason); i++ {
+		b = append(b, reason[i])
+	}
+	return str(b)
+}
+
+// CloseWith sends a close frame with code and reason; the connection then only drains.
+func (c Conn) CloseWith(code i64, reason str) ! {
+	st := c.st
+	if st[sClosed] != 0 || st[sBuf] == 0 {
+		return
+	}
+	p := close_payload(code, reason)
+	err := c.send(opClose, cast(i64, p)+8, len(p))
+	st[sClosed] = 1
+	if err != nil {
+		fail err
+	}
+}
+
+// Close sends a normal close (1000) and, for a client, closes the connection.
+func (c Conn) Close() {
+	if !c.open || c.st[sBuf] == 0 {
+		return
+	}
+	c.CloseWith(1000, "") catch _ {}
+	c.release()
+}
+
+// IsClosed reports whether err is the normal end of a connection: the peer closed it.
+func IsClosed(err fault) bool {
+	return err != nil && twine.HasPrefix(say.Str(err), "websocket: closed")
+}
+
+// protocol_error closes with code and fails with msg.
+func (c Conn) protocol_error(code i64, msg str) ! {
+	c.CloseWith(code, msg) catch _ {}
+	fail "websocket: {msg}"
+}
+
+// Read returns the next message; it answers pings and joins fragments on the way. When the
+// peer closes, it answers the close and fails with "websocket: closed (code)".
+func (c Conn) Read() !Message {
+	if !c.open {
+		fail "websocket: the connection is not open"
+	}
+	st := c.st
+	data := []u8{}
+	text := false
+	started := false
+	for {
+		try c.need(2)
+		p := st[sBuf] + st[sS]
+		b0 := i64(load8(p))
+		b1 := i64(load8(p + 1))
+		fin := b0&0x80 != 0
+		op := b0 & 15
+		masked := b1&0x80 != 0
+		n := b1 & 127
+		h := 2
+		if b0&0x70 != 0 {
+			fail c.protocol_error(1002, "reserved bits set")
+		}
+		if n == 126 {
+			try c.need(4)
+			p = st[sBuf] + st[sS]
+			n = i64(load8(p+2))<<8 | i64(load8(p+3))
+			h = 4
+		} else if n == 127 {
+			try c.need(10)
+			p = st[sBuf] + st[sS]
+			n = 0
+			for i := 0; i < 8; i++ {
+				n = n<<8 | i64(load8(p+2+i))
+			}
+			h = 10
+			if n < 0 {
+				fail c.protocol_error(1002, "bad frame length")
+			}
+		}
+		if masked != (st[sClient] == 0) {
+			fail c.protocol_error(1002, "wrong masking")
+		}
+		mk := h
+		if masked {
+			h += 4
+		}
+		control := op >= 8
+		if control && (n > 125 || !fin) {
+			fail c.protocol_error(1002, "bad control frame")
+		}
+		if !control && len(data)+n > st[sMax] {
+			fail c.protocol_error(1009, "message too big")
+		}
+		try c.need(h + n)
+		p = st[sBuf] + st[sS]
+		payload := make([]u8, n)
+		pp := cast(i64, payload)[2]
+		for i := 0; i < n; i++ {
+			v := i64(load8(p + h + i))
+			if masked {
+				v ^= i64(load8(p + mk + i%4))
+			}
+			store8(pp+i, v)
+		}
+		st[sS] += h + n
+		if op == opPing {
+			if st[sClosed] == 0 {
+				try c.send(opPong, pp, n)
+			}
+			continue
+		}
+		if op == opPong {
+			continue
+		}
+		if op == opClose {
+			code := 1005
+			if n >= 2 {
+				code = i64(payload[0])<<8 | i64(payload[1])
+			}
+			if n == 1 || (n > 2 && !glyph.Valid(str(payload[2:]))) {
+				fail c.protocol_error(1002, "bad close frame")
+			}
+			if st[sClosed] == 0 {
+				echo := 1000
+				if n >= 2 {
+					echo = code
+				}
+				c.CloseWith(echo, "") catch _ {}
+			}
+			fail "websocket: closed ({code})"
+		}
+		if op == opCont {
+			if !started {
+				fail c.protocol_error(1002, "continuation without a message")
+			}
+		} else if op == opText || op == opBinary {
+			if started {
+				fail c.protocol_error(1002, "a new message inside a fragmented one")
+			}
+			started = true
+			text = op == opText
+		} else {
+			fail c.protocol_error(1002, "unknown opcode")
+		}
+		for _, x := range payload {
+			data = append(data, x)
+		}
+		if fin {
+			s := str(data)
+			if text && !glyph.Valid(s) {
+				fail c.protocol_error(1007, "text message is not UTF-8")
+			}
+			return Message{Text: text, Data: s}
+		}
+	}
+}

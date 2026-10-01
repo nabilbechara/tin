@@ -77,6 +77,7 @@ const cNeed = 9   // bytes the pending request needs, when known
 const cTask = 10  // the request task waiting (sleep, I/O) on this connection; later requests queue
 const cAlive = 11 // that request's keep-alive
 const cDead = 12  // closed while its task waited: freed when the task ends
+const cHijack = 13 // taken out of HTTP by its handler (Req.Hijack): closed when the task ends
 const cWords = 14
 
 shared var gListen i64
@@ -921,7 +922,9 @@ func serve_one(c i64, p i64, n i64) i64 {
 	rebase_request(task, rb-p)
 	c[cTask] = task
 	c[cAlive] = i64(alive)
-	waiting++
+	if c[cHijack] == 0 {
+		waiting++
+	}
 	return total
 }
 
@@ -944,7 +947,9 @@ func run_request(c i64) {
 	w := Out{Body: body, code: 200, ctype: "text/plain; charset=utf-8", extra: make([]u8, 0, 256), own: body}
 	rt_task_current()[tUser] = cast(i64, q)
 	gHandler(q, mut w)
-	respond_out(w, hd)
+	if c[cHijack] == 0 {
+		respond_out(w, hd)
+	}
 }
 
 // rebase_request points a waiting task's Req at its own copy of the request bytes.
@@ -959,6 +964,11 @@ func rebase_request(task i64, delta i64) {
 func finish_request(c i64, task i64) {
 	free(task[tUser+1])
 	rt_task_free(task)
+	if c[cHijack] != 0 {
+		close(c[cFD])
+		free_conn(c)
+		return
+	}
 	waiting--
 	c[cTask] = 0
 	if c[cDead] != 0 {
@@ -1251,6 +1261,52 @@ func (q Req) Header(name str) str {
 		p = e + 1
 	}
 	return ""
+}
+
+// Hijack takes the request's connection out of HTTP for a protocol of its own (the
+// websocket package uses it): the responses before this request are written, the core
+// stops reading the connection and the request's deadline no longer applies. It returns
+// the non-blocking descriptor, for the caller's I/O until the handler returns; then anvil
+// closes it. The handler's Out is not sent.
+func (q Req) Hijack() !i64 {
+	task := rt_task_current()
+	if task == 0 {
+		fail "anvil: Hijack outside a request"
+	}
+	c := task[tArg]
+	if c[cHijack] != 0 {
+		fail "anvil: the connection is already hijacked"
+	}
+	fd := c[cFD]
+	ev_task_del(fd)
+	conns[fd] = 0
+	c[cHijack] = 1
+	rt_task_set_deadline(task, 0)
+	if obLen > 0 {
+		pend_out(c, ob, obLen)
+		obLen = 0
+	}
+	for c[cOut] != 0 && c[cOutOff] < c[cOutLen] {
+		k := write(fd, c[cOut]+c[cOutOff], c[cOutLen]-c[cOutOff])
+		if k > 0 {
+			c[cOutOff] += k
+			continue
+		}
+		e := errno()
+		if e == EAGAIN {
+			rt_task_wait(fd, 2, 0)
+		} else if e != 4 {
+			break
+		}
+	}
+	if c[cOut] != 0 {
+		free(c[cOut])
+		c[cOut] = 0
+	}
+	c[cWriting] = 0
+	// From here the request always ends through finish_request, which closes it.
+	rt_task_defer()
+	return fd
 }
 
 // Body returns the request body.

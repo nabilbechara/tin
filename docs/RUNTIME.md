@@ -268,6 +268,19 @@ core's pool words (bump, end, base, mark, extra) are swapped in and out with the
   fails every waiting slot; the next command reconnects. An idle connection is checked
   with a non-blocking `recv(MSG_PEEK)` before use, so a server restart costs no failures.
 
+### Upgraded connections: websocket (v0.4)
+
+- `Req.Hijack` takes a request's connection out of HTTP: anvil writes the responses queued
+  before it, removes the descriptor from the core's poller (so the task can watch it with
+  `rt_task_wait`), clears the request deadline and defers once, so the request always ends
+  through `finish_request`, which then closes the descriptor instead of answering.
+  Hijacked connections do not count toward the 4096 waiting requests per core.
+- `websocket.Accept` checks the handshake, hijacks and writes the 101 itself. The
+  connection's buffer lives in malloc'd memory; a `Read` that needs bytes waits on the fd,
+  so an idle WebSocket costs a parked task (its stack and pool) and no thread.
+- Tasks on one core may write to the same `Conn` (a broadcast): a frame is written whole
+  before the next writer, who waits its turn with `rt_task_defer`.
+
 ### Pooled clients: mysql (v0.4)
 
 - MySQL answers one statement at a time per connection, so each core keeps a pool per
