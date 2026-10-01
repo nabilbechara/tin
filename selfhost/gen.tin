@@ -1,0 +1,3249 @@
+const CTX_WORDS = 32;  // runtime context words before the per-core globals (lib/runtime.tin ctxWords)
+
+// Code generator: checked AST to the ARM64 instruction list in asm.tin.
+//
+// Locals whose address is never taken live in registers: callee-saved x19-x27 and
+// d8-d15, or caller-saved x9-x15 and d16-d30 in leaf functions. Expressions evaluate
+// into stacks of temporary registers (one per register class) indexed by depth, so
+// memory is only touched by real loads and stores, values live across calls, and the
+// rare expression too deep for the pool. x28 holds the thread context (like Go's g),
+// x16/x17 and d31 are scratch.
+
+const REG_SLOT = -1;
+const REG_DEAD = -2;
+const MAX_FRAME = 4095;
+const FPR = 64;       // d0 is register 64
+const FSCR = 95;      // d31, float scratch
+
+var code;        // the whole program
+var cg;          // the current function body
+var g_labels;
+var g_str_ptrs;
+var g_str_lens;
+var g_tstr_ptrs; // Tin string literals (length-prefixed)
+var g_tstr_lens;
+var g_loops;     // (continue, break) label pairs of the enclosing loops
+var t_regs;      // integer temporaries of the current function, by depth
+var t_count;
+var f_regs;      // float temporaries, by depth
+var f_count;
+var used_regs;   // bitmask of integer registers the current function writes
+var used_fregs;  // bitmask of float registers
+var cur_gen_fn;
+var pl;          // gen_pair results
+var pr;
+var cmp_cc;      // gen_compare result
+var am_base;     // gen_addr8 results
+var am_index;
+var am_off;
+var mm_base;     // gen_mem_addr results
+var mm_index;
+var mm_off;
+var trap_label;  // the current function's bounds-failure stub, once used
+var trap_sites;  // per failed-check site: [label, index reg (or -1), length reg, constant index]
+
+fn emit4(op, a, b, c, d) {
+    vec_push(cg, op);
+    vec_push(cg, a);
+    vec_push(cg, b);
+    vec_push(cg, c);
+    vec_push(cg, d);
+}
+
+fn emit3(op, a, b, c) {
+    emit4(op, a, b, c, 0);
+}
+
+fn emit2(op, a, b) {
+    emit4(op, a, b, 0, 0);
+}
+
+fn emit1(op, a) {
+    emit4(op, a, 0, 0, 0);
+}
+
+fn new_label() {
+    g_labels = g_labels + 1;
+    return g_labels;
+}
+
+fn label(l) {
+    emit1(I_LABEL, l);
+}
+
+fn is_fp(r) {
+    return r >= FPR;
+}
+
+fn e_fp(e) {
+    return is_float_t(e[N_TYPE]);
+}
+
+// mov copies between registers of either class (across classes it moves the bits).
+fn mov(dst, src) {
+    if dst == src {
+        return;
+    }
+    if is_fp(dst) && is_fp(src) {
+        emit2(I_FMOV, dst, src);
+    } else if is_fp(dst) {
+        emit2(I_FMOVDX, dst, src);
+    } else if is_fp(src) {
+        emit2(I_FMOVXD, dst, src);
+    } else {
+        emit2(I_MOV, dst, src);
+    }
+}
+
+fn treg(d) {
+    let r = vec_get(t_regs, d);
+    used_regs = used_regs | (1 << r);
+    return r;
+}
+
+fn freg(d) {
+    let r = vec_get(f_regs, d);
+    used_fregs = used_fregs | (1 << (r - FPR));
+    return r;
+}
+
+// next_depth is the first free temp depth once r holds a value computed at depth d.
+fn next_depth(r, d) {
+    if d < t_count && r == vec_get(t_regs, d) {
+        return d + 1;
+    }
+    if d < f_count && r == vec_get(f_regs, d) {
+        return d + 1;
+    }
+    return d;
+}
+
+fn room(d, fp) {
+    if fp {
+        return d < f_count;
+    }
+    return d < t_count;
+}
+
+// ---- expression properties ----
+
+fn is_const(e) {
+    let k = e[N_KIND];
+    if k == EX_INT {
+        return 1;
+    }
+    if k == EX_IDENT {
+        return e[ID_REF] && e[ID_REF][S_KIND] == SYM_CONST;
+    }
+    if k == EX_UNARY {
+        return !streq(e[UN_OP], "&") && !e_fp(e) && fold_safe(e) && is_const(e[UN_X]);
+    }
+    if k == EX_BINARY {
+        return !e_fp(e[BIN_L]) && fold_safe(e) && fold_safe(e[BIN_L]) && is_const(e[BIN_L]) && is_const(e[BIN_R]);
+    }
+    return 0;
+}
+
+// fold_safe: signed 64-bit (or untyped) arithmetic folds like the machine does it.
+fn fold_safe(e) {
+    let t = e[N_TYPE];
+    if !t {
+        return 1;
+    }
+    let k = t[TY_KIND];
+    if k == K_BOOL {
+        return 1;
+    }
+    if k != K_INT {
+        return 1;
+    }
+    return t[TY_SIGNED] && t[TY_WIDTH] == 8;
+}
+
+fn const_val(e) {
+    let k = e[N_KIND];
+    if k == EX_INT {
+        return e[INT_VAL];
+    }
+    if k == EX_IDENT {
+        return e[ID_REF][S_VAL];
+    }
+    if k == EX_UNARY {
+        return eval_unary(e[UN_OP], const_val(e[UN_X]));
+    }
+    return eval_binary(e[BIN_OP], const_val(e[BIN_L]), const_val(e[BIN_R]));
+}
+
+fn is_real_call(e) {
+    return e[N_KIND] == EX_CALL && !e[CALL_INTRINSIC];
+}
+
+fn stmts_have_call(stmts) {
+    let i = 0;
+    while i < stmts[VEC_LEN] {
+        if stmt_has_call(vec_get(stmts, i)) {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn stmt_has_call(s) {
+    if !s {
+        return 0;
+    }
+    let k = s[N_KIND];
+    if k == ST_BLOCK {
+        return stmts_have_call(s[BLK_STMTS]);
+    }
+    if k == ST_LET {
+        return contains_call(s[LET_INIT]);
+    }
+    if k == ST_ASSIGN {
+        return contains_call(s[AS_TARGET]) || contains_call(s[AS_VALUE]);
+    }
+    if k == ST_EXPR {
+        return contains_call(s[ES_X]);
+    }
+    if k == ST_IF {
+        return contains_call(s[IF_COND]) || stmt_has_call(s[IF_THEN]) || stmt_has_call(s[IF_ELSE]);
+    }
+    if k == ST_WHILE {
+        return contains_call(s[WH_COND]) || stmt_has_call(s[WH_BODY]) || stmt_has_call(s[WH_POST]);
+    }
+    if k == ST_RETURN {
+        return 1;
+    }
+    if k == ST_CALLMULTI {
+        return 1;
+    }
+    return 0;
+}
+
+fn contains_call(e) {
+    if !e {
+        return 0;
+    }
+    let k = e[N_KIND];
+    if k == EX_CALL {
+        if !e[CALL_INTRINSIC] {
+            return 1;
+        }
+        let args = e[CALL_ARGS];
+        let i = 0;
+        while i < args[VEC_LEN] {
+            if contains_call(vec_get(args, i)) {
+                return 1;
+            }
+            i = i + 1;
+        }
+        return 0;
+    }
+    if k == EX_UNARY {
+        return contains_call(e[UN_X]);
+    }
+    if k == EX_BINARY {
+        return contains_call(e[BIN_L]) || contains_call(e[BIN_R]);
+    }
+    if k == EX_INDEX {
+        return contains_call(e[IX_X]) || contains_call(e[IX_I]);
+    }
+    if k == EX_CONV {
+        return contains_call(e[CV_X]);
+    }
+    if k == EX_MEM {
+        return contains_call(e[MEM_BASE]) || contains_call(e[MEM_INDEX]) || contains_call(e[MEM_LEN]);
+    }
+    if k == EX_ELEM {
+        return contains_call(e[ELEM_SEQ]) || contains_call(e[ELEM_IDX]);
+    }
+    if k == EX_SEQ {
+        return 1;
+    }
+    return 0;
+}
+
+fn has_effects(e) {
+    let k = e[N_KIND];
+    if k == EX_CALL {
+        if !e[CALL_INTRINSIC] || !streq(e[CALL_NAME], "load8") {
+            return 1;
+        }
+        return has_effects(vec_get(e[CALL_ARGS], 0));
+    }
+    if k == EX_UNARY {
+        return has_effects(e[UN_X]);
+    }
+    if k == EX_BINARY {
+        return has_effects(e[BIN_L]) || has_effects(e[BIN_R]);
+    }
+    if k == EX_INDEX {
+        return has_effects(e[IX_X]) || has_effects(e[IX_I]);
+    }
+    if k == EX_CONV {
+        return has_effects(e[CV_X]);
+    }
+    if k == EX_MEM {
+        return has_effects(e[MEM_BASE]) || (e[MEM_INDEX] && has_effects(e[MEM_INDEX]));
+    }
+    if k == EX_ELEM {
+        return has_effects(e[ELEM_SEQ]) || has_effects(e[ELEM_IDX]);
+    }
+    if k == EX_SEQ {
+        return 1;
+    }
+    return 0;
+}
+
+// expr_equal compares effect-free expressions structurally.
+fn expr_equal(a, b) {
+    let k = a[N_KIND];
+    if k != b[N_KIND] {
+        return 0;
+    }
+    if k == EX_INT {
+        return a[INT_VAL] == b[INT_VAL];
+    }
+    if k == EX_FLOAT {
+        return a[FL_BITS] == b[FL_BITS];
+    }
+    if k == EX_IDENT {
+        return a[ID_REF] == b[ID_REF];
+    }
+    if k == EX_UNARY {
+        return streq(a[UN_OP], b[UN_OP]) && expr_equal(a[UN_X], b[UN_X]);
+    }
+    if k == EX_BINARY {
+        return streq(a[BIN_OP], b[BIN_OP]) && expr_equal(a[BIN_L], b[BIN_L]) && expr_equal(a[BIN_R], b[BIN_R]);
+    }
+    if k == EX_INDEX {
+        return expr_equal(a[IX_X], b[IX_X]) && expr_equal(a[IX_I], b[IX_I]);
+    }
+    if k == EX_CONV {
+        return a[CV_KIND] == b[CV_KIND] && expr_equal(a[CV_X], b[CV_X]);
+    }
+    if k == EX_MEM {
+        return a[MEM_OFF] == b[MEM_OFF] && a[MEM_SCALE] == b[MEM_SCALE] && a[N_TYPE] == b[N_TYPE] && expr_equal(a[MEM_BASE], b[MEM_BASE]) && opt_equal(a[MEM_INDEX], b[MEM_INDEX]);
+    }
+    if k == EX_ELEM {
+        return a[N_TYPE] == b[N_TYPE] && expr_equal(a[ELEM_SEQ], b[ELEM_SEQ]) && expr_equal(a[ELEM_IDX], b[ELEM_IDX]);
+    }
+    return 0;
+}
+
+fn opt_equal(a, b) {
+    if !a || !b {
+        return a == b;
+    }
+    return expr_equal(a, b);
+}
+
+// log2 of a positive power of two, else -1.
+fn pow2_log(c) {
+    if c <= 0 || (c & (c - 1)) != 0 {
+        return -1;
+    }
+    let k = 0;
+    while (1 << k) != c {
+        k = k + 1;
+    }
+    return k;
+}
+
+// k when c == 2^k - 1 (k ones), else 0.
+fn low_mask_bits(c) {
+    if c <= 0 || (c & (c + 1)) != 0 {
+        return 0;
+    }
+    let k = 0;
+    while k < 63 && ((c >> k) & 1) != 0 {
+        k = k + 1;
+    }
+    return k;
+}
+
+// ucond_code is the unsigned comparison's condition.
+fn ucond_code(op) {
+    if streq(op, "<") { return C_LO; }
+    if streq(op, "<=") { return C_LS; }
+    if streq(op, ">") { return C_HI; }
+    if streq(op, ">=") { return C_HS; }
+    return cond_code(op);
+}
+
+fn cond_code(op) {
+    if streq(op, "==") { return C_EQ; }
+    if streq(op, "!=") { return C_NE; }
+    if streq(op, "<") { return C_LT; }
+    if streq(op, "<=") { return C_LE; }
+    if streq(op, ">") { return C_GT; }
+    if streq(op, ">=") { return C_GE; }
+    return -1;
+}
+
+// After fcmp, MI and LS are the ordered < and <=, so NaN compares false like Go.
+fn fcond_code(op) {
+    if streq(op, "==") { return C_EQ; }
+    if streq(op, "!=") { return C_NE; }
+    if streq(op, "<") { return C_MI; }
+    if streq(op, "<=") { return C_LS; }
+    if streq(op, ">") { return C_GT; }
+    return C_GE;
+}
+
+// swap_cc is the condition for the same comparison with its operands exchanged.
+fn swap_cc(cc) {
+    if cc == C_LT { return C_GT; }
+    if cc == C_GT { return C_LT; }
+    if cc == C_LE { return C_GE; }
+    if cc == C_GE { return C_LE; }
+    if cc == C_LO { return C_HI; }
+    if cc == C_HI { return C_LO; }
+    if cc == C_LS { return C_HS; }
+    if cc == C_HS { return C_LS; }
+    return cc;
+}
+
+fn e_unsigned(e) {
+    return is_unsigned_t(e[N_TYPE]);
+}
+
+fn string_index(p, n) {
+    let i = 0;
+    while i < g_str_ptrs[VEC_LEN] {
+        if vec_get(g_str_lens, i) == n && mem_eq(vec_get(g_str_ptrs, i), p, n) {
+            return i;
+        }
+        i = i + 1;
+    }
+    vec_push(g_str_ptrs, p);
+    vec_push(g_str_lens, n);
+    return i;
+}
+
+fn tstring_index(p, n) {
+    let i = 0;
+    while i < g_tstr_ptrs[VEC_LEN] {
+        if vec_get(g_tstr_lens, i) == n && mem_eq(vec_get(g_tstr_ptrs, i), p, n) {
+            return i;
+        }
+        i = i + 1;
+    }
+    vec_push(g_tstr_ptrs, p);
+    vec_push(g_tstr_lens, n);
+    return i;
+}
+
+// ---- expressions ----
+
+fn load_imm(dst, v) {
+    if is_fp(dst) {
+        if v == 0 {
+            emit2(I_FMOVDX, dst, ZR);
+            return;
+        }
+        load_imm(X17, v);
+        emit2(I_FMOVDX, dst, X17);
+        return;
+    }
+    if v >= 0 && v <= 65535 {
+        emit3(I_MOVZ, dst, v, 0);
+        return;
+    }
+    if v < 0 && v >= -65536 {
+        emit3(I_MOVN, dst, ~v, 0);
+        return;
+    }
+    let zeros = 0;
+    let ones = 0;
+    let s = 0;
+    while s < 64 {
+        let h = (v >> s) & 0xffff;
+        if h == 0 {
+            zeros = zeros + 1;
+        }
+        if h == 0xffff {
+            ones = ones + 1;
+        }
+        s = s + 16;
+    }
+    // Start from all ones (movn) or all zeros (movz), whichever leaves fewer movk.
+    let fill = 0;
+    if ones > zeros {
+        fill = 0xffff;
+    }
+    let first = 1;
+    s = 0;
+    while s < 64 {
+        let part = (v >> s) & 0xffff;
+        if part != fill {
+            if first && fill != 0 {
+                emit3(I_MOVN, dst, ~part & 0xffff, s);
+            } else if first {
+                emit3(I_MOVZ, dst, part, s);
+            } else {
+                emit3(I_MOVK, dst, part, s);
+            }
+            first = 0;
+        }
+        s = s + 16;
+    }
+}
+
+// gen_val returns a register holding e: a local's own register, or temp depth d.
+fn gen_val(e, d) {
+    let k = e[N_KIND];
+    if k == EX_REG {
+        return e[REG_NUM];
+    }
+    if k == EX_IDENT && e[ID_REF][S_KIND] == SYM_LOCAL && e[ID_REF][S_REG] >= 0 {
+        return e[ID_REF][S_REG];
+    }
+    let r = 0;
+    if e_fp(e) {
+        r = freg(d);
+    } else {
+        r = treg(d);
+    }
+    gen_to(e, r, d);
+    return r;
+}
+
+// gen_to computes e into dst using temps from depth d up; dst is written last.
+fn gen_to(e, dst, d) {
+    let k = e[N_KIND];
+    if k == EX_INT {
+        load_imm(dst, e[INT_VAL]);
+    } else if k == EX_FLOAT {
+        load_imm(dst, e[FL_BITS]);
+    } else if k == EX_STR {
+        let sym = 0;
+        if kind_of(e[N_TYPE]) == K_STRING {
+            sym = sym_ref(SK_TSTR, tstring_index(e[STR_PTR], e[STR_LEN]));
+        } else {
+            sym = sym_ref(SK_STR, string_index(e[STR_PTR], e[STR_LEN]));
+        }
+        emit2(I_ADRP, dst, sym);
+        emit3(I_ADDLO, dst, dst, sym);
+    } else if k == EX_IDENT {
+        gen_ident(e, dst);
+    } else if k == EX_REG {
+        mov(dst, e[REG_NUM]);
+    } else if k == EX_UNARY {
+        gen_unary(e, dst, d);
+    } else if k == EX_BINARY {
+        gen_binary(e, dst, d);
+    } else if k == EX_INDEX {
+        gen_index_load(e, dst, d);
+    } else if k == EX_CONV {
+        gen_conv(e, dst, d);
+    } else if k == EX_MEM {
+        gen_mem_load(e, dst, d);
+    } else if k == EX_ELEM {
+        gen_elem_load(e, dst, d);
+    } else if k == EX_SEQ {
+        gen_seq(e, dst, d);
+    } else if k == EX_FUNCREF {
+        let fs = sym_ref(SK_FN, e[FR_FN][F_INDEX]);
+        emit2(I_ADRP, dst, fs);
+        emit3(I_ADDLO, dst, dst, fs);
+    } else if e[CALL_INTRINSIC] {
+        gen_intrinsic(e, dst, d);
+    } else {
+        gen_call(e, d);
+        if is_fp(dst) {
+            mov(dst, FPR);
+        } else {
+            mov(dst, 0);
+        }
+    }
+}
+
+// tls_off is a per-core global's offset from x28: the context words come first.
+fn tls_off(s) {
+    return 8 * (CTX_WORDS + s[S_TLS] - 1);
+}
+
+fn gen_ident(e, dst) {
+    let s = e[ID_REF];
+    let k = s[S_KIND];
+    if k == SYM_LOCAL {
+        if s[S_REG] >= 0 {
+            mov(dst, s[S_REG]);
+        } else if is_fp(dst) {
+            emit3(I_LDRD, dst, FP, s[S_OFF]);
+        } else {
+            emit3(I_LDR, dst, FP, s[S_OFF]);
+        }
+    } else if k == SYM_GLOBAL && s[S_TLS] {
+        if is_fp(dst) {
+            emit3(I_LDRD, dst, 28, tls_off(s));
+        } else {
+            emit3(I_LDR, dst, 28, tls_off(s));
+        }
+    } else if k == SYM_GLOBAL {
+        let sym = sym_ref(SK_VAR, s[S_INDEX]);
+        if is_fp(dst) {
+            emit2(I_ADRP, X17, sym);
+            emit3(I_LDRLO, X17, X17, sym);
+            emit2(I_FMOVDX, dst, X17);
+        } else {
+            emit2(I_ADRP, dst, sym);
+            emit3(I_LDRLO, dst, dst, sym);
+        }
+    } else {
+        load_imm(dst, s[S_VAL]);
+    }
+}
+
+// gen_pair evaluates two operands into pl and pr. pr may be x0/d0 (a call result) or
+// a scratch register (a spill), so the caller must consume both right away.
+fn gen_pair(lexp, rexp, d) {
+    let l = gen_val(lexp, d);
+    let d2 = next_depth(l, d);
+    let rfp = e_fp(rexp);
+    let r = 0;
+    if is_real_call(rexp) {
+        gen_call(rexp, d2);
+        if rfp {
+            r = FPR;
+        }
+    } else if !room(d2, rfp) {
+        if is_fp(l) {
+            emit1(I_FPUSH, l);
+        } else {
+            emit1(I_PUSH, l);
+        }
+        let rr = gen_val(rexp, d);
+        if rfp {
+            mov(FSCR, rr);
+            r = FSCR;
+        } else {
+            mov(X17, rr);
+            r = X17;
+        }
+        if is_fp(l) {
+            emit1(I_FPOP, l);
+        } else {
+            emit1(I_POP, l);
+        }
+    } else {
+        r = gen_val(rexp, d2);
+    }
+    pl = l;
+    pr = r;
+}
+
+fn gen_unary(e, dst, d) {
+    let op = e[UN_OP];
+    if streq(op, "&") {
+        let s = e[UN_X][ID_REF];
+        if s[S_KIND] == SYM_LOCAL {
+            emit3(I_ADDI, dst, FP, s[S_OFF]);
+        } else if s[S_TLS] {
+            load_imm(X17, tls_off(s));
+            emit3(I_ADD, dst, 28, X17);
+        } else {
+            let sym = sym_ref(SK_VAR, s[S_INDEX]);
+            emit2(I_ADRP, dst, sym);
+            emit3(I_ADDLO, dst, dst, sym);
+        }
+        return;
+    }
+    if is_const(e) {
+        load_imm(dst, const_val(e));
+        return;
+    }
+    let x = gen_val(e[UN_X], d);
+    if is_fp(dst) {
+        emit2(I_FNEG, dst, x);
+        return;
+    }
+    if streq(op, "-") {
+        emit2(I_NEG, dst, x);
+    } else if streq(op, "~") {
+        emit2(I_MVN, dst, x);
+    } else {
+        emit2(I_CMPI, x, 0);
+        emit2(I_CSET, dst, C_EQ);
+        return;
+    }
+    mask_byte(e, dst);
+}
+
+// mask_byte keeps narrow integer results canonical: sign-extended for i8/i16/i32,
+// zero-extended for u8/u16/u32, so wrapping matches the declared width.
+fn mask_byte(e, dst) {
+    canon(e[N_TYPE], dst);
+}
+
+fn canon(t, r) {
+    if !t || t[TY_KIND] != K_INT || t[TY_WIDTH] == 8 || is_fp(r) {
+        return;
+    }
+    if t[TY_SIGNED] {
+        emit3(I_SXT, r, r, width_log2(t[TY_WIDTH]));
+    } else {
+        emit3(I_ANDI, r, r, 8 * t[TY_WIDTH]);
+    }
+}
+
+fn is_plain_mul(e) {
+    return e[N_KIND] == EX_BINARY && streq(e[BIN_OP], "*") && !is_const(e[BIN_L]) && !is_const(e[BIN_R]);
+}
+
+fn gen_binary(e, dst, d) {
+    if is_const(e) {
+        load_imm(dst, const_val(e));
+        return;
+    }
+    let op = e[BIN_OP];
+    if streq(op, "&&") || streq(op, "||") {
+        let f = new_label();
+        let end = new_label();
+        gen_cond(e, f, d);
+        emit3(I_MOVZ, dst, 1, 0);
+        emit1(I_B, end);
+        label(f);
+        emit3(I_MOVZ, dst, 0, 0);
+        label(end);
+        return;
+    }
+    if cond_code(op) >= 0 {
+        gen_compare(e, d);
+        emit2(I_CSET, dst, cmp_cc);
+        return;
+    }
+    if is_fp(dst) {
+        gen_fbinary(e, dst, d);
+        return;
+    }
+    let l = e[BIN_L];
+    let r = e[BIN_R];
+    let comm = streq(op, "+") || streq(op, "*") || streq(op, "&") || streq(op, "|") || streq(op, "^");
+    if comm && is_const(l) {
+        let t = l;
+        l = r;
+        r = t;
+    }
+    arith_unsigned = e_unsigned(e);
+    if is_const(r) {
+        let c = const_val(r);
+        let lv = gen_val(l, d);
+        arith_unsigned = e_unsigned(e);
+        if arith_unsigned && gen_uconst(op, dst, lv, c) {
+            mask_byte(e, dst);
+            return;
+        }
+        gen_binary_const(op, dst, lv, c);
+        mask_byte(e, dst);
+        return;
+    }
+    if streq(op, "+") && d + 3 <= t_count {
+        if is_plain_mul(r) {
+            gen_madd(dst, l, r, d, I_MADD);
+            mask_byte(e, dst);
+            return;
+        }
+        if is_plain_mul(l) && !has_effects(l) && !has_effects(r) {
+            gen_madd(dst, r, l, d, I_MADD);
+            mask_byte(e, dst);
+            return;
+        }
+    }
+    gen_pair(l, r, d);
+    arith_unsigned = e_unsigned(e);
+    emit_arith(op, dst, pl, pr);
+    mask_byte(e, dst);
+}
+
+// gen_uconst handles unsigned division, modulo and right shift by constants.
+fn gen_uconst(op, dst, l, c) {
+    let k = pow2_log(c);
+    if streq(op, "/") && k >= 0 {
+        emit3(I_LSRI, dst, l, k);
+        return 1;
+    }
+    if streq(op, "%") && k > 0 {
+        emit3(I_ANDI, dst, l, k);
+        return 1;
+    }
+    if streq(op, ">>") {
+        emit3(I_LSRI, dst, l, c & 63);
+        return 1;
+    }
+    if streq(op, "/") || streq(op, "%") {
+        load_imm(X17, c);
+        emit_arith(op, dst, l, X17);
+        return 1;
+    }
+    return 0;
+}
+
+fn gen_fbinary(e, dst, d) {
+    let op = e[BIN_OP];
+    let l = e[BIN_L];
+    let r = e[BIN_R];
+    if d + 3 <= f_count && (streq(op, "+") || streq(op, "-")) {
+        if is_fmul(r) {
+            if streq(op, "+") {
+                gen_madd(dst, l, r, d, I_FMADD);
+            } else {
+                gen_madd(dst, l, r, d, I_FMSUB);
+            }
+            return;
+        }
+        if streq(op, "+") && is_fmul(l) && !has_effects(l) && !has_effects(r) {
+            gen_madd(dst, r, l, d, I_FMADD);
+            return;
+        }
+    }
+    gen_pair(l, r, d);
+    let ins = I_FADD;
+    if streq(op, "-") {
+        ins = I_FSUB;
+    } else if streq(op, "*") {
+        ins = I_FMUL;
+    } else if streq(op, "/") {
+        ins = I_FDIV;
+    }
+    emit3(ins, dst, pl, pr);
+}
+
+fn is_fmul(e) {
+    return e[N_KIND] == EX_BINARY && streq(e[BIN_OP], "*") && e_fp(e);
+}
+
+fn gen_madd(dst, addend, m, d, ins) {
+    let a = gen_val(addend, d);
+    gen_pair(m[BIN_L], m[BIN_R], next_depth(a, d));
+    emit4(ins, dst, pl, pr, a);
+}
+
+var arith_unsigned;
+var div_label;   // the current function's divide-by-zero stub, once used
+
+// div_check panics on a zero divisor in strict code (the hardware would return 0).
+fn div_check(b) {
+    if cur_gen_fn[F_LEGACY] {
+        return;
+    }
+    if !div_label {
+        div_label = new_label();
+    }
+    emit2(I_CBZ, b, div_label);
+}
+
+fn emit_arith(op, dst, a, b) {
+    if streq(op, "/") || streq(op, "%") {
+        div_check(b);
+    }
+    if arith_unsigned && streq(op, "/") {
+        emit3(I_UDIV, dst, a, b);
+        return;
+    }
+    if arith_unsigned && streq(op, "%") {
+        emit3(I_UDIV, X16, a, b);
+        emit4(I_MSUB, dst, X16, b, a);
+        return;
+    }
+    if arith_unsigned && streq(op, ">>") {
+        emit3(I_LSRV, dst, a, b);
+        return;
+    }
+    if streq(op, "+") {
+        emit4(I_ADD, dst, a, b, 0);
+    } else if streq(op, "-") {
+        emit4(I_SUB, dst, a, b, 0);
+    } else if streq(op, "*") {
+        emit3(I_MUL, dst, a, b);
+    } else if streq(op, "/") {
+        emit3(I_SDIV, dst, a, b);
+    } else if streq(op, "%") {
+        emit3(I_SDIV, X16, a, b);
+        emit4(I_MSUB, dst, X16, b, a);
+    } else if streq(op, "&") {
+        emit4(I_AND, dst, a, b, 0);
+    } else if streq(op, "|") {
+        emit4(I_ORR, dst, a, b, 0);
+    } else if streq(op, "^") {
+        emit4(I_EOR, dst, a, b, 0);
+    } else if streq(op, "<<") {
+        emit3(I_LSLV, dst, a, b);
+    } else {
+        emit3(I_ASRV, dst, a, b);
+    }
+}
+
+fn add_imm(dst, l, c) {
+    if c >= 0 && c < 4096 {
+        emit3(I_ADDI, dst, l, c);
+    } else if c < 0 && c > -4096 {
+        emit3(I_SUBI, dst, l, -c);
+    } else {
+        load_imm(X17, c);
+        emit4(I_ADD, dst, l, X17, 0);
+    }
+}
+
+// round_bias leaves l + (2^k - 1 if l < 0) in x17, so an arithmetic shift by k
+// rounds toward zero the way sdiv does.
+fn round_bias(l, k) {
+    if k == 1 {
+        emit4(I_ADD, X17, l, l, SH_LSR + 63);
+        return;
+    }
+    emit3(I_ASRI, X17, l, 63);
+    emit4(I_ADD, X17, l, X17, SH_LSR + 64 - k);
+}
+
+fn gen_binary_const(op, dst, l, c) {
+    if streq(op, "+") {
+        add_imm(dst, l, c);
+    } else if streq(op, "-") && c != -9223372036854775807 - 1 {
+        add_imm(dst, l, -c);
+    } else if streq(op, "*") {
+        let k = pow2_log(c);
+        if c == 0 {
+            emit3(I_MOVZ, dst, 0, 0);
+        } else if c == 1 {
+            mov(dst, l);
+        } else if c == -1 {
+            emit2(I_NEG, dst, l);
+        } else if k >= 0 {
+            emit3(I_LSLI, dst, l, k);
+        } else if c > 2 && pow2_log(c - 1) >= 0 {
+            emit4(I_ADD, dst, l, l, SH_LSL + pow2_log(c - 1));
+        } else if c > 2 && pow2_log(c + 1) >= 0 {
+            emit3(I_LSLI, X17, l, pow2_log(c + 1));
+            emit4(I_SUB, dst, X17, l, 0);
+        } else {
+            load_imm(X17, c);
+            emit3(I_MUL, dst, l, X17);
+        }
+    } else if streq(op, "/") {
+        let k = pow2_log(c);
+        if c == 1 {
+            mov(dst, l);
+        } else if c == -1 {
+            emit2(I_NEG, dst, l);
+        } else if c == 0 && !cur_gen_fn[F_LEGACY] {
+            div_check(ZR);
+        } else if c == 0 {
+            // sdiv by zero yields zero.
+            emit3(I_MOVZ, dst, 0, 0);
+        } else if k > 0 {
+            round_bias(l, k);
+            emit3(I_ASRI, dst, X17, k);
+        } else {
+            load_imm(X17, c);
+            emit3(I_SDIV, dst, l, X17);
+        }
+    } else if streq(op, "%") {
+        let m = c;
+        if m < 0 && m != -9223372036854775807 - 1 {
+            m = -m;
+        }
+        let k = pow2_log(m);
+        if m == 1 {
+            emit3(I_MOVZ, dst, 0, 0);
+        } else if c == 0 && !cur_gen_fn[F_LEGACY] {
+            div_check(ZR);
+        } else if c == 0 {
+            // x - (x / 0) * 0 == x
+            mov(dst, l);
+        } else if k > 0 {
+            round_bias(l, k);
+            emit3(I_ASRI, X17, X17, k);
+            emit4(I_SUB, dst, l, X17, SH_LSL + k);
+        } else {
+            load_imm(X17, c);
+            emit3(I_SDIV, X16, l, X17);
+            emit4(I_MSUB, dst, X16, X17, l);
+        }
+    } else if streq(op, "<<") {
+        emit3(I_LSLI, dst, l, c & 63);
+    } else if streq(op, ">>") {
+        emit3(I_ASRI, dst, l, c & 63);
+    } else if streq(op, "&") && low_mask_bits(c) > 0 {
+        emit3(I_ANDI, dst, l, low_mask_bits(c));
+    } else if (streq(op, "|") || streq(op, "^")) && c == 0 {
+        mov(dst, l);
+    } else {
+        load_imm(X17, c);
+        emit_arith(op, dst, l, X17);
+    }
+}
+
+// gen_compare sets the flags for comparison e and leaves its condition in cmp_cc.
+fn gen_compare(e, d) {
+    let l = e[BIN_L];
+    let r = e[BIN_R];
+    if e_fp(l) || e_fp(r) {
+        gen_pair(l, r, d);
+        emit2(I_FCMP, pl, pr);
+        cmp_cc = fcond_code(e[BIN_OP]);
+        return;
+    }
+    let cc = cond_code(e[BIN_OP]);
+    if e_unsigned(l) || e_unsigned(r) {
+        cc = ucond_code(e[BIN_OP]);
+    }
+    if is_const(l) {
+        let t = l;
+        l = r;
+        r = t;
+        cc = swap_cc(cc);
+    }
+    if is_const(r) {
+        let c = const_val(r);
+        let a = gen_val(l, d);
+        if c >= 0 && c < 4096 {
+            emit2(I_CMPI, a, c);
+        } else if c < 0 && c > -4096 {
+            emit2(I_CMNI, a, -c);
+        } else {
+            load_imm(X17, c);
+            emit2(I_CMP, a, X17);
+        }
+    } else {
+        gen_pair(l, r, d);
+        emit2(I_CMP, pl, pr);
+    }
+    cmp_cc = cc;
+}
+
+fn gen_index_load(e, dst, d) {
+    let ix = e[IX_I];
+    let fpl = is_fp(dst);
+    if is_const(ix) && const_val(ix) >= 0 && const_val(ix) < 4096 {
+        let off = const_val(ix) * 8;
+        let base = gen_val(e[IX_X], d);
+        if fpl {
+            emit3(I_LDRD, dst, base, off);
+        } else {
+            emit3(I_LDR, dst, base, off);
+        }
+        return;
+    }
+    gen_pair(e[IX_X], ix, d);
+    if fpl {
+        emit3(I_LDRDX, dst, pl, pr);
+    } else {
+        emit3(I_LDRX, dst, pl, pr);
+    }
+}
+
+fn gen_conv(e, dst, d) {
+    let k = e[CV_KIND];
+    let x = e[CV_X];
+    if k == CV_LEN || k == CV_CAP {
+        // Header word 0 (len) or 1 (cap); a nil string, slice or map has length 0.
+        let p = gen_val(x, d);
+        mov(dst, p);
+        let skip = new_label();
+        emit2(I_CBZ, dst, skip);
+        emit3(I_LDR, dst, dst, 8 * (k == CV_CAP));
+        label(skip);
+        return;
+    }
+    let v = gen_val(x, d);
+    if k == CV_I2F {
+        if is_unsigned_t(x[N_TYPE]) && x[N_TYPE][TY_WIDTH] == 8 {
+            emit2(I_UCVTF, dst, v);
+        } else {
+            emit2(I_SCVTF, dst, v);
+        }
+    } else if k == CV_F2I {
+        if is_unsigned_t(e[N_TYPE]) {
+            emit2(I_FCVTZU, dst, v);
+        } else {
+            emit2(I_FCVTZS, dst, v);
+        }
+        canon(e[N_TYPE], dst);
+    } else if k == CV_TOBYTE {
+        emit3(I_ANDI, dst, v, 8);
+    } else if k == CV_INT {
+        // Values are kept canonical, so widening is free; narrowing re-canonicalizes.
+        mov(dst, v);
+        if type_width(e[N_TYPE]) < type_width(x[N_TYPE]) || is_unsigned_t(e[N_TYPE]) != is_unsigned_t(x[N_TYPE]) {
+            canon(e[N_TYPE], dst);
+        }
+    } else {
+        mov(dst, v);
+    }
+}
+
+// ---- sized memory ----
+
+fn mem_kind(t) {
+    if is_float_t(t) {
+        return 3 | MK_FLOAT;
+    }
+    let w = type_width(t);
+    let k = width_log2(w);
+    if w < 8 && t[TY_KIND] == K_INT && t[TY_SIGNED] {
+        k = k | MK_SIGNED;
+    }
+    return k;
+}
+
+// gen_mem_addr evaluates an EX_MEM address into mm_base plus mm_index (scaled to the
+// access size) or plus the byte offset mm_off. Registers may be x16 (scratch), so the
+// caller must use them at once.
+fn gen_mem_addr(e, d) {
+    let size = type_width(e[N_TYPE]);
+    let base = gen_val(e[MEM_BASE], d);
+    let off = e[MEM_OFF];
+    let ix = e[MEM_INDEX];
+    let scale = e[MEM_SCALE];
+    if ix && is_const(ix) {
+        off = off + const_val(ix) * scale;
+        ix = 0;
+    }
+    if ix {
+        let idx = gen_val(ix, next_depth(base, d));
+        if e[MEM_LEN] {
+            bounds_check(idx, e[MEM_LEN], next_depth(idx, next_depth(base, d)));
+        }
+        if off == 0 && scale == size {
+            mm_base = base;
+            mm_index = idx;
+            mm_off = 0;
+            return;
+        }
+        emit4(I_ADD, X16, base, idx, SH_LSL + width_log2(scale));
+        base = X16;
+    }
+    if off >= 0 && off % size == 0 && off / size < 4096 {
+        mm_base = base;
+        mm_index = -1;
+        mm_off = off;
+        return;
+    }
+    add_imm(X16, base, off);
+    mm_base = X16;
+    mm_index = -1;
+    mm_off = 0;
+}
+
+fn emit_load(dst, t) {
+    let kind = mem_kind(t);
+    if mm_index >= 0 {
+        emit4(I_LDX, dst, mm_base, mm_index, kind | MK_SCALED);
+    } else {
+        emit4(I_LD, dst, mm_base, mm_off, kind);
+    }
+}
+
+fn emit_store(v, t) {
+    let kind = mem_kind(t);
+    if mm_index >= 0 {
+        emit4(I_STX, v, mm_base, mm_index, kind | MK_SCALED);
+    } else {
+        emit4(I_ST, v, mm_base, mm_off, kind);
+    }
+}
+
+fn gen_mem_load(e, dst, d) {
+    gen_mem_addr(e, d);
+    emit_load(dst, e[N_TYPE]);
+}
+
+// bounds_check traps unless idx is below the length expression (an unsigned compare
+// also catches negative indexes).
+fn bounds_check(idx, lenexpr, d) {
+    let lr = 0;
+    if lenexpr[N_KIND] == EX_IDENT && lenexpr[ID_REF][S_KIND] == SYM_LOCAL && lenexpr[ID_REF][S_REG] >= 0 {
+        lr = lenexpr[ID_REF][S_REG];
+    } else {
+        gen_to(lenexpr, X17, d);
+        lr = X17;
+    }
+    emit2(I_CMP, idx, lr);
+    emit2(I_BCOND, C_HS, trap_at(idx, lr, 0));
+}
+
+fn get_trap() {
+    if !trap_label {
+        trap_label = new_label();
+    }
+    return trap_label;
+}
+
+// trap_at is a cold stub for one bounds check that reports its index and length.
+fn trap_at(idx, len, cidx) {
+    let l = new_label();
+    let site = vec_new();
+    vec_push(site, l);
+    vec_push(site, idx);
+    vec_push(site, len);
+    vec_push(site, cidx);
+    vec_push(trap_sites, site);
+    return l;
+}
+
+// gen_elem_addr evaluates a slice or string element address (with its bounds check)
+// into mm_base/mm_index/mm_off.
+fn gen_elem_addr(e, d) {
+    let h = gen_val(e[ELEM_SEQ], d);
+    let d1 = next_depth(h, d);
+    let size = e[ELEM_SIZE];
+    let ix = e[ELEM_IDX];
+    let first = 16;
+    if e[ELEM_STR] {
+        first = 8;
+    }
+    if is_const(ix) {
+        let c = const_val(ix);
+        if !e[ELEM_SAFE] {
+            emit4(I_LD, X17, h, 0, 3);
+            if c >= 0 && c < 4096 {
+                emit2(I_CMPI, X17, c);
+            } else {
+                load_imm(X16, c);
+                emit2(I_CMP, X17, X16);
+            }
+            emit2(I_BCOND, C_LS, trap_at(-1, X17, c));
+        }
+        if e[ELEM_STR] {
+            mm_base = h;
+            mm_off = first + c * size;
+        } else {
+            emit4(I_LD, X16, h, 16, 3);
+            mm_base = X16;
+            mm_off = c * size;
+        }
+        mm_index = -1;
+        if mm_off < 0 || mm_off / size >= 4096 {
+            add_imm(X16, mm_base, mm_off);
+            mm_base = X16;
+            mm_off = 0;
+        }
+        return;
+    }
+    let idx = gen_val(ix, d1);
+    if !e[ELEM_SAFE] {
+        emit4(I_LD, X17, h, 0, 3);
+        emit2(I_CMP, idx, X17);
+        emit2(I_BCOND, C_HS, trap_at(idx, X17, 0));
+    }
+    if e[ELEM_STR] {
+        emit3(I_ADDI, X16, h, 8);
+    } else {
+        emit4(I_LD, X16, h, 16, 3);
+    }
+    mm_base = X16;
+    mm_index = idx;
+    mm_off = 0;
+}
+
+fn gen_elem_load(e, dst, d) {
+    gen_elem_addr(e, d);
+    emit_load(dst, e[N_TYPE]);
+}
+
+// gen_seq runs a checker-made statement list, then computes its value. The statements
+// use temps from depth 0, so live temps below d are saved around them.
+fn gen_seq(e, dst, d) {
+    let i = 0;
+    while i < d {
+        if i < t_count {
+            emit1(I_PUSH, vec_get(t_regs, i));
+        }
+        if i < f_count {
+            emit1(I_FPUSH, vec_get(f_regs, i));
+        }
+        i = i + 1;
+    }
+    gen_stmts(e[SEQ_STMTS]);
+    i = d - 1;
+    while i >= 0 {
+        if i < f_count {
+            emit1(I_FPOP, vec_get(f_regs, i));
+        }
+        if i < t_count {
+            emit1(I_POP, vec_get(t_regs, i));
+        }
+        i = i - 1;
+    }
+    let v = e[SEQ_VALUE];
+    if dst >= 0 && kind_of(e[N_TYPE]) != K_VOID {
+        gen_to(v, dst, d);
+    } else {
+        gen_effect(v);
+    }
+}
+
+// gen_addr8 picks a byte address mode for p: am_base plus am_index, or plus am_off.
+fn gen_addr8(p, d) {
+    if p[N_KIND] == EX_BINARY && streq(p[BIN_OP], "+") {
+        let r = p[BIN_R];
+        if is_const(r) && const_val(r) >= 0 && const_val(r) < 4096 {
+            let c = const_val(r);
+            am_base = gen_val(p[BIN_L], d);
+            am_index = -1;
+            am_off = c;
+            return;
+        }
+        gen_pair(p[BIN_L], r, d);
+        am_base = pl;
+        am_index = pr;
+        return;
+    }
+    am_base = gen_val(p, d);
+    am_index = -1;
+    am_off = 0;
+}
+
+fn float_intrinsic_op(name) {
+    if load8(name) != '_' || load8(name + 1) != '_' || load8(name + 2) != 'f' {
+        return 0;
+    }
+    if streq(name, "__fsqrt") {
+        return I_FSQRT;
+    }
+    if streq(name, "__fabs") {
+        return I_FABS;
+    }
+    if streq(name, "__frintm") {
+        return I_FRINTM;
+    }
+    if streq(name, "__frintp") {
+        return I_FRINTP;
+    }
+    if streq(name, "__frintz") {
+        return I_FRINTZ;
+    }
+    if streq(name, "__frinta") {
+        return I_FRINTA;
+    }
+    if streq(name, "__frintn") {
+        return I_FRINTN;
+    }
+    return 0;
+}
+
+fn gen_intrinsic(e, dst, d) {
+    let name = e[CALL_NAME];
+    if streq(name, "__prefetchw") {
+        gen_pair(vec_get(e[CALL_ARGS], 0), vec_get(e[CALL_ARGS], 1), d);
+        emit3(I_PRFM, 16, pl, pr);
+        return;
+    }
+    if streq(name, "load8") {
+        gen_addr8(vec_get(e[CALL_ARGS], 0), d);
+        if am_index < 0 {
+            emit3(I_LDRB, dst, am_base, am_off);
+        } else {
+            emit3(I_LDRBX, dst, am_base, am_index);
+        }
+        return;
+    }
+    if gen_runtime_intrinsic(e, dst, d) {
+        return;
+    }
+    gen_store8(e, dst, d);
+}
+
+// Runtime intrinsics: the thread context register and atomics for lib/runtime.tin.
+fn gen_runtime_intrinsic(e, dst, d) {
+    let name = e[CALL_NAME];
+    let args = e[CALL_ARGS];
+    if streq(name, "__ctx") {
+        mov(dst, 28);
+        return 1;
+    }
+    if streq(name, "__fp") {
+        mov(dst, FP);
+        return 1;
+    }
+    let fop = float_intrinsic_op(name);
+    if fop {
+        let fx = gen_val(vec_get(args, 0), d);
+        emit2(fop, dst, fx);
+        return 1;
+    }
+    if streq(name, "__st") {
+        // __st(p, v, sizelog2): a raw sized store for the runtime.
+        gen_pair(vec_get(args, 0), vec_get(args, 1), d);
+        emit4(I_ST, pr, pl, 0, const_val(vec_get(args, 2)));
+        return 1;
+    }
+    if streq(name, "__ld") {
+        let p = gen_val(vec_get(args, 0), d);
+        let k = vec_get(args, 1);
+        if is_const(k) {
+            emit4(I_LD, dst, p, 0, const_val(k));
+        } else {
+            emit4(I_LD, dst, p, 0, 3);
+        }
+        return 1;
+    }
+    if streq(name, "__empty") {
+        let z = sym_ref(SK_ZERO, 0);
+        emit2(I_ADRP, dst, z);
+        emit3(I_ADDLO, dst, dst, z);
+        return 1;
+    }
+    if streq(name, "__set_ctx") {
+        gen_to(vec_get(args, 0), 28, d);
+        return 1;
+    }
+    if streq(name, "__atomic_add") {
+        // Returns the old value: ldaddal adds v to [p] atomically.
+        gen_pair(vec_get(args, 0), vec_get(args, 1), d);
+        emit3(I_LDADDAL, pr, X17, pl);
+        if dst >= 0 {
+            mov(dst, X17);
+        }
+        return 1;
+    }
+    if streq(name, "__atomic_cas") {
+        // __atomic_cas(p, old, new) returns the value found at p.
+        let p = gen_val(vec_get(args, 0), d);
+        let d1 = next_depth(p, d);
+        let o = gen_val(vec_get(args, 1), d1);
+        let d2 = next_depth(o, d1);
+        let n = gen_val(vec_get(args, 2), d2);
+        mov(X17, o);
+        emit3(I_CASAL, X17, n, p);
+        if dst >= 0 {
+            mov(dst, X17);
+        }
+        return 1;
+    }
+    if streq(name, "__atomic_swap") {
+        gen_pair(vec_get(args, 0), vec_get(args, 1), d);
+        emit3(I_SWPAL, pr, X17, pl);
+        if dst >= 0 {
+            mov(dst, X17);
+        }
+        return 1;
+    }
+    if streq(name, "__atomic_load") {
+        let p = gen_val(vec_get(args, 0), d);
+        emit2(I_LDAR, dst, p);
+        return 1;
+    }
+    if streq(name, "__atomic_store") {
+        gen_pair(vec_get(args, 0), vec_get(args, 1), d);
+        emit2(I_STLR, pr, pl);
+        return 1;
+    }
+    if streq(name, "__yield") {
+        emit1(I_YIELD, 0);
+        return 1;
+    }
+    return 0;
+}
+
+// gen_store8 stores a byte and, when dst >= 0, also yields the stored value.
+fn gen_store8(e, dst, d) {
+    let p = vec_get(e[CALL_ARGS], 0);
+    let v = vec_get(e[CALL_ARGS], 1);
+    let base = 0;
+    let index = -1;
+    let off = 0;
+    let dv = d;
+    if p[N_KIND] == EX_BINARY && streq(p[BIN_OP], "+") && is_const(p[BIN_R]) && const_val(p[BIN_R]) >= 0 && const_val(p[BIN_R]) < 4096 {
+        off = const_val(p[BIN_R]);
+        base = gen_val(p[BIN_L], d);
+        dv = next_depth(base, d);
+    } else if p[N_KIND] == EX_BINARY && streq(p[BIN_OP], "+") && d + 3 <= t_count {
+        base = gen_val(p[BIN_L], d);
+        index = gen_val(p[BIN_R], next_depth(base, d));
+        dv = next_depth(index, next_depth(base, d));
+    } else {
+        base = gen_val(p, d);
+        dv = next_depth(base, d);
+    }
+    let val = 0;
+    if dv >= t_count {
+        // Too deep for another temp: keep the address on the stack meanwhile.
+        emit1(I_PUSH, base);
+        mov(X17, gen_val(v, d));
+        emit1(I_POP, base);
+        val = X17;
+    } else if is_const(v) && const_val(v) == 0 {
+        val = ZR;
+    } else {
+        val = gen_val(v, dv);
+    }
+    if index >= 0 {
+        emit3(I_STRBX, val, base, index);
+    } else {
+        emit3(I_STRB, val, base, off);
+    }
+    if dst >= 0 {
+        mov(dst, val);
+    }
+}
+
+// param_types are the parameter types a call passes, from its callee or func type.
+fn call_ptypes(e) {
+    if e[CALL_FN] {
+        return e[CALL_FN][F_PTYPES];
+    }
+    return e[CALL_CALLEE][N_TYPE][TY_FIELDS];
+}
+
+// arg_regs gives each argument its register: x0-x7 and d0-d7 counted separately,
+// or -1 for a variadic argument that goes on the stack.
+fn arg_regs(e) {
+    let ptypes = call_ptypes(e);
+    let n = e[CALL_ARGS][VEC_LEN];
+    let regs = vec_new();
+    let ni = 0;
+    let nf = 0;
+    let i = 0;
+    while i < n {
+        if i >= ptypes[VEC_LEN] && !tgt_linux {
+            // Apple's arm64 ABI passes variadic arguments on the stack.
+            vec_push(regs, -1);
+        } else if i >= ptypes[VEC_LEN] && e_fp(vec_get(e[CALL_ARGS], i)) {
+            // AAPCS64 (Linux) passes them in registers like any other argument.
+            vec_push(regs, FPR + nf);
+            nf = nf + 1;
+        } else if i >= ptypes[VEC_LEN] {
+            vec_push(regs, ni);
+            ni = ni + 1;
+        } else if is_float_t(vec_get(ptypes, i)) {
+            vec_push(regs, FPR + nf);
+            nf = nf + 1;
+        } else {
+            vec_push(regs, ni);
+            ni = ni + 1;
+        }
+        i = i + 1;
+    }
+    return regs;
+}
+
+fn push_reg(r) {
+    if is_fp(r) {
+        emit1(I_FPUSH, r);
+    } else {
+        emit1(I_PUSH, r);
+    }
+}
+
+fn pop_reg(r) {
+    if is_fp(r) {
+        emit1(I_FPOP, r);
+    } else {
+        emit1(I_POP, r);
+    }
+}
+
+fn caller_saved(r) {
+    if is_fp(r) {
+        return r < FPR + 8 || r >= FPR + 16;
+    }
+    return r < 19;
+}
+
+// gen_call leaves the result in x0 (or d0 for a float).
+fn gen_call(e, d) {
+    let args = e[CALL_ARGS];
+    let n = args[VEC_LEN];
+    let areg = arg_regs(e);
+    let f = e[CALL_FN];
+    let callee = e[CALL_CALLEE];
+    let variadic = f && f[F_VARIADIC] && !tgt_linux;
+    let callee_reg = -1;
+    let d0 = d;
+    if callee && contains_call(callee) {
+        callee_reg = gen_val(callee, d);
+        d0 = next_depth(callee_reg, d);
+    }
+    let nested = variadic;
+    let i = 0;
+    while i < n {
+        if contains_call(vec_get(args, i)) {
+            nested = 1;
+        }
+        i = i + 1;
+    }
+    let regs = vec_filled(n, -1);
+    if !nested {
+        // Temps never use x0-x7/d0-d7 in a function that calls, so args go straight there.
+        i = 0;
+        while i < n {
+            gen_to(vec_get(args, i), vec_get(areg, i), d0);
+            i = i + 1;
+        }
+    } else if d0 + n <= t_count && d0 + n <= f_count {
+        // Arguments with calls or loads run first, in order; the rest are effect-free
+        // and go straight into their registers afterwards.
+        let last = -1;
+        i = 0;
+        while i < n {
+            if !speculable(vec_get(args, i)) || vec_get(areg, i) < 0 {
+                last = i;
+            }
+            i = i + 1;
+        }
+        // dd counts the temps actually holding earlier arguments, so nested calls only
+        // save what is live.
+        let dd = d0;
+        i = 0;
+        while i < n {
+            let a = vec_get(args, i);
+            if i == last && is_real_call(a) && vec_get(areg, i) >= 0 && !variadic {
+                // Nothing runs between this call and ours, so the result moves right in.
+                gen_call(a, dd);
+                if e_fp(a) {
+                    mov(vec_get(areg, i), FPR);
+                } else {
+                    mov(vec_get(areg, i), 0);
+                }
+                regs[VEC_DATA][i] = vec_get(areg, i);
+            } else if !speculable(a) || vec_get(areg, i) < 0 {
+                let r = gen_val(a, dd);
+                regs[VEC_DATA][i] = r;
+                dd = next_depth(r, dd);
+            }
+            i = i + 1;
+        }
+    } else {
+        i = 0;
+        while i < n {
+            push_reg(gen_val(vec_get(args, i), d0));
+            i = i + 1;
+        }
+        i = n - 1;
+        while i >= 0 {
+            let r = vec_get(areg, i);
+            if r < 0 {
+                r = X16;
+                if e_fp(vec_get(args, i)) {
+                    r = FSCR;
+                }
+            }
+            // Recorded so the fix-up passes below neither move nor re-evaluate it.
+            regs[VEC_DATA][i] = r;
+            pop_reg(r);
+            i = i - 1;
+        }
+    }
+    // A variadic call stores its stack arguments while their temps are intact, and
+    // saves live temps first so the pushes land above the argument area.
+    let area = 0;
+    if variadic {
+        save_temps(d);
+        area = store_varargs(f, regs, n);
+    }
+    if nested {
+        i = 0;
+        while i < n {
+            let r = vec_get(regs, i);
+            if r >= 0 && vec_get(areg, i) >= 0 {
+                mov(vec_get(areg, i), r);
+            }
+            i = i + 1;
+        }
+        i = 0;
+        while i < n {
+            if vec_get(regs, i) < 0 {
+                // The temps above d are free again once moved into argument registers.
+                gen_to(vec_get(args, i), vec_get(areg, i), d0);
+            }
+            i = i + 1;
+        }
+    }
+    // With the args in place, a callee's parameter-only base case can be answered
+    // without the call (fib's leaves), which Go never inlines for recursive functions.
+    let pat = 0;
+    if f && !variadic {
+        pat = exit_pattern(f);
+    }
+    let done_l = 0;
+    if pat && d0 + n + 2 <= t_count && d0 + n + 2 <= f_count {
+        let homes = param_homes(f);
+        with_params_in_args(f, 0);
+        let call_l = new_label();
+        done_l = new_label();
+        gen_cond(pat[IF_COND], call_l, d0 + n);
+        let r = vec_get(pat[IF_THEN][BLK_STMTS], 0);
+        if r[RET_VALUE] {
+            if is_float_t(vec_get(f[F_RTYPES], 0)) {
+                gen_to(r[RET_VALUE], FPR, d0 + n);
+            } else {
+                gen_to(r[RET_VALUE], 0, d0 + n);
+            }
+        } else {
+            emit3(I_MOVZ, 0, 0, 0);
+        }
+        emit1(I_B, done_l);
+        label(call_l);
+        with_params_in_args(f, homes);
+    }
+    if !variadic {
+        save_temps(d);
+    }
+    if f {
+        emit1(I_BL, f);
+        f[F_USED] = 1;
+    } else if callee_reg >= 0 {
+        emit1(I_BLR, callee_reg);
+    } else {
+        gen_to(callee, X16, d0);
+        emit1(I_BLR, X16);
+    }
+    if area > 0 {
+        emit3(I_ADDI, SP, SP, area);
+    }
+    if done_l {
+        // Branch past the restores: the inline answer didn't spill anything.
+        let after = new_label();
+        restore_temps(d);
+        emit1(I_B, after);
+        label(done_l);
+        label(after);
+        return;
+    }
+    restore_temps(d);
+}
+
+// save_temps pushes the live caller-saved temps below depth d before a call.
+fn save_temps(d) {
+    let i = 0;
+    while i < d {
+        if i < t_count && caller_saved(vec_get(t_regs, i)) {
+            emit1(I_PUSH, vec_get(t_regs, i));
+        }
+        if i < f_count && caller_saved(vec_get(f_regs, i)) {
+            emit1(I_FPUSH, vec_get(f_regs, i));
+        }
+        i = i + 1;
+    }
+}
+
+// store_varargs places a variadic call's extra arguments in 8-byte stack slots
+// (Apple's ABI) and returns the bytes reserved.
+fn store_varargs(f, regs, n) {
+    let first = f[F_PTYPES][VEC_LEN];
+    let area = align_up(8 * (n - first), 16);
+    if area > 0 {
+        emit3(I_SUBI, SP, SP, area);
+    }
+    let i = first;
+    while i < n {
+        let r = vec_get(regs, i);
+        let off = 8 * (i - first);
+        if is_fp(r) {
+            emit3(I_STRD, r, SP, off);
+        } else {
+            emit3(I_STR, r, SP, off);
+        }
+        i = i + 1;
+    }
+    return area;
+}
+
+fn restore_temps(d) {
+    let i = d - 1;
+    while i >= 0 {
+        if i < f_count && caller_saved(vec_get(f_regs, i)) {
+            emit1(I_FPOP, vec_get(f_regs, i));
+        }
+        if i < t_count && caller_saved(vec_get(t_regs, i)) {
+            emit1(I_POP, vec_get(t_regs, i));
+        }
+        i = i - 1;
+    }
+}
+
+// ---- conditions ----
+
+// low_bits_test returns k when e is (x % 2^k) or (x & (2^k - 1)), which is zero
+// exactly when the low k bits of x are clear.
+fn low_bits_test(e) {
+    if e[N_KIND] != EX_BINARY || !is_const(e[BIN_R]) || has_effects(e[BIN_L]) || e_fp(e) {
+        return 0;
+    }
+    let c = const_val(e[BIN_R]);
+    if streq(e[BIN_OP], "%") {
+        if c < 0 && c != -9223372036854775807 - 1 {
+            c = -c;
+        }
+        let k = pow2_log(c);
+        if k > 0 {
+            return k;
+        }
+        return 0;
+    }
+    if streq(e[BIN_OP], "&") {
+        return low_mask_bits(c);
+    }
+    return 0;
+}
+
+// gen_cmp_branch branches to target when comparison e evaluates to when_true.
+fn gen_cmp_branch(e, target, d, when_true) {
+    if e_fp(e[BIN_L]) || e_fp(e[BIN_R]) {
+        gen_compare(e, d);
+        if when_true {
+            emit2(I_BCOND, cmp_cc, target);
+        } else {
+            emit2(I_BCOND, cmp_cc ^ 1, target);
+        }
+        return;
+    }
+    let cc = cond_code(e[BIN_OP]);
+    let l = e[BIN_L];
+    let r = e[BIN_R];
+    let unsigned = e_unsigned(l) || e_unsigned(r);
+    if unsigned {
+        cc = ucond_code(e[BIN_OP]);
+    }
+    if is_const(l) {
+        let t = l;
+        l = r;
+        r = t;
+        cc = swap_cc(cc);
+    }
+    if is_const(r) && const_val(r) == 0 && !(unsigned && cc != C_EQ && cc != C_NE) {
+        if cc == C_EQ || cc == C_NE {
+            let on_zero = (cc == C_EQ) == when_true;
+            let k = low_bits_test(l);
+            if k == 1 {
+                let x = gen_val(l[BIN_L], d);
+                if on_zero {
+                    emit3(I_TBZ, x, 0, target);
+                } else {
+                    emit3(I_TBNZ, x, 0, target);
+                }
+                return;
+            }
+            if k > 1 {
+                emit2(I_TSTI, gen_val(l[BIN_L], d), k);
+                if on_zero {
+                    emit2(I_BCOND, C_EQ, target);
+                } else {
+                    emit2(I_BCOND, C_NE, target);
+                }
+                return;
+            }
+            let z = gen_val(l, d);
+            if on_zero {
+                emit2(I_CBZ, z, target);
+            } else {
+                emit2(I_CBNZ, z, target);
+            }
+            return;
+        }
+        if cc == C_LT || cc == C_GE {
+            let on_neg = (cc == C_LT) == when_true;
+            let s = gen_val(l, d);
+            if on_neg {
+                emit3(I_TBNZ, s, 63, target);
+            } else {
+                emit3(I_TBZ, s, 63, target);
+            }
+            return;
+        }
+    }
+    gen_compare(e, d);
+    if when_true {
+        emit2(I_BCOND, cmp_cc, target);
+    } else {
+        emit2(I_BCOND, cmp_cc ^ 1, target);
+    }
+}
+
+// gen_cond branches to f when e is false and falls through when it is true.
+fn gen_cond(e, f, d) {
+    gen_branch(e, f, d, 0);
+}
+
+// gen_branch branches to target when e's truth equals when_true.
+fn gen_branch(e, target, d, when_true) {
+    if is_const(e) {
+        if (const_val(e) != 0) == when_true {
+            emit1(I_B, target);
+        }
+        return;
+    }
+    let k = e[N_KIND];
+    if k == EX_UNARY && streq(e[UN_OP], "!") {
+        gen_branch(e[UN_X], target, d, !when_true);
+        return;
+    }
+    if k == EX_BINARY {
+        let op = e[BIN_OP];
+        let is_and = streq(op, "&&");
+        if is_and || streq(op, "||") {
+            // Branching on the operator's own sense chains; the other sense skips ahead.
+            if is_and != when_true {
+                gen_branch(e[BIN_L], target, d, when_true);
+                gen_branch(e[BIN_R], target, d, when_true);
+            } else {
+                let skip = new_label();
+                gen_branch(e[BIN_L], skip, d, !when_true);
+                gen_branch(e[BIN_R], target, d, when_true);
+                label(skip);
+            }
+            return;
+        }
+        if cond_code(op) >= 0 {
+            gen_cmp_branch(e, target, d, when_true);
+            return;
+        }
+        if streq(op, "&") && is_const(e[BIN_R]) && pow2_log(const_val(e[BIN_R])) >= 0 {
+            let bit = pow2_log(const_val(e[BIN_R]));
+            let x = gen_val(e[BIN_L], d);
+            if when_true {
+                emit3(I_TBNZ, x, bit, target);
+            } else {
+                emit3(I_TBZ, x, bit, target);
+            }
+            return;
+        }
+    }
+    let v = gen_val(e, d);
+    if is_fp(v) {
+        emit2(I_FCMPZ, v, 0);
+        if when_true {
+            emit2(I_BCOND, C_NE, target);
+        } else {
+            emit2(I_BCOND, C_EQ, target);
+        }
+        return;
+    }
+    if when_true {
+        emit2(I_CBNZ, v, target);
+    } else {
+        emit2(I_CBZ, v, target);
+    }
+}
+
+// ---- statements ----
+
+fn gen_effect(e) {
+    if !has_effects(e) {
+        return;
+    }
+    if is_real_call(e) {
+        gen_call(e, 0);
+    } else if e[N_KIND] == EX_SEQ {
+        gen_seq(e, -1, 0);
+    } else if e[N_KIND] == EX_CALL && (streq(e[CALL_NAME], "__prefetchw") || streq(e[CALL_NAME], "store8")) {
+        gen_intrinsic(e, -1, 0);
+    } else if e[N_KIND] == EX_CALL && e[CALL_INTRINSIC] {
+        let r = 0;
+        if e_fp(e) {
+            r = freg(0);
+        } else {
+            r = treg(0);
+        }
+        gen_intrinsic(e, r, 0);
+    } else {
+        gen_val(e, 0);
+    }
+}
+
+fn assign_local(s, v) {
+    if s[S_REG] >= 0 {
+        gen_to(v, s[S_REG], 0);
+    } else if s[S_REG] == REG_SLOT {
+        let r = gen_val(v, 0);
+        if is_fp(r) {
+            emit3(I_STRD, r, FP, s[S_OFF]);
+        } else {
+            emit3(I_STR, r, FP, s[S_OFF]);
+        }
+    } else {
+        gen_effect(v);
+    }
+}
+
+fn node_copy(n) {
+    let c = malloc(8 * N_SIZE);
+    let i = 0;
+    while i < N_SIZE {
+        c[i] = n[i];
+        i = i + 1;
+    }
+    return c;
+}
+
+fn node_restore(n, c) {
+    let i = 0;
+    while i < N_SIZE {
+        n[i] = c[i];
+        i = i + 1;
+    }
+}
+
+// gen_store_mem stores v through an EX_MEM or EX_ELEM target. The address parts are
+// computed into stable temps first; a[i] = a[i] op x loads the element only once.
+fn gen_store_mem(t, v) {
+    let fpv = e_fp(t);
+    let base = 0;
+    let idx = -1;
+    let off = 0;
+    let d = 0;
+    let size = type_width(t[N_TYPE]);
+    if t[N_KIND] == EX_ELEM {
+        let h = gen_val(t[ELEM_SEQ], 0);
+        d = next_depth(h, 0);
+        let ix = t[ELEM_IDX];
+        if is_const(ix) && !t[ELEM_SAFE] {
+            idx = treg(d);
+            load_imm(idx, const_val(ix));
+            d = d + 1;
+        } else if !is_const(ix) {
+            idx = gen_val(ix, d);
+            d = next_depth(idx, d);
+        }
+        if !t[ELEM_SAFE] {
+            emit4(I_LD, X17, h, 0, 3);
+            emit2(I_CMP, idx, X17);
+            emit2(I_BCOND, C_HS, trap_at(idx, X17, 0));
+        }
+        base = treg(d);
+        d = d + 1;
+        if t[ELEM_STR] {
+            emit3(I_ADDI, base, h, 8);
+        } else {
+            emit4(I_LD, base, h, 16, 3);
+        }
+        if is_const(ix) && t[ELEM_SAFE] {
+            off = const_val(ix) * size;
+        } else if is_const(ix) {
+            off = const_val(ix) * size;
+            idx = -1;
+        }
+    } else {
+        base = gen_val(t[MEM_BASE], 0);
+        d = next_depth(base, 0);
+        off = t[MEM_OFF];
+        let ix = t[MEM_INDEX];
+        if ix && is_const(ix) {
+            off = off + const_val(ix) * t[MEM_SCALE];
+        } else if ix {
+            idx = gen_val(ix, d);
+            d = next_depth(idx, d);
+            if t[MEM_LEN] {
+                bounds_check(idx, t[MEM_LEN], d);
+            }
+            if t[MEM_SCALE] != size {
+                let nb = treg(d);
+                emit4(I_ADD, nb, base, idx, SH_LSL + width_log2(t[MEM_SCALE]));
+                d = d + 1;
+                base = nb;
+                idx = -1;
+            }
+        }
+    }
+    if idx >= 0 && off != 0 {
+        let nb2 = treg(d);
+        add_imm(nb2, base, off);
+        d = d + 1;
+        base = nb2;
+        off = 0;
+    }
+    if idx < 0 && (off < 0 || off % size != 0 || off / size >= 4096) {
+        let nb3 = treg(d);
+        add_imm(nb3, base, off);
+        d = d + 1;
+        base = nb3;
+        off = 0;
+    }
+    let val = 0;
+    if v[N_KIND] == EX_BINARY && d + 2 < t_count && d + 2 < f_count && !has_effects(t) && expr_equal(v[BIN_L], t) {
+        let cur = 0;
+        if fpv {
+            cur = freg(d);
+        } else {
+            cur = treg(d);
+        }
+        mm_base = base;
+        mm_index = idx;
+        mm_off = off;
+        emit_load(cur, t[N_TYPE]);
+        let saved = node_copy(v[BIN_L]);
+        v[BIN_L][N_KIND] = EX_REG;
+        v[BIN_L][REG_NUM] = cur;
+        gen_to(v, cur, d + 1);
+        node_restore(v[BIN_L], saved);
+        val = cur;
+    } else if !fpv && is_const(v) && const_val(v) == 0 {
+        val = ZR;
+    } else {
+        val = gen_val(v, d);
+    }
+    mm_base = base;
+    mm_index = idx;
+    mm_off = off;
+    emit_store(val, t[N_TYPE]);
+}
+
+fn gen_store_index(t, v) {
+    let base = gen_val(t[IX_X], 0);
+    let d = next_depth(base, 0);
+    let ix = t[IX_I];
+    let index = -1;
+    let off = 0;
+    if is_const(ix) && const_val(ix) >= 0 && const_val(ix) < 4096 {
+        off = const_val(ix) * 8;
+    } else {
+        index = gen_val(ix, d);
+        d = next_depth(index, d);
+    }
+    let fpv = e_fp(v) || e_fp(t);
+    let val = 0;
+    if v[N_KIND] == EX_BINARY && d + 1 < t_count && d + 1 < f_count && !has_effects(t) && expr_equal(v[BIN_L], t) {
+        // a[i] = a[i] op x: load the element once and update it in a register.
+        let cur = 0;
+        if fpv {
+            cur = freg(d);
+        } else {
+            cur = treg(d);
+        }
+        if index < 0 {
+            if fpv {
+                emit3(I_LDRD, cur, base, off);
+            } else {
+                emit3(I_LDR, cur, base, off);
+            }
+        } else if fpv {
+            emit3(I_LDRDX, cur, base, index);
+        } else {
+            emit3(I_LDRX, cur, base, index);
+        }
+        let saved = node_copy(v[BIN_L]);
+        v[BIN_L][N_KIND] = EX_REG;
+        v[BIN_L][REG_NUM] = cur;
+        gen_to(v, cur, d + 1);
+        node_restore(v[BIN_L], saved);
+        val = cur;
+    } else if !fpv && is_const(v) && const_val(v) == 0 {
+        val = ZR;
+    } else {
+        val = gen_val(v, d);
+    }
+    if is_fp(val) {
+        if index < 0 {
+            emit3(I_STRD, val, base, off);
+        } else {
+            emit3(I_STRDX, val, base, index);
+        }
+        return;
+    }
+    if index < 0 {
+        emit3(I_STR, val, base, off);
+    } else {
+        emit3(I_STRX, val, base, index);
+    }
+}
+
+fn gen_assign(s) {
+    let t = s[AS_TARGET];
+    let v = s[AS_VALUE];
+    if t[N_KIND] == EX_INDEX {
+        gen_store_index(t, v);
+        return;
+    }
+    if t[N_KIND] == EX_MEM || t[N_KIND] == EX_ELEM {
+        gen_store_mem(t, v);
+        return;
+    }
+    let sym = t[ID_REF];
+    if sym[S_KIND] == SYM_LOCAL {
+        assign_local(sym, v);
+        return;
+    }
+    let r = gen_val(v, 0);
+    if sym[S_TLS] {
+        if is_fp(r) {
+            emit3(I_STRD, r, 28, tls_off(sym));
+        } else {
+            emit3(I_STR, r, 28, tls_off(sym));
+        }
+        return;
+    }
+    let g = sym_ref(SK_VAR, sym[S_INDEX]);
+    emit2(I_ADRP, X17, g);
+    if is_fp(r) {
+        emit2(I_FMOVXD, X16, r);
+        r = X16;
+    }
+    emit3(I_STRLO, r, X17, g);
+}
+
+fn gen_while(s) {
+    let cond = s[WH_COND];
+    let body_l = new_label();
+    let cond_l = new_label();
+    let post_l = new_label();
+    let end_l = new_label();
+    if s[WH_ONCE] {
+        // A switch: break leaves it, continue goes to the enclosing loop.
+        let cont = -1;
+        if g_loops[VEC_LEN] >= 2 {
+            cont = vec_get(g_loops, g_loops[VEC_LEN] - 2);
+        }
+        vec_push(g_loops, cont);
+        vec_push(g_loops, end_l);
+        gen_stmts(s[WH_BODY][BLK_STMTS]);
+        g_loops[VEC_LEN] = g_loops[VEC_LEN] - 2;
+        label(end_l);
+        return;
+    }
+    if is_const(cond) && const_val(cond) == 0 {
+        return;
+    }
+    let forever = is_const(cond);
+    let cont_l = cond_l;
+    if s[WH_POST] {
+        cont_l = post_l;
+    } else if forever {
+        cont_l = body_l;
+    }
+    // Rotated loop: the test sits at the bottom, so each iteration takes one branch.
+    if !forever {
+        emit1(I_B, cond_l);
+    }
+    label(body_l);
+    vec_push(g_loops, cont_l);
+    vec_push(g_loops, end_l);
+    gen_stmts(s[WH_BODY][BLK_STMTS]);
+    g_loops[VEC_LEN] = g_loops[VEC_LEN] - 2;
+    label(post_l);
+    if s[WH_POST] {
+        gen_stmt(s[WH_POST]);
+    }
+    if forever {
+        emit1(I_B, body_l);
+    } else {
+        label(cond_l);
+        gen_branch(cond, body_l, 0, 1);
+    }
+    label(end_l);
+}
+
+fn gen_stmts(stmts) {
+    let i = 0;
+    while i < stmts[VEC_LEN] {
+        gen_stmt(vec_get(stmts, i));
+        i = i + 1;
+    }
+}
+
+fn result_reg(f, i) {
+    if f[F_RTYPES][VEC_LEN] == 1 && is_float_t(vec_get(f[F_RTYPES], 0)) {
+        return FPR;
+    }
+    return i;
+}
+
+fn gen_stmt(s) {
+    let k = s[N_KIND];
+    if k == ST_BLOCK {
+        gen_stmts(s[BLK_STMTS]);
+    } else if k == ST_LET {
+        assign_local(s[LET_SYM], s[LET_INIT]);
+    } else if k == ST_ASSIGN {
+        gen_assign(s);
+    } else if k == ST_EXPR {
+        gen_effect(s[ES_X]);
+    } else if k == ST_IF && try_select(s) {
+        // done: both arms computed and picked with csel
+    } else if k == ST_IF {
+        let else_l = new_label();
+        gen_cond(s[IF_COND], else_l, 0);
+        gen_stmts(s[IF_THEN][BLK_STMTS]);
+        if s[IF_ELSE] {
+            let end_l = new_label();
+            emit1(I_B, end_l);
+            label(else_l);
+            gen_stmt(s[IF_ELSE]);
+            label(end_l);
+        } else {
+            label(else_l);
+        }
+    } else if k == ST_WHILE {
+        gen_while(s);
+    } else if k == ST_RETURN {
+        gen_return(s);
+    } else if k == ST_BREAK {
+        emit1(I_B, vec_get(g_loops, g_loops[VEC_LEN] - 1));
+    } else if k == ST_CONTINUE {
+        // A switch block passes continue on to the loop around it.
+        let i = g_loops[VEC_LEN] - 2;
+        while vec_get(g_loops, i) < 0 {
+            i = i - 2;
+        }
+        emit1(I_B, vec_get(g_loops, i));
+    } else if k == ST_CALLMULTI {
+        gen_call(s[CM_CALL], 0);
+        let syms = s[CM_SYMS];
+        let i = 0;
+        while i < syms[VEC_LEN] {
+            let sym = vec_get(syms, i);
+            if sym[S_REG] >= 0 {
+                mov(sym[S_REG], i);
+            } else if sym[S_REG] == REG_SLOT {
+                emit3(I_STR, i, FP, sym[S_OFF]);
+            }
+            i = i + 1;
+        }
+    }
+}
+
+// Multiple results travel in x0-x7 (floats as bits); a single float result in d0.
+fn gen_return(s) {
+    let f = cur_gen_fn;
+    if s[RET_VALUES] {
+        let vals = s[RET_VALUES];
+        let regs = vec_new();
+        let i = 0;
+        while i < vals[VEC_LEN] {
+            vec_push(regs, gen_val(vec_get(vals, i), i));
+            i = i + 1;
+        }
+        i = 0;
+        while i < vals[VEC_LEN] {
+            mov(i, vec_get(regs, i));
+            i = i + 1;
+        }
+    } else if s[RET_VALUE] {
+        gen_to(s[RET_VALUE], result_reg(f, 0), 0);
+    } else {
+        emit3(I_MOVZ, 0, 0, 0);
+    }
+    emit1(I_RET, 0);
+}
+
+// ---- if-conversion ----
+
+// speculable reports whether e can be computed even on the path that doesn't need it:
+// no calls, no memory access, and cheap enough to beat a mispredicted branch.
+fn speculable(e) {
+    let k = e[N_KIND];
+    if k == EX_INT || k == EX_STR || k == EX_FLOAT || k == EX_FUNCREF {
+        return 1;
+    }
+    if k == EX_IDENT {
+        return e[ID_REF][S_KIND] != SYM_GLOBAL;
+    }
+    if k == EX_UNARY {
+        return speculable(e[UN_X]);
+    }
+    if k == EX_BINARY {
+        return !streq(e[BIN_OP], "&&") && !streq(e[BIN_OP], "||") && speculable(e[BIN_L]) && speculable(e[BIN_R]);
+    }
+    if k == EX_CONV {
+        return e[CV_KIND] != CV_LEN && e[CV_KIND] != CV_CAP && speculable(e[CV_X]);
+    }
+    if k == EX_CALL && e[CALL_INTRINSIC] && streq(e[CALL_NAME], "__empty") {
+        return 1;
+    }
+    return 0;
+}
+
+// single_reg_assign returns the register local assigned by a block of exactly one
+// `x = e;`, or 0 if the block is anything else.
+fn single_reg_assign(b) {
+    if b[BLK_STMTS][VEC_LEN] != 1 {
+        return 0;
+    }
+    let s = vec_get(b[BLK_STMTS], 0);
+    if s[N_KIND] != ST_ASSIGN || s[AS_TARGET][N_KIND] != EX_IDENT {
+        return 0;
+    }
+    let sym = s[AS_TARGET][ID_REF];
+    if sym[S_KIND] != SYM_LOCAL || sym[S_REG] < 0 || !speculable(s[AS_VALUE]) {
+        return 0;
+    }
+    return s;
+}
+
+// gen_flags sets the flags for condition e and returns the condition code meaning true.
+fn gen_flags(e, d) {
+    if e[N_KIND] == EX_UNARY && streq(e[UN_OP], "!") {
+        return gen_flags(e[UN_X], d) ^ 1;
+    }
+    if e[N_KIND] == EX_BINARY {
+        let cc = cond_code(e[BIN_OP]);
+        if (cc == C_EQ || cc == C_NE) && !e_fp(e[BIN_L]) && is_const(e[BIN_R]) && const_val(e[BIN_R]) == 0 && low_bits_test(e[BIN_L]) > 0 {
+            let l = e[BIN_L];
+            emit2(I_TSTI, gen_val(l[BIN_L], d), low_bits_test(l));
+            return cc;
+        }
+        if cc >= 0 {
+            gen_compare(e, d);
+            return cmp_cc;
+        }
+    }
+    emit2(I_CMPI, gen_val(e, d), 0);
+    return C_NE;
+}
+
+// try_select compiles `if c { x = a; } else { x = b; }` as x = csel(c, a, b), like
+// Go's branchelim: both values are cheap, so computing both beats a mispredicted branch.
+fn try_select(s) {
+    let c = s[IF_COND];
+    if has_effects(c) || contains_call(c) || is_const(c) || e_fp(c) {
+        return 0;
+    }
+    if c[N_KIND] == EX_BINARY && (streq(c[BIN_OP], "&&") || streq(c[BIN_OP], "||")) {
+        return 0;
+    }
+    let ta = single_reg_assign(s[IF_THEN]);
+    if !ta {
+        return 0;
+    }
+    let x = ta[AS_TARGET][ID_REF];
+    let fb = 0;
+    if s[IF_ELSE] {
+        if s[IF_ELSE][N_KIND] != ST_BLOCK {
+            return 0;
+        }
+        fb = single_reg_assign(s[IF_ELSE]);
+        if !fb || fb[AS_TARGET][ID_REF] != x {
+            return 0;
+        }
+    }
+    if op_cost(ta[AS_VALUE]) > 6 || (fb && op_cost(fb[AS_VALUE]) > 6) || t_count < 4 || f_count < 4 {
+        return 0;
+    }
+    let a = gen_val(ta[AS_VALUE], 0);
+    let d = next_depth(a, 0);
+    let b = x[S_REG];
+    if fb {
+        b = gen_val(fb[AS_VALUE], d);
+        d = next_depth(b, d);
+    }
+    let cc = gen_flags(c, d);
+    if is_fp(x[S_REG]) {
+        emit4(I_FCSEL, x[S_REG], a, b, cc);
+    } else {
+        emit4(I_CSEL, x[S_REG], a, b, cc);
+    }
+    return 1;
+}
+
+// ---- functions ----
+
+// param_only reports whether e reads nothing but parameters and constants, with no calls.
+fn param_only(e, np) {
+    let k = e[N_KIND];
+    if k == EX_INT || k == EX_FLOAT {
+        return 1;
+    }
+    if k == EX_IDENT {
+        let s = e[ID_REF];
+        return s[S_KIND] == SYM_CONST || (s[S_KIND] == SYM_LOCAL && s[S_SLOT] < np);
+    }
+    if k == EX_UNARY {
+        return !streq(e[UN_OP], "&") && param_only(e[UN_X], np);
+    }
+    if k == EX_BINARY {
+        return param_only(e[BIN_L], np) && param_only(e[BIN_R], np);
+    }
+    return 0;
+}
+
+// exit_pattern returns f's leading `if c { return v; }` when c and v only read
+// parameters, else 0.
+fn exit_pattern(f) {
+    if f[F_EXTERN] || !f[F_BODY] || f[F_RTYPES][VEC_LEN] > 1 {
+        return 0;
+    }
+    let stmts = f[F_BODY][BLK_STMTS];
+    if stmts[VEC_LEN] < 2 {
+        return 0;
+    }
+    let s = vec_get(stmts, 0);
+    if s[N_KIND] != ST_IF || s[IF_ELSE] || s[IF_THEN][BLK_STMTS][VEC_LEN] != 1 {
+        return 0;
+    }
+    let r = vec_get(s[IF_THEN][BLK_STMTS], 0);
+    let np = f[F_PARAMS][VEC_LEN];
+    if r[N_KIND] != ST_RETURN || r[RET_VALUES] || !param_only(s[IF_COND], np) || (r[RET_VALUE] && !param_only(r[RET_VALUE], np)) {
+        return 0;
+    }
+    if op_cost(s[IF_COND]) > 4 || (r[RET_VALUE] && op_cost(r[RET_VALUE]) > 4) {
+        return 0;
+    }
+    return s;
+}
+
+// with_params_in_args points f's parameters at x0-x7/d0-d7 (or back at their homes)
+// while code is generated for f's exit pattern outside f's own frame.
+fn with_params_in_args(f, homes) {
+    let locals = f[F_LOCALS];
+    let ni = 0;
+    let nf = 0;
+    let i = 0;
+    while i < f[F_PARAMS][VEC_LEN] {
+        let s = vec_get(locals, i);
+        if homes {
+            s[S_REG] = vec_get(homes, i);
+        } else if is_float_t(vec_get(f[F_PTYPES], i)) {
+            s[S_REG] = FPR + nf;
+            nf = nf + 1;
+        } else {
+            s[S_REG] = ni;
+            ni = ni + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn param_homes(f) {
+    let homes = vec_new();
+    let i = 0;
+    while i < f[F_PARAMS][VEC_LEN] {
+        vec_push(homes, vec_get(f[F_LOCALS], i)[S_REG]);
+        i = i + 1;
+    }
+    return homes;
+}
+
+// early_exit handles a leading `if c { return v; }` that only reads parameters before
+// the frame exists, so base cases (fib's n < 2) never pay for the prologue.
+fn early_exit(f) {
+    let s = exit_pattern(f);
+    if !s {
+        return 0;
+    }
+    let r = vec_get(s[IF_THEN][BLK_STMTS], 0);
+    // Parameters are still in x0-x7 here, and x9-x15 / d16-d23 are free for temps.
+    let homes = param_homes(f);
+    with_params_in_args(f, 0);
+    let saved_t = t_regs;
+    let saved_n = t_count;
+    let saved_f = f_regs;
+    let saved_fn = f_count;
+    t_regs = vec_new();
+    let i = 9;
+    while i <= 15 {
+        vec_push(t_regs, i);
+        i = i + 1;
+    }
+    t_count = 7;
+    f_regs = vec_new();
+    i = 16;
+    while i <= 23 {
+        vec_push(f_regs, FPR + i);
+        i = i + 1;
+    }
+    f_count = 8;
+    let body_l = new_label();
+    gen_cond(s[IF_COND], body_l, 0);
+    if r[RET_VALUE] {
+        gen_to(r[RET_VALUE], result_reg(f, 0), 0);
+    } else {
+        emit3(I_MOVZ, 0, 0, 0);
+    }
+    emit1(I_RETX, 0);
+    label(body_l);
+    t_regs = saved_t;
+    t_count = saved_n;
+    f_regs = saved_f;
+    f_count = saved_fn;
+    with_params_in_args(f, homes);
+    return 1;
+}
+
+// holds_temp reports whether e's value would occupy a temp register (locals and
+// constants are used in place).
+fn holds_temp(e) {
+    let k = e[N_KIND];
+    return !(k == EX_IDENT && e[ID_REF][S_KIND] != SYM_GLOBAL) && !is_const(e);
+}
+
+// cross_calls reports whether evaluating e keeps a temp alive across a call.
+fn cross_calls(e) {
+    if !e {
+        return 0;
+    }
+    let k = e[N_KIND];
+    if k == EX_BINARY {
+        if holds_temp(e[BIN_L]) && contains_call(e[BIN_R]) {
+            return 1;
+        }
+        return cross_calls(e[BIN_L]) || cross_calls(e[BIN_R]);
+    }
+    if k == EX_INDEX {
+        if holds_temp(e[IX_X]) && contains_call(e[IX_I]) {
+            return 1;
+        }
+        return cross_calls(e[IX_X]) || cross_calls(e[IX_I]);
+    }
+    if k == EX_MEM {
+        if holds_temp(e[MEM_BASE]) && (contains_call(e[MEM_INDEX]) || contains_call(e[MEM_LEN])) {
+            return 1;
+        }
+        return cross_calls(e[MEM_BASE]) || cross_calls(e[MEM_INDEX]);
+    }
+    if k == EX_ELEM {
+        if holds_temp(e[ELEM_SEQ]) && contains_call(e[ELEM_IDX]) {
+            return 1;
+        }
+        return cross_calls(e[ELEM_SEQ]) || cross_calls(e[ELEM_IDX]);
+    }
+    if k == EX_UNARY {
+        return cross_calls(e[UN_X]);
+    }
+    if k == EX_CONV {
+        return cross_calls(e[CV_X]);
+    }
+    if k == EX_SEQ {
+        return 1;
+    }
+    if k == EX_CALL {
+        let args = e[CALL_ARGS];
+        let calls = 0;
+        let i = args[VEC_LEN] - 1;
+        while i >= 0 {
+            let a = vec_get(args, i);
+            if cross_calls(a) || (calls && !speculable(a)) {
+                return 1;
+            }
+            if contains_call(a) {
+                calls = calls + 1;
+            }
+            i = i - 1;
+        }
+    }
+    return 0;
+}
+
+fn stmts_cross_calls(stmts) {
+    let i = 0;
+    while i < stmts[VEC_LEN] {
+        if stmt_cross_calls(vec_get(stmts, i)) {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn stmt_cross_calls(s) {
+    if !s {
+        return 0;
+    }
+    let k = s[N_KIND];
+    if k == ST_LET {
+        return cross_calls(s[LET_INIT]);
+    }
+    if k == ST_ASSIGN {
+        let t = s[AS_TARGET];
+        return cross_calls(s[AS_VALUE]) || ((t[N_KIND] == EX_INDEX || t[N_KIND] == EX_MEM || t[N_KIND] == EX_ELEM) && (cross_calls(t) || contains_call(s[AS_VALUE])));
+    }
+    if k == ST_EXPR {
+        return cross_calls(s[ES_X]);
+    }
+    if k == ST_RETURN {
+        if s[RET_VALUES] {
+            return 1;
+        }
+        return s[RET_VALUE] && cross_calls(s[RET_VALUE]);
+    }
+    if k == ST_BLOCK {
+        return stmts_cross_calls(s[BLK_STMTS]);
+    }
+    if k == ST_IF {
+        return cross_calls(s[IF_COND]) || stmt_cross_calls(s[IF_THEN]) || stmt_cross_calls(s[IF_ELSE]);
+    }
+    if k == ST_WHILE {
+        return cross_calls(s[WH_COND]) || stmt_cross_calls(s[WH_BODY]) || stmt_cross_calls(s[WH_POST]);
+    }
+    return 0;
+}
+
+// assign_homes gives each local a register or frame slot and builds the temp pools.
+// It returns the number of frame slots.
+fn assign_homes(f) {
+    let locals = f[F_LOCALS];
+    let leaf = f[F_LEAF];
+    let pool = vec_new();
+    let fpool = vec_new();
+    let r = 0;
+    if leaf {
+        r = 9;
+        while r <= 15 {
+            vec_push(pool, r);
+            r = r + 1;
+        }
+        r = 16;
+        while r <= 30 {
+            vec_push(fpool, FPR + r);
+            r = r + 1;
+        }
+    }
+    r = 19;
+    while r <= 27 {
+        vec_push(pool, r);
+        r = r + 1;
+    }
+    r = 8;
+    while r <= 15 {
+        vec_push(fpool, FPR + r);
+        r = r + 1;
+    }
+    let nslots = 0;
+    let i = 0;
+    while i < locals[VEC_LEN] {
+        let s = vec_get(locals, i);
+        s[S_REG] = REG_DEAD;
+        if s[S_ADDR] {
+            s[S_REG] = REG_SLOT;
+            s[S_OFF] = 16 + 8 * nslots;
+            nslots = nslots + 1;
+        }
+        i = i + 1;
+    }
+    // Hand out registers by descending loop-weighted use count.
+    let next = 0;
+    let fnext = 0;
+    while 1 {
+        let best = 0;
+        i = 0;
+        while i < locals[VEC_LEN] {
+            let c = vec_get(locals, i);
+            if c[S_REG] == REG_DEAD && c[S_USES] > 0 && (!best || c[S_USES] > best[S_USES]) {
+                best = c;
+            }
+            i = i + 1;
+        }
+        if !best {
+            break;
+        }
+        if is_float_t(best[S_TYPE]) && fnext < fpool[VEC_LEN] {
+            best[S_REG] = vec_get(fpool, fnext);
+            used_fregs = used_fregs | (1 << (best[S_REG] - FPR));
+            fnext = fnext + 1;
+        } else if !is_float_t(best[S_TYPE]) && next < pool[VEC_LEN] {
+            best[S_REG] = vec_get(pool, next);
+            used_regs = used_regs | (1 << best[S_REG]);
+            next = next + 1;
+        } else {
+            best[S_REG] = REG_SLOT;
+            best[S_OFF] = 16 + 8 * nslots;
+            nslots = nslots + 1;
+        }
+    }
+    let cross = !leaf && stmts_cross_calls(f[F_BODY][BLK_STMTS]);
+    t_regs = vec_new();
+    f_regs = vec_new();
+    if leaf {
+        r = 0;
+        while r <= 8 {
+            vec_push(t_regs, r);
+            r = r + 1;
+        }
+        while next < pool[VEC_LEN] && vec_get(pool, next) <= 15 {
+            vec_push(t_regs, vec_get(pool, next));
+            next = next + 1;
+        }
+        r = 0;
+        while r <= 7 {
+            vec_push(f_regs, FPR + r);
+            r = r + 1;
+        }
+        while fnext < fpool[VEC_LEN] && vec_get(fpool, fnext) >= FPR + 16 {
+            vec_push(f_regs, vec_get(fpool, fnext));
+            fnext = fnext + 1;
+        }
+    } else {
+        // Leftover callee-saved registers survive calls for free; caller-saved ones
+        // cost nothing in the prologue. Prefer whichever this function needs.
+        if cross {
+            while next < pool[VEC_LEN] {
+                vec_push(t_regs, vec_get(pool, next));
+                next = next + 1;
+            }
+            while fnext < fpool[VEC_LEN] {
+                vec_push(f_regs, vec_get(fpool, fnext));
+                fnext = fnext + 1;
+            }
+        }
+        r = 9;
+        while r <= 15 {
+            vec_push(t_regs, r);
+            r = r + 1;
+        }
+        vec_push(t_regs, 8);
+        r = 16;
+        while r <= 30 {
+            vec_push(f_regs, FPR + r);
+            r = r + 1;
+        }
+        while next < pool[VEC_LEN] {
+            vec_push(t_regs, vec_get(pool, next));
+            next = next + 1;
+        }
+        while fnext < fpool[VEC_LEN] {
+            vec_push(f_regs, vec_get(fpool, fnext));
+            fnext = fnext + 1;
+        }
+    }
+    t_count = t_regs[VEC_LEN];
+    f_count = f_regs[VEC_LEN];
+    return nslots;
+}
+
+// ---- hand-assembled functions ----
+//
+// seal.hw_blocks(state, data, nblocks, k) runs the SHA-256 compression function over
+// nblocks 64-byte blocks with the ARMv8 SHA-256 instructions (every Apple Silicon core
+// has them). Only caller-saved registers are used: x0-x3, v0-v7, v16-v20.
+
+fn q_ldp(t1, t2, n, off) {
+    return 0xAD400000 | (((off >> 4) & 0x7f) << 15) | (t2 << 10) | (n << 5) | t1;
+}
+
+fn q_stp(t1, t2, n, off) {
+    return 0xAD000000 | (((off >> 4) & 0x7f) << 15) | (t2 << 10) | (n << 5) | t1;
+}
+
+fn q_ldr(t, n, off) {
+    return 0x3DC00000 | ((off >> 4) << 10) | (n << 5) | t;
+}
+
+fn v3(op, d, n, m) {
+    return op | (m << 16) | (n << 5) | d;
+}
+
+fn raw(v, word) {
+    vec_push(v, word);
+}
+
+fn sha256_hw_words() {
+    let w = vec_new();
+    raw(w, q_ldp(0, 1, 0, 0));
+    let loop = w[VEC_LEN];
+    raw(w, q_ldp(4, 5, 1, 0));
+    raw(w, q_ldp(6, 7, 1, 32));
+    raw(w, 0x91010021);
+    let r = 4;
+    while r <= 7 {
+        raw(w, 0x6E200800 | (r << 5) | r);
+        r = r + 1;
+    }
+    raw(w, v3(0x4EA01C00, 16, 0, 0));
+    raw(w, v3(0x4EA01C00, 17, 1, 1));
+    let i = 0;
+    while i < 16 {
+        let wi = 4 + i % 4;
+        raw(w, q_ldr(20, 3, 16 * i));
+        raw(w, v3(0x4EA08400, 20, 20, wi));
+        if i < 12 {
+            raw(w, 0x5E282800 | ((4 + (i + 1) % 4) << 5) | wi);
+        }
+        raw(w, v3(0x4EA01C00, 18, 0, 0));
+        raw(w, v3(0x5E004000, 0, 1, 20));
+        raw(w, v3(0x5E005000, 1, 18, 20));
+        if i < 12 {
+            raw(w, v3(0x5E006000, wi, 4 + (i + 2) % 4, 4 + (i + 3) % 4));
+        }
+        i = i + 1;
+    }
+    raw(w, v3(0x4EA08400, 0, 0, 16));
+    raw(w, v3(0x4EA08400, 1, 1, 17));
+    raw(w, 0xF1000442);
+    let back = (loop - w[VEC_LEN]) & 0x7ffff;
+    raw(w, 0x54000000 | (back << 5) | 1);
+    raw(w, q_stp(0, 1, 0, 0));
+    raw(w, 0xD65F03C0);
+    return w;
+}
+
+// gen_raw_fn emits f as the hand-assembled words.
+fn gen_raw_fn(f, words) {
+    out4(I_FUNC, f, 0, 0, 0);
+    let i = 0;
+    while i < words[VEC_LEN] {
+        out4(I_RAW, vec_get(words, i), 0, 0, 0);
+        i = i + 1;
+    }
+}
+
+fn gen_fn(f) {
+    if streq(f[F_QNAME], "seal.hw_blocks") {
+        gen_raw_fn(f, sha256_hw_words());
+        return;
+    }
+    cur_gen_fn = f;
+    trap_label = 0;
+    div_label = 0;
+    trap_sites = vec_new();
+    if getenv("TINC_TRACE") {
+        let tb = buf_new();
+        buf_str(tb, "gen ");
+        buf_str(tb, f[F_QNAME]);
+        buf_byte(tb, '\n');
+        write_all(2, tb);
+    }
+    inline_appends(f);
+    licm_fn(f);
+    analyze_fn(f);
+    used_regs = 0;
+    used_fregs = 0;
+    g_loops[VEC_LEN] = 0;
+    let nslots = assign_homes(f);
+    cg = vec_new();
+    let early = early_exit(f);
+    let pre = cg;
+    cg = vec_new();
+    let locals = f[F_LOCALS];
+    let ni = 0;
+    let nf = 0;
+    let i = 0;
+    while i < f[F_PARAMS][VEC_LEN] {
+        let s = vec_get(locals, i);
+        let src = 0;
+        if is_float_t(vec_get(f[F_PTYPES], i)) {
+            src = FPR + nf;
+            nf = nf + 1;
+        } else {
+            src = ni;
+            ni = ni + 1;
+        }
+        if s[S_REG] >= 0 {
+            mov(s[S_REG], src);
+        } else if s[S_REG] == REG_SLOT {
+            if is_fp(src) {
+                emit3(I_STRD, src, FP, s[S_OFF]);
+            } else {
+                emit3(I_STR, src, FP, s[S_OFF]);
+            }
+        }
+        i = i + 1;
+    }
+    let stmts = f[F_BODY][BLK_STMTS];
+    i = early;
+    while i < stmts[VEC_LEN] {
+        gen_stmt(vec_get(stmts, i));
+        i = i + 1;
+    }
+    emit3(I_MOVZ, 0, 0, 0);
+    emit1(I_RET, 0);
+    if trap_label {
+        // The cold path every failed bounds check jumps to.
+        label(trap_label);
+        let bf = find_fn("rt_bounds_fail");
+        if bf {
+            emit1(I_BL, bf);
+            bf[F_USED] = 1;
+        }
+    }
+    if div_label {
+        label(div_label);
+        let df = find_fn("rt_div_fail");
+        if df {
+            emit1(I_BL, df);
+            df[F_USED] = 1;
+        }
+    }
+    // Per-site stubs: the index and length go through the stack into x0/x1 (any registers).
+    let ts = 0;
+    let bf2 = find_fn("rt_bounds_fail2");
+    while ts < trap_sites[VEC_LEN] {
+        let site = vec_get(trap_sites, ts);
+        label(vec_get(site, 0));
+        let ireg = vec_get(site, 1);
+        if ireg < 0 {
+            load_imm(X16, vec_get(site, 3));
+            ireg = X16;
+        }
+        emit3(I_STPPRE, ireg, vec_get(site, 2), -16);
+        emit3(I_LDR, 0, SP, 0);
+        emit3(I_LDR, 1, SP, 8);
+        if bf2 {
+            emit1(I_BL, bf2);
+            bf2[F_USED] = 1;
+        }
+        ts = ts + 1;
+    }
+    finish_fn(f, nslots, pre);
+}
+
+fn out4(op, a, b, c, d) {
+    vec_push(code, op);
+    vec_push(code, a);
+    vec_push(code, b);
+    vec_push(code, c);
+    vec_push(code, d);
+}
+
+// save_regs stores (or, with load, reloads) callee-saved registers in pairs.
+fn save_regs(saved, base, load) {
+    let i = 0;
+    while i < saved[VEC_LEN] {
+        let off = base + 8 * i;
+        let r = vec_get(saved, i);
+        let fp = is_fp(r);
+        if i + 1 < saved[VEC_LEN] && off + 8 <= 504 && is_fp(vec_get(saved, i + 1)) == fp {
+            let op = I_STP;
+            if fp && load {
+                op = I_LDPD;
+            } else if fp {
+                op = I_STPD;
+            } else if load {
+                op = I_LDP;
+            }
+            out4(op, r, vec_get(saved, i + 1), FP, off);
+            i = i + 2;
+        } else {
+            let op1 = I_STR;
+            if fp && load {
+                op1 = I_LDRD;
+            } else if fp {
+                op1 = I_STRD;
+            } else if load {
+                op1 = I_LDR;
+            }
+            out4(op1, r, FP, off, 0);
+            i = i + 1;
+        }
+    }
+}
+
+// branch_to_next reports whether the branch at instruction i only skips labels to reach its target.
+fn branch_to_next(i, n) {
+    let target = vec_get(cg, 5 * i + 1);
+    let j = i + 1;
+    while j < n && vec_get(cg, 5 * j) == I_LABEL {
+        if vec_get(cg, 5 * j + 1) == target {
+            return 1;
+        }
+        j = j + 1;
+    }
+    return 0;
+}
+
+// label_follows reports whether only labels separate instruction i from label l.
+fn label_follows(i, n, l) {
+    let j = i;
+    while j < n && vec_get(cg, 5 * j) == I_LABEL {
+        if vec_get(cg, 5 * j + 1) == l {
+            return 1;
+        }
+        j = j + 1;
+    }
+    return 0;
+}
+
+// cond_branch_target returns the label of a conditional branch, or -1.
+fn cond_branch_target(k) {
+    let op = vec_get(cg, k);
+    if op == I_BCOND || op == I_CBZ || op == I_CBNZ {
+        return vec_get(cg, k + 2);
+    }
+    if op == I_TBZ || op == I_TBNZ {
+        return vec_get(cg, k + 3);
+    }
+    return -1;
+}
+
+// emit_inverted copies conditional branch k with its sense flipped, aimed at label l.
+fn emit_inverted(k, l) {
+    let op = vec_get(cg, k);
+    let a = vec_get(cg, k + 1);
+    if op == I_BCOND {
+        out4(I_BCOND, a ^ 1, l, 0, 0);
+    } else if op == I_CBZ {
+        out4(I_CBNZ, a, l, 0, 0);
+    } else if op == I_CBNZ {
+        out4(I_CBZ, a, l, 0, 0);
+    } else if op == I_TBZ {
+        out4(I_TBNZ, a, vec_get(cg, k + 2), l, 0);
+    } else {
+        out4(I_TBZ, a, vec_get(cg, k + 2), l, 0);
+    }
+}
+
+// finish_fn wraps the body in its prologue and epilogues and drops unreachable code.
+fn finish_fn(f, nslots, pre) {
+    let saved = vec_new();
+    let r = 19;
+    while r <= 27 {
+        if (used_regs >> r) & 1 {
+            vec_push(saved, r);
+        }
+        r = r + 1;
+    }
+    r = 8;
+    while r <= 15 {
+        if (used_fregs >> r) & 1 {
+            vec_push(saved, FPR + r);
+        }
+        r = r + 1;
+    }
+    let slot_bytes = align_up(8 * nslots, 16);
+    let frame = 16 + slot_bytes + align_up(8 * saved[VEC_LEN], 16);
+    let frameless = f[F_LEAF] && nslots == 0 && saved[VEC_LEN] == 0;
+    if frame > MAX_FRAME {
+        err_quoted(f[F_POS], "function ", f[F_NAME], " has too many local variables");
+    }
+    out4(I_FUNC, f, 0, 0, 0);
+    let j = 0;
+    while j < pre[VEC_LEN] {
+        out4(vec_get(pre, j), vec_get(pre, j + 1), vec_get(pre, j + 2), vec_get(pre, j + 3), vec_get(pre, j + 4));
+        j = j + 5;
+    }
+    if !frameless {
+        if frame <= 504 {
+            out4(I_STPPRE, FP, LR, -frame, 0);
+        } else {
+            out4(I_SUBI, SP, SP, frame, 0);
+            out4(I_STP, FP, LR, SP, 0);
+        }
+        out4(I_ADDI, FP, SP, 0, 0);
+        save_regs(saved, 16 + slot_bytes, 0);
+    }
+    let n = cg[VEC_LEN] / 5;
+    let dead = 0;
+    let i = 0;
+    while i < n {
+        let op = vec_get(cg, 5 * i);
+        if op == I_LABEL {
+            dead = 0;
+        }
+        if dead || (op == I_B && branch_to_next(i, n)) {
+            i = i + 1;
+            continue;
+        }
+        // b.cond L1; b L2; L1:  becomes  b.!cond L2; L1:
+        let t1 = cond_branch_target(5 * i);
+        if t1 >= 0 && i + 1 < n && vec_get(cg, 5 * (i + 1)) == I_B && label_follows(i + 2, n, t1) {
+            emit_inverted(5 * i, vec_get(cg, 5 * (i + 1) + 1));
+            i = i + 2;
+            continue;
+        }
+        if op == I_RET {
+            if !frameless {
+                save_regs(saved, 16 + slot_bytes, 1);
+                if frame <= 504 {
+                    out4(I_LDPPOST, FP, LR, frame, 0);
+                } else {
+                    out4(I_LDP, FP, LR, SP, 0);
+                    out4(I_ADDI, SP, SP, frame, 0);
+                }
+            }
+            out4(I_RETX, 0, 0, 0, 0);
+            dead = 1;
+        } else {
+            let k = 5 * i;
+            out4(op, vec_get(cg, k + 1), vec_get(cg, k + 2), vec_get(cg, k + 3), vec_get(cg, k + 4));
+            if op == I_B {
+                dead = 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn generate() {
+    if tgt_x64 {
+        generate_x64();
+        return;
+    }
+    code = vec_new();
+    g_labels = 0;
+    g_str_ptrs = vec_new();
+    g_str_lens = vec_new();
+    g_tstr_ptrs = vec_new();
+    g_tstr_lens = vec_new();
+    g_loops = vec_new();
+    let i = 0;
+    while i < prog_fns[VEC_LEN] {
+        vec_get(prog_fns, i)[F_INDEX] = i;
+        i = i + 1;
+    }
+    inline_small_calls();
+    i = 0;
+    while i < prog_fns[VEC_LEN] {
+        let f = vec_get(prog_fns, i);
+        if !f[F_EXTERN] && f[F_REACH] {
+            gen_fn(f);
+        }
+        i = i + 1;
+    }
+}
+
+// print_asm renders the program as clang-compatible assembly (tinc -S).
+fn print_asm() {
+    let b = buf_new();
+    buf_str(b, "\t.section\t__TEXT,__text,regular,pure_instructions\n");
+    let i = 0;
+    while i < code[VEC_LEN] {
+        print_ins(b, code[VEC_DATA] + 8 * i);
+        i = i + 5;
+    }
+    if prog_vars[VEC_LEN] > 0 {
+        buf_str(b, "\t.section\t__DATA,__data\n\t.p2align\t3\n");
+        i = 0;
+        while i < prog_vars[VEC_LEN] {
+            let v = vec_get(prog_vars, i);
+            buf_str(b, "_");
+            buf_str(b, var_label(v));
+            buf_str(b, ":\n\t.quad ");
+            buf_int(b, v[D_VAL]);
+            buf_byte(b, '\n');
+            i = i + 1;
+        }
+    }
+    if g_str_ptrs[VEC_LEN] > 0 {
+        buf_str(b, "\t.section\t__TEXT,__cstring,cstring_literals\n");
+        i = 0;
+        while i < g_str_ptrs[VEC_LEN] {
+            buf_str(b, "l_.str.");
+            buf_int(b, i);
+            buf_str(b, ":\n\t.asciz \"");
+            asm_escape(b, vec_get(g_str_ptrs, i), vec_get(g_str_lens, i));
+            buf_str(b, "\"\n");
+            i = i + 1;
+        }
+    }
+    buf_str(b, "\t.section\t__TEXT,__const\n\t.p2align\t3\nl_.zero:\n\t.space 32\n");
+    if g_tstr_ptrs[VEC_LEN] > 0 {
+        i = 0;
+        while i < g_tstr_ptrs[VEC_LEN] {
+            buf_str(b, "\t.p2align\t3\nl_.tstr.");
+            buf_int(b, i);
+            buf_str(b, ":\n\t.quad ");
+            buf_int(b, vec_get(g_tstr_lens, i));
+            buf_str(b, "\n\t.asciz \"");
+            asm_escape(b, vec_get(g_tstr_ptrs, i), vec_get(g_tstr_lens, i));
+            buf_str(b, "\"\n");
+            i = i + 1;
+        }
+    }
+    return b;
+}
+
+// var_label is a global's symbol name (package-qualified).
+fn var_label(v) {
+    return v[D_SYM][S_NAME];
+}
+
+// asm_escape writes bytes the assembler's string syntax can't hold as octal escapes.
+fn asm_escape(b, s, n) {
+    let i = 0;
+    while i < n {
+        let c = load8(s + i);
+        if c == '"' || c == '\\' {
+            buf_byte(b, '\\');
+            buf_byte(b, c);
+        } else if c >= 32 && c < 127 {
+            buf_byte(b, c);
+        } else {
+            buf_byte(b, '\\');
+            buf_byte(b, '0' + ((c >> 6) & 7));
+            buf_byte(b, '0' + ((c >> 3) & 7));
+            buf_byte(b, '0' + (c & 7));
+        }
+        i = i + 1;
+    }
+}

@@ -1,0 +1,104 @@
+package main
+
+import "say"
+import "hearth"
+import "relay"
+import "mint"
+import "wire"
+
+// serve answers three raw echo lines, then HTTP requests until it sees /stop.
+func serve(l wire.Listener) fault {
+	c := try l.Accept()
+	buf := make([]u8, 0, 64)
+	for len(buf) < 14 {
+		_, err := c.Read(buf, 64)
+		if err != nil {
+			return err
+		}
+	}
+	try c.WriteBytes(buf)
+	c.Close()
+	for {
+		hc := try l.Accept()
+		req := make([]u8, 0, 1024)
+		for {
+			_, err := hc.Read(req, 1024)
+			if err != nil {
+				break
+			}
+			s := str(req)
+			if len(s) >= 4 && s[len(s)-4:] == "\r\n\r\n" {
+				break
+			}
+			if len(s) > 4 && s[:4] == "POST" && len(s) > 10 && s[len(s)-5:] == "hello" {
+				break
+			}
+		}
+		s := str(req)
+		if len(s) >= 9 && s[:9] == "GET /stop" {
+			try hc.Write("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nbye")
+			hc.Close()
+			return nil
+		}
+		if len(s) >= 12 && s[:12] == "GET /chunked" {
+			try hc.Write("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Kind: chunks\r\n\r\n5\r\nhello\r\n7\r\n, world\r\n0\r\n\r\n")
+		} else if len(s) >= 4 && s[:4] == "POST" {
+			try hc.Write("HTTP/1.1 201 Created\r\nContent-Length: 7\r\n\r\ncreated")
+		} else {
+			try hc.Write("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nok")
+		}
+		hc.Close()
+	}
+}
+
+func worker(id i64) {
+	if id == 1 {
+		l, err := wire.Listen("127.0.0.1:0")
+		if err != nil {
+			say.Line("listen", err)
+			return
+		}
+		relay.Send(0, mint.Itoa(l.Port()))
+		e2 := serve(l)
+		if e2 != nil {
+			say.Line("serve error", e2)
+		}
+		l.Close()
+		return
+	}
+	_, portmsg := relay.Recv()
+	addr := "127.0.0.1:" + portmsg
+	c, err := wire.Dial(addr)
+	say.Line("dial", err == nil)
+	c.SetTimeout(2000000000)
+	e1 := c.Write("one\n")
+	e2 := c.Write("two\n")
+	e3 := c.Write("three\n")
+	got, e4 := c.ReadFull(14)
+	say.Line("echo", say.Fmt("%q", got), e1 == nil && e2 == nil && e3 == nil && e4 == nil)
+	_, e5 := c.ReadFull(1)
+	say.Line("eof", wire.IsEOF(e5))
+	c.Close()
+	r, e6 := wire.Get("http://" + addr + "/hello?x=1")
+	say.Line("get", e6 == nil, r.Status, r.Body, r.Header("content-type"))
+	r2, e7 := wire.Get("http://" + addr + "/chunked")
+	say.Line("chunked", e7 == nil, r2.Status, say.Fmt("%q", r2.Body), r2.Header("X-Kind"))
+	r3, e8 := wire.Post("http://" + addr + "/items", "text/plain", "hello")
+	say.Line("post", e8 == nil, r3.Status, r3.Body)
+	r4, _ := wire.Get("http://" + addr + "/stop")
+	say.Line("stop", r4.Body)
+	_, e9 := wire.Get("https://example.com/")
+	say.Line("https", e9)
+	_, e10 := wire.Get("ftp://x")
+	say.Line("bad url", e10 != nil)
+	_, e11 := wire.Dial("127.0.0.1:1")
+	say.Line("refused", e11 != nil)
+	_, e12 := wire.Dial("nohostport")
+	say.Line("noport", e12)
+	_, e13 := wire.Dial("localhost:9")
+	say.Line("localhost", e13 != nil)
+}
+
+func main() {
+	hearth.Run(2, worker)
+}

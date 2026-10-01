@@ -1,0 +1,168 @@
+// Package relay carries messages between cores, which share no memory. A message is a
+// str copied into the receiving core's inbox (a lock-free multi-producer queue); the
+// receiver gets its own copy in its request pool. Encode structs with argo.Put/argo.Get.
+//
+//	relay.Send(2, "hello")              // from any core
+//	from, msg := relay.Recv()           // on core 2: blocks until a message arrives
+package relay
+
+import "hearth"
+
+extern func pipe(fds i64) i64
+extern func fcntl(fd i64, cmd i64, ...) i64
+extern func malloc(n i64) i64
+
+const maxCores = 256
+
+// Box words: 0 head (producers swap in here), 1 tail (owner only), 2 waiting (owner is
+// blocked: wake it through the pipe), 3 pipe read fd, 4 pipe write fd, 5 state (2 ready),
+// 6 messages received.
+shared var boxes i64 = calloc(maxCores, 64)
+
+func box(core i64) i64 {
+	if core < 0 || core >= maxCores {
+		rt_panic("relay: no such core")
+	}
+	b := boxes + core*64
+	st := __atomic_load(b + 40)
+	if st == 2 {
+		return b
+	}
+	if st == 0 && __atomic_cas(b+40, 0, 1) == 0 {
+		stub := calloc(1, 32)
+		b[0] = stub
+		b[1] = stub
+		fds := calloc(2, 4)
+		pipe(fds)
+		b[3] = __ld(fds, 2)
+		b[4] = __ld(fds+4, 2)
+		fcntl(b[3], F_SETFL, O_NONBLOCK)
+		fcntl(b[4], F_SETFL, O_NONBLOCK)
+		__atomic_store(b+40, 2)
+		return b
+	}
+	for __atomic_load(b+40) != 2 {
+		__yield()
+	}
+	return b
+}
+
+// Send copies msg into core to's inbox; it never blocks.
+func Send(to i64, msg str) {
+	b := box(to)
+	n := len(msg)
+	node := malloc(24 + n)
+	node[0] = 0
+	node[1] = rt_core_id()
+	node[2] = n
+	memcpy(node+24, cast(i64, msg)+8, n)
+	prev := __atomic_swap(b, node)
+	__atomic_store(prev, node)
+	if __atomic_swap(b+16, 0) != 0 {
+		word := calloc(1, 8)
+		write(b[4], word, 1)
+		free(word)
+	}
+}
+
+// Broadcast sends msg to every other running core.
+func Broadcast(msg str) {
+	me := rt_core_id()
+	n := Cores()
+	for c := 0; c < n; c++ {
+		if c != me {
+			Send(c, msg)
+		}
+	}
+}
+
+// Cores is the number of cores the program started.
+func Cores() i64 {
+	return __atomic_load(&rtCores)
+}
+
+// TryRecv returns the next message for this core, if there is one.
+func TryRecv() (i64, str, bool) {
+	b := box(rt_core_id())
+	tail := b[1]
+	next := __atomic_load(tail)
+	if next == 0 {
+		return 0, "", false
+	}
+	b[1] = next
+	free(tail)
+	b[6]++
+	return next[1], rt_str_from_raw(next+24, next[2]), true
+}
+
+// Recv blocks until a message for this core arrives and returns its sender and text.
+func Recv() (i64, str) {
+	b := box(rt_core_id())
+	for {
+		from, msg, ok := TryRecv()
+		if ok {
+			return from, msg
+		}
+		// Ask senders to wake us, then look once more before sleeping (no lost wake-ups).
+		__atomic_store(b+16, 1)
+		from2, msg2, ok2 := TryRecv()
+		if ok2 {
+			__atomic_store(b+16, 0)
+			return from2, msg2
+		}
+		wait_readable(b[3])
+		drain_pipe(b[3])
+	}
+}
+
+func drain_pipe(fd i64) {
+	word := calloc(1, 64)
+	for read(fd, word, 64) > 0 {
+	}
+	free(word)
+}
+
+extern func poll(fds i64, n i64, timeout i64) i64
+
+func wait_readable(fd i64) {
+	p := calloc(1, 8)
+	__st(p, fd, 2)
+	__st(p+4, 1, 1)
+	poll(p, 1, 100)
+	free(p)
+}
+
+// WakeFD is this core's wake-up descriptor, for event loops: after it turns readable,
+// call Drain. Arm must be called before the loop blocks.
+func WakeFD() i64 {
+	return box(rt_core_id())[3]
+}
+
+// Arm asks senders to wake this core through WakeFD (call just before blocking).
+func Arm() {
+	__atomic_store(box(rt_core_id())+16, 1)
+}
+
+// Drain runs h on every waiting message (event loops call it after WakeFD fires).
+func Drain(h func(i64, str)) {
+	b := box(rt_core_id())
+	__atomic_store(b+16, 0)
+	drain_pipe(b[3])
+	for {
+		from, msg, ok := TryRecv()
+		if !ok {
+			return
+		}
+		h(from, msg)
+	}
+}
+
+// Received is how many messages this core has taken from its inbox.
+func Received() i64 {
+	return box(rt_core_id())[6]
+}
+
+// Me is this core's number.
+func Me() i64 {
+	return hearth.ID()
+}

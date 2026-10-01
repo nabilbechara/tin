@@ -1,0 +1,127 @@
+// Package crucible is for tests and micro-benchmarks: labeled checks that collect failures,
+// Done to report them (exit status 1 on failure), and Bench to time a function.
+//
+//	crucible.EqI("sum", Sum(2, 3), 5)
+//	crucible.Done()
+package crucible
+
+import "say"
+
+extern func exit(code i64)
+
+var checks i64
+var failures []str
+
+func fail_check(label str, detail str) {
+	failures = append(failures, keep(say.Fmt("FAIL %s: %s", label, detail)))
+}
+
+// EqI checks two integers.
+func EqI(label str, got i64, want i64) {
+	checks++
+	if got != want {
+		fail_check(label, say.Fmt("got %d, want %d", got, want))
+	}
+}
+
+// EqU checks two unsigned integers.
+func EqU(label str, got u64, want u64) {
+	checks++
+	if got != want {
+		fail_check(label, say.Fmt("got %d, want %d", got, want))
+	}
+}
+
+// EqS checks two strings.
+func EqS(label str, got str, want str) {
+	checks++
+	if got != want {
+		fail_check(label, say.Fmt("got %q, want %q", got, want))
+	}
+}
+
+// EqB checks two bools.
+func EqB(label str, got bool, want bool) {
+	checks++
+	if got != want {
+		fail_check(label, say.Fmt("got %v, want %v", got, want))
+	}
+}
+
+// EqF checks two floats within eps.
+func EqF(label str, got f64, want f64, eps f64) {
+	checks++
+	d := got - want
+	if d < 0 {
+		d = -d
+	}
+	if !(d <= eps) {
+		fail_check(label, say.Fmt("got %v, want %v (eps %v)", got, want, eps))
+	}
+}
+
+// True checks that cond holds.
+func True(label str, cond bool) {
+	checks++
+	if !cond {
+		fail_check(label, "expected true")
+	}
+}
+
+// False checks that cond does not hold.
+func False(label str, cond bool) {
+	checks++
+	if cond {
+		fail_check(label, "expected false")
+	}
+}
+
+// NoFault checks that err is nil.
+func NoFault(label str, err fault) {
+	checks++
+	if err != nil {
+		fail_check(label, say.Fmt("unexpected fault: %v", err))
+	}
+}
+
+// HasFault checks that err is not nil.
+func HasFault(label str, err fault) {
+	checks++
+	if err == nil {
+		fail_check(label, "expected a fault")
+	}
+}
+
+// Failed reports whether any check failed so far.
+func Failed() bool {
+	return len(failures) > 0
+}
+
+// Checks is the number of checks run so far.
+func Checks() i64 {
+	return checks
+}
+
+// Done prints "ok N checks" or every failure, and exits with status 1 if any failed.
+func Done() {
+	if len(failures) == 0 {
+		say.Line("ok", checks, "checks")
+		return
+	}
+	for _, f := range failures {
+		say.Line(f)
+	}
+	say.Line("FAILED", len(failures), "of", checks, "checks")
+	rt_flush()
+	exit(1)
+}
+
+// Bench runs f(i) for i in [0, n) and prints the time per call.
+func Bench(label str, n i64, f func(i64)) {
+	t0 := rt_mono_ns()
+	for i := 0; i < n; i++ {
+		f(i)
+	}
+	dt := rt_mono_ns() - t0
+	say.Out("%s: %d ops, %.2f ns/op\n", label, n, f64(dt)/f64(n))
+}

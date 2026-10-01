@@ -1,0 +1,488 @@
+// Region pass: request memory must never be reachable from long-lived memory.
+//
+// Every request allocates from its core's pool (ember), which is wiped when the request
+// ends; globals and everything they hold live in the core's ingot heap. The pass gives
+// each expression a set of region bits and rejects any store of a possibly-ember pointer
+// into a container that may be long-lived, unless the value went through keep().
+// Functions are summarized (which parameters they store request memory into, and where
+// their results come from) and the summaries are iterated to a fixed point.
+
+const RG_FRESH = 1;   // may be a fresh allocation from the current request's pool
+const RG_INGOT = 2;   // may be long-lived (a global or something reachable from one)
+const RG_UNK = 4;     // origin unknown: treated as long-lived when stored into
+const RG_EMB = 8;     // the value may point into request memory
+const RG_P0 = 256;    // derived from parameter i: bit 8 + i
+const RG_MAXP = 48;
+
+const F_REGSUM = 26;  // [sink param bits, unused, result bits 0..7]
+
+var rg_fn;
+var rg_sum;
+var rg_report;
+var rg_changed;   // a summary grew: another round is needed
+var rg_lchanged;  // a local's bits grew
+var rg_nparams;
+var rg_multi;     // per-result bits of the last call (for ST_CALLMULTI)
+var rg_modrep;    // parameters already reported as modified
+
+fn has_ptr(t) {
+    let k = kind_of(t);
+    if k == K_OPT {
+        return has_ptr(t[TY_ELEM]);
+    }
+    return k == K_STRING || k == K_STRUCT || k == K_SLICE || k == K_MAP || k == K_ERROR;
+}
+
+fn rg_analyzable(f) {
+    return !f[F_EXTERN] && f[F_BODY] && !f[F_LEGACY] && !is_template(f);
+}
+
+fn is_keep_fn(f) {
+    let n = f[F_QNAME];
+    return n && load8(n) == 'k' && load8(n + 1) == 'e' && load8(n + 2) == 'e' && load8(n + 3) == 'p' && load8(n + 4) == '$';
+}
+
+fn region_check() {
+    let i = 0;
+    while i < prog_fns[VEC_LEN] {
+        let f = vec_get(prog_fns, i);
+        if rg_analyzable(f) {
+            f[F_REGSUM] = calloc(10, 8);
+        }
+        i = i + 1;
+    }
+    let round = 0;
+    rg_changed = 1;
+    while rg_changed && round < 60 {
+        rg_changed = 0;
+        i = 0;
+        while i < prog_fns[VEC_LEN] {
+            let f = vec_get(prog_fns, i);
+            if f[F_REGSUM] && f[F_REACH] {
+                rg_fn_pass(f, 0);
+            }
+            i = i + 1;
+        }
+        round = round + 1;
+    }
+    i = 0;
+    while i < prog_fns[VEC_LEN] {
+        let f = vec_get(prog_fns, i);
+        if f[F_REGSUM] && f[F_REACH] {
+            rg_fn_pass(f, 1);
+        }
+        i = i + 1;
+    }
+}
+
+fn rg_fn_pass(f, report) {
+    rg_fn = f;
+    rg_sum = f[F_REGSUM];
+    if is_keep_fn(f) {
+        rg_sum[2] = RG_INGOT;
+        return;
+    }
+    set_file(f[F_FILE]);
+    rg_report = 0;
+    let locals = f[F_LOCALS];
+    rg_nparams = f[F_PARAMS][VEC_LEN];
+    let i = 0;
+    while i < locals[VEC_LEN] {
+        let s = vec_get(locals, i);
+        s[S_REGION] = 0;
+        if i < rg_nparams && has_ptr(s[S_TYPE]) {
+            s[S_REGION] = RG_EMB | RG_UNK;
+            if i < RG_MAXP {
+                s[S_REGION] = RG_EMB | (RG_P0 << i);
+            }
+        }
+        i = i + 1;
+    }
+    let iter = 0;
+    rg_lchanged = 1;
+    while rg_lchanged && iter < 30 {
+        rg_lchanged = 0;
+        rg_stmts(f[F_BODY][BLK_STMTS]);
+        iter = iter + 1;
+    }
+    if report && !vec_get(file_trusted, f[F_FILE]) {
+        rg_report = 1;
+        rg_modrep = 0;
+        rg_stmts(f[F_BODY][BLK_STMTS]);
+        rg_report = 0;
+    }
+}
+
+fn rg_stmts(v) {
+    let i = 0;
+    while i < v[VEC_LEN] {
+        rg_stmt(vec_get(v, i));
+        i = i + 1;
+    }
+}
+
+fn rg_local(s, bits) {
+    if !has_ptr(s[S_TYPE]) {
+        return;
+    }
+    if (s[S_REGION] | bits) != s[S_REGION] {
+        s[S_REGION] = s[S_REGION] | bits;
+        rg_lchanged = 1;
+    }
+}
+
+fn rg_assign_sym(s, bits, pos) {
+    if s[S_KIND] == SYM_LOCAL {
+        rg_local(s, bits);
+    } else if s[S_KIND] == SYM_GLOBAL {
+        rg_store(RG_INGOT, bits, pos, s[S_NAME]);
+    }
+}
+
+fn rg_stmt(s) {
+    let k = s[N_KIND];
+    if k == ST_BLOCK {
+        rg_stmts(s[BLK_STMTS]);
+    } else if k == ST_LET {
+        if s[LET_INIT] {
+            rg_local(s[LET_SYM], rg_expr(s[LET_INIT]));
+        }
+    } else if k == ST_ASSIGN {
+        let t = s[AS_TARGET];
+        let v = rg_expr(s[AS_VALUE]);
+        let tk = t[N_KIND];
+        if tk == EX_IDENT {
+            rg_assign_sym(t[ID_REF], v, s[N_POS]);
+        } else if tk == EX_MEM {
+            let c = rg_expr(t[MEM_BASE]);
+            if t[MEM_INDEX] {
+                rg_expr(t[MEM_INDEX]);
+            }
+            rg_store(c, v, s[N_POS], 0);
+        } else if tk == EX_ELEM {
+            let c2 = rg_expr(t[ELEM_SEQ]);
+            rg_expr(t[ELEM_IDX]);
+            rg_store(c2, v, s[N_POS], 0);
+        } else {
+            rg_expr(t);
+        }
+    } else if k == ST_EXPR {
+        rg_expr(s[ES_X]);
+    } else if k == ST_IF {
+        rg_expr(s[IF_COND]);
+        rg_stmts(s[IF_THEN][BLK_STMTS]);
+        if s[IF_ELSE] {
+            rg_stmt(s[IF_ELSE]);
+        }
+    } else if k == ST_WHILE {
+        rg_expr(s[WH_COND]);
+        rg_stmts(s[WH_BODY][BLK_STMTS]);
+        if s[WH_POST] {
+            rg_stmt(s[WH_POST]);
+        }
+    } else if k == ST_RETURN {
+        if s[RET_VALUE] {
+            rg_result(0, rg_expr(s[RET_VALUE]));
+        }
+        if s[RET_VALUES] {
+            let i = 0;
+            while i < s[RET_VALUES][VEC_LEN] {
+                rg_result(i, rg_expr(vec_get(s[RET_VALUES], i)));
+                i = i + 1;
+            }
+        }
+    } else if k == ST_CALLMULTI {
+        rg_expr(s[CM_CALL]);
+        let bits = rg_multi;
+        let syms = s[CM_SYMS];
+        let j = 0;
+        while j < syms[VEC_LEN] {
+            let sy = vec_get(syms, j);
+            if sy {
+                let b = RG_UNK | RG_EMB;
+                if bits && j < 8 {
+                    b = vec_get(bits, j);
+                }
+                rg_assign_sym(sy, b, s[N_POS]);
+            }
+            j = j + 1;
+        }
+    }
+}
+
+fn rg_result(i, bits) {
+    if i >= 8 {
+        return;
+    }
+    if (rg_sum[2 + i] | bits) != rg_sum[2 + i] {
+        rg_sum[2 + i] = rg_sum[2 + i] | bits;
+        rg_changed = 1;
+    }
+}
+
+// rg_load is what a pointer read out of a container with bits b may be: anything held by
+// long-lived memory is long-lived (the pass keeps it so); anything else may be ember.
+fn rg_load(b) {
+    let r = b & ~RG_EMB;
+    if (b & ~RG_INGOT) != 0 {
+        r = r | RG_EMB;
+    }
+    return r;
+}
+
+fn rg_param_name(i) {
+    return vec_get(rg_fn[F_LOCALS], i)[S_NAME];
+}
+
+// rg_store checks a store of a value with bits v into a container with bits c.
+fn rg_store(c, v, pos, gname) {
+    let i = 0;
+    while i < rg_nparams && i < RG_MAXP {
+        if (c & (RG_P0 << i)) != 0 && rg_report && !vec_get(rg_fn[F_MUTS], i) && (rg_modrep & (1 << i)) == 0 {
+            rg_modrep = rg_modrep | (1 << i);
+            err_quoted(pos, "cannot modify parameter ", rg_param_name(i), ": declare it mut");
+        }
+        i = i + 1;
+    }
+    if (v & RG_EMB) == 0 {
+        return;
+    }
+    if (c & (RG_INGOT | RG_UNK)) != 0 && rg_report {
+        if gname {
+            err_quoted(pos, "request memory stored into global ", gname, ", which outlives the request: wrap the value in keep()");
+        } else {
+            err_at(pos, "request memory stored into long-lived memory (it may be reachable from a global): wrap the value in keep()");
+        }
+    }
+    i = 0;
+    while i < rg_nparams && i < RG_MAXP {
+        if (c & (RG_P0 << i)) != 0 && (rg_sum[0] & (1 << i)) == 0 {
+            rg_sum[0] = rg_sum[0] | (1 << i);
+            rg_changed = 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn rg_expr(e) {
+    let k = e[N_KIND];
+    if k == EX_IDENT {
+        let s = e[ID_REF];
+        if !s {
+            return 0;
+        }
+        if s[S_KIND] == SYM_LOCAL {
+            return s[S_REGION];
+        }
+        if s[S_KIND] == SYM_GLOBAL {
+            return RG_INGOT;
+        }
+        return 0;
+    }
+    if k == EX_UNARY {
+        rg_expr(e[UN_X]);
+        return 0;
+    }
+    if k == EX_BINARY {
+        rg_expr(e[BIN_L]);
+        rg_expr(e[BIN_R]);
+        if has_ptr(e[N_TYPE]) {
+            return RG_FRESH | RG_EMB;
+        }
+        return 0;
+    }
+    if k == EX_CONV {
+        let x = rg_expr(e[CV_X]);
+        if has_ptr(e[N_TYPE]) && !has_ptr(e[CV_X][N_TYPE]) {
+            // A raw word turned into a reference (standard library only): origin unknown.
+            return x | RG_UNK | RG_EMB;
+        }
+        return x;
+    }
+    if k == EX_MEM {
+        let b = rg_expr(e[MEM_BASE]);
+        if e[MEM_INDEX] {
+            rg_expr(e[MEM_INDEX]);
+        }
+        if e[MEM_LEN] {
+            rg_expr(e[MEM_LEN]);
+        }
+        if !has_ptr(e[N_TYPE]) {
+            return 0;
+        }
+        if !has_ptr(e[MEM_BASE][N_TYPE]) {
+            return b | RG_UNK | RG_EMB;
+        }
+        return rg_load(b);
+    }
+    if k == EX_ELEM {
+        let b2 = rg_expr(e[ELEM_SEQ]);
+        rg_expr(e[ELEM_IDX]);
+        if !has_ptr(e[N_TYPE]) {
+            return 0;
+        }
+        return rg_load(b2);
+    }
+    if k == EX_SEQ {
+        rg_stmts(e[SEQ_STMTS]);
+        return rg_expr(e[SEQ_VALUE]);
+    }
+    if k == EX_CALL {
+        return rg_call(e);
+    }
+    if k == EX_INDEX {
+        rg_expr(e[IX_X]);
+        rg_expr(e[IX_I]);
+        return 0;
+    }
+    return 0;
+}
+
+fn rg_call(e) {
+    let args = e[CALL_ARGS];
+    let n = args[VEC_LEN];
+    let b = vec_new();
+    let i = 0;
+    while i < n {
+        vec_push(b, rg_expr(vec_get(args, i)));
+        i = i + 1;
+    }
+    rg_multi = 0;
+    if e[CALL_INTRINSIC] {
+        return 0;
+    }
+    let pos = e[N_POS];
+    if e[CALL_CALLEE] {
+        rg_expr(e[CALL_CALLEE]);
+        if has_ptr(e[N_TYPE]) {
+            return RG_UNK | RG_EMB;
+        }
+        return 0;
+    }
+    let f = e[CALL_FN];
+    let name = e[CALL_NAME];
+    if f && f[F_QNAME] {
+        name = f[F_QNAME];
+    }
+    if e[N_REGION] == R_OWNED || (f && is_keep_fn(f)) || (name && str_prefix(name, "rt_keep")) {
+        return RG_INGOT;
+    }
+    if name && str_prefix(name, "rt_") {
+        return rg_runtime_call(e, name, b, pos);
+    }
+    let sum = 0;
+    if f {
+        sum = f[F_REGSUM];
+    }
+    if !sum {
+        if has_ptr(e[N_TYPE]) {
+            return RG_UNK | RG_EMB;
+        }
+        return 0;
+    }
+    i = 0;
+    while i < n && i < RG_MAXP {
+        if (sum[0] & (1 << i)) != 0 {
+            if rg_report && (vec_get(b, i) & (RG_INGOT | RG_UNK)) != 0 {
+                let m = err_begin(pos);
+                buf_str(m, name);
+                buf_str(m, " stores request memory into its mut parameter '");
+                buf_str(m, vec_get(f[F_LOCALS], i)[S_NAME]);
+                buf_str(m, "', but this argument may be long-lived: keep() the stored values inside ");
+                buf_str(m, name);
+                err_end(m);
+                let saved = rg_report;
+                rg_report = 0;
+                rg_store(vec_get(b, i), RG_EMB, pos, 0);
+                rg_report = saved;
+            } else {
+                rg_store(vec_get(b, i), RG_EMB, pos, 0);
+            }
+        } else if f[F_MUTS] && i < f[F_MUTS][VEC_LEN] && vec_get(f[F_MUTS], i) {
+            rg_store(vec_get(b, i), 0, pos, 0);
+        }
+        i = i + 1;
+    }
+    let res = vec_new();
+    let j = 0;
+    while j < 8 {
+        vec_push(res, rg_subst(sum[2 + j], b));
+        j = j + 1;
+    }
+    rg_multi = res;
+    if !has_ptr(e[N_TYPE]) {
+        return 0;
+    }
+    return vec_get(res, 0);
+}
+
+// rg_subst replaces a summary's parameter bits with the bits of the call's arguments.
+fn rg_subst(r, b) {
+    let out = r & 0xff;
+    let i = 0;
+    while i < b[VEC_LEN] && i < RG_MAXP {
+        if (r & (RG_P0 << i)) != 0 {
+            out = out | vec_get(b, i);
+        }
+        i = i + 1;
+    }
+    return out;
+}
+
+fn rg_runtime_call(e, name, b, pos) {
+    let n = b[VEC_LEN];
+    let b0 = 0;
+    if n > 0 {
+        b0 = vec_get(b, 0);
+    }
+    if streq(name, "rt_map_set") {
+        rg_store(b0, vec_get(b, 1), pos, 0);
+        rg_store(b0, vec_get(b, 2), pos, 0);
+        return 0;
+    }
+    if streq(name, "rt_append") {
+        rg_store(b0, vec_get(b, 1), pos, 0);
+        return b0;
+    }
+    if streq(name, "rt_slice_appendn") || streq(name, "rt_slice_copy") {
+        let et = 0;
+        let a1 = vec_get(e[CALL_ARGS], 1);
+        if kind_of(a1[N_TYPE]) == K_SLICE {
+            et = a1[N_TYPE][TY_ELEM];
+        }
+        if has_ptr(et) {
+            rg_store(b0, rg_load(vec_get(b, 1)), pos, 0);
+        } else {
+            rg_store(b0, 0, pos, 0);
+        }
+        return b0;
+    }
+    if streq(name, "rt_append_str") || streq(name, "rt_copy_str") || streq(name, "rt_map_del") {
+        rg_store(b0, 0, pos, 0);
+        return b0;
+    }
+    if streq(name, "rt_map_get") || streq(name, "rt_map_key") || streq(name, "rt_map_val") {
+        if has_ptr(e[N_TYPE]) {
+            return rg_load(b0);
+        }
+        return 0;
+    }
+    if streq(name, "rt_slice_sub") {
+        return b0 | RG_FRESH | RG_EMB;
+    }
+    if has_ptr(e[N_TYPE]) {
+        return RG_FRESH | RG_EMB;
+    }
+    return 0;
+}
+
+fn str_prefix(s, p) {
+    let i = 0;
+    while load8(p + i) != 0 {
+        if load8(s + i) != load8(p + i) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 1;
+}

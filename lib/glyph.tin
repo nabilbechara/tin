@@ -1,0 +1,287 @@
+// Package glyph is UTF-8 and simple character classification (like Go's unicode/utf8).
+package glyph
+
+// RuneError is the replacement character returned for invalid UTF-8.
+const RuneError = 0xfffd
+
+// MaxRune is the largest valid Unicode code point.
+const MaxRune = 0x10ffff
+
+// UTFMax is the maximum number of bytes one encoded rune occupies.
+const UTFMax = 4
+
+// ValidRune reports whether r can be legally encoded as UTF-8.
+func ValidRune(r i32) bool {
+	if r < 0 || r > MaxRune {
+		return false
+	}
+	if r >= 0xd800 && r <= 0xdfff {
+		return false
+	}
+	return true
+}
+
+// RuneLen returns the number of bytes needed to encode r, or -1 if r is not a valid rune.
+func RuneLen(r i32) i64 {
+	if r < 0 {
+		return -1
+	}
+	if r < 0x80 {
+		return 1
+	}
+	if r < 0x800 {
+		return 2
+	}
+	if r >= 0xd800 && r <= 0xdfff {
+		return -1
+	}
+	if r < 0x10000 {
+		return 3
+	}
+	if r <= MaxRune {
+		return 4
+	}
+	return -1
+}
+
+// EncodeRune appends the UTF-8 encoding of r to b (RuneError if invalid) and returns the byte count.
+func EncodeRune(b mut []u8, r i32) i64 {
+	if !ValidRune(r) {
+		r = RuneError
+	}
+	v := i64(r)
+	if v < 0x80 {
+		append(b, u8(v))
+		return 1
+	}
+	if v < 0x800 {
+		append(b, u8(0xc0|(v>>6)))
+		append(b, u8(0x80|(v&63)))
+		return 2
+	}
+	if v < 0x10000 {
+		append(b, u8(0xe0|(v>>12)))
+		append(b, u8(0x80|((v>>6)&63)))
+		append(b, u8(0x80|(v&63)))
+		return 3
+	}
+	append(b, u8(0xf0|(v>>18)))
+	append(b, u8(0x80|((v>>12)&63)))
+	append(b, u8(0x80|((v>>6)&63)))
+	append(b, u8(0x80|(v&63)))
+	return 4
+}
+
+// RuneStr returns r encoded as a one-rune string (RuneError if invalid).
+func RuneStr(r i32) str {
+	b := make([]u8, 0, 4)
+	EncodeRune(b, r)
+	return str(b)
+}
+
+// DecodeRune decodes the rune starting at byte i of s, returning (RuneError, 1) for bad bytes and (RuneError, 0) at the end.
+func DecodeRune(s str, i i64) (i32, i64) {
+	n := len(s)
+	if i < 0 || i >= n {
+		return RuneError, 0
+	}
+	c := i64(s[i])
+	if c < 0x80 {
+		return i32(c), 1
+	}
+	rem := n - i
+	if c >= 0xc2 && c < 0xe0 && rem >= 2 {
+		c1 := i64(s[i+1])
+		if c1&0xc0 == 0x80 {
+			return i32((c&31)<<6 | (c1 & 63)), 2
+		}
+		return RuneError, 1
+	}
+	if c >= 0xe0 && c < 0xf0 && rem >= 3 {
+		c1 := i64(s[i+1])
+		c2 := i64(s[i+2])
+		if c1&0xc0 == 0x80 && c2&0xc0 == 0x80 {
+			r := (c&15)<<12 | (c1&63)<<6 | (c2 & 63)
+			if r >= 0x800 && (r < 0xd800 || r > 0xdfff) {
+				return i32(r), 3
+			}
+		}
+		return RuneError, 1
+	}
+	if c >= 0xf0 && c < 0xf5 && rem >= 4 {
+		c1 := i64(s[i+1])
+		c2 := i64(s[i+2])
+		c3 := i64(s[i+3])
+		if c1&0xc0 == 0x80 && c2&0xc0 == 0x80 && c3&0xc0 == 0x80 {
+			r := (c&7)<<18 | (c1&63)<<12 | (c2&63)<<6 | (c3 & 63)
+			if r >= 0x10000 && r <= MaxRune {
+				return i32(r), 4
+			}
+		}
+		return RuneError, 1
+	}
+	return RuneError, 1
+}
+
+// DecodeLastRune decodes the last rune of s[0:end], returning its rune and size ((RuneError, 0) when end <= 0).
+func DecodeLastRune(s str, end i64) (i32, i64) {
+	if end <= 0 || end > len(s) {
+		return RuneError, 0
+	}
+	start := end - 1
+	lim := end - UTFMax
+	if lim < 0 {
+		lim = 0
+	}
+	for start > lim && s[start]&0xc0 == 0x80 {
+		start--
+	}
+	r, size := DecodeRune(s, start)
+	if start+size != end {
+		return RuneError, 1
+	}
+	return r, size
+}
+
+// RuneStart reports whether byte b could be the first byte of an encoded rune (not a continuation byte).
+func RuneStart(b u8) bool {
+	return b&0xc0 != 0x80
+}
+
+// FullRune reports whether s[i:] begins with a complete encoded rune (invalid bytes count as complete).
+func FullRune(s str, i i64) bool {
+	n := len(s)
+	if i < 0 || i >= n {
+		return false
+	}
+	c := s[i]
+	if c < 0x80 {
+		return true
+	}
+	need := 1
+	if c >= 0xc2 && c < 0xe0 {
+		need = 2
+	} else if c >= 0xe0 && c < 0xf0 {
+		need = 3
+	} else if c >= 0xf0 && c < 0xf5 {
+		need = 4
+	}
+	if n-i >= need {
+		return true
+	}
+	for k := i + 1; k < n; k++ {
+		if s[k]&0xc0 != 0x80 {
+			return true
+		}
+	}
+	return false
+}
+
+// RuneCount returns the number of runes in s, counting each invalid byte as one rune.
+func RuneCount(s str) i64 {
+	n := len(s)
+	count := 0
+	i := 0
+	for i < n {
+		if s[i] < 0x80 {
+			i++
+		} else {
+			_, size := DecodeRune(s, i)
+			i += size
+		}
+		count++
+	}
+	return count
+}
+
+// Valid reports whether s is entirely valid UTF-8.
+func Valid(s str) bool {
+	n := len(s)
+	i := 0
+	for i < n {
+		if s[i] < 0x80 {
+			i++
+			continue
+		}
+		r, size := DecodeRune(s, i)
+		if r == RuneError && size == 1 {
+			return false
+		}
+		i += size
+	}
+	return true
+}
+
+// IsLetter reports whether r is an ASCII or Latin-1 letter.
+func IsLetter(r i32) bool {
+	if r >= 'a' && r <= 'z' {
+		return true
+	}
+	if r >= 'A' && r <= 'Z' {
+		return true
+	}
+	if r < 0xaa {
+		return false
+	}
+	if r == 0xaa || r == 0xb5 || r == 0xba {
+		return true
+	}
+	if r >= 0xc0 && r <= 0xff {
+		return r != 0xd7 && r != 0xf7
+	}
+	return false
+}
+
+// IsDigit reports whether r is an ASCII decimal digit.
+func IsDigit(r i32) bool {
+	return r >= '0' && r <= '9'
+}
+
+// IsSpace reports whether r is ASCII or Latin-1 white space.
+func IsSpace(r i32) bool {
+	if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+		return true
+	}
+	return r == 0x0b || r == 0x0c || r == 0x85 || r == 0xa0
+}
+
+// IsUpper reports whether r is an ASCII or Latin-1 upper-case letter.
+func IsUpper(r i32) bool {
+	if r >= 'A' && r <= 'Z' {
+		return true
+	}
+	return r >= 0xc0 && r <= 0xde && r != 0xd7
+}
+
+// IsLower reports whether r is an ASCII or Latin-1 lower-case letter.
+func IsLower(r i32) bool {
+	if r >= 'a' && r <= 'z' {
+		return true
+	}
+	if r == 0xb5 {
+		return true
+	}
+	return r >= 0xdf && r <= 0xff && r != 0xf7
+}
+
+// ToUpper maps ASCII and simple Latin-1 lower-case letters to upper case (ß, ÿ and µ are unchanged).
+func ToUpper(r i32) i32 {
+	if r >= 'a' && r <= 'z' {
+		return r - 32
+	}
+	if r >= 0xe0 && r <= 0xfe && r != 0xf7 {
+		return r - 32
+	}
+	return r
+}
+
+// ToLower maps ASCII and Latin-1 upper-case letters to lower case.
+func ToLower(r i32) i32 {
+	if r >= 'A' && r <= 'Z' {
+		return r + 32
+	}
+	if r >= 0xc0 && r <= 0xde && r != 0xd7 {
+		return r + 32
+	}
+	return r
+}

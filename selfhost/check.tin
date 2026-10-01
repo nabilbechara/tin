@@ -1,0 +1,2948 @@
+// Checker: resolves names across packages, infers and checks types, evaluates constants,
+// and lowers Go-level constructs (strings, slices, maps, structs, range, switch,
+// multiple assignment, fmt) into the core AST that the optimizer and backend handle.
+
+const SYM_LOCAL = 0;
+const SYM_GLOBAL = 1;
+const SYM_CONST = 2;
+const SYM_FUNC = 3;
+
+// Symbol layout.
+const S_KIND = 0;
+const S_NAME = 1;
+const S_POS = 2;
+const S_SLOT = 3;
+const S_VAL = 4;
+const S_DONE = 5;
+const S_FN = 6;
+const S_INDEX = 7;  // global var: index in prog_vars
+const S_REG = 8;    // local home: register, REG_SLOT or REG_DEAD (set by codegen)
+const S_OFF = 9;    // local home: frame offset when in a slot
+const S_USES = 10;  // loop-weighted use count (set by analysis)
+const S_ADDR = 11;  // address taken with &
+const S_TYPE = 12;
+const S_DECL = 13;  // const: its declaration
+const S_EXPR = 14;  // non-integer const: its checked value expression
+const S_READS = 15; // times the variable is read (faults must be read)
+const S_SAFE = 16;  // index proven within this slice's bounds (range/loop proofs)
+const S_MUT = 17;   // mut parameter
+const S_REGION = 18;
+const S_TLS = 19;    // per-core global: slot + 1 in the core's context block
+const S_BIG = 20;    // integer constant above 2^63-1 (its bits look negative)
+
+const MAX_PARAMS = 8;
+
+var globals;
+var sc_syms;
+var sc_marks;
+var ck_fn;
+var ck_loops;
+var ck_breaks;     // loops plus switches
+var ck_file;
+var ck_pkg;
+var ck_legacy;
+var init_stmts;    // global initializers run by __start
+var lifted_count;
+var any_v2;
+var start_fn;
+var core_fn;       // __core_init: per-core global initializers, run on every core
+var core_stmts;
+var tls_count;
+var ck_trusted;    // the file is part of the standard library
+var file_trusted;
+var safe_pairs;    // [index sym, slice sym] proven in range in the current loop body
+
+fn sym_new(kind, name, pos) {
+    let s = calloc(24, 8);
+    s[S_KIND] = kind;
+    s[S_NAME] = name;
+    s[S_POS] = pos;
+    return s;
+}
+
+fn intrinsic_arity(name) {
+    if streq(name, "load8") || streq(name, "__set_ctx") || streq(name, "__atomic_load") {
+        return 1;
+    }
+    if streq(name, "store8") || streq(name, "__atomic_add") || streq(name, "__atomic_swap") || streq(name, "__atomic_store") {
+        return 2;
+    }
+    if streq(name, "__atomic_cas") || streq(name, "__st") {
+        return 3;
+    }
+    if streq(name, "__ld") {
+        return 2;
+    }
+    if streq(name, "__ctx") || streq(name, "__yield") || streq(name, "__empty") || streq(name, "__fp") {
+        return 0;
+    }
+    return -1;
+}
+
+fn err_at(pos, msg) {
+    let e = err_begin(pos);
+    buf_str(e, msg);
+    err_end(e);
+}
+
+fn err_type(pos, prefix, t, suffix) {
+    let e = err_begin(pos);
+    buf_str(e, prefix);
+    type_name(e, t);
+    buf_str(e, suffix);
+    err_end(e);
+}
+
+fn err_types(pos, prefix, a, mid, b) {
+    let e = err_begin(pos);
+    buf_str(e, prefix);
+    type_name(e, a);
+    buf_str(e, mid);
+    type_name(e, b);
+    err_end(e);
+}
+
+fn str_cat3(a, b, c) {
+    let s = buf_new();
+    buf_str(s, a);
+    buf_str(s, b);
+    buf_str(s, c);
+    buf_byte(s, 0);
+    return s[VEC_DATA];
+}
+
+// qual is the symbol name of a top-level name declared in package pkg.
+fn qual(pkg, name) {
+    if load8(pkg) == 0 {
+        return name;
+    }
+    return str_cat3(pkg, ".", name);
+}
+
+fn lookup_global(name) {
+    let i = 0;
+    while i < globals[VEC_LEN] {
+        let s = vec_get(globals, i);
+        if streq(s[S_NAME], name) {
+            return s;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn find_fn(name) {
+    let s = lookup_global(name);
+    if s && s[S_KIND] == SYM_FUNC {
+        return s[S_FN];
+    }
+    return 0;
+}
+
+fn declare_global(s) {
+    if intrinsic_arity(s[S_NAME]) >= 0 {
+        err_quoted(s[S_POS], "", s[S_NAME], " is a builtin and cannot be redeclared");
+        return;
+    }
+    let prev = lookup_global(s[S_NAME]);
+    if prev {
+        let e = err_begin(s[S_POS]);
+        buf_byte(e, '\'');
+        buf_str(e, s[S_NAME]);
+        buf_str(e, "' redeclared (previous declaration at ");
+        buf_pos(e, prev[S_POS]);
+        buf_byte(e, ')');
+        err_end(e);
+        return;
+    }
+    vec_push(globals, s);
+}
+
+fn set_file(f) {
+    ck_file = f;
+    ck_pkg = vec_get(file_pkgs, f);
+    ck_trusted = vec_get(file_trusted, f);
+}
+
+// import_pkg returns the package name an alias in the current file refers to, or 0.
+fn import_pkg(alias) {
+    let imps = vec_get(file_imports, ck_file);
+    let i = 0;
+    while i < imps[VEC_LEN] {
+        let rec = vec_get(imps, i);
+        if streq(vec_get(rec, 0), alias) {
+            let path = vec_get(rec, 1);
+            let name = path;
+            let j = 0;
+            while load8(path + j) != 0 {
+                if load8(path + j) == '/' {
+                    name = path + j + 1;
+                }
+                j = j + 1;
+            }
+            return name;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ---- types ----
+
+fn resolve_type(tx) {
+    if !tx {
+        return ty_int;
+    }
+    if tx[TY_KIND] < 40 && tx[N_KIND] == 0 {
+        return tx;
+    }
+    let k = tx[N_KIND];
+    if k == TX_NAME && tx[TX_ARGS] {
+        return generic_type_ref(tx);
+    }
+    if k == TX_NAME && !tx[TX_A] {
+        let bound = tbind_lookup(tx[TX_B]);
+        if bound {
+            return bound;
+        }
+    }
+    if k == TX_NAME {
+        let t = 0;
+        if tx[TX_A] {
+            let pkg = import_pkg(tx[TX_A]);
+            if !pkg {
+                err_quoted(tx[N_POS], "undefined package ", tx[TX_A], "");
+                return ty_int;
+            }
+            t = find_type(str_cat3(pkg, ".", tx[TX_B]));
+        } else {
+            if load8(ck_pkg) != 0 {
+                t = find_type(qual(ck_pkg, tx[TX_B]));
+            }
+            if !t {
+                t = find_type(tx[TX_B]);
+            }
+            if !t && !vec_get(file_v2, ck_file) {
+                if streq(tx[TX_B], "int") {
+                    t = ty_int;
+                } else if streq(tx[TX_B], "float") {
+                    t = ty_float;
+                } else if streq(tx[TX_B], "string") {
+                    t = ty_string;
+                }
+            }
+        }
+        if !t {
+            err_quoted(tx[N_POS], "undefined type ", tx[TX_B], "");
+            return ty_int;
+        }
+        return t;
+    }
+    if k == TX_SLICE || k == TX_ARRAY {
+        return slice_of(resolve_type(tx[TX_A + (k == TX_ARRAY)]));
+    }
+    if k == TX_MAP {
+        return map_of(resolve_type(tx[TX_A]), resolve_type(tx[TX_B]));
+    }
+    if k == TX_PTR {
+        return resolve_type(tx[TX_A]);
+    }
+    if k == TX_OPT {
+        let inner = resolve_type(tx[TX_A]);
+        if kind_of(inner) != K_STRUCT {
+            err_type(tx[N_POS], "only struct references can be optional, not ", inner, "");
+            return inner;
+        }
+        return opt_of(inner);
+    }
+    if k == TX_CHAN {
+        return chan_of(resolve_type(tx[TX_A]));
+    }
+    if k == TX_FUNC {
+        return func_of(resolve_types(tx[TX_A]), resolve_types(tx[TX_B]), 0);
+    }
+    if k == TX_STRUCT {
+        let st = ty_new(K_STRUCT, "struct");
+        resolve_fields(st, tx);
+        layout_struct(st);
+        return st;
+    }
+    err_at(tx[N_POS], "invalid type");
+    return ty_int;
+}
+
+fn resolve_types(v) {
+    let r = vec_new();
+    let i = 0;
+    while i < v[VEC_LEN] {
+        vec_push(r, resolve_type(vec_get(v, i)));
+        i = i + 1;
+    }
+    return r;
+}
+
+// array_len is N for an [N]T type expression, else 0 ([N]T is a []T that starts with N
+// zero elements).
+fn array_len(tx) {
+    if !tx || tx[N_KIND] != TX_ARRAY {
+        return 0;
+    }
+    let n = const_value(tx[TX_A], 0);
+    if n < 0 {
+        err_at(tx[N_POS], "array length must not be negative");
+        return 0;
+    }
+    // [N][M]T: remember M, so every row starts with M zero elements.
+    array_inner = array_len(tx[TX_B]);
+    return n;
+}
+
+var array_inner;  // the row length of the last [N][M]T array_len saw
+
+// array_make is the starting value of an [n]T: n zero elements.
+fn array_make(pos, t, n) {
+    let ek = kind_of(t[TY_ELEM]);
+    let nn = mk_int(pos, n, ty_int);
+    let inner = array_inner;
+    array_inner = 0;
+    if ek == K_SLICE && inner > 0 {
+        let ik = kind_of(t[TY_ELEM][TY_ELEM]);
+        if ik == K_STRUCT || ik == K_MAP || ik == K_FUNC || ik == K_SLICE {
+            err_type(pos, "an array of ", t[TY_ELEM], " rows is limited to numbers, bools and strs");
+        }
+        let args = vec_new();
+        vec_push(args, nn);
+        vec_push(args, mk_int(pos, inner, ty_int));
+        vec_push(args, mk_int(pos, elem_size(t[TY_ELEM]), ty_int));
+        vec_push(args, mk_int(pos, ik == K_STRING, ty_int));
+        return rt_call(pos, "rt_slice_make_grid", args, t);
+    }
+    if ek == K_STRUCT || ek == K_MAP || ek == K_FUNC {
+        err_type(pos, "an array of ", t[TY_ELEM], " would start with nil elements: use a slice and append");
+    }
+    if ek == K_STRING {
+        return rt_call(pos, "rt_slice_make_str", args2(nn, mk_int(pos, n, ty_int)), t);
+    }
+    if ek == K_SLICE {
+        return rt_call(pos, "rt_slice_make_nest", args3(nn, mk_int(pos, n, ty_int), mk_int(pos, elem_size(t[TY_ELEM]), ty_int)), t);
+    }
+    return rt_call(pos, "rt_slice_make", args3(nn, mk_int(pos, n, ty_int), mk_int(pos, elem_size(t), ty_int)), t);
+}
+
+fn resolve_fields(st, tx) {
+    let fs = vec_new();
+    let src = tx[TX_A];
+    let i = 0;
+    while i < src[VEC_LEN] {
+        let f = vec_get(src, i);
+        let rec = vec_new();
+        vec_push(rec, vec_get(f, 0));
+        vec_push(rec, resolve_type(vec_get(f, 1)));
+        // Slot 2 is the offset (layout_struct); [N]T fields start with N zero elements.
+        vec_push(rec, 0);
+        vec_push(rec, array_len(vec_get(f, 1)));
+        vec_push(rec, array_inner);
+        array_inner = 0;
+        vec_push(fs, rec);
+        i = i + 1;
+    }
+    st[TY_FIELDS] = fs;
+}
+
+// ---- declarations ----
+
+fn check() {
+    globals = vec_new();
+    sc_syms = vec_new();
+    sc_marks = vec_new();
+    init_stmts = vec_new();
+    safe_pairs = vec_new();
+    let i = 0;
+    while i < file_v2[VEC_LEN] {
+        if vec_get(file_v2, i) {
+            any_v2 = 1;
+        }
+        i = i + 1;
+    }
+    generics_init();
+    // Named types: structs first, so fields and aliases can refer to any of them.
+    i = 0;
+    while i < prog_types[VEC_LEN] {
+        let d = vec_get(prog_types, i);
+        set_file(d[D_FILE]);
+        let q = qual(ck_pkg, d[D_NAME]);
+        if d[D_TPARAMS] {
+        } else if d[D_TYPE][N_KIND] == TX_STRUCT {
+            name_type(q, ty_new(K_STRUCT, q));
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < prog_types[VEC_LEN] {
+        let d = vec_get(prog_types, i);
+        set_file(d[D_FILE]);
+        let q = qual(ck_pkg, d[D_NAME]);
+        if d[D_TPARAMS] {
+        } else if d[D_TYPE][N_KIND] == TX_STRUCT {
+            resolve_fields(find_type(q), d[D_TYPE]);
+            layout_struct(find_type(q));
+        } else {
+            name_type(q, resolve_type(d[D_TYPE]));
+        }
+        i = i + 1;
+    }
+    i = 0;
+    let ndecl = prog_fns[VEC_LEN];
+    while i < ndecl {
+        let df = vec_get(prog_fns, i);
+        if is_template(df) {
+            declare_template(df);
+        } else {
+            declare_fn(df);
+        }
+        i = i + 1;
+    }
+    generics_declared();
+    i = 0;
+    while i < prog_consts[VEC_LEN] {
+        let c = vec_get(prog_consts, i);
+        set_file(c[D_FILE]);
+        let cs = sym_new(SYM_CONST, qual(ck_pkg, c[D_NAME]), c[D_POS]);
+        cs[S_DECL] = c;
+        c[D_SYM] = cs;
+        declare_global(cs);
+        i = i + 1;
+    }
+    i = 0;
+    while i < prog_vars[VEC_LEN] {
+        let v = vec_get(prog_vars, i);
+        set_file(v[D_FILE]);
+        let vs = sym_new(SYM_GLOBAL, qual(ck_pkg, v[D_NAME]), v[D_POS]);
+        vs[S_INDEX] = i;
+        vs[S_TYPE] = 0;
+        if vec_get(file_v2, ck_file) && !v[D_SHARED] {
+            tls_count = tls_count + 1;
+            vs[S_TLS] = tls_count;
+        } else if v[D_SHARED] && !vec_get(file_trusted, ck_file) {
+            err_at(v[D_POS], "shared mutable state across cores is not allowed: globals are per core (use const, or relay messages)");
+        }
+        if v[D_TYPE] {
+            vs[S_TYPE] = resolve_type(v[D_TYPE]);
+        }
+        v[D_SYM] = vs;
+        declare_global(vs);
+        i = i + 1;
+    }
+    i = 0;
+    while i < prog_consts[VEC_LEN] {
+        check_const(vec_get(prog_consts, i));
+        i = i + 1;
+    }
+    start_fn = fn_new(0, "__start");
+    start_fn[F_LOCALS] = vec_new();
+    core_fn = fn_new(0, "__core_init");
+    core_fn[F_LOCALS] = vec_new();
+    core_fn[F_QNAME] = "__core_init";
+    core_fn[F_LEGACY] = 1;
+    core_fn[F_TYPE] = func_of(core_fn[F_PTYPES], core_fn[F_RTYPES], 0);
+    core_stmts = vec_new();
+    i = 0;
+    while i < prog_vars[VEC_LEN] {
+        check_var(vec_get(prog_vars, i));
+        i = i + 1;
+    }
+    // Function literals are lifted onto prog_fns while bodies are checked.
+    i = 0;
+    while i < prog_fns[VEC_LEN] {
+        let fd = vec_get(prog_fns, i);
+        if !fd[F_EXTERN] && fd[F_LIFTED] != 2 && !is_template(fd) {
+            check_fn(fd);
+        }
+        i = i + 1;
+    }
+    let m = lookup_global("main");
+    if !m || m[S_KIND] != SYM_FUNC {
+        let e = err_begin(NO_POS);
+        buf_str(e, "no main function");
+        err_end(e);
+        return;
+    }
+    if m[S_FN][F_EXTERN] {
+        let e2 = err_begin(m[S_POS]);
+        buf_str(e2, "main cannot be extern");
+        err_end(e2);
+    } else if m[S_FN][F_PARAMS][VEC_LEN] != 0 && m[S_FN][F_PARAMS][VEC_LEN] != 2 {
+        let e3 = err_begin(m[S_POS]);
+        buf_str(e3, "main takes no parameters or (argc, argv)");
+        err_end(e3);
+    }
+    if any_v2 {
+        make_start(m[S_FN]);
+        mark_reach(start_fn);
+        // Bounds-check traps call it from code the backend generates.
+        mark_reach(find_fn("rt_bounds_fail"));
+        mark_reach(find_fn("rt_bounds_fail2"));
+        mark_reach(find_fn("rt_div_fail"));
+    } else {
+        mark_reach(m[S_FN]);
+    }
+}
+
+// declare_template makes a generic function's name callable; instances are declared on use.
+fn declare_template(f) {
+    set_file(f[F_FILE]);
+    if f[F_RECV] {
+        f[F_QNAME] = str_cat3(qual(ck_pkg, f[F_RECV][TX_B]), "[].", f[F_NAME]);
+        return;
+    }
+    let name = qual(ck_pkg, f[F_NAME]);
+    f[F_QNAME] = name;
+    let fs = sym_new(SYM_FUNC, name, f[F_POS]);
+    fs[S_FN] = f;
+    declare_global(fs);
+}
+
+fn declare_fn(f) {
+    set_file(f[F_FILE]);
+    ck_legacy = f[F_LEGACY];
+    let np = f[F_PARAMS][VEC_LEN];
+    let ptypes = vec_new();
+    let i = 0;
+    while i < np {
+        if f[F_LEGACY] {
+            vec_push(ptypes, ty_int);
+        } else {
+            vec_push(ptypes, resolve_type(vec_get(f[F_PTYPES], i)));
+        }
+        i = i + 1;
+    }
+    let rtypes = resolve_types(f[F_RTYPES]);
+    let name = qual(ck_pkg, f[F_NAME]);
+    if f[F_EXTERN] {
+        // C symbols are global: every package's extern of the same name is one function.
+        name = f[F_NAME];
+    }
+    if f[F_RECV] {
+        let rt = resolve_type(f[F_RECV]);
+        if kind_of(rt) != K_STRUCT {
+            err_type(f[F_POS], "methods need a struct receiver, not ", rt, "");
+        }
+        name = str_cat3(rt[TY_NAME], ".", f[F_NAME]);
+        // The receiver is passed as parameter zero.
+        let params = vec_new();
+        vec_push(params, f[F_RECVNAME]);
+        let pt = vec_new();
+        vec_push(pt, rt);
+        let muts = vec_new();
+        vec_push(muts, f[F_RECVMUT]);
+        i = 0;
+        while i < np {
+            vec_push(params, vec_get(f[F_PARAMS], i));
+            vec_push(pt, vec_get(ptypes, i));
+            vec_push(muts, vec_get(f[F_MUTS], i));
+            i = i + 1;
+        }
+        f[F_PARAMS] = params;
+        f[F_MUTS] = muts;
+        ptypes = pt;
+    }
+    f[F_PTYPES] = ptypes;
+    f[F_RTYPES] = rtypes;
+    f[F_QNAME] = name;
+    f[F_TYPE] = func_of(ptypes, rtypes, f[F_VARIADIC]);
+    let ints = 0;
+    let floats = 0;
+    i = 0;
+    while i < ptypes[VEC_LEN] {
+        if is_float_t(vec_get(ptypes, i)) {
+            floats = floats + 1;
+        } else {
+            ints = ints + 1;
+        }
+        i = i + 1;
+    }
+    if ints > MAX_PARAMS || floats > MAX_PARAMS {
+        let e = err_begin(f[F_POS]);
+        buf_str(e, "function '");
+        buf_str(e, f[F_NAME]);
+        buf_str(e, "' has ");
+        buf_int(e, ptypes[VEC_LEN]);
+        buf_str(e, " parameters, the limit is 8");
+        err_end(e);
+    }
+    if rtypes[VEC_LEN] > 8 {
+        err_at(f[F_POS], "too many results");
+    }
+    if f[F_LIFTED] {
+        return;
+    }
+    let prev = lookup_global(name);
+    if f[F_EXTERN] && prev && prev[S_KIND] == SYM_FUNC && prev[S_FN][F_EXTERN] {
+        return;
+    }
+    let fs = sym_new(SYM_FUNC, name, f[F_POS]);
+    fs[S_FN] = f;
+    declare_global(fs);
+}
+
+fn check_const(c) {
+    set_file(c[D_FILE]);
+    ck_legacy = !vec_get(file_v2, ck_file);
+    ck_fn = 0;
+    let s = c[D_SYM];
+    if s[S_DECL] != c {
+        return;
+    }
+    let want = 0;
+    if c[D_TYPE] {
+        want = resolve_type(c[D_TYPE]);
+    }
+    let init = c[D_INIT];
+    if is_int_const_expr(init) {
+        let v = const_value(init, c[D_IOTA]);
+        s[S_BIG] = cv_big;
+        s[S_VAL] = v;
+        s[S_TYPE] = ty_uint;
+        if want {
+            if !is_integer_t(want) && !is_float_t(want) {
+                err_type(c[D_POS], "cannot use an integer constant as ", want, "");
+            }
+            s[S_TYPE] = want;
+        }
+        if ck_legacy {
+            s[S_TYPE] = ty_int;
+        }
+    } else {
+        if ck_legacy {
+            err_at(init[N_POS], "expression is not a constant");
+        }
+        let copy = expr_clone(init);
+        let t = chk(copy, want);
+        if !is_const_value(copy) {
+            err_at(init[N_POS], "expression is not a constant");
+        }
+        s[S_EXPR] = copy;
+        s[S_TYPE] = t;
+    }
+    s[S_DONE] = 1;
+}
+
+// is_const_value accepts the checked forms a non-integer constant may take.
+fn is_const_value(e) {
+    let k = e[N_KIND];
+    return k == EX_FLOAT || k == EX_STR || k == EX_INT || (k == EX_UNARY && is_const_value(e[UN_X]));
+}
+
+// is_int_const_expr reports whether e is built only from integer literals and constants.
+fn is_int_const_expr(e) {
+    let k = e[N_KIND];
+    if k == EX_INT {
+        return 1;
+    }
+    if k == EX_IDENT {
+        if streq(e[ID_NAME], "iota") {
+            return 1;
+        }
+        let s = lookup_name(e[ID_NAME]);
+        if s && s[S_KIND] == SYM_CONST {
+            let d = s[S_DECL];
+            return !s[S_DONE] || !s[S_EXPR];
+        }
+        return 0;
+    }
+    if k == EX_UNARY {
+        return !streq(e[UN_OP], "&") && is_int_const_expr(e[UN_X]);
+    }
+    if k == EX_BINARY {
+        return is_int_const_expr(e[BIN_L]) && is_int_const_expr(e[BIN_R]);
+    }
+    return 0;
+}
+
+// const_value evaluates an integer constant expression; iota is the group position.
+var cv_big;   // the last const_value result is an unsigned value above 2^63-1
+
+// eval_unsigned is >>, / or % on 64-bit patterns read as unsigned.
+fn eval_unsigned(op, a, b) {
+    if streq(op, ">>") {
+        if b <= 0 {
+            return a;
+        }
+        if b >= 64 {
+            return 0;
+        }
+        return (a >> b) & ((1 << (64 - b)) - 1);
+    }
+    let q = 0;
+    if b < 0 {
+        // A divisor of 2^63 or more goes into a at most once.
+        if (a ^ (1 << 63)) >= (b ^ (1 << 63)) {
+            q = 1;
+        }
+    } else if a >= 0 {
+        q = a / b;
+    } else {
+        q = (((a >> 1) & 0x7fffffffffffffff) / b) << 1;
+        let rem = a - q * b;
+        if (rem ^ (1 << 63)) >= (b ^ (1 << 63)) {
+            q = q + 1;
+        }
+    }
+    if streq(op, "/") {
+        return q;
+    }
+    return a - q * b;
+}
+
+fn const_value(e, iota) {
+    let v = const_value_b(e, iota);
+    return v;
+}
+
+fn const_value_b(e, iota) {
+    let k = e[N_KIND];
+    cv_big = 0;
+    if k == EX_INT {
+        cv_big = e[8];
+        return e[INT_VAL];
+    }
+    if k == EX_IDENT {
+        if streq(e[ID_NAME], "iota") {
+            return iota;
+        }
+        let s = lookup_name(e[ID_NAME]);
+        if !s || s[S_KIND] != SYM_CONST {
+            err_quoted(e[N_POS], "", e[ID_NAME], " is not a constant");
+            return 0;
+        }
+        if !s[S_DONE] {
+            err_quoted(e[N_POS], "constant ", e[ID_NAME], " used before its definition");
+            return 0;
+        }
+        e[ID_REF] = s;
+        cv_big = s[S_BIG];
+        return s[S_VAL];
+    }
+    if k == EX_UNARY && !streq(e[UN_OP], "&") {
+        let uv = eval_unary(e[UN_OP], const_value_b(e[UN_X], iota));
+        cv_big = cv_big && uv < 0 && !streq(e[UN_OP], "-");
+        return uv;
+    }
+    if k == EX_BINARY {
+        let before = error_count;
+        let l = const_value_b(e[BIN_L], iota);
+        let lb = cv_big;
+        let r = const_value_b(e[BIN_R], iota);
+        let ub = lb || cv_big;
+        cv_big = 0;
+        if error_count != before {
+            return 0;
+        }
+        let op = e[BIN_OP];
+        if (streq(op, "/") || streq(op, "%")) && r == 0 {
+            err_at(e[N_POS], "division by zero in constant expression");
+            return 0;
+        }
+        let res = 0;
+        if ub && (streq(op, ">>") || streq(op, "/") || streq(op, "%")) {
+            res = eval_unsigned(op, l, r);
+        } else if ub && (streq(op, "<") || streq(op, "<=") || streq(op, ">") || streq(op, ">=")) {
+            res = eval_binary(op, l ^ (1 << 63), r ^ (1 << 63));
+            return res;
+        } else {
+            res = eval_binary(op, l, r);
+        }
+        cv_big = ub && res < 0;
+        return res;
+    }
+    err_at(e[N_POS], "expression is not a constant");
+    return 0;
+}
+
+fn eval_unary(op, v) {
+    if streq(op, "-") {
+        return -v;
+    }
+    if streq(op, "~") {
+        return ~v;
+    }
+    return !v;
+}
+
+// eval_binary matches the ARM64 instructions codegen emits (shift counts wrap at 64).
+fn eval_binary(op, l, r) {
+    if streq(op, "+") { return l + r; }
+    if streq(op, "-") { return l - r; }
+    if streq(op, "*") { return l * r; }
+    if streq(op, "/") { return l / r; }
+    if streq(op, "%") { return l % r; }
+    if streq(op, "&") { return l & r; }
+    if streq(op, "|") { return l | r; }
+    if streq(op, "^") { return l ^ r; }
+    if streq(op, "<<") { return l << r; }
+    if streq(op, ">>") { return l >> r; }
+    if streq(op, "==") { return l == r; }
+    if streq(op, "!=") { return l != r; }
+    if streq(op, "<") { return l < r; }
+    if streq(op, "<=") { return l <= r; }
+    if streq(op, ">") { return l > r; }
+    if streq(op, ">=") { return l >= r; }
+    if streq(op, "&&") { return l && r; }
+    return l || r;
+}
+
+fn check_var(v) {
+    set_file(v[D_FILE]);
+    ck_legacy = !vec_get(file_v2, ck_file);
+    ck_fn = 0;
+    let s = v[D_SYM];
+    if s[S_INDEX] != vec_index(prog_vars, v) {
+        return;
+    }
+    let init = v[D_INIT];
+    if !init && s[S_TLS] && array_len(v[D_TYPE]) > 0 {
+        init = array_make(v[D_POS], s[S_TYPE], array_len(v[D_TYPE]));
+    }
+    if !init && s[S_TLS] && s[S_TYPE] && is_ref(s[S_TYPE]) && kind_of(s[S_TYPE]) != K_OPT && kind_of(s[S_TYPE]) != K_ERROR && kind_of(s[S_TYPE]) != K_FUNC {
+        init = zero_value(v[D_POS], s[S_TYPE]);
+    }
+    if !init {
+        if !s[S_TYPE] {
+            s[S_TYPE] = ty_int;
+        }
+        return;
+    }
+    if (ck_legacy || is_int_const_expr(init)) && !s[S_TLS] {
+        v[D_VAL] = const_value(init, 0);
+        if !s[S_TYPE] {
+            s[S_TYPE] = ty_int;
+        }
+        if is_float_t(s[S_TYPE]) {
+            v[D_VAL] = int_to_float_bits(v[D_VAL]);
+        }
+        return;
+    }
+    // Anything else runs at startup, in declaration order, inside __start.
+    start_scope();
+    ck_fn = start_fn;
+    if s[S_TLS] {
+        ck_fn = core_fn;
+    }
+    let t = chk(init, s[S_TYPE]);
+    if !s[S_TYPE] {
+        s[S_TYPE] = default_type(t);
+    }
+    if !assignable(t, s[S_TYPE]) {
+        err_types(init[N_POS], "cannot use ", t, " as ", s[S_TYPE]);
+    }
+    let target = node_new(EX_IDENT, v[D_POS]);
+    target[ID_NAME] = s[S_NAME];
+    target[ID_REF] = s;
+    target[N_TYPE] = s[S_TYPE];
+    let a = node_new(ST_ASSIGN, v[D_POS]);
+    a[AS_TARGET] = target;
+    a[AS_VALUE] = init;
+    if s[S_TLS] {
+        vec_push(core_stmts, a);
+    } else {
+        vec_push(init_stmts, a);
+    }
+}
+
+fn vec_index(v, x) {
+    let i = 0;
+    while i < v[VEC_LEN] {
+        if vec_get(v, i) == x {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// make_start builds __start: runtime setup, global initializers, main, flush and exit.
+fn make_start(main_fn) {
+    let pos = main_fn[F_POS];
+    let f = start_fn;
+    f[F_POS] = pos;
+    // __start takes the C entry name; the program's own main becomes main.main.
+    f[F_QNAME] = "main";
+    main_fn[F_QNAME] = "main.main";
+    f[F_LEGACY] = 1;
+    vec_push(f[F_PARAMS], "argc");
+    vec_push(f[F_PARAMS], "argv");
+    f[F_PTYPES] = vec_new();
+    vec_push(f[F_PTYPES], ty_int);
+    vec_push(f[F_PTYPES], ty_int);
+    f[F_RTYPES] = vec_new();
+    vec_push(f[F_RTYPES], ty_int);
+    f[F_TYPE] = func_of(f[F_PTYPES], f[F_RTYPES], 0);
+    let body = empty_block(pos);
+    f[F_BODY] = body;
+    ck_fn = f;
+    sc_syms[VEC_LEN] = 0;
+    sc_marks[VEC_LEN] = 0;
+    vec_push(sc_marks, 0);
+    // The parameters must be the first locals; initializer temps follow them.
+    let olds = f[F_LOCALS];
+    f[F_LOCALS] = vec_new();
+    f[F_SLOTS] = 0;
+    let a0 = declare_local(pos, "argc", ty_int);
+    let a1 = declare_local(pos, "argv", ty_int);
+    let oi = 0;
+    while oi < olds[VEC_LEN] {
+        vec_push(f[F_LOCALS], vec_get(olds, oi));
+        oi = oi + 1;
+    }
+    let cb = empty_block(pos);
+    let ci = 0;
+    while ci < core_stmts[VEC_LEN] {
+        vec_push(cb[BLK_STMTS], vec_get(core_stmts, ci));
+        ci = ci + 1;
+    }
+    core_fn[F_BODY] = cb;
+    core_fn[F_POS] = pos;
+    vec_push(prog_fns, core_fn);
+    let cref = node_new(EX_FUNCREF, pos);
+    cref[FR_FN] = core_fn;
+    cref[N_TYPE] = core_fn[F_TYPE];
+    let args = vec_new();
+    vec_push(args, sym_ref_node(pos, a0));
+    vec_push(args, sym_ref_node(pos, a1));
+    vec_push(args, mk_int(pos, tls_count, ty_int));
+    vec_push(args, cref);
+    vec_push(body[BLK_STMTS], expr_stmt(rt_call(pos, "rt_init", args, ty_void)));
+    let i = 0;
+    while i < init_stmts[VEC_LEN] {
+        vec_push(body[BLK_STMTS], vec_get(init_stmts, i));
+        i = i + 1;
+    }
+    let cc = node_new(EX_CALL, pos);
+    cc[CALL_NAME] = "__core_init";
+    cc[CALL_ARGS] = vec_new();
+    cc[CALL_FN] = core_fn;
+    cc[N_TYPE] = ty_void;
+    vec_push(body[BLK_STMTS], expr_stmt(cc));
+    vec_push(body[BLK_STMTS], expr_stmt(rt_call(pos, "rt_main_begin", vec_new(), ty_void)));
+    let call = node_new(EX_CALL, pos);
+    call[CALL_NAME] = "main";
+    call[CALL_ARGS] = vec_new();
+    call[CALL_FN] = main_fn;
+    call[N_TYPE] = ty_void;
+    vec_push(body[BLK_STMTS], expr_stmt(call));
+    vec_push(body[BLK_STMTS], expr_stmt(rt_call(pos, "rt_exit", vec_new(), ty_void)));
+    vec_push(prog_fns, f);
+    start_fn = f;
+}
+
+// ---- reachability ----
+
+fn mark_reach(f) {
+    if !f || f[F_REACH] {
+        return;
+    }
+    f[F_REACH] = 1;
+    if f[F_BODY] {
+        reach_stmts(f[F_BODY][BLK_STMTS]);
+    }
+}
+
+fn reach_stmts(v) {
+    let i = 0;
+    while i < v[VEC_LEN] {
+        reach_stmt(vec_get(v, i));
+        i = i + 1;
+    }
+}
+
+fn reach_stmt(s) {
+    if !s {
+        return;
+    }
+    let k = s[N_KIND];
+    if k == ST_BLOCK {
+        reach_stmts(s[BLK_STMTS]);
+    } else if k == ST_LET {
+        reach_expr(s[LET_INIT]);
+    } else if k == ST_ASSIGN {
+        reach_expr(s[AS_TARGET]);
+        reach_expr(s[AS_VALUE]);
+    } else if k == ST_EXPR {
+        reach_expr(s[ES_X]);
+    } else if k == ST_IF {
+        reach_expr(s[IF_COND]);
+        reach_stmt(s[IF_THEN]);
+        reach_stmt(s[IF_ELSE]);
+    } else if k == ST_WHILE {
+        reach_expr(s[WH_COND]);
+        reach_stmt(s[WH_BODY]);
+        reach_stmt(s[WH_POST]);
+    } else if k == ST_RETURN {
+        reach_expr(s[RET_VALUE]);
+        if s[RET_VALUES] {
+            reach_exprs(s[RET_VALUES]);
+        }
+    } else if k == ST_CALLMULTI {
+        reach_expr(s[CM_CALL]);
+    }
+}
+
+fn reach_exprs(v) {
+    let i = 0;
+    while i < v[VEC_LEN] {
+        reach_expr(vec_get(v, i));
+        i = i + 1;
+    }
+}
+
+fn reach_expr(e) {
+    if !e {
+        return;
+    }
+    let k = e[N_KIND];
+    if k == EX_CALL {
+        mark_reach(e[CALL_FN]);
+        reach_expr(e[CALL_CALLEE]);
+        reach_exprs(e[CALL_ARGS]);
+    } else if k == EX_FUNCREF {
+        mark_reach(e[FR_FN]);
+    } else if k == EX_UNARY {
+        reach_expr(e[UN_X]);
+    } else if k == EX_BINARY {
+        reach_expr(e[BIN_L]);
+        reach_expr(e[BIN_R]);
+    } else if k == EX_INDEX {
+        reach_expr(e[IX_X]);
+        reach_expr(e[IX_I]);
+    } else if k == EX_CONV {
+        reach_expr(e[CV_X]);
+    } else if k == EX_SEQ {
+        reach_stmts(e[SEQ_STMTS]);
+        reach_expr(e[SEQ_VALUE]);
+    } else if k == EX_MEM {
+        reach_expr(e[MEM_BASE]);
+        reach_expr(e[MEM_INDEX]);
+        reach_expr(e[MEM_LEN]);
+    } else if k == EX_ELEM {
+        reach_expr(e[ELEM_SEQ]);
+        reach_expr(e[ELEM_IDX]);
+    }
+}
+
+// ---- scopes ----
+
+fn start_scope() {
+    sc_syms[VEC_LEN] = 0;
+    sc_marks[VEC_LEN] = 0;
+    vec_push(sc_marks, 0);
+}
+
+fn check_fn(f) {
+    set_file(f[F_FILE]);
+    ck_tbind = f[F_TBIND];
+    ck_fn = f;
+    ck_legacy = f[F_LEGACY];
+    ck_loops = 0;
+    ck_breaks = 0;
+    start_scope();
+    f[F_SLOTS] = 0;
+    f[F_LOCALS] = vec_new();
+    let params = f[F_PARAMS];
+    let i = 0;
+    while i < params[VEC_LEN] {
+        let ps = declare_local(f[F_POS], vec_get(params, i), vec_get(f[F_PTYPES], i));
+        ps[S_READS] = 1;
+        if f[F_MUTS] && i < f[F_MUTS][VEC_LEN] {
+            ps[S_MUT] = vec_get(f[F_MUTS], i);
+        }
+        i = i + 1;
+    }
+    // The body shares the parameters' scope, so `let x` cannot silently hide parameter x.
+    ck_defers = 0;
+    check_stmts(f[F_BODY][BLK_STMTS]);
+    if ck_defers {
+        finish_defers(f);
+        ck_defers = 0;
+    }
+    if !ck_legacy && f[F_RTYPES][VEC_LEN] > 0 && !ends_in_return(f[F_BODY][BLK_STMTS]) {
+        err_quoted(f[F_POS], "function ", f[F_NAME], " is missing a return at the end");
+    }
+    if !ck_legacy {
+        // A fault that is assigned but never looked at is an ignored error.
+        let locals = f[F_LOCALS];
+        i = 0;
+        while i < locals[VEC_LEN] {
+            let l = vec_get(locals, i);
+            if kind_of(l[S_TYPE]) == K_ERROR && l[S_READS] == 0 && load8(l[S_NAME]) != '$' {
+                err_quoted(l[S_POS], "fault ", l[S_NAME], " is never checked");
+            }
+            i = i + 1;
+        }
+    }
+}
+
+// ends_in_return is Go's terminating-statement rule, simplified.
+fn ends_in_return(stmts) {
+    if stmts[VEC_LEN] == 0 {
+        return 0;
+    }
+    let s = vec_get(stmts, stmts[VEC_LEN] - 1);
+    let k = s[N_KIND];
+    if k == ST_RETURN {
+        return 1;
+    }
+    if k == ST_EXPR && s[ES_X][N_KIND] == EX_CALL && s[ES_X][CALL_NAME] && (streq(s[ES_X][CALL_NAME], "panic") || streq(s[ES_X][CALL_NAME], "rt_panic")) {
+        return 1;
+    }
+    if k == ST_BLOCK {
+        return ends_in_return(s[BLK_STMTS]);
+    }
+    if k == ST_IF {
+        if !s[IF_ELSE] || !ends_in_return(s[IF_THEN][BLK_STMTS]) {
+            return 0;
+        }
+        let one = vec_new();
+        vec_push(one, s[IF_ELSE]);
+        return ends_in_return(one);
+    }
+    if k == ST_WHILE {
+        return !s[WH_ONCE] && is_true_lit(s[WH_COND]) && !has_break(s[WH_BODY][BLK_STMTS]);
+    }
+    return 0;
+}
+
+fn is_true_lit(e) {
+    return e[N_KIND] == EX_INT && e[INT_VAL] != 0;
+}
+
+fn has_break(stmts) {
+    let i = 0;
+    while i < stmts[VEC_LEN] {
+        let s = vec_get(stmts, i);
+        let k = s[N_KIND];
+        if k == ST_BREAK {
+            return 1;
+        }
+        if k == ST_BLOCK && has_break(s[BLK_STMTS]) {
+            return 1;
+        }
+        if k == ST_IF {
+            if has_break(s[IF_THEN][BLK_STMTS]) {
+                return 1;
+            }
+            if s[IF_ELSE] {
+                let one = vec_new();
+                vec_push(one, s[IF_ELSE]);
+                if has_break(one) {
+                    return 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn declare_local(pos, name, t) {
+    let start = vec_get(sc_marks, sc_marks[VEC_LEN] - 1);
+    if load8(name) != '$' {
+        let i = sc_syms[VEC_LEN] - 1;
+        while i >= start {
+            let prev = vec_get(sc_syms, i);
+            if streq(prev[S_NAME], name) {
+                let e = err_begin(pos);
+                buf_byte(e, '\'');
+                buf_str(e, name);
+                buf_str(e, "' redeclared in this scope (previous declaration at ");
+                buf_pos(e, prev[S_POS]);
+                buf_byte(e, ')');
+                err_end(e);
+                break;
+            }
+            i = i - 1;
+        }
+    }
+    let s = sym_new(SYM_LOCAL, name, pos);
+    s[S_TYPE] = t;
+    s[S_SLOT] = ck_fn[F_SLOTS];
+    ck_fn[F_SLOTS] = ck_fn[F_SLOTS] + 1;
+    vec_push(ck_fn[F_LOCALS], s);
+    vec_push(sc_syms, s);
+    return s;
+}
+
+fn in_current_scope(name) {
+    let start = vec_get(sc_marks, sc_marks[VEC_LEN] - 1);
+    let i = sc_syms[VEC_LEN] - 1;
+    while i >= start {
+        let s = vec_get(sc_syms, i);
+        if streq(s[S_NAME], name) {
+            return s;
+        }
+        i = i - 1;
+    }
+    return 0;
+}
+
+// lookup_name searches the open scopes innermost first, then this package, then the universe.
+fn lookup_name(name) {
+    let i = sc_syms[VEC_LEN] - 1;
+    while i >= 0 {
+        let s = vec_get(sc_syms, i);
+        if streq(s[S_NAME], name) {
+            return s;
+        }
+        i = i - 1;
+    }
+    if load8(ck_pkg) != 0 {
+        let q = lookup_global(qual(ck_pkg, name));
+        if q {
+            return q;
+        }
+    }
+    return lookup_global(name);
+}
+
+fn push_scope() {
+    vec_push(sc_marks, sc_syms[VEC_LEN]);
+}
+
+fn pop_scope() {
+    sc_syms[VEC_LEN] = vec_get(sc_marks, sc_marks[VEC_LEN] - 1);
+    sc_marks[VEC_LEN] = sc_marks[VEC_LEN] - 1;
+}
+
+fn check_scoped(b) {
+    push_scope();
+    check_stmts(b[BLK_STMTS]);
+    pop_scope();
+}
+
+fn check_stmts(stmts) {
+    let narrowed = vec_new();
+    let i = 0;
+    while i < stmts[VEC_LEN] {
+        let s = vec_get(stmts, i);
+        check_stmt(s);
+        // if x == nil { return } narrows x to non-nil for the rest of the block.
+        if s[N_KIND] == ST_IF && !s[IF_ELSE] && ends_in_jump(s[IF_THEN][BLK_STMTS]) {
+            let nw = narrow_begin(s[IF_COND], 0);
+            if nw {
+                vec_push(narrowed, nw);
+            }
+        }
+        i = i + 1;
+    }
+    i = narrowed[VEC_LEN] - 1;
+    while i >= 0 {
+        narrow_end(vec_get(narrowed, i));
+        i = i - 1;
+    }
+}
+
+// ends_in_jump reports whether a block always leaves: return, break, continue, panic.
+fn ends_in_jump(stmts) {
+    if stmts[VEC_LEN] == 0 {
+        return 0;
+    }
+    let last = vec_get(stmts, stmts[VEC_LEN] - 1);
+    let k = last[N_KIND];
+    return k == ST_RETURN || k == ST_BREAK || k == ST_CONTINUE || ends_in_return(stmts);
+}
+
+fn replace_node(e, n) {
+    let i = 0;
+    while i < N_SIZE {
+        e[i] = n[i];
+        i = i + 1;
+    }
+}
+
+fn expr_clone(e) {
+    if !e {
+        return 0;
+    }
+    let c = node_new(e[N_KIND], e[N_POS]);
+    replace_node(c, e);
+    let k = e[N_KIND];
+    if k == EX_UNARY {
+        c[UN_X] = expr_clone(e[UN_X]);
+    } else if k == EX_BINARY {
+        c[BIN_L] = expr_clone(e[BIN_L]);
+        c[BIN_R] = expr_clone(e[BIN_R]);
+    } else if k == EX_INDEX {
+        c[IX_X] = expr_clone(e[IX_X]);
+        c[IX_I] = expr_clone(e[IX_I]);
+    } else if k == EX_CONV {
+        c[CV_X] = expr_clone(e[CV_X]);
+    } else if k == EX_CALL {
+        let args = vec_new();
+        let i = 0;
+        while i < e[CALL_ARGS][VEC_LEN] {
+            vec_push(args, expr_clone(vec_get(e[CALL_ARGS], i)));
+            i = i + 1;
+        }
+        c[CALL_ARGS] = args;
+        c[CALL_CALLEE] = expr_clone(e[CALL_CALLEE]);
+    } else if k == EX_SELECT {
+        c[SEL_X] = expr_clone(e[SEL_X]);
+    }
+    return c;
+}
+
+fn mk_int(pos, v, t) {
+    let n = node_new(EX_INT, pos);
+    n[INT_VAL] = v;
+    n[N_TYPE] = t;
+    return n;
+}
+
+fn mk_bin(pos, op, l, r, t) {
+    let b = binary_new(pos, op, l, r);
+    b[N_TYPE] = t;
+    return b;
+}
+
+fn mk_index(pos, x, i, t) {
+    let n = node_new(EX_INDEX, pos);
+    n[IX_X] = x;
+    n[IX_I] = i;
+    n[N_TYPE] = t;
+    return n;
+}
+
+// mk_hdr loads word k of a string, slice or map header (all are non-nil).
+fn mk_hdr(pos, x, k) {
+    let n = node_new(EX_MEM, pos);
+    n[MEM_BASE] = x;
+    n[MEM_OFF] = 8 * k;
+    n[MEM_HDR] = 1;
+    n[N_TYPE] = ty_int;
+    return n;
+}
+
+fn mk_conv(pos, x, kind, t) {
+    let n = node_new(EX_CONV, pos);
+    n[CV_X] = x;
+    n[CV_KIND] = kind;
+    n[N_TYPE] = t;
+    return n;
+}
+
+const CV_SAME = 8;   // retype only: same bits
+const CV_INT = 9;    // integer to integer: truncate or extend to the target width
+const CV_I2F = 1;
+const CV_F2I = 2;
+const CV_BITS2F = 3;
+const CV_F2BITS = 4;
+const CV_TOBYTE = 5;
+const CV_LEN = 6;    // null-safe header word 0 (len of string, slice, map)
+const CV_CAP = 7;    // null-safe header word 1
+
+fn intrinsic_call(pos, name, args, t) {
+    let c = node_new(EX_CALL, pos);
+    c[CALL_NAME] = name;
+    c[CALL_ARGS] = args;
+    c[CALL_INTRINSIC] = 1;
+    c[N_TYPE] = t;
+    return c;
+}
+
+fn args1(a) {
+    let v = vec_new();
+    vec_push(v, a);
+    return v;
+}
+
+fn args2(a, b) {
+    let v = args1(a);
+    vec_push(v, b);
+    return v;
+}
+
+fn args3(a, b, c) {
+    let v = args2(a, b);
+    vec_push(v, c);
+    return v;
+}
+
+fn args4(a, b, c, d) {
+    let v = args3(a, b, c);
+    vec_push(v, d);
+    return v;
+}
+
+fn mk_load8(pos, addr) {
+    return intrinsic_call(pos, "load8", args1(addr), ty_byte);
+}
+
+// rt_call calls a runtime function by name; the runtime is loaded for every v2 program.
+fn rt_call(pos, name, args, t) {
+    let f = find_fn(name);
+    if !f {
+        err_quoted(pos, "runtime function ", name, " is missing (is lib/runtime.tin loaded?)");
+    }
+    let c = node_new(EX_CALL, pos);
+    c[CALL_NAME] = name;
+    c[CALL_ARGS] = args;
+    c[CALL_FN] = f;
+    c[N_TYPE] = t;
+    return c;
+}
+
+fn sym_ref_node(pos, s) {
+    let n = node_new(EX_IDENT, pos);
+    n[ID_NAME] = s[S_NAME];
+    n[ID_REF] = s;
+    n[N_TYPE] = s[S_TYPE];
+    return n;
+}
+
+fn expr_stmt(e) {
+    let s = node_new(ST_EXPR, e[N_POS]);
+    s[ES_X] = e;
+    return s;
+}
+
+fn let_stmt(pos, s, init) {
+    let l = node_new(ST_LET, pos);
+    l[LET_NAME] = s[S_NAME];
+    l[LET_INIT] = init;
+    l[LET_SYM] = s;
+    return l;
+}
+
+fn assign_stmt(pos, target, value) {
+    let a = node_new(ST_ASSIGN, pos);
+    a[AS_TARGET] = target;
+    a[AS_VALUE] = value;
+    return a;
+}
+
+// temp declares a hidden local holding init (already checked) and returns its let.
+fn temp(pos, init, t) {
+    let s = declare_local(pos, "$", t);
+    return let_stmt(pos, s, init);
+}
+
+fn mk_seq(pos, stmts, value, t) {
+    let n = node_new(EX_SEQ, pos);
+    n[SEQ_STMTS] = stmts;
+    n[SEQ_VALUE] = value;
+    n[N_TYPE] = t;
+    return n;
+}
+
+// zero_value is the value a declaration without initializer starts with. Strings and
+// slices start empty (static objects, never nil); structs, maps and funcs have none.
+fn zero_value(pos, t) {
+    let k = kind_of(t);
+    if is_float_t(t) {
+        let f = node_new(EX_FLOAT, pos);
+        f[N_TYPE] = ty_float;
+        return f;
+    }
+    if k == K_STRING {
+        return lit_string(pos, "");
+    }
+    if k == K_SLICE {
+        if ck_legacy {
+            return intrinsic_call(pos, "__empty", vec_new(), t);
+        }
+        // A real header, made in the current region, so append never has to pick one.
+        return rt_call(pos, "rt_slice_make", args3(mk_int(pos, 0, ty_int), mk_int(pos, 0, ty_int), mk_int(pos, elem_size(t), ty_int)), t);
+    }
+    if (k == K_STRUCT || k == K_MAP || k == K_FUNC) && !ck_legacy {
+        err_type(pos, "a variable of type ", t, " needs an initializer (it cannot be nil; use ?T for an optional)");
+    }
+    return mk_int(pos, 0, t);
+}
+
+fn to_bits(e) {
+    if is_float_t(e[N_TYPE]) {
+        return mk_conv(e[N_POS], e, CV_F2BITS, ty_int);
+    }
+    return e;
+}
+
+fn from_bits(e, t) {
+    if is_float_t(t) {
+        return mk_conv(e[N_POS], e, CV_BITS2F, t);
+    }
+    e[N_TYPE] = t;
+    return e;
+}
+
+// ---- statements ----
+
+fn check_stmt(s) {
+    let k = s[N_KIND];
+    if k == ST_LET {
+        check_let(s);
+    } else if k == ST_ASSIGN {
+        check_assign(s);
+    } else if k == ST_MULTI {
+        check_multi(s);
+    } else if k == ST_EXPR {
+        let x = s[ES_X];
+        if x[N_KIND] == EX_TRY && !ck_legacy {
+            lower_try_stmt(s, x, 0, 0);
+            return;
+        }
+        let t = chk(x, 0);
+        if !ck_legacy && (kind_of(t) == K_ERROR || (kind_of(t) == K_TUPLE && kind_of(vec_get(t[TY_FIELDS], t[TY_FIELDS][VEC_LEN] - 1)) == K_ERROR)) {
+            err_at(s[N_POS], "the fault this call returns is ignored (check it, or use try)");
+        }
+        if kind_of(t) == K_TUPLE && x[N_KIND] == EX_CALL {
+            x[N_TYPE] = ty_void;
+        }
+    } else if k == ST_IF {
+        if s[IF_INIT] {
+            lower_with_init(s, IF_INIT);
+            return;
+        }
+        check_cond(s[IF_COND]);
+        let narrowed = narrow_begin(s[IF_COND], 1);
+        let saved = vec_len_of(safe_pairs);
+        add_len_fact(s[IF_COND], s[IF_THEN]);
+        check_scoped(s[IF_THEN]);
+        safe_pairs[VEC_LEN] = saved;
+        narrow_end(narrowed);
+        let els = s[IF_ELSE];
+        if els {
+            let narrowed2 = narrow_begin(s[IF_COND], 0);
+            if els[N_KIND] == ST_BLOCK {
+                check_scoped(els);
+            } else {
+                check_stmt(els);
+            }
+            narrow_end(narrowed2);
+        }
+    } else if k == ST_WHILE {
+        if s[WH_INIT] {
+            lower_for_init(s);
+            return;
+        }
+        check_cond(s[WH_COND]);
+        ck_loops = ck_loops + 1;
+        ck_breaks = ck_breaks + 1;
+        check_scoped(s[WH_BODY]);
+        if s[WH_POST] {
+            push_scope();
+            check_stmt(s[WH_POST]);
+            pop_scope();
+        }
+        ck_loops = ck_loops - 1;
+        ck_breaks = ck_breaks - 1;
+    } else if k == ST_RANGE {
+        lower_range(s);
+    } else if k == ST_SWITCH {
+        lower_switch(s);
+    } else if k == ST_RETURN {
+        check_return(s);
+    } else if k == ST_BREAK {
+        if ck_breaks == 0 {
+            err_at(s[N_POS], "break outside a loop");
+        }
+    } else if k == ST_CONTINUE {
+        if ck_loops == 0 {
+            err_at(s[N_POS], "continue outside a loop");
+        }
+    } else if k == ST_BLOCK && s[BLK_FLAT] {
+        check_stmts(s[BLK_STMTS]);
+    } else if k == ST_BLOCK {
+        check_scoped(s);
+    } else if k == ST_GO {
+        if !ck_legacy {
+            err_at(s[N_POS], "go is not allowed: cores share nothing (run work per core with hearth, talk across cores with relay)");
+        }
+        lower_go(s);
+    } else if k == ST_DEFER {
+        lower_defer(s);
+    }
+}
+
+// ---- defer ----
+//
+// defer f(a, b) evaluates f, a and b now and sets a flag; every return (including the
+// ones try makes) and the end of the function then run the flagged calls, last first.
+
+var ck_defers;   // the current function's defers: [flag, call]
+
+fn lower_defer(s) {
+    let pos = s[N_POS];
+    if ck_legacy {
+        err_at(pos, "defer needs func syntax");
+        return;
+    }
+    if ck_loops > 0 {
+        err_at(pos, "defer inside a loop would run once per function, not per iteration: move the loop body into a function");
+        return;
+    }
+    let call = s[GO_CALL];
+    let t = chk(call, 0);
+    let tk = kind_of(t);
+    if tk == K_ERROR || (tk == K_TUPLE && tuple_has_fault(t)) {
+        err_at(pos, "defer would ignore the fault this call returns: defer a function that handles it");
+        return;
+    }
+    if call[N_KIND] != EX_CALL || call[CALL_INTRINSIC] {
+        err_at(pos, "defer needs a plain function call (wrap anything else in a function)");
+        return;
+    }
+    let b = empty_block(pos);
+    b[BLK_FLAT] = 1;
+    if call[CALL_CALLEE] {
+        let ct = temp(pos, call[CALL_CALLEE], call[CALL_CALLEE][N_TYPE]);
+        vec_push(b[BLK_STMTS], ct);
+        call[CALL_CALLEE] = sym_ref_node(pos, ct[LET_SYM]);
+    }
+    let args = call[CALL_ARGS];
+    let i = 0;
+    while i < args[VEC_LEN] {
+        let a = vec_get(args, i);
+        let at = temp(pos, a, a[N_TYPE]);
+        vec_push(b[BLK_STMTS], at);
+        args[VEC_DATA][i] = sym_ref_node(pos, at[LET_SYM]);
+        i = i + 1;
+    }
+    let flag = declare_local(pos, "$", ty_bool);
+    vec_push(b[BLK_STMTS], assign_stmt(pos, sym_ref_node(pos, flag), mk_int(pos, 1, ty_bool)));
+    if !ck_defers {
+        ck_defers = vec_new();
+    }
+    vec_push(ck_defers, pair(flag, call));
+    replace_node(s, b);
+}
+
+fn tuple_has_fault(t) {
+    let i = 0;
+    while i < t[TY_FIELDS][VEC_LEN] {
+        if kind_of(vec_get(t[TY_FIELDS], i)) == K_ERROR {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// defer_calls appends the flagged deferred calls to stmts, last deferred first.
+fn defer_calls(pos, stmts) {
+    let j = ck_defers[VEC_LEN] - 1;
+    while j >= 0 {
+        let d = vec_get(ck_defers, j);
+        let call = vec_get(d, 1);
+        let c = node_new(EX_CALL, pos);
+        replace_node(c, call);
+        let args = vec_new();
+        let i = 0;
+        while i < call[CALL_ARGS][VEC_LEN] {
+            vec_push(args, sym_ref_node(pos, vec_get(call[CALL_ARGS], i)[ID_REF]));
+            i = i + 1;
+        }
+        c[CALL_ARGS] = args;
+        if call[CALL_CALLEE] {
+            c[CALL_CALLEE] = sym_ref_node(pos, call[CALL_CALLEE][ID_REF]);
+        }
+        let ifs = node_new(ST_IF, pos);
+        ifs[IF_COND] = sym_ref_node(pos, vec_get(d, 0));
+        ifs[IF_THEN] = empty_block(pos);
+        vec_push(ifs[IF_THEN][BLK_STMTS], expr_stmt(c));
+        vec_push(stmts, ifs);
+        j = j - 1;
+    }
+}
+
+fn finish_defers(f) {
+    let body = f[F_BODY];
+    defer_returns(body[BLK_STMTS]);
+    let pos = f[F_POS];
+    let init = vec_new();
+    let i = 0;
+    while i < ck_defers[VEC_LEN] {
+        vec_push(init, let_stmt(pos, vec_get(vec_get(ck_defers, i), 0), mk_int(pos, 0, ty_bool)));
+        i = i + 1;
+    }
+    i = 0;
+    while i < body[BLK_STMTS][VEC_LEN] {
+        vec_push(init, vec_get(body[BLK_STMTS], i));
+        i = i + 1;
+    }
+    if !ends_in_return(body[BLK_STMTS]) {
+        defer_calls(pos, init);
+    }
+    body[BLK_STMTS] = init;
+}
+
+fn defer_returns(v) {
+    let i = 0;
+    while i < v[VEC_LEN] {
+        defer_stmt(vec_get(v, i));
+        i = i + 1;
+    }
+}
+
+fn defer_stmt(s) {
+    let k = s[N_KIND];
+    if k == ST_BLOCK {
+        defer_returns(s[BLK_STMTS]);
+    } else if k == ST_IF {
+        defer_returns(s[IF_THEN][BLK_STMTS]);
+        if s[IF_ELSE] {
+            defer_stmt(s[IF_ELSE]);
+        }
+    } else if k == ST_WHILE {
+        defer_returns(s[WH_BODY][BLK_STMTS]);
+    } else if k == ST_RETURN {
+        let pos = s[N_POS];
+        let b = empty_block(pos);
+        b[BLK_FLAT] = 1;
+        let r = node_new(ST_RETURN, pos);
+        if s[RET_VALUE] {
+            let v = s[RET_VALUE];
+            if kind_of(v[N_TYPE]) == K_TUPLE {
+                err_at(pos, "in a function with defer, assign a multi-value call's results before returning them");
+            }
+            let t = temp(pos, v, v[N_TYPE]);
+            vec_push(b[BLK_STMTS], t);
+            r[RET_VALUE] = sym_ref_node(pos, t[LET_SYM]);
+        }
+        if s[RET_VALUES] {
+            let vals = vec_new();
+            let i = 0;
+            while i < s[RET_VALUES][VEC_LEN] {
+                let rv = vec_get(s[RET_VALUES], i);
+                let t2 = temp(pos, rv, rv[N_TYPE]);
+                vec_push(b[BLK_STMTS], t2);
+                vec_push(vals, sym_ref_node(pos, t2[LET_SYM]));
+                i = i + 1;
+            }
+            r[RET_VALUES] = vals;
+        }
+        defer_calls(pos, b[BLK_STMTS]);
+        vec_push(b[BLK_STMTS], r);
+        replace_node(s, b);
+    }
+}
+
+fn vec_len_of(v) {
+    return v[VEC_LEN];
+}
+
+// lower_with_init turns `if init; c {}` / `for init; c; post {}` into { init; stmt }.
+fn lower_with_init(s, field) {
+    let init = s[field];
+    let inner = node_new(s[N_KIND], s[N_POS]);
+    replace_node(inner, s);
+    inner[field] = 0;
+    let b = empty_block(s[N_POS]);
+    vec_push(b[BLK_STMTS], init);
+    vec_push(b[BLK_STMTS], inner);
+    replace_node(s, b);
+    check_scoped(s);
+}
+
+fn check_cond(c) {
+    let t = chk(c, ty_bool);
+    if ck_legacy {
+        return;
+    }
+    if !is_bool_t(t) {
+        err_type(c[N_POS], "condition must be a bool, not ", t, "");
+    }
+}
+
+fn check_let(s) {
+    let pos = s[N_POS];
+    let t = 0;
+    if s[LET_TYPE] {
+        t = resolve_type(s[LET_TYPE]);
+    }
+    let init = s[LET_INIT];
+    if init && init[N_KIND] == EX_TRY && !ck_legacy {
+        lower_try_stmt(s, init, 1, t);
+        return;
+    }
+    if init {
+        let it = chk(init, t);
+        if kind_of(it) == K_VOID || kind_of(it) == K_TUPLE {
+            err_type(pos, "cannot use ", it, " as a value");
+        }
+        if t {
+            check_assignable(init, it, t);
+            if is_untyped(it) {
+                reconvert(init, t);
+            }
+        } else {
+            t = default_type(it);
+            if kind_of(t) == K_NIL {
+                err_at(init[N_POS], "use of untyped nil");
+            }
+            if is_untyped(it) {
+                reconvert(init, t);
+            }
+        }
+    } else if !ck_legacy && array_len(s[LET_TYPE]) > 0 {
+        s[LET_INIT] = array_make(pos, t, array_len(s[LET_TYPE]));
+    } else {
+        s[LET_INIT] = zero_value(pos, t);
+    }
+    if streq(s[LET_NAME], "_") {
+        replace_node(s, expr_stmt(s[LET_INIT]));
+        return;
+    }
+    s[LET_SYM] = declare_local(pos, s[LET_NAME], t);
+}
+
+// check_target checks an assignment target and returns its type; it rewrites slice
+// elements and fields into word accesses and leaves map/byte stores to the caller.
+fn check_target(t) {
+    let k = t[N_KIND];
+    if k == EX_IDENT {
+        let s = lookup_name(t[ID_NAME]);
+        if !s {
+            let u = err_begin(t[N_POS]);
+            buf_str(u, "undefined: ");
+            buf_str(u, t[ID_NAME]);
+            err_end(u);
+            return ty_int;
+        }
+        if s[S_KIND] == SYM_CONST {
+            err_quoted(t[N_POS], "cannot assign to constant ", t[ID_NAME], "");
+        } else if s[S_KIND] == SYM_FUNC {
+            err_quoted(t[N_POS], "cannot assign to function ", t[ID_NAME], "");
+        }
+        t[ID_REF] = s;
+        t[N_TYPE] = s[S_TYPE];
+        return s[S_TYPE];
+    }
+    if k == EX_INDEX || k == EX_SELECT {
+        return chk(t, 0);
+    }
+    err_at(t[N_POS], "cannot assign to this expression");
+    return ty_int;
+}
+
+fn check_assign(s) {
+    let target = s[AS_TARGET];
+    let v = s[AS_VALUE];
+    if v[N_KIND] == EX_TRY && !ck_legacy {
+        lower_try_stmt(s, v, 2, 0);
+        return;
+    }
+    if target[N_KIND] == EX_IDENT && streq(target[ID_NAME], "_") {
+        let vt = chk(v, 0);
+        if kind_of(vt) == K_ERROR && !ck_legacy {
+            err_at(s[N_POS], "a fault cannot be discarded with _");
+        }
+        replace_node(s, expr_stmt(v));
+        return;
+    }
+    // Map stores become runtime calls. x op= v shares the target node with v, so take
+    // the target's parts before checking v.
+    if target[N_KIND] == EX_INDEX && !ck_legacy {
+        let tx = target[IX_X];
+        let ti = target[IX_I];
+        let xt = chk(tx, 0);
+        if kind_of(xt) == K_MAP {
+            let kt = chk(ti, xt[TY_KEY]);
+            check_assignable(ti, kt, xt[TY_KEY]);
+            if is_untyped(kt) {
+                reconvert(ti, xt[TY_KEY]);
+            }
+            let vt = chk(v, xt[TY_ELEM]);
+            check_assignable(v, vt, xt[TY_ELEM]);
+            if is_untyped(vt) {
+                reconvert(v, xt[TY_ELEM]);
+            }
+            let store = rt_call(s[N_POS], "rt_map_set", args3(tx, to_bits(ti), to_bits(v)), ty_void);
+            store[CALL_STORE] = 1;
+            replace_node(s, expr_stmt(store));
+            return;
+        }
+        if kind_of(xt) == K_STRING {
+            err_at(target[N_POS], "cannot assign to a str index (strings are immutable)");
+            return;
+        }
+    }
+    let tt = check_target(target);
+    let vt = chk(v, tt);
+    if !ck_legacy {
+        check_assignable(v, vt, tt);
+        if is_untyped(vt) {
+            reconvert(v, tt);
+        }
+        narrow_kill(target);
+    }
+}
+
+fn check_assignable(e, from, to) {
+    if !assignable(from, to) && !ck_legacy {
+        err_types(e[N_POS], "cannot use ", from, " as ", to);
+    }
+}
+
+fn check_multi(s) {
+    let pos = s[N_POS];
+    let targets = s[MU_TARGETS];
+    let values = s[MU_VALUES];
+    let define = s[MU_DEFINE];
+    let out = node_new(ST_BLOCK, pos);
+    out[BLK_STMTS] = vec_new();
+    out[BLK_FLAT] = 1;
+    let stmts = out[BLK_STMTS];
+    let n = targets[VEC_LEN];
+    let temps = vec_new();
+    if values[VEC_LEN] == 1 && n > 1 {
+        let v = vec_get(values, 0);
+        if v[N_KIND] == EX_TRY && !ck_legacy {
+            lower_try_stmt(s, v, 3, 0);
+            return;
+        }
+        // v, ok := m[k]
+        if v[N_KIND] == EX_INDEX && n == 2 {
+            let mt = chk(v[IX_X], 0);
+            if kind_of(mt) == K_MAP {
+                let kt = chk(v[IX_I], mt[TY_KEY]);
+                if is_untyped(kt) {
+                    reconvert(v[IX_I], mt[TY_KEY]);
+                }
+                let get = map_read(pos, v[IX_X], v[IX_I], mt[TY_ELEM]);
+                vec_push(stmts, temp(pos, get, mt[TY_ELEM]));
+                vec_push(temps, vec_get(stmts, 0)[LET_SYM]);
+                vec_push(stmts, temp(pos, rt_call(pos, "rt_map_found", vec_new(), ty_bool), ty_bool));
+                vec_push(temps, vec_get(stmts, 1)[LET_SYM]);
+                bind_targets(pos, targets, temps, define, stmts);
+                replace_node(s, out);
+                return;
+            }
+        }
+        let t = chk(v, 0);
+        if kind_of(t) != K_TUPLE || t[TY_FIELDS][VEC_LEN] != n {
+            err_at(pos, "assignment count mismatch");
+            return;
+        }
+        let cm = node_new(ST_CALLMULTI, pos);
+        cm[CM_CALL] = v;
+        cm[CM_SYMS] = vec_new();
+        let i = 0;
+        while i < n {
+            let ts = declare_local(pos, "$", vec_get(t[TY_FIELDS], i));
+            vec_push(cm[CM_SYMS], ts);
+            vec_push(temps, ts);
+            i = i + 1;
+        }
+        v[N_TYPE] = ty_void;
+        vec_push(stmts, cm);
+        bind_targets(pos, targets, temps, define, stmts);
+        replace_node(s, out);
+        return;
+    }
+    if values[VEC_LEN] != n {
+        err_at(pos, "assignment count mismatch");
+        return;
+    }
+    // Evaluate every value first, then assign: a, b = b, a swaps.
+    let i = 0;
+    while i < n {
+        let v = vec_get(values, i);
+        let want = 0;
+        let tg = vec_get(targets, i);
+        if !define && !(tg[N_KIND] == EX_IDENT && streq(tg[ID_NAME], "_")) {
+            want = check_target_type(tg);
+        }
+        let vt = chk(v, want);
+        if is_untyped(vt) {
+            vt = reconvert(v, default_type(vt));
+        }
+        let l = temp(pos, v, default_type(vt));
+        vec_push(stmts, l);
+        vec_push(temps, l[LET_SYM]);
+        i = i + 1;
+    }
+    bind_targets(pos, targets, temps, define, stmts);
+    replace_node(s, out);
+}
+
+// check_target_type reports a target's type without rewriting it.
+fn check_target_type(t) {
+    if t[N_KIND] == EX_IDENT {
+        let s = lookup_name(t[ID_NAME]);
+        if s {
+            return s[S_TYPE];
+        }
+    }
+    return 0;
+}
+
+fn splice_list(s, block) {
+    let l = node_new(ST_LIST, s[N_POS]);
+    replace_node(s, block);
+}
+
+// bind_targets assigns (or, for :=, declares) each target from its temp.
+fn bind_targets(pos, targets, temps, define, stmts) {
+    let i = 0;
+    while i < targets[VEC_LEN] {
+        let tg = vec_get(targets, i);
+        let ts = vec_get(temps, i);
+        if tg[N_KIND] == EX_IDENT && streq(tg[ID_NAME], "_") {
+            i = i + 1;
+            continue;
+        }
+        if define {
+            if tg[N_KIND] != EX_IDENT {
+                err_at(tg[N_POS], "expected a name before :=");
+            } else if !in_current_scope(tg[ID_NAME]) {
+                let l = node_new(ST_LET, pos);
+                l[LET_NAME] = tg[ID_NAME];
+                l[LET_INIT] = sym_ref_node(pos, ts);
+                l[LET_SYM] = declare_local(pos, tg[ID_NAME], ts[S_TYPE]);
+                vec_push(stmts, l);
+                i = i + 1;
+                continue;
+            }
+        }
+        let a = assign_stmt(pos, tg, sym_ref_node(pos, ts));
+        check_assign(a);
+        vec_push(stmts, a);
+        i = i + 1;
+    }
+}
+
+fn check_return(s) {
+    let f = ck_fn;
+    let want = f[F_RTYPES];
+    let pos = s[N_POS];
+    if s[RET_VALUE] && s[RET_VALUE][N_KIND] == EX_TRY && !ck_legacy {
+        lower_try_stmt(s, s[RET_VALUE], 4, 0);
+        return;
+    }
+    if s[RET_VALUES] {
+        let vals = s[RET_VALUES];
+        if vals[VEC_LEN] != want[VEC_LEN] {
+            err_at(pos, "wrong number of return values");
+            return;
+        }
+        let i = 0;
+        while i < vals[VEC_LEN] {
+            let v = vec_get(vals, i);
+            let vt = chk(v, vec_get(want, i));
+            check_assignable(v, vt, vec_get(want, i));
+            if is_untyped(vt) {
+                reconvert(v, vec_get(want, i));
+            }
+            i = i + 1;
+        }
+        return;
+    }
+    let v = s[RET_VALUE];
+    if !v {
+        if want[VEC_LEN] > 0 && !ck_legacy {
+            err_at(pos, "missing return value");
+        }
+        return;
+    }
+    if want[VEC_LEN] == 0 {
+        err_at(v[N_POS], "too many return values");
+        chk(v, 0);
+        return;
+    }
+    if want[VEC_LEN] > 1 {
+        // return f() where f returns as many values: pass them through.
+        let t = chk(v, 0);
+        if kind_of(t) != K_TUPLE || t[TY_FIELDS][VEC_LEN] != want[VEC_LEN] {
+            err_at(pos, "wrong number of return values");
+            return;
+        }
+        let out = empty_block(pos);
+        out[BLK_FLAT] = 1;
+        let cm = node_new(ST_CALLMULTI, pos);
+        cm[CM_CALL] = v;
+        cm[CM_SYMS] = vec_new();
+        let vals2 = vec_new();
+        let i = 0;
+        while i < want[VEC_LEN] {
+            let ts = declare_local(pos, "$", vec_get(t[TY_FIELDS], i));
+            vec_push(cm[CM_SYMS], ts);
+            vec_push(vals2, sym_ref_node(pos, ts));
+            i = i + 1;
+        }
+        v[N_TYPE] = ty_void;
+        vec_push(out[BLK_STMTS], cm);
+        let r = node_new(ST_RETURN, pos);
+        r[RET_VALUES] = vals2;
+        vec_push(out[BLK_STMTS], r);
+        replace_node(s, out);
+        return;
+    }
+    let vt = chk(v, vec_get(want, 0));
+    check_assignable(v, vt, vec_get(want, 0));
+    if is_untyped(vt) {
+        reconvert(v, vec_get(want, 0));
+    }
+}
+
+// lower_try_stmt compiles the five places try may appear:
+//   0 try f()   1 x := try f()   2 x = try f()   3 a, b := try f()   4 return try f()
+// into: results := f(); if fault != nil { return zero values..., fault }; then use them.
+fn lower_try_stmt(s, tr, mode, declared) {
+    let pos = s[N_POS];
+    let call = tr[TRY_X];
+    let f = ck_fn;
+    let frs = f[F_RTYPES];
+    if frs[VEC_LEN] == 0 || kind_of(vec_get(frs, frs[VEC_LEN] - 1)) != K_ERROR {
+        err_at(pos, "try needs the enclosing function to return a fault as its last result");
+        return;
+    }
+    let t = chk(call, 0);
+    let results = vec_new();
+    if kind_of(t) == K_TUPLE {
+        results = t[TY_FIELDS];
+    } else if kind_of(t) != K_VOID {
+        vec_push(results, t);
+    }
+    if results[VEC_LEN] == 0 || kind_of(vec_get(results, results[VEC_LEN] - 1)) != K_ERROR {
+        err_at(pos, "try needs a call whose last result is a fault");
+        return;
+    }
+    let out = empty_block(pos);
+    out[BLK_FLAT] = 1;
+    let stmts = out[BLK_STMTS];
+    let temps = vec_new();
+    if results[VEC_LEN] == 1 {
+        let tl = temp(pos, call, ty_error);
+        vec_push(stmts, tl);
+        vec_push(temps, tl[LET_SYM]);
+    } else {
+        let cm = node_new(ST_CALLMULTI, pos);
+        cm[CM_CALL] = call;
+        cm[CM_SYMS] = vec_new();
+        let i = 0;
+        while i < results[VEC_LEN] {
+            let ts = declare_local(pos, "$", vec_get(results, i));
+            vec_push(cm[CM_SYMS], ts);
+            vec_push(temps, ts);
+            i = i + 1;
+        }
+        call[N_TYPE] = ty_void;
+        vec_push(stmts, cm);
+    }
+    let errsym = vec_get(temps, temps[VEC_LEN] - 1);
+    errsym[S_READS] = 1;
+    // if fault != nil { return zero..., fault }
+    let ifs = node_new(ST_IF, pos);
+    ifs[IF_COND] = mk_bin(pos, "!=", sym_ref_node(pos, errsym), mk_int(pos, 0, ty_error), ty_bool);
+    ifs[IF_THEN] = empty_block(pos);
+    let ret = node_new(ST_RETURN, pos);
+    if frs[VEC_LEN] == 1 {
+        ret[RET_VALUE] = sym_ref_node(pos, errsym);
+    } else {
+        let rv = vec_new();
+        let i = 0;
+        while i < frs[VEC_LEN] - 1 {
+            let rt = vec_get(frs, i);
+            let rk = kind_of(rt);
+            if is_float_t(rt) {
+                vec_push(rv, zero_value(pos, ty_float));
+            } else if !ck_legacy && (rk == K_STRING || rk == K_SLICE || rk == K_MAP || rk == K_STRUCT) {
+                // A str, slice, map or struct is never nil, even next to a fault.
+                vec_push(rv, argo_new(pos, ifs[IF_THEN][BLK_STMTS], rt));
+            } else {
+                vec_push(rv, mk_int(pos, 0, rt));
+            }
+            i = i + 1;
+        }
+        vec_push(rv, sym_ref_node(pos, errsym));
+        ret[RET_VALUES] = rv;
+    }
+    vec_push(ifs[IF_THEN][BLK_STMTS], ret);
+    vec_push(stmts, ifs);
+    let nvals = temps[VEC_LEN] - 1;
+    if mode == 1 {
+        if nvals != 1 {
+            err_at(pos, "try here needs a call with exactly one result besides the fault");
+            return;
+        }
+        let vs = vec_get(temps, 0);
+        if declared {
+            check_assignable(s, vs[S_TYPE], declared);
+        }
+        if streq(s[LET_NAME], "_") {
+            replace_node(s, out);
+            return;
+        }
+        let l = node_new(ST_LET, pos);
+        l[LET_NAME] = s[LET_NAME];
+        l[LET_INIT] = sym_ref_node(pos, vs);
+        l[LET_SYM] = declare_local(pos, s[LET_NAME], vs[S_TYPE]);
+        vec_push(stmts, l);
+    } else if mode == 2 {
+        if nvals != 1 {
+            err_at(pos, "try here needs a call with exactly one result besides the fault");
+            return;
+        }
+        let a = assign_stmt(pos, s[AS_TARGET], sym_ref_node(pos, vec_get(temps, 0)));
+        check_assign(a);
+        vec_push(stmts, a);
+    } else if mode == 3 {
+        let targets = s[MU_TARGETS];
+        if targets[VEC_LEN] != nvals {
+            err_at(pos, "assignment count mismatch");
+            return;
+        }
+        let vals = vec_new();
+        let i = 0;
+        while i < nvals {
+            vec_push(vals, vec_get(temps, i));
+            i = i + 1;
+        }
+        bind_targets(pos, targets, vals, s[MU_DEFINE], stmts);
+    } else if mode == 4 {
+        if nvals != frs[VEC_LEN] - 1 {
+            err_at(pos, "wrong number of return values");
+            return;
+        }
+        let r = node_new(ST_RETURN, pos);
+        if frs[VEC_LEN] == 1 {
+            r[RET_VALUE] = mk_int(pos, 0, ty_error);
+        } else {
+            let rv2 = vec_new();
+            let i = 0;
+            while i < nvals {
+                let ts = vec_get(temps, i);
+                check_assignable(s, ts[S_TYPE], vec_get(frs, i));
+                vec_push(rv2, sym_ref_node(pos, ts));
+                i = i + 1;
+            }
+            vec_push(rv2, mk_int(pos, 0, ty_error));
+            r[RET_VALUES] = rv2;
+        }
+        vec_push(stmts, r);
+    }
+    replace_node(s, out);
+}
+
+// lower_range rewrites a range loop as a counted (or map-slot) loop and checks it.
+// Element reads it generates, and the body's own x[i] on the ranged slice, skip the
+// bounds check: the counter stays below the length captured before the loop.
+fn lower_range(s) {
+    let pos = s[N_POS];
+    let x = s[RG_EXPR];
+    let xname = 0;
+    if x[N_KIND] == EX_IDENT {
+        xname = x[ID_NAME];
+    }
+    let xt = chk(x, 0);
+    let k = kind_of(xt);
+    let out = empty_block(pos);
+    let stmts = out[BLK_STMTS];
+    push_scope();
+    let src = temp(pos, x, xt);
+    vec_push(stmts, src);
+    let ss = src[LET_SYM];
+    let key = s[RG_KEY];
+    let val = s[RG_VAL];
+    let body = s[RG_BODY];
+    let pre = vec_new();
+    let w = node_new(ST_WHILE, pos);
+    let it = ty_int;
+    if is_integer_t(xt) {
+        it = default_type(xt);
+        if is_untyped(xt) {
+            reconvert(x, ty_int);
+        }
+    }
+    let i = declare_local(pos, "$", it);
+    vec_push(stmts, let_stmt(pos, i, mk_int(pos, 0, it)));
+    let limit = 0;
+    let step = mk_bin(pos, "+", sym_ref_node(pos, i), mk_int(pos, 1, it), it);
+    let keysym = 0;
+    if is_integer_t(xt) {
+        limit = sym_ref_node(pos, ss);
+        if key {
+            vec_push(pre, range_bind(pos, key, sym_ref_node(pos, i), it, s[RG_DEFINE]));
+        }
+    } else if k == K_SLICE || k == K_STRING {
+        let n = temp(pos, mk_hdr(pos, sym_ref_node(pos, ss), 0), ty_int);
+        vec_push(stmts, n);
+        limit = sym_ref_node(pos, n[LET_SYM]);
+        if key {
+            vec_push(pre, range_bind(pos, key, sym_ref_node(pos, i), ty_int, s[RG_DEFINE]));
+        }
+        if k == K_SLICE && val {
+            let et = xt[TY_ELEM];
+            let elem = mk_elem(pos, sym_ref_node(pos, ss), sym_ref_node(pos, i), et, 0);
+            elem[ELEM_SAFE] = 1;
+            vec_push(pre, range_bind(pos, val, elem, et, s[RG_DEFINE]));
+        }
+        if k == K_STRING {
+            // Strings range over runes: rt_utf8 packs the rune and its width.
+            let packed = temp(pos, rt_call(pos, "rt_utf8", args2(sym_ref_node(pos, ss), sym_ref_node(pos, i)), ty_int), ty_int);
+            vec_push(pre, packed);
+            let nexti = temp(pos, mk_bin(pos, "+", sym_ref_node(pos, i), mk_bin(pos, ">>", sym_ref_node(pos, packed[LET_SYM]), mk_int(pos, 32, ty_int), ty_int), ty_int), ty_int);
+            vec_push(pre, nexti);
+            step = sym_ref_node(pos, nexti[LET_SYM]);
+            if val {
+                let rune = mk_conv(pos, mk_bin(pos, "&", sym_ref_node(pos, packed[LET_SYM]), mk_int(pos, 0xffffffff, ty_int), ty_int), CV_INT, ty_i32);
+                vec_push(pre, range_bind(pos, val, rune, ty_i32, s[RG_DEFINE]));
+            }
+        }
+    } else if k == K_MAP {
+        let cap = temp(pos, rt_call(pos, "rt_map_slots", args1(sym_ref_node(pos, ss)), ty_int), ty_int);
+        vec_push(stmts, cap);
+        limit = sym_ref_node(pos, cap[LET_SYM]);
+        // Only live slots run the body.
+        let live = node_new(ST_IF, pos);
+        live[IF_COND] = mk_bin(pos, "==", rt_call(pos, "rt_map_live", args2(sym_ref_node(pos, ss), sym_ref_node(pos, i)), ty_int), mk_int(pos, 0, ty_int), ty_bool);
+        let skip = empty_block(pos);
+        vec_push(skip[BLK_STMTS], node_new(ST_CONTINUE, pos));
+        live[IF_THEN] = skip;
+        vec_push(pre, live);
+        if key {
+            let kv = from_bits(rt_call(pos, "rt_map_key", args2(sym_ref_node(pos, ss), sym_ref_node(pos, i)), ty_int), xt[TY_KEY]);
+            vec_push(pre, range_bind(pos, key, kv, xt[TY_KEY], s[RG_DEFINE]));
+        }
+        if val {
+            let vv = from_bits(rt_call(pos, "rt_map_val", args2(sym_ref_node(pos, ss), sym_ref_node(pos, i)), ty_int), xt[TY_ELEM]);
+            vec_push(pre, range_bind(pos, val, vv, xt[TY_ELEM], s[RG_DEFINE]));
+        }
+    } else {
+        err_type(pos, "cannot range over ", xt, "");
+        pop_scope();
+        return;
+    }
+    w[WH_COND] = mk_bin(pos, "<", sym_ref_node(pos, i), limit, ty_bool);
+    w[WH_POST] = assign_stmt(pos, sym_ref_node(pos, i), step);
+    let nb = empty_block(pos);
+    let j = 0;
+    while j < pre[VEC_LEN] {
+        vec_push(nb[BLK_STMTS], vec_get(pre, j));
+        j = j + 1;
+    }
+    vec_push(nb[BLK_STMTS], body);
+    w[WH_BODY] = nb;
+    vec_push(stmts, w);
+    replace_node(s, out);
+    // The body's s[key] on the ranged slice is safe while neither name is reassigned.
+    let saved = safe_pairs[VEC_LEN];
+    ck_loops = ck_loops + 1;
+    ck_breaks = ck_breaks + 1;
+    push_scope();
+    check_pre_stmts(nb[BLK_STMTS]);
+    if (k == K_SLICE || k == K_STRING) && key && key[N_KIND] == EX_IDENT && s[RG_DEFINE] && xname && !names_assigned(body, xname, key[ID_NAME]) {
+        let ks = lookup_name_local(key[ID_NAME]);
+        let xs = lookup_name(xname);
+        if ks && xs && xs[S_KIND] == SYM_LOCAL {
+            vec_push(safe_pairs, pair(ks, xs));
+        }
+    }
+    check_stmt(body);
+    safe_pairs[VEC_LEN] = saved;
+    pop_scope();
+    ck_loops = ck_loops - 1;
+    ck_breaks = ck_breaks - 1;
+    pop_scope();
+}
+
+// check_pre_stmts declares the already-checked lets a lowered loop puts before its
+// body, so the body can see them; the body itself is checked by the caller.
+fn check_pre_stmts(stmts) {
+    let i = 0;
+    while i < stmts[VEC_LEN] - 1 {
+        let s = vec_get(stmts, i);
+        if s[N_KIND] == ST_LET && s[LET_SYM] {
+            vec_push(sc_syms, s[LET_SYM]);
+        } else if s[N_KIND] == ST_IF && s[IF_COND][N_TYPE] {
+        } else {
+            check_stmt(s);
+        }
+        i = i + 1;
+    }
+}
+
+// range_bind binds a range key or value: a new variable for :=, else an assignment.
+fn range_bind(pos, target, value, t, define) {
+    if target[N_KIND] == EX_IDENT && streq(target[ID_NAME], "_") {
+        return empty_block(pos);
+    }
+    if define {
+        let l = node_new(ST_LET, pos);
+        l[LET_NAME] = target[ID_NAME];
+        l[LET_INIT] = value;
+        l[LET_SYM] = sym_new(SYM_LOCAL, target[ID_NAME], pos);
+        l[LET_SYM][S_TYPE] = t;
+        l[LET_SYM][S_SLOT] = ck_fn[F_SLOTS];
+        ck_fn[F_SLOTS] = ck_fn[F_SLOTS] + 1;
+        vec_push(ck_fn[F_LOCALS], l[LET_SYM]);
+        return l;
+    }
+    let a = assign_stmt(pos, target, value);
+    return a;
+}
+
+// lower_switch turns a switch into an if-chain inside a block that break can leave.
+fn lower_switch(s) {
+    let pos = s[N_POS];
+    let out = empty_block(pos);
+    if s[SW_INIT] {
+        vec_push(out[BLK_STMTS], s[SW_INIT]);
+    }
+    let w = node_new(ST_WHILE, pos);
+    w[WH_ONCE] = 1;
+    w[WH_COND] = mk_int(pos, 1, ty_bool);
+    let body = empty_block(pos);
+    w[WH_BODY] = body;
+    let tag = s[SW_TAG];
+    let tagname = 0;
+    if tag {
+        // switch x { case a, b: }  compares a hidden copy of x.
+        tagname = node_new(EX_IDENT, pos);
+        tagname[ID_NAME] = "$sw";
+        let l = node_new(ST_LET, pos);
+        l[LET_NAME] = "$sw";
+        l[LET_INIT] = tag;
+        vec_push(body[BLK_STMTS], l);
+    }
+    let first = 0;
+    let last = 0;
+    let deflt = 0;
+    let cases = s[SW_CASES];
+    let i = 0;
+    while i < cases[VEC_LEN] {
+        let c = vec_get(cases, i);
+        let exprs = vec_get(c, 0);
+        let blk = vec_get(c, 1);
+        if !exprs {
+            deflt = blk;
+        } else {
+            let cond = 0;
+            let j = 0;
+            while j < exprs[VEC_LEN] {
+                let e = vec_get(exprs, j);
+                if tag {
+                    let id = node_new(EX_IDENT, pos);
+                    id[ID_NAME] = "$sw";
+                    e = binary_new(e[N_POS], "==", id, e);
+                }
+                if cond {
+                    cond = binary_new(e[N_POS], "||", cond, e);
+                } else {
+                    cond = e;
+                }
+                j = j + 1;
+            }
+            let ifs = node_new(ST_IF, blk[N_POS]);
+            ifs[IF_COND] = cond;
+            ifs[IF_THEN] = blk;
+            if last {
+                last[IF_ELSE] = ifs;
+            } else {
+                first = ifs;
+            }
+            last = ifs;
+        }
+        i = i + 1;
+    }
+    if deflt {
+        if last {
+            last[IF_ELSE] = deflt;
+        } else {
+            first = deflt;
+        }
+    }
+    if first {
+        vec_push(body[BLK_STMTS], first);
+    }
+    vec_push(out[BLK_STMTS], w);
+    replace_node(s, out);
+    push_scope();
+    let k = 0;
+    while k < out[BLK_STMTS][VEC_LEN] - 1 {
+        check_stmt(vec_get(out[BLK_STMTS], k));
+        k = k + 1;
+    }
+    ck_breaks = ck_breaks + 1;
+    check_scoped(body);
+    ck_breaks = ck_breaks - 1;
+    pop_scope();
+}
+
+// lower_go starts a thread running a call: the arguments are evaluated now and handed
+// to a lifted thunk that unpacks them on the new thread.
+fn lower_go(s) {
+    let pos = s[N_POS];
+    let call = s[GO_CALL];
+    chk(call, 0);
+    if call[N_KIND] != EX_CALL || call[CALL_INTRINSIC] || !call[CALL_FN] {
+        err_at(pos, "go needs a direct function call");
+        return;
+    }
+    let target = call[CALL_FN];
+    let args = call[CALL_ARGS];
+    let n = args[VEC_LEN];
+    let stmts = vec_new();
+    let blk = temp(pos, rt_call(pos, "rt_alloc", args1(mk_int(pos, 8 * n + 8, ty_int)), ty_int), ty_int);
+    vec_push(stmts, blk);
+    let i = 0;
+    while i < n {
+        let a = vec_get(args, i);
+        vec_push(stmts, assign_stmt(pos, mk_index(pos, sym_ref_node(pos, blk[LET_SYM]), mk_int(pos, i, ty_int), a[N_TYPE]), a));
+        i = i + 1;
+    }
+    // The thunk: fn thunk(blk) { target(blk[0], blk[1], ...); }
+    lifted_count = lifted_count + 1;
+    let th = fn_new(pos, "go");
+    let tb = buf_new();
+    buf_str(tb, "go$");
+    buf_int(tb, lifted_count);
+    buf_byte(tb, 0);
+    th[F_QNAME] = tb[VEC_DATA];
+    th[F_LEGACY] = 1;
+    vec_push(th[F_PARAMS], "blk");
+    vec_push(th[F_PTYPES], ty_int);
+    vec_push(th[F_RTYPES], ty_int);
+    th[F_TYPE] = func_of(th[F_PTYPES], th[F_RTYPES], 0);
+    th[F_LOCALS] = vec_new();
+    let ps = sym_new(SYM_LOCAL, "blk", pos);
+    ps[S_TYPE] = ty_int;
+    vec_push(th[F_LOCALS], ps);
+    th[F_SLOTS] = 1;
+    let inner = node_new(EX_CALL, pos);
+    inner[CALL_NAME] = target[F_QNAME];
+    inner[CALL_FN] = target;
+    inner[CALL_ARGS] = vec_new();
+    inner[N_TYPE] = ty_void;
+    i = 0;
+    while i < n {
+        let pt = vec_get(target[F_PTYPES], i);
+        vec_push(inner[CALL_ARGS], mk_index(pos, sym_ref_node(pos, ps), mk_int(pos, i, ty_int), pt));
+        i = i + 1;
+    }
+    th[F_BODY] = empty_block(pos);
+    vec_push(th[F_BODY][BLK_STMTS], expr_stmt(inner));
+    vec_push(th[F_BODY][BLK_STMTS], expr_stmt(rt_call(pos, "rt_thread_exit", vec_new(), ty_void)));
+    th[F_LIFTED] = 2;
+    vec_push(prog_fns, th);
+    let ref = node_new(EX_FUNCREF, pos);
+    ref[FR_FN] = th;
+    ref[N_TYPE] = th[F_TYPE];
+    vec_push(stmts, expr_stmt(rt_call(pos, "rt_go", args2(ref, sym_ref_node(pos, blk[LET_SYM])), ty_void)));
+    let b = empty_block(pos);
+    b[BLK_STMTS] = stmts;
+    replace_node(s, b);
+}
+
+fn pair(a, b) {
+    let v = vec_new();
+    vec_push(v, a);
+    vec_push(v, b);
+    return v;
+}
+
+// names_assigned reports whether any statement under s assigns to a variable named
+// a or b (shadowing declarations are fine: they make different symbols).
+fn names_assigned(s, a, b) {
+    if !s {
+        return 0;
+    }
+    let k = s[N_KIND];
+    if k == ST_ASSIGN {
+        let t = s[AS_TARGET];
+        if t[N_KIND] == EX_IDENT && (streq(t[ID_NAME], a) || streq(t[ID_NAME], b)) {
+            return 1;
+        }
+        return 0;
+    }
+    if k == ST_MULTI && !s[MU_DEFINE] {
+        let ts = s[MU_TARGETS];
+        let i = 0;
+        while i < ts[VEC_LEN] {
+            let t = vec_get(ts, i);
+            if t[N_KIND] == EX_IDENT && (streq(t[ID_NAME], a) || streq(t[ID_NAME], b)) {
+                return 1;
+            }
+            i = i + 1;
+        }
+        return 0;
+    }
+    if k == ST_BLOCK {
+        let i = 0;
+        while i < s[BLK_STMTS][VEC_LEN] {
+            if names_assigned(vec_get(s[BLK_STMTS], i), a, b) {
+                return 1;
+            }
+            i = i + 1;
+        }
+        return 0;
+    }
+    if k == ST_IF {
+        return names_assigned(s[IF_INIT], a, b) || names_assigned(s[IF_THEN], a, b) || names_assigned(s[IF_ELSE], a, b);
+    }
+    if k == ST_WHILE {
+        return names_assigned(s[WH_INIT], a, b) || names_assigned(s[WH_BODY], a, b) || names_assigned(s[WH_POST], a, b);
+    }
+    if k == ST_RANGE {
+        if !s[RG_DEFINE] && ((s[RG_KEY] && s[RG_KEY][N_KIND] == EX_IDENT && (streq(s[RG_KEY][ID_NAME], a) || streq(s[RG_KEY][ID_NAME], b))) || (s[RG_VAL] && s[RG_VAL][N_KIND] == EX_IDENT && (streq(s[RG_VAL][ID_NAME], a) || streq(s[RG_VAL][ID_NAME], b)))) {
+            return 1;
+        }
+        return names_assigned(s[RG_BODY], a, b);
+    }
+    if k == ST_SWITCH {
+        if names_assigned(s[SW_INIT], a, b) {
+            return 1;
+        }
+        let cs = s[SW_CASES];
+        let i = 0;
+        while i < cs[VEC_LEN] {
+            if names_assigned(vec_get(vec_get(cs, i), 1), a, b) {
+                return 1;
+            }
+            i = i + 1;
+        }
+    }
+    return 0;
+}
+
+// mark_safe_index drops the bounds check of x[i] when a loop or condition proved i is
+// within x's length.
+fn mark_safe_index(e) {
+    let x = e[ELEM_SEQ];
+    let i = e[ELEM_IDX];
+    if x[N_KIND] != EX_IDENT || i[N_KIND] != EX_IDENT {
+        return;
+    }
+    let j = 0;
+    while j < safe_pairs[VEC_LEN] {
+        let p = vec_get(safe_pairs, j);
+        if vec_get(p, 0) == i[ID_REF] && vec_get(p, 1) == x[ID_REF] {
+            e[ELEM_SAFE] = 1;
+            return;
+        }
+        j = j + 1;
+    }
+}
+
+// len_bound matches a checked `i < len(x)` and returns [i sym, x sym], or 0.
+fn len_bound(c) {
+    if c[N_KIND] != EX_BINARY || !streq(c[BIN_OP], "<") {
+        return 0;
+    }
+    let l = c[BIN_L];
+    let r = c[BIN_R];
+    if l[N_KIND] != EX_IDENT || r[N_KIND] != EX_MEM || !r[MEM_HDR] || r[MEM_OFF] != 0 || r[MEM_BASE][N_KIND] != EX_IDENT {
+        return 0;
+    }
+    let is = l[ID_REF];
+    let xs = r[MEM_BASE][ID_REF];
+    if !is || !xs || is[S_KIND] != SYM_LOCAL || xs[S_KIND] != SYM_LOCAL {
+        return 0;
+    }
+    return pair(is, xs);
+}
+
+// add_len_fact makes x[i] unchecked inside `if i < len(x) {...}` when i cannot be
+// negative (unsigned, or `i >= 0 &&` first) and the block reassigns neither.
+fn add_len_fact(c, then) {
+    let b = len_bound(c);
+    let nonneg = 0;
+    if !b && c[N_KIND] == EX_BINARY && streq(c[BIN_OP], "&&") {
+        let lo = c[BIN_L];
+        b = len_bound(c[BIN_R]);
+        if b && lo[N_KIND] == EX_BINARY && streq(lo[BIN_OP], ">=") && lo[BIN_L][N_KIND] == EX_IDENT && lo[BIN_L][ID_REF] == vec_get(b, 0) && is_const_zero(lo[BIN_R]) {
+            nonneg = 1;
+        }
+    }
+    if !b {
+        return;
+    }
+    let is = vec_get(b, 0);
+    if is_unsigned_t(is[S_TYPE]) {
+        nonneg = 1;
+    }
+    if nonneg && !names_assigned(then, is[S_NAME], vec_get(b, 1)[S_NAME]) {
+        vec_push(safe_pairs, b);
+    }
+}
+
+// lower_for_init checks `for init; cond; post {}` as { init; for cond; post {} },
+// proving `for i := c; i < len(x); i++` keeps i in range for x[i] in the body.
+fn lower_for_init(s) {
+    let init = s[WH_INIT];
+    let inner = node_new(ST_WHILE, s[N_POS]);
+    replace_node(inner, s);
+    inner[WH_INIT] = 0;
+    let b = empty_block(s[N_POS]);
+    vec_push(b[BLK_STMTS], init);
+    vec_push(b[BLK_STMTS], inner);
+    replace_node(s, b);
+    push_scope();
+    check_stmt(init);
+    check_cond(inner[WH_COND]);
+    let saved = safe_pairs[VEC_LEN];
+    let bound = len_bound(inner[WH_COND]);
+    if bound && !ck_legacy && init[N_KIND] == ST_LET && init[LET_SYM] == vec_get(bound, 0) && init[LET_INIT][N_KIND] == EX_INT && init[LET_INIT][INT_VAL] >= 0 && is_increment(inner[WH_POST], init[LET_NAME]) && !names_assigned(inner[WH_BODY], init[LET_NAME], vec_get(bound, 1)[S_NAME]) {
+        vec_push(safe_pairs, bound);
+    }
+    ck_loops = ck_loops + 1;
+    ck_breaks = ck_breaks + 1;
+    check_scoped(inner[WH_BODY]);
+    safe_pairs[VEC_LEN] = saved;
+    if inner[WH_POST] {
+        push_scope();
+        check_stmt(inner[WH_POST]);
+        pop_scope();
+    }
+    ck_loops = ck_loops - 1;
+    ck_breaks = ck_breaks - 1;
+    pop_scope();
+}
+
+// is_increment matches the unchecked post statement `i = i + c` (i++, i += c) with c > 0.
+fn is_increment(post, name) {
+    if !post || post[N_KIND] != ST_ASSIGN {
+        return 0;
+    }
+    let t = post[AS_TARGET];
+    let v = post[AS_VALUE];
+    return t[N_KIND] == EX_IDENT && streq(t[ID_NAME], name) && v[N_KIND] == EX_BINARY && streq(v[BIN_OP], "+") && v[BIN_L][N_KIND] == EX_IDENT && streq(v[BIN_L][ID_NAME], name) && v[BIN_R][N_KIND] == EX_INT && v[BIN_R][INT_VAL] > 0;
+}
+
+// ---- optional narrowing ----
+
+// narrow_begin narrows x from ?T to T where the condition proves x != nil (sense 1:
+// the condition holds; sense 0: it failed). It returns what narrow_end restores.
+fn narrow_begin(c, sense) {
+    if ck_legacy || c[N_KIND] != EX_BINARY {
+        return 0;
+    }
+    let op = c[BIN_OP];
+    // a != nil && b != nil holds, or a == nil || b == nil failed: both are narrowed.
+    if (streq(op, "&&") && sense) || (streq(op, "||") && !sense) {
+        let ra = narrow_begin(c[BIN_L], sense);
+        let rb = narrow_begin(c[BIN_R], sense);
+        if !ra {
+            return rb;
+        }
+        if !rb {
+            return ra;
+        }
+        let both = vec_new();
+        vec_push(both, 0);
+        vec_push(both, ra);
+        vec_push(both, rb);
+        return both;
+    }
+    let x = c[BIN_L];
+    let other = c[BIN_R];
+    if x[N_KIND] != EX_IDENT {
+        x = c[BIN_R];
+        other = c[BIN_L];
+    }
+    if x[N_KIND] != EX_IDENT || !x[ID_REF] || other[N_KIND] != EX_INT || other[INT_VAL] != 0 {
+        return 0;
+    }
+    let s = x[ID_REF];
+    if s[S_KIND] != SYM_LOCAL || kind_of(s[S_TYPE]) != K_OPT {
+        return 0;
+    }
+    let nonnil = (streq(op, "!=") && sense) || (streq(op, "==") && !sense);
+    if !nonnil {
+        return 0;
+    }
+    let rec = pair(s, s[S_TYPE]);
+    s[S_TYPE] = s[S_TYPE][TY_ELEM];
+    return rec;
+}
+
+fn narrow_end(rec) {
+    if rec && !vec_get(rec, 0) {
+        narrow_end(vec_get(rec, 2));
+        narrow_end(vec_get(rec, 1));
+    } else if rec {
+        vec_get(rec, 0)[S_TYPE] = vec_get(rec, 1);
+    }
+}
+
+// narrow_kill is where assigning to a narrowed variable would end the narrowing; a
+// narrowed x has type T there, so assigning nil to it is already a type error.
+fn narrow_kill(target) {
+}
+
+// ---- keep: deep copies into the long-lived heap ----
+
+var keep_types;
+var keep_fns;
+
+// keep_fn returns (generating on first use) keep$N(x T) T, which copies x and everything
+// it references into the core's ingot heap.
+fn keep_fn(t) {
+    if !keep_types {
+        keep_types = vec_new();
+        keep_fns = vec_new();
+    }
+    let i = 0;
+    while i < keep_types[VEC_LEN] {
+        if vec_get(keep_types, i) == t {
+            return vec_get(keep_fns, i);
+        }
+        i = i + 1;
+    }
+    if type_cycle(t, vec_new()) {
+        err_type(0, "keep cannot copy the recursive type ", t, "");
+    }
+    lifted_count = lifted_count + 1;
+    let pos = 0;
+    let f = fn_new(pos, "keep");
+    let nb = buf_new();
+    buf_str(nb, "keep$");
+    buf_int(nb, lifted_count);
+    buf_byte(nb, 0);
+    f[F_QNAME] = nb[VEC_DATA];
+    f[F_NAME] = nb[VEC_DATA];
+    f[F_LIFTED] = 2;
+    vec_push(f[F_PARAMS], "x");
+    vec_push(f[F_PTYPES], t);
+    vec_push(f[F_RTYPES], t);
+    f[F_TYPE] = func_of(f[F_PTYPES], f[F_RTYPES], 0);
+    f[F_LOCALS] = vec_new();
+    f[F_BODY] = empty_block(pos);
+    vec_push(keep_types, t);
+    vec_push(keep_fns, f);
+    vec_push(prog_fns, f);
+    let saved_fn = ck_fn;
+    ck_fn = f;
+    let x = sym_new(SYM_LOCAL, "x", pos);
+    x[S_TYPE] = t;
+    x[S_SLOT] = 0;
+    f[F_SLOTS] = 1;
+    vec_push(f[F_LOCALS], x);
+    let body = f[F_BODY][BLK_STMTS];
+    let k = kind_of(t);
+    let ret = node_new(ST_RETURN, pos);
+    if k == K_STRING || k == K_ERROR {
+        ret[RET_VALUE] = rt_call(pos, "rt_keep_str", args1(sym_ref_node(pos, x)), t);
+    } else if k == K_OPT {
+        let ifs = node_new(ST_IF, pos);
+        ifs[IF_COND] = mk_bin(pos, "==", sym_ref_node(pos, x), mk_int(pos, 0, t), ty_bool);
+        ifs[IF_THEN] = empty_block(pos);
+        let r0 = node_new(ST_RETURN, pos);
+        r0[RET_VALUE] = mk_int(pos, 0, t);
+        vec_push(ifs[IF_THEN][BLK_STMTS], r0);
+        vec_push(body, ifs);
+        let inner = keep_fn(t[TY_ELEM]);
+        ret[RET_VALUE] = keep_call(pos, inner, sym_ref_node(pos, x), t);
+    } else if k == K_SLICE {
+        let et = t[TY_ELEM];
+        let out = temp(pos, rt_call(pos, "rt_keep_slice", args2(sym_ref_node(pos, x), mk_int(pos, type_width(et), ty_int)), t), t);
+        vec_push(body, out);
+        if is_ref(et) && kind_of(et) != K_FUNC {
+            keep_each(pos, body, out[LET_SYM], et);
+        }
+        ret[RET_VALUE] = sym_ref_node(pos, out[LET_SYM]);
+    } else if k == K_STRUCT {
+        let out = temp(pos, rt_call(pos, "rt_keep_raw", args2(sym_ref_node(pos, x), mk_int(pos, t[TY_SIZE], ty_int)), t), t);
+        vec_push(body, out);
+        let fi = 0;
+        while fi < t[TY_FIELDS][VEC_LEN] {
+            let ft = field_type(t, fi);
+            if is_ref(ft) && kind_of(ft) != K_FUNC {
+                let src = mk_mem(pos, sym_ref_node(pos, out[LET_SYM]), 0, 0, field_offset(t, fi), ft);
+                vec_push(body, assign_stmt(pos, field_store(pos, sym_ref_node(pos, out[LET_SYM]), t, fi), keep_call(pos, keep_fn(ft), src, ft)));
+            }
+            fi = fi + 1;
+        }
+        ret[RET_VALUE] = sym_ref_node(pos, out[LET_SYM]);
+    } else if k == K_MAP {
+        // A new ingot map, filled entry by entry with kept keys and values.
+        let out = temp(pos, rt_call(pos, "rt_keep_map_new", args1(sym_ref_node(pos, x)), t), t);
+        vec_push(body, out);
+        let slots = temp(pos, rt_call(pos, "rt_map_slots", args1(sym_ref_node(pos, x)), ty_int), ty_int);
+        vec_push(body, slots);
+        let j = declare_local(pos, "$", ty_int);
+        vec_push(body, let_stmt(pos, j, mk_int(pos, 0, ty_int)));
+        let w = node_new(ST_WHILE, pos);
+        w[WH_COND] = mk_bin(pos, "<", sym_ref_node(pos, j), sym_ref_node(pos, slots[LET_SYM]), ty_bool);
+        w[WH_POST] = assign_stmt(pos, sym_ref_node(pos, j), mk_bin(pos, "+", sym_ref_node(pos, j), mk_int(pos, 1, ty_int), ty_int));
+        let wb = empty_block(pos);
+        w[WH_BODY] = wb;
+        let live = node_new(ST_IF, pos);
+        live[IF_COND] = rt_call(pos, "rt_map_live", args2(sym_ref_node(pos, x), sym_ref_node(pos, j)), ty_bool);
+        live[IF_THEN] = empty_block(pos);
+        let kv = from_bits(rt_call(pos, "rt_map_key", args2(sym_ref_node(pos, x), sym_ref_node(pos, j)), ty_int), t[TY_KEY]);
+        let vv = from_bits(rt_call(pos, "rt_map_val", args2(sym_ref_node(pos, x), sym_ref_node(pos, j)), ty_int), t[TY_ELEM]);
+        if is_ref(t[TY_KEY]) {
+            kv = keep_call(pos, keep_fn(t[TY_KEY]), kv, t[TY_KEY]);
+        }
+        if is_ref(t[TY_ELEM]) && kind_of(t[TY_ELEM]) != K_FUNC {
+            vv = keep_call(pos, keep_fn(t[TY_ELEM]), vv, t[TY_ELEM]);
+        }
+        vec_push(live[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, "rt_map_set", args3(sym_ref_node(pos, out[LET_SYM]), to_bits(kv), to_bits(vv)), ty_void)));
+        vec_push(wb[BLK_STMTS], live);
+        vec_push(body, w);
+        ret[RET_VALUE] = sym_ref_node(pos, out[LET_SYM]);
+    } else {
+        ret[RET_VALUE] = sym_ref_node(pos, x);
+    }
+    vec_push(body, ret);
+    ck_fn = saved_fn;
+    return f;
+}
+
+fn keep_call(pos, f, arg, t) {
+    let c = node_new(EX_CALL, pos);
+    c[CALL_NAME] = f[F_QNAME];
+    c[CALL_ARGS] = args1(arg);
+    c[CALL_FN] = f;
+    c[N_TYPE] = t;
+    return c;
+}
+
+// keep_each replaces every element of the (already copied) ingot slice out by a kept copy.
+fn keep_each(pos, body, out, et) {
+    let n = temp(pos, mk_hdr(pos, sym_ref_node(pos, out), 0), ty_int);
+    vec_push(body, n);
+    let data = temp(pos, mk_hdr(pos, sym_ref_node(pos, out), 2), ty_int);
+    vec_push(body, data);
+    let j = declare_local(pos, "$", ty_int);
+    vec_push(body, let_stmt(pos, j, mk_int(pos, 0, ty_int)));
+    let w = node_new(ST_WHILE, pos);
+    w[WH_COND] = mk_bin(pos, "<", sym_ref_node(pos, j), sym_ref_node(pos, n[LET_SYM]), ty_bool);
+    w[WH_POST] = assign_stmt(pos, sym_ref_node(pos, j), mk_bin(pos, "+", sym_ref_node(pos, j), mk_int(pos, 1, ty_int), ty_int));
+    let wb = empty_block(pos);
+    let cell = mk_mem(pos, sym_ref_node(pos, data[LET_SYM]), sym_ref_node(pos, j), 8, 0, et);
+    let cell2 = mk_mem(pos, sym_ref_node(pos, data[LET_SYM]), sym_ref_node(pos, j), 8, 0, et);
+    vec_push(wb[BLK_STMTS], assign_stmt(pos, cell, keep_call(pos, keep_fn(et), cell2, et)));
+    w[WH_BODY] = wb;
+    vec_push(body, w);
+}
+
+// type_cycle reports whether t can reach itself through references (keep would not end).
+fn type_cycle(t, path) {
+    let k = kind_of(t);
+    if k != K_STRUCT && k != K_SLICE && k != K_MAP && k != K_OPT {
+        return 0;
+    }
+    let i = 0;
+    while i < path[VEC_LEN] {
+        if vec_get(path, i) == t {
+            return 1;
+        }
+        i = i + 1;
+    }
+    vec_push(path, t);
+    let found = 0;
+    if k == K_STRUCT {
+        let fi = 0;
+        while fi < t[TY_FIELDS][VEC_LEN] && !found {
+            found = type_cycle(field_type(t, fi), path);
+            fi = fi + 1;
+        }
+    } else if k == K_MAP {
+        found = type_cycle(t[TY_KEY], path) || type_cycle(t[TY_ELEM], path);
+    } else {
+        found = type_cycle(t[TY_ELEM], path);
+    }
+    path[VEC_LEN] = path[VEC_LEN] - 1;
+    return found;
+}

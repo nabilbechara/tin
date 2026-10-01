@@ -1,0 +1,1560 @@
+// Parser: tokens to AST nodes. Accepts Tin v1 (fn/let/while, untyped words) and
+// Tin v2 (Go syntax: func, :=, for, types, structs, methods, packages).
+
+var prog_fns;
+var prog_consts;
+var prog_vars;
+var prog_types;
+var file_pkgs;     // per file: package name, "" for main
+var file_imports;  // per file: vec of [alias, path]
+var file_v2;       // per file: 1 when it declares a package or uses func
+var cur_file;
+
+// Function declaration layout.
+const F_POS = 0;
+const F_NAME = 1;
+const F_PARAMS = 2;
+const F_EXTERN = 3;
+const F_BODY = 4;
+const F_SLOTS = 5;
+const F_LOCALS = 6;  // params then lets, in declaration order (set by the checker)
+const F_LEAF = 7;    // makes no calls (set by analysis)
+const F_USED = 8;    // extern that is called, so it needs an import
+const F_ADDR = 9;    // code address (set by the linker)
+const F_GOT = 10;    // import index of an extern
+const F_PTYPES = 11; // param type exprs, then resolved types
+const F_RTYPES = 12; // result type exprs, then resolved types
+const F_RECV = 13;   // method receiver type expr, then type
+const F_RECVNAME = 14;
+const F_FILE = 15;
+const F_QNAME = 16;  // symbol name: pkg.Name, Type.Method
+const F_LEGACY = 17; // declared with fn: untyped words, C strings
+const F_VARIADIC = 18;
+const F_REACH = 19;  // reachable from main (set by the checker)
+const F_TYPE = 20;   // func type
+const F_LIFTED = 21; // function literal lifted to top level
+const F_INDEX = 22;  // position in prog_fns (set by codegen)
+const F_TPARAMS = 28; // generic: type parameter names (0 for ordinary functions)
+const F_TCONS = 29;   // generic: per type parameter, a vec of allowed types (0: any)
+const F_TOKS = 30;    // generic: the tokens, re-parsed for each instance
+const F_TOKAT = 31;
+const F_TBIND = 32;   // instance: vec of [name, type] bindings
+const F_INSTS = 33;   // generic: vec of [type args, instance]
+const F_GENOF = 34;   // instance: its generic
+const F_SIZE = 36;
+const F_MUTRES = 24;  // result is a fresh (request-pool) value the caller may modify
+const F_RECVMUT = 25; // method may modify its receiver (needs a fresh one)
+
+// Const, var and type declaration layout.
+const D_POS = 0;
+const D_NAME = 1;
+const D_INIT = 2;
+const D_VAL = 3;
+const D_TYPE = 4;
+const D_FILE = 5;
+const D_IOTA = 6;
+const D_SYM = 7;
+const D_SHARED = 8;  // shared var: one process-wide word (runtime only)
+const D_TPARAMS = 9;  // generic type: parameter names
+const D_TCONS = 10;
+const D_INSTS = 11;   // generic type: vec of [type args, type]
+const D_METHODS = 12; // generic type: its method templates
+const D_SIZE = 16;
+
+var p_shared;
+
+// Every AST node starts with its kind and position; expressions carry their type.
+const N_KIND = 0;
+const N_POS = 1;
+const N_TYPE = 6;
+const N_REGION = 9;   // region pass: where a reference value lives
+const N_SIZE = 10;
+
+const EX_INT = 1;
+const EX_STR = 2;
+const EX_IDENT = 3;
+const EX_UNARY = 4;
+const EX_BINARY = 5;
+const EX_CALL = 6;
+const EX_INDEX = 7;
+const EX_REG = 8;      // codegen-only: a value already in a register
+const EX_CONV = 9;     // checker-made conversion
+const ST_BLOCK = 10;
+const ST_LET = 11;
+const ST_ASSIGN = 12;
+const ST_EXPR = 13;
+const ST_IF = 14;
+const ST_WHILE = 15;
+const ST_RETURN = 16;
+const ST_BREAK = 17;
+const ST_CONTINUE = 18;
+const EX_FLOAT = 20;
+const EX_NIL = 21;
+const EX_SELECT = 22;
+const EX_SLICE = 23;
+const EX_COMPOSITE = 24;
+const EX_TYPE = 25;
+const EX_SEQ = 26;     // checker-made: run statements, then yield a value
+const EX_FUNCREF = 27; // checker-made: address of a function
+const EX_FUNCLIT = 28;
+const EX_MEM = 29;     // checker-made: sized load/store at base + index*scale + off
+const EX_ELEM = 39;    // checker-made: bounds-checked slice or string element
+const EX_TRY = 48;
+const ST_MULTI = 30;
+const ST_RANGE = 31;
+const ST_SWITCH = 32;
+const ST_LIST = 33;    // statements spliced into the enclosing block
+const ST_CALLMULTI = 34;
+const ST_GO = 35;
+const ST_DEFER = 36;
+const TX_NAME = 40;
+const TX_SLICE = 41;
+const TX_MAP = 42;
+const TX_PTR = 43;
+const TX_FUNC = 44;
+const TX_STRUCT = 45;
+const TX_ARRAY = 46;
+const TX_CHAN = 47;
+const TX_OPT = 49;
+
+// Node fields by kind.
+const INT_VAL = 2;
+const STR_PTR = 2;
+const STR_LEN = 3;
+const ID_NAME = 2;
+const ID_REF = 3;
+const UN_OP = 2;
+const UN_X = 3;
+const BIN_OP = 2;
+const BIN_L = 3;
+const BIN_R = 4;
+const CALL_NAME = 2;
+const CALL_ARGS = 3;
+const CALL_INTRINSIC = 4;
+const CALL_FN = 5;
+const CALL_CALLEE = 7;
+const REG_NUM = 2;
+const IX_X = 2;
+const IX_I = 3;
+const IX_ARGS = 4;  // X[A, B] or X[[]T]: type arguments, when they cannot be an index
+const IX_HDR = 7;     // a slice/string header field: invariant while a loop makes no calls
+const CV_X = 2;
+const CV_KIND = 3;
+const FL_BITS = 2;
+const FL_TEXT = 3;
+const SEL_X = 2;
+const SEL_NAME = 3;
+const SL_X = 2;
+const SL_LO = 3;
+const SL_HI = 4;
+const CL_TYPE = 2;
+const CL_ELEMS = 3;
+const CL_KEYS = 4;
+const CL_ADDR = 5;
+const TYX = 2;
+const SEQ_STMTS = 2;
+const SEQ_VALUE = 3;
+const FR_FN = 2;
+const LIT_FN = 2;
+const BLK_STMTS = 2;
+const LET_NAME = 2;
+const LET_INIT = 3;
+const LET_SYM = 4;
+const LET_TYPE = 5;
+const AS_TARGET = 2;
+const AS_VALUE = 3;
+const ES_X = 2;
+const IF_COND = 2;
+const IF_THEN = 3;
+const IF_ELSE = 4;
+const IF_INIT = 5;
+const WH_COND = 2;
+const WH_BODY = 3;
+const WH_POST = 4;
+const WH_INIT = 5;
+const WH_ONCE = 7;    // a switch: break leaves it, continue passes through
+const RET_VALUE = 2;
+const RET_VALUES = 3;
+const MU_TARGETS = 2;
+const MU_VALUES = 3;
+const MU_DEFINE = 4;
+const RG_KEY = 2;
+const RG_VAL = 3;
+const RG_EXPR = 4;
+const RG_BODY = 5;
+const RG_DEFINE = 6;
+const SW_TAG = 2;
+const SW_CASES = 3;
+const SW_INIT = 5;
+const LIST_STMTS = 2;
+const CM_CALL = 2;
+const CM_SYMS = 3;
+const GO_CALL = 2;
+const TX_A = 2;
+const TX_B = 3;
+const TX_ARGS = 4;  // Name[T1, T2]: type arguments
+const MEM_BASE = 2;
+const MEM_INDEX = 3;
+const MEM_SCALE = 4;
+const MEM_OFF = 5;
+const MEM_HDR = 7;    // a header word: invariant while a loop makes no calls
+const MEM_LEN = 8;    // bounds check: the index must be below this length (0: none)
+const ELEM_SEQ = 2;
+const ELEM_IDX = 3;
+const ELEM_SIZE = 4;
+const ELEM_STR = 5;
+const ELEM_SAFE = 7;  // index proven in range: no bounds check
+const TRY_X = 2;
+const BLK_FLAT = 3;   // a checker-made block that opens no scope
+const CALL_STORE = 8; // a runtime call that stores into its first argument (region pass)
+// Regions of reference values, for the ember/ingot rules.
+const R_UNKNOWN = 0;
+const R_EMBER = 1;    // lives in the current request's pool
+const R_INGOT = 2;    // lives in the core's long-lived heap
+const R_OWNED = 3;    // a fresh keep() copy, only storable into ingot memory
+const R_STATIC = 4;   // string literals and other immortal data
+const F_MUTS = 23;   // vec: 1 for each mut parameter
+
+var p_toks;
+var p_i;
+var p_nolit;   // composite literals after a name are off in if/for/switch headers
+var p_legacy;  // parsing a v1 fn body
+var p_mutres;  // the result list just parsed was marked mut
+
+fn node_new(kind, pos) {
+    let n = calloc(N_SIZE, 8);
+    n[N_KIND] = kind;
+    n[N_POS] = pos;
+    return n;
+}
+
+fn decl_new(pos, name) {
+    let d = calloc(D_SIZE, 8);
+    d[D_POS] = pos;
+    d[D_NAME] = name;
+    d[D_FILE] = cur_file;
+    d[D_SHARED] = p_shared;
+    return d;
+}
+
+fn fn_new(pos, name) {
+    let f = calloc(F_SIZE, 8);
+    f[F_POS] = pos;
+    f[F_NAME] = name;
+    f[F_PARAMS] = vec_new();
+    f[F_PTYPES] = vec_new();
+    f[F_RTYPES] = vec_new();
+    f[F_MUTS] = vec_new();
+    f[F_FILE] = cur_file;
+    return f;
+}
+
+fn parse_setup() {
+    prog_fns = vec_new();
+    prog_consts = vec_new();
+    prog_vars = vec_new();
+    prog_types = vec_new();
+    file_pkgs = vec_new();
+    file_imports = vec_new();
+    file_v2 = vec_new();
+}
+
+// parse reads one file's declarations; cur_file must be its index in files.
+fn parse(toks) {
+    p_toks = toks;
+    p_i = 0;
+    p_nolit = 0;
+    vec_push(file_pkgs, "");
+    vec_push(file_imports, vec_new());
+    vec_push(file_v2, 0);
+    while p_peek()[T_KIND] != TK_EOF {
+        if p_is(";") {
+            p_next();
+        } else if p_is("package") {
+            p_next();
+            file_pkgs[VEC_DATA][cur_file] = p_expect_ident()[T_TEXT];
+            if streq(vec_get(file_pkgs, cur_file), "main") {
+                file_pkgs[VEC_DATA][cur_file] = "";
+            }
+            file_v2[VEC_DATA][cur_file] = 1;
+        } else if p_is("import") {
+            p_next();
+            if p_is("(") {
+                p_next();
+                while !p_is(")") {
+                    if p_is(";") {
+                        p_next();
+                    } else {
+                        parse_import();
+                    }
+                }
+                p_next();
+            } else {
+                parse_import();
+            }
+        } else if p_is("fn") {
+            vec_push(prog_fns, parse_fn(0, 1));
+        } else if p_is("func") {
+            file_v2[VEC_DATA][cur_file] = 1;
+            vec_push(prog_fns, parse_fn(0, 0));
+        } else if p_is("extern") {
+            p_next();
+            vec_push(prog_fns, parse_fn(1, p_is("fn")));
+        } else if p_is("const") {
+            p_next();
+            parse_group(1);
+        } else if p_is("var") {
+            p_next();
+            parse_group(0);
+        } else if p_peek()[T_KIND] == TK_IDENT && streq(p_peek()[T_TEXT], "shared") {
+            p_next();
+            p_expect("var");
+            p_shared = 1;
+            parse_group(0);
+            p_shared = 0;
+        } else if p_is("type") {
+            p_next();
+            if p_is("(") {
+                p_next();
+                while !p_is(")") {
+                    if p_is(";") {
+                        p_next();
+                    } else {
+                        parse_type_decl();
+                    }
+                }
+                p_next();
+            } else {
+                parse_type_decl();
+            }
+        } else {
+            p_fail_found(p_peek()[T_POS], "expected a declaration (func, var, const, type)", p_peek());
+        }
+    }
+}
+
+fn parse_import() {
+    let alias = 0;
+    if p_peek()[T_KIND] == TK_IDENT {
+        alias = p_next()[T_TEXT];
+    }
+    let t = p_next();
+    if t[T_KIND] != TK_STRING {
+        p_fail_found(t[T_POS], "expected an import path", t);
+    }
+    let path = t[T_TEXT];
+    if !alias {
+        // The package name is the last path element: "net/http" is http.
+        alias = path;
+        let i = 0;
+        while load8(path + i) != 0 {
+            if load8(path + i) == '/' {
+                alias = path + i + 1;
+            }
+            i = i + 1;
+        }
+    }
+    let rec = vec_new();
+    vec_push(rec, alias);
+    vec_push(rec, path);
+    vec_push(vec_get(file_imports, cur_file), rec);
+    p_end();
+}
+
+// parse_group reads one const/var declaration or a parenthesized group of them.
+fn parse_group(is_const) {
+    if !p_is("(") {
+        parse_value_spec(is_const, 0, 0);
+        return;
+    }
+    p_next();
+    let iota = 0;
+    let last_init = 0;
+    let last_type = 0;
+    while !p_is(")") {
+        if p_is(";") {
+            p_next();
+        } else {
+            let d = parse_value_spec(is_const, iota, last_init);
+            if is_const {
+                // A bare name in a const group repeats the previous expression (with iota).
+                if d[D_INIT] == last_init && last_type {
+                    d[D_TYPE] = last_type;
+                }
+                last_init = d[D_INIT];
+                last_type = d[D_TYPE];
+            }
+            iota = iota + 1;
+        }
+    }
+    p_next();
+}
+
+fn parse_value_spec(is_const, iota, prev_init) {
+    let pos = p_peek()[T_POS];
+    let names = vec_new();
+    vec_push(names, p_expect_ident()[T_TEXT]);
+    while p_is(",") {
+        p_next();
+        vec_push(names, p_expect_ident()[T_TEXT]);
+    }
+    let ty = 0;
+    if !p_is("=") && !p_is(";") && !p_is(")") {
+        ty = parse_type();
+    }
+    let inits = 0;
+    if p_is("=") {
+        p_next();
+        inits = parse_expr_list();
+    }
+    let first = 0;
+    let i = 0;
+    while i < names[VEC_LEN] {
+        let d = decl_new(pos, vec_get(names, i));
+        d[D_TYPE] = ty;
+        d[D_IOTA] = iota;
+        if inits && i < inits[VEC_LEN] {
+            d[D_INIT] = vec_get(inits, i);
+        } else if is_const && !inits {
+            d[D_INIT] = prev_init;
+        }
+        if is_const {
+            if !d[D_INIT] {
+                p_fail(pos, "missing constant value");
+            }
+            vec_push(prog_consts, d);
+        } else {
+            vec_push(prog_vars, d);
+        }
+        if !first {
+            first = d;
+        }
+        i = i + 1;
+    }
+    p_end();
+    return first;
+}
+
+fn parse_type_decl() {
+    let pos = p_peek()[T_POS];
+    let d = decl_new(pos, p_expect_ident()[T_TEXT]);
+    // type Stack[T any] ...: a name and a constraint after '[' (an array type has a length).
+    if p_is("[") && p_peek2()[T_KIND] == TK_IDENT && !p_legacy {
+        let save = p_i;
+        p_next();
+        p_next();
+        let generic = !p_is("]");
+        p_i = save;
+        if generic {
+            d[D_TPARAMS] = vec_new();
+            d[D_TCONS] = vec_new();
+            parse_tparams(d[D_TPARAMS], d[D_TCONS]);
+        }
+    }
+    if p_is("=") {
+        p_next();
+        d[D_IOTA] = 1;
+    }
+    d[D_TYPE] = parse_type();
+    vec_push(prog_types, d);
+    p_end();
+}
+
+fn p_peek() {
+    return vec_get(p_toks, p_i);
+}
+
+fn p_peek2() {
+    if p_i + 1 < p_toks[VEC_LEN] {
+        return vec_get(p_toks, p_i + 1);
+    }
+    return vec_get(p_toks, p_i);
+}
+
+fn p_next() {
+    let t = p_peek();
+    if t[T_KIND] != TK_EOF {
+        p_i = p_i + 1;
+    }
+    return t;
+}
+
+// p_is reports whether the next token is the given keyword or punctuation.
+fn p_is(text) {
+    let t = p_peek();
+    return (t[T_KIND] == TK_KEYWORD || t[T_KIND] == TK_PUNCT) && streq(t[T_TEXT], text);
+}
+
+fn tok_is(t, text) {
+    return (t[T_KIND] == TK_KEYWORD || t[T_KIND] == TK_PUNCT) && streq(t[T_TEXT], text);
+}
+
+// p_end finishes a statement or declaration: a semicolon, or nothing before } or ).
+fn p_end() {
+    if p_is(";") {
+        p_next();
+        return;
+    }
+    if p_is("}") || p_is(")") || p_peek()[T_KIND] == TK_EOF {
+        return;
+    }
+    p_expect(";");
+}
+
+fn buf_describe(b, t) {
+    let k = t[T_KIND];
+    if k == TK_EOF {
+        buf_str(b, "end of file");
+    } else if k == TK_IDENT {
+        buf_str(b, "name '");
+        buf_str(b, t[T_TEXT]);
+        buf_byte(b, '\'');
+    } else if k == TK_INT || k == TK_FLOAT {
+        buf_str(b, "a number");
+    } else if k == TK_STRING {
+        buf_str(b, "a string");
+    } else if k == TK_PUNCT && streq(t[T_TEXT], ";") && t[T_VAL] {
+        buf_str(b, "newline");
+    } else {
+        buf_byte(b, '\'');
+        buf_str(b, t[T_TEXT]);
+        buf_byte(b, '\'');
+    }
+}
+
+fn p_fail_found(pos, msg, t) {
+    let e = err_begin(pos);
+    buf_str(e, msg);
+    buf_str(e, ", found ");
+    buf_describe(e, t);
+    fatal(e);
+}
+
+fn p_fail(pos, msg) {
+    let e = err_begin(pos);
+    buf_str(e, msg);
+    fatal(e);
+}
+
+fn p_expect(text) {
+    if !p_is(text) {
+        let e = err_begin(p_peek()[T_POS]);
+        buf_str(e, "expected '");
+        buf_str(e, text);
+        buf_str(e, "', found ");
+        buf_describe(e, p_peek());
+        fatal(e);
+    }
+    return p_next();
+}
+
+fn p_expect_ident() {
+    if p_peek()[T_KIND] != TK_IDENT {
+        p_fail_found(p_peek()[T_POS], "expected a name", p_peek());
+    }
+    return p_next();
+}
+
+// ---- types ----
+
+fn starts_type() {
+    let t = p_peek();
+    return t[T_KIND] == TK_IDENT || p_is("[") || p_is("map") || p_is("*") || p_is("func") || p_is("struct") || p_is("?") || p_is("mut");
+}
+
+fn parse_type() {
+    let pos = p_peek()[T_POS];
+    if p_is("[") {
+        p_next();
+        if p_is("]") {
+            p_next();
+            let s = node_new(TX_SLICE, pos);
+            s[TX_A] = parse_type();
+            return s;
+        }
+        let a = node_new(TX_ARRAY, pos);
+        a[TX_A] = parse_expr(1);
+        p_expect("]");
+        a[TX_B] = parse_type();
+        return a;
+    }
+    if p_is("map") {
+        p_next();
+        p_expect("[");
+        let m = node_new(TX_MAP, pos);
+        m[TX_A] = parse_type();
+        p_expect("]");
+        m[TX_B] = parse_type();
+        return m;
+    }
+    if p_is("*") {
+        p_next();
+        let pt = node_new(TX_PTR, pos);
+        pt[TX_A] = parse_type();
+        return pt;
+    }
+    if p_is("?") {
+        p_next();
+        let ot = node_new(TX_OPT, pos);
+        ot[TX_A] = parse_type();
+        return ot;
+    }
+    if p_is("func") {
+        p_next();
+        let ft = node_new(TX_FUNC, pos);
+        ft[TX_A] = parse_type_list();
+        ft[TX_B] = parse_results();
+        return ft;
+    }
+    if p_is("struct") {
+        p_next();
+        return parse_struct_body(pos);
+    }
+    let t = p_expect_ident();
+    if streq(t[T_TEXT], "chan") {
+        let c = node_new(TX_CHAN, pos);
+        c[TX_A] = parse_type();
+        return c;
+    }
+    let n = node_new(TX_NAME, pos);
+    n[TX_B] = t[T_TEXT];
+    if p_is(".") {
+        p_next();
+        n[TX_A] = t[T_TEXT];
+        n[TX_B] = p_expect_ident()[T_TEXT];
+    }
+    if p_is("[") && !p_legacy {
+        p_next();
+        let args = vec_new();
+        while !p_is("]") {
+            vec_push(args, parse_type());
+            if !p_is(",") {
+                break;
+            }
+            p_next();
+        }
+        p_expect("]");
+        n[TX_ARGS] = args;
+    }
+    return n;
+}
+
+// parse_tparams reads [T any, U i64 | f64] into f's (or a type decl's) names and constraints.
+fn parse_tparams(names, cons) {
+    p_expect("[");
+    while !p_is("]") {
+        vec_push(names, p_expect_ident()[T_TEXT]);
+        let c = 0;
+        if !p_is(",") && !p_is("]") {
+            let first = parse_type();
+            if first[N_KIND] == TX_NAME && !first[TX_A] && (streq(first[TX_B], "any") || streq(first[TX_B], "comparable")) && !p_is("|") {
+                c = 0;
+            } else {
+                c = vec_new();
+                vec_push(c, first);
+                while p_is("|") {
+                    p_next();
+                    vec_push(c, parse_type());
+                }
+            }
+        }
+        vec_push(cons, c);
+        if !p_is(",") {
+            break;
+        }
+        p_next();
+    }
+    p_expect("]");
+}
+
+// parse_struct_body reads { a, b int; c string } into a vec of [name, type expr].
+fn parse_struct_body(pos) {
+    let st = node_new(TX_STRUCT, pos);
+    let fields = vec_new();
+    p_expect("{");
+    while !p_is("}") {
+        if p_is(";") {
+            p_next();
+            continue;
+        }
+        let names = vec_new();
+        vec_push(names, p_expect_ident()[T_TEXT]);
+        while p_is(",") {
+            p_next();
+            vec_push(names, p_expect_ident()[T_TEXT]);
+        }
+        let ty = parse_type();
+        let i = 0;
+        while i < names[VEC_LEN] {
+            let f = vec_new();
+            vec_push(f, vec_get(names, i));
+            vec_push(f, ty);
+            vec_push(fields, f);
+            i = i + 1;
+        }
+        p_end();
+    }
+    p_next();
+    st[TX_A] = fields;
+    return st;
+}
+
+// parse_type_list reads (T1, T2) or (a T1, b T2) and returns the types.
+fn parse_type_list() {
+    let types = vec_new();
+    p_expect("(");
+    while !p_is(")") {
+        if p_is("...") {
+            p_next();
+        }
+        let t2 = p_peek2();
+        if p_peek()[T_KIND] == TK_IDENT && !tok_is(t2, ",") && !tok_is(t2, ")") && !tok_is(t2, ".") {
+            p_next();
+        }
+        vec_push(types, parse_type());
+        if !p_is(",") {
+            break;
+        }
+        p_next();
+    }
+    p_expect(")");
+    return types;
+}
+
+// parse_results reads a func's result types: none, T, or (T1, T2) with optional names.
+fn parse_results() {
+    if p_is("(") {
+        return parse_type_list();
+    }
+    let r = vec_new();
+    if p_is("mut") {
+        p_next();
+        p_mutres = 1;
+    }
+    if starts_type() && !p_is("{") {
+        vec_push(r, parse_type());
+    }
+    return r;
+}
+
+// ---- declarations ----
+
+// parse_fn reads fn/func declarations: receiver, grouped typed params, results, body.
+fn parse_fn(is_extern, legacy) {
+    let at = p_i;
+    let pos = p_next()[T_POS];
+    let f = fn_new(pos, 0);
+    f[F_TOKS] = p_toks;
+    f[F_TOKAT] = at;
+    f[F_EXTERN] = is_extern;
+    f[F_LEGACY] = legacy;
+    if !legacy && p_is("(") {
+        p_next();
+        f[F_RECVNAME] = p_expect_ident()[T_TEXT];
+        if p_is("mut") {
+            p_next();
+            f[F_RECVMUT] = 1;
+        }
+        f[F_RECV] = parse_type();
+        p_expect(")");
+    }
+    f[F_NAME] = p_expect_ident()[T_TEXT];
+    if !legacy && p_is("[") {
+        f[F_TPARAMS] = vec_new();
+        f[F_TCONS] = vec_new();
+        parse_tparams(f[F_TPARAMS], f[F_TCONS]);
+    }
+    // A method of a generic type is generic over the type's parameters.
+    let rx = f[F_RECV];
+    if rx && rx[N_KIND] == TX_NAME && rx[TX_ARGS] {
+        if !f[F_TPARAMS] {
+            f[F_TPARAMS] = vec_new();
+            f[F_TCONS] = vec_new();
+        }
+        let ri = 0;
+        while ri < rx[TX_ARGS][VEC_LEN] {
+            let a = vec_get(rx[TX_ARGS], ri);
+            if a[N_KIND] != TX_NAME || a[TX_A] || a[TX_ARGS] {
+                p_fail(pos, "a method's receiver lists its type's parameters by name, like (s Stack[T])");
+            }
+            vec_push(f[F_TPARAMS], a[TX_B]);
+            vec_push(f[F_TCONS], 0);
+            ri = ri + 1;
+        }
+    }
+    parse_params(f);
+    p_mutres = 0;
+    if legacy {
+        let int_t = node_new(TX_NAME, pos);
+        int_t[TX_B] = "int";
+        vec_push(f[F_RTYPES], int_t);
+    } else {
+        f[F_RTYPES] = parse_results();
+        f[F_MUTRES] = p_mutres;
+    }
+    if is_extern {
+        p_end();
+        return f;
+    }
+    let saved = p_legacy;
+    p_legacy = legacy;
+    f[F_BODY] = parse_block();
+    p_legacy = saved;
+    return f;
+}
+
+fn parse_params(f) {
+    p_expect("(");
+    let pending = 0;
+    while !p_is(")") {
+        if p_is("...") {
+            p_next();
+            f[F_VARIADIC] = 1;
+            if !p_is(")") {
+                parse_type();
+            }
+            break;
+        }
+        vec_push(f[F_PARAMS], p_expect_ident()[T_TEXT]);
+        vec_push(f[F_PTYPES], 0);
+        vec_push(f[F_MUTS], 0);
+        pending = pending + 1;
+        if !p_is(",") && !p_is(")") {
+            if p_is("...") {
+                p_next();
+                f[F_VARIADIC] = 1;
+            }
+            let ismut = 0;
+            if p_is("mut") {
+                p_next();
+                ismut = 1;
+            }
+            let ty = parse_type();
+            let i = f[F_PTYPES][VEC_LEN] - pending;
+            while i < f[F_PTYPES][VEC_LEN] {
+                f[F_PTYPES][VEC_DATA][i] = ty;
+                f[F_MUTS][VEC_DATA][i] = ismut;
+                i = i + 1;
+            }
+            pending = 0;
+        }
+        if !p_is(",") {
+            break;
+        }
+        p_next();
+    }
+    p_expect(")");
+}
+
+// ---- statements ----
+
+fn parse_block() {
+    let b = node_new(ST_BLOCK, p_expect("{")[T_POS]);
+    b[BLK_STMTS] = vec_new();
+    while !p_is("}") {
+        if p_peek()[T_KIND] == TK_EOF {
+            p_fail(p_peek()[T_POS], "expected '}', found end of file");
+        }
+        let s = parse_stmt();
+        if s[N_KIND] == ST_LIST {
+            let i = 0;
+            while i < s[LIST_STMTS][VEC_LEN] {
+                vec_push(b[BLK_STMTS], vec_get(s[LIST_STMTS], i));
+                i = i + 1;
+            }
+        } else if s[N_KIND] != ST_BLOCK || s[BLK_STMTS][VEC_LEN] > 0 || s[N_POS] != 0 {
+            vec_push(b[BLK_STMTS], s);
+        }
+    }
+    p_next();
+    return b;
+}
+
+fn empty_block(pos) {
+    let b = node_new(ST_BLOCK, pos);
+    b[BLK_STMTS] = vec_new();
+    return b;
+}
+
+fn parse_stmt() {
+    let pos = p_peek()[T_POS];
+    if p_is(";") {
+        p_next();
+        return empty_block(0);
+    }
+    if p_is("let") {
+        p_next();
+        let l = node_new(ST_LET, pos);
+        l[LET_NAME] = p_expect_ident()[T_TEXT];
+        p_expect("=");
+        l[LET_INIT] = parse_expr(1);
+        p_end();
+        return l;
+    }
+    if p_is("var") {
+        p_next();
+        return parse_local_var(pos);
+    }
+    if p_is("const") {
+        p_fail(pos, "local constants are not supported; declare them at top level");
+    }
+    if p_is("if") {
+        return parse_if();
+    }
+    if p_is("while") {
+        p_next();
+        let w = node_new(ST_WHILE, pos);
+        let saved = p_nolit;
+        p_nolit = 1;
+        w[WH_COND] = parse_expr(1);
+        p_nolit = saved;
+        w[WH_BODY] = parse_block();
+        return w;
+    }
+    if p_is("for") {
+        return parse_for();
+    }
+    if p_is("switch") {
+        return parse_switch();
+    }
+    if p_is("return") {
+        p_next();
+        let r = node_new(ST_RETURN, pos);
+        if !p_is(";") && !p_is("}") {
+            let vals = parse_expr_list();
+            if vals[VEC_LEN] == 1 {
+                r[RET_VALUE] = vec_get(vals, 0);
+            } else {
+                r[RET_VALUES] = vals;
+            }
+        }
+        p_end();
+        return r;
+    }
+    if p_is("break") {
+        p_next();
+        p_end();
+        return node_new(ST_BREAK, pos);
+    }
+    if p_is("continue") {
+        p_next();
+        p_end();
+        return node_new(ST_CONTINUE, pos);
+    }
+    if p_is("go") || p_is("defer") {
+        let kind = ST_GO;
+        if p_is("defer") {
+            kind = ST_DEFER;
+        }
+        p_next();
+        let g = node_new(kind, pos);
+        g[GO_CALL] = parse_expr(1);
+        if g[GO_CALL][N_KIND] != EX_CALL {
+            p_fail(pos, "expected a function call");
+        }
+        p_end();
+        return g;
+    }
+    if p_is("{") {
+        return parse_block();
+    }
+    let s = parse_simple_stmt(parse_expr_list());
+    p_end();
+    return s;
+}
+
+fn parse_local_var(pos) {
+    let names = vec_new();
+    vec_push(names, p_expect_ident()[T_TEXT]);
+    while p_is(",") {
+        p_next();
+        vec_push(names, p_expect_ident()[T_TEXT]);
+    }
+    let ty = 0;
+    if !p_is("=") {
+        ty = parse_type();
+    }
+    let inits = 0;
+    if p_is("=") {
+        p_next();
+        inits = parse_expr_list();
+    }
+    p_end();
+    if inits && inits[VEC_LEN] != names[VEC_LEN] {
+        let m = node_new(ST_MULTI, pos);
+        m[MU_TARGETS] = idents_of(pos, names);
+        m[MU_VALUES] = inits;
+        m[MU_DEFINE] = 1;
+        return m;
+    }
+    let list = node_new(ST_LIST, pos);
+    list[LIST_STMTS] = vec_new();
+    let i = 0;
+    while i < names[VEC_LEN] {
+        let l = node_new(ST_LET, pos);
+        l[LET_NAME] = vec_get(names, i);
+        l[LET_TYPE] = ty;
+        if inits {
+            l[LET_INIT] = vec_get(inits, i);
+        }
+        vec_push(list[LIST_STMTS], l);
+        i = i + 1;
+    }
+    return list;
+}
+
+fn idents_of(pos, names) {
+    let v = vec_new();
+    let i = 0;
+    while i < names[VEC_LEN] {
+        let id = node_new(EX_IDENT, pos);
+        id[ID_NAME] = vec_get(names, i);
+        vec_push(v, id);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn parse_expr_list() {
+    let v = vec_new();
+    vec_push(v, parse_expr(1));
+    while p_is(",") {
+        p_next();
+        vec_push(v, parse_expr(1));
+    }
+    return v;
+}
+
+fn is_assign_op(t) {
+    if t[T_KIND] != TK_PUNCT {
+        return 0;
+    }
+    let s = t[T_TEXT];
+    let n = strlen(s);
+    return n >= 2 && load8(s + n - 1) == '=' && !streq(s, "==") && !streq(s, "!=") && !streq(s, "<=") && !streq(s, ">=") && !streq(s, ":=");
+}
+
+// parse_simple_stmt finishes a statement that starts with the expression list xs.
+fn parse_simple_stmt(xs) {
+    let x = vec_get(xs, 0);
+    let pos = x[N_POS];
+    if p_is(":=") || (p_is("=") && xs[VEC_LEN] > 1) {
+        let define = p_is(":=");
+        p_next();
+        let vals = parse_expr_list();
+        if define && xs[VEC_LEN] == 1 && vals[VEC_LEN] == 1 {
+            if x[N_KIND] != EX_IDENT {
+                p_fail(pos, "expected a name before :=");
+            }
+            let l = node_new(ST_LET, pos);
+            l[LET_NAME] = x[ID_NAME];
+            l[LET_INIT] = vec_get(vals, 0);
+            return l;
+        }
+        let m = node_new(ST_MULTI, pos);
+        m[MU_TARGETS] = xs;
+        m[MU_VALUES] = vals;
+        m[MU_DEFINE] = define;
+        return m;
+    }
+    if xs[VEC_LEN] > 1 {
+        p_fail_found(p_peek()[T_POS], "expected := or =", p_peek());
+    }
+    if p_is("=") {
+        p_next();
+        let a = node_new(ST_ASSIGN, pos);
+        a[AS_TARGET] = x;
+        a[AS_VALUE] = parse_expr(1);
+        return a;
+    }
+    if is_assign_op(p_peek()) {
+        // x op= e  is  x = x op e  (the target is evaluated twice).
+        let t = p_next()[T_TEXT];
+        let a = node_new(ST_ASSIGN, pos);
+        a[AS_TARGET] = x;
+        a[AS_VALUE] = binary_new(pos, str_slice(t, strlen(t) - 1), x, parse_expr(1));
+        return a;
+    }
+    if p_is("++") || p_is("--") {
+        let op = "+";
+        if p_is("--") {
+            op = "-";
+        }
+        p_next();
+        let one = node_new(EX_INT, pos);
+        one[INT_VAL] = 1;
+        let inc = node_new(ST_ASSIGN, pos);
+        inc[AS_TARGET] = x;
+        inc[AS_VALUE] = binary_new(pos, op, x, one);
+        return inc;
+    }
+    let s = node_new(ST_EXPR, pos);
+    s[ES_X] = x;
+    return s;
+}
+
+fn binary_new(pos, op, l, r) {
+    let b = node_new(EX_BINARY, pos);
+    b[BIN_OP] = op;
+    b[BIN_L] = l;
+    b[BIN_R] = r;
+    return b;
+}
+
+fn parse_if() {
+    let s = node_new(ST_IF, p_expect("if")[T_POS]);
+    let saved = p_nolit;
+    p_nolit = 1;
+    let first = parse_simple_stmt(parse_expr_list());
+    if p_is(";") {
+        p_next();
+        s[IF_INIT] = first;
+        s[IF_COND] = parse_expr(1);
+    } else {
+        if first[N_KIND] != ST_EXPR {
+            p_fail(first[N_POS], "expected a condition");
+        }
+        s[IF_COND] = first[ES_X];
+    }
+    p_nolit = saved;
+    s[IF_THEN] = parse_block();
+    if p_is("else") {
+        p_next();
+        if p_is("if") {
+            s[IF_ELSE] = parse_if();
+        } else {
+            s[IF_ELSE] = parse_block();
+        }
+    }
+    return s;
+}
+
+fn true_node(pos) {
+    let t = node_new(EX_IDENT, pos);
+    t[ID_NAME] = "true";
+    return t;
+}
+
+fn parse_for() {
+    let pos = p_expect("for")[T_POS];
+    let w = node_new(ST_WHILE, pos);
+    if p_is("{") {
+        w[WH_COND] = true_node(pos);
+        w[WH_BODY] = parse_block();
+        return w;
+    }
+    let saved = p_nolit;
+    p_nolit = 1;
+    if p_is("range") {
+        p_next();
+        let r = node_new(ST_RANGE, pos);
+        r[RG_EXPR] = parse_expr(1);
+        p_nolit = saved;
+        r[RG_BODY] = parse_block();
+        return r;
+    }
+    let init = 0;
+    if !p_is(";") {
+        let xs = parse_expr_list();
+        if (p_is(":=") || p_is("=")) && tok_is(p_peek2(), "range") {
+            let r = node_new(ST_RANGE, pos);
+            r[RG_DEFINE] = p_is(":=");
+            p_next();
+            p_next();
+            r[RG_KEY] = vec_get(xs, 0);
+            if xs[VEC_LEN] > 1 {
+                r[RG_VAL] = vec_get(xs, 1);
+            }
+            r[RG_EXPR] = parse_expr(1);
+            p_nolit = saved;
+            r[RG_BODY] = parse_block();
+            return r;
+        }
+        if p_is("{") && xs[VEC_LEN] == 1 {
+            w[WH_COND] = vec_get(xs, 0);
+            p_nolit = saved;
+            w[WH_BODY] = parse_block();
+            return w;
+        }
+        init = parse_simple_stmt(xs);
+    }
+    p_expect(";");
+    w[WH_INIT] = init;
+    if p_is(";") {
+        w[WH_COND] = true_node(pos);
+    } else {
+        w[WH_COND] = parse_expr(1);
+    }
+    p_expect(";");
+    if !p_is("{") {
+        w[WH_POST] = parse_simple_stmt(parse_expr_list());
+    }
+    p_nolit = saved;
+    w[WH_BODY] = parse_block();
+    return w;
+}
+
+fn parse_switch() {
+    let s = node_new(ST_SWITCH, p_expect("switch")[T_POS]);
+    let saved = p_nolit;
+    p_nolit = 1;
+    if !p_is("{") {
+        let first = parse_simple_stmt(parse_expr_list());
+        if p_is(";") {
+            p_next();
+            s[SW_INIT] = first;
+            if !p_is("{") {
+                s[SW_TAG] = parse_expr(1);
+            }
+        } else {
+            if first[N_KIND] != ST_EXPR {
+                p_fail(first[N_POS], "expected a switch tag");
+            }
+            s[SW_TAG] = first[ES_X];
+        }
+    }
+    p_nolit = saved;
+    p_expect("{");
+    let cases = vec_new();
+    while !p_is("}") {
+        if p_is(";") {
+            p_next();
+            continue;
+        }
+        let c = vec_new();
+        let cpos = p_peek()[T_POS];
+        if p_is("case") {
+            p_next();
+            vec_push(c, parse_expr_list());
+        } else {
+            p_expect("default");
+            vec_push(c, 0);
+        }
+        p_expect(":");
+        let body = empty_block(cpos);
+        while !p_is("case") && !p_is("default") && !p_is("}") {
+            let st = parse_stmt();
+            if st[N_KIND] == ST_LIST {
+                let i = 0;
+                while i < st[LIST_STMTS][VEC_LEN] {
+                    vec_push(body[BLK_STMTS], vec_get(st[LIST_STMTS], i));
+                    i = i + 1;
+                }
+            } else {
+                vec_push(body[BLK_STMTS], st);
+            }
+        }
+        vec_push(c, body);
+        vec_push(cases, c);
+    }
+    p_next();
+    s[SW_CASES] = cases;
+    return s;
+}
+
+// ---- expressions ----
+
+// bin_prec gives a binary operator's binding power (Go's levels), or 0.
+fn bin_prec(t) {
+    if t[T_KIND] != TK_PUNCT {
+        return 0;
+    }
+    let s = t[T_TEXT];
+    if streq(s, "||") {
+        return 1;
+    }
+    if streq(s, "&&") {
+        return 2;
+    }
+    if streq(s, "==") || streq(s, "!=") || streq(s, "<") || streq(s, "<=") || streq(s, ">") || streq(s, ">=") {
+        return 3;
+    }
+    if streq(s, "+") || streq(s, "-") || streq(s, "|") || streq(s, "^") {
+        return 4;
+    }
+    if streq(s, "*") || streq(s, "/") || streq(s, "%") || streq(s, "<<") || streq(s, ">>") || streq(s, "&") {
+        return 5;
+    }
+    return 0;
+}
+
+// parse_expr is a precedence-climbing parser for left-associative binary operators.
+fn parse_expr(min_prec) {
+    let left = parse_unary();
+    while 1 {
+        let t = p_peek();
+        let prec = bin_prec(t);
+        if prec == 0 || prec < min_prec {
+            return left;
+        }
+        p_next();
+        let right = parse_expr(prec + 1);
+        left = binary_new(t[T_POS], t[T_TEXT], left, right);
+    }
+}
+
+fn parse_unary() {
+    let t = p_peek();
+    let s = t[T_TEXT];
+    if p_is("try") {
+        p_next();
+        let tr = node_new(EX_TRY, t[T_POS]);
+        tr[TRY_X] = parse_unary();
+        return tr;
+    }
+    if t[T_KIND] == TK_PUNCT && (streq(s, "-") || streq(s, "!") || streq(s, "~") || streq(s, "&") || streq(s, "^") || streq(s, "*") || streq(s, "+")) {
+        p_next();
+        let x = parse_unary();
+        if streq(s, "+") || streq(s, "*") {
+            // +x is x; *p is p, since struct values are references.
+            return x;
+        }
+        let u = node_new(EX_UNARY, t[T_POS]);
+        u[UN_OP] = s;
+        if streq(s, "^") {
+            u[UN_OP] = "~";
+        }
+        u[UN_X] = x;
+        return u;
+    }
+    return parse_postfix();
+}
+
+// type_operand reports whether a call to name takes a type as its first argument.
+fn type_operand(name) {
+    return streq(name, "make") || streq(name, "new") || streq(name, "cast");
+}
+
+fn parse_postfix() {
+    let x = parse_primary();
+    while 1 {
+        if p_is("(") {
+            let pos = p_next()[T_POS];
+            let call = node_new(EX_CALL, x[N_POS]);
+            call[CALL_ARGS] = vec_new();
+            if x[N_KIND] == EX_IDENT {
+                call[CALL_NAME] = x[ID_NAME];
+            } else {
+                call[CALL_CALLEE] = x;
+            }
+            let saved = p_nolit;
+            p_nolit = 0;
+            if !p_is(")") && x[N_KIND] == EX_IDENT && type_operand(x[ID_NAME]) {
+                let tx = node_new(EX_TYPE, p_peek()[T_POS]);
+                tx[TYX] = parse_type();
+                vec_push(call[CALL_ARGS], tx);
+                if p_is(",") {
+                    p_next();
+                }
+            }
+            while !p_is(")") {
+                if p_is(";") {
+                    p_next();
+                    continue;
+                }
+                let a = parse_expr(1);
+                if p_is("...") {
+                    let spread = node_new(EX_UNARY, p_next()[T_POS]);
+                    spread[UN_OP] = "...";
+                    spread[UN_X] = a;
+                    a = spread;
+                }
+                vec_push(call[CALL_ARGS], a);
+                if !p_is(",") {
+                    break;
+                }
+                p_next();
+            }
+            p_nolit = saved;
+            p_expect(")");
+            x = call;
+        } else if p_is("[") {
+            let pos = p_next()[T_POS];
+            let saved = p_nolit;
+            p_nolit = 0;
+            let lo = 0;
+            let targs = 0;
+            if p_is("[") || p_is("map") || p_is("?") || p_is("func") {
+                lo = node_new(EX_TYPE, p_peek()[T_POS]);
+                lo[TYX] = parse_type();
+                targs = vec_new();
+                vec_push(targs, lo);
+            } else if !p_is(":") {
+                lo = parse_expr(1);
+            }
+            if p_is(",") {
+                if !targs {
+                    targs = vec_new();
+                    vec_push(targs, lo);
+                }
+                while p_is(",") {
+                    p_next();
+                    if p_is("[") || p_is("map") || p_is("?") || p_is("func") {
+                        let tn = node_new(EX_TYPE, p_peek()[T_POS]);
+                        tn[TYX] = parse_type();
+                        vec_push(targs, tn);
+                    } else {
+                        vec_push(targs, parse_expr(1));
+                    }
+                }
+            }
+            if p_is(":") {
+                p_next();
+                let sl = node_new(EX_SLICE, pos);
+                sl[SL_X] = x;
+                sl[SL_LO] = lo;
+                if !p_is("]") {
+                    sl[SL_HI] = parse_expr(1);
+                }
+                p_nolit = saved;
+                p_expect("]");
+                x = sl;
+            } else {
+                p_nolit = saved;
+                p_expect("]");
+                let ix = node_new(EX_INDEX, pos);
+                ix[IX_X] = x;
+                ix[IX_I] = lo;
+                ix[IX_ARGS] = targs;
+                x = ix;
+            }
+        } else if p_is(".") {
+            let pos = p_next()[T_POS];
+            let sel = node_new(EX_SELECT, pos);
+            sel[SEL_X] = x;
+            sel[SEL_NAME] = p_expect_ident()[T_TEXT];
+            x = sel;
+        } else if p_is("{") && (x[N_KIND] == EX_TYPE || (!p_nolit && !p_legacy && (x[N_KIND] == EX_IDENT || (x[N_KIND] == EX_SELECT && x[SEL_X][N_KIND] == EX_IDENT) || (x[N_KIND] == EX_INDEX && (x[IX_X][N_KIND] == EX_IDENT || x[IX_X][N_KIND] == EX_SELECT))))) {
+            x = parse_composite(x);
+        } else {
+            return x;
+        }
+    }
+}
+
+// parse_composite reads T{...} with positional or key: value elements.
+fn parse_composite(tyexpr) {
+    let c = node_new(EX_COMPOSITE, tyexpr[N_POS]);
+    c[CL_TYPE] = tyexpr;
+    c[CL_ELEMS] = vec_new();
+    c[CL_KEYS] = vec_new();
+    p_expect("{");
+    let saved = p_nolit;
+    p_nolit = 0;
+    while !p_is("}") {
+        if p_is(";") {
+            p_next();
+            continue;
+        }
+        let v = parse_elem();
+        let k = 0;
+        if p_is(":") {
+            p_next();
+            k = v;
+            v = parse_elem();
+        }
+        vec_push(c[CL_KEYS], k);
+        vec_push(c[CL_ELEMS], v);
+        if !p_is(",") {
+            break;
+        }
+        p_next();
+    }
+    p_nolit = saved;
+    while p_is(";") {
+        p_next();
+    }
+    p_expect("}");
+    return c;
+}
+
+// parse_elem reads a composite element; a bare {...} takes its type from the context.
+fn parse_elem() {
+    if p_is("{") {
+        let untyped = node_new(EX_TYPE, p_peek()[T_POS]);
+        return parse_composite(untyped);
+    }
+    return parse_expr(1);
+}
+
+fn parse_primary() {
+    let t = p_peek();
+    let k = t[T_KIND];
+    let pos = t[T_POS];
+    if k == TK_INT {
+        p_next();
+        let i = node_new(EX_INT, pos);
+        i[INT_VAL] = t[T_VAL];
+        // A literal above 2^63-1 (its bits look negative) only fits 64-bit types.
+        if t[T_VAL] < 0 {
+            i[8] = 1;
+        }
+        if load8(t[T_TEXT]) == '\'' {
+            i[7] = 1;
+        }
+        return i;
+    }
+    if k == TK_FLOAT {
+        p_next();
+        let f = node_new(EX_FLOAT, pos);
+        f[FL_BITS] = t[T_VAL];
+        f[FL_TEXT] = t[T_TEXT];
+        return f;
+    }
+    if k == TK_STRING {
+        p_next();
+        let s = node_new(EX_STR, pos);
+        s[STR_PTR] = t[T_TEXT];
+        s[STR_LEN] = t[T_VAL];
+        return s;
+    }
+    if k == TK_IDENT {
+        p_next();
+        let id = node_new(EX_IDENT, pos);
+        id[ID_NAME] = t[T_TEXT];
+        return id;
+    }
+    if p_is("true") || p_is("false") {
+        p_next();
+        let b = node_new(EX_IDENT, pos);
+        b[ID_NAME] = t[T_TEXT];
+        return b;
+    }
+    if p_is("nil") {
+        p_next();
+        return node_new(EX_NIL, pos);
+    }
+    if p_is("(") {
+        p_next();
+        let saved = p_nolit;
+        p_nolit = 0;
+        let x = parse_expr(1);
+        p_nolit = saved;
+        p_expect(")");
+        return x;
+    }
+    if p_is("func") {
+        // A function literal, or a func type in a conversion.
+        p_next();
+        let f = fn_new(pos, "func");
+        parse_params(f);
+        f[F_RTYPES] = parse_results();
+        if !p_is("{") {
+            p_fail(pos, "expected a function body");
+        }
+        let saved = p_nolit;
+        p_nolit = 0;
+        f[F_BODY] = parse_block();
+        p_nolit = saved;
+        let lit = node_new(EX_FUNCLIT, pos);
+        lit[LIT_FN] = f;
+        return lit;
+    }
+    if p_is("[") || p_is("map") || p_is("struct") {
+        let ty = node_new(EX_TYPE, pos);
+        ty[TYX] = parse_type();
+        return ty;
+    }
+    p_next();
+    p_fail_found(pos, "expected an expression", t);
+}

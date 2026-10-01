@@ -1,0 +1,152 @@
+// Package herald writes leveled log lines, one write(2) per line so cores never interleave:
+//
+//	2026-10-01T11:22:05.123Z INFO core=2 listening addr=:8080
+package herald
+
+import "say"
+import "tide"
+
+const LDebug = 0
+const LInfo = 1
+const LWarn = 2
+const LError = 3
+
+var level i64 = LInfo
+var out i64 = 2
+var clock func() i64 = wall_ms
+
+func wall_ms() i64 {
+	return tide.Wall() / 1000000
+}
+
+// SetLevel drops lines below l (LDebug, LInfo, LWarn, LError) on this core.
+func SetLevel(l i64) {
+	level = l
+}
+
+// SetOutput sends this core's lines to file descriptor fd.
+func SetOutput(fd i64) {
+	out = fd
+}
+
+// SetClock replaces the clock (unix milliseconds), for tests.
+func SetClock(f func() i64) {
+	clock = f
+}
+
+func name_of(l i64) str {
+	if l == LDebug {
+		return "DEBUG"
+	}
+	if l == LInfo {
+		return "INFO"
+	}
+	if l == LWarn {
+		return "WARN"
+	}
+	return "ERROR"
+}
+
+func needs_quote(v str) bool {
+	if len(v) == 0 {
+		return true
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		if c <= ' ' || c == '"' || c == '=' || c >= 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
+func pad(b mut []u8, v i64, width i64) {
+	s := say.Str(v)
+	for i := len(s); i < width; i++ {
+		b = append(b, '0')
+	}
+	b = append(b, s...)
+}
+
+// Line formats a log line (without writing it): timestamp, level, core, message, pairs.
+func Line(l i64, msg str, kv []str) str {
+	ms := clock()
+	c := tide.UTC(ms * 1000000)
+	b := make([]u8, 0, 96+len(msg))
+	pad(b, c.Year, 4)
+	b = append(b, '-')
+	pad(b, c.Month, 2)
+	b = append(b, '-')
+	pad(b, c.Day, 2)
+	b = append(b, 'T')
+	pad(b, c.Hour, 2)
+	b = append(b, ':')
+	pad(b, c.Min, 2)
+	b = append(b, ':')
+	pad(b, c.Sec, 2)
+	b = append(b, '.')
+	pad(b, ms%1000, 3)
+	b = append(b, "Z "...)
+	b = append(b, name_of(l)...)
+	b = append(b, " core="...)
+	b = append(b, say.Str(rt_core_id())...)
+	b = append(b, ' ')
+	b = append(b, msg...)
+	for i := 0; i+1 < len(kv); i += 2 {
+		b = append(b, ' ')
+		b = append(b, kv[i]...)
+		b = append(b, '=')
+		v := kv[i+1]
+		if needs_quote(v) {
+			b = append(b, say.Fmt("%q", v)...)
+		} else {
+			b = append(b, v...)
+		}
+	}
+	b = append(b, '\n')
+	return str(b)
+}
+
+// Log writes msg at level l with key/value pairs kv (k1, v1, k2, v2, ...).
+func Log(l i64, msg str, kv []str) {
+	if l < level {
+		return
+	}
+	s := Line(l, msg, kv)
+	write(out, cast(i64, s)+8, len(s))
+}
+
+// Debug logs msg at debug level.
+func Debug(msg str) {
+	Log(LDebug, msg, []str{})
+}
+
+// Info logs msg at info level.
+func Info(msg str) {
+	Log(LInfo, msg, []str{})
+}
+
+// Warn logs msg at warning level.
+func Warn(msg str) {
+	Log(LWarn, msg, []str{})
+}
+
+// Error logs msg at error level.
+func Error(msg str) {
+	Log(LError, msg, []str{})
+}
+
+// Info2 logs msg with one key/value pair.
+func Info2(msg str, k str, v str) {
+	Log(LInfo, msg, []str{k, v})
+}
+
+// Info4 logs msg with two key/value pairs.
+func Info4(msg str, k1 str, v1 str, k2 str, v2 str) {
+	Log(LInfo, msg, []str{k1, v1, k2, v2})
+}
+
+// Error2 logs msg with one key/value pair at error level.
+func Error2(msg str, k str, v str) {
+	Log(LError, msg, []str{k, v})
+}

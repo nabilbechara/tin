@@ -1,0 +1,391 @@
+// Package dice is fast pseudo-random numbers (like Go's math/rand): xoshiro256** generators and a lazily seeded per-core one.
+package dice
+
+import "glyph"
+import "tide"
+
+extern func sqrt(x f64) f64
+extern func log(x f64) f64
+
+// Rand is a xoshiro256** generator; make one with New or FromState, or call the package functions for this core's generator.
+type Rand struct {
+	s0 u64
+	s1 u64
+	s2 u64
+	s3 u64
+}
+
+// mix is the splitmix64 output function, used to expand seeds.
+func mix(z u64) u64 {
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+	return z ^ (z >> 31)
+}
+
+// Seed resets r to the sequence for seed s (expanded with splitmix64, so every seed gives a good state).
+func (r mut Rand) Seed(s u64) {
+	z := s + 0x9e3779b97f4a7c15
+	r.s0 = mix(z)
+	z += 0x9e3779b97f4a7c15
+	r.s1 = mix(z)
+	z += 0x9e3779b97f4a7c15
+	r.s2 = mix(z)
+	z += 0x9e3779b97f4a7c15
+	r.s3 = mix(z)
+}
+
+// New returns a generator seeded with s; equal seeds give equal sequences.
+func New(s u64) Rand {
+	r := Rand{}
+	r.Seed(s)
+	return r
+}
+
+// FromState returns a generator holding the exact xoshiro256** state words, which must not all be zero.
+func FromState(s0 u64, s1 u64, s2 u64, s3 u64) Rand {
+	if s0|s1|s2|s3 == 0 {
+		panic("dice: FromState with an all-zero state")
+	}
+	return Rand{s0: s0, s1: s1, s2: s2, s3: s3}
+}
+
+// State returns the four state words, so the sequence can be resumed later with FromState.
+func (r Rand) State() (u64, u64, u64, u64) {
+	return r.s0, r.s1, r.s2, r.s3
+}
+
+// rotl rotates x left by k bits (0 < k < 64).
+func rotl(x u64, k i64) u64 {
+	return (x << k) | (x >> (64 - k))
+}
+
+// U64 returns the next uniformly distributed 64-bit value.
+func (r mut Rand) U64() u64 {
+	s0 := r.s0
+	s1 := r.s1
+	s2 := r.s2 ^ s0
+	s3 := r.s3 ^ s1
+	result := rotl(s1*5, 7) * 9
+	r.s0 = s0 ^ s3
+	r.s1 = s1 ^ s2
+	r.s2 = s2 ^ (s1 << 17)
+	r.s3 = rotl(s3, 45)
+	return result
+}
+
+// U32 returns the next uniformly distributed 32-bit value (the high half of U64).
+func (r mut Rand) U32() u32 {
+	return u32(r.U64() >> 32)
+}
+
+// mul64 returns the high and low 64-bit halves of the 128-bit product a*b.
+func mul64(a u64, b u64) (u64, u64) {
+	al := a & 0xffffffff
+	ah := a >> 32
+	bl := b & 0xffffffff
+	bh := b >> 32
+	p0 := al * bl
+	p1 := al * bh
+	p2 := ah * bl
+	mid := (p0 >> 32) + (p1 & 0xffffffff) + (p2 & 0xffffffff)
+	hi := ah*bh + (p1 >> 32) + (p2 >> 32) + (mid >> 32)
+	return hi, (mid << 32) | (p0 & 0xffffffff)
+}
+
+// U64n returns a uniform value in [0, n) without bias (Lemire's method); n == 0 means the full 64-bit range.
+func (r mut Rand) U64n(n u64) u64 {
+	if n&(n-1) == 0 {
+		return r.U64() & (n - 1)
+	}
+	if n <= 0xffffffff {
+		v := r.U64() >> 32
+		prod := v * n
+		low := prod & 0xffffffff
+		if low < n {
+			thresh := (0x100000000 - n) % n
+			for low < thresh {
+				v = r.U64() >> 32
+				prod = v * n
+				low = prod & 0xffffffff
+			}
+		}
+		return prod >> 32
+	}
+	hi, lo := mul64(r.U64(), n)
+	if lo < n {
+		thresh := (0 - n) % n
+		for lo < thresh {
+			hi, lo = mul64(r.U64(), n)
+		}
+	}
+	return hi
+}
+
+// I64n returns a uniform value in [0, n); it panics when n <= 0.
+func (r mut Rand) I64n(n i64) i64 {
+	if n <= 0 {
+		panic("dice: I64n with n <= 0")
+	}
+	return i64(r.U64n(u64(n)))
+}
+
+// Intn is I64n under Go's name (Tin's int is i64).
+func (r mut Rand) Intn(n i64) i64 {
+	return r.I64n(n)
+}
+
+// Range returns a uniform value in [lo, hi); it panics when hi <= lo.
+func (r mut Rand) Range(lo i64, hi i64) i64 {
+	if hi <= lo {
+		panic("dice: Range with hi <= lo")
+	}
+	return lo + i64(r.U64n(u64(hi)-u64(lo)))
+}
+
+// F64 returns a uniform float in [0, 1) built from 53 random bits.
+func (r mut Rand) F64() f64 {
+	return f64(r.U64()>>11) * (1.0 / 9007199254740992.0)
+}
+
+// NormF64 returns a normally distributed float (mean 0, standard deviation 1) by Marsaglia's polar method.
+func (r mut Rand) NormF64() f64 {
+	u := 0.0
+	s := 0.0
+	for s <= 0.0 || s >= 1.0 {
+		u = 2.0*r.F64() - 1.0
+		v := 2.0*r.F64() - 1.0
+		s = u*u + v*v
+	}
+	return u * sqrt(-2.0*log(s)/s)
+}
+
+// Shuffle permutes xs uniformly in place (Fisher-Yates).
+func (r mut Rand) Shuffle(xs mut []i64) {
+	for i := len(xs) - 1; i > 0; i-- {
+		j := i64(r.U64n(u64(i + 1)))
+		t := xs[i]
+		xs[i] = xs[j]
+		xs[j] = t
+	}
+}
+
+// ShuffleStr permutes the strings xs uniformly in place.
+func (r mut Rand) ShuffleStr(xs mut []str) {
+	for i := len(xs) - 1; i > 0; i-- {
+		j := i64(r.U64n(u64(i + 1)))
+		t := xs[i]
+		xs[i] = xs[j]
+		xs[j] = t
+	}
+}
+
+// Perm returns a uniformly random permutation of 0..n-1 (empty when n <= 0).
+func (r mut Rand) Perm(n i64) []i64 {
+	if n <= 0 {
+		return make([]i64, 0)
+	}
+	p := make([]i64, n)
+	for i := 0; i < n; i++ {
+		p[i] = i
+	}
+	r.Shuffle(p)
+	return p
+}
+
+// Fill overwrites every byte of b with random bytes, eight at a time.
+func (r mut Rand) Fill(b mut []u8) {
+	n := len(b)
+	if n == 0 {
+		return
+	}
+	d := cast(i64, b)[2]
+	words := n >> 3
+	for k := 0; k < words; k++ {
+		d[k] = i64(r.U64())
+	}
+	rem := n & 7
+	if rem > 0 {
+		v := r.U64()
+		base := n - rem
+		for j := 0; j < rem; j++ {
+			store8(d+base+j, i64(v&0xff))
+			v >>= 8
+		}
+	}
+}
+
+// Bytes returns n random bytes (empty when n <= 0).
+func (r mut Rand) Bytes(n i64) []u8 {
+	if n <= 0 {
+		return make([]u8, 0)
+	}
+	b := make([]u8, n)
+	r.Fill(b)
+	return b
+}
+
+// Str returns n characters drawn uniformly from alphabet (its bytes when ASCII, its runes otherwise); "" when n <= 0 or alphabet is empty.
+func (r mut Rand) Str(n i64, alphabet str) str {
+	la := len(alphabet)
+	if n <= 0 || la == 0 {
+		return ""
+	}
+	ascii := true
+	for i := 0; i < la; i++ {
+		if alphabet[i] >= 0x80 {
+			ascii = false
+			break
+		}
+	}
+	if ascii {
+		p := rt_str_new(n)
+		d := p + 8
+		src := cast(i64, alphabet) + 8
+		m := u64(la)
+		for i := 0; i < n; i++ {
+			store8(d+i, i64(load8(src+i64(r.U64n(m)))))
+		}
+		return cast(str, p)
+	}
+	parts := make([]str, 0, la)
+	i := 0
+	for i < la {
+		_, size := glyph.DecodeRune(alphabet, i)
+		parts = append(parts, alphabet[i:i+size])
+		i += size
+	}
+	b := make([]u8, 0, n*2)
+	m := u64(len(parts))
+	for k := 0; k < n; k++ {
+		b = append(b, parts[i64(r.U64n(m))]...)
+	}
+	return str(b)
+}
+
+// Every core has its own generator (globals are per core), seeded on first use from the clocks and the core id.
+var g Rand = Rand{}
+var gSeeded bool
+
+// seedCore seeds this core's generator from the wall clock, the monotonic clock and the core id.
+func seedCore() {
+	gSeeded = true
+	g.Seed(u64(tide.Wall()) ^ mix(u64(tide.Now())+u64(rt_core_id())*0x9e3779b97f4a7c15))
+}
+
+// Seed seeds this core's generator so that the package functions become deterministic on this core.
+func Seed(s u64) {
+	gSeeded = true
+	g.Seed(s)
+}
+
+// U64 returns the next 64-bit value from this core's generator.
+func U64() u64 {
+	if !gSeeded {
+		seedCore()
+	}
+	return g.U64()
+}
+
+// U32 returns the next 32-bit value from this core's generator.
+func U32() u32 {
+	if !gSeeded {
+		seedCore()
+	}
+	return g.U32()
+}
+
+// U64n returns a uniform value in [0, n) from this core's generator (n == 0 means the full range).
+func U64n(n u64) u64 {
+	if !gSeeded {
+		seedCore()
+	}
+	return g.U64n(n)
+}
+
+// I64n returns a uniform value in [0, n) from this core's generator; it panics when n <= 0.
+func I64n(n i64) i64 {
+	if !gSeeded {
+		seedCore()
+	}
+	return g.I64n(n)
+}
+
+// Intn is I64n under Go's name.
+func Intn(n i64) i64 {
+	if !gSeeded {
+		seedCore()
+	}
+	return g.I64n(n)
+}
+
+// Range returns a uniform value in [lo, hi) from this core's generator; it panics when hi <= lo.
+func Range(lo i64, hi i64) i64 {
+	if !gSeeded {
+		seedCore()
+	}
+	return g.Range(lo, hi)
+}
+
+// F64 returns a uniform float in [0, 1) from this core's generator.
+func F64() f64 {
+	if !gSeeded {
+		seedCore()
+	}
+	return g.F64()
+}
+
+// NormF64 returns a standard normal float from this core's generator.
+func NormF64() f64 {
+	if !gSeeded {
+		seedCore()
+	}
+	return g.NormF64()
+}
+
+// Shuffle permutes xs uniformly in place with this core's generator.
+func Shuffle(xs mut []i64) {
+	if !gSeeded {
+		seedCore()
+	}
+	g.Shuffle(xs)
+}
+
+// ShuffleStr permutes the strings xs uniformly in place with this core's generator.
+func ShuffleStr(xs mut []str) {
+	if !gSeeded {
+		seedCore()
+	}
+	g.ShuffleStr(xs)
+}
+
+// Perm returns a random permutation of 0..n-1 from this core's generator.
+func Perm(n i64) []i64 {
+	if !gSeeded {
+		seedCore()
+	}
+	return g.Perm(n)
+}
+
+// Fill overwrites b with random bytes from this core's generator.
+func Fill(b mut []u8) {
+	if !gSeeded {
+		seedCore()
+	}
+	g.Fill(b)
+}
+
+// Bytes returns n random bytes from this core's generator.
+func Bytes(n i64) []u8 {
+	if !gSeeded {
+		seedCore()
+	}
+	return g.Bytes(n)
+}
+
+// Str returns n random characters of alphabet from this core's generator.
+func Str(n i64, alphabet str) str {
+	if !gSeeded {
+		seedCore()
+	}
+	return g.Str(n, alphabet)
+}

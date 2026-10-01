@@ -1,0 +1,322 @@
+// Linux (glibc) part of the runtime: the same rt_ helpers as runtime_darwin.tin, with the
+// Linux calls, constants and struct layouts (arm64 and x86-64 share these values).
+
+extern func __errno_location() i64
+extern func clock_gettime(clock i64, ts i64) i64
+extern func getrandom(p i64, n i64, flags i64) i64
+extern func sysconf(name i64) i64
+extern func signal(sig i64, h i64) i64
+extern func sched_getaffinity(pid i64, n i64, set i64) i64
+extern func sched_setaffinity(pid i64, n i64, set i64) i64
+extern func open(path i64, flags i64, ...) i64
+extern func close(fd i64) i64
+extern func getenv(name i64) i64
+extern func pthread_sigmask(how i64, set i64, old i64) i64
+extern func signalfd(fd i64, mask i64, flags i64) i64
+
+const EINTR = 4
+const EAGAIN = 11
+const EINPROGRESS = 115
+const ENOENT = 2
+const EEXIST = 17
+const ENOTDIR = 20
+const EINVAL = 22
+const EMFILE = 24
+const ENFILE = 23
+const O_WRITE_CREATE = 0x241  // O_WRONLY | O_CREAT | O_TRUNC
+const O_APPEND_CREATE = 0x441 // O_WRONLY | O_CREAT | O_APPEND
+const O_NONBLOCK = 0x800
+const F_GETFL = 3
+const F_SETFL = 4
+const SOL_SOCKET = 1
+const SO_REUSEADDR = 2
+const SO_REUSEPORT = 15
+const SO_ERROR = 4
+const SO_RCVTIMEO = 20
+const SO_SNDTIMEO = 21
+const TARGET_LINUX = true
+
+var rtTimespec i64   // per core: the timespec clock_gettime fills
+
+func rt_errno() i64 {
+	return i64(i32(__errno_location()[0]))
+}
+
+func rt_clock(id i64) i64 {
+	if rtTimespec == 0 {
+		rtTimespec = rt_ingot_alloc(16)
+	}
+	clock_gettime(id, rtTimespec)
+	return rtTimespec[0]*1000000000 + rtTimespec[1]
+}
+
+// rt_mono_ns is CLOCK_MONOTONIC in nanoseconds.
+func rt_mono_ns() i64 {
+	return rt_clock(1)
+}
+
+// rt_wall_ns is CLOCK_REALTIME in nanoseconds since 1970.
+func rt_wall_ns() i64 {
+	return rt_clock(0)
+}
+
+// rt_random fills n bytes at p from getrandom (which may return fewer bytes per call).
+func rt_random(p i64, n i64) {
+	for n > 0 {
+		k := getrandom(p, n, 0)
+		if k <= 0 {
+			if rt_errno() == EINTR {
+				continue
+			}
+			rt_panic("getrandom failed")
+		}
+		p += k
+		n -= k
+	}
+}
+
+shared var rtPoolChunk i64   // request pool chunk size once a memory limit lowered it (0: the default)
+shared var rtCPUMask i64     // cpu_set_t (128 bytes) of the CPUs this process may run on, set by rt_pin_setup
+shared var rtCPUCount i64    // CPUs set in rtCPUMask
+shared var rtPin bool        // cores pin themselves to one CPU each (rt_pin_setup decided)
+
+// rt_read_file reads up to n-1 bytes of path into buf, NUL-terminated: the length, or -1 when it cannot be opened.
+func rt_read_file(path str, buf i64, n i64) i64 {
+	fd := i64(i32(open(cast(i64, path)+8, 0)))
+	if fd < 0 {
+		return -1
+	}
+	total := 0
+	for total < n-1 {
+		k := read(fd, buf+total, n-1-total)
+		if k <= 0 {
+			break
+		}
+		total += k
+	}
+	close(fd)
+	store8(buf+total, 0)
+	return total
+}
+
+// rt_num_at parses the decimal number after blanks at p: the value (-1 for "max", a negative
+// number or no digits) and the position after it.
+func rt_num_at(p i64) (i64, i64) {
+	for load8(p) == ' ' || load8(p) == '\t' || load8(p) == '\n' {
+		p++
+	}
+	if load8(p) == 'm' {
+		return -1, p + 3
+	}
+	neg := false
+	if load8(p) == '-' {
+		neg = true
+		p++
+	}
+	v := 0
+	nd := 0
+	for load8(p) >= '0' && load8(p) <= '9' {
+		if v < 1<<56 {
+			v = v*10 + i64(load8(p)-'0')
+		}
+		nd++
+		p++
+	}
+	if nd == 0 || neg {
+		return -1, p
+	}
+	return v, p
+}
+
+// rt_read_num reads a file holding one number: the value, or -1 when absent or not a number.
+func rt_read_num(path str, buf i64) i64 {
+	if rt_read_file(path, buf, 128) <= 0 {
+		return -1
+	}
+	v, _ := rt_num_at(buf)
+	return v
+}
+
+// rt_cpu_quota is the cgroup CPU limit rounded up to whole CPUs (v2 cpu.max, else v1
+// cpu.cfs_quota_us / cpu.cfs_period_us): 0 when unlimited or unknown.
+func rt_cpu_quota() i64 {
+	buf := calloc(1, 128)
+	quota := -1
+	period := -1
+	if rt_read_file("/sys/fs/cgroup/cpu.max", buf, 128) > 0 {
+		q, next := rt_num_at(buf)
+		p, _ := rt_num_at(next)
+		quota = q
+		period = p
+	} else {
+		quota = rt_read_num("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", buf)
+		period = rt_read_num("/sys/fs/cgroup/cpu/cpu.cfs_period_us", buf)
+		if quota <= 0 {
+			quota = rt_read_num("/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_quota_us", buf)
+			period = rt_read_num("/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_period_us", buf)
+		}
+	}
+	free(buf)
+	if quota <= 0 || period <= 0 {
+		return 0
+	}
+	return (quota + period - 1) / period
+}
+
+// rt_affinity_count fills the 128-byte cpu_set_t at set with the CPUs this thread may run on
+// and returns how many there are (0 when the call fails).
+func rt_affinity_count(set i64) i64 {
+	memset(set, 0, 128)
+	if i64(i32(sched_getaffinity(0, 128, set))) != 0 {
+		return 0
+	}
+	n := 0
+	for i := 0; i < 128; i++ {
+		b := i64(load8(set + i))
+		for b != 0 {
+			n += b & 1
+			b >>= 1
+		}
+	}
+	return n
+}
+
+// rt_ncpus is the number of CPUs this program may use: online CPUs, capped by the affinity
+// mask (cpuset) and by the cgroup CPU quota; never less than 1.
+func rt_ncpus() i64 {
+	n := sysconf(84) & 0xffffffff
+	if n < 1 {
+		n = 1
+	}
+	set := calloc(1, 128)
+	a := rt_affinity_count(set)
+	free(set)
+	if a > 0 && a < n {
+		n = a
+	}
+	q := rt_cpu_quota()
+	if q > 0 && q < n {
+		n = q
+	}
+	return n
+}
+
+// rt_mem_limit is the cgroup memory limit in bytes (v2 memory.max, else v1
+// memory.limit_in_bytes): 0 when unlimited or unknown.
+func rt_mem_limit() i64 {
+	buf := calloc(1, 128)
+	v := rt_read_num("/sys/fs/cgroup/memory.max", buf)
+	if v < 0 {
+		v = rt_read_num("/sys/fs/cgroup/memory/memory.limit_in_bytes", buf)
+	}
+	free(buf)
+	if v <= 0 || v >= 1<<60 {
+		return 0
+	}
+	return v
+}
+
+// rt_pin_setup (called before cores start) decides whether each core pins itself to one allowed
+// CPU: when the n cores map one-to-one onto the allowed CPUs, or TIN_PIN=1 asks for it and no
+// two cores would have to share a CPU.
+func rt_pin_setup(n i64) {
+	rtPin = false
+	if rtCPUMask == 0 {
+		rtCPUMask = calloc(1, 128)
+	}
+	allowed := rt_affinity_count(rtCPUMask)
+	rtCPUCount = allowed
+	if allowed <= 0 || n > allowed {
+		return
+	}
+	env := getenv(cast(i64, "TIN_PIN") + 8)
+	rtPin = n == allowed || (env != 0 && load8(env) == '1')
+}
+
+// rt_sig_block_term blocks SIGTERM and SIGINT in the calling thread; threads it creates inherit
+// the mask, so a server can take the signals from a descriptor instead of a handler.
+func rt_sig_block_term() {
+	set := calloc(1, 128)
+	set[0] = 1<<14 | 1<<1
+	pthread_sigmask(0, set, 0)
+	free(set)
+}
+
+// rt_signalfd returns a non-blocking descriptor that turns readable when a (blocked) SIGTERM or
+// SIGINT arrives; reading 128 bytes from it takes the signal (its number is the first u32).
+func rt_signalfd() i64 {
+	set := calloc(1, 128)
+	set[0] = 1<<14 | 1<<1
+	fd := i64(i32(signalfd(-1, set, 0x800|0x80000)))
+	free(set)
+	return fd
+}
+
+func rt_sockaddr_in(sa i64, ip i64, port i64) {
+	memset(sa, 0, 16)
+	__st(sa, 2, 1)
+	store8(sa+2, port>>8)
+	store8(sa+3, port&255)
+	store8(sa+4, (ip>>24)&255)
+	store8(sa+5, (ip>>16)&255)
+	store8(sa+6, (ip>>8)&255)
+	store8(sa+7, ip&255)
+}
+
+func rt_ai_addr(ai i64) i64 {
+	return (ai + 24)[0]
+}
+
+// rt_nosigpipe: Linux has no per-socket flag, so SIGPIPE is ignored process-wide.
+func rt_nosigpipe(fd i64) {
+	signal(13, 1)
+}
+
+// struct stat on arm64 Linux (st_mode is a u32 at 16; the other fields match x86-64).
+func rt_stat_mode(st i64) i64 {
+	return __ld(st+16, 2) & 0xffffffff
+}
+
+func rt_stat_size(st i64) i64 {
+	return (st + 48)[0]
+}
+
+func rt_stat_mtime(st i64) i64 {
+	return (st + 88)[0]
+}
+
+func rt_stat_dev(st i64) i64 {
+	return st[0]
+}
+
+func rt_stat_ino(st i64) i64 {
+	return (st + 8)[0]
+}
+
+func rt_dirent_name(ent i64) str {
+	return rt_str_from_raw(ent+19, strlen(ent+19))
+}
+
+// rt_core_qos pins core id to the id-th allowed CPU when rt_pin_setup decided to pin.
+func rt_core_qos(id i64) {
+	if !rtPin || rtCPUMask == 0 {
+		return
+	}
+	cpu := -1
+	seen := 0
+	for i := 0; i < 1024 && cpu < 0; i++ {
+		if (i64(load8(rtCPUMask+i/8))>>(i%8))&1 != 0 {
+			if seen == id {
+				cpu = i
+			}
+			seen++
+		}
+	}
+	if cpu < 0 {
+		return
+	}
+	set := calloc(1, 128)
+	store8(set+cpu/8, 1<<(cpu%8))
+	sched_setaffinity(0, 128, set)
+	free(set)
+}

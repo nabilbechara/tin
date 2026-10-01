@@ -1,0 +1,74 @@
+// Package hearth runs a program on every core: one thread per core, each with its own
+// globals, request pool and ingot heap. Cores share nothing; relay carries messages.
+package hearth
+
+extern func usleep(us i64) i64
+
+// Cores is the number of CPUs this program may use: the CPUs online, capped on Linux by the
+// affinity mask (cpuset) and the cgroup CPU quota (ceil of cpu.max quota/period); never 0.
+func Cores() i64 {
+	n := rt_ncpus()
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
+// MemLimit is the memory limit in bytes the container (cgroup) imposes: 0 when there is none.
+func MemLimit() i64 {
+	return rt_mem_limit()
+}
+
+// ID is the current core's number: 0 for the main core.
+func ID() i64 {
+	return rt_core_id()
+}
+
+// Run starts entry(i) on cores 1..n-1, runs entry(0) here, then waits for every core. Before
+// starting it sizes the request pools to the memory limit and decides whether cores pin
+// themselves to CPUs (only when they map one-to-one onto the allowed CPUs, or TIN_PIN=1).
+func Run(n i64, entry func(i64)) {
+	rt_pin_setup(n)
+	pool_tune(n)
+	for i := 1; i < n; i++ {
+		rt_spawn_core(entry, i)
+	}
+	if n > 1 {
+		rt_core_qos(0)
+	}
+	entry(0)
+	for __atomic_load(&rtCoresDone) < n-1 {
+		usleep(200)
+	}
+}
+
+// pool_tune lowers the per-core request pool chunk (4 MiB by default) when n of them would take
+// more than a quarter of the memory limit; the runtime reads rtPoolChunk when it is not 0.
+func pool_tune(n i64) {
+	limit := rt_mem_limit()
+	if limit <= 0 || n < 1 {
+		return
+	}
+	budget := limit / 4
+	if n*chunkSize <= budget {
+		return
+	}
+	c := budget / n / 65536 * 65536
+	if c < 65536 {
+		c = 65536
+	}
+	rtPoolChunk = c
+}
+
+// PoolChunk is the request pool chunk size in bytes each core uses (after pool_tune).
+func PoolChunk() i64 {
+	if rtPoolChunk != 0 {
+		return rtPoolChunk
+	}
+	return chunkSize
+}
+
+// Reset ends the current request: the core's pool is emptied for the next one.
+func Reset() {
+	rt_pool_reset()
+}

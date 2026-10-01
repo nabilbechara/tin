@@ -1,0 +1,428 @@
+// Types. Every Tin value is one 64-bit word at run time; its static type decides which
+// instructions and runtime calls the compiler uses on it. Reference types (string,
+// struct, slice, map, func, error, chan) are pointers, and 0 is their nil.
+
+const TY_KIND = 0;
+const TY_ELEM = 1;     // slice/chan element, map value
+const TY_KEY = 2;      // map key
+const TY_FIELDS = 3;   // struct: vec of [name, type]; func: param types
+const TY_RESULTS = 4;  // func: result types
+const TY_NAME = 5;     // display name
+const TY_VARIADIC = 6;
+const TY_WIDTH = 7;    // integers: size in bytes (1, 2, 4, 8)
+const TY_SIGNED = 8;   // integers: 1 when signed
+const TY_SIZE = 9;     // structs: object size in bytes
+const TY_TARGS = 10;   // generic instance: its type arguments
+const TY_GDECL = 11;   // generic instance: its declaration
+
+const K_INT = 1;
+const K_BOOL = 2;
+const K_BYTE = 3;
+const K_FLOAT = 4;
+const K_STRING = 5;
+const K_STRUCT = 6;
+const K_SLICE = 7;
+const K_MAP = 8;
+const K_FUNC = 9;
+const K_VOID = 10;
+const K_TUPLE = 11;
+const K_NIL = 12;
+const K_UINT = 13;     // untyped integer constant
+const K_UFLOAT = 14;   // untyped float constant
+const K_ERROR = 15;
+const K_CHAN = 16;
+const K_UBOOL = 17;    // untyped boolean (comparison results, true/false)
+const K_OPT = 18;      // ?T: a struct reference that may be nil
+
+var ty_int;
+var ty_bool;
+var ty_byte;
+var ty_float;
+var ty_string;
+var ty_void;
+var ty_nil;
+var ty_uint;
+var ty_ufloat;
+var ty_ubool;
+var ty_error;
+var ty_i8;
+var ty_i16;
+var ty_i32;
+var ty_u16;
+var ty_u32;
+var ty_u64;
+var ty_interned;   // slice, map, chan and func types, shared by structure
+var ty_named;      // [qualified name, type]
+
+fn ty_new(kind, name) {
+    let t = calloc(12, 8);
+    t[TY_KIND] = kind;
+    t[TY_NAME] = name;
+    t[TY_WIDTH] = 8;
+    return t;
+}
+
+fn int_type(name, width, signed) {
+    let t = ty_new(K_INT, name);
+    t[TY_WIDTH] = width;
+    t[TY_SIGNED] = signed;
+    name_type(name, t);
+    return t;
+}
+
+fn types_init() {
+    ty_named = vec_new();
+    ty_interned = vec_new();
+    ty_int = int_type("i64", 8, 1);
+    ty_i8 = int_type("i8", 1, 1);
+    ty_i16 = int_type("i16", 2, 1);
+    ty_i32 = int_type("i32", 4, 1);
+    ty_byte = int_type("u8", 1, 0);
+    ty_u16 = int_type("u16", 2, 0);
+    ty_u32 = int_type("u32", 4, 0);
+    ty_u64 = int_type("u64", 8, 0);
+    ty_bool = ty_new(K_BOOL, "bool");
+    ty_bool[TY_WIDTH] = 1;
+    ty_float = ty_new(K_FLOAT, "f64");
+    ty_string = ty_new(K_STRING, "str");
+    ty_void = ty_new(K_VOID, "void");
+    ty_nil = ty_new(K_NIL, "nil");
+    ty_uint = ty_new(K_UINT, "untyped int");
+    ty_ufloat = ty_new(K_UFLOAT, "untyped float");
+    ty_ubool = ty_new(K_UBOOL, "untyped bool");
+    ty_error = ty_new(K_ERROR, "fault");
+    name_type("bool", ty_bool);
+    name_type("f64", ty_float);
+    name_type("str", ty_string);
+    name_type("fault", ty_error);
+}
+
+fn name_type(name, t) {
+    let rec = vec_new();
+    vec_push(rec, name);
+    vec_push(rec, t);
+    vec_push(ty_named, rec);
+}
+
+fn find_type(name) {
+    let i = ty_named[VEC_LEN] - 1;
+    while i >= 0 {
+        let rec = vec_get(ty_named, i);
+        if streq(vec_get(rec, 0), name) {
+            return vec_get(rec, 1);
+        }
+        i = i - 1;
+    }
+    return 0;
+}
+
+fn types_equal_vec(a, b) {
+    if a[VEC_LEN] != b[VEC_LEN] {
+        return 0;
+    }
+    let i = 0;
+    while i < a[VEC_LEN] {
+        if vec_get(a, i) != vec_get(b, i) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// interned returns the shared type with this structure, creating it on first use.
+fn interned(kind, elem, key, params, results, variadic) {
+    let i = 0;
+    while i < ty_interned[VEC_LEN] {
+        let t = vec_get(ty_interned, i);
+        if t[TY_KIND] == kind && t[TY_ELEM] == elem && t[TY_KEY] == key && t[TY_VARIADIC] == variadic {
+            if kind != K_FUNC || (types_equal_vec(t[TY_FIELDS], params) && types_equal_vec(t[TY_RESULTS], results)) {
+                return t;
+            }
+        }
+        i = i + 1;
+    }
+    let n = ty_new(kind, 0);
+    n[TY_ELEM] = elem;
+    n[TY_KEY] = key;
+    n[TY_FIELDS] = params;
+    n[TY_RESULTS] = results;
+    n[TY_VARIADIC] = variadic;
+    vec_push(ty_interned, n);
+    return n;
+}
+
+fn slice_of(elem) {
+    return interned(K_SLICE, elem, 0, 0, 0, 0);
+}
+
+fn map_of(key, val) {
+    return interned(K_MAP, val, key, 0, 0, 0);
+}
+
+fn chan_of(elem) {
+    return interned(K_CHAN, elem, 0, 0, 0, 0);
+}
+
+fn opt_of(elem) {
+    return interned(K_OPT, elem, 0, 0, 0, 0);
+}
+
+fn func_of(params, results, variadic) {
+    return interned(K_FUNC, 0, 0, params, results, variadic);
+}
+
+fn tuple_of(types) {
+    let t = ty_new(K_TUPLE, 0);
+    t[TY_FIELDS] = types;
+    return t;
+}
+
+fn kind_of(t) {
+    if !t {
+        return K_INT;
+    }
+    return t[TY_KIND];
+}
+
+fn is_float_t(t) {
+    let k = kind_of(t);
+    return k == K_FLOAT || k == K_UFLOAT;
+}
+
+fn is_integer_t(t) {
+    let k = kind_of(t);
+    return k == K_INT || k == K_UINT;
+}
+
+fn is_unsigned_t(t) {
+    return t && t[TY_KIND] == K_INT && !t[TY_SIGNED];
+}
+
+// type_width is a value's size in memory: struct fields and slice elements use it.
+fn type_width(t) {
+    if !t {
+        return 8;
+    }
+    let k = t[TY_KIND];
+    if k == K_INT || k == K_BOOL {
+        return t[TY_WIDTH];
+    }
+    return 8;
+}
+
+fn width_log2(w) {
+    if w == 1 {
+        return 0;
+    }
+    if w == 2 {
+        return 1;
+    }
+    if w == 4 {
+        return 2;
+    }
+    return 3;
+}
+
+fn is_numeric_t(t) {
+    return is_integer_t(t) || is_float_t(t);
+}
+
+fn is_bool_t(t) {
+    let k = kind_of(t);
+    return k == K_BOOL || k == K_UBOOL;
+}
+
+fn is_untyped(t) {
+    let k = kind_of(t);
+    return k == K_UINT || k == K_UFLOAT || k == K_UBOOL || k == K_NIL;
+}
+
+// nilable types may hold nil: optionals, faults and channels. References are never nil.
+fn nilable(t) {
+    let k = kind_of(t);
+    return k == K_OPT || k == K_ERROR || k == K_NIL || k == K_FUNC;
+}
+
+// is_ref reports whether values of t are pointers to heap or static memory.
+fn is_ref(t) {
+    let k = kind_of(t);
+    return k == K_STRING || k == K_STRUCT || k == K_SLICE || k == K_MAP || k == K_FUNC || k == K_ERROR || k == K_CHAN || k == K_OPT;
+}
+
+// default_type is the type an untyped constant gets when nothing else decides it.
+fn default_type(t) {
+    let k = kind_of(t);
+    if k == K_UINT {
+        return ty_int;
+    }
+    if k == K_UFLOAT {
+        return ty_float;
+    }
+    if k == K_UBOOL {
+        return ty_bool;
+    }
+    return t;
+}
+
+// assignable reports whether a value of type from can be stored where to is expected.
+fn assignable(from, to) {
+    if from == to || !to {
+        return 1;
+    }
+    let fk = kind_of(from);
+    let tk = kind_of(to);
+    if fk == K_UINT {
+        return tk == K_INT || tk == K_FLOAT;
+    }
+    if tk == K_OPT && from == to[TY_ELEM] {
+        return 1;
+    }
+    if fk == K_UFLOAT {
+        return tk == K_FLOAT;
+    }
+    if fk == K_UBOOL {
+        return tk == K_BOOL;
+    }
+    if fk == K_NIL {
+        return nilable(to);
+    }
+    return 0;
+}
+
+fn type_name(b, t) {
+    if !t {
+        buf_str(b, "int");
+        return;
+    }
+    let k = t[TY_KIND];
+    if t[TY_NAME] {
+        buf_str(b, t[TY_NAME]);
+    } else if k == K_SLICE {
+        buf_str(b, "[]");
+        type_name(b, t[TY_ELEM]);
+    } else if k == K_CHAN {
+        buf_str(b, "chan ");
+        type_name(b, t[TY_ELEM]);
+    } else if k == K_OPT {
+        buf_byte(b, '?');
+        type_name(b, t[TY_ELEM]);
+    } else if k == K_MAP {
+        buf_str(b, "map[");
+        type_name(b, t[TY_KEY]);
+        buf_byte(b, ']');
+        type_name(b, t[TY_ELEM]);
+    } else if k == K_FUNC || k == K_TUPLE {
+        if k == K_FUNC {
+            buf_str(b, "func");
+        }
+        buf_byte(b, '(');
+        let ps = t[TY_FIELDS];
+        let i = 0;
+        while i < ps[VEC_LEN] {
+            if i > 0 {
+                buf_str(b, ", ");
+            }
+            type_name(b, vec_get(ps, i));
+            i = i + 1;
+        }
+        buf_byte(b, ')');
+        if k == K_FUNC && t[TY_RESULTS][VEC_LEN] == 1 {
+            buf_byte(b, ' ');
+            type_name(b, vec_get(t[TY_RESULTS], 0));
+        } else if k == K_FUNC && t[TY_RESULTS][VEC_LEN] > 1 {
+            buf_byte(b, ' ');
+            type_name(b, tuple_of(t[TY_RESULTS]));
+        }
+    } else {
+        buf_str(b, "?");
+    }
+}
+
+// struct_field returns the index of field name in struct type t, or -1.
+fn struct_field(t, name) {
+    let fs = t[TY_FIELDS];
+    let i = 0;
+    while i < fs[VEC_LEN] {
+        if streq(vec_get(vec_get(fs, i), 0), name) {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn field_type(t, i) {
+    return vec_get(vec_get(t[TY_FIELDS], i), 1);
+}
+
+fn field_offset(t, i) {
+    return vec_get(vec_get(t[TY_FIELDS], i), 2);
+}
+
+// layout_struct assigns field offsets: widest fields first, each naturally aligned, so
+// structs pack without padding holes; the object size rounds up to 8.
+fn layout_struct(t) {
+    let fs = t[TY_FIELDS];
+    let off = 0;
+    let w = 8;
+    while w >= 1 {
+        let i = 0;
+        while i < fs[VEC_LEN] {
+            let f = vec_get(fs, i);
+            if type_width(vec_get(f, 1)) == w {
+                while f[VEC_LEN] < 3 {
+                    vec_push(f, 0);
+                }
+                f[VEC_DATA][2] = off;
+                off = off + w;
+            }
+            i = i + 1;
+        }
+        w = w / 2;
+    }
+    t[TY_SIZE] = align_up(off + (off == 0), 8);
+}
+
+// elem_size is the size in bytes of one slice element.
+fn elem_size(t) {
+    return type_width(t[TY_ELEM]);
+}
+
+// int_to_float_bits converts an integer constant to IEEE-754 bits, rounding to nearest even.
+fn int_to_float_bits(v) {
+    if v == 0 {
+        return 0;
+    }
+    let sign = 0;
+    let m = v;
+    if v < 0 {
+        sign = 1;
+        m = -v;
+    }
+    // m is now the magnitude, read as unsigned (the most negative int stays 2^63).
+    let top = 63;
+    while ((m >> top) & 1) == 0 {
+        top = top - 1;
+    }
+    let mant = 0;
+    if top <= 52 {
+        mant = m << (52 - top);
+    } else {
+        let shift = top - 52;
+        mant = (m >> shift) & ((1 << (64 - shift)) - 1);
+        if shift == 63 {
+            mant = 1;
+        }
+        let rest = m & ((1 << shift) - 1);
+        let half = 1 << (shift - 1);
+        if rest > half || (rest == half && (mant & 1)) {
+            mant = mant + 1;
+            if mant == (1 << 53) {
+                mant = mant >> 1;
+                top = top + 1;
+            }
+        }
+    }
+    return (sign << 63) | ((top + 1023) << 52) | (mant & ((1 << 52) - 1));
+}

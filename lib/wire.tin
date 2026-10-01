@@ -1,0 +1,638 @@
+// Package wire is TCP networking and a small HTTP/1.1 client. Calls block the calling
+// core (servers should use anvil); every connection can carry a read/write timeout.
+//
+//	c := try wire.Dial("127.0.0.1:6379")
+//	try c.Write("PING\r\n")
+//	r := try wire.Get("http://127.0.0.1:8080/json")
+package wire
+
+import "say"
+
+extern func socket(domain i64, typ i64, proto i64) i64
+extern func connect(fd i64, addr i64, n i64) i64
+extern func setsockopt(fd i64, level i64, name i64, val i64, n i64) i64
+extern func getsockopt(fd i64, level i64, name i64, val i64, n i64) i64
+extern func getsockname(fd i64, addr i64, n i64) i64
+extern func bind(fd i64, addr i64, n i64) i64
+extern func listen(fd i64, backlog i64) i64
+extern func accept(fd i64, addr i64, n i64) i64
+extern func close(fd i64) i64
+extern func fcntl(fd i64, cmd i64, ...) i64
+extern func poll(fds i64, n i64, timeout i64) i64
+extern func getaddrinfo(node i64, service i64, hints i64, res i64) i64
+extern func freeaddrinfo(res i64)
+extern func strerror(e i64) i64
+
+// Conn is a TCP connection.
+type Conn struct {
+	fd     i64
+	closed bool
+}
+
+// Listener accepts TCP connections.
+type Listener struct {
+	fd   i64
+	port i64
+}
+
+// Resp is an HTTP response.
+type Resp struct {
+	Status i64
+	Body   str
+	head   str
+}
+
+func errno() i64 {
+	return rt_errno()
+}
+
+func os_fault(what str) fault {
+	m := strerror(errno())
+	return say.Fault("wire: %s: %s", what, rt_str_from_raw(m, strlen(m)))
+}
+
+// EOF is the fault Read returns at the end of the stream.
+func IsEOF(err fault) bool {
+	return err != nil && say.Str(err) == "EOF"
+}
+
+// split_addr cuts "host:port" (host may be empty).
+func split_addr(addr str) (str, i64, fault) {
+	colon := -1
+	for i := 0; i < len(addr); i++ {
+		if addr[i] == ':' {
+			colon = i
+		}
+	}
+	if colon < 0 || colon == len(addr)-1 {
+		return "", 0, say.Fault("wire: address %q needs a port", addr)
+	}
+	port := 0
+	for i := colon + 1; i < len(addr); i++ {
+		c := addr[i]
+		if c < '0' || c > '9' || port > 65535 {
+			return "", 0, say.Fault("wire: bad port in %q", addr)
+		}
+		port = port*10 + i64(c-'0')
+	}
+	if port > 65535 {
+		return "", 0, say.Fault("wire: bad port in %q", addr)
+	}
+	return addr[:colon], port, nil
+}
+
+// resolve fills a sockaddr_in for host (dotted IPv4, "localhost" or a DNS name).
+func resolve(host str, port i64, sa i64) fault {
+	rt_sockaddr_in(sa, 0, port)
+	if host == "" || host == "localhost" {
+		if host == "localhost" {
+			rt_sockaddr_in(sa, 0x7f000001, port)
+		}
+		return nil
+	}
+	parts := 0
+	val := 0
+	octets := calloc(1, 8)
+	dotted := true
+	for i := 0; i < len(host); i++ {
+		c := host[i]
+		if c == '.' {
+			if parts >= 3 || val > 255 {
+				dotted = false
+				break
+			}
+			store8(octets+parts, val)
+			parts++
+			val = 0
+		} else if c >= '0' && c <= '9' {
+			val = val*10 + i64(c-'0')
+		} else {
+			dotted = false
+			break
+		}
+	}
+	if dotted && parts == 3 && val <= 255 {
+		store8(octets+3, val)
+		memcpy(sa+4, octets, 4)
+		free(octets)
+		return nil
+	}
+	free(octets)
+	hints := calloc(1, 48)
+	__st(hints+4, 2, 2)
+	__st(hints+8, 1, 2)
+	res := calloc(1, 8)
+	rc := i64(i32(getaddrinfo(cast(i64, host)+8, 0, hints, res)))
+	free(hints)
+	if rc != 0 || res[0] == 0 {
+		free(res)
+		return say.Fault("wire: cannot resolve %q", host)
+	}
+	ai := res[0]
+	addr := rt_ai_addr(ai)
+	memcpy(sa+4, addr+4, 4)
+	freeaddrinfo(ai)
+	free(res)
+	return nil
+}
+
+// Dial connects to "host:port".
+func Dial(addr str) (Conn, fault) {
+	return DialTimeout(addr, 0)
+}
+
+// DialTimeout connects to "host:port", giving up after timeout nanoseconds (0: no limit).
+func DialTimeout(addr str, timeout i64) (Conn, fault) {
+	none := Conn{fd: -1, closed: true}
+	host, port, err := split_addr(addr)
+	if err != nil {
+		return none, err
+	}
+	sa := calloc(1, 16)
+	defer free(sa)
+	e2 := resolve(host, port, sa)
+	if e2 != nil {
+		return none, e2
+	}
+	fd := i64(i32(socket(2, 1, 0)))
+	if fd < 0 {
+		return none, os_fault("socket")
+	}
+	one := calloc(1, 8)
+	one[0] = 1
+	rt_nosigpipe(fd)
+	setsockopt(fd, 6, 1, one, 4)
+	free(one)
+	if timeout <= 0 {
+		if i64(i32(connect(fd, sa, 16))) < 0 {
+			f := os_fault(say.Fmt("connect %s", addr))
+			close(fd)
+			return none, f
+		}
+		return Conn{fd: fd}, nil
+	}
+	flags := i64(i32(fcntl(fd, F_GETFL, 0)))
+	fcntl(fd, F_SETFL, flags|O_NONBLOCK)
+	if i64(i32(connect(fd, sa, 16))) < 0 {
+		if errno() != EINPROGRESS {
+			f2 := os_fault(say.Fmt("connect %s", addr))
+			close(fd)
+			return none, f2
+		}
+		pfd := calloc(1, 8)
+		__st(pfd, fd, 2)
+		__st(pfd+4, 4, 1)
+		ready := i64(i32(poll(pfd, 1, timeout/1000000)))
+		free(pfd)
+		if ready <= 0 {
+			close(fd)
+			return none, say.Fault("wire: connect %s: timed out", addr)
+		}
+		soerr := calloc(1, 8)
+		ln := calloc(1, 8)
+		ln[0] = 4
+		getsockopt(fd, SOL_SOCKET, SO_ERROR, soerr, ln)
+		code := i64(i32(soerr[0]))
+		free(soerr)
+		free(ln)
+		if code != 0 {
+			m := strerror(code)
+			close(fd)
+			return none, say.Fault("wire: connect %s: %s", addr, rt_str_from_raw(m, strlen(m)))
+		}
+	}
+	fcntl(fd, F_SETFL, flags)
+	return Conn{fd: fd}, nil
+}
+
+// SetTimeout limits every later read and write to ns nanoseconds (0: no limit).
+func (c Conn) SetTimeout(ns i64) {
+	tv := calloc(1, 16)
+	tv[0] = ns / 1000000000
+	__st(tv+8, (ns%1000000000)/1000, 2)
+	setsockopt(c.fd, SOL_SOCKET, SO_RCVTIMEO, tv, 16)
+	setsockopt(c.fd, SOL_SOCKET, SO_SNDTIMEO, tv, 16)
+	free(tv)
+}
+
+// SetNoDelay turns Nagle's algorithm off (true) or on.
+func (c Conn) SetNoDelay(on bool) {
+	v := calloc(1, 8)
+	if on {
+		v[0] = 1
+	}
+	setsockopt(c.fd, 6, 1, v, 4)
+	free(v)
+}
+
+// WriteRaw sends n bytes at p.
+func (c Conn) write_raw(p i64, n i64) fault {
+	if c.closed {
+		return fail("wire: write on a closed connection")
+	}
+	for n > 0 {
+		k := write(c.fd, p, n)
+		if k < 0 {
+			e := errno()
+			if e == 4 {
+				continue
+			}
+			if e == EAGAIN {
+				return fail("wire: write timed out")
+			}
+			return os_fault("write")
+		}
+		p += k
+		n -= k
+	}
+	return nil
+}
+
+// Write sends all of s.
+func (c Conn) Write(s str) fault {
+	return c.write_raw(cast(i64, s)+8, len(s))
+}
+
+// WriteBytes sends all of b.
+func (c Conn) WriteBytes(b []u8) fault {
+	return c.write_raw(cast(i64, b)[2], len(b))
+}
+
+// Read appends up to max bytes to buf and returns how many; at the end it returns 0 and EOF.
+func (c Conn) Read(buf mut []u8, max i64) (i64, fault) {
+	if c.closed {
+		return 0, fail("wire: read on a closed connection")
+	}
+	h := cast(i64, buf)
+	if h[0]+max > h[1] {
+		rt_slice_grow(h, h[0]+max, 1)
+	}
+	for {
+		k := read(c.fd, h[2]+h[0], max)
+		if k > 0 {
+			h[0] += k
+			return k, nil
+		}
+		if k == 0 {
+			return 0, fail("EOF")
+		}
+		e := errno()
+		if e == 4 {
+			continue
+		}
+		if e == EAGAIN {
+			return 0, fail("wire: read timed out")
+		}
+		return 0, os_fault("read")
+	}
+}
+
+// ReadFull reads exactly n bytes.
+func (c Conn) ReadFull(n i64) (str, fault) {
+	b := make([]u8, 0, n)
+	for len(b) < n {
+		_, err := c.Read(b, n-len(b))
+		if err != nil {
+			return "", err
+		}
+	}
+	return str(b), nil
+}
+
+// Close closes the connection.
+func (c mut Conn) Close() {
+	if !c.closed {
+		close(c.fd)
+		c.closed = true
+	}
+}
+
+// Listen opens a TCP listener on "host:port" (":0" picks a free port: see Port).
+func Listen(addr str) (Listener, fault) {
+	none := Listener{fd: -1}
+	host, port, err := split_addr(addr)
+	if err != nil {
+		return none, err
+	}
+	sa := calloc(1, 16)
+	defer free(sa)
+	e2 := resolve(host, port, sa)
+	if e2 != nil {
+		return none, e2
+	}
+	fd := i64(i32(socket(2, 1, 0)))
+	if fd < 0 {
+		return none, os_fault("socket")
+	}
+	one := calloc(1, 8)
+	one[0] = 1
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, one, 4)
+	free(one)
+	if i64(i32(bind(fd, sa, 16))) < 0 {
+		f := os_fault(say.Fmt("bind %s", addr))
+		close(fd)
+		return none, f
+	}
+	if i64(i32(listen(fd, 1024))) < 0 {
+		f2 := os_fault("listen")
+		close(fd)
+		return none, f2
+	}
+	ln := calloc(1, 8)
+	ln[0] = 16
+	getsockname(fd, sa, ln)
+	free(ln)
+	return Listener{fd: fd, port: i64(load8(sa+2))<<8 | i64(load8(sa+3))}, nil
+}
+
+// Port is the port the listener is bound to.
+func (l Listener) Port() i64 {
+	return l.port
+}
+
+// Accept waits for the next connection.
+func (l Listener) Accept() (Conn, fault) {
+	for {
+		fd := i64(i32(accept(l.fd, 0, 0)))
+		if fd >= 0 {
+			one := calloc(1, 8)
+			one[0] = 1
+			rt_nosigpipe(fd)
+			setsockopt(fd, 6, 1, one, 4)
+			free(one)
+			return Conn{fd: fd}, nil
+		}
+		if errno() != 4 {
+			return Conn{fd: -1, closed: true}, os_fault("accept")
+		}
+	}
+}
+
+// Close stops listening.
+func (l mut Listener) Close() {
+	if l.fd >= 0 {
+		close(l.fd)
+		l.fd = -1
+	}
+}
+
+// ---- HTTP client ----
+
+// Get fetches url.
+func Get(url str) (Resp, fault) {
+	return Do("GET", url, []str{}, "")
+}
+
+// Post sends body with content type ctype to url.
+func Post(url str, ctype str, body str) (Resp, fault) {
+	return Do("POST", url, []str{"Content-Type", ctype}, body)
+}
+
+func none_resp() Resp {
+	return Resp{Body: "", head: ""}
+}
+
+// Do sends one request: headers is a list of name, value pairs.
+func Do(method str, url str, headers []str, body str) (Resp, fault) {
+	if len(url) < 7 || url[:7] != "http://" {
+		if len(url) >= 8 && url[:8] == "https://" {
+			return none_resp(), fail("wire: https is not supported yet")
+		}
+		return none_resp(), say.Fault("wire: %q is not an http:// URL", url)
+	}
+	rest := url[7:]
+	slash := len(rest)
+	for i := 0; i < len(rest); i++ {
+		if rest[i] == '/' || rest[i] == '?' {
+			slash = i
+			break
+		}
+	}
+	hostport := rest[:slash]
+	path := "/"
+	if slash < len(rest) {
+		path = rest[slash:]
+		if path[0] == '?' {
+			path = "/" + path
+		}
+	}
+	addr := hostport
+	hasport := false
+	for i := 0; i < len(hostport); i++ {
+		if hostport[i] == ':' {
+			hasport = true
+		}
+	}
+	if !hasport {
+		addr = hostport + ":80"
+	}
+	c := try Dial(addr)
+	defer c.Close()
+	req := make([]u8, 0, 256+len(body))
+	req = append(req, method...)
+	req = append(req, ' ')
+	req = append(req, path...)
+	req = append(req, " HTTP/1.1\r\nHost: "...)
+	req = append(req, hostport...)
+	req = append(req, "\r\nUser-Agent: tin-wire\r\nConnection: close\r\n"...)
+	for i := 0; i+1 < len(headers); i += 2 {
+		req = append(req, headers[i]...)
+		req = append(req, ": "...)
+		req = append(req, headers[i+1]...)
+		req = append(req, "\r\n"...)
+	}
+	if len(body) > 0 || method == "POST" || method == "PUT" {
+		req = append(req, "Content-Length: "...)
+		req = append(req, say.Str(len(body))...)
+		req = append(req, "\r\n"...)
+	}
+	req = append(req, "\r\n"...)
+	req = append(req, body...)
+	try c.WriteBytes(req)
+	r, err := read_response(c, method == "HEAD")
+	return r, err
+}
+
+func find_crlf2(b []u8) i64 {
+	for i := 3; i < len(b); i++ {
+		if b[i] == '\n' && b[i-1] == '\r' && b[i-2] == '\n' && b[i-3] == '\r' {
+			return i + 1
+		}
+	}
+	return -1
+}
+
+func read_response(c Conn, head bool) (Resp, fault) {
+	buf := make([]u8, 0, 4096)
+	hend := -1
+	for hend < 0 {
+		_, err := c.Read(buf, 4096)
+		if err != nil {
+			if IsEOF(err) {
+				return none_resp(), fail("wire: connection closed before the response headers")
+			}
+			return none_resp(), err
+		}
+		hend = find_crlf2(buf)
+		if hend < 0 && len(buf) > 1048576 {
+			return none_resp(), fail("wire: response headers too large")
+		}
+	}
+	h := str(buf[:hend])
+	if len(h) < 12 || h[:5] != "HTTP/" {
+		return none_resp(), fail("wire: malformed response")
+	}
+	status := 0
+	for i := 9; i < 12; i++ {
+		d := h[i]
+		if d < '0' || d > '9' {
+			return none_resp(), fail("wire: malformed status line")
+		}
+		status = status*10 + i64(d-'0')
+	}
+	r := Resp{Status: status, Body: "", head: h}
+	rest := buf[hend:]
+	if head || status == 204 || status == 304 || (status >= 100 && status < 200) {
+		return r, nil
+	}
+	te := r.Header("Transfer-Encoding")
+	if te == "chunked" {
+		b := try read_chunked(c, rest)
+		r.Body = b
+		return r, nil
+	}
+	cl := r.Header("Content-Length")
+	if cl != "" {
+		n := 0
+		for i := 0; i < len(cl); i++ {
+			d := cl[i]
+			if d < '0' || d > '9' {
+				return none_resp(), fail("wire: bad Content-Length")
+			}
+			n = n*10 + i64(d-'0')
+		}
+		body := make([]u8, 0, n)
+		body = append(body, rest...)
+		for len(body) < n {
+			_, err := c.Read(body, n-len(body))
+			if err != nil {
+				return none_resp(), err
+			}
+		}
+		r.Body = str(body[:n])
+		return r, nil
+	}
+	body2 := make([]u8, 0, 4096)
+	body2 = append(body2, rest...)
+	for {
+		_, err := c.Read(body2, 65536)
+		if err != nil {
+			if IsEOF(err) {
+				break
+			}
+			return none_resp(), err
+		}
+	}
+	r.Body = str(body2)
+	return r, nil
+}
+
+// read_chunked decodes a chunked body; pending holds bytes already read.
+func read_chunked(c Conn, pending []u8) (str, fault) {
+	buf := make([]u8, 0, len(pending)+4096)
+	buf = append(buf, pending...)
+	out := make([]u8, 0, 4096)
+	pos := 0
+	for {
+		// The chunk-size line.
+		nl := -1
+		for nl < 0 {
+			for i := pos; i < len(buf); i++ {
+				if buf[i] == '\n' {
+					nl = i
+					break
+				}
+			}
+			if nl < 0 {
+				_, err := c.Read(buf, 4096)
+				if err != nil {
+					return "", err
+				}
+			}
+		}
+		size := 0
+		for i := pos; i < nl; i++ {
+			d := buf[i]
+			v := -1
+			if d >= '0' && d <= '9' {
+				v = i64(d - '0')
+			} else if d >= 'a' && d <= 'f' {
+				v = i64(d-'a') + 10
+			} else if d >= 'A' && d <= 'F' {
+				v = i64(d-'A') + 10
+			}
+			if v < 0 {
+				break
+			}
+			size = size*16 + v
+		}
+		pos = nl + 1
+		if size == 0 {
+			return str(out), nil
+		}
+		for len(buf) < pos+size+2 {
+			_, err := c.Read(buf, pos+size+2-len(buf))
+			if err != nil {
+				return "", err
+			}
+		}
+		out = append(out, buf[pos:pos+size]...)
+		pos = pos + size + 2
+	}
+}
+
+// Header returns the response header name (any case), or "".
+func (r Resp) Header(name str) str {
+	h := r.head
+	i := 0
+	for i < len(h) {
+		j := i
+		for j < len(h) && h[j] != '\n' {
+			j++
+		}
+		line := h[i:j]
+		if len(line) > 0 && line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+		}
+		if len(line) > len(name) && line[len(name)] == ':' && fold_eq(line[:len(name)], name) {
+			v := line[len(name)+1:]
+			k := 0
+			for k < len(v) && (v[k] == ' ' || v[k] == '\t') {
+				k++
+			}
+			return v[k:]
+		}
+		i = j + 1
+	}
+	return ""
+}
+
+func fold_eq(a str, b str) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		x := a[i]
+		y := b[i]
+		if x >= 'A' && x <= 'Z' {
+			x += 32
+		}
+		if y >= 'A' && y <= 'Z' {
+			y += 32
+		}
+		if x != y {
+			return false
+		}
+	}
+	return true
+}

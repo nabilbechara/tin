@@ -1,0 +1,535 @@
+// Package argo writes JSON. argo.Put(b, v) appends v to the []u8 buffer b; the compiler
+// generates a dedicated encoder for v's type (fields in declaration order, no reflection,
+// no allocation). The w* writers below are what those encoders call.
+package argo
+
+import "say"
+
+const hexDigits = "0123456789abcdef"
+
+// Put appends v as JSON to b. The compiler replaces every call with a typed encoder.
+func Put(b mut []u8, v i64) {
+	wint(b, v)
+}
+
+// Str appends s as a JSON string.
+func Str(b mut []u8, s str) {
+	wstr(b, s)
+}
+
+// Raw appends already-encoded JSON text.
+func Raw(b mut []u8, s str) {
+	rt_append_str(cast(i64, b), s)
+}
+
+func wroom(h i64, n i64) {
+	if h[0]+n > h[1] {
+		rt_slice_grow(h, h[0]+n, 1)
+	}
+}
+
+func wstr(b mut []u8, s str) {
+	h := cast(i64, b)
+	n := len(s)
+	p := cast(i64, s) + 8
+	if h[0]+n+2 > h[1] {
+		rt_slice_grow(h, h[0]+n+2, 1)
+	}
+	d := h[2] + h[0]
+	store8(d, '"')
+	// Copy 8 bytes at a time while none needs escaping (control bytes, '"' and '\\').
+	i := 0
+	for i+8 <= n {
+		w := u64(__ld(p+i, 3))
+		lo := (w - 0x2020202020202020) & ^w
+		q := w ^ 0x2222222222222222
+		bs := w ^ 0x5c5c5c5c5c5c5c5c
+		hit := (lo | ((q - 0x0101010101010101) & ^q) | ((bs - 0x0101010101010101) & ^bs)) & 0x8080808080808080
+		if hit != 0 {
+			break
+		}
+		__st(d+1+i, i64(w), 3)
+		i += 8
+	}
+	for i < n {
+		c := load8(p + i)
+		if c < 0x20 || c == '"' || c == '\\' {
+			break
+		}
+		store8(d+1+i, i64(c))
+		i++
+	}
+	if i == n {
+		store8(d+1+n, '"')
+		h[0] += n + 2
+		return
+	}
+	h[0] += 1 + i
+	for i < n {
+		c := load8(p + i)
+		wroom(h, 7)
+		d = h[2] + h[0]
+		if c == '"' || c == '\\' {
+			store8(d, '\\')
+			store8(d+1, c)
+			h[0] += 2
+		} else if c == '\n' {
+			store8(d, '\\')
+			store8(d+1, 'n')
+			h[0] += 2
+		} else if c == '\r' {
+			store8(d, '\\')
+			store8(d+1, 'r')
+			h[0] += 2
+		} else if c == '\t' {
+			store8(d, '\\')
+			store8(d+1, 't')
+			h[0] += 2
+		} else if c < 0x20 {
+			store8(d, '\\')
+			store8(d+1, 'u')
+			store8(d+2, '0')
+			store8(d+3, '0')
+			store8(d+4, load8(cast(i64, hexDigits)+8+i64(c>>4)))
+			store8(d+5, load8(cast(i64, hexDigits)+8+i64(c&15)))
+			h[0] += 6
+		} else {
+			store8(d, c)
+			h[0]++
+		}
+		i++
+	}
+	wroom(h, 1)
+	store8(h[2]+h[0], '"')
+	h[0]++
+}
+
+func wuint(b mut []u8, v u64) {
+	h := cast(i64, b)
+	wroom(h, 21)
+	n := 1
+	for t := v; t >= 10; t /= 10 {
+		n++
+	}
+	d := h[2] + h[0]
+	for i := n - 1; i >= 0; i-- {
+		store8(d+i, '0'+i64(v%10))
+		v /= 10
+	}
+	h[0] += n
+}
+
+func wint(b mut []u8, v i64) {
+	if v < 0 {
+		h := cast(i64, b)
+		wroom(h, 1)
+		store8(h[2]+h[0], '-')
+		h[0]++
+		wuint(b, u64(0-v))
+		return
+	}
+	wuint(b, u64(v))
+}
+
+func wbool(b mut []u8, v bool) {
+	if v {
+		rt_append_str(cast(i64, b), "true")
+	} else {
+		rt_append_str(cast(i64, b), "false")
+	}
+}
+
+func wfloat(b mut []u8, v f64) {
+	if v != v || v > 1.7976931348623157e308 || v < -1.7976931348623157e308 {
+		rt_append_str(cast(i64, b), "null")
+		return
+	}
+	h := cast(i64, b)
+	if h[0]+40 > h[1] {
+		rt_slice_grow(h, h[0]+40, 1)
+	}
+	h[0] += shortest_into(h[2]+h[0], v, -6, 21, true, false)
+}
+
+// ---- decoding ----
+//
+// argo.Get(s, v) fills v (a struct, slice or map) from the JSON text s and returns a fault
+// for malformed input or a type mismatch. The compiler generates a decoder per type; it
+// calls the r* readers below, which record the first error in the Parser and then do
+// nothing, so decoders only test p.err at loop boundaries.
+
+type Parser struct {
+	s   str
+	i   i64
+	err fault
+}
+
+func parser(s str) Parser {
+	return Parser{s: s}
+}
+
+func finish(p mut Parser) fault {
+	if p.err != nil {
+		return p.err
+	}
+	ws(p)
+	if p.i < len(p.s) {
+		return say.Fault("argo: unexpected %q after the value at offset %d", str(p.s[p.i]), p.i)
+	}
+	return nil
+}
+
+func bad(p mut Parser, what str) {
+	if p.err == nil {
+		if p.i < len(p.s) {
+			p.err = say.Fault("argo: expected %s at offset %d, found %q", what, p.i, str(p.s[p.i]))
+		} else {
+			p.err = say.Fault("argo: expected %s, found the end of the input", what)
+		}
+	}
+	p.i = len(p.s)
+}
+
+func ws(p mut Parser) {
+	s := p.s
+	i := p.i
+	for i < len(s) {
+		c := s[i]
+		if c != ' ' && c != '\n' && c != '\r' && c != '\t' {
+			break
+		}
+		i++
+	}
+	p.i = i
+}
+
+// robj consumes '{' and reports whether a member follows ('}' right away is consumed).
+func robj(p mut Parser) bool {
+	ws(p)
+	if p.i >= len(p.s) || p.s[p.i] != '{' {
+		bad(p, "an object")
+		return false
+	}
+	p.i++
+	ws(p)
+	if p.i < len(p.s) && p.s[p.i] == '}' {
+		p.i++
+		return false
+	}
+	return true
+}
+
+// rarr consumes '[' and reports whether an element follows.
+func rarr(p mut Parser) bool {
+	ws(p)
+	if p.i >= len(p.s) || p.s[p.i] != '[' {
+		bad(p, "an array")
+		return false
+	}
+	p.i++
+	ws(p)
+	if p.i < len(p.s) && p.s[p.i] == ']' {
+		p.i++
+		return false
+	}
+	return true
+}
+
+// rmore consumes ',' (true: another member follows) or the closing byte (false).
+func rmore(p mut Parser, close u8) bool {
+	ws(p)
+	if p.i < len(p.s) {
+		c := p.s[p.i]
+		if c == ',' {
+			p.i++
+			return true
+		}
+		if c == close {
+			p.i++
+			return false
+		}
+	}
+	bad(p, "',' or the end of the object or array")
+	return false
+}
+
+// rkey reads a member name and its ':'.
+func rkey(p mut Parser) str {
+	k := rstr(p)
+	ws(p)
+	if p.i >= len(p.s) || p.s[p.i] != ':' {
+		bad(p, "':'")
+		return ""
+	}
+	p.i++
+	return k
+}
+
+// rnull consumes null if it is next.
+func rnull(p mut Parser) bool {
+	ws(p)
+	s := p.s
+	i := p.i
+	if i+4 <= len(s) && s[i] == 'n' && s[i+1] == 'u' && s[i+2] == 'l' && s[i+3] == 'l' {
+		p.i = i + 4
+		return true
+	}
+	return false
+}
+
+func hex4(s str, i i64) i64 {
+	v := 0
+	for k := 0; k < 4; k++ {
+		c := s[i+k]
+		d := -1
+		if c >= '0' && c <= '9' {
+			d = i64(c - '0')
+		} else if c >= 'a' && c <= 'f' {
+			d = i64(c-'a') + 10
+		} else if c >= 'A' && c <= 'F' {
+			d = i64(c-'A') + 10
+		}
+		if d < 0 {
+			return -1
+		}
+		v = v*16 + d
+	}
+	return v
+}
+
+func rstr(p mut Parser) str {
+	ws(p)
+	s := p.s
+	i := p.i
+	if i >= len(s) || s[i] != '"' {
+		bad(p, "a string")
+		return ""
+	}
+	i++
+	start := i
+	for i < len(s) {
+		c := s[i]
+		if c == '"' {
+			p.i = i + 1
+			return s[start:i]
+		}
+		if c == '\\' || c < 0x20 {
+			break
+		}
+		i++
+	}
+	b := make([]u8, 0, i-start+16)
+	b = append(b, s[start:i]...)
+	for i < len(s) {
+		c := s[i]
+		if c == '"' {
+			p.i = i + 1
+			return str(b)
+		}
+		if c < 0x20 {
+			p.i = i
+			bad(p, "an escaped control character")
+			return ""
+		}
+		if c != '\\' {
+			b = append(b, c)
+			i++
+			continue
+		}
+		if i+1 >= len(s) {
+			break
+		}
+		e := s[i+1]
+		i += 2
+		if e == 'n' {
+			b = append(b, '\n')
+		} else if e == 't' {
+			b = append(b, '\t')
+		} else if e == 'r' {
+			b = append(b, '\r')
+		} else if e == 'b' {
+			b = append(b, 8)
+		} else if e == 'f' {
+			b = append(b, 12)
+		} else if e == '"' || e == '\\' || e == '/' {
+			b = append(b, e)
+		} else if e == 'u' && i+4 <= len(s) && hex4(s, i) >= 0 {
+			r := hex4(s, i)
+			i += 4
+			if r >= 0xD800 && r < 0xDC00 && i+6 <= len(s) && s[i] == '\\' && s[i+1] == 'u' && hex4(s, i+2) >= 0xDC00 && hex4(s, i+2) < 0xE000 {
+				r = 0x10000 + (r-0xD800)<<10 + (hex4(s, i+2) - 0xDC00)
+				i += 6
+			}
+			b = append(b, str(i32(r))...)
+		} else {
+			p.i = i - 2
+			bad(p, "a valid escape")
+			return ""
+		}
+	}
+	p.i = len(s)
+	bad(p, "a closing '\"'")
+	return ""
+}
+
+func rint(p mut Parser) i64 {
+	ws(p)
+	s := p.s
+	i := p.i
+	neg := false
+	if i < len(s) && s[i] == '-' {
+		neg = true
+		i++
+	}
+	if i >= len(s) || s[i] < '0' || s[i] > '9' {
+		bad(p, "an integer")
+		return 0
+	}
+	v := u64(0)
+	top := ^u64(0)
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		d := u64(s[i] - '0')
+		if v > (top-d)/10 {
+			bad(p, "an integer that fits in 64 bits")
+			return 0
+		}
+		v = v*10 + d
+		i++
+	}
+	if i < len(s) && (s[i] == '.' || s[i] == 'e' || s[i] == 'E') {
+		bad(p, "an integer (not a fraction)")
+		return 0
+	}
+	if neg {
+		if v > u64(9223372036854775807)+1 {
+			bad(p, "an integer that fits in i64")
+			return 0
+		}
+		p.i = i
+		return 0 - i64(v)
+	}
+	if v > u64(9223372036854775807) {
+		bad(p, "an integer that fits in i64")
+		return 0
+	}
+	p.i = i
+	return i64(v)
+}
+
+// rintr reads an integer within [lo, hi] (for the sized integer types).
+func rintr(p mut Parser, lo i64, hi i64) i64 {
+	at := p.i
+	v := rint(p)
+	if p.err == nil && (v < lo || v > hi) {
+		p.i = at
+		ws(p)
+		bad(p, say.Fmt("an integer in [%d, %d]", lo, hi))
+		return 0
+	}
+	return v
+}
+
+func ruint(p mut Parser) u64 {
+	ws(p)
+	if p.i < len(p.s) && p.s[p.i] == '-' {
+		bad(p, "an unsigned integer")
+		return 0
+	}
+	s := p.s
+	i := p.i
+	if i >= len(s) || s[i] < '0' || s[i] > '9' {
+		bad(p, "an unsigned integer")
+		return 0
+	}
+	v := u64(0)
+	top := ^u64(0)
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		d := u64(s[i] - '0')
+		if v > (top-d)/10 {
+			bad(p, "an integer that fits in 64 bits")
+			return 0
+		}
+		v = v*10 + d
+		i++
+	}
+	p.i = i
+	return v
+}
+
+func rfloat(p mut Parser) f64 {
+	ws(p)
+	s := p.s
+	i := p.i
+	start := i
+	if i < len(s) && s[i] == '-' {
+		i++
+	}
+	digits := 0
+	for i < len(s) && ((s[i] >= '0' && s[i] <= '9') || s[i] == '.' || s[i] == 'e' || s[i] == 'E' || s[i] == '+' || s[i] == '-') {
+		i++
+		digits++
+	}
+	if digits == 0 {
+		bad(p, "a number")
+		return 0
+	}
+	t := s[start:i]
+	p.i = i
+	return strtod(cast(i64, t)+8, 0)
+}
+
+func rbool(p mut Parser) bool {
+	ws(p)
+	s := p.s
+	i := p.i
+	if i+4 <= len(s) && s[i] == 't' && s[i+1] == 'r' && s[i+2] == 'u' && s[i+3] == 'e' {
+		p.i = i + 4
+		return true
+	}
+	if i+5 <= len(s) && s[i] == 'f' && s[i+1] == 'a' && s[i+2] == 'l' && s[i+3] == 's' && s[i+4] == 'e' {
+		p.i = i + 5
+		return false
+	}
+	bad(p, "true or false")
+	return false
+}
+
+// rskip skips any value (an unknown member).
+func rskip(p mut Parser) {
+	ws(p)
+	if p.i >= len(p.s) {
+		bad(p, "a value")
+		return
+	}
+	c := p.s[p.i]
+	if c == '"' {
+		rstr(p)
+	} else if c == '{' {
+		if robj(p) {
+			for p.err == nil {
+				rkey(p)
+				rskip(p)
+				if !rmore(p, '}') {
+					break
+				}
+			}
+		}
+	} else if c == '[' {
+		if rarr(p) {
+			for p.err == nil {
+				rskip(p)
+				if !rmore(p, ']') {
+					break
+				}
+			}
+		}
+	} else if c == 't' || c == 'f' {
+		rbool(p)
+	} else if c == 'n' {
+		if !rnull(p) {
+			bad(p, "a value")
+		}
+	} else {
+		rfloat(p)
+	}
+}

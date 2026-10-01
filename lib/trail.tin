@@ -1,0 +1,446 @@
+// Package trail manipulates slash-separated file paths (like Go's path/filepath on Unix).
+package trail
+
+import "glyph"
+import "say"
+
+// Separator is the path separator byte.
+const Separator = '/'
+
+// Clean returns the shortest path equivalent to path by Go's rules: no "." or ".." elements where avoidable, no repeated or trailing slashes, "." for an empty path.
+func Clean(path str) str {
+	n := len(path)
+	if n == 0 {
+		return "."
+	}
+	rooted := path[0] == '/'
+	p := rt_str_new(n)
+	d := p + 8
+	w := 0
+	r := 0
+	dotdot := 0
+	if rooted {
+		store8(d, '/')
+		w = 1
+		r = 1
+		dotdot = 1
+	}
+	for r < n {
+		if path[r] == '/' {
+			r++
+		} else if path[r] == '.' && (r+1 == n || path[r+1] == '/') {
+			r++
+		} else if path[r] == '.' && path[r+1] == '.' && (r+2 == n || path[r+2] == '/') {
+			r += 2
+			if w > dotdot {
+				w--
+				for w > dotdot && load8(d+w) != '/' {
+					w--
+				}
+			} else if !rooted {
+				if w > 0 {
+					store8(d+w, '/')
+					w++
+				}
+				store8(d+w, '.')
+				store8(d+w+1, '.')
+				w += 2
+				dotdot = w
+			}
+		} else {
+			if (rooted && w != 1) || (!rooted && w != 0) {
+				store8(d+w, '/')
+				w++
+			}
+			for r < n && path[r] != '/' {
+				store8(d+w, i64(path[r]))
+				w++
+				r++
+			}
+		}
+	}
+	if w == 0 {
+		return "."
+	}
+	if w == n {
+		return path
+	}
+	p[0] = w
+	store8(d+w, 0)
+	return cast(str, p)
+}
+
+// IsAbs reports whether path starts with a slash.
+func IsAbs(path str) bool {
+	return len(path) > 0 && path[0] == '/'
+}
+
+// Base returns the last element of path after dropping trailing slashes: "." for an empty path, "/" for all slashes.
+func Base(path str) str {
+	n := len(path)
+	if n == 0 {
+		return "."
+	}
+	end := n
+	for end > 0 && path[end-1] == '/' {
+		end--
+	}
+	if end == 0 {
+		return "/"
+	}
+	i := end - 1
+	for i >= 0 && path[i] != '/' {
+		i--
+	}
+	return path[i+1 : end]
+}
+
+// Dir returns Clean of everything but the last element of path: "." when there is no slash.
+func Dir(path str) str {
+	i := len(path) - 1
+	for i >= 0 && path[i] != '/' {
+		i--
+	}
+	return Clean(path[0 : i+1])
+}
+
+// Ext returns the suffix of path's last element from its final dot, or "".
+func Ext(path str) str {
+	for i := len(path) - 1; i >= 0 && path[i] != '/'; i-- {
+		if path[i] == '.' {
+			return path[i:len(path)]
+		}
+	}
+	return ""
+}
+
+// Split splits path right after its last slash into (dir, file); dir keeps the slash.
+func Split(path str) (str, str) {
+	i := len(path) - 1
+	for i >= 0 && path[i] != '/' {
+		i--
+	}
+	return path[0 : i+1], path[i+1 : len(path)]
+}
+
+// JoinAll joins the non-empty parts with slashes and Cleans the result; "" when every part is empty.
+func JoinAll(parts []str) str {
+	first := 0
+	for first < len(parts) && len(parts[first]) == 0 {
+		first++
+	}
+	if first == len(parts) {
+		return ""
+	}
+	total := 0
+	for i := first; i < len(parts); i++ {
+		total += len(parts[i]) + 1
+	}
+	b := make([]u8, 0, total)
+	for i := first; i < len(parts); i++ {
+		if i > first {
+			b = append(b, '/')
+		}
+		b = append(b, parts[i]...)
+	}
+	return Clean(str(b))
+}
+
+// Join2 joins two path elements like Go's filepath.Join(a, b).
+func Join2(a str, b str) str {
+	if len(a) == 0 {
+		if len(b) == 0 {
+			return ""
+		}
+		return Clean(b)
+	}
+	if len(b) == 0 {
+		return Clean(a)
+	}
+	return Clean(a + "/" + b)
+}
+
+// Join3 joins three path elements like Go's filepath.Join(a, b, c).
+func Join3(a str, b str, c str) str {
+	return JoinAll([]str{a, b, c})
+}
+
+// Rel returns a relative path that is lexically equivalent to targ when joined to base, or a fault when one is absolute and the other is not or base holds "..".
+func Rel(base str, targ str) (str, fault) {
+	b := Clean(base)
+	t := Clean(targ)
+	if b == t {
+		return ".", nil
+	}
+	if b == "." {
+		b = ""
+	}
+	bs := len(b) > 0 && b[0] == '/'
+	ts := len(t) > 0 && t[0] == '/'
+	if bs != ts {
+		return "", say.Fault("Rel: can't make %s relative to %s", targ, base)
+	}
+	bl := len(b)
+	tl := len(t)
+	b0 := 0
+	bi := 0
+	t0 := 0
+	ti := 0
+	for {
+		for bi < bl && b[bi] != '/' {
+			bi++
+		}
+		for ti < tl && t[ti] != '/' {
+			ti++
+		}
+		if !sameRange(t, t0, ti, b, b0, bi) {
+			break
+		}
+		if bi < bl {
+			bi++
+		}
+		if ti < tl {
+			ti++
+		}
+		b0 = bi
+		t0 = ti
+	}
+	if bi-b0 == 2 && b[b0] == '.' && b[b0+1] == '.' {
+		return "", say.Fault("Rel: can't make %s relative to %s", targ, base)
+	}
+	if b0 != bl {
+		seps := 0
+		for i := b0; i < bl; i++ {
+			if b[i] == '/' {
+				seps++
+			}
+		}
+		size := 2 + seps*3
+		if tl != t0 {
+			size += 1 + tl - t0
+		}
+		p := rt_str_new(size)
+		d := p + 8
+		store8(d, '.')
+		store8(d+1, '.')
+		n := 2
+		for i := 0; i < seps; i++ {
+			store8(d+n, '/')
+			store8(d+n+1, '.')
+			store8(d+n+2, '.')
+			n += 3
+		}
+		if t0 != tl {
+			store8(d+n, '/')
+			memcpy(d+n+1, cast(i64, t)+8+t0, tl-t0)
+		}
+		return cast(str, p), nil
+	}
+	return t[t0:tl], nil
+}
+
+// sameRange reports whether a[alo:ahi] and b[blo:bhi] hold the same bytes.
+func sameRange(a str, alo i64, ahi i64, b str, blo i64, bhi i64) bool {
+	if ahi-alo != bhi-blo {
+		return false
+	}
+	for i := 0; i < ahi-alo; i++ {
+		if a[alo+i] != b[blo+i] {
+			return false
+		}
+	}
+	return true
+}
+
+// Match reports whether name matches the shell pattern: '*' (no slash), '?', '[a-z]', '[^x]' and '\' escapes, like Go's filepath.Match.
+func Match(pattern str, name str) (bool, fault) {
+	pi := 0
+	ni := 0
+	pn := len(pattern)
+	for pi < pn {
+		star := false
+		for pi < pn && pattern[pi] == '*' {
+			pi++
+			star = true
+		}
+		clo := pi
+		pi = chunkEnd(pattern, pi)
+		chi := pi
+		if star && clo == chi {
+			for i := ni; i < len(name); i++ {
+				if name[i] == '/' {
+					return false, nil
+				}
+			}
+			return true, nil
+		}
+		t, ok, bad := matchChunk(pattern, clo, chi, name, ni)
+		if bad {
+			return false, badPattern()
+		}
+		if ok && (t == len(name) || pi < pn) {
+			ni = t
+			continue
+		}
+		matched := false
+		if star {
+			for i := ni; i < len(name) && name[i] != '/'; i++ {
+				t2, ok2, bad2 := matchChunk(pattern, clo, chi, name, i+1)
+				if bad2 {
+					return false, badPattern()
+				}
+				if ok2 && (pi < pn || t2 == len(name)) {
+					ni = t2
+					matched = true
+					break
+				}
+			}
+		}
+		if matched {
+			continue
+		}
+		for pi < pn {
+			for pi < pn && pattern[pi] == '*' {
+				pi++
+			}
+			c0 := pi
+			pi = chunkEnd(pattern, pi)
+			_, _, bad3 := matchChunk(pattern, c0, pi, "", 0)
+			if bad3 {
+				return false, badPattern()
+			}
+		}
+		return false, nil
+	}
+	return ni == len(name), nil
+}
+
+// badPattern is the fault for a malformed pattern.
+func badPattern() fault {
+	return fail("syntax error in pattern")
+}
+
+// chunkEnd returns the end of the chunk starting at i: the next unescaped '*' outside brackets, or len.
+func chunkEnd(pattern str, i i64) i64 {
+	inrange := false
+	n := len(pattern)
+	for i < n {
+		c := pattern[i]
+		if c == '\\' {
+			if i+1 < n {
+				i++
+			}
+		} else if c == '[' {
+			inrange = true
+		} else if c == ']' {
+			inrange = false
+		} else if c == '*' && !inrange {
+			break
+		}
+		i++
+	}
+	return i
+}
+
+// matchChunk matches pattern[clo:chi] at s[si:], returning (end of the match in s, matched, bad pattern).
+func matchChunk(pattern str, clo i64, chi i64, s str, si i64) (i64, bool, bool) {
+	failed := false
+	ci := clo
+	for ci < chi {
+		if !failed && si >= len(s) {
+			failed = true
+		}
+		c := pattern[ci]
+		if c == '[' {
+			r := i32(0)
+			if !failed {
+				r2, w := glyph.DecodeRune(s, si)
+				r = r2
+				si += w
+			}
+			ci++
+			negated := false
+			if ci < chi && pattern[ci] == '^' {
+				negated = true
+				ci++
+			}
+			match := false
+			nrange := 0
+			for {
+				if ci < chi && pattern[ci] == ']' && nrange > 0 {
+					ci++
+					break
+				}
+				lo, next, bad := getEsc(pattern, ci, chi)
+				if bad {
+					return 0, false, true
+				}
+				ci = next
+				hi := lo
+				if pattern[ci] == '-' {
+					hi2, next2, bad2 := getEsc(pattern, ci+1, chi)
+					if bad2 {
+						return 0, false, true
+					}
+					hi = hi2
+					ci = next2
+				}
+				if lo <= r && r <= hi {
+					match = true
+				}
+				nrange++
+			}
+			if match == negated {
+				failed = true
+			}
+		} else if c == '?' {
+			if !failed {
+				if s[si] == '/' {
+					failed = true
+				}
+				_, w := glyph.DecodeRune(s, si)
+				si += w
+			}
+			ci++
+		} else {
+			if c == '\\' {
+				ci++
+				if ci >= chi {
+					return 0, false, true
+				}
+				c = pattern[ci]
+			}
+			if !failed {
+				if c != s[si] {
+					failed = true
+				}
+				si++
+			}
+			ci++
+		}
+	}
+	if failed {
+		return 0, false, false
+	}
+	return si, true, false
+}
+
+// getEsc reads one possibly escaped class character at pattern[i], returning (rune, next index, bad pattern).
+func getEsc(pattern str, i i64, chi i64) (i32, i64, bool) {
+	if i >= chi || pattern[i] == '-' || pattern[i] == ']' {
+		return 0, i, true
+	}
+	if pattern[i] == '\\' {
+		i++
+		if i >= chi {
+			return 0, i, true
+		}
+	}
+	r, w := glyph.DecodeRune(pattern, i)
+	bad := i64(r) == glyph.RuneError && w == 1
+	i += w
+	if i >= chi {
+		bad = true
+	}
+	return r, i, bad
+}

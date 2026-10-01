@@ -1,0 +1,579 @@
+// Package lever parses command-line flags (like Go's flag): register handles, Parse the arguments, then read .Val().
+package lever
+
+import "say"
+
+const kindStr = 0
+const kindInt = 1
+const kindBool = 2
+const kindF64 = 3
+
+// Flag is one registered flag; the typed handles below wrap it.
+type Flag struct {
+	name  str
+	help  str
+	kind  i64
+	def   str
+	sval  str
+	ival  i64
+	bval  bool
+	fval  f64
+	given bool
+}
+
+// StrFlag is the handle of a string flag.
+type StrFlag struct {
+	f Flag
+}
+
+// IntFlag is the handle of an integer flag.
+type IntFlag struct {
+	f Flag
+}
+
+// BoolFlag is the handle of a boolean flag.
+type BoolFlag struct {
+	f Flag
+}
+
+// F64Flag is the handle of a floating-point flag.
+type F64Flag struct {
+	f Flag
+}
+
+var flags []Flag
+var rest []str
+var parsed bool
+
+// register adds a flag to the registry (in the long-lived heap) and returns it; a repeated name panics like Go.
+func register(name str, help str, kind i64, def str) Flag {
+	for _, f := range flags {
+		if f.name == name {
+			panic("lever: flag redefined: " + name)
+		}
+	}
+	flags = append(flags, keep(Flag{name: name, help: help, kind: kind, def: def, sval: def}))
+	return flags[len(flags)-1]
+}
+
+// Str registers a string flag with its default and help text.
+func Str(name str, def str, help str) StrFlag {
+	return StrFlag{f: register(name, help, kindStr, def)}
+}
+
+// Int registers an integer flag with its default and help text.
+func Int(name str, def i64, help str) IntFlag {
+	f := register(name, help, kindInt, say.Str(def))
+	f.ival = def
+	return IntFlag{f: f}
+}
+
+// Bool registers a boolean flag with its default and help text.
+func Bool(name str, def bool, help str) BoolFlag {
+	f := register(name, help, kindBool, say.Str(def))
+	f.bval = def
+	return BoolFlag{f: f}
+}
+
+// F64 registers a floating-point flag with its default and help text.
+func F64(name str, def f64, help str) F64Flag {
+	f := register(name, help, kindF64, say.Str(def))
+	f.fval = def
+	return F64Flag{f: f}
+}
+
+// Val returns the flag's value (its default until Parse sets it).
+func (h StrFlag) Val() str {
+	return h.f.sval
+}
+
+// Val returns the flag's value (its default until Parse sets it).
+func (h IntFlag) Val() i64 {
+	return h.f.ival
+}
+
+// Val returns the flag's value (its default until Parse sets it).
+func (h BoolFlag) Val() bool {
+	return h.f.bval
+}
+
+// Val returns the flag's value (its default until Parse sets it).
+func (h F64Flag) Val() f64 {
+	return h.f.fval
+}
+
+// Given reports whether the flag appeared on the command line.
+func (h StrFlag) Given() bool {
+	return h.f.given
+}
+
+// Given reports whether the flag appeared on the command line.
+func (h IntFlag) Given() bool {
+	return h.f.given
+}
+
+// Given reports whether the flag appeared on the command line.
+func (h BoolFlag) Given() bool {
+	return h.f.given
+}
+
+// Given reports whether the flag appeared on the command line.
+func (h F64Flag) Given() bool {
+	return h.f.given
+}
+
+// Reset forgets every registered flag and parse result (for programs that parse several times).
+func Reset() {
+	flags = make([]Flag, 0)
+	rest = make([]str, 0)
+	parsed = false
+}
+
+// Rest returns the arguments left after the flags (empty before Parse).
+func Rest() []str {
+	return rest
+}
+
+// Parsed reports whether Parse has run.
+func Parsed() bool {
+	return parsed
+}
+
+// lookup returns the flag named name, or nil.
+func lookup(name str) ?Flag {
+	for _, f := range flags {
+		if f.name == name {
+			return f
+		}
+	}
+	return nil
+}
+
+// setValue parses value into f, returning Go's flag error text on failure.
+func setValue(f Flag, name str, value str) fault {
+	switch f.kind {
+	case kindStr:
+		f.sval = keep(value)
+	case kindInt:
+		v, code := parseInt(value)
+		if code != 0 {
+			return say.Fault("invalid value %q for flag -%s: %s", value, name, numErr(code))
+		}
+		f.ival = v
+	case kindBool:
+		v, ok := parseBool(value)
+		if !ok {
+			return say.Fault("invalid boolean value %q for -%s: parse error", value, name)
+		}
+		f.bval = v
+	case kindF64:
+		v, code := parseFloat(value)
+		if code != 0 {
+			return say.Fault("invalid value %q for flag -%s: %s", value, name, numErr(code))
+		}
+		f.fval = v
+	}
+	f.given = true
+	return nil
+}
+
+// numErr is Go's text for a number parse failure code: 1 syntax, 2 range.
+func numErr(code i64) str {
+	if code == 2 {
+		return "value out of range"
+	}
+	return "parse error"
+}
+
+// Set assigns value to the flag named name as if it were given on the command line.
+func Set(name str, value str) fault {
+	f := lookup(name)
+	if f == nil {
+		return say.Fault("no such flag -%s", name)
+	}
+	return setValue(f, name, value)
+}
+
+// Parse reads flags from args (without the program name) until the first non-flag or "--"; the rest is kept for Rest().
+func Parse(args []str) fault {
+	parsed = true
+	i := 0
+	n := len(args)
+	for i < n {
+		s := args[i]
+		if len(s) < 2 || s[0] != '-' {
+			break
+		}
+		minuses := 1
+		if s[1] == '-' {
+			minuses = 2
+			if len(s) == 2 {
+				i++
+				break
+			}
+		}
+		if len(s) == minuses || s[minuses] == '-' || s[minuses] == '=' {
+			return say.Fault("bad flag syntax: %s", s)
+		}
+		i++
+		name := s[minuses:len(s)]
+		value := ""
+		hasValue := false
+		for j := 1; j < len(name); j++ {
+			if name[j] == '=' {
+				value = name[j+1 : len(name)]
+				hasValue = true
+				name = name[0:j]
+				break
+			}
+		}
+		f := lookup(name)
+		if f == nil {
+			if name == "help" || name == "h" {
+				return fail("flag: help requested")
+			}
+			return say.Fault("flag provided but not defined: -%s", name)
+		}
+		if f.kind == kindBool {
+			if !hasValue {
+				value = "true"
+			}
+			try setValue(f, name, value)
+			continue
+		}
+		if !hasValue {
+			if i >= n {
+				return say.Fault("flag needs an argument: -%s", name)
+			}
+			value = args[i]
+			i++
+		}
+		try setValue(f, name, value)
+	}
+	rest = keep(args[i:n])
+	return nil
+}
+
+// parseBool parses a Go boolean literal: 1 t T TRUE true True / 0 f F FALSE false False.
+func parseBool(s str) (bool, bool) {
+	switch s {
+	case "1", "t", "T", "TRUE", "true", "True":
+		return true, true
+	case "0", "f", "F", "FALSE", "false", "False":
+		return false, true
+	}
+	return false, false
+}
+
+// lower lowers an ASCII letter byte.
+func lower(c u8) u8 {
+	return c | 0x20
+}
+
+// underscoreOK reports whether the underscores in s sit only between digits or after a base prefix, like Go.
+func underscoreOK(s str) bool {
+	saw := '^'
+	i := 0
+	n := len(s)
+	if n >= 1 && (s[0] == '-' || s[0] == '+') {
+		i = 1
+	}
+	hex := false
+	if n-i >= 2 && s[i] == '0' && (lower(s[i+1]) == 'b' || lower(s[i+1]) == 'o' || lower(s[i+1]) == 'x') {
+		hex = lower(s[i+1]) == 'x'
+		i += 2
+		saw = '0'
+	}
+	for i < n {
+		c := s[i]
+		if (c >= '0' && c <= '9') || (hex && lower(c) >= 'a' && lower(c) <= 'f') {
+			saw = '0'
+		} else if c == '_' {
+			if saw != '0' {
+				return false
+			}
+			saw = '_'
+		} else if saw == '_' {
+			return false
+		} else {
+			saw = '!'
+		}
+		i++
+	}
+	return saw != '_'
+}
+
+// parseInt parses s like Go's strconv.ParseInt(s, 0, 64): (value, 0), or (0, 1) for a syntax error, (0, 2) when out of range.
+func parseInt(s str) (i64, i64) {
+	n := len(s)
+	if n == 0 {
+		return 0, 1
+	}
+	i := 0
+	neg := false
+	if s[0] == '+' {
+		i = 1
+	} else if s[0] == '-' {
+		neg = true
+		i = 1
+	}
+	if i == n {
+		return 0, 1
+	}
+	base := u64(10)
+	if s[i] == '0' {
+		if n-i >= 3 && lower(s[i+1]) == 'b' {
+			base = 2
+			i += 2
+		} else if n-i >= 3 && lower(s[i+1]) == 'o' {
+			base = 8
+			i += 2
+		} else if n-i >= 3 && lower(s[i+1]) == 'x' {
+			base = 16
+			i += 2
+		} else {
+			base = 8
+			i++
+		}
+	}
+	top := ^u64(0)
+	cutoff := top/base + 1
+	v := u64(0)
+	underscores := false
+	for i < n {
+		c := s[i]
+		i++
+		d := u64(0)
+		if c == '_' {
+			underscores = true
+			continue
+		} else if c >= '0' && c <= '9' {
+			d = u64(c - '0')
+		} else if lower(c) >= 'a' && lower(c) <= 'z' {
+			d = u64(lower(c)-'a') + 10
+		} else {
+			return 0, 1
+		}
+		if d >= base {
+			return 0, 1
+		}
+		if v >= cutoff {
+			return 0, 2
+		}
+		v = v*base + d
+		if v < d {
+			return 0, 2
+		}
+	}
+	if underscores && !underscoreOK(s) {
+		return 0, 1
+	}
+	limit := u64(1) << 63
+	if !neg && v >= limit {
+		return 0, 2
+	}
+	if neg && v > limit {
+		return 0, 2
+	}
+	if neg {
+		return 0 - i64(v), 0
+	}
+	return i64(v), 0
+}
+
+// prefixFold reports whether s[i:] starts with the lower-case ASCII word w, ignoring case.
+func prefixFold(s str, i i64, w str) bool {
+	if len(s)-i < len(w) {
+		return false
+	}
+	for k := 0; k < len(w); k++ {
+		if lower(s[i+k]) != w[k] {
+			return false
+		}
+	}
+	return true
+}
+
+// parseFloat parses s like Go's strconv.ParseFloat(s, 64): (value, 0), or (0, 1) for a syntax error, (±Inf, 2) when out of range.
+func parseFloat(s str) (f64, i64) {
+	n := len(s)
+	if n == 0 {
+		return 0, 1
+	}
+	i := 0
+	neg := false
+	if s[0] == '+' || s[0] == '-' {
+		neg = s[0] == '-'
+		i = 1
+	}
+	if i < n && (s[i] == 'i' || s[i] == 'I') {
+		w := 3
+		if prefixFold(s, i, "infinity") {
+			w = 8
+		} else if !prefixFold(s, i, "inf") {
+			return 0, 1
+		}
+		if i+w != n {
+			return 0, 1
+		}
+		if neg {
+			return -1.0 / 0.0, 0
+		}
+		return 1.0 / 0.0, 0
+	}
+	if i == 0 && n == 3 && prefixFold(s, 0, "nan") {
+		return 0.0 / 0.0, 0
+	}
+	hex := false
+	if i+2 < n && s[i] == '0' && lower(s[i+1]) == 'x' {
+		hex = true
+		i += 2
+	}
+	sawdot := false
+	sawdigits := false
+	underscores := false
+	for i < n {
+		c := s[i]
+		if c == '_' {
+			underscores = true
+		} else if c == '.' {
+			if sawdot {
+				break
+			}
+			sawdot = true
+		} else if c >= '0' && c <= '9' {
+			sawdigits = true
+		} else if hex && lower(c) >= 'a' && lower(c) <= 'f' {
+			sawdigits = true
+		} else {
+			break
+		}
+		i++
+	}
+	if !sawdigits {
+		return 0, 1
+	}
+	expChar := u8('e')
+	if hex {
+		expChar = 'p'
+	}
+	if i < n && lower(s[i]) == expChar {
+		i++
+		if i >= n {
+			return 0, 1
+		}
+		if s[i] == '+' || s[i] == '-' {
+			i++
+		}
+		if i >= n || s[i] < '0' || s[i] > '9' {
+			return 0, 1
+		}
+		for i < n && ((s[i] >= '0' && s[i] <= '9') || s[i] == '_') {
+			if s[i] == '_' {
+				underscores = true
+			}
+			i++
+		}
+	} else if hex {
+		return 0, 1
+	}
+	if i != n {
+		return 0, 1
+	}
+	if underscores {
+		if !underscoreOK(s) {
+			return 0, 1
+		}
+		b := make([]u8, 0, n)
+		for k := 0; k < n; k++ {
+			if s[k] != '_' {
+				b = append(b, s[k])
+			}
+		}
+		s = str(b)
+	}
+	v := strtod(cast(i64, s)+8, 0)
+	if v > 1.7976931348623157e308 || v < -1.7976931348623157e308 {
+		return v, 2
+	}
+	return v, 0
+}
+
+// typeName returns the value name Go prints after a flag in its usage: "" for bool, else int/string/float.
+func typeName(kind i64) str {
+	switch kind {
+	case kindInt:
+		return "int"
+	case kindStr:
+		return "string"
+	case kindF64:
+		return "float"
+	}
+	return ""
+}
+
+// Usage returns the flags sorted by name, each with its value type, help and non-zero default, formatted exactly like Go's PrintDefaults.
+func Usage() str {
+	order := make([]Flag, 0, len(flags))
+	for _, f := range flags {
+		order = append(order, f)
+	}
+	for i := 1; i < len(order); i++ {
+		x := order[i]
+		j := i - 1
+		for j >= 0 && rt_str_cmp(order[j].name, x.name) > 0 {
+			order[j+1] = order[j]
+			j--
+		}
+		order[j+1] = x
+	}
+	b := make([]u8, 0, 256)
+	for _, f := range order {
+		b = append(b, "  -"...)
+		b = append(b, f.name...)
+		name := typeName(f.kind)
+		help := f.help
+		bq := -1
+		for i := 0; i < len(help); i++ {
+			if help[i] == '`' {
+				bq = i
+				break
+			}
+		}
+		if bq >= 0 {
+			for j := bq + 1; j < len(help); j++ {
+				if help[j] == '`' {
+					name = help[bq+1 : j]
+					help = help[0:bq] + name + help[j+1:len(help)]
+					break
+				}
+			}
+		}
+		if len(name) > 0 {
+			b = append(b, ' ')
+			b = append(b, name...)
+		}
+		if len(f.name)+3 <= 4 && len(name) == 0 {
+			b = append(b, '\t')
+		} else {
+			b = append(b, "\n    \t"...)
+		}
+		for i := 0; i < len(help); i++ {
+			if help[i] == '\n' {
+				b = append(b, "\n    \t"...)
+			} else {
+				b = append(b, help[i])
+			}
+		}
+		zero := f.def == "" || f.def == "0" || f.def == "false"
+		if f.kind == kindStr && len(f.def) > 0 {
+			b = append(b, say.Fmt(" (default %q)", f.def)...)
+		} else if f.kind != kindStr && !zero {
+			b = append(b, " (default "...)
+			b = append(b, f.def...)
+			b = append(b, ')')
+		}
+		b = append(b, '\n')
+	}
+	return str(b)
+}

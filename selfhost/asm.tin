@@ -1,0 +1,1041 @@
+// ARM64 instruction list, shared by codegen, the -S text printer and the machine-code encoder.
+// Each instruction is five words: op, a, b, c, d.
+
+const I_LABEL = 1;    // a=label
+const I_FUNC = 2;     // a=fn decl: function entry point
+const I_MOVZ = 3;     // a=rd b=imm16 c=shift
+const I_MOVN = 4;
+const I_MOVK = 5;
+const I_MOV = 6;      // a=rd b=rm
+const I_ADDI = 7;     // a=rd b=rn c=imm12 (rd/rn may be SP)
+const I_SUBI = 8;
+const I_ADD = 9;      // a=rd b=rn c=rm d=shift (SH_* + amount)
+const I_SUB = 10;
+const I_AND = 11;
+const I_ORR = 12;
+const I_EOR = 13;
+const I_ANDI = 14;    // a=rd b=rn c=k: rn & (2^k - 1)
+const I_MUL = 15;     // a=rd b=rn c=rm
+const I_MADD = 16;    // a=rd b=rn c=rm d=ra: ra + rn*rm
+const I_MSUB = 17;    // ra - rn*rm
+const I_SDIV = 18;
+const I_LSLV = 19;
+const I_ASRV = 20;
+const I_LSLI = 21;    // a=rd b=rn c=amount
+const I_ASRI = 22;
+const I_NEG = 23;     // a=rd b=rm
+const I_MVN = 24;
+const I_CMP = 25;     // a=rn b=rm
+const I_CMPI = 26;    // a=rn b=imm12
+const I_CMNI = 27;
+const I_TSTI = 28;    // a=rn b=k: test rn & (2^k - 1)
+const I_CSET = 29;    // a=rd b=cond
+const I_LDR = 30;     // a=rt b=rn c=byte offset (multiple of 8)
+const I_STR = 31;
+const I_LDRX = 32;    // a=rt b=rn c=rm: [rn + rm*8]
+const I_STRX = 33;
+const I_LDRB = 34;    // a=rt b=rn c=byte offset
+const I_STRB = 35;
+const I_LDRBX = 36;   // a=rt b=rn c=rm: [rn + rm]
+const I_STRBX = 37;
+const I_PUSH = 38;    // a=rt: str rt, [sp, #-16]!
+const I_POP = 39;     // a=rt: ldr rt, [sp], #16
+const I_STP = 40;     // a=rt1 b=rt2 c=rn d=offset
+const I_LDP = 41;
+const I_STPPRE = 42;  // a=rt1 b=rt2 c=offset: stp rt1, rt2, [sp, #offset]!
+const I_LDPPOST = 43; // ldp rt1, rt2, [sp], #offset
+const I_B = 44;       // a=label
+const I_BCOND = 45;   // a=cond b=label
+const I_CBZ = 46;     // a=rt b=label
+const I_CBNZ = 47;
+const I_TBZ = 48;     // a=rt b=bit c=label
+const I_TBNZ = 49;
+const I_BL = 50;      // a=fn decl
+const I_RET = 51;     // pseudo until finish_fn expands the epilogue, then a real ret
+const I_ADRP = 52;    // a=rd b=sym
+const I_ADDLO = 53;   // a=rd b=rn c=sym: add rd, rn, sym@PAGEOFF
+const I_LDRLO = 54;   // a=rt b=rn c=sym
+const I_STRLO = 55;
+const I_RETX = 56;    // the real ret instruction
+const I_CSEL = 57;    // a=rd b=rn c=rm d=cond: rd = cond ? rn : rm
+const I_PRFM = 58;    // a=prfop b=rn c=rm: prefetch [rn + rm*8]
+// Floating point: d registers are numbered FPR + n.
+const I_FADD = 60;    // a=dd b=dn c=dm
+const I_FSUB = 61;
+const I_FMUL = 62;
+const I_FDIV = 63;
+const I_FMADD = 64;   // a=dd b=dn c=dm d=da: da + dn*dm
+const I_FMSUB = 65;   // da - dn*dm
+const I_FNEG = 66;    // a=dd b=dn
+const I_FMOV = 67;
+const I_FMOVDX = 68;  // a=dd b=xn: move bits into a d register
+const I_FMOVXD = 69;  // a=xd b=dn
+const I_SCVTF = 70;   // a=dd b=xn
+const I_FCVTZS = 71;  // a=xd b=dn
+const I_FCMP = 72;    // a=dn b=dm
+const I_FCMPZ = 73;   // a=dn
+const I_LDRD = 74;    // a=dt b=xn c=offset
+const I_STRD = 75;
+const I_LDRDX = 76;   // a=dt b=xn c=xm: [xn + xm*8]
+const I_STRDX = 77;
+const I_FPUSH = 78;
+const I_FPOP = 79;
+const I_STPD = 80;    // a=dt1 b=dt2 c=xn d=offset
+const I_LDPD = 81;
+const I_FCSEL = 82;   // a=dd b=dn c=dm d=cond
+const I_FSQRT = 83;
+const I_FABS = 84;
+// Calls through registers and atomics.
+const I_BLR = 85;     // a=xn
+const I_LDADDAL = 86; // a=xs b=xt c=xn: xt = [xn]; [xn] += xs
+const I_CASAL = 87;   // a=xs b=xt c=xn: if [xn] == xs then [xn] = xt; xs = old
+const I_SWPAL = 88;   // a=xs b=xt c=xn: xt = [xn]; [xn] = xs
+const I_LDAR = 89;    // a=xt b=xn
+const I_STLR = 90;    // a=xt b=xn
+const I_YIELD = 91;
+// Sized memory access. d (kind) = size log2 | signed << 2 | float << 3 | scaled << 4.
+const I_LD = 92;      // a=rt b=rn c=byte offset
+const I_ST = 93;
+const I_LDX = 94;     // a=rt b=rn c=rm: [rn + rm << size] when scaled, else [rn + rm]
+const I_STX = 95;
+const I_SXT = 96;     // a=rd b=rn c=size log2: sign-extend the low 8/16/32 bits
+const I_UDIV = 97;
+const I_LSRV = 98;
+const I_LSRI = 99;    // a=rd b=rn c=amount
+const I_UCVTF = 100;
+const I_FCVTZU = 101;
+const I_FRINTM = 102;  // a=dd b=dn: floor
+const I_FRINTP = 103;  // ceil
+const I_FRINTZ = 104;  // trunc
+const I_FRINTA = 105;  // round half away
+const I_FRINTN = 106;  // round half even
+const I_RAW = 107;     // a=32-bit instruction word (hand-assembled code, e.g. SHA-256)
+const MK_SIGNED = 4;
+const MK_FLOAT = 8;
+const MK_SCALED = 16;
+
+// Registers: 0-30 are x0-x30; SP and ZR both encode as 31.
+const SP = 31;
+const ZR = 32;
+const FP = 29;
+const LR = 30;
+const X16 = 16;
+const X17 = 17;
+
+// Shift operand for register forms: kind + amount.
+const SH_LSL = 0;
+const SH_LSR = 64;
+const SH_ASR = 128;
+
+const C_EQ = 0;
+const C_NE = 1;
+const C_HS = 2;
+const C_LO = 3;
+const C_MI = 4;
+const C_HI = 8;
+const C_LS = 9;
+const C_GE = 10;
+const C_LT = 11;
+const C_GT = 12;
+const C_LE = 13;
+
+// Data symbols referenced by adrp/pageoff pairs.
+const SK_STR = 1;
+const SK_VAR = 2;
+const SK_GOT = 3;
+const SK_TSTR = 4;   // Tin string literal: length word, bytes, NUL
+const SK_FN = 5;     // address of a function
+const SK_ZERO = 6;   // a static zeroed block: the shared empty slice header
+
+fn sym_ref(kind, index) {
+    return (kind << 32) | index;
+}
+
+// ---- text printer (-S) ----
+
+fn pr_reg(b, r) {
+    if r >= 64 {
+        buf_byte(b, 'd');
+        buf_int(b, r - 64);
+    } else if r == SP {
+        buf_str(b, "sp");
+    } else if r == ZR {
+        buf_str(b, "xzr");
+    } else {
+        buf_byte(b, 'x');
+        buf_int(b, r);
+    }
+}
+
+fn pr_wreg(b, r) {
+    if r == ZR {
+        buf_str(b, "wzr");
+    } else {
+        buf_byte(b, 'w');
+        buf_int(b, r);
+    }
+}
+
+fn pr_regs(b, name, r1, r2, r3) {
+    buf_byte(b, '\t');
+    buf_str(b, name);
+    buf_byte(b, ' ');
+    pr_reg(b, r1);
+    buf_str(b, ", ");
+    pr_reg(b, r2);
+    if r3 >= 0 {
+        buf_str(b, ", ");
+        pr_reg(b, r3);
+    }
+}
+
+fn pr_imm(b, v) {
+    buf_str(b, ", #");
+    buf_int(b, v);
+}
+
+fn pr_shift(b, s) {
+    if s == 0 {
+        return;
+    }
+    if s >= SH_ASR {
+        buf_str(b, ", asr #");
+    } else if s >= SH_LSR {
+        buf_str(b, ", lsr #");
+    } else {
+        buf_str(b, ", lsl #");
+    }
+    buf_int(b, s & 63);
+}
+
+fn pr_label(b, l) {
+    buf_byte(b, 'L');
+    buf_int(b, l);
+}
+
+fn pr_cond(b, c) {
+    let names = "eqnehslomiplvsvchilsgeltgtleal";
+    buf_byte(b, load8(names + 2 * c));
+    buf_byte(b, load8(names + 2 * c + 1));
+}
+
+fn pr_sym(b, sym) {
+    let kind = sym >> 32;
+    let i = sym & 0xffffffff;
+    if kind == SK_STR {
+        buf_str(b, "l_.str.");
+        buf_int(b, i);
+    } else if kind == SK_TSTR {
+        buf_str(b, "l_.tstr.");
+        buf_int(b, i);
+    } else if kind == SK_FN {
+        buf_byte(b, '_');
+        buf_str(b, vec_get(prog_fns, i)[F_QNAME]);
+    } else if kind == SK_ZERO {
+        buf_str(b, "l_.zero");
+    } else {
+        buf_byte(b, '_');
+        buf_str(b, var_label(vec_get(prog_vars, i)));
+    }
+}
+
+fn pr_mem(b, name, rt, rn, off) {
+    buf_byte(b, '\t');
+    buf_str(b, name);
+    buf_byte(b, ' ');
+    pr_reg(b, rt);
+    buf_str(b, ", [");
+    pr_reg(b, rn);
+    if off != 0 {
+        pr_imm(b, off);
+    }
+    buf_byte(b, ']');
+}
+
+fn pr_memb(b, name, rt, rn, rm, off) {
+    buf_byte(b, '\t');
+    buf_str(b, name);
+    buf_byte(b, ' ');
+    pr_wreg(b, rt);
+    buf_str(b, ", [");
+    pr_reg(b, rn);
+    if rm >= 0 {
+        buf_str(b, ", ");
+        pr_reg(b, rm);
+    } else if off != 0 {
+        pr_imm(b, off);
+    }
+    buf_byte(b, ']');
+}
+
+fn print_ins(b, ins) {
+    let op = ins[0];
+    let x = ins[1];
+    let y = ins[2];
+    let z = ins[3];
+    let w = ins[4];
+    if op == I_LABEL {
+        pr_label(b, x);
+        buf_byte(b, ':');
+    } else if op == I_RAW {
+        buf_str(b, "\t.inst 0x");
+        let k = 28;
+        while k >= 0 {
+            buf_byte(b, load8("0123456789abcdef" + ((x >> k) & 15)));
+            k = k - 4;
+        }
+    } else if op == I_FUNC {
+        if streq(x[F_QNAME], "main") {
+            buf_str(b, "\t.globl _main\n");
+        }
+        buf_str(b, "\t.p2align 2\n_");
+        buf_str(b, x[F_QNAME]);
+        buf_byte(b, ':');
+    } else if op == I_MOVZ || op == I_MOVN || op == I_MOVK {
+        if op == I_MOVZ {
+            buf_str(b, "\tmovz ");
+        } else if op == I_MOVN {
+            buf_str(b, "\tmovn ");
+        } else {
+            buf_str(b, "\tmovk ");
+        }
+        pr_reg(b, x);
+        pr_imm(b, y);
+        if z != 0 {
+            buf_str(b, ", lsl #");
+            buf_int(b, z);
+        }
+    } else if op == I_MOV {
+        pr_regs(b, "mov", x, y, -1);
+    } else if op == I_ADDI {
+        pr_regs(b, "add", x, y, -1);
+        pr_imm(b, z);
+    } else if op == I_SUBI {
+        pr_regs(b, "sub", x, y, -1);
+        pr_imm(b, z);
+    } else if op >= I_ADD && op <= I_EOR {
+        let names = "add\0sub\0and\0orr\0eor";
+        pr_regs(b, names + 4 * (op - I_ADD), x, y, z);
+        pr_shift(b, w);
+    } else if op == I_ANDI {
+        pr_regs(b, "and", x, y, -1);
+        pr_imm(b, (1 << z) - 1);
+    } else if op == I_MUL {
+        pr_regs(b, "mul", x, y, z);
+    } else if op == I_MADD || op == I_MSUB {
+        if op == I_MADD {
+            pr_regs(b, "madd", x, y, z);
+        } else {
+            pr_regs(b, "msub", x, y, z);
+        }
+        buf_str(b, ", ");
+        pr_reg(b, w);
+    } else if op == I_SDIV {
+        pr_regs(b, "sdiv", x, y, z);
+    } else if op == I_LSLV {
+        pr_regs(b, "lsl", x, y, z);
+    } else if op == I_ASRV {
+        pr_regs(b, "asr", x, y, z);
+    } else if op == I_LSLI {
+        pr_regs(b, "lsl", x, y, -1);
+        pr_imm(b, z);
+    } else if op == I_ASRI {
+        pr_regs(b, "asr", x, y, -1);
+        pr_imm(b, z);
+    } else if op == I_NEG {
+        pr_regs(b, "neg", x, y, -1);
+    } else if op == I_MVN {
+        pr_regs(b, "mvn", x, y, -1);
+    } else if op == I_CMP {
+        pr_regs(b, "cmp", x, y, -1);
+    } else if op == I_CMPI || op == I_CMNI || op == I_TSTI {
+        buf_byte(b, '\t');
+        if op == I_CMPI {
+            buf_str(b, "cmp ");
+        } else if op == I_CMNI {
+            buf_str(b, "cmn ");
+        } else {
+            buf_str(b, "tst ");
+        }
+        pr_reg(b, x);
+        if op == I_TSTI {
+            pr_imm(b, (1 << y) - 1);
+        } else {
+            pr_imm(b, y);
+        }
+    } else if op == I_CSEL {
+        pr_regs(b, "csel", x, y, z);
+        buf_str(b, ", ");
+        pr_cond(b, w);
+    } else if op == I_PRFM {
+        buf_str(b, "\tprfm ");
+        if x == 16 {
+            buf_str(b, "pstl1keep");
+        } else {
+            buf_str(b, "pldl1keep");
+        }
+        buf_str(b, ", [");
+        pr_reg(b, y);
+        buf_str(b, ", ");
+        pr_reg(b, z);
+        buf_str(b, ", lsl #3]");
+    } else if op == I_CSET {
+        buf_str(b, "\tcset ");
+        pr_reg(b, x);
+        buf_str(b, ", ");
+        pr_cond(b, y);
+    } else if op == I_LDR {
+        pr_mem(b, "ldr", x, y, z);
+    } else if op == I_STR {
+        pr_mem(b, "str", x, y, z);
+    } else if op == I_LDRX || op == I_STRX {
+        if op == I_LDRX {
+            pr_mem(b, "ldr", x, y, 0);
+        } else {
+            pr_mem(b, "str", x, y, 0);
+        }
+        b[VEC_LEN] = b[VEC_LEN] - 1;
+        buf_str(b, ", ");
+        pr_reg(b, z);
+        buf_str(b, ", lsl #3]");
+    } else if op == I_LDRB {
+        pr_memb(b, "ldrb", x, y, -1, z);
+    } else if op == I_STRB {
+        pr_memb(b, "strb", x, y, -1, z);
+    } else if op == I_LDRBX {
+        pr_memb(b, "ldrb", x, y, z, 0);
+    } else if op == I_STRBX {
+        pr_memb(b, "strb", x, y, z, 0);
+    } else if op == I_PUSH {
+        buf_str(b, "\tstr ");
+        pr_reg(b, x);
+        buf_str(b, ", [sp, #-16]!");
+    } else if op == I_POP {
+        buf_str(b, "\tldr ");
+        pr_reg(b, x);
+        buf_str(b, ", [sp], #16");
+    } else if op == I_STP || op == I_LDP {
+        if op == I_STP {
+            pr_regs(b, "stp", x, y, -1);
+        } else {
+            pr_regs(b, "ldp", x, y, -1);
+        }
+        buf_str(b, ", [");
+        pr_reg(b, z);
+        if w != 0 {
+            pr_imm(b, w);
+        }
+        buf_byte(b, ']');
+    } else if op == I_STPPRE {
+        pr_regs(b, "stp", x, y, -1);
+        buf_str(b, ", [sp, #");
+        buf_int(b, z);
+        buf_str(b, "]!");
+    } else if op == I_LDPPOST {
+        pr_regs(b, "ldp", x, y, -1);
+        buf_str(b, ", [sp], #");
+        buf_int(b, z);
+    } else if op == I_B {
+        buf_str(b, "\tb ");
+        pr_label(b, x);
+    } else if op == I_BCOND {
+        buf_str(b, "\tb.");
+        pr_cond(b, x);
+        buf_byte(b, ' ');
+        pr_label(b, y);
+    } else if op == I_CBZ || op == I_CBNZ {
+        if op == I_CBZ {
+            buf_str(b, "\tcbz ");
+        } else {
+            buf_str(b, "\tcbnz ");
+        }
+        pr_reg(b, x);
+        buf_str(b, ", ");
+        pr_label(b, y);
+    } else if op == I_TBZ || op == I_TBNZ {
+        if op == I_TBZ {
+            buf_str(b, "\ttbz ");
+        } else {
+            buf_str(b, "\ttbnz ");
+        }
+        if y < 32 {
+            pr_wreg(b, x);
+        } else {
+            pr_reg(b, x);
+        }
+        pr_imm(b, y);
+        buf_str(b, ", ");
+        pr_label(b, z);
+    } else if op == I_BL {
+        buf_str(b, "\tbl _");
+        buf_str(b, x[F_QNAME]);
+    } else if op >= I_FADD && op <= I_FDIV {
+        let fnames = "fadd\0fsub\0fmul\0fdiv";
+        pr_regs(b, fnames + 5 * (op - I_FADD), x, y, z);
+    } else if op == I_FMADD || op == I_FMSUB {
+        if op == I_FMADD {
+            pr_regs(b, "fmadd", x, y, z);
+        } else {
+            pr_regs(b, "fmsub", x, y, z);
+        }
+        buf_str(b, ", ");
+        pr_reg(b, w);
+    } else if op == I_FNEG {
+        pr_regs(b, "fneg", x, y, -1);
+    } else if op == I_FSQRT {
+        pr_regs(b, "fsqrt", x, y, -1);
+    } else if op == I_FABS {
+        pr_regs(b, "fabs", x, y, -1);
+    } else if op == I_FRINTM {
+        pr_regs(b, "frintm", x, y, -1);
+    } else if op == I_FRINTP {
+        pr_regs(b, "frintp", x, y, -1);
+    } else if op == I_FRINTZ {
+        pr_regs(b, "frintz", x, y, -1);
+    } else if op == I_FRINTA {
+        pr_regs(b, "frinta", x, y, -1);
+    } else if op == I_FRINTN {
+        pr_regs(b, "frintn", x, y, -1);
+    } else if op == I_FMOV || op == I_FMOVDX || op == I_FMOVXD {
+        pr_regs(b, "fmov", x, y, -1);
+    } else if op == I_SCVTF {
+        pr_regs(b, "scvtf", x, y, -1);
+    } else if op == I_FCVTZS {
+        pr_regs(b, "fcvtzs", x, y, -1);
+    } else if op == I_FCMP {
+        pr_regs(b, "fcmp", x, y, -1);
+    } else if op == I_FCMPZ {
+        buf_str(b, "\tfcmp ");
+        pr_reg(b, x);
+        buf_str(b, ", #0.0");
+    } else if op == I_LDRD {
+        pr_mem(b, "ldr", x, y, z);
+    } else if op == I_STRD {
+        pr_mem(b, "str", x, y, z);
+    } else if op == I_LDRDX || op == I_STRDX {
+        if op == I_LDRDX {
+            pr_mem(b, "ldr", x, y, 0);
+        } else {
+            pr_mem(b, "str", x, y, 0);
+        }
+        b[VEC_LEN] = b[VEC_LEN] - 1;
+        buf_str(b, ", ");
+        pr_reg(b, z);
+        buf_str(b, ", lsl #3]");
+    } else if op == I_FPUSH {
+        buf_str(b, "\tstr ");
+        pr_reg(b, x);
+        buf_str(b, ", [sp, #-16]!");
+    } else if op == I_FPOP {
+        buf_str(b, "\tldr ");
+        pr_reg(b, x);
+        buf_str(b, ", [sp], #16");
+    } else if op == I_STPD || op == I_LDPD {
+        if op == I_STPD {
+            pr_regs(b, "stp", x, y, -1);
+        } else {
+            pr_regs(b, "ldp", x, y, -1);
+        }
+        buf_str(b, ", [");
+        pr_reg(b, z);
+        if w != 0 {
+            pr_imm(b, w);
+        }
+        buf_byte(b, ']');
+    } else if op == I_FCSEL {
+        pr_regs(b, "fcsel", x, y, z);
+        buf_str(b, ", ");
+        pr_cond(b, w);
+    } else if op == I_BLR {
+        buf_str(b, "\tblr ");
+        pr_reg(b, x);
+    } else if op == I_LDADDAL || op == I_CASAL || op == I_SWPAL {
+        if op == I_LDADDAL {
+            pr_regs(b, "ldaddal", x, y, -1);
+        } else if op == I_CASAL {
+            pr_regs(b, "casal", x, y, -1);
+        } else {
+            pr_regs(b, "swpal", x, y, -1);
+        }
+        buf_str(b, ", [");
+        pr_reg(b, z);
+        buf_byte(b, ']');
+    } else if op == I_LDAR || op == I_STLR {
+        if op == I_LDAR {
+            pr_mem(b, "ldar", x, y, 0);
+        } else {
+            pr_mem(b, "stlr", x, y, 0);
+        }
+    } else if op == I_YIELD {
+        buf_str(b, "\tyield");
+    } else if op == I_LD || op == I_ST || op == I_LDX || op == I_STX {
+        pr_sized(b, op, x, y, z, w);
+    } else if op == I_SXT {
+        if z == 0 {
+            buf_str(b, "\tsxtb ");
+        } else if z == 1 {
+            buf_str(b, "\tsxth ");
+        } else {
+            buf_str(b, "\tsxtw ");
+        }
+        pr_reg(b, x);
+        buf_str(b, ", ");
+        pr_wreg(b, y);
+    } else if op == I_UDIV {
+        pr_regs(b, "udiv", x, y, z);
+    } else if op == I_LSRV {
+        pr_regs(b, "lsr", x, y, z);
+    } else if op == I_LSRI {
+        pr_regs(b, "lsr", x, y, -1);
+        pr_imm(b, z);
+    } else if op == I_UCVTF {
+        pr_regs(b, "ucvtf", x, y, -1);
+    } else if op == I_FCVTZU {
+        pr_regs(b, "fcvtzu", x, y, -1);
+    } else if op == I_RETX {
+        buf_str(b, "\tret");
+    } else if op == I_ADRP {
+        buf_str(b, "\tadrp ");
+        pr_reg(b, x);
+        buf_str(b, ", ");
+        pr_sym(b, y);
+        buf_str(b, "@PAGE");
+    } else if op == I_ADDLO {
+        pr_regs(b, "add", x, y, -1);
+        buf_str(b, ", ");
+        pr_sym(b, z);
+        buf_str(b, "@PAGEOFF");
+    } else if op == I_LDRLO || op == I_STRLO {
+        if op == I_LDRLO {
+            buf_str(b, "\tldr ");
+        } else {
+            buf_str(b, "\tstr ");
+        }
+        pr_reg(b, x);
+        buf_str(b, ", [");
+        pr_reg(b, y);
+        buf_str(b, ", ");
+        pr_sym(b, z);
+        buf_str(b, "@PAGEOFF]");
+    }
+    buf_byte(b, '\n');
+}
+
+// pr_sized prints a sized load or store: ldrb/ldrsb/ldrh/ldrsh/ldr/ldrsw/str...
+fn pr_sized(b, op, rt, rn, off, kind) {
+    let size = kind & 3;
+    let signed = (kind >> 2) & 1;
+    let fp = (kind >> 3) & 1;
+    let load = op == I_LD || op == I_LDX;
+    buf_byte(b, '\t');
+    if load {
+        buf_str(b, "ldr");
+    } else {
+        buf_str(b, "str");
+    }
+    if signed && load && size < 3 {
+        buf_byte(b, 's');
+    }
+    if !fp && size == 0 {
+        buf_byte(b, 'b');
+    } else if !fp && size == 1 {
+        buf_byte(b, 'h');
+    } else if !fp && size == 2 && signed && load {
+        buf_byte(b, 'w');
+    }
+    buf_byte(b, ' ');
+    if fp || size == 3 || (signed && load) {
+        pr_reg(b, rt);
+    } else {
+        pr_wreg(b, rt);
+    }
+    buf_str(b, ", [");
+    pr_reg(b, rn);
+    if op == I_LDX || op == I_STX {
+        buf_str(b, ", ");
+        pr_reg(b, off);
+        if (kind & MK_SCALED) && size > 0 {
+            buf_str(b, ", lsl #");
+            buf_int(b, size);
+        }
+    } else if off != 0 {
+        pr_imm(b, off);
+    }
+    buf_byte(b, ']');
+}
+
+// ---- encoder ----
+
+// sized_base returns the opcode bits of a sized load/store (register form when reg).
+fn sized_base(load, kind, reg) {
+    let size = kind & 3;
+    let signed = (kind >> 2) & 1;
+    let fp = (kind >> 3) & 1;
+    let v = 0x39000000 | (size << 30);
+    if fp {
+        v = 0x3D000000 | (3 << 30);
+    }
+    if load {
+        if signed && size < 3 {
+            v = v | 0x00800000;
+        } else {
+            v = v | 0x00400000;
+        }
+    }
+    if reg {
+        // Clear the unsigned-offset bit (24) and add the register-offset form bits.
+        v = (v & ~0x01000000) | 0x00206800;
+        if (kind & MK_SCALED) && size > 0 {
+            v = v | 0x1000;
+        }
+    }
+    return v;
+}
+
+fn rn(r) {
+    if r >= 64 {
+        return r - 64;
+    }
+    if r >= 31 {
+        return 31;
+    }
+    return r;
+}
+
+// enc_rrr packs the common Rd, Rn, Rm fields.
+fn enc_rrr(base, d, n, m) {
+    return base | (rn(m) << 16) | (rn(n) << 5) | rn(d);
+}
+
+fn enc_branch19(base, from, to, low) {
+    let off = (to - from) >> 2;
+    if off < -262144 || off >= 262144 {
+        link_fail("conditional branch out of range");
+    }
+    return base | ((off & 0x7ffff) << 5) | low;
+}
+
+fn enc_shift(base, d, n, m, s) {
+    return enc_rrr(base, d, n, m) | ((s >> 6) << 22) | ((s & 63) << 10);
+}
+
+// encode returns the 32-bit machine word for one instruction at address pc.
+fn encode(ins, pc) {
+    let op = ins[0];
+    let x = ins[1];
+    let y = ins[2];
+    let z = ins[3];
+    let w = ins[4];
+    if op == I_RAW {
+        return x & 0xffffffff;
+    }
+    if op == I_MOVZ {
+        return 0xD2800000 | ((z >> 4) << 21) | (y << 5) | rn(x);
+    }
+    if op == I_MOVN {
+        return 0x92800000 | ((z >> 4) << 21) | (y << 5) | rn(x);
+    }
+    if op == I_MOVK {
+        return 0xF2800000 | ((z >> 4) << 21) | (y << 5) | rn(x);
+    }
+    if op == I_MOV {
+        return enc_rrr(0xAA0003E0, x, 0, y);
+    }
+    if op == I_ADDI {
+        return 0x91000000 | (z << 10) | (rn(y) << 5) | rn(x);
+    }
+    if op == I_SUBI {
+        return 0xD1000000 | (z << 10) | (rn(y) << 5) | rn(x);
+    }
+    if op == I_ADD {
+        return enc_shift(0x8B000000, x, y, z, w);
+    }
+    if op == I_SUB {
+        return enc_shift(0xCB000000, x, y, z, w);
+    }
+    if op == I_AND {
+        return enc_shift(0x8A000000, x, y, z, w);
+    }
+    if op == I_ORR {
+        return enc_shift(0xAA000000, x, y, z, w);
+    }
+    if op == I_EOR {
+        return enc_shift(0xCA000000, x, y, z, w);
+    }
+    if op == I_ANDI {
+        return 0x92400000 | ((z - 1) << 10) | (rn(y) << 5) | rn(x);
+    }
+    if op == I_MUL {
+        return enc_rrr(0x9B007C00, x, y, z);
+    }
+    if op == I_MADD {
+        return enc_rrr(0x9B000000, x, y, z) | (rn(w) << 10);
+    }
+    if op == I_MSUB {
+        return enc_rrr(0x9B008000, x, y, z) | (rn(w) << 10);
+    }
+    if op == I_SDIV {
+        return enc_rrr(0x9AC00C00, x, y, z);
+    }
+    if op == I_LSLV {
+        return enc_rrr(0x9AC02000, x, y, z);
+    }
+    if op == I_ASRV {
+        return enc_rrr(0x9AC02800, x, y, z);
+    }
+    if op == I_LSLI {
+        return 0xD3400000 | (((64 - z) & 63) << 16) | ((63 - z) << 10) | (rn(y) << 5) | rn(x);
+    }
+    if op == I_ASRI {
+        return 0x93400000 | (z << 16) | (63 << 10) | (rn(y) << 5) | rn(x);
+    }
+    if op == I_NEG {
+        return enc_rrr(0xCB0003E0, x, 0, y);
+    }
+    if op == I_MVN {
+        return enc_rrr(0xAA2003E0, x, 0, y);
+    }
+    if op == I_CMP {
+        return enc_rrr(0xEB00001F, 0, x, y);
+    }
+    if op == I_CMPI {
+        return 0xF100001F | (y << 10) | (rn(x) << 5);
+    }
+    if op == I_CMNI {
+        return 0xB100001F | (y << 10) | (rn(x) << 5);
+    }
+    if op == I_TSTI {
+        return 0xF240001F | ((y - 1) << 10) | (rn(x) << 5);
+    }
+    if op == I_CSEL {
+        return enc_rrr(0x9A800000, x, y, z) | (w << 12);
+    }
+    if op == I_PRFM {
+        return enc_rrr(0xF8A07800, x, y, z);
+    }
+    if op == I_CSET {
+        return 0x9A9F07E0 | ((y ^ 1) << 12) | rn(x);
+    }
+    if op == I_LDR {
+        return 0xF9400000 | ((z >> 3) << 10) | (rn(y) << 5) | rn(x);
+    }
+    if op == I_STR {
+        return 0xF9000000 | ((z >> 3) << 10) | (rn(y) << 5) | rn(x);
+    }
+    if op == I_LDRX {
+        return enc_rrr(0xF8607800, x, y, z);
+    }
+    if op == I_STRX {
+        return enc_rrr(0xF8207800, x, y, z);
+    }
+    if op == I_LDRB {
+        return 0x39400000 | (z << 10) | (rn(y) << 5) | rn(x);
+    }
+    if op == I_STRB {
+        return 0x39000000 | (z << 10) | (rn(y) << 5) | rn(x);
+    }
+    if op == I_LDRBX {
+        return enc_rrr(0x38606800, x, y, z);
+    }
+    if op == I_STRBX {
+        return enc_rrr(0x38206800, x, y, z);
+    }
+    if op == I_PUSH {
+        return 0xF81F0FE0 | rn(x);
+    }
+    if op == I_POP {
+        return 0xF84107E0 | rn(x);
+    }
+    if op == I_STP {
+        return 0xA9000000 | (((w >> 3) & 0x7f) << 15) | (rn(y) << 10) | (rn(z) << 5) | rn(x);
+    }
+    if op == I_LDP {
+        return 0xA9400000 | (((w >> 3) & 0x7f) << 15) | (rn(y) << 10) | (rn(z) << 5) | rn(x);
+    }
+    if op == I_STPPRE {
+        return 0xA98003E0 | (((z >> 3) & 0x7f) << 15) | (rn(y) << 10) | rn(x);
+    }
+    if op == I_LDPPOST {
+        return 0xA8C003E0 | (((z >> 3) & 0x7f) << 15) | (rn(y) << 10) | rn(x);
+    }
+    if op == I_B {
+        return 0x14000000 | (((label_addr(x) - pc) >> 2) & 0x3ffffff);
+    }
+    if op == I_BL {
+        return 0x94000000 | (((call_addr(x) - pc) >> 2) & 0x3ffffff);
+    }
+    if op == I_BCOND {
+        return enc_branch19(0x54000000, pc, label_addr(y), x);
+    }
+    if op == I_CBZ {
+        return enc_branch19(0xB4000000, pc, label_addr(y), rn(x));
+    }
+    if op == I_CBNZ {
+        return enc_branch19(0xB5000000, pc, label_addr(y), rn(x));
+    }
+    if op == I_TBZ || op == I_TBNZ {
+        let off = (label_addr(z) - pc) >> 2;
+        if off < -8192 || off >= 8192 {
+            link_fail("test-and-branch out of range");
+        }
+        let base = 0x36000000;
+        if op == I_TBNZ {
+            base = 0x37000000;
+        }
+        return base | ((y >> 5) << 31) | ((y & 31) << 19) | ((off & 0x3fff) << 5) | rn(x);
+    }
+    if op == I_RETX {
+        return 0xD65F03C0;
+    }
+    if op == I_FADD {
+        return enc_rrr(0x1E602800, x, y, z);
+    }
+    if op == I_FSUB {
+        return enc_rrr(0x1E603800, x, y, z);
+    }
+    if op == I_FMUL {
+        return enc_rrr(0x1E600800, x, y, z);
+    }
+    if op == I_FDIV {
+        return enc_rrr(0x1E601800, x, y, z);
+    }
+    if op == I_FMADD {
+        return enc_rrr(0x1F400000, x, y, z) | (rn(w) << 10);
+    }
+    if op == I_FMSUB {
+        return enc_rrr(0x1F408000, x, y, z) | (rn(w) << 10);
+    }
+    if op == I_FNEG {
+        return enc_rrr(0x1E614000, x, y, 0);
+    }
+    if op == I_FSQRT {
+        return enc_rrr(0x1E61C000, x, y, 0);
+    }
+    if op == I_FABS {
+        return enc_rrr(0x1E60C000, x, y, 0);
+    }
+    if op == I_FRINTM {
+        return enc_rrr(0x1E654000, x, y, 0);
+    }
+    if op == I_FRINTP {
+        return enc_rrr(0x1E64C000, x, y, 0);
+    }
+    if op == I_FRINTZ {
+        return enc_rrr(0x1E65C000, x, y, 0);
+    }
+    if op == I_FRINTA {
+        return enc_rrr(0x1E664000, x, y, 0);
+    }
+    if op == I_FRINTN {
+        return enc_rrr(0x1E644000, x, y, 0);
+    }
+    if op == I_FMOV {
+        return enc_rrr(0x1E604000, x, y, 0);
+    }
+    if op == I_FMOVDX {
+        return enc_rrr(0x9E670000, x, y, 0);
+    }
+    if op == I_FMOVXD {
+        return enc_rrr(0x9E660000, x, y, 0);
+    }
+    if op == I_SCVTF {
+        return enc_rrr(0x9E620000, x, y, 0);
+    }
+    if op == I_FCVTZS {
+        return enc_rrr(0x9E780000, x, y, 0);
+    }
+    if op == I_FCMP {
+        return 0x1E602000 | (rn(y) << 16) | (rn(x) << 5);
+    }
+    if op == I_FCMPZ {
+        return 0x1E602008 | (rn(x) << 5);
+    }
+    if op == I_LDRD {
+        return 0xFD400000 | ((z >> 3) << 10) | (rn(y) << 5) | rn(x);
+    }
+    if op == I_STRD {
+        return 0xFD000000 | ((z >> 3) << 10) | (rn(y) << 5) | rn(x);
+    }
+    if op == I_LDRDX {
+        return enc_rrr(0xFC607800, x, y, z);
+    }
+    if op == I_STRDX {
+        return enc_rrr(0xFC207800, x, y, z);
+    }
+    if op == I_FPUSH {
+        return 0xFC1F0FE0 | rn(x);
+    }
+    if op == I_FPOP {
+        return 0xFC4107E0 | rn(x);
+    }
+    if op == I_STPD {
+        return 0x6D000000 | (((w >> 3) & 0x7f) << 15) | (rn(y) << 10) | (rn(z) << 5) | rn(x);
+    }
+    if op == I_LDPD {
+        return 0x6D400000 | (((w >> 3) & 0x7f) << 15) | (rn(y) << 10) | (rn(z) << 5) | rn(x);
+    }
+    if op == I_FCSEL {
+        return enc_rrr(0x1E600C00, x, y, z) | (w << 12);
+    }
+    if op == I_BLR {
+        return 0xD63F0000 | (rn(x) << 5);
+    }
+    if op == I_LDADDAL {
+        return 0xF8E00000 | (rn(x) << 16) | (rn(z) << 5) | rn(y);
+    }
+    if op == I_CASAL {
+        return 0xC8E0FC00 | (rn(x) << 16) | (rn(z) << 5) | rn(y);
+    }
+    if op == I_SWPAL {
+        return 0xF8E08000 | (rn(x) << 16) | (rn(z) << 5) | rn(y);
+    }
+    if op == I_LDAR {
+        return 0xC8DFFC00 | (rn(y) << 5) | rn(x);
+    }
+    if op == I_STLR {
+        return 0xC89FFC00 | (rn(y) << 5) | rn(x);
+    }
+    if op == I_YIELD {
+        return 0xD503203F;
+    }
+    if op == I_LD || op == I_ST {
+        let size = w & 3;
+        return sized_base(op == I_LD, w, 0) | ((z >> size) << 10) | (rn(y) << 5) | rn(x);
+    }
+    if op == I_LDX || op == I_STX {
+        return sized_base(op == I_LDX, w, 1) | (rn(z) << 16) | (rn(y) << 5) | rn(x);
+    }
+    if op == I_SXT {
+        let bits = (8 << z) - 1;
+        return 0x93400000 | (bits << 10) | (rn(y) << 5) | rn(x);
+    }
+    if op == I_UDIV {
+        return enc_rrr(0x9AC00800, x, y, z);
+    }
+    if op == I_LSRV {
+        return enc_rrr(0x9AC02400, x, y, z);
+    }
+    if op == I_LSRI {
+        return 0xD3400000 | (z << 16) | (63 << 10) | (rn(y) << 5) | rn(x);
+    }
+    if op == I_UCVTF {
+        return enc_rrr(0x9E630000, x, y, 0);
+    }
+    if op == I_FCVTZU {
+        return enc_rrr(0x9E790000, x, y, 0);
+    }
+    if op == I_ADRP {
+        let page = ((sym_addr(y) >> 12) - (pc >> 12)) & 0x1fffff;
+        return 0x90000000 | ((page & 3) << 29) | ((page >> 2) << 5) | rn(x);
+    }
+    if op == I_ADDLO {
+        return 0x91000000 | ((sym_addr(z) & 0xfff) << 10) | (rn(y) << 5) | rn(x);
+    }
+    if op == I_LDRLO {
+        return 0xF9400000 | (((sym_addr(z) & 0xfff) >> 3) << 10) | (rn(y) << 5) | rn(x);
+    }
+    if op == I_STRLO {
+        return 0xF9000000 | (((sym_addr(z) & 0xfff) >> 3) << 10) | (rn(y) << 5) | rn(x);
+    }
+    link_fail("cannot encode instruction");
+}

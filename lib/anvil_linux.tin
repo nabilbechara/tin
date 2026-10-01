@@ -1,0 +1,107 @@
+// anvil's event loop on Linux: epoll (connections edge-triggered with EPOLLET), timerfd
+// for ticks, and one SO_REUSEPORT listener per core so the kernel balances connections.
+package anvil
+
+extern func epoll_create1(flags i64) i64
+extern func epoll_ctl(ep i64, op i64, fd i64, ev i64) i64
+extern func epoll_wait(ep i64, ev i64, n i64, timeout i64) i64
+extern func timerfd_create(clock i64, flags i64) i64
+extern func timerfd_settime(fd i64, flags i64, nv i64, old i64) i64
+
+// struct epoll_event is 16 bytes on arm64: u32 events, padding, u64 data.
+const evSize = 16
+const epIn = 1
+const epOut = 4
+const epErr = 8
+const epHup = 16
+const epRdHup = 0x2000
+const epEt = 0x80000000
+const ownListener = true
+
+func ep_set(op i64, fd i64, events i64) {
+	change[0] = events
+	change[1] = fd
+	epoll_ctl(kq, op, fd, change)
+}
+
+func ev_init() {
+	kq = c32(epoll_create1(0x80000))
+}
+
+func ev_level(fd i64) {
+	ep_set(1, fd, epIn)
+}
+
+func ev_conn(fd i64) {
+	ep_set(1, fd, epIn|epRdHup|epEt)
+}
+
+func ev_conn_write(fd i64) {
+	ep_set(3, fd, epOut|epEt)
+}
+
+func ev_conn_read(fd i64) {
+	ep_set(3, fd, epIn|epRdHup|epEt)
+}
+
+func ev_timer(ms i64) i64 {
+	tfd := c32(timerfd_create(1, 0x800|0x80000))
+	its := calloc(4, 8)
+	its[0] = ms / 1000
+	its[1] = (ms % 1000) * 1000000
+	its[2] = its[0]
+	its[3] = its[1]
+	timerfd_settime(tfd, 0, its, 0)
+	free(its)
+	ev_level(tfd)
+	return tfd
+}
+
+// ev_timer_ack reads the timerfd's expiry count so it stops being readable.
+func ev_timer_ack(fd i64) {
+	read(fd, word+96, 8)
+}
+
+// ev_drain_timer is a second periodic timer (the shutdown deadline check): another timerfd.
+func ev_drain_timer(ms i64) i64 {
+	return ev_timer(ms)
+}
+
+var sigfd i64   // core 0: the signalfd delivering the blocked SIGTERM/SIGINT (-1 when absent)
+
+// ev_signals adds a signalfd for SIGTERM and SIGINT (blocked in every thread) to the loop.
+func ev_signals() {
+	sigfd = rt_signalfd()
+	if sigfd >= 0 {
+		ev_level(sigfd)
+	}
+}
+
+// ev_signal reports whether event i is the signalfd turning readable.
+func ev_signal(i i64) bool {
+	return sigfd > 0 && ev_fd(i) == sigfd
+}
+
+// ev_signal_ack reads the 128-byte signalfd_siginfo so the signalfd stops being readable.
+func ev_signal_ack() {
+	read(sigfd, word+128, 128)
+}
+
+func ev_wait() i64 {
+	return c32(epoll_wait(kq, evs, maxEvents, -1))
+}
+
+func ev_fd(i i64) i64 {
+	return (evs + i*evSize + 8)[0]
+}
+
+// ev_hangup reports that the peer closed or reset (it may arrive with the last data).
+func ev_hangup(i i64) bool {
+	m := __ld(evs+i*evSize, 2) & 0xffffffff
+	return m&(epErr|epHup|epRdHup) != 0
+}
+
+func ev_writable(i i64) bool {
+	m := __ld(evs+i*evSize, 2) & 0xffffffff
+	return m&epOut != 0 && m&(epIn|epErr|epHup|epRdHup) == 0
+}

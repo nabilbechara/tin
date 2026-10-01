@@ -1,0 +1,80 @@
+#!/bin/sh
+# tin: run, build and test Tin programs with the self-hosted compiler (no cc, no Go).
+#
+#   tin FILE.tin [ARGS...]          compile and run
+#   tin run FILE.tin... [-- ARGS]   compile and run several files as one program
+#   tin build FILE.tin... [-o OUT] [--target T]  write an executable (T: darwin-arm64, linux-arm64)
+#   tin asm FILE.tin...             print the generated ARM64 assembly
+#   tin test                        run the strict test suite (tests/v2)
+#   tin bootstrap                   rebuild the compiler with itself and check the fixed point
+#   tin version
+set -e
+self=$0
+[ -L "$self" ] && self=$(readlink "$self")
+root=$(cd "$(dirname "$self")" && pwd)
+tinc=$root/bin/tinc
+[ -x "$tinc" ] || make -s -C "$root" bin/tinc
+export TIN_ROOT="$root"
+
+# Programs in the old syntax (fn, no package clause) need the legacy std library.
+legacy() {
+  for f in "$@"; do
+    if grep -qE '^[[:space:]]*package[[:space:]]' "$f" 2>/dev/null; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+target=
+compile() { # out files...
+  out=$1; shift
+  tflag=
+  [ -n "$target" ] && tflag="-target $target"
+  if legacy "$@"; then
+    "$tinc" $tflag -o "$out" "$root/lib/std.tin" "$@"
+  else
+    "$tinc" $tflag -o "$out" "$@"
+  fi
+}
+
+cache=${TMPDIR:-/tmp}/tin-$(id -u)
+mkdir -p "$cache"
+
+case $1 in
+  run)
+    shift; files=; while [ $# -gt 0 ] && [ "$1" != "--" ]; do files="$files $1"; shift; done
+    [ "$1" = "--" ] && shift
+    exe=$cache/run.$$; trap 'rm -f "$exe"' EXIT
+    compile "$exe" $files
+    "$exe" "$@" ;;
+  build)
+    shift; out=; files=
+    while [ $# -gt 0 ]; do
+      case $1 in
+        -o) out=$2; shift 2 ;;
+        --target|-target) target=$2; shift 2 ;;
+        *) files="$files $1"; shift ;;
+      esac
+    done
+    [ -n "$out" ] || { set -- $files; out=$(basename "$1" .tin); }
+    compile "$out" $files ;;
+  asm)
+    shift
+    if legacy "$@"; then "$tinc" -S "$root/lib/std.tin" "$@"; else "$tinc" -S "$@"; fi ;;
+  test)
+    "$root/tools/v2test.sh" "$tinc" ;;
+  bootstrap)
+    make -s -C "$root" bootstrap ;;
+  version|-v|--version)
+    echo "tin 0.2 (self-hosted, arm64-darwin, compiler $(cksum < "$tinc" | cut -d' ' -f1))" ;;
+  ""|help|-h|--help)
+    sed -n '2,11p' "$self" | sed 's/^# \{0,1\}//' ;;
+  *.tin)
+    f=$1; shift
+    exe=$cache/run.$$; trap 'rm -f "$exe"' EXIT
+    compile "$exe" "$f"
+    "$exe" "$@" ;;
+  *)
+    echo "tin: unknown command '$1' (try: tin help)" >&2; exit 2 ;;
+esac

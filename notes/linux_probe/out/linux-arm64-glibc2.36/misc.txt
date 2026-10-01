@@ -1,0 +1,62 @@
+uname: Linux 6.10.14-linuxkit aarch64
+## errno via __errno_location
+open(missing) = -1, *__errno_location() = 2, errno = 2, ENOENT = 2, strerror = "No such file or directory"
+strerror(EAGAIN=11) = "Resource temporarily unavailable" ; strerror(EPIPE) = "Broken pipe" ; strerror(ECONNREFUSED) = "Connection refused"
+## clocks
+CLOCK_REALTIME  sec=1790862650 nsec=776594501 (ts bytes: sec@0 nsec@8)
+CLOCK_MONOTONIC sec=130804 nsec=961662130
+CLOCK_BOOTTIME  sec=130804 nsec=961662255
+CLOCK_MONOTONIC_RAW sec=130804 nsec=961665122
+time(0) = 1790862650
+## randomness
+getrandom(16, 0) = 16 bytes: d7ab1c86...
+arc4random_buf present: f86da7c5...
+getentropy(16) = 0
+## stat via raw offsets
+stat rc=0 sizeof=128; raw: st_mode@16=0100644 st_size@48=13 st_mtim.tv_sec@88=1790862650 ; real: mode=0100644 size=13 mtime=1790862650
+S_IFMT=0xf000 S_IFDIR=0x4000 ; stat("/") is dir: yes
+bytes past sizeof(struct stat) untouched: yes
+lstat(/proc/self/exe) rc=0 is symlink=yes
+fstat(0) rc=0
+## readdir
+dirent: d_ino@0=933856 d_off@8=1 d_reclen@16=24 d_type@18=10 d_name@19="sbin" strlen=4  (no d_namlen on Linux: use strlen or d_reclen)
+dirent: d_ino@0=937889 d_off@8=2 d_reclen@16=24 d_type@18=4 d_name@19="tmp" strlen=3  (no d_namlen on Linux: use strlen or d_reclen)
+dirent: d_ino@0=933662 d_off@8=3 d_reclen@16=24 d_type@18=10 d_name@19="bin" strlen=3  (no d_namlen on Linux: use strlen or d_reclen)
+dirent: d_ino@0=933848 d_off@8=4 d_reclen@16=24 d_type@18=4 d_name@19="mnt" strlen=3  (no d_namlen on Linux: use strlen or d_reclen)
+## gmtime_r + strftime with Tin's Date format
+strftime -> 37 bytes: Date: Thu, 01 Oct 2026 13:50:50 GMT (tm_year@20=126 tm_mon@16=9)
+## fcntl O_NONBLOCK
+F_GETFL before=0x0 after=0x800 (O_NONBLOCK=0x800; darwin used 4 which is O_NONBLOCK there but O_ACCMODE-garbage here)
+read(empty nonblocking pipe) = -1 errno=11 (EAGAIN=11)
+pipe2(O_NONBLOCK|O_CLOEXEC) rc=0
+## sockets: BSD-style sockaddr_in (sin_len=16, family at byte 1) vs Linux layout
+bind with darwin layout: rc=-1 errno=97 (Address family not supported by protocol)
+bind with linux layout : rc=0 errno=0 (ok)
+getsockname: family@0=2 port@2=52289 (network order) len=16
+setsockopt SO_REUSEADDR(2)=0 SO_REUSEPORT(15)=0 SO_KEEPALIVE(9)=0 TCP_NODELAY=0
+setsockopt SO_RCVTIMEO(20) with 16-byte timeval = 0 ; SO_SNDTIMEO(21) = 0
+getsockopt SO_ERROR(4) = 0
+setsockopt with darwin SOL_SOCKET=0xffff: rc=-1 errno=92 (Protocol not available)
+signal(SIGPIPE=13, SIG_IGN=1) ok; write to closed pipe: rc=-1 errno=32 (EPIPE=32)
+send(MSG_NOSIGNAL=16384) to closed peer rc=-1 errno=32 (EPIPE=32)
+## getaddrinfo: ai_addr pointer offset (24 on Linux, 32 on darwin)
+rc=0 ai_family@4=2 ai_addrlen@16=16 ; [ai+24] -> family=2 addr=127.0.0.1 ; [ai+32] (ai_canonname) = (nil)
+## epoll + eventfd + timerfd via raw epoll_event bytes
+sizeof(epoll_event)=16 data@8 ; ctl ADD eventfd rc=0 ; ctl ADD timerfd rc=0
+timerfd_settime(20ms periodic) rc=0 (itimerspec it_interval@0 it_value@16 size 32)
+eventfd write(8 bytes) rc=8 ; epoll_wait -> 1: [events=0x1 fd=8] 
+eventfd read -> 8 bytes value=1 ; second wait -> 1 (timerfd fd=9) read expirations rc=8 count=1
+ctl DEL rc=0 ; epoll_pwait2 present=yes
+poll(eventfd, POLLOUT) rc=1 revents@6=0x4
+## threads / affinity / memory
+thread: arg=7 stack size=8388608 (requested 8388608) cpu=5
+pthread_create rc=0 sizeof(pthread_attr_t)=64
+sched_getaffinity count=11 sizeof(cpu_set_t)=128 ; sysconf(_SC_NPROCESSORS_ONLN=84)=11
+posix_memalign(128,1024) rc=0 aligned=yes
+mmap(1MiB, RW, PRIVATE|ANON|STACK) = ok ; mprotect(RW->R) = 0
+readlink(/proc/self/exe) = /tmp/probe/misc (15 bytes, NOT nul-terminated by the call)
+getcwd = 086d563614b7 ; gethostname rc=0 ; getpid=72
+realpath(/proc/self/exe) = /tmp/probe/misc
+nanosleep(1ms) rc=0 ; usleep(100) rc=0
+snprintf -> 22: 123456789012|42|s|3.14
+isatty(1)=0 ; strtod("2.5e3")=2500 ; atoi("-17")=-17

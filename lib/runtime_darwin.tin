@@ -1,0 +1,134 @@
+// macOS part of the runtime: every libSystem call, constant and struct layout that differs
+// from Linux sits here, behind rt_ helpers with the same names as in runtime_linux.tin.
+
+extern func __error() i64
+extern func clock_gettime_nsec_np(clock i64) i64
+extern func arc4random_buf(p i64, n i64)
+extern func sysconf(name i64) i64
+extern func setsockopt(fd i64, level i64, name i64, val i64, n i64) i64
+extern func pthread_set_qos_class_self_np(qos i64, rel i64) i64
+extern func pthread_sigmask(how i64, set i64, old i64) i64
+
+const EINTR = 4
+const EAGAIN = 35
+const EINPROGRESS = 36
+const ENOENT = 2
+const EEXIST = 17
+const ENOTDIR = 20
+const EINVAL = 22
+const EMFILE = 24
+const ENFILE = 23
+const O_WRITE_CREATE = 0x601  // O_WRONLY | O_CREAT | O_TRUNC
+const O_APPEND_CREATE = 0x209 // O_WRONLY | O_CREAT | O_APPEND
+const O_NONBLOCK = 4
+const F_GETFL = 3
+const F_SETFL = 4
+const SOL_SOCKET = 0xffff
+const SO_REUSEADDR = 4
+const SO_REUSEPORT = 0x200
+const SO_ERROR = 0x1007
+const SO_RCVTIMEO = 0x1006
+const SO_SNDTIMEO = 0x1005
+const TARGET_LINUX = false
+
+// rt_errno is the error code of the libc call that just failed.
+func rt_errno() i64 {
+	return i64(i32(__error()[0]))
+}
+
+// rt_mono_ns is a monotonic clock in nanoseconds (it stops while the machine sleeps).
+func rt_mono_ns() i64 {
+	return clock_gettime_nsec_np(8)
+}
+
+// rt_wall_ns is the wall clock in nanoseconds since 1970.
+func rt_wall_ns() i64 {
+	return clock_gettime_nsec_np(0)
+}
+
+// rt_random fills n bytes at p with cryptographically secure random bytes.
+func rt_random(p i64, n i64) {
+	arc4random_buf(p, n)
+}
+
+// rt_ncpus is the number of CPUs online.
+func rt_ncpus() i64 {
+	return sysconf(58) & 0xffffffff
+}
+
+// rt_sockaddr_in fills the 16-byte IPv4 address ip:port at sa (ip in host byte order).
+func rt_sockaddr_in(sa i64, ip i64, port i64) {
+	memset(sa, 0, 16)
+	store8(sa, 16)
+	store8(sa+1, 2)
+	store8(sa+2, port>>8)
+	store8(sa+3, port&255)
+	store8(sa+4, (ip>>24)&255)
+	store8(sa+5, (ip>>16)&255)
+	store8(sa+6, (ip>>8)&255)
+	store8(sa+7, ip&255)
+}
+
+// rt_ai_addr is the sockaddr of an addrinfo record.
+func rt_ai_addr(ai i64) i64 {
+	return (ai + 32)[0]
+}
+
+// rt_nosigpipe stops writes to a closed socket from raising SIGPIPE.
+func rt_nosigpipe(fd i64) {
+	one := calloc(1, 8)
+	one[0] = 1
+	setsockopt(fd, 0xffff, 0x1022, one, 4)
+	free(one)
+}
+
+// struct stat fields (st is a 256-byte buffer filled by stat, lstat or fstat).
+func rt_stat_mode(st i64) i64 {
+	return __ld(st+4, 1) & 0xffff
+}
+
+func rt_stat_size(st i64) i64 {
+	return (st + 96)[0]
+}
+
+func rt_stat_mtime(st i64) i64 {
+	return (st + 48)[0]
+}
+
+func rt_stat_dev(st i64) i64 {
+	return __ld(st, 2) & 0xffffffff
+}
+
+func rt_stat_ino(st i64) i64 {
+	return (st + 8)[0]
+}
+
+// rt_dirent_name is the name in a directory entry returned by readdir.
+func rt_dirent_name(ent i64) str {
+	return rt_str_from_raw(ent+21, __ld(ent+18, 1)&0xffff)
+}
+
+shared var rtPoolChunk i64   // request pool chunk size once a memory limit lowered it (0: the default)
+
+// rt_mem_limit is the container memory limit in bytes: macOS has none, so 0.
+func rt_mem_limit() i64 {
+	return 0
+}
+
+// rt_pin_setup is a no-op: macOS places threads itself (rt_core_qos asks for performance cores).
+func rt_pin_setup(n i64) {
+}
+
+// rt_core_qos asks macOS to keep this core's thread on a performance core.
+func rt_core_qos(id i64) {
+	pthread_set_qos_class_self_np(0x21, 0)
+}
+
+// rt_sig_block_term blocks SIGTERM and SIGINT in the calling thread; threads it creates inherit
+// the mask, so a server can take the signals from kqueue (EVFILT_SIGNAL) instead of a handler.
+func rt_sig_block_term() {
+	set := calloc(1, 128)
+	set[0] = 1<<14 | 1<<1
+	pthread_sigmask(1, set, 0)
+	free(set)
+}

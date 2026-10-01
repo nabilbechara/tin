@@ -1,0 +1,99 @@
+#!/usr/bin/env python3
+"""Generate docs/STDLIB.md from the comments in lib/*.tin (run from the repo root)."""
+import os, re
+
+SKIP = {"runtime", "std", "fmt", "say"}
+ORDER = ["say", "argo", "anvil", "hearth", "relay", "wire", "twine", "glyph", "mint", "gauge",
+         "ore", "flume", "quarry", "trail", "lever", "tide", "dice", "sift", "cairn", "stamp",
+         "seal", "herald", "crucible"]
+ROLE = {"say": "formatting and printing (fmt)", "argo": "JSON (encoding/json)", "anvil": "HTTP/1.1 server (net/http)",
+        "hearth": "cores and threads (runtime)", "relay": "messages between cores (channels)", "wire": "TCP and HTTP client (net)",
+        "twine": "strings (strings)", "glyph": "UTF-8 (unicode/utf8)", "mint": "number and string conversion (strconv)",
+        "gauge": "math (math, math/bits)", "ore": "byte slices (bytes)", "flume": "buffered I/O (bufio)",
+        "quarry": "files, environment, process (os)", "trail": "paths (path/filepath)", "lever": "command-line flags (flag)",
+        "tide": "time (time)", "dice": "random numbers (math/rand)", "sift": "sorting and searching (sort, slices)",
+        "cairn": "containers (container/heap, sets, LRU)", "stamp": "hashes and checksums (hash/*)",
+        "seal": "crypto and encodings (crypto/sha256, hmac, encoding/hex, base64)", "herald": "logging (log/slog)",
+        "crucible": "testing helpers (testing)"}
+
+def parse(path):
+    lines = open(path).read().split("\n")
+    pkgdoc, items, comment = [], [], []
+    seen_pkg = False
+    for line in lines:
+        if line.startswith("//"):
+            comment.append(line[2:])
+            continue
+        if line.startswith("package "):
+            pkgdoc = comment[:]
+            seen_pkg = True
+            comment = []
+            continue
+        m = re.match(r"^func (\([a-z]+ (mut )?[A-Za-z0-9_\[\], ]+\) )?([A-Z][A-Za-z0-9_]*)(\[[^\]]*\])?\((.*)$", line)
+        t = re.match(r"^type ([A-Z][A-Za-z0-9_]*)", line)
+        c = re.match(r"^const ([A-Z][A-Za-z0-9_]*)", line)
+        if m and seen_pkg:
+            sig = line[len("func "):].rstrip(" {")
+            items.append(("func", sig, " ".join(c.strip() for c in comment)))
+        elif t and seen_pkg:
+            items.append(("type", line.rstrip(" {"), " ".join(c.strip() for c in comment)))
+        elif c and seen_pkg:
+            items.append(("const", line, " ".join(c.strip() for c in comment)))
+        if not line.startswith("//"):
+            comment = []
+    return pkgdoc, items
+
+out = ["# Tin standard library", "", "Generated from the comments in `lib/*.tin` by `tools/gendoc.py`.", ""]
+out.append("| package | role (Go equivalent) |")
+out.append("|---|---|")
+for p in ORDER:
+    out.append(f"| [{p}](#{p}) | {ROLE[p]} |")
+out.append("")
+out.append("## say")
+out.append("")
+out.append("Built into the compiler (formatting by static type, no reflection): `say.Line(a, b...)`, `say.Text(...)`, "
+           "`say.Out(format, ...)`, `say.Fmt(format, ...) str`, `say.Str(x) str`, `say.Fault(format, ...) fault`, "
+           "`say.To(fd, ...)`, `say.LineTo(fd, ...)`. See docs/LANGUAGE.md.")
+out.append("")
+for p in ORDER:
+    if p == "say":
+        continue
+    path = f"lib/{p}.tin"
+    if not os.path.exists(path):
+        continue
+    doc, items = parse(path)
+    out.append(f"## {p}")
+    out.append("")
+    if doc:
+        text, code = [], []
+        def flush_text():
+            if text:
+                out.append(" ".join(text))
+                out.append("")
+                text.clear()
+        for c in doc:
+            if c.startswith("\t"):
+                flush_text()
+                code.append(c[1:])
+            else:
+                if code:
+                    out.append("```go")
+                    out.extend(code)
+                    out.append("```")
+                    out.append("")
+                    code = []
+                if c.strip():
+                    text.append(c.strip())
+                else:
+                    flush_text()
+        flush_text()
+        if code:
+            out.append("```go")
+            out.extend(code)
+            out.append("```")
+            out.append("")
+    for kind, sig, cm in items:
+        out.append(f"- `{sig}`" + (f": {cm}" if cm else ""))
+    out.append("")
+open("docs/STDLIB.md", "w").write("\n".join(out))
+print(sum(1 for l in out if l.startswith("- ")), "entries")

@@ -1,0 +1,953 @@
+// Package mint converts numbers and quoted strings to and from text (like Go's strconv), with Go's error texts.
+package mint
+
+import "say"
+import "glyph"
+
+const digits = "0123456789abcdefghijklmnopqrstuvwxyz"
+const smalls = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899"
+const hexDigits = "0123456789abcdef"
+
+// MaxI64 is the largest i64, the value ParseInt clamps to on overflow.
+const MaxI64 = 9223372036854775807
+
+// MinI64 is the smallest i64, the value ParseInt clamps to on negative overflow.
+const MinI64 = -9223372036854775807 - 1
+
+// fbuf is this core's scratch buffer for snprintf (allocated once in the ingot heap).
+var fbuf i64
+
+// endp is this core's one-word buffer receiving strtod's end pointer.
+var endp i64
+
+// Itoa returns v in decimal.
+func Itoa(v i64) str {
+	return FormatInt(v, 10)
+}
+
+// FormatInt returns v in base 2..36 with lower-case digits (panics on any other base).
+func FormatInt(v i64, base i64) str {
+	if base < 2 || base > 36 {
+		panic("mint: illegal FormatInt base")
+	}
+	u := u64(v)
+	if v < 0 {
+		u = 0 - u
+	}
+	n := uintLen(u, base)
+	if v < 0 {
+		n++
+	}
+	p := rt_str_new(n)
+	writeUint(p+8+n, u, base)
+	if v < 0 {
+		store8(p+8, '-')
+	}
+	return cast(str, p)
+}
+
+// FormatUint returns v in base 2..36 with lower-case digits (panics on any other base).
+func FormatUint(v u64, base i64) str {
+	if base < 2 || base > 36 {
+		panic("mint: illegal FormatUint base")
+	}
+	n := uintLen(v, base)
+	p := rt_str_new(n)
+	writeUint(p+8+n, v, base)
+	return cast(str, p)
+}
+
+// AppendInt appends v in decimal to b and returns b (use it as b = AppendInt(b, v)).
+func AppendInt(b mut []u8, v i64) []u8 {
+	u := u64(v)
+	if v < 0 {
+		b = append(b, '-')
+		u = 0 - u
+	}
+	n := uintLen(u, 10)
+	start := len(b)
+	for i := 0; i < n; i++ {
+		b = append(b, '0')
+	}
+	writeUint(cast(i64, b)[2]+start+n, u, 10)
+	return b
+}
+
+// uintLen returns the number of base digits of u.
+func uintLen(u u64, base i64) i64 {
+	n := 1
+	if base == 10 {
+		for u >= 10 {
+			u /= 10
+			n++
+		}
+		return n
+	}
+	ub := u64(base)
+	for u >= ub {
+		u /= ub
+		n++
+	}
+	return n
+}
+
+// writeUint writes the base digits of u ending just before byte address end.
+func writeUint(end i64, u u64, base i64) {
+	p := end
+	if base == 10 {
+		sm := cast(i64, smalls) + 8
+		for u >= 100 {
+			q := u / 100
+			k := i64(u-q*100) * 2
+			p -= 2
+			store8(p, i64(load8(sm + k)))
+			store8(p+1, i64(load8(sm + k + 1)))
+			u = q
+		}
+		if u >= 10 {
+			k := i64(u) * 2
+			p -= 2
+			store8(p, i64(load8(sm + k)))
+			store8(p+1, i64(load8(sm + k + 1)))
+			return
+		}
+		p--
+		store8(p, '0'+i64(u))
+		return
+	}
+	dg := cast(i64, digits) + 8
+	ub := u64(base)
+	for {
+		q := u / ub
+		p--
+		store8(p, i64(load8(dg + i64(u-q*ub))))
+		u = q
+		if u == 0 {
+			return
+		}
+	}
+}
+
+// numErr builds Go's text: strconv.FN: parsing "s": what.
+func numErr(fname str, s str, what str) fault {
+	return say.Fault("strconv.%s: parsing %s: %s", fname, Quote(s), what)
+}
+
+// syntaxErr is the invalid-syntax fault of fn for input s.
+func syntaxErr(fname str, s str) fault {
+	return numErr(fname, s, "invalid syntax")
+}
+
+// rangeErr is the out-of-range fault of fn for input s.
+func rangeErr(fname str, s str) fault {
+	return numErr(fname, s, "value out of range")
+}
+
+// lower folds an ASCII letter to lower case.
+func lower(c u8) u8 {
+	return c | 0x20
+}
+
+// Atoi parses a decimal i64 like Go's Atoi (clamping to MaxI64/MinI64 with a fault on overflow).
+func Atoi(s str) (i64, fault) {
+	return parseInt("Atoi", s, 10)
+}
+
+// ParseInt parses a signed integer in base 2..36, or base 0 for 0x/0o/0b prefixes and underscores.
+func ParseInt(s str, base i64) (i64, fault) {
+	return parseInt("ParseInt", s, base)
+}
+
+// parseInt is ParseInt reporting faults under the function name fn.
+func parseInt(fname str, s str, base i64) (i64, fault) {
+	if len(s) == 0 {
+		return 0, syntaxErr(fname, s)
+	}
+	neg := false
+	body := s
+	if s[0] == '+' {
+		body = s[1:len(s)]
+	} else if s[0] == '-' {
+		neg = true
+		body = s[1:len(s)]
+	}
+	un, kind := parseUint(body, base)
+	if kind == 1 {
+		return 0, syntaxErr(fname, s)
+	}
+	if kind == 3 {
+		return 0, numErr(fname, s, "invalid base "+Itoa(base))
+	}
+	var cutoff u64 = 9223372036854775808
+	if !neg && un >= cutoff {
+		return MaxI64, rangeErr(fname, s)
+	}
+	if neg && un > cutoff {
+		return MinI64, rangeErr(fname, s)
+	}
+	n := i64(un)
+	if neg {
+		n = -n
+	}
+	return n, nil
+}
+
+// ParseUint parses an unsigned integer in base 2..36, or base 0 for 0x/0o/0b prefixes and underscores.
+func ParseUint(s str, base i64) (u64, fault) {
+	un, kind := parseUint(s, base)
+	if kind == 1 {
+		return 0, syntaxErr("ParseUint", s)
+	}
+	if kind == 2 {
+		return un, rangeErr("ParseUint", s)
+	}
+	if kind == 3 {
+		return 0, numErr("ParseUint", s, "invalid base "+Itoa(base))
+	}
+	return un, nil
+}
+
+// parseUint returns the value and a kind: 0 ok, 1 syntax error, 2 out of range (value is MaxU64), 3 bad base.
+func parseUint(s str, base i64) (u64, i64) {
+	if len(s) == 0 {
+		return 0, 1
+	}
+	base0 := base == 0
+	i := 0
+	n := len(s)
+	if base0 {
+		base = 10
+		if s[0] == '0' {
+			if n >= 3 && lower(s[1]) == 'b' {
+				base = 2
+				i = 2
+			} else if n >= 3 && lower(s[1]) == 'o' {
+				base = 8
+				i = 2
+			} else if n >= 3 && lower(s[1]) == 'x' {
+				base = 16
+				i = 2
+			} else {
+				base = 8
+				i = 1
+			}
+		}
+	} else if base < 2 || base > 36 {
+		return 0, 3
+	}
+	var maxVal u64 = 18446744073709551615
+	ub := u64(base)
+	cutoff := maxVal/ub + 1
+	underscores := false
+	var v u64 = 0
+	for i < n {
+		c := s[i]
+		i++
+		d := u64(0)
+		if c == '_' && base0 {
+			underscores = true
+			continue
+		} else if c >= '0' && c <= '9' {
+			d = u64(c - '0')
+		} else if lower(c) >= 'a' && lower(c) <= 'z' {
+			d = u64(lower(c)-'a') + 10
+		} else {
+			return 0, 1
+		}
+		if d >= ub {
+			return 0, 1
+		}
+		if v >= cutoff {
+			return maxVal, 2
+		}
+		v *= ub
+		v1 := v + d
+		if v1 < v {
+			return maxVal, 2
+		}
+		v = v1
+	}
+	if underscores && !underscoreOK(s) {
+		return 0, 1
+	}
+	return v, 0
+}
+
+// underscoreOK reports whether the underscores in s separate digits as Go's literal syntax allows.
+func underscoreOK(s str) bool {
+	saw := '^'
+	i := 0
+	n := len(s)
+	if n >= 1 && (s[0] == '-' || s[0] == '+') {
+		i = 1
+	}
+	hex := false
+	if n-i >= 2 && s[i] == '0' && (lower(s[i+1]) == 'b' || lower(s[i+1]) == 'o' || lower(s[i+1]) == 'x') {
+		hex = lower(s[i+1]) == 'x'
+		i += 2
+		saw = '0'
+	}
+	for i < n {
+		c := s[i]
+		i++
+		if c >= '0' && c <= '9' || hex && lower(c) >= 'a' && lower(c) <= 'f' {
+			saw = '0'
+			continue
+		}
+		if c == '_' {
+			if saw != '0' {
+				return false
+			}
+			saw = '_'
+			continue
+		}
+		if saw == '_' {
+			return false
+		}
+		saw = '!'
+	}
+	return saw != '_'
+}
+
+// ParseBool parses 1 t T TRUE true True and 0 f F FALSE false False.
+func ParseBool(s str) (bool, fault) {
+	if s == "1" || s == "t" || s == "T" || s == "TRUE" || s == "true" || s == "True" {
+		return true, nil
+	}
+	if s == "0" || s == "f" || s == "F" || s == "FALSE" || s == "false" || s == "False" {
+		return false, nil
+	}
+	return false, syntaxErr("ParseBool", s)
+}
+
+// prefixFold returns how many leading bytes of s match word ignoring ASCII case.
+func prefixFold(s str, word str) i64 {
+	n := len(word)
+	if len(s) < n {
+		n = len(s)
+	}
+	for i := 0; i < n; i++ {
+		if lower(s[i]) != word[i] {
+			return i
+		}
+	}
+	return n
+}
+
+// ParseFloat parses a Go float literal (decimal or 0x hex with p exponent, underscores, inf/infinity/nan) via strtod.
+func ParseFloat(s str) (f64, fault) {
+	n := len(s)
+	if n == 0 {
+		return 0, syntaxErr("ParseFloat", s)
+	}
+	i := 0
+	neg := false
+	if s[0] == '+' || s[0] == '-' {
+		neg = s[0] == '-'
+		i = 1
+	}
+	if i < n && (s[i] == 'i' || s[i] == 'I') {
+		k := prefixFold(s[i:n], "infinity")
+		if k == 3 || k == 8 {
+			if i+k == n {
+				v := F64frombits(0x7ff0000000000000)
+				if neg {
+					return -v, nil
+				}
+				return v, nil
+			}
+		}
+		return 0, syntaxErr("ParseFloat", s)
+	}
+	if i == 0 && (s[0] == 'n' || s[0] == 'N') {
+		if n == 3 && prefixFold(s, "nan") == 3 {
+			return F64frombits(0x7ff8000000000001), nil
+		}
+		return 0, syntaxErr("ParseFloat", s)
+	}
+	hex := false
+	if n-i >= 2 && s[i] == '0' && lower(s[i+1]) == 'x' {
+		hex = true
+		i += 2
+	}
+	sawDigits := false
+	sawDot := false
+	underscores := false
+	for i < n {
+		c := s[i]
+		if c == '_' {
+			underscores = true
+		} else if c == '.' {
+			if sawDot {
+				return 0, syntaxErr("ParseFloat", s)
+			}
+			sawDot = true
+		} else if c >= '0' && c <= '9' || hex && lower(c) >= 'a' && lower(c) <= 'f' {
+			sawDigits = true
+		} else {
+			break
+		}
+		i++
+	}
+	if !sawDigits {
+		return 0, syntaxErr("ParseFloat", s)
+	}
+	expChar := u8('e')
+	if hex {
+		expChar = 'p'
+	}
+	if i < n && lower(s[i]) == expChar {
+		i++
+		if i < n && (s[i] == '+' || s[i] == '-') {
+			i++
+		}
+		if i >= n || s[i] < '0' || s[i] > '9' {
+			return 0, syntaxErr("ParseFloat", s)
+		}
+		for i < n && (s[i] >= '0' && s[i] <= '9' || s[i] == '_') {
+			if s[i] == '_' {
+				underscores = true
+			}
+			i++
+		}
+	} else if hex {
+		return 0, syntaxErr("ParseFloat", s)
+	}
+	if i != n {
+		return 0, syntaxErr("ParseFloat", s)
+	}
+	clean := s
+	if underscores {
+		if !underscoreOK(s) {
+			return 0, syntaxErr("ParseFloat", s)
+		}
+		clean = stripUnderscores(s)
+	}
+	if endp == 0 {
+		endp = rt_ingot_alloc(8)
+	}
+	start := cast(i64, clean) + 8
+	f := strtod(start, endp)
+	if endp[0]-start != len(clean) {
+		return 0, syntaxErr("ParseFloat", s)
+	}
+	if f > 1.7976931348623157e308 || f < -1.7976931348623157e308 {
+		return f, rangeErr("ParseFloat", s)
+	}
+	return f, nil
+}
+
+// stripUnderscores returns s without its underscores.
+func stripUnderscores(s str) str {
+	n := len(s)
+	k := 0
+	for i := 0; i < n; i++ {
+		if s[i] != '_' {
+			k++
+		}
+	}
+	p := rt_str_new(k)
+	d := p + 8
+	for i := 0; i < n; i++ {
+		if s[i] != '_' {
+			store8(d, i64(s[i]))
+			d++
+		}
+	}
+	return cast(str, p)
+}
+
+// F64frombits returns the f64 with bit pattern b.
+func F64frombits(b u64) f64 {
+	return cast(f64, i64(b))
+}
+
+// FormatFloat formats f as 'f' (ddd.ddd), 'e' (d.ddde±dd) or 'g' (shortest of the two); prec -1 is the shortest text that reads back exactly.
+func FormatFloat(f f64, fmt u8, prec i64) str {
+	if f != f {
+		return "NaN"
+	}
+	if f > 1.7976931348623157e308 {
+		return "+Inf"
+	}
+	if f < -1.7976931348623157e308 {
+		return "-Inf"
+	}
+	if fmt != 'f' && fmt != 'e' && fmt != 'g' && fmt != 'E' && fmt != 'G' {
+		return "%" + str(fmt)
+	}
+	if prec < 0 {
+		return shortest(f, fmt)
+	}
+	cf := "%.*f"
+	if fmt == 'e' {
+		cf = "%.*e"
+	} else if fmt == 'E' {
+		cf = "%.*E"
+	} else if fmt == 'g' {
+		cf = "%.*g"
+	} else if fmt == 'G' {
+		cf = "%.*G"
+	}
+	size := 4096
+	buf := fbuf
+	if prec > 3700 {
+		size = prec + 400
+		buf = rt_alloc(size)
+	} else if buf == 0 {
+		fbuf = rt_ingot_alloc(size)
+		buf = fbuf
+	}
+	n := snprintf(buf, size, cast(i64, cf)+8, prec, f) & 0xffffffff
+	return rt_str_from_raw(buf, n)
+}
+
+// shortest lays out the fewest digits that read back as f (taken from say.Str) in Go's 'e', 'f' or 'g' shape.
+func shortest(f f64, fmt u8) str {
+	s := say.Str(f)
+	n := len(s)
+	neg := false
+	i := 0
+	if n > 0 && s[0] == '-' {
+		neg = true
+		i = 1
+	}
+	b := make([]u8, 0, 24)
+	intLen := 0
+	exp := 0
+	hasExp := false
+	for i < n {
+		c := s[i]
+		if c == '.' {
+			intLen = len(b)
+		} else if c == 'e' {
+			hasExp = true
+			i++
+			esign := 1
+			if s[i] == '-' {
+				esign = -1
+				i++
+			} else if s[i] == '+' {
+				i++
+			}
+			for i < n {
+				exp = exp*10 + i64(s[i]-'0')
+				i++
+			}
+			exp *= esign
+			break
+		} else {
+			b = append(b, c)
+		}
+		i++
+	}
+	if intLen == 0 && !hasExp {
+		intLen = len(b)
+	}
+	dp := intLen
+	if hasExp {
+		dp = exp + 1
+	}
+	start := 0
+	for start < len(b) && b[start] == '0' {
+		start++
+		dp--
+	}
+	end := len(b)
+	for end > start && b[end-1] == '0' {
+		end--
+	}
+	d := b[start:end]
+	nd := len(d)
+	if nd == 0 {
+		dp = 0
+	}
+	out := make([]u8, 0, 32)
+	if neg {
+		out = append(out, '-')
+	}
+	if fmt == 'g' || fmt == 'G' {
+		e := dp - 1
+		if e < -4 || e >= 6 {
+			fmt = 'e' + fmt - 'g'
+		} else {
+			fmt = 'f'
+		}
+	}
+	if fmt == 'f' {
+		return str(layoutF(out, d, dp))
+	}
+	return str(layoutE(out, d, dp, fmt))
+}
+
+// layoutE appends digits d with decimal point position dp as d.ddde±dd.
+func layoutE(out mut []u8, d []u8, dp i64, fmt u8) []u8 {
+	nd := len(d)
+	if nd == 0 {
+		out = append(out, '0')
+	} else {
+		out = append(out, d[0])
+		if nd > 1 {
+			out = append(out, '.')
+			out = append(out, d[1:nd]...)
+		}
+	}
+	out = append(out, fmt)
+	e := dp - 1
+	if nd == 0 {
+		e = 0
+	}
+	if e < 0 {
+		out = append(out, '-')
+		e = -e
+	} else {
+		out = append(out, '+')
+	}
+	if e < 10 {
+		out = append(out, '0')
+	}
+	return AppendInt(out, e)
+}
+
+// layoutF appends digits d with decimal point position dp as ddd.ddd with no exponent.
+func layoutF(out mut []u8, d []u8, dp i64) []u8 {
+	nd := len(d)
+	if dp <= 0 {
+		out = append(out, '0')
+	} else {
+		for i := 0; i < dp; i++ {
+			if i < nd {
+				out = append(out, d[i])
+			} else {
+				out = append(out, '0')
+			}
+		}
+	}
+	if nd > dp {
+		out = append(out, '.')
+		for i := dp; i < nd; i++ {
+			if i < 0 {
+				out = append(out, '0')
+			} else {
+				out = append(out, d[i])
+			}
+		}
+	}
+	return out
+}
+
+// Quote returns s as a Go double-quoted literal with \n-style, \x, \u and \U escapes.
+func Quote(s str) str {
+	b := make([]u8, 0, len(s)+len(s)/2+2)
+	return str(appendQuoted(b, s, '"'))
+}
+
+// AppendQuote appends Quote(s) to b and returns b.
+func AppendQuote(b mut []u8, s str) []u8 {
+	return appendQuoted(b, s, '"')
+}
+
+// QuoteRune returns r as a Go single-quoted rune literal (invalid runes become U+FFFD).
+func QuoteRune(r i32) str {
+	if !glyph.ValidRune(r) {
+		r = glyph.RuneError
+	}
+	b := make([]u8, 0, 12)
+	b = append(b, '\'')
+	b = appendEscaped(b, i64(r), '\'')
+	b = append(b, '\'')
+	return str(b)
+}
+
+// appendQuoted appends s between quote bytes, escaping as Go does (invalid UTF-8 bytes become \xHH).
+func appendQuoted(b mut []u8, s str, quote u8) []u8 {
+	b = append(b, quote)
+	n := len(s)
+	i := 0
+	for i < n {
+		c := s[i]
+		if c < 0x80 {
+			i++
+			if c >= 0x20 && c < 0x7f && c != quote && c != '\\' {
+				b = append(b, c)
+			} else {
+				b = appendEscaped(b, i64(c), quote)
+			}
+			continue
+		}
+		r, w := glyph.DecodeRune(s, i)
+		i += w
+		if w == 1 && r == glyph.RuneError {
+			b = append(b, '\\')
+			b = append(b, 'x')
+			b = appendHex(b, i64(c), 2)
+			continue
+		}
+		b = appendEscaped(b, i64(r), quote)
+	}
+	return append(b, quote)
+}
+
+// appendEscaped appends one valid rune r in Go's quoted form for the given quote byte.
+func appendEscaped(b mut []u8, r i64, quote u8) []u8 {
+	if r == i64(quote) || r == '\\' {
+		b = append(b, '\\')
+		return append(b, u8(r))
+	}
+	if isPrint(r) {
+		if r < 0x80 {
+			return append(b, u8(r))
+		}
+		return append(b, str(i32(r))...)
+	}
+	if r == 7 {
+		return append(b, "\\a"...)
+	}
+	if r == 8 {
+		return append(b, "\\b"...)
+	}
+	if r == 12 {
+		return append(b, "\\f"...)
+	}
+	if r == '\n' {
+		return append(b, "\\n"...)
+	}
+	if r == '\r' {
+		return append(b, "\\r"...)
+	}
+	if r == '\t' {
+		return append(b, "\\t"...)
+	}
+	if r == 11 {
+		return append(b, "\\v"...)
+	}
+	b = append(b, '\\')
+	if r < ' ' || r == 0x7f {
+		b = append(b, 'x')
+		return appendHex(b, r, 2)
+	}
+	if r < 0x10000 {
+		b = append(b, 'u')
+		return appendHex(b, r, 4)
+	}
+	b = append(b, 'U')
+	return appendHex(b, r, 8)
+}
+
+// appendHex appends v as exactly n lower-case hex digits.
+func appendHex(b mut []u8, v i64, n i64) []u8 {
+	for k := (n - 1) * 4; k >= 0; k -= 4 {
+		b = append(b, hexDigits[v>>k&15])
+	}
+	return b
+}
+
+// isPrint approximates Go's IsPrint: ASCII and Latin-1 exactly, elsewhere only known format, space, private-use and noncharacter ranges are excluded.
+func isPrint(r i64) bool {
+	if r < 0x20 {
+		return false
+	}
+	if r < 0x7f {
+		return true
+	}
+	if r < 0xa1 {
+		return false
+	}
+	if r < 0x100 {
+		return r != 0xad
+	}
+	if r >= 0xd800 && r <= 0xf8ff {
+		return false
+	}
+	if r >= 0xf0000 || r&0xfffe == 0xfffe {
+		return false
+	}
+	if r >= 0x2000 && r <= 0x206f {
+		return r >= 0x2010 && r <= 0x2027 || r >= 0x2030 && r <= 0x205e
+	}
+	if r >= 0xfdd0 && r <= 0xfdef || r >= 0xfff9 && r <= 0xfffb || r == 0xfeff {
+		return false
+	}
+	if r == 0x1680 || r == 0x180e || r == 0x3000 || r == 0x061c || r == 0x06dd || r == 0x070f || r == 0x08e2 {
+		return false
+	}
+	if r >= 0x0600 && r <= 0x0605 {
+		return false
+	}
+	if r >= 0xe0000 && r <= 0xe007f {
+		return false
+	}
+	if r == 0x110bd || r == 0x110cd || r >= 0x13430 && r <= 0x1343f || r >= 0x1bca0 && r <= 0x1bca3 || r >= 0x1d173 && r <= 0x1d17a {
+		return false
+	}
+	return true
+}
+
+// Unquote interprets s as a Go string literal ("..." with escapes, '...' one rune, `...` raw) and returns its value.
+func Unquote(s str) (str, fault) {
+	n := len(s)
+	if n < 2 {
+		return "", fail("invalid syntax")
+	}
+	quote := s[0]
+	if s[n-1] != quote {
+		return "", fail("invalid syntax")
+	}
+	in := s[1 : n-1]
+	m := len(in)
+	if quote == '`' {
+		cr := 0
+		for i := 0; i < m; i++ {
+			if in[i] == '`' {
+				return "", fail("invalid syntax")
+			}
+			if in[i] == '\r' {
+				cr++
+			}
+		}
+		if cr == 0 {
+			return in, nil
+		}
+		b := make([]u8, 0, m-cr)
+		for i := 0; i < m; i++ {
+			if in[i] != '\r' {
+				b = append(b, in[i])
+			}
+		}
+		return str(b), nil
+	}
+	if quote != '"' && quote != '\'' {
+		return "", fail("invalid syntax")
+	}
+	plain := true
+	for i := 0; i < m; i++ {
+		c := in[i]
+		if c == '\\' || c == '\n' || c == quote {
+			plain = false
+			break
+		}
+	}
+	if plain {
+		if quote == '"' {
+			if glyph.Valid(in) {
+				return in, nil
+			}
+		} else {
+			r, w := glyph.DecodeRune(in, 0)
+			if w > 0 && w == m && (r != glyph.RuneError || w != 1) {
+				return in, nil
+			}
+		}
+	}
+	if quote == '\'' && m == 0 {
+		return "", fail("invalid syntax")
+	}
+	b := make([]u8, 0, m+m/2+4)
+	i := 0
+	for i < m {
+		c := in[i]
+		if c == quote || c == '\n' {
+			return "", fail("invalid syntax")
+		}
+		if c >= 0x80 {
+			r, w := glyph.DecodeRune(in, i)
+			b = append(b, str(r)...)
+			i += w
+		} else if c != '\\' {
+			b = append(b, c)
+			i++
+		} else {
+			if i+1 >= m {
+				return "", fail("invalid syntax")
+			}
+			e := in[i+1]
+			i += 2
+			if e == 'a' {
+				b = append(b, 7)
+			} else if e == 'b' {
+				b = append(b, 8)
+			} else if e == 'f' {
+				b = append(b, 12)
+			} else if e == 'n' {
+				b = append(b, '\n')
+			} else if e == 'r' {
+				b = append(b, '\r')
+			} else if e == 't' {
+				b = append(b, '\t')
+			} else if e == 'v' {
+				b = append(b, 11)
+			} else if e == 'x' || e == 'u' || e == 'U' {
+				k := 2
+				if e == 'u' {
+					k = 4
+				} else if e == 'U' {
+					k = 8
+				}
+				if m-i < k {
+					return "", fail("invalid syntax")
+				}
+				v := 0
+				for j := 0; j < k; j++ {
+					d := unhex(in[i+j])
+					if d < 0 {
+						return "", fail("invalid syntax")
+					}
+					v = v<<4 | d
+				}
+				i += k
+				if e == 'x' {
+					b = append(b, u8(v))
+				} else {
+					if !glyph.ValidRune(i32(v)) {
+						return "", fail("invalid syntax")
+					}
+					b = append(b, str(i32(v))...)
+				}
+			} else if e >= '0' && e <= '7' {
+				if m-i < 2 {
+					return "", fail("invalid syntax")
+				}
+				v := i64(e - '0')
+				for j := 0; j < 2; j++ {
+					x := in[i+j]
+					if x < '0' || x > '7' {
+						return "", fail("invalid syntax")
+					}
+					v = v<<3 | i64(x-'0')
+				}
+				i += 2
+				if v > 255 {
+					return "", fail("invalid syntax")
+				}
+				b = append(b, u8(v))
+			} else if e == '\\' {
+				b = append(b, '\\')
+			} else if e == '\'' || e == '"' {
+				if e != quote {
+					return "", fail("invalid syntax")
+				}
+				b = append(b, e)
+			} else {
+				return "", fail("invalid syntax")
+			}
+		}
+		if quote == '\'' && i != m {
+			return "", fail("invalid syntax")
+		}
+	}
+	return str(b), nil
+}
+
+// unhex returns the value of hex digit c, or -1.
+func unhex(c u8) i64 {
+	if c >= '0' && c <= '9' {
+		return i64(c - '0')
+	}
+	if c >= 'a' && c <= 'f' {
+		return i64(c-'a') + 10
+	}
+	if c >= 'A' && c <= 'F' {
+		return i64(c-'A') + 10
+	}
+	return -1
+}

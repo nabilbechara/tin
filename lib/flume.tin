@@ -1,0 +1,229 @@
+// Package flume reads and writes file descriptors through 64 KiB buffers: lines, whole
+// files and buffered output with one write per flush.
+package flume
+
+import "say"
+
+extern func open(path i64, flags i64, ...) i64
+extern func close(fd i64) i64
+extern func strerror(e i64) i64
+
+const bufSize = 65536
+
+// Reader buffers reads from a file descriptor.
+type Reader struct {
+	fd   i64
+	buf  []u8
+	pos  i64
+	fill i64
+	eof  bool
+	err  fault
+}
+
+// Writer buffers writes to a file descriptor.
+type Writer struct {
+	fd  i64
+	buf []u8
+	err fault
+}
+
+func errno_fault(what str) fault {
+	e := rt_errno()
+	m := strerror(e)
+	return say.Fault("flume: %s: %s", what, rt_str_from_raw(m, strlen(m)))
+}
+
+// New reads from fd.
+func New(fd i64) Reader {
+	return Reader{fd: fd, buf: make([]u8, bufSize)}
+}
+
+// Open reads the file at path.
+func Open(path str) (Reader, fault) {
+	fd := i64(i32(open(cast(i64, path)+8, 0)))
+	if fd < 0 {
+		return Reader{buf: make([]u8, 0)}, errno_fault(path)
+	}
+	return New(fd), nil
+}
+
+// Close closes the reader's descriptor.
+func (r mut Reader) Close() {
+	if r.fd >= 0 {
+		close(r.fd)
+		r.fd = -1
+	}
+}
+
+// more reads the next chunk, keeping the unread bytes at the front; false at end or error.
+func (r mut Reader) more() bool {
+	if r.eof || r.err != nil {
+		return false
+	}
+	if r.pos > 0 {
+		n := r.fill - r.pos
+		h := cast(i64, r.buf)
+		memmove(h[2], h[2]+r.pos, n)
+		r.fill = n
+		r.pos = 0
+	}
+	if r.fill == len(r.buf) {
+		bigger := make([]u8, 2*len(r.buf))
+		copy(bigger, r.buf)
+		r.buf = bigger
+	}
+	h2 := cast(i64, r.buf)
+	n := read(r.fd, h2[2]+r.fill, len(r.buf)-r.fill)
+	if n < 0 {
+		r.err = errno_fault("read")
+		return false
+	}
+	if n == 0 {
+		r.eof = true
+		return false
+	}
+	r.fill += n
+	return true
+}
+
+// Line returns the next line without its "\n" (or "\r\n"); ok is false at the end.
+func (r mut Reader) Line() (str, bool, fault) {
+	start := 0
+	for {
+		h := cast(i64, r.buf)
+		for i := r.pos + start; i < r.fill; i++ {
+			if load8(h[2]+i) == '\n' {
+				end := i
+				if end > r.pos && load8(h[2]+end-1) == '\r' {
+					end--
+				}
+				line := rt_str_from_raw(h[2]+r.pos, end-r.pos)
+				r.pos = i + 1
+				return line, true, nil
+			}
+		}
+		start = r.fill - r.pos
+		if !r.more() {
+			if r.err != nil {
+				return "", false, r.err
+			}
+			if r.fill > r.pos {
+				h3 := cast(i64, r.buf)
+				end2 := r.fill
+				if load8(h3[2]+end2-1) == '\r' {
+					end2--
+				}
+				line2 := rt_str_from_raw(h3[2]+r.pos, end2-r.pos)
+				r.pos = r.fill
+				return line2, true, nil
+			}
+			return "", false, nil
+		}
+	}
+}
+
+// Byte returns the next byte; ok is false at the end.
+func (r mut Reader) Byte() (u8, bool) {
+	if r.pos >= r.fill && !r.more() {
+		return 0, false
+	}
+	c := r.buf[r.pos]
+	r.pos++
+	return c, true
+}
+
+// ReadAll returns everything left.
+func (r mut Reader) ReadAll() (str, fault) {
+	for r.more() {
+	}
+	if r.err != nil {
+		return "", r.err
+	}
+	h := cast(i64, r.buf)
+	s := rt_str_from_raw(h[2]+r.pos, r.fill-r.pos)
+	r.pos = r.fill
+	return s, nil
+}
+
+// ReadFile returns the contents of the file at path.
+func ReadFile(path str) (str, fault) {
+	r := try Open(path)
+	defer r.Close()
+	return r.ReadAll()
+}
+
+// NewWriter writes to fd.
+func NewWriter(fd i64) Writer {
+	return Writer{fd: fd, buf: make([]u8, 0, bufSize)}
+}
+
+// Stdout writes to standard output (flush it before mixing with say output).
+func Stdout() Writer {
+	rt_flush()
+	return NewWriter(1)
+}
+
+// Create truncates or creates the file at path for writing.
+func Create(path str) (Writer, fault) {
+	fd := i64(i32(open(cast(i64, path)+8, O_WRITE_CREATE, 420)))
+	if fd < 0 {
+		return Writer{buf: make([]u8, 0)}, errno_fault(path)
+	}
+	return NewWriter(fd), nil
+}
+
+// Str appends s.
+func (w mut Writer) Str(s str) {
+	if len(w.buf)+len(s) > bufSize && w.Flush() != nil {
+		return
+	}
+	w.buf = append(w.buf, s...)
+}
+
+// Byte appends c.
+func (w mut Writer) Byte(c u8) {
+	if len(w.buf)+1 > bufSize && w.Flush() != nil {
+		return
+	}
+	w.buf = append(w.buf, c)
+}
+
+// Int appends v in decimal.
+func (w mut Writer) Int(v i64) {
+	w.Str(say.Str(v))
+}
+
+// Line appends s and a newline.
+func (w mut Writer) Line(s str) {
+	w.Str(s)
+	w.Byte('\n')
+}
+
+// Flush writes everything buffered (with as few writes as the descriptor allows).
+func (w mut Writer) Flush() fault {
+	h := cast(i64, w.buf)
+	p := h[2]
+	n := h[0]
+	for n > 0 {
+		k := write(w.fd, p, n)
+		if k < 0 {
+			e := rt_errno()
+			if e == 4 {
+				continue
+			}
+			w.err = errno_fault("write")
+			break
+		}
+		p += k
+		n -= k
+	}
+	h[0] = 0
+	return w.err
+}
+
+// Close flushes and closes the writer's descriptor.
+func (w mut Writer) Close() fault {
+	err := w.Flush()
+	close(w.fd)
+	return err
+}

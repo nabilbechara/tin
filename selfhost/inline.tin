@@ -1,0 +1,705 @@
+// Inline fast paths for the runtime's append calls, run per function before LICM.
+//
+// s = append(s, v) checks capacity and stores in place; only a full slice calls the
+// runtime. The region pass has already seen the original calls, so rewriting them here
+// changes no safety checks.
+
+var ia_fn;
+
+fn inline_appends(f) {
+    ia_fn = f;
+    ia_stmts(f[F_BODY][BLK_STMTS]);
+}
+
+fn ia_local(t) {
+    let s = sym_new(SYM_LOCAL, "$", 0);
+    s[S_TYPE] = t;
+    s[S_SLOT] = ia_fn[F_SLOTS];
+    ia_fn[F_SLOTS] = ia_fn[F_SLOTS] + 1;
+    vec_push(ia_fn[F_LOCALS], s);
+    return s;
+}
+
+fn ia_stmts(v) {
+    let i = 0;
+    while i < v[VEC_LEN] {
+        ia_stmt(vec_get(v, i));
+        i = i + 1;
+    }
+}
+
+fn ia_stmt(s) {
+    let k = s[N_KIND];
+    if k == ST_BLOCK {
+        ia_stmts(s[BLK_STMTS]);
+    } else if k == ST_LET {
+        if s[LET_INIT] {
+            ia_expr(s[LET_INIT]);
+        }
+    } else if k == ST_ASSIGN {
+        if s[AS_TARGET][N_KIND] != EX_IDENT {
+            ia_expr(s[AS_TARGET]);
+        }
+        ia_expr(s[AS_VALUE]);
+    } else if k == ST_EXPR {
+        ia_expr(s[ES_X]);
+    } else if k == ST_IF {
+        ia_expr(s[IF_COND]);
+        ia_stmts(s[IF_THEN][BLK_STMTS]);
+        if s[IF_ELSE] {
+            ia_stmt(s[IF_ELSE]);
+        }
+    } else if k == ST_WHILE {
+        ia_expr(s[WH_COND]);
+        ia_stmts(s[WH_BODY][BLK_STMTS]);
+        if s[WH_POST] {
+            ia_stmt(s[WH_POST]);
+        }
+    } else if k == ST_RETURN {
+        if s[RET_VALUE] {
+            ia_expr(s[RET_VALUE]);
+        }
+        if s[RET_VALUES] {
+            ia_exprs(s[RET_VALUES]);
+        }
+    } else if k == ST_CALLMULTI {
+        ia_expr(s[CM_CALL]);
+    }
+}
+
+fn ia_exprs(v) {
+    let i = 0;
+    while i < v[VEC_LEN] {
+        ia_expr(vec_get(v, i));
+        i = i + 1;
+    }
+}
+
+fn ia_expr(e) {
+    if !e {
+        return;
+    }
+    let k = e[N_KIND];
+    if k == EX_UNARY {
+        ia_expr(e[UN_X]);
+    } else if k == EX_BINARY {
+        ia_expr(e[BIN_L]);
+        ia_expr(e[BIN_R]);
+    } else if k == EX_CONV {
+        ia_expr(e[CV_X]);
+    } else if k == EX_MEM {
+        ia_expr(e[MEM_BASE]);
+        ia_expr(e[MEM_INDEX]);
+        ia_expr(e[MEM_LEN]);
+    } else if k == EX_ELEM {
+        ia_expr(e[ELEM_SEQ]);
+        ia_expr(e[ELEM_IDX]);
+    } else if k == EX_SEQ {
+        ia_stmts(e[SEQ_STMTS]);
+        ia_expr(e[SEQ_VALUE]);
+    } else if k == EX_INDEX {
+        ia_expr(e[IX_X]);
+        ia_expr(e[IX_I]);
+    } else if k == EX_CALL {
+        ia_expr(e[CALL_CALLEE]);
+        ia_exprs(e[CALL_ARGS]);
+        let name = e[CALL_NAME];
+        if !e[CALL_INTRINSIC] && name && !ia_fn[F_LEGACY] {
+            if streq(name, "rt_append") && e[CALL_ARGS][VEC_LEN] == 3 && vec_get(e[CALL_ARGS], 2)[N_KIND] == EX_INT {
+                ia_append(e);
+            } else if streq(name, "rt_append_str") && e[CALL_ARGS][VEC_LEN] == 2 {
+                ia_append_str(e);
+            }
+        }
+    }
+}
+
+fn ia_ref(s) {
+    return sym_ref_node(0, s);
+}
+
+fn ia_hdr(h, word) {
+    return mk_mem(0, ia_ref(h), 0, 0, 8 * word, ty_int);
+}
+
+fn elem_type_of_size(esz) {
+    if esz == 1 {
+        return ty_byte;
+    }
+    if esz == 2 {
+        return ty_u16;
+    }
+    if esz == 4 {
+        return ty_u32;
+    }
+    return ty_int;
+}
+
+// ia_append: h := s; v := x; n := h.len; if n >= h.cap { h = rt_append(h, v, esz) }
+// else { h.data[n] = v; h.len = n + 1 }; value h.
+fn ia_append(e) {
+    let pos = e[N_POS];
+    let args = e[CALL_ARGS];
+    let st = e[N_TYPE];
+    let esz = vec_get(args, 2)[INT_VAL];
+    let vt = vec_get(args, 1)[N_TYPE];
+    if !vt || is_float_t(vt) {
+        vt = ty_int;
+    }
+    let h = ia_local(st);
+    let v = ia_local(vt);
+    let n = ia_local(ty_int);
+    let stmts = vec_new();
+    vec_push(stmts, let_stmt(pos, h, vec_get(args, 0)));
+    vec_push(stmts, let_stmt(pos, v, vec_get(args, 1)));
+    vec_push(stmts, let_stmt(pos, n, ia_hdr(h, 0)));
+    let slow = node_new(EX_CALL, pos);
+    slow[CALL_NAME] = e[CALL_NAME];
+    slow[CALL_FN] = e[CALL_FN];
+    slow[CALL_ARGS] = args3(ia_ref(h), ia_ref(v), mk_int(pos, esz, ty_int));
+    slow[N_TYPE] = st;
+    let ifs = node_new(ST_IF, pos);
+    ifs[IF_COND] = mk_bin(pos, ">=", ia_ref(n), ia_hdr(h, 1), ty_bool);
+    ifs[IF_THEN] = empty_block(pos);
+    vec_push(ifs[IF_THEN][BLK_STMTS], assign_stmt(pos, ia_ref(h), slow));
+    let els = empty_block(pos);
+    let slot = mk_mem(pos, ia_hdr(h, 2), ia_ref(n), esz, 0, elem_type_of_size(esz));
+    vec_push(els[BLK_STMTS], assign_stmt(pos, slot, ia_ref(v)));
+    vec_push(els[BLK_STMTS], assign_stmt(pos, ia_hdr(h, 0), mk_bin(pos, "+", ia_ref(n), mk_int(pos, 1, ty_int), ty_int)));
+    ifs[IF_ELSE] = els;
+    vec_push(stmts, ifs);
+    replace_node(e, mk_seq(pos, stmts, ia_ref(h), st));
+}
+
+// ia_append_str: the same for append(b, s...) on a []u8: memcpy when it fits.
+fn ia_append_str(e) {
+    let pos = e[N_POS];
+    let args = e[CALL_ARGS];
+    let st = e[N_TYPE];
+    if !st || kind_of(st) != K_SLICE {
+        st = slice_of(ty_byte);
+    }
+    let lit = vec_get(args, 1);
+    if lit[N_KIND] == EX_STR && lit[STR_LEN] > 0 && lit[STR_LEN] <= 32 {
+        ia_append_lit(e, lit);
+        return;
+    }
+    let memcpy_fn = find_fn("memcpy");
+    if !memcpy_fn {
+        return;
+    }
+    memcpy_fn[F_USED] = 1;
+    let h = ia_local(st);
+    let t = ia_local(ty_string);
+    let n = ia_local(ty_int);
+    let m = ia_local(ty_int);
+    let stmts = vec_new();
+    vec_push(stmts, let_stmt(pos, h, vec_get(args, 0)));
+    vec_push(stmts, let_stmt(pos, t, vec_get(args, 1)));
+    vec_push(stmts, let_stmt(pos, n, ia_hdr(h, 0)));
+    vec_push(stmts, let_stmt(pos, m, mk_mem(pos, ia_ref(t), 0, 0, 0, ty_int)));
+    let slow = node_new(EX_CALL, pos);
+    slow[CALL_NAME] = e[CALL_NAME];
+    slow[CALL_FN] = e[CALL_FN];
+    slow[CALL_ARGS] = args2(ia_ref(h), ia_ref(t));
+    slow[N_TYPE] = st;
+    let ifs = node_new(ST_IF, pos);
+    ifs[IF_COND] = mk_bin(pos, ">=", mk_bin(pos, "+", ia_ref(n), ia_ref(m), ty_int), ia_hdr(h, 1), ty_bool);
+    ifs[IF_THEN] = empty_block(pos);
+    vec_push(ifs[IF_THEN][BLK_STMTS], assign_stmt(pos, ia_ref(h), slow));
+    let els = empty_block(pos);
+    let cp = node_new(EX_CALL, pos);
+    cp[CALL_NAME] = "memcpy";
+    cp[CALL_FN] = memcpy_fn;
+    cp[CALL_ARGS] = args3(mk_bin(pos, "+", ia_hdr(h, 2), ia_ref(n), ty_int), mk_bin(pos, "+", mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int), ia_ref(m));
+    cp[N_TYPE] = ty_int;
+    vec_push(els[BLK_STMTS], expr_stmt(cp));
+    vec_push(els[BLK_STMTS], assign_stmt(pos, ia_hdr(h, 0), mk_bin(pos, "+", ia_ref(n), ia_ref(m), ty_int)));
+    ifs[IF_ELSE] = els;
+    vec_push(stmts, ifs);
+    replace_node(e, mk_seq(pos, stmts, ia_ref(h), st));
+}
+
+// ---- small function inlining ----
+//
+// A function whose body is a single `return expr` over its parameters is expanded at
+// its call sites before any code is generated. Arguments that are constants, locals, or
+// pure and used once are substituted; others are evaluated once into temps.
+
+var il_fn;
+var il_depth;
+var il_subst;    // per callee param: the expression to use, or 0
+var il_callee;
+
+fn inline_small_calls() {
+    let i = 0;
+    while i < prog_fns[VEC_LEN] {
+        let f = vec_get(prog_fns, i);
+        if !f[F_EXTERN] && f[F_REACH] && !f[F_LEGACY] && f[F_BODY] {
+            il_fn = f;
+            il_depth = 0;
+            il_stmts(f[F_BODY][BLK_STMTS]);
+        }
+        i = i + 1;
+    }
+}
+
+fn il_stmts(v) {
+    let i = 0;
+    while i < v[VEC_LEN] {
+        il_stmt(vec_get(v, i));
+        i = i + 1;
+    }
+}
+
+fn il_stmt(s) {
+    let k = s[N_KIND];
+    if k == ST_BLOCK {
+        il_stmts(s[BLK_STMTS]);
+    } else if k == ST_LET {
+        if s[LET_INIT] {
+            il_expr(s[LET_INIT]);
+        }
+    } else if k == ST_ASSIGN {
+        if s[AS_TARGET][N_KIND] != EX_IDENT {
+            il_expr(s[AS_TARGET]);
+        }
+        il_expr(s[AS_VALUE]);
+    } else if k == ST_EXPR {
+        il_expr(s[ES_X]);
+    } else if k == ST_IF {
+        il_expr(s[IF_COND]);
+        il_stmts(s[IF_THEN][BLK_STMTS]);
+        if s[IF_ELSE] {
+            il_stmt(s[IF_ELSE]);
+        }
+    } else if k == ST_WHILE {
+        il_expr(s[WH_COND]);
+        il_stmts(s[WH_BODY][BLK_STMTS]);
+        if s[WH_POST] {
+            il_stmt(s[WH_POST]);
+        }
+    } else if k == ST_RETURN {
+        if s[RET_VALUE] {
+            il_expr(s[RET_VALUE]);
+        }
+        if s[RET_VALUES] {
+            let i = 0;
+            while i < s[RET_VALUES][VEC_LEN] {
+                il_expr(vec_get(s[RET_VALUES], i));
+                i = i + 1;
+            }
+        }
+    } else if k == ST_CALLMULTI {
+        il_expr(s[CM_CALL]);
+    }
+}
+
+fn il_expr(e) {
+    if !e {
+        return;
+    }
+    let k = e[N_KIND];
+    if k == EX_UNARY {
+        il_expr(e[UN_X]);
+    } else if k == EX_BINARY {
+        il_expr(e[BIN_L]);
+        il_expr(e[BIN_R]);
+    } else if k == EX_CONV {
+        il_expr(e[CV_X]);
+    } else if k == EX_MEM {
+        il_expr(e[MEM_BASE]);
+        il_expr(e[MEM_INDEX]);
+        il_expr(e[MEM_LEN]);
+    } else if k == EX_ELEM {
+        il_expr(e[ELEM_SEQ]);
+        il_expr(e[ELEM_IDX]);
+    } else if k == EX_SEQ {
+        il_stmts(e[SEQ_STMTS]);
+        il_expr(e[SEQ_VALUE]);
+    } else if k == EX_INDEX {
+        il_expr(e[IX_X]);
+        il_expr(e[IX_I]);
+    } else if k == EX_CALL {
+        il_expr(e[CALL_CALLEE]);
+        let args = e[CALL_ARGS];
+        let i = 0;
+        while i < args[VEC_LEN] {
+            il_expr(vec_get(args, i));
+            i = i + 1;
+        }
+        let f = e[CALL_FN];
+        if !e[CALL_INTRINSIC] && !e[CALL_CALLEE] && f {
+            if f[F_EXTERN] {
+                il_float_intrinsic(e, f);
+            } else if il_depth < 4 && f != il_fn && il_inlinable(f) {
+                il_expand(e, f);
+            }
+        }
+    }
+}
+
+// il_float_intrinsic turns libm calls the hardware does in one instruction into intrinsics.
+fn il_float_intrinsic(e, f) {
+    if e[CALL_ARGS][VEC_LEN] != 1 || !is_float_t(e[N_TYPE]) {
+        return;
+    }
+    let name = f[F_NAME];
+    let op = 0;
+    if streq(name, "sqrt") {
+        op = "__fsqrt";
+    } else if streq(name, "fabs") {
+        op = "__fabs";
+    } else if streq(name, "floor") {
+        op = "__frintm";
+    } else if streq(name, "ceil") {
+        op = "__frintp";
+    } else if streq(name, "trunc") {
+        op = "__frintz";
+    } else if streq(name, "round") {
+        op = "__frinta";
+    } else if streq(name, "rint") || streq(name, "nearbyint") {
+        op = "__frintn";
+    }
+    if op {
+        e[CALL_NAME] = op;
+        e[CALL_INTRINSIC] = 1;
+        e[CALL_FN] = 0;
+    }
+}
+
+fn il_inlinable(f) {
+    if f[F_EXTERN] || !f[F_BODY] || f[F_LEGACY] || f[F_VARIADIC] || f[F_RTYPES][VEC_LEN] != 1 {
+        return 0;
+    }
+    let stmts = f[F_BODY][BLK_STMTS];
+    if stmts[VEC_LEN] != 1 {
+        return 0;
+    }
+    let r = vec_get(stmts, 0);
+    if r[N_KIND] != ST_RETURN || !r[RET_VALUE] || r[RET_VALUES] {
+        return 0;
+    }
+    il_callee = f;
+    return il_size(r[RET_VALUE]) <= 40;
+}
+
+// il_size counts nodes, or returns a huge number for anything that cannot be copied.
+fn il_size(e) {
+    if !e {
+        return 0;
+    }
+    let k = e[N_KIND];
+    if k == EX_INT || k == EX_FLOAT || k == EX_STR || k == EX_FUNCREF {
+        return 1;
+    }
+    if k == EX_IDENT {
+        let s = e[ID_REF];
+        if !s {
+            return 1000;
+        }
+        if s[S_KIND] == SYM_LOCAL && il_param_index(s) < 0 {
+            return 1000;
+        }
+        return 1;
+    }
+    if k == EX_UNARY {
+        if streq(e[UN_OP], "&") {
+            return 1000;
+        }
+        return 1 + il_size(e[UN_X]);
+    }
+    if k == EX_BINARY {
+        return 1 + il_size(e[BIN_L]) + il_size(e[BIN_R]);
+    }
+    if k == EX_CONV {
+        return 1 + il_size(e[CV_X]);
+    }
+    if k == EX_MEM {
+        return 1 + il_size(e[MEM_BASE]) + il_size(e[MEM_INDEX]) + il_size(e[MEM_LEN]);
+    }
+    if k == EX_ELEM {
+        return 1 + il_size(e[ELEM_SEQ]) + il_size(e[ELEM_IDX]);
+    }
+    if k == EX_CALL {
+        if e[CALL_CALLEE] || e[CALL_FN] == il_callee {
+            return 1000;
+        }
+        let n = 3;
+        let i = 0;
+        while i < e[CALL_ARGS][VEC_LEN] {
+            n = n + il_size(vec_get(e[CALL_ARGS], i));
+            i = i + 1;
+        }
+        return n;
+    }
+    return 1000;
+}
+
+fn il_param_index(s) {
+    let locals = il_callee[F_LOCALS];
+    let np = il_callee[F_PARAMS][VEC_LEN];
+    let i = 0;
+    while i < np {
+        if vec_get(locals, i) == s {
+            return i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+fn il_uses(e, s) {
+    if !e {
+        return 0;
+    }
+    let k = e[N_KIND];
+    if k == EX_IDENT {
+        return e[ID_REF] == s;
+    }
+    if k == EX_UNARY {
+        return il_uses(e[UN_X], s);
+    }
+    if k == EX_BINARY {
+        return il_uses(e[BIN_L], s) + il_uses(e[BIN_R], s);
+    }
+    if k == EX_CONV {
+        return il_uses(e[CV_X], s);
+    }
+    if k == EX_MEM {
+        return il_uses(e[MEM_BASE], s) + il_uses(e[MEM_INDEX], s) + il_uses(e[MEM_LEN], s);
+    }
+    if k == EX_ELEM {
+        return il_uses(e[ELEM_SEQ], s) + il_uses(e[ELEM_IDX], s);
+    }
+    if k == EX_CALL {
+        let n = 0;
+        let i = 0;
+        while i < e[CALL_ARGS][VEC_LEN] {
+            n = n + il_uses(vec_get(e[CALL_ARGS], i), s);
+            i = i + 1;
+        }
+        return n;
+    }
+    return 0;
+}
+
+fn il_pure(e) {
+    if !e {
+        return 1;
+    }
+    let k = e[N_KIND];
+    if k == EX_INT || k == EX_FLOAT || k == EX_STR || k == EX_FUNCREF {
+        return 1;
+    }
+    if k == EX_IDENT {
+        return e[ID_REF] && e[ID_REF][S_KIND] != SYM_GLOBAL;
+    }
+    if k == EX_UNARY {
+        return !streq(e[UN_OP], "&") && il_pure(e[UN_X]);
+    }
+    if k == EX_BINARY {
+        return il_pure(e[BIN_L]) && il_pure(e[BIN_R]);
+    }
+    if k == EX_CONV {
+        return il_pure(e[CV_X]);
+    }
+    if k == EX_MEM {
+        return il_pure(e[MEM_BASE]) && il_pure(e[MEM_INDEX]) && il_pure(e[MEM_LEN]);
+    }
+    return 0;
+}
+
+fn il_expand(e, f) {
+    let pos = e[N_POS];
+    let args = e[CALL_ARGS];
+    let body = vec_get(f[F_BODY][BLK_STMTS], 0)[RET_VALUE];
+    let np = f[F_PARAMS][VEC_LEN];
+    if args[VEC_LEN] != np {
+        return;
+    }
+    let stmts = vec_new();
+    let subst = vec_filled(np, 0);
+    let i = 0;
+    while i < np {
+        let a = vec_get(args, i);
+        let p = vec_get(f[F_LOCALS], i);
+        let ak = a[N_KIND];
+        let simple = ak == EX_INT || ak == EX_FLOAT || ak == EX_STR || (ak == EX_IDENT && a[ID_REF] && a[ID_REF][S_KIND] == SYM_LOCAL && !a[ID_REF][S_ADDR]);
+        if simple || (il_pure(a) && il_uses(body, p) == 1) {
+            subst[VEC_DATA][i] = a;
+        } else {
+            let t = ia_local_in(il_fn, p[S_TYPE]);
+            vec_push(stmts, let_stmt(pos, t, a));
+            subst[VEC_DATA][i] = sym_ref_node(pos, t);
+        }
+        i = i + 1;
+    }
+    let saved = il_subst;
+    let saved_callee = il_callee;
+    il_subst = subst;
+    il_callee = f;
+    let copy = il_clone(body);
+    il_subst = saved;
+    il_callee = saved_callee;
+    let t = e[N_TYPE];
+    if stmts[VEC_LEN] > 0 {
+        replace_node(e, mk_seq(pos, stmts, copy, t));
+    } else {
+        replace_node(e, copy);
+        e[N_TYPE] = t;
+    }
+    il_depth = il_depth + 1;
+    il_expr(e);
+    il_depth = il_depth - 1;
+}
+
+fn ia_local_in(f, t) {
+    let s = sym_new(SYM_LOCAL, "$", 0);
+    s[S_TYPE] = t;
+    s[S_SLOT] = f[F_SLOTS];
+    f[F_SLOTS] = f[F_SLOTS] + 1;
+    vec_push(f[F_LOCALS], s);
+    return s;
+}
+
+fn il_clone(e) {
+    if !e {
+        return 0;
+    }
+    let k = e[N_KIND];
+    if k == EX_IDENT && e[ID_REF] && e[ID_REF][S_KIND] == SYM_LOCAL {
+        let pi = il_param_index(e[ID_REF]);
+        if pi >= 0 {
+            return il_dup(vec_get(il_subst, pi));
+        }
+    }
+    let c = node_new(k, e[N_POS]);
+    replace_node(c, e);
+    if k == EX_UNARY {
+        c[UN_X] = il_clone(e[UN_X]);
+    } else if k == EX_BINARY {
+        c[BIN_L] = il_clone(e[BIN_L]);
+        c[BIN_R] = il_clone(e[BIN_R]);
+    } else if k == EX_CONV {
+        c[CV_X] = il_clone(e[CV_X]);
+    } else if k == EX_MEM {
+        c[MEM_BASE] = il_clone(e[MEM_BASE]);
+        c[MEM_INDEX] = il_clone(e[MEM_INDEX]);
+        c[MEM_LEN] = il_clone(e[MEM_LEN]);
+    } else if k == EX_ELEM {
+        c[ELEM_SEQ] = il_clone(e[ELEM_SEQ]);
+        c[ELEM_IDX] = il_clone(e[ELEM_IDX]);
+    } else if k == EX_CALL {
+        let args = vec_new();
+        let i = 0;
+        while i < e[CALL_ARGS][VEC_LEN] {
+            vec_push(args, il_clone(vec_get(e[CALL_ARGS], i)));
+            i = i + 1;
+        }
+        c[CALL_ARGS] = args;
+    }
+    return c;
+}
+
+// il_dup copies an argument expression for one more use (it is pure or a single use).
+fn il_dup(a) {
+    return il_clone_plain(a);
+}
+
+fn il_clone_plain(e) {
+    if !e {
+        return 0;
+    }
+    let k = e[N_KIND];
+    let c = node_new(k, e[N_POS]);
+    replace_node(c, e);
+    if k == EX_UNARY {
+        c[UN_X] = il_clone_plain(e[UN_X]);
+    } else if k == EX_BINARY {
+        c[BIN_L] = il_clone_plain(e[BIN_L]);
+        c[BIN_R] = il_clone_plain(e[BIN_R]);
+    } else if k == EX_CONV {
+        c[CV_X] = il_clone_plain(e[CV_X]);
+    } else if k == EX_MEM {
+        c[MEM_BASE] = il_clone_plain(e[MEM_BASE]);
+        c[MEM_INDEX] = il_clone_plain(e[MEM_INDEX]);
+        c[MEM_LEN] = il_clone_plain(e[MEM_LEN]);
+    } else if k == EX_ELEM {
+        c[ELEM_SEQ] = il_clone_plain(e[ELEM_SEQ]);
+        c[ELEM_IDX] = il_clone_plain(e[ELEM_IDX]);
+    } else if k == EX_CALL {
+        let args = vec_new();
+        let i = 0;
+        while i < e[CALL_ARGS][VEC_LEN] {
+            vec_push(args, il_clone_plain(vec_get(e[CALL_ARGS], i)));
+            i = i + 1;
+        }
+        c[CALL_ARGS] = args;
+    }
+    return c;
+}
+
+// lit_word is the little-endian value of size bytes of literal lit at off.
+fn lit_word(lit, off, size) {
+    let v = 0;
+    let i = size - 1;
+    while i >= 0 {
+        v = (v << 8) | load8(lit[STR_PTR] + off + i);
+        i = i - 1;
+    }
+    return v;
+}
+
+// ia_append_lit appends a short string literal with constant stores: two to four
+// instructions for a JSON key instead of a memcpy call.
+fn ia_append_lit(e, lit) {
+    let pos = e[N_POS];
+    let args = e[CALL_ARGS];
+    let st = e[N_TYPE];
+    if !st || kind_of(st) != K_SLICE {
+        st = slice_of(ty_byte);
+    }
+    let len = lit[STR_LEN];
+    let h = ia_local(st);
+    let n = ia_local(ty_int);
+    let p = ia_local(ty_int);
+    let stmts = vec_new();
+    vec_push(stmts, let_stmt(pos, h, vec_get(args, 0)));
+    vec_push(stmts, let_stmt(pos, n, ia_hdr(h, 0)));
+    let slow = node_new(EX_CALL, pos);
+    slow[CALL_NAME] = e[CALL_NAME];
+    slow[CALL_FN] = e[CALL_FN];
+    slow[CALL_ARGS] = args2(ia_ref(h), lit);
+    slow[N_TYPE] = st;
+    let ifs = node_new(ST_IF, pos);
+    ifs[IF_COND] = mk_bin(pos, ">", mk_bin(pos, "+", ia_ref(n), mk_int(pos, len, ty_int), ty_int), ia_hdr(h, 1), ty_bool);
+    ifs[IF_THEN] = empty_block(pos);
+    vec_push(ifs[IF_THEN][BLK_STMTS], assign_stmt(pos, ia_ref(h), slow));
+    let els = empty_block(pos);
+    let eb = els[BLK_STMTS];
+    vec_push(eb, let_stmt(pos, p, mk_bin(pos, "+", ia_hdr(h, 2), ia_ref(n), ty_int)));
+    let off = 0;
+    while off < len {
+        let size = 8;
+        let lg = 3;
+        if len - off < 8 && len - off >= 4 {
+            size = 4;
+            lg = 2;
+        } else if len - off < 4 && len - off >= 2 {
+            size = 2;
+            lg = 1;
+        } else if len - off < 2 {
+            size = 1;
+            lg = 0;
+        }
+        let addr = mk_bin(pos, "+", ia_ref(p), mk_int(pos, off, ty_int), ty_int);
+        let st3 = intrinsic_call(pos, "__st", args3(addr, mk_int(pos, lit_word(lit, off, size), ty_int), mk_int(pos, lg, ty_int)), ty_void);
+        vec_push(eb, expr_stmt(st3));
+        off = off + size;
+    }
+    vec_push(eb, assign_stmt(pos, ia_hdr(h, 0), mk_bin(pos, "+", ia_ref(n), mk_int(pos, len, ty_int), ty_int)));
+    ifs[IF_ELSE] = els;
+    vec_push(stmts, ifs);
+    replace_node(e, mk_seq(pos, stmts, ia_ref(h), st));
+}

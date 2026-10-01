@@ -1,0 +1,1199 @@
+// Package sift sorts and searches slices (like Go's sort and slices); without generics every element type has its own function.
+package sift
+
+// maxInsertion is the largest range sorted by insertion instead of partitioning.
+const maxInsertion = 24
+
+// shortestNinther is the smallest range whose pivot is a median of three medians.
+const shortestNinther = 50
+
+// maxSwaps is the swap count of a fully decreasing pivot sample.
+const maxSwaps = 12
+
+// shortestShifting is the smallest range partialIns is allowed to shift elements in.
+const shortestShifting = 50
+
+// maxSteps is how many out-of-order pairs partialIns fixes before giving up.
+const maxSteps = 5
+
+const hintUnknown = 0
+const hintIncreasing = 1
+const hintDecreasing = 2
+
+// data returns the raw word pointer of a slice's elements (only valid when len > 0).
+func data(h i64) i64 {
+	return h[2]
+}
+
+// bitLen returns the number of bits needed to hold n (0 for 0).
+func bitLen(n i64) i64 {
+	k := 0
+	for n > 0 {
+		n >>= 1
+		k++
+	}
+	return k
+}
+
+// strLess orders two strs bytewise, a shorter prefix first.
+func strLess(a str, b str) bool {
+	la := len(a)
+	lb := len(b)
+	n := la
+	if lb < n {
+		n = lb
+	}
+	if n > 0 {
+		pa := cast(i64, a) + 8
+		pb := cast(i64, b) + 8
+		ca := i64(load8(pa))
+		cb := i64(load8(pb))
+		if ca != cb {
+			return ca < cb
+		}
+		r := (memcmp(pa, pb, n) << 32) >> 32
+		if r != 0 {
+			return r < 0
+		}
+	}
+	return la < lb
+}
+
+// reverseRange reverses the words d[a:b).
+func reverseRange(d i64, a i64, b i64) {
+	i := a
+	j := b - 1
+	for i < j {
+		t := d[i]
+		d[i] = d[j]
+		d[j] = t
+		i++
+		j--
+	}
+}
+
+// breakPatterns swaps three pseudo-random words into the middle of d[a:b) so a bad pivot pattern cannot repeat.
+func breakPatterns(d i64, a i64, b i64) {
+	length := b - a
+	if length >= 8 {
+		random := u64(length)
+		modulus := u64(1) << bitLen(length)
+		idx := a + (length/4)*2 - 1
+		for i := 0; i < 3; i++ {
+			random ^= random << 13
+			random ^= random >> 7
+			random ^= random << 17
+			other := i64(random & (modulus - 1))
+			if other >= length {
+				other -= length
+			}
+			t := d[idx-1+i]
+			d[idx-1+i] = d[a+other]
+			d[a+other] = t
+		}
+	}
+}
+
+// Ints sorts xs in increasing order with pattern-defeating quicksort (not stable, O(n log n) worst case).
+func Ints(xs mut []i64) {
+	n := len(xs)
+	if n < 2 {
+		return
+	}
+	pdqInts(data(cast(i64, xs)), 0, n, bitLen(n))
+}
+
+// IntsDesc sorts xs in decreasing order.
+func IntsDesc(xs mut []i64) {
+	n := len(xs)
+	if n < 2 {
+		return
+	}
+	d := data(cast(i64, xs))
+	pdqInts(d, 0, n, bitLen(n))
+	reverseRange(d, 0, n)
+}
+
+// U64s sorts xs in increasing unsigned order.
+func U64s(xs mut []u64) {
+	n := len(xs)
+	if n < 2 {
+		return
+	}
+	d := data(cast(i64, xs))
+	sb := i64(1) << 63
+	for i := 0; i < n; i++ {
+		d[i] ^= sb
+	}
+	pdqInts(d, 0, n, bitLen(n))
+	for i := 0; i < n; i++ {
+		d[i] ^= sb
+	}
+}
+
+// F64s sorts xs in increasing order with NaNs first, like Go's slices.Sort (-0 sorts before 0).
+func F64s(xs mut []f64) {
+	n := len(xs)
+	if n < 2 {
+		return
+	}
+	d := data(cast(i64, xs))
+	k := 0
+	for i := 0; i < n; i++ {
+		w := d[i]
+		if w&0x7fffffffffffffff > 0x7ff0000000000000 {
+			d[i] = d[k]
+			d[k] = w
+			k++
+		}
+	}
+	for i := k; i < n; i++ {
+		w := d[i]
+		d[i] = w ^ ((w >> 63) & 0x7fffffffffffffff)
+	}
+	pdqInts(d+k*8, 0, n-k, bitLen(n-k))
+	for i := k; i < n; i++ {
+		w := d[i]
+		d[i] = w ^ ((w >> 63) & 0x7fffffffffffffff)
+	}
+}
+
+// Strs sorts xs in increasing bytewise order.
+func Strs(xs mut []str) {
+	n := len(xs)
+	if n < 2 {
+		return
+	}
+	pdqStrs(data(cast(i64, xs)), 0, n, bitLen(n))
+}
+
+// SortBy sorts xs so that less(xs[i+1], xs[i]) is never true (less must be a strict weak order).
+func SortBy(xs mut []i64, less func(i64, i64) bool) {
+	n := len(xs)
+	if n < 2 {
+		return
+	}
+	pdqBy(data(cast(i64, xs)), 0, n, bitLen(n), less)
+}
+
+// HeapInts sorts xs in increasing order with heapsort (slower than Ints, no recursion, no extra memory).
+func HeapInts(xs mut []i64) {
+	n := len(xs)
+	if n < 2 {
+		return
+	}
+	heapInts(data(cast(i64, xs)), 0, n)
+}
+
+// StableInts sorts xs in increasing order with a merge sort that keeps equal elements in their original order.
+func StableInts(xs mut []i64) {
+	n := len(xs)
+	if n < 2 {
+		return
+	}
+	d := data(cast(i64, xs))
+	if n <= maxInsertion {
+		insInts(d, 0, n)
+		return
+	}
+	tmp := make([]i64, n)
+	t := data(cast(i64, tmp))
+	memcpy(t, d, n*8)
+	msortInts(t, d, 0, n)
+}
+
+// msortInts sorts the words s[a:b) into d[a:b) using s as scratch (both hold the same words on entry).
+func msortInts(s i64, d i64, a i64, b i64) {
+	if b-a <= maxInsertion {
+		insInts(d, a, b)
+		return
+	}
+	mid := a + (b-a)/2
+	msortInts(d, s, a, mid)
+	msortInts(d, s, mid, b)
+	if s[mid-1] <= s[mid] {
+		memcpy(d+a*8, s+a*8, (b-a)*8)
+		return
+	}
+	i := a
+	j := mid
+	k := a
+	for i < mid && j < b {
+		if s[j] < s[i] {
+			d[k] = s[j]
+			j++
+		} else {
+			d[k] = s[i]
+			i++
+		}
+		k++
+	}
+	for i < mid {
+		d[k] = s[i]
+		i++
+		k++
+	}
+	for j < b {
+		d[k] = s[j]
+		j++
+		k++
+	}
+}
+
+// IsSortedInts reports whether xs is in increasing order.
+func IsSortedInts(xs []i64) bool {
+	for i := len(xs) - 1; i > 0; i-- {
+		if xs[i] < xs[i-1] {
+			return false
+		}
+	}
+	return true
+}
+
+// IsSortedStrs reports whether xs is in increasing bytewise order.
+func IsSortedStrs(xs []str) bool {
+	for i := len(xs) - 1; i > 0; i-- {
+		if strLess(xs[i], xs[i-1]) {
+			return false
+		}
+	}
+	return true
+}
+
+// SearchInts returns the first index of sorted xs holding a value >= x (len(xs) when there is none).
+func SearchInts(xs []i64, x i64) i64 {
+	lo := 0
+	hi := len(xs)
+	if hi == 0 {
+		return 0
+	}
+	d := data(cast(i64, xs))
+	for lo < hi {
+		m := lo + (hi-lo)/2
+		if d[m] < x {
+			lo = m + 1
+		} else {
+			hi = m
+		}
+	}
+	return lo
+}
+
+// SearchStrs returns the first index of sorted xs holding a str >= x bytewise (len(xs) when there is none).
+func SearchStrs(xs []str, x str) i64 {
+	lo := 0
+	hi := len(xs)
+	if hi == 0 {
+		return 0
+	}
+	d := data(cast(i64, xs))
+	for lo < hi {
+		m := lo + (hi-lo)/2
+		if strLess(cast(str, d[m]), x) {
+			lo = m + 1
+		} else {
+			hi = m
+		}
+	}
+	return lo
+}
+
+// ReverseInts reverses xs in place.
+func ReverseInts(xs mut []i64) {
+	n := len(xs)
+	if n < 2 {
+		return
+	}
+	reverseRange(data(cast(i64, xs)), 0, n)
+}
+
+// ReverseStrs reverses xs in place.
+func ReverseStrs(xs mut []str) {
+	n := len(xs)
+	if n < 2 {
+		return
+	}
+	reverseRange(data(cast(i64, xs)), 0, n)
+}
+
+// UniqInts compacts runs of equal values in sorted xs to one element and returns the new length (xs[0:k] is the result).
+func UniqInts(xs mut []i64) i64 {
+	n := len(xs)
+	if n < 2 {
+		return n
+	}
+	d := data(cast(i64, xs))
+	k := 1
+	for i := 1; i < n; i++ {
+		if d[i] != d[k-1] {
+			d[k] = d[i]
+			k++
+		}
+	}
+	return k
+}
+
+// MinInts returns the smallest element of xs, or a fault when xs is empty.
+func MinInts(xs []i64) (i64, fault) {
+	n := len(xs)
+	if n == 0 {
+		return 0, fail("sift: MinInts of empty slice")
+	}
+	d := data(cast(i64, xs))
+	m := d[0]
+	for i := 1; i < n; i++ {
+		if d[i] < m {
+			m = d[i]
+		}
+	}
+	return m, nil
+}
+
+// MaxInts returns the largest element of xs, or a fault when xs is empty.
+func MaxInts(xs []i64) (i64, fault) {
+	n := len(xs)
+	if n == 0 {
+		return 0, fail("sift: MaxInts of empty slice")
+	}
+	d := data(cast(i64, xs))
+	m := d[0]
+	for i := 1; i < n; i++ {
+		if d[i] > m {
+			m = d[i]
+		}
+	}
+	return m, nil
+}
+
+// SumInts returns the sum of xs (wrapping on overflow, 0 for an empty slice).
+func SumInts(xs []i64) i64 {
+	s := i64(0)
+	for _, v := range xs {
+		s += v
+	}
+	return s
+}
+
+// IndexInts returns the index of the first x in xs, or -1.
+func IndexInts(xs []i64, x i64) i64 {
+	for i, v := range xs {
+		if v == x {
+			return i
+		}
+	}
+	return -1
+}
+
+// ContainsStr reports whether x occurs in xs.
+func ContainsStr(xs []str, x str) bool {
+	for _, v := range xs {
+		if v == x {
+			return true
+		}
+	}
+	return false
+}
+
+// EqualInts reports whether a and b have the same length and elements.
+func EqualInts(a []i64, b []i64) bool {
+	n := len(a)
+	if n != len(b) {
+		return false
+	}
+	if n == 0 {
+		return true
+	}
+	return memcmp(data(cast(i64, a)), data(cast(i64, b)), n*8)&0xffffffff == 0
+}
+
+// insInts sorts d[a:b) by insertion.
+func insInts(d i64, a i64, b i64) {
+	for i := a + 1; i < b; i++ {
+		v := d[i]
+		j := i
+		for j > a && v < d[j-1] {
+			d[j] = d[j-1]
+			j--
+		}
+		d[j] = v
+	}
+}
+
+// siftDownInts restores the max-heap property below root in the heap d[first:first+hi).
+func siftDownInts(d i64, lo i64, hi i64, first i64) {
+	root := lo
+	for {
+		child := 2*root + 1
+		if child >= hi {
+			return
+		}
+		if child+1 < hi && d[first+child] < d[first+child+1] {
+			child++
+		}
+		if !(d[first+root] < d[first+child]) {
+			return
+		}
+		t := d[first+root]
+		d[first+root] = d[first+child]
+		d[first+child] = t
+		root = child
+	}
+}
+
+// heapInts sorts d[a:b) with heapsort.
+func heapInts(d i64, a i64, b i64) {
+	first := a
+	hi := b - a
+	for i := (hi - 1) / 2; i >= 0; i-- {
+		siftDownInts(d, i, hi, first)
+	}
+	for i := hi - 1; i >= 0; i-- {
+		t := d[first]
+		d[first] = d[first+i]
+		d[first+i] = t
+		siftDownInts(d, 0, i, first)
+	}
+}
+
+// med3Ints returns the index of the median of d[a], d[b], d[c] and how many of the three orderings were reversed.
+func med3Ints(d i64, a i64, b i64, c i64) (i64, i64) {
+	s := 0
+	if d[b] < d[a] {
+		t := a
+		a = b
+		b = t
+		s++
+	}
+	if d[c] < d[b] {
+		t := b
+		b = c
+		c = t
+		s++
+	}
+	if d[b] < d[a] {
+		t := a
+		a = b
+		b = t
+		s++
+	}
+	return b, s
+}
+
+// pivotInts picks a pivot index in d[a:b) (median of three, ninther from 50 elements) and a sortedness hint.
+func pivotInts(d i64, a i64, b i64) (i64, i64) {
+	l := b - a
+	swaps := 0
+	s := 0
+	i := a + l/4*1
+	j := a + l/4*2
+	k := a + l/4*3
+	if l >= 8 {
+		if l >= shortestNinther {
+			i, s = med3Ints(d, i-1, i, i+1)
+			swaps += s
+			j, s = med3Ints(d, j-1, j, j+1)
+			swaps += s
+			k, s = med3Ints(d, k-1, k, k+1)
+			swaps += s
+		}
+		j, s = med3Ints(d, i, j, k)
+		swaps += s
+	}
+	if swaps == 0 {
+		return j, hintIncreasing
+	}
+	if swaps == maxSwaps {
+		return j, hintDecreasing
+	}
+	return j, hintUnknown
+}
+
+// partInts partitions d[a:b) around d[pivot], returning the pivot's final index and whether nothing had to move.
+func partInts(d i64, a i64, b i64, pivot i64) (i64, bool) {
+	t := d[a]
+	d[a] = d[pivot]
+	d[pivot] = t
+	p := d[a]
+	i := a + 1
+	j := b - 1
+	for i <= j && d[i] < p {
+		i++
+	}
+	for i <= j && !(d[j] < p) {
+		j--
+	}
+	if i > j {
+		d[a] = d[j]
+		d[j] = p
+		return j, true
+	}
+	t = d[i]
+	d[i] = d[j]
+	d[j] = t
+	i++
+	j--
+	for {
+		for i <= j && d[i] < p {
+			i++
+		}
+		for i <= j && !(d[j] < p) {
+			j--
+		}
+		if i > j {
+			break
+		}
+		t = d[i]
+		d[i] = d[j]
+		d[j] = t
+		i++
+		j--
+	}
+	d[a] = d[j]
+	d[j] = p
+	return j, false
+}
+
+// partEqInts moves the elements equal to d[pivot] to the front of d[a:b) and returns the index after them.
+func partEqInts(d i64, a i64, b i64, pivot i64) i64 {
+	t := d[a]
+	d[a] = d[pivot]
+	d[pivot] = t
+	p := d[a]
+	i := a + 1
+	j := b - 1
+	for {
+		for i <= j && !(p < d[i]) {
+			i++
+		}
+		for i <= j && p < d[j] {
+			j--
+		}
+		if i > j {
+			break
+		}
+		t = d[i]
+		d[i] = d[j]
+		d[j] = t
+		i++
+		j--
+	}
+	return i
+}
+
+// partialInsInts finishes a nearly sorted d[a:b) with at most five adjacent fixes, reporting whether it is sorted now.
+func partialInsInts(d i64, a i64, b i64) bool {
+	i := a + 1
+	for step := 0; step < maxSteps; step++ {
+		for i < b && !(d[i] < d[i-1]) {
+			i++
+		}
+		if i == b {
+			return true
+		}
+		if b-a < shortestShifting {
+			return false
+		}
+		t := d[i]
+		d[i] = d[i-1]
+		d[i-1] = t
+		if i-a >= 2 {
+			for j := i - 1; j > a; j-- {
+				if !(d[j] < d[j-1]) {
+					break
+				}
+				t = d[j]
+				d[j] = d[j-1]
+				d[j-1] = t
+			}
+		}
+		if b-i >= 2 {
+			for j := i + 1; j < b; j++ {
+				if !(d[j] < d[j-1]) {
+					break
+				}
+				t = d[j]
+				d[j] = d[j-1]
+				d[j-1] = t
+			}
+		}
+	}
+	return false
+}
+
+// pdqInts sorts d[a:b) with pattern-defeating quicksort, falling back to heapsort after limit bad partitions.
+func pdqInts(d i64, a i64, b i64, limit i64) {
+	wasBalanced := true
+	wasPartitioned := true
+	for {
+		length := b - a
+		if length <= maxInsertion {
+			insInts(d, a, b)
+			return
+		}
+		if limit == 0 {
+			heapInts(d, a, b)
+			return
+		}
+		if !wasBalanced {
+			breakPatterns(d, a, b)
+			limit--
+		}
+		pivot, hint := pivotInts(d, a, b)
+		if hint == hintDecreasing {
+			reverseRange(d, a, b)
+			pivot = (b - 1) - (pivot - a)
+			hint = hintIncreasing
+		}
+		if wasBalanced && wasPartitioned && hint == hintIncreasing {
+			if partialInsInts(d, a, b) {
+				return
+			}
+		}
+		if a > 0 && !(d[a-1] < d[pivot]) {
+			a = partEqInts(d, a, b, pivot)
+			continue
+		}
+		mid, already := partInts(d, a, b, pivot)
+		wasPartitioned = already
+		leftLen := mid - a
+		rightLen := b - mid
+		balanceThreshold := length / 8
+		if leftLen < rightLen {
+			wasBalanced = leftLen >= balanceThreshold
+			pdqInts(d, a, mid, limit)
+			a = mid + 1
+		} else {
+			wasBalanced = rightLen >= balanceThreshold
+			pdqInts(d, mid+1, b, limit)
+			b = mid
+		}
+	}
+}
+
+// insStrs sorts d[a:b) by insertion.
+func insStrs(d i64, a i64, b i64) {
+	for i := a + 1; i < b; i++ {
+		v := d[i]
+		j := i
+		for j > a && strLess(cast(str, v), cast(str, d[j-1])) {
+			d[j] = d[j-1]
+			j--
+		}
+		d[j] = v
+	}
+}
+
+// siftDownStrs restores the max-heap property below root in the heap d[first:first+hi).
+func siftDownStrs(d i64, lo i64, hi i64, first i64) {
+	root := lo
+	for {
+		child := 2*root + 1
+		if child >= hi {
+			return
+		}
+		if child+1 < hi && strLess(cast(str, d[first+child]), cast(str, d[first+child+1])) {
+			child++
+		}
+		if !strLess(cast(str, d[first+root]), cast(str, d[first+child])) {
+			return
+		}
+		t := d[first+root]
+		d[first+root] = d[first+child]
+		d[first+child] = t
+		root = child
+	}
+}
+
+// heapStrs sorts d[a:b) with heapsort.
+func heapStrs(d i64, a i64, b i64) {
+	first := a
+	hi := b - a
+	for i := (hi - 1) / 2; i >= 0; i-- {
+		siftDownStrs(d, i, hi, first)
+	}
+	for i := hi - 1; i >= 0; i-- {
+		t := d[first]
+		d[first] = d[first+i]
+		d[first+i] = t
+		siftDownStrs(d, 0, i, first)
+	}
+}
+
+// med3Strs returns the index of the median of d[a], d[b], d[c] and how many of the three orderings were reversed.
+func med3Strs(d i64, a i64, b i64, c i64) (i64, i64) {
+	s := 0
+	if strLess(cast(str, d[b]), cast(str, d[a])) {
+		t := a
+		a = b
+		b = t
+		s++
+	}
+	if strLess(cast(str, d[c]), cast(str, d[b])) {
+		t := b
+		b = c
+		c = t
+		s++
+	}
+	if strLess(cast(str, d[b]), cast(str, d[a])) {
+		t := a
+		a = b
+		b = t
+		s++
+	}
+	return b, s
+}
+
+// pivotStrs picks a pivot index in d[a:b) (median of three, ninther from 50 elements) and a sortedness hint.
+func pivotStrs(d i64, a i64, b i64) (i64, i64) {
+	l := b - a
+	swaps := 0
+	s := 0
+	i := a + l/4*1
+	j := a + l/4*2
+	k := a + l/4*3
+	if l >= 8 {
+		if l >= shortestNinther {
+			i, s = med3Strs(d, i-1, i, i+1)
+			swaps += s
+			j, s = med3Strs(d, j-1, j, j+1)
+			swaps += s
+			k, s = med3Strs(d, k-1, k, k+1)
+			swaps += s
+		}
+		j, s = med3Strs(d, i, j, k)
+		swaps += s
+	}
+	if swaps == 0 {
+		return j, hintIncreasing
+	}
+	if swaps == maxSwaps {
+		return j, hintDecreasing
+	}
+	return j, hintUnknown
+}
+
+// partStrs partitions d[a:b) around d[pivot], returning the pivot's final index and whether nothing had to move.
+func partStrs(d i64, a i64, b i64, pivot i64) (i64, bool) {
+	t := d[a]
+	d[a] = d[pivot]
+	d[pivot] = t
+	p := d[a]
+	i := a + 1
+	j := b - 1
+	for i <= j && strLess(cast(str, d[i]), cast(str, p)) {
+		i++
+	}
+	for i <= j && !strLess(cast(str, d[j]), cast(str, p)) {
+		j--
+	}
+	if i > j {
+		d[a] = d[j]
+		d[j] = p
+		return j, true
+	}
+	t = d[i]
+	d[i] = d[j]
+	d[j] = t
+	i++
+	j--
+	for {
+		for i <= j && strLess(cast(str, d[i]), cast(str, p)) {
+			i++
+		}
+		for i <= j && !strLess(cast(str, d[j]), cast(str, p)) {
+			j--
+		}
+		if i > j {
+			break
+		}
+		t = d[i]
+		d[i] = d[j]
+		d[j] = t
+		i++
+		j--
+	}
+	d[a] = d[j]
+	d[j] = p
+	return j, false
+}
+
+// partEqStrs moves the elements equal to d[pivot] to the front of d[a:b) and returns the index after them.
+func partEqStrs(d i64, a i64, b i64, pivot i64) i64 {
+	t := d[a]
+	d[a] = d[pivot]
+	d[pivot] = t
+	p := d[a]
+	i := a + 1
+	j := b - 1
+	for {
+		for i <= j && !strLess(cast(str, p), cast(str, d[i])) {
+			i++
+		}
+		for i <= j && strLess(cast(str, p), cast(str, d[j])) {
+			j--
+		}
+		if i > j {
+			break
+		}
+		t = d[i]
+		d[i] = d[j]
+		d[j] = t
+		i++
+		j--
+	}
+	return i
+}
+
+// partialInsStrs finishes a nearly sorted d[a:b) with at most five adjacent fixes, reporting whether it is sorted now.
+func partialInsStrs(d i64, a i64, b i64) bool {
+	i := a + 1
+	for step := 0; step < maxSteps; step++ {
+		for i < b && !strLess(cast(str, d[i]), cast(str, d[i-1])) {
+			i++
+		}
+		if i == b {
+			return true
+		}
+		if b-a < shortestShifting {
+			return false
+		}
+		t := d[i]
+		d[i] = d[i-1]
+		d[i-1] = t
+		if i-a >= 2 {
+			for j := i - 1; j > a; j-- {
+				if !strLess(cast(str, d[j]), cast(str, d[j-1])) {
+					break
+				}
+				t = d[j]
+				d[j] = d[j-1]
+				d[j-1] = t
+			}
+		}
+		if b-i >= 2 {
+			for j := i + 1; j < b; j++ {
+				if !strLess(cast(str, d[j]), cast(str, d[j-1])) {
+					break
+				}
+				t = d[j]
+				d[j] = d[j-1]
+				d[j-1] = t
+			}
+		}
+	}
+	return false
+}
+
+// pdqStrs sorts d[a:b) with pattern-defeating quicksort, falling back to heapsort after limit bad partitions.
+func pdqStrs(d i64, a i64, b i64, limit i64) {
+	wasBalanced := true
+	wasPartitioned := true
+	for {
+		length := b - a
+		if length <= maxInsertion {
+			insStrs(d, a, b)
+			return
+		}
+		if limit == 0 {
+			heapStrs(d, a, b)
+			return
+		}
+		if !wasBalanced {
+			breakPatterns(d, a, b)
+			limit--
+		}
+		pivot, hint := pivotStrs(d, a, b)
+		if hint == hintDecreasing {
+			reverseRange(d, a, b)
+			pivot = (b - 1) - (pivot - a)
+			hint = hintIncreasing
+		}
+		if wasBalanced && wasPartitioned && hint == hintIncreasing {
+			if partialInsStrs(d, a, b) {
+				return
+			}
+		}
+		if a > 0 && !strLess(cast(str, d[a-1]), cast(str, d[pivot])) {
+			a = partEqStrs(d, a, b, pivot)
+			continue
+		}
+		mid, already := partStrs(d, a, b, pivot)
+		wasPartitioned = already
+		leftLen := mid - a
+		rightLen := b - mid
+		balanceThreshold := length / 8
+		if leftLen < rightLen {
+			wasBalanced = leftLen >= balanceThreshold
+			pdqStrs(d, a, mid, limit)
+			a = mid + 1
+		} else {
+			wasBalanced = rightLen >= balanceThreshold
+			pdqStrs(d, mid+1, b, limit)
+			b = mid
+		}
+	}
+}
+
+// insBy sorts d[a:b) by insertion.
+func insBy(d i64, a i64, b i64, less func(i64, i64) bool) {
+	for i := a + 1; i < b; i++ {
+		v := d[i]
+		j := i
+		for j > a && less(v, d[j-1]) {
+			d[j] = d[j-1]
+			j--
+		}
+		d[j] = v
+	}
+}
+
+// siftDownBy restores the max-heap property below root in the heap d[first:first+hi).
+func siftDownBy(d i64, lo i64, hi i64, first i64, less func(i64, i64) bool) {
+	root := lo
+	for {
+		child := 2*root + 1
+		if child >= hi {
+			return
+		}
+		if child+1 < hi && less(d[first+child], d[first+child+1]) {
+			child++
+		}
+		if !less(d[first+root], d[first+child]) {
+			return
+		}
+		t := d[first+root]
+		d[first+root] = d[first+child]
+		d[first+child] = t
+		root = child
+	}
+}
+
+// heapBy sorts d[a:b) with heapsort.
+func heapBy(d i64, a i64, b i64, less func(i64, i64) bool) {
+	first := a
+	hi := b - a
+	for i := (hi - 1) / 2; i >= 0; i-- {
+		siftDownBy(d, i, hi, first, less)
+	}
+	for i := hi - 1; i >= 0; i-- {
+		t := d[first]
+		d[first] = d[first+i]
+		d[first+i] = t
+		siftDownBy(d, 0, i, first, less)
+	}
+}
+
+// med3By returns the index of the median of d[a], d[b], d[c] and how many of the three orderings were reversed.
+func med3By(d i64, a i64, b i64, c i64, less func(i64, i64) bool) (i64, i64) {
+	s := 0
+	if less(d[b], d[a]) {
+		t := a
+		a = b
+		b = t
+		s++
+	}
+	if less(d[c], d[b]) {
+		t := b
+		b = c
+		c = t
+		s++
+	}
+	if less(d[b], d[a]) {
+		t := a
+		a = b
+		b = t
+		s++
+	}
+	return b, s
+}
+
+// pivotBy picks a pivot index in d[a:b) (median of three, ninther from 50 elements) and a sortedness hint.
+func pivotBy(d i64, a i64, b i64, less func(i64, i64) bool) (i64, i64) {
+	l := b - a
+	swaps := 0
+	s := 0
+	i := a + l/4*1
+	j := a + l/4*2
+	k := a + l/4*3
+	if l >= 8 {
+		if l >= shortestNinther {
+			i, s = med3By(d, i-1, i, i+1, less)
+			swaps += s
+			j, s = med3By(d, j-1, j, j+1, less)
+			swaps += s
+			k, s = med3By(d, k-1, k, k+1, less)
+			swaps += s
+		}
+		j, s = med3By(d, i, j, k, less)
+		swaps += s
+	}
+	if swaps == 0 {
+		return j, hintIncreasing
+	}
+	if swaps == maxSwaps {
+		return j, hintDecreasing
+	}
+	return j, hintUnknown
+}
+
+// partBy partitions d[a:b) around d[pivot], returning the pivot's final index and whether nothing had to move.
+func partBy(d i64, a i64, b i64, pivot i64, less func(i64, i64) bool) (i64, bool) {
+	t := d[a]
+	d[a] = d[pivot]
+	d[pivot] = t
+	p := d[a]
+	i := a + 1
+	j := b - 1
+	for i <= j && less(d[i], p) {
+		i++
+	}
+	for i <= j && !less(d[j], p) {
+		j--
+	}
+	if i > j {
+		d[a] = d[j]
+		d[j] = p
+		return j, true
+	}
+	t = d[i]
+	d[i] = d[j]
+	d[j] = t
+	i++
+	j--
+	for {
+		for i <= j && less(d[i], p) {
+			i++
+		}
+		for i <= j && !less(d[j], p) {
+			j--
+		}
+		if i > j {
+			break
+		}
+		t = d[i]
+		d[i] = d[j]
+		d[j] = t
+		i++
+		j--
+	}
+	d[a] = d[j]
+	d[j] = p
+	return j, false
+}
+
+// partEqBy moves the elements equal to d[pivot] to the front of d[a:b) and returns the index after them.
+func partEqBy(d i64, a i64, b i64, pivot i64, less func(i64, i64) bool) i64 {
+	t := d[a]
+	d[a] = d[pivot]
+	d[pivot] = t
+	p := d[a]
+	i := a + 1
+	j := b - 1
+	for {
+		for i <= j && !less(p, d[i]) {
+			i++
+		}
+		for i <= j && less(p, d[j]) {
+			j--
+		}
+		if i > j {
+			break
+		}
+		t = d[i]
+		d[i] = d[j]
+		d[j] = t
+		i++
+		j--
+	}
+	return i
+}
+
+// partialInsBy finishes a nearly sorted d[a:b) with at most five adjacent fixes, reporting whether it is sorted now.
+func partialInsBy(d i64, a i64, b i64, less func(i64, i64) bool) bool {
+	i := a + 1
+	for step := 0; step < maxSteps; step++ {
+		for i < b && !less(d[i], d[i-1]) {
+			i++
+		}
+		if i == b {
+			return true
+		}
+		if b-a < shortestShifting {
+			return false
+		}
+		t := d[i]
+		d[i] = d[i-1]
+		d[i-1] = t
+		if i-a >= 2 {
+			for j := i - 1; j > a; j-- {
+				if !less(d[j], d[j-1]) {
+					break
+				}
+				t = d[j]
+				d[j] = d[j-1]
+				d[j-1] = t
+			}
+		}
+		if b-i >= 2 {
+			for j := i + 1; j < b; j++ {
+				if !less(d[j], d[j-1]) {
+					break
+				}
+				t = d[j]
+				d[j] = d[j-1]
+				d[j-1] = t
+			}
+		}
+	}
+	return false
+}
+
+// pdqBy sorts d[a:b) with pattern-defeating quicksort, falling back to heapsort after limit bad partitions.
+func pdqBy(d i64, a i64, b i64, limit i64, less func(i64, i64) bool) {
+	wasBalanced := true
+	wasPartitioned := true
+	for {
+		length := b - a
+		if length <= maxInsertion {
+			insBy(d, a, b, less)
+			return
+		}
+		if limit == 0 {
+			heapBy(d, a, b, less)
+			return
+		}
+		if !wasBalanced {
+			breakPatterns(d, a, b)
+			limit--
+		}
+		pivot, hint := pivotBy(d, a, b, less)
+		if hint == hintDecreasing {
+			reverseRange(d, a, b)
+			pivot = (b - 1) - (pivot - a)
+			hint = hintIncreasing
+		}
+		if wasBalanced && wasPartitioned && hint == hintIncreasing {
+			if partialInsBy(d, a, b, less) {
+				return
+			}
+		}
+		if a > 0 && !less(d[a-1], d[pivot]) {
+			a = partEqBy(d, a, b, pivot, less)
+			continue
+		}
+		mid, already := partBy(d, a, b, pivot, less)
+		wasPartitioned = already
+		leftLen := mid - a
+		rightLen := b - mid
+		balanceThreshold := length / 8
+		if leftLen < rightLen {
+			wasBalanced = leftLen >= balanceThreshold
+			pdqBy(d, a, mid, limit, less)
+			a = mid + 1
+		} else {
+			wasBalanced = rightLen >= balanceThreshold
+			pdqBy(d, mid+1, b, limit, less)
+			b = mid
+		}
+	}
+}

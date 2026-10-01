@@ -1,0 +1,486 @@
+// Generics by monomorphization: each use of a generic function or type with new type
+// arguments re-parses the declaration's tokens and checks the copy with the type
+// parameters bound, so every instance is ordinary, fully specialized code.
+
+var ck_tbind;       // vec of [name, type]: type parameters in scope
+var ty_generics;    // vec of [qualified name, decl] for generic types
+var gen_pending;    // [method template, type args] waiting for functions to be declared
+var ck_decl_done;
+
+fn tbind_lookup(name) {
+    if !ck_tbind {
+        return 0;
+    }
+    let i = 0;
+    while i < ck_tbind[VEC_LEN] {
+        let p = vec_get(ck_tbind, i);
+        if streq(vec_get(p, 0), name) {
+            return vec_get(p, 1);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn tbind_pairs(names, types) {
+    let v = vec_new();
+    let i = 0;
+    while i < names[VEC_LEN] {
+        vec_push(v, pair(vec_get(names, i), vec_get(types, i)));
+        i = i + 1;
+    }
+    return v;
+}
+
+fn same_types(a, b) {
+    if a[VEC_LEN] != b[VEC_LEN] {
+        return 0;
+    }
+    let i = 0;
+    while i < a[VEC_LEN] {
+        if vec_get(a, i) != vec_get(b, i) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// targs_name appends "[T1,T2]" to b.
+fn targs_name(b, targs) {
+    buf_byte(b, '[');
+    let i = 0;
+    while i < targs[VEC_LEN] {
+        if i > 0 {
+            buf_byte(b, ',');
+        }
+        type_name(b, vec_get(targs, i));
+        i = i + 1;
+    }
+    buf_byte(b, ']');
+}
+
+// generics_init registers generic types and gives them their method templates.
+fn generics_init() {
+    ty_generics = vec_new();
+    gen_pending = vec_new();
+    ck_decl_done = 0;
+    let i = 0;
+    while i < prog_types[VEC_LEN] {
+        let d = vec_get(prog_types, i);
+        if d[D_TPARAMS] {
+            set_file(d[D_FILE]);
+            d[D_INSTS] = vec_new();
+            d[D_METHODS] = vec_new();
+            vec_push(ty_generics, pair(qual(ck_pkg, d[D_NAME]), d));
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < prog_fns[VEC_LEN] {
+        let f = vec_get(prog_fns, i);
+        let rx = f[F_RECV];
+        if rx && rx[N_KIND] == TX_NAME && rx[TX_ARGS] {
+            set_file(f[F_FILE]);
+            let d = find_generic(qual(ck_pkg, rx[TX_B]));
+            if !d {
+                err_quoted(f[F_POS], "", rx[TX_B], " is not a generic type");
+            } else {
+                vec_push(d[D_METHODS], f);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn find_generic(qname) {
+    let i = 0;
+    while i < ty_generics[VEC_LEN] {
+        let p = vec_get(ty_generics, i);
+        if streq(vec_get(p, 0), qname) {
+            return vec_get(p, 1);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn is_template(f) {
+    return f[F_TPARAMS] && !f[F_TBIND];
+}
+
+// generic_type_ref resolves Name[T...] in the current file.
+fn generic_type_ref(tx) {
+    let d = 0;
+    if tx[TX_A] {
+        let pkg = import_pkg(tx[TX_A]);
+        if pkg {
+            d = find_generic(str_cat3(pkg, ".", tx[TX_B]));
+        }
+    } else {
+        if load8(ck_pkg) != 0 {
+            d = find_generic(qual(ck_pkg, tx[TX_B]));
+        }
+        if !d {
+            d = find_generic(tx[TX_B]);
+        }
+    }
+    if !d {
+        err_quoted(tx[N_POS], "", tx[TX_B], " is not a generic type");
+        return ty_int;
+    }
+    let targs = resolve_types(tx[TX_ARGS]);
+    if targs[VEC_LEN] != d[D_TPARAMS][VEC_LEN] {
+        err_quoted(tx[N_POS], "wrong number of type arguments for ", tx[TX_B], "");
+        return ty_int;
+    }
+    return instantiate_type(d, targs, tx[N_POS]);
+}
+
+// Checker state an instantiation must not disturb.
+fn ck_state_save() {
+    let s = vec_new();
+    vec_push(s, ck_file);
+    vec_push(s, ck_legacy);
+    vec_push(s, ck_fn);
+    vec_push(s, ck_tbind);
+    return s;
+}
+
+fn ck_state_restore(s) {
+    set_file(vec_get(s, 0));
+    ck_legacy = vec_get(s, 1);
+    ck_fn = vec_get(s, 2);
+    ck_tbind = vec_get(s, 3);
+}
+
+fn check_constraints(pos, names, cons, targs, file) {
+    let saved = ck_state_save();
+    set_file(file);
+    ck_tbind = 0;
+    let i = 0;
+    while i < names[VEC_LEN] {
+        let c = vec_get(cons, i);
+        if c {
+            let t = vec_get(targs, i);
+            let ok = 0;
+            let j = 0;
+            while j < c[VEC_LEN] {
+                if resolve_type(vec_get(c, j)) == t {
+                    ok = 1;
+                }
+                j = j + 1;
+            }
+            if !ok {
+                let m = err_begin(pos);
+                buf_str(m, "type ");
+                type_name(m, t);
+                buf_str(m, " does not satisfy the constraint of ");
+                buf_str(m, vec_get(names, i));
+                err_end(m);
+            }
+        }
+        i = i + 1;
+    }
+    ck_state_restore(saved);
+}
+
+fn instantiate_type(d, targs, pos) {
+    let i = 0;
+    while i < d[D_INSTS][VEC_LEN] {
+        let inst = vec_get(d[D_INSTS], i);
+        if same_types(vec_get(inst, 0), targs) {
+            return vec_get(inst, 1);
+        }
+        i = i + 1;
+    }
+    check_constraints(pos, d[D_TPARAMS], d[D_TCONS], targs, d[D_FILE]);
+    let saved = ck_state_save();
+    set_file(d[D_FILE]);
+    let nb = buf_new();
+    buf_str(nb, qual(ck_pkg, d[D_NAME]));
+    targs_name(nb, targs);
+    buf_byte(nb, 0);
+    let name = nb[VEC_DATA];
+    let t = 0;
+    if d[D_TYPE][N_KIND] == TX_STRUCT {
+        t = ty_new(K_STRUCT, name);
+        t[TY_TARGS] = targs;
+        t[TY_GDECL] = d;
+        name_type(name, t);
+        vec_push(d[D_INSTS], pair(targs, t));
+        ck_tbind = tbind_pairs(d[D_TPARAMS], targs);
+        resolve_fields(t, d[D_TYPE]);
+        layout_struct(t);
+    } else {
+        ck_tbind = tbind_pairs(d[D_TPARAMS], targs);
+        t = resolve_type(d[D_TYPE]);
+        vec_push(d[D_INSTS], pair(targs, t));
+    }
+    ck_state_restore(saved);
+    let m = 0;
+    while m < d[D_METHODS][VEC_LEN] {
+        let tmpl = vec_get(d[D_METHODS], m);
+        if ck_decl_done {
+            instantiate_fn(tmpl, targs, pos);
+        } else {
+            vec_push(gen_pending, pair(tmpl, targs));
+        }
+        m = m + 1;
+    }
+    return t;
+}
+
+// generics_declared runs once every ordinary function is declared.
+fn generics_declared() {
+    ck_decl_done = 1;
+    let i = 0;
+    while i < gen_pending[VEC_LEN] {
+        let p = vec_get(gen_pending, i);
+        instantiate_fn(vec_get(p, 0), vec_get(p, 1), 0);
+        i = i + 1;
+    }
+}
+
+// instantiate_fn returns the instance of template g for targs, declaring it on first use;
+// the main check loop checks its body later like any function's.
+fn instantiate_fn(g, targs, pos) {
+    if !g[F_INSTS] {
+        g[F_INSTS] = vec_new();
+    }
+    let i = 0;
+    while i < g[F_INSTS][VEC_LEN] {
+        let inst = vec_get(g[F_INSTS], i);
+        if same_types(vec_get(inst, 0), targs) {
+            return vec_get(inst, 1);
+        }
+        i = i + 1;
+    }
+    if targs[VEC_LEN] != g[F_TPARAMS][VEC_LEN] {
+        err_quoted(pos, "wrong number of type arguments for ", g[F_NAME], "");
+        return g;
+    }
+    check_constraints(pos, g[F_TPARAMS], g[F_TCONS], targs, g[F_FILE]);
+    let st_toks = p_toks;
+    let st_i = p_i;
+    let st_nolit = p_nolit;
+    let st_legacy = p_legacy;
+    let st_file = cur_file;
+    p_toks = g[F_TOKS];
+    p_i = g[F_TOKAT];
+    p_nolit = 0;
+    p_legacy = 0;
+    cur_file = g[F_FILE];
+    let nf = parse_fn(0, 0);
+    p_toks = st_toks;
+    p_i = st_i;
+    p_nolit = st_nolit;
+    p_legacy = st_legacy;
+    cur_file = st_file;
+    nf[F_TPARAMS] = g[F_TPARAMS];
+    nf[F_TBIND] = tbind_pairs(g[F_TPARAMS], targs);
+    nf[F_GENOF] = g;
+    nf[F_FILE] = g[F_FILE];
+    if !nf[F_RECV] {
+        let nb = buf_new();
+        buf_str(nb, nf[F_NAME]);
+        targs_name(nb, targs);
+        buf_byte(nb, 0);
+        nf[F_NAME] = nb[VEC_DATA];
+    }
+    vec_push(g[F_INSTS], pair(targs, nf));
+    vec_push(prog_fns, nf);
+    let saved = ck_state_save();
+    ck_tbind = nf[F_TBIND];
+    declare_fn(nf);
+    ck_state_restore(saved);
+    return nf;
+}
+
+// unify binds g's type parameters by matching type expression tx against type t.
+fn tunify(g, binds, tx, t, untyped_ok) {
+    if !tx || !t {
+        return;
+    }
+    let k = tx[N_KIND];
+    if k == TX_NAME && !tx[TX_A] && !tx[TX_ARGS] {
+        let i = 0;
+        while i < g[F_TPARAMS][VEC_LEN] {
+            if streq(vec_get(g[F_TPARAMS], i), tx[TX_B]) {
+                if is_untyped(t) {
+                    if untyped_ok && !vec_get(binds, i) {
+                        binds[VEC_DATA][i] = default_type(t);
+                    }
+                } else if !vec_get(binds, i) {
+                    binds[VEC_DATA][i] = t;
+                }
+                return;
+            }
+            i = i + 1;
+        }
+        return;
+    }
+    let tk = kind_of(t);
+    if k == TX_SLICE && tk == K_SLICE {
+        tunify(g, binds, tx[TX_A], t[TY_ELEM], untyped_ok);
+    } else if k == TX_OPT && tk == K_OPT {
+        tunify(g, binds, tx[TX_A], t[TY_ELEM], untyped_ok);
+    } else if k == TX_MAP && tk == K_MAP {
+        tunify(g, binds, tx[TX_A], t[TY_KEY], untyped_ok);
+        tunify(g, binds, tx[TX_B], t[TY_ELEM], untyped_ok);
+    } else if k == TX_FUNC && tk == K_FUNC {
+        let ps = tx[TX_A];
+        let rs = tx[TX_B];
+        let j = 0;
+        while ps && j < ps[VEC_LEN] && j < t[TY_FIELDS][VEC_LEN] {
+            tunify(g, binds, vec_get(ps, j), vec_get(t[TY_FIELDS], j), untyped_ok);
+            j = j + 1;
+        }
+        j = 0;
+        while rs && j < rs[VEC_LEN] && j < t[TY_RESULTS][VEC_LEN] {
+            tunify(g, binds, vec_get(rs, j), vec_get(t[TY_RESULTS], j), untyped_ok);
+            j = j + 1;
+        }
+    } else if k == TX_NAME && tx[TX_ARGS] && t[TY_TARGS] {
+        let j2 = 0;
+        while j2 < tx[TX_ARGS][VEC_LEN] && j2 < t[TY_TARGS][VEC_LEN] {
+            tunify(g, binds, vec_get(tx[TX_ARGS], j2), vec_get(t[TY_TARGS], j2), untyped_ok);
+            j2 = j2 + 1;
+        }
+    }
+}
+
+// generic_call checks call e of template g: arguments first, then the inferred instance.
+fn generic_call(e, g) {
+    let args = e[CALL_ARGS];
+    let atypes = vec_new();
+    let i = 0;
+    while i < args[VEC_LEN] {
+        vec_push(atypes, chk(vec_get(args, i), 0));
+        i = i + 1;
+    }
+    let np = g[F_PTYPES][VEC_LEN];
+    if args[VEC_LEN] != np {
+        let m = err_begin(e[N_POS]);
+        buf_str(m, g[F_NAME]);
+        buf_str(m, " expects ");
+        buf_int(m, np);
+        buf_str(m, " arguments, got ");
+        buf_int(m, args[VEC_LEN]);
+        err_end(m);
+        return ty_int;
+    }
+    let binds = vec_filled(g[F_TPARAMS][VEC_LEN], 0);
+    let pass = 0;
+    while pass < 2 {
+        i = 0;
+        while i < np {
+            tunify(g, binds, vec_get(g[F_PTYPES], i), vec_get(atypes, i), pass);
+            i = i + 1;
+        }
+        pass = pass + 1;
+    }
+    i = 0;
+    while i < binds[VEC_LEN] {
+        if !vec_get(binds, i) {
+            err_quoted(e[N_POS], "cannot infer type parameter ", vec_get(g[F_TPARAMS], i), " (give it explicitly: F[T](...))");
+            return ty_int;
+        }
+        i = i + 1;
+    }
+    let inst = instantiate_fn(g, binds, e[N_POS]);
+    e[CALL_FN] = inst;
+    e[CALL_CALLEE] = 0;
+    e[CALL_NAME] = inst[F_QNAME];
+    let ptypes = inst[F_PTYPES];
+    i = 0;
+    while i < args[VEC_LEN] {
+        let a = vec_get(args, i);
+        let want = vec_get(ptypes, i);
+        let at = vec_get(atypes, i);
+        check_assignable(a, at, want);
+        if is_untyped(at) {
+            reconvert(a, want);
+        }
+        i = i + 1;
+    }
+    return result_type(inst);
+}
+
+// expr_to_tx turns an expression that names a type (from X[A, B] or T[A]{...}) into a type expr.
+fn expr_to_tx(e) {
+    let k = e[N_KIND];
+    if k == EX_TYPE {
+        return e[TYX];
+    }
+    if k == EX_IDENT {
+        let n = node_new(TX_NAME, e[N_POS]);
+        n[TX_B] = e[ID_NAME];
+        return n;
+    }
+    if k == EX_SELECT && e[SEL_X][N_KIND] == EX_IDENT {
+        let n2 = node_new(TX_NAME, e[N_POS]);
+        n2[TX_A] = e[SEL_X][ID_NAME];
+        n2[TX_B] = e[SEL_NAME];
+        return n2;
+    }
+    if k == EX_INDEX {
+        let base = expr_to_tx(e[IX_X]);
+        if !base || base[N_KIND] != TX_NAME {
+            return 0;
+        }
+        base[TX_ARGS] = index_targs(e);
+        return base;
+    }
+    return 0;
+}
+
+// index_targs is the type expression list of X[A, B].
+fn index_targs(e) {
+    let out = vec_new();
+    let list = e[IX_ARGS];
+    if !list {
+        list = vec_new();
+        vec_push(list, e[IX_I]);
+    }
+    let i = 0;
+    while i < list[VEC_LEN] {
+        let tx = expr_to_tx(vec_get(list, i));
+        if !tx {
+            err_at(vec_get(list, i)[N_POS], "expected a type argument");
+            tx = node_new(TX_NAME, e[N_POS]);
+            tx[TX_B] = "i64";
+        }
+        vec_push(out, tx);
+        i = i + 1;
+    }
+    return out;
+}
+
+// explicit_generic returns the template a callee like F[T] or pkg.F[T] names, or 0.
+fn explicit_generic(callee) {
+    if callee[N_KIND] != EX_INDEX {
+        return 0;
+    }
+    let x = callee[IX_X];
+    if x[N_KIND] == EX_IDENT {
+        if lookup_name_local(x[ID_NAME]) {
+            return 0;
+        }
+        let s = lookup_name(x[ID_NAME]);
+        if s && s[S_KIND] == SYM_FUNC && is_template(s[S_FN]) {
+            return s[S_FN];
+        }
+        return 0;
+    }
+    if x[N_KIND] == EX_SELECT && x[SEL_X][N_KIND] == EX_IDENT && !lookup_name_local(x[SEL_X][ID_NAME]) {
+        let pkg = import_pkg(x[SEL_X][ID_NAME]);
+        if pkg {
+            let s2 = pkg_member(pkg, x[SEL_NAME]);
+            if s2 && s2[S_KIND] == SYM_FUNC && is_template(s2[S_FN]) {
+                return s2[S_FN];
+            }
+        }
+    }
+    return 0;
+}

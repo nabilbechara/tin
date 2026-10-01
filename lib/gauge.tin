@@ -1,0 +1,432 @@
+// Package gauge is floating-point and integer math (like Go's math and math/bits); transcendentals come from libm.
+package gauge
+
+// Pi is the ratio of a circle's circumference to its diameter.
+const Pi = 3.141592653589793
+
+// E is the base of natural logarithms.
+const E = 2.718281828459045
+
+// Sqrt2 is the square root of 2.
+const Sqrt2 = 1.4142135623730951
+
+// Ln2 is the natural logarithm of 2.
+const Ln2 = 0.6931471805599453
+
+// MaxI64 is the largest i64.
+const MaxI64 = 9223372036854775807
+
+// MinI64 is the smallest i64.
+const MinI64 = -9223372036854775807 - 1
+
+// MaxU64 is the largest u64 (typed, because an untyped constant this large folds to -1 in the frozen compiler).
+const MaxU64 u64 = 18446744073709551615
+
+// MaxF64 is the largest finite f64.
+const MaxF64 = 1.7976931348623157e308
+
+// SmallestNonzeroF64 is the smallest positive denormal f64.
+const SmallestNonzeroF64 = 4.9406564584124654e-324
+
+extern func sqrt(x f64) f64
+extern func cbrt(x f64) f64
+extern func pow(x f64, y f64) f64
+extern func exp(x f64) f64
+extern func exp2(x f64) f64
+extern func log(x f64) f64
+extern func log2(x f64) f64
+extern func log10(x f64) f64
+extern func log1p(x f64) f64
+extern func sin(x f64) f64
+extern func cos(x f64) f64
+extern func tan(x f64) f64
+extern func asin(x f64) f64
+extern func acos(x f64) f64
+extern func atan(x f64) f64
+extern func atan2(y f64, x f64) f64
+extern func sinh(x f64) f64
+extern func cosh(x f64) f64
+extern func tanh(x f64) f64
+extern func floor(x f64) f64
+extern func ceil(x f64) f64
+extern func trunc(x f64) f64
+extern func round(x f64) f64
+extern func rint(x f64) f64
+extern func fmod(x f64, y f64) f64
+extern func hypot(x f64, y f64) f64
+
+// pow10tab holds 1e0 .. 1e31; the two coarse tables hold every 32nd power, as in Go's math.Pow10.
+var pow10tab = []f64{1e00, 1e01, 1e02, 1e03, 1e04, 1e05, 1e06, 1e07, 1e08, 1e09, 1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18, 1e19, 1e20, 1e21, 1e22, 1e23, 1e24, 1e25, 1e26, 1e27, 1e28, 1e29, 1e30, 1e31}
+var pow10postab32 = []f64{1e00, 1e32, 1e64, 1e96, 1e128, 1e160, 1e192, 1e224, 1e256, 1e288}
+var pow10negtab32 = []f64{1e-00, 1e-32, 1e-64, 1e-96, 1e-128, 1e-160, 1e-192, 1e-224, 1e-256, 1e-288, 1e-320}
+
+// F64bits returns the IEEE 754 bit pattern of f.
+func F64bits(f f64) u64 {
+	return u64(cast(i64, f))
+}
+
+// F64frombits returns the f64 with bit pattern b.
+func F64frombits(b u64) f64 {
+	return cast(f64, i64(b))
+}
+
+// Abs returns |x| (NaN stays NaN, -0 becomes +0).
+func Abs(x f64) f64 {
+	return F64frombits(F64bits(x) & 0x7fffffffffffffff)
+}
+
+// Signbit reports whether x is negative or negative zero.
+func Signbit(x f64) bool {
+	return cast(i64, x) < 0
+}
+
+// Copysign returns a value with the magnitude of f and the sign of sign.
+func Copysign(f f64, sign f64) f64 {
+	return F64frombits(F64bits(f)&0x7fffffffffffffff | F64bits(sign)>>63<<63)
+}
+
+// Inf returns +Inf when sign >= 0, else -Inf.
+func Inf(sign i64) f64 {
+	v := F64frombits(0x7ff0000000000000)
+	if sign < 0 {
+		return -v
+	}
+	return v
+}
+
+// NaN returns a quiet not-a-number.
+func NaN() f64 {
+	return F64frombits(0x7ff8000000000001)
+}
+
+// IsNaN reports whether f is not-a-number.
+func IsNaN(f f64) bool {
+	return f != f
+}
+
+// IsInf reports whether f is +Inf (sign > 0), -Inf (sign < 0) or either (sign == 0).
+func IsInf(f f64, sign i64) bool {
+	return sign >= 0 && f > MaxF64 || sign <= 0 && f < -MaxF64
+}
+
+// Min returns the smaller of x and y; any NaN gives NaN and -0 is smaller than +0 (like Go).
+func Min(x f64, y f64) f64 {
+	if IsInf(x, -1) || IsInf(y, -1) {
+		return Inf(-1)
+	}
+	if x != x || y != y {
+		return NaN()
+	}
+	if x == 0 && x == y {
+		if Signbit(x) {
+			return x
+		}
+		return y
+	}
+	if x < y {
+		return x
+	}
+	return y
+}
+
+// Max returns the larger of x and y; any NaN gives NaN and +0 is larger than -0 (like Go).
+func Max(x f64, y f64) f64 {
+	if IsInf(x, 1) || IsInf(y, 1) {
+		return Inf(1)
+	}
+	if x != x || y != y {
+		return NaN()
+	}
+	if x == 0 && x == y {
+		if Signbit(x) {
+			return y
+		}
+		return x
+	}
+	if x > y {
+		return x
+	}
+	return y
+}
+
+// MinI returns the smaller of a and b.
+func MinI(a i64, b i64) i64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// MaxI returns the larger of a and b.
+func MaxI(a i64, b i64) i64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// AbsI returns |x| (MinI64 wraps to itself).
+func AbsI(x i64) i64 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// Clamp returns x limited to [lo, hi] (NaN passes through).
+func Clamp(x f64, lo f64, hi f64) f64 {
+	if x < lo {
+		return lo
+	}
+	if x > hi {
+		return hi
+	}
+	return x
+}
+
+// ClampI returns x limited to [lo, hi].
+func ClampI(x i64, lo i64, hi i64) i64 {
+	if x < lo {
+		return lo
+	}
+	if x > hi {
+		return hi
+	}
+	return x
+}
+
+// Sqrt returns the square root of x.
+func Sqrt(x f64) f64 {
+	return sqrt(x)
+}
+
+// Cbrt returns the cube root of x.
+func Cbrt(x f64) f64 {
+	return cbrt(x)
+}
+
+// Pow returns x**y.
+func Pow(x f64, y f64) f64 {
+	return pow(x, y)
+}
+
+// Exp returns e**x.
+func Exp(x f64) f64 {
+	return exp(x)
+}
+
+// Exp2 returns 2**x.
+func Exp2(x f64) f64 {
+	return exp2(x)
+}
+
+// Log returns the natural logarithm of x.
+func Log(x f64) f64 {
+	return log(x)
+}
+
+// Log2 returns the base-2 logarithm of x.
+func Log2(x f64) f64 {
+	return log2(x)
+}
+
+// Log10 returns the base-10 logarithm of x.
+func Log10(x f64) f64 {
+	return log10(x)
+}
+
+// Log1p returns log(1 + x), accurate for small x.
+func Log1p(x f64) f64 {
+	return log1p(x)
+}
+
+// Sin returns the sine of x (radians).
+func Sin(x f64) f64 {
+	return sin(x)
+}
+
+// Cos returns the cosine of x (radians).
+func Cos(x f64) f64 {
+	return cos(x)
+}
+
+// Tan returns the tangent of x (radians).
+func Tan(x f64) f64 {
+	return tan(x)
+}
+
+// Asin returns the arcsine of x.
+func Asin(x f64) f64 {
+	return asin(x)
+}
+
+// Acos returns the arccosine of x.
+func Acos(x f64) f64 {
+	return acos(x)
+}
+
+// Atan returns the arctangent of x.
+func Atan(x f64) f64 {
+	return atan(x)
+}
+
+// Atan2 returns the arctangent of y/x using the signs of both to pick the quadrant.
+func Atan2(y f64, x f64) f64 {
+	return atan2(y, x)
+}
+
+// Sinh returns the hyperbolic sine of x.
+func Sinh(x f64) f64 {
+	return sinh(x)
+}
+
+// Cosh returns the hyperbolic cosine of x.
+func Cosh(x f64) f64 {
+	return cosh(x)
+}
+
+// Tanh returns the hyperbolic tangent of x.
+func Tanh(x f64) f64 {
+	return tanh(x)
+}
+
+// Floor returns the largest integer value <= x.
+func Floor(x f64) f64 {
+	return floor(x)
+}
+
+// Ceil returns the smallest integer value >= x.
+func Ceil(x f64) f64 {
+	return ceil(x)
+}
+
+// Trunc returns the integer part of x (rounding toward zero).
+func Trunc(x f64) f64 {
+	return trunc(x)
+}
+
+// Round returns x rounded to the nearest integer, halves away from zero.
+func Round(x f64) f64 {
+	return round(x)
+}
+
+// RoundToEven returns x rounded to the nearest integer, halves to the even neighbour.
+func RoundToEven(x f64) f64 {
+	return rint(x)
+}
+
+// Mod returns the remainder of x/y with the sign of x (NaN for y == 0 or infinite x).
+func Mod(x f64, y f64) f64 {
+	return fmod(x, y)
+}
+
+// Hypot returns sqrt(x*x + y*y) without undue overflow.
+func Hypot(x f64, y f64) f64 {
+	return hypot(x, y)
+}
+
+// Pow10 returns 10**n: +Inf above 308, 0 below -323, exactly as Go's math.Pow10.
+func Pow10(n i64) f64 {
+	if n >= 0 && n <= 308 {
+		return pow10postab32[n/32] * pow10tab[n%32]
+	}
+	if n >= -323 && n < 0 {
+		return pow10negtab32[(-n)/32] / pow10tab[(-n)%32]
+	}
+	if n > 0 {
+		return Inf(1)
+	}
+	return 0
+}
+
+// Gcd returns the greatest common divisor of |a| and |b| (0 when both are 0).
+func Gcd(a i64, b i64) i64 {
+	a = AbsI(a)
+	b = AbsI(b)
+	for b != 0 {
+		t := a % b
+		a = b
+		b = t
+	}
+	return a
+}
+
+// Lcm returns the least common multiple of |a| and |b| (0 when either is 0; wraps on overflow).
+func Lcm(a i64, b i64) i64 {
+	if a == 0 || b == 0 {
+		return 0
+	}
+	return AbsI(a/Gcd(a, b)*b)
+}
+
+// PopCount returns the number of one bits in x.
+func PopCount(x u64) i64 {
+	x = x - (x>>1)&0x5555555555555555
+	x = x&0x3333333333333333 + (x>>2)&0x3333333333333333
+	x = (x + x>>4) & 0x0f0f0f0f0f0f0f0f
+	return i64(x * 0x0101010101010101 >> 56)
+}
+
+// LeadingZeros returns the number of leading zero bits in x (64 for 0).
+func LeadingZeros(x u64) i64 {
+	if x == 0 {
+		return 64
+	}
+	n := 0
+	if x>>32 == 0 {
+		n += 32
+		x <<= 32
+	}
+	if x>>48 == 0 {
+		n += 16
+		x <<= 16
+	}
+	if x>>56 == 0 {
+		n += 8
+		x <<= 8
+	}
+	if x>>60 == 0 {
+		n += 4
+		x <<= 4
+	}
+	if x>>62 == 0 {
+		n += 2
+		x <<= 2
+	}
+	if x>>63 == 0 {
+		n++
+	}
+	return n
+}
+
+// TrailingZeros returns the number of trailing zero bits in x (64 for 0).
+func TrailingZeros(x u64) i64 {
+	if x == 0 {
+		return 64
+	}
+	n := 0
+	if x&0xffffffff == 0 {
+		n += 32
+		x >>= 32
+	}
+	if x&0xffff == 0 {
+		n += 16
+		x >>= 16
+	}
+	if x&0xff == 0 {
+		n += 8
+		x >>= 8
+	}
+	if x&0xf == 0 {
+		n += 4
+		x >>= 4
+	}
+	if x&0x3 == 0 {
+		n += 2
+		x >>= 2
+	}
+	if x&0x1 == 0 {
+		n++
+	}
+	return n
+}

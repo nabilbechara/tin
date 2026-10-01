@@ -1,0 +1,1171 @@
+// Package anvil is an HTTP/1.1 server: one event loop per core (kqueue), share-nothing.
+//
+// Core 0 accepts connections and deals them round-robin to every core through a pipe;
+// from then on a connection belongs to one core for its whole life. Each core reads
+// into one scratch buffer, parses requests in place, runs the handler, writes every
+// response of the batch with one write, and wipes its request pool. Idle connections
+// hold no buffers, only a 96-byte record.
+//
+//	func handle(q anvil.Req, w mut anvil.Out) {
+//		w.Type("application/json")
+//		argo.Put(w.Body, Msg{message: "hi"})
+//	}
+//	func main() {
+//		err := anvil.Serve(":8080", handle)
+//		say.Line("server:", err)
+//	}
+package anvil
+
+import "hearth"
+import "relay"
+
+extern func socket(domain i64, typ i64, proto i64) i64
+extern func setsockopt(fd i64, level i64, name i64, val i64, n i64) i64
+extern func bind(fd i64, addr i64, n i64) i64
+extern func listen(fd i64, backlog i64) i64
+extern func accept(fd i64, addr i64, n i64) i64
+extern func fcntl(fd i64, cmd i64, ...) i64
+extern func close(fd i64) i64
+extern func pipe(fds i64) i64
+extern func signal(sig i64, h i64) i64
+extern func time(t i64) i64
+extern func gmtime_r(t i64, tm i64) i64
+extern func strftime(s i64, max i64, f i64, tm i64) i64
+extern func memchr(p i64, c i64, n i64) i64
+extern func getenv(name i64) i64
+extern func atoi(s i64) i64
+extern func open(path i64, flags i64, ...) i64
+
+// Req is the request being served. Its strings live in the request pool: keep() them
+// to store them anywhere long-lived.
+type Req struct {
+	Method str
+	Path   str
+	Query  str
+	hp     i64
+	hn     i64
+	bp     i64
+	bn     i64
+}
+
+// Out is the response being built. Body is the response body; the status defaults to
+// 200 and the content type to text/plain.
+type Out struct {
+	Body  []u8
+	code  i64
+	ctype str
+	extra []u8
+	own   []u8
+}
+
+const scrSize = 262144
+const maxRequest = 67108864
+const maxLine = 65536   // request line and header block limit: 414 / 431 past it
+const maxEvents = 256
+
+// Connection record words.
+const cFD = 0
+const cIn = 1     // pending input: a request that has not fully arrived
+const cInLen = 2
+const cInCap = 3
+const cOut = 4    // pending output the socket would not take yet
+const cOutLen = 5
+const cOutOff = 6
+const cClose = 7  // close once the output is written
+const cWriting = 8
+const cNeed = 9   // bytes the pending request needs, when known
+const cWords = 12
+
+shared var gListen i64
+shared var gIP i64
+shared var gPort i64
+shared var gHandler func(Req, Out)
+shared var gCores i64
+shared var gRelay func(i64, str)
+shared var gRelayOn bool
+shared var gTick func(i64)
+shared var gTickMs i64
+shared var gPipes i64   // [read fd, write fd] per core
+shared var gSpare i64   // an fd core 0 closes to accept and drop a connection when out of fds
+shared var gLoad i64    // live connections per core, one cache line each; a handoff credits its target
+shared var gStop i64    // 1 once SIGTERM or SIGINT started the graceful shutdown (core 0 only)
+shared var gDrained i64 // cores that stopped and have no connection left
+shared var gGrace i64   // seconds the shutdown waits for connections to finish (TIN_GRACE, default 25)
+
+var myID i64
+var draining bool     // this core stopped accepting; its connections close after their next response
+var reported bool     // this core counted itself in gDrained
+var deadline i64      // core 0: when the grace period ends (seconds)
+var drainTimer i64    // core 0: the timer that checks the deadline while draining
+var kq i64
+var myListen i64
+var conns i64
+var evs i64
+var scr i64
+var ob i64
+var obLen i64
+var obCap i64
+var change i64
+var word i64
+var common i64      // "Server: anvil\r\nDate: ...\r\n"
+var commonLen i64
+var lastSec i64
+var tm i64
+var rr i64
+var head bool
+var theReq Req = Req{}
+var theOut Out = Out{Body: make([]u8, 0, 65536), extra: make([]u8, 0, 1024), own: make([]u8, 0)}
+
+func c32(x i64) i64 {
+	return i64(i32(x))
+}
+
+func errno() i64 {
+	return rt_errno()
+}
+
+// Serve listens on addr (":8080", "127.0.0.1:8080") and serves h on every core. It
+// returns only if the server cannot start. TIN_CORES overrides the number of cores.
+func Serve(addr str, h func(Req, Out)) fault {
+	n := hearth.Cores()
+	env := getenv(cast(i64, "TIN_CORES") + 8)
+	if env != 0 && atoi(env)&0xffffffff > 0 {
+		n = atoi(env) & 0xffffffff
+	}
+	return ServeN(addr, n, h)
+}
+
+// ServeN is Serve on exactly n cores.
+func ServeN(addr str, n i64, h func(Req, Out)) fault {
+	port := 0
+	ip := 0
+	colon := -1
+	for i := 0; i < len(addr); i++ {
+		if addr[i] == ':' {
+			colon = i
+		}
+	}
+	if colon < 0 {
+		return fail("anvil: address needs a port, like \":8080\"")
+	}
+	for i := colon + 1; i < len(addr); i++ {
+		c := addr[i]
+		if c < '0' || c > '9' {
+			return fail("anvil: bad port in address")
+		}
+		port = port*10 + i64(c-'0')
+	}
+	if colon > 0 {
+		part := 0
+		for i := 0; i < colon; i++ {
+			c := addr[i]
+			if c == '.' {
+				ip = ip<<8 | part
+				part = 0
+			} else if c >= '0' && c <= '9' {
+				part = part*10 + i64(c-'0')
+			} else {
+				return fail("anvil: the host must be a dotted IPv4 address")
+			}
+		}
+		ip = ip<<8 | part
+	}
+	// $PORT (as set by Kubernetes, Cloud Run, Heroku...) replaces the port.
+	penv := getenv(cast(i64, "PORT") + 8)
+	if penv != 0 && atoi(penv)&0xffffffff > 0 && atoi(penv)&0xffffffff < 65536 {
+		port = atoi(penv) & 0xffffffff
+	}
+	gIP = ip
+	gPort = port
+	fd := open_listener(ip, port)
+	if fd == -1 {
+		return fail("anvil: socket failed")
+	}
+	if fd == -2 {
+		return fail("anvil: cannot bind the address (in use?)")
+	}
+	if fd == -3 {
+		return fail("anvil: listen failed")
+	}
+	signal(13, 1)
+	gListen = fd
+	gSpare = c32(open(cast(i64, "/dev/null")+8, 0))
+	gHandler = h
+	if n < 1 {
+		n = 1
+	}
+	gCores = n
+	gPipes = calloc(2*n, 8)
+	gLoad = rt_aligned_alloc(n * 128)
+	fds := calloc(2, 4)
+	for i := 0; i < n; i++ {
+		pipe(fds)
+		gPipes[2*i] = __ld(fds, 2)
+		gPipes[2*i+1] = __ld(fds+4, 2)
+		fcntl(gPipes[2*i], F_SETFL, O_NONBLOCK)
+	}
+	gGrace = 25
+	genv := getenv(cast(i64, "TIN_GRACE") + 8)
+	if genv != 0 && atoi(genv)&0xffffffff > 0 {
+		gGrace = atoi(genv) & 0xffffffff
+	}
+	// SIGTERM and SIGINT are blocked in every thread (cores inherit this mask) and taken by
+	// core 0's event loop instead: a handler could run on any thread and no Tin code may.
+	rt_sig_block_term()
+	hearth.Run(n, core)
+	return nil
+}
+
+
+// open_listener binds a non-blocking listener on ip:port (SO_REUSEPORT, so every core
+// can have one on Linux); -1, -2, -3 report a socket, bind or listen failure.
+func open_listener(ip i64, port i64) i64 {
+	fd := c32(socket(2, 1, 0))
+	if fd < 0 {
+		return -1
+	}
+	one := calloc(1, 8)
+	one[0] = 1
+	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, one, 4)
+	if ownListener {
+		setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, one, 4)
+	}
+	free(one)
+	sa := calloc(1, 16)
+	rt_sockaddr_in(sa, ip, port)
+	if c32(bind(fd, sa, 16)) < 0 {
+		close(fd)
+		return -2
+	}
+	free(sa)
+	if c32(listen(fd, 4096)) < 0 {
+		close(fd)
+		return -3
+	}
+	fcntl(fd, F_SETFL, O_NONBLOCK)
+	return fd
+}
+
+func core(id i64) {
+	myID = id
+	ev_init()
+	conns = calloc(65536, 8)
+	evs = calloc(maxEvents, 32)
+	scr = malloc(scrSize)
+	obCap = 65536
+	ob = malloc(obCap)
+	// The core's small scratch areas share one block aligned to the 128-byte cache line,
+	// so no two cores ever write the same line.
+	block := rt_aligned_alloc(1024)
+	change = block
+	word = block + 128
+	common = block + 640
+	tm = block + 768
+	theOut.own = theOut.Body
+	theOut.code = 200
+	theOut.ctype = "text/plain; charset=utf-8"
+	refresh_date(time(0))
+	pr := gPipes[2*id]
+	ev_level(pr)
+	myListen = -1
+	if id == 0 {
+		myListen = gListen
+	} else if ownListener {
+		myListen = open_listener(gIP, gPort)
+	}
+	if myListen >= 0 {
+		ev_level(myListen)
+	}
+	rfd := -1
+	if gRelayOn {
+		rfd = relay.WakeFD()
+		ev_level(rfd)
+	}
+	tick := -1
+	if gTickMs > 0 {
+		tick = ev_timer(gTickMs)
+	}
+	drainTimer = -1
+	if id == 0 {
+		ev_signals()
+	}
+	for {
+		if gRelayOn {
+			relay.Arm()
+		}
+		n := ev_wait()
+		if n <= 0 {
+			continue
+		}
+		now := time(0)
+		if now != lastSec {
+			refresh_date(now)
+		}
+		for i := 0; i < n; i++ {
+			fd := ev_fd(i)
+			if ev_signal(i) {
+				on_signal()
+			} else if fd == pr {
+				take_handoffs(pr)
+			} else if fd == drainTimer {
+				ev_timer_ack(drainTimer)
+				if rt_mono_ns() >= deadline {
+					rt_flush_core()
+					exit(0)
+				}
+			} else if fd == tick {
+				ev_timer_ack(tick)
+				gTick(id)
+				rt_pool_reset()
+			} else if fd == rfd {
+				relay.Drain(gRelay)
+				rt_pool_reset()
+			} else if fd == myListen {
+				accept_all()
+			} else {
+				c := conns[fd]
+				if c != 0 {
+					if ev_writable(i) {
+						on_write(c)
+					} else {
+						on_read(c)
+						// An edge-triggered hang-up is reported once: close now, or after
+						// the pending output is written.
+						if ev_hangup(i) && conns[fd] == c {
+							if c[cOut] == 0 {
+								close_conn(c)
+							} else {
+								c[cClose] = 1
+							}
+						}
+					}
+				}
+			}
+		}
+		if draining && drain_done() {
+			return
+		}
+	}
+}
+
+// on_signal (core 0) starts the graceful shutdown on the first SIGTERM or SIGINT: every core
+// stops accepting and ends once its connections are gone; a second signal exits at once.
+func on_signal() {
+	ev_signal_ack()
+	if gStop != 0 {
+		rt_flush_core()
+		exit(0)
+	}
+	gStop = 1
+	deadline = rt_mono_ns() + gGrace*1000000000
+	word[3] = -1
+	for j := 1; j < gCores; j++ {
+		write(gPipes[2*j+1], word+24, 8)
+	}
+	drainTimer = ev_drain_timer(100)
+	begin_drain()
+}
+
+// begin_drain stops this core from accepting: its listener closes, open connections finish
+// their current request and are closed after their next response (Connection: close).
+func begin_drain() {
+	if draining {
+		return
+	}
+	draining = true
+	if myListen >= 0 {
+		close(myListen)
+		myListen = -1
+	}
+}
+
+// drain_done reports whether this core may stop: no connection is left (counted once in
+// gDrained); core 0 also waits until every other core has reported, so Serve returns.
+func drain_done() bool {
+	if !reported && __atomic_load(gLoad+myID*128) == 0 {
+		reported = true
+		__atomic_add(&gDrained, 1)
+	}
+	if myID != 0 {
+		return reported
+	}
+	return __atomic_load(&gDrained) == gCores
+}
+
+func refresh_date(now i64) {
+	lastSec = now
+	word[0] = now
+	gmtime_r(word, tm)
+	s := "Server: anvil\r\n"
+	memcpy(common, cast(i64, s)+8, len(s))
+	commonLen = len(s) + c32(strftime(common+len(s), 100, cast(i64, "Date: %a, %d %b %Y %H:%M:%S GMT\r\n")+8, tm))
+}
+
+func accept_all() {
+	for k := 0; k < 64; k++ {
+		fd := c32(accept(myListen, 0, 0))
+		if fd < 0 {
+			e := errno()
+			if (e == 24 || e == 23) && gSpare >= 0 {
+				drop_one()
+			}
+			return
+		}
+		fcntl(fd, F_SETFL, O_NONBLOCK)
+		word[1] = 1
+		setsockopt(fd, 6, 1, word+8, 4)
+		if fd >= 65536 {
+			close(fd)
+			continue
+		}
+		target := myID
+		if ownListener {
+			// SO_REUSEPORT hashes connections unevenly over the per-core listeners: a core
+			// that is more than one connection ahead of the least-loaded one hands over.
+			j := least_loaded()
+			if j != myID && __atomic_load(gLoad+myID*128) > __atomic_load(gLoad+j*128)+1 {
+				target = j
+			}
+		} else {
+			target = rr % gCores
+			rr++
+		}
+		if target == myID {
+			add_conn(fd, true)
+		} else {
+			__atomic_add(gLoad+target*128, 1)
+			word[2] = fd
+			write(gPipes[2*target+1], word+16, 8)
+		}
+	}
+}
+
+// least_loaded is the core with the fewest live connections (handoffs in flight included).
+func least_loaded() i64 {
+	best := 0
+	bestLoad := __atomic_load(gLoad)
+	for j := 1; j < gCores; j++ {
+		l := __atomic_load(gLoad + j*128)
+		if l < bestLoad {
+			best = j
+			bestLoad = l
+		}
+	}
+	return best
+}
+
+// drop_one frees the spare fd to accept and close one waiting connection: the client gets
+// a clean close instead of hanging, and the level-triggered listen event stops spinning.
+func drop_one() {
+	close(gSpare)
+	fd := c32(accept(myListen, 0, 0))
+	if fd >= 0 {
+		close(fd)
+	}
+	gSpare = c32(open(cast(i64, "/dev/null")+8, 0))
+}
+
+// take_handoffs registers the connections other cores dealt to this one (already counted
+// in this core's load by the sender).
+func take_handoffs(pr i64) {
+	n := read(pr, word+64, 256)
+	for i := 0; i+8 <= n; i += 8 {
+		fd := (word + 64 + i)[0]
+		if fd == -1 {
+			begin_drain()
+		} else {
+			add_conn(fd, false)
+		}
+	}
+}
+
+func add_conn(fd i64, count bool) {
+	c := calloc(cWords, 8)
+	c[cFD] = fd
+	conns[fd] = c
+	if count {
+		__atomic_add(gLoad+myID*128, 1)
+	}
+	ev_conn(fd)
+}
+
+func close_conn(c i64) {
+	fd := c[cFD]
+	close(fd)
+	conns[fd] = 0
+	__atomic_add(gLoad+myID*128, -1)
+	if c[cIn] != 0 {
+		free(c[cIn])
+	}
+	if c[cOut] != 0 {
+		free(c[cOut])
+	}
+	free(c)
+}
+
+// Connections are edge-triggered (EV_CLEAR, like Go's poller): kqueue reports each
+// arrival once, so on_read keeps reading while a read fills the whole buffer.
+func on_read(c i64) {
+	for on_read_once(c) {
+	}
+}
+
+// on_read_once reads and serves what one read returns; true means more may be waiting.
+func on_read_once(c i64) bool {
+	fd := c[cFD]
+	buf := scr
+	cap := scrSize
+	have := 0
+	big := false
+	if c[cIn] != 0 {
+		if c[cInCap] > scrSize {
+			buf = c[cIn]
+			cap = c[cInCap]
+			have = c[cInLen]
+			big = true
+		} else {
+			memcpy(scr, c[cIn], c[cInLen])
+			have = c[cInLen]
+			free(c[cIn])
+			c[cIn] = 0
+			c[cInLen] = 0
+			c[cInCap] = 0
+		}
+	}
+	want := cap - have
+	n := read(fd, buf+have, want)
+	if n <= 0 {
+		if n < 0 && (errno() == EAGAIN || errno() == 4) {
+			n = 0
+		} else {
+			close_conn(c)
+			return false
+		}
+	}
+	full := n == want && n > 0
+	have += n
+	off := 0
+	for off < have && c[cClose] == 0 {
+		r := serve_one(c, buf+off, have-off)
+		if r <= 0 {
+			break
+		}
+		off += r
+	}
+	if !flush(c) {
+		return false
+	}
+	rem := have - off
+	if rem > 0 && c[cClose] == 0 {
+		need := c[cNeed]
+		if need < rem+4096 {
+			need = rem + 4096
+		}
+		if rem == cap {
+			need = cap * 2
+		}
+		if need > maxRequest {
+			close_conn(c)
+			return false
+		}
+		if big {
+			if off > 0 {
+				memmove(buf, buf+off, rem)
+			}
+			if need > cap {
+				buf = realloc(buf, need)
+				cap = need
+			}
+			c[cIn] = buf
+			c[cInLen] = rem
+			c[cInCap] = cap
+		} else {
+			p := malloc(need)
+			memcpy(p, buf+off, rem)
+			c[cIn] = p
+			c[cInLen] = rem
+			c[cInCap] = need
+		}
+	} else if big {
+		free(buf)
+		c[cIn] = 0
+		c[cInLen] = 0
+		c[cInCap] = 0
+	}
+	return full && c[cClose] == 0 && c[cWriting] == 0
+}
+
+// flush writes the batch's responses; false means the connection is gone. While the
+// socket will not take the output, reading stops too, so a client that never reads
+// cannot make the server buffer responses without bound.
+func flush(c i64) bool {
+	if obLen == 0 {
+		if c[cClose] != 0 && c[cOut] == 0 {
+			close_conn(c)
+			return false
+		}
+		return true
+	}
+	if c[cOut] != 0 {
+		pend_out(c, ob, obLen)
+		obLen = 0
+		return true
+	}
+	w := write(c[cFD], ob, obLen)
+	if w < 0 {
+		if errno() != EAGAIN && errno() != 4 {
+			obLen = 0
+			close_conn(c)
+			return false
+		}
+		w = 0
+	}
+	if w < obLen {
+		pend_out(c, ob+w, obLen-w)
+		obLen = 0
+		ev_conn_write(c[cFD])
+		c[cWriting] = 1
+		return true
+	}
+	obLen = 0
+	if c[cClose] != 0 {
+		close_conn(c)
+		return false
+	}
+	return true
+}
+
+func pend_out(c i64, p i64, n i64) {
+	if c[cOut] == 0 {
+		c[cOut] = malloc(n)
+		memcpy(c[cOut], p, n)
+		c[cOutLen] = n
+		c[cOutOff] = 0
+		return
+	}
+	c[cOut] = realloc(c[cOut], c[cOutLen]+n)
+	memcpy(c[cOut]+c[cOutLen], p, n)
+	c[cOutLen] += n
+}
+
+func on_write(c i64) {
+	if c[cOut] == 0 {
+		return
+	}
+	w := write(c[cFD], c[cOut]+c[cOutOff], c[cOutLen]-c[cOutOff])
+	if w < 0 {
+		if errno() != EAGAIN && errno() != 4 {
+			close_conn(c)
+		}
+		return
+	}
+	c[cOutOff] += w
+	if c[cOutOff] < c[cOutLen] {
+		return
+	}
+	free(c[cOut])
+	c[cOut] = 0
+	c[cOutLen] = 0
+	c[cOutOff] = 0
+	c[cWriting] = 0
+	if c[cClose] != 0 {
+		close_conn(c)
+		return
+	}
+	ev_conn_read(c[cFD])
+	if c[cIn] != 0 {
+		on_read(c)
+	}
+}
+
+func lower(c u8) u8 {
+	if c >= 'A' && c <= 'Z' {
+		return c + 32
+	}
+	return c
+}
+
+// name_is reports whether the header name at p (n bytes) is lname, ignoring case.
+func name_is(p i64, n i64, lname str) bool {
+	if n != len(lname) {
+		return false
+	}
+	for i := 0; i < n; i++ {
+		if lower(load8(p+i)) != lname[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// bytes_are reports whether the n bytes at p equal s.
+func bytes_are(p i64, n i64, s str) bool {
+	if n != len(s) {
+		return false
+	}
+	for i := 0; i < n; i++ {
+		if load8(p+i) != s[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func method_str(p i64, n i64) str {
+	c := load8(p)
+	if n == 3 && c == 'G' && load8(p+1) == 'E' && load8(p+2) == 'T' {
+		return "GET"
+	}
+	if c == 'P' && bytes_are(p, n, "POST") {
+		return "POST"
+	}
+	if c == 'P' && bytes_are(p, n, "PUT") {
+		return "PUT"
+	}
+	if c == 'H' && bytes_are(p, n, "HEAD") {
+		return "HEAD"
+	}
+	if c == 'D' && bytes_are(p, n, "DELETE") {
+		return "DELETE"
+	}
+	return rt_str_from_raw(p, n)
+}
+
+// serve_one handles the request at p (n bytes available): the bytes it used, or 0
+// when the request has not fully arrived.
+func serve_one(c i64, p i64, n i64) i64 {
+	nl := memchr(p, '\n', n)
+	if nl == 0 {
+		c[cNeed] = 0
+		if n > maxLine {
+			bad(c, 414)
+		}
+		return 0
+	}
+	le := nl - p
+	if le > maxLine {
+		bad(c, 414)
+		return -1
+	}
+	ll := le
+	if ll > 0 && load8(p+ll-1) == '\r' {
+		ll--
+	}
+	sp1 := -1
+	sp2 := -1
+	nsp := 0
+	for i := 0; i < ll; i++ {
+		if load8(p+i) == ' ' {
+			if sp1 < 0 {
+				sp1 = i
+			}
+			sp2 = i
+			nsp++
+		}
+	}
+	if nsp != 2 || sp1 <= 0 || sp2 <= sp1+1 || ll-sp2-1 != 8 || !is_http1(p+sp2+1) {
+		bad(c, 400)
+		return -1
+	}
+	alive := load8(p+ll-1) == '1'
+	pos := le + 1
+	cl := 0
+	hend := 0
+	for {
+		e := memchr(p+pos, '\n', n-pos)
+		if e == 0 {
+			c[cNeed] = 0
+			if n > maxLine {
+				bad(c, 431)
+			}
+			return 0
+		}
+		l := e - (p + pos)
+		if l == 0 || (l == 1 && load8(p+pos) == '\r') {
+			hend = pos + l + 1
+			break
+		}
+		if pos+l > maxLine {
+			bad(c, 431)
+			return -1
+		}
+		h := p + pos
+		k := memchr(h, ':', l)
+		if k != 0 {
+			kn := k - h
+			f := lower(load8(h))
+			if f == 'c' && kn == 14 && name_is(h, kn, "content-length") {
+				cl = parse_cl(h+kn+1, l-kn-1)
+				if cl < 0 {
+					bad(c, 400)
+					return -1
+				}
+			} else if f == 'c' && kn == 10 && name_is(h, kn, "connection") {
+				j := kn + 1
+				for j < l && (load8(h+j) == ' ' || load8(h+j) == '\t') {
+					j++
+				}
+				v := load8(h + j)
+				if v == 'c' || v == 'C' {
+					alive = false
+				} else if v == 'k' || v == 'K' {
+					alive = true
+				}
+			} else if f == 't' && kn == 17 && name_is(h, kn, "transfer-encoding") {
+				bad(c, 501)
+				return -1
+			}
+		}
+		pos += l + 1
+	}
+	total := hend + cl
+	if total > maxRequest {
+		bad(c, 413)
+		return -1
+	}
+	if n < total {
+		c[cNeed] = total
+		return 0
+	}
+	c[cNeed] = 0
+	q := theReq
+	q.Method = method_str(p, sp1)
+	t := p + sp1 + 1
+	tn := sp2 - sp1 - 1
+	qm := memchr(t, '?', tn)
+	if qm == 0 {
+		q.Path = rt_str_from_raw(t, tn)
+		q.Query = ""
+	} else {
+		q.Path = rt_str_from_raw(t, qm-t)
+		q.Query = rt_str_from_raw(qm+1, tn-(qm-t)-1)
+	}
+	q.hp = p + le + 1
+	q.hn = hend - le - 1
+	q.bp = p + hend
+	q.bn = cl
+	head = sp1 == 4 && load8(p) == 'H' && bytes_are(p, 4, "HEAD")
+	gHandler(q, theOut)
+	respond()
+	if !alive || draining {
+		c[cClose] = 1
+	}
+	return total
+}
+
+// is_http1 reports whether the 8 bytes at p start with "HTTP/1.".
+func is_http1(p i64) bool {
+	return load8(p) == 'H' && load8(p+1) == 'T' && load8(p+2) == 'T' && load8(p+3) == 'P' && load8(p+4) == '/' && load8(p+5) == '1' && load8(p+6) == '.'
+}
+
+// parse_cl parses a Content-Length value (n bytes at p): the length, -1 when it is not a plain decimal number.
+func parse_cl(p i64, n i64) i64 {
+	i := 0
+	for i < n && (load8(p+i) == ' ' || load8(p+i) == '\t') {
+		i++
+	}
+	v := 0
+	nd := 0
+	for i < n {
+		d := load8(p + i)
+		if d < '0' || d > '9' {
+			break
+		}
+		if v <= maxRequest {
+			v = v*10 + i64(d-'0')
+		}
+		nd++
+		i++
+	}
+	if nd == 0 {
+		return -1
+	}
+	for i < n {
+		d := load8(p + i)
+		if d != ' ' && d != '\t' && d != '\r' {
+			return -1
+		}
+		i++
+	}
+	return v
+}
+
+func bad(c i64, code i64) {
+	theOut.code = code
+	rt_append_str(cast(i64, theOut.Body), status_text(code))
+	head = false
+	respond()
+	c[cClose] = 1
+}
+
+func ob_room(n i64) {
+	if obLen+n > obCap {
+		for obLen+n > obCap {
+			obCap *= 2
+		}
+		ob = realloc(ob, obCap)
+	}
+}
+
+func ob_str(s str) {
+	memcpy(ob+obLen, cast(i64, s)+8, len(s))
+	obLen += len(s)
+}
+
+func ob_raw(p i64, n i64) {
+	memcpy(ob+obLen, p, n)
+	obLen += n
+}
+
+// respond appends the response the handler built to the batch, then resets for the
+// next request: Out, Req and the core's request pool.
+func respond() {
+	w := theOut
+	bh := cast(i64, w.Body)
+	eh := cast(i64, w.extra)
+	bn := bh[0]
+	ob_room(256 + len(w.ctype) + eh[0] + bn)
+	ob_str(status_line(w.code))
+	ob_raw(common, commonLen)
+	ob_str("Content-Type: ")
+	ob_str(w.ctype)
+	ob_str("\r\nContent-Length: ")
+	d := ob + obLen
+	nd := 1
+	for t := bn; t >= 10; t /= 10 {
+		nd++
+	}
+	v := bn
+	for i := nd - 1; i >= 0; i-- {
+		store8(d+i, '0'+v%10)
+		v /= 10
+	}
+	obLen += nd
+	ob_str("\r\n")
+	if eh[0] > 0 {
+		ob_raw(eh[2], eh[0])
+	}
+	if draining {
+		ob_str("Connection: close\r\n")
+	}
+	ob_str("\r\n")
+	if !head {
+		ob_raw(bh[2], bn)
+	}
+	oh := cast(i64, w.own)
+	oh[0] = 0
+	eh[0] = 0
+	w.Body = w.own
+	w.code = 200
+	w.ctype = "text/plain; charset=utf-8"
+	q := theReq
+	q.Method = ""
+	q.Path = ""
+	q.Query = ""
+	q.hp = 0
+	q.hn = 0
+	q.bp = 0
+	q.bn = 0
+	rt_pool_reset()
+}
+
+func status_line(code i64) str {
+	switch code {
+	case 200:
+		return "HTTP/1.1 200 OK\r\n"
+	case 201:
+		return "HTTP/1.1 201 Created\r\n"
+	case 204:
+		return "HTTP/1.1 204 No Content\r\n"
+	case 301:
+		return "HTTP/1.1 301 Moved Permanently\r\n"
+	case 302:
+		return "HTTP/1.1 302 Found\r\n"
+	case 304:
+		return "HTTP/1.1 304 Not Modified\r\n"
+	case 400:
+		return "HTTP/1.1 400 Bad Request\r\n"
+	case 401:
+		return "HTTP/1.1 401 Unauthorized\r\n"
+	case 403:
+		return "HTTP/1.1 403 Forbidden\r\n"
+	case 404:
+		return "HTTP/1.1 404 Not Found\r\n"
+	case 405:
+		return "HTTP/1.1 405 Method Not Allowed\r\n"
+	case 413:
+		return "HTTP/1.1 413 Content Too Large\r\n"
+	case 414:
+		return "HTTP/1.1 414 URI Too Long\r\n"
+	case 431:
+		return "HTTP/1.1 431 Request Header Fields Too Large\r\n"
+	case 500:
+		return "HTTP/1.1 500 Internal Server Error\r\n"
+	case 501:
+		return "HTTP/1.1 501 Not Implemented\r\n"
+	case 503:
+		return "HTTP/1.1 503 Service Unavailable\r\n"
+	}
+	b := make([]u8, 0, 32)
+	b = append(b, "HTTP/1.1 "...)
+	b = append(b, str_int(code)...)
+	b = append(b, " Status\r\n"...)
+	return str(b)
+}
+
+func status_text(code i64) str {
+	s := status_line(code)
+	return s[13 : len(s)-2]
+}
+
+func str_int(v i64) str {
+	if v == 0 {
+		return "0"
+	}
+	b := make([]u8, 0, 20)
+	for v > 0 {
+		b = append(b, u8('0'+v%10))
+		v /= 10
+	}
+	for i := 0; i < len(b)/2; i++ {
+		t := b[i]
+		b[i] = b[len(b)-1-i]
+		b[len(b)-1-i] = t
+	}
+	return str(b)
+}
+
+// Header returns the value of the request header name (any case), or "".
+func (q Req) Header(name str) str {
+	p := q.hp
+	end := q.hp + q.hn
+	for p < end {
+		e := memchr(p, '\n', end-p)
+		if e == 0 {
+			return ""
+		}
+		l := e - p
+		k := memchr(p, ':', l)
+		if k != 0 && k-p == len(name) {
+			same := true
+			for i := 0; i < len(name); i++ {
+				if lower(load8(p+i)) != lower(name[i]) {
+					same = false
+					break
+				}
+			}
+			if same {
+				v := k + 1
+				for v < e && (load8(v) == ' ' || load8(v) == '\t') {
+					v++
+				}
+				ve := e
+				for ve > v && (load8(ve-1) == '\r' || load8(ve-1) == ' ') {
+					ve--
+				}
+				return rt_str_from_raw(v, ve-v)
+			}
+		}
+		p = e + 1
+	}
+	return ""
+}
+
+// Body returns the request body.
+func (q Req) Body() str {
+	return rt_str_from_raw(q.bp, q.bn)
+}
+
+// Param returns query parameter name, %-decoded, or "".
+func (q Req) Param(name str) str {
+	s := q.Query
+	i := 0
+	for i < len(s) {
+		j := i
+		for j < len(s) && s[j] != '&' {
+			j++
+		}
+		eq := i
+		for eq < j && s[eq] != '=' {
+			eq++
+		}
+		if eq-i == len(name) && s[i:eq] == name {
+			if eq >= j {
+				return ""
+			}
+			return unescape(s[eq+1 : j])
+		}
+		i = j + 1
+	}
+	return ""
+}
+
+func hexval(c u8) i64 {
+	if c >= '0' && c <= '9' {
+		return i64(c - '0')
+	}
+	if c >= 'a' && c <= 'f' {
+		return i64(c-'a') + 10
+	}
+	if c >= 'A' && c <= 'F' {
+		return i64(c-'A') + 10
+	}
+	return -1
+}
+
+func unescape(s str) str {
+	b := make([]u8, 0, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '+' {
+			b = append(b, ' ')
+		} else if c == '%' && i+2 < len(s) && hexval(s[i+1]) >= 0 && hexval(s[i+2]) >= 0 {
+			b = append(b, u8(hexval(s[i+1])*16+hexval(s[i+2])))
+			i += 2
+		} else {
+			b = append(b, c)
+		}
+	}
+	return str(b)
+}
+
+// Status sets the response status code.
+func (w mut Out) Status(code i64) {
+	w.code = code
+}
+
+// Type sets the Content-Type header.
+func (w mut Out) Type(t str) {
+	w.ctype = t
+}
+
+// Head adds a response header.
+func (w mut Out) Head(k str, v str) {
+	w.extra = append(w.extra, k...)
+	w.extra = append(w.extra, ": "...)
+	w.extra = append(w.extra, v...)
+	w.extra = append(w.extra, "\r\n"...)
+}
+
+// Text appends s to the body.
+func (w mut Out) Text(s str) {
+	w.Body = append(w.Body, s...)
+}
+
+// Json sets the JSON content type; the body is then written with argo.Put(w.Body, v).
+func (w mut Out) Json() {
+	w.ctype = "application/json"
+}
+
+// OnRelay makes every core run h(from, msg) for each relay message it receives (call
+// before Serve). Handlers run between requests, with their own request pool.
+func OnRelay(h func(i64, str)) {
+	gRelay = h
+	gRelayOn = true
+}
+
+// OnTick makes every core run h(core) every ms milliseconds (call before Serve).
+func OnTick(ms i64, h func(i64)) {
+	gTick = h
+	gTickMs = ms
+}

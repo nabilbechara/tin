@@ -1,0 +1,656 @@
+// Package twine manipulates UTF-8 strings (like Go's strings); case helpers are ASCII/Latin-1 only.
+package twine
+
+import "glyph"
+
+extern func memchr(p i64, c i64, n i64) i64
+
+// IndexByte returns the byte offset of the first c in s, or -1.
+func IndexByte(s str, c u8) i64 {
+	n := len(s)
+	if n == 0 {
+		return -1
+	}
+	ps := cast(i64, s) + 8
+	p := memchr(ps, i64(c), n)
+	if p == 0 {
+		return -1
+	}
+	return p - ps
+}
+
+// LastIndexByte returns the byte offset of the last c in s, or -1.
+func LastIndexByte(s str, c u8) i64 {
+	for i := len(s) - 1; i >= 0; i-- {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
+}
+
+// indexAt returns the offset of the first sub in s at or after from, or -1 (sub must be non-empty).
+func indexAt(s str, sub str, from i64) i64 {
+	n := len(sub)
+	ls := len(s)
+	if from < 0 {
+		from = 0
+	}
+	if n > ls-from {
+		return -1
+	}
+	ps := cast(i64, s) + 8
+	psub := cast(i64, sub) + 8
+	c0 := i64(sub[0])
+	last := ls - n
+	i := from
+	for i <= last {
+		p := memchr(ps+i, c0, last-i+1)
+		if p == 0 {
+			return -1
+		}
+		i = p - ps
+		if n == 1 || memcmp(ps+i+1, psub+1, n-1)&0xffffffff == 0 {
+			return i
+		}
+		i++
+	}
+	return -1
+}
+
+// Index returns the byte offset of the first sub in s, or -1 (0 for an empty sub).
+func Index(s str, sub str) i64 {
+	if len(sub) == 0 {
+		return 0
+	}
+	return indexAt(s, sub, 0)
+}
+
+// LastIndex returns the byte offset of the last sub in s, or -1 (len(s) for an empty sub).
+func LastIndex(s str, sub str) i64 {
+	n := len(sub)
+	ls := len(s)
+	if n == 0 {
+		return ls
+	}
+	if n > ls {
+		return -1
+	}
+	ps := cast(i64, s) + 8
+	psub := cast(i64, sub) + 8
+	c0 := sub[0]
+	for i := ls - n; i >= 0; i-- {
+		if s[i] == c0 && memcmp(ps+i, psub, n)&0xffffffff == 0 {
+			return i
+		}
+	}
+	return -1
+}
+
+// Contains reports whether sub occurs in s.
+func Contains(s str, sub str) bool {
+	return Index(s, sub) >= 0
+}
+
+// ContainsByte reports whether byte c occurs in s.
+func ContainsByte(s str, c u8) bool {
+	return IndexByte(s, c) >= 0
+}
+
+// HasPrefix reports whether s starts with prefix.
+func HasPrefix(s str, prefix str) bool {
+	n := len(prefix)
+	if n > len(s) {
+		return false
+	}
+	if n == 0 {
+		return true
+	}
+	return memcmp(cast(i64, s)+8, cast(i64, prefix)+8, n)&0xffffffff == 0
+}
+
+// HasSuffix reports whether s ends with suffix.
+func HasSuffix(s str, suffix str) bool {
+	n := len(suffix)
+	ls := len(s)
+	if n > ls {
+		return false
+	}
+	if n == 0 {
+		return true
+	}
+	return memcmp(cast(i64, s)+8+ls-n, cast(i64, suffix)+8, n)&0xffffffff == 0
+}
+
+// Split slices s around every sep (into runes when sep is empty) and returns the pieces.
+func Split(s str, sep str) []str {
+	return SplitN(s, sep, -1)
+}
+
+// SplitN is Split returning at most n pieces (all when n < 0, none when n == 0).
+func SplitN(s str, sep str, n i64) []str {
+	out := make([]str, 0, 8)
+	if n == 0 {
+		return out
+	}
+	if len(sep) == 0 {
+		return explode(s, n)
+	}
+	start := 0
+	ls := len(s)
+	for n < 0 || len(out) < n-1 {
+		i := indexAt(s, sep, start)
+		if i < 0 {
+			break
+		}
+		out = append(out, s[start:i])
+		start = i + len(sep)
+	}
+	out = append(out, s[start:ls])
+	return out
+}
+
+// explode splits s into its runes, at most n pieces when n > 0.
+func explode(s str, n i64) []str {
+	out := make([]str, 0, 8)
+	ls := len(s)
+	i := 0
+	for i < ls {
+		if n > 0 && len(out) == n-1 {
+			break
+		}
+		_, size := glyph.DecodeRune(s, i)
+		out = append(out, s[i:i+size])
+		i += size
+	}
+	if i < ls {
+		out = append(out, s[i:ls])
+	}
+	return out
+}
+
+// isSpaceByte reports whether c is ASCII white space.
+func isSpaceByte(c u8) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 0x0b || c == 0x0c
+}
+
+// Fields splits s around runs of ASCII white space and returns the non-empty pieces.
+func Fields(s str) []str {
+	out := make([]str, 0, 8)
+	n := len(s)
+	i := 0
+	for i < n {
+		for i < n && isSpaceByte(s[i]) {
+			i++
+		}
+		if i >= n {
+			break
+		}
+		start := i
+		for i < n && !isSpaceByte(s[i]) {
+			i++
+		}
+		out = append(out, s[start:i])
+	}
+	return out
+}
+
+// Join concatenates elems with sep between them.
+func Join(elems []str, sep str) str {
+	n := len(elems)
+	if n == 0 {
+		return ""
+	}
+	if n == 1 {
+		return elems[0]
+	}
+	total := len(sep) * (n - 1)
+	for _, e := range elems {
+		total += len(e)
+	}
+	if total == 0 {
+		return ""
+	}
+	p := rt_str_new(total)
+	d := p + 8
+	off := 0
+	for i, e := range elems {
+		if i > 0 && len(sep) > 0 {
+			memcpy(d+off, cast(i64, sep)+8, len(sep))
+			off += len(sep)
+		}
+		if len(e) > 0 {
+			memcpy(d+off, cast(i64, e)+8, len(e))
+			off += len(e)
+		}
+	}
+	return cast(str, p)
+}
+
+// Repeat returns s concatenated count times (empty when count <= 0).
+func Repeat(s str, count i64) str {
+	n := len(s)
+	if count <= 0 || n == 0 {
+		return ""
+	}
+	if count == 1 {
+		return s
+	}
+	p := rt_str_new(n * count)
+	d := p + 8
+	src := cast(i64, s) + 8
+	for i := 0; i < count; i++ {
+		memcpy(d+i*n, src, n)
+	}
+	return cast(str, p)
+}
+
+// Count returns the number of non-overlapping sub in s (RuneCount+1 when sub is empty).
+func Count(s str, sub str) i64 {
+	n := len(sub)
+	if n == 0 {
+		return glyph.RuneCount(s) + 1
+	}
+	k := 0
+	if n == 1 {
+		c := sub[0]
+		for i := 0; i < len(s); i++ {
+			if s[i] == c {
+				k++
+			}
+		}
+		return k
+	}
+	i := 0
+	for i <= len(s)-n {
+		j := indexAt(s, sub, i)
+		if j < 0 {
+			break
+		}
+		k++
+		i = j + n
+	}
+	return k
+}
+
+// Replace returns s with the first n non-overlapping old replaced by repl (all when n < 0; empty old matches at every rune boundary).
+func Replace(s str, old str, repl str, n i64) str {
+	if n == 0 || old == repl {
+		return s
+	}
+	m := Count(s, old)
+	if m == 0 {
+		return s
+	}
+	if n < 0 || m < n {
+		n = m
+	}
+	b := make([]u8, 0, len(s)+n*(len(repl)-len(old)))
+	start := 0
+	for i := 0; i < n; i++ {
+		j := start
+		if len(old) == 0 {
+			if i > 0 {
+				_, size := glyph.DecodeRune(s, start)
+				j += size
+			}
+		} else {
+			j = indexAt(s, old, start)
+		}
+		b = append(b, s[start:j]...)
+		b = append(b, repl...)
+		start = j + len(old)
+	}
+	b = append(b, s[start:len(s)]...)
+	return str(b)
+}
+
+// ReplaceAll returns s with every non-overlapping old replaced by repl.
+func ReplaceAll(s str, old str, repl str) str {
+	return Replace(s, old, repl, -1)
+}
+
+// ToLower returns s with ASCII upper-case letters lowered (other bytes unchanged).
+func ToLower(s str) str {
+	n := len(s)
+	i := 0
+	for i < n && !(s[i] >= 'A' && s[i] <= 'Z') {
+		i++
+	}
+	if i == n {
+		return s
+	}
+	p := rt_str_new(n)
+	d := p + 8
+	memcpy(d, cast(i64, s)+8, n)
+	for i < n {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			store8(d+i, i64(c)+32)
+		}
+		i++
+	}
+	return cast(str, p)
+}
+
+// ToUpper returns s with ASCII lower-case letters raised (other bytes unchanged).
+func ToUpper(s str) str {
+	n := len(s)
+	i := 0
+	for i < n && !(s[i] >= 'a' && s[i] <= 'z') {
+		i++
+	}
+	if i == n {
+		return s
+	}
+	p := rt_str_new(n)
+	d := p + 8
+	memcpy(d, cast(i64, s)+8, n)
+	for i < n {
+		c := s[i]
+		if c >= 'a' && c <= 'z' {
+			store8(d+i, i64(c)-32)
+		}
+		i++
+	}
+	return cast(str, p)
+}
+
+// cutRune returns the size of the rune at s[i] when it is in cutset, else 0.
+func cutRune(s str, i i64, cutset str) i64 {
+	c := s[i]
+	if c < 0x80 {
+		if IndexByte(cutset, c) >= 0 {
+			return 1
+		}
+		return 0
+	}
+	_, size := glyph.DecodeRune(s, i)
+	if Contains(cutset, s[i:i+size]) {
+		return size
+	}
+	return 0
+}
+
+// TrimLeft returns s without its leading runes that are in cutset.
+func TrimLeft(s str, cutset str) str {
+	n := len(s)
+	if n == 0 || len(cutset) == 0 {
+		return s
+	}
+	i := 0
+	for i < n {
+		size := cutRune(s, i, cutset)
+		if size == 0 {
+			break
+		}
+		i += size
+	}
+	return s[i:n]
+}
+
+// TrimRight returns s without its trailing runes that are in cutset.
+func TrimRight(s str, cutset str) str {
+	end := len(s)
+	if end == 0 || len(cutset) == 0 {
+		return s
+	}
+	for end > 0 {
+		c := s[end-1]
+		if c < 0x80 {
+			if IndexByte(cutset, c) < 0 {
+				break
+			}
+			end--
+			continue
+		}
+		_, size := glyph.DecodeLastRune(s, end)
+		if !Contains(cutset, s[end-size:end]) {
+			break
+		}
+		end -= size
+	}
+	return s[0:end]
+}
+
+// Trim returns s without leading and trailing runes that are in cutset.
+func Trim(s str, cutset str) str {
+	return TrimRight(TrimLeft(s, cutset), cutset)
+}
+
+// TrimSpace returns s without leading and trailing white space (ASCII, U+0085, U+00A0).
+func TrimSpace(s str) str {
+	n := len(s)
+	i := 0
+	for i < n {
+		c := s[i]
+		if c < 0x80 {
+			if !isSpaceByte(c) {
+				break
+			}
+			i++
+			continue
+		}
+		r, size := glyph.DecodeRune(s, i)
+		if !glyph.IsSpace(r) {
+			break
+		}
+		i += size
+	}
+	end := n
+	for end > i {
+		c := s[end-1]
+		if c < 0x80 {
+			if !isSpaceByte(c) {
+				break
+			}
+			end--
+			continue
+		}
+		r, size := glyph.DecodeLastRune(s, end)
+		if !glyph.IsSpace(r) {
+			break
+		}
+		end -= size
+	}
+	return s[i:end]
+}
+
+// TrimPrefix returns s without the leading prefix, or s unchanged.
+func TrimPrefix(s str, prefix str) str {
+	if HasPrefix(s, prefix) {
+		return s[len(prefix):len(s)]
+	}
+	return s
+}
+
+// TrimSuffix returns s without the trailing suffix, or s unchanged.
+func TrimSuffix(s str, suffix str) str {
+	if HasSuffix(s, suffix) {
+		return s[0 : len(s)-len(suffix)]
+	}
+	return s
+}
+
+// lowerByte lowers an ASCII upper-case byte.
+func lowerByte(c u8) u8 {
+	if c >= 'A' && c <= 'Z' {
+		return c + 32
+	}
+	return c
+}
+
+// EqualFold reports whether s and t are equal under ASCII/Latin-1 simple case folding.
+func EqualFold(s str, t str) bool {
+	i := 0
+	j := 0
+	for i < len(s) && j < len(t) {
+		cs := s[i]
+		ct := t[j]
+		if cs < 0x80 && ct < 0x80 {
+			if cs != ct && lowerByte(cs) != lowerByte(ct) {
+				return false
+			}
+			i++
+			j++
+			continue
+		}
+		rs, ns := glyph.DecodeRune(s, i)
+		rt2, nt := glyph.DecodeRune(t, j)
+		if rs != rt2 && glyph.ToLower(rs) != glyph.ToLower(rt2) {
+			return false
+		}
+		i += ns
+		j += nt
+	}
+	return i == len(s) && j == len(t)
+}
+
+// Compare returns -1, 0 or 1 ordering a and b bytewise.
+func Compare(a str, b str) i64 {
+	la := len(a)
+	lb := len(b)
+	n := la
+	if lb < n {
+		n = lb
+	}
+	if n > 0 {
+		r := (memcmp(cast(i64, a)+8, cast(i64, b)+8, n) << 32) >> 32
+		if r < 0 {
+			return -1
+		}
+		if r > 0 {
+			return 1
+		}
+	}
+	if la < lb {
+		return -1
+	}
+	if la > lb {
+		return 1
+	}
+	return 0
+}
+
+// IndexRune returns the byte offset of the first r in s, or -1.
+func IndexRune(s str, r i32) i64 {
+	if r >= 0 && r < 0x80 {
+		return IndexByte(s, u8(r))
+	}
+	return Index(s, glyph.RuneStr(r))
+}
+
+// ContainsRune reports whether rune r occurs in s.
+func ContainsRune(s str, r i32) bool {
+	return IndexRune(s, r) >= 0
+}
+
+// IndexAny returns the byte offset of the first rune of s that is in chars, or -1.
+func IndexAny(s str, chars str) i64 {
+	if len(chars) == 0 {
+		return -1
+	}
+	n := len(s)
+	i := 0
+	for i < n {
+		size := cutRune(s, i, chars)
+		if size > 0 {
+			return i
+		}
+		if s[i] < 0x80 {
+			i++
+		} else {
+			_, w := glyph.DecodeRune(s, i)
+			i += w
+		}
+	}
+	return -1
+}
+
+// ContainsAny reports whether any rune of chars occurs in s.
+func ContainsAny(s str, chars str) bool {
+	return IndexAny(s, chars) >= 0
+}
+
+// Cut splits s around the first sep, returning (before, after, true), or (s, "", false) when absent.
+func Cut(s str, sep str) (str, str, bool) {
+	i := Index(s, sep)
+	if i < 0 {
+		return s, "", false
+	}
+	return s[0:i], s[i+len(sep) : len(s)], true
+}
+
+// Builder accumulates bytes; the zero Builder{} is ready to use, NewBuilder preallocates.
+type Builder struct {
+	buf []u8
+}
+
+// NewBuilder returns an empty Builder with room for n bytes.
+func NewBuilder(n i64) Builder {
+	return Builder{buf: make([]u8, 0, n)}
+}
+
+// Str appends s.
+func (b mut Builder) Str(s str) {
+	b.buf = append(b.buf, s...)
+}
+
+// Byte appends one byte.
+func (b mut Builder) Byte(c u8) {
+	b.buf = append(b.buf, c)
+}
+
+// Rune appends the UTF-8 encoding of r.
+func (b mut Builder) Rune(r i32) {
+	b.buf = append(b.buf, glyph.RuneStr(r)...)
+}
+
+// Int appends v in decimal.
+func (b mut Builder) Int(v i64) {
+	if v == 0 {
+		b.buf = append(b.buf, '0')
+		return
+	}
+	u := u64(v)
+	if v < 0 {
+		b.buf = append(b.buf, '-')
+		u = 0 - u
+	}
+	n := 0
+	t := u
+	for t > 0 {
+		t /= 10
+		n++
+	}
+	start := len(b.buf)
+	for i := 0; i < n; i++ {
+		b.buf = append(b.buf, '0')
+	}
+	pos := start + n - 1
+	for u > 0 {
+		b.buf[pos] = u8(u%10) + '0'
+		u /= 10
+		pos--
+	}
+}
+
+// Len returns the number of bytes accumulated.
+func (b Builder) Len() i64 {
+	return len(b.buf)
+}
+
+// String returns a copy of the accumulated bytes as a str.
+func (b Builder) String() str {
+	return str(b.buf)
+}
+
+// Bytes returns the accumulated bytes without copying (aliases the Builder).
+func (b Builder) Bytes() []u8 {
+	return b.buf
+}
+
+// Reset empties the Builder but keeps its capacity.
+func (b mut Builder) Reset() {
+	b.buf = b.buf[0:0]
+}

@@ -1,0 +1,2335 @@
+// Expression checking and lowering. chk(e, want) types e and rewrites it in place into
+// core nodes; want is the type the context expects (it settles untyped constants and
+// elided composite types). A node is checked once: N_TYPE marks it done.
+//
+// Strict rules for package code: operands must have identical types (constants adapt
+// and must fit), conditions are bool, references are never nil (?T may be), faults must
+// be handled, and every slice/string index is bounds-checked unless proven safe.
+// Legacy fn code keeps its untyped word semantics.
+
+fn chk(e, want) {
+    if e[N_TYPE] {
+        return e[N_TYPE];
+    }
+    let t = chk_kind(e, want);
+    if !t {
+        t = ty_int;
+    }
+    e[N_TYPE] = t;
+    return t;
+}
+
+fn chk_kind(e, want) {
+    let k = e[N_KIND];
+    if k == EX_INT {
+        if ck_legacy {
+            return ty_int;
+        }
+        return adapt_int(e, want);
+    }
+    if k == EX_FLOAT {
+        return ty_float;
+    }
+    if k == EX_STR {
+        if ck_legacy {
+            return ty_int;
+        }
+        return ty_string;
+    }
+    if k == EX_NIL {
+        e[N_KIND] = EX_INT;
+        e[INT_VAL] = 0;
+        if nilable(want) {
+            return want;
+        }
+        if !ck_legacy {
+            err_at(e[N_POS], "nil needs an optional (?T) or fault type");
+        }
+        return ty_nil;
+    }
+    if k == EX_IDENT {
+        return chk_ident(e, want);
+    }
+    if k == EX_UNARY {
+        if !ck_legacy && fold_const(e) {
+            return adapt_int(e, want);
+        }
+        return chk_unary(e, want);
+    }
+    if k == EX_BINARY {
+        if !ck_legacy && fold_const(e) {
+            return adapt_int(e, want);
+        }
+        if !ck_legacy && fold_compare(e) {
+            return ty_bool;
+        }
+        return chk_binary(e, want);
+    }
+    if k == EX_CALL {
+        return chk_call(e, want);
+    }
+    if k == EX_INDEX {
+        return chk_index(e);
+    }
+    if k == EX_SLICE {
+        return chk_slice(e);
+    }
+    if k == EX_SELECT {
+        return chk_select(e, want);
+    }
+    if k == EX_COMPOSITE {
+        return chk_composite(e, want);
+    }
+    if k == EX_FUNCLIT {
+        return chk_funclit(e);
+    }
+    if k == EX_TYPE {
+        err_at(e[N_POS], "type used as a value");
+        return ty_int;
+    }
+    if k == EX_TRY {
+        err_at(e[N_POS], "try is only allowed as a statement, an initializer, an assignment or a return");
+        return ty_int;
+    }
+    err_at(e[N_POS], "unexpected expression");
+    return ty_int;
+}
+
+// int_fits reports whether constant v is representable in integer type t.
+fn int_fits(v, t, big) {
+    let w = t[TY_WIDTH];
+    if w == 8 {
+        return t[TY_SIGNED] || v >= 0 || big;
+    }
+    if big {
+        return 0;
+    }
+    let bits = 8 * w;
+    if t[TY_SIGNED] {
+        let lim = 1 << (bits - 1);
+        return v >= -lim && v < lim;
+    }
+    return v >= 0 && v < (1 << bits);
+}
+
+// fold_compare turns a comparison of two integer constants into a bool (unsigned when
+// either is above 2^63-1).
+fn fold_compare(e) {
+    let op = e[BIN_OP];
+    if !(streq(op, "<") || streq(op, "<=") || streq(op, ">") || streq(op, ">=") || streq(op, "==") || streq(op, "!=")) {
+        return 0;
+    }
+    let l = e[BIN_L];
+    let r = e[BIN_R];
+    if !fold_const(l) || !fold_const(r) || l[N_KIND] != EX_INT || r[N_KIND] != EX_INT || l[7] || r[7] {
+        return 0;
+    }
+    let a = l[INT_VAL];
+    let b = r[INT_VAL];
+    if l[8] || r[8] {
+        a = a ^ (1 << 63);
+        b = b ^ (1 << 63);
+    }
+    replace_node(e, mk_int(e[N_POS], eval_binary(op, a, b), ty_bool));
+    return 1;
+}
+
+// fold_const evaluates an expression made only of integer literals, turning e into one literal.
+fn fold_const(e) {
+    let k = e[N_KIND];
+    if k == EX_INT {
+        return 1;
+    }
+    if k == EX_IDENT {
+        // An untyped integer constant folds like the literal it stands for.
+        let s = lookup_name(e[ID_NAME]);
+        if !s || s[S_KIND] != SYM_CONST || !s[S_DONE] || s[S_EXPR] || kind_of(s[S_TYPE]) != K_UINT {
+            return 0;
+        }
+        let big = s[S_BIG];
+        replace_node(e, mk_int(e[N_POS], s[S_VAL], 0));
+        e[8] = big;
+        return 1;
+    }
+    let v = 0;
+    if k == EX_UNARY {
+        let op = e[UN_OP];
+        let x = e[UN_X];
+        if !(streq(op, "-") || streq(op, "^") || streq(op, "+")) || !fold_const(x) {
+            return 0;
+        }
+        v = x[INT_VAL];
+        if streq(op, "-") {
+            v = 0 - v;
+        } else if streq(op, "^") {
+            v = ~v;
+        }
+    } else if k == EX_BINARY {
+        let op = e[BIN_OP];
+        let l = e[BIN_L];
+        let r = e[BIN_R];
+        if !fold_const(l) || !fold_const(r) {
+            return 0;
+        }
+        let a = l[INT_VAL];
+        let b = r[INT_VAL];
+        let ub = l[8] || r[8];
+        if ub && (streq(op, ">>") || streq(op, "/") || streq(op, "%")) {
+            if (streq(op, "/") || streq(op, "%")) && b == 0 {
+                return 0;
+            }
+            v = eval_unsigned(op, a, b);
+            e[N_KIND] = EX_INT;
+            e[INT_VAL] = v;
+            e[3] = 0;
+            e[4] = 0;
+            e[7] = 0;
+            e[8] = v < 0;
+            return 1;
+        }
+        if streq(op, "+") {
+            v = a + b;
+        } else if streq(op, "-") {
+            v = a - b;
+        } else if streq(op, "*") {
+            v = a * b;
+        } else if (streq(op, "/") || streq(op, "%")) && b != 0 {
+            if streq(op, "/") {
+                v = a / b;
+            } else {
+                v = a % b;
+            }
+        } else if streq(op, "&") {
+            v = a & b;
+        } else if streq(op, "|") {
+            v = a | b;
+        } else if streq(op, "^") {
+            v = a ^ b;
+        } else if streq(op, "<<") && b >= 0 && b < 64 {
+            v = a << b;
+        } else if streq(op, ">>") && b >= 0 && b < 64 {
+            v = a >> b;
+        } else {
+            return 0;
+        }
+    } else {
+        return 0;
+    }
+    let big = 0;
+    if k == EX_BINARY {
+        big = (e[BIN_L][8] || e[BIN_R][8]) && v < 0;
+    }
+    e[N_KIND] = EX_INT;
+    e[INT_VAL] = v;
+    e[3] = 0;
+    e[4] = 0;
+    e[7] = 0;
+    e[8] = big;
+    return 1;
+}
+
+// adapt_int gives an integer literal the expected type, checking that it fits.
+fn adapt_int(e, want) {
+    if !want {
+        want = ty_int;
+    }
+    if is_float_t(want) {
+        e[N_KIND] = EX_FLOAT;
+        e[FL_BITS] = int_to_float_bits(e[INT_VAL]);
+        return ty_float;
+    }
+    if kind_of(want) == K_INT {
+        if !int_fits(e[INT_VAL], want, e[8]) {
+            let m = err_begin(e[N_POS]);
+            buf_str(m, "constant ");
+            buf_int(m, e[INT_VAL]);
+            buf_str(m, " overflows ");
+            type_name(m, want);
+            err_end(m);
+        }
+        return want;
+    }
+    return ty_uint;
+}
+
+fn chk_ident(e, want) {
+    let name = e[ID_NAME];
+    if streq(name, "true") || streq(name, "false") {
+        replace_node(e, mk_int(e[N_POS], streq(name, "true"), 0));
+        return ty_bool;
+    }
+    let s = lookup_name(name);
+    if !s {
+        if import_pkg(name) {
+            err_quoted(e[N_POS], "use of package ", name, " without a selector");
+        } else {
+            let u = err_begin(e[N_POS]);
+            buf_str(u, "undefined: ");
+            buf_str(u, name);
+            err_end(u);
+        }
+        return ty_int;
+    }
+    return use_sym(e, s, want);
+}
+
+// use_sym turns a resolved name into a variable read, a constant or a function value.
+fn use_sym(e, s, want) {
+    let k = s[S_KIND];
+    if k == SYM_FUNC {
+        if ck_legacy || s[S_FN][F_LEGACY] {
+            err_quoted(e[N_POS], "function ", e[ID_NAME], " used as a value");
+            return ty_int;
+        }
+        let f = s[S_FN];
+        e[N_KIND] = EX_FUNCREF;
+        e[FR_FN] = f;
+        return f[F_TYPE];
+    }
+    if k == SYM_CONST {
+        if !s[S_DONE] {
+            err_quoted(e[N_POS], "constant ", e[ID_NAME], " used before its definition");
+            return ty_int;
+        }
+        if s[S_EXPR] {
+            replace_node(e, expr_clone(s[S_EXPR]));
+            return s[S_TYPE];
+        }
+        let v = s[S_VAL];
+        let t = s[S_TYPE];
+        replace_node(e, mk_int(e[N_POS], v, 0));
+        e[ID_REF] = s;
+        e[8] = s[S_BIG];
+        if kind_of(t) == K_UINT {
+            return chk_kind(e, want);
+        }
+        if is_float_t(t) {
+            e[N_KIND] = EX_FLOAT;
+            e[FL_BITS] = int_to_float_bits(v);
+        }
+        return t;
+    }
+    e[ID_REF] = s;
+    s[S_READS] = s[S_READS] + 1;
+    if !s[S_TYPE] {
+        return ty_int;
+    }
+    return s[S_TYPE];
+}
+
+fn chk_unary(e, want) {
+    let op = e[UN_OP];
+    let x = e[UN_X];
+    if streq(op, "&") {
+        if x[N_KIND] == EX_COMPOSITE {
+            let ct = chk(x, want);
+            replace_node(e, x);
+            return ct;
+        }
+        if x[N_KIND] != EX_IDENT {
+            err_at(e[N_POS], "'&' needs a variable name");
+            chk(x, 0);
+            return ty_int;
+        }
+        let xname = x[ID_NAME];
+        let xt = chk(x, 0);
+        if x[N_KIND] != EX_IDENT || !x[ID_REF] {
+            err_quoted(e[N_POS], "cannot take the address of constant ", xname, "");
+            return ty_int;
+        }
+        if kind_of(xt) == K_STRUCT {
+            replace_node(e, x);
+            return xt;
+        }
+        if !ck_legacy && !ck_trusted {
+            err_at(e[N_POS], "'&' on a variable is only allowed in the standard library");
+        }
+        return ty_int;
+    }
+    if streq(op, "...") {
+        err_at(e[N_POS], "... is only allowed on the last argument of a call");
+        return ty_int;
+    }
+    let t = chk(x, want);
+    if streq(op, "!") {
+        if ck_legacy {
+            return ty_int;
+        }
+        if !is_bool_t(t) {
+            err_type(e[N_POS], "operator ! needs a bool, not ", t, "");
+        }
+        return ty_bool;
+    }
+    if streq(op, "-") {
+        if !is_numeric_t(t) && !ck_legacy {
+            err_type(e[N_POS], "operator - needs a number, not ", t, "");
+        }
+        if x[N_KIND] == EX_FLOAT {
+            replace_node(e, x);
+            e[FL_BITS] = e[FL_BITS] ^ (1 << 63);
+            e[N_TYPE] = 0;
+            return ty_float;
+        }
+        if x[N_KIND] == EX_INT && (kind_of(t) == K_UINT || ck_legacy) {
+            replace_node(e, mk_int(e[N_POS], -x[INT_VAL], 0));
+            return t;
+        }
+        return t;
+    }
+    if !is_integer_t(t) && !ck_legacy {
+        err_type(e[N_POS], "operator ^ needs an integer, not ", t, "");
+    }
+    if x[N_KIND] == EX_INT && kind_of(t) == K_UINT {
+        replace_node(e, mk_int(e[N_POS], ~x[INT_VAL], 0));
+        return ty_uint;
+    }
+    return t;
+}
+
+fn is_cmp_op(op) {
+    return streq(op, "==") || streq(op, "!=") || streq(op, "<") || streq(op, "<=") || streq(op, ">") || streq(op, ">=");
+}
+
+fn is_untyped_lit(e) {
+    let k = e[N_KIND];
+    return k == EX_INT || k == EX_NIL || (k == EX_UNARY && is_untyped_lit(e[UN_X])) || (k == EX_BINARY && is_untyped_lit(e[BIN_L]) && is_untyped_lit(e[BIN_R]));
+}
+
+// unify checks both operands of a binary operator and returns their common type:
+// identical types, or an untyped constant adapted to the other side.
+fn unify(l, r, want) {
+    let lt = 0;
+    let rt = 0;
+    if !is_untyped_lit(l) || is_untyped_lit(r) {
+        lt = chk(l, want);
+        rt = chk(r, default_or(lt, want));
+    } else {
+        rt = chk(r, want);
+        lt = chk(l, default_or(rt, want));
+    }
+    if kind_of(lt) == K_UINT && !is_untyped(rt) {
+        lt = reconvert(l, rt);
+    } else if kind_of(rt) == K_UINT && !is_untyped(lt) {
+        rt = reconvert(r, lt);
+    }
+    if kind_of(lt) == K_NIL && nilable(rt) {
+        reconvert(l, rt);
+        return rt;
+    }
+    if kind_of(rt) == K_NIL && nilable(lt) {
+        reconvert(r, lt);
+        return lt;
+    }
+    if kind_of(lt) == K_UINT && kind_of(rt) == K_UINT {
+        return ty_uint;
+    }
+    if lt != rt && !ck_legacy {
+        err_types(l[N_POS], "mismatched types ", lt, " and ", rt);
+    }
+    return lt;
+}
+
+fn default_or(t, want) {
+    if is_untyped(t) {
+        return want;
+    }
+    return t;
+}
+
+// reconvert gives an untyped constant node the concrete type to.
+fn reconvert(e, to) {
+    let k = kind_of(e[N_TYPE]);
+    if k == K_UINT {
+        if e[N_KIND] == EX_INT {
+            e[N_TYPE] = 0;
+            let t = adapt_int(e, to);
+            e[N_TYPE] = t;
+            return t;
+        }
+        retype_untyped(e, to);
+        return to;
+    }
+    if k == K_NIL && nilable(to) {
+        e[N_TYPE] = to;
+        return to;
+    }
+    return e[N_TYPE];
+}
+
+fn retype_untyped(e, to) {
+    if kind_of(e[N_TYPE]) != K_UINT {
+        return;
+    }
+    e[N_TYPE] = to;
+    let k = e[N_KIND];
+    if k == EX_UNARY {
+        retype_untyped(e[UN_X], to);
+    } else if k == EX_BINARY && !is_cmp_op(e[BIN_OP]) {
+        retype_untyped(e[BIN_L], to);
+        retype_untyped(e[BIN_R], to);
+    }
+}
+
+fn chk_binary(e, want) {
+    let op = e[BIN_OP];
+    let l = e[BIN_L];
+    let r = e[BIN_R];
+    let pos = e[N_POS];
+    if streq(op, "&&") || streq(op, "||") {
+        let a = chk(l, ty_bool);
+        // x != nil && x.f: the right side sees x narrowed.
+        let narrowed = 0;
+        if streq(op, "&&") {
+            narrowed = narrow_begin(l, 1);
+        }
+        let b = chk(r, ty_bool);
+        narrow_end(narrowed);
+        if ck_legacy {
+            return ty_int;
+        }
+        if !is_bool_t(a) || !is_bool_t(b) {
+            err_at(pos, "operands of && and || must be bool");
+        }
+        return ty_bool;
+    }
+    if streq(op, "<<") || streq(op, ">>") {
+        let st = chk(l, want);
+        let ct = chk(r, ty_int);
+        if !is_integer_t(st) && !ck_legacy {
+            err_type(pos, "cannot shift ", st, "");
+        }
+        if !is_integer_t(ct) && !ck_legacy {
+            err_type(pos, "shift count must be an integer, not ", ct, "");
+        }
+        if kind_of(ct) == K_UINT {
+            reconvert(r, ty_int);
+        }
+        if l[N_KIND] == EX_INT && r[N_KIND] == EX_INT && kind_of(st) == K_UINT {
+            replace_node(e, mk_int(pos, eval_binary(op, l[INT_VAL], r[INT_VAL]), 0));
+            return ty_uint;
+        }
+        return st;
+    }
+    let t = unify(l, r, want);
+    if is_cmp_op(op) {
+        let ordered = !streq(op, "==") && !streq(op, "!=");
+        if kind_of(t) == K_STRING {
+            lower_str_cmp(e, op, l, r);
+            if ck_legacy {
+                return ty_int;
+            }
+            return ty_bool;
+        }
+        if l[N_KIND] == EX_INT && r[N_KIND] == EX_INT && kind_of(t) == K_UINT {
+            replace_node(e, mk_int(pos, eval_binary(op, l[INT_VAL], r[INT_VAL]), 0));
+            if ck_legacy {
+                return ty_int;
+            }
+            return ty_bool;
+        }
+        if ck_legacy {
+            return ty_int;
+        }
+        if ordered && !is_numeric_t(t) {
+            err_type(pos, "cannot order values of type ", t, "");
+        }
+        if kind_of(t) == K_UINT {
+            reconvert(l, ty_int);
+            reconvert(r, ty_int);
+        }
+        return ty_bool;
+    }
+    let k = kind_of(t);
+    if k == K_STRING {
+        if !streq(op, "+") {
+            err_quoted(pos, "operator ", op, " is not defined on str");
+        }
+        replace_node(e, rt_call(pos, "rt_str_cat", args2(l, r), ty_string));
+        e[N_TYPE] = 0;
+        return ty_string;
+    }
+    if ck_legacy {
+        return ty_int;
+    }
+    if !is_numeric_t(t) {
+        err_type(pos, "arithmetic on ", t, "");
+    }
+    if is_float_t(t) && (streq(op, "%") || streq(op, "&") || streq(op, "|") || streq(op, "^")) {
+        err_quoted(pos, "operator ", op, " is not defined on f64");
+    }
+    if k == K_UINT && l[N_KIND] == EX_INT && r[N_KIND] == EX_INT {
+        if (streq(op, "/") || streq(op, "%")) && r[INT_VAL] == 0 {
+            err_at(pos, "division by zero");
+            return ty_uint;
+        }
+        replace_node(e, mk_int(pos, eval_binary(op, l[INT_VAL], r[INT_VAL]), 0));
+        return ty_uint;
+    }
+    if k == K_INT && is_const_zero(r) && (streq(op, "/") || streq(op, "%")) {
+        err_at(pos, "division by zero");
+    }
+    return t;
+}
+
+fn is_const_zero(e) {
+    return e[N_KIND] == EX_INT && e[INT_VAL] == 0;
+}
+
+fn lower_str_cmp(e, op, l, r) {
+    let pos = e[N_POS];
+    if streq(op, "==") || streq(op, "!=") {
+        let eq = rt_call(pos, "rt_str_eq", args2(l, r), ty_bool);
+        if streq(op, "!=") {
+            let n = node_new(EX_UNARY, pos);
+            n[UN_OP] = "!";
+            n[UN_X] = eq;
+            n[N_TYPE] = ty_bool;
+            eq = n;
+        }
+        replace_node(e, eq);
+        e[N_TYPE] = 0;
+        return;
+    }
+    replace_node(e, mk_bin(pos, op, rt_call(pos, "rt_str_cmp", args2(l, r), ty_int), mk_int(pos, 0, ty_int), 0));
+}
+
+// ---- memory access ----
+
+// mk_mem is a load or store of type t at base + index*scale + off.
+fn mk_mem(pos, base, index, scale, off, t) {
+    let n = node_new(EX_MEM, pos);
+    n[MEM_BASE] = base;
+    n[MEM_INDEX] = index;
+    n[MEM_SCALE] = scale;
+    n[MEM_OFF] = off;
+    n[N_TYPE] = t;
+    return n;
+}
+
+// map_read is m[k]: a missing key reads as the value type's zero, and a str, slice, map
+// or struct zero is a real (never nil) value.
+fn map_read(pos, m, k, vt) {
+    let get = from_bits(rt_call(pos, "rt_map_get", args2(m, to_bits(k)), ty_int), vt);
+    let vk = kind_of(vt);
+    if ck_legacy || !(vk == K_STRING || vk == K_SLICE || vk == K_MAP || vk == K_STRUCT) {
+        return get;
+    }
+    let stmts = vec_new();
+    let tmp = temp(pos, get, vt);
+    vec_push(stmts, tmp);
+    let ifs = node_new(ST_IF, pos);
+    ifs[IF_COND] = mk_unot(pos, rt_call(pos, "rt_map_found", vec_new(), ty_bool));
+    ifs[IF_THEN] = empty_block(pos);
+    let alt = 0;
+    if vk == K_STRING {
+        alt = lit_string(pos, "");
+    } else if vk == K_SLICE {
+        alt = intrinsic_call(pos, "__empty", vec_new(), vt);
+    } else {
+        alt = argo_new(pos, ifs[IF_THEN][BLK_STMTS], vt);
+    }
+    vec_push(ifs[IF_THEN][BLK_STMTS], assign_stmt(pos, sym_ref_node(pos, tmp[LET_SYM]), alt));
+    vec_push(stmts, ifs);
+    return mk_seq(pos, stmts, sym_ref_node(pos, tmp[LET_SYM]), vt);
+}
+
+// mk_elem indexes a slice or string; the backend checks the index against the length
+// unless ELEM_SAFE is set (the checker proved it in range).
+fn mk_elem(pos, seq, index, t, isstr) {
+    let n = node_new(EX_ELEM, pos);
+    n[ELEM_SEQ] = seq;
+    n[ELEM_IDX] = index;
+    n[ELEM_SIZE] = type_width(t);
+    n[ELEM_STR] = isstr;
+    n[N_TYPE] = t;
+    return n;
+}
+
+fn chk_index(e) {
+    let pos = e[N_POS];
+    let x = e[IX_X];
+    let xt = chk(x, 0);
+    let k = kind_of(xt);
+    if ck_legacy || (k == K_INT && ck_trusted) {
+        // Raw word indexing: legacy code and the runtime's own memory management.
+        chk(e[IX_I], ty_int);
+        reconvert(e[IX_I], ty_int);
+        return ty_int;
+    }
+    if k == K_MAP {
+        let kt = chk(e[IX_I], xt[TY_KEY]);
+        check_assignable(e[IX_I], kt, xt[TY_KEY]);
+        if is_untyped(kt) {
+            reconvert(e[IX_I], xt[TY_KEY]);
+        }
+        replace_node(e, map_read(pos, x, e[IX_I], xt[TY_ELEM]));
+        e[N_TYPE] = 0;
+        return xt[TY_ELEM];
+    }
+    let it = chk(e[IX_I], ty_int);
+    if !is_integer_t(it) {
+        err_type(pos, "index must be an integer, not ", it, "");
+    }
+    if kind_of(it) == K_UINT {
+        reconvert(e[IX_I], ty_int);
+    }
+    if k == K_STRING {
+        replace_node(e, mk_elem(pos, x, e[IX_I], ty_byte, 1));
+        mark_safe_index(e);
+        e[N_TYPE] = 0;
+        return ty_byte;
+    }
+    if k == K_SLICE {
+        replace_node(e, mk_elem(pos, x, e[IX_I], xt[TY_ELEM], 0));
+        mark_safe_index(e);
+        e[N_TYPE] = 0;
+        return xt[TY_ELEM];
+    }
+    err_type(pos, "cannot index ", xt, "");
+    return ty_int;
+}
+
+fn chk_slice(e) {
+    let pos = e[N_POS];
+    let x = e[SL_X];
+    let xt = chk(x, 0);
+    let lo = e[SL_LO];
+    let hi = e[SL_HI];
+    if lo {
+        chk(lo, ty_int);
+        reconvert(lo, ty_int);
+    } else {
+        lo = mk_int(pos, 0, ty_int);
+    }
+    if hi {
+        chk(hi, ty_int);
+        reconvert(hi, ty_int);
+    } else {
+        hi = mk_int(pos, -1, ty_int);
+    }
+    if kind_of(xt) == K_STRING {
+        replace_node(e, rt_call(pos, "rt_str_sub", args3(x, lo, hi), ty_string));
+        e[N_TYPE] = 0;
+        return ty_string;
+    }
+    if kind_of(xt) == K_SLICE {
+        replace_node(e, rt_call(pos, "rt_slice_sub", args4(x, lo, hi, mk_int(pos, elem_size(xt), ty_int)), xt));
+        e[N_TYPE] = 0;
+        return xt;
+    }
+    err_type(pos, "cannot slice ", xt, "");
+    return ty_int;
+}
+
+// pkg_member resolves pkg.name to its global symbol, or 0.
+fn pkg_member(pkg, name) {
+    return lookup_global(str_cat3(pkg, ".", name));
+}
+
+fn chk_select(e, want) {
+    let pos = e[N_POS];
+    let x = e[SEL_X];
+    let name = e[SEL_NAME];
+    if x[N_KIND] == EX_IDENT && !lookup_name_local(x[ID_NAME]) {
+        let pkg = import_pkg(x[ID_NAME]);
+        if pkg {
+            let s = pkg_member(pkg, name);
+            if !s {
+                let u = err_begin(pos);
+                buf_str(u, "undefined: ");
+                buf_str(u, x[ID_NAME]);
+                buf_byte(u, '.');
+                buf_str(u, name);
+                err_end(u);
+                return ty_int;
+            }
+            replace_node(e, node_new(EX_IDENT, pos));
+            e[ID_NAME] = name;
+            return use_sym(e, s, want);
+        }
+    }
+    let xt = chk(x, 0);
+    if kind_of(xt) == K_OPT {
+        err_type(pos, "cannot use a field of optional ", xt, " before checking it against nil");
+        return ty_int;
+    }
+    if kind_of(xt) == K_STRUCT {
+        let i = struct_field(xt, name);
+        if i < 0 {
+            let u = err_begin(pos);
+            type_name(u, xt);
+            buf_str(u, " has no field ");
+            buf_str(u, name);
+            err_end(u);
+            return ty_int;
+        }
+        replace_node(e, mk_mem(pos, x, 0, 0, field_offset(xt, i), 0));
+        return field_type(xt, i);
+    }
+    err_type(pos, "cannot select a field of ", xt, "");
+    return ty_int;
+}
+
+fn lookup_name_local(name) {
+    let i = sc_syms[VEC_LEN] - 1;
+    while i >= 0 {
+        if streq(vec_get(sc_syms, i)[S_NAME], name) {
+            return vec_get(sc_syms, i);
+        }
+        i = i - 1;
+    }
+    return 0;
+}
+
+// field_store builds the target for storing into field fi of struct object obj.
+fn field_store(pos, obj, t, fi) {
+    return mk_mem(pos, obj, 0, 0, field_offset(t, fi), field_type(t, fi));
+}
+
+// chk_composite allocates a struct, slice or map and fills it, as an EX_SEQ.
+fn chk_composite(e, want) {
+    let pos = e[N_POS];
+    let tx = e[CL_TYPE];
+    let t = want;
+    if kind_of(t) == K_OPT {
+        t = t[TY_ELEM];
+    }
+    if tx[N_KIND] == EX_TYPE && tx[TYX] {
+        t = resolve_type(tx[TYX]);
+    } else if tx[N_KIND] == EX_INDEX {
+        let gtx = expr_to_tx(tx);
+        if gtx {
+            t = resolve_type(gtx);
+        }
+    } else if tx[N_KIND] == EX_IDENT || tx[N_KIND] == EX_SELECT {
+        let tn = node_new(TX_NAME, pos);
+        if tx[N_KIND] == EX_IDENT {
+            tn[TX_B] = tx[ID_NAME];
+        } else {
+            tn[TX_A] = tx[SEL_X][ID_NAME];
+            tn[TX_B] = tx[SEL_NAME];
+        }
+        t = resolve_type(tn);
+    }
+    if !t {
+        err_at(pos, "missing type in composite literal");
+        return ty_int;
+    }
+    let elems = e[CL_ELEMS];
+    let keys = e[CL_KEYS];
+    let stmts = vec_new();
+    let k = kind_of(t);
+    if k == K_STRUCT {
+        let nf = t[TY_FIELDS][VEC_LEN];
+        let obj = temp(pos, rt_call(pos, "rt_alloc", args1(mk_int(pos, t[TY_SIZE], ty_int)), t), t);
+        vec_push(stmts, obj);
+        let set = vec_filled(nf, 0);
+        let i = 0;
+        while i < elems[VEC_LEN] {
+            let fi = i;
+            let key = vec_get(keys, i);
+            if key {
+                if key[N_KIND] != EX_IDENT {
+                    err_at(key[N_POS], "expected a field name");
+                    return t;
+                }
+                fi = struct_field(t, key[ID_NAME]);
+                if fi < 0 {
+                    err_quoted(key[N_POS], "unknown field ", key[ID_NAME], "");
+                    return t;
+                }
+            } else if fi >= nf {
+                err_at(pos, "too many values in struct literal");
+                return t;
+            }
+            set[VEC_DATA][fi] = 1;
+            let ft = field_type(t, fi);
+            let v = vec_get(elems, i);
+            let vt = chk(v, ft);
+            check_assignable(v, vt, ft);
+            if is_untyped(vt) {
+                reconvert(v, ft);
+            }
+            if !(is_const_zero(v) && !is_ref(ft)) {
+                vec_push(stmts, assign_stmt(pos, field_store(pos, sym_ref_node(pos, obj[LET_SYM]), t, fi), v));
+            }
+            i = i + 1;
+        }
+        // Fields left out get their zero value; references that cannot be nil must be set.
+        i = 0;
+        while i < nf {
+            if !vec_get(set, i) {
+                init_zero_field(pos, stmts, obj[LET_SYM], t, i);
+            }
+            i = i + 1;
+        }
+        replace_node(e, mk_seq(pos, stmts, sym_ref_node(pos, obj[LET_SYM]), 0));
+        return t;
+    }
+    if k == K_SLICE {
+        let n = elems[VEC_LEN];
+        let et = t[TY_ELEM];
+        let sl = temp(pos, rt_call(pos, "rt_slice_make", args3(mk_int(pos, n, ty_int), mk_int(pos, n, ty_int), mk_int(pos, elem_size(t), ty_int)), t), t);
+        vec_push(stmts, sl);
+        let data = temp(pos, mk_hdr(pos, sym_ref_node(pos, sl[LET_SYM]), 2), ty_int);
+        vec_push(stmts, data);
+        let i = 0;
+        while i < n {
+            let v = vec_get(elems, i);
+            let vt = chk(v, et);
+            check_assignable(v, vt, et);
+            if is_untyped(vt) {
+                reconvert(v, et);
+            }
+            vec_push(stmts, assign_stmt(pos, mk_mem(pos, sym_ref_node(pos, data[LET_SYM]), 0, 0, i * type_width(et), et), v));
+            i = i + 1;
+        }
+        replace_node(e, mk_seq(pos, stmts, sym_ref_node(pos, sl[LET_SYM]), 0));
+        return t;
+    }
+    if k == K_MAP {
+        let m = temp(pos, rt_call(pos, "rt_map_make", args1(mk_int(pos, kind_of(t[TY_KEY]) == K_STRING, ty_int)), t), t);
+        vec_push(stmts, m);
+        let i = 0;
+        while i < elems[VEC_LEN] {
+            let key = vec_get(keys, i);
+            let v = vec_get(elems, i);
+            if !key {
+                err_at(v[N_POS], "missing key in map literal");
+                return t;
+            }
+            let kt = chk(key, t[TY_KEY]);
+            check_assignable(key, kt, t[TY_KEY]);
+            if is_untyped(kt) {
+                reconvert(key, t[TY_KEY]);
+            }
+            let vt = chk(v, t[TY_ELEM]);
+            check_assignable(v, vt, t[TY_ELEM]);
+            if is_untyped(vt) {
+                reconvert(v, t[TY_ELEM]);
+            }
+            vec_push(stmts, expr_stmt(rt_call(pos, "rt_map_set", args3(sym_ref_node(pos, m[LET_SYM]), to_bits(key), to_bits(v)), ty_void)));
+            i = i + 1;
+        }
+        replace_node(e, mk_seq(pos, stmts, sym_ref_node(pos, m[LET_SYM]), 0));
+        return t;
+    }
+    err_type(pos, "cannot build a composite literal of type ", t, "");
+    return ty_int;
+}
+
+// init_zero_field stores the zero value of a field the literal left out. Memory is
+// already zeroed, so only references need work: "" and empty slices are static
+// objects, and structs, maps and funcs have no zero value at all.
+fn init_zero_field(pos, stmts, obj, t, fi) {
+    let ft = field_type(t, fi);
+    let k = kind_of(ft);
+    let rec = vec_get(t[TY_FIELDS], fi);
+    if k == K_SLICE && rec[VEC_LEN] > 4 && vec_get(rec, 3) > 0 {
+        array_inner = vec_get(rec, 4);
+        vec_push(stmts, assign_stmt(pos, field_store(pos, sym_ref_node(pos, obj), t, fi), array_make(pos, ft, vec_get(rec, 3))));
+        return;
+    }
+    if k == K_STRING || k == K_SLICE {
+        vec_push(stmts, assign_stmt(pos, field_store(pos, sym_ref_node(pos, obj), t, fi), zero_value(pos, ft)));
+    } else if k == K_STRUCT || k == K_MAP || k == K_FUNC {
+        let m = err_begin(pos);
+        buf_str(m, "field ");
+        buf_str(m, vec_get(vec_get(t[TY_FIELDS], fi), 0));
+        buf_str(m, " of type ");
+        type_name(m, ft);
+        buf_str(m, " must be set (it cannot be nil; declare it ?T to allow that)");
+        err_end(m);
+    }
+}
+
+// chk_funclit lifts a function literal to a top-level function. Literals may not
+// capture local variables: only globals and their own parameters.
+fn chk_funclit(e) {
+    let f = e[LIT_FN];
+    lifted_count = lifted_count + 1;
+    let b = buf_new();
+    buf_str(b, "func$");
+    buf_int(b, lifted_count);
+    buf_byte(b, 0);
+    f[F_NAME] = b[VEC_DATA];
+    f[F_FILE] = ck_file;
+    f[F_LIFTED] = 1;
+    let saved_fn = ck_fn;
+    let saved_legacy = ck_legacy;
+    declare_fn(f);
+    ck_fn = saved_fn;
+    ck_legacy = saved_legacy;
+    f[F_QNAME] = f[F_NAME];
+    vec_push(prog_fns, f);
+    replace_node(e, node_new(EX_FUNCREF, e[N_POS]));
+    e[FR_FN] = f;
+    return f[F_TYPE];
+}
+
+// ---- calls ----
+
+fn chk_args(e, ptypes, variadic, legacy) {
+    let args = e[CALL_ARGS];
+    let n = ptypes[VEC_LEN];
+    if args[VEC_LEN] != n && !(variadic && args[VEC_LEN] >= n) {
+        let a = err_begin(e[N_POS]);
+        if e[CALL_NAME] {
+            buf_str(a, e[CALL_NAME]);
+        } else {
+            buf_str(a, "function");
+        }
+        buf_str(a, " expects ");
+        buf_int(a, n);
+        buf_str(a, " arguments, got ");
+        buf_int(a, args[VEC_LEN]);
+        err_end(a);
+    }
+    let i = 0;
+    while i < args[VEC_LEN] {
+        let a = vec_get(args, i);
+        let want = 0;
+        if i < n {
+            want = vec_get(ptypes, i);
+        }
+        let at = chk(a, want);
+        if i < n && !legacy {
+            check_assignable(a, at, want);
+            if is_untyped(at) {
+                reconvert(a, want);
+            }
+        } else if i < n && legacy && is_float_t(at) {
+            err_at(a[N_POS], "cannot pass a f64 to an untyped (fn) parameter");
+        }
+        if i >= n && is_untyped(at) {
+            reconvert(a, default_type(at));
+        }
+        i = i + 1;
+    }
+}
+
+fn result_type(f) {
+    let rs = f[F_RTYPES];
+    if rs[VEC_LEN] == 0 {
+        return ty_void;
+    }
+    if rs[VEC_LEN] == 1 {
+        return vec_get(rs, 0);
+    }
+    return tuple_of(rs);
+}
+
+fn func_result(ft) {
+    let rs = ft[TY_RESULTS];
+    if rs[VEC_LEN] == 0 {
+        return ty_void;
+    }
+    if rs[VEC_LEN] == 1 {
+        return vec_get(rs, 0);
+    }
+    return tuple_of(rs);
+}
+
+fn direct_call(e, f) {
+    if is_template(f) {
+        return generic_call(e, f);
+    }
+    e[CALL_FN] = f;
+    e[CALL_CALLEE] = 0;
+    chk_args(e, f[F_PTYPES], f[F_VARIADIC], f[F_LEGACY]);
+    return result_type(f);
+}
+
+fn chk_call(e, want) {
+    let name = e[CALL_NAME];
+    let callee = e[CALL_CALLEE];
+    if name {
+        let s = lookup_name(name);
+        if s && s[S_KIND] == SYM_FUNC {
+            return direct_call(e, s[S_FN]);
+        }
+        if s && (s[S_KIND] == SYM_LOCAL || s[S_KIND] == SYM_GLOBAL) && kind_of(s[S_TYPE]) == K_FUNC {
+            let id = node_new(EX_IDENT, e[N_POS]);
+            id[ID_NAME] = name;
+            e[CALL_CALLEE] = id;
+            e[CALL_NAME] = 0;
+            return indirect_call(e);
+        }
+        if !s {
+            let n = intrinsic_arity(name);
+            if n >= 0 {
+                if !ck_legacy && !ck_trusted {
+                    err_quoted(e[N_POS], "", name, " is internal to the runtime");
+                }
+                e[CALL_INTRINSIC] = 1;
+                if e[CALL_ARGS][VEC_LEN] != n {
+                    arity_error(e, n);
+                }
+                let i = 0;
+                while i < e[CALL_ARGS][VEC_LEN] {
+                    let a = vec_get(e[CALL_ARGS], i);
+                    chk(a, ty_int);
+                    reconvert(a, ty_int);
+                    i = i + 1;
+                }
+                if streq(name, "load8") && !ck_legacy {
+                    return ty_byte;
+                }
+                return ty_int;
+            }
+            let bt = chk_builtin(e, name, want);
+            if bt {
+                return bt;
+            }
+            let tt = find_type_name(name);
+            if tt {
+                return chk_conversion(e, tt);
+            }
+            let u = err_begin(e[N_POS]);
+            buf_str(u, "undefined function: ");
+            buf_str(u, name);
+            err_end(u);
+            return ty_int;
+        }
+        err_quoted(e[N_POS], "", name, " is not a function");
+        return ty_int;
+    }
+    let gx = explicit_generic(callee);
+    if gx {
+        let inst = instantiate_fn(gx, resolve_types(index_targs(callee)), e[N_POS]);
+        e[CALL_NAME] = inst[F_QNAME];
+        return direct_call(e, inst);
+    }
+    if callee[N_KIND] == EX_SELECT {
+        let x = callee[SEL_X];
+        let m = callee[SEL_NAME];
+        if x[N_KIND] == EX_IDENT && !lookup_name_local(x[ID_NAME]) && import_pkg(x[ID_NAME]) {
+            let pkg = import_pkg(x[ID_NAME]);
+            if streq(pkg, "say") && is_say_func(m) {
+                return lower_say(e, m, want);
+            }
+            if streq(pkg, "argo") && streq(m, "Put") {
+                return lower_argo_put(e);
+            }
+            if streq(pkg, "argo") && streq(m, "Get") {
+                return lower_argo_get(e);
+            }
+            let s = pkg_member(pkg, m);
+            if s && s[S_KIND] == SYM_FUNC {
+                e[CALL_NAME] = s[S_NAME];
+                return direct_call(e, s[S_FN]);
+            }
+            let pt = find_type(str_cat3(pkg, ".", m));
+            if pt {
+                return chk_conversion(e, pt);
+            }
+            let ov = overload(pkg, m, e);
+            if ov {
+                e[CALL_NAME] = ov[F_QNAME];
+                return direct_call(e, ov);
+            }
+            let u = err_begin(e[N_POS]);
+            buf_str(u, "undefined: ");
+            buf_str(u, x[ID_NAME]);
+            buf_byte(u, '.');
+            buf_str(u, m);
+            err_end(u);
+            return ty_int;
+        }
+        let xt = chk(x, 0);
+        if kind_of(xt) == K_OPT {
+            err_type(e[N_POS], "cannot call a method of optional ", xt, " before checking it against nil");
+            return ty_int;
+        }
+        if kind_of(xt) == K_STRUCT {
+            let mf = find_fn(str_cat3(xt[TY_NAME], ".", m));
+            if mf {
+                let args = vec_new();
+                vec_push(args, x);
+                let i = 0;
+                while i < e[CALL_ARGS][VEC_LEN] {
+                    vec_push(args, vec_get(e[CALL_ARGS], i));
+                    i = i + 1;
+                }
+                e[CALL_ARGS] = args;
+                e[CALL_NAME] = mf[F_QNAME];
+                return direct_call(e, mf);
+            }
+            let fi = struct_field(xt, m);
+            if fi >= 0 && kind_of(field_type(xt, fi)) == K_FUNC {
+                e[CALL_CALLEE] = mk_mem(e[N_POS], x, 0, 0, field_offset(xt, fi), field_type(xt, fi));
+                return indirect_call(e);
+            }
+            let u = err_begin(e[N_POS]);
+            type_name(u, xt);
+            buf_str(u, " has no method ");
+            buf_str(u, m);
+            err_end(u);
+            return ty_int;
+        }
+        if kind_of(xt) == K_ERROR && streq(m, "Error") {
+            replace_node(e, rt_call(e[N_POS], "rt_err_str", args1(x), ty_string));
+            e[N_TYPE] = 0;
+            return ty_string;
+        }
+        err_type(e[N_POS], "cannot call a method on ", xt, "");
+        return ty_int;
+    }
+    if callee[N_KIND] == EX_TYPE {
+        return chk_conversion(e, resolve_type(callee[TYX]));
+    }
+    return indirect_call(e);
+}
+
+// overload picks pkg.Name__suffix by the first argument's element type, the stand-in
+// for generics in library functions like sift.Sort.
+fn overload(pkg, name, e) {
+    let args = e[CALL_ARGS];
+    if args[VEC_LEN] == 0 {
+        return 0;
+    }
+    let t = chk(vec_get(args, 0), 0);
+    if kind_of(t) == K_SLICE {
+        t = t[TY_ELEM];
+    }
+    let b = buf_new();
+    buf_str(b, pkg);
+    buf_byte(b, '.');
+    buf_str(b, name);
+    buf_str(b, "__");
+    type_name(b, default_type(t));
+    buf_byte(b, 0);
+    return find_fn(b[VEC_DATA]);
+}
+
+fn indirect_call(e) {
+    let callee = e[CALL_CALLEE];
+    let ft = chk(callee, 0);
+    if kind_of(ft) != K_FUNC {
+        err_type(e[N_POS], "cannot call a value of type ", ft, "");
+        return ty_int;
+    }
+    e[CALL_FN] = 0;
+    chk_args(e, ft[TY_FIELDS], 0, 0);
+    return func_result(ft);
+}
+
+fn find_type_name(name) {
+    if load8(ck_pkg) != 0 {
+        let t = find_type(qual(ck_pkg, name));
+        if t {
+            return t;
+        }
+    }
+    return find_type(name);
+}
+
+fn arg0(e) {
+    return vec_get(e[CALL_ARGS], 0);
+}
+
+fn chk_conversion(e, to) {
+    let pos = e[N_POS];
+    if e[CALL_ARGS][VEC_LEN] != 1 {
+        err_type(pos, "conversion to ", to, " needs exactly one argument");
+        return to;
+    }
+    let x = arg0(e);
+    let from = chk(x, to);
+    let fk = kind_of(from);
+    let tk = kind_of(to);
+    if from == to || (is_untyped(from) && assignable(from, to)) {
+        if is_untyped(from) {
+            reconvert(x, to);
+        }
+        replace_node(e, x);
+        return to;
+    }
+    if tk == K_FLOAT && is_integer_t(from) {
+        replace_node(e, mk_conv(pos, x, CV_I2F, ty_float));
+        return ty_float;
+    }
+    if tk == K_INT && fk == K_FLOAT {
+        replace_node(e, mk_conv(pos, x, CV_F2I, to));
+        return to;
+    }
+    if tk == K_INT && is_integer_t(from) {
+        // Integer conversions truncate or extend to the target width.
+        replace_node(e, mk_conv(pos, x, CV_INT, to));
+        return to;
+    }
+    if tk == K_INT && fk == K_BOOL {
+        replace_node(e, mk_conv(pos, x, CV_SAME, to));
+        return to;
+    }
+    if tk == K_STRING && is_integer_t(from) {
+        replace_node(e, rt_call(pos, "rt_str_from_rune", args1(x), ty_string));
+        return ty_string;
+    }
+    if tk == K_STRING && fk == K_SLICE && from[TY_ELEM] == ty_byte {
+        replace_node(e, rt_call(pos, "rt_str_from_bytes", args1(x), ty_string));
+        return ty_string;
+    }
+    if tk == K_SLICE && to[TY_ELEM] == ty_byte && fk == K_STRING {
+        replace_node(e, rt_call(pos, "rt_bytes_from_str", args1(x), to));
+        return to;
+    }
+    if tk == K_OPT && from == to[TY_ELEM] {
+        replace_node(e, mk_conv(pos, x, CV_SAME, to));
+        return to;
+    }
+    err_types(pos, "cannot convert ", from, " to ", to);
+    return to;
+}
+
+// chk_builtin handles the predeclared functions; it returns 0 for other names.
+fn chk_builtin(e, name, want) {
+    let pos = e[N_POS];
+    let args = e[CALL_ARGS];
+    let n = args[VEC_LEN];
+    if streq(name, "len") || streq(name, "cap") {
+        if n != 1 {
+            err_quoted(pos, "", name, " expects 1 argument");
+            return ty_int;
+        }
+        let t = chk(arg0(e), 0);
+        let k = kind_of(t);
+        if k != K_STRING && k != K_SLICE && k != K_MAP {
+            err_type(pos, "invalid argument for len: ", t, "");
+        }
+        let word = 0;
+        if streq(name, "cap") {
+            word = 1;
+        }
+        replace_node(e, mk_hdr(pos, arg0(e), word));
+        e[N_TYPE] = 0;
+        return ty_int;
+    }
+    if streq(name, "append") {
+        if n == 0 {
+            err_at(pos, "append needs a slice");
+            return ty_int;
+        }
+        let st = chk(arg0(e), want);
+        if kind_of(st) != K_SLICE {
+            err_type(pos, "first argument to append must be a slice, not ", st, "");
+            return ty_int;
+        }
+        let et = st[TY_ELEM];
+        let acc = arg0(e);
+        let i = 1;
+        while i < n {
+            let a = vec_get(args, i);
+            if a[N_KIND] == EX_UNARY && streq(a[UN_OP], "...") {
+                let at = chk(a[UN_X], st);
+                if kind_of(at) == K_STRING && et == ty_byte {
+                    acc = rt_call(pos, "rt_append_str", args2(acc, a[UN_X]), st);
+                } else {
+                    check_assignable(a[UN_X], at, st);
+                    acc = rt_call(pos, "rt_slice_appendn", args3(acc, a[UN_X], mk_int(pos, elem_size(st), ty_int)), st);
+                }
+            } else {
+                let vt = chk(a, et);
+                check_assignable(a, vt, et);
+                if is_untyped(vt) {
+                    reconvert(a, et);
+                }
+                acc = rt_call(pos, "rt_append", args3(acc, to_bits(a), mk_int(pos, elem_size(st), ty_int)), st);
+            }
+            i = i + 1;
+        }
+        replace_node(e, acc);
+        e[N_TYPE] = 0;
+        return st;
+    }
+    if streq(name, "make") {
+        let t = resolve_type(arg0(e)[TYX]);
+        let k = kind_of(t);
+        if k == K_SLICE {
+            if n < 2 {
+                err_at(pos, "make of a slice needs a length");
+                return t;
+            }
+            chk(vec_get(args, 1), ty_int);
+            reconvert(vec_get(args, 1), ty_int);
+            let c = vec_get(args, 1);
+            if n > 2 {
+                c = vec_get(args, 2);
+                chk(c, ty_int);
+                reconvert(c, ty_int);
+            }
+            let ek = kind_of(t[TY_ELEM]);
+            let len0 = vec_get(args, 1);
+            let zero_len = len0[N_KIND] == EX_INT && len0[INT_VAL] == 0;
+            if !ck_legacy && !zero_len && (ek == K_STRUCT || ek == K_MAP || ek == K_FUNC) {
+                err_type(pos, "make with a length would fill the slice with nil ", t[TY_ELEM], " values: use make([]T, 0, n) and append (or []?T)");
+                return t;
+            }
+            if !ck_legacy && !zero_len && ek == K_STRING {
+                // Elements start as "" (a str is never nil).
+                replace_node(e, rt_call(pos, "rt_slice_make_str", args2(vec_get(args, 1), c), t));
+                return t;
+            }
+            if !ck_legacy && !zero_len && ek == K_SLICE {
+                replace_node(e, rt_call(pos, "rt_slice_make_nest", args3(vec_get(args, 1), c, mk_int(pos, elem_size(t[TY_ELEM]), ty_int)), t));
+                return t;
+            }
+            replace_node(e, rt_call(pos, "rt_slice_make", args3(vec_get(args, 1), c, mk_int(pos, elem_size(t), ty_int)), t));
+            return t;
+        }
+        if k == K_MAP {
+            replace_node(e, rt_call(pos, "rt_map_make", args1(mk_int(pos, kind_of(t[TY_KEY]) == K_STRING, ty_int)), t));
+            return t;
+        }
+        err_type(pos, "cannot make ", t, "");
+        return t;
+    }
+    if streq(name, "new") {
+        let t = resolve_type(arg0(e)[TYX]);
+        if kind_of(t) != K_STRUCT {
+            err_type(pos, "new needs a struct type, not ", t, "");
+            return t;
+        }
+        // new(T) is T{}: fields that cannot be nil must still be set.
+        let lit = node_new(EX_COMPOSITE, pos);
+        let tyx = node_new(EX_TYPE, pos);
+        tyx[TYX] = arg0(e)[TYX];
+        lit[CL_TYPE] = tyx;
+        lit[CL_ELEMS] = vec_new();
+        lit[CL_KEYS] = vec_new();
+        replace_node(e, lit);
+        e[N_TYPE] = 0;
+        return chk_kind(e, t);
+    }
+    if streq(name, "cast") {
+        if !ck_legacy && !ck_trusted {
+            err_at(pos, "cast is internal to the runtime");
+        }
+        let t = resolve_type(arg0(e)[TYX]);
+        let x = vec_get(args, 1);
+        let from = chk(x, 0);
+        if is_untyped(from) {
+            reconvert(x, ty_int);
+        }
+        if is_float_t(t) && !is_float_t(from) {
+            replace_node(e, mk_conv(pos, x, CV_BITS2F, t));
+        } else if !is_float_t(t) && is_float_t(from) {
+            replace_node(e, mk_conv(pos, x, CV_F2BITS, t));
+        } else {
+            // Same bits, new static type: the operand keeps its own type.
+            replace_node(e, mk_conv(pos, x, CV_SAME, t));
+        }
+        return t;
+    }
+    if streq(name, "delete") {
+        let mt = chk(arg0(e), 0);
+        if kind_of(mt) != K_MAP || n != 2 {
+            err_at(pos, "delete needs a map and a key");
+            return ty_void;
+        }
+        let kt = chk(vec_get(args, 1), mt[TY_KEY]);
+        check_assignable(vec_get(args, 1), kt, mt[TY_KEY]);
+        if is_untyped(kt) {
+            reconvert(vec_get(args, 1), mt[TY_KEY]);
+        }
+        replace_node(e, rt_call(pos, "rt_map_del", args2(arg0(e), to_bits(vec_get(args, 1))), ty_void));
+        return ty_void;
+    }
+    if streq(name, "copy") {
+        let dt = chk(arg0(e), 0);
+        let st = chk(vec_get(args, 1), 0);
+        if kind_of(st) == K_STRING {
+            replace_node(e, rt_call(pos, "rt_copy_str", args2(arg0(e), vec_get(args, 1)), ty_int));
+        } else {
+            replace_node(e, rt_call(pos, "rt_slice_copy", args3(arg0(e), vec_get(args, 1), mk_int(pos, elem_size(dt), ty_int)), ty_int));
+        }
+        return ty_int;
+    }
+    if streq(name, "panic") {
+        let pt = chk(arg0(e), ty_string);
+        let msg = arg0(e);
+        if kind_of(pt) == K_ERROR {
+            msg = rt_call(pos, "rt_err_str", args1(msg), ty_string);
+        } else if kind_of(pt) != K_STRING {
+            msg = say_text(pos, args, 0);
+        }
+        replace_node(e, rt_call(pos, "rt_panic", args1(msg), ty_void));
+        return ty_void;
+    }
+    if streq(name, "fail") {
+        if n != 1 {
+            err_at(pos, "fail needs a message");
+            return ty_error;
+        }
+        let ft = chk(arg0(e), ty_string);
+        if kind_of(ft) != K_STRING {
+            err_type(pos, "fail needs a str message, not ", ft, "");
+        }
+        replace_node(e, rt_call(pos, "rt_fail", args1(arg0(e)), ty_error));
+        e[N_TYPE] = 0;
+        return ty_error;
+    }
+    if streq(name, "keep") {
+        if n != 1 {
+            err_at(pos, "keep needs one value");
+            return ty_int;
+        }
+        return lower_keep(e, want);
+    }
+    if streq(name, "print") || streq(name, "println") {
+        if streq(name, "println") {
+            return lower_say(e, "Line", want);
+        }
+        return lower_say(e, "Text", want);
+    }
+    if streq(name, "min") || streq(name, "max") {
+        return lower_minmax(e, name, want);
+    }
+    return 0;
+}
+
+fn lower_minmax(e, name, want) {
+    let pos = e[N_POS];
+    let args = e[CALL_ARGS];
+    let n = args[VEC_LEN];
+    if n == 0 {
+        err_quoted(pos, "", name, " needs arguments");
+        return ty_int;
+    }
+    chk(arg0(e), want);
+    let i = 1;
+    while i < n {
+        unify(arg0(e), vec_get(args, i), want);
+        i = i + 1;
+    }
+    let t = default_type(arg0(e)[N_TYPE]);
+    i = 0;
+    while i < n {
+        reconvert(vec_get(args, i), t);
+        i = i + 1;
+    }
+    if !is_numeric_t(t) && kind_of(t) != K_STRING {
+        err_type(pos, "cannot compare ", t, "");
+    }
+    // acc := a; if b < acc { acc = b }  (compiled to csel)
+    let stmts = vec_new();
+    let acc = temp(pos, arg0(e), t);
+    vec_push(stmts, acc);
+    let op = "<";
+    if streq(name, "max") {
+        op = ">";
+    }
+    i = 1;
+    while i < n {
+        let v = temp(pos, vec_get(args, i), t);
+        vec_push(stmts, v);
+        let cond = mk_bin(pos, op, sym_ref_node(pos, v[LET_SYM]), sym_ref_node(pos, acc[LET_SYM]), ty_bool);
+        if kind_of(t) == K_STRING {
+            cond = mk_bin(pos, op, rt_call(pos, "rt_str_cmp", args2(sym_ref_node(pos, v[LET_SYM]), sym_ref_node(pos, acc[LET_SYM])), ty_int), mk_int(pos, 0, ty_int), ty_bool);
+        }
+        let ifs = node_new(ST_IF, pos);
+        ifs[IF_COND] = cond;
+        ifs[IF_THEN] = empty_block(pos);
+        vec_push(ifs[IF_THEN][BLK_STMTS], assign_stmt(pos, sym_ref_node(pos, acc[LET_SYM]), sym_ref_node(pos, v[LET_SYM])));
+        vec_push(stmts, ifs);
+        i = i + 1;
+    }
+    replace_node(e, mk_seq(pos, stmts, sym_ref_node(pos, acc[LET_SYM]), t));
+    return t;
+}
+
+// lower_keep deep-copies a value into the core's long-lived ingot heap. The result may
+// only be stored straight into long-lived memory (checked by the region pass).
+fn lower_keep(e, want) {
+    let pos = e[N_POS];
+    let x = arg0(e);
+    let t = chk(x, want);
+    if is_untyped(t) {
+        t = reconvert(x, default_type(t));
+    }
+    if !is_ref(t) || kind_of(t) == K_FUNC {
+        replace_node(e, x);
+        return t;
+    }
+    let f = keep_fn(t);
+    let c = node_new(EX_CALL, pos);
+    c[CALL_NAME] = f[F_QNAME];
+    c[CALL_ARGS] = args1(x);
+    c[CALL_FN] = f;
+    c[N_TYPE] = t;
+    c[N_REGION] = R_OWNED;
+    replace_node(e, c);
+    return t;
+}
+
+// ---- argo: a JSON encoder generated for each type ----
+
+var argo_types;
+var argo_fns;
+
+fn lower_argo_put(e) {
+    let pos = e[N_POS];
+    let args = e[CALL_ARGS];
+    if args[VEC_LEN] != 2 {
+        err_at(pos, "argo.Put takes a []u8 buffer and a value");
+        return ty_void;
+    }
+    let b = vec_get(args, 0);
+    let bt = chk(b, 0);
+    if kind_of(bt) != K_SLICE || bt[TY_ELEM] != ty_byte {
+        err_type(pos, "argo.Put writes into a []u8, not ", bt, "");
+        return ty_void;
+    }
+    let v = vec_get(args, 1);
+    let t = chk(v, 0);
+    if is_untyped(t) {
+        t = reconvert(v, default_type(t));
+    }
+    let f = argo_fn(pos, t);
+    if !f {
+        return ty_void;
+    }
+    replace_node(e, call_fn(pos, f, args2(b, v), ty_void));
+    return ty_void;
+}
+
+fn call_fn(pos, f, args, t) {
+    let c = node_new(EX_CALL, pos);
+    c[CALL_NAME] = f[F_QNAME];
+    c[CALL_ARGS] = args;
+    c[CALL_FN] = f;
+    c[N_TYPE] = t;
+    return c;
+}
+
+fn argo_lib(pos, name) {
+    let f = find_fn(name);
+    if !f {
+        err_quoted(pos, "argo.Put needs package argo (", name, " is missing): import \"argo\"");
+    }
+    return f;
+}
+
+// argo_emit appends a call that writes x (of type t) to buffer b.
+fn argo_emit(pos, body, b, x, t) {
+    let k = kind_of(t);
+    let bref = sym_ref_node(pos, b);
+    if k == K_STRING {
+        vec_push(body, expr_stmt(call_fn(pos, argo_lib(pos, "argo.wstr"), args2(bref, x), ty_void)));
+    } else if k == K_BOOL {
+        vec_push(body, expr_stmt(call_fn(pos, argo_lib(pos, "argo.wbool"), args2(bref, x), ty_void)));
+    } else if is_float_t(t) {
+        vec_push(body, expr_stmt(call_fn(pos, argo_lib(pos, "argo.wfloat"), args2(bref, x), ty_void)));
+    } else if k == K_INT && !t[TY_SIGNED] {
+        vec_push(body, expr_stmt(call_fn(pos, argo_lib(pos, "argo.wuint"), args2(bref, mk_conv(pos, x, CV_SAME, ty_u64)), ty_void)));
+    } else if k == K_INT {
+        vec_push(body, expr_stmt(call_fn(pos, argo_lib(pos, "argo.wint"), args2(bref, mk_conv(pos, x, CV_SAME, ty_int)), ty_void)));
+    } else {
+        let f = argo_fn(pos, t);
+        if f {
+            vec_push(body, expr_stmt(call_fn(pos, f, args2(bref, x), ty_void)));
+        }
+    }
+}
+
+fn argo_raw(pos, body, b, text) {
+    vec_push(body, expr_stmt(rt_call(pos, "rt_append_str", args2(sym_ref_node(pos, b), lit_string(pos, text)), ty_byte_slice())));
+}
+
+fn ty_byte_slice() {
+    return slice_of(ty_byte);
+}
+
+// argo_fn returns (generating on first use) argo$N(b mut []u8, x T), the encoder for T.
+fn argo_fn(pos, t) {
+    if !argo_types {
+        argo_types = vec_new();
+        argo_fns = vec_new();
+    }
+    let i = 0;
+    while i < argo_types[VEC_LEN] {
+        if vec_get(argo_types, i) == t {
+            return vec_get(argo_fns, i);
+        }
+        i = i + 1;
+    }
+    let k = kind_of(t);
+    if !(k == K_STRUCT || k == K_SLICE || k == K_MAP || k == K_OPT || k == K_ERROR || k == K_STRING || k == K_INT || k == K_BOOL || is_float_t(t)) {
+        err_type(pos, "argo cannot encode values of type ", t, "");
+        return 0;
+    }
+    if k == K_MAP && kind_of(t[TY_KEY]) != K_STRING && kind_of(t[TY_KEY]) != K_INT {
+        err_type(pos, "argo encodes maps with str or integer keys, not ", t, "");
+        return 0;
+    }
+    lifted_count = lifted_count + 1;
+    let f = fn_new(0, "argo");
+    let nb = buf_new();
+    buf_str(nb, "argo$");
+    buf_int(nb, lifted_count);
+    buf_byte(nb, 0);
+    f[F_QNAME] = nb[VEC_DATA];
+    f[F_NAME] = nb[VEC_DATA];
+    f[F_LIFTED] = 2;
+    let bt = ty_byte_slice();
+    vec_push(f[F_PARAMS], "b");
+    vec_push(f[F_PARAMS], "x");
+    vec_push(f[F_PTYPES], bt);
+    vec_push(f[F_PTYPES], t);
+    vec_push(f[F_MUTS], 1);
+    vec_push(f[F_MUTS], 0);
+    f[F_TYPE] = func_of(f[F_PTYPES], f[F_RTYPES], 0);
+    f[F_LOCALS] = vec_new();
+    f[F_BODY] = empty_block(0);
+    vec_push(argo_types, t);
+    vec_push(argo_fns, f);
+    vec_push(prog_fns, f);
+    let saved_fn = ck_fn;
+    ck_fn = f;
+    let b = sym_new(SYM_LOCAL, "b", 0);
+    b[S_TYPE] = bt;
+    b[S_SLOT] = 0;
+    b[S_MUT] = 1;
+    let x = sym_new(SYM_LOCAL, "x", 0);
+    x[S_TYPE] = t;
+    x[S_SLOT] = 1;
+    f[F_SLOTS] = 2;
+    vec_push(f[F_LOCALS], b);
+    vec_push(f[F_LOCALS], x);
+    let body = f[F_BODY][BLK_STMTS];
+    if k == K_STRUCT {
+        let nf = t[TY_FIELDS][VEC_LEN];
+        let fi = 0;
+        let lead = "{";
+        while fi < nf {
+            let fname = vec_get(vec_get(t[TY_FIELDS], fi), 0);
+            let ft = field_type(t, fi);
+            let piece = buf_new();
+            buf_str(piece, lead);
+            buf_byte(piece, '"');
+            buf_str(piece, fname);
+            buf_str(piece, "\":");
+            buf_byte(piece, 0);
+            argo_raw(pos, body, b, piece[VEC_DATA]);
+            argo_emit(pos, body, b, mk_mem(pos, sym_ref_node(pos, x), 0, 0, field_offset(t, fi), ft), ft);
+            lead = ",";
+            fi = fi + 1;
+        }
+        if nf == 0 {
+            argo_raw(pos, body, b, "{}");
+        } else {
+            argo_raw(pos, body, b, "}");
+        }
+    } else if k == K_OPT || k == K_ERROR {
+        let ifs = node_new(ST_IF, pos);
+        ifs[IF_COND] = mk_bin(pos, "==", sym_ref_node(pos, x), mk_int(pos, 0, t), ty_bool);
+        ifs[IF_THEN] = empty_block(pos);
+        argo_raw(pos, ifs[IF_THEN][BLK_STMTS], b, "null");
+        let els = empty_block(pos);
+        ifs[IF_ELSE] = els;
+        if k == K_ERROR {
+            argo_emit(pos, els[BLK_STMTS], b, mk_conv(pos, sym_ref_node(pos, x), CV_SAME, ty_string), ty_string);
+        } else {
+            argo_emit(pos, els[BLK_STMTS], b, mk_conv(pos, sym_ref_node(pos, x), CV_SAME, t[TY_ELEM]), t[TY_ELEM]);
+        }
+        vec_push(body, ifs);
+    } else if k == K_SLICE {
+        let et = t[TY_ELEM];
+        argo_raw(pos, body, b, "[");
+        let n = temp(pos, mk_hdr(pos, sym_ref_node(pos, x), 0), ty_int);
+        vec_push(body, n);
+        let j = declare_local(pos, "$", ty_int);
+        vec_push(body, let_stmt(pos, j, mk_int(pos, 0, ty_int)));
+        let w = node_new(ST_WHILE, pos);
+        w[WH_COND] = mk_bin(pos, "<", sym_ref_node(pos, j), sym_ref_node(pos, n[LET_SYM]), ty_bool);
+        w[WH_POST] = assign_stmt(pos, sym_ref_node(pos, j), mk_bin(pos, "+", sym_ref_node(pos, j), mk_int(pos, 1, ty_int), ty_int));
+        let wb = empty_block(pos);
+        w[WH_BODY] = wb;
+        let comma = node_new(ST_IF, pos);
+        comma[IF_COND] = mk_bin(pos, ">", sym_ref_node(pos, j), mk_int(pos, 0, ty_int), ty_bool);
+        comma[IF_THEN] = empty_block(pos);
+        argo_raw(pos, comma[IF_THEN][BLK_STMTS], b, ",");
+        vec_push(wb[BLK_STMTS], comma);
+        let el = mk_elem(pos, sym_ref_node(pos, x), sym_ref_node(pos, j), et, 0);
+        el[ELEM_SAFE] = 1;
+        argo_emit(pos, wb[BLK_STMTS], b, el, et);
+        vec_push(body, w);
+        argo_raw(pos, body, b, "]");
+    } else if k == K_MAP {
+        argo_raw(pos, body, b, "{");
+        let first = declare_local(pos, "$", ty_bool);
+        vec_push(body, let_stmt(pos, first, mk_int(pos, 1, ty_bool)));
+        let slots = temp(pos, rt_call(pos, "rt_map_slots", args1(sym_ref_node(pos, x)), ty_int), ty_int);
+        vec_push(body, slots);
+        let j2 = declare_local(pos, "$", ty_int);
+        vec_push(body, let_stmt(pos, j2, mk_int(pos, 0, ty_int)));
+        let w2 = node_new(ST_WHILE, pos);
+        w2[WH_COND] = mk_bin(pos, "<", sym_ref_node(pos, j2), sym_ref_node(pos, slots[LET_SYM]), ty_bool);
+        w2[WH_POST] = assign_stmt(pos, sym_ref_node(pos, j2), mk_bin(pos, "+", sym_ref_node(pos, j2), mk_int(pos, 1, ty_int), ty_int));
+        let wb2 = empty_block(pos);
+        w2[WH_BODY] = wb2;
+        let live = node_new(ST_IF, pos);
+        live[IF_COND] = rt_call(pos, "rt_map_live", args2(sym_ref_node(pos, x), sym_ref_node(pos, j2)), ty_bool);
+        live[IF_THEN] = empty_block(pos);
+        let lb = live[IF_THEN][BLK_STMTS];
+        let sep = node_new(ST_IF, pos);
+        sep[IF_COND] = sym_ref_node(pos, first);
+        sep[IF_THEN] = empty_block(pos);
+        vec_push(sep[IF_THEN][BLK_STMTS], assign_stmt(pos, sym_ref_node(pos, first), mk_int(pos, 0, ty_bool)));
+        sep[IF_ELSE] = empty_block(pos);
+        argo_raw(pos, sep[IF_ELSE][BLK_STMTS], b, ",");
+        vec_push(lb, sep);
+        let kt = t[TY_KEY];
+        let kv = from_bits(rt_call(pos, "rt_map_key", args2(sym_ref_node(pos, x), sym_ref_node(pos, j2)), ty_int), kt);
+        if kind_of(kt) == K_STRING {
+            argo_emit(pos, lb, b, kv, kt);
+        } else {
+            argo_raw(pos, lb, b, "\"");
+            argo_emit(pos, lb, b, kv, kt);
+            argo_raw(pos, lb, b, "\"");
+        }
+        argo_raw(pos, lb, b, ":");
+        let vt = t[TY_ELEM];
+        let vv = from_bits(rt_call(pos, "rt_map_val", args2(sym_ref_node(pos, x), sym_ref_node(pos, j2)), ty_int), vt);
+        argo_emit(pos, lb, b, vv, vt);
+        vec_push(wb2[BLK_STMTS], live);
+        vec_push(body, w2);
+        argo_raw(pos, body, b, "}");
+    } else {
+        argo_emit(pos, body, b, sym_ref_node(pos, x), t);
+    }
+    ck_fn = saved_fn;
+    return f;
+}
+
+// ---- argo.Get: a JSON decoder generated for each type ----
+
+var argo_dtypes;
+var argo_dfns;
+var argo_ptype;
+
+fn lower_argo_get(e) {
+    let pos = e[N_POS];
+    let args = e[CALL_ARGS];
+    if args[VEC_LEN] != 2 {
+        err_at(pos, "argo.Get takes the JSON text and a struct, slice or map to fill");
+        return ty_error;
+    }
+    let s = vec_get(args, 0);
+    let st = chk(s, ty_string);
+    if kind_of(st) != K_STRING {
+        err_type(pos, "argo.Get reads JSON from a str, not ", st, "");
+        return ty_error;
+    }
+    let v = vec_get(args, 1);
+    let t = chk(v, 0);
+    let k = kind_of(t);
+    if k != K_STRUCT && k != K_SLICE && k != K_MAP {
+        err_type(pos, "argo.Get fills a struct, slice or map (passed by reference), not ", t, "");
+        return ty_error;
+    }
+    let pt = argo_parser_type(pos);
+    let df = argo_dfn(pos, t);
+    if !pt || !df {
+        return ty_error;
+    }
+    let stmts = vec_new();
+    let p = temp(pos, call_fn(pos, argo_lib(pos, "argo.parser"), args1(s), pt), pt);
+    vec_push(stmts, p);
+    vec_push(stmts, expr_stmt(call_fn(pos, df, args2(sym_ref_node(pos, p[LET_SYM]), v), ty_void)));
+    let fin = call_fn(pos, argo_lib(pos, "argo.finish"), args1(sym_ref_node(pos, p[LET_SYM])), ty_error);
+    replace_node(e, mk_seq(pos, stmts, fin, ty_error));
+    return ty_error;
+}
+
+fn argo_parser_type(pos) {
+    if !argo_ptype {
+        argo_ptype = find_type("argo.Parser");
+        if !argo_ptype {
+            err_at(pos, "argo.Get needs package argo: import \"argo\"");
+        }
+    }
+    return argo_ptype;
+}
+
+// argo_rd is a call of reader name on parser p, of type t.
+fn argo_rd(pos, p, name, t) {
+    return call_fn(pos, argo_lib(pos, name), args1(sym_ref_node(pos, p)), t);
+}
+
+fn argo_err_return(pos, body, p) {
+    let pt = argo_ptype;
+    let fi = struct_field(pt, "err");
+    let ifs = node_new(ST_IF, pos);
+    ifs[IF_COND] = mk_bin(pos, "!=", mk_mem(pos, sym_ref_node(pos, p), 0, 0, field_offset(pt, fi), ty_error), mk_int(pos, 0, ty_error), ty_bool);
+    ifs[IF_THEN] = empty_block(pos);
+    vec_push(ifs[IF_THEN][BLK_STMTS], node_new(ST_RETURN, pos));
+    vec_push(body, ifs);
+}
+
+// argo_new is a fresh value of type t with every reference field made (decode target).
+fn argo_new(pos, body, t) {
+    let k = kind_of(t);
+    if k == K_STRING {
+        return lit_string(pos, "");
+    }
+    if k == K_SLICE {
+        return rt_call(pos, "rt_slice_make", args3(mk_int(pos, 0, ty_int), mk_int(pos, 0, ty_int), mk_int(pos, elem_size(t), ty_int)), t);
+    }
+    if k == K_MAP {
+        return rt_call(pos, "rt_map_make", args1(mk_int(pos, kind_of(t[TY_KEY]) == K_STRING, ty_int)), t);
+    }
+    if k != K_STRUCT {
+        return mk_int(pos, 0, t);
+    }
+    let obj = temp(pos, rt_call(pos, "rt_alloc", args1(mk_int(pos, t[TY_SIZE], ty_int)), t), t);
+    vec_push(body, obj);
+    let fi = 0;
+    while fi < t[TY_FIELDS][VEC_LEN] {
+        let ft = field_type(t, fi);
+        let fk = kind_of(ft);
+        if fk == K_STRING || fk == K_SLICE || fk == K_MAP || fk == K_STRUCT {
+            vec_push(body, assign_stmt(pos, field_store(pos, sym_ref_node(pos, obj[LET_SYM]), t, fi), argo_new(pos, body, ft)));
+        }
+        fi = fi + 1;
+    }
+    return sym_ref_node(pos, obj[LET_SYM]);
+}
+
+// argo_value appends statements that decode one value of type t and returns it, or 0
+// when t cannot be decoded (an error is reported).
+fn argo_value(pos, body, p, t) {
+    let k = kind_of(t);
+    if k == K_STRING {
+        return argo_rd(pos, p, "argo.rstr", ty_string);
+    }
+    if k == K_BOOL {
+        return argo_rd(pos, p, "argo.rbool", ty_bool);
+    }
+    if is_float_t(t) {
+        return argo_rd(pos, p, "argo.rfloat", ty_float);
+    }
+    if k == K_INT {
+        let w = t[TY_WIDTH];
+        if w == 8 && t[TY_SIGNED] {
+            return argo_rd(pos, p, "argo.rint", ty_int);
+        }
+        if w == 8 {
+            return argo_rd(pos, p, "argo.ruint", ty_u64);
+        }
+        let lo = 0;
+        let hi = (1 << (8 * w)) - 1;
+        if t[TY_SIGNED] {
+            lo = 0 - (1 << (8 * w - 1));
+            hi = (1 << (8 * w - 1)) - 1;
+        }
+        let c = call_fn(pos, argo_lib(pos, "argo.rintr"), args3(sym_ref_node(pos, p), mk_int(pos, lo, ty_int), mk_int(pos, hi, ty_int)), ty_int);
+        return mk_conv(pos, c, CV_INT, t);
+    }
+    if k == K_STRUCT || k == K_SLICE || k == K_MAP {
+        let obj = temp(pos, argo_new(pos, body, t), t);
+        vec_push(body, obj);
+        let df = argo_dfn(pos, t);
+        if !df {
+            return 0;
+        }
+        vec_push(body, expr_stmt(call_fn(pos, df, args2(sym_ref_node(pos, p), sym_ref_node(pos, obj[LET_SYM])), ty_void)));
+        return sym_ref_node(pos, obj[LET_SYM]);
+    }
+    if k == K_OPT {
+        let et = t[TY_ELEM];
+        if !is_ref(et) || kind_of(et) == K_FUNC {
+            err_type(pos, "argo.Get decodes optionals of references only, not ", t, "");
+            return 0;
+        }
+        let out = declare_local(pos, "$", t);
+        vec_push(body, let_stmt(pos, out, mk_int(pos, 0, t)));
+        let ifs = node_new(ST_IF, pos);
+        ifs[IF_COND] = mk_unot(pos, argo_rd(pos, p, "argo.rnull", ty_bool));
+        ifs[IF_THEN] = empty_block(pos);
+        let inner = argo_value(pos, ifs[IF_THEN][BLK_STMTS], p, et);
+        if !inner {
+            return 0;
+        }
+        vec_push(ifs[IF_THEN][BLK_STMTS], assign_stmt(pos, sym_ref_node(pos, out), mk_conv(pos, inner, CV_SAME, t)));
+        vec_push(body, ifs);
+        return sym_ref_node(pos, out);
+    }
+    err_type(pos, "argo.Get cannot decode values of type ", t, "");
+    return 0;
+}
+
+fn mk_unot(pos, x) {
+    let u = node_new(EX_UNARY, pos);
+    u[UN_OP] = "!";
+    u[UN_X] = x;
+    u[N_TYPE] = ty_bool;
+    return u;
+}
+
+fn forever(pos) {
+    let w = node_new(ST_WHILE, pos);
+    w[WH_COND] = mk_int(pos, 1, ty_bool);
+    w[WH_BODY] = empty_block(pos);
+    return w;
+}
+
+// argo_more ends a loop body: if !argo.rmore(p, close) { break }.
+fn argo_more(pos, body, p, close) {
+    let ifs = node_new(ST_IF, pos);
+    ifs[IF_COND] = mk_unot(pos, call_fn(pos, argo_lib(pos, "argo.rmore"), args2(sym_ref_node(pos, p), mk_int(pos, close, ty_byte)), ty_bool));
+    ifs[IF_THEN] = empty_block(pos);
+    vec_push(ifs[IF_THEN][BLK_STMTS], node_new(ST_BREAK, pos));
+    vec_push(body, ifs);
+}
+
+// argo_dfn returns (generating on first use) argo$dN(p mut argo.Parser, x mut T), which
+// fills x from the JSON value at p.
+fn argo_dfn(pos, t) {
+    if !argo_dtypes {
+        argo_dtypes = vec_new();
+        argo_dfns = vec_new();
+    }
+    let i = 0;
+    while i < argo_dtypes[VEC_LEN] {
+        if vec_get(argo_dtypes, i) == t {
+            return vec_get(argo_dfns, i);
+        }
+        i = i + 1;
+    }
+    let pt = argo_parser_type(pos);
+    if !pt {
+        return 0;
+    }
+    let k = kind_of(t);
+    if k == K_MAP && kind_of(t[TY_KEY]) != K_STRING {
+        err_type(pos, "argo.Get decodes maps with str keys, not ", t, "");
+        return 0;
+    }
+    lifted_count = lifted_count + 1;
+    let f = fn_new(0, "argo");
+    let nb = buf_new();
+    buf_str(nb, "argo$d");
+    buf_int(nb, lifted_count);
+    buf_byte(nb, 0);
+    f[F_QNAME] = nb[VEC_DATA];
+    f[F_NAME] = nb[VEC_DATA];
+    f[F_LIFTED] = 2;
+    vec_push(f[F_PARAMS], "p");
+    vec_push(f[F_PARAMS], "x");
+    vec_push(f[F_PTYPES], pt);
+    vec_push(f[F_PTYPES], t);
+    vec_push(f[F_MUTS], 1);
+    vec_push(f[F_MUTS], 1);
+    f[F_TYPE] = func_of(f[F_PTYPES], f[F_RTYPES], 0);
+    f[F_LOCALS] = vec_new();
+    f[F_BODY] = empty_block(0);
+    vec_push(argo_dtypes, t);
+    vec_push(argo_dfns, f);
+    vec_push(prog_fns, f);
+    let saved_fn = ck_fn;
+    ck_fn = f;
+    let p = sym_new(SYM_LOCAL, "p", 0);
+    p[S_TYPE] = pt;
+    p[S_SLOT] = 0;
+    p[S_MUT] = 1;
+    let x = sym_new(SYM_LOCAL, "x", 0);
+    x[S_TYPE] = t;
+    x[S_SLOT] = 1;
+    x[S_MUT] = 1;
+    f[F_SLOTS] = 2;
+    vec_push(f[F_LOCALS], p);
+    vec_push(f[F_LOCALS], x);
+    let body = f[F_BODY][BLK_STMTS];
+    if k == K_STRUCT {
+        let ifs = node_new(ST_IF, pos);
+        ifs[IF_COND] = mk_unot(pos, argo_rd(pos, p, "argo.robj", ty_bool));
+        ifs[IF_THEN] = empty_block(pos);
+        vec_push(ifs[IF_THEN][BLK_STMTS], node_new(ST_RETURN, pos));
+        vec_push(body, ifs);
+        let w = forever(pos);
+        vec_push(body, w);
+        let wb = w[WH_BODY][BLK_STMTS];
+        let key = temp(pos, argo_rd(pos, p, "argo.rkey", ty_string), ty_string);
+        vec_push(wb, key);
+        argo_err_return(pos, wb, p);
+        let chain = 0;
+        let last = 0;
+        let fi = 0;
+        while fi < t[TY_FIELDS][VEC_LEN] {
+            let fname = vec_get(vec_get(t[TY_FIELDS], fi), 0);
+            let ft = field_type(t, fi);
+            let br = node_new(ST_IF, pos);
+            br[IF_COND] = rt_call(pos, "rt_str_eq", args2(sym_ref_node(pos, key[LET_SYM]), lit_string(pos, fname)), ty_bool);
+            br[IF_THEN] = empty_block(pos);
+            let bb = br[IF_THEN][BLK_STMTS];
+            let fk = kind_of(ft);
+            if fk == K_STRUCT || fk == K_SLICE || fk == K_MAP {
+                // Fill the object the field already holds.
+                let df = argo_dfn(pos, ft);
+                if df {
+                    vec_push(bb, expr_stmt(call_fn(pos, df, args2(sym_ref_node(pos, p), mk_mem(pos, sym_ref_node(pos, x), 0, 0, field_offset(t, fi), ft)), ty_void)));
+                }
+            } else {
+                let val = argo_value(pos, bb, p, ft);
+                if val {
+                    vec_push(bb, assign_stmt(pos, field_store(pos, sym_ref_node(pos, x), t, fi), val));
+                }
+            }
+            if last {
+                let eb = empty_block(pos);
+                vec_push(eb[BLK_STMTS], br);
+                last[IF_ELSE] = eb;
+            } else {
+                chain = br;
+            }
+            last = br;
+            fi = fi + 1;
+        }
+        let skip = expr_stmt(call_fn(pos, argo_lib(pos, "argo.rskip"), args1(sym_ref_node(pos, p)), ty_void));
+        if last {
+            let sb = empty_block(pos);
+            vec_push(sb[BLK_STMTS], skip);
+            last[IF_ELSE] = sb;
+            vec_push(wb, chain);
+        } else {
+            vec_push(wb, skip);
+        }
+        argo_more(pos, wb, p, '}');
+    } else if k == K_SLICE {
+        let et = t[TY_ELEM];
+        let ifs2 = node_new(ST_IF, pos);
+        ifs2[IF_COND] = mk_unot(pos, argo_rd(pos, p, "argo.rarr", ty_bool));
+        ifs2[IF_THEN] = empty_block(pos);
+        vec_push(ifs2[IF_THEN][BLK_STMTS], node_new(ST_RETURN, pos));
+        vec_push(body, ifs2);
+        let w2 = forever(pos);
+        vec_push(body, w2);
+        let wb2 = w2[WH_BODY][BLK_STMTS];
+        let ev = argo_value(pos, wb2, p, et);
+        if ev {
+            vec_push(wb2, expr_stmt(rt_call(pos, "rt_append", args3(sym_ref_node(pos, x), to_bits(ev), mk_int(pos, elem_size(t), ty_int)), t)));
+        }
+        argo_err_return(pos, wb2, p);
+        argo_more(pos, wb2, p, ']');
+    } else if k == K_MAP {
+        let ifs3 = node_new(ST_IF, pos);
+        ifs3[IF_COND] = mk_unot(pos, argo_rd(pos, p, "argo.robj", ty_bool));
+        ifs3[IF_THEN] = empty_block(pos);
+        vec_push(ifs3[IF_THEN][BLK_STMTS], node_new(ST_RETURN, pos));
+        vec_push(body, ifs3);
+        let w3 = forever(pos);
+        vec_push(body, w3);
+        let wb3 = w3[WH_BODY][BLK_STMTS];
+        let mk = temp(pos, argo_rd(pos, p, "argo.rkey", ty_string), ty_string);
+        vec_push(wb3, mk);
+        argo_err_return(pos, wb3, p);
+        let mv = argo_value(pos, wb3, p, t[TY_ELEM]);
+        if mv {
+            vec_push(wb3, expr_stmt(rt_call(pos, "rt_map_set", args3(sym_ref_node(pos, x), sym_ref_node(pos, mk[LET_SYM]), to_bits(mv)), ty_void)));
+        }
+        argo_err_return(pos, wb3, p);
+        argo_more(pos, wb3, p, '}');
+    }
+    ck_fn = saved_fn;
+    return f;
+}
+
+// ---- say: formatting without interfaces ----
+
+fn is_say_func(m) {
+    return streq(m, "Line") || streq(m, "Text") || streq(m, "Out") || streq(m, "Fmt") || streq(m, "Str") || streq(m, "Fault") || streq(m, "To") || streq(m, "LineTo");
+}
+
+// say_arg formats one argument by its static type: prefix + "i", "s", "f", ...
+fn say_arg(a, prefix) {
+    let pos = a[N_POS];
+    let t = default_type(chk(a, 0));
+    if is_untyped(a[N_TYPE]) {
+        reconvert(a, t);
+    }
+    let k = kind_of(t);
+    let suffix = "i";
+    if k == K_STRING {
+        suffix = "s";
+    } else if k == K_FLOAT {
+        suffix = "f";
+    } else if k == K_BOOL {
+        suffix = "b";
+    } else if k == K_ERROR {
+        suffix = "e";
+    } else if is_unsigned_t(t) {
+        suffix = "u";
+    } else if k == K_SLICE {
+        let et = t[TY_ELEM];
+        let ek = kind_of(et);
+        if ek == K_STRING {
+            suffix = "sls";
+        } else if ek == K_FLOAT {
+            suffix = "slf";
+        } else if ek == K_BOOL {
+            suffix = "slt";
+        } else if ek == K_INT {
+            return rt_call(pos, str_cat3(prefix, "slint", ""), args3(a, mk_int(pos, type_width(et), ty_int), mk_int(pos, et[TY_SIGNED], ty_int)), ty_void);
+        } else {
+            suffix = "slp";
+        }
+    } else if k == K_STRUCT || k == K_OPT {
+        let st = t;
+        if k == K_OPT {
+            st = t[TY_ELEM];
+        }
+        return say_struct(a, st, prefix);
+    } else if k == K_MAP {
+        let kk = kind_of(t[TY_KEY]) == K_STRING;
+        let vk = 0;
+        let ek = kind_of(t[TY_ELEM]);
+        if ek == K_STRING {
+            vk = 1;
+        } else if ek == K_FLOAT {
+            vk = 2;
+        } else if ek == K_BOOL {
+            vk = 3;
+        }
+        return rt_call(pos, str_cat3(prefix, "map", ""), args3(a, mk_int(pos, kk, ty_int), mk_int(pos, vk, ty_int)), ty_void);
+    } else if k != K_INT && k != K_UINT {
+        suffix = "p";
+    }
+    let x = a;
+    if type_width(t) < 8 && k == K_INT {
+        x = mk_conv(pos, a, CV_SAME, ty_int);
+    }
+    return rt_call(pos, str_cat3(prefix, suffix, ""), args1(x), ty_void);
+}
+
+// say_struct prints {a b c} by formatting each field in turn (nil optionals print <nil>).
+fn say_struct(a, t, prefix) {
+    let pos = a[N_POS];
+    let stmts = vec_new();
+    let obj = temp(pos, mk_conv(pos, a, CV_SAME, ty_int), ty_int);
+    vec_push(stmts, obj);
+    vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "argsep", ""), vec_new(), ty_void)));
+    let nonnil = node_new(ST_IF, pos);
+    nonnil[IF_COND] = mk_bin(pos, "==", sym_ref_node(pos, obj[LET_SYM]), mk_int(pos, 0, ty_int), ty_bool);
+    nonnil[IF_THEN] = empty_block(pos);
+    vec_push(nonnil[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, "<nil>")), ty_void)));
+    let body = empty_block(pos);
+    nonnil[IF_ELSE] = body;
+    vec_push(body[BLK_STMTS], expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, "{")), ty_void)));
+    let fs = t[TY_FIELDS];
+    let i = 0;
+    while i < fs[VEC_LEN] {
+        if i > 0 {
+            vec_push(body[BLK_STMTS], expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, " ")), ty_void)));
+        }
+        let ft = field_type(t, i);
+        let fv = mk_mem(pos, sym_ref_node(pos, obj[LET_SYM]), 0, 0, field_offset(t, i), ft);
+        if kind_of(ft) == K_STRUCT || kind_of(ft) == K_OPT {
+            vec_push(body[BLK_STMTS], expr_stmt(rt_call(pos, str_cat3(prefix, "p", ""), args1(mk_conv(pos, fv, CV_SAME, ty_int)), ty_void)));
+        } else {
+            vec_push(body[BLK_STMTS], expr_stmt(say_arg(fv, prefix)));
+        }
+        i = i + 1;
+    }
+    vec_push(body[BLK_STMTS], expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, "}")), ty_void)));
+    vec_push(stmts, nonnil);
+    vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "argend", ""), vec_new(), ty_void)));
+    return mk_seq(pos, stmts, mk_int(pos, 0, ty_int), ty_void);
+}
+
+fn lit_string(pos, s) {
+    let n = node_new(EX_STR, pos);
+    n[STR_PTR] = s;
+    n[STR_LEN] = strlen(s);
+    n[N_TYPE] = ty_string;
+    return n;
+}
+
+// say_text formats args like say.Str (Line spacing when ln) and returns the str.
+fn say_text(pos, args, ln) {
+    let stmts = vec_new();
+    vec_push(stmts, expr_stmt(rt_call(pos, "rt_fmt_begin_v", args1(mk_int(pos, ln, ty_int)), ty_void)));
+    let i = 0;
+    while i < args[VEC_LEN] {
+        vec_push(stmts, expr_stmt(say_arg(vec_get(args, i), "rt_fmt_")));
+        i = i + 1;
+    }
+    return mk_seq(pos, stmts, rt_call(pos, "rt_fmt_end", vec_new(), ty_string), ty_string);
+}
+
+// lower_say compiles say calls into typed runtime calls: begin, one call per argument,
+// then end. No interfaces or reflection are needed.
+//   say.Line(a...)        print, spaces between, newline
+//   say.Text(a...)        print, Go's Print spacing
+//   say.Out(f, a...)      printf
+//   say.Fmt(f, a...) str  sprintf
+//   say.Str(a...) str     sprint
+//   say.Fault(f, a...)    a fault with a formatted message
+//   say.To(w, f, a...)    printf into w.Write(str)
+//   say.LineTo(w, a...)   println into w.Write(str)
+fn lower_say(e, m, want) {
+    let pos = e[N_POS];
+    let args = e[CALL_ARGS];
+    let first = 0;
+    let writer = 0;
+    if streq(m, "To") || streq(m, "LineTo") {
+        writer = arg0(e);
+        first = 1;
+    }
+    let printf = streq(m, "Out") || streq(m, "Fmt") || streq(m, "Fault") || streq(m, "To");
+    let ln = streq(m, "Line") || streq(m, "LineTo");
+    let stmts = vec_new();
+    if printf {
+        if args[VEC_LEN] <= first {
+            err_at(pos, "missing format");
+            return ty_void;
+        }
+        let f = vec_get(args, first);
+        let ft = chk(f, ty_string);
+        if kind_of(ft) != K_STRING {
+            err_at(f[N_POS], "format must be a str");
+        }
+        vec_push(stmts, expr_stmt(rt_call(pos, "rt_fmt_begin", args1(f), ty_void)));
+        first = first + 1;
+    } else {
+        vec_push(stmts, expr_stmt(rt_call(pos, "rt_fmt_begin_v", args1(mk_int(pos, ln, ty_int)), ty_void)));
+    }
+    let i = first;
+    while i < args[VEC_LEN] {
+        vec_push(stmts, expr_stmt(say_arg(vec_get(args, i), "rt_fmt_")));
+        i = i + 1;
+    }
+    let tail = 0;
+    let t = ty_void;
+    if writer {
+        let ws = node_new(EX_SELECT, pos);
+        ws[SEL_X] = writer;
+        ws[SEL_NAME] = "Write";
+        tail = node_new(EX_CALL, pos);
+        tail[CALL_CALLEE] = ws;
+        tail[CALL_ARGS] = args1(rt_call(pos, "rt_fmt_end", vec_new(), ty_string));
+        chk(tail, 0);
+        tail[N_TYPE] = ty_void;
+    } else if streq(m, "Fmt") || streq(m, "Str") {
+        tail = rt_call(pos, "rt_fmt_end", vec_new(), ty_string);
+        t = ty_string;
+    } else if streq(m, "Fault") {
+        tail = rt_call(pos, "rt_fmt_err", vec_new(), ty_error);
+        t = ty_error;
+    } else {
+        tail = rt_call(pos, "rt_fmt_out", vec_new(), ty_void);
+    }
+    replace_node(e, mk_seq(pos, stmts, tail, t));
+    e[N_TYPE] = 0;
+    return t;
+}
+
+fn arity_error(e, want) {
+    let a = err_begin(e[N_POS]);
+    buf_str(a, e[CALL_NAME]);
+    buf_str(a, " expects ");
+    buf_int(a, want);
+    buf_str(a, " arguments, got ");
+    buf_int(a, e[CALL_ARGS][VEC_LEN]);
+    err_end(a);
+}

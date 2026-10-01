@@ -1,0 +1,203 @@
+// Data structures for the self-hosted compiler: word vectors, byte buffers, positions, errors.
+
+// Vectors and buffers share one header layout; vectors count words, buffers count bytes.
+const VEC_LEN = 0;
+const VEC_CAP = 1;
+const VEC_DATA = 2;
+
+fn vec_new() {
+    let v = malloc(24);
+    v[VEC_LEN] = 0;
+    v[VEC_CAP] = 8;
+    v[VEC_DATA] = malloc(64);
+    return v;
+}
+
+fn vec_push(v, x) {
+    if v[VEC_LEN] == v[VEC_CAP] {
+        v[VEC_CAP] = v[VEC_CAP] * 2;
+        v[VEC_DATA] = realloc(v[VEC_DATA], v[VEC_CAP] * 8);
+    }
+    v[VEC_DATA][v[VEC_LEN]] = x;
+    v[VEC_LEN] = v[VEC_LEN] + 1;
+}
+
+fn vec_get(v, i) {
+    return v[VEC_DATA][i];
+}
+
+fn vec_filled(n, x) {
+    let v = vec_new();
+    let i = 0;
+    while i < n {
+        vec_push(v, x);
+        i = i + 1;
+    }
+    return v;
+}
+
+fn buf_new() {
+    let b = malloc(24);
+    b[VEC_LEN] = 0;
+    b[VEC_CAP] = 256;
+    b[VEC_DATA] = malloc(256);
+    return b;
+}
+
+fn buf_reserve(b, n) {
+    while b[VEC_LEN] + n > b[VEC_CAP] {
+        b[VEC_CAP] = b[VEC_CAP] * 2;
+        b[VEC_DATA] = realloc(b[VEC_DATA], b[VEC_CAP]);
+    }
+}
+
+fn buf_byte(b, c) {
+    buf_reserve(b, 1);
+    store8(b[VEC_DATA] + b[VEC_LEN], c);
+    b[VEC_LEN] = b[VEC_LEN] + 1;
+}
+
+fn buf_bytes(b, s, n) {
+    buf_reserve(b, n);
+    memcpy(b[VEC_DATA] + b[VEC_LEN], s, n);
+    b[VEC_LEN] = b[VEC_LEN] + n;
+}
+
+fn buf_str(b, s) {
+    buf_bytes(b, s, strlen(s));
+}
+
+fn buf_int(b, n) {
+    if n < 0 {
+        buf_byte(b, '-');
+        if n / 10 != 0 {
+            buf_int(b, -(n / 10));
+        }
+        buf_byte(b, '0' - n % 10);
+        return;
+    }
+    if n >= 10 {
+        buf_int(b, n / 10);
+    }
+    buf_byte(b, '0' + n % 10);
+}
+
+// str_slice copies n bytes into a new NUL-terminated string.
+fn str_slice(s, n) {
+    let r = malloc(n + 1);
+    let i = 0;
+    while i < n {
+        store8(r + i, load8(s + i));
+        i = i + 1;
+    }
+    store8(r + n, 0);
+    return r;
+}
+
+fn mem_eq(a, b, n) {
+    let i = 0;
+    while i < n {
+        if load8(a + i) != load8(b + i) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn write_all(fd, b) {
+    let done = 0;
+    while done < b[VEC_LEN] {
+        let n = write(fd, b[VEC_DATA] + done, b[VEC_LEN] - done);
+        if n <= 0 {
+            exit(1);
+        }
+        done = done + n;
+    }
+}
+
+// A position packs file index, line and column into one word.
+const NO_POS = -1;
+
+var files;
+var tgt_linux;   // the target OS is Linux (else macOS)
+var tgt_x64;     // the target CPU is x86-64 (else arm64)
+var error_count;
+
+fn pos_make(file, line, col) {
+    return (file << 48) | (line << 16) | col;
+}
+
+fn buf_pos(b, pos) {
+    buf_str(b, vec_get(files, pos >> 48));
+    buf_byte(b, ':');
+    buf_int(b, (pos >> 16) & 0xffffffff);
+    buf_byte(b, ':');
+    buf_int(b, pos & 0xffff);
+}
+
+// err_begin starts an error message; finish it with err_end (keep going) or fatal (stop).
+fn err_begin(pos) {
+    let b = buf_new();
+    if pos != NO_POS {
+        buf_pos(b, pos);
+        buf_str(b, ": ");
+    }
+    buf_str(b, "error: ");
+    return b;
+}
+
+fn err_end(b) {
+    buf_byte(b, '\n');
+    write_all(2, b);
+    error_count = error_count + 1;
+}
+
+fn fatal(b) {
+    err_end(b);
+    exit(1);
+}
+
+// err_quoted reports PREFIX 'NAME' SUFFIX, the shape of most checker errors.
+fn err_quoted(pos, prefix, name, suffix) {
+    let e = err_begin(pos);
+    buf_str(e, prefix);
+    buf_byte(e, '\'');
+    buf_str(e, name);
+    buf_byte(e, '\'');
+    buf_str(e, suffix);
+    err_end(e);
+}
+
+// Little- and big-endian stores into a byte array.
+fn put32(p, v) {
+    store8(p, v);
+    store8(p + 1, v >> 8);
+    store8(p + 2, v >> 16);
+    store8(p + 3, v >> 24);
+}
+
+fn put64(p, v) {
+    put32(p, v);
+    put32(p + 4, v >> 32);
+}
+
+fn load32(p) {
+    return load8(p) | (load8(p + 1) << 8) | (load8(p + 2) << 16) | (load8(p + 3) << 24);
+}
+
+fn put32be(p, v) {
+    store8(p, v >> 24);
+    store8(p + 1, v >> 16);
+    store8(p + 2, v >> 8);
+    store8(p + 3, v);
+}
+
+fn put64be(p, v) {
+    put32be(p, v >> 32);
+    put32be(p + 4, v);
+}
+
+fn align_up(n, a) {
+    return (n + a - 1) & ~(a - 1);
+}

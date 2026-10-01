@@ -1,0 +1,546 @@
+// Lexer: source bytes to a vector of tokens ending in TK_EOF.
+
+const TK_EOF = 0;
+const TK_IDENT = 1;
+const TK_INT = 2;
+const TK_STRING = 3;
+const TK_KEYWORD = 4;
+const TK_PUNCT = 5;
+const TK_FLOAT = 6;   // T_TEXT holds the literal text, T_VAL its IEEE-754 bits
+
+// Token layout.
+const T_KIND = 0;
+const T_TEXT = 1;
+const T_VAL = 2;
+const T_POS = 3;
+
+var lx_src;
+var lx_len;
+var lx_i;
+var lx_line;
+var lx_col;
+var lx_file;
+var lx_newline;
+var lx_esc_rune;
+
+fn lex(file, src, len) {
+    lx_file = file;
+    lx_src = src;
+    lx_len = len;
+    lx_i = 0;
+    lx_line = 1;
+    lx_col = 1;
+    let toks = vec_new();
+    let last = 0;
+    while 1 {
+        let t = lex_next();
+        if last && (lx_newline || t[T_KIND] == TK_EOF) && ends_statement(last) {
+            vec_push(toks, token_new(TK_PUNCT, ";", 1, t[T_POS]));
+        }
+        vec_push(toks, t);
+        if t[T_KIND] == TK_EOF {
+            return toks;
+        }
+        last = t;
+    }
+}
+
+// T_TEXT holds the identifier, keyword, punctuation or decoded string bytes;
+// T_VAL holds an integer literal's value or a string literal's byte length.
+fn token_new(kind, text, val, pos) {
+    let t = malloc(32);
+    t[T_KIND] = kind;
+    t[T_TEXT] = text;
+    t[T_VAL] = val;
+    t[T_POS] = pos;
+    return t;
+}
+
+fn lx_peek(off) {
+    if lx_i + off < lx_len {
+        return load8(lx_src + lx_i + off);
+    }
+    return 0;
+}
+
+fn lx_advance() {
+    let c = load8(lx_src + lx_i);
+    lx_i = lx_i + 1;
+    if c == '\n' {
+        lx_line = lx_line + 1;
+        lx_col = 1;
+    } else {
+        lx_col = lx_col + 1;
+    }
+    return c;
+}
+
+fn lx_fail(pos, msg) {
+    let e = err_begin(pos);
+    buf_str(e, msg);
+    fatal(e);
+}
+
+fn is_letter(c) {
+    return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+fn is_digit(c) {
+    return c >= '0' && c <= '9';
+}
+
+fn is_hex_digit(c) {
+    return is_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+fn hex_value(c) {
+    if is_digit(c) {
+        return c - '0';
+    }
+    if c >= 'a' {
+        return c - 'a' + 10;
+    }
+    return c - 'A' + 10;
+}
+
+fn is_keyword(s) {
+    let words = "fn extern const var let if else while return break continue func type struct for range import package map true false nil switch case default go defer try mut ";
+    let n = strlen(s);
+    let i = 0;
+    while load8(words + i) != 0 {
+        let j = 0;
+        while load8(words + i + j) != ' ' {
+            j = j + 1;
+        }
+        if j == n && mem_eq(words + i, s, n) {
+            return 1;
+        }
+        i = i + j + 1;
+    }
+    return 0;
+}
+
+// Punctuation, longest first: lex_next tries three characters, then two, then one.
+fn is_three_char_punct(a, b, c) {
+    return (a == '<' && b == '<' && c == '=') || (a == '>' && b == '>' && c == '=') || (a == '.' && b == '.' && c == '.');
+}
+
+fn is_two_char_punct(a, b) {
+    if b == '=' {
+        return a == '=' || a == '!' || a == '<' || a == '>' || a == ':' || a == '+' || a == '-' || a == '*' || a == '/' || a == '%' || a == '&' || a == '|' || a == '^';
+    }
+    return (a == '<' && b == '<') || (a == '>' && b == '>') || (a == '&' && b == '&') || (a == '|' && b == '|') || (a == '+' && b == '+') || (a == '-' && b == '-');
+}
+
+fn is_one_char_punct(c) {
+    let s = "(){}[],;=<>+-*/%&|^~!.:?";
+    let i = 0;
+    while load8(s + i) != 0 {
+        if load8(s + i) == c {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// lx_skip_space skips blanks and comments, noting in lx_newline whether it crossed a line end.
+fn lx_skip_space() {
+    lx_newline = 0;
+    while lx_i < lx_len {
+        let c = lx_peek(0);
+        if c == '\n' {
+            lx_newline = 1;
+            lx_advance();
+        } else if c == ' ' || c == '\t' || c == '\r' {
+            lx_advance();
+        } else if c == '/' && lx_peek(1) == '/' {
+            while lx_i < lx_len && lx_peek(0) != '\n' {
+                lx_advance();
+            }
+        } else if c == '/' && lx_peek(1) == '*' {
+            lx_advance();
+            lx_advance();
+            while lx_i < lx_len && !(lx_peek(0) == '*' && lx_peek(1) == '/') {
+                if lx_peek(0) == '\n' {
+                    lx_newline = 1;
+                }
+                lx_advance();
+            }
+            lx_advance();
+            lx_advance();
+        } else {
+            return;
+        }
+    }
+}
+
+// Go's semicolon rule: a line break after one of these tokens ends the statement.
+fn ends_statement(t) {
+    let k = t[T_KIND];
+    if k == TK_IDENT || k == TK_INT || k == TK_FLOAT || k == TK_STRING {
+        return 1;
+    }
+    let s = t[T_TEXT];
+    if k == TK_KEYWORD {
+        return streq(s, "break") || streq(s, "continue") || streq(s, "return") || streq(s, "true") || streq(s, "false") || streq(s, "nil");
+    }
+    return k == TK_PUNCT && (streq(s, ")") || streq(s, "]") || streq(s, "}") || streq(s, "++") || streq(s, "--"));
+}
+
+fn lex_next() {
+    lx_skip_space();
+    let pos = pos_make(lx_file, lx_line, lx_col);
+    if lx_i >= lx_len {
+        return token_new(TK_EOF, "", 0, pos);
+    }
+    let c = lx_peek(0);
+    if is_letter(c) {
+        let start = lx_i;
+        while is_letter(lx_peek(0)) || is_digit(lx_peek(0)) {
+            lx_advance();
+        }
+        let text = str_slice(lx_src + start, lx_i - start);
+        if is_keyword(text) {
+            return token_new(TK_KEYWORD, text, 0, pos);
+        }
+        return token_new(TK_IDENT, text, 0, pos);
+    }
+    if is_digit(c) || (c == '.' && is_digit(lx_peek(1))) {
+        return lex_number(pos);
+    }
+    if c == '`' {
+        return lex_raw_string(pos);
+    }
+    if lx_i + 2 < lx_len && is_three_char_punct(c, lx_peek(1), lx_peek(2)) {
+        let three = str_slice(lx_src + lx_i, 3);
+        lx_advance();
+        lx_advance();
+        lx_advance();
+        return token_new(TK_PUNCT, three, 0, pos);
+    }
+    if c == '\'' {
+        return lex_char(pos);
+    }
+    if c == '"' {
+        return lex_string(pos);
+    }
+    if lx_i + 1 < lx_len && is_two_char_punct(c, lx_peek(1)) {
+        let two = str_slice(lx_src + lx_i, 2);
+        lx_advance();
+        lx_advance();
+        return token_new(TK_PUNCT, two, 0, pos);
+    }
+    if is_one_char_punct(c) {
+        let one = str_slice(lx_src + lx_i, 1);
+        lx_advance();
+        return token_new(TK_PUNCT, one, 0, pos);
+    }
+    let e = err_begin(pos);
+    buf_str(e, "unexpected character '");
+    buf_byte(e, c);
+    buf_byte(e, '\'');
+    fatal(e);
+}
+
+// lex_float scans the fraction and exponent of a float literal starting at start.
+fn lex_float(pos, start) {
+    if lx_peek(0) == '.' {
+        lx_advance();
+        while is_digit(lx_peek(0)) {
+            lx_advance();
+        }
+    }
+    if lx_peek(0) == 'e' || lx_peek(0) == 'E' {
+        lx_advance();
+        if lx_peek(0) == '+' || lx_peek(0) == '-' {
+            lx_advance();
+        }
+        if !is_digit(lx_peek(0)) {
+            lx_fail(pos, "invalid float literal");
+        }
+        while is_digit(lx_peek(0)) {
+            lx_advance();
+        }
+    }
+    let text = str_slice(lx_src + start, lx_i - start);
+    return token_new(TK_FLOAT, text, float_bits(text), pos);
+}
+
+fn lex_raw_string(pos) {
+    lx_advance();
+    let b = buf_new();
+    while lx_peek(0) != '`' {
+        if lx_i >= lx_len {
+            lx_fail(pos, "unterminated raw string literal");
+        }
+        let c = lx_advance();
+        if c != '\r' {
+            buf_byte(b, c);
+        }
+    }
+    lx_advance();
+    buf_byte(b, 0);
+    return token_new(TK_STRING, b[VEC_DATA], b[VEC_LEN] - 1, pos);
+}
+
+fn lex_number(pos) {
+    let start = lx_i;
+    if lx_peek(0) == '.' {
+        return lex_float(pos, start);
+    }
+    // 0x, 0o and 0b prefixes; '_' may separate digits (1_000_000).
+    let base = 10;
+    if lx_peek(0) == '0' && (lx_peek(1) == 'x' || lx_peek(1) == 'X') {
+        base = 16;
+    } else if lx_peek(0) == '0' && (lx_peek(1) == 'o' || lx_peek(1) == 'O') {
+        base = 8;
+    } else if lx_peek(0) == '0' && (lx_peek(1) == 'b' || lx_peek(1) == 'B') {
+        base = 2;
+    }
+    if base != 10 {
+        lx_advance();
+        lx_advance();
+    } else {
+        while is_digit(lx_peek(0)) || (lx_peek(0) == '_' && is_digit(lx_peek(1))) {
+            lx_advance();
+        }
+        let after = lx_peek(1);
+        if (lx_peek(0) == '.' && !is_letter(after) && after != '.') || lx_peek(0) == 'e' || lx_peek(0) == 'E' {
+            return lex_float(pos, start);
+        }
+    }
+    while is_letter(lx_peek(0)) || is_digit(lx_peek(0)) {
+        lx_advance();
+    }
+    let s = lx_src + start;
+    let n = lx_i - start;
+    let val = 0;
+    let ok = 1;
+    let i = 0;
+    if base != 10 {
+        i = 2;
+        if n == 2 {
+            ok = 0;
+        }
+    }
+    let shift = 4;
+    if base == 8 {
+        shift = 3;
+    } else if base == 2 {
+        shift = 1;
+    }
+    let prev_digit = 0;
+    while i < n && ok {
+        let d = load8(s + i);
+        if d == '_' {
+            // A separator must sit between two digits.
+            if !prev_digit || i + 1 >= n || load8(s + i + 1) == '_' {
+                ok = 0;
+            }
+            prev_digit = 0;
+        } else if base == 10 {
+            // Literals up to 2^64-1 are allowed; above 2^63-1 they keep their 64-bit pattern.
+            if !is_digit(d) || val > 1844674407370955161 || (val == 1844674407370955161 && d - '0' > 5) {
+                ok = 0;
+            } else {
+                val = val * 10 + d - '0';
+            }
+            prev_digit = 1;
+        } else {
+            let dv = -1;
+            if is_hex_digit(d) {
+                dv = hex_value(d);
+            }
+            if dv < 0 || dv >= base || ((val >> (64 - shift)) & ((1 << shift) - 1)) != 0 {
+                ok = 0;
+            } else {
+                val = (val << shift) | dv;
+            }
+            prev_digit = 1;
+        }
+        i = i + 1;
+    }
+    if !prev_digit {
+        ok = 0;
+    }
+    let text = str_slice(s, n);
+    if !ok {
+        let e = err_begin(pos);
+        buf_str(e, "invalid number ");
+        buf_str(e, text);
+        fatal(e);
+    }
+    return token_new(TK_INT, text, val, pos);
+}
+
+// lx_rune decodes the UTF-8 character starting at the current byte (already peeked
+// as c >= 0x80) and consumes it.
+fn lx_rune(pos) {
+    let c = lx_advance();
+    let n = 0;
+    let r = 0;
+    if c >= 0xf0 {
+        n = 3;
+        r = c & 7;
+    } else if c >= 0xe0 {
+        n = 2;
+        r = c & 15;
+    } else if c >= 0xc0 {
+        n = 1;
+        r = c & 31;
+    } else {
+        return 0xfffd;
+    }
+    while n > 0 {
+        let d = lx_peek(0);
+        if (d & 0xc0) != 0x80 {
+            return 0xfffd;
+        }
+        lx_advance();
+        r = (r << 6) | (d & 63);
+        n = n - 1;
+    }
+    return r;
+}
+
+fn lex_char(pos) {
+    let start = lx_i;
+    lx_advance();
+    if lx_i >= lx_len || lx_peek(0) == '\n' || lx_peek(0) == '\'' {
+        lx_fail(pos, "invalid character literal");
+    }
+    let c = 0;
+    if lx_peek(0) == '\\' {
+        lx_advance();
+        c = lx_escape(pos);
+    } else if lx_peek(0) >= 0x80 {
+        c = lx_rune(pos);
+    } else {
+        c = lx_advance();
+    }
+    if lx_peek(0) != '\'' {
+        lx_fail(pos, "unterminated character literal");
+    }
+    lx_advance();
+    return token_new(TK_INT, str_slice(lx_src + start, lx_i - start), c, pos);
+}
+
+// buf_utf8 appends rune r encoded as UTF-8.
+fn buf_utf8(b, r) {
+    if r < 0x80 {
+        buf_byte(b, r);
+    } else if r < 0x800 {
+        buf_byte(b, 0xc0 | (r >> 6));
+        buf_byte(b, 0x80 | (r & 63));
+    } else if r < 0x10000 {
+        buf_byte(b, 0xe0 | (r >> 12));
+        buf_byte(b, 0x80 | ((r >> 6) & 63));
+        buf_byte(b, 0x80 | (r & 63));
+    } else {
+        buf_byte(b, 0xf0 | (r >> 18));
+        buf_byte(b, 0x80 | ((r >> 12) & 63));
+        buf_byte(b, 0x80 | ((r >> 6) & 63));
+        buf_byte(b, 0x80 | (r & 63));
+    }
+}
+
+fn lex_string(pos) {
+    lx_advance();
+    let b = buf_new();
+    while 1 {
+        if lx_i >= lx_len || lx_peek(0) == '\n' {
+            lx_fail(pos, "unterminated string literal");
+        }
+        let c = lx_advance();
+        if c == '"' {
+            // The NUL makes T_TEXT usable as a C string; T_VAL keeps the real length.
+            buf_byte(b, 0);
+            return token_new(TK_STRING, b[VEC_DATA], b[VEC_LEN] - 1, pos);
+        }
+        if c == '\\' {
+            let e = lx_escape(pos);
+            if lx_esc_rune {
+                buf_utf8(b, e);
+            } else {
+                buf_byte(b, e);
+            }
+        } else {
+            buf_byte(b, c);
+        }
+    }
+}
+
+fn lx_hex(pos, digits) {
+    let v = 0;
+    while digits > 0 {
+        let c = lx_peek(0);
+        if !is_hex_digit(c) {
+            lx_fail(pos, "invalid hex escape");
+        }
+        lx_advance();
+        v = v * 16 + hex_value(c);
+        digits = digits - 1;
+    }
+    return v;
+}
+
+// lx_escape reads the escape after a backslash. \u and \U give runes (lx_esc_rune is
+// set, so strings encode them as UTF-8); every other escape is one byte.
+fn lx_escape(pos) {
+    lx_esc_rune = 0;
+    if lx_i >= lx_len {
+        lx_fail(pos, "unterminated escape sequence");
+    }
+    let c = lx_advance();
+    if c == 'n' { return '\n'; }
+    if c == 't' { return '\t'; }
+    if c == 'r' { return '\r'; }
+    if c == 'a' { return 7; }
+    if c == 'b' { return 8; }
+    if c == 'f' { return 12; }
+    if c == 'v' { return 11; }
+    if c == '\\' || c == '\'' || c == '"' {
+        return c;
+    }
+    if c == 'x' {
+        return lx_hex(pos, 2);
+    }
+    if c == 'u' {
+        lx_esc_rune = 1;
+        return lx_hex(pos, 4);
+    }
+    if c == 'U' {
+        lx_esc_rune = 1;
+        return lx_hex(pos, 8);
+    }
+    if c >= '0' && c <= '7' {
+        // \0 alone is NUL; three octal digits are a byte, as in Go.
+        let v = c - '0';
+        let n = 1;
+        while n < 3 && lx_peek(0) >= '0' && lx_peek(0) <= '7' {
+            v = v * 8 + lx_advance() - '0';
+            n = n + 1;
+        }
+        return v & 255;
+    }
+    let e = err_begin(pos);
+    buf_str(e, "unknown escape sequence \\");
+    buf_byte(e, c);
+    fatal(e);
+}
+
+// float_bits converts a float literal to IEEE-754 bits. Exact for the common case of at
+// most 15 significant digits and a decimal exponent within +-22 (Clinger's fast path),
+// which is done with integer arithmetic only; other literals go through strtod at
+// stage two of the bootstrap.
+fn float_bits(text) {
+    return parse_float_bits(text);
+}
+
+extern func strtod(s int, end int) float
+
+// parse_float_bits converts a float literal exactly, with libc's correctly rounded strtod.
+fn parse_float_bits(text) {
+    return cast(int, strtod(text, 0));
+}

@@ -1,0 +1,721 @@
+// Analysis for code generation: leaf functions, address-taken locals, loop-weighted uses.
+
+var an_fn;
+var an_depth;
+
+fn analyze_fn(f) {
+    an_fn = f;
+    an_depth = 0;
+    f[F_LEAF] = 1;
+    let locals = f[F_LOCALS];
+    let i = 0;
+    while i < locals[VEC_LEN] {
+        let s = vec_get(locals, i);
+        s[S_USES] = 0;
+        s[S_ADDR] = 0;
+        i = i + 1;
+    }
+    an_stmts(f[F_BODY][BLK_STMTS]);
+}
+
+// A use inside k nested loops counts 8^k, so inner-loop variables win registers.
+fn an_use(s) {
+    if s[S_KIND] != SYM_LOCAL {
+        return;
+    }
+    let w = 512;
+    if an_depth < 3 {
+        w = 1 << (3 * an_depth);
+    }
+    s[S_USES] = s[S_USES] + w;
+}
+
+fn an_stmts(stmts) {
+    let i = 0;
+    while i < stmts[VEC_LEN] {
+        an_stmt(vec_get(stmts, i));
+        i = i + 1;
+    }
+}
+
+fn an_stmt(s) {
+    let k = s[N_KIND];
+    if k == ST_BLOCK {
+        an_stmts(s[BLK_STMTS]);
+    } else if k == ST_LET {
+        an_expr(s[LET_INIT]);
+        an_use(s[LET_SYM]);
+    } else if k == ST_ASSIGN {
+        let t = s[AS_TARGET];
+        if t[N_KIND] == EX_IDENT {
+            an_use(t[ID_REF]);
+        } else {
+            an_expr(t);
+        }
+        an_expr(s[AS_VALUE]);
+    } else if k == ST_EXPR {
+        an_expr(s[ES_X]);
+    } else if k == ST_IF {
+        an_expr(s[IF_COND]);
+        an_stmts(s[IF_THEN][BLK_STMTS]);
+        if s[IF_ELSE] {
+            an_stmt(s[IF_ELSE]);
+        }
+    } else if k == ST_WHILE {
+        let loop = !s[WH_ONCE];
+        an_depth = an_depth + loop;
+        an_expr(s[WH_COND]);
+        an_stmts(s[WH_BODY][BLK_STMTS]);
+        if s[WH_POST] {
+            an_stmt(s[WH_POST]);
+        }
+        an_depth = an_depth - loop;
+    } else if k == ST_RETURN {
+        if s[RET_VALUE] {
+            an_expr(s[RET_VALUE]);
+        }
+        if s[RET_VALUES] {
+            an_exprs(s[RET_VALUES]);
+        }
+    } else if k == ST_CALLMULTI {
+        an_expr(s[CM_CALL]);
+        let i = 0;
+        while i < s[CM_SYMS][VEC_LEN] {
+            an_use(vec_get(s[CM_SYMS], i));
+            i = i + 1;
+        }
+    }
+}
+
+fn an_exprs(v) {
+    let i = 0;
+    while i < v[VEC_LEN] {
+        an_expr(vec_get(v, i));
+        i = i + 1;
+    }
+}
+
+fn an_expr(e) {
+    let k = e[N_KIND];
+    if k == EX_IDENT {
+        an_use(e[ID_REF]);
+    } else if k == EX_UNARY {
+        let x = e[UN_X];
+        if streq(e[UN_OP], "&") && x[ID_REF][S_KIND] == SYM_LOCAL {
+            x[ID_REF][S_ADDR] = 1;
+        }
+        an_expr(x);
+    } else if k == EX_BINARY {
+        an_expr(e[BIN_L]);
+        an_expr(e[BIN_R]);
+    } else if k == EX_INDEX {
+        an_expr(e[IX_X]);
+        an_expr(e[IX_I]);
+    } else if k == EX_CONV {
+        an_expr(e[CV_X]);
+    } else if k == EX_MEM {
+        an_expr(e[MEM_BASE]);
+        if e[MEM_INDEX] {
+            an_expr(e[MEM_INDEX]);
+        }
+        if e[MEM_LEN] {
+            an_expr(e[MEM_LEN]);
+        }
+    } else if k == EX_ELEM {
+        an_expr(e[ELEM_SEQ]);
+        an_expr(e[ELEM_IDX]);
+    } else if k == EX_SEQ {
+        an_stmts(e[SEQ_STMTS]);
+        an_expr(e[SEQ_VALUE]);
+    } else if k == EX_CALL {
+        if !e[CALL_INTRINSIC] {
+            an_fn[F_LEAF] = 0;
+        }
+        if e[CALL_CALLEE] {
+            an_expr(e[CALL_CALLEE]);
+        }
+        let args = e[CALL_ARGS];
+        let i = 0;
+        while i < args[VEC_LEN] {
+            an_expr(vec_get(args, i));
+            i = i + 1;
+        }
+    }
+}
+
+// ---- loop-invariant code motion ----
+//
+// Runs on the AST before analysis. An expression is invariant in a loop when it only
+// reads constants and register-eligible locals the loop never assigns; Tin arithmetic
+// cannot trap, so hoisting such an expression ahead of the loop is always safe. Indexes
+// of the form x[a + b] with x and a invariant become (x + a*8)[b], so the row address
+// is computed once per loop instead of once per element.
+
+var lc_fn;
+var lc_assigned;
+var lc_exprs;
+var lc_syms;
+var lc_pre;
+var lc_calls;     // the loop makes calls, so headers may change under it
+
+fn licm_fn(f) {
+    analyze_fn(f);
+    lc_fn = f;
+    prefetch_block(f[F_BODY][BLK_STMTS]);
+    licm_block(f[F_BODY]);
+}
+
+// ---- strided prefetch ----
+//
+// An innermost loop that stores to x[j] while stepping j by a variable (or large)
+// stride misses cache on nearly every iteration; the core can only track so many
+// misses at once. Prefetching x[j + 4*step] keeps more of them in flight (sieve:
+// 155ms -> 133ms). Go does not do this.
+
+const PF_AHEAD = 4;
+
+fn prefetch_block(stmts) {
+    let i = 0;
+    while i < stmts[VEC_LEN] {
+        let s = vec_get(stmts, i);
+        let k = s[N_KIND];
+        if k == ST_WHILE && s[WH_ONCE] {
+            prefetch_block(s[WH_BODY][BLK_STMTS]);
+        } else if k == ST_WHILE {
+            if has_loop(s[WH_BODY][BLK_STMTS]) {
+                prefetch_block(s[WH_BODY][BLK_STMTS]);
+            } else {
+                prefetch_loop(s);
+            }
+        } else if k == ST_BLOCK {
+            prefetch_block(s[BLK_STMTS]);
+        } else if k == ST_IF {
+            prefetch_block(s[IF_THEN][BLK_STMTS]);
+            let els = s[IF_ELSE];
+            while els && els[N_KIND] == ST_IF {
+                prefetch_block(els[IF_THEN][BLK_STMTS]);
+                els = els[IF_ELSE];
+            }
+            if els {
+                prefetch_block(els[BLK_STMTS]);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn has_loop(stmts) {
+    let i = 0;
+    while i < stmts[VEC_LEN] {
+        let s = vec_get(stmts, i);
+        let k = s[N_KIND];
+        if k == ST_WHILE && !s[WH_ONCE] {
+            return 1;
+        }
+        if k == ST_WHILE && has_loop(s[WH_BODY][BLK_STMTS]) {
+            return 1;
+        }
+        if k == ST_BLOCK && has_loop(s[BLK_STMTS]) {
+            return 1;
+        }
+        if k == ST_IF {
+            if has_loop(s[IF_THEN][BLK_STMTS]) {
+                return 1;
+            }
+            if s[IF_ELSE] {
+                let one = vec_new();
+                vec_push(one, s[IF_ELSE]);
+                if has_loop(one) {
+                    return 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn is_reg_local(e) {
+    return e[N_KIND] == EX_IDENT && e[ID_REF][S_KIND] == SYM_LOCAL && !e[ID_REF][S_ADDR];
+}
+
+fn prefetch_loop(w) {
+    if w[WH_ONCE] {
+        return;
+    }
+    let body0 = w[WH_BODY][BLK_STMTS];
+    let body = vec_new();
+    let bi = 0;
+    while bi < body0[VEC_LEN] {
+        vec_push(body, vec_get(body0, bi));
+        bi = bi + 1;
+    }
+    if w[WH_POST] {
+        vec_push(body, w[WH_POST]);
+    }
+    lc_assigned = vec_new();
+    lc_calls = stmts_have_call(body);
+    collect_assigned(body);
+    // The induction step: a top-level `j = j + step` with step invariant.
+    let j = 0;
+    let step = 0;
+    let i = 0;
+    while i < body[VEC_LEN] {
+        let s = vec_get(body, i);
+        if s[N_KIND] == ST_ASSIGN && is_reg_local(s[AS_TARGET]) {
+            let v = s[AS_VALUE];
+            let t = s[AS_TARGET][ID_REF];
+            if v[N_KIND] == EX_BINARY && streq(v[BIN_OP], "+") && v[BIN_L][N_KIND] == EX_IDENT && v[BIN_L][ID_REF] == t && invariant(v[BIN_R]) {
+                j = t;
+                step = v[BIN_R];
+            }
+        }
+        i = i + 1;
+    }
+    if !j || count_assigns(body, j) != 1 {
+        return;
+    }
+    if is_const(step) && const_val(step) < 8 && const_val(step) > -8 {
+        return;
+    }
+    // The strided access: x[j] = ... with x invariant.
+    let target = 0;
+    i = 0;
+    while i < body[VEC_LEN] {
+        let s = vec_get(body, i);
+        if s[N_KIND] == ST_ASSIGN && s[AS_TARGET][N_KIND] == EX_INDEX {
+            let ix = s[AS_TARGET];
+            if (is_reg_local(ix[IX_X]) || ix[IX_X][IX_HDR]) && invariant(ix[IX_X]) && ix[IX_I][N_KIND] == EX_IDENT && ix[IX_I][ID_REF] == j {
+                target = ix;
+            }
+        }
+        if s[N_KIND] == ST_ASSIGN && s[AS_TARGET][N_KIND] == EX_ELEM {
+            let el = s[AS_TARGET];
+            if is_reg_local(el[ELEM_SEQ]) && invariant(el[ELEM_SEQ]) && el[ELEM_SIZE] == 8 && el[ELEM_IDX][N_KIND] == EX_IDENT && el[ELEM_IDX][ID_REF] == j {
+                target = el;
+            }
+        }
+        i = i + 1;
+    }
+    if !target {
+        return;
+    }
+    let pos = w[N_POS];
+    let ahead = node_new(EX_INT, pos);
+    ahead[INT_VAL] = PF_AHEAD;
+    let jref = node_new(EX_IDENT, pos);
+    jref[ID_NAME] = j[S_NAME];
+    jref[ID_REF] = j;
+    let call = node_new(EX_CALL, pos);
+    call[CALL_NAME] = "__prefetchw";
+    call[CALL_ARGS] = vec_new();
+    call[CALL_INTRINSIC] = 1;
+    if target[N_KIND] == EX_ELEM {
+        vec_push(call[CALL_ARGS], mk_hdr(pos, node_copy(target[ELEM_SEQ]), 2));
+    } else {
+        vec_push(call[CALL_ARGS], node_copy(target[IX_X]));
+    }
+    vec_push(call[CALL_ARGS], binary_node(pos, "+", jref, binary_node(pos, "*", node_copy(step), ahead)));
+    let st = node_new(ST_EXPR, pos);
+    st[ES_X] = call;
+    let nb = vec_new();
+    vec_push(nb, st);
+    i = 0;
+    while i < body0[VEC_LEN] {
+        vec_push(nb, vec_get(body0, i));
+        i = i + 1;
+    }
+    w[WH_BODY][BLK_STMTS] = nb;
+}
+
+fn count_assigns(stmts, sym) {
+    let n = 0;
+    let i = 0;
+    while i < lc_assigned[VEC_LEN] {
+        if vec_get(lc_assigned, i) == sym {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    return n;
+}
+
+fn licm_block(b) {
+    let stmts = b[BLK_STMTS];
+    let result = vec_new();
+    let i = 0;
+    while i < stmts[VEC_LEN] {
+        let s = vec_get(stmts, i);
+        licm_nested(s);
+        if s[N_KIND] == ST_WHILE && !s[WH_ONCE] {
+            let pre = licm_loop(s);
+            let j = 0;
+            while j < pre[VEC_LEN] {
+                vec_push(result, vec_get(pre, j));
+                j = j + 1;
+            }
+        }
+        vec_push(result, s);
+        i = i + 1;
+    }
+    b[BLK_STMTS] = result;
+}
+
+fn licm_nested(s) {
+    let k = s[N_KIND];
+    if k == ST_BLOCK {
+        licm_block(s);
+    } else if k == ST_IF {
+        licm_block(s[IF_THEN]);
+        if s[IF_ELSE] {
+            licm_nested(s[IF_ELSE]);
+        }
+    } else if k == ST_WHILE {
+        licm_block(s[WH_BODY]);
+    }
+}
+
+// licm_loop rewrites loop w in place and returns the lets to run before it.
+fn licm_loop(w) {
+    lc_assigned = vec_new();
+    lc_exprs = vec_new();
+    lc_syms = vec_new();
+    lc_pre = vec_new();
+    lc_calls = stmts_have_call(w[WH_BODY][BLK_STMTS]) || contains_call(w[WH_COND]) || stmt_has_call(w[WH_POST]);
+    collect_assigned(w[WH_BODY][BLK_STMTS]);
+    if w[WH_POST] {
+        let one = vec_new();
+        vec_push(one, w[WH_POST]);
+        collect_assigned(one);
+    }
+    hoist_expr(w[WH_COND]);
+    hoist_stmts(w[WH_BODY][BLK_STMTS]);
+    if w[WH_POST] {
+        let two = vec_new();
+        vec_push(two, w[WH_POST]);
+        hoist_stmts(two);
+    }
+    return lc_pre;
+}
+
+fn collect_assigned(stmts) {
+    let i = 0;
+    while i < stmts[VEC_LEN] {
+        let s = vec_get(stmts, i);
+        let k = s[N_KIND];
+        if k == ST_LET {
+            vec_push(lc_assigned, s[LET_SYM]);
+        } else if k == ST_ASSIGN && s[AS_TARGET][N_KIND] == EX_IDENT {
+            vec_push(lc_assigned, s[AS_TARGET][ID_REF]);
+        } else if k == ST_BLOCK {
+            collect_assigned(s[BLK_STMTS]);
+        } else if k == ST_IF {
+            collect_assigned(s[IF_THEN][BLK_STMTS]);
+            let els = s[IF_ELSE];
+            while els && els[N_KIND] == ST_IF {
+                collect_assigned(els[IF_THEN][BLK_STMTS]);
+                els = els[IF_ELSE];
+            }
+            if els {
+                collect_assigned(els[BLK_STMTS]);
+            }
+        } else if k == ST_WHILE {
+            collect_assigned(s[WH_BODY][BLK_STMTS]);
+            if s[WH_POST] {
+                let one = vec_new();
+                vec_push(one, s[WH_POST]);
+                collect_assigned(one);
+            }
+        } else if k == ST_CALLMULTI {
+            let j = 0;
+            while j < s[CM_SYMS][VEC_LEN] {
+                vec_push(lc_assigned, vec_get(s[CM_SYMS], j));
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn is_assigned(s) {
+    let i = 0;
+    while i < lc_assigned[VEC_LEN] {
+        if vec_get(lc_assigned, i) == s {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn invariant(e) {
+    let k = e[N_KIND];
+    if k == EX_INT {
+        return 1;
+    }
+    if k == EX_IDENT {
+        let s = e[ID_REF];
+        if s[S_KIND] == SYM_CONST {
+            return 1;
+        }
+        return s[S_KIND] == SYM_LOCAL && !s[S_ADDR] && !is_assigned(s);
+    }
+    if k == EX_UNARY {
+        return !streq(e[UN_OP], "&") && invariant(e[UN_X]);
+    }
+    if k == EX_BINARY {
+        return !streq(e[BIN_OP], "&&") && !streq(e[BIN_OP], "||") && invariant(e[BIN_L]) && invariant(e[BIN_R]);
+    }
+    if k == EX_FLOAT {
+        return 1;
+    }
+    if k == EX_CONV {
+        if (e[CV_KIND] == CV_LEN || e[CV_KIND] == CV_CAP) && lc_calls {
+            return 0;
+        }
+        return invariant(e[CV_X]);
+    }
+    if k == EX_INDEX && e[IX_HDR] {
+        // Slice and string headers only change through runtime calls.
+        return !lc_calls && invariant(e[IX_X]);
+    }
+    if k == EX_MEM && e[MEM_HDR] {
+        return !lc_calls && !e[MEM_INDEX] && invariant(e[MEM_BASE]);
+    }
+    return 0;
+}
+
+// op_cost estimates the instructions an expression needs; multiplies and divides count triple.
+fn op_cost(e) {
+    let k = e[N_KIND];
+    if k == EX_BINARY {
+        let op = e[BIN_OP];
+        let c = 1;
+        if streq(op, "*") || streq(op, "/") || streq(op, "%") {
+            c = 3;
+        }
+        return c + op_cost(e[BIN_L]) + op_cost(e[BIN_R]);
+    }
+    if k == EX_UNARY {
+        return 1 + op_cost(e[UN_X]);
+    }
+    if k == EX_CONV {
+        return 1 + op_cost(e[CV_X]);
+    }
+    if k == EX_INDEX {
+        return 2 + op_cost(e[IX_X]);
+    }
+    if k == EX_MEM {
+        return 2 + op_cost(e[MEM_BASE]);
+    }
+    if k == EX_FLOAT && e[FL_BITS] != 0 {
+        return 2;
+    }
+    return 0;
+}
+
+fn hoist_stmts(stmts) {
+    let i = 0;
+    while i < stmts[VEC_LEN] {
+        let s = vec_get(stmts, i);
+        let k = s[N_KIND];
+        if k == ST_LET {
+            hoist_expr(s[LET_INIT]);
+        } else if k == ST_ASSIGN {
+            hoist_expr(s[AS_TARGET]);
+            hoist_expr(s[AS_VALUE]);
+        } else if k == ST_EXPR {
+            hoist_expr(s[ES_X]);
+        } else if k == ST_RETURN {
+            if s[RET_VALUE] {
+                hoist_expr(s[RET_VALUE]);
+            }
+        } else if k == ST_BLOCK {
+            hoist_stmts(s[BLK_STMTS]);
+        } else if k == ST_IF {
+            hoist_expr(s[IF_COND]);
+            hoist_stmts(s[IF_THEN][BLK_STMTS]);
+            let els = s[IF_ELSE];
+            if els && els[N_KIND] == ST_BLOCK {
+                hoist_stmts(els[BLK_STMTS]);
+            } else if els {
+                let one = vec_new();
+                vec_push(one, els);
+                hoist_stmts(one);
+            }
+        } else if k == ST_WHILE {
+            hoist_expr(s[WH_COND]);
+            hoist_stmts(s[WH_BODY][BLK_STMTS]);
+            if s[WH_POST] {
+                let one = vec_new();
+                vec_push(one, s[WH_POST]);
+                hoist_stmts(one);
+            }
+        } else if k == ST_CALLMULTI {
+            hoist_expr(s[CM_CALL]);
+        }
+        i = i + 1;
+    }
+}
+
+fn hoist_expr(e) {
+    if !e {
+        return;
+    }
+    let k = e[N_KIND];
+    if (k == EX_BINARY || k == EX_UNARY || k == EX_CONV || k == EX_FLOAT || (k == EX_INDEX && e[IX_HDR]) || (k == EX_MEM && e[MEM_HDR])) && invariant(e) && !is_const(e) && op_cost(e) >= 2 {
+        replace_with_temp(e);
+        return;
+    }
+    if k == EX_ELEM {
+        elem_specialize(e);
+        k = e[N_KIND];
+    }
+    if k == EX_INDEX {
+        index_rewrite(e);
+        hoist_expr(e[IX_X]);
+        hoist_expr(e[IX_I]);
+    } else if k == EX_MEM {
+        mem_rewrite(e);
+        hoist_expr(e[MEM_BASE]);
+        hoist_expr(e[MEM_INDEX]);
+        hoist_expr(e[MEM_LEN]);
+    } else if k == EX_ELEM {
+        hoist_expr(e[ELEM_SEQ]);
+        hoist_expr(e[ELEM_IDX]);
+    } else if k == EX_UNARY {
+        hoist_expr(e[UN_X]);
+    } else if k == EX_BINARY {
+        hoist_expr(e[BIN_L]);
+        hoist_expr(e[BIN_R]);
+    } else if k == EX_CONV {
+        hoist_expr(e[CV_X]);
+    } else if k == EX_CALL {
+        let args = e[CALL_ARGS];
+        let i = 0;
+        while i < args[VEC_LEN] {
+            hoist_expr(vec_get(args, i));
+            i = i + 1;
+        }
+    }
+}
+
+fn binary_node(pos, op, l, r) {
+    let b = node_new(EX_BINARY, pos);
+    b[BIN_OP] = op;
+    b[BIN_L] = l;
+    b[BIN_R] = r;
+    return b;
+}
+
+// index_rewrite turns x[a + b] into (x + (a << 3))[b] when x and a are invariant and b is not.
+fn index_rewrite(e) {
+    let ix = e[IX_I];
+    if ix[N_KIND] != EX_BINARY || !streq(ix[BIN_OP], "+") || !invariant(e[IX_X]) {
+        return;
+    }
+    let a = ix[BIN_L];
+    let b = ix[BIN_R];
+    if invariant(b) && !invariant(a) {
+        a = ix[BIN_R];
+        b = ix[BIN_L];
+    }
+    if !invariant(a) || invariant(b) {
+        return;
+    }
+    let three = node_new(EX_INT, e[N_POS]);
+    three[INT_VAL] = 3;
+    e[IX_X] = binary_node(e[N_POS], "+", e[IX_X], binary_node(e[N_POS], "<<", a, three));
+    e[IX_I] = b;
+}
+
+// replace_with_temp moves e into a let before the loop and turns e into a read of it,
+// reusing the temp of an identical expression hoisted earlier from the same loop.
+fn replace_with_temp(e) {
+    let s = 0;
+    let i = 0;
+    while i < lc_exprs[VEC_LEN] && !s {
+        if expr_equal(vec_get(lc_exprs, i), e) {
+            s = vec_get(lc_syms, i);
+        }
+        i = i + 1;
+    }
+    if !s {
+        let moved = node_copy(e);
+        s = sym_new(SYM_LOCAL, "licm", e[N_POS]);
+        s[S_TYPE] = e[N_TYPE];
+        s[S_SLOT] = lc_fn[F_SLOTS];
+        lc_fn[F_SLOTS] = lc_fn[F_SLOTS] + 1;
+        vec_push(lc_fn[F_LOCALS], s);
+        let l = node_new(ST_LET, e[N_POS]);
+        l[LET_NAME] = "licm";
+        l[LET_INIT] = moved;
+        l[LET_SYM] = s;
+        vec_push(lc_pre, l);
+        vec_push(lc_exprs, moved);
+        vec_push(lc_syms, s);
+    }
+    let t = e[N_TYPE];
+    e[N_KIND] = EX_IDENT;
+    e[ID_NAME] = s[S_NAME];
+    e[ID_REF] = s;
+    e[4] = 0;
+    e[5] = 0;
+    e[N_TYPE] = t;
+    e[7] = 0;
+}
+
+// elem_specialize turns s[i] in a loop that cannot change s into a plain load from the
+// hoisted data pointer, checked against the hoisted length.
+fn elem_specialize(e) {
+    let x = e[ELEM_SEQ];
+    if lc_calls || !invariant(x) || !is_reg_local(x) {
+        return;
+    }
+    let pos = e[N_POS];
+    let data = 0;
+    if e[ELEM_STR] {
+        data = binary_node(pos, "+", node_copy(x), int_node(pos, 8));
+        data[N_TYPE] = ty_int;
+    } else {
+        data = mk_hdr(pos, node_copy(x), 2);
+    }
+    let lenx = 0;
+    if !e[ELEM_SAFE] {
+        lenx = mk_hdr(pos, node_copy(x), 0);
+    }
+    let idx = e[ELEM_IDX];
+    let size = e[ELEM_SIZE];
+    let t = e[N_TYPE];
+    let m = mk_mem(pos, data, idx, size, 0, t);
+    m[MEM_LEN] = lenx;
+    replace_node(e, m);
+}
+
+fn int_node(pos, v) {
+    let n = node_new(EX_INT, pos);
+    n[INT_VAL] = v;
+    n[N_TYPE] = ty_int;
+    return n;
+}
+
+// mem_rewrite turns base[a + b] (unchecked) with base and a invariant into
+// (base + a*scale)[b], so the row address is computed once per loop.
+fn mem_rewrite(e) {
+    let ix = e[MEM_INDEX];
+    if !ix || e[MEM_LEN] || ix[N_KIND] != EX_BINARY || !streq(ix[BIN_OP], "+") || !invariant(e[MEM_BASE]) {
+        return;
+    }
+    let a = ix[BIN_L];
+    let b = ix[BIN_R];
+    if invariant(b) && !invariant(a) {
+        a = ix[BIN_R];
+        b = ix[BIN_L];
+    }
+    if !invariant(a) || invariant(b) {
+        return;
+    }
+    let sh = int_node(e[N_POS], width_log2(e[MEM_SCALE]));
+    e[MEM_BASE] = binary_node(e[N_POS], "+", e[MEM_BASE], binary_node(e[N_POS], "<<", a, sh));
+    e[MEM_INDEX] = b;
+}

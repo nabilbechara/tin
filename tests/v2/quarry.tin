@@ -1,0 +1,142 @@
+package main
+
+import "say"
+import "quarry"
+import "trail"
+
+func main() {
+	a := quarry.Args()
+	say.Line("args", len(a) >= 1, len(a[0]) > 0)
+
+	say.Line("env set", quarry.Setenv("QUARRY_T", "v1"), say.Fmt("%q", quarry.Getenv("QUARRY_T")))
+	v, ok := quarry.LookupEnv("QUARRY_T")
+	say.Line("env lookup", say.Fmt("%q", v), ok)
+	say.Line("env set empty", quarry.Setenv("QUARRY_T", ""), say.Fmt("%q", quarry.Getenv("QUARRY_T")))
+	v, ok = quarry.LookupEnv("QUARRY_T")
+	say.Line("env lookup empty", say.Fmt("%q", v), ok)
+	say.Line("env unset", quarry.Unsetenv("QUARRY_T"))
+	v, ok = quarry.LookupEnv("QUARRY_T")
+	say.Line("env lookup unset", say.Fmt("%q", v), ok)
+	say.Line("env bad key", quarry.Setenv("", "x"), quarry.Setenv("A=B", "x"), quarry.Setenv("A\x00B", "x"))
+	say.Line("env empty key", say.Fmt("%q", quarry.Getenv("")))
+	say.Line("env unicode", quarry.Setenv("QUARRY_U", "héllo €"), quarry.Getenv("QUARRY_U"))
+	v, ok = quarry.LookupEnv("QUARRY_NEVER_SET_XYZ")
+	say.Line("env missing", say.Fmt("%q", v), ok)
+
+	tmp := trail.Join2(quarry.TempDir(), "quarry_test_dir")
+	say.Line("tempdir abs", trail.IsAbs(quarry.TempDir()))
+	say.Line("setup", quarry.RemoveAll(tmp), quarry.MkdirAll(tmp), quarry.Chdir(tmp))
+	wd, err := quarry.Getwd()
+	say.Line("getwd", err, trail.Base(wd))
+	say.Line("getwd set pwd", quarry.Setenv("PWD", tmp))
+	wd, err = quarry.Getwd()
+	say.Line("getwd via pwd", err, wd == tmp)
+
+	say.Line("mkdirall", quarry.MkdirAll("d1/d2/d3"), quarry.IsDir("d1/d2"), quarry.Exists("d1/d2/d3"), quarry.MkdirAll("d1/d2/d3"), quarry.MkdirAll("d1/d2/d3/"))
+	say.Line("mkdir exists", quarry.Mkdir("d1"))
+	say.Line("mkdir no parent", quarry.Mkdir("nope/x"))
+	say.Line("write", quarry.WriteFile("f.txt", "hello\n"))
+	s, err := quarry.ReadFile("f.txt")
+	say.Line("read", say.Fmt("%q", s), err)
+	n, err := quarry.Size("f.txt")
+	say.Line("size", n, err)
+	say.Line("append", quarry.AppendFile("f.txt", "wörld"))
+	s, err = quarry.ReadFile("f.txt")
+	say.Line("read appended", say.Fmt("%q", s), err)
+	n, err = quarry.Size("f.txt")
+	say.Line("size appended", n, err)
+	say.Line("overwrite", quarry.WriteFile("f.txt", "x"))
+	n, err = quarry.Size("f.txt")
+	say.Line("size overwritten", n, err)
+	say.Line("write empty", quarry.WriteFile("empty", ""), quarry.Exists("empty"), quarry.IsDir("empty"))
+	s, err = quarry.ReadFile("empty")
+	say.Line("read empty", say.Fmt("%q", s), err, len(s))
+	n, err = quarry.Size("empty")
+	say.Line("size empty", n, err)
+	say.Line("append creates", quarry.AppendFile("app.txt", "a"), quarry.AppendFile("app.txt", "b"))
+	s, err = quarry.ReadFile("app.txt")
+	say.Line("read app", s, err)
+	say.Line("mkdirall over file", quarry.MkdirAll("f.txt"), quarry.MkdirAll("f.txt/sub"))
+	_, err = quarry.ReadFile("missing")
+	say.Line("read missing", err)
+	_, err = quarry.ReadFile("d1")
+	say.Line("read dir", err)
+	say.Line("write dir", quarry.WriteFile("d1", "x"))
+	say.Line("write no parent", quarry.WriteFile("nope/f", "x"))
+	n, err = quarry.Size("missing")
+	say.Line("size missing", n, err)
+	say.Line("exists missing", quarry.Exists("missing"), quarry.IsDir("missing"), quarry.IsDir("f.txt"))
+
+	b := make([]u8, 0, 1000000)
+	for i := 0; i < 1000000; i++ {
+		b = append(b, u8((i*7+i/1000)&255))
+	}
+	say.Line("write big", quarry.WriteFile("big.bin", str(b)))
+	s, err = quarry.ReadFile("big.bin")
+	sum := 0
+	for i := 0; i < len(s); i++ {
+		sum += i64(s[i]) * (i%13 + 1)
+	}
+	say.Line("read big", len(s), err, sum)
+	n, err = quarry.Size("big.bin")
+	say.Line("size big", n, err)
+	mt, err := quarry.ModTime("big.bin")
+	say.Line("modtime", mt > 1600000000, err)
+	_, err = quarry.ModTime("missing")
+	say.Line("modtime missing", err)
+
+	say.Line("rename", quarry.Rename("f.txt", "g.txt"), quarry.Exists("f.txt"), quarry.Exists("g.txt"))
+	say.Line("rename missing", quarry.Rename("missing", "h"))
+	say.Line("rename onto dir", quarry.Rename("g.txt", "d1"))
+	say.Line("rename dir onto dir", quarry.Rename("d1/d2", "d1"))
+	say.Line("rename dir", quarry.Rename("d1/d2/d3", "d1/d3"), quarry.IsDir("d1/d3"), quarry.Exists("d1/d2/d3"))
+	say.Line("rename over file", quarry.Rename("g.txt", "app.txt"), quarry.Exists("g.txt"))
+	s, err = quarry.ReadFile("app.txt")
+	say.Line("read replaced", s, err)
+
+	say.Line("remove nonempty", quarry.Remove("d1"))
+	say.Line("remove missing", quarry.Remove("missing"))
+	say.Line("remove", quarry.Remove("d1/d3"), quarry.Remove("app.txt"), quarry.Exists("d1/d3"), quarry.Exists("app.txt"))
+
+	names, err := quarry.ReadDir(".")
+	say.Line("readdir", names, err)
+	_, err = quarry.ReadDir("missing")
+	say.Line("readdir missing", err)
+	_, err = quarry.ReadDir("empty")
+	say.Line("readdir file", err)
+	names, err = quarry.ReadDir("d1/d2")
+	say.Line("readdir empty", len(names), err)
+	say.Line("mkdir many", quarry.Mkdir("many"))
+	for i := 0; i < 40; i++ {
+		err = quarry.WriteFile(say.Fmt("many/n%02d", (i*17)%40), "")
+		if err != nil {
+			say.Line("many write failed", err)
+		}
+	}
+	extra := []str{"é", "Z", "a", ".hidden", "~", "0", "n1", "n100"}
+	for _, x := range extra {
+		err = quarry.WriteFile("many/"+x, x)
+		if err != nil {
+			say.Line("extra write failed", err)
+		}
+	}
+	say.Line("mkdir nested", quarry.MkdirAll("many/sub/deep"), quarry.WriteFile("many/sub/deep/leaf", "leaf"))
+	names, err = quarry.ReadDir("many")
+	say.Line("readdir many", len(names), err, names[0], names[1], names[2], names[len(names)-1])
+	say.Line("readdir many all", names)
+	say.Line("removeall", quarry.RemoveAll("many"), quarry.Exists("many"), quarry.RemoveAll("missing"), quarry.RemoveAll("d1"), quarry.Exists("d1"))
+	say.Line("removeall file", quarry.RemoveAll("empty"), quarry.Exists("empty"))
+
+	_, err = quarry.ReadFile("a\x00b")
+	say.Line("nul path", say.Fmt("%q", err))
+	say.Line("chdir missing", quarry.Chdir("missing"))
+	h, err := quarry.Hostname()
+	say.Line("hostname", len(h) > 0, err)
+	say.Line("pid", quarry.Pid() > 0)
+
+	say.Line("cleanup", quarry.Chdir("/"), quarry.RemoveAll(tmp), quarry.Exists(tmp))
+	quarry.Eprint("quarry test: ")
+	quarry.Eprintln("stderr works")
+	say.Line("exit flushes")
+	quarry.Exit(0)
+}

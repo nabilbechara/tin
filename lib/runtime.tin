@@ -1,0 +1,1987 @@
+// Tin runtime: memory, strings, slices, maps, formatting and program startup.
+// Compiler-generated code calls these rt_ functions with raw words; x28 holds the
+// current thread's context.
+//
+// Strings are pointers to [length word][bytes][NUL], slices to [len, cap, data], maps
+// to an open-addressing table. Every reference type uses 0 for nil, and nil strings,
+// slices and maps behave as empty.
+
+extern func write(fd i64, buf i64, n i64) i64
+extern func read(fd i64, buf i64, n i64) i64
+extern func malloc(n i64) i64
+extern func calloc(n i64, size i64) i64
+extern func realloc(p i64, n i64) i64
+extern func free(p i64)
+extern func memcpy(dst i64, src i64, n i64) i64
+extern func memmove(dst i64, src i64, n i64) i64
+extern func memcmp(a i64, b i64, n i64) i64
+extern func memset(p i64, c i64, n i64) i64
+extern func exit(code i64)
+extern func isatty(fd i64) i64
+extern func snprintf(buf i64, n i64, format i64, ...) i64
+extern func strtod(s i64, end i64) f64
+extern func strlen(s i64) i64
+extern func rint(x f64) f64
+extern func dladdr(addr i64, info i64) i64
+extern func posix_memalign(p i64, align i64, n i64) i64
+
+extern func pthread_create(t i64, attr i64, f i64, arg i64) i64
+extern func pthread_attr_init(attr i64) i64
+extern func pthread_attr_setstacksize(attr i64, n i64) i64
+
+// Core context words: x28 points here, and the core's globals follow (the compiler
+// addresses global i at x28 + 8*(ctxWords+i), so every core has its own copy).
+const ctxBump = 0
+const ctxEnd = 1
+const ctxFmt = 2
+const ctxFound = 3
+const ctxID = 4
+const ctxArena = 5
+const ctxIngot = 6      // 1 while initializers run: allocations go to the ingot heap
+const ctxPoolBase = 7   // the core's first pool chunk
+const ctxPoolMark = 8   // pool top in the first chunk once allocation moved past it
+const ctxPoolExtra = 9  // overflow chunks and big blocks, freed at reset: [next, ...]
+const ctxFree = 10      // 16 ingot free lists, one per size class
+const ctxSlab = 26      // ingot slab bump pointer
+const ctxSlabEnd = 27
+const ctxWords = 32
+
+const chunkSize = 4194304
+const bigAlloc = 262144
+const slabSize = 1048576
+
+shared var rtArgc i64
+shared var rtArgv i64
+shared var rtOut i64      // stdout buffer: [len, cap, data]
+shared var rtOutTTY bool
+shared var rtOutLock i64
+shared var rtTLS i64      // number of per-core globals
+shared var rtCoreInit func()
+shared var rtCores i64
+shared var rtCoresDone i64
+
+func rt_init(argc i64, argv i64, ntls i64, coreinit func()) {
+	rtTLS = ntls
+	rtCoreInit = coreinit
+	ctx := rt_ctx_new(0)
+	__set_ctx(ctx)
+	rtCores = 1
+	rtArgc = argc
+	rtArgv = argv
+	rtOut = calloc(3, 8)
+	rtOut[1] = 65536
+	rtOut[2] = malloc(65536)
+	rtOutTTY = isatty(1)&0xffffffff != 0
+}
+
+// rt_aligned_alloc returns n zeroed bytes on their own 128-byte cache lines (n is rounded up).
+func rt_aligned_alloc(n i64) i64 {
+	n = (n + 127) & -128
+	slot := calloc(1, 8)
+	posix_memalign(slot, 128, n)
+	p := slot[0]
+	free(slot)
+	memset(p, 0, n)
+	return p
+}
+
+func rt_ctx_new(id i64) i64 {
+	// Each core writes its context on every allocation: keep it off other cores' lines.
+	ctx := rt_aligned_alloc((ctxWords + rtTLS) * 8)
+	ctx[ctxID] = id
+	ctx[ctxIngot] = 1
+	return ctx
+}
+
+// rt_core_main is a new core's thread: its own context, its own globals, then entry(arg).
+func rt_core_main(p i64) i64 {
+	__set_ctx(rt_ctx_new(p[2]))
+	rt_core_qos(p[2])
+	rtCoreInit()
+	__ctx()[ctxIngot] = 0
+	entry := cast(func(i64), p[0])
+	entry(p[1])
+	rt_flush_core()
+	__atomic_add(&rtCoresDone, 1)
+	return 0
+}
+
+func rt_flush_core() {
+	rt_lock(&rtOutLock)
+	rt_flush()
+	rt_unlock(&rtOutLock)
+}
+
+// rt_spawn_core starts a core running entry(arg) on its own thread with an 8 MiB stack.
+func rt_spawn_core(entry func(i64), arg i64) {
+	p := calloc(4, 8)
+	p[0] = cast(i64, entry)
+	p[1] = arg
+	p[2] = __atomic_add(&rtCores, 1)
+	attr := calloc(16, 8)
+	pthread_attr_init(attr)
+	pthread_attr_setstacksize(attr, 8388608)
+	t := calloc(1, 8)
+	if pthread_create(t, attr, cast(i64, rt_core_main), p)&0xffffffff != 0 {
+		rt_panic("cannot start a core thread")
+	}
+}
+
+func rt_core_id() i64 {
+	return __ctx()[ctxID]
+}
+
+func rt_exit() {
+	rt_flush()
+	exit(0)
+}
+
+// rt_main_begin ends initialization: from here allocations go to the request pool.
+func rt_main_begin() {
+	__ctx()[ctxIngot] = 0
+}
+
+func rt_bounds_fail() {
+	rt_panic("index out of range")
+}
+
+func rt_div_fail() {
+	rt_panic("integer divide by zero")
+}
+
+// rt_bounds_fail2 is a failed bounds check with its index and length (Go's wording).
+func rt_bounds_fail2(i i64, n i64) {
+	b := rt_alloc(128)
+	k := snprintf(b, 128, cast(i64, "index out of range [%lld] with length %lld")+8, i, n) & 0xffffffff
+	rt_panic(rt_str_from_raw(b, k))
+}
+
+// rt_fail makes a fault: a str holding the message (a fault is never nil).
+func rt_fail(msg str) i64 {
+	n := len(msg)
+	p := rt_str_new(n)
+	memcpy(p+8, cast(i64, msg)+8, n)
+	return p
+}
+
+// ---- memory ----
+
+// rt_alloc returns n zeroed bytes from the thread's bump chunk. Memory is never freed:
+// programs and requests are short, and a bump pointer is the fastest allocator there is.
+func rt_alloc(n i64) i64 {
+	c := __ctx()
+	if c[ctxIngot] != 0 {
+		return rt_ingot_alloc(n)
+	}
+	n = (n + 15) & -16
+	p := c[ctxBump]
+	if p+n > c[ctxEnd] {
+		return rt_alloc_slow(n)
+	}
+	c[ctxBump] = p + n
+	return p
+}
+
+func rt_alloc_slow(n i64) i64 {
+	c := __ctx()
+	if c[ctxPoolBase] == 0 {
+		chunk := calloc(1, chunkSize)
+		c[ctxPoolBase] = chunk
+		c[ctxBump] = chunk + n
+		c[ctxEnd] = chunk + chunkSize
+		return chunk
+	}
+	if n >= bigAlloc {
+		b := calloc(1, n+16)
+		b[0] = c[ctxPoolExtra]
+		c[ctxPoolExtra] = b
+		return b + 16
+	}
+	if c[ctxPoolMark] == 0 {
+		c[ctxPoolMark] = c[ctxBump]
+	}
+	chunk := calloc(1, chunkSize)
+	chunk[0] = c[ctxPoolExtra]
+	c[ctxPoolExtra] = chunk
+	c[ctxBump] = chunk + 16 + n
+	c[ctxEnd] = chunk + chunkSize
+	return chunk + 16
+}
+
+// rt_pool_reset ends a request: the core's pool is zeroed back to empty in place.
+func rt_pool_reset() {
+	c := __ctx()
+	base := c[ctxPoolBase]
+	if base == 0 {
+		return
+	}
+	top := c[ctxBump]
+	if c[ctxPoolMark] != 0 {
+		top = c[ctxPoolMark]
+		for p := c[ctxPoolExtra]; p != 0; {
+			next := p[0]
+			free(p)
+			p = next
+		}
+		c[ctxPoolExtra] = 0
+		c[ctxPoolMark] = 0
+	} else if c[ctxPoolExtra] != 0 {
+		for p := c[ctxPoolExtra]; p != 0; {
+			next := p[0]
+			free(p)
+			p = next
+		}
+		c[ctxPoolExtra] = 0
+	}
+	memset(base, 0, top-base)
+	c[ctxBump] = base
+	c[ctxEnd] = base + chunkSize
+}
+
+// rt_pool_used reports the bytes the current request has taken from the pool.
+func rt_pool_used() i64 {
+	c := __ctx()
+	if c[ctxPoolMark] != 0 {
+		return c[ctxPoolMark] - c[ctxPoolBase] + chunkSize
+	}
+	return c[ctxBump] - c[ctxPoolBase]
+}
+
+// Ingot size classes (block sizes with the 8-byte header): 16 32 48 64, then 96 128 192
+// 256 ... 3072 4096. Larger blocks come from calloc with a -1 header.
+func rt_ingot_class(sz i64) i64 {
+	if sz <= 64 {
+		return (sz+15)>>4 - 1
+	}
+	s := 64
+	k := 4
+	for k < 16 {
+		if sz <= s+s>>1 {
+			return k
+		}
+		if sz <= 2*s {
+			return k + 1
+		}
+		s *= 2
+		k += 2
+	}
+	return -1
+}
+
+func rt_class_size(k i64) i64 {
+	if k < 4 {
+		return 16 * (k + 1)
+	}
+	j := k - 4
+	s := 64 << (j >> 1)
+	if j&1 == 0 {
+		return s + s>>1
+	}
+	return 2 * s
+}
+
+// rt_ingot_alloc returns zeroed long-lived memory from the core's ingot heap.
+func rt_ingot_alloc(n i64) i64 {
+	k := rt_ingot_class(n + 8)
+	if k < 0 {
+		b := calloc(1, n+8)
+		b[0] = -1
+		return b + 8
+	}
+	c := __ctx()
+	p := c[ctxFree+k]
+	if p != 0 {
+		c[ctxFree+k] = p[0]
+		memset(p, 0, rt_class_size(k)-8)
+		return p
+	}
+	bs := rt_class_size(k)
+	if c[ctxSlab]+bs > c[ctxSlabEnd] {
+		slab := calloc(1, slabSize)
+		c[ctxSlab] = slab
+		c[ctxSlabEnd] = slab + slabSize
+	}
+	b := c[ctxSlab]
+	c[ctxSlab] = b + bs
+	b[0] = k
+	return b + 8
+}
+
+// rt_ingot_free returns a block to its core's free list (blocks never cross cores).
+func rt_ingot_free(p i64) {
+	if p == 0 {
+		return
+	}
+	k := (p - 8)[0]
+	if k < 0 {
+		free(p - 8)
+		return
+	}
+	c := __ctx()
+	p[0] = c[ctxFree+k]
+	c[ctxFree+k] = p
+}
+
+// rt_region_alloc allocates in the ingot heap when ingot is 1, else in the pool.
+func rt_region_alloc(ingot i64, n i64) i64 {
+	if ingot != 0 {
+		return rt_ingot_alloc(n)
+	}
+	return rt_alloc(n)
+}
+
+// lsr is a logical shift right (Tin's >> is arithmetic).
+func lsr(x i64, n i64) i64 {
+	return (x >> n) & ((1 << (64 - n)) - 1)
+}
+
+// ---- output ----
+
+func rt_lock(p i64) {
+	for __atomic_swap(p, 1) != 0 {
+		__yield()
+	}
+}
+
+func rt_unlock(p i64) {
+	__atomic_store(p, 0)
+}
+
+func rt_write_all(fd i64, p i64, n i64) {
+	for n > 0 {
+		w := write(fd, p, n)
+		if w <= 0 {
+			return
+		}
+		p += w
+		n -= w
+	}
+}
+
+func rt_flush() {
+	if rtOut == 0 {
+		return
+	}
+	rt_write_all(1, rtOut[2], rtOut[0])
+	rtOut[0] = 0
+}
+
+// rt_out appends n bytes to the stdout buffer, flushing at 64 KiB or, on a terminal,
+// at every newline.
+func rt_out(p i64, n i64) {
+	rt_lock(&rtOutLock)
+	if rtOut[0]+n > rtOut[1] {
+		rt_flush()
+		if n > rtOut[1] {
+			rt_write_all(1, p, n)
+			rt_unlock(&rtOutLock)
+			return
+		}
+	}
+	memcpy(rtOut[2]+rtOut[0], p, n)
+	rtOut[0] += n
+	if rtOutTTY {
+		rt_flush()
+	}
+	rt_unlock(&rtOutLock)
+}
+
+func rt_panic(msg str) {
+	rt_flush()
+	head := "panic: "
+	rt_write_all(2, cast(i64, head)+8, len(head))
+	rt_write_all(2, cast(i64, msg)+8, len(msg))
+	rt_write_all(2, cast(i64, "\n")+8, 1)
+	rt_backtrace(__fp())
+	exit(2)
+}
+
+// rt_backtrace prints the calling functions by walking the frame-pointer chain.
+func rt_backtrace(fp i64) {
+	info := calloc(4, 8)
+	core := rt_alloc(64)
+	cn := snprintf(core, 64, cast(i64, "\ncore %lld:\n")+8, rt_core_id()) & 0xffffffff
+	rt_write_all(2, core, cn)
+	for k := 0; k < 64 && fp != 0; k++ {
+		ret := fp[1]
+		if ret == 0 {
+			break
+		}
+		name := cast(i64, "?") + 8
+		if dladdr(ret-4, info)&0xffffffff != 0 && info[2] != 0 {
+			name = info[2]
+			// Linux executables name Tin functions tin.<name> in their dynamic symbols.
+			if load8(name) == 't' && load8(name+1) == 'i' && load8(name+2) == 'n' && load8(name+3) == '.' {
+				name = name + 4
+			}
+		}
+		// The program's entry ("main", which calls main.main) ends the user's frames.
+		if load8(name) == 'm' && load8(name+1) == 'a' && load8(name+2) == 'i' && load8(name+3) == 'n' && load8(name+4) == 0 {
+			break
+		}
+		skip := load8(name) == 'r' && load8(name+1) == 't' && load8(name+2) == '_'
+		if !skip {
+			rt_write_all(2, cast(i64, "\t")+8, 1)
+			rt_write_all(2, name, strlen(name))
+			rt_write_all(2, cast(i64, "\n")+8, 1)
+		}
+		next := fp[0]
+		if next <= fp {
+			break
+		}
+		fp = next
+	}
+}
+
+func rt_err_str(e i64) str {
+	if e == 0 {
+		return "<nil>"
+	}
+	return cast(str, e)
+}
+
+// ---- strings ----
+
+func rt_str_new(n i64) i64 {
+	p := rt_alloc(n + 9)
+	p[0] = n
+	return p
+}
+
+func rt_cstr(s str) i64 {
+	if len(s) == 0 {
+		return cast(i64, "") + 8
+	}
+	return cast(i64, s) + 8
+}
+
+func rt_str_cat(a str, b str) str {
+	la := len(a)
+	lb := len(b)
+	if la == 0 {
+		return b
+	}
+	if lb == 0 {
+		return a
+	}
+	p := rt_str_new(la + lb)
+	memcpy(p+8, cast(i64, a)+8, la)
+	memcpy(p+8+la, cast(i64, b)+8, lb)
+	return cast(str, p)
+}
+
+func rt_str_eq(a str, b str) bool {
+	pa := cast(i64, a)
+	pb := cast(i64, b)
+	if pa == pb {
+		return true
+	}
+	la := len(a)
+	if la != len(b) {
+		return false
+	}
+	if la == 0 {
+		return true
+	}
+	if load8(pa+8) != load8(pb+8) {
+		return false
+	}
+	return memcmp(pa+8, pb+8, la)&0xffffffff == 0
+}
+
+func rt_str_cmp(a str, b str) i64 {
+	la := len(a)
+	lb := len(b)
+	n := la
+	if lb < n {
+		n = lb
+	}
+	if n > 0 {
+		r := (memcmp(cast(i64, a)+8, cast(i64, b)+8, n) << 32) >> 32
+		if r != 0 {
+			return r
+		}
+	}
+	return la - lb
+}
+
+func rt_str_sub(s str, lo i64, hi i64) str {
+	n := len(s)
+	if hi < 0 {
+		hi = n
+	}
+	if lo < 0 || hi > n || lo > hi {
+		rt_panic("str slice out of range")
+	}
+	if lo == 0 && hi == n {
+		return s
+	}
+	if hi == lo {
+		return ""
+	}
+	p := rt_str_new(hi - lo)
+	memcpy(p+8, cast(i64, s)+8+lo, hi-lo)
+	return cast(str, p)
+}
+
+func rt_str_from_bytes(b []u8) str {
+	n := len(b)
+	if n == 0 {
+		return ""
+	}
+	p := rt_str_new(n)
+	memcpy(p+8, cast(i64, b)[2], n)
+	return cast(str, p)
+}
+
+func rt_str_from_raw(p i64, n i64) str {
+	s := rt_str_new(n)
+	memcpy(s+8, p, n)
+	return cast(str, s)
+}
+
+func rt_bytes_from_str(s str) i64 {
+	n := len(s)
+	h := rt_slice_make(n, n, 1)
+	if n > 0 {
+		memcpy(h[2], cast(i64, s)+8, n)
+	}
+	return h
+}
+
+func rt_str_from_rune(r i64) str {
+	p := rt_str_new(4)
+	n := rt_utf8_put(p+8, r)
+	p[0] = n
+	return cast(str, p)
+}
+
+// rt_utf8_put encodes rune r at p and returns its length in bytes.
+func rt_utf8_put(p i64, r i64) i64 {
+	if r < 0 || r > 0x10ffff || (r >= 0xd800 && r <= 0xdfff) {
+		r = 0xfffd
+	}
+	if r < 0x80 {
+		store8(p, r)
+		return 1
+	}
+	if r < 0x800 {
+		store8(p, 0xc0|(r>>6))
+		store8(p+1, 0x80|(r&63))
+		return 2
+	}
+	if r < 0x10000 {
+		store8(p, 0xe0|(r>>12))
+		store8(p+1, 0x80|((r>>6)&63))
+		store8(p+2, 0x80|(r&63))
+		return 3
+	}
+	store8(p, 0xf0|(r>>18))
+	store8(p+1, 0x80|((r>>12)&63))
+	store8(p+2, 0x80|((r>>6)&63))
+	store8(p+3, 0x80|(r&63))
+	return 4
+}
+
+// rt_utf8 decodes the rune at byte i of s, returning rune | width<<32 (bad bytes are
+// U+FFFD, width 1), which range loops over strings unpack.
+func rt_utf8(s str, i i64) i64 {
+	p := cast(i64, s) + 8 + i
+	n := len(s) - i
+	c := i64(load8(p))
+	if c < 0x80 {
+		return c | (1 << 32)
+	}
+	if c >= 0xc2 && c < 0xe0 && n >= 2 {
+		c1 := i64(load8(p + 1))
+		if c1&0xc0 == 0x80 {
+			return ((c&31)<<6 | (c1 & 63)) | (2 << 32)
+		}
+	}
+	if c >= 0xe0 && c < 0xf0 && n >= 3 {
+		c1 := i64(load8(p + 1))
+		c2 := i64(load8(p + 2))
+		if c1&0xc0 == 0x80 && c2&0xc0 == 0x80 {
+			r := (c&15)<<12 | (c1&63)<<6 | (c2 & 63)
+			if r >= 0x800 && (r < 0xd800 || r > 0xdfff) {
+				return r | (3 << 32)
+			}
+		}
+	}
+	if c >= 0xf0 && c < 0xf5 && n >= 4 {
+		c1 := i64(load8(p + 1))
+		c2 := i64(load8(p + 2))
+		c3 := i64(load8(p + 3))
+		if c1&0xc0 == 0x80 && c2&0xc0 == 0x80 && c3&0xc0 == 0x80 {
+			r := (c&7)<<18 | (c1&63)<<12 | (c2&63)<<6 | (c3 & 63)
+			if r >= 0x10000 && r <= 0x10ffff {
+				return r | (4 << 32)
+			}
+		}
+	}
+	return 0xfffd | (1 << 32)
+}
+
+// ---- slices ----
+
+func rt_slice_make(n i64, c i64, esz i64) i64 {
+	if c < n {
+		c = n
+	}
+	ingot := __ctx()[ctxIngot]
+	h := rt_region_alloc(ingot, 32)
+	h[0] = n
+	h[1] = c
+	h[3] = ingot
+	if c > 0 {
+		h[2] = rt_region_alloc(ingot, c*esz+8)
+	}
+	return h
+}
+
+// rt_slice_make_str makes a []str of n "" elements (a str is never nil).
+func rt_slice_make_str(n i64, c i64) i64 {
+	h := rt_slice_make(n, c, 8)
+	e := cast(i64, "")
+	d := h[2]
+	for i := 0; i < n; i++ {
+		d[i] = e
+	}
+	return h
+}
+
+// rt_slice_make_nest makes a [][]T of n empty slices, each a header of its own.
+func rt_slice_make_nest(n i64, c i64, esz i64) i64 {
+	h := rt_slice_make(n, c, 8)
+	d := h[2]
+	for i := 0; i < n; i++ {
+		d[i] = rt_slice_make(0, 0, esz)
+	}
+	return h
+}
+
+// rt_slice_make_grid makes an [n][m]T: n rows of m zero elements ("" for strs).
+func rt_slice_make_grid(n i64, m i64, esz i64, isstr i64) i64 {
+	h := rt_slice_make(n, n, 8)
+	d := h[2]
+	for i := 0; i < n; i++ {
+		if isstr != 0 {
+			d[i] = rt_slice_make_str(m, m)
+		} else {
+			d[i] = rt_slice_make(m, m, esz)
+		}
+	}
+	return h
+}
+
+// rt_slice_grow gives s room for need elements, in the region s lives in.
+func rt_slice_grow(s i64, need i64, esz i64) {
+	c := s[1] * 2
+	if c < 8 {
+		c = 8
+	}
+	for c < need {
+		c *= 2
+	}
+	d := rt_region_alloc(s[3], c*esz+8)
+	if s[0] > 0 {
+		memcpy(d, s[2], s[0]*esz)
+	}
+	s[2] = d
+	s[1] = c
+}
+
+// rt_own returns a header append may change: the shared empty header (cap 0) is copied.
+func rt_own(s i64, esz i64) i64 {
+	if s == cast(i64, __empty()) {
+		return rt_slice_make(0, 0, esz)
+	}
+	return s
+}
+
+func rt_store_elem(p i64, v i64, esz i64) {
+	if esz == 8 {
+		p[0] = v
+	} else if esz == 1 {
+		store8(p, v)
+	} else if esz == 4 {
+		__st(p, v, 2)
+	} else {
+		__st(p, v, 1)
+	}
+}
+
+func rt_append(s i64, v i64, esz i64) i64 {
+	s = rt_own(s, esz)
+	n := s[0]
+	if n >= s[1] {
+		rt_slice_grow(s, n+1, esz)
+	}
+	rt_store_elem(s[2]+n*esz, v, esz)
+	s[0] = n + 1
+	return s
+}
+
+func rt_slice_appendn(s i64, t i64, esz i64) i64 {
+	if t[0] == 0 {
+		return s
+	}
+	s = rt_own(s, esz)
+	n := s[0]
+	need := n + t[0]
+	if need > s[1] {
+		rt_slice_grow(s, need, esz)
+	}
+	memmove(s[2]+n*esz, t[2], t[0]*esz)
+	s[0] = need
+	return s
+}
+
+func rt_append_str(s i64, txt str) i64 {
+	m := len(txt)
+	if m == 0 {
+		return s
+	}
+	s = rt_own(s, 1)
+	n := s[0]
+	if n+m > s[1] {
+		rt_slice_grow(s, n+m, 1)
+	}
+	memcpy(s[2]+n, cast(i64, txt)+8, m)
+	s[0] = n + m
+	return s
+}
+
+func rt_slice_sub(s i64, lo i64, hi i64, esz i64) i64 {
+	if hi < 0 {
+		hi = s[0]
+	}
+	if lo < 0 || hi > s[0] || lo > hi {
+		rt_panic("slice bounds out of range")
+	}
+	h := rt_alloc(32)
+	h[0] = hi - lo
+	h[1] = s[1] - lo
+	h[2] = s[2] + lo*esz
+	h[3] = s[3]
+	return h
+}
+
+func rt_slice_copy(dst i64, src i64, esz i64) i64 {
+	n := dst[0]
+	if src[0] < n {
+		n = src[0]
+	}
+	memmove(dst[2], src[2], n*esz)
+	return n
+}
+
+func rt_copy_str(dst i64, s str) i64 {
+	n := dst[0]
+	if len(s) < n {
+		n = len(s)
+	}
+	memmove(dst[2], cast(i64, s)+8, n)
+	return n
+}
+
+// ---- maps ----
+//
+// Open addressing with linear probing and Fibonacci hashing. Header words: count, cap,
+// keys, values, control bytes (0 empty, 1 full, 2 deleted), str keys?, shift,
+// tombstones, cached str hashes.
+
+func rt_map_make(isstr i64) i64 {
+	ingot := __ctx()[ctxIngot]
+	m := rt_region_alloc(ingot, 80)
+	m[5] = isstr
+	m[9] = ingot
+	rt_map_init(m, 8)
+	return m
+}
+
+func rt_map_init(m i64, c i64) {
+	m[1] = c
+	m[2] = rt_region_alloc(m[9], c*8)
+	m[3] = rt_region_alloc(m[9], c*8)
+	m[4] = rt_region_alloc(m[9], c)
+	shift := 64
+	for x := c; x > 1; x >>= 1 {
+		shift--
+	}
+	m[6] = shift
+	m[7] = 0
+	if m[5] != 0 {
+		m[8] = rt_region_alloc(m[9], c*8)
+	}
+}
+
+func rt_hash_str(s str) i64 {
+	n := len(s)
+	p := cast(i64, s) + 8
+	h := n*0x9E3779B97F4A7C15 + 0x2545F4914F6CDD1D
+	i := 0
+	for i+8 <= n {
+		w := (p + i)[0]
+		h = (h ^ w) * 0xbf58476d1ce4e5b9
+		h ^= lsr(h, 31)
+		i += 8
+	}
+	w := 0
+	shift := 0
+	for i < n {
+		w |= i64(load8(p+i)) << shift
+		shift += 8
+		i++
+	}
+	h = (h ^ w) * 0x94d049bb133111eb
+	h ^= lsr(h, 29)
+	return h
+}
+
+// rt_map_find returns the slot holding key k, or -1.
+func rt_map_find(m i64, k i64) i64 {
+	mask := m[1] - 1
+	ctrl := m[4]
+	keys := m[2]
+	if m[5] != 0 {
+		h := rt_hash_str(cast(str, k))
+		hashes := m[8]
+		i := lsr(h, m[6])
+		for {
+			c := load8(ctrl + i)
+			if c == 0 {
+				return -1
+			}
+			if c == 1 && hashes[i] == h && rt_str_eq(cast(str, keys[i]), cast(str, k)) {
+				return i
+			}
+			i = (i + 1) & mask
+		}
+	}
+	i := lsr(k*0x9E3779B97F4A7C15, m[6])
+	for {
+		c := load8(ctrl + i)
+		if c == 0 {
+			return -1
+		}
+		if c == 1 && keys[i] == k {
+			return i
+		}
+		i = (i + 1) & mask
+	}
+}
+
+func rt_map_get(m i64, k i64) i64 {
+	c := __ctx()
+	if m == 0 {
+		c[ctxFound] = 0
+		return 0
+	}
+	i := rt_map_find(m, k)
+	if i < 0 {
+		c[ctxFound] = 0
+		return 0
+	}
+	c[ctxFound] = 1
+	return m[3][i]
+}
+
+func rt_map_found() bool {
+	return __ctx()[ctxFound] != 0
+}
+
+func rt_map_grow(m i64) {
+	oc := m[1]
+	okeys := m[2]
+	ovals := m[3]
+	octrl := m[4]
+	nc := oc
+	if (m[0]+1)*2 > oc {
+		nc = oc * 2
+	}
+	ohashes := m[8]
+	rt_map_init(m, nc)
+	m[0] = 0
+	for i := 0; i < oc; i++ {
+		if load8(octrl+i) == 1 {
+			rt_map_insert(m, okeys[i], ovals[i])
+		}
+	}
+	// Map tables are never shared, so a long-lived map frees the old one.
+	if m[9] != 0 {
+		rt_ingot_free(okeys)
+		rt_ingot_free(ovals)
+		rt_ingot_free(octrl)
+		rt_ingot_free(ohashes)
+	}
+}
+
+// rt_map_insert stores k, v, assuming the table has room and k is absent or present.
+func rt_map_insert(m i64, k i64, v i64) {
+	mask := m[1] - 1
+	ctrl := m[4]
+	keys := m[2]
+	h := 0
+	i := 0
+	if m[5] != 0 {
+		h = rt_hash_str(cast(str, k))
+		i = lsr(h, m[6])
+	} else {
+		i = lsr(k*0x9E3779B97F4A7C15, m[6])
+	}
+	free := -1
+	for {
+		c := load8(ctrl + i)
+		if c == 0 {
+			break
+		}
+		if c == 2 {
+			if free < 0 {
+				free = i
+			}
+		} else if m[5] != 0 {
+			if m[8][i] == h && rt_str_eq(cast(str, keys[i]), cast(str, k)) {
+				m[3][i] = v
+				return
+			}
+		} else if keys[i] == k {
+			m[3][i] = v
+			return
+		}
+		i = (i + 1) & mask
+	}
+	if free >= 0 {
+		i = free
+		m[7]--
+	}
+	store8(ctrl+i, 1)
+	keys[i] = k
+	m[3][i] = v
+	if m[5] != 0 {
+		m[8][i] = h
+	}
+	m[0]++
+}
+
+func rt_map_set(m i64, k i64, v i64) {
+	if m == 0 {
+		rt_panic("assignment to entry in nil map")
+	}
+	if (m[0]+m[7]+1)*4 > m[1]*3 {
+		rt_map_grow(m)
+	}
+	rt_map_insert(m, k, v)
+}
+
+func rt_map_del(m i64, k i64) {
+	if m == 0 {
+		return
+	}
+	i := rt_map_find(m, k)
+	if i >= 0 {
+		store8(m[4]+i, 2)
+		m[0]--
+		m[7]++
+	}
+}
+
+func rt_map_slots(m i64) i64 {
+	if m == 0 {
+		return 0
+	}
+	return m[1]
+}
+
+func rt_map_live(m i64, i i64) bool {
+	return load8(m[4]+i) == 1
+}
+
+func rt_map_key(m i64, i i64) i64 {
+	return m[2][i]
+}
+
+func rt_map_val(m i64, i i64) i64 {
+	return m[3][i]
+}
+
+// ---- formatting ----
+//
+// fmt calls compile to begin, one typed call per argument, then end. A frame holds the
+// output bytes and, for Printf, the format and the verb the next argument gets.
+
+const fPrev = 0
+const fData = 1
+const fLen = 2
+const fCap = 3
+const fFormat = 4
+const fPos = 5
+const fMode = 6     // 0 Printf, 1 Print, 2 Println
+const fCount = 7
+const fWasStr = 8
+const fVerb = 9
+const fWidth = 10
+const fPrec = 11
+const fMinus = 12
+const fPlus = 13
+const fZero = 14
+const fSharp = 15
+const fNest = 16
+const fSpace = 17
+const fWords = 18
+
+func rt_frame() i64 {
+	return __ctx()[ctxFmt]
+}
+
+func rt_fmt_push(mode i64) i64 {
+	c := __ctx()
+	f := rt_alloc(fWords * 8)
+	f[fPrev] = c[ctxFmt]
+	f[fMode] = mode
+	f[fCap] = 64
+	f[fData] = rt_alloc(64)
+	c[ctxFmt] = f
+	return f
+}
+
+func rt_fmt_begin(format str) {
+	f := rt_fmt_push(0)
+	f[fFormat] = cast(i64, format)
+}
+
+func rt_fmt_begin_v(ln i64) {
+	rt_fmt_push(1 + ln)
+}
+
+func fb_reserve(f i64, n i64) {
+	if f[fLen]+n <= f[fCap] {
+		return
+	}
+	c := f[fCap] * 2
+	for c < f[fLen]+n {
+		c *= 2
+	}
+	d := rt_alloc(c)
+	memcpy(d, f[fData], f[fLen])
+	f[fData] = d
+	f[fCap] = c
+}
+
+func fb_byte(f i64, b i64) {
+	fb_reserve(f, 1)
+	store8(f[fData]+f[fLen], b)
+	f[fLen]++
+}
+
+func fb_raw(f i64, p i64, n i64) {
+	if n <= 0 {
+		return
+	}
+	fb_reserve(f, n)
+	memcpy(f[fData]+f[fLen], p, n)
+	f[fLen] += n
+}
+
+func fb_str(f i64, s str) {
+	fb_raw(f, cast(i64, s)+8, len(s))
+}
+
+func fb_pad(f i64, n i64, c i64) {
+	for n > 0 {
+		fb_byte(f, c)
+		n--
+	}
+}
+
+// fmt_pad writes n bytes at p padded to the current verb's width.
+func fmt_pad(f i64, p i64, n i64) {
+	w := f[fWidth]
+	if w <= n {
+		fb_raw(f, p, n)
+		return
+	}
+	if f[fMinus] != 0 {
+		fb_raw(f, p, n)
+		fb_pad(f, w-n, ' ')
+		return
+	}
+	if f[fZero] != 0 {
+		// Zero padding goes after the sign.
+		if n > 0 && (load8(p) == '-' || load8(p) == '+') {
+			fb_byte(f, i64(load8(p)))
+			fb_pad(f, w-n, '0')
+			fb_raw(f, p+1, n-1)
+			return
+		}
+		fb_pad(f, w-n, '0')
+		fb_raw(f, p, n)
+		return
+	}
+	fb_pad(f, w-n, ' ')
+	fb_raw(f, p, n)
+}
+
+// rt_fmt_next copies format text up to the next verb and parses it; 0 means none is left.
+func rt_fmt_next(f i64) i64 {
+	s := cast(str, f[fFormat])
+	n := len(s)
+	p := cast(i64, s) + 8
+	i := f[fPos]
+	for i < n {
+		c := i64(load8(p + i))
+		if c != '%' {
+			start := i
+			for i < n && load8(p+i) != '%' {
+				i++
+			}
+			fb_raw(f, p+start, i-start)
+			continue
+		}
+		if i+1 < n && load8(p+i+1) == '%' {
+			fb_byte(f, '%')
+			i += 2
+			continue
+		}
+		i++
+		f[fMinus] = 0
+		f[fPlus] = 0
+		f[fZero] = 0
+		f[fSharp] = 0
+		f[fSpace] = 0
+		for i < n {
+			c = i64(load8(p + i))
+			if c == '-' {
+				f[fMinus] = 1
+			} else if c == '+' {
+				f[fPlus] = 1
+			} else if c == '0' {
+				f[fZero] = 1
+			} else if c == '#' {
+				f[fSharp] = 1
+			} else if c == ' ' {
+				f[fSpace] = 1
+			} else {
+				break
+			}
+			i++
+		}
+		w := 0
+		for i < n && load8(p+i) >= '0' && load8(p+i) <= '9' {
+			w = w*10 + i64(load8(p+i)) - '0'
+			i++
+		}
+		f[fWidth] = w
+		f[fPrec] = -1
+		if i < n && load8(p+i) == '.' {
+			i++
+			pr := 0
+			for i < n && load8(p+i) >= '0' && load8(p+i) <= '9' {
+				pr = pr*10 + i64(load8(p+i)) - '0'
+				i++
+			}
+			f[fPrec] = pr
+		}
+		verb := 'v'
+		if i < n {
+			verb = i64(load8(p + i))
+			i++
+		}
+		f[fVerb] = verb
+		f[fPos] = i
+		return 1
+	}
+	f[fPos] = i
+	return 0
+}
+
+// rt_fmt_arg starts one argument: the separator for Print/Println, or the next verb
+// for Printf. It returns the verb to use.
+func rt_fmt_arg(f i64, isstr bool) i64 {
+	if f[fNest] != 0 {
+		f[fWidth] = 0
+		f[fPrec] = -1
+		return 'v'
+	}
+	if f[fMode] == 0 {
+		if rt_fmt_next(f) == 0 {
+			fb_str(f, "%!(EXTRA ")
+			f[fVerb] = 'v'
+			f[fWidth] = 0
+			f[fPrec] = -1
+		}
+		f[fCount]++
+		return f[fVerb]
+	}
+	if f[fCount] > 0 && (f[fMode] == 2 || (!isstr && f[fWasStr] == 0)) {
+		fb_byte(f, ' ')
+	}
+	f[fCount]++
+	if isstr {
+		f[fWasStr] = 1
+	} else {
+		f[fWasStr] = 0
+	}
+	f[fWidth] = 0
+	f[fPrec] = -1
+	f[fMinus] = 0
+	f[fZero] = 0
+	f[fPlus] = 0
+	return 'v'
+}
+
+func rt_fmt_close_extra(f i64) {
+	if f[fMode] == 0 && f[fCount] > 0 && rt_fmt_extra(f) {
+		fb_byte(f, ')')
+	}
+}
+
+func rt_fmt_extra(f i64) bool {
+	return false
+}
+
+// i64 formatting
+
+func fmt_uint_buf(buf i64, v i64, base i64, upper bool) i64 {
+	digits := "0123456789abcdef"
+	if upper {
+		digits = "0123456789ABCDEF"
+	}
+	dp := cast(i64, digits) + 8
+	i := 64
+	if v == 0 {
+		i--
+		store8(buf+i, '0')
+		return i
+	}
+	for v != 0 {
+		i--
+		d := 0
+		if base == 10 {
+			// Unsigned division by ten, valid for the full 64-bit range.
+			q := lsr(v, 1) / 5
+			d = v - q*10
+			v = q
+		} else {
+			d = v & (base - 1)
+			shift := 4
+			if base == 8 {
+				shift = 3
+			} else if base == 2 {
+				shift = 1
+			}
+			v = lsr(v, shift)
+		}
+		store8(buf+i, i64(load8(dp+d)))
+	}
+	return i
+}
+
+func fmt_int(f i64, v i64, verb i64) {
+	buf := rt_alloc(80)
+	if verb == 'c' {
+		n := rt_utf8_put(buf, v)
+		fmt_pad(f, buf, n)
+		return
+	}
+	if verb == 'q' {
+		store8(buf, '\'')
+		n := rt_utf8_put(buf+1, v)
+		store8(buf+1+n, '\'')
+		fmt_pad(f, buf, n+2)
+		return
+	}
+	if verb == 'U' {
+		store8(buf, 'U')
+		store8(buf+1, '+')
+		i := fmt_uint_buf(buf+8, v, 16, true)
+		n := 64 - i
+		for n < 4 {
+			i--
+			store8(buf+8+i, '0')
+			n++
+		}
+		memmove(buf+2, buf+8+i, n)
+		fmt_pad(f, buf, n+2)
+		return
+	}
+	base := 10
+	upper := false
+	if verb == 'x' {
+		base = 16
+	} else if verb == 'X' {
+		base = 16
+		upper = true
+	} else if verb == 'o' {
+		base = 8
+	} else if verb == 'b' {
+		base = 2
+	}
+	neg := v < 0 && base == 10
+	if neg {
+		v = -v
+	}
+	i := fmt_uint_buf(buf+16, v, base, upper)
+	if f[fPrec] >= 0 {
+		for 64-i < f[fPrec] {
+			i--
+			store8(buf+16+i, '0')
+		}
+	}
+	if f[fSharp] != 0 && base == 16 {
+		i--
+		store8(buf+16+i, 'x')
+		i--
+		store8(buf+16+i, '0')
+	}
+	if neg {
+		i--
+		store8(buf+16+i, '-')
+	} else if f[fPlus] != 0 {
+		i--
+		store8(buf+16+i, '+')
+	}
+	fmt_pad(f, buf+16+i, 64-i)
+}
+
+func rt_fmt_i(v i64) {
+	f := rt_frame()
+	fmt_int(f, v, rt_fmt_arg(f, false))
+}
+
+func rt_fmt_p(v i64) {
+	f := rt_frame()
+	rt_fmt_arg(f, false)
+	if v == 0 {
+		fb_str(f, "<nil>")
+		return
+	}
+	f[fSharp] = 1
+	fmt_int(f, v, 'x')
+}
+
+func rt_fmt_b(b bool) {
+	f := rt_frame()
+	rt_fmt_arg(f, false)
+	if b {
+		fmt_pad(f, cast(i64, "true")+8, 4)
+	} else {
+		fmt_pad(f, cast(i64, "false")+8, 5)
+	}
+}
+
+func fmt_quote(f i64, s str) {
+	fb_byte(f, '"')
+	n := len(s)
+	p := cast(i64, s) + 8
+	for i := 0; i < n; i++ {
+		c := i64(load8(p + i))
+		if c == '"' || c == '\\' {
+			fb_byte(f, '\\')
+			fb_byte(f, c)
+		} else if c == '\n' {
+			fb_str(f, "\\n")
+		} else if c == '\t' {
+			fb_str(f, "\\t")
+		} else if c == '\r' {
+			fb_str(f, "\\r")
+		} else if c < 32 || c == 127 {
+			fb_str(f, "\\x")
+			fb_byte(f, i64(load8(cast(i64, "0123456789abcdef")+8+(c>>4))))
+			fb_byte(f, i64(load8(cast(i64, "0123456789abcdef")+8+(c&15))))
+		} else {
+			fb_byte(f, c)
+		}
+	}
+	fb_byte(f, '"')
+}
+
+func fmt_string(f i64, s str, verb i64) {
+	if verb == 'q' {
+		fmt_quote(f, s)
+		return
+	}
+	if verb == 'x' || verb == 'X' {
+		digits := "0123456789abcdef"
+		if verb == 'X' {
+			digits = "0123456789ABCDEF"
+		}
+		for i := 0; i < len(s); i++ {
+			fb_byte(f, i64(digits[i64(s[i])>>4]))
+			fb_byte(f, i64(digits[i64(s[i])&15]))
+		}
+		return
+	}
+	n := len(s)
+	if f[fPrec] >= 0 && f[fPrec] < n {
+		n = f[fPrec]
+	}
+	fmt_pad(f, cast(i64, s)+8, n)
+}
+
+func rt_fmt_s(s str) {
+	f := rt_frame()
+	fmt_string(f, s, rt_fmt_arg(f, true))
+}
+
+func rt_fmt_e(e i64) {
+	f := rt_frame()
+	verb := rt_fmt_arg(f, false)
+	if e == 0 {
+		fb_str(f, "<nil>")
+		return
+	}
+	fmt_string(f, cast(str, e), verb)
+}
+
+func rt_fmt_raw(s str) {
+	fb_str(rt_frame(), s)
+}
+
+// rt_fmt_argsep starts a struct or map argument, whose parts are written raw.
+func rt_fmt_argsep() {
+	f := rt_frame()
+	rt_fmt_arg(f, false)
+	f[fNest]++
+}
+
+func rt_fmt_argend() {
+	rt_frame()[fNest]--
+}
+
+// f64 formatting, through snprintf and a shortest round-trip search for %v.
+
+func fmt_float_c(f i64, x f64, verb i64, prec i64) {
+	buf := rt_alloc(400)
+	cf := "%.*f"
+	if verb == 'e' {
+		cf = "%.*e"
+	} else if verb == 'E' {
+		cf = "%.*E"
+	} else if verb == 'g' {
+		cf = "%.*g"
+	} else if verb == 'G' {
+		cf = "%.*G"
+	}
+	n := snprintf(buf, 400, cast(i64, cf)+8, prec, x) & 0xffffffff
+	if f[fPlus] != 0 && load8(buf) != '-' {
+		memmove(buf+1, buf, n)
+		store8(buf, '+')
+		n++
+	}
+	fmt_pad(f, buf, n)
+}
+
+// fmt_shortest writes x with the fewest digits that read back exactly, laid out the way
+// Go's %v does: exponent form when the exponent is below -4 or at least 21.
+shared var fast_exp i64
+var fmtScratch i64   // per core: digit buffers for float formatting (no allocation per number)
+
+func fmt_scratch() i64 {
+	if fmtScratch == 0 {
+		fmtScratch = rt_ingot_alloc(128)
+	}
+	return fmtScratch
+}
+
+// short_digits finds the shortest decimal of x the quick way: the fewest decimals k with
+// rint(|x| * 10^k) / 10^k == |x| (exact: both operands are integers below 2^53 or powers
+// of ten, and IEEE division rounds correctly). It writes the digits and sets fast_exp,
+// or returns 0 when x is out of its range (the slow path then decides).
+func short_digits(x f64, digits i64) i64 {
+	ax := x
+	if ax < 0 {
+		ax = -ax
+	}
+	if !(ax >= 1e-7 && ax < 1e15) {
+		return 0
+	}
+	p := 1.0
+	for k := 0; k <= 22; k++ {
+		m := rint(ax * p)
+		if m >= 9007199254740992.0 {
+			return 0
+		}
+		if m/p == ax && m >= 1 {
+			mi := i64(m)
+			tmp := fmt_scratch() + 96
+			n := 0
+			for mi > 0 {
+				store8(tmp+n, '0'+mi%10)
+				mi /= 10
+				n++
+			}
+			for i := 0; i < n; i++ {
+				store8(digits+i, i64(load8(tmp+n-1-i)))
+			}
+			nd := n
+			for nd > 1 && load8(digits+nd-1) == '0' {
+				nd--
+			}
+			fast_exp = n - 1 - k
+			return nd
+		}
+		p *= 10
+	}
+	return 0
+}
+
+// shortest_into writes the shortest decimal that reads back as x into out (400 bytes):
+// exponent form when the exponent is below lo or at least hi; json drops the exponent's
+// zero padding (1e-7, not 1e-07). It returns the length.
+func shortest_into(out i64, x f64, lo i64, hi i64, json bool, plus bool) i64 {
+	if x != x {
+		memcpy(out, cast(i64, "NaN")+8, 3)
+		return 3
+	}
+	if x > 1.7976931348623157e308 || x < -1.7976931348623157e308 {
+		if x > 0 {
+			memcpy(out, cast(i64, "+Inf")+8, 4)
+		} else {
+			memcpy(out, cast(i64, "-Inf")+8, 4)
+		}
+		return 4
+	}
+	scratch := fmt_scratch()
+	tmp := scratch
+	digits := scratch + 64
+	nd := 0
+	exp := 0
+	neg := cast(i64, x) < 0
+	if x != 0 {
+		nd = short_digits(x, digits)
+		if nd > 0 {
+			exp = fast_exp
+		}
+	}
+	if x == 0 {
+		store8(digits, '0')
+		nd = 1
+	} else if nd == 0 {
+		for p := 1; p <= 17; p++ {
+			snprintf(tmp, 64, cast(i64, "%.*e")+8, p-1, x)
+			if strtod(tmp, 0) == x || p == 17 {
+				// tmp is [-]d.ddde±XX
+				q := tmp
+				if load8(q) == '-' {
+					q++
+				}
+				nd = 0
+				for load8(q) != 'e' {
+					if load8(q) != '.' {
+						store8(digits+nd, i64(load8(q)))
+						nd++
+					}
+					q++
+				}
+				q++
+				sign := 1
+				if load8(q) == '-' {
+					sign = -1
+				}
+				q++
+				for load8(q) >= '0' && load8(q) <= '9' {
+					exp = exp*10 + i64(load8(q)) - '0'
+					q++
+				}
+				exp *= sign
+				break
+			}
+		}
+		for nd > 1 && load8(digits+nd-1) == '0' {
+			nd--
+		}
+	}
+	n := 0
+	if neg {
+		store8(out, '-')
+		n = 1
+	} else if plus {
+		store8(out, '+')
+		n = 1
+	}
+	if exp < lo || exp >= hi {
+		store8(out+n, i64(load8(digits)))
+		n++
+		if nd > 1 {
+			store8(out+n, '.')
+			n++
+			memcpy(out+n, digits+1, nd-1)
+			n += nd - 1
+		}
+		store8(out+n, 'e')
+		n++
+		e := exp
+		if e < 0 {
+			store8(out+n, '-')
+			e = -e
+		} else {
+			store8(out+n, '+')
+		}
+		n++
+		if e < 10 && !json {
+			store8(out+n, '0')
+			n++
+		}
+		if e >= 100 {
+			store8(out+n, '0'+e/100)
+			n++
+			e %= 100
+			store8(out+n, '0'+e/10)
+			n++
+		} else if e >= 10 {
+			store8(out+n, '0'+e/10)
+			n++
+		}
+		store8(out+n, '0'+e%10)
+		n++
+	} else if exp >= 0 {
+		for i := 0; i <= exp; i++ {
+			if i < nd {
+				store8(out+n, i64(load8(digits+i)))
+			} else {
+				store8(out+n, '0')
+			}
+			n++
+		}
+		if nd > exp+1 {
+			store8(out+n, '.')
+			n++
+			memcpy(out+n, digits+exp+1, nd-exp-1)
+			n += nd - exp - 1
+		}
+	} else {
+		store8(out+n, '0')
+		store8(out+n+1, '.')
+		n += 2
+		for i := 0; i < -exp-1; i++ {
+			store8(out+n, '0')
+			n++
+		}
+		memcpy(out+n, digits, nd)
+		n += nd
+	}
+	return n
+}
+
+func fmt_shortest(f i64, x f64, lo i64, hi i64) {
+	out := rt_alloc(400)
+	n := shortest_into(out, x, lo, hi, false, f[fPlus] != 0)
+	fmt_pad(f, out, n)
+}
+
+// rt_float_json is x as encoding/json writes it (exponent below 1e-6 or from 1e21).
+func rt_float_json(x f64) str {
+	out := rt_alloc(400)
+	n := shortest_into(out, x, -6, 21, true, false)
+	return rt_str_from_raw(out, n)
+}
+
+func fmt_float(f i64, x f64, verb i64) {
+	if verb == 'v' || ((verb == 'g' || verb == 'G') && f[fPrec] < 0) {
+		fmt_shortest(f, x, -4, 6)
+		return
+	}
+	prec := f[fPrec]
+	if prec < 0 {
+		prec = 6
+	}
+	if verb != 'f' && verb != 'F' && verb != 'e' && verb != 'E' && verb != 'g' && verb != 'G' {
+		verb = 'g'
+	}
+	fmt_float_c(f, x, verb, prec)
+}
+
+func rt_fmt_f(x f64) {
+	f := rt_frame()
+	fmt_float(f, x, rt_fmt_arg(f, false))
+}
+
+// slices print as [a b c]
+
+func rt_fmt_sli(s []i64) {
+	f := rt_frame()
+	verb := rt_fmt_arg(f, false)
+	fb_byte(f, '[')
+	for i, v := range s {
+		if i > 0 {
+			fb_byte(f, ' ')
+		}
+		fmt_int(f, v, verb)
+	}
+	fb_byte(f, ']')
+}
+
+func rt_fmt_slb(s []u8) {
+	f := rt_frame()
+	verb := rt_fmt_arg(f, false)
+	if verb == 's' || verb == 'q' || verb == 'x' {
+		fmt_string(f, rt_str_from_bytes(s), verb)
+		return
+	}
+	fb_byte(f, '[')
+	for i, v := range s {
+		if i > 0 {
+			fb_byte(f, ' ')
+		}
+		fmt_int(f, i64(v), verb)
+	}
+	fb_byte(f, ']')
+}
+
+func rt_fmt_sls(s []str) {
+	f := rt_frame()
+	verb := rt_fmt_arg(f, false)
+	fb_byte(f, '[')
+	for i, v := range s {
+		if i > 0 {
+			fb_byte(f, ' ')
+		}
+		fmt_string(f, v, verb)
+	}
+	fb_byte(f, ']')
+}
+
+func rt_fmt_slf(s []f64) {
+	f := rt_frame()
+	verb := rt_fmt_arg(f, false)
+	fb_byte(f, '[')
+	for i, v := range s {
+		if i > 0 {
+			fb_byte(f, ' ')
+		}
+		fmt_float(f, v, verb)
+	}
+	fb_byte(f, ']')
+}
+
+func rt_fmt_slt(s []bool) {
+	f := rt_frame()
+	rt_fmt_arg(f, false)
+	fb_byte(f, '[')
+	for i, v := range s {
+		if i > 0 {
+			fb_byte(f, ' ')
+		}
+		if v {
+			fb_str(f, "true")
+		} else {
+			fb_str(f, "false")
+		}
+	}
+	fb_byte(f, ']')
+}
+
+// maps print as map[k:v ...] with keys sorted, like Go.
+func rt_fmt_map(m i64, strkeys i64, vkind i64) {
+	f := rt_frame()
+	verb := rt_fmt_arg(f, false)
+	fb_str(f, "map[")
+	n := 0
+	if m != 0 {
+		n = m[0]
+	}
+	order := rt_alloc(8*n + 8)
+	k := 0
+	for i := 0; i < rt_map_slots(m); i++ {
+		if rt_map_live(m, i) {
+			order[k] = i
+			k++
+		}
+	}
+	// Insertion sort of slot indexes by key: printing maps is not a hot path.
+	for i := 1; i < n; i++ {
+		x := order[i]
+		j := i - 1
+		for j >= 0 && rt_key_less(m, strkeys, x, order[j]) {
+			order[j+1] = order[j]
+			j--
+		}
+		order[j+1] = x
+	}
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			fb_byte(f, ' ')
+		}
+		slot := order[i]
+		if strkeys != 0 {
+			fmt_string(f, cast(str, rt_map_key(m, slot)), verb)
+		} else {
+			fmt_int(f, rt_map_key(m, slot), verb)
+		}
+		fb_byte(f, ':')
+		v := rt_map_val(m, slot)
+		if vkind == 1 {
+			fmt_string(f, cast(str, v), verb)
+		} else if vkind == 2 {
+			fmt_float(f, cast(f64, v), verb)
+		} else if vkind == 3 {
+			if v != 0 {
+				fb_str(f, "true")
+			} else {
+				fb_str(f, "false")
+			}
+		} else {
+			fmt_int(f, v, verb)
+		}
+	}
+	fb_byte(f, ']')
+}
+
+func rt_key_less(m i64, strkeys i64, a i64, b i64) bool {
+	ka := rt_map_key(m, a)
+	kb := rt_map_key(m, b)
+	if strkeys != 0 {
+		return rt_str_cmp(cast(str, ka), cast(str, kb)) < 0
+	}
+	return ka < kb
+}
+
+// rt_fmt_finish completes the frame (rest of the format, or the newline) and pops it.
+func rt_fmt_finish() i64 {
+	c := __ctx()
+	f := c[ctxFmt]
+	if f[fMode] == 0 {
+		for rt_fmt_next(f) != 0 {
+			fb_str(f, "%!")
+			fb_byte(f, f[fVerb])
+			fb_str(f, "(MISSING)")
+		}
+	} else if f[fMode] == 2 {
+		fb_byte(f, '\n')
+	}
+	c[ctxFmt] = f[fPrev]
+	return f
+}
+
+func rt_fmt_end() str {
+	f := rt_fmt_finish()
+	return rt_str_from_raw(f[fData], f[fLen])
+}
+
+func rt_fmt_out() {
+	f := rt_fmt_finish()
+	rt_out(f[fData], f[fLen])
+}
+
+func rt_fmt_err() i64 {
+	f := rt_fmt_finish()
+	s := rt_str_new(f[fLen])
+	memcpy(s+8, f[fData], f[fLen])
+	return s
+}
+
+// ---- keep: copies into the long-lived ingot heap ----
+
+func rt_keep_str(s str) str {
+	n := len(s)
+	if n == 0 {
+		return ""
+	}
+	p := rt_ingot_alloc(n + 9)
+	p[0] = n
+	memcpy(p+8, cast(i64, s)+8, n)
+	return cast(str, p)
+}
+
+func rt_keep_raw(p i64, n i64) i64 {
+	q := rt_ingot_alloc(n)
+	memcpy(q, p, n)
+	return q
+}
+
+func rt_keep_slice(s i64, esz i64) i64 {
+	n := s[0]
+	h := rt_ingot_alloc(32)
+	h[0] = n
+	h[1] = n
+	h[3] = 1
+	if n > 0 {
+		h[2] = rt_ingot_alloc(n*esz + 8)
+		memcpy(h[2], s[2], n*esz)
+	}
+	return h
+}
+
+func rt_keep_map_new(m i64) i64 {
+	k := rt_ingot_alloc(80)
+	k[5] = m[5]
+	k[9] = 1
+	rt_map_init(k, 8)
+	return k
+}
+
+// ---- unsigned and sized-int formatting ----
+
+func rt_fmt_u(v i64) {
+	f := rt_frame()
+	verb := rt_fmt_arg(f, false)
+	if verb == 'd' || verb == 'v' {
+		buf := rt_alloc(80)
+		i := fmt_uint_buf(buf+16, v, 10, false)
+		fmt_pad(f, buf+16+i, 64-i)
+		return
+	}
+	fmt_int(f, v, verb)
+}
+
+func rt_fmt_slint(s i64, width i64, signed i64) {
+	f := rt_frame()
+	verb := rt_fmt_arg(f, false)
+	fb_byte(f, '[')
+	n := s[0]
+	d := s[2]
+	for i := i64(0); i < n; i++ {
+		if i > 0 {
+			fb_byte(f, ' ')
+		}
+		v := i64(0)
+		if width == 1 {
+			v = i64(load8(d + i))
+		} else if width == 8 {
+			v = d[i]
+		} else if width == 2 {
+			v = __ld(d+i*2, 1)
+		} else {
+			v = __ld(d+i*4, 2)
+		}
+		if signed != 0 && width < 8 {
+			shift := 64 - 8*width
+			v = (v << shift) >> shift
+		}
+		if signed == 0 && (verb == 'v' || verb == 'd') {
+			buf := rt_alloc(80)
+			j := fmt_uint_buf(buf+16, v, 10, false)
+			fb_raw(f, buf+16+j, 64-j)
+		} else {
+			fmt_int(f, v, verb)
+		}
+	}
+	fb_byte(f, ']')
+}
+
+func width_log(w i64) i64 {
+	if w == 2 {
+		return 1
+	}
+	if w == 4 {
+		return 2
+	}
+	return 3
+}
+
+func rt_fmt_slp(s i64) {
+	f := rt_frame()
+	rt_fmt_arg(f, false)
+	fb_byte(f, '[')
+	n := s[0]
+	d := s[2]
+	for i := i64(0); i < n; i++ {
+		if i > 0 {
+			fb_byte(f, ' ')
+		}
+		f[fSharp] = 1
+		fmt_int(f, d[i], 'x')
+	}
+	fb_byte(f, ']')
+}

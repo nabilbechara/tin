@@ -1,0 +1,79 @@
+# examples/k8s/deployment.yaml: the anvil API server (examples/api.tin) on Kubernetes.
+#   docker build -f examples/k8s/Dockerfile -t tin-api:dev .      # then push, or `kind load docker-image tin-api:dev`
+#   kubectl apply -f examples/k8s/deployment.yaml
+#
+# What the server does with these settings (lib/hearth.tin, lib/anvil.tin):
+#   - hearth.Cores() = min(online CPUs, cpuset, ceil(cpu limit)) -> 2 cores here; TIN_CORES overrides.
+#   - the memory limit shrinks the per-core request pools when they would exceed a quarter of it.
+#   - SIGTERM: every core closes its listener, finishes in-flight requests (answering with
+#     Connection: close) and the process exits 0 once no connection is left or after TIN_GRACE s.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tin-api
+  labels:
+    app: tin-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: tin-api
+  template:
+    metadata:
+      labels:
+        app: tin-api
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: api
+          image: tin-api:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: TIN_GRACE
+              value: "25"
+          resources:
+            requests:
+              cpu: 500m
+              memory: 64Mi
+            limits:
+              cpu: "2"
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 10
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              # Endpoint removal is asynchronous: keep accepting for a moment so the Service
+              # stops routing new connections here before SIGTERM closes the listener.
+              exec:
+                command: ["/bin/sleep", "3"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tin-api
+spec:
+  selector:
+    app: tin-api
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
