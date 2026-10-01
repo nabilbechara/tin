@@ -9,7 +9,7 @@ PREFIX ?= /opt/homebrew
 HOST_OS := $(shell uname -s | tr A-Z a-z)
 SEED := seed/tinc-$(HOST_OS)-$(shell uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
 # Sources of a compiler for the other OS (cross builds).
-SELF_LINUX = $(filter-out selfhost/host_darwin.tin,$(SELF)) selfhost/host_linux.tin
+SELF_LINUX = $(filter-out selfhost/host_darwin.tin selfhost/host_linux.tin,$(SELF)) selfhost/host_linux.tin
 
 all: bin/tinc
 
