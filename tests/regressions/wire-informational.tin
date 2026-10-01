@@ -1,0 +1,108 @@
+package main
+
+import "hearth"
+import "mint"
+import "relay"
+import "say"
+import "tide"
+import "wire"
+
+// script is the response for path, as parts written 20 ms apart so they arrive in separate reads.
+func script(path str) []str {
+	cont := "HTTP/1.1 100 Continue\r\n\r\n"
+	final := "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+	if path == "/coalesced" {
+		return []str{cont + final}
+	}
+	if path == "/split" {
+		return []str{"HTTP/1.1 100 Cont", "inue\r\n\r\n", "HTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\n\r\n", "HTTP/1.1 200 OK\r\nX-Final: yes\r\nContent-Length: 5\r\n\r\nfinal"}
+	}
+	if path == "/early-chunked" {
+		return []str{"HTTP/1.1 103 Early Hints\r\nLink: </a.css>\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n"}
+	}
+	if path == "/five" {
+		return []str{cont + cont + cont + cont, cont + final}
+	}
+	if path == "/six" {
+		return []str{cont + cont + cont + cont + cont + cont + final}
+	}
+	if path == "/only-continue" {
+		return []str{cont}
+	}
+	if path == "/switch" {
+		return []str{"HTTP/1.1 101 Switching Protocols\r\nUpgrade: x\r\nConnection: upgrade\r\n\r\n"}
+	}
+	return []str{"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nbye"}
+}
+
+// serve answers each request with its script until it sees /stop.
+func serve(l wire.Listener) fault {
+	for {
+		c := try l.Accept()
+		req := make([]u8, 0, 1024)
+		for {
+			_, err := c.Read(req, 1024)
+			if err != nil {
+				return err
+			}
+			s := str(req)
+			if len(s) >= 4 && s[len(s)-4:] == "\r\n\r\n" {
+				break
+			}
+		}
+		s := str(req)
+		sp := 4
+		for sp < len(s) && s[sp] != ' ' {
+			sp++
+		}
+		path := s[4:sp]
+		parts := script(path)
+		for i, part := range parts {
+			if i > 0 {
+				tide.Sleep(20000000)
+			}
+			if c.Write(part) != nil {
+				break
+			}
+		}
+		c.Close()
+		if path == "/stop" {
+			return nil
+		}
+	}
+}
+
+func show(err fault) str {
+	if err == nil {
+		return "nil"
+	}
+	return say.Str(err)
+}
+
+func worker(id i64) {
+	if id == 1 {
+		l, err := wire.Listen("127.0.0.1:0")
+		if err != nil {
+			say.Line("listen", err)
+			return
+		}
+		relay.Send(0, mint.Itoa(l.Port()))
+		e2 := serve(l)
+		if e2 != nil {
+			say.Line("serve error", e2)
+		}
+		l.Close()
+		return
+	}
+	_, port := relay.Recv()
+	base := "http://127.0.0.1:" + port
+	paths := []str{"/coalesced", "/split", "/early-chunked", "/five", "/six", "/only-continue", "/switch", "/stop"}
+	for _, p := range paths {
+		r, err := wire.Get(base + p)
+		say.Line(p, r.Status, say.Fmt("%q", r.Body), say.Fmt("%q", r.Header("X-Final")), say.Fmt("%q", r.Header("Link")), show(err))
+	}
+}
+
+func main() {
+	hearth.Run(2, worker)
+}

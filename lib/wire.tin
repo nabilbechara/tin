@@ -462,79 +462,103 @@ func find_crlf2(b []u8) i64 {
 	return -1
 }
 
-func read_response(c Conn, head bool) (Resp, fault) {
-	buf := make([]u8, 0, 4096)
-	hend := -1
+// read_head reads until buf holds a complete header block and returns its length.
+func read_head(c Conn, buf mut []u8) (i64, fault) {
+	hend := find_crlf2(buf)
 	for hend < 0 {
+		if len(buf) > 1048576 {
+			return 0, fail("wire: response headers too large")
+		}
 		_, err := c.Read(buf, 4096)
 		if err != nil {
 			if IsEOF(err) {
-				return none_resp(), fail("wire: connection closed before the response headers")
+				return 0, fail("wire: connection closed before the response headers")
 			}
-			return none_resp(), err
+			return 0, err
 		}
 		hend = find_crlf2(buf)
-		if hend < 0 && len(buf) > 1048576 {
-			return none_resp(), fail("wire: response headers too large")
+	}
+	return hend, nil
+}
+
+// maxInformational bounds the 1xx responses accepted before the final one (as Go does).
+const maxInformational = 5
+
+func read_response(c Conn, head bool) (Resp, fault) {
+	buf := make([]u8, 0, 4096)
+	informational := 0
+	for {
+		hend := try read_head(c, buf)
+		h := str(buf[:hend])
+		if len(h) < 12 || h[:5] != "HTTP/" {
+			return none_resp(), fail("wire: malformed response")
 		}
-	}
-	h := str(buf[:hend])
-	if len(h) < 12 || h[:5] != "HTTP/" {
-		return none_resp(), fail("wire: malformed response")
-	}
-	status := 0
-	for i := 9; i < 12; i++ {
-		d := h[i]
-		if d < '0' || d > '9' {
-			return none_resp(), fail("wire: malformed status line")
-		}
-		status = status*10 + i64(d-'0')
-	}
-	r := Resp{Status: status, Body: "", head: h}
-	rest := buf[hend:]
-	if head || status == 204 || status == 304 || (status >= 100 && status < 200) {
-		return r, nil
-	}
-	te := r.Header("Transfer-Encoding")
-	if te == "chunked" {
-		b := try read_chunked(c, rest)
-		r.Body = b
-		return r, nil
-	}
-	cl := r.Header("Content-Length")
-	if cl != "" {
-		n := 0
-		for i := 0; i < len(cl); i++ {
-			d := cl[i]
+		status := 0
+		for i := 9; i < 12; i++ {
+			d := h[i]
 			if d < '0' || d > '9' {
-				return none_resp(), fail("wire: bad Content-Length")
+				return none_resp(), fail("wire: malformed status line")
 			}
-			n = n*10 + i64(d-'0')
+			status = status*10 + i64(d-'0')
 		}
-		body := make([]u8, 0, n)
-		body = append(body, rest...)
-		for len(body) < n {
-			_, err := c.Read(body, n-len(body))
+		r := Resp{Status: status, Body: "", head: h}
+		rest := buf[hend:]
+		// A 1xx other than 101 precedes the final response: drop it and keep the bytes after it.
+		if status >= 100 && status < 200 && status != 101 {
+			informational++
+			if informational > maxInformational {
+				return none_resp(), fail("wire: too many informational responses")
+			}
+			next := make([]u8, 0, len(rest)+4096)
+			next = append(next, rest...)
+			buf = next
+			continue
+		}
+		// wire never asks for an upgrade, so a 101 is returned as the final response without a body.
+		if head || status == 204 || status == 304 || status == 101 {
+			return r, nil
+		}
+		te := r.Header("Transfer-Encoding")
+		if te == "chunked" {
+			b := try read_chunked(c, rest)
+			r.Body = b
+			return r, nil
+		}
+		cl := r.Header("Content-Length")
+		if cl != "" {
+			n := 0
+			for i := 0; i < len(cl); i++ {
+				d := cl[i]
+				if d < '0' || d > '9' {
+					return none_resp(), fail("wire: bad Content-Length")
+				}
+				n = n*10 + i64(d-'0')
+			}
+			body := make([]u8, 0, n)
+			body = append(body, rest...)
+			for len(body) < n {
+				_, err := c.Read(body, n-len(body))
+				if err != nil {
+					return none_resp(), err
+				}
+			}
+			r.Body = str(body[:n])
+			return r, nil
+		}
+		body2 := make([]u8, 0, 4096)
+		body2 = append(body2, rest...)
+		for {
+			_, err := c.Read(body2, 65536)
 			if err != nil {
+				if IsEOF(err) {
+					break
+				}
 				return none_resp(), err
 			}
 		}
-		r.Body = str(body[:n])
+		r.Body = str(body2)
 		return r, nil
 	}
-	body2 := make([]u8, 0, 4096)
-	body2 = append(body2, rest...)
-	for {
-		_, err := c.Read(body2, 65536)
-		if err != nil {
-			if IsEOF(err) {
-				break
-			}
-			return none_resp(), err
-		}
-	}
-	r.Body = str(body2)
-	return r, nil
 }
 
 // read_chunked decodes a chunked body; pending holds bytes already read.
