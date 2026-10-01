@@ -65,5 +65,80 @@ class MakefileTests(unittest.TestCase):
             self.assertTrue((home / '.local/bin/tin').is_symlink())
 
 
+# A stand-in for bin/tinc: logs its arguments one per line and writes an executable that prints its own.
+FAKE_TINC = r"""#!/bin/sh
+: > "$FAKE_TINC_LOG"
+for a do printf '%s\n' "$a" >> "$FAKE_TINC_LOG"; done
+out=
+while [ $# -gt 0 ]; do
+  case $1 in
+    -o) out=$2; shift 2 ;;
+    -target) shift 2 ;;
+    *) [ -f "$1" ] || { echo "cannot open $1" >&2; exit 1; }; shift ;;
+  esac
+done
+printf '#!/bin/sh\nfor a do printf "%%s\\n" "$a"; done\n' > "$out"
+chmod +x "$out"
+"""
+
+
+class TinCommandTests(unittest.TestCase):
+    # Issue #9: run and build split file names on spaces and expanded wildcards.
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.base = Path(self.directory.name)
+        self.root = self.base / 'root'
+        (self.root / 'bin').mkdir(parents=True)
+        shutil.copy2(ROOT / 'tin', self.root / 'tin')
+        tinc = self.root / 'bin/tinc'
+        tinc.write_text(FAKE_TINC)
+        tinc.chmod(0o755)
+        self.work = self.base / 'work'
+        self.work.mkdir()
+        for name in ('hello world.tin', 'b*.tin', 'bx.tin', 'c.tin'):
+            (self.work / name).write_text('package main\n')
+        self.log = self.base / 'argv.log'
+
+    def tearDown(self):
+        self.directory.cleanup()
+
+    def tin(self, *args):
+        env = make_env(FAKE_TINC_LOG=str(self.log), TMPDIR=str(self.base))
+        result = subprocess.run(['sh', str(self.root / 'tin'), *args], cwd=self.work,
+                                capture_output=True, text=True, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.splitlines()
+
+    def tinc_args(self):
+        return self.log.read_text().splitlines()
+
+    def test_run_keeps_files_and_program_arguments(self):
+        output = self.tin('run', 'hello world.tin', 'b*.tin', '--', 'a', 'b c', '*', '--', '')
+        self.assertEqual(output, ['a', 'b c', '*', '--', ''])
+        argv = self.tinc_args()
+        self.assertEqual(argv[0], '-o')
+        self.assertEqual(argv[2:], ['hello world.tin', 'b*.tin'])
+
+    def test_run_without_program_arguments(self):
+        self.assertEqual(self.tin('run', 'hello world.tin', 'c.tin'), [])
+        self.assertEqual(self.tinc_args()[2:], ['hello world.tin', 'c.tin'])
+
+    def test_build_keeps_files_options_and_output(self):
+        (self.work / 'out dir').mkdir()
+        self.tin('build', 'hello world.tin', '-o', 'out dir/prog', 'b*.tin', '--target', 'linux-arm64')
+        self.assertEqual(self.tinc_args(), ['-target', 'linux-arm64', '-o', 'out dir/prog', 'hello world.tin', 'b*.tin'])
+
+    def test_build_default_output_is_first_file(self):
+        (self.work / 'sub dir').mkdir()
+        (self.work / 'sub dir/my prog.tin').write_text('package main\n')
+        self.tin('build', 'sub dir/my prog.tin', 'c.tin')
+        self.assertEqual(self.tinc_args(), ['-o', 'my prog', 'sub dir/my prog.tin', 'c.tin'])
+        self.assertTrue((self.work / 'my prog').exists())
+
+    def test_single_file_form(self):
+        self.assertEqual(self.tin('hello world.tin', 'x y', '*'), ['x y', '*'])
+        self.assertEqual(self.tinc_args()[2:], ['hello world.tin'])
+
+
 if __name__ == '__main__':
     unittest.main()

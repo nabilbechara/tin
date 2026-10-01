@@ -29,12 +29,10 @@ legacy() {
 target=
 compile() { # out files...
   out=$1; shift
-  tflag=
-  [ -n "$target" ] && tflag="-target $target"
   if legacy "$@"; then
-    "$tinc" $tflag -o "$out" "$root/lib/std.tin" "$@"
+    "$tinc" ${target:+-target} ${target:+"$target"} -o "$out" "$root/lib/std.tin" "$@"
   else
-    "$tinc" $tflag -o "$out" "$@"
+    "$tinc" ${target:+-target} ${target:+"$target"} -o "$out" "$@"
   fi
 }
 
@@ -43,22 +41,28 @@ mkdir -p "$cache"
 
 case $1 in
   run)
-    shift; files=; while [ $# -gt 0 ] && [ "$1" != "--" ]; do files="$files $1"; shift; done
-    [ "$1" = "--" ] && shift
+    # files holds references like "${2}" to the positional arguments, so eval never splits or globs a name.
+    shift; files=; n=0
+    for a do [ "$a" = "--" ] && break; n=$((n + 1)); files="$files \"\${$n}\""; done
     exe=$cache/run.$$; trap 'rm -f "$exe"' EXIT
-    compile "$exe" $files
+    eval "compile \"\$exe\" $files"
+    shift $n; [ "$1" = "--" ] && shift
     "$exe" "$@" ;;
   build)
-    shift; out=; files=
-    while [ $# -gt 0 ]; do
-      case $1 in
-        -o) out=$2; shift 2 ;;
-        --target|-target) target=$2; shift 2 ;;
-        *) files="$files $1"; shift ;;
+    shift; out=; files=; first=; i=0; skip=
+    for a do
+      i=$((i + 1))
+      case $skip in o) out=$a; skip=; continue ;; t) target=$a; skip=; continue ;; esac
+      case $a in
+        -o) skip=o ;;
+        --target|-target) skip=t ;;
+        *) files="$files \"\${$i}\""; [ -n "$first" ] || first=$a ;;
       esac
     done
-    [ -n "$out" ] || { set -- $files; out=$(basename "$1" .tin); }
-    compile "$out" $files ;;
+    [ -z "$skip" ] || { echo "tin: build: missing value after the last option" >&2; exit 2; }
+    [ -n "$first" ] || { echo "tin: build: no files" >&2; exit 2; }
+    [ -n "$out" ] || out=$(basename "$first" .tin)
+    eval "compile \"\$out\" $files" ;;
   asm)
     shift
     if legacy "$@"; then "$tinc" -S "$root/lib/std.tin" "$@"; else "$tinc" -S "$@"; fi ;;
