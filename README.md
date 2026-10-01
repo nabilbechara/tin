@@ -32,7 +32,7 @@ type Message struct {
 func handle(q anvil.Req, w mut anvil.Out) {
 	if q.Path == "/json" {
 		w.Json()
-		argo.Put(w.Body, Message{message: "Hello, World!"})
+		argo.Put(mut w.Body, Message{message: "Hello, World!"})
 		return
 	}
 	w.Status(404)

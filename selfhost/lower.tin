@@ -95,6 +95,10 @@ fn chk_kind(e, want) {
         err_at(e[N_POS], "catch is only allowed on a whole statement, initializer, assignment or return value");
         return ty_int;
     }
+    if k == EX_MUTARG {
+        err_at(e[N_POS], "mut here does nothing: only an argument for a mut parameter takes mut");
+        return chk(e[MUTARG_X], want);
+    }
     err_at(e[N_POS], "unexpected expression");
     return ty_int;
 }
@@ -732,6 +736,61 @@ fn pkg_member(pkg, name) {
     return lookup_global(str_cat3(pkg, ".", name));
 }
 
+// is_private reports whether name is private to its package (not capitalized).
+fn is_private(name) {
+    let c = load8(name);
+    return (c >= 'a' && c <= 'z') || c == '_';
+}
+
+// foreign_type reports whether struct type t was declared in a package other than the one
+// being checked (its name is pkg.Name with pkg not the current package).
+fn foreign_type(t) {
+    let n = t[TY_NAME];
+    if !n {
+        return 0;
+    }
+    let i = 0;
+    while load8(n + i) != 0 && load8(n + i) != '.' && load8(n + i) != '[' {
+        i = i + 1;
+    }
+    if load8(n + i) != '.' {
+        return 0;
+    }
+    let j = 0;
+    while j < i {
+        if load8(ck_pkg + j) != load8(n + j) {
+            return 1;
+        }
+        j = j + 1;
+    }
+    return load8(ck_pkg + i) != 0;
+}
+
+// private_use reports (once) a private name of another package used here.
+fn private_use(pos, what, name, owner) {
+    if ck_legacy {
+        return;
+    }
+    let m = err_begin(pos);
+    buf_str(m, what);
+    buf_str(m, " ");
+    buf_str(m, name);
+    buf_str(m, " is private to ");
+    buf_str(m, owner);
+    buf_str(m, ": only capitalized names are exported");
+    err_end(m);
+}
+
+// type_pkg is the package part of struct type t's name (for messages).
+fn type_pkg(t) {
+    let n = t[TY_NAME];
+    let i = 0;
+    while load8(n + i) != 0 && load8(n + i) != '.' {
+        i = i + 1;
+    }
+    return str_slice(n, i);
+}
+
 fn chk_select(e, want) {
     let pos = e[N_POS];
     let x = e[SEL_X];
@@ -748,6 +807,9 @@ fn chk_select(e, want) {
                 buf_str(u, name);
                 err_end(u);
                 return ty_int;
+            }
+            if is_private(name) {
+                private_use(pos, "name", name, pkg);
             }
             replace_node(e, node_new(EX_IDENT, pos));
             e[ID_NAME] = name;
@@ -768,6 +830,9 @@ fn chk_select(e, want) {
             buf_str(u, name);
             err_end(u);
             return ty_int;
+        }
+        if is_private(name) && foreign_type(xt) {
+            private_use(pos, "field", name, type_pkg(xt));
         }
         replace_node(e, mk_mem(pos, x, 0, 0, field_offset(xt, i), 0));
         return field_type(xt, i);
@@ -843,6 +908,9 @@ fn chk_composite(e, want) {
                 if fi < 0 {
                     err_quoted(key[N_POS], "unknown field ", key[ID_NAME], "");
                     return t;
+                }
+                if is_private(key[ID_NAME]) && foreign_type(t) {
+                    private_use(key[N_POS], "field", key[ID_NAME], type_pkg(t));
                 }
             } else if fi >= nf {
                 err_at(pos, "too many values in struct literal");
@@ -975,7 +1043,9 @@ fn chk_funclit(e) {
 
 // ---- calls ----
 
-fn chk_args(e, ptypes, variadic, legacy) {
+// mask has bit i set when parameter i is mut: its argument must be written `mut x`
+// (a method's receiver, argument 0 of a CALL_METHOD call, is exempt).
+fn chk_args(e, ptypes, variadic, legacy, mask) {
     let args = e[CALL_ARGS];
     let n = ptypes[VEC_LEN];
     if args[VEC_LEN] != n && !(variadic && args[VEC_LEN] >= n) {
@@ -994,6 +1064,15 @@ fn chk_args(e, ptypes, variadic, legacy) {
     let i = 0;
     while i < args[VEC_LEN] {
         let a = vec_get(args, i);
+        let marked = unwrap_mut(a);
+        if !legacy && !ck_legacy && !(i == 0 && e[CALL_METHOD]) {
+            let pm = i < n && i < 63 && (mask & (1 << i)) != 0;
+            if pm && !marked {
+                mut_arg_error(e, a, i, "is a mut parameter: write mut before the argument");
+            } else if marked && !pm {
+                mut_arg_error(e, a, i, "is not a mut parameter: remove mut");
+            }
+        }
         let want = 0;
         if i < n {
             want = vec_get(ptypes, i);
@@ -1012,6 +1091,34 @@ fn chk_args(e, ptypes, variadic, legacy) {
         }
         i = i + 1;
     }
+}
+
+// unwrap_mut turns `mut x` back into x and reports whether it was marked.
+fn unwrap_mut(a) {
+    if a[N_KIND] != EX_MUTARG {
+        return 0;
+    }
+    replace_node(a, a[MUTARG_X]);
+    return 1;
+}
+
+fn mut_arg_error(e, a, i, what) {
+    let m = err_begin(a[N_POS]);
+    buf_str(m, "argument ");
+    if e[CALL_METHOD] {
+        buf_int(m, i);
+    } else {
+        buf_int(m, i + 1);
+    }
+    buf_str(m, " of ");
+    if e[CALL_NAME] {
+        buf_str(m, e[CALL_NAME]);
+    } else {
+        buf_str(m, "this call");
+    }
+    buf_byte(m, ' ');
+    buf_str(m, what);
+    err_end(m);
 }
 
 fn result_type(f) {
@@ -1042,7 +1149,7 @@ fn direct_call(e, f) {
     }
     e[CALL_FN] = f;
     e[CALL_CALLEE] = 0;
-    chk_args(e, f[F_PTYPES], f[F_VARIADIC], f[F_LEGACY]);
+    chk_args(e, f[F_PTYPES], f[F_VARIADIC], f[F_LEGACY], mut_mask(f[F_MUTS]));
     return result_type(f);
 }
 
@@ -1121,6 +1228,9 @@ fn chk_call(e, want) {
                 return lower_argo_get(e);
             }
             let s = pkg_member(pkg, m);
+            if s && is_private(m) {
+                private_use(e[N_POS], "function", m, pkg);
+            }
             if s && s[S_KIND] == SYM_FUNC {
                 e[CALL_NAME] = s[S_NAME];
                 return direct_call(e, s[S_FN]);
@@ -1149,6 +1259,9 @@ fn chk_call(e, want) {
         }
         if kind_of(xt) == K_STRUCT {
             let mf = find_fn(str_cat3(xt[TY_NAME], ".", m));
+            if mf && is_private(m) && foreign_type(xt) {
+                private_use(e[N_POS], "method", m, type_pkg(xt));
+            }
             if mf {
                 let args = vec_new();
                 vec_push(args, x);
@@ -1159,6 +1272,7 @@ fn chk_call(e, want) {
                 }
                 e[CALL_ARGS] = args;
                 e[CALL_NAME] = mf[F_QNAME];
+                e[CALL_METHOD] = 1;
                 return direct_call(e, mf);
             }
             let fi = struct_field(xt, m);
@@ -1216,7 +1330,7 @@ fn indirect_call(e) {
         return ty_int;
     }
     e[CALL_FN] = 0;
-    chk_args(e, ft[TY_FIELDS], 0, 0);
+    chk_args(e, ft[TY_FIELDS], 0, 0, ft[TY_KEY]);
     return func_result(ft);
 }
 
@@ -1583,6 +1697,9 @@ fn lower_argo_put(e) {
         return ty_void;
     }
     let b = vec_get(args, 0);
+    if !unwrap_mut(b) && !ck_legacy {
+        err_at(b[N_POS], "argo.Put appends to its buffer: write mut before it");
+    }
     let bt = chk(b, 0);
     if kind_of(bt) != K_SLICE || bt[TY_ELEM] != ty_byte {
         err_type(pos, "argo.Put writes into a []u8, not ", bt, "");
@@ -1822,6 +1939,9 @@ fn lower_argo_get(e) {
     if args[VEC_LEN] != 2 {
         err_at(pos, "argo.Get takes the JSON text and a struct, slice or map to fill");
         return ty_error;
+    }
+    if !unwrap_mut(vec_get(args, 1)) && !ck_legacy {
+        err_at(vec_get(args, 1)[N_POS], "argo.Get fills its target: write mut before it");
     }
     let s = vec_get(args, 0);
     let st = chk(s, ty_string);

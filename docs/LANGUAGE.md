@@ -60,7 +60,11 @@ import u "util"       // with an alias
   targets are skipped.
 - The package name is the last element of the import path (`"net/http"` is `http`).
   Members are used as `pkg.Name`.
-- There are no export rules: lower-case names are visible to importers too.
+- **Exports** follow Go: a capitalized top-level name, method or struct field
+  (`Serve`, `Out.Status`, `Resp.Body`) is visible to importers; a lower-case one
+  (`parseInt`, `Conn.fd`) is private to its package, and using it from another package is
+  a compile error. Code the compiler generates (JSON encoding, printing, `keep`) may read
+  private fields.
 - Imports must not form a cycle.
 
 ### Program start
@@ -315,6 +319,12 @@ func fill(xs mut []i64, v i64) {      // may modify its argument
   elements, appending to it, storing into its map) is a compile error unless the
   parameter is declared `mut`. Passing a read-only parameter on to a `mut` parameter is
   also rejected. Reassigning the parameter variable itself is allowed.
+- **Call-site `mut`.** An argument for a `mut` parameter is written `mut x`, so every
+  call shows what it may modify: `fill(mut xs, 0)`, `sift.Ints(mut xs)`,
+  `argo.Put(mut buf, v)`, `argo.Get(text, mut v)`, and through function values too
+  (`f(mut box)`). Leaving it out, or writing it for a parameter that is not `mut`, is a
+  compile error. Method receivers (`p.Move(1, 2)`) and the builtins `append`, `copy` and
+  `delete` take no `mut`.
 
 ### Methods
 
@@ -756,22 +766,22 @@ type User struct {
 }
 
 b := make([]u8, 0, 1024)
-argo.Put(b, User{id: 7, name: "ana", email: "a@x", tags: []str{"admin"}})
+argo.Put(mut b, User{id: 7, name: "ana", email: "a@x", tags: []str{"admin"}})
 // {"id":7,"name":"ana","email":"a@x","tags":["admin"],"boss":null}
 
 u := User{tags: []str{}}
-err := argo.Get(text, u)            // fills u; returns a fault for bad JSON or types
+err := argo.Get(text, mut u)        // fills u; returns a fault for bad JSON or types
 xs := []User{}
-err2 := argo.Get(text, xs)          // appends decoded elements
+err2 := argo.Get(text, mut xs)      // appends decoded elements
 ```
 
 - The compiler generates an encoder and a decoder for each type. JSON member names are
   the struct's field names, in declaration order.
-- `argo.Put(b, v)` appends to a `[]u8`; any type: integers, floats (shortest exact form,
+- `argo.Put(mut b, v)` appends to a `[]u8`; any type: integers, floats (shortest exact form,
   exponent below 1e-6 or from 1e21, NaN/Inf as `null`), bools, strs (escaped), slices,
   maps with str or integer keys, structs, optionals (`null` when nil), faults (their
   message or `null`).
-- `argo.Get(text, v)` fills a struct, slice (appending) or map (adding entries); nested
+- `argo.Get(text, mut v)` fills a struct, slice (appending) or map (adding entries); nested
   struct fields are filled in place, `?T` fields accept `null`, unknown members are
   skipped, sized integers are range checked (`700` into a `u8` is a fault), and trailing
   garbage is a fault. Error messages name the offset: `argo: expected an integer in
@@ -874,7 +884,8 @@ unary         = primary | ( "-" | "!" | "^" | "~" ) unary | "try" Call .
 primary       = operand | primary "." ident | primary "[" expr "]"
               | primary "[" [ expr ] ":" [ expr ] "]" | primary TypeArgs
               | Call | Composite .
-Call          = primary "(" [ exprList [ "..." ] ] ")" .
+Call          = primary "(" [ Arg { "," Arg } [ "..." ] ] ")" .
+Arg           = [ "mut" ] expr .
 Composite     = ( TypeName [ TypeArgs ] | "[" "]" Type | "map" "[" Type "]" Type )
                 "{" [ Element { "," Element } [ "," ] ] "}" .
 Element       = [ ( ident | expr ) ":" ] ( expr | "{" ... "}" ) .
@@ -933,5 +944,6 @@ has no package clause). See [COMPILER.md](COMPILER.md) for how the compiler is w
 | closures capture variables | function literals cannot capture locals |
 | `defer` in loops, `recover` | defer outside loops only; no recover |
 | `fmt.Println` | `say.Line` (formatting by static type) |
-| exported = capitalized | no export rules |
+| exported = capitalized | the same rule, enforced for names, methods and fields |
+| `f(&x)` to let a callee modify x | `f(mut x)` for a `mut` parameter |
 | `for range ch`, `select`, labels, `goto`, `fallthrough` | not available |

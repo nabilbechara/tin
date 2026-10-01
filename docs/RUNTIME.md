@@ -211,11 +211,11 @@ is more than one above it. Graceful shutdown on SIGTERM/SIGINT: see PORTING.md Â
 
 ## 10. JSON: argo
 
-- `argo.Put(b, v)` compiles to a call of a generated encoder `argo$N(b, x)` per type.
+- `argo.Put(mut b, v)` compiles to a call of a generated encoder `argo$N(b, x)` per type.
   Constant pieces (`{"name":`) become a few word stores. Strings are scanned and copied
   8 bytes at a time with SWAR checks for `"`, `\` and control bytes. Integers are
   written digit by digit, floats via `shortest_into` straight into the buffer.
-- `argo.Get(text, v)` compiles to a generated decoder `argo$dN(p, x)` over a `Parser`
+- `argo.Get(text, mut v)` compiles to a generated decoder `argo$dN(p, x)` over a `Parser`
   (text, offset, first error). The readers (`robj`, `rarr`, `rkey`, `rstr`, `rint`,
   `rintr`, `ruint`, `rfloat`, `rbool`, `rnull`, `rskip`, `rmore`) record the first
   error and then do nothing, so decoders test the error only at loop boundaries.

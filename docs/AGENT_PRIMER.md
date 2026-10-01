@@ -20,7 +20,7 @@ the compiler: write a minimal repro to notes/compiler_bugs_NAME.md and work arou
 ## Language (strict)
 - Files start `package main` (programs) or `package NAME` (lib/NAME.tin, imported with
   `import "NAME"`, called as `NAME.Func`). `import "./geom"` imports a local file or directory
-  package. No export rules: lower-case names are visible too.
+  package. Capitalized names, methods and fields are exported; lower-case ones are private to their package.
 - Types: i8 i16 i32 i64 u8 u16 u32 u64, f64, bool, str (immutable bytes), [N]T arrays, []T (reference
   header; append mutates it in place and returns it), map[K]V (K = str or integer), struct (reference,
   never nil; == compares identity), ?T optional (may be nil), fault (error; nil = ok), func(...) values
@@ -38,7 +38,9 @@ the compiler: write a minimal repro to notes/compiler_bugs_NAME.md and work arou
   without narrowing is a compile error. Map reads of missing keys return the zero value; use
   `v, ok := m[k]` to tell.
 - Params are read-only unless declared `mut` (`func (b mut Buf) Add(...)`, `func f(xs mut []i64)`).
-  Modifying a non-mut param's contents (fields, elements, append, map store) is a compile error.
+  Modifying a non-mut param's contents (fields, elements, append, map store) is a compile error. A call
+  writes `mut` before every argument for a mut parameter: `f(mut xs)`, `sift.Ints(mut xs)`,
+  `argo.Put(mut buf, v)`; receivers and append/copy/delete take none.
 - No `go` statements, no shared mutable globals: every global is per core (each core thread has its own
   copy, initialized on every core). Concurrency is thread-per-core via hearth; messages via relay.
 - Memory: no GC. Allocations during a request go to the core's request pool (wiped per request);
@@ -57,7 +59,7 @@ the compiler: write a minimal repro to notes/compiler_bugs_NAME.md and work arou
   or a union of concrete types.
 - Bounds checks are always on (removed when provably safe: range loops, i < len(s) loops). Panics print
   the message, index and length, and a backtrace.
-- JSON: argo.Put(buf, v) encodes any value (encoder generated per type); `err := argo.Get(text, v)`
+- JSON: argo.Put(mut buf, v) encodes any value (encoder generated per type); `err := argo.Get(text, mut v)`
   decodes into a struct, slice or map. Field names are the struct field names.
 
 ## Trusted code (lib/*.tin only)
