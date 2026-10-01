@@ -5,8 +5,9 @@ SELF = lib/std.tin selfhost/util.tin selfhost/lex.tin selfhost/types.tin selfhos
 
 .PHONY: all bootstrap seed test bench clean install linux-bootstrap linux-test
 
-PREFIX ?= /opt/homebrew
 HOST_OS := $(shell uname -s | tr A-Z a-z)
+# Where `make install` links tin: Homebrew's prefix on a Mac that has one, /usr/local elsewhere.
+PREFIX ?= $(if $(and $(filter darwin,$(HOST_OS)),$(wildcard /opt/homebrew/bin)),/opt/homebrew,/usr/local)
 SEED := seed/tinc-$(HOST_OS)-$(shell uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
 # Sources of a compiler for the other OS (cross builds).
 SELF_LINUX = $(filter-out selfhost/host_darwin.tin selfhost/host_linux.tin,$(SELF)) selfhost/host_linux.tin
@@ -43,9 +44,11 @@ test: bin/tinc0 bin/tinc
 bench: bin/tinc
 	bench/run.py
 
-# Put `tin` on the PATH (a symlink: the tree stays where it is).
+# Put `tin` on the PATH (a symlink: the tree stays where it is); a leading ~/ in PREFIX means $HOME.
+INSTALL_BIN = $(patsubst ~/%,$(HOME)/%,$(PREFIX))/bin
 install: bin/tinc
-	ln -sf $(CURDIR)/tin $(PREFIX)/bin/tin
+	mkdir -p "$(INSTALL_BIN)"
+	ln -sf "$(CURDIR)/tin" "$(INSTALL_BIN)/tin"
 
 # A Linux arm64 compiler, cross-compiled from any host; check it in the container with
 # `make linux-bootstrap` (it must rebuild itself to an identical binary there).

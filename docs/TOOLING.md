@@ -8,9 +8,17 @@ for Linux testing.
 ## 1. Installing
 
 ```sh
-make install            # builds bin/tinc from seed/ and links `tin` into /opt/homebrew/bin
-make install PREFIX=~/.local
+make install                    # builds bin/tinc from seed/ and links `tin` into $(PREFIX)/bin
+make install PREFIX=~/.local    # a per-user install: no privileges, ~/.local/bin must be on PATH
+make && sudo make install       # a system-wide install where $(PREFIX)/bin is root-owned
 ```
+
+`PREFIX` defaults to `/opt/homebrew` on a Mac with Homebrew there and to `/usr/local`
+everywhere else (Linux, a Mac without Homebrew); an explicit `PREFIX` always wins.
+`$(PREFIX)/bin` is created if missing. On most Linux systems `/usr/local/bin` is
+root-owned, so either install per user or build first as yourself and run only the
+install step with `sudo` (so `bin/` stays yours). The link points into this tree:
+moving or deleting the tree breaks it.
 
 `tin` is a shell script (`./tin`); `bin/tinc` is the compiler binary.
 
@@ -60,7 +68,7 @@ tinc [-o OUT] [-S] [-target darwin-arm64|linux-arm64|linux-amd64] FILE.tin...
 | `make linux-test` | cross-compile every strict test for linux-arm64 and run it in an arm64 container (`tools/linuxtest.sh`) |
 | `make linux-bootstrap` | cross-compile a Linux compiler, then in the container it must rebuild itself identically; refreshes `seed/tinc-linux-arm64` |
 | `make bench` | the legacy CPU benchmarks vs Go (`bench/run.py`) |
-| `make install` | link `tin` into `$(PREFIX)/bin` |
+| `make install` | link `tin` into `$(PREFIX)/bin` (created if needed; see §1 for the default) |
 | `make print-VAR` | print a Makefile variable (e.g. `make print-SELF`, the compiler's sources) |
 | `make clean` | remove `bin/` |
 
