@@ -51,6 +51,15 @@ const bigAlloc = 262144
 const maxAlloc = 70368744177664 // 2^46 bytes: no single allocation may ask for more
 const slabSize = 1048576
 
+// rt_chunk is the request pool chunk size: chunkSize, or less when hearth lowered rtPoolChunk
+// to fit the memory limit (see pool_tune in lib/hearth.tin).
+func rt_chunk() i64 {
+	if rtPoolChunk != 0 {
+		return rtPoolChunk
+	}
+	return chunkSize
+}
+
 shared var rtArgc i64
 shared var rtArgv i64
 shared var rtOut i64      // stdout buffer: [len, cap, data]
@@ -186,17 +195,17 @@ func rt_alloc(n i64) i64 {
 func rt_alloc_slow(n i64) i64 {
 	c := __ctx()
 	if c[ctxPoolBase] == 0 {
-		chunk := calloc(1, chunkSize)
+		chunk := calloc(1, rt_chunk())
 		c[ctxPoolBase] = chunk
 		c[ctxBump] = chunk
-		c[ctxEnd] = chunk + chunkSize
+		c[ctxEnd] = chunk + rt_chunk()
 		// A first allocation that fits takes the base chunk; a big one still gets its own block.
-		if n < bigAlloc {
+		if n < bigAlloc && n <= rt_chunk() {
 			c[ctxBump] = chunk + n
 			return chunk
 		}
 	}
-	if n >= bigAlloc {
+	if n >= bigAlloc || n+16 > rt_chunk() {
 		if n > maxAlloc {
 			rt_panic("allocation size out of range")
 		}
@@ -211,11 +220,11 @@ func rt_alloc_slow(n i64) i64 {
 	if c[ctxPoolMark] == 0 {
 		c[ctxPoolMark] = c[ctxBump]
 	}
-	chunk := calloc(1, chunkSize)
+	chunk := calloc(1, rt_chunk())
 	chunk[0] = c[ctxPoolExtra]
 	c[ctxPoolExtra] = chunk
 	c[ctxBump] = chunk + 16 + n
-	c[ctxEnd] = chunk + chunkSize
+	c[ctxEnd] = chunk + rt_chunk()
 	return chunk + 16
 }
 
@@ -246,14 +255,14 @@ func rt_pool_reset() {
 	}
 	memset(base, 0, top-base)
 	c[ctxBump] = base
-	c[ctxEnd] = base + chunkSize
+	c[ctxEnd] = base + rt_chunk()
 }
 
 // rt_pool_used reports the bytes the current request has taken from the pool.
 func rt_pool_used() i64 {
 	c := __ctx()
 	if c[ctxPoolMark] != 0 {
-		return c[ctxPoolMark] - c[ctxPoolBase] + chunkSize
+		return c[ctxPoolMark] - c[ctxPoolBase] + rt_chunk()
 	}
 	return c[ctxBump] - c[ctxPoolBase]
 }
