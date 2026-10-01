@@ -28,6 +28,7 @@ Generated from the comments in `lib/*.tin` by `tools/gendoc.py`.
 | [herald](#herald) | logging (log/slog) |
 | [crucible](#crucible) | testing helpers (testing) |
 | [redis](#redis) | Redis client (go-redis) |
+| [mysql](#mysql) | MySQL client (database/sql with go-sql-driver/mysql) |
 
 ## say
 
@@ -622,7 +623,7 @@ Package stamp computes non-cryptographic hashes and checksums: FNV-1a, CRC-32 (I
 
 ## seal
 
-Package seal has cryptographic hashes (SHA-256, SHA-1), HMAC-SHA256, constant-time comparison, secure random bytes, and the hex and base64 encodings.
+Package seal has cryptographic hashes (SHA-256, SHA-1), HMAC-SHA256, constant-time comparison, secure random bytes, the hex and base64 encodings, and RSA-OAEP encryption with a public key.
 
 - `Sha256(s str) []u8`: Sha256 is the SHA-256 digest of s (32 bytes).
 - `Sha256Soft(s str) []u8`: Sha256Soft is SHA-256 in portable code (the reference the hardware path is tested against).
@@ -637,6 +638,9 @@ Package seal has cryptographic hashes (SHA-256, SHA-1), HMAC-SHA256, constant-ti
 - `B64Decode(s str) ![]u8`: B64Decode decodes standard padded base64.
 - `B64URL(b []u8) str`: B64URL encodes b as unpadded URL-safe base64 (as in JWTs).
 - `B64URLDecode(s str) ![]u8`: B64URLDecode decodes unpadded URL-safe base64.
+- `type RSAPublicKey struct`: RSAPublicKey is an RSA public key: modulus N and exponent E, as big-endian bytes.
+- `ParseRSAPublicKeyPEM(pem str) !RSAPublicKey`: ParseRSAPublicKeyPEM reads a PEM "PUBLIC KEY" (SubjectPublicKeyInfo) or "RSA PUBLIC KEY" (PKCS #1) block.
+- `EncryptOAEPSha1(key RSAPublicKey, msg []u8) ![]u8`: EncryptOAEPSha1 encrypts msg for key with RSA-OAEP (SHA-1, MGF1-SHA-1, empty label), as MySQL's caching_sha2_password and sha256_password expect.
 
 ## herald
 
@@ -726,3 +730,38 @@ Blocking commands (BLPOP, SUBSCRIBE, ...) would hold up the commands queued behi
 - `(c Client) Incr(key str) !i64`: Incr adds one to the integer at key and returns the result.
 - `(c Client) Expire(key str, ttl i64) !bool`: Expire makes key expire after ttl nanoseconds; false when there is no such key.
 - `(c Client) Ping() !`: Ping checks that the server answers.
+
+## mysql
+
+Package mysql is a MySQL client (tested with MySQL 8.0). Statements are queries: in db.Query("SELECT name FROM users WHERE id = {id}") the text becomes "... id = ?" and id a bound parameter of a prepared statement, so a value can never change a statement.
+
+Each core keeps a pool of connections per Client (Options.Pool, default 16); a request task waits for a free one without blocking the core. Prepared statements are cached per connection. Authentication: caching_sha2_password (the MySQL 8 default, including the RSA key exchange when the server has no cached entry) and mysql_native_password. TLS is not supported.
+
+```go
+var db = mysql.Open(mysql.Options{Addr: "127.0.0.1:3306", User: "app", Password: pw, Database: "shop"})
+rows := try db.Query("SELECT id, name FROM users WHERE id = {id}")
+for _, r := range rows.Rows {
+	say.Line(r[0].Int(), r[1].Text())
+}
+```
+
+- `type Value enum`: Value is one column of a row.
+- `type Rows struct`: Rows is a query's result.
+- `type Result struct`: Result is what a statement without rows did.
+- `type Options struct`: Options says where and how to connect.
+- `type Client struct`: Client runs statements on one MySQL server. Open it in a global's initializer (which runs on every core) or once in main, not per request.
+- `type Tx struct`: Tx is a transaction: its statements run on one connection until Commit or Rollback.
+- `Open(o Options) Client`: Open makes a client for the server in o. It connects on first use, on each core.
+- `(v Value) IsNull() bool`: IsNull reports whether v is NULL.
+- `(v Value) Int() i64`: Int is v as an integer (a Text or Float converted, NULL and bad text 0).
+- `(v Value) Float() f64`: Float is v as a float.
+- `(v Value) Text() str`: Text is v as text ("" for NULL).
+- `(r Rows) Col(name str) i64`: Col is the index of the named column, or -1.
+- `(c Client) Query(q query) !Rows`: Query runs a statement and returns its rows.
+- `(c Client) Exec(q query) !Result`: Exec runs a statement and returns what it changed.
+- `(c Client) Ping() !`: Ping checks that the server answers.
+- `(c Client) Begin() !Tx`: Begin starts a transaction; finish it with Commit or Rollback, or its connection stays out of the pool.
+- `(t mut Tx) Query(q query) !Rows`: Query runs a statement in the transaction and returns its rows.
+- `(t mut Tx) Exec(q query) !Result`: Exec runs a statement in the transaction.
+- `(t mut Tx) Commit() !`: Commit makes the transaction's changes permanent.
+- `(t mut Tx) Rollback() !`: Rollback undoes the transaction's changes.

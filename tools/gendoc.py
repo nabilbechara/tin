@@ -5,7 +5,7 @@ import os, re
 SKIP = {"runtime", "std", "fmt", "say"}
 ORDER = ["say", "argo", "anvil", "hearth", "relay", "wire", "twine", "glyph", "mint", "gauge",
          "ore", "flume", "quarry", "trail", "lever", "tide", "dice", "sift", "cairn", "stamp",
-         "seal", "herald", "crucible", "redis"]
+         "seal", "herald", "crucible", "redis", "mysql"]
 ROLE = {"say": "formatting and printing (fmt)", "argo": "JSON (encoding/json)", "anvil": "HTTP/1.1 server (net/http)",
         "hearth": "cores and threads (runtime)", "relay": "messages between cores (channels)", "wire": "TCP and HTTP client (net)",
         "twine": "strings (strings)", "glyph": "UTF-8 (unicode/utf8)", "mint": "number and string conversion (strconv)",
@@ -14,7 +14,8 @@ ROLE = {"say": "formatting and printing (fmt)", "argo": "JSON (encoding/json)", 
         "tide": "time (time)", "dice": "random numbers (math/rand)", "sift": "sorting and searching (sort, slices)",
         "cairn": "containers (container/heap, sets, LRU)", "stamp": "hashes and checksums (hash/*)",
         "seal": "crypto and encodings (crypto/sha256, hmac, encoding/hex, base64)", "herald": "logging (log/slog)",
-        "crucible": "testing helpers (testing)", "redis": "Redis client (go-redis)"}
+        "crucible": "testing helpers (testing)", "redis": "Redis client (go-redis)",
+        "mysql": "MySQL client (database/sql with go-sql-driver/mysql)"}
 
 def parse(path):
     lines = open(path).read().split("\n")

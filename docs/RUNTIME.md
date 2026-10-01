@@ -268,6 +268,22 @@ core's pool words (bump, end, base, mark, extra) are swapped in and out with the
   fails every waiting slot; the next command reconnects. An idle connection is checked
   with a non-blocking `recv(MSG_PEEK)` before use, so a server restart costs no failures.
 
+### Pooled clients: mysql (v0.4)
+
+- MySQL answers one statement at a time per connection, so each core keeps a pool per
+  `mysql.Client` (`Options.Pool`, default 16). A task takes an idle connection (checked
+  with `MSG_PEEK`), dials a new one while under the limit, or parks in the pool's FIFO;
+  a released connection goes straight to the first waiter still waiting.
+- The task that holds a connection does its I/O directly (`rt_task_wait` on `EAGAIN`) and
+  builds rows in its own pool. A server error (an ERR packet) leaves the connection usable;
+  an I/O error, a timeout or the deadline closes it, since its state is unknown.
+- A query with values runs as a prepared statement (`COM_STMT_PREPARE` once per text and
+  connection, then `COM_STMT_EXECUTE` with binary parameters and rows); one without values
+  as `COM_QUERY`. Up to 256 statements are cached per connection.
+- Login: `caching_sha2_password` (fast path, or the full exchange: the server's RSA public
+  key, fetched once per Client, encrypts the password with `seal.EncryptOAEPSha1`) and
+  `mysql_native_password`, including auth-switch requests.
+
 ## 10. JSON: argo
 
 - `argo.Put(mut b, v)` compiles to a call of a generated encoder `argo$N(b, x)` per type.

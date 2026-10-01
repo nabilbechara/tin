@@ -1,0 +1,98 @@
+package main
+
+import "anvil"
+import "argo"
+import "mint"
+import "mysql"
+import "quarry"
+import "say"
+
+// A users service over MySQL (MYSQL_ADDR, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE):
+//   GET /setup             creates the users table
+//   GET /add?name=N        adds a user, answers its id
+//   GET /user?id=N         the user as JSON, or 404
+//   GET /count             how many users there are
+//   GET /sleep?ms=N        a statement that takes N ms (SELECT SLEEP)
+type User struct {
+	id   i64
+	name str
+}
+
+var db = mysql.Open(mysql.Options{
+	Addr:     quarry.Getenv("MYSQL_ADDR"),
+	User:     quarry.Getenv("MYSQL_USER"),
+	Password: quarry.Getenv("MYSQL_PASSWORD"),
+	Database: quarry.Getenv("MYSQL_DATABASE"),
+	Pool:     env_int("MYSQL_POOL"),
+})
+
+func env_int(name str) i64 {
+	n := mint.Atoi(quarry.Getenv(name)) catch _ { 0 }
+	return n
+}
+
+func fail_with(w mut anvil.Out, err fault) {
+	w.Status(502)
+	w.Text("{err}")
+}
+
+func handle(q anvil.Req, w mut anvil.Out) {
+	if q.Path == "/user" {
+		id := mint.Atoi(q.Param("id")) catch _ { -1 }
+		rows := db.Query("SELECT id, name FROM users WHERE id = {id}") catch err {
+			fail_with(mut w, err)
+			return
+		}
+		if len(rows.Rows) == 0 {
+			w.Status(404)
+			w.Text("no user {id}")
+			return
+		}
+		r := rows.Rows[0]
+		w.Json()
+		argo.Put(mut w.Body, User{id: r[0].Int(), name: r[1].Text()})
+		return
+	}
+	if q.Path == "/add" {
+		name := q.Param("name")
+		res := db.Exec("INSERT INTO users (name) VALUES ({name})") catch err {
+			fail_with(mut w, err)
+			return
+		}
+		w.Text("{res.LastID}")
+		return
+	}
+	if q.Path == "/count" {
+		rows := db.Query("SELECT COUNT(*) FROM users") catch err {
+			fail_with(mut w, err)
+			return
+		}
+		w.Text(rows.Rows[0][0].Text())
+		return
+	}
+	if q.Path == "/sleep" {
+		ms := mint.Atoi(q.Param("ms")) catch _ { 100 }
+		secs := f64(ms) / 1000.0
+		_ = db.Query("SELECT SLEEP({secs})") catch err {
+			fail_with(mut w, err)
+			return
+		}
+		w.Text("slept")
+		return
+	}
+	if q.Path == "/setup" {
+		_ = db.Exec("CREATE TABLE IF NOT EXISTS users (id BIGINT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(255) NOT NULL)") catch err {
+			fail_with(mut w, err)
+			return
+		}
+		w.Text("ok")
+		return
+	}
+	w.Status(404)
+	w.Text("no route {q.Path}")
+}
+
+func main() {
+	err := anvil.Serve(":9185", handle)
+	say.Line("server:", err)
+}

@@ -1,5 +1,6 @@
 // Package seal has cryptographic hashes (SHA-256, SHA-1), HMAC-SHA256, constant-time
-// comparison, secure random bytes, and the hex and base64 encodings.
+// comparison, secure random bytes, the hex and base64 encodings, and RSA-OAEP encryption
+// with a public key.
 package seal
 
 import "say"
@@ -383,4 +384,256 @@ func B64URL(b []u8) str {
 // B64URLDecode decodes unpadded URL-safe base64.
 func B64URLDecode(s str) ![]u8 {
 	return try b64dec(s, true, false)
+}
+
+// ---- RSA public-key encryption (RSA-OAEP), for protocols that need it ----
+
+// RSAPublicKey is an RSA public key: modulus N and exponent E, as big-endian bytes.
+type RSAPublicKey struct {
+	N []u8
+	E []u8
+}
+
+// der_item reads the DER item at b[at]: its tag, where its contents start and end.
+func der_item(b []u8, at i64) !(u8, i64, i64) {
+	if at+2 > len(b) {
+		fail "seal: truncated DER"
+	}
+	tag := b[at]
+	n := i64(b[at+1])
+	at += 2
+	if n >= 0x80 {
+		k := n - 0x80
+		if k < 1 || k > 4 || at+k > len(b) {
+			fail "seal: bad DER length"
+		}
+		n = 0
+		for i := 0; i < k; i++ {
+			n = n<<8 | i64(b[at+i])
+		}
+		at += k
+	}
+	if at+n > len(b) {
+		fail "seal: truncated DER"
+	}
+	return tag, at, at + n
+}
+
+func der_uint(b []u8, at i64) !([]u8, i64) {
+	tag, from, to := try der_item(b, at)
+	if tag != 0x02 {
+		fail "seal: expected a DER integer"
+	}
+	for from < to-1 && b[from] == 0 {
+		from++
+	}
+	return b[from:to], to
+}
+
+// ParseRSAPublicKeyPEM reads a PEM "PUBLIC KEY" (SubjectPublicKeyInfo) or "RSA PUBLIC KEY"
+// (PKCS #1) block.
+func ParseRSAPublicKeyPEM(pem str) !RSAPublicKey {
+	body := []u8{}
+	pkcs1 := false
+	inside := false
+	start := 0
+	for i := 0; i <= len(pem); i++ {
+		if i < len(pem) && pem[i] != '\n' {
+			continue
+		}
+		ln := pem[start:i]
+		start = i + 1
+		if len(ln) > 0 && ln[len(ln)-1] == '\r' {
+			ln = ln[:len(ln)-1]
+		}
+		if len(ln) >= 5 && ln[:5] == "-----" {
+			if !inside {
+				inside = true
+				pkcs1 = len(ln) > 25 && ln[11:25] == "RSA PUBLIC KEY"
+			} else {
+				break
+			}
+			continue
+		}
+		if inside {
+			for j := 0; j < len(ln); j++ {
+				body = append(body, ln[j])
+			}
+		}
+	}
+	der := try B64Decode(str(body))
+	at := 0
+	if !pkcs1 {
+		tag, from, _ := try der_item(der, 0)
+		if tag != 0x30 {
+			fail "seal: not a public key"
+		}
+		tag2, _, algEnd := try der_item(der, from)
+		if tag2 != 0x30 {
+			fail "seal: not a public key"
+		}
+		tag3, bitFrom, _ := try der_item(der, algEnd)
+		if tag3 != 0x03 || bitFrom >= len(der) || der[bitFrom] != 0 {
+			fail "seal: not a public key"
+		}
+		at = bitFrom + 1
+	}
+	tag, from, _ := try der_item(der, at)
+	if tag != 0x30 {
+		fail "seal: not an RSA public key"
+	}
+	n, next := try der_uint(der, from)
+	e, _ := try der_uint(der, next)
+	return RSAPublicKey{N: n, E: e}
+}
+
+// Big numbers: little-endian 32-bit limbs in u64s.
+
+func big_from(b []u8) []u64 {
+	out := make([]u64, (len(b)+3)/4)
+	for i := 0; i < len(b); i++ {
+		k := len(b) - 1 - i
+		out[k/4] |= u64(b[i]) << u64(8*(k%4))
+	}
+	return out
+}
+
+func big_bytes(x []u64, n i64) []u8 {
+	out := make([]u8, n)
+	for k := 0; k < n; k++ {
+		if k/4 < len(x) {
+			out[n-1-k] = u8(x[k/4] >> u64(8*(k%4)))
+		}
+	}
+	return out
+}
+
+func big_mul(a []u64, b []u64) []u64 {
+	out := make([]u64, len(a)+len(b))
+	for i := 0; i < len(a); i++ {
+		carry := u64(0)
+		for j := 0; j < len(b); j++ {
+			t := a[i]*b[j] + out[i+j] + carry
+			out[i+j] = t & 0xffffffff
+			carry = t >> 32
+		}
+		k := i + len(b)
+		for carry != 0 {
+			t := out[k] + carry
+			out[k] = t & 0xffffffff
+			carry = t >> 32
+			k++
+		}
+	}
+	return out
+}
+
+// big_mod is p mod m, bit by bit: rem doubles, takes the next bit, and drops m when it can.
+func big_mod(p []u64, m []u64) []u64 {
+	n := len(m) + 1
+	rem := make([]u64, n)
+	for i := len(p)*32 - 1; i >= 0; i-- {
+		carry := (p[i/32] >> u64(i%32)) & 1
+		for k := 0; k < n; k++ {
+			t := rem[k]<<1 | carry
+			rem[k] = t & 0xffffffff
+			carry = t >> 32
+		}
+		ge := true
+		for k := n - 1; k >= 0; k-- {
+			mk := u64(0)
+			if k < len(m) {
+				mk = m[k]
+			}
+			if rem[k] != mk {
+				ge = rem[k] > mk
+				break
+			}
+		}
+		if ge {
+			borrow := u64(0)
+			for k := 0; k < n; k++ {
+				mk := u64(0)
+				if k < len(m) {
+					mk = m[k]
+				}
+				d := rem[k] - mk - borrow
+				if rem[k] < mk+borrow {
+					borrow = 1
+				} else {
+					borrow = 0
+				}
+				rem[k] = d & 0xffffffff
+			}
+		}
+	}
+	return rem[:len(m)]
+}
+
+// big_powmod is x^e mod m, by squaring from the top bit of e.
+func big_powmod(x []u64, e []u8, m []u64) []u64 {
+	r := []u64{1}
+	started := false
+	for i := 0; i < len(e)*8; i++ {
+		bit := (e[i/8] >> u8(7-i%8)) & 1
+		if started {
+			r = big_mod(big_mul(r, r), m)
+		}
+		if bit == 1 {
+			r = big_mod(big_mul(r, x), m)
+			started = true
+		}
+	}
+	return r
+}
+
+func mgf1_sha1(seed []u8, n i64) []u8 {
+	out := make([]u8, 0, n+20)
+	for c := 0; len(out) < n; c++ {
+		b := make([]u8, 0, len(seed)+4)
+		for _, x := range seed {
+			b = append(b, x)
+		}
+		b = append(b, u8(c>>24), u8(c>>16), u8(c>>8), u8(c))
+		for _, x := range Sha1(str(b)) {
+			out = append(out, x)
+		}
+	}
+	return out[:n]
+}
+
+// EncryptOAEPSha1 encrypts msg for key with RSA-OAEP (SHA-1, MGF1-SHA-1, empty label), as
+// MySQL's caching_sha2_password and sha256_password expect.
+func EncryptOAEPSha1(key RSAPublicKey, msg []u8) ![]u8 {
+	k := len(key.N)
+	if k < 64 || len(msg) > k-42 {
+		fail "seal: message too long for the RSA key"
+	}
+	db := make([]u8, 0, k-21)
+	for _, x := range Sha1("") {
+		db = append(db, x)
+	}
+	for i := 0; i < k-len(msg)-42; i++ {
+		db = append(db, 0)
+	}
+	db = append(db, 1)
+	for _, x := range msg {
+		db = append(db, x)
+	}
+	seed := RandomBytes(20)
+	dbMask := mgf1_sha1(seed, k-21)
+	for i := 0; i < len(db); i++ {
+		db[i] ^= dbMask[i]
+	}
+	seedMask := mgf1_sha1(db, 20)
+	em := make([]u8, 0, k)
+	em = append(em, 0)
+	for i := 0; i < 20; i++ {
+		em = append(em, seed[i]^seedMask[i])
+	}
+	for _, x := range db {
+		em = append(em, x)
+	}
+	c := big_powmod(big_from(em), key.E, big_from(key.N))
+	return big_bytes(c, k)
 }
