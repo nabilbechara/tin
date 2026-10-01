@@ -1089,6 +1089,23 @@ func rt_map_setk(m i64, k str, v i64) {
 
 // ---- map keys encoded as bytes (struct and enum keys compare by value) ----
 
+// query is what an interpolated literal becomes where a query is wanted: the text pieces
+// around each {value} and the values themselves, never pasted into the text. Database
+// and cache clients take a query so a value cannot change a command's shape.
+type query struct {
+	Parts []str
+	Args  []qarg
+}
+
+// qarg is one value of a query.
+type qarg enum {
+	Int(v i64)
+	Float(v f64)
+	Str(v str)
+	Bool(v bool)
+	Bytes(v []u8)
+}
+
 var kdOff i64 // per core: where rt_kd_* reads next
 
 func rt_kb_new() i64 {
@@ -2227,6 +2244,10 @@ var timerCap i64
 var waitHook func(i64, i64) // per core (set by a server): watch fd (1 read, 2 write) for curTask
 var waitCancel func(i64)    // per core: stop watching fd
 var doneFd i64              // per core: the pipe helper threads report finished jobs to (0: none)
+var readyQ i64              // per core: tasks woken by another task, resumed by the event loop
+var readyHead i64
+var readyN i64
+var readyCap i64
 
 // rt_task_swap stores the running registers into from and continues with those in to.
 func rt_task_swap(from i64, to i64) {
@@ -2369,6 +2390,67 @@ func rt_task_ready(t i64) {
 	t[tGen]++
 	t[tResult] = waitReady
 	t[tWaitFd] = -1
+}
+
+// rt_task_park waits until another task wakes this one (rt_task_wake), or timeout ns or
+// the deadline pass. Only a task parks: on the core's own stack there is no one to wake it.
+func rt_task_park(timeout i64) i64 {
+	return rt_task_wait(-1, 0, timeout)
+}
+
+// rt_task_wake ends a parked task's wait; the event loop resumes it on its next turn.
+func rt_task_wake(t i64) {
+	if t[tWaiting] == 0 || t[tWaitFd] >= 0 {
+		return
+	}
+	rt_task_ready(t)
+	if readyHead+readyN == readyCap {
+		if readyHead > 0 {
+			memmove(readyQ, readyQ+8*readyHead, 8*readyN)
+			readyHead = 0
+		} else {
+			readyCap = readyCap*2 + 64
+			readyQ = realloc(readyQ, 8*readyCap)
+		}
+	}
+	readyQ[readyHead+readyN] = t
+	readyN++
+}
+
+// rt_task_defer lets the core finish what it is doing (the other events of this turn)
+// before this task goes on; on the core's own stack it does nothing.
+func rt_task_defer() {
+	t := curTask
+	if t == 0 {
+		return
+	}
+	t[tGen]++
+	t[tWaiting] = 1
+	t[tWaitFd] = -1
+	rt_task_wake(t)
+	rt_task_yield()
+}
+
+// rt_task_take_ready returns the next woken task, or 0.
+func rt_task_take_ready() i64 {
+	if readyN == 0 {
+		readyHead = 0
+		return 0
+	}
+	t := readyQ[readyHead]
+	readyHead++
+	readyN--
+	return t
+}
+
+// rt_task_ready_count is how many woken tasks wait to be resumed.
+func rt_task_ready_count() i64 {
+	return readyN
+}
+
+// rt_task_any_ready reports whether woken tasks wait to be resumed.
+func rt_task_any_ready() bool {
+	return readyN > 0
 }
 
 // rt_poll_wait blocks until fd is ready or timeout ns pass (0: no limit).

@@ -27,6 +27,7 @@ Generated from the comments in `lib/*.tin` by `tools/gendoc.py`.
 | [seal](#seal) | crypto and encodings (crypto/sha256, hmac, encoding/hex, base64) |
 | [herald](#herald) | logging (log/slog) |
 | [crucible](#crucible) | testing helpers (testing) |
+| [redis](#redis) | Redis client (go-redis) |
 
 ## say
 
@@ -122,6 +123,7 @@ r := try wire.Get("http://127.0.0.1:8080/json")
 - `IsEOF(err fault) bool`: EOF is the fault Read returns at the end of the stream.
 - `Dial(addr str) !Conn`: Dial connects to "host:port".
 - `DialTimeout(addr str, timeout i64) !Conn`: DialTimeout connects to "host:port", giving up after timeout nanoseconds (0: no limit).
+- `(c Conn) Fd() i64`: Fd is the connection's descriptor, for clients that do their own I/O on it (it stays non-blocking; Close still closes it).
 - `(c mut Conn) SetTimeout(ns i64)`: SetTimeout limits every later read and write to ns nanoseconds (0: no limit).
 - `(c Conn) SetNoDelay(on bool)`: SetNoDelay turns Nagle's algorithm off (true) or on.
 - `(c Conn) Write(s str) !`: Write sends all of s.
@@ -696,3 +698,31 @@ crucible.Done()
 - `Run(name str, f func(mut T))`: Run runs one test and prints its result like go test -v.
 - `RunBench(name str, f func(mut B))`: RunBench runs one benchmark with b.N doubling until it takes at least 1 s, then prints the time per operation.
 - `Finish()`: Finish prints PASS or FAIL and exits with status 1 when a test failed.
+
+## redis
+
+Package redis is a Redis client. Commands are queries: in c.Do("SET user:{id} {body}") the values travel as separate arguments, so a value can never change a command.
+
+Each core keeps one connection per Client. The requests a core serves at the same time share it: their commands are written together and the replies matched in order (pipelining), so a busy server makes few system calls per command. Inside a request task a call waits without blocking the core; outside one it blocks.
+
+```go
+var cache = redis.Open(redis.Options{Addr: "127.0.0.1:6379"})
+try cache.Set("greeting", "hello")
+v, found := try cache.Get("greeting")
+```
+
+Blocking commands (BLPOP, SUBSCRIBE, ...) would hold up the commands queued behind them and are not supported.
+
+- `type Reply enum`: Reply is one Redis reply.
+- `type Options struct`: Options says where and how to connect.
+- `type Client struct`: Client sends commands to one Redis server. Open it in a global's initializer (which runs on every core) or once in main, not per request.
+- `Open(o Options) Client`: Open makes a client for the server in o. It connects on first use, on each core.
+- `(c Client) Do(q query) !Reply`: Do sends one command and returns its reply; an error reply fails.
+- `(c Client) Pipe(qs []query) ![]Reply`: Pipe sends commands together and returns their replies in order; error replies come back as Err. The commands go out back to back, so MULTI ... EXEC in one Pipe is atomic.
+- `(c Client) Get(key str) !(str, bool)`: Get returns the value at key, and whether there is one.
+- `(c Client) Set(key str, value str) !`: Set stores value at key.
+- `(c Client) SetEx(key str, value str, ttl i64) !`: SetEx stores value at key for ttl nanoseconds (at least a millisecond).
+- `(c Client) Del(key str) !i64`: Del removes key; it returns how many keys it removed (0 or 1).
+- `(c Client) Incr(key str) !i64`: Incr adds one to the integer at key and returns the result.
+- `(c Client) Expire(key str, ttl i64) !bool`: Expire makes key expire after ttl nanoseconds; false when there is no such key.
+- `(c Client) Ping() !`: Ping checks that the server answers.

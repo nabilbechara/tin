@@ -797,6 +797,24 @@ say.Line("literal {{braces}} and 100%") // {{ and }} are braces; % needs no esca
   printed as `%v`, and a precision on a float means decimal places (`{pi:.2}` is `3.14`).
 - A lone `}` is an error (write `}}`), and so is an unclosed `{`.
 
+### Queries
+
+Where a parameter (or variable) has the builtin type `query`, a literal does not become a
+`str`: it becomes a `query`, the text pieces around each `{value}` and the values
+themselves, kept apart. Clients for databases and caches take a `query`, so a value can
+never change the shape of a command:
+
+```go
+c.Do("SET user:{id} {body}")   // redis: SET, user:42 and body are three arguments
+c.Do(cmd)                      // error if cmd is a str: a query takes a string literal
+```
+
+- `query` is `struct { Parts []str; Args []qarg }`, with `len(Parts) == len(Args) + 1`.
+- `qarg` is an enum: `Int(v i64)`, `Float(v f64)`, `Str(v str)`, `Bool(v bool)`,
+  `Bytes(v []u8)`. Integers of any width become `Int`, `f32` becomes `Float`; other types
+  are a compile error, and so is a format spec (`{x:5}`): values are sent as they are.
+- A plain literal without values is a query with one part and no values.
+
 ## 15. Printing and formatting: say
 
 `say` is built into the compiler: each argument is formatted by its static type, without

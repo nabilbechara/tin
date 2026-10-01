@@ -248,6 +248,25 @@ core's pool words (bump, end, base, mark, extra) are swapped in and out with the
   the task yields, the helper runs `f(job)` and writes the job pointer to the core's done
   pipe, and the core resumes the task. Results travel in malloc'd memory in the job, never
   in the helper's pool. Outside a task `rt_helper_run` just calls `f`.
+- Tasks can wait on each other: `rt_task_park(timeout)` waits until another task calls
+  `rt_task_wake(t)`; woken tasks go on a per-core ready queue that the loop drains on its
+  next turn (it does not block while the queue has tasks). `rt_task_defer()` puts the
+  running task on that queue, so it continues after the core's other events of this turn.
+
+### Clients on shared connections: redis (v0.4)
+
+- Each core keeps one connection per `redis.Client`. A command is encoded straight into
+  the connection's output buffer and a slot for its replies joins a FIFO.
+- One task at a time owns the connection's I/O. The owner first defers (`rt_task_defer`),
+  so the other requests of the same event-loop turn add their commands; then it writes
+  everything queued in one `write`, reads, and hands each complete reply (checked with
+  `resp_len`, copied into the slot in malloc'd memory) to the slot at the front, waking its
+  task. When its own replies are in, it passes ownership to the first task still waiting.
+  Each woken task parses its reply into its own pool.
+- A caller that hits its deadline or timeout marks its slot gone and leaves; the slot stays
+  queued so the reply that comes later is consumed in order and freed. A connection error
+  fails every waiting slot; the next command reconnects. An idle connection is checked
+  with a non-blocking `recv(MSG_PEEK)` before use, so a server restart costs no failures.
 
 ## 10. JSON: argo
 

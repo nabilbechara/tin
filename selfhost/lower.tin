@@ -39,6 +39,9 @@ fn chk_kind(e, want) {
         if ck_legacy {
             return ty_int;
         }
+        if is_query_t(want) {
+            return chk_query(e, want);
+        }
         return ty_string;
     }
     if k == EX_NIL {
@@ -101,6 +104,9 @@ fn chk_kind(e, want) {
         return ty_int;
     }
     if k == EX_INTERP {
+        if is_query_t(want) {
+            return chk_query(e, want);
+        }
         return chk_interp(e, want);
     }
     if k == EX_MUTARG {
@@ -3340,6 +3346,130 @@ fn say_text(pos, args, ln) {
 //   say.LineTo(w, a...)   println into w.Write(str)
 // chk_interp turns "a {x} b {y:.2}" into say.Fmt("a %v b %.2f", x, y): the verb comes from
 // the spec (its last letter), else %v, or %f for a float with a precision.
+// is_query_t reports whether t is the runtime's query type.
+fn is_query_t(t) {
+    return t && t[TY_KIND] == K_STRUCT && t[TY_NAME] && streq(t[TY_NAME], "query");
+}
+
+fn tx_named(pos, name) {
+    let n = node_new(TX_NAME, pos);
+    n[TX_B] = name;
+    return n;
+}
+
+fn tx_slice_of(pos, name) {
+    let n = node_new(TX_SLICE, pos);
+    n[TX_A] = tx_named(pos, name);
+    return n;
+}
+
+fn ident_node(pos, name) {
+    let n = node_new(EX_IDENT, pos);
+    n[ID_NAME] = name;
+    return n;
+}
+
+fn composite_of(tyx, elems, keys) {
+    let c = node_new(EX_COMPOSITE, tyx[N_POS]);
+    c[CL_TYPE] = tyx;
+    c[CL_ELEMS] = elems;
+    c[CL_KEYS] = keys;
+    return c;
+}
+
+// query_arg wraps a checked value in the qarg variant for its type: integers become
+// Int(i64(x)), floats Float(f64(x)), then Str, Bool and Bytes ([]u8).
+fn query_arg(a, t) {
+    let pos = a[N_POS];
+    let variant = 0;
+    let conv = 0;
+    if is_integer_t(t) {
+        variant = "Int";
+        if t != ty_int {
+            conv = "i64";
+        }
+    } else if is_float_t(t) {
+        variant = "Float";
+        if t != ty_float {
+            conv = "f64";
+        }
+    } else if kind_of(t) == K_STRING {
+        variant = "Str";
+    } else if kind_of(t) == K_BOOL || kind_of(t) == K_UBOOL {
+        variant = "Bool";
+    } else if kind_of(t) == K_SLICE && t[TY_ELEM] == ty_byte {
+        variant = "Bytes";
+    } else {
+        err_type(pos, "a query value must be an integer, a float, a str, a bool or []u8, not ", t, "");
+        return 0;
+    }
+    let v = a;
+    if conv {
+        v = node_new(EX_CALL, pos);
+        v[CALL_NAME] = conv;
+        v[CALL_ARGS] = args1(a);
+    }
+    let sel = node_new(EX_SELECT, pos);
+    sel[SEL_X] = ident_node(pos, "qarg");
+    sel[SEL_NAME] = variant;
+    let call = node_new(EX_CALL, pos);
+    call[CALL_CALLEE] = sel;
+    call[CALL_ARGS] = args1(v);
+    return call;
+}
+
+// chk_query turns a literal where a query is wanted into query{Parts, Args}: "GET user:{id}"
+// keeps "GET user:" and "" as text and id as a value, so a value is never parsed as text.
+fn chk_query(e, want) {
+    let pos = e[N_POS];
+    let parts = vec_new();
+    let args = vec_new();
+    if e[N_KIND] == EX_STR {
+        let s = node_new(EX_STR, pos);
+        s[STR_PTR] = e[STR_PTR];
+        s[STR_LEN] = e[STR_LEN];
+        vec_push(parts, s);
+    } else {
+        parts = e[INTERP_PARTS];
+        let vals = e[INTERP_ARGS];
+        let specs = e[INTERP_SPECS];
+        let i = 0;
+        while i < vals[VEC_LEN] {
+            if vec_get(specs, i) {
+                err_at(pos, "a query value takes no format spec: it is sent as it is");
+            }
+            let a = vec_get(vals, i);
+            let qa = query_arg(a, chk(a, 0));
+            if qa {
+                vec_push(args, qa);
+            }
+            i = i + 1;
+        }
+    }
+    let nokeys = vec_new();
+    let i = 0;
+    while i < parts[VEC_LEN] {
+        vec_push(nokeys, 0);
+        i = i + 1;
+    }
+    let akeys = vec_new();
+    i = 0;
+    while i < args[VEC_LEN] {
+        vec_push(akeys, 0);
+        i = i + 1;
+    }
+    let elems = vec_new();
+    vec_push(elems, composite_of(tx_slice_of(pos, "str"), parts, nokeys));
+    vec_push(elems, composite_of(tx_slice_of(pos, "qarg"), args, akeys));
+    let keys = vec_new();
+    vec_push(keys, ident_node(pos, "Parts"));
+    vec_push(keys, ident_node(pos, "Args"));
+    let c = composite_of(tx_named(pos, "query"), elems, keys);
+    replace_node(e, c);
+    e[N_TYPE] = 0;
+    return chk_kind(e, want);
+}
+
 fn chk_interp(e, want) {
     let pos = e[N_POS];
     let parts = e[INTERP_PARTS];

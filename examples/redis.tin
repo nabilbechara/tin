@@ -1,0 +1,80 @@
+package main
+
+import "anvil"
+import "mint"
+import "quarry"
+import "redis"
+import "say"
+
+// A counter and key/value service over Redis (REDIS_ADDR, default 127.0.0.1:6379):
+//   GET /incr?key=K          adds one to K, answers the new value
+//   GET /get?key=K           the value at K, or 404
+//   GET /set?key=K&value=V   stores V at K
+//   GET /twice?key=K         adds two to K in one MULTI/EXEC
+//   GET /sleep?ms=N          makes the server pause (DEBUG SLEEP)
+var c = redis.Open(redis.Options{Addr: quarry.Getenv("REDIS_ADDR"), Password: quarry.Getenv("REDIS_PASSWORD")})
+
+func handle(q anvil.Req, w mut anvil.Out) {
+	key := q.Param("key")
+	if q.Path == "/incr" {
+		n := c.Incr(key) catch err {
+			w.Status(502)
+			w.Text("{err}")
+			return
+		}
+		w.Text("{n}")
+		return
+	}
+	if q.Path == "/get" {
+		v, found := c.Get(key) catch err {
+			w.Status(502)
+			w.Text("{err}")
+			return
+		}
+		if !found {
+			w.Status(404)
+			w.Text("no {key}")
+			return
+		}
+		w.Text(v)
+		return
+	}
+	if q.Path == "/set" {
+		c.Set(key, q.Param("value")) catch err {
+			w.Status(502)
+			w.Text("{err}")
+			return
+		}
+		w.Text("ok")
+		return
+	}
+	if q.Path == "/twice" {
+		// MULTI ... EXEC in one Pipe: both increments happen together.
+		rs := c.Pipe([]query{"MULTI", "INCR {key}", "INCR {key}", "EXEC"}) catch err {
+			w.Status(502)
+			w.Text("{err}")
+			return
+		}
+		w.Text("{rs[3]}")
+		return
+	}
+	if q.Path == "/sleep" {
+		// The server pauses (it needs enable-debug-command): commands queued behind wait too.
+		ms := mint.Atoi(q.Param("ms")) catch _ { 100 }
+		secs := f64(ms) / 1000.0
+		_ = c.Do("DEBUG SLEEP {secs}") catch err {
+			w.Status(502)
+			w.Text("{err}")
+			return
+		}
+		w.Text("slept")
+		return
+	}
+	w.Status(404)
+	w.Text("no route {q.Path}")
+}
+
+func main() {
+	err := anvil.Serve(":9184", handle)
+	say.Line("server:", err)
+}
