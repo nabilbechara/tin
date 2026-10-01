@@ -341,7 +341,7 @@ Package flume reads and writes file descriptors through 64 KiB buffers: lines, w
 - `(w mut Writer) Int(v i64)`: Int appends v in decimal.
 - `(w mut Writer) Line(s str)`: Line appends s and a newline.
 - `(w mut Writer) Flush() fault`: Flush writes everything buffered (with as few writes as the descriptor allows).
-- `(w mut Writer) Close() fault`: Close flushes and closes the writer's descriptor.
+- `(w mut Writer) Close() fault`: Close flushes and closes the writer's descriptor once; closing again (or a writer that never opened) is a fault.
 
 ## quarry
 

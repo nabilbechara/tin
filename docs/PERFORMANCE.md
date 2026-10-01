@@ -22,11 +22,13 @@ Desktop, running natively. Scripts: TOOLING.md §7.
 | 1 /json | 414k, p99 0.44 ms | 243k, 0.89 ms | 107k, 2.03 ms |
 | 2 /json | 859k, p99 0.32 ms | 378k, 0.71 ms | 181k, 1.71 ms |
 | 4 /json | 855k, p99 0.79 ms | 719k, 1.84 ms | 406k, 1.42 ms |
-| 4 /plaintext | 803–855k, p99 0.65–1.3 ms | 724–809k, p99 0.40–0.68 ms | 429k, 1.10 ms |
+| 4 /plaintext | 883k, p99 0.42 ms | 866k, 0.99 ms | 429k, 1.10 ms |
 
-At 4 cores on Linux, anvil leads on throughput; its p99 trails fasthttp's because
-`SO_REUSEPORT` hashes connections unevenly over the cores (measured 26/21/29/20 for 100
-connections). Rebalancing at accept time is in progress.
+The 4-core /plaintext row is after accept-time balancing (median of 7 interleaved rounds,
+server on CPUs 0–3 and wrk on 4–7). With server and wrk sharing all CPUs: anvil 864k, p99
+0.40 ms against fasthttp 852k, 0.39 ms. Before balancing, `SO_REUSEPORT` spread 100
+connections 26/21/29/20 over the cores and anvil's p99 was about twice fasthttp's; now
+27/27/28/26.
 
 **Pipelined (16 requests per write), macOS:** anvil 2.98M req/s on 1 core, 4.46M on 2,
 3.69M on 4 (client-bound); fasthttp 1.40M / 2.83M / 3.45M; net/http 0.19M / 0.33M /
@@ -90,7 +92,8 @@ fields.
 
 ## 4. Compile times and binary sizes
 
-The compiler (about 19.5k lines including `lib/std.tin`) builds itself in COMPILE_TIME.
+The compiler (about 20k lines including `lib/std.tin`, all backends) builds itself in 0.07 s
+(warm file cache; about 0.6 s cold).
 
 | program | Tin | Go |
 |---|---|---|

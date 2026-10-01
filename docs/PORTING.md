@@ -3,8 +3,8 @@
 | target | status | binary | notes |
 |---|---|---|---|
 | darwin-arm64 | complete | Mach-O, ad-hoc signed, linked to libSystem | the original target |
-| linux-arm64 | working: all strict tests pass, self-hosts, server passes conformance | ELF PIE linked to glibc ≥ 2.34 (tested on 2.36 and 2.41) | container features in progress |
-| linux-amd64 | in progress | ELF PIE (x86-64) | encoder done and fuzzed; code generator and linker being written |
+| linux-arm64 | complete: all tests pass, self-hosts, server passes conformance; tested natively in CI | ELF PIE linked to glibc ≥ 2.34 (tested on 2.36 and 2.41) | container limits, graceful shutdown, `examples/k8s/` |
+| linux-amd64 | working: all strict, regression and legacy tests pass and it self-hosts, in an emulated container | ELF PIE (x86-64) | not yet in CI; no benchmarks on real x86-64 hardware yet |
 
 Choose a target with `tin build --target T` or `tinc -target T`; the default is the
 machine the compiler runs on. One compiler binary contains every backend.
@@ -38,7 +38,7 @@ handled in `gen.tin` by `tgt_linux`.
 - musl (Alpine) is not supported (dynamic loader and symbol differences); use
   `debian:bookworm-slim` or a distroless glibc image.
 
-## 3. Linux amd64 (in progress)
+## 3. Linux amd64
 
 The plan (`notes/plan_linux.md`) and the work log (`notes/x64_progress.md`):
 - System V ABI (rdi, rsi, rdx, rcx, r8, r9; xmm0–7; `al` = vector registers for variadic
@@ -50,12 +50,13 @@ The plan (`notes/plan_linux.md`) and the work log (`notes/x64_progress.md`):
   24.
 - `seal.Sha256` uses the portable code until SHA-NI is added (also on arm64 CPUs without
   the SHA-2 instructions, detected through `AT_HWCAP`).
-- Correctness is tested in an emulated amd64 container. Benchmarks need real x86-64
-  hardware.
+- Correctness is tested in an emulated amd64 container (`tools/x64fuzz/linuxtest_amd64.sh`,
+  which also runs `tests/regressions`). A native CI job and benchmarks need real x86-64
+  hardware (GitHub's x86-64 runners would do for CI, once a linux-amd64 seed is committed).
 
 ## 4. Containers and Kubernetes
 
-Status: the code below is landing now; the Dockerfile and manifest come with it.
+`examples/k8s/` has a Dockerfile, a Deployment + Service manifest and a README.
 
 - Build on a Mac: `tin build --target linux-arm64 app.tin -o bin/linux/app`.
 - Image: `FROM debian:bookworm-slim`, copy the binary, run as a non-root user.
@@ -63,16 +64,20 @@ Status: the code below is landing now; the Dockerfile and manifest come with it.
 - Cores: anvil runs `hearth.Cores()` event loops. On Linux, `hearth.Cores()` is the
   smallest of the online CPUs, the affinity mask (cpuset) and the cgroup CPU quota
   rounded up (v2 `cpu.max`, else v1 `cpu.cfs_quota_us / cpu.cfs_period_us`); never 0.
+  The cgroup is the process's own (from `/proc/self/cgroup` and `/proc/self/mountinfo`, so
+  private and host cgroup namespaces both work), and the smallest limit over it and its
+  ancestors counts. The count is computed once, before core threads pin themselves.
   `TIN_CORES` lowers it.
 - Pinning: core threads pin themselves to CPUs only when they map one-to-one onto the
   allowed CPUs, or when `TIN_PIN=1`.
-- Memory: `hearth.MemLimit()` reads the cgroup limit (v2 `memory.max`, else v1
+- Memory: `hearth.MemLimit()` reads the cgroup limit the same way (v2 `memory.max`, else v1
   `memory.limit_in_bytes`; 0 when unlimited). The per-core pool chunk (normally 4 MiB)
-  shrinks to fit it (`hearth.PoolChunk()`). Idle connections cost about 96 bytes.
+  shrinks to fit it (`hearth.PoolChunk()`; `hearth.PoolCapacity()` is the size in use). Idle connections cost about 96 bytes.
 - SIGTERM and SIGINT are blocked in every thread and read by core 0 from its event loop
   (signalfd on Linux, kqueue `EVFILT_SIGNAL` on macOS), so no asynchronous handler runs.
-  Every core then stops accepting, finishes in-flight requests, closes idle connections
-  and exits within `TIN_GRACE` seconds (default 25, below Kubernetes' 30 s
+  Every core then stops accepting and finishes in-flight requests (responses carry
+  `Connection: close`); idle keep-alive connections stay open until they send a request or
+  the grace period ends. The process exits within `TIN_GRACE` seconds (default 25, below Kubernetes' 30 s
   `terminationGracePeriodSeconds`).
 
 ## 5. Porting to another target

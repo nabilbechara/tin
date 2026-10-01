@@ -116,8 +116,8 @@ load generator on the same machine. Run with `bench/http/run_wrk.sh` and
 | 2 /json | **859k**, p99 **0.32 ms** | 378k, 0.71 ms | 181k, 1.71 ms |
 | 4 /json | **855k**, p99 **0.79 ms** | 719k, 1.84 ms | 406k, 1.42 ms |
 
-At 4 cores on `/plaintext` anvil leads on throughput but fasthttp's p99 is lower (uneven
-`SO_REUSEPORT` spreading; accept-time balancing is in progress).
+At 4 cores on `/plaintext`, with accept-time balancing: anvil 883k req/s, p99 0.42 ms
+against fasthttp 866k, 0.99 ms.
 
 On macOS without pipelining, at 2 or more server cores wrk itself saturates this machine (all three
 servers land at 220–260k req/s, and net/http comes out about 10% ahead at 4 cores because
@@ -164,8 +164,9 @@ notes/       verification notes, benchmark analyses, roadmap
 
 ## Status and next steps
 
-Targets: darwin-arm64 and linux-arm64 are complete (all tests pass on both, and the
-compiler self-hosts on both); linux-amd64 is in progress; see
+Targets: darwin-arm64 and linux-arm64 are complete (all tests pass on both in CI, and the
+compiler self-hosts on both); linux-amd64 passes every test and self-hosts in an emulated
+container but is not yet in CI; see
 [docs/PORTING.md](docs/PORTING.md). Handlers in anvil run to completion, one at a time per core:
 a handler that waits on a database or another service stalls its core. Non-blocking I/O
 inside handlers (stackful tasks per request, per-request pools, Redis and MySQL clients)

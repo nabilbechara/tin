@@ -205,9 +205,9 @@ reading resumes and buffered input is served.
 - HTTP/1.0 closes unless keep-alive is asked for; `Connection: close` is honored.
 - `$PORT` replaces the port of the address passed to `Serve`.
 
-**In progress (Linux phase 1):** connection balancing across cores, graceful SIGTERM
-(stop accepting, drain, exit within `TIN_GRACE`), memory-limit-aware pool sizes,
-container manifests.
+Balancing: on Linux each core accepts on its own `SO_REUSEPORT` listener, then hands a new
+connection to the least-loaded core (per-core live-connection counters) when its own load
+is more than one above it. Graceful shutdown on SIGTERM/SIGINT: see PORTING.md §4.
 
 ## 10. JSON: argo
 

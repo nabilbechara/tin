@@ -1,46 +1,33 @@
-# Resume here (paused 2026-10-01 17:50 Beirut)
+# Resume here (updated 2026-10-01 21:04 Beirut)
 
 ## State
-- darwin-arm64: complete. linux-arm64 phase 1: all features in, gate met (see below), final
-  re-verification pending. linux-amd64 phase 2: milestone 1 (legacy hello runs in the amd64
-  container); strict programs, runtime, tests and self-hosting still to do.
-- Docs complete in docs/ (index docs/README.md). One placeholder: COMPILE_TIME in
-  docs/PERFORMANCE.md §4.
+- Repo: github.com/yasserreslan/tin (public). main is protected: the CI check (native
+  linux-arm64 + macOS arm64, docs/CI.md) must pass and branches must be up to date; all
+  changes go through PRs.
+- All 21 review issues are fixed and closed (PRs #22–#41); each has a regression in
+  tests/regressions/ or tools/ci/.
+- darwin-arm64 and linux-arm64: complete, tested natively in CI.
+- linux-amd64: every tests/v2, tests/regressions and legacy test passes and the compiler
+  self-hosts, in the emulated tin-debian-amd64 container (tools/x64fuzz/linuxtest_amd64.sh).
+  Not in CI yet.
 
-## Phase 1 results (agent A, verified in tin-bench-arm64)
-- Accept-time balancing (lib/anvil.tin: gLoad per-core counters, handoff when load > min+1):
-  4 cores, 100 conns spread 27/27/28/26.
-- 4-core /plaintext vs fasthttp, 7 rounds: server and wrk on separate CPUs: anvil 883k req/s,
-  p99 423 µs vs 866k, 990 µs. Shared CPUs: 864k / 397 µs vs 852k / 390 µs (p99 parity).
-- hearth.Cores() follows cpuset + cgroup quota, pinning when 1:1 or TIN_PIN=1; MemLimit and
-  PoolChunk; graceful SIGTERM/SIGINT (tests/graceful/graceful.go, 5 cases pass on both OSes);
-  examples/k8s/ (Dockerfile, deployment.yaml, README); tests/v2/hearth.tin.
-- Agent A reported: v2 tests pass, linuxtest 30/30, conformance 26/26 on both.
+## Next, in order
+1. Native x86-64 CI job: commit seed/tinc-linux-amd64 (cross-compile, then let it rebuild
+   itself in the container to a fixed point), add ubuntu-24.04 to the ci.yml matrix and
+   promote the amd64 probe (docs/CI.md). Then benchmark anvil vs Go on that hardware.
+2. cores-stable.tin failed once on emulated amd64 ("cannot start a core thread"), then passed
+   7 runs; probably emulator memory pressure with 11 x 8 MiB stacks. Watch it in native CI.
+3. wire leftovers: Content-Length bodies allocate the full announced size up front;
+   Transfer-Encoding values other than exactly "chunked" are read until EOF.
+4. seal on arm64 CPUs without SHA-2 (AT_HWCAP fallback) is untested on real hardware.
+5. Benchmark suites to add (bench/): rest of the Benchmarks Game (fasta, k-nucleotide,
+   reverse-complement; pidigits needs bigints, regex-redux a regex package), Are We Fast Yet,
+   1BRC.
+6. Releases: `make dist` + a tag-triggered release workflow (per-target tarballs, SHA256SUMS,
+   install.sh into ~/.tin), no Homebrew.
+7. ML serving path: f32, extern for user packages (bind ONNX Runtime), SIMD.
+8. v0.4 async I/O: design in notes/design_v04.md waits for the user's review.
 
-## To do, in order
-1. Apply notes/patch_runtime_memlimit.md to lib/runtime.tin (rt_chunk(), so the pool chunk
-   really shrinks under a memory limit). Without it PoolChunk is reported but not used.
-2. Re-verify everything (also covers the strict division-by-zero panic added in gen.tin):
-   `make bootstrap && make seed && tools/v2test.sh && make test && make linux-bootstrap && tools/linuxtest.sh`
-   then conformance (TOOLING.md §5) and `go run tests/graceful/graceful.go bin/api 9381`.
-3. Fill COMPILE_TIME in docs/PERFORMANCE.md (`time bin/tinc -o /tmp/x $(make -s print-SELF)`);
-   update docs/RUNTIME.md §9 "In progress" (balancing and SIGTERM are done) and the 4-core
-   rows in docs/PERFORMANCE.md and README.md with the numbers above; `python3 tools/gendoc.py`.
-4. Phase 2 (x86-64): resume from notes/x64_progress.md. Reached: legacy tests 13/13, strict
-   tests 27/31 in tin-debian-amd64, and the compiler self-hosts there (byte-identical, 587 KB).
-   Open items:
-   - apply notes/patch_x64_runtime.md (per-arch rt_stat_mode and epoll_event layout,
-     runtime_linux_arm64.tin / anvil_linux_arm64.tin, TARGET_X64): amd64 strict builds fail with
-     duplicate definitions until it is in; then notes/patch_x64_seal.md;
-   - failing: cairn and lever segfault, quarry one wrong value; all suspect the 7+-argument
-     (stack argument) call path; a gdb image recipe is in the progress note;
-   - mirror the strict division-by-zero panic in gen_x64.tin (x_divide; edit written in the note);
-   - the agent saw "strlen redeclared" on one darwin strict build (lib/quarry.tin and
-     lib/runtime.tin both declare extern strlen); tools/v2test.sh passed afterwards, so check
-     whether it only happens on some path;
-   - seal SHA-NI later. The benchmark gate needs real x86-64 hardware.
-5. v0.4 async I/O: design in notes/design_v04.md waits for the user's review.
-
-## Rules still in force
-No git yet (ready: `git init && git add -A`). Port 8080 belongs to the user's other program.
-At most 2 agents. Downloads need the user's OK.
+## Rules
+gh account for this repo: yasserreslan (switch back to yasser-reslan for work). Port 8080
+belongs to the user's other program. Downloads need the user's OK.
