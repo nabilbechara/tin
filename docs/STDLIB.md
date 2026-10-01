@@ -62,6 +62,7 @@ func main() {
 - `type Out struct`: Out is the response being built. Body is the response body; the status defaults to 200 and the content type to text/plain.
 - `Serve(addr str, h func(Req, mut Out)) !`: Serve listens on addr (":8080", "127.0.0.1:8080") and serves h on every core. It returns only if the server cannot start. TIN_CORES overrides the number of cores.
 - `ServeN(addr str, n i64, h func(Req, mut Out)) !`: ServeN is Serve on exactly n cores.
+- `Deadline(ms i64)`: Deadline makes every request's waits (tide.Wait, client calls) fail with "deadline exceeded" once ms have passed since the request started (0: no deadline; call before Serve). TIN_DEADLINE_MS sets it too; the default is 30000.
 - `(q Req) Header(name str) str`: Header returns the value of the request header name (any case), or "".
 - `(q Req) Body() str`: Body returns the request body.
 - `(q Req) Param(name str) str`: Param returns query parameter name, %-decoded, or "".
@@ -442,6 +443,7 @@ Package tide is clocks, durations and civil (calendar) time in UTC, like Go's ti
 - `Wall() i64`: Wall returns the wall clock as nanoseconds since the Unix epoch, 1970-01-01T00:00:00Z.
 - `Since(t i64) i64`: Since returns the nanoseconds elapsed since the Now() reading t.
 - `Sleep(ns i64)`: Sleep pauses the current core for ns nanoseconds (nothing happens when ns <= 0).
+- `Wait(ns i64) !`: Wait pauses for ns like Sleep, but inside a request with a deadline it fails with "deadline exceeded" once the deadline comes first. On a server core, other requests run while one waits.
 - `Seconds(d i64) f64`: Seconds returns d as floating-point seconds, like Go's Duration.Seconds.
 - `Minutes(d i64) f64`: Minutes returns d as floating-point minutes.
 - `Hours(d i64) f64`: Hours returns d as floating-point hours.

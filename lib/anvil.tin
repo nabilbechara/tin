@@ -74,7 +74,10 @@ const cOutOff = 6
 const cClose = 7  // close once the output is written
 const cWriting = 8
 const cNeed = 9   // bytes the pending request needs, when known
-const cWords = 12
+const cTask = 10  // the request task waiting (sleep, I/O) on this connection; later requests queue
+const cAlive = 11 // that request's keep-alive
+const cDead = 12  // closed while its task waited: freed when the task ends
+const cWords = 14
 
 shared var gListen i64
 shared var gIP i64
@@ -112,9 +115,22 @@ var commonLen i64
 var lastSec i64
 var tm i64
 var rr i64
+shared var gDeadlineMs i64 // a request's waits give up this long after it started (0: never)
+shared var gDeadlineSet bool
+
+const maxWaiting = 4096 // waiting request tasks per core; past it new requests get 503
+var waiting i64        // this core's request tasks that are waiting
+
 var head bool
-var theReq Req = Req{}
-var theOut Out = Out{Body: make([]u8, 0, 65536), extra: make([]u8, 0, 1024), own: make([]u8, 0)}
+// The request serve_one hands to the task it starts (read before the task first waits).
+var pReq i64
+var pReqLen i64
+var pSp1 i64
+var pSp2 i64
+var pLe i64
+var pHend i64
+var pCl i64
+var pHead bool
 
 func c32(x i64) i64 {
 	return i64(i32(x))
@@ -205,6 +221,13 @@ func ServeN(addr str, n i64, h func(Req, mut Out)) ! {
 		fcntl(gPipes[2*i], F_SETFL, O_NONBLOCK)
 	}
 	gGrace = 25
+	if !gDeadlineSet {
+		gDeadlineMs = 30000
+	}
+	denv := getenv(cast(i64, "TIN_DEADLINE_MS") + 8)
+	if denv != 0 {
+		gDeadlineMs = atoi(denv) & 0xffffffff
+	}
 	genv := getenv(cast(i64, "TIN_GRACE") + 8)
 	if genv != 0 && atoi(genv)&0xffffffff > 0 {
 		gGrace = atoi(genv) & 0xffffffff
@@ -260,9 +283,6 @@ func core(id i64) {
 	word = block + 128
 	common = block + 640
 	tm = block + 768
-	theOut.own = theOut.Body
-	theOut.code = 200
-	theOut.ctype = "text/plain; charset=utf-8"
 	refresh_date(time(0))
 	pr := gPipes[2*id]
 	ev_level(pr)
@@ -292,7 +312,8 @@ func core(id i64) {
 		if gRelayOn {
 			relay.Arm()
 		}
-		n := ev_wait()
+		n := ev_wait(wait_ms())
+		run_timers()
 		if n <= 0 {
 			continue
 		}
@@ -489,9 +510,22 @@ func add_conn(fd i64, count bool) {
 }
 
 func close_conn(c i64) {
+	if c[cDead] != 0 {
+		return
+	}
 	fd := c[cFD]
 	close(fd)
 	conns[fd] = 0
+	if c[cTask] != 0 {
+		// Its request is still waiting: free the connection when the task ends.
+		c[cDead] = 1
+		return
+	}
+	free_conn(c)
+}
+
+// free_conn releases a closed connection's buffers.
+func free_conn(c i64) {
 	__atomic_add(gLoad+myID*128, -1)
 	if c[cIn] != 0 {
 		free(c[cIn])
@@ -544,7 +578,7 @@ func on_read_once(c i64) bool {
 	full := n == want && n > 0
 	have += n
 	off := 0
-	for off < have && c[cClose] == 0 {
+	for off < have && c[cClose] == 0 && c[cTask] == 0 {
 		r := serve_one(c, buf+off, have-off)
 		if r <= 0 {
 			break
@@ -591,7 +625,8 @@ func on_read_once(c i64) bool {
 		c[cInLen] = 0
 		c[cInCap] = 0
 	}
-	return full && c[cClose] == 0 && c[cWriting] == 0
+	rt_pool_reset()
+	return full && c[cClose] == 0 && c[cWriting] == 0 && c[cTask] == 0
 }
 
 // flush writes the batch's responses; false means the connection is gone. While the
@@ -831,29 +866,130 @@ func serve_one(c i64, p i64, n i64) i64 {
 		return 0
 	}
 	c[cNeed] = 0
-	q := theReq
-	q.Method = method_str(p, sp1)
-	t := p + sp1 + 1
-	tn := sp2 - sp1 - 1
+	if waiting >= maxWaiting {
+		// Backpressure: too many requests already wait on this core.
+		bad(c, 503)
+		return total
+	}
+	// The handler runs in a task: when it waits (tide.Wait, a client call) the core serves
+	// other connections, and this one's later requests queue until it finishes.
+	pReq = p
+	pReqLen = total
+	pSp1 = sp1
+	pSp2 = sp2
+	pLe = le
+	pHend = hend
+	pCl = cl
+	pHead = sp1 == 4 && load8(p) == 'H' && bytes_are(p, 4, "HEAD")
+	task := rt_task_new(run_request, c)
+	if gDeadlineMs > 0 {
+		rt_task_set_deadline(task, rt_mono_ns()+gDeadlineMs*1000000)
+	}
+	if rt_task_run(task) {
+		rt_task_free(task)
+		if !alive || draining {
+			c[cClose] = 1
+		}
+		return total
+	}
+	// It waits: keep its own copy of the request bytes (the read buffer is reused).
+	rb := malloc(total)
+	memcpy(rb, p, total)
+	task[tUser+1] = rb
+	rebase_request(task, rb-p)
+	c[cTask] = task
+	c[cAlive] = i64(alive)
+	waiting++
+	return total
+}
+
+// run_request is a request task's body: build the Req and Out, run the handler, and append
+// the response to the core's output batch.
+func run_request(c i64) {
+	p := pReq
+	t := p + pSp1 + 1
+	tn := pSp2 - pSp1 - 1
+	q := Req{Method: method_str(p, pSp1), Path: "", Query: "", hp: p + pLe + 1, hn: pHend - pLe - 1, bp: p + pHend, bn: pCl}
 	qm := memchr(t, '?', tn)
 	if qm == 0 {
 		q.Path = rt_str_from_raw(t, tn)
-		q.Query = ""
 	} else {
 		q.Path = rt_str_from_raw(t, qm-t)
 		q.Query = rt_str_from_raw(qm+1, tn-(qm-t)-1)
 	}
-	q.hp = p + le + 1
-	q.hn = hend - le - 1
-	q.bp = p + hend
-	q.bn = cl
-	head = sp1 == 4 && load8(p) == 'H' && bytes_are(p, 4, "HEAD")
-	gHandler(q, mut theOut)
-	respond()
-	if !alive || draining {
+	hd := pHead
+	body := make([]u8, 0, 1024)
+	w := Out{Body: body, code: 200, ctype: "text/plain; charset=utf-8", extra: make([]u8, 0, 256), own: body}
+	rt_task_current()[tUser] = cast(i64, q)
+	gHandler(q, mut w)
+	respond_out(w, hd)
+}
+
+// rebase_request points a waiting task's Req at its own copy of the request bytes.
+func rebase_request(task i64, delta i64) {
+	q := cast(Req, task[tUser])
+	q.hp += delta
+	q.bp += delta
+}
+
+// finish_request completes connection c after its waiting task finished: write the
+// response, then serve the requests that queued behind it.
+func finish_request(c i64, task i64) {
+	free(task[tUser+1])
+	rt_task_free(task)
+	waiting--
+	c[cTask] = 0
+	if c[cDead] != 0 {
+		obLen = 0
+		free_conn(c)
+		return
+	}
+	if c[cAlive] == 0 || draining {
 		c[cClose] = 1
 	}
-	return total
+	if !flush(c) {
+		return
+	}
+	if c[cWriting] == 0 {
+		on_read(c)
+	}
+}
+
+// resume_task continues a task that waited; when it ends, its connection moves on.
+func resume_task(task i64) {
+	if rt_task_run(task) {
+		finish_request(task[tArg], task)
+	}
+}
+
+// run_timers resumes every task whose wait is over.
+func run_timers() {
+	task := rt_timer_pop(rt_mono_ns())
+	for task != 0 {
+		resume_task(task)
+		task = rt_timer_pop(rt_mono_ns())
+	}
+}
+
+// wait_ms is how long the event loop may block: until the earliest task wake-up, or -1.
+func wait_ms() i64 {
+	next := rt_timer_next()
+	if next < 0 {
+		return -1
+	}
+	d := next - rt_mono_ns()
+	if d <= 0 {
+		return 0
+	}
+	return (d + 999999) / 1000000
+}
+
+// Deadline makes every request's waits (tide.Wait, client calls) fail with "deadline
+// exceeded" once ms have passed since the request started (0: no deadline; call before
+// Serve). TIN_DEADLINE_MS sets it too; the default is 30000.
+func Deadline(ms i64) {
+	gDeadlineMs = ms
+	gDeadlineSet = true
 }
 
 // is_http1 reports whether the 8 bytes at p start with "HTTP/1.".
@@ -894,10 +1030,10 @@ func parse_cl(p i64, n i64) i64 {
 }
 
 func bad(c i64, code i64) {
-	theOut.code = code
-	rt_append_str(cast(i64, theOut.Body), status_text(code))
-	head = false
-	respond()
+	body := make([]u8, 0, 64)
+	w := Out{Body: body, code: code, ctype: "text/plain; charset=utf-8", extra: make([]u8, 0), own: body}
+	w.Body = append(w.Body, status_text(code)...)
+	respond_out(w, false)
 	c[cClose] = 1
 }
 
@@ -920,10 +1056,8 @@ func ob_raw(p i64, n i64) {
 	obLen += n
 }
 
-// respond appends the response the handler built to the batch, then resets for the
-// next request: Out, Req and the core's request pool.
-func respond() {
-	w := theOut
+// respond_out appends response w to the core's output batch.
+func respond_out(w Out, hd bool) {
 	bh := cast(i64, w.Body)
 	eh := cast(i64, w.extra)
 	bn := bh[0]
@@ -952,24 +1086,9 @@ func respond() {
 		ob_str("Connection: close\r\n")
 	}
 	ob_str("\r\n")
-	if !head {
+	if !hd {
 		ob_raw(bh[2], bn)
 	}
-	oh := cast(i64, w.own)
-	oh[0] = 0
-	eh[0] = 0
-	w.Body = w.own
-	w.code = 200
-	w.ctype = "text/plain; charset=utf-8"
-	q := theReq
-	q.Method = ""
-	q.Path = ""
-	q.Query = ""
-	q.hp = 0
-	q.hn = 0
-	q.bp = 0
-	q.bn = 0
-	rt_pool_reset()
 }
 
 func status_line(code i64) str {
@@ -1008,6 +1127,10 @@ func status_line(code i64) str {
 		return "HTTP/1.1 501 Not Implemented\r\n"
 	case 503:
 		return "HTTP/1.1 503 Service Unavailable\r\n"
+	case 502:
+		return "HTTP/1.1 502 Bad Gateway\r\n"
+	case 504:
+		return "HTTP/1.1 504 Gateway Timeout\r\n"
 	}
 	b := make([]u8, 0, 32)
 	b = append(b, "HTTP/1.1 "...)

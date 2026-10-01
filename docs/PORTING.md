@@ -86,7 +86,8 @@ The plan (`notes/plan_linux.md`) and the work log (`notes/x64_progress.md`):
 2. A backend: instruction list + encoder (+ printer for `-S`) + code generator over the
    lowered AST (see COMPILER.md §7 for what the arm64 one does).
 3. A linker for the object format.
-4. Platform files: `runtime_<os>.tin` with every helper of RUNTIME.md §8, the event-loop
+4. Platform files: `runtime_<os>.tin` with every helper of RUNTIME.md §8 (and, per CPU,
+   `rt_task_init`, plus the hand-assembled `rt_task_swap` in the backend), the event-loop
    functions for anvil (`ev_init`, `ev_level`, `ev_conn`, `ev_conn_write`,
    `ev_conn_read`, `ev_timer`, `ev_timer_ack`, `ev_wait`, `ev_fd`, `ev_writable`,
    `ev_hangup`, `ownListener`, and for shutdown `ev_signals`, `ev_signal`, `ev_signal_ack`,

@@ -12,6 +12,7 @@ extern func malloc(n i64) i64
 extern func calloc(n i64, size i64) i64
 extern func realloc(p i64, n i64) i64
 extern func free(p i64)
+extern func nanosleep(req i64, rem i64) i64
 extern func memcpy(dst i64, src i64, n i64) i64
 extern func memmove(dst i64, src i64, n i64) i64
 extern func memcmp(a i64, b i64, n i64) i64
@@ -2177,4 +2178,242 @@ func rt_fmt_slp(s i64) {
 		fmt_int(f, d[i], 'x')
 	}
 	fb_byte(f, ']')
+}
+
+// ---- tasks: a stack per in-flight request, switched in user space ----
+//
+// A task runs a func(i64) on its own 256 KiB stack (a guard region below it faults on
+// overflow) with its own request pool. rt_task_run switches into it from the core's own
+// stack; the task runs until it finishes or waits (rt_task_yield), and then the core
+// continues. rt_task_swap (hand-assembled by the compiler for each CPU) saves and loads
+// only what a call preserves: callee-saved registers, frame pointer, return address and
+// stack pointer. The core context register is the same on every task of a core.
+
+extern func mmap(addr i64, n i64, prot i64, flags i64, fd i64, off i64) i64
+extern func mprotect(addr i64, n i64, prot i64) i64
+
+const taskStack = 262144
+const taskGuard = 16384
+const tSave = 0      // 20 words of registers (layout per CPU, see rt_task_init)
+const tFn = 20
+const tArg = 21
+const tStack = 22    // the mapping: guard region, then the stack
+const tDone = 23
+const tPool = 24     // the task's pool words: bump, end, base, mark, extra
+const tWake = 29     // waiting: when to resume (mono ns)
+const tDeadline = 30 // 0, or when every wait of this task gives up (mono ns)
+const tFault = 31    // why the last wait ended: 0 woken, 1 deadline
+const tNext = 32     // free list link
+const tUser = 33     // 6 words for the owner (anvil keeps its connection here)
+const taskWords = 40
+
+var curTask i64   // per core: the running task, 0 on the core's own stack
+var schedSave i64 // per core: the core's own registers while a task runs
+var schedPool i64 // per core: the core's own pool words while a task runs
+var freeTasks i64 // per core: finished tasks, reused with their stacks
+var timerHeap i64 // per core: waiting tasks, a min-heap on tWake
+var timerN i64
+var timerCap i64
+
+// rt_task_swap stores the running registers into from and continues with those in to.
+func rt_task_swap(from i64, to i64) {
+}
+
+// rt_task_new makes a task that will run body(arg); rt_task_run starts it.
+func rt_task_new(body func(i64), arg i64) i64 {
+	t := freeTasks
+	if t != 0 {
+		freeTasks = t[tNext]
+	} else {
+		t = calloc(taskWords, 8)
+		base := mmap(0, taskStack+taskGuard, 3, MAP_STACK, -1, 0)
+		if base == -1 || base == 0 {
+			rt_panic("cannot map a task stack")
+		}
+		mprotect(base, taskGuard, 0)
+		t[tStack] = base
+	}
+	t[tFn] = cast(i64, body)
+	t[tArg] = arg
+	t[tDone] = 0
+	t[tFault] = 0
+	t[tDeadline] = 0
+	t[tWake] = 0
+	t[tNext] = 0
+	for i := 0; i < 20; i++ {
+		t[tSave+i] = 0
+	}
+	rt_task_init(t, (t[tStack]+taskStack+taskGuard)&-16)
+	return t
+}
+
+// rt_task_entry is where a new task starts: it runs its function, zeroes its pool and
+// switches back for good (a reused task starts over from rt_task_new).
+func rt_task_entry() {
+	t := curTask
+	f := cast(func(i64), t[tFn])
+	f(t[tArg])
+	rt_pool_reset()
+	t[tDone] = 1
+	rt_task_swap(t, schedSave)
+}
+
+// rt_task_run runs task t until it finishes (true) or waits (false).
+func rt_task_run(t i64) bool {
+	if schedSave == 0 {
+		schedSave = calloc(20, 8)
+		schedPool = calloc(5, 8)
+	}
+	c := __ctx()
+	schedPool[0] = c[ctxBump]
+	schedPool[1] = c[ctxEnd]
+	schedPool[2] = c[ctxPoolBase]
+	schedPool[3] = c[ctxPoolMark]
+	schedPool[4] = c[ctxPoolExtra]
+	c[ctxBump] = t[tPool]
+	c[ctxEnd] = t[tPool+1]
+	c[ctxPoolBase] = t[tPool+2]
+	c[ctxPoolMark] = t[tPool+3]
+	c[ctxPoolExtra] = t[tPool+4]
+	curTask = t
+	rt_task_swap(schedSave, t)
+	curTask = 0
+	t[tPool] = c[ctxBump]
+	t[tPool+1] = c[ctxEnd]
+	t[tPool+2] = c[ctxPoolBase]
+	t[tPool+3] = c[ctxPoolMark]
+	t[tPool+4] = c[ctxPoolExtra]
+	c[ctxBump] = schedPool[0]
+	c[ctxEnd] = schedPool[1]
+	c[ctxPoolBase] = schedPool[2]
+	c[ctxPoolMark] = schedPool[3]
+	c[ctxPoolExtra] = schedPool[4]
+	return t[tDone] != 0
+}
+
+// rt_task_yield switches from the running task back to the core; rt_task_run continues it.
+func rt_task_yield() {
+	t := curTask
+	if t == 0 {
+		rt_panic("rt_task_yield outside a task")
+	}
+	rt_task_swap(t, schedSave)
+}
+
+// rt_task_free returns a finished task (its stack and pool) for reuse.
+func rt_task_free(t i64) {
+	t[tNext] = freeTasks
+	freeTasks = t
+}
+
+func rt_task_current() i64 {
+	return curTask
+}
+
+// rt_task_set_deadline makes every wait of task t give up at mono time at (0: never).
+func rt_task_set_deadline(t i64, at i64) {
+	t[tDeadline] = at
+}
+
+// rt_task_sleep waits ns: inside a task the core runs other tasks meanwhile; outside one
+// it blocks. It returns true when the task's deadline cut the wait short.
+func rt_task_sleep(ns i64) bool {
+	t := curTask
+	if t == 0 {
+		rt_sleep_ns(ns)
+		return false
+	}
+	wake := rt_mono_ns() + ns
+	t[tFault] = 0
+	if t[tDeadline] > 0 && wake >= t[tDeadline] {
+		wake = t[tDeadline]
+		t[tFault] = 1
+	}
+	t[tWake] = wake
+	rt_timer_push(t)
+	rt_task_yield()
+	return t[tFault] != 0
+}
+
+// rt_sleep_ns blocks the thread for ns.
+func rt_sleep_ns(ns i64) {
+	if ns <= 0 {
+		return
+	}
+	ts := rt_alloc(32)
+	ts[0] = ns / 1000000000
+	ts[1] = ns % 1000000000
+	for i64(i32(nanosleep(ts, ts+16))) != 0 {
+		if rt_errno() != EINTR {
+			return
+		}
+		ts[0] = ts[2]
+		ts[1] = ts[3]
+	}
+}
+
+func rt_timer_push(t i64) {
+	if timerN == timerCap {
+		nc := timerCap * 2
+		if nc < 64 {
+			nc = 64
+		}
+		nh := calloc(nc, 8)
+		if timerN > 0 {
+			memcpy(nh, timerHeap, timerN*8)
+			free(timerHeap)
+		}
+		timerHeap = nh
+		timerCap = nc
+	}
+	i := timerN
+	timerN++
+	for i > 0 {
+		p := (i - 1) / 2
+		up := timerHeap[p]
+		if up[tWake] <= t[tWake] {
+			break
+		}
+		timerHeap[i] = up
+		i = p
+	}
+	timerHeap[i] = t
+}
+
+// rt_timer_next is when the earliest waiting task wants to run (mono ns), or -1.
+func rt_timer_next() i64 {
+	if timerN == 0 {
+		return -1
+	}
+	return timerHeap[0][tWake]
+}
+
+// rt_timer_pop removes and returns a task whose wake time has come, or 0.
+func rt_timer_pop(now i64) i64 {
+	if timerN == 0 || timerHeap[0][tWake] > now {
+		return 0
+	}
+	top := timerHeap[0]
+	timerN--
+	last := timerHeap[timerN]
+	i := 0
+	for {
+		l := 2*i + 1
+		if l >= timerN {
+			break
+		}
+		m := l
+		if l+1 < timerN && timerHeap[l+1][tWake] < timerHeap[l][tWake] {
+			m = l + 1
+		}
+		if timerHeap[m][tWake] >= last[tWake] {
+			break
+		}
+		timerHeap[i] = timerHeap[m]
+		i = m
+	}
+	if timerN > 0 {
+		timerHeap[i] = last
+	}
+	return top
 }

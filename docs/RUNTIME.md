@@ -209,6 +209,30 @@ Balancing: on Linux each core accepts on its own `SO_REUSEPORT` listener, then h
 connection to the least-loaded core (per-core live-connection counters) when its own load
 is more than one above it. Graceful shutdown on SIGTERM/SIGINT: see PORTING.md §4.
 
+### Request tasks (v0.4)
+
+Every request's handler runs in a **task**: its own 256 KiB stack (mmap'd, with a 16 KiB
+`PROT_NONE` guard region below it, so an overflow faults instead of corrupting memory) and
+its own request pool. `rt_task_run` switches into a task from the core's stack;
+`rt_task_swap`, hand-assembled per CPU, saves and loads only what a call preserves (arm64:
+x19–x27, x29, x30, sp, d8–d15; x86-64: rbx, rbp, r12–r14, rsp and the return address), about
+ten nanoseconds. x28 / r15, the core context, is the same on every task of a core, and the
+core's pool words (bump, end, base, mark, extra) are swapped in and out with the task.
+
+- A handler that never waits finishes inside `rt_task_run`: two switches and nothing else,
+  so the fast path keeps its speed (measured: 308–310k req/s on one core, as before).
+- A handler that waits (`tide.Wait`, `tide.Sleep`; network and helper calls in later
+  phases) yields: the request's bytes are copied out of the shared read buffer, the
+  connection stops serving its later pipelined requests (responses stay in order), and the
+  core goes back to its event loop. Sleeping tasks sit in a per-core min-heap; the loop
+  waits at most until the earliest wake-up (`ev_wait(ms)`), then resumes due tasks. A task
+  that finishes appends its response, flushes, and its connection serves what queued.
+- Deadlines: each request's waits give up at `anvil.Deadline(ms)` / `TIN_DEADLINE_MS`
+  (default 30 s) after it started: `tide.Wait` then fails with `deadline exceeded`.
+- Backpressure: at 4096 waiting requests on a core, new requests get 503.
+- A connection closed while its request waits is marked dead and freed when the task ends.
+- Finished tasks go on a per-core free list with their stacks and pools.
+
 ## 10. JSON: argo
 
 - `argo.Put(mut b, v)` compiles to a call of a generated encoder `argo$N(b, x)` per type.

@@ -20,8 +20,11 @@ func kadd(fd i64, filter i64, flags i64) {
 	kevent(kq, change, 1, 0, 0, 0)
 }
 
+var waitTs i64 // per core: the timespec ev_wait passes kevent
+
 func ev_init() {
 	kq = c32(kqueue())
+	waitTs = malloc(16)
 }
 
 // ev_level watches fd for reading, level-triggered (listeners, pipes, wakers).
@@ -84,8 +87,14 @@ func ev_signal(i i64) bool {
 func ev_signal_ack() {
 }
 
-func ev_wait() i64 {
-	return c32(kevent(kq, 0, 0, evs, maxEvents, 0))
+// ev_wait waits for events, at most ms milliseconds (-1: no limit).
+func ev_wait(ms i64) i64 {
+	if ms < 0 {
+		return c32(kevent(kq, 0, 0, evs, maxEvents, 0))
+	}
+	waitTs[0] = ms / 1000
+	waitTs[1] = (ms % 1000) * 1000000
+	return c32(kevent(kq, 0, 0, evs, maxEvents, waitTs))
 }
 
 func ev_fd(i i64) i64 {
