@@ -42,7 +42,7 @@ func New(fd i64) Reader {
 func Open(path str) (Reader, fault) {
 	fd := i64(i32(open(cast(i64, path)+8, 0)))
 	if fd < 0 {
-		return Reader{buf: make([]u8, 0)}, errno_fault(path)
+		return Reader{fd: -1, buf: make([]u8, 0)}, errno_fault(path)
 	}
 	return New(fd), nil
 }
@@ -167,7 +167,7 @@ func Stdout() Writer {
 func Create(path str) (Writer, fault) {
 	fd := i64(i32(open(cast(i64, path)+8, O_WRITE_CREATE, 420)))
 	if fd < 0 {
-		return Writer{buf: make([]u8, 0)}, errno_fault(path)
+		return Writer{fd: -1, buf: make([]u8, 0)}, errno_fault(path)
 	}
 	return NewWriter(fd), nil
 }
@@ -204,6 +204,10 @@ func (w mut Writer) Flush() fault {
 	h := cast(i64, w.buf)
 	p := h[2]
 	n := h[0]
+	if n > 0 && w.fd < 0 {
+		w.err = fail("flume: write: writer is closed")
+		n = 0
+	}
 	for n > 0 {
 		k := write(w.fd, p, n)
 		if k < 0 {
@@ -221,9 +225,16 @@ func (w mut Writer) Flush() fault {
 	return w.err
 }
 
-// Close flushes and closes the writer's descriptor.
+// Close flushes and closes the writer's descriptor once; closing again (or a writer that never opened) is a fault.
 func (w mut Writer) Close() fault {
+	if w.fd < 0 {
+		return fail("flume: close: writer is closed")
+	}
 	err := w.Flush()
-	close(w.fd)
+	fd := w.fd
+	w.fd = -1
+	if i64(i32(close(fd))) < 0 && err == nil {
+		err = errno_fault("close")
+	}
 	return err
 }
