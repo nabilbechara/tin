@@ -12,11 +12,11 @@
   make linux-amd64-bootstrap).
 
 ## Next, in order
-1. Benchmark anvil vs Go on real x86-64 hardware (CI now runs linux-amd64 natively on
+1. Phased plan in issue #46 (v0.5 syntax, then v0.4). Also: benchmark anvil vs Go on real x86-64 hardware (CI now runs linux-amd64 natively on
    ubuntu-24.04, but shared runners are too noisy for the benchmark gate).
 2. cores-stable.tin failed once on emulated amd64 ("cannot start a core thread"), then passed
    7 runs; probably emulator memory pressure with 11 x 8 MiB stacks. Watch it in native CI.
-3. wire: issues #43 (Content-Length trusted up front) and #44 (Transfer-Encoding variants).
+3. wire: #43 and #44 fixed in Phase 1.
 4. seal on arm64 CPUs without SHA-2 (AT_HWCAP fallback) is untested on real hardware.
 5. Benchmark suites to add (bench/): rest of the Benchmarks Game (fasta, k-nucleotide,
    reverse-complement; pidigits needs bigints, regex-redux a regex package), Are We Fast Yet,

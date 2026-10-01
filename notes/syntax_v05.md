@@ -312,4 +312,4 @@ func main() {
 | migrate stdlib, tests, docs (`(T, fault)` → `!T`, `mut` at call sites) | mechanical | 0.5 day |
 | **total** | | **about 7 days** |
 
-`query` parameters for `ledger`/`cask` come with v0.4, built on interpolation.
+`query` parameters for the `mysql` and `redis` clients come with v0.4, built on interpolation.

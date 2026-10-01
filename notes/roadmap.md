@@ -7,11 +7,16 @@
 4. Docs: docs/LANGUAGE.md, docs/STDLIB.md (generated), README. Done.
 5. Final benchmarks (README). Done.
 
-## Linux port (paused 2026-10-01; resume from notes/resume.md)
-Phase 1 linux-arm64: done pending final re-verification. Phase 2 linux-amd64: in progress
-(notes/x64_progress.md).
+## Linux port (done 2026-10-01)
+linux-arm64 and linux-amd64 pass every suite and self-host; CI runs all three targets
+natively. All review issues (#1–#21, #43, #44) are fixed.
 
-## v0.4 (next; design in notes/design_v04.md, waiting for the user's review): non-blocking I/O inside handlers
+## v0.5: syntax (notes/syntax_v05.md; phases 2–8 of #46)
+Go syntax kept; adds `!T`/`fail`/`catch`, call-site `mut`, `for i := range n`, the
+capitalized-export rule, string interpolation, enums with exhaustive `switch`, more map key
+types with insertion order, `f32`, and Go-style `*_test.tin` tests.
+
+## v0.4: non-blocking I/O inside handlers (design in notes/design_v04.md; phases 9–13 of #46)
 From the user's spec (2026-10-01):
 - Stackful tasks per in-flight request on each core; waiting on a socket registers the fd with
   the core's kqueue and switches to the event loop; resume when ready. Pooled task stacks with
