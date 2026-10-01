@@ -8,17 +8,15 @@
   tests/regressions/ or tools/ci/.
 - darwin-arm64 and linux-arm64: complete, tested natively in CI.
 - linux-amd64: every tests/v2, tests/regressions and legacy test passes and the compiler
-  self-hosts, in the emulated tin-debian-amd64 container (tools/x64fuzz/linuxtest_amd64.sh).
-  Not in CI yet.
+  self-hosts; CI runs it natively on ubuntu-24.04 (seed/tinc-linux-amd64,
+  make linux-amd64-bootstrap).
 
 ## Next, in order
-1. Native x86-64 CI job: commit seed/tinc-linux-amd64 (cross-compile, then let it rebuild
-   itself in the container to a fixed point), add ubuntu-24.04 to the ci.yml matrix and
-   promote the amd64 probe (docs/CI.md). Then benchmark anvil vs Go on that hardware.
+1. Benchmark anvil vs Go on real x86-64 hardware (CI now runs linux-amd64 natively on
+   ubuntu-24.04, but shared runners are too noisy for the benchmark gate).
 2. cores-stable.tin failed once on emulated amd64 ("cannot start a core thread"), then passed
    7 runs; probably emulator memory pressure with 11 x 8 MiB stacks. Watch it in native CI.
-3. wire leftovers: Content-Length bodies allocate the full announced size up front;
-   Transfer-Encoding values other than exactly "chunked" are read until EOF.
+3. wire: issues #43 (Content-Length trusted up front) and #44 (Transfer-Encoding variants).
 4. seal on arm64 CPUs without SHA-2 (AT_HWCAP fallback) is untested on real hardware.
 5. Benchmark suites to add (bench/): rest of the Benchmarks Game (fasta, k-nucleotide,
    reverse-complement; pidigits needs bigints, regex-redux a regex package), Are We Fast Yet,

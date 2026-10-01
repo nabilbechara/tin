@@ -3,7 +3,7 @@ SELF = lib/std.tin selfhost/util.tin selfhost/lex.tin selfhost/types.tin selfhos
        selfhost/sha256.tin selfhost/macho.tin selfhost/elf.tin selfhost/elf_x64.tin selfhost/main.tin \
        selfhost/host_$(HOST_OS).tin
 
-.PHONY: all bootstrap seed test bench clean install linux-bootstrap linux-test
+.PHONY: all bootstrap seed test bench clean install linux-bootstrap linux-amd64-bootstrap linux-test
 
 HOST_OS := $(shell uname -s | tr A-Z a-z)
 # Where `make install` links tin: Homebrew's prefix on a Mac that has one, /usr/local elsewhere.
@@ -60,6 +60,17 @@ linux-bootstrap: bin/linux/tinc
 	docker run --rm -v $(CURDIR):/src -w /src $${TIN_LINUX_IMAGE:-tin-debian-arm64} sh -c '\
 	  bin/linux/tinc -o /tmp/s2 $(SELF_LINUX) && /tmp/s2 -o /tmp/s3 $(SELF_LINUX) && cmp /tmp/s2 /tmp/s3 && \
 	  cp /tmp/s3 seed/tinc-linux-arm64 && echo "linux fixed point: tinc compiles itself to an identical binary"'
+
+# The same for linux-amd64, run in an (emulated on arm64 hosts) amd64 container; refreshes
+# seed/tinc-linux-amd64.
+bin/linux-amd64/tinc: bin/tinc $(SELF_LINUX)
+	@mkdir -p bin/linux-amd64
+	bin/tinc -target linux-amd64 -o $@ $(SELF_LINUX)
+
+linux-amd64-bootstrap: bin/linux-amd64/tinc
+	docker run --rm --platform linux/amd64 -v $(CURDIR):/src -w /src $${TIN_LINUX_AMD64_IMAGE:-tin-debian-amd64} sh -c '\
+	  bin/linux-amd64/tinc -o /tmp/s2 $(SELF_LINUX) && /tmp/s2 -o /tmp/s3 $(SELF_LINUX) && cmp /tmp/s2 /tmp/s3 && \
+	  cp /tmp/s3 seed/tinc-linux-amd64 && echo "linux-amd64 fixed point: tinc compiles itself to an identical binary"'
 
 linux-test: bin/tinc
 	tools/linuxtest.sh bin/tinc

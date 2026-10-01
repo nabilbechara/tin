@@ -1,19 +1,19 @@
 # Continuous integration and regression policy
 
-Every push to `main` and every pull request runs native Linux arm64 (`ubuntu-24.04-arm`) and macOS arm64 (`macos-15`) checks. Merge groups and manual runs use the same workflow. The final **CI** check succeeds only when both native jobs and the issue-policy job succeed; skipped, cancelled and failed dependencies cannot produce a green gate. Main requires this GitHub Actions check and an up-to-date PR branch, including for administrators.
+Every push to `main` and every pull request runs native Linux arm64 (`ubuntu-24.04-arm`), Linux x86-64 (`ubuntu-24.04`) and macOS arm64 (`macos-15`) checks. Merge groups and manual runs use the same workflow. The final **CI** check succeeds only when every native job and the issue-policy job succeed; skipped, cancelled and failed dependencies cannot produce a green gate. Main requires this GitHub Actions check and an up-to-date PR branch, including for administrators.
 
 ## What is tested
 
 - Clean build from the committed seed and two byte-identical self-hosted compiler rebuilds.
 - Every `tests/v2/*.tin`, including negative compilation tests and their exact diagnostics. Missing expected output, compiler crashes, process crashes, nonzero exit and timeouts fail. Each run uses fresh executable paths.
-- Legacy native-executable compatibility on both platforms; original Go bootstrap and assembly linkage on macOS (the original bootstrap emits Darwin assembly).
+- Legacy native-executable compatibility on every platform; original Go bootstrap and assembly linkage on macOS (the original bootstrap emits Darwin assembly).
 - Memory regressions: bounds panics, allocation size overflow and negative lengths, large first allocations, single evaluation of allocation lengths, read-only and region checking through indirect calls, nested zero values, deep `keep` ownership and 200 request-pool reset/reuse cycles.
 - Linux HTTP framing/conformance, stable RSS over two million requests after warmup, and graceful shutdown. Throughput is reported, never used as a performance threshold.
 - Harness self-tests ensure expected output cannot disguise crashes/timeouts or unexpectedly accepted negative programs.
 
 The Python harness uses only the standard library. Shell entrypoints now require Python 3. Native runtime probes have a 20-second timeout, core dumps disabled, and a 512 MiB virtual-memory limit on Linux. The first-allocation crash reproducer is Linux-only: macOS can map writable memory beyond the undersized allocation, making a SIGSEGV expectation unreliable there. HTTP tests require `ps` (available on hosted Ubuntu).
 
-Linux amd64 is **not yet a supported execution gate**. Its compilation blocker (#1) is probed on every native job without modifying the runtime. Once that blocker is fixed, promote the probe and add a native amd64 full-suite job as part of port enablement, covering #12–15. Do not apply temporary production patches in CI to make an incomplete port look supported.
+Linux amd64 is a supported execution gate: the `ubuntu-24.04` job builds the compiler from `seed/tinc-linux-amd64`, checks the self-hosting fixed point and runs every suite natively on x86-64 hardware. Refresh that seed with `make linux-amd64-bootstrap` (emulated container on an arm64 Mac).
 
 ## Existing defects versus new regressions
 

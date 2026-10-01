@@ -23,7 +23,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04-arm, macos-15]
+        include:
+          - os: ubuntu-24.04-arm
+            arch: arm64
+          - os: macos-15
+            arch: arm64
+          - os: ubuntu-24.04
+            arch: amd64
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -33,8 +39,11 @@ jobs:
           go-version-file: go.mod
           cache: false
       - name: Verify native architecture
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
         run: |
-          case "$(uname -m)" in arm64|aarch64) ;; *) echo 'Expected native ARM64'; exit 1 ;; esac
+          case "$(uname -m)" in arm64|aarch64) arch=arm64 ;; x86_64|amd64) arch=amd64 ;; *) arch=unknown ;; esac
+          test "$arch" = "$EXPECTED_ARCH" || { echo "Expected native $EXPECTED_ARCH, got $(uname -m)"; exit 1; }
       - name: Test the test harness
         run: python3 -m unittest discover -s tools/ci -p 'test_*.py' -v
       - name: Build from seed and verify self-hosting fixed point
@@ -57,7 +66,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: diagnostics-${{ matrix.os }}
+          name: diagnostics-${{ matrix.os }}-${{ matrix.arch }}
           path: |
             bin/ci/**/*.log
             bin/ci/**/*.json

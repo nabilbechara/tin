@@ -67,6 +67,7 @@ tinc [-o OUT] [-S] [-target darwin-arm64|linux-arm64|linux-amd64] FILE.tin...
 | `make test` | the strict suite, then the legacy suites in three modes (stage 0 Go compiler, native tinc, tinc -S through cc) |
 | `make linux-test` | cross-compile every strict test for linux-arm64 and run it in an arm64 container (`tools/linuxtest.sh`) |
 | `make linux-bootstrap` | cross-compile a Linux compiler, then in the container it must rebuild itself identically; refreshes `seed/tinc-linux-arm64` |
+| `make linux-amd64-bootstrap` | the same for x86-64 in `tin-debian-amd64` (emulated on an arm64 Mac); refreshes `seed/tinc-linux-amd64` |
 | `make bench` | the legacy CPU benchmarks vs Go (`bench/run.py`) |
 | `make install` | link `tin` into `$(PREFIX)/bin` (created if needed; see §1 for the default) |
 | `make print-VAR` | print a Makefile variable (e.g. `make print-SELF`, the compiler's sources) |
@@ -166,7 +167,7 @@ lib/                runtime and standard library (RUNTIME.md, STDLIB.md)
 tests/v2/           strict tests and expected outputs
 tests/*.tin         legacy tests (driven by bootstrap/*_test.go)
 bootstrap/          stage 0: the original Go compiler and the legacy harness
-seed/               tinc-darwin-arm64, tinc-linux-arm64: the compilers that start a build
+seed/               tinc-darwin-arm64, tinc-linux-arm64, tinc-linux-amd64: the compilers that start a build
 examples/           api.tin (HTTP server), demo.tin, fib.tin, demo_go/
 bench/              v2/ CPU benchmarks, http/ HTTP benchmarks and tools, ref/ Go references
 tools/              test runners, debugging helpers, gendoc.py, x64fuzz/
