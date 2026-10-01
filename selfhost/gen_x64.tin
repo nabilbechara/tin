@@ -73,7 +73,11 @@ fn x_load_imm(dst, v) {
 
 // x_ld loads from memory operand m: a sized integer load (kind as X_LOAD) or a double.
 fn x_ld(dst, m, kind) {
-    if is_fp(dst) {
+    if is_fp(dst) && (kind & 3) == 2 {
+        // An f32 in memory becomes the f64 with the same value in a register.
+        emit2(X_MOVSS_LD, dst, m);
+        emit2(X_CVTSS2SD, dst, dst);
+    } else if is_fp(dst) {
         emit2(X_MOVSD_LD, dst, m);
     } else {
         emit3(X_LOAD, dst, m, kind);
@@ -81,7 +85,10 @@ fn x_ld(dst, m, kind) {
 }
 
 fn x_st(src, m, size) {
-    if is_fp(src) {
+    if is_fp(src) && size == 2 {
+        emit2(X_CVTSD2SS, XFSCR, src);
+        emit2(X_MOVSS_ST, XFSCR, m);
+    } else if is_fp(src) {
         emit2(X_MOVSD_ST, src, m);
     } else {
         emit3(X_STORE, src, m, size);
@@ -803,6 +810,16 @@ fn x_gen_conv(e, dst, d) {
         return;
     }
     let v = x_gen_val(x, d);
+    if k == CV_ROUND32 {
+        emit2(X_CVTSD2SS, dst, v);
+        emit2(X_CVTSS2SD, dst, dst);
+        return;
+    }
+    if k == CV_F2BITS32 {
+        emit2(X_CVTSD2SS, XFSCR, v);
+        emit2(X_MOVD_RX, dst, XFSCR);
+        return;
+    }
     if k == CV_I2F {
         if is_unsigned_t(x[N_TYPE]) && x[N_TYPE][TY_WIDTH] == 8 {
             x_cvt_u2f(dst, v);

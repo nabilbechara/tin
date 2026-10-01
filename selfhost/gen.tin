@@ -1053,6 +1053,16 @@ fn gen_conv(e, dst, d) {
         return;
     }
     let v = gen_val(x, d);
+    if k == CV_ROUND32 {
+        emit2(I_FCVTSD, dst, v);
+        emit2(I_FCVTDS, dst, dst);
+        return;
+    }
+    if k == CV_F2BITS32 {
+        emit2(I_FCVTSD, FPR + 31, v);
+        emit2(I_FMOVWS, dst, FPR + 31);
+        return;
+    }
     if k == CV_I2F {
         if is_unsigned_t(x[N_TYPE]) && x[N_TYPE][TY_WIDTH] == 8 {
             emit2(I_UCVTF, dst, v);
@@ -1082,6 +1092,9 @@ fn gen_conv(e, dst, d) {
 // ---- sized memory ----
 
 fn mem_kind(t) {
+    if is_f32(t) {
+        return 2 | MK_FLOAT;
+    }
     if is_float_t(t) {
         return 3 | MK_FLOAT;
     }
@@ -1139,10 +1152,18 @@ fn emit_load(dst, t) {
     } else {
         emit4(I_LD, dst, mm_base, mm_off, kind);
     }
+    if is_f32(t) && is_fp(dst) {
+        // An f32 lives in registers as the f64 with the same value.
+        emit2(I_FCVTDS, dst, dst);
+    }
 }
 
 fn emit_store(v, t) {
     let kind = mem_kind(t);
+    if is_f32(t) && is_fp(v) {
+        emit2(I_FCVTSD, FPR + 31, v);
+        v = FPR + 31;
+    }
     if mm_index >= 0 {
         emit4(I_STX, v, mm_base, mm_index, kind | MK_SCALED);
     } else {

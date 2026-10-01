@@ -21,7 +21,7 @@ the compiler: write a minimal repro to notes/compiler_bugs_NAME.md and work arou
 - Files start `package main` (programs) or `package NAME` (lib/NAME.tin, imported with
   `import "NAME"`, called as `NAME.Func`). `import "./geom"` imports a local file or directory
   package. Capitalized names, methods and fields are exported; lower-case ones are private to their package.
-- Types: i8 i16 i32 i64 u8 u16 u32 u64, f64, bool, str (immutable bytes), [N]T arrays, []T (reference
+- Types: i8 i16 i32 i64 u8 u16 u32 u64, f64, f32 (exact float32 semantics, 4 bytes in slices), bool, str (immutable bytes), [N]T arrays, []T (reference
   header; append mutates it in place and returns it), map[K]V (K = str, ints, bool, f64, or structs/enums of those, by value; insertion-ordered), struct (reference,
   never nil; == compares identity), ?T optional (may be nil), fault (error; nil = ok), func(...) values
   (top-level functions or literals without captures).

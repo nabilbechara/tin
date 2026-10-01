@@ -116,6 +116,7 @@ or with the code passed to `quarry.Exit`.
 | `i8 i16 i32 i64` | 1 2 4 8 | signed integers; arithmetic wraps |
 | `u8 u16 u32 u64` | 1 2 4 8 | unsigned integers; arithmetic wraps |
 | `f64` | 8 | IEEE-754 double |
+| `f32` | 4 | IEEE-754 single: every operation rounds to f32 exactly as Go's float32 does (it is computed in f64 and rounded, which is exact for + - * / and conversions); `[]f32` uses 4 bytes per element; prints and encodes to JSON in its own shortest form (`f32(0.1)` is `0.1`) |
 | `bool` | 1 | `true`, `false` |
 | `str` | ref | immutable bytes (UTF-8 by convention); never nil; zero value `""` |
 | `[]T` | ref | slice: a reference to a header (length, capacity, data) |

@@ -39,6 +39,7 @@ var ty_int;
 var ty_bool;
 var ty_byte;
 var ty_float;
+var ty_f32;
 var ty_string;
 var ty_void;
 var ty_nil;
@@ -85,6 +86,8 @@ fn types_init() {
     ty_bool = ty_new(K_BOOL, "bool");
     ty_bool[TY_WIDTH] = 1;
     ty_float = ty_new(K_FLOAT, "f64");
+    ty_f32 = ty_new(K_FLOAT, "f32");
+    ty_f32[TY_WIDTH] = 4;
     ty_string = ty_new(K_STRING, "str");
     ty_void = ty_new(K_VOID, "void");
     ty_nil = ty_new(K_NIL, "nil");
@@ -94,6 +97,7 @@ fn types_init() {
     ty_error = ty_new(K_ERROR, "fault");
     name_type("bool", ty_bool);
     name_type("f64", ty_float);
+    name_type("f32", ty_f32);
     name_type("str", ty_string);
     name_type("fault", ty_error);
 }
@@ -209,6 +213,65 @@ fn is_float_t(t) {
     return k == K_FLOAT || k == K_UFLOAT;
 }
 
+// is_f32 reports whether t is f32 (kept in registers as an f64 holding an f32 value).
+fn is_f32(t) {
+    return t && t[TY_KIND] == K_FLOAT && t[TY_WIDTH] == 4;
+}
+
+// round_f32_bits rounds the f64 with bits b to the nearest f32 (ties to even) and returns
+// that value's f64 bits: how an f32 constant is folded without float arithmetic.
+fn round_f32_bits(b) {
+    let sign = b & (1 << 63);
+    let e = (b >> 52) & 0x7ff;
+    let m = b & 0xfffffffffffff;
+    if e == 0x7ff {
+        return b;
+    }
+    if e == 0 {
+        return sign;
+    }
+    let ue = e - 1023;
+    let full = m | (1 << 52);
+    if ue > 127 {
+        return sign | (0x7ff << 52);
+    }
+    if ue >= -126 {
+        let r = round_shift(full, 29);
+        if r == (1 << 24) {
+            r = 1 << 23;
+            ue = ue + 1;
+            if ue > 127 {
+                return sign | (0x7ff << 52);
+            }
+        }
+        return sign | ((ue + 1023) << 52) | ((r - (1 << 23)) << 29);
+    }
+    let s = -97 - ue;
+    if s > 54 {
+        return sign;
+    }
+    let k = round_shift(full, s);
+    if k == 0 {
+        return sign;
+    }
+    let p = 0;
+    while (k >> (p + 1)) != 0 {
+        p = p + 1;
+    }
+    return sign | ((p - 149 + 1023) << 52) | ((k << (52 - p)) & 0xfffffffffffff);
+}
+
+// round_shift is x >> s rounded to nearest, ties to even (x below 2^55).
+fn round_shift(x, s) {
+    let q = x >> s;
+    let rem = x & ((1 << s) - 1);
+    let half = 1 << (s - 1);
+    if rem > half || (rem == half && (q & 1) != 0) {
+        q = q + 1;
+    }
+    return q;
+}
+
 fn is_integer_t(t) {
     let k = kind_of(t);
     return k == K_INT || k == K_UINT;
@@ -224,7 +287,7 @@ fn type_width(t) {
         return 8;
     }
     let k = t[TY_KIND];
-    if k == K_INT || k == K_BOOL {
+    if k == K_INT || k == K_BOOL || k == K_FLOAT {
         return t[TY_WIDTH];
     }
     return 8;

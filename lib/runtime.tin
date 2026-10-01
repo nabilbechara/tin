@@ -1693,6 +1693,8 @@ func short_digits(x f64, digits i64) i64 {
 // shortest_into writes the shortest decimal that reads back as x into out (400 bytes):
 // exponent form when the exponent is below lo or at least hi; json drops the exponent's
 // zero padding (1e-7, not 1e-07). It returns the length.
+var shortF32 bool // per core: shortest_into finds the shortest digits for an f32, not an f64
+
 func shortest_into(out i64, x f64, lo i64, hi i64, json bool, plus bool) i64 {
 	if x != x {
 		memcpy(out, cast(i64, "NaN")+8, 3)
@@ -1712,7 +1714,7 @@ func shortest_into(out i64, x f64, lo i64, hi i64, json bool, plus bool) i64 {
 	nd := 0
 	exp := 0
 	neg := cast(i64, x) < 0
-	if x != 0 {
+	if x != 0 && !shortF32 {
 		nd = short_digits(x, digits)
 		if nd > 0 {
 			exp = fast_exp
@@ -1724,7 +1726,11 @@ func shortest_into(out i64, x f64, lo i64, hi i64, json bool, plus bool) i64 {
 	} else if nd == 0 {
 		for p := 1; p <= 17; p++ {
 			snprintf(tmp, 64, cast(i64, "%.*e")+8, p-1, x)
-			if strtod(tmp, 0) == x || p == 17 {
+			back := strtod(tmp, 0)
+			if shortF32 {
+				back = f64(f32(back))
+			}
+			if back == x || p == 17 {
 				// tmp is [-]d.ddde±XX
 				q := tmp
 				if load8(q) == '-' {
@@ -1859,6 +1865,29 @@ func fmt_float(f i64, x f64, verb i64) {
 func rt_fmt_f(x f64) {
 	f := rt_frame()
 	fmt_float(f, x, rt_fmt_arg(f, false))
+}
+
+// rt_fmt_f32 prints an f32 like Go's float32: the shortest digits that read back as it.
+func rt_fmt_f32(x f64) {
+	f := rt_frame()
+	shortF32 = true
+	fmt_float(f, x, rt_fmt_arg(f, false))
+	shortF32 = false
+}
+
+func rt_fmt_slf32(s []f32) {
+	f := rt_frame()
+	verb := rt_fmt_arg(f, false)
+	shortF32 = true
+	fb_byte(f, '[')
+	for i, v := range s {
+		if i > 0 {
+			fb_byte(f, ' ')
+		}
+		fmt_float(f, f64(v), verb)
+	}
+	fb_byte(f, ']')
+	shortF32 = false
 }
 
 // slices print as [a b c]

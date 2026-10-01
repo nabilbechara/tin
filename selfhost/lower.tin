@@ -28,6 +28,11 @@ fn chk_kind(e, want) {
         return adapt_int(e, want);
     }
     if k == EX_FLOAT {
+        if is_f32(want) {
+            // An f32 constant: fold the rounding into the bits.
+            e[FL_BITS] = round_f32_bits(e[FL_BITS]);
+            return ty_f32;
+        }
         return ty_float;
     }
     if k == EX_STR {
@@ -247,6 +252,10 @@ fn adapt_int(e, want) {
     if is_float_t(want) {
         e[N_KIND] = EX_FLOAT;
         e[FL_BITS] = int_to_float_bits(e[INT_VAL]);
+        if is_f32(want) {
+            e[FL_BITS] = round_f32_bits(e[FL_BITS]);
+            return ty_f32;
+        }
         return ty_float;
     }
     if kind_of(want) == K_INT {
@@ -403,7 +412,7 @@ fn is_cmp_op(op) {
 
 fn is_untyped_lit(e) {
     let k = e[N_KIND];
-    return k == EX_INT || k == EX_NIL || (k == EX_UNARY && is_untyped_lit(e[UN_X])) || (k == EX_BINARY && is_untyped_lit(e[BIN_L]) && is_untyped_lit(e[BIN_R]));
+    return k == EX_INT || k == EX_NIL || k == EX_FLOAT || (k == EX_UNARY && is_untyped_lit(e[UN_X])) || (k == EX_BINARY && is_untyped_lit(e[BIN_L]) && is_untyped_lit(e[BIN_R]));
 }
 
 // unify checks both operands of a binary operator and returns their common type:
@@ -569,7 +578,7 @@ fn chk_binary(e, want) {
         err_type(pos, "arithmetic on ", t, "");
     }
     if is_float_t(t) && (streq(op, "%") || streq(op, "&") || streq(op, "|") || streq(op, "^")) {
-        err_quoted(pos, "operator ", op, " is not defined on f64");
+        err_quoted(pos, "operator ", op, " is not defined on floats");
     }
     if k == K_UINT && l[N_KIND] == EX_INT && r[N_KIND] == EX_INT {
         if (streq(op, "/") || streq(op, "%")) && r[INT_VAL] == 0 {
@@ -581,6 +590,12 @@ fn chk_binary(e, want) {
     }
     if k == K_INT && is_const_zero(r) && (streq(op, "/") || streq(op, "%")) {
         err_at(pos, "division by zero");
+    }
+    if is_f32(t) {
+        // f32 arithmetic is f64 arithmetic rounded to f32 after each step (exact for + - * /).
+        let inner = node_copy(e);
+        inner[N_TYPE] = t;
+        replace_node(e, mk_conv(pos, inner, CV_ROUND32, t));
     }
     return t;
 }
@@ -702,6 +717,14 @@ fn enum_eq_fn(t) {
     ck_fn = saved_fn;
     ck_legacy = saved_legacy;
     return f;
+}
+
+// elem_bits is value v as the bits a slice element of type et holds (4 bytes for f32).
+fn elem_bits(v, et) {
+    if is_f32(et) {
+        return mk_conv(v[N_POS], v, CV_F2BITS32, ty_int);
+    }
+    return to_bits(v);
 }
 
 fn is_const_zero(e) {
@@ -1850,8 +1873,24 @@ fn chk_conversion(e, to) {
         return to;
     }
     if tk == K_FLOAT && is_integer_t(from) {
+        if is_untyped(from) {
+            reconvert(x, ty_int);
+        }
+        if is_f32(to) {
+            replace_node(e, mk_conv(pos, mk_conv(pos, x, CV_I2F, ty_float), CV_ROUND32, ty_f32));
+            return ty_f32;
+        }
         replace_node(e, mk_conv(pos, x, CV_I2F, ty_float));
         return ty_float;
+    }
+    if tk == K_FLOAT && fk == K_FLOAT {
+        // f64 -> f32 rounds; f32 -> f64 is exact (the register already holds an f64).
+        if is_f32(to) {
+            replace_node(e, mk_conv(pos, x, CV_ROUND32, ty_f32));
+        } else {
+            replace_node(e, mk_conv(pos, x, CV_SAME, to));
+        }
+        return to;
     }
     if tk == K_INT && fk == K_FLOAT {
         replace_node(e, mk_conv(pos, x, CV_F2I, to));
@@ -1938,7 +1977,7 @@ fn chk_builtin(e, name, want) {
                 if is_untyped(vt) {
                     reconvert(a, et);
                 }
-                acc = rt_call(pos, "rt_append", args3(acc, to_bits(a), mk_int(pos, elem_size(st), ty_int)), st);
+                acc = rt_call(pos, "rt_append", args3(acc, elem_bits(a, st[TY_ELEM]), mk_int(pos, elem_size(st), ty_int)), st);
             }
             i = i + 1;
         }
@@ -2227,6 +2266,8 @@ fn argo_emit(pos, body, b, x, t) {
         vec_push(body, expr_stmt(call_fn(pos, argo_lib(pos, "argo.wstr"), args2(bref, x), ty_void)));
     } else if k == K_BOOL {
         vec_push(body, expr_stmt(call_fn(pos, argo_lib(pos, "argo.wbool"), args2(bref, x), ty_void)));
+    } else if is_f32(t) {
+        vec_push(body, expr_stmt(call_fn(pos, argo_lib(pos, "argo.wfloat32"), args2(bref, x), ty_void)));
     } else if is_float_t(t) {
         vec_push(body, expr_stmt(call_fn(pos, argo_lib(pos, "argo.wfloat"), args2(bref, x), ty_void)));
     } else if k == K_INT && !t[TY_SIGNED] {
@@ -2613,6 +2654,9 @@ fn argo_value(pos, body, p, t) {
     if k == K_BOOL {
         return argo_rd(pos, p, "argo.rbool", ty_bool);
     }
+    if is_f32(t) {
+        return mk_conv(pos, argo_rd(pos, p, "argo.rfloat", ty_float), CV_ROUND32, ty_f32);
+    }
     if is_float_t(t) {
         return argo_rd(pos, p, "argo.rfloat", ty_float);
     }
@@ -2933,7 +2977,7 @@ fn argo_dfn(pos, t) {
         let wb2 = w2[WH_BODY][BLK_STMTS];
         let ev = argo_value(pos, wb2, p, et);
         if ev {
-            vec_push(wb2, expr_stmt(rt_call(pos, "rt_append", args3(sym_ref_node(pos, x), to_bits(ev), mk_int(pos, elem_size(t), ty_int)), t)));
+            vec_push(wb2, expr_stmt(rt_call(pos, "rt_append", args3(sym_ref_node(pos, x), elem_bits(ev, t[TY_ELEM]), mk_int(pos, elem_size(t), ty_int)), t)));
         }
         argo_err_return(pos, wb2, p);
         argo_more(pos, wb2, p, ']');
@@ -2979,6 +3023,9 @@ fn say_arg(a, prefix) {
         suffix = "s";
     } else if k == K_FLOAT {
         suffix = "f";
+        if is_f32(t) {
+            suffix = "f32";
+        }
     } else if k == K_BOOL {
         suffix = "b";
     } else if k == K_ERROR {
@@ -2992,6 +3039,9 @@ fn say_arg(a, prefix) {
             suffix = "sls";
         } else if ek == K_FLOAT {
             suffix = "slf";
+            if is_f32(et) {
+                suffix = "slf32";
+            }
         } else if ek == K_BOOL {
             suffix = "slt";
         } else if ek == K_INT {
