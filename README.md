@@ -64,6 +64,8 @@ the runtime [docs/RUNTIME.md](docs/RUNTIME.md), the compiler
 [docs/COMPILER.md](docs/COMPILER.md), and full benchmark results
 [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
+CI and the issue-to-regression workflow: [docs/CI.md](docs/CI.md).
+
 ## Standard library
 
 | package | role | | package | role |

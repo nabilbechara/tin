@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: Native (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04-arm, macos-15]
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Verify native architecture
+        run: |
+          case "$(uname -m)" in arm64|aarch64) ;; *) echo 'Expected native ARM64'; exit 1 ;; esac
+      - name: Test the test harness
+        run: python3 -m unittest discover -s tools/ci -p 'test_*.py' -v
+      - name: Build from seed and verify self-hosting fixed point
+        run: make bootstrap
+      - name: Strict language and standard library suite
+        run: tools/v2test.sh bin/tinc
+      - name: Memory safety and issue-linked regressions
+        run: python3 tools/ci/regressions.py
+      - name: Legacy compiler tests (native executable)
+        run: TINC="$PWD/bin/tinc" go test -count=1 -timeout=3m ./bootstrap
+      - name: Original bootstrap and assembly compatibility (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          go test -count=1 -timeout=3m ./bootstrap
+          TINC="$PWD/bin/tinc" TINC_ASM=1 go test -count=1 -timeout=3m ./bootstrap
+      - name: HTTP correctness, RSS stability and shutdown (Linux)
+        if: runner.os == 'Linux'
+        run: python3 tools/ci/http_check.py
+      - name: Preserve diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: diagnostics-${{ matrix.os }}
+          path: |
+            bin/ci/**/*.log
+            bin/ci/**/*.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+  issue-policy:
+    name: Issue regression policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - name: No closed issue may retain a known-failure exemption
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/ci/regressions.py --audit
+
+  gate:
+    name: CI
+    if: always()
+    needs: [native, issue-policy]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Require every job to succeed
+        env:
+          NATIVE_RESULT: ${{ needs.native.result }}
+          POLICY_RESULT: ${{ needs.issue-policy.result }}
+        run: |
+          test "$NATIVE_RESULT" = success
+          test "$POLICY_RESULT" = success
