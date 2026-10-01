@@ -561,6 +561,112 @@ func read_response(c Conn, head bool) (Resp, fault) {
 	}
 }
 
+// maxChunkLine bounds a chunk-size or trailer line, maxTrailers the whole trailer section.
+const maxChunkLine = 4096
+const maxTrailers = 1048576
+
+// chunk_fault names a connection that ends inside a chunked body.
+func chunk_fault(err fault) fault {
+	if IsEOF(err) {
+		return fail("wire: chunked body truncated")
+	}
+	return err
+}
+
+// chunk_line reads until buf holds a CRLF-terminated line at pos and returns the index of its CR.
+func chunk_line(c Conn, buf mut []u8, pos i64) (i64, fault) {
+	scan := pos
+	for {
+		for i := scan; i < len(buf); i++ {
+			if buf[i] == '\n' {
+				if i == pos || buf[i-1] != '\r' {
+					return 0, fail("wire: malformed chunked body: line not ended by CRLF")
+				}
+				return i - 1, nil
+			}
+		}
+		scan = len(buf)
+		if len(buf)-pos > maxChunkLine {
+			return 0, fail("wire: malformed chunked body: line too long")
+		}
+		_, err := c.Read(buf, 4096)
+		if err != nil {
+			return 0, chunk_fault(err)
+		}
+	}
+}
+
+// visible reports whether buf[from:to] has no control characters other than tab.
+func visible(buf []u8, from i64, to i64) bool {
+	for i := from; i < to; i++ {
+		d := buf[i]
+		if (d < ' ' && d != '\t') || d == 127 {
+			return false
+		}
+	}
+	return true
+}
+
+// chunk_size parses buf[pos:end]: one or more hex digits, then optional ";" extensions.
+func chunk_size(buf []u8, pos i64, end i64) (i64, fault) {
+	size := 0
+	i := pos
+	for i < end {
+		d := buf[i]
+		v := -1
+		if d >= '0' && d <= '9' {
+			v = i64(d - '0')
+		} else if d >= 'a' && d <= 'f' {
+			v = i64(d-'a') + 10
+		} else if d >= 'A' && d <= 'F' {
+			v = i64(d-'A') + 10
+		}
+		if v < 0 {
+			break
+		}
+		if size >= 0x0800000000000000 {
+			return 0, fail("wire: malformed chunked body: chunk size too large")
+		}
+		size = size*16 + v
+		i++
+	}
+	if i == pos {
+		return 0, fail("wire: malformed chunked body: bad chunk size")
+	}
+	for i < end && (buf[i] == ' ' || buf[i] == '\t') {
+		i++
+	}
+	if i < end && (buf[i] != ';' || !visible(buf, i, end)) {
+		return 0, fail("wire: malformed chunked body: bad chunk size")
+	}
+	return size, nil
+}
+
+// chunk_trailers reads the trailer fields after the last chunk up to the empty line; they are ignored.
+func chunk_trailers(c Conn, buf mut []u8, pos i64) fault {
+	start := pos
+	for {
+		end := try chunk_line(c, buf, pos)
+		if end == pos {
+			return nil
+		}
+		colon := -1
+		for i := pos; i < end; i++ {
+			if buf[i] == ':' {
+				colon = i
+				break
+			}
+		}
+		if colon <= pos || buf[pos] == ' ' || buf[pos] == '\t' || !visible(buf, pos, end) {
+			return fail("wire: malformed chunked body: bad trailer")
+		}
+		pos = end + 2
+		if pos-start > maxTrailers {
+			return fail("wire: malformed chunked body: trailers too large")
+		}
+	}
+}
+
 // read_chunked decodes a chunked body; pending holds bytes already read.
 func read_chunked(c Conn, pending []u8) (str, fault) {
 	buf := make([]u8, 0, len(pending)+4096)
@@ -568,50 +674,29 @@ func read_chunked(c Conn, pending []u8) (str, fault) {
 	out := make([]u8, 0, 4096)
 	pos := 0
 	for {
-		// The chunk-size line.
-		nl := -1
-		for nl < 0 {
-			for i := pos; i < len(buf); i++ {
-				if buf[i] == '\n' {
-					nl = i
-					break
-				}
-			}
-			if nl < 0 {
-				_, err := c.Read(buf, 4096)
-				if err != nil {
-					return "", err
-				}
-			}
-		}
-		size := 0
-		for i := pos; i < nl; i++ {
-			d := buf[i]
-			v := -1
-			if d >= '0' && d <= '9' {
-				v = i64(d - '0')
-			} else if d >= 'a' && d <= 'f' {
-				v = i64(d-'a') + 10
-			} else if d >= 'A' && d <= 'F' {
-				v = i64(d-'A') + 10
-			}
-			if v < 0 {
-				break
-			}
-			size = size*16 + v
-		}
-		pos = nl + 1
+		end := try chunk_line(c, buf, pos)
+		size := try chunk_size(buf, pos, end)
+		pos = end + 2
 		if size == 0 {
+			try chunk_trailers(c, buf, pos)
 			return str(out), nil
 		}
-		for len(buf) < pos+size+2 {
-			_, err := c.Read(buf, pos+size+2-len(buf))
+		// Read at most 64 KiB at a time so the buffer grows only as data arrives.
+		for len(buf)-pos < size+2 {
+			want := size + 2 - (len(buf) - pos)
+			if want > 65536 {
+				want = 65536
+			}
+			_, err := c.Read(buf, want)
 			if err != nil {
-				return "", err
+				return "", chunk_fault(err)
 			}
 		}
+		if buf[pos+size] != '\r' || buf[pos+size+1] != '\n' {
+			return "", fail("wire: malformed chunked body: chunk data not ended by CRLF")
+		}
 		out = append(out, buf[pos:pos+size]...)
-		pos = pos + size + 2
+		pos += size + 2
 	}
 }
 
