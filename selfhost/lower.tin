@@ -95,6 +95,9 @@ fn chk_kind(e, want) {
         err_at(e[N_POS], "catch is only allowed on a whole statement, initializer, assignment or return value");
         return ty_int;
     }
+    if k == EX_INTERP {
+        return chk_interp(e, want);
+    }
     if k == EX_MUTARG {
         err_at(e[N_POS], "mut here does nothing: only an argument for a mut parameter takes mut");
         return chk(e[MUTARG_X], want);
@@ -2395,6 +2398,74 @@ fn say_text(pos, args, ln) {
 //   say.Fault(f, a...)    a fault with a formatted message
 //   say.To(w, f, a...)    printf into w.Write(str)
 //   say.LineTo(w, a...)   println into w.Write(str)
+// chk_interp turns "a {x} b {y:.2}" into say.Fmt("a %v b %.2f", x, y): the verb comes from
+// the spec (its last letter), else %v, or %f for a float with a precision.
+fn chk_interp(e, want) {
+    let pos = e[N_POS];
+    let parts = e[INTERP_PARTS];
+    let vals = e[INTERP_ARGS];
+    let specs = e[INTERP_SPECS];
+    let f = buf_new();
+    let args = vec_new();
+    vec_push(args, 0);
+    let i = 0;
+    while i < parts[VEC_LEN] {
+        let part = vec_get(parts, i);
+        let k = 0;
+        while k < part[STR_LEN] {
+            let c = load8(part[STR_PTR] + k);
+            if c == '%' {
+                buf_byte(f, '%');
+            }
+            buf_byte(f, c);
+            k = k + 1;
+        }
+        if i < vals[VEC_LEN] {
+            let a = vec_get(vals, i);
+            let t = chk(a, 0);
+            let spec = vec_get(specs, i);
+            buf_byte(f, '%');
+            if !spec {
+                buf_byte(f, 'v');
+            } else {
+                buf_str(f, spec);
+                let sl = strlen(spec);
+                let last = 0;
+                if sl > 0 {
+                    last = load8(spec + sl - 1);
+                }
+                if !((last >= 'a' && last <= 'z') || (last >= 'A' && last <= 'Z')) {
+                    let dot = 0;
+                    let q = 0;
+                    while q < sl {
+                        if load8(spec + q) == '.' {
+                            dot = 1;
+                        }
+                        q = q + 1;
+                    }
+                    if dot && is_float_t(t) {
+                        buf_byte(f, 'f');
+                    } else {
+                        buf_byte(f, 'v');
+                    }
+                }
+            }
+            vec_push(args, a);
+        }
+        i = i + 1;
+    }
+    let fs = node_new(EX_STR, pos);
+    fs[STR_LEN] = f[VEC_LEN];
+    buf_byte(f, 0);
+    fs[STR_PTR] = f[VEC_DATA];
+    args[VEC_DATA][0] = fs;
+    let call = node_new(EX_CALL, pos);
+    call[CALL_ARGS] = args;
+    replace_node(e, call);
+    e[N_TYPE] = 0;
+    return lower_say(e, "Fmt", want);
+}
+
 fn lower_say(e, m, want) {
     let pos = e[N_POS];
     let args = e[CALL_ARGS];

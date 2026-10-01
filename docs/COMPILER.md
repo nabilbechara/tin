@@ -1,7 +1,7 @@
 # The Tin compiler (tinc): how it works
 
 `tinc` is about 17,000 lines of Tin in `selfhost/`, written in the legacy syntax
-(LANGUAGE.md §19: untyped 64-bit words, `fn`, `let`, `while`). It compiles itself:
+(LANGUAGE.md §20: untyped 64-bit words, `fn`, `let`, `while`). It compiles itself:
 `make bootstrap` builds it three times and the last two binaries must be byte-identical.
 It produces finished executables with its own assembler and linker (Mach-O for macOS,
 ELF for Linux); no external toolchain is involved.

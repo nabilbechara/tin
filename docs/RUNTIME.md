@@ -3,7 +3,7 @@
 The runtime is `lib/runtime.tin` (portable) plus `lib/runtime_darwin.tin` /
 `lib/runtime_linux.tin` (and `runtime_linux_<arch>.tin`), compiled into every strict
 program. It is written in strict Tin with the standard-library-only features
-(LANGUAGE.md §17). The HTTP server (`anvil`), cores (`hearth`), messages (`relay`) and
+(LANGUAGE.md §18). The HTTP server (`anvil`), cores (`hearth`), messages (`relay`) and
 JSON (`argo`) are ordinary library packages built on it.
 
 ## 1. Value layouts

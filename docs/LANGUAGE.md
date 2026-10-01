@@ -87,7 +87,7 @@ or with the code passed to `quarry.Exit`.
   blank identifier.
 - **Keywords**: `break case const continue default defer else extern fn for func go if
   import let map mut nil package range return struct switch true false try type var`
-  (`fn`, `let`, `extern`, `while` belong to the legacy syntax, section 19; `go` is
+  (`fn`, `let`, `extern`, `while` belong to the legacy syntax, section 20; `go` is
   reserved and rejected).
 - **Integer literals**: `42`, `0x2a`, `0o52`, `0b101010`, with `_` between digits
   (`1_000_000`). Values up to 2^64-1 are allowed; a literal above 2^63-1 only fits
@@ -352,7 +352,7 @@ extern func write(fd i64, p i64, n i64) i64
 extern func snprintf(buf i64, n i64, f i64, ...) i64
 ```
 
-Declares a C function from the system library; see section 17.
+Declares a C function from the system library; see section 18.
 
 ---
 
@@ -718,12 +718,32 @@ p := Pair[str, i64]{first: "k", second: 7}
 | `keep(x)` | deep copy into long-lived memory (section 10) |
 | `print(...)`, `println(...)` | same as `say.Text` / `say.Line` |
 
-Compiler-generated package functions: `say.*` (section 14), `argo.Put`, `argo.Get`
-(section 15).
+Compiler-generated package functions: `say.*` (section 15), `argo.Put`, `argo.Get`
+(section 16).
 
 ---
 
-## 14. Printing and formatting: say
+## 14. String interpolation
+
+A `"..."` literal can hold values in braces; it becomes a `str` built by the same
+formatting code as `say.Fmt`, decided at compile time from each value's static type:
+
+```go
+msg := "user {u.Name} has {len(items)} items"
+row := "{price:.2} {id:x} [{name:-12}] [{n:05}]"
+fail "port {n} out of range"
+say.Line("hits={m["hits"]}")            // not allowed: no quotes inside {...}
+say.Line(`raw strings keep {braces}`)   // backquotes: no interpolation
+say.Line("literal {{braces}} and 100%") // {{ and }} are braces; % needs no escaping
+```
+
+- Anything inside `{...}` is an expression (no `"` inside; bind the value first).
+- A spec after the last top-level `:` uses printf flags, width, precision and verb:
+  `{x:5}`, `{x:-8}`, `{x:05}`, `{x:x}`, `{x:q}`, `{x:.3e}`. Without a verb the value is
+  printed as `%v`, and a precision on a float means decimal places (`{pi:.2}` is `3.14`).
+- A lone `}` is an error (write `}}`), and so is an unclosed `{`.
+
+## 15. Printing and formatting: say
 
 `say` is built into the compiler: each argument is formatted by its static type, without
 interfaces or reflection.
@@ -754,7 +774,7 @@ Output to stdout is buffered (64 KiB, or per line on a terminal) and flushed at 
 
 ---
 
-## 15. JSON: argo
+## 16. JSON: argo
 
 ```go
 type User struct {
@@ -790,7 +810,7 @@ err2 := argo.Get(text, mut xs)      // appends decoded elements
 
 ---
 
-## 16. Safety checks
+## 17. Safety checks
 
 - **Bounds**: every slice and string index is checked; slicing beyond the length panics.
   The compiler removes a check where it can prove the index is in range: `range` loops,
@@ -809,7 +829,7 @@ err2 := argo.Get(text, mut xs)      // appends decoded elements
 
 ---
 
-## 17. Standard-library-only features
+## 18. Standard-library-only features
 
 Files under `lib/` are trusted and may use operations user code cannot:
 
@@ -831,7 +851,7 @@ User code that needs these goes through a library package.
 
 ---
 
-## 18. Grammar
+## 19. Grammar
 
 EBNF; `{x}` repeats, `[x]` is optional, `|` separates alternatives. Semicolons are
 inserted automatically (section 2).
@@ -895,7 +915,7 @@ FuncLit       = "func" Params [ Results ] Block .
 
 ---
 
-## 19. Legacy syntax
+## 20. Legacy syntax
 
 The compiler's own sources (`selfhost/`, `lib/std.tin`) and old programs use Tin's first
 syntax, still fully supported: a file with no `package` clause is legacy.
@@ -927,7 +947,7 @@ has no package clause). See [COMPILER.md](COMPILER.md) for how the compiler is w
 
 ---
 
-## 20. Differences from Go
+## 21. Differences from Go
 
 | Go | Tin |
 |---|---|

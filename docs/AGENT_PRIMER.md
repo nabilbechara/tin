@@ -51,6 +51,8 @@ the compiler: write a minimal repro to notes/compiler_bugs_NAME.md and work arou
 - Builtins: len cap append make copy delete panic fail keep; say.Line(a, b...) prints space-separated
   + newline; say.Text(...) no spaces/newline; say.Out(fmt, ...) printf; say.Fmt(fmt, ...) -> str;
   say.Str(x) -> str; verbs %d %s %q %v %x %f %5.2f %-4s etc. Floats print like Go's %v.
+- Strings interpolate: "user {u.Name} has {n} items", "{price:.2} {id:x} [{name:-8}]"; {{ and }} are braces;
+  no quotes inside {...}; `raw` backquote strings do not interpolate.
 - for i := 0; i < n; i++ {}, for cond {}, for {}, for i, x := range slice/str/map {}, switch x { case a, b: }.
   Methods: `func (p Point) Name() str`. Multiple returns. Composite literals T{F: v}, []T{...}, map[K]V{...}.
 - Generics: `func Max[T i64 | f64 | str](a T, b T) T`, `func Map[T any, U any](xs []T, f func(T) U) []U`,
