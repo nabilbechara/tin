@@ -70,7 +70,9 @@ Files: `selfhost/asm_x64.tin` (encoder, fuzzed against objdump: `tools/x64fuzz/r
   (struct return / `register` with many fields?). Debug with gdb: build an image once with
   `docker run --platform linux/amd64 --name b tin-debian-amd64 sh -c 'apt-get update -qq && apt-get install -y -qq gdb' && docker commit b x64dbg:local && docker rm b`
   then `docker run --rm --platform linux/amd64 -v DIR:/w x64dbg:local gdb -batch -ex run -ex bt /w/prog`.
-- `-S` for the x64 target needs the main.tin patch (notes/patch_x64_runtime.md section 6).
+- A compiler running on Linux x86-64 defaults to linux-amd64 (#15; `host_is_x64` reads
+  utsname.machine) and `-S` prints x86-64 for that target; `tools/x64fuzz/host_default.sh`
+  checks the default on both Linux CPUs (e_machine, strict and legacy runs, self-hosting).
 - A darwin v2 build in this tree currently fails with "strlen redeclared (lib/std.tin)"; this
   appeared while another engineer was changing lib/ and main.tin and is not from these files
   (legacy darwin builds and `make -s bin/tinc` work).
