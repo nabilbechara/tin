@@ -79,6 +79,7 @@ shared var rtPoolChunk i64   // request pool chunk size once a memory limit lowe
 shared var rtCPUMask i64     // cpu_set_t (128 bytes) of the CPUs this process may run on, set by rt_pin_setup
 shared var rtCPUCount i64    // CPUs set in rtCPUMask
 shared var rtPin bool        // cores pin themselves to one CPU each (rt_pin_setup decided)
+shared var rtNcpus i64       // rt_ncpus once computed (before any core pins itself)
 
 // rt_read_file reads up to n-1 bytes of path into buf, NUL-terminated: the length, or -1 when it cannot be opened.
 func rt_read_file(path str, buf i64, n i64) i64 {
@@ -137,30 +138,221 @@ func rt_read_num(path str, buf i64) i64 {
 	return v
 }
 
-// rt_cpu_quota is the cgroup CPU limit rounded up to whole CPUs (v2 cpu.max, else v1
-// cpu.cfs_quota_us / cpu.cfs_period_us): 0 when unlimited or unknown.
-func rt_cpu_quota() i64 {
-	buf := calloc(1, 128)
-	quota := -1
-	period := -1
-	if rt_read_file("/sys/fs/cgroup/cpu.max", buf, 128) > 0 {
-		q, next := rt_num_at(buf)
-		p, _ := rt_num_at(next)
-		quota = q
-		period = p
-	} else {
-		quota = rt_read_num("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", buf)
-		period = rt_read_num("/sys/fs/cgroup/cpu/cpu.cfs_period_us", buf)
-		if quota <= 0 {
-			quota = rt_read_num("/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_quota_us", buf)
-			period = rt_read_num("/sys/fs/cgroup/cpu,cpuacct/cpu.cfs_period_us", buf)
+// rt_same reports whether the n bytes at a and b are equal.
+func rt_same(a i64, b i64, n i64) bool {
+	for i := 0; i < n; i++ {
+		if load8(a+i) != load8(b+i) {
+			return false
 		}
 	}
-	free(buf)
-	if quota <= 0 || period <= 0 {
-		return 0
+	return true
+}
+
+// rt_find returns the address of the first byte c in the n bytes at p, or 0.
+func rt_find(p i64, c u8, n i64) i64 {
+	for i := 0; i < n; i++ {
+		if load8(p+i) == c {
+			return p + i
+		}
 	}
-	return (quota + period - 1) / period
+	return 0
+}
+
+// rt_list_has reports whether the comma-separated list of n bytes at p has an item equal to word.
+func rt_list_has(p i64, n i64, word str) bool {
+	w := len(word)
+	i := 0
+	for i <= n {
+		j := i
+		for j < n && load8(p+j) != ',' {
+			j++
+		}
+		if j-i == w && rt_same(p+i, cast(i64, word)+8, w) {
+			return true
+		}
+		i = j + 1
+	}
+	return false
+}
+
+// rt_field finds field k (0-based, space-separated) of the line at p ending at e: its start and length, or -1.
+func rt_field(p i64, e i64, k i64) (i64, i64) {
+	for i := 0; i < k; i++ {
+		for p < e && load8(p) != ' ' {
+			p++
+		}
+		if p >= e {
+			return -1, 0
+		}
+		p++
+	}
+	q := p
+	for q < e && load8(q) != ' ' {
+		q++
+	}
+	return p, q - p
+}
+
+// rt_cg_find writes into dir (4096 bytes, NUL-terminated) the directory of this process's own
+// cgroup for controller ctrl ("" for the v2 unified hierarchy), found through /proc/self/cgroup
+// and /proc/self/mountinfo, so it is right in a private and in the host cgroup namespace. It
+// returns the length of the cgroup mount point at the start of dir, or -1 when there is none.
+func rt_cg_find(ctrl str, dir i64) i64 {
+	cg := calloc(1, 8192)
+	mi := calloc(1, 262144)
+	mlen := -1
+	cn := rt_read_file("/proc/self/cgroup", cg, 8192)
+	mn := rt_read_file("/proc/self/mountinfo", mi, 262144)
+	// The process's path in the hierarchy: "0::/path" (v2) or "N:cpu,cpuacct:/path" (v1).
+	pp := 0
+	pl := 0
+	p := cg
+	for cn > 0 && p < cg+cn && pp == 0 {
+		e := rt_find(p, '\n', cg+cn-p)
+		if e == 0 {
+			e = cg + cn
+		}
+		c1 := rt_find(p, ':', e-p)
+		if c1 != 0 {
+			c2 := rt_find(c1+1, ':', e-c1-1)
+			if c2 != 0 {
+				if len(ctrl) == 0 && c2 == c1+1 && c1 == p+1 && load8(p) == '0' {
+					pp = c2 + 1
+					pl = e - pp
+				} else if len(ctrl) > 0 && rt_list_has(c1+1, c2-c1-1, ctrl) {
+					pp = c2 + 1
+					pl = e - pp
+				}
+			}
+		}
+		p = e + 1
+	}
+	// The mount of that hierarchy: fields 3 (root inside the hierarchy) and 4 (mount point),
+	// then after " - " the file system type and its super options.
+	p = mi
+	for pp != 0 && mn > 0 && p < mi+mn && mlen < 0 {
+		e := rt_find(p, '\n', mi+mn-p)
+		if e == 0 {
+			e = mi + mn
+		}
+		sep := 0
+		for q := p; q+2 < e; q++ {
+			if load8(q) == ' ' && load8(q+1) == '-' && load8(q+2) == ' ' {
+				sep = q + 3
+				break
+			}
+		}
+		if sep != 0 {
+			fs, fl := rt_field(sep, e, 0)
+			op, ol := rt_field(sep, e, 2)
+			ok := false
+			if len(ctrl) == 0 {
+				ok = fl == 7 && rt_same(fs, cast(i64, "cgroup2")+8, 7)
+			} else if fl == 6 && rt_same(fs, cast(i64, "cgroup")+8, 6) && op >= 0 {
+				ok = rt_list_has(op, ol, ctrl)
+			}
+			rp, rl := rt_field(p, e, 3)
+			mp, ml := rt_field(p, e, 4)
+			if ok && rp >= 0 && mp >= 0 && ml < 2048 {
+				memcpy(dir, mp, ml)
+				n := ml
+				// The part of the process's path below the mount's root; nothing when the
+				// mount shows a different subtree (the namespace already starts at the cgroup).
+				rel := pp
+				reln := pl
+				if rl == 1 && load8(rp) == '/' {
+				} else if pl >= rl && rt_same(pp, rp, rl) && (pl == rl || load8(pp+rl) == '/') {
+					rel = pp + rl
+					reln = pl - rl
+				} else {
+					reln = 0
+				}
+				if reln == 1 && load8(rel) == '/' {
+					reln = 0
+				}
+				if reln > 0 && n+reln < 4000 {
+					memcpy(dir+n, rel, reln)
+					n += reln
+				}
+				store8(dir+n, 0)
+				mlen = ml
+			}
+		}
+		p = e + 1
+	}
+	free(cg)
+	free(mi)
+	return mlen
+}
+
+// rt_cg_num reads the number in file under the cgroup directory dir (NUL-terminated) at level
+// up (0: dir itself, 1: its parent, ...), stopping at the mount point of length mlen: the value
+// (-1 for "max" or absent), the second number on the line, and whether that level exists.
+func rt_cg_num(dir i64, mlen i64, up i64, file str) (i64, i64, bool) {
+	n := i64(strlen(dir))
+	for i := 0; i < up; i++ {
+		if n <= mlen {
+			return -1, -1, false
+		}
+		for n > mlen && load8(dir+n-1) != '/' {
+			n--
+		}
+		if n > mlen {
+			n--
+		}
+	}
+	path := calloc(1, 4096+64)
+	memcpy(path, dir, n)
+	store8(path+n, '/')
+	memcpy(path+n+1, cast(i64, file)+8, len(file))
+	buf := calloc(1, 128)
+	v := -1
+	v2 := -1
+	if rt_read_file(rt_str_from_raw(path, n+1+len(file)), buf, 128) > 0 {
+		a, next := rt_num_at(buf)
+		b, _ := rt_num_at(next)
+		v = a
+		v2 = b
+	}
+	free(buf)
+	free(path)
+	return v, v2, true
+}
+
+// rt_cpu_quota is the cgroup CPU limit rounded up to whole CPUs: the smallest over this
+// process's cgroup and its ancestors (v2 cpu.max, else v1 cpu.cfs_quota_us / cfs_period_us);
+// 0 when unlimited or unknown.
+func rt_cpu_quota() i64 {
+	dir := calloc(1, 4096)
+	best := 0
+	v1 := false
+	mlen := rt_cg_find("", dir)
+	if mlen < 0 {
+		mlen = rt_cg_find("cpu", dir)
+		v1 = true
+	}
+	for up := 0; mlen >= 0; up++ {
+		quota := -1
+		period := -1
+		exists := false
+		if v1 {
+			quota, _, exists = rt_cg_num(dir, mlen, up, "cpu.cfs_quota_us")
+			period, _, _ = rt_cg_num(dir, mlen, up, "cpu.cfs_period_us")
+		} else {
+			quota, period, exists = rt_cg_num(dir, mlen, up, "cpu.max")
+		}
+		if !exists {
+			break
+		}
+		if quota > 0 && period > 0 {
+			c := (quota + period - 1) / period
+			if best == 0 || c < best {
+				best = c
+			}
+		}
+	}
+	free(dir)
+	return best
 }
 
 // rt_affinity_count fills the 128-byte cpu_set_t at set with the CPUs this thread may run on
@@ -184,6 +376,9 @@ func rt_affinity_count(set i64) i64 {
 // rt_ncpus is the number of CPUs this program may use: online CPUs, capped by the affinity
 // mask (cpuset) and by the cgroup CPU quota; never less than 1.
 func rt_ncpus() i64 {
+	if rtNcpus > 0 {
+		return rtNcpus
+	}
 	n := sysconf(84) & 0xffffffff
 	if n < 1 {
 		n = 1
@@ -198,28 +393,39 @@ func rt_ncpus() i64 {
 	if q > 0 && q < n {
 		n = q
 	}
+	rtNcpus = n
 	return n
 }
 
-// rt_mem_limit is the cgroup memory limit in bytes (v2 memory.max, else v1
-// memory.limit_in_bytes): 0 when unlimited or unknown.
+// rt_mem_limit is the cgroup memory limit in bytes: the smallest over this process's cgroup
+// and its ancestors (v2 memory.max, else v1 memory.limit_in_bytes); 0 when unlimited or unknown.
 func rt_mem_limit() i64 {
-	buf := calloc(1, 128)
-	v := rt_read_num("/sys/fs/cgroup/memory.max", buf)
-	if v < 0 {
-		v = rt_read_num("/sys/fs/cgroup/memory/memory.limit_in_bytes", buf)
+	dir := calloc(1, 4096)
+	file := "memory.max"
+	mlen := rt_cg_find("", dir)
+	if mlen < 0 {
+		mlen = rt_cg_find("memory", dir)
+		file = "memory.limit_in_bytes"
 	}
-	free(buf)
-	if v <= 0 || v >= 1<<60 {
-		return 0
+	best := 0
+	for up := 0; mlen >= 0; up++ {
+		v, _, exists := rt_cg_num(dir, mlen, up, file)
+		if !exists {
+			break
+		}
+		if v > 0 && v < 1<<60 && (best == 0 || v < best) {
+			best = v
+		}
 	}
-	return v
+	free(dir)
+	return best
 }
 
 // rt_pin_setup (called before cores start) decides whether each core pins itself to one allowed
 // CPU: when the n cores map one-to-one onto the allowed CPUs, or TIN_PIN=1 asks for it and no
 // two cores would have to share a CPU.
 func rt_pin_setup(n i64) {
+	rt_ncpus()
 	rtPin = false
 	if rtCPUMask == 0 {
 		rtCPUMask = calloc(1, 128)
