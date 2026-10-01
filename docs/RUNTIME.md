@@ -221,8 +221,7 @@ core's pool words (bump, end, base, mark, extra) are swapped in and out with the
 
 - A handler that never waits finishes inside `rt_task_run`: two switches and nothing else,
   so the fast path keeps its speed (measured: 308–310k req/s on one core, as before).
-- A handler that waits (`tide.Wait`, `tide.Sleep`; network and helper calls in later
-  phases) yields: the request's bytes are copied out of the shared read buffer, the
+- A handler that waits (`tide.Wait`, `tide.Sleep`, `wire` calls, `quarry` file calls) yields: the request's bytes are copied out of the shared read buffer, the
   connection stops serving its later pipelined requests (responses stay in order), and the
   core goes back to its event loop. Sleeping tasks sit in a per-core min-heap; the loop
   waits at most until the earliest wake-up (`ev_wait(ms)`), then resumes due tasks. A task
@@ -232,6 +231,23 @@ core's pool words (bump, end, base, mark, extra) are swapped in and out with the
 - Backpressure: at 4096 waiting requests on a core, new requests get 503.
 - A connection closed while its request waits is marked dead and freed when the task ends.
 - Finished tasks go on a per-core free list with their stacks and pools.
+
+### Non-blocking I/O and helper threads (v0.4)
+
+- `rt_task_wait(fd, want, timeout)` is the one wait primitive: inside a task it registers
+  the fd once (kqueue `EV_ONESHOT` / epoll `EPOLLONESHOT`) through the core's `waitHook`,
+  pushes a timer for the earlier of the timeout and the request deadline, and yields. The
+  event or the timer resumes the task, whichever comes first; a generation number makes the
+  loser stale (a stale timer is skipped, a stale fd watch is removed by `waitCancel`).
+  Outside a task it falls back to `poll` or a sleep, so the same code works in `main`.
+- `wire` sockets are non-blocking: connect, read, write and accept wait with
+  `rt_task_wait` on `EAGAIN`. `Conn.SetTimeout` bounds each wait; past it the call fails
+  with `wire: read timed out` (or connect/write), past the deadline with `deadline exceeded`.
+- Work with no non-blocking form (DNS `getaddrinfo`, file reads and writes in `quarry`)
+  goes to four shared helper threads: `rt_helper_run(f, job)` queues the job on a pipe,
+  the task yields, the helper runs `f(job)` and writes the job pointer to the core's done
+  pipe, and the core resumes the task. Results travel in malloc'd memory in the job, never
+  in the helper's pool. Outside a task `rt_helper_run` just calls `f`.
 
 ## 10. JSON: argo
 

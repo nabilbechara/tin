@@ -13,6 +13,8 @@ extern func calloc(n i64, size i64) i64
 extern func realloc(p i64, n i64) i64
 extern func free(p i64)
 extern func nanosleep(req i64, rem i64) i64
+extern func poll(fds i64, n i64, timeout i64) i64
+extern func pipe(fds i64) i64
 extern func memcpy(dst i64, src i64, n i64) i64
 extern func memmove(dst i64, src i64, n i64) i64
 extern func memcmp(a i64, b i64, n i64) i64
@@ -2205,15 +2207,26 @@ const tDeadline = 30 // 0, or when every wait of this task gives up (mono ns)
 const tFault = 31    // why the last wait ended: 0 woken, 1 deadline
 const tNext = 32     // free list link
 const tUser = 33     // 6 words for the owner (anvil keeps its connection here)
-const taskWords = 40
+const tGen = 40      // counts waits: a timer entry from an earlier wait is ignored
+const tWaiting = 41  // 1 while the task waits
+const tWaitFd = 42   // the descriptor it waits on, or -1
+const tResult = 43   // how the wait ended: waitReady, waitDeadline or waitTimeout
+const taskWords = 48
+
+const waitReady = 0
+const waitDeadline = 1
+const waitTimeout = 2
 
 var curTask i64   // per core: the running task, 0 on the core's own stack
 var schedSave i64 // per core: the core's own registers while a task runs
 var schedPool i64 // per core: the core's own pool words while a task runs
 var freeTasks i64 // per core: finished tasks, reused with their stacks
-var timerHeap i64 // per core: waiting tasks, a min-heap on tWake
+var timerHeap i64 // per core: a min-heap of [wake, task, gen] entries
 var timerN i64
 var timerCap i64
+var waitHook func(i64, i64) // per core (set by a server): watch fd (1 read, 2 write) for curTask
+var waitCancel func(i64)    // per core: stop watching fd
+var doneFd i64              // per core: the pipe helper threads report finished jobs to (0: none)
 
 // rt_task_swap stores the running registers into from and continues with those in to.
 func rt_task_swap(from i64, to i64) {
@@ -2315,24 +2328,80 @@ func rt_task_set_deadline(t i64, at i64) {
 	t[tDeadline] = at
 }
 
+// rt_task_wait waits until fd is ready (want 1: readable, 2: writable; fd -1: no fd), the
+// timeout passes (ns, 0: none) or the task's deadline comes. Inside a task the core runs
+// other tasks meanwhile; outside one it blocks in poll. It returns waitReady, waitTimeout
+// or waitDeadline.
+func rt_task_wait(fd i64, want i64, timeout i64) i64 {
+	t := curTask
+	if t == 0 || (fd >= 0 && cast(i64, waitHook) == 0) {
+		if fd < 0 {
+			rt_sleep_ns(timeout)
+			return waitTimeout
+		}
+		return rt_poll_wait(fd, want, timeout)
+	}
+	wake := -1
+	t[tResult] = waitTimeout
+	if timeout > 0 {
+		wake = rt_mono_ns() + timeout
+	}
+	if t[tDeadline] > 0 && (wake < 0 || t[tDeadline] <= wake) {
+		wake = t[tDeadline]
+		t[tResult] = waitDeadline
+	}
+	t[tGen]++
+	t[tWaiting] = 1
+	t[tWaitFd] = fd
+	if wake >= 0 {
+		rt_timer_push(t, wake)
+	}
+	if fd >= 0 {
+		waitHook(fd, want)
+	}
+	rt_task_yield()
+	return t[tResult]
+}
+
+// rt_task_ready ends task t's wait because what it waited for happened; resume it next.
+func rt_task_ready(t i64) {
+	t[tWaiting] = 0
+	t[tGen]++
+	t[tResult] = waitReady
+	t[tWaitFd] = -1
+}
+
+// rt_poll_wait blocks until fd is ready or timeout ns pass (0: no limit).
+func rt_poll_wait(fd i64, want i64, timeout i64) i64 {
+	pfd := rt_alloc(8)
+	__st(pfd, fd, 2)
+	if want == 1 {
+		__st(pfd+4, 1, 1)
+	} else {
+		__st(pfd+4, 4, 1)
+	}
+	ms := -1
+	if timeout > 0 {
+		ms = (timeout + 999999) / 1000000
+	}
+	for {
+		r := i64(i32(poll(pfd, 1, ms)))
+		if r > 0 {
+			return waitReady
+		}
+		if r == 0 {
+			return waitTimeout
+		}
+		if rt_errno() != EINTR {
+			return waitReady
+		}
+	}
+}
+
 // rt_task_sleep waits ns: inside a task the core runs other tasks meanwhile; outside one
 // it blocks. It returns true when the task's deadline cut the wait short.
 func rt_task_sleep(ns i64) bool {
-	t := curTask
-	if t == 0 {
-		rt_sleep_ns(ns)
-		return false
-	}
-	wake := rt_mono_ns() + ns
-	t[tFault] = 0
-	if t[tDeadline] > 0 && wake >= t[tDeadline] {
-		wake = t[tDeadline]
-		t[tFault] = 1
-	}
-	t[tWake] = wake
-	rt_timer_push(t)
-	rt_task_yield()
-	return t[tFault] != 0
+	return rt_task_wait(-1, 0, ns) == waitDeadline
 }
 
 // rt_sleep_ns blocks the thread for ns.
@@ -2352,15 +2421,15 @@ func rt_sleep_ns(ns i64) {
 	}
 }
 
-func rt_timer_push(t i64) {
+func rt_timer_push(t i64, wake i64) {
 	if timerN == timerCap {
 		nc := timerCap * 2
 		if nc < 64 {
 			nc = 64
 		}
-		nh := calloc(nc, 8)
+		nh := calloc(nc*3, 8)
 		if timerN > 0 {
-			memcpy(nh, timerHeap, timerN*8)
+			memcpy(nh, timerHeap, timerN*24)
 			free(timerHeap)
 		}
 		timerHeap = nh
@@ -2370,50 +2439,136 @@ func rt_timer_push(t i64) {
 	timerN++
 	for i > 0 {
 		p := (i - 1) / 2
-		up := timerHeap[p]
-		if up[tWake] <= t[tWake] {
+		if timerHeap[3*p] <= wake {
 			break
 		}
-		timerHeap[i] = up
+		timerHeap[3*i] = timerHeap[3*p]
+		timerHeap[3*i+1] = timerHeap[3*p+1]
+		timerHeap[3*i+2] = timerHeap[3*p+2]
 		i = p
 	}
-	timerHeap[i] = t
+	timerHeap[3*i] = wake
+	timerHeap[3*i+1] = t
+	timerHeap[3*i+2] = t[tGen]
 }
 
-// rt_timer_next is when the earliest waiting task wants to run (mono ns), or -1.
+// rt_timer_next is when the earliest timer entry is due (mono ns), or -1.
 func rt_timer_next() i64 {
 	if timerN == 0 {
 		return -1
 	}
-	return timerHeap[0][tWake]
+	return timerHeap[0]
 }
 
-// rt_timer_pop removes and returns a task whose wake time has come, or 0.
+// rt_timer_pop returns a task whose wait timed out by now (ending that wait), or 0. Entries
+// left by waits that already ended another way are dropped.
 func rt_timer_pop(now i64) i64 {
-	if timerN == 0 || timerHeap[0][tWake] > now {
-		return 0
+	for timerN > 0 && timerHeap[0] <= now {
+		t := timerHeap[1]
+		gen := timerHeap[2]
+		timerN--
+		w := timerHeap[3*timerN]
+		lt := timerHeap[3*timerN+1]
+		lg := timerHeap[3*timerN+2]
+		i := 0
+		for {
+			l := 2*i + 1
+			if l >= timerN {
+				break
+			}
+			m := l
+			if l+1 < timerN && timerHeap[3*(l+1)] < timerHeap[3*l] {
+				m = l + 1
+			}
+			if timerHeap[3*m] >= w {
+				break
+			}
+			timerHeap[3*i] = timerHeap[3*m]
+			timerHeap[3*i+1] = timerHeap[3*m+1]
+			timerHeap[3*i+2] = timerHeap[3*m+2]
+			i = m
+		}
+		if timerN > 0 {
+			timerHeap[3*i] = w
+			timerHeap[3*i+1] = lt
+			timerHeap[3*i+2] = lg
+		}
+		if gen == t[tGen] && t[tWaiting] != 0 {
+			t[tWaiting] = 0
+			t[tGen]++
+			if t[tWaitFd] >= 0 {
+				waitCancel(t[tWaitFd])
+				t[tWaitFd] = -1
+			}
+			return t
+		}
 	}
-	top := timerHeap[0]
-	timerN--
-	last := timerHeap[timerN]
-	i := 0
+	return 0
+}
+
+func rt_pipe(fds i64) i64 {
+	return i64(i32(pipe(fds)))
+}
+
+// ---- helper threads: blocking calls (DNS, files) run here while the task waits ----
+
+shared var helperQ i64    // a pipe of job pointers: [read fd, write fd]
+shared var helperLock i64
+shared var helperUp bool
+const helperThreads = 4
+
+// rt_helper_run runs f(arg) on a helper thread while the calling request task waits (the
+// core serves others meanwhile). Outside a task, or with no server loop, it just calls f.
+// f must leave its results in memory arg points to, not in its own request pool.
+func rt_helper_run(f func(i64), arg i64) {
+	t := curTask
+	if t == 0 || doneFd == 0 {
+		f(arg)
+		return
+	}
+	if !helperUp {
+		rt_lock(&helperLock)
+		if !helperUp {
+			helperQ = calloc(2, 8)
+			fds := calloc(2, 4)
+			rt_pipe(fds)
+			helperQ[0] = i64(i32(__ld(fds, 2)))
+			helperQ[1] = i64(i32(__ld(fds+4, 2)))
+			for i := 0; i < helperThreads; i++ {
+				rt_spawn_core(rt_helper_main, i)
+			}
+			helperUp = true
+		}
+		rt_unlock(&helperLock)
+	}
+	job := calloc(4, 8)
+	job[0] = cast(i64, f)
+	job[1] = arg
+	job[2] = t
+	job[3] = doneFd
+	jb := calloc(1, 8)
+	jb[0] = job
+	t[tGen]++
+	t[tWaiting] = 1
+	t[tWaitFd] = -1
+	rt_write_all(helperQ[1], jb, 8)
+	free(jb)
+	rt_task_yield()
+	free(job)
+}
+
+// rt_helper_main is a helper thread: run each queued job, then tell its core.
+func rt_helper_main(id i64) {
+	buf := calloc(1, 8)
 	for {
-		l := 2*i + 1
-		if l >= timerN {
-			break
+		n := read(helperQ[0], buf, 8)
+		if n != 8 {
+			continue
 		}
-		m := l
-		if l+1 < timerN && timerHeap[l+1][tWake] < timerHeap[l][tWake] {
-			m = l + 1
-		}
-		if timerHeap[m][tWake] >= last[tWake] {
-			break
-		}
-		timerHeap[i] = timerHeap[m]
-		i = m
+		job := buf[0]
+		f := cast(func(i64), job[0])
+		f(job[1])
+		rt_pool_reset()
+		rt_write_all(job[3], buf, 8)
 	}
-	if timerN > 0 {
-		timerHeap[i] = last
-	}
-	return top
 }

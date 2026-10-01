@@ -75,6 +75,36 @@ def main():
             failures.append('a fast request waited %.1f ms' % (max(fast) * 1000))
         if any(not b.startswith(b'slept') for b in bodies):
             failures.append('slow bodies: %r' % bodies)
+        prox = {}
+
+        def proxy(i):
+            prox[i] = get(port, '/proxy?ms=400')
+
+        threads = [threading.Thread(target=proxy, args=(i,)) for i in range(6)]
+        t0 = time.time()
+        for t in threads:
+            t.start()
+        time.sleep(0.05)
+        fast = [get(port, '/fast')[0] for _ in range(20)]
+        files = [get(port, '/file?n=%d' % i) for i in range(5)]
+        for t in threads:
+            t.join()
+        total = time.time() - t0
+        bodies = [d.split(b'\r\n\r\n', 1)[-1] for _, d in prox.values()]
+        print('6 proxied 400 ms calls in %.3f s; fast meanwhile: max %.1f ms; file: max %.1f ms' %
+              (total, max(fast) * 1000, max(f[0] for f in files) * 1000))
+        if total > 1.2:
+            failures.append('proxied calls did not overlap (%.3f s)' % total)
+        if max(fast) > 0.1:
+            failures.append('a fast request waited %.1f ms behind proxies' % (max(fast) * 1000))
+        if any(not b.startswith(b'via proxy: slept') for b in bodies):
+            failures.append('proxy bodies: %r' % bodies)
+        if any(not f[1].endswith(b'file: hello from a helper thread') for f in files):
+            failures.append('file bodies: %r' % [f[1][-60:] for f in files])
+        dt, d = get(port, '/proxy?ms=1&port=1')
+        print('refused upstream: %.3f s, %r' % (dt, d.split(b'\r\n')[0]))
+        if not d.startswith(b'HTTP/1.1 502') or dt > 1:
+            failures.append('refused upstream: %.3f s %r' % (dt, d[-80:]))
         dt, d = get(port, '/slow?ms=5000')
         print('deadline: %.3f s, %r' % (dt, d.split(b'\r\n')[0]))
         if not d.startswith(b'HTTP/1.1 504') or dt > 2.5:

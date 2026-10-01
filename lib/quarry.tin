@@ -166,6 +166,54 @@ func readFd(fd i64, hint i64, path str) !str {
 
 // ReadFile returns the whole content of the file at path.
 func ReadFile(path str) !str {
+	if rt_task_current() == 0 {
+		return try readFileHere(path)
+	}
+	// Inside a request task the read runs on a helper thread while the core serves others.
+	job := calloc(5, 8)
+	job[0] = cast(i64, path)
+	rt_helper_run(readJob, job)
+	return try jobResult(job)
+}
+
+// readJob runs ReadFile on a helper thread, copying the result (or the fault's message)
+// into malloc'd memory the task turns back into a str.
+func readJob(job i64) {
+	s, err := readFileHere(cast(str, job[0]))
+	if err != nil {
+		jobFault(job, err)
+		return
+	}
+	job[1] = malloc(len(s) + 1)
+	memcpy(job[1], cast(i64, s)+8, len(s))
+	job[2] = len(s)
+}
+
+func jobFault(job i64, err fault) {
+	m := say.Str(err)
+	job[3] = malloc(len(m) + 1)
+	memcpy(job[3], cast(i64, m)+8, len(m))
+	job[4] = len(m)
+}
+
+// jobResult turns a helper job's result into a str or a fault and frees the job.
+func jobResult(job i64) !str {
+	if job[3] != 0 {
+		m := rt_str_from_raw(job[3], job[4])
+		free(job[3])
+		free(job)
+		fail m
+	}
+	s := ""
+	if job[1] != 0 {
+		s = rt_str_from_raw(job[1], job[2])
+		free(job[1])
+	}
+	free(job)
+	return s
+}
+
+func readFileHere(path str) !str {
 	if badPath(path) {
 		fail invalidFault("open", path)
 	}
@@ -221,12 +269,32 @@ func writeAll(path str, data str, flags i64) ! {
 
 // WriteFile writes data to the file at path, creating it (mode 0644) or truncating it.
 func WriteFile(path str, data str) ! {
-	return try writeAll(path, data, oWrite)
+	return try writeVia(path, data, oWrite)
 }
 
 // AppendFile appends data to the file at path, creating it (mode 0644) when needed.
 func AppendFile(path str, data str) ! {
-	return try writeAll(path, data, oAppend)
+	return try writeVia(path, data, oAppend)
+}
+
+// writeVia is writeAll, on a helper thread when called from a request task.
+func writeVia(path str, data str, flags i64) ! {
+	if rt_task_current() == 0 {
+		return try writeAll(path, data, flags)
+	}
+	job := calloc(7, 8)
+	job[0] = cast(i64, path)
+	job[5] = cast(i64, data)
+	job[6] = flags
+	rt_helper_run(writeJob, job)
+	_ = try jobResult(job)
+}
+
+func writeJob(job i64) {
+	err := writeAll(cast(str, job[0]), cast(str, job[5]), job[6])
+	if err != nil {
+		jobFault(job, err)
+	}
 }
 
 // Exists reports whether path names an existing file or directory (symlinks are followed).

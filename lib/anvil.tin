@@ -121,6 +121,9 @@ shared var gDeadlineSet bool
 const maxWaiting = 4096 // waiting request tasks per core; past it new requests get 503
 var waiting i64        // this core's request tasks that are waiting
 
+var fdTask i64  // fd -> the request task waiting on it (client sockets)
+var doneRd i64  // the read end of this core's helper-job pipe
+
 var head bool
 // The request serve_one hands to the task it starts (read before the task first waits).
 var pReq i64
@@ -304,6 +307,17 @@ func core(id i64) {
 	if gTickMs > 0 {
 		tick = ev_timer(gTickMs)
 	}
+	// Request tasks wait on client sockets through this loop, and on helper threads
+	// through a pipe.
+	fdTask = calloc(65536, 8)
+	jfds := calloc(2, 4)
+	pipe(jfds)
+	doneRd = i64(i32(__ld(jfds, 2)))
+	doneFd = i64(i32(__ld(jfds+4, 2)))
+	fcntl(doneRd, F_SETFL, O_NONBLOCK)
+	ev_level(doneRd)
+	waitHook = task_watch
+	waitCancel = task_unwatch
 	drainTimer = -1
 	if id == 0 {
 		ev_signals()
@@ -342,6 +356,14 @@ func core(id i64) {
 				rt_pool_reset()
 			} else if fd == myListen {
 				accept_all()
+			} else if fd == doneRd {
+				take_jobs()
+			} else if fd >= 0 && fd < 65536 && fdTask[fd] != 0 {
+				task := fdTask[fd]
+				fdTask[fd] = 0
+				ev_task_del(fd)
+				rt_task_ready(task)
+				resume_task(task)
 			} else {
 				c := conns[fd]
 				if c != 0 {
@@ -959,6 +981,32 @@ func finish_request(c i64, task i64) {
 func resume_task(task i64) {
 	if rt_task_run(task) {
 		finish_request(task[tArg], task)
+	}
+}
+
+// task_watch is the runtime's wait hook: watch fd for the running task.
+func task_watch(fd i64, want i64) {
+	fdTask[fd] = rt_task_current()
+	ev_task_add(fd, want)
+}
+
+func task_unwatch(fd i64) {
+	ev_task_del(fd)
+	fdTask[fd] = 0
+}
+
+// take_jobs resumes the tasks whose helper jobs finished.
+func take_jobs() {
+	buf := word
+	for {
+		n := read(doneRd, buf, 8)
+		if n != 8 {
+			return
+		}
+		job := buf[0]
+		task := job[2]
+		rt_task_ready(task)
+		resume_task(task)
 	}
 }
 

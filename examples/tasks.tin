@@ -2,11 +2,16 @@ package main
 
 import "anvil"
 import "mint"
+import "quarry"
 import "say"
 import "tide"
+import "wire"
 
-// A server where some requests wait (GET /slow?ms=N) while others answer at once
-// (GET /fast). On one core, a waiting request does not delay the others.
+// A server where some requests wait while others answer at once. On one core:
+//   GET /slow?ms=N   waits N ms (tide.Wait)
+//   GET /proxy?ms=N  calls this same server's /slow with wire (non-blocking inside a task)
+//   GET /file        writes and reads a file (on a helper thread)
+//   GET /fast        answers at once
 func handle(q anvil.Req, w mut anvil.Out) {
 	if q.Path == "/slow" {
 		ms := mint.Atoi(q.Param("ms")) catch _ { 100 }
@@ -18,6 +23,43 @@ func handle(q anvil.Req, w mut anvil.Out) {
 			return
 		}
 		w.Text("slept {tide.Milliseconds(tide.Since(t0))} ms")
+		return
+	}
+	if q.Path == "/proxy" {
+		port := q.Param("port")
+		if port == "" {
+			port = quarry.Getenv("PORT")
+		}
+		if port == "" {
+			port = "9183"
+		}
+		host := q.Param("host")
+		if host == "" {
+			host = "127.0.0.1"
+		}
+		ms := q.Param("ms")
+		r := wire.Get("http://{host}:{port}/slow?ms={ms}") catch err {
+			w.Status(502)
+			w.Text("upstream: {err}")
+			return
+		}
+		w.Text("via proxy: {r.Body}")
+		return
+	}
+	if q.Path == "/file" {
+		n := q.Param("n")
+		path := "/tmp/tin-test-tasks-{n}.txt"
+		quarry.WriteFile(path, "hello from a helper thread") catch err {
+			w.Status(500)
+			w.Text("write: {err}")
+			return
+		}
+		data := quarry.ReadFile(path) catch err {
+			w.Status(500)
+			w.Text("read: {err}")
+			return
+		}
+		w.Text("file: {data}")
 		return
 	}
 	if q.Path == "/fast" {

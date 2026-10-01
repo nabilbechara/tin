@@ -25,8 +25,9 @@ extern func strerror(e i64) i64
 
 // Conn is a TCP connection.
 type Conn struct {
-	open bool // false for the zero Conn (a failed Dial or Accept): it owns no descriptor
-	fd   i64
+	open    bool // false for the zero Conn (a failed Dial or Accept): it owns no descriptor
+	fd      i64
+	timeout i64  // ns a read or write may wait (0: no limit; a request's deadline still applies)
 }
 
 // Listener accepts TCP connections.
@@ -119,21 +120,52 @@ func resolve(host str, port i64, sa i64) ! {
 		return
 	}
 	free(octets)
+	// getaddrinfo blocks: inside a request task it runs on a helper thread.
+	job := calloc(3, 8)
+	job[0] = cast(i64, host) + 8
+	job[1] = sa
+	rt_helper_run(dns_job, job)
+	ok := job[2] != 0
+	free(job)
+	if !ok {
+		fail say.Fault("wire: cannot resolve %q", host)
+	}
+}
+
+// dns_job resolves the C string job[0] into the sockaddr job[1]; job[2] is 1 on success.
+func dns_job(job i64) {
 	hints := calloc(1, 48)
 	__st(hints+4, 2, 2)
 	__st(hints+8, 1, 2)
 	res := calloc(1, 8)
-	rc := i64(i32(getaddrinfo(cast(i64, host)+8, 0, hints, res)))
+	rc := i64(i32(getaddrinfo(job[0], 0, hints, res)))
 	free(hints)
 	if rc != 0 || res[0] == 0 {
 		free(res)
-		fail say.Fault("wire: cannot resolve %q", host)
+		return
 	}
 	ai := res[0]
 	addr := rt_ai_addr(ai)
-	memcpy(sa+4, addr+4, 4)
+	memcpy(job[1]+4, addr+4, 4)
 	freeaddrinfo(ai)
 	free(res)
+	job[2] = 1
+}
+
+// wait_io waits until fd is ready for a read (want 1) or write (2), within timeout ns.
+func wait_io(fd i64, want i64, timeout i64, what str) ! {
+	r := rt_task_wait(fd, want, timeout)
+	if r == waitDeadline {
+		fail "deadline exceeded"
+	}
+	if r == waitTimeout {
+		fail "wire: {what} timed out"
+	}
+}
+
+func nonblocking(fd i64) {
+	flags := i64(i32(fcntl(fd, F_GETFL, 0)))
+	fcntl(fd, F_SETFL, flags|O_NONBLOCK)
 }
 
 // Dial connects to "host:port".
@@ -163,19 +195,8 @@ func DialTimeout(addr str, timeout i64) !Conn {
 	rt_nosigpipe(fd)
 	setsockopt(fd, 6, 1, one, 4)
 	free(one)
-	if timeout <= 0 {
-		if i64(i32(connect(fd, sa, 16))) < 0 {
-			f := os_fault(say.Fmt("connect %s", addr))
-			close(fd)
-			if f != nil {
-				fail f
-			}
-			return none
-		}
-		return Conn{open: true, fd: fd}
-	}
-	flags := i64(i32(fcntl(fd, F_GETFL, 0)))
-	fcntl(fd, F_SETFL, flags|O_NONBLOCK)
+	// Sockets are non-blocking: inside a request task a wait lets the core serve others.
+	nonblocking(fd)
 	if i64(i32(connect(fd, sa, 16))) < 0 {
 		if errno() != EINPROGRESS {
 			f2 := os_fault(say.Fmt("connect %s", addr))
@@ -185,14 +206,10 @@ func DialTimeout(addr str, timeout i64) !Conn {
 			}
 			return none
 		}
-		pfd := calloc(1, 8)
-		__st(pfd, fd, 2)
-		__st(pfd+4, 4, 1)
-		ready := i64(i32(poll(pfd, 1, timeout/1000000)))
-		free(pfd)
-		if ready <= 0 {
+		werr := wait_io(fd, 2, timeout, "connect " + addr)
+		if werr != nil {
 			close(fd)
-			fail say.Fault("wire: connect %s: timed out", addr)
+			fail werr
 		}
 		soerr := calloc(1, 8)
 		ln := calloc(1, 8)
@@ -207,18 +224,12 @@ func DialTimeout(addr str, timeout i64) !Conn {
 			fail say.Fault("wire: connect %s: %s", addr, rt_str_from_raw(m, strlen(m)))
 		}
 	}
-	fcntl(fd, F_SETFL, flags)
-	return Conn{open: true, fd: fd}
+	return Conn{open: true, fd: fd, timeout: 0}
 }
 
 // SetTimeout limits every later read and write to ns nanoseconds (0: no limit).
-func (c Conn) SetTimeout(ns i64) {
-	tv := calloc(1, 16)
-	tv[0] = ns / 1000000000
-	__st(tv+8, (ns%1000000000)/1000, 2)
-	setsockopt(c.fd, SOL_SOCKET, SO_RCVTIMEO, tv, 16)
-	setsockopt(c.fd, SOL_SOCKET, SO_SNDTIMEO, tv, 16)
-	free(tv)
+func (c mut Conn) SetTimeout(ns i64) {
+	c.timeout = ns
 }
 
 // SetNoDelay turns Nagle's algorithm off (true) or on.
@@ -244,7 +255,8 @@ func (c Conn) write_raw(p i64, n i64) ! {
 				continue
 			}
 			if e == EAGAIN {
-				fail "wire: write timed out"
+				try wait_io(c.fd, 2, c.timeout, "write")
+				continue
 			}
 			fail os_fault("write")
 		}
@@ -286,7 +298,8 @@ func (c Conn) Read(buf mut []u8, max i64) !i64 {
 			continue
 		}
 		if e == EAGAIN {
-			fail "wire: read timed out"
+			try wait_io(c.fd, 1, c.timeout, "read")
+			continue
 		}
 		fail os_fault("read")
 	}
@@ -353,6 +366,7 @@ func Listen(addr str) !Listener {
 	ln[0] = 16
 	getsockname(fd, sa, ln)
 	free(ln)
+	nonblocking(fd)
 	return Listener{open: true, fd: fd, port: i64(load8(sa+2))<<8 | i64(load8(sa+3))}
 }
 
@@ -374,9 +388,15 @@ func (l Listener) Accept() !Conn {
 			rt_nosigpipe(fd)
 			setsockopt(fd, 6, 1, one, 4)
 			free(one)
-			return Conn{open: true, fd: fd}
+			nonblocking(fd)
+			return Conn{open: true, fd: fd, timeout: 0}
 		}
-		if errno() != 4 {
+		e := errno()
+		if e == EAGAIN {
+			try wait_io(l.fd, 1, 0, "accept")
+			continue
+		}
+		if e != 4 {
 			fail os_fault("accept")
 		}
 	}

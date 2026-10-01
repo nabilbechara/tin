@@ -122,7 +122,7 @@ r := try wire.Get("http://127.0.0.1:8080/json")
 - `IsEOF(err fault) bool`: EOF is the fault Read returns at the end of the stream.
 - `Dial(addr str) !Conn`: Dial connects to "host:port".
 - `DialTimeout(addr str, timeout i64) !Conn`: DialTimeout connects to "host:port", giving up after timeout nanoseconds (0: no limit).
-- `(c Conn) SetTimeout(ns i64)`: SetTimeout limits every later read and write to ns nanoseconds (0: no limit).
+- `(c mut Conn) SetTimeout(ns i64)`: SetTimeout limits every later read and write to ns nanoseconds (0: no limit).
 - `(c Conn) SetNoDelay(on bool)`: SetNoDelay turns Nagle's algorithm off (true) or on.
 - `(c Conn) Write(s str) !`: Write sends all of s.
 - `(c Conn) WriteBytes(b []u8) !`: WriteBytes sends all of b.
