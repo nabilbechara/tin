@@ -460,6 +460,45 @@ func caseMalformed() {
 	result("bad-content-length", allOK, "%d variants -> 400/413/close %s", len(badCL), strings.Join(notes, "; "))
 }
 
+// caseDuplicateCL checks that conflicting Content-Length headers are rejected and the
+// connection closed before any later pipelined request runs, while identical ones are fine.
+func caseDuplicateCL() {
+	follow := "GET /json HTTP/1.1\r\nHost: x\r\n\r\n"
+	allOK := true
+	var notes []string
+	for _, pair := range [][2]string{{"5", "0"}, {"0", "5"}, {"3", "4"}} {
+		raw := "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: " + pair[0] + "\r\nContent-Length: " + pair[1] + "\r\n\r\nhello" + follow
+		rs, c, r, err := roundTrip(raw, false)
+		if err != nil {
+			if !(err == io.EOF || isReset(err)) {
+				allOK = false
+				notes = append(notes, fmt.Sprintf("%s,%s: %v", pair[0], pair[1], err))
+			}
+			continue
+		}
+		closed, why := closedSoon(c, r, time.Second)
+		c.Close()
+		if rs.status != 400 || !closed {
+			allOK = false
+			notes = append(notes, fmt.Sprintf("%s,%s: status %d %s", pair[0], pair[1], rs.status, why))
+		}
+	}
+	raw := "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello" + follow
+	rs, c, r, err := roundTrip(raw, false)
+	if err != nil {
+		allOK = false
+		notes = append(notes, "identical: "+err.Error())
+	} else {
+		rs2, err2 := readResp(r, false)
+		c.Close()
+		if rs.status != 200 || err2 != nil || rs2.status != 200 {
+			allOK = false
+			notes = append(notes, fmt.Sprintf("identical: status %d, follow-up %v", rs.status, err2))
+		}
+	}
+	result("duplicate-content-length", allOK, "conflicting -> 400+close, identical accepted %s", strings.Join(notes, "; "))
+}
+
 func caseClientCloseMid() {
 	partials := []string{
 		"GET /js",
@@ -875,6 +914,7 @@ func main() {
 		{"connection-close", caseConnectionClose},
 		{"head", caseHEAD},
 		{"malformed", caseMalformed},
+		{"duplicate-cl", caseDuplicateCL},
 		{"client-close", caseClientCloseMid},
 		{"query", caseQueryDecoding},
 		{"large-response", caseLargeResponse},
