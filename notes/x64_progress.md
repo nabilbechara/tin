@@ -77,11 +77,9 @@ Files: `selfhost/asm_x64.tin` (encoder, fuzzed against objdump: `tools/x64fuzz/r
 
 ## Patches to apply (not my files)
 
-- `notes/patch_x64_runtime.md`: move rt_stat_mode and the epoll_event layout into per-arch
-  files (new lib/runtime_linux_arm64.tin, lib/anvil_linux_arm64.tin; TARGET_X64 const), plus
-  the optional main.tin `-S` hook. Without it, any amd64 v2 build fails with duplicate
-  definitions.
-- `notes/patch_x64_seal.md`: Sha256 falls back to Sha256Soft when TARGET_X64.
+- `notes/patch_x64_runtime.md`: applied (#1) except the optional main.tin `-S` hook.
+- `notes/patch_x64_seal.md`: applied (#14) as `seal.hw_sha256` in lib/seal_darwin.tin and
+  lib/seal_linux.tin: false on x86-64, and on Linux arm64 only with HWCAP_SHA2.
 
 ## Resume
 

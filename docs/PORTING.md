@@ -19,7 +19,7 @@ Source code does not change. Differences live in three places:
 2. **The linker**: `macho.tin`, `elf.tin` (arm64), `elf_x64.tin`.
 3. **Platform library files**: `NAME_darwin.tin`, `NAME_linux.tin`,
    `NAME_linux_arm64.tin`, `NAME_linux_amd64.tin` next to `NAME.tin`, loaded
-   automatically for the target. Today: `runtime_*`, `anvil_*`.
+   automatically for the target. Today: `runtime_*`, `anvil_*`, `seal_*`.
 
 Calling-convention differences inside one architecture (arm64): Apple passes variadic C
 arguments on the stack, Linux (AAPCS64) in registers; Apple reserves x18. Both are
@@ -48,7 +48,8 @@ The plan (`notes/plan_linux.md`) and the work log (`notes/x64_progress.md`):
   `realpath@GLIBC_2.2.5`).
 - Layout differences: `struct epoll_event` is packed (12 bytes), `st_mode` is at offset
   24.
-- `seal.Sha256` uses the portable code until SHA-NI is added.
+- `seal.Sha256` uses the portable code until SHA-NI is added (also on arm64 CPUs without
+  the SHA-2 instructions, detected through `AT_HWCAP`).
 - Correctness is tested in an emulated amd64 container. Benchmarks need real x86-64
   hardware.
 
