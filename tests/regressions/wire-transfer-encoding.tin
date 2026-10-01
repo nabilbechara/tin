@@ -1,0 +1,109 @@
+package main
+
+import "hearth"
+import "mint"
+import "relay"
+import "say"
+import "wire"
+
+// reply is the raw response the test server sends for path; it closes the connection after it.
+func reply(path str) str {
+	chunks := "3\r\nabc\r\n0\r\n\r\n"
+	if path == "/upper" {
+		return "HTTP/1.1 200 OK\r\nTransfer-Encoding: Chunked\r\n\r\n" + chunks
+	}
+	if path == "/spaces" {
+		return "HTTP/1.1 200 OK\r\nTransfer-Encoding:  chunked \r\n\r\n" + chunks
+	}
+	if path == "/gzip-chunked" {
+		return "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n" + chunks
+	}
+	if path == "/gzip" {
+		return "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nabc"
+	}
+	if path == "/unknown" {
+		return "HTTP/1.1 200 OK\r\nTransfer-Encoding: x-squash\r\n\r\nabc"
+	}
+	if path == "/chunked-gzip" {
+		return "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\nabc"
+	}
+	if path == "/twice" {
+		return "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n" + chunks
+	}
+	if path == "/empty" {
+		return "HTTP/1.1 200 OK\r\nTransfer-Encoding: , \r\n\r\nabc"
+	}
+	if path == "/params" {
+		return "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked;q=1\r\n\r\n" + chunks
+	}
+	if path == "/identity" {
+		return "HTTP/1.1 200 OK\r\nTransfer-Encoding: identity\r\n\r\nabc"
+	}
+	return "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nbye"
+}
+
+func serve(l wire.Listener) fault {
+	for {
+		c := try l.Accept()
+		req := make([]u8, 0, 1024)
+		for {
+			_, err := c.Read(req, 1024)
+			if err != nil {
+				return err
+			}
+			s := str(req)
+			if len(s) >= 4 && s[len(s)-4:] == "\r\n\r\n" {
+				break
+			}
+		}
+		s := str(req)
+		sp := 4
+		for sp < len(s) && s[sp] != ' ' {
+			sp++
+		}
+		path := s[4:sp]
+		_ = c.Write(reply(path)) == nil
+		c.Close()
+		if path == "/stop" {
+			return nil
+		}
+	}
+}
+
+func show(err fault) str {
+	if err == nil {
+		return "nil"
+	}
+	return say.Str(err)
+}
+
+func worker(id i64) {
+	if id == 1 {
+		l, err := wire.Listen("127.0.0.1:0")
+		if err != nil {
+			say.Line("listen", err)
+			return
+		}
+		relay.Send(0, mint.Itoa(l.Port()))
+		e2 := serve(l)
+		if e2 != nil {
+			say.Line("serve error", e2)
+		}
+		l.Close()
+		return
+	}
+	_, port := relay.Recv()
+	base := "http://127.0.0.1:" + port
+	for _, p := range []str{"/upper", "/spaces", "/gzip-chunked", "/gzip", "/unknown", "/chunked-gzip", "/twice", "/empty", "/params", "/identity", "/stop"} {
+		r, err := wire.Get(base + p)
+		body := r.Body
+		if len(body) > 8 {
+			body = say.Fmt("%d bytes ending %s", len(body), body[len(body)-3:])
+		}
+		say.Line(p, r.Status, say.Fmt("%q", body), show(err))
+	}
+}
+
+func main() {
+	hearth.Run(2, worker)
+}

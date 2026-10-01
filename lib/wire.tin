@@ -518,16 +518,19 @@ func read_response(c Conn, head bool) (Resp, fault) {
 		if head || status == 204 || status == 304 || status == 101 {
 			return r, nil
 		}
-		te := r.Header("Transfer-Encoding")
+		chunked, err0 := transfer_coding(r)
+		if err0 != nil {
+			return none_resp(), err0
+		}
 		n, err := content_length(r)
 		if err != nil {
 			return none_resp(), err
 		}
-		if te != "" && n >= 0 {
+		if chunked && n >= 0 {
 			// Both framings at once is how responses get desynchronized: refuse it (RFC 9112 6.3).
 			return none_resp(), fail("wire: both Transfer-Encoding and Content-Length")
 		}
-		if te == "chunked" {
+		if chunked {
 			b := try read_chunked(c, rest)
 			r.Body = b
 			return r, nil
@@ -551,6 +554,70 @@ func read_response(c Conn, head bool) (Resp, fault) {
 		r.Body = str(body2)
 		return r, nil
 	}
+}
+
+// transfer_coding reports whether the response is chunked. Transfer-Encoding headers form one
+// comma-separated list of codings (case-insensitive, blanks ignored); wire decodes only
+// chunked, so a list that is not exactly "chunked" is a fault rather than raw bytes.
+func transfer_coding(r Resp) (bool, fault) {
+	seen := false
+	codings := 0
+	h := r.head
+	i := 0
+	for i < len(h) {
+		j := i
+		for j < len(h) && h[j] != '\n' {
+			j++
+		}
+		line := h[i:j]
+		i = j + 1
+		if len(line) > 0 && line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+		}
+		if len(line) <= 17 || line[17] != ':' || !fold_eq(line[:17], "transfer-encoding") {
+			continue
+		}
+		seen = true
+		v := line[18:]
+		k := 0
+		for k <= len(v) {
+			e := k
+			for e < len(v) && v[e] != ',' {
+				e++
+			}
+			a := k
+			b := e
+			for a < b && (v[a] == ' ' || v[a] == '\t') {
+				a++
+			}
+			for b > a && (v[b-1] == ' ' || v[b-1] == '\t') {
+				b--
+			}
+			if b > a {
+				c := v[a:b]
+				semi := 0
+				for semi < len(c) && c[semi] != ';' {
+					semi++
+				}
+				name := c[:semi]
+				if !fold_eq(name, "chunked") || semi < len(c) {
+					return false, fail(say.Fmt("wire: unsupported Transfer-Encoding %q", c))
+				}
+				codings++
+			}
+			k = e + 1
+		}
+	}
+	if !seen {
+		return false, nil
+	}
+	if codings == 0 {
+		return false, fail("wire: empty Transfer-Encoding")
+	}
+	if codings > 1 {
+		return false, fail("wire: chunked applied more than once")
+	}
+	return true, nil
 }
 
 // maxBodyLen bounds a Content-Length (1 TiB): larger values are refused, not trusted.
