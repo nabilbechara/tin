@@ -517,6 +517,9 @@ fn declare_fn(f) {
         i = i + 1;
     }
     let rtypes = resolve_types(f[F_RTYPES]);
+    if !ck_legacy && !f[F_EXTERN] && !f[F_BANG] && rtypes[VEC_LEN] > 0 && kind_of(vec_get(rtypes, rtypes[VEC_LEN] - 1)) == K_ERROR {
+        err_at(f[F_POS], "write a result that can fail as !T (or ! when there is no value), not with a fault result");
+    }
     let name = qual(ck_pkg, f[F_NAME]);
     if f[F_EXTERN] {
         // C symbols are global: every package's extern of the same name is one function.
@@ -1060,6 +1063,12 @@ fn check_fn(f) {
     // The body shares the parameters' scope, so `let x` cannot silently hide parameter x.
     ck_defers = 0;
     check_stmts(f[F_BODY][BLK_STMTS]);
+    if f[F_BANG] && !ck_legacy && f[F_RTYPES][VEC_LEN] == 1 && !ends_in_return(f[F_BODY][BLK_STMTS]) {
+        // A ! function that runs off its end succeeds.
+        let r = node_new(ST_RETURN, f[F_POS]);
+        r[RET_VALUE] = mk_int(f[F_POS], 0, ty_error);
+        vec_push(f[F_BODY][BLK_STMTS], r);
+    }
     if ck_defers {
         finish_defers(f);
         ck_defers = 0;
@@ -1247,7 +1256,7 @@ fn ends_in_jump(stmts) {
     }
     let last = vec_get(stmts, stmts[VEC_LEN] - 1);
     let k = last[N_KIND];
-    return k == ST_RETURN || k == ST_BREAK || k == ST_CONTINUE || ends_in_return(stmts);
+    return k == ST_RETURN || k == ST_BREAK || k == ST_CONTINUE || k == ST_FAIL || ends_in_return(stmts);
 }
 
 fn replace_node(e, n) {
@@ -1489,9 +1498,11 @@ fn check_stmt(s) {
         check_assign(s);
     } else if k == ST_MULTI {
         check_multi(s);
+    } else if k == ST_FAIL {
+        check_fail(s);
     } else if k == ST_EXPR {
         let x = s[ES_X];
-        if x[N_KIND] == EX_TRY && !ck_legacy {
+        if (x[N_KIND] == EX_TRY || x[N_KIND] == EX_CATCH) && !ck_legacy {
             lower_try_stmt(s, x, 0, 0);
             return;
         }
@@ -1765,7 +1776,7 @@ fn check_let(s) {
         t = resolve_type(s[LET_TYPE]);
     }
     let init = s[LET_INIT];
-    if init && init[N_KIND] == EX_TRY && !ck_legacy {
+    if init && (init[N_KIND] == EX_TRY || init[N_KIND] == EX_CATCH) && !ck_legacy {
         lower_try_stmt(s, init, 1, t);
         return;
     }
@@ -1832,7 +1843,7 @@ fn check_target(t) {
 fn check_assign(s) {
     let target = s[AS_TARGET];
     let v = s[AS_VALUE];
-    if v[N_KIND] == EX_TRY && !ck_legacy {
+    if (v[N_KIND] == EX_TRY || v[N_KIND] == EX_CATCH) && !ck_legacy {
         lower_try_stmt(s, v, 2, 0);
         return;
     }
@@ -1901,7 +1912,7 @@ fn check_multi(s) {
     let temps = vec_new();
     if values[VEC_LEN] == 1 && n > 1 {
         let v = vec_get(values, 0);
-        if v[N_KIND] == EX_TRY && !ck_legacy {
+        if (v[N_KIND] == EX_TRY || v[N_KIND] == EX_CATCH) && !ck_legacy {
             lower_try_stmt(s, v, 3, 0);
             return;
         }
@@ -2020,9 +2031,37 @@ fn check_return(s) {
     let f = ck_fn;
     let want = f[F_RTYPES];
     let pos = s[N_POS];
-    if s[RET_VALUE] && s[RET_VALUE][N_KIND] == EX_TRY && !ck_legacy {
+    if s[RET_VALUE] && (s[RET_VALUE][N_KIND] == EX_TRY || s[RET_VALUE][N_KIND] == EX_CATCH) && !ck_legacy {
         lower_try_stmt(s, s[RET_VALUE], 4, 0);
         return;
+    }
+    if f[F_BANG] && !ck_legacy {
+        // In a !T function, return gives the values; the fault slot is filled with nil.
+        let nw = want[VEC_LEN] - 1;
+        if s[RET_VALUES] {
+            if s[RET_VALUES][VEC_LEN] == want[VEC_LEN] {
+                err_at(pos, "a !T function returns only its values: use fail to return a fault");
+                return;
+            }
+            if s[RET_VALUES][VEC_LEN] == nw {
+                vec_push(s[RET_VALUES], mk_int(pos, 0, ty_error));
+            }
+        } else if s[RET_VALUE] {
+            if nw == 0 {
+                err_at(pos, "a ! function returns no value: use fail to return a fault");
+                return;
+            }
+            if nw == 1 {
+                let rv = vec_new();
+                vec_push(rv, s[RET_VALUE]);
+                vec_push(rv, mk_int(pos, 0, ty_error));
+                s[RET_VALUES] = rv;
+                s[RET_VALUE] = 0;
+            }
+        } else if nw == 0 {
+            s[RET_VALUE] = mk_int(pos, 0, ty_error);
+            return;
+        }
     }
     if s[RET_VALUES] {
         let vals = s[RET_VALUES];
@@ -2092,13 +2131,20 @@ fn check_return(s) {
 // lower_try_stmt compiles the five places try may appear:
 //   0 try f()   1 x := try f()   2 x = try f()   3 a, b := try f()   4 return try f()
 // into: results := f(); if fault != nil { return zero values..., fault }; then use them.
+// With tr an EX_CATCH (E catch name { ... }) the fault runs the catch block instead of
+// returning; a value catch assigns the block's last expression to the result.
 fn lower_try_stmt(s, tr, mode, declared) {
     let pos = s[N_POS];
     let call = tr[TRY_X];
+    let handler = 0;
+    if tr[N_KIND] == EX_CATCH {
+        handler = tr;
+    }
     let f = ck_fn;
     let frs = f[F_RTYPES];
-    if frs[VEC_LEN] == 0 || kind_of(vec_get(frs, frs[VEC_LEN] - 1)) != K_ERROR {
-        err_at(pos, "try needs the enclosing function to return a fault as its last result");
+    let hasf = frs[VEC_LEN] > 0 && kind_of(vec_get(frs, frs[VEC_LEN] - 1)) == K_ERROR;
+    if !handler && !hasf {
+        err_at(pos, "try needs the enclosing function to return a fault (write its result as !T)");
         return;
     }
     let t = chk(call, 0);
@@ -2109,7 +2155,11 @@ fn lower_try_stmt(s, tr, mode, declared) {
         vec_push(results, t);
     }
     if results[VEC_LEN] == 0 || kind_of(vec_get(results, results[VEC_LEN] - 1)) != K_ERROR {
-        err_at(pos, "try needs a call whose last result is a fault");
+        if handler {
+            err_at(pos, "catch needs a call whose result can be a fault (!T)");
+        } else {
+            err_at(pos, "try needs a call whose last result is a fault");
+        }
         return;
     }
     let out = empty_block(pos);
@@ -2136,35 +2186,31 @@ fn lower_try_stmt(s, tr, mode, declared) {
     }
     let errsym = vec_get(temps, temps[VEC_LEN] - 1);
     errsym[S_READS] = 1;
-    // if fault != nil { return zero..., fault }
+    let nvals = temps[VEC_LEN] - 1;
+    // if fault != nil { return zero..., fault }   (or, with catch: { the catch block })
     let ifs = node_new(ST_IF, pos);
     ifs[IF_COND] = mk_bin(pos, "!=", sym_ref_node(pos, errsym), mk_int(pos, 0, ty_error), ty_bool);
     ifs[IF_THEN] = empty_block(pos);
-    let ret = node_new(ST_RETURN, pos);
-    if frs[VEC_LEN] == 1 {
-        ret[RET_VALUE] = sym_ref_node(pos, errsym);
-    } else {
-        let rv = vec_new();
-        let i = 0;
-        while i < frs[VEC_LEN] - 1 {
-            let rt = vec_get(frs, i);
-            let rk = kind_of(rt);
-            if is_float_t(rt) {
-                vec_push(rv, zero_value(pos, ty_float));
-            } else if !ck_legacy && (rk == K_STRING || rk == K_SLICE || rk == K_MAP || rk == K_STRUCT) {
-                // A str, slice, map or struct is never nil, even next to a fault.
-                vec_push(rv, argo_new(pos, ifs[IF_THEN][BLK_STMTS], rt));
-            } else {
-                vec_push(rv, mk_int(pos, 0, rt));
-            }
-            i = i + 1;
+    if handler {
+        let needv = (mode == 1 || mode == 2 || mode == 4) && nvals == 1;
+        if nvals >= 1 {
+            // The block's value is assigned by name: give the value temp a name of its own.
+            catch_seq = catch_seq + 1;
+            let nb = buf_new();
+            buf_str(nb, "$catch");
+            buf_int(nb, catch_seq);
+            buf_byte(nb, 0);
+            vec_get(temps, 0)[S_NAME] = nb[VEC_DATA];
         }
-        vec_push(rv, sym_ref_node(pos, errsym));
-        ret[RET_VALUES] = rv;
+        if (mode == 3 || ((mode == 4 || mode == 1 || mode == 2) && nvals > 1)) && !ends_in_jump(handler[CATCH_BODY][BLK_STMTS]) {
+            err_at(handler[N_POS], "this catch block must leave (return, break, continue or fail): there is no single value to give");
+            return;
+        }
+        ifs[IF_THEN][BLK_STMTS] = catch_body(pos, handler, temps, errsym, needv);
+    } else {
+        vec_push(ifs[IF_THEN][BLK_STMTS], fault_return(pos, ifs[IF_THEN][BLK_STMTS], sym_ref_node(pos, errsym)));
     }
-    vec_push(ifs[IF_THEN][BLK_STMTS], ret);
     vec_push(stmts, ifs);
-    let nvals = temps[VEC_LEN] - 1;
     if mode == 1 {
         if nvals != 1 {
             err_at(pos, "try here needs a call with exactly one result besides the fault");
@@ -2204,6 +2250,27 @@ fn lower_try_stmt(s, tr, mode, declared) {
             i = i + 1;
         }
         bind_targets(pos, targets, vals, s[MU_DEFINE], stmts);
+    } else if mode == 4 && !hasf {
+        // return f() catch ... in a function that cannot fail: return just the values.
+        if nvals != frs[VEC_LEN] {
+            err_at(pos, "wrong number of return values");
+            return;
+        }
+        let r = node_new(ST_RETURN, pos);
+        if nvals == 1 {
+            check_assignable(s, vec_get(temps, 0)[S_TYPE], vec_get(frs, 0));
+            r[RET_VALUE] = sym_ref_node(pos, vec_get(temps, 0));
+        } else {
+            let rv3 = vec_new();
+            let i = 0;
+            while i < nvals {
+                check_assignable(s, vec_get(temps, i)[S_TYPE], vec_get(frs, i));
+                vec_push(rv3, sym_ref_node(pos, vec_get(temps, i)));
+                i = i + 1;
+            }
+            r[RET_VALUES] = rv3;
+        }
+        vec_push(stmts, r);
     } else if mode == 4 {
         if nvals != frs[VEC_LEN] - 1 {
             err_at(pos, "wrong number of return values");
@@ -2226,6 +2293,102 @@ fn lower_try_stmt(s, tr, mode, declared) {
         }
         vec_push(stmts, r);
     }
+    replace_node(s, out);
+}
+
+var catch_seq;  // numbers the value temps of catch blocks
+
+// fault_return is `return zero values..., fault` for the current function; statements that
+// build zero values (a struct's fields) go into body before it.
+fn fault_return(pos, body, fault) {
+    let frs = ck_fn[F_RTYPES];
+    let ret = node_new(ST_RETURN, pos);
+    if frs[VEC_LEN] == 1 {
+        ret[RET_VALUE] = fault;
+        return ret;
+    }
+    let rv = vec_new();
+    let i = 0;
+    while i < frs[VEC_LEN] - 1 {
+        let rt = vec_get(frs, i);
+        let rk = kind_of(rt);
+        if is_float_t(rt) {
+            vec_push(rv, zero_value(pos, ty_float));
+        } else if !ck_legacy && (rk == K_STRING || rk == K_SLICE || rk == K_MAP || rk == K_STRUCT) {
+            // A str, slice, map or struct is never nil, even next to a fault.
+            vec_push(rv, argo_new(pos, body, rt));
+        } else {
+            vec_push(rv, mk_int(pos, 0, rt));
+        }
+        i = i + 1;
+    }
+    vec_push(rv, fault);
+    ret[RET_VALUES] = rv;
+    return ret;
+}
+
+// catch_body checks a catch block with its fault bound to name (unless _). With needv the
+// block's last expression becomes the value: it is assigned to the call's first result.
+fn catch_body(pos, c, temps, errsym, needv) {
+    let user = c[CATCH_BODY][BLK_STMTS];
+    let n = user[VEC_LEN];
+    let valued = needv && !ends_in_jump(user);
+    if valued && (n == 0 || vec_get(user, n - 1)[N_KIND] != ST_EXPR) {
+        err_at(c[N_POS], "a catch block must end with the value to use, or leave (return, break, continue or fail)");
+        return vec_new();
+    }
+    let out = vec_new();
+    push_scope();
+    if !streq(c[CATCH_NAME], "_") {
+        let es = declare_local(pos, c[CATCH_NAME], ty_error);
+        vec_push(out, let_stmt(pos, es, sym_ref_node(pos, errsym)));
+    }
+    if valued {
+        // Everything before the last statement runs; the last one is the value.
+        let last = vec_get(user, n - 1);
+        user[VEC_LEN] = n - 1;
+        check_stmts(user);
+        user[VEC_LEN] = n;
+        let vt = vec_get(temps, 0);
+        let lt = chk(last[ES_X], vt[S_TYPE]);
+        if kind_of(lt) == K_VOID {
+            err_at(last[N_POS], "a catch block must end with the value to use, or leave (return, break, continue or fail)");
+        } else {
+            let a = assign_stmt(last[N_POS], sym_ref_node(last[N_POS], vt), last[ES_X]);
+            check_assign(a);
+            user[VEC_DATA][n - 1] = a;
+        }
+    } else {
+        check_stmts(user);
+    }
+    pop_scope();
+    let i = 0;
+    while i < user[VEC_LEN] {
+        vec_push(out, vec_get(user, i));
+        i = i + 1;
+    }
+    return out;
+}
+
+// check_fail lowers `fail X` to `return zero values..., fault`, X a str message or a fault.
+fn check_fail(s) {
+    let pos = s[N_POS];
+    let frs = ck_fn[F_RTYPES];
+    if frs[VEC_LEN] == 0 || kind_of(vec_get(frs, frs[VEC_LEN] - 1)) != K_ERROR {
+        err_at(pos, "fail needs the enclosing function to return a fault (write its result as !T)");
+        return;
+    }
+    let x = s[FAIL_X];
+    let t = chk(x, 0);
+    if kind_of(t) == K_STRING {
+        x = rt_call(pos, "rt_fail", args1(x), ty_error);
+    } else if kind_of(t) != K_ERROR {
+        err_type(pos, "fail needs a str message or a fault, not ", t, "");
+        return;
+    }
+    let out = empty_block(pos);
+    out[BLK_FLAT] = 1;
+    vec_push(out[BLK_STMTS], fault_return(pos, out[BLK_STMTS], x));
     replace_node(s, out);
 }
 

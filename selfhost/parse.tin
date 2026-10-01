@@ -41,6 +41,7 @@ const F_TOKAT = 31;
 const F_TBIND = 32;   // instance: vec of [name, type] bindings
 const F_INSTS = 33;   // generic: vec of [type args, instance]
 const F_GENOF = 34;   // instance: its generic
+const F_BANG = 35;   // results written !T: a return gives the values, fail the fault
 const F_SIZE = 36;
 const F_MUTRES = 24;  // result is a fresh (request-pool) value the caller may modify
 const F_RECVMUT = 25; // method may modify its receiver (needs a fresh one)
@@ -100,6 +101,8 @@ const EX_FUNCLIT = 28;
 const EX_MEM = 29;     // checker-made: sized load/store at base + index*scale + off
 const EX_ELEM = 39;    // checker-made: bounds-checked slice or string element
 const EX_TRY = 48;
+const EX_CATCH = 52;   // E catch name { body }
+const ST_FAIL = 53;    // fail X
 const ST_MULTI = 30;
 const ST_RANGE = 31;
 const ST_SWITCH = 32;
@@ -205,6 +208,10 @@ const ELEM_SIZE = 4;
 const ELEM_STR = 5;
 const ELEM_SAFE = 7;  // index proven in range: no bounds check
 const TRY_X = 2;
+const CATCH_X = 2;
+const CATCH_NAME = 3;
+const CATCH_BODY = 4;
+const FAIL_X = 2;
 const BLK_FLAT = 3;   // a checker-made block that opens no scope
 const CALL_STORE = 8; // a runtime call that stores into its first argument (region pass)
 // Regions of reference values, for the ember/ingot rules.
@@ -220,6 +227,7 @@ var p_i;
 var p_nolit;   // composite literals after a name are off in if/for/switch headers
 var p_legacy;  // parsing a v1 fn body
 var p_mutres;  // the result list just parsed was marked mut
+var p_bangres; // the result list just parsed was written !T
 
 fn node_new(kind, pos) {
     let n = calloc(N_SIZE, 8);
@@ -485,6 +493,12 @@ fn p_is(text) {
     return (t[T_KIND] == TK_KEYWORD || t[T_KIND] == TK_PUNCT) && streq(t[T_TEXT], text);
 }
 
+// p_word reports whether the next token is the name text (fail, catch: names, not keywords).
+fn p_word(text) {
+    let t = p_peek();
+    return t[T_KIND] == TK_IDENT && streq(t[T_TEXT], text);
+}
+
 fn tok_is(t, text) {
     return (t[T_KIND] == TK_KEYWORD || t[T_KIND] == TK_PUNCT) && streq(t[T_TEXT], text);
 }
@@ -731,6 +745,21 @@ fn parse_type_list() {
 
 // parse_results reads a func's result types: none, T, or (T1, T2) with optional names.
 fn parse_results() {
+    if p_is("!") {
+        // !T, !(A, B) or ! alone: the results, then a fault.
+        let bpos = p_next()[T_POS];
+        p_bangres = 1;
+        let br = vec_new();
+        if p_is("(") {
+            br = parse_type_list();
+        } else if starts_type() && !p_is("{") {
+            vec_push(br, parse_type());
+        }
+        let ft = node_new(TX_NAME, bpos);
+        ft[TX_B] = "fault";
+        vec_push(br, ft);
+        return br;
+    }
     if p_is("(") {
         return parse_type_list();
     }
@@ -792,6 +821,7 @@ fn parse_fn(is_extern, legacy) {
     }
     parse_params(f);
     p_mutres = 0;
+    p_bangres = 0;
     if legacy {
         let int_t = node_new(TX_NAME, pos);
         int_t[TX_B] = "int";
@@ -799,6 +829,7 @@ fn parse_fn(is_extern, legacy) {
     } else {
         f[F_RTYPES] = parse_results();
         f[F_MUTRES] = p_mutres;
+        f[F_BANG] = p_bangres;
     }
     if is_extern {
         p_end();
@@ -939,6 +970,16 @@ fn parse_stmt() {
         p_end();
         return r;
     }
+    if p_word("fail") && !p_legacy {
+        let t2 = p_peek2();
+        if !tok_is(t2, ":=") && !tok_is(t2, "=") && !tok_is(t2, ",") && !tok_is(t2, ".") {
+            p_next();
+            let fs = node_new(ST_FAIL, pos);
+            fs[FAIL_X] = parse_expr(1);
+            p_end();
+            return fs;
+        }
+    }
     if p_is("break") {
         p_next();
         p_end();
@@ -1025,12 +1066,24 @@ fn idents_of(pos, names) {
 
 fn parse_expr_list() {
     let v = vec_new();
-    vec_push(v, parse_expr(1));
+    vec_push(v, parse_catch(parse_expr(1)));
     while p_is(",") {
         p_next();
-        vec_push(v, parse_expr(1));
+        vec_push(v, parse_catch(parse_expr(1)));
     }
     return v;
+}
+
+// parse_catch reads an optional `catch name { ... }` after x (strict code only).
+fn parse_catch(x) {
+    if !p_word("catch") || p_legacy {
+        return x;
+    }
+    let c = node_new(EX_CATCH, p_next()[T_POS]);
+    c[CATCH_X] = x;
+    c[CATCH_NAME] = p_expect_ident()[T_TEXT];
+    c[CATCH_BODY] = parse_block();
+    return c;
 }
 
 fn is_assign_op(t) {
@@ -1072,7 +1125,7 @@ fn parse_simple_stmt(xs) {
         p_next();
         let a = node_new(ST_ASSIGN, pos);
         a[AS_TARGET] = x;
-        a[AS_VALUE] = parse_expr(1);
+        a[AS_VALUE] = parse_catch(parse_expr(1));
         return a;
     }
     if is_assign_op(p_peek()) {
@@ -1538,6 +1591,9 @@ fn parse_primary() {
         p_nolit = 0;
         let x = parse_expr(1);
         p_nolit = saved;
+        if p_word("catch") && !p_legacy {
+            p_fail(p_peek()[T_POS], "catch goes on a whole statement, initializer, assignment or return value, not inside an expression");
+        }
         p_expect(")");
         return x;
     }
@@ -1546,7 +1602,9 @@ fn parse_primary() {
         p_next();
         let f = fn_new(pos, "func");
         parse_params(f);
+        p_bangres = 0;
         f[F_RTYPES] = parse_results();
+        f[F_BANG] = p_bangres;
         if !p_is("{") {
             p_fail(pos, "expected a function body");
         }

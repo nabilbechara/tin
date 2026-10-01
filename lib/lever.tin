@@ -150,31 +150,30 @@ func lookup(name str) ?Flag {
 }
 
 // setValue parses value into f, returning Go's flag error text on failure.
-func setValue(f Flag, name str, value str) fault {
+func setValue(f Flag, name str, value str) ! {
 	switch f.kind {
 	case kindStr:
 		f.sval = keep(value)
 	case kindInt:
 		v, code := parseInt(value)
 		if code != 0 {
-			return say.Fault("invalid value %q for flag -%s: %s", value, name, numErr(code))
+			fail say.Fault("invalid value %q for flag -%s: %s", value, name, numErr(code))
 		}
 		f.ival = v
 	case kindBool:
 		v, ok := parseBool(value)
 		if !ok {
-			return say.Fault("invalid boolean value %q for -%s: parse error", value, name)
+			fail say.Fault("invalid boolean value %q for -%s: parse error", value, name)
 		}
 		f.bval = v
 	case kindF64:
 		v, code := parseFloat(value)
 		if code != 0 {
-			return say.Fault("invalid value %q for flag -%s: %s", value, name, numErr(code))
+			fail say.Fault("invalid value %q for flag -%s: %s", value, name, numErr(code))
 		}
 		f.fval = v
 	}
 	f.given = true
-	return nil
 }
 
 // numErr is Go's text for a number parse failure code: 1 syntax, 2 range.
@@ -186,16 +185,16 @@ func numErr(code i64) str {
 }
 
 // Set assigns value to the flag named name as if it were given on the command line.
-func Set(name str, value str) fault {
+func Set(name str, value str) ! {
 	f := lookup(name)
 	if f == nil {
-		return say.Fault("no such flag -%s", name)
+		fail say.Fault("no such flag -%s", name)
 	}
-	return setValue(f, name, value)
+	return try setValue(f, name, value)
 }
 
 // Parse reads flags from args (without the program name) until the first non-flag or "--"; the rest is kept for Rest().
-func Parse(args []str) fault {
+func Parse(args []str) ! {
 	parsed = true
 	i := 0
 	n := len(args)
@@ -213,7 +212,7 @@ func Parse(args []str) fault {
 			}
 		}
 		if len(s) == minuses || s[minuses] == '-' || s[minuses] == '=' {
-			return say.Fault("bad flag syntax: %s", s)
+			fail say.Fault("bad flag syntax: %s", s)
 		}
 		i++
 		name := s[minuses:len(s)]
@@ -230,9 +229,9 @@ func Parse(args []str) fault {
 		f := lookup(name)
 		if f == nil {
 			if name == "help" || name == "h" {
-				return fail("flag: help requested")
+				fail "flag: help requested"
 			}
-			return say.Fault("flag provided but not defined: -%s", name)
+			fail say.Fault("flag provided but not defined: -%s", name)
 		}
 		if f.kind == kindBool {
 			if !hasValue {
@@ -243,7 +242,7 @@ func Parse(args []str) fault {
 		}
 		if !hasValue {
 			if i >= n {
-				return say.Fault("flag needs an argument: -%s", name)
+				fail say.Fault("flag needs an argument: -%s", name)
 			}
 			value = args[i]
 			i++
@@ -251,7 +250,6 @@ func Parse(args []str) fault {
 		try setValue(f, name, value)
 	}
 	rest = keep(args[i:n])
-	return nil
 }
 
 // parseBool parses a Go boolean literal: 1 t T TRUE true True / 0 f F FALSE false False.

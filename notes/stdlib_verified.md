@@ -12,3 +12,10 @@
 | quarry | os | identical except stderr interleaving and naming fdopendir instead of open in one error |
 | lever | flag | identical except: a value that fails to parse leaves the flag unchanged (Go overwrites it with a zero value) |
 | twine, glyph | strings, unicode/utf8 | checked by hand against Go semantics |
+
+
+## Deliberate difference since v0.5 (!T results)
+
+A failing call returns zero values with its fault. Go's strconv returns the clamped value
+(MaxInt64, ±Inf, MaxUint64) together with ErrRange; mint.Atoi, ParseInt, ParseUint and
+ParseFloat now return 0 with the range fault. tests/v2/mint.out records this.

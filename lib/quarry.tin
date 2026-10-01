@@ -58,9 +58,9 @@ func errnoText(e i64) str {
 }
 
 // pathFault makes "op path: strerror(errno)" like Go's PathError.
-func pathFault(op str, path str) fault {
+func pathFault(op str, path str) ! {
 	e := errnoText(errno())
-	return say.Fault("%s %s: %s", op, path, e)
+	fail say.Fault("%s %s: %s", op, path, e)
 }
 
 // badPath reports whether path holds a NUL byte, which no C path can carry.
@@ -69,8 +69,8 @@ func badPath(path str) bool {
 }
 
 // invalidFault is the fault for a path with a NUL byte: "op path: invalid argument".
-func invalidFault(op str, path str) fault {
-	return say.Fault("%s %s: %s", op, path, errnoText(eINVAL))
+func invalidFault(op str, path str) ! {
+	fail say.Fault("%s %s: %s", op, path, errnoText(eINVAL))
 }
 
 // mode returns st_mode from the stat buffer st.
@@ -112,31 +112,29 @@ func LookupEnv(key str) (str, bool) {
 }
 
 // Setenv sets environment variable key to value; an empty key or one holding '=' or NUL is a fault.
-func Setenv(key str, value str) fault {
+func Setenv(key str, value str) ! {
 	if badPath(key) || badPath(value) {
-		return say.Fault("setenv: %s", errnoText(eINVAL))
+		fail say.Fault("setenv: %s", errnoText(eINVAL))
 	}
 	if c32(setenv(rt_cstr(key), rt_cstr(value), 1)) != 0 {
 		e := errnoText(errno())
-		return say.Fault("setenv: %s", e)
+		fail say.Fault("setenv: %s", e)
 	}
-	return nil
 }
 
 // Unsetenv removes environment variable key.
-func Unsetenv(key str) fault {
+func Unsetenv(key str) ! {
 	if badPath(key) {
-		return say.Fault("unsetenv: %s", errnoText(eINVAL))
+		fail say.Fault("unsetenv: %s", errnoText(eINVAL))
 	}
 	if c32(unsetenv(rt_cstr(key))) != 0 {
 		e := errnoText(errno())
-		return say.Fault("unsetenv: %s", e)
+		fail say.Fault("unsetenv: %s", e)
 	}
-	return nil
 }
 
 // readFd reads fd to its end into one str; hint is the expected size (0 when unknown).
-func readFd(fd i64, hint i64, path str) (str, fault) {
+func readFd(fd i64, hint i64, path str) !str {
 	room := hint + 1
 	if room < 512 {
 		room = 512
@@ -152,7 +150,7 @@ func readFd(fd i64, hint i64, path str) (str, fault) {
 		}
 		n := read(fd, p+8+got, room-got)
 		if n < 0 {
-			return "", pathFault("read", path)
+			fail pathFault("read", path)
 		}
 		if n == 0 {
 			break
@@ -160,20 +158,20 @@ func readFd(fd i64, hint i64, path str) (str, fault) {
 		got += n
 	}
 	if got == 0 {
-		return "", nil
+		return ""
 	}
 	p[0] = got
-	return cast(str, p), nil
+	return cast(str, p)
 }
 
 // ReadFile returns the whole content of the file at path.
-func ReadFile(path str) (str, fault) {
+func ReadFile(path str) !str {
 	if badPath(path) {
-		return "", invalidFault("open", path)
+		fail invalidFault("open", path)
 	}
 	fd := c32(open(rt_cstr(path), oRdonly))
 	if fd < 0 {
-		return "", pathFault("open", path)
+		fail pathFault("open", path)
 	}
 	size := 0
 	if c32(fstat(fd, stbuf)) == 0 && !isDirMode(mode(stbuf)) {
@@ -182,24 +180,24 @@ func ReadFile(path str) (str, fault) {
 	s, err := readFd(fd, size, path)
 	close(fd)
 	if err != nil {
-		return "", err
+		fail err
 	}
-	return s, nil
+	return s
 }
 
 // ReadStdin reads standard input to its end.
-func ReadStdin() (str, fault) {
-	return readFd(0, 0, "/dev/stdin")
+func ReadStdin() !str {
+	return try readFd(0, 0, "/dev/stdin")
 }
 
 // writeAll creates or opens path with flags (mode 0644) and writes all of data to it.
-func writeAll(path str, data str, flags i64) fault {
+func writeAll(path str, data str, flags i64) ! {
 	if badPath(path) {
-		return invalidFault("open", path)
+		fail invalidFault("open", path)
 	}
 	fd := c32(open(rt_cstr(path), flags, 420))
 	if fd < 0 {
-		return pathFault("open", path)
+		fail pathFault("open", path)
 	}
 	p := cast(i64, data) + 8
 	n := len(data)
@@ -208,25 +206,27 @@ func writeAll(path str, data str, flags i64) fault {
 		if w < 0 {
 			f := pathFault("write", path)
 			close(fd)
-			return f
+			if f != nil {
+				fail f
+			}
+			return
 		}
 		p += w
 		n -= w
 	}
 	if c32(close(fd)) < 0 {
-		return pathFault("close", path)
+		fail pathFault("close", path)
 	}
-	return nil
 }
 
 // WriteFile writes data to the file at path, creating it (mode 0644) or truncating it.
-func WriteFile(path str, data str) fault {
-	return writeAll(path, data, oWrite)
+func WriteFile(path str, data str) ! {
+	return try writeAll(path, data, oWrite)
 }
 
 // AppendFile appends data to the file at path, creating it (mode 0644) when needed.
-func AppendFile(path str, data str) fault {
-	return writeAll(path, data, oAppend)
+func AppendFile(path str, data str) ! {
+	return try writeAll(path, data, oAppend)
 }
 
 // Exists reports whether path names an existing file or directory (symlinks are followed).
@@ -240,68 +240,68 @@ func IsDir(path str) bool {
 }
 
 // Size returns the size in bytes of the file at path.
-func Size(path str) (i64, fault) {
+func Size(path str) !i64 {
 	if badPath(path) {
-		return 0, invalidFault("stat", path)
+		fail invalidFault("stat", path)
 	}
 	if c32(stat(rt_cstr(path), stbuf)) != 0 {
-		return 0, pathFault("stat", path)
+		fail pathFault("stat", path)
 	}
-	return rt_stat_size(stbuf), nil
+	return rt_stat_size(stbuf)
 }
 
 // ModTime returns the modification time of path in seconds since the Unix epoch.
-func ModTime(path str) (i64, fault) {
+func ModTime(path str) !i64 {
 	if badPath(path) {
-		return 0, invalidFault("stat", path)
+		fail invalidFault("stat", path)
 	}
 	if c32(stat(rt_cstr(path), stbuf)) != 0 {
-		return 0, pathFault("stat", path)
+		fail pathFault("stat", path)
 	}
-	return rt_stat_mtime(stbuf), nil
+	return rt_stat_mtime(stbuf)
 }
 
 // Remove deletes the file or empty directory at path.
-func Remove(path str) fault {
+func Remove(path str) ! {
 	if badPath(path) {
-		return invalidFault("remove", path)
+		fail invalidFault("remove", path)
 	}
 	cp := rt_cstr(path)
 	if c32(unlink(cp)) == 0 {
-		return nil
+		return
 	}
 	e := errno()
 	if c32(rmdir(cp)) == 0 {
-		return nil
+		return
 	}
 	e1 := errno()
 	if e1 != eNOTDIR {
 		e = e1
 	}
-	return say.Fault("remove %s: %s", path, errnoText(e))
+	fail say.Fault("remove %s: %s", path, errnoText(e))
 }
 
 // RemoveAll deletes path and everything below it; a missing path is not a fault.
-func RemoveAll(path str) fault {
+func RemoveAll(path str) ! {
 	if badPath(path) {
-		return invalidFault("unlinkat", path)
+		fail invalidFault("unlinkat", path)
 	}
 	if c32(lstat(rt_cstr(path), stbuf)) != 0 {
 		if errno() == 2 {
-			return nil
+			return
 		}
-		return pathFault("lstat", path)
+		fail pathFault("lstat", path)
 	}
 	if isDirMode(mode(stbuf)) {
 		names, err := ReadDir(path)
 		if err != nil {
-			return err
+			fail err
 		}
 		for _, name := range names {
 			try RemoveAll(path + "/" + name)
 		}
 	}
-	return Remove(path)
+	return try Remove(path)
 }
 
 // sameFile reports whether the two stat buffers describe the same inode.
@@ -310,47 +310,45 @@ func sameFile(a i64, b i64) bool {
 }
 
 // Rename moves oldpath to newpath, replacing a file there; like Go it never replaces a directory.
-func Rename(oldpath str, newpath str) fault {
+func Rename(oldpath str, newpath str) ! {
 	if badPath(oldpath) || badPath(newpath) {
-		return say.Fault("rename %s %s: %s", oldpath, newpath, errnoText(eINVAL))
+		fail say.Fault("rename %s %s: %s", oldpath, newpath, errnoText(eINVAL))
 	}
 	if c32(lstat(rt_cstr(newpath), stbuf)) == 0 && isDirMode(mode(stbuf)) {
 		if c32(lstat(rt_cstr(oldpath), stbuf2)) != 0 {
 			e := errnoText(errno())
-			return say.Fault("rename %s %s: %s", oldpath, newpath, e)
+			fail say.Fault("rename %s %s: %s", oldpath, newpath, e)
 		}
 		if newpath == oldpath || !sameFile(stbuf, stbuf2) {
-			return say.Fault("rename %s %s: %s", oldpath, newpath, errnoText(eEXIST))
+			fail say.Fault("rename %s %s: %s", oldpath, newpath, errnoText(eEXIST))
 		}
 	}
 	if c32(rename(rt_cstr(oldpath), rt_cstr(newpath))) != 0 {
 		e := errnoText(errno())
-		return say.Fault("rename %s %s: %s", oldpath, newpath, e)
+		fail say.Fault("rename %s %s: %s", oldpath, newpath, e)
 	}
-	return nil
 }
 
 // Mkdir creates the directory path (mode 0755); its parent must exist.
-func Mkdir(path str) fault {
+func Mkdir(path str) ! {
 	if badPath(path) {
-		return invalidFault("mkdir", path)
+		fail invalidFault("mkdir", path)
 	}
 	if c32(mkdir(rt_cstr(path), 493)) != 0 {
-		return pathFault("mkdir", path)
+		fail pathFault("mkdir", path)
 	}
-	return nil
 }
 
 // MkdirAll creates path and any missing parents (mode 0755); an existing directory is fine.
-func MkdirAll(path str) fault {
+func MkdirAll(path str) ! {
 	if badPath(path) {
-		return invalidFault("mkdir", path)
+		fail invalidFault("mkdir", path)
 	}
 	if c32(stat(rt_cstr(path), stbuf)) == 0 {
 		if isDirMode(mode(stbuf)) {
-			return nil
+			return
 		}
-		return say.Fault("mkdir %s: %s", path, errnoText(eNOTDIR))
+		fail say.Fault("mkdir %s: %s", path, errnoText(eNOTDIR))
 	}
 	i := len(path) - 1
 	for i >= 0 && path[i] == '/' {
@@ -368,11 +366,13 @@ func MkdirAll(path str) fault {
 	err := Mkdir(path)
 	if err != nil {
 		if c32(lstat(rt_cstr(path), stbuf)) == 0 && isDirMode(mode(stbuf)) {
-			return nil
+			return
 		}
-		return err
+		if err != nil {
+			fail err
+		}
+		return
 	}
-	return nil
 }
 
 // sortStrs sorts a[lo:hi] bytewise in place (quicksort, insertion sort for short runs).
@@ -437,17 +437,17 @@ func SortStrs(a mut []str) {
 }
 
 // ReadDir returns the names in directory path, sorted bytewise, without "." and "..".
-func ReadDir(path str) ([]str, fault) {
+func ReadDir(path str) ![]str {
 	out := make([]str, 0, 16)
 	if badPath(path) {
-		return out, invalidFault("open", path)
+		fail invalidFault("open", path)
 	}
 	d := opendir(rt_cstr(path))
 	if d == 0 {
 		if errno() == eNOTDIR {
-			return out, pathFault("fdopendir", path)
+			fail pathFault("fdopendir", path)
 		}
-		return out, pathFault("open", path)
+		fail pathFault("open", path)
 	}
 	for {
 		ent := readdir(d)
@@ -462,31 +462,30 @@ func ReadDir(path str) ([]str, fault) {
 	}
 	closedir(d)
 	sortStrs(out, 0, len(out))
-	return out, nil
+	return out
 }
 
 // Getwd returns the current working directory ($PWD when it still names it, like Go).
-func Getwd() (str, fault) {
+func Getwd() !str {
 	pwd := Getenv("PWD")
 	if len(pwd) > 0 && pwd[0] == '/' && c32(stat(rt_cstr(pwd), stbuf)) == 0 && c32(stat(rt_cstr("."), stbuf2)) == 0 && sameFile(stbuf, stbuf2) {
-		return pwd, nil
+		return pwd
 	}
 	if getcwd(pathbuf, 4096) == 0 {
 		e := errnoText(errno())
-		return "", say.Fault("getwd: %s", e)
+		fail say.Fault("getwd: %s", e)
 	}
-	return rt_str_from_raw(pathbuf, strlen(pathbuf)), nil
+	return rt_str_from_raw(pathbuf, strlen(pathbuf))
 }
 
 // Chdir changes the current working directory to path.
-func Chdir(path str) fault {
+func Chdir(path str) ! {
 	if badPath(path) {
-		return invalidFault("chdir", path)
+		fail invalidFault("chdir", path)
 	}
 	if c32(chdir(rt_cstr(path))) != 0 {
-		return pathFault("chdir", path)
+		fail pathFault("chdir", path)
 	}
-	return nil
 }
 
 // TempDir returns the directory for temporary files: $TMPDIR, or /tmp.
@@ -499,13 +498,13 @@ func TempDir() str {
 }
 
 // Hostname returns the machine's host name.
-func Hostname() (str, fault) {
+func Hostname() !str {
 	if c32(gethostname(pathbuf, 1024)) != 0 {
 		e := errnoText(errno())
-		return "", say.Fault("hostname: %s", e)
+		fail say.Fault("hostname: %s", e)
 	}
 	store8(pathbuf+1023, 0)
-	return rt_str_from_raw(pathbuf, strlen(pathbuf)), nil
+	return rt_str_from_raw(pathbuf, strlen(pathbuf))
 }
 
 // Pid returns the process id.

@@ -298,7 +298,7 @@ func add(a i64, b i64) i64 {
 func divmod(a i64, b i64) (i64, i64) {
 	return a / b, a % b
 }
-func parse(s str) (i64, fault) { ... }
+func parse(s str) !i64 { ... }
 func fill(xs mut []i64, v i64) {      // may modify its argument
 	for i := 0; i < len(xs); i++ {
 		xs[i] = v
@@ -308,7 +308,7 @@ func fill(xs mut []i64, v i64) {      // may modify its argument
 
 - Parameters each have a type (`a i64, b i64`; a shared type list `a, b i64` is also
   accepted). Up to 8 integer and 8 float parameters.
-- Results: none, one (`i64`), or a list (`(i64, fault)`); up to 8. There are no named
+- Results: none, one (`i64`), a list (`(i64, str)`), or any of these marked as able to fail (`!i64`, `!(i64, str)`, `!`); up to 8. There are no named
   results.
 - Every path of a function with results must end in a `return`.
 - Parameters are read-only: modifying a parameter's contents (assigning its fields or
@@ -448,48 +448,78 @@ There are no labels, no `goto`, no `fallthrough` and no `select`. `go` is reject
 
 ## 8. Errors
 
-A function that can fail returns a `fault` as its last result:
+A function that can fail says so in its result: `!T` is "a T, or a fault", `!(A, B)`
+"an A and a B, or a fault", and `!` alone "nothing, or a fault".
 
 ```go
-func parse(s str) (i64, fault) {
+func parse(s str) !i64 {
 	if s == "" {
-		return 0, fail("empty input")
+		fail "empty input"           // leave with a fault (zero values for the rest)
 	}
 	n := i64(0)
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if c < '0' || c > '9' {
-			return 0, say.Fault("bad digit %q at %d", str(c), i)
+			fail say.Fault("bad digit %q at %d", str(c), i)
 		}
 		n = n*10 + i64(c-'0')
 	}
-	return n, nil
+	return n                         // success: just the value
 }
 
-func double(s str) (i64, fault) {
-	v := try parse(s)            // on a fault: return zero values and the fault
-	return v * 2, nil
+func double(s str) !i64 {
+	v := try parse(s)                // on a fault: pass it upward
+	return v * 2
 }
+
+func save(path str, text str) ! {   // can fail, gives nothing
+	w := try flume.Create(path)
+	w.Str(text)
+	try w.Close()
+}                                    // running off the end succeeds
 
 func main() {
-	v, err := double("21")
-	if err != nil {
-		say.Line("error:", err)  // a fault prints as its message
-		return
+	v := double("21") catch err {    // handle it where it happens
+		say.Line("error:", err)
+		0
 	}
-	say.Line(v)
+	n, err := double("x")            // or look at the fault yourself
+	if err != nil {
+		say.Line("error:", err)      // a fault prints as its message
+	}
+	say.Line(v, n)
 }
 ```
 
-- **A fault must be handled.** Ignoring a call's fault result is a compile error; so is
-  a fault variable that is never read, and `_` in a fault position.
-- `fail("text")` makes a fault; `say.Fault(format, args...)` formats one. A fault prints
-  as its message, and `say.Str(err)` gives the message as a `str`.
-- `try` forms (inside a function whose last result is a fault):
-  `v := try f()`, `v = try f()`, `try f()` (statement), `return try f()`. On a fault it
-  returns the fault together with zero values for the other results; zero values of
-  `str`, slice, map and struct results are real values, never nil. `try` cannot be nested
-  inside another expression: bind the inner result first.
+- **One way to write it.** A result list ending in `fault` is rejected: write `!T`. In a
+  `!T` function `return` gives only the values (`return v`; a bare `return` in a `!`
+  function), and `fail X` leaves with a fault: X is a `str` message or a `fault` value.
+  `return v, nil` and `return 0, fail(...)` are compile errors that point at these forms.
+  A fault always comes with zero values: `str`, slice, map and struct zeros are real
+  values, never nil, so a struct that owns a resource must treat its zero value as
+  closed (as `flume.Writer` and `wire.Conn` do).
+- **A fault must be handled.** Ignoring a call's fault is a compile error; so is a fault
+  variable that is never read, and `_` in a fault position.
+- `fail("text")` as an expression makes a fault value (to store or pass along);
+  `say.Fault(format, args...)` formats one. A fault prints as its message, and
+  `say.Str(err)` gives the message as a `str`.
+- `try` passes a fault upward (inside a `!T` function): `v := try f()`, `v = try f()`,
+  `a, b := try f()`, `try f()` (statement), `return try f()`.
+- `catch` handles a fault in place: `E catch err { ... }` on a whole statement,
+  initializer, assignment or return value (not inside a larger expression). `err` is the
+  fault (`_` to ignore it). When a value is needed, the block's last expression is that
+  value; otherwise, or when the call has several results, the block must leave (`return`,
+  `break`, `continue`, `fail`, `panic`). On success the block does not run.
+  ```go
+  port := mint.Atoi(text) catch _ { 8080 }
+  n, ok := parsePair(s) catch err {
+      say.Line("skipping:", err)
+      continue
+  }
+  w.Close() catch err { herald.Warn(say.Str(err)) }
+  ```
+- `try` and `catch` cannot be nested inside another expression: bind the inner result
+  first.
 - `defer f(args)` evaluates `f` and its arguments when the defer statement runs and calls
   `f` when the function returns, last deferred first, on every return path including the
   returns `try` makes. A defer inside a loop is rejected (it would run once per function,
@@ -817,7 +847,7 @@ FuncDecl      = "func" [ Receiver ] ident [ TypeParams ] Params [ Results ] Bloc
 Receiver      = "(" ident [ "mut" ] Type ")" .
 Params        = "(" [ Param { "," Param } ] ")" .
 Param         = identList [ "mut" ] Type .
-Results       = Type | "(" Type { "," Type } ")" .
+Results       = [ "!" ] [ Type | "(" Type { "," Type } ")" ] .   (a bare "!" only)
 ExternDecl    = "extern" "func" ident "(" [ Param { "," Param } ] [ "," "..." ] ")" [ Results ] .
 
 Type          = TypeName [ TypeArgs ] | "[" "]" Type | "[" expr "]" Type

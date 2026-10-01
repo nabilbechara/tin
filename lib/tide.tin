@@ -237,7 +237,7 @@ func unitAt(s str, i i64, j i64) u64 {
 }
 
 // ParseDuration parses "300ms", "-1.5h" or "2h45m" (units ns us µs ms s m h) exactly like Go's time.ParseDuration.
-func ParseDuration(s str) (i64, fault) {
+func ParseDuration(s str) !i64 {
 	n := len(s)
 	i := 0
 	neg := false
@@ -246,27 +246,27 @@ func ParseDuration(s str) (i64, fault) {
 		i = 1
 	}
 	if n-i == 1 && s[i] == '0' {
-		return 0, nil
+		return 0
 	}
 	if i == n {
-		return 0, say.Fault("time: invalid duration %s", quote(s))
+		fail say.Fault("time: invalid duration %s", quote(s))
 	}
 	top := u64(1) << 63
 	d := u64(0)
 	for i < n {
 		c := s[i]
 		if !(c == '.' || (c >= '0' && c <= '9')) {
-			return 0, say.Fault("time: invalid duration %s", quote(s))
+			fail say.Fault("time: invalid duration %s", quote(s))
 		}
 		v := u64(0)
 		start := i
 		for i < n && s[i] >= '0' && s[i] <= '9' {
 			if v > top/10 {
-				return 0, say.Fault("time: invalid duration %s", quote(s))
+				fail say.Fault("time: invalid duration %s", quote(s))
 			}
 			v = v*10 + u64(s[i]-'0')
 			if v > top {
-				return 0, say.Fault("time: invalid duration %s", quote(s))
+				fail say.Fault("time: invalid duration %s", quote(s))
 			}
 			i++
 		}
@@ -297,7 +297,7 @@ func ParseDuration(s str) (i64, fault) {
 			post = i != start
 		}
 		if !pre && !post {
-			return 0, say.Fault("time: invalid duration %s", quote(s))
+			fail say.Fault("time: invalid duration %s", quote(s))
 		}
 		start = i
 		for i < n {
@@ -308,34 +308,34 @@ func ParseDuration(s str) (i64, fault) {
 			i++
 		}
 		if i == start {
-			return 0, say.Fault("time: missing unit in duration %s", quote(s))
+			fail say.Fault("time: missing unit in duration %s", quote(s))
 		}
 		unit := unitAt(s, start, i)
 		if unit == 0 {
-			return 0, say.Fault("time: unknown unit %s in duration %s", quote(s[start:i]), quote(s))
+			fail say.Fault("time: unknown unit %s in duration %s", quote(s[start:i]), quote(s))
 		}
 		if v > top/unit {
-			return 0, say.Fault("time: invalid duration %s", quote(s))
+			fail say.Fault("time: invalid duration %s", quote(s))
 		}
 		v *= unit
 		if f > 0 {
 			v += u64(i64(f64(f) * (f64(unit) / scale)))
 			if v > top {
-				return 0, say.Fault("time: invalid duration %s", quote(s))
+				fail say.Fault("time: invalid duration %s", quote(s))
 			}
 		}
 		d += v
 		if d > top {
-			return 0, say.Fault("time: invalid duration %s", quote(s))
+			fail say.Fault("time: invalid duration %s", quote(s))
 		}
 	}
 	if neg {
-		return 0 - i64(d), nil
+		return 0 - i64(d)
 	}
 	if d > top-1 {
-		return 0, say.Fault("time: invalid duration %s", quote(s))
+		fail say.Fault("time: invalid duration %s", quote(s))
 	}
-	return i64(d), nil
+	return i64(d)
 }
 
 // Civil is a broken-down UTC instant: Month 1..12, Day 1..31, Weekday 0 (Sunday)..6, YearDay 1..366.
@@ -630,26 +630,26 @@ func isDigitAt(s str, i i64) bool {
 }
 
 // ParseRFC3339 parses "2026-10-01T11:22:05Z", optional fraction ".123" and offsets "+02:00", accepting what Go's time.Parse(RFC3339) accepts, into Unix nanoseconds.
-func ParseRFC3339(s str) (i64, fault) {
+func ParseRFC3339(s str) !i64 {
 	n := len(s)
 	if n < 19 || s[4] != '-' || s[7] != '-' || s[10] != 'T' {
-		return 0, say.Fault("tide: cannot parse %s as RFC3339", quote(s))
+		fail say.Fault("tide: cannot parse %s as RFC3339", quote(s))
 	}
 	hi := digit2(s, 0)
 	lo := digit2(s, 2)
 	month := digit2(s, 5)
 	day := digit2(s, 8)
 	if hi < 0 || lo < 0 || month < 1 || month > 12 || day < 1 {
-		return 0, say.Fault("tide: cannot parse %s as RFC3339", quote(s))
+		fail say.Fault("tide: cannot parse %s as RFC3339", quote(s))
 	}
 	year := hi*100 + lo
 	if day > DaysIn(year, month) {
-		return 0, say.Fault("tide: day out of range in %s", quote(s))
+		fail say.Fault("tide: day out of range in %s", quote(s))
 	}
 	i := 11
 	hour := i64(s[i]) - '0'
 	if hour < 0 || hour > 9 {
-		return 0, say.Fault("tide: cannot parse %s as RFC3339", quote(s))
+		fail say.Fault("tide: cannot parse %s as RFC3339", quote(s))
 	}
 	i++
 	if isDigitAt(s, i) {
@@ -657,12 +657,12 @@ func ParseRFC3339(s str) (i64, fault) {
 		i++
 	}
 	if hour > 23 || i+6 > n || s[i] != ':' || s[i+3] != ':' {
-		return 0, say.Fault("tide: cannot parse %s as RFC3339", quote(s))
+		fail say.Fault("tide: cannot parse %s as RFC3339", quote(s))
 	}
 	min := digit2(s, i+1)
 	sec := digit2(s, i+4)
 	if min < 0 || min > 59 || sec < 0 || sec > 59 {
-		return 0, say.Fault("tide: cannot parse %s as RFC3339", quote(s))
+		fail say.Fault("tide: cannot parse %s as RFC3339", quote(s))
 	}
 	i += 6
 	nano := 0
@@ -682,12 +682,12 @@ func ParseRFC3339(s str) (i64, fault) {
 		i++
 	} else {
 		if i+6 != n || (s[i] != '+' && s[i] != '-') || s[i+3] != ':' {
-			return 0, say.Fault("tide: cannot parse %s as RFC3339", quote(s))
+			fail say.Fault("tide: cannot parse %s as RFC3339", quote(s))
 		}
 		zh := digit2(s, i+1)
 		zm := digit2(s, i+4)
 		if zh < 0 || zh > 24 || zm < 0 || zm > 60 {
-			return 0, say.Fault("tide: time zone offset out of range in %s", quote(s))
+			fail say.Fault("tide: time zone offset out of range in %s", quote(s))
 		}
 		offset = (zh*60 + zm) * 60
 		if s[i] == '-' {
@@ -695,7 +695,7 @@ func ParseRFC3339(s str) (i64, fault) {
 		}
 		i += 6
 	}
-	return Date(year, month, day, hour, min, sec-offset, nano), nil
+	return Date(year, month, day, hour, min, sec-offset, nano)
 }
 
 // FormatHTTP renders Unix seconds in the HTTP date format "Thu, 01 Oct 2026 11:22:05 GMT".

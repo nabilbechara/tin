@@ -8,10 +8,10 @@ const digits = "0123456789abcdefghijklmnopqrstuvwxyz"
 const smalls = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899"
 const hexDigits = "0123456789abcdef"
 
-// MaxI64 is the largest i64, the value ParseInt clamps to on overflow.
+// MaxI64 is the largest i64.
 const MaxI64 = 9223372036854775807
 
-// MinI64 is the smallest i64, the value ParseInt clamps to on negative overflow.
+// MinI64 is the smallest i64.
 const MinI64 = -9223372036854775807 - 1
 
 // fbuf is this core's scratch buffer for snprintf (allocated once in the ingot heap).
@@ -129,18 +129,18 @@ func writeUint(end i64, u u64, base i64) {
 }
 
 // numErr builds Go's text: strconv.FN: parsing "s": what.
-func numErr(fname str, s str, what str) fault {
-	return say.Fault("strconv.%s: parsing %s: %s", fname, Quote(s), what)
+func numErr(fname str, s str, what str) ! {
+	fail say.Fault("strconv.%s: parsing %s: %s", fname, Quote(s), what)
 }
 
 // syntaxErr is the invalid-syntax fault of fn for input s.
-func syntaxErr(fname str, s str) fault {
-	return numErr(fname, s, "invalid syntax")
+func syntaxErr(fname str, s str) ! {
+	fail numErr(fname, s, "invalid syntax")
 }
 
 // rangeErr is the out-of-range fault of fn for input s.
-func rangeErr(fname str, s str) fault {
-	return numErr(fname, s, "value out of range")
+func rangeErr(fname str, s str) ! {
+	fail numErr(fname, s, "value out of range")
 }
 
 // lower folds an ASCII letter to lower case.
@@ -148,20 +148,20 @@ func lower(c u8) u8 {
 	return c | 0x20
 }
 
-// Atoi parses a decimal i64 like Go's Atoi (clamping to MaxI64/MinI64 with a fault on overflow).
-func Atoi(s str) (i64, fault) {
-	return parseInt("Atoi", s, 10)
+// Atoi parses a decimal i64 like Go's Atoi; out of range is a fault (with 0, where Go returns the clamped value).
+func Atoi(s str) !i64 {
+	return try parseInt("Atoi", s, 10)
 }
 
 // ParseInt parses a signed integer in base 2..36, or base 0 for 0x/0o/0b prefixes and underscores.
-func ParseInt(s str, base i64) (i64, fault) {
-	return parseInt("ParseInt", s, base)
+func ParseInt(s str, base i64) !i64 {
+	return try parseInt("ParseInt", s, base)
 }
 
 // parseInt is ParseInt reporting faults under the function name fn.
-func parseInt(fname str, s str, base i64) (i64, fault) {
+func parseInt(fname str, s str, base i64) !i64 {
 	if len(s) == 0 {
-		return 0, syntaxErr(fname, s)
+		fail syntaxErr(fname, s)
 	}
 	neg := false
 	body := s
@@ -173,38 +173,38 @@ func parseInt(fname str, s str, base i64) (i64, fault) {
 	}
 	un, kind := parseUint(body, base)
 	if kind == 1 {
-		return 0, syntaxErr(fname, s)
+		fail syntaxErr(fname, s)
 	}
 	if kind == 3 {
-		return 0, numErr(fname, s, "invalid base "+Itoa(base))
+		fail numErr(fname, s, "invalid base "+Itoa(base))
 	}
 	var cutoff u64 = 9223372036854775808
 	if !neg && un >= cutoff {
-		return MaxI64, rangeErr(fname, s)
+		fail rangeErr(fname, s)
 	}
 	if neg && un > cutoff {
-		return MinI64, rangeErr(fname, s)
+		fail rangeErr(fname, s)
 	}
 	n := i64(un)
 	if neg {
 		n = -n
 	}
-	return n, nil
+	return n
 }
 
 // ParseUint parses an unsigned integer in base 2..36, or base 0 for 0x/0o/0b prefixes and underscores.
-func ParseUint(s str, base i64) (u64, fault) {
+func ParseUint(s str, base i64) !u64 {
 	un, kind := parseUint(s, base)
 	if kind == 1 {
-		return 0, syntaxErr("ParseUint", s)
+		fail syntaxErr("ParseUint", s)
 	}
 	if kind == 2 {
-		return un, rangeErr("ParseUint", s)
+		fail rangeErr("ParseUint", s)
 	}
 	if kind == 3 {
-		return 0, numErr("ParseUint", s, "invalid base "+Itoa(base))
+		fail numErr("ParseUint", s, "invalid base "+Itoa(base))
 	}
-	return un, nil
+	return un
 }
 
 // parseUint returns the value and a kind: 0 ok, 1 syntax error, 2 out of range (value is MaxU64), 3 bad base.
@@ -310,14 +310,14 @@ func underscoreOK(s str) bool {
 }
 
 // ParseBool parses 1 t T TRUE true True and 0 f F FALSE false False.
-func ParseBool(s str) (bool, fault) {
+func ParseBool(s str) !bool {
 	if s == "1" || s == "t" || s == "T" || s == "TRUE" || s == "true" || s == "True" {
-		return true, nil
+		return true
 	}
 	if s == "0" || s == "f" || s == "F" || s == "FALSE" || s == "false" || s == "False" {
-		return false, nil
+		return false
 	}
-	return false, syntaxErr("ParseBool", s)
+	fail syntaxErr("ParseBool", s)
 }
 
 // prefixFold returns how many leading bytes of s match word ignoring ASCII case.
@@ -335,10 +335,10 @@ func prefixFold(s str, word str) i64 {
 }
 
 // ParseFloat parses a Go float literal (decimal or 0x hex with p exponent, underscores, inf/infinity/nan) via strtod.
-func ParseFloat(s str) (f64, fault) {
+func ParseFloat(s str) !f64 {
 	n := len(s)
 	if n == 0 {
-		return 0, syntaxErr("ParseFloat", s)
+		fail syntaxErr("ParseFloat", s)
 	}
 	i := 0
 	neg := false
@@ -352,18 +352,18 @@ func ParseFloat(s str) (f64, fault) {
 			if i+k == n {
 				v := F64frombits(0x7ff0000000000000)
 				if neg {
-					return -v, nil
+					return -v
 				}
-				return v, nil
+				return v
 			}
 		}
-		return 0, syntaxErr("ParseFloat", s)
+		fail syntaxErr("ParseFloat", s)
 	}
 	if i == 0 && (s[0] == 'n' || s[0] == 'N') {
 		if n == 3 && prefixFold(s, "nan") == 3 {
-			return F64frombits(0x7ff8000000000001), nil
+			return F64frombits(0x7ff8000000000001)
 		}
-		return 0, syntaxErr("ParseFloat", s)
+		fail syntaxErr("ParseFloat", s)
 	}
 	hex := false
 	if n-i >= 2 && s[i] == '0' && lower(s[i+1]) == 'x' {
@@ -379,7 +379,7 @@ func ParseFloat(s str) (f64, fault) {
 			underscores = true
 		} else if c == '.' {
 			if sawDot {
-				return 0, syntaxErr("ParseFloat", s)
+				fail syntaxErr("ParseFloat", s)
 			}
 			sawDot = true
 		} else if c >= '0' && c <= '9' || hex && lower(c) >= 'a' && lower(c) <= 'f' {
@@ -390,7 +390,7 @@ func ParseFloat(s str) (f64, fault) {
 		i++
 	}
 	if !sawDigits {
-		return 0, syntaxErr("ParseFloat", s)
+		fail syntaxErr("ParseFloat", s)
 	}
 	expChar := u8('e')
 	if hex {
@@ -402,7 +402,7 @@ func ParseFloat(s str) (f64, fault) {
 			i++
 		}
 		if i >= n || s[i] < '0' || s[i] > '9' {
-			return 0, syntaxErr("ParseFloat", s)
+			fail syntaxErr("ParseFloat", s)
 		}
 		for i < n && (s[i] >= '0' && s[i] <= '9' || s[i] == '_') {
 			if s[i] == '_' {
@@ -411,15 +411,15 @@ func ParseFloat(s str) (f64, fault) {
 			i++
 		}
 	} else if hex {
-		return 0, syntaxErr("ParseFloat", s)
+		fail syntaxErr("ParseFloat", s)
 	}
 	if i != n {
-		return 0, syntaxErr("ParseFloat", s)
+		fail syntaxErr("ParseFloat", s)
 	}
 	clean := s
 	if underscores {
 		if !underscoreOK(s) {
-			return 0, syntaxErr("ParseFloat", s)
+			fail syntaxErr("ParseFloat", s)
 		}
 		clean = stripUnderscores(s)
 	}
@@ -429,12 +429,12 @@ func ParseFloat(s str) (f64, fault) {
 	start := cast(i64, clean) + 8
 	f := strtod(start, endp)
 	if endp[0]-start != len(clean) {
-		return 0, syntaxErr("ParseFloat", s)
+		fail syntaxErr("ParseFloat", s)
 	}
 	if f > 1.7976931348623157e308 || f < -1.7976931348623157e308 {
-		return f, rangeErr("ParseFloat", s)
+		fail rangeErr("ParseFloat", s)
 	}
-	return f, nil
+	return f
 }
 
 // stripUnderscores returns s without its underscores.
@@ -784,14 +784,14 @@ func isPrint(r i64) bool {
 }
 
 // Unquote interprets s as a Go string literal ("..." with escapes, '...' one rune, `...` raw) and returns its value.
-func Unquote(s str) (str, fault) {
+func Unquote(s str) !str {
 	n := len(s)
 	if n < 2 {
-		return "", fail("invalid syntax")
+		fail "invalid syntax"
 	}
 	quote := s[0]
 	if s[n-1] != quote {
-		return "", fail("invalid syntax")
+		fail "invalid syntax"
 	}
 	in := s[1 : n-1]
 	m := len(in)
@@ -799,14 +799,14 @@ func Unquote(s str) (str, fault) {
 		cr := 0
 		for i := 0; i < m; i++ {
 			if in[i] == '`' {
-				return "", fail("invalid syntax")
+				fail "invalid syntax"
 			}
 			if in[i] == '\r' {
 				cr++
 			}
 		}
 		if cr == 0 {
-			return in, nil
+			return in
 		}
 		b := make([]u8, 0, m-cr)
 		for i := 0; i < m; i++ {
@@ -814,10 +814,10 @@ func Unquote(s str) (str, fault) {
 				b = append(b, in[i])
 			}
 		}
-		return str(b), nil
+		return str(b)
 	}
 	if quote != '"' && quote != '\'' {
-		return "", fail("invalid syntax")
+		fail "invalid syntax"
 	}
 	plain := true
 	for i := 0; i < m; i++ {
@@ -830,24 +830,24 @@ func Unquote(s str) (str, fault) {
 	if plain {
 		if quote == '"' {
 			if glyph.Valid(in) {
-				return in, nil
+				return in
 			}
 		} else {
 			r, w := glyph.DecodeRune(in, 0)
 			if w > 0 && w == m && (r != glyph.RuneError || w != 1) {
-				return in, nil
+				return in
 			}
 		}
 	}
 	if quote == '\'' && m == 0 {
-		return "", fail("invalid syntax")
+		fail "invalid syntax"
 	}
 	b := make([]u8, 0, m+m/2+4)
 	i := 0
 	for i < m {
 		c := in[i]
 		if c == quote || c == '\n' {
-			return "", fail("invalid syntax")
+			fail "invalid syntax"
 		}
 		if c >= 0x80 {
 			r, w := glyph.DecodeRune(in, i)
@@ -858,7 +858,7 @@ func Unquote(s str) (str, fault) {
 			i++
 		} else {
 			if i+1 >= m {
-				return "", fail("invalid syntax")
+				fail "invalid syntax"
 			}
 			e := in[i+1]
 			i += 2
@@ -884,13 +884,13 @@ func Unquote(s str) (str, fault) {
 					k = 8
 				}
 				if m-i < k {
-					return "", fail("invalid syntax")
+					fail "invalid syntax"
 				}
 				v := 0
 				for j := 0; j < k; j++ {
 					d := unhex(in[i+j])
 					if d < 0 {
-						return "", fail("invalid syntax")
+						fail "invalid syntax"
 					}
 					v = v<<4 | d
 				}
@@ -899,43 +899,43 @@ func Unquote(s str) (str, fault) {
 					b = append(b, u8(v))
 				} else {
 					if !glyph.ValidRune(i32(v)) {
-						return "", fail("invalid syntax")
+						fail "invalid syntax"
 					}
 					b = append(b, str(i32(v))...)
 				}
 			} else if e >= '0' && e <= '7' {
 				if m-i < 2 {
-					return "", fail("invalid syntax")
+					fail "invalid syntax"
 				}
 				v := i64(e - '0')
 				for j := 0; j < 2; j++ {
 					x := in[i+j]
 					if x < '0' || x > '7' {
-						return "", fail("invalid syntax")
+						fail "invalid syntax"
 					}
 					v = v<<3 | i64(x-'0')
 				}
 				i += 2
 				if v > 255 {
-					return "", fail("invalid syntax")
+					fail "invalid syntax"
 				}
 				b = append(b, u8(v))
 			} else if e == '\\' {
 				b = append(b, '\\')
 			} else if e == '\'' || e == '"' {
 				if e != quote {
-					return "", fail("invalid syntax")
+					fail "invalid syntax"
 				}
 				b = append(b, e)
 			} else {
-				return "", fail("invalid syntax")
+				fail "invalid syntax"
 			}
 		}
 		if quote == '\'' && i != m {
-			return "", fail("invalid syntax")
+			fail "invalid syntax"
 		}
 	}
-	return str(b), nil
+	return str(b)
 }
 
 // unhex returns the value of hex digit c, or -1.

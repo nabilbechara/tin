@@ -28,9 +28,12 @@ the compiler: write a minimal repro to notes/compiler_bugs_NAME.md and work arou
 - No implicit conversions: i64(x), u8(x), f64(x), str(c) for a rune/byte, str(bytes []u8). Untyped
   constants adapt and must fit. Conditions must be bool. Integer overflow wraps; division by zero
   panics; shift counts are taken mod 64. Literals: 0x, 0b, 0o, 1_000.
-- Errors: functions return (T, fault). `fail("msg")` makes a fault, `say.Fault("fmt %d", x)` a formatted
-  one. Ignoring a fault is a compile error, and `_` cannot discard one. `v := try f()` returns the fault
-  upward (the other results get zero values). `defer f()` runs at every return, including try's.
+- Errors: a function that can fail returns `!T` (`!(A, B)`, or `!` for no value). Inside it, `return v`
+  succeeds and `fail "msg"` / `fail err` leaves with a fault (zero values for the rest); `return v, nil` and
+  `(T, fault)` result lists are compile errors. `v := try f()` passes a fault upward; `v := f() catch err { 0 }`
+  handles it in place (the block's last expression is the value, or the block leaves); `v, err := f()` also
+  works. Ignoring a fault is a compile error, and `_` cannot discard one. `fail("msg")` and
+  `say.Fault("fmt %d", x)` make fault values.
 - Optionals: `if p != nil { p.x }` narrows (also through && and ||, and `if p == nil { return }`). Narrow fields via a local. Using a ?T
   without narrowing is a compile error. Map reads of missing keys return the zero value; use
   `v, ok := m[k]` to tell.

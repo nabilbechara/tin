@@ -60,8 +60,8 @@ func main() {
 
 - `type Req struct`: Req is the request being served. Its strings live in the request pool: keep() them to store them anywhere long-lived.
 - `type Out struct`: Out is the response being built. Body is the response body; the status defaults to 200 and the content type to text/plain.
-- `Serve(addr str, h func(Req, mut Out)) fault`: Serve listens on addr (":8080", "127.0.0.1:8080") and serves h on every core. It returns only if the server cannot start. TIN_CORES overrides the number of cores.
-- `ServeN(addr str, n i64, h func(Req, mut Out)) fault`: ServeN is Serve on exactly n cores.
+- `Serve(addr str, h func(Req, mut Out)) !`: Serve listens on addr (":8080", "127.0.0.1:8080") and serves h on every core. It returns only if the server cannot start. TIN_CORES overrides the number of cores.
+- `ServeN(addr str, n i64, h func(Req, mut Out)) !`: ServeN is Serve on exactly n cores.
 - `(q Req) Header(name str) str`: Header returns the value of the request header name (any case), or "".
 - `(q Req) Body() str`: Body returns the request body.
 - `(q Req) Param(name str) str`: Param returns query parameter name, %-decoded, or "".
@@ -119,22 +119,22 @@ r := try wire.Get("http://127.0.0.1:8080/json")
 - `type Listener struct`: Listener accepts TCP connections.
 - `type Resp struct`: Resp is an HTTP response.
 - `IsEOF(err fault) bool`: EOF is the fault Read returns at the end of the stream.
-- `Dial(addr str) (Conn, fault)`: Dial connects to "host:port".
-- `DialTimeout(addr str, timeout i64) (Conn, fault)`: DialTimeout connects to "host:port", giving up after timeout nanoseconds (0: no limit).
+- `Dial(addr str) !Conn`: Dial connects to "host:port".
+- `DialTimeout(addr str, timeout i64) !Conn`: DialTimeout connects to "host:port", giving up after timeout nanoseconds (0: no limit).
 - `(c Conn) SetTimeout(ns i64)`: SetTimeout limits every later read and write to ns nanoseconds (0: no limit).
 - `(c Conn) SetNoDelay(on bool)`: SetNoDelay turns Nagle's algorithm off (true) or on.
-- `(c Conn) Write(s str) fault`: Write sends all of s.
-- `(c Conn) WriteBytes(b []u8) fault`: WriteBytes sends all of b.
-- `(c Conn) Read(buf mut []u8, max i64) (i64, fault)`: Read appends up to max bytes to buf and returns how many; at the end it returns 0 and EOF.
-- `(c Conn) ReadFull(n i64) (str, fault)`: ReadFull reads exactly n bytes.
+- `(c Conn) Write(s str) !`: Write sends all of s.
+- `(c Conn) WriteBytes(b []u8) !`: WriteBytes sends all of b.
+- `(c Conn) Read(buf mut []u8, max i64) !i64`: Read appends up to max bytes to buf and returns how many; at the end it returns 0 and EOF.
+- `(c Conn) ReadFull(n i64) !str`: ReadFull reads exactly n bytes.
 - `(c mut Conn) Close()`: Close closes the connection.
-- `Listen(addr str) (Listener, fault)`: Listen opens a TCP listener on "host:port" (":0" picks a free port: see Port).
+- `Listen(addr str) !Listener`: Listen opens a TCP listener on "host:port" (":0" picks a free port: see Port).
 - `(l Listener) Port() i64`: Port is the port the listener is bound to.
-- `(l Listener) Accept() (Conn, fault)`: Accept waits for the next connection.
+- `(l Listener) Accept() !Conn`: Accept waits for the next connection.
 - `(l mut Listener) Close()`: Close stops listening.
-- `Get(url str) (Resp, fault)`: Get fetches url.
-- `Post(url str, ctype str, body str) (Resp, fault)`: Post sends body with content type ctype to url.
-- `Do(method str, url str, headers []str, body str) (Resp, fault)`: Do sends one request: headers is a list of name, value pairs.
+- `Get(url str) !Resp`: Get fetches url.
+- `Post(url str, ctype str, body str) !Resp`: Post sends body with content type ctype to url.
+- `Do(method str, url str, headers []str, body str) !Resp`: Do sends one request: headers is a list of name, value pairs.
 - `(r Resp) Header(name str) str`: Header returns the response header name (any case), or "".
 
 ## twine
@@ -212,23 +212,23 @@ Package glyph is UTF-8 and simple character classification (like Go's unicode/ut
 
 Package mint converts numbers and quoted strings to and from text (like Go's strconv), with Go's error texts.
 
-- `const MaxI64 = 9223372036854775807`: MaxI64 is the largest i64, the value ParseInt clamps to on overflow.
-- `const MinI64 = -9223372036854775807 - 1`: MinI64 is the smallest i64, the value ParseInt clamps to on negative overflow.
+- `const MaxI64 = 9223372036854775807`: MaxI64 is the largest i64.
+- `const MinI64 = -9223372036854775807 - 1`: MinI64 is the smallest i64.
 - `Itoa(v i64) str`: Itoa returns v in decimal.
 - `FormatInt(v i64, base i64) str`: FormatInt returns v in base 2..36 with lower-case digits (panics on any other base).
 - `FormatUint(v u64, base i64) str`: FormatUint returns v in base 2..36 with lower-case digits (panics on any other base).
 - `AppendInt(b mut []u8, v i64) []u8`: AppendInt appends v in decimal to b and returns b (use it as b = AppendInt(b, v)).
-- `Atoi(s str) (i64, fault)`: Atoi parses a decimal i64 like Go's Atoi (clamping to MaxI64/MinI64 with a fault on overflow).
-- `ParseInt(s str, base i64) (i64, fault)`: ParseInt parses a signed integer in base 2..36, or base 0 for 0x/0o/0b prefixes and underscores.
-- `ParseUint(s str, base i64) (u64, fault)`: ParseUint parses an unsigned integer in base 2..36, or base 0 for 0x/0o/0b prefixes and underscores.
-- `ParseBool(s str) (bool, fault)`: ParseBool parses 1 t T TRUE true True and 0 f F FALSE false False.
-- `ParseFloat(s str) (f64, fault)`: ParseFloat parses a Go float literal (decimal or 0x hex with p exponent, underscores, inf/infinity/nan) via strtod.
+- `Atoi(s str) !i64`: Atoi parses a decimal i64 like Go's Atoi; out of range is a fault (with 0, where Go returns the clamped value).
+- `ParseInt(s str, base i64) !i64`: ParseInt parses a signed integer in base 2..36, or base 0 for 0x/0o/0b prefixes and underscores.
+- `ParseUint(s str, base i64) !u64`: ParseUint parses an unsigned integer in base 2..36, or base 0 for 0x/0o/0b prefixes and underscores.
+- `ParseBool(s str) !bool`: ParseBool parses 1 t T TRUE true True and 0 f F FALSE false False.
+- `ParseFloat(s str) !f64`: ParseFloat parses a Go float literal (decimal or 0x hex with p exponent, underscores, inf/infinity/nan) via strtod.
 - `F64frombits(b u64) f64`: F64frombits returns the f64 with bit pattern b.
 - `FormatFloat(f f64, fmt u8, prec i64) str`: FormatFloat formats f as 'f' (ddd.ddd), 'e' (d.ddde±dd) or 'g' (shortest of the two); prec -1 is the shortest text that reads back exactly.
 - `Quote(s str) str`: Quote returns s as a Go double-quoted literal with \n-style, \x, \u and \U escapes.
 - `AppendQuote(b mut []u8, s str) []u8`: AppendQuote appends Quote(s) to b and returns b.
 - `QuoteRune(r i32) str`: QuoteRune returns r as a Go single-quoted rune literal (invalid runes become U+FFFD).
-- `Unquote(s str) (str, fault)`: Unquote interprets s as a Go string literal ("..." with escapes, '...' one rune, `...` raw) and returns its value.
+- `Unquote(s str) !str`: Unquote interprets s as a Go string literal ("..." with escapes, '...' one rune, `...` raw) and returns its value.
 
 ## gauge
 
@@ -327,21 +327,21 @@ Package flume reads and writes file descriptors through 64 KiB buffers: lines, w
 - `type Reader struct`: Reader buffers reads from a file descriptor.
 - `type Writer struct`: Writer buffers writes to a file descriptor.
 - `New(fd i64) Reader`: New reads from fd.
-- `Open(path str) (Reader, fault)`: Open reads the file at path.
+- `Open(path str) !Reader`: Open reads the file at path.
 - `(r mut Reader) Close()`: Close closes the reader's descriptor.
-- `(r mut Reader) Line() (str, bool, fault)`: Line returns the next line without its "\n" (or "\r\n"); ok is false at the end.
+- `(r mut Reader) Line() !(str, bool)`: Line returns the next line without its "\n" (or "\r\n"); ok is false at the end.
 - `(r mut Reader) Byte() (u8, bool)`: Byte returns the next byte; ok is false at the end.
-- `(r mut Reader) ReadAll() (str, fault)`: ReadAll returns everything left.
-- `ReadFile(path str) (str, fault)`: ReadFile returns the contents of the file at path.
+- `(r mut Reader) ReadAll() !str`: ReadAll returns everything left.
+- `ReadFile(path str) !str`: ReadFile returns the contents of the file at path.
 - `NewWriter(fd i64) Writer`: NewWriter writes to fd.
 - `Stdout() Writer`: Stdout writes to standard output (flush it before mixing with say output).
-- `Create(path str) (Writer, fault)`: Create truncates or creates the file at path for writing.
+- `Create(path str) !Writer`: Create truncates or creates the file at path for writing.
 - `(w mut Writer) Str(s str)`: Str appends s.
 - `(w mut Writer) Byte(c u8)`: Byte appends c.
 - `(w mut Writer) Int(v i64)`: Int appends v in decimal.
 - `(w mut Writer) Line(s str)`: Line appends s and a newline.
-- `(w mut Writer) Flush() fault`: Flush writes everything buffered (with as few writes as the descriptor allows).
-- `(w mut Writer) Close() fault`: Close flushes and closes the writer's descriptor once; closing again (or a writer that never opened) is a fault.
+- `(w mut Writer) Flush() !`: Flush writes everything buffered (with as few writes as the descriptor allows).
+- `(w mut Writer) Close() !`: Close flushes and closes the writer's descriptor once; closing again (or a writer that never opened) is a fault.
 
 ## quarry
 
@@ -350,27 +350,27 @@ Package quarry is the operating system interface (like Go's os): arguments, envi
 - `Args() []str`: Args returns the command line, program name first.
 - `Getenv(key str) str`: Getenv returns the value of environment variable key, or "" when it is unset.
 - `LookupEnv(key str) (str, bool)`: LookupEnv returns the value of key and whether it is set (an empty value is still set).
-- `Setenv(key str, value str) fault`: Setenv sets environment variable key to value; an empty key or one holding '=' or NUL is a fault.
-- `Unsetenv(key str) fault`: Unsetenv removes environment variable key.
-- `ReadFile(path str) (str, fault)`: ReadFile returns the whole content of the file at path.
-- `ReadStdin() (str, fault)`: ReadStdin reads standard input to its end.
-- `WriteFile(path str, data str) fault`: WriteFile writes data to the file at path, creating it (mode 0644) or truncating it.
-- `AppendFile(path str, data str) fault`: AppendFile appends data to the file at path, creating it (mode 0644) when needed.
+- `Setenv(key str, value str) !`: Setenv sets environment variable key to value; an empty key or one holding '=' or NUL is a fault.
+- `Unsetenv(key str) !`: Unsetenv removes environment variable key.
+- `ReadFile(path str) !str`: ReadFile returns the whole content of the file at path.
+- `ReadStdin() !str`: ReadStdin reads standard input to its end.
+- `WriteFile(path str, data str) !`: WriteFile writes data to the file at path, creating it (mode 0644) or truncating it.
+- `AppendFile(path str, data str) !`: AppendFile appends data to the file at path, creating it (mode 0644) when needed.
 - `Exists(path str) bool`: Exists reports whether path names an existing file or directory (symlinks are followed).
 - `IsDir(path str) bool`: IsDir reports whether path names a directory.
-- `Size(path str) (i64, fault)`: Size returns the size in bytes of the file at path.
-- `ModTime(path str) (i64, fault)`: ModTime returns the modification time of path in seconds since the Unix epoch.
-- `Remove(path str) fault`: Remove deletes the file or empty directory at path.
-- `RemoveAll(path str) fault`: RemoveAll deletes path and everything below it; a missing path is not a fault.
-- `Rename(oldpath str, newpath str) fault`: Rename moves oldpath to newpath, replacing a file there; like Go it never replaces a directory.
-- `Mkdir(path str) fault`: Mkdir creates the directory path (mode 0755); its parent must exist.
-- `MkdirAll(path str) fault`: MkdirAll creates path and any missing parents (mode 0755); an existing directory is fine.
+- `Size(path str) !i64`: Size returns the size in bytes of the file at path.
+- `ModTime(path str) !i64`: ModTime returns the modification time of path in seconds since the Unix epoch.
+- `Remove(path str) !`: Remove deletes the file or empty directory at path.
+- `RemoveAll(path str) !`: RemoveAll deletes path and everything below it; a missing path is not a fault.
+- `Rename(oldpath str, newpath str) !`: Rename moves oldpath to newpath, replacing a file there; like Go it never replaces a directory.
+- `Mkdir(path str) !`: Mkdir creates the directory path (mode 0755); its parent must exist.
+- `MkdirAll(path str) !`: MkdirAll creates path and any missing parents (mode 0755); an existing directory is fine.
 - `SortStrs(a mut []str)`: SortStrs sorts a bytewise in place.
-- `ReadDir(path str) ([]str, fault)`: ReadDir returns the names in directory path, sorted bytewise, without "." and "..".
-- `Getwd() (str, fault)`: Getwd returns the current working directory ($PWD when it still names it, like Go).
-- `Chdir(path str) fault`: Chdir changes the current working directory to path.
+- `ReadDir(path str) ![]str`: ReadDir returns the names in directory path, sorted bytewise, without "." and "..".
+- `Getwd() !str`: Getwd returns the current working directory ($PWD when it still names it, like Go).
+- `Chdir(path str) !`: Chdir changes the current working directory to path.
 - `TempDir() str`: TempDir returns the directory for temporary files: $TMPDIR, or /tmp.
-- `Hostname() (str, fault)`: Hostname returns the machine's host name.
+- `Hostname() !str`: Hostname returns the machine's host name.
 - `Pid() i64`: Pid returns the process id.
 - `Exit(code i64)`: Exit flushes stdout and ends the program with status code.
 - `Eprint(s str)`: Eprint writes s to stderr.
@@ -390,8 +390,8 @@ Package trail manipulates slash-separated file paths (like Go's path/filepath on
 - `JoinAll(parts []str) str`: JoinAll joins the non-empty parts with slashes and Cleans the result; "" when every part is empty.
 - `Join2(a str, b str) str`: Join2 joins two path elements like Go's filepath.Join(a, b).
 - `Join3(a str, b str, c str) str`: Join3 joins three path elements like Go's filepath.Join(a, b, c).
-- `Rel(base str, targ str) (str, fault)`: Rel returns a relative path that is lexically equivalent to targ when joined to base, or a fault when one is absolute and the other is not or base holds "..".
-- `Match(pattern str, name str) (bool, fault)`: Match reports whether name matches the shell pattern: '*' (no slash), '?', '[a-z]', '[^x]' and '\' escapes, like Go's filepath.Match.
+- `Rel(base str, targ str) !str`: Rel returns a relative path that is lexically equivalent to targ when joined to base, or a fault when one is absolute and the other is not or base holds "..".
+- `Match(pattern str, name str) !bool`: Match reports whether name matches the shell pattern: '*' (no slash), '?', '[a-z]', '[^x]' and '\' escapes, like Go's filepath.Match.
 
 ## lever
 
@@ -417,8 +417,8 @@ Package lever parses command-line flags (like Go's flag): register handles, Pars
 - `Reset()`: Reset forgets every registered flag and parse result (for programs that parse several times).
 - `Rest() []str`: Rest returns the arguments left after the flags (empty before Parse).
 - `Parsed() bool`: Parsed reports whether Parse has run.
-- `Set(name str, value str) fault`: Set assigns value to the flag named name as if it were given on the command line.
-- `Parse(args []str) fault`: Parse reads flags from args (without the program name) until the first non-flag or "--"; the rest is kept for Rest().
+- `Set(name str, value str) !`: Set assigns value to the flag named name as if it were given on the command line.
+- `Parse(args []str) !`: Parse reads flags from args (without the program name) until the first non-flag or "--"; the rest is kept for Rest().
 - `Usage() str`: Usage returns the flags sorted by name, each with its value type, help and non-zero default, formatted exactly like Go's PrintDefaults.
 
 ## tide
@@ -448,7 +448,7 @@ Package tide is clocks, durations and civil (calendar) time in UTC, like Go's ti
 - `Milliseconds(d i64) i64`: Milliseconds returns d as whole milliseconds, truncated toward zero.
 - `Microseconds(d i64) i64`: Microseconds returns d as whole microseconds, truncated toward zero.
 - `FormatDuration(d i64) str`: FormatDuration renders d exactly like Go's Duration.String: "1.5s", "250ms", "1h2m3s", "0s", "-1.5µs".
-- `ParseDuration(s str) (i64, fault)`: ParseDuration parses "300ms", "-1.5h" or "2h45m" (units ns us µs ms s m h) exactly like Go's time.ParseDuration.
+- `ParseDuration(s str) !i64`: ParseDuration parses "300ms", "-1.5h" or "2h45m" (units ns us µs ms s m h) exactly like Go's time.ParseDuration.
 - `type Civil struct`: Civil is a broken-down UTC instant: Month 1..12, Day 1..31, Weekday 0 (Sunday)..6, YearDay 1..366.
 - `IsLeap(year i64) bool`: IsLeap reports whether year is a leap year in the proleptic Gregorian calendar.
 - `DaysIn(year i64, month i64) i64`: DaysIn returns the number of days in month (1..12) of year, or 0 for a month out of range.
@@ -463,7 +463,7 @@ Package tide is clocks, durations and civil (calendar) time in UTC, like Go's ti
 - `MonthName(m i64) str`: MonthName returns the English name of month m (1 = January), or "%!Month(m)" with m unsigned like Go.
 - `FormatRFC3339(ns i64) str`: FormatRFC3339 renders the Unix-nanosecond instant ns as "2026-10-01T11:22:05Z" (whole seconds, UTC).
 - `FormatRFC3339Nano(ns i64) str`: FormatRFC3339Nano is FormatRFC3339 with the fractional seconds, trailing zeros removed: "2026-10-01T11:22:05.5Z".
-- `ParseRFC3339(s str) (i64, fault)`: ParseRFC3339 parses "2026-10-01T11:22:05Z", optional fraction ".123" and offsets "+02:00", accepting what Go's time.Parse(RFC3339) accepts, into Unix nanoseconds.
+- `ParseRFC3339(s str) !i64`: ParseRFC3339 parses "2026-10-01T11:22:05Z", optional fraction ".123" and offsets "+02:00", accepting what Go's time.Parse(RFC3339) accepts, into Unix nanoseconds.
 - `FormatHTTP(unixSec i64) str`: FormatHTTP renders Unix seconds in the HTTP date format "Thu, 01 Oct 2026 11:22:05 GMT".
 
 ## dice
@@ -524,8 +524,8 @@ Package sift sorts and searches slices (like Go's sort and slices); without gene
 - `ReverseInts(xs mut []i64)`: ReverseInts reverses xs in place.
 - `ReverseStrs(xs mut []str)`: ReverseStrs reverses xs in place.
 - `UniqInts(xs mut []i64) i64`: UniqInts compacts runs of equal values in sorted xs to one element and returns the new length (xs[0:k] is the result).
-- `MinInts(xs []i64) (i64, fault)`: MinInts returns the smallest element of xs, or a fault when xs is empty.
-- `MaxInts(xs []i64) (i64, fault)`: MaxInts returns the largest element of xs, or a fault when xs is empty.
+- `MinInts(xs []i64) !i64`: MinInts returns the smallest element of xs, or a fault when xs is empty.
+- `MaxInts(xs []i64) !i64`: MaxInts returns the largest element of xs, or a fault when xs is empty.
 - `SumInts(xs []i64) i64`: SumInts returns the sum of xs (wrapping on overflow, 0 for an empty slice).
 - `IndexInts(xs []i64, x i64) i64`: IndexInts returns the index of the first x in xs, or -1.
 - `ContainsStr(xs []str, x str) bool`: ContainsStr reports whether x occurs in xs.
@@ -622,11 +622,11 @@ Package seal has cryptographic hashes (SHA-256, SHA-1), HMAC-SHA256, constant-ti
 - `ConstantTimeEq(a []u8, b []u8) bool`: ConstantTimeEq compares a and b in time that depends only on their lengths.
 - `RandomBytes(n i64) []u8`: RandomBytes returns n cryptographically secure random bytes.
 - `Hex(b []u8) str`: Hex encodes b in lower-case hexadecimal.
-- `HexDecode(s str) ([]u8, fault)`: HexDecode decodes hexadecimal text.
+- `HexDecode(s str) ![]u8`: HexDecode decodes hexadecimal text.
 - `B64(b []u8) str`: B64 encodes b as standard padded base64.
-- `B64Decode(s str) ([]u8, fault)`: B64Decode decodes standard padded base64.
+- `B64Decode(s str) ![]u8`: B64Decode decodes standard padded base64.
 - `B64URL(b []u8) str`: B64URL encodes b as unpadded URL-safe base64 (as in JWTs).
-- `B64URLDecode(s str) ([]u8, fault)`: B64URLDecode decodes unpadded URL-safe base64.
+- `B64URLDecode(s str) ![]u8`: B64URLDecode decodes unpadded URL-safe base64.
 
 ## herald
 
