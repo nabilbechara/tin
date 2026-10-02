@@ -241,15 +241,16 @@ Ordered by import path, as `go list std` prints them.
 
 ## What to build, in order
 
-The order comes from two things: what other work depends on, and what services import most. Foundations come first because the rest of the library is written in their terms; each gets a design document before code, per notes/plan_retire_go.md's method (the need, Tin's constraints, two or three candidates, a decision).
+The order comes from two things: what other work depends on, and what services import most. Foundations come first because the rest of the library is written in their terms. Each is decided in [notes/design_foundations.md](../notes/design_foundations.md) (the need, the decision, what it replaces, what was rejected, what it unlocks), which also has the order of the steps and what each depends on.
 
-**Foundations (design first):**
+**Foundations (decided; build in the order of that document):**
 
-1. Routines, and `context` as ambient cancellation, which share one design. `context` is imported by 3,725 koussa files, more than anything else.
-2. An abstraction mechanism in place of interfaces (`io.Reader` and `Writer`, `sort.Interface`, `database/sql/driver`, `hash.Hash`, `error` chains all need it), and function literals that capture.
-3. Error chains (`errors.Is`, `As`, `Unwrap`, `Join`) and per-request fault isolation in place of `recover`.
-4. Synchronization for routines (`sync`, `sync/atomic`): Once, WaitGroup, Pool, counters.
-5. Derivation in place of `reflect` and struct tags, extending what `argo` does for JSON.
+1. Closures that capture, as region objects.
+2. Shapes (structural interfaces, static by default, `dyn` when asked) for `io`, `sort`, `hash` and `database/sql/driver`.
+3. Fault chains (`fault.Is`, `Wrap`, `Join`, `try ... wrap`) and `guard` in place of `recover`.
+4. Tasks and scopes (structured concurrency on the core) and `context` as ambient deadline, cancellation and slots. `context` is imported by 3,725 koussa files, more than anything else.
+5. Atomics for cross-core counters; no mutexes.
+6. Compile-time type information and attributes in place of `reflect` and struct tags, extending what `argo` does for JSON.
 
 **High demand:** `time` (zones, layouts, timers), `net/url`, `regexp`, the rest of `encoding/json`, `strconv`, `strings`, `slices`, `maps`, `sort`, `bytes`, `os` file handles, `net/http` client and server completeness, `net/http/httptest`, `encoding/xml`, `crypto/tls` (#124), `database/sql`'s common shape, `image`, `math/big`, `compress/gzip`, `mime/multipart`.
 

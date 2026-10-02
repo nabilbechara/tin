@@ -36,3 +36,9 @@ Status (2026-10-02): phases 9–12 and the websocket package are merged (#64–#
 tasks, non-blocking I/O and helper threads, `query`, redis, mysql, websocket. Phase 13's
 service and harness are in bench/v04 (Tin and Go + chi, wrk2); the final measurement on a
 quiet machine is still to do (see the open benchmark issue).
+
+## Foundations (decided 2026-10-02): notes/design_foundations.md
+Closures that capture, shapes, fault chains and `guard`, tasks and scopes with `context` as ambient
+deadline and cancellation, atomics, compile-time type information, packages with capabilities. The
+document decides each, with what it replaces, what was rejected and what it unlocks, and orders the
+nine steps by dependency. docs/COVERAGE.md is the checklist of what each adds.
