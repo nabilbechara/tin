@@ -5,6 +5,7 @@ var prog_fns;
 var prog_consts;
 var prog_vars;
 var prog_types;
+var prog_shapes;
 var file_pkgs;     // per file: package name, "" for main
 var file_imports;  // per file: vec of [alias, path]
 var file_v2;       // per file: 1 when it declares a package or uses func
@@ -66,8 +67,11 @@ const D_TPARAMS = 9;  // generic type: parameter names
 const D_TCONS = 10;
 const D_INSTS = 11;   // generic type: vec of [type args, type]
 const D_METHODS = 12; // generic type: its method templates
+const D_SHAPE = 13;   // shape: vec of method signature nodes
 const D_INITS = 14;   // const specification expressions, repeated by a bare grouped spec
-const D_SIZE = 16;
+const D_UNION = 15;   // shape: vec of the shapes it lists (composition), or of `= A | B`
+const D_UNIONKIND = 16; // shape: 1 for the `= A | B` union form, 0 for a method set
+const D_SIZE = 17;
 
 var p_shared;
 
@@ -129,6 +133,7 @@ const TX_STRUCT = 45;
 const TX_ARRAY = 46;
 const TX_CHAN = 47;
 const TX_OPT = 49;
+const TX_DYN = 57;   // dyn Shape: a fat reference, TX_A holds the shape's type expr
 
 // Node fields by kind.
 const INT_VAL = 2;
@@ -279,6 +284,7 @@ fn parse_setup() {
     prog_consts = vec_new();
     prog_vars = vec_new();
     prog_types = vec_new();
+    prog_shapes = vec_new();
     file_pkgs = vec_new();
     file_imports = vec_new();
     file_v2 = vec_new();
@@ -352,8 +358,11 @@ fn parse(toks) {
             } else {
                 parse_type_decl();
             }
+        } else if p_word("shape") {
+            file_v2[VEC_DATA][cur_file] = 1;
+            vec_push(prog_shapes, parse_shape_decl());
         } else {
-            p_fail_found(p_peek()[T_POS], "expected a declaration (func, var, const, type)", p_peek());
+            p_fail_found(p_peek()[T_POS], "expected a declaration (func, var, const, type, shape)", p_peek());
         }
     }
 }
@@ -488,6 +497,66 @@ fn parse_type_decl() {
     d[D_TYPE] = parse_type();
     vec_push(prog_types, d);
     p_end();
+}
+
+// ---- shapes ----
+
+// parse_shape_decl reads a shape: shape Name { methods and listed shapes } or the
+// named union shape Name = A | B | C. `shape` is a contextual word (like enum, fail
+// and shared): it opens a declaration only at the top level, where no other form
+// starts with that name, so a program may still use it as a name elsewhere. A method
+// is a function node with no receiver and no body, so a shape signature and a func
+// signature are parsed by the same code and cannot drift apart.
+fn parse_shape_decl() {
+    let pos = p_next()[T_POS];
+    let d = decl_new(pos, p_expect_ident()[T_TEXT]);
+    d[D_SHAPE] = vec_new();
+    d[D_UNION] = vec_new();
+    // shape Seq[T]: a shape may take type parameters, constrained like a generic type's.
+    if p_is("[") {
+        d[D_TPARAMS] = vec_new();
+        d[D_TCONS] = vec_new();
+        parse_tparams(d[D_TPARAMS], d[D_TCONS]);
+    }
+    if p_is("=") {
+        p_next();
+        d[D_UNIONKIND] = 1;
+        d[D_UNION] = parse_type_union(parse_type());
+        p_end();
+        return d;
+    }
+    p_expect("{");
+    while !p_is("}") {
+        if p_is(";") {
+            p_next();
+            continue;
+        }
+        let mpos = p_peek()[T_POS];
+        // Name( ... is a method signature; a bare name lists another shape (composition),
+        // and `=` above already took the union form.
+        if p_peek2()[T_KIND] == TK_PUNCT && streq(p_peek2()[T_TEXT], "(") {
+            vec_push(d[D_SHAPE], parse_shape_method(mpos));
+        } else {
+            vec_push(d[D_UNION], parse_type());
+        }
+        p_end();
+    }
+    p_next();
+    p_end();
+    return d;
+}
+
+// parse_shape_method reads Name(params) results with no receiver and no body, keeping
+// the mut marks, the variadic and the !T fault result a func declaration keeps.
+fn parse_shape_method(pos) {
+    let m = fn_new(pos, p_expect_ident()[T_TEXT]);
+    parse_params(m);
+    p_mutres = 0;
+    p_bangres = 0;
+    m[F_RTYPES] = parse_results();
+    m[F_MUTRES] = p_mutres;
+    m[F_BANG] = p_bangres;
+    return m;
 }
 
 fn p_peek() {
@@ -652,6 +721,15 @@ fn parse_type() {
         p_next();
         return parse_enum_body(pos);
     }
+    // dyn Shape: a fat reference to anything satisfying Shape. Contextual: it is a
+    // keyword in type position only when a shape name follows, so a type of its own
+    // named `dyn` still resolves as a name.
+    if p_word("dyn") && p_peek2()[T_KIND] == TK_IDENT && !p_legacy {
+        p_next();
+        let dy = node_new(TX_DYN, pos);
+        dy[TX_A] = parse_type();
+        return dy;
+    }
     let t = p_expect_ident();
     if streq(t[T_TEXT], "chan") {
         let c = node_new(TX_CHAN, pos);
@@ -692,12 +770,7 @@ fn parse_tparams(names, cons) {
             if first[N_KIND] == TX_NAME && !first[TX_A] && (streq(first[TX_B], "any") || streq(first[TX_B], "comparable")) && !p_is("|") {
                 c = 0;
             } else {
-                c = vec_new();
-                vec_push(c, first);
-                while p_is("|") {
-                    p_next();
-                    vec_push(c, parse_type());
-                }
+                c = parse_type_union(first);
             }
         }
         vec_push(cons, c);
@@ -707,6 +780,18 @@ fn parse_tparams(names, cons) {
         p_next();
     }
     p_expect("]");
+}
+
+// parse_type_union reads the rest of a `A | B | C` union after its first member. A
+// generic type parameter's constraint and a shape's named union are one grammar.
+fn parse_type_union(first) {
+    let c = vec_new();
+    vec_push(c, first);
+    while p_is("|") {
+        p_next();
+        vec_push(c, parse_type());
+    }
+    return c;
 }
 
 // parse_struct_body reads { a, b int; c string } into a vec of [name, type expr].

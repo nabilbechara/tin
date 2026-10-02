@@ -116,6 +116,76 @@ any reader, `hash.Hash` and streaming `sha256`/`crc32`, `sort.Interface`, the `d
 driver contract, `fmt.Stringer` and `Formatter`, `net.Conn`/`Listener`, `testing` helpers, and
 `error` payloads.
 
+### 2.1 Syntax and rules (refined during implementation)
+
+The implementation fixes the surface syntax the decision above left open (section 10). Section 2.1
+is the rule the compiler enforces; the grammar is in docs/LANGUAGE.md section 19.
+
+```
+shape Reader { Read(buf mut []u8) !i64 }          // a method set
+shape Writer { Write(data []u8) !i64 }
+shape ReadWriter { Reader; Writer; Flush() !i64 }  // composition by listing shapes
+shape Ordered = i64 | i32 | f64 | str              // a named union
+shape Seq[T any] { Next() ?T; Close() !i64 }       // type parameters
+```
+
+- A shape member is a method signature or the name of another shape. The two cannot be
+  confused: a member is a method exactly when a `(` follows its name. A listed shape with
+  type arguments (`Seq[i64]`) is part of the later generic-shape step and is diagnosed today.
+- A method signature is a `func` signature without a receiver and without a body, so the two
+  grammars are one and cannot drift. Parameter `mut` marks, `...` and `!T` results are all
+  written as in a function declaration. There is no `self` parameter: a method's receiver is
+  implicit, as it is for a declared method.
+- `shape X = A | B | C` is the same union grammar as a generic type parameter's constraint;
+  the named union and the inline form are interchangeable (a named union used as a constraint is
+  exactly the named-constraint item of section 1).
+- `shape` and `dyn` are **contextual words**, following `enum`, `fail`, `catch` and `shared`:
+  they are recognized only where the grammar wants them, so a program may keep using them as
+  names (`shape := 1`, `type dyn = i64`, `var x dyn`). `shape` opens a declaration only at the
+  top level; `dyn` is a fat reference only when a shape name follows it in type position.
+- `dyn S` is written in type position; `?dyn S` is the optional. A `dyn S` is never nil.
+- There is no downcast, no type assertion and no type switch on a `dyn` value, and therefore no
+  runtime type information: a closed set of cases is an `enum`, an open set is a method on the
+  shape.
+
+Steps are built in the order of section 12.2: declarations and `dyn` parse first (they are
+registered but not yet usable), then satisfaction and diagnostics, then static dispatch, then
+`dyn` code generation with its method tables, then the library ports. Checking a box in
+notes/roadmap.md follows section 12.1: each step has its own acceptance test.
+
+### 2.2 Satisfaction and static dispatch (built)
+
+A shape is checked where it is used: as a type-parameter constraint, at each instantiation,
+when the type argument is concrete. The checks are:
+
+- **A method set**: the type must have every method a shape lists, with the same parameter
+  types and `mut` marks, the same result types (including `!T`, which adds the fault result),
+  and the same variadic mark. Method names are compared, not parameter names.
+- **Receiver mutability is not part of satisfaction.** A shape's method has no receiver, and
+  a `mut` receiver is a property of the concrete method; a method with one is called with the
+  call-site `mut` mark, so a generic body that calls it declares its own parameter `mut`
+  (`func Use[R Reader](r mut R)`), and its callers pass `mut`. This keeps every mutation
+  visible at the call site, as everywhere else in Tin.
+- **Composition**: `shape ReadWriter { Reader; Writer }` is satisfied by satisfying every
+  listed shape; a shape may not list itself, directly or through other shapes (diagnosed once,
+  at the shape that closes the cycle), and a generic shape is listed only with the later
+  generic-shape work.
+- **A named union used as a constraint** (`shape Ordered = i64 | f64 | str`, then `[T Ordered]`)
+  is membership in its list; its members are concrete types, never shapes.
+- One name is either a type or a shape, not both.
+
+Failure is a source-level error at the instantiation site that prints the declared signature
+and, for a name that exists with another signature, both signatures:
+`type Odd does not satisfy shape Reader: method Read(buf []u8) i64 has the wrong signature, want Read(buf mut []u8) !i64`.
+
+Dispatch costs nothing to provide: monomorphization already re-checks a generic body with the
+type parameters bound, so a call through a shaped parameter resolves to the concrete method
+like any other call, with no table and no indirection. `dyn` is the explicit exception and is
+the next step; until it is built, a `dyn` type in any signature that is resolved (every
+non-generic shape's signature is resolved when it is declared) and a generic shape used as a
+constraint are rejected with a message naming the missing step rather than being misread as
+ordinary types.
+
 ---
 
 ## 3. Errors: a chain, and a guard at the request boundary

@@ -32,7 +32,7 @@ The inventory is the 176 packages `go list std` reports for Go 1.26 (without `in
 | structs, methods | yes; fields and methods follow the capitalized-export rule | done |
 | struct embedding | not documented | missing |
 | struct tags | none: attributes checked by the compiler are the plan | design |
-| interfaces, type assertions, type switches | none: generics (monomorphized) and `enum` with exhaustive `switch`; an explicit dynamic-dispatch form is to be designed | design |
+| interfaces, type assertions, type switches | shapes: `shape` declarations (method sets, composition, named unions, type parameters), structural satisfaction, and static dispatch by monomorphization (a shaped type parameter's calls are direct calls on the concrete type). `dyn S` and generic shapes are parsed but not yet usable; no type assertions or type switches by design (an `enum` is a closed set); #141 | partial |
 | generics | type parameters with `any`, `comparable` and unions; inference; methods on generic types | partial |
 | function values, closures | capturing closures as region objects with shared cells (Go 1.22 per-iteration loop variables), frame-resident descriptors for closures only the library calls (no pool allocation), deep-copied by keep(), escape into globals rejected, defer with captures; a local closure cannot recurse and cannot capture a mut parameter; cells for every captured variable (by-value copies of never-reassigned variables are a later optimization) | done |
 | method values and expressions | not documented | missing |

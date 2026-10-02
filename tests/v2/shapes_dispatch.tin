@@ -1,0 +1,100 @@
+package main
+
+// Shapes (#141, compiler step 3: satisfaction and static dispatch). A type satisfies a
+// shape by having its methods, a shape composes by listing shapes, a named union works
+// as a constraint, and a method on an instantiated generic type satisfies a shape. All
+// of it is monomorphized: every call below is a direct call on the concrete type.
+//
+// The same program is the Go twin bench/ref/shapes/main.go, written with interfaces.
+
+import "say"
+
+shape Reader { Read(buf mut []u8) !i64 }
+
+shape Writer { Write(data []u8) !i64 }
+
+shape ReadWriter {
+	Reader
+	Writer
+}
+
+shape Ordered = i64 | f64 | str
+
+shape Sized { Len() i64 }
+
+type Stack[T any] struct { xs []T }
+
+func (s mut Stack[T]) Push(v T) {
+	s.xs = append(s.xs, v)
+}
+
+func (s Stack[T]) Len() i64 {
+	return len(s.xs)
+}
+
+type Buf struct { data []u8 }
+
+func (b Buf) Read(buf mut []u8) !i64 {
+	let n = len(b.data)
+	let i = 0
+	while i < n && i < len(buf) {
+		buf[i] = b.data[i]
+		i = i + 1
+	}
+	return i
+}
+
+func (b Buf) Write(data []u8) !i64 {
+	return len(data)
+}
+
+func Drain[R Reader](r R) !i64 {
+	let buf = make([]u8, 8)
+	return try r.Read(mut buf)
+}
+
+func Emit[W Writer](w W, s []u8) !i64 {
+	return try w.Write(s)
+}
+
+// The parameter is a ReadWriter, so both Drain (Reader) and Emit (Writer) accept it:
+// composition is satisfaction of every listed shape.
+func Both[RW ReadWriter](rw RW) !i64 {
+	let n = try Drain(rw)
+	let m = try Emit(rw, []u8{1, 2})
+	return n + m
+}
+
+func InOrder[T Ordered](a T, b T) i64 {
+	if a == b {
+		return 0
+	}
+	if a < b {
+		return -1
+	}
+	return 1
+}
+
+func Size[S Sized](s S) i64 {
+	return s.Len()
+}
+
+func main() {
+	let b = Buf{data: []u8{1, 2, 3}}
+	n := Drain(b) catch _ { -1 }
+	say.Line("read: {n}")
+	w := Emit(b, []u8{9, 9}) catch _ { -1 }
+	say.Line("write: {w}")
+	both := Both(b) catch _ { -1 }
+	say.Line("both: {both}")
+	say.Line("i64: {InOrder(1, 2)}")
+	so := InOrder("b", "a")
+	say.Line("str: {so}")
+	say.Line("f64: {InOrder(2.5, 2.5)}")
+	let st = Stack[i64]{xs: []i64{}}
+	st.Push(7)
+	st.Push(8)
+	st.Push(9)
+	say.Line("size: {Size(st)}")
+	say.Line("len: {st.Len()}")
+}

@@ -266,6 +266,10 @@ fn resolve_type(tx) {
         return resolve_type(tx[TX_A]);
     }
     if k == TX_OPT {
+        if tx[TX_A][N_KIND] == TX_DYN {
+            err_at(tx[TX_A][N_POS], "dyn shapes are not usable yet: reach the shape through a type parameter (#141)");
+            return ty_int;
+        }
         let inner = resolve_type(tx[TX_A]);
         if kind_of(inner) != K_STRUCT {
             err_type(tx[N_POS], "only struct references can be optional, not ", inner, "");
@@ -284,6 +288,10 @@ fn resolve_type(tx) {
         resolve_fields(st, tx);
         layout_struct(st);
         return st;
+    }
+    if k == TX_DYN {
+        err_at(tx[N_POS], "dyn shapes are not usable yet: reach the shape through a type parameter (#141)");
+        return ty_int;
     }
     err_at(tx[N_POS], "invalid type");
     return ty_int;
@@ -384,6 +392,7 @@ fn check() {
         i = i + 1;
     }
     generics_init();
+    shapes_init();
     // Named types: structs first, so fields and aliases can refer to any of them.
     i = 0;
     while i < prog_types[VEC_LEN] {
@@ -410,6 +419,20 @@ fn check() {
         }
         i = i + 1;
     }
+    // A type and a shape may not share a name: the two would be ambiguous wherever a
+    // name can be either (a constraint) and confusing everywhere else. A generic type's
+    // name lives in ty_generics until it is instantiated, so both are checked.
+    i = 0;
+    while i < prog_shapes[VEC_LEN] {
+        let sd = vec_get(prog_shapes, i);
+        set_file(sd[D_FILE]);
+        let q = qual(ck_pkg, sd[D_NAME]);
+        if find_type(q) || find_generic(q) {
+            err_quoted(sd[D_POS], "", sd[D_NAME], " is declared as a type and as a shape");
+        }
+        i = i + 1;
+    }
+    shapes_declared();
     i = 0;
     let ndecl = prog_fns[VEC_LEN];
     while i < ndecl {
