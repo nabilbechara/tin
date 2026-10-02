@@ -387,6 +387,10 @@ func fill(xs mut []i64, v i64) {      // may modify its argument
   elements, appending to it, storing into its map) is a compile error unless the
   parameter is declared `mut`. Passing a read-only parameter on to a `mut` parameter is
   also rejected. Reassigning the parameter variable itself is allowed.
+- `mut` is for a struct, a slice, a map or an optional of one: a callee modifies what they
+  hold. A number, a `bool`, a `str` or a fault is passed by value, so `mut` on such a parameter
+  is a compile error (it would silently do nothing), also for a generic function at the
+  instantiation that makes the parameter one of those types.
 - **Call-site `mut`.** An argument for a `mut` parameter is written `mut x`, so every
   call shows what it may modify: `fill(mut xs, 0)`, `sift.Ints(mut xs)`,
   `argo.Put(mut buf, v)`, `argo.Get(text, mut v)`, and through function values too
