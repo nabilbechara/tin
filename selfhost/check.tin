@@ -1859,9 +1859,7 @@ fn check_let(s) {
     }
     if init {
         let it = chk(init, t);
-        if kind_of(it) == K_VOID || kind_of(it) == K_TUPLE {
-            err_type(pos, "cannot use ", it, " as a value");
-        }
+        check_value(pos, it);
         if t {
             check_assignable(init, it, t);
             if is_untyped(it) {
@@ -1882,6 +1880,9 @@ fn check_let(s) {
         s[LET_INIT] = zero_value(pos, t);
     }
     if streq(s[LET_NAME], "_") {
+        if kind_of(t) == K_ERROR && !ck_legacy {
+            err_at(pos, "a fault cannot be discarded with _");
+        }
         replace_node(s, expr_stmt(s[LET_INIT]));
         return;
     }
@@ -1926,8 +1927,10 @@ fn check_assign(s) {
     }
     if target[N_KIND] == EX_IDENT && streq(target[ID_NAME], "_") {
         let vt = chk(v, 0);
-        if kind_of(vt) == K_ERROR && !ck_legacy {
+        if (kind_of(vt) == K_ERROR || (kind_of(vt) == K_TUPLE && tuple_has_fault(vt))) && !ck_legacy {
             err_at(s[N_POS], "a fault cannot be discarded with _");
+        } else {
+            check_value(s[N_POS], vt);
         }
         replace_node(s, expr_stmt(v));
         return;
@@ -1977,6 +1980,13 @@ fn check_assignable(e, from, to) {
             return;
         }
         err_types(e[N_POS], "cannot use ", from, " as ", to);
+    }
+}
+
+// check_value rejects a call with no result, or several, where one value is needed.
+fn check_value(pos, t) {
+    if kind_of(t) == K_VOID || kind_of(t) == K_TUPLE {
+        err_type(pos, "cannot use ", t, " as a value");
     }
 }
 
@@ -2050,6 +2060,7 @@ fn check_multi(s) {
             want = check_target_type(tg);
         }
         let vt = chk(v, want);
+        check_value(v[N_POS], vt);
         if is_untyped(vt) {
             vt = reconvert(v, default_type(vt));
         }
@@ -2085,6 +2096,9 @@ fn bind_targets(pos, targets, temps, define, stmts) {
         let tg = vec_get(targets, i);
         let ts = vec_get(temps, i);
         if tg[N_KIND] == EX_IDENT && streq(tg[ID_NAME], "_") {
+            if kind_of(ts[S_TYPE]) == K_ERROR && !ck_legacy {
+                err_at(tg[N_POS], "a fault cannot be discarded with _");
+            }
             i = i + 1;
             continue;
         }
