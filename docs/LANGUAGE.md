@@ -883,8 +883,9 @@ err2 := argo.Get(text, mut xs)      // appends decoded elements
 - `argo.Get(text, mut v)` fills a struct, slice (appending) or map (adding entries); nested
   struct fields are filled in place, `?T` fields accept `null`, unknown members are
   skipped, sized integers are range checked (`700` into a `u8` is a fault), and trailing
-  garbage is a fault. Error messages name the offset: `argo: expected an integer in
-  [0, 65535] at offset 8, found "7"`.
+  garbage is a fault, as are arrays and objects nested more than 512 deep (each level
+  takes stack, and a request handler's stack is 256 KiB). Error messages name the offset:
+  `argo: expected an integer in [0, 65535] at offset 8, found "7"`.
 - `argo.Str(b, s)` and `argo.Raw(b, json)` write pieces by hand.
 
 ---
@@ -894,7 +895,7 @@ err2 := argo.Get(text, mut xs)      // appends decoded elements
 - **Bounds**: every slice and string index is checked; slicing beyond the length panics.
   The compiler removes a check where it can prove the index is in range: `range` loops,
   `for i := 0; i < len(s); i++` (and loops whose bound is `len(s)` held in an unchanged
-  variable), `if i < len(s)` with a non-negative i, and constant indexes.
+  variable), and `if i < len(s)` with a non-negative i.
 - **Nil**: str, slice, map and struct values are never nil. Optionals must be checked
   before use (section 9). Missing map keys read as zero values; `try` returns real zero
   values.

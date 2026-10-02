@@ -172,8 +172,8 @@ close-after-write flag, writing flag, bytes needed. Idle connections hold no buf
   drained.
 - Complete requests are parsed in place:
   - request line;
-  - headers, scanned with `memchr`; only `Content-Length`, `Connection` and
-    `Transfer-Encoding` are interpreted;
+  - headers, scanned with `memchr`; each name must be a token followed by `:`, and
+    only `Content-Length`, `Connection` and `Transfer-Encoding` are interpreted;
   - body.
 - An incomplete request is copied into the connection's own buffer, sized to the
   request when its length is known (up to 64 MiB).
@@ -199,8 +199,9 @@ reading resumes and buffered input is served.
 
 **Limits and errors.**
 - A request line or header block over 64 KiB gets 414 / 431 and close.
-- A malformed request line or bad `Content-Length` gets 400; `Transfer-Encoding`
-  gets 501.
+- A malformed request line, a header line that is not `name: value` (no colon,
+  whitespace before it, obs-fold, a name that is not a token) or a bad
+  `Content-Length` gets 400; `Transfer-Encoding` gets 501.
 - Bodies are limited to 64 MiB (413).
 - HTTP/1.0 closes unless keep-alive is asked for; `Connection: close` is honored.
 - `$PORT` replaces the port of the address passed to `Serve`.
@@ -322,10 +323,14 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   8 bytes at a time with SWAR checks for `"`, `\` and control bytes. Integers are
   written digit by digit, floats via `shortest_into` straight into the buffer.
 - `argo.Get(text, mut v)` compiles to a generated decoder `argo$dN(p, x)` over a `Parser`
-  (text, offset, first error). The readers (`robj`, `rarr`, `rkey`, `rstr`, `rint`,
+  (text, offset, depth, first error). The readers (`robj`, `rarr`, `rkey`, `rstr`, `rint`,
   `rintr`, `ruint`, `rfloat`, `rbool`, `rnull`, `rskip`, `rmore`) record the first
   error and then do nothing, so decoders test the error only at loop boundaries.
   Strings without escapes are returned as substrings without copying.
+- `rskip` and the decoders of recursive types take a stack frame per nesting level
+  (32 bytes for `rskip`, 80 for a small struct, 240 for one of 32 fields), so `robj` and
+  `rarr` fault once 512 arrays and objects are open: even 240-byte frames then fit in
+  half of a 256 KiB task stack.
 
 ## 11. Startup sequence of a strict program
 
