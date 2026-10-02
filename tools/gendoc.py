@@ -5,7 +5,7 @@ import os, re
 SKIP = {"runtime", "std", "fmt", "say"}
 ORDER = ["say", "argo", "anvil", "hearth", "relay", "wire", "twine", "glyph", "mint", "gauge",
          "ore", "flume", "quarry", "trail", "lever", "tide", "dice", "sift", "cairn", "stamp",
-         "seal", "herald", "crucible", "redis", "mysql", "websocket"]
+         "seal", "herald", "crucible", "redis", "mysql", "postgres", "websocket"]
 ROLE = {"say": "formatting and printing (fmt)", "argo": "JSON (encoding/json)", "anvil": "HTTP/1.1 server (net/http)",
         "hearth": "cores and threads (runtime)", "relay": "messages between cores (channels)", "wire": "TCP and HTTP client (net)",
         "twine": "strings (strings)", "glyph": "UTF-8 (unicode/utf8)", "mint": "number and string conversion (strconv)",
@@ -16,6 +16,7 @@ ROLE = {"say": "formatting and printing (fmt)", "argo": "JSON (encoding/json)", 
         "seal": "crypto and encodings (crypto/sha256, hmac, encoding/hex, base64)", "herald": "logging (log/slog)",
         "crucible": "testing helpers (testing)", "redis": "Redis client (go-redis)",
         "mysql": "MySQL client (database/sql with go-sql-driver/mysql)",
+        "postgres": "PostgreSQL client (database/sql with pgx)",
         "websocket": "WebSocket server and client (gorilla/websocket)"}
 
 def parse(path):
