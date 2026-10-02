@@ -62,13 +62,10 @@ Builder (struct holding `buf []u8`; `Builder{}` is usable, `NewBuilder(n)` preal
 - `RuneCount(s str) i64` (each invalid byte counts as one), `Valid(s str) bool`
 - `RuneStart(b u8) bool` (not a continuation byte), `FullRune(s str, i i64) bool` (s[i:] begins with a
   complete rune; already-invalid bytes count as complete, like Go)
-- `IsLetter/IsDigit/IsSpace/IsUpper/IsLower(r i32) bool` — ASCII + Latin-1 (IsDigit is ASCII 0-9
-  only, like Go; ª º count as letters but not lower-case, like Go's tables).
-- `ToUpper/ToLower(r i32) i32` — ASCII + Latin-1 ranges 0xC0-0xDE/0xE0-0xFE (× ÷ excluded);
-  ß, ÿ and µ are returned unchanged because their counterparts lie outside Latin-1.
+- The classification and case functions are Unicode's, from Go's tables: see `lib/glyph/unicode.tin`
+  and the "glyph: Unicode" row of notes/stdlib_verified.md.
 
 ### Known gaps
-- No Unicode tables beyond Latin-1; `IsLetter(0x100)` is false.
 - `EncodeRune` appends rather than writing at index 0 as Go does; there is no in-place variant.
 
 ## Compiler bug found

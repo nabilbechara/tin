@@ -237,3 +237,6 @@ where the bootstrap passed, together with the compiler change that needed them.
 `python3 tools/gendoc.py` rewrites `docs/STDLIB.md` from the comments in `lib/*.tin`
 (package comment, then one line per exported function, type and constant). Write a
 one-line comment above every exported declaration.
+
+`python3 tools/gen_unicode.py` rewrites `lib/glyph/tables.tin` and `lib/runtime/printable.tin` (the Unicode
+tables) from Go's `unicode/tables.go`; it needs a Go tree only to read that one file.

@@ -11,7 +11,7 @@ Generated from the comments in `lib/*/` by `tools/gendoc.py`.
 | [relay](#relay) | messages between cores (channels) |
 | [wire](#wire) | TCP and HTTP client (net) |
 | [twine](#twine) | strings (strings) |
-| [glyph](#glyph) | UTF-8 (unicode/utf8) |
+| [glyph](#glyph) | UTF-8 and Unicode (unicode/utf8, unicode) |
 | [mint](#mint) | number and string conversion (strconv) |
 | [gauge](#gauge) | math (math) |
 | [bits](#bits) | bit counting and manipulation (math/bits) |
@@ -246,7 +246,7 @@ Package twine manipulates UTF-8 strings (like Go's strings); case helpers are AS
 
 ## glyph
 
-Package glyph is UTF-8 and simple character classification (like Go's unicode/utf8).
+Package glyph is UTF-8 (like Go's unicode/utf8) and Unicode: general categories, scripts, properties and case mapping, from the same tables as Go's unicode package (see UnicodeVersion).
 
 - `const RuneError = 0xfffd`: RuneError is the replacement character returned for invalid UTF-8.
 - `const MaxRune = 0x10ffff`: MaxRune is the largest valid Unicode code point.
@@ -261,13 +261,31 @@ Package glyph is UTF-8 and simple character classification (like Go's unicode/ut
 - `FullRune(s str, i i64) bool`: FullRune reports whether s[i:] begins with a complete encoded rune (invalid bytes count as complete).
 - `RuneCount(s str) i64`: RuneCount returns the number of runes in s, counting each invalid byte as one rune.
 - `Valid(s str) bool`: Valid reports whether s is entirely valid UTF-8.
-- `IsLetter(r i32) bool`: IsLetter reports whether r is an ASCII or Latin-1 letter.
-- `IsDigit(r i32) bool`: IsDigit reports whether r is an ASCII decimal digit.
-- `IsSpace(r i32) bool`: IsSpace reports whether r is ASCII or Latin-1 white space.
-- `IsUpper(r i32) bool`: IsUpper reports whether r is an ASCII or Latin-1 upper-case letter.
-- `IsLower(r i32) bool`: IsLower reports whether r is an ASCII or Latin-1 lower-case letter.
-- `ToUpper(r i32) i32`: ToUpper maps ASCII and simple Latin-1 lower-case letters to upper case (ß, ÿ and µ are unchanged).
-- `ToLower(r i32) i32`: ToLower maps ASCII and Latin-1 upper-case letters to lower case.
+- `const UnicodeVersion = "15.0.0"`: UnicodeVersion is the version of the Unicode Character Database the tables come from.
+- `type Table enum`: Table names a set of code points by Unicode's own name: a general category (Lu, Nd, P), a script (Latin, Han, Arabic) or a property (White_Space, Dash). Use it with Is.
+- `Is(t Table, r i32) bool`: Is reports whether r is in the set t.
+- `IsOneOf(sets []Table, r i32) bool`: IsOneOf reports whether r is in any of the sets.
+- `IsLetter(r i32) bool`: IsLetter reports whether r is a letter (category L).
+- `IsDigit(r i32) bool`: IsDigit reports whether r is a decimal digit (category Nd).
+- `IsNumber(r i32) bool`: IsNumber reports whether r is a number (category N).
+- `IsSpace(r i32) bool`: IsSpace reports whether r is white space as Unicode defines it (property White_Space): tab, line feed, vertical tab, form feed, carriage return, space, U+0085, U+00A0 and the Unicode space separators.
+- `IsUpper(r i32) bool`: IsUpper reports whether r is an upper-case letter (category Lu).
+- `IsLower(r i32) bool`: IsLower reports whether r is a lower-case letter (category Ll).
+- `IsTitle(r i32) bool`: IsTitle reports whether r is a title-case letter (category Lt).
+- `IsMark(r i32) bool`: IsMark reports whether r is a mark (category M).
+- `IsPunct(r i32) bool`: IsPunct reports whether r is punctuation (category P).
+- `IsSymbol(r i32) bool`: IsSymbol reports whether r is a symbol (category S).
+- `IsControl(r i32) bool`: IsControl reports whether r is a control character: U+0000 to U+001F and U+007F to U+009F.
+- `IsGraphic(r i32) bool`: IsGraphic reports whether r is a letter, mark, number, punctuation, symbol or space separator.
+- `IsPrint(r i32) bool`: IsPrint reports whether r is printable: a letter, mark, number, punctuation or symbol, or the ASCII space (no other space is).
+- `const UpperCase = 0`: The case a rune is mapped to by To.
+- `const LowerCase = 1`
+- `const TitleCase = 2`
+- `To(which i64, r i32) i32`: To maps r to the given case (UpperCase, LowerCase or TitleCase); a rune without a mapping is returned unchanged.
+- `ToUpper(r i32) i32`: ToUpper maps r to upper case.
+- `ToLower(r i32) i32`: ToLower maps r to lower case.
+- `ToTitle(r i32) i32`: ToTitle maps r to title case.
+- `SimpleFold(r i32) i32`: SimpleFold iterates over the code points that are equivalent under simple case folding: it returns the smallest rune greater than r in r's orbit, or the smallest one when there is none ('K' gives 'k', 'k' gives U+212A, U+212A gives 'K').
 
 ## mint
 

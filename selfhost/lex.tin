@@ -14,6 +14,7 @@ const T_TEXT = 1;
 const T_VAL = 2;
 const T_POS = 3;
 const T_RAW = 4;   // a `raw` string literal (no interpolation)
+const T_DBL = 5;   // an escape produced a brace, which the text holds doubled ({{ or }}) so that it is not read as interpolation
 
 var lx_src;
 var lx_len;
@@ -49,12 +50,13 @@ fn lex(file, src, len) {
 // T_TEXT holds the identifier, keyword, punctuation or decoded string bytes;
 // T_VAL holds an integer literal's value or a string literal's byte length.
 fn token_new(kind, text, val, pos) {
-    let t = malloc(40);
+    let t = malloc(48);
     t[T_KIND] = kind;
     t[T_TEXT] = text;
     t[T_VAL] = val;
     t[T_POS] = pos;
     t[T_RAW] = 0;
+    t[T_DBL] = 0;
     return t;
 }
 
@@ -452,6 +454,7 @@ fn buf_utf8(b, r) {
 fn lex_string(pos) {
     lx_advance();
     let b = buf_new();
+    let doubled = 0;
     while 1 {
         if lx_i >= lx_len || lx_peek(0) == '\n' {
             lx_fail(pos, "unterminated string literal");
@@ -460,10 +463,17 @@ fn lex_string(pos) {
         if c == '"' {
             // The NUL makes T_TEXT usable as a C string; T_VAL keeps the real length.
             buf_byte(b, 0);
-            return token_new(TK_STRING, b[VEC_DATA], b[VEC_LEN] - 1, pos);
+            let st = token_new(TK_STRING, b[VEC_DATA], b[VEC_LEN] - 1, pos);
+            st[T_DBL] = doubled;
+            return st;
         }
         if c == '\\' {
             let e = lx_escape(pos);
+            if e == '{' || e == '}' {
+                // An escaped brace is text, not interpolation: double it as the source would.
+                buf_byte(b, e);
+                doubled = 1;
+            }
             if lx_esc_rune {
                 buf_utf8(b, e);
             } else {
