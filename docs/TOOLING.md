@@ -34,7 +34,7 @@ moving or deleting the tree breaks it.
 | `tin run A.tin B.tin -- ARGS` | compile several files as one program and run it |
 | `tin build FILE.tin... [-o OUT] [--target T]` | write an executable (default name: the first file without `.tin`) |
 | `tin asm FILE.tin...` | print the generated ARM64 assembly (clang syntax) |
-| `tin test [-bench] [DIR]` | build DIR (default `.`) with its `*_test.tin` files and run every `TestXxx(t mut crucible.T)`, then `BenchmarkXxx(b mut crucible.B)` with `-bench`; exit status 1 when a test fails (see §5.1) |
+| `tin test [-bench] [DIR]` | build DIR (default `.`) with its `*_test.tin` files and run every `TestXxx(t mut crucible.T)`, then `BenchmarkXxx(b mut crucible.B)` with `-bench`; exit status 1 when a test fails, 2 for a wrong test signature (see §5.1) |
 | `tin suite` | run the compiler's strict test suite (`tools/v2test.sh`) |
 | `tin bootstrap` | rebuild the compiler with itself; the binaries must be identical |
 | `tin version` | version and compiler checksum |
@@ -123,6 +123,12 @@ then `PASS: N tests` or `FAIL: ...` (exit status 1). `tin test -bench ./geo` als
 benchmark, doubling `b.N` until it takes a second, and prints ns/op. `*_test.tin` files are
 never part of a normal build or import. Underneath, `tin test` writes a runner calling each
 test through `crucible.Run` and compiles the package with `tinc -entry pkg.TinTestMain`.
+
+As in Go, a test is a `TestXxx` (or benchmark `BenchmarkXxx`) in a `*_test.tin` file whose
+`Xxx` does not start with a lowercase letter (`Testify` is an ordinary function). It must be
+declared on one line as `func TestXxx(name mut crucible.T) {` (`mut crucible.B` for a
+benchmark); any other signature is reported as `FILE:LINE: wrong signature for TestXxx`
+with exit status 2, so no test is skipped silently.
 
 Adding a strict test: write `tests/v2/NAME.tin` with deterministic output (no times,
 addresses or map-order dependence beyond what sorting hides), run it, check every line

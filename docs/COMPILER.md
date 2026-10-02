@@ -180,7 +180,7 @@ Registers:
 
 | pass | file | does |
 |---|---|---|
-| `inline_small_calls` | inline.tin | inlines functions whose body is one `return expr` (≤ 40 nodes), substituting pure single-use or simple arguments, temps otherwise |
+| `inline_small_calls` | inline.tin | inlines functions whose body is one `return expr` (≤ 40 nodes), substituting simple arguments (and pure single-use ones when the whole call is pure), temps in order otherwise |
 | float intrinsics | inline.tin | `sqrt`, `fabs`, `floor`, `ceil`, `trunc`, `round`, `rint` externs become single instructions |
 | `inline_appends` | inline.tin | `append(s, v)` and `append(b, str...)` get an inline capacity check and store; short literal appends become constant stores |
 | `licm_fn` | opt.tin | hoists loop-invariant expressions (including slice headers when the loop makes no calls) and rewrites `x[a+b]` row addressing |

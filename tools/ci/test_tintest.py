@@ -43,6 +43,38 @@ func TestWrong(t mut crucible.T) {
 }
 '''
 
+# Issue #94: any parameter name and spacing; Testify is not a test (Go's rule).
+SPELLINGS = '''package geo
+
+import "crucible"
+
+func TestSpaced( t  mut  crucible.T ) {
+	t.True("spaced", true)
+}
+
+func  TestOtherName(tt mut crucible.T) {
+	crucible.Equal(mut tt, "area", Area(1, 1), 1)
+}
+
+func Testify(x i64) i64 {
+	return x
+}
+
+func BenchmarkSpaced(bb  mut crucible.B) {
+}
+'''
+
+BAD_SIGNATURES = '''package geo
+
+import "crucible"
+
+func TestNoParam() {
+}
+
+func BenchmarkTakesT(b mut crucible.T) {
+}
+'''
+
 APP = '''package main
 
 import "say"
@@ -87,6 +119,20 @@ class TinTestCommand(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertIn('--- FAIL: TestWrong', out)
         self.assertIn('area: got 4, want 5', out)
+
+    def test_any_parameter_name_and_spacing(self):
+        code, out = tin_test({'geo.tin': LIB, 'geo_test.tin': SPELLINGS})
+        self.assertEqual(code, 0, out)
+        self.assertIn('--- PASS: TestSpaced', out)
+        self.assertIn('--- PASS: TestOtherName', out)
+        self.assertIn('PASS: 2 tests', out)
+
+    def test_wrong_signature_is_an_error(self):
+        code, out = tin_test({'geo.tin': LIB, 'geo_test.tin': TESTS, 'bad_test.tin': BAD_SIGNATURES})
+        self.assertEqual(code, 2, out)
+        self.assertIn('bad_test.tin:5: wrong signature for TestNoParam, must be: func TestNoParam(t mut crucible.T)', out)
+        self.assertIn('bad_test.tin:8: wrong signature for BenchmarkTakesT, must be: func BenchmarkTakesT(b mut crucible.B)', out)
+        self.assertNotIn('--- ', out)
 
     def test_main_package(self):
         code, out = tin_test({'main.tin': APP, 'main_test.tin': APP_TEST})
