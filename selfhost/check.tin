@@ -29,6 +29,7 @@ const S_MUT = 17;   // mut parameter
 const S_REGION = 18;
 const S_TLS = 19;    // per-core global: slot + 1 in the core's context block
 const S_BIG = 20;    // integer constant above 2^63-1 (its bits look negative)
+const S_UNINIT = 21; // global: its startup initializer has not run yet (check_init_order)
 
 const MAX_PARAMS = 8;
 
@@ -171,20 +172,24 @@ fn import_pkg(alias) {
     while i < imps[VEC_LEN] {
         let rec = vec_get(imps, i);
         if streq(vec_get(rec, 0), alias) {
-            let path = vec_get(rec, 1);
-            let name = path;
-            let j = 0;
-            while load8(path + j) != 0 {
-                if load8(path + j) == '/' {
-                    name = path + j + 1;
-                }
-                j = j + 1;
-            }
-            return name;
+            return path_pkg(vec_get(rec, 1));
         }
         i = i + 1;
     }
     return 0;
+}
+
+// path_pkg is the package an import path names: its last element.
+fn path_pkg(path) {
+    let name = path;
+    let j = 0;
+    while load8(path + j) != 0 {
+        if load8(path + j) == '/' {
+            name = path + j + 1;
+        }
+        j = j + 1;
+    }
+    return name;
 }
 
 // ---- types ----
@@ -454,9 +459,10 @@ fn check() {
     core_fn[F_LEGACY] = 1;
     core_fn[F_TYPE] = func_of(core_fn[F_PTYPES], core_fn[F_RTYPES], 0);
     core_stmts = vec_new();
+    let pkgs_done = vec_new();
     i = 0;
-    while i < prog_vars[VEC_LEN] {
-        check_var(vec_get(prog_vars, i));
+    while i < file_pkgs[VEC_LEN] {
+        check_pkg_vars(vec_get(file_pkgs, i), pkgs_done);
         i = i + 1;
     }
     // Function literals are lifted onto prog_fns while bodies are checked.
@@ -508,6 +514,7 @@ fn check() {
         mark_reach(find_fn("rt_bounds_fail"));
         mark_reach(find_fn("rt_bounds_fail2"));
         mark_reach(find_fn("rt_div_fail"));
+        check_init_order();
     } else {
         mark_reach(m[S_FN]);
     }
@@ -838,6 +845,39 @@ fn eval_binary(op, l, r) {
     return l || r;
 }
 
+// check_pkg_vars checks package pkg's globals after those of the packages it imports, so
+// their initializers run first; done lists the packages already checked.
+fn check_pkg_vars(pkg, done) {
+    let i = 0;
+    while i < done[VEC_LEN] {
+        if streq(vec_get(done, i), pkg) {
+            return;
+        }
+        i = i + 1;
+    }
+    vec_push(done, pkg);
+    i = 0;
+    while i < file_pkgs[VEC_LEN] {
+        if streq(vec_get(file_pkgs, i), pkg) {
+            let imps = vec_get(file_imports, i);
+            let j = 0;
+            while j < imps[VEC_LEN] {
+                check_pkg_vars(path_pkg(vec_get(vec_get(imps, j), 1)), done);
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < prog_vars[VEC_LEN] {
+        let v = vec_get(prog_vars, i);
+        if streq(vec_get(file_pkgs, v[D_FILE]), pkg) {
+            check_var(v);
+        }
+        i = i + 1;
+    }
+}
+
 fn check_var(v) {
     set_file(v[D_FILE]);
     ck_legacy = !vec_get(file_v2, ck_file);
@@ -869,7 +909,7 @@ fn check_var(v) {
         }
         return;
     }
-    // Anything else runs at startup, in declaration order, inside __start.
+    // Anything else runs at startup, in the order checked, inside __start.
     start_scope();
     ck_fn = start_fn;
     if s[S_TLS] {
@@ -889,6 +929,7 @@ fn check_var(v) {
     let a = node_new(ST_ASSIGN, v[D_POS]);
     a[AS_TARGET] = target;
     a[AS_VALUE] = init;
+    s[S_UNINIT] = 1;
     if s[S_TLS] {
         vec_push(core_stmts, a);
     } else {
@@ -986,13 +1027,47 @@ fn make_start(main_fn) {
 
 // ---- reachability ----
 
+const F_INITWALK = 27; // walked by check_init_order
+var reach_init;        // the global whose initializer check_init_order walks (0: reachability)
+
 fn mark_reach(f) {
-    if !f || f[F_REACH] {
+    if !f {
         return;
     }
-    f[F_REACH] = 1;
+    if reach_init {
+        if f[F_INITWALK] {
+            return;
+        }
+        f[F_INITWALK] = 1;
+    } else if f[F_REACH] {
+        return;
+    } else {
+        f[F_REACH] = 1;
+    }
     if f[F_BODY] {
         reach_stmts(f[F_BODY][BLK_STMTS]);
+    }
+}
+
+// check_init_order rejects an initializer that can use a global whose initializer has not
+// run yet (it would see nil), directly or through the functions it calls or refers to.
+// Shared globals are initialized in __start, before the per-core ones in __core_init.
+// Each function is walked once, for the first initializer that reaches it: later ones have
+// fewer globals pending.
+fn check_init_order() {
+    walk_inits(init_stmts);
+    walk_inits(core_stmts);
+    reach_init = 0;
+}
+
+fn walk_inits(stmts) {
+    let i = 0;
+    while i < stmts[VEC_LEN] {
+        let a = vec_get(stmts, i);
+        reach_init = a[AS_TARGET][ID_REF];
+        reach_expr(a[AS_VALUE]);
+        reach_init[S_UNINIT] = 0;
+        i = i + 1;
     }
 }
 
@@ -1055,6 +1130,17 @@ fn reach_expr(e) {
         reach_exprs(e[CALL_ARGS]);
     } else if k == EX_FUNCREF {
         mark_reach(e[FR_FN]);
+    } else if k == EX_IDENT {
+        let s = e[ID_REF];
+        if reach_init && s && s[S_UNINIT] {
+            let b = err_begin(e[N_POS]);
+            buf_str(b, "the initializer of '");
+            buf_str(b, reach_init[S_NAME]);
+            buf_str(b, "' uses '");
+            buf_str(b, s[S_NAME]);
+            buf_str(b, "' before it is initialized (globals are initialized in declaration order)");
+            err_end(b);
+        }
     } else if k == EX_UNARY {
         reach_expr(e[UN_X]);
     } else if k == EX_BINARY {
