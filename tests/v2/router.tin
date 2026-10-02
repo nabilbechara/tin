@@ -1,0 +1,359 @@
+package main
+
+import "anvil"
+import "say"
+
+// Routes for precedence, parameters and methods.
+
+func root(q anvil.Req, w mut anvil.Out) {
+	w.Text("root")
+}
+
+func users(q anvil.Req, w mut anvil.Out) {
+	w.Text("users")
+}
+
+func users_slash(q anvil.Req, w mut anvil.Out) {
+	w.Text("users/")
+}
+
+func user_new(q anvil.Req, w mut anvil.Out) {
+	w.Text("new user form")
+}
+
+func user(q anvil.Req, w mut anvil.Out) {
+	id := q.PathParam("id")
+	x := q.Param("x")
+	w.Text("user {id} x={x} pattern={q.Pattern()}")
+}
+
+func user_delete(q anvil.Req, w mut anvil.Out) {
+	id := q.PathParam("id")
+	w.Text("deleted {id}")
+}
+
+func user_post(q anvil.Req, w mut anvil.Out) {
+	id := q.PathParam("id")
+	post := q.PathParam("post")
+	missing := q.PathParam("nope")
+	w.Text("user {id} post {post} missing=[{missing}]")
+}
+
+func create(q anvil.Req, w mut anvil.Out) {
+	b := q.Body()
+	w.Status(201)
+	w.Text("created {b}")
+}
+
+func files(q anvil.Req, w mut anvil.Out) {
+	p := q.PathParam("path")
+	w.Text("file [{p}]")
+}
+
+func star(q anvil.Req, w mut anvil.Out) {
+	p := q.PathParam("*")
+	w.Text("static [{p}]")
+}
+
+func one(q anvil.Req, w mut anvil.Out) {
+	x := q.PathParam("x")
+	w.Text("one [{x}]")
+}
+
+func rest(q anvil.Req, w mut anvil.Out) {
+	r := q.PathParam("r")
+	w.Text("rest [{r}]")
+}
+
+func any_method(q anvil.Req, w mut anvil.Out) {
+	w.Text("any {q.Method}")
+}
+
+func get_only(q anvil.Req, w mut anvil.Out) {
+	w.Text("the GET route")
+}
+
+func head_only(q anvil.Req, w mut anvil.Out) {
+	w.Head("X-Head", "yes")
+	w.Text("the HEAD route")
+}
+
+func propfind(q anvil.Req, w mut anvil.Out) {
+	w.Text("propfind")
+}
+
+func late(q anvil.Req, w mut anvil.Out) {
+	w.Text("added after a Run")
+}
+
+// Middleware: each wraps the rest of the chain in its own marks.
+
+func mw_a(q anvil.Req, w mut anvil.Out, next func(anvil.Req, mut anvil.Out)) {
+	w.Text("a<")
+	next(q, mut w)
+	w.Text(">a")
+}
+
+func mw_b(q anvil.Req, w mut anvil.Out, next func(anvil.Req, mut anvil.Out)) {
+	w.Text("b<")
+	next(q, mut w)
+	w.Text(">b")
+}
+
+func mw_g(q anvil.Req, w mut anvil.Out, next func(anvil.Req, mut anvil.Out)) {
+	w.Text("g<")
+	next(q, mut w)
+	w.Text(">g")
+}
+
+// mw_auth answers 401 itself unless the query has token=ok.
+func mw_auth(q anvil.Req, w mut anvil.Out, next func(anvil.Req, mut anvil.Out)) {
+	if q.Param("token") != "ok" {
+		w.Status(401)
+		w.Text("denied")
+		return
+	}
+	next(q, mut w)
+}
+
+func mw_twice(q anvil.Req, w mut anvil.Out, next func(anvil.Req, mut anvil.Out)) {
+	next(q, mut w)
+	next(q, mut w)
+}
+
+func mw_user(q anvil.Req, w mut anvil.Out, next func(anvil.Req, mut anvil.Out)) {
+	w.SetValue("user", "ada")
+	w.SetValue("role", "admin")
+	w.SetValue("user", "grace")
+	next(q, mut w)
+}
+
+func x(q anvil.Req, w mut anvil.Out) {
+	w.Text("x")
+}
+
+func item(q anvil.Req, w mut anvil.Out) {
+	id := q.PathParam("id")
+	w.Text("item {id}")
+}
+
+func api_index(q anvil.Req, w mut anvil.Out) {
+	w.Text("api index")
+}
+
+func api_missing(q anvil.Req, w mut anvil.Out) {
+	org := q.PathParam("org")
+	w.Text("api 404 {q.Path} org=[{org}]")
+}
+
+func secret(q anvil.Req, w mut anvil.Out) {
+	w.Text("secret")
+}
+
+func repo(q anvil.Req, w mut anvil.Out) {
+	org := q.PathParam("org")
+	name := q.PathParam("repo")
+	w.Text("org {org} repo {name} pattern={q.Pattern()}")
+}
+
+func me(q anvil.Req, w mut anvil.Out) {
+	u := w.Value("user")
+	role := w.Value("role")
+	none := w.Value("none")
+	w.Text("me {u} {role} [{none}]")
+}
+
+func custom_404(q anvil.Req, w mut anvil.Out) {
+	w.Json()
+	w.Text("{{\"missing\":\"{q.Path}\",\"status\":{w.Code()}}}")
+}
+
+func custom_405(q anvil.Req, w mut anvil.Out) {
+	allow := w.Header("Allow")
+	w.Text("use one of {allow}")
+}
+
+func spa(q anvil.Req, w mut anvil.Out) {
+	w.Status(200)
+	w.Text("index.html for {q.Path}")
+}
+
+func show(label str, r anvil.Router, method str, target str) {
+	w := r.Run(method, target, "")
+	report(label, method, target, w)
+}
+
+func report(label str, method str, target str, w anvil.Out) {
+	allow := w.Header("allow")
+	if allow != "" {
+		allow = " Allow: " + allow
+	}
+	say.Line("{label} {method} {target} -> {w.Code()}{allow} {str(w.Body)}")
+}
+
+func check(label str, r anvil.Router) {
+	err := r.Check()
+	say.Line(label, "->", err)
+}
+
+func h(q anvil.Req, w mut anvil.Out) {
+	w.Text("h")
+}
+
+func main() {
+	r := anvil.NewRouter()
+	r.Get("/", root)
+	r.Get("/users", users)
+	r.Get("/users/", users_slash)
+	r.Get("/users/new", user_new)
+	r.Get(`/users/{id}`, user)
+	r.Delete(`/users/{id}`, user_delete)
+	r.Get(`/users/{id}/posts/{post}`, user_post)
+	r.Post("/users", create)
+	r.Get(`/files/{path...}`, files)
+	r.Get("/static/*", star)
+	r.Get(`/a/{x}`, one)
+	r.Get(`/a/{r...}`, rest)
+	r.Any("/anything", any_method)
+	r.Get("/anything", get_only)
+	r.Get("/head", get_only)
+	r.Head("/head", head_only)
+	r.Handle("PROPFIND", "/dav", propfind)
+	for _, t := range []str{"/", "/users", "/users/", "/users/new", "/users/42", "/users/42?x=1", "/users/a%20b%2Fc", "/users/a+b",
+		"/users/new/posts/3", "/users/7/posts/9", "/files/a/b/c.txt", "/files/", "/files", "/static/css/x.css",
+		"/a/b", "/a/b/c", "/a/", "/anything", "/head", "/nope", "/users/42/extra", "users", ""} {
+		show("route", r, "GET", t)
+	}
+	show("route", r, "DELETE", "/users/42")
+	show("route", r, "DELETE", "/users/new")
+	show("route", r, "PUT", "/users/42")
+	show("route", r, "POST", "/users/new")
+	show("route", r, "OPTIONS", "/users/7/posts/9")
+	show("route", r, "HEAD", "/users/42")
+	show("route", r, "HEAD", "/head")
+	show("route", r, "POST", "/anything")
+	show("route", r, "BREW", "/anything")
+	show("route", r, "PROPFIND", "/dav")
+	show("route", r, "GET", "/dav")
+	show("route", r, "BREW", "/users/42")
+	w := r.Run("POST", "/users", "ada")
+	report("route", "POST", "/users", w)
+	say.Line("route content-type", w.Header("Content-Type"), "| head", r.Run("HEAD", "/head", "").Header("x-head"))
+	say.Line("match", r.Match("GET", "/users/42"), r.Match("DELETE", "/users/new"), r.Match("GET", "/files/x/y"),
+		"[" + r.Match("PUT", "/users/42") + "]", "[" + r.Match("GET", "/nope") + "]")
+	r.Get("/late", late)
+	show("route", r, "GET", "/late")
+
+	m := anvil.NewRouter()
+	m.Use(mw_a)
+	m.Get("/x", x)
+	m.Route("/api", func(g mut anvil.Router) {
+		g.Use(mw_g)
+		g.Get("", api_index)
+		g.Get(`/items/{id}`, item)
+		g.NotFound(api_missing)
+	})
+	m.Route(`/orgs/{org}`, func(g mut anvil.Router) {
+		g.Get(`/repos/{repo}`, repo)
+		g.NotFound(api_missing)
+	})
+	admin := anvil.NewRouter()
+	admin.Use(mw_auth)
+	admin.Get("/secret", secret)
+	m.Mount("/admin", admin)
+	m.Route("/twice", func(g mut anvil.Router) {
+		g.Use(mw_twice)
+		g.Get("", x)
+	})
+	m.Route("/me", func(g mut anvil.Router) {
+		g.Use(mw_user)
+		g.Get("", me)
+	})
+	// Use applies to every route of its router, whenever it is called.
+	m.Use(mw_b)
+	for _, t := range []str{"/x", "/api", "/api/", "/api/items/5", "/api/nope", "/orgs/acme/repos/tin", "/orgs/acme/nope",
+		"/admin/secret", "/admin/secret?token=ok", "/admin/nope", "/twice", "/me", "/nope"} {
+		show("chain", m, "GET", t)
+	}
+	show("chain", m, "POST", "/api/items/5")
+	show("chain", m, "POST", "/x")
+
+	c := anvil.NewRouter()
+	c.Get("/only", get_only)
+	c.Put("/only", get_only)
+	c.Patch("/only", get_only)
+	c.Options("/only", get_only)
+	c.Post("/only", get_only)
+	c.NotFound(custom_404)
+	c.MethodNotAllowed(custom_405)
+	show("custom", c, "GET", "/missing")
+	show("custom", c, "DELETE", "/only")
+	s := anvil.NewRouter()
+	s.Get(`/api/{rest...}`, get_only)
+	s.NotFound(spa)
+	show("custom", s, "GET", "/app/settings")
+
+	check("check ok", r)
+	check("check ok", m)
+	e1 := anvil.NewRouter()
+	e1.Get(`/users/{id}`, h)
+	e1.Post(`/users/{uid}`, h)
+	check("check different methods", e1)
+	e1.Get(`/users/{uid}`, h)
+	check("check duplicate", e1)
+	e2 := anvil.NewRouter()
+	e2.Any("/a", h)
+	e2.Any("/a", h)
+	check("check duplicate any", e2)
+	e3 := anvil.NewRouter()
+	e3.Get("/files/*", h)
+	e3.Get(`/files/{path...}`, h)
+	check("check duplicate catch-all", e3)
+	for _, p := range []str{"users", "", `/a/{}`, `/a/{x...}/b`, "/a/*/b", `/a/x{y}`, `/a/{x}/{x}`, `/a/{b-c}`, `/a/{...}`, `/a/}`} {
+		e := anvil.NewRouter()
+		e.Get(p, h)
+		check("check pattern", e)
+	}
+	for _, method := range []str{"GET POST", "", "BREW", "M(1)"} {
+		e := anvil.NewRouter()
+		e.Handle(method, "/x", h)
+		check("check method", e)
+	}
+	for _, prefix := range []str{"/api/", "api", "/", "", `/x/{rest...}`, "/x/*", `/{}`} {
+		e := anvil.NewRouter()
+		sub := anvil.NewRouter()
+		sub.Get("/y", h)
+		e.Mount(prefix, sub)
+		check("check prefix", e)
+	}
+	e4 := anvil.NewRouter()
+	e5 := anvil.NewRouter()
+	e4.Mount("/five", e5)
+	e5.Mount("/four", e4)
+	check("check mount cycle", e4)
+	e6 := anvil.NewRouter()
+	e6.Mount("/x", anvil.NewRouter())
+	e6.Mount("/x", anvil.NewRouter())
+	check("check same prefix", e6)
+	e7 := anvil.NewRouter()
+	e7.Mount(`/u/{a}`, anvil.NewRouter())
+	e7.Mount(`/u/{b}`, anvil.NewRouter())
+	check("check same prefix", e7)
+	e8 := anvil.NewRouter()
+	e8.Route("/api", func(g mut anvil.Router) {
+		g.Get("users", h)
+	})
+	check("check mounted pattern", e8)
+	e9 := anvil.NewRouter()
+	shared := anvil.NewRouter()
+	shared.Get(`/items/{id}`, item)
+	e9.Mount("/v1", shared)
+	e9.Mount("/v2", shared)
+	check("check one router at two prefixes", e9)
+	show("route", e9, "GET", "/v2/items/3")
+	bad := anvil.NewRouter()
+	bad.Get(`/a/{x}`, h)
+	bad.Get(`/a/{y}`, h)
+	err := bad.Serve("127.0.0.1:0")
+	say.Line("serve ->", err)
+}

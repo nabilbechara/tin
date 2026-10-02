@@ -13,7 +13,7 @@ shared mutable state between threads.
 - **No GC, no pauses**: request-scoped bump pools plus a long-lived per-core heap, with a
   compile-time check that request memory never escapes without `keep()`.
 - **Thread per core, share nothing**: per-core globals, `hearth` cores, `relay` messages,
-  and an HTTP server (`anvil`) with one kqueue/epoll event loop per core.
+  and an HTTP server (`anvil`) with one kqueue/epoll event loop per core and a router.
 - **Strict**: sized integers with no implicit conversions, non-nil references, `?T`
   optionals, faults that must be handled (`try`), mandatory bounds checks (removed when
   proven safe), `defer`, generics by monomorphization.
@@ -29,18 +29,21 @@ type Message struct {
 	message str
 }
 
-func handle(q anvil.Req, w mut anvil.Out) {
-	if q.Path == "/json" {
-		w.Json()
-		argo.Put(mut w.Body, Message{message: "Hello, World!"})
-		return
-	}
-	w.Status(404)
-	w.Text("not found")
+func hello(q anvil.Req, w mut anvil.Out) {
+	w.Json()
+	argo.Put(mut w.Body, Message{message: "Hello, World!"})
+}
+
+func user(q anvil.Req, w mut anvil.Out) {
+	id := q.PathParam("id")
+	w.Text("user {id}")
 }
 
 func main() {
-	err := anvil.Serve(":8080", handle)
+	r := anvil.NewRouter()
+	r.Get("/json", hello)
+	r.Get(`/users/{id}`, user) // a raw string: in "..." the {id} would interpolate
+	err := r.Serve(":8080")
 	say.Line("server:", err)
 }
 ```
@@ -90,20 +93,22 @@ CI and the issue-to-regression workflow: [docs/CI.md](docs/CI.md).
 |---|---|---|---|---|
 | say | formatting, printing | | quarry | files, env, process |
 | argo | JSON (generated per type) | | trail | paths |
-| anvil | HTTP/1.1 server | | lever | flags |
+| anvil | HTTP/1.1 server, router | | lever | flags |
 | hearth | cores | | tide | time |
 | relay | messages between cores | | dice | random numbers |
 | wire | TCP, HTTP client | | sift | sorting, searching |
 | twine | strings | | cairn | heaps, deques, sets, LRU |
 | glyph | UTF-8 | | stamp | CRC-32, FNV, xxHash64 |
-| mint | number/string conversion | | seal | SHA-256, HMAC, base64, hex |
+| mint | number/string conversion | | seal | SHA-256, HMAC, PBKDF2, base64, hex |
 | gauge | math | | herald | logging |
 | ore | byte slices | | crucible | test checks, benchmarks |
 | flume | buffered I/O | | redis | Redis client (pipelined) |
 | websocket | WebSocket server and client | | mysql | MySQL client (pooled) |
+| postgres | PostgreSQL client (pooled, SCRAM) | | | |
 
-Each package is tested in `tests/v2/` and checked against an equivalent Go program
-(`bench/ref/`); see [notes/stdlib_verified.md](notes/stdlib_verified.md).
+Language and library checks live in `tests/v2/`, and protocol client checks in
+`tools/ci/`. Core library behavior is also checked against Go equivalents in
+`bench/ref/`; see [notes/stdlib_verified.md](notes/stdlib_verified.md).
 
 ## Performance
 
@@ -187,7 +192,7 @@ Targets: darwin-arm64, linux-arm64 and linux-amd64, each tested natively in CI, 
 compiler self-hosts on all three; see [docs/PORTING.md](docs/PORTING.md).
 
 v0.4: each anvil request runs in its own task with its own stack and pool, so a handler
-that waits (`tide.Wait`, `wire`, `quarry` files, `redis`, `mysql`, `websocket`) lets its
+that waits (`tide.Wait`, `wire`, `quarry` files, `redis`, `mysql`, `postgres`, `websocket`) lets its
 core serve other requests meanwhile. Sockets are non-blocking; DNS and file I/O go to
 helper threads; every request has a deadline. Statements and commands are `query`
 values, so a value is always sent apart from the text. See

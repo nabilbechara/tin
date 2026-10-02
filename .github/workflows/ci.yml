@@ -61,6 +61,8 @@ jobs:
           TINC="$PWD/bin/tinc" TINC_ASM=1 go test -count=1 -timeout=3m ./bootstrap
       - name: Request tasks (waits overlap, deadlines, pipelined order)
         run: python3 tools/ci/task_check.py
+      - name: Router (parameters, middleware, 404/405 and waits under concurrent requests)
+        run: python3 tools/ci/router_check.py
       - name: Runtime lifetimes (formatting, helper deadlines, WebSocket memory)
         run: python3 tools/ci/lifetime_check.py
       - name: Redis client (batching, deadlines, reconnects, AUTH)
@@ -76,6 +78,15 @@ jobs:
           sudo systemctl start mysql.service
           mysql -uroot -proot -e "CREATE DATABASE IF NOT EXISTS tin; CREATE USER IF NOT EXISTS 'tin'@'%' IDENTIFIED WITH caching_sha2_password BY 'tinpass'; GRANT ALL ON tin.* TO 'tin'@'%'; FLUSH PRIVILEGES;"
           MYSQL_ADDR=127.0.0.1:3306 MYSQL_USER=tin MYSQL_PASSWORD=tinpass MYSQL_DATABASE=tin python3 tools/ci/mysql_check.py
+      - name: PostgreSQL client (SCRAM, binary parameters, pool, transactions, reconnects)
+        run: python3 tools/ci/postgres_check.py
+      - name: PostgreSQL client against the runner's PostgreSQL (Linux x86-64)
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        run: |
+          sudo systemctl start postgresql.service
+          sudo -u postgres psql -v ON_ERROR_STOP=1 -c "SET password_encryption = 'scram-sha-256'; CREATE ROLE tin LOGIN PASSWORD 'tinpass';"
+          sudo -u postgres createdb -O tin tin
+          POSTGRES_ADDR=127.0.0.1:5432 POSTGRES_USER=tin POSTGRES_PASSWORD=tinpass POSTGRES_DATABASE=tin python3 tools/ci/postgres_check.py
       - name: HTTP correctness, RSS stability and shutdown (Linux)
         if: runner.os == 'Linux'
         run: python3 tools/ci/http_check.py

@@ -299,6 +299,17 @@ fn chk_ident(e, want) {
     return use_sym(e, s, want);
 }
 
+// runtime_use rejects user code naming a function only the standard library may use: a C
+// extern or one of the runtime's own (the trusted files outside any package).
+fn runtime_use(pos, f, name) {
+    if ck_legacy || ck_trusted {
+        return;
+    }
+    if f[F_EXTERN] || (vec_get(file_trusted, f[F_FILE]) && load8(vec_get(file_pkgs, f[F_FILE])) == 0) {
+        err_quoted(pos, "", name, " is internal to the runtime");
+    }
+}
+
 // use_sym turns a resolved name into a variable read, a constant or a function value.
 fn use_sym(e, s, want) {
     let k = s[S_KIND];
@@ -308,6 +319,7 @@ fn use_sym(e, s, want) {
             return ty_int;
         }
         let f = s[S_FN];
+        runtime_use(e[N_POS], f, e[ID_NAME]);
         e[N_KIND] = EX_FUNCREF;
         e[FR_FN] = f;
         return f[F_TYPE];
@@ -1668,6 +1680,7 @@ fn chk_call(e, want) {
     if name {
         let s = lookup_name(name);
         if s && s[S_KIND] == SYM_FUNC {
+            runtime_use(e[N_POS], s[S_FN], name);
             return direct_call(e, s[S_FN]);
         }
         if s && (s[S_KIND] == SYM_LOCAL || s[S_KIND] == SYM_GLOBAL) && kind_of(s[S_TYPE]) == K_FUNC {
@@ -2661,7 +2674,7 @@ fn argo_value(pos, body, p, t) {
         return argo_rd(pos, p, "argo.rbool", ty_bool);
     }
     if is_f32(t) {
-        return mk_conv(pos, argo_rd(pos, p, "argo.rfloat", ty_float), CV_ROUND32, ty_f32);
+        return argo_rd(pos, p, "argo.rfloat32", ty_f32);
     }
     if is_float_t(t) {
         return argo_rd(pos, p, "argo.rfloat", ty_float);
@@ -3020,6 +3033,7 @@ fn is_say_func(m) {
 fn say_arg(a, prefix) {
     let pos = a[N_POS];
     let t = default_type(chk(a, 0));
+    check_value(pos, t);
     if is_untyped(a[N_TYPE]) {
         reconvert(a, t);
     }
@@ -3470,6 +3484,12 @@ fn chk_query(e, want) {
     return chk_kind(e, want);
 }
 
+// interp_name_known reports whether a name inside {...} in a string resolves: chk_ident
+// would not report it undefined.
+fn interp_name_known(name) {
+    return streq(name, "true") || streq(name, "false") || lookup_name(name) || import_pkg(name);
+}
+
 fn chk_interp(e, want) {
     let pos = e[N_POS];
     let parts = e[INTERP_PARTS];
@@ -3492,6 +3512,17 @@ fn chk_interp(e, want) {
         }
         if i < vals[VEC_LEN] {
             let a = vec_get(vals, i);
+            if a[N_KIND] == EX_IDENT && !interp_name_known(a[ID_NAME]) {
+                // Often meant as literal text, like a route pattern's {id}.
+                let u = err_begin(a[N_POS]);
+                buf_str(u, "undefined: ");
+                buf_str(u, a[ID_NAME]);
+                buf_str(u, " (in a string, {");
+                buf_str(u, a[ID_NAME]);
+                buf_str(u, "} is a value: write {{ for a brace, or use a `raw` string)");
+                err_end(u);
+                replace_node(a, mk_int(a[N_POS], 0, 0));
+            }
             let t = chk(a, 0);
             let spec = vec_get(specs, i);
             buf_byte(f, '%');

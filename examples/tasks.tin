@@ -12,65 +12,70 @@ import "wire"
 //   GET /proxy?ms=N  calls this same server's /slow with wire (non-blocking inside a task)
 //   GET /file        writes and reads a file (on a helper thread)
 //   GET /fast        answers at once
-func handle(q anvil.Req, w mut anvil.Out) {
-	if q.Path == "/slow" {
-		ms := mint.Atoi(q.Param("ms")) catch _ { 100 }
-		t0 := tide.Now()
-		err := tide.Wait(ms * tide.Millisecond)
-		if err != nil {
-			w.Status(504)
-			w.Text("gave up: {err}")
-			return
-		}
-		w.Text("slept {tide.Milliseconds(tide.Since(t0))} ms")
+func slow(q anvil.Req, w mut anvil.Out) {
+	ms := mint.Atoi(q.Param("ms")) catch _ { 100 }
+	t0 := tide.Now()
+	err := tide.Wait(ms * tide.Millisecond)
+	if err != nil {
+		w.Status(504)
+		w.Text("gave up: {err}")
 		return
 	}
-	if q.Path == "/proxy" {
-		port := q.Param("port")
-		if port == "" {
-			port = quarry.Getenv("PORT")
-		}
-		if port == "" {
-			port = "9183"
-		}
-		host := q.Param("host")
-		if host == "" {
-			host = "127.0.0.1"
-		}
-		ms := q.Param("ms")
-		r := wire.Get("http://{host}:{port}/slow?ms={ms}") catch err {
-			w.Status(502)
-			w.Text("upstream: {err}")
-			return
-		}
-		w.Text("via proxy: {r.Body}")
+	w.Text("slept {tide.Milliseconds(tide.Since(t0))} ms")
+}
+
+func proxy(q anvil.Req, w mut anvil.Out) {
+	port := q.Param("port")
+	if port == "" {
+		port = quarry.Getenv("PORT")
+	}
+	if port == "" {
+		port = "9183"
+	}
+	host := q.Param("host")
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	ms := q.Param("ms")
+	r := wire.Get("http://{host}:{port}/slow?ms={ms}") catch err {
+		w.Status(502)
+		w.Text("upstream: {err}")
 		return
 	}
-	if q.Path == "/file" {
-		n := q.Param("n")
-		path := "/tmp/tin-test-tasks-{n}.txt"
-		quarry.WriteFile(path, "hello from a helper thread") catch err {
-			w.Status(500)
-			w.Text("write: {err}")
-			return
-		}
-		data := quarry.ReadFile(path) catch err {
-			w.Status(500)
-			w.Text("read: {err}")
-			return
-		}
-		w.Text("file: {data}")
+	w.Text("via proxy: {r.Body}")
+}
+
+func file(q anvil.Req, w mut anvil.Out) {
+	n := q.Param("n")
+	path := "/tmp/tin-test-tasks-{n}.txt"
+	quarry.WriteFile(path, "hello from a helper thread") catch err {
+		w.Status(500)
+		w.Text("write: {err}")
 		return
 	}
-	if q.Path == "/fast" {
-		w.Text("fast")
+	data := quarry.ReadFile(path) catch err {
+		w.Status(500)
+		w.Text("read: {err}")
 		return
 	}
-	w.Status(404)
+	w.Text("file: {data}")
+}
+
+func fast(q anvil.Req, w mut anvil.Out) {
+	w.Text("fast")
+}
+
+func no_route(q anvil.Req, w mut anvil.Out) {
 	w.Text("no route {q.Path}")
 }
 
 func main() {
-	err := anvil.Serve(":9183", handle)
+	r := anvil.NewRouter()
+	r.Get("/slow", slow)
+	r.Get("/proxy", proxy)
+	r.Get("/file", file)
+	r.Get("/fast", fast)
+	r.NotFound(no_route)
+	err := r.Serve(":9183")
 	say.Line("server:", err)
 }

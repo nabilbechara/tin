@@ -8,16 +8,45 @@
 //
 //	func handle(q anvil.Req, w mut anvil.Out) {
 //		w.Type("application/json")
-//		argo.Put(w.Body, Msg{message: "hi"})
+//		argo.Put(mut w.Body, Msg{message: "hi"})
 //	}
 //	func main() {
 //		err := anvil.Serve(":8080", handle)
+//		say.Line("server:", err)
+//	}
+//
+// A Router picks the handler by method and path pattern, and runs middleware around it.
+// Patterns match whole segments: "users" itself, {id} any one non-empty segment, and a
+// last {path...} or * the rest of the path. Static segments win over {name}, and {name}
+// over the rest, segment by segment, whatever the order of registration. A path whose
+// routes take other methods gets 405 with Allow, any other miss 404; HEAD falls back to
+// GET. A trailing slash is part of the path: /users/ and /users are different routes.
+// Write patterns with {...} as raw strings: in "..." the braces would interpolate.
+//
+//	func user(q anvil.Req, w mut anvil.Out) {
+//		id := q.PathParam("id")
+//		w.Text("user {id}")
+//	}
+//	func logged(q anvil.Req, w mut anvil.Out, next func(anvil.Req, mut anvil.Out)) {
+//		next(q, mut w)
+//		say.Line(q.Method, q.Pattern(), w.Code())
+//	}
+//	func main() {
+//		r := anvil.NewRouter()
+//		r.Use(logged)
+//		r.Get(`/users/{id}`, user)
+//		r.Route("/admin", func(g mut anvil.Router) {
+//			g.Use(auth)
+//			g.Delete(`/users/{id}`, remove)
+//		})
+//		err := r.Serve(":8080")
 //		say.Line("server:", err)
 //	}
 package anvil
 
 import "hearth"
 import "relay"
+import "say"
 
 extern func socket(domain i64, typ i64, proto i64) i64
 extern func setsockopt(fd i64, level i64, name i64, val i64, n i64) i64
@@ -46,6 +75,7 @@ type Req struct {
 	hn     i64
 	bp     i64
 	bn     i64
+	ep     i64 // the Router endpoint that matched (an rend), for PathParam and Pattern
 }
 
 // Out is the response being built. Body is the response body; the status defaults to
@@ -56,6 +86,9 @@ type Out struct {
 	ctype str
 	extra []u8
 	own   []u8
+	ep    i64 // the Router endpoint whose middleware chain is running (an rend)
+	ci    i64 // the next middleware of that chain
+	vals  i64 // SetValue's keys and values: a []str made on first use, or 0
 }
 
 const scrSize = 262144
@@ -84,6 +117,7 @@ shared var gListen i64
 shared var gIP i64
 shared var gPort i64
 shared var gHandler func(Req, mut Out)
+shared var gRoutes i64 // a Router's compiled table (an rtable in core 0's ingot heap, read by every core), or 0
 shared var gCores i64
 shared var gRelay func(i64, str)
 shared var gRelayOn bool
@@ -148,16 +182,29 @@ func errno() i64 {
 // Serve listens on addr (":8080", "127.0.0.1:8080") and serves h on every core. It
 // returns only if the server cannot start. TIN_CORES overrides the number of cores.
 func Serve(addr str, h func(Req, mut Out)) ! {
+	return try ServeN(addr, serve_cores(), h)
+}
+
+// ServeN is Serve on exactly n cores.
+func ServeN(addr str, n i64, h func(Req, mut Out)) ! {
+	gHandler = h
+	gRoutes = 0
+	return try serve_on(addr, n)
+}
+
+// serve_cores is how many cores Serve uses: hearth.Cores(), or TIN_CORES when set.
+func serve_cores() i64 {
 	n := hearth.Cores()
 	env := getenv(cast(i64, "TIN_CORES") + 8)
 	if env != 0 && atoi(env)&0xffffffff > 0 {
 		n = atoi(env) & 0xffffffff
 	}
-	return try ServeN(addr, n, h)
+	return n
 }
 
-// ServeN is Serve on exactly n cores.
-func ServeN(addr str, n i64, h func(Req, mut Out)) ! {
+// serve_on listens on addr and runs the event loops of n cores, serving gHandler (or the
+// router in gRoutes); it returns only if the server cannot start.
+func serve_on(addr str, n i64) ! {
 	port := 0
 	ip := 0
 	colon := -1
@@ -211,7 +258,6 @@ func ServeN(addr str, n i64, h func(Req, mut Out)) ! {
 	signal(13, 1)
 	gListen = fd
 	gSpare = c32(open(cast(i64, "/dev/null")+8, 0))
-	gHandler = h
 	if n < 1 {
 		n = 1
 	}
@@ -955,7 +1001,11 @@ func run_request(c i64) {
 	body := make([]u8, 0, 1024)
 	w := Out{Body: body, code: 200, ctype: "text/plain; charset=utf-8", extra: make([]u8, 0, 256), own: body}
 	rt_task_current()[tUser] = cast(i64, q)
-	gHandler(q, mut w)
+	if gRoutes != 0 {
+		dispatch(cast(rtable, gRoutes), mut q, mut w)
+	} else {
+		gHandler(q, mut w)
+	}
 	if c[cHijack] == 0 {
 		respond_out(w, hd)
 	}
@@ -1364,6 +1414,35 @@ func (q Req) Param(name str) str {
 	return ""
 }
 
+// PathParam returns path parameter name of the Router route that matched ({name}, {name...},
+// or "*" for a last *), %-decoded, or "".
+func (q Req) PathParam(name str) str {
+	if q.ep == 0 {
+		return ""
+	}
+	e := cast(rend, q.ep)
+	for i := 0; i < len(e.names); i++ {
+		if e.names[i] == name {
+			a, b := seg_span(q.Path, e.segs[i])
+			if e.rest && i == len(e.names)-1 {
+				b = len(q.Path)
+			}
+			return path_unescape(q.Path, a, b)
+		}
+	}
+	return ""
+}
+
+// Pattern returns the pattern of the Router route serving the request ("/users/{id}"), or ""
+// (no Router, or a 404 or 405 answer).
+func (q Req) Pattern() str {
+	if q.ep == 0 {
+		return ""
+	}
+	e := cast(rend, q.ep)
+	return e.pattern
+}
+
 func hexval(c u8) i64 {
 	if c >= '0' && c <= '9' {
 		return i64(c - '0')
@@ -1416,9 +1495,84 @@ func (w mut Out) Text(s str) {
 	w.Body = append(w.Body, s...)
 }
 
-// Json sets the JSON content type; the body is then written with argo.Put(w.Body, v).
+// Json sets the JSON content type; the body is then written with argo.Put(mut w.Body, v).
 func (w mut Out) Json() {
 	w.ctype = "application/json"
+}
+
+// Code returns the response status set so far (200 unless Status changed it).
+func (w Out) Code() i64 {
+	return w.code
+}
+
+// Header returns response header k as set so far (Type sets Content-Type, Head the rest), or "".
+func (w Out) Header(k str) str {
+	if len(k) == 12 && name_is(cast(i64, k)+8, 12, "content-type") {
+		return w.ctype
+	}
+	e := w.extra
+	for i := 0; i < len(e); {
+		j := i
+		for j < len(e) && e[j] != '\n' {
+			j++
+		}
+		c := i
+		for c < j && e[c] != ':' {
+			c++
+		}
+		if c-i == len(k) && c < j {
+			same := true
+			for x := 0; x < len(k); x++ {
+				if lower(e[i+x]) != lower(k[x]) {
+					same = false
+					break
+				}
+			}
+			if same {
+				v := c + 1
+				for v < j && e[v] == ' ' {
+					v++
+				}
+				ve := j
+				if ve > v && e[ve-1] == '\r' {
+					ve--
+				}
+				return str(e[v:ve])
+			}
+		}
+		i = j + 1
+	}
+	return ""
+}
+
+// SetValue stores value under key for the rest of the request: middleware hand data (a user
+// id, a request id) to the handlers after them this way. Value reads it back.
+func (w mut Out) SetValue(key str, value str) {
+	if w.vals == 0 {
+		w.vals = cast(i64, make([]str, 0, 4))
+	}
+	v := cast([]str, w.vals)
+	for i := 0; i+1 < len(v); i += 2 {
+		if v[i] == key {
+			v[i+1] = value
+			return
+		}
+	}
+	v = append(v, key, value)
+}
+
+// Value returns what SetValue stored under key in this request, or "".
+func (w Out) Value(key str) str {
+	if w.vals == 0 {
+		return ""
+	}
+	v := cast([]str, w.vals)
+	for i := 0; i+1 < len(v); i += 2 {
+		if v[i] == key {
+			return v[i+1]
+		}
+	}
+	return ""
 }
 
 // OnRelay makes every core run h(from, msg) for each relay message it receives (call
@@ -1432,4 +1586,919 @@ func OnRelay(h func(i64, str)) {
 func OnTick(ms i64, h func(i64)) {
 	gTick = h
 	gTickMs = ms
+}
+
+// ---- Router ----
+
+// Router sends each request to the handler routed for its method and path pattern, through
+// the middleware added with Use. Build it in main (or in a function a global's initializer
+// calls), then Serve it, or try requests on it with Run.
+type Router struct {
+	routes []route
+	mws    []func(Req, mut Out, func(Req, mut Out))
+	mounts []mount
+	nf     func(Req, mut Out)
+	mna    func(Req, mut Out)
+	ownNF  bool
+	ownMNA bool
+}
+
+// A route as added: its method (unless all), its pattern within its router, its handler.
+type route struct {
+	method  str
+	all     bool
+	pattern str
+	h       func(Req, mut Out)
+}
+
+// A router mounted at prefix.
+type mount struct {
+	prefix str
+	sub    Router
+}
+
+// A compiled router (Serve's lives in core 0's ingot heap and every core reads it): the
+// trie of every route, the endpoints, one scope per router for its 404 and 405 answers,
+// and the method names by code.
+type rtable struct {
+	nodes   []rnode
+	ends    []rend
+	scopes  []rscope
+	methods []str
+}
+
+// A trie node: one per distinct pattern prefix. Node 0 is the root, so 0 is also "none".
+type rnode struct {
+	keys  []str // static children's segments
+	kids  []i64 // their nodes
+	slots []i64 // when there are many keys: a hash table of key index + 1 (0: empty)
+	param i64   // the {name} child
+	rest  i64   // the {name...} child
+	codes []i64 // the methods of the routes ending here
+	eps   []i64 // their endpoints
+	mask  i64   // one bit per method in codes
+	all   i64   // the Any route ending here: its endpoint + 1, or 0
+}
+
+// An endpoint: the handler and middleware chain a route (or a 404 or 405 answer) runs.
+type rend struct {
+	h       func(Req, mut Out)
+	mws     []func(Req, mut Out, func(Req, mut Out))
+	pattern str   // the whole pattern; "" for a 404 or 405 answer
+	names   []str // parameter names, in order
+	segs    []i64 // the path segment each one reads
+	rest    bool  // the last parameter reads the rest of the path
+}
+
+// A router's prefix and its 404 and 405 answers; a miss gets the deepest scope over its path.
+type rscope struct {
+	kinds []i64
+	texts []str
+	nf    i64
+	mna   i64
+}
+
+// A parsed pattern: each segment's kind, and its text (the static text or the parameter name).
+type ppat struct {
+	kinds []i64
+	texts []str
+}
+
+const segStatic = 0
+const segParam = 1
+const segRest = 2
+
+const mGet = 0
+const mHead = 1
+const nKnown = 9      // GET HEAD POST PUT PATCH DELETE OPTIONS CONNECT TRACE: codes 0 to 8
+const maxMethods = 63 // method codes are bits of a mask
+const manyKeys = 8    // a node with more static children hashes them
+const maxNest = 32    // how deep routers may be mounted in each other
+const tchars = "!#$%&'*+-.^_`|~"
+
+var routerGen i64 // per core: counts router changes, so Run's compiled table is never stale
+var runRouter i64 // per core: the router Run and Match compiled last, its table and when
+var runTable i64
+var runGen i64
+
+// NewRouter makes an empty router: every request gets 404 until routes are added.
+func NewRouter() Router {
+	routerGen++
+	return Router{nf: not_found, mna: not_allowed, ownNF: false, ownMNA: false}
+}
+
+// Get routes GET requests for pattern to h, and HEAD requests unless Head routes them.
+func (r mut Router) Get(pattern str, h func(Req, mut Out)) {
+	r.Handle("GET", pattern, h)
+}
+
+// Post routes POST requests for pattern to h.
+func (r mut Router) Post(pattern str, h func(Req, mut Out)) {
+	r.Handle("POST", pattern, h)
+}
+
+// Put routes PUT requests for pattern to h.
+func (r mut Router) Put(pattern str, h func(Req, mut Out)) {
+	r.Handle("PUT", pattern, h)
+}
+
+// Patch routes PATCH requests for pattern to h.
+func (r mut Router) Patch(pattern str, h func(Req, mut Out)) {
+	r.Handle("PATCH", pattern, h)
+}
+
+// Delete routes DELETE requests for pattern to h.
+func (r mut Router) Delete(pattern str, h func(Req, mut Out)) {
+	r.Handle("DELETE", pattern, h)
+}
+
+// Head routes HEAD requests for pattern to h (without it, they go to the GET route).
+func (r mut Router) Head(pattern str, h func(Req, mut Out)) {
+	r.Handle("HEAD", pattern, h)
+}
+
+// Options routes OPTIONS requests for pattern to h.
+func (r mut Router) Options(pattern str, h func(Req, mut Out)) {
+	r.Handle("OPTIONS", pattern, h)
+}
+
+// Handle routes requests with method (any HTTP method name, like "PROPFIND") for pattern to h.
+func (r mut Router) Handle(method str, pattern str, h func(Req, mut Out)) {
+	routerGen++
+	r.routes = append(r.routes, route{method: method, all: false, pattern: pattern, h: h})
+}
+
+// Any routes requests for pattern with every method to h; a route for the request's own
+// method on the same pattern wins over it.
+func (r mut Router) Any(pattern str, h func(Req, mut Out)) {
+	routerGen++
+	r.routes = append(r.routes, route{method: "", all: true, pattern: pattern, h: h})
+}
+
+// Use adds middleware mw to r. Middleware run in the order added, around every route of r
+// and of the routers mounted in it, and around their 404 and 405 answers. Each gets next,
+// the rest of the chain, and decides whether and when to call it.
+func (r mut Router) Use(mw func(Req, mut Out, func(Req, mut Out))) {
+	routerGen++
+	r.mws = append(r.mws, mw)
+}
+
+// Route groups routes under prefix ("/api"): build adds them to a new router mounted there.
+func (r mut Router) Route(prefix str, build func(mut Router)) {
+	g := NewRouter()
+	build(mut g)
+	r.Mount(prefix, g)
+}
+
+// Mount serves sub's routes under prefix: "/api" and "/users" make "/api/users", and "/api"
+// and "" make "/api". r's middleware run before sub's, and sub's 404 and 405 answers (with
+// its middleware) cover the paths under prefix.
+func (r mut Router) Mount(prefix str, sub Router) {
+	routerGen++
+	r.mounts = append(r.mounts, mount{prefix: prefix, sub: sub})
+}
+
+// NotFound sets the handler for the paths no route matches (under r's prefix when r is
+// mounted); the status starts as 404.
+func (r mut Router) NotFound(h func(Req, mut Out)) {
+	routerGen++
+	r.nf = h
+	r.ownNF = true
+}
+
+// MethodNotAllowed sets the handler for the paths whose routes take other methods; the
+// status starts as 405 and the Allow header lists those methods.
+func (r mut Router) MethodNotAllowed(h func(Req, mut Out)) {
+	routerGen++
+	r.mna = h
+	r.ownMNA = true
+}
+
+// Check fails with r's first bad pattern, conflicting route or misplaced mount, the error
+// Serve would fail with before listening.
+func (r Router) Check() ! {
+	_ = try compile(r)
+}
+
+// Serve listens on addr and serves r on every core, like anvil.Serve. The routes are checked
+// and compiled once, into a table every core reads; Serve fails with r's error, if any (see Check).
+func (r Router) Serve(addr str) ! {
+	return try r.ServeN(addr, serve_cores())
+}
+
+// ServeN is Serve on exactly n cores.
+func (r Router) ServeN(addr str, n i64) ! {
+	t := try compile(r)
+	gRoutes = cast(i64, keep(t))
+	return try serve_on(addr, n)
+}
+
+// Run sends one request through r on this thread, as Serve would (middleware, 404, 405),
+// and returns the response: for tests. target is the path and query ("/users/7?full=1"),
+// the request has no headers, and a HEAD response keeps its body. Run panics if r has an
+// error (see Check).
+func (r Router) Run(method str, target str, body str) Out {
+	t := run_table(r)
+	q := Req{Method: method, Path: target, Query: "", hp: 0, hn: 0, bp: cast(i64, body) + 8, bn: len(body)}
+	for i := 0; i < len(target); i++ {
+		if target[i] == '?' {
+			q.Path = target[:i]
+			q.Query = target[i+1:]
+			break
+		}
+	}
+	b := make([]u8, 0, 256)
+	w := Out{Body: b, code: 200, ctype: "text/plain; charset=utf-8", extra: make([]u8, 0, 64), own: b}
+	dispatch(t, mut q, mut w)
+	return w
+}
+
+// Match returns the pattern of the route that would serve method and path ("/users/{id}"),
+// or "" when the request would get 404 or 405. Like Run, it panics if r has an error (see Check).
+func (r Router) Match(method str, path str) str {
+	t := run_table(r)
+	e := find(t, method, path)
+	if e < 0 {
+		return ""
+	}
+	return t.ends[e].pattern
+}
+
+// run_table is r compiled, kept while no router is changed (so repeated Run and Match calls
+// do not compile it again).
+func run_table(r Router) rtable {
+	id := cast(i64, r)
+	if runTable == 0 || runRouter != id || runGen != routerGen {
+		t, err := compile(r)
+		if err != nil {
+			panic("{err}")
+		}
+		runTable = cast(i64, keep(t))
+		runRouter = id
+		runGen = routerGen
+	}
+	return cast(rtable, runTable)
+}
+
+// not_found is a router's default answer when no route matches (the status is already 404).
+func not_found(q Req, w mut Out) {
+	w.Text("Not Found")
+}
+
+// not_allowed is a router's default answer when the path's routes take other methods (the
+// status is already 405, and Allow is set).
+func not_allowed(q Req, w mut Out) {
+	w.Text("Method Not Allowed")
+}
+
+// ---- Routing a request ----
+
+// dispatch runs request q through table t: the matching route's endpoint, or the 404 or 405
+// answer of the deepest router over the path, inside its middleware chain.
+func dispatch(t rtable, q mut Req, w mut Out) {
+	e := find(t, q.Method, q.Path)
+	if e < 0 {
+		e = miss(t, q.Path, mut w)
+	}
+	ep := cast(i64, t.ends[e])
+	q.ep = ep
+	w.ep = ep
+	w.ci = 0
+	chain_next(q, mut w)
+}
+
+// chain_next runs the rest of the request's middleware chain, then its handler: it is the
+// next that every middleware gets. The position lives in the Out, so a middleware may call
+// next more than once, and may wait before or after it.
+func chain_next(q Req, w mut Out) {
+	if w.ep == 0 {
+		panic("anvil: next needs the Out its middleware was given")
+	}
+	e := cast(rend, w.ep)
+	i := w.ci
+	if i < len(e.mws) {
+		mw := e.mws[i]
+		w.ci = i + 1
+		mw(q, mut w, chain_next)
+		w.ci = i
+		return
+	}
+	h := e.h
+	h(q, mut w)
+}
+
+// find returns the endpoint for method and path in t, or -1.
+func find(t rtable, method str, path str) i64 {
+	n := len(path)
+	p := cast(i64, path) + 8
+	if n == 0 || load8(p) != '/' {
+		return -1
+	}
+	return walk(t, 0, p, n, 1, method_code(t, method))
+}
+
+// method_code is method m's code in t, or -1 when no route takes it. The known methods have
+// the codes of their place in compile's list.
+func method_code(t rtable, m str) i64 {
+	p := cast(i64, m) + 8
+	n := len(m)
+	switch load8(p) {
+	case 'G':
+		if bytes_are(p, n, "GET") {
+			return 0
+		}
+	case 'H':
+		if bytes_are(p, n, "HEAD") {
+			return 1
+		}
+	case 'P':
+		if bytes_are(p, n, "POST") {
+			return 2
+		}
+		if bytes_are(p, n, "PUT") {
+			return 3
+		}
+		if bytes_are(p, n, "PATCH") {
+			return 4
+		}
+	case 'D':
+		if bytes_are(p, n, "DELETE") {
+			return 5
+		}
+	case 'O':
+		if bytes_are(p, n, "OPTIONS") {
+			return 6
+		}
+	case 'C':
+		if bytes_are(p, n, "CONNECT") {
+			return 7
+		}
+	case 'T':
+		if bytes_are(p, n, "TRACE") {
+			return 8
+		}
+	}
+	ms := t.methods
+	for i := nKnown; i < len(ms); i++ {
+		if ms[i] == m {
+			return i
+		}
+	}
+	return -1
+}
+
+// walk returns the endpoint for method m and the path (n bytes at p) from offset at on,
+// below node i, or -1. It tries the static child first, then the {name} child, then the
+// catch-all, going back when a branch has no route for the rest of the path.
+func walk(t rtable, i i64, p i64, n i64, at i64, m i64) i64 {
+	nd := t.nodes[i]
+	if at > n {
+		return pick(nd, m)
+	}
+	end := at
+	for end < n && load8(p+end) != '/' {
+		end++
+	}
+	if len(nd.keys) > 0 {
+		c := find_static(nd, p+at, end-at)
+		if c != 0 {
+			e := walk(t, c, p, n, end+1, m)
+			if e >= 0 {
+				return e
+			}
+		}
+	}
+	if nd.param != 0 && end > at {
+		e := walk(t, nd.param, p, n, end+1, m)
+		if e >= 0 {
+			return e
+		}
+	}
+	if nd.rest != 0 {
+		return pick(t.nodes[nd.rest], m)
+	}
+	return -1
+}
+
+// pick returns node nd's endpoint for method m: its own, then GET's for HEAD, then Any's;
+// or -1.
+func pick(nd rnode, m i64) i64 {
+	if m >= 0 && (nd.mask>>m)&1 != 0 {
+		for i := 0; i < len(nd.codes); i++ {
+			if nd.codes[i] == m {
+				return nd.eps[i]
+			}
+		}
+	}
+	if m == mHead && nd.mask&1 != 0 {
+		return pick(nd, mGet)
+	}
+	return nd.all - 1
+}
+
+// allowed returns the methods (a mask) of every route matching the path from offset at on,
+// below node i, whatever its method.
+func allowed(t rtable, i i64, p i64, n i64, at i64) i64 {
+	nd := t.nodes[i]
+	if at > n {
+		return nd.mask
+	}
+	end := at
+	for end < n && load8(p+end) != '/' {
+		end++
+	}
+	mask := 0
+	if len(nd.keys) > 0 {
+		c := find_static(nd, p+at, end-at)
+		if c != 0 {
+			mask |= allowed(t, c, p, n, end+1)
+		}
+	}
+	if nd.param != 0 && end > at {
+		mask |= allowed(t, nd.param, p, n, end+1)
+	}
+	if nd.rest != 0 {
+		mask |= t.nodes[nd.rest].mask
+	}
+	return mask
+}
+
+// find_static returns node nd's static child for the n bytes at p, or 0.
+func find_static(nd rnode, p i64, n i64) i64 {
+	if len(nd.slots) == 0 {
+		for i := 0; i < len(nd.keys); i++ {
+			if seg_is(nd.keys[i], p, n) {
+				return nd.kids[i]
+			}
+		}
+		return 0
+	}
+	m := len(nd.slots) - 1
+	s := i64(hash_seg(p, n)) & m
+	for {
+		k := nd.slots[s]
+		if k == 0 {
+			return 0
+		}
+		if seg_is(nd.keys[k-1], p, n) {
+			return nd.kids[k-1]
+		}
+		s = (s + 1) & m
+	}
+	return 0
+}
+
+// seg_is reports whether the n bytes at p are k.
+func seg_is(k str, p i64, n i64) bool {
+	if len(k) != n {
+		return false
+	}
+	kp := cast(i64, k) + 8
+	for i := 0; i < n; i++ {
+		if load8(kp+i) != load8(p+i) {
+			return false
+		}
+	}
+	return true
+}
+
+// hash_seg is the FNV-1a hash of the n bytes at p.
+func hash_seg(p i64, n i64) u64 {
+	h := u64(14695981039346656037)
+	for i := 0; i < n; i++ {
+		h = (h ^ u64(load8(p+i))) * 1099511628211
+	}
+	return h
+}
+
+// miss prepares w for a request no route takes and returns the endpoint that answers it:
+// 405 with Allow when routes take the path with other methods, else 404, from the deepest
+// router (scope) whose prefix starts the path.
+func miss(t rtable, path str, w mut Out) i64 {
+	n := len(path)
+	p := cast(i64, path) + 8
+	mask := 0
+	s := t.scopes[0]
+	if n > 0 && load8(p) == '/' {
+		mask = allowed(t, 0, p, n, 1)
+		for i := 1; i < len(t.scopes); i++ {
+			c := t.scopes[i]
+			if scope_over(c, p, n) && scope_wins(c, s) {
+				s = c
+			}
+		}
+	}
+	if mask == 0 {
+		w.code = 404
+		return s.nf
+	}
+	w.code = 405
+	w.Head("Allow", allow_list(t, mask))
+	return s.mna
+}
+
+// scope_over reports whether scope s's prefix starts the path (n bytes at p).
+func scope_over(s rscope, p i64, n i64) bool {
+	at := 1
+	for k := 0; k < len(s.kinds); k++ {
+		if at > n {
+			return false
+		}
+		end := at
+		for end < n && load8(p+end) != '/' {
+			end++
+		}
+		if s.kinds[k] == segStatic {
+			if !seg_is(s.texts[k], p+at, end-at) {
+				return false
+			}
+		} else if end == at {
+			return false
+		}
+		at = end + 1
+	}
+	return true
+}
+
+// scope_wins reports whether scope a answers before b for a path both start: the deeper
+// one, or else the one with a static segment where the other has a parameter.
+func scope_wins(a rscope, b rscope) bool {
+	if len(a.kinds) != len(b.kinds) {
+		return len(a.kinds) > len(b.kinds)
+	}
+	for k := 0; k < len(a.kinds); k++ {
+		if a.kinds[k] != b.kinds[k] {
+			return a.kinds[k] < b.kinds[k]
+		}
+	}
+	return false
+}
+
+// allow_list is the Allow header for the methods in mask: their names in order, with HEAD
+// wherever GET is.
+func allow_list(t rtable, mask i64) str {
+	if mask&1 != 0 {
+		mask |= 1 << mHead
+	}
+	names := make([]str, 0, 8)
+	for c := 0; c < len(t.methods); c++ {
+		if (mask>>c)&1 != 0 {
+			names = append(names, t.methods[c])
+		}
+	}
+	for i := 1; i < len(names); i++ {
+		for j := i; j > 0 && names[j] < names[j-1]; j-- {
+			x := names[j]
+			names[j] = names[j-1]
+			names[j-1] = x
+		}
+	}
+	b := make([]u8, 0, 64)
+	for i, s := range names {
+		if i > 0 {
+			b = append(b, ", "...)
+		}
+		b = append(b, s...)
+	}
+	return str(b)
+}
+
+// seg_span returns where path segment k starts and ends (segment 0 follows the first /).
+func seg_span(path str, k i64) (i64, i64) {
+	n := len(path)
+	at := 1
+	for j := 0; j < k && at <= n; j++ {
+		for at < n && path[at] != '/' {
+			at++
+		}
+		at++
+	}
+	if at > n {
+		return n, n
+	}
+	end := at
+	for end < n && path[end] != '/' {
+		end++
+	}
+	return at, end
+}
+
+// path_unescape is s[a:b] with its %XX escapes decoded ('+' stays itself in a path).
+func path_unescape(s str, a i64, b i64) str {
+	esc := false
+	for i := a; i < b; i++ {
+		if s[i] == '%' {
+			esc = true
+			break
+		}
+	}
+	if !esc {
+		return s[a:b]
+	}
+	out := make([]u8, 0, b-a)
+	for i := a; i < b; i++ {
+		c := s[i]
+		if c == '%' && i+2 < b && hexval(s[i+1]) >= 0 && hexval(s[i+2]) >= 0 {
+			out = append(out, u8(hexval(s[i+1])*16+hexval(s[i+2])))
+			i += 2
+		} else {
+			out = append(out, c)
+		}
+	}
+	return str(out)
+}
+
+// ---- Compiling a router ----
+
+// compile checks router r and builds its table: every route (mounted routers' too, under
+// their prefixes) in one trie, an endpoint per route with its middleware chain, and a scope
+// per router for its 404 and 405 answers.
+func compile(r Router) !rtable {
+	t := rtable{}
+	t.nodes = append(t.nodes, rnode{})
+	t.methods = append(t.methods, "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE")
+	seen := make([]i64, maxNest)
+	none := make([]func(Req, mut Out, func(Req, mut Out)), 0)
+	try add_router(mut t, r, "", none, not_found, not_allowed, mut seen, 0)
+	for _, nd := range t.nodes {
+		index_keys(mut nd)
+	}
+	return t
+}
+
+// add_router adds router r, mounted at prefix: its scope, then its routes and mounts, with
+// the middleware of the routers around it (outer) before its own. nf and mna answer misses
+// unless r has its own. seen[:depth] are the routers r is mounted in.
+func add_router(t mut rtable, r Router, prefix str, outer []func(Req, mut Out, func(Req, mut Out)), nf func(Req, mut Out), mna func(Req, mut Out), seen mut []i64, depth i64) ! {
+	id := cast(i64, r)
+	for i := 0; i < depth; i++ {
+		if seen[i] == id {
+			fail "anvil: mount {prefix}: the router is mounted inside itself"
+		}
+	}
+	if depth == len(seen) {
+		fail "anvil: mount {prefix}: routers are mounted more than {maxNest} deep"
+	}
+	seen[depth] = id
+	chain := make([]func(Req, mut Out, func(Req, mut Out)), 0, len(outer)+len(r.mws))
+	for _, m := range outer {
+		chain = append(chain, m)
+	}
+	for _, m := range r.mws {
+		chain = append(chain, m)
+	}
+	if r.ownNF {
+		nf = r.nf
+	}
+	if r.ownMNA {
+		mna = r.mna
+	}
+	sp := ppat{}
+	if prefix != "" {
+		pp := parse_pattern(prefix, true) catch err {
+			fail "anvil: mount {prefix}: {err}"
+		}
+		sp = pp
+	}
+	for _, s := range t.scopes {
+		if same_shape(s.kinds, s.texts, sp.kinds, sp.texts) {
+			fail "anvil: mount {prefix}: another router is mounted at the same prefix"
+		}
+	}
+	t.scopes = append(t.scopes, rscope{kinds: sp.kinds, texts: sp.texts, nf: len(t.ends), mna: len(t.ends) + 1})
+	t.ends = append(t.ends, endpoint(nf, chain, "", sp), endpoint(mna, chain, "", sp))
+	for _, rt := range r.routes {
+		try add_route(mut t, rt, prefix, chain)
+	}
+	for _, m := range r.mounts {
+		if len(m.prefix) < 2 || m.prefix[0] != '/' || m.prefix[len(m.prefix)-1] == '/' {
+			fail "anvil: mount {m.prefix}: a prefix starts with / and does not end with one, like /api"
+		}
+		try add_router(mut t, m.sub, prefix+m.prefix, chain, nf, mna, mut seen, depth+1)
+	}
+}
+
+// add_route puts route rt, of a router mounted at prefix, into the trie with the given chain.
+func add_route(t mut rtable, rt route, prefix str, chain []func(Req, mut Out, func(Req, mut Out))) ! {
+	full := prefix + rt.pattern
+	what := rt.method
+	if rt.all {
+		what = "Any"
+	} else if !is_token(rt.method) {
+		fail "anvil: route {full}: bad method \"{rt.method}\""
+	}
+	if full == "" || (rt.pattern != "" && rt.pattern[0] != '/') {
+		where := ""
+		if prefix != "" {
+			where = " (mounted at {prefix})"
+		}
+		fail "anvil: route {what} \"{rt.pattern}\"{where}: a pattern starts with /, like /users/{{id}}"
+	}
+	pp := parse_pattern(full, false) catch err {
+		fail "anvil: route {what} {full}: {err}"
+	}
+	n := 0
+	for k := 0; k < len(pp.kinds); k++ {
+		n = child(mut t, n, pp.kinds[k], pp.texts[k])
+	}
+	nd := t.nodes[n]
+	e := len(t.ends)
+	if rt.all {
+		if nd.all != 0 {
+			first := t.ends[nd.all-1].pattern
+			fail "anvil: route {what} {full} conflicts with {first}: they match the same requests"
+		}
+		nd.all = e + 1
+	} else {
+		m := add_method(mut t, rt.method) catch err {
+			fail "anvil: route {what} {full}: {err}"
+		}
+		for i := 0; i < len(nd.codes); i++ {
+			if nd.codes[i] == m {
+				first := t.ends[nd.eps[i]].pattern
+				fail "anvil: route {what} {full} conflicts with {first}: they match the same requests"
+			}
+		}
+		nd.codes = append(nd.codes, m)
+		nd.eps = append(nd.eps, e)
+		nd.mask |= 1 << m
+	}
+	t.ends = append(t.ends, endpoint(rt.h, chain, full, pp))
+}
+
+// add_method returns method m's code in t, giving a method no route used before the next one.
+func add_method(t mut rtable, m str) !i64 {
+	for i := 0; i < len(t.methods); i++ {
+		if t.methods[i] == m {
+			return i
+		}
+	}
+	if len(t.methods) == maxMethods {
+		fail "more than {maxMethods} methods"
+	}
+	t.methods = append(t.methods, m)
+	return len(t.methods) - 1
+}
+
+// is_token reports whether m is an HTTP token, as a method name must be.
+func is_token(m str) bool {
+	if len(m) == 0 {
+		return false
+	}
+	for i := 0; i < len(m); i++ {
+		c := m[i]
+		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+		for j := 0; !ok && j < len(tchars); j++ {
+			ok = tchars[j] == c
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// child returns node n's child for a segment of kind and text, made if new.
+func child(t mut rtable, n i64, kind i64, text str) i64 {
+	nd := t.nodes[n]
+	if kind == segStatic {
+		for i := 0; i < len(nd.keys); i++ {
+			if nd.keys[i] == text {
+				return nd.kids[i]
+			}
+		}
+		c := len(t.nodes)
+		t.nodes = append(t.nodes, rnode{})
+		nd.keys = append(nd.keys, text)
+		nd.kids = append(nd.kids, c)
+		return c
+	}
+	if kind == segParam {
+		if nd.param == 0 {
+			nd.param = len(t.nodes)
+			t.nodes = append(t.nodes, rnode{})
+		}
+		return nd.param
+	}
+	if nd.rest == 0 {
+		nd.rest = len(t.nodes)
+		t.nodes = append(t.nodes, rnode{})
+	}
+	return nd.rest
+}
+
+// index_keys gives a node with many static children a hash table over their segments.
+func index_keys(nd mut rnode) {
+	if len(nd.keys) <= manyKeys {
+		return
+	}
+	size := 16
+	for size < 2*len(nd.keys) {
+		size *= 2
+	}
+	nd.slots = make([]i64, size)
+	for i, k := range nd.keys {
+		s := i64(hash_seg(cast(i64, k)+8, len(k))) & (size - 1)
+		for nd.slots[s] != 0 {
+			s = (s + 1) & (size - 1)
+		}
+		nd.slots[s] = i + 1
+	}
+}
+
+// endpoint makes the endpoint for handler h with middleware chain, for parsed pattern pp.
+func endpoint(h func(Req, mut Out), chain []func(Req, mut Out, func(Req, mut Out)), pattern str, pp ppat) rend {
+	e := rend{h: h, mws: chain, pattern: pattern, rest: false}
+	for k := 0; k < len(pp.kinds); k++ {
+		if pp.kinds[k] != segStatic {
+			e.names = append(e.names, pp.texts[k])
+			e.segs = append(e.segs, k)
+			e.rest = pp.kinds[k] == segRest
+		}
+	}
+	return e
+}
+
+// same_shape reports whether two parsed patterns match the same paths: the same static
+// segments, and parameters in the same places.
+func same_shape(ak []i64, at []str, bk []i64, bt []str) bool {
+	if len(ak) != len(bk) {
+		return false
+	}
+	for k := 0; k < len(ak); k++ {
+		if ak[k] != bk[k] || (ak[k] == segStatic && at[k] != bt[k]) {
+			return false
+		}
+	}
+	return true
+}
+
+// parse_pattern splits pattern p ("/users/{id}") into its segments. A static segment may not
+// hold a brace, a catch-all must come last, and a prefix (a mount's) may not have one.
+func parse_pattern(p str, prefix bool) !ppat {
+	pp := ppat{}
+	if len(p) == 0 || p[0] != '/' {
+		fail "a pattern starts with /"
+	}
+	at := 1
+	for {
+		end := at
+		for end < len(p) && p[end] != '/' {
+			end++
+		}
+		seg := p[at:end]
+		kind := segStatic
+		text := seg
+		if seg == "*" {
+			kind = segRest
+		} else if len(seg) >= 2 && seg[0] == '{' && seg[len(seg)-1] == '}' {
+			kind = segParam
+			text = seg[1 : len(seg)-1]
+			if len(text) > 3 && text[len(text)-3:] == "..." {
+				kind = segRest
+				text = text[:len(text)-3]
+			}
+			if !is_name(text) {
+				fail "bad parameter {seg}: a name is letters, digits and _"
+			}
+			for k := 0; k < len(pp.kinds); k++ {
+				if pp.kinds[k] != segStatic && pp.texts[k] == text {
+					fail "parameter {text} appears twice"
+				}
+			}
+		} else {
+			for i := 0; i < len(seg); i++ {
+				if seg[i] == '{' || seg[i] == '}' {
+					fail "a parameter is a whole segment, like /{{id}}"
+				}
+			}
+		}
+		if kind == segRest && prefix {
+			fail "a prefix cannot end in a catch-all"
+		}
+		if kind == segRest && end < len(p) {
+			fail "a catch-all ({{name...}} or *) must be the last segment"
+		}
+		pp.kinds = append(pp.kinds, kind)
+		pp.texts = append(pp.texts, text)
+		if end >= len(p) {
+			break
+		}
+		at = end + 1
+	}
+	return pp
+}
+
+// is_name reports whether s is a parameter name: letters, digits and _, at least one.
+func is_name(s str) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_') {
+			return false
+		}
+	}
+	return true
 }

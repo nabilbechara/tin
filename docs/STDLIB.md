@@ -29,6 +29,7 @@ Generated from the comments in `lib/*.tin` by `tools/gendoc.py`.
 | [crucible](#crucible) | testing helpers (testing) |
 | [redis](#redis) | Redis client (go-redis) |
 | [mysql](#mysql) | MySQL client (database/sql with go-sql-driver/mysql) |
+| [postgres](#postgres) | PostgreSQL client (database/sql with pgx) |
 | [websocket](#websocket) | WebSocket server and client (gorilla/websocket) |
 
 ## say
@@ -53,10 +54,34 @@ Core 0 accepts connections and deals them round-robin to every core through a pi
 ```go
 func handle(q anvil.Req, w mut anvil.Out) {
 	w.Type("application/json")
-	argo.Put(w.Body, Msg{message: "hi"})
+	argo.Put(mut w.Body, Msg{message: "hi"})
 }
 func main() {
 	err := anvil.Serve(":8080", handle)
+	say.Line("server:", err)
+}
+```
+
+A Router picks the handler by method and path pattern, and runs middleware around it. Patterns match whole segments: "users" itself, {id} any one non-empty segment, and a last {path...} or * the rest of the path. Static segments win over {name}, and {name} over the rest, segment by segment, whatever the order of registration. A path whose routes take other methods gets 405 with Allow, any other miss 404; HEAD falls back to GET. A trailing slash is part of the path: /users/ and /users are different routes. Write patterns with {...} as raw strings: in "..." the braces would interpolate.
+
+```go
+func user(q anvil.Req, w mut anvil.Out) {
+	id := q.PathParam("id")
+	w.Text("user {id}")
+}
+func logged(q anvil.Req, w mut anvil.Out, next func(anvil.Req, mut anvil.Out)) {
+	next(q, mut w)
+	say.Line(q.Method, q.Pattern(), w.Code())
+}
+func main() {
+	r := anvil.NewRouter()
+	r.Use(logged)
+	r.Get(`/users/{id}`, user)
+	r.Route("/admin", func(g mut anvil.Router) {
+		g.Use(auth)
+		g.Delete(`/users/{id}`, remove)
+	})
+	err := r.Serve(":8080")
 	say.Line("server:", err)
 }
 ```
@@ -70,13 +95,40 @@ func main() {
 - `(q Req) Hijack() !i64`: Hijack takes the request's connection out of HTTP for a protocol of its own (the websocket package uses it): the responses before this request are written, the core stops reading the connection and the request's deadline no longer applies. It returns the non-blocking descriptor, for the caller's I/O until the handler returns; then anvil closes it. The handler's Out is not sent.
 - `(q Req) Body() str`: Body returns the request body.
 - `(q Req) Param(name str) str`: Param returns query parameter name, %-decoded, or "".
+- `(q Req) PathParam(name str) str`: PathParam returns path parameter name of the Router route that matched ({name}, {name...}, or "*" for a last *), %-decoded, or "".
+- `(q Req) Pattern() str`: Pattern returns the pattern of the Router route serving the request ("/users/{id}"), or "" (no Router, or a 404 or 405 answer).
 - `(w mut Out) Status(code i64)`: Status sets the response status code.
 - `(w mut Out) Type(t str)`: Type sets the Content-Type header.
 - `(w mut Out) Head(k str, v str)`: Head adds a response header.
 - `(w mut Out) Text(s str)`: Text appends s to the body.
-- `(w mut Out) Json()`: Json sets the JSON content type; the body is then written with argo.Put(w.Body, v).
+- `(w mut Out) Json()`: Json sets the JSON content type; the body is then written with argo.Put(mut w.Body, v).
+- `(w Out) Code() i64`: Code returns the response status set so far (200 unless Status changed it).
+- `(w Out) Header(k str) str`: Header returns response header k as set so far (Type sets Content-Type, Head the rest), or "".
+- `(w mut Out) SetValue(key str, value str)`: SetValue stores value under key for the rest of the request: middleware hand data (a user id, a request id) to the handlers after them this way. Value reads it back.
+- `(w Out) Value(key str) str`: Value returns what SetValue stored under key in this request, or "".
 - `OnRelay(h func(i64, str))`: OnRelay makes every core run h(from, msg) for each relay message it receives (call before Serve). Handlers run between requests, with their own request pool.
 - `OnTick(ms i64, h func(i64))`: OnTick makes every core run h(core) every ms milliseconds (call before Serve).
+- `type Router struct`: Router sends each request to the handler routed for its method and path pattern, through the middleware added with Use. Build it in main (or in a function a global's initializer calls), then Serve it, or try requests on it with Run.
+- `NewRouter() Router`: NewRouter makes an empty router: every request gets 404 until routes are added.
+- `(r mut Router) Get(pattern str, h func(Req, mut Out))`: Get routes GET requests for pattern to h, and HEAD requests unless Head routes them.
+- `(r mut Router) Post(pattern str, h func(Req, mut Out))`: Post routes POST requests for pattern to h.
+- `(r mut Router) Put(pattern str, h func(Req, mut Out))`: Put routes PUT requests for pattern to h.
+- `(r mut Router) Patch(pattern str, h func(Req, mut Out))`: Patch routes PATCH requests for pattern to h.
+- `(r mut Router) Delete(pattern str, h func(Req, mut Out))`: Delete routes DELETE requests for pattern to h.
+- `(r mut Router) Head(pattern str, h func(Req, mut Out))`: Head routes HEAD requests for pattern to h (without it, they go to the GET route).
+- `(r mut Router) Options(pattern str, h func(Req, mut Out))`: Options routes OPTIONS requests for pattern to h.
+- `(r mut Router) Handle(method str, pattern str, h func(Req, mut Out))`: Handle routes requests with method (any HTTP method name, like "PROPFIND") for pattern to h.
+- `(r mut Router) Any(pattern str, h func(Req, mut Out))`: Any routes requests for pattern with every method to h; a route for the request's own method on the same pattern wins over it.
+- `(r mut Router) Use(mw func(Req, mut Out, func(Req, mut Out)))`: Use adds middleware mw to r. Middleware run in the order added, around every route of r and of the routers mounted in it, and around their 404 and 405 answers. Each gets next, the rest of the chain, and decides whether and when to call it.
+- `(r mut Router) Route(prefix str, build func(mut Router))`: Route groups routes under prefix ("/api"): build adds them to a new router mounted there.
+- `(r mut Router) Mount(prefix str, sub Router)`: Mount serves sub's routes under prefix: "/api" and "/users" make "/api/users", and "/api" and "" make "/api". r's middleware run before sub's, and sub's 404 and 405 answers (with its middleware) cover the paths under prefix.
+- `(r mut Router) NotFound(h func(Req, mut Out))`: NotFound sets the handler for the paths no route matches (under r's prefix when r is mounted); the status starts as 404.
+- `(r mut Router) MethodNotAllowed(h func(Req, mut Out))`: MethodNotAllowed sets the handler for the paths whose routes take other methods; the status starts as 405 and the Allow header lists those methods.
+- `(r Router) Check() !`: Check fails with r's first bad pattern, conflicting route or misplaced mount, the error Serve would fail with before listening.
+- `(r Router) Serve(addr str) !`: Serve listens on addr and serves r on every core, like anvil.Serve. The routes are checked and compiled once, into a table every core reads; Serve fails with r's error, if any (see Check).
+- `(r Router) ServeN(addr str, n i64) !`: ServeN is Serve on exactly n cores.
+- `(r Router) Run(method str, target str, body str) Out`: Run sends one request through r on this thread, as Serve would (middleware, 404, 405), and returns the response: for tests. target is the path and query ("/users/7?full=1"), the request has no headers, and a HEAD response keeps its body. Run panics if r has an error (see Check).
+- `(r Router) Match(method str, path str) str`: Match returns the pattern of the route that would serve method and path ("/users/{id}"), or "" when the request would get 404 or 405. Like Run, it panics if r has an error (see Check).
 
 ## hearth
 
@@ -159,7 +211,7 @@ Package twine manipulates UTF-8 strings (like Go's strings); case helpers are AS
 - `SplitN(s str, sep str, n i64) []str`: SplitN is Split returning at most n pieces (all when n < 0, none when n == 0).
 - `Fields(s str) []str`: Fields splits s around runs of ASCII white space and returns the non-empty pieces.
 - `Join(elems []str, sep str) str`: Join concatenates elems with sep between them.
-- `Repeat(s str, count i64) str`: Repeat returns s concatenated count times (empty when count <= 0).
+- `Repeat(s str, count i64) str`: Repeat returns s concatenated count times (empty when count <= 0; panics when the length overflows).
 - `Count(s str, sub str) i64`: Count returns the number of non-overlapping sub in s (RuneCount+1 when sub is empty).
 - `Replace(s str, old str, repl str, n i64) str`: Replace returns s with the first n non-overlapping old replaced by repl (all when n < 0; empty old matches at every rune boundary).
 - `ReplaceAll(s str, old str, repl str) str`: ReplaceAll returns s with every non-overlapping old replaced by repl.
@@ -324,7 +376,7 @@ Package ore works on byte slices ([]u8), like Go's bytes. Functions that append 
 - `Fields(b []u8) []str`: Fields splits b around runs of ASCII white space.
 - `ToLower(b []u8) []u8`: ToLower returns a copy with ASCII letters lowered.
 - `ToUpper(b []u8) []u8`: ToUpper returns a copy with ASCII letters raised.
-- `Repeat(b []u8, n i64) []u8`: Repeat returns n copies of b.
+- `Repeat(b []u8, n i64) []u8`: Repeat returns n copies of b (panics when the length overflows).
 
 ## flume
 
@@ -625,13 +677,15 @@ Package stamp computes non-cryptographic hashes and checksums: FNV-1a, CRC-32 (I
 
 ## seal
 
-Package seal has cryptographic hashes (SHA-256, SHA-1), HMAC-SHA256, constant-time comparison, secure random bytes, the hex and base64 encodings, and RSA-OAEP encryption with a public key.
+Package seal has cryptographic hashes (SHA-256, SHA-1), HMAC-SHA256, PBKDF2-HMAC-SHA-256, constant-time comparison, secure random bytes, the hex and base64 encodings, and RSA-OAEP encryption with a public key.
 
 - `Sha256(s str) []u8`: Sha256 is the SHA-256 digest of s (32 bytes).
 - `Sha256Soft(s str) []u8`: Sha256Soft is SHA-256 in portable code (the reference the hardware path is tested against).
 - `Sha256Hex(s str) str`: Sha256Hex is the SHA-256 digest of s in lower-case hex.
 - `Sha1(s str) []u8`: Sha1 is the SHA-1 digest of s (20 bytes); use it only where a protocol requires it.
 - `HmacSha256(key str, msg str) []u8`: HmacSha256 is the HMAC-SHA256 of msg under key (32 bytes).
+- `Pbkdf2Sha256(password str, salt str, iterations i64, length i64) ![]u8`: Pbkdf2Sha256 derives length bytes using PBKDF2-HMAC-SHA-256. Iterations must be positive; length must be between 0 and 1 MiB. Temporary storage is reused between rounds, so memory usage does not grow with iterations. Choose the work factor for your protocol or password policy (this function does not choose one).
+- `Pbkdf2Sha256Timeout(password str, salt str, iterations i64, length i64, timeout i64) ![]u8`: Pbkdf2Sha256Timeout derives bytes like Pbkdf2Sha256, with a timeout in nanoseconds (<= 0: no limit). Both forms honor request deadlines and let other tasks run between batches of rounds. Scratch storage is released before any timeout fault returns.
 - `ConstantTimeEq(a []u8, b []u8) bool`: ConstantTimeEq compares a and b in time that depends only on their lengths.
 - `RandomBytes(n i64) []u8`: RandomBytes returns n cryptographically secure random bytes.
 - `Hex(b []u8) str`: Hex encodes b in lower-case hexadecimal.
@@ -767,6 +821,37 @@ for _, r := range rows.Rows {
 - `(t mut Tx) Exec(q query) !Result`: Exec runs a statement in the transaction.
 - `(t mut Tx) Commit() !`: Commit makes the transaction's changes permanent.
 - `(t mut Tx) Rollback() !`: Rollback undoes the transaction's changes.
+
+## postgres
+
+Package postgres is a PostgreSQL protocol 3.0 client over TCP. Query interpolation binds binary parameters as $1, $2, ...; a plain str cannot be used as SQL. Connections are pooled per core (default 16) and waiting request tasks park without blocking it. Authentication supports SCRAM-SHA-256, MD5 and cleartext. TLS is not supported: use a trusted private network or a local TLS proxy. An SSL-only server is rejected.
+
+```go
+var db = postgres.Open(postgres.Options{Addr: "127.0.0.1:5432", User: "app", Password: pw, Database: "shop"})
+rows := try db.Query("INSERT INTO users(name) VALUES ({name}) RETURNING id")
+id := rows.Rows[0][0].Int()
+```
+
+- `type Value enum`: Value is one column of a row.
+- `type Rows struct`: Rows is a query's result.
+- `type Result struct`: Result is what a statement without rows did.
+- `type Options struct`: Options says where and how to connect.
+- `type Client struct`: Client runs statements on one PostgreSQL server. Open it in a global's initializer (which runs on every core) or once in main, not per request.
+- `type Tx struct`: Tx is a transaction: its statements run on one connection until Commit or Rollback.
+- `Open(o Options) Client`: Open makes a client for the server in o. It connects on first use, on each core.
+- `(v Value) IsNull() bool`: IsNull reports whether v is NULL.
+- `(v Value) Int() i64`: Int is v as an integer (a Text or Float converted, NULL and bad text 0).
+- `(v Value) Float() f64`: Float is v as a float.
+- `(v Value) Text() str`: Text is v as text ("" for NULL).
+- `(r Rows) Col(name str) i64`: Col is the index of the named column, or -1.
+- `(c Client) Query(q query) !Rows`: Query returns the first rowset. With no parameters, multiple statements are allowed and all replies are consumed before returning. Integers and booleans use Value.Int; float4/8 use Value.Float; other OIDs (including numeric and bytea) use Value.Text.
+- `(c Client) Exec(q query) !Result`: Exec returns the affected count of the last command. Use Query with RETURNING to obtain generated IDs (PostgreSQL has no connection-wide last insert ID).
+- `(c Client) Ping() !`: Ping checks that the server answers.
+- `(c Client) Begin() !Tx`: Begin pins a connection until Commit or Rollback. SQL errors abort the transaction until Rollback. Copies share its state: finishing one finishes them all. In request tasks an unfinished transaction is dropped when its owning task/scope ends. Outside tasks always finish explicitly. Tx and its rows belong to the caller's pool.
+- `(t mut Tx) Query(q query) !Rows`: Query runs a statement in the transaction and returns its first rowset.
+- `(t mut Tx) Exec(q query) !Result`: Exec runs a statement in the transaction and returns its affected count.
+- `(t mut Tx) Commit() !`: Commit makes the transaction's changes permanent. An aborted transaction must be rolled back explicitly; PostgreSQL's implicit COMMIT-to-ROLLBACK is not success.
+- `(t mut Tx) Rollback() !`: Rollback undoes the transaction's changes and releases its connection.
 
 ## websocket
 

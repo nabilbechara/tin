@@ -6,7 +6,7 @@
 | [STDLIB.md](STDLIB.md) | every standard-library package and exported name (generated from `lib/*.tin`) |
 | [TOOLING.md](TOOLING.md) | the `tin` command, `tinc`, make targets, tests, Docker, benchmarks, debugging, repository layout |
 | [DISTRIBUTION.md](DISTRIBUTION.md) | release archives, verified installer, builder images and source-to-container builds |
-| [RUNTIME.md](RUNTIME.md) | memory (pools, ingot heap, regions), cores, value layouts, panics, the HTTP server's internals, request tasks, non-blocking I/O and helper threads, how the redis/mysql/websocket clients share a core, the platform layer |
+| [RUNTIME.md](RUNTIME.md) | memory (pools, ingot heap, regions), cores, value layouts, panics, the HTTP server's internals and its router, request tasks, non-blocking I/O and helper threads, how the redis/mysql/websocket clients share a core, the platform layer |
 | [COMPILER.md](COMPILER.md) | how the self-hosted compiler works: passes, data structures, code generation, linkers, bootstrapping, how to change it |
 | [PORTING.md](PORTING.md) | targets (macOS, Linux arm64, Linux amd64), ELF details, containers and Kubernetes, adding a target |
 | [PERFORMANCE.md](PERFORMANCE.md) | benchmark results against Go, methodology, where Go still wins and why (the v0.4 service benchmark is pending: #74) |

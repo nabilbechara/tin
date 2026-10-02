@@ -70,7 +70,8 @@ import u "util"       // with an alias
 ### Program start
 
 Before `main` runs, every package's global initializers run (on every core: see
-section 11), in declaration order within a file and file order within the program.
+section 11): a package's after those of the packages it imports, and within a package in
+declaration order, file by file.
 `main` returns nothing; the program exits with status 0 when it returns, 2 on a panic,
 or with the code passed to `quarry.Exit`.
 
@@ -353,6 +354,10 @@ var cache map[str]User = make(map[str]User)
 Globals are per core (section 11): each core thread has its own copy, and initializers
 run once on every core. Values stored into globals live in the long-lived heap
 (section 10).
+
+An initializer may use imported packages and the globals declared before it. Using a
+later global of its package (or itself), directly or through a function it calls or refers
+to, is a compile error: that global's initializer has not run yet.
 
 ### Functions
 
@@ -677,7 +682,9 @@ What the checker tracks:
   argument into a global makes its callers `keep`; passing a global to a function that
   stores request memory into that parameter is an error at the call (`put stores request
   memory into its mut parameter 'b', but this argument may be long-lived: keep() the
-  stored values inside put`);
+  stored values inside put`; for a standard-library function, which the caller cannot
+  change, `... pass request memory (a local) instead`, as for an `anvil.Router` held in a
+  global and changed in `main`);
 - `keep` results, globals and constants are long-lived; literals are static.
 
 Plain programs (no server) never reset their pool: memory is released when the program
@@ -700,7 +707,8 @@ There are no goroutines and no shared mutable state.
   queue); `relay.Recv()` blocks for the next one, `relay.TryRecv()` polls,
   `relay.Broadcast(msg)` sends to every other core. Encode structs with `argo.Put` /
   `argo.Get`.
-- `anvil.Serve` runs one HTTP event loop per core; a connection stays on one core.
+- `anvil.Serve` runs one HTTP event loop per core; a connection stays on one core. A
+  `Router` built in `main` is compiled once by `r.Serve` into a table every core reads.
   `anvil.OnRelay(h)` and `anvil.OnTick(ms, h)` run handlers on server cores between
   requests.
 
@@ -808,6 +816,9 @@ say.Line("literal {{braces}} and 100%") // {{ and }} are braces; % needs no esca
   `{x:5}`, `{x:-8}`, `{x:05}`, `{x:x}`, `{x:q}`, `{x:.3e}`. Without a verb the value is
   printed as `%v`, and a precision on a float means decimal places (`{pi:.2}` is `3.14`).
 - A lone `}` is an error (write `}}`), and so is an unclosed `{`.
+- Text with braces of its own, like an anvil route pattern, is a raw string:
+  ``r.Get(`/users/{id}`, user)``. In `"/users/{id}"` the `{id}` would be a value; when no `id`
+  is in scope the compiler says so (`undefined: id (in a string, {id} is a value: ...)`).
 
 ### Queries
 
@@ -887,10 +898,11 @@ err2 := argo.Get(text, mut xs)      // appends decoded elements
   message or `null`).
 - `argo.Get(text, mut v)` fills a struct, slice (appending) or map (adding entries); nested
   struct fields are filled in place, `?T` fields accept `null`, unknown members are
-  skipped, sized integers are range checked (`700` into a `u8` is a fault), and trailing
-  garbage is a fault, as are arrays and objects nested more than 512 deep (each level
-  takes stack, and a request handler's stack is 256 KiB). Error messages name the offset:
-  `argo: expected an integer in [0, 65535] at offset 8, found "7"`.
+  skipped, numbers follow the JSON grammar and must fit their type (`007`, `1.`, `700` into
+  a `u8` and `1e400` into an `f64` are faults), and trailing garbage is a fault, as are
+  arrays and objects nested more than 512 deep (each level takes stack, and a request
+  handler's stack is 256 KiB). Error messages name the offset: `argo: expected an integer
+  in [0, 65535] at offset 8, found "7"`.
 - `argo.Str(b, s)` and `argo.Raw(b, json)` write pieces by hand.
 
 ---
@@ -926,9 +938,9 @@ Files under `lib/` are trusted and may use operations user code cannot:
   `__atomic_store`; `__yield` (a spin-wait hint);
 - `__ctx()` / `__set_ctx(p)` (the core context register), `__fp()` (the frame pointer),
   `__empty()` (the static empty slice header), `&x` (address of a local or global);
-- `extern func name(params) R` declarations of system library functions (variadic C
-  functions need `...` in the declaration); C int results are valid in the low 32 bits:
-  convert with `i64(i32(x))`;
+- `extern func name(params) R` declarations of system library functions, and calls to
+  them (variadic C functions need `...` in the declaration); C int results are valid in
+  the low 32 bits: convert with `i64(i32(x))`;
 - `shared var` (one process-wide variable, not per core) for the runtime's own state;
 - the runtime's `rt_` functions (see RUNTIME.md).
 
@@ -1046,6 +1058,7 @@ has no package clause). See [COMPILER.md](COMPILER.md) for how the compiler is w
 | pointers, `&x`, `*p` | reference types (structs, slices, maps are references) |
 | slices are values (header copied) | slices are references (header shared, `append` in place) |
 | goroutines, channels, mutexes | one thread per core, per-core globals, `relay` messages |
+| package variables initialized in dependency order | declaration order; an initializer using a later global is a compile error |
 | garbage collector | request pools + `keep` into a long-lived heap, checked at compile time |
 | interfaces, reflection | generics (monomorphized), compiler-generated `say` and `argo` |
 | closures capture variables | function literals cannot capture locals |
