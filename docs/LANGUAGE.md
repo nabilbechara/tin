@@ -667,12 +667,17 @@ What the checker tracks:
   source, or one of the function's parameters;
 - stores through fields, slice elements, map entries, `append`, `copy`, and assignments
   to globals;
-- function summaries: which `mut` parameters a function stores request memory into, and
-  where its results come from (iterated to a fixed point over the whole program). A
-  helper that stores its argument into a global makes its callers `keep`; passing a
-  global to a function that stores request memory into that parameter is an error at the
-  call (`put stores request memory into its mut parameter 'b', but this argument may be
-  long-lived: keep() the stored values inside put`);
+- what request-owned containers hold: a fresh slice, map or struct given a global's
+  object (or a parameter's) hands it back as long-lived (or as that parameter), so
+  `xs := []Box{gbox}; xs[0].Items = append(xs[0].Items, q)` needs `keep(q)` (it changes
+  `gbox`) and `func f(b Box) { xs := []Box{b}; xs[0].n = 9 }` needs `b mut`;
+- function summaries: which `mut` parameters a function stores request memory into (and
+  where inside them), what its containers hold, and where its results come from
+  (iterated to a fixed point over the whole program). A helper that stores its
+  argument into a global makes its callers `keep`; passing a global to a function that
+  stores request memory into that parameter is an error at the call (`put stores request
+  memory into its mut parameter 'b', but this argument may be long-lived: keep() the
+  stored values inside put`);
 - `keep` results, globals and constants are long-lived; literals are static.
 
 Plain programs (no server) never reset their pool: memory is released when the program
