@@ -3068,6 +3068,8 @@ fn say_arg(a, prefix) {
             return rt_call(pos, str_cat3(prefix, "slint", ""), args3(a, mk_int(pos, type_width(et), ty_int), mk_int(pos, et[TY_SIGNED], ty_int)), ty_void);
         } else if ek == K_STRUCT && et[TY_ENUM] {
             return say_enum_slice(a, t, prefix);
+        } else if ek == K_STRUCT {
+            return say_struct_slice(a, t, prefix);
         } else {
             suffix = "slp";
         }
@@ -3107,24 +3109,112 @@ fn say_struct(a, t, prefix) {
     vec_push(nonnil[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, "<nil>")), ty_void)));
     let body = empty_block(pos);
     nonnil[IF_ELSE] = body;
-    vec_push(body[BLK_STMTS], expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, "{")), ty_void)));
-    let fs = t[TY_FIELDS];
+    vec_push(body[BLK_STMTS], expr_stmt(call_fn(pos, say_struct_fn(t, prefix), args1(mk_conv(pos, sym_ref_node(pos, obj[LET_SYM]), CV_SAME, t)), ty_void)));
+    vec_push(stmts, nonnil);
+    vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "argend", ""), vec_new(), ty_void)));
+    return mk_seq(pos, stmts, mk_int(pos, 0, ty_int), ty_void);
+}
+
+var say_struct_keys;  // [type, prefix] of each generated struct printer
+var say_struct_fns;
+
+// field_name is the declared name of field i of struct type t.
+fn field_name(t, i) {
+    return vec_get(vec_get(t[TY_FIELDS], i), 0);
+}
+
+// say_struct_fn returns the generated function that prints one (non-nil) struct of type t as
+// {v1 v2 ...}, or {name:v1 name:v2 ...} under %+v. It is a function of its own, not inline code, so
+// a struct that holds itself through a slice (Node with kids []Node) terminates: the printer is
+// registered before its body is built, and the recursion happens when the program runs. A field
+// of struct or enum type is printed by the printer of its own type, a slice of structs element by
+// element; an optional field (a pointer in effect) stays an address, as Go prints a pointer field.
+fn say_struct_fn(t, prefix) {
+    if !say_struct_keys {
+        say_struct_keys = vec_new();
+        say_struct_fns = vec_new();
+    }
     let i = 0;
-    while i < fs[VEC_LEN] {
-        if i > 0 {
-            vec_push(body[BLK_STMTS], expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, " ")), ty_void)));
-        }
-        let ft = field_type(t, i);
-        let fv = mk_mem(pos, sym_ref_node(pos, obj[LET_SYM]), 0, 0, field_offset(t, i), ft);
-        if kind_of(ft) == K_STRUCT || kind_of(ft) == K_OPT {
-            vec_push(body[BLK_STMTS], expr_stmt(rt_call(pos, str_cat3(prefix, "p", ""), args1(mk_conv(pos, fv, CV_SAME, ty_int)), ty_void)));
-        } else {
-            vec_push(body[BLK_STMTS], expr_stmt(say_arg(fv, prefix)));
+    while i < say_struct_keys[VEC_LEN] {
+        let kp = vec_get(say_struct_keys, i);
+        if vec_get(kp, 0) == t && streq(vec_get(kp, 1), prefix) {
+            return vec_get(say_struct_fns, i);
         }
         i = i + 1;
     }
-    vec_push(body[BLK_STMTS], expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, "}")), ty_void)));
-    vec_push(stmts, nonnil);
+    let names = vec_new();
+    vec_push(names, "x");
+    let types = vec_new();
+    vec_push(types, t);
+    let f = lifted_fn("say", names, types, vec_new());
+    let kp2 = vec_new();
+    vec_push(kp2, t);
+    vec_push(kp2, prefix);
+    vec_push(say_struct_keys, kp2);
+    vec_push(say_struct_fns, f);
+    let saved_fn = ck_fn;
+    ck_fn = f;
+    let pos = 0;
+    let x = vec_get(f[F_LOCALS], 0);
+    let body = f[F_BODY][BLK_STMTS];
+    vec_push(body, expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, "{")), ty_void)));
+    let fs = t[TY_FIELDS];
+    i = 0;
+    while i < fs[VEC_LEN] {
+        if i > 0 {
+            vec_push(body, expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, " ")), ty_void)));
+        }
+        let named = node_new(ST_IF, pos);
+        named[IF_COND] = rt_call(pos, "rt_fmt_plusv", vec_new(), ty_bool);
+        named[IF_THEN] = empty_block(pos);
+        vec_push(named[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, str_cat3(field_name(t, i), ":", ""))), ty_void)));
+        vec_push(body, named);
+        let ft = field_type(t, i);
+        let fv = mk_mem(pos, sym_ref_node(pos, x), 0, 0, field_offset(t, i), ft);
+        if kind_of(ft) == K_STRUCT && ft[TY_ENUM] {
+            vec_push(body, expr_stmt(call_fn(pos, say_enum_fn(ft, prefix), args1(fv), ty_void)));
+        } else if kind_of(ft) == K_STRUCT {
+            vec_push(body, expr_stmt(call_fn(pos, say_struct_fn(ft, prefix), args1(fv), ty_void)));
+        } else if kind_of(ft) == K_OPT {
+            vec_push(body, expr_stmt(rt_call(pos, str_cat3(prefix, "p", ""), args1(mk_conv(pos, fv, CV_SAME, ty_int)), ty_void)));
+        } else {
+            vec_push(body, expr_stmt(say_arg(fv, prefix)));
+        }
+        i = i + 1;
+    }
+    vec_push(body, expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, "}")), ty_void)));
+    ck_fn = saved_fn;
+    return f;
+}
+
+// say_struct_slice prints [{...} {...}] with each element through its struct's printer.
+fn say_struct_slice(a, t, prefix) {
+    let pos = a[N_POS];
+    let et = t[TY_ELEM];
+    let stmts = vec_new();
+    vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "argsep", ""), vec_new(), ty_void)));
+    let sl = temp(pos, a, t);
+    vec_push(stmts, sl);
+    let n = temp(pos, mk_hdr(pos, sym_ref_node(pos, sl[LET_SYM]), 0), ty_int);
+    vec_push(stmts, n);
+    vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, "[")), ty_void)));
+    let j = declare_local(pos, "$", ty_int);
+    vec_push(stmts, let_stmt(pos, j, mk_int(pos, 0, ty_int)));
+    let w = node_new(ST_WHILE, pos);
+    w[WH_COND] = mk_bin(pos, "<", sym_ref_node(pos, j), sym_ref_node(pos, n[LET_SYM]), ty_bool);
+    w[WH_POST] = assign_stmt(pos, sym_ref_node(pos, j), mk_bin(pos, "+", sym_ref_node(pos, j), mk_int(pos, 1, ty_int), ty_int));
+    let wb = empty_block(pos);
+    w[WH_BODY] = wb;
+    let sep = node_new(ST_IF, pos);
+    sep[IF_COND] = mk_bin(pos, ">", sym_ref_node(pos, j), mk_int(pos, 0, ty_int), ty_bool);
+    sep[IF_THEN] = empty_block(pos);
+    vec_push(sep[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, " ")), ty_void)));
+    vec_push(wb[BLK_STMTS], sep);
+    let el = mk_elem(pos, sym_ref_node(pos, sl[LET_SYM]), sym_ref_node(pos, j), et, 0);
+    el[ELEM_SAFE] = 1;
+    vec_push(wb[BLK_STMTS], expr_stmt(call_fn(pos, say_struct_fn(et, prefix), args1(el), ty_void)));
+    vec_push(stmts, w);
+    vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, "]")), ty_void)));
     vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "argend", ""), vec_new(), ty_void)));
     return mk_seq(pos, stmts, mk_int(pos, 0, ty_int), ty_void);
 }

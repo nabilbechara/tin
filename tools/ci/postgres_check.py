@@ -94,6 +94,9 @@ class Fake:
         class TCP(socketserver.ThreadingTCPServer):
             allow_reuse_address = True
             daemon_threads = True
+            # The default listen backlog is 5: a burst of 20 clients opening connections overflows
+            # it, and macOS answers the overflow with a reset instead of making the client retry.
+            request_queue_size = 256
 
         self.srv = TCP(('127.0.0.1', 0), Handler)
         self.port = self.srv.server_address[1]

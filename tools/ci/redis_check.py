@@ -32,6 +32,7 @@ class Fake:
                 fake.serve(self.request)
 
         socketserver.ThreadingTCPServer.allow_reuse_address = True
+        socketserver.ThreadingTCPServer.request_queue_size = 256  # the default backlog of 5 resets bursts on macOS
         self.srv = socketserver.ThreadingTCPServer(('127.0.0.1', 0), H)
         self.srv.daemon_threads = True
         self.port = self.srv.server_address[1]

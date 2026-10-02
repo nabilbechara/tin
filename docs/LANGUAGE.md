@@ -868,8 +868,14 @@ align), `+` (sign), `0` (zero pad), `#` (alternate), space.
 
 Default formats: integers in decimal; floats in the shortest form that reads back
 exactly, with an exponent below 1e-4 or from 1e21 (Go's `%v`); `true`/`false`; strings as
-is; slices as `[a b c]`; maps as `map[k:v ...]` with sorted keys; structs as `{a b}`;
-nil optionals and faults as `<nil>`.
+is; slices as `[a b c]`; maps as `map[k:v ...]` with sorted keys; structs as `{a b}`, with
+nested structs, enums (by name) and slices of structs printed in full; `NaN`, `+Inf` and `-Inf`
+for the non-finite floats under every verb; nil optionals and faults as `<nil>`. An optional
+field of a struct prints as an address, as a pointer field does in Go, so that a structure that
+points back at itself prints and ends.
+
+`%+v` is not `%v` with a sign: it prints no `+` on numbers and gives structs their field names
+(`{a:1 b:2.5}`). `%+d`, `%+g`, `%+f` and `%+e` do print the sign.
 
 Output to stdout is buffered (64 KiB, or per line on a terminal) and flushed at exit.
 
