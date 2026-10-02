@@ -42,3 +42,6935 @@ Closures that capture, shapes, fault chains and `guard`, tasks and scopes with `
 deadline and cancellation, atomics, compile-time type information, packages with capabilities. The
 document decides each, with what it replaces, what was rejected and what it unlocks, and orders the
 nine steps by dependency. docs/COVERAGE.md is the checklist of what each adds.
+
+
+## Ten-year plan (written 2026-10-02)
+
+Tin's goal: a language as ready as Go, Rust and Odin for servers and tools, written in Tin, with
+performance as the end goal. This is the whole list, ordered by phase; a box is checked when it is merged
+with its tests (and, for library work, verified against Go: see notes/stdlib_verified.md). Years are targets,
+not promises; the order inside a phase follows dependencies (notes/design_foundations.md). The standard
+library checklist (section 9) is generated from docs/COVERAGE.md, which stays the detailed inventory.
+
+### 1. Language (year 1 to 3)
+
+Foundations, in the order of notes/design_foundations.md (#140 to #146):
+- [ ] Closures that capture, as region objects with cells (#140)
+- [ ] Shapes: structural interfaces, static by default, `dyn` for dynamic dispatch (#141)
+- [ ] Fault chains: `fault.Is`, `Wrap`, `Join`, `try ... wrap`, sentinels, `guard` in place of `recover` (#142)
+- [ ] Tasks and scopes: `scope`, `spawn`, `lane[T]` (structured concurrency on a core) (#143)
+- [ ] `context` as ambient deadline, cancellation and slots: `within`, `slot`/`with` (#144)
+- [ ] Derivation and attributes in place of `reflect` and struct tags (#145)
+- [ ] Packages with `tin.lock`, content addressing and capabilities (#146)
+- [ ] The `io` family on shapes (Reader, Writer, Closer, Seeker, ReaderAt, WriterTo)
+- [ ] Atomics for cross-core counters and flags (no mutexes)
+
+Other language work:
+- [ ] Range over functions and iterators (`iter.Seq` equivalent) and the `*Seq` forms in the library
+- [ ] Struct embedding with promotion
+- [ ] Method values and method expressions
+- [ ] Named results and bare `return`
+- [ ] User-declared variadic functions
+- [ ] `min` and `max` of any number of arguments, `clear`
+- [ ] Value arrays `[N]T` (copy semantics) next to the slice form
+- [ ] Full slice expressions `s[a:b:c]`
+- [ ] Labels, `goto`-free labeled `break` and `continue`, `fallthrough` decision
+- [ ] `init` functions decision and documentation
+- [ ] Generic constraints: named constraints, `cmp.Ordered`, constraints with methods (after shapes), generic type aliases
+- [ ] Generic methods and higher-kinded helpers decision
+- [ ] Complex numbers decision (`complex128`, `math/cmplx`) or a documented omission
+- [ ] `//embed` (compile-time file embedding) and generate hooks
+- [ ] `unsafe`-equivalent: a small, audited raw-memory package for the standard library only
+- [ ] Integer overflow policy (wrapping vs checked, per type) written down and tested
+- [ ] Optionals: decide whether `?T` extends to number, bool and enum types (today `?T` is for reference types) and write the rule; binding sugar decision
+- [ ] Pattern matching: nested patterns, guards, `switch` on tuples
+- [ ] Const evaluation: compile-time functions, typed const generics
+- [ ] Formal grammar and a language specification document, versioned
+- [ ] Compatibility promise and edition mechanism (breaking changes only by edition)
+
+### 2. Compiler (year 1 to 5)
+
+Correctness:
+- [ ] A conformance suite: Tin's own spec tests, and the corpus of Go programs ported as differential tests
+- [ ] Differential fuzzing of the compiler against the interpreter-free reference outputs (Go twins)
+- [ ] Fuzzing the lexer, parser and checker (no crash on any input, errors with positions)
+- [ ] LLVM-style test coverage: every pass has lit-style tests for what it must and must not do
+- [ ] Error messages: every diagnostic has a code, a span, a suggestion where one exists
+- [ ] Compile-time region checker proofs for the documented escape rules; counterexample corpus
+- [ ] Reproducible builds: the same source gives the same bytes on every machine
+
+Performance of the generated code:
+- [ ] Inliner for multi-statement functions (the cause of the remaining math and sort gaps)
+- [ ] Intrinsics: clz, ctz, popcount, rbit, rev, fma, sqrt, rounding, multiply-high, add-with-carry
+- [ ] Constant hoisting and strength reduction; loop-invariant code motion
+- [ ] Bounds-check elimination from range and induction facts
+- [ ] Register allocation: linear scan to a graph or SSA-based allocator
+- [ ] An SSA middle end (or equivalent) with common subexpression elimination and dead store elimination
+- [ ] Escape and region analysis that stack-allocates request-local values
+- [ ] SIMD: vector types, auto-vectorization of simple loops, hand-written kernels for memchr, memcmp, hashing, base64, utf8
+- [ ] Profile-guided optimization (inlining and layout from a recorded profile)
+- [ ] Link-time optimization across packages; dead data and code stripping
+- [ ] Monomorphization cost control: shared instantiation for identical machine code
+- [ ] Compile speed: incremental and parallel builds, a build cache keyed by content
+- [ ] Debug info: DWARF line tables and variables, so debuggers and profilers work
+
+Targets:
+- [ ] linux-arm64, linux-amd64, darwin-arm64 at full parity (done for the first three: keep green)
+- [ ] darwin-amd64
+- [ ] Windows (amd64, arm64): PE writer, Win32 runtime part, IOCP
+- [ ] FreeBSD and OpenBSD (kqueue is shared with darwin)
+- [ ] riscv64
+- [ ] WebAssembly (wasm32-wasi first, then browser); needs its own design note first: stackful tasks need stack switching or asyncify, and there are no threads-per-core (see 14.4)
+- [ ] Embedded and freestanding targets (no OS runtime part)
+- [ ] A second backend (LLVM IR emitter) as an optimization-quality reference, not a dependency
+
+### 3. Runtime (year 1 to 5)
+
+- [ ] Allocator: size classes, per-core caches, huge-page support, no libc (libc removal phases 2 to 6, #125)
+- [ ] Linux without libc: raw syscalls everywhere, vDSO clock
+- [ ] Number parsing and printing without libc (strtod, snprintf replacements)
+- [ ] DNS resolver in Tin (stub resolver, /etc/hosts, search domains, happy eyeballs)
+- [ ] io_uring backend next to epoll and kqueue
+- [ ] Task scheduler: request placement across cores at accept time (least loaded core), never migration of a running task (a task shares its parent's pool, so moving it would move a pool across cores); fairness by round-robin within a core and priority by deadline; acceptance: a 100 ms handler never delays a fast one on its core (wrk2 mix), p99 within 10 percent of the single-class run
+- [ ] A watchdog that reports (and optionally kills the request of) a task that never parks within a budget; no preemption, because tasks switch only where they park and that is why there are no mutexes
+- [ ] Task stacks: large lazily committed reservations with guard pages (no copying: non-escaping closure cells point into the stack); acceptance: 100,000 parked tasks on one core within a stated memory budget
+- [ ] Timers: hierarchical wheel, monotonic clocks, timer slack
+- [ ] Panics: backtraces with symbolized frames in release builds, core dumps, crash reports
+- [ ] Memory limits per request, per core and per process, with backpressure
+- [ ] Observability built in: counters, histograms, trace spans, the pprof format
+- [ ] Signals, process control, fork-free spawn, pipes, sockets options, `sendfile`, `splice`
+- [ ] TLS in the runtime's I/O path (non-blocking handshake, session resumption, kTLS)
+- [ ] Graceful reload and zero-downtime restart (socket handoff)
+
+### 4. Performance programme (continuous)
+
+- [ ] A benchmark suite in the repo with Go, Rust and Odin baselines, run in CI on dedicated hardware, regressions block merges
+- [ ] The service benchmark of v0.4 measured on a quiet machine (wrk2: req/s and p99 against Go with chi), published
+- [ ] Per-package micro benchmarks: strings, strconv, math, sort, maps, json, http parsing, hashing, compression
+- [ ] Performance budget documented per stdlib package (allocations per call, bytes copied)
+- [ ] JSON: faster than the Go standard library and than `sonic`-class libraries on real-world payloads
+- [ ] HTTP server: beat Go's net/http and fasthttp on throughput and tail latency, with TLS
+- [ ] Database clients: fewer allocations than pgx and go-sql-driver at equal features
+- [ ] Startup time and binary size budgets enforced in CI
+
+### 5. Tooling (year 1 to 6)
+
+- [ ] `tin` command: build, run, test, bench, fmt, vet, doc, get, mod, clean, install, version, env
+- [ ] `tin fmt`: one canonical format, stable, with a style check in CI
+- [ ] `tin vet`: the compiler's lints (unused, shadowing, suspicious formatting, misuse of `keep`)
+- [ ] `tin doc`: documentation from comments, searchable, with examples that run as tests
+- [ ] `tin test`: table tests, subtests, parallel tests, golden files, coverage, race-free by construction, fuzzing, benchmarks with `benchstat`-style comparison
+- [ ] Language server (LSP): diagnostics, completion, go-to-definition, rename, hover, code actions, inlay hints
+- [ ] Debugger support: DWARF, `lldb` and `gdb` pretty-printers, a Tin-aware debugger adapter (DAP)
+- [ ] Profilers: CPU, heap (pool usage), task and latency traces; flame graphs; `tin pprof`
+- [ ] Package manager: resolution, lock file, checksums, vendoring, private registries, offline mode, mirror (#146)
+- [ ] Package registry and documentation site
+- [ ] Editor support: VS Code, JetBrains, Neovim, Helix, Zed; tree-sitter grammar; syntax highlighting everywhere GitHub renders
+- [ ] Playground in the browser (wasm)
+- [ ] Code generation tools in Tin (stringer-like, mocks via shapes, protobuf, OpenAPI, SQL)
+- [ ] Migration tooling: a Go-to-Tin translator for the common subset, and a report of what does not map
+- [ ] Continuous integration templates and a hosted build cache
+- [ ] Installers: Homebrew, apt and rpm repositories, container images, `tinup` for toolchain versions
+
+### 6. Safety and security (continuous)
+
+- [ ] A memory-safety statement and proof sketch for the region checker; external review
+- [ ] Sanitizer-grade debug mode (poisoned pools, canaries, use-after-reset detection at run time)
+- [ ] Fuzz every parser in the library (JSON, HTTP, URL, TLS records, database wire protocols, archive formats)
+- [ ] Constant-time guarantees for the crypto package, tested with timing harnesses
+- [ ] Supply chain: signed releases, reproducible builds, SBOM, lock-file verification, capability prompts for dependencies
+- [ ] Vulnerability policy, advisory database and `tin audit`
+- [ ] FIPS-style validated crypto build, if customers need it
+
+### 7. Ecosystem and community (year 2 to 10)
+
+- [ ] Language specification, tour, book, cookbook, migration guide from Go
+- [ ] Style guide and project layout guide
+- [ ] Governance: RFC process, editions, release cadence, long-term support releases
+- [ ] A foundation or an equivalent home for the project; trademark and license policy
+- [ ] Third-party libraries to encourage: web frameworks, ORMs, queue clients (Kafka, NATS, SQS, RabbitMQ), cloud SDKs, observability agents, gRPC, GraphQL
+- [ ] Production references: Large production services running in Tin, with published numbers
+- [ ] Conferences, training material and certification
+- [ ] Compatibility with Go tooling where useful (`go list`-like metadata, SARIF reports)
+
+### 8. Years, in short
+
+| Year | Theme | Exit criteria |
+|---|---|---|
+| 1 (2026 to 2027) | Foundations and breadth | Sections 1 foundations done; stdlib "high demand" packages done and verified; libc gone on Linux; the service benchmark published |
+| 2 | Production readiness | `context`, TLS, database/sql shape, HTTP client and server complete; LSP and formatter; first external service in production |
+| 3 | Performance leadership | SSA middle end, inliner, intrinsics, SIMD kernels; Tin ahead of Go on the benchmark suite; package manager and registry live |
+| 4 | Platforms | Windows, darwin-amd64, wasm; debugger and profiler complete |
+| 5 | Ecosystem | Third-party libraries for the usual stacks; spec 1.0 and the compatibility promise |
+| 6 to 8 | Depth | Second backend, PGO and LTO by default, formal checker proofs, FIPS build, embedded targets |
+| 9 to 10 | Maturity | Long-term support, foundation governance, the standard library at parity with Go's and ahead where Tin's design allows |
+
+### 9. Standard library, A to Z
+
+One box per Go standard-library package (the 176 that `go list std` reports for Go 1.26, as in docs/COVERAGE.md), ordered by import path. `[x]` means done; the note says what Tin package carries it and what is still missing.
+
+- [ ] `archive/tar`: missing; tar archives; needs the io shape first
+- [ ] `archive/zip`: missing; zip archives; needs compress/flate
+- [ ] `bufio` (flume): partial; buffered Reader (Line, Byte, ReadAll) and Writer (Str, Int, Flush); no Scanner with split functions, no ReadWriter
+- [ ] `bytes` (ore, twine.Builder): partial; about 20 functions on []u8; no Buffer or Reader type, no Map, Title, FieldsFunc or TrimFunc
+- [ ] `cmp` (sift (Less, Cmp), builtin min/max): partial; Less and Cmp (NaN first, as Go); no cmp.Or and no named Ordered constraint (a union such as `i64
+- [ ] `compress/bzip2`: missing
+- [ ] `compress/flate`: missing; needed by gzip, zlib and zip
+- [ ] `compress/gzip`: missing
+- [ ] `compress/lzw`: missing
+- [ ] `compress/zlib`: missing
+- [ ] `container/heap` (cairn): partial; IntHeap and IntMaxHeap; no heap over any element type (generics now allow one)
+- [ ] `container/list` (cairn (deque, queue)): missing; no doubly linked list with stable element handles
+- [ ] `container/ring`: missing
+- [ ] `context` (design: ambient task deadline and cancellation): missing; every request task already has a deadline; the cancel signal, values and the scoped form are unbuilt
+- [-] `crypto`: n/a; the Hash registry and interfaces; there are no interfaces
+- [ ] `crypto/aes`: missing
+- [ ] `crypto/cipher`: missing; GCM, CTR, CBC
+- [ ] `crypto/des`: missing
+- [ ] `crypto/dsa`: missing; deprecated in Go
+- [ ] `crypto/ecdh`: missing
+- [ ] `crypto/ecdsa`: missing
+- [ ] `crypto/ed25519`: missing
+- [ ] `crypto/elliptic`: missing
+- [-] `crypto/fips140`: n/a; Go's FIPS module switch
+- [ ] `crypto/hkdf`: missing
+- [ ] `crypto/hmac` (seal): partial; HmacSha256 only
+- [ ] `crypto/hpke`: missing
+- [ ] `crypto/md5` ((postgres/md5, internal)): partial; exists only inside the PostgreSQL client; not public
+- [ ] `crypto/mlkem`: missing
+- [-] `crypto/mlkem/mlkemtest`: n/a
+- [ ] `crypto/pbkdf2` (seal): partial; Pbkdf2Sha256 and a timeout form; no other hashes
+- [ ] `crypto/rand` (seal): partial; RandomBytes; no Reader, Int or Prime
+- [ ] `crypto/rc4`: missing; deprecated in Go
+- [ ] `crypto/rsa` (seal): partial; ParseRSAPublicKeyPEM and EncryptOAEPSha1 (the MySQL login); no key generation, signing or verification
+- [ ] `crypto/sha1` (seal): partial; Sha1 one shot; no streaming hash
+- [ ] `crypto/sha256` (seal): partial; Sha256, Sha256Hex (hardware instructions where present); no streaming hash, no SHA-224
+- [ ] `crypto/sha3`: missing
+- [ ] `crypto/sha512`: missing
+- [ ] `crypto/subtle` (seal): partial; ConstantTimeEq only
+- [ ] `crypto/tls`: missing; issue #124: client first, then server; blocks https, wss and TLS to databases
+- [ ] `crypto/x509`: missing
+- [ ] `crypto/x509/pkix`: missing
+- [ ] `database/sql` (mysql, postgres (and the `query` type)): partial; each client has Open, Query, Exec, Begin, Commit, Rollback and typed values, pooled per core; no shared driver abstraction, no Scan into structs, no prepared-statement handle API
+- [ ] `database/sql/driver`: design; no interfaces: a driver would be a package with a fixed shape or a table of functions
+- [ ] `debug/buildinfo`: missing; low priority
+- [ ] `debug/dwarf`: missing; low priority
+- [ ] `debug/elf`: missing; low priority (the compiler writes ELF but does not read it)
+- [-] `debug/gosym`: n/a; Go symbol tables
+- [ ] `debug/macho`: missing; low priority
+- [ ] `debug/pe`: missing; low priority
+- [-] `debug/plan9obj`: n/a
+- [ ] `embed`: missing; compile-time file embedding
+- [ ] `encoding` (compile-time derivation): design; Marshaler interfaces become derived code, as argo already does for JSON
+- [ ] `encoding/ascii85`: missing
+- [ ] `encoding/asn1`: missing; needed by x509
+- [ ] `encoding/base32`: missing
+- [ ] `encoding/base64` (seal): partial; standard (padded) and URL-safe (unpadded) with decoders; no padded URL-safe form, no unpadded standard form, no streaming encoder
+- [ ] `encoding/binary`: missing; byte orders, varints, Read and Write of fixed-size values
+- [ ] `encoding/csv`: missing
+- [ ] `encoding/gob`: missing; low priority: Go's own format
+- [ ] `encoding/hex` (seal): partial; Hex and HexDecode; no Dump, no streaming
+- [ ] `encoding/json` (argo): partial; Put and Get are generated per type, fast; no decoding into a dynamic value, no field tags, no Indent, no streaming Encoder or Decoder, no RawMessage beyond Raw
+- [ ] `encoding/pem`: missing
+- [ ] `encoding/xml`: missing
+- [ ] `errors` (fault, try, catch, say.Fault): partial; no Is, As, Unwrap or Join: a fault is a message, with no wrapping chain
+- [ ] `expvar`: missing
+- [ ] `flag` (lever): partial; Str, Int, Bool, F64, Parse, Usage; no FlagSet, no Duration, no custom Value
+- [ ] `fmt` (say): partial; Line, Fmt, Str, Fault and string interpolation with format specs, by static type; no Sscanf, Fscan or Scan, and no Stringer or Formatter (formatting is derived)
+- [-] `go/ast`: n/a; Go's own compiler front end; Tin's compiler is selfhost/
+- [-] `go/build`: n/a
+- [-] `go/build/constraint`: n/a
+- [-] `go/constant`: n/a
+- [-] `go/doc`: n/a
+- [-] `go/doc/comment`: n/a
+- [-] `go/format`: n/a; a Tin formatter is a separate tool, not this package
+- [-] `go/importer`: n/a
+- [-] `go/parser`: n/a
+- [-] `go/printer`: n/a
+- [-] `go/scanner`: n/a
+- [-] `go/token`: n/a
+- [-] `go/types`: n/a
+- [-] `go/version`: n/a
+- [ ] `hash`: design; the Hash interface; streaming hashes need a generic or a table of functions
+- [ ] `hash/adler32` (stamp): partial; Adler32 one shot
+- [ ] `hash/crc32` (stamp): partial; Crc32, Crc32C, Crc32Update; no table type, no streaming hash
+- [ ] `hash/crc64`: missing
+- [ ] `hash/fnv` (stamp): partial; Fnv32a and Fnv64a; not the FNV-1 variants
+- [ ] `hash/maphash`: missing; maps are hashed internally with a per-process key
+- [ ] `html`: missing; EscapeString and UnescapeString
+- [ ] `html/template`: missing; contextual escaping; templ-style code generators are the common alternative
+- [ ] `image`: missing
+- [ ] `image/color`: missing
+- [ ] `image/color/palette`: missing
+- [ ] `image/draw`: missing
+- [ ] `image/gif`: missing
+- [ ] `image/jpeg`: missing
+- [ ] `image/png`: missing; needs compress/zlib
+- [ ] `index/suffixarray`: missing
+- [ ] `io` (flume (concrete Reader and Writer)): design; Reader and Writer are interfaces in Go; Copy, Pipe, MultiWriter, LimitReader and TeeReader have no Tin form yet
+- [ ] `io/fs`: missing
+- [-] `io/ioutil` (quarry): n/a; deprecated in Go; quarry has ReadFile, WriteFile, ReadDir
+- [ ] `iter`: missing; range over functions; `for range` covers slices, strings, maps and integers
+- [ ] `log` (herald): partial; levels, output, clock; no Logger values
+- [ ] `log/slog` (herald): partial; leveled lines with key and value pairs; no Handler, Group or LogValuer
+- [ ] `log/syslog`: missing
+- [ ] `maps` (atlas): partial; Keys, Values (slices, in insertion order), SortedKeys, Clone, Copy, Equal, EqualFunc, DeleteFunc; no iterator forms (All, Insert, Collect)
+- [ ] `math` (gauge): partial; Sin to Atan2, Sinh to Tanh, Exp, Exp2, Log family, Pow, Cbrt, Hypot, Mod, Frexp, Ldexp, Modf (ported from Go, no libm); missing Gamma, Lgamma, Erf, Erfc, Expm1, Asinh, Acosh, Atanh, Sincos, FMA, Ne...
+- [ ] `math/big`: missing; Int, Float, Rat
+- [x] `math/bits` (bits): done; LeadingZeros, TrailingZeros, PopCount (OnesCount), Len, RotateLeft, Reverse, ReverseBytes, and Add, Sub, Mul, Div, Rem with carries, at 8, 16, 32 and 64 bits as Go has them, each name carrying its ...
+- [ ] `math/cmplx`: missing; there is no complex type
+- [ ] `math/rand` (dice): partial; xoshiro256** generators, Intn, F64, NormF64, Perm, Shuffle; no Zipf, no ExpFloat64, no Source interface
+- [ ] `math/rand/v2` (dice): partial; same generators; no PCG or ChaCha8 types, different method names
+- [ ] `mime`: missing
+- [ ] `mime/multipart`: missing
+- [ ] `mime/quotedprintable`: missing
+- [ ] `net` (wire): partial; TCP Dial, DialTimeout, Listen, Accept, deadlines; no UDP, Unix sockets, IP or CIDR types, resolver control
+- [ ] `net/http` (anvil, wire, websocket): partial; server with Router, middleware, groups, HEAD and 405 handling; client Get, Post, Do; WebSocket; no TLS, HTTP/2, cookies, multipart, Client or Transport configuration, streaming bodies
+- [ ] `net/http/cgi`: missing; low priority
+- [ ] `net/http/cookiejar`: missing
+- [ ] `net/http/fcgi`: missing; low priority
+- [ ] `net/http/httptest` (anvil.Router.Run): partial; runs a request through a router without a socket; no ResponseRecorder or test Server
+- [ ] `net/http/httptrace`: missing
+- [ ] `net/http/httputil`: missing; ReverseProxy, DumpRequest
+- [ ] `net/http/pprof`: missing; profiling endpoints; part of the performance goal
+- [ ] `net/mail`: missing
+- [ ] `net/netip` (link): partial; only the check that a bracketed URL host is an IPv6 address, with Go's fault messages (private to link); no Addr, Prefix or AddrPort types
+- [ ] `net/rpc`: missing; low priority
+- [ ] `net/rpc/jsonrpc`: missing; low priority
+- [ ] `net/smtp`: missing
+- [ ] `net/textproto`: missing
+- [ ] `net/url` (link): partial; Parse, ParseRequestURI, URL (String, EscapedPath, EscapedFragment, Hostname, Port, RequestURI, Redacted, ResolveReference, Parse, JoinPath), Userinfo, Values (Get, Set, Add, Del, Has, Encode), Pars...
+- [ ] `os` (quarry): partial; Args, environment, ReadFile, WriteFile, AppendFile, Mkdir, Remove, Rename, ReadDir, Getwd, Exit, Hostname, Pid; files are opened through flume (buffered) and there is no os.File type with Seek; no ...
+- [ ] `os/exec`: missing
+- [ ] `os/signal`: missing; anvil handles SIGTERM and SIGINT for graceful shutdown internally
+- [ ] `os/user`: missing
+- [ ] `path` (trail): partial; Clean, Base, Dir, Ext, Join, Split, Match, IsAbs
+- [ ] `path/filepath` (trail): partial; the same, plus Rel; no Walk, WalkDir, Glob, Abs or EvalSymlinks
+- [ ] `plugin`: design; no dynamic loading
+- [ ] `reflect` (compile-time derivation (argo, say)): design; runtime reflection is not planned; what code uses it for (serialization, validation, mapping rows to structs) becomes derived code
+- [ ] `regexp`: missing; needs an RE2-style engine; linear time
+- [ ] `regexp/syntax`: missing
+- [ ] `runtime` (hearth): partial; Cores, ID, MemLimit, PoolChunk, Reset; no GC controls (there is no GC), no Gosched or NumGoroutine, no Caller or Stack
+- [-] `runtime/cgo`: n/a
+- [ ] `runtime/coverage`: missing
+- [ ] `runtime/debug`: missing; backtraces exist on panic; no SetGCPercent (no GC), no Stack or ReadBuildInfo
+- [ ] `runtime/metrics`: missing
+- [ ] `runtime/pprof`: missing; CPU and allocation profiling; part of the performance goal
+- [-] `runtime/race`: n/a; the language rules out shared mutable state between threads
+- [ ] `runtime/trace`: missing
+- [ ] `slices` (sift): partial; Sort, SortFunc, SortStableFunc (Go's algorithm, same order of equal elements), IsSorted, BinarySearch, Min, Max, Index, Contains, Equal, Compare, Reverse, Insert, Delete, DeleteFunc, Replace, Compa...
+- [ ] `sort` (sift): partial; Ints, Strs, SortBy, Search* and the generic Sort and SortFunc; no sort.Interface (by design), no sort.Slice (use SortFunc)
+- [ ] `strconv` (mint): partial; Itoa, Atoi, ParseInt, ParseUint, ParseBool, ParseFloat, FormatInt, FormatUint, FormatFloat, Quote, Unquote and friends; no AppendFloat, AppendBool, QuoteToASCII, IsPrint, ParseComplex
+- [ ] `strings` (twine): partial; every function except the iterator forms and Reader: Index family, Split family with SplitAfter, Fields and FieldsFunc, Map, Title, Unicode ToUpper, ToLower, ToTitle, EqualFold by SimpleFold, Trim ...
+- [-] `structs`: n/a
+- [ ] `sync` (share-nothing cores, relay): design; no Mutex or RWMutex by design; WaitGroup, Once, Pool and Map need routine-level equivalents
+- [ ] `sync/atomic`: missing; the runtime has atomic operations as compiler intrinsics; there is no public package
+- [ ] `syscall`: missing; low priority
+- [ ] `testing` (crucible, `tin test`): partial; checks, Run, benchmarks; no t.Parallel, subtests with cleanup, TempDir, fuzzing, example tests
+- [ ] `testing/cryptotest`: missing
+- [ ] `testing/fstest`: missing
+- [ ] `testing/iotest`: missing
+- [ ] `testing/quick`: missing
+- [ ] `testing/slogtest`: missing
+- [ ] `testing/synctest`: missing
+- [ ] `text/scanner`: missing
+- [ ] `text/tabwriter`: missing
+- [ ] `text/template`: missing
+- [ ] `text/template/parse`: missing
+- [ ] `time` (tide): partial; Now, Since, Sleep, Wait, durations with parse and format, RFC 3339 and HTTP date, calendar arithmetic; no time zones or Location, no layout-based Format and Parse, no Timer, Ticker or After, no Mon...
+- [ ] `time/tzdata`: missing
+- [ ] `unicode` (glyph): partial; Unicode 15.0.0 as Go has it: Is over every category, script and property (the Table enum), IsOneOf, IsLetter, IsDigit, IsNumber, IsSpace, IsUpper, IsLower, IsTitle, IsMark, IsPunct, IsSymbol, IsCon...
+- [ ] `unicode/utf16`: missing
+- [x] `unicode/utf8` (glyph): done; every function
+- [ ] `unique`: missing
+- [ ] `unsafe`: design; raw operations exist only for the standard library, behind the region checker
+- [-] `weak`: n/a; there is no garbage collector
+
+`[-]` marks a package that is specific to Go's toolchain or runtime and has no counterpart to build.
+
+### 10. Beyond Go's library (Tin-native)
+
+- [ ] `link`, `atlas`, `bits`, `sift`, `glyph`: keep API parity with Go and add Tin-native forms (iterators, shapes, derivation)
+- [ ] `herald`: structured logging on par with slog, with sampling and async sinks
+- [ ] Queue and stream clients: Kafka, NATS, SQS, RabbitMQ, Redis streams
+- [ ] Cloud clients: S3-compatible object storage, GCS, Azure Blob; secrets managers; service discovery
+- [ ] gRPC and protobuf, with derivation instead of reflection
+- [ ] GraphQL, OpenAPI server and client generation
+- [ ] Rate limiting, circuit breaking, retries with budgets, hedged requests
+- [ ] Caching: in-process cache with admission policy, distributed cache clients
+- [ ] Metrics and tracing: Prometheus, OpenTelemetry, Datadog formats, exemplars
+- [ ] Config: layered configuration, environment, files, hot reload, secrets
+- [ ] Feature flags and experimentation clients
+- [ ] Template engines (text and HTML, escaped by construction)
+- [ ] Search and analytics clients (Elasticsearch, ClickHouse)
+- [ ] Audio and media helpers relevant to streaming services (ID3, MP4 boxes, HLS and DASH manifests, Opus/AAC framing)
+- [ ] Machine-learning inference helpers (tensor layout, ONNX runtime binding) once FFI policy is settled
+
+### 11. Open questions (decide, then move to a section above)
+
+- [ ] FFI policy: how Tin calls C libraries without `cgo`, and how capabilities limit it
+- [ ] Generics beyond monomorphization: dictionary passing for code size
+- [ ] Whether `dyn` shapes need a stable ABI across packages
+- [ ] Async I/O across cores for file systems that cannot be non-blocking
+- [ ] Hot code reload for development
+- [ ] A long-lived arena with explicit drop (not a collector) for graphs that `keep` copies poorly; see 14.1 for reclaiming the long-lived heap
+
+### 12. Detailed task breakdown
+
+Every item below is a task a pull request can close. Language features share one template; each feature lists the specific work on top of it.
+
+#### 12.1 The template every language feature follows
+
+- [ ] design note updated in notes/design_foundations.md with the final syntax and rules
+- [ ] lexer and parser: grammar, error recovery, positions in diagnostics
+- [ ] checker: typing rules, diagnostics with codes, region/escape rules
+- [ ] lowering and code generation on arm64 and amd64
+- [ ] runtime support (if any), with allocation and Linux behavior covered
+- [ ] tests: positive, negative (`_bad.tin` with `.err`), regression cases tied to issues
+- [ ] docs: docs/LANGUAGE.md section, COVERAGE.md row, examples
+- [ ] stdlib adoption: the packages that wait for it (named below) switch to it
+- [ ] performance check: benchmark against the Go equivalent, no regression in compile time
+
+#### 12.2 Language features
+
+**Closures that capture (#140)**
+- [ ] closure object layout: code pointer plus captured cells, region-tagged
+- [ ] capture analysis: by value for immutable, cell for mutated variables
+- [ ] `keep` of a closure copies its cells into long-lived memory
+- [ ] escape rule: a closure that captures request memory cannot be stored in a global
+- [ ] function literals as arguments to `sift.SortFunc`, `twine.Map`, `FieldsFunc` etc. with capture
+- [ ] defer with closures; `for` loop variable per-iteration semantics decided and documented
+
+**Shapes (#141)**
+- [ ] structural shapes declared with `shape`, satisfied implicitly by methods
+- [ ] static dispatch by monomorphization (default) with no run-time cost
+- [ ] `dyn` fat reference (data pointer plus table) for open sets, with region rules
+- [ ] shape embedding and composition; shapes with generic parameters
+- [ ] error cases: missing method, wrong signature, mut mismatch, with fix-it text
+- [ ] port `io.Reader`/`Writer`/`Closer`/`Seeker`, `hash.Hash`, `sort` through generics (no `sort.Interface`), `fmt.Stringer`, `database/sql/driver` onto shapes
+- [ ] `say` and `argo` honor `String()` and derived encoders through shapes
+
+**Fault chains and guard (#142)**
+- [ ] fault values with a cause and a message; sentinels declared with `fault`
+- [ ] `fault.Is` against sentinels, `Wrap`, `Join`, `Unwrap` (typed payloads and an `As` are rejected in notes/design_foundations.md section 3: sentinels and fields carry the information)
+- [ ] `try ... wrap "context"` sugar; message format `outer: inner`
+- [ ] `guard` blocks that turn a panic into a fault at a task boundary (replaces `recover`)
+- [ ] stack traces attached to faults in debug builds
+- [ ] map every stdlib error onto sentinels plus a message that matches Go's text: url, strconv, os path errors, net operation errors (no typed payloads)
+- [ ] argo and herald render fault chains
+
+**Tasks and scopes (#143)**
+- [ ] `scope { ... }` waits for every `spawn`ed task; cancellation propagates down
+- [ ] `spawn f(x)` on the same core; `lane[T]` bounded queues between tasks
+- [ ] result collection: `scope.Wait`, first-error cancellation, `errgroup` equivalent
+- [ ] cross-core send with `relay` shapes; ownership transfer rules for pool memory
+- [ ] deadlock and leak diagnostics in debug builds
+- [ ] task-local storage via context slots
+- [ ] conformance tests: ordering, cancellation, panics inside tasks, timers
+
+**Context (#144)**
+- [ ] ambient deadline and cancellation per task: `within(duration) { ... }`
+- [ ] `slot[T]` declarations and `with slot = value { ... }` scopes
+- [ ] every blocking call (sockets, timers, queries, sleeps) observes the ambient deadline
+- [ ] `context.Context`-style parameters are not needed: migration guide for Go-style code
+- [ ] interop shim exposing `Done()` and `Err()` only for ported libraries (no untyped `Value()`: slots are typed, design_foundations section 4)
+- [ ] herald, trace and database clients read slots (request id, trace id)
+
+**Derivation and attributes (#145)**
+- [ ] compile-time type information: field names, types, offsets, enum variants
+- [ ] `#[json(name=...)]`-style attributes checked by the compiler
+- [ ] user-defined derivers written in Tin and run at compile time
+- [ ] derive Encode/Decode for json, xml, yaml, toml, csv, protobuf, sql rows
+- [ ] derive Equal, Hash, Compare, Clone, Default, Debug
+- [ ] no run-time reflection, so no binary-size cost when unused
+
+**Packages, lock file and capabilities (#146)**
+- [ ] `tin.mod` with module path, version, dependencies; `tin.lock` with content hashes
+- [ ] resolver per design_foundations section 8: exact content-addressed pins in `tin.lock` (no semantic version resolution), local path overrides, vendoring
+- [ ] content-addressed fetch from any URL or mirror (a registry is an index on top, not a prerequisite), checksums verified from the lock file, offline mirror
+- [ ] capabilities per package: net, fs, exec, env, time, unsafe; granted in the root module
+- [ ] `internal` and visibility rules; import cycles diagnostics
+- [ ] semantic import compatibility and editions
+
+**Atomics**
+- [ ] `atomic` package: Load, Store, Add, CAS, Swap on i32/i64/u32/u64/bool/the atomic cell types of design_foundations section 6 (`I64`, `U64`, `Bool`)
+- [ ] memory ordering defined (acquire/release/seq_cst) and mapped to arm64 and amd64
+- [ ] cross-core counters for metrics; `once` for process-wide init
+- [ ] no mutex by design: document the patterns that replace it (per-core state, relay messages)
+
+**Iterators and range over functions**
+- [ ] iterator protocol as a compile-time shape (`next` returning optional)
+- [ ] `for x := range f` with early exit and defer semantics
+- [ ] `seq`, `seq2` types; adapters: Map, Filter, Take, Zip, Chunk, Collect
+- [ ] library `*Seq` forms: strings.SplitSeq/Lines, maps.Keys/Values, slices.Values/All/Collect/Sorted, bytes, regexp
+
+#### 12.3 Library milestones (function-level)
+
+**time (zones, layouts, timers)**
+- [ ] `Time` with wall and monotonic readings, `Duration` formatting and parsing (in tide today)
+- [ ] `Month` and `Weekday` enums with `String`
+- [ ] `Location`, `LoadLocation` from the tz database embedded or read from the system, fixed zones
+- [ ] layout-based `Format` and `Parse` with all Go layout verbs, plus RFC 3339 and HTTP dates (done)
+- [ ] `Truncate`, `Round`, `AddDate`, `Sub`, `Before`, `After`, `Equal`, `Compare`, `UnixMilli` family
+- [ ] `Timer`, `Ticker`, `After`, `AfterFunc`, `Sleep` on the task scheduler, with the ambient deadline
+- [ ] `time.Now` via vDSO on Linux, `mach_absolute_time` on macOS
+- [ ] verify against Go: layouts across 10,000 instants in 20 zones, DST edges, leap years
+
+**regexp**
+- [ ] parser for RE2 syntax with flags and Unicode classes (uses glyph tables)
+- [ ] compiler to a Pike VM and a one-pass and a backtracking matcher selected like Go
+- [ ] `MatchString`, `Find*`, `FindAll*`, `Submatch`, named groups, `ReplaceAll*`, `Split`, `Longest`, `Expand`
+- [ ] DFA or lazy DFA for speed; literal prefix acceleration with memchr and SIMD
+- [ ] linear-time guarantee tests and a ReDoS corpus
+- [ ] verify against Go on the RE2 test corpus (several thousand patterns and inputs)
+
+**encoding/json (beyond argo)**
+- [ ] streaming `Decoder` and `Encoder` (`Token`, `More`, `Buffered`, `UseNumber`, `DisallowUnknownFields`)
+- [ ] `RawMessage`, `Number`, custom (un)marshalers via shapes or derivation
+- [ ] `MarshalIndent`, HTML escaping flag, `Valid`, `Compact`, `Indent`
+- [ ] dynamic values: a `json.Value` enum for maps and arrays of unknown shape
+- [ ] error messages with offsets and field paths as Go reports them
+- [ ] verify against Go on the JSONTestSuite and a fuzz corpus
+
+**strconv and fmt completion**
+- [ ] `AppendInt`, `AppendFloat`, `AppendBool`, `AppendQuote*`, `QuoteToASCII`, `QuoteToGraphic`, `IsPrint`, `IsGraphic`, `CanBackquote`
+- [ ] `ParseComplex` decision; `FormatFloat` with all formats and precisions verified against Go
+- [ ] `say`: width and flags on `%q` (#149), `%+q`, `%#q`, `%x` on slices, `%b`, `%o`, `%O`, `%e`/`%G` corner cases, `%T`, `%p`, `%*d`, `%[1]d` argument indexes
+- [ ] `Sscanf`, `Sscan`, `Fscan` family
+- [ ] verify against Go over a generated corpus of formats and values
+
+**os, io/fs and files**
+- [ ] `File` type with Read, Write, Seek, ReadAt, WriteAt, Close, Sync, Truncate, Stat
+- [ ] `Stat`, `Lstat`, `FileInfo`, `FileMode`, permissions, `Chmod`, `Chown`, `Chtimes`
+- [ ] `MkdirAll`, `RemoveAll`, `ReadDir` with entries, `CreateTemp`, `MkdirTemp`, `Symlink`, `Readlink`, `Link`
+- [ ] `io/fs` shapes (`FS`, `File`, `DirEntry`), `fs.WalkDir`, `embed.FS`, `testing/fstest`
+- [ ] `os/exec`: spawn, pipes, wait, environment, context deadlines, no fork in multi-threaded runtime (posix_spawn)
+- [ ] `os/signal`, `os/user`
+- [ ] file I/O off the core on helper threads or io_uring, so handlers never block
+
+**net and net/http**
+- [ ] `net`: `Dial`, `Listen`, `Conn`, `Listener`, UDP, Unix sockets, `LookupHost`, `ParseIP`, `IPNet`, `JoinHostPort`, deadlines
+- [ ] `net/netip`: `Addr`, `Prefix`, `AddrPort` with the parsing already done inside `link`
+- [ ] `net/http` client: `Client`, `Transport` with pooling per core, redirects, cookies (`cookiejar`), timeouts, HTTP/2, proxies
+- [ ] `net/http` server: HTTP/2, HTTP/3 (later), `ServeMux` patterns, middleware helpers, `ResponseController`, `Flusher`, `Hijacker` equivalents, graceful shutdown, `FileServer`
+- [ ] `httptest`, `httputil` (`ReverseProxy`, `Dump*`), `pprof` endpoints
+- [ ] `mime`, `mime/multipart`, `net/textproto`, `net/mail`, `net/smtp`
+- [ ] WebSocket (done), Server-Sent Events, gRPC transport on HTTP/2
+- [ ] conformance: h2spec, Autobahn for WebSocket, curl-based suites, differential tests against Go's server
+
+**crypto and TLS (#124)**
+- [ ] TLS 1.3 client, then server, then TLS 1.2; certificate verification with the system roots
+- [ ] `x509` parsing and verification, PEM, `asn1`, PKCS#1/8, `pkix`
+- [ ] hashes: streaming SHA-1/224/256/384/512/3, MD5, BLAKE2, HMAC, HKDF, PBKDF2, scrypt, argon2, bcrypt
+- [ ] ciphers: AES (hardware), GCM, CTR, CBC, ChaCha20-Poly1305, XChaCha
+- [ ] public key: RSA (keygen, PSS, OAEP, PKCS1v15), ECDSA, Ed25519, ECDH/X25519, P-256/384/521
+- [ ] `crypto/rand` with `Reader`, `Int`, `Prime`; `subtle` complete; ML-KEM later
+- [ ] constant-time tests and Wycheproof vectors
+- [ ] hardware paths for arm64 (AES, SHA, PMULL) and amd64 (AES-NI, SHA-NI, PCLMUL, AVX2)
+
+**database/sql shape**
+- [ ] shared driver shape (on shapes): `Conn`, `Stmt`, `Rows`, `Tx`, `Result`, `Named` args
+- [ ] `Open`, `Query`, `QueryRow`, `Exec`, `Prepare`, `BeginTx` with isolation, `Ping`, pool settings per core
+- [ ] `Scan` into variables, structs (derivation) and `sql.Null*` types
+- [ ] context deadlines and cancellation on every call
+- [ ] drivers: mysql and postgres (done, pooled per core) moved onto the shape; sqlite (pure Tin), clickhouse, mssql
+- [ ] verify against live servers in CI (MySQL 8, Postgres 16) with Go's `sqlmock`-style corpus
+
+**compress, archive, encoding**
+- [ ] `flate`, `gzip`, `zlib`, `lzw`, `bzip2` readers and writers; zstd and brotli as Tin-native extras
+- [ ] `archive/tar` and `archive/zip` on the io shapes
+- [ ] `encoding/*`: base32/64 variants, hex dump, csv, xml, gob decision, asn1, pem, binary (derivation), ascii85
+- [ ] `unicode/utf16`, `utf8` completion, `text/template`, `html/template`, `text/tabwriter`, `text/scanner`, `go/*` decision (a Tin parser package instead)
+- [ ] verify each codec against Go with round trips and cross-decoding
+
+**math, big numbers, random**
+- [ ] `math` special functions: Expm1, Asinh/Acosh/Atanh, Sincos, FMA, Nextafter, Remainder, Logb, Gamma, Lgamma, Erf, Erfc, Bessel family
+- [ ] `math/big`: Int, Rat, Float with Karatsuba/Toom and assembly kernels; `math/cmplx` if complex is accepted
+- [ ] `math/rand` and `rand/v2`: PCG, ChaCha8, Zipf, ExpFloat64, Source shape
+- [ ] verify against Go bit for bit; keep the FMA note in docs/PERFORMANCE.md current
+
+**runtime, sync, testing, misc**
+- [ ] `runtime` equivalents: `NumCPU`, stats, `Gosched`-like yield, `debug.Stack`, build info
+- [ ] `sync`-equivalents without mutexes: `once`, atomics, per-core maps, `relay` pools
+- [ ] `testing`: `T`, `B`, `F`, subtests, `TempDir`, `Setenv`, `Cleanup`, `testing/quick`, `iotest`, `fstest`, `slogtest`
+- [ ] `log` and `log/slog` parity in herald, `expvar`, `flag` completion, `html`, `image/*`, `hash/*` completion, `plugin` (not planned), `go/*` (not planned)
+
+#### 12.4 Compiler performance work packages
+
+**Inliner**
+- [ ] inline multi-statement functions with a size and call-count model
+- [ ] inline across packages after monomorphization
+- [ ] inline `mut` receivers and methods on structs
+- [ ] keep stack traces correct through inlined frames
+- [ ] benchmarks: sort, math, strings, json before and after
+
+**Intrinsics and SIMD**
+- [ ] map bits, math and memory functions to single instructions on both CPUs
+- [ ] vector types and operations in the language, with lane-width checks
+- [ ] memchr, memcmp, utf8 validation, base64, hex, hashing kernels (NEON and AVX2)
+- [ ] runtime CPU feature detection and function multiversioning
+
+**Middle end**
+- [ ] introduce SSA form with a verifier
+- [ ] constant propagation, CSE, DCE, dead store elimination
+- [ ] bounds-check elimination from loop facts
+- [ ] loop invariant motion, unrolling, strength reduction
+- [ ] register allocation and spill heuristics tested on the whole corpus
+
+**Memory**
+- [ ] allocation sinking and stack allocation of request-local values
+- [ ] pool layout tuning: size classes, alignment, prefetch
+- [ ] `keep` copy elision when the source is dead
+- [ ] zero-cost iteration over maps (insertion-ordered) with cache-friendly layout
+
+**Build speed**
+- [ ] parse and check packages in parallel
+- [ ] per-package object cache with content hashes
+- [ ] incremental relink; `tin run` under a second for small programs
+- [ ] compiler self-time profile in CI
+
+#### 12.5 Quality gates every release must keep
+
+- [ ] `make bootstrap` is a fixed point on darwin-arm64, linux-arm64 and linux-amd64
+- [ ] every stdlib package has a Go twin test that is identical or a documented, tested difference
+- [ ] every bug fix has a regression case tied to an issue
+- [ ] no Python added under tools/ci beyond extending existing files; no Go in the build (Go stays only as a comparison baseline)
+- [ ] docs regenerate cleanly (`gendoc.py`, `gen_unicode.py`, COVERAGE) and are checked in CI
+- [ ] benchmarks do not regress by more than 2 percent without a written reason
+
+### 13. API-level task list (every exported Go function, type, method and constant group)
+
+One box per exported function, type and method of each Go standard-library package (`go doc -all`, Go 1.26; constants are one task per package, not per name). `[x]` verified against Go (the package has a twin in notes/stdlib_verified.md or is done in docs/COVERAGE.md); `[~]` a Tin function of that name exists but the package is partial or by design, so it is not verified; `[ ]` to do; `[-]` replaced by design, with the replacement named. Packages marked n/a in docs/COVERAGE.md are left out. Per-package quality tasks are the Go twin, the regression policy and a benchmark, plus a fuzz target for packages that parse untrusted input; the rest are in 12.5.
+
+**5316 API tasks (425 verified, 106 name-only, the rest to do or replaced), plus 497 per-package quality tasks.**
+
+#### `archive/tar` (17 items, 23 constants)
+
+- [ ] `tar.FileInfoNames` (type)
+- [ ] `tar.Format` (type)
+- [ ] `tar.Format.String` (method)
+- [ ] `tar.Header` (type)
+- [ ] `tar.FileInfoHeader` (func)
+- [ ] `tar.Header.FileInfo` (method)
+- [ ] `tar.Reader` (type)
+- [ ] `tar.NewReader` (func)
+- [ ] `tar.Reader.Next` (method)
+- [ ] `tar.Reader.Read` (method)
+- [ ] `tar.Writer` (type)
+- [ ] `tar.NewWriter` (func)
+- [ ] `tar.Writer.AddFS` (method)
+- [ ] `tar.Writer.Close` (method)
+- [ ] `tar.Writer.Flush` (method)
+- [ ] `tar.Writer.Write` (method)
+- [ ] `tar.Writer.WriteHeader` (method)
+- [ ] `tar`: the 23 constants (one task per constant group in `go doc -all archive/tar`)
+- [ ] `tar`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `tar`: regression cases for every bug the twin finds, tied to issues
+- [ ] `tar`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `tar`: fuzz target for every parser and decoder in the package
+
+#### `archive/zip` (34 items, 6 constants)
+
+- [ ] `zip.RegisterCompressor` (func)
+- [ ] `zip.RegisterDecompressor` (func)
+- [ ] `zip.Compressor` (type)
+- [ ] `zip.Decompressor` (type)
+- [ ] `zip.File` (type)
+- [ ] `zip.File.DataOffset` (method)
+- [ ] `zip.File.Open` (method)
+- [ ] `zip.File.OpenRaw` (method)
+- [ ] `zip.FileHeader` (type)
+- [ ] `zip.FileInfoHeader` (func)
+- [ ] `zip.FileHeader.FileInfo` (method)
+- [ ] `zip.FileHeader.ModTime` (method)
+- [ ] `zip.FileHeader.Mode` (method)
+- [ ] `zip.FileHeader.SetModTime` (method)
+- [ ] `zip.FileHeader.SetMode` (method)
+- [ ] `zip.ReadCloser` (type)
+- [ ] `zip.OpenReader` (func)
+- [ ] `zip.ReadCloser.Close` (method)
+- [ ] `zip.Reader` (type)
+- [ ] `zip.NewReader` (func)
+- [ ] `zip.Reader.Open` (method)
+- [ ] `zip.Reader.RegisterDecompressor` (method)
+- [ ] `zip.Writer` (type)
+- [ ] `zip.NewWriter` (func)
+- [ ] `zip.Writer.AddFS` (method)
+- [ ] `zip.Writer.Close` (method)
+- [ ] `zip.Writer.Copy` (method)
+- [ ] `zip.Writer.Create` (method)
+- [ ] `zip.Writer.CreateHeader` (method)
+- [ ] `zip.Writer.CreateRaw` (method)
+- [ ] `zip.Writer.Flush` (method)
+- [ ] `zip.Writer.RegisterCompressor` (method)
+- [ ] `zip.Writer.SetComment` (method)
+- [ ] `zip.Writer.SetOffset` (method)
+- [ ] `zip`: the 6 constants (one task per constant group in `go doc -all archive/zip`)
+- [ ] `zip`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `zip`: regression cases for every bug the twin finds, tied to issues
+- [ ] `zip`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `zip`: fuzz target for every parser and decoder in the package
+
+#### `bufio` (48 items, 9 constants)
+
+- [ ] `bufio.ErrFinalToken` (var)
+- [ ] `bufio.ScanBytes` (func)
+- [ ] `bufio.ScanLines` (func)
+- [ ] `bufio.ScanRunes` (func)
+- [ ] `bufio.ScanWords` (func)
+- [ ] `bufio.ReadWriter` (type)
+- [ ] `bufio.NewReadWriter` (func)
+- [~] `bufio.Reader` (type)
+- [ ] `bufio.NewReader` (func)
+- [ ] `bufio.NewReaderSize` (func)
+- [ ] `bufio.Reader.Buffered` (method)
+- [ ] `bufio.Reader.Discard` (method)
+- [ ] `bufio.Reader.Peek` (method)
+- [ ] `bufio.Reader.Read` (method)
+- [ ] `bufio.Reader.ReadByte` (method)
+- [ ] `bufio.Reader.ReadBytes` (method)
+- [ ] `bufio.Reader.ReadLine` (method)
+- [ ] `bufio.Reader.ReadRune` (method)
+- [ ] `bufio.Reader.ReadSlice` (method)
+- [ ] `bufio.Reader.ReadString` (method)
+- [ ] `bufio.Reader.Reset` (method)
+- [ ] `bufio.Reader.Size` (method)
+- [ ] `bufio.Reader.UnreadByte` (method)
+- [ ] `bufio.Reader.UnreadRune` (method)
+- [ ] `bufio.Reader.WriteTo` (method)
+- [ ] `bufio.Scanner` (type)
+- [ ] `bufio.NewScanner` (func)
+- [ ] `bufio.Scanner.Buffer` (method)
+- [ ] `bufio.Scanner.Bytes` (method)
+- [ ] `bufio.Scanner.Err` (method)
+- [ ] `bufio.Scanner.Scan` (method)
+- [ ] `bufio.Scanner.Split` (method)
+- [ ] `bufio.Scanner.Text` (method)
+- [ ] `bufio.SplitFunc` (type)
+- [~] `bufio.Writer` (type)
+- [~] `bufio.NewWriter` (func)
+- [ ] `bufio.NewWriterSize` (func)
+- [ ] `bufio.Writer.Available` (method)
+- [ ] `bufio.Writer.AvailableBuffer` (method)
+- [ ] `bufio.Writer.Buffered` (method)
+- [~] `bufio.Writer.Flush` (method)
+- [ ] `bufio.Writer.ReadFrom` (method)
+- [ ] `bufio.Writer.Reset` (method)
+- [ ] `bufio.Writer.Size` (method)
+- [ ] `bufio.Writer.Write` (method)
+- [ ] `bufio.Writer.WriteByte` (method)
+- [ ] `bufio.Writer.WriteRune` (method)
+- [ ] `bufio.Writer.WriteString` (method)
+- [ ] `bufio`: the 9 constants (one task per constant group in `go doc -all bufio`)
+- [ ] `bufio`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `bufio`: regression cases for every bug the twin finds, tied to issues
+- [ ] `bufio`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `bufio`: fuzz target for every parser and decoder in the package
+
+#### `bytes` (99 items)
+
+- [ ] `bytes.MinRead` (const)
+- [ ] `bytes.ErrTooLarge` (var)
+- [x] `bytes.Clone` (func)
+- [x] `bytes.Compare` (func)
+- [x] `bytes.Contains` (func)
+- [x] `bytes.ContainsAny` (func)
+- [x] `bytes.ContainsFunc` (func)
+- [x] `bytes.ContainsRune` (func)
+- [x] `bytes.Count` (func)
+- [x] `bytes.Cut` (func)
+- [x] `bytes.CutPrefix` (func)
+- [x] `bytes.CutSuffix` (func)
+- [x] `bytes.Equal` (func)
+- [x] `bytes.EqualFold` (func)
+- [x] `bytes.Fields` (func)
+- [x] `bytes.FieldsFunc` (func)
+- [ ] `bytes.FieldsFuncSeq` (func)
+- [ ] `bytes.FieldsSeq` (func)
+- [x] `bytes.HasPrefix` (func)
+- [x] `bytes.HasSuffix` (func)
+- [x] `bytes.Index` (func)
+- [x] `bytes.IndexAny` (func)
+- [x] `bytes.IndexByte` (func)
+- [x] `bytes.IndexFunc` (func)
+- [x] `bytes.IndexRune` (func)
+- [x] `bytes.Join` (func)
+- [x] `bytes.LastIndex` (func)
+- [x] `bytes.LastIndexAny` (func)
+- [x] `bytes.LastIndexByte` (func)
+- [x] `bytes.LastIndexFunc` (func)
+- [x] `bytes.Lines` (func)
+- [x] `bytes.Map` (func)
+- [x] `bytes.Repeat` (func)
+- [x] `bytes.Replace` (func)
+- [x] `bytes.ReplaceAll` (func)
+- [ ] `bytes.Runes` (func)
+- [x] `bytes.Split` (func)
+- [x] `bytes.SplitAfter` (func)
+- [x] `bytes.SplitAfterN` (func)
+- [ ] `bytes.SplitAfterSeq` (func)
+- [x] `bytes.SplitN` (func)
+- [ ] `bytes.SplitSeq` (func)
+- [x] `bytes.Title` (func)
+- [x] `bytes.ToLower` (func)
+- [ ] `bytes.ToLowerSpecial` (func)
+- [x] `bytes.ToTitle` (func)
+- [ ] `bytes.ToTitleSpecial` (func)
+- [x] `bytes.ToUpper` (func)
+- [ ] `bytes.ToUpperSpecial` (func)
+- [x] `bytes.ToValidUTF8` (func)
+- [x] `bytes.Trim` (func)
+- [x] `bytes.TrimFunc` (func)
+- [x] `bytes.TrimLeft` (func)
+- [x] `bytes.TrimLeftFunc` (func)
+- [x] `bytes.TrimPrefix` (func)
+- [x] `bytes.TrimRight` (func)
+- [x] `bytes.TrimRightFunc` (func)
+- [x] `bytes.TrimSpace` (func)
+- [x] `bytes.TrimSuffix` (func)
+- [ ] `bytes.Buffer` (type)
+- [ ] `bytes.NewBuffer` (func)
+- [ ] `bytes.NewBufferString` (func)
+- [ ] `bytes.Buffer.Available` (method)
+- [ ] `bytes.Buffer.AvailableBuffer` (method)
+- [x] `bytes.Buffer.Bytes` (method)
+- [x] `bytes.Buffer.Cap` (method)
+- [x] `bytes.Buffer.Grow` (method)
+- [x] `bytes.Buffer.Len` (method)
+- [ ] `bytes.Buffer.Next` (method)
+- [ ] `bytes.Buffer.Peek` (method)
+- [ ] `bytes.Buffer.Read` (method)
+- [ ] `bytes.Buffer.ReadByte` (method)
+- [ ] `bytes.Buffer.ReadBytes` (method)
+- [ ] `bytes.Buffer.ReadFrom` (method)
+- [ ] `bytes.Buffer.ReadRune` (method)
+- [ ] `bytes.Buffer.ReadString` (method)
+- [x] `bytes.Buffer.Reset` (method)
+- [x] `bytes.Buffer.String` (method)
+- [x] `bytes.Buffer.Truncate` (method)
+- [ ] `bytes.Buffer.UnreadByte` (method)
+- [ ] `bytes.Buffer.UnreadRune` (method)
+- [x] `bytes.Buffer.Write` (method)
+- [ ] `bytes.Buffer.WriteByte` (method)
+- [ ] `bytes.Buffer.WriteRune` (method)
+- [ ] `bytes.Buffer.WriteString` (method)
+- [ ] `bytes.Buffer.WriteTo` (method)
+- [ ] `bytes.Reader` (type)
+- [ ] `bytes.NewReader` (func)
+- [x] `bytes.Reader.Len` (method)
+- [ ] `bytes.Reader.Read` (method)
+- [ ] `bytes.Reader.ReadAt` (method)
+- [ ] `bytes.Reader.ReadByte` (method)
+- [ ] `bytes.Reader.ReadRune` (method)
+- [x] `bytes.Reader.Reset` (method)
+- [ ] `bytes.Reader.Seek` (method)
+- [ ] `bytes.Reader.Size` (method)
+- [ ] `bytes.Reader.UnreadByte` (method)
+- [ ] `bytes.Reader.UnreadRune` (method)
+- [ ] `bytes.Reader.WriteTo` (method)
+- [ ] `bytes`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `bytes`: regression cases for every bug the twin finds, tied to issues
+- [ ] `bytes`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `cmp` (4 items)
+
+- [x] `cmp.Compare` (func)
+- [x] `cmp.Less` (func)
+- [ ] `cmp.Or` (func)
+- [ ] `cmp.Ordered` (type)
+- [ ] `cmp`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `cmp`: regression cases for every bug the twin finds, tied to issues
+- [ ] `cmp`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `compress/bzip2` (3 items)
+
+- [ ] `bzip2.NewReader` (func)
+- [ ] `bzip2.StructuralError` (type)
+- [ ] `bzip2.StructuralError.Error` (method)
+- [ ] `bzip2`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `bzip2`: regression cases for every bug the twin finds, tied to issues
+- [ ] `bzip2`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `bzip2`: fuzz target for every parser and decoder in the package
+
+#### `compress/flate` (19 items, 5 constants)
+
+- [ ] `flate.NewReader` (func)
+- [ ] `flate.NewReaderDict` (func)
+- [ ] `flate.CorruptInputError` (type)
+- [ ] `flate.CorruptInputError.Error` (method)
+- [ ] `flate.InternalError` (type)
+- [ ] `flate.InternalError.Error` (method)
+- [ ] `flate.ReadError` (type)
+- [ ] `flate.ReadError.Error` (method)
+- [ ] `flate.Reader` (type)
+- [ ] `flate.Resetter` (type)
+- [ ] `flate.WriteError` (type)
+- [ ] `flate.WriteError.Error` (method)
+- [ ] `flate.Writer` (type)
+- [ ] `flate.NewWriter` (func)
+- [ ] `flate.NewWriterDict` (func)
+- [ ] `flate.Writer.Close` (method)
+- [ ] `flate.Writer.Flush` (method)
+- [ ] `flate.Writer.Reset` (method)
+- [ ] `flate.Writer.Write` (method)
+- [ ] `flate`: the 5 constants (one task per constant group in `go doc -all compress/flate`)
+- [ ] `flate`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `flate`: regression cases for every bug the twin finds, tied to issues
+- [ ] `flate`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `flate`: fuzz target for every parser and decoder in the package
+
+#### `compress/gzip` (14 items, 7 constants)
+
+- [ ] `gzip.Header` (type)
+- [ ] `gzip.Reader` (type)
+- [ ] `gzip.NewReader` (func)
+- [ ] `gzip.Reader.Close` (method)
+- [ ] `gzip.Reader.Multistream` (method)
+- [ ] `gzip.Reader.Read` (method)
+- [ ] `gzip.Reader.Reset` (method)
+- [ ] `gzip.Writer` (type)
+- [ ] `gzip.NewWriter` (func)
+- [ ] `gzip.NewWriterLevel` (func)
+- [ ] `gzip.Writer.Close` (method)
+- [ ] `gzip.Writer.Flush` (method)
+- [ ] `gzip.Writer.Reset` (method)
+- [ ] `gzip.Writer.Write` (method)
+- [ ] `gzip`: the 7 constants (one task per constant group in `go doc -all compress/gzip`)
+- [ ] `gzip`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `gzip`: regression cases for every bug the twin finds, tied to issues
+- [ ] `gzip`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `gzip`: fuzz target for every parser and decoder in the package
+
+#### `compress/lzw` (11 items, 2 constants)
+
+- [ ] `lzw.NewReader` (func)
+- [ ] `lzw.NewWriter` (func)
+- [ ] `lzw.Order` (type)
+- [ ] `lzw.Reader` (type)
+- [ ] `lzw.Reader.Close` (method)
+- [ ] `lzw.Reader.Read` (method)
+- [ ] `lzw.Reader.Reset` (method)
+- [ ] `lzw.Writer` (type)
+- [ ] `lzw.Writer.Close` (method)
+- [ ] `lzw.Writer.Reset` (method)
+- [ ] `lzw.Writer.Write` (method)
+- [ ] `lzw`: the 2 constants (one task per constant group in `go doc -all compress/lzw`)
+- [ ] `lzw`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `lzw`: regression cases for every bug the twin finds, tied to issues
+- [ ] `lzw`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `lzw`: fuzz target for every parser and decoder in the package
+
+#### `compress/zlib` (11 items, 8 constants)
+
+- [ ] `zlib.NewReader` (func)
+- [ ] `zlib.NewReaderDict` (func)
+- [ ] `zlib.Resetter` (type)
+- [ ] `zlib.Writer` (type)
+- [ ] `zlib.NewWriter` (func)
+- [ ] `zlib.NewWriterLevel` (func)
+- [ ] `zlib.NewWriterLevelDict` (func)
+- [ ] `zlib.Writer.Close` (method)
+- [ ] `zlib.Writer.Flush` (method)
+- [ ] `zlib.Writer.Reset` (method)
+- [ ] `zlib.Writer.Write` (method)
+- [ ] `zlib`: the 8 constants (one task per constant group in `go doc -all compress/zlib`)
+- [ ] `zlib`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `zlib`: regression cases for every bug the twin finds, tied to issues
+- [ ] `zlib`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `zlib`: fuzz target for every parser and decoder in the package
+
+#### `container/heap` (6 items)
+
+- [ ] `heap.Fix` (func)
+- [ ] `heap.Init` (func)
+- [x] `heap.Pop` (func)
+- [x] `heap.Push` (func)
+- [ ] `heap.Remove` (func)
+- [ ] `heap.Interface` (type)
+- [ ] `heap`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `heap`: regression cases for every bug the twin finds, tied to issues
+- [ ] `heap`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `container/list` (20 items)
+
+- [ ] `list.Element` (type)
+- [x] `list.Element.Next` (method)
+- [ ] `list.Element.Prev` (method)
+- [ ] `list.List` (type)
+- [ ] `list.New` (func)
+- [x] `list.List.Back` (method)
+- [x] `list.List.Front` (method)
+- [ ] `list.List.Init` (method)
+- [ ] `list.List.InsertAfter` (method)
+- [ ] `list.List.InsertBefore` (method)
+- [x] `list.List.Len` (method)
+- [ ] `list.List.MoveAfter` (method)
+- [ ] `list.List.MoveBefore` (method)
+- [ ] `list.List.MoveToBack` (method)
+- [ ] `list.List.MoveToFront` (method)
+- [x] `list.List.PushBack` (method)
+- [ ] `list.List.PushBackList` (method)
+- [x] `list.List.PushFront` (method)
+- [ ] `list.List.PushFrontList` (method)
+- [ ] `list.List.Remove` (method)
+- [ ] `list`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `list`: regression cases for every bug the twin finds, tied to issues
+- [ ] `list`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `container/ring` (9 items)
+
+- [ ] `ring.Ring` (type)
+- [ ] `ring.New` (func)
+- [ ] `ring.Ring.Do` (method)
+- [ ] `ring.Ring.Len` (method)
+- [ ] `ring.Ring.Link` (method)
+- [ ] `ring.Ring.Move` (method)
+- [ ] `ring.Ring.Next` (method)
+- [ ] `ring.Ring.Prev` (method)
+- [ ] `ring.Ring.Unlink` (method)
+- [ ] `ring`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `ring`: regression cases for every bug the twin finds, tied to issues
+- [ ] `ring`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `context` (18 items)
+
+- [ ] `context.DoSomething` (func)
+- [ ] `context.Canceled` (var)
+- [ ] `context.DeadlineExceeded` (var)
+- [-] `context.AfterFunc` (func): replaced by design
+- [ ] `context.Cause` (func)
+- [ ] `context.WithCancel` (func)
+- [ ] `context.WithCancelCause` (func)
+- [ ] `context.WithDeadline` (func)
+- [ ] `context.WithDeadlineCause` (func)
+- [ ] `context.WithTimeout` (func)
+- [ ] `context.WithTimeoutCause` (func)
+- [ ] `context.CancelCauseFunc` (type)
+- [ ] `context.CancelFunc` (type)
+- [ ] `context.Context` (type)
+- [ ] `context.Background` (func)
+- [ ] `context.TODO` (func)
+- [-] `context.WithValue` (func): replaced by design
+- [-] `context.WithoutCancel` (func): replaced by design
+- [ ] `context`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `context`: regression cases for every bug the twin finds, tied to issues
+- [ ] `context`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `crypto/aes` (4 items)
+
+- [ ] `aes.BlockSize` (const)
+- [ ] `aes.NewCipher` (func)
+- [ ] `aes.KeySizeError` (type)
+- [ ] `aes.KeySizeError.Error` (method)
+- [ ] `aes`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `aes`: regression cases for every bug the twin finds, tied to issues
+- [ ] `aes`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `crypto/cipher` (19 items)
+
+- [ ] `cipher.AEAD` (type)
+- [ ] `cipher.NewGCM` (func)
+- [ ] `cipher.NewGCMWithNonceSize` (func)
+- [ ] `cipher.NewGCMWithRandomNonce` (func)
+- [ ] `cipher.NewGCMWithTagSize` (func)
+- [ ] `cipher.Block` (type)
+- [ ] `cipher.BlockMode` (type)
+- [ ] `cipher.NewCBCDecrypter` (func)
+- [ ] `cipher.NewCBCEncrypter` (func)
+- [ ] `cipher.Stream` (type)
+- [ ] `cipher.NewCFBDecrypter` (func)
+- [ ] `cipher.NewCFBEncrypter` (func)
+- [ ] `cipher.NewCTR` (func)
+- [ ] `cipher.NewOFB` (func)
+- [ ] `cipher.StreamReader` (type)
+- [ ] `cipher.StreamReader.Read` (method)
+- [ ] `cipher.StreamWriter` (type)
+- [ ] `cipher.StreamWriter.Close` (method)
+- [ ] `cipher.StreamWriter.Write` (method)
+- [ ] `cipher`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `cipher`: regression cases for every bug the twin finds, tied to issues
+- [ ] `cipher`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `crypto/des` (5 items)
+
+- [-] `des.BlockSize` (const): replaced by design
+- [-] `des.NewCipher` (func): replaced by design
+- [-] `des.NewTripleDESCipher` (func): replaced by design
+- [-] `des.KeySizeError` (type): replaced by design
+- [-] `des.KeySizeError.Error` (method): replaced by design
+- [ ] `des`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `des`: regression cases for every bug the twin finds, tied to issues
+- [ ] `des`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `crypto/dsa` (9 items, 4 constants)
+
+- [-] `dsa.ErrInvalidPublicKey` (var): replaced by design
+- [-] `dsa.GenerateKey` (func): replaced by design
+- [-] `dsa.GenerateParameters` (func): replaced by design
+- [-] `dsa.Sign` (func): replaced by design
+- [-] `dsa.Verify` (func): replaced by design
+- [-] `dsa.ParameterSizes` (type): replaced by design
+- [-] `dsa.Parameters` (type): replaced by design
+- [-] `dsa.PrivateKey` (type): replaced by design
+- [-] `dsa.PublicKey` (type): replaced by design
+- [ ] `dsa`: the 4 constants (one task per constant group in `go doc -all crypto/dsa`)
+- [ ] `dsa`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `dsa`: regression cases for every bug the twin finds, tied to issues
+- [ ] `dsa`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `crypto/ecdh` (17 items)
+
+- [ ] `ecdh.Curve` (type)
+- [ ] `ecdh.P256` (func)
+- [ ] `ecdh.P384` (func)
+- [ ] `ecdh.P521` (func)
+- [ ] `ecdh.X25519` (func)
+- [ ] `ecdh.KeyExchanger` (type)
+- [ ] `ecdh.PrivateKey` (type)
+- [ ] `ecdh.PrivateKey.Bytes` (method)
+- [ ] `ecdh.PrivateKey.Curve` (method)
+- [ ] `ecdh.PrivateKey.ECDH` (method)
+- [ ] `ecdh.PrivateKey.Equal` (method)
+- [ ] `ecdh.PrivateKey.Public` (method)
+- [ ] `ecdh.PrivateKey.PublicKey` (method)
+- [ ] `ecdh.PublicKey` (type)
+- [ ] `ecdh.PublicKey.Bytes` (method)
+- [ ] `ecdh.PublicKey.Curve` (method)
+- [ ] `ecdh.PublicKey.Equal` (method)
+- [ ] `ecdh`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `ecdh`: regression cases for every bug the twin finds, tied to issues
+- [ ] `ecdh`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `crypto/ecdsa` (17 items)
+
+- [ ] `ecdsa.Sign` (func)
+- [ ] `ecdsa.SignASN1` (func)
+- [ ] `ecdsa.Verify` (func)
+- [ ] `ecdsa.VerifyASN1` (func)
+- [ ] `ecdsa.PrivateKey` (type)
+- [ ] `ecdsa.GenerateKey` (func)
+- [ ] `ecdsa.ParseRawPrivateKey` (func)
+- [ ] `ecdsa.PrivateKey.Bytes` (method)
+- [ ] `ecdsa.PrivateKey.ECDH` (method)
+- [ ] `ecdsa.PrivateKey.Equal` (method)
+- [ ] `ecdsa.PrivateKey.Public` (method)
+- [ ] `ecdsa.PrivateKey.Sign` (method)
+- [ ] `ecdsa.PublicKey` (type)
+- [ ] `ecdsa.ParseUncompressedPublicKey` (func)
+- [ ] `ecdsa.PublicKey.Bytes` (method)
+- [ ] `ecdsa.PublicKey.ECDH` (method)
+- [ ] `ecdsa.PublicKey.Equal` (method)
+- [ ] `ecdsa`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `ecdsa`: regression cases for every bug the twin finds, tied to issues
+- [ ] `ecdsa`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `crypto/ed25519` (14 items, 4 constants)
+
+- [ ] `ed25519.GenerateKey` (func)
+- [ ] `ed25519.Sign` (func)
+- [ ] `ed25519.Verify` (func)
+- [ ] `ed25519.VerifyWithOptions` (func)
+- [ ] `ed25519.Options` (type)
+- [ ] `ed25519.Options.HashFunc` (method)
+- [ ] `ed25519.PrivateKey` (type)
+- [ ] `ed25519.NewKeyFromSeed` (func)
+- [ ] `ed25519.PrivateKey.Equal` (method)
+- [ ] `ed25519.PrivateKey.Public` (method)
+- [ ] `ed25519.PrivateKey.Seed` (method)
+- [ ] `ed25519.PrivateKey.Sign` (method)
+- [ ] `ed25519.PublicKey` (type)
+- [ ] `ed25519.PublicKey.Equal` (method)
+- [ ] `ed25519`: the 4 constants (one task per constant group in `go doc -all crypto/ed25519`)
+- [ ] `ed25519`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `ed25519`: regression cases for every bug the twin finds, tied to issues
+- [ ] `ed25519`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `crypto/elliptic` (17 items)
+
+- [ ] `elliptic.GenerateKey` (func)
+- [ ] `elliptic.Marshal` (func)
+- [ ] `elliptic.MarshalCompressed` (func)
+- [ ] `elliptic.Unmarshal` (func)
+- [ ] `elliptic.UnmarshalCompressed` (func)
+- [ ] `elliptic.Curve` (type)
+- [ ] `elliptic.P224` (func)
+- [ ] `elliptic.P256` (func)
+- [ ] `elliptic.P384` (func)
+- [ ] `elliptic.P521` (func)
+- [ ] `elliptic.CurveParams` (type)
+- [ ] `elliptic.CurveParams.Add` (method)
+- [ ] `elliptic.CurveParams.Double` (method)
+- [ ] `elliptic.CurveParams.IsOnCurve` (method)
+- [ ] `elliptic.CurveParams.Params` (method)
+- [ ] `elliptic.CurveParams.ScalarBaseMult` (method)
+- [ ] `elliptic.CurveParams.ScalarMult` (method)
+- [ ] `elliptic`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `elliptic`: regression cases for every bug the twin finds, tied to issues
+- [ ] `elliptic`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `crypto/hkdf` (3 items)
+
+- [ ] `hkdf.Expand` (func)
+- [ ] `hkdf.Extract` (func)
+- [ ] `hkdf.Key` (func)
+- [ ] `hkdf`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `hkdf`: regression cases for every bug the twin finds, tied to issues
+- [ ] `hkdf`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `crypto/hmac` (3 items)
+
+- [ ] `hmac.ValidMAC` (func)
+- [ ] `hmac.Equal` (func)
+- [ ] `hmac.New` (func)
+- [ ] `hmac`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `hmac`: regression cases for every bug the twin finds, tied to issues
+- [ ] `hmac`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `crypto/hpke` (39 items)
+
+- [ ] `hpke.Open` (func)
+- [ ] `hpke.Seal` (func)
+- [ ] `hpke.AEAD` (type)
+- [ ] `hpke.AES128GCM` (func)
+- [ ] `hpke.AES256GCM` (func)
+- [ ] `hpke.ChaCha20Poly1305` (func)
+- [ ] `hpke.ExportOnly` (func)
+- [ ] `hpke.NewAEAD` (func)
+- [ ] `hpke.KDF` (type)
+- [ ] `hpke.HKDFSHA256` (func)
+- [ ] `hpke.HKDFSHA384` (func)
+- [ ] `hpke.HKDFSHA512` (func)
+- [ ] `hpke.NewKDF` (func)
+- [ ] `hpke.SHAKE128` (func)
+- [ ] `hpke.SHAKE256` (func)
+- [ ] `hpke.KEM` (type)
+- [ ] `hpke.DHKEM` (func)
+- [ ] `hpke.MLKEM1024` (func)
+- [ ] `hpke.MLKEM1024P384` (func)
+- [ ] `hpke.MLKEM768` (func)
+- [ ] `hpke.MLKEM768P256` (func)
+- [ ] `hpke.MLKEM768X25519` (func)
+- [ ] `hpke.NewKEM` (func)
+- [ ] `hpke.PrivateKey` (type)
+- [ ] `hpke.NewDHKEMPrivateKey` (func)
+- [ ] `hpke.NewHybridPrivateKey` (func)
+- [ ] `hpke.NewMLKEMPrivateKey` (func)
+- [ ] `hpke.PublicKey` (type)
+- [ ] `hpke.NewDHKEMPublicKey` (func)
+- [ ] `hpke.NewHybridPublicKey` (func)
+- [ ] `hpke.NewMLKEMPublicKey` (func)
+- [ ] `hpke.Recipient` (type)
+- [ ] `hpke.NewRecipient` (func)
+- [ ] `hpke.Recipient.Export` (method)
+- [ ] `hpke.Recipient.Open` (method)
+- [ ] `hpke.Sender` (type)
+- [ ] `hpke.NewSender` (func)
+- [ ] `hpke.Sender.Export` (method)
+- [ ] `hpke.Sender.Seal` (method)
+- [ ] `hpke`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `hpke`: regression cases for every bug the twin finds, tied to issues
+- [ ] `hpke`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `crypto/md5` (4 items)
+
+- [ ] `md5.BlockSize` (const)
+- [ ] `md5.Size` (const)
+- [ ] `md5.New` (func)
+- [ ] `md5.Sum` (func)
+- [ ] `md5`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `md5`: regression cases for every bug the twin finds, tied to issues
+- [ ] `md5`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `crypto/mlkem` (22 items, 6 constants)
+
+- [ ] `mlkem.DecapsulationKey1024` (type)
+- [ ] `mlkem.GenerateKey1024` (func)
+- [ ] `mlkem.NewDecapsulationKey1024` (func)
+- [ ] `mlkem.DecapsulationKey1024.Bytes` (method)
+- [ ] `mlkem.DecapsulationKey1024.Decapsulate` (method)
+- [ ] `mlkem.DecapsulationKey1024.EncapsulationKey` (method)
+- [ ] `mlkem.DecapsulationKey1024.Encapsulator` (method)
+- [ ] `mlkem.DecapsulationKey768` (type)
+- [ ] `mlkem.GenerateKey768` (func)
+- [ ] `mlkem.NewDecapsulationKey768` (func)
+- [ ] `mlkem.DecapsulationKey768.Bytes` (method)
+- [ ] `mlkem.DecapsulationKey768.Decapsulate` (method)
+- [ ] `mlkem.DecapsulationKey768.EncapsulationKey` (method)
+- [ ] `mlkem.DecapsulationKey768.Encapsulator` (method)
+- [ ] `mlkem.EncapsulationKey1024` (type)
+- [ ] `mlkem.NewEncapsulationKey1024` (func)
+- [ ] `mlkem.EncapsulationKey1024.Bytes` (method)
+- [ ] `mlkem.EncapsulationKey1024.Encapsulate` (method)
+- [ ] `mlkem.EncapsulationKey768` (type)
+- [ ] `mlkem.NewEncapsulationKey768` (func)
+- [ ] `mlkem.EncapsulationKey768.Bytes` (method)
+- [ ] `mlkem.EncapsulationKey768.Encapsulate` (method)
+- [ ] `mlkem`: the 6 constants (one task per constant group in `go doc -all crypto/mlkem`)
+- [ ] `mlkem`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `mlkem`: regression cases for every bug the twin finds, tied to issues
+- [ ] `mlkem`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `crypto/pbkdf2` (1 items)
+
+- [ ] `pbkdf2.Key` (func)
+- [ ] `pbkdf2`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `pbkdf2`: regression cases for every bug the twin finds, tied to issues
+- [ ] `pbkdf2`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `crypto/rand` (5 items)
+
+- [ ] `rand.Reader` (var)
+- [ ] `rand.Int` (func)
+- [ ] `rand.Prime` (func)
+- [ ] `rand.Read` (func)
+- [ ] `rand.Text` (func)
+- [ ] `rand`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `rand`: regression cases for every bug the twin finds, tied to issues
+- [ ] `rand`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `crypto/rc4` (6 items)
+
+- [-] `rc4.Cipher` (type): replaced by design
+- [-] `rc4.NewCipher` (func): replaced by design
+- [-] `rc4.Cipher.Reset` (method): replaced by design
+- [-] `rc4.Cipher.XORKeyStream` (method): replaced by design
+- [-] `rc4.KeySizeError` (type): replaced by design
+- [-] `rc4.KeySizeError.Error` (method): replaced by design
+- [ ] `rc4`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `rc4`: regression cases for every bug the twin finds, tied to issues
+- [ ] `rc4`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `crypto/rsa` (31 items, 2 constants)
+
+- [ ] `rsa.ErrDecryption` (var)
+- [ ] `rsa.ErrMessageTooLong` (var)
+- [ ] `rsa.ErrVerification` (var)
+- [ ] `rsa.DecryptOAEP` (func)
+- [ ] `rsa.DecryptPKCS1v15` (func)
+- [ ] `rsa.DecryptPKCS1v15SessionKey` (func)
+- [ ] `rsa.EncryptOAEP` (func)
+- [ ] `rsa.EncryptOAEPWithOptions` (func)
+- [ ] `rsa.EncryptPKCS1v15` (func)
+- [ ] `rsa.SignPKCS1v15` (func)
+- [ ] `rsa.SignPSS` (func)
+- [ ] `rsa.VerifyPKCS1v15` (func)
+- [ ] `rsa.VerifyPSS` (func)
+- [ ] `rsa.CRTValue` (type)
+- [ ] `rsa.OAEPOptions` (type)
+- [ ] `rsa.PKCS1v15DecryptOptions` (type)
+- [ ] `rsa.PSSOptions` (type)
+- [ ] `rsa.PSSOptions.HashFunc` (method)
+- [ ] `rsa.PrecomputedValues` (type)
+- [ ] `rsa.PrivateKey` (type)
+- [ ] `rsa.GenerateKey` (func)
+- [ ] `rsa.GenerateMultiPrimeKey` (func)
+- [ ] `rsa.PrivateKey.Decrypt` (method)
+- [ ] `rsa.PrivateKey.Equal` (method)
+- [ ] `rsa.PrivateKey.Precompute` (method)
+- [ ] `rsa.PrivateKey.Public` (method)
+- [ ] `rsa.PrivateKey.Sign` (method)
+- [ ] `rsa.PrivateKey.Validate` (method)
+- [ ] `rsa.PublicKey` (type)
+- [ ] `rsa.PublicKey.Equal` (method)
+- [ ] `rsa.PublicKey.Size` (method)
+- [ ] `rsa`: the 2 constants (one task per constant group in `go doc -all crypto/rsa`)
+- [ ] `rsa`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `rsa`: regression cases for every bug the twin finds, tied to issues
+- [ ] `rsa`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `crypto/sha1` (4 items)
+
+- [ ] `sha1.BlockSize` (const)
+- [ ] `sha1.Size` (const)
+- [ ] `sha1.New` (func)
+- [ ] `sha1.Sum` (func)
+- [ ] `sha1`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `sha1`: regression cases for every bug the twin finds, tied to issues
+- [ ] `sha1`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `crypto/sha256` (7 items)
+
+- [ ] `sha256.BlockSize` (const)
+- [ ] `sha256.Size` (const)
+- [ ] `sha256.Size224` (const)
+- [ ] `sha256.New` (func)
+- [ ] `sha256.New224` (func)
+- [ ] `sha256.Sum224` (func)
+- [ ] `sha256.Sum256` (func)
+- [ ] `sha256`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `sha256`: regression cases for every bug the twin finds, tied to issues
+- [ ] `sha256`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `crypto/sha3` (32 items)
+
+- [ ] `sha3.Sum224` (func)
+- [ ] `sha3.Sum256` (func)
+- [ ] `sha3.Sum384` (func)
+- [ ] `sha3.Sum512` (func)
+- [ ] `sha3.SumSHAKE128` (func)
+- [ ] `sha3.SumSHAKE256` (func)
+- [ ] `sha3.SHA3` (type)
+- [ ] `sha3.New224` (func)
+- [ ] `sha3.New256` (func)
+- [ ] `sha3.New384` (func)
+- [ ] `sha3.New512` (func)
+- [ ] `sha3.SHA3.AppendBinary` (method)
+- [ ] `sha3.SHA3.BlockSize` (method)
+- [ ] `sha3.SHA3.Clone` (method)
+- [ ] `sha3.SHA3.MarshalBinary` (method)
+- [ ] `sha3.SHA3.Reset` (method)
+- [ ] `sha3.SHA3.Size` (method)
+- [ ] `sha3.SHA3.Sum` (method)
+- [ ] `sha3.SHA3.UnmarshalBinary` (method)
+- [ ] `sha3.SHA3.Write` (method)
+- [ ] `sha3.SHAKE` (type)
+- [ ] `sha3.NewCSHAKE128` (func)
+- [ ] `sha3.NewCSHAKE256` (func)
+- [ ] `sha3.NewSHAKE128` (func)
+- [ ] `sha3.NewSHAKE256` (func)
+- [ ] `sha3.SHAKE.AppendBinary` (method)
+- [ ] `sha3.SHAKE.BlockSize` (method)
+- [ ] `sha3.SHAKE.MarshalBinary` (method)
+- [ ] `sha3.SHAKE.Read` (method)
+- [ ] `sha3.SHAKE.Reset` (method)
+- [ ] `sha3.SHAKE.UnmarshalBinary` (method)
+- [ ] `sha3.SHAKE.Write` (method)
+- [ ] `sha3`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `sha3`: regression cases for every bug the twin finds, tied to issues
+- [ ] `sha3`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `crypto/sha512` (8 items, 5 constants)
+
+- [ ] `sha512.New` (func)
+- [ ] `sha512.New384` (func)
+- [ ] `sha512.New512_224` (func)
+- [ ] `sha512.New512_256` (func)
+- [ ] `sha512.Sum384` (func)
+- [ ] `sha512.Sum512` (func)
+- [ ] `sha512.Sum512_224` (func)
+- [ ] `sha512.Sum512_256` (func)
+- [ ] `sha512`: the 5 constants (one task per constant group in `go doc -all crypto/sha512`)
+- [ ] `sha512`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `sha512`: regression cases for every bug the twin finds, tied to issues
+- [ ] `sha512`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `crypto/subtle` (8 items)
+
+- [ ] `subtle.ConstantTimeByteEq` (func)
+- [ ] `subtle.ConstantTimeCompare` (func)
+- [ ] `subtle.ConstantTimeCopy` (func)
+- [~] `subtle.ConstantTimeEq` (func)
+- [ ] `subtle.ConstantTimeLessOrEq` (func)
+- [ ] `subtle.ConstantTimeSelect` (func)
+- [ ] `subtle.WithDataIndependentTiming` (func)
+- [ ] `subtle.XORBytes` (func)
+- [ ] `subtle`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `subtle`: regression cases for every bug the twin finds, tied to issues
+- [ ] `subtle`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `crypto/tls` (89 items, 75 constants)
+
+- [ ] `tls.CipherSuiteName` (func)
+- [ ] `tls.Listen` (func)
+- [ ] `tls.NewListener` (func)
+- [ ] `tls.VersionName` (func)
+- [ ] `tls.AlertError` (type)
+- [ ] `tls.AlertError.Error` (method)
+- [ ] `tls.Certificate` (type)
+- [ ] `tls.LoadX509KeyPair` (func)
+- [ ] `tls.X509KeyPair` (func)
+- [ ] `tls.CertificateRequestInfo` (type)
+- [ ] `tls.CertificateRequestInfo.Context` (method)
+- [ ] `tls.CertificateRequestInfo.SupportsCertificate` (method)
+- [ ] `tls.CertificateVerificationError` (type)
+- [ ] `tls.CertificateVerificationError.Error` (method)
+- [ ] `tls.CertificateVerificationError.Unwrap` (method)
+- [ ] `tls.CipherSuite` (type)
+- [ ] `tls.CipherSuites` (func)
+- [ ] `tls.InsecureCipherSuites` (func)
+- [ ] `tls.ClientAuthType` (type)
+- [ ] `tls.ClientAuthType.String` (method)
+- [ ] `tls.ClientHelloInfo` (type)
+- [ ] `tls.ClientHelloInfo.Context` (method)
+- [ ] `tls.ClientHelloInfo.SupportsCertificate` (method)
+- [ ] `tls.ClientSessionCache` (type)
+- [ ] `tls.NewLRUClientSessionCache` (func)
+- [ ] `tls.ClientSessionState` (type)
+- [ ] `tls.NewResumptionState` (func)
+- [ ] `tls.ClientSessionState.ResumptionState` (method)
+- [ ] `tls.Config` (type)
+- [ ] `tls.Config.BuildNameToCertificate` (method)
+- [ ] `tls.Config.Clone` (method)
+- [ ] `tls.Config.DecryptTicket` (method)
+- [ ] `tls.Config.EncryptTicket` (method)
+- [ ] `tls.Config.SetSessionTicketKeys` (method)
+- [ ] `tls.Conn` (type)
+- [ ] `tls.Client` (func)
+- [ ] `tls.Dial` (func)
+- [ ] `tls.DialWithDialer` (func)
+- [ ] `tls.Server` (func)
+- [ ] `tls.Conn.Close` (method)
+- [ ] `tls.Conn.CloseWrite` (method)
+- [ ] `tls.Conn.ConnectionState` (method)
+- [ ] `tls.Conn.Handshake` (method)
+- [ ] `tls.Conn.HandshakeContext` (method)
+- [ ] `tls.Conn.LocalAddr` (method)
+- [ ] `tls.Conn.NetConn` (method)
+- [ ] `tls.Conn.OCSPResponse` (method)
+- [ ] `tls.Conn.Read` (method)
+- [ ] `tls.Conn.RemoteAddr` (method)
+- [ ] `tls.Conn.SetDeadline` (method)
+- [ ] `tls.Conn.SetReadDeadline` (method)
+- [ ] `tls.Conn.SetWriteDeadline` (method)
+- [ ] `tls.Conn.VerifyHostname` (method)
+- [ ] `tls.Conn.Write` (method)
+- [ ] `tls.ConnectionState` (type)
+- [ ] `tls.ConnectionState.ExportKeyingMaterial` (method)
+- [ ] `tls.CurveID` (type)
+- [ ] `tls.CurveID.String` (method)
+- [ ] `tls.Dialer` (type)
+- [ ] `tls.Dialer.Dial` (method)
+- [ ] `tls.Dialer.DialContext` (method)
+- [ ] `tls.ECHRejectionError` (type)
+- [ ] `tls.ECHRejectionError.Error` (method)
+- [ ] `tls.EncryptedClientHelloKey` (type)
+- [ ] `tls.QUICConfig` (type)
+- [ ] `tls.QUICConn` (type)
+- [ ] `tls.QUICClient` (func)
+- [ ] `tls.QUICServer` (func)
+- [ ] `tls.QUICConn.Close` (method)
+- [ ] `tls.QUICConn.ConnectionState` (method)
+- [ ] `tls.QUICConn.HandleData` (method)
+- [ ] `tls.QUICConn.NextEvent` (method)
+- [ ] `tls.QUICConn.SendSessionTicket` (method)
+- [ ] `tls.QUICConn.SetTransportParameters` (method)
+- [ ] `tls.QUICConn.Start` (method)
+- [ ] `tls.QUICConn.StoreSession` (method)
+- [ ] `tls.QUICEncryptionLevel` (type)
+- [ ] `tls.QUICEncryptionLevel.String` (method)
+- [ ] `tls.QUICEvent` (type)
+- [ ] `tls.QUICEventKind` (type)
+- [ ] `tls.QUICSessionTicketOptions` (type)
+- [ ] `tls.RecordHeaderError` (type)
+- [ ] `tls.RecordHeaderError.Error` (method)
+- [ ] `tls.RenegotiationSupport` (type)
+- [ ] `tls.SessionState` (type)
+- [ ] `tls.ParseSessionState` (func)
+- [ ] `tls.SessionState.Bytes` (method)
+- [ ] `tls.SignatureScheme` (type)
+- [ ] `tls.SignatureScheme.String` (method)
+- [ ] `tls`: the 75 constants (one task per constant group in `go doc -all crypto/tls`)
+- [ ] `tls`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `tls`: regression cases for every bug the twin finds, tied to issues
+- [ ] `tls`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `tls`: fuzz target for every parser and decoder in the package
+
+#### `crypto/x509` (88 items, 61 constants)
+
+- [ ] `x509.ErrUnsupportedAlgorithm` (var)
+- [ ] `x509.IncorrectPasswordError` (var)
+- [ ] `x509.CreateCertificate` (func)
+- [ ] `x509.CreateCertificateRequest` (func)
+- [ ] `x509.CreateRevocationList` (func)
+- [ ] `x509.DecryptPEMBlock` (func)
+- [ ] `x509.EncryptPEMBlock` (func)
+- [ ] `x509.IsEncryptedPEMBlock` (func)
+- [ ] `x509.MarshalECPrivateKey` (func)
+- [ ] `x509.MarshalPKCS1PrivateKey` (func)
+- [ ] `x509.MarshalPKCS1PublicKey` (func)
+- [ ] `x509.MarshalPKCS8PrivateKey` (func)
+- [ ] `x509.MarshalPKIXPublicKey` (func)
+- [ ] `x509.ParseCRL` (func)
+- [ ] `x509.ParseDERCRL` (func)
+- [ ] `x509.ParseECPrivateKey` (func)
+- [ ] `x509.ParsePKCS1PrivateKey` (func)
+- [ ] `x509.ParsePKCS1PublicKey` (func)
+- [ ] `x509.ParsePKCS8PrivateKey` (func)
+- [ ] `x509.ParsePKIXPublicKey` (func)
+- [ ] `x509.SetFallbackRoots` (func)
+- [ ] `x509.CertPool` (type)
+- [ ] `x509.NewCertPool` (func)
+- [ ] `x509.SystemCertPool` (func)
+- [ ] `x509.CertPool.AddCert` (method)
+- [ ] `x509.CertPool.AddCertWithConstraint` (method)
+- [ ] `x509.CertPool.AppendCertsFromPEM` (method)
+- [ ] `x509.CertPool.Clone` (method)
+- [ ] `x509.CertPool.Equal` (method)
+- [ ] `x509.CertPool.Subjects` (method)
+- [ ] `x509.Certificate` (type)
+- [ ] `x509.ParseCertificate` (func)
+- [ ] `x509.ParseCertificates` (func)
+- [ ] `x509.Certificate.CheckCRLSignature` (method)
+- [ ] `x509.Certificate.CheckSignature` (method)
+- [ ] `x509.Certificate.CheckSignatureFrom` (method)
+- [ ] `x509.Certificate.CreateCRL` (method)
+- [ ] `x509.Certificate.Equal` (method)
+- [ ] `x509.Certificate.Verify` (method)
+- [ ] `x509.Certificate.VerifyHostname` (method)
+- [ ] `x509.CertificateInvalidError` (type)
+- [ ] `x509.CertificateInvalidError.Error` (method)
+- [ ] `x509.CertificateRequest` (type)
+- [ ] `x509.ParseCertificateRequest` (func)
+- [ ] `x509.CertificateRequest.CheckSignature` (method)
+- [ ] `x509.ConstraintViolationError` (type)
+- [ ] `x509.ConstraintViolationError.Error` (method)
+- [ ] `x509.ExtKeyUsage` (type)
+- [ ] `x509.ExtKeyUsage.OID` (method)
+- [ ] `x509.ExtKeyUsage.String` (method)
+- [ ] `x509.HostnameError` (type)
+- [ ] `x509.HostnameError.Error` (method)
+- [ ] `x509.InsecureAlgorithmError` (type)
+- [ ] `x509.InsecureAlgorithmError.Error` (method)
+- [ ] `x509.InvalidReason` (type)
+- [ ] `x509.KeyUsage` (type)
+- [ ] `x509.KeyUsage.String` (method)
+- [ ] `x509.OID` (type)
+- [ ] `x509.OIDFromASN1OID` (func)
+- [ ] `x509.OIDFromInts` (func)
+- [ ] `x509.ParseOID` (func)
+- [ ] `x509.OID.AppendBinary` (method)
+- [ ] `x509.OID.AppendText` (method)
+- [ ] `x509.OID.Equal` (method)
+- [ ] `x509.OID.EqualASN1OID` (method)
+- [ ] `x509.OID.MarshalBinary` (method)
+- [ ] `x509.OID.MarshalText` (method)
+- [ ] `x509.OID.String` (method)
+- [ ] `x509.OID.UnmarshalBinary` (method)
+- [ ] `x509.OID.UnmarshalText` (method)
+- [ ] `x509.PEMCipher` (type)
+- [ ] `x509.PolicyMapping` (type)
+- [ ] `x509.PublicKeyAlgorithm` (type)
+- [ ] `x509.PublicKeyAlgorithm.String` (method)
+- [ ] `x509.RevocationList` (type)
+- [ ] `x509.ParseRevocationList` (func)
+- [ ] `x509.RevocationList.CheckSignatureFrom` (method)
+- [ ] `x509.RevocationListEntry` (type)
+- [ ] `x509.SignatureAlgorithm` (type)
+- [ ] `x509.SignatureAlgorithm.String` (method)
+- [ ] `x509.SystemRootsError` (type)
+- [ ] `x509.SystemRootsError.Error` (method)
+- [ ] `x509.SystemRootsError.Unwrap` (method)
+- [ ] `x509.UnhandledCriticalExtension` (type)
+- [ ] `x509.UnhandledCriticalExtension.Error` (method)
+- [ ] `x509.UnknownAuthorityError` (type)
+- [ ] `x509.UnknownAuthorityError.Error` (method)
+- [ ] `x509.VerifyOptions` (type)
+- [ ] `x509`: the 61 constants (one task per constant group in `go doc -all crypto/x509`)
+- [ ] `x509`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `x509`: regression cases for every bug the twin finds, tied to issues
+- [ ] `x509`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `x509`: fuzz target for every parser and decoder in the package
+
+#### `crypto/x509/pkix` (15 items)
+
+- [ ] `pkix.AlgorithmIdentifier` (type)
+- [ ] `pkix.AttributeTypeAndValue` (type)
+- [ ] `pkix.AttributeTypeAndValueSET` (type)
+- [ ] `pkix.CertificateList` (type)
+- [ ] `pkix.CertificateList.HasExpired` (method)
+- [ ] `pkix.Extension` (type)
+- [ ] `pkix.Name` (type)
+- [ ] `pkix.Name.FillFromRDNSequence` (method)
+- [ ] `pkix.Name.String` (method)
+- [ ] `pkix.Name.ToRDNSequence` (method)
+- [ ] `pkix.RDNSequence` (type)
+- [ ] `pkix.RDNSequence.String` (method)
+- [ ] `pkix.RelativeDistinguishedNameSET` (type)
+- [ ] `pkix.RevokedCertificate` (type)
+- [ ] `pkix.TBSCertificateList` (type)
+- [ ] `pkix`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `pkix`: regression cases for every bug the twin finds, tied to issues
+- [ ] `pkix`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `database/sql` (113 items, 8 constants)
+
+- [ ] `sql.ErrConnDone` (var)
+- [ ] `sql.ErrNoRows` (var)
+- [ ] `sql.ErrTxDone` (var)
+- [ ] `sql.Drivers` (func)
+- [ ] `sql.Register` (func)
+- [ ] `sql.ColumnType` (type)
+- [ ] `sql.ColumnType.DatabaseTypeName` (method)
+- [ ] `sql.ColumnType.DecimalSize` (method)
+- [ ] `sql.ColumnType.Length` (method)
+- [ ] `sql.ColumnType.Name` (method)
+- [ ] `sql.ColumnType.Nullable` (method)
+- [ ] `sql.ColumnType.ScanType` (method)
+- [ ] `sql.Conn` (type)
+- [ ] `sql.Conn.BeginTx` (method)
+- [ ] `sql.Conn.Close` (method)
+- [ ] `sql.Conn.ExecContext` (method)
+- [ ] `sql.Conn.PingContext` (method)
+- [ ] `sql.Conn.PrepareContext` (method)
+- [ ] `sql.Conn.QueryContext` (method)
+- [ ] `sql.Conn.QueryRowContext` (method)
+- [ ] `sql.Conn.Raw` (method)
+- [ ] `sql.DB` (type)
+- [~] `sql.Open` (func)
+- [ ] `sql.OpenDB` (func)
+- [~] `sql.DB.Begin` (method)
+- [ ] `sql.DB.BeginTx` (method)
+- [ ] `sql.DB.Close` (method)
+- [ ] `sql.DB.Conn` (method)
+- [ ] `sql.DB.Driver` (method)
+- [~] `sql.DB.Exec` (method)
+- [ ] `sql.DB.ExecContext` (method)
+- [~] `sql.DB.Ping` (method)
+- [ ] `sql.DB.PingContext` (method)
+- [ ] `sql.DB.Prepare` (method)
+- [ ] `sql.DB.PrepareContext` (method)
+- [~] `sql.DB.Query` (method)
+- [ ] `sql.DB.QueryContext` (method)
+- [ ] `sql.DB.QueryRow` (method)
+- [ ] `sql.DB.QueryRowContext` (method)
+- [ ] `sql.DB.SetConnMaxIdleTime` (method)
+- [ ] `sql.DB.SetConnMaxLifetime` (method)
+- [ ] `sql.DB.SetMaxIdleConns` (method)
+- [ ] `sql.DB.SetMaxOpenConns` (method)
+- [ ] `sql.DB.Stats` (method)
+- [ ] `sql.DBStats` (type)
+- [ ] `sql.IsolationLevel` (type)
+- [ ] `sql.IsolationLevel.String` (method)
+- [ ] `sql.NamedArg` (type)
+- [ ] `sql.Named` (func)
+- [ ] `sql.Null` (type)
+- [ ] `sql.Null.Scan` (method)
+- [~] `sql.Null.Value` (method)
+- [ ] `sql.NullBool` (type)
+- [ ] `sql.NullBool.Scan` (method)
+- [~] `sql.NullBool.Value` (method)
+- [ ] `sql.NullByte` (type)
+- [ ] `sql.NullByte.Scan` (method)
+- [~] `sql.NullByte.Value` (method)
+- [ ] `sql.NullFloat64` (type)
+- [ ] `sql.NullFloat64.Scan` (method)
+- [~] `sql.NullFloat64.Value` (method)
+- [ ] `sql.NullInt16` (type)
+- [ ] `sql.NullInt16.Scan` (method)
+- [~] `sql.NullInt16.Value` (method)
+- [ ] `sql.NullInt32` (type)
+- [ ] `sql.NullInt32.Scan` (method)
+- [~] `sql.NullInt32.Value` (method)
+- [ ] `sql.NullInt64` (type)
+- [ ] `sql.NullInt64.Scan` (method)
+- [~] `sql.NullInt64.Value` (method)
+- [ ] `sql.NullString` (type)
+- [ ] `sql.NullString.Scan` (method)
+- [~] `sql.NullString.Value` (method)
+- [ ] `sql.NullTime` (type)
+- [ ] `sql.NullTime.Scan` (method)
+- [~] `sql.NullTime.Value` (method)
+- [ ] `sql.Out` (type)
+- [ ] `sql.RawBytes` (type)
+- [~] `sql.Result` (type)
+- [ ] `sql.Row` (type)
+- [ ] `sql.Row.Err` (method)
+- [ ] `sql.Row.Scan` (method)
+- [~] `sql.Rows` (type)
+- [ ] `sql.Rows.Close` (method)
+- [ ] `sql.Rows.ColumnTypes` (method)
+- [ ] `sql.Rows.Columns` (method)
+- [ ] `sql.Rows.Err` (method)
+- [ ] `sql.Rows.Next` (method)
+- [ ] `sql.Rows.NextResultSet` (method)
+- [ ] `sql.Rows.Scan` (method)
+- [ ] `sql.Scanner` (type)
+- [ ] `sql.Stmt` (type)
+- [ ] `sql.Stmt.Close` (method)
+- [~] `sql.Stmt.Exec` (method)
+- [ ] `sql.Stmt.ExecContext` (method)
+- [~] `sql.Stmt.Query` (method)
+- [ ] `sql.Stmt.QueryContext` (method)
+- [ ] `sql.Stmt.QueryRow` (method)
+- [ ] `sql.Stmt.QueryRowContext` (method)
+- [~] `sql.Tx` (type)
+- [~] `sql.Tx.Commit` (method)
+- [~] `sql.Tx.Exec` (method)
+- [ ] `sql.Tx.ExecContext` (method)
+- [ ] `sql.Tx.Prepare` (method)
+- [ ] `sql.Tx.PrepareContext` (method)
+- [~] `sql.Tx.Query` (method)
+- [ ] `sql.Tx.QueryContext` (method)
+- [ ] `sql.Tx.QueryRow` (method)
+- [ ] `sql.Tx.QueryRowContext` (method)
+- [~] `sql.Tx.Rollback` (method)
+- [ ] `sql.Tx.Stmt` (method)
+- [ ] `sql.Tx.StmtContext` (method)
+- [ ] `sql.TxOptions` (type)
+- [ ] `sql`: the 8 constants (one task per constant group in `go doc -all database/sql`)
+- [ ] `sql`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `sql`: regression cases for every bug the twin finds, tied to issues
+- [ ] `sql`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `sql`: fuzz target for every parser and decoder in the package
+
+#### `database/sql/driver` (50 items)
+
+- [ ] `driver.ErrBadConn` (var)
+- [ ] `driver.ErrRemoveArgument` (var)
+- [ ] `driver.ErrSkip` (var)
+- [ ] `driver.Bool` (var)
+- [ ] `driver.DefaultParameterConverter` (var)
+- [ ] `driver.Int32` (var)
+- [ ] `driver.ResultNoRows` (var)
+- [ ] `driver.String` (var)
+- [ ] `driver.IsScanValue` (func)
+- [ ] `driver.IsValue` (func)
+- [ ] `driver.ColumnConverter` (type)
+- [ ] `driver.Conn` (type)
+- [ ] `driver.ConnBeginTx` (type)
+- [ ] `driver.ConnPrepareContext` (type)
+- [ ] `driver.Connector` (type)
+- [ ] `driver.Driver` (type)
+- [ ] `driver.DriverContext` (type)
+- [ ] `driver.Execer` (type)
+- [ ] `driver.ExecerContext` (type)
+- [ ] `driver.IsolationLevel` (type)
+- [ ] `driver.NamedValue` (type)
+- [ ] `driver.NamedValueChecker` (type)
+- [ ] `driver.NotNull` (type)
+- [ ] `driver.NotNull.ConvertValue` (method)
+- [ ] `driver.Null` (type)
+- [ ] `driver.Null.ConvertValue` (method)
+- [ ] `driver.Pinger` (type)
+- [ ] `driver.Queryer` (type)
+- [ ] `driver.QueryerContext` (type)
+- [ ] `driver.Result` (type)
+- [ ] `driver.Rows` (type)
+- [ ] `driver.RowsAffected` (type)
+- [ ] `driver.RowsAffected.LastInsertId` (method)
+- [ ] `driver.RowsAffected.RowsAffected` (method)
+- [ ] `driver.RowsColumnTypeDatabaseTypeName` (type)
+- [ ] `driver.RowsColumnTypeLength` (type)
+- [ ] `driver.RowsColumnTypeNullable` (type)
+- [ ] `driver.RowsColumnTypePrecisionScale` (type)
+- [ ] `driver.RowsColumnTypeScanType` (type)
+- [ ] `driver.RowsNextResultSet` (type)
+- [ ] `driver.SessionResetter` (type)
+- [ ] `driver.Stmt` (type)
+- [ ] `driver.StmtExecContext` (type)
+- [ ] `driver.StmtQueryContext` (type)
+- [ ] `driver.Tx` (type)
+- [ ] `driver.TxOptions` (type)
+- [ ] `driver.Validator` (type)
+- [ ] `driver.Value` (type)
+- [ ] `driver.ValueConverter` (type)
+- [ ] `driver.Valuer` (type)
+- [ ] `driver`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `driver`: regression cases for every bug the twin finds, tied to issues
+- [ ] `driver`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `debug/buildinfo` (3 items)
+
+- [ ] `buildinfo.BuildInfo` (type)
+- [ ] `buildinfo.Read` (func)
+- [ ] `buildinfo.ReadFile` (func)
+- [ ] `buildinfo`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `buildinfo`: regression cases for every bug the twin finds, tied to issues
+- [ ] `buildinfo`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `debug/dwarf` (84 items, 210 constants)
+
+- [ ] `dwarf.ErrUnknownPC` (var)
+- [ ] `dwarf.AddrType` (type)
+- [ ] `dwarf.ArrayType` (type)
+- [ ] `dwarf.ArrayType.Size` (method)
+- [ ] `dwarf.ArrayType.String` (method)
+- [ ] `dwarf.Attr` (type)
+- [ ] `dwarf.Attr.GoString` (method)
+- [ ] `dwarf.Attr.String` (method)
+- [ ] `dwarf.BasicType` (type)
+- [ ] `dwarf.BasicType.Basic` (method)
+- [ ] `dwarf.BasicType.String` (method)
+- [ ] `dwarf.BoolType` (type)
+- [ ] `dwarf.CharType` (type)
+- [ ] `dwarf.Class` (type)
+- [ ] `dwarf.Class.GoString` (method)
+- [ ] `dwarf.Class.String` (method)
+- [ ] `dwarf.CommonType` (type)
+- [ ] `dwarf.CommonType.Common` (method)
+- [ ] `dwarf.CommonType.Size` (method)
+- [ ] `dwarf.ComplexType` (type)
+- [ ] `dwarf.Data` (type)
+- [ ] `dwarf.New` (func)
+- [ ] `dwarf.Data.AddSection` (method)
+- [ ] `dwarf.Data.AddTypes` (method)
+- [ ] `dwarf.Data.LineReader` (method)
+- [ ] `dwarf.Data.Ranges` (method)
+- [ ] `dwarf.Data.Reader` (method)
+- [ ] `dwarf.Data.Type` (method)
+- [ ] `dwarf.DecodeError` (type)
+- [ ] `dwarf.DecodeError.Error` (method)
+- [ ] `dwarf.DotDotDotType` (type)
+- [ ] `dwarf.DotDotDotType.String` (method)
+- [ ] `dwarf.Entry` (type)
+- [ ] `dwarf.Entry.AttrField` (method)
+- [ ] `dwarf.Entry.Val` (method)
+- [ ] `dwarf.EnumType` (type)
+- [ ] `dwarf.EnumType.String` (method)
+- [ ] `dwarf.EnumValue` (type)
+- [ ] `dwarf.Field` (type)
+- [ ] `dwarf.FloatType` (type)
+- [ ] `dwarf.FuncType` (type)
+- [ ] `dwarf.FuncType.String` (method)
+- [ ] `dwarf.IntType` (type)
+- [ ] `dwarf.LineEntry` (type)
+- [ ] `dwarf.LineFile` (type)
+- [ ] `dwarf.LineReader` (type)
+- [ ] `dwarf.LineReader.Files` (method)
+- [ ] `dwarf.LineReader.Next` (method)
+- [ ] `dwarf.LineReader.Reset` (method)
+- [ ] `dwarf.LineReader.Seek` (method)
+- [ ] `dwarf.LineReader.SeekPC` (method)
+- [ ] `dwarf.LineReader.Tell` (method)
+- [ ] `dwarf.LineReaderPos` (type)
+- [ ] `dwarf.Offset` (type)
+- [ ] `dwarf.PtrType` (type)
+- [ ] `dwarf.PtrType.String` (method)
+- [ ] `dwarf.QualType` (type)
+- [ ] `dwarf.QualType.Size` (method)
+- [ ] `dwarf.QualType.String` (method)
+- [ ] `dwarf.Reader` (type)
+- [ ] `dwarf.Reader.AddressSize` (method)
+- [ ] `dwarf.Reader.ByteOrder` (method)
+- [ ] `dwarf.Reader.Next` (method)
+- [ ] `dwarf.Reader.Seek` (method)
+- [ ] `dwarf.Reader.SeekPC` (method)
+- [ ] `dwarf.Reader.SkipChildren` (method)
+- [ ] `dwarf.StructField` (type)
+- [ ] `dwarf.StructType` (type)
+- [ ] `dwarf.StructType.Defn` (method)
+- [ ] `dwarf.StructType.String` (method)
+- [ ] `dwarf.Tag` (type)
+- [ ] `dwarf.Tag.GoString` (method)
+- [ ] `dwarf.Tag.String` (method)
+- [ ] `dwarf.Type` (type)
+- [ ] `dwarf.TypedefType` (type)
+- [ ] `dwarf.TypedefType.Size` (method)
+- [ ] `dwarf.TypedefType.String` (method)
+- [ ] `dwarf.UcharType` (type)
+- [ ] `dwarf.UintType` (type)
+- [ ] `dwarf.UnspecifiedType` (type)
+- [ ] `dwarf.UnsupportedType` (type)
+- [ ] `dwarf.UnsupportedType.String` (method)
+- [ ] `dwarf.VoidType` (type)
+- [ ] `dwarf.VoidType.String` (method)
+- [ ] `dwarf`: the 210 constants (one task per constant group in `go doc -all debug/dwarf`)
+- [ ] `dwarf`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `dwarf`: regression cases for every bug the twin finds, tied to issues
+- [ ] `dwarf`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `debug/elf` (158 items, 1489 constants)
+
+- [ ] `elf.ARM_MAGIC_TRAMP_NUMBER` (const)
+- [ ] `elf.ELFMAG` (const)
+- [ ] `elf.Sym32Size` (const)
+- [ ] `elf.Sym64Size` (const)
+- [ ] `elf.ErrNoSymbols` (var)
+- [ ] `elf.NewFile` (func)
+- [ ] `elf.Open` (func)
+- [ ] `elf.R_INFO` (func)
+- [ ] `elf.R_INFO32` (func)
+- [ ] `elf.R_SYM32` (func)
+- [ ] `elf.R_SYM64` (func)
+- [ ] `elf.R_TYPE32` (func)
+- [ ] `elf.R_TYPE64` (func)
+- [ ] `elf.ST_INFO` (func)
+- [ ] `elf.Chdr32` (type)
+- [ ] `elf.Chdr64` (type)
+- [ ] `elf.Class` (type)
+- [ ] `elf.Class.GoString` (method)
+- [ ] `elf.Class.String` (method)
+- [ ] `elf.CompressionType` (type)
+- [ ] `elf.CompressionType.GoString` (method)
+- [ ] `elf.CompressionType.String` (method)
+- [ ] `elf.Data` (type)
+- [ ] `elf.Data.GoString` (method)
+- [ ] `elf.Data.String` (method)
+- [ ] `elf.Dyn32` (type)
+- [ ] `elf.Dyn64` (type)
+- [ ] `elf.DynFlag` (type)
+- [ ] `elf.DynFlag.GoString` (method)
+- [ ] `elf.DynFlag.String` (method)
+- [ ] `elf.DynFlag1` (type)
+- [ ] `elf.DynFlag1.GoString` (method)
+- [ ] `elf.DynFlag1.String` (method)
+- [ ] `elf.DynTag` (type)
+- [ ] `elf.DynTag.GoString` (method)
+- [ ] `elf.DynTag.String` (method)
+- [ ] `elf.DynamicVersion` (type)
+- [ ] `elf.DynamicVersionDep` (type)
+- [ ] `elf.DynamicVersionFlag` (type)
+- [ ] `elf.DynamicVersionNeed` (type)
+- [ ] `elf.File` (type)
+- [ ] `elf.File.Close` (method)
+- [ ] `elf.File.DWARF` (method)
+- [ ] `elf.File.DynString` (method)
+- [ ] `elf.File.DynValue` (method)
+- [ ] `elf.File.DynamicSymbols` (method)
+- [ ] `elf.File.DynamicVersionNeeds` (method)
+- [ ] `elf.File.DynamicVersions` (method)
+- [ ] `elf.File.ImportedLibraries` (method)
+- [ ] `elf.File.ImportedSymbols` (method)
+- [ ] `elf.File.Section` (method)
+- [ ] `elf.File.SectionByType` (method)
+- [ ] `elf.File.Symbols` (method)
+- [ ] `elf.FileHeader` (type)
+- [ ] `elf.FormatError` (type)
+- [ ] `elf.FormatError.Error` (method)
+- [ ] `elf.Header32` (type)
+- [ ] `elf.Header64` (type)
+- [ ] `elf.ImportedSymbol` (type)
+- [ ] `elf.Machine` (type)
+- [ ] `elf.Machine.GoString` (method)
+- [ ] `elf.Machine.String` (method)
+- [ ] `elf.NType` (type)
+- [ ] `elf.NType.GoString` (method)
+- [ ] `elf.NType.String` (method)
+- [ ] `elf.OSABI` (type)
+- [ ] `elf.OSABI.GoString` (method)
+- [ ] `elf.OSABI.String` (method)
+- [ ] `elf.Prog` (type)
+- [ ] `elf.Prog.Open` (method)
+- [ ] `elf.Prog32` (type)
+- [ ] `elf.Prog64` (type)
+- [ ] `elf.ProgFlag` (type)
+- [ ] `elf.ProgFlag.GoString` (method)
+- [ ] `elf.ProgFlag.String` (method)
+- [ ] `elf.ProgHeader` (type)
+- [ ] `elf.ProgType` (type)
+- [ ] `elf.ProgType.GoString` (method)
+- [ ] `elf.ProgType.String` (method)
+- [ ] `elf.R_386` (type)
+- [ ] `elf.R_386.GoString` (method)
+- [ ] `elf.R_386.String` (method)
+- [ ] `elf.R_390` (type)
+- [ ] `elf.R_390.GoString` (method)
+- [ ] `elf.R_390.String` (method)
+- [ ] `elf.R_AARCH64` (type)
+- [ ] `elf.R_AARCH64.GoString` (method)
+- [ ] `elf.R_AARCH64.String` (method)
+- [ ] `elf.R_ALPHA` (type)
+- [ ] `elf.R_ALPHA.GoString` (method)
+- [ ] `elf.R_ALPHA.String` (method)
+- [ ] `elf.R_ARM` (type)
+- [ ] `elf.R_ARM.GoString` (method)
+- [ ] `elf.R_ARM.String` (method)
+- [ ] `elf.R_LARCH` (type)
+- [ ] `elf.R_LARCH.GoString` (method)
+- [ ] `elf.R_LARCH.String` (method)
+- [ ] `elf.R_MIPS` (type)
+- [ ] `elf.R_MIPS.GoString` (method)
+- [ ] `elf.R_MIPS.String` (method)
+- [ ] `elf.R_PPC` (type)
+- [ ] `elf.R_PPC.GoString` (method)
+- [ ] `elf.R_PPC.String` (method)
+- [ ] `elf.R_PPC64` (type)
+- [ ] `elf.R_PPC64.GoString` (method)
+- [ ] `elf.R_PPC64.String` (method)
+- [ ] `elf.R_RISCV` (type)
+- [ ] `elf.R_RISCV.GoString` (method)
+- [ ] `elf.R_RISCV.String` (method)
+- [ ] `elf.R_SPARC` (type)
+- [ ] `elf.R_SPARC.GoString` (method)
+- [ ] `elf.R_SPARC.String` (method)
+- [ ] `elf.R_X86_64` (type)
+- [ ] `elf.R_X86_64.GoString` (method)
+- [ ] `elf.R_X86_64.String` (method)
+- [ ] `elf.Rel32` (type)
+- [ ] `elf.Rel64` (type)
+- [ ] `elf.Rela32` (type)
+- [ ] `elf.Rela64` (type)
+- [ ] `elf.Section` (type)
+- [ ] `elf.Section.Data` (method)
+- [ ] `elf.Section.Open` (method)
+- [ ] `elf.Section32` (type)
+- [ ] `elf.Section64` (type)
+- [ ] `elf.SectionFlag` (type)
+- [ ] `elf.SectionFlag.GoString` (method)
+- [ ] `elf.SectionFlag.String` (method)
+- [ ] `elf.SectionHeader` (type)
+- [ ] `elf.SectionIndex` (type)
+- [ ] `elf.SectionIndex.GoString` (method)
+- [ ] `elf.SectionIndex.String` (method)
+- [ ] `elf.SectionType` (type)
+- [ ] `elf.SectionType.GoString` (method)
+- [ ] `elf.SectionType.String` (method)
+- [ ] `elf.Sym32` (type)
+- [ ] `elf.Sym64` (type)
+- [ ] `elf.SymBind` (type)
+- [ ] `elf.ST_BIND` (func)
+- [ ] `elf.SymBind.GoString` (method)
+- [ ] `elf.SymBind.String` (method)
+- [ ] `elf.SymType` (type)
+- [ ] `elf.ST_TYPE` (func)
+- [ ] `elf.SymType.GoString` (method)
+- [ ] `elf.SymType.String` (method)
+- [ ] `elf.SymVis` (type)
+- [ ] `elf.ST_VISIBILITY` (func)
+- [ ] `elf.SymVis.GoString` (method)
+- [ ] `elf.SymVis.String` (method)
+- [ ] `elf.Symbol` (type)
+- [ ] `elf.Type` (type)
+- [ ] `elf.Type.GoString` (method)
+- [ ] `elf.Type.String` (method)
+- [ ] `elf.Version` (type)
+- [ ] `elf.Version.GoString` (method)
+- [ ] `elf.Version.String` (method)
+- [ ] `elf.VersionIndex` (type)
+- [ ] `elf.VersionIndex.Index` (method)
+- [ ] `elf.VersionIndex.IsHidden` (method)
+- [ ] `elf`: the 1489 constants (one task per constant group in `go doc -all debug/elf`)
+- [ ] `elf`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `elf`: regression cases for every bug the twin finds, tied to issues
+- [ ] `elf`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `debug/macho` (70 items, 85 constants)
+
+- [ ] `macho.ErrNotFat` (var)
+- [ ] `macho.Cpu` (type)
+- [ ] `macho.Cpu.GoString` (method)
+- [ ] `macho.Cpu.String` (method)
+- [ ] `macho.Dylib` (type)
+- [ ] `macho.DylibCmd` (type)
+- [ ] `macho.Dysymtab` (type)
+- [ ] `macho.DysymtabCmd` (type)
+- [ ] `macho.FatArch` (type)
+- [ ] `macho.FatArchHeader` (type)
+- [ ] `macho.FatFile` (type)
+- [ ] `macho.NewFatFile` (func)
+- [ ] `macho.OpenFat` (func)
+- [ ] `macho.FatFile.Close` (method)
+- [ ] `macho.File` (type)
+- [ ] `macho.NewFile` (func)
+- [ ] `macho.Open` (func)
+- [ ] `macho.File.Close` (method)
+- [ ] `macho.File.DWARF` (method)
+- [ ] `macho.File.ImportedLibraries` (method)
+- [ ] `macho.File.ImportedSymbols` (method)
+- [ ] `macho.File.Section` (method)
+- [ ] `macho.File.Segment` (method)
+- [ ] `macho.FileHeader` (type)
+- [ ] `macho.FormatError` (type)
+- [ ] `macho.FormatError.Error` (method)
+- [ ] `macho.Load` (type)
+- [ ] `macho.LoadBytes` (type)
+- [ ] `macho.LoadBytes.Raw` (method)
+- [ ] `macho.LoadCmd` (type)
+- [ ] `macho.LoadCmd.GoString` (method)
+- [ ] `macho.LoadCmd.String` (method)
+- [ ] `macho.Nlist32` (type)
+- [ ] `macho.Nlist64` (type)
+- [ ] `macho.Regs386` (type)
+- [ ] `macho.RegsAMD64` (type)
+- [ ] `macho.Reloc` (type)
+- [ ] `macho.RelocTypeARM` (type)
+- [ ] `macho.RelocTypeARM.GoString` (method)
+- [ ] `macho.RelocTypeARM.String` (method)
+- [ ] `macho.RelocTypeARM64` (type)
+- [ ] `macho.RelocTypeARM64.GoString` (method)
+- [ ] `macho.RelocTypeARM64.String` (method)
+- [ ] `macho.RelocTypeGeneric` (type)
+- [ ] `macho.RelocTypeGeneric.GoString` (method)
+- [ ] `macho.RelocTypeGeneric.String` (method)
+- [ ] `macho.RelocTypeX86_64` (type)
+- [ ] `macho.RelocTypeX86_64.GoString` (method)
+- [ ] `macho.RelocTypeX86_64.String` (method)
+- [ ] `macho.Rpath` (type)
+- [ ] `macho.RpathCmd` (type)
+- [ ] `macho.Section` (type)
+- [ ] `macho.Section.Data` (method)
+- [ ] `macho.Section.Open` (method)
+- [ ] `macho.Section32` (type)
+- [ ] `macho.Section64` (type)
+- [ ] `macho.SectionHeader` (type)
+- [ ] `macho.Segment` (type)
+- [ ] `macho.Segment.Data` (method)
+- [ ] `macho.Segment.Open` (method)
+- [ ] `macho.Segment32` (type)
+- [ ] `macho.Segment64` (type)
+- [ ] `macho.SegmentHeader` (type)
+- [ ] `macho.Symbol` (type)
+- [ ] `macho.Symtab` (type)
+- [ ] `macho.SymtabCmd` (type)
+- [ ] `macho.Thread` (type)
+- [ ] `macho.Type` (type)
+- [ ] `macho.Type.GoString` (method)
+- [ ] `macho.Type.String` (method)
+- [ ] `macho`: the 85 constants (one task per constant group in `go doc -all debug/macho`)
+- [ ] `macho`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `macho`: regression cases for every bug the twin finds, tied to issues
+- [ ] `macho`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `debug/pe` (29 items, 96 constants)
+
+- [ ] `pe.COFFSymbolSize` (const)
+- [ ] `pe.COFFSymbol` (type)
+- [ ] `pe.COFFSymbol.FullName` (method)
+- [ ] `pe.COFFSymbolAuxFormat5` (type)
+- [ ] `pe.DataDirectory` (type)
+- [ ] `pe.File` (type)
+- [ ] `pe.NewFile` (func)
+- [ ] `pe.Open` (func)
+- [ ] `pe.File.COFFSymbolReadSectionDefAux` (method)
+- [ ] `pe.File.Close` (method)
+- [ ] `pe.File.DWARF` (method)
+- [ ] `pe.File.ImportedLibraries` (method)
+- [ ] `pe.File.ImportedSymbols` (method)
+- [ ] `pe.File.Section` (method)
+- [ ] `pe.FileHeader` (type)
+- [ ] `pe.FormatError` (type)
+- [ ] `pe.FormatError.Error` (method)
+- [ ] `pe.ImportDirectory` (type)
+- [ ] `pe.OptionalHeader32` (type)
+- [ ] `pe.OptionalHeader64` (type)
+- [ ] `pe.Reloc` (type)
+- [ ] `pe.Section` (type)
+- [ ] `pe.Section.Data` (method)
+- [ ] `pe.Section.Open` (method)
+- [ ] `pe.SectionHeader` (type)
+- [ ] `pe.SectionHeader32` (type)
+- [ ] `pe.StringTable` (type)
+- [ ] `pe.StringTable.String` (method)
+- [ ] `pe.Symbol` (type)
+- [ ] `pe`: the 96 constants (one task per constant group in `go doc -all debug/pe`)
+- [ ] `pe`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `pe`: regression cases for every bug the twin finds, tied to issues
+- [ ] `pe`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `embed` (4 items)
+
+- [ ] `embed.FS` (type)
+- [ ] `embed.FS.Open` (method)
+- [ ] `embed.FS.ReadDir` (method)
+- [ ] `embed.FS.ReadFile` (method)
+- [ ] `embed`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `embed`: regression cases for every bug the twin finds, tied to issues
+- [ ] `embed`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `encoding` (6 items)
+
+- [ ] `encoding.BinaryAppender` (type)
+- [ ] `encoding.BinaryMarshaler` (type)
+- [ ] `encoding.BinaryUnmarshaler` (type)
+- [ ] `encoding.TextAppender` (type)
+- [ ] `encoding.TextMarshaler` (type)
+- [ ] `encoding.TextUnmarshaler` (type)
+- [ ] `encoding`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `encoding`: regression cases for every bug the twin finds, tied to issues
+- [ ] `encoding`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `encoding/ascii85` (7 items)
+
+- [ ] `ascii85.Decode` (func)
+- [ ] `ascii85.Encode` (func)
+- [ ] `ascii85.MaxEncodedLen` (func)
+- [ ] `ascii85.NewDecoder` (func)
+- [ ] `ascii85.NewEncoder` (func)
+- [ ] `ascii85.CorruptInputError` (type)
+- [ ] `ascii85.CorruptInputError.Error` (method)
+- [ ] `ascii85`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `ascii85`: regression cases for every bug the twin finds, tied to issues
+- [ ] `ascii85`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `encoding/asn1` (20 items, 22 constants)
+
+- [ ] `asn1.NullBytes` (var)
+- [ ] `asn1.NullRawValue` (var)
+- [ ] `asn1.Marshal` (func)
+- [ ] `asn1.MarshalWithParams` (func)
+- [ ] `asn1.Unmarshal` (func)
+- [ ] `asn1.UnmarshalWithParams` (func)
+- [ ] `asn1.BitString` (type)
+- [ ] `asn1.BitString.At` (method)
+- [ ] `asn1.BitString.RightAlign` (method)
+- [ ] `asn1.Enumerated` (type)
+- [ ] `asn1.Flag` (type)
+- [ ] `asn1.ObjectIdentifier` (type)
+- [ ] `asn1.ObjectIdentifier.Equal` (method)
+- [ ] `asn1.ObjectIdentifier.String` (method)
+- [ ] `asn1.RawContent` (type)
+- [ ] `asn1.RawValue` (type)
+- [ ] `asn1.StructuralError` (type)
+- [ ] `asn1.StructuralError.Error` (method)
+- [ ] `asn1.SyntaxError` (type)
+- [ ] `asn1.SyntaxError.Error` (method)
+- [ ] `asn1`: the 22 constants (one task per constant group in `go doc -all encoding/asn1`)
+- [ ] `asn1`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `asn1`: regression cases for every bug the twin finds, tied to issues
+- [ ] `asn1`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `asn1`: fuzz target for every parser and decoder in the package
+
+#### `encoding/base32` (17 items, 2 constants)
+
+- [ ] `base32.HexEncoding` (var)
+- [ ] `base32.StdEncoding` (var)
+- [ ] `base32.NewDecoder` (func)
+- [ ] `base32.NewEncoder` (func)
+- [ ] `base32.CorruptInputError` (type)
+- [ ] `base32.CorruptInputError.Error` (method)
+- [ ] `base32.Encoding` (type)
+- [ ] `base32.NewEncoding` (func)
+- [ ] `base32.Encoding.AppendDecode` (method)
+- [ ] `base32.Encoding.AppendEncode` (method)
+- [ ] `base32.Encoding.Decode` (method)
+- [ ] `base32.Encoding.DecodeString` (method)
+- [ ] `base32.Encoding.DecodedLen` (method)
+- [ ] `base32.Encoding.Encode` (method)
+- [ ] `base32.Encoding.EncodeToString` (method)
+- [ ] `base32.Encoding.EncodedLen` (method)
+- [ ] `base32.Encoding.WithPadding` (method)
+- [ ] `base32`: the 2 constants (one task per constant group in `go doc -all encoding/base32`)
+- [ ] `base32`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `base32`: regression cases for every bug the twin finds, tied to issues
+- [ ] `base32`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `base32`: fuzz target for every parser and decoder in the package
+
+#### `encoding/base64` (20 items, 2 constants)
+
+- [ ] `base64.RawStdEncoding` (var)
+- [ ] `base64.RawURLEncoding` (var)
+- [ ] `base64.StdEncoding` (var)
+- [ ] `base64.URLEncoding` (var)
+- [ ] `base64.NewDecoder` (func)
+- [ ] `base64.NewEncoder` (func)
+- [ ] `base64.CorruptInputError` (type)
+- [ ] `base64.CorruptInputError.Error` (method)
+- [ ] `base64.Encoding` (type)
+- [ ] `base64.NewEncoding` (func)
+- [ ] `base64.Encoding.AppendDecode` (method)
+- [ ] `base64.Encoding.AppendEncode` (method)
+- [ ] `base64.Encoding.Decode` (method)
+- [ ] `base64.Encoding.DecodeString` (method)
+- [ ] `base64.Encoding.DecodedLen` (method)
+- [ ] `base64.Encoding.Encode` (method)
+- [ ] `base64.Encoding.EncodeToString` (method)
+- [ ] `base64.Encoding.EncodedLen` (method)
+- [ ] `base64.Encoding.Strict` (method)
+- [ ] `base64.Encoding.WithPadding` (method)
+- [ ] `base64`: the 2 constants (one task per constant group in `go doc -all encoding/base64`)
+- [ ] `base64`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `base64`: regression cases for every bug the twin finds, tied to issues
+- [ ] `base64`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `base64`: fuzz target for every parser and decoder in the package
+
+#### `encoding/binary` (19 items, 3 constants)
+
+- [ ] `binary.BigEndian` (var)
+- [ ] `binary.LittleEndian` (var)
+- [ ] `binary.NativeEndian` (var)
+- [ ] `binary.Append` (func)
+- [ ] `binary.AppendUvarint` (func)
+- [ ] `binary.AppendVarint` (func)
+- [ ] `binary.Decode` (func)
+- [ ] `binary.Encode` (func)
+- [ ] `binary.PutUvarint` (func)
+- [ ] `binary.PutVarint` (func)
+- [ ] `binary.Read` (func)
+- [ ] `binary.ReadUvarint` (func)
+- [ ] `binary.ReadVarint` (func)
+- [ ] `binary.Size` (func)
+- [ ] `binary.Uvarint` (func)
+- [ ] `binary.Varint` (func)
+- [ ] `binary.Write` (func)
+- [ ] `binary.AppendByteOrder` (type)
+- [ ] `binary.ByteOrder` (type)
+- [ ] `binary`: the 3 constants (one task per constant group in `go doc -all encoding/binary`)
+- [ ] `binary`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `binary`: regression cases for every bug the twin finds, tied to issues
+- [ ] `binary`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `binary`: fuzz target for every parser and decoder in the package
+
+#### `encoding/csv` (15 items, 4 constants)
+
+- [ ] `csv.ParseError` (type)
+- [ ] `csv.ParseError.Error` (method)
+- [ ] `csv.ParseError.Unwrap` (method)
+- [ ] `csv.Reader` (type)
+- [ ] `csv.NewReader` (func)
+- [ ] `csv.Reader.FieldPos` (method)
+- [ ] `csv.Reader.InputOffset` (method)
+- [ ] `csv.Reader.Read` (method)
+- [ ] `csv.Reader.ReadAll` (method)
+- [ ] `csv.Writer` (type)
+- [ ] `csv.NewWriter` (func)
+- [ ] `csv.Writer.Error` (method)
+- [ ] `csv.Writer.Flush` (method)
+- [ ] `csv.Writer.Write` (method)
+- [ ] `csv.Writer.WriteAll` (method)
+- [ ] `csv`: the 4 constants (one task per constant group in `go doc -all encoding/csv`)
+- [ ] `csv`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `csv`: regression cases for every bug the twin finds, tied to issues
+- [ ] `csv`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `csv`: fuzz target for every parser and decoder in the package
+
+#### `encoding/gob` (13 items)
+
+- [-] `gob.Register` (func): replaced by design (reflection-based; replaced by derivation)
+- [-] `gob.RegisterName` (func): replaced by design (reflection-based; replaced by derivation)
+- [-] `gob.CommonType` (type): replaced by design (reflection-based; replaced by derivation)
+- [-] `gob.Decoder` (type): replaced by design (reflection-based; replaced by derivation)
+- [-] `gob.NewDecoder` (func): replaced by design (reflection-based; replaced by derivation)
+- [-] `gob.Decoder.Decode` (method): replaced by design (reflection-based; replaced by derivation)
+- [-] `gob.Decoder.DecodeValue` (method): replaced by design (reflection-based; replaced by derivation)
+- [-] `gob.Encoder` (type): replaced by design (reflection-based; replaced by derivation)
+- [-] `gob.NewEncoder` (func): replaced by design (reflection-based; replaced by derivation)
+- [-] `gob.Encoder.Encode` (method): replaced by design (reflection-based; replaced by derivation)
+- [-] `gob.Encoder.EncodeValue` (method): replaced by design (reflection-based; replaced by derivation)
+- [-] `gob.GobDecoder` (type): replaced by design (reflection-based; replaced by derivation)
+- [-] `gob.GobEncoder` (type): replaced by design (reflection-based; replaced by derivation)
+- [ ] `gob`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `gob`: regression cases for every bug the twin finds, tied to issues
+- [ ] `gob`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `gob`: fuzz target for every parser and decoder in the package
+
+#### `encoding/hex` (15 items)
+
+- [ ] `hex.ErrLength` (var)
+- [ ] `hex.AppendDecode` (func)
+- [ ] `hex.AppendEncode` (func)
+- [ ] `hex.Decode` (func)
+- [ ] `hex.DecodeString` (func)
+- [ ] `hex.DecodedLen` (func)
+- [ ] `hex.Dump` (func)
+- [ ] `hex.Dumper` (func)
+- [ ] `hex.Encode` (func)
+- [ ] `hex.EncodeToString` (func)
+- [ ] `hex.EncodedLen` (func)
+- [ ] `hex.NewDecoder` (func)
+- [ ] `hex.NewEncoder` (func)
+- [ ] `hex.InvalidByteError` (type)
+- [ ] `hex.InvalidByteError.Error` (method)
+- [ ] `hex`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `hex`: regression cases for every bug the twin finds, tied to issues
+- [ ] `hex`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `hex`: fuzz target for every parser and decoder in the package
+
+#### `encoding/json` (50 items)
+
+- [ ] `json.Compact` (func)
+- [ ] `json.HTMLEscape` (func)
+- [ ] `json.Indent` (func)
+- [ ] `json.Marshal` (func)
+- [ ] `json.MarshalIndent` (func)
+- [ ] `json.Unmarshal` (func)
+- [ ] `json.Valid` (func)
+- [ ] `json.Decoder` (type)
+- [ ] `json.NewDecoder` (func)
+- [ ] `json.Decoder.Buffered` (method)
+- [ ] `json.Decoder.Decode` (method)
+- [ ] `json.Decoder.DisallowUnknownFields` (method)
+- [ ] `json.Decoder.InputOffset` (method)
+- [ ] `json.Decoder.More` (method)
+- [ ] `json.Decoder.Token` (method)
+- [ ] `json.Decoder.UseNumber` (method)
+- [ ] `json.Delim` (type)
+- [ ] `json.Delim.String` (method)
+- [ ] `json.Encoder` (type)
+- [ ] `json.NewEncoder` (func)
+- [ ] `json.Encoder.Encode` (method)
+- [ ] `json.Encoder.SetEscapeHTML` (method)
+- [ ] `json.Encoder.SetIndent` (method)
+- [ ] `json.InvalidUTF8Error` (type)
+- [ ] `json.InvalidUTF8Error.Error` (method)
+- [ ] `json.InvalidUnmarshalError` (type)
+- [ ] `json.InvalidUnmarshalError.Error` (method)
+- [ ] `json.Marshaler` (type)
+- [ ] `json.MarshalerError` (type)
+- [ ] `json.MarshalerError.Error` (method)
+- [ ] `json.MarshalerError.Unwrap` (method)
+- [ ] `json.Number` (type)
+- [ ] `json.Number.Float64` (method)
+- [ ] `json.Number.Int64` (method)
+- [ ] `json.Number.String` (method)
+- [ ] `json.RawMessage` (type)
+- [ ] `json.RawMessage.MarshalJSON` (method)
+- [ ] `json.RawMessage.UnmarshalJSON` (method)
+- [ ] `json.SyntaxError` (type)
+- [ ] `json.SyntaxError.Error` (method)
+- [ ] `json.Token` (type)
+- [ ] `json.UnmarshalFieldError` (type)
+- [ ] `json.UnmarshalFieldError.Error` (method)
+- [ ] `json.UnmarshalTypeError` (type)
+- [ ] `json.UnmarshalTypeError.Error` (method)
+- [ ] `json.Unmarshaler` (type)
+- [ ] `json.UnsupportedTypeError` (type)
+- [ ] `json.UnsupportedTypeError.Error` (method)
+- [ ] `json.UnsupportedValueError` (type)
+- [ ] `json.UnsupportedValueError.Error` (method)
+- [ ] `json`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `json`: regression cases for every bug the twin finds, tied to issues
+- [ ] `json`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `json`: fuzz target for every parser and decoder in the package
+
+#### `encoding/pem` (4 items)
+
+- [ ] `pem.Encode` (func)
+- [ ] `pem.EncodeToMemory` (func)
+- [ ] `pem.Block` (type)
+- [ ] `pem.Decode` (func)
+- [ ] `pem`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `pem`: regression cases for every bug the twin finds, tied to issues
+- [ ] `pem`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `pem`: fuzz target for every parser and decoder in the package
+
+#### `encoding/xml` (54 items, 1 constants)
+
+- [ ] `xml.HTMLAutoClose` (var)
+- [ ] `xml.HTMLEntity` (var)
+- [ ] `xml.Escape` (func)
+- [ ] `xml.EscapeText` (func)
+- [ ] `xml.Marshal` (func)
+- [ ] `xml.MarshalIndent` (func)
+- [ ] `xml.Unmarshal` (func)
+- [ ] `xml.Attr` (type)
+- [ ] `xml.CharData` (type)
+- [ ] `xml.CharData.Copy` (method)
+- [ ] `xml.Comment` (type)
+- [ ] `xml.Comment.Copy` (method)
+- [ ] `xml.Decoder` (type)
+- [ ] `xml.NewDecoder` (func)
+- [ ] `xml.NewTokenDecoder` (func)
+- [ ] `xml.Decoder.Decode` (method)
+- [ ] `xml.Decoder.DecodeElement` (method)
+- [ ] `xml.Decoder.InputOffset` (method)
+- [ ] `xml.Decoder.InputPos` (method)
+- [ ] `xml.Decoder.RawToken` (method)
+- [ ] `xml.Decoder.Skip` (method)
+- [ ] `xml.Decoder.Token` (method)
+- [ ] `xml.Directive` (type)
+- [ ] `xml.Directive.Copy` (method)
+- [ ] `xml.Encoder` (type)
+- [ ] `xml.NewEncoder` (func)
+- [ ] `xml.Encoder.Close` (method)
+- [ ] `xml.Encoder.Encode` (method)
+- [ ] `xml.Encoder.EncodeElement` (method)
+- [ ] `xml.Encoder.EncodeToken` (method)
+- [ ] `xml.Encoder.Flush` (method)
+- [ ] `xml.Encoder.Indent` (method)
+- [ ] `xml.EndElement` (type)
+- [ ] `xml.Marshaler` (type)
+- [ ] `xml.MarshalerAttr` (type)
+- [ ] `xml.Name` (type)
+- [ ] `xml.ProcInst` (type)
+- [ ] `xml.ProcInst.Copy` (method)
+- [ ] `xml.StartElement` (type)
+- [ ] `xml.StartElement.Copy` (method)
+- [ ] `xml.StartElement.End` (method)
+- [ ] `xml.SyntaxError` (type)
+- [ ] `xml.SyntaxError.Error` (method)
+- [ ] `xml.TagPathError` (type)
+- [ ] `xml.TagPathError.Error` (method)
+- [ ] `xml.Token` (type)
+- [ ] `xml.CopyToken` (func)
+- [ ] `xml.TokenReader` (type)
+- [ ] `xml.UnmarshalError` (type)
+- [ ] `xml.UnmarshalError.Error` (method)
+- [ ] `xml.Unmarshaler` (type)
+- [ ] `xml.UnmarshalerAttr` (type)
+- [ ] `xml.UnsupportedTypeError` (type)
+- [ ] `xml.UnsupportedTypeError.Error` (method)
+- [ ] `xml`: the 1 constants (one task per constant group in `go doc -all encoding/xml`)
+- [ ] `xml`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `xml`: regression cases for every bug the twin finds, tied to issues
+- [ ] `xml`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `xml`: fuzz target for every parser and decoder in the package
+
+#### `errors` (7 items)
+
+- [ ] `errors.ErrUnsupported` (var)
+- [-] `errors.As` (func): replaced by design
+- [-] `errors.AsType` (func): replaced by design
+- [ ] `errors.Is` (func)
+- [ ] `errors.Join` (func)
+- [ ] `errors.New` (func)
+- [ ] `errors.Unwrap` (func)
+- [ ] `errors`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `errors`: regression cases for every bug the twin finds, tied to issues
+- [ ] `errors`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `expvar` (36 items)
+
+- [-] `expvar.Do` (func): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Handler` (func): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Publish` (func): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Float` (type): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.NewFloat` (func): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Float.Add` (method): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Float.Set` (method): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Float.String` (method): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Float.Value` (method): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Func` (type): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Func.String` (method): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Func.Value` (method): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Int` (type): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.NewInt` (func): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Int.Add` (method): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Int.Set` (method): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Int.String` (method): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Int.Value` (method): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.KeyValue` (type): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Map` (type): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.NewMap` (func): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Map.Add` (method): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Map.AddFloat` (method): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Map.Delete` (method): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Map.Do` (method): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Map.Get` (method): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Map.Init` (method): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Map.Set` (method): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Map.String` (method): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.String` (type): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.NewString` (func): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.String.Set` (method): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.String.String` (method): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.String.Value` (method): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Var` (type): replaced by design (global mutex; replaced by per-core metrics)
+- [-] `expvar.Get` (func): replaced by design (global mutex; replaced by per-core metrics)
+- [ ] `expvar`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `expvar`: regression cases for every bug the twin finds, tied to issues
+- [ ] `expvar`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `flag` (77 items, 3 constants)
+
+- [ ] `flag.ErrHelp` (var)
+- [x] `flag.Usage` (var)
+- [ ] `flag.Arg` (func)
+- [ ] `flag.Args` (func)
+- [x] `flag.Bool` (func)
+- [ ] `flag.BoolFunc` (func)
+- [ ] `flag.BoolVar` (func)
+- [ ] `flag.Duration` (func)
+- [ ] `flag.DurationVar` (func)
+- [ ] `flag.Float64` (func)
+- [ ] `flag.Float64Var` (func)
+- [ ] `flag.Func` (func)
+- [x] `flag.Int` (func)
+- [ ] `flag.Int64` (func)
+- [ ] `flag.Int64Var` (func)
+- [ ] `flag.IntVar` (func)
+- [ ] `flag.NArg` (func)
+- [ ] `flag.NFlag` (func)
+- [x] `flag.Parse` (func)
+- [x] `flag.Parsed` (func)
+- [ ] `flag.PrintDefaults` (func)
+- [x] `flag.Set` (func)
+- [ ] `flag.String` (func)
+- [ ] `flag.StringVar` (func)
+- [ ] `flag.TextVar` (func)
+- [ ] `flag.Uint` (func)
+- [ ] `flag.Uint64` (func)
+- [ ] `flag.Uint64Var` (func)
+- [ ] `flag.UintVar` (func)
+- [ ] `flag.UnquoteUsage` (func)
+- [ ] `flag.Var` (func)
+- [ ] `flag.Visit` (func)
+- [ ] `flag.VisitAll` (func)
+- [ ] `flag.ErrorHandling` (type)
+- [x] `flag.Flag` (type)
+- [ ] `flag.Lookup` (func)
+- [ ] `flag.FlagSet` (type)
+- [ ] `flag.CommandLine` (var)
+- [ ] `flag.NewFlagSet` (func)
+- [ ] `flag.FlagSet.Arg` (method)
+- [ ] `flag.FlagSet.Args` (method)
+- [x] `flag.FlagSet.Bool` (method)
+- [ ] `flag.FlagSet.BoolFunc` (method)
+- [ ] `flag.FlagSet.BoolVar` (method)
+- [ ] `flag.FlagSet.Duration` (method)
+- [ ] `flag.FlagSet.DurationVar` (method)
+- [ ] `flag.FlagSet.ErrorHandling` (method)
+- [ ] `flag.FlagSet.Float64` (method)
+- [ ] `flag.FlagSet.Float64Var` (method)
+- [ ] `flag.FlagSet.Func` (method)
+- [ ] `flag.FlagSet.Init` (method)
+- [x] `flag.FlagSet.Int` (method)
+- [ ] `flag.FlagSet.Int64` (method)
+- [ ] `flag.FlagSet.Int64Var` (method)
+- [ ] `flag.FlagSet.IntVar` (method)
+- [ ] `flag.FlagSet.Lookup` (method)
+- [ ] `flag.FlagSet.NArg` (method)
+- [ ] `flag.FlagSet.NFlag` (method)
+- [ ] `flag.FlagSet.Name` (method)
+- [ ] `flag.FlagSet.Output` (method)
+- [x] `flag.FlagSet.Parse` (method)
+- [x] `flag.FlagSet.Parsed` (method)
+- [ ] `flag.FlagSet.PrintDefaults` (method)
+- [x] `flag.FlagSet.Set` (method)
+- [ ] `flag.FlagSet.SetOutput` (method)
+- [ ] `flag.FlagSet.String` (method)
+- [ ] `flag.FlagSet.StringVar` (method)
+- [ ] `flag.FlagSet.TextVar` (method)
+- [ ] `flag.FlagSet.Uint` (method)
+- [ ] `flag.FlagSet.Uint64` (method)
+- [ ] `flag.FlagSet.Uint64Var` (method)
+- [ ] `flag.FlagSet.UintVar` (method)
+- [ ] `flag.FlagSet.Var` (method)
+- [ ] `flag.FlagSet.Visit` (method)
+- [ ] `flag.FlagSet.VisitAll` (method)
+- [ ] `flag.Getter` (type)
+- [ ] `flag.Value` (type)
+- [ ] `flag`: the 3 constants (one task per constant group in `go doc -all flag`)
+- [ ] `flag`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `flag`: regression cases for every bug the twin finds, tied to issues
+- [ ] `flag`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `fmt` (31 items)
+
+- [ ] `fmt.X.String` (method)
+- [ ] `fmt.X.String` (method)
+- [ ] `fmt.Append` (func)
+- [ ] `fmt.Appendf` (func)
+- [ ] `fmt.Appendln` (func)
+- [ ] `fmt.Errorf` (func)
+- [ ] `fmt.FormatString` (func)
+- [ ] `fmt.Fprint` (func)
+- [ ] `fmt.Fprintf` (func)
+- [ ] `fmt.Fprintln` (func)
+- [ ] `fmt.Fscan` (func)
+- [ ] `fmt.Fscanf` (func)
+- [ ] `fmt.Fscanln` (func)
+- [ ] `fmt.Print` (func)
+- [ ] `fmt.Printf` (func)
+- [ ] `fmt.Println` (func)
+- [ ] `fmt.Scan` (func)
+- [ ] `fmt.Scanf` (func)
+- [ ] `fmt.Scanln` (func)
+- [ ] `fmt.Sprint` (func)
+- [ ] `fmt.Sprintf` (func)
+- [ ] `fmt.Sprintln` (func)
+- [ ] `fmt.Sscan` (func)
+- [ ] `fmt.Sscanf` (func)
+- [ ] `fmt.Sscanln` (func)
+- [ ] `fmt.Formatter` (type)
+- [ ] `fmt.GoStringer` (type)
+- [ ] `fmt.ScanState` (type)
+- [ ] `fmt.Scanner` (type)
+- [ ] `fmt.State` (type)
+- [ ] `fmt.Stringer` (type)
+- [ ] `fmt`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `fmt`: regression cases for every bug the twin finds, tied to issues
+- [ ] `fmt`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `hash` (5 items)
+
+- [ ] `hash.Cloner` (type)
+- [ ] `hash.Hash` (type)
+- [ ] `hash.Hash32` (type)
+- [ ] `hash.Hash64` (type)
+- [ ] `hash.XOF` (type)
+- [ ] `hash`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `hash`: regression cases for every bug the twin finds, tied to issues
+- [ ] `hash`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `hash/adler32` (3 items)
+
+- [ ] `adler32.Size` (const)
+- [ ] `adler32.Checksum` (func)
+- [ ] `adler32.New` (func)
+- [ ] `adler32`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `adler32`: regression cases for every bug the twin finds, tied to issues
+- [ ] `adler32`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `hash/crc32` (9 items, 3 constants)
+
+- [ ] `crc32.Size` (const)
+- [ ] `crc32.IEEETable` (var)
+- [ ] `crc32.Checksum` (func)
+- [ ] `crc32.ChecksumIEEE` (func)
+- [ ] `crc32.New` (func)
+- [ ] `crc32.NewIEEE` (func)
+- [ ] `crc32.Update` (func)
+- [ ] `crc32.Table` (type)
+- [ ] `crc32.MakeTable` (func)
+- [ ] `crc32`: the 3 constants (one task per constant group in `go doc -all hash/crc32`)
+- [ ] `crc32`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `crc32`: regression cases for every bug the twin finds, tied to issues
+- [ ] `crc32`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `hash/crc64` (6 items, 2 constants)
+
+- [ ] `crc64.Size` (const)
+- [ ] `crc64.Checksum` (func)
+- [ ] `crc64.New` (func)
+- [ ] `crc64.Update` (func)
+- [ ] `crc64.Table` (type)
+- [ ] `crc64.MakeTable` (func)
+- [ ] `crc64`: the 2 constants (one task per constant group in `go doc -all hash/crc64`)
+- [ ] `crc64`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `crc64`: regression cases for every bug the twin finds, tied to issues
+- [ ] `crc64`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `hash/fnv` (6 items)
+
+- [ ] `fnv.New128` (func)
+- [ ] `fnv.New128a` (func)
+- [ ] `fnv.New32` (func)
+- [ ] `fnv.New32a` (func)
+- [ ] `fnv.New64` (func)
+- [ ] `fnv.New64a` (func)
+- [ ] `fnv`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `fnv`: regression cases for every bug the twin finds, tied to issues
+- [ ] `fnv`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `hash/maphash` (18 items)
+
+- [ ] `maphash.Bytes` (func)
+- [ ] `maphash.Comparable` (func)
+- [ ] `maphash.String` (func)
+- [ ] `maphash.WriteComparable` (func)
+- [ ] `maphash.Hash` (type)
+- [ ] `maphash.Hash.BlockSize` (method)
+- [ ] `maphash.Hash.Clone` (method)
+- [ ] `maphash.Hash.Reset` (method)
+- [ ] `maphash.Hash.Seed` (method)
+- [ ] `maphash.Hash.SetSeed` (method)
+- [ ] `maphash.Hash.Size` (method)
+- [ ] `maphash.Hash.Sum` (method)
+- [ ] `maphash.Hash.Sum64` (method)
+- [ ] `maphash.Hash.Write` (method)
+- [ ] `maphash.Hash.WriteByte` (method)
+- [ ] `maphash.Hash.WriteString` (method)
+- [ ] `maphash.Seed` (type)
+- [ ] `maphash.MakeSeed` (func)
+- [ ] `maphash`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `maphash`: regression cases for every bug the twin finds, tied to issues
+- [ ] `maphash`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `html` (2 items)
+
+- [ ] `html.EscapeString` (func)
+- [ ] `html.UnescapeString` (func)
+- [ ] `html`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `html`: regression cases for every bug the twin finds, tied to issues
+- [ ] `html`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `html`: fuzz target for every parser and decoder in the package
+
+#### `html/template` (41 items, 13 constants)
+
+- [-] `template.HTMLEscape` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.HTMLEscapeString` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.HTMLEscaper` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.IsTrue` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.JSEscape` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.JSEscapeString` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.JSEscaper` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.URLQueryEscaper` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.CSS` (type): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Error` (type): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Error.Error` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.ErrorCode` (type): replaced by design (reflection-based; needs derivation first)
+- [-] `template.FuncMap` (type): replaced by design (reflection-based; needs derivation first)
+- [-] `template.HTML` (type): replaced by design (reflection-based; needs derivation first)
+- [-] `template.HTMLAttr` (type): replaced by design (reflection-based; needs derivation first)
+- [-] `template.JS` (type): replaced by design (reflection-based; needs derivation first)
+- [-] `template.JSStr` (type): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Srcset` (type): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template` (type): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Must` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.New` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.ParseFS` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.ParseFiles` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.ParseGlob` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.AddParseTree` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.Clone` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.DefinedTemplates` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.Delims` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.Execute` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.ExecuteTemplate` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.Funcs` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.Lookup` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.Name` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.New` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.Option` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.Parse` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.ParseFS` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.ParseFiles` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.ParseGlob` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.Templates` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.URL` (type): replaced by design (reflection-based; needs derivation first)
+- [ ] `template`: the 13 constants (one task per constant group in `go doc -all html/template`)
+- [ ] `template`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `template`: regression cases for every bug the twin finds, tied to issues
+- [ ] `template`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `template`: fuzz target for every parser and decoder in the package
+
+#### `image` (199 items, 10 constants)
+
+- [ ] `image.ErrFormat` (var)
+- [ ] `image.RegisterFormat` (func)
+- [ ] `image.Alpha` (type)
+- [ ] `image.NewAlpha` (func)
+- [ ] `image.Alpha.AlphaAt` (method)
+- [ ] `image.Alpha.At` (method)
+- [ ] `image.Alpha.Bounds` (method)
+- [ ] `image.Alpha.ColorModel` (method)
+- [ ] `image.Alpha.Opaque` (method)
+- [ ] `image.Alpha.PixOffset` (method)
+- [ ] `image.Alpha.RGBA64At` (method)
+- [ ] `image.Alpha.Set` (method)
+- [ ] `image.Alpha.SetAlpha` (method)
+- [ ] `image.Alpha.SetRGBA64` (method)
+- [ ] `image.Alpha.SubImage` (method)
+- [ ] `image.Alpha16` (type)
+- [ ] `image.NewAlpha16` (func)
+- [ ] `image.Alpha16.Alpha16At` (method)
+- [ ] `image.Alpha16.At` (method)
+- [ ] `image.Alpha16.Bounds` (method)
+- [ ] `image.Alpha16.ColorModel` (method)
+- [ ] `image.Alpha16.Opaque` (method)
+- [ ] `image.Alpha16.PixOffset` (method)
+- [ ] `image.Alpha16.RGBA64At` (method)
+- [ ] `image.Alpha16.Set` (method)
+- [ ] `image.Alpha16.SetAlpha16` (method)
+- [ ] `image.Alpha16.SetRGBA64` (method)
+- [ ] `image.Alpha16.SubImage` (method)
+- [ ] `image.CMYK` (type)
+- [ ] `image.NewCMYK` (func)
+- [ ] `image.CMYK.At` (method)
+- [ ] `image.CMYK.Bounds` (method)
+- [ ] `image.CMYK.CMYKAt` (method)
+- [ ] `image.CMYK.ColorModel` (method)
+- [ ] `image.CMYK.Opaque` (method)
+- [ ] `image.CMYK.PixOffset` (method)
+- [ ] `image.CMYK.RGBA64At` (method)
+- [ ] `image.CMYK.Set` (method)
+- [ ] `image.CMYK.SetCMYK` (method)
+- [ ] `image.CMYK.SetRGBA64` (method)
+- [ ] `image.CMYK.SubImage` (method)
+- [ ] `image.Config` (type)
+- [ ] `image.DecodeConfig` (func)
+- [ ] `image.Gray` (type)
+- [ ] `image.NewGray` (func)
+- [ ] `image.Gray.At` (method)
+- [ ] `image.Gray.Bounds` (method)
+- [ ] `image.Gray.ColorModel` (method)
+- [ ] `image.Gray.GrayAt` (method)
+- [ ] `image.Gray.Opaque` (method)
+- [ ] `image.Gray.PixOffset` (method)
+- [ ] `image.Gray.RGBA64At` (method)
+- [ ] `image.Gray.Set` (method)
+- [ ] `image.Gray.SetGray` (method)
+- [ ] `image.Gray.SetRGBA64` (method)
+- [ ] `image.Gray.SubImage` (method)
+- [ ] `image.Gray16` (type)
+- [ ] `image.NewGray16` (func)
+- [ ] `image.Gray16.At` (method)
+- [ ] `image.Gray16.Bounds` (method)
+- [ ] `image.Gray16.ColorModel` (method)
+- [ ] `image.Gray16.Gray16At` (method)
+- [ ] `image.Gray16.Opaque` (method)
+- [ ] `image.Gray16.PixOffset` (method)
+- [ ] `image.Gray16.RGBA64At` (method)
+- [ ] `image.Gray16.Set` (method)
+- [ ] `image.Gray16.SetGray16` (method)
+- [ ] `image.Gray16.SetRGBA64` (method)
+- [ ] `image.Gray16.SubImage` (method)
+- [ ] `image.Image` (type)
+- [ ] `image.Decode` (func)
+- [ ] `image.NRGBA` (type)
+- [ ] `image.NewNRGBA` (func)
+- [ ] `image.NRGBA.At` (method)
+- [ ] `image.NRGBA.Bounds` (method)
+- [ ] `image.NRGBA.ColorModel` (method)
+- [ ] `image.NRGBA.NRGBAAt` (method)
+- [ ] `image.NRGBA.Opaque` (method)
+- [ ] `image.NRGBA.PixOffset` (method)
+- [ ] `image.NRGBA.RGBA64At` (method)
+- [ ] `image.NRGBA.Set` (method)
+- [ ] `image.NRGBA.SetNRGBA` (method)
+- [ ] `image.NRGBA.SetRGBA64` (method)
+- [ ] `image.NRGBA.SubImage` (method)
+- [ ] `image.NRGBA64` (type)
+- [ ] `image.NewNRGBA64` (func)
+- [ ] `image.NRGBA64.At` (method)
+- [ ] `image.NRGBA64.Bounds` (method)
+- [ ] `image.NRGBA64.ColorModel` (method)
+- [ ] `image.NRGBA64.NRGBA64At` (method)
+- [ ] `image.NRGBA64.Opaque` (method)
+- [ ] `image.NRGBA64.PixOffset` (method)
+- [ ] `image.NRGBA64.RGBA64At` (method)
+- [ ] `image.NRGBA64.Set` (method)
+- [ ] `image.NRGBA64.SetNRGBA64` (method)
+- [ ] `image.NRGBA64.SetRGBA64` (method)
+- [ ] `image.NRGBA64.SubImage` (method)
+- [ ] `image.NYCbCrA` (type)
+- [ ] `image.NewNYCbCrA` (func)
+- [ ] `image.NYCbCrA.AOffset` (method)
+- [ ] `image.NYCbCrA.At` (method)
+- [ ] `image.NYCbCrA.ColorModel` (method)
+- [ ] `image.NYCbCrA.NYCbCrAAt` (method)
+- [ ] `image.NYCbCrA.Opaque` (method)
+- [ ] `image.NYCbCrA.RGBA64At` (method)
+- [ ] `image.NYCbCrA.SubImage` (method)
+- [ ] `image.Paletted` (type)
+- [ ] `image.NewPaletted` (func)
+- [ ] `image.Paletted.At` (method)
+- [ ] `image.Paletted.Bounds` (method)
+- [ ] `image.Paletted.ColorIndexAt` (method)
+- [ ] `image.Paletted.ColorModel` (method)
+- [ ] `image.Paletted.Opaque` (method)
+- [ ] `image.Paletted.PixOffset` (method)
+- [ ] `image.Paletted.RGBA64At` (method)
+- [ ] `image.Paletted.Set` (method)
+- [ ] `image.Paletted.SetColorIndex` (method)
+- [ ] `image.Paletted.SetRGBA64` (method)
+- [ ] `image.Paletted.SubImage` (method)
+- [ ] `image.PalettedImage` (type)
+- [ ] `image.Point` (type)
+- [ ] `image.ZP` (var)
+- [ ] `image.Pt` (func)
+- [ ] `image.Point.Add` (method)
+- [ ] `image.Point.Div` (method)
+- [ ] `image.Point.Eq` (method)
+- [ ] `image.Point.In` (method)
+- [ ] `image.Point.Mod` (method)
+- [ ] `image.Point.Mul` (method)
+- [ ] `image.Point.String` (method)
+- [ ] `image.Point.Sub` (method)
+- [ ] `image.RGBA` (type)
+- [ ] `image.NewRGBA` (func)
+- [ ] `image.RGBA.At` (method)
+- [ ] `image.RGBA.Bounds` (method)
+- [ ] `image.RGBA.ColorModel` (method)
+- [ ] `image.RGBA.Opaque` (method)
+- [ ] `image.RGBA.PixOffset` (method)
+- [ ] `image.RGBA.RGBA64At` (method)
+- [ ] `image.RGBA.RGBAAt` (method)
+- [ ] `image.RGBA.Set` (method)
+- [ ] `image.RGBA.SetRGBA` (method)
+- [ ] `image.RGBA.SetRGBA64` (method)
+- [ ] `image.RGBA.SubImage` (method)
+- [ ] `image.RGBA64` (type)
+- [ ] `image.NewRGBA64` (func)
+- [ ] `image.RGBA64.At` (method)
+- [ ] `image.RGBA64.Bounds` (method)
+- [ ] `image.RGBA64.ColorModel` (method)
+- [ ] `image.RGBA64.Opaque` (method)
+- [ ] `image.RGBA64.PixOffset` (method)
+- [ ] `image.RGBA64.RGBA64At` (method)
+- [ ] `image.RGBA64.Set` (method)
+- [ ] `image.RGBA64.SetRGBA64` (method)
+- [ ] `image.RGBA64.SubImage` (method)
+- [ ] `image.RGBA64Image` (type)
+- [ ] `image.Rectangle` (type)
+- [ ] `image.ZR` (var)
+- [ ] `image.Rect` (func)
+- [ ] `image.Rectangle.Add` (method)
+- [ ] `image.Rectangle.At` (method)
+- [ ] `image.Rectangle.Bounds` (method)
+- [ ] `image.Rectangle.Canon` (method)
+- [ ] `image.Rectangle.ColorModel` (method)
+- [ ] `image.Rectangle.Dx` (method)
+- [ ] `image.Rectangle.Dy` (method)
+- [ ] `image.Rectangle.Empty` (method)
+- [ ] `image.Rectangle.Eq` (method)
+- [ ] `image.Rectangle.In` (method)
+- [ ] `image.Rectangle.Inset` (method)
+- [ ] `image.Rectangle.Intersect` (method)
+- [ ] `image.Rectangle.Overlaps` (method)
+- [ ] `image.Rectangle.RGBA64At` (method)
+- [ ] `image.Rectangle.Size` (method)
+- [ ] `image.Rectangle.String` (method)
+- [ ] `image.Rectangle.Sub` (method)
+- [ ] `image.Rectangle.Union` (method)
+- [ ] `image.Uniform` (type)
+- [ ] `image.NewUniform` (func)
+- [ ] `image.Uniform.At` (method)
+- [ ] `image.Uniform.Bounds` (method)
+- [ ] `image.Uniform.ColorModel` (method)
+- [ ] `image.Uniform.Convert` (method)
+- [ ] `image.Uniform.Opaque` (method)
+- [ ] `image.Uniform.RGBA` (method)
+- [ ] `image.Uniform.RGBA64At` (method)
+- [ ] `image.YCbCr` (type)
+- [ ] `image.NewYCbCr` (func)
+- [ ] `image.YCbCr.At` (method)
+- [ ] `image.YCbCr.Bounds` (method)
+- [ ] `image.YCbCr.COffset` (method)
+- [ ] `image.YCbCr.ColorModel` (method)
+- [ ] `image.YCbCr.Opaque` (method)
+- [ ] `image.YCbCr.RGBA64At` (method)
+- [ ] `image.YCbCr.SubImage` (method)
+- [ ] `image.YCbCr.YCbCrAt` (method)
+- [ ] `image.YCbCr.YOffset` (method)
+- [ ] `image.YCbCrSubsampleRatio` (type)
+- [ ] `image.YCbCrSubsampleRatio.String` (method)
+- [ ] `image`: the 10 constants (one task per constant group in `go doc -all image`)
+- [ ] `image`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `image`: regression cases for every bug the twin finds, tied to issues
+- [ ] `image`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `image`: fuzz target for every parser and decoder in the package
+
+#### `image/color` (35 items, 12 constants)
+
+- [ ] `color.CMYKToRGB` (func)
+- [ ] `color.RGBToCMYK` (func)
+- [ ] `color.RGBToYCbCr` (func)
+- [ ] `color.YCbCrToRGB` (func)
+- [ ] `color.Alpha` (type)
+- [ ] `color.Alpha.RGBA` (method)
+- [ ] `color.Alpha16` (type)
+- [ ] `color.Alpha16.RGBA` (method)
+- [ ] `color.CMYK` (type)
+- [ ] `color.CMYK.RGBA` (method)
+- [ ] `color.Color` (type)
+- [ ] `color.Gray` (type)
+- [ ] `color.Gray.RGBA` (method)
+- [ ] `color.Gray16` (type)
+- [ ] `color.Gray16.RGBA` (method)
+- [ ] `color.Model` (type)
+- [ ] `color.CMYKModel` (var)
+- [ ] `color.NYCbCrAModel` (var)
+- [ ] `color.YCbCrModel` (var)
+- [ ] `color.ModelFunc` (func)
+- [ ] `color.NRGBA` (type)
+- [ ] `color.NRGBA.RGBA` (method)
+- [ ] `color.NRGBA64` (type)
+- [ ] `color.NRGBA64.RGBA` (method)
+- [ ] `color.NYCbCrA` (type)
+- [ ] `color.NYCbCrA.RGBA` (method)
+- [ ] `color.Palette` (type)
+- [ ] `color.Palette.Convert` (method)
+- [ ] `color.Palette.Index` (method)
+- [ ] `color.RGBA` (type)
+- [ ] `color.RGBA.RGBA` (method)
+- [ ] `color.RGBA64` (type)
+- [ ] `color.RGBA64.RGBA` (method)
+- [ ] `color.YCbCr` (type)
+- [ ] `color.YCbCr.RGBA` (method)
+- [ ] `color`: the 12 constants (one task per constant group in `go doc -all image/color`)
+- [ ] `color`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `color`: regression cases for every bug the twin finds, tied to issues
+- [ ] `color`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `image/color/palette` (2 items)
+
+- [ ] `palette.Plan9` (var)
+- [ ] `palette.WebSafe` (var)
+- [ ] `palette`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `palette`: regression cases for every bug the twin finds, tied to issues
+- [ ] `palette`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `image/draw` (9 items, 2 constants)
+
+- [ ] `draw.Draw` (func)
+- [ ] `draw.DrawMask` (func)
+- [ ] `draw.Drawer` (type)
+- [ ] `draw.FloydSteinberg` (var)
+- [ ] `draw.Image` (type)
+- [ ] `draw.Op` (type)
+- [ ] `draw.Op.Draw` (method)
+- [ ] `draw.Quantizer` (type)
+- [ ] `draw.RGBA64Image` (type)
+- [ ] `draw`: the 2 constants (one task per constant group in `go doc -all image/draw`)
+- [ ] `draw`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `draw`: regression cases for every bug the twin finds, tied to issues
+- [ ] `draw`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `image/gif` (7 items, 3 constants)
+
+- [ ] `gif.Decode` (func)
+- [ ] `gif.DecodeConfig` (func)
+- [ ] `gif.Encode` (func)
+- [ ] `gif.EncodeAll` (func)
+- [ ] `gif.GIF` (type)
+- [ ] `gif.DecodeAll` (func)
+- [ ] `gif.Options` (type)
+- [ ] `gif`: the 3 constants (one task per constant group in `go doc -all image/gif`)
+- [ ] `gif`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `gif`: regression cases for every bug the twin finds, tied to issues
+- [ ] `gif`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `gif`: fuzz target for every parser and decoder in the package
+
+#### `image/jpeg` (10 items)
+
+- [ ] `jpeg.DefaultQuality` (const)
+- [ ] `jpeg.Decode` (func)
+- [ ] `jpeg.DecodeConfig` (func)
+- [ ] `jpeg.Encode` (func)
+- [ ] `jpeg.FormatError` (type)
+- [ ] `jpeg.FormatError.Error` (method)
+- [ ] `jpeg.Options` (type)
+- [ ] `jpeg.Reader` (type)
+- [ ] `jpeg.UnsupportedError` (type)
+- [ ] `jpeg.UnsupportedError.Error` (method)
+- [ ] `jpeg`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `jpeg`: regression cases for every bug the twin finds, tied to issues
+- [ ] `jpeg`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `jpeg`: fuzz target for every parser and decoder in the package
+
+#### `image/png` (12 items, 4 constants)
+
+- [ ] `png.Decode` (func)
+- [ ] `png.DecodeConfig` (func)
+- [ ] `png.Encode` (func)
+- [ ] `png.CompressionLevel` (type)
+- [ ] `png.Encoder` (type)
+- [ ] `png.Encoder.Encode` (method)
+- [ ] `png.EncoderBuffer` (type)
+- [ ] `png.EncoderBufferPool` (type)
+- [ ] `png.FormatError` (type)
+- [ ] `png.FormatError.Error` (method)
+- [ ] `png.UnsupportedError` (type)
+- [ ] `png.UnsupportedError.Error` (method)
+- [ ] `png`: the 4 constants (one task per constant group in `go doc -all image/png`)
+- [ ] `png`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `png`: regression cases for every bug the twin finds, tied to issues
+- [ ] `png`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `png`: fuzz target for every parser and decoder in the package
+
+#### `index/suffixarray` (7 items)
+
+- [ ] `suffixarray.Index` (type)
+- [ ] `suffixarray.New` (func)
+- [ ] `suffixarray.Index.Bytes` (method)
+- [ ] `suffixarray.Index.FindAllIndex` (method)
+- [ ] `suffixarray.Index.Lookup` (method)
+- [ ] `suffixarray.Index.Read` (method)
+- [ ] `suffixarray.Index.Write` (method)
+- [ ] `suffixarray`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `suffixarray`: regression cases for every bug the twin finds, tied to issues
+- [ ] `suffixarray`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `io` (64 items, 3 constants)
+
+- [ ] `io.EOF` (var)
+- [ ] `io.ErrClosedPipe` (var)
+- [ ] `io.ErrNoProgress` (var)
+- [ ] `io.ErrShortBuffer` (var)
+- [ ] `io.ErrShortWrite` (var)
+- [ ] `io.ErrUnexpectedEOF` (var)
+- [ ] `io.Copy` (func)
+- [ ] `io.CopyBuffer` (func)
+- [ ] `io.CopyN` (func)
+- [ ] `io.Pipe` (func)
+- [~] `io.ReadAll` (func)
+- [ ] `io.ReadAtLeast` (func)
+- [ ] `io.ReadFull` (func)
+- [ ] `io.WriteString` (func)
+- [ ] `io.ByteReader` (type)
+- [ ] `io.ByteScanner` (type)
+- [ ] `io.ByteWriter` (type)
+- [ ] `io.Closer` (type)
+- [ ] `io.LimitedReader` (type)
+- [ ] `io.LimitedReader.Read` (method)
+- [ ] `io.OffsetWriter` (type)
+- [ ] `io.NewOffsetWriter` (func)
+- [ ] `io.OffsetWriter.Seek` (method)
+- [ ] `io.OffsetWriter.Write` (method)
+- [ ] `io.OffsetWriter.WriteAt` (method)
+- [ ] `io.PipeReader` (type)
+- [~] `io.PipeReader.Close` (method)
+- [ ] `io.PipeReader.CloseWithError` (method)
+- [ ] `io.PipeReader.Read` (method)
+- [ ] `io.PipeWriter` (type)
+- [~] `io.PipeWriter.Close` (method)
+- [ ] `io.PipeWriter.CloseWithError` (method)
+- [ ] `io.PipeWriter.Write` (method)
+- [ ] `io.ReadCloser` (type)
+- [ ] `io.NopCloser` (func)
+- [ ] `io.ReadSeekCloser` (type)
+- [ ] `io.ReadSeeker` (type)
+- [ ] `io.ReadWriteCloser` (type)
+- [ ] `io.ReadWriteSeeker` (type)
+- [ ] `io.ReadWriter` (type)
+- [~] `io.Reader` (type)
+- [ ] `io.LimitReader` (func)
+- [ ] `io.MultiReader` (func)
+- [ ] `io.TeeReader` (func)
+- [ ] `io.ReaderAt` (type)
+- [ ] `io.ReaderFrom` (type)
+- [ ] `io.RuneReader` (type)
+- [ ] `io.RuneScanner` (type)
+- [ ] `io.SectionReader` (type)
+- [ ] `io.NewSectionReader` (func)
+- [ ] `io.SectionReader.Outer` (method)
+- [ ] `io.SectionReader.Read` (method)
+- [ ] `io.SectionReader.ReadAt` (method)
+- [ ] `io.SectionReader.Seek` (method)
+- [ ] `io.SectionReader.Size` (method)
+- [ ] `io.Seeker` (type)
+- [ ] `io.StringWriter` (type)
+- [ ] `io.WriteCloser` (type)
+- [ ] `io.WriteSeeker` (type)
+- [~] `io.Writer` (type)
+- [ ] `io.Discard` (var)
+- [ ] `io.MultiWriter` (func)
+- [ ] `io.WriterAt` (type)
+- [ ] `io.WriterTo` (type)
+- [ ] `io`: the 3 constants (one task per constant group in `go doc -all io`)
+- [ ] `io`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `io`: regression cases for every bug the twin finds, tied to issues
+- [ ] `io`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `io/fs` (36 items, 20 constants)
+
+- [ ] `fs.SkipAll` (var)
+- [ ] `fs.SkipDir` (var)
+- [ ] `fs.FormatDirEntry` (func)
+- [ ] `fs.FormatFileInfo` (func)
+- [ ] `fs.Glob` (func)
+- [ ] `fs.ReadFile` (func)
+- [ ] `fs.ReadLink` (func)
+- [ ] `fs.ValidPath` (func)
+- [ ] `fs.WalkDir` (func)
+- [ ] `fs.DirEntry` (type)
+- [ ] `fs.FileInfoToDirEntry` (func)
+- [ ] `fs.ReadDir` (func)
+- [ ] `fs.FS` (type)
+- [ ] `fs.Sub` (func)
+- [ ] `fs.File` (type)
+- [ ] `fs.FileInfo` (type)
+- [ ] `fs.Lstat` (func)
+- [ ] `fs.Stat` (func)
+- [ ] `fs.FileMode` (type)
+- [ ] `fs.FileMode.IsDir` (method)
+- [ ] `fs.FileMode.IsRegular` (method)
+- [ ] `fs.FileMode.Perm` (method)
+- [ ] `fs.FileMode.String` (method)
+- [ ] `fs.FileMode.Type` (method)
+- [ ] `fs.GlobFS` (type)
+- [ ] `fs.PathError` (type)
+- [ ] `fs.PathError.Error` (method)
+- [ ] `fs.PathError.Timeout` (method)
+- [ ] `fs.PathError.Unwrap` (method)
+- [ ] `fs.ReadDirFS` (type)
+- [ ] `fs.ReadDirFile` (type)
+- [ ] `fs.ReadFileFS` (type)
+- [ ] `fs.ReadLinkFS` (type)
+- [ ] `fs.StatFS` (type)
+- [ ] `fs.SubFS` (type)
+- [ ] `fs.WalkDirFunc` (type)
+- [ ] `fs`: the 20 constants (one task per constant group in `go doc -all io/fs`)
+- [ ] `fs`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `fs`: regression cases for every bug the twin finds, tied to issues
+- [ ] `fs`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `iter` (20 items)
+
+- [-] `iter.Keys` (func): replaced by design (range over functions (section 1))
+- [-] `iter.PrintAll` (func): replaced by design (range over functions (section 1))
+- [-] `iter.Set.All` (method): replaced by design (range over functions (section 1))
+- [-] `iter.Country.Cities` (method): replaced by design (range over functions (section 1))
+- [-] `iter.Country.Languages` (method): replaced by design (range over functions (section 1))
+- [-] `iter.Map.Scan` (method): replaced by design (range over functions (section 1))
+- [-] `iter.Split` (func): replaced by design (range over functions (section 1))
+- [-] `iter.List.All` (method): replaced by design (range over functions (section 1))
+- [-] `iter.List.Backward` (method): replaced by design (range over functions (section 1))
+- [-] `iter.Preorder` (func): replaced by design (range over functions (section 1))
+- [-] `iter.Reader.Lines` (method): replaced by design (range over functions (section 1))
+- [-] `iter.Pairs` (func): replaced by design (range over functions (section 1))
+- [-] `iter.Tree.Positions` (method): replaced by design (range over functions (section 1))
+- [-] `iter.Pos.Value` (method): replaced by design (range over functions (section 1))
+- [-] `iter.Pos.Delete` (method): replaced by design (range over functions (section 1))
+- [-] `iter.Pos.Set` (method): replaced by design (range over functions (section 1))
+- [-] `iter.Pull` (func): replaced by design (range over functions (section 1))
+- [-] `iter.Pull2` (func): replaced by design (range over functions (section 1))
+- [-] `iter.Seq` (type): replaced by design (range over functions (section 1))
+- [-] `iter.Seq2` (type): replaced by design (range over functions (section 1))
+- [ ] `iter`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `iter`: regression cases for every bug the twin finds, tied to issues
+- [ ] `iter`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `log` (35 items, 8 constants)
+
+- [ ] `log.Fatal` (func)
+- [ ] `log.Fatalf` (func)
+- [ ] `log.Fatalln` (func)
+- [ ] `log.Flags` (func)
+- [ ] `log.Output` (func)
+- [ ] `log.Panic` (func)
+- [ ] `log.Panicf` (func)
+- [ ] `log.Panicln` (func)
+- [ ] `log.Prefix` (func)
+- [ ] `log.Print` (func)
+- [ ] `log.Printf` (func)
+- [ ] `log.Println` (func)
+- [ ] `log.SetFlags` (func)
+- [~] `log.SetOutput` (func)
+- [ ] `log.SetPrefix` (func)
+- [ ] `log.Writer` (func)
+- [ ] `log.Logger` (type)
+- [ ] `log.Default` (func)
+- [ ] `log.New` (func)
+- [ ] `log.Logger.Fatal` (method)
+- [ ] `log.Logger.Fatalf` (method)
+- [ ] `log.Logger.Fatalln` (method)
+- [ ] `log.Logger.Flags` (method)
+- [ ] `log.Logger.Output` (method)
+- [ ] `log.Logger.Panic` (method)
+- [ ] `log.Logger.Panicf` (method)
+- [ ] `log.Logger.Panicln` (method)
+- [ ] `log.Logger.Prefix` (method)
+- [ ] `log.Logger.Print` (method)
+- [ ] `log.Logger.Printf` (method)
+- [ ] `log.Logger.Println` (method)
+- [ ] `log.Logger.SetFlags` (method)
+- [~] `log.Logger.SetOutput` (method)
+- [ ] `log.Logger.SetPrefix` (method)
+- [ ] `log.Logger.Writer` (method)
+- [ ] `log`: the 8 constants (one task per constant group in `go doc -all log`)
+- [ ] `log`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `log`: regression cases for every bug the twin finds, tied to issues
+- [ ] `log`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `log/slog` (119 items, 18 constants)
+
+- [ ] `slog.Infof` (func)
+- [~] `slog.Debug` (func)
+- [ ] `slog.DebugContext` (func)
+- [~] `slog.Error` (func)
+- [ ] `slog.ErrorContext` (func)
+- [~] `slog.Info` (func)
+- [ ] `slog.InfoContext` (func)
+- [~] `slog.Log` (func)
+- [ ] `slog.LogAttrs` (func)
+- [ ] `slog.NewLogLogger` (func)
+- [ ] `slog.SetDefault` (func)
+- [~] `slog.Warn` (func)
+- [ ] `slog.WarnContext` (func)
+- [ ] `slog.Attr` (type)
+- [ ] `slog.Any` (func)
+- [ ] `slog.Bool` (func)
+- [ ] `slog.Duration` (func)
+- [ ] `slog.Float64` (func)
+- [ ] `slog.Group` (func)
+- [ ] `slog.GroupAttrs` (func)
+- [ ] `slog.Int` (func)
+- [ ] `slog.Int64` (func)
+- [ ] `slog.String` (func)
+- [ ] `slog.Time` (func)
+- [ ] `slog.Uint64` (func)
+- [ ] `slog.Attr.Equal` (method)
+- [ ] `slog.Attr.String` (method)
+- [ ] `slog.Handler` (type)
+- [ ] `slog.DiscardHandler` (var)
+- [ ] `slog.HandlerOptions` (type)
+- [ ] `slog.JSONHandler` (type)
+- [ ] `slog.NewJSONHandler` (func)
+- [ ] `slog.JSONHandler.Enabled` (method)
+- [ ] `slog.JSONHandler.Handle` (method)
+- [ ] `slog.JSONHandler.WithAttrs` (method)
+- [ ] `slog.JSONHandler.WithGroup` (method)
+- [ ] `slog.Kind` (type)
+- [ ] `slog.Kind.String` (method)
+- [ ] `slog.Level` (type)
+- [ ] `slog.SetLogLoggerLevel` (func)
+- [ ] `slog.Level.AppendText` (method)
+- [ ] `slog.Level.Level` (method)
+- [ ] `slog.Level.MarshalJSON` (method)
+- [ ] `slog.Level.MarshalText` (method)
+- [ ] `slog.Level.String` (method)
+- [ ] `slog.Level.UnmarshalJSON` (method)
+- [ ] `slog.Level.UnmarshalText` (method)
+- [ ] `slog.LevelVar` (type)
+- [ ] `slog.LevelVar.AppendText` (method)
+- [ ] `slog.LevelVar.Level` (method)
+- [ ] `slog.LevelVar.MarshalText` (method)
+- [ ] `slog.LevelVar.Set` (method)
+- [ ] `slog.LevelVar.String` (method)
+- [ ] `slog.LevelVar.UnmarshalText` (method)
+- [ ] `slog.Leveler` (type)
+- [ ] `slog.LogValuer` (type)
+- [ ] `slog.Logger` (type)
+- [ ] `slog.Default` (func)
+- [ ] `slog.New` (func)
+- [ ] `slog.With` (func)
+- [~] `slog.Logger.Debug` (method)
+- [ ] `slog.Logger.DebugContext` (method)
+- [ ] `slog.Logger.Enabled` (method)
+- [~] `slog.Logger.Error` (method)
+- [ ] `slog.Logger.ErrorContext` (method)
+- [ ] `slog.Logger.Handler` (method)
+- [~] `slog.Logger.Info` (method)
+- [ ] `slog.Logger.InfoContext` (method)
+- [~] `slog.Logger.Log` (method)
+- [ ] `slog.Logger.LogAttrs` (method)
+- [~] `slog.Logger.Warn` (method)
+- [ ] `slog.Logger.WarnContext` (method)
+- [ ] `slog.Logger.With` (method)
+- [ ] `slog.Logger.WithGroup` (method)
+- [ ] `slog.MultiHandler` (type)
+- [ ] `slog.NewMultiHandler` (func)
+- [ ] `slog.MultiHandler.Enabled` (method)
+- [ ] `slog.MultiHandler.Handle` (method)
+- [ ] `slog.MultiHandler.WithAttrs` (method)
+- [ ] `slog.MultiHandler.WithGroup` (method)
+- [ ] `slog.Record` (type)
+- [ ] `slog.NewRecord` (func)
+- [ ] `slog.Record.Add` (method)
+- [ ] `slog.Record.AddAttrs` (method)
+- [ ] `slog.Record.Attrs` (method)
+- [ ] `slog.Record.Clone` (method)
+- [ ] `slog.Record.NumAttrs` (method)
+- [ ] `slog.Record.Source` (method)
+- [ ] `slog.Source` (type)
+- [ ] `slog.TextHandler` (type)
+- [ ] `slog.NewTextHandler` (func)
+- [ ] `slog.TextHandler.Enabled` (method)
+- [ ] `slog.TextHandler.Handle` (method)
+- [ ] `slog.TextHandler.WithAttrs` (method)
+- [ ] `slog.TextHandler.WithGroup` (method)
+- [ ] `slog.Value` (type)
+- [ ] `slog.AnyValue` (func)
+- [ ] `slog.BoolValue` (func)
+- [ ] `slog.DurationValue` (func)
+- [ ] `slog.Float64Value` (func)
+- [ ] `slog.GroupValue` (func)
+- [ ] `slog.Int64Value` (func)
+- [ ] `slog.IntValue` (func)
+- [ ] `slog.StringValue` (func)
+- [ ] `slog.TimeValue` (func)
+- [ ] `slog.Uint64Value` (func)
+- [ ] `slog.Value.Any` (method)
+- [ ] `slog.Value.Bool` (method)
+- [ ] `slog.Value.Duration` (method)
+- [ ] `slog.Value.Equal` (method)
+- [ ] `slog.Value.Float64` (method)
+- [ ] `slog.Value.Group` (method)
+- [ ] `slog.Value.Int64` (method)
+- [ ] `slog.Value.Kind` (method)
+- [ ] `slog.Value.LogValuer` (method)
+- [ ] `slog.Value.Resolve` (method)
+- [ ] `slog.Value.String` (method)
+- [ ] `slog.Value.Time` (method)
+- [ ] `slog.Value.Uint64` (method)
+- [ ] `slog`: the 18 constants (one task per constant group in `go doc -all log/slog`)
+- [ ] `slog`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `slog`: regression cases for every bug the twin finds, tied to issues
+- [ ] `slog`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `log/syslog` (15 items, 28 constants)
+
+- [ ] `syslog.NewLogger` (func)
+- [ ] `syslog.Priority` (type)
+- [ ] `syslog.Writer` (type)
+- [ ] `syslog.Dial` (func)
+- [ ] `syslog.New` (func)
+- [ ] `syslog.Writer.Alert` (method)
+- [ ] `syslog.Writer.Close` (method)
+- [ ] `syslog.Writer.Crit` (method)
+- [ ] `syslog.Writer.Debug` (method)
+- [ ] `syslog.Writer.Emerg` (method)
+- [ ] `syslog.Writer.Err` (method)
+- [ ] `syslog.Writer.Info` (method)
+- [ ] `syslog.Writer.Notice` (method)
+- [ ] `syslog.Writer.Warning` (method)
+- [ ] `syslog.Writer.Write` (method)
+- [ ] `syslog`: the 28 constants (one task per constant group in `go doc -all log/syslog`)
+- [ ] `syslog`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `syslog`: regression cases for every bug the twin finds, tied to issues
+- [ ] `syslog`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `maps` (10 items)
+
+- [ ] `maps.All` (func)
+- [x] `maps.Clone` (func)
+- [ ] `maps.Collect` (func)
+- [x] `maps.Copy` (func)
+- [x] `maps.DeleteFunc` (func)
+- [x] `maps.Equal` (func)
+- [x] `maps.EqualFunc` (func)
+- [ ] `maps.Insert` (func)
+- [x] `maps.Keys` (func)
+- [x] `maps.Values` (func)
+- [ ] `maps`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `maps`: regression cases for every bug the twin finds, tied to issues
+- [ ] `maps`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `math` (67 items, 30 constants)
+
+- [x] `math.Abs` (func)
+- [x] `math.Acos` (func)
+- [ ] `math.Acosh` (func)
+- [x] `math.Asin` (func)
+- [ ] `math.Asinh` (func)
+- [x] `math.Atan` (func)
+- [x] `math.Atan2` (func)
+- [ ] `math.Atanh` (func)
+- [x] `math.Cbrt` (func)
+- [x] `math.Ceil` (func)
+- [x] `math.Copysign` (func)
+- [x] `math.Cos` (func)
+- [x] `math.Cosh` (func)
+- [ ] `math.Dim` (func)
+- [ ] `math.Erf` (func)
+- [ ] `math.Erfc` (func)
+- [ ] `math.Erfcinv` (func)
+- [ ] `math.Erfinv` (func)
+- [x] `math.Exp` (func)
+- [x] `math.Exp2` (func)
+- [ ] `math.Expm1` (func)
+- [ ] `math.FMA` (func)
+- [ ] `math.Float32bits` (func)
+- [ ] `math.Float32frombits` (func)
+- [ ] `math.Float64bits` (func)
+- [ ] `math.Float64frombits` (func)
+- [x] `math.Floor` (func)
+- [x] `math.Frexp` (func)
+- [ ] `math.Gamma` (func)
+- [x] `math.Hypot` (func)
+- [ ] `math.Ilogb` (func)
+- [x] `math.Inf` (func)
+- [x] `math.IsInf` (func)
+- [x] `math.IsNaN` (func)
+- [ ] `math.J0` (func)
+- [ ] `math.J1` (func)
+- [ ] `math.Jn` (func)
+- [x] `math.Ldexp` (func)
+- [ ] `math.Lgamma` (func)
+- [x] `math.Log` (func)
+- [x] `math.Log10` (func)
+- [x] `math.Log1p` (func)
+- [x] `math.Log2` (func)
+- [ ] `math.Logb` (func)
+- [x] `math.Max` (func)
+- [x] `math.Min` (func)
+- [x] `math.Mod` (func)
+- [x] `math.Modf` (func)
+- [x] `math.NaN` (func)
+- [ ] `math.Nextafter` (func)
+- [ ] `math.Nextafter32` (func)
+- [x] `math.Pow` (func)
+- [x] `math.Pow10` (func)
+- [ ] `math.Remainder` (func)
+- [x] `math.Round` (func)
+- [x] `math.RoundToEven` (func)
+- [x] `math.Signbit` (func)
+- [x] `math.Sin` (func)
+- [ ] `math.Sincos` (func)
+- [x] `math.Sinh` (func)
+- [x] `math.Sqrt` (func)
+- [x] `math.Tan` (func)
+- [x] `math.Tanh` (func)
+- [x] `math.Trunc` (func)
+- [ ] `math.Y0` (func)
+- [ ] `math.Y1` (func)
+- [ ] `math.Yn` (func)
+- [ ] `math`: the 30 constants (one task per constant group in `go doc -all math`)
+- [ ] `math`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `math`: regression cases for every bug the twin finds, tied to issues
+- [ ] `math`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `math/big` (161 items, 12 constants)
+
+- [ ] `big.NewT` (func)
+- [ ] `big.T.SetV` (method)
+- [ ] `big.T.Unary` (method)
+- [ ] `big.T.Binary` (method)
+- [ ] `big.T.Pred` (method)
+- [ ] `big.Int.Add` (method)
+- [ ] `big.Int.Sign` (method)
+- [ ] `big.MaxBase` (const)
+- [ ] `big.Jacobi` (func)
+- [ ] `big.ParseFloat` (func)
+- [ ] `big.Accuracy` (type)
+- [ ] `big.Accuracy.String` (method)
+- [ ] `big.ErrNaN` (type)
+- [ ] `big.ErrNaN.Error` (method)
+- [ ] `big.Float` (type)
+- [ ] `big.NewFloat` (func)
+- [ ] `big.Float.Abs` (method)
+- [ ] `big.Float.Acc` (method)
+- [ ] `big.Float.Add` (method)
+- [ ] `big.Float.Append` (method)
+- [ ] `big.Float.AppendText` (method)
+- [ ] `big.Float.Cmp` (method)
+- [ ] `big.Float.Copy` (method)
+- [ ] `big.Float.Float32` (method)
+- [ ] `big.Float.Float64` (method)
+- [ ] `big.Float.Format` (method)
+- [ ] `big.Float.GobDecode` (method)
+- [ ] `big.Float.GobEncode` (method)
+- [ ] `big.Float.Int` (method)
+- [ ] `big.Float.Int64` (method)
+- [ ] `big.Float.IsInf` (method)
+- [ ] `big.Float.IsInt` (method)
+- [ ] `big.Float.MantExp` (method)
+- [ ] `big.Float.MarshalText` (method)
+- [ ] `big.Float.MinPrec` (method)
+- [ ] `big.Float.Mode` (method)
+- [ ] `big.Float.Mul` (method)
+- [ ] `big.Float.Neg` (method)
+- [ ] `big.Float.Parse` (method)
+- [ ] `big.Float.Prec` (method)
+- [ ] `big.Float.Quo` (method)
+- [ ] `big.Float.Rat` (method)
+- [ ] `big.Float.Scan` (method)
+- [ ] `big.Float.Set` (method)
+- [ ] `big.Float.SetFloat64` (method)
+- [ ] `big.Float.SetInf` (method)
+- [ ] `big.Float.SetInt` (method)
+- [ ] `big.Float.SetInt64` (method)
+- [ ] `big.Float.SetMantExp` (method)
+- [ ] `big.Float.SetMode` (method)
+- [ ] `big.Float.SetPrec` (method)
+- [ ] `big.Float.SetRat` (method)
+- [ ] `big.Float.SetString` (method)
+- [ ] `big.Float.SetUint64` (method)
+- [ ] `big.Float.Sign` (method)
+- [ ] `big.Float.Signbit` (method)
+- [ ] `big.Float.Sqrt` (method)
+- [ ] `big.Float.String` (method)
+- [ ] `big.Float.Sub` (method)
+- [ ] `big.Float.Text` (method)
+- [ ] `big.Float.Uint64` (method)
+- [ ] `big.Float.UnmarshalText` (method)
+- [ ] `big.Int` (type)
+- [ ] `big.NewInt` (func)
+- [ ] `big.Int.Abs` (method)
+- [ ] `big.Int.Add` (method)
+- [ ] `big.Int.And` (method)
+- [ ] `big.Int.AndNot` (method)
+- [ ] `big.Int.Append` (method)
+- [ ] `big.Int.AppendText` (method)
+- [ ] `big.Int.Binomial` (method)
+- [ ] `big.Int.Bit` (method)
+- [ ] `big.Int.BitLen` (method)
+- [ ] `big.Int.Bits` (method)
+- [ ] `big.Int.Bytes` (method)
+- [ ] `big.Int.Cmp` (method)
+- [ ] `big.Int.CmpAbs` (method)
+- [ ] `big.Int.Div` (method)
+- [ ] `big.Int.DivMod` (method)
+- [ ] `big.Int.Exp` (method)
+- [ ] `big.Int.FillBytes` (method)
+- [ ] `big.Int.Float64` (method)
+- [ ] `big.Int.Format` (method)
+- [ ] `big.Int.GCD` (method)
+- [ ] `big.Int.GobDecode` (method)
+- [ ] `big.Int.GobEncode` (method)
+- [ ] `big.Int.Int64` (method)
+- [ ] `big.Int.IsInt64` (method)
+- [ ] `big.Int.IsUint64` (method)
+- [ ] `big.Int.Lsh` (method)
+- [ ] `big.Int.MarshalJSON` (method)
+- [ ] `big.Int.MarshalText` (method)
+- [ ] `big.Int.Mod` (method)
+- [ ] `big.Int.ModInverse` (method)
+- [ ] `big.Int.ModSqrt` (method)
+- [ ] `big.Int.Mul` (method)
+- [ ] `big.Int.MulRange` (method)
+- [ ] `big.Int.Neg` (method)
+- [ ] `big.Int.Not` (method)
+- [ ] `big.Int.Or` (method)
+- [ ] `big.Int.ProbablyPrime` (method)
+- [ ] `big.Int.Quo` (method)
+- [ ] `big.Int.QuoRem` (method)
+- [ ] `big.Int.Rand` (method)
+- [ ] `big.Int.Rem` (method)
+- [ ] `big.Int.Rsh` (method)
+- [ ] `big.Int.Scan` (method)
+- [ ] `big.Int.Set` (method)
+- [ ] `big.Int.SetBit` (method)
+- [ ] `big.Int.SetBits` (method)
+- [ ] `big.Int.SetBytes` (method)
+- [ ] `big.Int.SetInt64` (method)
+- [ ] `big.Int.SetString` (method)
+- [ ] `big.Int.SetUint64` (method)
+- [ ] `big.Int.Sign` (method)
+- [ ] `big.Int.Sqrt` (method)
+- [ ] `big.Int.String` (method)
+- [ ] `big.Int.Sub` (method)
+- [ ] `big.Int.Text` (method)
+- [ ] `big.Int.TrailingZeroBits` (method)
+- [ ] `big.Int.Uint64` (method)
+- [ ] `big.Int.UnmarshalJSON` (method)
+- [ ] `big.Int.UnmarshalText` (method)
+- [ ] `big.Int.Xor` (method)
+- [ ] `big.Rat` (type)
+- [ ] `big.NewRat` (func)
+- [ ] `big.Rat.Abs` (method)
+- [ ] `big.Rat.Add` (method)
+- [ ] `big.Rat.AppendText` (method)
+- [ ] `big.Rat.Cmp` (method)
+- [ ] `big.Rat.Denom` (method)
+- [ ] `big.Rat.Float32` (method)
+- [ ] `big.Rat.Float64` (method)
+- [ ] `big.Rat.FloatPrec` (method)
+- [ ] `big.Rat.FloatString` (method)
+- [ ] `big.Rat.GobDecode` (method)
+- [ ] `big.Rat.GobEncode` (method)
+- [ ] `big.Rat.Inv` (method)
+- [ ] `big.Rat.IsInt` (method)
+- [ ] `big.Rat.MarshalText` (method)
+- [ ] `big.Rat.Mul` (method)
+- [ ] `big.Rat.Neg` (method)
+- [ ] `big.Rat.Num` (method)
+- [ ] `big.Rat.Quo` (method)
+- [ ] `big.Rat.RatString` (method)
+- [ ] `big.Rat.Scan` (method)
+- [ ] `big.Rat.Set` (method)
+- [ ] `big.Rat.SetFloat64` (method)
+- [ ] `big.Rat.SetFrac` (method)
+- [ ] `big.Rat.SetFrac64` (method)
+- [ ] `big.Rat.SetInt` (method)
+- [ ] `big.Rat.SetInt64` (method)
+- [ ] `big.Rat.SetString` (method)
+- [ ] `big.Rat.SetUint64` (method)
+- [ ] `big.Rat.Sign` (method)
+- [ ] `big.Rat.String` (method)
+- [ ] `big.Rat.Sub` (method)
+- [ ] `big.Rat.UnmarshalText` (method)
+- [ ] `big.RoundingMode` (type)
+- [ ] `big.RoundingMode.String` (method)
+- [ ] `big.Word` (type)
+- [ ] `big`: the 12 constants (one task per constant group in `go doc -all math/big`)
+- [ ] `big`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `big`: regression cases for every bug the twin finds, tied to issues
+- [ ] `big`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `math/bits` (50 items)
+
+- [ ] `bits.UintSize` (const)
+- [ ] `bits.Add` (func)
+- [x] `bits.Add32` (func)
+- [x] `bits.Add64` (func)
+- [ ] `bits.Div` (func)
+- [x] `bits.Div32` (func)
+- [x] `bits.Div64` (func)
+- [ ] `bits.LeadingZeros` (func)
+- [x] `bits.LeadingZeros16` (func)
+- [x] `bits.LeadingZeros32` (func)
+- [x] `bits.LeadingZeros64` (func)
+- [x] `bits.LeadingZeros8` (func)
+- [ ] `bits.Len` (func)
+- [x] `bits.Len16` (func)
+- [x] `bits.Len32` (func)
+- [x] `bits.Len64` (func)
+- [x] `bits.Len8` (func)
+- [ ] `bits.Mul` (func)
+- [x] `bits.Mul32` (func)
+- [x] `bits.Mul64` (func)
+- [ ] `bits.OnesCount` (func)
+- [ ] `bits.OnesCount16` (func)
+- [ ] `bits.OnesCount32` (func)
+- [ ] `bits.OnesCount64` (func)
+- [ ] `bits.OnesCount8` (func)
+- [ ] `bits.Rem` (func)
+- [x] `bits.Rem32` (func)
+- [x] `bits.Rem64` (func)
+- [ ] `bits.Reverse` (func)
+- [x] `bits.Reverse16` (func)
+- [x] `bits.Reverse32` (func)
+- [x] `bits.Reverse64` (func)
+- [x] `bits.Reverse8` (func)
+- [ ] `bits.ReverseBytes` (func)
+- [x] `bits.ReverseBytes16` (func)
+- [x] `bits.ReverseBytes32` (func)
+- [x] `bits.ReverseBytes64` (func)
+- [ ] `bits.RotateLeft` (func)
+- [x] `bits.RotateLeft16` (func)
+- [x] `bits.RotateLeft32` (func)
+- [x] `bits.RotateLeft64` (func)
+- [x] `bits.RotateLeft8` (func)
+- [ ] `bits.Sub` (func)
+- [x] `bits.Sub32` (func)
+- [x] `bits.Sub64` (func)
+- [ ] `bits.TrailingZeros` (func)
+- [x] `bits.TrailingZeros16` (func)
+- [x] `bits.TrailingZeros32` (func)
+- [x] `bits.TrailingZeros64` (func)
+- [x] `bits.TrailingZeros8` (func)
+- [ ] `bits`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `bits`: regression cases for every bug the twin finds, tied to issues
+- [ ] `bits`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `math/cmplx` (27 items)
+
+- [ ] `cmplx.Abs` (func)
+- [ ] `cmplx.Acos` (func)
+- [ ] `cmplx.Acosh` (func)
+- [ ] `cmplx.Asin` (func)
+- [ ] `cmplx.Asinh` (func)
+- [ ] `cmplx.Atan` (func)
+- [ ] `cmplx.Atanh` (func)
+- [ ] `cmplx.Conj` (func)
+- [ ] `cmplx.Cos` (func)
+- [ ] `cmplx.Cosh` (func)
+- [ ] `cmplx.Cot` (func)
+- [ ] `cmplx.Exp` (func)
+- [ ] `cmplx.Inf` (func)
+- [ ] `cmplx.IsInf` (func)
+- [ ] `cmplx.IsNaN` (func)
+- [ ] `cmplx.Log` (func)
+- [ ] `cmplx.Log10` (func)
+- [ ] `cmplx.NaN` (func)
+- [ ] `cmplx.Phase` (func)
+- [ ] `cmplx.Polar` (func)
+- [ ] `cmplx.Pow` (func)
+- [ ] `cmplx.Rect` (func)
+- [ ] `cmplx.Sin` (func)
+- [ ] `cmplx.Sinh` (func)
+- [ ] `cmplx.Sqrt` (func)
+- [ ] `cmplx.Tan` (func)
+- [ ] `cmplx.Tanh` (func)
+- [ ] `cmplx`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `cmplx`: regression cases for every bug the twin finds, tied to issues
+- [ ] `cmplx`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `math/rand` (40 items)
+
+- [ ] `rand.ExpFloat64` (func)
+- [ ] `rand.Float32` (func)
+- [ ] `rand.Float64` (func)
+- [ ] `rand.Int` (func)
+- [ ] `rand.Int31` (func)
+- [ ] `rand.Int31n` (func)
+- [ ] `rand.Int63` (func)
+- [ ] `rand.Int63n` (func)
+- [x] `rand.Intn` (func)
+- [ ] `rand.NormFloat64` (func)
+- [x] `rand.Perm` (func)
+- [ ] `rand.Read` (func)
+- [x] `rand.Seed` (func)
+- [x] `rand.Shuffle` (func)
+- [ ] `rand.Uint32` (func)
+- [ ] `rand.Uint64` (func)
+- [x] `rand.Rand` (type)
+- [x] `rand.New` (func)
+- [ ] `rand.Rand.ExpFloat64` (method)
+- [ ] `rand.Rand.Float32` (method)
+- [ ] `rand.Rand.Float64` (method)
+- [ ] `rand.Rand.Int` (method)
+- [ ] `rand.Rand.Int31` (method)
+- [ ] `rand.Rand.Int31n` (method)
+- [ ] `rand.Rand.Int63` (method)
+- [ ] `rand.Rand.Int63n` (method)
+- [x] `rand.Rand.Intn` (method)
+- [ ] `rand.Rand.NormFloat64` (method)
+- [x] `rand.Rand.Perm` (method)
+- [ ] `rand.Rand.Read` (method)
+- [x] `rand.Rand.Seed` (method)
+- [x] `rand.Rand.Shuffle` (method)
+- [ ] `rand.Rand.Uint32` (method)
+- [ ] `rand.Rand.Uint64` (method)
+- [ ] `rand.Source` (type)
+- [ ] `rand.NewSource` (func)
+- [ ] `rand.Source64` (type)
+- [ ] `rand.Zipf` (type)
+- [ ] `rand.NewZipf` (func)
+- [ ] `rand.Zipf.Uint64` (method)
+- [ ] `rand`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `rand`: regression cases for every bug the twin finds, tied to issues
+- [ ] `rand`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `math/rand/v2` (58 items)
+
+- [ ] `v2.ExpFloat64` (func)
+- [ ] `v2.Float32` (func)
+- [ ] `v2.Float64` (func)
+- [ ] `v2.Int` (func)
+- [ ] `v2.Int32` (func)
+- [ ] `v2.Int32N` (func)
+- [ ] `v2.Int64` (func)
+- [ ] `v2.Int64N` (func)
+- [ ] `v2.IntN` (func)
+- [ ] `v2.N` (func)
+- [ ] `v2.NormFloat64` (func)
+- [x] `v2.Perm` (func)
+- [x] `v2.Shuffle` (func)
+- [ ] `v2.Uint` (func)
+- [ ] `v2.Uint32` (func)
+- [ ] `v2.Uint32N` (func)
+- [ ] `v2.Uint64` (func)
+- [ ] `v2.Uint64N` (func)
+- [ ] `v2.UintN` (func)
+- [ ] `v2.ChaCha8` (type)
+- [ ] `v2.NewChaCha8` (func)
+- [ ] `v2.ChaCha8.AppendBinary` (method)
+- [ ] `v2.ChaCha8.MarshalBinary` (method)
+- [ ] `v2.ChaCha8.Read` (method)
+- [x] `v2.ChaCha8.Seed` (method)
+- [ ] `v2.ChaCha8.Uint64` (method)
+- [ ] `v2.ChaCha8.UnmarshalBinary` (method)
+- [ ] `v2.PCG` (type)
+- [ ] `v2.NewPCG` (func)
+- [ ] `v2.PCG.AppendBinary` (method)
+- [ ] `v2.PCG.MarshalBinary` (method)
+- [x] `v2.PCG.Seed` (method)
+- [ ] `v2.PCG.Uint64` (method)
+- [ ] `v2.PCG.UnmarshalBinary` (method)
+- [x] `v2.Rand` (type)
+- [x] `v2.New` (func)
+- [ ] `v2.Rand.ExpFloat64` (method)
+- [ ] `v2.Rand.Float32` (method)
+- [ ] `v2.Rand.Float64` (method)
+- [ ] `v2.Rand.Int` (method)
+- [ ] `v2.Rand.Int32` (method)
+- [ ] `v2.Rand.Int32N` (method)
+- [ ] `v2.Rand.Int64` (method)
+- [ ] `v2.Rand.Int64N` (method)
+- [ ] `v2.Rand.IntN` (method)
+- [ ] `v2.Rand.NormFloat64` (method)
+- [x] `v2.Rand.Perm` (method)
+- [x] `v2.Rand.Shuffle` (method)
+- [ ] `v2.Rand.Uint` (method)
+- [ ] `v2.Rand.Uint32` (method)
+- [ ] `v2.Rand.Uint32N` (method)
+- [ ] `v2.Rand.Uint64` (method)
+- [ ] `v2.Rand.Uint64N` (method)
+- [ ] `v2.Rand.UintN` (method)
+- [ ] `v2.Source` (type)
+- [ ] `v2.Zipf` (type)
+- [ ] `v2.NewZipf` (func)
+- [ ] `v2.Zipf.Uint64` (method)
+- [ ] `v2`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `v2`: regression cases for every bug the twin finds, tied to issues
+- [ ] `v2`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `mime` (11 items, 2 constants)
+
+- [ ] `mime.ErrInvalidMediaParameter` (var)
+- [ ] `mime.AddExtensionType` (func)
+- [ ] `mime.ExtensionsByType` (func)
+- [ ] `mime.FormatMediaType` (func)
+- [ ] `mime.ParseMediaType` (func)
+- [ ] `mime.TypeByExtension` (func)
+- [ ] `mime.WordDecoder` (type)
+- [ ] `mime.WordDecoder.Decode` (method)
+- [ ] `mime.WordDecoder.DecodeHeader` (method)
+- [ ] `mime.WordEncoder` (type)
+- [ ] `mime.WordEncoder.Encode` (method)
+- [ ] `mime`: the 2 constants (one task per constant group in `go doc -all mime`)
+- [ ] `mime`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `mime`: regression cases for every bug the twin finds, tied to issues
+- [ ] `mime`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `mime`: fuzz target for every parser and decoder in the package
+
+#### `mime/multipart` (27 items)
+
+- [ ] `multipart.ErrMessageTooLarge` (var)
+- [ ] `multipart.FileContentDisposition` (func)
+- [ ] `multipart.File` (type)
+- [ ] `multipart.FileHeader` (type)
+- [ ] `multipart.FileHeader.Open` (method)
+- [ ] `multipart.Form` (type)
+- [ ] `multipart.Form.RemoveAll` (method)
+- [ ] `multipart.Part` (type)
+- [ ] `multipart.Part.Close` (method)
+- [ ] `multipart.Part.FileName` (method)
+- [ ] `multipart.Part.FormName` (method)
+- [ ] `multipart.Part.Read` (method)
+- [ ] `multipart.Reader` (type)
+- [ ] `multipart.NewReader` (func)
+- [ ] `multipart.Reader.NextPart` (method)
+- [ ] `multipart.Reader.NextRawPart` (method)
+- [ ] `multipart.Reader.ReadForm` (method)
+- [ ] `multipart.Writer` (type)
+- [ ] `multipart.NewWriter` (func)
+- [ ] `multipart.Writer.Boundary` (method)
+- [ ] `multipart.Writer.Close` (method)
+- [ ] `multipart.Writer.CreateFormField` (method)
+- [ ] `multipart.Writer.CreateFormFile` (method)
+- [ ] `multipart.Writer.CreatePart` (method)
+- [ ] `multipart.Writer.FormDataContentType` (method)
+- [ ] `multipart.Writer.SetBoundary` (method)
+- [ ] `multipart.Writer.WriteField` (method)
+- [ ] `multipart`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `multipart`: regression cases for every bug the twin finds, tied to issues
+- [ ] `multipart`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `multipart`: fuzz target for every parser and decoder in the package
+
+#### `mime/quotedprintable` (7 items)
+
+- [ ] `quotedprintable.Reader` (type)
+- [ ] `quotedprintable.NewReader` (func)
+- [ ] `quotedprintable.Reader.Read` (method)
+- [ ] `quotedprintable.Writer` (type)
+- [ ] `quotedprintable.NewWriter` (func)
+- [ ] `quotedprintable.Writer.Close` (method)
+- [ ] `quotedprintable.Writer.Write` (method)
+- [ ] `quotedprintable`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `quotedprintable`: regression cases for every bug the twin finds, tied to issues
+- [ ] `quotedprintable`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `net` (265 items, 19 constants)
+
+- [ ] `net.DefaultResolver` (var)
+- [ ] `net.ErrClosed` (var)
+- [~] `net.Dial` (func)
+- [ ] `net.DialIP` (func)
+- [ ] `net.DialTCP` (func)
+- [~] `net.DialTimeout` (func)
+- [ ] `net.DialUDP` (func)
+- [ ] `net.DialUnix` (func)
+- [ ] `net.FileConn` (func)
+- [ ] `net.FileListener` (func)
+- [ ] `net.FilePacketConn` (func)
+- [ ] `net.InterfaceAddrs` (func)
+- [ ] `net.InterfaceByIndex` (func)
+- [ ] `net.InterfaceByName` (func)
+- [ ] `net.Interfaces` (func)
+- [ ] `net.JoinHostPort` (func)
+- [~] `net.Listen` (func)
+- [ ] `net.ListenIP` (func)
+- [ ] `net.ListenMulticastUDP` (func)
+- [ ] `net.ListenPacket` (func)
+- [ ] `net.ListenTCP` (func)
+- [ ] `net.ListenUDP` (func)
+- [ ] `net.ListenUnix` (func)
+- [ ] `net.ListenUnixgram` (func)
+- [ ] `net.LookupAddr` (func)
+- [ ] `net.LookupCNAME` (func)
+- [ ] `net.LookupHost` (func)
+- [ ] `net.LookupIP` (func)
+- [ ] `net.LookupMX` (func)
+- [ ] `net.LookupNS` (func)
+- [ ] `net.LookupPort` (func)
+- [ ] `net.LookupSRV` (func)
+- [ ] `net.LookupTXT` (func)
+- [ ] `net.ParseCIDR` (func)
+- [ ] `net.ParseMAC` (func)
+- [ ] `net.Pipe` (func)
+- [ ] `net.ResolveIPAddr` (func)
+- [ ] `net.ResolveTCPAddr` (func)
+- [ ] `net.ResolveUDPAddr` (func)
+- [ ] `net.ResolveUnixAddr` (func)
+- [ ] `net.SplitHostPort` (func)
+- [ ] `net.Addr` (type)
+- [ ] `net.AddrError` (type)
+- [ ] `net.AddrError.Error` (method)
+- [ ] `net.AddrError.Temporary` (method)
+- [ ] `net.AddrError.Timeout` (method)
+- [ ] `net.Buffers` (type)
+- [~] `net.Buffers.Read` (method)
+- [ ] `net.Buffers.WriteTo` (method)
+- [~] `net.Conn` (type)
+- [ ] `net.DNSConfigError` (type)
+- [ ] `net.DNSConfigError.Error` (method)
+- [ ] `net.DNSConfigError.Temporary` (method)
+- [ ] `net.DNSConfigError.Timeout` (method)
+- [ ] `net.DNSConfigError.Unwrap` (method)
+- [ ] `net.DNSError` (type)
+- [ ] `net.DNSError.Error` (method)
+- [ ] `net.DNSError.Temporary` (method)
+- [ ] `net.DNSError.Timeout` (method)
+- [ ] `net.DNSError.Unwrap` (method)
+- [ ] `net.Dialer` (type)
+- [~] `net.Dialer.Dial` (method)
+- [ ] `net.Dialer.DialContext` (method)
+- [ ] `net.Dialer.DialIP` (method)
+- [ ] `net.Dialer.DialTCP` (method)
+- [ ] `net.Dialer.DialUDP` (method)
+- [ ] `net.Dialer.DialUnix` (method)
+- [ ] `net.Dialer.MultipathTCP` (method)
+- [ ] `net.Dialer.SetMultipathTCP` (method)
+- [ ] `net.Error` (type)
+- [ ] `net.Flags` (type)
+- [ ] `net.Flags.String` (method)
+- [ ] `net.HardwareAddr` (type)
+- [ ] `net.HardwareAddr.String` (method)
+- [ ] `net.IP` (type)
+- [ ] `net.IPv4` (func)
+- [ ] `net.ParseIP` (func)
+- [ ] `net.IP.AppendText` (method)
+- [ ] `net.IP.DefaultMask` (method)
+- [ ] `net.IP.Equal` (method)
+- [ ] `net.IP.IsGlobalUnicast` (method)
+- [ ] `net.IP.IsInterfaceLocalMulticast` (method)
+- [ ] `net.IP.IsLinkLocalMulticast` (method)
+- [ ] `net.IP.IsLinkLocalUnicast` (method)
+- [ ] `net.IP.IsLoopback` (method)
+- [ ] `net.IP.IsMulticast` (method)
+- [ ] `net.IP.IsPrivate` (method)
+- [ ] `net.IP.IsUnspecified` (method)
+- [ ] `net.IP.MarshalText` (method)
+- [ ] `net.IP.Mask` (method)
+- [ ] `net.IP.String` (method)
+- [ ] `net.IP.To16` (method)
+- [ ] `net.IP.To4` (method)
+- [ ] `net.IP.UnmarshalText` (method)
+- [ ] `net.IPAddr` (type)
+- [ ] `net.IPAddr.Network` (method)
+- [ ] `net.IPAddr.String` (method)
+- [ ] `net.IPConn` (type)
+- [~] `net.IPConn.Close` (method)
+- [ ] `net.IPConn.File` (method)
+- [ ] `net.IPConn.LocalAddr` (method)
+- [~] `net.IPConn.Read` (method)
+- [ ] `net.IPConn.ReadFrom` (method)
+- [ ] `net.IPConn.ReadFromIP` (method)
+- [ ] `net.IPConn.ReadMsgIP` (method)
+- [ ] `net.IPConn.RemoteAddr` (method)
+- [ ] `net.IPConn.SetDeadline` (method)
+- [ ] `net.IPConn.SetReadBuffer` (method)
+- [ ] `net.IPConn.SetReadDeadline` (method)
+- [ ] `net.IPConn.SetWriteBuffer` (method)
+- [ ] `net.IPConn.SetWriteDeadline` (method)
+- [ ] `net.IPConn.SyscallConn` (method)
+- [~] `net.IPConn.Write` (method)
+- [ ] `net.IPConn.WriteMsgIP` (method)
+- [ ] `net.IPConn.WriteTo` (method)
+- [ ] `net.IPConn.WriteToIP` (method)
+- [ ] `net.IPMask` (type)
+- [ ] `net.CIDRMask` (func)
+- [ ] `net.IPv4Mask` (func)
+- [ ] `net.IPMask.Size` (method)
+- [ ] `net.IPMask.String` (method)
+- [ ] `net.IPNet` (type)
+- [ ] `net.IPNet.Contains` (method)
+- [ ] `net.IPNet.Network` (method)
+- [ ] `net.IPNet.String` (method)
+- [ ] `net.Interface` (type)
+- [ ] `net.Interface.Addrs` (method)
+- [ ] `net.Interface.MulticastAddrs` (method)
+- [ ] `net.InvalidAddrError` (type)
+- [ ] `net.InvalidAddrError.Error` (method)
+- [ ] `net.InvalidAddrError.Temporary` (method)
+- [ ] `net.InvalidAddrError.Timeout` (method)
+- [ ] `net.KeepAliveConfig` (type)
+- [ ] `net.ListenConfig` (type)
+- [~] `net.ListenConfig.Listen` (method)
+- [ ] `net.ListenConfig.ListenPacket` (method)
+- [ ] `net.ListenConfig.MultipathTCP` (method)
+- [ ] `net.ListenConfig.SetMultipathTCP` (method)
+- [~] `net.Listener` (type)
+- [ ] `net.MX` (type)
+- [ ] `net.NS` (type)
+- [ ] `net.OpError` (type)
+- [ ] `net.OpError.Error` (method)
+- [ ] `net.OpError.Temporary` (method)
+- [ ] `net.OpError.Timeout` (method)
+- [ ] `net.OpError.Unwrap` (method)
+- [ ] `net.PacketConn` (type)
+- [ ] `net.ParseError` (type)
+- [ ] `net.ParseError.Error` (method)
+- [ ] `net.ParseError.Temporary` (method)
+- [ ] `net.ParseError.Timeout` (method)
+- [ ] `net.Resolver` (type)
+- [ ] `net.Resolver.LookupAddr` (method)
+- [ ] `net.Resolver.LookupCNAME` (method)
+- [ ] `net.Resolver.LookupHost` (method)
+- [ ] `net.Resolver.LookupIP` (method)
+- [ ] `net.Resolver.LookupIPAddr` (method)
+- [ ] `net.Resolver.LookupMX` (method)
+- [ ] `net.Resolver.LookupNS` (method)
+- [ ] `net.Resolver.LookupNetIP` (method)
+- [ ] `net.Resolver.LookupPort` (method)
+- [ ] `net.Resolver.LookupSRV` (method)
+- [ ] `net.Resolver.LookupTXT` (method)
+- [ ] `net.SRV` (type)
+- [ ] `net.TCPAddr` (type)
+- [ ] `net.TCPAddrFromAddrPort` (func)
+- [ ] `net.TCPAddr.AddrPort` (method)
+- [ ] `net.TCPAddr.Network` (method)
+- [ ] `net.TCPAddr.String` (method)
+- [ ] `net.TCPConn` (type)
+- [~] `net.TCPConn.Close` (method)
+- [ ] `net.TCPConn.CloseRead` (method)
+- [ ] `net.TCPConn.CloseWrite` (method)
+- [ ] `net.TCPConn.File` (method)
+- [ ] `net.TCPConn.LocalAddr` (method)
+- [ ] `net.TCPConn.MultipathTCP` (method)
+- [~] `net.TCPConn.Read` (method)
+- [ ] `net.TCPConn.ReadFrom` (method)
+- [ ] `net.TCPConn.RemoteAddr` (method)
+- [ ] `net.TCPConn.SetDeadline` (method)
+- [ ] `net.TCPConn.SetKeepAlive` (method)
+- [ ] `net.TCPConn.SetKeepAliveConfig` (method)
+- [ ] `net.TCPConn.SetKeepAlivePeriod` (method)
+- [ ] `net.TCPConn.SetLinger` (method)
+- [~] `net.TCPConn.SetNoDelay` (method)
+- [ ] `net.TCPConn.SetReadBuffer` (method)
+- [ ] `net.TCPConn.SetReadDeadline` (method)
+- [ ] `net.TCPConn.SetWriteBuffer` (method)
+- [ ] `net.TCPConn.SetWriteDeadline` (method)
+- [ ] `net.TCPConn.SyscallConn` (method)
+- [~] `net.TCPConn.Write` (method)
+- [ ] `net.TCPConn.WriteTo` (method)
+- [ ] `net.TCPListener` (type)
+- [~] `net.TCPListener.Accept` (method)
+- [ ] `net.TCPListener.AcceptTCP` (method)
+- [ ] `net.TCPListener.Addr` (method)
+- [~] `net.TCPListener.Close` (method)
+- [ ] `net.TCPListener.File` (method)
+- [ ] `net.TCPListener.SetDeadline` (method)
+- [ ] `net.TCPListener.SyscallConn` (method)
+- [ ] `net.UDPAddr` (type)
+- [ ] `net.UDPAddrFromAddrPort` (func)
+- [ ] `net.UDPAddr.AddrPort` (method)
+- [ ] `net.UDPAddr.Network` (method)
+- [ ] `net.UDPAddr.String` (method)
+- [ ] `net.UDPConn` (type)
+- [~] `net.UDPConn.Close` (method)
+- [ ] `net.UDPConn.File` (method)
+- [ ] `net.UDPConn.LocalAddr` (method)
+- [~] `net.UDPConn.Read` (method)
+- [ ] `net.UDPConn.ReadFrom` (method)
+- [ ] `net.UDPConn.ReadFromUDP` (method)
+- [ ] `net.UDPConn.ReadFromUDPAddrPort` (method)
+- [ ] `net.UDPConn.ReadMsgUDP` (method)
+- [ ] `net.UDPConn.ReadMsgUDPAddrPort` (method)
+- [ ] `net.UDPConn.RemoteAddr` (method)
+- [ ] `net.UDPConn.SetDeadline` (method)
+- [ ] `net.UDPConn.SetReadBuffer` (method)
+- [ ] `net.UDPConn.SetReadDeadline` (method)
+- [ ] `net.UDPConn.SetWriteBuffer` (method)
+- [ ] `net.UDPConn.SetWriteDeadline` (method)
+- [ ] `net.UDPConn.SyscallConn` (method)
+- [~] `net.UDPConn.Write` (method)
+- [ ] `net.UDPConn.WriteMsgUDP` (method)
+- [ ] `net.UDPConn.WriteMsgUDPAddrPort` (method)
+- [ ] `net.UDPConn.WriteTo` (method)
+- [ ] `net.UDPConn.WriteToUDP` (method)
+- [ ] `net.UDPConn.WriteToUDPAddrPort` (method)
+- [ ] `net.UnixAddr` (type)
+- [ ] `net.UnixAddr.Network` (method)
+- [ ] `net.UnixAddr.String` (method)
+- [ ] `net.UnixConn` (type)
+- [~] `net.UnixConn.Close` (method)
+- [ ] `net.UnixConn.CloseRead` (method)
+- [ ] `net.UnixConn.CloseWrite` (method)
+- [ ] `net.UnixConn.File` (method)
+- [ ] `net.UnixConn.LocalAddr` (method)
+- [~] `net.UnixConn.Read` (method)
+- [ ] `net.UnixConn.ReadFrom` (method)
+- [ ] `net.UnixConn.ReadFromUnix` (method)
+- [ ] `net.UnixConn.ReadMsgUnix` (method)
+- [ ] `net.UnixConn.RemoteAddr` (method)
+- [ ] `net.UnixConn.SetDeadline` (method)
+- [ ] `net.UnixConn.SetReadBuffer` (method)
+- [ ] `net.UnixConn.SetReadDeadline` (method)
+- [ ] `net.UnixConn.SetWriteBuffer` (method)
+- [ ] `net.UnixConn.SetWriteDeadline` (method)
+- [ ] `net.UnixConn.SyscallConn` (method)
+- [~] `net.UnixConn.Write` (method)
+- [ ] `net.UnixConn.WriteMsgUnix` (method)
+- [ ] `net.UnixConn.WriteTo` (method)
+- [ ] `net.UnixConn.WriteToUnix` (method)
+- [ ] `net.UnixListener` (type)
+- [~] `net.UnixListener.Accept` (method)
+- [ ] `net.UnixListener.AcceptUnix` (method)
+- [ ] `net.UnixListener.Addr` (method)
+- [~] `net.UnixListener.Close` (method)
+- [ ] `net.UnixListener.File` (method)
+- [ ] `net.UnixListener.SetDeadline` (method)
+- [ ] `net.UnixListener.SetUnlinkOnClose` (method)
+- [ ] `net.UnixListener.SyscallConn` (method)
+- [ ] `net.UnknownNetworkError` (type)
+- [ ] `net.UnknownNetworkError.Error` (method)
+- [ ] `net.UnknownNetworkError.Temporary` (method)
+- [ ] `net.UnknownNetworkError.Timeout` (method)
+- [ ] `net`: the 19 constants (one task per constant group in `go doc -all net`)
+- [ ] `net`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `net`: regression cases for every bug the twin finds, tied to issues
+- [ ] `net`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `net`: fuzz target for every parser and decoder in the package
+
+#### `net/http` (185 items, 93 constants)
+
+- [ ] `http.DefaultMaxHeaderBytes` (const)
+- [ ] `http.DefaultMaxIdleConnsPerHost` (const)
+- [ ] `http.TimeFormat` (const)
+- [ ] `http.TrailerPrefix` (const)
+- [ ] `http.DefaultClient` (var)
+- [ ] `http.DefaultServeMux` (var)
+- [ ] `http.ErrAbortHandler` (var)
+- [ ] `http.ErrBodyReadAfterClose` (var)
+- [ ] `http.ErrHandlerTimeout` (var)
+- [ ] `http.ErrLineTooLong` (var)
+- [ ] `http.ErrMissingFile` (var)
+- [ ] `http.ErrNoCookie` (var)
+- [ ] `http.ErrNoLocation` (var)
+- [ ] `http.ErrSchemeMismatch` (var)
+- [ ] `http.ErrServerClosed` (var)
+- [ ] `http.ErrSkipAltProtocol` (var)
+- [ ] `http.ErrUseLastResponse` (var)
+- [ ] `http.NoBody` (var)
+- [ ] `http.CanonicalHeaderKey` (func)
+- [ ] `http.DetectContentType` (func)
+- [ ] `http.Error` (func)
+- [~] `http.Get` (func)
+- [~] `http.Handle` (func)
+- [ ] `http.HandleFunc` (func)
+- [~] `http.Head` (func)
+- [ ] `http.ListenAndServe` (func)
+- [ ] `http.ListenAndServeTLS` (func)
+- [ ] `http.MaxBytesReader` (func)
+- [ ] `http.NewRequest` (func)
+- [ ] `http.NewRequestWithContext` (func)
+- [~] `http.NotFound` (func)
+- [ ] `http.ParseCookie` (func)
+- [ ] `http.ParseHTTPVersion` (func)
+- [ ] `http.ParseSetCookie` (func)
+- [ ] `http.ParseTime` (func)
+- [~] `http.Post` (func)
+- [ ] `http.PostForm` (func)
+- [ ] `http.ProxyFromEnvironment` (func)
+- [ ] `http.ProxyURL` (func)
+- [ ] `http.ReadRequest` (func)
+- [ ] `http.ReadResponse` (func)
+- [ ] `http.Redirect` (func)
+- [~] `http.Serve` (func)
+- [ ] `http.ServeContent` (func)
+- [ ] `http.ServeFile` (func)
+- [ ] `http.ServeFileFS` (func)
+- [ ] `http.ServeTLS` (func)
+- [ ] `http.SetCookie` (func)
+- [ ] `http.StatusText` (func)
+- [ ] `http.Client` (type)
+- [ ] `http.Client.CloseIdleConnections` (method)
+- [~] `http.Client.Do` (method)
+- [~] `http.Client.Get` (method)
+- [~] `http.Client.Head` (method)
+- [~] `http.Client.Post` (method)
+- [ ] `http.Client.PostForm` (method)
+- [ ] `http.ClientConn` (type)
+- [ ] `http.ClientConn.Available` (method)
+- [~] `http.ClientConn.Close` (method)
+- [ ] `http.ClientConn.Err` (method)
+- [ ] `http.ClientConn.InFlight` (method)
+- [ ] `http.ClientConn.Release` (method)
+- [ ] `http.ClientConn.Reserve` (method)
+- [ ] `http.ClientConn.RoundTrip` (method)
+- [ ] `http.ClientConn.SetStateHook` (method)
+- [ ] `http.CloseNotifier` (type)
+- [ ] `http.ConnState` (type)
+- [ ] `http.ConnState.String` (method)
+- [ ] `http.Cookie` (type)
+- [ ] `http.Cookie.String` (method)
+- [ ] `http.Cookie.Valid` (method)
+- [ ] `http.CookieJar` (type)
+- [ ] `http.CrossOriginProtection` (type)
+- [ ] `http.NewCrossOriginProtection` (func)
+- [ ] `http.CrossOriginProtection.AddInsecureBypassPattern` (method)
+- [ ] `http.CrossOriginProtection.AddTrustedOrigin` (method)
+- [~] `http.CrossOriginProtection.Check` (method)
+- [ ] `http.CrossOriginProtection.Handler` (method)
+- [ ] `http.CrossOriginProtection.SetDenyHandler` (method)
+- [ ] `http.Dir` (type)
+- [ ] `http.Dir.Open` (method)
+- [ ] `http.File` (type)
+- [ ] `http.FileSystem` (type)
+- [ ] `http.FS` (func)
+- [ ] `http.Flusher` (type)
+- [ ] `http.HTTP2Config` (type)
+- [ ] `http.Handler` (type)
+- [ ] `http.AllowQuerySemicolons` (func)
+- [ ] `http.FileServer` (func)
+- [ ] `http.FileServerFS` (func)
+- [ ] `http.MaxBytesHandler` (func)
+- [ ] `http.NotFoundHandler` (func)
+- [ ] `http.RedirectHandler` (func)
+- [ ] `http.StripPrefix` (func)
+- [ ] `http.TimeoutHandler` (func)
+- [ ] `http.HandlerFunc` (type)
+- [ ] `http.HandlerFunc.ServeHTTP` (method)
+- [~] `http.Header` (type)
+- [ ] `http.Header.Add` (method)
+- [ ] `http.Header.Clone` (method)
+- [ ] `http.Header.Del` (method)
+- [~] `http.Header.Get` (method)
+- [ ] `http.Header.Set` (method)
+- [ ] `http.Header.Values` (method)
+- [~] `http.Header.Write` (method)
+- [ ] `http.Header.WriteSubset` (method)
+- [ ] `http.Hijacker` (type)
+- [ ] `http.MaxBytesError` (type)
+- [ ] `http.MaxBytesError.Error` (method)
+- [ ] `http.ProtocolError` (type)
+- [ ] `http.ProtocolError.Error` (method)
+- [ ] `http.ProtocolError.Is` (method)
+- [ ] `http.Protocols` (type)
+- [ ] `http.Protocols.HTTP1` (method)
+- [ ] `http.Protocols.HTTP2` (method)
+- [ ] `http.Protocols.SetHTTP1` (method)
+- [ ] `http.Protocols.SetHTTP2` (method)
+- [ ] `http.Protocols.SetUnencryptedHTTP2` (method)
+- [ ] `http.Protocols.String` (method)
+- [ ] `http.Protocols.UnencryptedHTTP2` (method)
+- [ ] `http.PushOptions` (type)
+- [ ] `http.Pusher` (type)
+- [ ] `http.Request` (type)
+- [ ] `http.Request.AddCookie` (method)
+- [ ] `http.Request.BasicAuth` (method)
+- [ ] `http.Request.Clone` (method)
+- [ ] `http.Request.Context` (method)
+- [ ] `http.Request.Cookie` (method)
+- [ ] `http.Request.Cookies` (method)
+- [ ] `http.Request.CookiesNamed` (method)
+- [ ] `http.Request.FormFile` (method)
+- [ ] `http.Request.FormValue` (method)
+- [ ] `http.Request.MultipartReader` (method)
+- [ ] `http.Request.ParseForm` (method)
+- [ ] `http.Request.ParseMultipartForm` (method)
+- [ ] `http.Request.PathValue` (method)
+- [ ] `http.Request.PostFormValue` (method)
+- [ ] `http.Request.ProtoAtLeast` (method)
+- [ ] `http.Request.Referer` (method)
+- [ ] `http.Request.SetBasicAuth` (method)
+- [ ] `http.Request.SetPathValue` (method)
+- [ ] `http.Request.UserAgent` (method)
+- [ ] `http.Request.WithContext` (method)
+- [~] `http.Request.Write` (method)
+- [ ] `http.Request.WriteProxy` (method)
+- [ ] `http.Response` (type)
+- [ ] `http.Response.Cookies` (method)
+- [ ] `http.Response.Location` (method)
+- [ ] `http.Response.ProtoAtLeast` (method)
+- [~] `http.Response.Write` (method)
+- [ ] `http.ResponseController` (type)
+- [ ] `http.NewResponseController` (func)
+- [ ] `http.ResponseController.EnableFullDuplex` (method)
+- [ ] `http.ResponseController.Flush` (method)
+- [~] `http.ResponseController.Hijack` (method)
+- [ ] `http.ResponseController.SetReadDeadline` (method)
+- [ ] `http.ResponseController.SetWriteDeadline` (method)
+- [ ] `http.ResponseWriter` (type)
+- [ ] `http.RoundTripper` (type)
+- [ ] `http.DefaultTransport` (var)
+- [ ] `http.NewFileTransport` (func)
+- [ ] `http.NewFileTransportFS` (func)
+- [ ] `http.SameSite` (type)
+- [ ] `http.ServeMux` (type)
+- [ ] `http.NewServeMux` (func)
+- [~] `http.ServeMux.Handle` (method)
+- [ ] `http.ServeMux.HandleFunc` (method)
+- [ ] `http.ServeMux.Handler` (method)
+- [ ] `http.ServeMux.ServeHTTP` (method)
+- [ ] `http.Server` (type)
+- [~] `http.Server.Close` (method)
+- [ ] `http.Server.ListenAndServe` (method)
+- [ ] `http.Server.ListenAndServeTLS` (method)
+- [ ] `http.Server.RegisterOnShutdown` (method)
+- [~] `http.Server.Serve` (method)
+- [ ] `http.Server.ServeTLS` (method)
+- [ ] `http.Server.SetKeepAlivesEnabled` (method)
+- [ ] `http.Server.Shutdown` (method)
+- [ ] `http.Transport` (type)
+- [ ] `http.Transport.CancelRequest` (method)
+- [ ] `http.Transport.Clone` (method)
+- [ ] `http.Transport.CloseIdleConnections` (method)
+- [ ] `http.Transport.NewClientConn` (method)
+- [ ] `http.Transport.RegisterProtocol` (method)
+- [ ] `http.Transport.RoundTrip` (method)
+- [ ] `http`: the 93 constants (one task per constant group in `go doc -all net/http`)
+- [ ] `http`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `http`: regression cases for every bug the twin finds, tied to issues
+- [ ] `http`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `http`: fuzz target for every parser and decoder in the package
+
+#### `net/http/cgi` (5 items)
+
+- [ ] `cgi.Request` (func)
+- [ ] `cgi.RequestFromMap` (func)
+- [ ] `cgi.Serve` (func)
+- [ ] `cgi.Handler` (type)
+- [ ] `cgi.Handler.ServeHTTP` (method)
+- [ ] `cgi`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `cgi`: regression cases for every bug the twin finds, tied to issues
+- [ ] `cgi`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `net/http/cookiejar` (6 items)
+
+- [ ] `cookiejar.Jar` (type)
+- [ ] `cookiejar.New` (func)
+- [ ] `cookiejar.Jar.Cookies` (method)
+- [ ] `cookiejar.Jar.SetCookies` (method)
+- [ ] `cookiejar.Options` (type)
+- [ ] `cookiejar.PublicSuffixList` (type)
+- [ ] `cookiejar`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `cookiejar`: regression cases for every bug the twin finds, tied to issues
+- [ ] `cookiejar`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `net/http/fcgi` (4 items)
+
+- [ ] `fcgi.ErrConnClosed` (var)
+- [ ] `fcgi.ErrRequestAborted` (var)
+- [ ] `fcgi.ProcessEnv` (func)
+- [ ] `fcgi.Serve` (func)
+- [ ] `fcgi`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `fcgi`: regression cases for every bug the twin finds, tied to issues
+- [ ] `fcgi`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `net/http/httptest` (21 items)
+
+- [ ] `httptest.DefaultRemoteAddr` (const)
+- [ ] `httptest.NewRequest` (func)
+- [ ] `httptest.NewRequestWithContext` (func)
+- [ ] `httptest.ResponseRecorder` (type)
+- [ ] `httptest.NewRecorder` (func)
+- [ ] `httptest.ResponseRecorder.Flush` (method)
+- [~] `httptest.ResponseRecorder.Header` (method)
+- [ ] `httptest.ResponseRecorder.Result` (method)
+- [ ] `httptest.ResponseRecorder.Write` (method)
+- [ ] `httptest.ResponseRecorder.WriteHeader` (method)
+- [ ] `httptest.ResponseRecorder.WriteString` (method)
+- [ ] `httptest.Server` (type)
+- [ ] `httptest.NewServer` (func)
+- [ ] `httptest.NewTLSServer` (func)
+- [ ] `httptest.NewUnstartedServer` (func)
+- [ ] `httptest.Server.Certificate` (method)
+- [ ] `httptest.Server.Client` (method)
+- [ ] `httptest.Server.Close` (method)
+- [ ] `httptest.Server.CloseClientConnections` (method)
+- [ ] `httptest.Server.Start` (method)
+- [ ] `httptest.Server.StartTLS` (method)
+- [ ] `httptest`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `httptest`: regression cases for every bug the twin finds, tied to issues
+- [ ] `httptest`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `net/http/httptrace` (7 items)
+
+- [ ] `httptrace.WithClientTrace` (func)
+- [ ] `httptrace.ClientTrace` (type)
+- [ ] `httptrace.ContextClientTrace` (func)
+- [ ] `httptrace.DNSDoneInfo` (type)
+- [ ] `httptrace.DNSStartInfo` (type)
+- [ ] `httptrace.GotConnInfo` (type)
+- [ ] `httptrace.WroteRequestInfo` (type)
+- [ ] `httptrace`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `httptrace`: regression cases for every bug the twin finds, tied to issues
+- [ ] `httptrace`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `net/http/httputil` (29 items, 3 constants)
+
+- [ ] `httputil.ErrLineTooLong` (var)
+- [ ] `httputil.DumpRequest` (func)
+- [ ] `httputil.DumpRequestOut` (func)
+- [ ] `httputil.DumpResponse` (func)
+- [ ] `httputil.NewChunkedReader` (func)
+- [ ] `httputil.NewChunkedWriter` (func)
+- [ ] `httputil.BufferPool` (type)
+- [ ] `httputil.ClientConn` (type)
+- [ ] `httputil.NewClientConn` (func)
+- [ ] `httputil.NewProxyClientConn` (func)
+- [ ] `httputil.ClientConn.Close` (method)
+- [ ] `httputil.ClientConn.Do` (method)
+- [ ] `httputil.ClientConn.Hijack` (method)
+- [ ] `httputil.ClientConn.Pending` (method)
+- [ ] `httputil.ClientConn.Read` (method)
+- [ ] `httputil.ClientConn.Write` (method)
+- [ ] `httputil.ProxyRequest` (type)
+- [ ] `httputil.ProxyRequest.SetURL` (method)
+- [ ] `httputil.ProxyRequest.SetXForwarded` (method)
+- [ ] `httputil.ReverseProxy` (type)
+- [ ] `httputil.NewSingleHostReverseProxy` (func)
+- [ ] `httputil.ReverseProxy.ServeHTTP` (method)
+- [ ] `httputil.ServerConn` (type)
+- [ ] `httputil.NewServerConn` (func)
+- [ ] `httputil.ServerConn.Close` (method)
+- [ ] `httputil.ServerConn.Hijack` (method)
+- [ ] `httputil.ServerConn.Pending` (method)
+- [ ] `httputil.ServerConn.Read` (method)
+- [ ] `httputil.ServerConn.Write` (method)
+- [ ] `httputil`: the 3 constants (one task per constant group in `go doc -all net/http/httputil`)
+- [ ] `httputil`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `httputil`: regression cases for every bug the twin finds, tied to issues
+- [ ] `httputil`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `net/http/pprof` (6 items)
+
+- [ ] `pprof.Cmdline` (func)
+- [ ] `pprof.Handler` (func)
+- [ ] `pprof.Index` (func)
+- [ ] `pprof.Profile` (func)
+- [ ] `pprof.Symbol` (func)
+- [ ] `pprof.Trace` (func)
+- [ ] `pprof`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `pprof`: regression cases for every bug the twin finds, tied to issues
+- [ ] `pprof`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `net/mail` (15 items)
+
+- [ ] `mail.ErrHeaderNotPresent` (var)
+- [ ] `mail.ParseDate` (func)
+- [ ] `mail.Address` (type)
+- [ ] `mail.ParseAddress` (func)
+- [ ] `mail.ParseAddressList` (func)
+- [ ] `mail.Address.String` (method)
+- [ ] `mail.AddressParser` (type)
+- [ ] `mail.AddressParser.Parse` (method)
+- [ ] `mail.AddressParser.ParseList` (method)
+- [ ] `mail.Header` (type)
+- [ ] `mail.Header.AddressList` (method)
+- [ ] `mail.Header.Date` (method)
+- [ ] `mail.Header.Get` (method)
+- [ ] `mail.Message` (type)
+- [ ] `mail.ReadMessage` (func)
+- [ ] `mail`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `mail`: regression cases for every bug the twin finds, tied to issues
+- [ ] `mail`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `mail`: fuzz target for every parser and decoder in the package
+
+#### `net/netip` (80 items)
+
+- [ ] `netip.Addr` (type)
+- [ ] `netip.AddrFrom16` (func)
+- [ ] `netip.AddrFrom4` (func)
+- [ ] `netip.AddrFromSlice` (func)
+- [ ] `netip.IPv4Unspecified` (func)
+- [ ] `netip.IPv6LinkLocalAllNodes` (func)
+- [ ] `netip.IPv6LinkLocalAllRouters` (func)
+- [ ] `netip.IPv6Loopback` (func)
+- [ ] `netip.IPv6Unspecified` (func)
+- [ ] `netip.MustParseAddr` (func)
+- [ ] `netip.ParseAddr` (func)
+- [ ] `netip.Addr.AppendBinary` (method)
+- [ ] `netip.Addr.AppendText` (method)
+- [ ] `netip.Addr.AppendTo` (method)
+- [ ] `netip.Addr.As16` (method)
+- [ ] `netip.Addr.As4` (method)
+- [ ] `netip.Addr.AsSlice` (method)
+- [ ] `netip.Addr.BitLen` (method)
+- [ ] `netip.Addr.Compare` (method)
+- [ ] `netip.Addr.Is4` (method)
+- [ ] `netip.Addr.Is4In6` (method)
+- [ ] `netip.Addr.Is6` (method)
+- [ ] `netip.Addr.IsGlobalUnicast` (method)
+- [ ] `netip.Addr.IsInterfaceLocalMulticast` (method)
+- [ ] `netip.Addr.IsLinkLocalMulticast` (method)
+- [ ] `netip.Addr.IsLinkLocalUnicast` (method)
+- [ ] `netip.Addr.IsLoopback` (method)
+- [ ] `netip.Addr.IsMulticast` (method)
+- [ ] `netip.Addr.IsPrivate` (method)
+- [ ] `netip.Addr.IsUnspecified` (method)
+- [ ] `netip.Addr.IsValid` (method)
+- [ ] `netip.Addr.Less` (method)
+- [ ] `netip.Addr.MarshalBinary` (method)
+- [ ] `netip.Addr.MarshalText` (method)
+- [ ] `netip.Addr.Next` (method)
+- [ ] `netip.Addr.Prefix` (method)
+- [ ] `netip.Addr.Prev` (method)
+- [x] `netip.Addr.String` (method)
+- [ ] `netip.Addr.StringExpanded` (method)
+- [ ] `netip.Addr.Unmap` (method)
+- [ ] `netip.Addr.UnmarshalBinary` (method)
+- [ ] `netip.Addr.UnmarshalText` (method)
+- [ ] `netip.Addr.WithZone` (method)
+- [ ] `netip.Addr.Zone` (method)
+- [ ] `netip.AddrPort` (type)
+- [ ] `netip.AddrPortFrom` (func)
+- [ ] `netip.MustParseAddrPort` (func)
+- [ ] `netip.ParseAddrPort` (func)
+- [ ] `netip.AddrPort.Addr` (method)
+- [ ] `netip.AddrPort.AppendBinary` (method)
+- [ ] `netip.AddrPort.AppendText` (method)
+- [ ] `netip.AddrPort.AppendTo` (method)
+- [ ] `netip.AddrPort.Compare` (method)
+- [ ] `netip.AddrPort.IsValid` (method)
+- [ ] `netip.AddrPort.MarshalBinary` (method)
+- [ ] `netip.AddrPort.MarshalText` (method)
+- [x] `netip.AddrPort.Port` (method)
+- [x] `netip.AddrPort.String` (method)
+- [ ] `netip.AddrPort.UnmarshalBinary` (method)
+- [ ] `netip.AddrPort.UnmarshalText` (method)
+- [ ] `netip.Prefix` (type)
+- [ ] `netip.MustParsePrefix` (func)
+- [ ] `netip.ParsePrefix` (func)
+- [ ] `netip.PrefixFrom` (func)
+- [ ] `netip.Prefix.Addr` (method)
+- [ ] `netip.Prefix.AppendBinary` (method)
+- [ ] `netip.Prefix.AppendText` (method)
+- [ ] `netip.Prefix.AppendTo` (method)
+- [ ] `netip.Prefix.Bits` (method)
+- [ ] `netip.Prefix.Compare` (method)
+- [ ] `netip.Prefix.Contains` (method)
+- [ ] `netip.Prefix.IsSingleIP` (method)
+- [ ] `netip.Prefix.IsValid` (method)
+- [ ] `netip.Prefix.MarshalBinary` (method)
+- [ ] `netip.Prefix.MarshalText` (method)
+- [ ] `netip.Prefix.Masked` (method)
+- [ ] `netip.Prefix.Overlaps` (method)
+- [x] `netip.Prefix.String` (method)
+- [ ] `netip.Prefix.UnmarshalBinary` (method)
+- [ ] `netip.Prefix.UnmarshalText` (method)
+- [ ] `netip`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `netip`: regression cases for every bug the twin finds, tied to issues
+- [ ] `netip`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `net/rpc` (38 items, 2 constants)
+
+- [-] `rpc.T.MethodName` (method): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.Arith.Multiply` (method): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.Arith.Divide` (method): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.DefaultServer` (var): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.ErrShutdown` (var): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.Accept` (func): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.HandleHTTP` (func): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.Register` (func): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.RegisterName` (func): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.ServeCodec` (func): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.ServeConn` (func): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.ServeRequest` (func): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.Call` (type): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.Client` (type): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.Dial` (func): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.DialHTTP` (func): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.DialHTTPPath` (func): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.NewClient` (func): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.NewClientWithCodec` (func): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.Client.Call` (method): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.Client.Close` (method): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.Client.Go` (method): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.ClientCodec` (type): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.Request` (type): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.Response` (type): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.Server` (type): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.NewServer` (func): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.Server.Accept` (method): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.Server.HandleHTTP` (method): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.Server.Register` (method): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.Server.RegisterName` (method): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.Server.ServeCodec` (method): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.Server.ServeConn` (method): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.Server.ServeHTTP` (method): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.Server.ServeRequest` (method): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.ServerCodec` (type): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.ServerError` (type): replaced by design (reflection-based; replaced by derivation)
+- [-] `rpc.ServerError.Error` (method): replaced by design (reflection-based; replaced by derivation)
+- [ ] `rpc`: the 2 constants (one task per constant group in `go doc -all net/rpc`)
+- [ ] `rpc`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `rpc`: regression cases for every bug the twin finds, tied to issues
+- [ ] `rpc`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `net/rpc/jsonrpc` (5 items)
+
+- [-] `jsonrpc.Dial` (func): replaced by design (reflection-based)
+- [-] `jsonrpc.NewClient` (func): replaced by design (reflection-based)
+- [-] `jsonrpc.NewClientCodec` (func): replaced by design (reflection-based)
+- [-] `jsonrpc.NewServerCodec` (func): replaced by design (reflection-based)
+- [-] `jsonrpc.ServeConn` (func): replaced by design (reflection-based)
+- [ ] `jsonrpc`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `jsonrpc`: regression cases for every bug the twin finds, tied to issues
+- [ ] `jsonrpc`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `net/smtp` (21 items)
+
+- [ ] `smtp.SendMail` (func)
+- [ ] `smtp.Auth` (type)
+- [ ] `smtp.CRAMMD5Auth` (func)
+- [ ] `smtp.PlainAuth` (func)
+- [ ] `smtp.Client` (type)
+- [ ] `smtp.Dial` (func)
+- [ ] `smtp.NewClient` (func)
+- [ ] `smtp.Client.Auth` (method)
+- [ ] `smtp.Client.Close` (method)
+- [ ] `smtp.Client.Data` (method)
+- [ ] `smtp.Client.Extension` (method)
+- [ ] `smtp.Client.Hello` (method)
+- [ ] `smtp.Client.Mail` (method)
+- [ ] `smtp.Client.Noop` (method)
+- [ ] `smtp.Client.Quit` (method)
+- [ ] `smtp.Client.Rcpt` (method)
+- [ ] `smtp.Client.Reset` (method)
+- [ ] `smtp.Client.StartTLS` (method)
+- [ ] `smtp.Client.TLSConnectionState` (method)
+- [ ] `smtp.Client.Verify` (method)
+- [ ] `smtp.ServerInfo` (type)
+- [ ] `smtp`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `smtp`: regression cases for every bug the twin finds, tied to issues
+- [ ] `smtp`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `net/textproto` (40 items)
+
+- [ ] `textproto.CanonicalMIMEHeaderKey` (func)
+- [ ] `textproto.TrimBytes` (func)
+- [ ] `textproto.TrimString` (func)
+- [ ] `textproto.Conn` (type)
+- [ ] `textproto.Dial` (func)
+- [ ] `textproto.NewConn` (func)
+- [ ] `textproto.Conn.Close` (method)
+- [ ] `textproto.Conn.Cmd` (method)
+- [ ] `textproto.Error` (type)
+- [ ] `textproto.Error.Error` (method)
+- [ ] `textproto.MIMEHeader` (type)
+- [ ] `textproto.MIMEHeader.Add` (method)
+- [ ] `textproto.MIMEHeader.Del` (method)
+- [ ] `textproto.MIMEHeader.Get` (method)
+- [ ] `textproto.MIMEHeader.Set` (method)
+- [ ] `textproto.MIMEHeader.Values` (method)
+- [ ] `textproto.Pipeline` (type)
+- [ ] `textproto.Pipeline.EndRequest` (method)
+- [ ] `textproto.Pipeline.EndResponse` (method)
+- [ ] `textproto.Pipeline.Next` (method)
+- [ ] `textproto.Pipeline.StartRequest` (method)
+- [ ] `textproto.Pipeline.StartResponse` (method)
+- [ ] `textproto.ProtocolError` (type)
+- [ ] `textproto.ProtocolError.Error` (method)
+- [ ] `textproto.Reader` (type)
+- [ ] `textproto.NewReader` (func)
+- [ ] `textproto.Reader.DotReader` (method)
+- [ ] `textproto.Reader.ReadCodeLine` (method)
+- [ ] `textproto.Reader.ReadContinuedLine` (method)
+- [ ] `textproto.Reader.ReadContinuedLineBytes` (method)
+- [ ] `textproto.Reader.ReadDotBytes` (method)
+- [ ] `textproto.Reader.ReadDotLines` (method)
+- [ ] `textproto.Reader.ReadLine` (method)
+- [ ] `textproto.Reader.ReadLineBytes` (method)
+- [ ] `textproto.Reader.ReadMIMEHeader` (method)
+- [ ] `textproto.Reader.ReadResponse` (method)
+- [ ] `textproto.Writer` (type)
+- [ ] `textproto.NewWriter` (func)
+- [ ] `textproto.Writer.DotWriter` (method)
+- [ ] `textproto.Writer.PrintfLine` (method)
+- [ ] `textproto`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `textproto`: regression cases for every bug the twin finds, tied to issues
+- [ ] `textproto`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `textproto`: fuzz target for every parser and decoder in the package
+
+#### `net/url` (46 items)
+
+- [x] `url.JoinPath` (func)
+- [x] `url.PathEscape` (func)
+- [x] `url.PathUnescape` (func)
+- [x] `url.QueryEscape` (func)
+- [x] `url.QueryUnescape` (func)
+- [ ] `url.Error` (type)
+- [ ] `url.Error.Error` (method)
+- [ ] `url.Error.Temporary` (method)
+- [ ] `url.Error.Timeout` (method)
+- [ ] `url.Error.Unwrap` (method)
+- [ ] `url.EscapeError` (type)
+- [ ] `url.EscapeError.Error` (method)
+- [ ] `url.InvalidHostError` (type)
+- [ ] `url.InvalidHostError.Error` (method)
+- [x] `url.URL` (type)
+- [x] `url.Parse` (func)
+- [x] `url.ParseRequestURI` (func)
+- [ ] `url.URL.AppendBinary` (method)
+- [x] `url.URL.EscapedFragment` (method)
+- [x] `url.URL.EscapedPath` (method)
+- [x] `url.URL.Hostname` (method)
+- [x] `url.URL.IsAbs` (method)
+- [x] `url.URL.JoinPath` (method)
+- [ ] `url.URL.MarshalBinary` (method)
+- [x] `url.URL.Parse` (method)
+- [x] `url.URL.Port` (method)
+- [x] `url.URL.Query` (method)
+- [x] `url.URL.Redacted` (method)
+- [x] `url.URL.RequestURI` (method)
+- [x] `url.URL.ResolveReference` (method)
+- [x] `url.URL.String` (method)
+- [ ] `url.URL.UnmarshalBinary` (method)
+- [x] `url.Userinfo` (type)
+- [x] `url.User` (func)
+- [x] `url.UserPassword` (func)
+- [x] `url.Userinfo.Password` (method)
+- [x] `url.Userinfo.String` (method)
+- [x] `url.Userinfo.Username` (method)
+- [x] `url.Values` (type)
+- [x] `url.ParseQuery` (func)
+- [x] `url.Values.Add` (method)
+- [x] `url.Values.Del` (method)
+- [x] `url.Values.Encode` (method)
+- [x] `url.Values.Get` (method)
+- [x] `url.Values.Has` (method)
+- [x] `url.Values.Set` (method)
+- [ ] `url`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `url`: regression cases for every bug the twin finds, tied to issues
+- [ ] `url`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `url`: fuzz target for every parser and decoder in the package
+
+#### `os` (143 items, 42 constants)
+
+- [ ] `os.DevNull` (const)
+- [x] `os.Args` (var)
+- [x] `os.Chdir` (func)
+- [ ] `os.Chmod` (func)
+- [ ] `os.Chown` (func)
+- [ ] `os.Chtimes` (func)
+- [ ] `os.Clearenv` (func)
+- [ ] `os.CopyFS` (func)
+- [ ] `os.DirFS` (func)
+- [ ] `os.Environ` (func)
+- [ ] `os.Executable` (func)
+- [x] `os.Exit` (func)
+- [ ] `os.Expand` (func)
+- [ ] `os.ExpandEnv` (func)
+- [ ] `os.Getegid` (func)
+- [x] `os.Getenv` (func)
+- [ ] `os.Geteuid` (func)
+- [ ] `os.Getgid` (func)
+- [ ] `os.Getgroups` (func)
+- [ ] `os.Getpagesize` (func)
+- [ ] `os.Getpid` (func)
+- [ ] `os.Getppid` (func)
+- [ ] `os.Getuid` (func)
+- [x] `os.Getwd` (func)
+- [x] `os.Hostname` (func)
+- [ ] `os.IsExist` (func)
+- [ ] `os.IsNotExist` (func)
+- [ ] `os.IsPathSeparator` (func)
+- [ ] `os.IsPermission` (func)
+- [ ] `os.IsTimeout` (func)
+- [ ] `os.Lchown` (func)
+- [ ] `os.Link` (func)
+- [x] `os.LookupEnv` (func)
+- [x] `os.Mkdir` (func)
+- [x] `os.MkdirAll` (func)
+- [ ] `os.MkdirTemp` (func)
+- [ ] `os.NewSyscallError` (func)
+- [ ] `os.Pipe` (func)
+- [x] `os.ReadFile` (func)
+- [ ] `os.Readlink` (func)
+- [x] `os.Remove` (func)
+- [x] `os.RemoveAll` (func)
+- [x] `os.Rename` (func)
+- [ ] `os.SameFile` (func)
+- [x] `os.Setenv` (func)
+- [ ] `os.Symlink` (func)
+- [x] `os.TempDir` (func)
+- [ ] `os.Truncate` (func)
+- [x] `os.Unsetenv` (func)
+- [ ] `os.UserCacheDir` (func)
+- [ ] `os.UserConfigDir` (func)
+- [ ] `os.UserHomeDir` (func)
+- [x] `os.WriteFile` (func)
+- [ ] `os.DirEntry` (type)
+- [x] `os.ReadDir` (func)
+- [ ] `os.File` (type)
+- [ ] `os.Create` (func)
+- [ ] `os.CreateTemp` (func)
+- [ ] `os.NewFile` (func)
+- [ ] `os.Open` (func)
+- [ ] `os.OpenFile` (func)
+- [ ] `os.OpenInRoot` (func)
+- [x] `os.File.Chdir` (method)
+- [ ] `os.File.Chmod` (method)
+- [ ] `os.File.Chown` (method)
+- [ ] `os.File.Close` (method)
+- [ ] `os.File.Fd` (method)
+- [ ] `os.File.Name` (method)
+- [ ] `os.File.Read` (method)
+- [ ] `os.File.ReadAt` (method)
+- [x] `os.File.ReadDir` (method)
+- [ ] `os.File.ReadFrom` (method)
+- [ ] `os.File.Readdir` (method)
+- [ ] `os.File.Readdirnames` (method)
+- [ ] `os.File.Seek` (method)
+- [ ] `os.File.SetDeadline` (method)
+- [ ] `os.File.SetReadDeadline` (method)
+- [ ] `os.File.SetWriteDeadline` (method)
+- [ ] `os.File.Stat` (method)
+- [ ] `os.File.Sync` (method)
+- [ ] `os.File.SyscallConn` (method)
+- [ ] `os.File.Truncate` (method)
+- [ ] `os.File.Write` (method)
+- [ ] `os.File.WriteAt` (method)
+- [ ] `os.File.WriteString` (method)
+- [ ] `os.File.WriteTo` (method)
+- [ ] `os.FileInfo` (type)
+- [ ] `os.Lstat` (func)
+- [ ] `os.Stat` (func)
+- [ ] `os.FileMode` (type)
+- [ ] `os.LinkError` (type)
+- [ ] `os.LinkError.Error` (method)
+- [ ] `os.LinkError.Unwrap` (method)
+- [ ] `os.PathError` (type)
+- [ ] `os.ProcAttr` (type)
+- [ ] `os.Process` (type)
+- [ ] `os.FindProcess` (func)
+- [ ] `os.StartProcess` (func)
+- [ ] `os.Process.Kill` (method)
+- [ ] `os.Process.Release` (method)
+- [ ] `os.Process.Signal` (method)
+- [ ] `os.Process.Wait` (method)
+- [ ] `os.Process.WithHandle` (method)
+- [ ] `os.ProcessState` (type)
+- [ ] `os.ProcessState.ExitCode` (method)
+- [ ] `os.ProcessState.Exited` (method)
+- [x] `os.ProcessState.Pid` (method)
+- [ ] `os.ProcessState.String` (method)
+- [ ] `os.ProcessState.Success` (method)
+- [ ] `os.ProcessState.Sys` (method)
+- [ ] `os.ProcessState.SysUsage` (method)
+- [ ] `os.ProcessState.SystemTime` (method)
+- [ ] `os.ProcessState.UserTime` (method)
+- [ ] `os.Root` (type)
+- [ ] `os.OpenRoot` (func)
+- [ ] `os.Root.Chmod` (method)
+- [ ] `os.Root.Chown` (method)
+- [ ] `os.Root.Chtimes` (method)
+- [ ] `os.Root.Close` (method)
+- [ ] `os.Root.Create` (method)
+- [ ] `os.Root.FS` (method)
+- [ ] `os.Root.Lchown` (method)
+- [ ] `os.Root.Link` (method)
+- [ ] `os.Root.Lstat` (method)
+- [x] `os.Root.Mkdir` (method)
+- [x] `os.Root.MkdirAll` (method)
+- [ ] `os.Root.Name` (method)
+- [ ] `os.Root.Open` (method)
+- [ ] `os.Root.OpenFile` (method)
+- [ ] `os.Root.OpenRoot` (method)
+- [x] `os.Root.ReadFile` (method)
+- [ ] `os.Root.Readlink` (method)
+- [x] `os.Root.Remove` (method)
+- [x] `os.Root.RemoveAll` (method)
+- [x] `os.Root.Rename` (method)
+- [ ] `os.Root.Stat` (method)
+- [ ] `os.Root.Symlink` (method)
+- [x] `os.Root.WriteFile` (method)
+- [ ] `os.Signal` (type)
+- [ ] `os.SyscallError` (type)
+- [ ] `os.SyscallError.Error` (method)
+- [ ] `os.SyscallError.Timeout` (method)
+- [ ] `os.SyscallError.Unwrap` (method)
+- [ ] `os`: the 42 constants (one task per constant group in `go doc -all os`)
+- [ ] `os`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `os`: regression cases for every bug the twin finds, tied to issues
+- [ ] `os`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `os/exec` (22 items)
+
+- [ ] `exec.ErrDot` (var)
+- [ ] `exec.ErrNotFound` (var)
+- [ ] `exec.ErrWaitDelay` (var)
+- [ ] `exec.LookPath` (func)
+- [ ] `exec.Cmd` (type)
+- [ ] `exec.Command` (func)
+- [ ] `exec.CommandContext` (func)
+- [ ] `exec.Cmd.CombinedOutput` (method)
+- [ ] `exec.Cmd.Environ` (method)
+- [ ] `exec.Cmd.Output` (method)
+- [ ] `exec.Cmd.Run` (method)
+- [ ] `exec.Cmd.Start` (method)
+- [ ] `exec.Cmd.StderrPipe` (method)
+- [ ] `exec.Cmd.StdinPipe` (method)
+- [ ] `exec.Cmd.StdoutPipe` (method)
+- [ ] `exec.Cmd.String` (method)
+- [ ] `exec.Cmd.Wait` (method)
+- [ ] `exec.Error` (type)
+- [ ] `exec.Error.Error` (method)
+- [ ] `exec.Error.Unwrap` (method)
+- [ ] `exec.ExitError` (type)
+- [ ] `exec.ExitError.Error` (method)
+- [ ] `exec`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `exec`: regression cases for every bug the twin finds, tied to issues
+- [ ] `exec`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `os/signal` (6 items)
+
+- [ ] `signal.Ignore` (func)
+- [ ] `signal.Ignored` (func)
+- [ ] `signal.Notify` (func)
+- [ ] `signal.NotifyContext` (func)
+- [ ] `signal.Reset` (func)
+- [ ] `signal.Stop` (func)
+- [ ] `signal`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `signal`: regression cases for every bug the twin finds, tied to issues
+- [ ] `signal`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `os/user` (16 items)
+
+- [ ] `user.Group` (type)
+- [ ] `user.LookupGroup` (func)
+- [ ] `user.LookupGroupId` (func)
+- [ ] `user.UnknownGroupError` (type)
+- [ ] `user.UnknownGroupError.Error` (method)
+- [ ] `user.UnknownGroupIdError` (type)
+- [ ] `user.UnknownGroupIdError.Error` (method)
+- [ ] `user.UnknownUserError` (type)
+- [ ] `user.UnknownUserError.Error` (method)
+- [ ] `user.UnknownUserIdError` (type)
+- [ ] `user.UnknownUserIdError.Error` (method)
+- [ ] `user.User` (type)
+- [ ] `user.Current` (func)
+- [ ] `user.Lookup` (func)
+- [ ] `user.LookupId` (func)
+- [ ] `user.User.GroupIds` (method)
+- [ ] `user`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `user`: regression cases for every bug the twin finds, tied to issues
+- [ ] `user`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `path` (9 items)
+
+- [ ] `path.ErrBadPattern` (var)
+- [x] `path.Base` (func)
+- [x] `path.Clean` (func)
+- [x] `path.Dir` (func)
+- [x] `path.Ext` (func)
+- [x] `path.IsAbs` (func)
+- [ ] `path.Join` (func)
+- [x] `path.Match` (func)
+- [x] `path.Split` (func)
+- [ ] `path`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `path`: regression cases for every bug the twin finds, tied to issues
+- [ ] `path`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `path`: fuzz target for every parser and decoder in the package
+
+#### `path/filepath` (25 items, 2 constants)
+
+- [ ] `filepath.ErrBadPattern` (var)
+- [ ] `filepath.SkipAll` (var)
+- [ ] `filepath.SkipDir` (var)
+- [ ] `filepath.Abs` (func)
+- [x] `filepath.Base` (func)
+- [x] `filepath.Clean` (func)
+- [x] `filepath.Dir` (func)
+- [ ] `filepath.EvalSymlinks` (func)
+- [x] `filepath.Ext` (func)
+- [ ] `filepath.FromSlash` (func)
+- [ ] `filepath.Glob` (func)
+- [ ] `filepath.HasPrefix` (func)
+- [x] `filepath.IsAbs` (func)
+- [ ] `filepath.IsLocal` (func)
+- [ ] `filepath.Join` (func)
+- [ ] `filepath.Localize` (func)
+- [x] `filepath.Match` (func)
+- [x] `filepath.Rel` (func)
+- [x] `filepath.Split` (func)
+- [ ] `filepath.SplitList` (func)
+- [ ] `filepath.ToSlash` (func)
+- [ ] `filepath.VolumeName` (func)
+- [ ] `filepath.Walk` (func)
+- [ ] `filepath.WalkDir` (func)
+- [ ] `filepath.WalkFunc` (type)
+- [ ] `filepath`: the 2 constants (one task per constant group in `go doc -all path/filepath`)
+- [ ] `filepath`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `filepath`: regression cases for every bug the twin finds, tied to issues
+- [ ] `filepath`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `filepath`: fuzz target for every parser and decoder in the package
+
+#### `plugin` (4 items)
+
+- [-] `plugin.Plugin` (type): replaced by design (not planned)
+- [-] `plugin.Open` (func): replaced by design (not planned)
+- [-] `plugin.Plugin.Lookup` (method): replaced by design (not planned)
+- [-] `plugin.Symbol` (type): replaced by design (not planned)
+- [ ] `plugin`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `plugin`: regression cases for every bug the twin finds, tied to issues
+- [ ] `plugin`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `reflect` (133 items, 33 constants)
+
+- [-] `reflect.Ptr` (const): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Copy` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.DeepEqual` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Select` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Swapper` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.TypeAssert` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.ChanDir` (type): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.ChanDir.String` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Kind` (type): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Kind.String` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.MapIter` (type): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.MapIter.Key` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.MapIter.Next` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.MapIter.Reset` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.MapIter.Value` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Method` (type): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Method.IsExported` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.SelectCase` (type): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.SelectDir` (type): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.SliceHeader` (type): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.StringHeader` (type): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.StructField` (type): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.VisibleFields` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.StructField.IsExported` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.StructTag` (type): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.StructTag.Get` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.StructTag.Lookup` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Type` (type): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.ArrayOf` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.ChanOf` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.FuncOf` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.MapOf` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.PointerTo` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.PtrTo` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.SliceOf` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.StructOf` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.TypeFor` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.TypeOf` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value` (type): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Append` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.AppendSlice` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Indirect` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.MakeChan` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.MakeFunc` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.MakeMap` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.MakeMapWithSize` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.MakeSlice` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.New` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.NewAt` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.SliceAt` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.ValueOf` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Zero` (func): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Addr` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Bool` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Bytes` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Call` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.CallSlice` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.CanAddr` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.CanComplex` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.CanConvert` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.CanFloat` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.CanInt` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.CanInterface` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.CanSet` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.CanUint` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Cap` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Clear` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Close` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Comparable` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Complex` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Convert` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Elem` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Equal` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Field` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.FieldByIndex` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.FieldByIndexErr` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.FieldByName` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.FieldByNameFunc` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Fields` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Float` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Grow` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Index` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Int` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Interface` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.InterfaceData` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.IsNil` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.IsValid` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.IsZero` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Kind` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Len` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.MapIndex` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.MapKeys` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.MapRange` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Method` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.MethodByName` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Methods` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.NumField` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.NumMethod` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.OverflowComplex` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.OverflowFloat` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.OverflowInt` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.OverflowUint` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Pointer` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Recv` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Send` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Seq` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Seq2` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Set` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.SetBool` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.SetBytes` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.SetCap` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.SetComplex` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.SetFloat` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.SetInt` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.SetIterKey` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.SetIterValue` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.SetLen` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.SetMapIndex` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.SetPointer` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.SetString` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.SetUint` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.SetZero` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Slice` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Slice3` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.String` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.TryRecv` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.TrySend` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Type` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.Uint` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.UnsafeAddr` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.Value.UnsafePointer` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.ValueError` (type): replaced by design (compile-time derivation (design_foundations 7))
+- [-] `reflect.ValueError.Error` (method): replaced by design (compile-time derivation (design_foundations 7))
+- [ ] `reflect`: the 33 constants (one task per constant group in `go doc -all reflect`)
+- [ ] `reflect`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `reflect`: regression cases for every bug the twin finds, tied to issues
+- [ ] `reflect`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `regexp` (49 items)
+
+- [ ] `regexp.Match` (func)
+- [ ] `regexp.MatchReader` (func)
+- [ ] `regexp.MatchString` (func)
+- [ ] `regexp.QuoteMeta` (func)
+- [ ] `regexp.Regexp` (type)
+- [ ] `regexp.Compile` (func)
+- [ ] `regexp.CompilePOSIX` (func)
+- [ ] `regexp.MustCompile` (func)
+- [ ] `regexp.MustCompilePOSIX` (func)
+- [ ] `regexp.Regexp.AppendText` (method)
+- [ ] `regexp.Regexp.Copy` (method)
+- [ ] `regexp.Regexp.Expand` (method)
+- [ ] `regexp.Regexp.ExpandString` (method)
+- [ ] `regexp.Regexp.Find` (method)
+- [ ] `regexp.Regexp.FindAll` (method)
+- [ ] `regexp.Regexp.FindAllIndex` (method)
+- [ ] `regexp.Regexp.FindAllString` (method)
+- [ ] `regexp.Regexp.FindAllStringIndex` (method)
+- [ ] `regexp.Regexp.FindAllStringSubmatch` (method)
+- [ ] `regexp.Regexp.FindAllStringSubmatchIndex` (method)
+- [ ] `regexp.Regexp.FindAllSubmatch` (method)
+- [ ] `regexp.Regexp.FindAllSubmatchIndex` (method)
+- [ ] `regexp.Regexp.FindIndex` (method)
+- [ ] `regexp.Regexp.FindReaderIndex` (method)
+- [ ] `regexp.Regexp.FindReaderSubmatchIndex` (method)
+- [ ] `regexp.Regexp.FindString` (method)
+- [ ] `regexp.Regexp.FindStringIndex` (method)
+- [ ] `regexp.Regexp.FindStringSubmatch` (method)
+- [ ] `regexp.Regexp.FindStringSubmatchIndex` (method)
+- [ ] `regexp.Regexp.FindSubmatch` (method)
+- [ ] `regexp.Regexp.FindSubmatchIndex` (method)
+- [ ] `regexp.Regexp.LiteralPrefix` (method)
+- [ ] `regexp.Regexp.Longest` (method)
+- [ ] `regexp.Regexp.MarshalText` (method)
+- [ ] `regexp.Regexp.Match` (method)
+- [ ] `regexp.Regexp.MatchReader` (method)
+- [ ] `regexp.Regexp.MatchString` (method)
+- [ ] `regexp.Regexp.NumSubexp` (method)
+- [ ] `regexp.Regexp.ReplaceAll` (method)
+- [ ] `regexp.Regexp.ReplaceAllFunc` (method)
+- [ ] `regexp.Regexp.ReplaceAllLiteral` (method)
+- [ ] `regexp.Regexp.ReplaceAllLiteralString` (method)
+- [ ] `regexp.Regexp.ReplaceAllString` (method)
+- [ ] `regexp.Regexp.ReplaceAllStringFunc` (method)
+- [ ] `regexp.Regexp.Split` (method)
+- [ ] `regexp.Regexp.String` (method)
+- [ ] `regexp.Regexp.SubexpIndex` (method)
+- [ ] `regexp.Regexp.SubexpNames` (method)
+- [ ] `regexp.Regexp.UnmarshalText` (method)
+- [ ] `regexp`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `regexp`: regression cases for every bug the twin finds, tied to issues
+- [ ] `regexp`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `regexp`: fuzz target for every parser and decoder in the package
+
+#### `regexp/syntax` (29 items, 65 constants)
+
+- [ ] `syntax.IsWordChar` (func)
+- [ ] `syntax.EmptyOp` (type)
+- [ ] `syntax.EmptyOpContext` (func)
+- [ ] `syntax.Error` (type)
+- [ ] `syntax.Error.Error` (method)
+- [ ] `syntax.ErrorCode` (type)
+- [ ] `syntax.ErrorCode.String` (method)
+- [ ] `syntax.Flags` (type)
+- [ ] `syntax.Inst` (type)
+- [ ] `syntax.Inst.MatchEmptyWidth` (method)
+- [ ] `syntax.Inst.MatchRune` (method)
+- [ ] `syntax.Inst.MatchRunePos` (method)
+- [ ] `syntax.Inst.String` (method)
+- [ ] `syntax.InstOp` (type)
+- [ ] `syntax.InstOp.String` (method)
+- [ ] `syntax.Op` (type)
+- [ ] `syntax.Op.String` (method)
+- [ ] `syntax.Prog` (type)
+- [ ] `syntax.Compile` (func)
+- [ ] `syntax.Prog.Prefix` (method)
+- [ ] `syntax.Prog.StartCond` (method)
+- [ ] `syntax.Prog.String` (method)
+- [ ] `syntax.Regexp` (type)
+- [ ] `syntax.Parse` (func)
+- [ ] `syntax.Regexp.CapNames` (method)
+- [ ] `syntax.Regexp.Equal` (method)
+- [ ] `syntax.Regexp.MaxCap` (method)
+- [ ] `syntax.Regexp.Simplify` (method)
+- [ ] `syntax.Regexp.String` (method)
+- [ ] `syntax`: the 65 constants (one task per constant group in `go doc -all regexp/syntax`)
+- [ ] `syntax`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `syntax`: regression cases for every bug the twin finds, tied to issues
+- [ ] `syntax`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `syntax`: fuzz target for every parser and decoder in the package
+
+#### `runtime` (66 items)
+
+- [ ] `runtime.Compiler` (const)
+- [ ] `runtime.GOARCH` (const)
+- [ ] `runtime.GOOS` (const)
+- [ ] `runtime.MemProfileRate` (var)
+- [ ] `runtime.BlockProfile` (func)
+- [ ] `runtime.Breakpoint` (func)
+- [ ] `runtime.CPUProfile` (func)
+- [ ] `runtime.Caller` (func)
+- [ ] `runtime.Callers` (func)
+- [-] `runtime.GC` (func): replaced by design
+- [-] `runtime.GOMAXPROCS` (func): replaced by design
+- [ ] `runtime.GOROOT` (func)
+- [-] `runtime.Goexit` (func): replaced by design
+- [ ] `runtime.GoroutineProfile` (func)
+- [-] `runtime.Gosched` (func): replaced by design
+- [-] `runtime.KeepAlive` (func): replaced by design
+- [-] `runtime.LockOSThread` (func): replaced by design
+- [ ] `runtime.MemProfile` (func)
+- [ ] `runtime.MutexProfile` (func)
+- [ ] `runtime.NumCPU` (func)
+- [ ] `runtime.NumCgoCall` (func)
+- [ ] `runtime.NumGoroutine` (func)
+- [ ] `runtime.ReadMemStats` (func)
+- [ ] `runtime.ReadTrace` (func)
+- [ ] `runtime.SetBlockProfileRate` (func)
+- [ ] `runtime.SetCPUProfileRate` (func)
+- [ ] `runtime.SetCgoTraceback` (func)
+- [ ] `runtime.SetDefaultGOMAXPROCS` (func)
+- [-] `runtime.SetFinalizer` (func): replaced by design
+- [ ] `runtime.SetMutexProfileFraction` (func)
+- [ ] `runtime.Stack` (func)
+- [ ] `runtime.StartTrace` (func)
+- [ ] `runtime.StopTrace` (func)
+- [ ] `runtime.ThreadCreateProfile` (func)
+- [-] `runtime.UnlockOSThread` (func): replaced by design
+- [ ] `runtime.Version` (func)
+- [ ] `runtime.BlockProfileRecord` (type)
+- [ ] `runtime.Cleanup` (type)
+- [-] `runtime.AddCleanup` (func): replaced by design
+- [ ] `runtime.Cleanup.Stop` (method)
+- [ ] `runtime.Error` (type)
+- [ ] `runtime.Frame` (type)
+- [ ] `runtime.Frames` (type)
+- [ ] `runtime.CallersFrames` (func)
+- [ ] `runtime.Frames.Next` (method)
+- [ ] `runtime.Func` (type)
+- [ ] `runtime.FuncForPC` (func)
+- [ ] `runtime.Func.Entry` (method)
+- [ ] `runtime.Func.FileLine` (method)
+- [ ] `runtime.Func.Name` (method)
+- [ ] `runtime.MemProfileRecord` (type)
+- [ ] `runtime.MemProfileRecord.InUseBytes` (method)
+- [ ] `runtime.MemProfileRecord.InUseObjects` (method)
+- [ ] `runtime.MemProfileRecord.Stack` (method)
+- [ ] `runtime.MemStats` (type)
+- [ ] `runtime.PanicNilError` (type)
+- [ ] `runtime.PanicNilError.Error` (method)
+- [ ] `runtime.PanicNilError.RuntimeError` (method)
+- [ ] `runtime.Pinner` (type)
+- [ ] `runtime.Pinner.Pin` (method)
+- [ ] `runtime.Pinner.Unpin` (method)
+- [ ] `runtime.StackRecord` (type)
+- [ ] `runtime.StackRecord.Stack` (method)
+- [ ] `runtime.TypeAssertionError` (type)
+- [ ] `runtime.TypeAssertionError.Error` (method)
+- [ ] `runtime.TypeAssertionError.RuntimeError` (method)
+- [ ] `runtime`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `runtime`: regression cases for every bug the twin finds, tied to issues
+- [ ] `runtime`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `runtime/coverage` (5 items)
+
+- [ ] `coverage.ClearCounters` (func)
+- [ ] `coverage.WriteCounters` (func)
+- [ ] `coverage.WriteCountersDir` (func)
+- [ ] `coverage.WriteMeta` (func)
+- [ ] `coverage.WriteMetaDir` (func)
+- [ ] `coverage`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `coverage`: regression cases for every bug the twin finds, tied to issues
+- [ ] `coverage`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `runtime/debug` (20 items)
+
+- [ ] `debug.FreeOSMemory` (func)
+- [ ] `debug.PrintStack` (func)
+- [ ] `debug.ReadGCStats` (func)
+- [ ] `debug.SetCrashOutput` (func)
+- [ ] `debug.SetGCPercent` (func)
+- [ ] `debug.SetMaxStack` (func)
+- [ ] `debug.SetMaxThreads` (func)
+- [ ] `debug.SetMemoryLimit` (func)
+- [ ] `debug.SetPanicOnFault` (func)
+- [ ] `debug.SetTraceback` (func)
+- [ ] `debug.Stack` (func)
+- [ ] `debug.WriteHeapDump` (func)
+- [ ] `debug.BuildInfo` (type)
+- [ ] `debug.ParseBuildInfo` (func)
+- [ ] `debug.ReadBuildInfo` (func)
+- [ ] `debug.BuildInfo.String` (method)
+- [ ] `debug.BuildSetting` (type)
+- [ ] `debug.CrashOptions` (type)
+- [ ] `debug.GCStats` (type)
+- [ ] `debug.Module` (type)
+- [ ] `debug`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `debug`: regression cases for every bug the twin finds, tied to issues
+- [ ] `debug`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `runtime/metrics` (11 items, 4 constants)
+
+- [ ] `metrics.Read` (func)
+- [ ] `metrics.Description` (type)
+- [ ] `metrics.All` (func)
+- [ ] `metrics.Float64Histogram` (type)
+- [ ] `metrics.Sample` (type)
+- [ ] `metrics.Value` (type)
+- [ ] `metrics.Value.Float64` (method)
+- [ ] `metrics.Value.Float64Histogram` (method)
+- [ ] `metrics.Value.Kind` (method)
+- [ ] `metrics.Value.Uint64` (method)
+- [ ] `metrics.ValueKind` (type)
+- [ ] `metrics`: the 4 constants (one task per constant group in `go doc -all runtime/metrics`)
+- [ ] `metrics`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `metrics`: regression cases for every bug the twin finds, tied to issues
+- [ ] `metrics`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `runtime/pprof` (19 items)
+
+- [ ] `pprof.Do` (func)
+- [ ] `pprof.ForLabels` (func)
+- [ ] `pprof.Label` (func)
+- [ ] `pprof.SetGoroutineLabels` (func)
+- [ ] `pprof.StartCPUProfile` (func)
+- [ ] `pprof.StopCPUProfile` (func)
+- [ ] `pprof.WithLabels` (func)
+- [ ] `pprof.WriteHeapProfile` (func)
+- [ ] `pprof.LabelSet` (type)
+- [ ] `pprof.Labels` (func)
+- [ ] `pprof.Profile` (type)
+- [ ] `pprof.Lookup` (func)
+- [ ] `pprof.NewProfile` (func)
+- [ ] `pprof.Profiles` (func)
+- [ ] `pprof.Profile.Add` (method)
+- [ ] `pprof.Profile.Count` (method)
+- [ ] `pprof.Profile.Name` (method)
+- [ ] `pprof.Profile.Remove` (method)
+- [ ] `pprof.Profile.WriteTo` (method)
+- [ ] `pprof`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `pprof`: regression cases for every bug the twin finds, tied to issues
+- [ ] `pprof`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `runtime/trace` (19 items)
+
+- [ ] `trace.IsEnabled` (func)
+- [ ] `trace.Log` (func)
+- [ ] `trace.Logf` (func)
+- [ ] `trace.Start` (func)
+- [ ] `trace.Stop` (func)
+- [ ] `trace.WithRegion` (func)
+- [ ] `trace.FlightRecorder` (type)
+- [ ] `trace.NewFlightRecorder` (func)
+- [ ] `trace.FlightRecorder.Enabled` (method)
+- [ ] `trace.FlightRecorder.Start` (method)
+- [ ] `trace.FlightRecorder.Stop` (method)
+- [ ] `trace.FlightRecorder.WriteTo` (method)
+- [ ] `trace.FlightRecorderConfig` (type)
+- [ ] `trace.Region` (type)
+- [ ] `trace.StartRegion` (func)
+- [ ] `trace.Region.End` (method)
+- [ ] `trace.Task` (type)
+- [ ] `trace.NewTask` (func)
+- [ ] `trace.Task.End` (method)
+- [ ] `trace`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `trace`: regression cases for every bug the twin finds, tied to issues
+- [ ] `trace`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `slices` (40 items)
+
+- [ ] `slices.All` (func)
+- [ ] `slices.AppendSeq` (func)
+- [ ] `slices.Backward` (func)
+- [x] `slices.BinarySearch` (func)
+- [x] `slices.BinarySearchFunc` (func)
+- [ ] `slices.Chunk` (func)
+- [ ] `slices.Clip` (func)
+- [x] `slices.Clone` (func)
+- [ ] `slices.Collect` (func)
+- [x] `slices.Compact` (func)
+- [x] `slices.CompactFunc` (func)
+- [x] `slices.Compare` (func)
+- [x] `slices.CompareFunc` (func)
+- [x] `slices.Concat` (func)
+- [x] `slices.Contains` (func)
+- [x] `slices.ContainsFunc` (func)
+- [x] `slices.Delete` (func)
+- [x] `slices.DeleteFunc` (func)
+- [x] `slices.Equal` (func)
+- [x] `slices.EqualFunc` (func)
+- [x] `slices.Grow` (func)
+- [x] `slices.Index` (func)
+- [x] `slices.IndexFunc` (func)
+- [x] `slices.Insert` (func)
+- [x] `slices.IsSorted` (func)
+- [x] `slices.IsSortedFunc` (func)
+- [x] `slices.Max` (func)
+- [x] `slices.MaxFunc` (func)
+- [x] `slices.Min` (func)
+- [x] `slices.MinFunc` (func)
+- [x] `slices.Repeat` (func)
+- [x] `slices.Replace` (func)
+- [x] `slices.Reverse` (func)
+- [x] `slices.Sort` (func)
+- [x] `slices.SortFunc` (func)
+- [x] `slices.SortStableFunc` (func)
+- [ ] `slices.Sorted` (func)
+- [ ] `slices.SortedFunc` (func)
+- [ ] `slices.SortedStableFunc` (func)
+- [ ] `slices.Values` (func)
+- [ ] `slices`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `slices`: regression cases for every bug the twin finds, tied to issues
+- [ ] `slices`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `sort` (37 items)
+
+- [ ] `sort.Find` (func)
+- [ ] `sort.Float64s` (func)
+- [ ] `sort.Float64sAreSorted` (func)
+- [x] `sort.Ints` (func)
+- [ ] `sort.IntsAreSorted` (func)
+- [x] `sort.IsSorted` (func)
+- [ ] `sort.Search` (func)
+- [ ] `sort.SearchFloat64s` (func)
+- [x] `sort.SearchInts` (func)
+- [ ] `sort.SearchStrings` (func)
+- [ ] `sort.Slice` (func)
+- [ ] `sort.SliceIsSorted` (func)
+- [ ] `sort.SliceStable` (func)
+- [x] `sort.Sort` (func)
+- [ ] `sort.Stable` (func)
+- [ ] `sort.Strings` (func)
+- [ ] `sort.StringsAreSorted` (func)
+- [ ] `sort.Float64Slice` (type)
+- [ ] `sort.Float64Slice.Len` (method)
+- [x] `sort.Float64Slice.Less` (method)
+- [ ] `sort.Float64Slice.Search` (method)
+- [x] `sort.Float64Slice.Sort` (method)
+- [ ] `sort.Float64Slice.Swap` (method)
+- [ ] `sort.IntSlice` (type)
+- [ ] `sort.IntSlice.Len` (method)
+- [x] `sort.IntSlice.Less` (method)
+- [ ] `sort.IntSlice.Search` (method)
+- [x] `sort.IntSlice.Sort` (method)
+- [ ] `sort.IntSlice.Swap` (method)
+- [ ] `sort.Interface` (type)
+- [x] `sort.Reverse` (func)
+- [ ] `sort.StringSlice` (type)
+- [ ] `sort.StringSlice.Len` (method)
+- [x] `sort.StringSlice.Less` (method)
+- [ ] `sort.StringSlice.Search` (method)
+- [x] `sort.StringSlice.Sort` (method)
+- [ ] `sort.StringSlice.Swap` (method)
+- [ ] `sort`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `sort`: regression cases for every bug the twin finds, tied to issues
+- [ ] `sort`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `strconv` (40 items)
+
+- [ ] `strconv.IntSize` (const)
+- [ ] `strconv.ErrRange` (var)
+- [ ] `strconv.ErrSyntax` (var)
+- [ ] `strconv.AppendBool` (func)
+- [ ] `strconv.AppendFloat` (func)
+- [x] `strconv.AppendInt` (func)
+- [x] `strconv.AppendQuote` (func)
+- [ ] `strconv.AppendQuoteRune` (func)
+- [ ] `strconv.AppendQuoteRuneToASCII` (func)
+- [ ] `strconv.AppendQuoteRuneToGraphic` (func)
+- [ ] `strconv.AppendQuoteToASCII` (func)
+- [ ] `strconv.AppendQuoteToGraphic` (func)
+- [ ] `strconv.AppendUint` (func)
+- [x] `strconv.Atoi` (func)
+- [ ] `strconv.CanBackquote` (func)
+- [ ] `strconv.FormatBool` (func)
+- [ ] `strconv.FormatComplex` (func)
+- [x] `strconv.FormatFloat` (func)
+- [x] `strconv.FormatInt` (func)
+- [x] `strconv.FormatUint` (func)
+- [ ] `strconv.IsGraphic` (func)
+- [ ] `strconv.IsPrint` (func)
+- [x] `strconv.Itoa` (func)
+- [x] `strconv.ParseBool` (func)
+- [ ] `strconv.ParseComplex` (func)
+- [x] `strconv.ParseFloat` (func)
+- [x] `strconv.ParseInt` (func)
+- [x] `strconv.ParseUint` (func)
+- [x] `strconv.Quote` (func)
+- [x] `strconv.QuoteRune` (func)
+- [ ] `strconv.QuoteRuneToASCII` (func)
+- [ ] `strconv.QuoteRuneToGraphic` (func)
+- [ ] `strconv.QuoteToASCII` (func)
+- [ ] `strconv.QuoteToGraphic` (func)
+- [ ] `strconv.QuotedPrefix` (func)
+- [x] `strconv.Unquote` (func)
+- [ ] `strconv.UnquoteChar` (func)
+- [ ] `strconv.NumError` (type)
+- [ ] `strconv.NumError.Error` (method)
+- [ ] `strconv.NumError.Unwrap` (method)
+- [ ] `strconv`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `strconv`: regression cases for every bug the twin finds, tied to issues
+- [ ] `strconv`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `strconv`: fuzz target for every parser and decoder in the package
+
+#### `strings` (82 items)
+
+- [x] `strings.Clone` (func)
+- [x] `strings.Compare` (func)
+- [x] `strings.Contains` (func)
+- [x] `strings.ContainsAny` (func)
+- [x] `strings.ContainsFunc` (func)
+- [x] `strings.ContainsRune` (func)
+- [x] `strings.Count` (func)
+- [x] `strings.Cut` (func)
+- [x] `strings.CutPrefix` (func)
+- [x] `strings.CutSuffix` (func)
+- [x] `strings.EqualFold` (func)
+- [x] `strings.Fields` (func)
+- [x] `strings.FieldsFunc` (func)
+- [ ] `strings.FieldsFuncSeq` (func)
+- [ ] `strings.FieldsSeq` (func)
+- [x] `strings.HasPrefix` (func)
+- [x] `strings.HasSuffix` (func)
+- [x] `strings.Index` (func)
+- [x] `strings.IndexAny` (func)
+- [x] `strings.IndexByte` (func)
+- [x] `strings.IndexFunc` (func)
+- [x] `strings.IndexRune` (func)
+- [x] `strings.Join` (func)
+- [x] `strings.LastIndex` (func)
+- [x] `strings.LastIndexAny` (func)
+- [x] `strings.LastIndexByte` (func)
+- [x] `strings.LastIndexFunc` (func)
+- [x] `strings.Lines` (func)
+- [x] `strings.Map` (func)
+- [x] `strings.Repeat` (func)
+- [x] `strings.Replace` (func)
+- [x] `strings.ReplaceAll` (func)
+- [x] `strings.Split` (func)
+- [x] `strings.SplitAfter` (func)
+- [x] `strings.SplitAfterN` (func)
+- [ ] `strings.SplitAfterSeq` (func)
+- [x] `strings.SplitN` (func)
+- [ ] `strings.SplitSeq` (func)
+- [x] `strings.Title` (func)
+- [x] `strings.ToLower` (func)
+- [ ] `strings.ToLowerSpecial` (func)
+- [x] `strings.ToTitle` (func)
+- [ ] `strings.ToTitleSpecial` (func)
+- [x] `strings.ToUpper` (func)
+- [ ] `strings.ToUpperSpecial` (func)
+- [x] `strings.ToValidUTF8` (func)
+- [x] `strings.Trim` (func)
+- [x] `strings.TrimFunc` (func)
+- [x] `strings.TrimLeft` (func)
+- [x] `strings.TrimLeftFunc` (func)
+- [x] `strings.TrimPrefix` (func)
+- [x] `strings.TrimRight` (func)
+- [x] `strings.TrimRightFunc` (func)
+- [x] `strings.TrimSpace` (func)
+- [x] `strings.TrimSuffix` (func)
+- [x] `strings.Builder` (type)
+- [x] `strings.Builder.Cap` (method)
+- [x] `strings.Builder.Grow` (method)
+- [x] `strings.Builder.Len` (method)
+- [x] `strings.Builder.Reset` (method)
+- [x] `strings.Builder.String` (method)
+- [x] `strings.Builder.Write` (method)
+- [ ] `strings.Builder.WriteByte` (method)
+- [ ] `strings.Builder.WriteRune` (method)
+- [ ] `strings.Builder.WriteString` (method)
+- [ ] `strings.Reader` (type)
+- [ ] `strings.NewReader` (func)
+- [x] `strings.Reader.Len` (method)
+- [ ] `strings.Reader.Read` (method)
+- [ ] `strings.Reader.ReadAt` (method)
+- [ ] `strings.Reader.ReadByte` (method)
+- [ ] `strings.Reader.ReadRune` (method)
+- [x] `strings.Reader.Reset` (method)
+- [ ] `strings.Reader.Seek` (method)
+- [ ] `strings.Reader.Size` (method)
+- [ ] `strings.Reader.UnreadByte` (method)
+- [ ] `strings.Reader.UnreadRune` (method)
+- [ ] `strings.Reader.WriteTo` (method)
+- [x] `strings.Replacer` (type)
+- [x] `strings.NewReplacer` (func)
+- [x] `strings.Replacer.Replace` (method)
+- [ ] `strings.Replacer.WriteString` (method)
+- [ ] `strings`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `strings`: regression cases for every bug the twin finds, tied to issues
+- [ ] `strings`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `sync` (42 items)
+
+- [ ] `sync.OnceFunc` (func)
+- [ ] `sync.OnceValue` (func)
+- [ ] `sync.OnceValues` (func)
+- [-] `sync.Cond` (type): replaced by design
+- [ ] `sync.NewCond` (func)
+- [-] `sync.Cond.Broadcast` (method): replaced by design
+- [-] `sync.Cond.Signal` (method): replaced by design
+- [-] `sync.Cond.Wait` (method): replaced by design
+- [-] `sync.Locker` (type): replaced by design
+- [-] `sync.Map` (type): replaced by design
+- [-] `sync.Map.Clear` (method): replaced by design
+- [-] `sync.Map.CompareAndDelete` (method): replaced by design
+- [-] `sync.Map.CompareAndSwap` (method): replaced by design
+- [-] `sync.Map.Delete` (method): replaced by design
+- [-] `sync.Map.Load` (method): replaced by design
+- [-] `sync.Map.LoadAndDelete` (method): replaced by design
+- [-] `sync.Map.LoadOrStore` (method): replaced by design
+- [-] `sync.Map.Range` (method): replaced by design
+- [-] `sync.Map.Store` (method): replaced by design
+- [-] `sync.Map.Swap` (method): replaced by design
+- [-] `sync.Mutex` (type): replaced by design
+- [-] `sync.Mutex.Lock` (method): replaced by design
+- [-] `sync.Mutex.TryLock` (method): replaced by design
+- [-] `sync.Mutex.Unlock` (method): replaced by design
+- [ ] `sync.Once` (type)
+- [ ] `sync.Once.Do` (method)
+- [-] `sync.Pool` (type): replaced by design
+- [-] `sync.Pool.Get` (method): replaced by design
+- [-] `sync.Pool.Put` (method): replaced by design
+- [-] `sync.RWMutex` (type): replaced by design
+- [-] `sync.RWMutex.Lock` (method): replaced by design
+- [-] `sync.RWMutex.RLock` (method): replaced by design
+- [-] `sync.RWMutex.RLocker` (method): replaced by design
+- [-] `sync.RWMutex.RUnlock` (method): replaced by design
+- [-] `sync.RWMutex.TryLock` (method): replaced by design
+- [-] `sync.RWMutex.TryRLock` (method): replaced by design
+- [-] `sync.RWMutex.Unlock` (method): replaced by design
+- [-] `sync.WaitGroup` (type): replaced by design
+- [-] `sync.WaitGroup.Add` (method): replaced by design
+- [-] `sync.WaitGroup.Done` (method): replaced by design
+- [-] `sync.WaitGroup.Go` (method): replaced by design
+- [-] `sync.WaitGroup.Wait` (method): replaced by design
+- [ ] `sync`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `sync`: regression cases for every bug the twin finds, tied to issues
+- [ ] `sync`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `sync/atomic` (94 items)
+
+- [ ] `atomic.AddInt32` (func)
+- [ ] `atomic.AddInt64` (func)
+- [ ] `atomic.AddUint32` (func)
+- [ ] `atomic.AddUint64` (func)
+- [ ] `atomic.AddUintptr` (func)
+- [ ] `atomic.AndInt32` (func)
+- [ ] `atomic.AndInt64` (func)
+- [ ] `atomic.AndUint32` (func)
+- [ ] `atomic.AndUint64` (func)
+- [ ] `atomic.AndUintptr` (func)
+- [ ] `atomic.CompareAndSwapInt32` (func)
+- [ ] `atomic.CompareAndSwapInt64` (func)
+- [ ] `atomic.CompareAndSwapPointer` (func)
+- [ ] `atomic.CompareAndSwapUint32` (func)
+- [ ] `atomic.CompareAndSwapUint64` (func)
+- [ ] `atomic.CompareAndSwapUintptr` (func)
+- [ ] `atomic.LoadInt32` (func)
+- [ ] `atomic.LoadInt64` (func)
+- [ ] `atomic.LoadPointer` (func)
+- [ ] `atomic.LoadUint32` (func)
+- [ ] `atomic.LoadUint64` (func)
+- [ ] `atomic.LoadUintptr` (func)
+- [ ] `atomic.OrInt32` (func)
+- [ ] `atomic.OrInt64` (func)
+- [ ] `atomic.OrUint32` (func)
+- [ ] `atomic.OrUint64` (func)
+- [ ] `atomic.OrUintptr` (func)
+- [ ] `atomic.StoreInt32` (func)
+- [ ] `atomic.StoreInt64` (func)
+- [ ] `atomic.StorePointer` (func)
+- [ ] `atomic.StoreUint32` (func)
+- [ ] `atomic.StoreUint64` (func)
+- [ ] `atomic.StoreUintptr` (func)
+- [ ] `atomic.SwapInt32` (func)
+- [ ] `atomic.SwapInt64` (func)
+- [ ] `atomic.SwapPointer` (func)
+- [ ] `atomic.SwapUint32` (func)
+- [ ] `atomic.SwapUint64` (func)
+- [ ] `atomic.SwapUintptr` (func)
+- [ ] `atomic.Bool` (type)
+- [ ] `atomic.Bool.CompareAndSwap` (method)
+- [ ] `atomic.Bool.Load` (method)
+- [ ] `atomic.Bool.Store` (method)
+- [ ] `atomic.Bool.Swap` (method)
+- [ ] `atomic.Int32` (type)
+- [ ] `atomic.Int32.Add` (method)
+- [ ] `atomic.Int32.And` (method)
+- [ ] `atomic.Int32.CompareAndSwap` (method)
+- [ ] `atomic.Int32.Load` (method)
+- [ ] `atomic.Int32.Or` (method)
+- [ ] `atomic.Int32.Store` (method)
+- [ ] `atomic.Int32.Swap` (method)
+- [ ] `atomic.Int64` (type)
+- [ ] `atomic.Int64.Add` (method)
+- [ ] `atomic.Int64.And` (method)
+- [ ] `atomic.Int64.CompareAndSwap` (method)
+- [ ] `atomic.Int64.Load` (method)
+- [ ] `atomic.Int64.Or` (method)
+- [ ] `atomic.Int64.Store` (method)
+- [ ] `atomic.Int64.Swap` (method)
+- [ ] `atomic.Pointer` (type)
+- [ ] `atomic.Pointer.CompareAndSwap` (method)
+- [ ] `atomic.Pointer.Load` (method)
+- [ ] `atomic.Pointer.Store` (method)
+- [ ] `atomic.Pointer.Swap` (method)
+- [ ] `atomic.Uint32` (type)
+- [ ] `atomic.Uint32.Add` (method)
+- [ ] `atomic.Uint32.And` (method)
+- [ ] `atomic.Uint32.CompareAndSwap` (method)
+- [ ] `atomic.Uint32.Load` (method)
+- [ ] `atomic.Uint32.Or` (method)
+- [ ] `atomic.Uint32.Store` (method)
+- [ ] `atomic.Uint32.Swap` (method)
+- [ ] `atomic.Uint64` (type)
+- [ ] `atomic.Uint64.Add` (method)
+- [ ] `atomic.Uint64.And` (method)
+- [ ] `atomic.Uint64.CompareAndSwap` (method)
+- [ ] `atomic.Uint64.Load` (method)
+- [ ] `atomic.Uint64.Or` (method)
+- [ ] `atomic.Uint64.Store` (method)
+- [ ] `atomic.Uint64.Swap` (method)
+- [ ] `atomic.Uintptr` (type)
+- [ ] `atomic.Uintptr.Add` (method)
+- [ ] `atomic.Uintptr.And` (method)
+- [ ] `atomic.Uintptr.CompareAndSwap` (method)
+- [ ] `atomic.Uintptr.Load` (method)
+- [ ] `atomic.Uintptr.Or` (method)
+- [ ] `atomic.Uintptr.Store` (method)
+- [ ] `atomic.Uintptr.Swap` (method)
+- [ ] `atomic.Value` (type)
+- [ ] `atomic.Value.CompareAndSwap` (method)
+- [ ] `atomic.Value.Load` (method)
+- [ ] `atomic.Value.Store` (method)
+- [ ] `atomic.Value.Swap` (method)
+- [ ] `atomic`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `atomic`: regression cases for every bug the twin finds, tied to issues
+- [ ] `atomic`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `syscall` (277 items, 1652 constants)
+
+- [ ] `syscall.ImplementsGetwd` (const)
+- [ ] `syscall.ForkLock` (var)
+- [ ] `syscall.SocketDisableIPv6` (var)
+- [ ] `syscall.Accept` (func)
+- [ ] `syscall.Access` (func)
+- [ ] `syscall.Adjtime` (func)
+- [ ] `syscall.Bind` (func)
+- [ ] `syscall.BpfBuflen` (func)
+- [ ] `syscall.BpfDatalink` (func)
+- [ ] `syscall.BpfHeadercmpl` (func)
+- [ ] `syscall.BpfInterface` (func)
+- [ ] `syscall.BpfStats` (func)
+- [ ] `syscall.BpfTimeout` (func)
+- [ ] `syscall.BytePtrFromString` (func)
+- [ ] `syscall.ByteSliceFromString` (func)
+- [ ] `syscall.Chdir` (func)
+- [ ] `syscall.CheckBpfVersion` (func)
+- [ ] `syscall.Chflags` (func)
+- [ ] `syscall.Chmod` (func)
+- [ ] `syscall.Chown` (func)
+- [ ] `syscall.Chroot` (func)
+- [ ] `syscall.Clearenv` (func)
+- [ ] `syscall.Close` (func)
+- [ ] `syscall.CloseOnExec` (func)
+- [ ] `syscall.CmsgLen` (func)
+- [ ] `syscall.CmsgSpace` (func)
+- [ ] `syscall.Connect` (func)
+- [ ] `syscall.Dup` (func)
+- [ ] `syscall.Dup2` (func)
+- [ ] `syscall.Environ` (func)
+- [ ] `syscall.Exchangedata` (func)
+- [ ] `syscall.Exec` (func)
+- [ ] `syscall.Exit` (func)
+- [ ] `syscall.Fchdir` (func)
+- [ ] `syscall.Fchflags` (func)
+- [ ] `syscall.Fchmod` (func)
+- [ ] `syscall.Fchown` (func)
+- [ ] `syscall.FcntlFlock` (func)
+- [ ] `syscall.Flock` (func)
+- [ ] `syscall.FlushBpf` (func)
+- [ ] `syscall.ForkExec` (func)
+- [ ] `syscall.Fpathconf` (func)
+- [ ] `syscall.Fstat` (func)
+- [ ] `syscall.Fstatfs` (func)
+- [ ] `syscall.Fsync` (func)
+- [ ] `syscall.Ftruncate` (func)
+- [ ] `syscall.Futimes` (func)
+- [ ] `syscall.Getdirentries` (func)
+- [ ] `syscall.Getdtablesize` (func)
+- [ ] `syscall.Getegid` (func)
+- [ ] `syscall.Getenv` (func)
+- [ ] `syscall.Geteuid` (func)
+- [ ] `syscall.Getfsstat` (func)
+- [ ] `syscall.Getgid` (func)
+- [ ] `syscall.Getgroups` (func)
+- [ ] `syscall.Getpagesize` (func)
+- [ ] `syscall.Getpeername` (func)
+- [ ] `syscall.Getpgid` (func)
+- [ ] `syscall.Getpgrp` (func)
+- [ ] `syscall.Getpid` (func)
+- [ ] `syscall.Getppid` (func)
+- [ ] `syscall.Getpriority` (func)
+- [ ] `syscall.Getrlimit` (func)
+- [ ] `syscall.Getrusage` (func)
+- [ ] `syscall.Getsid` (func)
+- [ ] `syscall.Getsockname` (func)
+- [ ] `syscall.GetsockoptByte` (func)
+- [ ] `syscall.GetsockoptICMPv6Filter` (func)
+- [ ] `syscall.GetsockoptIPMreq` (func)
+- [ ] `syscall.GetsockoptIPv6MTUInfo` (func)
+- [ ] `syscall.GetsockoptIPv6Mreq` (func)
+- [ ] `syscall.GetsockoptInet4Addr` (func)
+- [ ] `syscall.GetsockoptInt` (func)
+- [ ] `syscall.Gettimeofday` (func)
+- [ ] `syscall.Getuid` (func)
+- [ ] `syscall.Getwd` (func)
+- [ ] `syscall.Issetugid` (func)
+- [ ] `syscall.Kevent` (func)
+- [ ] `syscall.Kill` (func)
+- [ ] `syscall.Kqueue` (func)
+- [ ] `syscall.Lchown` (func)
+- [ ] `syscall.Link` (func)
+- [ ] `syscall.Listen` (func)
+- [ ] `syscall.Lstat` (func)
+- [ ] `syscall.Mkdir` (func)
+- [ ] `syscall.Mkfifo` (func)
+- [ ] `syscall.Mknod` (func)
+- [ ] `syscall.Mlock` (func)
+- [ ] `syscall.Mlockall` (func)
+- [ ] `syscall.Mmap` (func)
+- [ ] `syscall.Mprotect` (func)
+- [ ] `syscall.Munlock` (func)
+- [ ] `syscall.Munlockall` (func)
+- [ ] `syscall.Munmap` (func)
+- [ ] `syscall.Open` (func)
+- [ ] `syscall.ParseDirent` (func)
+- [ ] `syscall.ParseRoutingMessage` (func)
+- [ ] `syscall.ParseRoutingSockaddr` (func)
+- [ ] `syscall.ParseSocketControlMessage` (func)
+- [ ] `syscall.ParseUnixRights` (func)
+- [ ] `syscall.Pathconf` (func)
+- [ ] `syscall.Pipe` (func)
+- [ ] `syscall.Pread` (func)
+- [ ] `syscall.PtraceAttach` (func)
+- [ ] `syscall.PtraceDetach` (func)
+- [ ] `syscall.Pwrite` (func)
+- [ ] `syscall.RawSyscall` (func)
+- [ ] `syscall.RawSyscall6` (func)
+- [ ] `syscall.Read` (func)
+- [ ] `syscall.ReadDirent` (func)
+- [ ] `syscall.Readlink` (func)
+- [ ] `syscall.Recvfrom` (func)
+- [ ] `syscall.Recvmsg` (func)
+- [ ] `syscall.Rename` (func)
+- [ ] `syscall.Revoke` (func)
+- [ ] `syscall.Rmdir` (func)
+- [ ] `syscall.RouteRIB` (func)
+- [ ] `syscall.Seek` (func)
+- [ ] `syscall.Select` (func)
+- [ ] `syscall.Sendfile` (func)
+- [ ] `syscall.Sendmsg` (func)
+- [ ] `syscall.SendmsgN` (func)
+- [ ] `syscall.Sendto` (func)
+- [ ] `syscall.SetBpf` (func)
+- [ ] `syscall.SetBpfBuflen` (func)
+- [ ] `syscall.SetBpfDatalink` (func)
+- [ ] `syscall.SetBpfHeadercmpl` (func)
+- [ ] `syscall.SetBpfImmediate` (func)
+- [ ] `syscall.SetBpfInterface` (func)
+- [ ] `syscall.SetBpfPromisc` (func)
+- [ ] `syscall.SetBpfTimeout` (func)
+- [ ] `syscall.SetKevent` (func)
+- [ ] `syscall.SetNonblock` (func)
+- [ ] `syscall.Setegid` (func)
+- [ ] `syscall.Setenv` (func)
+- [ ] `syscall.Seteuid` (func)
+- [ ] `syscall.Setgid` (func)
+- [ ] `syscall.Setgroups` (func)
+- [ ] `syscall.Setlogin` (func)
+- [ ] `syscall.Setpgid` (func)
+- [ ] `syscall.Setpriority` (func)
+- [ ] `syscall.Setprivexec` (func)
+- [ ] `syscall.Setregid` (func)
+- [ ] `syscall.Setreuid` (func)
+- [ ] `syscall.Setrlimit` (func)
+- [ ] `syscall.Setsid` (func)
+- [ ] `syscall.SetsockoptByte` (func)
+- [ ] `syscall.SetsockoptICMPv6Filter` (func)
+- [ ] `syscall.SetsockoptIPMreq` (func)
+- [ ] `syscall.SetsockoptIPv6Mreq` (func)
+- [ ] `syscall.SetsockoptInet4Addr` (func)
+- [ ] `syscall.SetsockoptInt` (func)
+- [ ] `syscall.SetsockoptLinger` (func)
+- [ ] `syscall.SetsockoptString` (func)
+- [ ] `syscall.SetsockoptTimeval` (func)
+- [ ] `syscall.Settimeofday` (func)
+- [ ] `syscall.Setuid` (func)
+- [ ] `syscall.Shutdown` (func)
+- [ ] `syscall.SlicePtrFromStrings` (func)
+- [ ] `syscall.Socket` (func)
+- [ ] `syscall.Socketpair` (func)
+- [ ] `syscall.StartProcess` (func)
+- [ ] `syscall.Stat` (func)
+- [ ] `syscall.Statfs` (func)
+- [ ] `syscall.StringBytePtr` (func)
+- [ ] `syscall.StringByteSlice` (func)
+- [ ] `syscall.StringSlicePtr` (func)
+- [ ] `syscall.Symlink` (func)
+- [ ] `syscall.Sync` (func)
+- [ ] `syscall.Syscall` (func)
+- [ ] `syscall.Syscall6` (func)
+- [ ] `syscall.Syscall9` (func)
+- [ ] `syscall.Sysctl` (func)
+- [ ] `syscall.SysctlUint32` (func)
+- [ ] `syscall.TimespecToNsec` (func)
+- [ ] `syscall.TimevalToNsec` (func)
+- [ ] `syscall.Truncate` (func)
+- [ ] `syscall.Umask` (func)
+- [ ] `syscall.Undelete` (func)
+- [ ] `syscall.UnixRights` (func)
+- [ ] `syscall.Unlink` (func)
+- [ ] `syscall.Unmount` (func)
+- [ ] `syscall.Unsetenv` (func)
+- [ ] `syscall.Utimes` (func)
+- [ ] `syscall.UtimesNano` (func)
+- [ ] `syscall.Wait4` (func)
+- [ ] `syscall.Write` (func)
+- [ ] `syscall.BpfHdr` (type)
+- [ ] `syscall.BpfInsn` (type)
+- [ ] `syscall.BpfJump` (func)
+- [ ] `syscall.BpfStmt` (func)
+- [ ] `syscall.BpfProgram` (type)
+- [ ] `syscall.BpfStat` (type)
+- [ ] `syscall.BpfVersion` (type)
+- [ ] `syscall.Cmsghdr` (type)
+- [ ] `syscall.Cmsghdr.SetLen` (method)
+- [ ] `syscall.Conn` (type)
+- [ ] `syscall.Credential` (type)
+- [ ] `syscall.Dirent` (type)
+- [ ] `syscall.Errno` (type)
+- [ ] `syscall.Errno.Error` (method)
+- [ ] `syscall.Errno.Is` (method)
+- [ ] `syscall.Errno.Temporary` (method)
+- [ ] `syscall.Errno.Timeout` (method)
+- [ ] `syscall.Fbootstraptransfer_t` (type)
+- [ ] `syscall.FdSet` (type)
+- [ ] `syscall.Flock_t` (type)
+- [ ] `syscall.Fsid` (type)
+- [ ] `syscall.Fstore_t` (type)
+- [ ] `syscall.ICMPv6Filter` (type)
+- [ ] `syscall.IPMreq` (type)
+- [ ] `syscall.IPv6MTUInfo` (type)
+- [ ] `syscall.IPv6Mreq` (type)
+- [ ] `syscall.IfData` (type)
+- [ ] `syscall.IfMsghdr` (type)
+- [ ] `syscall.IfaMsghdr` (type)
+- [ ] `syscall.IfmaMsghdr` (type)
+- [ ] `syscall.IfmaMsghdr2` (type)
+- [ ] `syscall.Inet4Pktinfo` (type)
+- [ ] `syscall.Inet6Pktinfo` (type)
+- [ ] `syscall.InterfaceAddrMessage` (type)
+- [ ] `syscall.InterfaceMessage` (type)
+- [ ] `syscall.InterfaceMulticastAddrMessage` (type)
+- [ ] `syscall.Iovec` (type)
+- [ ] `syscall.Iovec.SetLen` (method)
+- [ ] `syscall.Kevent_t` (type)
+- [ ] `syscall.Linger` (type)
+- [ ] `syscall.Log2phys_t` (type)
+- [ ] `syscall.Msghdr` (type)
+- [ ] `syscall.Msghdr.SetControllen` (method)
+- [ ] `syscall.ProcAttr` (type)
+- [ ] `syscall.Radvisory_t` (type)
+- [ ] `syscall.RawConn` (type)
+- [ ] `syscall.RawSockaddr` (type)
+- [ ] `syscall.RawSockaddrAny` (type)
+- [ ] `syscall.RawSockaddrDatalink` (type)
+- [ ] `syscall.RawSockaddrInet4` (type)
+- [ ] `syscall.RawSockaddrInet6` (type)
+- [ ] `syscall.RawSockaddrUnix` (type)
+- [ ] `syscall.Rlimit` (type)
+- [ ] `syscall.RouteMessage` (type)
+- [ ] `syscall.RoutingMessage` (type)
+- [ ] `syscall.RtMetrics` (type)
+- [ ] `syscall.RtMsghdr` (type)
+- [ ] `syscall.Rusage` (type)
+- [ ] `syscall.Signal` (type)
+- [ ] `syscall.Signal.Signal` (method)
+- [ ] `syscall.Signal.String` (method)
+- [ ] `syscall.Sockaddr` (type)
+- [ ] `syscall.SockaddrDatalink` (type)
+- [ ] `syscall.SockaddrInet4` (type)
+- [ ] `syscall.SockaddrInet6` (type)
+- [ ] `syscall.SockaddrUnix` (type)
+- [ ] `syscall.SocketControlMessage` (type)
+- [ ] `syscall.Stat_t` (type)
+- [ ] `syscall.Statfs_t` (type)
+- [ ] `syscall.SysProcAttr` (type)
+- [ ] `syscall.Termios` (type)
+- [ ] `syscall.Timespec` (type)
+- [ ] `syscall.NsecToTimespec` (func)
+- [ ] `syscall.Timespec.Nano` (method)
+- [ ] `syscall.Timespec.Unix` (method)
+- [ ] `syscall.Timeval` (type)
+- [ ] `syscall.NsecToTimeval` (func)
+- [ ] `syscall.Timeval.Nano` (method)
+- [ ] `syscall.Timeval.Unix` (method)
+- [ ] `syscall.Timeval32` (type)
+- [ ] `syscall.WaitStatus` (type)
+- [ ] `syscall.WaitStatus.Continued` (method)
+- [ ] `syscall.WaitStatus.CoreDump` (method)
+- [ ] `syscall.WaitStatus.ExitStatus` (method)
+- [ ] `syscall.WaitStatus.Exited` (method)
+- [ ] `syscall.WaitStatus.Signal` (method)
+- [ ] `syscall.WaitStatus.Signaled` (method)
+- [ ] `syscall.WaitStatus.StopSignal` (method)
+- [ ] `syscall.WaitStatus.Stopped` (method)
+- [ ] `syscall.WaitStatus.TrapCause` (method)
+- [ ] `syscall`: the 1652 constants (one task per constant group in `go doc -all syscall`)
+- [ ] `syscall`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `syscall`: regression cases for every bug the twin finds, tied to issues
+- [ ] `syscall`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `testing` (148 items)
+
+- [ ] `testing.TestXxx` (func)
+- [ ] `testing.TestAbs` (func)
+- [ ] `testing.TestAbs` (func)
+- [ ] `testing.BenchmarkXxx` (func)
+- [ ] `testing.BenchmarkRandInt` (func)
+- [ ] `testing.BenchmarkBigLen` (func)
+- [ ] `testing.BenchmarkTemplateParallel` (func)
+- [ ] `testing.BenchmarkRandInt` (func)
+- [ ] `testing.BenchmarkBigLen` (func)
+- [ ] `testing.ExampleHello` (func)
+- [ ] `testing.ExampleSalutations` (func)
+- [ ] `testing.ExamplePerm` (func)
+- [ ] `testing.Example` (func)
+- [ ] `testing.ExampleF` (func)
+- [ ] `testing.ExampleT` (func)
+- [ ] `testing.ExampleT_M` (func)
+- [ ] `testing.Example_suffix` (func)
+- [ ] `testing.ExampleF_suffix` (func)
+- [ ] `testing.ExampleT_suffix` (func)
+- [ ] `testing.ExampleT_M_suffix` (func)
+- [ ] `testing.FuzzXxx` (func)
+- [ ] `testing.FuzzHex` (func)
+- [ ] `testing.TestTimeConsuming` (func)
+- [ ] `testing.FuzzJSONMarshaling` (func)
+- [ ] `testing.TestFoo` (func)
+- [ ] `testing.TestGroupedParallel` (func)
+- [ ] `testing.TestTeardownParallel` (func)
+- [ ] `testing.TestMain` (func)
+- [ ] `testing.TestMain` (func)
+- [ ] `testing.AllocsPerRun` (func)
+- [ ] `testing.CoverMode` (func)
+- [ ] `testing.Coverage` (func)
+- [ ] `testing.Init` (func)
+- [ ] `testing.Main` (func)
+- [ ] `testing.RegisterCover` (func)
+- [ ] `testing.RunBenchmarks` (func)
+- [ ] `testing.RunExamples` (func)
+- [ ] `testing.RunTests` (func)
+- [ ] `testing.Short` (func)
+- [ ] `testing.Testing` (func)
+- [ ] `testing.Verbose` (func)
+- [~] `testing.B` (type)
+- [ ] `testing.B.ArtifactDir` (method)
+- [ ] `testing.B.Attr` (method)
+- [ ] `testing.B.Chdir` (method)
+- [ ] `testing.B.Cleanup` (method)
+- [ ] `testing.B.Context` (method)
+- [ ] `testing.B.Elapsed` (method)
+- [~] `testing.B.Error` (method)
+- [ ] `testing.B.Errorf` (method)
+- [ ] `testing.B.Fail` (method)
+- [ ] `testing.B.FailNow` (method)
+- [~] `testing.B.Failed` (method)
+- [ ] `testing.B.Fatal` (method)
+- [ ] `testing.B.Fatalf` (method)
+- [ ] `testing.B.Helper` (method)
+- [~] `testing.B.Log` (method)
+- [ ] `testing.B.Logf` (method)
+- [ ] `testing.B.Loop` (method)
+- [ ] `testing.B.Name` (method)
+- [ ] `testing.B.Output` (method)
+- [ ] `testing.B.ReportAllocs` (method)
+- [ ] `testing.B.ReportMetric` (method)
+- [ ] `testing.B.ResetTimer` (method)
+- [~] `testing.B.Run` (method)
+- [ ] `testing.B.RunParallel` (method)
+- [ ] `testing.B.SetBytes` (method)
+- [ ] `testing.B.SetParallelism` (method)
+- [ ] `testing.B.Setenv` (method)
+- [ ] `testing.B.Skip` (method)
+- [ ] `testing.B.SkipNow` (method)
+- [ ] `testing.B.Skipf` (method)
+- [ ] `testing.B.Skipped` (method)
+- [ ] `testing.B.StartTimer` (method)
+- [ ] `testing.B.StopTimer` (method)
+- [ ] `testing.B.TempDir` (method)
+- [ ] `testing.BenchmarkResult` (type)
+- [ ] `testing.Benchmark` (func)
+- [ ] `testing.BenchmarkResult.AllocedBytesPerOp` (method)
+- [ ] `testing.BenchmarkResult.AllocsPerOp` (method)
+- [ ] `testing.BenchmarkResult.MemString` (method)
+- [ ] `testing.BenchmarkResult.NsPerOp` (method)
+- [ ] `testing.BenchmarkResult.String` (method)
+- [ ] `testing.Cover` (type)
+- [ ] `testing.CoverBlock` (type)
+- [ ] `testing.F` (type)
+- [ ] `testing.F.Add` (method)
+- [ ] `testing.F.ArtifactDir` (method)
+- [ ] `testing.F.Attr` (method)
+- [ ] `testing.F.Chdir` (method)
+- [ ] `testing.F.Cleanup` (method)
+- [ ] `testing.F.Context` (method)
+- [~] `testing.F.Error` (method)
+- [ ] `testing.F.Errorf` (method)
+- [ ] `testing.F.Fail` (method)
+- [ ] `testing.F.FailNow` (method)
+- [~] `testing.F.Failed` (method)
+- [ ] `testing.F.Fatal` (method)
+- [ ] `testing.F.Fatalf` (method)
+- [ ] `testing.F.Fuzz` (method)
+- [ ] `testing.F.Helper` (method)
+- [~] `testing.F.Log` (method)
+- [ ] `testing.F.Logf` (method)
+- [ ] `testing.F.Name` (method)
+- [ ] `testing.F.Output` (method)
+- [ ] `testing.F.Setenv` (method)
+- [ ] `testing.F.Skip` (method)
+- [ ] `testing.F.SkipNow` (method)
+- [ ] `testing.F.Skipf` (method)
+- [ ] `testing.F.Skipped` (method)
+- [ ] `testing.F.TempDir` (method)
+- [ ] `testing.InternalBenchmark` (type)
+- [ ] `testing.InternalExample` (type)
+- [ ] `testing.InternalFuzzTarget` (type)
+- [ ] `testing.InternalTest` (type)
+- [ ] `testing.M` (type)
+- [ ] `testing.MainStart` (func)
+- [~] `testing.M.Run` (method)
+- [ ] `testing.PB` (type)
+- [ ] `testing.PB.Next` (method)
+- [~] `testing.T` (type)
+- [ ] `testing.T.ArtifactDir` (method)
+- [ ] `testing.T.Attr` (method)
+- [ ] `testing.T.Chdir` (method)
+- [ ] `testing.T.Cleanup` (method)
+- [ ] `testing.T.Context` (method)
+- [ ] `testing.T.Deadline` (method)
+- [~] `testing.T.Error` (method)
+- [ ] `testing.T.Errorf` (method)
+- [ ] `testing.T.Fail` (method)
+- [ ] `testing.T.FailNow` (method)
+- [~] `testing.T.Failed` (method)
+- [ ] `testing.T.Fatal` (method)
+- [ ] `testing.T.Fatalf` (method)
+- [ ] `testing.T.Helper` (method)
+- [~] `testing.T.Log` (method)
+- [ ] `testing.T.Logf` (method)
+- [ ] `testing.T.Name` (method)
+- [ ] `testing.T.Output` (method)
+- [ ] `testing.T.Parallel` (method)
+- [~] `testing.T.Run` (method)
+- [ ] `testing.T.Setenv` (method)
+- [ ] `testing.T.Skip` (method)
+- [ ] `testing.T.SkipNow` (method)
+- [ ] `testing.T.Skipf` (method)
+- [ ] `testing.T.Skipped` (method)
+- [ ] `testing.T.TempDir` (method)
+- [ ] `testing.TB` (type)
+- [ ] `testing`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `testing`: regression cases for every bug the twin finds, tied to issues
+- [ ] `testing`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `testing/cryptotest` (1 items)
+
+- [ ] `cryptotest.SetGlobalRandom` (func)
+- [ ] `cryptotest`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `cryptotest`: regression cases for every bug the twin finds, tied to issues
+- [ ] `cryptotest`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `testing/fstest` (11 items)
+
+- [ ] `fstest.TestFS` (func)
+- [ ] `fstest.MapFS` (type)
+- [ ] `fstest.MapFS.Glob` (method)
+- [ ] `fstest.MapFS.Lstat` (method)
+- [ ] `fstest.MapFS.Open` (method)
+- [ ] `fstest.MapFS.ReadDir` (method)
+- [ ] `fstest.MapFS.ReadFile` (method)
+- [ ] `fstest.MapFS.ReadLink` (method)
+- [ ] `fstest.MapFS.Stat` (method)
+- [ ] `fstest.MapFS.Sub` (method)
+- [ ] `fstest.MapFile` (type)
+- [ ] `fstest`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `fstest`: regression cases for every bug the twin finds, tied to issues
+- [ ] `fstest`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `testing/iotest` (10 items)
+
+- [ ] `iotest.ErrTimeout` (var)
+- [ ] `iotest.DataErrReader` (func)
+- [ ] `iotest.ErrReader` (func)
+- [ ] `iotest.HalfReader` (func)
+- [ ] `iotest.NewReadLogger` (func)
+- [ ] `iotest.NewWriteLogger` (func)
+- [ ] `iotest.OneByteReader` (func)
+- [ ] `iotest.TestReader` (func)
+- [ ] `iotest.TimeoutReader` (func)
+- [ ] `iotest.TruncateWriter` (func)
+- [ ] `iotest`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `iotest`: regression cases for every bug the twin finds, tied to issues
+- [ ] `iotest`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `testing/quick` (11 items)
+
+- [ ] `quick.Check` (func)
+- [ ] `quick.CheckEqual` (func)
+- [ ] `quick.Value` (func)
+- [ ] `quick.CheckEqualError` (type)
+- [ ] `quick.CheckEqualError.Error` (method)
+- [ ] `quick.CheckError` (type)
+- [ ] `quick.CheckError.Error` (method)
+- [ ] `quick.Config` (type)
+- [ ] `quick.Generator` (type)
+- [ ] `quick.SetupError` (type)
+- [ ] `quick.SetupError.Error` (method)
+- [ ] `quick`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `quick`: regression cases for every bug the twin finds, tied to issues
+- [ ] `quick`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `testing/slogtest` (2 items)
+
+- [ ] `slogtest.Run` (func)
+- [ ] `slogtest.TestHandler` (func)
+- [ ] `slogtest`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `slogtest`: regression cases for every bug the twin finds, tied to issues
+- [ ] `slogtest`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `testing/synctest` (7 items)
+
+- [ ] `synctest.TestTime` (func)
+- [ ] `synctest.TestWait` (func)
+- [ ] `synctest.TestContextAfterFunc` (func)
+- [ ] `synctest.TestContextWithTimeout` (func)
+- [ ] `synctest.TestHTTPTransport100Continue` (func)
+- [ ] `synctest.Test` (func)
+- [ ] `synctest.Wait` (func)
+- [ ] `synctest`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `synctest`: regression cases for every bug the twin finds, tied to issues
+- [ ] `synctest`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `text/scanner` (12 items, 17 constants)
+
+- [ ] `scanner.GoWhitespace` (const)
+- [ ] `scanner.TokenString` (func)
+- [ ] `scanner.Position` (type)
+- [ ] `scanner.Position.IsValid` (method)
+- [ ] `scanner.Position.String` (method)
+- [ ] `scanner.Scanner` (type)
+- [ ] `scanner.Scanner.Init` (method)
+- [ ] `scanner.Scanner.Next` (method)
+- [ ] `scanner.Scanner.Peek` (method)
+- [ ] `scanner.Scanner.Pos` (method)
+- [ ] `scanner.Scanner.Scan` (method)
+- [ ] `scanner.Scanner.TokenText` (method)
+- [ ] `scanner`: the 17 constants (one task per constant group in `go doc -all text/scanner`)
+- [ ] `scanner`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `scanner`: regression cases for every bug the twin finds, tied to issues
+- [ ] `scanner`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `scanner`: fuzz target for every parser and decoder in the package
+
+#### `text/tabwriter` (6 items, 6 constants)
+
+- [ ] `tabwriter.Escape` (const)
+- [ ] `tabwriter.Writer` (type)
+- [ ] `tabwriter.NewWriter` (func)
+- [ ] `tabwriter.Writer.Flush` (method)
+- [ ] `tabwriter.Writer.Init` (method)
+- [ ] `tabwriter.Writer.Write` (method)
+- [ ] `tabwriter`: the 6 constants (one task per constant group in `go doc -all text/tabwriter`)
+- [ ] `tabwriter`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `tabwriter`: regression cases for every bug the twin finds, tied to issues
+- [ ] `tabwriter`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `text/template` (34 items)
+
+- [-] `template.HTMLEscape` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.HTMLEscapeString` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.HTMLEscaper` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.IsTrue` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.JSEscape` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.JSEscapeString` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.JSEscaper` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.URLQueryEscaper` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.ExecError` (type): replaced by design (reflection-based; needs derivation first)
+- [-] `template.ExecError.Error` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.ExecError.Unwrap` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.FuncMap` (type): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template` (type): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Must` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.New` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.ParseFS` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.ParseFiles` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.ParseGlob` (func): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.AddParseTree` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.Clone` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.DefinedTemplates` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.Delims` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.Execute` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.ExecuteTemplate` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.Funcs` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.Lookup` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.Name` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.New` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.Option` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.Parse` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.ParseFS` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.ParseFiles` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.ParseGlob` (method): replaced by design (reflection-based; needs derivation first)
+- [-] `template.Template.Templates` (method): replaced by design (reflection-based; needs derivation first)
+- [ ] `template`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `template`: regression cases for every bug the twin finds, tied to issues
+- [ ] `template`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `template`: fuzz target for every parser and decoder in the package
+
+#### `text/template/parse` (84 items, 23 constants)
+
+- [ ] `parse.IsEmptyTree` (func)
+- [ ] `parse.Parse` (func)
+- [ ] `parse.ActionNode` (type)
+- [ ] `parse.ActionNode.Copy` (method)
+- [ ] `parse.ActionNode.String` (method)
+- [ ] `parse.BoolNode` (type)
+- [ ] `parse.BoolNode.Copy` (method)
+- [ ] `parse.BoolNode.String` (method)
+- [ ] `parse.BranchNode` (type)
+- [ ] `parse.BranchNode.Copy` (method)
+- [ ] `parse.BranchNode.String` (method)
+- [ ] `parse.BreakNode` (type)
+- [ ] `parse.BreakNode.Copy` (method)
+- [ ] `parse.BreakNode.String` (method)
+- [ ] `parse.ChainNode` (type)
+- [ ] `parse.ChainNode.Add` (method)
+- [ ] `parse.ChainNode.Copy` (method)
+- [ ] `parse.ChainNode.String` (method)
+- [ ] `parse.CommandNode` (type)
+- [ ] `parse.CommandNode.Copy` (method)
+- [ ] `parse.CommandNode.String` (method)
+- [ ] `parse.CommentNode` (type)
+- [ ] `parse.CommentNode.Copy` (method)
+- [ ] `parse.CommentNode.String` (method)
+- [ ] `parse.ContinueNode` (type)
+- [ ] `parse.ContinueNode.Copy` (method)
+- [ ] `parse.ContinueNode.String` (method)
+- [ ] `parse.DotNode` (type)
+- [ ] `parse.DotNode.Copy` (method)
+- [ ] `parse.DotNode.String` (method)
+- [ ] `parse.DotNode.Type` (method)
+- [ ] `parse.FieldNode` (type)
+- [ ] `parse.FieldNode.Copy` (method)
+- [ ] `parse.FieldNode.String` (method)
+- [ ] `parse.IdentifierNode` (type)
+- [ ] `parse.NewIdentifier` (func)
+- [ ] `parse.IdentifierNode.Copy` (method)
+- [ ] `parse.IdentifierNode.SetPos` (method)
+- [ ] `parse.IdentifierNode.SetTree` (method)
+- [ ] `parse.IdentifierNode.String` (method)
+- [ ] `parse.IfNode` (type)
+- [ ] `parse.IfNode.Copy` (method)
+- [ ] `parse.ListNode` (type)
+- [ ] `parse.ListNode.Copy` (method)
+- [ ] `parse.ListNode.CopyList` (method)
+- [ ] `parse.ListNode.String` (method)
+- [ ] `parse.Mode` (type)
+- [ ] `parse.NilNode` (type)
+- [ ] `parse.NilNode.Copy` (method)
+- [ ] `parse.NilNode.String` (method)
+- [ ] `parse.NilNode.Type` (method)
+- [ ] `parse.Node` (type)
+- [ ] `parse.NodeType` (type)
+- [ ] `parse.NodeType.Type` (method)
+- [ ] `parse.NumberNode` (type)
+- [ ] `parse.NumberNode.Copy` (method)
+- [ ] `parse.NumberNode.String` (method)
+- [ ] `parse.PipeNode` (type)
+- [ ] `parse.PipeNode.Copy` (method)
+- [ ] `parse.PipeNode.CopyPipe` (method)
+- [ ] `parse.PipeNode.String` (method)
+- [ ] `parse.Pos` (type)
+- [ ] `parse.Pos.Position` (method)
+- [ ] `parse.RangeNode` (type)
+- [ ] `parse.RangeNode.Copy` (method)
+- [ ] `parse.StringNode` (type)
+- [ ] `parse.StringNode.Copy` (method)
+- [ ] `parse.StringNode.String` (method)
+- [ ] `parse.TemplateNode` (type)
+- [ ] `parse.TemplateNode.Copy` (method)
+- [ ] `parse.TemplateNode.String` (method)
+- [ ] `parse.TextNode` (type)
+- [ ] `parse.TextNode.Copy` (method)
+- [ ] `parse.TextNode.String` (method)
+- [ ] `parse.Tree` (type)
+- [ ] `parse.New` (func)
+- [ ] `parse.Tree.Copy` (method)
+- [ ] `parse.Tree.ErrorContext` (method)
+- [ ] `parse.Tree.Parse` (method)
+- [ ] `parse.VariableNode` (type)
+- [ ] `parse.VariableNode.Copy` (method)
+- [ ] `parse.VariableNode.String` (method)
+- [ ] `parse.WithNode` (type)
+- [ ] `parse.WithNode.Copy` (method)
+- [ ] `parse`: the 23 constants (one task per constant group in `go doc -all text/template/parse`)
+- [ ] `parse`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `parse`: regression cases for every bug the twin finds, tied to issues
+- [ ] `parse`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `time` (94 items, 44 constants)
+
+- [ ] `time.After` (func)
+- [x] `time.Sleep` (func)
+- [ ] `time.Tick` (func)
+- [ ] `time.Duration` (type)
+- [x] `time.ParseDuration` (func)
+- [x] `time.Since` (func)
+- [ ] `time.Until` (func)
+- [ ] `time.Duration.Abs` (method)
+- [x] `time.Duration.Hours` (method)
+- [x] `time.Duration.Microseconds` (method)
+- [x] `time.Duration.Milliseconds` (method)
+- [x] `time.Duration.Minutes` (method)
+- [ ] `time.Duration.Nanoseconds` (method)
+- [ ] `time.Duration.Round` (method)
+- [x] `time.Duration.Seconds` (method)
+- [ ] `time.Duration.String` (method)
+- [ ] `time.Duration.Truncate` (method)
+- [ ] `time.Location` (type)
+- [ ] `time.Local` (var)
+- [x] `time.UTC` (var)
+- [ ] `time.FixedZone` (func)
+- [ ] `time.LoadLocation` (func)
+- [ ] `time.LoadLocationFromTZData` (func)
+- [ ] `time.Location.String` (method)
+- [ ] `time.Month` (type)
+- [ ] `time.Month.String` (method)
+- [ ] `time.ParseError` (type)
+- [ ] `time.ParseError.Error` (method)
+- [ ] `time.Ticker` (type)
+- [ ] `time.NewTicker` (func)
+- [ ] `time.Ticker.Reset` (method)
+- [ ] `time.Ticker.Stop` (method)
+- [ ] `time.Time` (type)
+- [x] `time.Date` (func)
+- [x] `time.Now` (func)
+- [ ] `time.Parse` (func)
+- [ ] `time.ParseInLocation` (func)
+- [x] `time.Unix` (func)
+- [ ] `time.UnixMicro` (func)
+- [ ] `time.UnixMilli` (func)
+- [ ] `time.Time.Add` (method)
+- [ ] `time.Time.AddDate` (method)
+- [ ] `time.Time.After` (method)
+- [ ] `time.Time.AppendBinary` (method)
+- [ ] `time.Time.AppendFormat` (method)
+- [ ] `time.Time.AppendText` (method)
+- [ ] `time.Time.Before` (method)
+- [ ] `time.Time.Clock` (method)
+- [ ] `time.Time.Compare` (method)
+- [x] `time.Time.Date` (method)
+- [ ] `time.Time.Day` (method)
+- [ ] `time.Time.Equal` (method)
+- [ ] `time.Time.Format` (method)
+- [ ] `time.Time.GoString` (method)
+- [ ] `time.Time.GobDecode` (method)
+- [ ] `time.Time.GobEncode` (method)
+- [x] `time.Time.Hour` (method)
+- [ ] `time.Time.ISOWeek` (method)
+- [ ] `time.Time.In` (method)
+- [ ] `time.Time.IsDST` (method)
+- [ ] `time.Time.IsZero` (method)
+- [ ] `time.Time.Local` (method)
+- [ ] `time.Time.Location` (method)
+- [ ] `time.Time.MarshalBinary` (method)
+- [ ] `time.Time.MarshalJSON` (method)
+- [ ] `time.Time.MarshalText` (method)
+- [x] `time.Time.Minute` (method)
+- [ ] `time.Time.Month` (method)
+- [x] `time.Time.Nanosecond` (method)
+- [ ] `time.Time.Round` (method)
+- [x] `time.Time.Second` (method)
+- [ ] `time.Time.String` (method)
+- [ ] `time.Time.Sub` (method)
+- [ ] `time.Time.Truncate` (method)
+- [x] `time.Time.UTC` (method)
+- [x] `time.Time.Unix` (method)
+- [ ] `time.Time.UnixMicro` (method)
+- [ ] `time.Time.UnixMilli` (method)
+- [ ] `time.Time.UnixNano` (method)
+- [ ] `time.Time.UnmarshalBinary` (method)
+- [ ] `time.Time.UnmarshalJSON` (method)
+- [ ] `time.Time.UnmarshalText` (method)
+- [ ] `time.Time.Weekday` (method)
+- [ ] `time.Time.Year` (method)
+- [ ] `time.Time.YearDay` (method)
+- [ ] `time.Time.Zone` (method)
+- [ ] `time.Time.ZoneBounds` (method)
+- [ ] `time.Timer` (type)
+- [ ] `time.AfterFunc` (func)
+- [ ] `time.NewTimer` (func)
+- [ ] `time.Timer.Reset` (method)
+- [ ] `time.Timer.Stop` (method)
+- [ ] `time.Weekday` (type)
+- [ ] `time.Weekday.String` (method)
+- [ ] `time`: the 44 constants (one task per constant group in `go doc -all time`)
+- [ ] `time`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `time`: regression cases for every bug the twin finds, tied to issues
+- [ ] `time`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `time`: fuzz target for every parser and decoder in the package
+
+#### `unicode` (41 items, 256 constants)
+
+- [ ] `unicode.Version` (const)
+- [ ] `unicode.CaseRanges` (var)
+- [ ] `unicode.Categories` (var)
+- [ ] `unicode.CategoryAliases` (var)
+- [ ] `unicode.FoldCategory` (var)
+- [ ] `unicode.FoldScript` (var)
+- [ ] `unicode.GraphicRanges` (var)
+- [ ] `unicode.PrintRanges` (var)
+- [ ] `unicode.Properties` (var)
+- [ ] `unicode.Scripts` (var)
+- [ ] `unicode.In` (func)
+- [x] `unicode.Is` (func)
+- [x] `unicode.IsControl` (func)
+- [x] `unicode.IsDigit` (func)
+- [x] `unicode.IsGraphic` (func)
+- [x] `unicode.IsLetter` (func)
+- [x] `unicode.IsLower` (func)
+- [x] `unicode.IsMark` (func)
+- [x] `unicode.IsNumber` (func)
+- [x] `unicode.IsOneOf` (func)
+- [x] `unicode.IsPrint` (func)
+- [x] `unicode.IsPunct` (func)
+- [x] `unicode.IsSpace` (func)
+- [x] `unicode.IsSymbol` (func)
+- [x] `unicode.IsTitle` (func)
+- [x] `unicode.IsUpper` (func)
+- [x] `unicode.SimpleFold` (func)
+- [x] `unicode.To` (func)
+- [x] `unicode.ToLower` (func)
+- [x] `unicode.ToTitle` (func)
+- [x] `unicode.ToUpper` (func)
+- [ ] `unicode.CaseRange` (type)
+- [ ] `unicode.Range16` (type)
+- [ ] `unicode.Range32` (type)
+- [ ] `unicode.RangeTable` (type)
+- [ ] `unicode.SpecialCase` (type)
+- [ ] `unicode.AzeriCase` (var)
+- [ ] `unicode.TurkishCase` (var)
+- [x] `unicode.SpecialCase.ToLower` (method)
+- [x] `unicode.SpecialCase.ToTitle` (method)
+- [x] `unicode.SpecialCase.ToUpper` (method)
+- [ ] `unicode`: the 256 constants (one task per constant group in `go doc -all unicode`)
+- [ ] `unicode`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `unicode`: regression cases for every bug the twin finds, tied to issues
+- [ ] `unicode`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `unicode/utf16` (7 items)
+
+- [ ] `utf16.AppendRune` (func)
+- [ ] `utf16.Decode` (func)
+- [ ] `utf16.DecodeRune` (func)
+- [ ] `utf16.Encode` (func)
+- [ ] `utf16.EncodeRune` (func)
+- [ ] `utf16.IsSurrogate` (func)
+- [ ] `utf16.RuneLen` (func)
+- [ ] `utf16`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `utf16`: regression cases for every bug the twin finds, tied to issues
+- [ ] `utf16`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `utf16`: fuzz target for every parser and decoder in the package
+
+#### `unicode/utf8` (15 items, 4 constants)
+
+- [ ] `utf8.AppendRune` (func)
+- [x] `utf8.DecodeLastRune` (func)
+- [ ] `utf8.DecodeLastRuneInString` (func)
+- [x] `utf8.DecodeRune` (func)
+- [ ] `utf8.DecodeRuneInString` (func)
+- [x] `utf8.EncodeRune` (func)
+- [x] `utf8.FullRune` (func)
+- [ ] `utf8.FullRuneInString` (func)
+- [x] `utf8.RuneCount` (func)
+- [ ] `utf8.RuneCountInString` (func)
+- [x] `utf8.RuneLen` (func)
+- [x] `utf8.RuneStart` (func)
+- [x] `utf8.Valid` (func)
+- [x] `utf8.ValidRune` (func)
+- [ ] `utf8.ValidString` (func)
+- [ ] `utf8`: the 4 constants (one task per constant group in `go doc -all unicode/utf8`)
+- [ ] `utf8`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `utf8`: regression cases for every bug the twin finds, tied to issues
+- [ ] `utf8`: benchmark against Go, allocations per call recorded in the performance budget
+- [ ] `utf8`: fuzz target for every parser and decoder in the package
+
+#### `unique` (3 items)
+
+- [ ] `unique.Handle` (type)
+- [ ] `unique.Make` (func)
+- [ ] `unique.Handle.Value` (method)
+- [ ] `unique`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `unique`: regression cases for every bug the twin finds, tied to issues
+- [ ] `unique`: benchmark against Go, allocations per call recorded in the performance budget
+
+#### `unsafe` (11 items)
+
+- [-] `unsafe.Alignof` (func): replaced by design (an audited raw-memory package, standard library only)
+- [-] `unsafe.Offsetof` (func): replaced by design (an audited raw-memory package, standard library only)
+- [-] `unsafe.Sizeof` (func): replaced by design (an audited raw-memory package, standard library only)
+- [-] `unsafe.String` (func): replaced by design (an audited raw-memory package, standard library only)
+- [-] `unsafe.StringData` (func): replaced by design (an audited raw-memory package, standard library only)
+- [-] `unsafe.ArbitraryType` (type): replaced by design (an audited raw-memory package, standard library only)
+- [-] `unsafe.Slice` (func): replaced by design (an audited raw-memory package, standard library only)
+- [-] `unsafe.SliceData` (func): replaced by design (an audited raw-memory package, standard library only)
+- [-] `unsafe.IntegerType` (type): replaced by design (an audited raw-memory package, standard library only)
+- [-] `unsafe.Pointer` (type): replaced by design (an audited raw-memory package, standard library only)
+- [-] `unsafe.Add` (func): replaced by design (an audited raw-memory package, standard library only)
+- [ ] `unsafe`: Go twin test (`bench/ref`) generated with the Tin test from one description, identical output
+- [ ] `unsafe`: regression cases for every bug the twin finds, tied to issues
+- [ ] `unsafe`: benchmark against Go, allocations per call recorded in the performance budget
+
+
+### 14. Review corrections and the work the first draft left out
+
+An independent review of sections 1 to 13 found contradictions with Tin's design (fixed in place above), missing areas, ordering mistakes and oversized items. This section holds what it added; every box is a task.
+
+#### 14.1 Memory the design leaves open
+- [ ] Reclaiming the long-lived heap in a server that runs for months: what frees an overwritten global, an evicted cache entry, a replaced config; design note with the rule (explicit drop, epoch reclaim, or arena per owner) and the leak detector
+- [ ] Leak and growth diagnostics: per-core heap statistics, allocation-site sampling for `keep`, a debug mode that reports memory still reachable from globals at shutdown
+- [ ] Fragmentation policy and a month-long soak test (allocate, keep, drop under a synthetic cache workload; resident size must stay within a stated bound)
+- [ ] Read-mostly shared data that changes (config reload, router swap, certificate rotation) without a mutex: an epoch or read-copy-update scheme in the runtime, with the region rules for readers
+- [ ] Memory model specification: what atomics, `relay` messages and helper-thread results guarantee (happens-before), written as a document and tested on arm64 (weak) and amd64
+- [ ] Offload pool for CPU-heavy or blocking work (bcrypt, compression, TLS handshakes, file I/O) with a deadline-aware queue, so a core never stalls; acceptance: handshake storm does not move p99 of unrelated requests more than a stated amount
+
+#### 14.2 Language and runtime gaps
+- [ ] `guard`: unwinding design (run defers on panic, rewind a sub-region, release task resources) and its codegen cost on both CPUs; today a panic ends the process with status 2
+- [ ] `defer` inside loops, and the cost model of defers
+- [ ] Struct equality and hashing rules, map key rules for every key type, shadowing rules, written in LANGUAGE.md with tests
+- [ ] Cross-compilation as a first-class command (`tin build -target`), tested from each host to each target
+- [ ] FFI policy promoted from an open question to a design note with a decision date: how Tin calls system libraries (needed for the darwin system calls and root certificates, Windows, sqlite, ML runtimes) and how capabilities limit it
+- [ ] Darwin carve-out for "no libc": macOS requires libSystem for stable system calls; define what is linked and what is replaced
+- [ ] Completion-capable I/O layer designed before io_uring or IOCP (they are completion-based; epoll and kqueue are readiness-based)
+- [ ] Constant-time code generation rules decided before the SSA optimizer lands, and the crypto constant-time tests re-run after every optimizer change
+- [ ] Editions mechanism before the package registry and before value arrays and the overflow policy (both are breaking changes); versioning and deprecation policy written in year 1, not year 7
+
+#### 14.3 Ordering fixes
+- [ ] Move `tin fmt` to year 1 (cheap, and stops churn while syntax is still moving)
+- [ ] Move DWARF line tables, symbolized backtraces and the pprof format to years 1 to 2 (the first production service needs them)
+- [ ] Atomics do not depend on tasks: schedule them with the first metrics work, before scopes
+- [ ] TLS needs AES and carry-less multiply intrinsics, streaming hashes, `asn1` and `x509`: list them as its prerequisites, in that order
+- [ ] Specification 1.0 and the compatibility promise only after the registry, editions and two external production services
+- [ ] Year 1 is split into 1a (foundations 1 to 3, formatter, benchmark publication) and 1b (foundations 4 to 7, libc removal on Linux, high-demand library packages)
+
+#### 14.4 Items too large to be one box (split before scheduling)
+- [ ] TLS: record layer; TLS 1.3 client; X.509 path validation; system roots per OS; server; TLS 1.2; session resumption; kernel TLS; conformance with tlsfuzzer and BoGo
+- [ ] HTTP/2: framing, HPACK, flow control, server push removal, conformance with h2spec; HTTP/3 is a separate project on top of a QUIC stack (loss recovery, congestion control, TLS 1.3 integration) and is not in the first five years
+- [ ] Windows: PE writer, structured exception handling and unwinding, Win32 runtime part, IOCP on the completion-capable layer, path and console semantics, a Windows CI runner
+- [ ] WebAssembly: runtime model without threads, stack switching, file and socket model through WASI, size budget
+- [ ] Regular expressions: parser, Pike VM, one-pass and backtracking engines, lazy DFA, literal acceleration, Unicode classes; each engine verified separately against RE2's corpus
+- [ ] Optimizer: SSA construction and verifier; simple passes; bounds-check elimination; register allocation; each lands behind a flag with the whole corpus as the test
+- [ ] `math/big` with assembly kernels, and the claim "JSON faster than the fastest Go JSON libraries": a baseline and a margin first (see 14.5)
+- [ ] Formal proofs of the region checker: start with a mechanized core calculus and a soundness statement for it, not the whole language
+
+#### 14.5 Measurable acceptance criteria (replace the vague items)
+- [ ] Define the benchmark suite by name (a list of at least 30 programs with Go baselines), the hardware, and the statistical method (repeat runs, confidence interval); the 2 percent regression gate applies only on dedicated hardware
+- [ ] Numbers for "startup time" and "binary size": hello world, an HTTP echo server, the compiler itself, each with a ceiling checked in CI
+- [ ] "Tin ahead of Go" means: a stated geometric-mean speedup over the suite and no benchmark worse than a stated factor
+- [ ] Diagnostics: every error has a stable code and a documented page; "suggestion where one exists" becomes a checklist of error classes that must carry a fix-it
+- [ ] Observability: the list of counters, histograms and span names, and the export formats (Prometheus text, OpenTelemetry), each with a test
+- [ ] "Differential fuzzing against Go twins": generate programs from a restricted grammar, run them under Tin and Go, compare output; list the grammar subset
+- [ ] Every "decision" item gets an owner field in the issue and a deadline; undecided at the deadline means it is declared out of scope
+
+#### 14.6 Missing areas
+- [ ] Binary hardening: position-independent executables, read-only relocations, W^X, BTI and pointer authentication on arm64, CET on amd64, stack protector equivalents
+- [ ] Bootstrap provenance: how the checked-in seed binaries are produced and verified (diverse double compilation), and how a seed is rebuilt from source on a clean machine
+- [ ] Release engineering: versioning scheme, changelog generation, backports to supported releases, signed artifacts, an error-code index, versioned documentation
+- [ ] Testing: a random program generator for miscompiles (Csmith-like), automatic test-case reduction, miscompile bisection by pass, soak and chaos tests for the scheduler (injected delays, dropped sockets), fuzzing of the region checker for soundness
+- [ ] Documentation: language specification with examples tested by the suite, architecture documents for the compiler and runtime, onboarding guide, glossary
+
+#### 14.7 Section 13 corrections
+- [ ] Extractor: include generic functions and methods (the first version dropped generics, so `slices` and `maps` were almost empty, and `go doc -all` methods were missed)
+- [ ] Group constants: packages such as `syscall` and `debug/elf` have thousands of constants; one task per constant group, not per name
+- [ ] Mark three states: verified (`[x]`), a same-named function exists but the package is partial or by design (`[~]`, not verified), missing (`[ ]`)
+- [ ] Mark APIs replaced by design (`[-]` with the replacement named): `reflect` (derivation), `unsafe` (audited raw-memory package), `sync.Mutex` and `RWMutex` (no mutexes), `runtime.GC` and `SetFinalizer` (no collector), `context.WithValue` (typed slots), `errors.As` (sentinels), `net/rpc` and `encoding/gob` (reflection-based), `text/template` and `html/template` (need derivation first), `expvar`, `iter.Pull` (tasks)
+- [ ] Move the per-package quality tasks to one list (12.5); keep only the Go twin, the regression policy and the benchmark per package, and a fuzz target only for packages that parse untrusted input
