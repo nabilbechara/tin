@@ -178,6 +178,15 @@ fn const_val(e) {
     return eval_binary(e[BIN_OP], const_val(e[BIN_L]), const_val(e[BIN_R]));
 }
 
+// may_panic reports whether binary e can panic by itself: integer / and % do unless the
+// divisor is a nonzero constant, so moving them past their guards is unsafe.
+fn may_panic(e) {
+    if e_fp(e) || (!streq(e[BIN_OP], "/") && !streq(e[BIN_OP], "%")) {
+        return 0;
+    }
+    return !is_const(e[BIN_R]) || const_val(e[BIN_R]) == 0;
+}
+
 fn is_real_call(e) {
     return e[N_KIND] == EX_CALL && !e[CALL_INTRINSIC];
 }
@@ -1601,8 +1610,8 @@ fn gen_call(e, d) {
             i = i + 1;
         }
     } else if d0 + n <= t_count && d0 + n <= f_count {
-        // Arguments with calls or loads run first, in order; the rest are effect-free
-        // and go straight into their registers afterwards.
+        // Arguments that call, load or may panic run first, in order; the rest are
+        // effect-free and go straight into their registers afterwards.
         let last = -1;
         i = 0;
         while i < n {
@@ -2348,7 +2357,7 @@ fn gen_return(s) {
 // ---- if-conversion ----
 
 // speculable reports whether e can be computed even on the path that doesn't need it:
-// no calls, no memory access, and cheap enough to beat a mispredicted branch.
+// no calls, no memory access, no panics, and cheap enough to beat a mispredicted branch.
 fn speculable(e) {
     let k = e[N_KIND];
     if k == EX_INT || k == EX_STR || k == EX_FLOAT || k == EX_FUNCREF {
@@ -2361,7 +2370,7 @@ fn speculable(e) {
         return speculable(e[UN_X]);
     }
     if k == EX_BINARY {
-        return !streq(e[BIN_OP], "&&") && !streq(e[BIN_OP], "||") && speculable(e[BIN_L]) && speculable(e[BIN_R]);
+        return !streq(e[BIN_OP], "&&") && !streq(e[BIN_OP], "||") && !may_panic(e) && speculable(e[BIN_L]) && speculable(e[BIN_R]);
     }
     if k == EX_CONV {
         return e[CV_KIND] != CV_LEN && e[CV_KIND] != CV_CAP && speculable(e[CV_X]);
