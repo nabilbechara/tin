@@ -142,9 +142,17 @@ Each expression gets region bits: `RG_FRESH` (a new allocation from the request 
 Locals accumulate the bits of everything assigned to them (iterated to a fixed point per
 function). A store of a value with `RG_EMB` into a container with `RG_INGOT` or `RG_UNK`
 is an error; into a parameter's container it marks that parameter a sink in the
-function's summary. Summaries (sink parameters, result bits per result) are iterated over
-the whole program until nothing changes, then a final pass reports errors (only in
-non-library files). Runtime calls with special meaning (`rt_map_set`, `rt_append`,
+function's summary. A container that is not long-lived may still hold long-lived or
+parameter objects: every store into one adds the value's long-lived, unknown and
+parameter bits to a per-type table of the function (`rg_hold`), and a read of that type
+out of such a container takes them (`rg_load`). Summaries (sink parameters, the held
+table restricted to types reachable from the parameters and results, records of where
+inside each parameter it stores, result bits per result) are iterated over the whole
+program until nothing changes, then a final pass reports errors (only in non-library
+files). At a call, a parameter's bits stand for everything reachable from the argument,
+so the caller's held entries on the way from the argument's type to a stored-into object
+(`rg_deep`) count too; calls through function values use the joined summaries of all
+functions used as values. Runtime calls with special meaning (`rt_map_set`, `rt_append`,
 `rt_slice_sub`...) are modelled by name.
 
 ## 7. Code generation (`gen.tin`, arm64)
