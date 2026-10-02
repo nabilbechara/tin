@@ -894,7 +894,7 @@ err2 := argo.Get(text, mut xs)      // appends decoded elements
 - **Bounds**: every slice and string index is checked; slicing beyond the length panics.
   The compiler removes a check where it can prove the index is in range: `range` loops,
   `for i := 0; i < len(s); i++` (and loops whose bound is `len(s)` held in an unchanged
-  variable), `if i < len(s)` with a non-negative i, and constant indexes.
+  variable), and `if i < len(s)` with a non-negative i.
 - **Nil**: str, slice, map and struct values are never nil. Optionals must be checked
   before use (section 9). Missing map keys read as zero values; `try` returns real zero
   values.
