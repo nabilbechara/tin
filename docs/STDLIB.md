@@ -13,7 +13,8 @@ Generated from the comments in `lib/*/` by `tools/gendoc.py`.
 | [twine](#twine) | strings (strings) |
 | [glyph](#glyph) | UTF-8 (unicode/utf8) |
 | [mint](#mint) | number and string conversion (strconv) |
-| [gauge](#gauge) | math (math, math/bits) |
+| [gauge](#gauge) | math (math) |
+| [bits](#bits) | bit counting and manipulation (math/bits) |
 | [ore](#ore) | byte slices (bytes) |
 | [flume](#flume) | buffered I/O (bufio) |
 | [quarry](#quarry) | files, environment, process (os) |
@@ -291,7 +292,7 @@ Package mint converts numbers and quoted strings to and from text (like Go's str
 
 ## gauge
 
-Package gauge is floating-point and integer math (like Go's math and math/bits). The transcendental functions are written in Tin (ported from Go's math package); only the functions the CPU has an instruction for (sqrt, floor, ceil, trunc, round, rint) go through the system.
+Package gauge is floating-point math and a few integer helpers (like Go's math); bit operations are in package bits. The transcendental functions are written in Tin (ported from Go's math package); only the functions the CPU has an instruction for (sqrt, floor, ceil, trunc, round, rint) go through the system.
 
 - `Atan(x f64) f64`: Atan returns the arctangent of x, in [-Pi/2, Pi/2]. Atan(±0) = ±0, Atan(±Inf) = ±Pi/2.
 - `Atan2(y f64, x f64) f64`: Atan2 returns the arctangent of y/x using the signs of both to pick the quadrant, in [-Pi, Pi].
@@ -341,9 +342,6 @@ Package gauge is floating-point and integer math (like Go's math and math/bits).
 - `ClampI(x i64, lo i64, hi i64) i64`: ClampI returns x limited to [lo, hi].
 - `Gcd(a i64, b i64) i64`: Gcd returns the greatest common divisor of |a| and |b| (0 when both are 0).
 - `Lcm(a i64, b i64) i64`: Lcm returns the least common multiple of |a| and |b| (0 when either is 0; wraps on overflow).
-- `PopCount(x u64) i64`: PopCount returns the number of one bits in x.
-- `LeadingZeros(x u64) i64`: LeadingZeros returns the number of leading zero bits in x (64 for 0).
-- `TrailingZeros(x u64) i64`: TrailingZeros returns the number of trailing zero bits in x (64 for 0).
 - `Log(x f64) f64`: Log returns the natural logarithm of x. Log(+Inf) = +Inf, Log(0) = -Inf, Log(x < 0) = NaN.
 - `Log2(x f64) f64`: Log2 returns the binary logarithm of x, exact for powers of two.
 - `Log10(x f64) f64`: Log10 returns the decimal logarithm of x.
@@ -353,6 +351,48 @@ Package gauge is floating-point and integer math (like Go's math and math/bits).
 - `Sin(x f64) f64`: Sin returns the sine of x (radians). Sin(±0) = ±0, Sin(±Inf) = Sin(NaN) = NaN.
 - `Cos(x f64) f64`: Cos returns the cosine of x (radians). Cos(±Inf) = Cos(NaN) = NaN.
 - `Tan(x f64) f64`: Tan returns the tangent of x (radians). Tan(±0) = ±0, Tan(±Inf) = Tan(NaN) = NaN.
+
+## bits
+
+Package bits counts, rotates and reverses the bits of fixed-width unsigned integers, and does 64-bit and 32-bit arithmetic with carries (like Go's math/bits). Every name carries its width; PopCount is Go's OnesCount; there is no uint-wide form because Tin has no uint.
+
+- `Len64(x u64) i64`: Len64 returns the minimum number of bits needed to represent x; Len64(0) is 0.
+- `Len32(x u32) i64`: Len32 is Len64 for a u32.
+- `Len16(x u16) i64`: Len16 is Len64 for a u16.
+- `Len8(x u8) i64`: Len8 is Len64 for a u8.
+- `LeadingZeros64(x u64) i64`: LeadingZeros64 returns the number of leading zero bits in x; it is 64 for 0.
+- `LeadingZeros32(x u32) i64`: LeadingZeros32 returns the number of leading zero bits in x; it is 32 for 0.
+- `LeadingZeros16(x u16) i64`: LeadingZeros16 returns the number of leading zero bits in x; it is 16 for 0.
+- `LeadingZeros8(x u8) i64`: LeadingZeros8 returns the number of leading zero bits in x; it is 8 for 0.
+- `TrailingZeros64(x u64) i64`: TrailingZeros64 returns the number of trailing zero bits in x; it is 64 for 0.
+- `TrailingZeros32(x u32) i64`: TrailingZeros32 returns the number of trailing zero bits in x; it is 32 for 0.
+- `TrailingZeros16(x u16) i64`: TrailingZeros16 returns the number of trailing zero bits in x; it is 16 for 0.
+- `TrailingZeros8(x u8) i64`: TrailingZeros8 returns the number of trailing zero bits in x; it is 8 for 0.
+- `PopCount64(x u64) i64`: PopCount64 returns the number of one bits in x.
+- `PopCount32(x u32) i64`: PopCount32 returns the number of one bits in x.
+- `PopCount16(x u16) i64`: PopCount16 returns the number of one bits in x.
+- `PopCount8(x u8) i64`: PopCount8 returns the number of one bits in x.
+- `RotateLeft64(x u64, k i64) u64`: RotateLeft64 returns x rotated left by k bits; a negative k rotates right.
+- `RotateLeft32(x u32, k i64) u32`: RotateLeft32 returns x rotated left by k bits; a negative k rotates right.
+- `RotateLeft16(x u16, k i64) u16`: RotateLeft16 returns x rotated left by k bits; a negative k rotates right.
+- `RotateLeft8(x u8, k i64) u8`: RotateLeft8 returns x rotated left by k bits; a negative k rotates right.
+- `ReverseBytes64(x u64) u64`: ReverseBytes64 returns x with its bytes in reversed order.
+- `ReverseBytes32(x u32) u32`: ReverseBytes32 returns x with its bytes in reversed order.
+- `ReverseBytes16(x u16) u16`: ReverseBytes16 returns x with its bytes in reversed order.
+- `Reverse64(x u64) u64`: Reverse64 returns x with its bits in reversed order.
+- `Reverse32(x u32) u32`: Reverse32 returns x with its bits in reversed order.
+- `Reverse16(x u16) u16`: Reverse16 returns x with its bits in reversed order.
+- `Reverse8(x u8) u8`: Reverse8 returns x with its bits in reversed order.
+- `Add64(x u64, y u64, carry u64) (u64, u64)`: Add64 returns the sum x + y + carry and the carry out. carry must be 0 or 1, otherwise the behavior is undefined.
+- `Add32(x u32, y u32, carry u32) (u32, u32)`: Add32 returns the sum x + y + carry and the carry out (0 or 1).
+- `Sub64(x u64, y u64, borrow u64) (u64, u64)`: Sub64 returns the difference x - y - borrow and the borrow out. borrow must be 0 or 1, otherwise the behavior is undefined.
+- `Sub32(x u32, y u32, borrow u32) (u32, u32)`: Sub32 returns the difference x - y - borrow and the borrow out (0 or 1).
+- `Mul64(x u64, y u64) (u64, u64)`: Mul64 returns the 128-bit product of x and y as (high word, low word).
+- `Mul32(x u32, y u32) (u32, u32)`: Mul32 returns the 64-bit product of x and y as (high word, low word).
+- `Div64(hi u64, lo u64, y u64) (u64, u64)`: Div64 returns the quotient and remainder of (hi, lo) divided by y. It panics for y == 0 (division by zero) and for y <= hi (the quotient does not fit in 64 bits).
+- `Div32(hi u32, lo u32, y u32) (u32, u32)`: Div32 returns the quotient and remainder of (hi, lo) divided by y. It panics for y == 0 and for y <= hi (the quotient does not fit in 32 bits).
+- `Rem64(hi u64, lo u64, y u64) u64`: Rem64 returns the remainder of (hi, lo) divided by y, for any hi (no overflow panic). It panics for y == 0.
+- `Rem32(hi u32, lo u32, y u32) u32`: Rem32 returns the remainder of (hi, lo) divided by y. It panics for y == 0.
 
 ## ore
 

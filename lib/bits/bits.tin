@@ -1,0 +1,344 @@
+// Package bits counts, rotates and reverses the bits of fixed-width unsigned integers, and does 64-bit
+// and 32-bit arithmetic with carries (like Go's math/bits). Every name carries its width; PopCount is
+// Go's OnesCount; there is no uint-wide form because Tin has no uint.
+package bits
+
+// shr is x >> n for any count: a count of 64 or more gives 0, where the hardware (and Tin) takes the
+// count modulo 64.
+func shr(x u64, n u64) u64 {
+	if n >= 64 {
+		return 0
+	}
+	return x >> n
+}
+
+// shl is x << n for any count (see shr).
+func shl(x u64, n u64) u64 {
+	if n >= 64 {
+		return 0
+	}
+	return x << n
+}
+
+// ---- Len and the zero counts ----
+
+// Len64 returns the minimum number of bits needed to represent x; Len64(0) is 0.
+func Len64(x u64) i64 {
+	n := 0
+	if x >= 1<<32 {
+		x >>= 32
+		n = 32
+	}
+	if x >= 1<<16 {
+		x >>= 16
+		n += 16
+	}
+	if x >= 1<<8 {
+		x >>= 8
+		n += 8
+	}
+	if x >= 1<<4 {
+		x >>= 4
+		n += 4
+	}
+	if x >= 1<<2 {
+		x >>= 2
+		n += 2
+	}
+	if x >= 1<<1 {
+		x >>= 1
+		n += 1
+	}
+	return n + i64(x) // x is now 0 or 1
+}
+
+// Len32 is Len64 for a u32.
+func Len32(x u32) i64 {
+	return Len64(u64(x))
+}
+
+// Len16 is Len64 for a u16.
+func Len16(x u16) i64 {
+	return Len64(u64(x))
+}
+
+// Len8 is Len64 for a u8.
+func Len8(x u8) i64 {
+	return Len64(u64(x))
+}
+
+// LeadingZeros64 returns the number of leading zero bits in x; it is 64 for 0.
+func LeadingZeros64(x u64) i64 {
+	return 64 - Len64(x)
+}
+
+// LeadingZeros32 returns the number of leading zero bits in x; it is 32 for 0.
+func LeadingZeros32(x u32) i64 {
+	return 32 - Len64(u64(x))
+}
+
+// LeadingZeros16 returns the number of leading zero bits in x; it is 16 for 0.
+func LeadingZeros16(x u16) i64 {
+	return 16 - Len64(u64(x))
+}
+
+// LeadingZeros8 returns the number of leading zero bits in x; it is 8 for 0.
+func LeadingZeros8(x u8) i64 {
+	return 8 - Len64(u64(x))
+}
+
+// TrailingZeros64 returns the number of trailing zero bits in x; it is 64 for 0.
+func TrailingZeros64(x u64) i64 {
+	if x == 0 {
+		return 64
+	}
+	return Len64(x&(^x+1)) - 1 // x & -x keeps only the lowest set bit
+}
+
+// TrailingZeros32 returns the number of trailing zero bits in x; it is 32 for 0.
+func TrailingZeros32(x u32) i64 {
+	if x == 0 {
+		return 32
+	}
+	return TrailingZeros64(u64(x))
+}
+
+// TrailingZeros16 returns the number of trailing zero bits in x; it is 16 for 0.
+func TrailingZeros16(x u16) i64 {
+	if x == 0 {
+		return 16
+	}
+	return TrailingZeros64(u64(x))
+}
+
+// TrailingZeros8 returns the number of trailing zero bits in x; it is 8 for 0.
+func TrailingZeros8(x u8) i64 {
+	if x == 0 {
+		return 8
+	}
+	return TrailingZeros64(u64(x))
+}
+
+// ---- PopCount ----
+
+// PopCount64 returns the number of one bits in x.
+func PopCount64(x u64) i64 {
+	const m0 = 0x5555555555555555 // 01010101 ...
+	const m1 = 0x3333333333333333 // 00110011 ...
+	const m2 = 0x0f0f0f0f0f0f0f0f // 00001111 ...
+	x = (x>>1)&m0 + x&m0
+	x = (x>>2)&m1 + x&m1
+	x = ((x >> 4) + x) & m2
+	x += x >> 8
+	x += x >> 16
+	x += x >> 32
+	return i64(x) & (1<<7 - 1)
+}
+
+// PopCount32 returns the number of one bits in x.
+func PopCount32(x u32) i64 {
+	return PopCount64(u64(x))
+}
+
+// PopCount16 returns the number of one bits in x.
+func PopCount16(x u16) i64 {
+	return PopCount64(u64(x))
+}
+
+// PopCount8 returns the number of one bits in x.
+func PopCount8(x u8) i64 {
+	return PopCount64(u64(x))
+}
+
+// ---- RotateLeft ----
+
+// RotateLeft64 returns x rotated left by k bits; a negative k rotates right.
+func RotateLeft64(x u64, k i64) u64 {
+	s := u64(k) & 63
+	if s == 0 {
+		return x
+	}
+	return x<<s | x>>(64-s)
+}
+
+// RotateLeft32 returns x rotated left by k bits; a negative k rotates right.
+func RotateLeft32(x u32, k i64) u32 {
+	s := u64(k) & 31
+	return u32(u64(x)<<s | u64(x)>>(32-s))
+}
+
+// RotateLeft16 returns x rotated left by k bits; a negative k rotates right.
+func RotateLeft16(x u16, k i64) u16 {
+	s := u64(k) & 15
+	return u16(u64(x)<<s | u64(x)>>(16-s))
+}
+
+// RotateLeft8 returns x rotated left by k bits; a negative k rotates right.
+func RotateLeft8(x u8, k i64) u8 {
+	s := u64(k) & 7
+	return u8(u64(x)<<s | u64(x)>>(8-s))
+}
+
+// ---- Reverse ----
+
+// ReverseBytes64 returns x with its bytes in reversed order.
+func ReverseBytes64(x u64) u64 {
+	const m3 = 0x00ff00ff00ff00ff
+	const m4 = 0x0000ffff0000ffff
+	x = (x>>8)&m3 | (x&m3)<<8
+	x = (x>>16)&m4 | (x&m4)<<16
+	return x>>32 | x<<32
+}
+
+// ReverseBytes32 returns x with its bytes in reversed order.
+func ReverseBytes32(x u32) u32 {
+	return u32(ReverseBytes64(u64(x)) >> 32)
+}
+
+// ReverseBytes16 returns x with its bytes in reversed order.
+func ReverseBytes16(x u16) u16 {
+	return u16(ReverseBytes64(u64(x)) >> 48)
+}
+
+// Reverse64 returns x with its bits in reversed order.
+func Reverse64(x u64) u64 {
+	const m0 = 0x5555555555555555
+	const m1 = 0x3333333333333333
+	const m2 = 0x0f0f0f0f0f0f0f0f
+	x = (x>>1)&m0 | (x&m0)<<1
+	x = (x>>2)&m1 | (x&m1)<<2
+	x = (x>>4)&m2 | (x&m2)<<4
+	return ReverseBytes64(x)
+}
+
+// Reverse32 returns x with its bits in reversed order.
+func Reverse32(x u32) u32 {
+	return u32(Reverse64(u64(x)) >> 32)
+}
+
+// Reverse16 returns x with its bits in reversed order.
+func Reverse16(x u16) u16 {
+	return u16(Reverse64(u64(x)) >> 48)
+}
+
+// Reverse8 returns x with its bits in reversed order.
+func Reverse8(x u8) u8 {
+	return u8(Reverse64(u64(x)) >> 56)
+}
+
+// ---- arithmetic with carries ----
+
+// Add64 returns the sum x + y + carry and the carry out. carry must be 0 or 1, otherwise the
+// behavior is undefined.
+func Add64(x u64, y u64, carry u64) (u64, u64) {
+	sum := x + y + carry
+	// The carry out is the sum of the carries of the top bits of x, y and the incoming carry.
+	return sum, ((x & y) | ((x | y) & ^sum)) >> 63
+}
+
+// Add32 returns the sum x + y + carry and the carry out (0 or 1).
+func Add32(x u32, y u32, carry u32) (u32, u32) {
+	sum64 := u64(x) + u64(y) + u64(carry)
+	return u32(sum64), u32(sum64 >> 32)
+}
+
+// Sub64 returns the difference x - y - borrow and the borrow out. borrow must be 0 or 1,
+// otherwise the behavior is undefined.
+func Sub64(x u64, y u64, borrow u64) (u64, u64) {
+	diff := x - y - borrow
+	return diff, ((^x & y) | (^(x ^ y) & diff)) >> 63
+}
+
+// Sub32 returns the difference x - y - borrow and the borrow out (0 or 1).
+func Sub32(x u32, y u32, borrow u32) (u32, u32) {
+	diff := x - y - borrow
+	return diff, ((^x & y) | (^(x ^ y) & diff)) >> 31
+}
+
+// Mul64 returns the 128-bit product of x and y as (high word, low word).
+func Mul64(x u64, y u64) (u64, u64) {
+	const mask32 = 1<<32 - 1
+	x0 := x & mask32
+	x1 := x >> 32
+	y0 := y & mask32
+	y1 := y >> 32
+	w0 := x0 * y0
+	t := x1*y0 + w0>>32
+	w1 := t & mask32
+	w2 := t >> 32
+	w1 += x0 * y1
+	return x1*y1 + w2 + w1>>32, x * y
+}
+
+// Mul32 returns the 64-bit product of x and y as (high word, low word).
+func Mul32(x u32, y u32) (u32, u32) {
+	tmp := u64(x) * u64(y)
+	return u32(tmp >> 32), u32(tmp)
+}
+
+// Div64 returns the quotient and remainder of (hi, lo) divided by y. It panics for y == 0 (division
+// by zero) and for y <= hi (the quotient does not fit in 64 bits).
+func Div64(hi u64, lo u64, y u64) (u64, u64) {
+	if y == 0 {
+		panic("integer divide by zero")
+	}
+	if y <= hi {
+		panic("integer overflow")
+	}
+	if hi == 0 {
+		return lo / y, lo % y
+	}
+	// Knuth's algorithm D on 32-bit digits.
+	s := u64(LeadingZeros64(y))
+	y <<= s
+	const two32 = 1 << 32
+	const mask32 = two32 - 1
+	yn1 := y >> 32
+	yn0 := y & mask32
+	un32 := shl(hi, s) | shr(lo, 64-s)
+	un10 := shl(lo, s)
+	un1 := un10 >> 32
+	un0 := un10 & mask32
+	q1 := un32 / yn1
+	rhat := un32 - q1*yn1
+	for q1 >= two32 || q1*yn0 > two32*rhat+un1 {
+		q1--
+		rhat += yn1
+		if rhat >= two32 {
+			break
+		}
+	}
+	un21 := un32*two32 + un1 - q1*y
+	q0 := un21 / yn1
+	rhat = un21 - q0*yn1
+	for q0 >= two32 || q0*yn0 > two32*rhat+un0 {
+		q0--
+		rhat += yn1
+		if rhat >= two32 {
+			break
+		}
+	}
+	return q1*two32 + q0, shr(un21*two32+un0-q0*y, s)
+}
+
+// Div32 returns the quotient and remainder of (hi, lo) divided by y. It panics for y == 0 and for
+// y <= hi (the quotient does not fit in 32 bits).
+func Div32(hi u32, lo u32, y u32) (u32, u32) {
+	if y != 0 && y <= hi {
+		panic("integer overflow")
+	}
+	z := u64(hi)<<32 | u64(lo)
+	return u32(z / u64(y)), u32(z % u64(y))
+}
+
+// Rem64 returns the remainder of (hi, lo) divided by y, for any hi (no overflow panic). It panics
+// for y == 0.
+func Rem64(hi u64, lo u64, y u64) u64 {
+	_, rem := Div64(hi%y, lo, y)
+	return rem
+}
+
+// Rem32 returns the remainder of (hi, lo) divided by y. It panics for y == 0.
+func Rem32(hi u32, lo u32, y u32) u32 {
+	return u32((u64(hi)<<32 | u64(lo)) % u64(y))
+}

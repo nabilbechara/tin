@@ -12,8 +12,8 @@ The inventory is the 176 packages `go list std` reports for Go 1.26 (without `in
 | design | Go's shape needs something Tin deliberately lacks; the replacement is named or still to be designed |
 | n/a | specific to Go's toolchain or runtime, with no counterpart to build |
 
-**Standard library, 176 packages:** 1 done, 43 partial, 8 design, 100 missing, 24 n/a.
-**Of the 87 packages koussa imports:** 1 done, 40 partial, 7 design, 39 missing, 0 n/a.
+**Standard library, 176 packages:** 2 done, 42 partial, 8 design, 100 missing, 24 n/a.
+**Of the 87 packages koussa imports:** 2 done, 39 partial, 7 design, 39 missing, 0 n/a.
 
 ## The language
 
@@ -170,7 +170,7 @@ Ordered by import path, as `go list std` prints them.
 | `maps` | 2+4 | partial | atlas | Keys, Values (slices, in insertion order), SortedKeys, Clone, Copy, Equal, EqualFunc, DeleteFunc; no iterator forms (All, Insert, Collect) |
 | `math` | 59+23 | partial | gauge | Sin to Atan2, Sinh to Tanh, Exp, Exp2, Log family, Pow, Cbrt, Hypot, Mod, Frexp, Ldexp, Modf (ported from Go, no libm); missing Gamma, Lgamma, Erf, Erfc, Expm1, Asinh, Acosh, Atanh, Sincos, FMA, Nextafter, Remainder, Logb, Dim, Bessel functions |
 | `math/big` | 8+0 | missing |  | Int, Float, Rat |
-| `math/bits` | 3+0 | partial | gauge | PopCount, LeadingZeros, TrailingZeros; no Mul64, Add64, Div64, Len, Reverse, RotateLeft (the first two exist unexported) |
+| `math/bits` | 3+0 | done | bits | LeadingZeros, TrailingZeros, PopCount (OnesCount), Len, RotateLeft, Reverse, ReverseBytes, and Add, Sub, Mul, Div, Rem with carries, at 8, 16, 32 and 64 bits as Go has them, each name carrying its width; no uint-wide forms because Tin has no uint |
 | `math/cmplx` |  | missing |  | there is no complex type |
 | `math/rand` | 17+8 | partial | dice | xoshiro256** generators, Intn, F64, NormF64, Perm, Shuffle; no Zipf, no ExpFloat64, no Source interface |
 | `math/rand/v2` | 1+1 | partial | dice | same generators; no PCG or ChaCha8 types, different method names |

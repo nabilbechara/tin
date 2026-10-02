@@ -8,6 +8,7 @@
 | dice | same algorithms in Go | identical |
 | sift | slices/sort | identical |
 | sift (generic: Sort, SortFunc, SortStableFunc, Insert, Delete, Compact, BinarySearch ...) | slices, cmp (`bench/ref/sift/generic.go`) | identical on 149 lines, including the order of equal elements after SortFunc on 119 inputs of 7 shapes up to 20,000 elements; the port is Go's pdqsort, and changing one shift constant in it breaks 16 lines |
+| bits | math/bits (`bench/ref/bits`, generated with `tests/v2/bits.tin` from one description) | identical on all 37 function hashes: every function at 8, 16, 32 and 64 bits, exhaustive for 8 and 16 bits, about 40,000 values at 32 bits and 20,000 at 64; changing one comparison in `Div64`'s correction loop breaks 2 of them |
 | atlas | maps (`bench/ref/atlas`) | identical; Keys and Values come back in insertion order, so the test sorts them |
 | cairn | hand-written Go equivalents | identical |
 | trail | path/filepath | identical |
