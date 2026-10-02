@@ -60,6 +60,7 @@ const D_TPARAMS = 9;  // generic type: parameter names
 const D_TCONS = 10;
 const D_INSTS = 11;   // generic type: vec of [type args, type]
 const D_METHODS = 12; // generic type: its method templates
+const D_INITS = 14;   // const specification expressions, repeated by a bare grouped spec
 const D_SIZE = 16;
 
 var p_shared;
@@ -105,6 +106,7 @@ const EX_CATCH = 52;   // E catch name { body }
 const ST_FAIL = 53;    // fail X
 const EX_MUTARG = 54;  // mut x: an argument for a mut parameter
 const EX_INTERP = 55;  // "text {x} {y:.2}": parts, values, format specs
+const ST_CONST = 56;   // local constant declarations; field 2 is their declaration vector
 const ST_MULTI = 30;
 const ST_RANGE = 31;
 const ST_SWITCH = 32;
@@ -317,15 +319,15 @@ fn parse(toks) {
             vec_push(prog_fns, parse_fn(1, p_is("fn")));
         } else if p_is("const") {
             p_next();
-            parse_group(1);
+            parse_group(1, prog_consts);
         } else if p_is("var") {
             p_next();
-            parse_group(0);
+            parse_group(0, prog_vars);
         } else if p_peek()[T_KIND] == TK_IDENT && streq(p_peek()[T_TEXT], "shared") {
             p_next();
             p_expect("var");
             p_shared = 1;
-            parse_group(0);
+            parse_group(0, prog_vars);
             p_shared = 0;
         } else if p_is("type") {
             p_next();
@@ -377,9 +379,9 @@ fn parse_import() {
 }
 
 // parse_group reads one const/var declaration or a parenthesized group of them.
-fn parse_group(is_const) {
+fn parse_group(is_const, decls) {
     if !p_is("(") {
-        parse_value_spec(is_const, 0, 0);
+        parse_value_spec(is_const, 0, 0, 0, decls);
         return;
     }
     p_next();
@@ -390,13 +392,9 @@ fn parse_group(is_const) {
         if p_is(";") {
             p_next();
         } else {
-            let d = parse_value_spec(is_const, iota, last_init);
+            let d = parse_value_spec(is_const, iota, last_init, last_type, decls);
             if is_const {
-                // A bare name in a const group repeats the previous expression (with iota).
-                if d[D_INIT] == last_init && last_type {
-                    d[D_TYPE] = last_type;
-                }
-                last_init = d[D_INIT];
+                last_init = d[D_INITS];
                 last_type = d[D_TYPE];
             }
             iota = iota + 1;
@@ -405,7 +403,7 @@ fn parse_group(is_const) {
     p_next();
 }
 
-fn parse_value_spec(is_const, iota, prev_init) {
+fn parse_value_spec(is_const, iota, prev_init, prev_type, decls) {
     let pos = p_peek()[T_POS];
     let names = vec_new();
     vec_push(names, p_expect_ident()[T_TEXT]);
@@ -414,7 +412,7 @@ fn parse_value_spec(is_const, iota, prev_init) {
         vec_push(names, p_expect_ident()[T_TEXT]);
     }
     let ty = 0;
-    if !p_is("=") && !p_is(";") && !p_is(")") {
+    if !p_is("=") && !p_is(";") && !p_is(")") && !p_is("}") {
         ty = parse_type();
     }
     let inits = 0;
@@ -422,25 +420,34 @@ fn parse_value_spec(is_const, iota, prev_init) {
         p_next();
         inits = parse_expr_list();
     }
+    if is_const {
+        if !inits {
+            if ty || !prev_init {
+                p_fail(pos, "missing constant value");
+            }
+            inits = prev_init;
+            ty = prev_type;
+        }
+        if inits[VEC_LEN] != names[VEC_LEN] {
+            p_fail(pos, "constant declaration count mismatch");
+        }
+    }
     let first = 0;
     let i = 0;
     while i < names[VEC_LEN] {
         let d = decl_new(pos, vec_get(names, i));
         d[D_TYPE] = ty;
         d[D_IOTA] = iota;
+        d[D_INITS] = inits;
         if inits && i < inits[VEC_LEN] {
             d[D_INIT] = vec_get(inits, i);
-        } else if is_const && !inits {
-            d[D_INIT] = prev_init;
         }
         if is_const {
             if !d[D_INIT] {
                 p_fail(pos, "missing constant value");
             }
-            vec_push(prog_consts, d);
-        } else {
-            vec_push(prog_vars, d);
         }
+        vec_push(decls, d);
         if !first {
             first = d;
         }
@@ -1009,7 +1016,11 @@ fn parse_stmt() {
         return parse_local_var(pos);
     }
     if p_is("const") {
-        p_fail(pos, "local constants are not supported; declare them at top level");
+        p_next();
+        let c = node_new(ST_CONST, pos);
+        c[2] = vec_new();
+        parse_group(1, c[2]);
+        return c;
     }
     if p_is("if") {
         return parse_if();

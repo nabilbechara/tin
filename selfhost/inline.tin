@@ -223,8 +223,9 @@ fn ia_append_str(e) {
 // ---- small function inlining ----
 //
 // A function whose body is a single `return expr` over its parameters is expanded at
-// its call sites before any code is generated. Arguments that are constants, locals, or
-// pure and used once are substituted; others are evaluated once into temps.
+// its call sites before any code is generated. Arguments that are constants or locals are
+// substituted, and so are pure ones used once when the whole call is pure; others are
+// evaluated once into temps, in order.
 
 var il_fn;
 var il_depth;
@@ -499,7 +500,7 @@ fn il_pure(e) {
         return !streq(e[UN_OP], "&") && il_pure(e[UN_X]);
     }
     if k == EX_BINARY {
-        return il_pure(e[BIN_L]) && il_pure(e[BIN_R]);
+        return !may_panic(e) && il_pure(e[BIN_L]) && il_pure(e[BIN_R]);
     }
     if k == EX_CONV {
         return il_pure(e[CV_X]);
@@ -518,15 +519,24 @@ fn il_expand(e, f) {
     if args[VEC_LEN] != np {
         return;
     }
+    // A substituted argument runs at its use: after the temps and inside the body. A call
+    // in either may write what it reads or run before it traps, so unless the body and
+    // all arguments are pure, only constants and locals are substituted.
+    let pure = il_pure(body);
+    let i = 0;
+    while i < np {
+        pure = pure && il_pure(vec_get(args, i));
+        i = i + 1;
+    }
     let stmts = vec_new();
     let subst = vec_filled(np, 0);
-    let i = 0;
+    i = 0;
     while i < np {
         let a = vec_get(args, i);
         let p = vec_get(f[F_LOCALS], i);
         let ak = a[N_KIND];
         let simple = ak == EX_INT || ak == EX_FLOAT || ak == EX_STR || (ak == EX_IDENT && a[ID_REF] && a[ID_REF][S_KIND] == SYM_LOCAL && !a[ID_REF][S_ADDR]);
-        if simple || (il_pure(a) && il_uses(body, p) == 1) {
+        if simple || (pure && il_uses(body, p) == 1) {
             subst[VEC_DATA][i] = a;
         } else {
             let t = ia_local_in(il_fn, p[S_TYPE]);
