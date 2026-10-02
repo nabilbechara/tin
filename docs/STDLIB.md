@@ -775,17 +775,17 @@ Package websocket is the WebSocket protocol (RFC 6455): Accept upgrades an anvil
 ```go
 func handle(q anvil.Req, w mut anvil.Out) {
 	ws := websocket.Accept(q, mut w) catch _ { return }
-	for {
-		m := ws.Read() catch _ { return }
-		ws.WriteText("echo: {m.Data}") catch _ { return }
-	}
+	ws.Each(echo) catch _ {}
+}
+func echo(ws websocket.Conn, m websocket.Message) ! {
+	try ws.WriteText("echo: {m.Data}")
 }
 ```
 
 - `type Message struct`: Message is one complete message.
 - `type Conn struct`: Conn is a WebSocket connection.
-- `Accept(q anvil.Req, w mut anvil.Out) !Conn`: Accept completes the opening handshake for request q and takes over its connection. A request that is not a WebSocket handshake gets a 400 (426 for another version) in w and fails. The connection closes when the handler returns.
-- `Dial(url str) !Conn`: Dial connects to a ws:// URL ("ws://host:port/path").
+- `Accept(q anvil.Req, w mut anvil.Out) !Conn`: Accept completes the opening handshake for request q and takes over its connection. A request that is not a WebSocket handshake gets a 400 (426 for another version) in w and fails. The connection and its buffers close when the handler returns.
+- `Dial(url str) !Conn`: Dial connects to a ws:// URL ("ws://host:port/path"). Close it when finished; inside a request task, it is also closed automatically when its scope ends.
 - `(c Conn) SetTimeout(ns i64)`: SetTimeout limits every later read and write to ns nanoseconds (0: no limit).
 - `(c Conn) SetMaxMessage(n i64)`: SetMaxMessage sets the largest message Read accepts (default 16 MiB); a bigger one closes the connection with 1009.
 - `(c Conn) WriteText(s str) !`: WriteText sends s as a text message.
@@ -794,4 +794,5 @@ func handle(q anvil.Req, w mut anvil.Out) {
 - `(c Conn) CloseWith(code i64, reason str) !`: CloseWith sends a close frame with code and reason; the connection then only drains.
 - `(c Conn) Close()`: Close sends a normal close (1000) and, for a client, closes the connection.
 - `IsClosed(err fault) bool`: IsClosed reports whether err is the normal end of a connection: the peer closed it.
-- `(c Conn) Read() !Message`: Read returns the next message; it answers pings and joins fragments on the way. When the peer closes, it answers the close and fails with "websocket: closed (code)".
+- `(c Conn) Read() !Message`: Read returns the next message; it answers pings and joins fragments on the way. When the peer closes, it answers the close and fails with "websocket: closed (code)". The returned message lives in the caller's pool. For a long-lived stream, use Each to reset message allocations after every callback without invalidating the Conn.
+- `(c Conn) Each(h func(Conn, Message) !) !`: Each reads messages and calls h until a read or callback fails. Every callback has a reusable message pool: use keep() to retain its data after the callback returns. The Conn and all objects allocated before Each remain valid. Callbacks may wait. A closed peer returns the same IsClosed fault as Read; callback faults propagate.

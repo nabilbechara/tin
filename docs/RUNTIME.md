@@ -217,7 +217,9 @@ its own request pool. `rt_task_run` switches into a task from the core's stack;
 `rt_task_swap`, hand-assembled per CPU, saves and loads only what a call preserves (arm64:
 x19–x27, x29, x30, sp, d8–d15; x86-64: rbx, rbp, r12–r14, rsp and the return address), about
 ten nanoseconds. x28 / r15, the core context, is the same on every task of a core, and the
-core's pool words (bump, end, base, mark, extra) are swapped in and out with the task.
+core's pool words (bump, end, base, mark, extra) and formatting frame stack are swapped
+in and out with the task. Formatting arguments may wait without sharing frames with
+another task. Resource cleanup callbacks run before the owning pool is reset.
 
 - A handler that never waits finishes inside `rt_task_run`: two switches and nothing else,
   so the fast path keeps its speed (measured: 308–310k req/s on one core, as before).
@@ -244,10 +246,14 @@ core's pool words (bump, end, base, mark, extra) are swapped in and out with the
   `rt_task_wait` on `EAGAIN`. `Conn.SetTimeout` bounds each wait; past it the call fails
   with `wire: read timed out` (or connect/write), past the deadline with `deadline exceeded`.
 - Work with no non-blocking form (DNS `getaddrinfo`, file reads and writes in `quarry`)
-  goes to four shared helper threads: `rt_helper_run(f, job)` queues the job on a pipe,
-  the task yields, the helper runs `f(job)` and writes the job pointer to the core's done
-  pipe, and the core resumes the task. Results travel in malloc'd memory in the job, never
-  in the helper's pool. Outside a task `rt_helper_run` just calls `f`.
+  goes to four shared helper threads. `rt_helper_run(f, job, drop)` queues a heap-owned
+  job in a bounded queue (4096 outstanding jobs process-wide), signals a non-blocking
+  wake pipe and parks within the request deadline. A full queue fails immediately.
+  A helper runs `f(job)` and writes the completion to the owning core's done pipe.
+  Inputs and results live outside request pools, so an expired request may return and
+  reuse its task safely. A late completion calls `drop(job)` and never resumes the old
+  task. Already-running system calls can still finish after the caller's deadline;
+  their results are discarded. Outside a task the helper runs synchronously.
 - Tasks can wait on each other: `rt_task_park(timeout)` waits until another task calls
   `rt_task_wake(t)`; woken tasks go on a per-core ready queue that the loop drains on its
   next turn (it does not block while the queue has tasks). `rt_task_defer()` puts the
@@ -276,10 +282,22 @@ core's pool words (bump, end, base, mark, extra) are swapped in and out with the
   through `finish_request`, which then closes the descriptor instead of answering.
   Hijacked connections do not count toward the 4096 waiting requests per core.
 - `websocket.Accept` checks the handshake, hijacks and writes the 101 itself. The
-  connection's buffer lives in malloc'd memory; a `Read` that needs bytes waits on the fd,
-  so an idle WebSocket costs a parked task (its stack and pool) and no thread.
-- Tasks on one core may write to the same `Conn` (a broadcast): a frame is written whole
-  before the next writer, who waits its turn with `rt_task_defer`.
+  connection's state belongs to its caller's pool; heap-owned I/O buffers are released
+  by `Close` or automatically before the owning task/scope resets. Repeated `Close`
+  is safe. An idle connection parks its request task and occupies no thread.
+- Tasks on one core may write to the same `Conn`: a frame is written whole before
+  the next writer, who waits its turn with `rt_task_defer`.
+- `Conn.Each(h)` gives every message callback a reusable pool, reset after the callback
+  returns; use `keep()` to retain message data. Objects allocated before `Each`,
+  including the Conn, remain valid, and callbacks may wait. Read/callback faults are
+  copied into the caller's pool before the scope is released. The echo example uses
+  `Each`, so memory use stays bounded for a long-lived stream.
+- `Read` continues to return data in the caller's pool, preserving earlier messages
+  across later reads. Its fragment accumulator is temporary heap memory, freed on
+  every return, and ping/pong payloads are processed in place without pool allocations.
+  Client masking keys are generated directly into the frame header. `Read` users who
+  retain all messages must manage their pool lifetime explicitly; `Each` is the stream
+  API that supplies a safe per-message lifetime.
 
 ### Pooled clients: mysql (v0.4)
 

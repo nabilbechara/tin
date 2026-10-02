@@ -1,0 +1,100 @@
+package main
+
+import "anvil"
+import "quarry"
+import "say"
+import "tide"
+import "websocket"
+
+var saved str
+
+func delayed(s str, ms i64) str {
+	tide.Wait(ms * tide.Millisecond) catch _ { return "timeout" }
+	return s
+}
+
+func echo(ws websocket.Conn, m websocket.Message) ! {
+	websocket.ProbeScopeResource()
+	if websocket.ProbePoolUsed() > len(m.Data)*2+65536 {
+		panic("message allocations accumulated")
+	}
+	if m.Text && m.Data == "fault" {
+		fail "callback stopped"
+	}
+	if m.Text && m.Data == "keep" {
+		saved = keep(m.Data)
+	}
+	if m.Text && m.Data == "wait" {
+		try tide.Wait(5 * tide.Millisecond)
+	}
+	if m.Text {
+		try ws.WriteText(m.Data)
+	} else {
+		try ws.WriteBinary([]u8(m.Data))
+	}
+}
+
+func handle(q anvil.Req, w mut anvil.Out) {
+	if q.Path == "/a" {
+		w.Text(say.Fmt("A:%s", delayed(q.Path, 100)))
+		return
+	}
+	if q.Path == "/b" {
+		w.Text(say.Fmt("B:%s", delayed(q.Path, 300)))
+		return
+	}
+	if q.Path == "/file" || q.Path == "/write" {
+		path := quarry.Getenv("REVIEW_DIR") + "/" + q.Param("name")
+		if q.Path == "/file" {
+			data := quarry.ReadFile(path) catch e {
+				w.Status(504)
+				w.Text(say.Str(e))
+				return
+			}
+			w.Text(data)
+		} else {
+			data := q.Param("data")
+			quarry.WriteFile(path, "owned:{data}") catch e {
+				w.Status(504)
+				w.Text(say.Str(e))
+				return
+			}
+			w.Text("written")
+		}
+		return
+	}
+	if q.Path == "/ws" || q.Path == "/raw" || q.Path == "/close" {
+		ws := websocket.ProbeAccept(q, mut w) catch _ { return }
+		if q.Path == "/close" {
+			ws.Close()
+			ws.Close()
+			_, e := ws.Read()
+			if e == nil || !websocket.IsClosed(e) {
+				panic("Read after Close did not report closure")
+			}
+			return
+		}
+		if q.Path == "/raw" {
+			first := ws.Read() catch _ { return }
+			second := ws.Read() catch _ { return }
+			ws.WriteText("{first.Data}|{second.Data}") catch _ {}
+			return
+		}
+		before := "outer:" + q.Path
+		err := ws.Each(echo)
+		if err != nil && !websocket.IsClosed(err) {
+			ws.WriteText("{before}|{err}") catch _ {}
+		}
+		return
+	}
+	if q.Path == "/stats" {
+		w.Text("{websocket.ProbeClosed()}|{websocket.ProbeBadCleanup()}|{rt_test_helpers()}|{saved}|{websocket.ProbeScoped()}")
+		return
+	}
+	w.Text("healthy")
+}
+
+func main() {
+	err := anvil.Serve(":0", handle)
+	say.Line(err)
+}

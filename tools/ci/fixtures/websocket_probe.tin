@@ -1,0 +1,52 @@
+// Appended to a temporary copy of lib/websocket.tin by lifetime_check.py.
+// Observe automatic resource cleanup after the handler, before its pool is wiped.
+var probeClosed i64
+var probeBadCleanup i64
+var probeScoped i64
+
+func probe_after(slot i64) {
+	if slot[0] != 0 {
+		if slot[1] != 0 {
+			probeScoped++
+		} else {
+			probeClosed++
+		}
+		if slot[0][sBuf] != 0 {
+			probeBadCleanup++
+		}
+	}
+	free(slot)
+}
+
+func ProbeAccept(q anvil.Req, w mut anvil.Out) !Conn {
+	slot := calloc(2, 8)
+	rt_task_cleanup(probe_after, slot)
+	c := try Accept(q, mut w)
+	slot[0] = c.st
+	return c
+}
+
+func ProbeClosed() i64 {
+	return probeClosed
+}
+
+func ProbeBadCleanup() i64 {
+	return probeBadCleanup
+}
+
+func ProbePoolUsed() i64 {
+	return rt_pool_used()
+}
+
+// A callback-owned connection state must be cleaned before Each resets its pool,
+// rather than leaving a dangling cleanup argument for task exit.
+func ProbeScopeResource() {
+	slot := calloc(2, 8)
+	slot[1] = 1
+	rt_task_cleanup(probe_after, slot)
+	slot[0] = new_state(-1, false)
+}
+
+func ProbeScoped() i64 {
+	return probeScoped
+}

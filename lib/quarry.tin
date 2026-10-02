@@ -171,8 +171,8 @@ func ReadFile(path str) !str {
 	}
 	// Inside a request task the read runs on a helper thread while the core serves others.
 	job := calloc(5, 8)
-	job[0] = cast(i64, path)
-	rt_helper_run(readJob, job)
+	job[0] = rt_heap_str(path)
+	try rt_helper_run(readJob, job, jobDrop)
 	return try jobResult(job)
 }
 
@@ -196,20 +196,34 @@ func jobFault(job i64, err fault) {
 	job[4] = len(m)
 }
 
-// jobResult turns a helper job's result into a str or a fault and frees the job.
+// Heap-owned inputs stay alive after a caller's deadline. The completion path uses
+// these same disposers for late results, which never enter the expired request pool.
+func jobDrop(job i64) {
+	free(job[0])
+	free(job[1])
+	free(job[3])
+	free(job)
+}
+
+func writeDrop(job i64) {
+	free(job[5])
+	jobDrop(job)
+}
+
+// jobResult copies the result into the caller's pool and releases the heap-owned job.
 func jobResult(job i64) !str {
-	if job[3] != 0 {
-		m := rt_str_from_raw(job[3], job[4])
-		free(job[3])
-		free(job)
+	m := ""
+	s := ""
+	bad := job[3] != 0
+	if bad {
+		m = rt_str_from_raw(job[3], job[4])
+	} else if job[1] != 0 {
+		s = rt_str_from_raw(job[1], job[2])
+	}
+	jobDrop(job)
+	if bad {
 		fail m
 	}
-	s := ""
-	if job[1] != 0 {
-		s = rt_str_from_raw(job[1], job[2])
-		free(job[1])
-	}
-	free(job)
 	return s
 }
 
@@ -283,10 +297,11 @@ func writeVia(path str, data str, flags i64) ! {
 		return try writeAll(path, data, flags)
 	}
 	job := calloc(7, 8)
-	job[0] = cast(i64, path)
-	job[5] = cast(i64, data)
+	job[0] = rt_heap_str(path)
+	job[5] = rt_heap_str(data)
 	job[6] = flags
-	rt_helper_run(writeJob, job)
+	try rt_helper_run(writeJob, job, writeDrop)
+	free(job[5])
 	_ = try jobResult(job)
 }
 

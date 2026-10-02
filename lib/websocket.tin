@@ -5,10 +5,10 @@
 //
 //	func handle(q anvil.Req, w mut anvil.Out) {
 //		ws := websocket.Accept(q, mut w) catch _ { return }
-//		for {
-//			m := ws.Read() catch _ { return }
-//			ws.WriteText("echo: {m.Data}") catch _ { return }
-//		}
+//		ws.Each(echo) catch _ {}
+//	}
+//	func echo(ws websocket.Conn, m websocket.Message) ! {
+//		try ws.WriteText("echo: {m.Data}")
 //	}
 package websocket
 
@@ -34,7 +34,8 @@ type Conn struct {
 	st   i64
 }
 
-// The connection's state, in malloc'd memory: it outlives the calls that use it.
+// The state lives in the same pool as its Conn. Its I/O buffer is heap-owned and
+// released on Close, or automatically before an owning request/scope ends.
 const sFd = 0
 const sClient = 1  // we are the client: our frames are masked, the server's are not
 const sBuf = 2     // bytes read and not yet used, from sS to sE
@@ -58,12 +59,13 @@ const opPing = 9
 const opPong = 10
 
 func new_state(fd i64, client bool) i64 {
-	st := calloc(stWords, 8)
+	st := rt_alloc(stWords * 8)
 	st[sFd] = fd
 	st[sClient] = i64(client)
 	st[sCap] = 16384
 	st[sBuf] = malloc(st[sCap])
 	st[sMax] = 16 << 20
+	rt_task_cleanup(release_state, st)
 	return st
 }
 
@@ -82,7 +84,7 @@ func has_token(v str, tok str) bool {
 
 // Accept completes the opening handshake for request q and takes over its connection. A
 // request that is not a WebSocket handshake gets a 400 (426 for another version) in w and
-// fails. The connection closes when the handler returns.
+// fails. The connection and its buffers close when the handler returns.
 func Accept(q anvil.Req, w mut anvil.Out) !Conn {
 	key := q.Header("Sec-WebSocket-Key")
 	if q.Method != "GET" || !has_token(q.Header("Upgrade"), "websocket") || !has_token(q.Header("Connection"), "upgrade") || key == "" {
@@ -113,7 +115,8 @@ func Accept(q anvil.Req, w mut anvil.Out) !Conn {
 	return c
 }
 
-// Dial connects to a ws:// URL ("ws://host:port/path").
+// Dial connects to a ws:// URL ("ws://host:port/path"). Close it when finished;
+// inside a request task, it is also closed automatically when its scope ends.
 func Dial(url str) !Conn {
 	if !twine.HasPrefix(url, "ws://") {
 		fail "websocket: only ws:// URLs (no TLS)"
@@ -192,7 +195,10 @@ func find_head_end(st i64) i64 {
 }
 
 func (c Conn) release() {
-	st := c.st
+	release_state(c.st)
+}
+
+func release_state(st i64) {
 	if st[sOwnFd] != 0 && st[sFd] >= 0 {
 		close(st[sFd])
 		st[sFd] = -1
@@ -302,6 +308,9 @@ func (c Conn) fill() ! {
 // need makes sure n bytes are buffered.
 func (c Conn) need(n i64) ! {
 	st := c.st
+	if st[sBuf] == 0 {
+		fail "websocket: closed (the connection is closed)"
+	}
 	if st[sS]+n > st[sCap] {
 		memmove(st[sBuf], st[sBuf]+st[sS], st[sE]-st[sS])
 		st[sE] -= st[sS]
@@ -350,14 +359,12 @@ func (c Conn) frame(op i64, p i64, n i64) ! {
 		return try c.write_raw(p, n)
 	}
 	// A client masks its payload with a fresh key.
-	key := seal.RandomBytes(4)
-	for i := 0; i < 4; i++ {
-		store8(hdr+h+i, i64(key[i]))
-	}
+	rt_random(hdr+h, 4)
+	key := hdr + h
 	h += 4
 	body := malloc(n + 1)
 	for i := 0; i < n; i++ {
-		store8(body+i, i64(load8(p+i))^i64(key[i%4]))
+		store8(body+i, i64(load8(p+i))^i64(load8(key+i%4)))
 	}
 	err := c.write_raw(hdr, h)
 	free(hdr)
@@ -449,13 +456,19 @@ func (c Conn) protocol_error(code i64, msg str) ! {
 }
 
 // Read returns the next message; it answers pings and joins fragments on the way. When the
-// peer closes, it answers the close and fails with "websocket: closed (code)".
+// peer closes, it answers the close and fails with "websocket: closed (code)". The
+// returned message lives in the caller's pool. For a long-lived stream, use Each
+// to reset message allocations after every callback without invalidating the Conn.
 func (c Conn) Read() !Message {
 	if !c.open {
 		fail "websocket: the connection is not open"
 	}
 	st := c.st
-	data := []u8{}
+	if st[sBuf] == 0 {
+		fail "websocket: closed (the connection is closed)"
+	}
+	data := calloc(3, 8) // [heap buffer, length, capacity], including all fragments
+	defer free_message(data)
 	text := false
 	started := false
 	for {
@@ -499,19 +512,16 @@ func (c Conn) Read() !Message {
 		if control && (n > 125 || !fin) {
 			fail c.protocol_error(1002, "bad control frame")
 		}
-		if !control && len(data)+n > st[sMax] {
+		if !control && (st[sMax] < 0 || data[1] > st[sMax] || n > st[sMax]-data[1]) {
 			fail c.protocol_error(1009, "message too big")
 		}
 		try c.need(h + n)
 		p = st[sBuf] + st[sS]
-		payload := make([]u8, n)
-		pp := cast(i64, payload)[2]
-		for i := 0; i < n; i++ {
-			v := i64(load8(p + h + i))
-			if masked {
-				v ^= i64(load8(p + mk + i%4))
+		pp := p + h
+		if masked {
+			for i := 0; i < n; i++ {
+				store8(pp+i, i64(load8(pp+i))^i64(load8(p+mk+i%4)))
 			}
-			store8(pp+i, v)
 		}
 		st[sS] += h + n
 		if op == opPing {
@@ -526,9 +536,9 @@ func (c Conn) Read() !Message {
 		if op == opClose {
 			code := 1005
 			if n >= 2 {
-				code = i64(payload[0])<<8 | i64(payload[1])
+				code = i64(load8(pp))<<8 | i64(load8(pp+1))
 			}
-			if n == 1 || (n > 2 && !glyph.Valid(str(payload[2:]))) {
+			if n == 1 || (n > 2 && !glyph.Valid(rt_str_from_raw(pp+2, n-2))) {
 				fail c.protocol_error(1002, "bad close frame")
 			}
 			if st[sClosed] == 0 {
@@ -553,15 +563,52 @@ func (c Conn) Read() !Message {
 		} else {
 			fail c.protocol_error(1002, "unknown opcode")
 		}
-		for _, x := range payload {
-			data = append(data, x)
+		if data[1]+n > data[2] {
+			cap := data[2]*2 + n
+			if cap > st[sMax] {
+				cap = st[sMax]
+			}
+			data[0] = realloc(data[0], cap)
+			data[2] = cap
 		}
+		if n > 0 {
+			memcpy(data[0]+data[1], pp, n)
+		}
+		data[1] += n
 		if fin {
-			s := str(data)
+			s := rt_str_from_raw(data[0], data[1])
 			if text && !glyph.Valid(s) {
 				fail c.protocol_error(1007, "text message is not UTF-8")
 			}
 			return Message{Text: text, Data: s}
 		}
+	}
+}
+
+func free_message(data i64) {
+	free(data[0])
+	free(data)
+}
+
+// Each reads messages and calls h until a read or callback fails. Every callback has
+// a reusable message pool: use keep() to retain its data after the callback returns.
+// The Conn and all objects allocated before Each remain valid. Callbacks may wait.
+// A closed peer returns the same IsClosed fault as Read; callback faults propagate.
+func (c Conn) Each(h func(Conn, Message) !) ! {
+	scope := rt_pool_enter()
+	for {
+		m, err := c.Read()
+		if err == nil {
+			err = h(c, m)
+		}
+		if err != nil {
+			// The fault belongs to the message pool too: copy it across the scope boundary.
+			msg := rt_heap_str(say.Str(err))
+			rt_pool_leave(scope)
+			out := rt_str_from_raw(msg+8, msg[0])
+			free(msg)
+			fail out
+		}
+		rt_pool_scope_reset(scope)
 	}
 }

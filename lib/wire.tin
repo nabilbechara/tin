@@ -122,23 +122,32 @@ func resolve(host str, port i64, sa i64) ! {
 	free(octets)
 	// getaddrinfo blocks: inside a request task it runs on a helper thread.
 	job := calloc(3, 8)
-	job[0] = cast(i64, host) + 8
-	job[1] = sa
-	rt_helper_run(dns_job, job)
+	job[0] = rt_heap_str(host)
+	job[1] = calloc(1, 16)
+	try rt_helper_run(dns_job, job, dns_drop)
 	ok := job[2] != 0
-	free(job)
+	if ok {
+		memcpy(sa+4, job[1]+4, 4)
+	}
+	dns_drop(job)
 	if !ok {
 		fail say.Fault("wire: cannot resolve %q", host)
 	}
 }
 
-// dns_job resolves the C string job[0] into the sockaddr job[1]; job[2] is 1 on success.
+func dns_drop(job i64) {
+	free(job[0])
+	free(job[1])
+	free(job)
+}
+
+// dns_job resolves heap-owned inputs into its own sockaddr; job[2] is 1 on success.
 func dns_job(job i64) {
 	hints := calloc(1, 48)
 	__st(hints+4, 2, 2)
 	__st(hints+8, 1, 2)
 	res := calloc(1, 8)
-	rc := i64(i32(getaddrinfo(job[0], 0, hints, res)))
+	rc := i64(i32(getaddrinfo(job[0]+8, 0, hints, res)))
 	free(hints)
 	if rc != 0 || res[0] == 0 {
 		free(res)
