@@ -322,10 +322,14 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   8 bytes at a time with SWAR checks for `"`, `\` and control bytes. Integers are
   written digit by digit, floats via `shortest_into` straight into the buffer.
 - `argo.Get(text, mut v)` compiles to a generated decoder `argo$dN(p, x)` over a `Parser`
-  (text, offset, first error). The readers (`robj`, `rarr`, `rkey`, `rstr`, `rint`,
+  (text, offset, depth, first error). The readers (`robj`, `rarr`, `rkey`, `rstr`, `rint`,
   `rintr`, `ruint`, `rfloat`, `rbool`, `rnull`, `rskip`, `rmore`) record the first
   error and then do nothing, so decoders test the error only at loop boundaries.
   Strings without escapes are returned as substrings without copying.
+- `rskip` and the decoders of recursive types take a stack frame per nesting level
+  (32 bytes for `rskip`, 80 for a small struct, 240 for one of 32 fields), so `robj` and
+  `rarr` fault once 512 arrays and objects are open: even 240-byte frames then fit in
+  half of a 256 KiB task stack.
 
 ## 11. Startup sequence of a strict program
 
