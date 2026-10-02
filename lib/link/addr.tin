@@ -1,0 +1,166 @@
+package link
+
+import "mint"
+import "twine"
+
+// addrFault is the message of Go's netip.ParseAddr faults: ParseAddr("in"): msg (at "at").
+func addrFault(in str, msg str, at str) str {
+	if at != "" {
+		return "ParseAddr(" + mint.Quote(in) + "): " + msg + " (at " + mint.Quote(at) + ")"
+	}
+	return "ParseAddr(" + mint.Quote(in) + "): " + msg
+}
+
+// checkAddr validates s as an IP address the way Go's netip.ParseAddr does, for the host of a URL
+// in brackets: it reports whether s is an IPv4 address and, when it is no address at all, the
+// fault message ("" when it is one).
+func checkAddr(s str) (bool, str) {
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '.':
+			return true, checkIPv4Fields(s, 0, len(s))
+		case ':':
+			return false, checkIPv6(s)
+		case '%':
+			return false, addrFault(s, "missing IPv6 address", "")
+		}
+	}
+	return false, addrFault(s, "unable to parse IP", "")
+}
+
+// checkIPv4Fields validates in[off:end] as the four decimal fields of an IPv4 address.
+func checkIPv4Fields(in str, off i64, end i64) str {
+	val := 0
+	pos := 0
+	digLen := 0
+	s := in[off:end]
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= '0' && c <= '9' {
+			if digLen == 1 && val == 0 {
+				return addrFault(in, "IPv4 field has octet with leading zero", "")
+			}
+			val = val*10 + i64(c) - '0'
+			digLen++
+			if val > 255 {
+				return addrFault(in, "IPv4 field has value >255", "")
+			}
+		} else if c == '.' {
+			if i == 0 || i == len(s)-1 || s[i-1] == '.' {
+				return addrFault(in, "IPv4 field must have at least one digit", s[i:])
+			}
+			if pos == 3 {
+				return addrFault(in, "IPv4 address too long", "")
+			}
+			pos++
+			val = 0
+			digLen = 0
+		} else {
+			return addrFault(in, "unexpected character", s[i:])
+		}
+	}
+	if pos < 3 {
+		return addrFault(in, "IPv4 address too short", "")
+	}
+	return ""
+}
+
+// checkIPv6 validates in as an IPv6 address with an optional %zone, returning the fault message or "".
+func checkIPv6(in str) str {
+	s := in
+	zone := ""
+	i := twine.IndexByte(s, '%')
+	if i != -1 {
+		zone = s[i+1:]
+		s = s[:i]
+		if zone == "" {
+			return addrFault(in, "zone must be a non-empty string", "")
+		}
+	}
+	ellipsis := -1 // the group index where :: stands
+	if len(s) >= 2 && s[0] == ':' && s[1] == ':' {
+		ellipsis = 0
+		s = s[2:]
+		if len(s) == 0 {
+			return ""
+		}
+	}
+	i = 0 // bytes parsed so far
+	for i < 16 {
+		off := 0
+		var acc u32 = 0
+		for ; off < len(s); off++ {
+			c := s[off]
+			if c >= '0' && c <= '9' {
+				acc = acc<<4 + u32(c-'0')
+			} else if c >= 'a' && c <= 'f' {
+				acc = acc<<4 + u32(c-'a'+10)
+			} else if c >= 'A' && c <= 'F' {
+				acc = acc<<4 + u32(c-'A'+10)
+			} else {
+				break
+			}
+			if off > 3 {
+				return addrFault(in, "each group must have 4 or less digits", s)
+			}
+			if acc > 65535 {
+				return addrFault(in, "IPv6 field has value >=2^16", s)
+			}
+		}
+		if off == 0 {
+			return addrFault(in, "each colon-separated field must have at least one digit", s)
+		}
+		// A dot after the digits starts an embedded IPv4 address in the last two groups.
+		if off < len(s) && s[off] == '.' {
+			if ellipsis < 0 && i != 12 {
+				return addrFault(in, "embedded IPv4 address must replace the final 2 fields of the address", s)
+			}
+			if i+4 > 16 {
+				return addrFault(in, "too many hex fields to fit an embedded IPv4 at the end of the address", s)
+			}
+			end := len(in)
+			if len(zone) > 0 {
+				end -= len(zone) + 1
+			}
+			msg := checkIPv4Fields(in, end-len(s), end)
+			if msg != "" {
+				return msg
+			}
+			s = ""
+			i += 4
+			break
+		}
+		i += 2
+		s = s[off:]
+		if len(s) == 0 {
+			break
+		}
+		if s[0] != ':' {
+			return addrFault(in, "unexpected character, want colon", s)
+		} else if len(s) == 1 {
+			return addrFault(in, "colon must be followed by more characters", s)
+		}
+		s = s[1:]
+		if s[0] == ':' {
+			if ellipsis >= 0 {
+				return addrFault(in, "multiple :: in address", s)
+			}
+			ellipsis = i
+			s = s[1:]
+			if len(s) == 0 {
+				break
+			}
+		}
+	}
+	if len(s) != 0 {
+		return addrFault(in, "trailing garbage after address", s)
+	}
+	if i < 16 {
+		if ellipsis < 0 {
+			return addrFault(in, "address string too short", "")
+		}
+	} else if ellipsis >= 0 {
+		return addrFault(in, "the :: must expand to at least one field of zeros", "")
+	}
+	return ""
+}

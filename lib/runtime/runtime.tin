@@ -1715,28 +1715,117 @@ func rt_fmt_b(b bool) {
 	}
 }
 
+// fmt_quote_hex writes v as exactly n lower-case hex digits.
+func fmt_quote_hex(f i64, v i64, n i64) {
+	for k := (n - 1) * 4; k >= 0; k -= 4 {
+		fb_byte(f, i64(load8(cast(i64, "0123456789abcdef")+8+(v>>k&15))))
+	}
+}
+
+// rt_is_print approximates Go's unicode.IsPrint: ASCII and Latin-1 exactly, elsewhere only known
+// format, space, private-use and noncharacter ranges are excluded (mint.Quote has the same table).
+func rt_is_print(r i64) bool {
+	if r < 0x20 {
+		return false
+	}
+	if r < 0x7f {
+		return true
+	}
+	if r < 0xa1 {
+		return false
+	}
+	if r < 0x100 {
+		return r != 0xad
+	}
+	if r >= 0xd800 && r <= 0xf8ff {
+		return false
+	}
+	if r >= 0xf0000 || r&0xfffe == 0xfffe {
+		return false
+	}
+	if r >= 0x2000 && r <= 0x206f {
+		return r >= 0x2010 && r <= 0x2027 || r >= 0x2030 && r <= 0x205e
+	}
+	if r >= 0xfdd0 && r <= 0xfdef || r >= 0xfff9 && r <= 0xfffb || r == 0xfeff {
+		return false
+	}
+	if r == 0x1680 || r == 0x180e || r == 0x3000 || r == 0x061c || r == 0x06dd || r == 0x070f || r == 0x08e2 {
+		return false
+	}
+	if r >= 0x0600 && r <= 0x0605 {
+		return false
+	}
+	if r >= 0xe0000 && r <= 0xe007f {
+		return false
+	}
+	if r == 0x110bd || r == 0x110cd || r >= 0x13430 && r <= 0x1343f || r >= 0x1bca0 && r <= 0x1bca3 || r >= 0x1d173 && r <= 0x1d17a {
+		return false
+	}
+	return true
+}
+
+// fmt_quote_rune writes the escape of one valid rune that is not printable, or is the quote or a
+// backslash, in Go's quoted form.
+func fmt_quote_rune(f i64, r i64) {
+	if r == '"' || r == '\\' {
+		fb_byte(f, '\\')
+		fb_byte(f, r)
+	} else if r == 7 {
+		fb_str(f, "\\a")
+	} else if r == 8 {
+		fb_str(f, "\\b")
+	} else if r == 12 {
+		fb_str(f, "\\f")
+	} else if r == '\n' {
+		fb_str(f, "\\n")
+	} else if r == '\r' {
+		fb_str(f, "\\r")
+	} else if r == '\t' {
+		fb_str(f, "\\t")
+	} else if r == 11 {
+		fb_str(f, "\\v")
+	} else if r < ' ' || r == 0x7f {
+		fb_str(f, "\\x")
+		fmt_quote_hex(f, r, 2)
+	} else if r < 0x10000 {
+		fb_str(f, "\\u")
+		fmt_quote_hex(f, r, 4)
+	} else {
+		fb_str(f, "\\U")
+		fmt_quote_hex(f, r, 8)
+	}
+}
+
+// fmt_quote writes s as a Go double-quoted string: invalid UTF-8 bytes become \xHH and unprintable
+// runes \u escapes, as strconv.Quote does.
 func fmt_quote(f i64, s str) {
 	fb_byte(f, '"')
 	n := len(s)
 	p := cast(i64, s) + 8
-	for i := 0; i < n; i++ {
+	i := 0
+	for i < n {
 		c := i64(load8(p + i))
-		if c == '"' || c == '\\' {
-			fb_byte(f, '\\')
-			fb_byte(f, c)
-		} else if c == '\n' {
-			fb_str(f, "\\n")
-		} else if c == '\t' {
-			fb_str(f, "\\t")
-		} else if c == '\r' {
-			fb_str(f, "\\r")
-		} else if c < 32 || c == 127 {
-			fb_str(f, "\\x")
-			fb_byte(f, i64(load8(cast(i64, "0123456789abcdef")+8+(c>>4))))
-			fb_byte(f, i64(load8(cast(i64, "0123456789abcdef")+8+(c&15))))
-		} else {
-			fb_byte(f, c)
+		if c < 0x80 {
+			i++
+			if c >= 32 && c < 127 && c != '"' && c != '\\' {
+				fb_byte(f, c)
+			} else {
+				fmt_quote_rune(f, c)
+			}
+			continue
 		}
+		d := rt_utf8(s, i)
+		r := d & 0xffffffff
+		w := d >> 32
+		if w == 1 && r == 0xfffd {
+			fb_str(f, "\\x")
+			fmt_quote_hex(f, c, 2)
+		} else if rt_is_print(r) {
+			fb_raw(f, p+i, w)
+		} else {
+			fmt_quote_rune(f, r)
+		}
+		i += w
 	}
 	fb_byte(f, '"')
 }

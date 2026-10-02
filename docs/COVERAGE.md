@@ -12,8 +12,8 @@ The inventory is the 176 packages `go list std` reports for Go 1.26 (without `in
 | design | Go's shape needs something Tin deliberately lacks; the replacement is named or still to be designed |
 | n/a | specific to Go's toolchain or runtime, with no counterpart to build |
 
-**Standard library, 176 packages:** 2 done, 42 partial, 8 design, 100 missing, 24 n/a.
-**Of the 87 packages koussa imports:** 2 done, 39 partial, 7 design, 39 missing, 0 n/a.
+**Standard library, 176 packages:** 2 done, 44 partial, 8 design, 98 missing, 24 n/a.
+**Of the 87 packages koussa imports:** 2 done, 40 partial, 7 design, 38 missing, 0 n/a.
 
 ## The language
 
@@ -187,12 +187,12 @@ Ordered by import path, as `go list std` prints them.
 | `net/http/httputil` | 5+0 | missing |  | ReverseProxy, DumpRequest |
 | `net/http/pprof` | 1+0 | missing |  | profiling endpoints; part of the performance goal |
 | `net/mail` | 6+0 | missing |  |  |
-| `net/netip` |  | missing |  |  |
+| `net/netip` |  | partial | link | only the check that a bracketed URL host is an IPv6 address, with Go's fault messages (private to link); no Addr, Prefix or AddrPort types |
 | `net/rpc` |  | missing |  | low priority |
 | `net/rpc/jsonrpc` |  | missing |  | low priority |
 | `net/smtp` |  | missing |  |  |
 | `net/textproto` |  | missing |  |  |
-| `net/url` | 103+20 | missing |  | Parse, Query, Values, PathEscape, QueryEscape: anvil decodes query parameters but there is no URL package |
+| `net/url` | 103+20 | partial | link | Parse, ParseRequestURI, URL (String, EscapedPath, EscapedFragment, Hostname, Port, RequestURI, Redacted, ResolveReference, Parse, JoinPath), Userinfo, Values (Get, Set, Add, Del, Has, Encode), ParseQuery, Query/Path Escape and Unescape, JoinPath, with Go's fault messages; User is an optional, Values is a struct over a map (methods need a struct), URL.Clone replaces copying by assignment; no *url.Error type (a fault carries its message only, until fault chains, #142), no MarshalBinary, AppendBinary or UnmarshalBinary |
 | `os` | 24+60 | partial | quarry | Args, environment, ReadFile, WriteFile, AppendFile, Mkdir, Remove, Rename, ReadDir, Getwd, Exit, Hostname, Pid; files are opened through flume (buffered) and there is no os.File type with Seek; no Stat and FileInfo, no Chmod, symlinks or pipes |
 | `os/exec` | 1+3 | missing |  |  |
 | `os/signal` | 1+0 | missing |  | anvil handles SIGTERM and SIGINT for graceful shutdown internally |
@@ -252,7 +252,7 @@ The order comes from two things: what other work depends on, and what services i
 5. Atomics for cross-core counters; no mutexes.
 6. Compile-time type information and attributes in place of `reflect` and struct tags, extending what `argo` does for JSON.
 
-**High demand:** `time` (zones, layouts, timers), `net/url`, `regexp`, the rest of `encoding/json`, `strconv`, `strings`, `slices`, `maps`, `sort`, `bytes`, `os` file handles, `net/http` client and server completeness, `net/http/httptest`, `encoding/xml`, `crypto/tls` (#124), `database/sql`'s common shape, `image`, `math/big`, `compress/gzip`, `mime/multipart`.
+**High demand:** `time` (zones, layouts, timers), `regexp`, the rest of `encoding/json`, `strconv`, `strings`, `slices`, `maps`, `sort`, `bytes`, `os` file handles, `net/http` client and server completeness, `net/http/httptest`, `encoding/xml`, `crypto/tls` (#124), `database/sql`'s common shape, `image`, `math/big`, `compress/gzip`, `mime/multipart`.
 
 **Performance tooling:** `runtime/pprof`, `net/http/pprof`, `runtime/metrics`: the end goal is performance, and it cannot be improved without a profiler.
 

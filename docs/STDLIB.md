@@ -15,6 +15,7 @@ Generated from the comments in `lib/*/` by `tools/gendoc.py`.
 | [mint](#mint) | number and string conversion (strconv) |
 | [gauge](#gauge) | math (math) |
 | [bits](#bits) | bit counting and manipulation (math/bits) |
+| [link](#link) | URLs and their escaping (net/url) |
 | [ore](#ore) | byte slices (bytes) |
 | [flume](#flume) | buffered I/O (bufio) |
 | [quarry](#quarry) | files, environment, process (os) |
@@ -393,6 +394,52 @@ Package bits counts, rotates and reverses the bits of fixed-width unsigned integ
 - `Div32(hi u32, lo u32, y u32) (u32, u32)`: Div32 returns the quotient and remainder of (hi, lo) divided by y. It panics for y == 0 and for y <= hi (the quotient does not fit in 32 bits).
 - `Rem64(hi u64, lo u64, y u64) u64`: Rem64 returns the remainder of (hi, lo) divided by y, for any hi (no overflow panic). It panics for y == 0.
 - `Rem32(hi u32, lo u32, y u32) u32`: Rem32 returns the remainder of (hi, lo) divided by y. It panics for y == 0.
+
+## link
+
+Package link parses, builds and resolves URLs, and escapes and unescapes their parts (like Go's net/url). A URL is a struct; its User is an optional (nil when the URL has no userinfo); query parameters are a Values, a small wrapper over map[str][]str whose keys keep insertion order and whose Encode sorts them. Faults carry Go's messages: parse "x": invalid URL escape "%zz".
+
+- `QueryUnescape(s str) !str`: QueryUnescape converts each %AB in s to the byte 0xAB and each + to a space; a % not followed by two hex digits is a fault.
+- `PathUnescape(s str) !str`: PathUnescape is QueryUnescape for a path segment: + stays a plus sign.
+- `QueryEscape(s str) str`: QueryEscape escapes s for use as a query key or value: a space becomes +.
+- `PathEscape(s str) str`: PathEscape escapes s for use as one path segment: / and ? are escaped too.
+- `type Userinfo struct`: Userinfo is the username and optional password of a URL.
+- `User(username str) Userinfo`: User returns a Userinfo with a username and no password.
+- `UserPassword(username str, password str) Userinfo`: UserPassword returns a Userinfo with a username and a password (only for legacy services: RFC 2396 warns against passwords in URLs).
+- `(u Userinfo) Username() str`: Username returns the username.
+- `(u Userinfo) Password() (str, bool)`: Password returns the password and whether one is set.
+- `(u Userinfo) String() str`: String returns the escaped userinfo, username[:password].
+- `type URL struct`: URL is a parsed URL, in the general form [scheme:][//[userinfo@]host][/]path[?query][#fragment]. A URL whose rest after the scheme does not start with a slash is opaque: scheme:opaque[?query][#fragment]. Path and Fragment are stored decoded; RawPath and RawFragment hold the original encoding when it differs from the default one (EscapedPath and EscapedFragment use them).
+- `(u URL) Clone() URL`: Clone returns a copy of u (a plain assignment of a struct shares it).
+- `Parse(rawURL str) !URL`: Parse parses a URL, absolute or relative; a hostname and path without a scheme is invalid but may not be rejected, because of parsing ambiguities.
+- `ParseRequestURI(rawURL str) !URL`: ParseRequestURI parses a URL received in an HTTP request: an absolute URI or an absolute path, without a #fragment.
+- `(u URL) EscapedPath() str`: EscapedPath returns u.RawPath when it is a valid encoding of u.Path, else the default escaping.
+- `(u URL) EscapedFragment() str`: EscapedFragment returns u.RawFragment when it is a valid encoding of u.Fragment, else the default.
+- `(u URL) Username() str`: Username returns the username of u's userinfo, or "".
+- `(u URL) Password() (str, bool)`: Password returns the password of u's userinfo and whether one is set.
+- `(u URL) String() str`: String reassembles u into a URL string: [scheme:][//[userinfo@]host][/]path[?query][#fragment].
+- `(u URL) Redacted() str`: Redacted is String with the password, if any, replaced by xxxxx.
+- `(u URL) IsAbs() bool`: IsAbs reports whether u has a scheme.
+- `(u URL) Hostname() str`: Hostname returns u.Host without its port, and without the brackets of an IPv6 literal.
+- `(u URL) Port() str`: Port returns the port of u.Host, or "" when there is none.
+- `(u URL) RequestURI() str`: RequestURI returns what goes in an HTTP request line: the escaped path (or / when empty) and query, or the opaque part.
+- `(u URL) Query() Values`: Query parses u.RawQuery, keeping every well-formed parameter and skipping malformed ones.
+- `(u URL) Parse(ref str) !URL`: Parse parses ref (which may be relative) in the context of u: Parse then ResolveReference.
+- `(u URL) ResolveReference(ref URL) URL`: ResolveReference resolves a URI reference against u as an absolute URI (RFC 3986 section 5.2): ref may be relative or absolute, and u is typically an absolute URL.
+- `(u URL) JoinPath(elems []str) URL`: JoinPath returns a copy of u with the elements joined onto its path (cleaned, with a trailing slash kept if the last element had one).
+- `JoinPath(base str, elems []str) !str`: JoinPath parses base and joins the elements onto its path, returning the URL as a string.
+- `type Values struct`: Values maps a query key to its values, in the order they were added; Encode sorts the keys.
+- `NewValues() Values`: NewValues returns an empty Values.
+- `(v Values) Get(key str) str`: Get returns the first value of key, or "" when there is none.
+- `(v Values) All(key str) []str`: All returns every value of key (empty when there is none).
+- `(v mut Values) Set(key str, value str)`: Set makes value the only value of key.
+- `(v mut Values) Add(key str, value str)`: Add appends value to the values of key.
+- `(v mut Values) Del(key str)`: Del removes key and its values.
+- `(v Values) Has(key str) bool`: Has reports whether key is present.
+- `(v Values) Keys() []str`: Keys returns the keys in the order they were first added.
+- `(v Values) Len() i64`: Len returns the number of keys.
+- `ParseQuery(query str) !Values`: ParseQuery parses a URL query ("a=1&b=2&a=3") into Values. It faults on the first malformed parameter (a bad escape, or a semicolon separator); URL.Query keeps the good ones instead.
+- `(v Values) Encode() str`: Encode returns the values URL-encoded ("a=1&a=3&b=2"), sorted by key.
 
 ## ore
 

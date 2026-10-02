@@ -1,0 +1,964 @@
+// Package link parses, builds and resolves URLs, and escapes and unescapes their parts (like Go's
+// net/url). A URL is a struct; its User is an optional (nil when the URL has no userinfo); query
+// parameters are a Values, a small wrapper over map[str][]str whose keys keep insertion order and
+// whose Encode sorts them. Faults carry Go's messages: parse "x": invalid URL escape "%zz".
+package link
+
+import "mint"
+import "say"
+import "sift"
+import "trail"
+import "twine"
+
+// ---- escaping ----
+
+// The part of a URL being escaped or unescaped.
+const encodePath = 1
+const encodePathSegment = 2
+const encodeHost = 3
+const encodeZone = 4
+const encodeUserPassword = 5
+const encodeQueryComponent = 6
+const encodeFragment = 7
+
+const upperhex = "0123456789ABCDEF"
+
+func ishex(c u8) bool {
+	return '0' <= c && c <= '9' || 'a' <= c && c <= 'f' || 'A' <= c && c <= 'F'
+}
+
+// unhex is the value of the hex digit c (ishex(c) must hold).
+func unhex(c u8) u8 {
+	if c >= 'a' {
+		return c - 'a' + 10
+	}
+	if c >= 'A' {
+		return c - 'A' + 10
+	}
+	return c - '0'
+}
+
+// shouldEscape reports whether c must be %-escaped in the given part of a URL (RFC 3986).
+func shouldEscape(c u8, mode i64) bool {
+	if 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' || '0' <= c && c <= '9' {
+		return false
+	}
+	if mode == encodeHost || mode == encodeZone {
+		// sub-delims are allowed in a reg-name, and ":" and "[" "]" because the host includes
+		// the port and an IPv6 literal; "<" ">" and quote because Parse rejects them escaped.
+		switch c {
+		case '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=', ':', '[', ']', '<', '>', '"':
+			return false
+		}
+	}
+	switch c {
+	case '-', '_', '.', '~':
+		return false
+	case '$', '&', '+', ',', '/', ':', ';', '=', '?', '@':
+		// Reserved characters: each part allows some of them.
+		switch mode {
+		case encodePath:
+			return c == '?'
+		case encodePathSegment:
+			return c == '/' || c == ';' || c == ',' || c == '?'
+		case encodeUserPassword:
+			return c == '@' || c == '/' || c == '?' || c == ':'
+		case encodeQueryComponent:
+			return true
+		case encodeFragment:
+			return false
+		}
+	}
+	if mode == encodeFragment {
+		switch c {
+		case '!', '(', ')', '*':
+			return false
+		}
+	}
+	return true
+}
+
+func escapeFault(s str) ! {
+	fail "invalid URL escape " + mint.Quote(s)
+}
+
+func invalidHostFault(s str) ! {
+	fail "invalid character " + mint.Quote(s) + " in host name"
+}
+
+// QueryUnescape converts each %AB in s to the byte 0xAB and each + to a space; a % not followed by
+// two hex digits is a fault.
+func QueryUnescape(s str) !str {
+	return try unescape(s, encodeQueryComponent)
+}
+
+// PathUnescape is QueryUnescape for a path segment: + stays a plus sign.
+func PathUnescape(s str) !str {
+	return try unescape(s, encodePathSegment)
+}
+
+func unescape(s str, mode i64) !str {
+	n := 0
+	hasPlus := false
+	for i := 0; i < len(s); {
+		switch s[i] {
+		case '%':
+			n++
+			if i+2 >= len(s) || !ishex(s[i+1]) || !ishex(s[i+2]) {
+				bad := s[i:]
+				if len(bad) > 3 {
+					bad = bad[:3]
+				}
+				try escapeFault(bad)
+			}
+			// In a host, %-encoding is for non-ASCII bytes only, except %25 (RFC 6874).
+			if mode == encodeHost && unhex(s[i+1]) < 8 && s[i:i+3] != "%25" {
+				try escapeFault(s[i : i+3])
+			}
+			if mode == encodeZone {
+				// A zone may use escapes, but only for bytes that are valid host bytes unescaped.
+				v := unhex(s[i+1])<<4 | unhex(s[i+2])
+				if s[i:i+3] != "%25" && v != ' ' && shouldEscape(v, encodeHost) {
+					try escapeFault(s[i : i+3])
+				}
+			}
+			i += 3
+		case '+':
+			hasPlus = mode == encodeQueryComponent
+			i++
+		default:
+			if (mode == encodeHost || mode == encodeZone) && s[i] < 0x80 && shouldEscape(s[i], mode) {
+				try invalidHostFault(s[i : i+1])
+			}
+			i++
+		}
+	}
+	if n == 0 && !hasPlus {
+		return s
+	}
+	var plus u8 = '+'
+	if mode == encodeQueryComponent {
+		plus = ' '
+	}
+	t := make([]u8, 0, len(s)-2*n)
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '%':
+			t = append(t, unhex(s[i+1])<<4|unhex(s[i+2]))
+			i += 2
+		case '+':
+			t = append(t, plus)
+		default:
+			t = append(t, s[i])
+		}
+	}
+	return str(t)
+}
+
+// QueryEscape escapes s for use as a query key or value: a space becomes +.
+func QueryEscape(s str) str {
+	return escape(s, encodeQueryComponent)
+}
+
+// PathEscape escapes s for use as one path segment: / and ? are escaped too.
+func PathEscape(s str) str {
+	return escape(s, encodePathSegment)
+}
+
+func escape(s str, mode i64) str {
+	spaces := 0
+	hexes := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if shouldEscape(c, mode) {
+			if c == ' ' && mode == encodeQueryComponent {
+				spaces++
+			} else {
+				hexes++
+			}
+		}
+	}
+	if spaces == 0 && hexes == 0 {
+		return s
+	}
+	t := make([]u8, 0, len(s)+2*hexes)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == ' ' && mode == encodeQueryComponent {
+			t = append(t, '+')
+		} else if shouldEscape(c, mode) {
+			t = append(t, '%', upperhex[c>>4], upperhex[c&15])
+		} else {
+			t = append(t, c)
+		}
+	}
+	return str(t)
+}
+
+// ---- Userinfo ----
+
+// Userinfo is the username and optional password of a URL.
+type Userinfo struct {
+	username    str
+	password    str
+	passwordSet bool
+}
+
+// User returns a Userinfo with a username and no password.
+func User(username str) Userinfo {
+	return Userinfo{username: username, password: "", passwordSet: false}
+}
+
+// UserPassword returns a Userinfo with a username and a password (only for legacy services: RFC 2396
+// warns against passwords in URLs).
+func UserPassword(username str, password str) Userinfo {
+	return Userinfo{username: username, password: password, passwordSet: true}
+}
+
+// Username returns the username.
+func (u Userinfo) Username() str {
+	return u.username
+}
+
+// Password returns the password and whether one is set.
+func (u Userinfo) Password() (str, bool) {
+	return u.password, u.passwordSet
+}
+
+// String returns the escaped userinfo, username[:password].
+func (u Userinfo) String() str {
+	s := escape(u.username, encodeUserPassword)
+	if u.passwordSet {
+		s += ":" + escape(u.password, encodeUserPassword)
+	}
+	return s
+}
+
+// ---- URL ----
+
+// URL is a parsed URL, in the general form [scheme:][//[userinfo@]host][/]path[?query][#fragment].
+// A URL whose rest after the scheme does not start with a slash is opaque: scheme:opaque[?query][#fragment].
+// Path and Fragment are stored decoded; RawPath and RawFragment hold the original encoding when it
+// differs from the default one (EscapedPath and EscapedFragment use them).
+type URL struct {
+	Scheme      str
+	Opaque      str // encoded opaque data
+	User        ?Userinfo
+	Host        str // host or host:port; an IPv6 host is in square brackets
+	Path        str
+	RawPath     str
+	ForceQuery  bool // a ? was present even though RawQuery is empty
+	RawQuery    str  // encoded query values, without the ?
+	Fragment    str
+	RawFragment str
+	OmitHost    bool // the URL has an empty authority (scheme:///path); String keeps it out
+}
+
+// Clone returns a copy of u (a plain assignment of a struct shares it).
+func (u URL) Clone() URL {
+	return URL{Scheme: u.Scheme, Opaque: u.Opaque, User: u.User, Host: u.Host, Path: u.Path, RawPath: u.RawPath, ForceQuery: u.ForceQuery, RawQuery: u.RawQuery, Fragment: u.Fragment, RawFragment: u.RawFragment, OmitHost: u.OmitHost}
+}
+
+func emptyURL() URL {
+	return URL{Scheme: "", Opaque: "", User: nil, Host: "", Path: "", RawPath: "", ForceQuery: false, RawQuery: "", Fragment: "", RawFragment: "", OmitHost: false}
+}
+
+// wrap makes the fault Go's *url.Error shows: op "url": message.
+func wrap(op str, raw str, e fault) ! {
+	fail op + " " + mint.Quote(raw) + ": " + say.Str(e)
+}
+
+// Parse parses a URL, absolute or relative; a hostname and path without a scheme is invalid but may
+// not be rejected, because of parsing ambiguities.
+func Parse(rawURL str) !URL {
+	u, frag, _ := twine.Cut(rawURL, "#")
+	url := parse(u, false) catch e {
+		try wrap("parse", u, e)
+		return emptyURL()
+	}
+	if frag == "" {
+		return url
+	}
+	url.setFragment(frag) catch e {
+		try wrap("parse", rawURL, e)
+		return emptyURL()
+	}
+	return url
+}
+
+// ParseRequestURI parses a URL received in an HTTP request: an absolute URI or an absolute path,
+// without a #fragment.
+func ParseRequestURI(rawURL str) !URL {
+	url := parse(rawURL, true) catch e {
+		try wrap("parse", rawURL, e)
+		return emptyURL()
+	}
+	return url
+}
+
+// getScheme splits off a leading scheme: [a-zA-Z][a-zA-Z0-9+.-]* followed by a colon.
+func getScheme(rawURL str) !(str, str) {
+	for i := 0; i < len(rawURL); i++ {
+		c := rawURL[i]
+		if 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' {
+			continue
+		}
+		if '0' <= c && c <= '9' || c == '+' || c == '-' || c == '.' {
+			if i == 0 {
+				return "", rawURL
+			}
+			continue
+		}
+		if c == ':' {
+			if i == 0 {
+				fail "missing protocol scheme"
+			}
+			return rawURL[:i], rawURL[i+1:]
+		}
+		return "", rawURL
+	}
+	return "", rawURL
+}
+
+func containsCTL(s str) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < ' ' || s[i] == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
+func parse(rawURL str, viaRequest bool) !URL {
+	if containsCTL(rawURL) {
+		fail "net/url: invalid control character in URL"
+	}
+	if rawURL == "" && viaRequest {
+		fail "empty url"
+	}
+	url := emptyURL()
+	if rawURL == "*" {
+		url.Path = "*"
+		return url
+	}
+	scheme, rest := try getScheme(rawURL)
+	url.Scheme = twine.ToLower(scheme)
+
+	if twine.HasSuffix(rest, "?") && twine.Count(rest, "?") == 1 {
+		url.ForceQuery = true
+		rest = rest[:len(rest)-1]
+	} else {
+		rest, url.RawQuery, _ = twine.Cut(rest, "?")
+	}
+
+	if !twine.HasPrefix(rest, "/") {
+		if url.Scheme != "" {
+			// A rootless path after a scheme is opaque (RFC 3986).
+			url.Opaque = rest
+			return url
+		}
+		if viaRequest {
+			fail "invalid URI for request"
+		}
+		// A relative path's first segment may not contain a colon (RFC 3986 3.3), which would
+		// read as a malformed scheme.
+		segment, _, _ := twine.Cut(rest, "/")
+		if twine.Contains(segment, ":") {
+			fail "first path segment in URL cannot contain colon"
+		}
+	}
+
+	if (url.Scheme != "" || !viaRequest && !twine.HasPrefix(rest, "///")) && twine.HasPrefix(rest, "//") {
+		authority := rest[2:]
+		rest = ""
+		i := twine.Index(authority, "/")
+		if i >= 0 {
+			rest = authority[i:]
+			authority = authority[:i]
+		}
+		user, host := try parseAuthority(url.Scheme, authority)
+		url.User = user
+		url.Host = host
+	} else if url.Scheme != "" && twine.HasPrefix(rest, "/") {
+		url.OmitHost = true
+	}
+	try url.setPath(rest)
+	return url
+}
+
+func parseAuthority(scheme str, authority str) !(?Userinfo, str) {
+	i := twine.LastIndex(authority, "@")
+	var host str
+	if i < 0 {
+		host = try parseHost(scheme, authority)
+	} else {
+		host = try parseHost(scheme, authority[i+1:])
+	}
+	if i < 0 {
+		return nil, host
+	}
+	userinfo := authority[:i]
+	if !validUserinfo(userinfo) {
+		fail "net/url: invalid userinfo"
+	}
+	if !twine.Contains(userinfo, ":") {
+		name := try unescape(userinfo, encodeUserPassword)
+		return User(name), host
+	}
+	username, password, _ := twine.Cut(userinfo, ":")
+	username = try unescape(username, encodeUserPassword)
+	password = try unescape(password, encodeUserPassword)
+	return UserPassword(username, password), host
+}
+
+func validUserinfo(s str) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if 'A' <= c && c <= 'Z' || 'a' <= c && c <= 'z' || '0' <= c && c <= '9' {
+			continue
+		}
+		switch c {
+		case '-', '.', '_', ':', '~', '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=', '%', '@':
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validOptionalPort(port str) bool {
+	if port == "" {
+		return true
+	}
+	if port[0] != ':' {
+		return false
+	}
+	for i := 1; i < len(port); i++ {
+		if port[i] < '0' || port[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// parseHost parses an authority without userinfo: host[:port], or [ipv6][:port].
+func parseHost(scheme str, host str) !str {
+	open := twine.LastIndex(host, "[")
+	if open > 0 {
+		fail "invalid IP-literal"
+	}
+	if open == 0 {
+		// An IP-literal (RFC 3986, RFC 6874): [fe80::1], [fe80::1%25en0], [fe80::1]:80.
+		closeAt := twine.LastIndex(host, "]")
+		if closeAt < 0 {
+			fail "missing ']' in host"
+		}
+		colonPort := host[closeAt+1:]
+		if !validOptionalPort(colonPort) {
+			fail "invalid port " + mint.Quote(colonPort) + " after host"
+		}
+		unescapedColonPort := try unescape(colonPort, encodeHost)
+		hostname := host[open+1 : closeAt]
+		var unescapedHostname str
+		// %25 introduces the zone, which may use any escaping the zone rules allow; the host
+		// itself may only escape non-ASCII bytes.
+		zoneAt := twine.Index(hostname, "%25")
+		if zoneAt >= 0 {
+			hostPart := try unescape(hostname[:zoneAt], encodeHost)
+			zonePart := try unescape(hostname[zoneAt:], encodeZone)
+			unescapedHostname = hostPart + zonePart
+		} else {
+			unescapedHostname = try unescape(hostname, encodeHost)
+		}
+		// Only an IPv6 address may be in square brackets (an IPv4-mapped one is IPv6).
+		is4, msg := checkAddr(unescapedHostname)
+		if msg != "" {
+			fail "invalid host: " + msg
+		}
+		if is4 {
+			fail "invalid IP-literal"
+		}
+		return "[" + unescapedHostname + "]" + unescapedColonPort
+	}
+	i := twine.Index(host, ":")
+	if i != -1 {
+		lastColon := twine.LastIndex(host, ":")
+		if lastColon != i && (scheme == "postgresql" || scheme == "postgres") {
+			// libpq takes a comma-separated host list with ports in the host part.
+			i = lastColon
+		}
+		colonPort := host[i:]
+		if !validOptionalPort(colonPort) {
+			fail "invalid port " + mint.Quote(colonPort) + " after host"
+		}
+	}
+	return try unescape(host, encodeHost)
+}
+
+// setPath sets Path from the escaped path p, and RawPath only when p is not the default escaping.
+func (u mut URL) setPath(p str) ! {
+	path := try unescape(p, encodePath)
+	u.Path = path
+	if p == escape(path, encodePath) {
+		u.RawPath = ""
+	} else {
+		u.RawPath = p
+	}
+}
+
+// EscapedPath returns u.RawPath when it is a valid encoding of u.Path, else the default escaping.
+func (u URL) EscapedPath() str {
+	if u.RawPath != "" && validEncoded(u.RawPath, encodePath) {
+		p := unescape(u.RawPath, encodePath) catch _ { "" }
+		if p == u.Path {
+			return u.RawPath
+		}
+	}
+	if u.Path == "*" {
+		return "*"
+	}
+	return escape(u.Path, encodePath)
+}
+
+// validEncoded reports whether s has no byte that must be escaped in mode (used for RawPath and
+// RawFragment).
+func validEncoded(s str, mode i64) bool {
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '!', '$', '&', '\'', '(', ')', '*', '+', ',', ';', '=', ':', '@', '[', ']', '%':
+		default:
+			if shouldEscape(s[i], mode) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (u mut URL) setFragment(f str) ! {
+	frag := try unescape(f, encodeFragment)
+	u.Fragment = frag
+	if f == escape(frag, encodeFragment) {
+		u.RawFragment = ""
+	} else {
+		u.RawFragment = f
+	}
+}
+
+// EscapedFragment returns u.RawFragment when it is a valid encoding of u.Fragment, else the default.
+func (u URL) EscapedFragment() str {
+	if u.RawFragment != "" && validEncoded(u.RawFragment, encodeFragment) {
+		f := unescape(u.RawFragment, encodeFragment) catch _ { "" }
+		if f == u.Fragment {
+			return u.RawFragment
+		}
+	}
+	return escape(u.Fragment, encodeFragment)
+}
+
+// Username returns the username of u's userinfo, or "".
+func (u URL) Username() str {
+	ui := u.User
+	if ui == nil {
+		return ""
+	}
+	return ui.Username()
+}
+
+// Password returns the password of u's userinfo and whether one is set.
+func (u URL) Password() (str, bool) {
+	ui := u.User
+	if ui == nil {
+		return "", false
+	}
+	return ui.Password()
+}
+
+// String reassembles u into a URL string: [scheme:][//[userinfo@]host][/]path[?query][#fragment].
+func (u URL) String() str {
+	b := twine.NewBuilder(len(u.Scheme) + len(u.Host) + len(u.Path) + len(u.RawQuery) + len(u.RawFragment) + 16)
+	if u.Scheme != "" {
+		b.Str(u.Scheme)
+		b.Byte(':')
+	}
+	if u.Opaque != "" {
+		b.Str(u.Opaque)
+	} else {
+		ui := u.User
+		if u.Scheme != "" || u.Host != "" || ui != nil {
+			if u.OmitHost && u.Host == "" && ui == nil {
+				// omit the empty authority
+			} else {
+				if u.Host != "" || u.Path != "" || ui != nil {
+					b.Str("//")
+				}
+				if ui != nil {
+					b.Str(ui.String())
+					b.Byte('@')
+				}
+				if u.Host != "" {
+					b.Str(escape(u.Host, encodeHost))
+				}
+			}
+		}
+		path := u.EscapedPath()
+		// A rootless path after a host needs a slash.
+		if path != "" && path[0] != '/' && u.Host != "" {
+			b.Byte('/')
+		}
+		if b.Len() == 0 {
+			// A relative path whose first segment has a colon would read as a scheme.
+			segment, _, _ := twine.Cut(path, "/")
+			if twine.Contains(segment, ":") {
+				b.Str("./")
+			}
+		}
+		b.Str(path)
+	}
+	if u.ForceQuery || u.RawQuery != "" {
+		b.Byte('?')
+		b.Str(u.RawQuery)
+	}
+	if u.Fragment != "" {
+		b.Byte('#')
+		b.Str(u.EscapedFragment())
+	}
+	return b.String()
+}
+
+// Redacted is String with the password, if any, replaced by xxxxx.
+func (u URL) Redacted() str {
+	ru := u.Clone()
+	ui := ru.User
+	if ui != nil {
+		_, has := ui.Password()
+		if has {
+			ru.User = UserPassword(ui.Username(), "xxxxx")
+		}
+	}
+	return ru.String()
+}
+
+// IsAbs reports whether u has a scheme.
+func (u URL) IsAbs() bool {
+	return u.Scheme != ""
+}
+
+// Hostname returns u.Host without its port, and without the brackets of an IPv6 literal.
+func (u URL) Hostname() str {
+	host, _ := splitHostPort(u.Host)
+	return host
+}
+
+// Port returns the port of u.Host, or "" when there is none.
+func (u URL) Port() str {
+	_, port := splitHostPort(u.Host)
+	return port
+}
+
+func splitHostPort(hostPort str) (str, str) {
+	host := hostPort
+	port := ""
+	colon := twine.LastIndexByte(host, ':')
+	if colon != -1 && validOptionalPort(host[colon:]) {
+		port = host[colon+1:]
+		host = host[:colon]
+	}
+	if twine.HasPrefix(host, "[") && twine.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+	return host, port
+}
+
+// RequestURI returns what goes in an HTTP request line: the escaped path (or / when empty) and query,
+// or the opaque part.
+func (u URL) RequestURI() str {
+	result := u.Opaque
+	if result == "" {
+		result = u.EscapedPath()
+		if result == "" {
+			result = "/"
+		}
+	} else if twine.HasPrefix(result, "//") {
+		result = u.Scheme + ":" + result
+	}
+	if u.ForceQuery || u.RawQuery != "" {
+		result += "?" + u.RawQuery
+	}
+	return result
+}
+
+// Query parses u.RawQuery, keeping every well-formed parameter and skipping malformed ones.
+func (u URL) Query() Values {
+	v := NewValues()
+	parseQueryInto(v, u.RawQuery)
+	return v
+}
+
+// ---- resolving ----
+
+// resolvePath applies RFC 3986 section 5.2.4 (remove dot segments) to ref resolved against base.
+func resolvePath(base str, ref str) str {
+	var full str
+	if ref == "" {
+		full = base
+	} else if ref[0] != '/' {
+		i := twine.LastIndex(base, "/")
+		full = base[:i+1] + ref
+	} else {
+		full = ref
+	}
+	if full == "" {
+		return ""
+	}
+	elem := ""
+	dst := "/"
+	first := true
+	remaining := full
+	found := true
+	for found {
+		elem, remaining, found = twine.Cut(remaining, "/")
+		if elem == "." {
+			first = false
+			continue
+		}
+		if elem == ".." {
+			// Remove the last element of dst.
+			last := dst[1:]
+			index := twine.LastIndexByte(last, '/')
+			if index == -1 {
+				dst = "/"
+				first = true
+			} else {
+				dst = "/" + last[:index]
+			}
+		} else {
+			if !first {
+				dst += "/"
+			}
+			dst += elem
+			first = false
+		}
+	}
+	if elem == "." || elem == ".." {
+		dst += "/"
+	}
+	// We wrote an initial / but the path may already have one.
+	if len(dst) > 1 && dst[1] == '/' {
+		dst = dst[1:]
+	}
+	return dst
+}
+
+// Parse parses ref (which may be relative) in the context of u: Parse then ResolveReference.
+func (u URL) Parse(ref str) !URL {
+	refURL := try Parse(ref)
+	return u.ResolveReference(refURL)
+}
+
+// ResolveReference resolves a URI reference against u as an absolute URI (RFC 3986 section 5.2):
+// ref may be relative or absolute, and u is typically an absolute URL.
+func (u URL) ResolveReference(ref URL) URL {
+	url := ref.Clone()
+	if ref.Scheme == "" {
+		url.Scheme = u.Scheme
+	}
+	if ref.Scheme != "" || ref.Host != "" || ref.User != nil {
+		// The reference is an absolute URL (or has an authority): only its path is normalized.
+		url.setPath(resolvePath(ref.EscapedPath(), "")) catch _ {}
+		return url
+	}
+	if ref.Opaque != "" {
+		url.User = nil
+		url.Host = ""
+		url.Path = ""
+		return url
+	}
+	if ref.Path == "" && !ref.ForceQuery && ref.RawQuery == "" {
+		url.RawQuery = u.RawQuery
+		if ref.Fragment == "" {
+			url.Fragment = u.Fragment
+			url.RawFragment = u.RawFragment
+		}
+	}
+	if ref.Path == "" && u.Opaque != "" {
+		url.Opaque = u.Opaque
+		url.User = nil
+		url.Host = ""
+		url.Path = ""
+		return url
+	}
+	// The reference is a relative path.
+	url.Host = u.Host
+	url.User = u.User
+	url.setPath(resolvePath(u.EscapedPath(), ref.EscapedPath())) catch _ {}
+	return url
+}
+
+// JoinPath returns a copy of u with the elements joined onto its path (cleaned, with a trailing slash
+// kept if the last element had one).
+func (u URL) JoinPath(elems []str) URL {
+	return u.joinPath(elems) catch _ {
+		u.Clone()
+	}
+}
+
+func (u URL) joinPath(elems []str) !URL {
+	all := make([]str, 0, len(elems)+1)
+	all = append(all, u.EscapedPath())
+	all = append(all, elems...)
+	var p str
+	if !twine.HasPrefix(all[0], "/") {
+		all[0] = "/" + all[0]
+		p = trail.JoinAll(all)[1:]
+	} else {
+		p = trail.JoinAll(all)
+	}
+	if twine.HasSuffix(all[len(all)-1], "/") && !twine.HasSuffix(p, "/") {
+		p += "/"
+	}
+	url := u.Clone()
+	try url.setPath(p)
+	return url
+}
+
+// JoinPath parses base and joins the elements onto its path, returning the URL as a string.
+func JoinPath(base str, elems []str) !str {
+	url := try Parse(base)
+	res := try url.joinPath(elems)
+	return res.String()
+}
+
+// ---- query values ----
+
+// Values maps a query key to its values, in the order they were added; Encode sorts the keys.
+type Values struct {
+	m map[str][]str
+}
+
+// NewValues returns an empty Values.
+func NewValues() Values {
+	return Values{m: map[str][]str{}}
+}
+
+// Get returns the first value of key, or "" when there is none.
+func (v Values) Get(key str) str {
+	vs, ok := v.m[key]
+	if !ok || len(vs) == 0 {
+		return ""
+	}
+	return vs[0]
+}
+
+// All returns every value of key (empty when there is none).
+func (v Values) All(key str) []str {
+	return v.m[key]
+}
+
+// Set makes value the only value of key.
+func (v mut Values) Set(key str, value str) {
+	v.m[key] = []str{value}
+}
+
+// Add appends value to the values of key.
+func (v mut Values) Add(key str, value str) {
+	v.m[key] = append(v.m[key], value)
+}
+
+// Del removes key and its values.
+func (v mut Values) Del(key str) {
+	delete(v.m, key)
+}
+
+// Has reports whether key is present.
+func (v Values) Has(key str) bool {
+	_, ok := v.m[key]
+	return ok
+}
+
+// Keys returns the keys in the order they were first added.
+func (v Values) Keys() []str {
+	keys := make([]str, 0, len(v.m))
+	for k := range v.m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// Len returns the number of keys.
+func (v Values) Len() i64 {
+	return len(v.m)
+}
+
+// maxQueryParams is the most parameters ParseQuery accepts, so that a hostile query cannot make a
+// server build a huge map.
+const maxQueryParams = 10000
+
+// ParseQuery parses a URL query ("a=1&b=2&a=3") into Values. It faults on the first malformed
+// parameter (a bad escape, or a semicolon separator); URL.Query keeps the good ones instead.
+func ParseQuery(query str) !Values {
+	v := NewValues()
+	msg := parseQueryInto(v, query)
+	if msg != "" {
+		fail msg
+	}
+	return v
+}
+
+// parseQueryInto adds every well-formed parameter of query to m and returns the first fault message
+// ("" when all were well-formed).
+func parseQueryInto(m Values, query str) str {
+	if twine.Count(query, "&")+1 > maxQueryParams {
+		return "number of URL query parameters exceeded limit"
+	}
+	first := ""
+	for query != "" {
+		var key str
+		key, query, _ = twine.Cut(query, "&")
+		if twine.Contains(key, ";") {
+			first = "invalid semicolon separator in query"
+			continue
+		}
+		if key == "" {
+			continue
+		}
+		var value str
+		key, value, _ = twine.Cut(key, "=")
+		k := QueryUnescape(key) catch e {
+			if first == "" {
+				first = say.Str(e)
+			}
+			continue
+		}
+		val := QueryUnescape(value) catch e {
+			if first == "" {
+				first = say.Str(e)
+			}
+			continue
+		}
+		m.Add(k, val)
+	}
+	return first
+}
+
+// Encode returns the values URL-encoded ("a=1&a=3&b=2"), sorted by key.
+func (v Values) Encode() str {
+	if len(v.m) == 0 {
+		return ""
+	}
+	keys := v.Keys()
+	sift.Sort(mut keys)
+	b := twine.NewBuilder(64)
+	for _, k := range keys {
+		keyEscaped := QueryEscape(k)
+		for _, val := range v.m[k] {
+			if b.Len() > 0 {
+				b.Byte('&')
+			}
+			b.Str(keyEscaped)
+			b.Byte('=')
+			b.Str(QueryEscape(val))
+		}
+	}
+	return b.String()
+}

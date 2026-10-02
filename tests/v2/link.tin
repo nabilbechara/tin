@@ -1,0 +1,175 @@
+package main
+
+import "say"
+import "link"
+
+func q(s str) str {
+	return say.Fmt("%q", s)
+}
+
+func b(v bool) str {
+	if v {
+		return "true"
+	}
+	return "false"
+}
+
+func parseWith(raw str, req bool) !link.URL {
+	if req {
+		return try link.ParseRequestURI(raw)
+	}
+	return try link.Parse(raw)
+}
+
+func show(label str, raw str, req bool) {
+	u := parseWith(raw, req) catch e {
+		say.Line(label, q(raw), "ERR", say.Str(e))
+		return
+	}
+	pw, has := u.Password()
+	say.Line(label, q(raw), q(u.String()), q(u.Scheme), q(u.Opaque), q(u.Username()), q(pw), b(has), q(u.Host), q(u.Hostname()), q(u.Port()),
+		q(u.Path), q(u.RawPath), q(u.EscapedPath()), q(u.RawQuery), b(u.ForceQuery), q(u.Fragment), q(u.RawFragment), q(u.EscapedFragment()),
+		b(u.OmitHost), q(u.RequestURI()), b(u.IsAbs()), q(u.Redacted()), q(u.Query().Encode()))
+}
+
+func resolve(base str, ref str) {
+	bu := link.Parse(base) catch e {
+		say.Line("resolve", q(base), q(ref), "BASEERR", say.Str(e))
+		return
+	}
+	ru := link.Parse(ref) catch e {
+		say.Line("resolve", q(base), q(ref), "REFERR", say.Str(e))
+		return
+	}
+	r := bu.ResolveReference(ru)
+	say.Line("resolve", q(base), q(ref), q(r.String()))
+	p := bu.Parse(ref) catch e {
+		say.Line("resolve-parse", q(base), q(ref), "ERR", say.Str(e))
+		return
+	}
+	say.Line("resolve-parse", q(base), q(ref), q(p.String()))
+}
+
+func query(raw str) {
+	v := link.ParseQuery(raw) catch e {
+		say.Line("query", q(raw), "ERR", say.Str(e), q(lenient(raw)))
+		return
+	}
+	say.Line("query", q(raw), q(v.Encode()), v.Len(), q(v.Get("a")), b(v.Has("a")), len(v.All("a")))
+}
+
+func lenient(raw str) str {
+	u := link.Parse("?" + raw) catch _ {
+		return "?"
+	}
+	return u.Query().Encode()
+}
+
+func join(base str, elems []str, label str) {
+	r := link.JoinPath(base, elems) catch e {
+		say.Line("join", base, label, "ERR", say.Str(e))
+		return
+	}
+	say.Line("join", base, label, q(r))
+}
+
+func main() {
+	for _, s := range []str{"http://www.google.com", "http://www.google.com/", "http://www.google.com/file%20one%26two", "ftp://webmaster@www.google.com/", "ftp://john%20doe@www.google.com/", "http://www.google.com/?q=go+language", "http://www.google.com/?q=go%20language", "http://www.google.com/a%20b?q=c+d", "http:www.google.com/?q=go+language", "http:%2f%2fwww.google.com/?q=go+language", "mailto:/webmaster@golang.org", "mailto:webmaster@golang.org", "/foo?query=http://bad", "//foo", "//user@foo/path?a=b", "///threeslashes", "http:///threeslashes", "file:///home/adg/rabbits", "file:///C:/FooBar/Baz.txt", "file:///", "file:/x", "x:", "x:/", "http://www.google.com/#frag", "http://www.google.com/#frag%20ment", "http://www.google.com/#a b", "http://www.google.com/#%zz", "http://www.google.com/?", "http://www.google.com?", "http://www.google.com/?#", "http://www.google.com/a?b?c", "http://[fe80::1]/", "http://[fe80::1]:8080/", "http://[fe80::1%25en0]/", "http://[fe80::1%25en0]:8080/", "http://[fe80::1%en0]/", "http://[::1", "http://[::1]x/", "http://[::1]:x/", "http://[1.2.3.4]/", "http://[::ffff:1.2.3.4]/", "http://[::ffff:1.2.3.4%25z]/", "http://[::1]:80:90/", "http://[:::1]/", "http://[1::2::3]/", "http://[12345::1]/", "http://[g::1]/", "http://[1:2:3:4:5:6:7:8:9]/", "http://[1:2:3:4:5:6:7]/", "http://[::1%25]/", "http://[1.2.3.4.5]/", "http://[1.02.3.4]/", "http://[::1.2.3]/", "http://[::256.1.1.1]/", "http://[fe80::1%25a%00]/", "http://[]/", "http://[%25]/", "http://a[b]c/", "http://host:80", "http://host:", "http://host:port/", "http://host:80:80/", "http://:80/", "postgres://user:pw@host1:5432,host2:5433/db", "postgresql://a,b/db", "http://user@host@evil/", "http://a@b@c/", "http://us%zzer@host/", "http://user:pass:word@host/", "http://user:@host/", "http://:pw@host/", "http://@host/", "http://us er@host/", "http://user%20name:p%3Aw@host/path", "http://host/%zz", "http://host/%", "http://host/%4", "http://ho%41st/", "http://ho%20st/", "http://ho st/", "http://host%25/", "http://héllo.com/", "http://host/päth", "http://host/a%2Fb", "http://host/a%2fb/c", "http://host/a/b%2", "http://host/a%3Ab", "http://host/a;b,c", "http://host/a$b&c", "http://host/a b", "http://host/a+b", "http://host/a%2bb", "http://host/*", "*", "", " ", "%", "a", "a/b", "a:b", "a:b/c", "1:b", "+a:b", "a+b.c-d:e", "./a:b", "a/b:c", "/a:b", "http://host/a?x=%zz", "http://host/a?x=1;y=2", "http://host/\x01", "http://host/", "http://host\n/", "http:", "http://", "http:///", "http://?q", "http://#f", "HTTP://HOST/PATH", "HtTp://Example.COM/A", ":foo", "://foo", "foo://", "//", "///", "////", "/..", "/a/../b", "../a", "?q=1", "#f", "?", "#", "a?b#c", "//host/path?query#frag", "//host:80", "x://[::1]", "sc:opaque?q#f", "sc://h/p?q#f", "sc:/p", "sc:///p", "sc://", "sc:?q", "sc:#f", "tel:+1-555-0100", "urn:isbn:0451450523", "http://host/%e4%b8%96%e7%95%8c", "http://host/世界", "http://host/?q=世界", "http://世界.com/", "http://host/a%20b%2Fc", "http://host/%7Euser", "http://host/~user", "http://host/a%21b", "http://host/a!b'c(d)e*f", "http://host/#a!b'c(d)e*f", "http://host/#a%21b", "http://host/#a/b?c", "http://host/#%e4%b8", "http://host/%41"} {
+		show("parse", s, false)
+	}
+	for _, s := range []str{"/", "/a/b?c=d", "*", "", "http://h/p?q", "a/b", "//h/p", "/a#b", "/a b", "/a%zz", "///x", "http:", "x:y", "/\x01"} {
+		show("request", s, true)
+	}
+	for _, s := range []str{"", "abc", "a b", "a+b", "a%b", "a/b", "a?b", "a&b=c", "a;b", "a,b", "a:b@c", "a~b_c-d.e", "a!b'c(d)e*f", "aéb", "世界", "a\x00b", "%41", "%zz", "%4", "%", "a%2", "%2g", "a+b%20c", "a%2Bb", "%e4%b8%96", "100%", "~", "$&+,/:;=?@", "[]<>\"{{}}|\\^`", "\t\n"} {
+		say.Line("escape", q(s), q(link.QueryEscape(s)), q(link.PathEscape(s)))
+		qu := link.QueryUnescape(s) catch e {
+			say.Line("queryunescape", q(s), "ERR", say.Str(e))
+			continue
+		}
+		say.Line("queryunescape", q(s), q(qu))
+	}
+	for _, s := range []str{"", "abc", "a b", "a+b", "a%b", "a/b", "a?b", "a&b=c", "a;b", "a,b", "a:b@c", "a~b_c-d.e", "a!b'c(d)e*f", "aéb", "世界", "a\x00b", "%41", "%zz", "%4", "%", "a%2", "%2g", "a+b%20c", "a%2Bb", "%e4%b8%96", "100%", "~", "$&+,/:;=?@", "[]<>\"{{}}|\\^`", "\t\n"} {
+		pu := link.PathUnescape(s) catch e {
+			say.Line("pathunescape", q(s), "ERR", say.Str(e))
+			continue
+		}
+		say.Line("pathunescape", q(s), q(pu))
+	}
+	for _, ref := range []str{"g:h", "?", "?#s", "g", "./g", "g/", "/g", "//g", "?y", "g?y", "#s", "g#s", "g?y#s", ";x", "g;x", "g;x?y#s", "", ".", "./", "..", "../", "../g", "../..", "../../", "../../g", "../../../g", "../../../../g", "/./g", "/../g", "g.", ".g", "g..", "..g", "./../g", "./g/.", "g/./h", "g/../h", "g;x=1/./y", "g;x=1/../y", "g?y/./x", "g?y/../x", "g#s/./x", "g#s/../x", "http:g", "http://x/y", "//x", "/a%2fb", "a%2fb/../c", "g h", "%zz"} {
+		resolve("http://a/b/c/d;p?q", ref)
+	}
+	for _, base := range []str{"http://a/b/c/", "http://a", "http://a/", "http://a/b", "/a/b", "a/b", "", "http://u:p@h:1/x?y#z", "mailto:a@b", "mailto:a@b?s=1", "http://a/b%2fc/d", "file:///a/b", "sc:opaque", "http://a/b/c/d?q#f"} {
+		for _, ref := range []str{"x", "/x", "../x", "?z", "#z", "", "//h2/x", "mailto:c@d", "sc:other", "./", "..", "../..", "../../..", "u://h"} {
+			resolve(base, ref)
+		}
+	}
+	join("http://h/a/b", []str{}, "[]")
+	join("http://h/a/b", []str{"c"}, "[c]")
+	join("http://h/a/b/", []str{"c"}, "[c]")
+	join("http://h/a/b", []str{"../c"}, "[../c]")
+	join("http://h/a/b", []str{"..", ".."}, "[.. ..]")
+	join("http://h/a/b", []str{"../../../.."}, "[../../../..]")
+	join("http://h", []str{"x"}, "[x]")
+	join("http://h", []str{"", "x"}, "[ x]")
+	join("http://h/", []str{"x/"}, "[x/]")
+	join("http://h/a", []str{"b/", "c/"}, "[b/ c/]")
+	join("http://h/a%2fb", []str{"c"}, "[c]")
+	join("http://h/a", []str{"b c"}, "[b c]")
+	join("http://h/a", []str{"%zz"}, "[%zz]")
+	join("a/b", []str{"c"}, "[c]")
+	join("", []str{"c"}, "[c]")
+	join("%zz", []str{"c"}, "[c]")
+	join("http://h/a?q#f", []str{"b"}, "[b]")
+	join("http://h/a", []str{"b?c"}, "[b?c]")
+	join("mailto:a@b", []str{"c"}, "[c]")
+	join("http://h/a", []str{"//b"}, "[//b]")
+	join("http://h/a", []str{"."}, "[.]")
+	join("http://h/a/", []str{".."}, "[..]")
+	join("http://h/", []str{".."}, "[..]")
+	query("")
+	query("a=1")
+	query("a=1&b=2")
+	query("b=2&a=1&a=3")
+	query("a")
+	query("a=")
+	query("=1")
+	query("&&a=1&&")
+	query("a=1;b=2")
+	query("a=%zz")
+	query("%zz=1")
+	query("a=1&b=%zz&c=3")
+	query("a+b=c+d")
+	query("a%20b=c%2Bd")
+	query("a=b=c")
+	query("x=%e4%b8%96")
+	query("k=v&k=v&k=w")
+	query("é=ü")
+	query("a=1&a=2&a=3&b=&c")
+	query("a=%")
+	query("a=%4")
+	query("%=1")
+	query("a=1;")
+	query(";")
+	query("a=1&;&b=2")
+	query("a b=c d")
+	query("?a=1")
+	v := link.NewValues()
+	v.Set("a", "1")
+	say.Line("values", q(v.Encode()), v.Len(), q(v.Get("a")), b(v.Has("b")), len(v.All("a")), len(v.All("zz")))
+	v.Add("a", "2")
+	say.Line("values", q(v.Encode()), v.Len(), q(v.Get("a")), b(v.Has("b")), len(v.All("a")), len(v.All("zz")))
+	v.Add("b", "x y")
+	say.Line("values", q(v.Encode()), v.Len(), q(v.Get("a")), b(v.Has("b")), len(v.All("a")), len(v.All("zz")))
+	v.Set("c", "é&=+")
+	say.Line("values", q(v.Encode()), v.Len(), q(v.Get("a")), b(v.Has("b")), len(v.All("a")), len(v.All("zz")))
+	v.Add("a", "3")
+	say.Line("values", q(v.Encode()), v.Len(), q(v.Get("a")), b(v.Has("b")), len(v.All("a")), len(v.All("zz")))
+	v.Del("b")
+	say.Line("values", q(v.Encode()), v.Len(), q(v.Get("a")), b(v.Has("b")), len(v.All("a")), len(v.All("zz")))
+	v.Add("d", "")
+	say.Line("values", q(v.Encode()), v.Len(), q(v.Get("a")), b(v.Has("b")), len(v.All("a")), len(v.All("zz")))
+	v.Set("d", "z")
+	say.Line("values", q(v.Encode()), v.Len(), q(v.Get("a")), b(v.Has("b")), len(v.All("a")), len(v.All("zz")))
+	v.Add("e f", "g")
+	say.Line("values", q(v.Encode()), v.Len(), q(v.Get("a")), b(v.Has("b")), len(v.All("a")), len(v.All("zz")))
+}
