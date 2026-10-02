@@ -1,0 +1,111 @@
+package main
+
+import "anvil"
+import "mint"
+import "say"
+import "tide"
+import "websocket"
+
+// The routed server tools/ci/router_check.py drives. Every request goes through two root
+// middleware; /api adds one that waits before calling next. Handlers wait too, and read
+// their path parameters and middleware values after the wait.
+
+// stamp tags the request in the order the middleware ran, and the status after them.
+func stamp(q anvil.Req, w mut anvil.Out, next func(anvil.Req, mut anvil.Out)) {
+	w.SetValue("trace", "stamp")
+	next(q, mut w)
+	w.Head("X-Status", say.Str(w.Code()))
+}
+
+// tag adds its name to the trace set by stamp.
+func tag(q anvil.Req, w mut anvil.Out, next func(anvil.Req, mut anvil.Out)) {
+	w.SetValue("trace", w.Value("trace") + ">tag")
+	next(q, mut w)
+}
+
+// slow_mw waits ms (from the query) before the rest of the chain runs.
+func slow_mw(q anvil.Req, w mut anvil.Out, next func(anvil.Req, mut anvil.Out)) {
+	ms := mint.Atoi(q.Param("mw")) catch _ { 0 }
+	if ms > 0 {
+		tide.Wait(ms * tide.Millisecond) catch err {
+			w.Status(504)
+			w.Text("middleware: {err}")
+			return
+		}
+	}
+	w.SetValue("trace", w.Value("trace") + ">api")
+	next(q, mut w)
+}
+
+func pause(q anvil.Req) ! {
+	ms := mint.Atoi(q.Param("ms")) catch _ { 0 }
+	if ms > 0 {
+		try tide.Wait(ms * tide.Millisecond)
+	}
+}
+
+func user(q anvil.Req, w mut anvil.Out) {
+	pause(q) catch err {
+		w.Status(504)
+		w.Text("{err}")
+		return
+	}
+	id := q.PathParam("id")
+	trace := w.Value("trace")
+	w.Text("user {id} {trace} {q.Pattern()}")
+}
+
+func create(q anvil.Req, w mut anvil.Out) {
+	b := q.Body()
+	w.Status(201)
+	w.Text("created {len(b)}")
+}
+
+func file(q anvil.Req, w mut anvil.Out) {
+	p := q.PathParam("path")
+	w.Text("file {p}")
+}
+
+func item(q anvil.Req, w mut anvil.Out) {
+	pause(q) catch err {
+		w.Status(504)
+		w.Text("{err}")
+		return
+	}
+	id := q.PathParam("id")
+	trace := w.Value("trace")
+	w.Text("item {id} {trace}")
+}
+
+func fast(q anvil.Req, w mut anvil.Out) {
+	w.Text("fast")
+}
+
+// ws upgrades a routed request: it names its room, then echoes every message.
+func ws(q anvil.Req, w mut anvil.Out) {
+	c := websocket.Accept(q, mut w) catch _ { return }
+	room := q.PathParam("room")
+	c.WriteText("room {room}") catch _ { return }
+	c.Each(echo) catch _ {}
+}
+
+func echo(c websocket.Conn, m websocket.Message) ! {
+	try c.WriteText("echo: {m.Data}")
+}
+
+func main() {
+	r := anvil.NewRouter()
+	r.Use(stamp)
+	r.Use(tag)
+	r.Get(`/users/{id}`, user)
+	r.Post("/users", create)
+	r.Get(`/files/{path...}`, file)
+	r.Get("/fast", fast)
+	r.Get(`/ws/{room}`, ws)
+	r.Route("/api", func(g mut anvil.Router) {
+		g.Use(slow_mw)
+		g.Get(`/items/{id}`, item)
+	})
+	err := r.Serve(":0")
+	say.Line("server:", err)
+}

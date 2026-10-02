@@ -53,10 +53,34 @@ Core 0 accepts connections and deals them round-robin to every core through a pi
 ```go
 func handle(q anvil.Req, w mut anvil.Out) {
 	w.Type("application/json")
-	argo.Put(w.Body, Msg{message: "hi"})
+	argo.Put(mut w.Body, Msg{message: "hi"})
 }
 func main() {
 	err := anvil.Serve(":8080", handle)
+	say.Line("server:", err)
+}
+```
+
+A Router picks the handler by method and path pattern, and runs middleware around it. Patterns match whole segments: "users" itself, {id} any one non-empty segment, and a last {path...} or * the rest of the path. Static segments win over {name}, and {name} over the rest, segment by segment, whatever the order of registration. A path whose routes take other methods gets 405 with Allow, any other miss 404; HEAD falls back to GET. A trailing slash is part of the path: /users/ and /users are different routes. Write patterns with {...} as raw strings: in "..." the braces would interpolate.
+
+```go
+func user(q anvil.Req, w mut anvil.Out) {
+	id := q.PathParam("id")
+	w.Text("user {id}")
+}
+func logged(q anvil.Req, w mut anvil.Out, next func(anvil.Req, mut anvil.Out)) {
+	next(q, mut w)
+	say.Line(q.Method, q.Pattern(), w.Code())
+}
+func main() {
+	r := anvil.NewRouter()
+	r.Use(logged)
+	r.Get(`/users/{id}`, user)
+	r.Route("/admin", func(g mut anvil.Router) {
+		g.Use(auth)
+		g.Delete(`/users/{id}`, remove)
+	})
+	err := r.Serve(":8080")
 	say.Line("server:", err)
 }
 ```
@@ -70,13 +94,40 @@ func main() {
 - `(q Req) Hijack() !i64`: Hijack takes the request's connection out of HTTP for a protocol of its own (the websocket package uses it): the responses before this request are written, the core stops reading the connection and the request's deadline no longer applies. It returns the non-blocking descriptor, for the caller's I/O until the handler returns; then anvil closes it. The handler's Out is not sent.
 - `(q Req) Body() str`: Body returns the request body.
 - `(q Req) Param(name str) str`: Param returns query parameter name, %-decoded, or "".
+- `(q Req) PathParam(name str) str`: PathParam returns path parameter name of the Router route that matched ({name}, {name...}, or "*" for a last *), %-decoded, or "".
+- `(q Req) Pattern() str`: Pattern returns the pattern of the Router route serving the request ("/users/{id}"), or "" (no Router, or a 404 or 405 answer).
 - `(w mut Out) Status(code i64)`: Status sets the response status code.
 - `(w mut Out) Type(t str)`: Type sets the Content-Type header.
 - `(w mut Out) Head(k str, v str)`: Head adds a response header.
 - `(w mut Out) Text(s str)`: Text appends s to the body.
-- `(w mut Out) Json()`: Json sets the JSON content type; the body is then written with argo.Put(w.Body, v).
+- `(w mut Out) Json()`: Json sets the JSON content type; the body is then written with argo.Put(mut w.Body, v).
+- `(w Out) Code() i64`: Code returns the response status set so far (200 unless Status changed it).
+- `(w Out) Header(k str) str`: Header returns response header k as set so far (Type sets Content-Type, Head the rest), or "".
+- `(w mut Out) SetValue(key str, value str)`: SetValue stores value under key for the rest of the request: middleware hand data (a user id, a request id) to the handlers after them this way. Value reads it back.
+- `(w Out) Value(key str) str`: Value returns what SetValue stored under key in this request, or "".
 - `OnRelay(h func(i64, str))`: OnRelay makes every core run h(from, msg) for each relay message it receives (call before Serve). Handlers run between requests, with their own request pool.
 - `OnTick(ms i64, h func(i64))`: OnTick makes every core run h(core) every ms milliseconds (call before Serve).
+- `type Router struct`: Router sends each request to the handler routed for its method and path pattern, through the middleware added with Use. Build it in main (or in a function a global's initializer calls), then Serve it, or try requests on it with Run.
+- `NewRouter() Router`: NewRouter makes an empty router: every request gets 404 until routes are added.
+- `(r mut Router) Get(pattern str, h func(Req, mut Out))`: Get routes GET requests for pattern to h, and HEAD requests unless Head routes them.
+- `(r mut Router) Post(pattern str, h func(Req, mut Out))`: Post routes POST requests for pattern to h.
+- `(r mut Router) Put(pattern str, h func(Req, mut Out))`: Put routes PUT requests for pattern to h.
+- `(r mut Router) Patch(pattern str, h func(Req, mut Out))`: Patch routes PATCH requests for pattern to h.
+- `(r mut Router) Delete(pattern str, h func(Req, mut Out))`: Delete routes DELETE requests for pattern to h.
+- `(r mut Router) Head(pattern str, h func(Req, mut Out))`: Head routes HEAD requests for pattern to h (without it, they go to the GET route).
+- `(r mut Router) Options(pattern str, h func(Req, mut Out))`: Options routes OPTIONS requests for pattern to h.
+- `(r mut Router) Handle(method str, pattern str, h func(Req, mut Out))`: Handle routes requests with method (any HTTP method name, like "PROPFIND") for pattern to h.
+- `(r mut Router) Any(pattern str, h func(Req, mut Out))`: Any routes requests for pattern with every method to h; a route for the request's own method on the same pattern wins over it.
+- `(r mut Router) Use(mw func(Req, mut Out, func(Req, mut Out)))`: Use adds middleware mw to r. Middleware run in the order added, around every route of r and of the routers mounted in it, and around their 404 and 405 answers. Each gets next, the rest of the chain, and decides whether and when to call it.
+- `(r mut Router) Route(prefix str, build func(mut Router))`: Route groups routes under prefix ("/api"): build adds them to a new router mounted there.
+- `(r mut Router) Mount(prefix str, sub Router)`: Mount serves sub's routes under prefix: "/api" and "/users" make "/api/users", and "/api" and "" make "/api". r's middleware run before sub's, and sub's 404 and 405 answers (with its middleware) cover the paths under prefix.
+- `(r mut Router) NotFound(h func(Req, mut Out))`: NotFound sets the handler for the paths no route matches (under r's prefix when r is mounted); the status starts as 404.
+- `(r mut Router) MethodNotAllowed(h func(Req, mut Out))`: MethodNotAllowed sets the handler for the paths whose routes take other methods; the status starts as 405 and the Allow header lists those methods.
+- `(r Router) Check() !`: Check fails with r's first bad pattern, conflicting route or misplaced mount, the error Serve would fail with before listening.
+- `(r Router) Serve(addr str) !`: Serve listens on addr and serves r on every core, like anvil.Serve. The routes are checked and compiled once, into a table every core reads; Serve fails with r's error, if any (see Check).
+- `(r Router) ServeN(addr str, n i64) !`: ServeN is Serve on exactly n cores.
+- `(r Router) Run(method str, target str, body str) Out`: Run sends one request through r on this thread, as Serve would (middleware, 404, 405), and returns the response: for tests. target is the path and query ("/users/7?full=1"), the request has no headers, and a HEAD response keeps its body. Run panics if r has an error (see Check).
+- `(r Router) Match(method str, path str) str`: Match returns the pattern of the route that would serve method and path ("/users/{id}"), or "" when the request would get 404 or 405. Like Run, it panics if r has an error (see Check).
 
 ## hearth
 

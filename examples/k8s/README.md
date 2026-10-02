@@ -11,7 +11,10 @@ docker build -f examples/k8s/Dockerfile -t tin-api:dev .  # context = repository
 ```
 
 The first stage uses the published `ghcr.io/yasserreslan/tin:0.4.0` compiler image to
-compile the source. Docker selects arm64 or amd64 for the build. Use
+compile the source. `examples/api.tin` routes with `anvil.Router`, which came after 0.4.0:
+until a release includes it, pass a builder made from this tree with
+`--build-arg TIN_BUILDER=...` (`make dist`, then `docker/builder.Dockerfile`, as
+`tools/ci/distribution_check.py` does). Docker selects arm64 or amd64 for the build. Use
 `docker buildx build --platform linux/amd64` to select a different destination, or
 `--platform linux/amd64,linux/arm64 --push -t YOUR_IMAGE` for both. The compiler stays
 in the build stage. See [distribution](../../docs/DISTRIBUTION.md) for local builder overrides.

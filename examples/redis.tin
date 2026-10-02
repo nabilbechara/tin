@@ -14,67 +14,74 @@ import "say"
 //   GET /sleep?ms=N          makes the server pause (DEBUG SLEEP)
 var c = redis.Open(redis.Options{Addr: quarry.Getenv("REDIS_ADDR"), Password: quarry.Getenv("REDIS_PASSWORD")})
 
-func handle(q anvil.Req, w mut anvil.Out) {
+func upstream(w mut anvil.Out, err fault) {
+	w.Status(502)
+	w.Text("{err}")
+}
+
+func incr(q anvil.Req, w mut anvil.Out) {
+	n := c.Incr(q.Param("key")) catch err {
+		upstream(mut w, err)
+		return
+	}
+	w.Text("{n}")
+}
+
+func get(q anvil.Req, w mut anvil.Out) {
 	key := q.Param("key")
-	if q.Path == "/incr" {
-		n := c.Incr(key) catch err {
-			w.Status(502)
-			w.Text("{err}")
-			return
-		}
-		w.Text("{n}")
+	v, found := c.Get(key) catch err {
+		upstream(mut w, err)
 		return
 	}
-	if q.Path == "/get" {
-		v, found := c.Get(key) catch err {
-			w.Status(502)
-			w.Text("{err}")
-			return
-		}
-		if !found {
-			w.Status(404)
-			w.Text("no {key}")
-			return
-		}
-		w.Text(v)
+	if !found {
+		w.Status(404)
+		w.Text("no {key}")
 		return
 	}
-	if q.Path == "/set" {
-		c.Set(key, q.Param("value")) catch err {
-			w.Status(502)
-			w.Text("{err}")
-			return
-		}
-		w.Text("ok")
+	w.Text(v)
+}
+
+func set(q anvil.Req, w mut anvil.Out) {
+	c.Set(q.Param("key"), q.Param("value")) catch err {
+		upstream(mut w, err)
 		return
 	}
-	if q.Path == "/twice" {
-		// MULTI ... EXEC in one Pipe: both increments happen together.
-		rs := c.Pipe([]query{"MULTI", "INCR {key}", "INCR {key}", "EXEC"}) catch err {
-			w.Status(502)
-			w.Text("{err}")
-			return
-		}
-		w.Text("{rs[3]}")
+	w.Text("ok")
+}
+
+func twice(q anvil.Req, w mut anvil.Out) {
+	key := q.Param("key")
+	// MULTI ... EXEC in one Pipe: both increments happen together.
+	rs := c.Pipe([]query{"MULTI", "INCR {key}", "INCR {key}", "EXEC"}) catch err {
+		upstream(mut w, err)
 		return
 	}
-	if q.Path == "/sleep" {
-		// The server pauses (it needs enable-debug-command): commands queued behind wait too.
-		ms := mint.Atoi(q.Param("ms")) catch _ { 100 }
-		secs := f64(ms) / 1000.0
-		_ = c.Do("DEBUG SLEEP {secs}") catch err {
-			w.Status(502)
-			w.Text("{err}")
-			return
-		}
-		w.Text("slept")
+	w.Text("{rs[3]}")
+}
+
+func sleep(q anvil.Req, w mut anvil.Out) {
+	// The server pauses (it needs enable-debug-command): commands queued behind wait too.
+	ms := mint.Atoi(q.Param("ms")) catch _ { 100 }
+	secs := f64(ms) / 1000.0
+	_ = c.Do("DEBUG SLEEP {secs}") catch err {
+		upstream(mut w, err)
 		return
 	}
-	w.Status(404)
+	w.Text("slept")
+}
+
+func no_route(q anvil.Req, w mut anvil.Out) {
 	w.Text("no route {q.Path}")
 }
 
 func main() {
-	err := anvil.Serve(":9184", handle)
+	r := anvil.NewRouter()
+	r.Get("/incr", incr)
+	r.Get("/get", get)
+	r.Get("/set", set)
+	r.Get("/twice", twice)
+	r.Get("/sleep", sleep)
+	r.NotFound(no_route)
+	err := r.Serve(":9184")
 	say.Line("server:", err)
 }

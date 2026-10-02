@@ -13,7 +13,7 @@ shared mutable state between threads.
 - **No GC, no pauses**: request-scoped bump pools plus a long-lived per-core heap, with a
   compile-time check that request memory never escapes without `keep()`.
 - **Thread per core, share nothing**: per-core globals, `hearth` cores, `relay` messages,
-  and an HTTP server (`anvil`) with one kqueue/epoll event loop per core.
+  and an HTTP server (`anvil`) with one kqueue/epoll event loop per core and a router.
 - **Strict**: sized integers with no implicit conversions, non-nil references, `?T`
   optionals, faults that must be handled (`try`), mandatory bounds checks (removed when
   proven safe), `defer`, generics by monomorphization.
@@ -29,18 +29,21 @@ type Message struct {
 	message str
 }
 
-func handle(q anvil.Req, w mut anvil.Out) {
-	if q.Path == "/json" {
-		w.Json()
-		argo.Put(mut w.Body, Message{message: "Hello, World!"})
-		return
-	}
-	w.Status(404)
-	w.Text("not found")
+func hello(q anvil.Req, w mut anvil.Out) {
+	w.Json()
+	argo.Put(mut w.Body, Message{message: "Hello, World!"})
+}
+
+func user(q anvil.Req, w mut anvil.Out) {
+	id := q.PathParam("id")
+	w.Text("user {id}")
 }
 
 func main() {
-	err := anvil.Serve(":8080", handle)
+	r := anvil.NewRouter()
+	r.Get("/json", hello)
+	r.Get(`/users/{id}`, user) // a raw string: in "..." the {id} would interpolate
+	err := r.Serve(":8080")
 	say.Line("server:", err)
 }
 ```
@@ -90,7 +93,7 @@ CI and the issue-to-regression workflow: [docs/CI.md](docs/CI.md).
 |---|---|---|---|---|
 | say | formatting, printing | | quarry | files, env, process |
 | argo | JSON (generated per type) | | trail | paths |
-| anvil | HTTP/1.1 server | | lever | flags |
+| anvil | HTTP/1.1 server, router | | lever | flags |
 | hearth | cores | | tide | time |
 | relay | messages between cores | | dice | random numbers |
 | wire | TCP, HTTP client | | sift | sorting, searching |

@@ -173,6 +173,8 @@ Go binaries for the container: `GOOS=linux GOARCH=arm64 go build -o bin/linux/x 
 | `bench/v2/NAME.tin` + `NAME.go` | CPU benchmarks; build both, time with `/usr/bin/time -l`, outputs must be identical |
 | `examples/demo.tin` + `examples/demo_go` | the mixed demo (primes, sort, SHA-256, JSON, maps), self-timing |
 | `bench/http/hammer` | a Go load generator (wrk-like) with exact latency histograms |
+| `bench/router/router.tin` + `bench/router/go` | routing cost with 1, 20 and 200 routes: a lookup (`Match`) and a whole request through the router (`Run`), against chi's `Find` and `ServeHTTP` |
+| `bench/http/routes.tin` | `/json` and `/plaintext` behind a router of `ROUTES` routes (port 9180, like `examples/api.tin`), for routing inside a served request |
 | `bench/v04/run.py` | `GET /users/{id}` through Redis over MySQL, Tin vs Go + chi under wrk2: max req/s, req per CPU-second, p50/p99/p99.9 at a fixed rate, RSS (needs Redis, MySQL seeded by `bench/v04/seed.py`, and `WRK2`) |
 
 Servers used: `examples/api.tin` (port 9180, `TIN_CORES=n`), `bench/http/fast` (fasthttp,

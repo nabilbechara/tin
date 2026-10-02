@@ -52,6 +52,36 @@ Why anvil is fast:
 - edge-triggered polling;
 - JSON encoders generated per type.
 
+**Routing** (`anvil.Router`, measured on an Apple M4 Pro, not the M3 Pro above).
+`bench/router` times a lookup (`Match`) and a whole request through the router without
+sockets (`Run`: the Req and Out, the lookup, the handler), against the same routes in chi
+(`Find`, and `ServeHTTP` with one parsed request reused and a writer that discards):
+
+| routes, request | Tin lookup | chi lookup | Tin request | chi request |
+|---|---|---|---|---|
+| 1, `GET /res0/42` | 16–17 ns | 36 ns | 39–40 ns | 175 ns |
+| 20, `GET /res7/42` | 17–18 ns | 49 ns | 39–41 ns | 185 ns |
+| 200, `GET /res37/42/items` | 25–27 ns | 65 ns | 51–55 ns | 209 ns |
+| 200, `GET /nope` (404) | 14 ns | 13 ns | 44 ns | 175 ns |
+
+Served on one core with 16 pipelined requests per write (`bin/hammer -c 64 -t 8 -pipeline
+16`), so that the server is the bottleneck; median of 3 interleaved rounds, server CPU time
+per request from `ps`:
+
+| server | /json | CPU per request | /plaintext | CPU per request |
+|---|---|---|---|---|
+| plain handler, anvil before the router | 1.93M req/s | 517 ns | 1.95M req/s | 511 ns |
+| plain handler, anvil with the router | 1.93M req/s | 516 ns | 1.95M req/s | 511 ns |
+| `examples/api.tin` (7 routes, 1 middleware) | 1.88M req/s | 528 ns | 1.88M req/s | 528 ns |
+| `bench/http/routes.tin`, 22 routes | 1.89M req/s | 527 ns | 1.90M req/s | 525 ns |
+| `bench/http/routes.tin`, 202 routes | 1.88M req/s | 530 ns | 1.89M req/s | 527 ns |
+
+Routing adds 10–15 ns to the 516 ns a pipelined request costs, and a plain handler pays
+nothing. Without pipelining, the load generator saturates first on this machine: every
+server above measures 181–190k req/s with hammer (`-c 100 -t 4`). The 316k req/s in the
+first table was measured with wrk on the M3 Pro before the router, and has not been
+re-measured with wrk since.
+
 ## 2. CPU benchmarks (bench/v2, best of 3, output identical to Go)
 
 | benchmark | Tin | Go | Tin/Go |
@@ -102,6 +132,6 @@ The compiler (about 20k lines including `lib/std.tin`, all backends) builds itse
 | program | Tin | Go |
 |---|---|---|
 | hello world (macOS) | 35 KB | 2.5 MB |
-| JSON API server (`examples/api.tin` vs net/http / fasthttp) | 54 KB (macOS), 132 KB (Linux ELF, mostly 64 KiB segment padding) | 8.2 MB / 8.1 MB |
+| JSON API server (`examples/api.tin`, with a Router, vs net/http / fasthttp) | 91 KB (macOS), 132 KB (Linux ELF, mostly 64 KiB segment padding) | 8.2 MB / 8.1 MB |
 
 Programs need no runtime besides libc and libm.
