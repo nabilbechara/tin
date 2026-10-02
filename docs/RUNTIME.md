@@ -172,8 +172,8 @@ close-after-write flag, writing flag, bytes needed. Idle connections hold no buf
   drained.
 - Complete requests are parsed in place:
   - request line;
-  - headers, scanned with `memchr`; only `Content-Length`, `Connection` and
-    `Transfer-Encoding` are interpreted;
+  - headers, scanned with `memchr`; each name must be a token followed by `:`, and
+    only `Content-Length`, `Connection` and `Transfer-Encoding` are interpreted;
   - body.
 - An incomplete request is copied into the connection's own buffer, sized to the
   request when its length is known (up to 64 MiB).
@@ -199,8 +199,9 @@ reading resumes and buffered input is served.
 
 **Limits and errors.**
 - A request line or header block over 64 KiB gets 414 / 431 and close.
-- A malformed request line or bad `Content-Length` gets 400; `Transfer-Encoding`
-  gets 501.
+- A malformed request line, a header line that is not `name: value` (no colon,
+  whitespace before it, obs-fold, a name that is not a token) or a bad
+  `Content-Length` gets 400; `Transfer-Encoding` gets 501.
 - Bodies are limited to 64 MiB (413).
 - HTTP/1.0 closes unless keep-alive is asked for; `Connection: close` is honored.
 - `$PORT` replaces the port of the address passed to `Serve`.
