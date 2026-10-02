@@ -1,7 +1,7 @@
 # Tin
 
-Tin is a compiled, Go-like language for servers and tools on macOS and Linux (arm64;
-x86-64 in progress). It is meant to
+Tin is a compiled, Go-like language for servers and tools on macOS arm64 and Linux
+arm64/amd64. It is meant to
 be written by AI, so it trades human convenience for speed and robustness: the compiler
 rejects ignored errors, nil dereferences, request memory leaking into long-lived state, and
 shared mutable state between threads.
@@ -46,6 +46,23 @@ func main() {
 ```
 
 ## Quick start
+
+Install a release without a local toolchain:
+
+```sh
+curl -fL https://github.com/yasserreslan/tin/releases/download/v0.4.0/install.sh -o install-tin.sh
+sh install-tin.sh 0.4.0
+export PATH="$HOME/.tin/bin:$PATH"
+```
+
+Or compile in Docker:
+
+```sh
+docker run --rm -v "$PWD:/src" ghcr.io/yasserreslan/tin:0.4.0 build app.tin -o app
+```
+
+See [distribution and containers](docs/DISTRIBUTION.md) for checksums, upgrades and
+multi-stage Dockerfiles. To build and test from a source checkout:
 
 ```sh
 make install                  # build bin/tinc from the seed and put `tin` on the PATH

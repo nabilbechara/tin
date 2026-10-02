@@ -7,6 +7,10 @@ for Linux testing.
 
 ## 1. Installing
 
+For prebuilt archives, the checksum-verifying installer and the multi-architecture
+Docker builder, see [DISTRIBUTION.md](DISTRIBUTION.md). The commands below install
+from a source checkout.
+
 ```sh
 make install                    # builds bin/tinc from seed/ and links `tin` into $(PREFIX)/bin
 make install PREFIX=~/.local    # a per-user install: no privileges, ~/.local/bin must be on PATH
@@ -36,7 +40,7 @@ moving or deleting the tree breaks it.
 | `tin version` | version and compiler checksum |
 
 Targets (`--target`): `darwin-arm64` (default on a Mac), `linux-arm64` (default on
-arm64 Linux), `linux-amd64` (in progress). Cross-compiling needs nothing extra: the
+arm64 Linux), `linux-amd64` (supported and tested natively). Cross-compiling needs nothing extra: the
 compiler contains every backend and writes Mach-O or ELF itself.
 
 Programs without a `package` clause use the legacy syntax; `tin` adds `lib/std.tin` to
@@ -71,6 +75,7 @@ tinc [-o OUT] [-S] [-target darwin-arm64|linux-arm64|linux-amd64] FILE.tin...
 | `make linux-amd64-bootstrap` | the same for x86-64 in `tin-debian-amd64` (emulated on an arm64 Mac); refreshes `seed/tinc-linux-amd64` |
 | `make bench` | the legacy CPU benchmarks vs Go (`bench/run.py`) |
 | `make install` | link `tin` into `$(PREFIX)/bin` (created if needed; see §1 for the default) |
+| `make dist` | package the native compiler, library and sources in a versioned archive with a SHA-256 checksum |
 | `make print-VAR` | print a Makefile variable (e.g. `make print-SELF`, the compiler's sources) |
 | `make clean` | remove `bin/` |
 
