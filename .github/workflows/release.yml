@@ -1,0 +1,128 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag on a main commit with green CI
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.version.outputs.sha }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: version
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -c 'import re,os; assert re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?",os.environ["TAG"])'
+          version=$(cat VERSION)
+          test "$TAG" = "v$version"
+          sha=$(git rev-parse HEAD)
+          test "$(git rev-parse "$TAG^{commit}")" = "$sha"
+          git merge-base --is-ancestor "$sha" origin/main
+          passed=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs" --jq '[.check_runs[] | select(.name == "CI" and .conclusion == "success")] | length')
+          test "$passed" -gt 0 || { echo 'Release commit must have a successful CI gate'; exit 1; }
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'This version has already been released; bump VERSION for another release'; exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+  build:
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: darwin-arm64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+          - os: ubuntu-24.04
+            target: linux-amd64
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+      - run: make bootstrap dist
+      - name: Test archives and build native images
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            python3 tools/ci/distribution_check.py "bin/dist/tin-$VERSION-$TARGET.tar.gz" --docker --image "ghcr.io/$GITHUB_REPOSITORY:$VERSION-$TARGET"
+          else
+            python3 tools/ci/distribution_check.py "bin/dist/tin-$VERSION-$TARGET.tar.gz"
+          fi
+      - name: Publish the tested native image
+        if: runner.os == 'Linux'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.validate.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "ghcr.io/$GITHUB_REPOSITORY:$VERSION-$TARGET"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: bin/dist/*
+          retention-days: 7
+          if-no-files-found: error
+  publish:
+    needs: [validate, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.validate.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: release
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - name: Publish the multi-architecture image and release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          cp install.sh release/install.sh
+          cat release/*.sha256 | LC_ALL=C sort > release/SHA256SUMS
+          (cd release && sha256sum install.sh >> SHA256SUMS && sha256sum -c SHA256SUMS)
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          image=ghcr.io/$GITHUB_REPOSITORY
+          docker buildx imagetools create -t "$image:$VERSION" "$image:$VERSION-linux-amd64" "$image:$VERSION-linux-arm64"
+          docker buildx imagetools inspect "$image:$VERSION" --raw | python3 -c 'import json,sys; d=json.load(sys.stdin); assert sorted(m["platform"]["architecture"] for m in d["manifests"]) == ["amd64","arm64"]'
+          if [ "${VERSION#*-}" = "$VERSION" ]; then
+            docker buildx imagetools create -t "$image:latest" "$image:$VERSION"
+            gh release create "v$VERSION" release/*.tar.gz release/SHA256SUMS release/install.sh --verify-tag --title "Tin $VERSION" --generate-notes
+          else
+            gh release create "v$VERSION" release/*.tar.gz release/SHA256SUMS release/install.sh --verify-tag --title "Tin $VERSION" --generate-notes --prerelease
+          fi

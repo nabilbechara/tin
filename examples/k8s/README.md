@@ -1,18 +1,22 @@
 # examples/k8s: the anvil API server in a container and on Kubernetes
 
 `examples/api.tin` is an HTTP/1.1 server built on `anvil` (one event loop per core). This
-directory packages its Linux build: a `Dockerfile`, a `Deployment` + `Service`, and the commands
+directory builds and packages it: a `Dockerfile`, a `Deployment` + `Service`, and the commands
 below. Everything was verified on an arm64 Docker host (Apple silicon).
 
 ## Build
 
 ```sh
-make -s bin/tinc                                                     # the compiler
-TIN_ROOT=$PWD bin/tinc -target linux-arm64 -o bin/linux/api examples/api.tin
-docker build -f examples/k8s/Dockerfile -t tin-api:dev .            # context = repository root
+docker build -f examples/k8s/Dockerfile -t tin-api:dev .  # context = repository root
 ```
 
-The binary is a plain glibc executable (`libc.so.6` + `libm.so.6`), so the image is
+The first stage uses the published `ghcr.io/yasserreslan/tin:0.4.0` compiler image to
+compile the source. Docker selects arm64 or amd64 for the build. Use
+`docker buildx build --platform linux/amd64` to select a different destination, or
+`--platform linux/amd64,linux/arm64 --push -t YOUR_IMAGE` for both. The compiler stays
+in the build stage. See [distribution](../../docs/DISTRIBUTION.md) for local builder overrides.
+
+The binary is a glibc executable (`libc.so.6` + `libm.so.6`), so the final image is
 `debian:bookworm-slim` plus one file; it runs as uid 10001.
 
 ## Run locally with the limits a pod would get

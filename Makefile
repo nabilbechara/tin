@@ -3,7 +3,7 @@ SELF = lib/std.tin selfhost/util.tin selfhost/lex.tin selfhost/types.tin selfhos
        selfhost/sha256.tin selfhost/macho.tin selfhost/elf.tin selfhost/elf_x64.tin selfhost/main.tin \
        selfhost/host_$(HOST_OS).tin
 
-.PHONY: all bootstrap seed test bench clean install linux-bootstrap linux-amd64-bootstrap linux-test
+.PHONY: all bootstrap seed test bench clean install dist linux-bootstrap linux-amd64-bootstrap linux-test
 
 HOST_OS := $(shell uname -s | tr A-Z a-z)
 # Where `make install` links tin: Homebrew's prefix on a Mac that has one, /usr/local elsewhere.
@@ -13,6 +13,11 @@ SEED := seed/tinc-$(HOST_OS)-$(shell uname -m | sed 's/x86_64/amd64/; s/aarch64/
 SELF_LINUX = $(filter-out selfhost/host_darwin.tin selfhost/host_linux.tin,$(SELF)) selfhost/host_linux.tin
 
 all: bin/tinc
+
+# Native release archive. Build on each supported host; releases.yml collects all three.
+DIST_TARGET ?= $(HOST_OS)-$(shell uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
+dist: bin/tinc
+	python3 tools/dist.py --target $(DIST_TARGET)
 
 # The compiler, built by the checked-in seed compiler: no Go, no cc.
 bin/tinc: $(SEED) $(SELF)

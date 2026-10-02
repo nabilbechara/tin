@@ -4,7 +4,7 @@
 |---|---|---|---|
 | darwin-arm64 | complete | Mach-O, ad-hoc signed, linked to libSystem | the original target |
 | linux-arm64 | complete: all tests pass, self-hosts, server passes conformance; tested natively in CI | ELF PIE linked to glibc ≥ 2.34 (tested on 2.36 and 2.41) | container limits, graceful shutdown, `examples/k8s/` |
-| linux-amd64 | working: all strict, regression and legacy tests pass and it self-hosts, in an emulated container | ELF PIE (x86-64) | not yet in CI; no benchmarks on real x86-64 hardware yet |
+| linux-amd64 | complete: all strict, regression and legacy tests pass and it self-hosts; tested natively in CI | ELF PIE (x86-64), glibc ≥ 2.34 | performance benchmarks on dedicated x86-64 hardware remain pending |
 
 Choose a target with `tin build --target T` or `tinc -target T`; the default is the
 machine the compiler runs on. One compiler binary contains every backend.
@@ -50,15 +50,18 @@ The plan (`notes/plan_linux.md`) and the work log (`notes/x64_progress.md`):
   24.
 - `seal.Sha256` uses the portable code until SHA-NI is added (also on arm64 CPUs without
   the SHA-2 instructions, detected through `AT_HWCAP`).
-- Correctness is tested in an emulated amd64 container (`tools/x64fuzz/linuxtest_amd64.sh`,
-  which also runs `tests/regressions`). A native CI job and benchmarks need real x86-64
-  hardware (GitHub's x86-64 runners would do for CI, once a linux-amd64 seed is committed).
+- Correctness and self-hosting run natively on GitHub's `ubuntu-24.04` x86-64 runner.
+  `tools/x64fuzz/linuxtest_amd64.sh` also checks the strict and regression suites in a
+  container, emulated when the host is arm64. Dedicated x86-64 performance benchmarks
+  remain pending.
 
 ## 4. Containers and Kubernetes
 
 `examples/k8s/` has a Dockerfile, a Deployment + Service manifest and a README.
 
-- Build on a Mac: `tin build --target linux-arm64 app.tin -o bin/linux/app`.
+- Build from source in Docker with the multi-stage example; no host compiler is needed.
+  The published builder supports amd64 and arm64; see [DISTRIBUTION.md](DISTRIBUTION.md).
+  Or cross-compile on a Mac: `tin build --target linux-arm64 app.tin -o bin/linux/app`.
 - Image: `FROM debian:bookworm-slim`, copy the binary, run as a non-root user.
 - `anvil.Serve(":8080", h)` binds 0.0.0.0; `$PORT` overrides the port.
 - Cores: anvil runs `hearth.Cores()` event loops. On Linux, `hearth.Cores()` is the
