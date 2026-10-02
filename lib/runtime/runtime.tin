@@ -1241,6 +1241,103 @@ func rt_map_val(m i64, i i64) i64 {
 	return m[3][i]
 }
 
+// rt_map_len is the number of entries of m (0 for the zero map).
+func rt_map_len(m i64) i64 {
+	if m == 0 {
+		return 0
+	}
+	return m[0]
+}
+
+// Key kinds for rt_map_order: how the stored key words compare.
+const keySigned = 0
+const keyStr = 1
+const keyFloat = 2
+const keyUnsigned = 3 // unsigned integers and bool
+
+// rt_key_less orders two keys of a map the way Go's fmt prints them: numbers by value (unsigned
+// above 2^63 as unsigned, floats as floats with NaN first), strings bytewise, false before true.
+func rt_key_less(m i64, kind i64, a i64, b i64) bool {
+	ka := rt_map_key(m, a)
+	kb := rt_map_key(m, b)
+	if kind == keyStr {
+		return rt_str_cmp(cast(str, ka), cast(str, kb)) < 0
+	}
+	if kind == keyFloat {
+		x := cast(f64, ka)
+		y := cast(f64, kb)
+		return x < y || (x != x && y == y)
+	}
+	if kind == keyUnsigned {
+		return u64(ka) < u64(kb)
+	}
+	return ka < kb
+}
+
+// rt_map_order returns the live slots of m sorted by key, as an array of rt_map_len(m) words in
+// the current request's memory. Printing a map is the only user, and it must not depend on the
+// order the entries were added in.
+func rt_map_order(m i64, kind i64) i64 {
+	n := rt_map_len(m)
+	order := rt_alloc(8*n + 8)
+	k := 0
+	for i := 0; i < rt_map_slots(m); i++ {
+		if rt_map_live(m, i) {
+			order[k] = i
+			k++
+		}
+	}
+	if n < 2 {
+		return order
+	}
+	// Bottom-up merge sort (stable, O(n log n)): a map may be large.
+	tmp := rt_alloc(8*n + 8)
+	for width := 1; width < n; width *= 2 {
+		for lo := 0; lo < n; lo += 2 * width {
+			mid := lo + width
+			if mid > n {
+				mid = n
+			}
+			hi := lo + 2*width
+			if hi > n {
+				hi = n
+			}
+			i := lo
+			j := mid
+			o := lo
+			for i < mid && j < hi {
+				if rt_key_less(m, kind, order[j], order[i]) {
+					tmp[o] = order[j]
+					j++
+				} else {
+					tmp[o] = order[i]
+					i++
+				}
+				o++
+			}
+			for i < mid {
+				tmp[o] = order[i]
+				i++
+				o++
+			}
+			for j < hi {
+				tmp[o] = order[j]
+				j++
+				o++
+			}
+		}
+		for i := 0; i < n; i++ {
+			order[i] = tmp[i]
+		}
+	}
+	return order
+}
+
+// rt_order_at is word j of an array returned by rt_map_order.
+func rt_order_at(order i64, j i64) i64 {
+	return order[j]
+}
+
 // ---- formatting ----
 //
 // fmt calls compile to begin, one typed call per argument, then end. A frame holds the
@@ -2061,71 +2158,6 @@ func rt_fmt_slt(s []bool) {
 		}
 	}
 	fb_byte(f, ']')
-}
-
-// maps print as map[k:v ...] with keys sorted, like Go.
-func rt_fmt_map(m i64, strkeys i64, vkind i64) {
-	f := rt_frame()
-	verb := rt_fmt_arg(f, false)
-	fb_str(f, "map[")
-	n := 0
-	if m != 0 {
-		n = m[0]
-	}
-	order := rt_alloc(8*n + 8)
-	k := 0
-	for i := 0; i < rt_map_slots(m); i++ {
-		if rt_map_live(m, i) {
-			order[k] = i
-			k++
-		}
-	}
-	// Insertion sort of slot indexes by key: printing maps is not a hot path.
-	for i := 1; i < n; i++ {
-		x := order[i]
-		j := i - 1
-		for j >= 0 && rt_key_less(m, strkeys, x, order[j]) {
-			order[j+1] = order[j]
-			j--
-		}
-		order[j+1] = x
-	}
-	for i := 0; i < n; i++ {
-		if i > 0 {
-			fb_byte(f, ' ')
-		}
-		slot := order[i]
-		if strkeys != 0 {
-			fmt_string(f, cast(str, rt_map_key(m, slot)), verb)
-		} else {
-			fmt_int(f, rt_map_key(m, slot), verb)
-		}
-		fb_byte(f, ':')
-		v := rt_map_val(m, slot)
-		if vkind == 1 {
-			fmt_string(f, cast(str, v), verb)
-		} else if vkind == 2 {
-			fmt_float(f, cast(f64, v), verb)
-		} else if vkind == 3 {
-			if v != 0 {
-				fb_str(f, "true")
-			} else {
-				fb_str(f, "false")
-			}
-		} else {
-			fmt_int(f, v, verb)
-		}
-	}
-	fb_byte(f, ']')
-}
-
-func rt_key_less(m i64, strkeys i64, a i64, b i64) bool {
-	ka := rt_map_key(m, a)
-	kb := rt_map_key(m, b)
-	if strkeys != 0 {
-		return rt_str_cmp(cast(str, ka), cast(str, kb)) < 0
-	}
-	return ka < kb
 }
 
 // rt_fmt_finish completes the frame (rest of the format, or the newline) and pops it.

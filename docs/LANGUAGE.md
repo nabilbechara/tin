@@ -171,8 +171,9 @@ Use `keep(x)` (a deep copy into long-lived memory) or explicit copies (`copy`,
   `m[k] += 1` updates; `delete(m, k)` removes; `len(m)` counts.
 - `for k, v := range m` iterates in **insertion order**: a new key goes last, updating a
   key keeps its place, and deleting then re-adding moves it to the end. JSON output and
-  `atlas.Keys` / `atlas.Values` follow the same order; printing a map sorts str and number
-  keys like Go.
+  `atlas.Keys` / `atlas.Values` follow the same order; printing a map sorts its keys like Go
+  (strings bytewise, numbers by value, floats with NaN first, `false` before `true`) and prints
+  each key and value with its own type.
 - Keys are `str`, integers, `bool`, `f64` (by bits), or structs and enums made only of
   those, which hash and compare **by value**. A struct key is copied in, so changing the
   original afterwards does not change the map. Slices, maps, funcs, optionals and faults

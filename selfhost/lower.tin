@@ -3080,17 +3080,7 @@ fn say_arg(a, prefix) {
     } else if k == K_MAP && key_composite(t[TY_KEY]) {
         return say_map_keyed(a, t, prefix);
     } else if k == K_MAP {
-        let kk = kind_of(t[TY_KEY]) == K_STRING;
-        let vk = 0;
-        let ek = kind_of(t[TY_ELEM]);
-        if ek == K_STRING {
-            vk = 1;
-        } else if ek == K_FLOAT {
-            vk = 2;
-        } else if ek == K_BOOL {
-            vk = 3;
-        }
-        return rt_call(pos, str_cat3(prefix, "map", ""), args3(a, mk_int(pos, kk, ty_int), mk_int(pos, vk, ty_int)), ty_void);
+        return say_map_sorted(a, t, prefix);
     } else if k != K_INT && k != K_UINT {
         suffix = "p";
     }
@@ -3182,6 +3172,62 @@ fn say_enum(a, t, prefix) {
     let stmts = vec_new();
     vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "argsep", ""), vec_new(), ty_void)));
     vec_push(stmts, expr_stmt(call_fn(pos, say_enum_fn(t, prefix), args1(a), ty_void)));
+    vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "argend", ""), vec_new(), ty_void)));
+    return mk_seq(pos, stmts, mk_int(pos, 0, ty_int), ty_void);
+}
+
+// map_key_kind is the kind rt_map_order sorts a map's key words by: 0 signed integers, 1 str,
+// 2 f64, 3 unsigned integers and bool.
+fn map_key_kind(kt) {
+    let k = kind_of(kt);
+    if k == K_STRING {
+        return 1;
+    }
+    if k == K_FLOAT {
+        return 2;
+    }
+    if k == K_BOOL || is_unsigned_t(kt) {
+        return 3;
+    }
+    return 0;
+}
+
+// say_map_sorted prints a map with str, number or bool keys as map[k:v ...], the entries in the
+// order Go prints them (by key), and each key and value through its own static type, so a float
+// key reads as a float and a slice or map value prints its elements.
+fn say_map_sorted(a, t, prefix) {
+    let pos = a[N_POS];
+    let kt = t[TY_KEY];
+    let stmts = vec_new();
+    vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "argsep", ""), vec_new(), ty_void)));
+    let m = temp(pos, a, t);
+    vec_push(stmts, m);
+    let ord = temp(pos, rt_call(pos, "rt_map_order", args2(sym_ref_node(pos, m[LET_SYM]), mk_int(pos, map_key_kind(kt), ty_int)), ty_int), ty_int);
+    vec_push(stmts, ord);
+    let n = temp(pos, rt_call(pos, "rt_map_len", args1(sym_ref_node(pos, m[LET_SYM])), ty_int), ty_int);
+    vec_push(stmts, n);
+    vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, "map[")), ty_void)));
+    let j = declare_local(pos, "$", ty_int);
+    vec_push(stmts, let_stmt(pos, j, mk_int(pos, 0, ty_int)));
+    let w = node_new(ST_WHILE, pos);
+    w[WH_COND] = mk_bin(pos, "<", sym_ref_node(pos, j), sym_ref_node(pos, n[LET_SYM]), ty_bool);
+    w[WH_POST] = assign_stmt(pos, sym_ref_node(pos, j), mk_bin(pos, "+", sym_ref_node(pos, j), mk_int(pos, 1, ty_int), ty_int));
+    let wb = empty_block(pos);
+    w[WH_BODY] = wb;
+    let sep = node_new(ST_IF, pos);
+    sep[IF_COND] = mk_bin(pos, ">", sym_ref_node(pos, j), mk_int(pos, 0, ty_int), ty_bool);
+    sep[IF_THEN] = empty_block(pos);
+    vec_push(sep[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, " ")), ty_void)));
+    vec_push(wb[BLK_STMTS], sep);
+    let slot = temp(pos, rt_call(pos, "rt_order_at", args2(sym_ref_node(pos, ord[LET_SYM]), sym_ref_node(pos, j)), ty_int), ty_int);
+    vec_push(wb[BLK_STMTS], slot);
+    let kv = from_bits(rt_call(pos, "rt_map_key", args2(sym_ref_node(pos, m[LET_SYM]), sym_ref_node(pos, slot[LET_SYM])), ty_int), kt);
+    vec_push(wb[BLK_STMTS], expr_stmt(say_arg(kv, prefix)));
+    vec_push(wb[BLK_STMTS], expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, ":")), ty_void)));
+    let vv = from_bits(rt_call(pos, "rt_map_val", args2(sym_ref_node(pos, m[LET_SYM]), sym_ref_node(pos, slot[LET_SYM])), ty_int), t[TY_ELEM]);
+    vec_push(wb[BLK_STMTS], expr_stmt(say_arg(vv, prefix)));
+    vec_push(stmts, w);
+    vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, "]")), ty_void)));
     vec_push(stmts, expr_stmt(rt_call(pos, str_cat3(prefix, "argend", ""), vec_new(), ty_void)));
     return mk_seq(pos, stmts, mk_int(pos, 0, ty_int), ty_void);
 }
