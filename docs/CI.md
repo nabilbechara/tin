@@ -5,7 +5,7 @@ Every push to `main` and every pull request runs native Linux arm64 (`ubuntu-24.
 ## What is tested
 
 - Clean build from the committed seed and two byte-identical self-hosted compiler rebuilds.
-- Every `tests/v2/*.tin`, including negative compilation tests and their exact diagnostics. Missing expected output, compiler crashes, process crashes, nonzero exit and timeouts fail. Each run uses fresh executable paths.
+- Every `tests/v2/*.tin`, including negative compilation tests and their exact diagnostics. Missing expected output, compiler crashes, process crashes, nonzero exit and timeouts fail. Each run uses fresh executable paths. `tests/v2/*_asm.tin` files are compiled with `-S` instead and their listing matched against the ordered `CHECK:`/`CHECK-NOT:` lines in `*_asm.check` (the CPU's section), so a codegen change that loses a direct call, or turns it into an indirect one, fails.
 - Memory regressions: bounds panics, allocation size overflow and negative lengths, large first allocations, single evaluation of allocation lengths, read-only and region checking through indirect calls, nested zero values, deep `keep` ownership and 200 request-pool reset/reuse cycles.
 - Linux HTTP framing/conformance, stable RSS over two million requests after warmup, and graceful shutdown. Throughput is reported, never used as a performance threshold.
 - Request tasks (`task_check.py`): waits on one core overlap, fast requests stay fast behind waiting ones (timers, proxied `wire` calls, helper-thread file I/O), deadlines give 504, refused upstreams 502, and pipelined responses keep their order.

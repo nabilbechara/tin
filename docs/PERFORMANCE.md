@@ -183,3 +183,24 @@ The compiler (about 20k lines including `lib/std.tin`, all backends) builds itse
 | JSON API server (`examples/api.tin`, with a Router, vs net/http / fasthttp) | 91 KB (macOS), 132 KB (Linux ELF, mostly 64 KiB segment padding) | 8.2 MB / 8.1 MB |
 
 Programs need no runtime besides libc (Linux) or libSystem (macOS); the math library is Tin, so libm is not linked.
+
+## 5. Shape dispatch (static, monomorphized)
+
+A call through a shape-constrained type parameter must cost what a hand-written call costs
+(roadmap #141, "static dispatch by monomorphization"). `bench/dispatch/dispatch.tin` runs the
+same work both ways (build an 8-byte buffer, copy three bytes through `Read`), 2,000,000
+iterations per round, best of 5 rounds, on the arm64 development machine:
+
+| form | ns/op (three runs) |
+|---|---|
+| through `Reader` (shape-constrained, monomorphized) | 10.72, 11.00, 10.67 |
+| hand-written `drainBuf(b Buf)` | 10.52, 10.89, 10.85 |
+| ratio | 1.019, 1.010, 0.983 |
+
+The two functions' generated bodies are instruction-identical after normalizing labels:
+`tinc -S` prints `_drainBuf` and `_Drain[Buf]` as the same instruction sequence. Across the
+machines it has been run on, the ratio stays within a few percent (0.97 to 1.02), i.e. there
+is no dispatch overhead. The committed check `tests/v2/shapes_dispatch_asm.tin` + `.check`
+asserts the direct call (`bl _Buf.Read` on arm64, `call S<n>  # Buf.Read` on amd64) and that
+no indirect call follows it in the listing, on every target in CI.
+

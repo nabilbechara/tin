@@ -22,7 +22,7 @@ ELF for Linux); no external toolchain is involved.
 | `opt.tin` | analysis (leaf functions, uses, address-taken), loop-invariant code motion, strided prefetch |
 | `gen.tin` | the arm64 code generator; hand-assembled SHA-256 |
 | `asm.tin` | the arm64 instruction list, its text printer (`-S`) and its encoder |
-| `asm_x64.tin` | the x86-64 instruction list, printer and encoder (fuzzed against objdump) |
+| `asm_x64.tin` | the x86-64 instruction list, printer and encoder (fuzzed against objdump); its `-S` listing names each direct call's target (`call S3  # Buf.Read`) |
 | `gen_x64.tin`, `elf_x64.tin` | the x86-64 backend and linker (in progress) |
 | `sha256.tin` | SHA-256 for code signatures and the Mach-O UUID |
 | `macho.tin` | the macOS linker: layout, import stubs, GOT binding, symbols, ad-hoc signature |

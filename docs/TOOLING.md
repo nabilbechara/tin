@@ -88,6 +88,7 @@ passes.
 | suite | where | how it checks |
 |---|---|---|
 | strict tests | `tests/v2/*.tin` | `tools/v2test.sh`: compiles and runs each, sorts the output and compares it with `NAME.out`; `NAME_bad.tin` must fail to compile with exactly `NAME_bad.err` |
+| assembly checks | `tests/v2/*_asm.tin` + `*_asm.check` | `tools/v2test.sh`: compiles with `-S` and matches the listing against ordered `CHECK:`/`CHECK-NOT:` lines, lit-style; a `[arm64]`/`[amd64]` line selects a section, lines before any section apply to every CPU |
 | Linux | same files | `tools/linuxtest.sh`: cross-compiles for linux-arm64, runs in `tin-debian-arm64`, compares with the same `.out` files |
 | HTTP conformance | `bench/http/conformance` | 26 edge cases against a running server: `bin/conformance -addr 127.0.0.1:9180 -pid PID` |
 | x86-64 encoder | `tools/x64fuzz` | `tools/x64fuzz/run.sh [COUNT] [SEED]`: random instructions vs `x86_64-linux-gnu-objdump` |
@@ -176,6 +177,7 @@ Go binaries for the container: `GOOS=linux GOARCH=arm64 go build -o bin/linux/x 
 | `bench/http/run_pipelined.sh "1 2 4"` | the same with 16 pipelined requests per write (wrk Lua script) |
 | `bin/linux/bench.sh` (inside `tin-bench-arm64`) | the same comparison on Linux |
 | `bench/v2/NAME.tin` + `NAME.go` | CPU benchmarks; build both, time with `/usr/bin/time -l`, outputs must be identical |
+| `bench/dispatch/dispatch.tin` | shape dispatch against a hand-written call (Tin only, no Go twin): ns/op of each and their ratio; see PERFORMANCE.md section 5 |
 | `examples/demo.tin` + `examples/demo_go` | the mixed demo (primes, sort, SHA-256, JSON, maps), self-timing |
 | `bench/http/hammer` | a Go load generator (wrk-like) with exact latency histograms |
 | `bench/router/router.tin` + `bench/router/go` | routing cost with 1, 20 and 200 routes: a lookup (`Match`) and a whole request through the router (`Run`), against chi's `Find` and `ServeHTTP` |
