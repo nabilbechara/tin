@@ -921,9 +921,9 @@ Files under `lib/` are trusted and may use operations user code cannot:
   `__atomic_store`; `__yield` (a spin-wait hint);
 - `__ctx()` / `__set_ctx(p)` (the core context register), `__fp()` (the frame pointer),
   `__empty()` (the static empty slice header), `&x` (address of a local or global);
-- `extern func name(params) R` declarations of system library functions (variadic C
-  functions need `...` in the declaration); C int results are valid in the low 32 bits:
-  convert with `i64(i32(x))`;
+- `extern func name(params) R` declarations of system library functions, and calls to
+  them (variadic C functions need `...` in the declaration); C int results are valid in
+  the low 32 bits: convert with `i64(i32(x))`;
 - `shared var` (one process-wide variable, not per core) for the runtime's own state;
 - the runtime's `rt_` functions (see RUNTIME.md).
 
