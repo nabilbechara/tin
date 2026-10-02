@@ -7,6 +7,8 @@
 | tide | time | identical |
 | dice | same algorithms in Go | identical |
 | sift | slices/sort | identical |
+| sift (generic: Sort, SortFunc, SortStableFunc, Insert, Delete, Compact, BinarySearch ...) | slices, cmp (`bench/ref/sift/generic.go`) | identical on 149 lines, including the order of equal elements after SortFunc on 119 inputs of 7 shapes up to 20,000 elements; the port is Go's pdqsort, and changing one shift constant in it breaks 16 lines |
+| atlas | maps (`bench/ref/atlas`) | identical; Keys and Values come back in insertion order, so the test sorts them |
 | cairn | hand-written Go equivalents | identical |
 | trail | path/filepath | identical |
 | quarry | os | identical except stderr interleaving and naming fdopendir instead of open in one error |

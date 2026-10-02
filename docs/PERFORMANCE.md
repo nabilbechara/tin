@@ -155,6 +155,23 @@ them out of the function, and small functions that Go inlines (`IsNaN`, `Copysig
 called by `Pow` and `Atan2`) but Tin does not, because its inliner takes only single-statement
 functions. These functions make a good benchmark for that work.
 
+## 3c. Sorting (sift)
+
+`sift.Sort` and `sift.SortFunc` are Go's pattern-defeating quicksort ported to Tin (the same algorithm, so
+the order of equal elements matches Go's too). 2,000,000 elements, best of 3, Apple M3 Pro, one thread,
+milliseconds:
+
+| sort | Tin | Go | Tin/Go |
+|---|---|---|---|
+| `sift.Sort` on i64 (generic) | 233 | 182 | 1.28 |
+| `sift.Ints` (the older i64-only code, hand-tuned) | 159 | 182 | 0.87 |
+| `sift.Sort` on f64 | 267 | 228 | 1.17 |
+| `sift.SortFunc` on 16-byte structs by key | 388 | 276 | 1.41 |
+
+The generic code is slower than `Ints` for the same reason the math functions are slower than Go's:
+comparisons that Go inlines are calls here (the comparator form), and Tin's inliner takes only
+single-statement functions. `Ints` and `Strs` stay for programs that sort those and nothing else.
+
 ## 4. Compile times and binary sizes
 
 The compiler (about 20k lines including `lib/std.tin`, all backends) builds itself in 0.07 s

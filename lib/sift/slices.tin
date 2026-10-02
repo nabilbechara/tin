@@ -1,0 +1,457 @@
+package sift
+
+// Sort sorts xs in ascending order, in place. Floating-point NaNs sort first. It is not stable,
+// and the order of equal elements is the same as Go's slices.Sort.
+func Sort[E i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str](xs mut []E) {
+	n := len(xs)
+	pdqsortOrdered(mut xs, 0, n, bitLen(n))
+}
+
+// SortFunc sorts xs in place by cmp, which returns a negative number when a sorts before b, zero
+// when they are equal and a positive number after. It is not stable.
+func SortFunc[E any](xs mut []E, cmp func(E, E) i64) {
+	n := len(xs)
+	pdqsortCmpFunc(mut xs, 0, n, bitLen(n), cmp)
+}
+
+// SortStableFunc is SortFunc, keeping the original order of elements that compare equal.
+func SortStableFunc[E any](xs mut []E, cmp func(E, E) i64) {
+	stableCmpFunc(mut xs, len(xs), cmp)
+}
+
+// IsSorted reports whether xs is in ascending order.
+func IsSorted[E i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str](xs []E) bool {
+	for i := len(xs) - 1; i > 0; i-- {
+		if less(xs[i], xs[i-1]) {
+			return false
+		}
+	}
+	return true
+}
+
+// IsSortedFunc reports whether xs is sorted by cmp.
+func IsSortedFunc[E any](xs []E, cmp func(E, E) i64) bool {
+	for i := len(xs) - 1; i > 0; i-- {
+		if cmp(xs[i], xs[i-1]) < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// Less is cmp.Less: x < y, with NaN smaller than every other value (and so before them in Sort).
+func Less[E i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str](x E, y E) bool {
+	return x < y || (x != x && y == y)
+}
+
+// Cmp is cmp.Compare: -1 if x sorts before y, 0 if they are equal, +1 after. NaNs are equal to each
+// other and sort before every other value.
+func Cmp[E i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str](x E, y E) i64 {
+	xNaN := x != x
+	yNaN := y != y
+	if xNaN {
+		if yNaN {
+			return 0
+		}
+		return -1
+	}
+	if yNaN {
+		return 1
+	}
+	if x < y {
+		return -1
+	}
+	if x > y {
+		return 1
+	}
+	return 0
+}
+
+// BinarySearch searches the sorted xs for target and returns the position where it is, or would
+// be inserted, and whether it is there.
+func BinarySearch[E i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str](xs []E, target E) (i64, bool) {
+	n := len(xs)
+	// Invariant: xs[i-1] < target, xs[j] >= target.
+	i := 0
+	j := n
+	for i < j {
+		h := (i + j) >> 1
+		if less(xs[h], target) {
+			i = h + 1
+		} else {
+			j = h
+		}
+	}
+	return i, i < n && (xs[i] == target || (xs[i] != xs[i] && target != target))
+}
+
+// BinarySearchFunc is BinarySearch for a target of another type, ordered by cmp(element, target).
+func BinarySearchFunc[E any, T any](xs []E, target T, cmp func(E, T) i64) (i64, bool) {
+	n := len(xs)
+	i := 0
+	j := n
+	for i < j {
+		h := (i + j) >> 1
+		if cmp(xs[h], target) < 0 {
+			i = h + 1
+		} else {
+			j = h
+		}
+	}
+	return i, i < n && cmp(xs[i], target) == 0
+}
+
+// Min returns the smallest element of xs; a NaN anywhere gives NaN. It panics if xs is empty. (-0
+// and +0 compare equal here, so a mix of them returns whichever comes first.)
+func Min[E i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str](xs []E) E {
+	if len(xs) < 1 {
+		panic("sift.Min: empty slice")
+	}
+	m := xs[0]
+	if m != m {
+		return m
+	}
+	for i := 1; i < len(xs); i++ {
+		v := xs[i]
+		if v != v {
+			return v
+		}
+		if v < m {
+			m = v
+		}
+	}
+	return m
+}
+
+// Max returns the largest element of xs; a NaN anywhere gives NaN. It panics if xs is empty.
+func Max[E i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str](xs []E) E {
+	if len(xs) < 1 {
+		panic("sift.Max: empty slice")
+	}
+	m := xs[0]
+	if m != m {
+		return m
+	}
+	for i := 1; i < len(xs); i++ {
+		v := xs[i]
+		if v != v {
+			return v
+		}
+		if v > m {
+			m = v
+		}
+	}
+	return m
+}
+
+// MinFunc returns the first smallest element of xs by cmp. It panics if xs is empty.
+func MinFunc[E any](xs []E, cmp func(E, E) i64) E {
+	if len(xs) < 1 {
+		panic("sift.MinFunc: empty slice")
+	}
+	m := xs[0]
+	for i := 1; i < len(xs); i++ {
+		if cmp(xs[i], m) < 0 {
+			m = xs[i]
+		}
+	}
+	return m
+}
+
+// MaxFunc returns the first largest element of xs by cmp. It panics if xs is empty.
+func MaxFunc[E any](xs []E, cmp func(E, E) i64) E {
+	if len(xs) < 1 {
+		panic("sift.MaxFunc: empty slice")
+	}
+	m := xs[0]
+	for i := 1; i < len(xs); i++ {
+		if cmp(xs[i], m) > 0 {
+			m = xs[i]
+		}
+	}
+	return m
+}
+
+// Index returns the position of the first element equal to v, or -1.
+func Index[E comparable](xs []E, v E) i64 {
+	for i := range xs {
+		if v == xs[i] {
+			return i
+		}
+	}
+	return -1
+}
+
+// IndexFunc returns the position of the first element for which f is true, or -1.
+func IndexFunc[E any](xs []E, f func(E) bool) i64 {
+	for i := range xs {
+		if f(xs[i]) {
+			return i
+		}
+	}
+	return -1
+}
+
+// Contains reports whether v is in xs.
+func Contains[E comparable](xs []E, v E) bool {
+	return Index(xs, v) >= 0
+}
+
+// ContainsFunc reports whether f is true for some element of xs.
+func ContainsFunc[E any](xs []E, f func(E) bool) bool {
+	return IndexFunc(xs, f) >= 0
+}
+
+// Equal reports whether a and b have the same length and equal elements.
+func Equal[E comparable](a []E, b []E) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// EqualFunc is Equal for two element types, with eq deciding.
+func EqualFunc[A any, B any](a []A, b []B, eq func(A, B) bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if !eq(a[i], b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// Compare compares a and b element by element with Cmp, then by length: -1, 0 or +1.
+func Compare[E i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str](a []E, b []E) i64 {
+	for i := range a {
+		if i >= len(b) {
+			return 1
+		}
+		c := Cmp(a[i], b[i])
+		if c != 0 {
+			return c
+		}
+	}
+	if len(a) < len(b) {
+		return -1
+	}
+	return 0
+}
+
+// CompareFunc is Compare for two element types, with cmp comparing elements.
+func CompareFunc[A any, B any](a []A, b []B, cmp func(A, B) i64) i64 {
+	for i := range a {
+		if i >= len(b) {
+			return 1
+		}
+		c := cmp(a[i], b[i])
+		if c != 0 {
+			return c
+		}
+	}
+	if len(a) < len(b) {
+		return -1
+	}
+	return 0
+}
+
+// Reverse reverses xs in place.
+func Reverse[E any](xs mut []E) {
+	i := 0
+	j := len(xs) - 1
+	for i < j {
+		xs[i], xs[j] = xs[j], xs[i]
+		i++
+		j--
+	}
+}
+
+// Clone returns a copy of xs that shares nothing with it.
+func Clone[E any](xs []E) []E {
+	out := make([]E, 0, len(xs))
+	for _, x := range xs {
+		out = append(out, x)
+	}
+	return out
+}
+
+// Grow returns a copy of xs with room for n more elements before it has to grow again.
+func Grow[E any](xs []E, n i64) []E {
+	if n < 0 {
+		panic("sift.Grow: n cannot be negative")
+	}
+	out := make([]E, 0, len(xs)+n)
+	for _, x := range xs {
+		out = append(out, x)
+	}
+	return out
+}
+
+// Concat returns a new slice holding a followed by b.
+func Concat[E any](a []E, b []E) []E {
+	out := make([]E, 0, len(a)+len(b))
+	for _, x := range a {
+		out = append(out, x)
+	}
+	for _, x := range b {
+		out = append(out, x)
+	}
+	return out
+}
+
+// ConcatAll returns a new slice holding every slice of parts, in order.
+func ConcatAll[E any](parts [][]E) []E {
+	size := 0
+	for _, p := range parts {
+		size += len(p)
+	}
+	out := make([]E, 0, size)
+	for _, p := range parts {
+		for _, x := range p {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+// Repeat returns a new slice that repeats xs count times.
+func Repeat[E any](xs []E, count i64) []E {
+	if count < 0 {
+		panic("sift.Repeat: count cannot be negative")
+	}
+	out := make([]E, 0, len(xs)*count)
+	for k := 0; k < count; k++ {
+		for _, x := range xs {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+// Insert inserts v at position i (0 to len(xs)) and returns the longer slice. Like append, it
+// grows xs in place, so every other reference to the same slice sees the new length.
+func Insert[E any](xs mut []E, i i64, v E) []E {
+	n := len(xs)
+	if i < 0 || i > n {
+		panic("sift.Insert: index out of range")
+	}
+	xs = append(xs, v)
+	for k := n; k > i; k-- {
+		xs[k] = xs[k-1]
+	}
+	xs[i] = v
+	return xs
+}
+
+// InsertAll inserts all of vs at position i and returns the longer slice (grown in place, as Insert).
+func InsertAll[E any](xs mut []E, i i64, vs []E) []E {
+	n := len(xs)
+	if i < 0 || i > n {
+		panic("sift.InsertAll: index out of range")
+	}
+	m := len(vs)
+	if m == 0 {
+		return xs
+	}
+	xs = append(xs, vs...)
+	// xs is now xs[:i] + xs[i:n] + vs: rotate the tail so that vs comes before xs[i:n].
+	rotateLeft(mut xs, i, n+m, n-i)
+	return xs
+}
+
+// rotateLeft rotates xs[a:b] left by k places, by three reversals.
+func rotateLeft[E any](xs mut []E, a i64, b i64, k i64) {
+	reverseSpan(mut xs, a, a+k)
+	reverseSpan(mut xs, a+k, b)
+	reverseSpan(mut xs, a, b)
+}
+
+func reverseSpan[E any](xs mut []E, a i64, b i64) {
+	i := a
+	j := b - 1
+	for i < j {
+		xs[i], xs[j] = xs[j], xs[i]
+		i++
+		j--
+	}
+}
+
+// Delete removes xs[i:j] and returns the shorter slice; the elements after j move down in place.
+func Delete[E any](xs mut []E, i i64, j i64) []E {
+	n := len(xs)
+	if i < 0 || j < i || j > n {
+		panic("sift.Delete: bounds out of range")
+	}
+	if i == j {
+		return xs
+	}
+	d := j - i
+	for k := j; k < n; k++ {
+		xs[k-d] = xs[k]
+	}
+	return xs[:n-d]
+}
+
+// DeleteFunc removes the elements for which del is true, in place, and returns the shorter slice.
+func DeleteFunc[E any](xs mut []E, del func(E) bool) []E {
+	i := IndexFunc(xs, del)
+	if i == -1 {
+		return xs
+	}
+	for j := i + 1; j < len(xs); j++ {
+		v := xs[j]
+		if !del(v) {
+			xs[i] = v
+			i++
+		}
+	}
+	return xs[:i]
+}
+
+// Replace replaces xs[i:j] with vs and returns the resulting slice (grown or shrunk in place).
+func Replace[E any](xs mut []E, i i64, j i64, vs []E) []E {
+	n := len(xs)
+	if i < 0 || j < i || j > n {
+		panic("sift.Replace: bounds out of range")
+	}
+	xs = Delete(mut xs, i, j)
+	return InsertAll(mut xs, i, vs)
+}
+
+// Compact removes runs of equal consecutive elements, keeping the first of each run, in place, and
+// returns the shorter slice.
+func Compact[E comparable](xs mut []E) []E {
+	if len(xs) < 2 {
+		return xs
+	}
+	k := 1
+	for r := 1; r < len(xs); r++ {
+		if xs[r] != xs[k-1] {
+			xs[k] = xs[r]
+			k++
+		}
+	}
+	return xs[:k]
+}
+
+// CompactFunc is Compact with eq deciding which neighbours are equal.
+func CompactFunc[E any](xs mut []E, eq func(E, E) bool) []E {
+	if len(xs) < 2 {
+		return xs
+	}
+	k := 1
+	for r := 1; r < len(xs); r++ {
+		if !eq(xs[r], xs[k-1]) {
+			xs[k] = xs[r]
+			k++
+		}
+	}
+	return xs[:k]
+}

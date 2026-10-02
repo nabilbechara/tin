@@ -66,7 +66,7 @@ Ordered by import path, as `go list std` prints them.
 | `archive/zip` |  | missing |  | zip archives; needs compress/flate |
 | `bufio` | 18+3 | partial | flume | buffered Reader (Line, Byte, ReadAll) and Writer (Str, Int, Flush); no Scanner with split functions, no ReadWriter |
 | `bytes` | 76+28 | partial | ore, twine.Builder | about 20 functions on []u8; no Buffer or Reader type, no Map, Title, FieldsFunc or TrimFunc |
-| `cmp` | 14+5 | partial | builtin min/max, generics | no cmp.Compare, cmp.Or or cmp.Ordered (a union such as `i64 | f64 | str` does the constraining) |
+| `cmp` | 14+5 | partial | sift (Less, Cmp), builtin min/max | Less and Cmp (NaN first, as Go); no cmp.Or and no named Ordered constraint (a union such as `i64 | f64 | str` does the constraining) |
 | `compress/bzip2` |  | missing |  |  |
 | `compress/flate` |  | missing |  | needed by gzip, zlib and zip |
 | `compress/gzip` | 7+1 | missing |  |  |
@@ -167,7 +167,7 @@ Ordered by import path, as `go list std` prints them.
 | `log` | 7+2 | partial | herald | levels, output, clock; no Logger values |
 | `log/slog` |  | partial | herald | leveled lines with key and value pairs; no Handler, Group or LogValuer |
 | `log/syslog` |  | missing |  |  |
-| `maps` | 2+4 | partial | sift | Keys, Values, SortedKeys; no Clone, Copy, Equal, DeleteFunc or Collect |
+| `maps` | 2+4 | partial | atlas | Keys, Values (slices, in insertion order), SortedKeys, Clone, Copy, Equal, EqualFunc, DeleteFunc; no iterator forms (All, Insert, Collect) |
 | `math` | 59+23 | partial | gauge | Sin to Atan2, Sinh to Tanh, Exp, Exp2, Log family, Pow, Cbrt, Hypot, Mod, Frexp, Ldexp, Modf (ported from Go, no libm); missing Gamma, Lgamma, Erf, Erfc, Expm1, Asinh, Acosh, Atanh, Sincos, FMA, Nextafter, Remainder, Logb, Dim, Bessel functions |
 | `math/big` | 8+0 | missing |  | Int, Float, Rat |
 | `math/bits` | 3+0 | partial | gauge | PopCount, LeadingZeros, TrailingZeros; no Mul64, Add64, Div64, Len, Reverse, RotateLeft (the first two exist unexported) |
@@ -211,8 +211,8 @@ Ordered by import path, as `go list std` prints them.
 | `runtime/pprof` |  | missing |  | CPU and allocation profiling; part of the performance goal |
 | `runtime/race` |  | n/a |  | the language rules out shared mutable state between threads |
 | `runtime/trace` |  | missing |  |  |
-| `slices` | 79+37 | partial | sift | int and string specific functions plus generic Map, Filter, Reduce; no generic Sort, BinarySearch, Contains, Index, Insert, Delete, Reverse, Max, Min, Compact, Equal |
-| `sort` | 105+8 | partial | sift | Ints, Strs, SortBy, Search*, stable sorts; no sort.Interface (by design), no generic Slice |
+| `slices` | 79+37 | partial | sift | Sort, SortFunc, SortStableFunc (Go's algorithm, same order of equal elements), IsSorted, BinarySearch, Min, Max, Index, Contains, Equal, Compare, Reverse, Insert, Delete, DeleteFunc, Replace, Compact, Clone, Grow, Concat, Repeat, with the Func forms; Insert, Delete and the others take a `mut` slice and return the result; no Clip, Chunk, or iterator forms, and no variadic forms (InsertAll and ConcatAll take slices) |
+| `sort` | 105+8 | partial | sift | Ints, Strs, SortBy, Search* and the generic Sort and SortFunc; no sort.Interface (by design), no sort.Slice (use SortFunc) |
 | `strconv` | 875+97 | partial | mint | Itoa, Atoi, ParseInt, ParseUint, ParseBool, ParseFloat, FormatInt, FormatUint, FormatFloat, Quote, Unquote and friends; no AppendFloat, AppendBool, QuoteToASCII, IsPrint, ParseComplex |
 | `strings` | 657+147 | partial | twine | about 40 functions (Index, Split, Fields, Replace, Trim*, Cut, EqualFold, Builder ...); no Map, Title, FieldsFunc, TrimFunc, IndexFunc, SplitAfter, Replacer, Reader, CutPrefix, CutSuffix, ContainsFunc |
 | `structs` |  | n/a |  |  |

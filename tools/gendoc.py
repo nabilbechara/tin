@@ -4,14 +4,14 @@ import os, re
 
 SKIP = {"runtime", "std", "fmt", "say"}
 ORDER = ["say", "argo", "anvil", "hearth", "relay", "wire", "twine", "glyph", "mint", "gauge",
-         "ore", "flume", "quarry", "trail", "lever", "tide", "dice", "sift", "cairn", "stamp",
+         "ore", "flume", "quarry", "trail", "lever", "tide", "dice", "sift", "atlas", "cairn", "stamp",
          "seal", "herald", "crucible", "redis", "mysql", "postgres", "websocket"]
 ROLE = {"say": "formatting and printing (fmt)", "argo": "JSON (encoding/json)", "anvil": "HTTP/1.1 server (net/http)",
         "hearth": "cores and threads (runtime)", "relay": "messages between cores (channels)", "wire": "TCP and HTTP client (net)",
         "twine": "strings (strings)", "glyph": "UTF-8 (unicode/utf8)", "mint": "number and string conversion (strconv)",
         "gauge": "math (math, math/bits)", "ore": "byte slices (bytes)", "flume": "buffered I/O (bufio)",
         "quarry": "files, environment, process (os)", "trail": "paths (path/filepath)", "lever": "command-line flags (flag)",
-        "tide": "time (time)", "dice": "random numbers (math/rand)", "sift": "sorting and searching (sort, slices)",
+        "tide": "time (time)", "dice": "random numbers (math/rand)", "sift": "sorting, searching and the generic slice functions (sort, slices, cmp)", "atlas": "functions on maps (maps)",
         "cairn": "containers (container/heap, sets, LRU)", "stamp": "hashes and checksums (hash/*)",
         "seal": "crypto and encodings (crypto/sha256, hmac, encoding/hex, base64)", "herald": "logging (log/slog)",
         "crucible": "testing helpers (testing)", "redis": "Redis client (go-redis)",

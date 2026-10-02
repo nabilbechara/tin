@@ -21,7 +21,8 @@ Generated from the comments in `lib/*/` by `tools/gendoc.py`.
 | [lever](#lever) | command-line flags (flag) |
 | [tide](#tide) | time (time) |
 | [dice](#dice) | random numbers (math/rand) |
-| [sift](#sift) | sorting and searching (sort, slices) |
+| [sift](#sift) | sorting, searching and the generic slice functions (sort, slices, cmp) |
+| [atlas](#atlas) | functions on maps (maps) |
 | [cairn](#cairn) | containers (container/heap, sets, LRU) |
 | [stamp](#stamp) | hashes and checksums (hash/*) |
 | [seal](#seal) | crypto and encodings (crypto/sha256, hmac, encoding/hex, base64) |
@@ -569,7 +570,7 @@ Package dice is fast pseudo-random numbers (like Go's math/rand): xoshiro256** g
 
 ## sift
 
-Package sift sorts and searches slices (like Go's sort and slices); without generics every element type has its own function.
+Package sift sorts and searches slices and has the generic functions on them (like Go's sort, slices and cmp). Sort, SortFunc, IsSorted and the rest work on any element type; the type-specific functions (Ints, Strs, SortBy ...) are the faster, older forms.
 
 - `Ints(xs mut []i64)`: Ints sorts xs in increasing order with pattern-defeating quicksort (not stable, O(n log n) worst case).
 - `IntsDesc(xs mut []i64)`: IntsDesc sorts xs in decreasing order.
@@ -592,12 +593,56 @@ Package sift sorts and searches slices (like Go's sort and slices); without gene
 - `IndexInts(xs []i64, x i64) i64`: IndexInts returns the index of the first x in xs, or -1.
 - `ContainsStr(xs []str, x str) bool`: ContainsStr reports whether x occurs in xs.
 - `EqualInts(a []i64, b []i64) bool`: EqualInts reports whether a and b have the same length and elements.
-- `Keys[K any, V any](m map[K]V) []K`: Keys returns m's keys in insertion order.
-- `Values[K any, V any](m map[K]V) []V`: Values returns m's values in insertion order.
-- `SortedKeys[K i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | str, V any](m map[K]V) []K`: SortedKeys returns m's keys sorted ascending.
 - `Map[T any, U any](xs []T, f func(T) U) []U`: Map returns f applied to each element of xs.
 - `Filter[T any](xs []T, keep func(T) bool) []T`: Filter returns the elements of xs for which keep returns true, in order.
 - `Reduce[T any, A any](xs []T, start A, f func(A, T) A) A`: Reduce folds xs into one value: f(f(f(start, x0), x1), ...).
+- `Sort[E i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str](xs mut []E)`: Sort sorts xs in ascending order, in place. Floating-point NaNs sort first. It is not stable, and the order of equal elements is the same as Go's slices.Sort.
+- `SortFunc[E any](xs mut []E, cmp func(E, E) i64)`: SortFunc sorts xs in place by cmp, which returns a negative number when a sorts before b, zero when they are equal and a positive number after. It is not stable.
+- `SortStableFunc[E any](xs mut []E, cmp func(E, E) i64)`: SortStableFunc is SortFunc, keeping the original order of elements that compare equal.
+- `IsSorted[E i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str](xs []E) bool`: IsSorted reports whether xs is in ascending order.
+- `IsSortedFunc[E any](xs []E, cmp func(E, E) i64) bool`: IsSortedFunc reports whether xs is sorted by cmp.
+- `Less[E i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str](x E, y E) bool`: Less is cmp.Less: x < y, with NaN smaller than every other value (and so before them in Sort).
+- `Cmp[E i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str](x E, y E) i64`: Cmp is cmp.Compare: -1 if x sorts before y, 0 if they are equal, +1 after. NaNs are equal to each other and sort before every other value.
+- `BinarySearch[E i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str](xs []E, target E) (i64, bool)`: BinarySearch searches the sorted xs for target and returns the position where it is, or would be inserted, and whether it is there.
+- `BinarySearchFunc[E any, T any](xs []E, target T, cmp func(E, T) i64) (i64, bool)`: BinarySearchFunc is BinarySearch for a target of another type, ordered by cmp(element, target).
+- `Min[E i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str](xs []E) E`: Min returns the smallest element of xs; a NaN anywhere gives NaN. It panics if xs is empty. (-0 and +0 compare equal here, so a mix of them returns whichever comes first.)
+- `Max[E i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str](xs []E) E`: Max returns the largest element of xs; a NaN anywhere gives NaN. It panics if xs is empty.
+- `MinFunc[E any](xs []E, cmp func(E, E) i64) E`: MinFunc returns the first smallest element of xs by cmp. It panics if xs is empty.
+- `MaxFunc[E any](xs []E, cmp func(E, E) i64) E`: MaxFunc returns the first largest element of xs by cmp. It panics if xs is empty.
+- `Index[E comparable](xs []E, v E) i64`: Index returns the position of the first element equal to v, or -1.
+- `IndexFunc[E any](xs []E, f func(E) bool) i64`: IndexFunc returns the position of the first element for which f is true, or -1.
+- `Contains[E comparable](xs []E, v E) bool`: Contains reports whether v is in xs.
+- `ContainsFunc[E any](xs []E, f func(E) bool) bool`: ContainsFunc reports whether f is true for some element of xs.
+- `Equal[E comparable](a []E, b []E) bool`: Equal reports whether a and b have the same length and equal elements.
+- `EqualFunc[A any, B any](a []A, b []B, eq func(A, B) bool) bool`: EqualFunc is Equal for two element types, with eq deciding.
+- `Compare[E i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str](a []E, b []E) i64`: Compare compares a and b element by element with Cmp, then by length: -1, 0 or +1.
+- `CompareFunc[A any, B any](a []A, b []B, cmp func(A, B) i64) i64`: CompareFunc is Compare for two element types, with cmp comparing elements.
+- `Reverse[E any](xs mut []E)`: Reverse reverses xs in place.
+- `Clone[E any](xs []E) []E`: Clone returns a copy of xs that shares nothing with it.
+- `Grow[E any](xs []E, n i64) []E`: Grow returns a copy of xs with room for n more elements before it has to grow again.
+- `Concat[E any](a []E, b []E) []E`: Concat returns a new slice holding a followed by b.
+- `ConcatAll[E any](parts [][]E) []E`: ConcatAll returns a new slice holding every slice of parts, in order.
+- `Repeat[E any](xs []E, count i64) []E`: Repeat returns a new slice that repeats xs count times.
+- `Insert[E any](xs mut []E, i i64, v E) []E`: Insert inserts v at position i (0 to len(xs)) and returns the longer slice. Like append, it grows xs in place, so every other reference to the same slice sees the new length.
+- `InsertAll[E any](xs mut []E, i i64, vs []E) []E`: InsertAll inserts all of vs at position i and returns the longer slice (grown in place, as Insert).
+- `Delete[E any](xs mut []E, i i64, j i64) []E`: Delete removes xs[i:j] and returns the shorter slice; the elements after j move down in place.
+- `DeleteFunc[E any](xs mut []E, del func(E) bool) []E`: DeleteFunc removes the elements for which del is true, in place, and returns the shorter slice.
+- `Replace[E any](xs mut []E, i i64, j i64, vs []E) []E`: Replace replaces xs[i:j] with vs and returns the resulting slice (grown or shrunk in place).
+- `Compact[E comparable](xs mut []E) []E`: Compact removes runs of equal consecutive elements, keeping the first of each run, in place, and returns the shorter slice.
+- `CompactFunc[E any](xs mut []E, eq func(E, E) bool) []E`: CompactFunc is Compact with eq deciding which neighbours are equal.
+
+## atlas
+
+Package atlas is the functions on maps (like Go's maps): keys, values, copies and comparisons.
+
+- `Keys[K comparable, V any](m map[K]V) []K`: Keys returns m's keys in insertion order.
+- `Values[K comparable, V any](m map[K]V) []V`: Values returns m's values in insertion order.
+- `SortedKeys[K i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str, V any](m map[K]V) []K`: SortedKeys returns m's keys in ascending order (NaN first), whatever order they were added in.
+- `Clone[K comparable, V any](m map[K]V) map[K]V`: Clone returns a new map with the same entries, in the same order.
+- `Copy[K comparable, V any](dst mut map[K]V, src map[K]V)`: Copy adds every entry of src to dst, replacing the values of keys dst already has.
+- `Equal[K comparable, V comparable](a map[K]V, b map[K]V) bool`: Equal reports whether a and b have the same keys with equal values.
+- `EqualFunc[K comparable, V1 any, V2 any](a map[K]V1, b map[K]V2, eq func(V1, V2) bool) bool`: EqualFunc is Equal with eq comparing the values, which may have different types.
+- `DeleteFunc[K comparable, V any](m mut map[K]V, del func(K, V) bool)`: DeleteFunc removes the entries for which del is true.
 
 ## cairn
 
