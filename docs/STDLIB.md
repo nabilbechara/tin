@@ -759,6 +759,7 @@ Package sift sorts and searches slices and has the generic functions on them (li
 - `Replace[E any](xs mut []E, i i64, j i64, vs []E) []E`: Replace replaces xs[i:j] with vs and returns the resulting slice (grown or shrunk in place).
 - `Compact[E comparable](xs mut []E) []E`: Compact removes runs of equal consecutive elements, keeping the first of each run, in place, and returns the shorter slice.
 - `CompactFunc[E any](xs mut []E, eq func(E, E) bool) []E`: CompactFunc is Compact with eq deciding which neighbours are equal.
+- `Each[E any](xs []E, f func(E))`: Each calls f for every element of xs in ascending index order.
 
 ## atlas
 

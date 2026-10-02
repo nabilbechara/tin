@@ -34,7 +34,7 @@ The inventory is the 176 packages `go list std` reports for Go 1.26 (without `in
 | struct tags | none: attributes checked by the compiler are the plan | design |
 | interfaces, type assertions, type switches | none: generics (monomorphized) and `enum` with exhaustive `switch`; an explicit dynamic-dispatch form is to be designed | design |
 | generics | type parameters with `any`, `comparable` and unions; inference; methods on generic types | partial |
-| function values, closures | capturing closures as region objects with one-word shared cells, stack descriptors for non-escaping closures (0 heap allocations), deep-copied via keep(), uniform descriptors across Mach-O and Linux ELF (ARM64 and AMD64) | done |
+| function values, closures | capturing closures as region objects with shared cells (Go 1.22 per-iteration loop variables), frame-resident descriptors for closures only the library calls (no pool allocation), deep-copied by keep(), escape into globals rejected, defer with captures; a local closure cannot recurse and cannot capture a mut parameter; cells for every captured variable (by-value copies of never-reassigned variables are a later optimization) | done |
 | method values and expressions | not documented | missing |
 | variadic functions | documented for the standard library's formatting; user-declared variadics not documented | partial |
 | named results, bare `return` | not documented | missing |

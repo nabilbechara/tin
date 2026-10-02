@@ -1367,6 +1367,12 @@ fn scan_idents_in_stmt(s, inner_params, outer_names, cells) {
                 i = i + 1;
             }
         }
+    } else if k == ST_DEFER || k == ST_GO {
+        scan_idents_in_expr(s[GO_CALL], inner_params, outer_names, cells);
+    } else if k == ST_FAIL {
+        scan_idents_in_expr(s[FAIL_X], inner_params, outer_names, cells);
+    } else if k == ST_CALLMULTI {
+        scan_idents_in_expr(s[CM_CALL], inner_params, outer_names, cells);
     } else if k == ST_BLOCK {
         scan_idents_in_block(s, inner_params, outer_names, cells);
     } else if k == ST_LIST {
@@ -1413,6 +1419,24 @@ fn scan_idents_in_expr(e, inner_params, outer_names, cells) {
         scan_idents_in_expr(e[CV_X], inner_params, outer_names, cells);
     } else if k == EX_MUTARG {
         scan_idents_in_expr(e[MUTARG_X], inner_params, outer_names, cells);
+    } else if k == EX_SLICE {
+        scan_idents_in_expr(e[SL_X], inner_params, outer_names, cells);
+        scan_idents_in_expr(e[SL_LO], inner_params, outer_names, cells);
+        scan_idents_in_expr(e[SL_HI], inner_params, outer_names, cells);
+    } else if k == EX_TRY {
+        scan_idents_in_expr(e[TRY_X], inner_params, outer_names, cells);
+    } else if k == EX_CATCH {
+        scan_idents_in_expr(e[CATCH_X], inner_params, outer_names, cells);
+        scan_idents_in_block(e[CATCH_BODY], inner_params, outer_names, cells);
+    } else if k == EX_INTERP {
+        let ia = e[INTERP_ARGS];
+        if ia {
+            let ii = 0;
+            while ii < ia[VEC_LEN] {
+                scan_idents_in_expr(vec_get(ia, ii), inner_params, outer_names, cells);
+                ii = ii + 1;
+            }
+        }
     } else if k == EX_COMPOSITE {
         let elems = e[CL_ELEMS];
         if elems {
@@ -1532,6 +1556,12 @@ fn scan_funclits_in_stmt(s, outer_names, cells) {
                 i = i + 1;
             }
         }
+    } else if k == ST_DEFER || k == ST_GO {
+        scan_funclits_in_expr(s[GO_CALL], outer_names, cells);
+    } else if k == ST_FAIL {
+        scan_funclits_in_expr(s[FAIL_X], outer_names, cells);
+    } else if k == ST_CALLMULTI {
+        scan_funclits_in_expr(s[CM_CALL], outer_names, cells);
     } else if k == ST_BLOCK {
         scan_funclits_in_block(s, outer_names, cells);
     } else if k == ST_LIST {
@@ -1575,6 +1605,24 @@ fn scan_funclits_in_expr(e, outer_names, cells) {
         scan_funclits_in_expr(e[CV_X], outer_names, cells);
     } else if k == EX_MUTARG {
         scan_funclits_in_expr(e[MUTARG_X], outer_names, cells);
+    } else if k == EX_SLICE {
+        scan_funclits_in_expr(e[SL_X], outer_names, cells);
+        scan_funclits_in_expr(e[SL_LO], outer_names, cells);
+        scan_funclits_in_expr(e[SL_HI], outer_names, cells);
+    } else if k == EX_TRY {
+        scan_funclits_in_expr(e[TRY_X], outer_names, cells);
+    } else if k == EX_CATCH {
+        scan_funclits_in_expr(e[CATCH_X], outer_names, cells);
+        scan_funclits_in_block(e[CATCH_BODY], outer_names, cells);
+    } else if k == EX_INTERP {
+        let ia = e[INTERP_ARGS];
+        if ia {
+            let ii = 0;
+            while ii < ia[VEC_LEN] {
+                scan_funclits_in_expr(vec_get(ia, ii), outer_names, cells);
+                ii = ii + 1;
+            }
+        }
     } else if k == EX_COMPOSITE {
         let elems = e[CL_ELEMS];
         if elems {
@@ -1875,6 +1923,9 @@ fn capture_sym(f, os) {
         i = i + 1;
     }
     if ci < 0 {
+        if os[S_MUT] {
+            err_at(f[F_POS], str_cat3("a function literal cannot capture the mut parameter '", os[S_NAME], "': copy it into a local first, or pass it as an argument"));
+        }
         ci = caps[VEC_LEN];
         vec_push(caps, os);
         os[S_ADDR] = 1;
@@ -3336,6 +3387,9 @@ fn check_pre_stmts(stmts) {
         let s = vec_get(stmts, i);
         if s[N_KIND] == ST_LET && s[LET_SYM] {
             vec_push(sc_syms, s[LET_SYM]);
+        } else if s[N_KIND] == ST_BLOCK && s[BLK_FLAT] && s[4] {
+            // a celled range variable: its cell sym is already a local, the variable itself enters scope
+            vec_push(sc_syms, s[4]);
         } else if s[N_KIND] == ST_IF && s[IF_COND][N_TYPE] {
         } else {
             check_stmt(s);
@@ -3358,6 +3412,26 @@ fn range_bind(pos, target, value, t, define) {
         l[LET_SYM][S_SLOT] = ck_fn[F_SLOTS];
         ck_fn[F_SLOTS] = ck_fn[F_SLOTS] + 1;
         vec_push(ck_fn[F_LOCALS], l[LET_SYM]);
+        if ck_escaping_cells && vec_has_str(ck_escaping_cells, target[ID_NAME]) {
+            // A variable a closure captures lives in a cell, and each iteration allocates its own.
+            let sym = l[LET_SYM];
+            sym[S_CELL] = 1;
+            let csym = sym_new(SYM_LOCAL, str_cat3("$cell_", target[ID_NAME], ""), pos);
+            csym[S_TYPE] = ty_int;
+            csym[S_READS] = 1;
+            csym[S_SLOT] = ck_fn[F_SLOTS];
+            ck_fn[F_SLOTS] = ck_fn[F_SLOTS] + 1;
+            vec_push(ck_fn[F_LOCALS], csym);
+            sym[S_CELL_SYM] = csym;
+            let alloc_call = rt_call(pos, "rt_alloc", args1(mk_int(pos, 8, ty_int)), ty_int);
+            let blk = node_new(ST_BLOCK, pos);
+            blk[BLK_STMTS] = vec_new();
+            vec_push(blk[BLK_STMTS], let_stmt(pos, csym, alloc_call));
+            vec_push(blk[BLK_STMTS], assign_stmt(pos, mk_mem(pos, sym_ref_node(pos, csym), 0, 0, 0, t), value));
+            blk[BLK_FLAT] = 1;
+            blk[4] = sym;
+            return blk;
+        }
         return l;
     }
     let a = assign_stmt(pos, target, value);
@@ -3879,6 +3953,11 @@ fn add_len_fact(c, then) {
 // proving `for i := c; i < len(x); i++` keeps i in range for x[i] in the body.
 fn lower_for_init(s) {
     let init = s[WH_INIT];
+    let init_name = 0;
+    if init[N_KIND] == ST_LET {
+        init_name = init[LET_NAME];
+    }
+    let s_pos = s[N_POS];
     let inner = node_new(ST_WHILE, s[N_POS]);
     replace_node(inner, s);
     inner[WH_INIT] = 0;
@@ -3902,6 +3981,28 @@ fn lower_for_init(s) {
         push_scope();
         check_stmt(inner[WH_POST]);
         pop_scope();
+        // A loop variable a closure captures is a fresh variable in each iteration: before the post
+        // statement, move its current value into a new cell, so closures made earlier keep the old one.
+        if init[N_KIND] == ST_BLOCK || init[N_KIND] == ST_LET {
+            let lv = 0;
+            if init_name {
+                lv = lookup_name_local(init_name);
+            }
+            if lv && lv[S_CELL] {
+                let pos = s_pos;
+                let t = lv[S_TYPE];
+                let csym = lv[S_CELL_SYM];
+                let old_val = temp(pos, mk_mem(pos, sym_ref_node(pos, csym), 0, 0, 0, t), t);
+                let nb = node_new(ST_BLOCK, pos);
+                nb[BLK_STMTS] = vec_new();
+                nb[BLK_FLAT] = 1;
+                vec_push(nb[BLK_STMTS], old_val);
+                vec_push(nb[BLK_STMTS], assign_stmt(pos, sym_ref_node(pos, csym), rt_call(pos, "rt_alloc", args1(mk_int(pos, 8, ty_int)), ty_int)));
+                vec_push(nb[BLK_STMTS], assign_stmt(pos, mk_mem(pos, sym_ref_node(pos, csym), 0, 0, 0, t), sym_ref_node(pos, old_val[LET_SYM])));
+                vec_push(nb[BLK_STMTS], inner[WH_POST]);
+                inner[WH_POST] = nb;
+            }
+        }
     }
     ck_loops = ck_loops - 1;
     ck_breaks = ck_breaks - 1;

@@ -127,7 +127,7 @@ or with the code passed to `quarry.Exit`.
 | `?T` | ref | optional T: a T or `nil` (T a reference type) |
 | `fault` | ref | an error; `nil` means no error |
 | `query` | ref | a literal's text pieces and values kept apart, for database and cache clients (§14, Queries) |
-| `func(A, B) (R, S)` | 8 | a function value: a top-level function or a function literal without captures |
+| `func(A, B) (R, S)` | 8 | a function value: a top-level function, or a function literal, which may capture variables of the enclosing functions (see Closures below) |
 
 There are no pointers in user code, no interfaces, no channels and no `byte`/`int`
 aliases: use `u8` and `i64`.
@@ -265,12 +265,50 @@ case Empty:
 type Handler func(anvil.Req, mut anvil.Out)
 func double(x i64) i64 { return 2 * x }
 f := double
-g := func(x i64) i64 { return x + 1 }  // a literal; it cannot capture local variables
+g := func(x i64) i64 { return x + 1 }  // a literal; it may capture local variables
 say.Line(f(3), g(3))
 ```
 
-Function literals are lifted to top-level functions: they may use their parameters and
-globals, not the enclosing function's locals.
+### Closures
+
+A function literal may read and write the variables of the functions around it, as in Go: the
+closure and its parent share one variable, so a write by either is seen by both.
+
+```go
+func makeCounter() func() i64 {
+	n := 0
+	return func() i64 {
+		n++
+		return n
+	}
+}
+c := makeCounter()
+say.Line(c(), c(), c())      // 1 2 3
+```
+
+- **Each iteration has its own loop variable** (Go 1.22 rules): in `for i := 0; i < 3; i++`
+  and `for _, v := range xs`, closures made in different iterations capture different
+  variables. For a three-clause loop, the value is copied to a fresh variable before the post
+  statement runs.
+- **Where the closure lives.** A function literal that is called at once, or passed to one of the
+  library functions that only call what they are given (`sift.Each`, `Map`, `Filter`, `Reduce`
+  and the `*Func` functions of `sift`, `atlas` and `twine`), keeps its captured variables on the
+  caller's stack frame: no pool allocation. Every other closure (returned, stored in a slice, a
+  struct or a map, passed to your own function, deferred) allocates its descriptor and cells in the
+  current request pool and lives as long as that pool.
+- **Long-lived closures.** Storing a closure that captures request memory in a global, or anywhere
+  long-lived, without `keep` is a compile error naming the global. `keep(f)` deep-copies the
+  descriptor and every captured variable into the long-lived heap.
+- **Captured `mut` parameters are rejected**: a function literal cannot capture a `mut`
+  parameter (the parameter is the caller's variable, not a cell); copy it into a local, or pass it
+  as an argument.
+- **Recursion.** A local closure cannot call itself (a variable of function type needs an
+  initializer, so `var fib func(i64) i64` is rejected): use a top-level function, or pass the
+  function to itself.
+- `defer func() { ... }()` may capture variables and sees their value at the time the deferred
+  call runs.
+- All captured variables are cells; copying a variable that is never reassigned by value, instead
+  of sharing a cell, is a later optimization (it changes no result).
 
 A `mut` parameter is part of a function's type: `func put(b mut Box)` has type
 `func(mut Box)`, which is not `func(Box)`. A call through a function value is checked like a
@@ -1073,7 +1111,7 @@ has no package clause). See [COMPILER.md](COMPILER.md) for how the compiler is w
 | package variables initialized in dependency order | declaration order; an initializer using a later global is a compile error |
 | garbage collector | request pools + `keep` into a long-lived heap, checked at compile time |
 | interfaces, reflection | generics (monomorphized), compiler-generated `say` and `argo` |
-| closures capture variables | function literals cannot capture locals |
+| closures capture variables | the same, with Go 1.22's per-iteration loop variables; no `mut` parameter capture; a local closure cannot recurse |
 | `defer` in loops, `recover` | defer outside loops only; no recover |
 | `fmt.Println` | `say.Line` (formatting by static type) |
 | interfaces for sum types | `enum` with exhaustive `switch` |

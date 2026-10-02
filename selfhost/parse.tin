@@ -1167,6 +1167,28 @@ fn parse_expr_list() {
     return v;
 }
 
+// callee_keeps_nothing reports whether a call's callee is a library function that only calls the
+// function values it is given and never stores or returns them: sift's and atlas's *Func functions,
+// sift.Each, Map, Filter and Reduce, and twine's *Func functions and Map.
+fn callee_keeps_nothing(x) {
+    if x[N_KIND] != EX_SELECT || x[SEL_X][N_KIND] != EX_IDENT {
+        return 0;
+    }
+    let pkg = x[SEL_X][ID_NAME];
+    let name = x[SEL_NAME];
+    if !streq(pkg, "sift") && !streq(pkg, "twine") && !streq(pkg, "atlas") {
+        return 0;
+    }
+    let n = strlen(name);
+    if n >= 4 && streq(name + n - 4, "Func") {
+        return 1;
+    }
+    if streq(name, "Each") || streq(name, "Map") || streq(name, "Filter") || streq(name, "Reduce") {
+        return 1;
+    }
+    return 0;
+}
+
 fn has_brace(p, n) {
     let i = 0;
     while i < n {
@@ -1646,9 +1668,11 @@ fn parse_postfix() {
                     spread[UN_X] = a;
                     a = spread;
                 }
-                if a[N_KIND] == EX_FUNCLIT {
+                // A function literal passed to a function keeps its closure on the caller's frame only when
+                // the callee is known not to keep it; any other call may store it, so it must outlive the frame.
+                if a[N_KIND] == EX_FUNCLIT && callee_keeps_nothing(x) {
                     a[LIT_ESCAPE] = 0;
-                } else if a[N_KIND] == EX_MUTARG && a[MUTARG_X][N_KIND] == EX_FUNCLIT {
+                } else if a[N_KIND] == EX_MUTARG && a[MUTARG_X][N_KIND] == EX_FUNCLIT && callee_keeps_nothing(x) {
                     a[MUTARG_X][LIT_ESCAPE] = 0;
                 }
                 vec_push(call[CALL_ARGS], a);
