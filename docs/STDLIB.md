@@ -159,7 +159,7 @@ Package twine manipulates UTF-8 strings (like Go's strings); case helpers are AS
 - `SplitN(s str, sep str, n i64) []str`: SplitN is Split returning at most n pieces (all when n < 0, none when n == 0).
 - `Fields(s str) []str`: Fields splits s around runs of ASCII white space and returns the non-empty pieces.
 - `Join(elems []str, sep str) str`: Join concatenates elems with sep between them.
-- `Repeat(s str, count i64) str`: Repeat returns s concatenated count times (empty when count <= 0).
+- `Repeat(s str, count i64) str`: Repeat returns s concatenated count times (empty when count <= 0; panics when the length overflows).
 - `Count(s str, sub str) i64`: Count returns the number of non-overlapping sub in s (RuneCount+1 when sub is empty).
 - `Replace(s str, old str, repl str, n i64) str`: Replace returns s with the first n non-overlapping old replaced by repl (all when n < 0; empty old matches at every rune boundary).
 - `ReplaceAll(s str, old str, repl str) str`: ReplaceAll returns s with every non-overlapping old replaced by repl.
@@ -324,7 +324,7 @@ Package ore works on byte slices ([]u8), like Go's bytes. Functions that append 
 - `Fields(b []u8) []str`: Fields splits b around runs of ASCII white space.
 - `ToLower(b []u8) []u8`: ToLower returns a copy with ASCII letters lowered.
 - `ToUpper(b []u8) []u8`: ToUpper returns a copy with ASCII letters raised.
-- `Repeat(b []u8, n i64) []u8`: Repeat returns n copies of b.
+- `Repeat(b []u8, n i64) []u8`: Repeat returns n copies of b (panics when the length overflows).
 
 ## flume
 
