@@ -150,17 +150,6 @@ fn is_loaded(path) {
     return 0;
 }
 
-// lib_path is root/lib/<import path>.tin.
-fn lib_path(ipath) {
-    let b = buf_new();
-    buf_str(b, lib_root);
-    buf_str(b, "/lib/");
-    buf_str(b, ipath);
-    buf_str(b, ".tin");
-    buf_byte(b, 0);
-    return b[VEC_DATA];
-}
-
 fn cat_path(a, b) {
     let p = buf_new();
     buf_str(p, a);
@@ -367,17 +356,21 @@ fn main(argc, argv) {
     }
     if v2 {
         lib_root = find_root();
-        let rt = lib_path("runtime");
-        if !is_loaded(rt) {
-            load_file_trusted(rt, 1);
-            let rtos = lib_path(cat_path("runtime", os_suffix()));
-            if try_read_file(rtos) && !is_loaded(rtos) {
-                load_file_trusted(rtos, 1);
+        // The runtime is the package lib/runtime: every file of it for this OS and CPU.
+        let rtfiles = package_files(cat_path(lib_root, "/lib/runtime"));
+        if !rtfiles {
+            let e = err_begin(NO_POS);
+            buf_str(e, "the runtime package is missing: no lib/runtime in ");
+            buf_str(e, lib_root);
+            fatal(e);
+        }
+        let rk = 0;
+        while rk < rtfiles[VEC_LEN] {
+            let rpath = vec_get(rtfiles, rk);
+            if !is_loaded(rpath) {
+                load_file_trusted(rpath, 1);
             }
-            let rtarch = lib_path(cat_path(cat_path("runtime", os_suffix()), arch_suffix()));
-            if try_read_file(rtarch) && !is_loaded(rtarch) {
-                load_file_trusted(rtarch, 1);
-            }
+            rk = rk + 1;
         }
         load_imports();
     }

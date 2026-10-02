@@ -58,7 +58,7 @@ def main():
     tables += array('decomp', decomp)+array('chars', chars)+array('combining', combining)
     tables += array('compositions', [v for row in sorted(compose) for v in row])
     runtime = Path(__file__).with_name('saslprep_runtime.tin').read_text()
-    (ROOT/'lib/postgres/sasl.tin').write_text(tables+runtime)
+    (ROOT/'lib/postgres/sasl/sasl.tin').write_text(tables+runtime)
 
 
 if __name__ == '__main__':

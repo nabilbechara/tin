@@ -55,8 +55,8 @@ tinc [-o OUT] [-S] [-target darwin-arm64|linux-arm64|linux-amd64] FILE.tin...
 - `-o OUT`: write the executable (default `a.out`). `-S`: print assembly instead.
 - The standard library is found through `$TIN_ROOT` or, without it, relative to the
   executable (`<root>/bin/tinc` means `<root>/lib`). The `tin` script sets `TIN_ROOT`.
-- Strict programs get `lib/runtime.tin` (plus `runtime_<os>.tin` and
-  `runtime_<os>_<arch>.tin`) automatically; imports are resolved as in LANGUAGE.md §1.
+- Strict programs get the package `lib/runtime/` (its `*_<os>.tin` and `*_<os>_<arch>.tin`
+  files only for the target) automatically; imports are resolved as in LANGUAGE.md §1.
 - Errors print as `file:line:col: error: message`, every error in one run; the exit code
   is 1. A compiler crash prints a backtrace only under a debugger (see §8).
 - `TINC_TRACE=1` prints each function as it is generated (to find which one crashes the
@@ -207,7 +207,7 @@ passes.
 tin                 the tin command (shell script)
 Makefile            builds, bootstraps, tests
 selfhost/           the compiler, in legacy Tin (COMPILER.md)
-lib/                runtime and standard library (RUNTIME.md, STDLIB.md)
+lib/<package>/      the runtime and each standard-library package, one directory each (lib/README.md)
 tests/v2/           strict tests and expected outputs
 seed/               tinc-darwin-arm64, tinc-linux-arm64, tinc-linux-amd64: the compilers that start a build
 examples/           api.tin (HTTP server), tasks.tin, redis.tin, mysql.tin, websocket.tin, demo.tin, demo_go/

@@ -176,7 +176,7 @@ binary-trees uses 917 MB against Go's 37 MB: a plain program never resets its po
 ```
 selfhost/    the compiler: lex, parse, check, lower, generics, region, inline, opt,
              gen + asm (arm64), gen_x64 + asm_x64, macho, elf, elf_x64
-lib/         runtime and standard library
+lib/         the runtime and the standard library, one directory per package (see lib/README.md)
 tests/v2/    strict tests with expected outputs (*_bad.tin: expected compile errors)
 bench/       CPU benchmarks vs Go (v2/), HTTP benchmarks (http/), Go reference programs (ref/)
 seed/        tinc-darwin-arm64, tinc-linux-arm64: the compilers that start a build

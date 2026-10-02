@@ -160,7 +160,7 @@ def main():
         shutil.copytree(ROOT / 'lib', directory / 'lib')
         fixtures = ROOT / 'tools/ci/fixtures'
         for library, probe in [('runtime', 'helper_probe'), ('websocket', 'websocket_probe')]:
-            with (directory / 'lib' / (library + '.tin')).open('a') as f:
+            with (directory / 'lib' / library / (library + '.tin')).open('a') as f:
                 f.write('\n' + (fixtures / (probe + '.tin')).read_text())
         exe = directory / 'server'
         subprocess.run([str(ROOT / 'bin/tinc'), '-o', str(exe), str(fixtures / 'lifetime.tin')],

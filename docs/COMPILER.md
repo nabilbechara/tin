@@ -218,7 +218,7 @@ underscore only in Mach-O.
 
 ## 10. The runtime interface
 
-The compiler emits calls to these `lib/runtime.tin` functions (others are reached from
+The compiler emits calls to these `lib/runtime/` functions (others are reached from
 them): `rt_init`, `rt_main_begin`, `rt_exit`, `rt_alloc`, `rt_panic`, `rt_bounds_fail`,
 `rt_bounds_fail2`, `rt_div_fail`, `rt_fail`, `rt_str_*` (cat, eq, cmp, sub, from_bytes,
 from_rune), `rt_utf8`, `rt_bytes_from_str`, `rt_copy_str`, `rt_slice_make`,

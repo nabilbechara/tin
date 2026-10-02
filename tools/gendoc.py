@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate docs/STDLIB.md from the comments in lib/*.tin (run from the repo root)."""
+"""Generate docs/STDLIB.md from the comments in lib/*/ (run from the repo root)."""
 import os, re
 
 SKIP = {"runtime", "std", "fmt", "say"}
@@ -18,6 +18,16 @@ ROLE = {"say": "formatting and printing (fmt)", "argo": "JSON (encoding/json)", 
         "mysql": "MySQL client (database/sql with go-sql-driver/mysql)",
         "postgres": "PostgreSQL client (database/sql with pgx)",
         "websocket": "WebSocket server and client (gorilla/websocket)"}
+
+def package_files(name):
+    """The files of lib/<name>/ that document the package: every .tin file except tests and the
+    per-OS and per-CPU parts, in name order."""
+    directory = f"lib/{name}"
+    if not os.path.isdir(directory):
+        return []
+    return [f"{directory}/{f}" for f in sorted(os.listdir(directory))
+            if f.endswith(".tin") and not f.endswith("_test.tin")
+            and not re.search(r"_(darwin|linux)(_(arm64|amd64))?\.tin$", f)]
 
 def parse(path):
     lines = open(path).read().split("\n")
@@ -46,7 +56,7 @@ def parse(path):
             comment = []
     return pkgdoc, items
 
-out = ["# Tin standard library", "", "Generated from the comments in `lib/*.tin` by `tools/gendoc.py`.", ""]
+out = ["# Tin standard library", "", "Generated from the comments in `lib/*/` by `tools/gendoc.py`.", ""]
 out.append("| package | role (Go equivalent) |")
 out.append("|---|---|")
 for p in ORDER:
@@ -61,10 +71,14 @@ out.append("")
 for p in ORDER:
     if p == "say":
         continue
-    path = f"lib/{p}.tin"
-    if not os.path.exists(path):
+    files = package_files(p)
+    if not files:
         continue
-    doc, items = parse(path)
+    doc, items = [], []
+    for path in files:
+        file_doc, file_items = parse(path)
+        doc = doc or file_doc
+        items += file_items
     out.append(f"## {p}")
     out.append("")
     if doc:

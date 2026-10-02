@@ -13,8 +13,8 @@ docs/RUNTIME.md (memory, layouts, trusted code).
     docker run --rm -v "$PWD/bin/linux":/w tin-debian-arm64 /w/prog
 When several agents work at once, each uses a frozen compiler (for example bin/tinc_agents, with
 TIN_ROOT set to the root) and its own output dir bin/agent_NAME/. Never run tools/v2test.sh,
-never write bin/t, and never touch selfhost/, lib/runtime*.tin, lib/anvil*.tin, lib/argo.tin,
-lib/hearth.tin, Makefile or seed/ unless your task says so. If you hit a compiler bug, do NOT fix
+never write bin/t, and never touch selfhost/, lib/runtime/, lib/anvil/, lib/argo/,
+lib/hearth/, Makefile or seed/ unless your task says so. If you hit a compiler bug, do NOT fix
 the compiler: write a minimal repro to notes/compiler_bugs_NAME.md and work around it.
 
 ## Language (strict)
