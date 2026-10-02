@@ -16,6 +16,7 @@ var lk_stubs;     // address of the first import stub
 var lk_strs;      // string literal -> address
 var lk_tstrs;     // Tin string literal -> address of its length word
 var lk_zero;      // 32 zero bytes: the empty slice header every empty slice shares
+var lk_fndescs;   // function descriptors: [code, env] pairs
 var lk_got;
 var lk_data;
 var mo;           // the output file image
@@ -52,6 +53,9 @@ fn sym_addr(sym) {
     }
     if kind == SK_FN {
         return vec_get(prog_fns, i)[F_ADDR];
+    }
+    if kind == SK_FNDESC {
+        return lk_fndescs + 16 * i;
     }
     if kind == SK_ZERO {
         return lk_zero;
@@ -172,7 +176,8 @@ fn write_executable(path) {
     let data_vm = TEXT_BASE + text_size;
     lk_got = data_vm;
     lk_data = data_vm + 8 * nimp;
-    let data_size = align_up(8 * (nimp + nvars) + 8, PAGE);
+    lk_fndescs = lk_data + 8 * nvars;
+    let data_size = align_up(8 * (nimp + nvars) + 16 * prog_fns[VEC_LEN] + 8, PAGE);
     let link_off = text_size + data_size;
 
     // Linkedit contents: bind opcodes, then function symbols and their names.
@@ -253,7 +258,7 @@ fn write_executable(path) {
     p = w_section(p, "__const", "__TEXT", const_start, const_end - const_start, 3, 0);
     p = w_segment(p, "__DATA", data_vm, data_size, text_size, data_size, 3, 2);
     p = w_section(p, "__got", "__DATA", lk_got, 8 * nimp, 3, 0);
-    p = w_section(p, "__data", "__DATA", lk_data, 8 * nvars, 3, 0);
+    p = w_section(p, "__data", "__DATA", lk_data, 8 * nvars + 16 * prog_fns[VEC_LEN], 3, 0);
     p = w_segment(p, "__LINKEDIT", data_vm + data_size, align_up(link_size, PAGE), link_off, link_size, 1, 0);
     put32(p, 0x80000022);
     put32(p + 4, 48);

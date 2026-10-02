@@ -559,7 +559,11 @@ fn gen_to(e, dst, d) {
     } else if k == EX_SEQ {
         gen_seq(e, dst, d);
     } else if k == EX_FUNCREF {
-        let fs = sym_ref(SK_FN, e[FR_FN][F_INDEX]);
+        let kind = SK_FNDESC;
+        if e[FR_RAW] {
+            kind = SK_FN;
+        }
+        let fs = sym_ref(kind, e[FR_FN][F_INDEX]);
         emit2(I_ADRP, dst, fs);
         emit3(I_ADDLO, dst, dst, fs);
     } else if e[CALL_INTRINSIC] {
@@ -1723,9 +1727,12 @@ fn gen_call(e, d) {
         emit1(I_BL, f);
         f[F_USED] = 1;
     } else if callee_reg >= 0 {
-        emit1(I_BLR, callee_reg);
+        mov(X17, callee_reg);
+        emit3(I_LDR, X16, X17, 0);
+        emit1(I_BLR, X16);
     } else {
-        gen_to(callee, X16, d0);
+        gen_to(callee, X17, d0);
+        emit3(I_LDR, X16, X17, 0);
         emit1(I_BLR, X16);
     }
     if area > 0 {
@@ -2989,6 +2996,22 @@ fn gen_fn(f) {
         i = i + 1;
     }
     let stmts = f[F_BODY][BLK_STMTS];
+    if f == entry_fn() {
+        let di = 0;
+        while di < prog_fns[VEC_LEN] {
+            let df = vec_get(prog_fns, di);
+            if !df[F_EXTERN] && df[F_REACH] {
+                let code_sym = sym_ref(SK_FN, di);
+                let desc_sym = sym_ref(SK_FNDESC, di);
+                emit2(I_ADRP, X16, code_sym);
+                emit3(I_ADDLO, X16, X16, code_sym);
+                emit2(I_ADRP, X17, desc_sym);
+                emit3(I_ADDLO, X17, X17, desc_sym);
+                emit3(I_STR, X16, X17, 0);
+            }
+            di = di + 1;
+        }
+    }
     i = early;
     while i < stmts[VEC_LEN] {
         gen_stmt(vec_get(stmts, i));
@@ -3249,7 +3272,7 @@ fn print_asm() {
         print_ins(b, code[VEC_DATA] + 8 * i);
         i = i + 5;
     }
-    if prog_vars[VEC_LEN] > 0 {
+    if prog_vars[VEC_LEN] > 0 || prog_fns[VEC_LEN] > 0 {
         buf_str(b, "\t.section\t__DATA,__data\n\t.p2align\t3\n");
         i = 0;
         while i < prog_vars[VEC_LEN] {
@@ -3260,6 +3283,16 @@ fn print_asm() {
             buf_int(b, v[D_VAL]);
             buf_byte(b, '\n');
             i = i + 1;
+        }
+        let di = 0;
+        while di < prog_fns[VEC_LEN] {
+            let df = vec_get(prog_fns, di);
+            if !df[F_EXTERN] && df[F_REACH] {
+                buf_str(b, "_");
+                buf_str(b, df[F_QNAME]);
+                buf_str(b, "$desc:\n\t.space 16\n");
+            }
+            di = di + 1;
         }
     }
     if g_str_ptrs[VEC_LEN] > 0 {

@@ -565,7 +565,11 @@ fn x_gen_to(e, dst, d) {
     } else if k == EX_SEQ {
         x_gen_seq(e, dst, d);
     } else if k == EX_FUNCREF {
-        emit2(X_LEA, dst, x64_mem_sym(x_sym(SK_FN, e[FR_FN][F_INDEX])));
+        let kind = SK_FNDESC;
+        if e[FR_RAW] {
+            kind = SK_FN;
+        }
+        emit2(X_LEA, dst, x64_mem_sym(x_sym(kind, e[FR_FN][F_INDEX])));
     } else if e[CALL_INTRINSIC] {
         x_gen_intrinsic(e, dst, d);
     } else {
@@ -1428,6 +1432,8 @@ fn x_gen_call(e, d) {
         emit1(X_CALL, x_sym(SK_FN, f[F_INDEX]));
         f[F_USED] = 1;
     } else {
+        emit2(X_MOV_RR, R11, RAX);
+        x_ld(RAX, x_mem1(R11, 0), 3);
         emit1(X_CALL_R, RAX);
     }
     if area > 0 {
@@ -2252,6 +2258,18 @@ fn x_gen_fn(f) {
     let nslots = x_assign_homes(f);
     cg = vec_new();
     x_entry_moves(f);
+    if f == entry_fn() {
+        let di = 0;
+        while di < prog_fns[VEC_LEN] {
+            let df = vec_get(prog_fns, di);
+            if !df[F_EXTERN] && df[F_REACH] {
+                emit2(X_LEA, RAX, x64_mem_sym(x_sym(SK_FN, di)));
+                emit2(X_LEA, RDX, x64_mem_sym(x_sym(SK_FNDESC, di)));
+                x_st(RAX, x_mem1(RDX, 0), 3);
+            }
+            di = di + 1;
+        }
+    }
     let stmts = f[F_BODY][BLK_STMTS];
     let i = 0;
     while i < stmts[VEC_LEN] {
