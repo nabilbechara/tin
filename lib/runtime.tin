@@ -73,6 +73,8 @@ shared var rtTLS i64      // number of per-core globals
 shared var rtCoreInit func()
 shared var rtCores i64
 shared var rtCoresDone i64
+shared var rtHashK0 i64   // map hash key: random per process, so keys cannot be chosen to collide
+shared var rtHashK1 i64
 
 func rt_init(argc i64, argv i64, ntls i64, coreinit func()) {
 	rtTLS = ntls
@@ -86,6 +88,8 @@ func rt_init(argc i64, argv i64, ntls i64, coreinit func()) {
 	rtOut[1] = 65536
 	rtOut[2] = malloc(65536)
 	rtOutTTY = isatty(1)&0xffffffff != 0
+	rt_random(&rtHashK0, 8)
+	rt_random(&rtHashK1, 8)
 }
 
 // rt_aligned_alloc returns n zeroed bytes on their own 128-byte cache lines (n is rounded up).
@@ -832,7 +836,7 @@ func rt_copy_str(dst i64, s str) i64 {
 //
 // Insertion-ordered: entries are appended to arrays (keys, values, cached str hashes, a
 // live byte each) and found through an open-addressing index of entry numbers (0 empty,
-// -1 deleted, else entry+1) with Fibonacci hashing and linear probing. The index has twice
+// -1 deleted, else entry+1) with a keyed hash (rt_map_hash) and linear probing. The index has twice
 // as many slots as there are entries, so it is never more than half full. Header words:
 // count, index slots, keys, values, index, str keys?, shift, index tombstones, hashes,
 // ingot, entries used, entry capacity, live bytes.
@@ -869,35 +873,82 @@ func rt_map_init(m i64, ec i64) {
 	m[12] = rt_region_alloc(m[9], ec)
 }
 
+// rt_hash_str is SipHash-1-3 of s keyed with the process's random key, so a client cannot
+// pick keys that collide in a map (hash flooding).
 func rt_hash_str(s str) i64 {
 	n := len(s)
 	p := cast(i64, s) + 8
-	h := n*0x9E3779B97F4A7C15 + 0x2545F4914F6CDD1D
+	v0 := rtHashK0 ^ 0x736f6d6570736575
+	v1 := rtHashK1 ^ 0x646f72616e646f6d
+	v2 := rtHashK0 ^ 0x6c7967656e657261
+	v3 := rtHashK1 ^ 0x7465646279746573
 	i := 0
 	for i+8 <= n {
-		w := (p + i)[0]
-		h = (h ^ w) * 0xbf58476d1ce4e5b9
-		h ^= lsr(h, 31)
+		m := (p + i)[0]
+		v3 ^= m
+		v0 += v1
+		v1 = (v1<<13 | (v1>>51)&8191) ^ v0
+		v0 = (v0<<32 | (v0>>32)&4294967295)
+		v2 += v3
+		v3 = (v3<<16 | (v3>>48)&65535) ^ v2
+		v0 += v3
+		v3 = (v3<<21 | (v3>>43)&2097151) ^ v0
+		v2 += v1
+		v1 = (v1<<17 | (v1>>47)&131071) ^ v2
+		v2 = (v2<<32 | (v2>>32)&4294967295)
+		v0 ^= m
 		i += 8
 	}
-	w := 0
+	m := n << 56
 	shift := 0
 	for i < n {
-		w |= i64(load8(p+i)) << shift
+		m |= i64(load8(p+i)) << shift
 		shift += 8
 		i++
 	}
-	h = (h ^ w) * 0x94d049bb133111eb
-	h ^= lsr(h, 29)
-	return h
+	v3 ^= m
+	v0 += v1
+	v1 = (v1<<13 | (v1>>51)&8191) ^ v0
+	v0 = (v0<<32 | (v0>>32)&4294967295)
+	v2 += v3
+	v3 = (v3<<16 | (v3>>48)&65535) ^ v2
+	v0 += v3
+	v3 = (v3<<21 | (v3>>43)&2097151) ^ v0
+	v2 += v1
+	v1 = (v1<<17 | (v1>>47)&131071) ^ v2
+	v2 = (v2<<32 | (v2>>32)&4294967295)
+	v0 ^= m
+	v2 ^= 0xff
+	for r := 0; r < 3; r++ {
+		v0 += v1
+		v1 = (v1<<13 | (v1>>51)&8191) ^ v0
+		v0 = (v0<<32 | (v0>>32)&4294967295)
+		v2 += v3
+		v3 = (v3<<16 | (v3>>48)&65535) ^ v2
+		v0 += v3
+		v3 = (v3<<21 | (v3>>43)&2097151) ^ v0
+		v2 += v1
+		v1 = (v1<<17 | (v1>>47)&131071) ^ v2
+		v2 = (v2<<32 | (v2>>32)&4294967295)
+	}
+	return v0 ^ v1 ^ v2 ^ v3
 }
 
-// rt_map_hash is key k's hash: the str hash, or the integer times the golden ratio.
+// rt_hash_int mixes integer key k with the process's random key (the splitmix64 finalizer
+// over k ^ key), so precomputed keys do not land in one probe run.
+func rt_hash_int(k i64) i64 {
+	h := k ^ rtHashK0
+	h = (h ^ (h>>30)&0x3ffffffff) * 0xbf58476d1ce4e5b9
+	h = (h ^ (h>>27)&0x1fffffffff) * 0x94d049bb133111eb
+	return h ^ (h>>31)&0x1ffffffff
+}
+
+// rt_map_hash is key k's hash: rt_hash_str for str (and struct or enum) keys, else rt_hash_int.
 func rt_map_hash(m i64, k i64) i64 {
 	if m[5] != 0 {
 		return rt_hash_str(cast(str, k))
 	}
-	return k * 0x9E3779B97F4A7C15
+	return rt_hash_int(k)
 }
 
 // An index slot holds 0 (empty), -1 (deleted) or fp<<32 | entry+1, fp being 31 hash bits,
@@ -952,11 +1003,7 @@ func rt_map_get(m i64, k i64) i64 {
 		c[ctxFound] = 0
 		return 0
 	}
-	h := k * 0x9E3779B97F4A7C15
-	if m[5] != 0 {
-		h = rt_hash_str(cast(str, k))
-	}
-	sl := rt_map_slot(m, k, h)
+	sl := rt_map_slot(m, k, rt_map_hash(m, k))
 	if sl < 0 {
 		c[ctxFound] = 0
 		return 0

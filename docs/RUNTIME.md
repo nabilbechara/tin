@@ -20,8 +20,11 @@ JSON (`argo`) are ordinary library packages built on it.
 | fault | a pointer to a str (the message), or 0 for nil |
 | func value | the code address |
 
-Map hashing: strings use a 64-bit multiply-mix hash over 8-byte words, integers a
-Fibonacci multiply; the table grows at half load.
+Map hashing is keyed with 128 random bits drawn once per process in `rt_init` (one key for
+every core, so a map built on one core is found on another): strings (and struct or enum
+keys, encoded as bytes) use SipHash-1-3, integers the splitmix64 finalizer over `k ^ key`.
+A client cannot precompute keys that collide (hash flooding). Iteration follows insertion
+order, so no output depends on the key. The table grows at half load.
 
 ## 2. The core context (x28)
 
