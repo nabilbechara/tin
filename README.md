@@ -53,15 +53,15 @@ func main() {
 Install a release without a local toolchain:
 
 ```sh
-curl -fL https://github.com/yasserreslan/tin/releases/download/v0.4.0/install.sh -o install-tin.sh
-sh install-tin.sh 0.4.0
+curl -fL https://github.com/yasserreslan/tin/releases/latest/download/install.sh -o install-tin.sh
+sh install-tin.sh
 export PATH="$HOME/.tin/bin:$PATH"
 ```
 
 Or compile in Docker:
 
 ```sh
-docker run --rm -v "$PWD:/src" ghcr.io/yasserreslan/tin:0.4.0 build app.tin -o app
+docker run --rm -v "$PWD:/src" ghcr.io/yasserreslan/tin:latest build app.tin -o app
 ```
 
 See [distribution and containers](docs/DISTRIBUTION.md) for checksums, upgrades and
