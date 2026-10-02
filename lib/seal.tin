@@ -1,4 +1,4 @@
-// Package seal has cryptographic hashes (SHA-256, SHA-1), HMAC-SHA256, constant-time
+// Package seal has cryptographic hashes (SHA-256, SHA-1), HMAC-SHA256, PBKDF2-HMAC-SHA-256, constant-time
 // comparison, secure random bytes, the hex and base64 encodings, and RSA-OAEP encryption
 // with a public key.
 package seal
@@ -221,6 +221,84 @@ func HmacSha256(key str, msg str) []u8 {
 	inner := Sha256(str(ipad))
 	opad = append(opad, inner...)
 	return Sha256(str(opad))
+}
+
+// Pbkdf2Sha256 derives length bytes using PBKDF2-HMAC-SHA-256. Iterations must be
+// positive; length must be between 0 and 1 MiB. Temporary storage is reused between
+// rounds, so memory usage does not grow with iterations. Choose the work factor for
+// your protocol or password policy (this function does not choose one).
+func Pbkdf2Sha256(password str, salt str, iterations i64, length i64) ![]u8 {
+	return try Pbkdf2Sha256Timeout(password, salt, iterations, length, 0)
+}
+
+// Pbkdf2Sha256Timeout derives bytes like Pbkdf2Sha256, with a timeout in nanoseconds
+// (<= 0: no limit). Both forms honor request deadlines and let other tasks run between
+// batches of rounds. Scratch storage is released before any timeout fault returns.
+func Pbkdf2Sha256Timeout(password str, salt str, iterations i64, length i64, timeout i64) ![]u8 {
+	until := 0
+	if timeout > 0 { until = rt_mono_ns()+timeout }
+	if iterations <= 0 || length < 0 || length > 1048576 {
+		fail "seal: invalid PBKDF2 iterations or length"
+	}
+	key := password
+	if len(key) > 64 {
+		key = str(Sha256(key))
+	}
+	out := make([]u8, length)
+	u := make([]u8, 32)
+	t := make([]u8, 32)
+	first := make([]u8, len(salt)+4)
+	for i := 0; i < len(salt); i++ {
+		first[i] = salt[i]
+	}
+	scope := rt_pool_enter()
+	for block := 0; block*32 < length; block++ {
+		status := pbkdf_budget(until)
+		if status != 0 {
+			rt_pool_leave(scope)
+			if status == waitDeadline { fail "deadline exceeded" }
+			fail "seal: PBKDF2 timed out"
+		}
+		for i := 0; i < 4; i++ {
+			first[len(salt)+i] = u8((block+1) >> (24-8*i))
+		}
+		v := HmacSha256(key, str(first))
+		for i := 0; i < 32; i++ {
+			u[i] = v[i]
+			t[i] = v[i]
+		}
+		rt_pool_scope_reset(scope)
+		for round := 1; round < iterations; round++ {
+			v = HmacSha256(key, str(u))
+			for i := 0; i < 32; i++ {
+				u[i] = v[i]
+				t[i] ^= v[i]
+			}
+			rt_pool_scope_reset(scope)
+			if round%128 == 0 {
+				status = pbkdf_budget(until)
+				if status != 0 {
+					rt_pool_leave(scope)
+					if status == waitDeadline { fail "deadline exceeded" }
+					fail "seal: PBKDF2 timed out"
+				}
+			}
+		}
+		for i := 0; i < 32 && block*32+i < length; i++ {
+			out[block*32+i] = t[i]
+		}
+	}
+	rt_pool_leave(scope)
+	return out
+}
+
+func pbkdf_budget(until i64) i64 {
+	rt_task_defer()
+	now := rt_mono_ns()
+	t := rt_task_current()
+	if t != 0 && t[tDeadline] > 0 && now >= t[tDeadline] { return waitDeadline }
+	if until > 0 && now >= until { return waitTimeout }
+	return waitReady
 }
 
 // ConstantTimeEq compares a and b in time that depends only on their lengths.
