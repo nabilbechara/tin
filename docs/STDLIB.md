@@ -290,17 +290,15 @@ Package mint converts numbers and quoted strings to and from text (like Go's str
 
 ## gauge
 
-Package gauge is floating-point and integer math (like Go's math and math/bits); transcendentals come from libm.
+Package gauge is floating-point and integer math (like Go's math and math/bits). The transcendental functions are written in Tin (ported from Go's math package); only the functions the CPU has an instruction for (sqrt, floor, ceil, trunc, round, rint) go through the system.
 
-- `const Pi = 3.141592653589793`: Pi is the ratio of a circle's circumference to its diameter.
-- `const E = 2.718281828459045`: E is the base of natural logarithms.
-- `const Sqrt2 = 1.4142135623730951`: Sqrt2 is the square root of 2.
-- `const Ln2 = 0.6931471805599453`: Ln2 is the natural logarithm of 2.
-- `const MaxI64 = 9223372036854775807`: MaxI64 is the largest i64.
-- `const MinI64 = -9223372036854775807 - 1`: MinI64 is the smallest i64.
-- `const MaxU64 u64 = 18446744073709551615`: MaxU64 is the largest u64 (typed, because an untyped constant this large folds to -1 in the frozen compiler).
-- `const MaxF64 = 1.7976931348623157e308`: MaxF64 is the largest finite f64.
-- `const SmallestNonzeroF64 = 4.9406564584124654e-324`: SmallestNonzeroF64 is the smallest positive denormal f64.
+- `Atan(x f64) f64`: Atan returns the arctangent of x, in [-Pi/2, Pi/2]. Atan(±0) = ±0, Atan(±Inf) = ±Pi/2.
+- `Atan2(y f64, x f64) f64`: Atan2 returns the arctangent of y/x using the signs of both to pick the quadrant, in [-Pi, Pi].
+- `Asin(x f64) f64`: Asin returns the arcsine of x, in [-Pi/2, Pi/2]. NaN for |x| > 1.
+- `Acos(x f64) f64`: Acos returns the arccosine of x, in [0, Pi]. NaN for |x| > 1.
+- `Cbrt(x f64) f64`: Cbrt returns the cube root of x. Cbrt(±0) = ±0, Cbrt(±Inf) = ±Inf, Cbrt(NaN) = NaN.
+- `Exp(x f64) f64`: Exp returns e**x. Exp(+Inf) = +Inf, Exp(-Inf) = 0, Exp(NaN) = NaN; it overflows above 709.78.
+- `Exp2(x f64) f64`: Exp2 returns 2**x. Exp2(+Inf) = +Inf, Exp2(-Inf) = 0, Exp2(NaN) = NaN.
 - `F64bits(f f64) u64`: F64bits returns the IEEE 754 bit pattern of f.
 - `F64frombits(b u64) f64`: F64frombits returns the f64 with bit pattern b.
 - `Abs(x f64) f64`: Abs returns |x| (NaN stays NaN, -0 becomes +0).
@@ -312,43 +310,48 @@ Package gauge is floating-point and integer math (like Go's math and math/bits);
 - `IsInf(f f64, sign i64) bool`: IsInf reports whether f is +Inf (sign > 0), -Inf (sign < 0) or either (sign == 0).
 - `Min(x f64, y f64) f64`: Min returns the smaller of x and y; any NaN gives NaN and -0 is smaller than +0 (like Go).
 - `Max(x f64, y f64) f64`: Max returns the larger of x and y; any NaN gives NaN and +0 is larger than -0 (like Go).
-- `MinI(a i64, b i64) i64`: MinI returns the smaller of a and b.
-- `MaxI(a i64, b i64) i64`: MaxI returns the larger of a and b.
-- `AbsI(x i64) i64`: AbsI returns |x| (MinI64 wraps to itself).
 - `Clamp(x f64, lo f64, hi f64) f64`: Clamp returns x limited to [lo, hi] (NaN passes through).
-- `ClampI(x i64, lo i64, hi i64) i64`: ClampI returns x limited to [lo, hi].
+- `Pow10(n i64) f64`: Pow10 returns 10**n: +Inf above 308, 0 below -323, exactly as Go's math.Pow10.
+- `Frexp(f f64) (f64, i64)`: Frexp breaks f into a fraction in [0.5, 1) and a power of two: f = frac * 2**exp. Frexp(0), Frexp(±Inf) and Frexp(NaN) return f and 0.
+- `Ldexp(frac f64, exp i64) f64`: Ldexp returns frac * 2**exp, the inverse of Frexp.
+- `Modf(f f64) (f64, f64)`: Modf returns the integer and fractional parts of f, both with the sign of f.
+- `const Pi = 3.141592653589793`: Pi is the ratio of a circle's circumference to its diameter.
+- `const E = 2.718281828459045`: E is the base of natural logarithms.
+- `const Sqrt2 = 1.4142135623730951`: Sqrt2 is the square root of 2.
+- `const Ln2 = 0.6931471805599453`: Ln2 is the natural logarithm of 2.
+- `const MaxI64 = 9223372036854775807`: MaxI64 is the largest i64.
+- `const MinI64 = -9223372036854775807 - 1`: MinI64 is the smallest i64.
+- `const MaxU64 u64 = 18446744073709551615`: MaxU64 is the largest u64 (typed, because an untyped constant this large folds to -1 in the frozen compiler).
+- `const MaxF64 = 1.7976931348623157e308`: MaxF64 is the largest finite f64.
+- `const SmallestNonzeroF64 = 4.9406564584124654e-324`: SmallestNonzeroF64 is the smallest positive denormal f64.
 - `Sqrt(x f64) f64`: Sqrt returns the square root of x.
-- `Cbrt(x f64) f64`: Cbrt returns the cube root of x.
-- `Pow(x f64, y f64) f64`: Pow returns x**y.
-- `Exp(x f64) f64`: Exp returns e**x.
-- `Exp2(x f64) f64`: Exp2 returns 2**x.
-- `Log(x f64) f64`: Log returns the natural logarithm of x.
-- `Log2(x f64) f64`: Log2 returns the base-2 logarithm of x.
-- `Log10(x f64) f64`: Log10 returns the base-10 logarithm of x.
-- `Log1p(x f64) f64`: Log1p returns log(1 + x), accurate for small x.
-- `Sin(x f64) f64`: Sin returns the sine of x (radians).
-- `Cos(x f64) f64`: Cos returns the cosine of x (radians).
-- `Tan(x f64) f64`: Tan returns the tangent of x (radians).
-- `Asin(x f64) f64`: Asin returns the arcsine of x.
-- `Acos(x f64) f64`: Acos returns the arccosine of x.
-- `Atan(x f64) f64`: Atan returns the arctangent of x.
-- `Atan2(y f64, x f64) f64`: Atan2 returns the arctangent of y/x using the signs of both to pick the quadrant.
-- `Sinh(x f64) f64`: Sinh returns the hyperbolic sine of x.
-- `Cosh(x f64) f64`: Cosh returns the hyperbolic cosine of x.
-- `Tanh(x f64) f64`: Tanh returns the hyperbolic tangent of x.
 - `Floor(x f64) f64`: Floor returns the largest integer value <= x.
 - `Ceil(x f64) f64`: Ceil returns the smallest integer value >= x.
 - `Trunc(x f64) f64`: Trunc returns the integer part of x (rounding toward zero).
 - `Round(x f64) f64`: Round returns x rounded to the nearest integer, halves away from zero.
 - `RoundToEven(x f64) f64`: RoundToEven returns x rounded to the nearest integer, halves to the even neighbour.
-- `Mod(x f64, y f64) f64`: Mod returns the remainder of x/y with the sign of x (NaN for y == 0 or infinite x).
-- `Hypot(x f64, y f64) f64`: Hypot returns sqrt(x*x + y*y) without undue overflow.
-- `Pow10(n i64) f64`: Pow10 returns 10**n: +Inf above 308, 0 below -323, exactly as Go's math.Pow10.
+- `Sinh(x f64) f64`: Sinh returns the hyperbolic sine of x. It uses Exp above 0.5 and a rational approximation below.
+- `Cosh(x f64) f64`: Cosh returns the hyperbolic cosine of x.
+- `Tanh(x f64) f64`: Tanh returns the hyperbolic tangent of x, in [-1, 1].
+- `Hypot(p f64, q f64) f64`: Hypot returns sqrt(p*p + q*q), overflowing only if the result does.
+- `MinI(a i64, b i64) i64`: MinI returns the smaller of a and b.
+- `MaxI(a i64, b i64) i64`: MaxI returns the larger of a and b.
+- `AbsI(x i64) i64`: AbsI returns |x| (MinI64 wraps to itself).
+- `ClampI(x i64, lo i64, hi i64) i64`: ClampI returns x limited to [lo, hi].
 - `Gcd(a i64, b i64) i64`: Gcd returns the greatest common divisor of |a| and |b| (0 when both are 0).
 - `Lcm(a i64, b i64) i64`: Lcm returns the least common multiple of |a| and |b| (0 when either is 0; wraps on overflow).
 - `PopCount(x u64) i64`: PopCount returns the number of one bits in x.
 - `LeadingZeros(x u64) i64`: LeadingZeros returns the number of leading zero bits in x (64 for 0).
 - `TrailingZeros(x u64) i64`: TrailingZeros returns the number of trailing zero bits in x (64 for 0).
+- `Log(x f64) f64`: Log returns the natural logarithm of x. Log(+Inf) = +Inf, Log(0) = -Inf, Log(x < 0) = NaN.
+- `Log2(x f64) f64`: Log2 returns the binary logarithm of x, exact for powers of two.
+- `Log10(x f64) f64`: Log10 returns the decimal logarithm of x.
+- `Log1p(x f64) f64`: Log1p returns log(1 + x), accurate even when x is close to zero.
+- `Mod(x f64, y f64) f64`: Mod returns the remainder of x/y with the sign of x, exactly. NaN for y == 0, infinite x or either NaN.
+- `Pow(x f64, y f64) f64`: Pow returns x**y, with the special cases of C99 and Go: Pow(x, ±0) = 1, Pow(1, y) = 1, Pow(NaN, y) = NaN, Pow(x < 0, non-integer y) = NaN, and the usual infinities and signed zeros. It is exact for small integer powers of exactly representable bases and within an ulp or two otherwise (it is not correctly rounded).
+- `Sin(x f64) f64`: Sin returns the sine of x (radians). Sin(±0) = ±0, Sin(±Inf) = Sin(NaN) = NaN.
+- `Cos(x f64) f64`: Cos returns the cosine of x (radians). Cos(±Inf) = Cos(NaN) = NaN.
+- `Tan(x f64) f64`: Tan returns the tangent of x (radians). Tan(±0) = ±0, Tan(±Inf) = Tan(NaN) = NaN.
 
 ## ore
 

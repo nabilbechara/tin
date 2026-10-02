@@ -1,0 +1,81 @@
+package gauge
+
+// Splitting a float into fraction and exponent and back, as in Go's frexp.go, ldexp.go and modf.go.
+
+const f64Mask = 0x7ff
+
+const f64Shift = 52
+
+const f64Bias = 1023
+
+const smallestNormal = 2.2250738585072014e-308 // 2**-1022
+
+func normalize(x f64) (f64, i64) {
+	if Abs(x) < smallestNormal {
+		return x * 4503599627370496.0, -52 // 2**52
+	}
+	return x, 0
+}
+
+// Frexp breaks f into a fraction in [0.5, 1) and a power of two: f = frac * 2**exp. Frexp(0),
+// Frexp(±Inf) and Frexp(NaN) return f and 0.
+func Frexp(f f64) (f64, i64) {
+	// A normal number only needs its exponent field read and replaced.
+	bits := F64bits(f)
+	field := i64(bits>>f64Shift) & f64Mask
+	if field != 0 && field != f64Mask {
+		return F64frombits(bits&0x800fffffffffffff | u64(f64Bias-1)<<f64Shift), field - f64Bias + 1
+	}
+	if f == 0 || IsNaN(f) || IsInf(f, 0) {
+		return f, 0
+	}
+	g, exp := normalize(f)
+	x := F64bits(g)
+	exp += i64((x>>f64Shift)&f64Mask) - f64Bias + 1
+	x &= ~(u64(f64Mask) << f64Shift)
+	x |= u64(f64Bias-1) << f64Shift
+	return F64frombits(x), exp
+}
+
+// Ldexp returns frac * 2**exp, the inverse of Frexp.
+func Ldexp(frac f64, exp i64) f64 {
+	// A normal frac with a normal result only needs its exponent field replaced.
+	bits := F64bits(frac)
+	field := i64(bits>>f64Shift) & f64Mask
+	if field != 0 && field != f64Mask {
+		total := exp + field - f64Bias
+		if total >= -1022 && total <= 1023 {
+			return F64frombits(bits&0x800fffffffffffff | u64(total+f64Bias)<<f64Shift)
+		}
+	}
+	if frac == 0 || IsNaN(frac) || IsInf(frac, 0) {
+		return frac
+	}
+	g, e := normalize(frac)
+	exp += e
+	x := F64bits(g)
+	exp += i64((x>>f64Shift)&f64Mask) - f64Bias
+	if exp < -1075 {
+		return Copysign(0, g)
+	}
+	if exp > 1023 {
+		if g < 0 {
+			return Inf(-1)
+		}
+		return Inf(1)
+	}
+	m := 1.0
+	if exp < -1022 {
+		exp += 53
+		m = 1.0 / 9007199254740992.0 // 2**-53
+	}
+	x &= ~(u64(f64Mask) << f64Shift)
+	x |= u64(exp+f64Bias) << f64Shift
+	return m * F64frombits(x)
+}
+
+// Modf returns the integer and fractional parts of f, both with the sign of f.
+func Modf(f f64) (f64, f64) {
+	integer := Trunc(f)
+	return integer, Copysign(f-integer, f)
+}

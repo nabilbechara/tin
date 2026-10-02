@@ -1,0 +1,138 @@
+package gauge
+
+// Arctangent, arcsine, arccosine and atan2: Cephes, through Go's atan.go, asin.go and atan2.go.
+
+const atanP0 = -8.750608600031904122785e-01
+
+const atanP1 = -1.615753718733365076637e+01
+
+const atanP2 = -7.500855792314704667340e+01
+
+const atanP3 = -1.228866684490136173410e+02
+
+const atanP4 = -6.485021904942025371773e+01
+
+const atanQ0 = 2.485846490142306297962e+01
+
+const atanQ1 = 1.650270098316988542046e+02
+
+const atanQ2 = 4.328810604912902668951e+02
+
+const atanQ3 = 4.853903996359136964868e+02
+
+const atanQ4 = 1.945506571482613964425e+02
+
+// xatan evaluates a rational approximation of atan on [0, 0.66].
+func xatan(x f64) f64 {
+	z := x * x
+	z = z * ((((atanP0*z+atanP1)*z+atanP2)*z+atanP3)*z + atanP4) / (((((z+atanQ0)*z+atanQ1)*z+atanQ2)*z+atanQ3)*z + atanQ4)
+	z = x*z + x
+	return z
+}
+
+// satan reduces the argument to [0, 0.66] and calls xatan.
+func satan(x f64) f64 {
+	const morebits = 6.123233995736765886130e-17 // Pi/2 = pi2 + morebits
+	const tan3pio8 = 2.41421356237309504880 // tan(3*Pi/8)
+	if x <= 0.66 {
+		return xatan(x)
+	}
+	if x > tan3pio8 {
+		return pi2 - xatan(1/x) + morebits
+	}
+	return pi4 + xatan((x-1)/(x+1)) + 0.5*morebits
+}
+
+// Atan returns the arctangent of x, in [-Pi/2, Pi/2]. Atan(±0) = ±0, Atan(±Inf) = ±Pi/2.
+func Atan(x f64) f64 {
+	const morebits = 6.123233995736765886130e-17 // Pi/2 = pi2 + morebits
+	const tan3pio8 = 2.41421356237309504880 // tan(3*Pi/8)
+	if x == 0 {
+		return x
+	}
+	neg := x < 0
+	if neg {
+		x = -x
+	}
+	var r f64 // satan(x), written out here: one call (xatan) instead of two
+	if x <= 0.66 {
+		r = xatan(x)
+	} else if x > tan3pio8 {
+		r = pi2 - xatan(1/x) + morebits
+	} else {
+		r = pi4 + xatan((x-1)/(x+1)) + 0.5*morebits
+	}
+	if neg {
+		return -r
+	}
+	return r
+}
+
+// Atan2 returns the arctangent of y/x using the signs of both to pick the quadrant, in [-Pi, Pi].
+func Atan2(y f64, x f64) f64 {
+	if IsNaN(y) || IsNaN(x) {
+		return NaN()
+	}
+	if y == 0 {
+		if x >= 0 && !Signbit(x) {
+			return Copysign(0, y)
+		}
+		return Copysign(pi, y)
+	}
+	if x == 0 {
+		return Copysign(pi2, y)
+	}
+	if IsInf(x, 0) {
+		if IsInf(x, 1) {
+			if IsInf(y, 0) {
+				return Copysign(pi4, y)
+			}
+			return Copysign(0, y)
+		}
+		if IsInf(y, 0) {
+			return Copysign(pi34, y)
+		}
+		return Copysign(pi, y)
+	}
+	if IsInf(y, 0) {
+		return Copysign(pi2, y)
+	}
+	q := Atan(y / x)
+	if x < 0 {
+		if q <= 0 {
+			return q + pi
+		}
+		return q - pi
+	}
+	return q
+}
+
+// Asin returns the arcsine of x, in [-Pi/2, Pi/2]. NaN for |x| > 1.
+func Asin(x f64) f64 {
+	if x == 0 {
+		return x
+	}
+	sign := false
+	if x < 0 {
+		x = -x
+		sign = true
+	}
+	if x > 1 {
+		return NaN()
+	}
+	temp := Sqrt(1 - x*x)
+	if x > 0.7 {
+		temp = pi2 - satan(temp/x)
+	} else {
+		temp = satan(x / temp)
+	}
+	if sign {
+		temp = -temp
+	}
+	return temp
+}
+
+// Acos returns the arccosine of x, in [0, Pi]. NaN for |x| > 1.
+func Acos(x f64) f64 {
+	return pi2 - Asin(x)
+}

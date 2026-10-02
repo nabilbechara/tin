@@ -66,6 +66,44 @@ fn el_import(name) {
     return nf;
 }
 
+// is_libm_symbol reports whether name is a function of the math library (libm.so.6). Everything
+// else the programs import is in libc.so.6, so a program that imports none of these does not need
+// libm at all: the math package is written in Tin, and the instructions the hardware has (sqrt,
+// floor, ceil, trunc, round, rint) are compiled inline.
+fn is_libm_symbol(name) {
+    let names = "acos asin atan atan2 acosh asinh atanh cbrt ceil copysign cos cosh erf erfc exp exp2 expm1 fabs floor fmax fmin fmod frexp hypot ldexp lgamma log log10 log1p log2 modf nearbyint pow rint round sin sinh sqrt tan tanh tgamma trunc ";
+    let n = strlen(name);
+    let i = 0;
+    while load8(names + i) {
+        let j = 0;
+        while j < n && load8(names + i + j) == load8(name + j) {
+            j = j + 1;
+        }
+        // A whole-word match: all of name, then the separating space.
+        if j == n && load8(names + i + n) == ' ' {
+            return 1;
+        }
+        // Skip to the start of the next word.
+        while load8(names + i) != ' ' {
+            i = i + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// imports_libm reports whether any imported function lives in libm.
+fn imports_libm(imports) {
+    let i = 0;
+    while i < imports[VEC_LEN] {
+        if is_libm_symbol(vec_get(imports, i)[F_NAME]) {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
 fn w_adrp(rd, pc, target) {
     let imm = (target >> 12) - (pc >> 12);
     return 0x90000000 | ((imm & 3) << 29) | (((imm >> 2) & 0x7ffff) << 5) | rd;
@@ -92,9 +130,14 @@ fn write_elf(path) {
     let libc_at = dstr[VEC_LEN];
     buf_str(dstr, "libc.so.6");
     buf_byte(dstr, 0);
-    let libm_at = dstr[VEC_LEN];
-    buf_str(dstr, "libm.so.6");
-    buf_byte(dstr, 0);
+    // libm is listed only when the program imports one of its functions.
+    let libm_at = 0;
+    let uses_libm = imports_libm(lk_imports);
+    if uses_libm {
+        libm_at = dstr[VEC_LEN];
+        buf_str(dstr, "libm.so.6");
+        buf_byte(dstr, 0);
+    }
     let interp = "/lib/ld-linux-aarch64.so.1";
     let names = vec_new();
     let name_off = vec_new();
@@ -268,7 +311,9 @@ fn write_elf(path) {
     // Dynamic section.
     let d = img + dyn_addr;
     d = el_dyn(d, 1, libc_at);
-    d = el_dyn(d, 1, libm_at);
+    if uses_libm {
+        d = el_dyn(d, 1, libm_at);
+    }
     d = el_dyn(d, 4, hash_off);
     d = el_dyn(d, 5, dynstr_off);
     d = el_dyn(d, 6, dynsym_off);

@@ -1,0 +1,155 @@
+package main
+
+// The corpus check, Tin side: the same inputs and hashes as bench/ref/gauge/corpus.go. Equal output
+// means every transcendental function agrees with Go's to the last bit.
+
+import "say"
+import "gauge"
+import "quarry"
+
+var seed u64 = 88172645463325252
+
+func next() u64 {
+	seed ^= seed >> 12
+	seed ^= seed << 25
+	seed ^= seed >> 27
+	return seed * 2685821657736338717
+}
+
+func edge() []f64 {
+	return []f64{
+		0, gauge.Copysign(0, -1), 1, -1, 0.5, -0.5, 2, -2, 3, 10, 100, 1e-3, 1e-10, 1e-300, 1e300, -1e300,
+		gauge.Inf(1), gauge.Inf(-1), gauge.NaN(), gauge.MaxF64, -gauge.MaxF64, gauge.SmallestNonzeroF64,
+		-gauge.SmallestNonzeroF64, 2.2250738585072014e-308, 2.225073858507201e-308, 1e-310, 1e-320,
+		0.625, 0.66, 0.7, 21, 21.000000000000004, 44.01, 88.03, 709.78, 709.782712893384, 710, -745.13, -745.2,
+		1023.9999999999999, 1024, -1074, -1075, 3.725290298461914e-09, 1.862645149230957e-09, 5.551115123125783e-17,
+		0.4142135623730951, -0.2928932188134525, 1.4142135623730951, 0.7071067811865476, 0.7853981633974483,
+		1.5707963267948966, 3.141592653589793, 6.283185307179586, 536870911, 536870912, 536870913, 1073741824,
+		1e10, 1e15, 4503599627370496, 9007199254740992, 9007199254740993, 1e22, 1e100, 1.7e308,
+		9.223372036854776e18, 1.8446744073709552e19, 27, -27, 8, 1000, 0.001, 0.1, 0.2, 0.3, 123.456,
+	}
+}
+
+func inputs() []f64 {
+	xs := edge()
+	for i := 0; i < 20000; i++ {
+		v := next()
+		m := next()
+		switch v % 4 {
+		case 0:
+			xs = append(xs, f64(i64(m>>11)%2000001-1000000)/100000)
+		case 1:
+			e := i64(v>>8) % 121
+			if e < 0 {
+				e = -e
+			}
+			e -= 60
+			bits := u64(1023+e)<<52 | m&0xfffffffffffff | (v>>20&1)<<63
+			xs = append(xs, gauge.F64frombits(bits))
+		case 2:
+			xs = append(xs, gauge.F64frombits(m))
+		default:
+			k := i64(v>>8)%8001 - 4000
+			xs = append(xs, f64(k)/8)
+		}
+	}
+	return xs
+}
+
+func canon(f f64) u64 {
+	if f != f {
+		return 0x7ff8000000000001
+	}
+	return gauge.F64bits(f)
+}
+
+func mix(h u64, b u64) u64 {
+	for i := 0; i < 8; i++ {
+		h ^= (b >> u64(8*i)) & 0xff
+		h *= 1099511628211
+	}
+	return h
+}
+
+func hex(b u64) str {
+	return say.Fmt("%016x", b)
+}
+
+func unary(name str, f func(f64) f64, xs []f64, dump bool) {
+	h := u64(14695981039346656037)
+	for i, x := range xs {
+		b := canon(f(x))
+		h = mix(h, b)
+		if dump {
+			say.Line(name, i, hex(gauge.F64bits(x)), hex(b))
+		}
+	}
+	if !dump {
+		say.Line(name, len(xs), hex(h))
+	}
+}
+
+func binary(name str, f func(f64, f64) f64, xs []f64, dump bool) {
+	h := u64(14695981039346656037)
+	n := 0
+	for i, x := range xs {
+		js := []i64{(i*7 + 3) % len(xs), (i*13 + 1) % len(xs), i}
+		for _, j := range js {
+			b := canon(f(x, xs[j]))
+			h = mix(h, b)
+			if dump {
+				say.Line(name, say.Fmt("{i},{j}"), hex(gauge.F64bits(x)), hex(gauge.F64bits(xs[j])), hex(b))
+			}
+			n++
+		}
+	}
+	if !dump {
+		say.Line(name, n, hex(h))
+	}
+}
+
+func absPow(x f64, y f64) f64 {
+	return gauge.Pow(gauge.Abs(x), y)
+}
+
+func main() {
+	dump := len(quarry.Args()) > 1 && quarry.Args()[1] == "dump"
+	xs := inputs()
+	unary("sin", gauge.Sin, xs, dump)
+	unary("cos", gauge.Cos, xs, dump)
+	unary("tan", gauge.Tan, xs, dump)
+	unary("asin", gauge.Asin, xs, dump)
+	unary("acos", gauge.Acos, xs, dump)
+	unary("atan", gauge.Atan, xs, dump)
+	unary("sinh", gauge.Sinh, xs, dump)
+	unary("cosh", gauge.Cosh, xs, dump)
+	unary("tanh", gauge.Tanh, xs, dump)
+	unary("exp", gauge.Exp, xs, dump)
+	unary("exp2", gauge.Exp2, xs, dump)
+	unary("log", gauge.Log, xs, dump)
+	unary("log2", gauge.Log2, xs, dump)
+	unary("log10", gauge.Log10, xs, dump)
+	unary("log1p", gauge.Log1p, xs, dump)
+	unary("cbrt", gauge.Cbrt, xs, dump)
+	binary("atan2", gauge.Atan2, xs, dump)
+	binary("pow", gauge.Pow, xs, dump)
+	binary("hypot", gauge.Hypot, xs, dump)
+	binary("mod", gauge.Mod, xs, dump)
+
+	h := u64(14695981039346656037)
+	n := 0
+	ys := []f64{2, 3, -2, 10, -7, 0.25, 1.5, -0.75, 100, 0.3333333333333333, 2.5, -1.5}
+	for i := 0; i < 2000; i++ {
+		for _, y := range ys {
+			b := canon(absPow(xs[i], y))
+			h = mix(h, b)
+			if dump {
+				say.Line("powi", n, hex(gauge.F64bits(gauge.Abs(xs[i]))), hex(gauge.F64bits(y)), hex(b))
+			}
+			n++
+		}
+	}
+	if !dump {
+		say.Line("powi", n, hex(h))
+	}
+}

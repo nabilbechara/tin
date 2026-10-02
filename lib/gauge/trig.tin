@@ -1,0 +1,252 @@
+package gauge
+
+// Sine, cosine and tangent: Cephes, through Go's sin.go, tan.go and trig_reduce.go. Arguments of 2**29 and
+// above use Payne-Hanek range reduction (trigReduce), which is exact for every finite argument.
+
+// The binary digits of 4/pi: 4/pi = Sum mPi4[i] * 2**(-64*i). 19 digits and the leading one give
+// 1217 bits, enough for the largest f64 exponent.
+var mPi4 = []u64{
+	0x0000000000000001,
+	0x45f306dc9c882a53,
+	0xf84eafa3ea69bb81,
+	0xb6c52b3278872083,
+	0xfca2c757bd778ac3,
+	0x6e48dc74849ba5c0,
+	0x0c925dd413a32439,
+	0xfc3bd63962534e7d,
+	0xd1046bea5d768909,
+	0xd338e04d68befc82,
+	0x7323ac7306a673e9,
+	0x3908bf177bf25076,
+	0x3ff12fffbc0b301f,
+	0xde5e2316b414da3e,
+	0xda6cfd9e4f96136e,
+	0x9e8c7ecd3cbfd45a,
+	0xea4f758fd7cbe2f6,
+	0x7a0e73ef14a525d4,
+	0xd7f6bf623f1aba10,
+	0xac06608df8f6d757,
+}
+
+// funnel returns the top 64 bits of the 128-bit value (hi, lo) shifted left by s.
+func funnel(hi u64, lo u64, s u64) u64 {
+	return shl(hi, s) | shr(lo, 64-s)
+}
+
+// trigReduce is Payne-Hanek range reduction by Pi/4 for x > 0: it returns the octant j (mod 8)
+// and the remainder z of x/(Pi/4) scaled back by Pi/4. It is exact for any finite x, where the
+// three-part Cody-Waite reduction in trigArg is exact only below 2**29. See K. C. Ng et al.,
+// "Argument reduction for huge arguments: good to the last bit", 1992.
+func trigReduce(x f64) (u64, f64) {
+	if x < pi4 {
+		return 0, x
+	}
+	ix := F64bits(x)
+	exp := i64((ix>>f64Shift)&f64Mask) - f64Bias - f64Shift
+	ix &= ~(u64(f64Mask) << f64Shift)
+	ix |= u64(1) << f64Shift
+	// x = ix * 2**exp. Pick the three digits of 4/pi so the product's leading digit has
+	// exponent -61.
+	digit := u64(exp+61) / 64
+	bitshift := u64(exp+61) % 64
+	z0 := funnel(mPi4[digit], mPi4[digit+1], bitshift)
+	z1 := funnel(mPi4[digit+1], mPi4[digit+2], bitshift)
+	z2 := funnel(mPi4[digit+2], mPi4[digit+3], bitshift)
+	z2hi, _ := mul64(z2, ix)
+	z1hi, z1lo := mul64(z1, ix)
+	z0lo := z0 * ix
+	lo, c := add64(z1lo, z2hi, 0)
+	hi, _ := add64(z0lo, z1hi, c)
+	j := hi >> 61 // the top three bits are the octant
+	hi = hi<<3 | lo>>61
+	lz := u64(LeadingZeros(hi))
+	e := u64(f64Bias) - (lz + 1)
+	// Clear the implicit bit, shift the mantissa into place and add the exponent.
+	hi = shl(hi, lz+1) | shr(lo, 64-(lz+1))
+	hi >>= 64 - f64Shift
+	hi |= e << f64Shift
+	z := F64frombits(hi)
+	if j&1 == 1 { // map zeros to the origin
+		j++
+		j &= 7
+		z -= 1.0
+	}
+	return j, z * pi4
+}
+
+// Pi/4 in three parts, so that y*pi4a, y*pi4b and y*pi4c are exact for y below 2**30.
+const pi4a = 7.85398125648498535156e-1 // 0x3fe921fb40000000
+
+const pi4b = 3.77489470793079817668e-8 // 0x3e64442d00000000
+
+const pi4c = 2.69515142907905952645e-15 // 0x3ce8469898cc5170
+
+// reduceThreshold is where trigArg hands over to trigReduce.
+const reduceThreshold = 536870912.0 // 2**29
+
+// Cephes coefficients of x + x**3 P(x**2) (sin) and 1 - x**2/2 + x**4 Q(x**2) (cos) on [0, Pi/4].
+const sinC0 = 1.58962301576546568060e-10
+
+const sinC1 = -2.50507477628578072866e-8
+
+const sinC2 = 2.75573136213857245213e-6
+
+const sinC3 = -1.98412698295895385996e-4
+
+const sinC4 = 8.33333333332211858878e-3
+
+const sinC5 = -1.66666666666666307295e-1
+
+const cosC0 = -1.13585365213876817300e-11
+
+const cosC1 = 2.08757008419747316778e-9
+
+const cosC2 = -2.75573141792967388112e-7
+
+const cosC3 = 2.48015872888517045348e-5
+
+const cosC4 = -1.38888888888730564116e-3
+
+const cosC5 = 4.16666666666665929218e-2
+
+// Sin returns the sine of x (radians). Sin(±0) = ±0, Sin(±Inf) = Sin(NaN) = NaN.
+func Sin(x f64) f64 {
+	if x == 0 || IsNaN(x) {
+		return x
+	}
+	if IsInf(x, 0) {
+		return NaN()
+	}
+	sign := false
+	if x < 0 {
+		x = -x
+		sign = true
+	}
+	var j u64
+	var z f64
+	if x >= reduceThreshold {
+		j, z = trigReduce(x)
+	} else {
+		j = u64(i64(x * invPi4)) // integer part of x/(Pi/4)
+		y := f64(i64(j))
+		if j&1 == 1 { // map zeros and singularities to the origin
+			j++
+			y += 1.0
+		}
+		j &= 7
+		z = ((x - y*pi4a) - y*pi4b) - y*pi4c
+	}
+	if j > 3 { // reflect in the x axis
+		sign = !sign
+		j -= 4
+	}
+	zz := z * z
+	var y f64
+	if j == 1 || j == 2 {
+		y = 1.0 - 0.5*zz + zz*zz*((((((cosC0*zz)+cosC1)*zz+cosC2)*zz+cosC3)*zz+cosC4)*zz+cosC5)
+	} else {
+		y = z + z*zz*((((((sinC0*zz)+sinC1)*zz+sinC2)*zz+sinC3)*zz+sinC4)*zz+sinC5)
+	}
+	if sign {
+		y = -y
+	}
+	return y
+}
+
+// Cos returns the cosine of x (radians). Cos(±Inf) = Cos(NaN) = NaN.
+func Cos(x f64) f64 {
+	if IsNaN(x) || IsInf(x, 0) {
+		return NaN()
+	}
+	sign := false
+	x = Abs(x)
+	var j u64
+	var z f64
+	if x >= reduceThreshold {
+		j, z = trigReduce(x)
+	} else {
+		j = u64(i64(x * invPi4)) // integer part of x/(Pi/4)
+		y := f64(i64(j))
+		if j&1 == 1 { // map zeros and singularities to the origin
+			j++
+			y += 1.0
+		}
+		j &= 7
+		z = ((x - y*pi4a) - y*pi4b) - y*pi4c
+	}
+	if j > 3 {
+		j -= 4
+		sign = !sign
+	}
+	if j > 1 {
+		sign = !sign
+	}
+	zz := z * z
+	var y f64
+	if j == 1 || j == 2 {
+		y = z + z*zz*((((((sinC0*zz)+sinC1)*zz+sinC2)*zz+sinC3)*zz+sinC4)*zz+sinC5)
+	} else {
+		y = 1.0 - 0.5*zz + zz*zz*((((((cosC0*zz)+cosC1)*zz+cosC2)*zz+cosC3)*zz+cosC4)*zz+cosC5)
+	}
+	if sign {
+		y = -y
+	}
+	return y
+}
+
+const tanP0 = -1.30936939181383777646e4
+
+const tanP1 = 1.15351664838587416140e6
+
+const tanP2 = -1.79565251976484877988e7
+
+const tanQ1 = 1.36812963470692954678e4
+
+const tanQ2 = -1.32089234440210967447e6
+
+const tanQ3 = 2.50083801823357915839e7
+
+const tanQ4 = -5.38695755929454629881e7
+
+// Tan returns the tangent of x (radians). Tan(±0) = ±0, Tan(±Inf) = Tan(NaN) = NaN.
+func Tan(x f64) f64 {
+	if x == 0 || IsNaN(x) {
+		return x
+	}
+	if IsInf(x, 0) {
+		return NaN()
+	}
+	sign := false
+	if x < 0 {
+		x = -x
+		sign = true
+	}
+	var j u64
+	var z f64
+	if x >= reduceThreshold {
+		j, z = trigReduce(x)
+	} else {
+		j = u64(i64(x * invPi4)) // integer part of x/(Pi/4)
+		y := f64(i64(j))
+		if j&1 == 1 { // map zeros and singularities to the origin
+			j++
+			y += 1.0
+		}
+		j &= 7
+		z = ((x - y*pi4a) - y*pi4b) - y*pi4c
+	}
+	zz := z * z
+	var y f64
+	if zz > 1e-14 {
+		y = z + z*(zz*(((tanP0*zz)+tanP1)*zz+tanP2)/((((zz+tanQ1)*zz+tanQ2)*zz+tanQ3)*zz+tanQ4))
+	} else {
+		y = z
+	}
+	if j&2 == 2 {
+		y = -1 / y
+	}
+	if sign {
+		y = -y
+	}
+	return y
+}

@@ -27,8 +27,9 @@ handled in `gen.tin` by `tgt_linux`.
 
 ## 2. Linux arm64 executables
 
-- PIE (`ET_DYN`), interpreter `/lib/ld-linux-aarch64.so.1`, `DT_NEEDED` libc.so.6 and
-  libm.so.6, SysV `DT_HASH`, `BIND_NOW`, one `R_AARCH64_GLOB_DAT` per imported function,
+- PIE (`ET_DYN`), interpreter `/lib/ld-linux-aarch64.so.1`, `DT_NEEDED` libc.so.6 (and
+  libm.so.6 only if the program imports a libm function, which the standard library no
+  longer does: the math package is Tin and `sqrt`, `floor` ... are instructions), SysV `DT_HASH`, `BIND_NOW`, one `R_AARCH64_GLOB_DAT` per imported function,
   no PLT, no section headers, segments aligned to 64 KiB.
 - `_start` calls `__libc_start_main(main, argc, argv, 0, 0, rtld_fini, stack_end)`.
 - No symbol versions are emitted. On arm64, glibc binds unversioned references to the

@@ -1687,6 +1687,29 @@ func rt_fmt_argend() {
 
 // f64 formatting, through snprintf and a shortest round-trip search for %v.
 
+// fmt_nonfinite prints NaN, +Inf or -Inf the way Go's fmt does for every float verb: NaN has no sign
+// (+NaN with the + flag), infinities always do, and neither is padded with zeros. snprintf spells
+// them "nan" and "inf", so they must not reach it. It reports whether x was one of them.
+func fmt_nonfinite(f i64, x f64, verb i64) bool {
+	if x == x && x <= 1.7976931348623157e308 && x >= -1.7976931348623157e308 {
+		return false
+	}
+	text := "+Inf"
+	if x != x {
+		text = "NaN"
+		if f[fPlus] != 0 && verb != 'v' { // Go clears the + flag for %+v of a non-struct
+			text = "+NaN"
+		}
+	} else if x < 0 {
+		text = "-Inf"
+	}
+	zero := f[fZero]
+	f[fZero] = 0
+	fmt_pad(f, cast(i64, text)+8, len(text))
+	f[fZero] = zero
+	return true
+}
+
 func fmt_float_c(f i64, x f64, verb i64, prec i64) {
 	buf := rt_alloc(400)
 	cf := "%.*f"
@@ -1920,6 +1943,9 @@ func rt_float_json(x f64) str {
 }
 
 func fmt_float(f i64, x f64, verb i64) {
+	if fmt_nonfinite(f, x, verb) {
+		return
+	}
 	if verb == 'v' || ((verb == 'g' || verb == 'G') && f[fPrec] < 0) {
 		fmt_shortest(f, x, -4, 6)
 		return

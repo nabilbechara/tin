@@ -124,6 +124,37 @@ weights, length-fact bounds-check elimination, division by constants via
 multiply-high, hoisting constant materialization, and alias information for struct
 fields.
 
+## 3b. Math functions (gauge)
+
+The transcendental functions are Tin, ported from Go's math package (bench/ref/gauge). 20M calls
+in a loop (`x = i%1000*0.01 + 0.001`), best of 9, Apple M3 Pro, one thread, Go 1.26, `clang -O2` against
+the system libm. Times in seconds:
+
+| function | Tin | Go | C libm | Tin/Go | Tin/C |
+|---|---|---|---|---|---|
+| sqrt (one instruction) | 0.015 | 0.015 | 0.015 | 1.02 | 1.01 |
+| sin | 0.104 | 0.065 | 0.049 | 1.60 | 2.12 |
+| cos | 0.107 | 0.060 | 0.050 | 1.80 | 2.13 |
+| tan | 0.103 | 0.064 | 0.064 | 1.61 | 1.60 |
+| atan | 0.081 | 0.050 | 0.051 | 1.62 | 1.58 |
+| atan2 | 0.116 | 0.081 | 0.102 | 1.43 | 1.13 |
+| exp | 0.088 | 0.074 | 0.038 | 1.20 | 2.33 |
+| log | 0.105 | 0.069 | 0.042 | 1.53 | 2.47 |
+| log1p | 0.107 | 0.070 | 0.054 | 1.53 | 1.96 |
+| pow (1.5) | 0.432 | 0.335 | 0.108 | 1.29 | 3.98 |
+| sinh | 0.125 | 0.094 | 0.065 | 1.33 | 1.93 |
+| cbrt | 0.080 | 0.069 | 0.039 | 1.15 | 2.06 |
+
+Tin runs the same algorithm as Go 1.2 to 1.8 times slower, and libm's tuned kernels are faster
+still. `sqrt` shows the harness is fair. The first version of the port was 2 to 4 times slower than
+Go (`exp` 0.214 s); the exact fast paths in `Frexp`, `Ldexp`, `Exp` and `Log` (reading and
+replacing the exponent field instead of calling) took `exp` to 0.088 s without changing a single
+result bit. What is left is the code generator's, and it is the same list as section 3: 64-bit
+constants rebuilt with `movz`/`movk` (a 6-term polynomial has a dozen coefficients), no hoisting of
+them out of the function, and small functions that Go inlines (`IsNaN`, `Copysign`, the helpers
+called by `Pow` and `Atan2`) but Tin does not, because its inliner takes only single-statement
+functions. These functions make a good benchmark for that work.
+
 ## 4. Compile times and binary sizes
 
 The compiler (about 20k lines including `lib/std.tin`, all backends) builds itself in 0.07 s
@@ -134,4 +165,4 @@ The compiler (about 20k lines including `lib/std.tin`, all backends) builds itse
 | hello world (macOS) | 35 KB | 2.5 MB |
 | JSON API server (`examples/api.tin`, with a Router, vs net/http / fasthttp) | 91 KB (macOS), 132 KB (Linux ELF, mostly 64 KiB segment padding) | 8.2 MB / 8.1 MB |
 
-Programs need no runtime besides libc and libm.
+Programs need no runtime besides libc (Linux) or libSystem (macOS); the math library is Tin, so libm is not linked.
