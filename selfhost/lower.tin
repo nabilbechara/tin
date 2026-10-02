@@ -302,7 +302,7 @@ fn chk_ident(e, want) {
 // runtime_use rejects user code naming a function only the standard library may use: a C
 // extern or one of the runtime's own (the trusted files outside any package).
 fn runtime_use(pos, f, name) {
-    if ck_legacy || ck_trusted {
+    if ck_legacy || ck_trusted || streq(name, "rt_pool_used") {
         return;
     }
     if f[F_EXTERN] || (vec_get(file_trusted, f[F_FILE]) && load8(vec_get(file_pkgs, f[F_FILE])) == 0) {
@@ -347,6 +347,19 @@ fn use_sym(e, s, want) {
         }
         return t;
     }
+    if s[S_CAPTURED] {
+        let env_ref = sym_ref_node(e[N_POS], ck_fn[F_ENV_SYM]);
+        let cell_addr = mk_mem(e[N_POS], env_ref, 0, 0, 8 * (2 + s[S_CAP_IDX]), ty_int);
+        let val = mk_mem(e[N_POS], cell_addr, 0, 0, 0, s[S_TYPE]);
+        replace_node(e, val);
+        return s[S_TYPE];
+    }
+    if s[S_CELL] {
+        let cell_ref = sym_ref_node(e[N_POS], s[S_CELL_SYM]);
+        let val = mk_mem(e[N_POS], cell_ref, 0, 0, 0, s[S_TYPE]);
+        replace_node(e, val);
+        return s[S_TYPE];
+    }
     e[ID_REF] = s;
     s[S_READS] = s[S_READS] + 1;
     if !s[S_TYPE] {
@@ -371,6 +384,18 @@ fn chk_unary(e, want) {
         }
         let xname = x[ID_NAME];
         let xt = chk(x, 0);
+        if x[ID_REF] && x[ID_REF][S_CAPTURED] {
+            let s = x[ID_REF];
+            let env_ref = sym_ref_node(e[N_POS], ck_fn[F_ENV_SYM]);
+            let cell_addr = mk_mem(e[N_POS], env_ref, 0, 0, 8 * (2 + s[S_CAP_IDX]), ty_int);
+            replace_node(e, cell_addr);
+            return ty_int;
+        }
+        if x[ID_REF] && x[ID_REF][S_CELL] {
+            let s = x[ID_REF];
+            replace_node(e, sym_ref_node(e[N_POS], s[S_CELL_SYM]));
+            return ty_int;
+        }
         if x[N_KIND] != EX_IDENT || !x[ID_REF] {
             err_quoted(e[N_POS], "cannot take the address of constant ", xname, "");
             return ty_int;
@@ -1538,8 +1563,20 @@ fn init_zero_field(pos, stmts, obj, t, fi) {
     }
 }
 
-// chk_funclit lifts a function literal to a top-level function. Literals may not
-// capture local variables: only globals and their own parameters.
+fn get_cell_addr(pos, os) {
+    if os[S_CAPTURED] {
+        return mk_mem(pos, sym_ref_node(pos, ck_fn[F_ENV_SYM]), 0, 0, 8 * (2 + os[S_CAP_IDX]), ty_int);
+    }
+    if os[S_CELL] {
+        return sym_ref_node(pos, os[S_CELL_SYM]);
+    }
+    os[S_ADDR] = 1;
+    return mk_unary(pos, "&", sym_ref_node(pos, os));
+}
+
+// chk_funclit lifts a function literal to a top-level function. Literals may capture
+// variables from enclosing scopes: non-escaping closures allocate frame descriptors
+// and cells on stack (0 bytes allocated), while escaping closures allocate region objects.
 fn chk_funclit(e) {
     let f = e[LIT_FN];
     lifted_count = lifted_count + 1;
@@ -1550,15 +1587,79 @@ fn chk_funclit(e) {
     f[F_NAME] = b[VEC_DATA];
     f[F_FILE] = ck_file;
     f[F_LIFTED] = 1;
+    f[F_QNAME] = f[F_NAME];
+    f[F_PARENT] = ck_fn;
+    f[F_CAPTURES] = vec_new();
+    f[F_OUTER_SYMS] = vec_clone(sc_syms);
+    f[F_ESCAPES] = e[LIT_ESCAPE];
+
     let saved_fn = ck_fn;
     let saved_legacy = ck_legacy;
     declare_fn(f);
     ck_fn = saved_fn;
     ck_legacy = saved_legacy;
-    f[F_QNAME] = f[F_NAME];
+
+    check_fn_closure(f);
+    f[F_DONE] = 1;
     vec_push(prog_fns, f);
-    replace_node(e, node_new(EX_FUNCREF, e[N_POS]));
-    e[FR_FN] = f;
+
+    let k = f[F_CAPTURES][VEC_LEN];
+    if k == 0 {
+        replace_node(e, node_new(EX_FUNCREF, e[N_POS]));
+        e[FR_FN] = f;
+        return f[F_TYPE];
+    }
+
+    let pos = e[N_POS];
+    let fn_ref = node_new(EX_FUNCREF, pos);
+    fn_ref[FR_FN] = f;
+    fn_ref[FR_RAW] = 1;
+    fn_ref[N_TYPE] = ty_int;
+
+    let stmts = vec_new();
+    let desc_val = 0;
+
+    if e[LIT_ESCAPE] == 0 {
+        let desc_sym = declare_local(pos, "$desc", ty_int);
+        desc_sym[S_ADDR] = 1;
+        desc_sym[S_WORDS] = 2 + k;
+        let desc_addr = mk_unary(pos, "&", sym_ref_node(pos, desc_sym));
+        let dptr = temp(pos, desc_addr, ty_int);
+        vec_push(stmts, dptr);
+        let dref = sym_ref_node(pos, dptr[LET_SYM]);
+
+        vec_push(stmts, assign_stmt(pos, mk_mem(pos, dref, 0, 0, 0, ty_int), fn_ref));
+        vec_push(stmts, assign_stmt(pos, mk_mem(pos, dref, 0, 0, 8, ty_int), mk_int(pos, k, ty_int)));
+
+        let i = 0;
+        while i < k {
+            let os = vec_get(f[F_CAPTURES], i);
+            let cell_expr = get_cell_addr(pos, os);
+            vec_push(stmts, assign_stmt(pos, mk_mem(pos, dref, 0, 0, 8 * (2 + i), ty_int), cell_expr));
+            i = i + 1;
+        }
+        desc_val = dref;
+    } else {
+        let alloc_call = rt_call(pos, "rt_alloc", args1(mk_int(pos, 8 * (2 + k), ty_int)), ty_int);
+        let obj = temp(pos, alloc_call, ty_int);
+        vec_push(stmts, obj);
+        let dref = sym_ref_node(pos, obj[LET_SYM]);
+
+        vec_push(stmts, assign_stmt(pos, mk_mem(pos, dref, 0, 0, 0, ty_int), fn_ref));
+        vec_push(stmts, assign_stmt(pos, mk_mem(pos, dref, 0, 0, 8, ty_int), mk_int(pos, k, ty_int)));
+
+        let i = 0;
+        while i < k {
+            let os = vec_get(f[F_CAPTURES], i);
+            let cell_expr = get_cell_addr(pos, os);
+            vec_push(stmts, assign_stmt(pos, mk_mem(pos, dref, 0, 0, 8 * (2 + i), ty_int), cell_expr));
+            i = i + 1;
+        }
+        desc_val = dref;
+    }
+
+    let seq = mk_seq(pos, stmts, desc_val, f[F_TYPE]);
+    replace_node(e, seq);
     return f[F_TYPE];
 }
 
@@ -2214,7 +2315,13 @@ fn lower_keep(e, want) {
     if is_untyped(t) {
         t = reconvert(x, default_type(t));
     }
-    if !is_ref(t) || kind_of(t) == K_FUNC {
+    if kind_of(t) == K_FUNC {
+        let c = rt_call(pos, "rt_keep_closure", args1(x), t);
+        c[N_REGION] = R_OWNED;
+        replace_node(e, c);
+        return t;
+    }
+    if !is_ref(t) {
         replace_node(e, x);
         return t;
     }

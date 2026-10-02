@@ -30,6 +30,11 @@ const S_REGION = 18;
 const S_TLS = 19;    // per-core global: slot + 1 in the core's context block
 const S_BIG = 20;    // integer constant above 2^63-1 (its bits look negative)
 const S_UNINIT = 21; // global: its startup initializer has not run yet (check_init_order)
+const S_CAPTURED = 22; // captured variable proxy symbol inside closure
+const S_CAP_IDX = 23;  // capture index in enclosing closure's capture list
+const S_CELL = 24;     // symbol needs a heap cell (allocated via rt_alloc)
+const S_CELL_SYM = 25; // local symbol holding the cell address pointer
+const S_WORDS = 26;    // multi-word local slot allocation size (default 1)
 
 const MAX_PARAMS = 8;
 
@@ -52,9 +57,10 @@ var tls_count;
 var ck_trusted;    // the file is part of the standard library
 var file_trusted;
 var safe_pairs;    // [index sym, slice sym] proven in range in the current loop body
+var ck_escaping_cells; // variable names that must be allocated in heap cells
 
 fn sym_new(kind, name, pos) {
-    let s = calloc(24, 8);
+    let s = calloc(28, 8);
     s[S_KIND] = kind;
     s[S_NAME] = name;
     s[S_POS] = pos;
@@ -469,6 +475,10 @@ fn check() {
     i = 0;
     while i < prog_fns[VEC_LEN] {
         let fd = vec_get(prog_fns, i);
+        if fd[F_DONE] {
+            i = i + 1;
+            continue;
+        }
         if !fd[F_EXTERN] && fd[F_LIFTED] != 2 && !is_template(fd) {
             check_fn(fd);
         }
@@ -1180,6 +1190,431 @@ fn mut_capable(t) {
     return k == K_STRUCT || k == K_SLICE || k == K_MAP || k == K_OPT;
 }
 
+fn collect_local_decls(stmts, names) {
+    if !stmts { return; }
+    let i = 0;
+    while i < stmts[VEC_LEN] {
+        let s = vec_get(stmts, i);
+        let k = s[N_KIND];
+        if k == ST_LET {
+            vec_push(names, s[LET_NAME]);
+        } else if k == ST_MULTI && s[MU_DEFINE] {
+            let tg = s[MU_TARGETS];
+            let j = 0;
+            while j < tg[VEC_LEN] {
+                let t = vec_get(tg, j);
+                if t[N_KIND] == EX_IDENT {
+                    vec_push(names, t[ID_NAME]);
+                }
+                j = j + 1;
+            }
+        } else if k == ST_BLOCK {
+            collect_local_decls(s[BLK_STMTS], names);
+        } else if k == ST_LIST {
+            collect_local_decls(s[LIST_STMTS], names);
+        } else if k == ST_IF {
+            if s[IF_INIT] {
+                let tmp = vec_new();
+                vec_push(tmp, s[IF_INIT]);
+                collect_local_decls(tmp, names);
+            }
+            collect_local_decls(s[IF_THEN][BLK_STMTS], names);
+            if s[IF_ELSE] {
+                if s[IF_ELSE][N_KIND] == ST_BLOCK {
+                    collect_local_decls(s[IF_ELSE][BLK_STMTS], names);
+                } else {
+                    let tmp = vec_new();
+                    vec_push(tmp, s[IF_ELSE]);
+                    collect_local_decls(tmp, names);
+                }
+            }
+        } else if k == ST_WHILE {
+            if s[WH_INIT] {
+                let tmp = vec_new();
+                vec_push(tmp, s[WH_INIT]);
+                collect_local_decls(tmp, names);
+            }
+            collect_local_decls(s[WH_BODY][BLK_STMTS], names);
+        } else if k == ST_RANGE {
+            if s[RG_DEFINE] {
+                if s[RG_KEY] && s[RG_KEY][N_KIND] == EX_IDENT {
+                    vec_push(names, s[RG_KEY][ID_NAME]);
+                }
+                if s[RG_VAL] && s[RG_VAL][N_KIND] == EX_IDENT {
+                    vec_push(names, s[RG_VAL][ID_NAME]);
+                }
+            }
+            collect_local_decls(s[RG_BODY][BLK_STMTS], names);
+        } else if k == ST_SWITCH {
+            if s[SW_INIT] {
+                let tmp = vec_new();
+                vec_push(tmp, s[SW_INIT]);
+                collect_local_decls(tmp, names);
+            }
+            let cases = s[SW_CASES];
+            if cases {
+                let ci = 0;
+                while ci < cases[VEC_LEN] {
+                    let c = vec_get(cases, ci);
+                    let body = vec_get(c, 1);
+                    if body {
+                        collect_local_decls(body[BLK_STMTS], names);
+                    }
+                    ci = ci + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn scan_funclit_escaping_idents(lf, outer_names, cells) {
+    if !lf || !lf[F_BODY] {
+        return;
+    }
+    let inner_params = lf[F_PARAMS];
+    scan_idents_in_block(lf[F_BODY], inner_params, outer_names, cells);
+}
+
+fn scan_idents_in_block(b, inner_params, outer_names, cells) {
+    if !b || !b[BLK_STMTS] {
+        return;
+    }
+    let stmts = b[BLK_STMTS];
+    let i = 0;
+    while i < stmts[VEC_LEN] {
+        scan_idents_in_stmt(vec_get(stmts, i), inner_params, outer_names, cells);
+        i = i + 1;
+    }
+}
+
+fn scan_idents_in_stmt(s, inner_params, outer_names, cells) {
+    if !s { return; }
+    let k = s[N_KIND];
+    if k == ST_LET {
+        scan_idents_in_expr(s[LET_INIT], inner_params, outer_names, cells);
+    } else if k == ST_ASSIGN {
+        scan_idents_in_expr(s[AS_TARGET], inner_params, outer_names, cells);
+        scan_idents_in_expr(s[AS_VALUE], inner_params, outer_names, cells);
+    } else if k == ST_MULTI {
+        let vals = s[MU_VALUES];
+        if vals {
+            let i = 0;
+            while i < vals[VEC_LEN] {
+                scan_idents_in_expr(vec_get(vals, i), inner_params, outer_names, cells);
+                i = i + 1;
+            }
+        }
+    } else if k == ST_EXPR {
+        scan_idents_in_expr(s[ES_X], inner_params, outer_names, cells);
+    } else if k == ST_IF {
+        if s[IF_INIT] {
+            scan_idents_in_stmt(s[IF_INIT], inner_params, outer_names, cells);
+        }
+        scan_idents_in_expr(s[IF_COND], inner_params, outer_names, cells);
+        scan_idents_in_block(s[IF_THEN], inner_params, outer_names, cells);
+        if s[IF_ELSE] {
+            if s[IF_ELSE][N_KIND] == ST_BLOCK {
+                scan_idents_in_block(s[IF_ELSE], inner_params, outer_names, cells);
+            } else {
+                scan_idents_in_stmt(s[IF_ELSE], inner_params, outer_names, cells);
+            }
+        }
+    } else if k == ST_WHILE {
+        if s[WH_INIT] {
+            scan_idents_in_stmt(s[WH_INIT], inner_params, outer_names, cells);
+        }
+        scan_idents_in_expr(s[WH_COND], inner_params, outer_names, cells);
+        scan_idents_in_block(s[WH_BODY], inner_params, outer_names, cells);
+        scan_idents_in_stmt(s[WH_POST], inner_params, outer_names, cells);
+    } else if k == ST_RANGE {
+        scan_idents_in_expr(s[RG_EXPR], inner_params, outer_names, cells);
+        scan_idents_in_block(s[RG_BODY], inner_params, outer_names, cells);
+    } else if k == ST_SWITCH {
+        if s[SW_INIT] {
+            scan_idents_in_stmt(s[SW_INIT], inner_params, outer_names, cells);
+        }
+        if s[SW_TAG] {
+            scan_idents_in_expr(s[SW_TAG], inner_params, outer_names, cells);
+        }
+        let cases = s[SW_CASES];
+        if cases {
+            let ci = 0;
+            while ci < cases[VEC_LEN] {
+                let c = vec_get(cases, ci);
+                let exprs = vec_get(c, 0);
+                if exprs {
+                    let j = 0;
+                    while j < exprs[VEC_LEN] {
+                        scan_idents_in_expr(vec_get(exprs, j), inner_params, outer_names, cells);
+                        j = j + 1;
+                    }
+                }
+                let body = vec_get(c, 1);
+                if body {
+                    scan_idents_in_block(body, inner_params, outer_names, cells);
+                }
+                ci = ci + 1;
+            }
+        }
+    } else if k == ST_RETURN {
+        scan_idents_in_expr(s[RET_VALUE], inner_params, outer_names, cells);
+        let vals = s[RET_VALUES];
+        if vals {
+            let i = 0;
+            while i < vals[VEC_LEN] {
+                scan_idents_in_expr(vec_get(vals, i), inner_params, outer_names, cells);
+                i = i + 1;
+            }
+        }
+    } else if k == ST_BLOCK {
+        scan_idents_in_block(s, inner_params, outer_names, cells);
+    } else if k == ST_LIST {
+        let stmts = s[LIST_STMTS];
+        let i = 0;
+        while i < stmts[VEC_LEN] {
+            scan_idents_in_stmt(vec_get(stmts, i), inner_params, outer_names, cells);
+            i = i + 1;
+        }
+    }
+}
+
+fn scan_idents_in_expr(e, inner_params, outer_names, cells) {
+    if !e { return; }
+    let k = e[N_KIND];
+    if k == EX_IDENT {
+        let name = e[ID_NAME];
+        if !vec_has_str(inner_params, name) && vec_has_str(outer_names, name) {
+            if !vec_has_str(cells, name) {
+                vec_push(cells, name);
+            }
+        }
+    } else if k == EX_CALL {
+        scan_idents_in_expr(e[CALL_CALLEE], inner_params, outer_names, cells);
+        let args = e[CALL_ARGS];
+        if args {
+            let i = 0;
+            while i < args[VEC_LEN] {
+                scan_idents_in_expr(vec_get(args, i), inner_params, outer_names, cells);
+                i = i + 1;
+            }
+        }
+    } else if k == EX_BINARY {
+        scan_idents_in_expr(e[BIN_L], inner_params, outer_names, cells);
+        scan_idents_in_expr(e[BIN_R], inner_params, outer_names, cells);
+    } else if k == EX_UNARY {
+        scan_idents_in_expr(e[UN_X], inner_params, outer_names, cells);
+    } else if k == EX_SELECT {
+        scan_idents_in_expr(e[SEL_X], inner_params, outer_names, cells);
+    } else if k == EX_INDEX {
+        scan_idents_in_expr(e[IX_X], inner_params, outer_names, cells);
+        scan_idents_in_expr(e[IX_I], inner_params, outer_names, cells);
+    } else if k == EX_CONV {
+        scan_idents_in_expr(e[CV_X], inner_params, outer_names, cells);
+    } else if k == EX_MUTARG {
+        scan_idents_in_expr(e[MUTARG_X], inner_params, outer_names, cells);
+    } else if k == EX_COMPOSITE {
+        let elems = e[CL_ELEMS];
+        if elems {
+            let i = 0;
+            while i < elems[VEC_LEN] {
+                scan_idents_in_expr(vec_get(elems, i), inner_params, outer_names, cells);
+                i = i + 1;
+            }
+        }
+    } else if k == EX_FUNCLIT {
+        scan_funclit_escaping_idents(e[LIT_FN], outer_names, cells);
+    }
+}
+
+fn scan_captures(f, cells) {
+    if !f || !f[F_BODY] {
+        return;
+    }
+    let outer_names = vec_new();
+    let i = 0;
+    while i < f[F_PARAMS][VEC_LEN] {
+        vec_push(outer_names, vec_get(f[F_PARAMS], i));
+        i = i + 1;
+    }
+    collect_local_decls(f[F_BODY][BLK_STMTS], outer_names);
+    scan_funclits_in_block(f[F_BODY], outer_names, cells);
+}
+
+fn scan_funclits_in_block(b, outer_names, cells) {
+    if !b || !b[BLK_STMTS] {
+        return;
+    }
+    let stmts = b[BLK_STMTS];
+    let i = 0;
+    while i < stmts[VEC_LEN] {
+        scan_funclits_in_stmt(vec_get(stmts, i), outer_names, cells);
+        i = i + 1;
+    }
+}
+
+fn scan_funclits_in_stmt(s, outer_names, cells) {
+    if !s { return; }
+    let k = s[N_KIND];
+    if k == ST_LET {
+        scan_funclits_in_expr(s[LET_INIT], outer_names, cells);
+    } else if k == ST_ASSIGN {
+        scan_funclits_in_expr(s[AS_TARGET], outer_names, cells);
+        scan_funclits_in_expr(s[AS_VALUE], outer_names, cells);
+    } else if k == ST_MULTI {
+        let vals = s[MU_VALUES];
+        if vals {
+            let i = 0;
+            while i < vals[VEC_LEN] {
+                scan_funclits_in_expr(vec_get(vals, i), outer_names, cells);
+                i = i + 1;
+            }
+        }
+    } else if k == ST_EXPR {
+        scan_funclits_in_expr(s[ES_X], outer_names, cells);
+    } else if k == ST_IF {
+        if s[IF_INIT] {
+            scan_funclits_in_stmt(s[IF_INIT], outer_names, cells);
+        }
+        scan_funclits_in_expr(s[IF_COND], outer_names, cells);
+        scan_funclits_in_block(s[IF_THEN], outer_names, cells);
+        if s[IF_ELSE] {
+            if s[IF_ELSE][N_KIND] == ST_BLOCK {
+                scan_funclits_in_block(s[IF_ELSE], outer_names, cells);
+            } else {
+                scan_funclits_in_stmt(s[IF_ELSE], outer_names, cells);
+            }
+        }
+    } else if k == ST_WHILE {
+        if s[WH_INIT] {
+            scan_funclits_in_stmt(s[WH_INIT], outer_names, cells);
+        }
+        scan_funclits_in_expr(s[WH_COND], outer_names, cells);
+        scan_funclits_in_block(s[WH_BODY], outer_names, cells);
+        scan_funclits_in_stmt(s[WH_POST], outer_names, cells);
+    } else if k == ST_RANGE {
+        scan_funclits_in_expr(s[RG_EXPR], outer_names, cells);
+        scan_funclits_in_block(s[RG_BODY], outer_names, cells);
+    } else if k == ST_SWITCH {
+        if s[SW_INIT] {
+            scan_funclits_in_stmt(s[SW_INIT], outer_names, cells);
+        }
+        if s[SW_TAG] {
+            scan_funclits_in_expr(s[SW_TAG], outer_names, cells);
+        }
+        let cases = s[SW_CASES];
+        if cases {
+            let ci = 0;
+            while ci < cases[VEC_LEN] {
+                let c = vec_get(cases, ci);
+                let exprs = vec_get(c, 0);
+                if exprs {
+                    let j = 0;
+                    while j < exprs[VEC_LEN] {
+                        scan_funclits_in_expr(vec_get(exprs, j), outer_names, cells);
+                        j = j + 1;
+                    }
+                }
+                let body = vec_get(c, 1);
+                if body {
+                    scan_funclits_in_block(body, outer_names, cells);
+                }
+                ci = ci + 1;
+            }
+        }
+    } else if k == ST_RETURN {
+        scan_funclits_in_expr(s[RET_VALUE], outer_names, cells);
+        let vals = s[RET_VALUES];
+        if vals {
+            let i = 0;
+            while i < vals[VEC_LEN] {
+                scan_funclits_in_expr(vec_get(vals, i), outer_names, cells);
+                i = i + 1;
+            }
+        }
+    } else if k == ST_BLOCK {
+        scan_funclits_in_block(s, outer_names, cells);
+    } else if k == ST_LIST {
+        let stmts = s[LIST_STMTS];
+        let i = 0;
+        while i < stmts[VEC_LEN] {
+            scan_funclits_in_stmt(vec_get(stmts, i), outer_names, cells);
+            i = i + 1;
+        }
+    }
+}
+
+fn scan_funclits_in_expr(e, outer_names, cells) {
+    if !e { return; }
+    let k = e[N_KIND];
+    if k == EX_FUNCLIT {
+        if e[LIT_ESCAPE] != 0 {
+            scan_funclit_escaping_idents(e[LIT_FN], outer_names, cells);
+        }
+    } else if k == EX_CALL {
+        scan_funclits_in_expr(e[CALL_CALLEE], outer_names, cells);
+        let args = e[CALL_ARGS];
+        if args {
+            let i = 0;
+            while i < args[VEC_LEN] {
+                scan_funclits_in_expr(vec_get(args, i), outer_names, cells);
+                i = i + 1;
+            }
+        }
+    } else if k == EX_BINARY {
+        scan_funclits_in_expr(e[BIN_L], outer_names, cells);
+        scan_funclits_in_expr(e[BIN_R], outer_names, cells);
+    } else if k == EX_UNARY {
+        scan_funclits_in_expr(e[UN_X], outer_names, cells);
+    } else if k == EX_SELECT {
+        scan_funclits_in_expr(e[SEL_X], outer_names, cells);
+    } else if k == EX_INDEX {
+        scan_funclits_in_expr(e[IX_X], outer_names, cells);
+        scan_funclits_in_expr(e[IX_I], outer_names, cells);
+    } else if k == EX_CONV {
+        scan_funclits_in_expr(e[CV_X], outer_names, cells);
+    } else if k == EX_MUTARG {
+        scan_funclits_in_expr(e[MUTARG_X], outer_names, cells);
+    } else if k == EX_COMPOSITE {
+        let elems = e[CL_ELEMS];
+        if elems {
+            let i = 0;
+            while i < elems[VEC_LEN] {
+                scan_funclits_in_expr(vec_get(elems, i), outer_names, cells);
+                i = i + 1;
+            }
+        }
+    }
+}
+
+fn check_fn_closure(f) {
+    let saved_file = ck_file;
+    let saved_legacy = ck_legacy;
+    let saved_fn = ck_fn;
+    let saved_tbind = ck_tbind;
+    let saved_loops = ck_loops;
+    let saved_breaks = ck_breaks;
+    let saved_defers = ck_defers;
+    let saved_syms = vec_clone(sc_syms);
+    let saved_marks = vec_clone(sc_marks);
+    let saved_safe = safe_pairs;
+    let saved_cells = ck_escaping_cells;
+
+    check_fn(f);
+
+    set_file(saved_file);
+    ck_legacy = saved_legacy;
+    ck_fn = saved_fn;
+    ck_tbind = saved_tbind;
+    ck_loops = saved_loops;
+    ck_breaks = saved_breaks;
+    ck_defers = saved_defers;
+    sc_syms = saved_syms;
+    sc_marks = saved_marks;
+    safe_pairs = saved_safe;
+    ck_escaping_cells = saved_cells;
+}
+
 fn check_fn(f) {
     set_file(f[F_FILE]);
     ck_tbind = f[F_TBIND];
@@ -1187,6 +1622,10 @@ fn check_fn(f) {
     ck_legacy = f[F_LEGACY];
     ck_loops = 0;
     ck_breaks = 0;
+    ck_escaping_cells = vec_new();
+    if f[F_BODY] {
+        scan_captures(f, ck_escaping_cells);
+    }
     start_scope();
     f[F_SLOTS] = 0;
     f[F_LOCALS] = vec_new();
@@ -1202,6 +1641,39 @@ fn check_fn(f) {
             }
         }
         i = i + 1;
+    }
+    if f[F_PARENT] {
+        let env_sym = declare_local(f[F_POS], "$env", ty_int);
+        env_sym[S_READS] = 1;
+        f[F_ENV_SYM] = env_sym;
+    }
+    let cell_inits = vec_new();
+    i = 0;
+    while i < params[VEC_LEN] {
+        let ps = vec_get(f[F_LOCALS], i);
+        if ps[S_CELL] {
+            let alloc_call = rt_call(f[F_POS], "rt_alloc", args1(mk_int(f[F_POS], 8, ty_int)), ty_int);
+            let let_cell = let_stmt(f[F_POS], ps[S_CELL_SYM], alloc_call);
+            let store_cell = assign_stmt(f[F_POS], mk_mem(f[F_POS], sym_ref_node(f[F_POS], ps[S_CELL_SYM]), 0, 0, 0, ps[S_TYPE]), sym_ref_node(f[F_POS], ps));
+            vec_push(cell_inits, let_cell);
+            vec_push(cell_inits, store_cell);
+        }
+        i = i + 1;
+    }
+    if cell_inits[VEC_LEN] > 0 {
+        let new_stmts = vec_new();
+        i = 0;
+        while i < cell_inits[VEC_LEN] {
+            vec_push(new_stmts, vec_get(cell_inits, i));
+            i = i + 1;
+        }
+        i = 0;
+        let old_stmts = f[F_BODY][BLK_STMTS];
+        while i < old_stmts[VEC_LEN] {
+            vec_push(new_stmts, vec_get(old_stmts, i));
+            i = i + 1;
+        }
+        f[F_BODY][BLK_STMTS] = new_stmts;
     }
     // The body shares the parameters' scope, so `let x` cannot silently hide parameter x.
     ck_defers = 0;
@@ -1326,6 +1798,16 @@ fn declare_local(pos, name, t) {
     s[S_SLOT] = ck_fn[F_SLOTS];
     ck_fn[F_SLOTS] = ck_fn[F_SLOTS] + 1;
     vec_push(ck_fn[F_LOCALS], s);
+    if ck_escaping_cells && vec_has_str(ck_escaping_cells, name) {
+        s[S_CELL] = 1;
+        let csym = sym_new(SYM_LOCAL, str_cat3("$cell_", name, ""), pos);
+        csym[S_TYPE] = ty_int;
+        csym[S_READS] = 1;
+        csym[S_SLOT] = ck_fn[F_SLOTS];
+        ck_fn[F_SLOTS] = ck_fn[F_SLOTS] + 1;
+        vec_push(ck_fn[F_LOCALS], csym);
+        s[S_CELL_SYM] = csym;
+    }
     return s;
 }
 
@@ -1342,7 +1824,90 @@ fn in_current_scope(name) {
     return 0;
 }
 
-// lookup_name searches the open scopes innermost first, then this package, then the universe.
+fn vec_has_str(v, s) {
+    if !v {
+        return 0;
+    }
+    let i = 0;
+    while i < v[VEC_LEN] {
+        if streq(vec_get(v, i), s) {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn lookup_outer(f, name) {
+    let p = f[F_PARENT];
+    if !p {
+        return 0;
+    }
+    let syms = f[F_OUTER_SYMS];
+    if syms {
+        let i = syms[VEC_LEN] - 1;
+        while i >= 0 {
+            let s = vec_get(syms, i);
+            if streq(s[S_NAME], name) {
+                return s;
+            }
+            i = i - 1;
+        }
+    }
+    if p[F_PARENT] {
+        let os = lookup_outer(p, name);
+        if os {
+            return capture_sym(p, os);
+        }
+    }
+    return 0;
+}
+
+fn capture_sym(f, os) {
+    let caps = f[F_CAPTURES];
+    let ci = -1;
+    let i = 0;
+    while i < caps[VEC_LEN] {
+        if vec_get(caps, i) == os {
+            ci = i;
+            break;
+        }
+        i = i + 1;
+    }
+    if ci < 0 {
+        ci = caps[VEC_LEN];
+        vec_push(caps, os);
+        os[S_ADDR] = 1;
+        if f[F_ESCAPES] {
+            os[S_CELL] = 1;
+        }
+    }
+    if f == ck_fn {
+        let j = sc_syms[VEC_LEN] - 1;
+        while j >= 0 {
+            let s = vec_get(sc_syms, j);
+            if s[S_CAPTURED] && s[S_CAP_IDX] == ci {
+                return s;
+            }
+            j = j - 1;
+        }
+        let cs = sym_new(SYM_LOCAL, os[S_NAME], os[S_POS]);
+        cs[S_TYPE] = os[S_TYPE];
+        cs[S_CAPTURED] = 1;
+        cs[S_CAP_IDX] = ci;
+        cs[S_READS] = 1;
+        vec_push(sc_syms, cs);
+        return cs;
+    }
+    let cs = sym_new(SYM_LOCAL, os[S_NAME], os[S_POS]);
+    cs[S_TYPE] = os[S_TYPE];
+    cs[S_CAPTURED] = 1;
+    cs[S_CAP_IDX] = ci;
+    cs[S_READS] = 1;
+    return cs;
+}
+
+// lookup_name searches the open scopes innermost first, then outer closures, then this package, then the universe.
 fn lookup_name(name) {
     let i = sc_syms[VEC_LEN] - 1;
     while i >= 0 {
@@ -1351,6 +1916,12 @@ fn lookup_name(name) {
             return s;
         }
         i = i - 1;
+    }
+    if ck_fn && ck_fn[F_PARENT] {
+        let os = lookup_outer(ck_fn, name);
+        if os {
+            return capture_sym(ck_fn, os);
+        }
     }
     if load8(ck_pkg) != 0 {
         let q = lookup_global(qual(ck_pkg, name));
@@ -1597,6 +2168,14 @@ fn mk_seq(pos, stmts, value, t) {
     n[SEQ_VALUE] = value;
     n[N_TYPE] = t;
     return n;
+}
+
+fn mk_unary(pos, op, x) {
+    let u = node_new(EX_UNARY, pos);
+    u[UN_OP] = op;
+    u[UN_X] = x;
+    u[N_TYPE] = ty_int;
+    return u;
 }
 
 // zero_value is the value a declaration without initializer starts with. Strings and
@@ -1990,6 +2569,18 @@ fn check_let(s) {
         return;
     }
     s[LET_SYM] = declare_local(pos, s[LET_NAME], t);
+    if s[LET_SYM][S_CELL] {
+        let sym = s[LET_SYM];
+        let csym = sym[S_CELL_SYM];
+        let alloc_call = rt_call(pos, "rt_alloc", args1(mk_int(pos, 8, ty_int)), ty_int);
+        let stmts = vec_new();
+        vec_push(stmts, let_stmt(pos, csym, alloc_call));
+        vec_push(stmts, assign_stmt(pos, mk_mem(pos, sym_ref_node(pos, csym), 0, 0, 0, t), s[LET_INIT]));
+        let blk = node_new(ST_BLOCK, pos);
+        blk[BLK_STMTS] = stmts;
+        blk[BLK_FLAT] = 1;
+        replace_node(s, blk);
+    }
 }
 
 // check_target checks an assignment target and returns its type; it rewrites slice
@@ -2010,12 +2601,28 @@ fn check_target(t) {
         } else if s[S_KIND] == SYM_FUNC {
             err_quoted(t[N_POS], "cannot assign to function ", t[ID_NAME], "");
         }
+        if s[S_CAPTURED] {
+            let env_ref = sym_ref_node(t[N_POS], ck_fn[F_ENV_SYM]);
+            let cell_addr = mk_mem(t[N_POS], env_ref, 0, 0, 8 * (2 + s[S_CAP_IDX]), ty_int);
+            let val = mk_mem(t[N_POS], cell_addr, 0, 0, 0, s[S_TYPE]);
+            replace_node(t, val);
+            return s[S_TYPE];
+        }
+        if s[S_CELL] {
+            let cell_ref = sym_ref_node(t[N_POS], s[S_CELL_SYM]);
+            let val = mk_mem(t[N_POS], cell_ref, 0, 0, 0, s[S_TYPE]);
+            replace_node(t, val);
+            return s[S_TYPE];
+        }
         t[ID_REF] = s;
         t[N_TYPE] = s[S_TYPE];
         return s[S_TYPE];
     }
     if k == EX_INDEX || k == EX_SELECT {
         return chk(t, 0);
+    }
+    if k == EX_MEM {
+        return t[N_TYPE];
     }
     err_at(t[N_POS], "cannot assign to this expression");
     return ty_int;
@@ -2212,7 +2819,16 @@ fn bind_targets(pos, targets, temps, define, stmts) {
                 let l = node_new(ST_LET, pos);
                 l[LET_NAME] = tg[ID_NAME];
                 l[LET_INIT] = sym_ref_node(pos, ts);
-                l[LET_SYM] = declare_local(pos, tg[ID_NAME], ts[S_TYPE]);
+                let sym = declare_local(pos, tg[ID_NAME], ts[S_TYPE]);
+                l[LET_SYM] = sym;
+                if sym[S_CELL] {
+                    let csym = sym[S_CELL_SYM];
+                    let alloc_call = rt_call(pos, "rt_alloc", args1(mk_int(pos, 8, ty_int)), ty_int);
+                    vec_push(stmts, let_stmt(pos, csym, alloc_call));
+                    vec_push(stmts, assign_stmt(pos, mk_mem(pos, sym_ref_node(pos, csym), 0, 0, 0, ts[S_TYPE]), sym_ref_node(pos, ts)));
+                    i = i + 1;
+                    continue;
+                }
                 vec_push(stmts, l);
                 i = i + 1;
                 continue;

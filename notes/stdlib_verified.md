@@ -6,7 +6,7 @@
 | gauge | math, math/bits | the transcendental functions are Tin ports of Go's algorithms: see "gauge: the corpus check" below |
 | tide | time | identical |
 | dice | same algorithms in Go | identical |
-| sift | slices/sort | identical |
+| sift | slices/sort, Each (`bench/ref/closures/main.go`) | identical |
 | sift (generic: Sort, SortFunc, SortStableFunc, Insert, Delete, Compact, BinarySearch ...) | slices, cmp (`bench/ref/sift/generic.go`) | identical on 149 lines, including the order of equal elements after SortFunc on 119 inputs of 7 shapes up to 20,000 elements; the port is Go's pdqsort, and changing one shift constant in it breaks 16 lines |
 | bits | math/bits (`bench/ref/bits`, generated with `tests/v2/bits.tin` from one description) | identical on all 37 function hashes: every function at 8, 16, 32 and 64 bits, exhaustive for 8 and 16 bits, about 40,000 values at 32 bits and 20,000 at 64; changing one comparison in `Div64`'s correction loop breaks 2 of them |
 | link | net/url (`bench/ref/link`, generated with `tests/v2/link.tin` from one description) | identical on all 813 lines: 159 URLs through Parse and 14 through ParseRequestURI (every field and method, fault messages included: bad escapes, IPv6 literals and zones, ports, userinfo, opaque and rootless forms, CTL bytes), 30 strings through the four escape functions, 246 references resolved (50 against the RFC 3986 section 5.4 base, 196 more across 14 bases and 14 references), 23 JoinPath cases, 27 queries and a Values sequence; five mutations (OmitHost, ForceQuery in ResolveReference, the path-segment escape set, the IPv6 group length, the postgres host list) each break 1 to 4 lines |
