@@ -7,11 +7,12 @@ architecture matches the image; its host distribution does not need to match Deb
 
 ## Install a compiler
 
-Download the installer from a versioned release, then run it:
+Download the installer from the latest release, then run it (`sh install-tin.sh 0.4.1`
+installs a given version instead):
 
 ```sh
-curl -fL https://github.com/yasserreslan/tin/releases/download/v0.4.0/install.sh -o install-tin.sh
-sh install-tin.sh 0.4.0
+curl -fL https://github.com/yasserreslan/tin/releases/latest/download/install.sh -o install-tin.sh
+sh install-tin.sh
 export PATH="$HOME/.tin/bin:$PATH"
 tin version
 tin build app.tin -o app
@@ -73,23 +74,29 @@ docker run --rm -p 9180:8080 tin-api:dev
 
 ## Maintain releases
 
-`VERSION` is the source of the release version. `make dist` creates a native archive
-and its SHA-256 sidecar in `bin/dist/`. `.github/workflows/distribution.yml` verifies
-relocated archives and self-hosting on all three native targets, and builds/runs the
-Linux builder and application images on both architectures for every PR.
+Every merge into main is released automatically once its CI gate is green:
+`.github/workflows/auto-release.yml` tags the merged commit and runs the release workflow.
+The version comes from `VERSION` and the existing tags (`tools/ci/next_version.py`): the
+first merge after `VERSION` changes is released as `VERSION` itself, and later merges as
+the next patch of its major.minor (`0.4.1`, `0.4.2`, ...). To start a new series, bump
+`VERSION`'s major or minor (`0.5.0`) in a PR; a prerelease `VERSION` (`0.6.0-rc.1`) is
+released once, then needs another bump. Only the commit at the head of main is released:
+when merges land faster than CI, the last one carries all of them.
 
-After the release commit is merged and its required CI gate is green:
+`make dist` creates a native archive and its SHA-256 sidecar in `bin/dist/`.
+`.github/workflows/distribution.yml` verifies relocated archives and self-hosting on all
+three native targets, and builds/runs the Linux builder and application images on both
+architectures for every PR.
 
-```sh
-git tag v0.4.0 COMMIT_SHA
-git push origin v0.4.0
-```
-
-`.github/workflows/release.yml` rejects mismatched versions, tags outside main, commits
-without successful CI and versions already released. It builds each target natively,
+A release can still be made by hand: push a tag for a main commit with green CI
+(`git tag v0.4.7 COMMIT_SHA && git push origin v0.4.7`), or rerun one through workflow
+dispatch. `.github/workflows/release.yml` rejects tags that are not `VERSION` or a later
+patch of it, tags outside main, commits without successful CI and versions already
+released. It builds each target natively,
 tests the archives and images, pushes the Linux images, combines their manifests, and
-publishes three archives, `SHA256SUMS` and `install.sh` as GitHub Release assets. A tag
-such as `v0.4.1-rc.1` creates a prerelease without moving `latest`. Failed runs before
+publishes three archives, `SHA256SUMS` and `install.sh` as GitHub Release assets, with
+notes generated from the merged PRs. A prerelease tag such as `v0.6.0-rc.1` does not move
+`latest`. Failed runs before
 publication can be retried through workflow dispatch with the same existing tag.
 
 The first GHCR package is private by default. Its owner must change the package's

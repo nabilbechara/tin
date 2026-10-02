@@ -1,0 +1,62 @@
+name: Auto release
+
+# Every merge into main is released once its CI passes: the commit is tagged with the next
+# version (tools/ci/next_version.py: VERSION, then the next patch of its major.minor) and
+# release.yml builds, tests and publishes it. Bump VERSION's major or minor in a PR to start
+# a new series.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.next.outputs.tag }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: next
+        env:
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          if [ "$head" != "$SHA" ]; then
+            echo "main has moved on to $head: that commit's CI releases it"; exit 0
+          fi
+          if git tag --points-at "$SHA" | grep -q '^v'; then
+            echo "$SHA is already released as $(git tag --points-at "$SHA" | grep '^v')"; exit 0
+          fi
+          tag=$(python3 tools/ci/next_version.py next VERSION $(git tag -l 'v*'))
+          if [ -z "$tag" ]; then
+            echo "VERSION $(cat VERSION) is a prerelease that is already released: bump it to release again"; exit 0
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$tag" -f sha="$SHA" > /dev/null
+          echo "Tagged $SHA as $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+  release:
+    needs: tag
+    if: needs.tag.outputs.tag != ''
+    permissions:
+      contents: write
+      packages: write
+      checks: read
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.tag.outputs.tag }}
