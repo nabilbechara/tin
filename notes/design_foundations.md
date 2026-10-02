@@ -191,7 +191,8 @@ and, for a name that exists with another signature, both signatures:
 Dispatch costs nothing to provide: monomorphization already re-checks a generic body with the
 type parameters bound, so a call through a shaped parameter resolves to the concrete method
 like any other call, with no table and no indirection. `dyn` is the explicit exception and is
-the next step; until it is built, a `dyn` type in any signature that is resolved (every
+the next step; its two-word representation, the ABI and the staging are decided in
+notes/design_dyn.md. Until it is built, a `dyn` type in any signature that is resolved (every
 non-generic shape's signature is resolved when it is declared) is rejected with a message
 naming the missing step rather than being misread as an ordinary type.
 
