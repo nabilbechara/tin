@@ -12,8 +12,8 @@ The inventory is the 176 packages `go list std` reports for Go 1.26 (without `in
 | design | Go's shape needs something Tin deliberately lacks; the replacement is named or still to be designed |
 | n/a | specific to Go's toolchain or runtime, with no counterpart to build |
 
-**Standard library, 176 packages:** 2 done, 44 partial, 8 design, 98 missing, 24 n/a.
-**Of the 87 packages koussa imports:** 2 done, 40 partial, 7 design, 38 missing, 0 n/a.
+**Standard library, 176 packages:** 2 done, 45 partial, 7 design, 98 missing, 24 n/a.
+**Of the 87 packages koussa imports:** 2 done, 41 partial, 6 design, 38 missing, 0 n/a.
 
 ## The language
 
@@ -32,7 +32,7 @@ The inventory is the 176 packages `go list std` reports for Go 1.26 (without `in
 | structs, methods | yes; fields and methods follow the capitalized-export rule | done |
 | struct embedding | not documented | missing |
 | struct tags | none: attributes checked by the compiler are the plan | design |
-| interfaces, type assertions, type switches | shapes: `shape` declarations (method sets, composition, named unions, type parameters), structural satisfaction, and static dispatch by monomorphization (a shaped type parameter's calls are direct calls on the concrete type). `dyn S` and generic shapes are parsed but not yet usable; no type assertions or type switches by design (an `enum` is a closed set); #141 | partial |
+| interfaces, type assertions, type switches | shapes: `shape` declarations (method sets, composition, named unions, generic parameters and instances like `Seq[i64]`), structural satisfaction with conflicting listed methods diagnosed, and static dispatch by monomorphization (a shaped type parameter's calls are direct calls on the concrete type). `dyn S` is parsed but not yet usable; no type assertions or type switches by design (an `enum` is a closed set); #141 | partial |
 | generics | type parameters with `any`, `comparable` and unions; inference; methods on generic types | partial |
 | function values, closures | capturing closures as region objects with shared cells (Go 1.22 per-iteration loop variables), frame-resident descriptors for closures only the library calls (no pool allocation), deep-copied by keep(), escape into globals rejected, defer with captures; a local closure cannot recurse and cannot capture a mut parameter; cells for every captured variable (by-value copies of never-reassigned variables are a later optimization) | done |
 | method values and expressions | not documented | missing |
@@ -160,7 +160,7 @@ Ordered by import path, as `go list std` prints them.
 | `image/jpeg` | 7+1 | missing |  |  |
 | `image/png` | 6+0 | missing |  | needs compress/zlib |
 | `index/suffixarray` |  | missing |  |  |
-| `io` | 91+20 | design | flume (concrete Reader and Writer) | Reader and Writer are interfaces in Go; Copy, Pipe, MultiWriter, LimitReader and TeeReader have no Tin form yet |
+| `io` | 91+20 | partial | `io` declares the shapes (Reader, Writer, Closer, Seeker, ReaderAt, WriterAt and the compositions); a type satisfies them structurally. Copy, ReadAll, Pipe, MultiWriter, LimitReader and TeeReader, and EOF as a sentinel fault, are the next step (#141) |
 | `io/fs` | 2+0 | missing |  |  |
 | `io/ioutil` |  | n/a | quarry | deprecated in Go; quarry has ReadFile, WriteFile, ReadDir |
 | `iter` |  | missing |  | range over functions; `for range` covers slices, strings, maps and integers |
@@ -214,7 +214,7 @@ Ordered by import path, as `go list std` prints them.
 | `slices` | 79+37 | partial | sift | Sort, SortFunc, SortStableFunc (Go's algorithm, same order of equal elements), IsSorted, BinarySearch, Min, Max, Index, Contains, Equal, Compare, Reverse, Insert, Delete, DeleteFunc, Replace, Compact, Clone, Grow, Concat, Repeat, with the Func forms; Insert, Delete and the others take a `mut` slice and return the result; no Clip, Chunk, or iterator forms, and no variadic forms (InsertAll and ConcatAll take slices) |
 | `sort` | 105+8 | partial | sift | Ints, Strs, SortBy, Search* and the generic Sort and SortFunc; no sort.Interface (by design), no sort.Slice (use SortFunc) |
 | `strconv` | 875+97 | partial | mint | Itoa, Atoi, ParseInt, ParseUint, ParseBool, ParseFloat, FormatInt, FormatUint, FormatFloat, Quote, Unquote and friends; no AppendFloat, AppendBool, QuoteToASCII, IsPrint, ParseComplex |
-| `strings` | 657+147 | partial | twine | every function except the iterator forms and Reader: Index family, Split family with SplitAfter, Fields and FieldsFunc, Map, Title, Unicode ToUpper, ToLower, ToTitle, EqualFold by SimpleFold, Trim family with Func forms, Cut, CutPrefix, CutSuffix, Replacer, Lines, ToValidUTF8, Clone, Builder (Cap, Grow, Write); Lines is a slice, not an iterator; no NewReader (needs shapes), no ToUpperSpecial |
+| `strings` | 657+147 | partial | twine | every function except the iterator forms and Reader: Index family, Split family with SplitAfter, Fields and FieldsFunc, Map, Title, Unicode ToUpper, ToLower, ToTitle, EqualFold by SimpleFold, Trim family with Func forms, Cut, CutPrefix, CutSuffix, Replacer, Lines, ToValidUTF8, Clone, Builder (Cap, Grow, Write); Lines is a slice, not an iterator; no NewReader (with the io port), no ToUpperSpecial |
 | `structs` |  | n/a |  |  |
 | `sync` | 69+32 | design | share-nothing cores, relay | no Mutex or RWMutex by design; WaitGroup, Once, Pool and Map need routine-level equivalents |
 | `sync/atomic` | 7+12 | missing |  | the runtime has atomic operations as compiler intrinsics; there is no public package |

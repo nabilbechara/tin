@@ -1,0 +1,131 @@
+package main
+
+// Generic shapes (roadmap #141, "shape embedding and composition; shapes with generic
+// parameters"): a shape instance as a constraint, an instance in a composition, a
+// generic type's instance satisfying one, and the library's composed io.ReadWriteCloser
+// satisfied by a type here.
+
+import "io"
+import "say"
+
+shape Seq[T any] { Next() ?T }
+
+type Ints struct { n i64 }
+
+func (x Ints) Next() ?Ints {
+	return nil
+}
+
+type Stack[T any] struct { xs []T }
+
+func (s Stack[T]) Next() ?Stack[T] {
+	return nil
+}
+
+type File struct { n i64 }
+
+func (f File) Read(buf mut []u8) !i64 {
+	return 0
+}
+
+func (f File) Write(data []u8) !i64 {
+	return len(data)
+}
+
+func (f File) Close() !i64 {
+	return 0
+}
+
+// A shape instance as a constraint.
+func Drain[S Seq[Ints]](s S) i64 {
+	return 1
+}
+
+// A composition that lists an instance of a generic shape.
+shape Streams { Seq[Stack[i64]] }
+
+func Use[X Streams](x X) i64 {
+	return 2
+}
+
+// The library's io.ReadWriteCloser (Reader, Writer and Closer), satisfied by File.
+func Wrap[RW io.ReadWriteCloser](rw RW) i64 {
+	n := rw.Read(mut make([]u8, 1)) catch _ { -1 }
+	m := rw.Write([]u8{1}) catch _ { -1 }
+	c := rw.Close() catch _ { -1 }
+	return n + m + c
+}
+
+// A generic shape whose body lists another generic shape with its own parameter.
+shape Getter[T any] { Get() T }
+
+shape PairGetter[U any] { Getter[U] }
+
+type Seven struct { n i64 }
+
+func (s Seven) Get() i64 {
+	return 7
+}
+
+func Pair[G PairGetter[i64]](g G) i64 {
+	return g.Get()
+}
+
+// A later constraint may mention an earlier parameter: T is inferred from x.
+func Pick[T any, S Seq[T]](s S, x T) i64 {
+	return 1
+}
+
+// A generic shape whose listed instance has a constrained parameter: the constraint is
+// checked at the instantiation, not at the declaration.
+shape Limited[T i64 | str] { Get() T }
+
+shape LimitedGetter[U any] { Limited[U] }
+
+// A generic shape with a map keyed by its parameter (a placeholder must be a valid key).
+shape Indexed[T any] { Lookup(m map[T]i64) i64 }
+
+type Table struct { n i64 }
+
+func (t Table) Lookup(m map[str]i64) i64 {
+	return 3
+}
+
+type Num struct { n i64 }
+
+func (n Num) Get() i64 {
+	return 4
+}
+
+// A generic named union.
+shape NumberOr[T any] = i64 | T
+
+func Numbered[S NumberOr[Seven]](s S) i64 {
+	return 2
+}
+
+// The constrained composition and the map-key shape, instantiated.
+func Limited[S LimitedGetter[i64]](s S) i64 {
+	return 3
+}
+
+func Lookup[S Indexed[str]](s S) i64 {
+	return 4
+}
+
+func main() {
+	let x = Ints{n: 1}
+	say.Line("seq: {Drain(x)}")
+	let st = Stack[i64]{xs: []i64{}}
+	say.Line("streams: {Use(st)}")
+	let f = File{n: 1}
+	say.Line("rwc: {Wrap(f)}")
+	let s = Seven{n: 0}
+	say.Line("pair: {Pair(s)}")
+	say.Line("pick: {Pick(x, x)}")
+	say.Line("limited: {Numbered(s)}")
+	let n = Num{n: 0}
+	say.Line("constraint: {Limited(n)}")
+	let t = Table{n: 0}
+	say.Line("lookup: {Lookup(t)}")
+}

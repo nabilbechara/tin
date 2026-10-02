@@ -131,7 +131,14 @@ shape Seq[T any] { Next() ?T; Close() !i64 }       // type parameters
 
 - A shape member is a method signature or the name of another shape. The two cannot be
   confused: a member is a method exactly when a `(` follows its name. A listed shape with
-  type arguments (`Seq[i64]`) is part of the later generic-shape step and is diagnosed today.
+  type arguments (`Seq[i64]`) is an instance of a generic shape; a bare generic name is an
+  error.
+- Two listed shapes that give the same method name different signatures are a compile error at
+  the shape's declaration, and so is one shape declaring a name twice; identical methods coming
+  from different listed shapes are allowed. A generic body is validated at the declaration with
+  its parameters standing in as fresh types, so a conflict or a cycle through instances is
+  reported without an instantiation; its listed instances' parameter constraints are checked at
+  each instantiation, where the arguments are real.
 - A method signature is a `func` signature without a receiver and without a body, so the two
   grammars are one and cannot drift. Parameter `mut` marks, `...` and `!T` results are all
   written as in a function declaration. There is no `self` parameter: a method's receiver is
@@ -143,6 +150,9 @@ shape Seq[T any] { Next() ?T; Close() !i64 }       // type parameters
   they are recognized only where the grammar wants them, so a program may keep using them as
   names (`shape := 1`, `type dyn = i64`, `var x dyn`). `shape` opens a declaration only at the
   top level; `dyn` is a fat reference only when a shape name follows it in type position.
+- The streaming shapes live in `lib/io`, not in `flume` as the roadmap first assumed:
+  `flume.Reader` and `flume.Writer` are concrete types, and a type and a shape cannot share a
+  name. `flume` keeps the buffered reader and writer and gains the `io` methods at the port.
 - `dyn S` is written in type position; `?dyn S` is the optional. A `dyn S` is never nil.
 - There is no downcast, no type assertion and no type switch on a `dyn` value, and therefore no
   runtime type information: a closed set of cases is an `enum`, an open set is a method on the
@@ -168,8 +178,8 @@ when the type argument is concrete. The checks are:
   visible at the call site, as everywhere else in Tin.
 - **Composition**: `shape ReadWriter { Reader; Writer }` is satisfied by satisfying every
   listed shape; a shape may not list itself, directly or through other shapes (diagnosed once,
-  at the shape that closes the cycle), and a generic shape is listed only with the later
-  generic-shape work.
+  at the shape that closes the cycle), and a generic shape is listed as an instance
+  (`Seq[i64]`), whose methods are checked with its type arguments bound.
 - **A named union used as a constraint** (`shape Ordered = i64 | f64 | str`, then `[T Ordered]`)
   is membership in its list; its members are concrete types, never shapes.
 - One name is either a type or a shape, not both.
@@ -182,9 +192,8 @@ Dispatch costs nothing to provide: monomorphization already re-checks a generic 
 type parameters bound, so a call through a shaped parameter resolves to the concrete method
 like any other call, with no table and no indirection. `dyn` is the explicit exception and is
 the next step; until it is built, a `dyn` type in any signature that is resolved (every
-non-generic shape's signature is resolved when it is declared) and a generic shape used as a
-constraint are rejected with a message naming the missing step rather than being misread as
-ordinary types.
+non-generic shape's signature is resolved when it is declared) is rejected with a message
+naming the missing step rather than being misread as an ordinary type.
 
 ---
 

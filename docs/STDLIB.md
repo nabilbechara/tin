@@ -6,6 +6,7 @@ Generated from the comments in `lib/*/` by `tools/gendoc.py`.
 |---|---|
 | [say](#say) | formatting and printing (fmt) |
 | [argo](#argo) | JSON (encoding/json) |
+| [io](#io) | streaming shapes (io) |
 | [anvil](#anvil) | HTTP/1.1 server (net/http) |
 | [hearth](#hearth) | cores and threads (runtime) |
 | [relay](#relay) | messages between cores (channels) |
@@ -47,6 +48,25 @@ Package argo writes JSON. argo.Put(b, v) appends v to the []u8 buffer b; the com
 - `Str(b mut []u8, s str)`: Str appends s as a JSON string.
 - `Raw(b mut []u8, s str)`: Raw appends already-encoded JSON text.
 - `type Parser struct`
+
+## io
+
+Package io declares the streaming shapes: a type satisfies Reader, Writer, Closer or Seeker by having the methods, with no declaration, and compositions like ReadWriteCloser by satisfying every listed shape. The helpers (Copy, ReadAll, Pipe, MultiWriter, ...) and EOF as a sentinel fault land with the io port (roadmap #141); the byte, rune and string shapes (ByteReader, RuneReader, StringWriter, ...) and Go's ReaderFrom and WriterTo (which need dyn) are not declared yet.
+
+- `shape Reader { Read(buf mut []u8) !i64 }`: Reader is anything with Read: it fills buf and returns how many bytes it wrote.
+- `shape Writer { Write(data []u8) !i64 }`: Writer is anything with Write: it takes data and returns how many bytes it took.
+- `shape Closer { Close() !i64 }`: Closer is anything with Close.
+- `shape Seeker { Seek(offset i64, whence i64) !i64 }`: Seeker is anything with Seek: offset is relative to whence (0 start, 1 current, 2 end).
+- `shape ReaderAt { ReadAt(buf mut []u8, off i64) !i64 }`: ReaderAt is a reader that does not move a position: it reads at off.
+- `shape WriterAt { WriteAt(data []u8, off i64) !i64 }`: WriterAt is a writer that does not move a position: it writes at off.
+- `shape ReadWriter`: ReadWriter reads and writes.
+- `shape ReadCloser`: ReadCloser reads and closes.
+- `shape WriteCloser`: WriteCloser writes and closes.
+- `shape WriteSeeker`: WriteSeeker writes and seeks.
+- `shape ReadSeekCloser`: ReadSeekCloser reads, seeks and closes.
+- `shape ReadWriteCloser`: ReadWriteCloser reads, writes and closes.
+- `shape ReadSeeker`: ReadSeeker reads and seeks.
+- `shape ReadWriteSeeker`: ReadWriteSeeker reads, writes and seeks.
 
 ## anvil
 

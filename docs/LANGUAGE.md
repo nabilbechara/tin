@@ -374,12 +374,14 @@ union in every signature.
 them, so a program may still use either as an ordinary name (`shape := 1`, `type dyn = i64`).
 
 **Status.** The parser and the checker are built: a shape can be a type-parameter constraint, a
-type satisfies it structurally, shapes compose, named unions work as constraints, and every
-call through a shaped parameter is a direct call on the concrete type, because a generic body
-is checked with its type parameters bound. `dyn` is parsed but not yet usable, and a generic
-shape (`Seq[T]`) is not yet usable as a constraint; each is rejected with a message naming the
-missing step wherever its signature is resolved, and each is a following step. The `io`,
-`hash`, `Stringer` and driver ports come after `dyn`.
+type satisfies it structurally, shapes compose, named unions work as constraints, a generic
+shape takes type arguments (`Seq[i64]`) and can be listed in a composition, and every call
+through a shaped parameter is a direct call on the concrete type, because a generic body is
+checked with its type parameters bound. A method that two listed shapes give different
+signatures is a compile error. `dyn` is parsed but not yet usable; it is rejected with a message
+naming the missing step wherever its signature is resolved, and it is a following step. The
+`io` shapes are declared in `lib/io`; the `Copy` family, `hash`, `Stringer` and the driver
+shapes come after `dyn`.
 
 ---
 

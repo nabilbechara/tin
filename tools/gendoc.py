@@ -3,13 +3,13 @@
 import os, re
 
 SKIP = {"runtime", "std", "fmt", "say"}
-ORDER = ["say", "argo", "anvil", "hearth", "relay", "wire", "twine", "glyph", "mint", "gauge", "bits",
+ORDER = ["say", "argo", "io", "anvil", "hearth", "relay", "wire", "twine", "glyph", "mint", "gauge", "bits",
          "link", "ore", "flume", "quarry", "trail", "lever", "tide", "dice", "sift", "atlas", "cairn", "stamp",
          "seal", "herald", "crucible", "redis", "mysql", "postgres", "websocket"]
 ROLE = {"say": "formatting and printing (fmt)", "argo": "JSON (encoding/json)", "anvil": "HTTP/1.1 server (net/http)",
         "hearth": "cores and threads (runtime)", "relay": "messages between cores (channels)", "wire": "TCP and HTTP client (net)",
         "twine": "strings (strings)", "glyph": "UTF-8 and Unicode (unicode/utf8, unicode)", "mint": "number and string conversion (strconv)",
-        "gauge": "math (math)", "bits": "bit counting and manipulation (math/bits)", "link": "URLs and their escaping (net/url)", "ore": "byte slices (bytes)", "flume": "buffered I/O (bufio)",
+        "gauge": "math (math)", "bits": "bit counting and manipulation (math/bits)", "link": "URLs and their escaping (net/url)", "io": "streaming shapes (io)", "ore": "byte slices (bytes)", "flume": "buffered I/O (bufio)",
         "quarry": "files, environment, process (os)", "trail": "paths (path/filepath)", "lever": "command-line flags (flag)",
         "tide": "time (time)", "dice": "random numbers (math/rand)", "sift": "sorting, searching and the generic slice functions (sort, slices, cmp)", "atlas": "functions on maps (maps)",
         "cairn": "containers (container/heap, sets, LRU)", "stamp": "hashes and checksums (hash/*)",
@@ -44,12 +44,15 @@ def parse(path):
             continue
         m = re.match(r"^func (\([a-z]+ (mut )?[A-Za-z0-9_\[\], ]+\) )?([A-Z][A-Za-z0-9_]*)(\[[^\]]*\])?\((.*)$", line)
         t = re.match(r"^type ([A-Z][A-Za-z0-9_]*)", line)
+        sh = re.match(r"^shape ([A-Z][A-Za-z0-9_]*)", line)
         c = re.match(r"^const ([A-Z][A-Za-z0-9_]*)", line)
         if m and seen_pkg:
             sig = line[len("func "):].rstrip(" {")
             items.append(("func", sig, " ".join(c.strip() for c in comment)))
         elif t and seen_pkg:
             items.append(("type", line.rstrip(" {"), " ".join(c.strip() for c in comment)))
+        elif sh and seen_pkg:
+            items.append(("shape", line.rstrip(" {"), " ".join(c.strip() for c in comment)))
         elif c and seen_pkg:
             items.append(("const", line, " ".join(c.strip() for c in comment)))
         if not line.startswith("//"):

@@ -157,42 +157,33 @@ fn ck_state_restore(s) {
 fn check_constraints(pos, names, cons, targs, file) {
     let saved = ck_state_save();
     set_file(file);
-    ck_tbind = 0;
+    // A later constraint may mention an earlier parameter (`[T any, S Seq[T]]`), so the
+    // type arguments in scope resolve while the constraints are checked.
+    ck_tbind = tbind_pairs(names, targs);
     let i = 0;
     while i < names[VEC_LEN] {
         let c = vec_get(cons, i);
         if c {
             let t = vec_get(targs, i);
-            let sd = 0;
+            let inst = 0;
             let handled = 0;
             let cx = vec_get(c, 0);
             if c[VEC_LEN] == 1 && cx[N_KIND] == TX_NAME {
-                if cx[TX_ARGS] {
-                    // A generic shape as a constraint is a later step of #141: report it
-                    // once, and do not go on to check a shape whose parameters are unbound.
-                    if shape_ref_name(cx) {
-                        err_quoted(cx[N_POS], "shape ", cx[TX_B], " takes type arguments, which are not usable in a constraint yet (#141)");
-                        handled = 1;
-                    }
-                } else {
-                    sd = shape_ref(cx);
-                    if sd && sd[D_TPARAMS] {
-                        // A generic shape written without type arguments: same later step.
-                        err_quoted(cx[N_POS], "shape ", cx[TX_B], " takes type arguments, which are not usable in a constraint yet (#141)");
-                        handled = 1;
-                        sd = 0;
-                    }
-                }
+                // A shape, with or without type arguments: Seq[i64] is an instance.
+                inst = shape_inst(cx);
+                // A name that is a shape but failed to instantiate was diagnosed there;
+                // do not go on to read it as a union member.
+                handled = shape_ref_name(cx) != 0;
             }
-            if handled {
-            } else if sd {
-                check_shape(pos, t, sd);
+            if inst {
+                check_shape(pos, t, vec_get(inst, 0), vec_get(inst, 1));
+            } else if handled {
             } else {
                 let ok = 0;
                 let j = 0;
                 while j < c[VEC_LEN] {
                     let mt = vec_get(c, j);
-                    if shape_ref(mt) || shape_ref_name(mt) {
+                    if shape_ref_name(mt) {
                         err_quoted(mt[N_POS], "", shape_member_name(mt), " is a shape: a union constraint lists concrete types, and a shape goes in the constraint alone");
                     } else if resolve_type(mt) == t {
                         ok = 1;
@@ -547,14 +538,20 @@ var shape_validated; // shapes whose body has been validated (memo: composition 
 var shape_checking;  // shapes on the current satisfaction path (a cycle guard)
 var shape_checked;   // shapes already checked in the current satisfaction tree
 var shape_bad;       // shapes whose signature did not resolve (reported once)
+var shape_collecting; // (shape, bindings) pairs collected in the current flattening
+var shape_conflicts;  // errors the current flattening attributed to the owner shape
+var shape_placeholders; // the fresh types shape_sym_bind made for symbolic validation
 
 fn shapes_init() {
+    shape_placeholders = vec_new();
     ty_shapes = vec_new();
     shape_cycles = vec_new();
     shape_validated = vec_new();
     shape_checking = vec_new();
     shape_checked = vec_new();
     shape_bad = vec_new();
+    shape_collecting = vec_new();
+    shape_conflicts = 0;
     let i = 0;
     while i < prog_shapes[VEC_LEN] {
         let d = vec_get(prog_shapes, i);
@@ -592,15 +589,24 @@ fn find_shape(qname) {
 // shapes_declared resolves every non-generic shape's signatures (and a named union's
 // members) once the named types exist, so an unused shape still reports a `dyn` it
 // cannot carry or a type that does not exist, instead of hiding it until first use. A
-// shape whose types failed is remembered so satisfaction does not report them again.
+// shapes_declared resolves every shape's signatures (and a named union's members) once
+// the named types exist, so an unused shape still reports a `dyn` it cannot carry or a
+// type that does not exist, instead of hiding it until first use. A generic shape is
+// validated with its parameters bound to fresh types, which catches a conflict or a
+// `dyn` that does not depend on the instantiation. A shape whose types failed is
+// remembered so satisfaction does not report them again.
 fn shapes_declared() {
     let i = 0;
     while i < prog_shapes[VEC_LEN] {
         let d = vec_get(prog_shapes, i);
-        if !d[D_TPARAMS] && !shape_on_path(shape_bad, d) {
+        if !shape_on_path(shape_bad, d) {
             let saved = ck_state_save();
             set_file(d[D_FILE]);
-            ck_tbind = 0;
+            let bind = 0;
+            if d[D_TPARAMS] {
+                bind = shape_sym_bind(d);
+            }
+            ck_tbind = bind;
             let before = error_count;
             let j = 0;
             if d[D_UNIONKIND] {
@@ -610,15 +616,17 @@ fn shapes_declared() {
                 let bad = 0;
                 while j < d[D_UNION][VEC_LEN] {
                     let m = vec_get(d[D_UNION], j);
-                    if shape_ref(m) || shape_ref_name(m) {
+                    if shape_ref_name(m) {
                         bad = 1;
                     } else {
                         resolve_type(m);
                     }
                     j = j + 1;
                 }
-                if bad && !shape_on_path(shape_bad, d) {
-                    vec_push(shape_bad, d);
+                if error_count != before || bad {
+                    if !shape_on_path(shape_bad, d) {
+                        vec_push(shape_bad, d);
+                    }
                 }
             } else {
                 while j < d[D_SHAPE][VEC_LEN] {
@@ -635,9 +643,19 @@ fn shapes_declared() {
                     }
                     j = j + 1;
                 }
-            }
-            if error_count != before && !shape_on_path(shape_bad, d) {
-                vec_push(shape_bad, d);
+                if error_count != before {
+                    // d's own signature is what failed; conflicts are checked for the
+                    // shapes that are still sound.
+                    if !shape_on_path(shape_bad, d) {
+                        vec_push(shape_bad, d);
+                    }
+                } else {
+                    // A conflict or a duplicate is d's; a listed shape's signature
+                    // failure was attributed to that shape by shape_collect.
+                    if check_shape_conflicts(d, bind) > 0 && !shape_on_path(shape_bad, d) {
+                        vec_push(shape_bad, d);
+                    }
+                }
             }
             ck_state_restore(saved);
         }
@@ -662,13 +680,385 @@ fn shape_ref_name(tx) {
     return find_shape(tx[TX_B]);
 }
 
-// shape_ref resolves a type expression to a shape in scope, or 0. A shape with type
-// arguments is still reported by the caller, so return 0 here.
-fn shape_ref(tx) {
-    if !tx || tx[N_KIND] != TX_NAME || tx[TX_ARGS] {
+// shape_inst resolves a shape reference, with or without type arguments, to a vec of
+// [decl, bindings]; bindings is 0 for a non-generic shape. Type arguments are resolved
+// and the shape's own parameter constraints are checked, so `Seq[i64]` is an instance
+// and `Seq` alone is an error. Returns 0 when the name is not a shape.
+fn shape_inst(tx) {
+    let d = shape_ref_name(tx);
+    if !d {
         return 0;
     }
-    return shape_ref_name(tx);
+    if !d[D_TPARAMS] {
+        if tx[TX_ARGS] {
+            err_quoted(tx[N_POS], "shape ", tx[TX_B], " takes no type arguments");
+            return 0;
+        }
+        return pair(d, 0);
+    }
+    if !tx[TX_ARGS] {
+        let e = err_begin(tx[N_POS]);
+        buf_str(e, "shape ");
+        buf_str(e, tx[TX_B]);
+        buf_str(e, " needs type arguments, like ");
+        buf_str(e, tx[TX_B]);
+        buf_str(e, "[...]");
+        err_end(e);
+        return 0;
+    }
+    if tx[TX_ARGS][VEC_LEN] != d[D_TPARAMS][VEC_LEN] {
+        let e = err_begin(tx[N_POS]);
+        buf_str(e, "wrong number of type arguments for shape ");
+        buf_str(e, tx[TX_B]);
+        buf_str(e, ": it takes ");
+        buf_int(e, d[D_TPARAMS][VEC_LEN]);
+        err_end(e);
+        return 0;
+    }
+    let before = error_count;
+    let targs = resolve_types(tx[TX_ARGS]);
+    if error_count != before {
+        // A type argument that did not resolve was reported; bindings built from the
+        // fallback types would only add misleading errors.
+        return 0;
+    }
+    let before_cons = error_count;
+    check_constraints(tx[N_POS], d[D_TPARAMS], d[D_TCONS], targs, d[D_FILE]);
+    if error_count != before_cons {
+        // The arguments were reported; a pair built from them would only cause the same
+        // error again at use.
+        return 0;
+    }
+    return pair(d, tbind_pairs(d[D_TPARAMS], targs));
+}
+
+// shape_inst_decl is shape_inst for declaration validation: it checks the name and the
+// arity but not the type arguments' constraints, which a symbolic parameter cannot meet.
+fn shape_inst_decl(tx) {
+    let d = shape_ref_name(tx);
+    if !d {
+        return 0;
+    }
+    if !d[D_TPARAMS] {
+        if tx[TX_ARGS] {
+            err_quoted(tx[N_POS], "shape ", tx[TX_B], " takes no type arguments");
+            return 0;
+        }
+        return pair(d, 0);
+    }
+    if !tx[TX_ARGS] {
+        let e = err_begin(tx[N_POS]);
+        buf_str(e, "shape ");
+        buf_str(e, tx[TX_B]);
+        buf_str(e, " needs type arguments, like ");
+        buf_str(e, tx[TX_B]);
+        buf_str(e, "[...]");
+        err_end(e);
+        return 0;
+    }
+    if tx[TX_ARGS][VEC_LEN] != d[D_TPARAMS][VEC_LEN] {
+        let e = err_begin(tx[N_POS]);
+        buf_str(e, "wrong number of type arguments for shape ");
+        buf_str(e, tx[TX_B]);
+        buf_str(e, ": it takes ");
+        buf_int(e, d[D_TPARAMS][VEC_LEN]);
+        err_end(e);
+        return 0;
+    }
+    return pair(d, 0);
+}
+
+// shape_member_symbolic reports whether any type argument of a listed member is one of
+// the enclosing shape's parameters bound to a symbolic type, which is what makes an
+// instance's own argument constraints impossible to check at declaration. A concrete
+// argument (`shape G[T any] { A[f64] }`) and a parameter already bound to a real type
+// (`shape C[V any] { A[V] }` used with `C[f64]`) are checked.
+fn shape_member_symbolic(m, sd, bind) {
+    if !m[TX_ARGS] || !bind {
+        return 0;
+    }
+    let i = 0;
+    while i < m[TX_ARGS][VEC_LEN] {
+        let arg = vec_get(m[TX_ARGS], i);
+        let j = 0;
+        while j < sd[D_TPARAMS][VEC_LEN] {
+            let name = vec_get(sd[D_TPARAMS], j);
+            let one = vec_new();
+            vec_push(one, name);
+            if shape_tx_mentions(arg, one) {
+                let value = shape_bind_value(bind, name);
+                if value && shape_on_path(shape_placeholders, value) {
+                    return 1;
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn shape_bind_value(bind, name) {
+    let i = 0;
+    while i < bind[VEC_LEN] {
+        let p = vec_get(bind, i);
+        if streq(vec_get(p, 0), name) {
+            return vec_get(p, 1);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn shape_tx_mentions(tx, names) {
+    if !tx {
+        return 0;
+    }
+    let k = tx[N_KIND];
+    if k == TX_NAME {
+        let i = 0;
+        while i < names[VEC_LEN] {
+            if !tx[TX_A] && streq(tx[TX_B], vec_get(names, i)) {
+                return 1;
+            }
+            i = i + 1;
+        }
+        let j = 0;
+        while tx[TX_ARGS] && j < tx[TX_ARGS][VEC_LEN] {
+            if shape_tx_mentions(vec_get(tx[TX_ARGS], j), names) {
+                return 1;
+            }
+            j = j + 1;
+        }
+        return 0;
+    }
+    if k == TX_SLICE || k == TX_ARRAY {
+        return shape_tx_mentions(tx[TX_A + (k == TX_ARRAY)], names);
+    }
+    if k == TX_MAP {
+        return shape_tx_mentions(tx[TX_A], names) || shape_tx_mentions(tx[TX_B], names);
+    }
+    if k == TX_OPT || k == TX_PTR || k == TX_CHAN {
+        return shape_tx_mentions(tx[TX_A], names);
+    }
+    if k == TX_FUNC {
+        return shape_tx_list_mentions(tx[TX_A], names) || shape_tx_list_mentions(tx[TX_B], names);
+    }
+    if k == TX_STRUCT {
+        let fields = tx[TX_A];
+        let i = 0;
+        while fields && i < fields[VEC_LEN] {
+            if shape_tx_mentions(vec_get(vec_get(fields, i), 1), names) {
+                return 1;
+            }
+            i = i + 1;
+        }
+        return 0;
+    }
+    return 0;
+}
+
+fn shape_tx_list_mentions(list, names) {
+    let i = 0;
+    while list && i < list[VEC_LEN] {
+        if shape_tx_mentions(vec_get(list, i), names) {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+// shape_sym_bind binds each of a generic shape's parameters to a fresh struct type of its
+// own, so a body can be validated at declaration: `shape B[U] { A[U] }` resolves U to B's
+// parameter and two mentions of it compare equal, while `A[T]` against `B.M() i64` are
+// different types and a conflict is reported. The fresh types are compared by identity
+// only; nothing is named after them. A struct keeps `?T` well formed, as T must be a
+// reference for that to be legal at an instantiation.
+fn shape_sym_bind(d) {
+    let bind = vec_new();
+    let i = 0;
+    while i < d[D_TPARAMS][VEC_LEN] {
+        let ph = ty_new(K_STRUCT, vec_get(d[D_TPARAMS], i));
+        // A struct with no fields, not a null one: key_valid walks a map key's fields.
+        ph[TY_FIELDS] = vec_new();
+        vec_push(shape_placeholders, ph);
+        vec_push(bind, pair(vec_get(d[D_TPARAMS], i), ph));
+        i = i + 1;
+    }
+    return bind;
+}
+
+// shape_inst_soft resolves a listed instance for declaration validation: it checks the
+// name and the arity, binds the arguments, but does not check their constraints, because
+// a symbolic parameter cannot satisfy a union or a shape. The constraints are checked
+// again at every real instantiation.
+fn shape_inst_soft(tx) {
+    let d = shape_ref_name(tx);
+    if !d {
+        return 0;
+    }
+    if !d[D_TPARAMS] {
+        if tx[TX_ARGS] {
+            err_quoted(tx[N_POS], "shape ", tx[TX_B], " takes no type arguments");
+            return 0;
+        }
+        return pair(d, 0);
+    }
+    if !tx[TX_ARGS] {
+        let e = err_begin(tx[N_POS]);
+        buf_str(e, "shape ");
+        buf_str(e, tx[TX_B]);
+        buf_str(e, " needs type arguments, like ");
+        buf_str(e, tx[TX_B]);
+        buf_str(e, "[...]");
+        err_end(e);
+        return 0;
+    }
+    if tx[TX_ARGS][VEC_LEN] != d[D_TPARAMS][VEC_LEN] {
+        let e = err_begin(tx[N_POS]);
+        buf_str(e, "wrong number of type arguments for shape ");
+        buf_str(e, tx[TX_B]);
+        buf_str(e, ": it takes ");
+        buf_int(e, d[D_TPARAMS][VEC_LEN]);
+        err_end(e);
+        return 0;
+    }
+    let before = error_count;
+    let targs = resolve_types(tx[TX_ARGS]);
+    if error_count != before {
+        return 0;
+    }
+    return pair(d, tbind_pairs(d[D_TPARAMS], targs));
+}
+
+// shape_collect_visited reports whether (shape, bindings) has been collected in the
+// current flattening, so a diamond is walked once and a generic instance is not confused
+// with another instance of the same shape.
+fn shape_collect_visited(sd, bind) {
+    let i = 0;
+    while i < shape_collecting[VEC_LEN] {
+        let p = vec_get(shape_collecting, i);
+        if vec_get(p, 0) == sd && shape_bind_same(vec_get(p, 1), bind) {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn shape_bind_same(a, b) {
+    if !a || !b {
+        return a == b;
+    }
+    if a[VEC_LEN] != b[VEC_LEN] {
+        return 0;
+    }
+    let i = 0;
+    while i < a[VEC_LEN] {
+        if vec_get(vec_get(a, i), 1) != vec_get(vec_get(b, i), 1) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+// check_shape_conflicts flattens a shape's method set (its own methods and every listed
+// shape's, with the instance's type arguments bound) and reports a name that two shapes
+// give different signatures, or that one shape declares twice. Identical methods from
+// different listed shapes are allowed, as in Go. It returns how many errors it attributed
+// to the owner, so the caller can mark the owner bad without claiming a listed shape's.
+fn check_shape_conflicts(d, bind) {
+    shape_collecting = vec_new();
+    shape_conflicts = 0;
+    shape_collect(d, bind, vec_new(), d, vec_new());
+    return shape_conflicts;
+}
+
+fn shape_collect(sd, bind, methods, owner, own) {
+    if shape_on_path(shape_cycles, sd) || shape_collect_visited(sd, bind) || shape_on_path(shape_bad, sd) {
+        return;
+    }
+    vec_push(shape_collecting, pair(sd, bind));
+    let saved = ck_state_save();
+    set_file(sd[D_FILE]);
+    ck_tbind = bind;
+    let i = 0;
+    while i < sd[D_UNION][VEC_LEN] {
+        let m = vec_get(sd[D_UNION], i);
+        let base = shape_ref_name(m);
+        // A member that check_shape_decl already rejected (a bare generic shape, a
+        // non-generic one with arguments, a bad shape) is skipped so its error is not
+        // reported once per listing.
+        if base && !shape_on_path(shape_bad, base) && ((base[D_TPARAMS] && m[TX_ARGS]) || (!base[D_TPARAMS] && !m[TX_ARGS])) {
+            // Under symbolic arguments the constraints cannot be checked here; with real
+            // arguments (even inside a generic body) they can, and an error is sd's.
+            let before_inst = error_count;
+            let inst = 0;
+            if shape_member_symbolic(m, sd, bind) {
+                inst = shape_inst_soft(m);
+            } else {
+                inst = shape_inst(m);
+            }
+            if inst {
+                shape_collect(vec_get(inst, 0), vec_get(inst, 1), methods, owner, vec_new());
+            } else if error_count != before_inst && !shape_on_path(shape_bad, sd) {
+                vec_push(shape_bad, sd);
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < sd[D_SHAPE][VEC_LEN] {
+        let f = vec_get(sd[D_SHAPE], i);
+        let before = error_count;
+        let sig = shape_sig_of(f, 0, bind);
+        if error_count != before {
+            // The failing signature is sd's, not the owner's that listed it.
+            if !shape_on_path(shape_bad, sd) {
+                vec_push(shape_bad, sd);
+            }
+            ck_state_restore(saved);
+            return;
+        }
+        if sd == owner {
+            // The same shape declaring one name twice is an error even when the two
+            // signatures are identical (a listed shape may repeat a method).
+            let k = 0;
+            while k < own[VEC_LEN] {
+                if streq(vec_get(own, k), f[F_NAME]) {
+                    let e0 = err_begin(f[F_POS]);
+                    buf_str(e0, "shape ");
+                    buf_str(e0, owner[D_NAME]);
+                    buf_str(e0, " declares ");
+                    buf_str(e0, f[F_NAME]);
+                    buf_str(e0, " twice");
+                    err_end(e0);
+                    shape_conflicts = shape_conflicts + 1;
+                }
+                k = k + 1;
+            }
+            vec_push(own, f[F_NAME]);
+        }
+        let j = 0;
+        while j < methods[VEC_LEN] {
+            let prev = vec_get(methods, j);
+            if streq(vec_get(prev, 0), f[F_NAME]) && !shape_sig_same(vec_get(prev, 1), sig) {
+                let e = err_begin(f[F_POS]);
+                buf_str(e, "shape ");
+                buf_str(e, owner[D_NAME]);
+                buf_str(e, " has two methods named ");
+                buf_str(e, f[F_NAME]);
+                buf_str(e, " with different signatures (one from a listed shape)");
+                err_end(e);
+                shape_conflicts = shape_conflicts + 1;
+            }
+            j = j + 1;
+        }
+        vec_push(methods, pair(f[F_NAME], sig));
+        i = i + 1;
+    }
+    ck_state_restore(saved);
 }
 
 // check_shape_decl validates a registered shape: its body lists shapes only, its union
@@ -677,6 +1067,8 @@ fn shape_ref(tx) {
 // in it is remembered so the walk over it does not recurse forever or report again.
 // Each name is resolved in the file that declares the shape, and a validated shape is
 // remembered, so a shared sub-shape is walked once and diamonds do not cost 2^depth.
+// A generic shape's body is validated with its parameters bound to fresh types, so a
+// listed instance may mention them (`shape B[U] { A[U] }`) and its own cycle is caught.
 fn check_shape_decl(d, path) {
     if shape_on_path(shape_validated, d) {
         return;
@@ -684,53 +1076,66 @@ fn check_shape_decl(d, path) {
     let saved = ck_state_save();
     set_file(d[D_FILE]);
     vec_push(shape_validated, d);
+    // Only an error about d's own members marks d bad; an error inside a listed shape is
+    // that shape's, and marking d too would skip its own signature checks in
+    // shapes_declared (and lose them).
+    let mine = 0;
+    let bind = 0;
+    if d[D_TPARAMS] {
+        bind = shape_sym_bind(d);
+    }
     if d[D_UNIONKIND] {
         let i = 0;
         while i < d[D_UNION][VEC_LEN] {
             let m = vec_get(d[D_UNION], i);
-            if shape_ref(m) || shape_ref_name(m) {
+            if shape_ref_name(m) {
                 err_quoted(m[N_POS], "a named union lists concrete types, but ", shape_member_name(m), " is a shape: list shapes in a shape body instead");
+                mine = 1;
             }
             i = i + 1;
         }
-        ck_state_restore(saved);
-        return;
-    }
-    vec_push(path, d);
-    let i = 0;
-    while i < d[D_UNION][VEC_LEN] {
-        let m = vec_get(d[D_UNION], i);
-        let sub = shape_ref(m);
-        if !sub {
-            let nm = shape_member_name(m);
-            if nm {
-                let e = err_begin(m[N_POS]);
-                buf_str(e, "shape ");
-                buf_str(e, d[D_NAME]);
-                buf_str(e, " lists ");
-                buf_str(e, nm);
-                buf_str(e, ", which is not a shape");
-                err_end(e);
+    } else {
+        vec_push(path, d);
+        ck_tbind = bind;
+        let i = 0;
+        while i < d[D_UNION][VEC_LEN] {
+            let m = vec_get(d[D_UNION], i);
+            let sub = shape_ref_name(m);
+            if !sub {
+                let nm = shape_member_name(m);
+                if nm {
+                    let e = err_begin(m[N_POS]);
+                    buf_str(e, "shape ");
+                    buf_str(e, d[D_NAME]);
+                    buf_str(e, " lists ");
+                    buf_str(e, nm);
+                    buf_str(e, ", which is not a shape");
+                    err_end(e);
+                } else {
+                    err_at(m[N_POS], "a shape lists another shape by name");
+                }
+                mine = 1;
+            } else if shape_on_path(path, sub) {
+                err_quoted(sub[D_POS], "shape ", sub[D_NAME], " is composed of itself (directly or through other shapes)");
+                shape_mark_cycle(path, sub);
             } else {
-                err_at(m[N_POS], "a shape lists another shape by name");
+                // Reports a missing type argument, a wrong count or extra arguments.
+                let before_inst = error_count;
+                let inst = shape_inst_decl(m);
+                if inst {
+                    check_shape_decl(sub, path);
+                } else if error_count != before_inst {
+                    mine = 1;
+                }
             }
-        } else if shape_on_path(path, sub) {
-            err_quoted(sub[D_POS], "shape ", sub[D_NAME], " is composed of itself (directly or through other shapes)");
-            shape_mark_cycle(path, sub);
-        } else if sub[D_TPARAMS] {
-            let e2 = err_begin(m[N_POS]);
-            buf_str(e2, "shape ");
-            buf_str(e2, d[D_NAME]);
-            buf_str(e2, " lists the generic shape ");
-            buf_str(e2, sub[D_NAME]);
-            buf_str(e2, ", which needs type arguments (#141)");
-            err_end(e2);
-        } else {
-            check_shape_decl(sub, path);
+            i = i + 1;
         }
-        i = i + 1;
+        ck_tbind = saved[3];
+        path[VEC_LEN] = path[VEC_LEN] - 1;
     }
-    path[VEC_LEN] = path[VEC_LEN] - 1;
+    if mine && !shape_on_path(shape_bad, d) {
+        vec_push(shape_bad, d);
+    }
     ck_state_restore(saved);
 }
 
@@ -771,10 +1176,25 @@ fn shape_on_path(path, d) {
     return 0;
 }
 
-// shape_seen reports whether the (shape, type) pair is in a satisfaction set. The pair
-// matters: resolving a union member can check the same shape against a nested type while
-// the outer check is in flight, and the outer type must not be suppressed by it.
-fn shape_seen(v, sd, t) {
+// shape_seen reports whether the (shape, type, bindings) key is in a satisfaction set.
+// The key matters: resolving a union member can check the same shape against a nested
+// type while the outer check is in flight, and the outer type must not be suppressed by
+// it; two instantiations of one shape are different keys.
+fn shape_seen(v, sd, t, bind) {
+    let i = 0;
+    while i < v[VEC_LEN] {
+        let p = vec_get(v, i);
+        if vec_get(p, 0) == sd && vec_get(p, 1) == t && shape_bind_same(vec_get(p, 2), bind) {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// shape_seen_type reports whether the (shape, type) part of a key is on the path, under
+// any bindings.
+fn shape_seen_type(v, sd, t) {
     let i = 0;
     while i < v[VEC_LEN] {
         let p = vec_get(v, i);
@@ -978,24 +1398,32 @@ fn shape_result_list(b, rs, n) {
     buf_byte(b, ')');
 }
 
-// check_shape reports why t does not satisfy sd, or nothing when it does. Composition is
-// walked once per shape per satisfaction tree (shape_checked) and never through a cycle
-// (shape_checking), so a diamond costs its depth, not 2^depth, and a cycle reported at
-// registration cannot recurse here.
-fn check_shape(pos, t, sd) {
-    if shape_on_path(shape_bad, sd) {
+// check_shape reports why t does not satisfy sd, or nothing when it does. bind holds the
+// type arguments of a generic shape instance (0 for a non-generic one), so `Seq[i64]`
+// resolves its methods as i64. Composition is walked once per (shape, type, bindings) per
+// satisfaction tree and never through a cycle, so a diamond costs its depth, not 2^depth,
+// and a cycle reported at registration cannot recurse here.
+fn check_shape(pos, t, sd, bind) {
+    if shape_on_path(shape_bad, sd) || shape_on_path(shape_cycles, sd) {
         return;
     }
     if shape_checking[VEC_LEN] == 0 {
         shape_checked = vec_new();
     }
-    if shape_seen(shape_checking, sd, t) || shape_seen(shape_checked, sd, t) {
+    if shape_seen(shape_checking, sd, t, bind) || shape_seen(shape_checked, sd, t, bind) {
         return;
     }
-    vec_push(shape_checked, pair(sd, t));
-    vec_push(shape_checking, pair(sd, t));
+    // The same shape and type under a different instantiation means the composition
+    // recurses through type arguments (`shape G[T] { G[Box[T]] }`); the cycle is reported
+    // at declaration, and stopping here keeps the walk finite.
+    if shape_seen_type(shape_checking, sd, t) {
+        return;
+    }
+    vec_push(shape_checked, shape_key(sd, t, bind));
+    vec_push(shape_checking, shape_key(sd, t, bind));
     let saved = ck_state_save();
     set_file(sd[D_FILE]);
+    ck_tbind = bind;
     if sd[D_UNIONKIND] {
         let ok = 0;
         let j = 0;
@@ -1021,17 +1449,15 @@ fn check_shape(pos, t, sd) {
     }
     let j = 0;
     while j < sd[D_UNION][VEC_LEN] {
-        let sub = shape_ref(vec_get(sd[D_UNION], j));
-        // A generic shape listed here was diagnosed at declaration; resolving it would
-        // add errors from its unbound type parameters.
-        if sub && !sub[D_TPARAMS] {
-            check_shape(pos, t, sub);
+        let inst = shape_inst(vec_get(sd[D_UNION], j));
+        if inst {
+            check_shape(pos, t, vec_get(inst, 0), vec_get(inst, 1));
         }
         j = j + 1;
     }
     let i = 0;
     while i < sd[D_SHAPE][VEC_LEN] {
-        if !check_shape_method(pos, t, sd, vec_get(sd[D_SHAPE], i)) {
+        if !check_shape_method(pos, t, sd, vec_get(sd[D_SHAPE], i), bind) {
             i = sd[D_SHAPE][VEC_LEN];
         } else {
             i = i + 1;
@@ -1039,6 +1465,15 @@ fn check_shape(pos, t, sd) {
     }
     shape_checking[VEC_LEN] = shape_checking[VEC_LEN] - 1;
     ck_state_restore(saved);
+}
+
+// shape_key is the (shape, type, bindings) triple a satisfaction tree is memoized on.
+fn shape_key(sd, t, bind) {
+    let k = vec_new();
+    vec_push(k, sd);
+    vec_push(k, t);
+    vec_push(k, bind);
+    return k;
 }
 
 fn shape_union_str(b, sd) {
@@ -1052,12 +1487,13 @@ fn shape_union_str(b, sd) {
     }
 }
 
-// check_shape_method reports whether t has want's method with want's signature. It
-// returns 0 when the shape's own signature could not be resolved (already reported), so
-// the caller stops rather than reporting the same missing type once per method.
-fn check_shape_method(pos, t, sd, want) {
+// check_shape_method reports whether t has want's method with want's signature. bind
+// resolves a generic shape's method types. It returns 0 when the shape's own signature
+// could not be resolved (already reported), so the caller stops rather than reporting
+// the same missing type once per method.
+fn check_shape_method(pos, t, sd, want, bind) {
     let before = error_count;
-    let wsig = shape_sig_of(want, 0, 0);
+    let wsig = shape_sig_of(want, 0, bind);
     if error_count != before {
         if !shape_on_path(shape_bad, sd) {
             vec_push(shape_bad, sd);
