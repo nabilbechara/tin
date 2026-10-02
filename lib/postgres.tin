@@ -1,0 +1,1035 @@
+// Package postgres is a PostgreSQL protocol 3.0 client over TCP. Query interpolation
+// binds binary parameters as $1, $2, ...; a plain str cannot be used as SQL. Connections
+// are pooled per core (default 16) and waiting request tasks park without blocking it.
+// Authentication supports SCRAM-SHA-256, MD5 and cleartext. TLS is not supported: use
+// a trusted private network or a local TLS proxy. An SSL-only server is rejected.
+//
+//	var db = postgres.Open(postgres.Options{Addr: "127.0.0.1:5432", User: "app", Password: pw, Database: "shop"})
+//	rows := try db.Query("INSERT INTO users(name) VALUES ({name}) RETURNING id")
+//	id := rows.Rows[0][0].Int()
+package postgres
+
+import "gauge"
+import "mint"
+import "postgres/md5"
+import "postgres/sasl"
+import "seal"
+import "wire"
+
+extern func close(fd i64) i64
+extern func strerror(e i64) i64
+extern func recv(fd i64, buf i64, n i64, flags i64) i64
+
+// Value is one column of a row.
+type Value enum {
+	Null
+	Int(v i64)   // integer columns and booleans (0 or 1)
+	Float(v f64) // real and double precision
+	Text(v str)  // everything else: strings, blobs, numeric, JSON, bytea, dates and times as text
+}
+
+// Rows is a query's result.
+type Rows struct {
+	Columns []str
+	Rows    [][]Value
+}
+
+// Result is what a statement without rows did.
+type Result struct {
+	Affected i64
+}
+
+// Options says where and how to connect.
+type Options struct {
+	Addr     str // "host:port" (default "127.0.0.1:5432")
+	User     str
+	Password str
+	Database str
+	Pool     i64 // connections per core (default 16)
+	Timeout  i64 // ns for acquisition, login, preparation and execution (0: no limit)
+}
+
+// Client runs statements on one PostgreSQL server. Open it in a global's initializer (which
+// runs on every core) or once in main, not per request.
+type Client struct {
+	open bool // false for the zero Client
+	rec  i64
+}
+
+// Tx is a transaction: its statements run on one connection until Commit or Rollback.
+type Tx struct {
+	state i64 // caller-owned [connection, Client record, active]; shared by copies
+}
+
+const maxClients = 1024
+
+// The shared record of a Client.
+const rAddr = 0
+const rAddrN = 1
+const rUser = 2
+const rUserN = 3
+const rPass = 4
+const rPassN = 5
+const rDB = 6
+const rDBN = 7
+const rPool = 8
+const rTimeout = 9
+const rID = 10
+const recWords = 11
+
+// A core's pool for one Client.
+const pIdle = 0 // a stack of idle connections
+const pIdleN = 1
+const pTotal = 2
+const pWait = 3 // waiters, in order
+const pWaitHead = 4
+const pWaitN = 5
+const pWaitCap = 6
+const poolWords = 7
+
+// A waiter: [task, connection handed over, gone, done].
+const wTask = 0
+const wConn = 1
+const wGone = 2
+const wDone = 3
+
+// A connection.
+const cFd = 0
+const cBuf = 1 // bytes read: packets from cS to cE
+const cS = 2
+const cE = 3
+const cCap = 4
+const cNext = 5 // where the packet returned last ends
+const cOut = 6
+const cOutN = 7
+const cOutCap = 8
+const cKind = 9
+const cSynced = 10 // set only after ReadyForQuery
+const cStmts = 11 // cached SQL, parameter signature and statement name
+const cNStmts = 12
+const cPkt = 13 // the start of the packet being written
+const cUntil = 14 // absolute operation timeout
+const cStatus = 15 // I (idle), T (transaction), E (failed transaction)
+const cSerial = 16
+const cPID = 17
+const cKey = 18
+const cParsed = 19
+const connWords = 20
+
+const stmtWords = 5 // [SQL ptr, len, signature ptr, len, name serial]
+const maxStmts = 256
+
+shared var nClients i64
+var pools i64 // per core: the pool of each Client, by id
+
+func keep_raw(s str) i64 {
+	p := malloc(len(s) + 1)
+	memcpy(p, cast(i64, s)+8, len(s))
+	return p
+}
+
+func rec_str(rec i64, at i64) str {
+	return rt_str_from_raw(rec[at], rec[at+1])
+}
+
+// Open makes a client for the server in o. It connects on first use, on each core.
+func Open(o Options) Client {
+	addr := o.Addr
+	if addr == "" {
+		addr = "127.0.0.1:5432"
+	}
+	id := __atomic_add(&nClients, 1)
+	if id >= maxClients {
+		return Client{open: false, rec: 0}
+	}
+	rec := calloc(recWords, 8)
+	rec[rAddr] = keep_raw(addr)
+	rec[rAddrN] = len(addr)
+	rec[rUser] = keep_raw(o.User)
+	rec[rUserN] = len(o.User)
+	rec[rPass] = keep_raw(o.Password)
+	rec[rPassN] = len(o.Password)
+	rec[rDB] = keep_raw(o.Database)
+	rec[rDBN] = len(o.Database)
+	rec[rPool] = o.Pool
+	if o.Pool <= 0 {
+		rec[rPool] = 16
+	}
+	rec[rTimeout] = o.Timeout
+	rec[rID] = id
+	return Client{open: true, rec: rec}
+}
+
+// ---- values ----
+
+// IsNull reports whether v is NULL.
+func (v Value) IsNull() bool {
+	switch v {
+	case Null:
+		return true
+	default:
+	}
+	return false
+}
+
+// Int is v as an integer (a Text or Float converted, NULL and bad text 0).
+func (v Value) Int() i64 {
+	switch v {
+	case Int(n):
+		return n
+	case Float(f):
+		return i64(f)
+	case Text(s):
+		n := mint.ParseInt(s, 10) catch _ { 0 }
+		return n
+	case Null:
+	}
+	return 0
+}
+
+// Float is v as a float.
+func (v Value) Float() f64 {
+	switch v {
+	case Int(n):
+		return f64(n)
+	case Float(f):
+		return f
+	case Text(s):
+		f := mint.ParseFloat(s) catch _ { 0.0 }
+		return f
+	case Null:
+	}
+	return 0.0
+}
+
+// Text is v as text ("" for NULL).
+func (v Value) Text() str {
+	switch v {
+	case Int(n):
+		return mint.Itoa(n)
+	case Float(f):
+		return mint.FormatFloat(f, 'g', -1)
+	case Text(s):
+		return s
+	case Null:
+	}
+	return ""
+}
+
+// Col is the index of the named column, or -1.
+func (r Rows) Col(name str) i64 {
+	for i, c := range r.Columns {
+		if c == name {
+			return i
+		}
+	}
+	return -1
+}
+
+// ---- protocol framing and bounded cursors ----
+
+func os_msg(what str, e i64) str {
+	m := strerror(e)
+	return "postgres: {what}: {rt_str_from_raw(m, strlen(m))}"
+}
+
+func wait_msg(r i64) str {
+	if r == waitDeadline { return "deadline exceeded" }
+	return "postgres: timed out"
+}
+
+func expiration(rec i64) i64 {
+	if rec == 0 || rec[rTimeout] <= 0 { return 0 }
+	return rt_mono_ns()+rec[rTimeout]
+}
+
+func remaining(until i64) !i64 {
+	now := rt_mono_ns()
+	t := rt_task_current()
+	if t != 0 && t[tDeadline] > 0 && now >= t[tDeadline] { fail "deadline exceeded" }
+	if until == 0 { return 0 }
+	left := until-now
+	if left <= 0 { fail "postgres: timed out" }
+	return left
+}
+
+func be(p i64, n i64) i64 {
+	v := 0
+	for i := 0; i < n; i++ { v = v<<8 | i64(load8(p+i)) }
+	return v
+}
+
+// A payload remains valid until the next read. Reject lengths before growing buffers.
+func read_packet(c i64) !(i64, i64) {
+	c[cS] = c[cNext]
+	for {
+		_ = try remaining(c[cUntil])
+		avail := c[cE]-c[cS]
+		if avail >= 5 {
+			p := c[cBuf]+c[cS]
+			n := be(p+1, 4)
+			if n < 4 || n > 16777216 { fail "postgres: invalid or oversized message length" }
+			if avail >= n+1 {
+				c[cKind] = i64(load8(p))
+				c[cNext] = c[cS]+n+1
+				return p+5, n-4
+			}
+			if c[cS]+n+1 > c[cCap] {
+				memmove(c[cBuf], p, avail)
+				c[cS] = 0; c[cE] = avail
+				if n+1 > c[cCap] {
+					c[cCap] = n+1+16384
+					c[cBuf] = realloc(c[cBuf], c[cCap])
+				}
+			}
+		} else if c[cS] > 0 && (c[cS] == c[cE] || c[cE] == c[cCap]) {
+			memmove(c[cBuf], c[cBuf]+c[cS], avail)
+			c[cS] = 0; c[cE] = avail
+		}
+		k := read(c[cFd], c[cBuf]+c[cE], c[cCap]-c[cE])
+		if k > 0 { c[cE] += k; continue }
+		if k == 0 { fail "postgres: the server closed the connection" }
+		e := rt_errno()
+		if e == EINTR { continue }
+		if e != EAGAIN { fail os_msg("read", e) }
+		left := try remaining(c[cUntil])
+		r := rt_task_wait(c[cFd], 1, left)
+		if r != waitReady { fail wait_msg(r) }
+	}
+}
+
+func out_reserve(c i64, n i64) i64 {
+	if n < 0 || c[cOutN]+n > 33554432 { rt_panic("postgres: output too large") }
+	if c[cOutN]+n > c[cOutCap] {
+		c[cOutCap] = c[cOutCap]*2+n+4096
+		c[cOut] = realloc(c[cOut], c[cOutCap])
+	}
+	p := c[cOut]+c[cOutN]
+	c[cOutN] += n
+	return p
+}
+
+func put_be(c i64, v i64, n i64) {
+	p := out_reserve(c, n)
+	for i := 0; i < n; i++ { store8(p+i, v >> (8*(n-1-i))) }
+}
+
+func put_raw(c i64, p i64, n i64) {
+	if n > 0 { memcpy(out_reserve(c, n), p, n) }
+}
+
+func put_str(c i64, s str) { put_raw(c, cast(i64, s)+8, len(s)) }
+func put_cstr(c i64, s str) { put_str(c, s); put_be(c, 0, 1) }
+
+// kind 0 is the untyped startup frame; otherwise a one-byte tag precedes the length.
+func begin_packet(c i64, kind i64) {
+	if kind != 0 { put_be(c, kind, 1) }
+	c[cPkt] = c[cOutN]
+	out_reserve(c, 4)
+}
+
+func end_packet(c i64) ! {
+	n := c[cOutN]-c[cPkt]
+	if n > 16777216 { fail "postgres: messages above 16 MiB are not supported" }
+	p := c[cOut]+c[cPkt]
+	for i := 0; i < 4; i++ { store8(p+i, n >> (24-8*i)) }
+}
+
+func flush(c i64) ! {
+	at := 0
+	for at < c[cOutN] {
+		_ = try remaining(c[cUntil])
+		k := write(c[cFd], c[cOut]+at, c[cOutN]-at)
+		if k > 0 { at += k; continue }
+		e := rt_errno()
+		if e == EINTR { continue }
+		if e != EAGAIN { fail os_msg("write", e) }
+		left := try remaining(c[cUntil])
+		r := rt_task_wait(c[cFd], 2, left)
+		if r != waitReady { fail wait_msg(r) }
+	}
+	c[cOutN] = 0
+}
+
+type cur struct { p i64; at i64; end i64 }
+func (k mut cur) fixed(n i64) !i64 {
+	if n < 0 || n > k.end-k.at { fail "postgres: truncated message" }
+	v := be(k.p+k.at, n)
+	k.at += n
+	return v
+}
+func (k mut cur) bytes(n i64) !str {
+	if n < 0 || n > k.end-k.at { fail "postgres: truncated message" }
+	s := rt_str_from_raw(k.p+k.at, n)
+	k.at += n
+	return s
+}
+func (k mut cur) cstr() !str {
+	e := k.at
+	for e < k.end && load8(k.p+e) != 0 { e++ }
+	if e == k.end { fail "postgres: unterminated string" }
+	s := try k.bytes(e-k.at)
+	k.at++
+	return s
+}
+func (k cur) done() ! {
+	if k.at != k.end { fail "postgres: unexpected trailing message data" }
+}
+
+func error_text(k mut cur) !str {
+	severity := "ERROR"
+	unlocalized := ""
+	state := ""
+	message := ""
+	detail := ""
+	for {
+		tag := try k.fixed(1)
+		if tag == 0 { break }
+		s := try k.cstr()
+		if tag == 'S' { severity = s }
+		if tag == 'V' { unlocalized = s }
+		if tag == 'C' { state = s }
+		if tag == 'M' { message = s }
+		if tag == 'D' { detail = s }
+	}
+	try k.done()
+	if unlocalized != "" { severity = unlocalized }
+	out := "postgres: {severity} {state}: {message}"
+	if detail != "" { out += " (detail: {detail})" }
+	return out
+}
+
+func ready(c i64, k mut cur) ! {
+	status := try k.fixed(1)
+	try k.done()
+	if status != 'I' && status != 'T' && status != 'E' { fail "postgres: invalid transaction status" }
+	c[cStatus] = status
+	c[cSynced] = 1
+}
+
+func status_message(c i64, k mut cur) ! {
+	if c[cKind] == 'S' { _ = try k.cstr(); _ = try k.cstr(); try k.done(); return }
+	if c[cKind] == 'K' {
+		c[cPID] = try k.fixed(4); c[cKey] = try k.fixed(4); try k.done(); return
+	}
+	if c[cKind] == 'N' { _ = try error_text(mut k); return }
+	fail "postgres: unexpected server message"
+}
+
+func no_nul(s str) ! {
+	for i := 0; i < len(s); i++ { if s[i] == 0 { fail "postgres: NUL in protocol string" } }
+}
+
+// ---- authentication ----
+
+func password_message(c i64, text str, terminated bool) ! {
+	begin_packet(c, 'p')
+	put_str(c, text)
+	if terminated { put_be(c, 0, 1) }
+	try end_packet(c); try flush(c)
+}
+
+func attrs(s str) ![]str {
+	out := make([]str, 128)
+	at := 0
+	for at < len(s) {
+		if at+2 > len(s) || s[at+1] != '=' || !(s[at] >= 'a' && s[at] <= 'z' || s[at] >= 'A' && s[at] <= 'Z') { fail "postgres: invalid SCRAM attributes" }
+		tag := i64(s[at])
+		if out[tag] != "" || tag == 'm' { fail "postgres: unsupported or duplicate SCRAM attribute" }
+		e := at+2
+		for e < len(s) && s[e] != ',' { e++ }
+		if e == at+2 { fail "postgres: empty SCRAM attribute" }
+		out[tag] = s[at+2:e]
+		at = e+1
+		if at == len(s) { fail "postgres: trailing SCRAM separator" }
+	}
+	return out
+}
+
+func handshake(c i64, rec i64) ! {
+	user := rec_str(rec, rUser)
+	pass := rec_str(rec, rPass)
+	db := rec_str(rec, rDB)
+	try no_nul(user); try no_nul(db)
+	if len(user)+len(db) > 16700000 || len(pass) > 16700000 { fail "postgres: login data too large" }
+	begin_packet(c, 0)
+	put_be(c, 196608, 4)
+	put_cstr(c, "user"); put_cstr(c, user)
+	if db != "" { put_cstr(c, "database"); put_cstr(c, db) }
+	put_cstr(c, "client_encoding"); put_cstr(c, "UTF8")
+	put_be(c, 0, 1)
+	try end_packet(c); try flush(c)
+	phase := 0
+	nonce := ""
+	bare := ""
+	serverSig := []u8{}
+	authed := false
+	for {
+		p, n := try read_packet(c)
+		k := cur{p: p, end: n}
+		if c[cKind] == 'R' {
+			method := try k.fixed(4)
+			if method == 0 {
+				try k.done()
+				if phase != 0 && phase != 4 { fail "postgres: unverified authentication" }
+				authed = true; phase = 5; continue
+			}
+			if method == 3 && phase == 0 {
+				try k.done(); try no_nul(pass)
+				try password_message(c, pass, true); phase = 4; continue
+			}
+			if method == 5 && phase == 0 {
+				salt := try k.bytes(4); try k.done()
+				inner := seal.Hex(md5.Sum(pass+user))
+				try password_message(c, "md5"+seal.Hex(md5.Sum(inner+salt)), true)
+				phase = 4; continue
+			}
+			if method == 10 && phase == 0 {
+				found := false
+				for {
+					mechanism := try k.cstr()
+					if mechanism == "" { break }
+					if mechanism == "SCRAM-SHA-256" { found = true }
+				}
+				try k.done()
+				if !found { fail "postgres: SCRAM-SHA-256 required (TLS/channel binding unsupported)" }
+				nonce = seal.B64(seal.RandomBytes(24))
+				bare = "n=,r={nonce}"
+				first := "n,,{bare}"
+				begin_packet(c, 'p'); put_cstr(c, "SCRAM-SHA-256"); put_be(c, len(first), 4); put_str(c, first)
+				try end_packet(c); try flush(c); phase = 1; continue
+			}
+			if method == 11 && phase == 1 {
+				first := try k.bytes(k.end-k.at)
+				a := try attrs(first)
+				r := a['r']
+				if len(r) > 16384 { fail "postgres: SCRAM server nonce too large" }
+				for i := 0; i < len(r); i++ {
+					if r[i] < 33 || r[i] > 126 { fail "postgres: invalid SCRAM server nonce" }
+				}
+				if len(r) <= len(nonce) || r[:len(nonce)] != nonce { fail "postgres: invalid SCRAM server nonce" }
+				count := a['i']
+				if len(count) == 0 || len(count) > 7 { fail "postgres: invalid SCRAM iteration count" }
+				for i := 0; i < len(count); i++ {
+					if count[i] < '0' || count[i] > '9' { fail "postgres: invalid SCRAM iteration count" }
+				}
+				iterations := try mint.Atoi(count)
+				if iterations < 1 || iterations > 1000000 { fail "postgres: SCRAM iteration count outside 1..1000000" }
+				if len(a['s']) == 0 || len(a['s']) > 4096 { fail "postgres: invalid SCRAM salt" }
+				salt := try seal.B64Decode(a['s'])
+				left := try remaining(c[cUntil])
+				salted, err := seal.Pbkdf2Sha256Timeout(sasl.Prep(pass), str(salt), iterations, 32, left)
+				if err != nil {
+					// Reclassify the derivation's timeout using the whole operation budget.
+					_ = try remaining(c[cUntil])
+					fail err
+				}
+				_ = try remaining(c[cUntil])
+				key := seal.HmacSha256(str(salted), "Client Key")
+				final := "c=biws,r={r}"
+				message := "{bare},{first},{final}"
+				signature := seal.HmacSha256(str(seal.Sha256(str(key))), message)
+				proof := make([]u8, 32)
+				for i := 0; i < 32; i++ { proof[i] = key[i]^signature[i] }
+				serverSig = seal.HmacSha256(str(seal.HmacSha256(str(salted), "Server Key")), message)
+				try password_message(c, "{final},p={seal.B64(proof)}", false)
+				phase = 2; continue
+			}
+			if method == 12 && phase == 2 {
+				last := try k.bytes(k.end-k.at)
+				a := try attrs(last)
+				if a['e'] != "" { fail "postgres: SCRAM authentication failed: {a['e']}" }
+				if a['v'] == "" { fail "postgres: missing SCRAM server verifier" }
+				if len(a['v']) != 44 { fail "postgres: invalid SCRAM server verifier" }
+				v := try seal.B64Decode(a['v'])
+				if !seal.ConstantTimeEq(v, serverSig) { fail "postgres: invalid SCRAM server verifier" }
+				phase = 4; continue
+			}
+			fail "postgres: unsupported or out-of-order authentication method {method}"
+		}
+		if c[cKind] == 'E' {
+			message := try error_text(mut k)
+			if contains(message, "SSL") || contains(message, "no encryption") {
+				fail "{message}; postgres: TLS is not supported; use a local TLS proxy"
+			}
+			fail message
+		}
+		if c[cKind] == 'Z' {
+			if !authed { fail "postgres: ReadyForQuery before authentication" }
+			try ready(c, mut k); return
+		}
+		try status_message(c, mut k)
+	}
+}
+
+func contains(s str, part str) bool {
+	for i := 0; i+len(part) <= len(s); i++ { if s[i:i+len(part)] == part { return true } }
+	return false
+}
+
+// ---- the pool ----
+
+func (c Client) pool() i64 {
+	if pools == 0 {
+		pools = calloc(maxClients+1, 8)
+	}
+	id := c.rec[rID]
+	p := pools[id]
+	if p == 0 {
+		p = calloc(poolWords, 8)
+		p[pIdle] = calloc(c.rec[rPool]+1, 8)
+		pools[id] = p
+	}
+	return p
+}
+
+func conn_free(c i64) {
+	if c[cFd] >= 0 {
+		close(c[cFd])
+	}
+	free(c[cBuf])
+	free(c[cOut])
+	st := c[cStmts]
+	for i := 0; i < c[cNStmts]; i++ {
+		free(st[i*stmtWords])
+		free(st[i*stmtWords+2])
+	}
+	free(st)
+	free(c)
+}
+
+func dial(rec i64, until i64) !i64 {
+	addr := rec_str(rec, rAddr)
+	left := try remaining(until)
+	w := try wire.DialTimeout(addr, left)
+	c := calloc(connWords, 8)
+	c[cFd] = w.Fd()
+	c[cCap] = 16384
+	c[cBuf] = malloc(c[cCap])
+	c[cStmts] = calloc(maxStmts*stmtWords, 8)
+	c[cUntil] = until
+	err := handshake(c, rec)
+	if err != nil {
+		conn_free(c)
+		fail err
+	}
+	return c
+}
+
+// alive reports whether an idle connection is still open (the server may have closed it:
+// a restart, wait_timeout).
+func alive(c i64) bool {
+	if c[cNext] != c[cE] { return false }
+	b := calloc(1, 8)
+	k := recv(c[cFd], b, 1, 2)
+	e := rt_errno()
+	free(b)
+	return k < 0 && (e == EAGAIN || e == EINTR)
+}
+
+func (c Client) acquire(until i64) !i64 {
+	if !c.open {
+		fail "postgres: the client is not open (too many clients: open one per server, not per request)"
+	}
+	p := c.pool()
+	for {
+		_ = try remaining(until)
+		for p[pIdleN] > 0 {
+			p[pIdleN]--
+			idle := p[pIdle]
+			conn := idle[p[pIdleN]]
+			if alive(conn) {
+				return conn
+			}
+			conn_free(conn)
+			p[pTotal]--
+		}
+		if p[pTotal] < c.rec[rPool] {
+			p[pTotal]++
+			conn, err := dial(c.rec, until)
+			if err != nil {
+				p[pTotal]--
+				wake_retry(p)
+				fail err
+			}
+			return conn
+		}
+		if rt_task_current() == 0 { fail "postgres: pool exhausted outside a request task" }
+		// Every connection is busy: wait for one.
+		left := try remaining(until)
+		w := calloc(4, 8)
+		w[wTask] = rt_task_current()
+		if p[pWaitHead]+p[pWaitN] == p[pWaitCap] {
+			if p[pWaitHead] > 0 {
+				memmove(p[pWait], p[pWait]+8*p[pWaitHead], 8*p[pWaitN])
+				p[pWaitHead] = 0
+			} else {
+				cp := p[pWaitCap]*2 + 32
+				p[pWait] = realloc(p[pWait], 8*cp)
+				p[pWaitCap] = cp
+			}
+		}
+		q := p[pWait]
+		q[p[pWaitHead]+p[pWaitN]] = w
+		p[pWaitN]++
+		r := rt_task_park(left)
+		if w[wDone] == 0 {
+			// Timed out: the releaser frees the entry when it reaches it.
+			w[wGone] = 1
+			fail wait_msg(r)
+		}
+		conn := w[wConn]
+		free(w)
+		if conn != 0 {
+			return conn
+		}
+		// A connection was dropped: there is room to dial again.
+	}
+}
+
+// next_waiter is the first waiter still waiting, or 0.
+func next_waiter(p i64) i64 {
+	for p[pWaitN] > 0 {
+		q := p[pWait]
+		w := q[p[pWaitHead]]
+		p[pWaitHead]++
+		p[pWaitN]--
+		if p[pWaitN] == 0 {
+			p[pWaitHead] = 0
+		}
+		if w[wGone] != 0 {
+			free(w)
+			continue
+		}
+		return w
+	}
+	return 0
+}
+
+// release returns a connection to the pool; a broken one (ok false) is closed.
+func (c Client) release(conn i64, ok bool) {
+	p := c.pool()
+	if !ok {
+		conn_free(conn)
+		p[pTotal]--
+		conn = 0
+	}
+	w := next_waiter(p)
+	if w != 0 {
+		w[wConn] = conn
+		w[wDone] = 1
+		rt_task_wake(w[wTask])
+		return
+	}
+	if conn != 0 {
+		idle := p[pIdle]
+		idle[p[pIdleN]] = conn
+		p[pIdleN]++
+	}
+}
+
+
+func wake_retry(p i64) {
+	w := next_waiter(p)
+	if w != 0 { w[wDone] = 1; rt_task_wake(w[wTask]) }
+}
+
+// ---- statement execution ----
+
+func placeholders(q query) str {
+	n := len(q.Args)*6
+	for _, part := range q.Parts { n += len(part) }
+	out := make([]u8, 0, n)
+	for i, part := range q.Parts {
+		out = append(out, part...)
+		if i < len(q.Args) {
+			out = append(out, '$')
+			out = append(out, mint.Itoa(i+1)...)
+		}
+	}
+	return str(out)
+}
+
+func param_oid(v qarg) i64 {
+	switch v {
+	case Int(_): return 20
+	case Float(_): return 701
+	case Str(_): return 25
+	case Bool(_): return 16
+	case Bytes(_): return 17
+	}
+	return 0
+}
+
+func eq_raw(p i64, s str) bool {
+	for i := 0; i < len(s); i++ { if load8(p+i) != s[i] { return false } }
+	return true
+}
+
+func name(id i64) str { return "tin"+mint.Itoa(id) }
+
+// read_result always drains through ReadyForQuery, including after a server error.
+// Return the first rowset and the affected count from the last command.
+func read_result(c i64) !(Rows, Result) {
+	rows := Rows{}
+	res := Result{}
+	oids := []i64{}
+	formats := []i64{}
+	first := true
+	haveRows := false
+	message := ""
+	for {
+		p, n := try read_packet(c)
+		k := cur{p: p, end: n}
+		kind := c[cKind]
+		if kind == 'Z' {
+			try ready(c, mut k)
+			if message != "" { fail message }
+			return rows, res
+		}
+		if kind == 'E' {
+			m := try error_text(mut k)
+			if message == "" { message = m }
+			continue
+		}
+		if kind == 'T' {
+			count := try k.fixed(2)
+			if count > (n-2)/19 { fail "postgres: invalid column count" }
+			oids = make([]i64, count); formats = make([]i64, count)
+			columns := make([]str, count)
+			for i := 0; i < count; i++ {
+				columns[i] = try k.cstr()
+				_ = try k.fixed(4); _ = try k.fixed(2)
+				oids[i] = try k.fixed(4)
+				_ = try k.fixed(2); _ = try k.fixed(4)
+				formats[i] = try k.fixed(2)
+				if formats[i] != 0 { fail "postgres: unexpected binary result format" }
+			}
+			try k.done()
+			first = !haveRows
+			if first { rows.Columns = columns; haveRows = true }
+			continue
+		}
+		if kind == 'D' {
+			count := try k.fixed(2)
+			if count != len(oids) { fail "postgres: row has incorrect column count" }
+			row := make([]Value, 0, count)
+			for i := 0; i < count; i++ {
+				rawLength := try k.fixed(4)
+				length := i64(i32(rawLength))
+				if length == -1 { row = append(row, Value.Null); continue }
+				text := try k.bytes(length)
+				if oids[i] == 20 || oids[i] == 21 || oids[i] == 23 {
+					number := try mint.Atoi(text)
+					row = append(row, Value.Int(number))
+				} else if oids[i] == 700 || oids[i] == 701 {
+					number := try mint.ParseFloat(text)
+					row = append(row, Value.Float(number))
+				} else if oids[i] == 16 {
+					if text == "t" { row = append(row, Value.Int(1)) } else if text == "f" { row = append(row, Value.Int(0)) } else { fail "postgres: invalid boolean result" }
+				} else { row = append(row, Value.Text(text)) }
+			}
+			try k.done()
+			if first { rows.Rows = append(rows.Rows, row) }
+			continue
+		}
+		if kind == 'C' {
+			tag := try k.cstr(); try k.done()
+			at := len(tag)
+			for at > 0 && tag[at-1] >= '0' && tag[at-1] <= '9' { at-- }
+			res.Affected = 0
+			if at < len(tag) && at > 0 && tag[at-1] == ' ' { res.Affected = try mint.Atoi(tag[at:]) }
+			continue
+		}
+		if kind == '1' { try k.done(); c[cParsed] = 1; continue }
+		if kind == '2' || kind == '3' || kind == 'n' || kind == 'I' { try k.done(); continue }
+		try status_message(c, mut k)
+	}
+}
+
+func clear_statements(c i64) ! {
+	st := c[cStmts]
+	for i := 0; i < c[cNStmts]; i++ {
+		e := st+8*stmtWords*i
+		begin_packet(c, 'C'); put_be(c, 'S', 1); put_cstr(c, name(e[4])); try end_packet(c)
+	}
+	begin_packet(c, 'S'); try end_packet(c); try flush(c)
+	_, _, err := read_result(c)
+	if err != nil { c[cSynced] = 0; fail err }
+	for i := 0; i < c[cNStmts]; i++ { free(st[i*stmtWords]); free(st[i*stmtWords+2]) }
+	c[cNStmts] = 0
+	c[cSynced] = 0
+}
+
+func bind_param(c i64, v qarg) {
+	switch v {
+	case Int(n): put_be(c, 8, 4); put_be(c, n, 8)
+	case Float(f): put_be(c, 8, 4); put_be(c, i64(gauge.F64bits(f)), 8)
+	case Str(s): put_be(c, len(s), 4); put_str(c, s)
+	case Bool(b): put_be(c, 1, 4); if b { put_be(c, 1, 1) } else { put_be(c, 0, 1) }
+	case Bytes(b): put_be(c, len(b), 4); put_raw(c, cast(i64, b)[2], len(b))
+	}
+}
+
+func run(c i64, q query) !(Rows, Result) {
+	if len(q.Parts) != len(q.Args)+1 { fail "postgres: invalid query parts" }
+	n := len(q.Args)*6
+	for _, part := range q.Parts { n += len(part) }
+	if len(q.Args) > 65535 || n > 16700000 { fail "postgres: statement too large" }
+	text := placeholders(q)
+	try no_nul(text)
+	// Validate before changing synchronization state; local failures can reuse the socket.
+	bytes := 64+len(q.Args)*16
+	for _, v := range q.Args {
+		switch v {
+		case Str(s): bytes += len(s)
+		case Bytes(b): bytes += len(b)
+		default:
+		}
+	}
+	if bytes > 16700000 { fail "postgres: parameters too large" }
+	c[cSynced] = 0
+	if len(q.Args) == 0 {
+		begin_packet(c, 'Q'); put_cstr(c, text); try end_packet(c); try flush(c)
+		return try read_result(c)
+	}
+	signature := make([]u8, 0, len(q.Args)*4)
+	for _, v := range q.Args {
+		signature = append(signature, mint.Itoa(param_oid(v))...)
+		signature = append(signature, ',')
+	}
+	sig := str(signature)
+	st := c[cStmts]
+	entry := 0
+	for i := 0; i < c[cNStmts]; i++ {
+		e := st+8*stmtWords*i
+		if e[1] == len(text) && e[3] == len(sig) && eq_raw(e[0], text) && eq_raw(e[2], sig) { entry = e; break }
+	}
+	if entry == 0 {
+		if c[cNStmts] == maxStmts { try clear_statements(c) }
+		c[cSerial]++
+		id := c[cSerial]
+		// Prepare separately: record only a confirmed Parse, even if a later Bind fails.
+		c[cParsed] = 0
+		begin_packet(c, 'P'); put_cstr(c, name(id)); put_cstr(c, text); put_be(c, len(q.Args), 2)
+		for _, v := range q.Args { put_be(c, param_oid(v), 4) }
+		try end_packet(c); begin_packet(c, 'S'); try end_packet(c); try flush(c)
+		_, _ = try read_result(c)
+		if c[cParsed] == 0 { c[cSynced] = 0; fail "postgres: missing ParseComplete" }
+		entry = st+8*stmtWords*c[cNStmts]
+		entry[0] = keep_raw(text); entry[1] = len(text)
+		entry[2] = keep_raw(sig); entry[3] = len(sig); entry[4] = id
+		c[cNStmts]++
+		c[cSynced] = 0
+	}
+	begin_packet(c, 'B'); put_cstr(c, ""); put_cstr(c, name(entry[4]))
+	put_be(c, 1, 2); put_be(c, 1, 2) // one binary format for all parameters
+	put_be(c, len(q.Args), 2)
+	for _, v := range q.Args { bind_param(c, v) }
+	put_be(c, 0, 2) // text results, decoded by OID
+	try end_packet(c)
+	begin_packet(c, 'D'); put_be(c, 'P', 1); put_cstr(c, ""); try end_packet(c)
+	begin_packet(c, 'E'); put_cstr(c, ""); put_be(c, 0, 4); try end_packet(c)
+	begin_packet(c, 'S'); try end_packet(c); try flush(c)
+	return try read_result(c)
+}
+
+func (c Client) exec(q query) !(Rows, Result) {
+	until := expiration(c.rec)
+	conn := try c.acquire(until)
+	conn[cUntil] = until
+	rows, res, err := run(conn, q)
+	if err != nil {
+		c.release(conn, conn[cSynced] != 0 && conn[cStatus] == 'I')
+		fail err
+	}
+	c.release(conn, conn[cStatus] == 'I')
+	return rows, res
+}
+
+// Query returns the first rowset. With no parameters, multiple statements are allowed
+// and all replies are consumed before returning. Integers and booleans use Value.Int;
+// float4/8 use Value.Float; other OIDs (including numeric and bytea) use Value.Text.
+func (c Client) Query(q query) !Rows {
+	rows, _ := try c.exec(q)
+	return rows
+}
+
+// Exec returns the affected count of the last command. Use Query with RETURNING
+// to obtain generated IDs (PostgreSQL has no connection-wide last insert ID).
+func (c Client) Exec(q query) !Result {
+	_, res := try c.exec(q)
+	return res
+}
+
+// Ping checks that the server answers.
+func (c Client) Ping() ! {
+	_ = try c.Exec("SELECT 1")
+}
+
+// Begin pins a connection until Commit or Rollback. SQL errors abort the transaction
+// until Rollback. Copies share its state: finishing one finishes them all. In request
+// tasks an unfinished transaction is dropped when its owning task/scope ends. Outside
+// tasks always finish explicitly. Tx and its rows belong to the caller's pool.
+func (c Client) Begin() !Tx {
+	until := expiration(c.rec)
+	conn := try c.acquire(until)
+	conn[cUntil] = until
+	_, _, err := run(conn, "BEGIN")
+	if err != nil {
+		c.release(conn, conn[cSynced] != 0 && conn[cStatus] == 'I')
+		fail err
+	}
+	state := rt_alloc(24)
+	state[0] = conn; state[1] = c.rec; state[2] = 1
+	rt_task_cleanup(abandon_tx, state)
+	return Tx{state: state}
+}
+
+func abandon_tx(state i64) {
+	if state[2] == 0 { return }
+	c := Client{open: true, rec: state[1]}
+	c.release(state[0], false)
+	state[2] = 0
+}
+
+func (t mut Tx) run(q query) !(Rows, Result) {
+	if t.state == 0 || t.state[2] == 0 { fail "postgres: the transaction is finished" }
+	c := Client{open: true, rec: t.state[1]}
+	conn := t.state[0]
+	conn[cUntil] = expiration(c.rec)
+	rows, res, err := run(conn, q)
+	if err != nil {
+		if conn[cSynced] == 0 { abandon_tx(t.state) } else if conn[cStatus] == 'I' { c.release(conn, true); t.state[2] = 0 }
+		fail err
+	}
+	// Explicit transaction-control SQL also ends ownership of this connection.
+	if conn[cStatus] == 'I' { c.release(conn, true); t.state[2] = 0 }
+	return rows, res
+}
+
+// Query runs a statement in the transaction and returns its first rowset.
+func (t mut Tx) Query(q query) !Rows {
+	rows, _ := try t.run(q)
+	return rows
+}
+
+// Exec runs a statement in the transaction and returns its affected count.
+func (t mut Tx) Exec(q query) !Result {
+	_, res := try t.run(q)
+	return res
+}
+
+// Commit makes the transaction's changes permanent. An aborted transaction must be
+// rolled back explicitly; PostgreSQL's implicit COMMIT-to-ROLLBACK is not success.
+func (t mut Tx) Commit() ! {
+	if t.state != 0 && t.state[2] != 0 && t.state[0][cStatus] == 'E' {
+		fail "postgres: transaction aborted; Rollback required"
+	}
+	_, _ = try t.run("COMMIT")
+}
+
+// Rollback undoes the transaction's changes and releases its connection.
+func (t mut Tx) Rollback() ! {
+	_, _ = try t.run("ROLLBACK")
+}
