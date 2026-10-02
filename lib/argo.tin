@@ -431,6 +431,10 @@ func rint(p mut Parser) i64 {
 		}
 		v = v*10 + d
 		i++
+		if v == 0 {
+			// A leading 0 is the whole number: in "007" the next byte is junk after a value.
+			break
+		}
 	}
 	if i < len(s) && (s[i] == '.' || s[i] == 'e' || s[i] == 'E') {
 		bad(mut p, "an integer (not a fraction)")
@@ -487,31 +491,83 @@ func ruint(p mut Parser) u64 {
 		}
 		v = v*10 + d
 		i++
+		if v == 0 {
+			break
+		}
 	}
 	p.i = i
 	return v
 }
 
-func rfloat(p mut Parser) f64 {
+// rnum consumes a number and returns where it starts. It matches RFC 8259's
+// -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)? as far as it goes, so "007" and "1.2.3"
+// end early and fail on the byte that follows, as junk after any value does.
+func rnum(p mut Parser) i64 {
 	ws(mut p)
 	s := p.s
-	i := p.i
-	start := i
+	at := p.i
+	i := at
 	if i < len(s) && s[i] == '-' {
 		i++
 	}
-	digits := 0
-	for i < len(s) && ((s[i] >= '0' && s[i] <= '9') || s[i] == '.' || s[i] == 'e' || s[i] == 'E' || s[i] == '+' || s[i] == '-') {
-		i++
-		digits++
+	if i < len(s) && s[i] == '0' {
+		p.i = i + 1
+	} else {
+		digits(mut p, i, "a number")
 	}
-	if digits == 0 {
-		bad(mut p, "a number")
+	if p.i < len(s) && s[p.i] == '.' {
+		digits(mut p, p.i+1, "a digit")
+	}
+	i = p.i
+	if i < len(s) && (s[i] == 'e' || s[i] == 'E') {
+		i++
+		if i < len(s) && (s[i] == '+' || s[i] == '-') {
+			i++
+		}
+		digits(mut p, i, "a digit")
+	}
+	return at
+}
+
+// digits consumes the digits at i; there must be at least one.
+func digits(p mut Parser, i i64, what str) {
+	s := p.s
+	j := i
+	for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+		j++
+	}
+	p.i = j
+	if j == i {
+		bad(mut p, what)
+	}
+}
+
+// rfloat reads a number that fits in f64 (1e400 is a fault, as in Go).
+func rfloat(p mut Parser) f64 {
+	at := rnum(mut p)
+	if p.err != nil {
 		return 0
 	}
-	t := s[start:i]
-	p.i = i
-	return strtod(cast(i64, t)+8, 0)
+	v := strtod(cast(i64, p.s[at:p.i])+8, 0)
+	if v > 1.7976931348623157e308 || v < -1.7976931348623157e308 {
+		p.i = at
+		bad(mut p, "a number that fits in f64")
+		return 0
+	}
+	return v
+}
+
+// rfloat32 reads a number that fits in f32.
+func rfloat32(p mut Parser) f32 {
+	at := p.i
+	v := f32(rfloat(mut p))
+	if f64(v) > 3.4028234663852886e38 || f64(v) < -3.4028234663852886e38 {
+		p.i = at
+		ws(mut p)
+		bad(mut p, "a number that fits in f32")
+		return 0
+	}
+	return v
 }
 
 func rbool(p mut Parser) bool {
@@ -566,6 +622,6 @@ func rskip(p mut Parser) {
 			bad(mut p, "a value")
 		}
 	} else {
-		rfloat(mut p)
+		rnum(mut p)
 	}
 }
