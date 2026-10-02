@@ -200,8 +200,19 @@ r := try wire.Get("http://127.0.0.1:8080/json")
 
 ## twine
 
-Package twine manipulates UTF-8 strings (like Go's strings); case helpers are ASCII/Latin-1 only.
+Package twine manipulates UTF-8 strings (like Go's strings), with Unicode case mapping, folding and white space from glyph's tables.
 
+- `Clone(s str) str`: Clone returns a copy of s that shares no memory with it.
+- `CutPrefix(s str, prefix str) (str, bool)`: CutPrefix returns s without the leading prefix and true, or s and false when it does not start with prefix.
+- `CutSuffix(s str, suffix str) (str, bool)`: CutSuffix returns s without the trailing suffix and true, or s and false when it does not end with suffix.
+- `SplitAfter(s str, sep str) []str`: SplitAfter slices s after every sep (into runes when sep is empty) and returns the pieces, each ending with sep.
+- `SplitAfterN(s str, sep str, n i64) []str`: SplitAfterN is SplitAfter returning at most n pieces (all when n < 0, none when n == 0).
+- `LastIndexAny(s str, chars str) i64`: LastIndexAny returns the byte offset of the last rune of s that is in chars, or -1.
+- `ToValidUTF8(s str, replacement str) str`: ToValidUTF8 returns s with each run of invalid UTF-8 bytes replaced by replacement.
+- `Lines(s str) []str`: Lines returns the lines of s, each ending with its newline ("\n", and a final line may lack one).
+- `type Replacer struct`: Replacer replaces a list of strings with replacements, in one pass over the text.
+- `NewReplacer(oldnew []str) Replacer`: NewReplacer returns a Replacer from a list of old, new string pairs. Replacements are made in the order they appear in the text, without overlapping matches; at one position the old strings are tried in argument order. An empty old string matches at the start and after every byte. It panics when the list has an odd length.
+- `(r Replacer) Replace(s str) str`: Replace returns s with all replacements performed.
 - `IndexByte(s str, c u8) i64`: IndexByte returns the byte offset of the first c in s, or -1.
 - `LastIndexByte(s str, c u8) i64`: LastIndexByte returns the byte offset of the last c in s, or -1.
 - `Index(s str, sub str) i64`: Index returns the byte offset of the first sub in s, or -1 (0 for an empty sub).
@@ -212,21 +223,17 @@ Package twine manipulates UTF-8 strings (like Go's strings); case helpers are AS
 - `HasSuffix(s str, suffix str) bool`: HasSuffix reports whether s ends with suffix.
 - `Split(s str, sep str) []str`: Split slices s around every sep (into runes when sep is empty) and returns the pieces.
 - `SplitN(s str, sep str, n i64) []str`: SplitN is Split returning at most n pieces (all when n < 0, none when n == 0).
-- `Fields(s str) []str`: Fields splits s around runs of ASCII white space and returns the non-empty pieces.
 - `Join(elems []str, sep str) str`: Join concatenates elems with sep between them.
 - `Repeat(s str, count i64) str`: Repeat returns s concatenated count times (empty when count <= 0; panics when the length overflows).
 - `Count(s str, sub str) i64`: Count returns the number of non-overlapping sub in s (RuneCount+1 when sub is empty).
 - `Replace(s str, old str, repl str, n i64) str`: Replace returns s with the first n non-overlapping old replaced by repl (all when n < 0; empty old matches at every rune boundary).
 - `ReplaceAll(s str, old str, repl str) str`: ReplaceAll returns s with every non-overlapping old replaced by repl.
-- `ToLower(s str) str`: ToLower returns s with ASCII upper-case letters lowered (other bytes unchanged).
-- `ToUpper(s str) str`: ToUpper returns s with ASCII lower-case letters raised (other bytes unchanged).
 - `TrimLeft(s str, cutset str) str`: TrimLeft returns s without its leading runes that are in cutset.
 - `TrimRight(s str, cutset str) str`: TrimRight returns s without its trailing runes that are in cutset.
 - `Trim(s str, cutset str) str`: Trim returns s without leading and trailing runes that are in cutset.
 - `TrimSpace(s str) str`: TrimSpace returns s without leading and trailing white space (ASCII, U+0085, U+00A0).
 - `TrimPrefix(s str, prefix str) str`: TrimPrefix returns s without the leading prefix, or s unchanged.
 - `TrimSuffix(s str, suffix str) str`: TrimSuffix returns s without the trailing suffix, or s unchanged.
-- `EqualFold(s str, t str) bool`: EqualFold reports whether s and t are equal under ASCII/Latin-1 simple case folding.
 - `Compare(a str, b str) i64`: Compare returns -1, 0 or 1 ordering a and b bytewise.
 - `IndexRune(s str, r i32) i64`: IndexRune returns the byte offset of the first r in s, or -1.
 - `ContainsRune(s str, r i32) bool`: ContainsRune reports whether rune r occurs in s.
@@ -242,7 +249,24 @@ Package twine manipulates UTF-8 strings (like Go's strings); case helpers are AS
 - `(b Builder) Len() i64`: Len returns the number of bytes accumulated.
 - `(b Builder) String() str`: String returns a copy of the accumulated bytes as a str.
 - `(b Builder) Bytes() []u8`: Bytes returns the accumulated bytes without copying (aliases the Builder).
+- `(b Builder) Cap() i64`: Cap returns the number of bytes the Builder can hold without growing.
+- `(b mut Builder) Grow(n i64)`: Grow makes room for n more bytes.
+- `(b mut Builder) Write(p []u8)`: Write appends p.
 - `(b mut Builder) Reset()`: Reset empties the Builder but keeps its capacity.
+- `Map(mapping func(i32) i32, s str) str`: Map returns s with every rune replaced by mapping(rune); a rune mapped to a negative value is dropped. Invalid UTF-8 bytes reach mapping as U+FFFD, and a rune mapped to it is written as U+FFFD.
+- `ToUpper(s str) str`: ToUpper returns s with every letter mapped to upper case.
+- `ToLower(s str) str`: ToLower returns s with every letter mapped to lower case.
+- `ToTitle(s str) str`: ToTitle returns s with every letter mapped to title case.
+- `Title(s str) str`: Title returns s with the first letter of each word mapped to title case. It cannot tell where words start in every script (the apostrophe in "they're" starts one): it is Go's deprecated strings.Title.
+- `EqualFold(s str, t str) bool`: EqualFold reports whether s and t are equal under Unicode simple case folding.
+- `Fields(s str) []str`: Fields splits s around runs of white space (Unicode's) and returns the non-empty pieces.
+- `FieldsFunc(s str, f func(i32) bool) []str`: FieldsFunc splits s around runs of runes for which f is true and returns the non-empty pieces.
+- `IndexFunc(s str, f func(i32) bool) i64`: IndexFunc returns the byte offset of the first rune for which f is true, or -1.
+- `LastIndexFunc(s str, f func(i32) bool) i64`: LastIndexFunc returns the byte offset of the last rune for which f is true, or -1.
+- `ContainsFunc(s str, f func(i32) bool) bool`: ContainsFunc reports whether f is true for any rune of s.
+- `TrimLeftFunc(s str, f func(i32) bool) str`: TrimLeftFunc returns s without the leading runes for which f is true.
+- `TrimRightFunc(s str, f func(i32) bool) str`: TrimRightFunc returns s without the trailing runes for which f is true.
+- `TrimFunc(s str, f func(i32) bool) str`: TrimFunc returns s without the leading and trailing runes for which f is true.
 
 ## glyph
 

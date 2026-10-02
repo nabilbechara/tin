@@ -27,7 +27,7 @@ Transform:
 - `ToLower(s str) str`, `ToUpper(s str) str` — ASCII only, return s itself when nothing changes
 - `Trim/TrimLeft/TrimRight(s, cutset str) str` (cutset is a set of runes), `TrimSpace(s str) str`
   (ASCII space, \t \n \v \f \r, plus U+0085 and U+00A0), `TrimPrefix`, `TrimSuffix`
-- `EqualFold(s, t str) bool` — ASCII + Latin-1 simple folding via glyph.ToLower
+- `EqualFold(s, t str) bool` — Unicode simple folding (SimpleFold orbits)
 
 Builder (struct holding `buf []u8`; `Builder{}` is usable, `NewBuilder(n)` preallocates):
 - mut: `Str(s str)`, `Byte(c u8)`, `Rune(r i32)`, `Int(v i64)`, `Reset()`

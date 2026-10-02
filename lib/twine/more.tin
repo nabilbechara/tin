@@ -1,0 +1,176 @@
+package twine
+
+import "glyph"
+
+// Clone returns a copy of s that shares no memory with it.
+func Clone(s str) str {
+	if len(s) == 0 {
+		return ""
+	}
+	return str([]u8(s))
+}
+
+// CutPrefix returns s without the leading prefix and true, or s and false when it does not start
+// with prefix.
+func CutPrefix(s str, prefix str) (str, bool) {
+	if !HasPrefix(s, prefix) {
+		return s, false
+	}
+	return s[len(prefix):], true
+}
+
+// CutSuffix returns s without the trailing suffix and true, or s and false when it does not end with
+// suffix.
+func CutSuffix(s str, suffix str) (str, bool) {
+	if !HasSuffix(s, suffix) {
+		return s, false
+	}
+	return s[:len(s)-len(suffix)], true
+}
+
+// SplitAfter slices s after every sep (into runes when sep is empty) and returns the pieces, each
+// ending with sep.
+func SplitAfter(s str, sep str) []str {
+	return SplitAfterN(s, sep, -1)
+}
+
+// SplitAfterN is SplitAfter returning at most n pieces (all when n < 0, none when n == 0).
+func SplitAfterN(s str, sep str, n i64) []str {
+	out := make([]str, 0, 8)
+	if n == 0 {
+		return out
+	}
+	if len(sep) == 0 {
+		return explode(s, n)
+	}
+	start := 0
+	for n < 0 || len(out) < n-1 {
+		i := indexAt(s, sep, start)
+		if i < 0 {
+			break
+		}
+		out = append(out, s[start:i+len(sep)])
+		start = i + len(sep)
+	}
+	out = append(out, s[start:])
+	return out
+}
+
+// LastIndexAny returns the byte offset of the last rune of s that is in chars, or -1.
+func LastIndexAny(s str, chars str) i64 {
+	if len(chars) == 0 {
+		return -1
+	}
+	end := len(s)
+	for end > 0 {
+		r, size := glyph.DecodeLastRune(s, end)
+		end -= size
+		if IndexRune(chars, r) >= 0 {
+			return end
+		}
+	}
+	return -1
+}
+
+// ToValidUTF8 returns s with each run of invalid UTF-8 bytes replaced by replacement.
+func ToValidUTF8(s str, replacement str) str {
+	b := NewBuilder(len(s))
+	invalid := false
+	i := 0
+	for i < len(s) {
+		if s[i] < 0x80 {
+			invalid = false
+			b.Byte(s[i])
+			i++
+			continue
+		}
+		r, size := glyph.DecodeRune(s, i)
+		if r == glyph.RuneError && size == 1 {
+			if !invalid {
+				invalid = true
+				b.Str(replacement)
+			}
+			i++
+			continue
+		}
+		invalid = false
+		b.Str(s[i : i+size])
+		i += size
+	}
+	return b.String()
+}
+
+// Lines returns the lines of s, each ending with its newline ("\n", and a final line may lack one).
+func Lines(s str) []str {
+	out := make([]str, 0, 8)
+	for len(s) > 0 {
+		i := IndexByte(s, '\n')
+		if i < 0 {
+			out = append(out, s)
+			break
+		}
+		out = append(out, s[:i+1])
+		s = s[i+1:]
+	}
+	return out
+}
+
+// ---- Replacer ----
+
+// Replacer replaces a list of strings with replacements, in one pass over the text.
+type Replacer struct {
+	pairs []str
+}
+
+// NewReplacer returns a Replacer from a list of old, new string pairs. Replacements are made in the
+// order they appear in the text, without overlapping matches; at one position the old strings are tried
+// in argument order. An empty old string matches at the start and after every byte. It panics when the
+// list has an odd length.
+func NewReplacer(oldnew []str) Replacer {
+	if len(oldnew)%2 == 1 {
+		panic("strings.NewReplacer: odd argument count")
+	}
+	pairs := make([]str, 0, len(oldnew))
+	pairs = append(pairs, oldnew...)
+	return Replacer{pairs: pairs}
+}
+
+// Replace returns s with all replacements performed.
+func (r Replacer) Replace(s str) str {
+	b := NewBuilder(len(s))
+	last := 0
+	prevEmpty := false
+	i := 0
+	for i <= len(s) {
+		found := -1
+		for k := 0; k < len(r.pairs); k += 2 {
+			old := r.pairs[k]
+			if len(old) == 0 {
+				if prevEmpty {
+					continue
+				}
+				found = k
+				break
+			}
+			if len(old) <= len(s)-i && s[i:i+len(old)] == old {
+				found = k
+				break
+			}
+		}
+		if found < 0 {
+			prevEmpty = false
+			i++
+			continue
+		}
+		old := r.pairs[found]
+		prevEmpty = len(old) == 0
+		b.Str(s[last:i])
+		b.Str(r.pairs[found+1])
+		i += len(old)
+		last = i
+	}
+	if last < len(s) {
+		b.Str(s[last:])
+	}
+	return b.String()
+}

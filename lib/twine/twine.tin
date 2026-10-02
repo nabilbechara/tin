@@ -1,4 +1,5 @@
-// Package twine manipulates UTF-8 strings (like Go's strings); case helpers are ASCII/Latin-1 only.
+// Package twine manipulates UTF-8 strings (like Go's strings), with Unicode case mapping, folding and white
+// space from glyph's tables.
 package twine
 
 import "glyph"
@@ -174,27 +175,6 @@ func isSpaceByte(c u8) bool {
 	return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 0x0b || c == 0x0c
 }
 
-// Fields splits s around runs of ASCII white space and returns the non-empty pieces.
-func Fields(s str) []str {
-	out := make([]str, 0, 8)
-	n := len(s)
-	i := 0
-	for i < n {
-		for i < n && isSpaceByte(s[i]) {
-			i++
-		}
-		if i >= n {
-			break
-		}
-		start := i
-		for i < n && !isSpaceByte(s[i]) {
-			i++
-		}
-		out = append(out, s[start:i])
-	}
-	return out
-}
-
 // Join concatenates elems with sep between them.
 func Join(elems []str, sep str) str {
 	n := len(elems)
@@ -313,52 +293,6 @@ func ReplaceAll(s str, old str, repl str) str {
 	return Replace(s, old, repl, -1)
 }
 
-// ToLower returns s with ASCII upper-case letters lowered (other bytes unchanged).
-func ToLower(s str) str {
-	n := len(s)
-	i := 0
-	for i < n && !(s[i] >= 'A' && s[i] <= 'Z') {
-		i++
-	}
-	if i == n {
-		return s
-	}
-	p := rt_str_new(n)
-	d := p + 8
-	memcpy(d, cast(i64, s)+8, n)
-	for i < n {
-		c := s[i]
-		if c >= 'A' && c <= 'Z' {
-			store8(d+i, i64(c)+32)
-		}
-		i++
-	}
-	return cast(str, p)
-}
-
-// ToUpper returns s with ASCII lower-case letters raised (other bytes unchanged).
-func ToUpper(s str) str {
-	n := len(s)
-	i := 0
-	for i < n && !(s[i] >= 'a' && s[i] <= 'z') {
-		i++
-	}
-	if i == n {
-		return s
-	}
-	p := rt_str_new(n)
-	d := p + 8
-	memcpy(d, cast(i64, s)+8, n)
-	for i < n {
-		c := s[i]
-		if c >= 'a' && c <= 'z' {
-			store8(d+i, i64(c)-32)
-		}
-		i++
-	}
-	return cast(str, p)
-}
-
 // cutRune returns the size of the rune at s[i] when it is in cutset, else 0.
 func cutRune(s str, i i64, cutset str) i64 {
 	c := s[i]
@@ -368,8 +302,8 @@ func cutRune(s str, i i64, cutset str) i64 {
 		}
 		return 0
 	}
-	_, size := glyph.DecodeRune(s, i)
-	if Contains(cutset, s[i:i+size]) {
+	r, size := glyph.DecodeRune(s, i)
+	if IndexRune(cutset, r) >= 0 {
 		return size
 	}
 	return 0
@@ -407,8 +341,8 @@ func TrimRight(s str, cutset str) str {
 			end--
 			continue
 		}
-		_, size := glyph.DecodeLastRune(s, end)
-		if !Contains(cutset, s[end-size:end]) {
+		r, size := glyph.DecodeLastRune(s, end)
+		if IndexRune(cutset, r) < 0 {
 			break
 		}
 		end -= size
@@ -475,40 +409,6 @@ func TrimSuffix(s str, suffix str) str {
 	return s
 }
 
-// lowerByte lowers an ASCII upper-case byte.
-func lowerByte(c u8) u8 {
-	if c >= 'A' && c <= 'Z' {
-		return c + 32
-	}
-	return c
-}
-
-// EqualFold reports whether s and t are equal under ASCII/Latin-1 simple case folding.
-func EqualFold(s str, t str) bool {
-	i := 0
-	j := 0
-	for i < len(s) && j < len(t) {
-		cs := s[i]
-		ct := t[j]
-		if cs < 0x80 && ct < 0x80 {
-			if cs != ct && lowerByte(cs) != lowerByte(ct) {
-				return false
-			}
-			i++
-			j++
-			continue
-		}
-		rs, ns := glyph.DecodeRune(s, i)
-		rt2, nt := glyph.DecodeRune(t, j)
-		if rs != rt2 && glyph.ToLower(rs) != glyph.ToLower(rt2) {
-			return false
-		}
-		i += ns
-		j += nt
-	}
-	return i == len(s) && j == len(t)
-}
-
 // Compare returns -1, 0 or 1 ordering a and b bytewise.
 func Compare(a str, b str) i64 {
 	la := len(a)
@@ -539,6 +439,21 @@ func Compare(a str, b str) i64 {
 func IndexRune(s str, r i32) i64 {
 	if r >= 0 && r < 0x80 {
 		return IndexByte(s, u8(r))
+	}
+	if r == glyph.RuneError {
+		// Matches an invalid byte as well as a real U+FFFD.
+		i := 0
+		for i < len(s) {
+			c, size := glyph.DecodeRune(s, i)
+			if c == glyph.RuneError {
+				return i
+			}
+			i += size
+		}
+		return -1
+	}
+	if !glyph.ValidRune(r) {
+		return -1
 	}
 	return Index(s, glyph.RuneStr(r))
 }
@@ -651,6 +566,28 @@ func (b Builder) String() str {
 // Bytes returns the accumulated bytes without copying (aliases the Builder).
 func (b Builder) Bytes() []u8 {
 	return b.buf
+}
+
+// Cap returns the number of bytes the Builder can hold without growing.
+func (b Builder) Cap() i64 {
+	return cap(b.buf)
+}
+
+// Grow makes room for n more bytes.
+func (b mut Builder) Grow(n i64) {
+	if n < 0 {
+		panic("strings.Builder.Grow: negative count")
+	}
+	if cap(b.buf)-len(b.buf) < n {
+		grown := make([]u8, len(b.buf), 2*cap(b.buf)+n)
+		copy(grown, b.buf)
+		b.buf = grown
+	}
+}
+
+// Write appends p.
+func (b mut Builder) Write(p []u8) {
+	b.buf = append(b.buf, p...)
 }
 
 // Reset empties the Builder but keeps its capacity.
