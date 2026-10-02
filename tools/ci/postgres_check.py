@@ -125,6 +125,9 @@ class Session:
         self.sql, self.vals, self.oids = b'', [], []
         self.user = b''
         self.s.settimeout(10)
+        # PostgreSQL disables Nagle: separate small protocol replies must not wait
+        # for Linux delayed ACKs (otherwise each Parse/Sync costs ~40ms).
+        self.s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
     def receive(self, n):
         out = b''
