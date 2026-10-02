@@ -10,7 +10,7 @@ import tarfile
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = ('darwin-arm64', 'linux-arm64', 'linux-amd64')
-TREES = ('lib', 'selfhost', 'bootstrap', 'tools', 'tests', 'docs', 'examples', 'bench')
+TREES = ('lib', 'selfhost', 'tools', 'tests', 'docs', 'examples', 'bench')
 
 
 def version_name(value):

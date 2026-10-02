@@ -1,7 +1,7 @@
 #!/bin/sh
 # Check that a compiler running on Linux defaults to its own CPU (issue #15): for amd64 and
-# arm64, cross-build tinc, then in a container of that CPU compile a legacy test, a strict
-# test and tinc itself with no -target, check e_machine, run the results and reach a fixed point.
+# arm64, cross-build tinc, then in a container of that CPU compile a strict test and tinc
+# itself with no -target, check e_machine, run the results and reach a fixed point.
 cd "$(dirname "$0")/../.." || exit 1
 tinc=${1:-bin/tinc}
 self=$(make -s print-SELF_LINUX)
@@ -18,9 +18,6 @@ for arch in amd64 arm64; do
     set -e
     em() { od -An -tu2 -j18 -N2 "$1" | tr -d " "; }
     t=/w/tinc-'$arch'
-    $t -o /w/arith-'$arch' lib/std.tin tests/arith.tin
-    [ "$(em /w/arith-'$arch')" = '$machine' ] || { echo "legacy e_machine $(em /w/arith-'$arch')"; exit 1; }
-    /w/arith-'$arch' > /dev/null
     $t -o /w/hello-'$arch' tests/v2/hello.tin
     [ "$(em /w/hello-'$arch')" = '$machine' ] || { echo "strict e_machine $(em /w/hello-'$arch')"; exit 1; }
     /w/hello-'$arch' | LC_ALL=C sort | cmp - tests/v2/hello.out

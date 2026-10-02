@@ -6,7 +6,6 @@ Every push to `main` and every pull request runs native Linux arm64 (`ubuntu-24.
 
 - Clean build from the committed seed and two byte-identical self-hosted compiler rebuilds.
 - Every `tests/v2/*.tin`, including negative compilation tests and their exact diagnostics. Missing expected output, compiler crashes, process crashes, nonzero exit and timeouts fail. Each run uses fresh executable paths.
-- Legacy native-executable compatibility on every platform; original Go bootstrap and assembly linkage on macOS (the original bootstrap emits Darwin assembly).
 - Memory regressions: bounds panics, allocation size overflow and negative lengths, large first allocations, single evaluation of allocation lengths, read-only and region checking through indirect calls, nested zero values, deep `keep` ownership and 200 request-pool reset/reuse cycles.
 - Linux HTTP framing/conformance, stable RSS over two million requests after warmup, and graceful shutdown. Throughput is reported, never used as a performance threshold.
 - Request tasks (`task_check.py`): waits on one core overlap, fast requests stay fast behind waiting ones (timers, proxied `wire` calls, helper-thread file I/O), deadlines give 504, refused upstreams 502, and pipelined responses keep their order.
@@ -45,7 +44,6 @@ python3 -m unittest discover -s tools/ci -p 'test_*.py' -v
 tools/v2test.sh bin/tinc
 python3 tools/ci/regressions.py
 python3 tools/ci/regressions.py --audit   # network; GH_TOKEN optional for public issues
-TINC="$PWD/bin/tinc" go test -count=1 ./bootstrap
 python3 tools/ci/http_check.py            # Linux HTTP/RSS/shutdown
 python3 tools/ci/task_check.py            # request tasks, deadlines, helpers
 python3 tools/ci/router_check.py          # routed server: parameters, middleware, 404/405 under load

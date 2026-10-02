@@ -36,15 +36,8 @@ bootstrap: bin/tinc
 seed: bootstrap
 	cp bin/s3/tinc $(SEED)
 
-# Stage 0, the original Go compiler: kept for history and the test harness.
-bin/tinc0: $(wildcard bootstrap/*.go)
-	go build -o $@ ./bootstrap
-
-test: bin/tinc0 bin/tinc
+test: bin/tinc
 	tools/v2test.sh bin/tinc
-	go test -count=1 ./bootstrap
-	TINC=$(CURDIR)/bin/tinc go test -count=1 ./bootstrap
-	TINC=$(CURDIR)/bin/tinc TINC_ASM=1 go test -count=1 ./bootstrap
 
 bench: bin/tinc
 	bench/run.py

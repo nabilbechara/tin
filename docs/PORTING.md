@@ -4,7 +4,7 @@
 |---|---|---|---|
 | darwin-arm64 | complete | Mach-O, ad-hoc signed, linked to libSystem | the original target |
 | linux-arm64 | complete: all tests pass, self-hosts, server passes conformance; tested natively in CI | ELF PIE linked to glibc ≥ 2.34 (tested on 2.36 and 2.41) | container limits, graceful shutdown, `examples/k8s/` |
-| linux-amd64 | complete: all strict, regression and legacy tests pass and it self-hosts; tested natively in CI | ELF PIE (x86-64), glibc ≥ 2.34 | performance benchmarks on dedicated x86-64 hardware remain pending |
+| linux-amd64 | complete: all strict and regression tests pass and it self-hosts; tested natively in CI | ELF PIE (x86-64), glibc ≥ 2.34 | performance benchmarks on dedicated x86-64 hardware remain pending |
 
 Choose a target with `tin build --target T` or `tinc -target T`; the default is the
 machine the compiler runs on. One compiler binary contains every backend.

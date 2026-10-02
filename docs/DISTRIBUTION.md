@@ -28,7 +28,7 @@ For a manual install, download `tin-0.4.0-<target>.tar.gz` and `SHA256SUMS` from
 same release, verify the SHA-256 digest, extract it and put its root directory on PATH.
 The archive includes `bin/tinc`, all libraries, compiler sources, tests and the matching
 seed. Moving the whole extracted tree is safe. Python 3 and make are needed for the
-compiler's suites/bootstrap; Go is needed only for the legacy harness and Go benchmarks.
+compiler's suites/bootstrap; Go is needed only for the HTTP conformance tools and Go benchmarks.
 
 ## Compile with Docker
 
