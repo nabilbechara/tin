@@ -677,7 +677,9 @@ What the checker tracks:
   helper that stores its argument into a global makes its callers `keep`; passing a
   global to a function that stores request memory into that parameter is an error at the
   call (`put stores request memory into its mut parameter 'b', but this argument may be
-  long-lived: keep() the stored values inside put`);
+  long-lived: keep() the stored values inside put`; for a standard-library function, which the
+  caller cannot change, `... pass request memory (a local) instead`, as for an
+  `anvil.Router` held in a global and changed in `main`);
 - `keep` results, globals and constants are long-lived; literals are static.
 
 Plain programs (no server) never reset their pool: memory is released when the program
@@ -700,7 +702,8 @@ There are no goroutines and no shared mutable state.
   queue); `relay.Recv()` blocks for the next one, `relay.TryRecv()` polls,
   `relay.Broadcast(msg)` sends to every other core. Encode structs with `argo.Put` /
   `argo.Get`.
-- `anvil.Serve` runs one HTTP event loop per core; a connection stays on one core.
+- `anvil.Serve` runs one HTTP event loop per core; a connection stays on one core. A
+  `Router` built in `main` is compiled once by `r.Serve` into a table every core reads.
   `anvil.OnRelay(h)` and `anvil.OnTick(ms, h)` run handlers on server cores between
   requests.
 
@@ -808,6 +811,9 @@ say.Line("literal {{braces}} and 100%") // {{ and }} are braces; % needs no esca
   `{x:5}`, `{x:-8}`, `{x:05}`, `{x:x}`, `{x:q}`, `{x:.3e}`. Without a verb the value is
   printed as `%v`, and a precision on a float means decimal places (`{pi:.2}` is `3.14`).
 - A lone `}` is an error (write `}}`), and so is an unclosed `{`.
+- Text with braces of its own, like an anvil route pattern, is a raw string:
+  ``r.Get(`/users/{id}`, user)``. In `"/users/{id}"` the `{id}` would be a value; when no `id`
+  is in scope the compiler says so (`undefined: id (in a string, {id} is a value: ...)`).
 
 ### Queries
 

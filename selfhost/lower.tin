@@ -3484,6 +3484,12 @@ fn chk_query(e, want) {
     return chk_kind(e, want);
 }
 
+// interp_name_known reports whether a name inside {...} in a string resolves: chk_ident
+// would not report it undefined.
+fn interp_name_known(name) {
+    return streq(name, "true") || streq(name, "false") || lookup_name(name) || import_pkg(name);
+}
+
 fn chk_interp(e, want) {
     let pos = e[N_POS];
     let parts = e[INTERP_PARTS];
@@ -3506,6 +3512,17 @@ fn chk_interp(e, want) {
         }
         if i < vals[VEC_LEN] {
             let a = vec_get(vals, i);
+            if a[N_KIND] == EX_IDENT && !interp_name_known(a[ID_NAME]) {
+                // Often meant as literal text, like a route pattern's {id}.
+                let u = err_begin(a[N_POS]);
+                buf_str(u, "undefined: ");
+                buf_str(u, a[ID_NAME]);
+                buf_str(u, " (in a string, {");
+                buf_str(u, a[ID_NAME]);
+                buf_str(u, "} is a value: write {{ for a brace, or use a `raw` string)");
+                err_end(u);
+                replace_node(a, mk_int(a[N_POS], 0, 0));
+            }
             let t = chk(a, 0);
             let spec = vec_get(specs, i);
             buf_byte(f, '%');

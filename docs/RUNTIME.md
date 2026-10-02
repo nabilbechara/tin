@@ -316,6 +316,77 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   key, fetched once per Client, encrypts the password with `seal.EncryptOAEPSha1`) and
   `mysql_native_password`, including auth-switch requests.
 
+### Routing: Router
+
+```go
+r := anvil.NewRouter()
+r.Use(logged)                                  // middleware, around every route below
+r.Get(`/users/{id}`, user)                     // patterns with {...} are raw strings
+r.Get(`/static/{path...}`, files)              // the rest of the path; * is the same, named "*"
+r.Route("/admin", func(g mut anvil.Router) {   // a group: a new router mounted at /admin
+	g.Use(auth)
+	g.Delete(`/users/{id}`, remove)
+})
+r.Mount("/v2", v2)                             // another router's routes under /v2
+r.NotFound(missing)                            // the status is already 404
+err := r.Serve(":8080")                        // fails first if a pattern is bad (r.Check)
+```
+
+**Matching.**
+- A pattern is a path split at `/`: a static segment matches itself, `{name}` any one
+  non-empty segment, and a last `{name...}` or `*` the rest of the path, possibly empty
+  (`/static/` matches it, `/static` does not). A trailing slash is part of the path:
+  `/users` and `/users/` are different routes, and no redirect is made.
+- Segment by segment, a static child is tried first, then the `{name}` child, then the
+  catch-all, going back when a branch has no route for the rest of the path; so
+  `/users/new` beats `/users/{id}` whatever the order of registration, and
+  `/users/new/posts/3` still reaches `/users/{id}/posts/{post}`.
+- The method takes part: a node only matches with a route for the request's method, then
+  GET's for a HEAD request (the body is dropped when written), then `Any`'s. When no route
+  matches but routes take the path with other methods, the answer is 405 with `Allow`
+  (their names in order, HEAD wherever GET is); otherwise 404.
+- Static segments are compared with the path as sent (still %-encoded). `q.PathParam` reads
+  the matched segment, %-decoded (`%2F` gives `/` inside one parameter, `+` stays `+`), and
+  `q.Pattern()` the route's whole pattern, for logs and metrics.
+- Errors are found before serving (`r.Check()`, `Serve`, `Run`): a pattern not starting
+  with `/`, a brace inside a static segment, a catch-all before the end, a bad or repeated
+  parameter name, a bad method, two routes for the same method whose patterns match the
+  same paths (`/users/{id}` and `/users/{uid}`), a mount prefix that ends in `/` or a
+  catch-all, two routers mounted at the same prefix, and a router mounted inside itself.
+
+**Groups and middleware.**
+- A mounted router's patterns are its prefix plus its own (`""` is the prefix itself), and
+  its chain is the outer routers' middleware, then its own, in the order added; `Use`
+  covers every route of its router, whenever it is called.
+- A miss is answered by the deepest router (scope) whose prefix starts the path, through
+  that router's chain, with its `NotFound` / `MethodNotAllowed` handler or the nearest one
+  around it (defaults: `Not Found`, `Method Not Allowed`).
+- Middleware is a top-level function `func(Req, mut Out, next func(Req, mut Out))`; literals
+  cannot capture, so `next` is one anvil function, and the chain's position lives in the
+  `Out` (`ep`, the endpoint, and `ci`, the next middleware). A middleware may skip `next`,
+  call it more than once, or wait before or after it. It hands data to later handlers with
+  `w.SetValue(key, value)` / `w.Value(key)`, a list made on first use in the request's pool.
+
+**The table.**
+- Routers are built in `main` (request-pool memory) or by a function a global's initializer
+  calls. `Serve` compiles one into an `rtable`: a flat trie (nodes, with indexes for children
+  so the type is not recursive and `keep` can copy it), the endpoints (handler, middleware
+  chain, pattern, parameter names and segments), one scope per router, and the method names
+  (codes 0–8 for GET … TRACE, the others after them; masks hold up to 63).
+- The table is `keep`ed into core 0's ingot heap and published in `shared var gRoutes`
+  before the cores start; no core writes it afterwards. `run_request` calls
+  `dispatch(gRoutes)` instead of the handler, which sets `q.ep` (for `PathParam` and
+  `Pattern`) and starts the chain. Matching reads the path in place and allocates nothing.
+- Static children are scanned when a node has up to 8, else found through an FNV-1a hash
+  table; the method code comes from a switch on the first byte.
+- `Run(method, target, body)` and `Match(method, path)` serve tests on the calling thread.
+  They reuse their compiled table until any router changes (a per-core counter that every
+  change bumps).
+- Cost (bench/router, Apple M4 Pro): 15–25 ns per lookup with 1, 20 or 200 routes (chi:
+  33–65 ns); 38–49 ns for a whole `Run` (chi's ServeHTTP: 176–212 ns). Served on one core
+  with 16 pipelined requests per write, routing adds 10–15 ns of CPU to the 516 ns a request
+  takes (see PERFORMANCE.md).
+
 ### Pooled clients: postgres
 
 - `postgres.Client` keeps a FIFO pool per core (`Options.Pool`, default 16). Socket

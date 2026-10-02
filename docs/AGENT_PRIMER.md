@@ -48,6 +48,16 @@ the compiler: write a minimal repro to notes/compiler_bugs_NAME.md and work arou
 - In anvil each request runs in its own task: a call that waits (tide.Wait, wire, quarry files, redis,
   mysql, websocket Read) lets the core serve others. Requests have a deadline (TIN_DEADLINE_MS, default
   30 s); waits past it fail with "deadline exceeded".
+- Services route with `r := anvil.NewRouter()` in main: ``r.Get(`/users/{id}`, user)`` (Post, Put, Patch,
+  Delete, Head, Options, Handle(method, ...), Any), `q.PathParam("id")` (%-decoded), a last `{path...}` or
+  `*` for the rest; patterns with {...} are raw strings. Static beats {name} beats the rest whatever the
+  order; a wrong method gets 405 + Allow, HEAD falls back to GET, a trailing slash is significant.
+  `r.Use(mw)`, mw a top-level `func(q anvil.Req, w mut anvil.Out, next func(anvil.Req, mut anvil.Out))`
+  that calls `next(q, mut w)`; it hands data on with `w.SetValue(k, v)` / `w.Value(k)`. Groups:
+  `r.Route("/api", func(g mut anvil.Router) { g.Use(auth); g.Get(...) })`, `r.Mount("/v2", sub)`;
+  `r.NotFound(h)`, `r.MethodNotAllowed(h)`. `err := r.Serve(":8080")` fails first on a bad or
+  conflicting pattern (`r.Check()`). Test without a server: `w := r.Run("GET", "/users/7", "")` then
+  `w.Code()`, `w.Header("Allow")`, `str(w.Body)`; `r.Match(method, path)` is the pattern that would serve.
 - Memory: no GC. Allocations during a request go to the core's request pool (wiped per request);
   globals live in the long-lived ingot heap. Storing request memory into a global (or anything a global
   holds) without `keep(x)` is a compile error. keep() deep-copies into the ingot heap.
@@ -57,7 +67,8 @@ the compiler: write a minimal repro to notes/compiler_bugs_NAME.md and work arou
   + newline; say.Text(...) no spaces/newline; say.Out(fmt, ...) printf; say.Fmt(fmt, ...) -> str;
   say.Str(x) -> str; verbs %d %s %q %v %x %f %5.2f %-4s etc. Floats print like Go's %v.
 - Strings interpolate: "user {u.Name} has {n} items", "{price:.2} {id:x} [{name:-8}]"; {{ and }} are braces;
-  no quotes inside {...}; `raw` backquote strings do not interpolate.
+  no quotes inside {...}; `raw` backquote strings do not interpolate (use them for text with braces of
+  its own, like the route pattern `/users/{id}`).
 - Queries: where a parameter has type `query`, a literal keeps its values apart from its text:
   `db.Query("SELECT name FROM users WHERE id = {id}")` binds id, `cache.Do("SET user:{id} {body}")`
   sends three arguments. Passing a `str` there is a compile error; values must be integers, floats,
@@ -90,7 +101,7 @@ rt_ingot_alloc(n), rt_core_id(), rt_errno(). Prefer plain Tin over raw tricks un
 Keep comments one line, ending with a period.
 
 ## Standard library (import instead of re-implementing)
-say(fmt) twine(strings) glyph(utf8) mint(strconv) argo(JSON) anvil(HTTP server) wire(TCP, HTTP client)
+say(fmt) twine(strings) glyph(utf8) mint(strconv) argo(JSON) anvil(HTTP server, router) wire(TCP, HTTP client)
 hearth(cores) relay(cross-core messages) tide(time) quarry(os/files/env) trail(paths) lever(flags/args)
 sift(sort/search) cairn(containers) gauge(math) dice(random) stamp(non-crypto hashes) seal(SHA-256,
 HMAC, base64, hex, RSA-OAEP) ore(bytes) flume(buffered I/O) herald(logging) crucible(testing)

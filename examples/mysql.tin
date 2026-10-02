@@ -36,63 +36,69 @@ func fail_with(w mut anvil.Out, err fault) {
 	w.Text("{err}")
 }
 
-func handle(q anvil.Req, w mut anvil.Out) {
-	if q.Path == "/user" {
-		id := mint.Atoi(q.Param("id")) catch _ { -1 }
-		rows := db.Query("SELECT id, name FROM users WHERE id = {id}") catch err {
-			fail_with(mut w, err)
-			return
-		}
-		if len(rows.Rows) == 0 {
-			w.Status(404)
-			w.Text("no user {id}")
-			return
-		}
-		r := rows.Rows[0]
-		w.Json()
-		argo.Put(mut w.Body, User{id: r[0].Int(), name: r[1].Text()})
+func user(q anvil.Req, w mut anvil.Out) {
+	id := mint.Atoi(q.Param("id")) catch _ { -1 }
+	rows := db.Query("SELECT id, name FROM users WHERE id = {id}") catch err {
+		fail_with(mut w, err)
 		return
 	}
-	if q.Path == "/add" {
-		name := q.Param("name")
-		res := db.Exec("INSERT INTO users (name) VALUES ({name})") catch err {
-			fail_with(mut w, err)
-			return
-		}
-		w.Text("{res.LastID}")
+	if len(rows.Rows) == 0 {
+		w.Status(404)
+		w.Text("no user {id}")
 		return
 	}
-	if q.Path == "/count" {
-		rows := db.Query("SELECT COUNT(*) FROM users") catch err {
-			fail_with(mut w, err)
-			return
-		}
-		w.Text(rows.Rows[0][0].Text())
+	r := rows.Rows[0]
+	w.Json()
+	argo.Put(mut w.Body, User{id: r[0].Int(), name: r[1].Text()})
+}
+
+func add(q anvil.Req, w mut anvil.Out) {
+	name := q.Param("name")
+	res := db.Exec("INSERT INTO users (name) VALUES ({name})") catch err {
+		fail_with(mut w, err)
 		return
 	}
-	if q.Path == "/sleep" {
-		ms := mint.Atoi(q.Param("ms")) catch _ { 100 }
-		secs := f64(ms) / 1000.0
-		_ = db.Query("SELECT SLEEP({secs})") catch err {
-			fail_with(mut w, err)
-			return
-		}
-		w.Text("slept")
+	w.Text("{res.LastID}")
+}
+
+func count(q anvil.Req, w mut anvil.Out) {
+	rows := db.Query("SELECT COUNT(*) FROM users") catch err {
+		fail_with(mut w, err)
 		return
 	}
-	if q.Path == "/setup" {
-		_ = db.Exec("CREATE TABLE IF NOT EXISTS users (id BIGINT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(255) NOT NULL)") catch err {
-			fail_with(mut w, err)
-			return
-		}
-		w.Text("ok")
+	w.Text(rows.Rows[0][0].Text())
+}
+
+func sleep(q anvil.Req, w mut anvil.Out) {
+	ms := mint.Atoi(q.Param("ms")) catch _ { 100 }
+	secs := f64(ms) / 1000.0
+	_ = db.Query("SELECT SLEEP({secs})") catch err {
+		fail_with(mut w, err)
 		return
 	}
-	w.Status(404)
+	w.Text("slept")
+}
+
+func setup(q anvil.Req, w mut anvil.Out) {
+	_ = db.Exec("CREATE TABLE IF NOT EXISTS users (id BIGINT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(255) NOT NULL)") catch err {
+		fail_with(mut w, err)
+		return
+	}
+	w.Text("ok")
+}
+
+func no_route(q anvil.Req, w mut anvil.Out) {
 	w.Text("no route {q.Path}")
 }
 
 func main() {
-	err := anvil.Serve(":9185", handle)
+	r := anvil.NewRouter()
+	r.Get("/user", user)
+	r.Get("/add", add)
+	r.Get("/count", count)
+	r.Get("/sleep", sleep)
+	r.Get("/setup", setup)
+	r.NotFound(no_route)
+	err := r.Serve(":9185")
 	say.Line("server:", err)
 }

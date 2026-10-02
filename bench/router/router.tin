@@ -1,0 +1,100 @@
+package main
+
+import "anvil"
+import "hearth"
+import "say"
+import "tide"
+
+// The cost of routing with 1, 20 and 200 routes (bench/router/go is the same with chi):
+// Match is the lookup alone, Run a whole request through the router (Req, Out, handler).
+//   tin bench/router/router.tin
+func h(q anvil.Req, w mut anvil.Out) {
+	w.Text("ok")
+}
+
+// build makes a router of n routes: per resource i, GET /resI, GET and PUT /resI/{id}, and
+// GET /resI/{id}/items (n = 1 is just GET /res0/{id}).
+func build(n i64) anvil.Router {
+	r := anvil.NewRouter()
+	if n == 1 {
+		r.Get(`/res0/{id}`, h)
+		return r
+	}
+	for i := 0; len(routes_of(n, i)) > 0; i++ {
+		for _, p := range routes_of(n, i) {
+			if p[0] == 'P' {
+				r.Put(p[1:], h)
+			} else {
+				r.Get(p, h)
+			}
+		}
+	}
+	return r
+}
+
+// routes_of is resource i's patterns in a router of n routes ("P" marks a PUT).
+func routes_of(n i64, i i64) []str {
+	per := 2
+	if n > 20 {
+		per = 4
+	}
+	if i*per >= n {
+		return []str{}
+	}
+	ps := []str{say.Fmt("/res%d", i), say.Fmt(`/res%d/{id}`, i)}
+	if per == 4 {
+		ps = append(ps, say.Fmt(`P/res%d/{id}`, i), say.Fmt(`/res%d/{id}/items`, i))
+	}
+	return ps
+}
+
+var r1 = build(1)
+var r20 = build(20)
+var r200 = build(200)
+
+func match(label str, r anvil.Router, method str, path str, want str) {
+	if r.Match(method, path) != want {
+		say.Line("wrong match for", path)
+		return
+	}
+	n := 5000000
+	t0 := tide.Now()
+	for i := 0; i < n; i++ {
+		r.Match(method, path)
+	}
+	say.Out("%-34s %6.1f ns\n", label, f64(tide.Since(t0))/f64(n))
+}
+
+func run(label str, r anvil.Router, method str, path str) {
+	n := 200000
+	best := 0.0
+	for round := 0; round < 5; round++ {
+		t0 := tide.Now()
+		for i := 0; i < n; i++ {
+			r.Run(method, path, "")
+		}
+		ns := f64(tide.Since(t0)) / f64(n)
+		if round == 0 || ns < best {
+			best = ns
+		}
+		hearth.Reset()
+	}
+	say.Out("%-34s %6.1f ns\n", label, best)
+}
+
+func main() {
+	say.Line("routes", r1.Check(), r20.Check(), r200.Check())
+	match("match 1   /res0/42", r1, "GET", "/res0/42", `/res0/{id}`)
+	match("match 20  /res7 (static)", r20, "GET", "/res7", "/res7")
+	match("match 20  /res7/42", r20, "GET", "/res7/42", `/res7/{id}`)
+	match("match 20  /nope (404)", r20, "GET", "/nope", "")
+	match("match 200 /res37 (static)", r200, "GET", "/res37", "/res37")
+	match("match 200 /res37/42", r200, "GET", "/res37/42", `/res37/{id}`)
+	match("match 200 PUT /res37/42", r200, "PUT", "/res37/42", `/res37/{id}`)
+	match("match 200 /res37/42/items", r200, "GET", "/res37/42/items", `/res37/{id}/items`)
+	match("match 200 /nope (404)", r200, "GET", "/nope", "")
+	run("run 1   /res0/42", r1, "GET", "/res0/42")
+	run("run 20  /res7/42", r20, "GET", "/res7/42")
+	run("run 200 /res37/42/items", r200, "GET", "/res37/42/items")
+	run("run 200 /nope (404)", r200, "GET", "/nope")
+}
