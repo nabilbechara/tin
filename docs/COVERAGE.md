@@ -1,0 +1,258 @@
+# Go coverage: what Tin has, and what it still needs
+
+The goal is a language in which everything Go's built-ins and standard library let a program do can be done, written in Tin. That is a goal about capabilities, not about copying Go: where Go's shape needs something Tin has chosen not to have (interfaces, reflection, shared mutable state), the entry says what takes its place. This page is the checklist. Update it in the same change that adds or removes a capability.
+
+The inventory is the 176 packages `go list std` reports for Go 1.26 (without `internal`, `vendor` and `cmd`), plus the language itself. The `koussa` column is how many of the files in Anghami's service (about 5,600 Go files, 1.15 million lines) import the package, as production files plus test files. It is a yardstick for what real services need, not a port target.
+
+| status | meaning |
+|---|---|
+| done | covers what the Go package is used for |
+| partial | a Tin package covers part of it; the gaps are listed |
+| missing | nothing yet |
+| design | Go's shape needs something Tin deliberately lacks; the replacement is named or still to be designed |
+| n/a | specific to Go's toolchain or runtime, with no counterpart to build |
+
+**Standard library, 176 packages:** 1 done, 43 partial, 8 design, 100 missing, 24 n/a.
+**Of the 87 packages koussa imports:** 1 done, 40 partial, 7 design, 39 missing, 0 n/a.
+
+## The language
+
+| Go | Tin | status |
+|---|---|---|
+| `append`, `cap`, `copy`, `delete`, `len`, `make`, `new`, `panic`, `print`, `println` | the same (docs/LANGUAGE.md section 13); `make` covers slices and maps | done |
+| `min`, `max` | two arguments of one type; Go takes any number | partial |
+| `clear` |  | missing |
+| `complex`, `real`, `imag`, complex types | no complex type | missing |
+| `close`, channels | no channels: routines and messages, to be designed (relay between cores exists) | design |
+| `recover` | none: a panic ends the program. Per-request fault isolation is to be designed | design |
+| integer and float types, `bool`, `string` | `i8` to `i64`, `u8` to `u64`, `f32`, `f64`, `bool`, `str`; no implicit conversions | done |
+| arrays `[N]T` | `[N]T` is a slice that starts with N zeros; no value semantics | partial |
+| slices, three-index slices | slices are references; the full slice expression `s[a:b:c]` is not documented | partial |
+| maps | insertion-ordered; keys `str`, integers, `bool`, `f64`, structs and enums of those | partial |
+| structs, methods | yes; fields and methods follow the capitalized-export rule | done |
+| struct embedding | not documented | missing |
+| struct tags | none: attributes checked by the compiler are the plan | design |
+| interfaces, type assertions, type switches | none: generics (monomorphized) and `enum` with exhaustive `switch`; an explicit dynamic-dispatch form is to be designed | design |
+| generics | type parameters with `any`, `comparable` and unions; inference; methods on generic types | partial |
+| function values, closures | function values yes; function literals cannot capture local variables | partial |
+| method values and expressions | not documented | missing |
+| variadic functions | documented for the standard library's formatting; user-declared variadics not documented | partial |
+| named results, bare `return` | not documented | missing |
+| multiple results, `err` as a value | `!T` results with `fail`, `try` and `catch`; ignoring a fault is a compile error | done |
+| `defer` | yes, outside loops | partial |
+| `goroutines`, `go`, `select`, `sync` | none: routines to be designed on top of the per-request tasks | design |
+| labels, `goto`, `fallthrough` | none | design |
+| `switch`, `for`, `range` over slices, strings, maps, integers | yes; `switch` has no fallthrough | done |
+| range over functions and iterators |  | missing |
+| `iota`, typed and untyped constants | yes | done |
+| `init` functions, package variables | package variables initialize in declaration order; `init` is not documented | partial |
+| packages and imports, `internal` | directories under `lib/`, imports by name, `./` for local packages; an `internal` rule is not documented | partial |
+| modules, `go.mod`, versioned dependencies | none: a content-addressed package system is planned | missing |
+| build tags, `GOOS`/`GOARCH` files | files ending `_darwin`, `_linux`, `_linux_arm64`, `_linux_amd64` | partial |
+| `unsafe`, `cgo` | no `unsafe`; `extern` only inside the standard library | design |
+| `reflect` | none: compile-time derivation | design |
+| `//go:embed`, `//go:generate` | none | missing |
+| `testing`, benchmarks, fuzzing | `tin test` with `crucible`; no fuzzing | partial |
+| garbage collector | none: request pools and `keep`, checked at compile time | design |
+| race detector | not needed: no shared mutable state between threads | n/a |
+
+## The standard library
+
+Ordered by import path, as `go list std` prints them.
+
+| Go package | koussa | status | Tin | what is there, what is missing |
+|---|---|---|---|---|
+| `archive/tar` | 1+0 | missing |  | tar archives; needs the io shape first |
+| `archive/zip` |  | missing |  | zip archives; needs compress/flate |
+| `bufio` | 18+3 | partial | flume | buffered Reader (Line, Byte, ReadAll) and Writer (Str, Int, Flush); no Scanner with split functions, no ReadWriter |
+| `bytes` | 76+28 | partial | ore, twine.Builder | about 20 functions on []u8; no Buffer or Reader type, no Map, Title, FieldsFunc or TrimFunc |
+| `cmp` | 14+5 | partial | builtin min/max, generics | no cmp.Compare, cmp.Or or cmp.Ordered (a union such as `i64 | f64 | str` does the constraining) |
+| `compress/bzip2` |  | missing |  |  |
+| `compress/flate` |  | missing |  | needed by gzip, zlib and zip |
+| `compress/gzip` | 7+1 | missing |  |  |
+| `compress/lzw` |  | missing |  |  |
+| `compress/zlib` |  | missing |  |  |
+| `container/heap` | 2+0 | partial | cairn | IntHeap and IntMaxHeap; no heap over any element type (generics now allow one) |
+| `container/list` | 1+1 | missing | cairn (deque, queue) | no doubly linked list with stable element handles |
+| `container/ring` |  | missing |  |  |
+| `context` | 3044+681 | missing | design: ambient task deadline and cancellation | every request task already has a deadline; the cancel signal, values and the scoped form are unbuilt |
+| `crypto` |  | n/a |  | the Hash registry and interfaces; there are no interfaces |
+| `crypto/aes` | 4+0 | missing |  |  |
+| `crypto/cipher` | 2+0 | missing |  | GCM, CTR, CBC |
+| `crypto/des` |  | missing |  |  |
+| `crypto/dsa` |  | missing |  | deprecated in Go |
+| `crypto/ecdh` |  | missing |  |  |
+| `crypto/ecdsa` | 1+1 | missing |  |  |
+| `crypto/ed25519` |  | missing |  |  |
+| `crypto/elliptic` |  | missing |  |  |
+| `crypto/fips140` |  | n/a |  | Go's FIPS module switch |
+| `crypto/hkdf` |  | missing |  |  |
+| `crypto/hmac` | 16+7 | partial | seal | HmacSha256 only |
+| `crypto/hpke` |  | missing |  |  |
+| `crypto/md5` | 12+3 | partial | (postgres/md5, internal) | exists only inside the PostgreSQL client; not public |
+| `crypto/mlkem` |  | missing |  |  |
+| `crypto/mlkem/mlkemtest` |  | n/a |  |  |
+| `crypto/pbkdf2` |  | partial | seal | Pbkdf2Sha256 and a timeout form; no other hashes |
+| `crypto/rand` | 18+1 | partial | seal | RandomBytes; no Reader, Int or Prime |
+| `crypto/rc4` |  | missing |  | deprecated in Go |
+| `crypto/rsa` | 4+0 | partial | seal | ParseRSAPublicKeyPEM and EncryptOAEPSha1 (the MySQL login); no key generation, signing or verification |
+| `crypto/sha1` | 8+1 | partial | seal | Sha1 one shot; no streaming hash |
+| `crypto/sha256` | 23+8 | partial | seal | Sha256, Sha256Hex (hardware instructions where present); no streaming hash, no SHA-224 |
+| `crypto/sha3` |  | missing |  |  |
+| `crypto/sha512` | 1+0 | missing |  |  |
+| `crypto/subtle` | 9+0 | partial | seal | ConstantTimeEq only |
+| `crypto/tls` | 3+2 | missing |  | issue #124: client first, then server; blocks https, wss and TLS to databases |
+| `crypto/x509` | 2+3 | missing |  |  |
+| `crypto/x509/pkix` |  | missing |  |  |
+| `database/sql` | 702+19 | partial | mysql, postgres (and the `query` type) | each client has Open, Query, Exec, Begin, Commit, Rollback and typed values, pooled per core; no shared driver abstraction, no Scan into structs, no prepared-statement handle API |
+| `database/sql/driver` | 18+0 | design |  | no interfaces: a driver would be a package with a fixed shape or a table of functions |
+| `debug/buildinfo` |  | missing |  | low priority |
+| `debug/dwarf` |  | missing |  | low priority |
+| `debug/elf` |  | missing |  | low priority (the compiler writes ELF but does not read it) |
+| `debug/gosym` |  | n/a |  | Go symbol tables |
+| `debug/macho` |  | missing |  | low priority |
+| `debug/pe` |  | missing |  | low priority |
+| `debug/plan9obj` |  | n/a |  |  |
+| `embed` | 2+0 | missing |  | compile-time file embedding |
+| `encoding` | 1+0 | design | compile-time derivation | Marshaler interfaces become derived code, as argo already does for JSON |
+| `encoding/ascii85` |  | missing |  |  |
+| `encoding/asn1` |  | missing |  | needed by x509 |
+| `encoding/base32` | 1+0 | missing |  |  |
+| `encoding/base64` | 50+15 | partial | seal | standard (padded) and URL-safe (unpadded) with decoders; no padded URL-safe form, no unpadded standard form, no streaming encoder |
+| `encoding/binary` | 5+1 | missing |  | byte orders, varints, Read and Write of fixed-size values |
+| `encoding/csv` | 4+0 | missing |  |  |
+| `encoding/gob` | 2+0 | missing |  | low priority: Go's own format |
+| `encoding/hex` | 37+9 | partial | seal | Hex and HexDecode; no Dump, no streaming |
+| `encoding/json` | 297+76 | partial | argo | Put and Get are generated per type, fast; no decoding into a dynamic value, no field tags, no Indent, no streaming Encoder or Decoder, no RawMessage beyond Raw |
+| `encoding/pem` | 1+1 | missing |  |  |
+| `encoding/xml` | 52+8 | missing |  |  |
+| `errors` | 393+152 | partial | fault, try, catch, say.Fault | no Is, As, Unwrap or Join: a fault is a message, with no wrapping chain |
+| `expvar` |  | missing |  |  |
+| `flag` | 1+0 | partial | lever | Str, Int, Bool, F64, Parse, Usage; no FlagSet, no Duration, no custom Value |
+| `fmt` | 944+127 | partial | say | Line, Fmt, Str, Fault and string interpolation with format specs, by static type; no Sscanf, Fscan or Scan, and no Stringer or Formatter (formatting is derived) |
+| `go/ast` |  | n/a |  | Go's own compiler front end; Tin's compiler is selfhost/ |
+| `go/build` |  | n/a |  |  |
+| `go/build/constraint` |  | n/a |  |  |
+| `go/constant` |  | n/a |  |  |
+| `go/doc` |  | n/a |  |  |
+| `go/doc/comment` |  | n/a |  |  |
+| `go/format` |  | n/a |  | a Tin formatter is a separate tool, not this package |
+| `go/importer` |  | n/a |  |  |
+| `go/parser` |  | n/a |  |  |
+| `go/printer` |  | n/a |  |  |
+| `go/scanner` |  | n/a |  |  |
+| `go/token` |  | n/a |  |  |
+| `go/types` |  | n/a |  |  |
+| `go/version` |  | n/a |  |  |
+| `hash` | 1+0 | design |  | the Hash interface; streaming hashes need a generic or a table of functions |
+| `hash/adler32` |  | partial | stamp | Adler32 one shot |
+| `hash/crc32` | 0+1 | partial | stamp | Crc32, Crc32C, Crc32Update; no table type, no streaming hash |
+| `hash/crc64` |  | missing |  |  |
+| `hash/fnv` | 3+0 | partial | stamp | Fnv32a and Fnv64a; not the FNV-1 variants |
+| `hash/maphash` |  | missing |  | maps are hashed internally with a per-process key |
+| `html` |  | missing |  | EscapeString and UnescapeString |
+| `html/template` | 3+1 | missing |  | contextual escaping; koussa uses templ, a code generator |
+| `image` | 24+1 | missing |  |  |
+| `image/color` | 9+2 | missing |  |  |
+| `image/color/palette` |  | missing |  |  |
+| `image/draw` | 1+0 | missing |  |  |
+| `image/gif` | 1+0 | missing |  |  |
+| `image/jpeg` | 7+1 | missing |  |  |
+| `image/png` | 6+0 | missing |  | needs compress/zlib |
+| `index/suffixarray` |  | missing |  |  |
+| `io` | 91+20 | design | flume (concrete Reader and Writer) | Reader and Writer are interfaces in Go; Copy, Pipe, MultiWriter, LimitReader and TeeReader have no Tin form yet |
+| `io/fs` | 2+0 | missing |  |  |
+| `io/ioutil` |  | n/a | quarry | deprecated in Go; quarry has ReadFile, WriteFile, ReadDir |
+| `iter` |  | missing |  | range over functions; `for range` covers slices, strings, maps and integers |
+| `log` | 7+2 | partial | herald | levels, output, clock; no Logger values |
+| `log/slog` |  | partial | herald | leveled lines with key and value pairs; no Handler, Group or LogValuer |
+| `log/syslog` |  | missing |  |  |
+| `maps` | 2+4 | partial | sift | Keys, Values, SortedKeys; no Clone, Copy, Equal, DeleteFunc or Collect |
+| `math` | 59+23 | partial | gauge | Sin to Atan2, Sinh to Tanh, Exp, Exp2, Log family, Pow, Cbrt, Hypot, Mod, Frexp, Ldexp, Modf (ported from Go, no libm); missing Gamma, Lgamma, Erf, Erfc, Expm1, Asinh, Acosh, Atanh, Sincos, FMA, Nextafter, Remainder, Logb, Dim, Bessel functions |
+| `math/big` | 8+0 | missing |  | Int, Float, Rat |
+| `math/bits` | 3+0 | partial | gauge | PopCount, LeadingZeros, TrailingZeros; no Mul64, Add64, Div64, Len, Reverse, RotateLeft (the first two exist unexported) |
+| `math/cmplx` |  | missing |  | there is no complex type |
+| `math/rand` | 17+8 | partial | dice | xoshiro256** generators, Intn, F64, NormF64, Perm, Shuffle; no Zipf, no ExpFloat64, no Source interface |
+| `math/rand/v2` | 1+1 | partial | dice | same generators; no PCG or ChaCha8 types, different method names |
+| `mime` | 1+0 | missing |  |  |
+| `mime/multipart` | 8+0 | missing |  |  |
+| `mime/quotedprintable` |  | missing |  |  |
+| `net` | 20+2 | partial | wire | TCP Dial, DialTimeout, Listen, Accept, deadlines; no UDP, Unix sockets, IP or CIDR types, resolver control |
+| `net/http` | 553+126 | partial | anvil, wire, websocket | server with Router, middleware, groups, HEAD and 405 handling; client Get, Post, Do; WebSocket; no TLS, HTTP/2, cookies, multipart, Client or Transport configuration, streaming bodies |
+| `net/http/cgi` |  | missing |  | low priority |
+| `net/http/cookiejar` |  | missing |  |  |
+| `net/http/fcgi` |  | missing |  | low priority |
+| `net/http/httptest` | 1+57 | partial | anvil.Router.Run | runs a request through a router without a socket; no ResponseRecorder or test Server |
+| `net/http/httptrace` |  | missing |  |  |
+| `net/http/httputil` | 5+0 | missing |  | ReverseProxy, DumpRequest |
+| `net/http/pprof` | 1+0 | missing |  | profiling endpoints; part of the performance goal |
+| `net/mail` | 6+0 | missing |  |  |
+| `net/netip` |  | missing |  |  |
+| `net/rpc` |  | missing |  | low priority |
+| `net/rpc/jsonrpc` |  | missing |  | low priority |
+| `net/smtp` |  | missing |  |  |
+| `net/textproto` |  | missing |  |  |
+| `net/url` | 103+20 | missing |  | Parse, Query, Values, PathEscape, QueryEscape: anvil decodes query parameters but there is no URL package |
+| `os` | 24+60 | partial | quarry | Args, environment, ReadFile, WriteFile, AppendFile, Mkdir, Remove, Rename, ReadDir, Getwd, Exit, Hostname, Pid; files are opened through flume (buffered) and there is no os.File type with Seek; no Stat and FileInfo, no Chmod, symlinks or pipes |
+| `os/exec` | 1+3 | missing |  |  |
+| `os/signal` | 1+0 | missing |  | anvil handles SIGTERM and SIGINT for graceful shutdown internally |
+| `os/user` |  | missing |  |  |
+| `path` | 8+1 | partial | trail | Clean, Base, Dir, Ext, Join, Split, Match, IsAbs |
+| `path/filepath` | 27+6 | partial | trail | the same, plus Rel; no Walk, WalkDir, Glob, Abs or EvalSymlinks |
+| `plugin` |  | design |  | no dynamic loading |
+| `reflect` | 369+132 | design | compile-time derivation (argo, say) | runtime reflection is not planned; what code uses it for (serialization, validation, mapping rows to structs) becomes derived code |
+| `regexp` | 59+1 | missing |  | needs an RE2-style engine; linear time |
+| `regexp/syntax` |  | missing |  |  |
+| `runtime` | 2+2 | partial | hearth | Cores, ID, MemLimit, PoolChunk, Reset; no GC controls (there is no GC), no Gosched or NumGoroutine, no Caller or Stack |
+| `runtime/cgo` |  | n/a |  |  |
+| `runtime/coverage` |  | missing |  |  |
+| `runtime/debug` | 3+0 | missing |  | backtraces exist on panic; no SetGCPercent (no GC), no Stack or ReadBuildInfo |
+| `runtime/metrics` |  | missing |  |  |
+| `runtime/pprof` |  | missing |  | CPU and allocation profiling; part of the performance goal |
+| `runtime/race` |  | n/a |  | the language rules out shared mutable state between threads |
+| `runtime/trace` |  | missing |  |  |
+| `slices` | 79+37 | partial | sift | int and string specific functions plus generic Map, Filter, Reduce; no generic Sort, BinarySearch, Contains, Index, Insert, Delete, Reverse, Max, Min, Compact, Equal |
+| `sort` | 105+8 | partial | sift | Ints, Strs, SortBy, Search*, stable sorts; no sort.Interface (by design), no generic Slice |
+| `strconv` | 875+97 | partial | mint | Itoa, Atoi, ParseInt, ParseUint, ParseBool, ParseFloat, FormatInt, FormatUint, FormatFloat, Quote, Unquote and friends; no AppendFloat, AppendBool, QuoteToASCII, IsPrint, ParseComplex |
+| `strings` | 657+147 | partial | twine | about 40 functions (Index, Split, Fields, Replace, Trim*, Cut, EqualFold, Builder ...); no Map, Title, FieldsFunc, TrimFunc, IndexFunc, SplitAfter, Replacer, Reader, CutPrefix, CutSuffix, ContainsFunc |
+| `structs` |  | n/a |  |  |
+| `sync` | 69+32 | design | share-nothing cores, relay | no Mutex or RWMutex by design; WaitGroup, Once, Pool and Map need routine-level equivalents |
+| `sync/atomic` | 7+12 | missing |  | the runtime has atomic operations as compiler intrinsics; there is no public package |
+| `syscall` | 2+1 | missing |  | low priority |
+| `testing` | 4+1071 | partial | crucible, `tin test` | checks, Run, benchmarks; no t.Parallel, subtests with cleanup, TempDir, fuzzing, example tests |
+| `testing/cryptotest` |  | missing |  |  |
+| `testing/fstest` |  | missing |  |  |
+| `testing/iotest` |  | missing |  |  |
+| `testing/quick` | 0+1 | missing |  |  |
+| `testing/slogtest` |  | missing |  |  |
+| `testing/synctest` |  | missing |  |  |
+| `text/scanner` |  | missing |  |  |
+| `text/tabwriter` |  | missing |  |  |
+| `text/template` |  | missing |  |  |
+| `text/template/parse` |  | missing |  |  |
+| `time` | 1012+272 | partial | tide | Now, Since, Sleep, Wait, durations with parse and format, RFC 3339 and HTTP date, calendar arithmetic; no time zones or Location, no layout-based Format and Parse, no Timer, Ticker or After, no Month and Weekday types |
+| `time/tzdata` |  | missing |  |  |
+| `unicode` | 14+0 | partial | glyph | IsLetter, IsDigit, IsSpace, IsUpper, IsLower, ToUpper, ToLower; no range tables, IsPunct, IsControl, IsSymbol, SimpleFold, Title |
+| `unicode/utf16` |  | missing |  |  |
+| `unicode/utf8` | 10+0 | done | glyph | every function |
+| `unique` |  | missing |  |  |
+| `unsafe` | 342+0 | design |  | raw operations exist only for the standard library, behind the region checker |
+| `weak` |  | n/a |  | there is no garbage collector |
+
+## What to build, in order
+
+The order comes from two things: what other work depends on, and what services import most. Foundations come first because the rest of the library is written in their terms; each gets a design document before code, per notes/plan_retire_go.md's method (the need, Tin's constraints, two or three candidates, a decision).
+
+**Foundations (design first):**
+
+1. Routines, and `context` as ambient cancellation, which share one design. `context` is imported by 3,725 koussa files, more than anything else.
+2. An abstraction mechanism in place of interfaces (`io.Reader` and `Writer`, `sort.Interface`, `database/sql/driver`, `hash.Hash`, `error` chains all need it), and function literals that capture.
+3. Error chains (`errors.Is`, `As`, `Unwrap`, `Join`) and per-request fault isolation in place of `recover`.
+4. Synchronization for routines (`sync`, `sync/atomic`): Once, WaitGroup, Pool, counters.
+5. Derivation in place of `reflect` and struct tags, extending what `argo` does for JSON.
+
+**High demand:** `time` (zones, layouts, timers), `net/url`, `regexp`, the rest of `encoding/json`, `strconv`, `strings`, `slices`, `maps`, `sort`, `bytes`, `os` file handles, `net/http` client and server completeness, `net/http/httptest`, `encoding/xml`, `crypto/tls` (#124), `database/sql`'s common shape, `image`, `math/big`, `compress/gzip`, `mime/multipart`.
+
+**Performance tooling:** `runtime/pprof`, `net/http/pprof`, `runtime/metrics`: the end goal is performance, and it cannot be improved without a profiler.
+
+**The rest** as services need them: the remaining `crypto`, `encoding`, `text`, `net` and `archive` packages.
