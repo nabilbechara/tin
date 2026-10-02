@@ -43,11 +43,13 @@ check()                                             (check.tin)
   generics_init: register generic types, attach their method templates
   named types: structs first (so fields can refer to any struct), then aliases; layout
   declare functions (templates only register their names), then pending generic methods
-  constants, then globals (per-core globals get __core_init statements)
+  constants, then globals, each package after its imports (per-core globals get
+  __core_init statements)
   check every function body (instances and generated functions are appended and checked
   in the same loop): typing, lowering, say/argo/keep generation, defer finishing
   make_start: __start = rt_init, shared initializers, __core_init, rt_main_begin,
-  main.main, rt_exit; mark reachable functions
+  main.main, rt_exit; mark reachable functions; check_init_order: no initializer
+  reaches a global whose initializer runs later
 region_check()                                      (region.tin)
 generate()                                          (gen.tin; generate_x64 for amd64)
   inline_small_calls over the whole program

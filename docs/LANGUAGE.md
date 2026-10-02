@@ -70,7 +70,8 @@ import u "util"       // with an alias
 ### Program start
 
 Before `main` runs, every package's global initializers run (on every core: see
-section 11), in declaration order within a file and file order within the program.
+section 11): a package's after those of the packages it imports, and within a package in
+declaration order, file by file.
 `main` returns nothing; the program exits with status 0 when it returns, 2 on a panic,
 or with the code passed to `quarry.Exit`.
 
@@ -353,6 +354,10 @@ var cache map[str]User = make(map[str]User)
 Globals are per core (section 11): each core thread has its own copy, and initializers
 run once on every core. Values stored into globals live in the long-lived heap
 (section 10).
+
+An initializer may use imported packages and the globals declared before it. Using a
+later global of its package (or itself), directly or through a function it calls or refers
+to, is a compile error: that global's initializer has not run yet.
 
 ### Functions
 
@@ -1040,6 +1045,7 @@ has no package clause). See [COMPILER.md](COMPILER.md) for how the compiler is w
 | pointers, `&x`, `*p` | reference types (structs, slices, maps are references) |
 | slices are values (header copied) | slices are references (header shared, `append` in place) |
 | goroutines, channels, mutexes | one thread per core, per-core globals, `relay` messages |
+| package variables initialized in dependency order | declaration order; an initializer using a later global is a compile error |
 | garbage collector | request pools + `keep` into a long-lived heap, checked at compile time |
 | interfaces, reflection | generics (monomorphized), compiler-generated `say` and `argo` |
 | closures capture variables | function literals cannot capture locals |
