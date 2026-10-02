@@ -9,6 +9,9 @@ Every push to `main` and every pull request runs native Linux arm64 (`ubuntu-24.
 - Legacy native-executable compatibility on every platform; original Go bootstrap and assembly linkage on macOS (the original bootstrap emits Darwin assembly).
 - Memory regressions: bounds panics, allocation size overflow and negative lengths, large first allocations, single evaluation of allocation lengths, read-only and region checking through indirect calls, nested zero values, deep `keep` ownership and 200 request-pool reset/reuse cycles.
 - Linux HTTP framing/conformance, stable RSS over two million requests after warmup, and graceful shutdown. Throughput is reported, never used as a performance threshold.
+- Request tasks (`task_check.py`): waits on one core overlap, fast requests stay fast behind waiting ones (timers, proxied `wire` calls, helper-thread file I/O), deadlines give 504, refused upstreams 502, and pipelined responses keep their order.
+- Clients and protocols, each against a small server written in Python inside the check, so no service has to be installed: `redis_check.py` (concurrent load, command batching, deadlines that keep replies in step, reconnects, AUTH), `mysql_check.py` (bound values, pool waits, deadlines, both auth plugins including the RSA exchange, wrong passwords, reconnects) and `websocket_check.py` (RFC 6455 rules, 300 idle connections and 20 concurrent streams on one core, the Tin client). On `ubuntu-24.04` the MySQL check also runs against the runner's own MySQL 8; `REDIS_ADDR` / `MYSQL_ADDR` point the checks at real servers locally.
+- The v0.4 service benchmark (`.github/workflows/bench.yml`) is separate and runs only on demand: Redis and MySQL service containers, wrk2 built from source, Tin vs Go + chi. It is never a merge gate.
 - Harness self-tests ensure expected output cannot disguise crashes/timeouts or unexpectedly accepted negative programs.
 
 The Python harness uses only the standard library. Shell entrypoints now require Python 3. Native runtime probes have a 20-second timeout, core dumps disabled, and a 512 MiB virtual-memory limit on Linux. The first-allocation crash reproducer is Linux-only: macOS can map writable memory beyond the undersized allocation, making a SIGSEGV expectation unreliable there. HTTP tests require `ps` (available on hosted Ubuntu).
@@ -42,6 +45,10 @@ python3 tools/ci/regressions.py
 python3 tools/ci/regressions.py --audit   # network; GH_TOKEN optional for public issues
 TINC="$PWD/bin/tinc" go test -count=1 ./bootstrap
 python3 tools/ci/http_check.py            # Linux HTTP/RSS/shutdown
+python3 tools/ci/task_check.py            # request tasks, deadlines, helpers
+python3 tools/ci/redis_check.py           # REDIS_ADDR=host:port for a real Redis
+python3 tools/ci/mysql_check.py           # MYSQL_ADDR, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE for a real MySQL
+python3 tools/ci/websocket_check.py
 ```
 
 `tools/linuxtest.sh` and `tools/x64fuzz/linuxtest_amd64.sh` use the same strict runner for Docker cross-tests. They check negative diagnostics on the build host and positive outputs/exit codes in the chosen image. `TIN_LINUX_IMAGE` chooses the image; `TIN_ROOT` can select a library tree. The old `X64_TEST_DIR` output option is replaced by unique temporary directories and logs under `bin/ci/`.

@@ -121,10 +121,11 @@ or with the code passed to `quarry.Exit`.
 | `str` | ref | immutable bytes (UTF-8 by convention); never nil; zero value `""` |
 | `[]T` | ref | slice: a reference to a header (length, capacity, data) |
 | `[N]T` | ref | a `[]T` that starts with N zero elements (`[N][M]T` too) |
-| `map[K]V` | ref | hash map; K is `str` or an integer type; never nil |
+| `map[K]V` | ref | hash map, insertion-ordered; K is `str`, an integer type, `bool`, `f64`, or a struct or enum of those; never nil |
 | `struct { ... }` | ref | a reference to an object; never nil |
 | `?T` | ref | optional T: a T or `nil` (T a reference type) |
 | `fault` | ref | an error; `nil` means no error |
+| `query` | ref | a literal's text pieces and values kept apart, for database and cache clients (§14, Queries) |
 | `func(A, B) (R, S)` | 8 | a function value: a top-level function or a function literal without captures |
 
 There are no pointers in user code, no interfaces, no channels and no `byte`/`int`

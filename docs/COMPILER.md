@@ -115,6 +115,10 @@ structure), so type identity is pointer equality.
 - `try` (`lower_try_stmt`) becomes a multi-result call into temps and
   `if err != nil { return zero..., err }`, with real zero values for references.
 - Map reads (`map_read`) substitute the value type's zero on a miss.
+- String interpolation (`chk_interp`) becomes a `say.Fmt` call. Where the expected type is
+  the runtime's `query` (`is_query_t`), `chk_query` instead builds the composite
+  `query{Parts: []str{...}, Args: []qarg{qarg.Int(i64(x)), ...}}` from the literal's pieces
+  and values and checks that; `check_assignable` gives the query-specific error for a `str`.
 - Faults that are never read and calls whose fault result is dropped are errors
   (`check_fn`, `check_stmt`).
 

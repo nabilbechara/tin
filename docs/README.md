@@ -5,10 +5,10 @@
 | [LANGUAGE.md](LANGUAGE.md) | the language reference: every type, statement, expression, rule and error, plus the grammar |
 | [STDLIB.md](STDLIB.md) | every standard-library package and exported name (generated from `lib/*.tin`) |
 | [TOOLING.md](TOOLING.md) | the `tin` command, `tinc`, make targets, tests, Docker, benchmarks, debugging, repository layout |
-| [RUNTIME.md](RUNTIME.md) | memory (pools, ingot heap, regions), cores, value layouts, panics, the HTTP server's internals, the platform layer |
+| [RUNTIME.md](RUNTIME.md) | memory (pools, ingot heap, regions), cores, value layouts, panics, the HTTP server's internals, request tasks, non-blocking I/O and helper threads, how the redis/mysql/websocket clients share a core, the platform layer |
 | [COMPILER.md](COMPILER.md) | how the self-hosted compiler works: passes, data structures, code generation, linkers, bootstrapping, how to change it |
 | [PORTING.md](PORTING.md) | targets (macOS, Linux arm64, Linux amd64), ELF details, containers and Kubernetes, adding a target |
-| [PERFORMANCE.md](PERFORMANCE.md) | benchmark results against Go, methodology, where Go still wins and why |
+| [PERFORMANCE.md](PERFORMANCE.md) | benchmark results against Go, methodology, where Go still wins and why (the v0.4 service benchmark is pending: #74) |
 | [AGENT_PRIMER.md](AGENT_PRIMER.md) | a one-page brief to give an AI agent before it writes Tin code |
 
 Design notes and records live in [`../notes/`](../notes): the roadmap (`roadmap.md`), the

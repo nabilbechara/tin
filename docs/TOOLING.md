@@ -168,6 +168,7 @@ Go binaries for the container: `GOOS=linux GOARCH=arm64 go build -o bin/linux/x 
 | `bench/v2/NAME.tin` + `NAME.go` | CPU benchmarks; build both, time with `/usr/bin/time -l`, outputs must be identical |
 | `examples/demo.tin` + `examples/demo_go` | the mixed demo (primes, sort, SHA-256, JSON, maps), self-timing |
 | `bench/http/hammer` | a Go load generator (wrk-like) with exact latency histograms |
+| `bench/v04/run.py` | `GET /users/{id}` through Redis over MySQL, Tin vs Go + chi under wrk2: max req/s, req per CPU-second, p50/p99/p99.9 at a fixed rate, RSS (needs Redis, MySQL seeded by `bench/v04/seed.py`, and `WRK2`) |
 
 Servers used: `examples/api.tin` (port 9180, `TIN_CORES=n`), `bench/http/fast` (fasthttp,
 9182), `bench/http/gonet` (net/http, 9181), with `GOMAXPROCS=n`. Results and analysis:
@@ -199,8 +200,8 @@ tests/v2/           strict tests and expected outputs
 tests/*.tin         legacy tests (driven by bootstrap/*_test.go)
 bootstrap/          stage 0: the original Go compiler and the legacy harness
 seed/               tinc-darwin-arm64, tinc-linux-arm64, tinc-linux-amd64: the compilers that start a build
-examples/           api.tin (HTTP server), demo.tin, fib.tin, demo_go/
-bench/              v2/ CPU benchmarks, http/ HTTP benchmarks and tools, ref/ Go references
+examples/           api.tin (HTTP server), tasks.tin, redis.tin, mysql.tin, websocket.tin, demo.tin, demo_go/
+bench/              v2/ CPU benchmarks, http/ HTTP benchmarks and tools, v04/ the service benchmark, ref/ Go references
 tools/              test runners, debugging helpers, gendoc.py, x64fuzz/
 docs/               this documentation
 notes/              design notes, plans, verification records, roadmap

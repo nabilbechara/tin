@@ -1,7 +1,7 @@
 # Tin primer for agents (strict Tin)
 
-Tin is a self-hosted, Go-like language that compiles to native code for macOS arm64 and
-Linux arm64 (x86-64 in progress). AI writes all Tin code: optimize for speed and
+Tin is a self-hosted, Go-like language that compiles to native code for macOS arm64,
+Linux arm64 and Linux x86-64. AI writes all Tin code: optimize for speed and
 robustness, not human ergonomics. Root: /Users/yasserreslan/Desktop/tin. Full reference:
 docs/LANGUAGE.md (language), docs/STDLIB.md (packages), docs/TOOLING.md (commands),
 docs/RUNTIME.md (memory, layouts, trusted code).
@@ -43,6 +43,11 @@ the compiler: write a minimal repro to notes/compiler_bugs_NAME.md and work arou
   `argo.Put(mut buf, v)`; receivers and append/copy/delete take none.
 - No `go` statements, no shared mutable globals: every global is per core (each core thread has its own
   copy, initialized on every core). Concurrency is thread-per-core via hearth; messages via relay.
+  Function literals cannot capture, so clients a handler uses are globals opened in their initializer:
+  `var cache = redis.Open(redis.Options{Addr: quarry.Getenv("REDIS_ADDR")})` (one per core, lazy).
+- In anvil each request runs in its own task: a call that waits (tide.Wait, wire, quarry files, redis,
+  mysql, websocket Read) lets the core serve others. Requests have a deadline (TIN_DEADLINE_MS, default
+  30 s); waits past it fail with "deadline exceeded".
 - Memory: no GC. Allocations during a request go to the core's request pool (wiped per request);
   globals live in the long-lived ingot heap. Storing request memory into a global (or anything a global
   holds) without `keep(x)` is a compile error. keep() deep-copies into the ingot heap.
@@ -53,6 +58,10 @@ the compiler: write a minimal repro to notes/compiler_bugs_NAME.md and work arou
   say.Str(x) -> str; verbs %d %s %q %v %x %f %5.2f %-4s etc. Floats print like Go's %v.
 - Strings interpolate: "user {u.Name} has {n} items", "{price:.2} {id:x} [{name:-8}]"; {{ and }} are braces;
   no quotes inside {...}; `raw` backquote strings do not interpolate.
+- Queries: where a parameter has type `query`, a literal keeps its values apart from its text:
+  `db.Query("SELECT name FROM users WHERE id = {id}")` binds id, `cache.Do("SET user:{id} {body}")`
+  sends three arguments. Passing a `str` there is a compile error; values must be integers, floats,
+  str, bool or []u8, with no format spec.
 - for i := 0; i < n; i++ {}, for cond {}, for {}, for i, x := range slice/str/map {}, switch x { case a, b: }.
   Methods: `func (p Point) Name() str`. Multiple returns. Composite literals T{F: v}, []T{...}, map[K]V{...}.
 - Enums: `type Shape enum { Circle(r f64), Rect(w, h f64), Empty }`, built as `Shape.Circle(2)`, read with
@@ -84,7 +93,8 @@ Keep comments one line, ending with a period.
 say(fmt) twine(strings) glyph(utf8) mint(strconv) argo(JSON) anvil(HTTP server) wire(TCP, HTTP client)
 hearth(cores) relay(cross-core messages) tide(time) quarry(os/files/env) trail(paths) lever(flags/args)
 sift(sort/search) cairn(containers) gauge(math) dice(random) stamp(non-crypto hashes) seal(SHA-256,
-HMAC, base64, hex) ore(bytes) flume(buffered I/O) herald(logging) crucible(testing). Signatures:
+HMAC, base64, hex, RSA-OAEP) ore(bytes) flume(buffered I/O) herald(logging) crucible(testing)
+redis(Redis client) mysql(MySQL client) websocket(WebSocket server via anvil, and client). Signatures:
 docs/STDLIB.md.
 
 ## Tests in your own packages

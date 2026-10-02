@@ -5,6 +5,10 @@ Measured on an Apple M3 Pro (5 performance + 6 efficiency cores), Go 1.26, fasth
 machine as the server. Linux numbers come from an arm64 Debian container under Docker
 Desktop, running natively. Scripts: TOOLING.md §7.
 
+The v0.4 service benchmark (`GET /users/{id}` through Redis over MySQL, Tin vs Go + chi
+under wrk2, `bench/v04`) is built but not yet measured on a quiet machine; its results
+will go here (issue #74).
+
 ## 1. HTTP
 
 **macOS, 1 server core, wrk -t4 -c100, median of 3** (the server is the bottleneck):
