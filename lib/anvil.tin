@@ -95,6 +95,7 @@ shared var gLoad i64    // live connections per core, one cache line each; a han
 shared var gStop i64    // 1 once SIGTERM or SIGINT started the graceful shutdown (core 0 only)
 shared var gDrained i64 // cores that stopped and have no connection left
 shared var gGrace i64   // seconds the shutdown waits for connections to finish (TIN_GRACE, default 25)
+shared var gTok i64     // 256 bytes: 1 for each byte a token (a field name) may hold (RFC 9110 5.6.2)
 
 var myID i64
 var draining bool     // this core stopped accepting; its connections close after their next response
@@ -217,6 +218,11 @@ func ServeN(addr str, n i64, h func(Req, mut Out)) ! {
 	gCores = n
 	gPipes = calloc(2*n, 8)
 	gLoad = rt_aligned_alloc(n * 128)
+	gTok = calloc(256, 1)
+	tc := "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+	for i := 0; i < len(tc); i++ {
+		store8(gTok+i64(tc[i]), 1)
+	}
 	fds := calloc(2, 4)
 	for i := 0; i < n; i++ {
 		pipe(fds)
@@ -848,34 +854,37 @@ func serve_one(c i64, p i64, n i64) i64 {
 			return -1
 		}
 		h := p + pos
-		k := memchr(h, ':', l)
-		if k != 0 {
-			kn := k - h
-			f := lower(load8(h))
-			if f == 'c' && kn == 14 && name_is(h, kn, "content-length") {
-				v := parse_cl(h+kn+1, l-kn-1)
-				// Repeated Content-Length headers must agree, or the framing is ambiguous (RFC 9112 6.3).
-				if v < 0 || (seenCL && v != cl) {
-					bad(c, 400)
-					return -1
-				}
-				cl = v
-				seenCL = true
-			} else if f == 'c' && kn == 10 && name_is(h, kn, "connection") {
-				j := kn + 1
-				for j < l && (load8(h+j) == ' ' || load8(h+j) == '\t') {
-					j++
-				}
-				v := load8(h + j)
-				if v == 'c' || v == 'C' {
-					alive = false
-				} else if v == 'k' || v == 'K' {
-					alive = true
-				}
-			} else if f == 't' && kn == 17 && name_is(h, kn, "transfer-encoding") {
-				bad(c, 501)
+		kn := field_name(h, l)
+		if kn == 0 {
+			// Rejected, not skipped: a parser that trims or unfolds the line could frame
+			// the request differently (RFC 9112 5.1, 5.2).
+			bad(c, 400)
+			return -1
+		}
+		f := lower(load8(h))
+		if f == 'c' && kn == 14 && name_is(h, kn, "content-length") {
+			v := parse_cl(h+kn+1, l-kn-1)
+			// Repeated Content-Length headers must agree, or the framing is ambiguous (RFC 9112 6.3).
+			if v < 0 || (seenCL && v != cl) {
+				bad(c, 400)
 				return -1
 			}
+			cl = v
+			seenCL = true
+		} else if f == 'c' && kn == 10 && name_is(h, kn, "connection") {
+			j := kn + 1
+			for j < l && (load8(h+j) == ' ' || load8(h+j) == '\t') {
+				j++
+			}
+			v := load8(h + j)
+			if v == 'c' || v == 'C' {
+				alive = false
+			} else if v == 'k' || v == 'K' {
+				alive = true
+			}
+		} else if f == 't' && kn == 17 && name_is(h, kn, "transfer-encoding") {
+			bad(c, 501)
+			return -1
 		}
 		pos += l + 1
 	}
@@ -1063,6 +1072,21 @@ func Deadline(ms i64) {
 // is_http1 reports whether the 8 bytes at p start with "HTTP/1.".
 func is_http1(p i64) bool {
 	return load8(p) == 'H' && load8(p+1) == 'T' && load8(p+2) == 'T' && load8(p+3) == 'P' && load8(p+4) == '/' && load8(p+5) == '1' && load8(p+6) == '.'
+}
+
+// field_name is the length of the name of the header line at h (l bytes): a token
+// followed by ':'. 0 means it is not a field line: no colon, an empty name, whitespace
+// before the colon, obs-fold or another byte a token cannot hold.
+func field_name(h i64, l i64) i64 {
+	tok := gTok
+	i := 0
+	for i < l && load8(tok+i64(load8(h+i))) != 0 {
+		i++
+	}
+	if i < l && load8(h+i) == ':' {
+		return i
+	}
+	return 0
 }
 
 // parse_cl parses a Content-Length value (n bytes at p): the length, -1 when it is not a plain decimal number.
