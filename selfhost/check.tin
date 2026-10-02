@@ -617,6 +617,11 @@ fn check_const(c) {
     set_file(c[D_FILE]);
     ck_legacy = !vec_get(file_v2, ck_file);
     ck_fn = 0;
+    check_const_value(c);
+}
+
+// Evaluate in the caller's lexical scope; local declarations keep the current function.
+fn check_const_value(c) {
     let s = c[D_SYM];
     if s[S_DECL] != c {
         return;
@@ -636,6 +641,11 @@ fn check_const(c) {
                 err_type(c[D_POS], "cannot use an integer constant as ", want, "");
             }
             s[S_TYPE] = want;
+            if !ck_legacy && is_integer_t(want) {
+                let value = mk_int(c[D_POS], v, 0);
+                value[8] = s[S_BIG];
+                adapt_int(value, want);
+            }
         }
         if ck_legacy {
             s[S_TYPE] = ty_int;
@@ -646,6 +656,9 @@ fn check_const(c) {
         }
         let copy = expr_clone(init);
         let t = chk(copy, want);
+        if want {
+            check_assignable(copy, t, want);
+        }
         if !is_const_value(copy) {
             err_at(init[N_POS], "expression is not a constant");
         }
@@ -1179,7 +1192,9 @@ fn has_break(stmts) {
     return 0;
 }
 
-fn declare_local(pos, name, t) {
+fn declare_scoped(s) {
+    let pos = s[S_POS];
+    let name = s[S_NAME];
     let start = vec_get(sc_marks, sc_marks[VEC_LEN] - 1);
     if load8(name) != '$' {
         let i = sc_syms[VEC_LEN] - 1;
@@ -1198,12 +1213,16 @@ fn declare_local(pos, name, t) {
             i = i - 1;
         }
     }
+    vec_push(sc_syms, s);
+}
+
+fn declare_local(pos, name, t) {
     let s = sym_new(SYM_LOCAL, name, pos);
     s[S_TYPE] = t;
+    declare_scoped(s);
     s[S_SLOT] = ck_fn[F_SLOTS];
     ck_fn[F_SLOTS] = ck_fn[F_SLOTS] + 1;
     vec_push(ck_fn[F_LOCALS], s);
-    vec_push(sc_syms, s);
     return s;
 }
 
@@ -1521,7 +1540,9 @@ fn from_bits(e, t) {
 
 fn check_stmt(s) {
     let k = s[N_KIND];
-    if k == ST_LET {
+    if k == ST_CONST {
+        check_local_consts(s);
+    } else if k == ST_LET {
         check_let(s);
     } else if k == ST_ASSIGN {
         check_assign(s);
@@ -1606,6 +1627,33 @@ fn check_stmt(s) {
     } else if k == ST_DEFER {
         lower_defer(s);
     }
+}
+
+// Constants become literals at their uses and require no stack slot or runtime work.
+fn check_local_consts(stmt) {
+    let decls = stmt[2];
+    let i = 0;
+    while i < decls[VEC_LEN] {
+        let start = i;
+        let pos = vec_get(decls, i)[D_POS];
+        // Names in one specification enter scope together, after all initializers.
+        while i < decls[VEC_LEN] && vec_get(decls, i)[D_POS] == pos {
+            let d = vec_get(decls, i);
+            let s = sym_new(SYM_CONST, d[D_NAME], d[D_POS]);
+            s[S_DECL] = d;
+            d[D_SYM] = s;
+            check_const_value(d);
+            i = i + 1;
+        }
+        while start < i {
+            let d = vec_get(decls, start);
+            if !streq(d[D_NAME], "_") {
+                declare_scoped(d[D_SYM]);
+            }
+            start = start + 1;
+        }
+    }
+    replace_node(stmt, empty_block(stmt[N_POS]));
 }
 
 // ---- defer ----

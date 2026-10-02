@@ -311,6 +311,12 @@ const (
 )
 ```
 
+- Constants may be declared at package level or inside functions and nested blocks,
+  including parenthesized groups with `iota`. A local name enters scope after its
+  declaration and ends at the enclosing block; it may shadow an outer name. Names in
+  one specification (`const a, b = ...`) enter scope together, after both initializers.
+- Initializers must be constant expressions. Constants cannot be reassigned, incremented,
+  or redeclared in the same scope. They require no runtime storage.
 - Untyped constants take the type the context needs and must fit it: `var b u8 = 300`
   and `i8(200)` are compile errors.
 - Constant expressions are folded exactly in 64 bits; values above 2^63-1 are treated as
