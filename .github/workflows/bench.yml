@@ -1,0 +1,61 @@
+name: Benchmark v0.4
+
+# GET /users/{id} through Redis over MySQL: Tin vs Go + chi under wrk2 (bench/v04/run.py).
+# Runs on demand (Actions > Benchmark v0.4 > Run workflow); the table goes to the job summary.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  users:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    services:
+      redis:
+        image: redis:7.2
+        ports: ['6379:6379']
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: bench
+          MYSQL_USER: bench
+          MYSQL_PASSWORD: benchpass
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd="mysqladmin ping -h127.0.0.1 -proot" --health-interval=5s --health-timeout=5s --health-retries=30
+    env:
+      REDIS_ADDR: 127.0.0.1:6379
+      MYSQL_ADDR: 127.0.0.1:3306
+      MYSQL_USER: bench
+      MYSQL_PASSWORD: benchpass
+      MYSQL_DATABASE: bench
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Build Tin
+        run: make bootstrap
+      - name: Build wrk2
+        run: |
+          git clone --depth 1 https://github.com/giltene/wrk2.git /tmp/wrk2
+          make -C /tmp/wrk2 -j4 > /tmp/wrk2/build.log 2>&1 || { tail -30 /tmp/wrk2/build.log; exit 1; }
+      - name: Seed MySQL
+        run: python3 bench/v04/seed.py | mysql -h127.0.0.1 -P3306 -ubench -pbenchpass bench
+      - name: Run (2 cores per server, wrk2 with 2 threads)
+        env:
+          WRK2: /tmp/wrk2/wrk
+          CORES: '2'
+          THREADS: '2'
+          CONNS: '128'
+          ROUNDS: '3'
+          SECS: '20'
+        run: |
+          python3 bench/v04/run.py | tee /tmp/bench.txt
+          { echo '```'; cat /tmp/bench.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

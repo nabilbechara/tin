@@ -1,0 +1,109 @@
+package main
+
+import "anvil"
+import "argo"
+import "mint"
+import "mysql"
+import "quarry"
+import "redis"
+import "say"
+import "tide"
+
+// The v0.4 benchmark service (bench/v04/go/main.go is the same in Go with chi):
+//   GET /users/{id}   the user as JSON: from Redis, else MySQL (then cached for 60 s)
+//   GET /db/users/{id} the user as JSON straight from MySQL
+//   GET /slow         answers after 50 ms (a slow upstream), to mix with fast requests
+type User struct {
+	id      i64
+	name    str
+	email   str
+	score   f64
+	created str
+}
+
+var cache = redis.Open(redis.Options{Addr: quarry.Getenv("REDIS_ADDR")})
+
+var db = mysql.Open(mysql.Options{
+	Addr:     quarry.Getenv("MYSQL_ADDR"),
+	User:     quarry.Getenv("MYSQL_USER"),
+	Password: quarry.Getenv("MYSQL_PASSWORD"),
+	Database: quarry.Getenv("MYSQL_DATABASE"),
+	Pool:     16,
+})
+
+func upstream(w mut anvil.Out, err fault) {
+	w.Status(502)
+	w.Text("{err}")
+}
+
+// from_db reads user id from MySQL and returns it as JSON ("" when there is none).
+func from_db(id i64) !str {
+	rows := try db.Query("SELECT id, name, email, score, created FROM users WHERE id = {id}")
+	if len(rows.Rows) == 0 {
+		return ""
+	}
+	r := rows.Rows[0]
+	b := make([]u8, 0, 256)
+	argo.Put(mut b, User{id: r[0].Int(), name: r[1].Text(), email: r[2].Text(), score: r[3].Float(), created: r[4].Text()})
+	return str(b)
+}
+
+func user(q anvil.Req, w mut anvil.Out, at i64, cached bool) {
+	id := mint.Atoi(q.Path[at:]) catch _ {
+		w.Status(404)
+		w.Text("no such user")
+		return
+	}
+	key := "user:{id}"
+	if cached {
+		v, found := cache.Get(key) catch err {
+			upstream(mut w, err)
+			return
+		}
+		if found {
+			w.Json()
+			w.Text(v)
+			return
+		}
+	}
+	body := from_db(id) catch err {
+		upstream(mut w, err)
+		return
+	}
+	if body == "" {
+		w.Status(404)
+		w.Text("no such user")
+		return
+	}
+	if cached {
+		cache.SetEx(key, body, 60*tide.Second) catch err {
+			upstream(mut w, err)
+			return
+		}
+	}
+	w.Json()
+	w.Text(body)
+}
+
+func handle(q anvil.Req, w mut anvil.Out) {
+	if len(q.Path) > 7 && q.Path[:7] == "/users/" {
+		user(q, mut w, 7, true)
+		return
+	}
+	if len(q.Path) > 10 && q.Path[:10] == "/db/users/" {
+		user(q, mut w, 10, false)
+		return
+	}
+	if q.Path == "/slow" {
+		tide.Wait(50 * tide.Millisecond) catch _ {}
+		w.Text("slow")
+		return
+	}
+	w.Status(404)
+	w.Text("not found")
+}
+
+func main() {
+	err := anvil.Serve(":9190", handle)
+	say.Line("server:", err)
+}

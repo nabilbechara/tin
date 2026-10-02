@@ -82,7 +82,8 @@ CI and the issue-to-regression workflow: [docs/CI.md](docs/CI.md).
 | mint | number/string conversion | | seal | SHA-256, HMAC, base64, hex |
 | gauge | math | | herald | logging |
 | ore | byte slices | | crucible | test checks, benchmarks |
-| flume | buffered I/O | | | |
+| flume | buffered I/O | | redis | Redis client (pipelined) |
+| websocket | WebSocket server and client | | mysql | MySQL client (pooled) |
 
 Each package is tested in `tests/v2/` and checked against an equivalent Go program
 (`bench/ref/`); see [notes/stdlib_verified.md](notes/stdlib_verified.md).
@@ -165,10 +166,12 @@ notes/       verification notes, benchmark analyses, roadmap
 
 ## Status and next steps
 
-Targets: darwin-arm64 and linux-arm64 are complete (all tests pass on both in CI, and the
-compiler self-hosts on both); linux-amd64 passes every test and self-hosts in an emulated
-container but is not yet in CI; see
-[docs/PORTING.md](docs/PORTING.md). Handlers in anvil run to completion, one at a time per core:
-a handler that waits on a database or another service stalls its core. Non-blocking I/O
-inside handlers (stackful tasks per request, per-request pools, Redis and MySQL clients)
-is the next milestone; see [notes/roadmap.md](notes/roadmap.md).
+Targets: darwin-arm64, linux-arm64 and linux-amd64, each tested natively in CI, and the
+compiler self-hosts on all three; see [docs/PORTING.md](docs/PORTING.md).
+
+v0.4: each anvil request runs in its own task with its own stack and pool, so a handler
+that waits (`tide.Wait`, `wire`, `quarry` files, `redis`, `mysql`, `websocket`) lets its
+core serve other requests meanwhile. Sockets are non-blocking; DNS and file I/O go to
+helper threads; every request has a deadline. Statements and commands are `query`
+values, so a value is always sent apart from the text. See
+[docs/RUNTIME.md](docs/RUNTIME.md) and [notes/roadmap.md](notes/roadmap.md).

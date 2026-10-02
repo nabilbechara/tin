@@ -31,3 +31,8 @@ Done when: a 100ms-wait handler on a core does not delay fast requests on that c
 /users/{id} via Redis cache backed by MySQL, wrk2 vs the same service in Go with chi: Tin wins
 on req/s and p99, including a slow/fast mix. make bootstrap stays a fixed point, tests green.
 Show the design (task switching, stack size, pool ownership) before building.
+
+Status (2026-10-02): phases 9–12 and the websocket package are merged (#64–#73): request
+tasks, non-blocking I/O and helper threads, `query`, redis, mysql, websocket. Phase 13's
+service and harness are in bench/v04 (Tin and Go + chi, wrk2); the final measurement on a
+quiet machine is still to do (see the open benchmark issue).
