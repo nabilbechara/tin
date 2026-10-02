@@ -499,6 +499,58 @@ func caseDuplicateCL() {
 	result("duplicate-content-length", allOK, "conflicting -> 400+close, identical accepted %s", strings.Join(notes, "; "))
 }
 
+// caseFieldLines checks that a header line that is not "token: value" is rejected and the
+// connection closed before a pipelined follow-up runs (RFC 9112 5.1, 5.2): a parser that
+// trims, unfolds or skips the line would frame the request differently.
+func caseFieldLines() {
+	follow := "GET /json HTTP/1.1\r\nHost: x\r\n\r\n"
+	cases := []struct{ name, line, body string }{
+		{"space-before-colon", "Content-Length : 5", "hello"},
+		{"tab-before-colon", "Content-Length\t: 5", "hello"},
+		{"te-space-before-colon", "Transfer-Encoding : chunked", "5\r\nhello\r\n0\r\n\r\n"},
+		{"obs-fold", "X-A: 1\r\n Content-Length: 5", "hello"},
+		{"no-colon", "Content-Length 5", "hello"},
+		{"empty-name", ": 5", "hello"},
+		{"space-in-name", "Content Length: 5", "hello"},
+		{"control-in-name", "Content-Length\x0b: 5", "hello"},
+	}
+	allOK := true
+	var notes []string
+	for _, tc := range cases {
+		raw := "POST /echo HTTP/1.1\r\nHost: x\r\n" + tc.line + "\r\n\r\n" + tc.body + follow
+		rs, c, r, err := roundTrip(raw, false)
+		if err != nil {
+			if !(err == io.EOF || isReset(err)) {
+				allOK = false
+				notes = append(notes, tc.name+": "+err.Error())
+			}
+			continue
+		}
+		closed, why := closedSoon(c, r, time.Second)
+		c.Close()
+		if rs.status != 400 || !closed {
+			allOK = false
+			notes = append(notes, fmt.Sprintf("%s: status %d %s", tc.name, rs.status, why))
+		}
+	}
+	// Every token character may appear in a name, and the space after the colon is optional.
+	raw := "POST /echo HTTP/1.1\r\nHost:x\r\nX-Tchar!#$%&'*+-.^_`|~09AZaz: v\r\nContent-Length:5\r\n\r\nhello" + follow
+	rs, c, r, err := roundTrip(raw, false)
+	if err != nil {
+		allOK = false
+		notes = append(notes, "valid: "+err.Error())
+	} else {
+		e, jerr := echoOf(rs)
+		rs2, err2 := readResp(r, false)
+		c.Close()
+		if rs.status != 200 || jerr != nil || e.Length != 5 || err2 != nil || rs2.status != 200 {
+			allOK = false
+			notes = append(notes, fmt.Sprintf("valid: status %d, length %d, follow-up %v", rs.status, e.Length, err2))
+		}
+	}
+	result("header-field-lines", allOK, "%d malformed -> 400+close, tokens accepted %s", len(cases), strings.Join(notes, "; "))
+}
+
 func caseClientCloseMid() {
 	partials := []string{
 		"GET /js",
@@ -915,6 +967,7 @@ func main() {
 		{"head", caseHEAD},
 		{"malformed", caseMalformed},
 		{"duplicate-cl", caseDuplicateCL},
+		{"field-lines", caseFieldLines},
 		{"client-close", caseClientCloseMid},
 		{"query", caseQueryDecoding},
 		{"large-response", caseLargeResponse},
