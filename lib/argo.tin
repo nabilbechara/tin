@@ -1,6 +1,8 @@
 // Package argo writes JSON. argo.Put(b, v) appends v to the []u8 buffer b; the compiler
 // generates a dedicated encoder for v's type (fields in declaration order, no reflection,
-// no allocation). The w* writers below are what those encoders call.
+// no allocation). The w* writers below are what those encoders call. argo.Get(s, v) fills
+// v from the JSON text s with a decoder generated the same way; it returns a fault for
+// arrays and objects nested more than 512 deep, as each level takes stack.
 package argo
 
 import "say"
@@ -165,10 +167,16 @@ func wfloat32(b mut []u8, v f32) {
 // calls the r* readers below, which record the first error in the Parser and then do
 // nothing, so decoders only test p.err at loop boundaries.
 
+// maxDepth bounds the arrays and objects open at once: each holds a stack frame of rskip
+// (32 bytes) or of a decoder (80 for a small struct, 240 for one of 32 fields), and a
+// request task has 256 KiB of stack.
+const maxDepth = 512
+
 type Parser struct {
-	s   str
-	i   i64
-	err fault
+	s     str
+	i     i64
+	depth i64 // arrays and objects open at i
+	err   fault
 }
 
 func parser(s str) Parser {
@@ -216,13 +224,7 @@ func robj(p mut Parser) bool {
 		bad(mut p, "an object")
 		return false
 	}
-	p.i++
-	ws(mut p)
-	if p.i < len(p.s) && p.s[p.i] == '}' {
-		p.i++
-		return false
-	}
-	return true
+	return nest(mut p, '}')
 }
 
 // rarr consumes '[' and reports whether an element follows.
@@ -232,12 +234,23 @@ func rarr(p mut Parser) bool {
 		bad(mut p, "an array")
 		return false
 	}
+	return nest(mut p, ']')
+}
+
+// nest consumes the '{' or '[' at p.i and reports whether a member follows (close right
+// away is consumed). The array or object counts toward maxDepth until rmore closes it.
+func nest(p mut Parser, close u8) bool {
+	if p.depth == maxDepth {
+		bad(mut p, say.Fmt("at most %d nested arrays and objects", maxDepth))
+		return false
+	}
 	p.i++
 	ws(mut p)
-	if p.i < len(p.s) && p.s[p.i] == ']' {
+	if p.i < len(p.s) && p.s[p.i] == close {
 		p.i++
 		return false
 	}
+	p.depth++
 	return true
 }
 
@@ -252,6 +265,7 @@ func rmore(p mut Parser, close u8) bool {
 		}
 		if c == close {
 			p.i++
+			p.depth--
 			return false
 		}
 	}
