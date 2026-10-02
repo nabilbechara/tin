@@ -12,7 +12,7 @@ Every push to `main` and every pull request runs native Linux arm64 (`ubuntu-24.
 - Request tasks (`task_check.py`): waits on one core overlap, fast requests stay fast behind waiting ones (timers, proxied `wire` calls, helper-thread file I/O), deadlines give 504, refused upstreams 502, and pipelined responses keep their order.
 - Router (`router_check.py`, server `tools/ci/fixtures/router.tin`): on one core and on two, 1200 keep-alive requests interleave routes whose middleware and handlers wait, and every answer must carry its own path parameter and middleware trace; waits in a routed handler or middleware overlap; 404, 405 with `Allow`, HEAD, bodies, a catch-all and pipelined order go through the router; and 20 WebSocket connections are accepted by a routed handler. The router's matching rules and errors are in `tests/v2/router.tin` and `router*_bad.tin`.
 - Runtime lifetimes (`lifetime_check.py`): overlapping formatting on one core, deadlines for running and queued helper jobs, safe late read/write completion after task reuse, per-message WebSocket pool bounds, fragmented/control traffic, retained `Read` results, and automatic buffer cleanup after 300 connection cycles. Private probes are injected into temporary library copies.
-- Clients and protocols, each against a small server written in Python inside the check, so no service has to be installed: `redis_check.py` (concurrent load, command batching, deadlines that keep replies in step, reconnects, AUTH), `mysql_check.py` (bound values, pool waits, deadlines, both auth plugins including the RSA exchange, wrong passwords, reconnects) and `websocket_check.py` (RFC 6455 rules, 300 idle connections and 20 concurrent streams on one core, the Tin client). On `ubuntu-24.04` the MySQL check also runs against the runner's own MySQL 8; `REDIS_ADDR` / `MYSQL_ADDR` point the checks at real servers locally.
+- Clients and protocols, each against a small server written in Python inside the check, so no service has to be installed: `redis_check.py` (concurrent load, command batching, deadlines that keep replies in step, reconnects, AUTH), `mysql_check.py` (bound values, pool waits, deadlines, both auth plugins including the RSA exchange, wrong passwords, reconnects), `postgres_check.py` (SCRAM/MD5/cleartext, Unicode passwords, typed binary parameters, OID results, statement cache eviction, transactions, pool waits, deadlines, malformed frames and 1000 inserts) and `websocket_check.py` (RFC 6455 rules, 300 idle connections and 20 concurrent streams on one core, the Tin client). On `ubuntu-24.04` the MySQL check also runs against the runner's own MySQL 8 and the PostgreSQL check runs against its preinstalled PostgreSQL with a SCRAM user; `REDIS_ADDR` / `MYSQL_ADDR` / `POSTGRES_ADDR` point the checks at real servers locally.
 - The v0.4 service benchmark (`.github/workflows/bench.yml`) is separate and runs only on demand: Redis and MySQL service containers, wrk2 built from source, Tin vs Go + chi. It is never a merge gate.
 - Harness self-tests ensure expected output cannot disguise crashes/timeouts or unexpectedly accepted negative programs.
 
@@ -52,9 +52,20 @@ python3 tools/ci/router_check.py          # routed server: parameters, middlewar
 python3 tools/ci/lifetime_check.py        # formatting, helper deadlines, WebSocket lifetimes
 python3 tools/ci/redis_check.py           # REDIS_ADDR=host:port for a real Redis
 python3 tools/ci/mysql_check.py           # MYSQL_ADDR, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE for a real MySQL
+python3 tools/ci/postgres_check.py        # POSTGRES_ADDR, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DATABASE for a real PostgreSQL
 python3 tools/ci/websocket_check.py
 ```
 
 `tools/linuxtest.sh` and `tools/x64fuzz/linuxtest_amd64.sh` use the same strict runner for Docker cross-tests. They check negative diagnostics on the build host and positive outputs/exit codes in the chosen image. `TIN_LINUX_IMAGE` chooses the image; `TIN_ROOT` can select a library tree. The old `X64_TEST_DIR` output option is replaced by unique temporary directories and logs under `bin/ci/`.
 
 Diagnostics are uploaded for 14 days even if a job fails. No compiled output is cached: a stale compiler or test binary cannot make a fresh checkout pass.
+
+PostgreSQL checks use a private users table in the selected database; choose a throwaway
+instance/database for local real-server checks. They exercise `examples/postgres.tin`
+with extra test routes compiled only into the fixture service. No downloads are needed
+for the fake checks. The native Ubuntu x86-64 CI job starts the runner's PostgreSQL and
+creates a dedicated `tin` database/user with a SCRAM verifier; it does not install packages.
+`POSTGRES_TIMEOUT_MS` configures the example's operation timeout independently of
+`TIN_DEADLINE_MS`. The crypto suite checks published PBKDF2/RFC 1321 vectors and Unicode
+normalization/bidirectional/prohibited-input cases; `tools/gen_saslprep.py` regenerates
+fixed Unicode 3.2 tables with Python's standard library.

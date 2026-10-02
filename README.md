@@ -99,14 +99,16 @@ CI and the issue-to-regression workflow: [docs/CI.md](docs/CI.md).
 | wire | TCP, HTTP client | | sift | sorting, searching |
 | twine | strings | | cairn | heaps, deques, sets, LRU |
 | glyph | UTF-8 | | stamp | CRC-32, FNV, xxHash64 |
-| mint | number/string conversion | | seal | SHA-256, HMAC, base64, hex |
+| mint | number/string conversion | | seal | SHA-256, HMAC, PBKDF2, base64, hex |
 | gauge | math | | herald | logging |
 | ore | byte slices | | crucible | test checks, benchmarks |
 | flume | buffered I/O | | redis | Redis client (pipelined) |
 | websocket | WebSocket server and client | | mysql | MySQL client (pooled) |
+| postgres | PostgreSQL client (pooled, SCRAM) | | | |
 
-Each package is tested in `tests/v2/` and checked against an equivalent Go program
-(`bench/ref/`); see [notes/stdlib_verified.md](notes/stdlib_verified.md).
+Language and library checks live in `tests/v2/`, and protocol client checks in
+`tools/ci/`. Core library behavior is also checked against Go equivalents in
+`bench/ref/`; see [notes/stdlib_verified.md](notes/stdlib_verified.md).
 
 ## Performance
 
@@ -190,7 +192,7 @@ Targets: darwin-arm64, linux-arm64 and linux-amd64, each tested natively in CI, 
 compiler self-hosts on all three; see [docs/PORTING.md](docs/PORTING.md).
 
 v0.4: each anvil request runs in its own task with its own stack and pool, so a handler
-that waits (`tide.Wait`, `wire`, `quarry` files, `redis`, `mysql`, `websocket`) lets its
+that waits (`tide.Wait`, `wire`, `quarry` files, `redis`, `mysql`, `postgres`, `websocket`) lets its
 core serve other requests meanwhile. Sockets are non-blocking; DNS and file I/O go to
 helper threads; every request has a deadline. Statements and commands are `query`
 values, so a value is always sent apart from the text. See

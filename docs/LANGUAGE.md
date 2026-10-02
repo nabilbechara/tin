@@ -893,10 +893,11 @@ err2 := argo.Get(text, mut xs)      // appends decoded elements
   message or `null`).
 - `argo.Get(text, mut v)` fills a struct, slice (appending) or map (adding entries); nested
   struct fields are filled in place, `?T` fields accept `null`, unknown members are
-  skipped, sized integers are range checked (`700` into a `u8` is a fault), and trailing
-  garbage is a fault, as are arrays and objects nested more than 512 deep (each level
-  takes stack, and a request handler's stack is 256 KiB). Error messages name the offset:
-  `argo: expected an integer in [0, 65535] at offset 8, found "7"`.
+  skipped, numbers follow the JSON grammar and must fit their type (`007`, `1.`, `700` into
+  a `u8` and `1e400` into an `f64` are faults), and trailing garbage is a fault, as are
+  arrays and objects nested more than 512 deep (each level takes stack, and a request
+  handler's stack is 256 KiB). Error messages name the offset: `argo: expected an integer
+  in [0, 65535] at offset 8, found "7"`.
 - `argo.Str(b, s)` and `argo.Raw(b, json)` write pieces by hand.
 
 ---
