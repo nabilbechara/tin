@@ -252,6 +252,24 @@ def conformance(port, failures):
     got, closed = first(b'GET /users/9?ms=200 HTTP/1.1\r\nHost: x\r\n\r\n', wait=5, shut=True)
     if not got.startswith(b'HTTP/1.1 200 ') or not got.endswith(b'user 9 stamp>tag /users/{id}') or not closed:
         failures.append('half-closed client with a waiting request: %r closed=%s' % (got, closed))
+    # #103: a client that sends Expect: 100-continue waits for 100 Continue before its body.
+    with socket.create_connection(('127.0.0.1', port), timeout=10) as s:
+        s.sendall(b'POST /users HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n')
+        s.settimeout(1)
+        try:
+            interim = s.recv(100)
+        except socket.timeout:
+            interim = b'(nothing within 1 s)'
+        s.sendall(b'hello')
+        s.settimeout(10)
+        rest = b''
+        while True:
+            d = s.recv(65536)
+            if not d:
+                break
+            rest += d
+        if interim != b'HTTP/1.1 100 Continue\r\n\r\n' or not rest.startswith(b'HTTP/1.1 201 ') or not rest.endswith(b'created 5'):
+            failures.append('Expect: 100-continue: %r then %r' % (interim, rest))
     print('request conformance (#183):', not failures)
 
 

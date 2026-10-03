@@ -208,6 +208,8 @@ reading resumes and buffered input is served.
   whitespace before it, obs-fold, a name that is not a token), a CR or NUL inside a header
   line, an HTTP/1.1 request without exactly one `Host`, or a bad `Content-Length` gets
   400; `Transfer-Encoding` gets 501.
+- A request with `Expect: 100-continue` whose body has not arrived gets
+  `HTTP/1.1 100 Continue` first (clients such as curl and the AWS SDKs wait for it).
 - An absolute-form target (`GET http://host/path?q HTTP/1.1`) is routed on its path and
   query; an empty path is `/`.
 - Bodies are limited to 64 MiB by default (413); `anvil.Limits` or `TIN_MAX_BODY` changes it.

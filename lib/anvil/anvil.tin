@@ -115,7 +115,8 @@ const cHijack = 13 // taken out of HTTP by its handler (Req.Hijack): closed when
 const cDeadline = 14 // monotonic ns after which the sweep closes the connection (0: none)
 const cStart = 15    // when the first bytes of the request still arriving came (0: none pending)
 const cLinger = 16   // 1: close after an error response by lingering (see linger); 2: lingering
-const cWords = 17
+const cSent100 = 17  // the request still arriving was told 100 Continue
+const cWords = 18
 
 shared var gListen i64
 shared var gIP i64
@@ -1014,6 +1015,7 @@ func serve_one(c i64, p i64, n i64) i64 {
 		}
 	}
 	hosts := 0
+	expect100 := false
 	seenClose := false
 	pos := le + 1
 	cl := 0
@@ -1058,6 +1060,16 @@ func serve_one(c i64, p i64, n i64) i64 {
 		f := lower(load8(h))
 		if f == 'h' && kn == 4 && name_is(h, kn, "host") {
 			hosts++
+		} else if f == 'e' && kn == 6 && name_is(h, kn, "expect") {
+			j := kn + 1
+			for j < vl && (load8(h+j) == ' ' || load8(h+j) == '\t') {
+				j++
+			}
+			e := vl
+			for e > j && (load8(h+e-1) == ' ' || load8(h+e-1) == '\t') {
+				e--
+			}
+			expect100 = name_is(h+j, e-j, "100-continue")
 		} else if f == 'c' && kn == 14 && name_is(h, kn, "content-length") {
 			v := parse_cl(h+kn+1, l-kn-1)
 			// Repeated Content-Length headers must agree, or the framing is ambiguous (RFC 9112 6.3).
@@ -1104,9 +1116,17 @@ func serve_one(c i64, p i64, n i64) i64 {
 	}
 	if n < total {
 		c[cNeed] = total
+		if expect100 && !http10 && c[cSent100] == 0 {
+			// The client waits for this before sending its body (RFC 9110 10.1.1): without it,
+			// curl and most SDKs stall about a second on every upload.
+			ob_room(32)
+			ob_str("HTTP/1.1 100 Continue\r\n\r\n")
+			c[cSent100] = 1
+		}
 		return 0
 	}
 	c[cNeed] = 0
+	c[cSent100] = 0
 	if waiting >= maxWaiting {
 		// Backpressure: too many requests already wait on this core.
 		bad(c, 503)
