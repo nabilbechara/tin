@@ -19,10 +19,52 @@ development platform (docs/PORTING.md, "Platform roles").
 - **Continuous tracking:** `.github/workflows/bench-linux.yml` runs the CPU suite
   (`bench/v2`, Tin vs Go) and the HTTP suite (`bench/http/run_wrk.sh`, anvil vs fasthttp vs
   net/http) on `ubuntu-24.04` (x86-64) and `ubuntu-24.04-arm` every week, on demand and on
-  pull requests that change `bench/`, and writes the tables to the job summary.
+  pull requests that change `bench/`, `lib/` or `selfhost/`, and writes the tables to
+  the job summary. The same job compares the PR head with its merge base, each built
+  from its own seed, compiler, runtime and libraries. Manual runs accept `base_ref`;
+  manual runs without it and scheduled runs compare against the first parent.
 - **Existing macOS numbers:** the sections below were measured on the macOS development
   machine before this policy. They are kept for history until Linux reference runs replace
   them, section by section; do not add new macOS numbers.
+
+## Comparing revisions
+
+For libc-removal work ([phase plan](../notes/libc_removal.md)), use both native Linux
+jobs in `bench-linux.yml`. Each job retains Tin-versus-Go measurements and adds a
+base-versus-head comparison with identical benchmark source. Each compiler loads its
+own revision's `lib/` through an explicit `TIN_ROOT`; copying two compiler binaries
+into one source tree is not an allocator/runtime comparison.
+
+CPU measurements use at least seven alternating runs per side, check stdout and stderr
+on **every** run, and report medians plus head/base elapsed time. HTTP uses at least
+five alternating rounds per side on one server core, `/json` and `/plaintext`, with the
+same load generator and settings. It checks readiness, response bodies, process status
+and wrk errors; failed work is never a performance sample. JSON artifacts retain raw
+samples, and HTTP keeps per-run wrk output and server logs. Outputs, crashes, timeouts
+and invalid measurements fail the job. Timing alone never fails CI.
+
+A CPU head/base ratio above 1.05 or HTTP head/base req/s below 0.95 is marked **REVIEW**.
+Rerun the affected benchmark once; if it persists, fix it or attach a profile for the
+maintainer's decision before merging a runtime phase. Paste both architecture tables
+and the workflow links in the PR. These thresholds are review triggers, not evidence
+that a shared runner measures a 5% change precisely.
+
+With two already bootstrapped checkouts, run on the same native Linux machine:
+
+```sh
+python3 bench/compare.py --base-root /path/to/base --head-root /path/to/head --json bin/bench-cpu-compare.json
+python3 bench/compare.py --base-root /path/to/base --head-root /path/to/head --suite http --json bin/bench-http-compare.json
+# A focused CPU rerun (same seven samples per side):
+python3 bench/compare.py --base-root /path/to/base --head-root /path/to/head nbody
+# Reference measurements still compare against Go:
+BENCH_DIR=bench/v2 python3 bench/run.py --json bin/bench-cpu-reference.json
+```
+
+The default CPU input suite is the comparison script's `bench/v2`; `--bench-dir` selects
+another shared input suite. HTTP always compiles the head checkout's `examples/api.tin`
+with both compilers and their matching library trees. The shell entrypoint
+`bench/http/run_wrk.sh` keeps its positional arguments and also accepts
+`--base-api /path/to/base-server --head-api /path/to/head-server` (at least five rounds).
 
 ## Measurement setup of the existing numbers (macOS development machine)
 
