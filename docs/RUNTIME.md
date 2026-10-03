@@ -55,7 +55,10 @@ cores never share a line.
 - `rt_pool_reset()` zeroes the used part of the first chunk, frees the overflow chunks
   and big blocks, and rewinds the bump pointer.
 - anvil calls it after every response, `relay`/tick handlers after each run, and
-  `hearth.Reset()` exposes it.
+  `hearth.Reset()` exposes it. The compiler rejects reading a local that may hold request
+  memory after a `hearth.Reset()` (called directly or through the program's own functions)
+  until it is assigned again, on any path, loops included: keep() it before the reset or
+  create it after.
 - Plain programs never reset: they release everything at exit.
 
 **Ingot heap.** `rt_ingot_alloc(n)` serves blocks from 16 size classes (16, 32, 48, 64,

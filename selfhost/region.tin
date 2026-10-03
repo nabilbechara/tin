@@ -30,6 +30,10 @@ var rg_multi;     // per-result bits of the last call (for ST_CALLMULTI)
 var rg_modrep;    // parameters already reported as modified
 var rg_held;      // [type, bits] pairs: origins held by containers that may not be long-lived
 var rg_fnsum;     // the summaries of all functions used as values, joined (indirect calls)
+var rs_active;    // the use-after-reset walk is running (rs_walk)
+var rs_dead;      // locals that may hold request memory from before a hearth.Reset()
+var rs_said;      // locals already reported
+var rs_cur;       // [local, bits] of each local's latest assignment on the walk (else S_REGION)
 
 fn has_ptr(t) {
     let k = kind_of(t);
@@ -87,7 +91,7 @@ fn region_check() {
 }
 
 fn rg_sum_new() {
-    let sum = calloc(12, 8);
+    let sum = calloc(13, 8);  // [12]: the function resets the request pool (hearth.Reset)
     sum[1] = vec_new();
     sum[10] = vec_new();
     sum[11] = vec_new();
@@ -140,6 +144,9 @@ fn rg_fn_pass(f, report) {
         rg_modrep = 0;
         rg_stmts(f[F_BODY][BLK_STMTS]);
         rg_report = 0;
+        if rg_sum[12] {
+            rs_walk(f);
+        }
     }
 }
 
@@ -554,6 +561,10 @@ fn rg_expr(e) {
             return 0;
         }
         if s[S_KIND] == SYM_LOCAL {
+            if rs_active && vec_has(rs_dead, s) && !vec_has(rs_said, s) {
+                vec_push(rs_said, s);
+                err_quoted(e[N_POS], "", s[S_NAME], " may hold request memory from before hearth.Reset(), which freed it, and is read after the reset: keep() the value before the reset, or create it after");
+            }
             return s[S_REGION];
         }
         if s[S_KIND] == SYM_GLOBAL {
@@ -661,6 +672,217 @@ fn rg_expr(e) {
     return 0;
 }
 
+// ---- use after hearth.Reset() (#179) ----
+
+// rg_resets notes that the function being analyzed resets the request pool (its callers do
+// too), and in rs_walk marks every local that may hold request memory as freed.
+fn rg_resets() {
+    if !rg_sum[12] {
+        rg_sum[12] = 1;
+        rg_changed = 1;
+    }
+    if !rs_active {
+        return;
+    }
+    let locals = rg_fn[F_LOCALS];
+    let i = 0;
+    while i < locals[VEC_LEN] {
+        let s = vec_get(locals, i);
+        if has_ptr(s[S_TYPE]) && (rs_bits(rs_cur, s) & RG_EMB) != 0 && !vec_has(rs_dead, s) {
+            vec_push(rs_dead, s);
+        }
+        i = i + 1;
+    }
+}
+
+// rs_bits is what local s may hold on the walk: its latest assignment's bits, else all of them.
+fn rs_bits(cur, s) {
+    let i = 0;
+    while i < cur[VEC_LEN] {
+        if vec_get(cur, i) == s {
+            return vec_get(cur, i + 1);
+        }
+        i = i + 2;
+    }
+    return s[S_REGION];
+}
+
+fn rs_assign(s, bits) {
+    let i = 0;
+    while i < rs_cur[VEC_LEN] {
+        if vec_get(rs_cur, i) == s {
+            rs_cur[VEC_DATA][i + 1] = bits;
+            vec_drop(rs_dead, s);
+            return;
+        }
+        i = i + 2;
+    }
+    vec_push(rs_cur, s);
+    vec_push(rs_cur, bits);
+    vec_drop(rs_dead, s);
+}
+
+// rs_join merges two walk states: a local is freed if it is on either path, and may hold
+// what either path assigned.
+fn rs_join(dead_a, cur_a, dead_b, cur_b) {
+    vec_union(dead_a, dead_b);
+    let out = vec_new();
+    let i = 0;
+    while i < cur_a[VEC_LEN] {
+        let s = vec_get(cur_a, i);
+        vec_push(out, s);
+        vec_push(out, vec_get(cur_a, i + 1) | rs_bits(cur_b, s));
+        i = i + 2;
+    }
+    i = 0;
+    while i < cur_b[VEC_LEN] {
+        let s = vec_get(cur_b, i);
+        if rs_bits(out, s) == s[S_REGION] && !rs_has_entry(out, s) {
+            vec_push(out, s);
+            vec_push(out, vec_get(cur_b, i + 1) | s[S_REGION]);
+        }
+        i = i + 2;
+    }
+    rs_dead = dead_a;
+    rs_cur = out;
+}
+
+fn rs_has_entry(cur, s) {
+    let i = 0;
+    while i < cur[VEC_LEN] {
+        if vec_get(cur, i) == s {
+            return 1;
+        }
+        i = i + 2;
+    }
+    return 0;
+}
+
+fn vec_has(v, x) {
+    let i = 0;
+    while i < v[VEC_LEN] {
+        if vec_get(v, i) == x {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn vec_drop(v, x) {
+    let i = 0;
+    while i < v[VEC_LEN] {
+        if vec_get(v, i) == x {
+            v[VEC_DATA][i] = vec_get(v, v[VEC_LEN] - 1);
+            v[VEC_LEN] = v[VEC_LEN] - 1;
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+fn vec_union(a, b) {
+    let i = 0;
+    while i < b[VEC_LEN] {
+        if !vec_has(a, vec_get(b, i)) {
+            vec_push(a, vec_get(b, i));
+        }
+        i = i + 1;
+    }
+}
+
+// rs_walk follows f's statements in order: after a reset, a local that may hold request
+// memory is freed until it is assigned again; reading it then is an error. Loop bodies are
+// walked twice so a read before the reset in the next iteration is seen; branches join.
+fn rs_walk(f) {
+    rs_active = 1;
+    rs_dead = vec_new();
+    rs_said = vec_new();
+    rs_cur = vec_new();
+    rs_stmts(f[F_BODY][BLK_STMTS]);
+    rs_active = 0;
+}
+
+fn rs_stmts(v) {
+    let i = 0;
+    while i < v[VEC_LEN] {
+        rs_stmt(vec_get(v, i));
+        i = i + 1;
+    }
+}
+
+fn rs_stmt(s) {
+    let k = s[N_KIND];
+    if k == ST_BLOCK {
+        rs_stmts(s[BLK_STMTS]);
+    } else if k == ST_LET {
+        let lb = 0;
+        if s[LET_INIT] {
+            lb = rg_expr(s[LET_INIT]);
+        }
+        rs_assign(s[LET_SYM], lb);
+    } else if k == ST_ASSIGN {
+        let ab = rg_expr(s[AS_VALUE]);
+        let t = s[AS_TARGET];
+        if t[N_KIND] == EX_IDENT && t[ID_REF] {
+            rs_assign(t[ID_REF], ab);
+        } else {
+            rg_expr(t);
+        }
+    } else if k == ST_EXPR {
+        rg_expr(s[ES_X]);
+    } else if k == ST_IF {
+        rg_expr(s[IF_COND]);
+        let dead0 = vec_clone(rs_dead);
+        let cur0 = vec_clone(rs_cur);
+        rs_stmts(s[IF_THEN][BLK_STMTS]);
+        let dead1 = rs_dead;
+        let cur1 = rs_cur;
+        rs_dead = dead0;
+        rs_cur = cur0;
+        if s[IF_ELSE] {
+            rs_stmt(s[IF_ELSE]);
+        }
+        rs_join(rs_dead, rs_cur, dead1, cur1);
+    } else if k == ST_WHILE {
+        // Twice, so the next iteration sees what this one freed; then joined with the path
+        // that skips the loop.
+        let dead0 = vec_clone(rs_dead);
+        let cur0 = vec_clone(rs_cur);
+        let pass = 0;
+        while pass < 2 {
+            rg_expr(s[WH_COND]);
+            rs_stmts(s[WH_BODY][BLK_STMTS]);
+            if s[WH_POST] {
+                rs_stmt(s[WH_POST]);
+            }
+            pass = pass + 1;
+        }
+        rs_join(rs_dead, rs_cur, dead0, cur0);
+    } else if k == ST_RETURN {
+        if s[RET_VALUE] {
+            rg_expr(s[RET_VALUE]);
+        }
+        if s[RET_VALUES] {
+            let i = 0;
+            while i < s[RET_VALUES][VEC_LEN] {
+                rg_expr(vec_get(s[RET_VALUES], i));
+                i = i + 1;
+            }
+        }
+    } else if k == ST_CALLMULTI {
+        rg_expr(s[CM_CALL]);
+        let syms = s[CM_SYMS];
+        let j = 0;
+        while j < syms[VEC_LEN] {
+            if vec_get(syms, j) {
+                rs_assign(vec_get(syms, j), vec_get(syms, j)[S_REGION]);
+            }
+            j = j + 1;
+        }
+    }
+}
+
 fn rg_call(e) {
     let args = e[CALL_ARGS];
     let n = args[VEC_LEN];
@@ -717,6 +939,9 @@ fn rg_call(e) {
     let name = e[CALL_NAME];
     if f && f[F_QNAME] {
         name = f[F_QNAME];
+    }
+    if (name && streq(name, "hearth.Reset")) || (f && f[F_REGSUM] && f[F_REGSUM][12] && !vec_get(file_trusted, f[F_FILE])) {
+        rg_resets();
     }
     if e[N_REGION] == R_OWNED || (f && is_keep_fn(f)) || (name && str_prefix(name, "rt_keep")) {
         return RG_INGOT;
