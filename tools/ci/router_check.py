@@ -207,6 +207,54 @@ def response_headers(port, failures):
     print('204/304 without a body, header injection refused:', not failures)
 
 
+def conformance(port, failures):
+    """#183: bare CR, NUL and control bytes are rejected, HTTP/1.1 needs one Host, absolute-form
+    targets route on their path, HTTP/1.0 keep-alive is echoed, "close" anywhere in Connection
+    wins, and a client that half-closes still gets the answer to a request that waits."""
+    def first(data, wait=2.0, shut=False):
+        with socket.create_connection(('127.0.0.1', port), timeout=10) as s:
+            s.sendall(data)
+            if shut:
+                s.shutdown(socket.SHUT_WR)
+            s.settimeout(wait)
+            out = b''
+            try:
+                while True:
+                    d = s.recv(65536)
+                    if not d:
+                        return out, True
+                    out += d
+            except socket.timeout:
+                return out, False
+    cases = [
+        (b'GET /fast HTTP/1.1\r\nHost: x\r\nX-A: a\rb\r\n\r\n', b'HTTP/1.1 400 '),
+        (b'GET /fast HTTP/1.1\r\nHost: x\r\nX-A: a\x00b\r\n\r\n', b'HTTP/1.1 400 '),
+        (b'GET /fa\x01st HTTP/1.1\r\nHost: x\r\n\r\n', b'HTTP/1.1 400 '),
+        (b'GET /fast HTTP/1.1\r\n\r\n', b'HTTP/1.1 400 '),
+        (b'GET /fast HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n', b'HTTP/1.1 400 '),
+        (b'GET /fast HTTP/1.x\r\nHost: x\r\n\r\n', b'HTTP/1.1 400 '),
+        (b'GET /fast HTTP/1.0\r\n\r\n', b'HTTP/1.1 200 '),
+        (b'GET http://other.example/files/a/b?x=1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n', b'HTTP/1.1 200 '),
+    ]
+    for data, want in cases:
+        got, _ = first(data)
+        if not got.startswith(want):
+            failures.append('%r -> %r' % (data, got[:60]))
+    got, _ = first(b'GET http://other.example/files/a/b?x=1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n')
+    if not got.endswith(b'file a/b'):
+        failures.append('absolute-form target: %r' % got)
+    got, closed = first(b'GET /fast HTTP/1.0\r\nConnection: keep-alive\r\n\r\n', wait=0.5)
+    if b'\r\nConnection: keep-alive\r\n' not in got or closed:
+        failures.append('HTTP/1.0 keep-alive: %r closed=%s' % (got, closed))
+    got, closed = first(b'GET /fast HTTP/1.1\r\nHost: x\r\nConnection: keep-alive, close\r\n\r\n')
+    if not got.endswith(b'fast') or not closed:
+        failures.append('Connection: keep-alive, close: %r closed=%s' % (got, closed))
+    got, closed = first(b'GET /users/9?ms=200 HTTP/1.1\r\nHost: x\r\n\r\n', wait=5, shut=True)
+    if not got.startswith(b'HTTP/1.1 200 ') or not got.endswith(b'user 9 stamp>tag /users/{id}') or not closed:
+        failures.append('half-closed client with a waiting request: %r closed=%s' % (got, closed))
+    print('request conformance (#183):', not failures)
+
+
 def websockets(port, failures):
     """A routed handler upgrades: its path parameter, an echo, and 20 at once on the core."""
     ws.PORT = port
@@ -242,6 +290,7 @@ def main():
             protocol(port, failures)
             if cores == 1:
                 response_headers(port, failures)
+                conformance(port, failures)
                 overlap(port, failures)
                 websockets(port, failures)
             if server.poll() is not None:

@@ -170,6 +170,9 @@ var pLe i64
 var pHend i64
 var pCl i64
 var pHead bool
+var pTs i64      // the request target: offset in the request and length (absolute-form reduced to its path)
+var pTn i64
+var pKeep10 bool // an HTTP/1.0 request asked for keep-alive: the response must say so
 
 func c32(x i64) i64 {
 	return i64(i32(x))
@@ -427,7 +430,9 @@ func core(id i64) {
 						// An edge-triggered hang-up is reported once: close now, or after
 						// the pending output is written.
 						if ev_hangup(i) && conns[fd] == c {
-							if c[cOut] == 0 {
+							// A client that only shut down its sending side still reads: a
+							// request that waits gets its response, then the connection closes.
+							if c[cOut] == 0 && c[cTask] == 0 {
 								close_conn(c)
 							} else {
 								c[cClose] = 1
@@ -642,6 +647,11 @@ func on_read_once(c i64) bool {
 	}
 	want := cap - have
 	n := read(fd, buf+have, want)
+	if n == 0 && c[cTask] != 0 {
+		// End of input while a request waits: answer it, then close.
+		c[cClose] = 1
+		return false
+	}
 	if n <= 0 {
 		if n < 0 && (errno() == EAGAIN || errno() == 4) {
 			n = 0
@@ -863,20 +873,48 @@ func serve_one(c i64, p i64, n i64) i64 {
 	sp1 := -1
 	sp2 := -1
 	nsp := 0
+	ctl := false
 	for i := 0; i < ll; i++ {
-		if load8(p+i) == ' ' {
+		b := load8(p + i)
+		if b == ' ' {
 			if sp1 < 0 {
 				sp1 = i
 			}
 			sp2 = i
 			nsp++
+		} else if b < ' ' || b == 0x7f {
+			ctl = true
 		}
 	}
-	if nsp != 2 || sp1 <= 0 || sp2 <= sp1+1 || ll-sp2-1 != 8 || !is_http1(p+sp2+1) {
+	minor := load8(p + ll - 1)
+	if ctl || nsp != 2 || sp1 <= 0 || sp2 <= sp1+1 || ll-sp2-1 != 8 || !is_http1(p+sp2+1) || minor < '0' || minor > '9' {
+		// Control bytes (a bare CR, NUL, tab) are not allowed anywhere in the request line.
 		bad(c, 400)
 		return -1
 	}
-	alive := load8(p+ll-1) == '1'
+	// HTTP/1.0 closes unless it asks for keep-alive; 1.1 and later 1.x keep the connection.
+	http10 := minor == '0'
+	alive := !http10
+	ts := sp1 + 1
+	tn := sp2 - sp1 - 1
+	if tn > 7 && (load8(p+ts) == 'h' || load8(p+ts) == 'H') {
+		// Absolute-form ("http://host/path?q", RFC 9112 3.2.2): route on the path.
+		k := 0
+		if name_is(p+ts, 7, "http://") {
+			k = 7
+		} else if tn > 8 && name_is(p+ts, 8, "https://") {
+			k = 8
+		}
+		if k > 0 {
+			for k < tn && load8(p+ts+k) != '/' && load8(p+ts+k) != '?' {
+				k++
+			}
+			ts += k
+			tn -= k
+		}
+	}
+	hosts := 0
+	seenClose := false
 	pos := le + 1
 	cl := 0
 	seenCL := false
@@ -907,8 +945,20 @@ func serve_one(c i64, p i64, n i64) i64 {
 			bad(c, 400)
 			return -1
 		}
+		// A CR inside a field line (only the one before LF is allowed) or a NUL is rejected: a
+		// proxy that ends lines at a bare CR would frame the request differently (RFC 9112 2.2).
+		vl := l
+		if vl > 0 && load8(h+vl-1) == '\r' {
+			vl--
+		}
+		if memchr(h, '\r', vl) != 0 || memchr(h, 0, vl) != 0 {
+			bad(c, 400)
+			return -1
+		}
 		f := lower(load8(h))
-		if f == 'c' && kn == 14 && name_is(h, kn, "content-length") {
+		if f == 'h' && kn == 4 && name_is(h, kn, "host") {
+			hosts++
+		} else if f == 'c' && kn == 14 && name_is(h, kn, "content-length") {
 			v := parse_cl(h+kn+1, l-kn-1)
 			// Repeated Content-Length headers must agree, or the framing is ambiguous (RFC 9112 6.3).
 			if v < 0 || (seenCL && v != cl) {
@@ -918,21 +968,34 @@ func serve_one(c i64, p i64, n i64) i64 {
 			cl = v
 			seenCL = true
 		} else if f == 'c' && kn == 10 && name_is(h, kn, "connection") {
+			// A comma-separated list of tokens: "close" anywhere wins (RFC 9112 9.6).
 			j := kn + 1
-			for j < l && (load8(h+j) == ' ' || load8(h+j) == '\t') {
-				j++
-			}
-			v := load8(h + j)
-			if v == 'c' || v == 'C' {
-				alive = false
-			} else if v == 'k' || v == 'K' {
-				alive = true
+			for j < vl {
+				for j < vl && (load8(h+j) == ' ' || load8(h+j) == '\t' || load8(h+j) == ',') {
+					j++
+				}
+				e := j
+				for e < vl && load8(h+e) != ',' && load8(h+e) != ' ' && load8(h+e) != '\t' {
+					e++
+				}
+				if name_is(h+j, e-j, "close") {
+					alive = false
+					seenClose = true
+				} else if name_is(h+j, e-j, "keep-alive") && !seenClose {
+					alive = true
+				}
+				j = e
 			}
 		} else if f == 't' && kn == 17 && name_is(h, kn, "transfer-encoding") {
 			bad(c, 501)
 			return -1
 		}
 		pos += l + 1
+	}
+	if !http10 && hosts != 1 {
+		// HTTP/1.1 requires exactly one Host field (RFC 9112 3.2).
+		bad(c, 400)
+		return -1
 	}
 	total := hend + cl
 	if total > maxRequest {
@@ -959,6 +1022,9 @@ func serve_one(c i64, p i64, n i64) i64 {
 	pHend = hend
 	pCl = cl
 	pHead = sp1 == 4 && load8(p) == 'H' && bytes_are(p, 4, "HEAD")
+	pTs = ts
+	pTn = tn
+	pKeep10 = http10 && alive
 	task := rt_task_new(run_request, c)
 	if gDeadlineMs > 0 {
 		rt_task_set_deadline(task, rt_mono_ns()+gDeadlineMs*1000000)
@@ -987,8 +1053,8 @@ func serve_one(c i64, p i64, n i64) i64 {
 // the response to the core's output batch.
 func run_request(c i64) {
 	p := pReq
-	t := p + pSp1 + 1
-	tn := pSp2 - pSp1 - 1
+	t := p + pTs
+	tn := pTn
 	q := Req{Method: method_str(p, pSp1), Path: "", Query: "", hp: p + pLe + 1, hn: pHend - pLe - 1, bp: p + pHend, bn: pCl}
 	qm := memchr(t, '?', tn)
 	if qm == 0 {
@@ -997,7 +1063,11 @@ func run_request(c i64) {
 		q.Path = rt_str_from_raw(t, qm-t)
 		q.Query = rt_str_from_raw(qm+1, tn-(qm-t)-1)
 	}
+	if len(q.Path) == 0 {
+		q.Path = "/"
+	}
 	hd := pHead
+	keep10 := pKeep10
 	body := make([]u8, 0, 1024)
 	w := Out{Body: body, code: 200, ctype: "text/plain; charset=utf-8", extra: make([]u8, 0, 256), own: body}
 	rt_task_current()[tUser] = cast(i64, q)
@@ -1007,7 +1077,7 @@ func run_request(c i64) {
 		gHandler(q, mut w)
 	}
 	if c[cHijack] == 0 {
-		respond_out(w, hd)
+		respond_out(w, hd, keep10)
 	}
 }
 
@@ -1175,7 +1245,7 @@ func bad(c i64, code i64) {
 	body := make([]u8, 0, 64)
 	w := Out{Body: body, code: code, ctype: "text/plain; charset=utf-8", extra: make([]u8, 0), own: body}
 	w.Body = append(w.Body, status_text(code)...)
-	respond_out(w, false)
+	respond_out(w, false, false)
 	c[cClose] = 1
 }
 
@@ -1198,8 +1268,9 @@ func ob_raw(p i64, n i64) {
 	obLen += n
 }
 
-// respond_out appends response w to the core's output batch.
-func respond_out(w Out, hd bool) {
+// respond_out appends response w to the core's output batch; keep10 adds
+// "Connection: keep-alive", which an HTTP/1.0 client needs to keep the connection.
+func respond_out(w Out, hd bool, keep10 bool) {
 	bh := cast(i64, w.Body)
 	eh := cast(i64, w.extra)
 	bn := bh[0]
@@ -1214,6 +1285,8 @@ func respond_out(w Out, hd bool) {
 		}
 		if draining {
 			ob_str("Connection: close\r\n")
+		} else if keep10 {
+			ob_str("Connection: keep-alive\r\n")
 		}
 		ob_str("\r\n")
 		return
@@ -1238,6 +1311,8 @@ func respond_out(w Out, hd bool) {
 	}
 	if draining {
 		ob_str("Connection: close\r\n")
+	} else if keep10 {
+		ob_str("Connection: keep-alive\r\n")
 	}
 	ob_str("\r\n")
 	if !hd {

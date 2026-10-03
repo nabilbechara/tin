@@ -181,7 +181,8 @@ close-after-write flag, writing flag, bytes needed. Idle connections hold no buf
 - An incomplete request is copied into the connection's own buffer, sized to the
   request when its length is known (up to 64 MiB).
 - A hang-up reported with the last data closes the connection once its output is
-  written.
+  written. A client that only shuts down its sending side still gets the response to a
+  request that is waiting; the connection closes after it.
 
 **Handlers** get two per-core objects:
 - `anvil.Req`: method (interned for common verbs), path, query (copied into the pool),
@@ -202,11 +203,17 @@ reading resumes and buffered input is served.
 
 **Limits and errors.**
 - A request line or header block over 64 KiB gets 414 / 431 and close.
-- A malformed request line, a header line that is not `name: value` (no colon,
-  whitespace before it, obs-fold, a name that is not a token) or a bad
-  `Content-Length` gets 400; `Transfer-Encoding` gets 501.
+- A malformed request line (including control bytes such as a bare CR, NUL or tab, or a
+  version other than `HTTP/1.<digit>`), a header line that is not `name: value` (no colon,
+  whitespace before it, obs-fold, a name that is not a token), a CR or NUL inside a header
+  line, an HTTP/1.1 request without exactly one `Host`, or a bad `Content-Length` gets
+  400; `Transfer-Encoding` gets 501.
+- An absolute-form target (`GET http://host/path?q HTTP/1.1`) is routed on its path and
+  query; an empty path is `/`.
 - Bodies are limited to 64 MiB (413).
-- HTTP/1.0 closes unless keep-alive is asked for; `Connection: close` is honored.
+- HTTP/1.0 closes unless keep-alive is asked for, and a kept HTTP/1.0 connection gets
+  `Connection: keep-alive` in every response. `Connection` is read as a token list:
+  `close` anywhere closes the connection after the response.
 - `$PORT` replaces the port of the address passed to `Serve`.
 
 Balancing: on Linux each core accepts on its own `SO_REUSEPORT` listener, then hands a new
