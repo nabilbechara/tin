@@ -23,7 +23,7 @@ an entry removed only when no Linux declaration or linker-added import remains.
 | `__errno_location` | `lib/runtime/runtime_linux.tin` | 3 | active | Tin per-thread syscall error state | tools/ci syscall failure and per-core error tests (phase 3) |
 | `__libc_start_main` | `selfhost/elf.tin`, `selfhost/elf_x64.tin` | 5 | active | Tin _start reads argc/argv/envp/auxv | Bootstrap fixed point; argv/environment and static ELF/container checks (phase 5) |
 | `accept` | `lib/anvil/anvil.tin`, `lib/wire/wire.tin` | 3 | active | accept raw syscall (per-architecture ABI) | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
-| `atoi` | `lib/anvil/anvil.tin` | 1 | active | Tin decimal integer parser | Anvil environment integer parsing cases (phase 1) |
+| `atoi` | `lib/anvil/anvil.tin` | 1 | removed | Tin decimal integer parser | Anvil environment integer parsing cases (phase 1) |
 | `bind` | `lib/anvil/anvil.tin`, `lib/wire/wire.tin` | 3 | active | bind raw syscall (per-architecture ABI) | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
 | `calloc` | `lib/runtime/runtime.tin`, `lib/std.tin` | 2 | active | Tin mmap allocator or byte/word operations | Memory/OOM injection; overlap/alignment/microbenchmarks; bootstrap (phase 2) |
 | `ceil` | `lib/gauge/gauge.tin` | 0 | intrinsic | Hardware float intrinsic | tests/v2/gauge.tin and gauge_math.tin; both backend instruction checks |
@@ -91,7 +91,7 @@ an entry removed only when no Linux declaration or linker-added import remains.
 | `setsockopt` | `lib/anvil/anvil.tin`, `lib/wire/wire.tin` | 3 | active | setsockopt raw syscall (per-architecture ABI) | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
 | `signal` | `lib/anvil/anvil.tin`, `lib/runtime/runtime_linux.tin` | 3 | active | rt_sigaction and per-architecture signal return | Broken-pipe behavior; signal return; issue #175 handler (phases 3/5) |
 | `signalfd` | `lib/runtime/runtime_linux.tin` | 3 | active | signalfd4 | tools/ci/http_check.py shutdown (phase 3) |
-| `snprintf` | `lib/runtime/runtime.tin` | 1 | active | Tin precision float formatting and diagnostic text | Go fmt differential precision/flag corpus; bounds/core diagnostics (phase 1) |
+| `snprintf` | `lib/runtime/runtime.tin` | 1 | removed | Tin precision float formatting and diagnostic text | tools/ci/number_check.py; existing bounds/core diagnostics |
 | `socket` | `lib/anvil/anvil.tin`, `lib/wire/wire.tin` | 3 | active | socket raw syscall (per-architecture ABI) | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
 | `sqrt` | `lib/dice/dice.tin`, `lib/gauge/gauge.tin` | 0 | intrinsic | Hardware float intrinsic | tests/v2/gauge.tin and gauge_math.tin; both backend instruction checks |
 | `stat` | `lib/quarry/quarry.tin` | 3 | active | newfstatat pathname lookup | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
@@ -99,7 +99,7 @@ an entry removed only when no Linux declaration or linker-added import remains.
 | `strerror` | `lib/flume/flume.tin`, `lib/mysql/mysql.tin`, `lib/postgres/postgres.tin`, `lib/quarry/quarry.tin`, `lib/redis/redis.tin`, `lib/websocket/websocket.tin`, `lib/wire/wire.tin` | 4 | active | Per-OS Tin errno message table | tests/v2/quarry.tin; exact network/file error messages (phase 4) |
 | `strftime` | `lib/anvil/anvil.tin` | 4 | active | Tin time formatting | UTC calendar boundary Go twin; HTTP Date (phase 4) |
 | `strlen` | `lib/quarry/quarry.tin`, `lib/runtime/runtime.tin` | 2 | active | Tin mmap allocator or byte/word operations | Memory/OOM injection; overlap/alignment/microbenchmarks; bootstrap (phase 2) |
-| `strtod` | `lib/runtime/runtime.tin`, `selfhost/lex.tin` | 1 | active | Correctly rounded Tin float parser | Go strconv differential corpus; tests/v2/mint.tin; bootstrap fixed point (phase 1) |
+| `strtod` | `lib/runtime/runtime.tin`, `selfhost/lex.tin` | 1 | removed | Correctly rounded Tin float parser | tools/ci/number_check.py; tests/v2/mint.tin; bootstrap fixed point |
 | `sysconf` | `lib/runtime/runtime_linux.tin` | 4 | active | Affinity mask and cgroup CPU limits; page size via auxv | CPU quota/affinity tests; page-size kernels (phases 4/5) |
 | `time` | `lib/anvil/anvil.tin` | 4 | active | clock_gettime CLOCK_REALTIME | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 4) |
 | `timerfd_create` | `lib/anvil/anvil_linux.tin` | 3 | active | timerfd_create raw syscall (per-architecture ABI) | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
