@@ -28,7 +28,8 @@ def interleaved(commands, runs, *, check_output=True):
                 if expected is None:
                     expected = output
                 elif output != expected:
-                    raise ValueError('OUTPUT MISMATCH: ' + name + ' in round ' + str(round_number + 1))
+                    raise ValueError('OUTPUT MISMATCH: ' + name + ' in round ' + str(round_number + 1)
+                                     + f' expected={expected!r} actual={output!r}')
             samples[name].append(seconds)
     return {name: statistics.median(values) for name, values in samples.items()}, samples
 
