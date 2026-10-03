@@ -574,6 +574,10 @@ fn chk_binary(e, want) {
         return st;
     }
     let t = unify(l, r, want);
+    if is_cmp_op(op) && kind_of(t) == K_DYN {
+        err_at(pos, "cannot compare dyn values: use a method on the shape (?dyn compares against nil)");
+        return ty_bool;
+    }
     if is_cmp_op(op) {
         let ordered = !streq(op, "==") && !streq(op, "!=");
         if !ordered && kind_of(t) == K_STRUCT && t[TY_ENUM] && !ck_legacy {
@@ -1363,6 +1367,10 @@ fn chk_select(e, want) {
         err_type(pos, "an enum's data is read with switch, not as a field of ", xt, "");
         return ty_int;
     }
+    if kind_of(xt) == K_DYN {
+        err_at(pos, "a method value on a dyn value needs the table: the next step (#141)");
+        return ty_int;
+    }
     if kind_of(xt) == K_STRUCT {
         let i = struct_field(xt, name);
         if i < 0 {
@@ -1552,13 +1560,17 @@ fn init_zero_field(pos, stmts, obj, t, fi) {
     }
     if k == K_STRING || k == K_SLICE {
         vec_push(stmts, assign_stmt(pos, field_store(pos, sym_ref_node(pos, obj), t, fi), zero_value(pos, ft)));
-    } else if k == K_STRUCT || k == K_MAP || k == K_FUNC {
+    } else if k == K_STRUCT || k == K_MAP || k == K_FUNC || k == K_DYN {
         let m = err_begin(pos);
         buf_str(m, "field ");
         buf_str(m, vec_get(vec_get(t[TY_FIELDS], fi), 0));
         buf_str(m, " of type ");
         type_name(m, ft);
-        buf_str(m, " must be set (it cannot be nil; declare it ?T to allow that)");
+        if k == K_DYN {
+            buf_str(m, " must be set (a dyn value has no zero; the table comes with the next step, #141)");
+        } else {
+            buf_str(m, " must be set (it cannot be nil; declare it ?T to allow that)");
+        }
         err_end(m);
     }
 }
@@ -1919,6 +1931,10 @@ fn chk_call(e, want) {
             e[N_TYPE] = 0;
             return ty_string;
         }
+        if kind_of(xt) == K_DYN {
+            err_at(e[N_POS], "a method call through a dyn value is the next step (#141): the checker types it, the back ends build the table");
+            return ty_int;
+        }
         err_type(e[N_POS], "cannot call a method on ", xt, "");
         return ty_int;
     }
@@ -2126,7 +2142,7 @@ fn chk_builtin(e, name, want) {
             let ek = kind_of(t[TY_ELEM]);
             let len0 = vec_get(args, 1);
             let zero_len = len0[N_KIND] == EX_INT && len0[INT_VAL] == 0;
-            if !ck_legacy && !zero_len && (ek == K_STRUCT || ek == K_MAP || ek == K_FUNC) {
+            if !ck_legacy && !zero_len && (ek == K_STRUCT || ek == K_MAP || ek == K_FUNC || ek == K_DYN) {
                 err_type(pos, "make with a length would fill the slice with nil ", t[TY_ELEM], " values: use make([]T, 0, n) and append (or []?T)");
                 return t;
             }
@@ -2314,6 +2330,11 @@ fn lower_keep(e, want) {
     let t = chk(x, want);
     if is_untyped(t) {
         t = reconvert(x, default_type(t));
+    }
+    if kind_of(t) == K_DYN {
+        err_at(pos, "keep of a dyn value needs the method table's copy entry: the next step (#141)");
+        replace_node(e, x);
+        return t;
     }
     if kind_of(t) == K_FUNC {
         let c = rt_call(pos, "rt_keep_closure", args1(x), t);
@@ -3140,6 +3161,40 @@ fn is_say_func(m) {
 }
 
 // say_arg formats one argument by its static type: prefix + "i", "s", "f", ...
+// say_type_has_dyn reports whether a struct's fields (or a container's element) hold a
+// dyn value, which has no formatter until the table lands. The depth limit keeps a
+// recursive type (an enum holding itself) finite; a deeper dyn is still caught by
+// say_arg when the recursion reaches it.
+fn say_type_has_dyn(t) {
+    return say_type_has_dyn_at(t, 0);
+}
+
+fn say_type_has_dyn_at(t, depth) {
+    if depth > 8 {
+        return 0;
+    }
+    let k = kind_of(t);
+    if k == K_DYN {
+        return 1;
+    }
+    if k == K_OPT || k == K_SLICE {
+        return say_type_has_dyn_at(t[TY_ELEM], depth + 1);
+    }
+    if k == K_MAP {
+        return say_type_has_dyn_at(t[TY_KEY], depth + 1) || say_type_has_dyn_at(t[TY_ELEM], depth + 1);
+    }
+    if k == K_STRUCT {
+        let i = 0;
+        while i < t[TY_FIELDS][VEC_LEN] {
+            if say_type_has_dyn_at(field_type(t, i), depth + 1) {
+                return 1;
+            }
+            i = i + 1;
+        }
+    }
+    return 0;
+}
+
 fn say_arg(a, prefix) {
     let pos = a[N_POS];
     let t = default_type(chk(a, 0));
@@ -3165,6 +3220,10 @@ fn say_arg(a, prefix) {
     } else if k == K_SLICE {
         let et = t[TY_ELEM];
         let ek = kind_of(et);
+        if say_type_has_dyn(et) {
+            err_at(pos, "cannot format a slice of dyn values: give the shape a method that formats (#141)");
+            return ty_void;
+        }
         if ek == K_STRING {
             suffix = "sls";
         } else if ek == K_FLOAT {
@@ -3186,13 +3245,24 @@ fn say_arg(a, prefix) {
     } else if k == K_STRUCT || k == K_OPT {
         let st = t;
         if k == K_OPT {
+            if kind_of(t[TY_ELEM]) == K_DYN {
+                err_at(pos, "cannot format a dyn value: give the shape a method that formats (#141)");
+                return ty_void;
+            }
             st = t[TY_ELEM];
+        }
+        if say_type_has_dyn(st) {
+            err_at(pos, "cannot format a value holding a dyn value: give the shape a method that formats (#141)");
+            return ty_void;
         }
         return say_struct(a, st, prefix);
     } else if k == K_MAP && key_composite(t[TY_KEY]) {
         return say_map_keyed(a, t, prefix);
     } else if k == K_MAP {
         return say_map_sorted(a, t, prefix);
+    } else if k == K_DYN {
+        err_at(pos, "cannot format a dyn value: give the shape a method that formats (#141)");
+        return ty_void;
     } else if k != K_INT && k != K_UINT {
         suffix = "p";
     }

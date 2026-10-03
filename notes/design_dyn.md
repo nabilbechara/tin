@@ -1,5 +1,12 @@
 # Design: `dyn` and multi-word values
 
+Status: staging step 2 has landed — the checker types `dyn` (conversions check
+satisfaction and require a struct or enum object, `?dyn` and `[]dyn` are types, a `dyn`
+satisfies its own shape as a type argument, the region bits are the object's, and `keep`,
+`==`, `say`, `make`, omitted fields and `[N]dyn` are rejected with the rule they follow) and
+both back ends refuse a program that uses one with a positioned message naming the step, at
+the first `dyn` the checker resolves. Step 3 is the arm64 code generation.
+
 This note is the implementation design for the `dyn` sub-item of #141 (notes/roadmap.md,
 "`dyn` fat reference (data pointer plus table) for open sets, with region rules"). The
 decision that `dyn S` exists and what it means is in notes/design_foundations.md section 2;
@@ -124,7 +131,9 @@ positive tests and the table `_asm` check land with step 4.
    type, with one clear message per target. The gate is whole-program (an uncalled function's
    signature and an unused shape's signature both resolve `dyn`), so the two existing `_bad`
    tests that assert "dyn shapes are not usable yet" (`shapes_dyn_bad`, `shapes_dyn_unused_bad`)
-   stay negative with the gate's message.
+   stay negative with the gate's message. A generic template that mentions `dyn` only inside a
+   body that is never instantiated builds no `K_DYN` type and is not gated; nothing can
+   generate one either, so this is the lazy-constraint rule, not a hole.
 3. **arm64 codegen**: homes, parameters, results, fields, element access, tables and the
    startup fill, method calls. No `_asm` check yet: the strict suite compiles `*_asm.tin` on
    both CPUs, and the amd64 gate would fail one here.

@@ -34,6 +34,7 @@ const K_ERROR = 15;
 const K_CHAN = 16;
 const K_UBOOL = 17;    // untyped boolean (comparison results, true/false)
 const K_OPT = 18;      // ?T: a struct reference that may be nil
+const K_DYN = 19;      // dyn S: a two-word value (object, method table)
 
 var ty_int;
 var ty_bool;
@@ -55,6 +56,8 @@ var ty_u32;
 var ty_u64;
 var ty_interned;   // slice, map, chan and func types, shared by structure
 var ty_named;      // [qualified name, type]
+var saw_dyn;       // a dyn type was built: the back ends refuse it until step 3
+var saw_dyn_pos;   // where the first dyn type was written, for the back ends' message
 
 fn ty_new(kind, name) {
     let t = calloc(13, 8);
@@ -173,6 +176,29 @@ fn opt_of(elem) {
     return interned(K_OPT, elem, 0, 0, 0, 0);
 }
 
+// dyn_of is the type of a dyn S value: the shape declaration in TY_GDECL and the
+// instance's bindings in TY_TARGS (0 for a non-generic shape). It is two words, and
+// saw_dyn makes the back ends refuse the program until size-16 values are generated
+// (notes/design_dyn.md, staging step 2).
+fn dyn_of(sd, bind) {
+    let i = 0;
+    while i < ty_interned[VEC_LEN] {
+        let t = vec_get(ty_interned, i);
+        if t[TY_KIND] == K_DYN && t[TY_GDECL] == sd && shape_bind_same(t[TY_TARGS], bind) {
+            return t;
+        }
+        i = i + 1;
+    }
+    let n = ty_new(K_DYN, 0);
+    n[TY_GDECL] = sd;
+    n[TY_TARGS] = bind;
+    vec_push(ty_interned, n);
+    saw_dyn = 1;
+    return n;
+}
+
+
+
 fn func_of(params, results, variadic) {
     return interned(K_FUNC, 0, 0, params, results, variadic);
 }
@@ -290,6 +316,9 @@ fn type_width(t) {
     if k == K_INT || k == K_BOOL || k == K_FLOAT {
         return t[TY_WIDTH];
     }
+    if k == K_DYN {
+        return 16;
+    }
     return 8;
 }
 
@@ -378,6 +407,27 @@ fn type_name(b, t) {
         return;
     }
     let k = t[TY_KIND];
+    if k == K_DYN {
+        buf_str(b, "dyn ");
+        let sd = t[TY_GDECL];
+        if sd {
+            buf_str(b, sd[D_NAME]);
+        }
+        let bind = t[TY_TARGS];
+        if bind {
+            buf_byte(b, '[');
+            let i = 0;
+            while i < bind[VEC_LEN] {
+                if i > 0 {
+                    buf_byte(b, ',');
+                }
+                type_name(b, vec_get(vec_get(bind, i), 1));
+                i = i + 1;
+            }
+            buf_byte(b, ']');
+        }
+        return;
+    }
     if t[TY_NAME] {
         buf_str(b, t[TY_NAME]);
     } else if k == K_SLICE {

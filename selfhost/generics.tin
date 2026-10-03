@@ -168,7 +168,11 @@ fn check_constraints(pos, names, cons, targs, file) {
             let inst = 0;
             let handled = 0;
             let cx = vec_get(c, 0);
-            if c[VEC_LEN] == 1 && cx[N_KIND] == TX_NAME {
+            if c[VEC_LEN] == 1 && cx[N_KIND] == TX_DYN {
+                err_at(cx[N_POS], "a dyn type is not a constraint: name the shape");
+                handled = 1;
+            }
+            if !handled && c[VEC_LEN] == 1 && cx[N_KIND] == TX_NAME {
                 // A shape, with or without type arguments: Seq[i64] is an instance.
                 inst = shape_inst(cx);
                 // A name that is a shape but failed to instantiate was diagnosed there;
@@ -361,7 +365,7 @@ fn tunify(g, binds, tx, t, untyped_ok) {
             tunify(g, binds, vec_get(rs, j), vec_get(t[TY_RESULTS], j), untyped_ok);
             j = j + 1;
         }
-    } else if k == TX_NAME && tx[TX_ARGS] && t[TY_TARGS] {
+    } else if k == TX_NAME && tx[TX_ARGS] && t[TY_TARGS] && kind_of(t) != K_DYN {
         let j2 = 0;
         while j2 < tx[TX_ARGS][VEC_LEN] && j2 < t[TY_TARGS][VEC_LEN] {
             tunify(g, binds, vec_get(tx[TX_ARGS], j2), vec_get(t[TY_TARGS], j2), untyped_ok);
@@ -1213,6 +1217,15 @@ fn shape_seen_type(v, sd, t) {
 fn shape_method(t, name) {
     sm_bind = 0;
     sm_declared = 0;
+    if kind_of(t) == K_DYN {
+        // A dyn value's methods live in its table; check_shape handles it.
+        return 0;
+    }
+    if !t[TY_NAME] {
+        // An unnamed type (a slice, map, func, tuple, optional) has no methods; asking
+        // for one must not build a qualified name from a null string.
+        return 0;
+    }
     let d = t[TY_GDECL];
     if d {
         sm_bind = tbind_pairs(d[D_TPARAMS], t[TY_TARGS]);
@@ -1405,6 +1418,13 @@ fn shape_result_list(b, rs, n) {
 // and a cycle reported at registration cannot recurse here.
 fn check_shape(pos, t, sd, bind) {
     if shape_on_path(shape_bad, sd) || shape_on_path(shape_cycles, sd) {
+        return;
+    }
+    if kind_of(t) == K_DYN {
+        if t[TY_GDECL] == sd && shape_bind_same(t[TY_TARGS], bind) {
+            return;
+        }
+        err_at(pos, "a dyn value satisfies its own shape only; dyn-to-dyn widening is the next step (#141)");
         return;
     }
     if shape_checking[VEC_LEN] == 0 {

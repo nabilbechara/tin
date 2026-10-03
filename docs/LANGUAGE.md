@@ -378,10 +378,12 @@ type satisfies it structurally, shapes compose, named unions work as constraints
 shape takes type arguments (`Seq[i64]`) and can be listed in a composition, and every call
 through a shaped parameter is a direct call on the concrete type, because a generic body is
 checked with its type parameters bound. A method that two listed shapes give different
-signatures is a compile error. `dyn` is parsed but not yet usable; it is rejected with a message
-naming the missing step wherever its signature is resolved, and it is a following step. The
-`io` shapes are declared in `lib/io`; the `Copy` family, `hash`, `Stringer` and the driver
-shapes come after `dyn`.
+signatures is a compile error. `dyn S` is typed by the checker — a conversion checks
+satisfaction, `?dyn S` and `[]dyn S` work as types, and the region rules apply — but
+generating the two-word value is the next step, so a program that uses one is refused with a
+message naming the step, at the first `dyn` the checker resolves (notes/design_dyn.md). The `io` shapes are
+declared in `lib/io`; the `Copy` family, `hash`, `Stringer` and the driver shapes come after
+`dyn`.
 
 ---
 
