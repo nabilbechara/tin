@@ -21,6 +21,9 @@ extern func memmove(dst i64, src i64, n i64) i64
 extern func memcmp(a i64, b i64, n i64) i64
 extern func memset(p i64, c i64, n i64) i64
 extern func exit(code i64)
+extern func _exit(code i64)
+extern func sigaltstack(ss i64, old i64) i64
+extern func sigaction(sig i64, act i64, old i64) i64
 extern func isatty(fd i64) i64
 extern func snprintf(buf i64, n i64, format i64, ...) i64
 extern func strtod(s i64, end i64) f64
@@ -90,6 +93,47 @@ func rt_init(argc i64, argv i64, ntls i64, coreinit func()) {
 	rtOutTTY = isatty(1)&0xffffffff != 0
 	rt_random(&rtHashK0, 8)
 	rt_random(&rtHashK1, 8)
+	rt_altstack()
+	rt_fault_handlers(cast(i64, rt_fault))
+}
+
+// ---- faults: a stack overflow or a bad access is reported, not a silent death (#175) ----
+
+const altStackSize = 65536
+
+// rt_altstack gives the calling thread a signal stack of its own, so rt_fault can run after
+// this thread's stack overflowed (every thread: the main one and each core and helper).
+func rt_altstack() {
+	st := calloc(1, 32)
+	rt_stack_t(st, calloc(1, altStackSize), altStackSize)
+	sigaltstack(st, 0)
+	free(st)
+}
+
+// rt_fault handles SIGSEGV and SIGBUS on the thread's signal stack. It only reads this core's
+// current task, writes one line to stderr and exits: nothing it calls may allocate or lock.
+// A fault inside a request task's guard region is that task's stack overflowing.
+func rt_fault(sig i64, info i64, uctx i64) {
+	addr := rt_fault_addr(info)
+	// Output printed before the fault goes out first, unless the fault came while the output
+	// lock was held (taking it then would never return).
+	if __atomic_swap(&rtOutLock, 1) == 0 {
+		rt_flush()
+		rt_unlock(&rtOutLock)
+	}
+	t := curTask
+	if t != 0 && addr >= t[tStack] && addr < t[tStack]+taskGuard {
+		rt_fault_say("\npanic: stack overflow in a request handler (a request task's stack is 256 KiB: deep or unbounded recursion?)\n")
+	} else if sig == rt_sigbus() {
+		rt_fault_say("\npanic: bus error (invalid memory access, or a thread stack overflow)\n")
+	} else {
+		rt_fault_say("\npanic: segmentation fault (invalid memory access, or a thread stack overflow)\n")
+	}
+	_exit(2)
+}
+
+func rt_fault_say(s str) {
+	write(2, cast(i64, s)+8, len(s))
 }
 
 // rt_aligned_alloc returns n zeroed bytes on their own 128-byte cache lines (n is rounded up).
@@ -114,6 +158,7 @@ func rt_ctx_new(id i64) i64 {
 // rt_core_main is a new core's thread: its own context, its own globals, then entry(arg).
 func rt_core_main(p i64) i64 {
 	__set_ctx(rt_ctx_new(p[2]))
+	rt_altstack()
 	rt_core_qos(p[2])
 	rtCoreInit()
 	__ctx()[ctxIngot] = 0

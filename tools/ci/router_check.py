@@ -395,6 +395,37 @@ def limits(exe, failures):
         stop(server)
 
 
+def overflow(exe, failures):
+    """#175: a handler that overflows its task stack ends the process with a panic line on
+    stderr and status 2, not a silent SIGBUS/SIGSEGV."""
+    port = ws.free_port()
+    server = subprocess.Popen([str(exe)], env=dict(os.environ, PORT=str(port), TIN_CORES='1'),
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        for _ in range(100):
+            try:
+                socket.create_connection(('127.0.0.1', port), timeout=0.1).close()
+                break
+            except OSError:
+                time.sleep(0.05)
+        status, _, body = request(port, 'GET', '/recurse?n=1000')
+        if status != 200 or body != b'depth 1000':
+            failures.append('shallow recursion: %r %r' % (status, body))
+        try:
+            request(port, 'GET', '/recurse?n=100000000')
+        except (EOFError, OSError):
+            pass
+        code = server.wait(timeout=10)
+        err = server.stderr.read().decode(errors='replace')
+        print('stack overflow in a handler: status %d, stderr %r' % (code, err.strip()))
+        if code != 2 or 'panic: stack overflow in a request handler' not in err:
+            failures.append('stack overflow: status %d, stderr %r' % (code, err))
+    finally:
+        if server.poll() is None:
+            server.kill()
+            server.wait()
+
+
 def main():
     out = ROOT / 'bin/ci/router'
     out.mkdir(parents=True, exist_ok=True)
@@ -419,6 +450,8 @@ def main():
             stop(server)
     print('-- limits')
     limits(exe, failures)
+    print('-- stack overflow')
+    overflow(exe, failures)
     if failures:
         sys.exit('\n'.join(failures))
 

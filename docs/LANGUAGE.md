@@ -1035,8 +1035,10 @@ err2 := argo.Get(text, mut xs)      // appends decoded elements
   zero value or is required to be set.
 - **Memory lifetime**: the region check (section 10).
 - **Data races**: impossible by construction (section 11).
-- **Stack overflow**: deep recursion crashes the process (the default thread stack is
-  8 MiB).
+- **Stack overflow**: deep recursion ends the process with `panic: stack overflow in a
+  request handler` (or `panic: segmentation fault ...` outside a request) on stderr and
+  status 2, after flushing the output printed before it. Threads have 8 MiB stacks; a
+  request handler runs on its task's 256 KiB stack.
 
 ---
 
