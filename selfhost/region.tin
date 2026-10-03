@@ -108,7 +108,8 @@ fn rg_fn_pass(f, report) {
     let i = 0;
     while i < locals[VEC_LEN] {
         let s = vec_get(locals, i);
-        s[S_REGION] = 0;
+        // A captured local also holds what frame-local closures stored into it.
+        s[S_REGION] = s[S_CAPBITS];
         if i < rg_nparams && has_ptr(s[S_TYPE]) {
             s[S_REGION] = RG_EMB | RG_UNK;
             if i < RG_MAXP {
@@ -184,6 +185,8 @@ fn rg_stmt(s) {
             rg_assign_sym(t[ID_REF], v, s[N_POS]);
         } else if rg_regrow(t, s[AS_VALUE]) {
             // The slot gets back the object it held; the append checked what it added.
+        } else if tk == EX_MEM && rg_cell_index(t[MEM_BASE]) >= 0 {
+            rg_cell_store(rg_cell_index(t[MEM_BASE]), v, t[N_TYPE], s[N_POS]);
         } else if tk == EX_MEM {
             let c = rg_expr(t[MEM_BASE]);
             if t[MEM_INDEX] {
@@ -493,6 +496,56 @@ fn rg_store(c, co, ct, v, t, pos, gname) {
     }
 }
 
+// rg_cell_index is i when e is the address of captured variable i, read from the closure's
+// environment ($env word 2 + i), or -1.
+fn rg_cell_index(e) {
+    if !rg_fn[F_PARENT] || !rg_fn[F_ENV_SYM] || e[N_KIND] != EX_MEM || e[MEM_INDEX] {
+        return -1;
+    }
+    let b = e[MEM_BASE];
+    if b[N_KIND] != EX_IDENT || b[ID_REF] != rg_fn[F_ENV_SYM] || e[MEM_OFF] < 16 {
+        return -1;
+    }
+    return e[MEM_OFF] / 8 - 2;
+}
+
+// rg_cell_bits is what captured variable i may hold. A closure that is only passed to functions
+// that call it (sift.Each and the like) lives no longer than its parent's frame: the variable
+// holds what the parent and such closures put there. Any other closure may be kept, which copies
+// its variables into long-lived memory, so their origin is unknown.
+fn rg_cell_bits(i) {
+    if rg_fn[F_ESCAPES] {
+        return RG_UNK | RG_EMB;
+    }
+    let os = vec_get(rg_fn[F_CAPTURES], i);
+    if !os || os[S_CAPTURED] {
+        return RG_UNK | RG_EMB;
+    }
+    return os[S_REGION] | os[S_CAPBITS];
+}
+
+// rg_cell_store checks an assignment of bits v to captured variable i. In a frame-local closure
+// the variable is the parent's local: the bits join it. A closure that may be kept must not
+// store request memory there: once kept, its variables are long-lived (#171).
+fn rg_cell_store(i, v, t, pos) {
+    if rg_fn[F_ESCAPES] {
+        if (v & RG_EMB) != 0 && has_ptr(t) && rg_report {
+            let os = vec_get(rg_fn[F_CAPTURES], i);
+            let name = "a captured variable";
+            if os {
+                name = os[S_NAME];
+            }
+            err_quoted(pos, "request memory stored into ", name, ", a captured variable of a closure that may outlive the request (keep() copies its variables into long-lived memory): wrap the value in keep(), or pass the closure only to functions that call it");
+        }
+        return;
+    }
+    let os = vec_get(rg_fn[F_CAPTURES], i);
+    if os && !os[S_CAPTURED] && (os[S_CAPBITS] | v) != os[S_CAPBITS] {
+        os[S_CAPBITS] = os[S_CAPBITS] | v;
+        rg_changed = 1;
+    }
+}
+
 fn rg_expr(e) {
     let k = e[N_KIND];
     if k == EX_IDENT {
@@ -530,6 +583,15 @@ fn rg_expr(e) {
             return x | RG_UNK | RG_EMB;
         }
         return x;
+    }
+    if k == EX_MEM && rg_cell_index(e) >= 0 {
+        return 0;
+    }
+    if k == EX_MEM && rg_cell_index(e[MEM_BASE]) >= 0 {
+        if !has_ptr(e[N_TYPE]) {
+            return 0;
+        }
+        return rg_cell_bits(rg_cell_index(e[MEM_BASE]));
     }
     if k == EX_MEM {
         let b = rg_expr(e[MEM_BASE]);
