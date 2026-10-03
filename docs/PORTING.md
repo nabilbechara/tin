@@ -1,10 +1,18 @@
 # Targets and porting
 
-| target | status | binary | notes |
-|---|---|---|---|
-| darwin-arm64 | complete | Mach-O, ad-hoc signed, linked to libSystem | the original target |
-| linux-arm64 | complete: all tests pass, self-hosts, server passes conformance; tested natively in CI | ELF PIE linked to glibc ≥ 2.34 (tested on 2.36 and 2.41) | container limits, graceful shutdown, `examples/k8s/` |
-| linux-amd64 | complete: all strict and regression tests pass and it self-hosts; tested natively in CI | ELF PIE (x86-64), glibc ≥ 2.34 | performance benchmarks on dedicated x86-64 hardware remain pending |
+| target | role | status | binary | notes |
+|---|---|---|---|---|
+| linux-arm64 | production, benchmarks | complete: all tests pass, self-hosts, server passes conformance; tested natively in CI | ELF PIE linked to glibc ≥ 2.34 (tested on 2.36 and 2.41) | container limits, graceful shutdown, `examples/k8s/` |
+| linux-amd64 | production, benchmarks | complete: all strict and regression tests pass and it self-hosts; tested natively in CI | ELF PIE (x86-64), glibc ≥ 2.34 | performance benchmarks on dedicated x86-64 hardware remain pending |
+| darwin-arm64 | development only | complete | Mach-O, ad-hoc signed, linked to libSystem | the original target |
+
+**Platform roles.** Linux is the platform Tin programs are deployed on and the only one
+whose performance is a reference: server behaviour (epoll, `SO_REUSEPORT` accept, cgroup
+limits, graceful shutdown in containers) and benchmark numbers are judged on Linux.
+macOS arm64 is a development platform: the compiler, the tests and `tin run` must keep
+working there (it is a native CI gate), but it is not a deployment target, macOS-only
+behaviour is never a reason for a design decision, and macOS numbers are never quoted as
+results (docs/PERFORMANCE.md, "Benchmark policy").
 
 Choose a target with `tin build --target T` or `tinc -target T`; the default is the
 machine the compiler runs on. One compiler binary contains every backend.

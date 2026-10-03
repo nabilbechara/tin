@@ -1,8 +1,8 @@
 # Tin
 
-Tin is a compiled, Go-like language for servers and tools on macOS arm64 and Linux
-arm64/amd64. It is meant to
-be written by AI, so it trades human convenience for speed and robustness: the compiler
+Tin is a compiled, Go-like language for servers and tools. Linux arm64/amd64 is the
+production target: deployments and benchmarks are Linux. macOS arm64 is supported for
+development (writing, building and testing on a Mac) only. It is meant to be written by AI, so it trades human convenience for speed and robustness: the compiler
 rejects ignored errors, nil dereferences, request memory leaking into long-lived state, and
 shared mutable state between threads.
 
@@ -112,6 +112,13 @@ Language and library checks live in `tests/v2/`, and protocol client checks in
 
 ## Performance
 
+**Policy:** reference benchmarks are measured on Linux; macOS is a development platform
+and its numbers are not reference results (see
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md#benchmark-policy)). The tables below were
+measured on the macOS development machine before this policy and are kept until Linux
+reference runs replace them; the Linux workflow `.github/workflows/bench-linux.yml`
+tracks Tin/Go ratios on GitHub's Linux runners meanwhile.
+
 Apple M3 Pro (5 performance + 6 efficiency cores), Go 1.26, fasthttp 1.74, wrk 4.2, the
 load generator on the same machine. Run with `bench/http/run_wrk.sh` and
 `bench/http/run_pipelined.sh`.
@@ -187,8 +194,9 @@ notes/       verification notes, benchmark analyses, roadmap
 
 ## Status and next steps
 
-Targets: darwin-arm64, linux-arm64 and linux-amd64, each tested natively in CI, and the
-compiler self-hosts on all three; see [docs/PORTING.md](docs/PORTING.md).
+Targets: linux-arm64 and linux-amd64 (production and benchmarks) and darwin-arm64
+(development only), each tested natively in CI, and the compiler self-hosts on all three;
+see [docs/PORTING.md](docs/PORTING.md).
 
 v0.4: each anvil request runs in its own task with its own stack and pool, so a handler
 that waits (`tide.Wait`, `wire`, `quarry` files, `redis`, `mysql`, `postgres`, `websocket`) lets its

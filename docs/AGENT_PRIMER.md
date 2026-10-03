@@ -1,8 +1,9 @@
 # Tin primer for agents (strict Tin)
 
-Tin is a self-hosted, Go-like language that compiles to native code for macOS arm64,
-Linux arm64 and Linux x86-64. AI writes all Tin code: optimize for speed and
-robustness, not human ergonomics. Root: /Users/yasserreslan/Desktop/tin. Full reference:
+Tin is a self-hosted, Go-like language that compiles to native code for Linux arm64 and
+Linux x86-64 (production and benchmarks) and macOS arm64 (development only; see
+docs/PORTING.md, "Platform roles"). AI writes all Tin code: optimize for speed and
+robustness, not human ergonomics. Root: the repository checkout. Full reference:
 docs/LANGUAGE.md (language), docs/STDLIB.md (packages), docs/TOOLING.md (commands),
 docs/RUNTIME.md (memory, layouts, trusted code).
 

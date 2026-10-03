@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Build each benchmark with Tin and Go, check outputs match, report best-of-N times."""
+"""Build each benchmark with Tin and Go, check outputs match, report best-of-N times.
+
+BENCH_DIR selects the directory (default bench/; bench/v2 is the CPU suite in the README).
+Reference numbers come from Linux (see docs/PERFORMANCE.md, "Benchmark policy")."""
 import os, subprocess, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BENCH = os.path.join(ROOT, "bench")
+BENCH = os.path.join(ROOT, os.environ.get("BENCH_DIR", "bench"))
 OUT = os.path.join(ROOT, "bin", "bench")
 TIN = os.path.join(ROOT, "tin")
 RUNS = int(os.environ.get("RUNS", "5"))
@@ -25,7 +28,8 @@ print(f"{'bench':10} {'tin build':>10} {'go build':>10} {'tin run':>10} {'go run
 for name in names:
     tin_exe, go_exe = os.path.join(OUT, name + "_tin"), os.path.join(OUT, name + "_go")
     tb, _ = best([TIN, "build", os.path.join(BENCH, name + ".tin"), "-o", tin_exe], 3)
-    gb, _ = best(["go", "build", "-o", go_exe, os.path.join(BENCH, name + ".go")], 3)
+    # Built from the benchmark's directory, so a go.mod there (bench/v2) is its module.
+    gb, _ = best(["go", "-C", BENCH, "build", "-o", go_exe, name + ".go"], 3)
     tr, tout = best([tin_exe])
     gr, gout = best([go_exe])
     flag = "" if tout == gout else "  OUTPUT MISMATCH"

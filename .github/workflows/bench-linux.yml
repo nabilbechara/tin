@@ -1,0 +1,79 @@
+name: Benchmarks (Linux)
+
+# Reference benchmarks are Linux (docs/PERFORMANCE.md, "Benchmark policy"). This runs the CPU
+# suite (bench/v2, Tin vs Go) and the HTTP suite (anvil vs fasthttp vs net/http under wrk) on
+# both Linux CPUs and writes the tables to the job summary. GitHub-hosted runners are shared:
+# compare the ratios within one run, not absolute numbers across runs. Never a merge gate.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'
+  pull_request:
+    paths:
+      - 'bench/**'
+      - '.github/workflows/bench-linux.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-linux-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bench:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Install wrk
+        run: sudo apt-get update -q && sudo apt-get install -y -q wrk
+      - name: Build Tin
+        run: make bootstrap
+      - name: Machine
+        run: |
+          {
+            echo "## Linux ${{ matrix.arch }} (${{ matrix.os }}, GitHub-hosted, shared)"
+            echo '```'
+            uname -srm
+            lscpu | grep -E '^(Model name|CPU\(s\)):' || true
+            go version
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: CPU suite (bench/v2, Tin vs Go, best of 3; speedup = Go time / Tin time)
+        run: |
+          RUNS=3 BENCH_DIR=bench/v2 python3 bench/run.py | tee bin/bench-cpu.txt
+          if grep -q 'OUTPUT MISMATCH' bin/bench-cpu.txt; then echo "Tin and Go outputs differ"; exit 1; fi
+          { echo '### CPU (bench/v2)'; echo '```'; cat bin/bench-cpu.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: HTTP suite (1 server core, wrk -t2 -c100, 10 s, median of 3 interleaved rounds)
+        run: |
+          ./tin build examples/api.tin -o bin/api
+          go -C bench/http build -o "$GITHUB_WORKSPACE/bin/fast" ./fast
+          go -C bench/http build -o "$GITHUB_WORKSPACE/bin/gonet" ./gonet
+          bench/http/run_wrk.sh 1 2 100 10 3 | tee bin/bench-http.txt
+          { echo '### HTTP (anvil vs fasthttp vs net/http)'; echo '```'; cat bin/bench-http.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep the raw results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bench-linux-${{ matrix.arch }}
+          path: |
+            bin/bench-*.txt
+            bin/wrk_results.txt
+          retention-days: 90
+          if-no-files-found: ignore

@@ -1,5 +1,31 @@
 # Performance
 
+## Benchmark policy
+
+Tin is deployed on Linux, so its performance is judged on Linux. macOS arm64 is a
+development platform (docs/PORTING.md, "Platform roles").
+
+- **Reference numbers are Linux.** A number quoted as a result (README, this file, a PR
+  claiming a speed-up or "no regression", a release note) comes from Linux on bare metal
+  or a dedicated VM, native to the CPU, with the machine, CPU model, kernel, Go version
+  and load-generator placement stated next to it. Both CPUs count: linux-arm64 and
+  linux-amd64.
+- **Not reference:** macOS, Linux containers on a macOS host (Docker Desktop runs a VM),
+  emulated CPUs, laptops on battery. These are fine for a quick check during development,
+  but are not quoted as results and do not decide "faster or slower".
+- **Comparisons run on the same machine in the same job**, interleaved (Tin and Go, before
+  and after), and are reported as medians with the ratio. On shared machines (GitHub-hosted
+  runners) only the ratios are meaningful; absolute numbers vary between runs.
+- **Continuous tracking:** `.github/workflows/bench-linux.yml` runs the CPU suite
+  (`bench/v2`, Tin vs Go) and the HTTP suite (`bench/http/run_wrk.sh`, anvil vs fasthttp vs
+  net/http) on `ubuntu-24.04` (x86-64) and `ubuntu-24.04-arm` every week, on demand and on
+  pull requests that change `bench/`, and writes the tables to the job summary.
+- **Existing macOS numbers:** the sections below were measured on the macOS development
+  machine before this policy. They are kept for history until Linux reference runs replace
+  them, section by section; do not add new macOS numbers.
+
+## Measurement setup of the existing numbers (macOS development machine)
+
 Measured on an Apple M3 Pro (5 performance + 6 efficiency cores), Go 1.26, fasthttp
 1.74, wrk 4.2 (4.1 inside Linux containers), the load generator always on the same
 machine as the server. Linux numbers come from an arm64 Debian container under Docker
