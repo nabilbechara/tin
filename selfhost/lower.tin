@@ -1586,6 +1586,79 @@ fn get_cell_addr(pos, os) {
     return mk_unary(pos, "&", sym_ref_node(pos, os));
 }
 
+// closure_keeper builds keep$N(d), which copies closure descriptor d and its captured
+// variables into the long-lived heap, each value kept by its type (a str, slice, struct or
+// closure deeply), so a kept closure never reads request memory (#170). It returns 0 when
+// no captured variable holds a reference.
+fn closure_keeper(pos, cf) {
+    let caps = cf[F_CAPTURES];
+    let k = caps[VEC_LEN];
+    let refs = 0;
+    let i = 0;
+    while i < k {
+        let ct = vec_get(caps, i)[S_TYPE];
+        if is_ref(ct) || is_dyn_value(ct) {
+            refs = 1;
+        }
+        i = i + 1;
+    }
+    if !refs {
+        return 0;
+    }
+    lifted_count = lifted_count + 1;
+    let f = fn_new(pos, "keep");
+    let nb = buf_new();
+    buf_str(nb, "keep$");
+    buf_int(nb, lifted_count);
+    buf_byte(nb, 0);
+    f[F_QNAME] = nb[VEC_DATA];
+    f[F_NAME] = nb[VEC_DATA];
+    f[F_LIFTED] = 2;
+    f[F_FILE] = cf[F_FILE];
+    vec_push(f[F_PARAMS], "d");
+    vec_push(f[F_PTYPES], ty_int);
+    vec_push(f[F_RTYPES], ty_int);
+    f[F_TYPE] = func_of(f[F_PTYPES], f[F_RTYPES], 0);
+    f[F_LOCALS] = vec_new();
+    f[F_BODY] = empty_block(pos);
+    vec_push(prog_fns, f);
+    let saved_fn = ck_fn;
+    ck_fn = f;
+    let d = sym_new(SYM_LOCAL, "d", pos);
+    d[S_TYPE] = ty_int;
+    d[S_SLOT] = 0;
+    f[F_SLOTS] = 1;
+    vec_push(f[F_LOCALS], d);
+    let body = f[F_BODY][BLK_STMTS];
+    let nd = temp(pos, rt_call(pos, "rt_ingot_alloc", args1(mk_int(pos, 8 * (3 + k), ty_int)), ty_int), ty_int);
+    vec_push(body, nd);
+    let w = 0;
+    while w < 2 {
+        vec_push(body, assign_stmt(pos, mk_mem(pos, sym_ref_node(pos, nd[LET_SYM]), 0, 0, 8 * w, ty_int), mk_mem(pos, sym_ref_node(pos, d), 0, 0, 8 * w, ty_int)));
+        w = w + 1;
+    }
+    vec_push(body, assign_stmt(pos, mk_mem(pos, sym_ref_node(pos, nd[LET_SYM]), 0, 0, 8 * (2 + k), ty_int), mk_mem(pos, sym_ref_node(pos, d), 0, 0, 8 * (2 + k), ty_int)));
+    i = 0;
+    while i < k {
+        let ct = vec_get(caps, i)[S_TYPE];
+        let cell = temp(pos, rt_call(pos, "rt_ingot_alloc", args1(mk_int(pos, 8, ty_int)), ty_int), ty_int);
+        vec_push(body, cell);
+        let old = mk_mem(pos, mk_mem(pos, sym_ref_node(pos, d), 0, 0, 8 * (2 + i), ty_int), 0, 0, 0, ct);
+        let val = old;
+        if is_ref(ct) || is_dyn_value(ct) {
+            val = keep_call(pos, keep_fn(ct), old, ct);
+        }
+        vec_push(body, assign_stmt(pos, mk_mem(pos, sym_ref_node(pos, cell[LET_SYM]), 0, 0, 0, ct), val));
+        vec_push(body, assign_stmt(pos, mk_mem(pos, sym_ref_node(pos, nd[LET_SYM]), 0, 0, 8 * (2 + i), ty_int), sym_ref_node(pos, cell[LET_SYM])));
+        i = i + 1;
+    }
+    let ret = node_new(ST_RETURN, pos);
+    ret[RET_VALUE] = sym_ref_node(pos, nd[LET_SYM]);
+    vec_push(body, ret);
+    ck_fn = saved_fn;
+    return f;
+}
+
 // chk_funclit lifts a function literal to a top-level function. Literals may capture
 // variables from enclosing scopes: non-escaping closures allocate frame descriptors
 // and cells on stack (0 bytes allocated), while escaping closures allocate region objects.
@@ -1634,7 +1707,7 @@ fn chk_funclit(e) {
     if e[LIT_ESCAPE] == 0 {
         let desc_sym = declare_local(pos, "$desc", ty_int);
         desc_sym[S_ADDR] = 1;
-        desc_sym[S_WORDS] = 2 + k;
+        desc_sym[S_WORDS] = 3 + k;
         let desc_addr = mk_unary(pos, "&", sym_ref_node(pos, desc_sym));
         let dptr = temp(pos, desc_addr, ty_int);
         vec_push(stmts, dptr);
@@ -1650,9 +1723,11 @@ fn chk_funclit(e) {
             vec_push(stmts, assign_stmt(pos, mk_mem(pos, dref, 0, 0, 8 * (2 + i), ty_int), cell_expr));
             i = i + 1;
         }
+        // A frame descriptor is never kept (the closure is only called): no keeper.
+        vec_push(stmts, assign_stmt(pos, mk_mem(pos, dref, 0, 0, 8 * (2 + k), ty_int), mk_int(pos, 0, ty_int)));
         desc_val = dref;
     } else {
-        let alloc_call = rt_call(pos, "rt_alloc", args1(mk_int(pos, 8 * (2 + k), ty_int)), ty_int);
+        let alloc_call = rt_call(pos, "rt_alloc", args1(mk_int(pos, 8 * (3 + k), ty_int)), ty_int);
         let obj = temp(pos, alloc_call, ty_int);
         vec_push(stmts, obj);
         let dref = sym_ref_node(pos, obj[LET_SYM]);
@@ -1667,6 +1742,16 @@ fn chk_funclit(e) {
             vec_push(stmts, assign_stmt(pos, mk_mem(pos, dref, 0, 0, 8 * (2 + i), ty_int), cell_expr));
             i = i + 1;
         }
+        // Word 2 + k: the function keep() calls to copy this closure deeply (0: no captured
+        // variable holds a reference, so copying the words is enough).
+        let keeper = closure_keeper(pos, f);
+        let kv = mk_int(pos, 0, ty_int);
+        if keeper {
+            kv = node_new(EX_FUNCREF, pos);
+            kv[FR_FN] = keeper;
+            kv[N_TYPE] = ty_int;
+        }
+        vec_push(stmts, assign_stmt(pos, mk_mem(pos, dref, 0, 0, 8 * (2 + k), ty_int), kv));
         desc_val = dref;
     }
 

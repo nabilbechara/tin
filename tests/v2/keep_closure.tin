@@ -1,0 +1,49 @@
+package main
+
+import "hearth"
+import "say"
+
+// keep() on a closure copies what it captured, deeply (#170): after the request pool is reset
+// and reused, the kept closures still see their own values.
+
+type Holder struct {
+	f func() str
+}
+
+var greet func() str = func() str { return "none" }
+var held []Holder = []Holder{}
+var byName map[str]func() str = make(map[str]func() str)
+var counter func() i64 = func() i64 { return 0 }
+
+func remember(q str) {
+	name := "user-" + q
+	parts := []str{"a-" + q, "b-" + q}
+	greet = keep(func() str { return name + " " + parts[1] })
+	held = append(held, keep(Holder{f: func() str { return "held " + name }}))
+	byName["x"] = keep(func() str { return "mapped " + parts[0] })
+	n := 40
+	counter = keep(func() i64 {
+		n++
+		return n
+	})
+}
+
+func clobber() {
+	for i := 0; i < 200; i++ {
+		x := say.Fmt("XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX%d", i)
+		if len(x) == 0 {
+			say.Line("never")
+		}
+	}
+}
+
+func main() {
+	remember(say.Fmt("alice-%d", 42))
+	hearth.Reset()
+	clobber()
+	say.Line("greet", greet())
+	say.Line("struct", held[0].f())
+	say.Line("map", byName["x"]())
+	counter()
+	say.Line("counter", counter())
+}
