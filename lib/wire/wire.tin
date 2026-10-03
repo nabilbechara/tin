@@ -28,6 +28,7 @@ type Conn struct {
 	open    bool // false for the zero Conn (a failed Dial or Accept): it owns no descriptor
 	fd      i64
 	timeout i64  // ns a read or write may wait (0: no limit; a request's deadline still applies)
+	until   i64  // monotonic ns after which every wait fails (0: none); set by DoWith's Timeout
 }
 
 // Listener accepts TCP connections.
@@ -172,6 +173,21 @@ func wait_io(fd i64, want i64, timeout i64, what str) ! {
 	}
 }
 
+// wait is wait_io for c: the per-wait timeout, cut short by the call's overall limit.
+func (c Conn) wait(want i64, what str) ! {
+	t := c.timeout
+	if c.until > 0 {
+		left := c.until - rt_mono_ns()
+		if left <= 0 {
+			fail "wire: {what} timed out"
+		}
+		if t == 0 || left < t {
+			t = left
+		}
+	}
+	try wait_io(c.fd, want, t, what)
+}
+
 func nonblocking(fd i64) {
 	flags := i64(i32(fcntl(fd, F_GETFL, 0)))
 	fcntl(fd, F_SETFL, flags|O_NONBLOCK)
@@ -270,7 +286,7 @@ func (c Conn) write_raw(p i64, n i64) ! {
 				continue
 			}
 			if e == EAGAIN {
-				try wait_io(c.fd, 2, c.timeout, "write")
+				try c.wait(2, "write")
 				continue
 			}
 			fail os_fault("write")
@@ -313,7 +329,7 @@ func (c Conn) Read(buf mut []u8, max i64) !i64 {
 			continue
 		}
 		if e == EAGAIN {
-			try wait_io(c.fd, 1, c.timeout, "read")
+			try c.wait(1, "read")
 			continue
 		}
 		fail os_fault("read")
@@ -427,6 +443,16 @@ func (l mut Listener) Close() {
 
 // ---- HTTP client ----
 
+// Options configure one client call (DoWith); the zero value is what Do uses.
+type Options struct {
+	Timeout i64 // ns for the whole call: connect, send and the complete response (0: no limit; a request's deadline still applies)
+	MaxBody i64 // largest response body accepted, in bytes (0: DefaultMaxBody)
+}
+
+// DefaultMaxBody is the largest response body Do accepts (64 MiB, anvil's request limit):
+// a larger one is a fault rather than memory a broken or hostile server can fill.
+const DefaultMaxBody = 67108864
+
 // Get fetches url.
 func Get(url str) !Resp {
 	return try Do("GET", url, []str{}, "")
@@ -441,8 +467,46 @@ func none_resp() Resp {
 	return Resp{Body: "", head: ""}
 }
 
-// Do sends one request: headers is a list of name, value pairs.
+// Do sends one request: headers is a list of name, value pairs. The method and header names
+// must be tokens, and the URL and header values must not hold CR, LF, NUL or other control
+// bytes (the URL no spaces either), or Do fails instead of sending a request an input could
+// have split. Response bodies over DefaultMaxBody fail; DoWith sets a timeout and the limit.
 func Do(method str, url str, headers []str, body str) !Resp {
+	return try DoWith(method, url, headers, body, Options{Timeout: 0, MaxBody: 0})
+}
+
+// DoWith is Do with options: an overall timeout and a response size limit.
+func DoWith(method str, url str, headers []str, body str, opt Options) !Resp {
+	limit := opt.MaxBody
+	if limit <= 0 {
+		limit = DefaultMaxBody
+	}
+	until := 0
+	if opt.Timeout > 0 {
+		until = rt_mono_ns() + opt.Timeout
+	}
+	if !is_token(method) {
+		fail say.Fault("wire: invalid method %q", method)
+	}
+	for i := 0; i < len(url); i++ {
+		if url[i] <= ' ' || url[i] == 0x7f {
+			fail say.Fault("wire: invalid character in URL %q", url)
+		}
+	}
+	if len(headers)%2 != 0 {
+		fail "wire: headers must be name, value pairs"
+	}
+	for i := 0; i+1 < len(headers); i += 2 {
+		if !is_token(headers[i]) {
+			fail say.Fault("wire: invalid header name %q", headers[i])
+		}
+		v := headers[i+1]
+		for k := 0; k < len(v); k++ {
+			if v[k] == '\r' || v[k] == '\n' || v[k] == 0 {
+				fail say.Fault("wire: invalid header value for %s", headers[i])
+			}
+		}
+	}
 	if len(url) < 7 || url[:7] != "http://" {
 		if len(url) >= 8 && url[:8] == "https://" {
 			fail "wire: https is not supported yet"
@@ -475,8 +539,9 @@ func Do(method str, url str, headers []str, body str) !Resp {
 	if !hasport {
 		addr = hostport + ":80"
 	}
-	c := try Dial(addr)
+	c := try DialTimeout(addr, opt.Timeout)
 	defer c.Close()
+	c.until = until
 	req := make([]u8, 0, 256+len(body))
 	req = append(req, method...)
 	req = append(req, ' ')
@@ -498,11 +563,36 @@ func Do(method str, url str, headers []str, body str) !Resp {
 	req = append(req, "\r\n"...)
 	req = append(req, body...)
 	try c.WriteBytes(req)
-	r, err := read_response(c, method == "HEAD")
+	r, err := read_response(c, method == "HEAD", limit)
 	if err != nil {
 		fail err
 	}
 	return r
+}
+
+// is_token reports whether s is an HTTP token (a method or header name, RFC 9110 5.6.2).
+func is_token(s str) bool {
+	if len(s) == 0 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			continue
+		}
+		ok := false
+		t := "!#$%&'*+-.^_`|~"
+		for j := 0; j < len(t); j++ {
+			if t[j] == c {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func find_crlf2(b []u8) i64 {
@@ -539,7 +629,7 @@ func read_head(c Conn, buf mut []u8) !i64 {
 // maxInformational bounds the 1xx responses accepted before the final one (as Go does).
 const maxInformational = 5
 
-func read_response(c Conn, head bool) !Resp {
+func read_response(c Conn, head bool, limit i64) !Resp {
 	buf := make([]u8, 0, 4096)
 	informational := 0
 	for {
@@ -586,9 +676,12 @@ func read_response(c Conn, head bool) !Resp {
 			fail "wire: both Transfer-Encoding and Content-Length"
 		}
 		if chunked {
-			b := try read_chunked(c, rest)
+			b := try read_chunked(c, rest, limit)
 			r.Body = b
 			return r
+		}
+		if n > limit {
+			fail say.Fault("wire: response body of %d bytes is over the %d-byte limit", n, limit)
 		}
 		if n >= 0 {
 			b := try read_length(c, rest, n)
@@ -598,6 +691,9 @@ func read_response(c Conn, head bool) !Resp {
 		body2 := make([]u8, 0, 4096)
 		body2 = append(body2, rest...)
 		for {
+			if len(body2) > limit {
+				fail say.Fault("wire: response body is over the %d-byte limit", limit)
+			}
 			_, err := c.Read(mut body2, 65536)
 			if err != nil {
 				if IsEOF(err) {
@@ -868,7 +964,7 @@ func chunk_trailers(c Conn, buf mut []u8, pos i64) ! {
 }
 
 // read_chunked decodes a chunked body; pending holds bytes already read.
-func read_chunked(c Conn, pending []u8) !str {
+func read_chunked(c Conn, pending []u8, limit i64) !str {
 	buf := make([]u8, 0, len(pending)+4096)
 	buf = append(buf, pending...)
 	out := make([]u8, 0, 4096)
@@ -880,6 +976,9 @@ func read_chunked(c Conn, pending []u8) !str {
 		if size == 0 {
 			try chunk_trailers(c, mut buf, pos)
 			return str(out)
+		}
+		if size > limit-len(out) {
+			fail say.Fault("wire: response body is over the %d-byte limit", limit)
 		}
 		// Read at most 64 KiB at a time so the buffer grows only as data arrives.
 		for len(buf)-pos < size+2 {

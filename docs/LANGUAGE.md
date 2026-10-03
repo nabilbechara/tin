@@ -301,6 +301,12 @@ say.Line(c(), c(), c())      // 1 2 3
 - **Long-lived closures.** Storing a closure that captures request memory in a global, or anywhere
   long-lived, without `keep` is a compile error naming the global. `keep(f)` deep-copies the
   descriptor and every captured variable into the long-lived heap.
+- **What a closure may store in its captured variables.** A closure passed only to functions
+  that call it (`sift.Each` and the others above) is part of its parent's frame, so its body
+  may store request memory in a captured local, for example `out = append(out, s)` to collect
+  results. Any other closure may be kept, after which its captured variables are long-lived,
+  so its body storing request memory in a captured variable is a compile error naming the
+  variable: store `keep(v)`, or pass the closure only to functions that call it.
 - **Captured `mut` parameters are rejected**: a function literal cannot capture a `mut`
   parameter (the parameter is the caller's variable, not a cell); copy it into a local, or pass it
   as an argument.
@@ -474,7 +480,11 @@ func fill(xs mut []i64, v i64) {      // may modify its argument
 - Parameters are read-only: modifying a parameter's contents (assigning its fields or
   elements, appending to it, storing into its map) is a compile error unless the
   parameter is declared `mut`. Passing a read-only parameter on to a `mut` parameter is
-  also rejected. Reassigning the parameter variable itself is allowed.
+  also rejected. Reassigning the parameter variable itself is allowed, except for a `mut`
+  struct, optional or map parameter: `b = Box{}` or `x = nil` there would rebind only the
+  callee's copy, which the caller (who wrote `mut`) would never see, so it is a compile
+  error. Modify the fields or elements instead, or return the new value. A `mut` slice
+  parameter may still be reassigned, for `xs = append(xs, v)`.
 - `mut` is for a struct, a slice, a map or an optional of one: a callee modifies what they
   hold. A number, a `bool`, a `str` or a fault is passed by value, so `mut` on such a parameter
   is a compile error (it would silently do nothing), also for a generic function at the
