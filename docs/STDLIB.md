@@ -214,9 +214,12 @@ r := try wire.Get("http://127.0.0.1:8080/json")
 - `(l Listener) Port() i64`: Port is the port the listener is bound to.
 - `(l Listener) Accept() !Conn`: Accept waits for the next connection.
 - `(l mut Listener) Close()`: Close stops listening.
+- `type Options struct`: Options configure one client call (DoWith); the zero value is what Do uses.
+- `const DefaultMaxBody = 67108864`: DefaultMaxBody is the largest response body Do accepts (64 MiB, anvil's request limit): a larger one is a fault rather than memory a broken or hostile server can fill.
 - `Get(url str) !Resp`: Get fetches url.
 - `Post(url str, ctype str, body str) !Resp`: Post sends body with content type ctype to url.
-- `Do(method str, url str, headers []str, body str) !Resp`: Do sends one request: headers is a list of name, value pairs.
+- `Do(method str, url str, headers []str, body str) !Resp`: Do sends one request: headers is a list of name, value pairs. The method and header names must be tokens, and the URL and header values must not hold CR, LF, NUL or other control bytes (the URL no spaces either), or Do fails instead of sending a request an input could have split. Response bodies over DefaultMaxBody fail; DoWith sets a timeout and the limit.
+- `DoWith(method str, url str, headers []str, body str, opt Options) !Resp`: DoWith is Do with options: an overall timeout and a response size limit.
 - `(r Resp) Header(name str) str`: Header returns the response header name (any case), or "".
 
 ## twine

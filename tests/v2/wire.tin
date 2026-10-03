@@ -5,6 +5,7 @@ import "hearth"
 import "relay"
 import "mint"
 import "wire"
+import "twine"
 
 // serve answers three raw echo lines, then HTTP requests until it sees /stop.
 func serve(l wire.Listener) ! {
@@ -39,6 +40,24 @@ func serve(l wire.Listener) ! {
 			try hc.Write("HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nbye")
 			hc.Close()
 			return
+		}
+		if len(s) >= 10 && s[:10] == "GET /stall" {
+			// Half a body, then nothing until the client gives up and closes.
+			try hc.Write("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nab")
+			junk := make([]u8, 0, 64)
+			for {
+				_, err := hc.Read(mut junk, 64)
+				if err != nil {
+					break
+				}
+			}
+			hc.Close()
+			continue
+		}
+		if len(s) >= 8 && s[:8] == "GET /big" {
+			try hc.Write("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n" + twine.Repeat("x", 100))
+			hc.Close()
+			continue
 		}
 		if len(s) >= 12 && s[:12] == "GET /chunked" {
 			try hc.Write("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nX-Kind: chunks\r\n\r\n5\r\nhello\r\n7\r\n, world\r\n0\r\n\r\n")
@@ -85,6 +104,22 @@ func worker(id i64) {
 	say.Line("chunked", e7 == nil, r2.Status, say.Fmt("%q", r2.Body), r2.Header("X-Kind"))
 	r3, e8 := wire.Post("http://" + addr + "/items", "text/plain", "hello")
 	say.Line("post", e8 == nil, r3.Status, r3.Body)
+	_, e14 := wire.DoWith("GET", "http://" + addr + "/stall", []str{}, "", wire.Options{Timeout: 200000000, MaxBody: 0})
+	say.Line("timeout", e14)
+	_, e15 := wire.DoWith("GET", "http://" + addr + "/big", []str{}, "", wire.Options{Timeout: 0, MaxBody: 50})
+	say.Line("maxbody length", e15)
+	r5, e16 := wire.DoWith("GET", "http://" + addr + "/big", []str{}, "", wire.Options{Timeout: 0, MaxBody: 100})
+	say.Line("maxbody exact", e16 == nil, len(r5.Body))
+	_, e17 := wire.DoWith("GET", "http://" + addr + "/chunked", []str{}, "", wire.Options{Timeout: 0, MaxBody: 8})
+	say.Line("maxbody chunked", e17)
+	_, e18 := wire.Do("GET", "http://" + addr + "/x", []str{"X-A", "a\r\nSet-Cookie: x=1"}, "")
+	say.Line("header value", e18)
+	_, e19 := wire.Do("GET", "http://" + addr + "/x", []str{"Bad Name", "v"}, "")
+	say.Line("header name", e19)
+	_, e20 := wire.Do("GET", "http://" + addr + "/x HTTP/1.1\r\nX: y", []str{}, "")
+	say.Line("url", e20 != nil)
+	_, e21 := wire.Do("GE T", "http://" + addr + "/x", []str{}, "")
+	say.Line("method", e21)
 	r4 := wire.Get("http://" + addr + "/stop") catch err {
 		say.Line("stop", err)
 		return
