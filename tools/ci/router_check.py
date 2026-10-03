@@ -172,6 +172,41 @@ def protocol(port, failures):
         failures.append('pipelined order: %r' % order)
 
 
+def raw(port, data):
+    """Send data, then read until the server closes; the raw bytes."""
+    with socket.create_connection(('127.0.0.1', port), timeout=10) as s:
+        s.sendall(data)
+        out = b''
+        while True:
+            d = s.recv(65536)
+            if not d:
+                return out
+            out += d
+
+
+def response_headers(port, failures):
+    """#172: header values from the request cannot add header lines or a body, framing headers
+    set by a handler are ignored, and 204/304 responses carry no body."""
+    got = raw(port, b'GET /echo-head?v=a%0d%0aSet-Cookie:%20x=1%0d%0a%0d%0aINJECTED&t=text/x%0d%0aX-Evil:%201'
+                    b' HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n')
+    head, _, body = got.partition(b'\r\n\r\n')
+    lines = head.split(b'\r\n')
+    names = [l.split(b':', 1)[0].lower() for l in lines[1:]]
+    print('response header names:', names)
+    if b'set-cookie' in names or b'x-evil' in names or b'bad name' in names:
+        failures.append('a header line was injected: %r' % got)
+    if names.count(b'content-length') != 1 or names.count(b'connection') != 0 or body != b'echoed':
+        failures.append('framing headers from the handler were sent: %r' % got)
+    if b'X-Echo: a  Set-Cookie: x=1    INJECTED' not in lines or b'Content-Type: text/x  X-Evil: 1' not in lines:
+        failures.append('CR/LF in values were not replaced by spaces: %r' % got)
+    for code in (204, 304):
+        got = raw(port, b'GET /status/%d HTTP/1.1\r\nHost: x\r\n\r\nGET /fast HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' % code)
+        first, _, rest = got.partition(b'\r\n\r\n')
+        if b'content-length' in first.lower() or not rest.startswith(b'HTTP/1.1 200 OK\r\n') or not rest.endswith(b'\r\n\r\nfast'):
+            failures.append('%d response framing: %r' % (code, got))
+    print('204/304 without a body, header injection refused:', not failures)
+
+
 def websockets(port, failures):
     """A routed handler upgrades: its path parameter, an echo, and 20 at once on the core."""
     ws.PORT = port
@@ -206,6 +241,7 @@ def main():
             mixed_load(port, failures)
             protocol(port, failures)
             if cores == 1:
+                response_headers(port, failures)
                 overlap(port, failures)
                 websockets(port, failures)
             if server.poll() is not None:

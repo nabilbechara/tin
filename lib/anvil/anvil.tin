@@ -1206,6 +1206,18 @@ func respond_out(w Out, hd bool) {
 	ob_room(256 + len(w.ctype) + eh[0] + bn)
 	ob_str(status_line(w.code))
 	ob_raw(common, commonLen)
+	if w.code < 200 || w.code == 204 || w.code == 304 {
+		// No body is allowed (RFC 9110 6.4.1): no Content-Type or Content-Length either, and
+		// whatever the handler wrote is dropped, or the client would read it as the next response.
+		if eh[0] > 0 {
+			ob_raw(eh[2], eh[0])
+		}
+		if draining {
+			ob_str("Connection: close\r\n")
+		}
+		ob_str("\r\n")
+		return
+	}
 	ob_str("Content-Type: ")
 	ob_str(w.ctype)
 	ob_str("\r\nContent-Length: ")
@@ -1477,17 +1489,59 @@ func (w mut Out) Status(code i64) {
 	w.code = code
 }
 
-// Type sets the Content-Type header.
+// Type sets the Content-Type header. CR, LF and NUL in t become spaces, so a value taken from
+// the request cannot add header lines.
 func (w mut Out) Type(t str) {
-	w.ctype = t
+	w.ctype = field_value(t)
 }
 
-// Head adds a response header.
+// Head adds a response header. A name that is not an HTTP token is ignored, and so are
+// Content-Length, Transfer-Encoding and Connection: anvil writes the framing itself. CR, LF and
+// NUL in the value become spaces, so a value taken from the request cannot add header lines or
+// a body (response splitting), as Go's net/http does.
 func (w mut Out) Head(k str, v str) {
+	if !is_token(k) || is_framing(k) {
+		return
+	}
 	w.extra = append(w.extra, k...)
 	w.extra = append(w.extra, ": "...)
-	w.extra = append(w.extra, v...)
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		if c == '\r' || c == '\n' || c == 0 {
+			c = ' '
+		}
+		w.extra = append(w.extra, c)
+	}
 	w.extra = append(w.extra, "\r\n"...)
+}
+
+// field_value is s with CR, LF and NUL replaced by spaces (s itself when it has none).
+func field_value(s str) str {
+	bad := false
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\r' || s[i] == '\n' || s[i] == 0 {
+			bad = true
+			break
+		}
+	}
+	if !bad {
+		return s
+	}
+	b := make([]u8, len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '\r' || c == '\n' || c == 0 {
+			c = ' '
+		}
+		b[i] = c
+	}
+	return str(b)
+}
+
+// is_framing reports whether header k is one anvil computes for every response.
+func is_framing(k str) bool {
+	n := cast(i64, k) + 8
+	return name_is(n, len(k), "content-length") || name_is(n, len(k), "transfer-encoding") || name_is(n, len(k), "connection")
 }
 
 // Text appends s to the body.
