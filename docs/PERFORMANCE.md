@@ -204,3 +204,18 @@ is no dispatch overhead. The committed check `tests/v2/shapes_dispatch_asm.tin` 
 asserts the direct call (`bl _Buf.Read` on arm64, `call S<n>  # Buf.Read` on amd64) and that
 no indirect call follows it in the listing, on every target in CI.
 
+## 6. Dynamic shape dispatch
+
+`bench/dispatch/dyn.tin` compares `Log(w dyn Writer, ...)` with a direct call to the same
+concrete method. Each process runs five rounds of 2,000,000 iterations and reports its best
+round; the table shows four process runs on the Apple M3 Pro development machine:
+
+| measurement | process runs | median |
+|---|---|---|
+| dynamic call | 4.54, 4.77, 4.55, 4.89 ns/op | 4.66 ns/op |
+| direct call | 2.93, 3.25, 2.97, 2.88 ns/op | 2.95 ns/op |
+| dynamic/direct | 1.55, 1.47, 1.53, 1.70 | 1.54 |
+
+The measured loop used zero pool bytes. `tests/v2/shapes_dyn_asm.tin` checks arm64 and
+amd64 assembly for exactly one indirect call in the dynamic method and no allocator call.
+These numbers describe this microbenchmark and machine; they are not a whole-program estimate.

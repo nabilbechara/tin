@@ -522,6 +522,9 @@ fn rg_expr(e) {
     }
     if k == EX_CONV {
         let x = rg_expr(e[CV_X]);
+        if e[CV_KIND] == CV_DYN_KEEP {
+            return RG_INGOT;
+        }
         if has_ptr(e[N_TYPE]) && !has_ptr(e[CV_X][N_TYPE]) {
             // A raw word turned into a reference (standard library only): origin unknown.
             return x | RG_UNK | RG_EMB;
@@ -610,6 +613,9 @@ fn rg_call(e) {
         return 0;
     }
     let pos = e[N_POS];
+    if e[CALL_DYN_SHAPE] {
+        return rg_dyn_call(e, args, b, pos);
+    }
     if e[CALL_CALLEE] {
         rg_expr(e[CALL_CALLEE]);
         // The callee is unknown: a mut argument may be modified and may receive request
@@ -715,6 +721,62 @@ fn rg_call(e) {
     return vec_get(res, 0);
 }
 
+// A dyn call can target any concrete method table for its shape. Join the region
+// summaries of those methods using each table's concrete receiver type.
+fn rg_dyn_call(e, args, b, pos) {
+    let shape = e[CALL_DYN_SHAPE];
+    let index = e[CALL_DYN_INDEX] - 1;
+    let saved_fn = e[CALL_FN];
+    let saved_callee = e[CALL_CALLEE];
+    let saved_shape = e[CALL_DYN_SHAPE];
+    let saved_index = e[CALL_DYN_INDEX];
+    let saved_type = vec_get(args, 0)[N_TYPE];
+    let joined = vec_new();
+    let j = 0;
+    while j < 8 {
+        vec_push(joined, 0);
+        j = j + 1;
+    }
+    let result = 0;
+    let found = 0;
+    let i = 0;
+    while i < dyn_tables[VEC_LEN] {
+        let rec = vec_get(dyn_tables, i);
+        let methods = vec_get(rec, 3);
+        if vec_get(rec, 1) == shape && index >= 0 && index < methods[VEC_LEN] {
+            let f = vec_get(methods, index);
+            if f {
+                found = 1;
+                e[CALL_FN] = f;
+                e[CALL_CALLEE] = 0;
+                e[CALL_DYN_SHAPE] = 0;
+                e[CALL_DYN_INDEX] = 0;
+                vec_get(args, 0)[N_TYPE] = vec_get(rec, 0);
+                result = result | rg_call(e);
+                let ri = 0;
+                while ri < 8 {
+                    joined[VEC_DATA][ri] = vec_get(joined, ri) | vec_get(rg_multi, ri);
+                    ri = ri + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    e[CALL_FN] = saved_fn;
+    e[CALL_CALLEE] = saved_callee;
+    e[CALL_DYN_SHAPE] = saved_shape;
+    e[CALL_DYN_INDEX] = saved_index;
+    vec_get(args, 0)[N_TYPE] = saved_type;
+    if !found {
+        if has_ptr(e[N_TYPE]) {
+            return RG_UNK | RG_EMB;
+        }
+        return 0;
+    }
+    rg_multi = joined;
+    return result;
+}
+
 // rg_pass applies a callee's records (rg_record) for argument i: each names an object
 // inside the argument, whose bits (rg_deep) are joined into the result, and v (unless -1)
 // is stored into each.
@@ -792,6 +854,11 @@ fn rg_runtime_call(e, name, b, pos) {
     }
     if streq(name, "rt_append") {
         rg_store(b0, co, ct, vec_get(b, 1), vec_get(args, 1)[N_TYPE], pos, 0);
+        return b0;
+    }
+    if streq(name, "rt_append_dyn") {
+        let et = vec_get(args, 0)[N_TYPE][TY_ELEM];
+        rg_store(b0, co, ct, vec_get(b, 1), et, pos, 0);
         return b0;
     }
     if streq(name, "rt_slice_appendn") || streq(name, "rt_slice_copy") {

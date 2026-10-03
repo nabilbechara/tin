@@ -31,6 +31,7 @@ Generated from the comments in `lib/*/` by `tools/gendoc.py`.
 | [seal](#seal) | crypto and encodings (crypto/sha256, hmac, encoding/hex, base64) |
 | [herald](#herald) | logging (log/slog) |
 | [crucible](#crucible) | testing helpers (testing) |
+| [constraints](#constraints) | named generic constraint shapes |
 | [redis](#redis) | Redis client (go-redis) |
 | [mysql](#mysql) | MySQL client (database/sql with go-sql-driver/mysql) |
 | [postgres](#postgres) | PostgreSQL client (database/sql with pgx) |
@@ -742,57 +743,58 @@ Package sift sorts and searches slices and has the generic functions on them (li
 - `IndexInts(xs []i64, x i64) i64`: IndexInts returns the index of the first x in xs, or -1.
 - `ContainsStr(xs []str, x str) bool`: ContainsStr reports whether x occurs in xs.
 - `EqualInts(a []i64, b []i64) bool`: EqualInts reports whether a and b have the same length and elements.
-- `Map[T any, U any](xs []T, f func(T) U) []U`: Map returns f applied to each element of xs.
-- `Filter[T any](xs []T, keep func(T) bool) []T`: Filter returns the elements of xs for which keep returns true, in order.
-- `Reduce[T any, A any](xs []T, start A, f func(A, T) A) A`: Reduce folds xs into one value: f(f(f(start, x0), x1), ...).
-- `Sort[E i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str](xs mut []E)`: Sort sorts xs in ascending order, in place. Floating-point NaNs sort first. It is not stable, and the order of equal elements is the same as Go's slices.Sort.
-- `SortFunc[E any](xs mut []E, cmp func(E, E) i64)`: SortFunc sorts xs in place by cmp, which returns a negative number when a sorts before b, zero when they are equal and a positive number after. It is not stable.
-- `SortStableFunc[E any](xs mut []E, cmp func(E, E) i64)`: SortStableFunc is SortFunc, keeping the original order of elements that compare equal.
-- `IsSorted[E i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str](xs []E) bool`: IsSorted reports whether xs is in ascending order.
-- `IsSortedFunc[E any](xs []E, cmp func(E, E) i64) bool`: IsSortedFunc reports whether xs is sorted by cmp.
-- `Less[E i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str](x E, y E) bool`: Less is cmp.Less: x < y, with NaN smaller than every other value (and so before them in Sort).
-- `Cmp[E i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str](x E, y E) i64`: Cmp is cmp.Compare: -1 if x sorts before y, 0 if they are equal, +1 after. NaNs are equal to each other and sort before every other value.
-- `BinarySearch[E i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str](xs []E, target E) (i64, bool)`: BinarySearch searches the sorted xs for target and returns the position where it is, or would be inserted, and whether it is there.
-- `BinarySearchFunc[E any, T any](xs []E, target T, cmp func(E, T) i64) (i64, bool)`: BinarySearchFunc is BinarySearch for a target of another type, ordered by cmp(element, target).
-- `Min[E i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str](xs []E) E`: Min returns the smallest element of xs; a NaN anywhere gives NaN. It panics if xs is empty. (-0 and +0 compare equal here, so a mix of them returns whichever comes first.)
-- `Max[E i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str](xs []E) E`: Max returns the largest element of xs; a NaN anywhere gives NaN. It panics if xs is empty.
-- `MinFunc[E any](xs []E, cmp func(E, E) i64) E`: MinFunc returns the first smallest element of xs by cmp. It panics if xs is empty.
-- `MaxFunc[E any](xs []E, cmp func(E, E) i64) E`: MaxFunc returns the first largest element of xs by cmp. It panics if xs is empty.
-- `Index[E comparable](xs []E, v E) i64`: Index returns the position of the first element equal to v, or -1.
-- `IndexFunc[E any](xs []E, f func(E) bool) i64`: IndexFunc returns the position of the first element for which f is true, or -1.
-- `Contains[E comparable](xs []E, v E) bool`: Contains reports whether v is in xs.
-- `ContainsFunc[E any](xs []E, f func(E) bool) bool`: ContainsFunc reports whether f is true for some element of xs.
-- `Equal[E comparable](a []E, b []E) bool`: Equal reports whether a and b have the same length and equal elements.
-- `EqualFunc[A any, B any](a []A, b []B, eq func(A, B) bool) bool`: EqualFunc is Equal for two element types, with eq deciding.
-- `Compare[E i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str](a []E, b []E) i64`: Compare compares a and b element by element with Cmp, then by length: -1, 0 or +1.
-- `CompareFunc[A any, B any](a []A, b []B, cmp func(A, B) i64) i64`: CompareFunc is Compare for two element types, with cmp comparing elements.
-- `Reverse[E any](xs mut []E)`: Reverse reverses xs in place.
-- `Clone[E any](xs []E) []E`: Clone returns a copy of xs that shares nothing with it.
-- `Grow[E any](xs []E, n i64) []E`: Grow returns a copy of xs with room for n more elements before it has to grow again.
-- `Concat[E any](a []E, b []E) []E`: Concat returns a new slice holding a followed by b.
-- `ConcatAll[E any](parts [][]E) []E`: ConcatAll returns a new slice holding every slice of parts, in order.
-- `Repeat[E any](xs []E, count i64) []E`: Repeat returns a new slice that repeats xs count times.
-- `Insert[E any](xs mut []E, i i64, v E) []E`: Insert inserts v at position i (0 to len(xs)) and returns the longer slice. Like append, it grows xs in place, so every other reference to the same slice sees the new length.
-- `InsertAll[E any](xs mut []E, i i64, vs []E) []E`: InsertAll inserts all of vs at position i and returns the longer slice (grown in place, as Insert).
-- `Delete[E any](xs mut []E, i i64, j i64) []E`: Delete removes xs[i:j] and returns the shorter slice; the elements after j move down in place.
-- `DeleteFunc[E any](xs mut []E, del func(E) bool) []E`: DeleteFunc removes the elements for which del is true, in place, and returns the shorter slice.
-- `Replace[E any](xs mut []E, i i64, j i64, vs []E) []E`: Replace replaces xs[i:j] with vs and returns the resulting slice (grown or shrunk in place).
-- `Compact[E comparable](xs mut []E) []E`: Compact removes runs of equal consecutive elements, keeping the first of each run, in place, and returns the shorter slice.
-- `CompactFunc[E any](xs mut []E, eq func(E, E) bool) []E`: CompactFunc is Compact with eq deciding which neighbours are equal.
-- `Each[E any](xs []E, f func(E))`: Each calls f for every element of xs in ascending index order.
+- `Map[T constraints.Any, U constraints.Any](xs []T, f func(T) U) []U`: Map returns f applied to each element of xs.
+- `Filter[T constraints.Any](xs []T, keep func(T) bool) []T`: Filter returns the elements of xs for which keep returns true, in order.
+- `Reduce[T constraints.Any, A constraints.Any](xs []T, start A, f func(A, T) A) A`: Reduce folds xs into one value: f(f(f(start, x0), x1), ...).
+- `shape Ordered = i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str`: Ordered is the set of built-in types with a total ordering operator.
+- `Sort[E Ordered](xs mut []E)`: Sort sorts xs in ascending order, in place. Floating-point NaNs sort first. It is not stable, and the order of equal elements is the same as Go's slices.Sort.
+- `SortFunc[E constraints.Any](xs mut []E, cmp func(E, E) i64)`: SortFunc sorts xs in place by cmp, which returns a negative number when a sorts before b, zero when they are equal and a positive number after. It is not stable.
+- `SortStableFunc[E constraints.Any](xs mut []E, cmp func(E, E) i64)`: SortStableFunc is SortFunc, keeping the original order of elements that compare equal.
+- `IsSorted[E Ordered](xs []E) bool`: IsSorted reports whether xs is in ascending order.
+- `IsSortedFunc[E constraints.Any](xs []E, cmp func(E, E) i64) bool`: IsSortedFunc reports whether xs is sorted by cmp.
+- `Less[E Ordered](x E, y E) bool`: Less is cmp.Less: x < y, with NaN smaller than every other value (and so before them in Sort).
+- `Cmp[E Ordered](x E, y E) i64`: Cmp is cmp.Compare: -1 if x sorts before y, 0 if they are equal, +1 after. NaNs are equal to each other and sort before every other value.
+- `BinarySearch[E Ordered](xs []E, target E) (i64, bool)`: BinarySearch searches the sorted xs for target and returns the position where it is, or would be inserted, and whether it is there.
+- `BinarySearchFunc[E constraints.Any, T constraints.Any](xs []E, target T, cmp func(E, T) i64) (i64, bool)`: BinarySearchFunc is BinarySearch for a target of another type, ordered by cmp(element, target).
+- `Min[E Ordered](xs []E) E`: Min returns the smallest element of xs; a NaN anywhere gives NaN. It panics if xs is empty. (-0 and +0 compare equal here, so a mix of them returns whichever comes first.)
+- `Max[E Ordered](xs []E) E`: Max returns the largest element of xs; a NaN anywhere gives NaN. It panics if xs is empty.
+- `MinFunc[E constraints.Any](xs []E, cmp func(E, E) i64) E`: MinFunc returns the first smallest element of xs by cmp. It panics if xs is empty.
+- `MaxFunc[E constraints.Any](xs []E, cmp func(E, E) i64) E`: MaxFunc returns the first largest element of xs by cmp. It panics if xs is empty.
+- `Index[E constraints.Comparable](xs []E, v E) i64`: Index returns the position of the first element equal to v, or -1.
+- `IndexFunc[E constraints.Any](xs []E, f func(E) bool) i64`: IndexFunc returns the position of the first element for which f is true, or -1.
+- `Contains[E constraints.Comparable](xs []E, v E) bool`: Contains reports whether v is in xs.
+- `ContainsFunc[E constraints.Any](xs []E, f func(E) bool) bool`: ContainsFunc reports whether f is true for some element of xs.
+- `Equal[E constraints.Comparable](a []E, b []E) bool`: Equal reports whether a and b have the same length and equal elements.
+- `EqualFunc[A constraints.Any, B constraints.Any](a []A, b []B, eq func(A, B) bool) bool`: EqualFunc is Equal for two element types, with eq deciding.
+- `Compare[E Ordered](a []E, b []E) i64`: Compare compares a and b element by element with Cmp, then by length: -1, 0 or +1.
+- `CompareFunc[A constraints.Any, B constraints.Any](a []A, b []B, cmp func(A, B) i64) i64`: CompareFunc is Compare for two element types, with cmp comparing elements.
+- `Reverse[E constraints.Any](xs mut []E)`: Reverse reverses xs in place.
+- `Clone[E constraints.Any](xs []E) []E`: Clone returns a copy of xs that shares nothing with it.
+- `Grow[E constraints.Any](xs []E, n i64) []E`: Grow returns a copy of xs with room for n more elements before it has to grow again.
+- `Concat[E constraints.Any](a []E, b []E) []E`: Concat returns a new slice holding a followed by b.
+- `ConcatAll[E constraints.Any](parts [][]E) []E`: ConcatAll returns a new slice holding every slice of parts, in order.
+- `Repeat[E constraints.Any](xs []E, count i64) []E`: Repeat returns a new slice that repeats xs count times.
+- `Insert[E constraints.Any](xs mut []E, i i64, v E) []E`: Insert inserts v at position i (0 to len(xs)) and returns the longer slice. Like append, it grows xs in place, so every other reference to the same slice sees the new length.
+- `InsertAll[E constraints.Any](xs mut []E, i i64, vs []E) []E`: InsertAll inserts all of vs at position i and returns the longer slice (grown in place, as Insert).
+- `Delete[E constraints.Any](xs mut []E, i i64, j i64) []E`: Delete removes xs[i:j] and returns the shorter slice; the elements after j move down in place.
+- `DeleteFunc[E constraints.Any](xs mut []E, del func(E) bool) []E`: DeleteFunc removes the elements for which del is true, in place, and returns the shorter slice.
+- `Replace[E constraints.Any](xs mut []E, i i64, j i64, vs []E) []E`: Replace replaces xs[i:j] with vs and returns the resulting slice (grown or shrunk in place).
+- `Compact[E constraints.Comparable](xs mut []E) []E`: Compact removes runs of equal consecutive elements, keeping the first of each run, in place, and returns the shorter slice.
+- `CompactFunc[E constraints.Any](xs mut []E, eq func(E, E) bool) []E`: CompactFunc is Compact with eq deciding which neighbours are equal.
+- `Each[E constraints.Any](xs []E, f func(E))`: Each calls f for every element of xs in ascending index order.
 
 ## atlas
 
 Package atlas is the functions on maps (like Go's maps): keys, values, copies and comparisons.
 
-- `Keys[K comparable, V any](m map[K]V) []K`: Keys returns m's keys in insertion order.
-- `Values[K comparable, V any](m map[K]V) []V`: Values returns m's values in insertion order.
-- `SortedKeys[K i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str, V any](m map[K]V) []K`: SortedKeys returns m's keys in ascending order (NaN first), whatever order they were added in.
-- `Clone[K comparable, V any](m map[K]V) map[K]V`: Clone returns a new map with the same entries, in the same order.
-- `Copy[K comparable, V any](dst mut map[K]V, src map[K]V)`: Copy adds every entry of src to dst, replacing the values of keys dst already has.
-- `Equal[K comparable, V comparable](a map[K]V, b map[K]V) bool`: Equal reports whether a and b have the same keys with equal values.
-- `EqualFunc[K comparable, V1 any, V2 any](a map[K]V1, b map[K]V2, eq func(V1, V2) bool) bool`: EqualFunc is Equal with eq comparing the values, which may have different types.
-- `DeleteFunc[K comparable, V any](m mut map[K]V, del func(K, V) bool)`: DeleteFunc removes the entries for which del is true.
+- `Keys[K constraints.Comparable, V constraints.Any](m map[K]V) []K`: Keys returns m's keys in insertion order.
+- `Values[K constraints.Comparable, V constraints.Any](m map[K]V) []V`: Values returns m's values in insertion order.
+- `SortedKeys[K sift.Ordered, V constraints.Any](m map[K]V) []K`: SortedKeys returns m's keys in ascending order (NaN first), whatever order they were added in.
+- `Clone[K constraints.Comparable, V constraints.Any](m map[K]V) map[K]V`: Clone returns a new map with the same entries, in the same order.
+- `Copy[K constraints.Comparable, V constraints.Any](dst mut map[K]V, src map[K]V)`: Copy adds every entry of src to dst, replacing the values of keys dst already has.
+- `Equal[K constraints.Comparable, V constraints.Comparable](a map[K]V, b map[K]V) bool`: Equal reports whether a and b have the same keys with equal values.
+- `EqualFunc[K constraints.Comparable, V1 constraints.Any, V2 constraints.Any](a map[K]V1, b map[K]V2, eq func(V1, V2) bool) bool`: EqualFunc is Equal with eq comparing the values, which may have different types.
+- `DeleteFunc[K constraints.Comparable, V constraints.Any](m mut map[K]V, del func(K, V) bool)`: DeleteFunc removes the entries for which del is true.
 
 ## cairn
 
@@ -952,10 +954,17 @@ crucible.Done()
 - `(t mut T) False(label str, cond bool)`: False fails the test with label if cond holds.
 - `(t mut T) NoFault(label str, err fault)`: NoFault fails the test if err is not nil.
 - `(t mut T) HasFault(label str, err fault)`: HasFault fails the test if err is nil.
-- `Equal[V comparable](t mut T, label str, got V, want V)`: Equal fails the test unless got == want; both are printed on failure.
+- `Equal[V constraints.Comparable](t mut T, label str, got V, want V)`: Equal fails the test unless got == want; both are printed on failure.
 - `Run(name str, f func(mut T))`: Run runs one test and prints its result like go test -v.
 - `RunBench(name str, f func(mut B))`: RunBench runs one benchmark with b.N doubling until it takes at least 1 s, then prints the time per operation.
 - `Finish()`: Finish prints PASS or FAIL and exits with status 1 when a test failed.
+
+## constraints
+
+Package constraints contains the named generic constraints used by the standard library.
+
+- `shape Any {}`: Any imposes no operations on a type parameter.
+- `shape Comparable {}`: Comparable admits values that can be compared by value, including structs and enums whose fields are all comparable. The compiler checks this property at each instantiation.
 
 ## redis
 

@@ -50,7 +50,8 @@ Tin's goal: a language as ready as Go, Rust and Odin for servers and tools, writ
 performance as the end goal. This is the whole list, ordered by phase; a box is checked when it is merged
 with its tests (and, for library work, verified against Go: see notes/stdlib_verified.md). Years are targets,
 not promises; the order inside a phase follows dependencies (notes/design_foundations.md). The standard
-library checklist (section 9) is generated from docs/COVERAGE.md, which stays the detailed inventory.
+library checklist (section 9) is generated from notes/coverage.md; docs/COVERAGE.md is its
+published generated inventory.
 
 ### 1. Language (year 1 to 3)
 

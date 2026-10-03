@@ -97,9 +97,9 @@ conversion happens) and is two words. It converts from a concrete type implicitl
 is expected, and the compiler reports the missing method when it does not satisfy. A `dyn S` is
 never nil, as nothing else in Tin is; `?dyn S` is the optional.
 
-Named unions become shapes too: `shape Ordered = i64 | i32 | ... | f64 | str`. `any`,
-`comparable` and `Ordered` are then ordinary names in the library (`sift.Ordered`), not syntax, and
-a signature no longer repeats an eleven-way union.
+Named unions become shapes too: `shape Ordered = i64 | i32 | ... | f64 | str`.
+`constraints.Any`, `constraints.Comparable` and `sift.Ordered` are ordinary imported library
+shapes, not syntax, and a signature no longer repeats an eleven-way union.
 
 **There is no downcast.** No type assertion and no type switch on a `dyn`: a closed set of cases is
 an `enum` (checked for exhaustiveness), an open set is a method on the shape (`Kind()`). Go code
@@ -126,7 +126,7 @@ shape Reader { Read(buf mut []u8) !i64 }          // a method set
 shape Writer { Write(data []u8) !i64 }
 shape ReadWriter { Reader; Writer; Flush() !i64 }  // composition by listing shapes
 shape Ordered = i64 | i32 | f64 | str              // a named union
-shape Seq[T any] { Next() ?T; Close() !i64 }       // type parameters
+shape Seq[T constraints.Any] { Next() ?T; Close() !i64 } // type parameters
 ```
 
 - A shape member is a method signature or the name of another shape. The two cannot be
@@ -158,10 +158,10 @@ shape Seq[T any] { Next() ?T; Close() !i64 }       // type parameters
   runtime type information: a closed set of cases is an `enum`, an open set is a method on the
   shape.
 
-Steps are built in the order of section 12.2: declarations and `dyn` parse first (they are
-registered but not yet usable), then satisfaction and diagnostics, then static dispatch, then
-`dyn` code generation with its method tables, then the library ports. Checking a box in
-notes/roadmap.md follows section 12.1: each step has its own acceptance test.
+The language, checker, static dispatch and `dyn` code generation are implemented, including
+method tables and region checks. The library ports follow this foundation as separate roadmap
+work. Checking a box in notes/roadmap.md follows section 12.1: each step has its own acceptance
+test.
 
 ### 2.2 Satisfaction and static dispatch (built)
 
@@ -188,13 +188,11 @@ Failure is a source-level error at the instantiation site that prints the declar
 and, for a name that exists with another signature, both signatures:
 `type Odd does not satisfy shape Reader: method Read(buf []u8) i64 has the wrong signature, want Read(buf mut []u8) !i64`.
 
-Dispatch costs nothing to provide: monomorphization already re-checks a generic body with the
-type parameters bound, so a call through a shaped parameter resolves to the concrete method
-like any other call, with no table and no indirection. `dyn` is the explicit exception and is
-the next step; its two-word representation, the ABI and the staging are decided in
-notes/design_dyn.md. Until it is built, a `dyn` type in any signature that is resolved (every
-non-generic shape's signature is resolved when it is declared) is rejected with a message
-naming the missing step rather than being misread as an ordinary type.
+Dispatch costs nothing to provide for a shaped type parameter: monomorphization already
+re-checks a generic body with the type parameters bound, so a call resolves to the concrete
+method. `dyn` is the explicit exception: its two-word representation, ABI, method tables and
+region behavior are implemented as described in notes/design_dyn.md. A dynamic call uses one
+indirect call; the remaining map-value and library-port work is tracked separately.
 
 ---
 

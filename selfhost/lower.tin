@@ -1932,8 +1932,7 @@ fn chk_call(e, want) {
             return ty_string;
         }
         if kind_of(xt) == K_DYN {
-            err_at(e[N_POS], "a method call through a dyn value is the next step (#141): the checker types it, the back ends build the table");
-            return ty_int;
+            return lower_dyn_method_call(e, x, xt, m);
         }
         err_type(e[N_POS], "cannot call a method on ", xt, "");
         return ty_int;
@@ -1942,6 +1941,81 @@ fn chk_call(e, want) {
         return chk_conversion(e, resolve_type(callee[TYX]));
     }
     return indirect_call(e);
+}
+
+// lower_dyn_method_call checks the explicit arguments against the flattened shape
+// signature, then builds an ordinary indirect call whose first ABI argument is the
+// object word and whose callee is the method descriptor loaded from the table.
+fn lower_dyn_method_call(e, receiver, dt, name) {
+    let pos = e[N_POS];
+    let info = dyn_shape_method(dt, name);
+    if !info {
+        let m = err_begin(pos);
+        buf_str(m, "dyn shape ");
+        buf_str(m, dt[TY_GDECL][D_NAME]);
+        buf_str(m, " has no method ");
+        buf_str(m, name);
+        err_end(m);
+        return ty_int;
+    }
+    let sig = vec_get(info, 1);
+    let names = vec_get(sig, 0);
+    let ps = vec_get(sig, 1);
+    let ms = vec_get(sig, 2);
+    let rs = vec_get(sig, 3);
+    let variadic = vec_get(sig, 4);
+    let mutmask = 0;
+    let i = 0;
+    while i < ms[VEC_LEN] && i < 63 {
+        if vec_get(ms, i) {
+            mutmask = mutmask | (1 << i);
+        }
+        i = i + 1;
+    }
+    e[CALL_NAME] = name;
+    chk_args(e, ps, variadic, 0, mutmask);
+
+    // A method receiver may itself be an expression with effects. Store its pair once;
+    // both the object argument and descriptor lookup then read the same value.
+    let receiver_temp = temp(pos, receiver, dt);
+    let receiver_ref = sym_ref_node(pos, receiver_temp[LET_SYM]);
+    let object = mk_conv(pos, receiver_ref, CV_DYN_OBJECT, ty_int);
+    let desc_params = vec_new();
+    vec_push(desc_params, ty_int);
+    i = 0;
+    while i < ps[VEC_LEN] {
+        vec_push(desc_params, vec_get(ps, i));
+        i = i + 1;
+    }
+    let desc_mask = 0;
+    i = 0;
+    while i < ms[VEC_LEN] && i < 62 {
+        if vec_get(ms, i) {
+            desc_mask = desc_mask | (1 << (i + 1));
+        }
+        i = i + 1;
+    }
+    let ft = func_of_m(desc_params, rs, variadic, desc_mask);
+    let desc = mk_conv(pos, receiver_ref, CV_DYN_DESC, ft);
+    desc[CV_DYN_INDEX] = vec_get(info, 0);
+
+    let inner = node_new(EX_CALL, pos);
+    inner[CALL_NAME] = name;
+    inner[CALL_ARGS] = args1(object);
+    i = 0;
+    while i < e[CALL_ARGS][VEC_LEN] {
+        vec_push(inner[CALL_ARGS], vec_get(e[CALL_ARGS], i));
+        i = i + 1;
+    }
+    inner[CALL_CALLEE] = desc;
+    inner[CALL_METHOD] = 1;
+    inner[CALL_DYN_SHAPE] = dt;
+    inner[CALL_DYN_INDEX] = vec_get(info, 0);
+    inner[N_TYPE] = func_result(ft);
+    let stmts = vec_new();
+    vec_push(stmts, receiver_temp);
+    replace_node(e, mk_seq(pos, stmts, inner, inner[N_TYPE]));
+    return inner[N_TYPE];
 }
 
 // overload picks pkg.Name__suffix by the first argument's element type, the stand-in
@@ -1975,6 +2049,21 @@ fn indirect_call(e) {
     e[CALL_FN] = 0;
     chk_args(e, ft[TY_FIELDS], 0, 0, ft[TY_KEY]);
     return func_result(ft);
+}
+
+// lower_append_dyn passes the object and table as separate scalar arguments to the
+// runtime append helper. The pair temporary evaluates a conversion or other expression
+// once, and the region pass still sees its object bits through both projections.
+fn lower_append_dyn(pos, slice, value, st) {
+    let et = st[TY_ELEM];
+    let saved = temp(pos, value, et);
+    let ref = sym_ref_node(pos, saved[LET_SYM]);
+    let object = mk_conv(pos, ref, CV_DYN_OBJECT, ty_int);
+    let table = mk_conv(pos, ref, CV_DYN_TABLE_WORD, ty_int);
+    let call = rt_call(pos, "rt_append_dyn", args3(slice, object, table), st);
+    let stmts = vec_new();
+    vec_push(stmts, saved);
+    return mk_seq(pos, stmts, call, st);
 }
 
 fn find_type_name(name) {
@@ -2113,7 +2202,11 @@ fn chk_builtin(e, name, want) {
                 if is_untyped(vt) {
                     reconvert(a, et);
                 }
-                acc = rt_call(pos, "rt_append", args3(acc, elem_bits(a, st[TY_ELEM]), mk_int(pos, elem_size(st), ty_int)), st);
+                if is_dyn_value(et) {
+                    acc = lower_append_dyn(pos, acc, a, st);
+                } else {
+                    acc = rt_call(pos, "rt_append", args3(acc, elem_bits(a, st[TY_ELEM]), mk_int(pos, elem_size(st), ty_int)), st);
+                }
             }
             i = i + 1;
         }
@@ -2359,14 +2452,15 @@ fn lower_keep(e, want) {
     if is_untyped(t) {
         t = reconvert(x, default_type(t));
     }
-    if kind_of(t) == K_DYN {
-        err_at(pos, "keep of a dyn value needs the method table's copy entry: the next step (#141)");
-        replace_node(e, x);
-        return t;
-    }
-    if type_has_dyn(t, 0) {
-        err_at(pos, "keep of a value holding dyn needs the method table's copy entry: the next step (#141)");
-        replace_node(e, x);
+    if kind_of(t) == K_DYN || type_has_dyn(t, 0) {
+        let f = keep_fn(t);
+        let c = node_new(EX_CALL, pos);
+        c[CALL_NAME] = f[F_QNAME];
+        c[CALL_ARGS] = args1(x);
+        c[CALL_FN] = f;
+        c[N_TYPE] = t;
+        c[N_REGION] = R_OWNED;
+        replace_node(e, c);
         return t;
     }
     if kind_of(t) == K_FUNC {

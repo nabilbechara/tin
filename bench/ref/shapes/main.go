@@ -76,6 +76,19 @@ func Both[RW ReadWriter](rw RW) (int64, error) {
 	return n + m, nil
 }
 
+func Copy[R Reader, W Writer](dst W, src R) (int64, error) {
+	buf := make([]uint8, 8)
+	n, err := src.Read(buf)
+	if err != nil {
+		return -1, err
+	}
+	return dst.Write(buf[:n])
+}
+
+func Log(w Writer, msg []uint8) (int64, error) {
+	return w.Write(msg)
+}
+
 func InOrder[T Ordered](a, b T) int64 {
 	if a == b {
 		return 0
@@ -98,6 +111,10 @@ func main() {
 	fmt.Println("write:", w)
 	both, _ := Both(b)
 	fmt.Println("both:", both)
+	copied, _ := Copy(b, b)
+	fmt.Println("copy:", copied)
+	logged, _ := Log(b, []uint8{4, 5, 6})
+	fmt.Println("log:", logged)
 	fmt.Println("i64:", InOrder[int64](1, 2))
 	fmt.Println("str:", InOrder("b", "a"))
 	fmt.Println("f64:", InOrder(2.5, 2.5))

@@ -1,0 +1,77 @@
+package main
+
+// Dynamic shape dispatch vs a direct method call. `Log` receives a dyn once converted
+// outside the loop. Pool usage is sampled around the hot loop to verify that dispatch
+// adds no allocation; the companion strict assembly check verifies the one indirect call.
+
+import "say"
+import "tide"
+
+shape Writer { Write(data []i64) i64 }
+
+type Buf struct { n i64 }
+
+func (b Buf) Write(data []i64) i64 {
+	let total = b.n
+	let i = 0
+	while i < len(data) {
+		total = total + data[i]
+		i = i + 1
+	}
+	return total
+}
+
+func Log(w dyn Writer, data []i64) i64 {
+	return w.Write(data)
+}
+
+func logBuf(b Buf, data []i64) i64 {
+	return b.Write(data)
+}
+
+const Iters = 2000000
+
+const Rounds = 5
+
+func main() {
+	let b = Buf{n: 7}
+	var w dyn Writer = b
+	let data = []i64{4, 5, 6}
+	var checksum i64 = 0
+	var bestDyn i64 = 0
+	var bestDirect i64 = 0
+	var dynPoolBytes i64 = 0
+	let r = 0
+	while r < Rounds {
+		let before = rt_pool_used()
+		t0 := tide.Now()
+		let i = 0
+		while i < Iters {
+			data[0] = i
+			checksum = checksum + Log(w, data)
+			i = i + 1
+		}
+		let elapsed = tide.Since(t0)
+		dynPoolBytes = rt_pool_used() - before
+		if bestDyn == 0 || elapsed < bestDyn {
+			bestDyn = elapsed
+		}
+		t0 = tide.Now()
+		let j = 0
+		while j < Iters {
+			data[0] = j
+			checksum = checksum + logBuf(b, data)
+			j = j + 1
+		}
+		let elapsed2 = tide.Since(t0)
+		if bestDirect == 0 || elapsed2 < bestDirect {
+			bestDirect = elapsed2
+		}
+		r = r + 1
+	}
+	say.Line("dyn: {f64(bestDyn) / f64(Iters):.2} ns/op")
+	say.Line("direct: {f64(bestDirect) / f64(Iters):.2} ns/op")
+	say.Line("ratio: {f64(bestDyn) / f64(bestDirect):.3}")
+	say.Line("dyn pool bytes: {dynPoolBytes}")
+	say.Line("checksum: {checksum}")
+}

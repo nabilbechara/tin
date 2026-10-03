@@ -1,15 +1,12 @@
 # Design: `dyn` and multi-word values
 
-Status: staging step 2 has landed — the checker types `dyn` (conversions check
-satisfaction and require a struct or enum object, `?dyn` and `[]dyn` are types, a `dyn`
-satisfies its own shape as a type argument, the region bits are the object's, and `keep`
-(including a container holding a `dyn`), `==`, `say` (including `?dyn`, slices and structs),
-`make`, omitted fields, `[N]dyn`, a `?dyn` zero value, `map[K]dyn` values, `!dyn` results and
-`dyn` as a constraint are rejected with the rule they follow) and both back ends refuse a
-program that uses one with a positioned message naming the step, at the first `dyn` the
-checker resolves. `dyn` in expression-position type arguments parses (`Box[dyn W]{...}`), and
-an unnamed `dyn` parameter is a parse error that says how to name it. Step 3 is the arm64
-code generation.
+Status: `dyn` is implemented on arm64 and amd64. The checker validates conversions and
+structural satisfaction; both back ends generate the two-word object/table pair, table fills,
+method calls and size-16 ABI paths. `?dyn`, `[]dyn`, `keep` of a dynamic value or container,
+and region summaries/checks are covered. Map values, `!dyn` results, formatting, comparisons,
+and closure cells that capture a `dyn` remain rejected or deferred under the rules below.
+`dyn` in expression-position type arguments parses (`Box[dyn W]{...}`), and an unnamed `dyn`
+parameter is a parse error that says how to name it.
 
 This note is the implementation design for the `dyn` sub-item of #141 (notes/roadmap.md,
 "`dyn` fat reference (data pointer plus table) for open sets, with region rules"). The
@@ -123,30 +120,21 @@ error's `keep` suggestion keeps working.
 
 ## 6. Staging
 
-Each step keeps `make bootstrap` a fixed point and adds its own tests. Positive `dyn` tests
-can only run once both backends emit size-16 values, because CI runs the strict suite on
-amd64 and arm64; steps 2 and 3 add negative tests, and the
-positive tests and the table `_asm` check land with step 4.
+Each step kept `make bootstrap` a fixed point and added its own tests. The first five steps
+are complete; the final step remains deferred.
 
-1. **This note** (no compiler change).
-2. **Size-16 in the type system**: `K_DYN` interned by (shape, bindings), `type_width`,
-   `?dyn`, `[]dyn`, conversion checking, region bits, and a gate at the top of
-   `generate`/`generate_x64` that refuses a program in which the checker built any `K_DYN`
-   type, with one clear message per target. The gate is whole-program (an uncalled function's
-   signature and an unused shape's signature both resolve `dyn`), so the two existing `_bad`
-   tests that assert "dyn shapes are not usable yet" (`shapes_dyn_bad`, `shapes_dyn_unused_bad`)
-   stay negative with the gate's message. A generic template that mentions `dyn` only inside a
-   body that is never instantiated builds no `K_DYN` type and is not gated; nothing can
-   generate one either, so this is the lazy-constraint rule, not a hole.
-3. **arm64 codegen**: homes, parameters, results, fields, element access, tables and the
-   startup fill, method calls. No `_asm` check yet: the strict suite compiles `*_asm.tin` on
-   both CPUs, and the amd64 gate would fail one here.
-4. **amd64 codegen** and the positive suite tests, `[]dyn`, the table's `_asm` check, and the
-   Go twin of the acceptance program.
-5. **Region and lifetime tests**: storing a `dyn` of request memory in a global is an error;
-   `keep(dyn)` survives pool resets; `[]dyn` of two types works.
-6. **Map values and the library ports that need `dyn`** (`io.ReaderFrom`/`WriterTo`,
-   `MultiReader`, the driver shapes).
+1. **Representation decision**: this note fixes the pair layout, method-table shape, and
+   region semantics.
+2. **Size-16 type system**: `K_DYN` is interned by (shape, bindings); `type_width`, `?dyn`,
+   `[]dyn`, conversion checking and object-derived region bits are implemented.
+3. **arm64 codegen**: homes, parameters, results, fields, element access, tables and startup
+   fill, method calls, and stack argument handling are implemented.
+4. **amd64 codegen and positive coverage**: the Go twin, `[]dyn`, method-table `_asm` check,
+   and dynamic calls are implemented.
+5. **Region and lifetime behavior**: storing a request-backed `dyn` in a global is rejected;
+   `keep(dyn)` survives pool resets; and `[]dyn` values of different types work.
+6. **Deferred**: map values and the library ports that need them (`io.ReaderFrom`/`WriterTo`,
+   `MultiReader`, and driver shapes) follow the map ABI and library roadmap work.
 
 ## 7. What this unlocks
 
