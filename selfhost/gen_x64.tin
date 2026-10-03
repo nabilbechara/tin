@@ -576,14 +576,30 @@ fn x_gen_to(e, dst, d) {
         x_gen_binary(e, dst, d);
     } else if k == EX_INDEX {
         x_gen_index_load(e, dst, d);
+    } else if k == EX_CONV && (e[CV_KIND] == CV_DYN || e[CV_KIND] == CV_DYN_KEEP || e[CV_KIND] == CV_DYN_OBJECT || e[CV_KIND] == CV_DYN_DESC || (e[CV_KIND] == CV_SAME && is_dyn_value(e[N_TYPE]))) {
+        x_gen_dyn_pair(e, dst, XSCR2, d);
+    } else if k == EX_CONV && e[CV_KIND] == CV_DYN_TABLE_WORD {
+        let spare = XSCR;
+        if dst == XSCR {
+            spare = XSCR2;
+        }
+        x_gen_dyn_pair(e[CV_X], spare, dst, d);
     } else if k == EX_CONV {
         x_gen_conv(e, dst, d);
     } else if k == EX_MEM {
-        x_gen_mem_addr(e, d);
-        x_emit_load(dst, e[N_TYPE]);
+        if is_dyn_value(e[N_TYPE]) {
+            x_gen_dyn_pair(e, dst, XSCR2, d);
+        } else {
+            x_gen_mem_addr(e, d);
+            x_emit_load(dst, e[N_TYPE]);
+        }
     } else if k == EX_ELEM {
-        x_gen_elem_addr(e, d);
-        x_emit_load(dst, e[N_TYPE]);
+        if is_dyn_value(e[N_TYPE]) {
+            x_gen_dyn_pair(e, dst, XSCR2, d);
+        } else {
+            x_gen_elem_addr(e, d);
+            x_emit_load(dst, e[N_TYPE]);
+        }
     } else if k == EX_SEQ {
         x_gen_seq(e, dst, d);
     } else if k == EX_FUNCREF {
@@ -602,6 +618,123 @@ fn x_gen_to(e, dst, d) {
             x_mov(dst, RAX);
         }
     }
+}
+
+// x_gen_dyn_addr computes the address of a two-word field or slice element. x86 has no
+// addressing mode for a scale of 16, so a dyn slice index is multiplied explicitly.
+fn x_gen_dyn_addr(e, d) {
+    if e[N_KIND] == EX_ELEM {
+        x_gen_elem_addr(e, d);
+    } else {
+        x_gen_mem_addr(e, d);
+    }
+    let base = mm_base;
+    let idx = mm_index;
+    let scale = mm_scale;
+    let off = mm_off;
+    if idx >= 0 {
+        if base == XSCR {
+            x_mov(XSCR2, base);
+            base = XSCR2;
+        }
+        emit3(X_IMUL_RRI, XSCR, idx, scale);
+        emit2(X_ADD, XSCR, base);
+        if off != 0 {
+            x_add_imm(XSCR, XSCR, off);
+        }
+    } else {
+        emit2(X_LEA, XSCR, x_mem1(base, off));
+    }
+}
+
+// x_gen_dyn_pair computes a dyn value as adjacent object and table words.
+fn x_gen_dyn_pair(e, obj, tab, d) {
+    let k = e[N_KIND];
+    if k == EX_CONV && e[CV_KIND] == CV_DYN_OBJECT {
+        let spare = XSCR2;
+        if obj == XSCR2 {
+            spare = XSCR;
+        }
+        x_gen_dyn_pair(e[CV_X], obj, spare, d);
+        return;
+    }
+    if k == EX_CONV && e[CV_KIND] == CV_DYN_TABLE_WORD {
+        let spare = XSCR;
+        if tab == XSCR {
+            spare = XSCR2;
+        }
+        x_gen_dyn_pair(e[CV_X], spare, tab, d);
+        return;
+    }
+    if k == EX_CONV && e[CV_KIND] == CV_DYN_DESC {
+        x_gen_dyn_pair(e[CV_X], RAX, RDX, d);
+        x_ld(obj, x_mem1(RDX, 8 * e[CV_DYN_INDEX]), 3);
+        return;
+    }
+    if k == EX_CONV && e[CV_KIND] == CV_DYN {
+        x_gen_to(e[CV_X], obj, d);
+        let rec = vec_get(dyn_tables, e[CV_DYN_TABLE]);
+        emit2(X_LEA, tab, x64_mem_sym(x_sym(SK_VAR, vec_get(rec, 4))));
+        return;
+    }
+    if k == EX_CONV && e[CV_KIND] == CV_DYN_KEEP {
+        x_gen_dyn_pair(e[CV_X], obj, tab, d);
+        let done = new_label();
+        emit2(X_TEST, obj, obj);
+        emit2(X_JCC, XC_E, done);
+        x_push(tab);
+        x_ld(XSCR, x_mem1(tab, 0), 3);
+        x_ld(XSCR2, x_mem1(XSCR, 0), 3);
+        x_save_temps(d);
+        x_mov(x_int_arg(0), obj);
+        emit1(X_CALL_R, XSCR2);
+        x_restore_temps(d);
+        x_mov(obj, RAX);
+        x_pop(tab);
+        x_label(done);
+        return;
+    }
+    if k == EX_SEQ {
+        x_gen_seq(e, -1, d);
+        x_gen_dyn_pair(e[SEQ_VALUE], obj, tab, d);
+        return;
+    }
+    if k == EX_CALL {
+        x_gen_call(e, d);
+        x_mov(obj, RAX);
+        x_mov(tab, RDX);
+        return;
+    }
+    if k == EX_CONV && e[CV_KIND] == CV_SAME {
+        x_gen_dyn_pair(e[CV_X], obj, tab, d);
+        return;
+    }
+    if k == EX_IDENT {
+        let s = e[ID_REF];
+        if s[S_KIND] == SYM_LOCAL {
+            x_slot_load(obj, s[S_OFF]);
+            x_slot_load(tab, s[S_OFF] + 8);
+        } else if s[S_TLS] {
+            x_ld(obj, x_mem1(XCTX, tls_off(s)), 3);
+            x_ld(tab, x_mem1(XCTX, tls_off(s) + 8), 3);
+        } else {
+            x_ld(obj, x64_mem_sym(x_sym(SK_VAR, s[S_INDEX])), 3);
+            x_ld(tab, x64_mem_sym(x_sym(SK_VAR, s[S_WORDS])), 3);
+        }
+        return;
+    }
+    if k == EX_MEM || k == EX_ELEM {
+        x_gen_dyn_addr(e, d);
+        x_ld(obj, x_mem1(XSCR, 0), 3);
+        x_ld(tab, x_mem1(XSCR, 8), 3);
+        return;
+    }
+    if k == EX_INT && is_const(e) && const_val(e) == 0 {
+        x_load_imm(obj, 0);
+        x_load_imm(tab, 0);
+        return;
+    }
+    err_at(e[N_POS], "unsupported dyn value location in amd64 code generation");
 }
 
 fn x_gen_ident(e, dst) {
@@ -1334,13 +1467,20 @@ fn x_arg_regs(e) {
     let nf = 0;
     let i = 0;
     while i < n {
-        let fp = 0;
+        let t = vec_get(e[CALL_ARGS], i)[N_TYPE];
+        let fp = i < ptypes[VEC_LEN] && is_float_t(vec_get(ptypes, i));
         if i >= ptypes[VEC_LEN] {
             fp = e_fp(vec_get(e[CALL_ARGS], i));
-        } else {
-            fp = is_float_t(vec_get(ptypes, i));
         }
-        if fp {
+        if i < ptypes[VEC_LEN] && is_dyn_value(t) {
+            if ni + 1 < 6 {
+                vec_push(regs, x_int_arg(ni));
+                ni = ni + 2;
+            } else {
+                vec_push(regs, -1);
+                ni = 6;
+            }
+        } else if fp {
             if nf < 8 {
                 vec_push(regs, XMM + nf);
             } else {
@@ -1353,6 +1493,33 @@ fn x_arg_regs(e) {
             } else {
                 vec_push(regs, -1);
             }
+            ni = ni + 1;
+        }
+        i = i + 1;
+    }
+    return regs;
+}
+
+fn x_arg_regs2(e, areg) {
+    let ptypes = call_ptypes(e);
+    let n = e[CALL_ARGS][VEC_LEN];
+    let regs = vec_filled(n, -1);
+    let ni = 0;
+    let nf = 0;
+    let i = 0;
+    while i < n {
+        let fp = i < ptypes[VEC_LEN] && is_float_t(vec_get(ptypes, i));
+        if i >= ptypes[VEC_LEN] {
+            fp = e_fp(vec_get(e[CALL_ARGS], i));
+        }
+        if i < ptypes[VEC_LEN] && is_dyn_value(vec_get(e[CALL_ARGS], i)[N_TYPE]) {
+            if vec_get(areg, i) >= 0 {
+                regs[VEC_DATA][i] = x_int_arg(ni + 1);
+            }
+            ni = ni + 2;
+        } else if fp {
+            nf = nf + 1;
+        } else {
             ni = ni + 1;
         }
         i = i + 1;
@@ -1400,23 +1567,48 @@ fn x_restore_temps(d) {
 // reverse into their registers (or copied into the stack-argument area reserved below the
 // pushes), so evaluating one argument can never clobber another.
 fn x_gen_call(e, d) {
+    if e[N_KIND] == EX_SEQ {
+        x_gen_seq(e, -1, d);
+        return;
+    }
     let args = e[CALL_ARGS];
     let n = args[VEC_LEN];
     let areg = x_arg_regs(e);
+    let areg2 = x_arg_regs2(e, areg);
     let f = e[CALL_FN];
     x_save_temps(d);
-    let nstack = 0;
+    let stackoffs = vec_filled(n, -1);
+    let pushslots = vec_filled(n, -1);
+    let stack_words = 0;
+    let stage_slot = 0;
+    if !f {
+        stage_slot = 1;
+    }
     let nvec = 0;
     let i = 0;
     while i < n {
+        let a = vec_get(args, i);
+        pushslots[VEC_DATA][i] = stage_slot;
+        if is_dyn_value(a[N_TYPE]) {
+            stage_slot = stage_slot + 2;
+        } else {
+            stage_slot = stage_slot + 1;
+        }
         if vec_get(areg, i) < 0 {
-            nstack = nstack + 1;
+            if is_dyn_value(a[N_TYPE]) {
+                stack_words = align_up(stack_words, 2);
+                stackoffs[VEC_DATA][i] = 8 * stack_words;
+                stack_words = stack_words + 2;
+            } else {
+                stackoffs[VEC_DATA][i] = 8 * stack_words;
+                stack_words = stack_words + 1;
+            }
         } else if vec_get(areg, i) >= XMM {
             nvec = nvec + 1;
         }
         i = i + 1;
     }
-    let area = align_up(8 * nstack, 16);
+    let area = align_up(8 * stack_words, 16);
     if area > 0 {
         emit2(X_SUBI, RSP, area);
     }
@@ -1427,19 +1619,38 @@ fn x_gen_call(e, d) {
     }
     i = 0;
     while i < n {
-        x_push(x_gen_val(vec_get(args, i), d));
+        let a = vec_get(args, i);
+        if is_dyn_value(a[N_TYPE]) {
+            let r0 = treg(d);
+            let r1 = treg(d + 1);
+            x_gen_dyn_pair(a, r0, r1, d);
+            x_push(r0);
+            x_push(r1);
+        } else {
+            x_push(x_gen_val(a, d));
+        }
         i = i + 1;
     }
-    // Popping slot i leaves slots 0..i-1 (and the callee's) below rsp, then the area.
-    let j = nstack;
     i = n - 1;
     while i >= 0 {
-        if vec_get(areg, i) >= 0 {
-            x_pop(vec_get(areg, i));
+        let a = vec_get(args, i);
+        let r = vec_get(areg, i);
+        let pushslot = vec_get(pushslots, i);
+        if is_dyn_value(a[N_TYPE]) {
+            if r >= 0 {
+                x_pop(vec_get(areg2, i));
+                x_pop(r);
+            } else {
+                x_pop(XSCR);
+                x_st(XSCR, x_mem1(RSP, 16 * (pushslot + 1) + vec_get(stackoffs, i) + 8), 3);
+                x_pop(XSCR);
+                x_st(XSCR, x_mem1(RSP, 16 * pushslot + vec_get(stackoffs, i)), 3);
+            }
+        } else if r >= 0 {
+            x_pop(r);
         } else {
-            j = j - 1;
             x_pop(XSCR);
-            x_st(XSCR, x_mem1(RSP, 16 * i + callee_slot + 8 * j), 3);
+            x_st(XSCR, x_mem1(RSP, 16 * pushslot + vec_get(stackoffs, i)), 3);
         }
         i = i - 1;
     }
@@ -1615,6 +1826,18 @@ fn x_gen_effect(e) {
 }
 
 fn x_assign_local(s, v) {
+    if is_dyn_value(s[S_TYPE]) {
+        let r0 = treg(0);
+        let r1 = treg(1);
+        x_gen_dyn_pair(v, r0, r1, 0);
+        if s[S_REG] == REG_SLOT {
+            x_slot_store(r0, s[S_OFF]);
+            x_slot_store(r1, s[S_OFF] + 8);
+        } else {
+            err_at(s[S_POS], "dyn local is not in a two-word frame slot");
+        }
+        return;
+    }
     if s[S_REG] >= 0 {
         x_gen_to(v, s[S_REG], 0);
     } else if s[S_REG] == REG_SLOT {
@@ -1627,6 +1850,17 @@ fn x_assign_local(s, v) {
 // x_gen_store_mem stores v through an EX_MEM or EX_ELEM target. The address parts are
 // computed into stable temps first; a[i] = a[i] op x loads the element only once.
 fn x_gen_store_mem(t, v) {
+    if is_dyn_value(t[N_TYPE]) {
+        x_gen_dyn_addr(t, 0);
+        x_push(XSCR);
+        let r0 = treg(0);
+        let r1 = treg(1);
+        x_gen_dyn_pair(v, r0, r1, 0);
+        x_pop(XSCR);
+        x_st(r0, x_mem1(XSCR, 0), 3);
+        x_st(r1, x_mem1(XSCR, 8), 3);
+        return;
+    }
     let fpv = e_fp(t);
     let base = 0;
     let idx = -1;
@@ -1781,6 +2015,19 @@ fn x_gen_assign(s) {
         x_assign_local(sym, v);
         return;
     }
+    if is_dyn_value(sym[S_TYPE]) {
+        let r0 = treg(0);
+        let r1 = treg(1);
+        x_gen_dyn_pair(v, r0, r1, 0);
+        if sym[S_TLS] {
+            x_st(r0, x_mem1(XCTX, tls_off(sym)), 3);
+            x_st(r1, x_mem1(XCTX, tls_off(sym) + 8), 3);
+        } else {
+            x_st(r0, x64_mem_sym(x_sym(SK_VAR, sym[S_INDEX])), 3);
+            x_st(r1, x64_mem_sym(x_sym(SK_VAR, sym[S_WORDS])), 3);
+        }
+        return;
+    }
     let r = x_gen_val(v, 0);
     if sym[S_TLS] {
         x_st(r, x_mem1(XCTX, tls_off(sym)), 3);
@@ -1915,18 +2162,43 @@ fn x_gen_return(s) {
     let f = cur_gen_fn;
     if s[RET_VALUES] {
         let vals = s[RET_VALUES];
+        let lanes = vec_new();
+        let nlanes = 0;
         let i = 0;
         while i < vals[VEC_LEN] {
-            x_push(x_gen_val(vec_get(vals, i), 0));
+            let v = vec_get(vals, i);
+            vec_push(lanes, nlanes);
+            if is_dyn_value(v[N_TYPE]) {
+                let r0 = treg(0);
+                let r1 = treg(1);
+                x_gen_dyn_pair(v, r0, r1, 0);
+                x_push(r0);
+                x_push(r1);
+                nlanes = nlanes + 2;
+            } else {
+                x_push(x_gen_val(v, 0));
+                nlanes = nlanes + 1;
+            }
             i = i + 1;
         }
         i = vals[VEC_LEN] - 1;
         while i >= 0 {
-            x_pop(x_res_reg(i));
+            let v = vec_get(vals, i);
+            let start = vec_get(lanes, i);
+            if is_dyn_value(v[N_TYPE]) {
+                x_pop(x_res_reg(start + 1));
+                x_pop(x_res_reg(start));
+            } else {
+                x_pop(x_res_reg(start));
+            }
             i = i - 1;
         }
     } else if s[RET_VALUE] {
-        x_gen_to(s[RET_VALUE], x_result_reg(f), 0);
+        if is_dyn_value(s[RET_VALUE][N_TYPE]) {
+            x_gen_dyn_pair(s[RET_VALUE], RAX, RDX, 0);
+        } else {
+            x_gen_to(s[RET_VALUE], x_result_reg(f), 0);
+        }
     } else {
         x_load_imm(RAX, 0);
     }
@@ -2097,6 +2369,10 @@ fn x_assign_homes(f) {
     while i < locals[VEC_LEN] {
         let s = vec_get(locals, i);
         s[S_REG] = REG_DEAD;
+        if is_dyn_value(s[S_TYPE]) {
+            s[S_ADDR] = 1;
+            s[S_WORDS] = 2;
+        }
         if s[S_ADDR] {
             s[S_REG] = REG_SLOT;
             let nw = 1;
@@ -2193,8 +2469,36 @@ fn x_entry_moves(f) {
     let i = 0;
     while i < f[F_PARAMS][VEC_LEN] {
         let s = vec_get(locals, i);
+        let pt = vec_get(f[F_PTYPES], i);
+        if is_dyn_value(pt) {
+            if ni + 1 < 6 {
+                let r0 = x_int_arg(ni);
+                let r1 = x_int_arg(ni + 1);
+                ni = ni + 2;
+                if s[S_REG] == REG_SLOT {
+                    x_slot_store(r0, s[S_OFF]);
+                    x_slot_store(r1, s[S_OFF] + 8);
+                } else {
+                    err_at(s[S_POS], "dyn parameter is not in a two-word frame slot");
+                }
+            } else {
+                ni = 6;
+                x_nstack = align_up(x_nstack, 2);
+                x_slot_load(XSCR, 16 + 8 * x_nstack);
+                x_slot_load(XSCR2, 24 + 8 * x_nstack);
+                if s[S_REG] == REG_SLOT {
+                    x_slot_store(XSCR, s[S_OFF]);
+                    x_slot_store(XSCR2, s[S_OFF] + 8);
+                } else {
+                    err_at(s[S_POS], "dyn parameter is not in a two-word frame slot");
+                }
+                x_nstack = x_nstack + 2;
+            }
+            i = i + 1;
+            continue;
+        }
         let src = -1;
-        if is_float_t(vec_get(f[F_PTYPES], i)) {
+        if is_float_t(pt) {
             if nf < 8 {
                 src = XMM + nf;
             }
@@ -2303,6 +2607,7 @@ fn x_gen_fn(f) {
             }
             di = di + 1;
         }
+        x_gen_dyn_table_init();
     }
     let stmts = f[F_BODY][BLK_STMTS];
     let i = 0;
@@ -2356,6 +2661,32 @@ fn x_gen_fn(f) {
         ts = ts + 1;
     }
     x_finish_fn(f, nslots);
+}
+
+fn x_gen_dyn_table_init() {
+    let i = 0;
+    while i < dyn_tables[VEC_LEN] {
+        let rec = vec_get(dyn_tables, i);
+        let base = vec_get(rec, 4);
+        let fns = vec_new();
+        vec_push(fns, vec_get(rec, 2));
+        let methods = vec_get(rec, 3);
+        let j = 0;
+        while j < methods[VEC_LEN] {
+            vec_push(fns, vec_get(methods, j));
+            j = j + 1;
+        }
+        j = 0;
+        while j < fns[VEC_LEN] {
+            let f = vec_get(fns, j);
+            if f {
+                emit2(X_LEA, RAX, x64_mem_sym(x_sym(SK_FNDESC, f[F_INDEX])));
+                x_st(RAX, x64_mem_sym(x_sym(SK_VAR, base + j)), 3);
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
 }
 
 fn x_out4(op, a, b, c, d) {

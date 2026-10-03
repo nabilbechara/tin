@@ -157,7 +157,7 @@ fn ck_state_restore(s) {
 fn check_constraints(pos, names, cons, targs, file) {
     let saved = ck_state_save();
     set_file(file);
-    // A later constraint may mention an earlier parameter (`[T any, S Seq[T]]`), so the
+    // A later constraint may mention an earlier parameter (`[T constraints.Any, S Seq[T]]`), so the
     // type arguments in scope resolve while the constraints are checked.
     ck_tbind = tbind_pairs(names, targs);
     let i = 0;
@@ -775,8 +775,8 @@ fn shape_inst_decl(tx) {
 // shape_member_symbolic reports whether any type argument of a listed member is one of
 // the enclosing shape's parameters bound to a symbolic type, which is what makes an
 // instance's own argument constraints impossible to check at declaration. A concrete
-// argument (`shape G[T any] { A[f64] }`) and a parameter already bound to a real type
-// (`shape C[V any] { A[V] }` used with `C[f64]`) are checked.
+// argument (`shape G[T constraints.Any] { A[f64] }`) and a parameter already bound to a real type
+// (`shape C[V constraints.Any] { A[V] }` used with `C[f64]`) are checked.
 fn shape_member_symbolic(m, sd, bind) {
     if !m[TX_ARGS] || !bind {
         return 0;
@@ -1059,10 +1059,98 @@ fn shape_collect(sd, bind, methods, owner, own) {
             }
             j = j + 1;
         }
-        vec_push(methods, pair(f[F_NAME], sig));
+        let rec = vec_new();
+        vec_push(rec, f[F_NAME]);
+        vec_push(rec, sig);
+        vec_push(rec, f);
+        vec_push(rec, bind);
+        vec_push(rec, sd);
+        vec_push(methods, rec);
         i = i + 1;
     }
     ck_state_restore(saved);
+}
+
+// dyn_table_add records the concrete methods behind one dyn shape. Its order is the
+// flattened shape order with repeated identical methods emitted once.
+fn dyn_table_add(t, dt, pos) {
+    let i = 0;
+    while i < dyn_tables[VEC_LEN] {
+        let old = vec_get(dyn_tables, i);
+        if vec_get(old, 0) == t && vec_get(old, 1) == dt {
+            return i;
+        }
+        i = i + 1;
+    }
+    let sd = dt[TY_GDECL];
+    let bind = dt[TY_TARGS];
+    let flat = vec_new();
+    shape_collecting = vec_new();
+    shape_collect(sd, bind, flat, sd, vec_new());
+    let names = vec_new();
+    let fns = vec_new();
+    i = 0;
+    while i < flat[VEC_LEN] {
+        let item = vec_get(flat, i);
+        let name = vec_get(item, 0);
+        if !vec_has_str(names, name) {
+            let f = shape_method(t, name);
+            if f && is_template(f) {
+                f = instantiate_fn(f, t[TY_TARGS], pos);
+            }
+            if f {
+                vec_push(names, name);
+                vec_push(fns, f);
+            }
+        }
+        i = i + 1;
+    }
+    let rec = vec_new();
+    vec_push(rec, t);
+    vec_push(rec, dt);
+    vec_push(rec, keep_fn(t));
+    vec_push(rec, fns);
+    vec_push(rec, -1);
+    vec_push(dyn_tables, rec);
+    return dyn_tables[VEC_LEN] - 1;
+}
+
+// dyn_shape_method returns [table method index, flattened signature] for a method on a
+// dyn shape. Slot zero is reserved for keep, so method indices start at one.
+fn dyn_shape_method(dt, name) {
+    let sd = dt[TY_GDECL];
+    let bind = dt[TY_TARGS];
+    let flat = vec_new();
+    shape_collecting = vec_new();
+    shape_collect(sd, bind, flat, sd, vec_new());
+    let names = vec_new();
+    let i = 0;
+    while i < flat[VEC_LEN] {
+        let item = vec_get(flat, i);
+        let method = vec_get(item, 0);
+        if !vec_has_str(names, method) {
+            if streq(method, name) {
+                return pair(names[VEC_LEN] + 1, vec_get(item, 1));
+            }
+            vec_push(names, method);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn dyn_table_mark(i) {
+    if i < 0 || i >= dyn_tables[VEC_LEN] {
+        return;
+    }
+    let rec = vec_get(dyn_tables, i);
+    mark_reach(vec_get(rec, 2));
+    let fns = vec_get(rec, 3);
+    let j = 0;
+    while j < fns[VEC_LEN] {
+        mark_reach(vec_get(fns, j));
+        j = j + 1;
+    }
 }
 
 // check_shape_decl validates a registered shape: its body lists shapes only, its union
@@ -1416,12 +1504,33 @@ fn shape_result_list(b, rs, n) {
 // resolves its methods as i64. Composition is walked once per (shape, type, bindings) per
 // satisfaction tree and never through a cycle, so a diamond costs its depth, not 2^depth,
 // and a cycle reported at registration cannot recurse here.
+// The constraints package exposes Any as an empty structural shape and Comparable as a
+// compiler-checked property constraint. Keep the property named in the library API rather
+// than treating the word as generic-parameter syntax.
+fn constraints_shape(sd, name) {
+    return streq(vec_get(file_pkgs, sd[D_FILE]), "constraints") && streq(sd[D_NAME], name);
+}
+
 fn check_shape(pos, t, sd, bind) {
     if shape_on_path(shape_bad, sd) || shape_on_path(shape_cycles, sd) {
         return;
     }
+    if constraints_shape(sd, "Comparable") {
+        if key_valid(t, vec_new()) {
+            return;
+        }
+        let m = err_begin(pos);
+        buf_str(m, "type ");
+        type_name(m, t);
+        buf_str(m, " does not satisfy shape Comparable: it is not comparable");
+        err_end(m);
+        return;
+    }
     if kind_of(t) == K_DYN {
         if t[TY_GDECL] == sd && shape_bind_same(t[TY_TARGS], bind) {
+            return;
+        }
+        if constraints_shape(sd, "Any") {
             return;
         }
         err_at(pos, "a dyn value satisfies its own shape only; dyn-to-dyn widening is the next step (#141)");
@@ -1529,6 +1638,8 @@ fn check_shape_method(pos, t, sd, want, bind) {
         buf_str(m, sd[D_NAME]);
         buf_str(m, ": it has no method ");
         shape_sig_str(m, want[F_NAME], wsig);
+        buf_str(m, "; fix-it: add method ");
+        shape_sig_str(m, want[F_NAME], wsig);
         err_end(m);
         return 1;
     }
@@ -1547,8 +1658,9 @@ fn check_shape_method(pos, t, sd, want, bind) {
         shape_sig_str(m, want[F_NAME], csig);
         buf_str(m, " has the wrong signature, want ");
         shape_sig_str(m, want[F_NAME], wsig);
+        buf_str(m, "; fix-it: change the method signature to ");
+        shape_sig_str(m, want[F_NAME], wsig);
         err_end(m);
     }
     return 1;
 }
-

@@ -1,5 +1,10 @@
 package main
 
+import "constraints"
+import "io"
+import "say"
+import "sift"
+
 // Shapes (#141, compiler step 3: satisfaction and static dispatch). A type satisfies a
 // shape by having its methods, a shape composes by listing shapes, a named union works
 // as a constraint, and a method on an instantiated generic type satisfies a shape. All
@@ -7,7 +12,6 @@ package main
 //
 // The same program is the Go twin bench/ref/shapes/main.go, written with interfaces.
 
-import "say"
 
 shape Reader { Read(buf mut []u8) !i64 }
 
@@ -18,11 +22,9 @@ shape ReadWriter {
 	Writer
 }
 
-shape Ordered = i64 | f64 | str
-
 shape Sized { Len() i64 }
 
-type Stack[T any] struct { xs []T }
+type Stack[T constraints.Any] struct { xs []T }
 
 func (s mut Stack[T]) Push(v T) {
 	s.xs = append(s.xs, v)
@@ -65,7 +67,20 @@ func Both[RW ReadWriter](rw RW) !i64 {
 	return n + m
 }
 
-func InOrder[T Ordered](a T, b T) i64 {
+// Copy is the conventional static path: generic calls specialize to the concrete type.
+func Copy[R io.Reader, W io.Writer](dst W, src R) !i64 {
+	let buf = make([]u8, 8)
+	let n = try src.Read(mut buf)
+	return try dst.Write(buf[:n])
+}
+
+// Log opts into the dynamic path explicitly. A concrete value converts to dyn at the call
+// site, and method dispatch uses the shape table.
+func Log(w dyn io.Writer, msg []u8) !i64 {
+	return try w.Write(msg)
+}
+
+func InOrder[T sift.Ordered](a T, b T) i64 {
 	if a == b {
 		return 0
 	}
@@ -87,6 +102,10 @@ func main() {
 	say.Line("write: {w}")
 	both := Both(b) catch _ { -1 }
 	say.Line("both: {both}")
+	copied := Copy(b, b) catch _ { -1 }
+	say.Line("copy: {copied}")
+	logged := Log(b, []u8{4, 5, 6}) catch _ { -1 }
+	say.Line("log: {logged}")
 	say.Line("i64: {InOrder(1, 2)}")
 	so := InOrder("b", "a")
 	say.Line("str: {so}")

@@ -36,7 +36,7 @@ const F_TYPE = 20;   // func type
 const F_LIFTED = 21; // function literal lifted to top level
 const F_INDEX = 22;  // position in prog_fns (set by codegen)
 const F_TPARAMS = 28; // generic: type parameter names (0 for ordinary functions)
-const F_TCONS = 29;   // generic: per type parameter, a vec of allowed types (0: any)
+const F_TCONS = 29;   // generic: per type parameter, a vec of allowed types (0: unconstrained)
 const F_TOKS = 30;    // generic: the tokens, re-parsed for each instance
 const F_TOKAT = 31;
 const F_TBIND = 32;   // instance: vec of [name, type] bindings
@@ -80,7 +80,7 @@ const N_KIND = 0;
 const N_POS = 1;
 const N_TYPE = 6;
 const N_REGION = 9;   // region pass: where a reference value lives
-const N_SIZE = 10;
+const N_SIZE = 12;
 
 const EX_INT = 1;
 const EX_STR = 2;
@@ -236,6 +236,8 @@ const INTERP_SPECS = 4;
 const BLK_FLAT = 3;   // a checker-made block that opens no scope
 const CALL_STORE = 8; // a runtime call that stores into its first argument (region pass)
 const CALL_METHOD = 9; // argument 0 is a method receiver (no call-site mut)
+const CALL_DYN_SHAPE = 10; // shape whose method set can be called through this dyn value
+const CALL_DYN_INDEX = 11; // method slot in its per-type table (keep is slot zero)
 // Regions of reference values, for the ember/ingot rules.
 const R_UNKNOWN = 0;
 const R_EMBER = 1;    // lives in the current request's pool
@@ -477,7 +479,7 @@ fn parse_value_spec(is_const, iota, prev_init, prev_type, decls) {
 fn parse_type_decl() {
     let pos = p_peek()[T_POS];
     let d = decl_new(pos, p_expect_ident()[T_TEXT]);
-    // type Stack[T any] ...: a name and a constraint after '[' (an array type has a length).
+    // type Stack[T constraints.Any] ...: a name and a constraint after '[' (an array type has a length).
     if p_is("[") && p_peek2()[T_KIND] == TK_IDENT && !p_legacy {
         let save = p_i;
         p_next();
@@ -759,7 +761,7 @@ fn parse_type() {
     return n;
 }
 
-// parse_tparams reads [T any, U i64 | f64] into f's (or a type decl's) names and constraints.
+// parse_tparams reads [T constraints.Any, U i64 | f64] into f's (or a type decl's) names and constraints.
 fn parse_tparams(names, cons) {
     p_expect("[");
     while !p_is("]") {
@@ -767,11 +769,7 @@ fn parse_tparams(names, cons) {
         let c = 0;
         if !p_is(",") && !p_is("]") {
             let first = parse_type();
-            if first[N_KIND] == TX_NAME && !first[TX_A] && (streq(first[TX_B], "any") || streq(first[TX_B], "comparable")) && !p_is("|") {
-                c = 0;
-            } else {
-                c = parse_type_union(first);
-            }
+            c = parse_type_union(first);
         }
         vec_push(cons, c);
         if !p_is(",") {

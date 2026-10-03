@@ -207,6 +207,8 @@ p := Point{1, 2, "a", []str{}, nil}   // positional, every field in order
 An enum is a value that is one of several variants, each with its own data:
 
 ```go
+import "constraints"
+
 type Shape enum {
 	Circle(r f64)
 	Rect(w, h f64)
@@ -214,7 +216,7 @@ type Shape enum {
 	Empty
 }
 type Color enum { Red, Green, Blue }
-type Option[T any] enum { Some(v T), None }
+type Option[T constraints.Any] enum { Some(v T), None }
 
 s := Shape.Rect(3, 4)
 c := Color.Red
@@ -342,11 +344,13 @@ A *shape* is a set of method signatures. A type satisfies a shape structurally: 
 methods, it satisfies it, with no declaration. Shapes replace interfaces (section 21).
 
 ```
+import "constraints"
+
 shape Reader { Read(buf mut []u8) !i64 }
 shape Writer { Write(data []u8) !i64 }
 shape ReadWriter { Reader; Writer; Flush() !i64 }   // composition by listing shapes
 shape Ordered = i64 | i32 | f64 | str               // a named union
-shape Seq[T any] { Next() ?T; Close() !i64 }        // a shape with type parameters
+shape Seq[T constraints.Any] { Next() ?T; Close() !i64 } // a shape with type parameters
 ```
 
 A member is a method signature or the name of another shape. A method signature is a `func`
@@ -361,9 +365,9 @@ A shape is used in two ways:
   types (including `!T`), and variadic mark. Receiver mutability is not part of satisfaction —
   a `mut` receiver is a property of the concrete method, so a call to one takes the call-site
   `mut`, and a generic body that makes such a call declares its parameter `mut`.
-- **Dynamically** (planned), as `dyn S`: the object pointer plus a table of its methods for `S`,
-  converting from a concrete type where a `dyn S` is expected. A `dyn S` is never nil;
-  `?dyn S` is the optional.
+- **Dynamically**, as `dyn S`: the object pointer plus a static table of its methods for `S`,
+  converting from a concrete type where a `dyn S` is expected. Conversion allocates nothing,
+  and a method call uses one indirect call. A `dyn S` is never nil; `?dyn S` is the optional.
 
 There is no downcast and no type switch: a closed set of cases is an `enum` with an exhaustive
 `switch`, an open set is a method on the shape. A named union (`shape Ordered = i64 | f64 | str`)
@@ -373,17 +377,14 @@ union in every signature.
 `shape` and `dyn` are **contextual words**: they are recognized only where the grammar wants
 them, so a program may still use either as an ordinary name (`shape := 1`, `type dyn = i64`).
 
-**Status.** The parser and the checker are built: a shape can be a type-parameter constraint, a
-type satisfies it structurally, shapes compose, named unions work as constraints, a generic
-shape takes type arguments (`Seq[i64]`) and can be listed in a composition, and every call
-through a shaped parameter is a direct call on the concrete type, because a generic body is
-checked with its type parameters bound. A method that two listed shapes give different
-signatures is a compile error. `dyn S` is typed by the checker — a conversion checks
-satisfaction, `?dyn S` and `[]dyn S` work as types, and the region rules apply — but
-generating the two-word value is the next step, so a program that uses one is refused with a
-message naming the step, at the first `dyn` the checker resolves (notes/design_dyn.md). The `io` shapes are
-declared in `lib/io`; the `Copy` family, `hash`, `Stringer` and the driver shapes come after
-`dyn`.
+**Status.** Shapes support structural constraints, composition, named unions and generic
+instances. Calls through shaped type parameters are direct calls on concrete types. `dyn S`
+uses a two-word object/table pair; the checker verifies conversions, and method calls dispatch
+through the table without allocating. `?dyn S`, `[]dyn S`, `keep` of a dynamic value or
+container, and region checks are implemented. Map values and `!dyn` results remain deferred;
+see [the representation and staging note](../notes/design_dyn.md). The `io` shapes live in
+`lib/io`. `constraints.Any`, `constraints.Comparable` and `sift.Ordered` are ordinary library
+shapes, not language keywords; import their packages where used.
 
 ---
 
@@ -500,7 +501,7 @@ declared on named struct types in the same package.
 
 ```go
 type Point struct { X, Y i64 }
-type Stack[T any] struct { items []T }    // generic: section 12
+type Stack[T constraints.Any] struct { items []T }    // generic: section 12
 type ID i64
 ```
 
@@ -810,6 +811,8 @@ There are no goroutines and no shared mutable state.
 ## 12. Generics
 
 ```go
+import "constraints"
+
 func Max[T i64 | f64 | str](a T, b T) T {
 	if a > b {
 		return a
@@ -817,7 +820,7 @@ func Max[T i64 | f64 | str](a T, b T) T {
 	return b
 }
 
-func Map[T any, U any](xs []T, f func(T) U) []U {
+func Map[T constraints.Any, U constraints.Any](xs []T, f func(T) U) []U {
 	out := make([]U, 0, len(xs))
 	for _, x := range xs {
 		out = append(out, f(x))
@@ -825,7 +828,7 @@ func Map[T any, U any](xs []T, f func(T) U) []U {
 	return out
 }
 
-type Stack[T any] struct {
+type Stack[T constraints.Any] struct {
 	items []T
 }
 
@@ -844,7 +847,7 @@ func (s mut Stack[T]) Pop() (T, bool) {
 	return x, true
 }
 
-type Pair[A any, B any] struct {
+type Pair[A constraints.Any, B constraints.Any] struct {
 	first  A
 	second B
 }
@@ -855,9 +858,10 @@ s := Stack[i64]{items: []i64{}}
 p := Pair[str, i64]{first: "k", second: 7}
 ```
 
-- Type parameters: `[T any]`, `[T comparable]`, a union `[T i64 | f64 | str]` (the
-  type argument must be one of them), or a shape name (`[R Reader]`, section 3). Several:
-  `[K comparable, V any]`.
+- Type parameters: an imported shape such as `[T constraints.Any]` or
+  `[K constraints.Comparable]`, a union `[T i64 | f64 | str]` (the type argument must be
+  one of them), or another shape name (`[R Reader]`, section 3). Ordering constraints use
+  `[T sift.Ordered]`.
 - Type arguments are inferred from the call's arguments (untyped constants default to
   `i64`/`f64`), or given explicitly: `F[T](...)`, `pkg.F[T](...)`.
 - Every instantiation is compiled separately and fully specialized: there is no boxing
@@ -1068,7 +1072,7 @@ TypeDecl      = "type" ( TypeSpec | "(" { TypeSpec ";" } ")" ) .
 TypeSpec      = ident [ TypeParams ] [ "=" ] Type .
 TypeParams    = "[" TypeParam { "," TypeParam } "]" .
 TypeParam     = ident [ Constraint ] .
-Constraint    = "any" | "comparable" | Type { "|" Type } .
+Constraint    = Type { "|" Type } .
 
 ShapeDecl     = "shape" ident [ TypeParams ] ( ShapeBody | "=" TypeUnion ) .
 ShapeBody     = "{" { ShapeMember ";" } "}" .
@@ -1169,7 +1173,7 @@ has no package clause). See [COMPILER.md](COMPILER.md) for how the compiler is w
 | goroutines, channels, mutexes | one thread per core, per-core globals, `relay` messages |
 | package variables initialized in dependency order | declaration order; an initializer using a later global is a compile error |
 | garbage collector | request pools + `keep` into a long-lived heap, checked at compile time |
-| interfaces, reflection | shapes (`shape`, satisfied structurally; `dyn S` for explicit dynamic dispatch is planned); generics (monomorphized); compiler-generated `say` and `argo` |
+| interfaces, reflection | shapes (`shape`, satisfied structurally; `dyn S` for explicit dynamic dispatch); generics (monomorphized); compiler-generated `say` and `argo` |
 | closures capture variables | the same, with Go 1.22's per-iteration loop variables; no `mut` parameter capture; a local closure cannot recurse |
 | `defer` in loops, `recover` | defer outside loops only; no recover |
 | `fmt.Println` | `say.Line` (formatting by static type) |

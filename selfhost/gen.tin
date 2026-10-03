@@ -41,6 +41,7 @@ var mm_index;
 var mm_off;
 var trap_label;  // the current function's bounds-failure stub, once used
 var trap_sites;  // per failed-check site: [label, index reg (or -1), length reg, constant index]
+var incoming_stack_loads; // pairs: instruction index in cg, incoming argument byte offset
 
 fn emit4(op, a, b, c, d) {
     vec_push(cg, op);
@@ -525,6 +526,129 @@ fn gen_val(e, d) {
 }
 
 // gen_to computes e into dst using temps from depth d up; dst is written last.
+fn gen_dyn_mem_address(e, d) {
+    if e[N_KIND] == EX_ELEM {
+        gen_elem_addr(e, d);
+    } else {
+        gen_mem_addr(e, d);
+    }
+    if mm_index >= 0 {
+        emit4(I_ADD, X16, mm_base, mm_index, SH_LSL + 4);
+        if mm_off != 0 {
+            add_imm(X16, X16, mm_off);
+        }
+    } else if mm_off != 0 {
+        add_imm(X16, mm_base, mm_off);
+    } else {
+        mov(X16, mm_base);
+    }
+}
+
+// gen_dyn_pair computes a dyn value into adjacent machine registers. In storage the two
+// words are contiguous; globals use an explicit second data word because each declaration
+// has its own linker slot.
+fn gen_dyn_pair(e, obj, tab, d) {
+    let k = e[N_KIND];
+    if k == EX_CONV && e[CV_KIND] == CV_DYN_OBJECT {
+        let spare = X17;
+        if obj == X17 {
+            spare = X16;
+        }
+        gen_dyn_pair(e[CV_X], obj, spare, d);
+        return;
+    }
+    if k == EX_CONV && e[CV_KIND] == CV_DYN_TABLE_WORD {
+        let spare = X16;
+        if tab == X16 {
+            spare = X17;
+        }
+        gen_dyn_pair(e[CV_X], spare, tab, d);
+        return;
+    }
+    if k == EX_CONV && e[CV_KIND] == CV_DYN_DESC {
+        gen_dyn_pair(e[CV_X], X16, X17, d);
+        emit3(I_LDR, obj, X17, 8 * e[CV_DYN_INDEX]);
+        return;
+    }
+    if k == EX_CONV && e[CV_KIND] == CV_DYN {
+        gen_to(e[CV_X], obj, d);
+        let rec = vec_get(dyn_tables, e[CV_DYN_TABLE]);
+        let sym = sym_ref(SK_VAR, vec_get(rec, 4));
+        emit2(I_ADRP, tab, sym);
+        emit3(I_ADDLO, tab, tab, sym);
+        return;
+    }
+    if k == EX_CONV && e[CV_KIND] == CV_DYN_KEEP {
+        gen_dyn_pair(e[CV_X], obj, tab, d);
+        let done = new_label();
+        emit2(I_CBZ, obj, done);
+        emit1(I_PUSH, tab);
+        emit3(I_LDR, X16, tab, 0);
+        emit3(I_LDR, X17, X16, 0);
+        mov(0, obj);
+        save_temps(d);
+        emit1(I_BLR, X17);
+        restore_temps(d);
+        emit1(I_POP, tab);
+        if obj != 0 {
+            mov(obj, 0);
+        }
+        label(done);
+        return;
+    }
+    if k == EX_SEQ {
+        gen_seq(e, -1, d);
+        gen_dyn_pair(e[SEQ_VALUE], obj, tab, d);
+        return;
+    }
+    if k == EX_CALL {
+        gen_call(e, d);
+        if obj != 0 {
+            mov(obj, 0);
+        }
+        if tab != 1 {
+            mov(tab, 1);
+        }
+        return;
+    }
+    if k == EX_CONV && e[CV_KIND] == CV_SAME {
+        gen_dyn_pair(e[CV_X], obj, tab, d);
+        return;
+    }
+    if k == EX_IDENT {
+        let s = e[ID_REF];
+        if s[S_KIND] == SYM_LOCAL {
+            emit3(I_LDR, obj, FP, s[S_OFF]);
+            emit3(I_LDR, tab, FP, s[S_OFF] + 8);
+        } else if s[S_TLS] {
+            emit3(I_LDR, obj, 28, tls_off(s));
+            emit3(I_LDR, tab, 28, tls_off(s) + 8);
+        } else {
+            let first = sym_ref(SK_VAR, s[S_INDEX]);
+            let second = sym_ref(SK_VAR, s[S_WORDS]);
+            emit2(I_ADRP, X16, first);
+            emit3(I_ADDLO, X16, X16, first);
+            emit3(I_LDR, obj, X16, 0);
+            emit2(I_ADRP, X16, second);
+            emit3(I_ADDLO, X16, X16, second);
+            emit3(I_LDR, tab, X16, 0);
+        }
+        return;
+    }
+    if k == EX_MEM || k == EX_ELEM {
+        gen_dyn_mem_address(e, d);
+        emit3(I_LDR, obj, X16, 0);
+        emit3(I_LDR, tab, X16, 8);
+        return;
+    }
+    if k == EX_INT && is_const(e) && const_val(e) == 0 {
+        emit3(I_MOVZ, obj, 0, 0);
+        emit3(I_MOVZ, tab, 0, 0);
+        return;
+    }
+    err_at(e[N_POS], "unsupported dyn value location in code generation");
+}
+
 fn gen_to(e, dst, d) {
     let k = e[N_KIND];
     if k == EX_INT {
@@ -550,12 +674,30 @@ fn gen_to(e, dst, d) {
         gen_binary(e, dst, d);
     } else if k == EX_INDEX {
         gen_index_load(e, dst, d);
+    } else if k == EX_CONV && (e[CV_KIND] == CV_DYN || e[CV_KIND] == CV_DYN_KEEP || e[CV_KIND] == CV_DYN_OBJECT || e[CV_KIND] == CV_DYN_DESC) {
+        gen_dyn_pair(e, dst, X17, d);
+    } else if k == EX_CONV && e[CV_KIND] == CV_DYN_TABLE_WORD {
+        let spare = X16;
+        if dst == X16 {
+            spare = X17;
+        }
+        gen_dyn_pair(e[CV_X], spare, dst, d);
+    } else if k == EX_CONV && e[CV_KIND] == CV_SAME && is_dyn_value(e[N_TYPE]) {
+        gen_dyn_pair(e, dst, X17, d);
     } else if k == EX_CONV {
         gen_conv(e, dst, d);
     } else if k == EX_MEM {
-        gen_mem_load(e, dst, d);
+        if is_dyn_value(e[N_TYPE]) {
+            gen_dyn_pair(e, dst, X17, d);
+        } else {
+            gen_mem_load(e, dst, d);
+        }
     } else if k == EX_ELEM {
-        gen_elem_load(e, dst, d);
+        if is_dyn_value(e[N_TYPE]) {
+            gen_dyn_pair(e, dst, X17, d);
+        } else {
+            gen_elem_load(e, dst, d);
+        }
     } else if k == EX_SEQ {
         gen_seq(e, dst, d);
     } else if k == EX_FUNCREF {
@@ -1542,6 +1684,14 @@ fn arg_regs(e) {
         if i >= ptypes[VEC_LEN] && !tgt_linux {
             // Apple's arm64 ABI passes variadic arguments on the stack.
             vec_push(regs, -1);
+        } else if i < ptypes[VEC_LEN] && is_dyn_value(vec_get(ptypes, i)) {
+            if ni + 1 < 8 {
+                vec_push(regs, ni);
+                ni = ni + 2;
+            } else {
+                vec_push(regs, -1);
+                ni = 8;
+            }
         } else if i >= ptypes[VEC_LEN] && e_fp(vec_get(e[CALL_ARGS], i)) {
             // AAPCS64 (Linux) passes them in registers like any other argument.
             vec_push(regs, FPR + nf);
@@ -1586,12 +1736,36 @@ fn caller_saved(r) {
 
 // gen_call leaves the result in x0 (or d0 for a float).
 fn gen_call(e, d) {
+    if e[N_KIND] == EX_SEQ {
+        gen_seq(e, -1, d);
+        return;
+    }
     let args = e[CALL_ARGS];
     let n = args[VEC_LEN];
     let areg = arg_regs(e);
     let f = e[CALL_FN];
     let callee = e[CALL_CALLEE];
     let variadic = f && f[F_VARIADIC] && !tgt_linux;
+    let stackoffs = vec_filled(n, -1);
+    let stack_words = 0;
+    let has_stack = 0;
+    let i = 0;
+    while i < n {
+        let a = vec_get(args, i);
+        if vec_get(areg, i) < 0 && !variadic {
+            has_stack = 1;
+            if is_dyn_value(a[N_TYPE]) {
+                stack_words = align_up(stack_words, 2);
+                stackoffs[VEC_DATA][i] = 8 * stack_words;
+                stack_words = stack_words + 2;
+            } else {
+                stackoffs[VEC_DATA][i] = 8 * stack_words;
+                stack_words = stack_words + 1;
+            }
+        }
+        i = i + 1;
+    }
+    let stack_area = align_up(8 * stack_words, 16);
     let callee_reg = -1;
     let d0 = d;
     if callee && contains_call(callee) {
@@ -1599,28 +1773,59 @@ fn gen_call(e, d) {
         d0 = next_depth(callee_reg, d);
     }
     let nested = variadic;
-    let i = 0;
+    i = 0;
     while i < n {
-        if contains_call(vec_get(args, i)) {
+        if contains_call(vec_get(args, i)) || (has_stack && vec_get(areg, i) < 0) {
             nested = 1;
         }
         i = i + 1;
     }
     let regs = vec_filled(n, -1);
+    let regs2 = vec_filled(n, -1);
+    let area = 0;
+    let temps_saved = 0;
+    let stack_stored = 0;
     if !nested {
         // Temps never use x0-x7/d0-d7 in a function that calls, so args go straight there.
         i = 0;
         while i < n {
-            gen_to(vec_get(args, i), vec_get(areg, i), d0);
+            let a = vec_get(args, i);
+            let ar = vec_get(areg, i);
+            if is_dyn_value(a[N_TYPE]) {
+                if ar < 0 {
+                    err_at(a[N_POS], "a dyn argument needs two argument registers or the stack");
+                } else {
+                    gen_dyn_pair(a, ar, ar + 1, d0);
+                }
+            } else {
+                gen_to(a, ar, d0);
+            }
             i = i + 1;
         }
-    } else if d0 + n <= t_count && d0 + n <= f_count {
+    } else {
+        let words = n;
+        i = 0;
+        while i < n {
+            if is_dyn_value(vec_get(args, i)[N_TYPE]) {
+                words = words + 1;
+            }
+            i = i + 1;
+        }
+        let has_fp = 0;
+        i = 0;
+        while i < n {
+            if e_fp(vec_get(args, i)) {
+                has_fp = 1;
+            }
+            i = i + 1;
+        }
+        if d0 + words <= t_count && (!has_fp || d0 + words <= f_count) {
         // Arguments that call, load or may panic run first, in order; the rest are
         // effect-free and go straight into their registers afterwards.
         let last = -1;
         i = 0;
         while i < n {
-            if !speculable(vec_get(args, i)) || vec_get(areg, i) < 0 {
+            if !speculable(vec_get(args, i)) || vec_get(areg, i) < 0 || is_dyn_value(vec_get(args, i)[N_TYPE]) {
                 last = i;
             }
             i = i + 1;
@@ -1631,7 +1836,7 @@ fn gen_call(e, d) {
         i = 0;
         while i < n {
             let a = vec_get(args, i);
-            if i == last && is_real_call(a) && vec_get(areg, i) >= 0 && !variadic {
+            if i == last && is_real_call(a) && vec_get(areg, i) >= 0 && !variadic && !is_dyn_value(a[N_TYPE]) {
                 // Nothing runs between this call and ours, so the result moves right in.
                 gen_call(a, dd);
                 if e_fp(a) {
@@ -1640,6 +1845,13 @@ fn gen_call(e, d) {
                     mov(vec_get(areg, i), 0);
                 }
                 regs[VEC_DATA][i] = vec_get(areg, i);
+            } else if is_dyn_value(a[N_TYPE]) {
+                let r0 = treg(dd);
+                let r1 = treg(dd + 1);
+                gen_dyn_pair(a, r0, r1, dd);
+                regs[VEC_DATA][i] = r0;
+                regs2[VEC_DATA][i] = r1;
+                dd = dd + 2;
             } else if !speculable(a) || vec_get(areg, i) < 0 {
                 let r = gen_val(a, dd);
                 regs[VEC_DATA][i] = r;
@@ -1647,32 +1859,98 @@ fn gen_call(e, d) {
             }
             i = i + 1;
         }
-    } else {
+        } else {
+        if has_stack {
+            save_temps(d);
+            temps_saved = 1;
+            emit3(I_SUBI, SP, SP, stack_area);
+            area = stack_area;
+        }
         i = 0;
         while i < n {
-            push_reg(gen_val(vec_get(args, i), d0));
+            let a = vec_get(args, i);
+            if is_dyn_value(a[N_TYPE]) {
+                let r0 = treg(d0);
+                let r1 = treg(d0 + 1);
+                gen_dyn_pair(a, r0, r1, d0);
+                push_reg(r0);
+                push_reg(r1);
+            } else {
+                push_reg(gen_val(a, d0));
+            }
             i = i + 1;
         }
         i = n - 1;
         while i >= 0 {
             let r = vec_get(areg, i);
-            if r < 0 {
-                r = X16;
-                if e_fp(vec_get(args, i)) {
-                    r = FSCR;
+            if is_dyn_value(vec_get(args, i)[N_TYPE]) {
+                if r < 0 {
+                    r = X16;
+                    let r2 = X17;
+                    pop_reg(r2);
+                    pop_reg(r);
+                    if has_stack {
+                        let prior = 0;
+                        let pi = 0;
+                        while pi < i {
+                            if is_dyn_value(vec_get(args, pi)[N_TYPE]) {
+                                prior = prior + 2;
+                            } else {
+                                prior = prior + 1;
+                            }
+                            pi = pi + 1;
+                        }
+                        emit3(I_STR, r, SP, 16 * prior + vec_get(stackoffs, i));
+                        emit3(I_STR, r2, SP, 16 * prior + vec_get(stackoffs, i) + 8);
+                        stack_stored = 1;
+                    }
+                    regs[VEC_DATA][i] = -2;
+                    regs2[VEC_DATA][i] = -1;
+                } else {
+                    pop_reg(r + 1);
+                    pop_reg(r);
+                    regs[VEC_DATA][i] = r;
+                    regs2[VEC_DATA][i] = r + 1;
+                }
+            } else {
+                if r < 0 {
+                    r = X16;
+                    if e_fp(vec_get(args, i)) {
+                        r = FSCR;
+                    }
+                }
+                pop_reg(r);
+                if vec_get(areg, i) < 0 && has_stack {
+                    let prior = 0;
+                    let pi = 0;
+                    while pi < i {
+                        if is_dyn_value(vec_get(args, pi)[N_TYPE]) {
+                            prior = prior + 2;
+                        } else {
+                            prior = prior + 1;
+                        }
+                        pi = pi + 1;
+                    }
+                    if e_fp(vec_get(args, i)) {
+                        emit3(I_STRD, r, SP, 16 * prior + vec_get(stackoffs, i));
+                    } else {
+                        emit3(I_STR, r, SP, 16 * prior + vec_get(stackoffs, i));
+                    }
+                    regs[VEC_DATA][i] = -2;
+                    stack_stored = 1;
+                } else {
+                    regs[VEC_DATA][i] = r;
                 }
             }
-            // Recorded so the fix-up passes below neither move nor re-evaluate it.
-            regs[VEC_DATA][i] = r;
-            pop_reg(r);
             i = i - 1;
+        }
         }
     }
     // A variadic call stores its stack arguments while their temps are intact, and
     // saves live temps first so the pushes land above the argument area.
-    let area = 0;
     if variadic {
         save_temps(d);
+        temps_saved = 1;
         area = store_varargs(f, regs, n);
     }
     if nested {
@@ -1681,14 +1959,26 @@ fn gen_call(e, d) {
             let r = vec_get(regs, i);
             if r >= 0 && vec_get(areg, i) >= 0 {
                 mov(vec_get(areg, i), r);
+                if is_dyn_value(vec_get(args, i)[N_TYPE]) {
+                    mov(vec_get(areg, i) + 1, vec_get(regs2, i));
+                }
             }
             i = i + 1;
         }
         i = 0;
         while i < n {
-            if vec_get(regs, i) < 0 {
+            if vec_get(regs, i) == -1 {
                 // The temps above d are free again once moved into argument registers.
-                gen_to(vec_get(args, i), vec_get(areg, i), d0);
+                if is_dyn_value(vec_get(args, i)[N_TYPE]) {
+                    let r = vec_get(areg, i);
+                    if r < 0 {
+                        err_at(vec_get(args, i)[N_POS], "a dyn argument needs two argument registers or the stack");
+                    } else {
+                        gen_dyn_pair(vec_get(args, i), r, r + 1, d0);
+                    }
+                } else {
+                    gen_to(vec_get(args, i), vec_get(areg, i), d0);
+                }
             }
             i = i + 1;
         }
@@ -1700,7 +1990,7 @@ fn gen_call(e, d) {
         pat = exit_pattern(f);
     }
     let done_l = 0;
-    if pat && d0 + n + 2 <= t_count && d0 + n + 2 <= f_count {
+    if pat && !has_stack && d0 + n + 2 <= t_count && d0 + n + 2 <= f_count {
         let homes = param_homes(f);
         with_params_in_args(f, 0);
         let call_l = new_label();
@@ -1720,8 +2010,32 @@ fn gen_call(e, d) {
         label(call_l);
         with_params_in_args(f, homes);
     }
-    if !variadic {
+    if !variadic && !temps_saved {
         save_temps(d);
+        temps_saved = 1;
+    }
+    if has_stack && !stack_stored {
+        if stack_area > 0 {
+            emit3(I_SUBI, SP, SP, stack_area);
+            area = stack_area;
+        }
+        i = 0;
+        while i < n {
+            if vec_get(areg, i) < 0 {
+                let r = vec_get(regs, i);
+                if r < 0 {
+                    err_at(vec_get(args, i)[N_POS], "unable to stage a stack argument");
+                } else if is_dyn_value(vec_get(args, i)[N_TYPE]) {
+                    emit3(I_STR, r, SP, vec_get(stackoffs, i));
+                    emit3(I_STR, vec_get(regs2, i), SP, vec_get(stackoffs, i) + 8);
+                } else if is_fp(vec_get(args, i)) {
+                    emit3(I_STRD, r, SP, vec_get(stackoffs, i));
+                } else {
+                    emit3(I_STR, r, SP, vec_get(stackoffs, i));
+                }
+            }
+            i = i + 1;
+        }
     }
     if f {
         emit1(I_BL, f);
@@ -1989,6 +2303,18 @@ fn gen_effect(e) {
 }
 
 fn assign_local(s, v) {
+    if is_dyn_value(s[S_TYPE]) {
+        let r0 = treg(0);
+        let r1 = treg(1);
+        gen_dyn_pair(v, r0, r1, 0);
+        if s[S_REG] == REG_SLOT {
+            emit3(I_STR, r0, FP, s[S_OFF]);
+            emit3(I_STR, r1, FP, s[S_OFF] + 8);
+        } else {
+            err_at(s[S_POS], "dyn local is not in a two-word frame slot");
+        }
+        return;
+    }
     if s[S_REG] >= 0 {
         gen_to(v, s[S_REG], 0);
     } else if s[S_REG] == REG_SLOT {
@@ -2024,6 +2350,17 @@ fn node_restore(n, c) {
 // gen_store_mem stores v through an EX_MEM or EX_ELEM target. The address parts are
 // computed into stable temps first; a[i] = a[i] op x loads the element only once.
 fn gen_store_mem(t, v) {
+    if is_dyn_value(t[N_TYPE]) {
+        gen_dyn_mem_address(t, 0);
+        emit1(I_PUSH, X16);
+        let r0 = treg(0);
+        let r1 = treg(1);
+        gen_dyn_pair(v, r0, r1, 0);
+        emit1(I_POP, X16);
+        emit3(I_STR, r0, X16, 0);
+        emit3(I_STR, r1, X16, 8);
+        return;
+    }
     let fpv = e_fp(t);
     let base = 0;
     let idx = -1;
@@ -2200,6 +2537,23 @@ fn gen_assign(s) {
         assign_local(sym, v);
         return;
     }
+    if is_dyn_value(sym[S_TYPE]) {
+        let r0 = treg(0);
+        let r1 = treg(1);
+        gen_dyn_pair(v, r0, r1, 0);
+        if sym[S_TLS] {
+            emit3(I_STR, r0, 28, tls_off(sym));
+            emit3(I_STR, r1, 28, tls_off(sym) + 8);
+        } else {
+            let first = sym_ref(SK_VAR, sym[S_INDEX]);
+            let second = sym_ref(SK_VAR, sym[S_WORDS]);
+            emit2(I_ADRP, X16, first);
+            emit3(I_STRLO, r0, X16, first);
+            emit2(I_ADRP, X16, second);
+            emit3(I_STRLO, r1, X16, second);
+        }
+        return;
+    }
     let r = gen_val(v, 0);
     if sym[S_TLS] {
         if is_fp(r) {
@@ -2343,19 +2697,54 @@ fn gen_return(s) {
     let f = cur_gen_fn;
     if s[RET_VALUES] {
         let vals = s[RET_VALUES];
-        let regs = vec_new();
+        let lanes = vec_new();
+        let nlanes = 0;
         let i = 0;
         while i < vals[VEC_LEN] {
-            vec_push(regs, gen_val(vec_get(vals, i), i));
+            let v = vec_get(vals, i);
+            vec_push(lanes, nlanes);
+            if is_dyn_value(v[N_TYPE]) {
+                let r0 = treg(i);
+                let r1 = treg(i + 1);
+                gen_dyn_pair(v, r0, r1, i);
+                emit1(I_PUSH, r0);
+                emit1(I_PUSH, r1);
+                nlanes = nlanes + 2;
+            } else {
+                push_reg(gen_val(v, i));
+                nlanes = nlanes + 1;
+            }
             i = i + 1;
         }
         i = 0;
-        while i < vals[VEC_LEN] {
-            mov(i, vec_get(regs, i));
-            i = i + 1;
+        let lane = nlanes;
+        i = vals[VEC_LEN] - 1;
+        while i >= 0 {
+            let v = vec_get(vals, i);
+            let start = vec_get(lanes, i);
+            if is_dyn_value(v[N_TYPE]) {
+                lane = lane - 2;
+                emit1(I_POP, X16);
+                emit1(I_POP, X17);
+                mov(start, X17);
+                mov(start + 1, X16);
+            } else {
+                lane = lane - 1;
+                if is_float_t(v[N_TYPE]) {
+                    emit1(I_FPOP, FPR);
+                    mov(start, FPR);
+                } else {
+                    emit1(I_POP, start);
+                }
+            }
+            i = i - 1;
         }
     } else if s[RET_VALUE] {
-        gen_to(s[RET_VALUE], result_reg(f, 0), 0);
+        if is_dyn_value(s[RET_VALUE][N_TYPE]) {
+            gen_dyn_pair(s[RET_VALUE], 0, 1, 0);
+        } else {
+            gen_to(s[RET_VALUE], result_reg(f, 0), 0);
+        }
     } else {
         emit3(I_MOVZ, 0, 0, 0);
     }
@@ -2738,6 +3127,10 @@ fn assign_homes(f) {
     while i < locals[VEC_LEN] {
         let s = vec_get(locals, i);
         s[S_REG] = REG_DEAD;
+        if is_dyn_value(s[S_TYPE]) {
+            s[S_ADDR] = 1;
+            s[S_WORDS] = 2;
+        }
         if s[S_ADDR] {
             s[S_REG] = REG_SLOT;
             let nw = 1;
@@ -2915,6 +3308,32 @@ fn gen_raw_fn(f, words) {
     }
 }
 
+fn gen_dyn_table_init() {
+    let i = 0;
+    while i < dyn_tables[VEC_LEN] {
+        let rec = vec_get(dyn_tables, i);
+        let keep = vec_get(rec, 2);
+        let methods = vec_get(rec, 3);
+        let start = vec_get(rec, 4);
+        let j = 0;
+        while j <= methods[VEC_LEN] {
+            let f = keep;
+            if j > 0 {
+                f = vec_get(methods, j - 1);
+            }
+            let desc = sym_ref(SK_FNDESC, f[F_INDEX]);
+            let slot = sym_ref(SK_VAR, start + j);
+            emit2(I_ADRP, X16, desc);
+            emit3(I_ADDLO, X16, X16, desc);
+            emit2(I_ADRP, X17, slot);
+            emit3(I_ADDLO, X17, X17, slot);
+            emit3(I_STR, X16, X17, 0);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
 // task_swap_words is rt_task_swap(from x0, to x1): store x19-x27, x29, x30, sp and
 // d8-d15 at from, load them from to, and return on the other stack.
 fn task_swap_words() {
@@ -2941,6 +3360,15 @@ fn hex_word(p) {
         i = i + 1;
     }
     return v;
+}
+
+// Stack parameters are below the callee's frame. finish_fn patches the byte offset once
+// it knows the complete frame size, which includes locals and saved registers.
+fn gen_stack_param_load(dst, incoming_off) {
+    let instruction = cg[VEC_LEN] / 5;
+    emit3(I_LDR, dst, FP, 0);
+    vec_push(incoming_stack_loads, instruction);
+    vec_push(incoming_stack_loads, incoming_off);
 }
 
 fn gen_fn(f) {
@@ -2971,22 +3399,55 @@ fn gen_fn(f) {
     g_loops[VEC_LEN] = 0;
     let nslots = assign_homes(f);
     cg = vec_new();
+    incoming_stack_loads = vec_new();
     let early = early_exit(f);
     let pre = cg;
     cg = vec_new();
     let locals = f[F_LOCALS];
     let ni = 0;
     let nf = 0;
+    let stack_words = 0;
     let i = 0;
     while i < f[F_PARAMS][VEC_LEN] {
         let s = vec_get(locals, i);
         let src = 0;
-        if is_float_t(vec_get(f[F_PTYPES], i)) {
+        if is_dyn_value(vec_get(f[F_PTYPES], i)) {
+            let stack = ni + 1 >= 8;
+            if stack {
+                ni = 8;
+                stack_words = align_up(stack_words, 2);
+                gen_stack_param_load(X16, 8 * stack_words);
+                gen_stack_param_load(X17, 8 * stack_words + 8);
+                stack_words = stack_words + 2;
+                src = X16;
+            } else {
+                src = ni;
+                ni = ni + 2;
+            }
+            if s[S_REG] == REG_SLOT {
+                emit3(I_STR, src, FP, s[S_OFF]);
+                if stack {
+                    emit3(I_STR, X17, FP, s[S_OFF] + 8);
+                } else {
+                    emit3(I_STR, src + 1, FP, s[S_OFF] + 8);
+                }
+            } else {
+                err_at(s[S_POS], "dyn parameter is not in a two-word frame slot");
+            }
+            i = i + 1;
+            continue;
+        } else if is_float_t(vec_get(f[F_PTYPES], i)) {
             src = FPR + nf;
             nf = nf + 1;
         } else {
-            src = ni;
-            ni = ni + 1;
+            if ni >= 8 {
+                gen_stack_param_load(X16, 8 * stack_words);
+                stack_words = stack_words + 1;
+                src = X16;
+            } else {
+                src = ni;
+                ni = ni + 1;
+            }
         }
         if s[S_REG] >= 0 {
             mov(s[S_REG], src);
@@ -3023,6 +3484,7 @@ fn gen_fn(f) {
             }
             di = di + 1;
         }
+        gen_dyn_table_init();
     }
     i = early;
     while i < stmts[VEC_LEN] {
@@ -3185,12 +3647,19 @@ fn finish_fn(f, nslots, pre) {
     }
     let slot_bytes = align_up(8 * nslots, 16);
     let frame = 16 + slot_bytes + align_up(8 * saved[VEC_LEN], 16);
-    let frameless = f[F_LEAF] && nslots == 0 && saved[VEC_LEN] == 0;
+    let j = 0;
+    while j < incoming_stack_loads[VEC_LEN] {
+        let instruction = vec_get(incoming_stack_loads, j);
+        let incoming_off = vec_get(incoming_stack_loads, j + 1);
+        cg[VEC_DATA][5 * instruction + 3] = frame + incoming_off;
+        j = j + 2;
+    }
+    let frameless = f[F_LEAF] && nslots == 0 && saved[VEC_LEN] == 0 && incoming_stack_loads[VEC_LEN] == 0;
     if frame > MAX_FRAME {
         err_quoted(f[F_POS], "function ", f[F_NAME], " has too many local variables");
     }
     out4(I_FUNC, f, 0, 0, 0);
-    let j = 0;
+    j = 0;
     while j < pre[VEC_LEN] {
         out4(vec_get(pre, j), vec_get(pre, j + 1), vec_get(pre, j + 2), vec_get(pre, j + 3), vec_get(pre, j + 4));
         j = j + 5;
@@ -3247,13 +3716,64 @@ fn finish_fn(f, nslots, pre) {
     }
 }
 
-fn generate() {
-    if saw_dyn {
-        // The checker types dyn; generating a size-16 value is the next step
-        // (notes/design_dyn.md, staging steps 3 and 4).
-        err_at(saw_dyn_pos, "dyn values are not generated yet: the checker types them, the back ends are the next step (#141)");
-        return;
+fn append_dyn_slot(name) {
+    let index = prog_vars[VEC_LEN];
+    let d = calloc(D_SIZE, 8);
+    let s = sym_new(SYM_GLOBAL, name, 0);
+    s[S_INDEX] = index;
+    s[S_TYPE] = ty_int;
+    d[D_NAME] = name;
+    d[D_VAL] = 0;
+    d[D_SYM] = s;
+    vec_push(prog_vars, d);
+    return index;
+}
+
+// dyn_layout reserves the second word of global dyn values and lays out each static
+// (concrete type, shape) method table as consecutive global words.
+fn dyn_layout() {
+    let original = prog_vars[VEC_LEN];
+    let i = 0;
+    while i < original {
+        let v = vec_get(prog_vars, i);
+        let s = v[D_SYM];
+        if s && is_dyn_value(s[S_TYPE]) && !s[S_TLS] {
+            let b = buf_new();
+            buf_str(b, "__dyn_global_");
+            buf_int(b, i);
+            buf_str(b, "_table");
+            buf_byte(b, 0);
+            s[S_WORDS] = append_dyn_slot(b[VEC_DATA]);
+        }
+        i = i + 1;
     }
+    i = 0;
+    while i < dyn_tables[VEC_LEN] {
+        let rec = vec_get(dyn_tables, i);
+        let b = buf_new();
+        buf_str(b, "__dyn_table_");
+        buf_int(b, i);
+        buf_byte(b, 0);
+        rec[VEC_DATA][4] = prog_vars[VEC_LEN];
+        append_dyn_slot(b[VEC_DATA]);
+        let fs = vec_get(rec, 3);
+        let j = 0;
+        while j < fs[VEC_LEN] {
+            b = buf_new();
+            buf_str(b, "__dyn_table_");
+            buf_int(b, i);
+            buf_byte(b, '_');
+            buf_int(b, j + 1);
+            buf_byte(b, 0);
+            append_dyn_slot(b[VEC_DATA]);
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn generate() {
+    dyn_layout();
     if tgt_x64 {
         generate_x64();
         return;

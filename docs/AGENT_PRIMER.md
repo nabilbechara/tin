@@ -78,10 +78,13 @@ the compiler: write a minimal repro to notes/compiler_bugs_NAME.md and work arou
 - Enums: `type Shape enum { Circle(r f64), Rect(w, h f64), Empty }`, built as `Shape.Circle(2)`, read with
   `switch s { case Circle(r): ... case Rect(w, h): ... case Empty: ... }` (every variant or default; no
   field access). `==` by value; print as `Rect(3 4)`; JSON `{"Rect":{"w":3,"h":4}}` / `"Empty"`.
-- Generics: `func Max[T i64 | f64 | str](a T, b T) T`, `func Map[T any, U any](xs []T, f func(T) U) []U`,
-  `type Stack[T any] struct { items []T }` with `func (s mut Stack[T]) Push(x T)`; `Max(1, 2)` (inferred)
-  or `Max[i64](1, 2)`. Fully specialized; `var zero T` is the zero value. Constraints: any, comparable,
-  or a union of concrete types.
+- Generics: `func Max[T i64 | f64 | str](a T, b T) T`, `func Map[T constraints.Any, U constraints.Any](xs []T, f func(T) U) []U`,
+  `type Stack[T constraints.Any] struct { items []T }` with `func (s mut Stack[T]) Push(x T)`; `Max(1, 2)` (inferred)
+  or `Max[i64](1, 2)`. Fully specialized; `var zero T` is the zero value. Constraints are imported shapes
+  such as `constraints.Any`, `constraints.Comparable` and `sift.Ordered`, or a union of concrete types.
+- Shapes: structural method sets, composed shapes and named unions; generic shape calls are direct. `dyn S`
+  opts into a two-word object/table value and one indirect method call; conversion allocates nothing. `?dyn S`,
+  `[]dyn S`, `keep` and region checks work; map values and `!dyn` results are deferred.
 - Bounds checks are always on (removed when provably safe: range loops, i < len(s) loops). Panics print
   the message, index and length, and a backtrace.
 - JSON: argo.Put(mut buf, v) encodes any value (encoder generated per type); `err := argo.Get(text, mut v)`

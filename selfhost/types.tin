@@ -1,6 +1,7 @@
-// Types. Every Tin value is one 64-bit word at run time; its static type decides which
-// instructions and runtime calls the compiler uses on it. Reference types (string,
-// struct, slice, map, func, error, chan) are pointers, and 0 is their nil.
+// Tin values are one 64-bit word except for dyn, which is an object/table pair. The
+// static type decides which instructions and runtime calls the compiler uses on them.
+// Reference types (string, struct, slice, map, func, error, chan) are pointers, and 0 is
+// their nil.
 
 const TY_KIND = 0;
 const TY_ELEM = 1;     // slice/chan element, map value
@@ -234,6 +235,19 @@ fn kind_of(t) {
     return t[TY_KIND];
 }
 
+// dyn values, including optionals, occupy an object word and a table word.
+fn is_dyn_value(t) {
+    let k = kind_of(t);
+    return k == K_DYN || (k == K_OPT && kind_of(t[TY_ELEM]) == K_DYN);
+}
+
+fn dyn_type(t) {
+    if kind_of(t) == K_OPT {
+        return t[TY_ELEM];
+    }
+    return t;
+}
+
 fn is_float_t(t) {
     let k = kind_of(t);
     return k == K_FLOAT || k == K_UFLOAT;
@@ -316,7 +330,7 @@ fn type_width(t) {
     if k == K_INT || k == K_BOOL || k == K_FLOAT {
         return t[TY_WIDTH];
     }
-    if k == K_DYN {
+    if is_dyn_value(t) {
         return 16;
     }
     return 8;
@@ -331,6 +345,9 @@ fn width_log2(w) {
     }
     if w == 4 {
         return 2;
+    }
+    if w == 16 {
+        return 4;
     }
     return 3;
 }
@@ -500,7 +517,7 @@ fn field_offset(t, i) {
 fn layout_struct(t) {
     let fs = t[TY_FIELDS];
     let off = 0;
-    let w = 8;
+    let w = 16;
     while w >= 1 {
         let i = 0;
         while i < fs[VEC_LEN] {

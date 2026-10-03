@@ -178,6 +178,7 @@ Go binaries for the container: `GOOS=linux GOARCH=arm64 go build -o bin/linux/x 
 | `bin/linux/bench.sh` (inside `tin-bench-arm64`) | the same comparison on Linux |
 | `bench/v2/NAME.tin` + `NAME.go` | CPU benchmarks; build both, time with `/usr/bin/time -l`, outputs must be identical |
 | `bench/dispatch/dispatch.tin` | shape dispatch against a hand-written call (Tin only, no Go twin): ns/op of each and their ratio; see PERFORMANCE.md section 5 |
+| `bench/dispatch/dyn.tin` | dynamic shape dispatch against a direct method call; reports ns/op and pool bytes, with a paired assembly check in `tests/v2/shapes_dyn_asm.tin` |
 | `examples/demo.tin` + `examples/demo_go` | the mixed demo (primes, sort, SHA-256, JSON, maps), self-timing |
 | `bench/http/hammer` | a Go load generator (wrk-like) with exact latency histograms |
 | `bench/router/router.tin` + `bench/router/go` | routing cost with 1, 20 and 200 routes: a lookup (`Match`) and a whole request through the router (`Run`), against chi's `Find` and `ServeHTTP` |
@@ -214,7 +215,7 @@ tests/v2/           strict tests and expected outputs
 seed/               tinc-darwin-arm64, tinc-linux-arm64, tinc-linux-amd64: the compilers that start a build
 examples/           api.tin (HTTP server), tasks.tin, redis.tin, mysql.tin, websocket.tin, demo.tin, demo_go/
 bench/              v2/ CPU benchmarks, http/ HTTP benchmarks and tools, v04/ the service benchmark, ref/ Go references
-tools/              test runners, debugging helpers, gendoc.py, x64fuzz/
+tools/              test runners, debugging helpers, gendoc.py, gencoverage.tin, x64fuzz/
 docs/               this documentation
 notes/              design notes, plans, verification records, roadmap
 bin/                build output (ignored)
@@ -223,7 +224,8 @@ bin/                build output (ignored)
 ## 10. Version control
 
 The tree is ready to become a git repository: `.gitignore` excludes `bin/` and scratch
-output, every generated file can be regenerated (`make`, `tools/gendoc.py`), seeds are
+output, every generated file can be regenerated (`make`, `tools/gendoc.py`,
+`tools/gencoverage.tin`), seeds are
 plain files, and no script depends on a machine-specific path.
 
 ```sh
@@ -239,6 +241,9 @@ where the bootstrap passed, together with the compiler change that needed them.
 `python3 tools/gendoc.py` rewrites `docs/STDLIB.md` from the comments in `lib/*.tin`
 (package comment, then one line per exported function, type and constant). Write a
 one-line comment above every exported declaration.
+
+`bin/tinc -o /tmp/gencoverage tools/gencoverage.tin && /tmp/gencoverage` rewrites
+`docs/COVERAGE.md` from the maintained inventory in `notes/coverage.md`.
 
 `python3 tools/gen_unicode.py` rewrites `lib/glyph/tables.tin` and `lib/runtime/printable.tin` (the Unicode
 tables) from Go's `unicode/tables.go`; it needs a Go tree only to read that one file.
