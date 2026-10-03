@@ -1,4 +1,4 @@
-SELF = lib/std.tin lib/runtime/number.tin selfhost/util.tin selfhost/lex.tin selfhost/types.tin selfhost/parse.tin \
+SELF = lib/std.tin lib/runtime/memory.tin lib/runtime/number.tin selfhost/util.tin selfhost/lex.tin selfhost/types.tin selfhost/parse.tin \
        selfhost/check.tin selfhost/lower.tin selfhost/generics.tin selfhost/region.tin selfhost/inline.tin selfhost/opt.tin selfhost/asm.tin selfhost/gen.tin selfhost/asm_x64.tin selfhost/gen_x64.tin \
        selfhost/sha256.tin selfhost/macho.tin selfhost/elf.tin selfhost/elf_x64.tin selfhost/main.tin \
        selfhost/host_$(HOST_OS).tin

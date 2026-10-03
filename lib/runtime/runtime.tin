@@ -8,27 +8,17 @@
 
 extern func write(fd i64, buf i64, n i64) i64
 extern func read(fd i64, buf i64, n i64) i64
-extern func malloc(n i64) i64
-extern func calloc(n i64, size i64) i64
-extern func realloc(p i64, n i64) i64
-extern func free(p i64)
 extern func nanosleep(req i64, rem i64) i64
 extern func poll(fds i64, n i64, timeout i64) i64
 extern func pipe(fds i64) i64
 extern func fcntl(fd i64, cmd i64, ...) i64
-extern func memcpy(dst i64, src i64, n i64) i64
-extern func memmove(dst i64, src i64, n i64) i64
-extern func memcmp(a i64, b i64, n i64) i64
-extern func memset(p i64, c i64, n i64) i64
 extern func exit(code i64)
 extern func _exit(code i64)
 extern func sigaltstack(ss i64, old i64) i64
 extern func sigaction(sig i64, act i64, old i64) i64
 extern func isatty(fd i64) i64
-extern func strlen(s i64) i64
 extern func rint(x f64) f64
 extern func dladdr(addr i64, info i64) i64
-extern func posix_memalign(p i64, align i64, n i64) i64
 
 extern func pthread_create(t i64, attr i64, f i64, arg i64) i64
 extern func pthread_attr_init(attr i64) i64
@@ -78,6 +68,8 @@ shared var rtHashK0 i64   // map hash key: random per process, so keys cannot be
 shared var rtHashK1 i64
 
 func rt_init(argc i64, argv i64, ntls i64, coreinit func()) {
+	__set_ctx(0)
+	rt_memory_test_setup()
 	rtTLS = ntls
 	rtCoreInit = coreinit
 	ctx := rt_ctx_new(0)
@@ -136,13 +128,9 @@ func rt_fault_say(s str) {
 
 // rt_aligned_alloc returns n zeroed bytes on their own 128-byte cache lines (n is rounded up).
 func rt_aligned_alloc(n i64) i64 {
-	n = (n + 127) & -128
-	slot := calloc(1, 8)
-	posix_memalign(slot, 128, n)
-	p := slot[0]
-	free(slot)
-	memset(p, 0, n)
-	return p
+    n = (n+127)&-128
+    // Contexts live for the process lifetime; a page mapping also aligns cache lines.
+    return mem_map((n+rt_page_size()-1)&-rt_page_size(),MAP_STACK)
 }
 
 func rt_ctx_new(id i64) i64 {
@@ -155,6 +143,7 @@ func rt_ctx_new(id i64) i64 {
 
 // rt_core_main is a new core's thread: its own context, its own globals, then entry(arg).
 func rt_core_main(p i64) i64 {
+	__set_ctx(0)
 	__set_ctx(rt_ctx_new(p[2]))
 	rt_altstack()
 	rt_core_qos(p[2])
@@ -246,6 +235,7 @@ func rt_alloc(n i64) i64 {
 }
 
 func rt_alloc_slow(n i64) i64 {
+	if curTask != 0 && n > 65536 { curTask[tTrim] = 1 }
 	c := __ctx()
 	if c[ctxPoolBase] == 0 {
 		chunk := calloc(1, rt_chunk())
@@ -320,86 +310,11 @@ func rt_pool_used() i64 {
 	return c[ctxBump] - c[ctxPoolBase]
 }
 
-// Ingot size classes (block sizes with the 8-byte header): 16 32 48 64, then 96 128 192
-// 256 ... 3072 4096. Larger blocks come from calloc with a -1 header.
-func rt_ingot_class(sz i64) i64 {
-	if sz <= 64 {
-		return (sz+15)>>4 - 1
-	}
-	s := 64
-	k := 4
-	for k < 16 {
-		if sz <= s+s>>1 {
-			return k
-		}
-		if sz <= 2*s {
-			return k + 1
-		}
-		s *= 2
-		k += 2
-	}
-	return -1
-}
+// rt_ingot_alloc returns zeroed memory from the owning core's mmap size-class heap.
+func rt_ingot_alloc(n i64) i64 { return calloc(1,n) }
 
-func rt_class_size(k i64) i64 {
-	if k < 4 {
-		return 16 * (k + 1)
-	}
-	j := k - 4
-	s := 64 << (j >> 1)
-	if j&1 == 0 {
-		return s + s>>1
-	}
-	return 2 * s
-}
-
-// rt_ingot_alloc returns zeroed long-lived memory from the core's ingot heap.
-func rt_ingot_alloc(n i64) i64 {
-	k := rt_ingot_class(n + 8)
-	if k < 0 {
-		if n > maxAlloc {
-			rt_panic("allocation size out of range")
-		}
-		b := calloc(1, n+8)
-		if b == 0 {
-			rt_panic("out of memory")
-		}
-		b[0] = -1
-		return b + 8
-	}
-	c := __ctx()
-	p := c[ctxFree+k]
-	if p != 0 {
-		c[ctxFree+k] = p[0]
-		memset(p, 0, rt_class_size(k)-8)
-		return p
-	}
-	bs := rt_class_size(k)
-	if c[ctxSlab]+bs > c[ctxSlabEnd] {
-		slab := calloc(1, slabSize)
-		c[ctxSlab] = slab
-		c[ctxSlabEnd] = slab + slabSize
-	}
-	b := c[ctxSlab]
-	c[ctxSlab] = b + bs
-	b[0] = k
-	return b + 8
-}
-
-// rt_ingot_free returns a block to its core's free list (blocks never cross cores).
-func rt_ingot_free(p i64) {
-	if p == 0 {
-		return
-	}
-	k := (p - 8)[0]
-	if k < 0 {
-		free(p - 8)
-		return
-	}
-	c := __ctx()
-	p[0] = c[ctxFree+k]
-	c[ctxFree+k] = p
-}
+// rt_ingot_free returns a block locally or queues it for its owning core.
+func rt_ingot_free(p i64) { free(p) }
 
 // rt_region_alloc allocates in the ingot heap when ingot is 1, else in the pool.
 func rt_region_alloc(ingot i64, n i64) i64 {
@@ -2536,8 +2451,8 @@ func rt_fmt_slp(s i64) {
 // only what a call preserves: callee-saved registers, frame pointer, return address and
 // stack pointer. The core context register is the same on every task of a core.
 
-extern func mmap(addr i64, n i64, prot i64, flags i64, fd i64, off i64) i64
 extern func mprotect(addr i64, n i64, prot i64) i64
+extern func madvise(addr i64, n i64, advice i64) i64
 
 const taskStack = 262144
 const taskGuard = 16384
@@ -2561,7 +2476,8 @@ const tCleanup = 45  // LIFO cleanup records, run before their pool is reset
 const tRecover = 46  // 1: a panic ends this task, not the process (rt_task_recover); 0 once it panicked
 const tPanicked = 47 // 1: the task ended by a panic
 const tRecoverable = 48
-const taskWords = 49
+const tTrim = 49     // observed heavy pool or suspended stack: discard cached pages
+const taskWords = 50
 
 const waitReady = 0
 const waitDeadline = 1
@@ -2571,6 +2487,8 @@ var curTask i64   // per core: the running task, 0 on the core's own stack
 var schedSave i64 // per core: the core's own registers while a task runs
 var schedPool i64 // per core: the core's own pool words and formatting stack while a task runs
 var freeTasks i64 // per core: finished tasks, reused with their stacks
+var freeTaskCount i64
+const maxFreeTasks = 64
 var timerHeap i64 // per core: a min-heap of [wake, task, gen] entries
 var timerN i64
 var timerCap i64
@@ -2591,15 +2509,15 @@ func rt_task_new(body func(i64), arg i64) i64 {
 	t := freeTasks
 	if t != 0 {
 		freeTasks = t[tNext]
-	} else {
-		t = calloc(taskWords, 8)
-		base := mmap(0, taskStack+taskGuard, 3, MAP_STACK, -1, 0)
-		if base == -1 || base == 0 {
-			rt_panic("cannot map a task stack")
-		}
-		mprotect(base, taskGuard, 0)
-		t[tStack] = base
-	}
+        freeTaskCount--
+    } else {
+        t = calloc(taskWords,8)
+    }
+    if t[tStack] == 0 {
+        base := mem_map(taskStack+taskGuard,MAP_STACK)
+        if i64(i32(mprotect(base,taskGuard,0))) != 0 { mem_oom(taskStack+taskGuard) }
+        t[tStack] = base
+    }
 	t[tFn] = cast(i64, body)
 	t[tArg] = arg
 	t[tDone] = 0
@@ -2612,6 +2530,7 @@ func rt_task_new(body func(i64), arg i64) i64 {
 	t[tRecover] = 0
 	t[tPanicked] = 0
 	t[tRecoverable] = 0
+	t[tTrim] = 0
 	for i := 0; i < 20; i++ {
 		t[tSave+i] = 0
 	}
@@ -2626,6 +2545,7 @@ func rt_task_entry() {
 	f := cast(func(i64), t[tFn])
 	f(t[tArg])
 	rt_task_cleanups(0)
+	if __ctx()[ctxPoolExtra] != 0 || rt_pool_used() > 65536 { t[tTrim] = 1 }
 	rt_pool_reset()
 	t[tDone] = 1
 	rt_task_swap(t, schedSave)
@@ -2673,6 +2593,7 @@ func rt_task_run(t i64) bool {
 	curTask = t
 	rt_task_swap(schedSave, t)
 	curTask = 0
+	if rt_task_sp(t) < t[tStack]+taskGuard+taskStack-16384 { t[tTrim] = 1 }
 	t[tPool] = c[ctxBump]
 	t[tPool+1] = c[ctxEnd]
 	t[tPool+2] = c[ctxPoolBase]
@@ -2697,10 +2618,28 @@ func rt_task_yield() {
 	rt_task_swap(t, schedSave)
 }
 
-// rt_task_free returns a finished task (its stack and pool) for reuse.
+// rt_task_free trims heavy pools/stacks and unmaps overflow records, caching at most 64.
 func rt_task_free(t i64) {
-	t[tNext] = freeTasks
-	freeTasks = t
+    // Stale timers must not dereference a record after it is released or reused.
+    for i := 0; i < timerN; i++ {
+        if timerHeap[3*i+1] == t { timerHeap[3*i+1] = 0 }
+    }
+    if freeTaskCount >= maxFreeTasks {
+        free(t[tPool+2])
+        munmap(t[tStack],taskStack+taskGuard)
+        free(t)
+        return
+    }
+    if t[tTrim] != 0 {
+        rt_memory_discard(t[tPool+2])
+        if i64(i32(madvise(t[tStack]+taskGuard,taskStack,MEM_DONTNEED))) != 0 {
+            munmap(t[tStack],taskStack+taskGuard)
+            t[tStack] = 0
+        }
+    }
+    t[tNext] = freeTasks
+    freeTasks = t
+    freeTaskCount++
 }
 
 func rt_task_current() i64 {
@@ -3014,7 +2953,7 @@ func rt_timer_pop(now i64) i64 {
 			timerHeap[3*i+1] = lt
 			timerHeap[3*i+2] = lg
 		}
-		if gen == t[tGen] && t[tWaiting] != 0 {
+		if t != 0 && gen == t[tGen] && t[tWaiting] != 0 {
 			t[tWaiting] = 0
 			t[tGen]++
 			if t[tWaitFd] >= 0 {

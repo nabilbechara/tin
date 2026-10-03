@@ -1,0 +1,130 @@
+package memoryprobe
+
+import "say"
+import "tide"
+
+shared var handoff i64
+shared var turn i64
+
+// Run checks memory operations at every word alignment and allocation class boundary.
+func Run() {
+    for _, n := range []i64{0,1,2,7,8,9,15,16,17,47,48,49,63,64,65,95,96,97,127,128,129,255,256,257,1023,1024,1025,4095,4096,4097,1048576} {
+        sum := i64(0)
+        for a := 0; a < 8; a++ {
+            for b := 0; b < 8; b++ {
+                source := calloc(1,n+32)
+                dest := calloc(1,n+32)
+                p := source+a
+                q := dest+b
+                for i := 0; i < n; i++ { store8(p+i,(i*13+7)&255) }
+                if memset(q,165,n) != q { panic("memset result") }
+                if memcpy(q,p,n) != q || memcmp(q,p,n) != 0 { panic("memcpy/compare") }
+                for i := 0; i < n; i++ {
+                    if load8(q+i) != u8((i*13+7)&255) { panic("copy bytes") }
+                }
+                for c := 0; c < 256; c += 17 {
+                    expected := i64(0)
+                    for i := 0; i < n; i++ {
+                        if load8(p+i) == u8(c) { expected=p+i; break }
+                    }
+                    found := memchr(p,c,n)
+                    if found != expected { panic("memchr") }
+                    if found != 0 { sum += found-p+1 }
+                }
+                store8(p+n,0)
+                expectedLen := i64(0)
+                for expectedLen < n && load8(p+expectedLen) != 0 { expectedLen++ }
+                if strlen(p) != expectedLen { panic("strlen") }
+                for i := 0; i < 16; i++ { store8(source+i,i+1) }
+                memmove(source+3,source,13)
+                for i := 0; i < 13; i++ { if load8(source+3+i) != u8(i+1) { panic("overlap backwards") } }
+                memmove(source,source+3,13)
+                for i := 0; i < 13; i++ { if load8(source+i) != u8(i+1) { panic("overlap forwards") } }
+                free(source); free(dest)
+            }
+        }
+        say.Line("memory",n,sum)
+    }
+    // A guard page immediately follows these ranges: no bounded operation may over-read.
+    page := rt_page_size()
+    mapping := mem_map(page*2,MAP_STACK)
+    if i64(i32(mprotect(mapping+page,page,0))) != 0 { panic("guard protection") }
+    for n := 0; n < 80; n++ {
+        p := mapping+page-n
+        memset(p,1,n)
+        if memchr(p,2,n) != 0 || memcmp(p,p,n) != 0 { panic("bounded guard read") }
+        if n > 0 {
+            store8(mapping+page-1,0)
+            if strlen(p) != n-1 { panic("guard strlen") }
+        }
+    }
+    munmap(mapping,page*2)
+    for _, n := range []i64{1,16,31,32,47,48,64,96,128,192,256,512,1024,2048,3072,4080,4081,1048576} {
+        p := calloc(1,n)
+        if p&15 != 0 { panic("allocation alignment") }
+        for i := 0; i < n; i++ { if load8(p+i) != 0 { panic("calloc zero") } }
+        memset(p,91,n)
+        q := realloc(p,n+17)
+        for i := 0; i < n; i++ { if load8(q+i) != 91 { panic("realloc preservation") } }
+        free(q)
+        p = calloc(1,n)
+        for i := 0; i < n; i++ { if load8(p+i) != 0 { panic("calloc reuse zero") } }
+        free(p)
+    }
+    say.Line("allocator zero aligned realloc guard")
+}
+
+// ReturnCore checks an owning core drains blocks freed on another core.
+func ReturnCore(id i64) {
+    for i := 0; i < 1000; i++ {
+        if id == 0 {
+            p := calloc(1,31)
+            __atomic_store(&handoff,p)
+            __atomic_store(&turn,i*2+1)
+            for __atomic_load(&turn) != i*2+2 { __yield() }
+            q := calloc(1,31)
+            if q != p { panic("owner return reuse") }
+            for j := 0; j < 31; j++ { if load8(q+j) != 0 { panic("owner return zero") } }
+            free(q)
+        } else {
+            for __atomic_load(&turn) != i*2+1 { __yield() }
+            p := __atomic_load(&handoff)
+            memset(p,99,31)
+            free(p)
+            __atomic_store(&turn,i*2+2)
+        }
+    }
+}
+
+var active i64
+var released bool
+
+// Touch keeps a sizeable suspended stack so the recycle check covers stack pages.
+func Touch(n i64) i64 {
+    a0,a1,a2,a3 := n+1,n+2,n+3,n+4
+    a4,a5,a6,a7 := n+5,n+6,n+7,n+8
+    a8,a9,a10,a11 := n+9,n+10,n+11,n+12
+    a12,a13,a14,a15 := n+13,n+14,n+15,n+16
+    if n == 0 { tide.Wait(1000000) catch err { panic(err) }; return 0 }
+    v := Touch(n-1)
+    return v+a0+a1+a2+a3+a4+a5+a6+a7+a8+a9+a10+a11+a12+a13+a14+a15
+}
+
+// Heavy dirties the base and overflow request chunks, then waits for the burst release.
+func Heavy() str {
+    total := i64(0)
+    for j := 0; j < 24; j++ {
+        b := make([]u8,200000)
+        for i := 0; i < len(b); i += 4096 { b[i] = u8(j+1) }
+        total += i64(b[0])
+    }
+    active++
+    total += Touch(256)
+    for !released { tide.Wait(10000000) catch err { panic(err) } }
+    active--
+    return say.Fmt("done %d",total)
+}
+
+func Active() i64 { return active }
+func Release() { released = true }
+func Cached() i64 { return freeTaskCount }

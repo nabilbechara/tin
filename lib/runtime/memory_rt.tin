@@ -1,0 +1,60 @@
+// Runtime front end: one heap per core, plus a locked heap before contexts exist.
+extern func getenv(name i64) i64
+shared var memoryBootHeap i64
+shared var memoryBootLock i64
+shared var memoryFailAfter i64 = -1
+shared var memoryAllocCount i64
+var memoryHeap i64
+
+func mem_failpoint(n i64) {
+    if memoryFailAfter >= 0 && __atomic_add(&memoryAllocCount,1) >= memoryFailAfter {
+        mem_oom(n)
+    }
+}
+
+func rt_memory_test_setup() {
+    enabled := getenv(cast(i64,"TIN_ALLOC_TEST")+8)
+    if enabled == 0 || load8(enabled) != '1' { return }
+    limit := getenv(cast(i64,"TIN_FAIL_ALLOC_AFTER")+8)
+    if limit != 0 { memoryFailAfter = rt_decimal_integer(limit) }
+}
+
+func rt_memory_heap() i64 {
+    if memoryHeap == 0 { memoryHeap = mem_heap_new(MAP_STACK,rt_page_size()) }
+    return memoryHeap
+}
+
+func rt_memory_alloc(n i64, zero i64) i64 {
+    if __ctx() != 0 { return mem_alloc(rt_memory_heap(),n,zero) }
+    mem_lock(&memoryBootLock)
+    if memoryBootHeap == 0 { memoryBootHeap = mem_heap_new(MAP_STACK,rt_page_size()) }
+    p := mem_alloc(memoryBootHeap,n,zero)
+    mem_unlock(&memoryBootLock)
+    return p
+}
+
+func calloc(n i64, size i64) i64 {
+    if n < 0 || size < 0 || (size != 0 && n > maxAlloc/size) { mem_oom(maxAlloc) }
+    bytes := n*size
+    return rt_memory_alloc(bytes,1)
+}
+
+func free(p i64) {
+    if __ctx() == 0 { mem_free(p,0) } else { mem_free(p,memoryHeap) }
+}
+
+func realloc(p i64, n i64) i64 {
+    return mem_realloc(rt_memory_heap(),p,n)
+}
+
+func malloc(n i64) i64 { return rt_memory_alloc(n,0) }
+
+// Discard complete payload pages while keeping the header and boundary pages intact.
+func rt_memory_discard(p i64) {
+    if p == 0 { return }
+    heap := (p-16)[0]
+    page := heap[1]
+    start := (p+page-1)&-page
+    end := (p+(p-8)[0])&-page
+    if end > start { madvise(start,end-start,MEM_DONTNEED) }
+}
