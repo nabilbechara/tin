@@ -268,7 +268,11 @@ fn resolve_type(tx) {
         if !ck_legacy && !key_valid(mkt, vec_new()) {
             err_type(tx[N_POS], "a map key must compare by value (str, numbers, bool, or structs and enums of those), not ", mkt, "");
         }
-        return map_of(mkt, resolve_type(tx[TX_B]));
+        let mvt = resolve_type(tx[TX_B]);
+        if kind_of(mvt) == K_DYN && !ck_legacy {
+            err_at(tx[N_POS], "a map value of type dyn is the next step: the map stores 16-byte slots with the table (#141)");
+        }
+        return map_of(mkt, mvt);
     }
     if k == TX_PTR {
         return resolve_type(tx[TX_A]);
@@ -613,6 +617,15 @@ fn declare_fn(f) {
         i = i + 1;
     }
     let rtypes = resolve_types(f[F_RTYPES]);
+    if !ck_legacy && !f[F_EXTERN] && f[F_BANG] {
+        let ri = 0;
+        while ri < rtypes[VEC_LEN] {
+            if kind_of(vec_get(rtypes, ri)) == K_DYN {
+                err_at(f[F_POS], "a !dyn result is the next step: fail would need the zero pair (#141)");
+            }
+            ri = ri + 1;
+        }
+    }
     if !ck_legacy && !f[F_EXTERN] && !f[F_BANG] && rtypes[VEC_LEN] > 0 && kind_of(vec_get(rtypes, rtypes[VEC_LEN] - 1)) == K_ERROR {
         err_at(f[F_POS], "write a result that can fail as !T (or ! when there is no value), not with a fault result");
     }
@@ -2303,6 +2316,10 @@ fn zero_value(pos, t) {
     }
     if k == K_STRING {
         return lit_string(pos, "");
+    }
+    if k == K_OPT && kind_of(t[TY_ELEM]) == K_DYN && !ck_legacy {
+        err_at(pos, "a ?dyn needs an initializer: its zero pair comes with the method table (#141)");
+        return mk_int(pos, 0, t);
     }
     if k == K_SLICE {
         if ck_legacy {

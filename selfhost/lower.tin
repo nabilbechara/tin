@@ -2324,6 +2324,34 @@ fn lower_minmax(e, name, want) {
 
 // lower_keep deep-copies a value into the core's long-lived ingot heap. The result may
 // only be stored straight into long-lived memory (checked by the region pass).
+// type_has_dyn reports whether a value of t holds a dyn value (a dyn field, element or
+// optional), depth-limited so a recursive type stays finite.
+fn type_has_dyn(t, depth) {
+    if depth > 8 {
+        return 0;
+    }
+    let k = kind_of(t);
+    if k == K_DYN {
+        return 1;
+    }
+    if k == K_OPT || k == K_SLICE {
+        return type_has_dyn(t[TY_ELEM], depth + 1);
+    }
+    if k == K_MAP {
+        return type_has_dyn(t[TY_KEY], depth + 1) || type_has_dyn(t[TY_ELEM], depth + 1);
+    }
+    if k == K_STRUCT {
+        let i = 0;
+        while i < t[TY_FIELDS][VEC_LEN] {
+            if type_has_dyn(field_type(t, i), depth + 1) {
+                return 1;
+            }
+            i = i + 1;
+        }
+    }
+    return 0;
+}
+
 fn lower_keep(e, want) {
     let pos = e[N_POS];
     let x = arg0(e);
@@ -2333,6 +2361,11 @@ fn lower_keep(e, want) {
     }
     if kind_of(t) == K_DYN {
         err_at(pos, "keep of a dyn value needs the method table's copy entry: the next step (#141)");
+        replace_node(e, x);
+        return t;
+    }
+    if type_has_dyn(t, 0) {
+        err_at(pos, "keep of a value holding dyn needs the method table's copy entry: the next step (#141)");
         replace_node(e, x);
         return t;
     }
