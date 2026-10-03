@@ -224,3 +224,24 @@ in your PRs, except #177 and #178, which belong to phase 2:
 - #172–#174, #183: anvil validation, timeouts and limits.
 - #176: long-lived reclamation, which builds on your phase 2 free API.
 - #124: TLS.
+
+## Phase 1 implementation and validation
+
+The compiler and runtime share `lib/runtime/number.tin`, written in the legacy function
+syntax so the committed seeds can compile it. Decimal parsing uses Eisel-Lemire's
+integer multiply/rounding path and an 800-digit exact decimal fallback; hexadecimal
+parsing rounds with a sticky tail. Precision formatting uses exact decimal shifts and
+nearest-even rounding. Shortest formatting finds the interval between adjacent floats;
+the existing small-number fast path remains. Scratch workspaces belong to each core,
+and conversion neither yields nor allocates after that workspace is initialized.
+
+`tools/ci/number_check.py` compares 221,604 generated cases with Go and 20,963 pinned
+finite cases from parse-number-fxx-test-data on every native CI target. It checks bits,
+errors, random decimal/hex values, midpoint ties, subnormals, signed zero, overlong tails,
+precision through 100, f32 and width/left/zero/plus flags. The long-integer mantissa case
+`1` followed by 2,000 zeroes and `e-2000` is checked with Go's exact `big.Rat` and
+nearest-even `big.Float.SetRat`: Go's capped strconv fallback returns zero for that
+input, whereas the exact result, Tin and the previous libc parser return one.
+`tests/v2/number.tin` also checks compiler literal bits and deterministic outputs against
+`bench/ref/number_smoke`. The packed power table is regenerated entirely with Python
+integers by `tools/gen_number_powers.py`; the Go adaptations retain their BSD license.
