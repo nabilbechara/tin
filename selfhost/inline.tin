@@ -338,6 +338,55 @@ fn il_expr(e) {
             }
         }
     }
+    il_fold_reflexive_cmp(e);
+    il_fold_boolean(e);
+}
+
+// For a non-float value x is always equal to itself. After generic inlining this removes
+// the NaN checks from ordered comparisons specialized for integers and strings.
+fn il_fold_reflexive_cmp(e) {
+    if !e || e[N_KIND] != EX_BINARY || (!streq(e[BIN_OP], "==") && !streq(e[BIN_OP], "!=")) {
+        return;
+    }
+    let l = e[BIN_L];
+    let r = e[BIN_R];
+    if l[N_KIND] != EX_IDENT || r[N_KIND] != EX_IDENT || !l[ID_REF] || l[ID_REF] != r[ID_REF] || l[ID_REF][S_KIND] != SYM_LOCAL || is_float_t(l[N_TYPE]) {
+        return;
+    }
+    let value = streq(e[BIN_OP], "==");
+    replace_node(e, mk_int(e[N_POS], value, ty_bool));
+}
+
+// Remove constant identities introduced by ordered comparisons, such as
+// `x < y || (x != x && y == y)` specializing to an integer type.
+fn il_fold_boolean(e) {
+    if !e || e[N_KIND] != EX_BINARY {
+        return;
+    }
+    let op = e[BIN_OP];
+    let l = e[BIN_L];
+    let r = e[BIN_R];
+    if streq(op, "&&") {
+        if is_const(l) {
+            if const_val(l) == 0 {
+                replace_node(e, mk_int(e[N_POS], 0, ty_bool));
+            } else {
+                replace_node(e, r);
+            }
+        } else if is_const(r) && const_val(r) != 0 {
+            replace_node(e, l);
+        }
+    } else if streq(op, "||") {
+        if is_const(l) {
+            if const_val(l) != 0 {
+                replace_node(e, mk_int(e[N_POS], 1, ty_bool));
+            } else {
+                replace_node(e, r);
+            }
+        } else if is_const(r) && const_val(r) == 0 {
+            replace_node(e, l);
+        }
+    }
 }
 
 // il_float_intrinsic turns libm calls the hardware does in one instruction into intrinsics.
