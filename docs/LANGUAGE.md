@@ -301,6 +301,12 @@ say.Line(c(), c(), c())      // 1 2 3
 - **Long-lived closures.** Storing a closure that captures request memory in a global, or anywhere
   long-lived, without `keep` is a compile error naming the global. `keep(f)` deep-copies the
   descriptor and every captured variable into the long-lived heap.
+- **What a closure may store in its captured variables.** A closure passed only to functions
+  that call it (`sift.Each` and the others above) is part of its parent's frame, so its body
+  may store request memory in a captured local, for example `out = append(out, s)` to collect
+  results. Any other closure may be kept, after which its captured variables are long-lived,
+  so its body storing request memory in a captured variable is a compile error naming the
+  variable: store `keep(v)`, or pass the closure only to functions that call it.
 - **Captured `mut` parameters are rejected**: a function literal cannot capture a `mut`
   parameter (the parameter is the caller's variable, not a cell); copy it into a local, or pass it
   as an argument.
