@@ -275,6 +275,126 @@ def websockets(port, failures):
         failures.append('websocket through the router')
 
 
+def limits(exe, failures):
+    """#173/#174: header, read and idle timeouts close stalled connections, a body over
+    TIN_MAX_BODY gets 413, partial requests past the per-core budget get 503, connections past
+    TIN_MAX_CONNS are closed at accept, and a waiting handler outlives the header timeout."""
+    port = ws.free_port()
+    env = dict(os.environ, PORT=str(port), TIN_CORES='1', TIN_DEADLINE_MS='5000', TIN_GRACE='1',
+               TIN_HEADER_TIMEOUT_MS='1000', TIN_READ_TIMEOUT_MS='2000', TIN_IDLE_TIMEOUT_MS='1500',
+               TIN_MAX_BODY='1000000', TIN_MAX_BUFFERED='3000000', TIN_MAX_CONNS='40')
+    server = subprocess.Popen([str(exe)], env=env)
+    try:
+        for _ in range(100):
+            try:
+                socket.create_connection(('127.0.0.1', port), timeout=0.1).close()
+                break
+            except OSError:
+                time.sleep(0.05)
+
+        def conn():
+            return socket.create_connection(('127.0.0.1', port), timeout=10)
+
+        def closed_after(s, limit):
+            s.settimeout(limit)
+            t = time.time()
+            try:
+                while s.recv(65536):
+                    pass
+                return time.time() - t
+            except socket.timeout:
+                return None
+            except ConnectionResetError:
+                return time.time() - t
+
+        cases = [
+            ('partial headers', b'GET /fast HTTP/1.1\r\nHost: x\r\nX-a: ', 0.5, 4),
+            ('nothing sent', b'', 0.5, 4),
+            ('unfinished body', b'POST /users HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n0123456789', 1.5, 5),
+        ]
+        for name, data, low, high in cases:
+            s = conn()
+            if data:
+                s.sendall(data)
+            took = closed_after(s, high + 2)
+            s.close()
+            print('%s: closed after %s s' % (name, took and round(took, 2)))
+            if took is None or took < low or took > high:
+                failures.append('%s: closed after %r s, want %s to %s' % (name, took, low, high))
+        s = conn()
+        s.sendall(b'GET /fast HTTP/1.1\r\nHost: x\r\n\r\n')
+        time.sleep(0.2)
+        s.recv(1000)
+        took = closed_after(s, 6)
+        s.close()
+        print('idle keep-alive: closed after %s s' % (took and round(took, 2)))
+        if took is None or took < 1 or took > 4:
+            failures.append('idle keep-alive closed after %r s' % took)
+        with conn() as s:
+            s.sendall(b'POST /users HTTP/1.1\r\nHost: x\r\nContent-Length: 2000000\r\n\r\n')
+            got = s.recv(100)
+            if not got.startswith(b'HTTP/1.1 413 '):
+                failures.append('body over TIN_MAX_BODY: %r' % got)
+        # A client still sending the body of a refused request must read the refusal: the
+        # server lingers instead of closing with unread input (which would reset the connection).
+        with conn() as s:
+            try:
+                s.sendall(b'POST /users HTTP/1.1\r\nHost: x\r\nContent-Length: 1500000\r\n\r\n' + b'b' * 1500000)
+            except OSError:
+                pass
+            try:
+                got = s.recv(100)
+            except OSError as e:
+                got = repr(e).encode()
+            if not got.startswith(b'HTTP/1.1 413 '):
+                failures.append('413 while the client sends its body: %r' % got)
+        held = []
+        for _ in range(4):
+            c = conn()
+            try:
+                c.sendall(b'POST /users HTTP/1.1\r\nHost: x\r\nContent-Length: 900000\r\n\r\n' + b'a' * 800000)
+            except OSError:
+                pass
+            held.append(c)
+            time.sleep(0.2)
+        refused = 0
+        for c in held:
+            c.settimeout(0.3)
+            try:
+                if c.recv(100).startswith(b'HTTP/1.1 503 '):
+                    refused += 1
+            except (socket.timeout, ConnectionResetError):
+                pass
+            c.close()
+        print('partial 900 kB bodies past a 3 MB budget: %d of 4 refused' % refused)
+        if refused != 1:
+            failures.append('buffer budget: %d of 4 partial bodies refused, want 1' % refused)
+        time.sleep(0.3)
+        many = [conn() for _ in range(45)]
+        time.sleep(0.5)
+        shut = 0
+        for c in many:
+            c.settimeout(0.01)
+            try:
+                if c.recv(10) == b'':
+                    shut += 1
+            except (socket.timeout, ConnectionResetError):
+                pass
+        for c in many:
+            c.close()
+        print('45 connections with TIN_MAX_CONNS=40: %d closed at accept' % shut)
+        if shut != 5:
+            failures.append('connection cap: %d of 45 closed at accept, want 5' % shut)
+        time.sleep(0.3)
+        status, _, body = request(port, 'GET', '/users/7?ms=1500')
+        if status != 200 or not body.startswith(b'user 7'):
+            failures.append('a handler waiting past the header timeout: %r %r' % (status, body))
+        if server.poll() is not None:
+            failures.append('the server exited during the limit checks')
+    finally:
+        stop(server)
+
+
 def main():
     out = ROOT / 'bin/ci/router'
     out.mkdir(parents=True, exist_ok=True)
@@ -297,6 +417,8 @@ def main():
                 failures.append('the server exited on %d cores' % cores)
         finally:
             stop(server)
+    print('-- limits')
+    limits(exe, failures)
     if failures:
         sys.exit('\n'.join(failures))
 
