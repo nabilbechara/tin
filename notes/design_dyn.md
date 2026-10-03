@@ -2,10 +2,14 @@
 
 Status: staging step 2 has landed — the checker types `dyn` (conversions check
 satisfaction and require a struct or enum object, `?dyn` and `[]dyn` are types, a `dyn`
-satisfies its own shape as a type argument, the region bits are the object's, and `keep`,
-`==`, `say`, `make`, omitted fields and `[N]dyn` are rejected with the rule they follow) and
-both back ends refuse a program that uses one with a positioned message naming the step, at
-the first `dyn` the checker resolves. Step 3 is the arm64 code generation.
+satisfies its own shape as a type argument, the region bits are the object's, and `keep`
+(including a container holding a `dyn`), `==`, `say` (including `?dyn`, slices and structs),
+`make`, omitted fields, `[N]dyn`, a `?dyn` zero value, `map[K]dyn` values, `!dyn` results and
+`dyn` as a constraint are rejected with the rule they follow) and both back ends refuse a
+program that uses one with a positioned message naming the step, at the first `dyn` the
+checker resolves. `dyn` in expression-position type arguments parses (`Box[dyn W]{...}`), and
+an unnamed `dyn` parameter is a parse error that says how to name it. Step 3 is the arm64
+code generation.
 
 This note is the implementation design for the `dyn` sub-item of #141 (notes/roadmap.md,
 "`dyn` fat reference (data pointer plus table) for open sets, with region rules"). The
