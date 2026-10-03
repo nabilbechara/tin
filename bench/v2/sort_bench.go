@@ -3,6 +3,7 @@ package main
 import (
 	"cmp"
 	"fmt"
+	"os"
 	"slices"
 	"time"
 )
@@ -45,5 +46,6 @@ func main() {
 	slices.Sort(xs)
 	t7 := time.Now()
 	fmt.Println("presorted", slices.IsSorted(xs))
-	fmt.Printf("ms ints %d stable %d f64s %d presorted %d\n", t1.Sub(t0).Milliseconds(), t3.Sub(t2).Milliseconds(), t5.Sub(t4).Milliseconds(), t7.Sub(t6).Milliseconds())
+	// Timings go to stderr: stdout must match the Tin twin byte for byte (bench/run.py checks it).
+	fmt.Fprintf(os.Stderr, "ms ints %d stable %d f64s %d presorted %d\n", t1.Sub(t0).Milliseconds(), t3.Sub(t2).Milliseconds(), t5.Sub(t4).Milliseconds(), t7.Sub(t6).Milliseconds())
 }
