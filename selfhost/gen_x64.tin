@@ -1752,6 +1752,11 @@ fn x_gen_branch(e, target, d, when_true) {
         return;
     }
     let k = e[N_KIND];
+    if k == EX_SEQ {
+        x_gen_stmts(e[SEQ_STMTS]);
+        x_gen_branch(e[SEQ_VALUE], target, d, when_true);
+        return;
+    }
     if k == EX_UNARY && streq(e[UN_OP], "!") {
         x_gen_branch(e[UN_X], target, d, !when_true);
         return;
@@ -2112,6 +2117,8 @@ fn x_gen_stmt(s) {
         x_gen_assign(s);
     } else if k == ST_EXPR {
         x_gen_effect(s[ES_X]);
+    } else if k == ST_IF && x_try_if_increment(s) {
+        // The condition flags drive a conditional move of x + 1.
     } else if k == ST_IF && x_try_select(s) {
         // Done: both arms computed and picked with cmov.
     } else if k == ST_IF {
@@ -2212,6 +2219,30 @@ fn x_gen_flags(e, d) {
     if e[N_KIND] == EX_UNARY && streq(e[UN_OP], "!") {
         return x_gen_flags(e[UN_X], d) ^ 1;
     }
+    if e[N_KIND] == EX_SEQ {
+        let i = 0;
+        while i < d {
+            if i < t_count {
+                x_push(vec_get(t_regs, i));
+            }
+            if i < f_count {
+                x_push(vec_get(f_regs, i));
+            }
+            i = i + 1;
+        }
+        x_gen_stmts(e[SEQ_STMTS]);
+        i = d - 1;
+        while i >= 0 {
+            if i < f_count {
+                x_pop(vec_get(f_regs, i));
+            }
+            if i < t_count {
+                x_pop(vec_get(t_regs, i));
+            }
+            i = i - 1;
+        }
+        return x_gen_flags(e[SEQ_VALUE], d);
+    }
     if e[N_KIND] == EX_BINARY {
         let cc = x_cond(e[BIN_OP]);
         if (cc == XC_E || cc == XC_NE) && !e_fp(e[BIN_L]) && is_const(e[BIN_R]) && const_val(e[BIN_R]) == 0 && low_bits_test(e[BIN_L]) > 0 {
@@ -2229,13 +2260,33 @@ fn x_gen_flags(e, d) {
     return XC_NE;
 }
 
+fn x_try_if_increment(s) {
+    if x_float_cmp(s[IF_COND]) {
+        return 0;
+    }
+    let a = if_increment_assignment(s);
+    if !a {
+        return 0;
+    }
+    let x = a[AS_TARGET][ID_REF];
+    let value_expr = a[AS_VALUE];
+    let value = x_gen_val(value_expr, 0);
+    let d = next_depth(value, 0);
+    let cc = x_gen_flags(s[IF_COND], d);
+    emit3(X_CMOVCC, x[S_REG], value, cc);
+    return 1;
+}
+
 // x_float_cmp reports whether c (under any number of !) compares floats, which cmov cannot
 // select on because of the unordered case.
 fn x_float_cmp(c) {
     while c[N_KIND] == EX_UNARY && streq(c[UN_OP], "!") {
         c = c[UN_X];
     }
-    return c[N_KIND] == EX_BINARY && x_cond(c[BIN_OP]) >= 0 && e_fp(c[BIN_L]);
+    if c[N_KIND] == EX_SEQ {
+        return x_float_cmp(c[SEQ_VALUE]);
+    }
+    return c[N_KIND] == EX_BINARY && x_cond(c[BIN_OP]) >= 0 && (e_fp(c[BIN_L]) || e_fp(c[BIN_R]));
 }
 
 // x_try_select compiles `if c { x = a; } else { x = b; }` as x = cmov(c, a, b), like
