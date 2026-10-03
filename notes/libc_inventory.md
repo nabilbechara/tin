@@ -110,3 +110,7 @@ an entry removed only when no Linux declaration or linker-added import remains.
 | `unsetenv` | `lib/quarry/quarry.tin` | 5 | active | Tin owned environment removal | tests/v2/quarry.tin deletion (phase 5) |
 | `usleep` | `lib/hearth/hearth.tin` | 4 | active | nanosleep with interruption handling | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 4) |
 | `write` | `lib/runtime/runtime.tin`, `lib/std.tin` | 3 | active | write raw syscall (per-architecture ABI) | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
+| `_exit` | `lib/runtime/runtime.tin` | 3 | active | exit_group raw syscall | Fault/stack-overflow diagnostics and nonzero exit (issue #175) |
+| `shutdown` | `lib/anvil/anvil.tin` | 3 | active | shutdown raw syscall | HTTP conformance and graceful shutdown |
+| `sigaction` | `lib/runtime/runtime.tin` | 3 | active | rt_sigaction and per-architecture restorer | Existing native stack-overflow/bad-access probes; signal-return tests (phase 3) |
+| `sigaltstack` | `lib/runtime/runtime.tin` | 3 | active | sigaltstack raw syscall | Existing native per-thread stack-overflow probes (issue #175) |
