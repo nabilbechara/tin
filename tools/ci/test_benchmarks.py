@@ -112,6 +112,13 @@ out.chmod(0o755)
             with self.subTest(text=text), self.assertRaises(ValueError):
                 http.parse_wrk(text)
 
+    def test_workflow_pipelines_propagate_harness_failures(self):
+        workflow = (ROOT / '.github/workflows/bench-linux.yml').read_text()
+        self.assertIn('defaults:\n  run:\n    shell: bash', workflow)
+        result = subprocess.run(['bash', '-e', '-o', 'pipefail', '-c',
+                                 'python3 -c "raise SystemExit(2)" | cat'], capture_output=True)
+        self.assertEqual(result.returncode, 2)
+
     def test_http_body_is_checked_before_timing(self):
         http.verify_body('/json', b'{"message":"Hello, World!"}\n')
         http.verify_body('/plaintext', b'Hello, World!')
