@@ -257,6 +257,12 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
 - Deadlines: each request's waits give up at `anvil.Deadline(ms)` / `TIN_DEADLINE_MS`
   (default 30 s) after it started: `tide.Wait` then fails with `deadline exceeded`.
 - Backpressure: at 4096 waiting requests on a core, new requests get 503.
+- A panic in a handler (an index out of range, a division by zero, `panic`) ends only its
+  request: `panic: ...` and the backtrace go to stderr, the task's cleanups run and its pool
+  is reset, its stack is abandoned and reused, and the request gets 500 and its connection
+  closes. Other requests, waiting ones on the same core included, go on. Deferred calls in
+  the handler do not run (that needs unwinding: `guard`, #142), and a panic outside a request
+  (main, a tick, a relay handler) or a stack overflow still ends the process.
 - A connection closed while its request waits is marked dead and freed when the task ends.
 - Finished tasks go on a per-core free list with their stacks and pools.
 

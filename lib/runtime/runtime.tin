@@ -466,12 +466,26 @@ func rt_out(p i64, n i64) {
 }
 
 func rt_panic(msg str) {
-	rt_flush()
+	t := curTask
+	if t != 0 && t[tRecover] != 0 {
+		// A request task whose owner recovers (anvil): end only this task (#142).
+		t[tRecover] = 0
+		if __atomic_swap(&rtOutLock, 1) == 0 {
+			rt_flush()
+			rt_unlock(&rtOutLock)
+		}
+	} else {
+		rt_flush()
+	}
 	head := "panic: "
 	rt_write_all(2, cast(i64, head)+8, len(head))
 	rt_write_all(2, cast(i64, msg)+8, len(msg))
 	rt_write_all(2, cast(i64, "\n")+8, 1)
 	rt_backtrace(__fp())
+	if t != 0 && t[tPanicked] == 0 && t[tRecoverable] != 0 {
+		t[tPanicked] = 1
+		rt_task_abort(t)
+	}
 	exit(2)
 }
 
@@ -2511,7 +2525,10 @@ const tWaitFd = 42   // the descriptor it waits on, or -1
 const tResult = 43   // how the wait ended: waitReady, waitDeadline or waitTimeout
 const tFmt = 44      // this task's formatting frame stack
 const tCleanup = 45  // LIFO cleanup records, run before their pool is reset
-const taskWords = 48
+const tRecover = 46  // 1: a panic ends this task, not the process (rt_task_recover); 0 once it panicked
+const tPanicked = 47 // 1: the task ended by a panic
+const tRecoverable = 48
+const taskWords = 49
 
 const waitReady = 0
 const waitDeadline = 1
@@ -2559,6 +2576,9 @@ func rt_task_new(body func(i64), arg i64) i64 {
 	t[tNext] = 0
 	t[tFmt] = 0
 	t[tCleanup] = 0
+	t[tRecover] = 0
+	t[tPanicked] = 0
+	t[tRecoverable] = 0
 	for i := 0; i < 20; i++ {
 		t[tSave+i] = 0
 	}
@@ -2572,6 +2592,26 @@ func rt_task_entry() {
 	t := curTask
 	f := cast(func(i64), t[tFn])
 	f(t[tArg])
+	rt_task_cleanups(0)
+	rt_pool_reset()
+	t[tDone] = 1
+	rt_task_swap(t, schedSave)
+}
+
+// rt_task_recover makes a panic in task t end t only: rt_panic prints the message and the
+// backtrace, runs t's cleanups, resets its pool and switches back to the core as if t had
+// finished; rt_task_panicked then reports it. A panic while those cleanups run ends the process.
+func rt_task_recover(t i64) {
+	t[tRecover] = 1
+	t[tRecoverable] = 1
+}
+
+func rt_task_panicked(t i64) bool {
+	return t[tPanicked] != 0
+}
+
+// rt_task_abort ends the running task t after a panic: its stack is abandoned where it is.
+func rt_task_abort(t i64) {
 	rt_task_cleanups(0)
 	rt_pool_reset()
 	t[tDone] = 1

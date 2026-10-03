@@ -1126,10 +1126,15 @@ func serve_one(c i64, p i64, n i64) i64 {
 	pTn = tn
 	pKeep10 = http10 && alive
 	task := rt_task_new(run_request, c)
+	// A panic in the handler ends its request with 500, not the server (#142).
+	rt_task_recover(task)
 	if gDeadlineMs > 0 {
 		rt_task_set_deadline(task, rt_mono_ns()+gDeadlineMs*1000000)
 	}
 	if rt_task_run(task) {
+		if rt_task_panicked(task) {
+			panicked(c)
+		}
 		rt_task_free(task)
 		if !alive || draining {
 			c[cClose] = 1
@@ -1192,6 +1197,9 @@ func rebase_request(task i64, delta i64) {
 // response, then serve the requests that queued behind it.
 func finish_request(c i64, task i64) {
 	free(task[tUser+1])
+	if rt_task_panicked(task) && c[cHijack] == 0 && c[cDead] == 0 {
+		panicked(c)
+	}
 	rt_task_free(task)
 	if c[cHijack] != 0 {
 		close(c[cFD])
@@ -1437,6 +1445,16 @@ func parse_cl(p i64, n i64) i64 {
 		i++
 	}
 	return v
+}
+
+// panicked answers a request whose handler panicked: 500, then the connection closes (the
+// panic and its backtrace are on stderr). Nothing of the handler's response was sent yet.
+func panicked(c i64) {
+	body := make([]u8, 0, 64)
+	w := Out{Body: body, code: 500, ctype: "text/plain; charset=utf-8", extra: make([]u8, 0), own: body}
+	w.Body = append(w.Body, status_text(500)...)
+	respond_out(w, false, false)
+	c[cClose] = 1
 }
 
 func bad(c i64, code i64) {
