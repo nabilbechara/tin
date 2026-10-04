@@ -841,3 +841,12 @@ compression pointers have their two high bits set, and TCP frames have a u16 len
 See [RFC 1035](https://www.rfc-editor.org/rfc/rfc1035) and
 [resolv.conf](https://man7.org/linux/man-pages/man5/resolv.conf.5.html).
 
+
+Phase 5 threads use the `rt_sys_clone` leaf (tools/arch/syscall-fast-*.S). Tin passes
+(flags, stack top, ptid, ctid, entry code, arg). arm64 stores entry/arg at stack-16
+(pre-indexed), moves ctid to x4 and zeroes x3 (tls) for clone 220 (flags, stack, ptid,
+tls, ctid). amd64 stores them at stack-16, moves ctid to r10 and zeroes r8 (tls) for
+clone 56 (flags, stack, ptid, ctid, tls). The child pops entry/arg, clears x28/x29/x30
+(r15/rbp), calls entry and ends the thread with exit (93 / 60); amd64 leaves rsp at
+8 mod 16 on entry. Flags are 0x350f00. The runtime frees a stack only after futex
+(98 / 202) FUTEX_WAIT sees the CLONE_CHILD_CLEARTID word cleared.

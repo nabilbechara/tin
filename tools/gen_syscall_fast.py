@@ -10,7 +10,8 @@ from gen_memory_fast import functions
 
 ROOT = Path(__file__).resolve().parents[1]
 CALLS = ('read', 'write', 'close', 'fcntl', 'accept', 'recvfrom', 'epoll_ctl',
-         'epoll_pwait', 'timerfd_settime', 'clock_gettime')
+         'epoll_pwait', 'timerfd_settime', 'clock_gettime', 'clone')
+DEFINES = CALLS+('exit',)
 NAMES = tuple('rt_sys_'+{'recvfrom':'recv', 'epoll_pwait':'epoll_wait'}.get(n,n) for n in CALLS)
 
 
@@ -22,7 +23,7 @@ def generate():
             numbers = dict(re.findall(r'fn linux_nr_(\w+)\(\) \{ return (\d+); \}',source))
             obj = Path(tmp)/f'{arch}.o'
             subprocess.run(['clang', '-target', target,
-                *[f'-DNR_{n.upper()}={numbers[n]}' for n in CALLS], '-c',
+                *[f'-DNR_{n.upper()}={numbers[n]}' for n in DEFINES], '-c',
                 str(ROOT/f'tools/arch/syscall-fast-{arch}.S'), '-o', str(obj)], check=True)
             table = functions(obj, NAMES)
             result += ['', f'fn syscall_fast_{arch}(name) {{', '    let hex="";']

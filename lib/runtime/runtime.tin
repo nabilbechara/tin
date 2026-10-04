@@ -8,10 +8,6 @@
 
 extern func rint(x f64) f64
 
-extern func pthread_create(t i64, attr i64, f i64, arg i64) i64
-extern func pthread_attr_init(attr i64) i64
-extern func pthread_attr_setstacksize(attr i64, n i64) i64
-
 // Core context words: x28 points here, and the core's globals follow (the compiler
 // addresses global i at x28 + 8*(ctxWords+i), so every core has its own copy).
 const ctxBump = 0
@@ -93,6 +89,9 @@ const altStackSize = 65536
 // rt_altstack gives the calling thread a signal stack of its own, so rt_fault can run after
 // this thread's stack overflowed (every thread: the main one and each core and helper).
 func rt_altstack() {
+	if rt_altstack_ready() {
+		return
+	}
 	st := calloc(1, 32)
 	rt_stack_t(st, calloc(1, altStackSize), altStackSize)
 	rt_sys_sigaltstack(st, 0)
@@ -192,11 +191,7 @@ func rt_spawn_core(entry func(i64), arg i64) {
 	p[0] = cast(i64, entry)
 	p[1] = arg
 	p[2] = __atomic_add(&rtCores, 1)
-	attr := calloc(16, 8)
-	pthread_attr_init(attr)
-	pthread_attr_setstacksize(attr, 8388608)
-	t := calloc(1, 8)
-	if pthread_create(t, attr, cast(i64, rt_core_main), p)&0xffffffff != 0 {
+	if !rt_thread_start(cast(i64, rt_core_main), p) {
 		rt_panic("cannot start a core thread")
 	}
 }
@@ -212,11 +207,9 @@ func rt_watch_start() {
 	if !rtPollsEnabled { return }
 	if rtWatchStarted != 0 { return }
 	if __atomic_swap(&rtWatchStarted, 1) != 0 { return }
-	t := calloc(1, 8)
-	if pthread_create(t, 0, cast(i64, rt_watch_main), 0)&0xffffffff != 0 {
+	if !rt_thread_start(cast(i64, rt_watch_main), 0) {
 		rt_panic("cannot start the watchdog thread")
 	}
-	free(t)
 }
 
 // rt_watch_main never touches boundary records; its own context contains no Tin globals.
