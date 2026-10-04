@@ -344,8 +344,13 @@ fn load_imports() {
             while k < found[VEC_LEN] {
                 let path = vec_get(found, k);
                 if !is_loaded(path) {
+                    let std = starts_with(path, cat_path(lib_root, "/lib/"));
+                    // A changed dependency is reported by its hash before it is parsed.
+                    if !std {
+                        lock_has(path);
+                    }
                     // Only the standard library may use the raw operations.
-                    load_file_trusted(path, starts_with(path, cat_path(lib_root, "/lib/")));
+                    load_file_trusted(path, std);
                 }
                 k = k + 1;
             }
@@ -504,7 +509,28 @@ fn verify_lock() {
     }
 }
 
+// print_hashes prints "<sha256> <path>" for each file, the lines tin vendor writes to tin.lock.
+fn print_hashes(argc, argv) {
+    let out = buf_new();
+    let i = 2;
+    while i < argc {
+        let src = read_file(argv[i]);
+        let digest = calloc(32, 1);
+        sha256(src[VEC_DATA], src[VEC_LEN], digest);
+        buf_str(out, digest_hex(digest));
+        buf_byte(out, ' ');
+        buf_str(out, argv[i]);
+        buf_byte(out, '\n');
+        i = i + 1;
+    }
+    write_all(1, out);
+    return 0;
+}
+
 fn main(argc, argv) {
+    if argc > 1 && streq(argv[1], "-hash") {
+        return print_hashes(argc, argv);
+    }
     files = vec_new();
     file_trusted = vec_new();
     parse_setup();
