@@ -1,0 +1,276 @@
+package seal
+
+import "say"
+
+// ---- Ed25519 signature verification (RFC 8032), on x25519.tin's field ----
+// Verification sees only public values, so it is not constant time. Points are extended
+// twisted Edwards coordinates (X:Y:Z:T), x = X/Z, y = Y/Z, xy = T/Z, with the unified
+// addition formula (Hisil, Wong, Carter and Dawson 2008), which also doubles. As in Go's
+// crypto/ed25519 the check is cofactorless: [S]B - [k]A must encode to R exactly, and S must be
+// below the group order L.
+
+// edpt is a point in extended coordinates; each coordinate is a field element (fe_new).
+type edpt struct {
+	x []i64
+	y []i64
+	z []i64
+	t []i64
+}
+
+// ed_fe reads a 32-byte little-endian constant.
+func ed_fe(hexle str) []i64 {
+	b := HexDecode(hexle) catch err {
+		rt_panic("seal: bad Ed25519 constant: " + say.Str(err))
+		[]u8{}
+	}
+	f := fe_new()
+	fe_frombytes(mut f, b)
+	return f
+}
+
+// d2 is 2d (d = -121665/121666), sqrtm1 a square root of -1, both little-endian.
+var ed_d = ed_fe("a3785913ca4deb75abd841414d0a700098e879777940c78c73fe6f2bee6c0352")
+var ed_d2 = ed_fe("59f1b226949bd6eb56b183829a14e00030d1f3eef2808e19e7fcdf56dcd90624")
+var ed_sqrtm1 = ed_fe("b0a00e4a271beec478e42fad0618432fa7d7fb3d99004d2b0bdfc14f8024832b")
+
+// The group order L, big-endian.
+const edOrder = "1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3ed"
+
+func ed_identity() edpt {
+	p := edpt{x: fe_new(), y: fe_new(), z: fe_new(), t: fe_new()}
+	p.y[0] = 1
+	p.z[0] = 1
+	return p
+}
+
+// ed_add sets r = p + q (unified: also correct for p == q and the identity); r may alias p or q.
+func ed_add(r mut edpt, p edpt, q edpt) {
+	a := fe_new()
+	b := fe_new()
+	c := fe_new()
+	d := fe_new()
+	t := fe_new()
+	fe_sub(mut a, p.y, p.x)
+	fe_sub(mut t, q.y, q.x)
+	fe_mul(mut a, a, t)
+	fe_add(mut b, p.y, p.x)
+	fe_add(mut t, q.y, q.x)
+	fe_mul(mut b, b, t)
+	fe_mul(mut c, p.t, ed_d2)
+	fe_mul(mut c, c, q.t)
+	fe_mul(mut d, p.z, q.z)
+	fe_add(mut d, d, d)
+	e := fe_new()
+	f := fe_new()
+	g := fe_new()
+	h := fe_new()
+	fe_sub(mut e, b, a)
+	fe_sub(mut f, d, c)
+	fe_add(mut g, d, c)
+	fe_add(mut h, b, a)
+	fe_mul(mut r.x, e, f)
+	fe_mul(mut r.y, g, h)
+	fe_mul(mut r.t, e, h)
+	fe_mul(mut r.z, f, g)
+}
+
+func ed_neg(p edpt) edpt {
+	r := ed_identity()
+	zero := fe_new()
+	fe_sub(mut r.x, zero, p.x)
+	fe_copy(mut r.y, p.y)
+	fe_copy(mut r.z, p.z)
+	fe_sub(mut r.t, zero, p.t)
+	return r
+}
+
+// fe_pow22523 sets out = z^((p-5)/8) = z^(2^252-3).
+func fe_pow22523(out mut []i64, z []i64) {
+	t0 := fe_new()
+	t1 := fe_new()
+	t2 := fe_new()
+	fe_sq(mut t0, z)
+	fe_sq(mut t1, t0)
+	fe_sq(mut t1, t1)
+	fe_mul(mut t1, z, t1)
+	fe_mul(mut t0, t0, t1)
+	fe_sq(mut t0, t0)
+	fe_mul(mut t0, t1, t0)
+	fe_sq(mut t1, t0)
+	for i := 1; i < 5; i++ {
+		fe_sq(mut t1, t1)
+	}
+	fe_mul(mut t0, t1, t0)
+	fe_sq(mut t1, t0)
+	for i := 1; i < 10; i++ {
+		fe_sq(mut t1, t1)
+	}
+	fe_mul(mut t1, t1, t0)
+	fe_sq(mut t2, t1)
+	for i := 1; i < 20; i++ {
+		fe_sq(mut t2, t2)
+	}
+	fe_mul(mut t1, t2, t1)
+	fe_sq(mut t1, t1)
+	for i := 1; i < 10; i++ {
+		fe_sq(mut t1, t1)
+	}
+	fe_mul(mut t0, t1, t0)
+	fe_sq(mut t1, t0)
+	for i := 1; i < 50; i++ {
+		fe_sq(mut t1, t1)
+	}
+	fe_mul(mut t1, t1, t0)
+	fe_sq(mut t2, t1)
+	for i := 1; i < 100; i++ {
+		fe_sq(mut t2, t2)
+	}
+	fe_mul(mut t1, t2, t1)
+	fe_sq(mut t1, t1)
+	for i := 1; i < 50; i++ {
+		fe_sq(mut t1, t1)
+	}
+	fe_mul(mut t0, t1, t0)
+	fe_sq(mut t0, t0)
+	fe_sq(mut t0, t0)
+	fe_mul(mut out, t0, z)
+}
+
+func fe_equal(a []i64, b []i64) bool {
+	return nat_bytes_eq(fe_tobytes(a), fe_tobytes(b))
+}
+
+// ed_decode decompresses a 32-byte point encoding (RFC 8032 section 5.1.3). As Go's
+// edwards25519 does, a y at or above p is read mod p.
+func ed_decode(b []u8) !edpt {
+	if len(b) != 32 {
+		fail "seal: Ed25519 point must be 32 bytes"
+	}
+	sign := i64(b[31] >> 7)
+	p := ed_identity()
+	fe_frombytes(mut p.y, b)
+	y2 := fe_new()
+	fe_sq(mut y2, p.y)
+	u := fe_new()
+	v := fe_new()
+	one := fe_new()
+	one[0] = 1
+	fe_sub(mut u, y2, one)
+	fe_mul(mut v, y2, ed_d)
+	fe_add(mut v, v, one)
+	// x = u v^3 (u v^7)^((p-5)/8).
+	v3 := fe_new()
+	fe_sq(mut v3, v)
+	fe_mul(mut v3, v3, v)
+	x := fe_new()
+	fe_sq(mut x, v3)
+	fe_mul(mut x, x, v)
+	fe_mul(mut x, x, u)
+	fe_pow22523(mut x, x)
+	fe_mul(mut x, x, v3)
+	fe_mul(mut x, x, u)
+	vx2 := fe_new()
+	fe_sq(mut vx2, x)
+	fe_mul(mut vx2, vx2, v)
+	negu := fe_new()
+	zero := fe_new()
+	fe_sub(mut negu, zero, u)
+	if !fe_equal(vx2, u) {
+		if !fe_equal(vx2, negu) {
+			fail "seal: Ed25519 point is not on the curve"
+		}
+		fe_mul(mut x, x, ed_sqrtm1)
+	}
+	xb := fe_tobytes(x)
+	if xb[0]&1 != u8(sign) {
+		if fe_equal(x, zero) {
+			fail "seal: invalid Ed25519 point encoding"
+		}
+		fe_sub(mut x, zero, x)
+	}
+	fe_copy(mut p.x, x)
+	fe_mul(mut p.t, p.x, p.y)
+	return p
+}
+
+// ed_encode is p's 32-byte encoding: y with the low bit of x in the top bit.
+func ed_encode(p edpt) []u8 {
+	zi := fe_new()
+	fe_invert(mut zi, p.z)
+	x := fe_new()
+	y := fe_new()
+	fe_mul(mut x, p.x, zi)
+	fe_mul(mut y, p.y, zi)
+	out := fe_tobytes(y)
+	out[31] |= (fe_tobytes(x)[0] & 1) << 7
+	return out
+}
+
+// ed_le_to_be reverses little-endian bytes.
+func ed_le_to_be(b []u8) []u8 {
+	out := make([]u8, len(b))
+	for i := 0; i < len(b); i++ {
+		out[i] = b[len(b)-1-i]
+	}
+	return out
+}
+
+// ed_table is the 16 multiples 0..15 of p.
+func ed_table(p edpt) []edpt {
+	t := make([]edpt, 0, 16)
+	t = append(t, ed_identity())
+	for i := 1; i < 16; i++ {
+		e := ed_identity()
+		ed_add(mut e, t[i-1], p)
+		t = append(t, e)
+	}
+	return t
+}
+
+var ed_base_enc = "5866666666666666666666666666666666666666666666666666666666666666"
+
+// VerifyEd25519 checks an Ed25519 signature (64 bytes) of msg by the public key pub (32 bytes).
+func VerifyEd25519(pub []u8, msg []u8, sig []u8) ! {
+	if len(pub) != 32 || len(sig) != 64 {
+		fail "seal: Ed25519 key or signature has the wrong length"
+	}
+	lb := try HexDecode(edOrder)
+	l := try monty_new(lb)
+	s := l.elem()
+	if l.from_bytes(mut s, monty_bytes(l, ed_le_to_be(sig[32:]))) == 0 {
+		fail "seal: Ed25519 signature verification failed"
+	}
+	a := try ed_decode(pub)
+	bb := try HexDecode(ed_base_enc)
+	base := try ed_decode(bb)
+	hin := make([]u8, 0, 64+len(msg))
+	hin = append(hin, sig[:32]...)
+	hin = append(hin, pub...)
+	hin = append(hin, msg...)
+	k := l.elem()
+	monty_reduce(mut l, mut k, ed_le_to_be(Sha512(str(hin))))
+	kb := l.to_bytes(k)
+	sb := ed_le_to_be(sig[32:])
+	sb = monty_bytes(l, sb)
+	tb := ed_table(base)
+	ta := ed_table(ed_neg(a))
+	acc := ed_identity()
+	for i := 0; i < 2*len(kb); i++ {
+		if i > 0 {
+			for j := 0; j < 4; j++ {
+				ed_add(mut acc, acc, acc)
+			}
+		}
+		w1 := ecdsa_nibble(sb, i)
+		w2 := ecdsa_nibble(kb, i)
+		if w1 != 0 {
+			ed_add(mut acc, acc, tb[w1])
+		}
+		if w2 != 0 {
+			ed_add(mut acc, acc, ta[w2])
+		}
+	}
+	if !nat_bytes_eq(ed_encode(acc), sig[:32]) {
+		fail "seal: Ed25519 signature verification failed"
+	}
+}

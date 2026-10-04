@@ -58,7 +58,7 @@ Phase 2's files: `der.tin` (strict DER reader), `bignum.tin` (`monty_new`: Montg
 computed at run time, so `field.tin`'s `monty` serves RSA moduli), `rsa.tin` (PKCS #1 v1.5 and
 PSS verification), `x509.tin` (PEM, certificates, pools, chains, host names),
 `roots_linux.tin` / `roots_darwin.tin` (system bundle paths), `ecdsa.tin` (`VerifyECDSA`),
-`p384.tin` (P-384 over a curve value); later `ed25519.tin`. All exported, in `seal`.
+`p384.tin` (P-384 over a curve value), `ed25519.tin` (`VerifyEd25519`). All exported, in `seal`.
 
 ## lib/tls (phase 3)
 
@@ -94,7 +94,7 @@ returns the chain, leaf first. Then `leaf.CheckTLSSignature(scheme, signed, sig)
 CertificateVerify, `signed` being the 64 spaces, the context string, a zero byte and the
 transcript hash, as RFC 8446 §4.4.3 builds it. `scheme` is the SignatureScheme code
 (0x0804-0x0806 RSA-PSS, 0x0403 ECDSA P-256 and 0x0503 ECDSA P-384, each checking that the
-certificate's key is on the scheme's curve; 0x0807 when Ed25519 lands). Faults start
+certificate's key is on the scheme's curve, and 0x0807 Ed25519). Faults start
 with "x509: " and name the reason: expired or not yet valid, the names the certificate is
 valid for, unknown authority, not a CA, bad signature, SHA-1, chain too long, path length,
 key usage, name constraints, unhandled critical extension.

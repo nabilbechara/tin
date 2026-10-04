@@ -5,7 +5,7 @@
    generated for this run; tests/v2/seal_x509.tin and its Go twin bench/ref/seal_x509 verify every
    case, and both must give the outcome cases.txt expects.
 2. The checked-in PKI (tests/data/x509: chains and parsed fields) and the Wycheproof vectors
-   (tests/wycheproof/rsa and ecdsa) give the same results in Go as the strict suite's expected Tin output.
+   (tests/wycheproof/rsa, ecdsa and ed25519) give the same results in Go as the strict suite's expected Tin output.
 3. Every byte of every certificate in the fresh PKI, in tests/data/x509_real (public roots that
    found differences before) and in the system bundle is flipped three ways;
    Tin must reject every mutant Go rejects (Tin may reject more: Go ignores trailing bytes in a
@@ -83,7 +83,8 @@ def check_checked_in():
     go = outcomes(run(['go', 'run', './bench/ref/seal_x509']))
     assert tin == go, f'checked-in PKI: Tin {tin} != Go {go}'
     want = sorted((ROOT / 'tests/v2/seal_wycheproof.out').read_text().splitlines() +
-                  (ROOT / 'tests/v2/seal_wycheproof_ecdsa.out').read_text().splitlines())
+                  (ROOT / 'tests/v2/seal_wycheproof_ecdsa.out').read_text().splitlines() +
+                  (ROOT / 'tests/v2/seal_wycheproof_ed25519.out').read_text().splitlines())
     got = sorted(run(['go', 'run', './bench/ref/seal_wycheproof']).splitlines())
     assert got == want, 'Wycheproof: Go output differs from tests/v2/seal_wycheproof*.out:\n' + \
         '\n'.join(set(got) ^ set(want))

@@ -26,7 +26,7 @@ import (
 var names = []string{"root", "inter", "leaf", "leaf-pss", "inter-pss", "leaf-ec-key", "leaf-ec-key-P-384",
 	"leaf-ec-key-P-521", "inter-pathlen0", "inter-permit", "inter-exclude", "leaf-client", "inter-not-ca",
 	"inter-no-bc", "inter-no-certsign", "leaf-critical", "leaf-cn-only", "leaf-sha1", "self-signed", "ec-root", "ec-inter",
-	"leaf-under-ec", "leaf-ec-sha1"}
+	"leaf-under-ec", "leaf-ec-sha1", "ed-root", "leaf-under-ed"}
 
 func join(xs []string) string {
 	if len(xs) == 0 {
@@ -111,6 +111,12 @@ func tlsSigs() {
 		msg, _ := hex.DecodeString(f[2])
 		sig, _ := hex.DecodeString(f[3])
 		verify := func(sc int) bool {
+			if k, ok := c.PublicKey.(ed25519.PublicKey); ok {
+				return sc == 0x0807 && ed25519.Verify(k, msg, sig)
+			}
+			if sc == 0x0807 {
+				return false
+			}
 			h := map[int]crypto.Hash{0x0804: crypto.SHA256, 0x0805: crypto.SHA384, 0x0806: crypto.SHA512, 0x0403: crypto.SHA256, 0x0503: crypto.SHA384}[sc]
 			d := h.New()
 			d.Write(msg)
@@ -130,7 +136,7 @@ func tlsSigs() {
 			other = 0x0805
 		case 0x0403:
 			other = 0x0503
-		case 0x0503:
+		case 0x0503, 0x0807:
 			other = 0x0403
 		}
 		e1 := verify(scheme)
