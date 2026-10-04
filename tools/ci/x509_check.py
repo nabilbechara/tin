@@ -6,7 +6,8 @@
    case, and both must give the outcome cases.txt expects.
 2. The checked-in PKI (tests/data/x509: chains and parsed fields) and the Wycheproof vectors
    (tests/wycheproof/rsa and ecdsa) give the same results in Go as the strict suite's expected Tin output.
-3. Every byte of every certificate in the fresh PKI and in the system bundle is flipped three ways;
+3. Every byte of every certificate in the fresh PKI, in tests/data/x509_real (public roots that
+   found differences before) and in the system bundle is flipped three ways;
    Tin must reject every mutant Go rejects (Tin may reject more: Go ignores trailing bytes in a
    few places).
 4. SystemRoots reads the operating system's bundle and parses the same certificates Go does.
@@ -147,6 +148,7 @@ def main():
         check_pki(tin, pki)
         check_checked_in()
         files = sorted(str(p) for p in (pki / 'certs').glob('*.pem'))
+        files += sorted(str(p) for p in (ROOT / 'tests/data/x509_real').glob('*.pem'))
         if system_bundle():
             files.append(system_bundle())
         check_mutants(mutate, gomutate, files)
