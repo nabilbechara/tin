@@ -24,12 +24,12 @@ def timed(port, path):
 def checks(port):
     (status, body), took = timed(port, '/all')
     assert (status, body) == (200, b'[p0 p1 p2 p3]'), (status, body)
-    assert took < 0.18, 'four 50 ms children took %.3f s: their waits did not overlap' % took
-    print('fetchAll: 4 children waiting 50 ms each answered in %.0f ms' % (took * 1000))
+    assert took < 0.3, 'four 100 ms children took %.3f s: their waits did not overlap' % took
+    print('fetchAll: 4 children waiting 100 ms each answered in %.0f ms' % (took * 1000))
 
     (status, body), took = timed(port, '/fail')
     assert (status, body) == (200, b'fault: child 2 failed'), (status, body)
-    assert took < 0.04, 'a child fault should cancel the 50 ms siblings at once (%.3f s)' % took
+    assert took < 0.08, 'a child fault should cancel the 100 ms siblings at once (%.3f s)' % took
     print('first fault: siblings cancelled, answered in %.1f ms' % (took * 1000))
 
     # Many requests with scopes on one core: each gets its own children and results.
