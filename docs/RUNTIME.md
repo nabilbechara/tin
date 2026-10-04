@@ -385,10 +385,13 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   memory in what it captures. The scope's end waits for every child; the first child fault
   cancels the scope, and so its other children, and is the scope's fault (`try` passes it
   on). `t := s.spawn(f)` gives a handle with `t.wait() !` and `t.cancel()`; a child cancelled
-  through its handle does not fail the scope. In a server the event loop resumes children;
+  through its handle does not fail the scope. A child with a value (`s.spawn(fn() !T { ... })`)
+  gives a `spawnedOf[T]` whose `t.wait() !T` is its value or its fault (waiting again gives the
+  same value), usable in `select` like any handle. Leaving a scope body early, by `return` or
+  a `try`'s fault, cancels and joins the children still running, then leaves the scope. In a server the event loop resumes children;
   in `main` the scope's end runs them itself. Spawned closures make their captured variables
   cells per spawn, so `for i in 0..n { let k = i; s.spawn(...) }` gives each child its own `k`.
-  A handle (`spawned`) and its scope cannot outlive the scope block, which frees the
+  A handle (`spawned`, `spawnedOf[T]`) and its scope cannot outlive the scope block, which frees the
   children's records: the compiler keeps them in local variables and parameters (and local
   slices, maps and optionals of them), never in a global, a field, a result, a type argument
   or a `dyn` value; a value goes only into a variable declared inside its scope (an assignment,

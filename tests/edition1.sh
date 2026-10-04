@@ -155,7 +155,7 @@ if ! cmp -s tests/edition1/use_bad.err "$tmp/use_bad.err"; then
 fi
 
 # Structured concurrency (#232): scopes, spawn, wait, cancel, first-fault cancellation.
-for name in scopes lanes selects guards handles
+for name in scopes lanes selects guards handles spawn_values
 do
 	"$compiler" -edition 1 -o "$tmp/$name" "tests/edition1/run/$name.tin"
 	"$tmp/$name" >"$tmp/$name.out" 2>/dev/null
@@ -219,7 +219,7 @@ fi
 
 # A task handle cannot outlive its scope, and detach captures only long-lived memory (#232):
 # each is a compile error.
-for name in scope_escape_bad detach_capture_bad
+for name in scope_escape_bad detach_capture_bad spawn_value_bad
 do
 	if "$compiler" -edition 1 -o "$tmp/$name" "tests/edition1/$name.tin" >"$tmp/$name.out" 2>"$tmp/$name.err"; then
 		echo "FAIL edition1/$name: unexpectedly accepted"

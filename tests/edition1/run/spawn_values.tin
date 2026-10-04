@@ -1,0 +1,164 @@
+package main
+
+import "fault"
+import "say"
+import "tide"
+
+// Values from spawn (#232): s.spawn(f) for f with a value gives a handle whose wait() is the
+// value or the fault.
+
+fn price(id i64) !i64 {
+	try tide.Wait(20 * tide.Millisecond)
+	if id < 0 {
+		fail "no price for {id}"
+	}
+	return id * 10
+}
+
+fn label(id i64) !str {
+	try tide.Wait(10 * tide.Millisecond)
+	return "item{id}"
+}
+
+// both waits for two children with values of different types.
+fn both(id i64) !str {
+	mut out = ""
+	scope s {
+		let p = s.spawn(fn() !i64 {
+			return try price(id)
+		})
+		let n = s.spawn(fn() !str {
+			return try label(id)
+		})
+		let pv = try p.wait()
+		let nv = try n.wait()
+		out = "{nv} costs {pv}"
+	}
+	return out
+}
+
+// failing: a child's fault is its wait's fault, and the scope's.
+fn failing() !i64 {
+	mut v i64 = 0
+	scope s {
+		let p = s.spawn(fn() !i64 {
+			return try price(-1)
+		})
+		v = try p.wait()
+	}
+	return v
+}
+
+// many keeps value handles in a slice and sums them in spawn order.
+fn many() !i64 {
+	mut total i64 = 0
+	scope s {
+		mut hs = []spawnedOf[i64]{}
+		for i in 0..5 {
+			let k = i
+			hs = append(hs, s.spawn(fn() !i64 {
+				try tide.Wait((5 - k) * 5 * tide.Millisecond)
+				return k * k
+			}))
+		}
+		for h in hs {
+			let v = try h.wait()
+			total += v
+		}
+	}
+	return total
+}
+
+// twice: waiting again gives the same value.
+fn twice() !str {
+	mut out = ""
+	scope s {
+		let t = s.spawn(fn() !str {
+			return "once"
+		})
+		let a = try t.wait()
+		let b = try t.wait()
+		out = "{a} {b}"
+	}
+	return out
+}
+
+// early returns from inside two scopes while their children still wait: the children are
+// cancelled instead of waited for, and the task's own waits afterwards are not cancelled.
+fn early() !str {
+	scope outer {
+		outer.spawn(fn() ! {
+			try tide.Wait(10 * tide.Second)
+		})
+		scope inner {
+			let t = inner.spawn(fn() !i64 {
+				try tide.Wait(10 * tide.Second)
+				return 1
+			})
+			if tide.Now() > 0 {
+				return "left early"
+			}
+			let v = try t.wait()
+			return "never {v}"
+		}
+	}
+	return "never"
+}
+
+// first: select takes whichever value handle is ready first.
+fn first() !str {
+	mut out = ""
+	scope s {
+		let slow = s.spawn(fn() !str {
+			try tide.Wait(200 * tide.Millisecond)
+			return "slow"
+		})
+		let fast = s.spawn(fn() !str {
+			try tide.Wait(10 * tide.Millisecond)
+			return "fast"
+		})
+		select {
+			let a = slow.wait() => {
+				out = "got {a}"
+			}
+			let b = fast.wait() => {
+				out = "got {b}"
+			}
+		}
+		slow.cancel()
+	}
+	return out
+}
+
+fn main() {
+	let b = both(3) catch err {
+		"fault {err}"
+	}
+	say.Line(b)
+	let f = failing() catch err {
+		say.Line("failing:", err, fault.Message(err) == "no price for -1")
+		0
+	}
+	say.Line("failing gave", f)
+	let m = many() catch err {
+		say.Line("never", err)
+		0
+	}
+	say.Line("many:", m)
+	let t = twice() catch err {
+		"fault {err}"
+	}
+	say.Line("twice:", t)
+	let t0 = tide.Now()
+	let e = early() catch err {
+		"fault {err}"
+	}
+	tide.Wait(5 * tide.Millisecond) catch err {
+		say.Line("after early:", err)
+	}
+	say.Line("early:", e, "fast:", (tide.Now() - t0) / tide.Millisecond < 1000)
+	let r = first() catch err {
+		"fault {err}"
+	}
+	say.Line("select:", r)
+}
