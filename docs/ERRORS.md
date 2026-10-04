@@ -693,9 +693,10 @@ importing file (`import "./geom"`).
 
 ### E111 LOCK_MISMATCH
 
-When the project directory has a `tin.lock`, every source file outside the standard library
-must be listed in it with its SHA-256 hash (docs/PACKAGES.md), so changed or unexpected code
-does not build.
+When the project directory has a `tin.lock`, every vendored source file (under `vendor/`) must
+be listed in it with its SHA-256 hash, and every other file the lock lists must still have the
+hash it records (docs/PACKAGES.md). A changed or unexpected dependency does not build; the
+message names the file, the hash the lock records and the hash the file has.
 
 ```text file=tin.lock
 0000000000000000000000000000000000000000000000000000000000000000 example.tin
@@ -709,10 +710,61 @@ func main() {
 ```
 
 ```text
-error E111 LOCK_MISMATCH: tin.lock hash mismatch or missing entry for example.tin
+error E111 LOCK_MISMATCH: tin.lock hash mismatch for example.tin: the lock records sha256 0000000000000000000000000000000000000000000000000000000000000000, the file has 7531bb038e7638befa0dc8bdd22788bf076dbef70ab580b80adb3087074f96ba
 ```
 
-Fix: review the change, then regenerate the file's entry (`shasum -a 256 example.tin`).
+Fix: review the change; if it is intended, run `tin vendor` to copy the dependency again and
+record the new hashes (or regenerate the entry with `shasum -a 256 example.tin`).
+
+### E112 NOT_VENDORED
+
+An import path whose first element contains a dot (`github.com/ana/geo`) names a package by
+where it comes from. It is read only from `vendor/<path>` in the program's directory: never
+from the standard library, and never from the network (docs/PACKAGES.md).
+
+```tin
+package main
+
+import "example.com/geo"
+
+func main() {
+}
+```
+
+```text
+error E112 NOT_VENDORED: package "example.com/geo" is not vendored: there is no vendor/example.com/geo in the program's directory (tin vendor copies it there; the build never fetches)
+```
+
+Fix: add the package to `tin.mod` with `require` and run `tin vendor`.
+
+### E113 PACKAGE_CONFLICT
+
+A package's name is the last element of its import path, and two import paths that load
+different packages under the same name would merge into one package.
+
+```text file=vendor/example.com/say/say.tin
+package say
+
+func Hi() {
+}
+```
+
+```tin
+package main
+
+import "say"
+import "example.com/say"
+
+func main() {
+}
+```
+
+```text
+error E113 PACKAGE_CONFLICT: import paths "say" and "example.com/say" are different packages with the same name say
+```
+
+Fix: import only one of them; a vendored package should not reuse the name of a standard
+package or of another dependency.
 
 ### E120 NO_MAIN
 
