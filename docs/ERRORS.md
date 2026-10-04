@@ -41,7 +41,8 @@ edition 1 syntax and is compiled with `-edition 1`.
 An example for an error about the command line or the installation shows its command in a
 ```` ```sh ```` block (one line, `[VAR=value ...] tinc ARGS`), and a block opened with
 ```` ```text file=NAME ```` (any language) is a file written next to the example, such as a
-`tin.lock`.
+`tin.lock`. An internal error, which only a compiler bug reaches, has a `No example:` line
+instead of an example.
 
 ## E0xx Files, tokens and syntax
 
@@ -1521,3 +1522,47 @@ error E903 NO_RUNTIME: the runtime package is missing: no lib/runtime in /nonexi
 
 Fix: set `TIN_ROOT` to the Tin checkout or installation, or run the compiler from its
 installed `bin/` (the `tin` command sets `TIN_ROOT` itself).
+
+### E904 CANNOT_CREATE
+
+The compiler writes the executable to the `-o` path (`a.out` by default), so its directory
+must exist and be writable.
+
+```sh
+tinc -o missing/example example.tin
+```
+
+```tin
+package main
+
+func main() {
+}
+```
+
+```text
+error E904 CANNOT_CREATE: cannot create missing/example
+```
+
+Fix: create the directory first, or choose a writable path.
+
+### E905 TOO_MANY_LOCALS
+
+On arm64 a function's stack frame (its local variables, temporaries and saved registers) is
+at most 4095 bytes, about 500 eight-byte locals.
+
+No example: it takes a function with hundreds of local variables.
+
+Fix: split the function, or keep the values in a slice or a struct instead of separate
+locals.
+
+### E990 INTERNAL
+
+The code generator, assembler or linker met a case it cannot handle: a `dyn` value or
+argument in a place it cannot put it, an instruction it cannot encode, a branch out of range,
+code that changed size between layout and encoding, or a missing entry point. Assembler and
+linker messages start with `x64:` or `link:`.
+
+No example: only a compiler bug reaches this error.
+
+Fix: report it as a compiler bug with the smallest program that shows it; splitting a very
+large function usually avoids a branch out of range in the meantime.

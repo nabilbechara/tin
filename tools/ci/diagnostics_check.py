@@ -67,6 +67,8 @@ def parse_doc(text):
             continue
         if entry is not None and line.startswith('Retired'):
             entry['retired'] = True
+        if entry is not None and line.startswith('No example:'):
+            entry['unexampled'] = True
     if fence is not None:
         raise ValueError(f'{DOC}: unterminated code block')
     return entries
@@ -117,7 +119,7 @@ def check_doc(entries, problems):
         last = number
         documented[e['code']] = e
         names[e['name']] = e['code']
-        if e['retired']:
+        if e['retired'] or e.get('unexampled'):
             continue
         program, _, output, why = example(e)
         if why:
@@ -230,7 +232,7 @@ def main():
     problems, entries, coded, uncoded = check_static()
     if args.compiler:
         compiler = Path(args.compiler).resolve()
-        live = [e for e in entries if not e['retired'] and not example(e)[3]]
+        live = [e for e in entries if not e['retired'] and not e.get('unexampled') and not example(e)[3]]
         with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
             problems += [p for p in pool.map(lambda e: run_example(compiler, ROOT, e), live) if p]
     for problem in problems:
