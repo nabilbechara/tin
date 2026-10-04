@@ -258,6 +258,37 @@ Replaying, a `select` waits for the recorded arm only; the run queue of a reques
 ordered by the recorded `sched.resume` events. Recording these is #243's slice; #241 records
 no scheduling.
 
+### 7.1 Details (#243)
+
+- **Select site.** `file` is the base name of the source file (`sched.tin:17`), so a capsule
+  replays against a build made in another directory.
+- **Select arm.** 0 to n-1 for the arms in source order; n (the number of arms) when the select
+  left with its boundary's fault (a cancelled boundary and no `canceled()` arm). Replaying, a
+  select checks, watches and waits for the recorded arm only; a cancelled boundary still ends
+  it, and an arm other than the recorded one is a divergence. A select whose record diverges
+  runs live: the first divergence is what the replay reports.
+- **Resumes.** `sched.resume@1` is appended each time a task of the request is switched in,
+  a child's first run included, except while its tape is suspended (inside an effect's body:
+  a replayed effect does not wait, so the waits inside a live call are not events). Task
+  numbers come from `tpSched`: the request task is 0; a child gets the next number when it is
+  spawned.
+- **Effects of several tasks.** The tape holds effects in completion order, which can differ
+  from the order a request's tasks issue them. Replaying, a task whose effect is not the next
+  record waits until it is (a task's own effects keep their order). When no task of the
+  request can move on (each waits for its turn or is held for its resume), the replay has
+  diverged, with the message of the effect that could not be served.
+- **Cancels.** The key of `sched.cancel@1` is the boundary's kind (`request`, `task`, `guard`,
+  `within`, `limit`, `scope`, `arena`, `with`), " " and its task's number (`within 0`); the
+  outcome is the reason as a fault (section 3.3, with its sentinel). One record per cancel of a
+  request's boundary: the boundary cancelled, or for a drain (the core's boundary) each request
+  boundary it reaches. A deadline is recorded when it ends a wait of the request (before that
+  task's resume) or when a running task finds it past.
+- **Replaying cancels.** Deadlines and drains do not cancel a replaying request by the clock:
+  their records are applied when they are the next record (their waits are not cut by the
+  deadline; `task.Deadline()` still reads it). Every other cancel (a child's fault, a handle's
+  `cancel`, a scope left early, a budget) happens as the program runs and must match the next
+  record; a cancel with no record, or a record with no cancel, is a divergence.
+
 ## 8. Replay mode (#242)
 
 `tin replay CAPSULE [--against BUILD] [--live KIND]...` runs BUILD (a binary, or a program
