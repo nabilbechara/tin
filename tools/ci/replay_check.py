@@ -2,6 +2,7 @@
 """Replay tapes (#241): rt_effect records results and faults, and a replay serves them without
 running the live call, keeps fault identity, and stops at the first divergence. Capsules (#241):
 lib/replay writes a kept tape as an encrypted capsule into the bounded spool."""
+import base64
 import hashlib
 import hmac
 import os
@@ -12,6 +13,7 @@ import signal
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -486,6 +488,113 @@ def clients(work, env):
           'replay with no live call, and a changed key diverges')
 
 
+def ws_echo(conn):
+    """A WebSocket server for one connection: the handshake, then each text frame echoed, until a close."""
+    buf = b''
+    while b'\r\n\r\n' not in buf:
+        chunk = conn.recv(4096)
+        if not chunk:
+            return
+        buf += chunk
+    head, buf = buf.split(b'\r\n\r\n', 1)
+    key = [l.split(b':', 1)[1].strip() for l in head.split(b'\r\n') if l.lower().startswith(b'sec-websocket-key:')][0]
+    accept = base64.b64encode(hashlib.sha1(key + b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest())
+    conn.sendall(b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+                 b'Sec-WebSocket-Accept: ' + accept + b'\r\n\r\n')
+    while True:
+        while len(buf) < 2:
+            chunk = conn.recv(4096)
+            if not chunk:
+                return
+            buf += chunk
+        op, n = buf[0] & 15, buf[1] & 127
+        at = 2
+        if n == 126:
+            n, at = struct.unpack('>H', buf[2:4])[0], 4
+        while len(buf) < at + 4 + n:
+            chunk = conn.recv(4096)
+            if not chunk:
+                return
+            buf += chunk
+        mask, data = buf[at:at + 4], buf[at + 4:at + 4 + n]
+        buf = buf[at + 4 + n:]
+        data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+        if op == 8:
+            conn.sendall(b'\x88\x02\x03\xe8')
+            return
+        reply = b'echo: ' + data
+        conn.sendall(bytes([0x81, len(reply)]) + reply)
+
+
+def more_clients(work, env):
+    """Recording in mysql, postgres, websocket and quarry: the effects of one task against fake
+    servers and real files go on its tape in order; replayed, the same code gets the same values
+    with no connection made and no file touched."""
+    sys.path.insert(0, str(ROOT / 'tools/ci'))
+    import mysql_check
+    import postgres_check
+    lib = work / 'lib/replaymore'
+    lib.mkdir()
+    shutil.copy(ROOT / 'tools/ci/fixtures/replay_more_probe.tin', lib / 'probe.tin')
+    exe = work / 'replay_more'
+    subprocess.run([str(ROOT / 'bin/tinc'), '-o', str(exe), 'tools/ci/fixtures/replay_more.tin'],
+                   check=True, env=env, cwd=ROOT, timeout=120)
+    my, pg = mysql_check.Fake(), postgres_check.Fake()
+    wsock, wcount = serve_thread(ws_echo)
+    tape = work / 'more.tape'
+    files = work / 'files'
+    run_env = {k: v for k, v in os.environ.items() if not k.startswith('TIN_REPLAY_')}
+    run_env.update(MYSQL_ADDR='127.0.0.1:%d' % my.port, POSTGRES_ADDR='127.0.0.1:%d' % pg.port,
+                   WS_ADDR='127.0.0.1:%d' % wsock.getsockname()[1], FILES_DIR=str(files), TAPE_OUT=str(tape),
+                   TIN_REPLAY_DIR=str(work / 'spool-more'), TIN_REPLAY_KEY=CAPSULE_KEY.hex())
+    r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=120, env=run_env)
+    wsock.close()
+    (ROOT / 'bin/ci/replay/more.log').write_text(r.stdout + r.stderr)
+    failures = []
+    check = lambda name, got, want: got == want or failures.append(f'{name}: got {got!r}, want {want!r}')
+    lines = r.stdout.splitlines()
+    if r.returncode != 0 or len(lines) < 5:
+        failures.append(f'exit {r.returncode}\n{r.stdout}{r.stderr}')
+    else:
+        recorded = lines[1]
+        for part in ['mysql 1 <nil> [1 ada] <nil> | mysql: Error 1146', '<nil> 2 <nil> <nil>',
+                     '| postgres 1 <nil> [1 ada] <nil> | <nil> 1 <nil> <nil>',
+                     'ws <nil> true "echo: hello ws" <nil>',
+                     'files <nil> <nil> <nil> <nil> "alpha+beta" <nil> 10 <nil> <nil> [b.txt sub] <nil> true true <nil> true']:
+            if part not in recorded:
+                failures.append(f'recorded summary lacks {part!r}: {recorded}')
+        check('replay', lines[3], 'replayed same: true left: 0 diverged: ')
+        check('no file touched', lines[4], 'replay touched no file: true')
+        data = tape.read_bytes()
+        kinds, keys, pos = [], [], 0
+        while pos < len(data):
+            pos += 8
+            n = struct.unpack_from('<q', data, pos)[0]
+            kinds.append(data[pos + 8:pos + 8 + n].decode())
+            pos += 8 + n
+            n = struct.unpack_from('<q', data, pos)[0]
+            keys.append(data[pos + 8:pos + 8 + n])
+            pos += 8 + n + 16
+            n = struct.unpack_from('<q', data, pos)[0]
+            pos += 8 + n
+        check('kinds in order', kinds, ['mysql@1', 'mysql@1', 'mysql@1', 'mysql.tx@1', 'mysql@1', 'mysql.tx@1',
+                                        'postgres@1', 'postgres@1', 'postgres.tx@1', 'postgres@1', 'postgres.tx@1',
+                                        'websocket.dial@1', 'websocket.write@1', 'websocket.read@1',
+                                        'quarry.fs@1', 'quarry.write@1', 'quarry.write@1', 'quarry.fs@1', 'quarry.read@1',
+                                        'quarry.stat@1', 'quarry.stat@1', 'quarry.dir@1', 'quarry.stat@1', 'quarry.stat@1',
+                                        'quarry.fs@1', 'quarry.read@1'])
+        if keys:
+            check('mysql key', keys[0], b'E INSERT INTO users (name) VALUES (\nSada\n)\n')
+            check('mysql query key', keys[1], b'Q SELECT id, name FROM users WHERE id = \nI1\n\n')
+            check('rename key', keys[17], ('mv %s/a.txt\n%s/b.txt' % (files, files)).encode())
+        if b'tinpass' in data:
+            failures.append('a database password is on the tape')
+    if failures:
+        raise SystemExit('FAIL replay mysql, postgres, websocket, quarry:\n' + '\n'.join(failures))
+    print('PASS replay mysql, postgres, websocket, quarry: recorded in order (transactions too), replayed with no '
+          'connection and no file touched')
+
+
 def main():
     out = ROOT / 'bin/ci/replay'
     out.mkdir(parents=True, exist_ok=True)
@@ -508,6 +617,7 @@ def main():
         capsules(work, env)
         recording(work, env)
         clients(work, env)
+        more_clients(work, env)
     print('PASS replay tapes: record, replay without live calls, fault identity, divergence, live kinds, children share the tape, panics on it')
 
 

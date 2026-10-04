@@ -621,6 +621,9 @@ func rt_alloc_slow(n i64) i64 {
 	}
 	if c[ctxPoolBase] == 0 {
 		chunk := calloc(1, rt_chunk())
+		// The pool's first object starts at this heap block's payload: pin the chunk so
+		// the long-lived counts never treat pool memory as theirs (#176).
+		(chunk - 8)[0] = (chunk-8)[0] | rcPin
 		c[ctxPoolBase] = chunk
 		c[ctxBump] = chunk
 		c[ctxEnd] = chunk + rt_chunk()
@@ -761,6 +764,7 @@ const rcOne = 1 << 47             // one long-lived reference
 const rcCount = (1 << 62) - rcOne // the count's bits
 const rcPin = rcCount             // a saturated count: pinned for good
 const rcQ = 1 << 62               // set only while the block sits in the limbo
+const limboMax = 1 << 20          // per core: past this many queued blocks, a drop pins instead
 
 // rt_rc_mine reports whether p is a block of this core's heap, the only memory counted.
 func rt_rc_mine(p i64) bool {
@@ -853,6 +857,12 @@ func rt_rc_dec(p i64, drop func(i64)) {
 		w[0] = c
 		return
 	}
+	if rtRcLimbo >= limboMax {
+		// Release is held back (a long-lived task): leak the block as before #176 rather
+		// than grow the limbo without bound.
+		w[0] = (c & rcSize) | rcPin
+		return
+	}
 	rtRcBlocks--
 	rtRcBytes -= c & rcSize
 	w[0] = c | rcQ
@@ -892,7 +902,7 @@ func rt_rc_drop_fresh(p i64) {
 		return
 	}
 	w := p - 8
-	if (w[0] & (rcQ | rcCount)) != 0 {
+	if (w[0] & (rcQ | rcCount)) != 0 || rtRcLimbo >= limboMax {
 		return
 	}
 	w[0] = w[0] | rcQ

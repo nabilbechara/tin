@@ -4,7 +4,7 @@
 //
 //	go run ./bench/ref/x509_pki DIR
 //
-// tls_sigs.txt: "SCHEME MSGHEX SIGHEX" lines, RSA-PSS signatures by the "leaf" key.
+// tls_sigs.txt: "CERT SCHEME MSGHEX SIGHEX" lines, TLS 1.3 signatures by the named certificate's key.
 //
 // cases.txt: a "now UNIX" line, then one line per case:
 //
@@ -302,6 +302,28 @@ func main() {
 	leaf("leaf-twin", "inter-twin-new", nil)
 	add("expired-and-valid-issuer", "www.example.com", "server", "leaf-twin", "inter-twin-old,inter-twin-new", "root", "OK 3")
 
+	// ECDSA chains: P-256 root, P-384 intermediate; and an ECDSA intermediate under the RSA root.
+	ecRootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	check(err)
+	ecInterKey, err := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	check(err)
+	ca("ec-root", "", func(s *spec) { s.key = ecRootKey; s.alg = x509.ECDSAWithSHA256 })
+	ca("ec-inter", "ec-root", func(s *spec) { s.key = ecInterKey; s.alg = x509.ECDSAWithSHA256 })
+	leaf("leaf-under-ec", "ec-inter", func(s *spec) { s.alg = x509.ECDSAWithSHA384 })
+	add("good-ecdsa-chain", "www.example.com", "server", "leaf-under-ec", "ec-inter", "ec-root", "OK 3")
+	leaf("leaf-ec-sha512", "ec-inter", func(s *spec) { s.alg = x509.ECDSAWithSHA512 })
+	add("good-ecdsa-sha512", "www.example.com", "server", "leaf-ec-sha512", "ec-inter", "ec-root", "OK 3")
+	leaf("leaf-ec-badsig", "ec-inter", func(s *spec) { s.alg = x509.ECDSAWithSHA384; s.corruptSig = true })
+	add("bad-ecdsa-signature", "www.example.com", "server", "leaf-ec-badsig", "ec-inter", "ec-root", "signature")
+	leaf("leaf-ec-sha1", "ec-inter", func(s *spec) { s.alg = x509.ECDSAWithSHA1 })
+	add("ecdsa-sha1-signature", "www.example.com", "server", "leaf-ec-sha1", "ec-inter", "ec-root", "sha1")
+	k256, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	check(err)
+	ca("inter-ec-under-rsa", "root", func(s *spec) { s.key = k256 })
+	leaf("leaf-under-ec-rsa", "inter-ec-under-rsa", func(s *spec) { s.alg = x509.ECDSAWithSHA256 })
+	add("good-rsa-root-ecdsa-intermediate", "www.example.com", "server", "leaf-under-ec-rsa", "inter-ec-under-rsa", "root", "OK 3")
+	add("ecdsa-intermediate-wrong-root", "www.example.com", "server", "leaf-under-ec-rsa", "inter-ec-under-rsa", "ec-root", "unknown-authority")
+
 	// TLS 1.3 CertificateVerify-style RSA-PSS signatures by the leaf's key (salt = hash length).
 	var sigs []string
 	msg := []byte(strings.Repeat(" ", 64) + "TLS 1.3, server CertificateVerify\x00transcript")
@@ -313,7 +335,19 @@ func main() {
 		d.Write(msg)
 		sig, err := rsa.SignPSS(rand.Reader, keys["leaf"].(*rsa.PrivateKey), sc.h, d.Sum(nil), &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash})
 		check(err)
-		sigs = append(sigs, fmt.Sprintf("%d %x %x", sc.code, msg, sig))
+		sigs = append(sigs, fmt.Sprintf("leaf %d %x %x", sc.code, msg, sig))
+	}
+	// ECDSA signatures (0x0403 with P-256 and SHA-256, 0x0503 with P-384 and SHA-384).
+	for _, sc := range []struct {
+		cert string
+		code int
+		h    crypto.Hash
+	}{{"leaf-ec-key", 0x0403, crypto.SHA256}, {"leaf-ec-key-P-384", 0x0503, crypto.SHA384}} {
+		d := sc.h.New()
+		d.Write(msg)
+		sig, err := ecdsa.SignASN1(rand.Reader, keys[sc.cert].(*ecdsa.PrivateKey), d.Sum(nil))
+		check(err)
+		sigs = append(sigs, fmt.Sprintf("%s %d %x %x", sc.cert, sc.code, msg, sig))
 	}
 	check(os.WriteFile(filepath.Join(dir, "tls_sigs.txt"), []byte(strings.Join(sigs, "\n")+"\n"), 0o644))
 

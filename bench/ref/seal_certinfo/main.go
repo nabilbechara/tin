@@ -25,7 +25,8 @@ import (
 
 var names = []string{"root", "inter", "leaf", "leaf-pss", "inter-pss", "leaf-ec-key", "leaf-ec-key-P-384",
 	"leaf-ec-key-P-521", "inter-pathlen0", "inter-permit", "inter-exclude", "leaf-client", "inter-not-ca",
-	"inter-no-bc", "inter-no-certsign", "leaf-critical", "leaf-cn-only", "leaf-sha1", "self-signed"}
+	"inter-no-bc", "inter-no-certsign", "leaf-critical", "leaf-cn-only", "leaf-sha1", "self-signed", "ec-root", "ec-inter",
+	"leaf-under-ec", "leaf-ec-sha1"}
 
 func join(xs []string) string {
 	if len(xs) == 0 {
@@ -97,32 +98,49 @@ func show(name string) {
 }
 
 func tlsSigs() {
-	text, _ := os.ReadFile("tests/data/x509/certs/leaf.pem")
-	blk, _ := pem.Decode(text)
-	c, err := x509.ParseCertificate(blk.Bytes)
-	if err != nil {
-		panic(err)
-	}
-	key := c.PublicKey.(*rsa.PublicKey)
 	lines, _ := os.ReadFile("tests/data/x509/tls_sigs.txt")
 	for _, ln := range strings.Split(strings.TrimSpace(string(lines)), "\n") {
 		f := strings.Fields(ln)
-		scheme, _ := strconv.Atoi(f[0])
-		h := map[int]crypto.Hash{0x0804: crypto.SHA256, 0x0805: crypto.SHA384, 0x0806: crypto.SHA512}[scheme]
-		msg, _ := hex.DecodeString(f[1])
-		sig, _ := hex.DecodeString(f[2])
-		verify := func() bool {
+		text, _ := os.ReadFile("tests/data/x509/certs/" + f[0] + ".pem")
+		blk, _ := pem.Decode(text)
+		c, err := x509.ParseCertificate(blk.Bytes)
+		if err != nil {
+			panic(err)
+		}
+		scheme, _ := strconv.Atoi(f[1])
+		msg, _ := hex.DecodeString(f[2])
+		sig, _ := hex.DecodeString(f[3])
+		verify := func(sc int) bool {
+			h := map[int]crypto.Hash{0x0804: crypto.SHA256, 0x0805: crypto.SHA384, 0x0806: crypto.SHA512, 0x0403: crypto.SHA256, 0x0503: crypto.SHA384}[sc]
 			d := h.New()
 			d.Write(msg)
-			return rsa.VerifyPSS(key, h, d.Sum(nil), sig, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash}) == nil
+			switch k := c.PublicKey.(type) {
+			case *rsa.PublicKey:
+				return sc >= 0x0804 && sc <= 0x0806 && rsa.VerifyPSS(k, h, d.Sum(nil), sig, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash}) == nil
+			case *ecdsa.PublicKey:
+				// TLS 1.3 binds the curve to the scheme.
+				want := map[int]string{0x0403: "P-256", 0x0503: "P-384"}[sc]
+				return k.Curve.Params().Name == want && ecdsa.VerifyASN1(k, d.Sum(nil), sig)
+			}
+			return false
 		}
-		e1 := verify()
+		other := 0x0804
+		switch scheme {
+		case 0x0804:
+			other = 0x0805
+		case 0x0403:
+			other = 0x0503
+		case 0x0503:
+			other = 0x0403
+		}
+		e1 := verify(scheme)
+		e4 := verify(other)
 		msg[len(msg)-1] ^= 1
-		e2 := verify()
+		e2 := verify(scheme)
 		msg[len(msg)-1] ^= 1
-		sig[0] ^= 1
-		e3 := verify()
-		fmt.Println("tls", scheme, e1, e2, e3)
+		sig[len(sig)-1] ^= 1
+		e3 := verify(scheme)
+		fmt.Println("tls", f[0], scheme, e1, e2, e3, e4)
 	}
 }
 

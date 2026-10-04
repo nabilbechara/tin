@@ -948,6 +948,11 @@ func (c Client) exec(q query) !(Rows, Result) {
 // and all replies are consumed before returning. Integers and booleans use Value.Int;
 // float4/8 use Value.Float; other OIDs (including numeric and bytea) use Value.Text.
 func (c Client) Query(q query) !Rows {
+	tp := rt_tape()
+	if tp != 0 {
+		rows, _ := try c.exec_taped(tp, "Q ", q) // recorded for replay (#241)
+		return rows
+	}
 	rows, _ := try c.exec(q)
 	return rows
 }
@@ -955,6 +960,11 @@ func (c Client) Query(q query) !Rows {
 // Exec returns the affected count of the last command. Use Query with RETURNING
 // to obtain generated IDs (PostgreSQL has no connection-wide last insert ID).
 func (c Client) Exec(q query) !Result {
+	tp := rt_tape()
+	if tp != 0 {
+		_, res := try c.exec_taped(tp, "E ", q) // recorded for replay (#241)
+		return res
+	}
 	_, res := try c.exec(q)
 	return res
 }
@@ -969,6 +979,10 @@ func (c Client) Ping() ! {
 // tasks an unfinished transaction is dropped when its owning task/scope ends. Outside
 // tasks always finish explicitly. Tx and its rows belong to the caller's pool.
 func (c Client) Begin() !Tx {
+	tp := rt_tape()
+	if tp != 0 {
+		return try c.begin_taped(tp) // recorded for replay (#241)
+	}
 	until := expiration(c.rec)
 	conn := try c.acquire(until)
 	conn[cUntil] = until
@@ -1007,12 +1021,22 @@ func (t mut Tx) run(q query) !(Rows, Result) {
 
 // Query runs a statement in the transaction and returns its first rowset.
 func (t mut Tx) Query(q query) !Rows {
+	tp := rt_tape()
+	if tp != 0 {
+		rows, _ := try t.run_taped(tp, "Q ", q) // recorded for replay (#241)
+		return rows
+	}
 	rows, _ := try t.run(q)
 	return rows
 }
 
 // Exec runs a statement in the transaction and returns its affected count.
 func (t mut Tx) Exec(q query) !Result {
+	tp := rt_tape()
+	if tp != 0 {
+		_, res := try t.run_taped(tp, "E ", q) // recorded for replay (#241)
+		return res
+	}
 	_, res := try t.run(q)
 	return res
 }
@@ -1020,6 +1044,10 @@ func (t mut Tx) Exec(q query) !Result {
 // Commit makes the transaction's changes permanent. An aborted transaction must be
 // rolled back explicitly; PostgreSQL's implicit COMMIT-to-ROLLBACK is not success.
 func (t mut Tx) Commit() ! {
+	tp := rt_tape()
+	if tp != 0 {
+		return try t.finish_taped(tp, "commit", commit_live) // recorded for replay (#241)
+	}
 	if t.state != 0 && t.state[2] != 0 && t.state[0][cStatus] == 'E' {
 		fail "postgres: transaction aborted; Rollback required"
 	}
@@ -1028,5 +1056,205 @@ func (t mut Tx) Commit() ! {
 
 // Rollback undoes the transaction's changes and releases its connection.
 func (t mut Tx) Rollback() ! {
+	tp := rt_tape()
+	if tp != 0 {
+		return try t.finish_taped(tp, "rollback", rollback_live) // recorded for replay (#241)
+	}
 	_, _ = try t.run("ROLLBACK")
+}
+
+// ---- recording and replay (notes/interface_replay.md, section 4; #241) ----
+
+// An effect's body runs at once, before it waits: these hand it its arguments.
+var tapedClient i64
+var tapedQuery i64
+var tapedTx i64
+
+// exec_taped records or replays one statement as postgres@1 (kind "Q " or "E ", then the query).
+func (c Client) exec_taped(tp i64, kind str, q query) !(Rows, Result) {
+	tapedClient = cast(i64, c)
+	tapedQuery = cast(i64, q)
+	v := try rt_effect(tp, "postgres@1", rt_query_key(kind, q), exec_live)
+	return try untape(v)
+}
+
+func exec_live() !str {
+	c := cast(Client, tapedClient)
+	rows, res := try c.exec(cast(query, tapedQuery))
+	return entape(rows, res)
+}
+
+// entape is a statement's outcome as a tape holds it: the columns, the rows (each value a tag,
+// 0 null, 1 int, 2 float, 3 text, and its payload), then the Result.
+func entape(rows Rows, res Result) str {
+	b := make([]u8, 0, 256)
+	b = tput(b, len(rows.Columns))
+	for _, col := range rows.Columns {
+		b = tput_str(b, col)
+	}
+	b = tput(b, len(rows.Rows))
+	for _, row := range rows.Rows {
+		b = tput(b, len(row))
+		for _, v := range row {
+			switch v {
+			case Null:
+				b = tput(b, 0)
+			case Int(x):
+				b = tput(b, 1)
+				b = tput(b, x)
+			case Float(x):
+				b = tput(b, 2)
+				b = tput(b, i64(gauge.F64bits(x)))
+			case Text(x):
+				b = tput(b, 3)
+				b = tput_str(b, x)
+			}
+		}
+	}
+	b = tput(b, res.Affected)
+	return str(b)
+}
+
+// untape is entape's outcome again.
+func untape(v str) !(Rows, Result) {
+	k := tcur{s: v, pos: 0, bad: false}
+	cols := make([]str, 0, 8)
+	nc := k.word()
+	for i := 0; i < nc && !k.bad; i++ {
+		cols = append(cols, k.text())
+	}
+	all := make([][]Value, 0, 8)
+	nr := k.word()
+	for i := 0; i < nr && !k.bad; i++ {
+		row := make([]Value, 0, 8)
+		n := k.word()
+		for j := 0; j < n && !k.bad; j++ {
+			t := k.word()
+			if t == 0 {
+				row = append(row, Value.Null)
+			} else if t == 1 {
+				row = append(row, Value.Int(k.word()))
+			} else if t == 2 {
+				row = append(row, Value.Float(gauge.F64frombits(u64(k.word()))))
+			} else if t == 3 {
+				row = append(row, Value.Text(k.text()))
+			} else {
+				k.bad = true
+			}
+		}
+		all = append(all, row)
+	}
+	res := Result{Affected: k.word()}
+	if k.bad || k.pos != len(v) {
+		fail "replay: postgres@1 result is damaged"
+	}
+	return Rows{Columns: cols, Rows: all}, res
+}
+
+// tcur reads words and strings off a recorded result; bad once it ran past the end.
+type tcur struct {
+	s   str
+	pos i64
+	bad bool
+}
+
+func (k mut tcur) word() i64 {
+	if k.pos+8 > len(k.s) {
+		k.bad = true
+		return 0
+	}
+	v := 0
+	for i := 7; i >= 0; i-- {
+		v = v<<8 | i64(k.s[k.pos+i])
+	}
+	k.pos += 8
+	return v
+}
+
+func (k mut tcur) text() str {
+	n := k.word()
+	if n < 0 || k.pos+n > len(k.s) {
+		k.bad = true
+		return ""
+	}
+	s := k.s[k.pos : k.pos+n]
+	k.pos += n
+	return s
+}
+
+func tput(b []u8, v i64) []u8 {
+	for i := 0; i < 8; i++ {
+		b = append(b, u8(v >> (8 * i)))
+	}
+	return b
+}
+
+func tput_str(b []u8, s str) []u8 {
+	b = tput(b, len(s))
+	b = append(b, s...)
+	return b
+}
+
+// begin_taped records or replays Begin as postgres.tx@1 "begin"; replaying, the Tx has no
+// connection (and no cleanup) and its statements come from the tape.
+func (c Client) begin_taped(tp i64) !Tx {
+	tapedClient = cast(i64, c)
+	tapedTx = 0
+	_ = try rt_effect(tp, "postgres.tx@1", "begin", begin_live)
+	if tapedTx != 0 {
+		t := cast(Tx, tapedTx)
+		tapedTx = 0
+		return t
+	}
+	state := rt_alloc(24)
+	state[0] = 0
+	state[1] = c.rec
+	state[2] = 1
+	return Tx{state: state}
+}
+
+func begin_live() !str {
+	c := cast(Client, tapedClient)
+	t := try c.Begin()
+	tapedTx = cast(i64, t)
+	return ""
+}
+
+// run_taped records or replays a statement of the transaction as postgres@1.
+func (t mut Tx) run_taped(tp i64, kind str, q query) !(Rows, Result) {
+	if t.state == 0 || t.state[2] == 0 {
+		fail "postgres: the transaction is finished"
+	}
+	tapedTx = cast(i64, t)
+	tapedQuery = cast(i64, q)
+	v := try rt_effect(tp, "postgres@1", rt_query_key(kind, q), txrun_live)
+	return try untape(v)
+}
+
+func txrun_live() !str {
+	t := cast(Tx, tapedTx)
+	rows, res := try t.run(cast(query, tapedQuery))
+	return entape(rows, res)
+}
+
+// finish_taped records or replays Commit or Rollback as postgres.tx@1; done, the transaction
+// is finished.
+func (t mut Tx) finish_taped(tp i64, what str, live func() !str) ! {
+	tapedTx = cast(i64, t)
+	_ = try rt_effect(tp, "postgres.tx@1", what, live)
+	if t.state != 0 {
+		t.state[2] = 0
+	}
+}
+
+func commit_live() !str {
+	t := cast(Tx, tapedTx)
+	try t.Commit()
+	return ""
+}
+
+func rollback_live() !str {
+	t := cast(Tx, tapedTx)
+	try t.Rollback()
+	return ""
 }

@@ -3,13 +3,15 @@ package main
 
 import (
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/sha512"
-	"hash"
 	"crypto/x509"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"math/big"
 	"os"
 	"strconv"
@@ -17,10 +19,12 @@ import (
 )
 
 var files = []string{
-	"rsa_signature_2048_sha256", "rsa_signature_2048_sha384", "rsa_signature_2048_sha512", "rsa_signature_3072_sha256",
-	"rsa_signature_4096_sha256", "rsa_signature_4096_sha384", "rsa_signature_4096_sha512",
-	"rsa_pss_2048_sha256_mgf1_0", "rsa_pss_2048_sha256_mgf1_32", "rsa_pss_2048_sha384_mgf1_48",
-	"rsa_pss_4096_sha256_mgf1_32", "rsa_pss_4096_sha512_mgf1_64", "rsa_pss_misc",
+	"rsa/rsa_signature_2048_sha256", "rsa/rsa_signature_2048_sha384", "rsa/rsa_signature_2048_sha512", "rsa/rsa_signature_3072_sha256",
+	"rsa/rsa_signature_4096_sha256", "rsa/rsa_signature_4096_sha384", "rsa/rsa_signature_4096_sha512",
+	"rsa/rsa_pss_2048_sha256_mgf1_0", "rsa/rsa_pss_2048_sha256_mgf1_32", "rsa/rsa_pss_2048_sha384_mgf1_48",
+	"rsa/rsa_pss_4096_sha256_mgf1_32", "rsa/rsa_pss_4096_sha512_mgf1_64", "rsa/rsa_pss_misc",
+	"ecdsa/ecdsa_secp256r1_sha256", "ecdsa/ecdsa_secp256r1_sha512", "ecdsa/ecdsa_secp384r1_sha256",
+	"ecdsa/ecdsa_secp384r1_sha384", "ecdsa/ecdsa_secp384r1_sha512",
 }
 
 func unhex(s string) []byte {
@@ -73,13 +77,14 @@ func pssSaltLen(key *rsa.PublicKey, h crypto.Hash, sig []byte) int {
 }
 
 func run(name string) {
-	text, err := os.ReadFile("tests/wycheproof/rsa/" + name + ".txt")
+	text, err := os.ReadFile("tests/wycheproof/" + name + ".txt")
 	if err != nil {
 		fmt.Println(name, "unreadable:", err)
 		return
 	}
 	kind, salt, h := "", -1, crypto.SHA256
 	var key *rsa.PublicKey
+	var eckey *ecdsa.PublicKey
 	counts, passed := map[string]int{}, map[string]int{}
 	for _, ln := range strings.Split(string(text), "\n") {
 		if ln == "" || ln[0] == '#' {
@@ -88,6 +93,15 @@ func run(name string) {
 		f := strings.Fields(ln)
 		if f[0] == "group" {
 			kind, salt, h = f[1], -1, hashes[f[2]]
+			if kind == "ecdsa" {
+				c := elliptic.P256()
+				if f[3] == "P-384" {
+					c = elliptic.P384()
+				}
+				x, y := elliptic.Unmarshal(c, unhex(f[4])) //nolint:staticcheck // the twin needs the raw point
+				eckey = &ecdsa.PublicKey{Curve: c, X: x, Y: y}
+				continue
+			}
 			if f[3] != "-" {
 				salt, _ = strconv.Atoi(f[3])
 			}
@@ -101,7 +115,9 @@ func run(name string) {
 		digest := digestOf(h, unhex(f[2]))
 		sig := unhex(f[3])
 		ok := false
-		if key != nil {
+		if kind == "ecdsa" {
+			ok = eckey.X != nil && ecdsa.VerifyASN1(eckey, digest, sig)
+		} else if key != nil {
 			if kind == "rsa-pkcs1" {
 				ok = rsa.VerifyPKCS1v15(key, h, digest, sig) == nil
 			} else {
