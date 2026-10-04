@@ -5009,9 +5009,46 @@ fn lit_string(pos, s) {
     return n;
 }
 
+var say_temps; // hidden locals say_hoist has made, for their names
+
+// say_hoist evaluates the arguments from first on that are more than a literal or a name into
+// hidden locals before the formatting frame opens: the frame is the core's, so a call that
+// runs other tasks (anvil.Serve in say.Line) must not run while it is open (#347).
+fn say_hoist(pos, args, first, stmts) {
+    if ck_legacy {
+        return 0;
+    }
+    let i = first;
+    while i < args[VEC_LEN] {
+        let a = vec_get(args, i);
+        let k = a[N_KIND];
+        if k != EX_INT && k != EX_STR && k != EX_IDENT && k != EX_FLOAT && k != EX_NIL {
+            let t = default_type(chk(a, 0));
+            let tk = kind_of(t);
+            if tk != K_VOID && tk != K_TUPLE {
+                if is_untyped(a[N_TYPE]) {
+                    reconvert(a, t);
+                }
+                // a name of its own: the lifetime checks tell hidden locals apart by name
+                say_temps = say_temps + 1;
+                let nb = buf_new();
+                buf_str(nb, "$say");
+                buf_int(nb, say_temps);
+                buf_byte(nb, 0);
+                let s = declare_local(a[N_POS], nb[VEC_DATA], t);
+                vec_push(stmts, let_stmt(a[N_POS], s, a));
+                args[VEC_DATA][i] = sym_ref_node(a[N_POS], s);
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
 // say_text formats args like say.Str (Line spacing when ln) and returns the str.
 fn say_text(pos, args, ln) {
     let stmts = vec_new();
+    say_hoist(pos, args, 0, stmts);
     vec_push(stmts, expr_stmt(rt_call(pos, "rt_fmt_begin_v", args1(mk_int(pos, ln, ty_int)), ty_void)));
     let i = 0;
     while i < args[VEC_LEN] {
@@ -5265,6 +5302,11 @@ fn lower_say(e, m, want) {
     let ln = streq(m, "Line") || streq(m, "LineTo");
     let stmts = vec_new();
     secret_say_args(args, m);
+    if printf {
+        say_hoist(pos, args, first + 1, stmts);
+    } else {
+        say_hoist(pos, args, first, stmts);
+    }
     if printf {
         if args[VEC_LEN] <= first {
             err_code_at(pos, "E282 FORMAT", "missing format");
