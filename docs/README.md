@@ -15,7 +15,8 @@
 
 Design notes and records live in [`../notes/`](../notes): the roadmap (`roadmap.md`), the
 v0.4 async-I/O design (`design_v04.md`), the decisions for the foundations the missing
-standard library waits on (`design_foundations.md`), the Linux plan and ABI reference (`plan_linux.md`,
+standard library waits on (`design_foundations.md`), the next milestone, Tin 1: its semantic
+model (`design_semantics.md`) and its syntax (`design_syntax.md`, replacing `syntax_v05.md`), the Linux plan and ABI reference (`plan_linux.md`,
 `linux_abi.md`), stdlib verification against Go (`stdlib_verified.md`), benchmark analyses
 (`bench_v2.md`) and the HTTP edge-case work (`anvil_hardening.md`).
 

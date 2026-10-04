@@ -2465,7 +2465,9 @@ const tRecover = 46  // 1: a panic ends this task, not the process (rt_task_reco
 const tPanicked = 47 // 1: the task ended by a panic
 const tRecoverable = 48
 const tTrim = 49     // observed heavy pool or suspended stack: discard cached pages
-const taskWords = 50
+const tTimers = 50   // timer heap entries that still name this record
+const tRetired = 51  // 1: released over the cache cap; freed when its last timer entry pops
+const taskWords = 52
 
 const waitReady = 0
 const waitDeadline = 1
@@ -2609,13 +2611,14 @@ func rt_task_yield() {
 
 // rt_task_free trims heavy pools/stacks and unmaps overflow records, caching at most 64.
 func rt_task_free(t i64) {
-    // Stale timers must not dereference a record after it is released or reused.
-    for i := 0; i < timerN; i++ {
-        if timerHeap[3*i+1] == t { timerHeap[3*i+1] = 0 }
-    }
     if freeTaskCount >= maxFreeTasks {
         free(t[tPool+2])
         rt_sys_munmap(t[tStack],taskStack+taskGuard)
+        // Stale timer entries still read this record; the last one to pop frees it.
+        if t[tTimers] > 0 {
+            t[tRetired] = 1
+            return
+        }
         free(t)
         return
     }
@@ -2899,6 +2902,7 @@ func rt_timer_push(t i64, wake i64) {
 	timerHeap[3*i] = wake
 	timerHeap[3*i+1] = t
 	timerHeap[3*i+2] = t[tGen]
+	t[tTimers]++
 }
 
 // rt_timer_next is when the earliest timer entry is due (mono ns), or -1.
@@ -2942,7 +2946,14 @@ func rt_timer_pop(now i64) i64 {
 			timerHeap[3*i+1] = lt
 			timerHeap[3*i+2] = lg
 		}
-		if t != 0 && gen == t[tGen] && t[tWaiting] != 0 {
+		t[tTimers]--
+		if t[tRetired] != 0 {
+			if t[tTimers] == 0 {
+				free(t)
+			}
+			continue
+		}
+		if gen == t[tGen] && t[tWaiting] != 0 {
 			t[tWaiting] = 0
 			t[tGen]++
 			if t[tWaitFd] >= 0 {
