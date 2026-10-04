@@ -32,7 +32,7 @@ Tests: `tests/v2/seal_p256.tin` (Go twin `bench/ref/seal_p256`), and Wycheproof
 
 ## Signatures and certificates (#124 phase 2)
 
-API: `VerifyPKCS1v15`, `VerifyPSS`, `VerifyECDSA`, `RSAKeyBits`, `ParseRSAPublicKeyDER`, `DecodePEM`
+API: `VerifyPKCS1v15`, `VerifyPSS`, `VerifyECDSA`, `VerifyEd25519`, `RSAKeyBits`, `ParseRSAPublicKeyDER`, `DecodePEM`
 (`PEMBlock`), `ParseCertificate`, `ParseCertificatesPEM`, `Certificate` (with `Name`,
 `SignatureAlgorithm`, `PublicKeyAlgorithm`, the `KeyUsage*` and `ExtKeyUsage*` constants),
 `Certificate.Verify` (`VerifyOptions`), `CheckSignature`, `CheckSignatureFrom`,
@@ -49,13 +49,16 @@ API: `VerifyPKCS1v15`, `VerifyPSS`, `VerifyECDSA`, `RSAKeyBits`, `ParseRSAPublic
 - ECDSA: P-256 on `p256.tin`'s points and `p256n`; P-384 on `p384.tin`, the same complete
   formulas written once over a curve value with a `monty_new` field. u1*G + u2*Q uses 4-bit
   windows skipping zero digits (public data). P-521 is not supported (no Web PKI root uses it).
-- Gaps: Ed25519 (waits for the 25519 field of X25519),
+- Ed25519 (`ed25519.tin`) runs on `x25519.tin`'s field: extended coordinates, the unified
+  addition formula, RFC 8032 decompression with `fe_pow22523`, and a cofactorless check that
+  [S]B - [k]A encodes to R with S below L, as Go's crypto/ed25519 does.
+- Gaps:
   name constraints on email, URI and directory names (a CA with them is refused when the leaf
   has such names), CRLs and OCSP. Speed: RSA-2048 verification takes about 0.9 ms on Linux
   x86-64 against Go's 30 us; a faster `monty.mul` (one pass per row over raw words) halves it.
 
 Tests: `tests/v2/seal_wycheproof.tin` (13 Wycheproof RSA files), `seal_wycheproof_ecdsa.tin`
-(5 ECDSA files), `tests/v2/seal_x509.tin`
+(5 ECDSA files), `seal_wycheproof_ed25519.tin`, `tests/v2/seal_x509.tin`
 (46 chain cases), `tests/v2/seal_certinfo.tin` (fields, IP parsing, PEM, host names), each
 with a Go twin, and `tools/ci/x509_check.py` (fresh PKI, mutated certificates, system roots).
 ## X25519 and ChaCha20-Poly1305 (#124 phase 1)
