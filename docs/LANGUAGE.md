@@ -49,6 +49,7 @@ import "say"          // the standard library: lib/say ... lib/wire
 import "./geom"       // relative to this file: ./geom.tin, or every .tin file in ./geom/
 import "util"         // not in the standard library: <directory of the program>/util(.tin)
 import u "util"       // with an alias
+import "github.com/ana/geo"  // a dependency, by path: only from vendor/github.com/ana/geo
 ```
 
 - A package is a file `name.tin` or a directory of `.tin` files. Directory files are read
@@ -66,6 +67,12 @@ import u "util"       // with an alias
   a compile error. Code the compiler generates (JSON encoding, printing, `keep`) may read
   private fields.
 - Imports must not form a cycle.
+- **Dependencies** are imported by path: an import whose first element contains a dot
+  (`"github.com/ana/geo"`) is read only from `vendor/<path>` in the program's directory,
+  never from the standard library or the network. `tin vendor` copies the packages
+  `tin.mod` requires there, and `tin.lock` records each vendored file's SHA-256; a file
+  whose hash differs is a compile error (docs/PACKAGES.md). Two import paths cannot load
+  different packages with the same name.
 
 ### Program start
 
