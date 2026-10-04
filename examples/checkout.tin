@@ -1,0 +1,52 @@
+package main
+
+import "anvil"
+import "fault"
+import "quarry"
+import "redis"
+import "wire"
+
+// A checkout service, and how to replay one of its failures (#242, notes/design_semantics.md
+// §12). POST /checkout/{id} reads the cart from Redis (REDIS_ADDR) and charges it at the payment
+// service (PAYMENTS_URL); a charge that fails answers 500.
+//
+// Record: with a spool and a key, anvil keeps the capsule of every failed request.
+//   TIN_REPLAY_DIR=spool TIN_REPLAY_KEY=$(openssl rand -hex 32) tin examples/checkout.tin
+// Replay: the same request runs again with every effect served from its capsule. Redis and the
+// payment service are not contacted, so neither has to be running.
+//   TIN_REPLAY_KEY=... tin replay spool/<capsule>.tcap --against examples/checkout.tin
+var cache = redis.Open(redis.Options{Addr: quarry.Getenv("REDIS_ADDR"), Password: quarry.Getenv("REDIS_PASSWORD")})
+
+func checkout(q anvil.Req, w mut anvil.Out) {
+	id := q.PathParam("id")
+	items, found := cache.Get("cart:" + id) catch err {
+		w.Status(502)
+		w.Text("cart: " + fault.Message(err) + "\n")
+		return
+	}
+	if !found {
+		w.Status(404)
+		w.Text("no cart " + id + "\n")
+		return
+	}
+	r := wire.Post(quarry.Getenv("PAYMENTS_URL") + "/charge", "text/plain", "cart=" + items) catch err {
+		w.Status(500)
+		w.Text("charge failed: " + fault.Message(err) + "\n")
+		return
+	}
+	if r.Status != 200 {
+		w.Status(500)
+		w.Text("charge failed: payments answered {r.Status}\n")
+		return
+	}
+	w.Text("paid " + r.Body + " for " + items + "\n")
+}
+
+func main() {
+	r := anvil.NewRouter()
+	r.Post(`/checkout/{id}`, checkout)
+	err := r.Serve(":9186")
+	if err != nil {
+		panic(fault.Message(err))
+	}
+}

@@ -779,6 +779,88 @@ def secret_queries(work, env):
     print('PASS replay secret queries: secret query values are sent as themselves and keyed by their handles; replay matches')
 
 
+def fake_payments(conn):
+    """A payment service that declines: every charge gets a 502."""
+    data = b''
+    while b'\r\n\r\n' not in data:
+        chunk = conn.recv(4096)
+        if not chunk:
+            return
+        data += chunk
+    head, _, body = data.partition(b'\r\n\r\n')
+    length = 0
+    for line in head.split(b'\r\n')[1:]:
+        name, _, value = line.partition(b':')
+        if name.strip().lower() == b'content-length':
+            length = int(value)
+    while len(body) < length:
+        body += conn.recv(4096)
+    reply = b'payments: card declined'
+    conn.sendall(b'HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\nContent-Length: ' +
+                 str(len(reply)).encode() + b'\r\nConnection: close\r\n\r\n' + reply)
+
+
+def checkout_example(work, env):
+    """#242's done-when: examples/checkout.tin records a real 500 (Redis and the payment service
+    live), and `tin replay` reproduces it from the capsule with both of them gone."""
+    exe = work / 'checkout'
+    subprocess.run([str(ROOT / 'bin/tinc'), '-o', str(exe), 'examples/checkout.tin'],
+                   check=True, env=env, cwd=ROOT, timeout=60)
+    failures = []
+    check = lambda name, got, want: got == want or failures.append(f'{name}: got {got!r}, want {want!r}')
+    (rsock, rcount), (psock, pcount) = serve_thread(fake_redis), serve_thread(fake_payments)
+    spool = work / 'spool-checkout'
+    port = free_port()
+    run_env = {k: v for k, v in os.environ.items() if not k.startswith('TIN_REPLAY_')}
+    run_env.update(PORT=str(port), TIN_CORES='1', TIN_REPLAY_DIR=str(spool), TIN_REPLAY_KEY=CAPSULE_KEY.hex(),
+                   REDIS_ADDR='127.0.0.1:%d' % rsock.getsockname()[1],
+                   PAYMENTS_URL='http://127.0.0.1:%d' % psock.getsockname()[1])
+    server = subprocess.Popen([str(exe)], env=run_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        for _ in range(200):
+            try:
+                socket.create_connection(('127.0.0.1', port), timeout=0.1).close()
+                break
+            except OSError:
+                time.sleep(0.05)
+        answer = http(port, b'POST /checkout/7 HTTP/1.1\r\nHost: shop\r\nContent-Length: 0\r\n'
+                            b'Connection: close\r\n\r\n')
+    finally:
+        server.send_signal(signal.SIGTERM)
+        out, err = server.communicate(timeout=30)
+        rsock.close()
+        psock.close()
+    body = 'charge failed: payments answered 502\n'
+    check('live answer', (answer.split(b' ')[1], answer.split(b'\r\n\r\n', 1)[-1].decode()), (b'500', body))
+    check('live calls', (rcount['conns'], pcount['conns']), (1, 1))
+    capsules = sorted(spool.glob('*.tcap')) if spool.exists() else []
+    check('capsules kept', len(capsules), 1)
+    if capsules:
+        c = decode_body(open_capsule(capsules[0].read_bytes()))
+        check('recorded effects', [e[1] for e in c['effects'] if not e[1].startswith('sched.')],
+              ['redis@1', 'wire.http@1'])
+        # The same configuration, and both servers gone: a live call would be refused and give
+        # another answer. tin replay builds the example itself.
+        drive_env = {k: v for k, v in run_env.items() if not k.startswith('TIN_REPLAY_')}
+        drive_env.pop('PORT', None)
+        drive_env['TIN_REPLAY_KEY'] = CAPSULE_KEY.hex()
+        replay = [str(ROOT / 'tin'), 'replay', str(capsules[0]), '--against', 'examples/checkout.tin']
+        r = subprocess.run(replay, capture_output=True, text=True, timeout=120, env=drive_env, cwd=ROOT)
+        log = r.stdout + r.stderr
+        check('tin replay', (r.returncode, r.stdout), (0, 'replay: status 500 (recorded 500)\n' + body))
+        check('calls during replay', (rcount['conns'], pcount['conns']), (1, 1))
+        # Another payment service URL changes the charge's call: replay reports it, calls nothing.
+        r = subprocess.run(replay, capture_output=True, text=True, timeout=120, cwd=ROOT,
+                           env=dict(drive_env, PAYMENTS_URL='http://127.0.0.1:9'))
+        log += r.stdout + r.stderr
+        check('another URL diverges', (r.returncode, 'divergence at effect 2: got wire.http@1 "POST http://127.0.0.1:9/charge' in r.stdout),
+              (3, True))
+        (ROOT / 'bin/ci/replay/checkout.log').write_text(log)
+    if failures:
+        raise SystemExit('FAIL replay checkout example:\n' + '\n'.join(failures) + '\n' + err.decode())
+    print('PASS replay checkout example: a recorded 500 replays through tin replay with Redis and the payment service gone')
+
+
 def main():
     out = ROOT / 'bin/ci/replay'
     out.mkdir(parents=True, exist_ok=True)
@@ -804,6 +886,7 @@ def main():
         clients(work, env)
         more_clients(work, env)
         secret_queries(work, env)
+        checkout_example(work, env)
     print('PASS replay tapes: record, replay without live calls, fault identity, divergence, live kinds, children share the tape, panics on it')
 
 
