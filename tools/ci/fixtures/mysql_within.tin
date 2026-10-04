@@ -1,0 +1,75 @@
+package main
+
+import "anvil"
+import "fault"
+import "mint"
+import "mysql"
+import "quarry"
+import "say"
+import "task"
+import "tide"
+
+// A slow MySQL statement inside within blocks (#233): mysql_check.py runs it against the fake
+// server and the runner's MySQL.
+let db = mysql.Open(mysql.Options{
+	Addr: quarry.Getenv("MYSQL_ADDR"),
+	User: quarry.Getenv("MYSQL_USER"),
+	Password: quarry.Getenv("MYSQL_PASSWORD"),
+	Database: quarry.Getenv("MYSQL_DATABASE"),
+	Pool: 4,
+})
+
+fn sleep(secs f64) ! {
+	try db.Query("SELECT SLEEP({secs})")
+}
+
+// within runs a 3 s statement inside within ms milliseconds, then a short one after the block.
+fn within_ms(q anvil.Req, w mut anvil.Out) {
+	let ms = mint.Atoi(q.Param("ms")) catch _ {
+		50
+	}
+	let start = tide.Now()
+	mut left i64 = 0
+	within ms * tide.Millisecond {
+		left = (task.Deadline() - start) / tide.Millisecond
+		try sleep(3.0)
+	} catch err {
+		let took = (tide.Now() - start) / tide.Millisecond
+		sleep(0.01) catch after {
+			w.Text("after the block: {after}")
+			return
+		}
+		w.Text("{err}; {fault.Is(err, fault.DeadlineExceeded)}; deadline {left} ms; took {took} ms; after ok")
+		return
+	}
+	w.Text("never")
+}
+
+// nested puts the statement in a 10 s block inside a 50 ms one: the earlier deadline wins.
+fn nested(q anvil.Req, w mut anvil.Out) {
+	let start = tide.Now()
+	within 50ms {
+		try within 10s {
+			try sleep(3.0)
+		}
+	} catch err {
+		let took = (tide.Now() - start) / tide.Millisecond
+		w.Text("{err}; {fault.Is(err, fault.DeadlineExceeded)}; took {took} ms")
+		return
+	}
+	w.Text("never")
+}
+
+// request is the request's own deadline as task.Deadline reads it, in ms from now.
+fn request(q anvil.Req, w mut anvil.Out) {
+	w.Text("{(task.Deadline() - tide.Now()) / tide.Millisecond}")
+}
+
+fn main() {
+	mut r = anvil.NewRouter()
+	r.Get("/within", within_ms)
+	r.Get("/nested", nested)
+	r.Get("/request", request)
+	let err = r.Serve(":0")
+	say.Line("server:", err)
+}

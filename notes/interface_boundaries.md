@@ -143,7 +143,7 @@ A deadline is a cancellation scheduled in advance: when it passes, the runtime c
 | function | does |
 |---|---|
 | `rt_bnd_cancel(b i64, reason fault)` | if `b` is not cancelled: sets `bCancel = reason`, `bOrigin = b` on `b`, and on every descendant not already cancelled sets the same reason with `bOrigin = b`; ends the wait of every task waiting inside `b`'s subtree (`rt_task_interrupt`); sets `ctxWatch = -1` if the running task is inside it (section 6). The first reason wins; cancelling again does nothing. |
-| `rt_bnd_canceled(b i64) i64` | the reason as a fault word, or 0. `task.Canceled()` is this on the current boundary, after `rt_bnd_check`. |
+| `rt_bnd_canceled(b i64) i64` | the reason as a fault word, or 0. `task.Canceled()` tests this on the current boundary, after `rt_bnd_check`, and gives the fault a wait would fail with (`rt_wait_fault()`, so `fault.Is(c, fault.Canceled)` holds for a cancel) (#233). |
 | `rt_bnd_check()` | cancels the deadline owner if the current effective deadline has passed (one clock read); used by `task.Canceled()` and after a wait ends by its deadline. |
 | `rt_bnd_stopped() bool` | `rt_bnd_check()`, then whether the current boundary is cancelled: for code that reads `tDeadline` itself (DNS, PBKDF2, `postgres` budgets, `rt_helper_run`). |
 | `rt_task_interrupt(t i64)` | ends any wait of `t` (fd, timer or park) as `waitDeadline` and queues `t` to run; does nothing if `t` is not waiting. Internal to cancel. |
