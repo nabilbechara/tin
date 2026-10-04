@@ -172,6 +172,22 @@ Mixed demo (`examples/demo.tin` vs `examples/demo_go`): 0.80 s against 1.01 s.
 
 binary-trees uses 917 MB against 37 MB: a plain program never resets its pool.
 
+### Signed division by ten (native Linux amd64)
+
+The dedicated `div10q` and `rem10` benchmarks isolate signed `/ 10` and `% 10` in a
+100-million-iteration loop. On the shared GitHub runner (Intel Xeon Platinum 8370C,
+Go 1.26.8),
+the head uses multiply-high lowering while the base uses hardware division:
+
+| operation | base Tin ms | head Tin ms | Go ms | head/base | head Tin/Go |
+|---|---:|---:|---:|---:|---:|
+| signed `i64 / 10` | 288.89 | 94.01 | 93.6 | 0.325 | 1.00 |
+| signed `i64 % 10` | 288.95 | 118.62 | 120.8 | 0.411 | 0.98 |
+
+The benchmark harness checks output on every timed run. The full CPU suite stayed within
+the 5% review threshold. HTTP throughput was 2.6% above base for `/json` and 2.2% below
+base for `/plaintext`; arm64 is unchanged by this x64-only lowering.
+
 ## 3. Where Go still wins, and why
 
 From `notes/bench_v2.md`, which has the assembly analysis:
@@ -182,13 +198,14 @@ From `notes/bench_v2.md`, which has the assembly analysis:
     fields are reloaded;
   - a few bounds checks the prover cannot remove (`j < n` where `n == len(s)` is only
     known through a separate variable).
-- **string building:** `append` of a single byte still checks capacity per call;
-  `% 10` uses a division where Go multiplies by a magic constant.
+- **string building:** `append` of a single byte still checks capacity per call. Signed
+  `/10` and `%10` use multiply-high on x64; the arm64 backend and other divisors still
+  use hardware division.
 - **Constant materialization:** 64-bit constants are rebuilt with movz/movk inside
   loops.
 
 Planned codegen work in order of payoff: a register allocator with loop-depth spill
-weights, length-fact bounds-check elimination, division by constants via
+weights, length-fact bounds-check elimination, generalized division by constants via
 multiply-high, hoisting constant materialization, and alias information for struct
 fields.
 
