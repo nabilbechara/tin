@@ -669,6 +669,28 @@ example.tin:4:8: error E103 UNDEFINED: undefined type 'Count'
 
 Fix: declare the name before using it, correct its spelling, or import its package.
 
+### E104 PRIVATE
+
+A lower-case name is private to its package: only capitalized names, methods and fields
+are exported.
+
+```tin
+package main
+
+import "twine"
+
+func main() {
+	_ = twine.isASCII("abc")
+}
+```
+
+```text
+example.tin:6:11: error E104 PRIVATE: function isASCII is private to twine: only capitalized names are exported
+```
+
+Fix: use the package's exported API (docs/STDLIB.md); in your own package, capitalize the
+name to export it.
+
 ### E110 UNKNOWN_PACKAGE
 
 An import path names a package in `vendor/`, in the standard library, or next to the
@@ -893,6 +915,142 @@ example.tin:11:6: error E210 ARG_COUNT: Max expects 2 arguments, got 3
 Fix: pass one argument per parameter; to take any number of values, declare the last
 parameter variadic (`xs ...T`) or pass a slice.
 
+### E211 VARIADIC_ARG
+
+`xs...` passes a slice as the variadic parameter, so it is the last argument of a call.
+
+```tin
+package main
+
+func sum(base i64, xs ...i64) i64 {
+	return base
+}
+
+func main() {
+	xs := []i64{1, 2}
+	_ = sum(xs..., 3)
+}
+```
+
+```text
+example.tin:9:12: error E211 VARIADIC_ARG: ... is only allowed on the last argument of a call
+```
+
+Fix: put the spread slice last, and pass the other values before it.
+
+### E213 FIELD
+
+A selector reads a field the struct declares; an enum's values are read with `switch` or
+`match`, and other types have no fields.
+
+```tin
+package main
+
+type User struct {
+	Name str
+}
+
+func main() {
+	u := User{Name: "ada"}
+	_ = u.Email
+}
+```
+
+```text
+example.tin:9:7: error E213 FIELD: User has no field Email
+```
+
+Fix: correct the field name, or add the field to the struct.
+
+### E214 METHOD
+
+A method call names a method of the value's type (or of its shape, for a `dyn` value).
+
+```tin
+package main
+
+type User struct {
+	Name str
+}
+
+func main() {
+	u := User{Name: "ada"}
+	u.Save()
+}
+```
+
+```text
+example.tin:9:3: error E214 METHOD: User has no method Save
+```
+
+Fix: correct the method name, or declare the method (`func (u User) Save()`).
+
+### E215 NOT_CALLABLE
+
+Only functions and function values can be called.
+
+```tin
+package main
+
+func main() {
+	n := 3
+	n()
+}
+```
+
+```text
+example.tin:5:2: error E215 NOT_CALLABLE: 'n' is not a function
+```
+
+Fix: call a function; to convert, write the type (`i64(x)`).
+
+### E216 COMPOSITE
+
+A composite literal names its type (`T{...}`), sets fields of a struct by name, gives keys
+in a map literal, and builds only structs, slices, arrays and maps; an enum value is built
+with a variant (`Shape.Circle(2)`).
+
+```tin
+package main
+
+type Point struct {
+	X i64
+	Y i64
+}
+
+func main() {
+	p := Point{X: 1, Z: 2}
+	_ = p
+}
+```
+
+```text
+example.tin:9:19: error E216 COMPOSITE: unknown field 'Z'
+```
+
+Fix: set the fields the struct declares, by name.
+
+### E217 BUILTIN_ARGS
+
+The builtins take fixed kinds of arguments: `len(x)`, `append(s, v...)` on a slice,
+`make([]T, n)` or `make(map[K]V)`, `copy(dst, src)`, `delete(m, k)`, `panic(v)` and
+`keep(v)`.
+
+```tin
+package main
+
+func main() {
+	m := map[str]i64{}
+	delete(m)
+}
+```
+
+```text
+example.tin:5:2: error E217 BUILTIN_ARGS: delete needs a map and a key
+```
+
+Fix: give the builtin the arguments it takes (`delete(m, "k")`).
+
 ### E220 NOT_CONSTANT
 
 A constant's value, an array length and a constant expression are computed by the compiler,
@@ -957,6 +1115,25 @@ example.tin:4:19: error E222 DIVISION_BY_ZERO: division by zero in constant expr
 
 Fix: divide by a constant that is not zero.
 
+### E223 CONST_OVERFLOW
+
+A constant fits the type it becomes: `300` is not a `u8`.
+
+```tin
+package main
+
+func main() {
+	var b u8 = 300
+	_ = b
+}
+```
+
+```text
+example.tin:4:13: error E223 CONST_OVERFLOW: constant 300 overflows u8
+```
+
+Fix: use a wider type, or a value in range.
+
 ### E230 TYPE_MISMATCH
 
 A value is used where its type is expected: there are no implicit conversions, so an `i64`
@@ -977,6 +1154,28 @@ example.tin:4:14: error E230 TYPE_MISMATCH: cannot use str as i64
 
 Fix: convert explicitly (`i64(x)`, `str(b)`, `mint.Atoi(s)`), or give the variable the
 value's type.
+
+### E231 CONVERSION
+
+A conversion `T(x)` changes a value between number types, between a number and a rune or
+byte, or between `str` and `[]u8`; other conversions do not exist.
+
+```tin
+package main
+
+func main() {
+	s := "12"
+	n := i64(s)
+	_ = n
+}
+```
+
+```text
+example.tin:5:7: error E231 CONVERSION: cannot convert str to i64
+```
+
+Fix: parse text with `mint.Atoi(s)` (or `mint.ParseFloat`), and format a number with
+`say.Str(n)`.
 
 ### E232 CONDITION
 
@@ -1015,7 +1214,7 @@ func main() {
 ```
 
 ```text
-example.tin:4:7: error: nil needs an optional (?T) or fault type
+example.tin:4:7: error E233 UNTYPED_NIL: nil needs an optional (?T) or fault type
 example.tin:4:7: error E233 UNTYPED_NIL: use of untyped nil
 ```
 
@@ -1050,6 +1249,123 @@ example.tin:13:2: error E234 VALUE_COUNT: assignment count mismatch
 ```
 
 Fix: give as many names as there are values (use `_` for the ones you do not need).
+
+### E235 NOT_A_VALUE
+
+A type, or a package name on its own, is not a value.
+
+```tin
+package main
+
+import "say"
+
+func main() {
+	x := say
+	_ = x
+}
+```
+
+```text
+example.tin:6:7: error E235 NOT_A_VALUE: use of package 'say' without a selector
+```
+
+Fix: select from the package (`say.Line`), or build a value of the type (`T{}`).
+
+### E236 OPERATOR
+
+Each operator works on its own kinds of operands: arithmetic on numbers (and `+` on
+`str`), `%`, bit operators and shifts on integers, `!`, `&&` and `||` on `bool`, and `<`,
+`<=`, `>`, `>=` on numbers and `str`.
+
+```tin
+package main
+
+func main() {
+	ok := true
+	n := 3
+	if ok && n {
+		n = 0
+	}
+}
+```
+
+```text
+example.tin:6:8: error E236 OPERATOR: operands of && and || must be bool
+```
+
+Fix: compare to get a `bool` (`n != 0`), or convert the operand.
+
+### E237 COMPARE
+
+`==` and `!=` compare values of one type that have equality: numbers, `bool`, `str`,
+structs (by identity), and enums whose variants hold such values. `dyn` values and
+functions do not compare.
+
+```tin
+package main
+
+type Job enum {
+	Run(f func()),
+	Idle,
+}
+
+func main() {
+	a := Job.Idle
+	b := Job.Idle
+	_ = a == b
+}
+```
+
+```text
+example.tin:11:8: error E237 COMPARE: cannot compare Job values: a variant holds func(), which has no value equality
+```
+
+Fix: compare the parts that have equality, or give the type a method that compares.
+
+### E238 INDEX
+
+`x[i]` indexes a slice, an array, a `str` or a map, with an integer index (a map takes its
+key type); slicing `x[a:b]` works on slices, arrays and `str`.
+
+```tin
+package main
+
+func main() {
+	xs := []i64{1, 2, 3}
+	_ = xs["1"]
+}
+```
+
+```text
+example.tin:5:8: error E238 INDEX: index must be an integer, not str
+```
+
+Fix: index with an integer (convert with `mint.Atoi` or `i64(x)`).
+
+### E239 VARIANT
+
+An enum value is built with one of its variants, passing exactly the values it declares.
+
+```tin
+package main
+
+type Shape enum {
+	Circle(r f64),
+	Rect(w, h f64),
+}
+
+func main() {
+	s := Shape.Rect(2)
+	_ = s
+}
+```
+
+```text
+example.tin:9:12: error E239 VARIANT: Shape.Rect takes 2 values, got 1
+```
+
+Fix: pass every value of the variant (`Shape.Rect(2, 3)`), or use a variant the enum
+declares.
 
 ### E240 SECRET_TYPE
 
@@ -1238,6 +1554,28 @@ example.tin:8:11: error E251 UNCHECKED_BOUND: cannot use str as str max 8: its l
 Fix: check the length with `bound`, which fails with `fault.LimitExceeded` when it does not
 fit: `u.name = try bound(raw)`.
 
+### E252 BOUND_CALL
+
+`bound(x)` checks one value against the bounded type it is stored into, so it needs a
+destination whose type is bounded (`str max N`), and a value of that kind.
+
+```tin edition=1
+package main
+
+fn check(raw str) ! {
+	try bound(raw)
+}
+
+fn main() {
+}
+```
+
+```text
+example.tin:4:6: error E252 BOUND_CALL: bound needs a bounded destination to check against: write its type (let v str max 100 = try bound(x))
+```
+
+Fix: write the bounded type: `let b str max 100 = try bound(raw)`.
+
 ### E260 MISSING_RETURN
 
 A function with results ends with a `return` (or `fail`, `panic`, or an `if`/`switch`/loop
@@ -1378,6 +1716,55 @@ example.tin:8:6: error E280 QUERY: a query takes a string literal: put values in
 ```
 
 Fix: write the value in the literal: `run("SELECT name FROM users WHERE id = {id}")`.
+
+### E281 ARGO
+
+`argo.Put(mut buf, v)` appends JSON for a value to a `[]u8`, and `argo.Get(text, mut v)`
+fills a struct, slice or map from JSON; both need `import "argo"` and a type argo can
+encode (no functions, `dyn` values or maps with other keys than `str` and integers).
+
+```tin
+package main
+
+import "argo"
+
+type Job struct {
+	Run func()
+}
+
+func main() {
+	buf := []u8{}
+	argo.Put(mut buf, Job{Run: main})
+}
+```
+
+```text
+example.tin:11:6: error E281 ARGO: argo cannot encode values of type func()
+```
+
+Fix: encode a struct of plain data (numbers, `str`, `bool`, slices, maps, structs and
+enums of those).
+
+### E282 FORMAT
+
+`say.Out`, `say.Fmt` and the other printf-style calls take a format string first.
+
+```tin
+package main
+
+import "say"
+
+func main() {
+	n := 3
+	say.Out(n)
+}
+```
+
+```text
+example.tin:7:10: error E282 FORMAT: format must be a str
+```
+
+Fix: pass the format first (`say.Out("%d\n", n)`), or use `say.Line(n)`.
 
 ### E290 MATCH_PATTERN
 
@@ -1620,6 +2007,40 @@ example.tin:9:11: error E313 USE_AFTER_RESET: 's' may hold request memory from b
 
 Fix: `keep()` the value before the reset, or create it again after.
 
+### E314 DETACH_ESCAPE
+
+A `detach` block runs as a task that outlives the request that started it, so what it
+captures must already be long-lived: request memory is an error unless it was kept first,
+or the block reads it only inside `keep()`.
+
+```tin edition=1
+package main
+
+mut flushed str = ""
+
+fn flush(s str) {
+	flushed = keep(flushed + s)
+}
+
+fn later(n i64) {
+	let msg = "job {n}"
+	detach {
+		flush(msg)
+	}
+}
+
+fn main() {
+	later(1)
+}
+```
+
+```text
+example.tin:11:2: error E314 DETACH_ESCAPE: detach captures 'msg', which may hold request memory, but the detached task outlives the request: keep() it before the block (let v = keep(...)), or read it in the block only inside keep()
+```
+
+Fix: `let kept = keep(msg)` before the block and use `kept` in it, or write `keep(msg)`
+inside the block.
+
 ### E320 KEEP_TYPE
 
 `keep(x)` copies a value into the long-lived heap, following every reference in it; a type
@@ -1693,6 +2114,30 @@ example.tin:3:1: error E402 FAULT_RESULT: write a result that can fail as !T (or
 ```
 
 Fix: write `func parse() !i64`, `return v` on success and `fail "msg"` on failure.
+
+### E403 TRY_PLACEMENT
+
+`try` passes a fault upward from a whole statement, initializer, assignment or return
+value, not from the middle of an expression.
+
+```tin
+package main
+
+import "mint"
+
+func double(s str) !i64 {
+	return 2 * try mint.Atoi(s)
+}
+
+func main() {
+}
+```
+
+```text
+example.tin:6:13: error E403 TRY_PLACEMENT: try is only allowed as a statement, an initializer, an assignment or a return
+```
+
+Fix: give the call its own line (`n := try mint.Atoi(s)`), then use `n`.
 
 ### E410 UNCHECKED_FAULT
 
@@ -1859,6 +2304,29 @@ example.tin:5:3: error E416 FAIL_VALUE: fail needs a str message or a fault, not
 
 Fix: `fail "negative count"`, or `fail say.Fault("bad count %d", n)`.
 
+### E417 SENTINEL
+
+`fault("msg")` declares a sentinel fault that callers compare against: it is written at
+package level, as `var ErrX = fault("msg")`, with a `str` message.
+
+```tin
+package main
+
+func find() ! {
+	fail fault("not found")
+}
+
+func main() {
+}
+```
+
+```text
+example.tin:4:7: error E417 SENTINEL: fault("...") declares a sentinel: write it at package level as var ErrX = fault("msg"), or use fail("msg") for a one-off fault
+```
+
+Fix: declare `var ErrNotFound = fault("not found")` and `fail ErrNotFound`, or use
+`fail "not found"` for a one-off fault.
+
 ### E420 OPTIONAL_TYPE
 
 Only references can be optional (`?T`): `str`, slices, maps, structs and `dyn` values. A
@@ -1880,6 +2348,32 @@ example.tin:3:13: error E420 OPTIONAL_TYPE: only references (str, slices, maps, 
 
 Fix: use a separate `bool` (or `v, ok`) for a missing number, or keep the number in a
 struct and make the struct optional.
+
+### E421 UNCHECKED_OPTIONAL
+
+An optional (`?T`) may be nil, so its fields and methods are used only after a check
+against nil narrows it.
+
+```tin
+package main
+
+type User struct {
+	Name str
+}
+
+func show(u ?User) {
+	_ = u.Name
+}
+
+func main() {
+}
+```
+
+```text
+example.tin:8:7: error E421 UNCHECKED_OPTIONAL: cannot use a field of optional ?User before checking it against nil
+```
+
+Fix: check it first: `if u != nil { return u.Name }`.
 
 ## E5xx Generics, shapes and dyn
 
@@ -2572,6 +3066,129 @@ example.tin:9:1: error E640 SCOPE_ESCAPE: a function cannot return a task handle
 
 Fix: wait for the task inside the scope block, and return its value rather than its handle.
 
+### E650 BOUNDARY
+
+A boundary block (`within`, `limit`, `guard`) gives its value with its last expression and
+leaves early only with `fail`; `limit` bounds `memory` and `tasks`.
+
+```tin edition=1
+package main
+
+fn work() ! {
+	try limit cpu 2 {
+	}
+}
+
+fn main() {
+}
+```
+
+```text
+example.tin:4:6: error E650 BOUNDARY: limit bounds are memory and tasks, not 'cpu'
+```
+
+Fix: bound `memory` and `tasks` only (`limit memory 4mb, tasks 8 { ... }`); end a block
+with its value, and leave it early only with `fail`.
+
+### E651 PARALLEL
+
+`parallel { ... }` runs two or more lines as child tasks, and each line is an expression
+that gives one value.
+
+```tin edition=1
+package main
+
+fn one() !i64 {
+	return 1
+}
+
+fn work() ! {
+	parallel {
+		one()
+		let n = 2
+	}
+}
+
+fn main() {
+}
+```
+
+```text
+example.tin:10:3: error E651 PARALLEL: each line of parallel is an expression that runs as a child task
+```
+
+Fix: make each line an expression (a call, or a value), with at least two lines; compute
+other values before the block.
+
+### E652 POLICY
+
+`with p { ... }` runs the block through a policy: a value of a concrete type with a method
+`Run(body func() !T) !T`, whose body gives what the block gives.
+
+```tin edition=1
+package main
+
+import "say"
+
+type Plain struct {
+	n i64
+}
+
+fn work() ! {
+	let p = Plain{n: 1}
+	try with p {
+		say.Line("work")
+	}
+}
+
+fn main() {
+}
+```
+
+```text
+example.tin:11:11: error E652 POLICY: Plain is not a policy: with needs a value with a method Run(body func() !T) !T
+```
+
+Fix: use a policy from the `policy` package (`policy.Retry(3)`), or give the type the `Run`
+method.
+
+### E653 POLICY_BODY
+
+A policy's `Run` may only call its `body`, or pass it to a function that only calls it:
+the block's variables live on the caller's frame, so a body kept for later would outlive
+them.
+
+```tin edition=1
+package main
+
+import "say"
+
+type Saver struct {
+	saved []fn() !i64
+}
+
+fn (s mut Saver) Run(body fn() !i64) !i64 {
+	s.saved = append(s.saved, body)
+	return try body()
+}
+
+fn main() {
+	mut s = Saver{saved: []fn() !i64{}}
+	let a = with s {
+		1
+	} catch _ {
+		0
+	}
+	say.Line(a)
+}
+```
+
+```text
+example.tin:10:28: error E653 POLICY_BODY: Saver.Run keeps the body of a with block: a policy may only call body, or pass it to a function that only calls it (the block's variables live on the caller's frame)
+```
+
+Fix: call `body()` inside `Run` (as often as the policy needs) and keep only its results.
+
 ## E7xx mut parameters
 
 ### E701 NOT_MUT
@@ -2677,6 +3294,30 @@ example.tin:8:2: error E704 MUT_PARAM_REBIND: cannot assign to mut parameter 'b'
 
 Fix: change the fields (`b.n = 0`), or return the new value.
 
+### E705 MUT_ARG
+
+A call writes `mut` before an argument exactly when the parameter is `mut`, so every
+change a function can make to its arguments shows at the call.
+
+```tin
+package main
+
+func add(xs mut []i64, v i64) {
+	xs = append(xs, v)
+}
+
+func main() {
+	xs := []i64{}
+	add(xs, 1)
+}
+```
+
+```text
+example.tin:9:6: error E705 MUT_ARG: argument 1 of add is a mut parameter: write mut before the argument
+```
+
+Fix: write `add(mut xs, 1)`; remove `mut` before an argument whose parameter is not `mut`.
+
 ### E710 NOT_ASSIGNABLE
 
 An assignment's target is a variable, a field, or an element of a slice, array or map;
@@ -2720,6 +3361,47 @@ example.tin:3:8: error E801 TRUSTED_ONLY: extern is only allowed in the standard
 
 Fix: use the standard library package that wraps the call (`quarry` for the process and
 files).
+
+### E802 RUNTIME_INTERNAL
+
+The runtime's own functions (`rt_...`, `memset`, `cast`) are internal: programs and
+packages use the standard library instead.
+
+```tin
+package main
+
+func main() {
+	_ = rt_core_id()
+}
+```
+
+```text
+example.tin:4:6: error E802 RUNTIME_INTERNAL: 'rt_core_id' is internal to the runtime
+```
+
+Fix: use the standard library function that wraps it (`hearth.Core()` for the core).
+
+### E803 ADDRESS_OF
+
+`&x` takes the address of a variable, in the standard library only: it needs a variable
+name, not a constant or an expression.
+
+```tin
+package main
+
+const size = 4
+
+func main() {
+	_ = &size
+}
+```
+
+```text
+example.tin:6:6: error E803 ADDRESS_OF: cannot take the address of constant 'size'
+```
+
+Fix: programs pass structs, slices and maps by reference already; there is no `&` outside
+`lib/`.
 
 ## E9xx Building
 
