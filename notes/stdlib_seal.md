@@ -62,3 +62,18 @@ Nonces are 12 bytes only, like Go's `cipher.NewGCM`.
 
 Tests: `tests/v2/seal_aes.tin` (NIST GCM cases, every length class for all key sizes,
 tampering; Go twin `bench/ref/seal_aes`), and Wycheproof `aes_gcm` in `tools/ci/crypto_check.py`.
+
+## AES-GCM on the CPU's instructions (#124 phase 1)
+
+- `tools/arch/aes-gcm-{arm64,amd64}.S` hold three leaves (CTR with GCM's 32-bit counter,
+  GHASH, and on x86-64 the CPUID check); `tools/gen_aes_hw.py` assembles them with clang into
+  `selfhost/aes_hw.tin`, and `gen.tin` / `gen_x64.tin` emit those bytes for the placeholders
+  `seal.aes_hw_ctr`, `seal.ghash_hw` and `seal.aes_hw_cpu`, as they do for `seal.hw_blocks`.
+- GHASH bit-reverses each byte (RBIT, or PSHUFB on nibbles on x86-64) so the carry-less
+  multiply works on a plain polynomial; the reduction is two more multiplies by 0x87. The same
+  steps on both CPUs.
+- Detection: `aes_hw()` in seal_linux.tin (AT_HWCAP bits 3 and 4 on arm64, CPUID on x86-64)
+  and seal_darwin.tin (always). `TIN_SEAL_SOFT=1` forces the software path.
+- One block at a time today: about 780 MB/s for AES-128-GCM on Linux x86-64 in a shared
+  container, against several GB/s for Go's interleaved assembly; interleaving four blocks is
+  the next step.
