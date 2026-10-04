@@ -97,7 +97,7 @@ rt_arena_close(b)
 
 `arenacopy$N(x T) T` deep-copies `x` into the current pool, as `keep$N` does into the ingot
 heap. A value type that holds a func or dyn value, or a recursive type, is a compile error
-(`E315 ARENA_VALUE`).
+(`E316 ARENA_VALUE`).
 
 ## 6. Unwinding
 
@@ -120,9 +120,9 @@ Inside an arena's closure, and closures inside it:
 - slicing a slice that may be `RG_OUT` gives `RG_OUT` too: `ys := xs[a:b]` shares `xs`'s
   array, so `ys = append(ys, v)` with spare capacity would write into the outer array;
 - storing a value that may be fresh (made in the arena) into a container that may be
-  `RG_OUT`, or into a captured variable, is `E314 ARENA_ESCAPE`;
+  `RG_OUT`, or into a captured variable, is `E315 ARENA_ESCAPE`;
 - appending to, or inserting into, a slice or map that may be `RG_OUT` (and is not only
-  long-lived) is `E314 ARENA_ESCAPE` whatever the value: growth would allocate in the arena.
+  long-lived) is `E315 ARENA_ESCAPE` whatever the value: growth would allocate in the arena.
 - calls are checked from three per-function tables, iterated with the other summaries:
   the parameters a function may grow (`rg_grows`), store its own fresh memory into
   (`rg_fstores`), and store another parameter into (`rg_pstores`), so `setLabel(mut box, s)`
