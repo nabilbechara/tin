@@ -194,6 +194,9 @@ fn rg_stmt(s) {
             // The slot gets back the object it held; the append checked what it added.
         } else if tk == EX_MEM && rg_cell_index(t[MEM_BASE]) >= 0 {
             rg_cell_store(rg_cell_index(t[MEM_BASE]), v, t[N_TYPE], s[N_POS]);
+        } else if tk == EX_MEM && rg_own_cell(t) {
+            // The parent's own store into a variable it keeps in a cell.
+            rg_local(rg_own_cell(t), v);
         } else if tk == EX_MEM {
             let c = rg_expr(t[MEM_BASE]);
             if t[MEM_INDEX] {
@@ -503,6 +506,23 @@ fn rg_store(c, co, ct, v, t, pos, gname) {
     }
 }
 
+// rg_own_cell is the variable e reads or writes when e is the word of a cell the running
+// function made for one of its own variables, which no closure that may be kept captures; or 0.
+fn rg_own_cell(e) {
+    if e[N_KIND] != EX_MEM || e[MEM_INDEX] || e[MEM_OFF] != 0 {
+        return 0;
+    }
+    let b = e[MEM_BASE];
+    if b[N_KIND] != EX_IDENT || !b[ID_REF] {
+        return 0;
+    }
+    let os = b[ID_REF][S_CELL_OF];
+    if !os || os[S_KEPT_CAP] {
+        return 0;
+    }
+    return os;
+}
+
 // rg_cell_index is i when e is the address of captured variable i, read from the closure's
 // environment ($env word 2 + i), or -1.
 fn rg_cell_index(e) {
@@ -603,6 +623,15 @@ fn rg_expr(e) {
             return 0;
         }
         return rg_cell_bits(rg_cell_index(e[MEM_BASE]));
+    }
+    if k == EX_MEM && rg_own_cell(e) {
+        // The parent reading a variable it keeps in a cell for closures that cannot outlive it
+        // (frame-local ones and a scope's children): the variable holds what was stored in it.
+        let os = rg_own_cell(e);
+        if !has_ptr(e[N_TYPE]) {
+            return 0;
+        }
+        return os[S_REGION] | os[S_CAPBITS];
     }
     if k == EX_MEM {
         let b = rg_expr(e[MEM_BASE]);

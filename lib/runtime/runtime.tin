@@ -25,6 +25,9 @@ const ctxPoolBase = 7   // the core's first pool chunk
 const ctxPoolMark = 8   // pool top in the first chunk once allocation moved past it
 const ctxPoolExtra = 9  // overflow chunks and big blocks, freed at reset: [next, ...]
 // Words 10 and 11 hold the Linux error and vector mode; 12..31 preserve global offsets.
+const ctxPoll = 12
+const ctxWatch = 13
+const ctxRunGen = 14
 const ctxWords = 32
 
 const chunkSize = 4194304
@@ -51,6 +54,15 @@ shared var rtCoreInit func()
 shared var rtCores i64
 shared var rtCoresDone i64
 shared var rtHashK0 i64   // map hash key: random per process, so keys cannot be chosen to collide
+shared var rtWatchCores i64 // entries: context, previous generation, stopped, previous watch.
+shared var rtWatchCount i64
+shared var rtWatchCap i64
+shared var rtWatchLock i64
+shared var rtWatchStarted i64
+shared var rtPollsEnabled bool
+shared var rtWatchSignal i64 // Linux signalfd, published by anvil; never consumed here.
+shared var rtWatchGrace i64
+shared var rtWatchDrainAt i64
 shared var rtHashK1 i64
 
 func rt_init(argc i64, argv i64, ntls i64, coreinit func()) {
@@ -126,6 +138,23 @@ func rt_ctx_new(id i64) i64 {
 	ctx[ctxID] = id
 	ctx[ctxIngot] = 1
 	ctx[11] = rt_memory_vector_mode()
+	rt_lock(&rtWatchLock)
+	if rtWatchCount == rtWatchCap {
+		rtWatchCap = rtWatchCap*2 + 8
+		next := calloc(rtWatchCap, 32)
+		if rtWatchCores != 0 {
+			memcpy(next, rtWatchCores, 32*rtWatchCount)
+			free(rtWatchCores)
+		}
+		rtWatchCores = next
+	}
+	n := rtWatchCores + 32*rtWatchCount
+	n[0] = ctx
+	n[1] = 0
+	n[2] = 0
+	n[3] = 0
+	rtWatchCount++
+	rt_unlock(&rtWatchLock)
 	return ctx
 }
 
@@ -163,6 +192,82 @@ func rt_spawn_core(entry func(i64), arg i64) {
 	if pthread_create(t, attr, cast(i64, rt_core_main), p)&0xffffffff != 0 {
 		rt_panic("cannot start a core thread")
 	}
+}
+
+// rt_poll_enable is emitted at startup only for a program compiled with -polls.
+func rt_poll_enable() {
+	rtPollsEnabled = true
+	rt_watch_start()
+}
+
+// rt_watch_start starts one process-wide watchdog only when cancellable work begins.
+func rt_watch_start() {
+	if !rtPollsEnabled { return }
+	if rtWatchStarted != 0 { return }
+	if __atomic_swap(&rtWatchStarted, 1) != 0 { return }
+	t := calloc(1, 8)
+	if pthread_create(t, 0, cast(i64, rt_watch_main), 0)&0xffffffff != 0 {
+		rt_panic("cannot start the watchdog thread")
+	}
+	free(t)
+}
+
+// rt_watch_main never touches boundary records; its own context contains no Tin globals.
+func rt_watch_main(arg i64) i64 {
+	__set_ctx(rt_aligned_alloc((ctxWords + rtTLS)*8))
+	rt_sig_block_term()
+	ts := calloc(2, 8)
+	ts[1] = 1000000
+	pfd := calloc(1, 8)
+	for {
+		rt_sys_nanosleep(ts, 0)
+		now := rt_mono_ns()
+		if rtWatchSignal > 0 && rtWatchDrainAt == 0 {
+			__st(pfd, rtWatchSignal, 2)
+			__st(pfd+4, 1, 1)
+			if rt_sys_poll(pfd, 1, 0)&0xffffffff == 1 {
+				rtWatchDrainAt = now + rtWatchGrace
+			}
+		}
+		rt_lock(&rtWatchLock)
+		i := 0
+		for i < rtWatchCount {
+			n := rtWatchCores + 32*i
+			c := n[0]
+			gen := c[ctxRunGen]
+			watch := c[ctxWatch]
+			stopped := watch == -1 || (watch > 0 && now >= watch)
+			if rtWatchDrainAt > 0 && now >= rtWatchDrainAt { stopped = true }
+			if gen == n[1] && stopped && n[2] != 0 && n[3] == watch {
+				// Recheck the generation immediately before publishing a poll.
+				if c[ctxRunGen] == gen { c[ctxPoll] = 1 }
+			}
+			n[1] = gen
+			n[2] = 0
+			if stopped { n[2] = 1 }
+			n[3] = watch
+			i++
+		}
+		rt_unlock(&rtWatchLock)
+	}
+	return 0
+}
+
+// rt_watch_update publishes the running boundary's effective deadline or cancellation.
+func rt_watch_update() {
+	if !rtPollsEnabled { return }
+	b := rt_bnd_current()
+	w := b[bDeadline]
+	if b[bCancel] != 0 { w = -1 }
+	__ctx()[ctxWatch] = w
+}
+
+// rt_watch_switch clears old polls and distinguishes this run from every previous one.
+func rt_watch_switch() {
+	c := __ctx()
+	c[ctxRunGen]++
+	c[ctxPoll] = 0
+	rt_watch_update()
 }
 
 func rt_core_id() i64 {
@@ -2897,7 +3002,7 @@ func rt_task_entry() {
 	rt_task_cleanups(0)
 	rt_bnd_task_end(t)
 	// A scope's child allocates in its parent's pool (#232): that memory stays.
-	if t[tChild] == 0 {
+	if t[tChild] == 0 || t[tChild][spOwnPool] != 0 {
 		if __ctx()[ctxPoolExtra] != 0 || rt_pool_used() > 65536 { t[tTrim] = 1 }
 		rt_pool_reset()
 	}
@@ -2922,7 +3027,7 @@ func rt_task_abort(t i64) {
 	rt_task_cleanups(0)
 	rt_bnd_task_end(t)
 	// A scope's child allocates in its parent's pool (#232): that memory stays.
-	if t[tChild] == 0 {
+	if t[tChild] == 0 || t[tChild][spOwnPool] != 0 {
 		if __ctx()[ctxPoolExtra] != 0 || rt_pool_used() > 65536 { t[tTrim] = 1 }
 		rt_pool_reset()
 	}
@@ -2952,8 +3057,10 @@ func rt_task_run(t i64) bool {
 	c[ctxPoolExtra] = pw[4]
 	c[ctxFmt] = t[tFmt]
 	curTask = t
+	if rtPollsEnabled { rt_watch_switch() }
 	rt_task_swap(schedSave, t)
 	curTask = 0
+	if rtPollsEnabled { rt_watch_switch() }
 	if rt_task_sp(t) < t[tStack]+taskGuard+taskStack-16384 { t[tTrim] = 1 }
 	pw[0] = c[ctxBump]
 	pw[1] = c[ctxEnd]
@@ -2973,7 +3080,7 @@ func rt_task_run(t i64) bool {
 // rt_pool_words is where task t's pool words live: its own, or for a scope's child those of
 // the nearest task that is not a child (the core's own while a scope in main waits).
 func rt_pool_words(t i64) i64 {
-	for t != 0 && t[tChild] != 0 {
+	for t != 0 && t[tChild] != 0 && t[tChild][spOwnPool] == 0 {
 		t = t[tChild][spScope][bTask]
 	}
 	if t == 0 {
@@ -3114,13 +3221,21 @@ func rt_limit_call(body func(i64) !, r i64, mem i64, tasks i64) i64 {
 	return rt_land_call(bkLimit, body, r, mem, tasks)
 }
 
+// rt_within_call gives within a landing before its body can hit a poll.
+func rt_within_call(body func(i64) !, r i64, duration i64) i64 {
+	return rt_land_call(bkWithin, body, r, rt_mono_ns()+duration, 0)
+}
+
 // rt_land_call runs body(r) on a stack of its own inside a new boundary of the given kind, so
 // a panic (guard) or a passed budget (limit) can leave it from anywhere inside.
 func rt_land_call(kind i64, body func(i64) !, r i64, mem i64, tasks i64) i64 {
 	g := calloc(guardWords, 8)
 	b := rt_bnd_enter(kind)
 	b[bLand] = g
-	if mem > 0 || tasks > 0 {
+	if kind == bkWithin {
+		rt_watch_start()
+		rt_bnd_set_deadline(b, mem)
+	} else if mem > 0 || tasks > 0 {
 		b[bMemMax] = mem
 		b[bTaskMax] = tasks
 		b[bLimit] = b
@@ -3188,6 +3303,37 @@ func rt_guard_land(g i64, msg str) {
 	rt_land(g, rt_fault_panic("panic: "+msg, ""))
 }
 
+// rt_bnd_landing distinguishes unwind stacks from a scope's child-list word.
+func rt_bnd_landing(b i64) i64 {
+	k := b[bKind]&255
+	if k == bkWithin || k == bkGuard || k == bkLimit { return b[bLand] }
+	return 0
+}
+
+// rt_bnd_join_scopes stops and joins children before their parent's defers run.
+func rt_bnd_join_scopes(target i64, f i64) {
+	b := rt_bnd_current()
+	for b != 0 {
+		if b[bKind]&255 == bkScope {
+			rt_bnd_cancel(b, cast(fault, f))
+			for b[bLive] > 0 { rt_scope_block(b, 0) }
+		}
+		if b == target || b[bKind]&bfRoot != 0 { break }
+		b = b[bParent]
+	}
+}
+
+// rt_scope_discard releases joined child handles after the unwinding defers finish.
+func rt_scope_discard(b i64) {
+	r := b[bLand]
+	for r != 0 {
+		n := r[spNext]
+		free(r)
+		r = n
+	}
+	b[bLand] = 0
+}
+
 // rt_land unwinds to the boundary of record g, which then gives fault word f, and resumes its
 // caller: deferred calls and cleanups registered since it began run, and the boundaries
 // entered inside it are left (their own stacks go back to the cache).
@@ -3197,6 +3343,7 @@ func rt_land(g i64, f i64) {
 		rt_sys_exit(2)
 	}
 	g[gUnwinding] = 1
+	rt_bnd_join_scopes(g[gBnd], f)
 	rt_defer_run(g[gDefer])
 	if curTask != 0 {
 		rt_task_cleanups(g[gCleanup])
@@ -3204,7 +3351,8 @@ func rt_land(g i64, f i64) {
 	b := g[gBnd]
 	for rt_bnd_current() != b {
 		in := rt_bnd_current()
-		ig := in[bLand]
+		if in[bKind]&255 == bkScope { rt_scope_discard(in) }
+		ig := rt_bnd_landing(in)
 		if ig != 0 {
 			st := ig[gStack]
 			(st + taskGuard)[0] = guardStacks
@@ -3397,6 +3545,7 @@ func rt_bnd_enter(kind i64) i64 {
 	} else {
 		bndCur = b
 	}
+	rt_watch_update()
 	return b
 }
 
@@ -3413,6 +3562,7 @@ func rt_bnd_leave(b i64) {
 		bndCur = p
 	}
 	rt_bnd_unlink(b)
+	rt_watch_update()
 }
 
 // rt_bnd_task gives task t a root boundary under parent before it first runs.
@@ -3450,6 +3600,14 @@ func rt_bnd_task_end(t i64) {
 			if l != 0 {
 				l[bTaskUsed]--
 			}
+		}
+		if b[bKind]&255 == bkScope { rt_scope_discard(b) }
+		g := rt_bnd_landing(b)
+		if g != 0 {
+			st := g[gStack]
+			(st + taskGuard)[0] = guardStacks
+			guardStacks = st
+			free(g)
 		}
 		rt_bnd_unlink(b)
 		if root {
@@ -3494,6 +3652,7 @@ func rt_bnd_set_deadline(b i64, at i64) {
 		}
 		d = d[bNext]
 	}
+	rt_watch_update()
 }
 
 // rt_bnd_charge counts n pool bytes against every memory budget around the running code. Past
@@ -3566,7 +3725,8 @@ const spScope = 5
 const spNext = 6
 const spCanceled = 7 // cancelled through its handle: its fault is not the scope's
 const spArg = 8      // 1 + the argument of a body that takes one (parallel's result cell)
-const spWords = 9
+const spOwnPool = 9  // a detached task: its own pool, and its fault is logged, not passed on
+const spWords = 10
 
 // rt_scope_open starts a scope boundary inside the current one.
 func rt_scope_open() scope {
@@ -3636,6 +3796,94 @@ func rt_scope_close_word(b i64) i64 {
 func rt_scope_spawn_arg(b i64, body func(i64) !, arg i64) {
 	h := scope{b: b}.spawn(cast(func() !, cast(i64, body)))
 	h.r[spArg] = arg + 1
+}
+
+// rt_detach starts f as a task in the core's background boundary (detach { }, #232). It has
+// its own pool, outlives the request that started it, runs when the core's event loop turns,
+// and is cancelled with the rest of the core by the drain. Its fault is logged.
+func rt_detach(f func() !) {
+	b := rt_bnd_background()
+	r := calloc(spWords, 8)
+	r[spBody] = cast(i64, f)
+	r[spScope] = b
+	r[spOwnPool] = 1
+	t := rt_task_new(rt_child_main, r)
+	r[spTask] = t
+	if rt_bnd_task(t, b, bkTask) != nil {
+		rt_task_free(t)
+		free(r)
+		return
+	}
+	t[tChild] = r
+	rt_task_recover(t)
+	b[bLive]++
+	rt_task_queue(t)
+}
+
+// ---- select (#232): the runtime side of the lowering in check.tin ----
+
+// rt_select_deadline is when an after(d) arm becomes ready (mono ns).
+func rt_select_deadline(d i64) i64 {
+	return rt_mono_ns() + d
+}
+
+// rt_select_due reports whether an after arm's time has come.
+func rt_select_due(at i64) bool {
+	return rt_mono_ns() >= at
+}
+
+// rt_select_canceled reports whether the current boundary is cancelled or past its deadline.
+func rt_select_canceled() bool {
+	return rt_bnd_stopped()
+}
+
+// rt_select_min is the earlier of two deadlines (0: none).
+func rt_select_min(a i64, b i64) i64 {
+	if a == 0 || (b != 0 && b < a) {
+		return b
+	}
+	return a
+}
+
+// rt_select_park waits until a watched source wakes this task or deadline (mono ns, 0: none)
+// comes; on the core's own stack it runs the core's tasks one step instead.
+func rt_select_park(deadline i64) {
+	if curTask == 0 {
+		rt_core_step_until(rt_select_min(deadline, rt_bnd_deadline(rt_bnd_current())))
+		return
+	}
+	if deadline > 0 {
+		left := deadline - rt_mono_ns()
+		if left <= 0 {
+			return
+		}
+		rt_task_park(left)
+		return
+	}
+	rt_task_park(0)
+}
+
+// rt_select_fail leaves a select whose boundary was cancelled, with the wait's fault.
+func rt_select_fail() ! {
+	fail cast(fault, rt_wait_fault())
+}
+
+// ready reports whether the child has finished (a select arm on t.wait()).
+func (h spawned) ready() bool {
+	return h.r[spDone] != 0
+}
+
+// watch makes the child's end wake the running task (a select waiting on it).
+func (h spawned) watch() {
+	if h.r[spDone] == 0 && curTask != 0 {
+		h.r[spWaiter] = curTask
+	}
+}
+
+func (h spawned) unwatch() {
+	if h.r[spWaiter] == curTask {
+		h.r[spWaiter] = 0
+	}
 }
 
 // rt_scope_close waits for every child of s, leaves the scope and gives its first fault.
@@ -3725,13 +3973,30 @@ func rt_child_main(r i64) {
 	f := cast(func() !, r[spBody])
 	f() catch err {
 		r[spFault] = cast(i64, err)
+		if r[spOwnPool] != 0 {
+			// A detached task's fault lives in its own pool: log it before the pool ends.
+			m := "detached task failed: " + say_fault(err) + "\n"
+			rt_write_all(2, cast(i64, m)+8, len(m))
+		}
 	}
+}
+
+func say_fault(err fault) str {
+	return cast(str, cast(i64, err))
 }
 
 // rt_task_finish_child completes ended child task t: its fault reaches the scope, its
 // waiters wake, and the task is reused.
 func rt_task_finish_child(t i64) {
 	r := t[tChild]
+	if r[spOwnPool] != 0 {
+		// A detached task: nobody waits for it (rt_child_main logged its fault).
+		r[spScope][bLive]--
+		free(r)
+		t[tChild] = 0
+		rt_task_free(t)
+		return
+	}
 	if t[tPanicked] != 0 && r[spFault] == 0 {
 		r[spFault] = rt_fault_std(faultPanic, "panic")
 	}
@@ -3815,6 +4080,7 @@ func rt_bnd_cancel(b i64, reason fault) {
 		}
 		d = d[bNext]
 	}
+	rt_watch_update()
 }
 
 // rt_bnd_canceled is b's cancel reason (a fault word), or 0.
@@ -3828,6 +4094,58 @@ func rt_bnd_check() {
 	if b[bCancel] == 0 && b[bDeadline] > 0 && rt_mono_ns() >= b[bDeadline] {
 		rt_bnd_cancel(b[bDlOwner], cast(fault, rt_fault_deadline()))
 	}
+}
+
+// rt_bnd_target stops cancellation at its owner, or at this task's root.
+func rt_bnd_target(origin i64) i64 {
+	b := rt_bnd_current()
+	for b != 0 {
+		if b == origin || b[bKind]&bfRoot != 0 { return b }
+		b = b[bParent]
+	}
+	return origin
+}
+
+// rt_bnd_poll contains CPU-bound cancellation and preserves the server after a deadline.
+func rt_bnd_poll() {
+	__ctx()[ctxPoll] = 0
+	rt_bnd_check()
+	if rtWatchDrainAt > 0 && rt_mono_ns() >= rtWatchDrainAt {
+		rt_bnd_cancel(rt_bnd_core(), cast(fault, rt_fault_draining()))
+	}
+	b := rt_bnd_current()
+	if b[bCancel] == 0 { return }
+	f := rt_wait_fault()
+	target := rt_bnd_target(b[bOrigin])
+	g := rt_bnd_landing(target)
+	if g != 0 {
+		if g[gUnwinding] != 0 { return }
+		rt_land(g, f)
+	}
+	t := curTask
+	if t != 0 && t[tPanicked] != 0 { return }
+	if t != 0 && t[tRecoverable] != 0 {
+		t[tRecover] = 0
+		t[tPanicked] = 1
+		if t[tChild] != 0 {
+			t[tChild][spFault] = f
+		} else {
+			if rt_fault_ident(f) == faultDeadline { t[tPanicked] = 504 }
+			rt_fault_say("request canceled: " + cast(str, f) + "\n")
+		}
+		rt_bnd_join_scopes(rt_bnd_root(t), f)
+		rt_defer_run(0)
+		rt_task_abort(t)
+	}
+	// A draining event loop has no task to unwind; it completes shutdown itself.
+	if t == 0 { return }
+	rt_panic(cast(str, f))
+}
+
+// rt_task_failure_status distinguishes a CPU deadline from ordinary panic recovery.
+func rt_task_failure_status(t i64) i64 {
+	if t[tPanicked] == 504 { return 504 }
+	return 500
 }
 
 // rt_bnd_stopped reports whether the current boundary is cancelled or past its deadline.

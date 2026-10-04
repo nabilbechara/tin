@@ -247,3 +247,19 @@ one-line comment above every exported declaration.
 
 `python3 tools/gen_unicode.py` rewrites `lib/glyph/tables.tin` and `lib/runtime/printable.tin` (the Unicode
 tables) from Go's `unicode/tables.go`; it needs a Go tree only to read that one file.
+
+## CPU cancellation safepoints
+
+`tin build --polls FILE.tin -o app` and `tin run --polls FILE.tin` enable CPU
+cancellation safepoints (`bin/tinc -polls` directly). `TINC_POLLS=1` enables the same
+compiler option for build scripts and benchmark harnesses. Polls are experimental and
+opt-in because native Linux measurements exceed the 2% performance budget; see
+[PERFORMANCE.md](PERFORMANCE.md#cpu-cancellation-safepoints).
+
+With polls, loop back-edges and function entries in user code observe watchdog cancellation.
+A `within` deadline unwinds to its owner, runs defers, and returns its fault. A request
+spinning past its deadline gets HTTP 504 and the core serves queued requests. Linux SIGTERM
+drain also stops a spinning request at the grace deadline. `@nopoll fn kernel(...) ...`
+(edition 1) omits polls in that function; calls into other functions may still poll. Trusted
+`lib/runtime/` functions never poll. Without the option, waits still observe deadlines and
+cancellation; CPU-bound code has no cancellation guarantee.

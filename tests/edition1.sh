@@ -31,9 +31,13 @@ fi
 # Boundary blocks run: guard turns a panic into a fault after the defers run; within
 # deadlines stop waits, nest, and leave the enclosing block alone (#230, #233); try E wrap
 # "msg" passes fault.Wrap(err, msg) upward (#229).
-for name in boundaries fault_wrap once
+# deadlines stop waits, nest, and leave the enclosing block alone (#230, #233); try E wrap
+# "msg" passes fault.Wrap(err, msg) upward (#229).
+for name in boundaries fault_wrap once polls
 do
-	"$compiler" -edition 1 -o "$tmp/$name" "tests/edition1/run/$name.tin"
+	polls=
+	[ "$name" != polls ] || polls=-polls
+	"$compiler" $polls -edition 1 -o "$tmp/$name" "tests/edition1/run/$name.tin"
 	"$tmp/$name" >"$tmp/$name.out" 2>/dev/null
 	if ! cmp -s "tests/edition1/run/$name.out" "$tmp/$name.out"; then
 		echo "FAIL edition1/run/$name: output differs"
@@ -54,7 +58,7 @@ if ! cmp -s tests/edition1/fault_wrap_bad.err "$tmp/fault_wrap_bad.err"; then
 fi
 
 # Structured concurrency (#232): scopes, spawn, wait, cancel, first-fault cancellation.
-for name in scopes lanes
+for name in scopes lanes selects
 do
 	"$compiler" -edition 1 -o "$tmp/$name" "tests/edition1/run/$name.tin"
 	"$tmp/$name" >"$tmp/$name.out" 2>/dev/null
