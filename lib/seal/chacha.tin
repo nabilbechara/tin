@@ -1,0 +1,325 @@
+package seal
+
+// ---- ChaCha20 and Poly1305 (RFC 8439) ----
+// Both use only additions, rotations, xors and 32x32->64 multiplications on values that do
+// not select memory addresses or branches: constant-time in the key, the data and the tag.
+
+func ld32(p i64) u32 {
+	return u32(__ld(p, 2))
+}
+
+// chacha20_xor XORs n bytes at src with the ChaCha20 keystream for key (32 bytes at kp),
+// nonce (12 bytes at np) and the block counter, writing them at dst (which may equal src).
+func chacha20_xor(dst i64, src i64, n i64, kp i64, np i64, counter u32) {
+	k0 := ld32(kp)
+	k1 := ld32(kp + 4)
+	k2 := ld32(kp + 8)
+	k3 := ld32(kp + 12)
+	k4 := ld32(kp + 16)
+	k5 := ld32(kp + 20)
+	k6 := ld32(kp + 24)
+	k7 := ld32(kp + 28)
+	n0 := ld32(np)
+	n1 := ld32(np + 4)
+	n2 := ld32(np + 8)
+	ctr := counter
+	ks := make([]u8, 64)
+	kq := cast(i64, ks)[2]
+	for off := 0; off < n; off += 64 {
+		x0 := u32(0x61707865)
+		x1 := u32(0x3320646e)
+		x2 := u32(0x79622d32)
+		x3 := u32(0x6b206574)
+		x4 := k0
+		x5 := k1
+		x6 := k2
+		x7 := k3
+		x8 := k4
+		x9 := k5
+		x10 := k6
+		x11 := k7
+		x12 := ctr
+		x13 := n0
+		x14 := n1
+		x15 := n2
+		for r := 0; r < 10; r++ {
+			x0 += x4
+			x12 = rotl(x12^x0, 16)
+			x8 += x12
+			x4 = rotl(x4^x8, 12)
+			x0 += x4
+			x12 = rotl(x12^x0, 8)
+			x8 += x12
+			x4 = rotl(x4^x8, 7)
+			x1 += x5
+			x13 = rotl(x13^x1, 16)
+			x9 += x13
+			x5 = rotl(x5^x9, 12)
+			x1 += x5
+			x13 = rotl(x13^x1, 8)
+			x9 += x13
+			x5 = rotl(x5^x9, 7)
+			x2 += x6
+			x14 = rotl(x14^x2, 16)
+			x10 += x14
+			x6 = rotl(x6^x10, 12)
+			x2 += x6
+			x14 = rotl(x14^x2, 8)
+			x10 += x14
+			x6 = rotl(x6^x10, 7)
+			x3 += x7
+			x15 = rotl(x15^x3, 16)
+			x11 += x15
+			x7 = rotl(x7^x11, 12)
+			x3 += x7
+			x15 = rotl(x15^x3, 8)
+			x11 += x15
+			x7 = rotl(x7^x11, 7)
+			x0 += x5
+			x15 = rotl(x15^x0, 16)
+			x10 += x15
+			x5 = rotl(x5^x10, 12)
+			x0 += x5
+			x15 = rotl(x15^x0, 8)
+			x10 += x15
+			x5 = rotl(x5^x10, 7)
+			x1 += x6
+			x12 = rotl(x12^x1, 16)
+			x11 += x12
+			x6 = rotl(x6^x11, 12)
+			x1 += x6
+			x12 = rotl(x12^x1, 8)
+			x11 += x12
+			x6 = rotl(x6^x11, 7)
+			x2 += x7
+			x13 = rotl(x13^x2, 16)
+			x8 += x13
+			x7 = rotl(x7^x8, 12)
+			x2 += x7
+			x13 = rotl(x13^x2, 8)
+			x8 += x13
+			x7 = rotl(x7^x8, 7)
+			x3 += x4
+			x14 = rotl(x14^x3, 16)
+			x9 += x14
+			x4 = rotl(x4^x9, 12)
+			x3 += x4
+			x14 = rotl(x14^x3, 8)
+			x9 += x14
+			x4 = rotl(x4^x9, 7)
+		}
+		__st(kq, i64(x0+0x61707865), 2)
+		__st(kq+4, i64(x1+0x3320646e), 2)
+		__st(kq+8, i64(x2+0x79622d32), 2)
+		__st(kq+12, i64(x3+0x6b206574), 2)
+		__st(kq+16, i64(x4+k0), 2)
+		__st(kq+20, i64(x5+k1), 2)
+		__st(kq+24, i64(x6+k2), 2)
+		__st(kq+28, i64(x7+k3), 2)
+		__st(kq+32, i64(x8+k4), 2)
+		__st(kq+36, i64(x9+k5), 2)
+		__st(kq+40, i64(x10+k6), 2)
+		__st(kq+44, i64(x11+k7), 2)
+		__st(kq+48, i64(x12+ctr), 2)
+		__st(kq+52, i64(x13+n0), 2)
+		__st(kq+56, i64(x14+n1), 2)
+		__st(kq+60, i64(x15+n2), 2)
+		m := n - off
+		if m >= 64 {
+			for i := 0; i < 64; i += 8 {
+				__st(dst+off+i, __ld(src+off+i, 3)^__ld(kq+i, 3), 3)
+			}
+		} else {
+			for i := 0; i < m; i++ {
+				store8(dst+off+i, load8(src+off+i)^load8(kq+i))
+			}
+		}
+		ctr++
+	}
+}
+
+// ChaCha20 XORs data with the ChaCha20 keystream (RFC 8439) for a 32-byte key, a 12-byte nonce
+// and the initial block counter.
+func ChaCha20(key secret []u8, nonce []u8, counter u32, data []u8) ![]u8 {
+	if len(key) != 32 || len(nonce) != 12 {
+		fail "seal: ChaCha20 needs a 32-byte key and a 12-byte nonce"
+	}
+	out := make([]u8, len(data))
+	if len(data) > 0 {
+		chacha20_xor(cast(i64, out)[2], cast(i64, data)[2], len(data), cast(i64, key)[2], cast(i64, nonce)[2], counter)
+	}
+	return out
+}
+
+// poly1305 is the Poly1305 tag (16 bytes) of the RFC 8439 AEAD input (aad, padding, ciphertext,
+// padding, lengths) under the 32-byte one-time key at kp.
+func poly1305_aead(kp i64, aad []u8, ct i64, ctlen i64) []u8 {
+	r0 := u64(ld32(kp)) & 0x3ffffff
+	r1 := (u64(ld32(kp+3)) >> 2) & 0x3ffff03
+	r2 := (u64(ld32(kp+6)) >> 4) & 0x3ffc0ff
+	r3 := (u64(ld32(kp+9)) >> 6) & 0x3f03fff
+	r4 := (u64(ld32(kp+12)) >> 8) & 0x00fffff
+	s1 := r1 * 5
+	s2 := r2 * 5
+	s3 := r3 * 5
+	s4 := r4 * 5
+	h0 := u64(0)
+	h1 := u64(0)
+	h2 := u64(0)
+	h3 := u64(0)
+	h4 := u64(0)
+	blk := make([]u8, 16)
+	bp := cast(i64, blk)[2]
+	lens := make([]u8, 16)
+	for i := 0; i < 8; i++ {
+		lens[i] = u8(u64(len(aad)) >> u64(8*i))
+		lens[8+i] = u8(u64(ctlen) >> u64(8*i))
+	}
+	// Three segments: aad and the ciphertext, each zero-padded to 16 bytes, then the lengths.
+	for seg := 0; seg < 3; seg++ {
+		p := cast(i64, lens)[2]
+		n := 16
+		if seg == 0 {
+			p = cast(i64, aad)[2]
+			n = len(aad)
+		} else if seg == 1 {
+			p = ct
+			n = ctlen
+		}
+		for off := 0; off < n; off += 16 {
+			q := p + off
+			if n-off < 16 {
+				for i := 0; i < 16; i++ {
+					blk[i] = 0
+				}
+				for i := 0; i < n-off; i++ {
+					blk[i] = load8(p + off + i)
+				}
+				q = bp
+			}
+			h0 += u64(ld32(q)) & 0x3ffffff
+			h1 += (u64(ld32(q+3)) >> 2) & 0x3ffffff
+			h2 += (u64(ld32(q+6)) >> 4) & 0x3ffffff
+			h3 += (u64(ld32(q+9)) >> 6) & 0x3ffffff
+			h4 += (u64(ld32(q+12)) >> 8) | (1 << 24)
+			d0 := h0*r0 + h1*s4 + h2*s3 + h3*s2 + h4*s1
+			d1 := h0*r1 + h1*r0 + h2*s4 + h3*s3 + h4*s2
+			d2 := h0*r2 + h1*r1 + h2*r0 + h3*s4 + h4*s3
+			d3 := h0*r3 + h1*r2 + h2*r1 + h3*r0 + h4*s4
+			d4 := h0*r4 + h1*r3 + h2*r2 + h3*r1 + h4*r0
+			c := d0 >> 26
+			h0 = d0 & 0x3ffffff
+			d1 += c
+			c = d1 >> 26
+			h1 = d1 & 0x3ffffff
+			d2 += c
+			c = d2 >> 26
+			h2 = d2 & 0x3ffffff
+			d3 += c
+			c = d3 >> 26
+			h3 = d3 & 0x3ffffff
+			d4 += c
+			c = d4 >> 26
+			h4 = d4 & 0x3ffffff
+			h0 += c * 5
+			c = h0 >> 26
+			h0 = h0 & 0x3ffffff
+			h1 += c
+		}
+	}
+	// Fully carry h, then subtract p = 2^130 - 5 when h >= p, in constant time.
+	c := h1 >> 26
+	h1 = h1 & 0x3ffffff
+	h2 += c
+	c = h2 >> 26
+	h2 = h2 & 0x3ffffff
+	h3 += c
+	c = h3 >> 26
+	h3 = h3 & 0x3ffffff
+	h4 += c
+	c = h4 >> 26
+	h4 = h4 & 0x3ffffff
+	h0 += c * 5
+	c = h0 >> 26
+	h0 = h0 & 0x3ffffff
+	h1 += c
+	g0 := h0 + 5
+	c = g0 >> 26
+	g0 &= 0x3ffffff
+	g1 := h1 + c
+	c = g1 >> 26
+	g1 &= 0x3ffffff
+	g2 := h2 + c
+	c = g2 >> 26
+	g2 &= 0x3ffffff
+	g3 := h3 + c
+	c = g3 >> 26
+	g3 &= 0x3ffffff
+	g4 := h4 + c - (1 << 26)
+	// g4's top bit is set when h < p: then keep h.
+	mask := (g4 >> 63) - 1
+	h0 = (h0 & ^mask) | (g0 & mask)
+	h1 = (h1 & ^mask) | (g1 & mask)
+	h2 = (h2 & ^mask) | (g2 & mask)
+	h3 = (h3 & ^mask) | (g3 & mask)
+	h4 = (h4 & ^mask) | (g4 & mask)
+	// h mod 2^128, plus s.
+	w0 := (h0 | (h1 << 26)) & 0xffffffff
+	w1 := ((h1 >> 6) | (h2 << 20)) & 0xffffffff
+	w2 := ((h2 >> 12) | (h3 << 14)) & 0xffffffff
+	w3 := ((h3 >> 18) | (h4 << 8)) & 0xffffffff
+	f := w0 + u64(ld32(kp+16))
+	out := make([]u8, 16)
+	op := cast(i64, out)[2]
+	__st(op, i64(f), 2)
+	f = w1 + u64(ld32(kp+20)) + (f >> 32)
+	__st(op+4, i64(f), 2)
+	f = w2 + u64(ld32(kp+24)) + (f >> 32)
+	__st(op+8, i64(f), 2)
+	f = w3 + u64(ld32(kp+28)) + (f >> 32)
+	__st(op+12, i64(f), 2)
+	return out
+}
+
+// chacha_poly_key is the Poly1305 one-time key: the first 32 bytes of ChaCha20 block 0.
+func chacha_poly_key(key []u8, nonce []u8) []u8 {
+	pk := make([]u8, 32)
+	p := cast(i64, pk)[2]
+	chacha20_xor(p, p, 32, cast(i64, key)[2], cast(i64, nonce)[2], 0)
+	return pk
+}
+
+// chacha_seal is the RFC 8439 AEAD: ciphertext then the 16-byte tag.
+func chacha_seal(key []u8, nonce []u8, plaintext []u8, aad []u8) []u8 {
+	n := len(plaintext)
+	out := make([]u8, n+16)
+	op := cast(i64, out)[2]
+	if n > 0 {
+		chacha20_xor(op, cast(i64, plaintext)[2], n, cast(i64, key)[2], cast(i64, nonce)[2], 1)
+	}
+	pk := chacha_poly_key(key, nonce)
+	tag := poly1305_aead(cast(i64, pk)[2], aad, op, n)
+	for i := 0; i < 16; i++ {
+		out[n+i] = tag[i]
+	}
+	return out
+}
+
+// chacha_open checks the tag of sealed (ciphertext then tag) and returns the plaintext.
+func chacha_open(key []u8, nonce []u8, sealed []u8, aad []u8) ![]u8 {
+	if len(sealed) < 16 {
+		fail "seal: message authentication failed"
+	}
+	n := len(sealed) - 16
+	sp := cast(i64, sealed)[2]
+	pk := chacha_poly_key(key, nonce)
+	tag := poly1305_aead(cast(i64, pk)[2], aad, sp, n)
+	if !ConstantTimeEq(tag, sealed[n:]) {
+		fail "seal: message authentication failed"
+	}
+	out := make([]u8, n)
+	if n > 0 {
+		chacha20_xor(cast(i64, out)[2], sp, n, cast(i64, key)[2], cast(i64, nonce)[2], 1)
+	}
+	return out
+}
