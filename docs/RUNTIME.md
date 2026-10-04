@@ -146,8 +146,8 @@ fires. Messages are copied into the receiver's request pool.
 - `rt_panic(msg)` flushes stdout, prints `panic: msg`, walks the frame-pointer chain from
   `__fp()`, names each return address with `dladdr`, and exits with status 2.
 - The walk skips `rt_` frames and stops at the program entry.
-- On Linux the ELF exports functions as `tin.<name>` with sizes, so `dladdr` can name
-  them; the prefix is stripped when printing.
+- On Linux the linker emits a read-only Tin table of function start/end/name records.
+  Backtrace lookup uses image-relative ranges, including under ASLR; printed names stay unchanged.
 - `rt_bounds_fail2(i, n)` and `rt_div_fail()` are the cold paths of failed checks.
 
 ## 8. The OS layer
@@ -160,9 +160,9 @@ names in both OS files:
 | `rt_errno()` | `__error()` | core context word 10, set from negative kernel results |
 | `rt_mono_ns()`, `rt_wall_ns()` | `clock_gettime_nsec_np(8 / 0)` | kernel vDSO clock with clock_gettime syscall fallback |
 | `rt_random(p, n)` | `arc4random_buf` | `getrandom` (loop) |
-| `rt_ncpus()` | `sysconf(58)` | `sysconf(84)`, plus affinity and cgroups |
+| `rt_ncpus()` | `sysconf(58)` | affinity mask plus cgroup quota |
 | `rt_sockaddr_in(sa, ip, port)` | `sin_len` + family bytes | u16 family |
-| `rt_ai_addr(ai)` | addrinfo + 32 | addrinfo + 24 |
+| `rt_ai_addr(ai)` | addrinfo + 32 | unused; Tin DNS builds sockaddr directly |
 | `rt_nosigpipe(fd)` | `SO_NOSIGPIPE` | ignore SIGPIPE process-wide |
 | `rt_stat_mode/size/mtime/dev/ino(st)` | struct stat offsets | kernel offsets (st_mode differs between arm64 and amd64: per-arch file) |
 | `rt_dirent_name(ent)` | `d_namlen` + `d_name@21` | bounded getdents64 record, name@19 |
@@ -181,6 +181,13 @@ Pthreads remain until the static cutover; libc environment failures still use it
 errno, and the old seed uses a libc syscall fallback only to build stage 1. Clock lookup reads the kernel vDSO from AT_SYSINFO_EHDR (libc auxv until phase 5),
 with the raw syscall as fallback. Generated
 Linux programs do not import syscall or the removed OS entry points.
+
+UTC calendar/Date formatting, errno messages and Linux backtrace lookup are Tin code.
+Darwin errno codes 0..106 use the stable Tin message table. Newer/unknown codes
+retain libSystem text because code assignments vary between macOS development releases.
+Linux errno messages use Tin exclusively.
+Linux TTY detection uses ioctl TCGETS, hostname uses uname, and sleeps use nanosleep.
+Environment, auxv, pthread startup and dynamic ELF remain for the final cutover.
 
 ## 9. The HTTP server: anvil
 
@@ -320,7 +327,8 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
 - `wire` sockets are non-blocking: connect, read, write and accept wait with
   `rt_task_wait` on `EAGAIN`. `Conn.SetTimeout` bounds each wait; past it the call fails
   with `wire: read timed out` (or connect/write), past the deadline with `deadline exceeded`.
-- Work with no non-blocking form (DNS `getaddrinfo`, file reads and writes in `quarry`)
+- Linux DNS uses nonblocking UDP/TCP sockets and task waits (docs/STDLIB.md, wire contract).
+- Work with no non-blocking form (macOS DNS `getaddrinfo`, file reads and writes in `quarry`)
   goes to four shared helper threads. `rt_helper_run(f, job, drop)` queues a heap-owned
   job in a bounded queue (4096 outstanding jobs process-wide), signals a non-blocking
   wake pipe and parks within the request deadline. A full queue fails immediately.
