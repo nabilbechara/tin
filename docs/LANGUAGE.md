@@ -836,8 +836,8 @@ let names = try arena {                 // a body that can fail is a !T: try or 
   blocks. `return` cannot leave it. A panic passes through it (the arena is freed on the way)
   to the nearest `guard`.
 - The value is deep-copied, like `keep`, but into the enclosing region. A recursive type, or
-  one holding a `func` or `dyn` value, cannot be the value (E315 ARENA_VALUE).
-- **Nothing else made in the arena may leave it** (E314 ARENA_ESCAPE): storing it into a
+  one holding a `func` or `dyn` value, cannot be the value (E316 ARENA_VALUE).
+- **Nothing else made in the arena may leave it** (E315 ARENA_ESCAPE): storing it into a
   variable from outside the block, into a field, element or map entry of an object from
   outside, or through a call's `mut` argument. Appending to or inserting into a slice or
   map from outside is rejected whatever the value, since its new array or table would be

@@ -35,7 +35,9 @@ fi
 # "msg" passes fault.Wrap(err, msg) upward (#229).
 # task.Deadline and task.Canceled read the innermost boundary; nested within takes the
 # earlier deadline (#233).
-for name in boundaries fault_wrap once polls deadlines
+# A value main borrowed from a long-lived map stays valid while a spawned child replaces
+# the entry and ends: the core's own stack is an epoch participant (#176).
+for name in boundaries fault_wrap once polls deadlines borrows
 do
 	polls=
 	[ "$name" != polls ] || polls=-polls
@@ -234,8 +236,8 @@ done
 
 # arena { } (#236): values of every kind are copied out, faults pass with try and catch,
 # panics and limits discard the arena, and scope children that share a pool keep it while an
-# arena body waits. Memory made in an arena cannot leave it any other way (E314), and its
-# value must be a type the copy can follow (E315).
+# arena body waits. Memory made in an arena cannot leave it any other way (E315), and its
+# value must be a type the copy can follow (E316).
 "$compiler" -edition 1 -o "$tmp/arenas" tests/edition1/run/arenas.tin
 "$tmp/arenas" >"$tmp/arenas.out" 2>/dev/null
 if ! cmp -s tests/edition1/run/arenas.out "$tmp/arenas.out"; then

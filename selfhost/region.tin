@@ -261,7 +261,7 @@ fn rg_stmt(s) {
 // rg_regrow reports whether x appends onto the slot target t names: append grows the
 // header in place and returns it, so storing the result back changes nothing.
 fn rg_regrow(t, x) {
-    while x[N_KIND] == EX_CALL && x[CALL_NAME] && (streq(x[CALL_NAME], "rt_append") || streq(x[CALL_NAME], "rt_slice_appendn") || streq(x[CALL_NAME], "rt_append_str")) {
+    while x[N_KIND] == EX_CALL && x[CALL_NAME] && (streq(x[CALL_NAME], "rt_append") || streq(x[CALL_NAME], "rt_append_rc") || streq(x[CALL_NAME], "rt_slice_appendn") || streq(x[CALL_NAME], "rt_slice_appendn_rc") || streq(x[CALL_NAME], "rt_append_str")) {
         x = vec_get(x[CALL_ARGS], 0);
     }
     return rg_same(t, x);
@@ -786,7 +786,7 @@ fn rg_detach_check(f) {
                 bit = j;
             }
             if os && (raw & (1 << bit)) != 0 && has_ptr(os[S_TYPE]) && (rg_capture_bits(os) & RG_EMB) != 0 {
-                err_quoted(d[F_POS], "detach captures ", os[S_NAME], ", which may hold request memory, but the detached task outlives the request: keep() it before the block (let v = keep(...)), or read it in the block only inside keep()");
+                err_code_quoted(d[F_POS], "E314 DETACH_ESCAPE", "detach captures ", os[S_NAME], ", which may hold request memory, but the detached task outlives the request: keep() it before the block (let v = keep(...)), or read it in the block only inside keep()");
             }
             j = j + 1;
         }
@@ -798,7 +798,7 @@ fn rg_detach_check(f) {
 //
 // An arena's closure reads its captured variables as RG_OUT (made outside the arena) instead
 // of RG_FRESH, so fresh bits there are the arena's own memory. Storing that into an object
-// from outside, or into a captured variable, is E314; so is growing (append, map insert) a
+// from outside, or into a captured variable, is E315; so is growing (append, map insert) a
 // slice or map from outside, since the new array or table would be allocated in the arena.
 
 var rg_grows;   // [function, parameter bits]: the parameters (and what they hold) it may grow
@@ -827,7 +827,7 @@ fn rg_arena_made(v) {
 }
 
 fn rg_arena_escape(pos, name) {
-    err_code_quoted(pos, "E314 ARENA_ESCAPE", "memory made in an arena stored into ", name, ", a variable from outside it, which outlives the arena: make the value the arena block's result (it is copied out), or keep() it");
+    err_code_quoted(pos, "E315 ARENA_ESCAPE", "memory made in an arena stored into ", name, ", a variable from outside it, which outlives the arena: make the value the arena block's result (it is copied out), or keep() it");
 }
 
 // rg_arena_cell_store checks a store of bits v into captured variable i inside an arena and
@@ -846,7 +846,7 @@ fn rg_arena_cell_store(i, v, t, pos) {
 }
 
 fn rg_grows_op(name) {
-    return streq(name, "rt_append") || streq(name, "rt_append_dyn") || streq(name, "rt_slice_appendn") || streq(name, "rt_append_str") || streq(name, "rt_map_set") || streq(name, "rt_map_setk");
+    return streq(name, "rt_append") || streq(name, "rt_append_rc") || streq(name, "rt_append_dyn") || streq(name, "rt_slice_appendn") || streq(name, "rt_slice_appendn_rc") || streq(name, "rt_append_str") || streq(name, "rt_map_set") || streq(name, "rt_map_setk");
 }
 
 // rg_grow notes that the running function may grow the slice or map with bits b.
@@ -864,12 +864,12 @@ fn rg_grow(b, pos) {
         i = i + 1;
     }
     if (b & RG_OUT) != 0 && (b & ~(RG_OUT | RG_INGOT)) != 0 && rg_report && rg_in_arena() {
-        err_code_at(pos, "E314 ARENA_ESCAPE", "a slice or map from outside an arena grows inside it (append or insert), so its new memory would be the arena's: grow it after the block, from the block's result");
+        err_code_at(pos, "E315 ARENA_ESCAPE", "a slice or map from outside an arena grows inside it (append or insert), so its new memory would be the arena's: grow it after the block, from the block's result");
     }
 }
 
 // rg_arena_store notes a store of bits v into a container with bits c: in terms of the running
-// function's parameters, for its callers, and as E314 when it takes arena memory outside.
+// function's parameters, for its callers, and as E315 when it takes arena memory outside.
 fn rg_arena_store(c, v, pos) {
     let i = 0;
     while i < rg_nparams && i < RG_MAXP && i < 62 {
@@ -897,7 +897,7 @@ fn rg_arena_store(c, v, pos) {
         i = i + 1;
     }
     if (c & (RG_INGOT | RG_UNK)) == 0 && (c & RG_OUT) != 0 && rg_report && rg_in_arena() && rg_arena_made(v) {
-        err_code_at(pos, "E314 ARENA_ESCAPE", "memory made in an arena stored into an object from outside it, which outlives the arena: make the value the arena block's result (it is copied out), or keep() it");
+        err_code_at(pos, "E315 ARENA_ESCAPE", "memory made in an arena stored into an object from outside it, which outlives the arena: make the value the arena block's result (it is copied out), or keep() it");
     }
 }
 
@@ -1444,7 +1444,7 @@ fn rg_runtime_call(e, name, b, pos) {
         rg_store(b0, co, ct, vec_get(b, 2), vec_get(args, 2)[N_TYPE], pos, 0);
         return 0;
     }
-    if streq(name, "rt_append") {
+    if streq(name, "rt_append") || streq(name, "rt_append_rc") {
         rg_store(b0, co, ct, vec_get(b, 1), vec_get(args, 1)[N_TYPE], pos, 0);
         return b0;
     }
@@ -1453,7 +1453,7 @@ fn rg_runtime_call(e, name, b, pos) {
         rg_store(b0, co, ct, vec_get(b, 1), et, pos, 0);
         return b0;
     }
-    if streq(name, "rt_slice_appendn") || streq(name, "rt_slice_copy") {
+    if streq(name, "rt_slice_appendn") || streq(name, "rt_slice_copy") || streq(name, "rt_slice_appendn_rc") || streq(name, "rt_slice_copy_rc") {
         let et = 0;
         let a1 = vec_get(args, 1);
         if kind_of(a1[N_TYPE]) == K_SLICE {
@@ -1560,7 +1560,7 @@ fn wb_param_ok(f, i, say) {
 // passed to, or is 0.
 fn wb_keeps(pos, via) {
     if wb_say && !wb_bad {
-        let m = err_begin(pos);
+        let m = err_code(pos, "E653 POLICY_BODY");
         buf_str(m, wb_fn[F_QNAME]);
         if via {
             buf_str(m, " passes the body of a with block to ");
@@ -1684,4 +1684,317 @@ fn wb_expr(e) {
             i = i + 1;
         }
     }
+}
+
+// ---- long-lived stores: the counts around them (#176, notes/interface_mem.md) ----
+//
+// rc_mark runs after region_check, when the bits on every local are final. It wraps each
+// store whose destination is provably long-lived: an assignment to a global, and field
+// or element stores whose base ident is a global or a local left at exactly RG_INGOT
+// (one that can hold nothing else). The store keeps the value it had: the new value's
+// count arrives and the old slot's count leaves, both before the store itself (the value
+// is bound to a temporary first, so it is evaluated once).
+//
+// A store whose destination may be long-lived but is not provably so (through a
+// parameter, a closure's cells, an element of an element) cannot be counted: the old
+// slot may never have had a count. Its value is pinned instead (rt_rc_pinned), so the
+// uncounted reference can leak the block but never outlive it. A store into a container
+// the region pass proved request-local needs neither.
+//
+// Map entries and append elements count themselves in the runtime (rt_map_set,
+// rt_append_rc, rt_slice_appendn_rc, rt_slice_copy_rc), which decide by the container's
+// own region word and need no marking here. keep$N counts the fields, elements and
+// entries of its copy itself, so lifted functions are left alone. __core_init is not
+// visited: what a core makes while it initializes starts pinned (rt_ingot_alloc).
+
+var rc_fn;
+var rc_reach_ok; // 1 once reachability is final: rc_*_call may mark what they add
+
+fn rc_mark() {
+    rc_reach_ok = 1;
+    let saved_fn = ck_fn;
+    let saved_marks = sc_marks;
+    let saved_syms = sc_syms;
+    let saved_cells = ck_escaping_cells;
+    // declare_local reads the current scope; give the wrapped temporaries one of their own.
+    sc_marks = vec_new();
+    vec_push(sc_marks, 0);
+    sc_syms = vec_new();
+    ck_escaping_cells = vec_new();
+    let i = 0;
+    while i < prog_fns[VEC_LEN] {
+        let f = vec_get(prog_fns, i);
+        if f[F_REGSUM] && f[F_REACH] && f[F_LIFTED] != 2 {
+            rc_fn = f;
+            ck_fn = f;
+            rc_stmts(f[F_BODY][BLK_STMTS]);
+        }
+        i = i + 1;
+    }
+    ck_fn = saved_fn;
+    sc_marks = saved_marks;
+    sc_syms = saved_syms;
+    ck_escaping_cells = saved_cells;
+}
+
+fn rc_stmts(v) {
+    let i = 0;
+    while i < v[VEC_LEN] {
+        let s = vec_get(v, i);
+        if s && s[N_KIND] == ST_ASSIGN {
+            // The wrap leaves the store itself in place; skip it, the temporaries around
+            // it carry the value expression (a composite literal's stores) instead.
+            i = i + rc_assign(s, v, i) + 1;
+        } else if s && s[N_KIND] == ST_CALLMULTI {
+            rc_seq(s[CM_CALL]);
+            i = i + rc_callmulti(s, v, i) + 1;
+        } else {
+            rc_walk(s);
+            i = i + 1;
+        }
+    }
+}
+
+// rc_walk reaches the stores nested in a statement (a composite literal carries them
+// inside an EX_SEQ).
+fn rc_walk(s) {
+    if !s {
+        return;
+    }
+    let k = s[N_KIND];
+    if k == ST_BLOCK {
+        rc_stmts(s[BLK_STMTS]);
+    } else if k == ST_LIST {
+        rc_stmts(s[LIST_STMTS]);
+    } else if k == ST_LET {
+        rc_seq(s[LET_INIT]);
+    } else if k == ST_EXPR {
+        rc_seq(s[ES_X]);
+    } else if k == ST_IF {
+        rc_stmts(s[IF_THEN][BLK_STMTS]);
+        if s[IF_ELSE] {
+            rc_walk(s[IF_ELSE]);
+        }
+    } else if k == ST_WHILE {
+        rc_stmts(s[WH_BODY][BLK_STMTS]);
+        if s[WH_POST] {
+            rc_walk(s[WH_POST]);
+        }
+    } else if k == ST_RETURN {
+        if s[RET_VALUE] {
+            rc_seq(s[RET_VALUE]);
+        }
+    }
+}
+
+fn rc_seq(e) {
+    if e && e[N_KIND] == EX_SEQ {
+        rc_stmts(e[SEQ_STMTS]);
+        rc_seq(e[SEQ_VALUE]);
+    }
+}
+
+// rc_assign counts or pins the assignment at position i of stmts, by what its
+// destination can be. It reports how many statements it spliced in before it.
+fn rc_assign(s, stmts, i) {
+    let target = s[AS_TARGET];
+    let val = s[AS_VALUE];
+    if !target || !val {
+        return 0;
+    }
+    let pos = s[N_POS];
+    let t = target[N_TYPE];
+    if !rc_counted(t) {
+        rc_seq(val);
+        return 0;
+    }
+    let k = target[N_KIND];
+    if k == EX_IDENT {
+        if target[ID_REF] && target[ID_REF][S_KIND] == SYM_GLOBAL {
+            // xs = append(xs, v): the append counts its own element and returns the same
+            // header, so the slot's count is already right.
+            if rc_append_into(val, target) {
+                return 0;
+            }
+            return rc_wrap(s, stmts, i, sym_ref_node(pos, target[ID_REF]), t, 0);
+        }
+        // A local: the variable itself is not long-lived storage.
+        rc_seq(val);
+        return 0;
+    }
+    if k == EX_MEM {
+        let base = target[MEM_BASE];
+        if target[MEM_INDEX] == 0 && rc_ingot_base(base) {
+            return rc_wrap(s, stmts, i, rc_field_read(pos, target, t), t, 0);
+        }
+        if !rc_local_base(base) {
+            rc_pin_value(s, t);
+        }
+        rc_seq(val);
+        return 0;
+    }
+    if k == EX_ELEM {
+        // s[i] = v, already lowered to a bounds-checked element. The index is bound to a
+        // temporary so the old value is read back from the very same index.
+        let seq = target[ELEM_SEQ];
+        if rc_ingot_base(seq) {
+            let pre0 = vec_new();
+            let idx = temp(pos, target[ELEM_IDX], ty_int);
+            vec_push(pre0, idx);
+            target[ELEM_IDX] = sym_ref_node(pos, idx[LET_SYM]);
+            return rc_wrap(s, stmts, i, rc_elem_read(pos, target, t), t, pre0);
+        }
+        if !rc_local_base(seq) {
+            rc_pin_value(s, t);
+        }
+        rc_seq(val);
+        return 0;
+    }
+    rc_seq(val);
+    return 0;
+}
+
+// rc_wrap binds the stored value, reads the old one, counts the new value, drops the old
+// one's count (in that order: a value stored over itself is never queued) and leaves the
+// store itself last. pre0 (0: none) holds statements the caller prepared (an index
+// temporary). It reports how many statements it spliced in.
+fn rc_wrap(s, stmts, i, oldRead, t, pre0) {
+    let pos = s[N_POS];
+    let val = s[AS_VALUE];
+    let pre = vec_new();
+    if pre0 {
+        let p = 0;
+        while p < pre0[VEC_LEN] {
+            vec_push(pre, vec_get(pre0, p));
+            p = p + 1;
+        }
+    }
+    let v = temp(pos, val, t);
+    vec_push(pre, v);
+    // The store reads the temporary now, so the value expression is evaluated once.
+    s[AS_VALUE] = sym_ref_node(pos, v[LET_SYM]);
+    let old = temp(pos, oldRead, t);
+    vec_push(pre, old);
+    vec_push(pre, expr_stmt(rc_inc_call(pos, sym_ref_node(pos, v[LET_SYM]))));
+    vec_push(pre, expr_stmt(rc_dec_call(pos, sym_ref_node(pos, old[LET_SYM]), drop_fn(t))));
+    rc_splice(stmts, i, pre);
+    // A composite literal's own stores travel inside the bound value.
+    rc_stmts(pre);
+    return pre[VEC_LEN];
+}
+
+// rc_pin_value pins the value assignment s stores, in place: rt_rc_pinned returns its
+// argument, so the evaluation order of the store does not change.
+fn rc_pin_value(s, t) {
+    let c = rt_call(s[N_POS], "rt_rc_pinned", args1(s[AS_VALUE]), t);
+    mark_reach(c[CALL_FN]);
+    s[AS_VALUE] = c;
+}
+
+// rc_callmulti counts the globals a multiple assignment (a, g = f()) stores: each old
+// value is read before the call and loses its count after it, once the new one has
+// gained its own. It reports how many statements it spliced in around the call.
+fn rc_callmulti(s, stmts, i) {
+    let pos = s[N_POS];
+    let syms = s[CM_SYMS];
+    let pre = vec_new();
+    let post = vec_new();
+    let j = 0;
+    while j < syms[VEC_LEN] {
+        let g = vec_get(syms, j);
+        if g && g[S_KIND] == SYM_GLOBAL && rc_counted(g[S_TYPE]) {
+            let old = temp(pos, sym_ref_node(pos, g), g[S_TYPE]);
+            vec_push(pre, old);
+            vec_push(post, expr_stmt(rc_inc_call(pos, sym_ref_node(pos, g))));
+            vec_push(post, expr_stmt(rc_dec_call(pos, sym_ref_node(pos, old[LET_SYM]), drop_fn(g[S_TYPE]))));
+        }
+        j = j + 1;
+    }
+    rc_splice(stmts, i + 1, post);
+    rc_splice(stmts, i, pre);
+    return pre[VEC_LEN] + post[VEC_LEN];
+}
+
+// rc_splice puts pre before position i, moving the statements from i up.
+fn rc_splice(stmts, i, pre) {
+    let n = stmts[VEC_LEN];
+    let k = pre[VEC_LEN];
+    if k == 0 {
+        return;
+    }
+    if n + k > stmts[VEC_CAP] {
+        while n + k > stmts[VEC_CAP] {
+            stmts[VEC_CAP] = stmts[VEC_CAP] * 2;
+        }
+        stmts[VEC_DATA] = realloc(stmts[VEC_DATA], stmts[VEC_CAP] * 8);
+    }
+    let j = n - 1;
+    while j >= i {
+        stmts[VEC_DATA][j + k] = stmts[VEC_DATA][j];
+        j = j - 1;
+    }
+    let m = 0;
+    while m < k {
+        stmts[VEC_DATA][i + m] = vec_get(pre, m);
+        m = m + 1;
+    }
+    stmts[VEC_LEN] = n + k;
+}
+
+// rc_ingot_base reports whether the ident e names a container that can hold nothing but
+// long-lived values: a global, or a local the region pass left at exactly RG_INGOT.
+fn rc_ingot_base(e) {
+    if e[N_KIND] != EX_IDENT || !e[ID_REF] {
+        return 0;
+    }
+    let s = e[ID_REF];
+    if s[S_KIND] == SYM_GLOBAL {
+        return 1;
+    }
+    if s == rc_fn[F_ENV_SYM] {
+        return 0;
+    }
+    return s[S_REGION] == RG_INGOT;
+}
+
+// rc_local_base reports whether the ident e names a container the region pass proved
+// request-local: a local whose objects are all fresh from the pool.
+fn rc_local_base(e) {
+    if e[N_KIND] != EX_IDENT || !e[ID_REF] {
+        return 0;
+    }
+    let s = e[ID_REF];
+    if s[S_KIND] == SYM_GLOBAL || s == rc_fn[F_ENV_SYM] {
+        return 0;
+    }
+    return s[S_REGION] != 0 && (s[S_REGION] & ~(RG_FRESH | RG_EMB)) == 0;
+}
+
+// rc_field_read reads the field the store writes (the base is a named ident).
+fn rc_field_read(pos, target, t) {
+    let base = target[MEM_BASE];
+    return mk_mem(pos, sym_ref_node(pos, base[ID_REF]), 0, 0, target[MEM_OFF], t);
+}
+
+// rc_elem_read reads the element the store writes; the slice and the index are names, so
+// naming them twice costs nothing.
+fn rc_elem_read(pos, target, t) {
+    let seq = target[ELEM_SEQ];
+    let n = node_new(EX_ELEM, pos);
+    n[ELEM_SEQ] = sym_ref_node(pos, seq[ID_REF]);
+    n[ELEM_IDX] = sym_ref_node(pos, target[ELEM_IDX][ID_REF]);
+    n[ELEM_SIZE] = target[ELEM_SIZE];
+    n[ELEM_STR] = target[ELEM_STR];
+    n[N_TYPE] = t;
+    return n;
+}
+
+// rc_append_into reports whether xs = append(xs, v) grows the very global being assigned:
+// rt_append_rc counted its element and returned the same header, so nothing else moves.
+fn rc_append_into(v, target) {
+    if v[N_KIND] != EX_CALL || !v[CALL_NAME] || !streq(v[CALL_NAME], "rt_append_rc") {
+        return 0;
+    }
+    let a0 = vec_get(v[CALL_ARGS], 0);
+    return a0[N_KIND] == EX_IDENT && a0[ID_REF] == target[ID_REF];
 }
