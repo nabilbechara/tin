@@ -2715,7 +2715,31 @@ fn x_memory_bytes(fill) {
     return v;
 }
 
+fn x_syscall_bytes(restorer) {
+    let hex="4889f84889f74889d64889ca4d89c24d89c84c8b4c24080f05c3";
+    if restorer { hex="48c7c00f0000000f05"; }
+    let v=vec_new(); let i=0;
+    while load8(hex+i) != 0 {
+        vec_push(v,num_digit(load8(hex+i))*16+num_digit(load8(hex+i+1)));
+        i=i+2;
+    }
+    return v;
+}
+
 fn x_gen_fn(f) {
+    if tgt_linux && any_v2 {
+        let bytes=syscall_fast_amd64(f[F_QNAME]);
+        if bytes != 0 {
+            x_out4(X_LABEL,vec_get(x_fn_labels,f[F_INDEX]),0,0,0);
+            if streq(f[F_QNAME],"rt_sys_clock_gettime") {
+                let s=lookup_global("rtVdsoClock");
+                x_out4(X_LOAD,RDX,x64_mem_sym(x_sym(SK_VAR,s[S_INDEX])),3,0);
+            }
+            let i=0;
+            while i < bytes[VEC_LEN] { x_out4(X_RAWB,vec_get(bytes,i),0,0,0); i=i+1; }
+            return;
+        }
+    }
     if streq(f[F_QNAME],"memcpy") || streq(f[F_QNAME],"memmove") || streq(f[F_QNAME],"memset") || streq(f[F_QNAME],"memcmp") || streq(f[F_QNAME],"memchr") || streq(f[F_QNAME],"mem_avx2_supported") {
         x_out4(X_LABEL,vec_get(x_fn_labels,f[F_INDEX]),0,0,0);
         let bs=memory_fast_amd64(f[F_QNAME]); let i=0;
@@ -2723,6 +2747,13 @@ fn x_gen_fn(f) {
         return;
     }
 
+    if tgt_linux && (streq(f[F_QNAME],"linux_raw") || streq(f[F_QNAME],"linux_restorer")) {
+        x_out4(X_LABEL,vec_get(x_fn_labels,f[F_INDEX]),0,0,0);
+        let bs=x_syscall_bytes(streq(f[F_QNAME],"linux_restorer"));
+        let i=0;
+        while i < bs[VEC_LEN] { x_out4(X_RAWB,vec_get(bs,i),0,0,0); i=i+1; }
+        return;
+    }
     if streq(f[F_QNAME],"mem_copy64") || streq(f[F_QNAME],"mem_fill64") {
         x_out4(X_LABEL,vec_get(x_fn_labels,f[F_INDEX]),0,0,0);
         let bs=x_memory_bytes(streq(f[F_QNAME],"mem_fill64"));

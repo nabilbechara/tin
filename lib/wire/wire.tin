@@ -8,17 +8,6 @@ package wire
 
 import "say"
 
-extern func socket(domain i64, typ i64, proto i64) i64
-extern func connect(fd i64, addr i64, n i64) i64
-extern func setsockopt(fd i64, level i64, name i64, val i64, n i64) i64
-extern func getsockopt(fd i64, level i64, name i64, val i64, n i64) i64
-extern func getsockname(fd i64, addr i64, n i64) i64
-extern func bind(fd i64, addr i64, n i64) i64
-extern func listen(fd i64, backlog i64) i64
-extern func accept(fd i64, addr i64, n i64) i64
-extern func close(fd i64) i64
-extern func fcntl(fd i64, cmd i64, ...) i64
-extern func poll(fds i64, n i64, timeout i64) i64
 extern func getaddrinfo(node i64, service i64, hints i64, res i64) i64
 extern func freeaddrinfo(res i64)
 extern func strerror(e i64) i64
@@ -189,8 +178,8 @@ func (c Conn) wait(want i64, what str) ! {
 }
 
 func nonblocking(fd i64) {
-	flags := i64(i32(fcntl(fd, F_GETFL, 0)))
-	fcntl(fd, F_SETFL, flags|O_NONBLOCK)
+	flags := i64(i32(rt_sys_fcntl(fd, F_GETFL, 0)))
+	rt_sys_fcntl(fd, F_SETFL, flags|O_NONBLOCK)
 }
 
 // Dial connects to "host:port".
@@ -211,21 +200,21 @@ func DialTimeout(addr str, timeout i64) !Conn {
 	if e2 != nil {
 		fail e2
 	}
-	fd := i64(i32(socket(2, 1, 0)))
+	fd := i64(i32(rt_sys_socket(2, 1, 0)))
 	if fd < 0 {
 		fail os_fault("socket")
 	}
 	one := calloc(1, 8)
 	one[0] = 1
 	rt_nosigpipe(fd)
-	setsockopt(fd, 6, 1, one, 4)
+	rt_sys_setsockopt(fd, 6, 1, one, 4)
 	free(one)
 	// Sockets are non-blocking: inside a request task a wait lets the core serve others.
 	nonblocking(fd)
-	if i64(i32(connect(fd, sa, 16))) < 0 {
+	if i64(i32(rt_sys_connect(fd, sa, 16))) < 0 {
 		if errno() != EINPROGRESS {
 			f2 := os_fault(say.Fmt("connect %s", addr))
-			close(fd)
+			rt_sys_close(fd)
 			if f2 != nil {
 				fail f2
 			}
@@ -233,19 +222,19 @@ func DialTimeout(addr str, timeout i64) !Conn {
 		}
 		werr := wait_io(fd, 2, timeout, "connect " + addr)
 		if werr != nil {
-			close(fd)
+			rt_sys_close(fd)
 			fail werr
 		}
 		soerr := calloc(1, 8)
 		ln := calloc(1, 8)
 		ln[0] = 4
-		getsockopt(fd, SOL_SOCKET, SO_ERROR, soerr, ln)
+		rt_sys_getsockopt(fd, SOL_SOCKET, SO_ERROR, soerr, ln)
 		code := i64(i32(soerr[0]))
 		free(soerr)
 		free(ln)
 		if code != 0 {
 			m := strerror(code)
-			close(fd)
+			rt_sys_close(fd)
 			fail say.Fault("wire: connect %s: %s", addr, rt_str_from_raw(m, strlen(m)))
 		}
 	}
@@ -269,7 +258,7 @@ func (c Conn) SetNoDelay(on bool) {
 	if on {
 		v[0] = 1
 	}
-	setsockopt(c.fd, 6, 1, v, 4)
+	rt_sys_setsockopt(c.fd, 6, 1, v, 4)
 	free(v)
 }
 
@@ -279,7 +268,7 @@ func (c Conn) write_raw(p i64, n i64) ! {
 		fail "wire: write on a closed connection"
 	}
 	for n > 0 {
-		k := write(c.fd, p, n)
+		k := rt_sys_write(c.fd, p, n)
 		if k < 0 {
 			e := errno()
 			if e == 4 {
@@ -316,7 +305,7 @@ func (c Conn) Read(buf mut []u8, max i64) !i64 {
 		rt_slice_grow(h, h[0]+max, 1)
 	}
 	for {
-		k := read(c.fd, h[2]+h[0], max)
+		k := rt_sys_read(c.fd, h[2]+h[0], max)
 		if k > 0 {
 			h[0] += k
 			return k
@@ -351,7 +340,7 @@ func (c Conn) ReadFull(n i64) !str {
 // Close closes the connection.
 func (c mut Conn) Close() {
 	if c.open {
-		close(c.fd)
+		rt_sys_close(c.fd)
 		c.open = false
 	}
 }
@@ -369,25 +358,25 @@ func Listen(addr str) !Listener {
 	if e2 != nil {
 		fail e2
 	}
-	fd := i64(i32(socket(2, 1, 0)))
+	fd := i64(i32(rt_sys_socket(2, 1, 0)))
 	if fd < 0 {
 		fail os_fault("socket")
 	}
 	one := calloc(1, 8)
 	one[0] = 1
-	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, one, 4)
+	rt_sys_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, one, 4)
 	free(one)
-	if i64(i32(bind(fd, sa, 16))) < 0 {
+	if i64(i32(rt_sys_bind(fd, sa, 16))) < 0 {
 		f := os_fault(say.Fmt("bind %s", addr))
-		close(fd)
+		rt_sys_close(fd)
 		if f != nil {
 			fail f
 		}
 		return none
 	}
-	if i64(i32(listen(fd, 1024))) < 0 {
+	if i64(i32(rt_sys_listen(fd, 1024))) < 0 {
 		f2 := os_fault("listen")
-		close(fd)
+		rt_sys_close(fd)
 		if f2 != nil {
 			fail f2
 		}
@@ -395,7 +384,7 @@ func Listen(addr str) !Listener {
 	}
 	ln := calloc(1, 8)
 	ln[0] = 16
-	getsockname(fd, sa, ln)
+	rt_sys_getsockname(fd, sa, ln)
 	free(ln)
 	nonblocking(fd)
 	return Listener{open: true, fd: fd, port: i64(load8(sa+2))<<8 | i64(load8(sa+3))}
@@ -412,12 +401,12 @@ func (l Listener) Accept() !Conn {
 		fail "wire: accept on a closed listener"
 	}
 	for {
-		fd := i64(i32(accept(l.fd, 0, 0)))
+		fd := i64(i32(rt_sys_accept(l.fd, 0, 0)))
 		if fd >= 0 {
 			one := calloc(1, 8)
 			one[0] = 1
 			rt_nosigpipe(fd)
-			setsockopt(fd, 6, 1, one, 4)
+			rt_sys_setsockopt(fd, 6, 1, one, 4)
 			free(one)
 			nonblocking(fd)
 			return Conn{open: true, fd: fd, timeout: 0}
@@ -436,7 +425,7 @@ func (l Listener) Accept() !Conn {
 // Close stops listening.
 func (l mut Listener) Close() {
 	if l.open {
-		close(l.fd)
+		rt_sys_close(l.fd)
 		l.open = false
 	}
 }

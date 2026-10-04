@@ -6,16 +6,6 @@
 // to an open-addressing table. Every reference type uses 0 for nil, and nil strings,
 // slices and maps behave as empty.
 
-extern func write(fd i64, buf i64, n i64) i64
-extern func read(fd i64, buf i64, n i64) i64
-extern func nanosleep(req i64, rem i64) i64
-extern func poll(fds i64, n i64, timeout i64) i64
-extern func pipe(fds i64) i64
-extern func fcntl(fd i64, cmd i64, ...) i64
-extern func exit(code i64)
-extern func _exit(code i64)
-extern func sigaltstack(ss i64, old i64) i64
-extern func sigaction(sig i64, act i64, old i64) i64
 extern func isatty(fd i64) i64
 extern func rint(x f64) f64
 extern func dladdr(addr i64, info i64) i64
@@ -36,7 +26,7 @@ const ctxIngot = 6      // 1 while initializers run: allocations go to the ingot
 const ctxPoolBase = 7   // the core's first pool chunk
 const ctxPoolMark = 8   // pool top in the first chunk once allocation moved past it
 const ctxPoolExtra = 9  // overflow chunks and big blocks, freed at reset: [next, ...]
-// Word 11 caches vector capability; other words 10..31 remain reserved so compiler-generated global offsets stay unchanged.
+// Words 10 and 11 hold the Linux error and vector mode; 12..31 preserve global offsets.
 const ctxWords = 32
 
 const chunkSize = 4194304
@@ -79,6 +69,7 @@ func rt_init(argc i64, argv i64, ntls i64, coreinit func()) {
 	rtOut[1] = 65536
 	rtOut[2] = malloc(65536)
 	rtOutTTY = isatty(1)&0xffffffff != 0
+	rt_clock_setup()
 	rt_random(&rtHashK0, 8)
 	rt_random(&rtHashK1, 8)
 	rt_altstack()
@@ -94,7 +85,7 @@ const altStackSize = 65536
 func rt_altstack() {
 	st := calloc(1, 32)
 	rt_stack_t(st, calloc(1, altStackSize), altStackSize)
-	sigaltstack(st, 0)
+	rt_sys_sigaltstack(st, 0)
 	free(st)
 }
 
@@ -117,11 +108,11 @@ func rt_fault(sig i64, info i64, uctx i64) {
 	} else {
 		rt_fault_say("\npanic: segmentation fault (invalid memory access, or a thread stack overflow)\n")
 	}
-	_exit(2)
+	rt_sys__exit(2)
 }
 
 func rt_fault_say(s str) {
-	write(2, cast(i64, s)+8, len(s))
+	rt_sys_write(2, cast(i64, s)+8, len(s))
 }
 
 // rt_aligned_alloc returns n zeroed bytes on their own 128-byte cache lines (n is rounded up).
@@ -182,7 +173,7 @@ func rt_core_id() i64 {
 
 func rt_exit() {
 	rt_flush()
-	exit(0)
+	rt_sys_exit(0)
 }
 
 // rt_main_begin ends initialization: from here allocations go to the request pool.
@@ -342,7 +333,7 @@ func rt_unlock(p i64) {
 
 func rt_write_all(fd i64, p i64, n i64) {
 	for n > 0 {
-		w := write(fd, p, n)
+		w := rt_sys_write(fd, p, n)
 		if w <= 0 {
 			return
 		}
@@ -400,7 +391,7 @@ func rt_panic(msg str) {
 		t[tPanicked] = 1
 		rt_task_abort(t)
 	}
-	exit(2)
+	rt_sys_exit(2)
 }
 
 // rt_backtrace prints the calling functions by walking the frame-pointer chain.
@@ -2450,8 +2441,6 @@ func rt_fmt_slp(s i64) {
 // only what a call preserves: callee-saved registers, frame pointer, return address and
 // stack pointer. The core context register is the same on every task of a core.
 
-extern func mprotect(addr i64, n i64, prot i64) i64
-extern func madvise(addr i64, n i64, advice i64) i64
 
 const taskStack = 262144
 const taskGuard = 16384
@@ -2516,7 +2505,7 @@ func rt_task_new(body func(i64), arg i64) i64 {
     }
     if t[tStack] == 0 {
         base := mem_map(taskStack+taskGuard,MAP_STACK)
-        if i64(i32(mprotect(base,taskGuard,0))) != 0 { mem_oom(taskStack+taskGuard) }
+        if i64(i32(rt_sys_mprotect(base,taskGuard,0))) != 0 { mem_oom(taskStack+taskGuard) }
         t[tStack] = base
     }
 	t[tFn] = cast(i64, body)
@@ -2624,7 +2613,7 @@ func rt_task_yield() {
 func rt_task_free(t i64) {
     if freeTaskCount >= maxFreeTasks {
         free(t[tPool+2])
-        munmap(t[tStack],taskStack+taskGuard)
+        rt_sys_munmap(t[tStack],taskStack+taskGuard)
         // Stale timer entries still read this record; the last one to pop frees it.
         if t[tTimers] > 0 {
             t[tRetired] = 1
@@ -2635,8 +2624,8 @@ func rt_task_free(t i64) {
     }
     if t[tTrim] != 0 {
         rt_memory_discard(t[tPool+2])
-        if i64(i32(madvise(t[tStack]+taskGuard,taskStack,MEM_DONTNEED))) != 0 {
-            munmap(t[tStack],taskStack+taskGuard)
+        if i64(i32(rt_sys_madvise(t[tStack]+taskGuard,taskStack,MEM_DONTNEED))) != 0 {
+            rt_sys_munmap(t[tStack],taskStack+taskGuard)
             t[tStack] = 0
         }
     }
@@ -2848,7 +2837,7 @@ func rt_poll_wait(fd i64, want i64, timeout i64) i64 {
 		ms = (timeout + 999999) / 1000000
 	}
 	for {
-		r := i64(i32(poll(pfd, 1, ms)))
+		r := i64(i32(rt_sys_poll(pfd, 1, ms)))
 		if r > 0 {
 			return waitReady
 		}
@@ -2875,7 +2864,7 @@ func rt_sleep_ns(ns i64) {
 	ts := rt_alloc(32)
 	ts[0] = ns / 1000000000
 	ts[1] = ns % 1000000000
-	for i64(i32(nanosleep(ts, ts+16))) != 0 {
+	for i64(i32(rt_sys_nanosleep(ts, ts+16))) != 0 {
 		if rt_errno() != EINTR {
 			return
 		}
@@ -2978,7 +2967,7 @@ func rt_timer_pop(now i64) i64 {
 }
 
 func rt_pipe(fds i64) i64 {
-	return i64(i32(pipe(fds)))
+	return i64(i32(rt_sys_pipe(fds)))
 }
 
 // ---- helper threads: blocking calls (DNS, files) run here while the task waits ----
@@ -3021,7 +3010,7 @@ func rt_helper_run(f func(i64), arg i64, drop func(i64)) ! {
 		rt_pipe(fds)
 		helperQ[0] = i64(i32(__ld(fds, 2)))
 		helperQ[1] = i64(i32(__ld(fds+4, 2)))
-		fcntl(helperQ[1], F_SETFL, O_NONBLOCK)
+		rt_sys_fcntl(helperQ[1], F_SETFL, O_NONBLOCK)
 		free(fds)
 		for i := 0; i < helperThreads; i++ {
 			rt_spawn_core(rt_helper_main, i)
@@ -3049,7 +3038,7 @@ func rt_helper_run(f func(i64), arg i64, drop func(i64)) ! {
 	rt_unlock(&helperLock)
 	// A full pipe already has wakeups pending; workers drain the whole queue.
 	b := calloc(1, 8)
-	for write(helperQ[1], b, 1) < 0 && rt_errno() == EINTR {}
+	for rt_sys_write(helperQ[1], b, 1) < 0 && rt_errno() == EINTR {}
 	free(b)
 	r := rt_task_park(0)
 	if r == waitDeadline {
@@ -3091,7 +3080,7 @@ func rt_helper_take() i64 {
 func rt_helper_main(id i64) {
 	buf := calloc(1, 8)
 	for {
-		if read(helperQ[0], buf, 1) != 1 {
+		if rt_sys_read(helperQ[0], buf, 1) != 1 {
 			continue
 		}
 		job := rt_helper_take()

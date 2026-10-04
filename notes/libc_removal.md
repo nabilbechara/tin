@@ -280,3 +280,38 @@ medium copies now use a per-core capability cache, guarded by CPUID AVX/OSXSAVE,
 XMM/YMM state, and CPUID AVX2. SSE2 remains the unsupported-CPU and legacy-compiler path.
 The corpus runs with automatic selection and forced SSE2, including guard pages and
 large overlaps. Native timing tables will be attached after the new head is measured.
+
+## Phase 3 implementation and validation
+
+Both backends emit raw syscall and signal-return leaves. The runtime and compiler
+share seed-compatible Linux wrappers with per-architecture numbers and directory
+flags; generic shared-library callers use rt_sys_* names. Darwin keeps its original
+foreign interfaces behind package/platform helpers, without raw calls. Linux errors
+come directly from kernel results and live in core word 10. Pthread creation remains.
+
+Directory iteration uses checked 32 KiB getdents64 records with refill, long-name
+validation and lstat for unknown types. The returning-signal probe supplies an
+SA_RESTORER leaf on both CPUs and confirms execution on an alternate stack. The
+strict suite, bootstrap, existing network/lifetime checks and syscall_check.py remain
+required. The latter compares Go outputs and forbids removed syscall imports in ELF.
+
+The checked-in old Linux seed needs a libc syscall fallback when building stage 1.
+Reachability excludes that body for compiler-emitted leaves, so generated programs
+do not import it. Its declarations remain honestly inventoried until phase 5's seed
+cutover. __errno_location also remains solely for failures of libc setenv/unsetenv,
+which the plan moves in phase 5; syscall errors never read it.
+
+Clock lookup uses AT_SYSINFO_EHDR and the kernel vDSO symbol tables (SysV and GNU),
+with the raw syscall as fallback. This brings the phase 5 clock lookup forward to
+preserve the existing fast clock path during the syscall transition; libc getauxval
+still supplies auxv until initial-stack startup replaces it in phase 5.
+
+
+Phase 3 performance follow-up: both first-run native HTTP comparisons missed the
+0.95 req/s gate (arm64 0.932/0.931 and amd64 0.913/0.931 for JSON/plaintext). The
+required repeat is retained. Hot strict wrappers now emit direct syscall leaves with
+inline kernel-error translation, removing the legacy wrapper/result call chain. The
+clock leaf loads the shared vDSO pointer and calls its C ABI directly, retaining a
+raw clock_gettime fallback, argument preservation and ABI stack alignment. Legacy
+compiler wrappers retain their seed-compatible error storage. The relocation-free
+leaves are regenerated from the recorded per-CPU numbers by gen_syscall_fast.py.
