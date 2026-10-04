@@ -1,6 +1,7 @@
+package seal
+
 // RSA signature verification: PKCS #1 v1.5 and PSS (RFC 8017), for X.509 and TLS.
 // Verification sees only public values, so it is not constant time.
-package seal
 
 import "say"
 
@@ -9,8 +10,6 @@ const oidRSA = "1.2.840.113549.1.1.1"
 // rsa_digest_info is the DER DigestInfo prefix PKCS #1 v1.5 puts before a digest made with h.
 func rsa_digest_info(h Hash) []u8 {
 	switch h {
-	case SHA1:
-		return []u8{0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04, 0x14}
 	case SHA256:
 		return []u8{0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20}
 	case SHA384:
@@ -60,20 +59,37 @@ func rsa_public(key RSAPublicKey, sig []u8) ![]u8 {
 	if len(sig) != k {
 		fail "seal: RSA signature has the wrong length"
 	}
-	c := try mont_new(key.N)
-	s := nat_from_bytes(sig, c.n)
-	if nat_cmp(s, c.m) >= 0 {
+	f := try monty_new(key.N)
+	z := f.elem()
+	if len(sig) > 4*f.n || f.from_bytes(mut z, monty_bytes(f, sig)) == 0 {
 		fail "seal: RSA signature out of range"
 	}
-	return nat_bytes(mont_exp_pub(c, s, e), k)
+	rsa_exp_pub(mut f, mut z, e)
+	out := f.to_bytes(z)
+	return out[len(out)-k:]
+}
+
+// rsa_exp_pub sets z = z^e in Montgomery form, square and multiply from e's top set bit; e is public.
+func rsa_exp_pub(f mut monty, z mut []u64, e []u8) {
+	base := f.elem()
+	f.set(mut base, z)
+	started := false
+	for i := 0; i < len(e)*8; i++ {
+		bit := (e[i/8] >> u8(7-i%8)) & 1
+		if started {
+			f.mul(mut z, z, z)
+			if bit == 1 {
+				f.mul(mut z, z, base)
+			}
+		} else if bit == 1 {
+			started = true
+		}
+	}
 }
 
 // VerifyPKCS1v15 checks an RSASSA-PKCS1-v1_5 signature over digest, a hash made with h.
 func VerifyPKCS1v15(key RSAPublicKey, h Hash, digest []u8, sig []u8) ! {
-	if !hash_ready(h) {
-		fail "seal: " + HashName(h) + " is not available yet"
-	}
-	if len(digest) != HashSize(h) {
+	if len(digest) != Size(h) {
 		fail "seal: digest length does not match the hash"
 	}
 	em := try rsa_public(key, sig)
@@ -101,7 +117,7 @@ func VerifyPKCS1v15(key RSAPublicKey, h Hash, digest []u8, sig []u8) ! {
 
 // mgf1 is MGF1 over h: n bytes of mask from seed.
 func mgf1(h Hash, seed []u8, n i64) []u8 {
-	out := make([]u8, 0, n+HashSize(h))
+	out := make([]u8, 0, n+Size(h))
 	b := make([]u8, len(seed)+4)
 	copy(b, seed)
 	for c := 0; len(out) < n; c++ {
@@ -109,7 +125,7 @@ func mgf1(h Hash, seed []u8, n i64) []u8 {
 		b[len(seed)+1] = u8(c >> 16)
 		b[len(seed)+2] = u8(c >> 8)
 		b[len(seed)+3] = u8(c)
-		for _, x := range HashSum(h, str(b)) {
+		for _, x := range Sum(h, str(b)) {
 			out = append(out, x)
 		}
 	}
@@ -119,10 +135,7 @@ func mgf1(h Hash, seed []u8, n i64) []u8 {
 // VerifyPSS checks an RSASSA-PSS signature over digest, a hash made with h, with MGF1 over the same
 // hash. saltLen is the exact salt length, or -1 to accept any.
 func VerifyPSS(key RSAPublicKey, h Hash, digest []u8, sig []u8, saltLen i64) ! {
-	if !hash_ready(h) {
-		fail "seal: " + HashName(h) + " is not available yet"
-	}
-	hlen := HashSize(h)
+	hlen := Size(h)
 	if len(digest) != hlen {
 		fail "seal: digest length does not match the hash"
 	}
@@ -165,7 +178,7 @@ func VerifyPSS(key RSAPublicKey, h Hash, digest []u8, sig []u8, saltLen i64) ! {
 	for _, x := range salt {
 		mp = append(mp, x)
 	}
-	want := HashSum(h, str(mp))
+	want := Sum(h, str(mp))
 	if !ConstantTimeEq(want, hh) {
 		fail "seal: RSA PSS signature verification failed"
 	}

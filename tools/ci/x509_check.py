@@ -5,7 +5,7 @@
    generated for this run; tests/v2/seal_x509.tin and its Go twin bench/ref/seal_x509 verify every
    case, and both must give the outcome cases.txt expects.
 2. The checked-in PKI (tests/data/x509: chains and parsed fields) and the Wycheproof vectors
-   (tests/data/wycheproof) give the same results in Go as the strict suite's expected Tin output.
+   (tests/wycheproof/rsa) give the same results in Go as the strict suite's expected Tin output.
 3. Every byte of every certificate in the fresh PKI and in the system bundle is flipped three ways;
    Tin must reject every mutant Go rejects (Tin may reject more: Go ignores trailing bytes in a
    few places).

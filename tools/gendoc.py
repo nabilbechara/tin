@@ -13,7 +13,7 @@ ROLE = {"say": "formatting and printing (fmt)", "fault": "fault chains and stand
         "quarry": "files, environment, process (os)", "trail": "paths (path/filepath)", "lever": "command-line flags (flag)",
         "tide": "time (time)", "dice": "random numbers (math/rand)", "sift": "sorting, searching and the generic slice functions (sort, slices, cmp)", "atlas": "functions on maps (maps)",
         "cairn": "containers (container/heap, sets, LRU)", "stamp": "hashes and checksums (hash/*)",
-        "seal": "crypto and encodings (crypto/sha256, hmac, encoding/hex, base64)", "herald": "logging (log/slog)",
+        "seal": "crypto and encodings (crypto/sha256, sha512, hmac, hkdf, ecdh, rsa, x509, encoding/hex, base64, pem)", "herald": "logging (log/slog)",
         "crucible": "testing helpers (testing)", "constraints": "named generic constraint shapes",
         "policy": "with policies and slots (context values, retry/cache/trace middleware)",
         "redis": "Redis client (go-redis)",

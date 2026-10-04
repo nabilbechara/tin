@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert Wycheproof signature vectors to the compact files under tests/data/wycheproof/.
+"""Convert Wycheproof RSA signature vectors to the compact files under tests/wycheproof/rsa/.
 
 Usage: tools/gen_wycheproof.py PATH/TO/wycheproof   (a checkout of github.com/C2SP/wycheproof)
 
@@ -9,23 +9,29 @@ per test:
     group rsa-pss SHA-256 32 KEYHEX           (salt length; MGF1 uses the same hash)
     TCID valid|invalid|acceptable MSGHEX SIGHEX   ("-" for an empty field)
 Only groups whose hashes seal implements are kept (HASHES below). Standard library only;
-the output is deterministic. The vectors are Apache-2.0 (notes/licenses/wycheproof.txt).
+the output is deterministic. The vectors are Apache-2.0; tests/wycheproof/README.md names the
+commit they come from.
 """
 import json
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / 'tests/data/wycheproof'
-HASHES = {'SHA-256'}
+OUT = ROOT / 'tests/wycheproof/rsa'
+HASHES = {'SHA-256', 'SHA-384', 'SHA-512'}
 FILES = [
     'rsa_signature_2048_sha256_test.json',
+    'rsa_signature_2048_sha384_test.json',
+    'rsa_signature_2048_sha512_test.json',
     'rsa_signature_3072_sha256_test.json',
     'rsa_signature_4096_sha256_test.json',
+    'rsa_signature_4096_sha384_test.json',
+    'rsa_signature_4096_sha512_test.json',
     'rsa_pss_2048_sha256_mgf1_0_test.json',
     'rsa_pss_2048_sha256_mgf1_32_test.json',
-    'rsa_pss_3072_sha256_mgf1_32_test.json',
+    'rsa_pss_2048_sha384_mgf1_48_test.json',
     'rsa_pss_4096_sha256_mgf1_32_test.json',
+    'rsa_pss_4096_sha512_mgf1_64_test.json',
     'rsa_pss_misc_test.json',
 ]
 

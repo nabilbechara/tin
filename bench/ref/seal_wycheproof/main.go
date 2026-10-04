@@ -5,6 +5,8 @@ import (
 	"crypto"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/sha512"
+	"hash"
 	"crypto/x509"
 	"encoding/hex"
 	"fmt"
@@ -15,9 +17,10 @@ import (
 )
 
 var files = []string{
-	"rsa_signature_2048_sha256", "rsa_signature_3072_sha256", "rsa_signature_4096_sha256",
-	"rsa_pss_2048_sha256_mgf1_0", "rsa_pss_2048_sha256_mgf1_32", "rsa_pss_3072_sha256_mgf1_32",
-	"rsa_pss_4096_sha256_mgf1_32", "rsa_pss_misc",
+	"rsa_signature_2048_sha256", "rsa_signature_2048_sha384", "rsa_signature_2048_sha512", "rsa_signature_3072_sha256",
+	"rsa_signature_4096_sha256", "rsa_signature_4096_sha384", "rsa_signature_4096_sha512",
+	"rsa_pss_2048_sha256_mgf1_0", "rsa_pss_2048_sha256_mgf1_32", "rsa_pss_2048_sha384_mgf1_48",
+	"rsa_pss_4096_sha256_mgf1_32", "rsa_pss_4096_sha512_mgf1_64", "rsa_pss_misc",
 }
 
 func unhex(s string) []byte {
@@ -28,18 +31,34 @@ func unhex(s string) []byte {
 	return b
 }
 
-// pssSaltLen recovers the salt length of a PSS signature that verified (SHA-256, MGF1-SHA-256).
-func pssSaltLen(key *rsa.PublicKey, sig []byte) int {
+var hashes = map[string]crypto.Hash{"SHA-256": crypto.SHA256, "SHA-384": crypto.SHA384, "SHA-512": crypto.SHA512}
+
+func digestOf(h crypto.Hash, msg []byte) []byte {
+	var d hash.Hash
+	switch h {
+	case crypto.SHA384:
+		d = sha512.New384()
+	case crypto.SHA512:
+		d = sha512.New()
+	default:
+		d = sha256.New()
+	}
+	d.Write(msg)
+	return d.Sum(nil)
+}
+
+// pssSaltLen recovers the salt length of a PSS signature that verified (MGF1 over the same hash).
+func pssSaltLen(key *rsa.PublicKey, h crypto.Hash, sig []byte) int {
 	m := new(big.Int).Exp(new(big.Int).SetBytes(sig), big.NewInt(int64(key.E)), key.N)
 	emBits := key.N.BitLen() - 1
 	emLen := (emBits + 7) / 8
 	em := m.FillBytes(make([]byte, emLen))
-	dbLen := emLen - 32 - 1
-	h := em[dbLen : dbLen+32]
+	hlen := h.Size()
+	dbLen := emLen - hlen - 1
+	hh := em[dbLen : dbLen+hlen]
 	var mask []byte
 	for c := 0; len(mask) < dbLen; c++ {
-		x := sha256.Sum256(append(append([]byte{}, h...), byte(c>>24), byte(c>>16), byte(c>>8), byte(c)))
-		mask = append(mask, x[:]...)
+		mask = append(mask, digestOf(h, append(append([]byte{}, hh...), byte(c>>24), byte(c>>16), byte(c>>8), byte(c)))...)
 	}
 	db := make([]byte, dbLen)
 	for i := range db {
@@ -54,12 +73,12 @@ func pssSaltLen(key *rsa.PublicKey, sig []byte) int {
 }
 
 func run(name string) {
-	text, err := os.ReadFile("tests/data/wycheproof/" + name + ".txt")
+	text, err := os.ReadFile("tests/wycheproof/rsa/" + name + ".txt")
 	if err != nil {
 		fmt.Println(name, "unreadable:", err)
 		return
 	}
-	kind, salt := "", -1
+	kind, salt, h := "", -1, crypto.SHA256
 	var key *rsa.PublicKey
 	counts, passed := map[string]int{}, map[string]int{}
 	for _, ln := range strings.Split(string(text), "\n") {
@@ -68,7 +87,7 @@ func run(name string) {
 		}
 		f := strings.Fields(ln)
 		if f[0] == "group" {
-			kind, salt = f[1], -1
+			kind, salt, h = f[1], -1, hashes[f[2]]
 			if f[3] != "-" {
 				salt, _ = strconv.Atoi(f[3])
 			}
@@ -79,17 +98,17 @@ func run(name string) {
 			continue
 		}
 		result := f[1]
-		digest := sha256.Sum256(unhex(f[2]))
+		digest := digestOf(h, unhex(f[2]))
 		sig := unhex(f[3])
 		ok := false
 		if key != nil {
 			if kind == "rsa-pkcs1" {
-				ok = rsa.VerifyPKCS1v15(key, crypto.SHA256, digest[:], sig) == nil
+				ok = rsa.VerifyPKCS1v15(key, h, digest, sig) == nil
 			} else {
 				// Go reads salt length 0 as "auto"; Tin checks it exactly, so check it here too.
-				ok = rsa.VerifyPSS(key, crypto.SHA256, digest[:], sig, &rsa.PSSOptions{SaltLength: salt}) == nil
+				ok = rsa.VerifyPSS(key, h, digest, sig, &rsa.PSSOptions{SaltLength: salt}) == nil
 				if ok && salt == 0 {
-					ok = pssSaltLen(key, sig) == 0
+					ok = pssSaltLen(key, h, sig) == 0
 				}
 			}
 		}

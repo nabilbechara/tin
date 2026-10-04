@@ -1,7 +1,8 @@
+package seal
+
 // X.509 certificates: PEM, a strict DER certificate parser, certificate pools, chain building to
 // trusted roots and RFC 6125 host name checks. Verification sees only public data, so none of
 // this is constant time.
-package seal
 
 import "say"
 import "tide"
@@ -429,13 +430,16 @@ func x509_pss_params(b []u8, from i64, to i64) !SignatureAlgorithm {
 	if pt != to {
 		fail "seal: trailing data after RSA-PSS parameters"
 	}
-	h := Hash.SHA1
-	mh := Hash.SHA1
+	h := Hash.SHA256
+	mh := Hash.SHA256
 	salt := 20
+	sha1 := true
+	mgfSha1 := true
 	p := pf
 	if p < pt && b[p] == 0xa0 {
 		_, f, t := try der_read(b, p, pt)
 		h = try x509_hash_alg(b, f, t)
+		sha1 = false
 		p = t
 	}
 	if p < pt && b[p] == 0xa1 {
@@ -446,6 +450,7 @@ func x509_pss_params(b []u8, from i64, to i64) !SignatureAlgorithm {
 			fail "seal: unsupported RSA-PSS mask generation function"
 		}
 		mh = try x509_hash_alg(b, q, mt)
+		mgfSha1 = false
 		p = t
 	}
 	if p < pt && b[p] == 0xa2 {
@@ -468,7 +473,10 @@ func x509_pss_params(b []u8, from i64, to i64) !SignatureAlgorithm {
 	if p != pt {
 		fail "seal: malformed RSA-PSS parameters"
 	}
-	if h != mh || salt != HashSize(h) {
+	if sha1 || mgfSha1 {
+		fail "seal: RSA-PSS with SHA-1 is not supported"
+	}
+	if h != mh || salt != Size(h) {
 		fail "seal: unsupported RSA-PSS parameters (the MGF1 hash and salt length must match the hash)"
 	}
 	switch h {
@@ -587,7 +595,7 @@ func x509_spki(b []u8, at i64, end i64, c mut Certificate) !i64 {
 		if len(key) != 1+2*size || key[0] != 4 {
 			fail "seal: EC public keys must be uncompressed points"
 		}
-		try x509_on_curve(c.Curve, key[1:1+size], key[1+size:])
+		try x509_on_curve(c.Curve, key)
 		c.PublicKeyAlgorithm = PublicKeyAlgorithm.ECDSA
 	} else if oid == oidEd25519 {
 		if p != aend || len(key) != 32 {
@@ -599,44 +607,41 @@ func x509_spki(b []u8, at i64, end i64, c mut Certificate) !i64 {
 }
 
 // x509_on_curve fails unless (x, y) is a point of the named curve: coordinates below p and
-// y^2 = x^3 - 3x + b (mod p). Public data: the arithmetic need not be constant time.
-func x509_on_curve(curve str, x []u8, y []u8) ! {
-	ph := "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff"
-	bh := "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b"
-	if curve == "P-384" {
-		ph = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff"
-		bh = "b3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875ac656398d8a2ed19d2a85c8edd3ec2aef"
-	} else if curve == "P-521" {
+// y^2 = x^3 - 3x + b (mod p). P-256 uses p256.tin's decoder; the others a monty built here.
+func x509_on_curve(curve str, point []u8) ! {
+	if curve == "P-256" {
+		_ = try p256_decode(point)
+		return
+	}
+	ph := "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff"
+	bh := "b3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875ac656398d8a2ed19d2a85c8edd3ec2aef"
+	if curve == "P-521" {
 		ph = "01ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 		bh = "0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e156193951ec7e937b1652c0bd3bb1bf073573df883d2c34f1ef451fd46b503f00"
 	}
 	pb := try HexDecode(ph)
 	bb := try HexDecode(bh)
-	c := try mont_new(pb)
-	n := c.n
-	xs := nat_from_bytes(x, n)
-	ys := nat_from_bytes(y, n)
-	if nat_cmp(xs, c.m) >= 0 || nat_cmp(ys, c.m) >= 0 {
+	size := len(pb)
+	f := try monty_new(pb)
+	x := f.elem()
+	y := f.elem()
+	b := f.elem()
+	if f.from_bytes(mut x, monty_bytes(f, point[1:1+size])) == 0 || f.from_bytes(mut y, monty_bytes(f, point[1+size:])) == 0 {
 		fail "seal: EC public key coordinate out of range"
 	}
-	t := make([]u64, n+2)
-	tmp := make([]u64, n)
-	xm := make([]u64, n)
-	ym := make([]u64, n)
-	bm := make([]u64, n)
-	mont_mul(c, xs, c.rr, mut xm, mut t)
-	mont_mul(c, ys, c.rr, mut ym, mut t)
-	mont_mul(c, nat_from_bytes(bb, n), c.rr, mut bm, mut t)
-	lhs := make([]u64, n)
-	mont_mul(c, ym, ym, mut lhs, mut t)
-	rhs := make([]u64, n)
-	mont_mul(c, xm, xm, mut rhs, mut t)
-	mont_mul(c, rhs, xm, mut rhs, mut t)
-	for i := 0; i < 3; i++ {
-		mont_sub(c, rhs, xm, mut rhs)
+	if f.from_bytes(mut b, monty_bytes(f, bb)) == 0 {
+		fail "seal: bad curve constant"
 	}
-	mont_add(c, rhs, bm, mut rhs, mut tmp)
-	if nat_cmp(lhs, rhs) != 0 {
+	lhs := f.elem()
+	f.mul(mut lhs, y, y)
+	rhs := f.elem()
+	f.mul(mut rhs, x, x)
+	f.mul(mut rhs, rhs, x)
+	for i := 0; i < 3; i++ {
+		f.sub(mut rhs, rhs, x)
+	}
+	f.add(mut rhs, rhs, b)
+	if f.equal(lhs, rhs) == 0 {
 		fail "seal: EC public key is not on the curve"
 	}
 }
@@ -1014,11 +1019,9 @@ func ParseCertificatesPEM(pem str) ![]Certificate {
 
 // ---- Signatures ----
 
-// x509_sig_hash is the hash a signature algorithm uses.
+// x509_sig_hash is the hash a signature algorithm uses (SHA-1 algorithms are refused before hashing).
 func x509_sig_hash(a SignatureAlgorithm) Hash {
 	switch a {
-	case SHA1WithRSA, ECDSAWithSHA1:
-		return Hash.SHA1
 	case SHA384WithRSA, SHA384WithRSAPSS, ECDSAWithSHA384:
 		return Hash.SHA384
 	case SHA512WithRSA, SHA512WithRSAPSS, ECDSAWithSHA512:
@@ -1040,14 +1043,14 @@ func (c Certificate) CheckSignature(alg SignatureAlgorithm, signed []u8, sig []u
 		if c.PublicKeyAlgorithm != PublicKeyAlgorithm.RSA {
 			fail "x509: signature algorithm " + x509_alg_name(alg) + " does not match the issuer's key"
 		}
-		VerifyPKCS1v15(c.RSAKey, h, HashSum(h, str(signed)), sig) catch err {
+		VerifyPKCS1v15(c.RSAKey, h, Sum(h, str(signed)), sig) catch err {
 			fail say.Fault("x509: bad signature: %s", err)
 		}
 	case SHA256WithRSAPSS, SHA384WithRSAPSS, SHA512WithRSAPSS:
 		if c.PublicKeyAlgorithm != PublicKeyAlgorithm.RSA {
 			fail "x509: signature algorithm " + x509_alg_name(alg) + " does not match the issuer's key"
 		}
-		VerifyPSS(c.RSAKey, h, HashSum(h, str(signed)), sig, HashSize(h)) catch err {
+		VerifyPSS(c.RSAKey, h, Sum(h, str(signed)), sig, Size(h)) catch err {
 			fail say.Fault("x509: bad signature: %s", err)
 		}
 	default:
@@ -1057,9 +1060,6 @@ func (c Certificate) CheckSignature(alg SignatureAlgorithm, signed []u8, sig []u
 
 // CheckSignatureFrom checks that parent signed c. It does not check that parent may sign.
 func (c Certificate) CheckSignatureFrom(parent Certificate) ! {
-	if !hash_ready(x509_sig_hash(c.SignatureAlgorithm)) && c.SignatureAlgorithm != SignatureAlgorithm.SHA1WithRSA && c.SignatureAlgorithm != SignatureAlgorithm.ECDSAWithSHA1 {
-		fail "x509: " + x509_alg_name(c.SignatureAlgorithm) + " signatures are not supported yet"
-	}
 	try parent.CheckSignature(c.SignatureAlgorithm, c.RawTBS, c.Signature)
 }
 
@@ -1076,10 +1076,7 @@ func (c Certificate) CheckTLSSignature(scheme i64, signed []u8, sig []u8) ! {
 		if c.PublicKeyAlgorithm != PublicKeyAlgorithm.RSA {
 			fail "x509: TLS signature scheme does not match the certificate's key"
 		}
-		if !hash_ready(h) {
-			fail "x509: " + HashName(h) + " is not available yet"
-		}
-		VerifyPSS(c.RSAKey, h, HashSum(h, str(signed)), sig, HashSize(h)) catch err {
+		VerifyPSS(c.RSAKey, h, Sum(h, str(signed)), sig, Size(h)) catch err {
 			fail say.Fault("x509: bad TLS signature: %s", err)
 		}
 		return
