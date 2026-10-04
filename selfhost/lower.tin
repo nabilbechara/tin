@@ -3481,6 +3481,8 @@ fn say_arg(a, prefix) {
         } else {
             suffix = "slp";
         }
+    } else if k == K_OPT && kind_of(t[TY_ELEM]) != K_STRUCT && kind_of(t[TY_ELEM]) != K_DYN {
+        return say_opt(a, t, prefix);
     } else if k == K_STRUCT || k == K_OPT {
         let st = t;
         if k == K_OPT {
@@ -3510,6 +3512,24 @@ fn say_arg(a, prefix) {
         x = mk_conv(pos, a, CV_SAME, ty_int);
     }
     return rt_call(pos, str_cat3(prefix, suffix, ""), args1(x), ty_void);
+}
+
+// say_opt prints an optional str, slice or map: <nil>, or its value as that type prints.
+fn say_opt(a, t, prefix) {
+    let pos = a[N_POS];
+    let stmts = vec_new();
+    let obj = temp(pos, mk_conv(pos, a, CV_SAME, ty_int), ty_int);
+    vec_push(stmts, obj);
+    let ifs = node_new(ST_IF, pos);
+    ifs[IF_COND] = mk_bin(pos, "==", sym_ref_node(pos, obj[LET_SYM]), mk_int(pos, 0, ty_int), ty_bool);
+    ifs[IF_THEN] = empty_block(pos);
+    vec_push(ifs[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, str_cat3(prefix, "argsep", ""), vec_new(), ty_void)));
+    vec_push(ifs[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, "<nil>")), ty_void)));
+    vec_push(ifs[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, str_cat3(prefix, "argend", ""), vec_new(), ty_void)));
+    ifs[IF_ELSE] = empty_block(pos);
+    vec_push(ifs[IF_ELSE][BLK_STMTS], expr_stmt(say_arg(mk_conv(pos, sym_ref_node(pos, obj[LET_SYM]), CV_SAME, t[TY_ELEM]), prefix)));
+    vec_push(stmts, ifs);
+    return mk_seq(pos, stmts, mk_int(pos, 0, ty_int), ty_void);
 }
 
 // say_struct prints {a b c} by formatting each field in turn (nil optionals print <nil>).
@@ -3594,6 +3614,8 @@ fn say_struct_fn(t, prefix) {
             vec_push(body, expr_stmt(call_fn(pos, say_enum_fn(ft, prefix), args1(fv), ty_void)));
         } else if kind_of(ft) == K_STRUCT {
             vec_push(body, expr_stmt(call_fn(pos, say_struct_fn(ft, prefix), args1(fv), ty_void)));
+        } else if kind_of(ft) == K_OPT && kind_of(ft[TY_ELEM]) != K_STRUCT && kind_of(ft[TY_ELEM]) != K_DYN {
+            vec_push(body, expr_stmt(say_opt(fv, ft, prefix)));
         } else if kind_of(ft) == K_OPT {
             vec_push(body, expr_stmt(rt_call(pos, str_cat3(prefix, "p", ""), args1(mk_conv(pos, fv, CV_SAME, ty_int)), ty_void)));
         } else {
