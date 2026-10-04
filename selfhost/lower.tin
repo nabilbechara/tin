@@ -94,6 +94,9 @@ fn chk_kind(e, want) {
     if k == EX_BOUNDARY {
         return chk_boundary(e);
     }
+    if k == EX_UNIT {
+        return chk_unit(e, want);
+    }
     if k == EX_TYPE {
         err_at(e[N_POS], "type used as a value");
         return ty_int;
@@ -1764,6 +1767,44 @@ fn chk_funclit(e) {
     let seq = mk_seq(pos, stmts, desc_val, f[F_TYPE]);
     replace_node(e, seq);
     return f[F_TYPE];
+}
+
+// chk_unit turns an edition 1 unit literal (200ms, 4mb) into its integer constant:
+// nanoseconds for a duration, bytes for a size (design_syntax §2).
+fn chk_unit(e, want) {
+    let pos = e[N_POS];
+    let u = e[UNIT_NAME];
+    if e[UNIT_FLOAT] {
+        err_at(pos, "a fractional unit literal is not supported yet: write it in a smaller unit (2500ms, not 2.5s)");
+        return ty_int;
+    }
+    let scale = 1;
+    if streq(u, "us") {
+        scale = 1000;
+    } else if streq(u, "ms") {
+        scale = 1000000;
+    } else if streq(u, "s") {
+        scale = 1000000000;
+    } else if streq(u, "m") {
+        scale = 60000000000;
+    } else if streq(u, "h") {
+        scale = 3600000000000;
+    } else if streq(u, "kb") {
+        scale = 1024;
+    } else if streq(u, "mb") {
+        scale = 1048576;
+    } else if streq(u, "gb") {
+        scale = 1073741824;
+    }
+    let v = e[UNIT_VALUE];
+    if v < 0 || (v > 0 && v > 9223372036854775807 / scale) {
+        err_at(pos, "unit literal out of range");
+        return ty_int;
+    }
+    let n = node_new(EX_INT, pos);
+    n[INT_VAL] = v * scale;
+    replace_node(e, n);
+    return chk(e, want);
 }
 
 // ---- boundary blocks: guard (#230), within (#233) and limit (#235) ----
