@@ -57,8 +57,9 @@ tinc [-o OUT] [-S] [-target darwin-arm64|linux-arm64|linux-amd64] FILE.tin...
   executable (`<root>/bin/tinc` means `<root>/lib`). The `tin` script sets `TIN_ROOT`.
 - Strict programs get the package `lib/runtime/` (its `*_<os>.tin` and `*_<os>_<arch>.tin`
   files only for the target) automatically; imports are resolved as in LANGUAGE.md §1.
-- Errors print as `file:line:col: error: message`, every error in one run; the exit code
-  is 1. A compiler crash prints a backtrace only under a debugger (see §8).
+- Errors print as `file:line:col: error E502 TYPE_ARG_COUNT: message` (code and name from
+  [ERRORS.md](ERRORS.md); errors not yet given a code print `error: message`), every error
+  in one run; the exit code is 1. A compiler crash prints a backtrace only under a debugger (see §8).
 - `TINC_TRACE=1` prints each function as it is generated (to find which one crashes the
   code generator).
 
@@ -88,6 +89,7 @@ passes.
 | suite | where | how it checks |
 |---|---|---|
 | strict tests | `tests/v2/*.tin` | `tools/v2test.sh`: compiles and runs each, sorts the output and compares it with `NAME.out`; `NAME_bad.tin` must fail to compile with exactly `NAME_bad.err` |
+| diagnostic codes | `docs/ERRORS.md` | `tools/v2test.sh` runs `tools/ci/diagnostics_check.py`: the compiler's codes, the page and the `.err` files agree, and every example on the page compiles to exactly the output it shows |
 | assembly checks | `tests/v2/*_asm.tin` + `*_asm.check` | `tools/v2test.sh`: compiles with `-S` and matches the listing against ordered `CHECK:`/`CHECK-NOT:` lines, lit-style; a `[arm64]`/`[amd64]` line selects a section, lines before any section apply to every CPU |
 | Linux | same files | `tools/linuxtest.sh`: cross-compiles for linux-arm64, runs in `tin-debian-arm64`, compares with the same `.out` files |
 | HTTP conformance | `bench/http/conformance` | 26 edge cases against a running server: `bin/conformance -addr 127.0.0.1:9180 -pid PID` |
@@ -134,6 +136,11 @@ Adding a strict test: write `tests/v2/NAME.tin` with deterministic output (no ti
 addresses or map-order dependence beyond what sorting hides), run it, check every line
 by hand, then save `bin/t | sort > tests/v2/NAME.out`. `v2test.sh` never creates
 expected files itself.
+
+Adding a compiler error: report it with `err_code(pos, "E5NN NAME")` (or `err_code_at`,
+`err_code_quoted`), reusing the code of the rule it enforces or adding one: a new entry in
+`docs/ERRORS.md`, in code order, with the rule, an example, the exact output and the fix.
+Never renumber or reuse a code; when a diagnostic goes away, its entry stays, marked `Retired:`.
 
 Writing to files in tests: use paths under `/tmp/tin-test-*` (they work on macOS and
 Linux).
