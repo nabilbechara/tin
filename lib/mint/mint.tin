@@ -14,10 +14,10 @@ const MaxI64 = 9223372036854775807
 // MinI64 is the smallest i64.
 const MinI64 = -9223372036854775807 - 1
 
-// fbuf is this core's scratch buffer for snprintf (allocated once in the ingot heap).
+// fbuf is this core's scratch buffer for float conversion (allocated once in the ingot heap).
 var fbuf i64
 
-// endp is this core's one-word buffer receiving strtod's end pointer.
+// endp is this core's one-word buffer receiving the float parser's end pointer.
 var endp i64
 
 // Itoa returns v in decimal.
@@ -334,7 +334,7 @@ func prefixFold(s str, word str) i64 {
 	return n
 }
 
-// ParseFloat parses a Go float literal (decimal or 0x hex with p exponent, underscores, inf/infinity/nan) via strtod.
+// ParseFloat parses a Go float literal (decimal or 0x hex with p exponent, underscores, inf/infinity/nan) with exact nearest-even rounding.
 func ParseFloat(s str) !f64 {
 	n := len(s)
 	if n == 0 {
@@ -427,7 +427,7 @@ func ParseFloat(s str) !f64 {
 		endp = rt_ingot_alloc(8)
 	}
 	start := cast(i64, clean) + 8
-	f := strtod(start, endp)
+	f := rt_parse_float(start, endp)
 	if endp[0]-start != len(clean) {
 		fail syntaxErr("ParseFloat", s)
 	}
@@ -479,16 +479,6 @@ func FormatFloat(f f64, fmt u8, prec i64) str {
 	if prec < 0 {
 		return shortest(f, fmt)
 	}
-	cf := "%.*f"
-	if fmt == 'e' {
-		cf = "%.*e"
-	} else if fmt == 'E' {
-		cf = "%.*E"
-	} else if fmt == 'g' {
-		cf = "%.*g"
-	} else if fmt == 'G' {
-		cf = "%.*G"
-	}
 	size := 4096
 	buf := fbuf
 	if prec > 3700 {
@@ -498,7 +488,7 @@ func FormatFloat(f f64, fmt u8, prec i64) str {
 		fbuf = rt_ingot_alloc(size)
 		buf = fbuf
 	}
-	n := snprintf(buf, size, cast(i64, cf)+8, prec, f) & 0xffffffff
+	n := rt_number_format(buf, f, i64(fmt), prec)
 	return rt_str_from_raw(buf, n)
 }
 

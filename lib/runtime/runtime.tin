@@ -25,8 +25,6 @@ extern func _exit(code i64)
 extern func sigaltstack(ss i64, old i64) i64
 extern func sigaction(sig i64, act i64, old i64) i64
 extern func isatty(fd i64) i64
-extern func snprintf(buf i64, n i64, format i64, ...) i64
-extern func strtod(s i64, end i64) f64
 extern func strlen(s i64) i64
 extern func rint(x f64) f64
 extern func dladdr(addr i64, info i64) i64
@@ -215,7 +213,9 @@ func rt_div_fail() {
 // rt_bounds_fail2 is a failed bounds check with its index and length (Go's wording).
 func rt_bounds_fail2(i i64, n i64) {
 	b := rt_alloc(128)
-	k := snprintf(b, 128, cast(i64, "index out of range [%lld] with length %lld")+8, i, n) & 0xffffffff
+	text := "index out of range [" + rt_i64str(i) + "] with length " + rt_i64str(n)
+	k := len(text)
+	memcpy(b, cast(i64, text)+8, k)
 	rt_panic(rt_str_from_raw(b, k))
 }
 
@@ -493,7 +493,9 @@ func rt_panic(msg str) {
 func rt_backtrace(fp i64) {
 	info := calloc(4, 8)
 	core := rt_alloc(64)
-	cn := snprintf(core, 64, cast(i64, "\ncore %lld:\n")+8, rt_core_id()) & 0xffffffff
+	text := "\ncore " + rt_i64str(rt_core_id()) + ":\n"
+	cn := len(text)
+	memcpy(core, cast(i64, text)+8, cn)
 	rt_write_all(2, core, cn)
 	for k := 0; k < 64 && fp != 0; k++ {
 		ret := fp[1]
@@ -2016,11 +2018,11 @@ func rt_fmt_argend() {
 	rt_frame()[fNest]--
 }
 
-// f64 formatting, through snprintf and a shortest round-trip search for %v.
+// f64 formatting uses exact decimal rounding and shortest adjacent-float intervals.
 
 // fmt_nonfinite prints NaN, +Inf or -Inf the way Go's fmt does for every float verb: NaN has no sign
-// (+NaN with the + flag), infinities always do, and neither is padded with zeros. snprintf spells
-// them "nan" and "inf", so they must not reach it. It reports whether x was one of them.
+// (+NaN with the + flag), infinities always do, and neither is padded with zeros.
+// It reports whether x was one of them.
 func fmt_nonfinite(f i64, x f64, verb i64) bool {
 	if x == x && x <= 1.7976931348623157e308 && x >= -1.7976931348623157e308 {
 		return false
@@ -2041,19 +2043,9 @@ func fmt_nonfinite(f i64, x f64, verb i64) bool {
 	return true
 }
 
-func fmt_float_c(f i64, x f64, verb i64, prec i64) {
-	buf := rt_alloc(400)
-	cf := "%.*f"
-	if verb == 'e' {
-		cf = "%.*e"
-	} else if verb == 'E' {
-		cf = "%.*E"
-	} else if verb == 'g' {
-		cf = "%.*g"
-	} else if verb == 'G' {
-		cf = "%.*G"
-	}
-	n := snprintf(buf, 400, cast(i64, cf)+8, prec, x) & 0xffffffff
+func fmt_float_number(f i64, x f64, verb i64, prec i64) {
+	buf := rt_alloc(prec + 400)
+	n := rt_number_format(buf, x, verb, prec)
 	if f[fPlus] != 0 && load8(buf) != '-' {
 		memmove(buf+1, buf, n)
 		store8(buf, '+')
@@ -2064,7 +2056,7 @@ func fmt_float_c(f i64, x f64, verb i64, prec i64) {
 
 // fmt_shortest writes x with the fewest digits that read back exactly, laid out the way
 // Go's %v does: exponent form when the exponent is below -4 or at least 21.
-shared var fast_exp i64
+var fast_exp i64
 var fmtScratch i64   // per core: digit buffers for float formatting (no allocation per number)
 
 func fmt_scratch() i64 {
@@ -2150,43 +2142,8 @@ func shortest_into(out i64, x f64, lo i64, hi i64, json bool, plus bool) i64 {
 		store8(digits, '0')
 		nd = 1
 	} else if nd == 0 {
-		for p := 1; p <= 17; p++ {
-			snprintf(tmp, 64, cast(i64, "%.*e")+8, p-1, x)
-			back := strtod(tmp, 0)
-			if shortF32 {
-				back = f64(f32(back))
-			}
-			if back == x || p == 17 {
-				// tmp is [-]d.ddde±XX
-				q := tmp
-				if load8(q) == '-' {
-					q++
-				}
-				nd = 0
-				for load8(q) != 'e' {
-					if load8(q) != '.' {
-						store8(digits+nd, i64(load8(q)))
-						nd++
-					}
-					q++
-				}
-				q++
-				sign := 1
-				if load8(q) == '-' {
-					sign = -1
-				}
-				q++
-				for load8(q) >= '0' && load8(q) <= '9' {
-					exp = exp*10 + i64(load8(q)) - '0'
-					q++
-				}
-				exp *= sign
-				break
-			}
-		}
-		for nd > 1 && load8(digits+nd-1) == '0' {
-			nd--
-		}
+		nd = rt_number_short(x, digits, shortF32)
+		exp = fast_exp
 	}
 	n := 0
 	if neg {
@@ -2288,7 +2245,7 @@ func fmt_float(f i64, x f64, verb i64) {
 	if verb != 'f' && verb != 'F' && verb != 'e' && verb != 'E' && verb != 'g' && verb != 'G' {
 		verb = 'g'
 	}
-	fmt_float_c(f, x, verb, prec)
+	fmt_float_number(f, x, verb, prec)
 }
 
 func rt_fmt_f(x f64) {
