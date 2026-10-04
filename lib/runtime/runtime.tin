@@ -245,20 +245,41 @@ func rt_fault_sentinel(msg str, ident i64) i64 {
 	return rt_fault_raw(cast(i64, msg)+8, len(msg), 0, ident)
 }
 
+var faultStd i64 // per core: the runtime's sentinels by identity, made once in the ingot heap
+
+// rt_fault_std is the runtime sentinel id with message msg: one record per core, in the
+// ingot heap, so it outlives every request and boundary that holds it as a reason.
+func rt_fault_std(id i64, msg str) i64 {
+	if faultStd == 0 {
+		faultStd = rt_ingot_alloc(8 * faultUserIdent)
+	}
+	w := faultStd[id]
+	if w == 0 {
+		n := len(msg)
+		b := rt_ingot_alloc(faultHead + n + 9)
+		b[fhIdent] = id
+		w = b + faultHead
+		w[0] = n
+		memcpy(w+8, cast(i64, msg)+8, n)
+		faultStd[id] = w
+	}
+	return w
+}
+
 // rt_fault_canceled is fault.Canceled: a wait in a cancelled boundary.
-func rt_fault_canceled() i64 { return rt_fault_sentinel("canceled", faultCanceled) }
+func rt_fault_canceled() i64 { return rt_fault_std(faultCanceled, "canceled") }
 
 // rt_fault_deadline is fault.DeadlineExceeded: a wait past the task's deadline.
-func rt_fault_deadline() i64 { return rt_fault_sentinel("deadline exceeded", faultDeadline) }
+func rt_fault_deadline() i64 { return rt_fault_std(faultDeadline, "deadline exceeded") }
 
 // rt_fault_limit is fault.LimitExceeded: a budget or bounded value exceeded.
-func rt_fault_limit() i64 { return rt_fault_sentinel("limit exceeded", faultLimit) }
+func rt_fault_limit() i64 { return rt_fault_std(faultLimit, "limit exceeded") }
 
 // rt_fault_overloaded is fault.Overloaded: admission refused by load shedding.
-func rt_fault_overloaded() i64 { return rt_fault_sentinel("overloaded", faultOverloaded) }
+func rt_fault_overloaded() i64 { return rt_fault_std(faultOverloaded, "overloaded") }
 
 // rt_fault_draining is fault.Draining: the cause of cancellations during a drain.
-func rt_fault_draining() i64 { return rt_fault_sentinel("draining", faultDraining) }
+func rt_fault_draining() i64 { return rt_fault_std(faultDraining, "draining") }
 
 // rt_fault_panic is a panic converted to a fault (identity fault.Panic): its message and backtrace text.
 func rt_fault_panic(msg str, trace str) i64 {

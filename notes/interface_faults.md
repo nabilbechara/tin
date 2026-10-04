@@ -48,8 +48,11 @@ p+8   bytes     > a plain str: the FULL message, "outer: inner" for a wrapped fa
   | `fault.Panic` | 6 | the panic message | `rt_fault_panic(msg, trace)` |
 
   Constants `faultCanceled` .. `faultPanic` name them in the runtime. Runtime and library
-  code produce one with `fail cast(fault, rt_fault_deadline())`; each call allocates a
-  fresh record in the current region (identity, not the address, is what matches).
+  code produce one with `fail cast(fault, rt_fault_deadline())` (a boundary reason:
+  `rt_bnd_cancel(b, cast(fault, rt_fault_draining()))`). Each core makes each of these
+  records once, in the ingot heap (`rt_fault_std`), so a call allocates nothing and the
+  word outlives every request and boundary that holds it; the `fault` package's variables
+  are these same words. Identity, not the address, is what matches across cores.
 - **Boundaries (#231).** A wait that ends early fails with `rt_wait_fault()`: the cancel
   reason itself when its identity is `DeadlineExceeded` or `LimitExceeded`; otherwise a
   `fault.Canceled` record (message `canceled: <reason>`) whose cause is the reason, so
