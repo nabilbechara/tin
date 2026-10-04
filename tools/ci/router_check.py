@@ -501,6 +501,53 @@ def panics(exe, failures):
             failures.append('a panic during unwinding must print both messages: %r' % err[-2000:])
 
 
+def implicit_guards(out, failures):
+    """#230: ticks, relay handlers and detached tasks are guarded implicitly. A tick that
+    panics (the first three), relay messages whose handler panics and a detached task that
+    panics run their deferred calls and are logged; the core keeps ticking, handles the other
+    messages and serves requests."""
+    exe = out / 'guards'
+    subprocess.run([str(ROOT / 'bin/tinc'), '-edition', '1', '-o', str(exe), 'tools/ci/fixtures/guards.tin'],
+                   cwd=ROOT, check=True, env=dict(os.environ, TIN_ROOT=str(ROOT)))
+    port = ws.free_port()
+    server = subprocess.Popen([str(exe)], env=dict(os.environ, PORT=str(port), TIN_CORES='1'),
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    want = b'ticks true defers true; relay a;boom1;b;boom2;c; defers 5; detach defers 1'
+    try:
+        for _ in range(100):
+            try:
+                socket.create_connection(('127.0.0.1', port), timeout=0.1).close()
+                break
+            except OSError:
+                time.sleep(0.05)
+        sent = request(port, 'GET', '/send?m=a,boom1,b,boom2,c')
+        later = request(port, 'GET', '/later')
+        body = b''
+        for _ in range(100):
+            body = request(port, 'GET', '/state')[-1]
+            if body == want:
+                break
+            time.sleep(0.02)
+        print('panicking ticks, relay handlers and detached task:', sent[0], later[0], body)
+        if sent[0] != 200 or later[0] != 200 or body != want:
+            failures.append('implicit guards: %r %r %r' % (sent, later, body))
+        if server.poll() is not None:
+            failures.append('the server exited after a tick or relay handler panicked')
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait()
+        err = server.stderr.read().decode(errors='replace')
+        for msg in ('tick 1', 'tick 2', 'tick 3', 'relay boom1', 'relay boom2', 'detached boom'):
+            if err.count('panic: %s\n' % msg) != 1:
+                failures.append('panic %r on stderr: %r' % (msg, err[-2000:]))
+        if server.returncode != 0:
+            failures.append('guards server exit status %r' % server.returncode)
+
+
 def main():
     out = ROOT / 'bin/ci/router'
     out.mkdir(parents=True, exist_ok=True)
@@ -529,6 +576,8 @@ def main():
     panics(exe, failures)
     print('-- stack overflow')
     overflow(exe, failures)
+    print('-- implicit guards')
+    implicit_guards(out, failures)
     if failures:
         sys.exit('\n'.join(failures))
 

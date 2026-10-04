@@ -1,0 +1,77 @@
+package main
+
+import "anvil"
+import "relay"
+import "say"
+import "twine"
+
+// Ticks, relay handlers and detached tasks are guarded implicitly (#230): a panic in one runs
+// its deferred calls, is logged, and the core goes on. router_check.py runs this on one core.
+mut ticks i64 = 0
+mut tickDefers i64 = 0
+mut handled str = ""
+mut relayDefers i64 = 0
+
+fn tick_done() {
+	tickDefers += 1
+}
+
+// tick panics on its first three runs, after deferring tick_done.
+fn tick(core i64) {
+	ticks += 1
+	defer tick_done()
+	if ticks <= 3 {
+		panic("tick {ticks}")
+	}
+}
+
+fn relay_done() {
+	relayDefers += 1
+}
+
+// message records msg and panics for a message starting with "boom".
+fn message(from i64, msg str) {
+	defer relay_done()
+	handled = keep(handled + msg + ";")
+	if twine.HasPrefix(msg, "boom") {
+		panic("relay {msg}")
+	}
+}
+
+mut detachDefers i64 = 0
+
+fn detach_done() {
+	detachDefers += 1
+}
+
+// later detaches work that panics: a detached task is a task root, guarded like a request.
+fn later(q anvil.Req, w mut anvil.Out) {
+	detach {
+		defer detach_done()
+		panic("detached boom")
+	}
+	w.Text("detached")
+}
+
+// send relays each comma-separated message of ?m to this core.
+fn send(q anvil.Req, w mut anvil.Out) {
+	for m in twine.Split(q.Param("m"), ",") {
+		relay.Send(relay.Me(), m)
+	}
+	w.Text("sent")
+}
+
+fn state(q anvil.Req, w mut anvil.Out) {
+	w.Text("ticks {ticks > 3} defers {tickDefers == ticks}; relay {handled} defers {relayDefers}; detach defers {detachDefers}")
+}
+
+fn main() {
+	mut r = anvil.NewRouter()
+	r.Get("/send", send)
+	r.Get("/state", state)
+	r.Get("/later", later)
+	anvil.OnTick(10, tick)
+	anvil.OnRelay(message)
+	let err = r.Serve(":0")
+	say.Line(err)
+}
