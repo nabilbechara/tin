@@ -831,3 +831,13 @@ in context word 10 and returns -1; success preserves the previous error. The clo
 leaf receives the shared vDSO pointer in x2/rdx from a normal linker relocation,
 preserves id/timespec over the C-ABI call, and falls back for an absent/nonzero
 result. Both leaves preserve x28/r15 and all callee-saved registers.
+
+Phase 4 helpers use ioctl TCGETS (0x5401; ioctl syscall arm64 29 / amd64 16),
+uname's six 65-byte fields, and sched_getaffinity with a 4096-byte mask. DNS sockaddr_in
+is 16 bytes, family 2 at offset 0, network-order port at 2 and IPv4 bytes at 4;
+sockaddr_in6 is 28 bytes, family 10, port at 2, address at 8 and scope ID u32 at 24.
+Wire buffers reserve 32 bytes for either family. DNS wire integers are big-endian,
+compression pointers have their two high bits set, and TCP frames have a u16 length.
+See [RFC 1035](https://www.rfc-editor.org/rfc/rfc1035) and
+[resolv.conf](https://man7.org/linux/man-pages/man5/resolv.conf.5.html).
+

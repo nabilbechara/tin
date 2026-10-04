@@ -48,9 +48,6 @@ import "hearth"
 import "relay"
 import "say"
 
-extern func time(t i64) i64
-extern func gmtime_r(t i64, tm i64) i64
-extern func strftime(s i64, max i64, f i64, tm i64) i64
 extern func getenv(name i64) i64
 
 // Req is the request being served. Its strings live in the request pool: keep() them
@@ -154,7 +151,6 @@ var word i64
 var common i64      // "Server: anvil\r\nDate: ...\r\n"
 var commonLen i64
 var lastSec i64
-var tm i64
 var rr i64
 shared var gDeadlineMs i64 // a request's waits give up this long after it started (0: never)
 shared var gDeadlineSet bool
@@ -364,8 +360,7 @@ func core(id i64) {
 	change = block
 	word = block + 128
 	common = block + 640
-	tm = block + 768
-	refresh_date(time(0))
+	refresh_date(rt_wall_seconds())
 	pr := gPipes[2*id]
 	ev_level(pr)
 	myListen = -1
@@ -417,7 +412,7 @@ func core(id i64) {
 		if n <= 0 {
 			continue
 		}
-		now := time(0)
+		now := rt_wall_seconds()
 		if now != lastSec {
 			refresh_date(now)
 		}
@@ -524,11 +519,11 @@ func drain_done() bool {
 
 func refresh_date(now i64) {
 	lastSec = now
-	word[0] = now
-	gmtime_r(word, tm)
 	s := "Server: anvil\r\n"
 	memcpy(common, cast(i64, s)+8, len(s))
-	commonLen = len(s) + c32(strftime(common+len(s), 100, cast(i64, "Date: %a, %d %b %Y %H:%M:%S GMT\r\n")+8, tm))
+	date := rt_http_date(now)
+	memcpy(common+len(s),cast(i64,date)+8,len(date))
+	commonLen = len(s)+len(date)
 }
 
 func accept_all() {
