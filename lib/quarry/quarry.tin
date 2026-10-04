@@ -228,9 +228,56 @@ func readFileHere(path str) !str {
 	return s
 }
 
-// ReadStdin reads standard input to its end.
+// ReadStdin reads standard input to its end. Inside a task, from a pipe, socket or terminal,
+// it waits through rt_task_wait: the core serves others, and a deadline or cancel fails it.
 func ReadStdin() !str {
+	if rt_task_current() != 0 && waitable(0) {
+		return try readFdWait(0, "/dev/stdin")
+	}
 	return try readFd(0, 0, "/dev/stdin")
+}
+
+// waitable reports whether fd is a pipe, socket or terminal, which a task can wait on.
+func waitable(fd i64) bool {
+	if c32(rt_sys_fstat(fd, stbuf)) != 0 {
+		return false
+	}
+	t := mode(stbuf) & 0xf000
+	return t == 0x1000 || t == 0xc000 || (t == 0x2000 && rt_isatty(fd))
+}
+
+// readFdWait is readFd for a waitable fd in a task: it waits for input before every read.
+func readFdWait(fd i64, path str) !str {
+	room := 512
+	p := rt_str_new(room)
+	got := 0
+	for {
+		if got == room {
+			room *= 2
+			q := rt_str_new(room)
+			memcpy(q+8, p+8, got)
+			p = q
+		}
+		if rt_task_wait(fd, 1, 0) == waitDeadline {
+			fail cast(fault, rt_wait_fault())
+		}
+		n := rt_sys_read(fd, p+8+got, room-got)
+		if n < 0 {
+			if errno() == EAGAIN {
+				continue
+			}
+			fail pathFault("read", path)
+		}
+		if n == 0 {
+			break
+		}
+		got += n
+	}
+	if got == 0 {
+		return ""
+	}
+	p[0] = got
+	return cast(str, p)
 }
 
 // writeAll creates or opens path with flags (mode 0644) and writes all of data to it.

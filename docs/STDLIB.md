@@ -194,13 +194,15 @@ Package relay carries messages between cores, which share no memory. A message i
 ```go
 relay.Send(2, "hello")              // from any core
 from, msg := relay.Recv()           // on core 2: blocks until a message arrives
+from, msg := try relay.Next()       // the same, but fails on a deadline or cancel
 ```
 
 - `Send(to i64, msg str)`: Send copies msg into core to's inbox; it never blocks.
 - `Broadcast(msg str)`: Broadcast sends msg to every other running core.
 - `Cores() i64`: Cores is the number of cores the program started.
 - `TryRecv() (i64, str, bool)`: TryRecv returns the next message for this core, if there is one.
-- `Recv() (i64, str)`: Recv blocks until a message for this core arrives and returns its sender and text.
+- `Recv() (i64, str)`: Recv blocks until a message for this core arrives and returns its sender and text. It blocks the whole core and ignores deadlines and cancels; use Next in tasks and within blocks.
+- `Next() !(i64, str)`: Next waits until a message for this core arrives and returns its sender and text. Unlike Recv it waits through rt_task_wait: inside a task the core serves other tasks meanwhile, and a deadline (within, the request's) or a cancel ends the wait with that fault. Under anvil.OnRelay the event loop takes every message, so do not call Next there.
 - `WakeFD() i64`: WakeFD is this core's wake-up descriptor, for event loops: after it turns readable, call Drain. Arm must be called before the loop blocks.
 - `Arm()`: Arm asks senders to wake this core through WakeFD (call just before blocking).
 - `Drain(h func(i64, str))`: Drain runs h on every waiting message (event loops call it after WakeFD fires).
@@ -567,7 +569,7 @@ Package ore works on byte slices ([]u8), like Go's bytes. Functions that append 
 
 Package flume reads and writes file descriptors through 64 KiB buffers: lines, whole files and buffered output with one write per flush.
 
-- `type Reader struct`: Reader buffers reads from a file descriptor.
+- `type Reader struct`: Reader buffers reads from a file descriptor. Inside a task it waits on a pipe, socket or terminal through rt_task_wait, so a deadline or cancel fails the read (the next read retries).
 - `type Writer struct`: Writer buffers writes to a file descriptor.
 - `New(fd i64) Reader`: New reads from fd.
 - `Open(path str) !Reader`: Open reads the file at path.
@@ -596,7 +598,7 @@ Package quarry is the operating system interface (like Go's os): arguments, envi
 - `Setenv(key str, value str) !`: Setenv sets environment variable key to value; an empty key or one holding '=' or NUL is a fault.
 - `Unsetenv(key str) !`: Unsetenv removes environment variable key.
 - `ReadFile(path str) !str`: ReadFile returns the whole content of the file at path.
-- `ReadStdin() !str`: ReadStdin reads standard input to its end.
+- `ReadStdin() !str`: ReadStdin reads standard input to its end. Inside a task, from a pipe, socket or terminal, it waits through rt_task_wait: the core serves others, and a deadline or cancel fails it.
 - `WriteFile(path str, data str) !`: WriteFile writes data to the file at path, creating it (mode 0644) or truncating it.
 - `AppendFile(path str, data str) !`: AppendFile appends data to the file at path, creating it (mode 0644) when needed.
 - `Exists(path str) bool`: Exists reports whether path names an existing file or directory (symlinks are followed).

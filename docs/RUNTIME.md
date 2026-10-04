@@ -150,7 +150,11 @@ Each core has a box in a process-wide array of 256 boxes. A box is:
 
 `Send(core, msg)` copies the message into a malloc'd node, links it, and writes one byte
 to the wake pipe only if the receiver set its waiting flag. `Recv()` pops, or sets the
-flag, re-checks (no lost wake-ups), then blocks in `poll` on the pipe. Event loops
+flag, re-checks (no lost wake-ups), then blocks in `poll` on the pipe: it stops the whole
+core and ignores deadlines and cancels. `Next()` does the same through
+`rt_task_wait(pipe, 1, 0)`, so inside a task the core serves others meanwhile, and a deadline
+(`within`, the request's) or a cancel fails it with `rt_wait_fault()` (#316); one task per core
+watches the pipe and the others look again every millisecond. Event loops
 register `relay.WakeFD()`, call `relay.Arm()` before sleeping and `relay.Drain(h)` when it
 fires. Messages are copied into the receiver's request pool.
 
@@ -370,6 +374,11 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   reuse its task safely. A late completion calls `drop(job)` and never resumes the old
   task. Already-running system calls can still finish after the caller's deadline;
   their results are discarded. Outside a task the helper runs synchronously.
+- Standard input and streams (#316): inside a task, when the descriptor is a pipe, socket or
+  terminal, `quarry.ReadStdin` and `flume.Reader` wait with `rt_task_wait(fd, 1, 0)` before
+  each read and fail with `rt_wait_fault()`; a flume reader's wait fault is cleared by its next
+  read. Regular files, other devices and code outside a task read directly, as before.
+  `relay.Next` is the receive that waits the same way (§5).
 - Boundaries (Tin 1, notes/interface_boundaries.md): each request task has a root boundary
   record under its core's root, holding its deadline and cancel state; block boundaries nest
   under it. `rt_bnd_cancel(b, reason)` cancels `b` and everything inside it (never its parent
