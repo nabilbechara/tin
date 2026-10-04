@@ -35,9 +35,13 @@ fi
 [ "$actual" = "$expected" ] || { echo 'tin: checksum mismatch; nothing installed' >&2; exit 1; }
 tar -xzf "$work/$archive" -C "$work"
 [ -x "$work/$name/bin/tinc" ] && [ -x "$work/$name/tin" ] || { echo 'tin: incomplete release' >&2; exit 1; }
-# Verify the compiler can actually run (in particular, that the host supplies glibc).
-printf 'package main\nimport "say"\nfunc main() { say.Line("Tin installation verified") }\n' > "$work/check.tin"
-"$work/$name/tin" build "$work/check.tin" -o "$work/check"
+# Verify the compiler can actually run.
+# Edition 1 (#226); a release from before it reads only edition 0.
+printf 'package main\nimport "say"\nfn main() { say.Line("Tin installation verified") }\n' > "$work/check.tin"
+if ! "$work/$name/tin" build "$work/check.tin" -o "$work/check" 2>/dev/null; then
+  printf 'package main\nimport "say"\nfunc main() { say.Line("Tin installation verified") }\n' > "$work/check.tin"
+  "$work/$name/tin" build "$work/check.tin" -o "$work/check"
+fi
 "$work/check" >/dev/null
 install_dir=${TIN_INSTALL_DIR:-$HOME/.tin}
 mkdir -p "$install_dir/versions" "$install_dir/bin"
