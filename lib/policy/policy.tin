@@ -1,0 +1,208 @@
+// Package policy is the with policies (design_semantics §7.1, notes/interface_policy.md): with p { body } calls p.Run(body) inside a boundary of its own, with the block as body. Slots are typed ambient values that Bind binds for a block and the tasks it spawns; Retry, Trace and Cached are the library policies.
+package policy
+
+import "constraints"
+import "fault"
+import "herald"
+import "say"
+import "tide"
+
+// Policy is what with p { body } needs of p: Run runs body (any number of times) and gives the block's value. Run may only call body, or pass it to a function that only calls it.
+shape Policy[T constraints.Any] { Run(body func() !T) !T }
+
+// ---- slots ----
+
+// Slot is a typed ambient value: with policy.Bind(s, v) { } binds it for the block and the tasks the block spawns.
+type Slot[T constraints.Any] struct {
+	name str
+}
+
+// cell holds a bound value, so a binding stores one word whatever T is.
+type cell[T constraints.Any] struct {
+	v T
+}
+
+// NewSlot makes a slot named name; declare it once, in a package-level let (one per core).
+func NewSlot[T constraints.Any](name str) Slot[T] {
+	return Slot[T]{name: name}
+}
+
+// Name is the slot's name.
+func (s Slot[T]) Name() str {
+	return s.name
+}
+
+// Get is the value of the innermost Bind of s around the running code; it fails when s is not bound.
+func (s Slot[T]) Get() !T {
+	n := rt_slot_find(cast(i64, s))
+	if n == 0 {
+		fail "slot " + s.name + " is not bound"
+	}
+	c := cast(cell[T], n[2])
+	return c.v
+}
+
+// Bound reports whether s is bound around the running code.
+func (s Slot[T]) Bound() bool {
+	return rt_slot_find(cast(i64, s)) != 0
+}
+
+// BindPolicy binds a slot for its block (Bind).
+type BindPolicy[V constraints.Any, T constraints.Any] struct {
+	s Slot[V]
+	v V
+}
+
+// Bind is a policy that binds s to v for its block and the tasks the block spawns: with policy.Bind(requestID, id) { }.
+func Bind[V constraints.Any, T constraints.Any](s Slot[V], v V) BindPolicy[V, T] {
+	return BindPolicy[V, T]{s: s, v: v}
+}
+
+// Run binds the slot on the with block's boundary, then runs body once.
+func (b BindPolicy[V, T]) Run(body func() !T) !T {
+	rt_slot_bind(cast(i64, b.s), cast(i64, cell[V]{v: b.v}))
+	return try body()
+}
+
+// ---- retry ----
+
+// RetryPolicy runs its block again while it fails (Retry).
+type RetryPolicy[T constraints.Any] struct {
+	attempts i64
+	wait     i64
+}
+
+// Retry is a policy that runs its block up to attempts times while it fails and gives the last fault. A cancellation fault (or a cancelled boundary) ends it at once. The block's side effects run again on each attempt.
+func Retry[T constraints.Any](attempts i64) RetryPolicy[T] {
+	return RetryPolicy[T]{attempts: attempts, wait: 0}
+}
+
+// Backoff is r waiting d before the second attempt, and twice as long before each later one.
+func (r RetryPolicy[T]) Backoff(d i64) RetryPolicy[T] {
+	return RetryPolicy[T]{attempts: r.attempts, wait: d}
+}
+
+// Run runs body until it succeeds, attempts runs have failed, or the boundary is cancelled.
+func (r RetryPolicy[T]) Run(body func() !T) !T {
+	wait := r.wait
+	n := 1
+	for {
+		v, err := body()
+		if err == nil {
+			return v
+		}
+		if n >= r.attempts || canceled(err) {
+			fail err
+		}
+		if wait > 0 {
+			try tide.Wait(wait)
+			wait = wait * 2
+		}
+		n++
+	}
+}
+
+// canceled reports whether err ends the work instead of being worth another attempt.
+func canceled(err fault) bool {
+	return fault.Is(err, fault.Canceled) || fault.Is(err, fault.DeadlineExceeded) || fault.Is(err, fault.LimitExceeded) || rt_bnd_stopped()
+}
+
+// ---- trace ----
+
+var tracer func(str, i64, fault) = logSpan
+
+// SetTracer sends this core's trace spans to f(name, duration in ns, fault or nil) instead of the log.
+func SetTracer(f func(str, i64, fault)) {
+	tracer = f
+}
+
+// logSpan is the default tracer: one herald line per span.
+func logSpan(name str, ns i64, err fault) {
+	if err != nil {
+		herald.Log(herald.LInfo, "trace", []str{"name", name, "us", say.Str(ns / 1000), "fault", say.Str(err)})
+		return
+	}
+	herald.Log(herald.LInfo, "trace", []str{"name", name, "us", say.Str(ns / 1000)})
+}
+
+// TracePolicy reports each run of its block (Trace).
+type TracePolicy[T constraints.Any] struct {
+	name str
+}
+
+// Trace is a policy that reports its block's name, duration and fault to the core's tracer (a herald line by default).
+func Trace[T constraints.Any](name str) TracePolicy[T] {
+	return TracePolicy[T]{name: name}
+}
+
+// Run runs body once and reports it.
+func (t TracePolicy[T]) Run(body func() !T) !T {
+	start := tide.Now()
+	v, err := body()
+	tracer(t.name, tide.Now()-start, err)
+	if err != nil {
+		fail err
+	}
+	return v
+}
+
+// ---- cached ----
+
+// entry is a cached value and when it expires (mono ns).
+type entry[T constraints.Any] struct {
+	v     T
+	until i64
+}
+
+// Cache is a per-core store for Cached: declare it in a package-level let. Values are kept (copied to the long-lived heap).
+type Cache[T constraints.Any] struct {
+	m   map[str]entry[T]
+	max i64
+}
+
+// NewCache makes a cache of at most max entries (at least one); a full cache drops its oldest entry.
+func NewCache[T constraints.Any](max i64) Cache[T] {
+	if max < 1 {
+		max = 1
+	}
+	return Cache[T]{m: map[str]entry[T]{}, max: max}
+}
+
+// Len is the number of entries, fresh or expired.
+func (c Cache[T]) Len() i64 {
+	return len(c.m)
+}
+
+// Drop removes key's entry.
+func (c mut Cache[T]) Drop(key str) {
+	delete(c.m, key)
+}
+
+// CachedPolicy answers its block from a cache (Cached).
+type CachedPolicy[T constraints.Any] struct {
+	c   Cache[T]
+	key str
+	ttl i64
+}
+
+// Cached is a policy that gives the value cached under key while it is younger than ttl (ns), without running its block; otherwise it runs the block and caches a value it gives. Faults are not cached.
+func Cached[T constraints.Any](c Cache[T], key str, ttl i64) CachedPolicy[T] {
+	return CachedPolicy[T]{c: c, key: key, ttl: ttl}
+}
+
+// Run gives the cached value, or runs body and caches its value.
+func (p mut CachedPolicy[T]) Run(body func() !T) !T {
+	e, ok := p.c.m[p.key]
+	if ok && tide.Now() < e.until {
+		return e.v
+	}
+	v := try body()
+	if !ok && len(p.c.m) >= p.c.max {
+		for k := range p.c.m {
+			delete(p.c.m, k)
+			break
+		}
+	}
+	p.c.m[keep(p.key)] = keep(entry[T]{v: v, until: tide.Now() + p.ttl})
+	return v
+}

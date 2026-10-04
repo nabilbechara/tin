@@ -1,0 +1,194 @@
+package main
+
+import "constraints"
+import "policy"
+import "say"
+import "tide"
+
+// with policies and bind (#237, notes/interface_policy.md).
+
+let requestID = policy.NewSlot[str]("request id")
+let users = policy.NewCache[str](2)
+
+mut tries i64 = 0
+mut loads i64 = 0
+mut spans str = ""
+
+fn flaky(n i64) !i64 {
+	tries += 1
+	if tries < n {
+		fail "attempt {tries} failed"
+	}
+	return tries * 10
+}
+
+fn span(name str, ns i64, err fault) {
+	if err != nil {
+		spans = keep(spans + "{name}:fault({err});")
+		return
+	}
+	spans = keep(spans + "{name}:ok;")
+}
+
+fn load(id i64) !str {
+	loads += 1
+	if id < 0 {
+		fail "no user {id}"
+	}
+	return "user{id}"
+}
+
+fn user(id i64) !str {
+	let u = try with policy.Cached(users, "user:{id}", 1h) {
+		try load(id)
+	}
+	return u
+}
+
+fn current() str {
+	let id = requestID.Get() catch err {
+		"({err})"
+	}
+	return id
+}
+
+// Twice is a policy written in edition 1: it runs its block twice and gives the second value.
+type Twice[T constraints.Any] struct {
+	label str
+}
+
+fn twice[T constraints.Any](label str) Twice[T] {
+	return Twice[T]{label: label}
+}
+
+fn (t Twice[T]) Run(body fn() !T) !T {
+	let first = try body()
+	let second = try body()
+	_ = first
+	return second
+}
+
+// Counter is a policy for blocks without a value.
+type Counter struct {
+	runs i64
+}
+
+fn (c mut Counter) Run(body fn() !) ! {
+	c.runs += 1
+	try body()
+}
+
+fn main() {
+	let v = with policy.Retry(3) {
+		try flaky(3)
+	} catch err {
+		say.Line("never", err)
+		0
+	}
+	say.Line("retry:", v, "tries:", tries)
+	tries = 0
+	let w = with policy.Retry(2) {
+		try flaky(5)
+	} catch err {
+		say.Line("retry fault:", err)
+		-1
+	}
+	say.Line("retry gave:", w, "tries:", tries)
+	mut n i64 = 0
+	with policy.Retry(3) {
+		n += 1
+		if n < 2 {
+			fail "first"
+		}
+	} catch err {
+		say.Line("never", err)
+	}
+	say.Line("retry without a value, runs:", n)
+	let start = tide.Now()
+	mut k i64 = 0
+	let b = with policy.Retry(4).Backoff(5ms) {
+		k += 1
+		if k < 3 {
+			fail "again {k}"
+		}
+		k
+	} catch _ {
+		0
+	}
+	say.Line("backoff:", b, "waited:", (tide.Now() - start) / tide.Millisecond >= 15)
+	within 20ms {
+		try with policy.Retry(1000).Backoff(1ms) {
+			fail "never works"
+		}
+	} catch err {
+		say.Line("retry stops at the deadline:", err)
+	}
+
+	policy.SetTracer(span)
+	let t = with policy.Trace("work") {
+		7 * 6
+	} catch _ {
+		0
+	}
+	with policy.Trace("broken") {
+		fail "boom"
+	} catch err {
+		say.Line("trace fault:", err)
+	}
+	say.Line("trace:", t, spans)
+
+	let u1 = user(1) catch _ { "" }
+	let u2 = user(1) catch _ { "" }
+	let u3 = user(2) catch _ { "" }
+	user(-1) catch err {
+		say.Line("cached fault:", err)
+	}
+	let u4 = user(3) catch _ { "" }
+	say.Line("cached:", u1, u2, u3, u4, "loads:", loads, "entries:", users.Len())
+
+	say.Line("before:", current())
+	with policy.Bind(requestID, "r-81") {
+		say.Line("bound:", current())
+		with policy.Bind(requestID, "r-82") {
+			say.Line("inner:", current())
+		} catch err {
+			say.Line("never", err)
+		}
+		say.Line("outer again:", current())
+		scope s {
+			s.spawn(fn() ! {
+				try tide.Wait(tide.Millisecond)
+				say.Line("spawned child:", current())
+			})
+		}
+		let (p, q) = try parallel {
+			current()
+			current()
+		}
+		say.Line("parallel lines:", p, q)
+	} catch err {
+		say.Line("never", err)
+	}
+	say.Line("after:", current())
+
+	mut runs i64 = 0
+	let x = with twice("x") {
+		runs += 1
+		runs * 100
+	} catch _ {
+		0
+	}
+	say.Line("edition 1 policy:", x, "runs:", runs)
+	mut c = Counter{runs: 0}
+	with c {
+		say.Line("counted block")
+	} catch err {
+		say.Line("never", err)
+	}
+	with c {
+		fail "counted fault"
+	} catch err {
+		say.Line("counter fault:", err)
+	}
+	say.Line("counter runs:", c.runs)
+}

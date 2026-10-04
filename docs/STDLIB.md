@@ -34,6 +34,7 @@ Generated from the comments in `lib/*/` by `tools/gendoc.py`.
 | [herald](#herald) | logging (log/slog) |
 | [crucible](#crucible) | testing helpers (testing) |
 | [constraints](#constraints) | named generic constraint shapes |
+| [policy](#policy) | with policies and slots (context values, retry/cache/trace middleware) |
 | [redis](#redis) | Redis client (go-redis) |
 | [mysql](#mysql) | MySQL client (database/sql with go-sql-driver/mysql) |
 | [postgres](#postgres) | PostgreSQL client (database/sql with pgx) |
@@ -991,6 +992,35 @@ Package constraints contains the named generic constraints used by the standard 
 
 - `shape Any {}`: Any imposes no operations on a type parameter.
 - `shape Comparable {}`: Comparable admits values that can be compared by value, including structs and enums whose fields are all comparable. The compiler checks this property at each instantiation.
+
+## policy
+
+Package policy is the with policies (design_semantics §7.1, notes/interface_policy.md): with p { body } calls p.Run(body) inside a boundary of its own, with the block as body. Slots are typed ambient values that Bind binds for a block and the tasks it spawns; Retry, Trace and Cached are the library policies.
+
+- `shape Policy[T constraints.Any] { Run(body func() !T) !T }`: Policy is what with p { body } needs of p: Run runs body (any number of times) and gives the block's value. Run may only call body, or pass it to a function that only calls it.
+- `type Slot[T constraints.Any] struct`: Slot is a typed ambient value: with policy.Bind(s, v) { } binds it for the block and the tasks the block spawns.
+- `NewSlot[T constraints.Any](name str) Slot[T]`: NewSlot makes a slot named name; declare it once, in a package-level let (one per core).
+- `(s Slot[T]) Name() str`: Name is the slot's name.
+- `(s Slot[T]) Get() !T`: Get is the value of the innermost Bind of s around the running code; it fails when s is not bound.
+- `(s Slot[T]) Bound() bool`: Bound reports whether s is bound around the running code.
+- `type BindPolicy[V constraints.Any, T constraints.Any] struct`: BindPolicy binds a slot for its block (Bind).
+- `Bind[V constraints.Any, T constraints.Any](s Slot[V], v V) BindPolicy[V, T]`: Bind is a policy that binds s to v for its block and the tasks the block spawns: with policy.Bind(requestID, id) { }.
+- `(b BindPolicy[V, T]) Run(body func() !T) !T`: Run binds the slot on the with block's boundary, then runs body once.
+- `type RetryPolicy[T constraints.Any] struct`: RetryPolicy runs its block again while it fails (Retry).
+- `Retry[T constraints.Any](attempts i64) RetryPolicy[T]`: Retry is a policy that runs its block up to attempts times while it fails and gives the last fault. A cancellation fault (or a cancelled boundary) ends it at once. The block's side effects run again on each attempt.
+- `(r RetryPolicy[T]) Backoff(d i64) RetryPolicy[T]`: Backoff is r waiting d before the second attempt, and twice as long before each later one.
+- `(r RetryPolicy[T]) Run(body func() !T) !T`: Run runs body until it succeeds, attempts runs have failed, or the boundary is cancelled.
+- `SetTracer(f func(str, i64, fault))`: SetTracer sends this core's trace spans to f(name, duration in ns, fault or nil) instead of the log.
+- `type TracePolicy[T constraints.Any] struct`: TracePolicy reports each run of its block (Trace).
+- `Trace[T constraints.Any](name str) TracePolicy[T]`: Trace is a policy that reports its block's name, duration and fault to the core's tracer (a herald line by default).
+- `(t TracePolicy[T]) Run(body func() !T) !T`: Run runs body once and reports it.
+- `type Cache[T constraints.Any] struct`: Cache is a per-core store for Cached: declare it in a package-level let. Values are kept (copied to the long-lived heap).
+- `NewCache[T constraints.Any](max i64) Cache[T]`: NewCache makes a cache of at most max entries (at least one); a full cache drops its oldest entry.
+- `(c Cache[T]) Len() i64`: Len is the number of entries, fresh or expired.
+- `(c mut Cache[T]) Drop(key str)`: Drop removes key's entry.
+- `type CachedPolicy[T constraints.Any] struct`: CachedPolicy answers its block from a cache (Cached).
+- `Cached[T constraints.Any](c Cache[T], key str, ttl i64) CachedPolicy[T]`: Cached is a policy that gives the value cached under key while it is younger than ttl (ns), without running its block; otherwise it runs the block and caches a value it gives. Faults are not cached.
+- `(p mut CachedPolicy[T]) Run(body func() !T) !T`: Run gives the cached value, or runs body and caches its value.
 
 ## redis
 
