@@ -1151,7 +1151,7 @@ Blocking commands (BLPOP, SUBSCRIBE, ...) would hold up the commands queued behi
 
 Package mysql is a MySQL client (tested with MySQL 8.0). Statements are queries: in db.Query("SELECT name FROM users WHERE id = {id}") the text becomes "... id = ?" and id a bound parameter of a prepared statement, so a value can never change a statement.
 
-Each core keeps a pool of connections per Client (Options.Pool, default 16); a request task waits for a free one without blocking the core. Prepared statements are cached per connection. Authentication: caching_sha2_password (the MySQL 8 default, including the RSA key exchange when the server has no cached entry) and mysql_native_password. TLS is not supported.
+Each core keeps a pool of connections per Client (Options.Pool, default 16); a request task waits for a free one without blocking the core. Prepared statements are cached per connection. Authentication: caching_sha2_password (the MySQL 8 default, including the RSA key exchange when the server has no cached entry) and mysql_native_password. Options.TLS connects over TLS 1.3 (SSLRequest), verifying the server's certificate and name.
 
 ```tin body
 let pw = quarry.Getenv("MYSQL_PASSWORD")
