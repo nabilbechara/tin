@@ -124,8 +124,11 @@ stack has reset its pool (the end of a request or tick, `hearth.Reset()`). Then 
 children are dropped and it is freed. So `u := cache[k]` stays valid for the rest of the
 request even if another request replaces the entry. Values made while a core initializes
 its globals, and values stored where the compiler cannot count (through a parameter), are
-pinned: they are never freed. `hearth.RcStats()` reports the counted blocks, their bytes
-and the limbo length.
+pinned: they are never freed. A task that lives for a long time (a WebSocket, a `detach`
+loop) holds back releases on its core; past 2^20 queued blocks a core pins what it drops
+instead, so such a core leaks as before reclamation but its limbo stays bounded.
+`hearth.RcStats()` reports the counted blocks (pinned ones included), their bytes and the
+limbo length.
 
 ## 4. Cores and threads: hearth
 

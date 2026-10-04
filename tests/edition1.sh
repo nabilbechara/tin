@@ -36,8 +36,9 @@ fi
 # task.Deadline and task.Canceled read the innermost boundary; nested within takes the
 # earlier deadline (#233).
 # A value main borrowed from a long-lived map stays valid while a spawned child replaces
-# the entry and ends: the core's own stack is an epoch participant (#176).
-for name in boundaries fault_wrap once polls deadlines borrows
+# the entry and ends: the core's own stack is an epoch participant (#176). A detached task
+# that never ends holds back releases; past the limbo's cap drops are pinned (#176).
+for name in boundaries fault_wrap once polls deadlines borrows limbo_cap
 do
 	polls=
 	[ "$name" != polls ] || polls=-polls
