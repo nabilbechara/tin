@@ -3,9 +3,6 @@ package quarry
 
 import "say"
 
-extern func getenv(name i64) i64
-extern func setenv(name i64, val i64, overwrite i64) i64
-extern func unsetenv(name i64) i64
 
 const oRdonly = 0
 const oWrite = O_WRITE_CREATE
@@ -49,6 +46,12 @@ func badPath(path str) bool {
 	return len(path) > 0 && memchr(cast(i64, path)+8, 0, len(path)) != 0
 }
 
+// badKey reports an environment variable name the environment cannot hold: empty, or with
+// '=' or NUL in it (as POSIX setenv and unsetenv refuse them).
+func badKey(key str) bool {
+	return len(key) == 0 || memchr(cast(i64, key)+8, '=', len(key)) != 0 || badPath(key)
+}
+
 // invalidFault is the fault for a path with a NUL byte: "op path: invalid argument".
 func invalidFault(op str, path str) ! {
 	fail say.Fault("%s %s: %s", op, path, errnoText(eINVAL))
@@ -76,7 +79,7 @@ func Args() []str {
 
 // Getenv returns the value of environment variable key, or "" when it is unset.
 func Getenv(key str) str {
-	p := getenv(rt_cstr(key))
+	p := rt_getenv(rt_cstr(key))
 	if p == 0 {
 		return ""
 	}
@@ -85,7 +88,7 @@ func Getenv(key str) str {
 
 // LookupEnv returns the value of key and whether it is set (an empty value is still set).
 func LookupEnv(key str) (str, bool) {
-	p := getenv(rt_cstr(key))
+	p := rt_getenv(rt_cstr(key))
 	if p == 0 {
 		return "", false
 	}
@@ -94,10 +97,10 @@ func LookupEnv(key str) (str, bool) {
 
 // Setenv sets environment variable key to value; an empty key or one holding '=' or NUL is a fault.
 func Setenv(key str, value str) ! {
-	if badPath(key) || badPath(value) {
+	if badKey(key) || badPath(value) {
 		fail say.Fault("setenv: %s", errnoText(eINVAL))
 	}
-	if c32(setenv(rt_cstr(key), rt_cstr(value), 1)) != 0 {
+	if c32(rt_setenv(rt_cstr(key), rt_cstr(value))) != 0 {
 		e := errnoText(rt_env_errno())
 		fail say.Fault("setenv: %s", e)
 	}
@@ -105,10 +108,10 @@ func Setenv(key str, value str) ! {
 
 // Unsetenv removes environment variable key.
 func Unsetenv(key str) ! {
-	if badPath(key) {
+	if badKey(key) {
 		fail say.Fault("unsetenv: %s", errnoText(eINVAL))
 	}
-	if c32(unsetenv(rt_cstr(key))) != 0 {
+	if c32(rt_unsetenv(rt_cstr(key))) != 0 {
 		e := errnoText(rt_env_errno())
 		fail say.Fault("unsetenv: %s", e)
 	}

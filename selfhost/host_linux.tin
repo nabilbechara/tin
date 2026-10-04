@@ -13,9 +13,65 @@ fn host_dirent_name(ent) {
     return ent + 19;
 }
 
-extern fn getauxval(key);
+// The environment and the auxiliary vector follow argv's NULL on the initial stack (the same
+// layout under glibc's start and Tin's own _start); host_start records where, first thing in
+// main, so the compiler needs no libc getenv or getauxval (#125).
+var host_envp;
+var host_auxv;
+
+fn host_start(argc, argv) {
+    let env = argv + 8 * (argc + 1);
+    let n = 0;
+    while env[n] != 0 {
+        n = n + 1;
+    }
+    host_envp = env;
+    host_auxv = env + 8 * (n + 1);
+}
+
+// host_getenv is the value of the C string name as a C string, or 0 when it is unset.
+fn host_getenv(name) {
+    if !host_envp {
+        return 0;
+    }
+    let i = 0;
+    while host_envp[i] != 0 {
+        let e = host_envp[i];
+        let k = 0;
+        while load8(name + k) != 0 && load8(e + k) == load8(name + k) {
+            k = k + 1;
+        }
+        if load8(name + k) == 0 && load8(e + k) == '=' {
+            return e + k + 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// host_auxval is the auxv value of key (6: AT_PAGESZ), or 0 when absent.
+fn host_auxval(key) {
+    if !host_auxv {
+        return 0;
+    }
+    let p = host_auxv;
+    while p[0] != 0 {
+        if p[0] == key {
+            return p[1];
+        }
+        p = p + 16;
+    }
+    return 0;
+}
+
 fn host_mem_flags() { return 0x22; }
-fn host_mem_page() { return getauxval(6); }
+fn host_mem_page() {
+    let n = host_auxval(6);
+    if n == 0 {
+        n = 4096; // before host_start: the smallest Linux page
+    }
+    return n;
+}
 
 var hostError;
 fn linux_set_errno(e) { hostError=e; }
