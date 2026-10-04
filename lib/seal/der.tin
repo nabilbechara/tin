@@ -1,0 +1,200 @@
+// A strict DER reader for keys and certificates: definite minimal lengths, one-byte tags, minimal integers.
+package seal
+
+// DER tags used by keys and certificates.
+const (
+	derBoolean = 0x01
+	derInteger = 0x02
+	derBitString = 0x03
+	derOctetString = 0x04
+	derNull = 0x05
+	derOID = 0x06
+	derUTF8String = 0x0c
+	derPrintableString = 0x13
+	derT61String = 0x14
+	derIA5String = 0x16
+	derUTCTime = 0x17
+	derGeneralizedTime = 0x18
+	derUniversalString = 0x1c
+	derBMPString = 0x1e
+	derSequence = 0x30
+	derSet = 0x31
+)
+
+// der_read reads the element at b[at:end]: its tag, where its contents start and end.
+func der_read(b []u8, at i64, end i64) !(i64, i64, i64) {
+	if end > len(b) || at+2 > end {
+		fail "seal: truncated DER"
+	}
+	tag := i64(b[at])
+	if tag&0x1f == 0x1f {
+		fail "seal: DER tag numbers above 30 are not supported"
+	}
+	n := i64(b[at+1])
+	at += 2
+	if n >= 0x80 {
+		k := n - 0x80
+		if k < 1 || k > 4 {
+			fail "seal: bad DER length"
+		}
+		if at+k > end {
+			fail "seal: truncated DER"
+		}
+		if b[at] == 0 {
+			fail "seal: DER length is not minimal"
+		}
+		n = 0
+		for i := 0; i < k; i++ {
+			n = n<<8 | i64(b[at+i])
+		}
+		if n < 0x80 {
+			fail "seal: DER length is not minimal"
+		}
+		at += k
+	}
+	if n > end-at {
+		fail "seal: truncated DER"
+	}
+	return tag, at, at + n
+}
+
+// der_expect reads the element at b[at:end] and fails unless its tag is want.
+func der_expect(b []u8, at i64, end i64, want i64, what str) !(i64, i64) {
+	tag, from, to := try der_read(b, at, end)
+	if tag != want {
+		fail "seal: malformed DER: expected " + what
+	}
+	return from, to
+}
+
+// der_posint reads a non-negative minimal DER INTEGER at b[at:end] and returns its magnitude without leading zeros.
+func der_posint(b []u8, at i64, end i64) !([]u8, i64) {
+	from, to := try der_expect(b, at, end, derInteger, "an integer")
+	if from == to {
+		fail "seal: empty DER integer"
+	}
+	if b[from]&0x80 != 0 {
+		fail "seal: negative DER integer"
+	}
+	if to-from > 1 && b[from] == 0 && b[from+1]&0x80 == 0 {
+		fail "seal: DER integer is not minimal"
+	}
+	if b[from] == 0 && to-from > 1 {
+		from++
+	}
+	return b[from:to], to
+}
+
+// der_small_int reads a DER INTEGER that fits in 62 bits; negative values are allowed.
+func der_small_int(b []u8, at i64, end i64) !(i64, i64) {
+	from, to := try der_expect(b, at, end, derInteger, "an integer")
+	if from == to || to-from > 7 {
+		fail "seal: DER integer out of range"
+	}
+	if to-from > 1 && ((b[from] == 0 && b[from+1]&0x80 == 0) || (b[from] == 0xff && b[from+1]&0x80 != 0)) {
+		fail "seal: DER integer is not minimal"
+	}
+	v := 0
+	if b[from]&0x80 != 0 {
+		v = -1
+	}
+	for i := from; i < to; i++ {
+		v = v<<8 | i64(b[i])
+	}
+	return v, to
+}
+
+// der_bits reads a BIT STRING with no unused bits and returns its bytes.
+func der_bits(b []u8, at i64, end i64) !([]u8, i64) {
+	from, to := try der_expect(b, at, end, derBitString, "a bit string")
+	if from == to || b[from] != 0 {
+		fail "seal: malformed DER bit string"
+	}
+	return b[from+1 : to], to
+}
+
+// der_oid_text formats the OID contents b[from:to] as dotted decimal ("1.2.840.113549.1.1.11").
+func der_oid_text(b []u8, from i64, to i64) !str {
+	if from == to || b[to-1]&0x80 != 0 {
+		fail "seal: malformed DER object identifier"
+	}
+	out := []u8{}
+	v := 0
+	first := true
+	for i := from; i < to; i++ {
+		if v == 0 && b[i] == 0x80 {
+			fail "seal: DER object identifier is not minimal"
+		}
+		if v > (1 << 55) {
+			fail "seal: DER object identifier arc too large"
+		}
+		v = v<<7 | i64(b[i]&0x7f)
+		if b[i]&0x80 != 0 {
+			continue
+		}
+		if first {
+			a := 2
+			if v < 40 {
+				a = 0
+			} else if v < 80 {
+				a = 1
+			}
+			out = der_append_dec(out, a)
+			out = append(out, '.')
+			out = der_append_dec(out, v-40*a)
+			first = false
+		} else {
+			out = append(out, '.')
+			out = der_append_dec(out, v)
+		}
+		v = 0
+	}
+	return str(out)
+}
+
+func der_append_dec(out []u8, v i64) []u8 {
+	if v >= 10 {
+		out = der_append_dec(out, v/10)
+	}
+	return append(out, u8('0'+v%10))
+}
+
+// der_oid reads an OBJECT IDENTIFIER at b[at:end] as dotted decimal text.
+func der_oid(b []u8, at i64, end i64) !(str, i64) {
+	from, to := try der_expect(b, at, end, derOID, "an object identifier")
+	s := try der_oid_text(b, from, to)
+	return s, to
+}
+
+// ParseRSAPublicKeyDER reads a DER RSAPublicKey (PKCS #1) or SubjectPublicKeyInfo holding one.
+func ParseRSAPublicKeyDER(der []u8) !RSAPublicKey {
+	from, to := try der_expect(der, 0, len(der), derSequence, "a public key")
+	if to != len(der) {
+		fail "seal: trailing data after the RSA public key"
+	}
+	tag, _, _ := try der_read(der, from, to)
+	if tag == derSequence {
+		algFrom, algTo := try der_expect(der, from, to, derSequence, "an algorithm identifier")
+		oid, after := try der_oid(der, algFrom, algTo)
+		if oid != oidRSA {
+			fail "seal: not an RSA public key (algorithm " + oid + ")"
+		}
+		if after != algTo {
+			nf, nt := try der_expect(der, after, algTo, derNull, "NULL parameters")
+			if nf != nt || nt != algTo {
+				fail "seal: bad RSA algorithm parameters"
+			}
+		}
+		bits, end := try der_bits(der, algTo, to)
+		if end != to {
+			fail "seal: trailing data after the RSA public key"
+		}
+		return try ParseRSAPublicKeyDER(bits)
+	}
+	n, next := try der_posint(der, from, to)
+	e, last := try der_posint(der, next, to)
+	if last != to {
+		fail "seal: trailing data in the RSA public key"
+	}
+	return RSAPublicKey{N: n, E: e}
+}

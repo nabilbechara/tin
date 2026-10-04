@@ -1,0 +1,1707 @@
+// X.509 certificates: PEM, a strict DER certificate parser, certificate pools, chain building to
+// trusted roots and RFC 6125 host name checks. Verification sees only public data, so none of
+// this is constant time.
+package seal
+
+import "say"
+import "tide"
+import "quarry"
+
+// PEMBlock is one "-----BEGIN TYPE-----" block: its type and decoded bytes.
+type PEMBlock struct {
+	Type str
+	Bytes []u8
+}
+
+// DecodePEM returns every PEM block in text, in order; text between blocks is ignored.
+func DecodePEM(text str) ![]PEMBlock {
+	out := []PEMBlock{}
+	kind := ""
+	inside := false
+	body := []u8{}
+	start := 0
+	for i := 0; i <= len(text); i++ {
+		if i < len(text) && text[i] != '\n' {
+			continue
+		}
+		ln := text[start:i]
+		start = i + 1
+		for len(ln) > 0 && (ln[len(ln)-1] == '\r' || ln[len(ln)-1] == ' ' || ln[len(ln)-1] == '\t') {
+			ln = ln[:len(ln)-1]
+		}
+		if !inside {
+			if len(ln) > 16 && ln[:11] == "-----BEGIN " && ln[len(ln)-5:] == "-----" {
+				kind = ln[11 : len(ln)-5]
+				inside = true
+				body = []u8{}
+			}
+			continue
+		}
+		if len(ln) >= 9 && ln[:9] == "-----END " {
+			if ln != "-----END "+kind+"-----" {
+				fail "seal: PEM block " + kind + " ends with " + ln
+			}
+			der := B64Decode(str(body)) catch err {
+				fail say.Fault("seal: bad base64 in PEM block %s: %s", kind, err)
+			}
+			out = append(out, PEMBlock{Type: kind, Bytes: der})
+			inside = false
+			continue
+		}
+		for j := 0; j < len(ln); j++ {
+			if ln[j] == ':' {
+				fail "seal: PEM headers are not supported"
+			}
+			if ln[j] != ' ' && ln[j] != '\t' {
+				body = append(body, ln[j])
+			}
+		}
+	}
+	if inside {
+		fail "seal: PEM block " + kind + " has no END line"
+	}
+	return out
+}
+
+// SignatureAlgorithm is how a certificate is signed.
+type SignatureAlgorithm enum {
+	UnknownSignature,
+	SHA1WithRSA,
+	SHA256WithRSA,
+	SHA384WithRSA,
+	SHA512WithRSA,
+	SHA256WithRSAPSS,
+	SHA384WithRSAPSS,
+	SHA512WithRSAPSS,
+	ECDSAWithSHA1,
+	ECDSAWithSHA256,
+	ECDSAWithSHA384,
+	ECDSAWithSHA512,
+	PureEd25519,
+}
+
+// PublicKeyAlgorithm is the kind of key a certificate holds.
+type PublicKeyAlgorithm enum {
+	UnknownKey,
+	RSA,
+	ECDSA,
+	Ed25519,
+}
+
+// Key usage bits (KeyUsage), numbered as in RFC 5280 with bit 0 = digitalSignature.
+const (
+	KeyUsageDigitalSignature = 1
+	KeyUsageContentCommitment = 2
+	KeyUsageKeyEncipherment = 4
+	KeyUsageDataEncipherment = 8
+	KeyUsageKeyAgreement = 16
+	KeyUsageCertSign = 32
+	KeyUsageCRLSign = 64
+	KeyUsageEncipherOnly = 128
+	KeyUsageDecipherOnly = 256
+)
+
+// Extended key usage OIDs.
+const (
+	ExtKeyUsageAny = "2.5.29.37.0"
+	ExtKeyUsageServerAuth = "1.3.6.1.5.5.7.3.1"
+	ExtKeyUsageClientAuth = "1.3.6.1.5.5.7.3.2"
+)
+
+const (
+	oidRSAPSS = "1.2.840.113549.1.1.10"
+	oidECPublicKey = "1.2.840.10045.2.1"
+	oidEd25519 = "1.3.101.112"
+	oidP256 = "1.2.840.10045.3.1.7"
+	oidP384 = "1.3.132.0.34"
+	oidP521 = "1.3.132.0.35"
+	oidSHA256 = "2.16.840.1.101.3.4.2.1"
+	oidSHA384 = "2.16.840.1.101.3.4.2.2"
+	oidSHA512 = "2.16.840.1.101.3.4.2.3"
+	oidMGF1 = "1.2.840.113549.1.1.8"
+)
+
+// Name is a distinguished name: the common attributes, and the DER bytes chains are matched on.
+type Name struct {
+	CommonName str
+	Organization []str
+	OrganizationalUnit []str
+	Country []str
+	Locality []str
+	Province []str
+	SerialNumber str
+	Raw []u8
+}
+
+// Certificate is a parsed X.509 v1/v3 certificate. Times are Unix seconds.
+type Certificate struct {
+	Raw []u8
+	RawTBS []u8
+	Version i64
+	SerialNumber []u8
+	Issuer Name
+	Subject Name
+	NotBefore i64
+	NotAfter i64
+	SignatureAlgorithm SignatureAlgorithm
+	Signature []u8
+	PublicKeyAlgorithm PublicKeyAlgorithm
+	// PublicKey is the key's bytes: a DER RSAPublicKey, an uncompressed SEC 1 point or 32 Ed25519 bytes.
+	PublicKey []u8
+	// Curve is "P-256", "P-384" or "P-521" for an ECDSA key, else "".
+	Curve str
+	RSAKey RSAPublicKey
+	RawSubjectPublicKeyInfo []u8
+	DNSNames []str
+	EmailAddresses []str
+	IPAddresses [][]u8
+	URIs []str
+	BasicConstraintsValid bool
+	IsCA bool
+	// MaxPathLen is the basic constraints path length, or -1 when there is none.
+	MaxPathLen i64
+	KeyUsage i64
+	HasKeyUsage bool
+	ExtKeyUsage []str
+	SubjectKeyId []u8
+	AuthorityKeyId []u8
+	PermittedDNSDomains []str
+	ExcludedDNSDomains []str
+	// PermittedIPRanges and ExcludedIPRanges hold address then mask (8 or 32 bytes each).
+	PermittedIPRanges [][]u8
+	ExcludedIPRanges [][]u8
+	// HasOtherNameConstraints is true when name constraints restrict names other than DNS and IP.
+	HasOtherNameConstraints bool
+	UnhandledCritical []str
+}
+
+func x509_alg_name(a SignatureAlgorithm) str {
+	return say.Str(a)
+}
+
+// x509_civil turns a validated date into Unix seconds.
+func x509_time(b []u8, from i64, to i64, tag i64) !i64 {
+	s := b[from:to]
+	n := len(s)
+	digits := n - 1
+	if (tag == derUTCTime && n != 13) || (tag == derGeneralizedTime && n != 15) || s[n-1] != 'Z' {
+		fail "seal: bad certificate time"
+	}
+	v := make([]i64, 0, 7)
+	for i := 0; i < digits; i += 2 {
+		if s[i] < '0' || s[i] > '9' || s[i+1] < '0' || s[i+1] > '9' {
+			fail "seal: bad certificate time"
+		}
+		v = append(v, i64(s[i]-'0')*10+i64(s[i+1]-'0'))
+	}
+	year := 0
+	at := 0
+	if tag == derUTCTime {
+		year = v[0] + 1900
+		if v[0] < 50 {
+			year = v[0] + 2000
+		}
+		at = 1
+	} else {
+		year = v[0]*100 + v[1]
+		at = 2
+	}
+	mon := v[at]
+	day := v[at+1]
+	hh := v[at+2]
+	mm := v[at+3]
+	ss := v[at+4]
+	if mon < 1 || mon > 12 || day < 1 || day > tide.DaysIn(year, mon) || hh > 23 || mm > 59 || ss > 59 {
+		fail "seal: bad certificate time"
+	}
+	return tide.DaysFromCivil(year, mon, day)*86400 + hh*3600 + mm*60 + ss
+}
+
+// x509_string decodes a directory string to UTF-8, checking its characters as its type requires.
+func x509_string(b []u8, from i64, to i64, tag i64) !str {
+	if tag == derBMPString {
+		if (to-from)%2 != 0 {
+			fail "seal: bad BMPString"
+		}
+		out := []u8{}
+		for i := from; i < to; i += 2 {
+			r := i64(b[i])<<8 | i64(b[i+1])
+			if r >= 0xd800 && r < 0xe000 {
+				fail "seal: bad BMPString"
+			}
+			out = x509_utf8(out, r)
+		}
+		return str(out)
+	}
+	if tag == derT61String {
+		out := []u8{}
+		for i := from; i < to; i++ {
+			out = x509_utf8(out, i64(b[i]))
+		}
+		return str(out)
+	}
+	for i := from; i < to; i++ {
+		c := b[i]
+		ok := true
+		if tag == derPrintableString {
+			ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == ' ' || c == 39 ||
+				c == '(' || c == ')' || c == '+' || c == ',' || c == '-' || c == '.' || c == '/' || c == ':' ||
+				c == '=' || c == '?' || c == '*' || c == '&'
+		} else if tag == derIA5String {
+			ok = c < 0x80
+		} else if tag == 0x12 {
+			ok = (c >= '0' && c <= '9') || c == ' '
+		} else if tag != derUTF8String {
+			fail "seal: unsupported string type in a name"
+		}
+		if !ok {
+			fail "seal: invalid character in a name string"
+		}
+	}
+	if tag == derUTF8String && !x509_valid_utf8(b, from, to) {
+		fail "seal: invalid UTF-8 in a name string"
+	}
+	return str(b[from:to])
+}
+
+// x509_valid_utf8 reports whether b[from:to] is well-formed UTF-8 (no overlongs or surrogates).
+func x509_valid_utf8(b []u8, from i64, to i64) bool {
+	i := from
+	for i < to {
+		c := i64(b[i])
+		if c < 0x80 {
+			i++
+			continue
+		}
+		n := 0
+		min := 0
+		r := 0
+		if c&0xe0 == 0xc0 {
+			n = 1
+			min = 0x80
+			r = c & 0x1f
+		} else if c&0xf0 == 0xe0 {
+			n = 2
+			min = 0x800
+			r = c & 0x0f
+		} else if c&0xf8 == 0xf0 {
+			n = 3
+			min = 0x10000
+			r = c & 0x07
+		} else {
+			return false
+		}
+		if i+n >= to {
+			return false
+		}
+		for k := 1; k <= n; k++ {
+			if b[i+k]&0xc0 != 0x80 {
+				return false
+			}
+			r = r<<6 | i64(b[i+k]&0x3f)
+		}
+		if r < min || r > 0x10ffff || (r >= 0xd800 && r < 0xe000) {
+			return false
+		}
+		i += n + 1
+	}
+	return true
+}
+
+func x509_utf8(out []u8, r i64) []u8 {
+	if r < 0x80 {
+		return append(out, u8(r))
+	}
+	if r < 0x800 {
+		return append(out, u8(0xc0|r>>6), u8(0x80|r&0x3f))
+	}
+	if r < 0x10000 {
+		return append(out, u8(0xe0|r>>12), u8(0x80|(r>>6)&0x3f), u8(0x80|r&0x3f))
+	}
+	return append(out, u8(0xf0|(r>>18)&7), u8(0x80|(r>>12)&0x3f), u8(0x80|(r>>6)&0x3f), u8(0x80|r&0x3f))
+}
+
+// x509_name parses the RDNSequence at b[at:end].
+func x509_name(b []u8, at i64, end i64) !(Name, i64) {
+	from, to := try der_expect(b, at, end, derSequence, "a name")
+	n := Name{Raw: b[at:to]}
+	p := from
+	for p < to {
+		sf, st := try der_expect(b, p, to, derSet, "a relative distinguished name")
+		q := sf
+		if sf == st {
+			fail "seal: empty relative distinguished name"
+		}
+		for q < st {
+			af, at2 := try der_expect(b, q, st, derSequence, "an attribute")
+			oid, vat := try der_oid(b, af, at2)
+			tag, vf, vt := try der_read(b, vat, at2)
+			if vt != at2 {
+				fail "seal: trailing data in a name attribute"
+			}
+			v := try x509_string(b, vf, vt, tag)
+			if oid == "2.5.4.3" {
+				n.CommonName = v
+			} else if oid == "2.5.4.10" {
+				n.Organization = append(n.Organization, v)
+			} else if oid == "2.5.4.11" {
+				n.OrganizationalUnit = append(n.OrganizationalUnit, v)
+			} else if oid == "2.5.4.6" {
+				n.Country = append(n.Country, v)
+			} else if oid == "2.5.4.7" {
+				n.Locality = append(n.Locality, v)
+			} else if oid == "2.5.4.8" {
+				n.Province = append(n.Province, v)
+			} else if oid == "2.5.4.5" {
+				n.SerialNumber = v
+			}
+			q = at2
+		}
+		p = st
+	}
+	return n, to
+}
+
+// String formats n like "CN=example.com,O=Example,C=US".
+func (n Name) String() str {
+	parts := []str{}
+	if n.CommonName != "" {
+		parts = append(parts, "CN="+n.CommonName)
+	}
+	for _, v := range n.OrganizationalUnit {
+		parts = append(parts, "OU="+v)
+	}
+	for _, v := range n.Organization {
+		parts = append(parts, "O="+v)
+	}
+	for _, v := range n.Locality {
+		parts = append(parts, "L="+v)
+	}
+	for _, v := range n.Province {
+		parts = append(parts, "ST="+v)
+	}
+	for _, v := range n.Country {
+		parts = append(parts, "C="+v)
+	}
+	out := ""
+	for i, p := range parts {
+		if i > 0 {
+			out = out + ","
+		}
+		out = out + p
+	}
+	return out
+}
+
+// x509_hash_oid maps a hash algorithm OID to a Hash.
+func x509_hash_oid(oid str) !Hash {
+	if oid == oidSHA256 {
+		return Hash.SHA256
+	}
+	if oid == oidSHA384 {
+		return Hash.SHA384
+	}
+	if oid == oidSHA512 {
+		return Hash.SHA512
+	}
+	fail "seal: unsupported hash in RSA-PSS parameters (" + oid + ")"
+}
+
+// x509_hash_alg reads an AlgorithmIdentifier naming a hash, with absent or NULL parameters.
+func x509_hash_alg(b []u8, from i64, to i64) !Hash {
+	af, at := try der_expect(b, from, to, derSequence, "a hash algorithm")
+	oid, p := try der_oid(b, af, at)
+	if p != at {
+		nf, nt := try der_expect(b, p, at, derNull, "NULL parameters")
+		if nf != nt || nt != at {
+			fail "seal: bad hash algorithm parameters"
+		}
+	}
+	if at != to {
+		fail "seal: trailing data after a hash algorithm"
+	}
+	return try x509_hash_oid(oid)
+}
+
+// x509_pss_params checks RSASSA-PSS-params: MGF1 with the same hash, salt length = hash length, trailer 1.
+func x509_pss_params(b []u8, from i64, to i64) !SignatureAlgorithm {
+	pf, pt := try der_expect(b, from, to, derSequence, "RSA-PSS parameters")
+	if pt != to {
+		fail "seal: trailing data after RSA-PSS parameters"
+	}
+	h := Hash.SHA1
+	mh := Hash.SHA1
+	salt := 20
+	p := pf
+	if p < pt && b[p] == 0xa0 {
+		_, f, t := try der_read(b, p, pt)
+		h = try x509_hash_alg(b, f, t)
+		p = t
+	}
+	if p < pt && b[p] == 0xa1 {
+		_, f, t := try der_read(b, p, pt)
+		mf, mt := try der_expect(b, f, t, derSequence, "a mask generation function")
+		oid, q := try der_oid(b, mf, mt)
+		if oid != oidMGF1 || mt != t {
+			fail "seal: unsupported RSA-PSS mask generation function"
+		}
+		mh = try x509_hash_alg(b, q, mt)
+		p = t
+	}
+	if p < pt && b[p] == 0xa2 {
+		_, f, t := try der_read(b, p, pt)
+		v, e := try der_small_int(b, f, t)
+		if e != t {
+			fail "seal: bad RSA-PSS salt length"
+		}
+		salt = v
+		p = t
+	}
+	if p < pt && b[p] == 0xa3 {
+		_, f, t := try der_read(b, p, pt)
+		v, e := try der_small_int(b, f, t)
+		if e != t || v != 1 {
+			fail "seal: bad RSA-PSS trailer field"
+		}
+		p = t
+	}
+	if p != pt {
+		fail "seal: malformed RSA-PSS parameters"
+	}
+	if h != mh || salt != HashSize(h) {
+		fail "seal: unsupported RSA-PSS parameters (the MGF1 hash and salt length must match the hash)"
+	}
+	switch h {
+	case SHA256:
+		return SignatureAlgorithm.SHA256WithRSAPSS
+	case SHA384:
+		return SignatureAlgorithm.SHA384WithRSAPSS
+	case SHA512:
+		return SignatureAlgorithm.SHA512WithRSAPSS
+	default:
+	}
+	fail "seal: RSA-PSS with SHA-1 is not supported"
+}
+
+// x509_sig_alg reads a signature AlgorithmIdentifier at b[at:end].
+func x509_sig_alg(b []u8, at i64, end i64) !(SignatureAlgorithm, i64) {
+	from, to := try der_expect(b, at, end, derSequence, "a signature algorithm")
+	oid, p := try der_oid(b, from, to)
+	params := p != to
+	nullParams := false
+	if params {
+		tag, nf, nt := try der_read(b, p, to)
+		if nt != to {
+			fail "seal: trailing data after signature algorithm parameters"
+		}
+		nullParams = tag == derNull && nf == nt
+	}
+	rsaAlg := SignatureAlgorithm.UnknownSignature
+	if oid == "1.2.840.113549.1.1.5" {
+		rsaAlg = SignatureAlgorithm.SHA1WithRSA
+	} else if oid == "1.2.840.113549.1.1.11" {
+		rsaAlg = SignatureAlgorithm.SHA256WithRSA
+	} else if oid == "1.2.840.113549.1.1.12" {
+		rsaAlg = SignatureAlgorithm.SHA384WithRSA
+	} else if oid == "1.2.840.113549.1.1.13" {
+		rsaAlg = SignatureAlgorithm.SHA512WithRSA
+	}
+	if rsaAlg != SignatureAlgorithm.UnknownSignature {
+		if params && !nullParams {
+			fail "seal: bad RSA signature algorithm parameters"
+		}
+		return rsaAlg, to
+	}
+	if oid == oidRSAPSS {
+		if !params {
+			fail "seal: RSA-PSS signature algorithm without parameters"
+		}
+		alg := try x509_pss_params(b, p, to)
+		return alg, to
+	}
+	ecAlg := SignatureAlgorithm.UnknownSignature
+	if oid == "1.2.840.10045.4.1" {
+		ecAlg = SignatureAlgorithm.ECDSAWithSHA1
+	} else if oid == "1.2.840.10045.4.3.2" {
+		ecAlg = SignatureAlgorithm.ECDSAWithSHA256
+	} else if oid == "1.2.840.10045.4.3.3" {
+		ecAlg = SignatureAlgorithm.ECDSAWithSHA384
+	} else if oid == "1.2.840.10045.4.3.4" {
+		ecAlg = SignatureAlgorithm.ECDSAWithSHA512
+	} else if oid == oidEd25519 {
+		ecAlg = SignatureAlgorithm.PureEd25519
+	}
+	if ecAlg != SignatureAlgorithm.UnknownSignature {
+		if params {
+			fail "seal: unexpected signature algorithm parameters"
+		}
+		return ecAlg, to
+	}
+	return SignatureAlgorithm.UnknownSignature, to
+}
+
+// x509_spki parses SubjectPublicKeyInfo into c.
+func x509_spki(b []u8, at i64, end i64, c mut Certificate) !i64 {
+	from, to := try der_expect(b, at, end, derSequence, "a subject public key info")
+	c.RawSubjectPublicKeyInfo = b[at:to]
+	af, aend := try der_expect(b, from, to, derSequence, "a public key algorithm")
+	oid, p := try der_oid(b, af, aend)
+	if p != aend {
+		_, _, pend := try der_read(b, p, aend)
+		if pend != aend {
+			fail "seal: trailing data after public key parameters"
+		}
+	}
+	key, kend := try der_bits(b, aend, to)
+	if kend != to {
+		fail "seal: trailing data after the public key"
+	}
+	c.PublicKey = key
+	if oid == oidRSA {
+		if p != aend {
+			nf, nt := try der_expect(b, p, aend, derNull, "NULL parameters")
+			if nf != nt || nt != aend {
+				fail "seal: bad RSA key parameters"
+			}
+		}
+		c.RSAKey = try ParseRSAPublicKeyDER(key)
+		c.PublicKeyAlgorithm = PublicKeyAlgorithm.RSA
+	} else if oid == oidECPublicKey {
+		curve, q := try der_oid(b, p, aend)
+		if q != aend {
+			fail "seal: bad EC key parameters"
+		}
+		size := 0
+		if curve == oidP256 {
+			c.Curve = "P-256"
+			size = 32
+		} else if curve == oidP384 {
+			c.Curve = "P-384"
+			size = 48
+		} else if curve == oidP521 {
+			c.Curve = "P-521"
+			size = 66
+		} else {
+			fail "seal: unsupported elliptic curve " + curve
+		}
+		if len(key) != 1+2*size || key[0] != 4 {
+			fail "seal: EC public keys must be uncompressed points"
+		}
+		try x509_on_curve(c.Curve, key[1:1+size], key[1+size:])
+		c.PublicKeyAlgorithm = PublicKeyAlgorithm.ECDSA
+	} else if oid == oidEd25519 {
+		if p != aend || len(key) != 32 {
+			fail "seal: bad Ed25519 public key"
+		}
+		c.PublicKeyAlgorithm = PublicKeyAlgorithm.Ed25519
+	}
+	return to
+}
+
+// x509_on_curve fails unless (x, y) is a point of the named curve: coordinates below p and
+// y^2 = x^3 - 3x + b (mod p). Public data: the arithmetic need not be constant time.
+func x509_on_curve(curve str, x []u8, y []u8) ! {
+	ph := "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff"
+	bh := "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b"
+	if curve == "P-384" {
+		ph = "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff"
+		bh = "b3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875ac656398d8a2ed19d2a85c8edd3ec2aef"
+	} else if curve == "P-521" {
+		ph = "01ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+		bh = "0051953eb9618e1c9a1f929a21a0b68540eea2da725b99b315f3b8b489918ef109e156193951ec7e937b1652c0bd3bb1bf073573df883d2c34f1ef451fd46b503f00"
+	}
+	pb := try HexDecode(ph)
+	bb := try HexDecode(bh)
+	c := try mont_new(pb)
+	n := c.n
+	xs := nat_from_bytes(x, n)
+	ys := nat_from_bytes(y, n)
+	if nat_cmp(xs, c.m) >= 0 || nat_cmp(ys, c.m) >= 0 {
+		fail "seal: EC public key coordinate out of range"
+	}
+	t := make([]u64, n+2)
+	tmp := make([]u64, n)
+	xm := make([]u64, n)
+	ym := make([]u64, n)
+	bm := make([]u64, n)
+	mont_mul(c, xs, c.rr, mut xm, mut t)
+	mont_mul(c, ys, c.rr, mut ym, mut t)
+	mont_mul(c, nat_from_bytes(bb, n), c.rr, mut bm, mut t)
+	lhs := make([]u64, n)
+	mont_mul(c, ym, ym, mut lhs, mut t)
+	rhs := make([]u64, n)
+	mont_mul(c, xm, xm, mut rhs, mut t)
+	mont_mul(c, rhs, xm, mut rhs, mut t)
+	for i := 0; i < 3; i++ {
+		mont_sub(c, rhs, xm, mut rhs)
+	}
+	mont_add(c, rhs, bm, mut rhs, mut tmp)
+	if nat_cmp(lhs, rhs) != 0 {
+		fail "seal: EC public key is not on the curve"
+	}
+}
+
+// x509_general_names reads GeneralNames into c (the subject alternative name extension).
+func x509_general_names(b []u8, from i64, to i64, c mut Certificate) ! {
+	sf, st := try der_expect(b, from, to, derSequence, "general names")
+	if st != to {
+		fail "seal: trailing data after subject alternative names"
+	}
+	if sf == st {
+		fail "seal: empty subject alternative names"
+	}
+	p := sf
+	for p < st {
+		tag, f, t := try der_read(b, p, st)
+		if tag == 0x82 {
+			v := try x509_ia5(b, f, t, "DNS name")
+			c.DNSNames = append(c.DNSNames, v)
+		} else if tag == 0x81 {
+			v := try x509_ia5(b, f, t, "email address")
+			c.EmailAddresses = append(c.EmailAddresses, v)
+		} else if tag == 0x86 {
+			v := try x509_ia5(b, f, t, "URI")
+			c.URIs = append(c.URIs, v)
+		} else if tag == 0x87 {
+			if t-f != 4 && t-f != 16 {
+				fail "seal: bad IP address in subject alternative names"
+			}
+			c.IPAddresses = append(c.IPAddresses, b[f:t])
+		}
+		p = t
+	}
+}
+
+func x509_ia5(b []u8, f i64, t i64, what str) !str {
+	for i := f; i < t; i++ {
+		if b[i] >= 0x80 {
+			fail "seal: " + what + " is not ASCII"
+		}
+	}
+	return str(b[f:t])
+}
+
+// x509_subtrees reads GeneralSubtrees for name constraints.
+func x509_subtrees(b []u8, from i64, to i64, dns mut []str, ips mut [][]u8) !bool {
+	other := false
+	p := from
+	for p < to {
+		gf, gt := try der_expect(b, p, to, derSequence, "a general subtree")
+		tag, f, t := try der_read(b, gf, gt)
+		if t != gt {
+			fail "seal: name constraints with minimum or maximum are not supported"
+		}
+		if tag == 0x82 {
+			v := try x509_ia5(b, f, t, "DNS constraint")
+			dns = append(dns, v)
+		} else if tag == 0x87 {
+			if t-f != 8 && t-f != 32 {
+				fail "seal: bad IP name constraint"
+			}
+			ips = append(ips, b[f:t])
+		} else {
+			other = true
+		}
+		p = gt
+	}
+	return other
+}
+
+// x509_extension applies one extension to c; critical extensions it does not know are recorded.
+func x509_extension(b []u8, oid str, critical bool, f i64, t i64, c mut Certificate) ! {
+	if oid == "2.5.29.17" {
+		try x509_general_names(b, f, t, mut c)
+	} else if oid == "2.5.29.19" {
+		sf, st := try der_expect(b, f, t, derSequence, "basic constraints")
+		if st != t {
+			fail "seal: trailing data after basic constraints"
+		}
+		c.BasicConstraintsValid = true
+		p := sf
+		if p < st && b[p] == derBoolean {
+			bf, bt := try der_expect(b, p, st, derBoolean, "a boolean")
+			if bt-bf != 1 || (b[bf] != 0 && b[bf] != 0xff) {
+				fail "seal: bad boolean in basic constraints"
+			}
+			c.IsCA = b[bf] == 0xff
+			p = bt
+		}
+		if p < st {
+			v, e := try der_small_int(b, p, st)
+			if v < 0 || e != st {
+				fail "seal: bad path length in basic constraints"
+			}
+			c.MaxPathLen = v
+		}
+	} else if oid == "2.5.29.15" {
+		bf, bt := try der_expect(b, f, t, derBitString, "key usage bits")
+		if bt != t || bt-bf < 1 || b[bf] > 7 || (bt-bf == 1 && b[bf] != 0) || b[bt-1]&u8((1<<i64(b[bf]))-1) != 0 {
+			fail "seal: bad key usage"
+		}
+		v := 0
+		for i := 0; i < (bt-bf-1)*8 && i < 9; i++ {
+			if (b[bf+1+i/8]>>u8(7-i%8))&1 == 1 {
+				v |= 1 << i
+			}
+		}
+		c.KeyUsage = v
+		c.HasKeyUsage = true
+	} else if oid == "2.5.29.37" {
+		sf, st := try der_expect(b, f, t, derSequence, "extended key usages")
+		if st != t || sf == st {
+			fail "seal: bad extended key usage"
+		}
+		p := sf
+		for p < st {
+			u, next := try der_oid(b, p, st)
+			c.ExtKeyUsage = append(c.ExtKeyUsage, u)
+			p = next
+		}
+	} else if oid == "2.5.29.14" {
+		kf, kt := try der_expect(b, f, t, derOctetString, "a subject key identifier")
+		if kt != t {
+			fail "seal: bad subject key identifier"
+		}
+		c.SubjectKeyId = b[kf:kt]
+	} else if oid == "2.5.29.35" {
+		sf, st := try der_expect(b, f, t, derSequence, "an authority key identifier")
+		if st != t {
+			fail "seal: bad authority key identifier"
+		}
+		if sf < st && b[sf] == 0x80 {
+			_, kf, kt := try der_read(b, sf, st)
+			c.AuthorityKeyId = b[kf:kt]
+		}
+	} else if oid == "2.5.29.30" {
+		sf, st := try der_expect(b, f, t, derSequence, "name constraints")
+		if st != t || sf == st {
+			fail "seal: bad name constraints"
+		}
+		p := sf
+		if p < st && b[p] == 0xa0 {
+			_, pf, pt := try der_read(b, p, st)
+			other := try x509_subtrees(b, pf, pt, mut c.PermittedDNSDomains, mut c.PermittedIPRanges)
+			if other {
+				c.HasOtherNameConstraints = true
+			}
+			p = pt
+		}
+		if p < st && b[p] == 0xa1 {
+			_, ef, et := try der_read(b, p, st)
+			other := try x509_subtrees(b, ef, et, mut c.ExcludedDNSDomains, mut c.ExcludedIPRanges)
+			if other {
+				c.HasOtherNameConstraints = true
+			}
+			p = et
+		}
+		if p != st {
+			fail "seal: bad name constraints"
+		}
+	} else if oid == "2.5.29.31" || oid == "2.5.29.32" || oid == "2.5.29.33" || oid == "2.5.29.36" || oid == "2.5.29.54" || oid == "1.3.6.1.5.5.7.1.1" {
+		// Extensions Tin does not use are still checked for shape, as Go checks them; policies are not enforced.
+		try x509_check_shape(b, oid, f, t)
+	} else if critical {
+		c.UnhandledCritical = append(c.UnhandledCritical, oid)
+	}
+}
+
+// x509_check_shape checks the DER shape of the CRL distribution points, policy and authority
+// information access extensions, which Tin parses but does not use.
+func x509_check_shape(b []u8, oid str, f i64, t i64) ! {
+	if oid == "2.5.29.54" {
+		_, e := try der_small_int(b, f, t)
+		if e != t {
+			fail "seal: bad inhibitAnyPolicy"
+		}
+		return
+	}
+	sf, st := try der_expect(b, f, t, derSequence, "a sequence")
+	if st != t {
+		fail "seal: trailing data in an extension"
+	}
+	if oid == "2.5.29.36" {
+		p := sf
+		for p < st {
+			tag, vf, vt := try der_read(b, p, st)
+			if tag != 0x80 && tag != 0x81 {
+				fail "seal: bad policy constraints"
+			}
+			if vf == vt || vt-vf > 7 {
+				fail "seal: bad policy constraints"
+			}
+			p = vt
+		}
+		return
+	}
+	p := sf
+	for p < st {
+		ef, et := try der_expect(b, p, st, derSequence, "a sequence")
+		if oid == "2.5.29.31" {
+			if ef < et && b[ef] == 0xa0 {
+				_, nf, nt := try der_read(b, ef, et)
+				tag, xf, xt := try der_read(b, nf, nt)
+				if tag != 0xa0 || xt != nt {
+					fail "seal: bad CRL distribution point"
+				}
+				q := xf
+				for q < xt {
+					_, _, next := try der_read(b, q, xt)
+					q = next
+				}
+			}
+		} else if oid == "2.5.29.32" {
+			_, _ = try der_oid(b, ef, et)
+		} else if oid == "2.5.29.33" {
+			_, q := try der_oid(b, ef, et)
+			_, r := try der_oid(b, q, et)
+			if r != et {
+				fail "seal: bad policy mapping"
+			}
+		} else {
+			_, q := try der_oid(b, ef, et)
+			_, _, r := try der_read(b, q, et)
+			if r != et {
+				fail "seal: bad authority information access"
+			}
+		}
+		p = et
+	}
+}
+
+// ParseCertificate parses one DER certificate. Slices in the result share der's memory.
+func ParseCertificate(der []u8) !Certificate {
+	c := Certificate{Issuer: Name{}, Subject: Name{}, SignatureAlgorithm: SignatureAlgorithm.UnknownSignature,
+		PublicKeyAlgorithm: PublicKeyAlgorithm.UnknownKey, RSAKey: RSAPublicKey{N: []u8{}, E: []u8{}}, MaxPathLen: -1}
+	cf, ct := try der_expect(der, 0, len(der), derSequence, "a certificate")
+	if ct != len(der) {
+		fail "seal: trailing data after the certificate"
+	}
+	c.Raw = der
+	tf, tt := try der_expect(der, cf, ct, derSequence, "the certificate body")
+	c.RawTBS = der[cf:tt]
+	p := tf
+	if p < tt && der[p] == 0xa0 {
+		_, vf, vt := try der_read(der, p, tt)
+		v, e := try der_small_int(der, vf, vt)
+		if e != vt || v < 0 || v > 2 {
+			fail "seal: unsupported certificate version"
+		}
+		if v == 0 {
+			fail "seal: certificate version 1 must not be written explicitly"
+		}
+		c.Version = v
+		p = vt
+	}
+	sf, st := try der_expect(der, p, tt, derInteger, "a serial number")
+	if sf == st {
+		fail "seal: empty serial number"
+	}
+	if der[sf]&0x80 != 0 {
+		fail "seal: negative serial number"
+	}
+	if st-sf > 1 && der[sf] == 0 && der[sf+1]&0x80 == 0 {
+		fail "seal: serial number is not minimally encoded"
+	}
+	c.SerialNumber = der[sf:st]
+	p = st
+	innerAlgStart := p
+	_, ip := try x509_sig_alg(der, p, tt)
+	innerAlg := der[innerAlgStart:ip]
+	c.Issuer, p = try x509_name(der, ip, tt)
+	vf, vt := try der_expect(der, p, tt, derSequence, "a validity period")
+	tag1, f1, t1 := try der_read(der, vf, vt)
+	if tag1 != derUTCTime && tag1 != derGeneralizedTime {
+		fail "seal: bad certificate time"
+	}
+	c.NotBefore = try x509_time(der, f1, t1, tag1)
+	tag2, f2, t2 := try der_read(der, t1, vt)
+	if (tag2 != derUTCTime && tag2 != derGeneralizedTime) || t2 != vt {
+		fail "seal: bad certificate time"
+	}
+	c.NotAfter = try x509_time(der, f2, t2, tag2)
+	c.Subject, p = try x509_name(der, vt, tt)
+	p = try x509_spki(der, p, tt, mut c)
+	// Issuer and subject unique identifiers ([1], [2]) are skipped.
+	for p < tt && (der[p] == 0x81 || der[p] == 0xa1 || der[p] == 0x82 || der[p] == 0xa2) {
+		if c.Version < 1 {
+			fail "seal: unique identifiers in a version 1 certificate"
+		}
+		_, _, next := try der_read(der, p, tt)
+		p = next
+	}
+	if p < tt && der[p] == 0xa3 {
+		if c.Version != 2 {
+			fail "seal: extensions in a certificate before version 3"
+		}
+		_, ef, et := try der_read(der, p, tt)
+		lf, lt := try der_expect(der, ef, et, derSequence, "extensions")
+		if lt != et || lf == lt {
+			fail "seal: bad extensions"
+		}
+		seen := map[str]bool{}
+		q := lf
+		for q < lt {
+			xf, xt := try der_expect(der, q, lt, derSequence, "an extension")
+			oid, r := try der_oid(der, xf, xt)
+			if seen[oid] {
+				fail "seal: duplicate certificate extension " + oid
+			}
+			seen[oid] = true
+			critical := false
+			if r < xt && der[r] == derBoolean {
+				bf, bt := try der_expect(der, r, xt, derBoolean, "a boolean")
+				if bt-bf != 1 || der[bf] != 0xff {
+					fail "seal: bad critical flag in an extension"
+				}
+				critical = true
+				r = bt
+			}
+			of, ot := try der_expect(der, r, xt, derOctetString, "an extension value")
+			if ot != xt {
+				fail "seal: trailing data in an extension"
+			}
+			x509_extension(der, oid, critical, of, ot, mut c) catch err {
+				fail say.Fault("%s (in extension %s)", err, oid)
+			}
+			q = xt
+		}
+		p = et
+	}
+	if p != tt {
+		fail "seal: trailing data in the certificate body"
+	}
+	outerStart := tt
+	outer, op := try x509_sig_alg(der, tt, ct)
+	if !x509_same(der[outerStart:op], innerAlg) {
+		fail "seal: the certificate's two signature algorithms differ"
+	}
+	c.SignatureAlgorithm = outer
+	sig, end := try der_bits(der, op, ct)
+	if end != ct {
+		fail "seal: trailing data after the signature"
+	}
+	c.Signature = sig
+	return c
+}
+
+func x509_same(a []u8, b []u8) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// ParseCertificatesPEM parses every CERTIFICATE block in pem (other blocks are skipped).
+func ParseCertificatesPEM(pem str) ![]Certificate {
+	blocks := try DecodePEM(pem)
+	out := []Certificate{}
+	for _, b := range blocks {
+		if b.Type == "CERTIFICATE" {
+			c := try ParseCertificate(b.Bytes)
+			out = append(out, c)
+		}
+	}
+	if len(out) == 0 {
+		fail "seal: no certificate in PEM"
+	}
+	return out
+}
+
+// ---- Signatures ----
+
+// x509_sig_hash is the hash a signature algorithm uses.
+func x509_sig_hash(a SignatureAlgorithm) Hash {
+	switch a {
+	case SHA1WithRSA, ECDSAWithSHA1:
+		return Hash.SHA1
+	case SHA384WithRSA, SHA384WithRSAPSS, ECDSAWithSHA384:
+		return Hash.SHA384
+	case SHA512WithRSA, SHA512WithRSAPSS, ECDSAWithSHA512:
+		return Hash.SHA512
+	default:
+		return Hash.SHA256
+	}
+}
+
+// CheckSignature checks that sig is c's key's signature of signed under alg. SHA-1 is refused.
+func (c Certificate) CheckSignature(alg SignatureAlgorithm, signed []u8, sig []u8) ! {
+	h := x509_sig_hash(alg)
+	switch alg {
+	case UnknownSignature:
+		fail "x509: unknown signature algorithm"
+	case SHA1WithRSA, ECDSAWithSHA1:
+		fail "x509: SHA-1 signatures are not accepted (" + x509_alg_name(alg) + ")"
+	case SHA256WithRSA, SHA384WithRSA, SHA512WithRSA:
+		if c.PublicKeyAlgorithm != PublicKeyAlgorithm.RSA {
+			fail "x509: signature algorithm " + x509_alg_name(alg) + " does not match the issuer's key"
+		}
+		VerifyPKCS1v15(c.RSAKey, h, HashSum(h, str(signed)), sig) catch err {
+			fail say.Fault("x509: bad signature: %s", err)
+		}
+	case SHA256WithRSAPSS, SHA384WithRSAPSS, SHA512WithRSAPSS:
+		if c.PublicKeyAlgorithm != PublicKeyAlgorithm.RSA {
+			fail "x509: signature algorithm " + x509_alg_name(alg) + " does not match the issuer's key"
+		}
+		VerifyPSS(c.RSAKey, h, HashSum(h, str(signed)), sig, HashSize(h)) catch err {
+			fail say.Fault("x509: bad signature: %s", err)
+		}
+	default:
+		fail "x509: " + x509_alg_name(alg) + " signatures are not supported yet"
+	}
+}
+
+// CheckSignatureFrom checks that parent signed c. It does not check that parent may sign.
+func (c Certificate) CheckSignatureFrom(parent Certificate) ! {
+	if !hash_ready(x509_sig_hash(c.SignatureAlgorithm)) && c.SignatureAlgorithm != SignatureAlgorithm.SHA1WithRSA && c.SignatureAlgorithm != SignatureAlgorithm.ECDSAWithSHA1 {
+		fail "x509: " + x509_alg_name(c.SignatureAlgorithm) + " signatures are not supported yet"
+	}
+	try parent.CheckSignature(c.SignatureAlgorithm, c.RawTBS, c.Signature)
+}
+
+// CheckTLSSignature checks a TLS 1.3 CertificateVerify signature by c's key: scheme is the
+// SignatureScheme code and signed the bytes the peer signed (padding, context and transcript hash).
+func (c Certificate) CheckTLSSignature(scheme i64, signed []u8, sig []u8) ! {
+	h := Hash.SHA256
+	if scheme == 0x0805 || scheme == 0x0503 {
+		h = Hash.SHA384
+	} else if scheme == 0x0806 || scheme == 0x0603 {
+		h = Hash.SHA512
+	}
+	if scheme >= 0x0804 && scheme <= 0x0806 {
+		if c.PublicKeyAlgorithm != PublicKeyAlgorithm.RSA {
+			fail "x509: TLS signature scheme does not match the certificate's key"
+		}
+		if !hash_ready(h) {
+			fail "x509: " + HashName(h) + " is not available yet"
+		}
+		VerifyPSS(c.RSAKey, h, HashSum(h, str(signed)), sig, HashSize(h)) catch err {
+			fail say.Fault("x509: bad TLS signature: %s", err)
+		}
+		return
+	}
+	if scheme == 0x0403 || scheme == 0x0503 || scheme == 0x0603 || scheme == 0x0807 {
+		fail say.Fault("x509: TLS signature scheme 0x%04x is not supported yet", scheme)
+	}
+	fail say.Fault("x509: TLS signature scheme 0x%04x is not allowed in TLS 1.3", scheme)
+}
+
+// ---- Pools ----
+
+// CertPool is a set of certificates indexed by subject, used for roots and intermediates.
+type CertPool struct {
+	certs []Certificate
+	bySubject map[str][]i64
+	byRaw map[str]bool
+}
+
+// NewCertPool returns an empty pool.
+func NewCertPool() CertPool {
+	return CertPool{bySubject: map[str][]i64{}, byRaw: map[str]bool{}}
+}
+
+// Add adds c to the pool unless it is already there.
+func (p mut CertPool) Add(c Certificate) {
+	raw := str(c.Raw)
+	if p.byRaw[raw] {
+		return
+	}
+	p.byRaw[raw] = true
+	key := str(c.Subject.Raw)
+	idx := p.bySubject[key]
+	idx = append(idx, len(p.certs))
+	p.bySubject[key] = idx
+	p.certs = append(p.certs, c)
+}
+
+// AddPEM adds every certificate in pem that parses and returns how many were added; it fails
+// only when none could be.
+func (p mut CertPool) AddPEM(pem str) !i64 {
+	blocks := try DecodePEM(pem)
+	n := 0
+	for _, b := range blocks {
+		if b.Type != "CERTIFICATE" {
+			continue
+		}
+		c, err := ParseCertificate(b.Bytes)
+		if err == nil {
+			p.Add(c)
+			n++
+		}
+	}
+	if n == 0 {
+		fail "x509: no usable certificate in PEM"
+	}
+	return n
+}
+
+// Len is the number of certificates in the pool.
+func (p CertPool) Len() i64 {
+	return len(p.certs)
+}
+
+// Certificates returns the pool's certificates in the order they were added.
+func (p CertPool) Certificates() []Certificate {
+	return p.certs
+}
+
+func (p CertPool) contains(c Certificate) bool {
+	return p.byRaw[str(c.Raw)]
+}
+
+var systemRoots ?CertPool
+
+// SystemRoots loads the operating system's trusted roots (SSL_CERT_FILE overrides the
+// location) once per core and returns them.
+func SystemRoots() !CertPool {
+	cached := systemRoots
+	if cached != nil {
+		return cached
+	}
+	pool := NewCertPool()
+	paths := []str{}
+	env := quarry.Getenv("SSL_CERT_FILE")
+	if env != "" {
+		paths = append(paths, env)
+	} else {
+		paths = rootFiles()
+	}
+	tried := ""
+	for _, path := range paths {
+		text, err := quarry.ReadFile(path)
+		if err != nil {
+			tried = tried + " " + path
+			continue
+		}
+		_, perr := pool.AddPEM(text)
+		if perr == nil {
+			systemRoots = keep(pool)
+			return pool
+		}
+		tried = tried + " " + path
+	}
+	fail "x509: no system roots found (tried" + tried + "; set SSL_CERT_FILE)"
+}
+
+// ---- Verification ----
+
+// VerifyOptions controls Verify. Roots nil means the system roots; Now 0 means the clock;
+// DNSName "" skips the host name check; KeyUsages empty means server authentication;
+// MaxChain 0 means 8 certificates, leaf and root included.
+type VerifyOptions struct {
+	DNSName str
+	Roots ?CertPool
+	Intermediates ?CertPool
+	Now i64
+	KeyUsages []str
+	MaxChain i64
+}
+
+func x509_time_text(t i64) str {
+	return tide.FormatRFC3339(t * 1000000000)
+}
+
+// x509_check_time fails when now is outside c's validity period.
+func x509_check_time(c Certificate, now i64, role str) ! {
+	if now < c.NotBefore {
+		fail "x509: " + role + " certificate is not valid yet: current time " + x509_time_text(now) + " is before " + x509_time_text(c.NotBefore) + " (" + c.Subject.String() + ")"
+	}
+	if now > c.NotAfter {
+		fail "x509: " + role + " certificate has expired: current time " + x509_time_text(now) + " is after " + x509_time_text(c.NotAfter) + " (" + c.Subject.String() + ")"
+	}
+}
+
+func x509_has(list []str, s str) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+// x509_check_eku fails unless c (with an EKU extension) allows one of the wanted usages.
+func x509_check_eku(c Certificate, wanted []str, role str) ! {
+	if len(c.ExtKeyUsage) == 0 || x509_has(c.ExtKeyUsage, ExtKeyUsageAny) || x509_has(wanted, ExtKeyUsageAny) {
+		return
+	}
+	for _, w := range wanted {
+		if x509_has(c.ExtKeyUsage, w) {
+			return
+		}
+	}
+	fail "x509: " + role + " certificate is not allowed for this key usage (" + c.Subject.String() + ")"
+}
+
+type x509State struct {
+	roots CertPool
+	inter CertPool
+	now i64
+	wanted []str
+	maxChain i64
+	budget i64
+}
+
+// Verify builds a chain from c through opts.Intermediates to a trusted root and checks it: validity
+// periods, CA and key-usage rules, path lengths, name constraints, signatures (no SHA-1), the
+// chain length and the host name. The chain is returned leaf first, root last.
+func (c Certificate) Verify(opts VerifyOptions) ![]Certificate {
+	st := x509State{roots: NewCertPool(), inter: NewCertPool(), now: opts.Now, wanted: opts.KeyUsages, maxChain: opts.MaxChain, budget: 100}
+	r := opts.Roots
+	if r != nil {
+		st.roots = r
+	} else {
+		st.roots = try SystemRoots()
+	}
+	im := opts.Intermediates
+	if im != nil {
+		st.inter = im
+	}
+	if st.now == 0 {
+		st.now = tide.Wall() / 1000000000
+	}
+	if len(st.wanted) == 0 {
+		st.wanted = []str{ExtKeyUsageServerAuth}
+	}
+	if st.maxChain <= 0 {
+		st.maxChain = 8
+	}
+	if len(c.UnhandledCritical) > 0 {
+		fail "x509: unhandled critical extension " + c.UnhandledCritical[0] + " in the leaf certificate"
+	}
+	try x509_check_time(c, st.now, "leaf")
+	try x509_check_eku(c, st.wanted, "leaf")
+	if opts.DNSName != "" {
+		try c.VerifyHostname(opts.DNSName)
+	}
+	chain := []Certificate{c}
+	if st.roots.contains(c) {
+		return chain
+	}
+	return try x509_extend(mut st, chain)
+}
+
+// x509_extend finds an issuer for the last certificate of chain and recurses until a root.
+func x509_extend(st mut x509State, chain []Certificate) ![]Certificate {
+	child := chain[len(chain)-1]
+	key := str(child.Issuer.Raw)
+	first := ""
+	tried := 0
+	for pass := 0; pass < 2; pass++ {
+		pool := st.roots
+		if pass == 1 {
+			pool = st.inter
+		}
+		for _, i := range pool.bySubject[key] {
+			cand := pool.certs[i]
+			if x509_in(chain, cand) {
+				continue
+			}
+			tried++
+			got, err := x509_try(mut st, chain, cand, pass == 0)
+			if err == nil {
+				return got
+			}
+			if first == "" {
+				first = say.Str(err)
+			}
+		}
+	}
+	if tried == 0 {
+		fail "x509: certificate signed by unknown authority (no trusted root or intermediate for issuer " + child.Issuer.String() + ")"
+	}
+	fail first
+}
+
+func x509_in(chain []Certificate, c Certificate) bool {
+	for _, x := range chain {
+		if x509_same(x.Raw, c.Raw) {
+			return true
+		}
+	}
+	return false
+}
+
+// x509_try checks cand as the issuer of chain's last certificate; a root ends the chain.
+func x509_try(st mut x509State, chain []Certificate, cand Certificate, isRoot bool) ![]Certificate {
+	child := chain[len(chain)-1]
+	role := "intermediate"
+	if isRoot {
+		role = "root"
+	}
+	if len(chain)+1 > st.maxChain {
+		fail say.Fault("x509: certificate chain is too long (more than %d certificates)", st.maxChain)
+	}
+	if st.budget <= 0 {
+		fail "x509: too many signature checks while building the chain"
+	}
+	st.budget--
+	if !isRoot {
+		if !cand.BasicConstraintsValid || !cand.IsCA {
+			fail "x509: intermediate certificate is not a CA (" + cand.Subject.String() + ")"
+		}
+	}
+	if !isRoot && cand.HasKeyUsage && cand.KeyUsage&KeyUsageCertSign == 0 {
+		fail "x509: " + role + " certificate may not sign certificates (key usage) (" + cand.Subject.String() + ")"
+	}
+	if len(cand.UnhandledCritical) > 0 {
+		fail "x509: unhandled critical extension " + cand.UnhandledCritical[0] + " in the " + role + " certificate"
+	}
+	try x509_check_time(cand, st.now, role)
+	try x509_check_eku(cand, st.wanted, role)
+	// Path length: the CA's MaxPathLen bounds the intermediates below it (the leaf not counted).
+	if cand.MaxPathLen >= 0 && len(chain)-1 > cand.MaxPathLen {
+		fail say.Fault("x509: path length constraint of %d exceeded by %s", cand.MaxPathLen, cand.Subject.String())
+	}
+	try x509_check_constraints(cand, chain[0], role)
+	child.CheckSignatureFrom(cand) catch err {
+		fail say.Fault("%s (certificate %s signed by %s)", err, child.Subject.String(), cand.Subject.String())
+	}
+	next := make([]Certificate, 0, len(chain)+1)
+	for _, x := range chain {
+		next = append(next, x)
+	}
+	next = append(next, cand)
+	if isRoot {
+		return next
+	}
+	return try x509_extend(mut st, next)
+}
+
+// ---- Host names and name constraints ----
+
+func x509_lower(s str) str {
+	b := []u8(s)
+	for i := 0; i < len(b); i++ {
+		if b[i] >= 'A' && b[i] <= 'Z' {
+			b[i] += 32
+		}
+	}
+	return str(b)
+}
+
+// ParseIP parses dotted IPv4 (4 bytes) or IPv6 text (16 bytes), optionally in brackets; nil if invalid.
+func ParseIP(s str) ?[]u8 {
+	if len(s) > 2 && s[0] == '[' && s[len(s)-1] == ']' {
+		s = s[1 : len(s)-1]
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] == ':' {
+			return x509_ip6(s)
+		}
+	}
+	return x509_ip4(s)
+}
+
+func x509_ip4(s str) ?[]u8 {
+	out := make([]u8, 0, 4)
+	v := 0
+	digits := 0
+	for i := 0; i <= len(s); i++ {
+		if i == len(s) || s[i] == '.' {
+			if digits == 0 || len(out) == 4 {
+				return nil
+			}
+			out = append(out, u8(v))
+			v = 0
+			digits = 0
+			continue
+		}
+		if s[i] < '0' || s[i] > '9' || (digits == 1 && v == 0) {
+			return nil
+		}
+		v = v*10 + i64(s[i]-'0')
+		digits++
+		if v > 255 {
+			return nil
+		}
+	}
+	if len(out) != 4 {
+		return nil
+	}
+	return out
+}
+
+func x509_ip6(s str) ?[]u8 {
+	out := make([]u8, 16)
+	n := 0
+	gap := -1
+	i := 0
+	if len(s) >= 2 && s[0] == ':' && s[1] == ':' {
+		gap = 0
+		i = 2
+	} else if len(s) > 0 && s[0] == ':' {
+		return nil
+	}
+	for i < len(s) {
+		j := i
+		v := 0
+		for j < len(s) && j-i < 4 && unhex(s[j]) >= 0 {
+			v = v*16 + unhex(s[j])
+			j++
+		}
+		if j < len(s) && s[j] == '.' {
+			v4 := x509_ip4(s[i:])
+			if v4 == nil || n > 12 {
+				return nil
+			}
+			for k := 0; k < 4; k++ {
+				out[n+k] = v4[k]
+			}
+			n += 4
+			i = len(s)
+			break
+		}
+		if j == i || n >= 16 {
+			return nil
+		}
+		out[n] = u8(v >> 8)
+		out[n+1] = u8(v)
+		n += 2
+		i = j
+		if i == len(s) {
+			break
+		}
+		if s[i] != ':' {
+			return nil
+		}
+		if i+1 < len(s) && s[i+1] == ':' {
+			if gap >= 0 {
+				return nil
+			}
+			gap = n
+			i += 2
+		} else {
+			i++
+			if i == len(s) {
+				return nil
+			}
+		}
+	}
+	if gap < 0 {
+		if n != 16 {
+			return nil
+		}
+		return out
+	}
+	if n == 16 {
+		return nil
+	}
+	shift := 16 - n
+	for k := n - 1; k >= gap; k-- {
+		out[k+shift] = out[k]
+	}
+	for k := gap; k < gap+shift; k++ {
+		out[k] = 0
+	}
+	return out
+}
+
+// x509_ip16 widens an IPv4 address to its IPv4-mapped IPv6 form.
+func x509_ip16(ip []u8) []u8 {
+	if len(ip) == 16 {
+		return ip
+	}
+	out := make([]u8, 16)
+	out[10] = 0xff
+	out[11] = 0xff
+	for i := 0; i < 4; i++ {
+		out[12+i] = ip[i]
+	}
+	return out
+}
+
+// x509_ip_text formats an address as RFC 5952 does: the longest run of two or more zero groups becomes "::".
+func x509_ip_text(ip []u8) str {
+	if len(ip) == 4 {
+		return say.Fmt("%d.%d.%d.%d", ip[0], ip[1], ip[2], ip[3])
+	}
+	best := -1
+	bestLen := 1
+	for i := 0; i < 8; i++ {
+		j := i
+		for j < 8 && ip[2*j] == 0 && ip[2*j+1] == 0 {
+			j++
+		}
+		if j-i > bestLen {
+			best = i
+			bestLen = j - i
+		}
+	}
+	out := ""
+	for i := 0; i < 8; i++ {
+		if i == best {
+			out = out + "::"
+			i += bestLen - 1
+			continue
+		}
+		if len(out) > 0 && out[len(out)-1] != ':' {
+			out = out + ":"
+		}
+		out = out + say.Fmt("%x", i64(ip[2*i])<<8|i64(ip[2*i+1]))
+	}
+	return out
+}
+
+// x509_match_host matches a host against a SAN pattern: exact, or "*." + rest where * is one whole label.
+func x509_match_host(pattern str, host str) bool {
+	// A SAN with a trailing dot is malformed and matches nothing, as in Go.
+	p := x509_lower(pattern)
+	if p == "" || host == "" {
+		return false
+	}
+	if p == host {
+		return true
+	}
+	if len(p) < 3 || p[0] != '*' || p[1] != '.' {
+		return false
+	}
+	rest := p[1:]
+	for i := 0; i < len(rest); i++ {
+		if rest[i] == '*' {
+			return false
+		}
+	}
+	// "*." alone over a single-label suffix ("*.com") is too broad to match.
+	dots := 0
+	for i := 0; i < len(rest); i++ {
+		if rest[i] == '.' {
+			dots++
+		}
+	}
+	if dots < 2 {
+		return false
+	}
+	dot := -1
+	for i := 0; i < len(host); i++ {
+		if host[i] == '.' {
+			dot = i
+			break
+		}
+	}
+	return dot > 0 && host[dot:] == rest
+}
+
+// VerifyHostname checks that c is valid for host: an IP address against the IP SANs, otherwise a
+// DNS name against the DNS SANs (case-insensitive, one leftmost "*" label followed by at least
+// two labels; a host containing "*" never matches). The common name is not used.
+func (c Certificate) VerifyHostname(host str) ! {
+	ip := ParseIP(host)
+	if ip != nil {
+		want := x509_ip16(ip)
+		names := ""
+		for _, a := range c.IPAddresses {
+			if x509_same(x509_ip16(a), want) {
+				return
+			}
+			if names != "" {
+				names = names + ", "
+			}
+			names = names + x509_ip_text(a)
+		}
+		if names == "" {
+			fail "x509: certificate is not valid for any IP address, but wanted to match " + host
+		}
+		fail "x509: certificate is valid for " + names + ", not " + host
+	}
+	h := x509_lower(host)
+	if len(h) > 0 && h[len(h)-1] == '.' {
+		h = h[:len(h)-1]
+	}
+	for i := 0; i < len(h); i++ {
+		if h[i] == '*' {
+			fail "x509: host name " + host + " contains a wildcard"
+		}
+	}
+	for _, n := range c.DNSNames {
+		if x509_match_host(n, h) {
+			return
+		}
+	}
+	if len(c.DNSNames) == 0 {
+		fail "x509: certificate is not valid for any names, but wanted to match " + host
+	}
+	names := ""
+	for i, n := range c.DNSNames {
+		if i > 0 {
+			names = names + ", "
+		}
+		names = names + n
+	}
+	fail "x509: certificate is valid for " + names + ", not " + host
+}
+
+// x509_dns_within reports whether name is the constraint's domain or below it (".example.com" means below only).
+func x509_dns_within(name str, constraint str) bool {
+	n := x509_lower(name)
+	k := x509_lower(constraint)
+	if len(n) > 0 && n[len(n)-1] == '.' {
+		n = n[:len(n)-1]
+	}
+	if k == "" {
+		return true
+	}
+	if k[0] == '.' {
+		return len(n) > len(k) && n[len(n)-len(k):] == k
+	}
+	if n == k {
+		return true
+	}
+	return len(n) > len(k) && n[len(n)-len(k):] == k && n[len(n)-len(k)-1] == '.'
+}
+
+func x509_ip_within(ip []u8, rng []u8) bool {
+	half := len(rng) / 2
+	if len(ip) != half {
+		return false
+	}
+	for i := 0; i < half; i++ {
+		if ip[i]&rng[half+i] != rng[i]&rng[half+i] {
+			return false
+		}
+	}
+	return true
+}
+
+// x509_check_constraints applies ca's name constraints to the leaf's DNS and IP names.
+func x509_check_constraints(ca Certificate, leaf Certificate, role str) ! {
+	if ca.HasOtherNameConstraints && (len(leaf.EmailAddresses) > 0 || len(leaf.URIs) > 0) {
+		fail "x509: " + role + " certificate has name constraints on names Tin does not check (" + ca.Subject.String() + ")"
+	}
+	for _, n := range leaf.DNSNames {
+		for _, k := range ca.ExcludedDNSDomains {
+			if x509_dns_within(n, k) {
+				fail "x509: DNS name " + n + " is excluded by the name constraints of " + ca.Subject.String()
+			}
+		}
+		if len(ca.PermittedDNSDomains) > 0 {
+			ok := false
+			for _, k := range ca.PermittedDNSDomains {
+				ok = ok || x509_dns_within(n, k)
+			}
+			if !ok {
+				fail "x509: DNS name " + n + " is not permitted by the name constraints of " + ca.Subject.String()
+			}
+		}
+	}
+	for _, ip := range leaf.IPAddresses {
+		for _, r := range ca.ExcludedIPRanges {
+			if x509_ip_within(ip, r) {
+				fail "x509: IP address " + x509_ip_text(ip) + " is excluded by the name constraints of " + ca.Subject.String()
+			}
+		}
+		if len(ca.PermittedIPRanges) > 0 {
+			ok := false
+			for _, r := range ca.PermittedIPRanges {
+				ok = ok || x509_ip_within(ip, r)
+			}
+			if !ok {
+				fail "x509: IP address " + x509_ip_text(ip) + " is not permitted by the name constraints of " + ca.Subject.String()
+			}
+		}
+	}
+}
