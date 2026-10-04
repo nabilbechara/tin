@@ -260,9 +260,9 @@ def main():
             subprocess.run([str(compiler),'-o',str(ipv6),'tools/ci/fixtures/ipv6.tin'],check=True,cwd=ROOT,env=dict(os.environ,TIN_ROOT=str(work)),timeout=60)
             listener=subprocess.Popen([str(ipv6)],stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=dict(os.environ,TIN_CORES='1'))
             try:
-                assert select.select([listener.stdout],[],[],5)[0],'IPv6 listener did not report its port'
-                line=listener.stdout.readline()
-                assert line,listener.stderr.read()
+                assert select.select([listener.stderr],[],[],5)[0],'IPv6 listener did not report its port'
+                line=listener.stderr.readline()
+                assert line,'IPv6 listener exited before reporting its port'
                 chosen=int(line)
                 with socket.socket(socket.AF_INET6,socket.SOCK_STREAM) as c:
                     c.settimeout(3);c.connect(('::1',chosen));c.sendall(b'IPv6')
