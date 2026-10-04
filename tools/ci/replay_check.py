@@ -407,8 +407,6 @@ def recording(work, env):
                 failures.append(f'{p.name}: does not open with the key')
                 continue
             c = decode_body(body)
-            # Scheduling records (sched.*, #243) share the tape; these checks are about effects.
-            c['effects'] = [e for e in c['effects'] if not e[1].startswith('sched.')]
             out[c['request'].split(b' ')[1].decode()] = c
             for secret in SECRETS:
                 if secret in p.read_bytes() or secret in body:
@@ -429,7 +427,9 @@ def recording(work, env):
               ('GET /cart/7?fail=1 HTTP/1.1\r\nHost: shop\r\nAuthorization: ' + handle + '\r\nCookie: ' +
                secret_handle(b'sid=c00k1e') + '\r\nConnection: close\r\n\r\n').encode())
         check('status and flags', (c['status'], c['flags'], c['panic']), (504, 0, b''))
+        # The request task's first run is a scheduling event on the tape too (#243).
         check('effects in order', [e[1:] for e in c['effects']], [
+            ('sched.resume@1', '', 0, 0, bytes(8)),
             ('redis@1', 'GET cart:7', 0, 0, b'2 books'),
             ('wire.http@1', charge, 1, 2, b'payments: deadline exceeded')])
         if abs(c['wall'] - time.time_ns()) > 600 * 10**9:
@@ -438,10 +438,11 @@ def recording(work, env):
     c = caps.get('/cart/8?panic=1')
     if c:
         check('panicked', (c['status'], c['flags'], c['panic'], len(c['effects'])),
-              (500, 1, b'checkout: cart 2 books', 1))
+              (500, 1, b'checkout: cart 2 books', 2))
     c = caps.get('/cart/9?wait=1&fail=1')
     if c:
-        check('a request that waited', (c['status'], [e[1] for e in c['effects']]), (504, ['redis@1', 'wire.http@1']))
+        check('a request that waited', (c['status'], [e[1] for e in c['effects']]),
+              (504, ['sched.resume@1', 'redis@1', 'sched.resume@1', 'wire.http@1']))
     # TIN_REPLAY_SAMPLE=1 keeps a 200 too.
     spool = work / 'spool-anvil-sample'
     serve(spool, [request('/cart/3')], TIN_REPLAY_SAMPLE='1')
