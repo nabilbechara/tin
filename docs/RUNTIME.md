@@ -126,7 +126,7 @@ drop the old one; maps and long-lived slices count their own entries and element
 block whose count falls to 0 waits in the core's limbo until everything that could have
 borrowed it is past: every task alive when it was dropped has ended, and the core's own
 stack has reset its pool (the end of a request or tick, `hearth.Reset()`). Then its
-children are dropped and it is freed. So `u := cache[k]` stays valid for the rest of the
+children are dropped and it is freed. So `let u = cache[k]` stays valid for the rest of the
 request even if another request replaces the entry. Values made while a core initializes
 its globals, and values stored where the compiler cannot count (through a parameter), are
 pinned: they are never freed. A task that lives for a long time (a WebSocket, a `detach`
@@ -439,7 +439,7 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   allocates in its parent's pool (children share the parent's region) and may store request
   memory in what it captures. The scope's end waits for every child; the first child fault
   cancels the scope, and so its other children, and is the scope's fault (`try` passes it
-  on). `t := s.spawn(f)` gives a handle with `t.wait() !` and `t.cancel()`; a child cancelled
+  on). `let t = s.spawn(f)` gives a handle with `t.wait() !` and `t.cancel()`; a child cancelled
   through its handle does not fail the scope. `s.cancel(reason)` (#143) cancels the scope by
   hand: every wait inside it, its children's and its body's, fails with `canceled: reason`
   (`fault.Is(err, fault.Canceled)`), and that is the scope's fault unless a child failed first.
@@ -592,18 +592,43 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
 
 ### Routing: Router
 
-```go
-r := anvil.NewRouter()
+<!-- tin-prelude
+import "anvil"
+
+fn logged(q anvil.Req, w mut anvil.Out, next fn(anvil.Req, mut anvil.Out)) {
+	next(q, mut w)
+}
+
+fn auth(q anvil.Req, w mut anvil.Out, next fn(anvil.Req, mut anvil.Out)) {
+	next(q, mut w)
+}
+
+fn user(q anvil.Req, w mut anvil.Out) {
+	w.Text(q.PathParam("id"))
+}
+
+fn files(q anvil.Req, w mut anvil.Out) {
+}
+
+fn remove(q anvil.Req, w mut anvil.Out) {
+}
+
+fn missing(q anvil.Req, w mut anvil.Out) {
+}
+-->
+```tin body
+let r = anvil.NewRouter()
+let v2 = anvil.NewRouter()
 r.Use(logged)                                  // middleware, around every route below
 r.Get(`/users/{id}`, user)                     // patterns with {...} are raw strings
 r.Get(`/static/{path...}`, files)              // the rest of the path; * is the same, named "*"
-r.Route("/admin", func(g mut anvil.Router) {   // a group: a new router mounted at /admin
+r.Route("/admin", fn(g mut anvil.Router) {     // a group: a new router mounted at /admin
 	g.Use(auth)
 	g.Delete(`/users/{id}`, remove)
 })
 r.Mount("/v2", v2)                             // another router's routes under /v2
 r.NotFound(missing)                            // the status is already 404
-err := r.Serve(":8080")                        // fails first if a pattern is bad (r.Check)
+try r.Serve(":8080")                           // fails first if a pattern is bad (r.Check)
 ```
 
 **Matching.**
@@ -635,8 +660,8 @@ err := r.Serve(":8080")                        // fails first if a pattern is ba
 - A miss is answered by the deepest router (scope) whose prefix starts the path, through
   that router's chain, with its `NotFound` / `MethodNotAllowed` handler or the nearest one
   around it (defaults: `Not Found`, `Method Not Allowed`).
-- Middleware is a top-level function `func(Req, mut Out, next func(Req, mut Out))`; literals
-  cannot capture, so `next` is one anvil function, and the chain's position lives in the
+- Middleware is a top-level function `fn(Req, mut Out, next fn(Req, mut Out))`; a
+  middleware is not a closure, so `next` is one anvil function, and the chain's position lives in the
   `Out` (`ep`, the endpoint, and `ci`, the next middleware). A middleware may skip `next`,
   call it more than once, or wait before or after it. It hands data to later handlers with
   `w.SetValue(key, value)` / `w.Value(key)`, a list made on first use in the request's pool.
@@ -647,7 +672,7 @@ err := r.Serve(":8080")                        // fails first if a pattern is ba
   so the type is not recursive and `keep` can copy it), the endpoints (handler, middleware
   chain, pattern, parameter names and segments), one scope per router, and the method names
   (codes 0–8 for GET … TRACE, the others after them; masks hold up to 63).
-- The table is `keep`ed into core 0's ingot heap and published in `shared var gRoutes`
+- The table is `keep`ed into core 0's ingot heap and published in the process-wide (`shared`) global `gRoutes`
   before the cores start; no core writes it afterwards. `run_request` calls
   `dispatch(gRoutes)` instead of the handler, which sets `q.ep` (for `PathParam` and
   `Pattern`) and starts the chain. Matching reads the path in place and allocates nothing.
@@ -749,7 +774,7 @@ layouts are in `notes/interface_replay.md`.
 
 ## 11. Startup sequence of a strict program
 
-```
+```text
 _start (ELF) or dyld (Mach-O) -> main (the generated __start):
   rt_init(argc, argv, number of per-core globals, __core_init)
   shared (process-wide) global initializers

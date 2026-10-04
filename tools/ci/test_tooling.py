@@ -154,8 +154,8 @@ class PackageResolutionTests(unittest.TestCase):
             (project / 'vendor/dep').mkdir(parents=True)
             main = project / 'main.tin'
             dep = project / 'vendor/dep/dep.tin'
-            main.write_text('package main\nimport "dep"\nimport "say"\nfunc main() { say.Line(dep.Value()) }\n')
-            dep.write_text('package dep\nfunc Value() i64 { return 7 }\n')
+            main.write_text('package main\nimport "dep"\nimport "say"\nfn main() { say.Line(dep.Value()) }\n')
+            dep.write_text('package dep\nfn Value() i64 { return 7 }\n')
             output = project / 'program'
             env = make_env(TIN_ROOT=str(ROOT))
             command = [str(ROOT / 'bin/tinc'), '-o', str(output), str(main)]
@@ -173,7 +173,7 @@ class PackageResolutionTests(unittest.TestCase):
             result = subprocess.run(command, capture_output=True, text=True, env=env)
             self.assertEqual(result.returncode, 0, result.stderr)
 
-            dep.write_text('package dep\nfunc Value() i64 { return 8 }\n')
+            dep.write_text('package dep\nfn Value() i64 { return 8 }\n')
             result = subprocess.run(command, capture_output=True, text=True, env=env)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('tin.lock hash mismatch', result.stderr)

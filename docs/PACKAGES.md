@@ -32,13 +32,13 @@ next to it.
 Each package can have a `tin.mod` next to its source files. It is line based: blank lines
 and lines starting with `//` are ignored.
 
-```
+```text
 module example.com/app
 require github.com/ana/geo ../geo
 require example.com/units /src/mirror/units
 ```
 
-```
+```text
 // github.com/ana/geo/tin.mod
 module github.com/ana/geo
 caps net files
@@ -68,14 +68,14 @@ Commit `vendor/` and `tin.lock`. A build needs nothing else.
 
 ## The lock file: `tin.lock`
 
-```
+```text
 <64 lowercase hexadecimal SHA-256> <path relative to the project directory>
 ```
 
 `tin vendor` writes one line for every file under `vendor/` (sources and manifests), sorted
 by path, then one line per vendored package with the capabilities its manifest declares:
 
-```
+```text
 caps example.com/units
 caps github.com/ana/geo net files
 ```
@@ -95,7 +95,7 @@ it:
 A mismatch is `E111 LOCK_MISMATCH`, naming the file, the hash the lock records and the hash
 the file has:
 
-```
+```text
 error E111 LOCK_MISMATCH: tin.lock hash mismatch for vendor/example.com/units/units.tin: the lock records sha256 c620…, the file has e74e…
 ```
 
@@ -134,7 +134,7 @@ is checked, called or not, and so are its package-level initializers. A call tha
 the package for code needing a capability the manifest does not declare is
 `E804 CAPABILITY`, reported at that call with the path to the entry point:
 
-```
+```text
 vendor/example.com/peek/peek.tin:6:16: error E804 CAPABILITY: wire.Dial needs capability net (wire.Dial -> wire.DialTimeout -> wire.resolve), which package example.com/peek does not declare in its tin.mod (caps: none)
 ```
 
@@ -148,7 +148,7 @@ package.
 `tin caps main.tin` (`tinc -caps`) prints, for each package, the capabilities its exported
 functions can reach. It is useful for writing a manifest and for review:
 
-```
+```text
 $ tin caps main.tin
 example.com/peek net
 main net files

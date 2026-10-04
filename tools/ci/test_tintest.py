@@ -9,11 +9,11 @@ ROOT = Path(__file__).resolve().parents[2]
 LIB = '''package geo
 
 // Area is the area of a w by h rectangle.
-func Area(w i64, h i64) i64 {
+fn Area(w i64, h i64) i64 {
 	return w * h
 }
 
-func clampPos(x i64) i64 {
+fn clampPos(x i64) i64 {
 	if x < 0 {
 		return 0
 	}
@@ -25,11 +25,11 @@ TESTS = '''package geo
 
 import "crucible"
 
-func TestArea(t mut crucible.T) {
+fn TestArea(t mut crucible.T) {
 	crucible.Equal(mut t, "2x3", Area(2, 3), 6)
 }
 
-func TestPrivate(t mut crucible.T) {
+fn TestPrivate(t mut crucible.T) {
 	t.True("clamp", clampPos(-1) == 0)
 }
 '''
@@ -38,7 +38,7 @@ FAILING = '''package geo
 
 import "crucible"
 
-func TestWrong(t mut crucible.T) {
+fn TestWrong(t mut crucible.T) {
 	crucible.Equal(mut t, "area", Area(2, 2), 5)
 }
 '''
@@ -48,19 +48,19 @@ SPELLINGS = '''package geo
 
 import "crucible"
 
-func TestSpaced( t  mut  crucible.T ) {
+fn TestSpaced( t  mut  crucible.T ) {
 	t.True("spaced", true)
 }
 
-func  TestOtherName(tt mut crucible.T) {
+fn  TestOtherName(tt mut crucible.T) {
 	crucible.Equal(mut tt, "area", Area(1, 1), 1)
 }
 
-func Testify(x i64) i64 {
+fn Testify(x i64) i64 {
 	return x
 }
 
-func BenchmarkSpaced(bb  mut crucible.B) {
+fn BenchmarkSpaced(bb  mut crucible.B) {
 }
 '''
 
@@ -68,10 +68,10 @@ BAD_SIGNATURES = '''package geo
 
 import "crucible"
 
-func TestNoParam() {
+fn TestNoParam() {
 }
 
-func BenchmarkTakesT(b mut crucible.T) {
+fn BenchmarkTakesT(b mut crucible.T) {
 }
 '''
 
@@ -79,11 +79,11 @@ APP = '''package main
 
 import "say"
 
-func double(x i64) i64 {
+fn double(x i64) i64 {
 	return 2 * x
 }
 
-func main() {
+fn main() {
 	say.Line(double(2))
 }
 '''
@@ -92,7 +92,7 @@ APP_TEST = '''package main
 
 import "crucible"
 
-func TestDouble(t mut crucible.T) {
+fn TestDouble(t mut crucible.T) {
 	crucible.Equal(mut t, "double", double(21), 42)
 }
 '''
@@ -160,8 +160,8 @@ class TinTestCommand(unittest.TestCase):
     def test_wrong_signature_is_an_error(self):
         code, out = tin_test({'geo.tin': LIB, 'geo_test.tin': TESTS, 'bad_test.tin': BAD_SIGNATURES})
         self.assertEqual(code, 2, out)
-        self.assertIn('bad_test.tin:5: wrong signature for TestNoParam, must be: func TestNoParam(t mut crucible.T)', out)
-        self.assertIn('bad_test.tin:8: wrong signature for BenchmarkTakesT, must be: func BenchmarkTakesT(b mut crucible.B)', out)
+        self.assertIn('bad_test.tin:5: wrong signature for TestNoParam, must be: fn TestNoParam(t mut crucible.T)', out)
+        self.assertIn('bad_test.tin:8: wrong signature for BenchmarkTakesT, must be: fn BenchmarkTakesT(b mut crucible.B)', out)
         self.assertNotIn('--- ', out)
 
     def test_main_package(self):

@@ -36,7 +36,7 @@ compiler build.
 
 ## 2. Pipeline
 
-```
+```text
 main: parse arguments (-o, -S, -target), detect the host (uname)
   for each file: lex -> parse                      (lex.tin, parse.tin)
   if any file is strict: load lib/runtime (+ _os, _os_arch), then imports transitively

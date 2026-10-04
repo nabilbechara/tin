@@ -100,7 +100,7 @@ out.chmod(0o755)
             source.write_text('fn main() { print(1); }')
             command = measure.tin_command(root, source, root / 'out')
             self.assertEqual(command['command'][-2:], [str(root / 'lib/std.tin'), str(source)])
-            source.write_text('package main\nfunc main() {}')
+            source.write_text('package main\nfn main() {}')
             command = measure.tin_command(root, source, root / 'out')
             self.assertNotIn(str(root / 'lib/std.tin'), command['command'])
 

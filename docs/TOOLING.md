@@ -34,6 +34,7 @@ moving or deleting the tree breaks it.
 | `tin run A.tin B.tin -- ARGS` | compile several files as one program and run it |
 | `tin build FILE.tin... [-o OUT] [--target T]` | write an executable (default name: the first file without `.tin`) |
 | `tin asm FILE.tin...` | print the generated ARM64 assembly (clang syntax) |
+| `tin fix -edition 1 FILE.tin...` | rewrite edition-0 (Go-like) files to edition 1 in place (LANGUAGE.md §22) |
 | `tin audit secrets [-edition 1] FILE.tin...` | check the program and list every place a `secret` leaves the checker's protection: each `reveal(x)` and each secret passed to a library parameter declared `secret`, as `file:line:col: ...` sorted by position, then a count; exit status 1 (with the errors) when the program does not check |
 | `tin test [-bench] [DIR]` | build DIR (default `.`) with its `*_test.tin` files and run every `TestXxx(t mut crucible.T)`, then `BenchmarkXxx(b mut crucible.B)` with `-bench`; exit status 1 when a test fails, 2 for a wrong test signature (see §5.1) |
 | `tin replay CAPSULE --against BUILD [--live KIND]... [--save-test NAME --issue N]` | run a recorded request again with every effect served from its capsule, and report the first divergence (see §8.1) |
@@ -78,13 +79,16 @@ parsed: `E111 LOCK_MISMATCH` names the file and both hashes. Review the change, 
 
 ## 3. The compiler, `tinc`
 
-```
-tinc [-o OUT] [-S] [-target darwin-arm64|linux-arm64|linux-amd64] FILE.tin...
+```text
+tinc [-o OUT] [-S] [-edition 1] [-target darwin-arm64|linux-arm64|linux-amd64] FILE.tin...
 ```
 
 - `-o OUT`: write the executable (default `a.out`). `-S`: print assembly instead.
+- `-edition 1`: read the program's files as edition 1 (LANGUAGE.md). Without the flag each
+  file is read in the edition it is written in. Edition 0, the Go-like syntax before it, is
+  retired (#226): the compiler refuses it (E090) and only `tin fix -edition 1` reads it.
 - `-audit-secrets`: check the program and print its secret audit instead of building
-  (`tin audit secrets`; LANGUAGE.md §17).
+  (`tin audit secrets`; LANGUAGE.md §18).
 - The standard library is found through `$TIN_ROOT` or, without it, relative to the
   executable (`<root>/bin/tinc` means `<root>/lib`). The `tin` script sets `TIN_ROOT`.
 - Strict programs get the package `lib/runtime/` (its `*_<os>.tin` and `*_<os>_<arch>.tin`
@@ -135,23 +139,38 @@ passes.
 
 ### 5.1 Testing your own code: `*_test.tin`
 
+<!-- tin-prelude
+fn Area(w i64, h i64) i64 {
+	return w * h
+}
+
+fn clampPos(x i64) i64 {
+	return max(x, 0)
+}
+
+fn parse(s str) !i64 {
+	return len(s)
+}
+-->
 ```tin
 // geo_test.tin, next to geo.tin (same package; private names are visible)
 package geo
 
 import "crucible"
 
-func TestArea(t mut crucible.T) {
+fn TestArea(t mut crucible.T) {
 	crucible.Equal(mut t, "2x3", Area(2, 3), 6)   // any comparable type
 	t.True("clamp", clampPos(-1) == 0)
+	let (n, err) = parse("12")
 	t.NoFault("parse", err)
+	crucible.Equal(mut t, "parsed", n, 2)
 	if t.Failed() {
 		t.Log("printed only when the test fails")
 	}
 }
 
-func BenchmarkArea(b mut crucible.B) {
-	for i := 0; i < b.N; i++ {
+fn BenchmarkArea(b mut crucible.B) {
+	for i in 0..b.N {
 		Area(i, 3)
 	}
 }
@@ -165,7 +184,7 @@ test through `crucible.Run` and compiles the package with `tinc -entry pkg.TinTe
 
 As in Go, a test is a `TestXxx` (or benchmark `BenchmarkXxx`) in a `*_test.tin` file whose
 `Xxx` does not start with a lowercase letter (`Testify` is an ordinary function). It must be
-declared on one line as `func TestXxx(name mut crucible.T) {` (`mut crucible.B` for a
+declared on one line as `fn TestXxx(name mut crucible.T) {` (`mut crucible.B` for a
 benchmark); any other signature is reported as `FILE:LINE: wrong signature for TestXxx`
 with exit status 2, so no test is skipped silently.
 
@@ -278,7 +297,7 @@ TIN_REPLAY_KEY=<64 hex digits> tin replay spool/00001700000000000000-000-1.tcap 
   that kind's calls for real. They are still compared with the recording, which they consume.
 - The report goes to standard output, followed by the response body:
 
-  ```
+  ```text
   replay: status 500 (recorded 500)
   replay: divergence at effect 0: got wire.http@1 "POST ...", recorded redis@1 "GET cart:7"
   replay: 2 recorded effects not served
@@ -305,7 +324,7 @@ TIN_REPLAY_KEY=<64 hex digits> tin replay spool/00001700000000000000-000-1.tcap 
 
 ## 9. Repository layout
 
-```
+```text
 tin                 the tin command (shell script)
 Makefile            builds, bootstraps, tests
 selfhost/           the compiler, in legacy Tin (COMPILER.md)

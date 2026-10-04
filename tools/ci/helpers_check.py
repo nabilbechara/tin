@@ -83,7 +83,7 @@ def main():
                 n,page=map(int,got.stdout.split())
                 assert 1<=n<=count and page==os.sysconf('SC_PAGESIZE'),got
             symbols=work/'symbols.tin'
-            symbols.write_text('package main\nimport "helperprobe"\nfunc main() { helperprobe.Symbols() }\n')
+            symbols.write_text('package main\nimport "helperprobe"\nfn main() { helperprobe.Symbols() }\n')
             exe2=work/'symbols'
             subprocess.run([str(compiler),'-o',str(exe2),str(symbols)],check=True,env=dict(os.environ,TIN_ROOT=str(work)),timeout=60)
             got=subprocess.run([str(exe2)],capture_output=True,timeout=10)
