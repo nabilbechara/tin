@@ -3773,6 +3773,10 @@ func rt_task_abort(t i64) {
 
 // rt_task_run runs task t until it finishes (true) or waits (false).
 func rt_task_run(t i64) bool {
+	tape := t[tTape]
+	if tape != 0 && !rt_sched_resume(t) {
+		return false // replaying: held until the tape says it is its turn (#243)
+	}
 	if schedSave == 0 {
 		schedSave = calloc(20, 8)
 		schedPool = calloc(6, 8)
@@ -3816,6 +3820,9 @@ func rt_task_run(t i64) bool {
 	c[ctxPoolMark] = sp[3]
 	c[ctxPoolExtra] = sp[4]
 	c[ctxFmt] = sp[5]
+	if tape != 0 {
+		rt_sched_stopped(t) // replaying: a request whose tasks all wait for their turn diverged
+	}
 	return t[tDone] != 0
 }
 
@@ -4687,7 +4694,8 @@ const spCanceled = 7 // cancelled through its handle: its fault is not the scope
 const spArg = 8      // 1 + the argument of a body that takes one (parallel's result cell)
 const spOwnPool = 9  // a detached task: its own pool, and its fault is logged, not passed on
 const spMore = 10    // waiters beyond spWaiter: [capacity, count, task...], or 0
-const spWords = 11
+const spNum = 11     // the child's number in its request (#243), 0 when it has no tape
+const spWords = 12
 
 // rt_scope_open starts a scope boundary inside the current one.
 func rt_scope_open() scope {
@@ -4717,6 +4725,9 @@ func (s scope) spawn(f func() !) spawned {
 		return spawned{r: r}
 	}
 	t[tChild] = r
+	if t[tTape] != 0 {
+		rt_sched_spawned(t[tTape], r) // its number in the request, for sched.resume (#243)
+	}
 	rt_task_recover(t)
 	b[bLive]++
 	rt_task_queue(t)
@@ -5165,6 +5176,9 @@ func rt_task_finish_child(t i64) {
 		// Only when it waits for the scope's end: any other wait of its own goes on.
 		rt_task_wake(b[bTask])
 	}
+	if r[spNum] != 0 {
+		rt_sched_ended(t[tTape]&-2, t)
+	}
 	t[tChild] = 0
 	rt_task_free(t)
 }
@@ -5308,6 +5322,9 @@ func rt_bnd_stopped() bool {
 // rt_task_interrupt ends t's wait, whatever it waits for, as waitDeadline, and queues t.
 func rt_task_interrupt(t i64) {
 	if t[tWaiting] == 0 {
+		if t[tTape] != 0 && rt_sched_held(t) {
+			t[tResult] = waitDeadline // replaying: its wait ends when its turn comes, cancelled (#243)
+		}
 		return
 	}
 	if t[tWaitFd] >= 0 {

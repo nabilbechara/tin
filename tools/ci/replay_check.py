@@ -407,6 +407,8 @@ def recording(work, env):
                 failures.append(f'{p.name}: does not open with the key')
                 continue
             c = decode_body(body)
+            # Scheduling records (sched.*, #243) share the tape; these checks are about effects.
+            c['effects'] = [e for e in c['effects'] if not e[1].startswith('sched.')]
             out[c['request'].split(b' ')[1].decode()] = c
             for secret in SECRETS:
                 if secret in p.read_bytes() or secret in body:

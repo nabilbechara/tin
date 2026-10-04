@@ -42,6 +42,47 @@ fn bounded(ms i64) !str {
 	return v
 }
 
+// order runs two children that wait a ms and b ms and then note their name: the order of
+// their resumes decides the result.
+fn order(a i64, b i64) !str {
+	mut seen str = ""
+	scope s {
+		s.spawn(fn() ! {
+			try tide.Wait(a * tide.Millisecond)
+			seen = seen + "a"
+		})
+		s.spawn(fn() ! {
+			try tide.Wait(b * tide.Millisecond)
+			seen = seen + "b"
+		})
+	}
+	return seen
+}
+
+// effects runs two children whose effects take a ms and b ms live: they complete, and are
+// recorded, in the other order than they are issued. The second child's key is kb.
+fn effects(a i64, b i64, kb str) !str {
+	mut seen str = ""
+	scope s {
+		s.spawn(fn() ! {
+			let v = try schedprobe.Effect("a", a)
+			seen = seen + v + " "
+		})
+		s.spawn(fn() ! {
+			let v = try schedprobe.Effect(kb, b)
+			seen = seen + v + " "
+		})
+	}
+	return seen
+}
+
+// single makes one effect, then races a select.
+fn single(a i64, b i64) !str {
+	let v = try schedprobe.Effect("a", a)
+	let r = try race(1, b)
+	return "{v} {r}"
+}
+
 type Run struct {
 	got str
 	tp i64
@@ -79,8 +120,38 @@ fn boundedOf(ms i64, send i64, timer i64) !str {
 	return try bounded(ms)
 }
 
+fn singleOf(k i64, a i64, b i64) !str {
+	return try single(a, b)
+}
+
+fn orderOf(k i64, a i64, b i64) !str {
+	return try order(a, b)
+}
+
+fn effectsOf(k i64, a i64, b i64) !str {
+	if k == 1 {
+		return try effects(a, b, "c")
+	}
+	return try effects(a, b, "b")
+}
+
+// replays replays tape rec n times with f(k, x, y) and counts the runs that gave want and
+// served the whole tape.
+fn replays(rec Run, f fn(i64, i64, i64) !str, k i64, x i64, y i64, n i64) !i64 {
+	mut same i64 = 0
+	for i in 0..n {
+		let r = try taped(rec.tp, f, k, x, y)
+		if r.got == rec.got && schedprobe.Diverged(r.tp) == "" && schedprobe.Left(r.tp) == 0 {
+			same += 1
+		}
+		schedprobe.Free(r.tp)
+	}
+	return same
+}
+
 // forced records the race where one side surely wins, then replays it n times with the
-// timing that makes the other side win live: the replay takes the recorded branch.
+// timing that makes the other side win live: the replay takes the recorded branch. Both
+// timings wait (no zero waits), so the program's scheduling events are the same.
 fn forced(name str, send i64, timer i64, rsend i64, rtimer i64, n i64) ! {
 	let rec = try taped(0, raceOf, 0, send, timer)
 	say.Line(name, "recorded:", rec.got, schedprobe.Events(rec.tp))
@@ -103,11 +174,11 @@ fn forced(name str, send i64, timer i64, rsend i64, rtimer i64, n i64) ! {
 
 fn checks() ! {
 	// No tape: a select runs as before.
-	let plain = try taped(-1, raceOf, 0, 0, 1000)
+	let plain = try taped(-1, raceOf, 0, 1, 1000)
 	say.Line("no tape:", plain.got)
 
-	try forced("lane", 0, 1000, 40, 1, 20)
-	try forced("timer", 1000, 1, 0, 40, 20)
+	try forced("lane", 1, 1000, 40, 1, 20)
+	try forced("timer", 1000, 1, 1, 40, 20)
 
 	// A real race: the child's 1 to 3 ms wait against a 2 ms timer, recorded n times; each
 	// tape replays its own branch under both timings that would decide it live.
@@ -115,8 +186,8 @@ fn checks() ! {
 	mut agreed i64 = 0
 	for i in 0..n {
 		let rec = try taped(0, raceOf, 0, 1 + i % 3, 2)
-		let a = try taped(rec.tp, raceOf, 0, 0, 30)
-		let b = try taped(rec.tp, raceOf, 0, 30, 0)
+		let a = try taped(rec.tp, raceOf, 0, 1, 30)
+		let b = try taped(rec.tp, raceOf, 0, 30, 1)
 		if a.got == rec.got && b.got == rec.got && schedprobe.Diverged(a.tp) == "" && schedprobe.Diverged(b.tp) == "" {
 			agreed += 1
 		}
@@ -133,8 +204,42 @@ fn checks() ! {
 	let cutr = try taped(cut.tp, boundedOf, 20, 0, 0)
 	say.Line("deadline replayed:", cutr.got, "diverged:", schedprobe.Diverged(cutr.tp) != "")
 
+	// Resume order: children that wait 1 and 30 ms note themselves in that order; the replay
+	// keeps it when the waits are swapped.
+	let ab = try taped(0, orderOf, 0, 1, 30)
+	let ba = try taped(0, orderOf, 0, 30, 1)
+	let abLive = try taped(-1, orderOf, 0, 30, 1)
+	say.Line("order recorded:", ab.got, ba.got, "live swapped:", abLive.got)
+	let abn = try replays(ab, orderOf, 0, 30, 1, 20)
+	let ban = try replays(ba, orderOf, 0, 1, 30, 20)
+	say.Line("order replayed:", abn, "of 20 gave", ab.got, "and", ban, "of 20 gave", ba.got)
+	schedprobe.Free(ab.tp)
+	schedprobe.Free(ba.tp)
+
+	// Effects complete in another order than they are issued; replayed (no live calls, so no
+	// waits), each child waits for its record's turn and the results come in the recorded order.
+	let fx = try taped(0, effectsOf, 0, 30, 1)
+	say.Line("effects recorded:", fx.got, schedprobe.Events(fx.tp))
+	let fxn = try replays(fx, effectsOf, 0, 1, 30, 20)
+	say.Line("effects replayed:", fxn, "of 20 gave", fx.got)
+	// A child whose effect is not on the tape: nobody can go on, so the replay diverges.
+	let bad = try taped(fx.tp, effectsOf, 1, 1, 30)
+	say.Line("effects diverged:", bad.got, "|", schedprobe.Diverged(bad.tp))
+	schedprobe.Free(bad.tp)
+	schedprobe.Free(fx.tp)
+
+	// A tape with no scheduling records (a build without them recorded it) replays its effects
+	// and runs its scheduling live.
+	let one = try taped(0, singleOf, 0, 1, 1000)
+	let old = schedprobe.Strip(one.tp)
+	let oldr = try taped(old, singleOf, 0, 1, 1000)
+	say.Line("old tape:", oldr.got, "diverged:", schedprobe.Diverged(oldr.tp) != "", "left:", schedprobe.Left(oldr.tp))
+	schedprobe.Free(oldr.tp)
+	schedprobe.Free(old)
+	schedprobe.Free(one.tp)
+
 	// A tape replayed by a select at another site diverges, and that select runs live.
-	let rec = try taped(0, raceOf, 0, 0, 1000)
+	let rec = try taped(0, raceOf, 0, 1, 1000)
 	let wrong = try taped(rec.tp, otherOf, 0, 0, 0)
 	say.Line("other site:", wrong.got, schedprobe.Diverged(wrong.tp))
 }

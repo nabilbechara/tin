@@ -68,6 +68,7 @@ func rt_tape_free(tp i64) {
 	free(tp[tpReq])
 	free(tp[tpPanic])
 	free(tp[tpLive])
+	rt_sched_free(tp)
 	free(tp)
 }
 
@@ -347,30 +348,39 @@ func tape_value(tp i64, kind str, key str) str {
 // key. Otherwise the replay diverged: the first divergence is kept and every later effect
 // fails with it, so a replay never falls through to a live call.
 func tape_next(tp i64, kind str, key str) !i64 {
-	if tp[tpDiverged] != 0 {
-		fail cast(str, tp[tpDiverged])
+	for {
+		if tp[tpDiverged] != 0 {
+			fail cast(str, tp[tpDiverged])
+		}
+		n := tp[tpSeq]
+		pos := tp[tpPos]
+		if pos >= tp[tpLen] {
+			tape_diverge(tp, "replay: divergence at effect " + rt_i64str(n) + ": got " + kind + " " + tape_quote(key) + ", recorded nothing more")
+			fail cast(str, tp[tpDiverged])
+		}
+		b := tp[tpBuf]
+		rkind := tape_field(b, pos+8)
+		rkey := tape_field(b, pos+16+len(rkind))
+		if !rt_str_eq(rkind, kind) || !rt_str_eq(rkey, key) {
+			// The next record may be another task's of the request: wait for this one's turn (#243).
+			if rt_sched_wait_turn(tp) {
+				continue
+			}
+			tape_diverge(tp, "replay: divergence at effect " + rt_i64str(n) + ": got " + kind + " " + tape_quote(key) + ", recorded " + rkind + " " + tape_quote(rkey))
+			fail cast(str, tp[tpDiverged])
+		}
+		tp[tpPos] = tape_skip(tp, pos)
+		tp[tpSeq]++
+		rt_sched_took(tp)
+		return pos
 	}
-	n := tp[tpSeq]
-	pos := tp[tpPos]
-	if pos >= tp[tpLen] {
-		tape_diverge(tp, "replay: divergence at effect " + rt_i64str(n) + ": got " + kind + " " + tape_quote(key) + ", recorded nothing more")
-		fail cast(str, tp[tpDiverged])
-	}
-	b := tp[tpBuf]
-	rkind := tape_field(b, pos+8)
-	rkey := tape_field(b, pos+16+len(rkind))
-	if !rt_str_eq(rkind, kind) || !rt_str_eq(rkey, key) {
-		tape_diverge(tp, "replay: divergence at effect " + rt_i64str(n) + ": got " + kind + " " + tape_quote(key) + ", recorded " + rkind + " " + tape_quote(rkey))
-		fail cast(str, tp[tpDiverged])
-	}
-	tp[tpPos] = tape_skip(tp, pos)
-	tp[tpSeq]++
-	return pos
+	return 0
 }
 
 func tape_diverge(tp i64, msg str) {
 	if tp[tpDiverged] == 0 {
 		tp[tpDiverged] = rt_raw_str(msg)
+		rt_sched_release(tp) // tasks waiting for their turn go on, and fail with it (#243)
 	}
 }
 
