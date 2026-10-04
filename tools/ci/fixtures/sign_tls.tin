@@ -1,0 +1,32 @@
+package main
+
+import "say"
+import "seal"
+import "quarry"
+import "twine"
+
+// Signs a CertificateVerify-like message with every test key under each scheme it supports and
+// prints "KEY SCHEME MSGHEX SIGHEX"; `go run ./bench/ref/seal_sign verify` checks the lines
+// (tools/ci/x509_check.py). PSS signatures are random, so this cannot be a golden file.
+func main() {
+	msg := []u8("                                                                TLS 1.3, server CertificateVerify")
+	msg = append(msg, 0)
+	msg = append(msg, seal.Sha256("transcript")...)
+	keys := []str{"rsa2048-pkcs1", "rsa2048-pkcs8", "rsa3072-pkcs8", "rsa4096-pkcs1", "ec256-sec1", "ec256-pkcs8", "ec384-sec1", "ec384-pkcs8"}
+	for _, name := range keys {
+		text := quarry.ReadFile("tests/data/keys/" + name + ".pem") catch err {
+			say.Line("error", name, err)
+			continue
+		}
+		k := seal.ParsePrivateKeyPEM(twine.ReplaceAll(text, "TESTING KEY", "PRIVATE KEY")) catch err {
+			say.Line("error", name, err)
+			continue
+		}
+		for _, scheme := range []i64{0x0804, 0x0805, 0x0806, 0x0403, 0x0503} {
+			sig, err := k.SignTLS(scheme, msg)
+			if err == nil {
+				say.Line(name, scheme, seal.Hex(msg), seal.Hex(sig))
+			}
+		}
+	}
+}

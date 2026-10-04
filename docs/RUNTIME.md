@@ -738,6 +738,9 @@ functions keep that rule, and grows as phase 1 lands.
 | `P256PublicKey`, `P256ECDH` and the field and point code under them (`field.tin`, `p256.tin`) | the private key and every coordinate | the validity checks of the key and the peer's point, whose results are public |
 
 | `monty_new` (`bignum.tin`: Montgomery constants for a modulus given at run time) | the modulus's value | its limb count and bit length |
+| `SignPKCS1v15`, `SignPSS` (`rsa_sign.tin`: CRT, base blinding by r^e, r^-1 by Fermat inversion in each prime, a public-key check of every signature) and `monty_exp_ct`, `monty_reduce`, `nat_mul_ct` under them | the private key, the message representative and r | the key's size; PSS's salt is random and public |
+| `SignECDSA`, `PrivateKey.SignTLS` (`ecdsa_sign.tin`: RFC 6979 nonces by `Hmac`, k·G by `p256_mul` or `ec_mul_ct`, k^-1 as k^(n-2) with the public exponent) | the private scalar and the nonce | the digest, and the (negligibly rare, public) retry when a nonce candidate is not below n |
+| `ParsePrivateKeyPEM`, `ParsePrivateKeyDER` | nothing: the key's encoding (lengths, tags) is parsed with ordinary branches | |
 
 `Sha1`, `Pbkdf2Sha256`, the hex and base64 codecs and the RSA-OAEP code are not
 constant-time and must not be used on secrets in a timing-sensitive protocol path.

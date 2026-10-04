@@ -10,7 +10,9 @@
    found differences before) and in the system bundle is flipped three ways;
    Tin must reject every mutant Go rejects (Tin may reject more: Go ignores trailing bytes in a
    few places).
-4. SystemRoots reads the operating system's bundle and parses the same certificates Go does.
+4. Private keys and signing (tests/data/keys): signatures Tin makes for TLS (RSA-PSS with random
+   salts, RFC 6979 ECDSA) verify in Go; deterministic ones equal Go's (tests/v2/seal_sign.tin).
+5. SystemRoots reads the operating system's bundle and parses the same certificates Go does.
 Needs Go (as http_check.py does)."""
 import os
 from pathlib import Path
@@ -85,6 +87,10 @@ def check_checked_in():
     got = sorted(run(['go', 'run', './bench/ref/seal_wycheproof']).splitlines())
     assert got == want, 'Wycheproof: Go output differs from tests/v2/seal_wycheproof*.out:\n' + \
         '\n'.join(set(got) ^ set(want))
+    want_sign = (ROOT / 'tests/v2/seal_sign.out').read_text().splitlines()
+    got_sign = sorted(run(['go', 'run', './bench/ref/seal_sign']).splitlines())
+    assert got_sign == want_sign, 'signing: Go output differs from tests/v2/seal_sign.out:\n' + \
+        '\n'.join(sorted(set(got_sign) ^ set(want_sign))[:40])
     want_info = (ROOT / 'tests/v2/seal_certinfo.out').read_text().splitlines()
     got_info = sorted(run(['go', 'run', './bench/ref/seal_certinfo']).splitlines())
     assert got_info == want_info, 'certificate fields: Go output differs from tests/v2/seal_certinfo.out:\n' + \
@@ -121,6 +127,20 @@ def check_mutants(mutate, gomutate, files):
           f'({len(tin - go)} more rejected by Tin only), {len(files)} files')
 
 
+def check_signatures(signer):
+    """Signatures Tin makes with the test keys (random PSS salts included) verify in Go."""
+    lines = run([str(signer)])
+    assert 'error' not in lines, lines
+    proc = subprocess.run(['go', 'run', './bench/ref/seal_sign', 'verify', 'tests/data/keys'], cwd=ROOT,
+                          input=lines.encode(), capture_output=True, timeout=300)
+    assert proc.returncode == 0, proc.stderr.decode(errors='replace')
+    out = proc.stdout.decode().splitlines()
+    bad = [l for l in out if not l.endswith(' ok')]
+    want = len([l for l in lines.splitlines() if l.strip()])
+    assert not bad and len(out) == want, f'Go rejected Tin signatures: {bad} ({len(out)} of {want} checked)'
+    print(f'PASS signatures: Go verifies all {want} TLS signatures Tin made (RSA-PSS and ECDSA)')
+
+
 def check_system_roots(roots):
     out = run([str(roots)]).strip()
     path = system_bundle()
@@ -143,6 +163,7 @@ def main():
         gomutate = tmp / 'x509_mutate_go'
         run(['go', 'build', '-o', str(gomutate), './bench/ref/x509_mutate'])
         roots = build('tools/ci/fixtures/x509_roots.tin', tmp / 'x509_roots')
+        signer = build('tools/ci/fixtures/sign_tls.tin', tmp / 'sign_tls')
         pki = tmp / 'pki'
         run(['go', 'run', './bench/ref/x509_pki', str(pki)])
         check_pki(tin, pki)
@@ -152,6 +173,7 @@ def main():
         if system_bundle():
             files.append(system_bundle())
         check_mutants(mutate, gomutate, files)
+        check_signatures(signer)
         check_system_roots(roots)
 
 
