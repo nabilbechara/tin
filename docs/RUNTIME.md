@@ -109,6 +109,11 @@ startup allocations and mappings. Without that explicit flag the variable is ign
 - Each extra core runs `__core_init` (the per-core global initializers) in ingot mode,
   then switches to its pool.
 
+**Arenas.** An `arena { }` block (#236) allocates from a pool of its own, made when it is
+entered and freed (chunks and big blocks) when it ends; only its value, copied out by a
+generated `arenacopy$N`, survives. Arena memory is pool memory: it is never counted or
+reclaimed by the ingot heap's machinery. See section 9, "Arenas".
+
 **keep.** `keep(x)` calls a generated `keep$N` function per type. It copies strings
 (`rt_keep_str`), structs (`rt_keep_raw`, then their reference fields), slices
 (`rt_keep_slice`, then elements) and maps (a new ingot map, entry by entry) into the
@@ -407,6 +412,18 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   while it may go on), for code that does not wait or wants to stop at a point of its own.
 - `once { ... }` (#236) runs its block the first time each core reaches it (globals are per
   core, so this is the unit; process-wide one-time work belongs in `on app.start`).
+- Arenas (#236, edition 1, notes/interface_arena.md): `arena { }` is `arena$N(c)`, which
+  opens a `bkArena` boundary with a fresh pool (`rt_arena_open`), runs the block's closure
+  (`rt_arena_run`), gives the context the parent pool back (`rt_arena_out`), copies the fault
+  (`rt_arena_fault`) and the value (a generated `arenacopy$N`, the pool twin of `keep$N`)
+  into it, and frees the arena's chunks (`rt_arena_close`). The record's `bRegion` points to
+  the arena's saved pool words. A pool's words have one home while its code is not running:
+  `rt_arena_open` writes the parent's back to theirs first, so scope children that share the
+  parent's pool keep allocating in it while the arena body waits, and `rt_task_run` keeps a
+  task's arena pool in its innermost arena (`rt_pool_home`). An unwind that passes through
+  an arena frees it: `rt_land` (guard, limit and within landings, with the landing fault
+  copied out first) and `rt_bnd_task_end` (a task ended by panic, with a scope child's fault
+  copied out). Its chunks charged to a `limit` are given back.
 - Budgets (#235): `limit memory n, tasks k { }` counts the pool chunks and big blocks taken
   inside it (the bump fast path is not touched) and tasks started in it. Passing the memory
   budget leaves the block with `fault.LimitExceeded` at once (its defers and cleanups run).
