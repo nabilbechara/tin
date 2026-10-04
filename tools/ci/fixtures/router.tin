@@ -11,23 +11,23 @@ import "websocket"
 // their path parameters and middleware values after the wait.
 
 // stamp tags the request in the order the middleware ran, and the status after them.
-func stamp(q anvil.Req, w mut anvil.Out, next func(anvil.Req, mut anvil.Out)) {
+fn stamp(q anvil.Req, w mut anvil.Out, next fn(anvil.Req, mut anvil.Out)) {
 	w.SetValue("trace", "stamp")
 	next(q, mut w)
 	w.Head("X-Status", say.Str(w.Code()))
 }
 
 // tag adds its name to the trace set by stamp.
-func tag(q anvil.Req, w mut anvil.Out, next func(anvil.Req, mut anvil.Out)) {
+fn tag(q anvil.Req, w mut anvil.Out, next fn(anvil.Req, mut anvil.Out)) {
 	w.SetValue("trace", w.Value("trace") + ">tag")
 	next(q, mut w)
 }
 
 // slow_mw waits ms (from the query) before the rest of the chain runs.
-func slow_mw(q anvil.Req, w mut anvil.Out, next func(anvil.Req, mut anvil.Out)) {
-	ms := mint.Atoi(q.Param("mw")) catch _ { 0 }
+fn slow_mw(q anvil.Req, w mut anvil.Out, next fn(anvil.Req, mut anvil.Out)) {
+	let ms = mint.Atoi(q.Param("mw")) catch _ { 0 }
 	if ms > 0 {
-		tide.Wait(ms * tide.Millisecond) catch err {
+		tide.Wait(ms * 1ms) catch err {
 			w.Status(504)
 			w.Text("middleware: {err}")
 			return
@@ -37,105 +37,105 @@ func slow_mw(q anvil.Req, w mut anvil.Out, next func(anvil.Req, mut anvil.Out)) 
 	next(q, mut w)
 }
 
-func pause(q anvil.Req) ! {
-	ms := mint.Atoi(q.Param("ms")) catch _ { 0 }
+fn pause(q anvil.Req) ! {
+	let ms = mint.Atoi(q.Param("ms")) catch _ { 0 }
 	if ms > 0 {
-		try tide.Wait(ms * tide.Millisecond)
+		try tide.Wait(ms * 1ms)
 	}
 }
 
-func user(q anvil.Req, w mut anvil.Out) {
+fn user(q anvil.Req, w mut anvil.Out) {
 	pause(q) catch err {
 		w.Status(504)
 		w.Text("{err}")
 		return
 	}
-	id := q.PathParam("id")
-	trace := w.Value("trace")
+	let id = q.PathParam("id")
+	let trace = w.Value("trace")
 	w.Text("user {id} {trace} {q.Pattern()}")
 }
 
-func create(q anvil.Req, w mut anvil.Out) {
-	b := q.Body()
+fn create(q anvil.Req, w mut anvil.Out) {
+	let b = q.Body()
 	w.Status(201)
 	w.Text("created {len(b)}")
 }
 
-func file(q anvil.Req, w mut anvil.Out) {
-	p := q.PathParam("path")
+fn file(q anvil.Req, w mut anvil.Out) {
+	let p = q.PathParam("path")
 	w.Text("file {p}")
 }
 
-func item(q anvil.Req, w mut anvil.Out) {
+fn item(q anvil.Req, w mut anvil.Out) {
 	pause(q) catch err {
 		w.Status(504)
 		w.Text("{err}")
 		return
 	}
-	id := q.PathParam("id")
-	trace := w.Value("trace")
+	let id = q.PathParam("id")
+	let trace = w.Value("trace")
 	w.Text("item {id} {trace}")
 }
 
 // deep recurses n levels (from the query): far past a request task's 256 KiB stack (#175).
-func deep(n i64) i64 {
+fn deep(n i64) i64 {
 	if n == 0 {
 		return 0
 	}
 	return deep(n-1) + 1
 }
 
-func recurse(q anvil.Req, w mut anvil.Out) {
-	n := mint.Atoi(q.Param("n")) catch _ { 10 }
+fn recurse(q anvil.Req, w mut anvil.Out) {
+	let n = mint.Atoi(q.Param("n")) catch _ { 10 }
 	w.Text("depth {deep(n)}")
 }
 
 // boom panics, at once or after waiting ms (from the query): the request gets 500 and the
 // server keeps serving (#142); its defers and pick's run while the panic unwinds (#230).
-func boom(q anvil.Req, w mut anvil.Out) {
+fn boom(q anvil.Req, w mut anvil.Out) {
 	defer note_unwind("handler;")
 	pause(q) catch err {
 		w.Status(504)
 		w.Text("{err}")
 		return
 	}
-	xs := []i64{1, 2, 3}
-	k := len(q.Param("k")) + 5
+	let xs = []i64{1, 2, 3}
+	let k = len(q.Param("k")) + 5
 	w.Text("never {pick(xs, k)}")
 }
 
-var unwound str
+mut unwound str
 
-func note_unwind(s str) {
+fn note_unwind(s str) {
 	unwound = keep(unwound + s)
 }
 
-func pick(xs []i64, k i64) i64 {
+fn pick(xs []i64, k i64) i64 {
 	defer note_unwind("inner;")
 	return xs[k]
 }
 
 // unwinds reports the deferred calls that ran during panics, in order.
-func unwinds(q anvil.Req, w mut anvil.Out) {
+fn unwinds(q anvil.Req, w mut anvil.Out) {
 	w.Text(unwound)
 }
 
 // double panics again in a deferred call while unwinding: the process ends (#230).
-func double(q anvil.Req, w mut anvil.Out) {
+fn double(q anvil.Req, w mut anvil.Out) {
 	defer panic_again()
 	panic("first")
 }
 
-func panic_again() {
+fn panic_again() {
 	panic("second")
 }
 
-func fast(q anvil.Req, w mut anvil.Out) {
+fn fast(q anvil.Req, w mut anvil.Out) {
 	w.Text("fast")
 }
 
 // echo_head copies query values into response headers (#172: they must not add lines).
-func echo_head(q anvil.Req, w mut anvil.Out) {
+fn echo_head(q anvil.Req, w mut anvil.Out) {
 	w.Head("X-Echo", q.Param("v"))
 	w.Head("Bad Name", "dropped")
 	w.Head("Content-Length", "0")
@@ -145,26 +145,26 @@ func echo_head(q anvil.Req, w mut anvil.Out) {
 }
 
 // status answers with the status in the path and a body, which 204 and 304 must not send.
-func status(q anvil.Req, w mut anvil.Out) {
-	code := mint.Atoi(q.PathParam("code")) catch _ { 500 }
+fn status(q anvil.Req, w mut anvil.Out) {
+	let code = mint.Atoi(q.PathParam("code")) catch _ { 500 }
 	w.Status(code)
 	w.Text("body for {code}")
 }
 
 // ws upgrades a routed request: it names its room, then echoes every message.
-func ws(q anvil.Req, w mut anvil.Out) {
-	c := websocket.Accept(q, mut w) catch _ { return }
-	room := q.PathParam("room")
+fn ws(q anvil.Req, w mut anvil.Out) {
+	let c = websocket.Accept(q, mut w) catch _ { return }
+	let room = q.PathParam("room")
 	c.WriteText("room {room}") catch _ { return }
 	c.Each(echo) catch _ {}
 }
 
-func echo(c websocket.Conn, m websocket.Message) ! {
+fn echo(c websocket.Conn, m websocket.Message) ! {
 	try c.WriteText("echo: {m.Data}")
 }
 
-func main() {
-	r := anvil.NewRouter()
+fn main() {
+	let r = anvil.NewRouter()
 	r.Use(stamp)
 	r.Use(tag)
 	r.Get(`/users/{id}`, user)
@@ -178,10 +178,10 @@ func main() {
 	r.Get("/echo-head", echo_head)
 	r.Get(`/status/{code}`, status)
 	r.Get(`/ws/{room}`, ws)
-	r.Route("/api", func(g mut anvil.Router) {
+	r.Route("/api", fn(g mut anvil.Router) {
 		g.Use(slow_mw)
 		g.Get(`/items/{id}`, item)
 	})
-	err := r.Serve(":0")
+	let err = r.Serve(":0")
 	say.Line("server:", err)
 }

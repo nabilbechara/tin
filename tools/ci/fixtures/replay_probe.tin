@@ -6,33 +6,33 @@ import "say"
 // Copied into a temporary lib/replayprobe by replay_check.py: drives the runtime's replay tape
 // (lib/runtime/replay.tin, notes/interface_replay.md) directly, before anvil and the clients use it.
 
-var ran i64
-var value str
+mut ran i64
+mut value str
 
 // liveBody is an effect body that counts its runs and gives value.
-func liveBody() !str {
-	ran++
+fn liveBody() !str {
+	ran += 1
 	return value
 }
 
 // timedOut is an effect body that fails with a deadline wrapped in its own message.
-func timedOut() !str {
-	ran++
+fn timedOut() !str {
+	ran += 1
 	try fault.Wrap(fault.DeadlineExceeded, "redis GET")
 	return ""
 }
 
 // records is a replaying tape that serves the records of tape tp.
-func records(tp i64) i64 {
-	rp := rt_tape_new(2)
+fn records(tp i64) i64 {
+	let rp = rt_tape_new(2)
 	rt_tape_load(rp, tp[1], tp[2])
 	return rp
 }
 
-func Run() {
-	tp := rt_tape_new(1)
+fn Run() {
+	let tp = rt_tape_new(1)
 	value = "one"
-	a, err := rt_effect(tp, "test@1", "first", liveBody)
+	mut (a, err) = rt_effect(tp, "test@1", "first", liveBody)
 	say.Line("record first:", a, err == nil, "ran", ran)
 	_, err = rt_effect(tp, "redis@1", "GET k", timedOut)
 	say.Line("record fault:", fault.Message(err), fault.Is(err, fault.DeadlineExceeded), "ran", ran)
@@ -40,7 +40,7 @@ func Run() {
 	say.Line("record bytes:", rt_effect_bytes(tp, "dice@1", "seed", "abc"))
 
 	ran = 0
-	rp := records(tp)
+	let rp = records(tp)
 	value = "other"
 	a, err = rt_effect(rp, "test@1", "first", liveBody)
 	say.Line("replay first:", a, err == nil)
@@ -57,12 +57,12 @@ func Run() {
 	_, err = rt_effect(rp, "test@1", "first", liveBody)
 	say.Line("sticky:", fault.Message(err) == rt_tape_diverged(rp), "ran", ran)
 
-	rq := records(tp)
+	let rq = records(tp)
 	value = "x"
 	_, err = rt_effect(rq, "test@1", "other", liveBody)
 	say.Line("mismatch:", fault.Message(err))
 
-	rl := records(tp)
+	let rl = records(tp)
 	rt_tape_live(rl, ",test,")
 	value = "fresh"
 	a, err = rt_effect(rl, "test@1", "first", liveBody)
@@ -77,17 +77,17 @@ func Run() {
 }
 
 // children: a scope child shares its parent task's tape, and a panic's message goes on it.
-func children() {
-	s := rt_scope_open()
-	s.spawn(func() ! {
-		tp := rt_tape_new(1)
+fn children() {
+	let s = rt_scope_open()
+	s.spawn(fn() ! {
+		let tp = rt_tape_new(1)
 		rt_tape_set(curTask, tp)
-		inner := rt_scope_open()
-		inner.spawn(func() ! {
+		let inner = rt_scope_open()
+		inner.spawn(fn() ! {
 			say.Line("child shares the tape:", rt_tape() == tp)
 			panic("boom in child")
 		})
-		panicked := false
+		mut panicked = false
 		rt_scope_close(inner) catch err {
 			panicked = err != nil
 		}
@@ -95,7 +95,7 @@ func children() {
 		rt_tape_set(curTask, 0)
 		rt_tape_free(tp)
 	})
-	ok := true
+	mut ok = true
 	rt_scope_close(s) catch err {
 		ok = err == nil
 	}

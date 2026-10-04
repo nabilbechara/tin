@@ -24,63 +24,68 @@ const SO_SNDTIMEO = 21
 const TARGET_LINUX = true
 const MAP_STACK = 0x22 // MAP_PRIVATE | MAP_ANONYMOUS
 
-var rtTimespec i64   // per core: the timespec clock_gettime fills
+mut rtTimespec i64   // per core: the timespec clock_gettime fills
 
 // Word 10 belongs to this kernel thread, including helpers; no architecture TLS is used.
-func linux_set_errno(e i64) { if __ctx() != 0 { __ctx()[10] = e } }
-func linux_get_errno() i64 { if __ctx() == 0 { return 0 }; return __ctx()[10] }
-func rt_errno() i64 { return linux_get_errno() }
+fn linux_set_errno(e i64) { if __ctx() != 0 { __ctx()[10] = e } }
+fn linux_get_errno() i64 { if __ctx() == 0 { return 0 }
+ return __ctx()[10] }
+fn rt_errno() i64 { return linux_get_errno() }
 // Environment updates fail only on invalid names, which quarry rejects before calling.
-func rt_env_errno() i64 { return linux_get_errno() }
+fn rt_env_errno() i64 { return linux_get_errno() }
 
 // ---- process start: environment and auxiliary vector from the initial stack ----
 
 // The kernel places argv, NULL, envp, NULL, then auxv pairs ending in AT_NULL. rtEnviron is a
 // NULL-terminated array of "NAME=value" C strings: the kernel's until the first update.
-shared var rtEnviron i64
-shared var rtEnvCap i64
-shared var rtEnvLock i64
-shared var rtAuxv i64
+shared mut rtEnviron i64
+shared mut rtEnvCap i64
+shared mut rtEnvLock i64
+shared mut rtAuxv i64
 
 // rt_os_start finds envp and auxv past argv's NULL; it runs before anything reads them.
-func rt_os_start(argc i64, argv i64) {
+fn rt_os_start(argc i64, argv i64) {
 	if rtAuxv != 0 || argv == 0 {
 		return
 	}
-	env := argv + 8*(argc+1)
-	n := i64(0)
+	let env = argv + 8*(argc+1)
+	mut n = i64(0)
 	for env[n] != 0 {
-		n++
+		n += 1
 	}
 	rtEnviron = env
 	rtAuxv = env + 8*(n+1)
 }
 
 // rt_getauxval is the auxv value of key (AT_PAGESZ, AT_HWCAP, ...), or 0 when absent.
-func rt_getauxval(key i64) i64 {
+fn rt_getauxval(key i64) i64 {
 	if rtAuxv == 0 {
 		return 0
 	}
-	for p := rtAuxv; p[0] != 0; p += 16 {
-		if p[0] == key {
-			return p[1]
+	{
+		mut p = rtAuxv
+		for p[0] != 0 {
+			if p[0] == key {
+				return p[1]
+			}
+			p += 16
 		}
 	}
 	return 0
 }
 
 // rt_env_value is the value in entry e when it is "name=value", or 0.
-func rt_env_value(e i64, name i64) i64 {
-	i := i64(0)
+fn rt_env_value(e i64, name i64) i64 {
+	mut i = i64(0)
 	for {
-		c := load8(name + i)
+		let c = load8(name + i)
 		if c == 0 {
 			break
 		}
 		if load8(e+i) != c {
 			return 0
 		}
-		i++
+		i += 1
 	}
 	if load8(e+i) != '=' {
 		return 0
@@ -89,15 +94,19 @@ func rt_env_value(e i64, name i64) i64 {
 }
 
 // rt_getenv is the value of the C string name as a C string, or 0 when it is unset.
-func rt_getenv(name i64) i64 {
-	env := rtEnviron
+fn rt_getenv(name i64) i64 {
+	let env = rtEnviron
 	if env == 0 {
 		return 0
 	}
-	for i := i64(0); env[i] != 0; i++ {
-		v := rt_env_value(env[i], name)
-		if v != 0 {
-			return v
+	{
+		mut i = i64(0)
+		for env[i] != 0 {
+			let v = rt_env_value(env[i], name)
+			if v != 0 {
+				return v
+			}
+			i += 1
 		}
 	}
 	return 0
@@ -105,14 +114,14 @@ func rt_getenv(name i64) i64 {
 
 // rt_env_own returns the entry count after making rtEnviron an owned array with room for one
 // more entry. Old arrays and entries are never freed: another core may still be reading them.
-func rt_env_own() i64 {
-	n := i64(0)
+fn rt_env_own() i64 {
+	mut n = i64(0)
 	for rtEnviron != 0 && rtEnviron[n] != 0 {
-		n++
+		n += 1
 	}
 	if rtEnvCap < n+2 {
-		c := n*2 + 16
-		next := calloc(c, 8)
+		let c = n*2 + 16
+		let next = calloc(c, 8)
 		if n > 0 {
 			memcpy(next, rtEnviron, 8*n)
 		}
@@ -123,17 +132,17 @@ func rt_env_own() i64 {
 }
 
 // rt_setenv sets name to value (C strings, name already validated); it returns 0.
-func rt_setenv(name i64, value i64) i64 {
-	nl := strlen(name)
-	vl := strlen(value)
-	e := malloc(nl + vl + 2)
+fn rt_setenv(name i64, value i64) i64 {
+	let nl = strlen(name)
+	let vl = strlen(value)
+	let e = malloc(nl + vl + 2)
 	memcpy(e, name, nl)
 	store8(e+nl, '=')
 	memcpy(e+nl+1, value, vl+1)
 	rt_lock(&rtEnvLock)
-	n := rt_env_own()
-	env := rtEnviron
-	for i := i64(0); i < n; i++ {
+	let n = rt_env_own()
+	let env = rtEnviron
+	for i in i64(0)..n {
 		if rt_env_value(env[i], name) != 0 {
 			env[i] = e
 			rt_unlock(&rtEnvLock)
@@ -147,28 +156,28 @@ func rt_setenv(name i64, value i64) i64 {
 }
 
 // rt_unsetenv removes every entry for name (a validated C string); it returns 0.
-func rt_unsetenv(name i64) i64 {
+fn rt_unsetenv(name i64) i64 {
 	rt_lock(&rtEnvLock)
-	n := rt_env_own()
-	env := rtEnviron
-	j := i64(0)
-	for i := i64(0); i < n; i++ {
+	let n = rt_env_own()
+	let env = rtEnviron
+	mut j = i64(0)
+	for i in i64(0)..n {
 		if rt_env_value(env[i], name) == 0 {
 			env[j] = env[i]
-			j++
+			j += 1
 		}
 	}
 	for j < n {
 		env[j] = 0
-		j++
+		j += 1
 	}
 	rt_unlock(&rtEnvLock)
 	return 0
 }
-func linux_restorer() {}
-func linux_restorer_ptr() i64 { return cast(i64,linux_restorer) }
+fn linux_restorer() {}
+fn linux_restorer_ptr() i64 { return cast(i64,linux_restorer) }
 
-func rt_clock(id i64) i64 {
+fn rt_clock(id i64) i64 {
 	if rtTimespec == 0 {
 		rtTimespec = rt_ingot_alloc(16)
 	}
@@ -177,19 +186,19 @@ func rt_clock(id i64) i64 {
 }
 
 // rt_mono_ns is CLOCK_MONOTONIC in nanoseconds.
-func rt_mono_ns() i64 {
+fn rt_mono_ns() i64 {
 	return rt_clock(1)
 }
 
 // rt_wall_ns is CLOCK_REALTIME in nanoseconds since 1970.
-func rt_wall_ns() i64 {
+fn rt_wall_ns() i64 {
 	return rt_clock(0)
 }
 
 // rt_random fills n bytes at p from getrandom (which may return fewer bytes per call).
-func rt_random(p i64, n i64) {
+fn rt_random(p i64, n i64) {
 	for n > 0 {
-		k := rt_sys_getrandom(p, n, 0)
+		let k = rt_sys_getrandom(p, n, 0)
 		if k <= 0 {
 			if rt_errno() == EINTR {
 				continue
@@ -201,21 +210,21 @@ func rt_random(p i64, n i64) {
 	}
 }
 
-shared var rtPoolChunk i64   // request pool chunk size once a memory limit lowered it (0: the default)
-shared var rtCPUMask i64     // cpu_set_t (128 bytes) of the CPUs this process may run on, set by rt_pin_setup
-shared var rtCPUCount i64    // CPUs set in rtCPUMask
-shared var rtPin bool        // cores pin themselves to one CPU each (rt_pin_setup decided)
-shared var rtNcpus i64       // rt_ncpus once computed (before any core pins itself)
+shared mut rtPoolChunk i64   // request pool chunk size once a memory limit lowered it (0: the default)
+shared mut rtCPUMask i64     // cpu_set_t (128 bytes) of the CPUs this process may run on, set by rt_pin_setup
+shared mut rtCPUCount i64    // CPUs set in rtCPUMask
+shared mut rtPin bool        // cores pin themselves to one CPU each (rt_pin_setup decided)
+shared mut rtNcpus i64       // rt_ncpus once computed (before any core pins itself)
 
 // rt_read_file reads up to n-1 bytes of path into buf, NUL-terminated: the length, or -1 when it cannot be opened.
-func rt_read_file(path str, buf i64, n i64) i64 {
-	fd := i64(i32(rt_sys_open(cast(i64, path)+8, 0, 0)))
+fn rt_read_file(path str, buf i64, n i64) i64 {
+	let fd = i64(i32(rt_sys_open(cast(i64, path)+8, 0, 0)))
 	if fd < 0 {
 		return -1
 	}
-	total := 0
+	mut total = 0
 	for total < n-1 {
-		k := rt_sys_read(fd, buf+total, n-1-total)
+		let k = rt_sys_read(fd, buf+total, n-1-total)
 		if k <= 0 {
 			break
 		}
@@ -228,26 +237,26 @@ func rt_read_file(path str, buf i64, n i64) i64 {
 
 // rt_num_at parses the decimal number after blanks at p: the value (-1 for "max", a negative
 // number or no digits) and the position after it.
-func rt_num_at(p i64) (i64, i64) {
+fn rt_num_at(p i64) (i64, i64) {
 	for load8(p) == ' ' || load8(p) == '\t' || load8(p) == '\n' {
-		p++
+		p += 1
 	}
 	if load8(p) == 'm' {
 		return -1, p + 3
 	}
-	neg := false
+	mut neg = false
 	if load8(p) == '-' {
 		neg = true
-		p++
+		p += 1
 	}
-	v := 0
-	nd := 0
+	mut v = 0
+	mut nd = 0
 	for load8(p) >= '0' && load8(p) <= '9' {
 		if v < 1<<56 {
 			v = v*10 + i64(load8(p)-'0')
 		}
-		nd++
-		p++
+		nd += 1
+		p += 1
 	}
 	if nd == 0 || neg {
 		return -1, p
@@ -256,17 +265,17 @@ func rt_num_at(p i64) (i64, i64) {
 }
 
 // rt_read_num reads a file holding one number: the value, or -1 when absent or not a number.
-func rt_read_num(path str, buf i64) i64 {
+fn rt_read_num(path str, buf i64) i64 {
 	if rt_read_file(path, buf, 128) <= 0 {
 		return -1
 	}
-	v, _ := rt_num_at(buf)
+	let (v, _) = rt_num_at(buf)
 	return v
 }
 
 // rt_same reports whether the n bytes at a and b are equal.
-func rt_same(a i64, b i64, n i64) bool {
-	for i := 0; i < n; i++ {
+fn rt_same(a i64, b i64, n i64) bool {
+	for i in 0..n {
 		if load8(a+i) != load8(b+i) {
 			return false
 		}
@@ -275,8 +284,8 @@ func rt_same(a i64, b i64, n i64) bool {
 }
 
 // rt_find returns the address of the first byte c in the n bytes at p, or 0.
-func rt_find(p i64, c u8, n i64) i64 {
-	for i := 0; i < n; i++ {
+fn rt_find(p i64, c u8, n i64) i64 {
+	for i in 0..n {
 		if load8(p+i) == c {
 			return p + i
 		}
@@ -285,13 +294,13 @@ func rt_find(p i64, c u8, n i64) i64 {
 }
 
 // rt_list_has reports whether the comma-separated list of n bytes at p has an item equal to word.
-func rt_list_has(p i64, n i64, word str) bool {
-	w := len(word)
-	i := 0
+fn rt_list_has(p i64, n i64, word str) bool {
+	let w = len(word)
+	mut i = 0
 	for i <= n {
-		j := i
+		mut j = i
 		for j < n && load8(p+j) != ',' {
-			j++
+			j += 1
 		}
 		if j-i == w && rt_same(p+i, cast(i64, word)+8, w) {
 			return true
@@ -302,19 +311,19 @@ func rt_list_has(p i64, n i64, word str) bool {
 }
 
 // rt_field finds field k (0-based, space-separated) of the line at p ending at e: its start and length, or -1.
-func rt_field(p i64, e i64, k i64) (i64, i64) {
-	for i := 0; i < k; i++ {
+fn rt_field(p i64, e i64, k i64) (i64, i64) {
+	for i in 0..k {
 		for p < e && load8(p) != ' ' {
-			p++
+			p += 1
 		}
 		if p >= e {
 			return -1, 0
 		}
-		p++
+		p += 1
 	}
-	q := p
+	mut q = p
 	for q < e && load8(q) != ' ' {
-		q++
+		q += 1
 	}
 	return p, q - p
 }
@@ -323,24 +332,24 @@ func rt_field(p i64, e i64, k i64) (i64, i64) {
 // cgroup for controller ctrl ("" for the v2 unified hierarchy), found through /proc/self/cgroup
 // and /proc/self/mountinfo, so it is right in a private and in the host cgroup namespace. It
 // returns the length of the cgroup mount point at the start of dir, or -1 when there is none.
-func rt_cg_find(ctrl str, dir i64) i64 {
-	cg := calloc(1, 8192)
-	mi := calloc(1, 262144)
-	mlen := -1
-	cn := rt_read_file("/proc/self/cgroup", cg, 8192)
-	mn := rt_read_file("/proc/self/mountinfo", mi, 262144)
+fn rt_cg_find(ctrl str, dir i64) i64 {
+	let cg = calloc(1, 8192)
+	let mi = calloc(1, 262144)
+	mut mlen = -1
+	let cn = rt_read_file("/proc/self/cgroup", cg, 8192)
+	let mn = rt_read_file("/proc/self/mountinfo", mi, 262144)
 	// The process's path in the hierarchy: "0::/path" (v2) or "N:cpu,cpuacct:/path" (v1).
-	pp := 0
-	pl := 0
-	p := cg
+	mut pp = 0
+	mut pl = 0
+	mut p = cg
 	for cn > 0 && p < cg+cn && pp == 0 {
-		e := rt_find(p, '\n', cg+cn-p)
+		mut e = rt_find(p, '\n', cg+cn-p)
 		if e == 0 {
 			e = cg + cn
 		}
-		c1 := rt_find(p, ':', e-p)
+		let c1 = rt_find(p, ':', e-p)
 		if c1 != 0 {
-			c2 := rt_find(c1+1, ':', e-c1-1)
+			let c2 = rt_find(c1+1, ':', e-c1-1)
 			if c2 != 0 {
 				if len(ctrl) == 0 && c2 == c1+1 && c1 == p+1 && load8(p) == '0' {
 					pp = c2 + 1
@@ -357,35 +366,39 @@ func rt_cg_find(ctrl str, dir i64) i64 {
 	// then after " - " the file system type and its super options.
 	p = mi
 	for pp != 0 && mn > 0 && p < mi+mn && mlen < 0 {
-		e := rt_find(p, '\n', mi+mn-p)
+		mut e = rt_find(p, '\n', mi+mn-p)
 		if e == 0 {
 			e = mi + mn
 		}
-		sep := 0
-		for q := p; q+2 < e; q++ {
-			if load8(q) == ' ' && load8(q+1) == '-' && load8(q+2) == ' ' {
-				sep = q + 3
-				break
+		mut sep = 0
+		{
+			mut q = p
+			for q+2 < e {
+				if load8(q) == ' ' && load8(q+1) == '-' && load8(q+2) == ' ' {
+					sep = q + 3
+					break
+				}
+				q += 1
 			}
 		}
 		if sep != 0 {
-			fs, fl := rt_field(sep, e, 0)
-			op, ol := rt_field(sep, e, 2)
-			ok := false
+			let (fs, fl) = rt_field(sep, e, 0)
+			let (op, ol) = rt_field(sep, e, 2)
+			mut ok = false
 			if len(ctrl) == 0 {
 				ok = fl == 7 && rt_same(fs, cast(i64, "cgroup2")+8, 7)
 			} else if fl == 6 && rt_same(fs, cast(i64, "cgroup")+8, 6) && op >= 0 {
 				ok = rt_list_has(op, ol, ctrl)
 			}
-			rp, rl := rt_field(p, e, 3)
-			mp, ml := rt_field(p, e, 4)
+			let (rp, rl) = rt_field(p, e, 3)
+			let (mp, ml) = rt_field(p, e, 4)
 			if ok && rp >= 0 && mp >= 0 && ml < 2048 {
 				memcpy(dir, mp, ml)
-				n := ml
+				mut n = ml
 				// The part of the process's path below the mount's root; nothing when the
 				// mount shows a different subtree (the namespace already starts at the cgroup).
-				rel := pp
-				reln := pl
+				mut rel = pp
+				mut reln = pl
 				if rl == 1 && load8(rp) == '/' {
 				} else if pl >= rl && rt_same(pp, rp, rl) && (pl == rl || load8(pp+rl) == '/') {
 					rel = pp + rl
@@ -414,29 +427,29 @@ func rt_cg_find(ctrl str, dir i64) i64 {
 // rt_cg_num reads the number in file under the cgroup directory dir (NUL-terminated) at level
 // up (0: dir itself, 1: its parent, ...), stopping at the mount point of length mlen: the value
 // (-1 for "max" or absent), the second number on the line, and whether that level exists.
-func rt_cg_num(dir i64, mlen i64, up i64, file str) (i64, i64, bool) {
-	n := i64(strlen(dir))
-	for i := 0; i < up; i++ {
+fn rt_cg_num(dir i64, mlen i64, up i64, file str) (i64, i64, bool) {
+	mut n = i64(strlen(dir))
+	for i in 0..up {
 		if n <= mlen {
 			return -1, -1, false
 		}
 		for n > mlen && load8(dir+n-1) != '/' {
-			n--
+			n -= 1
 		}
 		if n > mlen {
-			n--
+			n -= 1
 		}
 	}
-	path := calloc(1, 4096+64)
+	let path = calloc(1, 4096+64)
 	memcpy(path, dir, n)
 	store8(path+n, '/')
 	memcpy(path+n+1, cast(i64, file)+8, len(file))
-	buf := calloc(1, 128)
-	v := -1
-	v2 := -1
+	let buf = calloc(1, 128)
+	mut v = -1
+	mut v2 = -1
 	if rt_read_file(rt_str_from_raw(path, n+1+len(file)), buf, 128) > 0 {
-		a, next := rt_num_at(buf)
-		b, _ := rt_num_at(next)
+		let (a, next) = rt_num_at(buf)
+		let (b, _) = rt_num_at(next)
 		v = a
 		v2 = b
 	}
@@ -448,33 +461,37 @@ func rt_cg_num(dir i64, mlen i64, up i64, file str) (i64, i64, bool) {
 // rt_cpu_quota is the cgroup CPU limit rounded up to whole CPUs: the smallest over this
 // process's cgroup and its ancestors (v2 cpu.max, else v1 cpu.cfs_quota_us / cfs_period_us);
 // 0 when unlimited or unknown.
-func rt_cpu_quota() i64 {
-	dir := calloc(1, 4096)
-	best := 0
-	v1 := false
-	mlen := rt_cg_find("", dir)
+fn rt_cpu_quota() i64 {
+	let dir = calloc(1, 4096)
+	mut best = 0
+	mut v1 = false
+	mut mlen = rt_cg_find("", dir)
 	if mlen < 0 {
 		mlen = rt_cg_find("cpu", dir)
 		v1 = true
 	}
-	for up := 0; mlen >= 0; up++ {
-		quota := -1
-		period := -1
-		exists := false
-		if v1 {
-			quota, _, exists = rt_cg_num(dir, mlen, up, "cpu.cfs_quota_us")
-			period, _, _ = rt_cg_num(dir, mlen, up, "cpu.cfs_period_us")
-		} else {
-			quota, period, exists = rt_cg_num(dir, mlen, up, "cpu.max")
-		}
-		if !exists {
-			break
-		}
-		if quota > 0 && period > 0 {
-			c := (quota + period - 1) / period
-			if best == 0 || c < best {
-				best = c
+	{
+		mut up = 0
+		for mlen >= 0 {
+			let quota = -1
+			let period = -1
+			mut exists = false
+			if v1 {
+				quota, _, exists = rt_cg_num(dir, mlen, up, "cpu.cfs_quota_us")
+				period, _, _ = rt_cg_num(dir, mlen, up, "cpu.cfs_period_us")
+			} else {
+				quota, period, exists = rt_cg_num(dir, mlen, up, "cpu.max")
 			}
+			if !exists {
+				break
+			}
+			if quota > 0 && period > 0 {
+				let c = (quota + period - 1) / period
+				if best == 0 || c < best {
+					best = c
+				}
+			}
+			up += 1
 		}
 	}
 	free(dir)
@@ -483,14 +500,14 @@ func rt_cpu_quota() i64 {
 
 // rt_affinity_count fills the 4096-byte affinity mask at set with the CPUs this thread may run on
 // and returns how many there are (0 when the call fails).
-func rt_affinity_count(set i64) i64 {
+fn rt_affinity_count(set i64) i64 {
 	memset(set, 0, 4096)
 	if i64(i32(rt_sys_sched_getaffinity(0, 4096, set))) != 0 {
 		return 0
 	}
-	n := 0
-	for i := 0; i < 4096; i++ {
-		b := i64(load8(set + i))
+	mut n = 0
+	for i in 0..4096 {
+		mut b = i64(load8(set + i))
 		for b != 0 {
 			n += b & 1
 			b >>= 1
@@ -501,18 +518,18 @@ func rt_affinity_count(set i64) i64 {
 
 // rt_ncpus is the number of CPUs this program may use: the affinity mask (cpuset),
 // capped by the cgroup CPU quota; never less than 1.
-func rt_ncpus() i64 {
+fn rt_ncpus() i64 {
 	if rtNcpus > 0 {
 		return rtNcpus
 	}
-	n := 1
-	set := calloc(1, 4096)
-	a := rt_affinity_count(set)
+	mut n = 1
+	let set = calloc(1, 4096)
+	let a = rt_affinity_count(set)
 	free(set)
 	if a > 0 {
 		n = a
 	}
-	q := rt_cpu_quota()
+	let q = rt_cpu_quota()
 	if q > 0 && q < n {
 		n = q
 	}
@@ -522,22 +539,26 @@ func rt_ncpus() i64 {
 
 // rt_mem_limit is the cgroup memory limit in bytes: the smallest over this process's cgroup
 // and its ancestors (v2 memory.max, else v1 memory.limit_in_bytes); 0 when unlimited or unknown.
-func rt_mem_limit() i64 {
-	dir := calloc(1, 4096)
-	file := "memory.max"
-	mlen := rt_cg_find("", dir)
+fn rt_mem_limit() i64 {
+	let dir = calloc(1, 4096)
+	mut file = "memory.max"
+	mut mlen = rt_cg_find("", dir)
 	if mlen < 0 {
 		mlen = rt_cg_find("memory", dir)
 		file = "memory.limit_in_bytes"
 	}
-	best := 0
-	for up := 0; mlen >= 0; up++ {
-		v, _, exists := rt_cg_num(dir, mlen, up, file)
-		if !exists {
-			break
-		}
-		if v > 0 && v < 1<<60 && (best == 0 || v < best) {
-			best = v
+	mut best = 0
+	{
+		mut up = 0
+		for mlen >= 0 {
+			let (v, _, exists) = rt_cg_num(dir, mlen, up, file)
+			if !exists {
+				break
+			}
+			if v > 0 && v < 1<<60 && (best == 0 || v < best) {
+				best = v
+			}
+			up += 1
 		}
 	}
 	free(dir)
@@ -547,23 +568,23 @@ func rt_mem_limit() i64 {
 // rt_pin_setup (called before cores start) decides whether each core pins itself to one allowed
 // CPU: when the n cores map one-to-one onto the allowed CPUs, or TIN_PIN=1 asks for it and no
 // two cores would have to share a CPU.
-func rt_pin_setup(n i64) {
+fn rt_pin_setup(n i64) {
 	rt_ncpus()
 	rtPin = false
 	if rtCPUMask == 0 {
 		rtCPUMask = calloc(1, 4096)
 	}
-	allowed := rt_affinity_count(rtCPUMask)
+	let allowed = rt_affinity_count(rtCPUMask)
 	rtCPUCount = allowed
 	if allowed <= 0 || n > allowed {
 		return
 	}
-	env := rt_getenv(cast(i64, "TIN_PIN") + 8)
+	let env = rt_getenv(cast(i64, "TIN_PIN") + 8)
 	rtPin = n == allowed || (env != 0 && load8(env) == '1')
 }
 
 // rt_stack_t fills a stack_t for sigaltstack: ss_sp, ss_flags (int, padded), ss_size.
-func rt_stack_t(st i64, sp i64, n i64) {
+fn rt_stack_t(st i64, sp i64, n i64) {
 	st[0] = sp
 	st[1] = 0
 	st[2] = n
@@ -571,8 +592,8 @@ func rt_stack_t(st i64, sp i64, n i64) {
 
 // rt_fault_handlers installs h (sig, siginfo, ucontext) for SIGSEGV and SIGBUS on the signal
 // stack, using the kernel's handler/flags/restorer/8-byte mask record.
-func rt_fault_handlers(h i64) {
-	act := calloc(4, 8)
+fn rt_fault_handlers(h i64) {
+	let act = calloc(4, 8)
 	act[0] = h
 	act[1] = 0x0c000004
 	act[2] = linux_restorer_ptr()
@@ -582,18 +603,18 @@ func rt_fault_handlers(h i64) {
 }
 
 // rt_fault_addr is siginfo_t's si_addr (after si_signo, si_errno, si_code and padding).
-func rt_fault_addr(info i64) i64 {
+fn rt_fault_addr(info i64) i64 {
 	return (info + 16)[0]
 }
 
-func rt_sigbus() i64 {
+fn rt_sigbus() i64 {
 	return 7
 }
 
 // rt_sig_block_term blocks SIGTERM and SIGINT in the calling thread; threads it creates inherit
 // the mask, so a server can take the signals from a descriptor instead of a handler.
-func rt_sig_block_term() {
-	set := calloc(1, 8)
+fn rt_sig_block_term() {
+	let set = calloc(1, 8)
 	set[0] = 1<<14 | 1<<1
 	rt_sys_pthread_sigmask(0, set, 0)
 	free(set)
@@ -622,21 +643,21 @@ const thrNext = 8
 const thrAltT = 9
 const thrWords = 12
 
-shared var rtThreads i64
-shared var rtThreadLock i64
+shared mut rtThreads i64
+shared mut rtThreadLock i64
 
 // rt_thread_start runs the function at code with arg on a new kernel thread with an 8 MiB stack above a guard.
-func rt_thread_start(code i64, arg i64) bool {
+fn rt_thread_start(code i64, arg i64) bool {
 	rt_threads_reap()
-	page := rt_page_size()
-	guard := (threadGuard+page-1) & -page
-	size := guard + threadStackSize
-	base := mem_map(size, MAP_STACK)
-	if i64(i32(rt_sys_mprotect(base, guard, 0))) != 0 {
+	let page = rt_page_size()
+	let guard_ = (threadGuard+page-1) & -page
+	let size = guard_ + threadStackSize
+	let base = mem_map(size, MAP_STACK)
+	if i64(i32(rt_sys_mprotect(base, guard_, 0))) != 0 {
 		rt_sys_munmap(base, size)
 		return false
 	}
-	rec := calloc(thrWords, 8)
+	let rec = calloc(thrWords, 8)
 	rec[thrStack] = base
 	rec[thrSize] = size
 	rec[thrAlt] = mem_map(altStackSize, MAP_STACK)
@@ -645,7 +666,7 @@ func rt_thread_start(code i64, arg i64) bool {
 	rt_lock(&rtThreadLock)
 	rec[thrNext] = rtThreads
 	rtThreads = rec
-	tid := rt_sys_clone(cloneThreadFlags, base+size, rec, rec, cast(i64, rt_thread_entry), rec)
+	let tid = rt_sys_clone(cloneThreadFlags, base+size, rec, rec, cast(i64, rt_thread_entry), rec)
 	if tid < 0 {
 		rtThreads = rec[thrNext]
 	}
@@ -658,15 +679,15 @@ func rt_thread_start(code i64, arg i64) bool {
 }
 
 // rt_thread_entry is a new thread's first Tin frame: its own signal stack, then the entry.
-func rt_thread_entry(rec i64) {
+fn rt_thread_entry(rec i64) {
 	rt_stack_t(rec+8*thrAltT, rec[thrAlt], altStackSize)
 	rt_sys_sigaltstack(rec+8*thrAltT, 0)
-	entry := cast(func(i64) i64, rec+8*thrEntry)
+	let entry = cast(fn(i64) i64, rec+8*thrEntry)
 	entry(rec[thrArg])
 	__atomic_store(rec+8*thrDone, 1)
 }
 
-func rt_thread_free(rec i64) {
+fn rt_thread_free(rec i64) {
 	rt_sys_munmap(rec[thrStack], rec[thrSize])
 	rt_sys_munmap(rec[thrAlt], altStackSize)
 	free(rec)
@@ -674,17 +695,17 @@ func rt_thread_free(rec i64) {
 
 // rt_threads_reap frees the stacks of threads whose entry returned, once the kernel cleared
 // their tid word (the thread no longer runs on them).
-func rt_threads_reap() {
+fn rt_threads_reap() {
 	rt_lock(&rtThreadLock)
-	prev := i64(0)
-	r := rtThreads
+	mut prev = i64(0)
+	mut r = rtThreads
 	for r != 0 {
-		next := r[thrNext]
+		let next = r[thrNext]
 		if __atomic_load(r+8*thrDone) == 0 {
 			prev = r
 		} else {
 			for {
-				tid := __atomic_load(r) & 0xffffffff
+				let tid = __atomic_load(r) & 0xffffffff
 				if tid == 0 {
 					break
 				}
@@ -704,25 +725,25 @@ func rt_threads_reap() {
 
 // rt_altstack_ready reports whether this thread already has a signal stack (clone threads
 // install theirs from the record before their entry runs).
-func rt_altstack_ready() bool {
-	old := calloc(3, 8)
+fn rt_altstack_ready() bool {
+	let old = calloc(3, 8)
 	rt_sys_sigaltstack(0, old)
-	ready := __ld(old+8, 2)&SS_DISABLE == 0
+	let ready = __ld(old+8, 2)&SS_DISABLE == 0
 	free(old)
 	return ready
 }
 
 // rt_signalfd returns a non-blocking descriptor that turns readable when a (blocked) SIGTERM or
 // SIGINT arrives; reading 128 bytes from it takes the signal (its number is the first u32).
-func rt_signalfd() i64 {
-	set := calloc(1, 8)
+fn rt_signalfd() i64 {
+	let set = calloc(1, 8)
 	set[0] = 1<<14 | 1<<1
-	fd := i64(i32(rt_sys_signalfd(-1, set, 0x800|0x80000)))
+	let fd = i64(i32(rt_sys_signalfd(-1, set, 0x800|0x80000)))
 	free(set)
 	return fd
 }
 
-func rt_sockaddr_in(sa i64, ip i64, port i64) {
+fn rt_sockaddr_in(sa i64, ip i64, port i64) {
 	memset(sa, 0, 16)
 	__st(sa, 2, 1)
 	store8(sa+2, port>>8)
@@ -733,75 +754,80 @@ func rt_sockaddr_in(sa i64, ip i64, port i64) {
 	store8(sa+7, ip&255)
 }
 
-func rt_ai_addr(ai i64) i64 {
+fn rt_ai_addr(ai i64) i64 {
 	return (ai + 24)[0]
 }
 
 // rt_nosigpipe: Linux has no per-socket flag, so SIGPIPE is ignored process-wide.
-func rt_nosigpipe(fd i64) {
+fn rt_nosigpipe(fd i64) {
 	rt_sys_signal(13, 1)
 }
 
 // struct stat: st_mode's offset differs per CPU (runtime_linux_<arch>.tin); the rest is shared.
 
-func rt_stat_size(st i64) i64 {
+fn rt_stat_size(st i64) i64 {
 	return (st + 48)[0]
 }
 
-func rt_stat_mtime(st i64) i64 {
+fn rt_stat_mtime(st i64) i64 {
 	return (st + 88)[0]
 }
 
-func rt_stat_dev(st i64) i64 {
+fn rt_stat_dev(st i64) i64 {
 	return st[0]
 }
 
-func rt_stat_ino(st i64) i64 {
+fn rt_stat_ino(st i64) i64 {
 	return (st + 8)[0]
 }
 
-func rt_dirent_name(ent i64) str {
+fn rt_dirent_name(ent i64) str {
 	return rt_str_from_raw(ent+19, strlen(ent+19))
 }
 
 // rt_core_qos pins core id to the id-th allowed CPU when rt_pin_setup decided to pin.
-func rt_core_qos(id i64) {
+fn rt_core_qos(id i64) {
 	if !rtPin || rtCPUMask == 0 {
 		return
 	}
-	cpu := -1
-	seen := 0
-	for i := 0; i < 32768 && cpu < 0; i++ {
-		if (i64(load8(rtCPUMask+i/8))>>(i%8))&1 != 0 {
-			if seen == id {
-				cpu = i
+	mut cpu = -1
+	mut seen = 0
+	{
+		mut i = 0
+		for i < 32768 && cpu < 0 {
+			if (i64(load8(rtCPUMask+i/8))>>(i%8))&1 != 0 {
+				if seen == id {
+					cpu = i
+				}
+				seen += 1
 			}
-			seen++
+			i += 1
 		}
 	}
 	if cpu < 0 {
 		return
 	}
-	set := calloc(1, 4096)
+	let set = calloc(1, 4096)
 	store8(set+cpu/8, 1<<(cpu%8))
 	rt_sys_sched_setaffinity(0, 4096, set)
 	free(set)
 }
 
 // rt_page_size is the OS mapping page size.
-func rt_page_size() i64 { return rt_getauxval(6) }
-func rt_date_year_width() i64 { return 1 }
-func rt_isatty(fd i64) bool {
-    termios := calloc(1,64)
-    result := linux_result(linux_raw(linux_nr_ioctl(),fd,0x5401,termios,0,0,0))
+fn rt_page_size() i64 { return rt_getauxval(6) }
+fn rt_date_year_width() i64 { return 1 }
+fn rt_isatty(fd i64) bool {
+    let termios = calloc(1,64)
+    let result = linux_result(linux_raw(linux_nr_ioctl(),fd,0x5401,termios,0,0,0))
     free(termios)
     return result == 0
 }
 
 const MEM_DONTNEED = 4
 
-func rt_dir_error(d i64) i64 { return d[3] }
+fn rt_dir_error(d i64) i64 { return d[3] }
 
 // Socket address family and length follow the native OS layout.
-func rt_sockaddr_family(sa i64) i64 { return __ld(sa,1) }
-func rt_sockaddr_len(sa i64) i64 { if rt_sockaddr_family(sa) == 10 { return 28 }; return 16 }
+fn rt_sockaddr_family(sa i64) i64 { return __ld(sa,1) }
+fn rt_sockaddr_len(sa i64) i64 { if rt_sockaddr_family(sa) == 10 { return 28 }
+ return 16 }

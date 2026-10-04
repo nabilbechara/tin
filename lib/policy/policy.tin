@@ -8,7 +8,7 @@ import "say"
 import "tide"
 
 // Policy is what with p { body } needs of p: Run runs body (any number of times) and gives the block's value. Run may only call body, or pass it to a function that only calls it.
-shape Policy[T constraints.Any] { Run(body func() !T) !T }
+shape Policy[T constraints.Any] { Run(body fn() !T) !T }
 
 // ---- slots ----
 
@@ -23,27 +23,27 @@ type cell[T constraints.Any] struct {
 }
 
 // NewSlot makes a slot named name; declare it once, in a package-level let (one per core).
-func NewSlot[T constraints.Any](name str) Slot[T] {
+fn NewSlot[T constraints.Any](name str) Slot[T] {
 	return Slot[T]{name: name}
 }
 
 // Name is the slot's name.
-func (s Slot[T]) Name() str {
+fn (s Slot[T]) Name() str {
 	return s.name
 }
 
 // Get is the value of the innermost Bind of s around the running code; it fails when s is not bound.
-func (s Slot[T]) Get() !T {
-	n := rt_slot_find(cast(i64, s))
+fn (s Slot[T]) Get() !T {
+	let n = rt_slot_find(cast(i64, s))
 	if n == 0 {
 		fail "slot " + s.name + " is not bound"
 	}
-	c := cast(cell[T], n[2])
+	let c = cast(cell[T], n[2])
 	return c.v
 }
 
 // Bound reports whether s is bound around the running code.
-func (s Slot[T]) Bound() bool {
+fn (s Slot[T]) Bound() bool {
 	return rt_slot_find(cast(i64, s)) != 0
 }
 
@@ -54,12 +54,12 @@ type BindPolicy[V constraints.Any, T constraints.Any] struct {
 }
 
 // Bind is a policy that binds s to v for its block and the tasks the block spawns: with policy.Bind(requestID, id) { }.
-func Bind[V constraints.Any, T constraints.Any](s Slot[V], v V) BindPolicy[V, T] {
+fn Bind[V constraints.Any, T constraints.Any](s Slot[V], v V) BindPolicy[V, T] {
 	return BindPolicy[V, T]{s: s, v: v}
 }
 
 // Run binds the slot on the with block's boundary, then runs body once.
-func (b BindPolicy[V, T]) Run(body func() !T) !T {
+fn (b BindPolicy[V, T]) Run(body fn() !T) !T {
 	rt_slot_bind(cast(i64, b.s), cast(i64, cell[V]{v: b.v}))
 	return try body()
 }
@@ -73,21 +73,21 @@ type RetryPolicy[T constraints.Any] struct {
 }
 
 // Retry is a policy that runs its block up to attempts times while it fails and gives the last fault. A cancellation ends it at once: a cancellation fault from the block is given as it is, and a boundary cancelled (or past its deadline) between attempts gives the cancellation's fault. The block's side effects run again on each attempt.
-func Retry[T constraints.Any](attempts i64) RetryPolicy[T] {
+fn Retry[T constraints.Any](attempts i64) RetryPolicy[T] {
 	return RetryPolicy[T]{attempts: attempts, wait: 0}
 }
 
 // Backoff is r waiting d before the second attempt, and twice as long before each later one.
-func (r RetryPolicy[T]) Backoff(d i64) RetryPolicy[T] {
+fn (r RetryPolicy[T]) Backoff(d i64) RetryPolicy[T] {
 	return RetryPolicy[T]{attempts: r.attempts, wait: d}
 }
 
 // Run runs body until it succeeds, attempts runs have failed, or the boundary is cancelled.
-func (r RetryPolicy[T]) Run(body func() !T) !T {
-	wait := r.wait
-	n := 1
+fn (r RetryPolicy[T]) Run(body fn() !T) !T {
+	mut wait = r.wait
+	mut n = 1
 	for {
-		v, err := body()
+		let (v, err) = body()
 		if err == nil {
 			return v
 		}
@@ -101,26 +101,26 @@ func (r RetryPolicy[T]) Run(body func() !T) !T {
 			try tide.Wait(wait)
 			wait = wait * 2
 		}
-		n++
+		n += 1
 	}
 }
 
 // canceled reports whether err is a cancellation, which no attempt can get past.
-func canceled(err fault) bool {
+fn canceled(err fault) bool {
 	return fault.Is(err, fault.Canceled) || fault.Is(err, fault.DeadlineExceeded) || fault.Is(err, fault.LimitExceeded)
 }
 
 // ---- trace ----
 
-var tracer func(str, i64, fault) = logSpan
+mut tracer fn(str, i64, fault) = logSpan
 
 // SetTracer sends this core's trace spans to f(name, duration in ns, fault or nil) instead of the log.
-func SetTracer(f func(str, i64, fault)) {
+fn SetTracer(f fn(str, i64, fault)) {
 	tracer = f
 }
 
 // logSpan is the default tracer: one herald line per span.
-func logSpan(name str, ns i64, err fault) {
+fn logSpan(name str, ns i64, err fault) {
 	if err != nil {
 		herald.Log(herald.LInfo, "trace", []str{"name", name, "us", say.Str(ns / 1000), "fault", say.Str(err)})
 		return
@@ -134,14 +134,14 @@ type TracePolicy[T constraints.Any] struct {
 }
 
 // Trace is a policy that reports its block's name, duration and fault to the core's tracer (a herald line by default).
-func Trace[T constraints.Any](name str) TracePolicy[T] {
+fn Trace[T constraints.Any](name str) TracePolicy[T] {
 	return TracePolicy[T]{name: name}
 }
 
 // Run runs body once and reports it.
-func (t TracePolicy[T]) Run(body func() !T) !T {
-	start := tide.Now()
-	v, err := body()
+fn (t TracePolicy[T]) Run(body fn() !T) !T {
+	let start = tide.Now()
+	let (v, err) = body()
 	tracer(t.name, tide.Now()-start, err)
 	if err != nil {
 		fail err
@@ -164,7 +164,7 @@ type Cache[T constraints.Any] struct {
 }
 
 // NewCache makes a cache of at most max entries (at least one); a full cache drops its oldest entry.
-func NewCache[T constraints.Any](max i64) Cache[T] {
+fn NewCache[T constraints.Any](max i64) Cache[T] {
 	if max < 1 {
 		max = 1
 	}
@@ -172,12 +172,12 @@ func NewCache[T constraints.Any](max i64) Cache[T] {
 }
 
 // Len is the number of entries, fresh or expired.
-func (c Cache[T]) Len() i64 {
+fn (c Cache[T]) Len() i64 {
 	return len(c.m)
 }
 
 // Drop removes key's entry.
-func (c mut Cache[T]) Drop(key str) {
+fn (c mut Cache[T]) Drop(key str) {
 	delete(c.m, key)
 }
 
@@ -189,19 +189,19 @@ type CachedPolicy[T constraints.Any] struct {
 }
 
 // Cached is a policy that gives the value cached under key while it is younger than ttl (ns), without running its block; otherwise it runs the block and caches a value it gives. Faults are not cached.
-func Cached[T constraints.Any](c Cache[T], key str, ttl i64) CachedPolicy[T] {
+fn Cached[T constraints.Any](c Cache[T], key str, ttl i64) CachedPolicy[T] {
 	return CachedPolicy[T]{c: c, key: key, ttl: ttl}
 }
 
 // Run gives the cached value, or runs body and caches its value.
-func (p mut CachedPolicy[T]) Run(body func() !T) !T {
-	e, ok := p.c.m[p.key]
+fn (p mut CachedPolicy[T]) Run(body fn() !T) !T {
+	let (e, ok) = p.c.m[p.key]
 	if ok && tide.Now() < e.until {
 		return e.v
 	}
-	v := try body()
+	let v = try body()
 	if !ok && len(p.c.m) >= p.c.max {
-		for k := range p.c.m {
+		for k, _ in p.c.m {
 			delete(p.c.m, k)
 			break
 		}

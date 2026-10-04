@@ -13,29 +13,33 @@ type swapCount struct {
 }
 
 // less is cmp.Less: x < y, with NaN smaller than everything else.
-func less[E Ordered](x E, y E) bool {
+fn less[E Ordered](x E, y E) bool {
 	return x < y || (x != x && y == y)
 }
 
 // ---- ordered element types ----
 
-func insertionSortOrdered[E Ordered](data mut []E, a i64, b i64) {
-	for i := a + 1; i < b; i++ {
-		for j := i; j > a && less(data[j], data[j-1]); j-- {
-			data[j], data[j-1] = data[j-1], data[j]
+fn insertionSortOrdered[E Ordered](data mut []E, a i64, b i64) {
+	for i in a + 1..b {
+		{
+			mut j = i
+			for j > a && less(data[j], data[j-1]) {
+				data[j], data[j-1] = data[j-1], data[j]
+				j -= 1
+			}
 		}
 	}
 }
 
-func siftDownOrdered[E Ordered](data mut []E, lo i64, hi i64, first i64) {
-	root := lo
+fn siftDownOrdered[E Ordered](data mut []E, lo i64, hi i64, first i64) {
+	mut root = lo
 	for {
-		child := 2*root + 1
+		mut child = 2*root + 1
 		if child >= hi {
 			break
 		}
 		if child+1 < hi && less(data[first+child], data[first+child+1]) {
-			child++
+			child += 1
 		}
 		if !less(data[first+root], data[first+child]) {
 			return
@@ -45,40 +49,49 @@ func siftDownOrdered[E Ordered](data mut []E, lo i64, hi i64, first i64) {
 	}
 }
 
-func heapSortOrdered[E Ordered](data mut []E, a i64, b i64) {
-	first := a
-	lo := 0
-	hi := b - a
-	for i := (hi - 1) / 2; i >= 0; i-- {
-		siftDownOrdered(mut data, i, hi, first)
+fn heapSortOrdered[E Ordered](data mut []E, a i64, b i64) {
+	let first = a
+	let lo = 0
+	let hi = b - a
+	{
+		mut i = (hi - 1) / 2
+		for i >= 0 {
+			siftDownOrdered(mut data, i, hi, first)
+			i -= 1
+		}
 	}
-	for i := hi - 1; i >= 0; i-- {
-		data[first], data[first+i] = data[first+i], data[first]
-		siftDownOrdered(mut data, lo, i, first)
+	{
+		mut i = hi - 1
+		for i >= 0 {
+			data[first], data[first+i] = data[first+i], data[first]
+			siftDownOrdered(mut data, lo, i, first)
+			i -= 1
+		}
 	}
 }
 
-func pdqsortOrdered[E Ordered](data mut []E, a i64, b i64, limit i64) {
-	const maxInsertion = 12
-	wasBalanced := true // whether the last partitioning was reasonably balanced
-	wasPartitioned := true // whether the slice was already partitioned
+const pdqsortOrderedMaxInsertion = 12
+
+fn pdqsortOrdered[E Ordered](data mut []E, a i64, b i64, limit_ i64) {
+	mut wasBalanced = true // whether the last partitioning was reasonably balanced
+	mut wasPartitioned = true // whether the slice was already partitioned
 	for {
-		length := b - a
-		if length <= maxInsertion {
+		let length = b - a
+		if length <= pdqsortOrderedMaxInsertion {
 			insertionSortOrdered(mut data, a, b)
 			return
 		}
 		// Fall back to heapsort if too many bad choices were made.
-		if limit == 0 {
+		if limit_ == 0 {
 			heapSortOrdered(mut data, a, b)
 			return
 		}
 		// If the last partitioning was imbalanced, we need to breakPatterns.
 		if !wasBalanced {
 			breakPatternsOrdered(mut data, a, b)
-			limit--
+			limit_ -= 1
 		}
-		pivot, hint := choosePivotOrdered(data, a, b)
+		mut (pivot, hint) = choosePivotOrdered(data, a, b)
 		if hint == hintDecreasing {
 			reverseRangeOrdered(mut data, a, b)
 			// The chosen pivot was pivot-a elements after the start of the array.
@@ -95,110 +108,116 @@ func pdqsortOrdered[E Ordered](data mut []E, a i64, b i64, limit i64) {
 		// Probably the slice contains many duplicate elements, partition the slice into
 		// elements equal to and elements greater than the pivot.
 		if a > 0 && !less(data[a-1], data[pivot]) {
-			mid := partitionEqualOrdered(mut data, a, b, pivot)
+			let mid = partitionEqualOrdered(mut data, a, b, pivot)
 			a = mid
 			continue
 		}
-		mid, alreadyPartitioned := partitionOrdered(mut data, a, b, pivot)
+		let (mid, alreadyPartitioned) = partitionOrdered(mut data, a, b, pivot)
 		wasPartitioned = alreadyPartitioned
-		leftLen := mid - a
-		rightLen := b - mid
-		balanceThreshold := length / 8
+		let leftLen = mid - a
+		let rightLen = b - mid
+		let balanceThreshold = length / 8
 		if leftLen < rightLen {
 			wasBalanced = leftLen >= balanceThreshold
-			pdqsortOrdered(mut data, a, mid, limit)
+			pdqsortOrdered(mut data, a, mid, limit_)
 			a = mid + 1
 		} else {
 			wasBalanced = rightLen >= balanceThreshold
-			pdqsortOrdered(mut data, mid+1, b, limit)
+			pdqsortOrdered(mut data, mid+1, b, limit_)
 			b = mid
 		}
 	}
 }
 
-func partitionOrdered[E Ordered](data mut []E, a i64, b i64, pivot i64) (i64, bool) {
+fn partitionOrdered[E Ordered](data mut []E, a i64, b i64, pivot i64) (i64, bool) {
 	data[a], data[pivot] = data[pivot], data[a]
-	i := a + 1
-	j := b - 1 // i and j are inclusive of the elements remaining to be partitioned
+	mut i = a + 1
+	mut j = b - 1 // i and j are inclusive of the elements remaining to be partitioned
 	for i <= j && less(data[i], data[a]) {
-		i++
+		i += 1
 	}
 	for i <= j && !less(data[j], data[a]) {
-		j--
+		j -= 1
 	}
 	if i > j {
 		data[j], data[a] = data[a], data[j]
 		return j, true
 	}
 	data[i], data[j] = data[j], data[i]
-	i++
-	j--
+	i += 1
+	j -= 1
 	for {
 		for i <= j && less(data[i], data[a]) {
-			i++
+			i += 1
 		}
 		for i <= j && !less(data[j], data[a]) {
-			j--
+			j -= 1
 		}
 		if i > j {
 			break
 		}
 		data[i], data[j] = data[j], data[i]
-		i++
-		j--
+		i += 1
+		j -= 1
 	}
 	data[j], data[a] = data[a], data[j]
 	return j, false
 }
 
-func partitionEqualOrdered[E Ordered](data mut []E, a i64, b i64, pivot i64) i64 {
+fn partitionEqualOrdered[E Ordered](data mut []E, a i64, b i64, pivot i64) i64 {
 	data[a], data[pivot] = data[pivot], data[a]
-	i := a + 1
-	j := b - 1 // i and j are inclusive of the elements remaining to be partitioned
+	mut i = a + 1
+	mut j = b - 1 // i and j are inclusive of the elements remaining to be partitioned
 	for {
 		for i <= j && !less(data[a], data[i]) {
-			i++
+			i += 1
 		}
 		for i <= j && less(data[a], data[j]) {
-			j--
+			j -= 1
 		}
 		if i > j {
 			break
 		}
 		data[i], data[j] = data[j], data[i]
-		i++
-		j--
+		i += 1
+		j -= 1
 	}
 	return i
 }
 
-func partialInsertionSortOrdered[E Ordered](data mut []E, a i64, b i64) bool {
-	const maxSteps = 5 // maximum number of adjacent out-of-order pairs that will get shifted
-	const shortestShifting = 50 // don't shift any elements on short arrays
-	i := a + 1
-	for j := 0; j < maxSteps; j++ {
+const partialInsertionSortOrderedMaxSteps = 5 // maximum number of adjacent out-of-order pairs that will get shifted
+
+const partialInsertionSortOrderedShortestShifting = 50 // don't shift any elements on short arrays
+
+fn partialInsertionSortOrdered[E Ordered](data mut []E, a i64, b i64) bool {
+	mut i = a + 1
+	for j in 0..partialInsertionSortOrderedMaxSteps {
 		for i < b && !less(data[i], data[i-1]) {
-			i++
+			i += 1
 		}
 		if i == b {
 			return true
 		}
-		if b-a < shortestShifting {
+		if b-a < partialInsertionSortOrderedShortestShifting {
 			return false
 		}
 		data[i], data[i-1] = data[i-1], data[i]
 		// Shift the smaller one to the left.
 		if i-a >= 2 {
-			for k := i - 1; k >= 1; k-- {
-				if !less(data[k], data[k-1]) {
-					break
+			{
+				mut k = i - 1
+				for k >= 1 {
+					if !less(data[k], data[k-1]) {
+						break
+					}
+					data[k], data[k-1] = data[k-1], data[k]
+					k -= 1
 				}
-				data[k], data[k-1] = data[k-1], data[k]
 			}
 		}
 		// Shift the greater one to the right.
 		if b-i >= 2 {
-			for k := i + 1; k < b; k++ {
+			for k in i + 1..b {
 				if !less(data[k], data[k-1]) {
 					break
 				}
@@ -209,36 +228,42 @@ func partialInsertionSortOrdered[E Ordered](data mut []E, a i64, b i64) bool {
 	return false
 }
 
-func breakPatternsOrdered[E Ordered](data mut []E, a i64, b i64) {
-	length := b - a
+fn breakPatternsOrdered[E Ordered](data mut []E, a i64, b i64) {
+	let length = b - a
 	if length >= 8 {
-		random := u64(length) // xorshift, seeded with the length: deterministic
-		modulus := u64(1) << u64(bitLen(length))
-		for idx := a + (length/4)*2 - 1; idx <= a+(length/4)*2+1; idx++ {
-			random ^= random << 13
-			random ^= random >> 7
-			random ^= random << 17
-			other := i64(random & (modulus - 1))
-			if other >= length {
-				other -= length
+		mut random = u64(length) // xorshift, seeded with the length: deterministic
+		let modulus = u64(1) << u64(bitLen(length))
+		{
+			mut idx = a + (length/4)*2 - 1
+			for idx <= a+(length/4)*2+1 {
+				random ^= random << 13
+				random ^= random >> 7
+				random ^= random << 17
+				mut other = i64(random & (modulus - 1))
+				if other >= length {
+					other -= length
+				}
+				data[idx], data[a+other] = data[a+other], data[idx]
+				idx += 1
 			}
-			data[idx], data[a+other] = data[a+other], data[idx]
 		}
 	}
 }
 
+const choosePivotOrderedShortestNinther = 50
+
+const choosePivotOrderedMaxSwaps = 4 * 3
+
 // choosePivot chooses a pivot in data[a:b] and reports whether the slice looks sorted, reverse
 // sorted or neither (a hint).
-func choosePivotOrdered[E Ordered](data []E, a i64, b i64) (i64, i64) {
-	const shortestNinther = 50
-	const maxSwaps = 4 * 3
-	l := b - a
-	swaps := swapCount{}
-	i := a + l/4*1
-	j := a + l/4*2
-	k := a + l/4*3
+fn choosePivotOrdered[E Ordered](data []E, a i64, b i64) (i64, i64) {
+	let l = b - a
+	let swaps = swapCount{}
+	mut i = a + l/4*1
+	mut j = a + l/4*2
+	mut k = a + l/4*3
 	if l >= 8 {
-		if l >= shortestNinther {
+		if l >= choosePivotOrderedShortestNinther {
 			// Tukey ninther method, the idea came from Rust's implementation.
 			i = medianAdjacentOrdered(data, i, mut swaps)
 			j = medianAdjacentOrdered(data, j, mut swaps)
@@ -250,23 +275,23 @@ func choosePivotOrdered[E Ordered](data []E, a i64, b i64) (i64, i64) {
 	if swaps.n == 0 {
 		return j, hintIncreasing
 	}
-	if swaps.n == maxSwaps {
+	if swaps.n == choosePivotOrderedMaxSwaps {
 		return j, hintDecreasing
 	}
 	return j, hintUnknown
 }
 
 // order2 returns x,y where data[x] <= data[y], where x,y=a,b or x,y=b,a.
-func order2Ordered[E Ordered](data []E, a i64, b i64, swaps mut swapCount) (i64, i64) {
+fn order2Ordered[E Ordered](data []E, a i64, b i64, swaps mut swapCount) (i64, i64) {
 	if less(data[b], data[a]) {
-		swaps.n++
+		swaps.n += 1
 		return b, a
 	}
 	return a, b
 }
 
 // median returns x where data[x] is the median of data[a],data[b],data[c], where x is a, b, or c.
-func medianOrdered[E Ordered](data []E, a i64, b i64, c i64, swaps mut swapCount) i64 {
+fn medianOrdered[E Ordered](data []E, a i64, b i64, c i64, swaps mut swapCount) i64 {
 	a, b = order2Ordered(data, a, b, mut swaps)
 	b, c = order2Ordered(data, b, c, mut swaps)
 	a, b = order2Ordered(data, a, b, mut swaps)
@@ -274,39 +299,43 @@ func medianOrdered[E Ordered](data []E, a i64, b i64, c i64, swaps mut swapCount
 }
 
 // medianAdjacent finds the median of data[a - 1], data[a], data[a + 1] and stores the index into a.
-func medianAdjacentOrdered[E Ordered](data []E, a i64, swaps mut swapCount) i64 {
+fn medianAdjacentOrdered[E Ordered](data []E, a i64, swaps mut swapCount) i64 {
 	return medianOrdered(data, a-1, a, a+1, mut swaps)
 }
 
-func reverseRangeOrdered[E Ordered](data mut []E, a i64, b i64) {
-	i := a
-	j := b - 1
+fn reverseRangeOrdered[E Ordered](data mut []E, a i64, b i64) {
+	mut i = a
+	mut j = b - 1
 	for i < j {
 		data[i], data[j] = data[j], data[i]
-		i++
-		j--
+		i += 1
+		j -= 1
 	}
 }
 
 // ---- comparison function ----
 
-func insertionSortCmpFunc[E constraints.Any](data mut []E, a i64, b i64, cmp func(E, E) i64) {
-	for i := a + 1; i < b; i++ {
-		for j := i; j > a && (cmp(data[j], data[j-1]) < 0); j-- {
-			data[j], data[j-1] = data[j-1], data[j]
+fn insertionSortCmpFunc[E constraints.Any](data mut []E, a i64, b i64, cmp fn(E, E) i64) {
+	for i in a + 1..b {
+		{
+			mut j = i
+			for j > a && (cmp(data[j], data[j-1]) < 0) {
+				data[j], data[j-1] = data[j-1], data[j]
+				j -= 1
+			}
 		}
 	}
 }
 
-func siftDownCmpFunc[E constraints.Any](data mut []E, lo i64, hi i64, first i64, cmp func(E, E) i64) {
-	root := lo
+fn siftDownCmpFunc[E constraints.Any](data mut []E, lo i64, hi i64, first i64, cmp fn(E, E) i64) {
+	mut root = lo
 	for {
-		child := 2*root + 1
+		mut child = 2*root + 1
 		if child >= hi {
 			break
 		}
 		if child+1 < hi && (cmp(data[first+child], data[first+child+1]) < 0) {
-			child++
+			child += 1
 		}
 		if !(cmp(data[first+root], data[first+child]) < 0) {
 			return
@@ -316,40 +345,49 @@ func siftDownCmpFunc[E constraints.Any](data mut []E, lo i64, hi i64, first i64,
 	}
 }
 
-func heapSortCmpFunc[E constraints.Any](data mut []E, a i64, b i64, cmp func(E, E) i64) {
-	first := a
-	lo := 0
-	hi := b - a
-	for i := (hi - 1) / 2; i >= 0; i-- {
-		siftDownCmpFunc(mut data, i, hi, first, cmp)
+fn heapSortCmpFunc[E constraints.Any](data mut []E, a i64, b i64, cmp fn(E, E) i64) {
+	let first = a
+	let lo = 0
+	let hi = b - a
+	{
+		mut i = (hi - 1) / 2
+		for i >= 0 {
+			siftDownCmpFunc(mut data, i, hi, first, cmp)
+			i -= 1
+		}
 	}
-	for i := hi - 1; i >= 0; i-- {
-		data[first], data[first+i] = data[first+i], data[first]
-		siftDownCmpFunc(mut data, lo, i, first, cmp)
+	{
+		mut i = hi - 1
+		for i >= 0 {
+			data[first], data[first+i] = data[first+i], data[first]
+			siftDownCmpFunc(mut data, lo, i, first, cmp)
+			i -= 1
+		}
 	}
 }
 
-func pdqsortCmpFunc[E constraints.Any](data mut []E, a i64, b i64, limit i64, cmp func(E, E) i64) {
-	const maxInsertion = 12
-	wasBalanced := true // whether the last partitioning was reasonably balanced
-	wasPartitioned := true // whether the slice was already partitioned
+const pdqsortCmpFuncMaxInsertion = 12
+
+fn pdqsortCmpFunc[E constraints.Any](data mut []E, a i64, b i64, limit_ i64, cmp fn(E, E) i64) {
+	mut wasBalanced = true // whether the last partitioning was reasonably balanced
+	mut wasPartitioned = true // whether the slice was already partitioned
 	for {
-		length := b - a
-		if length <= maxInsertion {
+		let length = b - a
+		if length <= pdqsortCmpFuncMaxInsertion {
 			insertionSortCmpFunc(mut data, a, b, cmp)
 			return
 		}
 		// Fall back to heapsort if too many bad choices were made.
-		if limit == 0 {
+		if limit_ == 0 {
 			heapSortCmpFunc(mut data, a, b, cmp)
 			return
 		}
 		// If the last partitioning was imbalanced, we need to breakPatterns.
 		if !wasBalanced {
 			breakPatternsCmpFunc(mut data, a, b, cmp)
-			limit--
+			limit_ -= 1
 		}
-		pivot, hint := choosePivotCmpFunc(data, a, b, cmp)
+		mut (pivot, hint) = choosePivotCmpFunc(data, a, b, cmp)
 		if hint == hintDecreasing {
 			reverseRangeCmpFunc(mut data, a, b, cmp)
 			// The chosen pivot was pivot-a elements after the start of the array.
@@ -366,110 +404,116 @@ func pdqsortCmpFunc[E constraints.Any](data mut []E, a i64, b i64, limit i64, cm
 		// Probably the slice contains many duplicate elements, partition the slice into
 		// elements equal to and elements greater than the pivot.
 		if a > 0 && !(cmp(data[a-1], data[pivot]) < 0) {
-			mid := partitionEqualCmpFunc(mut data, a, b, pivot, cmp)
+			let mid = partitionEqualCmpFunc(mut data, a, b, pivot, cmp)
 			a = mid
 			continue
 		}
-		mid, alreadyPartitioned := partitionCmpFunc(mut data, a, b, pivot, cmp)
+		let (mid, alreadyPartitioned) = partitionCmpFunc(mut data, a, b, pivot, cmp)
 		wasPartitioned = alreadyPartitioned
-		leftLen := mid - a
-		rightLen := b - mid
-		balanceThreshold := length / 8
+		let leftLen = mid - a
+		let rightLen = b - mid
+		let balanceThreshold = length / 8
 		if leftLen < rightLen {
 			wasBalanced = leftLen >= balanceThreshold
-			pdqsortCmpFunc(mut data, a, mid, limit, cmp)
+			pdqsortCmpFunc(mut data, a, mid, limit_, cmp)
 			a = mid + 1
 		} else {
 			wasBalanced = rightLen >= balanceThreshold
-			pdqsortCmpFunc(mut data, mid+1, b, limit, cmp)
+			pdqsortCmpFunc(mut data, mid+1, b, limit_, cmp)
 			b = mid
 		}
 	}
 }
 
-func partitionCmpFunc[E constraints.Any](data mut []E, a i64, b i64, pivot i64, cmp func(E, E) i64) (i64, bool) {
+fn partitionCmpFunc[E constraints.Any](data mut []E, a i64, b i64, pivot i64, cmp fn(E, E) i64) (i64, bool) {
 	data[a], data[pivot] = data[pivot], data[a]
-	i := a + 1
-	j := b - 1 // i and j are inclusive of the elements remaining to be partitioned
+	mut i = a + 1
+	mut j = b - 1 // i and j are inclusive of the elements remaining to be partitioned
 	for i <= j && (cmp(data[i], data[a]) < 0) {
-		i++
+		i += 1
 	}
 	for i <= j && !(cmp(data[j], data[a]) < 0) {
-		j--
+		j -= 1
 	}
 	if i > j {
 		data[j], data[a] = data[a], data[j]
 		return j, true
 	}
 	data[i], data[j] = data[j], data[i]
-	i++
-	j--
+	i += 1
+	j -= 1
 	for {
 		for i <= j && (cmp(data[i], data[a]) < 0) {
-			i++
+			i += 1
 		}
 		for i <= j && !(cmp(data[j], data[a]) < 0) {
-			j--
+			j -= 1
 		}
 		if i > j {
 			break
 		}
 		data[i], data[j] = data[j], data[i]
-		i++
-		j--
+		i += 1
+		j -= 1
 	}
 	data[j], data[a] = data[a], data[j]
 	return j, false
 }
 
-func partitionEqualCmpFunc[E constraints.Any](data mut []E, a i64, b i64, pivot i64, cmp func(E, E) i64) i64 {
+fn partitionEqualCmpFunc[E constraints.Any](data mut []E, a i64, b i64, pivot i64, cmp fn(E, E) i64) i64 {
 	data[a], data[pivot] = data[pivot], data[a]
-	i := a + 1
-	j := b - 1 // i and j are inclusive of the elements remaining to be partitioned
+	mut i = a + 1
+	mut j = b - 1 // i and j are inclusive of the elements remaining to be partitioned
 	for {
 		for i <= j && !(cmp(data[a], data[i]) < 0) {
-			i++
+			i += 1
 		}
 		for i <= j && (cmp(data[a], data[j]) < 0) {
-			j--
+			j -= 1
 		}
 		if i > j {
 			break
 		}
 		data[i], data[j] = data[j], data[i]
-		i++
-		j--
+		i += 1
+		j -= 1
 	}
 	return i
 }
 
-func partialInsertionSortCmpFunc[E constraints.Any](data mut []E, a i64, b i64, cmp func(E, E) i64) bool {
-	const maxSteps = 5 // maximum number of adjacent out-of-order pairs that will get shifted
-	const shortestShifting = 50 // don't shift any elements on short arrays
-	i := a + 1
-	for j := 0; j < maxSteps; j++ {
+const partialInsertionSortCmpFuncMaxSteps = 5 // maximum number of adjacent out-of-order pairs that will get shifted
+
+const partialInsertionSortCmpFuncShortestShifting = 50 // don't shift any elements on short arrays
+
+fn partialInsertionSortCmpFunc[E constraints.Any](data mut []E, a i64, b i64, cmp fn(E, E) i64) bool {
+	mut i = a + 1
+	for j in 0..partialInsertionSortCmpFuncMaxSteps {
 		for i < b && !(cmp(data[i], data[i-1]) < 0) {
-			i++
+			i += 1
 		}
 		if i == b {
 			return true
 		}
-		if b-a < shortestShifting {
+		if b-a < partialInsertionSortCmpFuncShortestShifting {
 			return false
 		}
 		data[i], data[i-1] = data[i-1], data[i]
 		// Shift the smaller one to the left.
 		if i-a >= 2 {
-			for k := i - 1; k >= 1; k-- {
-				if !(cmp(data[k], data[k-1]) < 0) {
-					break
+			{
+				mut k = i - 1
+				for k >= 1 {
+					if !(cmp(data[k], data[k-1]) < 0) {
+						break
+					}
+					data[k], data[k-1] = data[k-1], data[k]
+					k -= 1
 				}
-				data[k], data[k-1] = data[k-1], data[k]
 			}
 		}
 		// Shift the greater one to the right.
 		if b-i >= 2 {
-			for k := i + 1; k < b; k++ {
+			for k in i + 1..b {
 				if !(cmp(data[k], data[k-1]) < 0) {
 					break
 				}
@@ -480,36 +524,42 @@ func partialInsertionSortCmpFunc[E constraints.Any](data mut []E, a i64, b i64, 
 	return false
 }
 
-func breakPatternsCmpFunc[E constraints.Any](data mut []E, a i64, b i64, cmp func(E, E) i64) {
-	length := b - a
+fn breakPatternsCmpFunc[E constraints.Any](data mut []E, a i64, b i64, cmp fn(E, E) i64) {
+	let length = b - a
 	if length >= 8 {
-		random := u64(length) // xorshift, seeded with the length: deterministic
-		modulus := u64(1) << u64(bitLen(length))
-		for idx := a + (length/4)*2 - 1; idx <= a+(length/4)*2+1; idx++ {
-			random ^= random << 13
-			random ^= random >> 7
-			random ^= random << 17
-			other := i64(random & (modulus - 1))
-			if other >= length {
-				other -= length
+		mut random = u64(length) // xorshift, seeded with the length: deterministic
+		let modulus = u64(1) << u64(bitLen(length))
+		{
+			mut idx = a + (length/4)*2 - 1
+			for idx <= a+(length/4)*2+1 {
+				random ^= random << 13
+				random ^= random >> 7
+				random ^= random << 17
+				mut other = i64(random & (modulus - 1))
+				if other >= length {
+					other -= length
+				}
+				data[idx], data[a+other] = data[a+other], data[idx]
+				idx += 1
 			}
-			data[idx], data[a+other] = data[a+other], data[idx]
 		}
 	}
 }
 
+const choosePivotCmpFuncShortestNinther = 50
+
+const choosePivotCmpFuncMaxSwaps = 4 * 3
+
 // choosePivot chooses a pivot in data[a:b] and reports whether the slice looks sorted, reverse
 // sorted or neither (a hint).
-func choosePivotCmpFunc[E constraints.Any](data []E, a i64, b i64, cmp func(E, E) i64) (i64, i64) {
-	const shortestNinther = 50
-	const maxSwaps = 4 * 3
-	l := b - a
-	swaps := swapCount{}
-	i := a + l/4*1
-	j := a + l/4*2
-	k := a + l/4*3
+fn choosePivotCmpFunc[E constraints.Any](data []E, a i64, b i64, cmp fn(E, E) i64) (i64, i64) {
+	let l = b - a
+	let swaps = swapCount{}
+	mut i = a + l/4*1
+	mut j = a + l/4*2
+	mut k = a + l/4*3
 	if l >= 8 {
-		if l >= shortestNinther {
+		if l >= choosePivotCmpFuncShortestNinther {
 			// Tukey ninther method, the idea came from Rust's implementation.
 			i = medianAdjacentCmpFunc(data, i, mut swaps, cmp)
 			j = medianAdjacentCmpFunc(data, j, mut swaps, cmp)
@@ -521,23 +571,23 @@ func choosePivotCmpFunc[E constraints.Any](data []E, a i64, b i64, cmp func(E, E
 	if swaps.n == 0 {
 		return j, hintIncreasing
 	}
-	if swaps.n == maxSwaps {
+	if swaps.n == choosePivotCmpFuncMaxSwaps {
 		return j, hintDecreasing
 	}
 	return j, hintUnknown
 }
 
 // order2 returns x,y where data[x] <= data[y], where x,y=a,b or x,y=b,a.
-func order2CmpFunc[E constraints.Any](data []E, a i64, b i64, swaps mut swapCount, cmp func(E, E) i64) (i64, i64) {
+fn order2CmpFunc[E constraints.Any](data []E, a i64, b i64, swaps mut swapCount, cmp fn(E, E) i64) (i64, i64) {
 	if (cmp(data[b], data[a]) < 0) {
-		swaps.n++
+		swaps.n += 1
 		return b, a
 	}
 	return a, b
 }
 
 // median returns x where data[x] is the median of data[a],data[b],data[c], where x is a, b, or c.
-func medianCmpFunc[E constraints.Any](data []E, a i64, b i64, c i64, swaps mut swapCount, cmp func(E, E) i64) i64 {
+fn medianCmpFunc[E constraints.Any](data []E, a i64, b i64, c i64, swaps mut swapCount, cmp fn(E, E) i64) i64 {
 	a, b = order2CmpFunc(data, a, b, mut swaps, cmp)
 	b, c = order2CmpFunc(data, b, c, mut swaps, cmp)
 	a, b = order2CmpFunc(data, a, b, mut swaps, cmp)
@@ -545,17 +595,17 @@ func medianCmpFunc[E constraints.Any](data []E, a i64, b i64, c i64, swaps mut s
 }
 
 // medianAdjacent finds the median of data[a - 1], data[a], data[a + 1] and stores the index into a.
-func medianAdjacentCmpFunc[E constraints.Any](data []E, a i64, swaps mut swapCount, cmp func(E, E) i64) i64 {
+fn medianAdjacentCmpFunc[E constraints.Any](data []E, a i64, swaps mut swapCount, cmp fn(E, E) i64) i64 {
 	return medianCmpFunc(data, a-1, a, a+1, mut swaps, cmp)
 }
 
-func reverseRangeCmpFunc[E constraints.Any](data mut []E, a i64, b i64, cmp func(E, E) i64) {
-	i := a
-	j := b - 1
+fn reverseRangeCmpFunc[E constraints.Any](data mut []E, a i64, b i64, cmp fn(E, E) i64) {
+	mut i = a
+	mut j = b - 1
 	for i < j {
 		data[i], data[j] = data[j], data[i]
-		i++
-		j--
+		i += 1
+		j -= 1
 	}
 }
 
@@ -563,10 +613,10 @@ func reverseRangeCmpFunc[E constraints.Any](data mut []E, a i64, b i64, cmp func
 
 // stableCmpFunc sorts data[0:n] stably: insertion sort on blocks of 20, then merges of
 // doubling blocks (SymMerge, which needs no scratch memory).
-func stableCmpFunc[E constraints.Any](data mut []E, n i64, cmp func(E, E) i64) {
-	blockSize := 20 // must be > 0
-	a := 0
-	b := blockSize
+fn stableCmpFunc[E constraints.Any](data mut []E, n i64, cmp fn(E, E) i64) {
+	mut blockSize = 20 // must be > 0
+	mut a = 0
+	mut b = blockSize
 	for b <= n {
 		insertionSortCmpFunc(mut data, a, b, cmp)
 		a = b
@@ -581,7 +631,7 @@ func stableCmpFunc[E constraints.Any](data mut []E, n i64, cmp func(E, E) i64) {
 			a = b
 			b += 2 * blockSize
 		}
-		m := a + blockSize
+		let m = a + blockSize
 		if m < n {
 			symMergeCmpFunc(mut data, a, m, n, cmp)
 		}
@@ -591,15 +641,15 @@ func stableCmpFunc[E constraints.Any](data mut []E, n i64, cmp func(E, E) i64) {
 
 // symMergeCmpFunc merges the sorted runs data[a:m] and data[m:b] in place, stably, using
 // rotations (Kim and Kutzner, "Stable Minimum Storage Merging by Symmetric Comparisons").
-func symMergeCmpFunc[E constraints.Any](data mut []E, a i64, m i64, b i64, cmp func(E, E) i64) {
+fn symMergeCmpFunc[E constraints.Any](data mut []E, a i64, m i64, b i64, cmp fn(E, E) i64) {
 	// Avoid unnecessary recursions of symMerge by direct insertion of data[a] into data[m:b]
 	// if data[a:m] only contains one element.
 	if m-a == 1 {
 		// Use binary search to find the lowest index i such that data[i] >= data[a] for m <= i < b.
-		i := m
-		j := b
+		mut i = m
+		mut j = b
 		for i < j {
-			h := (i + j) >> 1
+			let h = (i + j) >> 1
 			if cmp(data[h], data[a]) < 0 {
 				i = h + 1
 			} else {
@@ -607,7 +657,7 @@ func symMergeCmpFunc[E constraints.Any](data mut []E, a i64, m i64, b i64, cmp f
 			}
 		}
 		// Swap values until data[a] reaches the position before i.
-		for k := a; k < i-1; k++ {
+		for k in a..i-1 {
 			data[k], data[k+1] = data[k+1], data[k]
 		}
 		return
@@ -616,10 +666,10 @@ func symMergeCmpFunc[E constraints.Any](data mut []E, a i64, m i64, b i64, cmp f
 	// if data[m:b] only contains one element.
 	if b-m == 1 {
 		// Use binary search to find the lowest index i such that data[i] > data[m] for a <= i < m.
-		i := a
-		j := m
+		mut i = a
+		mut j = m
 		for i < j {
-			h := (i + j) >> 1
+			let h = (i + j) >> 1
 			if !(cmp(data[m], data[h]) < 0) {
 				i = h + 1
 			} else {
@@ -627,15 +677,19 @@ func symMergeCmpFunc[E constraints.Any](data mut []E, a i64, m i64, b i64, cmp f
 			}
 		}
 		// Swap values until data[m] reaches the position i.
-		for k := m; k > i; k-- {
-			data[k], data[k-1] = data[k-1], data[k]
+		{
+			mut k = m
+			for k > i {
+				data[k], data[k-1] = data[k-1], data[k]
+				k -= 1
+			}
 		}
 		return
 	}
-	mid := (a + b) >> 1
-	n := mid + m
-	var start i64
-	var r i64
+	let mid = (a + b) >> 1
+	let n = mid + m
+	mut start i64
+	mut r i64
 	if m > mid {
 		start = n - b
 		r = mid
@@ -643,16 +697,16 @@ func symMergeCmpFunc[E constraints.Any](data mut []E, a i64, m i64, b i64, cmp f
 		start = a
 		r = m
 	}
-	p := n - 1
+	let p = n - 1
 	for start < r {
-		c := (start + r) >> 1
+		let c = (start + r) >> 1
 		if !(cmp(data[p-c], data[c]) < 0) {
 			start = c + 1
 		} else {
 			r = c
 		}
 	}
-	end := n - start
+	let end = n - start
 	if start < m && m < end {
 		rotateRange(mut data, start, m, end)
 	}
@@ -665,9 +719,9 @@ func symMergeCmpFunc[E constraints.Any](data mut []E, a i64, m i64, b i64, cmp f
 }
 
 // rotateRange rotates the two consecutive blocks data[a:m] and data[m:b] by swapping.
-func rotateRange[E constraints.Any](data mut []E, a i64, m i64, b i64) {
-	i := m - a
-	j := b - m
+fn rotateRange[E constraints.Any](data mut []E, a i64, m i64, b i64) {
+	mut i = m - a
+	mut j = b - m
 	for i != j {
 		if i > j {
 			swapRange(mut data, m-i, m, j)
@@ -681,8 +735,8 @@ func rotateRange[E constraints.Any](data mut []E, a i64, m i64, b i64) {
 	swapRange(mut data, m-i, m, i)
 }
 
-func swapRange[E constraints.Any](data mut []E, a i64, b i64, n i64) {
-	for i := 0; i < n; i++ {
+fn swapRange[E constraints.Any](data mut []E, a i64, b i64, n i64) {
+	for i in 0..n {
 		data[a+i], data[b+i] = data[b+i], data[a+i]
 	}
 }

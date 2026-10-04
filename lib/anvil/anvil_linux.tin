@@ -12,29 +12,29 @@ const epRdHup = 0x2000
 const epEt = 0x80000000
 const ownListener = true
 
-func ev_init() {
+fn ev_init() {
 	kq = c32(rt_sys_epoll_create1(0x80000))
 }
 
-func ev_level(fd i64) {
+fn ev_level(fd i64) {
 	ep_set(1, fd, epIn)
 }
 
-func ev_conn(fd i64) {
+fn ev_conn(fd i64) {
 	ep_set(1, fd, epIn|epRdHup|epEt)
 }
 
-func ev_conn_write(fd i64) {
+fn ev_conn_write(fd i64) {
 	ep_set(3, fd, epOut|epEt)
 }
 
-func ev_conn_read(fd i64) {
+fn ev_conn_read(fd i64) {
 	ep_set(3, fd, epIn|epRdHup|epEt)
 }
 
-func ev_timer(ms i64) i64 {
-	tfd := c32(rt_sys_timerfd_create(1, 0x800|0x80000))
-	its := calloc(4, 8)
+fn ev_timer(ms i64) i64 {
+	let tfd = c32(rt_sys_timerfd_create(1, 0x800|0x80000))
+	let its = calloc(4, 8)
 	its[0] = ms / 1000
 	its[1] = (ms % 1000) * 1000000
 	its[2] = its[0]
@@ -46,19 +46,19 @@ func ev_timer(ms i64) i64 {
 }
 
 // ev_timer_ack reads the timerfd's expiry count so it stops being readable.
-func ev_timer_ack(fd i64) {
+fn ev_timer_ack(fd i64) {
 	rt_sys_read(fd, word+96, 8)
 }
 
 // ev_drain_timer is a second periodic timer (the shutdown deadline check): another timerfd.
-func ev_drain_timer(ms i64) i64 {
+fn ev_drain_timer(ms i64) i64 {
 	return ev_timer(ms)
 }
 
-var sigfd i64   // core 0: the signalfd delivering the blocked SIGTERM/SIGINT (-1 when absent)
+mut sigfd i64   // core 0: the signalfd delivering the blocked SIGTERM/SIGINT (-1 when absent)
 
 // ev_signals adds a signalfd for SIGTERM and SIGINT (blocked in every thread) to the loop.
-func ev_signals() {
+fn ev_signals() {
 	sigfd = rt_signalfd()
 	if sigfd >= 0 {
 		rtWatchGrace = gGrace*1000000000
@@ -68,34 +68,34 @@ func ev_signals() {
 }
 
 // ev_signal reports whether event i is the signalfd turning readable.
-func ev_signal(i i64) bool {
+fn ev_signal(i i64) bool {
 	return sigfd > 0 && ev_fd(i) == sigfd
 }
 
 // ev_signal_ack reads the 128-byte signalfd_siginfo so the signalfd stops being readable.
-func ev_signal_ack() {
+fn ev_signal_ack() {
 	rt_sys_read(sigfd, word+128, 128)
 }
 
 // ev_wait waits for events, at most ms milliseconds (-1: no limit).
-func ev_wait(ms i64) i64 {
+fn ev_wait(ms i64) i64 {
 	return c32(rt_sys_epoll_wait(kq, evs, maxEvents, ms))
 }
 
 // ev_hangup reports that the peer closed or reset (it may arrive with the last data).
-func ev_hangup(i i64) bool {
-	m := __ld(evs+i*evSize, 2) & 0xffffffff
+fn ev_hangup(i i64) bool {
+	let m = __ld(evs+i*evSize, 2) & 0xffffffff
 	return m&(epErr|epHup|epRdHup) != 0
 }
 
-func ev_writable(i i64) bool {
-	m := __ld(evs+i*evSize, 2) & 0xffffffff
+fn ev_writable(i i64) bool {
+	let m = __ld(evs+i*evSize, 2) & 0xffffffff
 	return m&epOut != 0 && m&(epIn|epErr|epHup|epRdHup) == 0
 }
 
 // ev_task_add watches fd once for a waiting request task: want 1 readable, 2 writable.
-func ev_task_add(fd i64, want i64) {
-	ev := epIn | epRdHup
+fn ev_task_add(fd i64, want i64) {
+	mut ev = epIn | epRdHup
 	if want == 2 {
 		ev = epOut
 	}
@@ -103,6 +103,6 @@ func ev_task_add(fd i64, want i64) {
 }
 
 // ev_task_del stops watching fd for a task.
-func ev_task_del(fd i64) {
+fn ev_task_del(fd i64) {
 	ep_set(2, fd, 0)
 }

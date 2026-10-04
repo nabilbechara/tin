@@ -22,9 +22,9 @@ def carry(lines):
     first = True
     for i in list(range(10)) + [0]:
         w = 26 if i % 2 == 0 else 25
-        decl = ':=' if first else '='
+        decl = 'mut c =' if first else 'c ='
         first = False
-        lines.append(f'\tc {decl} (h{i} + (1 << {w - 1})) >> {w}')
+        lines.append(f'\t{decl} (h{i} + (1 << {w - 1})) >> {w}')
         if i == 9:
             lines.append('\th0 += 19 * c')
         else:
@@ -41,14 +41,14 @@ def scaled(name, k, pre, lines):
     key = f'{name}_{k}'
     if key not in pre:
         pre.add(key)
-        lines.append(f'\t{key} := {k} * {name}')
+        lines.append(f'\tlet {key} = {k} * {name}')
     return key
 
 
 def mul():
     lines = ['// fe_mul sets h = f*g; h may alias f or g. Limbs of f and g up to 2^27 in magnitude.',
-             'func fe_mul(h mut []i64, f []i64, g []i64) {']
-    lines += [f'\tf{i} := f[{i}]' for i in range(10)] + [f'\tg{i} := g[{i}]' for i in range(10)]
+             'fn fe_mul(h mut []i64, f []i64, g []i64) {']
+    lines += [f'\tlet f{i} = f[{i}]' for i in range(10)] + [f'\tlet g{i} = g[{i}]' for i in range(10)]
     pre = set()
     body = []
     for k in range(10):
@@ -58,7 +58,7 @@ def mul():
             a = scaled(f'f{i}', 2 if (i % 2 and j % 2) else 1, pre, lines)
             b = scaled(f'g{j}', 19 if i + j >= 10 else 1, pre, lines)
             terms.append(f'{a}*{b}')
-        body.append(f'\th{k} := ' + ' + '.join(terms))
+        body.append(f'\tmut h{k} = ' + ' + '.join(terms))
     lines += body
     carry(lines)
     lines.append('}')
@@ -67,8 +67,8 @@ def mul():
 
 def sq():
     lines = ['// fe_sq sets h = f*f (each cross product once, doubled); h may alias f.',
-             'func fe_sq(h mut []i64, f []i64) {']
-    lines += [f'\tf{i} := f[{i}]' for i in range(10)]
+             'fn fe_sq(h mut []i64, f []i64) {']
+    lines += [f'\tlet f{i} = f[{i}]' for i in range(10)]
     pre = set()
     body = []
     for k in range(10):
@@ -86,7 +86,7 @@ def sq():
             a = scaled(f'f{i}', a_k, pre, lines)
             b = scaled(f'f{j}', b_k, pre, lines)
             terms.append(f'{a}*{b}')
-        body.append(f'\th{k} := ' + ' + '.join(terms))
+        body.append(f'\tmut h{k} = ' + ' + '.join(terms))
     lines += body
     carry(lines)
     lines.append('}')

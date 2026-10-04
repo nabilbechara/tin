@@ -3,38 +3,36 @@ package seal
 // A strict DER reader for keys and certificates: definite minimal lengths, one-byte tags, minimal integers.
 
 // DER tags used by keys and certificates.
-const (
-	derBoolean = 0x01
-	derInteger = 0x02
-	derBitString = 0x03
-	derOctetString = 0x04
-	derNull = 0x05
-	derOID = 0x06
-	derUTF8String = 0x0c
-	derPrintableString = 0x13
-	derT61String = 0x14
-	derIA5String = 0x16
-	derUTCTime = 0x17
-	derGeneralizedTime = 0x18
-	derUniversalString = 0x1c
-	derBMPString = 0x1e
-	derSequence = 0x30
-	derSet = 0x31
-)
+const derBoolean = 0x01
+const derInteger = 0x02
+const derBitString = 0x03
+const derOctetString = 0x04
+const derNull = 0x05
+const derOID = 0x06
+const derUTF8String = 0x0c
+const derPrintableString = 0x13
+const derT61String = 0x14
+const derIA5String = 0x16
+const derUTCTime = 0x17
+const derGeneralizedTime = 0x18
+const derUniversalString = 0x1c
+const derBMPString = 0x1e
+const derSequence = 0x30
+const derSet = 0x31
 
 // der_read reads the element at b[at:end]: its tag, where its contents start and end.
-func der_read(b []u8, at i64, end i64) !(i64, i64, i64) {
+fn der_read(b []u8, at i64, end i64) !(i64, i64, i64) {
 	if end > len(b) || at+2 > end {
 		fail "seal: truncated DER"
 	}
-	tag := i64(b[at])
+	let tag = i64(b[at])
 	if tag&0x1f == 0x1f {
 		fail "seal: DER tag numbers above 30 are not supported"
 	}
-	n := i64(b[at+1])
+	mut n = i64(b[at+1])
 	at += 2
 	if n >= 0x80 {
-		k := n - 0x80
+		let k = n - 0x80
 		if k < 1 || k > 4 {
 			fail "seal: bad DER length"
 		}
@@ -45,7 +43,7 @@ func der_read(b []u8, at i64, end i64) !(i64, i64, i64) {
 			fail "seal: DER length is not minimal"
 		}
 		n = 0
-		for i := 0; i < k; i++ {
+		for i in 0..k {
 			n = n<<8 | i64(b[at+i])
 		}
 		if n < 0x80 {
@@ -60,8 +58,8 @@ func der_read(b []u8, at i64, end i64) !(i64, i64, i64) {
 }
 
 // der_expect reads the element at b[at:end] and fails unless its tag is want.
-func der_expect(b []u8, at i64, end i64, want i64, what str) !(i64, i64) {
-	tag, from, to := try der_read(b, at, end)
+fn der_expect(b []u8, at i64, end i64, want i64, what str) !(i64, i64) {
+	let (tag, from, to) = try der_read(b, at, end)
 	if tag != want {
 		fail "seal: malformed DER: expected " + what
 	}
@@ -69,8 +67,8 @@ func der_expect(b []u8, at i64, end i64, want i64, what str) !(i64, i64) {
 }
 
 // der_posint reads a non-negative minimal DER INTEGER at b[at:end] and returns its magnitude without leading zeros.
-func der_posint(b []u8, at i64, end i64) !([]u8, i64) {
-	from, to := try der_expect(b, at, end, derInteger, "an integer")
+fn der_posint(b []u8, at i64, end i64) !([]u8, i64) {
+	mut (from, to) = try der_expect(b, at, end, derInteger, "an integer")
 	if from == to {
 		fail "seal: empty DER integer"
 	}
@@ -81,33 +79,33 @@ func der_posint(b []u8, at i64, end i64) !([]u8, i64) {
 		fail "seal: DER integer is not minimal"
 	}
 	if b[from] == 0 && to-from > 1 {
-		from++
+		from += 1
 	}
 	return b[from:to], to
 }
 
 // der_small_int reads a DER INTEGER that fits in 62 bits; negative values are allowed.
-func der_small_int(b []u8, at i64, end i64) !(i64, i64) {
-	from, to := try der_expect(b, at, end, derInteger, "an integer")
+fn der_small_int(b []u8, at i64, end i64) !(i64, i64) {
+	let (from, to) = try der_expect(b, at, end, derInteger, "an integer")
 	if from == to || to-from > 7 {
 		fail "seal: DER integer out of range"
 	}
 	if to-from > 1 && ((b[from] == 0 && b[from+1]&0x80 == 0) || (b[from] == 0xff && b[from+1]&0x80 != 0)) {
 		fail "seal: DER integer is not minimal"
 	}
-	v := 0
+	mut v = 0
 	if b[from]&0x80 != 0 {
 		v = -1
 	}
-	for i := from; i < to; i++ {
+	for i in from..to {
 		v = v<<8 | i64(b[i])
 	}
 	return v, to
 }
 
 // der_bits reads a BIT STRING with no unused bits and returns its bytes.
-func der_bits(b []u8, at i64, end i64) !([]u8, i64) {
-	from, to := try der_expect(b, at, end, derBitString, "a bit string")
+fn der_bits(b []u8, at i64, end i64) !([]u8, i64) {
+	let (from, to) = try der_expect(b, at, end, derBitString, "a bit string")
 	if from == to || b[from] != 0 {
 		fail "seal: malformed DER bit string"
 	}
@@ -115,14 +113,14 @@ func der_bits(b []u8, at i64, end i64) !([]u8, i64) {
 }
 
 // der_oid_text formats the OID contents b[from:to] as dotted decimal ("1.2.840.113549.1.1.11").
-func der_oid_text(b []u8, from i64, to i64) !str {
+fn der_oid_text(b []u8, from i64, to i64) !str {
 	if from == to || b[to-1]&0x80 != 0 {
 		fail "seal: malformed DER object identifier"
 	}
-	out := []u8{}
-	v := 0
-	first := true
-	for i := from; i < to; i++ {
+	mut out = []u8{}
+	mut v = 0
+	mut first = true
+	for i in from..to {
 		if v == 0 && b[i] == 0x80 {
 			fail "seal: DER object identifier is not minimal"
 		}
@@ -134,7 +132,7 @@ func der_oid_text(b []u8, from i64, to i64) !str {
 			continue
 		}
 		if first {
-			a := 2
+			mut a = 2
 			if v < 40 {
 				a = 0
 			} else if v < 80 {
@@ -153,7 +151,7 @@ func der_oid_text(b []u8, from i64, to i64) !str {
 	return str(out)
 }
 
-func der_append_dec(out []u8, v i64) []u8 {
+fn der_append_dec(out []u8, v i64) []u8 {
 	if v >= 10 {
 		out = der_append_dec(out, v/10)
 	}
@@ -161,39 +159,39 @@ func der_append_dec(out []u8, v i64) []u8 {
 }
 
 // der_oid reads an OBJECT IDENTIFIER at b[at:end] as dotted decimal text.
-func der_oid(b []u8, at i64, end i64) !(str, i64) {
-	from, to := try der_expect(b, at, end, derOID, "an object identifier")
-	s := try der_oid_text(b, from, to)
+fn der_oid(b []u8, at i64, end i64) !(str, i64) {
+	let (from, to) = try der_expect(b, at, end, derOID, "an object identifier")
+	let s = try der_oid_text(b, from, to)
 	return s, to
 }
 
 // ParseRSAPublicKeyDER reads a DER RSAPublicKey (PKCS #1) or SubjectPublicKeyInfo holding one.
-func ParseRSAPublicKeyDER(der []u8) !RSAPublicKey {
-	from, to := try der_expect(der, 0, len(der), derSequence, "a public key")
+fn ParseRSAPublicKeyDER(der []u8) !RSAPublicKey {
+	let (from, to) = try der_expect(der, 0, len(der), derSequence, "a public key")
 	if to != len(der) {
 		fail "seal: trailing data after the RSA public key"
 	}
-	tag, _, _ := try der_read(der, from, to)
+	let (tag, _, _) = try der_read(der, from, to)
 	if tag == derSequence {
-		algFrom, algTo := try der_expect(der, from, to, derSequence, "an algorithm identifier")
-		oid, after := try der_oid(der, algFrom, algTo)
+		let (algFrom, algTo) = try der_expect(der, from, to, derSequence, "an algorithm identifier")
+		let (oid, after) = try der_oid(der, algFrom, algTo)
 		if oid != oidRSA {
 			fail "seal: not an RSA public key (algorithm " + oid + ")"
 		}
 		if after != algTo {
-			nf, nt := try der_expect(der, after, algTo, derNull, "NULL parameters")
+			let (nf, nt) = try der_expect(der, after, algTo, derNull, "NULL parameters")
 			if nf != nt || nt != algTo {
 				fail "seal: bad RSA algorithm parameters"
 			}
 		}
-		bits, end := try der_bits(der, algTo, to)
+		let (bits, end) = try der_bits(der, algTo, to)
 		if end != to {
 			fail "seal: trailing data after the RSA public key"
 		}
 		return try ParseRSAPublicKeyDER(bits)
 	}
-	n, next := try der_posint(der, from, to)
-	e, last := try der_posint(der, next, to)
+	let (n, next) = try der_posint(der, from, to)
+	let (e, last) = try der_posint(der, next, to)
 	if last != to {
 		fail "seal: trailing data in the RSA public key"
 	}

@@ -98,6 +98,28 @@ func TestDouble(t mut crucible.T) {
 '''
 
 
+# The same package and tests in edition 1 (#226): fn declarations, found and run alike.
+LIB_ED1 = '''package geo
+
+// Area is the area of a w by h rectangle.
+fn Area(w i64, h i64) i64 {
+	return w * h
+}
+'''
+
+TESTS_ED1 = '''package geo
+
+import "crucible"
+
+fn TestArea(t mut crucible.T) {
+	crucible.Equal(mut t, "2x3", Area(2, 3), 6)
+}
+
+fn TestNoParam() {
+}
+'''
+
+
 def tin_test(files, *args):
     with tempfile.TemporaryDirectory() as d:
         for name, text in files.items():
@@ -107,6 +129,14 @@ def tin_test(files, *args):
 
 
 class TinTestCommand(unittest.TestCase):
+    def test_edition1_package(self):
+        code, out = tin_test({'geo.tin': LIB_ED1, 'geo_test.tin': TESTS_ED1.replace('fn TestNoParam() {\n}\n', '')})
+        self.assertEqual(code, 0, out)
+        self.assertIn('--- PASS: TestArea', out)
+        code, out = tin_test({'geo.tin': LIB_ED1, 'geo_test.tin': TESTS_ED1})
+        self.assertEqual(code, 2, out)
+        self.assertIn('wrong signature for TestNoParam, must be: fn TestNoParam(t mut crucible.T)', out)
+
     def test_library_package_passes(self):
         code, out = tin_test({'geo.tin': LIB, 'geo_test.tin': TESTS})
         self.assertEqual(code, 0, out)

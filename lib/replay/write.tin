@@ -8,20 +8,20 @@ import "say"
 import "seal"
 
 // The switches, read once by Setup before the cores start (malloc'd copies, shared by every core).
-shared var gOn bool         // recording is on
-shared var gDir str         // TIN_REPLAY_DIR
-shared var gKe str          // the keystream key: HMAC-SHA256(K, "tin replay enc")
-shared var gKm str          // the tag key: HMAC-SHA256(K, "tin replay mac")
-shared var gKs str          // the secret key: HMAC-SHA256(K, "tin replay secret")
-shared var gSample i64      // TIN_REPLAY_SAMPLE in parts per billion
-shared var gMaxBytes i64    // TIN_REPLAY_MAX_MB in bytes
-shared var gCores i64       // the cores sharing the spool's bound
-shared var gDrop str        // ",name,name," lower case: header values not stored
-shared var gSpool i64       // per core, 64 bytes: the capsules it keeps (section 6)
-shared var gProgram str     // argv[0]
+shared mut gOn bool         // recording is on
+shared mut gDir str         // TIN_REPLAY_DIR
+shared mut gKe str          // the keystream key: HMAC-SHA256(K, "tin replay enc")
+shared mut gKm str          // the tag key: HMAC-SHA256(K, "tin replay mac")
+shared mut gKs str          // the secret key: HMAC-SHA256(K, "tin replay secret")
+shared mut gSample i64      // TIN_REPLAY_SAMPLE in parts per billion
+shared mut gMaxBytes i64    // TIN_REPLAY_MAX_MB in bytes
+shared mut gCores i64       // the cores sharing the spool's bound
+shared mut gDrop str        // ",name,name," lower case: header values not stored
+shared mut gSpool i64       // per core, 64 bytes: the capsules it keeps (section 6)
+shared mut gProgram str     // argv[0]
 
 // Per core: its sampling generator.
-var sampleState u64
+mut sampleState u64
 
 const envMagic = "TINCAP\x01\x00"
 const schema = 1
@@ -43,14 +43,14 @@ const spCount = 5 // capsules this core wrote (the N of their names)
 // TIN_REPLAY_CAPSULE replays a capsule). Call it before
 // the cores start. A missing or malformed key, or a spool that cannot be made, prints one
 // line on stderr and leaves recording off.
-func Setup(cores i64) bool {
+fn Setup(cores i64) bool {
 	gOn = false
-	dir := quarry.Getenv("TIN_REPLAY_DIR")
+	let dir = quarry.Getenv("TIN_REPLAY_DIR")
 	if quarry.Getenv("TIN_REPLAY_CAPSULE") != "" {
 		// A process replaying a capsule (#242) records nothing, but it writes secrets into
 		// effect keys as the recording did (the same key and secret headers), or no key with a
 		// secret in it would match the capsule's.
-		k, err := seal.HexDecode(quarry.Getenv("TIN_REPLAY_KEY"))
+		let (k, err) = seal.HexDecode(quarry.Getenv("TIN_REPLAY_KEY"))
 		if err == nil && len(k) == 32 {
 			gKs = held(str(seal.HmacSha256(str(k), "tin replay secret")))
 			rt_replay_setup(Secret, list(secretDefaults, quarry.Getenv("TIN_REPLAY_SECRET_HEADERS")))
@@ -60,12 +60,12 @@ func Setup(cores i64) bool {
 	if dir == "" {
 		return false
 	}
-	k, err := seal.HexDecode(quarry.Getenv("TIN_REPLAY_KEY"))
+	let (k, err) = seal.HexDecode(quarry.Getenv("TIN_REPLAY_KEY"))
 	if err != nil || len(k) != 32 {
 		warn("replay: recording is off: TIN_REPLAY_KEY must be 64 hex digits")
 		return false
 	}
-	key := str(k)
+	let key = str(k)
 	if !quarry.IsDir(dir) {
 		quarry.MkdirAll(dir) catch err {
 			warn("replay: recording is off: " + say.Str(err))
@@ -81,13 +81,13 @@ func Setup(cores i64) bool {
 	gKs = held(str(seal.HmacSha256(key, "tin replay secret")))
 	gSample = fraction(quarry.Getenv("TIN_REPLAY_SAMPLE"))
 	gMaxBytes = 256 << 20
-	mb := quarry.Getenv("TIN_REPLAY_MAX_MB")
+	let mb = quarry.Getenv("TIN_REPLAY_MAX_MB")
 	if mb != "" {
 		gMaxBytes = decimal(mb) << 20
 	}
 	gCores = cores
 	gDrop = held(list("", quarry.Getenv("TIN_REPLAY_DROP_HEADERS")))
-	args := quarry.Args()
+	let args = quarry.Args()
 	gProgram = held("")
 	if len(args) > 0 {
 		gProgram = held(args[0])
@@ -100,21 +100,21 @@ func Setup(cores i64) bool {
 }
 
 // On reports whether Setup turned recording on.
-func On() bool {
+fn On() bool {
 	return gOn
 }
 
 // Secret is the handle an effect key or a stored header holds instead of a secret's text:
 // "tin-secret:" and the first 16 bytes of HMAC-SHA256(Ks, s) in hex (section 5.1).
-func Secret(s str) str {
-	h := seal.HmacSha256(gKs, s)
+fn Secret(s str) str {
+	let h = seal.HmacSha256(gKs, s)
 	return "tin-secret:" + seal.Hex(h[:16])
 }
 
 // Wanted is the flags a capsule of a request that ended with status is kept with (1 panicked,
 // 2 sampled), or -1 when it is dropped: kept when the status is 500 or more, or it panicked,
 // or it is in the TIN_REPLAY_SAMPLE fraction.
-func Wanted(status i64, panicked bool) i64 {
+fn Wanted(status i64, panicked bool) i64 {
 	if panicked {
 		return flagPanicked
 	}
@@ -133,11 +133,11 @@ func Wanted(status i64, panicked bool) i64 {
 // Done ends the recording tape tp of a request served on core: its capsule is written when the
 // request is kept (Wanted), and the tape is freed. A capsule that cannot be written prints one
 // line on stderr; the server goes on.
-func Done(tp i64, core i64) {
+fn Done(tp i64, core i64) {
 	if tp == 0 {
 		return
 	}
-	flags := Wanted(tp[10], tp[11] != 0)
+	let flags = Wanted(tp[10], tp[11] != 0)
 	if flags >= 0 && gOn {
 		Write(tp, core, flags) catch err {
 			warn("replay: capsule not written: " + say.Str(err))
@@ -149,16 +149,16 @@ func Done(tp i64, core i64) {
 
 // Write writes the capsule of tape tp (recorded on core, with flags) into the spool, deleting
 // the core's oldest capsules past its share of TIN_REPLAY_MAX_MB; it returns the capsule's path.
-func Write(tp i64, core i64, flags i64) !str {
-	data := Seal(Encode(tp, core, flags))
-	wall := tp[13]
+fn Write(tp i64, core i64, flags i64) !str {
+	let data = Seal(Encode(tp, core, flags))
+	mut wall = tp[13]
 	if wall == 0 {
 		wall = rt_wall_ns()
 	}
-	sp := gSpool + (core%gCores)*64
-	sp[spCount]++
-	name := pad(wall, 20) + "-" + pad(core, 3) + "-" + say.Str(sp[spCount]) + ".tcap"
-	path := gDir + "/" + name
+	let sp = gSpool + (core%gCores)*64
+	sp[spCount] += 1
+	let name = pad(wall, 20) + "-" + pad(core, 3) + "-" + say.Str(sp[spCount]) + ".tcap"
+	let path = gDir + "/" + name
 	try quarry.WriteFile(path + ".tmp", data)
 	quarry.Rename(path + ".tmp", path) catch err {
 		remove(path + ".tmp")
@@ -171,19 +171,19 @@ func Write(tp i64, core i64, flags i64) !str {
 
 // Encode is the capsule body of tape tp (section 6): the request with its secret headers as
 // handles and its dropped headers empty, the panic, and the effect records.
-func Encode(tp i64, core i64, flags i64) str {
-	req := ""
+fn Encode(tp i64, core i64, flags i64) str {
+	mut req = ""
 	if tp[8] != 0 {
 		req = rt_str_from_raw(tp[8], tp[9])
 	}
-	pan := ""
+	mut pan = ""
 	if tp[11] != 0 {
 		pan = rt_str_from_raw(tp[11], tp[12])
 	}
 	if pan != "" {
 		flags |= flagPanicked
 	}
-	b := make([]u8, 0, 256+len(req)+len(pan)+tp[2])
+	mut b = make([]u8, 0, 256+len(req)+len(pan)+tp[2])
 	b = put_word(b, schema)
 	b = put_str(b, "dev")
 	b = put_str(b, gProgram)
@@ -202,41 +202,49 @@ func Encode(tp i64, core i64, flags i64) str {
 
 // Seal is the envelope of a capsule body (section 6): the magic, a random nonce, the body under
 // the HMAC-SHA256 keystream, and the tag over all of it.
-func Seal(body str) str {
-	nonce := str(seal.RandomBytes(16))
-	out := make([]u8, 0, len(body)+56)
+fn Seal(body str) str {
+	let nonce = str(seal.RandomBytes(16))
+	mut out = make([]u8, 0, len(body)+56)
 	out = append(out, envMagic...)
 	out = append(out, nonce...)
-	for i := 0; i*32 < len(body); i++ {
-		ks := seal.HmacSha256(gKe, nonce + str(put_word(make([]u8, 0, 8), i)))
-		for j := 0; j < 32 && i*32+j < len(body); j++ {
-			out = append(out, body[i*32+j]^ks[j])
+	{
+		mut i = 0
+		for i*32 < len(body) {
+			let ks = seal.HmacSha256(gKe, nonce + str(put_word(make([]u8, 0, 8), i)))
+			{
+			mut j = 0
+			for j < 32 && i*32+j < len(body) {
+					out = append(out, body[i*32+j]^ks[j])
+					j += 1
+			}
+		}
+			i += 1
 		}
 	}
-	tag := seal.HmacSha256(gKm, str(out))
+	let tag = seal.HmacSha256(gKm, str(out))
 	out = append(out, tag...)
 	return str(out)
 }
 
 // Scrub is a request as a capsule stores it: the values of secret headers (section 1) become
 // their handles and the values of dropped headers become empty; everything else is kept.
-func Scrub(req str) str {
-	i := 0
+fn Scrub(req str) str {
+	mut i = 0
 	for i < len(req) && req[i] != '\n' {
-		i++
+		i += 1
 	}
 	if i >= len(req) {
 		return req
 	}
-	b := make([]u8, 0, len(req)+64)
+	mut b = make([]u8, 0, len(req)+64)
 	b = append(b, req[:i+1]...)
-	i++
+	i += 1
 	for i < len(req) {
-		e := i
+		mut e = i
 		for e < len(req) && req[e] != '\n' {
-			e++
+			e += 1
 		}
-		line := req[i:e]
+		let line = req[i:e]
 		if line == "" || line == "\r" {
 			// The end of the headers: the body is kept as received.
 			b = append(b, req[i:]...)
@@ -252,9 +260,9 @@ func Scrub(req str) str {
 }
 
 // scrub_line is one header line with its value hashed or dropped by the policy.
-func scrub_line(line str) str {
-	colon := -1
-	for i := 0; i < len(line); i++ {
+fn scrub_line(line str) str {
+	mut colon = -1
+	for i in 0..len(line) {
 		if line[i] == ':' {
 			colon = i
 			break
@@ -263,20 +271,20 @@ func scrub_line(line str) str {
 	if colon <= 0 {
 		return line
 	}
-	name := line[:colon]
-	cr := ""
-	stop := len(line)
+	let name = line[:colon]
+	mut cr = ""
+	mut stop = len(line)
 	if stop > 0 && line[stop-1] == '\r' {
 		cr = "\r"
-		stop--
+		stop -= 1
 	}
-	v := colon + 1
+	mut v = colon + 1
 	for v < stop && (line[v] == ' ' || line[v] == '\t') {
-		v++
+		v += 1
 	}
-	e := stop
+	mut e = stop
 	for e > v && (line[e-1] == ' ' || line[e-1] == '\t') {
-		e--
+		e -= 1
 	}
 	if rt_has_word(gDrop, name) {
 		return name + ":" + cr
@@ -291,17 +299,17 @@ func scrub_line(line str) str {
 
 // trim_start deletes the spool's oldest capsules (by name) while it holds more than
 // TIN_REPLAY_MAX_MB, then gives each core the capsules it wrote, to bound with its share.
-func trim_start() {
-	names := quarry.ReadDir(gDir) catch err {
+fn trim_start() {
+	let names = quarry.ReadDir(gDir) catch err {
 		warn("replay: spool not trimmed: " + say.Str(err))
 		return
 	}
-	sizes := make([]i64, 0, len(names))
-	total := 0
-	for _, n := range names {
-		s := 0
+	mut sizes = make([]i64, 0, len(names))
+	mut total = 0
+	for _, n in names {
+		mut s = 0
 		if is_capsule(n) {
-			sz, err := quarry.Size(gDir + "/" + n)
+			let (sz, err) = quarry.Size(gDir + "/" + n)
 			if err == nil {
 				s = sz
 			}
@@ -309,7 +317,7 @@ func trim_start() {
 		sizes = append(sizes, s)
 		total += s
 	}
-	for i, n := range names {
+	for i, n in names {
 		if !is_capsule(n) {
 			continue
 		}
@@ -323,26 +331,26 @@ func trim_start() {
 }
 
 // is_capsule reports whether a spool file name is a capsule's (WALL-CORE-N.tcap).
-func is_capsule(name str) bool {
+fn is_capsule(name str) bool {
 	return len(name) > 25 && name[20] == '-' && name[24] == '-' && name[len(name)-5:] == ".tcap"
 }
 
-func core_of(name str) i64 {
+fn core_of(name str) i64 {
 	return decimal(name[21:24])
 }
 
 // spool_add appends a capsule to a core's spool list.
-func spool_add(sp i64, name str, size i64) {
+fn spool_add(sp i64, name str, size i64) {
 	if sp[spLen] == sp[spCap] {
 		if sp[spHead] > 0 {
 			// Move the kept entries to the front before growing.
-			k := sp[spLen] - sp[spHead]
+			let k = sp[spLen] - sp[spHead]
 			memmove(sp[spNames], sp[spNames]+sp[spHead]*16, k*16)
 			sp[spLen] = k
 			sp[spHead] = 0
 		}
 		if sp[spLen] == sp[spCap] {
-			c := sp[spCap] * 2
+			mut c = sp[spCap] * 2
 			if c < 64 {
 				c = 64
 			}
@@ -350,39 +358,39 @@ func spool_add(sp i64, name str, size i64) {
 			sp[spCap] = c
 		}
 	}
-	e := sp[spNames] + sp[spLen]*16
+	let e = sp[spNames] + sp[spLen]*16
 	e[0] = rt_raw_str(name)
 	e[1] = size
-	sp[spLen]++
+	sp[spLen] += 1
 	sp[spBytes] += size
 }
 
 // spool_trim deletes a core's oldest capsules while they take more than max bytes; the newest
 // one stays even when it alone is larger.
-func spool_trim(sp i64, max i64) {
+fn spool_trim(sp i64, max i64) {
 	for sp[spBytes] > max && sp[spLen]-sp[spHead] > 1 {
-		e := sp[spNames] + sp[spHead]*16
+		let e = sp[spNames] + sp[spHead]*16
 		remove(gDir + "/" + cast(str, e[0]))
 		sp[spBytes] -= e[1]
 		free(e[0])
-		sp[spHead]++
+		sp[spHead] += 1
 	}
 }
 
 // ---- helpers ----
 
 // held is a malloc'd copy of s that outlives every pool (for the shared switches).
-func held(s str) str {
+fn held(s str) str {
 	return cast(str, rt_raw_str(s))
 }
 
 // list is ",a,b," (lower case, spaces dropped) from the comma lists a and b.
-func list(a str, b str) str {
-	out := make([]u8, 0, len(a)+len(b)+3)
+fn list(a str, b str) str {
+	mut out = make([]u8, 0, len(a)+len(b)+3)
 	out = append(out, ',')
-	for _, s := range []str{a, b} {
-		for i := 0; i < len(s); i++ {
-			c := s[i]
+	for _, s in []str{a, b} {
+		for i in 0..len(s) {
+			mut c = s[i]
 			if c == ',' {
 				if out[len(out)-1] != ',' {
 					out = append(out, ',')
@@ -402,16 +410,16 @@ func list(a str, b str) str {
 }
 
 // fraction is a decimal fraction from 0 to 1 in parts per billion; anything else is 0.
-func fraction(s str) i64 {
-	whole := 0
-	part := 0
-	scale := 1000000000
-	dot := false
+fn fraction(s str) i64 {
+	mut whole = 0
+	mut part = 0
+	mut scale = 1000000000
+	mut dot = false
 	if s == "" {
 		return 0
 	}
-	for i := 0; i < len(s); i++ {
-		c := s[i]
+	for i in 0..len(s) {
+		let c = s[i]
 		if c == '.' && !dot {
 			dot = true
 		} else if c >= '0' && c <= '9' {
@@ -435,9 +443,9 @@ func fraction(s str) i64 {
 }
 
 // decimal is the non-negative integer s, or 0.
-func decimal(s str) i64 {
-	v := 0
-	for i := 0; i < len(s); i++ {
+fn decimal(s str) i64 {
+	mut v = 0
+	for i in 0..len(s) {
 		if s[i] < '0' || s[i] > '9' {
 			return 0
 		}
@@ -447,29 +455,29 @@ func decimal(s str) i64 {
 }
 
 // pad is v in decimal with leading zeros to width digits.
-func pad(v i64, width i64) str {
-	s := say.Str(v)
+fn pad(v i64, width i64) str {
+	mut s = say.Str(v)
 	for len(s) < width {
 		s = "0" + s
 	}
 	return s
 }
 
-func put_word(b []u8, v i64) []u8 {
-	for i := 0; i < 8; i++ {
+fn put_word(b []u8, v i64) []u8 {
+	for i in 0..8 {
 		b = append(b, u8(v >> (8 * i)))
 	}
 	return b
 }
 
-func put_str(b []u8, s str) []u8 {
+fn put_str(b []u8, s str) []u8 {
 	b = put_word(b, len(s))
 	b = append(b, s...)
 	return b
 }
 
 // next_sample is the next draw of this core's sampling generator (xorshift64*).
-func next_sample() u64 {
+fn next_sample() u64 {
 	if sampleState == 0 {
 		sampleState = u64(rt_mono_ns()) ^ 0x9e3779b97f4a7c15
 	}
@@ -480,14 +488,14 @@ func next_sample() u64 {
 }
 
 // remove deletes a spool file; one already gone is not an error.
-func remove(path str) {
-	err := quarry.Remove(path)
+fn remove(path str) {
+	let err = quarry.Remove(path)
 	if err != nil {
 		return
 	}
 }
 
-func warn(msg str) {
-	m := msg + "\n"
+fn warn(msg str) {
+	let m = msg + "\n"
 	rt_write_all(2, cast(i64, m)+8, len(m))
 }

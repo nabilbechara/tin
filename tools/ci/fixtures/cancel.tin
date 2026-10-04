@@ -14,56 +14,66 @@ import "websocket"
 import "wire"
 
 // Every client points at a server that accepts and never answers (cancel_check.py).
-var hole = quarry.Getenv("HOLE_ADDR")
-var rc = redis.Open(redis.Options{Addr: quarry.Getenv("HOLE_ADDR")})
-var mc = mysql.Open(mysql.Options{Addr: quarry.Getenv("HOLE_ADDR"), User: "tin", Pool: 1})
-var pc = postgres.Open(postgres.Options{Addr: quarry.Getenv("HOLE_ADDR"), User: "tin", Pool: 1})
+let hole = quarry.Getenv("HOLE_ADDR")
+let rc = redis.Open(redis.Options{Addr: quarry.Getenv("HOLE_ADDR")})
+let mc = mysql.Open(mysql.Options{Addr: quarry.Getenv("HOLE_ADDR"), User: "tin", Pool: 1})
+let pc = postgres.Open(postgres.Options{Addr: quarry.Getenv("HOLE_ADDR"), User: "tin", Pool: 1})
 
-func slot(q anvil.Req) i64 {
-	i := mint.Atoi(q.PathParam("i")) catch _ { 0 }
+fn slot(q anvil.Req) i64 {
+	let i = mint.Atoi(q.PathParam("i")) catch _ { 0 }
 	return i
 }
 
 // wait_in waits in one client until the wait fails.
-func wait_in(kind str) ! {
-	switch kind {
-	case "tide":
-		try tide.Wait(10 * tide.Second)
-	case "wire":
-		c := try wire.Dial(hole)
-		buf := make([]u8, 16)
-		n := try c.Read(mut buf, 16)
-		say.Line(n)
-	case "redis":
-		r := try rc.Do("GET k")
-		say.Line(r)
-	case "mysql":
-		r := try mc.Exec("SELECT 1")
-		say.Line(r)
-	case "postgres":
-		r := try pc.Exec("SELECT 1")
-		say.Line(r)
-	case "websocket":
-		c := try websocket.Dial("ws://{hole}/")
-		say.Line(c)
-	case "file":
-		s := try quarry.ReadFile(quarry.Getenv("FIFO"))
-		say.Line(len(s))
-	case "relay":
-		from, msg := try relay.Next()
-		say.Line(from, msg)
-	case "stdin":
-		s := try quarry.ReadStdin()
-		say.Line(len(s))
-	case "flume":
-		r := flume.New(0)
-		line, ok := try r.Line()
-		say.Line(line, ok)
+fn wait_in(kind str) ! {
+	match kind {
+		"tide" => {
+			try tide.Wait(10s)
+		}
+		"wire" => {
+			mut c = try wire.Dial(hole)
+			let buf = make([]u8, 16)
+			let n = try c.Read(mut buf, 16)
+			say.Line(n)
+		}
+		"redis" => {
+			mut r = try rc.Do("GET k")
+			say.Line(r)
+		}
+		"mysql" => {
+			mut r = try mc.Exec("SELECT 1")
+			say.Line(r)
+		}
+		"postgres" => {
+			mut r = try pc.Exec("SELECT 1")
+			say.Line(r)
+		}
+		"websocket" => {
+			let c = try websocket.Dial("ws://{hole}/")
+			say.Line(c)
+		}
+		"file" => {
+			mut s = try quarry.ReadFile(quarry.Getenv("FIFO"))
+			say.Line(len(s))
+		}
+		"relay" => {
+			let (from, msg) = try relay.Next()
+			say.Line(from, msg)
+		}
+		"stdin" => {
+			let s = try quarry.ReadStdin()
+			say.Line(len(s))
+		}
+		"flume" => {
+			let r = flume.New(0)
+			let (line, ok) = try r.Line()
+			say.Line(line, ok)
+		}
 	}
 }
 
 // park waits in a client; /cancel/{i} cancels it.
-func park(q anvil.Req, w mut anvil.Out) {
+fn park(q anvil.Req, w mut anvil.Out) {
 	tide.ProbeMark(slot(q))
 	wait_in(q.PathParam("kind")) catch err {
 		w.Text("fault: {err}")
@@ -72,111 +82,111 @@ func park(q anvil.Req, w mut anvil.Out) {
 	w.Text("no fault")
 }
 
-func cancel(q anvil.Req, w mut anvil.Out) {
+fn cancel(q anvil.Req, w mut anvil.Out) {
 	tide.ProbeCancel(slot(q), "test reason {slot(q)}")
 	w.Text("ok")
 }
 
 // nested cancels an inner block only: the request's own boundary must stay live.
-func nested(q anvil.Req, w mut anvil.Out) {
-	outer := tide.ProbeCurrent()
-	b := tide.ProbeEnter()
+fn nested(q anvil.Req, w mut anvil.Out) {
+	let outer = tide.ProbeCurrent()
+	let b = tide.ProbeEnter()
 	tide.ProbeMark(slot(q))
-	inner := ""
-	tide.Wait(10 * tide.Second) catch err {
+	mut inner = ""
+	tide.Wait(10s) catch err {
 		inner = say.Str(err)
 	}
 	tide.ProbeLeave(b)
-	after := "ok"
-	tide.Wait(tide.Millisecond) catch err {
+	mut after = "ok"
+	tide.Wait(1ms) catch err {
 		after = say.Str(err)
 	}
 	w.Text("inner: {inner}; outer: [{tide.ProbeCanceled(outer)}]; after: {after}")
 }
 
 // outer cancels the request's boundary while a block inside it waits.
-func outer(q anvil.Req, w mut anvil.Out) {
+fn outer(q anvil.Req, w mut anvil.Out) {
 	tide.ProbeMark(slot(q))
-	b := tide.ProbeEnter()
-	inner := ""
-	tide.Wait(10 * tide.Second) catch err {
+	let b = tide.ProbeEnter()
+	mut inner = ""
+	tide.Wait(10s) catch err {
 		inner = say.Str(err)
 	}
-	reason := tide.ProbeCanceled(b)
+	let reason = tide.ProbeCanceled(b)
 	tide.ProbeLeave(b)
-	again := "ok"
-	tide.Wait(tide.Millisecond) catch err {
+	mut again = "ok"
+	tide.Wait(1ms) catch err {
 		again = say.Str(err)
 	}
 	w.Text("inner: {inner}; block: {reason}; again: {again}")
 }
 
 // within gives a block a 50 ms deadline inside the request's longer one.
-func within(q anvil.Req, w mut anvil.Out) {
-	b := tide.ProbeEnter()
+fn within_(q anvil.Req, w mut anvil.Out) {
+	let b = tide.ProbeEnter()
 	tide.ProbeDeadline(b, 50)
-	start := tide.Now()
-	inner := ""
-	tide.Wait(10 * tide.Second) catch err {
+	let start = tide.Now()
+	mut inner = ""
+	tide.Wait(10s) catch err {
 		inner = say.Str(err)
 	}
-	ms := (tide.Now() - start) / tide.Millisecond
+	let ms = (tide.Now() - start) / tide.Millisecond
 	tide.ProbeLeave(b)
-	after := "ok"
-	tide.Wait(tide.Millisecond) catch err {
+	mut after = "ok"
+	tide.Wait(1ms) catch err {
 		after = say.Str(err)
 	}
 	w.Text("inner: {inner}; ms: {ms}; after: {after}")
 }
 
 // within_in gives a block a 50 ms deadline around a wait in one client (#316).
-func within_in(q anvil.Req, w mut anvil.Out) {
-	b := tide.ProbeEnter()
+fn within_in(q anvil.Req, w mut anvil.Out) {
+	let b = tide.ProbeEnter()
 	tide.ProbeDeadline(b, 50)
-	start := tide.Now()
-	inner := "no fault"
+	let start = tide.Now()
+	mut inner = "no fault"
 	wait_in(q.PathParam("kind")) catch err {
 		inner = say.Str(err)
 	}
-	ms := (tide.Now() - start) / tide.Millisecond
+	let ms = (tide.Now() - start) / tide.Millisecond
 	tide.ProbeLeave(b)
-	after := "ok"
-	tide.Wait(tide.Millisecond) catch err {
+	mut after = "ok"
+	tide.Wait(1ms) catch err {
 		after = say.Str(err)
 	}
 	w.Text("inner: {inner}; ms: {ms}; after: {after}")
 }
 
 // relay_next waits in relay.Next until /relay-send gives this core a message (#316).
-func relay_next(q anvil.Req, w mut anvil.Out) {
-	from, msg := relay.Next() catch err {
+fn relay_next(q anvil.Req, w mut anvil.Out) {
+	let (from, msg) = relay.Next() catch err {
 		w.Text("fault: {err}")
 		return
 	}
 	w.Text("from {from}: {msg}")
 }
 
-func relay_send(q anvil.Req, w mut anvil.Out) {
+fn relay_send(q anvil.Req, w mut anvil.Out) {
 	relay.Send(relay.Me(), q.PathParam("msg"))
 	w.Text("sent")
 }
 
 // hog takes about 64 MiB of request memory, past a TIN_REQUEST_MEMORY budget.
-func hog(q anvil.Req, w mut anvil.Out) {
-	total := 0
-	for i := 0; i < 8; i++ {
-		xs := make([]i64, 1000000)
+fn hog(q anvil.Req, w mut anvil.Out) {
+	mut total = 0
+	for i in 0..8 {
+		let xs = make([]i64, 1000000)
 		total += len(xs)
 	}
 	w.Text("hogged {total}")
 }
 
-func cpu_deferred() {
+fn cpu_deferred() {
 	say.Line("cpu cancel deferred")
 }
 
 // cpu_cancel never waits after cancelling its own request.
-func cpu_cancel(q anvil.Req, w mut anvil.Out) {
+fn cpu_cancel(q anvil.Req, w mut anvil.Out) {
 	defer cpu_deferred()
 	tide.ProbeMark(31)
 	tide.ProbeCancel(31, "cpu stop")
@@ -184,27 +194,27 @@ func cpu_cancel(q anvil.Req, w mut anvil.Out) {
 	}
 }
 
-func plain(q anvil.Req, w mut anvil.Out) {
-	tide.Wait(tide.Millisecond) catch err {
+fn plain(q anvil.Req, w mut anvil.Out) {
+	tide.Wait(1ms) catch err {
 		w.Text("fault: {err}")
 		return
 	}
 	w.Text("plain ok")
 }
 
-func main() {
-	r := anvil.NewRouter()
+fn main() {
+	let r = anvil.NewRouter()
 	r.Get(`/park/{i}/{kind}`, park)
 	r.Get(`/cancel/{i}`, cancel)
 	r.Get(`/nested/{i}`, nested)
 	r.Get(`/outer/{i}`, outer)
-	r.Get(`/within`, within)
+	r.Get(`/within`, within_)
 	r.Get(`/within/{kind}`, within_in)
 	r.Get(`/relay-next`, relay_next)
 	r.Get(`/relay-send/{msg}`, relay_send)
 	r.Get(`/plain`, plain)
 	r.Get(`/hog`, hog)
 	r.Get(`/cpu-cancel`, cpu_cancel)
-	err := r.Serve(":0")
+	let err = r.Serve(":0")
 	say.Line(err)
 }

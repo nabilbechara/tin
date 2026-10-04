@@ -1,11 +1,11 @@
 package threadprobe
 
-shared var probeOK i64
+shared mut probeOK i64
 
 // child checks what a new core inherits and owns: a signal stack and the blocked SIGTERM.
-func child(arg i64) {
-    ok := rt_altstack_ready()
-    set := calloc(1, 8)
+fn child(arg i64) {
+    mut ok = rt_altstack_ready()
+    let set = calloc(1, 8)
     rt_sys_pthread_sigmask(0, 0, set)
     ok = ok && set[0]&(1<<14) != 0
     free(set)
@@ -18,10 +18,10 @@ func child(arg i64) {
 }
 
 // Cycle starts n cores one after another, waits for each to return and reaps its stacks.
-func Cycle(n i64) i64 {
+fn Cycle(n i64) i64 {
     rt_sig_block_term()
-    for i := i64(0); i < n; i++ {
-        done := __atomic_load(&rtCoresDone)
+    for i in i64(0)..n {
+        let done = __atomic_load(&rtCoresDone)
         rt_spawn_core(child, i)
         for __atomic_load(&rtCoresDone) == done {
             rt_sleep_ns(50000)
@@ -32,27 +32,31 @@ func Cycle(n i64) i64 {
 }
 
 // Live is the number of thread records still held (threads not yet reaped).
-func Live() i64 {
-    n := i64(0)
-    for r := rtThreads; r != 0; r = r[thrNext] {
-        n++
+fn Live() i64 {
+    mut n = i64(0)
+    {
+    	mut r = rtThreads
+    	for r != 0 {
+	        n += 1
+	    	r = r[thrNext]
+    	}
     }
     return n
 }
 
-func deep(n i64) i64 {
+fn deep(n i64) i64 {
     if n < 0 {
         return 0
     }
     return deep(n+1) + 1
 }
 
-func overflow(arg i64) {
+fn overflow(arg i64) {
     deep(arg)
 }
 
 // Overflow runs unbounded recursion on a core thread; the fault report ends the process.
-func Overflow() {
+fn Overflow() {
     rt_spawn_core(overflow, 0)
     for {
         rt_sleep_ns(1000000)

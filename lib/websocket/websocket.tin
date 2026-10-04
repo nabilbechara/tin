@@ -59,8 +59,8 @@ const opClose = 8
 const opPing = 9
 const opPong = 10
 
-func new_state(fd i64, client bool) i64 {
-	st := rt_alloc(stWords * 8)
+fn new_state(fd i64, client bool) i64 {
+	let st = rt_alloc(stWords * 8)
 	st[sFd] = fd
 	st[sClient] = i64(client)
 	st[sCap] = 16384
@@ -70,12 +70,12 @@ func new_state(fd i64, client bool) i64 {
 	return st
 }
 
-func accept_key(key str) str {
+fn accept_key(key str) str {
 	return seal.B64(seal.Sha1(key + guid))
 }
 
-func has_token(v str, tok str) bool {
-	for _, part := range twine.Split(v, ",") {
+fn has_token(v str, tok str) bool {
+	for _, part in twine.Split(v, ",") {
 		if twine.EqualFold(twine.TrimSpace(part), tok) {
 			return true
 		}
@@ -86,8 +86,8 @@ func has_token(v str, tok str) bool {
 // Accept completes the opening handshake for request q and takes over its connection. A
 // request that is not a WebSocket handshake gets a 400 (426 for another version) in w and
 // fails. The connection and its buffers close when the handler returns.
-func Accept(q anvil.Req, w mut anvil.Out) !Conn {
-	key := q.Header("Sec-WebSocket-Key")
+fn Accept(q anvil.Req, w mut anvil.Out) !Conn {
+	let key = q.Header("Sec-WebSocket-Key")
 	if q.Method != "GET" || !has_token(q.Header("Upgrade"), "websocket") || !has_token(q.Header("Connection"), "upgrade") || key == "" {
 		w.Status(400)
 		w.Text("not a websocket handshake")
@@ -99,16 +99,16 @@ func Accept(q anvil.Req, w mut anvil.Out) !Conn {
 		w.Text("websocket version 13 only")
 		fail "websocket: unsupported version"
 	}
-	raw := seal.B64Decode(key) catch _ { []u8{} }
+	let raw = seal.B64Decode(key) catch _ { []u8{} }
 	if len(raw) != 16 {
 		w.Status(400)
 		w.Text("bad Sec-WebSocket-Key")
 		fail "websocket: bad Sec-WebSocket-Key"
 	}
-	fd := try q.Hijack()
-	st := new_state(fd, false)
-	c := Conn{open: true, st: st}
-	err := c.write_all("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept_key(key)}\r\n\r\n")
+	let fd = try q.Hijack()
+	let st = new_state(fd, false)
+	let c = Conn{open: true, st: st}
+	let err = c.write_all("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept_key(key)}\r\n\r\n")
 	if err != nil {
 		c.release()
 		fail err
@@ -119,8 +119,8 @@ func Accept(q anvil.Req, w mut anvil.Out) !Conn {
 // Dial connects to a ws:// or wss:// URL ("ws://host:port/path"); wss:// verifies the
 // server's certificate against the system's roots. Close it when finished; inside a request
 // task, it is also closed automatically when its scope ends.
-func Dial(url str) !Conn {
-	tp := rt_tape()
+fn Dial(url str) !Conn {
+	let tp = rt_tape()
 	if tp != 0 {
 		return try dial_taped(tp, url) // recorded for replay (#241)
 	}
@@ -129,64 +129,64 @@ func Dial(url str) !Conn {
 
 // DialTLS is Dial with the TLS configuration of a wss:// URL (RootCAs, Timeout for the
 // handshake, InsecureSkipVerify for tests); the server name is the URL's host.
-func DialTLS(url str, cfg tls.Config) !Conn {
-	secure := twine.HasPrefix(url, "wss://")
+fn DialTLS(url str, cfg tls.Config) !Conn {
+	let secure = twine.HasPrefix(url, "wss://")
 	if !secure && !twine.HasPrefix(url, "ws://") {
 		fail "websocket: only ws:// and wss:// URLs"
 	}
-	rest := url[5:]
+	mut rest = url[5:]
 	if secure {
 		rest = url[6:]
 	}
-	slash := twine.IndexByte(rest, '/')
-	host := rest
-	path := "/"
+	let slash = twine.IndexByte(rest, '/')
+	mut host = rest
+	mut path = "/"
 	if slash >= 0 {
 		host = rest[:slash]
 		path = rest[slash:]
 	}
-	addr := host
+	mut addr = host
 	if twine.LastIndexByte(host, ':') < 0 || twine.HasSuffix(host, "]") {
 		addr = host + ":80"
 		if secure {
 			addr = host + ":443"
 		}
 	}
-	st := 0
+	mut st = 0
 	if secure {
-		tc := try tls.Dial(addr, cfg)
+		let tc = try tls.Dial(addr, cfg)
 		st = new_state(tc.Fd(), true)
 		st[sTls] = cast(i64, tc)
 	} else {
-		wc := try wire.Dial(addr)
+		let wc = try wire.Dial(addr)
 		st = new_state(wc.Fd(), true)
 	}
 	st[sOwnFd] = 1
-	c := Conn{open: true, st: st}
-	key := seal.B64(seal.RandomBytes(16))
-	err := c.write_all("GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+	let c = Conn{open: true, st: st}
+	let key = seal.B64(seal.RandomBytes(16))
+	let err = c.write_all("GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
 	if err != nil {
 		c.release()
 		fail err
 	}
 	// Read the response head; what follows it is the first frames.
 	for {
-		end := find_head_end(st)
+		let end = find_head_end(st)
 		if end >= 0 {
-			head := rt_str_from_raw(st[sBuf]+st[sS], end)
+			let head = rt_str_from_raw(st[sBuf]+st[sS], end)
 			st[sS] += end + 4
-			lines := twine.Split(head, "\r\n")
+			let lines = twine.Split(head, "\r\n")
 			if len(lines) == 0 || !twine.HasPrefix(lines[0], "HTTP/1.1 101") {
 				c.release()
-				first := ""
+				mut first = ""
 				if len(lines) > 0 {
 					first = lines[0]
 				}
 				fail "websocket: the server refused the upgrade: {first}"
 			}
-			got := ""
-			for _, ln := range lines[1:] {
-				colon := twine.IndexByte(ln, ':')
+			mut got = ""
+			for _, ln in lines[1:] {
+				let colon = twine.IndexByte(ln, ':')
 				if colon > 0 && twine.EqualFold(ln[:colon], "Sec-WebSocket-Accept") {
 					got = twine.TrimSpace(ln[colon+1:])
 				}
@@ -201,7 +201,7 @@ func DialTLS(url str, cfg tls.Config) !Conn {
 			c.release()
 			fail "websocket: response head too large"
 		}
-		rerr := c.fill()
+		let rerr = c.fill()
 		if rerr != nil {
 			c.release()
 			fail rerr
@@ -209,25 +209,29 @@ func DialTLS(url str, cfg tls.Config) !Conn {
 	}
 }
 
-func find_head_end(st i64) i64 {
-	p := st[sBuf] + st[sS]
-	n := st[sE] - st[sS]
-	for i := 0; i+3 < n; i++ {
-		if load8(p+i) == '\r' && load8(p+i+1) == '\n' && load8(p+i+2) == '\r' && load8(p+i+3) == '\n' {
-			return i
+fn find_head_end(st i64) i64 {
+	let p = st[sBuf] + st[sS]
+	let n = st[sE] - st[sS]
+	{
+		mut i = 0
+		for i+3 < n {
+			if load8(p+i) == '\r' && load8(p+i+1) == '\n' && load8(p+i+2) == '\r' && load8(p+i+3) == '\n' {
+				return i
+			}
+			i += 1
 		}
 	}
 	return -1
 }
 
-func (c Conn) release() {
+fn (c Conn) release() {
 	release_state(c.st)
 }
 
-func release_state(st i64) {
+fn release_state(st i64) {
 	if st[sTls] != 0 && st[sFd] >= 0 {
 		// close_notify, then the descriptor.
-		tc := cast(tls.Conn, st[sTls])
+		let tc = cast(tls.Conn, st[sTls])
 		tc.Close()
 		st[sTls] = 0
 		st[sFd] = -1
@@ -243,70 +247,70 @@ func release_state(st i64) {
 }
 
 // SetTimeout limits every later read and write to ns nanoseconds (0: no limit).
-func (c Conn) SetTimeout(ns i64) {
+fn (c Conn) SetTimeout(ns i64) {
 	c.st[sTimeout] = ns
 	if c.st[sTls] != 0 {
-		tc := cast(tls.Conn, c.st[sTls])
+		let tc = cast(tls.Conn, c.st[sTls])
 		tc.SetTimeout(ns)
 	}
 }
 
 // SetMaxMessage sets the largest message Read accepts (default 16 MiB); a bigger one
 // closes the connection with 1009.
-func (c Conn) SetMaxMessage(n i64) {
+fn (c Conn) SetMaxMessage(n i64) {
 	c.st[sMax] = n
 }
 
-func os_msg(what str, e i64) str {
-	m := rt_sys_strerror(e)
+fn os_msg(what str, e i64) str {
+	let m = rt_sys_strerror(e)
 	return "websocket: {what}: {rt_str_from_raw(m, strlen(m))}"
 }
 
-func wait_fail(r i64) ! {
+fn wait_fail(r i64) ! {
 	if r == waitDeadline {
 		fail cast(fault, rt_wait_fault())
 	}
 	fail "websocket: timed out"
 }
 
-func (c Conn) write_raw(p i64, n i64) ! {
-	st := c.st
+fn (c Conn) write_raw(p i64, n i64) ! {
+	let st = c.st
 	if st[sBuf] == 0 {
 		fail "websocket: the connection is closed"
 	}
 	if st[sTls] != 0 {
-		tc := cast(tls.Conn, st[sTls])
+		let tc = cast(tls.Conn, st[sTls])
 		try tc.Write(rt_str_from_raw(p, n))
 		return
 	}
 	for n > 0 {
-		k := rt_sys_write(st[sFd], p, n)
+		let k = rt_sys_write(st[sFd], p, n)
 		if k > 0 {
 			p += k
 			n -= k
 			continue
 		}
-		e := rt_errno()
+		let e = rt_errno()
 		if e == EINTR {
 			continue
 		}
 		if e != EAGAIN {
 			fail os_msg("write", e)
 		}
-		r := rt_task_wait(st[sFd], 2, st[sTimeout])
+		let r = rt_task_wait(st[sFd], 2, st[sTimeout])
 		if r != waitReady {
 			fail wait_fail(r)
 		}
 	}
 }
 
-func (c Conn) write_all(s str) ! {
+fn (c Conn) write_all(s str) ! {
 	return try c.write_raw(cast(i64, s)+8, len(s))
 }
 
 // fill reads more bytes into the buffer.
-func (c Conn) fill() ! {
-	st := c.st
+fn (c Conn) fill() ! {
+	let st = c.st
 	if st[sBuf] == 0 {
 		fail "websocket: the connection is closed"
 	}
@@ -325,8 +329,8 @@ func (c Conn) fill() ! {
 		}
 	}
 	if st[sTls] != 0 {
-		tc := cast(tls.Conn, st[sTls])
-		tmp := make([]u8, 0, st[sCap]-st[sE])
+		let tc = cast(tls.Conn, st[sTls])
+		let tmp = make([]u8, 0, st[sCap]-st[sE])
 		tc.Read(mut tmp, st[sCap]-st[sE]) catch e {
 			if wire.IsEOF(e) {
 				fail "websocket: closed (the peer went away)"
@@ -338,7 +342,7 @@ func (c Conn) fill() ! {
 		return
 	}
 	for {
-		k := rt_sys_read(st[sFd], st[sBuf]+st[sE], st[sCap]-st[sE])
+		let k = rt_sys_read(st[sFd], st[sBuf]+st[sE], st[sCap]-st[sE])
 		if k > 0 {
 			st[sE] += k
 			return
@@ -346,14 +350,14 @@ func (c Conn) fill() ! {
 		if k == 0 {
 			fail "websocket: closed (the peer went away)"
 		}
-		e := rt_errno()
+		let e = rt_errno()
 		if e == EINTR {
 			continue
 		}
 		if e != EAGAIN {
 			fail os_msg("read", e)
 		}
-		r := rt_task_wait(st[sFd], 1, st[sTimeout])
+		let r = rt_task_wait(st[sFd], 1, st[sTimeout])
 		if r != waitReady {
 			fail wait_fail(r)
 		}
@@ -361,8 +365,8 @@ func (c Conn) fill() ! {
 }
 
 // need makes sure n bytes are buffered.
-func (c Conn) need(n i64) ! {
-	st := c.st
+fn (c Conn) need(n i64) ! {
+	let st = c.st
 	if st[sBuf] == 0 {
 		fail "websocket: closed (the connection is closed)"
 	}
@@ -381,12 +385,12 @@ func (c Conn) need(n i64) ! {
 }
 
 // frame sends one frame (the writer's turn is taken by the caller).
-func (c Conn) frame(op i64, p i64, n i64) ! {
-	st := c.st
-	hdr := calloc(2, 8)
-	h := 0
+fn (c Conn) frame(op i64, p i64, n i64) ! {
+	let st = c.st
+	let hdr = calloc(2, 8)
+	mut h = 0
 	store8(hdr, 0x80|op)
-	mask := 0
+	mut mask = 0
 	if st[sClient] != 0 {
 		mask = 0x80
 	}
@@ -400,13 +404,13 @@ func (c Conn) frame(op i64, p i64, n i64) ! {
 		h = 4
 	} else {
 		store8(hdr+1, mask|127)
-		for i := 0; i < 8; i++ {
+		for i in 0..8 {
 			store8(hdr+2+i, n>>(8*(7-i)))
 		}
 		h = 10
 	}
 	if st[sClient] == 0 {
-		err := c.write_raw(hdr, h)
+		let err = c.write_raw(hdr, h)
 		free(hdr)
 		if err != nil {
 			fail err
@@ -415,13 +419,13 @@ func (c Conn) frame(op i64, p i64, n i64) ! {
 	}
 	// A client masks its payload with a fresh key.
 	rt_random(hdr+h, 4)
-	key := hdr + h
+	let key = hdr + h
 	h += 4
-	body := malloc(n + 1)
-	for i := 0; i < n; i++ {
+	let body = malloc(n + 1)
+	for i in 0..n {
 		store8(body+i, i64(load8(p+i))^i64(load8(key+i%4)))
 	}
-	err := c.write_raw(hdr, h)
+	mut err = c.write_raw(hdr, h)
 	free(hdr)
 	if err == nil {
 		err = c.write_raw(body, n)
@@ -433,8 +437,8 @@ func (c Conn) frame(op i64, p i64, n i64) ! {
 }
 
 // send takes the writer's turn (tasks on one core may share a Conn), sends, gives it back.
-func (c Conn) send(op i64, p i64, n i64) ! {
-	st := c.st
+fn (c Conn) send(op i64, p i64, n i64) ! {
+	let st = c.st
 	if !c.open {
 		fail "websocket: the connection is not open"
 	}
@@ -448,7 +452,7 @@ func (c Conn) send(op i64, p i64, n i64) ! {
 		fail "websocket: the connection is closing"
 	}
 	st[sWriting] = 1
-	err := c.frame(op, p, n)
+	let err = c.frame(op, p, n)
 	st[sWriting] = 0
 	if err != nil {
 		fail err
@@ -456,8 +460,8 @@ func (c Conn) send(op i64, p i64, n i64) ! {
 }
 
 // WriteText sends s as a text message.
-func (c Conn) WriteText(s str) ! {
-	tp := rt_tape()
+fn (c Conn) WriteText(s str) ! {
+	let tp = rt_tape()
 	if tp != 0 && c.open {
 		return try c.write_taped(tp, opText, cast(i64, s)+8, len(s)) // recorded for replay (#241)
 	}
@@ -465,8 +469,8 @@ func (c Conn) WriteText(s str) ! {
 }
 
 // WriteBinary sends b as a binary message.
-func (c Conn) WriteBinary(b []u8) ! {
-	tp := rt_tape()
+fn (c Conn) WriteBinary(b []u8) ! {
+	let tp = rt_tape()
 	if tp != 0 && c.open {
 		return try c.write_taped(tp, opBinary, cast(i64, b)[2], len(b)) // recorded for replay (#241)
 	}
@@ -474,27 +478,27 @@ func (c Conn) WriteBinary(b []u8) ! {
 }
 
 // Ping sends a ping; the peer's pong is consumed by Read.
-func (c Conn) Ping() ! {
+fn (c Conn) Ping() ! {
 	return try c.send(opPing, 0, 0)
 }
 
-func close_payload(code i64, reason str) str {
-	b := make([]u8, 0, 2+len(reason))
+fn close_payload(code i64, reason str) str {
+	mut b = make([]u8, 0, 2+len(reason))
 	b = append(b, u8(code>>8), u8(code))
-	for i := 0; i < len(reason); i++ {
+	for i in 0..len(reason) {
 		b = append(b, reason[i])
 	}
 	return str(b)
 }
 
 // CloseWith sends a close frame with code and reason; the connection then only drains.
-func (c Conn) CloseWith(code i64, reason str) ! {
-	st := c.st
+fn (c Conn) CloseWith(code i64, reason str) ! {
+	let st = c.st
 	if st[sClosed] != 0 || st[sBuf] == 0 {
 		return
 	}
-	p := close_payload(code, reason)
-	err := c.send(opClose, cast(i64, p)+8, len(p))
+	let p = close_payload(code, reason)
+	let err = c.send(opClose, cast(i64, p)+8, len(p))
 	st[sClosed] = 1
 	if err != nil {
 		fail err
@@ -502,7 +506,7 @@ func (c Conn) CloseWith(code i64, reason str) ! {
 }
 
 // Close sends a normal close (1000) and, for a client, closes the connection.
-func (c Conn) Close() {
+fn (c Conn) Close() {
 	if !c.open || c.st[sBuf] == 0 {
 		return
 	}
@@ -511,12 +515,12 @@ func (c Conn) Close() {
 }
 
 // IsClosed reports whether err is the normal end of a connection: the peer closed it.
-func IsClosed(err fault) bool {
+fn IsClosed(err fault) bool {
 	return err != nil && twine.HasPrefix(say.Str(err), "websocket: closed")
 }
 
 // protocol_error closes with code and fails with msg.
-func (c Conn) protocol_error(code i64, msg str) ! {
+fn (c Conn) protocol_error(code i64, msg str) ! {
 	c.CloseWith(code, msg) catch _ {}
 	fail "websocket: {msg}"
 }
@@ -525,32 +529,32 @@ func (c Conn) protocol_error(code i64, msg str) ! {
 // peer closes, it answers the close and fails with "websocket: closed (code)". The
 // returned message lives in the caller's pool. For a long-lived stream, use Each
 // to reset message allocations after every callback without invalidating the Conn.
-func (c Conn) Read() !Message {
+fn (c Conn) Read() !Message {
 	if !c.open {
 		fail "websocket: the connection is not open"
 	}
-	tp := rt_tape()
+	let tp = rt_tape()
 	if tp != 0 {
 		return try c.read_taped(tp) // recorded for replay (#241)
 	}
-	st := c.st
+	let st = c.st
 	if st[sBuf] == 0 {
 		fail "websocket: closed (the connection is closed)"
 	}
-	data := calloc(3, 8) // [heap buffer, length, capacity], including all fragments
+	let data = calloc(3, 8) // [heap buffer, length, capacity], including all fragments
 	defer free_message(data)
-	text := false
-	started := false
+	mut text = false
+	mut started = false
 	for {
 		try c.need(2)
-		p := st[sBuf] + st[sS]
-		b0 := i64(load8(p))
-		b1 := i64(load8(p + 1))
-		fin := b0&0x80 != 0
-		op := b0 & 15
-		masked := b1&0x80 != 0
-		n := b1 & 127
-		h := 2
+		mut p = st[sBuf] + st[sS]
+		let b0 = i64(load8(p))
+		let b1 = i64(load8(p + 1))
+		let fin = b0&0x80 != 0
+		let op = b0 & 15
+		let masked = b1&0x80 != 0
+		mut n = b1 & 127
+		mut h = 2
 		if b0&0x70 != 0 {
 			fail c.protocol_error(1002, "reserved bits set")
 		}
@@ -563,7 +567,7 @@ func (c Conn) Read() !Message {
 			try c.need(10)
 			p = st[sBuf] + st[sS]
 			n = 0
-			for i := 0; i < 8; i++ {
+			for i in 0..8 {
 				n = n<<8 | i64(load8(p+2+i))
 			}
 			h = 10
@@ -574,11 +578,11 @@ func (c Conn) Read() !Message {
 		if masked != (st[sClient] == 0) {
 			fail c.protocol_error(1002, "wrong masking")
 		}
-		mk := h
+		let mk = h
 		if masked {
 			h += 4
 		}
-		control := op >= 8
+		let control = op >= 8
 		if control && (n > 125 || !fin) {
 			fail c.protocol_error(1002, "bad control frame")
 		}
@@ -587,9 +591,9 @@ func (c Conn) Read() !Message {
 		}
 		try c.need(h + n)
 		p = st[sBuf] + st[sS]
-		pp := p + h
+		let pp = p + h
 		if masked {
-			for i := 0; i < n; i++ {
+			for i in 0..n {
 				store8(pp+i, i64(load8(pp+i))^i64(load8(p+mk+i%4)))
 			}
 		}
@@ -604,7 +608,7 @@ func (c Conn) Read() !Message {
 			continue
 		}
 		if op == opClose {
-			code := 1005
+			mut code = 1005
 			if n >= 2 {
 				code = i64(load8(pp))<<8 | i64(load8(pp+1))
 			}
@@ -612,7 +616,7 @@ func (c Conn) Read() !Message {
 				fail c.protocol_error(1002, "bad close frame")
 			}
 			if st[sClosed] == 0 {
-				echo := 1000
+				mut echo = 1000
 				if n >= 2 {
 					echo = code
 				}
@@ -634,7 +638,7 @@ func (c Conn) Read() !Message {
 			fail c.protocol_error(1002, "unknown opcode")
 		}
 		if data[1]+n > data[2] {
-			cap := data[2]*2 + n
+			mut cap = data[2]*2 + n
 			if cap > st[sMax] {
 				cap = st[sMax]
 			}
@@ -646,7 +650,7 @@ func (c Conn) Read() !Message {
 		}
 		data[1] += n
 		if fin {
-			s := rt_str_from_raw(data[0], data[1])
+			let s = rt_str_from_raw(data[0], data[1])
 			if text && !glyph.Valid(s) {
 				fail c.protocol_error(1007, "text message is not UTF-8")
 			}
@@ -655,7 +659,7 @@ func (c Conn) Read() !Message {
 	}
 }
 
-func free_message(data i64) {
+fn free_message(data i64) {
 	free(data[0])
 	free(data)
 }
@@ -664,18 +668,18 @@ func free_message(data i64) {
 // a reusable message pool: use keep() to retain its data after the callback returns.
 // The Conn and all objects allocated before Each remain valid. Callbacks may wait.
 // A closed peer returns the same IsClosed fault as Read; callback faults propagate.
-func (c Conn) Each(h func(Conn, Message) !) ! {
-	scope := rt_pool_enter()
+fn (c Conn) Each(h fn(Conn, Message) !) ! {
+	let scope = rt_pool_enter()
 	for {
-		m, err := c.Read()
+		mut (m, err) = c.Read()
 		if err == nil {
 			err = h(c, m)
 		}
 		if err != nil {
 			// The fault belongs to the message pool too: copy it, with its chain, across the scope boundary.
-			held := rt_fault_copy(cast(i64, err), true)
+			let held = rt_fault_copy(cast(i64, err), true)
 			rt_pool_leave(scope)
-			out := rt_fault_copy(held, false)
+			let out = rt_fault_copy(held, false)
 			rt_fault_free(held)
 			fail cast(fault, out)
 		}
@@ -686,56 +690,56 @@ func (c Conn) Each(h func(Conn, Message) !) ! {
 // ---- recording and replay (notes/interface_replay.md, section 4; #241) ----
 
 // An effect's body runs at once, before it waits: these hand it its arguments and results.
-var tapedCall i64 // the URL to dial, or the Conn to read or write
-var tapedOp i64
-var tapedP i64
-var tapedN i64
-var tapedConn i64 // the connection a dial's body made
+mut tapedCall i64 // the URL to dial, or the Conn to read or write
+mut tapedOp i64
+mut tapedP i64
+mut tapedN i64
+mut tapedConn i64 // the connection a dial's body made
 
 // dial_taped records or replays Dial as websocket.dial@1 (key: the URL; result: the
 // connection's number in the request). Replaying, the connection has no socket.
-func dial_taped(tp i64, url str) !Conn {
+fn dial_taped(tp i64, url str) !Conn {
 	tapedCall = cast(i64, url)
 	tapedConn = 0
-	v := try rt_effect(tp, "websocket.dial@1", url, dial_live)
+	let v = try rt_effect(tp, "websocket.dial@1", url, dial_live)
 	if len(v) != 8 {
 		fail "replay: websocket.dial@1 result is damaged"
 	}
-	n := tword(v, 0)
+	let n = tword(v, 0)
 	if tapedConn != 0 {
-		c := cast(Conn, tapedConn)
+		let c = cast(Conn, tapedConn)
 		tapedConn = 0
 		c.st[sTn] = n
 		return c
 	}
-	st := new_state(-1, true)
+	let st = new_state(-1, true)
 	st[sTn] = n
 	return Conn{open: true, st: st}
 }
 
-func dial_live() !str {
-	c := try Dial(cast(str, tapedCall))
+fn dial_live() !str {
+	let c = try Dial(cast(str, tapedCall))
 	tapedConn = cast(i64, c)
-	n := rt_tape_kinds(rt_tape_of(rt_task_current()), "websocket.dial@1") + 1
+	let n = rt_tape_kinds(rt_tape_of(rt_task_current()), "websocket.dial@1") + 1
 	return tput(make([]u8, 0, 8), n)
 }
 
 // read_taped records or replays Read as websocket.read@1 (key: the connection's number; result:
 // 1 text or 2 binary, then the data).
-func (c Conn) read_taped(tp i64) !Message {
+fn (c Conn) read_taped(tp i64) !Message {
 	tapedCall = cast(i64, c)
-	v := try rt_effect(tp, "websocket.read@1", rt_i64str(c.st[sTn]), read_live)
+	let v = try rt_effect(tp, "websocket.read@1", rt_i64str(c.st[sTn]), read_live)
 	if len(v) < 16 || tword(v, 8) != len(v)-16 {
 		fail "replay: websocket.read@1 result is damaged"
 	}
 	return Message{Text: tword(v, 0) == 1, Data: v[16:]}
 }
 
-func read_live() !str {
-	c := cast(Conn, tapedCall)
-	m := try c.Read()
-	b := make([]u8, 0, 16+len(m.Data))
-	kind := 2
+fn read_live() !str {
+	let c = cast(Conn, tapedCall)
+	let m = try c.Read()
+	mut b = make([]u8, 0, 16+len(m.Data))
+	mut kind = 2
 	if m.Text {
 		kind = 1
 	}
@@ -747,7 +751,7 @@ func read_live() !str {
 
 // write_taped records or replays a message write as websocket.write@1 (key: the connection's
 // number, " ", the bytes).
-func (c Conn) write_taped(tp i64, op i64, p i64, n i64) ! {
+fn (c Conn) write_taped(tp i64, op i64, p i64, n i64) ! {
 	tapedCall = cast(i64, c)
 	tapedOp = op
 	tapedP = p
@@ -755,23 +759,27 @@ func (c Conn) write_taped(tp i64, op i64, p i64, n i64) ! {
 	_ = try rt_effect(tp, "websocket.write@1", rt_i64str(c.st[sTn]) + " " + rt_str_from_raw(p, n), write_live)
 }
 
-func write_live() !str {
-	c := cast(Conn, tapedCall)
+fn write_live() !str {
+	let c = cast(Conn, tapedCall)
 	try c.send(tapedOp, tapedP, tapedN)
 	return ""
 }
 
-func tput(b []u8, v i64) str {
-	for i := 0; i < 8; i++ {
+fn tput(b []u8, v i64) str {
+	for i in 0..8 {
 		b = append(b, u8(v >> (8 * i)))
 	}
 	return str(b)
 }
 
-func tword(s str, at i64) i64 {
-	v := 0
-	for i := 7; i >= 0; i-- {
-		v = v<<8 | i64(s[at+i])
+fn tword(s str, at i64) i64 {
+	mut v = 0
+	{
+		mut i = 7
+		for i >= 0 {
+			v = v<<8 | i64(s[at+i])
+			i -= 1
+		}
 	}
 	return v
 }

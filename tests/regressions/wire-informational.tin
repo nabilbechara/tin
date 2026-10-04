@@ -8,9 +8,9 @@ import "tide"
 import "wire"
 
 // script is the response for path, as parts written 20 ms apart so they arrive in separate reads.
-func script(path str) []str {
-	cont := "HTTP/1.1 100 Continue\r\n\r\n"
-	final := "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+fn script(path str) []str {
+	let cont = "HTTP/1.1 100 Continue\r\n\r\n"
+	let final = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
 	if path == "/coalesced" {
 		return []str{cont + final}
 	}
@@ -36,28 +36,28 @@ func script(path str) []str {
 }
 
 // serve answers each request with its script until it sees /stop.
-func serve(l wire.Listener) ! {
+fn serve(l wire.Listener) ! {
 	for {
-		c := try l.Accept()
-		req := make([]u8, 0, 1024)
+		let c = try l.Accept()
+		let req = make([]u8, 0, 1024)
 		for {
-			_, err := c.Read(mut req, 1024)
+			let (_, err) = c.Read(mut req, 1024)
 			if err != nil {
 				fail err
 			}
-			s := str(req)
+			let s = str(req)
 			if len(s) >= 4 && s[len(s)-4:] == "\r\n\r\n" {
 				break
 			}
 		}
-		s := str(req)
-		sp := 4
+		let s = str(req)
+		mut sp = 4
 		for sp < len(s) && s[sp] != ' ' {
-			sp++
+			sp += 1
 		}
-		path := s[4:sp]
-		parts := script(path)
-		for i, part := range parts {
+		let path = s[4:sp]
+		let parts = script(path)
+		for i, part in parts {
 			if i > 0 {
 				tide.Sleep(20000000)
 			}
@@ -72,37 +72,37 @@ func serve(l wire.Listener) ! {
 	}
 }
 
-func show(err fault) str {
+fn show(err fault) str {
 	if err == nil {
 		return "nil"
 	}
 	return say.Str(err)
 }
 
-func worker(id i64) {
+fn worker(id i64) {
 	if id == 1 {
-		l, err := wire.Listen("127.0.0.1:0")
+		let (l, err) = wire.Listen("127.0.0.1:0")
 		if err != nil {
 			say.Line("listen", err)
 			return
 		}
 		relay.Send(0, mint.Itoa(l.Port()))
-		e2 := serve(l)
+		let e2 = serve(l)
 		if e2 != nil {
 			say.Line("serve error", e2)
 		}
 		l.Close()
 		return
 	}
-	_, port := relay.Recv()
-	base := "http://127.0.0.1:" + port
-	paths := []str{"/coalesced", "/split", "/early-chunked", "/five", "/six", "/only-continue", "/switch", "/stop"}
-	for _, p := range paths {
-		r, err := wire.Get(base + p)
+	let (_, port) = relay.Recv()
+	let base = "http://127.0.0.1:" + port
+	let paths = []str{"/coalesced", "/split", "/early-chunked", "/five", "/six", "/only-continue", "/switch", "/stop"}
+	for _, p in paths {
+		let (r, err) = wire.Get(base + p)
 		say.Line(p, r.Status, say.Fmt("%q", r.Body), say.Fmt("%q", r.Header("X-Final")), say.Fmt("%q", r.Header("Link")), show(err))
 	}
 }
 
-func main() {
+fn main() {
 	hearth.Run(2, worker)
 }

@@ -11,8 +11,8 @@ import "quarry"
 // multiplications on operands with holes (no carry reaches a kept bit), also constant-time.
 
 // aes_transpose transposes the 8x8 bit matrix in x (bit 8k+j becomes bit 8j+k).
-func aes_transpose(x u64) u64 {
-	t := (x ^ (x >> 7)) & 0x00AA00AA00AA00AA
+fn aes_transpose(x u64) u64 {
+	mut t = (x ^ (x >> 7)) & 0x00AA00AA00AA00AA
 	x = x ^ t ^ (t << 7)
 	t = (x ^ (x >> 14)) & 0x0000CCCC0000CCCC
 	x = x ^ t ^ (t << 14)
@@ -21,30 +21,30 @@ func aes_transpose(x u64) u64 {
 }
 
 // aes_pack loads four 16-byte blocks at p into the planes q.
-func aes_pack(q mut []u64, p i64) {
-	for i := 0; i < 8; i++ {
+fn aes_pack(q mut []u64, p i64) {
+	for i in 0..8 {
 		q[i] = 0
 	}
-	for blk := 0; blk < 4; blk++ {
-		a := aes_transpose(u64(__ld(p+16*blk, 3)))
-		b := aes_transpose(u64(__ld(p+16*blk+8, 3)))
-		sh := u64(16 * blk)
-		for i := 0; i < 8; i++ {
-			s := u64(8 * i)
+	for blk in 0..4 {
+		let a = aes_transpose(u64(__ld(p+16*blk, 3)))
+		let b = aes_transpose(u64(__ld(p+16*blk+8, 3)))
+		let sh = u64(16 * blk)
+		for i in 0..8 {
+			let s = u64(8 * i)
 			q[i] |= (((a >> s) & 0xff) | (((b >> s) & 0xff) << 8)) << sh
 		}
 	}
 }
 
 // aes_unpack stores the planes q as four 16-byte blocks at p.
-func aes_unpack(q []u64, p i64) {
-	for blk := 0; blk < 4; blk++ {
-		sh := u64(16 * blk)
-		a := u64(0)
-		b := u64(0)
-		for i := 0; i < 8; i++ {
-			lane := q[i] >> sh
-			s := u64(8 * i)
+fn aes_unpack(q []u64, p i64) {
+	for blk in 0..4 {
+		let sh = u64(16 * blk)
+		mut a = u64(0)
+		mut b = u64(0)
+		for i in 0..8 {
+			let lane = q[i] >> sh
+			let s = u64(8 * i)
 			a |= (lane & 0xff) << s
 			b |= ((lane >> 8) & 0xff) << s
 		}
@@ -54,9 +54,9 @@ func aes_unpack(q []u64, p i64) {
 }
 
 // aes_shift_rows moves the byte at (column c, row r) to (c - r mod 4, r) in every lane.
-func aes_shift_rows(q mut []u64) {
-	for i := 0; i < 8; i++ {
-		x := q[i]
+fn aes_shift_rows(q mut []u64) {
+	for i in 0..8 {
+		let x = q[i]
 		q[i] = (x & 0x1111111111111111) |
 			((x >> 4) & 0x0222022202220222) | ((x << 12) & 0x2000200020002000) |
 			((x >> 8) & 0x0044004400440044) | ((x << 8) & 0x4400440044004400) |
@@ -64,24 +64,24 @@ func aes_shift_rows(q mut []u64) {
 	}
 }
 
-func aes_rot1(x u64) u64 {
+fn aes_rot1(x u64) u64 {
 	return ((x >> 1) & 0x7777777777777777) | ((x << 3) & 0x8888888888888888)
 }
 
-func aes_rot2(x u64) u64 {
+fn aes_rot2(x u64) u64 {
 	return ((x >> 2) & 0x3333333333333333) | ((x << 2) & 0xcccccccccccccccc)
 }
 
 // aes_mix_columns is b_r = 2(a_r + a_r+1) + a_r+1 + a_r+2 + a_r+3 on every column.
-func aes_mix_columns(q mut []u64) {
-	t0 := q[0] ^ aes_rot1(q[0])
-	t1 := q[1] ^ aes_rot1(q[1])
-	t2 := q[2] ^ aes_rot1(q[2])
-	t3 := q[3] ^ aes_rot1(q[3])
-	t4 := q[4] ^ aes_rot1(q[4])
-	t5 := q[5] ^ aes_rot1(q[5])
-	t6 := q[6] ^ aes_rot1(q[6])
-	t7 := q[7] ^ aes_rot1(q[7])
+fn aes_mix_columns(q mut []u64) {
+	let t0 = q[0] ^ aes_rot1(q[0])
+	let t1 = q[1] ^ aes_rot1(q[1])
+	let t2 = q[2] ^ aes_rot1(q[2])
+	let t3 = q[3] ^ aes_rot1(q[3])
+	let t4 = q[4] ^ aes_rot1(q[4])
+	let t5 = q[5] ^ aes_rot1(q[5])
+	let t6 = q[6] ^ aes_rot1(q[6])
+	let t7 = q[7] ^ aes_rot1(q[7])
 	// a_r+1 + a_r+2 + a_r+3 = rot1(a + rot1(a)) + rot1... computed as rot1(q) + rot2(t).
 	q[0] = t7 ^ aes_rot1(q[0]) ^ aes_rot2(t0)
 	q[1] = t0 ^ t7 ^ aes_rot1(q[1]) ^ aes_rot2(t1)
@@ -94,40 +94,40 @@ func aes_mix_columns(q mut []u64) {
 }
 
 // aes_encrypt4 encrypts the four blocks in q with the bitsliced round keys rk (nr rounds).
-func aes_encrypt4(q mut []u64, rk []u64, nr i64) {
-	for i := 0; i < 8; i++ {
+fn aes_encrypt4(q mut []u64, rk []u64, nr i64) {
+	for i in 0..8 {
 		q[i] ^= rk[i]
 	}
-	for r := 1; r < nr; r++ {
+	for r in 1..nr {
 		aes_sbox(mut q)
 		aes_shift_rows(mut q)
 		aes_mix_columns(mut q)
-		for i := 0; i < 8; i++ {
+		for i in 0..8 {
 			q[i] ^= rk[8*r+i]
 		}
 	}
 	aes_sbox(mut q)
 	aes_shift_rows(mut q)
-	for i := 0; i < 8; i++ {
+	for i in 0..8 {
 		q[i] ^= rk[8*nr+i]
 	}
 }
 
 // aes_sub_word is the S-box on each byte of w, in constant time.
-func aes_sub_word(w u32) u32 {
+fn aes_sub_word(w u32) u32 {
 	if gcm_hw {
 		return u32(aes_hw_subword(u64(w)))
 	}
-	q := make([]u64, 8)
-	for i := 0; i < 8; i++ {
-		for b := 0; b < 4; b++ {
+	let q = make([]u64, 8)
+	for i in 0..8 {
+		for b in 0..4 {
 			q[i] |= u64((w >> u32(8*b+i)) & 1) << u64(b)
 		}
 	}
 	aes_sbox(mut q)
-	r := u32(0)
-	for i := 0; i < 8; i++ {
-		for b := 0; b < 4; b++ {
+	mut r = u32(0)
+	for i in 0..8 {
+		for b in 0..4 {
 			r |= u32((q[i] >> u64(b)) & 1) << u32(8*b+i)
 		}
 	}
@@ -135,17 +135,17 @@ func aes_sub_word(w u32) u32 {
 }
 
 // aes_expand returns the round keys of a 16-, 24- or 32-byte key as bytes (16*(nr+1)).
-func aes_expand(key []u8) []u8 {
-	nk := len(key) / 4
-	nr := nk + 6
-	total := 4 * (nr + 1)
-	w := make([]u32, total)
-	for i := 0; i < nk; i++ {
+fn aes_expand(key []u8) []u8 {
+	let nk = len(key) / 4
+	let nr = nk + 6
+	let total = 4 * (nr + 1)
+	let w = make([]u32, total)
+	for i in 0..nk {
 		w[i] = u32(key[4*i]) | u32(key[4*i+1])<<8 | u32(key[4*i+2])<<16 | u32(key[4*i+3])<<24
 	}
-	rcon := u32(1)
-	for i := nk; i < total; i++ {
-		t := w[i-1]
+	mut rcon = u32(1)
+	for i in nk..total {
+		mut t = w[i-1]
 		if i%nk == 0 {
 			t = aes_sub_word((t >> 8) | (t << 24)) ^ rcon
 			rcon = rcon << 1
@@ -157,8 +157,8 @@ func aes_expand(key []u8) []u8 {
 		}
 		w[i] = w[i-nk] ^ t
 	}
-	out := make([]u8, 4*total)
-	for i := 0; i < total; i++ {
+	let out = make([]u8, 4*total)
+	for i in 0..total {
 		out[4*i] = u8(w[i])
 		out[4*i+1] = u8(w[i] >> 8)
 		out[4*i+2] = u8(w[i] >> 16)
@@ -168,19 +168,19 @@ func aes_expand(key []u8) []u8 {
 }
 
 // aes_bitslice_keys turns byte round keys into planes, each lane repeated for the four blocks.
-func aes_bitslice_keys(rkb []u8) []u64 {
-	n := len(rkb) / 16
-	out := make([]u64, 8*n)
-	buf := make([]u8, 64)
-	q := make([]u64, 8)
-	for r := 0; r < n; r++ {
-		for b := 0; b < 4; b++ {
-			for i := 0; i < 16; i++ {
+fn aes_bitslice_keys(rkb []u8) []u64 {
+	let n = len(rkb) / 16
+	let out = make([]u64, 8*n)
+	let buf = make([]u8, 64)
+	let q = make([]u64, 8)
+	for r in 0..n {
+		for b in 0..4 {
+			for i in 0..16 {
 				buf[16*b+i] = rkb[16*r+i]
 			}
 		}
 		aes_pack(mut q, cast(i64, buf)[2])
-		for i := 0; i < 8; i++ {
+		for i in 0..8 {
 			out[8*r+i] = q[i]
 		}
 	}
@@ -194,34 +194,34 @@ func aes_bitslice_keys(rkb []u8) []u64 {
 // TIN_SEAL_SOFT=1 in the environment forces the software path (for tests).
 
 // gcm_hw is true when AES-GCM uses the CPU's instructions (decided once per core).
-var gcm_hw = aes_hw() && quarry.Getenv("TIN_SEAL_SOFT") != "1"
+let gcm_hw = aes_hw() && quarry.Getenv("TIN_SEAL_SOFT") != "1"
 
 // AESHardware reports whether AES-GCM runs on the CPU's AES instructions here (AES-NI and
 // PCLMULQDQ, or ARMv8 AES and PMULL); without them it runs a slower constant-time software
 // path and ChaCha20-Poly1305 is the faster choice.
-func AESHardware() bool {
+fn AESHardware() bool {
 	return gcm_hw
 }
 
 // aes_hw_ctr XORs n 16-byte blocks at src with AES(rk, counter) into dst, incrementing the
 // counter block at ctr (big-endian, last four bytes) per block.
-func aes_hw_ctr(rk i64, nr i64, ctr i64, src i64, dst i64, n i64) {
+fn aes_hw_ctr(rk i64, nr i64, ctr i64, src i64, dst i64, n i64) {
 	rt_panic("seal: hardware AES is not available for this target")
 }
 
 // aes_hw_subword is the S-box on each byte of w, on the CPU's AES instructions.
-func aes_hw_subword(w u64) u64 {
+fn aes_hw_subword(w u64) u64 {
 	rt_panic("seal: hardware AES is not available for this target")
 	return 0
 }
 
 // ghash_hw folds n 16-byte blocks at data into the GHASH state at state under H at h.
-func ghash_hw(state i64, h i64, data i64, n i64) {
+fn ghash_hw(state i64, h i64, data i64, n i64) {
 	rt_panic("seal: hardware GHASH is not available for this target")
 }
 
 // aes_hw_cpu is 1 when an x86-64 CPU has AES-NI, PCLMULQDQ, SSSE3 and SSE4.1 (CPUID).
-func aes_hw_cpu() i64 {
+fn aes_hw_cpu() i64 {
 	rt_panic("seal: CPUID is only available on x86-64")
 	return 0
 }
@@ -230,65 +230,65 @@ func aes_hw_cpu() i64 {
 
 // clmul32 is the carry-less product of two 32-bit values, with integer multiplications on
 // operands that keep three zero bits between kept bits so carries never reach them.
-func clmul32(x u64, y u64) u64 {
-	x0 := x & 0x11111111
-	x1 := x & 0x22222222
-	x2 := x & 0x44444444
-	x3 := x & 0x88888888
-	y0 := y & 0x11111111
-	y1 := y & 0x22222222
-	y2 := y & 0x44444444
-	y3 := y & 0x88888888
-	z0 := (x0 * y0) ^ (x1 * y3) ^ (x2 * y2) ^ (x3 * y1)
-	z1 := (x0 * y1) ^ (x1 * y0) ^ (x2 * y3) ^ (x3 * y2)
-	z2 := (x0 * y2) ^ (x1 * y1) ^ (x2 * y0) ^ (x3 * y3)
-	z3 := (x0 * y3) ^ (x1 * y2) ^ (x2 * y1) ^ (x3 * y0)
+fn clmul32(x u64, y u64) u64 {
+	let x0 = x & 0x11111111
+	let x1 = x & 0x22222222
+	let x2 = x & 0x44444444
+	let x3 = x & 0x88888888
+	let y0 = y & 0x11111111
+	let y1 = y & 0x22222222
+	let y2 = y & 0x44444444
+	let y3 = y & 0x88888888
+	let z0 = (x0 * y0) ^ (x1 * y3) ^ (x2 * y2) ^ (x3 * y1)
+	let z1 = (x0 * y1) ^ (x1 * y0) ^ (x2 * y3) ^ (x3 * y2)
+	let z2 = (x0 * y2) ^ (x1 * y1) ^ (x2 * y0) ^ (x3 * y3)
+	let z3 = (x0 * y3) ^ (x1 * y2) ^ (x2 * y1) ^ (x3 * y0)
 	return (z0 & 0x1111111111111111) | (z1 & 0x2222222222222222) | (z2 & 0x4444444444444444) | (z3 & 0x8888888888888888)
 }
 
 // clmul64 is the 128-bit carry-less product of x and y as (high, low).
-func clmul64(x u64, y u64) (u64, u64) {
-	xl := x & 0xffffffff
-	xh := x >> 32
-	yl := y & 0xffffffff
-	yh := y >> 32
-	lo := clmul32(xl, yl)
-	hi := clmul32(xh, yh)
-	mid := clmul32(xl, yh) ^ clmul32(xh, yl)
+fn clmul64(x u64, y u64) (u64, u64) {
+	let xl = x & 0xffffffff
+	let xh = x >> 32
+	let yl = y & 0xffffffff
+	let yh = y >> 32
+	let lo = clmul32(xl, yl)
+	let hi = clmul32(xh, yh)
+	let mid = clmul32(xl, yh) ^ clmul32(xh, yl)
 	return hi ^ (mid >> 32), lo ^ (mid << 32)
 }
 
 // ghash_mul is (a1:a0) * (h1:h0) in GF(2^128) with x^i at bit i (GCM's bits reversed).
-func ghash_mul(a0 u64, a1 u64, h0 u64, h1 u64) (u64, u64) {
+fn ghash_mul(a0 u64, a1 u64, h0 u64, h1 u64) (u64, u64) {
 	// Karatsuba: three 64x64 products.
-	l1, l0 := clmul64(a0, h0)
-	m1, m0 := clmul64(a1, h1)
-	k1, k0 := clmul64(a0^a1, h0^h1)
+	let (l1, l0) = clmul64(a0, h0)
+	let (m1, m0) = clmul64(a1, h1)
+	mut (k1, k0) = clmul64(a0^a1, h0^h1)
 	k0 ^= l0 ^ m0
 	k1 ^= l1 ^ m1
-	p0 := l0
-	p1 := l1 ^ k0
-	p2 := m0 ^ k1
-	p3 := m1
+	let p0 = l0
+	let p1 = l1 ^ k0
+	let p2 = m0 ^ k1
+	let p3 = m1
 	// Reduce mod x^128 + x^7 + x^2 + x + 1.
-	r0 := p0 ^ p2 ^ (p2 << 1) ^ (p2 << 2) ^ (p2 << 7)
-	r1 := p1 ^ p3 ^ ((p3 << 1) | (p2 >> 63)) ^ ((p3 << 2) | (p2 >> 62)) ^ ((p3 << 7) | (p2 >> 57))
-	t := (p3 >> 63) ^ (p3 >> 62) ^ (p3 >> 57)
+	mut r0 = p0 ^ p2 ^ (p2 << 1) ^ (p2 << 2) ^ (p2 << 7)
+	let r1 = p1 ^ p3 ^ ((p3 << 1) | (p2 >> 63)) ^ ((p3 << 2) | (p2 >> 62)) ^ ((p3 << 7) | (p2 >> 57))
+	let t = (p3 >> 63) ^ (p3 >> 62) ^ (p3 >> 57)
 	r0 ^= t ^ (t << 1) ^ (t << 2) ^ (t << 7)
 	return r0, r1
 }
 
-func be64u(p i64) u64 {
+fn be64u(p i64) u64 {
 	return bits.ReverseBytes64(u64(__ld(p, 3)))
 }
 
 // ghash_blocks folds n bytes at p (zero-padded to 16) into the state (y0, y1) under H.
-func ghash_blocks(y0 u64, y1 u64, h0 u64, h1 u64, p i64, n i64) (u64, u64) {
-	pad := make([]u8, 16)
-	for off := 0; off < n; off += 16 {
-		q := p + off
+fn ghash_blocks(y0 u64, y1 u64, h0 u64, h1 u64, p i64, n i64) (u64, u64) {
+	let pad = make([]u8, 16)
+	for off in (0..n).step(16) {
+		mut q = p + off
 		if n-off < 16 {
-			for i := 0; i < n-off; i++ {
+			for i in 0..n-off {
 				pad[i] = load8(q + i)
 			}
 			q = cast(i64, pad)[2]
@@ -304,36 +304,36 @@ func ghash_blocks(y0 u64, y1 u64, h0 u64, h1 u64, p i64, n i64) (u64, u64) {
 
 // gcm_ctr XORs n bytes at src with the keystream from counter block j (incremented per
 // block, big-endian in its last four bytes) into dst.
-func gcm_ctr(a AEAD, dst i64, src i64, n i64, j mut []u8) {
+fn gcm_ctr(a AEAD, dst i64, src i64, n i64, j mut []u8) {
 	if a.hw {
-		full := n / 16
-		jp := cast(i64, j)[2]
-		rkp := cast(i64, a.rkb)[2]
+		let full = n / 16
+		let jp = cast(i64, j)[2]
+		let rkp = cast(i64, a.rkb)[2]
 		aes_hw_ctr(rkp, a.nr, jp, src, dst, full)
-		rest := n - 16*full
+		let rest = n - 16*full
 		if rest > 0 {
-			blk := make([]u8, 16)
-			bp := cast(i64, blk)[2]
-			for i := 0; i < rest; i++ {
+			let blk = make([]u8, 16)
+			let bp = cast(i64, blk)[2]
+			for i in 0..rest {
 				blk[i] = load8(src + 16*full + i)
 			}
 			aes_hw_ctr(rkp, a.nr, jp, bp, bp, 1)
-			for i := 0; i < rest; i++ {
+			for i in 0..rest {
 				store8(dst+16*full+i, blk[i])
 			}
 		}
 		return
 	}
-	q := make([]u64, 8)
-	ks := make([]u8, 64)
-	kp := cast(i64, ks)[2]
-	for off := 0; off < n; off += 64 {
-		for b := 0; b < 4; b++ {
-			for i := 0; i < 16; i++ {
+	let q = make([]u64, 8)
+	let ks = make([]u8, 64)
+	let kp = cast(i64, ks)[2]
+	for off in (0..n).step(64) {
+		for b in 0..4 {
+			for i in 0..16 {
 				ks[16*b+i] = j[i]
 			}
-			ctr := u32(j[12])<<24 | u32(j[13])<<16 | u32(j[14])<<8 | u32(j[15])
-			ctr++
+			mut ctr = u32(j[12])<<24 | u32(j[13])<<16 | u32(j[14])<<8 | u32(j[15])
+			ctr += 1
 			j[12] = u8(ctr >> 24)
 			j[13] = u8(ctr >> 16)
 			j[14] = u8(ctr >> 8)
@@ -342,53 +342,53 @@ func gcm_ctr(a AEAD, dst i64, src i64, n i64, j mut []u8) {
 		aes_pack(mut q, kp)
 		aes_encrypt4(mut q, a.rk, a.nr)
 		aes_unpack(q, kp)
-		m := n - off
+		mut m = n - off
 		if m > 64 {
 			m = 64
 		}
-		for i := 0; i < m; i++ {
+		for i in 0..m {
 			store8(dst+off+i, load8(src+off+i)^ks[i])
 		}
 	}
 }
 
 // gcm_tag is GHASH(aad, ct) xor E(J0).
-func gcm_tag(a AEAD, nonce []u8, aad []u8, ct i64, n i64) []u8 {
+fn gcm_tag(a AEAD, nonce []u8, aad []u8, ct i64, n i64) []u8 {
 	if a.hw {
 		return gcm_tag_hw(a, nonce, aad, ct, n)
 	}
-	y0, y1 := ghash_blocks(0, 0, a.h0, a.h1, cast(i64, aad)[2], len(aad))
+	mut (y0, y1) = ghash_blocks(0, 0, a.h0, a.h1, cast(i64, aad)[2], len(aad))
 	y0, y1 = ghash_blocks(y0, y1, a.h0, a.h1, ct, n)
-	lens := make([]u8, 16)
-	for i := 0; i < 8; i++ {
+	let lens = make([]u8, 16)
+	for i in 0..8 {
 		lens[7-i] = u8(u64(len(aad)) * 8 >> u64(8*i))
 		lens[15-i] = u8(u64(n) * 8 >> u64(8*i))
 	}
 	y0, y1 = ghash_blocks(y0, y1, a.h0, a.h1, cast(i64, lens)[2], 16)
-	j0 := make([]u8, 16)
-	for i := 0; i < 12; i++ {
+	let j0 = make([]u8, 16)
+	for i in 0..12 {
 		j0[i] = nonce[i]
 	}
 	j0[15] = 1
-	ek := make([]u8, 16)
+	let ek = make([]u8, 16)
 	gcm_ctr(a, cast(i64, ek)[2], cast(i64, ek)[2], 16, mut j0)
-	tag := make([]u8, 16)
-	tp := cast(i64, tag)[2]
+	let tag = make([]u8, 16)
+	let tp = cast(i64, tag)[2]
 	__st(tp, i64(bits.ReverseBytes64(bits.Reverse64(y0))), 3)
 	__st(tp+8, i64(bits.ReverseBytes64(bits.Reverse64(y1))), 3)
-	for i := 0; i < 16; i++ {
+	for i in 0..16 {
 		tag[i] ^= ek[i]
 	}
 	return tag
 }
 
 // ghash_hw_bytes folds n bytes at p (zero-padded to 16) into the state at sp.
-func ghash_hw_bytes(sp i64, hp i64, p i64, n i64) {
-	full := n / 16
+fn ghash_hw_bytes(sp i64, hp i64, p i64, n i64) {
+	let full = n / 16
 	ghash_hw(sp, hp, p, full)
 	if n > 16*full {
-		pad := make([]u8, 16)
-		for i := 0; i < n-16*full; i++ {
+		let pad = make([]u8, 16)
+		for i in 0..n-16*full {
 			pad[i] = load8(p + 16*full + i)
 		}
 		ghash_hw(sp, hp, cast(i64, pad)[2], 1)
@@ -396,20 +396,20 @@ func ghash_hw_bytes(sp i64, hp i64, p i64, n i64) {
 }
 
 // gcm_tag_hw is gcm_tag with the CPU's instructions.
-func gcm_tag_hw(a AEAD, nonce []u8, aad []u8, ct i64, n i64) []u8 {
-	st := make([]u8, 16)
-	sp := cast(i64, st)[2]
-	hp := cast(i64, a.hb)[2]
+fn gcm_tag_hw(a AEAD, nonce []u8, aad []u8, ct i64, n i64) []u8 {
+	let st = make([]u8, 16)
+	let sp = cast(i64, st)[2]
+	let hp = cast(i64, a.hb)[2]
 	ghash_hw_bytes(sp, hp, cast(i64, aad)[2], len(aad))
 	ghash_hw_bytes(sp, hp, ct, n)
-	lens := make([]u8, 16)
-	for i := 0; i < 8; i++ {
+	let lens = make([]u8, 16)
+	for i in 0..8 {
 		lens[7-i] = u8(u64(len(aad)) * 8 >> u64(8*i))
 		lens[15-i] = u8(u64(n) * 8 >> u64(8*i))
 	}
 	ghash_hw(sp, hp, cast(i64, lens)[2], 1)
-	j0 := make([]u8, 16)
-	for i := 0; i < 12; i++ {
+	let j0 = make([]u8, 16)
+	for i in 0..12 {
 		j0[i] = nonce[i]
 	}
 	j0[15] = 1
@@ -418,40 +418,40 @@ func gcm_tag_hw(a AEAD, nonce []u8, aad []u8, ct i64, n i64) []u8 {
 }
 
 // gcm_counter is J0 + 1: the counter block of the first data block.
-func gcm_counter(nonce []u8) []u8 {
-	j := make([]u8, 16)
-	for i := 0; i < 12; i++ {
+fn gcm_counter(nonce []u8) []u8 {
+	let j = make([]u8, 16)
+	for i in 0..12 {
 		j[i] = nonce[i]
 	}
 	j[15] = 2
 	return j
 }
 
-func gcm_seal(a AEAD, nonce []u8, plaintext []u8, aad []u8) []u8 {
-	n := len(plaintext)
-	out := make([]u8, n+16)
-	op := cast(i64, out)[2]
+fn gcm_seal(a AEAD, nonce []u8, plaintext []u8, aad []u8) []u8 {
+	let n = len(plaintext)
+	let out = make([]u8, n+16)
+	let op = cast(i64, out)[2]
 	if n > 0 {
 		gcm_ctr(a, op, cast(i64, plaintext)[2], n, mut gcm_counter(nonce))
 	}
-	tag := gcm_tag(a, nonce, aad, op, n)
-	for i := 0; i < 16; i++ {
+	let tag = gcm_tag(a, nonce, aad, op, n)
+	for i in 0..16 {
 		out[n+i] = tag[i]
 	}
 	return out
 }
 
-func gcm_open(a AEAD, nonce []u8, sealed []u8, aad []u8) ![]u8 {
+fn gcm_open(a AEAD, nonce []u8, sealed []u8, aad []u8) ![]u8 {
 	if len(sealed) < 16 {
 		fail "seal: message authentication failed"
 	}
-	n := len(sealed) - 16
-	sp := cast(i64, sealed)[2]
-	tag := gcm_tag(a, nonce, aad, sp, n)
+	let n = len(sealed) - 16
+	let sp = cast(i64, sealed)[2]
+	let tag = gcm_tag(a, nonce, aad, sp, n)
 	if !ConstantTimeEq(tag, sealed[n:]) {
 		fail "seal: message authentication failed"
 	}
-	out := make([]u8, n)
+	let out = make([]u8, n)
 	if n > 0 {
 		gcm_ctr(a, cast(i64, out)[2], sp, n, mut gcm_counter(nonce))
 	}
@@ -460,24 +460,24 @@ func gcm_open(a AEAD, nonce []u8, sealed []u8, aad []u8) ![]u8 {
 
 // NewAESGCM is AES-GCM (16-byte tags, 12-byte nonces) with a 16-, 24- or 32-byte key
 // (AES-128, AES-192 or AES-256).
-func NewAESGCM(key secret []u8) !AEAD {
+fn NewAESGCM(key secret []u8) !AEAD {
 	if len(key) != 16 && len(key) != 24 && len(key) != 32 {
 		fail "seal: AES key must be 16, 24 or 32 bytes"
 	}
-	rkb := aes_expand(key)
-	nr := len(key)/4 + 6
+	let rkb = aes_expand(key)
+	let nr = len(key)/4 + 6
 	if gcm_hw {
 		// H = E(0^128), in GCM's byte order for the hardware GHASH.
-		h := make([]u8, 16)
-		ctr := make([]u8, 16)
+		let h = make([]u8, 16)
+		let ctr = make([]u8, 16)
 		aes_hw_ctr(cast(i64, rkb)[2], nr, cast(i64, ctr)[2], cast(i64, h)[2], cast(i64, h)[2], 1)
 		return AEAD{kind: aeadAESGCM, rkb: rkb, nr: nr, hw: true, hb: h}
 	}
-	a := AEAD{kind: aeadAESGCM, rk: aes_bitslice_keys(rkb), nr: nr}
+	let a = AEAD{kind: aeadAESGCM, rk: aes_bitslice_keys(rkb), nr: nr}
 	// H = E(0^128), kept with its bits reversed.
-	z := make([]u8, 64)
-	q := make([]u64, 8)
-	zp := cast(i64, z)[2]
+	let z = make([]u8, 64)
+	let q = make([]u64, 8)
+	let zp = cast(i64, z)[2]
 	aes_pack(mut q, zp)
 	aes_encrypt4(mut q, a.rk, a.nr)
 	aes_unpack(q, zp)

@@ -15,22 +15,22 @@ const maxCores = 256
 // Box words: 0 head (producers swap in here), 1 tail (owner only), 2 waiting (owner is
 // blocked: wake it through the pipe), 3 pipe read fd, 4 pipe write fd, 5 state (2 ready),
 // 6 messages received.
-shared var boxes i64 = calloc(maxCores, 64)
+shared let boxes i64 = calloc(maxCores, 64)
 
-func box(core i64) i64 {
+fn box(core i64) i64 {
 	if core < 0 || core >= maxCores {
 		rt_panic("relay: no such core")
 	}
-	b := boxes + core*64
-	st := __atomic_load(b + 40)
+	let b = boxes + core*64
+	let st = __atomic_load(b + 40)
 	if st == 2 {
 		return b
 	}
 	if st == 0 && __atomic_cas(b+40, 0, 1) == 0 {
-		stub := calloc(1, 32)
+		let stub = calloc(1, 32)
 		b[0] = stub
 		b[1] = stub
-		fds := calloc(2, 4)
+		let fds = calloc(2, 4)
 		rt_sys_pipe(fds)
 		b[3] = __ld(fds, 2)
 		b[4] = __ld(fds+4, 2)
@@ -46,28 +46,28 @@ func box(core i64) i64 {
 }
 
 // Send copies msg into core to's inbox; it never blocks.
-func Send(to i64, msg str) {
-	b := box(to)
-	n := len(msg)
-	node := malloc(24 + n)
+fn Send(to i64, msg str) {
+	let b = box(to)
+	let n = len(msg)
+	let node = malloc(24 + n)
 	node[0] = 0
 	node[1] = rt_core_id()
 	node[2] = n
 	memcpy(node+24, cast(i64, msg)+8, n)
-	prev := __atomic_swap(b, node)
+	let prev = __atomic_swap(b, node)
 	__atomic_store(prev, node)
 	if __atomic_swap(b+16, 0) != 0 {
-		word := calloc(1, 8)
+		let word = calloc(1, 8)
 		rt_sys_write(b[4], word, 1)
 		free(word)
 	}
 }
 
 // Broadcast sends msg to every other running core.
-func Broadcast(msg str) {
-	me := rt_core_id()
-	n := Cores()
-	for c := 0; c < n; c++ {
+fn Broadcast(msg str) {
+	let me = rt_core_id()
+	let n = Cores()
+	for c in 0..n {
 		if c != me {
 			Send(c, msg)
 		}
@@ -75,36 +75,36 @@ func Broadcast(msg str) {
 }
 
 // Cores is the number of cores the program started.
-func Cores() i64 {
+fn Cores() i64 {
 	return __atomic_load(&rtCores)
 }
 
 // TryRecv returns the next message for this core, if there is one.
-func TryRecv() (i64, str, bool) {
-	b := box(rt_core_id())
-	tail := b[1]
-	next := __atomic_load(tail)
+fn TryRecv() (i64, str, bool) {
+	let b = box(rt_core_id())
+	let tail = b[1]
+	let next = __atomic_load(tail)
 	if next == 0 {
 		return 0, "", false
 	}
 	b[1] = next
 	free(tail)
-	b[6]++
+	b[6] += 1
 	return next[1], rt_str_from_raw(next+24, next[2]), true
 }
 
 // Recv blocks until a message for this core arrives and returns its sender and text. It
 // blocks the whole core and ignores deadlines and cancels; use Next in tasks and within blocks.
-func Recv() (i64, str) {
-	b := box(rt_core_id())
+fn Recv() (i64, str) {
+	let b = box(rt_core_id())
 	for {
-		from, msg, ok := TryRecv()
+		let (from, msg, ok) = TryRecv()
 		if ok {
 			return from, msg
 		}
 		// Ask senders to wake us, then look once more before sleeping (no lost wake-ups).
 		__atomic_store(b+16, 1)
-		from2, msg2, ok2 := TryRecv()
+		let (from2, msg2, ok2) = TryRecv()
 		if ok2 {
 			__atomic_store(b+16, 0)
 			return from2, msg2
@@ -115,16 +115,16 @@ func Recv() (i64, str) {
 }
 
 // nextWaiting is true while a task on this core waits on the wake pipe in Next.
-var nextWaiting = false
+mut nextWaiting = false
 
 // Next waits until a message for this core arrives and returns its sender and text. Unlike
 // Recv it waits through rt_task_wait: inside a task the core serves other tasks meanwhile,
 // and a deadline (within, the request's) or a cancel ends the wait with that fault. Under
 // anvil.OnRelay the event loop takes every message, so do not call Next there.
-func Next() !(i64, str) {
-	b := box(rt_core_id())
+fn Next() !(i64, str) {
+	let b = box(rt_core_id())
 	for {
-		from, msg, ok := TryRecv()
+		let (from, msg, ok) = TryRecv()
 		if ok {
 			return from, msg
 		}
@@ -137,13 +137,13 @@ func Next() !(i64, str) {
 		}
 		// Ask senders to wake us, then look once more before sleeping (no lost wake-ups).
 		__atomic_store(b+16, 1)
-		from2, msg2, ok2 := TryRecv()
+		let (from2, msg2, ok2) = TryRecv()
 		if ok2 {
 			__atomic_store(b+16, 0)
 			return from2, msg2
 		}
 		nextWaiting = true
-		r := rt_task_wait(b[3], 1, 0)
+		let r = rt_task_wait(b[3], 1, 0)
 		nextWaiting = false
 		if r == waitDeadline {
 			fail cast(fault, rt_wait_fault())
@@ -152,16 +152,16 @@ func Next() !(i64, str) {
 	}
 }
 
-func drain_pipe(fd i64) {
-	word := calloc(1, 64)
+fn drain_pipe(fd i64) {
+	let word = calloc(1, 64)
 	for rt_sys_read(fd, word, 64) > 0 {
 	}
 	free(word)
 }
 
 
-func wait_readable(fd i64) {
-	p := calloc(1, 8)
+fn wait_readable(fd i64) {
+	let p = calloc(1, 8)
 	__st(p, fd, 2)
 	__st(p+4, 1, 1)
 	rt_sys_poll(p, 1, 100)
@@ -170,22 +170,22 @@ func wait_readable(fd i64) {
 
 // WakeFD is this core's wake-up descriptor, for event loops: after it turns readable,
 // call Drain. Arm must be called before the loop blocks.
-func WakeFD() i64 {
+fn WakeFD() i64 {
 	return box(rt_core_id())[3]
 }
 
 // Arm asks senders to wake this core through WakeFD (call just before blocking).
-func Arm() {
+fn Arm() {
 	__atomic_store(box(rt_core_id())+16, 1)
 }
 
 // Drain runs h on every waiting message (event loops call it after WakeFD fires).
-func Drain(h func(i64, str)) {
-	b := box(rt_core_id())
+fn Drain(h fn(i64, str)) {
+	let b = box(rt_core_id())
 	__atomic_store(b+16, 0)
 	drain_pipe(b[3])
 	for {
-		from, msg, ok := TryRecv()
+		let (from, msg, ok) = TryRecv()
 		if !ok {
 			return
 		}
@@ -194,11 +194,11 @@ func Drain(h func(i64, str)) {
 }
 
 // Received is how many messages this core has taken from its inbox.
-func Received() i64 {
+fn Received() i64 {
 	return box(rt_core_id())[6]
 }
 
 // Me is this core's number.
-func Me() i64 {
+fn Me() i64 {
 	return hearth.ID()
 }

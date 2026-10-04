@@ -29,20 +29,20 @@ type Writer struct {
 	err fault
 }
 
-func errno_fault(what str) ! {
-	e := rt_errno()
-	m := rt_sys_strerror(e)
+fn errno_fault(what str) ! {
+	let e = rt_errno()
+	let m = rt_sys_strerror(e)
 	fail say.Fault("flume: %s: %s", what, rt_str_from_raw(m, strlen(m)))
 }
 
 // New reads from fd.
-func New(fd i64) Reader {
+fn New(fd i64) Reader {
 	return Reader{open: true, fd: fd, buf: make([]u8, bufSize)}
 }
 
 // Open reads the file at path.
-func Open(path str) !Reader {
-	fd := i64(i32(rt_sys_open(cast(i64, path)+8, 0, 0)))
+fn Open(path str) !Reader {
+	let fd = i64(i32(rt_sys_open(cast(i64, path)+8, 0, 0)))
 	if fd < 0 {
 		fail errno_fault(path)
 	}
@@ -50,7 +50,7 @@ func Open(path str) !Reader {
 }
 
 // Close closes the reader's descriptor.
-func (r mut Reader) Close() {
+fn (r mut Reader) Close() {
 	if r.open {
 		rt_sys_close(r.fd)
 		r.open = false
@@ -58,7 +58,7 @@ func (r mut Reader) Close() {
 }
 
 // more reads the next chunk, keeping the unread bytes at the front; false at end or error.
-func (r mut Reader) more() bool {
+fn (r mut Reader) more() bool {
 	if r.waited {
 		r.err = nil
 		r.waited = false
@@ -71,18 +71,18 @@ func (r mut Reader) more() bool {
 		return false
 	}
 	if r.pos > 0 {
-		n := r.fill - r.pos
-		h := cast(i64, r.buf)
+		let n = r.fill - r.pos
+		let h = cast(i64, r.buf)
 		memmove(h[2], h[2]+r.pos, n)
 		r.fill = n
 		r.pos = 0
 	}
 	if r.fill == len(r.buf) {
-		bigger := make([]u8, 2*len(r.buf))
+		let bigger = make([]u8, 2*len(r.buf))
 		copy(bigger, r.buf)
 		r.buf = bigger
 	}
-	h2 := cast(i64, r.buf)
+	let h2 = cast(i64, r.buf)
 	// Inside a task a pipe, socket or terminal is waited on, so deadlines and cancels apply.
 	if rt_task_current() != 0 && r.waits() {
 		if rt_task_wait(r.fd, 1, 0) == waitDeadline {
@@ -91,7 +91,7 @@ func (r mut Reader) more() bool {
 			return false
 		}
 	}
-	n := rt_sys_read(r.fd, h2[2]+r.fill, len(r.buf)-r.fill)
+	let n = rt_sys_read(r.fd, h2[2]+r.fill, len(r.buf)-r.fill)
 	if n < 0 && rt_errno() == EAGAIN && rt_task_current() != 0 && r.waits() {
 		return r.more()
 	}
@@ -108,12 +108,12 @@ func (r mut Reader) more() bool {
 }
 
 // waits reports whether the reader's descriptor is a pipe, socket or terminal.
-func (r mut Reader) waits() bool {
+fn (r mut Reader) waits() bool {
 	if r.wait == 0 {
 		r.wait = 2
-		st := calloc(1, 256)
+		let st = calloc(1, 256)
 		if i64(i32(rt_sys_fstat(r.fd, st))) == 0 {
-			t := rt_stat_mode(st) & 0xf000
+			let t = rt_stat_mode(st) & 0xf000
 			if t == 0x1000 || t == 0xc000 || (t == 0x2000 && rt_isatty(r.fd)) {
 				r.wait = 1
 			}
@@ -124,17 +124,17 @@ func (r mut Reader) waits() bool {
 }
 
 // Line returns the next line without its "\n" (or "\r\n"); ok is false at the end.
-func (r mut Reader) Line() !(str, bool) {
-	start := 0
+fn (r mut Reader) Line() !(str, bool) {
+	mut start = 0
 	for {
-		h := cast(i64, r.buf)
-		for i := r.pos + start; i < r.fill; i++ {
+		let h = cast(i64, r.buf)
+		for i in r.pos + start..r.fill {
 			if load8(h[2]+i) == '\n' {
-				end := i
+				mut end = i
 				if end > r.pos && load8(h[2]+end-1) == '\r' {
-					end--
+					end -= 1
 				}
-				line := rt_str_from_raw(h[2]+r.pos, end-r.pos)
+				let line = rt_str_from_raw(h[2]+r.pos, end-r.pos)
 				r.pos = i + 1
 				return line, true
 			}
@@ -145,12 +145,12 @@ func (r mut Reader) Line() !(str, bool) {
 				fail r.err
 			}
 			if r.fill > r.pos {
-				h3 := cast(i64, r.buf)
-				end2 := r.fill
+				let h3 = cast(i64, r.buf)
+				mut end2 = r.fill
 				if load8(h3[2]+end2-1) == '\r' {
-					end2--
+					end2 -= 1
 				}
-				line2 := rt_str_from_raw(h3[2]+r.pos, end2-r.pos)
+				let line2 = rt_str_from_raw(h3[2]+r.pos, end2-r.pos)
 				r.pos = r.fill
 				return line2, true
 			}
@@ -160,49 +160,49 @@ func (r mut Reader) Line() !(str, bool) {
 }
 
 // Byte returns the next byte; ok is false at the end.
-func (r mut Reader) Byte() (u8, bool) {
+fn (r mut Reader) Byte() (u8, bool) {
 	if r.pos >= r.fill && !r.more() {
 		return 0, false
 	}
-	c := r.buf[r.pos]
-	r.pos++
+	let c = r.buf[r.pos]
+	r.pos += 1
 	return c, true
 }
 
 // ReadAll returns everything left.
-func (r mut Reader) ReadAll() !str {
+fn (r mut Reader) ReadAll() !str {
 	for r.more() {
 	}
 	if r.err != nil {
 		fail r.err
 	}
-	h := cast(i64, r.buf)
-	s := rt_str_from_raw(h[2]+r.pos, r.fill-r.pos)
+	let h = cast(i64, r.buf)
+	let s = rt_str_from_raw(h[2]+r.pos, r.fill-r.pos)
 	r.pos = r.fill
 	return s
 }
 
 // ReadFile returns the contents of the file at path.
-func ReadFile(path str) !str {
-	r := try Open(path)
+fn ReadFile(path str) !str {
+	let r = try Open(path)
 	defer r.Close()
 	return try r.ReadAll()
 }
 
 // NewWriter writes to fd.
-func NewWriter(fd i64) Writer {
+fn NewWriter(fd i64) Writer {
 	return Writer{open: true, fd: fd, buf: make([]u8, 0, bufSize)}
 }
 
 // Stdout writes to standard output (flush it before mixing with say output).
-func Stdout() Writer {
+fn Stdout() Writer {
 	rt_flush()
 	return NewWriter(1)
 }
 
 // Create truncates or creates the file at path for writing.
-func Create(path str) !Writer {
-	fd := i64(i32(rt_sys_open(cast(i64, path)+8, O_WRITE_CREATE, 420)))
+fn Create(path str) !Writer {
+	let fd = i64(i32(rt_sys_open(cast(i64, path)+8, O_WRITE_CREATE, 420)))
 	if fd < 0 {
 		fail errno_fault(path)
 	}
@@ -210,7 +210,7 @@ func Create(path str) !Writer {
 }
 
 // Str appends s.
-func (w mut Writer) Str(s str) {
+fn (w mut Writer) Str(s str) {
 	if len(w.buf)+len(s) > bufSize && w.Flush() != nil {
 		return
 	}
@@ -218,7 +218,7 @@ func (w mut Writer) Str(s str) {
 }
 
 // Byte appends c.
-func (w mut Writer) Byte(c u8) {
+fn (w mut Writer) Byte(c u8) {
 	if len(w.buf)+1 > bufSize && w.Flush() != nil {
 		return
 	}
@@ -226,29 +226,29 @@ func (w mut Writer) Byte(c u8) {
 }
 
 // Int appends v in decimal.
-func (w mut Writer) Int(v i64) {
+fn (w mut Writer) Int(v i64) {
 	w.Str(say.Str(v))
 }
 
 // Line appends s and a newline.
-func (w mut Writer) Line(s str) {
+fn (w mut Writer) Line(s str) {
 	w.Str(s)
 	w.Byte('\n')
 }
 
 // Flush writes everything buffered (with as few writes as the descriptor allows).
-func (w mut Writer) Flush() ! {
-	h := cast(i64, w.buf)
-	p := h[2]
-	n := h[0]
+fn (w mut Writer) Flush() ! {
+	let h = cast(i64, w.buf)
+	mut p = h[2]
+	mut n = h[0]
 	if n > 0 && !w.open {
 		w.err = fail("flume: write: writer is closed")
 		n = 0
 	}
 	for n > 0 {
-		k := rt_sys_write(w.fd, p, n)
+		let k = rt_sys_write(w.fd, p, n)
 		if k < 0 {
-			e := rt_errno()
+			let e = rt_errno()
 			if e == 4 {
 				continue
 			}
@@ -263,12 +263,12 @@ func (w mut Writer) Flush() ! {
 }
 
 // Close flushes and closes the writer's descriptor once; closing again (or a writer that never opened) is a fault.
-func (w mut Writer) Close() ! {
+fn (w mut Writer) Close() ! {
 	if !w.open {
 		fail "flume: close: writer is closed"
 	}
-	err := w.Flush()
-	fd := w.fd
+	mut err = w.Flush()
+	let fd = w.fd
 	w.open = false
 	if i64(i32(rt_sys_close(fd))) < 0 && err == nil {
 		err = errno_fault("close")
