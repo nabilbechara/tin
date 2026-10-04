@@ -27,18 +27,21 @@ HEADING = re.compile(r'^### (E\d{3}) ([A-Z][A-Z0-9_]*)$')
 GROUP = re.compile(r'^## E(\d)xx ')
 FENCE = re.compile(r'^```(\w*)(.*)$')
 FENCE_EDITION = re.compile(r'\bedition=(\d+)\b')
+# A block opened with file=NAME is written next to the example as NAME (a tin.lock, a second
+# package), and a ```sh block replaces the default command: one line, [VAR=value ...] tinc ARGS.
+FENCE_FILE = re.compile(r'\bfile=(\S+)')
 PRINTED = re.compile(r'\berror (E\d{3}) ([A-Z][A-Z0-9_]*): ')
 UNCODED = re.compile(r'(^|: )error: ')
 
 
 def parse_doc(text):
     """The entries of the page in order: code, name, line, group digit, retired, fenced blocks."""
-    entries, entry, group, fence, block, edition = [], None, None, None, [], EDITION
+    entries, entry, group, fence, block, edition, name = [], None, None, None, [], EDITION, None
     for number, line in enumerate(text.splitlines(), 1):
         if fence is not None:
             if line.startswith('```'):
                 if entry is not None:
-                    entry['blocks'].append((fence, ''.join(l + '\n' for l in block), edition))
+                    entry['blocks'].append((fence, ''.join(l + '\n' for l in block), edition, name))
                 fence, block = None, []
             else:
                 block.append(line)
@@ -48,6 +51,8 @@ def parse_doc(text):
             fence = match.group(1)
             found = FENCE_EDITION.search(match.group(2))
             edition = found.group(1) if found else EDITION
+            found = FENCE_FILE.search(match.group(2))
+            name = found.group(1) if found else None
             continue
         match = HEADING.match(line)
         if match:
@@ -68,12 +73,30 @@ def parse_doc(text):
 
 
 def example(entry):
-    """The program, its edition and the expected output of an entry, or a problem."""
-    programs = [(body, edition) for kind, body, edition in entry['blocks'] if kind == 'tin']
-    outputs = [body for kind, body, _ in entry['blocks'] if kind == 'text']
-    if len(programs) != 1 or len(outputs) != 1:
-        return None, None, None, 'needs exactly one ```tin example and one ```text output'
+    """The program (None when a command runs without one), its edition and the expected output
+    of an entry, or a problem."""
+    blocks = [b for b in entry['blocks'] if b[3] is None]
+    programs = [(body, edition) for kind, body, edition, _ in blocks if kind == 'tin']
+    outputs = [body for kind, body, _, _ in blocks if kind == 'text']
+    commands = [body for kind, body, _, _ in blocks if kind == 'sh']
+    if len(programs) > 1 or len(outputs) != 1 or len(commands) > 1 or not (programs or commands):
+        return None, None, None, 'needs exactly one ```tin example (or ```sh command) and one ```text output'
+    if commands and (len(commands[0].splitlines()) != 1 or 'tinc' not in commands[0].split()):
+        return None, None, None, 'a ```sh command is one line that runs tinc'
+    if not programs:
+        return None, EDITION, outputs[0], None
     return programs[0][0], programs[0][1], outputs[0], None
+
+
+def command(entry, compiler, edition):
+    """The environment additions and argv that compile an entry's example."""
+    commands = [body for kind, body, _, name in entry['blocks'] if kind == 'sh' and name is None]
+    if not commands:
+        return {}, [str(compiler), '-edition', edition, '-o', 'example', 'example.tin']
+    words = commands[0].split()
+    at = words.index('tinc')
+    env = dict(word.split('=', 1) for word in words[:at])
+    return env, [str(compiler)] + words[at + 1:]
 
 
 def check_doc(entries, problems):
@@ -180,11 +203,17 @@ def run_example(compiler, root, entry):
     """Compile one documented example; return a problem or None."""
     program, edition, output, _ = example(entry)
     with tempfile.TemporaryDirectory(prefix='diag-') as work:
-        Path(work, 'example.tin').write_text(program)
+        if program is not None:
+            Path(work, 'example.tin').write_text(program)
+        for _, body, _, name in entry['blocks']:
+            if name is not None:
+                Path(work, name).parent.mkdir(parents=True, exist_ok=True)
+                Path(work, name).write_text(body)
+        extra, argv = command(entry, compiler, edition)
         env = dict(os.environ, TIN_ROOT=str(root), LC_ALL='C')
+        env.update(extra)
         try:
-            result = subprocess.run([str(compiler), '-edition', edition, '-o', 'example', 'example.tin'],
-                                    cwd=work, env=env, capture_output=True, timeout=60)
+            result = subprocess.run(argv, cwd=work, env=env, capture_output=True, timeout=60)
         except subprocess.TimeoutExpired:
             return f"{entry['code']} {entry['name']}: the example timed out"
     got = result.stderr.decode(errors='replace')
