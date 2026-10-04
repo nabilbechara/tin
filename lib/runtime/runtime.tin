@@ -4014,6 +4014,56 @@ func (h spawned) cancel() {
 	}
 }
 
+// ---- values from spawn (#232) ----
+
+// spawnedValue admits the value of any spawned function.
+shape spawnedValue {}
+
+// spawnedOf is the handle of a child that gives a value: t := s.spawn(fn() !T { ... }), then
+// t.wait() !T. The child writes its value into v, one element the handle shares; like
+// everything the child makes, it lives in its parent's memory.
+type spawnedOf[T spawnedValue] struct {
+	h spawned
+	v []T
+}
+
+// rt_spawn_value starts f as a child of s whose value the handle gives: the compiler's
+// lowering of s.spawn(f) for a function with a value.
+func rt_spawn_value[T spawnedValue](s scope, f func() !T) spawnedOf[T] {
+	// The child runs after this returns, so what it uses is held in slices (cells in memory),
+	// never in this frame.
+	fs := []func() !T{f}
+	v := make([]T, 1)
+	h := s.spawn(func() ! {
+		v[0] = try fs[0]()
+	})
+	return spawnedOf[T]{h: h, v: v}
+}
+
+// wait waits until the child has finished and gives its value, or its fault.
+func (t spawnedOf[T]) wait() !T {
+	try t.h.wait()
+	return t.v[0]
+}
+
+// cancel cancels the child (its waits fail with "canceled: canceled").
+func (t spawnedOf[T]) cancel() {
+	t.h.cancel()
+}
+
+// ready, watch and unwatch are a select arm's view of the child, as for spawned.
+func (t spawnedOf[T]) ready() bool {
+	return t.h.ready()
+}
+
+func (t spawnedOf[T]) watch() {
+	t.h.watch()
+}
+
+func (t spawnedOf[T]) unwatch() {
+	t.h.unwatch()
+}
+
 // rt_scope_open_word and rt_scope_close_word are the scope calls of a parallel block's wrapper,
 // with the scope as a word and the fault as the result (#232).
 func rt_scope_open_word() i64 {
@@ -4212,6 +4262,22 @@ func rt_scope_close(s scope) ! {
 	if f != 0 {
 		fail cast(fault, f)
 	}
+}
+
+// rt_scope_exit leaves scope s when its body is left early, by a return or a try's fault: its
+// children are cancelled and joined, their handles freed and its boundary left. Their faults
+// are dropped: the body's own result is what leaves (#232).
+func rt_scope_exit(s scope) {
+	b := s.b
+	if b[bLive] > 0 {
+		rt_bnd_cancel(b, cast(fault, rt_fault_canceled()))
+		for b[bLive] > 0 {
+			rt_scope_block(b, 0)
+		}
+	}
+	rt_scope_discard(b)
+	b[bFault] = 0
+	rt_bnd_leave(b)
 }
 
 // rt_scope_block lets children of b run until one finishes: a task parks (the child's end

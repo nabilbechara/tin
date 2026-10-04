@@ -2842,6 +2842,7 @@ fn lower_once(s) {
 fn lower_scope(s) {
     let pos = s[N_POS];
     let name = s[SCOPE_NAME];
+    let body = s[SCOPE_BODY];
     let b = empty_block(pos);
     let l = node_new(ST_LET, pos);
     l[LET_NAME] = name;
@@ -2864,6 +2865,59 @@ fn lower_scope(s) {
     ck_scope_depth = ck_scope_depth + 1;
     check_scoped(s);
     ck_scope_depth = ck_scope_depth - 1;
+    if l[LET_SYM] {
+        scope_exits(body[BLK_STMTS], l[LET_SYM]);
+    }
+}
+
+// scope_exits makes every return out of a scope body (a try's fault is one) leave the scope
+// first: its value is computed, rt_scope_exit cancels and joins the children and leaves the
+// boundary, then it returns. An inner scope's exits come first, as they were made first.
+fn scope_exits(v, sc) {
+    let i = 0;
+    while i < v[VEC_LEN] {
+        scope_exit_stmt(vec_get(v, i), sc);
+        i = i + 1;
+    }
+}
+
+fn scope_exit_stmt(s, sc) {
+    let k = s[N_KIND];
+    if k == ST_BLOCK {
+        scope_exits(s[BLK_STMTS], sc);
+    } else if k == ST_IF {
+        scope_exits(s[IF_THEN][BLK_STMTS], sc);
+        if s[IF_ELSE] {
+            scope_exit_stmt(s[IF_ELSE], sc);
+        }
+    } else if k == ST_WHILE {
+        scope_exits(s[WH_BODY][BLK_STMTS], sc);
+    } else if k == ST_RETURN {
+        let pos = s[N_POS];
+        let b = empty_block(pos);
+        b[BLK_FLAT] = 1;
+        let r = node_new(ST_RETURN, pos);
+        if s[RET_VALUE] {
+            let t = temp(pos, s[RET_VALUE], s[RET_VALUE][N_TYPE]);
+            vec_push(b[BLK_STMTS], t);
+            r[RET_VALUE] = sym_ref_node(pos, t[LET_SYM]);
+        }
+        if s[RET_VALUES] {
+            let vals = vec_new();
+            let i = 0;
+            while i < s[RET_VALUES][VEC_LEN] {
+                let rv = vec_get(s[RET_VALUES], i);
+                let t2 = temp(pos, rv, rv[N_TYPE]);
+                vec_push(b[BLK_STMTS], t2);
+                vec_push(vals, sym_ref_node(pos, t2[LET_SYM]));
+                i = i + 1;
+            }
+            r[RET_VALUES] = vals;
+        }
+        vec_push(b[BLK_STMTS], expr_stmt(rt_call(pos, "rt_scope_exit", args1(sym_ref_node(pos, sc)), ty_void)));
+        vec_push(b[BLK_STMTS], r);
+        replace_node(s, b);
+    }
 }
 
 // detach { body } is rt_detach(keep(fn() ! { body })): a task in the core's background
@@ -3678,7 +3732,7 @@ fn is_stmt_kind(k) {
 
 var ck_scope_depth; // scope blocks around the code being checked (a closure starts 65536 deeper)
 var ck_fn_base;     // ck_scope_depth where the current function's body starts
-var sb_types;       // [scope, spawned]: the runtime's types, once looked up
+var sb_types;       // [scope, spawned, spawnedOf]: the runtime's types, once looked up
 
 // sb_type reports whether a value of type t is, or holds, a task handle or a scope.
 fn sb_type(t) {
@@ -3704,6 +3758,11 @@ fn sb_type(t) {
         sb_types = vec_new();
         vec_push(sb_types, sc);
         vec_push(sb_types, sp);
+        vec_push(sb_types, find_generic("spawnedOf"));
+    }
+    if t[TY_GDECL] && t[TY_GDECL] == vec_get(sb_types, 2) {
+        // The handle of a child with a value.
+        return 1;
     }
     return t == vec_get(sb_types, 0) || t == vec_get(sb_types, 1);
 }
@@ -4128,6 +4187,31 @@ fn sb_defer(pos, call) {
     if d > ck_fn_base {
         err_at(pos, "defer runs when the function returns, after the scope of the task handle it uses has ended: make the call inside the scope instead");
     }
+}
+
+// spawn_value lowers s.spawn(f), for f a function with a value (func() !T), to
+// rt_spawn_value[T](s, f): its handle, a spawnedOf[T], gives the value through wait() !T
+// (#232). It gives 0 when the call is not one, and the method call is checked as usual.
+fn spawn_value(e, x, xt, m) {
+    if !streq(m, "spawn") || !sb_type(xt) || xt != vec_get(sb_types, 0) || e[CALL_ARGS][VEC_LEN] != 1 {
+        return 0;
+    }
+    let a = vec_get(e[CALL_ARGS], 0);
+    let ft = chk(a, 0);
+    if kind_of(ft) != K_FUNC || ft[TY_RESULTS][VEC_LEN] != 2 || kind_of(vec_get(ft[TY_RESULTS], 1)) != K_ERROR || ft[TY_FIELDS][VEC_LEN] != 0 {
+        return 0;
+    }
+    let g = find_fn("rt_spawn_value");
+    if !g {
+        return 0;
+    }
+    let targs = vec_new();
+    vec_push(targs, vec_get(ft[TY_RESULTS], 0));
+    let inst = instantiate_fn(g, targs, e[N_POS]);
+    e[CALL_ARGS] = args2(x, a);
+    e[CALL_CALLEE] = 0;
+    e[CALL_NAME] = inst[F_QNAME];
+    return direct_call(e, inst);
 }
 
 // ---- defer ----
