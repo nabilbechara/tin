@@ -50,9 +50,9 @@ The inventory is the 176 packages `go list std` reports for Go 1.26 (without `in
 | `iota`, typed and untyped constants | yes | done |
 | `init` functions, package variables | package variables initialize in declaration order; `init` is not documented | partial |
 | packages and imports, `internal` | directories under `lib/`, imports by name, `./` for local packages; an `internal` rule is not documented | partial |
-| modules, `go.mod`, versioned dependencies | path imports from `vendor/`, `tin.mod`, `tin vendor` and `tin.lock` content hashes (PACKAGES.md); no version resolution or fetching by design | partial |
+| modules, `go.mod`, versioned dependencies | path imports from `vendor/`, `tin.mod`, `tin vendor`, `tin.lock` content hashes and per-package capabilities checked at compile time (PACKAGES.md); no version resolution by design, no fetching from URLs yet | partial |
 | build tags, `GOOS`/`GOARCH` files | files ending `_darwin`, `_linux`, `_linux_arm64`, `_linux_amd64` | partial |
-| `unsafe`, `cgo` | no `unsafe`; `extern` only inside the standard library | design |
+| `unsafe`, `cgo` | no `unsafe`; `extern` and raw memory only inside the standard library and vendored packages whose `tin.mod` declares `caps unsafe` | design |
 | `reflect` | none: compile-time derivation | design |
 | `//go:embed`, `//go:generate` | none | missing |
 | `testing`, benchmarks, fuzzing | `tin test` with `crucible`; no fuzzing | partial |

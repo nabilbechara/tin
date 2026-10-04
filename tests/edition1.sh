@@ -234,4 +234,23 @@ do
 	fi
 done
 
+# Packages (#146): an edition 1 program imports a vendored edition 1 package by path, and a
+# vendored edition 1 package that reaches a capability its tin.mod does not grant is refused.
+"$compiler" -edition 1 -o "$tmp/caps" tests/edition1/run/caps.tin
+"$tmp/caps" >"$tmp/caps.out" 2>/dev/null
+if ! cmp -s tests/edition1/run/caps.out "$tmp/caps.out"; then
+	echo "FAIL edition1/run/caps: output differs"
+	diff -u tests/edition1/run/caps.out "$tmp/caps.out" || true
+	exit 1
+fi
+if "$compiler" -edition 1 -o "$tmp/caps_bad" tests/edition1/caps_bad.tin >"$tmp/caps_bad.out" 2>"$tmp/caps_bad.err"; then
+	echo "FAIL edition1/caps_bad: unexpectedly accepted"
+	exit 1
+fi
+if ! cmp -s tests/edition1/caps_bad.err "$tmp/caps_bad.err"; then
+	echo "FAIL edition1/caps_bad: diagnostic mismatch"
+	diff -u tests/edition1/caps_bad.err "$tmp/caps_bad.err" || true
+	exit 1
+fi
+
 echo "PASS edition 1 parser"
