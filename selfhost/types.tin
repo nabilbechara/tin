@@ -16,6 +16,7 @@ const TY_SIZE = 9;     // structs: object size in bytes
 const TY_TARGS = 10;   // generic instance: its type arguments
 const TY_GDECL = 11;   // generic instance: its declaration
 const TY_ENUM = 12;    // enum (a struct underneath): vec of [variant name, first field, field count]
+const TY_SECRET = 13;  // secret T: the plain T this twin qualifies (selfhost/secret.tin)
 
 const K_INT = 1;
 const K_BOOL = 2;
@@ -59,9 +60,10 @@ var ty_interned;   // slice, map, chan and func types, shared by structure
 var ty_named;      // [qualified name, type]
 var saw_dyn;       // a dyn type was built: the back ends refuse it until step 3
 var saw_dyn_pos;   // where the first dyn type was written, for the back ends' message
+var ty_secrets;    // secret twins, one per plain type (secret_of)
 
 fn ty_new(kind, name) {
-    let t = calloc(13, 8);
+    let t = calloc(14, 8);
     t[TY_KIND] = kind;
     t[TY_NAME] = name;
     t[TY_WIDTH] = 8;
@@ -398,6 +400,16 @@ fn assignable(from, to) {
     if from == to || !to {
         return 1;
     }
+    // A plain value may become secret (secret_of); a secret never becomes plain without reveal.
+    if to[TY_SECRET] {
+        if from && from[TY_SECRET] {
+            return assignable(from[TY_SECRET], to[TY_SECRET]);
+        }
+        return assignable(from, to[TY_SECRET]);
+    }
+    if to[TY_KIND] == K_OPT && is_secret(to[TY_ELEM]) && from && !from[TY_SECRET] && kind_of(from) != K_OPT && kind_of(from) != K_NIL {
+        return assignable(from, to[TY_ELEM]);
+    }
     let fk = kind_of(from);
     let tk = kind_of(to);
     if fk == K_UINT {
@@ -421,6 +433,11 @@ fn assignable(from, to) {
 fn type_name(b, t) {
     if !t {
         buf_str(b, "int");
+        return;
+    }
+    if t[TY_SECRET] {
+        buf_str(b, "secret ");
+        type_name(b, t[TY_SECRET]);
         return;
     }
     let k = t[TY_KIND];
