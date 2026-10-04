@@ -254,6 +254,12 @@ func serve_on(addr str, n i64) ! {
 	if penv != 0 && rt_decimal_integer(penv)&0xffffffff > 0 && rt_decimal_integer(penv)&0xffffffff < 65536 {
 		port = rt_decimal_integer(penv) & 0xffffffff
 	}
+	if replay_prepare() {
+		// TIN_REPLAY_CAPSULE (#242): one recorded request, sent to a listener only this process knows.
+		ip = 0x7f000001
+		port = 0
+		n = 1
+	}
 	gIP = ip
 	gPort = port
 	fd := open_listener(ip, port)
@@ -404,9 +410,15 @@ func core(id i64) {
 	if id == 0 {
 		ev_signals()
 	}
+	if id == 0 && gReplayTape != 0 {
+		replay_start()
+	}
 	loopNow = rt_mono_ns()
 	nextSweep = loopNow + 1000000000
 	for {
+		if replayFd != 0 {
+			replay_pump()
+		}
 		if gRelayOn {
 			relay.Arm()
 		}
@@ -1210,6 +1222,9 @@ func serve_one(c i64, p i64, n i64) i64 {
 	pTn = tn
 	pKeep10 = http10 && alive
 	task := rt_task_new(run_request, c)
+	if gReplayTape != 0 {
+		rt_tape_set(task, gReplayTape) // the recorded request's effects come from its capsule (#242)
+	}
 	// The request's boundary: its deadline and cancel state (notes/interface_boundaries.md).
 	if rt_bnd_task(task, rt_bnd_core(), bkRequest) != nil {
 		rt_task_free(task)

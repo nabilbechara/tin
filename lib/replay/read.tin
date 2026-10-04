@@ -1,0 +1,176 @@
+// Reading replay capsules (notes/interface_replay.md, section 6; #242): the envelope's tag
+// and keystream, the body, and the effect kinds this build can replay. Writing capsules, the
+// spool and the keys of secrets are #241's, next to this file.
+package replay
+
+import "quarry"
+import "say"
+import "seal"
+
+// Capsule is a decoded capsule: one recorded request and its effect records.
+type Capsule struct {
+	Tin     str // the Tin version that recorded it
+	Program str // argv[0] of the recording program
+	Wall    i64 // wall clock (ns) when the request started
+	Core    i64
+	Status  i64 // the recorded response status
+	Flags   i64 // 1 panicked, 2 sampled
+	Request str // the request bytes, secret headers as handles
+	Panic   str // the panic message, "" if none
+	Count   i64 // effect records
+	Effects str // the effect records (section 3.3), as rt_tape_load takes them
+}
+
+// Kinds lists the effect kinds (name@version) this build replays (section 4); a capsule with
+// any other kind is refused. sched.* kinds join the list with their replay (#243).
+const Kinds = ",tide.now@1,tide.wall@1,dice.seed@1,seal.random@1,wire.http@1,wire.dial@1,wire.read@1,wire.write@1,redis@1,mysql@1,mysql.tx@1,postgres@1,postgres.tx@1,websocket.dial@1,websocket.read@1,websocket.write@1,quarry.read@1,quarry.write@1,quarry.stat@1,quarry.dir@1,quarry.fs@1,"
+
+const magic = "TINCAP\x01\x00"
+
+// Open reads the capsule at path, encrypted under keyHex (the 64 hex digits of TIN_REPLAY_KEY).
+func Open(path str, keyHex str) !Capsule {
+	key := try Key(keyHex)
+	data := quarry.ReadFile(path) catch err {
+		fail "capsule: " + say.Str(err)
+	}
+	body := try Unseal(data, key)
+	return try Decode(body)
+}
+
+// Key is the 32 bytes a TIN_REPLAY_KEY value (64 hex digits) stands for.
+func Key(keyHex str) !str {
+	b, err := seal.HexDecode(keyHex)
+	if err != nil || len(b) != 32 {
+		fail "capsule: TIN_REPLAY_KEY must be 64 hex digits"
+	}
+	return str(b)
+}
+
+// Unseal checks a capsule envelope's tag under key and returns its decrypted body.
+func Unseal(data str, key str) !str {
+	n := len(data)
+	if n < 8 || data[:8] != magic {
+		fail "capsule: not a capsule (no TINCAP header)"
+	}
+	if n < 56 {
+		fail "capsule: wrong key or damaged"
+	}
+	km := str(seal.HmacSha256(key, "tin replay mac"))
+	tag := seal.HmacSha256(km, data[:n-32])
+	diff := u8(0)
+	for i := 0; i < 32; i++ {
+		diff |= tag[i] ^ data[n-32+i]
+	}
+	if diff != 0 {
+		fail "capsule: wrong key or damaged"
+	}
+	ke := str(seal.HmacSha256(key, "tin replay enc"))
+	nonce := data[8:24]
+	ct := data[24 : n-32]
+	out := make([]u8, len(ct))
+	for i := 0; i*32 < len(ct); i++ {
+		ks := seal.HmacSha256(ke, nonce+word(i))
+		for j := 0; j < 32 && i*32+j < len(ct); j++ {
+			out[i*32+j] = ct[i*32+j] ^ ks[j]
+		}
+	}
+	return str(out)
+}
+
+// word is v as 8 little-endian bytes.
+func word(v i64) str {
+	b := make([]u8, 8)
+	for i := 0; i < 8; i++ {
+		b[i] = u8(v >> (8 * i))
+	}
+	return str(b)
+}
+
+// Decode reads a capsule body (schema 1) and checks every effect record and its kind.
+func Decode(body str) !Capsule {
+	r := reader{b: body, pos: 0}
+	schema := try r.word()
+	if schema != 1 {
+		fail "capsule: unsupported schema {schema} (this build reads schema 1)"
+	}
+	c := Capsule{}
+	c.Tin = try r.bytes()
+	c.Program = try r.bytes()
+	c.Wall = try r.word()
+	c.Core = try r.word()
+	c.Status = try r.word()
+	c.Flags = try r.word()
+	c.Request = try r.bytes()
+	c.Panic = try r.bytes()
+	c.Count = try r.word()
+	if c.Count < 0 {
+		fail "capsule: damaged (effect count {c.Count})"
+	}
+	start := r.pos
+	for k := 0; k < c.Count; k++ {
+		seq := try r.word()
+		kind := try r.bytes()
+		_ = try r.bytes()
+		_ = try r.word()
+		_ = try r.word()
+		_ = try r.bytes()
+		if seq != k {
+			fail "capsule: damaged (effect {k} has number {seq})"
+		}
+		if !Supported(kind) {
+			fail "capsule: effect {k} has kind {kind}, which this build cannot replay"
+		}
+	}
+	if r.pos != len(body) {
+		fail "capsule: damaged ({len(body) - r.pos} bytes after the last effect)"
+	}
+	c.Effects = body[start:]
+	return c
+}
+
+// Supported reports whether this build replays effect kind (name@version).
+func Supported(kind str) bool {
+	if len(kind) == 0 {
+		return false
+	}
+	for i := 0; i < len(kind); i++ {
+		if kind[i] == ',' {
+			return false
+		}
+	}
+	n := len(kind)
+	for i := 0; i+n+1 < len(Kinds); i++ {
+		if Kinds[i] == ',' && Kinds[i+n+1] == ',' && Kinds[i+1:i+n+1] == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// reader takes words and strings off a capsule body.
+type reader struct {
+	b   str
+	pos i64
+}
+
+func (r mut reader) word() !i64 {
+	if r.pos+8 > len(r.b) {
+		fail "capsule: damaged (truncated)"
+	}
+	v := 0
+	for i := 7; i >= 0; i-- {
+		v = v<<8 | i64(r.b[r.pos+i])
+	}
+	r.pos += 8
+	return v
+}
+
+func (r mut reader) bytes() !str {
+	n := try r.word()
+	if n < 0 || n > len(r.b)-r.pos {
+		fail "capsule: damaged (truncated)"
+	}
+	s := r.b[r.pos : r.pos+n]
+	r.pos += n
+	return s
+}

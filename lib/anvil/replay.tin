@@ -1,0 +1,168 @@
+// Replay mode (notes/interface_replay.md, section 8; #242): with TIN_REPLAY_CAPSULE set, Serve
+// does not take connections. It sends the capsule's request once, from a socket of its own, to a
+// listener only this process knows, on one core; the request task's tape serves every effect from
+// the capsule. When the response is in, it prints the report and the body and exits: 0, or 3
+// when the replay diverged or left recorded effects, or 4 when the capsule cannot be read.
+package anvil
+
+import "replay"
+import "say"
+
+shared var gReplayTape i64   // the replaying tape (malloc'd), 0: not replaying
+shared var gReplayReq i64    // the recorded request bytes (malloc'd)
+shared var gReplayReqLen i64
+shared var gReplayStatus i64 // the recorded status
+
+var replayFd i64    // core 0: the replay's client socket, 0 until it connects
+var replaySent i64  // request bytes written so far
+var replayShut bool // the request is all written and the sending side shut down
+var replayBuf i64   // the response read so far (malloc'd)
+var replayLen i64
+var replayCap i64
+
+// replay_prepare reads TIN_REPLAY_CAPSULE (and TIN_REPLAY_KEY, TIN_REPLAY_LIVE) before the
+// cores start; false when the program serves normally. A capsule that cannot be read ends
+// the process with status 4.
+func replay_prepare() bool {
+	path := replay_env("TIN_REPLAY_CAPSULE")
+	if path == "" {
+		return false
+	}
+	c, err := replay.Open(path, replay_env("TIN_REPLAY_KEY"))
+	if err != nil {
+		replay_quit("replay: " + say.Str(err) + "\n", 4)
+		return false
+	}
+	tp := rt_tape_new(2)
+	rt_tape_load(tp, cast(i64, c.Effects)+8, len(c.Effects))
+	live := replay_env("TIN_REPLAY_LIVE")
+	if live != "" {
+		b := make([]u8, 0, len(live)+2)
+		b = append(b, ',')
+		for i := 0; i < len(live); i++ {
+			if live[i] != ' ' {
+				b = append(b, lower(live[i]))
+			}
+		}
+		b = append(b, ',')
+		rt_tape_live(tp, str(b))
+	}
+	gReplayReq = malloc(len(c.Request) + 1)
+	memcpy(gReplayReq, cast(i64, c.Request)+8, len(c.Request))
+	gReplayReqLen = len(c.Request)
+	gReplayStatus = c.Status
+	gReplayTape = tp
+	return true
+}
+
+func replay_env(name str) str {
+	p := getenv(cast(i64, name) + 8)
+	if p == 0 {
+		return ""
+	}
+	n := 0
+	for load8(p+n) != 0 {
+		n++
+	}
+	return rt_str_from_raw(p, n)
+}
+
+// replay_quit prints msg on stderr and exits with status code.
+func replay_quit(msg str, code i64) {
+	rt_write_all(2, cast(i64, msg)+8, len(msg))
+	rt_flush_core()
+	rt_sys_exit(code)
+}
+
+// replay_start (core 0, before its loop) connects the replay's client socket to the listener.
+func replay_start() {
+	sa := calloc(1, 16)
+	sl := calloc(1, 8)
+	sl[0] = 16
+	if c32(rt_sys_getsockname(gListen, sa, sl)) < 0 {
+		replay_quit("replay: cannot find the replay listener\n", 4)
+	}
+	port := i64(load8(sa+2))<<8 | i64(load8(sa+3))
+	fd := c32(rt_sys_socket(2, 1, 0))
+	rt_sockaddr_in(sa, 0x7f000001, port)
+	if fd < 0 || c32(rt_sys_connect(fd, sa, 16)) < 0 {
+		replay_quit("replay: cannot connect to the replay listener\n", 4)
+	}
+	free(sa)
+	free(sl)
+	rt_sys_fcntl(fd, F_SETFL, O_NONBLOCK)
+	replayCap = 65536
+	replayBuf = malloc(replayCap)
+	replayFd = fd
+	ev_level(fd)
+}
+
+// replay_pump (core 0, every loop turn) writes what is left of the request, then reads the
+// response; at its end it reports.
+func replay_pump() {
+	for replaySent < gReplayReqLen {
+		w := rt_sys_write(replayFd, gReplayReq+replaySent, gReplayReqLen-replaySent)
+		if w <= 0 {
+			break
+		}
+		replaySent += w
+	}
+	if replaySent == gReplayReqLen && !replayShut {
+		rt_sys_shutdown(replayFd, 1)
+		replayShut = true
+	}
+	for {
+		if replayLen == replayCap {
+			replayCap *= 2
+			replayBuf = realloc(replayBuf, replayCap)
+		}
+		r := rt_sys_read(replayFd, replayBuf+replayLen, replayCap-replayLen)
+		if r < 0 && (errno() == EAGAIN || errno() == 4) {
+			return
+		}
+		if r <= 0 {
+			replay_report()
+			return
+		}
+		replayLen += r
+	}
+}
+
+// replay_report prints the report (section 8) and the response body, and exits.
+func replay_report() {
+	tp := gReplayTape
+	resp := rt_str_from_raw(replayBuf, replayLen)
+	status := 0
+	if len(resp) >= 12 && resp[:7] == "HTTP/1." {
+		for i := 9; i < 12; i++ {
+			status = status*10 + i64(resp[i]-'0')
+		}
+	}
+	body := ""
+	for i := 0; i+4 <= len(resp); i++ {
+		if resp[i] == '\r' && resp[i+1] == '\n' && resp[i+2] == '\r' && resp[i+3] == '\n' {
+			body = resp[i+4:]
+			break
+		}
+	}
+	code := 0
+	out := "replay: status " + say.Str(status) + " (recorded " + say.Str(gReplayStatus) + ")\n"
+	if status == 0 {
+		out = "replay: no response (recorded " + say.Str(gReplayStatus) + ")\n"
+		code = 3
+	}
+	d := rt_tape_diverged(tp)
+	if d != "" {
+		out += d + "\n"
+		code = 3
+	}
+	left := rt_tape_left(tp)
+	if left > 0 {
+		out += "replay: " + say.Str(left) + " recorded effects not served\n"
+		code = 3
+	}
+	out += body
+	rt_write_all(1, cast(i64, out)+8, len(out))
+	rt_flush_core()
+	rt_sys_exit(code)
+}
