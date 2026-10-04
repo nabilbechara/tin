@@ -121,10 +121,13 @@ class Fake:
         class H(socketserver.BaseRequestHandler):
             def handle(self):
                 fake.conns.append(self.request)
+                session = Session(fake, self.request)
                 try:
-                    Session(fake, self.request).run()
+                    session.run()
                 except (OSError, ConnectionError, AssertionError, struct.error):
                     pass
+                finally:
+                    session.s.close()
 
         socketserver.ThreadingTCPServer.allow_reuse_address = True
         socketserver.ThreadingTCPServer.request_queue_size = 256  # the default backlog of 5 resets bursts on macOS
