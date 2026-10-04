@@ -146,26 +146,28 @@ fn mem_drain(heap) {
     mem_unlock(heap+16);
     while p != 0 {
         let next=p[0];
-        let k=mem_class((p-8)[0]+16);
+        let k=mem_class((p-16)[0]+24);
         p[0]=heap[6+k]; heap[6+k]=p;
         p=next;
     }
 }
 
-// Every block has [owning heap, requested size] before its 16-byte-aligned payload.
+// Every block has [owning heap, requested size, rc] before its 16-byte-aligned payload
+// (#176, notes/interface_mem.md). The rc word counts long-lived references (per core,
+// not atomic); 0 on every path out of mem_alloc, so a freelist reuse inherits nothing.
 fn mem_alloc(heap, n, zero) {
     mem_failpoint(n);
     if n < 0 || n > 70368744177664 { return mem_oom(n); }
     if n == 0 { n=1; }
-    let k=mem_class(n+16);
+    let k=mem_class(n+24);
     let b=0;
     if k < 0 {
-        let size=(n+16+heap[1]-1) & -heap[1];
+        let size=(n+24+heap[1]-1) & -heap[1];
         b=mem_map(size,heap[0]);
     } else {
         mem_drain(heap);
         let p=heap[6+k];
-        if p != 0 { heap[6+k]=p[0]; (p-8)[0]=n; if zero { memset(p,0,n); } return p; }
+        if p != 0 { heap[6+k]=p[0]; (p-16)[0]=n; (p-8)[0]=0; if zero { memset(p,0,n); } return p; }
         let bs=mem_class_size(k);
         if heap[4]+bs > heap[5] {
             let slab=mem_map(1048576,heap[0]);
@@ -173,16 +175,16 @@ fn mem_alloc(heap, n, zero) {
         }
         b=heap[4]; heap[4]=b+bs;
     }
-    b[0]=heap; b[1]=n;
-    return b+16;
+    b[0]=heap; b[1]=n; b[2]=0;
+    return b+24;
 }
 
 fn mem_free(p, current) {
     if p == 0 { return; }
-    let b=p-16;
+    let b=p-24;
     let heap=b[0]; let n=b[1];
-    let k=mem_class(n+16);
-    if k < 0 { rt_sys_munmap(b,(n+16+heap[1]-1) & -heap[1]); return; }
+    let k=mem_class(n+24);
+    if k < 0 { rt_sys_munmap(b,(n+24+heap[1]-1) & -heap[1]); return; }
     if heap == current { p[0]=heap[6+k]; heap[6+k]=p; return; }
     mem_lock(heap+16);
     p[0]=heap[3]; __atomic_store(heap+24,p);
@@ -192,10 +194,10 @@ fn mem_free(p, current) {
 fn mem_realloc(heap, p, n) {
     if p == 0 { return mem_alloc(heap,n,0); }
     if n == 0 { mem_free(p,heap); return 0; }
-    let old=(p-8)[0];
+    let old=(p-16)[0];
     // Keep the recorded class stable; growing within it needs no mapping or copy.
-    if n > old && mem_class(old+16) >= 0 && n+16 <= mem_class_size(mem_class(old+16)) {
-        mem_failpoint(n); (p-8)[0]=n; return p;
+    if n > old && mem_class(old+24) >= 0 && n+24 <= mem_class_size(mem_class(old+24)) {
+        mem_failpoint(n); (p-16)[0]=n; return p;
     }
     let q=mem_alloc(heap,n,0);
     let copy=old; if n < copy { copy=n; }

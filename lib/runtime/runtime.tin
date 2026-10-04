@@ -688,6 +688,7 @@ func rt_pool_reset() {
 	memset(base, 0, top-base)
 	c[ctxBump] = base
 	c[ctxEnd] = base + rt_chunk()
+	rt_epoch_release()
 }
 
 // rt_pool_used reports the bytes the current request has taken from the pool.
@@ -711,6 +712,165 @@ func rt_region_alloc(ingot i64, n i64) i64 {
 		return rt_ingot_alloc(n)
 	}
 	return rt_alloc(n)
+}
+
+// ---- long-lived reclamation: counts, the limbo and epochs (#176, notes/interface_mem.md) ----
+//
+// Every ingot block's header word 2 (p-8) counts the long-lived references to it (per
+// core: kept data never crosses cores). rt_rc_dec never frees at once: a count of 0
+// queues the block in the core's limbo until every task that started before the free has
+// finished, so a request that borrowed `u := cache[k]` keeps a valid u even if another
+// request replaced the entry meanwhile. A queued block whose count rises again (a
+// borrowed value stored once more) is dequeued: it is not garbage after all.
+
+var epochNext i64 = 1 // per core: the next task start serial
+var epLive i64       // per core: live tasks, oldest start first
+var epLiveTail i64
+var limboHead i64    // per core: FIFO of [next, block, drop, epoch], epochs never fall
+var limboTail i64
+var rtRcBlocks i64  // per core: counted blocks this core owns (diagnostics, 14.1)
+var rtRcBytes i64
+var rtRcLimbo i64
+
+// The rc word holds the count in its low bits and one flag above it: rcQ, set only
+// while the block sits in the limbo (a count of 0 without rcQ is a fresh keep).
+const rcQ = 1 << 62
+const rcCount = rcQ - 1
+
+// rt_rc_drop_none is the drop of blocks with no children of their own (a str, a slice
+// backing array whose elements moved on): releasing frees the block and nothing else.
+func rt_rc_drop_none(x i64) {
+}
+
+// rt_rc_inc notes one more long-lived reference to p. Static data and code addresses
+// have no heap header word: the writers keep 24 zero bytes before them, so one load
+// tells them apart. A queued block stored again is dequeued: it is not garbage.
+func rt_rc_inc(p i64) {
+	if p == 0 || (p-24)[0] == 0 {
+		return
+	}
+	w := p - 8
+	c := w[0]
+	if (c & rcQ) != 0 {
+		rt_rc_unqueue(p)
+		c = w[0]
+	}
+	if (c & rcCount) == 0 {
+		rtRcBlocks++
+		rtRcBytes += (p-16)[0]
+	}
+	w[0] = c + 1
+}
+
+// rt_rc_dec drops one long-lived reference: a count of 0 queues the block for the
+// epoch limbo (drop runs at release, never now: the block may still be borrowed).
+func rt_rc_dec(p i64, drop func(i64)) {
+	if p == 0 || (p-24)[0] == 0 {
+		return
+	}
+	w := p - 8
+	c := w[0] - 1
+	w[0] = c
+	if (c & rcCount) != 0 {
+		return
+	}
+	rtRcBlocks--
+	rtRcBytes -= (p-16)[0]
+	w[0] = c | rcQ
+	n := calloc(4, 8)
+	n[1] = p
+	n[2] = cast(i64, drop)
+	n[3] = epochNext
+	if limboTail == 0 {
+		limboHead = n
+	} else {
+		limboTail[0] = n
+	}
+	limboTail = n
+	rtRcLimbo++
+}
+
+// rt_rc_unqueue takes p, queued but stored again, out of the limbo (rare: a borrowed
+// value that a long-lived slot takes over).
+func rt_rc_unqueue(p i64) {
+	prev := i64(0)
+	n := limboHead
+	for n != 0 {
+		if n[1] == p {
+			if prev == 0 {
+				limboHead = n[0]
+			} else {
+				prev[0] = n[0]
+			}
+			if limboTail == n {
+				limboTail = prev
+			}
+			free(n)
+			rtRcLimbo--
+			(p - 8)[0] = (p - 8)[0] - rcQ
+			return
+		}
+		prev = n
+		n = n[0]
+	}
+}
+
+// rt_rc_arr_n is the element count of a slice backing array block (a spare word ends it).
+func rt_rc_arr_n(p i64, esz i64) i64 {
+	return ((p-16)[0] - 8) / esz
+}
+
+// rt_rc_stats reports this core's counted blocks, their bytes and the limbo length.
+func rt_rc_stats() (i64, i64, i64) {
+	return rtRcBlocks, rtRcBytes, rtRcLimbo
+}
+
+// rt_rc_live_add links a task into the core's live list (starts are serial, so the list
+// stays ordered oldest first) and rt_rc_live_del unlinks it.
+func rt_rc_live_add(t i64) {
+	t[tEpNext] = 0
+	t[tEpPrev] = epLiveTail
+	if epLiveTail != 0 {
+		epLiveTail[tEpNext] = t
+	} else {
+		epLive = t
+	}
+	epLiveTail = t
+}
+
+func rt_rc_live_del(t i64) {
+	if t[tEpPrev] != 0 {
+		t[tEpPrev][tEpNext] = t[tEpNext]
+	} else {
+		epLive = t[tEpNext]
+	}
+	if t[tEpNext] != 0 {
+		t[tEpNext][tEpPrev] = t[tEpPrev]
+	} else {
+		epLiveTail = t[tEpPrev]
+	}
+}
+
+// rt_epoch_release frees limbo entries whose epoch every earlier-started task has left:
+// drop walks the block's children (queueing them now, at the current epoch), then the
+// block itself is freed. Entries whose block was stored again are gone (rt_rc_inc
+// dequeued them), so everything on the queue is dead.
+func rt_epoch_release() {
+	for limboHead != 0 && (epLive == 0 || limboHead[3] < epLive[tEp]) {
+		n := limboHead
+		limboHead = n[0]
+		if limboHead == 0 {
+			limboTail = 0
+		}
+		rtRcLimbo--
+		b := n[1]
+		if n[2] != 0 {
+			drop := cast(func(i64), n[2])
+			drop(b)
+		}
+		rt_ingot_free(b)
+		free(n)
+	}
 }
 
 // lsr is a logical shift right (Tin's >> is arithmetic).
@@ -1058,6 +1218,10 @@ func rt_slice_make(n i64, c i64, esz i64) i64 {
 	h[3] = ingot
 	if c > 0 {
 		h[2] = rt_region_alloc(ingot, c*esz+8)
+		if ingot != 0 {
+			// The header owns its backing array's one count (#176).
+			rt_rc_inc(h[2])
+		}
 	}
 	return h
 }
@@ -1097,7 +1261,9 @@ func rt_slice_make_grid(n i64, m i64, esz i64, isstr i64) i64 {
 	return h
 }
 
-// rt_slice_grow gives s room for need elements, in the region s lives in.
+// rt_slice_grow gives s room for need elements, in the region s lives in. A long-lived
+// slice's old backing array drops its count (its elements moved: their owners are the
+// new array now, so nothing walks them) and the new array takes one from the header.
 func rt_slice_grow(s i64, need i64, esz i64) {
 	c := s[1] * 2
 	if c < 8 {
@@ -1109,12 +1275,19 @@ func rt_slice_grow(s i64, need i64, esz i64) {
 	for c < need {
 		c *= 2
 	}
+	old := s[2]
 	d := rt_region_alloc(s[3], c*esz+8)
 	if s[0] > 0 {
-		memcpy(d, s[2], s[0]*esz)
+		memcpy(d, old, s[0]*esz)
 	}
 	s[2] = d
 	s[1] = c
+	if s[3] != 0 {
+		if old != 0 {
+			rt_rc_dec(old, rt_rc_drop_none)
+		}
+		rt_rc_inc(d)
+	}
 }
 
 // rt_own returns a header append may change: the shared empty header (cap 0) is copied.
@@ -1145,6 +1318,23 @@ func rt_append(s i64, v i64, esz i64) i64 {
 	}
 	rt_store_elem(s[2]+n*esz, v, esz)
 	s[0] = n + 1
+	return s
+}
+
+// rt_append_rc is rt_append for a slice whose element type is counted (#176): the new
+// element gains the count of the slot it lands in. The slice's own region word decides,
+// so a request-local slice pays nothing.
+func rt_append_rc(s i64, v i64, esz i64) i64 {
+	s = rt_own(s, esz)
+	n := s[0]
+	if n >= s[1] {
+		rt_slice_grow(s, n+1, esz)
+	}
+	rt_store_elem(s[2]+n*esz, v, esz)
+	s[0] = n + 1
+	if s[3] != 0 {
+		rt_rc_inc(v)
+	}
 	return s
 }
 
@@ -1200,6 +1390,11 @@ func rt_slice_sub(s i64, lo i64, hi i64, esz i64, hasHi i64) i64 {
 	if lo < 0 || hi > s[0] || lo > hi {
 		rt_panic("slice bounds out of range")
 	}
+	if s[3] != 0 && s[2] != 0 {
+		// The sub shares its parent's backing array: its header holds a count of
+		// its own, so a grow of either cannot free the array under the other (#176).
+		rt_rc_inc(s[2])
+	}
 	h := rt_alloc(32)
 	h[0] = hi - lo
 	h[1] = s[1] - lo
@@ -1233,13 +1428,28 @@ func rt_copy_str(dst i64, s str) i64 {
 // -1 deleted, else entry+1) with a keyed hash (rt_map_hash) and linear probing. The index has twice
 // as many slots as there are entries, so it is never more than half full. Header words:
 // count, index slots, keys, values, index, str keys?, shift, index tombstones, hashes,
-// ingot, entries used, entry capacity, live bytes.
+// ingot, entries used, entry capacity, live bytes, value drop, counted sides (#176).
 
 func rt_map_make(isstr i64) i64 {
 	ingot := __ctx()[ctxIngot]
-	m := rt_region_alloc(ingot, 104)
+	m := rt_region_alloc(ingot, 120)
 	m[5] = isstr
 	m[9] = ingot
+	rt_map_init(m, 8)
+	return m
+}
+
+// rt_map_make_rc makes a map whose entries own counted keys and values (#176): counted
+// bit 0 the key side (str and encoded struct or enum keys), bit 1 the value side, with
+// drop the value's drop (the key side's blocks never have children of their own). An
+// uncounted side passes the runtime's own no-op drop; the gates skip it.
+func rt_map_make_rc(isstr i64, drop func(i64), counted i64) i64 {
+	ingot := __ctx()[ctxIngot]
+	m := rt_region_alloc(ingot, 120)
+	m[5] = isstr
+	m[9] = ingot
+	m[13] = cast(i64, drop)
+	m[14] = counted
 	rt_map_init(m, 8)
 	return m
 }
@@ -1495,6 +1705,11 @@ func rt_map_set(m i64, k i64, v i64) {
 		} else if x&-4294967296 == fp {
 			e0 := (x & 0xffffffff) - 1
 			if (str_keys && rt_str_eq(cast(str, keys[e0]), cast(str, k))) || (!str_keys && keys[e0] == k) {
+				if m[9] != 0 && (m[14]&2) != 0 {
+					// The old value's count leaves with the slot; the new one takes it.
+					rt_rc_dec(m[3][e0], cast(func(i64), m[13]))
+					rt_rc_inc(v)
+				}
 				m[3][e0] = v
 				return
 			}
@@ -1511,6 +1726,14 @@ func rt_map_set(m i64, k i64, v i64) {
 	store8(m[12]+e, 1)
 	if str_keys {
 		m[8][e] = h
+	}
+	if m[9] != 0 {
+		if (m[14] & 1) != 0 {
+			rt_rc_inc(k)
+		}
+		if (m[14] & 2) != 0 {
+			rt_rc_inc(v)
+		}
 	}
 	m[10] = e + 1
 	m[0]++
@@ -1608,6 +1831,15 @@ func rt_map_del(m i64, k i64) {
 	s := rt_map_slot(m, k, rt_map_hash(m, k))
 	if s >= 0 {
 		e := (m[4][s] & 0xffffffff) - 1
+		if m[9] != 0 {
+			// The slot's counts leave with it (#176); encoded keys are plain blocks.
+			if (m[14] & 1) != 0 {
+				rt_rc_dec(m[2][e], rt_rc_drop_none)
+			}
+			if (m[14] & 2) != 0 {
+				rt_rc_dec(m[3][e], cast(func(i64), m[13]))
+			}
+		}
 		store8(m[12]+e, 0)
 		m[4][s] = -1
 		m[0]--
@@ -2733,10 +2965,12 @@ func rt_keep_slice(s i64, esz i64) i64 {
 	return h
 }
 
-func rt_keep_map_new(m i64) i64 {
-	k := rt_ingot_alloc(104)
+func rt_keep_map_new(m i64, drop func(i64), counted i64) i64 {
+	k := rt_ingot_alloc(120)
 	k[5] = m[5]
 	k[9] = 1
+	k[13] = cast(i64, drop)
+	k[14] = counted
 	rt_map_init(k, 8)
 	return k
 }
@@ -2883,7 +3117,10 @@ const tDefer = 53    // the task's defer chain (#230): records [next, defer$N, v
 const tChild = 54    // a scope's child task (#232): its record [task, body, fault, done, waiter, scope, next]
 const tScopeWait = 55 // the scope whose end the task is parked for (#232), else 0
 const tTape = 56     // the request's replay tape (notes/interface_replay.md), 0: none; low bit: suspended
-const taskWords = 57
+const tEp = 57       // start serial (epoch), stamped on the task's first run (#176)
+const tEpNext = 58    // live-task list links (start order, oldest first)
+const tEpPrev = 59
+const taskWords = 60
 
 const waitReady = 0
 const waitDeadline = 1
@@ -3197,6 +3434,9 @@ func rt_task_new(body func(i64), arg i64) i64 {
 	t[tDefer] = 0
 	t[tChild] = 0
 	t[tTape] = 0
+	t[tEp] = 0
+	t[tEpNext] = 0
+	t[tEpPrev] = 0
 	for i := 0; i < 20; i++ {
 		t[tSave+i] = 0
 	}
@@ -3212,6 +3452,8 @@ func rt_task_entry() {
 	f(t[tArg])
 	rt_task_cleanups(0)
 	rt_bnd_task_end(t)
+	rt_rc_live_del(t)
+	rt_epoch_release()
 	// A scope's child allocates in its parent's pool (#232): that memory stays.
 	if t[tChild] == 0 || t[tChild][spOwnPool] != 0 {
 		if __ctx()[ctxPoolExtra] != 0 || rt_pool_used() > 65536 { t[tTrim] = 1 }
@@ -3237,6 +3479,8 @@ func rt_task_panicked(t i64) bool {
 func rt_task_abort(t i64) {
 	rt_task_cleanups(0)
 	rt_bnd_task_end(t)
+	rt_rc_live_del(t)
+	rt_epoch_release()
 	// A scope's child allocates in its parent's pool (#232): that memory stays.
 	if t[tChild] == 0 || t[tChild][spOwnPool] != 0 {
 		if __ctx()[ctxPoolExtra] != 0 || rt_pool_used() > 65536 { t[tTrim] = 1 }
@@ -3267,6 +3511,12 @@ func rt_task_run(t i64) bool {
 	c[ctxPoolMark] = pw[3]
 	c[ctxPoolExtra] = pw[4]
 	c[ctxFmt] = t[tFmt]
+	if t[tEp] == 0 {
+		// The task's start serial: the epoch limbo waits for the oldest live task (#176).
+		t[tEp] = epochNext
+		epochNext = epochNext + 1
+		rt_rc_live_add(t)
+	}
 	curTask = t
 	if rtPollsEnabled { rt_watch_switch() }
 	rt_task_swap(schedSave, t)
@@ -4726,12 +4976,15 @@ func rt_poll_wait(fd i64, want i64, timeout i64) i64 {
 	for {
 		r := i64(i32(rt_sys_poll(pfd, 1, ms)))
 		if r > 0 {
+			rt_epoch_release()
 			return waitReady
 		}
 		if r == 0 {
+			rt_epoch_release()
 			return waitTimeout
 		}
 		if rt_errno() != EINTR {
+			rt_epoch_release()
 			return waitReady
 		}
 	}
