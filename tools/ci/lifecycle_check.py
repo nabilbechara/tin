@@ -191,6 +191,63 @@ def serve_in_say(out):
     print('serve in say.Line: three kept requests, then SIGTERM: <nil> and exit 0 (#347)')
 
 
+def client_addr(out):
+    # #355: RemoteAddr is the connection's peer; ClientIP believes X-Forwarded-For and Forwarded
+    # only from TrustedProxies, taking the rightmost untrusted address, and formats IPv6 per
+    # RFC 5952 (an IPv4-mapped address as IPv4).
+    exe = out / 'client_addr'
+    subprocess.run([str(ROOT / 'bin/tinc'), '-o', str(exe), 'tools/ci/fixtures/client_addr.tin'],
+                   cwd=ROOT, env=dict(os.environ, TIN_ROOT=str(ROOT)), check=True)
+
+    def serve(trust, asks):
+        port = ws.free_port()
+        server = subprocess.Popen([str(exe)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  env=dict(os.environ, PORT=str(port), TIN_CORES='1', TRUST=trust))
+        got = []
+        try:
+            eventually(lambda: server_ready(port, server))
+            for header in asks:
+                s = socket.create_connection(('127.0.0.1', port), timeout=10)
+                local = s.getsockname()[1]
+                s.sendall(('GET /addr HTTP/1.1\r\nHost: x\r\n%s\r\n' % header).encode())
+                status, _, body = answer(s)
+                s.close()
+                remote, client = body.decode().split(' ')
+                assert status == 200 and remote == '127.0.0.1:%d' % local, (status, body, local)
+                got.append(client)
+        finally:
+            server.terminate()
+            server.wait(timeout=15)
+        return got
+
+    xff = lambda v: 'X-Forwarded-For: %s\r\n' % v
+    fwd = lambda v: 'Forwarded: %s\r\n' % v
+    got = serve('', ['', xff('203.0.113.7'), fwd('for=192.0.2.60')])
+    assert got == ['127.0.0.1'] * 3, ('an untrusted peer: the headers are ignored', got)
+    cases = [
+        ('', '127.0.0.1'),
+        (xff('203.0.113.7'), '203.0.113.7'),
+        (xff('198.51.100.1, 203.0.113.7, 10.1.2.3'), '203.0.113.7'),
+        (xff('10.0.0.1'), '10.0.0.1'),
+        (xff('2001:DB8:0:0:0:0:0:1'), '2001:db8::1'),
+        (xff('2001:db8:0:0:1:0:0:1'), '2001:db8::1:0:0:1'),
+        (xff('::ffff:192.0.2.5'), '192.0.2.5'),
+        (xff('fe80::1:2'), 'fe80::1:2'),
+        (xff('garbage, 203.0.113.7'), '203.0.113.7'),
+        (xff('203.0.113.7, 01.2.3.4'), '127.0.0.1'),
+        (fwd('for="[2001:db8:cafe::17]:4711"'), '2001:db8:cafe::17'),
+        (fwd('for=192.0.2.60;proto=http;by=203.0.113.43, for=10.9.9.9'), '192.0.2.60'),
+        (fwd('For="192.0.2.61:8080"'), '192.0.2.61'),
+    ]
+    got = serve('127.0.0.0/8,10.0.0.0/8,fd00::/8', [h for h, _ in cases])
+    assert got == [w for _, w in cases], list(zip([w for _, w in cases], got))
+    result = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30,
+                            env=dict(os.environ, PORT=str(ws.free_port()), TRUST='10.0.0.0/8,10.0.0.0/33'))
+    assert 'is not an IP address or network' in result.stdout, result
+    print('client address: RemoteAddr, ClientIP behind trusted proxies only (X-Forwarded-For, Forwarded), '
+          'RFC 5952 IPv6, mapped IPv4, malformed entries and a bad network refused (#355)')
+
+
 def main():
     out = ROOT / 'bin/ci/lifecycle'
     out.mkdir(parents=True, exist_ok=True)
@@ -203,6 +260,7 @@ def main():
     run(exe, out, 'anvil.Drain')
     admission(out)
     serve_in_say(out)
+    client_addr(out)
 
 
 if __name__ == '__main__':

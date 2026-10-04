@@ -133,6 +133,9 @@ fn main() {
 }
 ```
 
+- `TrustedProxies(cidrs []str) !`: TrustedProxies sets the proxies whose X-Forwarded-For and Forwarded headers ClientIP believes, as networks ("10.0.0.0/8", "fd00::/8") or single addresses. Call it before Serve. With none (the default) ClientIP is the connection's peer: the headers are written by the client and prove nothing unless a proxy you run replaced them.
+- `(q Req) RemoteAddr() str`: RemoteAddr is the address the request's connection comes from, "ip:port" ("[ip]:port" for IPv6, and an IPv4 client of an IPv6 listener as IPv4), or "" for a request made in the process. It is read once per connection.
+- `(q Req) ClientIP() str`: ClientIP is the client's IP address: the connection's peer, or, when the peer is one of the TrustedProxies, the rightmost address of X-Forwarded-For (else Forwarded's for=) that is not a trusted proxy. A malformed entry ends the walk at the peer. "" for a request made in the process.
 - `type Req struct`: Req is the request being served. Its strings live in the request pool: keep() them to store them anywhere long-lived.
 - `type Out struct`: Out is the response being built. Body is the response body; the status defaults to 200 and the content type to text/plain.
 - `Serve(addr str, h fn(Req, mut Out)) !`: Serve listens on addr (":8080", "127.0.0.1:8080") and serves h on every core. It returns only if the server cannot start. TIN_CORES overrides the number of cores.

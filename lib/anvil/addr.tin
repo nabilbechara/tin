@@ -1,0 +1,418 @@
+package anvil
+
+import "say"
+
+// Client addresses (#355): the peer of a request's connection, read once per connection,
+// and the client behind proxies the server trusts.
+
+shared mut gTrusted []u8 // TrustedProxies' networks: 16 address bytes, then the prefix length
+
+// TrustedProxies sets the proxies whose X-Forwarded-For and Forwarded headers ClientIP
+// believes, as networks ("10.0.0.0/8", "fd00::/8") or single addresses. Call it before
+// Serve. With none (the default) ClientIP is the connection's peer: the headers are written
+// by the client and prove nothing unless a proxy you run replaced them.
+fn TrustedProxies(cidrs []str) ! {
+	mut t = make([]u8, 0, 17*len(cidrs))
+	for _, c in cidrs {
+		let (ip, bits, ok) = cidr_parse(c)
+		if !ok {
+			fail say.Fault("anvil: %q is not an IP address or network (a.b.c.d/n, x:x::x/n)", c)
+		}
+		t = append(t, ip...)
+		t = append(t, u8(bits))
+	}
+	gTrusted = keep(t)
+}
+
+// RemoteAddr is the address the request's connection comes from, "ip:port" ("[ip]:port"
+// for IPv6, and an IPv4 client of an IPv6 listener as IPv4), or "" for a request made in
+// the process. It is read once per connection.
+fn (q Req) RemoteAddr() str {
+	let (ip, port, ok) = peer_ip(q.cn)
+	if !ok {
+		return ""
+	}
+	let s = ip_string(ip)
+	if is_v4(ip) {
+		return "{s}:{port}"
+	}
+	return "[{s}]:{port}"
+}
+
+// ClientIP is the client's IP address: the connection's peer, or, when the peer is one of
+// the TrustedProxies, the rightmost address of X-Forwarded-For (else Forwarded's for=) that
+// is not a trusted proxy. A malformed entry ends the walk at the peer. "" for a request
+// made in the process.
+fn (q Req) ClientIP() str {
+	let (peer, _, ok) = peer_ip(q.cn)
+	if !ok {
+		return ""
+	}
+	if !trusted(peer) {
+		return ip_string(peer)
+	}
+	mut hops = forwarded_for(q.Header("X-Forwarded-For"), false)
+	if len(hops) == 0 {
+		hops = forwarded_for(q.Header("Forwarded"), true)
+	}
+	mut i = len(hops) - 1
+	for i >= 0 {
+		let (ip, good) = ip_parse(hops[i])
+		if !good {
+			return ip_string(peer)
+		}
+		if !trusted(ip) || i == 0 {
+			return ip_string(ip)
+		}
+		i -= 1
+	}
+	return ip_string(peer)
+}
+
+// forwarded_for splits an X-Forwarded-For value into its addresses or, for Forwarded
+// (RFC 7239), takes each element's for= value without quotes, brackets or port.
+fn forwarded_for(v str, rfc7239 bool) []str {
+	mut out = make([]str, 0, 4)
+	mut i = 0
+	for i <= len(v) {
+		mut j = i
+		for j < len(v) && v[j] != ',' {
+			j += 1
+		}
+		let part = trim_space(v[i:j])
+		if rfc7239 {
+			let f = forwarded_param(part)
+			if len(f) > 0 {
+				out = append(out, f)
+			}
+		} else if len(part) > 0 {
+			out = append(out, part)
+		}
+		i = j + 1
+	}
+	return out
+}
+
+// forwarded_param is the address in an element's for= pair: "for=192.0.2.43",
+// for="[2001:db8::1]:4711"; "" when the element has none.
+fn forwarded_param(e str) str {
+	mut i = 0
+	for i < len(e) {
+		mut j = i
+		for j < len(e) && e[j] != ';' {
+			j += 1
+		}
+		let pair = trim_space(e[i:j])
+		if len(pair) > 4 && (pair[0] == 'f' || pair[0] == 'F') && (pair[1] == 'o' || pair[1] == 'O') && (pair[2] == 'r' || pair[2] == 'R') && pair[3] == '=' {
+			mut a = pair[4:]
+			if len(a) >= 2 && a[0] == '"' && a[len(a)-1] == '"' {
+				a = a[1 : len(a)-1]
+			}
+			if len(a) > 0 && a[0] == '[' {
+				mut k = 1
+				for k < len(a) && a[k] != ']' {
+					k += 1
+				}
+				return a[1:k]
+			}
+			// a.b.c.d or a.b.c.d:port
+			mut k = 0
+			for k < len(a) && a[k] != ':' {
+				k += 1
+			}
+			return a[:k]
+		}
+		i = j + 1
+	}
+	return ""
+}
+
+fn trim_space(s str) str {
+	mut a = 0
+	mut b = len(s)
+	for a < b && (s[a] == ' ' || s[a] == '\t') {
+		a += 1
+	}
+	for b > a && (s[b-1] == ' ' || s[b-1] == '\t') {
+		b -= 1
+	}
+	return s[a:b]
+}
+
+// peer_ip is the connection's peer address as 16 bytes (IPv4 mapped into IPv6) and its
+// port, read with getpeername the first time and kept in the connection record.
+fn peer_ip(c i64) ([]u8, i64, bool) {
+	mut ip = make([]u8, 16)
+	if c == 0 {
+		return ip, 0, false
+	}
+	if c[cPeer] == 0 {
+		let sa = calloc(1, 128)
+		let sl = calloc(1, 8)
+		sl[0] = 120
+		if c32(rt_sys_getpeername(c[cFD], sa, sl)) < 0 {
+			free(sa)
+			c[cPeer] = -1
+		} else {
+			c[cPeer] = sa
+		}
+		free(sl)
+	}
+	let sa = c[cPeer]
+	if sa < 0 {
+		return ip, 0, false
+	}
+	let port = i64(load8(sa+2))<<8 | i64(load8(sa+3))
+	if rt_sockaddr_family(sa) == 2 {
+		ip[10] = 0xff
+		ip[11] = 0xff
+		for k in 0..4 {
+			ip[12+k] = u8(load8(sa + 4 + k))
+		}
+		return ip, port, true
+	}
+	for k in 0..16 {
+		ip[k] = u8(load8(sa + 8 + k))
+	}
+	return ip, port, true
+}
+
+fn is_v4(ip []u8) bool {
+	for k in 0..10 {
+		if ip[k] != 0 {
+			return false
+		}
+	}
+	return ip[10] == 0xff && ip[11] == 0xff
+}
+
+// trusted reports whether ip is in one of TrustedProxies' networks.
+fn trusted(ip []u8) bool {
+	if cast(i64, gTrusted) == 0 {
+		return false // TrustedProxies was not called
+	}
+	let t = gTrusted
+	mut e = 0
+	for e+17 <= len(t) {
+		let bits = i64(t[e+16])
+		mut same = true
+		mut b = 0
+		for b < bits && same {
+			let byte = b / 8
+			let mask = u8(0x80) >> u8(b % 8)
+			if (ip[byte] & mask) != (t[e+byte] & mask) {
+				same = false
+			}
+			b += 1
+		}
+		if same {
+			return true
+		}
+		e += 17
+	}
+	return false
+}
+
+// cidr_parse reads "addr" or "addr/n": the address as 16 bytes and the prefix length in
+// those 128 bits (an IPv4 /n is 96+n).
+fn cidr_parse(s str) ([]u8, i64, bool) {
+	mut slash = 0
+	for slash < len(s) && s[slash] != '/' {
+		slash += 1
+	}
+	let (ip, ok) = ip_parse(s[:slash])
+	if !ok {
+		return ip, 0, false
+	}
+	mut most = 128
+	mut base = 0
+	if is_v4(ip) && !has_colon(s[:slash]) {
+		most = 32
+		base = 96
+	}
+	if slash == len(s) {
+		return ip, 128, true
+	}
+	let digits = s[slash+1:]
+	if len(digits) == 0 || len(digits) > 3 {
+		return ip, 0, false
+	}
+	mut n = 0
+	for _, d in digits {
+		if d < '0' || d > '9' {
+			return ip, 0, false
+		}
+		n = n*10 + i64(d-'0')
+	}
+	if n > most {
+		return ip, 0, false
+	}
+	return ip, base + n, true
+}
+
+fn has_colon(s str) bool {
+	for _, c in s {
+		if c == ':' {
+			return true
+		}
+	}
+	return false
+}
+
+// ip_parse reads a dotted IPv4 address (no leading zeros) or an IPv6 address (RFC 4291
+// text, with :: and a trailing dotted IPv4), as 16 bytes; IPv4 is mapped (::ffff:a.b.c.d).
+fn ip_parse(s str) ([]u8, bool) {
+	mut ip = make([]u8, 16)
+	if !has_colon(s) {
+		let ok = v4_into(s, mut ip, 12)
+		ip[10] = 0xff
+		ip[11] = 0xff
+		return ip, ok
+	}
+	// IPv6: up to eight groups, one "::" standing for the zero groups it replaces.
+	mut groups = make([]i64, 0, 8)
+	mut gap = -1
+	mut i = 0
+	if len(s) >= 2 && s[0] == ':' && s[1] == ':' {
+		gap = 0
+		i = 2
+	} else if len(s) > 0 && s[0] == ':' {
+		return ip, false
+	}
+	for i < len(s) {
+		mut j = i
+		for j < len(s) && s[j] != ':' {
+			j += 1
+		}
+		let part = s[i:j]
+		if j == len(s) && !has_hex_only(part) {
+			// the last part may be dotted IPv4, as two groups
+			mut v4 = make([]u8, 16)
+			if !v4_into(part, mut v4, 12) {
+				return ip, false
+			}
+			groups = append(groups, i64(v4[12])<<8|i64(v4[13]))
+			groups = append(groups, i64(v4[14])<<8|i64(v4[15]))
+			i = j
+			break
+		}
+		if len(part) == 0 || len(part) > 4 {
+			return ip, false
+		}
+		mut g = 0
+		for q in 0..len(part) {
+			let h = hexval(part[q])
+			if h < 0 {
+				return ip, false
+			}
+			g = g*16 + h
+		}
+		groups = append(groups, g)
+		if j+1 < len(s) && s[j] == ':' && s[j+1] == ':' {
+			if gap >= 0 {
+				return ip, false
+			}
+			gap = len(groups)
+			i = j + 2
+		} else if j < len(s) {
+			i = j + 1
+			if i == len(s) {
+				return ip, false
+			}
+		} else {
+			i = j
+		}
+	}
+	if len(groups) > 8 || (gap < 0 && len(groups) != 8) || (gap >= 0 && len(groups) > 7) {
+		return ip, false
+	}
+	mut k = 0
+	for k < len(groups) {
+		mut at = k
+		if gap >= 0 && k >= gap {
+			at = 8 - (len(groups) - k)
+		}
+		ip[2*at] = u8(groups[k] >> 8)
+		ip[2*at+1] = u8(groups[k] & 0xff)
+		k += 1
+	}
+	return ip, true
+}
+
+fn has_hex_only(s str) bool {
+	for q in 0..len(s) {
+		if hexval(s[q]) < 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// v4_into reads a dotted IPv4 address into ip[at:at+4].
+fn v4_into(s str, ip mut []u8, at i64) bool {
+	mut part = 0
+	mut i = 0
+	for part < 4 {
+		mut j = i
+		mut n = 0
+		for j < len(s) && s[j] >= '0' && s[j] <= '9' && j-i < 3 {
+			n = n*10 + i64(s[j]-'0')
+			j += 1
+		}
+		if j == i || n > 255 || (j-i > 1 && s[i] == '0') {
+			return false
+		}
+		ip[at+part] = u8(n)
+		part += 1
+		if part < 4 {
+			if j >= len(s) || s[j] != '.' {
+				return false
+			}
+			j += 1
+		}
+		i = j
+	}
+	return i == len(s)
+}
+
+// ip_string formats 16 address bytes: dotted for a mapped IPv4 address, otherwise RFC 5952
+// (lower-case hex, no leading zeros, the longest run of two or more zero groups as ::).
+fn ip_string(ip []u8) str {
+	if is_v4(ip) {
+		return "{ip[12]}.{ip[13]}.{ip[14]}.{ip[15]}"
+	}
+	mut best = -1
+	mut bestLen = 1
+	mut k = 0
+	for k < 8 {
+		if ip[2*k] == 0 && ip[2*k+1] == 0 {
+			mut e = k
+			for e < 8 && ip[2*e] == 0 && ip[2*e+1] == 0 {
+				e += 1
+			}
+			if e-k > bestLen {
+				best = k
+				bestLen = e - k
+			}
+			k = e
+		} else {
+			k += 1
+		}
+	}
+	mut b = make([]u8, 0, 40)
+	k = 0
+	for k < 8 {
+		if k == best {
+			b = append(b, "::"...)
+			k += bestLen
+			continue
+		}
+		if k > 0 && k != best+bestLen {
+			b = append(b, ':')
+		}
+		let g = i64(ip[2*k])<<8 | i64(ip[2*k+1])
+		b = append(b, say.Fmt("%x", g)...)
+		k += 1
+	}
+	return str(b)
+}
