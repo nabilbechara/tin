@@ -1,0 +1,43 @@
+// Recording requests for replay (notes/interface_replay.md, sections 2 and 6; #241): with
+// TIN_REPLAY_DIR and TIN_REPLAY_KEY set, each request task gets a recording tape, and when the
+// task ends lib/replay keeps its capsule (a 5xx, a panic, or the sample) and frees the tape.
+package anvil
+
+import "replay"
+
+shared var gRecord bool // recording is on (replay.Setup said so before the cores started)
+
+// record_setup reads the replay switches for a server on n cores, before the cores start.
+func record_setup(n i64) {
+	gRecord = replay.Setup(n)
+}
+
+// record_start gives a request task that has not run yet a recording tape holding a copy of its
+// request bytes p[0:n] and the wall clock.
+func record_start(task i64, p i64, n i64) {
+	tp := rt_tape_new(1)
+	rt_tape_req(tp, p, n)
+	tp[13] = rt_wall_ns()
+	rt_tape_set(task, tp)
+}
+
+// record_status notes the status a request task responds with.
+func record_status(code i64) {
+	tp := rt_tape_of(rt_task_current())
+	if tp != 0 {
+		tp[10] = code
+	}
+}
+
+// record_end, on the core after a request task ended, keeps or drops its tape.
+func record_end(task i64) {
+	tp := rt_tape_of(task)
+	if tp == 0 {
+		return
+	}
+	rt_tape_set(task, 0)
+	if rt_task_panicked(task) {
+		tp[10] = rt_task_failure_status(task)
+	}
+	replay.Done(tp, myID)
+}
