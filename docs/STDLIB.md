@@ -41,6 +41,7 @@ Generated from the comments in `lib/*/` by `tools/gendoc.py`.
 | [mysql](#mysql) | MySQL client (database/sql with go-sql-driver/mysql) |
 | [postgres](#postgres) | PostgreSQL client (database/sql with pgx) |
 | [websocket](#websocket) | WebSocket server and client (gorilla/websocket) |
+| [replay](#replay) | production replay capsules (notes/interface_replay.md) |
 
 ## say
 
@@ -1261,3 +1262,15 @@ func echo(ws websocket.Conn, m websocket.Message) ! {
 - `IsClosed(err fault) bool`: IsClosed reports whether err is the normal end of a connection: the peer closed it.
 - `(c Conn) Read() !Message`: Read returns the next message; it answers pings and joins fragments on the way. When the peer closes, it answers the close and fails with "websocket: closed (code)". The returned message lives in the caller's pool. For a long-lived stream, use Each to reset message allocations after every callback without invalidating the Conn.
 - `(c Conn) Each(h func(Conn, Message) !) !`: Each reads messages and calls h until a read or callback fails. Every callback has a reusable message pool: use keep() to retain its data after the callback returns. The Conn and all objects allocated before Each remain valid. Callbacks may wait. A closed peer returns the same IsClosed fault as Read; callback faults propagate.
+
+## replay
+
+Reading replay capsules (notes/interface_replay.md, section 6; #242): the envelope's tag and keystream, the body, and the effect kinds this build can replay. Writing capsules, the spool and the keys of secrets are #241's, next to this file.
+
+- `type Capsule struct`: Capsule is a decoded capsule: one recorded request and its effect records.
+- `const Kinds = ",tide.now@1,tide.wall@1,dice.seed@1,seal.random@1,wire.http@1,wire.dial@1,wire.read@1,wire.write@1,redis@1,mysql@1,mysql.tx@1,postgres@1,postgres.tx@1,websocket.dial@1,websocket.read@1,websocket.write@1,quarry.read@1,quarry.write@1,quarry.stat@1,quarry.dir@1,quarry.fs@1,"`: Kinds lists the effect kinds (name@version) this build replays (section 4); a capsule with any other kind is refused. sched.* kinds join the list with their replay (#243).
+- `Open(path str, keyHex str) !Capsule`: Open reads the capsule at path, encrypted under keyHex (the 64 hex digits of TIN_REPLAY_KEY).
+- `Key(keyHex str) !str`: Key is the 32 bytes a TIN_REPLAY_KEY value (64 hex digits) stands for.
+- `Unseal(data str, key str) !str`: Unseal checks a capsule envelope's tag under key and returns its decrypted body.
+- `Decode(body str) !Capsule`: Decode reads a capsule body (schema 1) and checks every effect record and its kind.
+- `Supported(kind str) bool`: Supported reports whether this build replays effect kind (name@version).

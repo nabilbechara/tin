@@ -36,6 +36,7 @@ moving or deleting the tree breaks it.
 | `tin asm FILE.tin...` | print the generated ARM64 assembly (clang syntax) |
 | `tin audit secrets [-edition 1] FILE.tin...` | check the program and list every place a `secret` leaves the checker's protection: each `reveal(x)` and each secret passed to a library parameter declared `secret`, as `file:line:col: ...` sorted by position, then a count; exit status 1 (with the errors) when the program does not check |
 | `tin test [-bench] [DIR]` | build DIR (default `.`) with its `*_test.tin` files and run every `TestXxx(t mut crucible.T)`, then `BenchmarkXxx(b mut crucible.B)` with `-bench`; exit status 1 when a test fails, 2 for a wrong test signature (see §5.1) |
+| `tin replay CAPSULE --against BUILD [--live KIND]...` | run a recorded request again with every effect served from its capsule, and report the first divergence (see §8.1) |
 | `tin vendor [DIR]` | copy every package `DIR/tin.mod` requires (transitively, from local source directories) into `DIR/vendor/<path>` and write `DIR/tin.lock` with each vendored file's SHA-256 (see §2.1) |
 | `tin caps FILE.tin...` | check the program and print, per package, the capabilities (`net`, `files`, `spawn`, `exec`, `unsafe`) its exported functions can reach |
 | `tin suite` | run the compiler's strict test suite (`tools/v2test.sh`) |
@@ -243,6 +244,47 @@ Servers used: `examples/api.tin` (port 9180, `TIN_CORES=n`), `bench/http/fast` (
 A compiler change that breaks the compiler itself: build with the previous good
 compiler (`bin/s3/tinc` or the seed), never overwrite the seed until `make bootstrap`
 passes.
+
+### 8.1 Replaying a recorded request: `tin replay`
+
+A server records a request's effects in a capsule when it runs with `TIN_REPLAY_DIR` and
+`TIN_REPLAY_KEY` set (the switches are listed in `notes/interface_replay.md` §1). `tin replay` runs that request again:
+
+```sh
+TIN_REPLAY_KEY=<64 hex digits> tin replay spool/00001700000000000000-000-1.tcap --against server.tin
+```
+
+- `--against BUILD` is the program to run: a binary, or a `FILE.tin` that `tin` builds
+  first. It can be a later build than the one that recorded the capsule.
+- BUILD runs with `TIN_REPLAY_CAPSULE` set. Its `anvil.Serve` (or `Router.Serve`) does not
+  listen. It opens the capsule, checks the tag under `TIN_REPLAY_KEY`, and refuses a schema or
+  effect kind the build does not list (`replay.Kinds`). Then it sends the recorded request once
+  through the handler or router on one core. Every effect that goes through the replay hook
+  gets its recorded result or fault, and none is performed. The clients (clock, randomness,
+  HTTP, Redis, SQL, files) join the hook in #241's recording slices.
+- Replay stops at the first **divergence**: an effect whose kind or key differs from the next
+  recorded one (a different call, or a different order), or an effect after the last one. From
+  then on every effect of the request fails with the divergence; replay never falls through to
+  a live call.
+- `--live KIND` (repeatable, a kind without `@version`, such as `wire.http` or `redis`) makes
+  that kind's calls for real. They are still compared with the recording, which they consume.
+- The report goes to standard output, followed by the response body:
+
+  ```
+  replay: status 500 (recorded 500)
+  replay: divergence at effect 0: got wire.http@1 "POST ...", recorded redis@1 "GET cart:7"
+  replay: 2 recorded effects not served
+  charge failed: ...
+  ```
+
+  The second line appears only after a divergence, and the third only if some recorded effects
+  were not used.
+- Exit status: 0 when nothing diverged and every recorded effect was used; 3 when the replay
+  diverged or left effects; 4 when the capsule cannot be read (wrong key or damaged, unsupported
+  schema or kind, missing `TIN_REPLAY_KEY`); 2 for a usage error.
+- Only the request is replayed. Code that runs before `Serve` (`main`, eager initializers,
+  `use` resources, `on app.start`) runs as usual, live. A BUILD that never calls `Serve`
+  ignores the capsule.
 
 ## 9. Repository layout
 
