@@ -399,8 +399,36 @@ fn x_shift_imm(op, dst, l, k) {
     }
 }
 
+// x_signed_div10 mirrors the exact signed multiply-high sequence used by Go.
+fn x_signed_div10(op, dst, l, c) {
+    x_mov(RAX, l)
+    x_load_imm(XSCR, -3689348814741910323)
+    emit1(X_IMULH, XSCR)
+    x_binop(X_ADD, RDX, RDX, l, 1)
+    emit2(X_SARI, RDX, 3)
+    x_mov(XSCR, l)
+    emit2(X_SARI, XSCR, 63)
+    emit2(X_SUB, RDX, XSCR)
+    if streq(op, "/") {
+        x_mov(dst, RDX)
+        if c < 0 {
+            emit1(X_NEG, dst)
+        }
+    } else {
+        let q10 = XSCR2
+        if dst == q10 {
+            q10 = RAX
+        }
+        emit3(X_IMUL_RRI, q10, RDX, 10)
+        x_mov(dst, l)
+        emit2(X_SUB, dst, q10)
+    }
+}
+
 fn x_binary_const(op, dst, l, c) {
-    if streq(op, "+") {
+    if !arith_unsigned && (streq(op, "/") || streq(op, "%")) && (c == 10 || c == -10) {
+        x_signed_div10(op, dst, l, c);
+    } else if streq(op, "+") {
         x_add_imm(dst, l, c);
     } else if streq(op, "-") && c != -9223372036854775807 - 1 {
         x_add_imm(dst, l, -c);
@@ -2616,7 +2644,33 @@ fn x_task_swap_bytes() {
     return v;
 }
 
+// REP bulk memory loops preserve all callee-saved registers and r15.
+fn x_memory_bytes(fill) {
+    let hex="4889d148c1e106f3a4c3";
+    if fill { hex="4889f04889d148c1e106f3aac3"; }
+    let v=vec_new(); let i=0;
+    while load8(hex+i) != 0 {
+        vec_push(v,num_digit(load8(hex+i))*16+num_digit(load8(hex+i+1)));
+        i=i+2;
+    }
+    return v;
+}
+
 fn x_gen_fn(f) {
+    if streq(f[F_QNAME],"memcpy") || streq(f[F_QNAME],"memmove") || streq(f[F_QNAME],"memset") || streq(f[F_QNAME],"memcmp") || streq(f[F_QNAME],"memchr") || streq(f[F_QNAME],"mem_avx2_supported") {
+        x_out4(X_LABEL,vec_get(x_fn_labels,f[F_INDEX]),0,0,0);
+        let bs=memory_fast_amd64(f[F_QNAME]); let i=0;
+        while i < bs[VEC_LEN] { x_out4(X_RAWB,vec_get(bs,i),0,0,0); i=i+1; }
+        return;
+    }
+
+    if streq(f[F_QNAME],"mem_copy64") || streq(f[F_QNAME],"mem_fill64") {
+        x_out4(X_LABEL,vec_get(x_fn_labels,f[F_INDEX]),0,0,0);
+        let bs=x_memory_bytes(streq(f[F_QNAME],"mem_fill64"));
+        let i=0;
+        while i < bs[VEC_LEN] { x_out4(X_RAWB,vec_get(bs,i),0,0,0); i=i+1; }
+        return;
+    }
     if streq(f[F_QNAME], "rt_task_swap") {
         x_out4(X_LABEL, vec_get(x_fn_labels, f[F_INDEX]), 0, 0, 0);
         let bs = x_task_swap_bytes();

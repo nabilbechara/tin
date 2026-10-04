@@ -224,3 +224,59 @@ in your PRs, except #177 and #178, which belong to phase 2:
 - #172–#174, #183: anvil validation, timeouts and limits.
 - #176: long-lived reclamation, which builds on your phase 2 free API.
 - #124: TLS.
+
+## Phase 1 implementation and validation
+
+The compiler and runtime share `lib/runtime/number.tin`, written in the legacy function
+syntax so the committed seeds can compile it. Decimal parsing uses Eisel-Lemire's
+integer multiply/rounding path and an 800-digit exact decimal fallback; hexadecimal
+parsing rounds with a sticky tail. Precision formatting uses exact decimal shifts and
+nearest-even rounding. Shortest formatting finds the interval between adjacent floats;
+the existing small-number fast path remains. Scratch workspaces belong to each core,
+and conversion neither yields nor allocates after that workspace is initialized.
+
+`tools/ci/number_check.py` compares 221,604 generated cases with Go and 20,963 pinned
+finite cases from parse-number-fxx-test-data on every native CI target. It checks bits,
+errors, random decimal/hex values, midpoint ties, subnormals, signed zero, overlong tails,
+precision through 100, f32 and width/left/zero/plus flags. The long-integer mantissa case
+`1` followed by 2,000 zeroes and `e-2000` is checked with Go's exact `big.Rat` and
+nearest-even `big.Float.SetRat`: Go's capped strconv fallback returns zero for that
+input, whereas the exact result, Tin and the previous libc parser return one.
+`tests/v2/number.tin` also checks compiler literal bits and deterministic outputs against
+`bench/ref/number_smoke`. The packed power table is regenerated entirely with Python
+integers by `tools/gen_number_powers.py`; the Go adaptations retain their BSD license.
+
+## Phase 2 implementation and validation
+
+`lib/runtime/memory.tin` supplies the seed-compatible mmap heap and memory primitives
+for the compiler and runtime. Size-class headers preserve ownership across cores;
+remote frees queue to the owner's page source. Individual large mappings are unmapped
+on free. The public ingot free API and its lifetime boundary are in `docs/RUNTIME.md`;
+no owner-retirement or long-lived reclamation policy is introduced. Bulk copy/fill
+leaves use NEON on arm64 and REP on amd64, with bounded word scans for equality and
+byte search. The saved-register task layout and swap routines stay unchanged.
+
+`memory_check.py` checks Go-identical outputs, all byte alignments, overlapping moves,
+guard pages, allocator zeroing/realloc and cross-core returns. It injects 46 process-wide
+allocation/mapping failures only behind `TIN_ALLOC_TEST=1`; `oom-mapping.tin` also
+checks a real Linux mapping failure under the regression runner's virtual-memory limit.
+`task_memory_check.py` holds 300 heavy requests concurrently, then checks pool/stack
+page release and the 64-task cache cap. RSS acceptance is Linux-only. The benchmark
+suite adds matching Tin/Go memory cases at 16 B, 1 KiB and 1 MiB.
+
+Phase 2 performance repair: the first native Linux comparison missed the CPU gate in
+fannkuch, strbuild and the three memory microbenchmarks; its required rerun is retained.
+The seed-compatible Tin bodies now have bounded SSE2/NEON leaf replacements in both
+backends. Short copies load the complete range before storing (including overlapping
+memmove); 64-byte scans identify the first differing/matching byte. Guard-page tests now
+include copy/fill/scan lengths through 259 and overlap distances through 127 at lengths
+through 257. Machine code is reproducible from the checked-in relocation-free assembly
+with `python3 tools/gen_memory_fast.py --check`. No task swap or saved-register layout
+changes are involved.
+
+Phase 2 performance follow-up: the first native x86-64 run missed the 1 KiB memory gate
+(1.236 head/base); its required repeat is retained separately. Bounded AVX2 scans and
+medium copies now use a per-core capability cache, guarded by CPUID AVX/OSXSAVE, XGETBV
+XMM/YMM state, and CPUID AVX2. SSE2 remains the unsupported-CPU and legacy-compiler path.
+The corpus runs with automatic selection and forced SSE2, including guard pages and
+large overlaps. Native timing tables will be attached after the new head is measured.
