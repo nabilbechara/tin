@@ -55,6 +55,7 @@ extern func listen(fd i64, backlog i64) i64
 extern func accept(fd i64, addr i64, n i64) i64
 extern func fcntl(fd i64, cmd i64, ...) i64
 extern func close(fd i64) i64
+extern func shutdown(fd i64, how i64) i64
 extern func pipe(fds i64) i64
 extern func signal(sig i64, h i64) i64
 extern func time(t i64) i64
@@ -111,7 +112,11 @@ const cTask = 10  // the request task waiting (sleep, I/O) on this connection; l
 const cAlive = 11 // that request's keep-alive
 const cDead = 12  // closed while its task waited: freed when the task ends
 const cHijack = 13 // taken out of HTTP by its handler (Req.Hijack): closed when the task ends
-const cWords = 14
+const cDeadline = 14 // monotonic ns after which the sweep closes the connection (0: none)
+const cStart = 15    // when the first bytes of the request still arriving came (0: none pending)
+const cLinger = 16   // 1: close after an error response by lingering (see linger); 2: lingering
+const cSent100 = 17  // the request still arriving was told 100 Continue
+const cWords = 18
 
 shared var gListen i64
 shared var gIP i64
@@ -130,8 +135,21 @@ shared var gStop i64    // 1 once SIGTERM or SIGINT started the graceful shutdow
 shared var gDrained i64 // cores that stopped and have no connection left
 shared var gGrace i64   // seconds the shutdown waits for connections to finish (TIN_GRACE, default 25)
 shared var gTok i64     // 256 bytes: 1 for each byte a token (a field name) may hold (RFC 9110 5.6.2)
+shared var gHeaderMs i64   // a request's line and headers must arrive within this (0: no limit)
+shared var gReadMs i64     // the whole request, body included (0: no limit)
+shared var gIdleMs i64     // a keep-alive connection with no request in progress (0: no limit)
+shared var gWriteMs i64    // a response the client does not read: no progress for this long (0: no limit)
+shared var gTimeoutsSet bool
+shared var gMaxBody i64     // largest request body (413 past it)
+shared var gMaxBuffered i64 // bytes of requests still arriving a core may hold (503 past it)
+shared var gMaxConns i64    // connections per core; more are closed at accept (0: no limit)
+shared var gLimitsSet bool
 
 var myID i64
+var loopNow i64    // monotonic ns, read once per event-loop turn
+var nextSweep i64  // when the loop next closes connections past their deadline
+var hiFd i64       // the highest descriptor this core has held a connection on
+var bufBytes i64   // bytes held in connections' pending-input buffers on this core
 var draining bool     // this core stopped accepting; its connections close after their next response
 var reported bool     // this core counted itself in gDrained
 var deadline i64      // core 0: when the grace period ends (seconds)
@@ -287,6 +305,24 @@ func serve_on(addr str, n i64) ! {
 	if denv != 0 {
 		gDeadlineMs = atoi(denv) & 0xffffffff
 	}
+	if !gTimeoutsSet {
+		gHeaderMs = 10000
+		gReadMs = 60000
+		gIdleMs = 60000
+		gWriteMs = 30000
+	}
+	if !gLimitsSet {
+		gMaxBody = maxRequest
+		gMaxBuffered = 268435456
+		gMaxConns = 16384
+	}
+	gHeaderMs = env_int("TIN_HEADER_TIMEOUT_MS", gHeaderMs)
+	gReadMs = env_int("TIN_READ_TIMEOUT_MS", gReadMs)
+	gIdleMs = env_int("TIN_IDLE_TIMEOUT_MS", gIdleMs)
+	gWriteMs = env_int("TIN_WRITE_TIMEOUT_MS", gWriteMs)
+	gMaxBody = env_int("TIN_MAX_BODY", gMaxBody)
+	gMaxBuffered = env_int("TIN_MAX_BUFFERED", gMaxBuffered)
+	gMaxConns = env_int("TIN_MAX_CONNS", gMaxConns)
 	genv := getenv(cast(i64, "TIN_GRACE") + 8)
 	if genv != 0 && atoi(genv)&0xffffffff > 0 {
 		gGrace = atoi(genv) & 0xffffffff
@@ -378,11 +414,18 @@ func core(id i64) {
 	if id == 0 {
 		ev_signals()
 	}
+	loopNow = rt_mono_ns()
+	nextSweep = loopNow + 1000000000
 	for {
 		if gRelayOn {
 			relay.Arm()
 		}
 		n := ev_wait(wait_ms())
+		loopNow = rt_mono_ns()
+		if loopNow >= nextSweep {
+			sweep()
+			nextSweep = loopNow + 1000000000
+		}
 		run_timers()
 		if n <= 0 {
 			continue
@@ -530,6 +573,11 @@ func accept_all() {
 			target = rr % gCores
 			rr++
 		}
+		if gMaxConns > 0 && __atomic_load(gLoad+target*128) >= gMaxConns {
+			// Full: close at once rather than let one client hold every descriptor.
+			close(fd)
+			continue
+		}
 		if target == myID {
 			add_conn(fd, true)
 		} else {
@@ -583,6 +631,14 @@ func add_conn(fd i64, count bool) {
 	c := calloc(cWords, 8)
 	c[cFD] = fd
 	conns[fd] = c
+	if fd > hiFd {
+		hiFd = fd
+	}
+	// The first request must arrive like any other: its headers within the header timeout.
+	c[cStart] = loopNow
+	if gHeaderMs > 0 {
+		c[cDeadline] = loopNow + gHeaderMs*1000000
+	}
 	if count {
 		__atomic_add(gLoad+myID*128, 1)
 	}
@@ -608,6 +664,7 @@ func close_conn(c i64) {
 func free_conn(c i64) {
 	__atomic_add(gLoad+myID*128, -1)
 	if c[cIn] != 0 {
+		bufBytes -= c[cInCap]
 		free(c[cIn])
 	}
 	if c[cOut] != 0 {
@@ -626,6 +683,18 @@ func on_read(c i64) {
 // on_read_once reads and serves what one read returns; true means more may be waiting.
 func on_read_once(c i64) bool {
 	fd := c[cFD]
+	if c[cLinger] == 2 {
+		for {
+			n := read(fd, scr, scrSize)
+			if n == 0 || (n < 0 && errno() != EAGAIN && errno() != 4) {
+				close_conn(c)
+				return false
+			}
+			if n < 0 {
+				return false
+			}
+		}
+	}
 	buf := scr
 	cap := scrSize
 	have := 0
@@ -639,6 +708,7 @@ func on_read_once(c i64) bool {
 		} else {
 			memcpy(scr, c[cIn], c[cInLen])
 			have = c[cInLen]
+			bufBytes -= c[cInCap]
 			free(c[cIn])
 			c[cIn] = 0
 			c[cInLen] = 0
@@ -682,8 +752,23 @@ func on_read_once(c i64) bool {
 		if rem == cap {
 			need = cap * 2
 		}
-		if need > maxRequest {
+		if need > gMaxBody+2*maxLine {
 			close_conn(c)
+			return false
+		}
+		grow := need
+		if big {
+			grow = need - cap
+		}
+		if grow > 0 && gMaxBuffered > 0 && bufBytes+grow > gMaxBuffered {
+			// This core already holds as many partial requests as it may: refuse this one.
+			if big {
+				c[cIn] = buf
+				c[cInLen] = 0
+				c[cInCap] = cap
+			}
+			bad(c, 503)
+			flush(c)
 			return false
 		}
 		if big {
@@ -692,6 +777,7 @@ func on_read_once(c i64) bool {
 			}
 			if need > cap {
 				buf = realloc(buf, need)
+				bufBytes += need - cap
 				cap = need
 			}
 			c[cIn] = buf
@@ -699,17 +785,20 @@ func on_read_once(c i64) bool {
 			c[cInCap] = cap
 		} else {
 			p := malloc(need)
+			bufBytes += need
 			memcpy(p, buf+off, rem)
 			c[cIn] = p
 			c[cInLen] = rem
 			c[cInCap] = need
 		}
 	} else if big {
+		bufBytes -= cap
 		free(buf)
 		c[cIn] = 0
 		c[cInLen] = 0
 		c[cInCap] = 0
 	}
+	arm(c, rem > 0 && c[cClose] == 0)
 	rt_pool_reset()
 	return full && c[cClose] == 0 && c[cWriting] == 0 && c[cTask] == 0
 }
@@ -720,7 +809,7 @@ func on_read_once(c i64) bool {
 func flush(c i64) bool {
 	if obLen == 0 {
 		if c[cClose] != 0 && c[cOut] == 0 {
-			close_conn(c)
+			close_or_linger(c)
 			return false
 		}
 		return true
@@ -744,11 +833,12 @@ func flush(c i64) bool {
 		obLen = 0
 		ev_conn_write(c[cFD])
 		c[cWriting] = 1
+		write_deadline(c)
 		return true
 	}
 	obLen = 0
 	if c[cClose] != 0 {
-		close_conn(c)
+		close_or_linger(c)
 		return false
 	}
 	return true
@@ -780,6 +870,7 @@ func on_write(c i64) {
 	}
 	c[cOutOff] += w
 	if c[cOutOff] < c[cOutLen] {
+		write_deadline(c)
 		return
 	}
 	free(c[cOut])
@@ -788,12 +879,22 @@ func on_write(c i64) {
 	c[cOutOff] = 0
 	c[cWriting] = 0
 	if c[cClose] != 0 {
-		close_conn(c)
+		close_or_linger(c)
 		return
 	}
 	ev_conn_read(c[cFD])
+	arm(c, c[cIn] != 0)
 	if c[cIn] != 0 {
 		on_read(c)
+	}
+}
+
+// write_deadline gives a client that is not reading its response until the write timeout,
+// counted from the last progress.
+func write_deadline(c i64) {
+	c[cDeadline] = 0
+	if gWriteMs > 0 {
+		c[cDeadline] = loopNow + gWriteMs*1000000
 	}
 }
 
@@ -914,6 +1015,7 @@ func serve_one(c i64, p i64, n i64) i64 {
 		}
 	}
 	hosts := 0
+	expect100 := false
 	seenClose := false
 	pos := le + 1
 	cl := 0
@@ -958,6 +1060,16 @@ func serve_one(c i64, p i64, n i64) i64 {
 		f := lower(load8(h))
 		if f == 'h' && kn == 4 && name_is(h, kn, "host") {
 			hosts++
+		} else if f == 'e' && kn == 6 && name_is(h, kn, "expect") {
+			j := kn + 1
+			for j < vl && (load8(h+j) == ' ' || load8(h+j) == '\t') {
+				j++
+			}
+			e := vl
+			for e > j && (load8(h+e-1) == ' ' || load8(h+e-1) == '\t') {
+				e--
+			}
+			expect100 = name_is(h+j, e-j, "100-continue")
 		} else if f == 'c' && kn == 14 && name_is(h, kn, "content-length") {
 			v := parse_cl(h+kn+1, l-kn-1)
 			// Repeated Content-Length headers must agree, or the framing is ambiguous (RFC 9112 6.3).
@@ -998,15 +1110,23 @@ func serve_one(c i64, p i64, n i64) i64 {
 		return -1
 	}
 	total := hend + cl
-	if total > maxRequest {
+	if cl > gMaxBody {
 		bad(c, 413)
 		return -1
 	}
 	if n < total {
 		c[cNeed] = total
+		if expect100 && !http10 && c[cSent100] == 0 {
+			// The client waits for this before sending its body (RFC 9110 10.1.1): without it,
+			// curl and most SDKs stall about a second on every upload.
+			ob_room(32)
+			ob_str("HTTP/1.1 100 Continue\r\n\r\n")
+			c[cSent100] = 1
+		}
 		return 0
 	}
 	c[cNeed] = 0
+	c[cSent100] = 0
 	if waiting >= maxWaiting {
 		// Backpressure: too many requests already wait on this core.
 		bad(c, 503)
@@ -1026,10 +1146,15 @@ func serve_one(c i64, p i64, n i64) i64 {
 	pTn = tn
 	pKeep10 = http10 && alive
 	task := rt_task_new(run_request, c)
+	// A panic in the handler ends its request with 500, not the server (#142).
+	rt_task_recover(task)
 	if gDeadlineMs > 0 {
 		rt_task_set_deadline(task, rt_mono_ns()+gDeadlineMs*1000000)
 	}
 	if rt_task_run(task) {
+		if rt_task_panicked(task) {
+			panicked(c)
+		}
 		rt_task_free(task)
 		if !alive || draining {
 			c[cClose] = 1
@@ -1092,6 +1217,9 @@ func rebase_request(task i64, delta i64) {
 // response, then serve the requests that queued behind it.
 func finish_request(c i64, task i64) {
 	free(task[tUser+1])
+	if rt_task_panicked(task) && c[cHijack] == 0 && c[cDead] == 0 {
+		panicked(c)
+	}
 	rt_task_free(task)
 	if c[cHijack] != 0 {
 		close(c[cFD])
@@ -1165,20 +1293,118 @@ func run_timers() {
 	}
 }
 
-// wait_ms is how long the event loop may block: until the earliest task wake-up, or -1.
+// wait_ms is how long the event loop may block: until the earliest task wake-up or the next
+// sweep of connection deadlines.
 func wait_ms() i64 {
 	if rt_task_any_ready() {
 		return 0
 	}
 	next := rt_timer_next()
-	if next < 0 {
-		return -1
+	if next < 0 || next > nextSweep {
+		next = nextSweep
 	}
 	d := next - rt_mono_ns()
 	if d <= 0 {
 		return 0
 	}
 	return (d + 999999) / 1000000
+}
+
+// sweep closes the connections past their deadline: a request that does not arrive in time,
+// an idle keep-alive connection, or a client that stopped reading its response. Connections
+// whose request is running are left to the request deadline.
+func sweep() {
+	for fd := 0; fd <= hiFd; fd++ {
+		c := conns[fd]
+		if c != 0 && c[cDeadline] != 0 && c[cDeadline] <= loopNow && c[cTask] == 0 && c[cHijack] == 0 {
+			close_conn(c)
+		}
+	}
+}
+
+// arm sets c's deadline for its state once a read or a response is done: a request still
+// arriving (header timeout until its headers are in, then the read timeout, both from its
+// first bytes), or an idle keep-alive connection.
+func arm(c i64, partial bool) {
+	if c[cTask] != 0 || c[cHijack] != 0 {
+		c[cDeadline] = 0
+		return
+	}
+	if c[cWriting] != 0 {
+		return
+	}
+	if partial {
+		if c[cStart] == 0 {
+			c[cStart] = loopNow
+		}
+		ms := gHeaderMs
+		if c[cNeed] > 0 {
+			ms = gReadMs
+		}
+		c[cDeadline] = 0
+		if ms > 0 {
+			c[cDeadline] = c[cStart] + ms*1000000
+		}
+		return
+	}
+	c[cStart] = 0
+	c[cDeadline] = 0
+	if gIdleMs > 0 {
+		c[cDeadline] = loopNow + gIdleMs*1000000
+	}
+}
+
+// env_int is environment variable name as a non-negative decimal number, or def when it is
+// unset or not one.
+func env_int(name str, def i64) i64 {
+	p := getenv(cast(i64, name) + 8)
+	if p == 0 {
+		return def
+	}
+	v := 0
+	n := 0
+	for {
+		d := load8(p + n)
+		if d == 0 {
+			break
+		}
+		if d < '0' || d > '9' || n > 15 {
+			return def
+		}
+		v = v*10 + i64(d-'0')
+		n++
+	}
+	if n == 0 {
+		return def
+	}
+	return v
+}
+
+// Timeouts sets the connection timeouts in milliseconds; 0 turns one off. header: a
+// request's line and headers must arrive within it (slowloris); read: the whole request,
+// body included; idle: a keep-alive connection with no request in progress; write: a
+// response the client stops reading (no progress for this long). A connection is closed
+// when one passes; a request whose handler is running is governed by Deadline instead.
+// Defaults 10000, 60000, 60000 and 30000; TIN_HEADER_TIMEOUT_MS, TIN_READ_TIMEOUT_MS,
+// TIN_IDLE_TIMEOUT_MS and TIN_WRITE_TIMEOUT_MS override them. Call before Serve.
+func Timeouts(header i64, read i64, idle i64, write i64) {
+	gHeaderMs = header
+	gReadMs = read
+	gIdleMs = idle
+	gWriteMs = write
+	gTimeoutsSet = true
+}
+
+// Limits sets the largest request body in bytes (413 past it), the bytes of requests still
+// arriving that one core may buffer (a new partial request past it gets 503 and close), and
+// the connections per core (more are closed at accept; 0: no limit). Defaults 64 MiB,
+// 256 MiB and 16384; TIN_MAX_BODY, TIN_MAX_BUFFERED and TIN_MAX_CONNS override them. Call
+// before Serve.
+func Limits(maxBody i64, maxBuffered i64, maxConns i64) {
+	gMaxBody = maxBody
+	gMaxBuffered = maxBuffered
+	gMaxConns = maxConns
+	gLimitsSet = true
 }
 
 // Deadline makes every request's waits (tide.Wait, client calls) fail with "deadline
@@ -1241,12 +1467,54 @@ func parse_cl(p i64, n i64) i64 {
 	return v
 }
 
+// panicked answers a request whose handler panicked: 500, then the connection closes (the
+// panic and its backtrace are on stderr). Nothing of the handler's response was sent yet.
+func panicked(c i64) {
+	body := make([]u8, 0, 64)
+	w := Out{Body: body, code: 500, ctype: "text/plain; charset=utf-8", extra: make([]u8, 0), own: body}
+	w.Body = append(w.Body, status_text(500)...)
+	respond_out(w, false, false)
+	c[cClose] = 1
+}
+
 func bad(c i64, code i64) {
 	body := make([]u8, 0, 64)
 	w := Out{Body: body, code: code, ctype: "text/plain; charset=utf-8", extra: make([]u8, 0), own: body}
 	w.Body = append(w.Body, status_text(code)...)
 	respond_out(w, false, false)
 	c[cClose] = 1
+	c[cLinger] = 1
+}
+
+// lingerMs bounds how long a connection closed after an error response keeps reading.
+const lingerMs = 2000
+
+// linger ends a connection after an error response without losing the response: closing a
+// socket with unread input (a client still sending the body of a 413 or 503) makes the kernel
+// reset it, and the client may never read the answer. So the sending side is shut down and
+// whatever arrives is read and dropped until the client closes or lingerMs pass (as nginx's
+// lingering close).
+func linger(c i64) {
+	shutdown(c[cFD], 1)
+	c[cLinger] = 2
+	if c[cIn] != 0 {
+		bufBytes -= c[cInCap]
+		free(c[cIn])
+		c[cIn] = 0
+		c[cInLen] = 0
+		c[cInCap] = 0
+	}
+	c[cDeadline] = loopNow + lingerMs*1000000
+}
+
+// close_or_linger closes c once its last response is out: at once, or by lingering after an
+// error response.
+func close_or_linger(c i64) {
+	if c[cLinger] != 0 && c[cTask] == 0 {
+		linger(c)
+		return
+	}
+	close_conn(c)
 }
 
 func ob_room(n i64) {

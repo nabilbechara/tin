@@ -252,6 +252,24 @@ def conformance(port, failures):
     got, closed = first(b'GET /users/9?ms=200 HTTP/1.1\r\nHost: x\r\n\r\n', wait=5, shut=True)
     if not got.startswith(b'HTTP/1.1 200 ') or not got.endswith(b'user 9 stamp>tag /users/{id}') or not closed:
         failures.append('half-closed client with a waiting request: %r closed=%s' % (got, closed))
+    # #103: a client that sends Expect: 100-continue waits for 100 Continue before its body.
+    with socket.create_connection(('127.0.0.1', port), timeout=10) as s:
+        s.sendall(b'POST /users HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n')
+        s.settimeout(1)
+        try:
+            interim = s.recv(100)
+        except socket.timeout:
+            interim = b'(nothing within 1 s)'
+        s.sendall(b'hello')
+        s.settimeout(10)
+        rest = b''
+        while True:
+            d = s.recv(65536)
+            if not d:
+                break
+            rest += d
+        if interim != b'HTTP/1.1 100 Continue\r\n\r\n' or not rest.startswith(b'HTTP/1.1 201 ') or not rest.endswith(b'created 5'):
+            failures.append('Expect: 100-continue: %r then %r' % (interim, rest))
     print('request conformance (#183):', not failures)
 
 
@@ -273,6 +291,194 @@ def websockets(port, failures):
     print('20 WebSocket connections through a routed handler:', ok)
     if not ok:
         failures.append('websocket through the router')
+
+
+def limits(exe, failures):
+    """#173/#174: header, read and idle timeouts close stalled connections, a body over
+    TIN_MAX_BODY gets 413, partial requests past the per-core budget get 503, connections past
+    TIN_MAX_CONNS are closed at accept, and a waiting handler outlives the header timeout."""
+    port = ws.free_port()
+    env = dict(os.environ, PORT=str(port), TIN_CORES='1', TIN_DEADLINE_MS='5000', TIN_GRACE='1',
+               TIN_HEADER_TIMEOUT_MS='1000', TIN_READ_TIMEOUT_MS='2000', TIN_IDLE_TIMEOUT_MS='1500',
+               TIN_MAX_BODY='1000000', TIN_MAX_BUFFERED='3000000', TIN_MAX_CONNS='40')
+    server = subprocess.Popen([str(exe)], env=env)
+    try:
+        for _ in range(100):
+            try:
+                socket.create_connection(('127.0.0.1', port), timeout=0.1).close()
+                break
+            except OSError:
+                time.sleep(0.05)
+
+        def conn():
+            return socket.create_connection(('127.0.0.1', port), timeout=10)
+
+        def closed_after(s, limit):
+            s.settimeout(limit)
+            t = time.time()
+            try:
+                while s.recv(65536):
+                    pass
+                return time.time() - t
+            except socket.timeout:
+                return None
+            except ConnectionResetError:
+                return time.time() - t
+
+        cases = [
+            ('partial headers', b'GET /fast HTTP/1.1\r\nHost: x\r\nX-a: ', 0.5, 4),
+            ('nothing sent', b'', 0.5, 4),
+            ('unfinished body', b'POST /users HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n0123456789', 1.5, 5),
+        ]
+        for name, data, low, high in cases:
+            s = conn()
+            if data:
+                s.sendall(data)
+            took = closed_after(s, high + 2)
+            s.close()
+            print('%s: closed after %s s' % (name, took and round(took, 2)))
+            if took is None or took < low or took > high:
+                failures.append('%s: closed after %r s, want %s to %s' % (name, took, low, high))
+        s = conn()
+        s.sendall(b'GET /fast HTTP/1.1\r\nHost: x\r\n\r\n')
+        time.sleep(0.2)
+        s.recv(1000)
+        took = closed_after(s, 6)
+        s.close()
+        print('idle keep-alive: closed after %s s' % (took and round(took, 2)))
+        if took is None or took < 1 or took > 4:
+            failures.append('idle keep-alive closed after %r s' % took)
+        with conn() as s:
+            s.sendall(b'POST /users HTTP/1.1\r\nHost: x\r\nContent-Length: 2000000\r\n\r\n')
+            got = s.recv(100)
+            if not got.startswith(b'HTTP/1.1 413 '):
+                failures.append('body over TIN_MAX_BODY: %r' % got)
+        # A client still sending the body of a refused request must read the refusal: the
+        # server lingers instead of closing with unread input (which would reset the connection).
+        with conn() as s:
+            try:
+                s.sendall(b'POST /users HTTP/1.1\r\nHost: x\r\nContent-Length: 1500000\r\n\r\n' + b'b' * 1500000)
+            except OSError:
+                pass
+            try:
+                got = s.recv(100)
+            except OSError as e:
+                got = repr(e).encode()
+            if not got.startswith(b'HTTP/1.1 413 '):
+                failures.append('413 while the client sends its body: %r' % got)
+        held = []
+        for _ in range(4):
+            c = conn()
+            try:
+                c.sendall(b'POST /users HTTP/1.1\r\nHost: x\r\nContent-Length: 900000\r\n\r\n' + b'a' * 800000)
+            except OSError:
+                pass
+            held.append(c)
+            time.sleep(0.2)
+        refused = 0
+        for c in held:
+            c.settimeout(0.3)
+            try:
+                if c.recv(100).startswith(b'HTTP/1.1 503 '):
+                    refused += 1
+            except (socket.timeout, ConnectionResetError):
+                pass
+            c.close()
+        print('partial 900 kB bodies past a 3 MB budget: %d of 4 refused' % refused)
+        if refused != 1:
+            failures.append('buffer budget: %d of 4 partial bodies refused, want 1' % refused)
+        time.sleep(0.3)
+        many = [conn() for _ in range(45)]
+        time.sleep(0.5)
+        shut = 0
+        for c in many:
+            c.settimeout(0.01)
+            try:
+                if c.recv(10) == b'':
+                    shut += 1
+            except (socket.timeout, ConnectionResetError):
+                pass
+        for c in many:
+            c.close()
+        print('45 connections with TIN_MAX_CONNS=40: %d closed at accept' % shut)
+        if shut != 5:
+            failures.append('connection cap: %d of 45 closed at accept, want 5' % shut)
+        time.sleep(0.3)
+        status, _, body = request(port, 'GET', '/users/7?ms=1500')
+        if status != 200 or not body.startswith(b'user 7'):
+            failures.append('a handler waiting past the header timeout: %r %r' % (status, body))
+        if server.poll() is not None:
+            failures.append('the server exited during the limit checks')
+    finally:
+        stop(server)
+
+
+def overflow(exe, failures):
+    """#175: a handler that overflows its task stack ends the process with a panic line on
+    stderr and status 2, not a silent SIGBUS/SIGSEGV."""
+    port = ws.free_port()
+    server = subprocess.Popen([str(exe)], env=dict(os.environ, PORT=str(port), TIN_CORES='1'),
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        for _ in range(100):
+            try:
+                socket.create_connection(('127.0.0.1', port), timeout=0.1).close()
+                break
+            except OSError:
+                time.sleep(0.05)
+        status, _, body = request(port, 'GET', '/recurse?n=1000')
+        if status != 200 or body != b'depth 1000':
+            failures.append('shallow recursion: %r %r' % (status, body))
+        try:
+            request(port, 'GET', '/recurse?n=100000000')
+        except (EOFError, OSError):
+            pass
+        code = server.wait(timeout=10)
+        err = server.stderr.read().decode(errors='replace')
+        print('stack overflow in a handler: status %d, stderr %r' % (code, err.strip()))
+        if code != 2 or 'panic: stack overflow in a request handler' not in err:
+            failures.append('stack overflow: status %d, stderr %r' % (code, err))
+    finally:
+        if server.poll() is None:
+            server.kill()
+            server.wait()
+
+
+def panics(exe, failures):
+    """#142: a handler that panics, at once or after a wait, answers 500 and closes its
+    connection; the panic and its backtrace go to stderr; other requests, including one
+    waiting on the same core at the time, are served and the server keeps running."""
+    port = ws.free_port()
+    server = subprocess.Popen([str(exe)], env=dict(os.environ, PORT=str(port), TIN_CORES='1'),
+                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        for _ in range(100):
+            try:
+                socket.create_connection(('127.0.0.1', port), timeout=0.1).close()
+                break
+            except OSError:
+                time.sleep(0.05)
+        slow = {}
+        t = threading.Thread(target=lambda: slow.setdefault('r', request(port, 'GET', '/users/5?ms=400')))
+        t.start()
+        time.sleep(0.1)
+        got = [request(port, 'GET', p)[0] for p in ('/boom', '/boom?ms=100', '/fast', '/boom', '/fast')]
+        t.join()
+        print('panicking handlers and others:', got, 'waiting request:', slow.get('r', (0,))[0])
+        if got != [500, 500, 200, 500, 200] or slow.get('r', (0,))[0] != 200:
+            failures.append('panics: %r, waiting request %r' % (got, slow.get('r')))
+        if server.poll() is not None:
+            failures.append('the server exited after a handler panicked')
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait()
+        err = server.stderr.read().decode(errors='replace')
+        if err.count('panic: index out of range [5] with length 3') != 3:
+            failures.append('panic messages on stderr: %r' % err[:2000])
 
 
 def main():
@@ -297,6 +503,12 @@ def main():
                 failures.append('the server exited on %d cores' % cores)
         finally:
             stop(server)
+    print('-- limits')
+    limits(exe, failures)
+    print('-- panics')
+    panics(exe, failures)
+    print('-- stack overflow')
+    overflow(exe, failures)
     if failures:
         sys.exit('\n'.join(failures))
 

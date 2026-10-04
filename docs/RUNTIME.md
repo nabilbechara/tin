@@ -208,9 +208,26 @@ reading resumes and buffered input is served.
   whitespace before it, obs-fold, a name that is not a token), a CR or NUL inside a header
   line, an HTTP/1.1 request without exactly one `Host`, or a bad `Content-Length` gets
   400; `Transfer-Encoding` gets 501.
+- A request with `Expect: 100-continue` whose body has not arrived gets
+  `HTTP/1.1 100 Continue` first (clients such as curl and the AWS SDKs wait for it).
 - An absolute-form target (`GET http://host/path?q HTTP/1.1`) is routed on its path and
   query; an empty path is `/`.
-- Bodies are limited to 64 MiB (413).
+- Bodies are limited to 64 MiB by default (413); `anvil.Limits` or `TIN_MAX_BODY` changes it.
+- **Timeouts** (`anvil.Timeouts`, or the environment): a request's line and headers must
+  arrive within 10 s of its first byte (`TIN_HEADER_TIMEOUT_MS`), and the whole request
+  within 60 s (`TIN_READ_TIMEOUT_MS`); a keep-alive connection with no request in progress
+  is closed after 60 s (`TIN_IDLE_TIMEOUT_MS`); a response the client stops reading is
+  dropped after 30 s without progress (`TIN_WRITE_TIMEOUT_MS`). A new connection gets the
+  header timeout for its first request. 0 turns one off. While a handler runs, only the
+  request deadline (`anvil.Deadline`) applies. Each core checks its connections' deadlines
+  once a second, in its event loop (no timer per connection).
+- **Closing after an error:** a connection closed after a parse error, 413 or 503 shuts down
+  its sending side and reads and drops input for up to 2 s before it closes (a lingering
+  close, as nginx does): closing with unread input would reset the connection, and a client
+  still sending its body would lose the response.
+- **Memory and connections:** the partial requests one core buffers are limited to 256 MiB
+  (`TIN_MAX_BUFFERED`): a new partial request past it gets 503 and close. Each core takes at
+  most 16384 connections (`TIN_MAX_CONNS`); more are closed at accept.
 - HTTP/1.0 closes unless keep-alive is asked for, and a kept HTTP/1.0 connection gets
   `Connection: keep-alive` in every response. `Connection` is read as a token list:
   `close` anywhere closes the connection after the response.
@@ -242,6 +259,12 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
 - Deadlines: each request's waits give up at `anvil.Deadline(ms)` / `TIN_DEADLINE_MS`
   (default 30 s) after it started: `tide.Wait` then fails with `deadline exceeded`.
 - Backpressure: at 4096 waiting requests on a core, new requests get 503.
+- A panic in a handler (an index out of range, a division by zero, `panic`) ends only its
+  request: `panic: ...` and the backtrace go to stderr, the task's cleanups run and its pool
+  is reset, its stack is abandoned and reused, and the request gets 500 and its connection
+  closes. Other requests, waiting ones on the same core included, go on. Deferred calls in
+  the handler do not run (that needs unwinding: `guard`, #142), and a panic outside a request
+  (main, a tick, a relay handler) or a stack overflow still ends the process.
 - A connection closed while its request waits is marked dead and freed when the task ends.
 - Finished tasks go on a per-core free list with their stacks and pools.
 
