@@ -200,6 +200,15 @@ let user = loadUser(id) catch err {
   variants with bindings, `_`, several patterns separated by `,`, and a guard
   (`n if n > 100 =>`). An enum `match` must cover every variant or have `_`.
 - There is no fallthrough.
+- Lowering (#225): an arm may also be a `return`, `break`, `continue`, `fail` or an assignment.
+  `break` and `continue` in an arm apply to the enclosing loop. A name pattern compares with a
+  package-level constant or variable (a sentinel), names a variant of an enum subject, or binds
+  the value; naming a local variable is an error (compare with a guard). Inside a variant's
+  values a name binds, as in a switch case. A `match` that gives a value handles every value
+  (`_`, every variant, or `true` and `false`); as a statement, `let` or assignment value,
+  `return` value or a catch or boundary block's last expression its arms may be blocks that
+  leave, while inside a larger expression its arms are expressions. A statement `match` a
+  `switch` can express compiles to the same instructions as that switch.
 
 ---
 
