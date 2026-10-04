@@ -196,12 +196,267 @@ func rt_bounds_fail2(i i64, n i64) {
 	rt_panic(rt_str_from_raw(b, k))
 }
 
-// rt_fail makes a fault: a str holding the message (a fault is never nil).
+// rt_fail makes a fault: a record whose word points at the str holding the message (a fault is never nil).
 func rt_fail(msg str) i64 {
-	n := len(msg)
-	p := rt_str_new(n)
-	memcpy(p+8, cast(i64, msg)+8, n)
+	return rt_fault_raw(cast(i64, msg)+8, len(msg), 0, 0)
+}
+
+// ---- fault records (notes/interface_faults.md) ----
+
+// A fault word points at a str [len][bytes][NUL] holding the full message; the four words
+// before it are the record: trace, joined, identity, cause (fault word p: p[-4] .. p[-1]).
+const faultHead = 32
+const fhTrace = 0
+const fhJoined = 1
+const fhIdent = 2
+const fhCause = 3
+
+// Identities of the runtime's standard sentinels (package fault); the compiler numbers
+// package-level fault("...") sentinels from faultUserIdent up.
+const faultCanceled = 1
+const faultDeadline = 2
+const faultLimit = 3
+const faultOverloaded = 4
+const faultDraining = 5
+const faultPanic = 6
+const faultUserIdent = 64
+
+// rt_fault_raw makes a fault record from n message bytes at data, a cause and an identity.
+func rt_fault_raw(data i64, n i64, cause i64, ident i64) i64 {
+	if n < 0 || n > maxAlloc {
+		rt_panic("allocation size out of range")
+	}
+	b := rt_alloc(faultHead + n + 9)
+	b[fhIdent] = ident
+	b[fhCause] = cause
+	p := b + faultHead
+	p[0] = n
+	memcpy(p+8, data, n)
 	return p
+}
+
+// rt_fault_new makes a fault with message msg, a cause (0: none) and an identity (0: none).
+func rt_fault_new(msg str, cause i64, ident i64) i64 {
+	return rt_fault_raw(cast(i64, msg)+8, len(msg), cause, ident)
+}
+
+// rt_fault_sentinel makes the value of a sentinel: package-level `var E = fault("msg")`.
+func rt_fault_sentinel(msg str, ident i64) i64 {
+	return rt_fault_raw(cast(i64, msg)+8, len(msg), 0, ident)
+}
+
+// rt_fault_canceled is fault.Canceled: a wait in a cancelled boundary.
+func rt_fault_canceled() i64 { return rt_fault_sentinel("canceled", faultCanceled) }
+
+// rt_fault_deadline is fault.DeadlineExceeded: a wait past the task's deadline.
+func rt_fault_deadline() i64 { return rt_fault_sentinel("deadline exceeded", faultDeadline) }
+
+// rt_fault_limit is fault.LimitExceeded: a budget or bounded value exceeded.
+func rt_fault_limit() i64 { return rt_fault_sentinel("limit exceeded", faultLimit) }
+
+// rt_fault_overloaded is fault.Overloaded: admission refused by load shedding.
+func rt_fault_overloaded() i64 { return rt_fault_sentinel("overloaded", faultOverloaded) }
+
+// rt_fault_draining is fault.Draining: the cause of cancellations during a drain.
+func rt_fault_draining() i64 { return rt_fault_sentinel("draining", faultDraining) }
+
+// rt_fault_panic is a panic converted to a fault (identity fault.Panic): its message and backtrace text.
+func rt_fault_panic(msg str, trace str) i64 {
+	p := rt_fault_raw(cast(i64, msg)+8, len(msg), 0, faultPanic)
+	if len(trace) > 0 {
+		b := p - faultHead
+		b[fhTrace] = rt_fault_raw(cast(i64, trace)+8, len(trace), 0, 0)
+	}
+	return p
+}
+
+// rt_fault_wrap is fault.Wrap: "msg: cause" with err as the cause; a nil err stays nil.
+func rt_fault_wrap(err i64, msg str) i64 {
+	if err == 0 {
+		return 0
+	}
+	la := len(msg)
+	lb := err[0]
+	n := la + 2 + lb
+	b := rt_alloc(faultHead + n + 9)
+	b[fhCause] = err
+	p := b + faultHead
+	p[0] = n
+	memcpy(p+8, cast(i64, msg)+8, la)
+	store8(p+8+la, ':')
+	store8(p+9+la, ' ')
+	memcpy(p+10+la, err+8, lb)
+	return p
+}
+
+// rt_fault_join is fault.Join: every non-nil fault of the []fault slice xs, reachable by
+// fault.Is, the messages joined with newlines; nil when there are none.
+func rt_fault_join(xs i64) i64 {
+	n := xs[0]
+	d := xs[2]
+	count := 0
+	total := 0
+	for i := 0; i < n; i++ {
+		e := d[i]
+		if e != 0 {
+			if count > 0 {
+				total++
+			}
+			total += e[0]
+			count++
+		}
+	}
+	if count == 0 {
+		return 0
+	}
+	list := rt_alloc(8 * (count + 1))
+	list[0] = count
+	b := rt_alloc(faultHead + total + 9)
+	b[fhJoined] = list
+	p := b + faultHead
+	p[0] = total
+	at := p + 8
+	k := 0
+	for i := 0; i < n; i++ {
+		e := d[i]
+		if e != 0 {
+			if k > 0 {
+				store8(at, '\n')
+				at++
+			}
+			memcpy(at, e+8, e[0])
+			at += e[0]
+			k++
+			list[k] = e
+		}
+	}
+	return p
+}
+
+// rt_fault_is is fault.Is: whether err or any fault in its chain (causes and joined faults)
+// is target, by identity for sentinels and by reference otherwise; a nil target matches only nil.
+func rt_fault_is(err i64, target i64) bool {
+	if target == 0 {
+		return err == 0
+	}
+	tb := target - faultHead
+	id := tb[fhIdent]
+	for err != 0 {
+		if err == target {
+			return true
+		}
+		b := err - faultHead
+		if id != 0 && b[fhIdent] == id {
+			return true
+		}
+		list := b[fhJoined]
+		if list != 0 {
+			for i := 1; i <= list[0]; i++ {
+				if rt_fault_is(list[i], target) {
+					return true
+				}
+			}
+		}
+		err = b[fhCause]
+	}
+	return false
+}
+
+// rt_fault_cause is fault.Cause: the fault err wraps (nil for none, for nil and for a join).
+func rt_fault_cause(err i64) i64 {
+	if err == 0 {
+		return 0
+	}
+	b := err - faultHead
+	return b[fhCause]
+}
+
+// rt_fault_ident is the sentinel identity of err (0: none).
+func rt_fault_ident(err i64) i64 {
+	if err == 0 {
+		return 0
+	}
+	b := err - faultHead
+	return b[fhIdent]
+}
+
+// rt_fault_trace is the backtrace text of the first panic fault in err's chain ("" for none).
+func rt_fault_trace(err i64) str {
+	for err != 0 {
+		b := err - faultHead
+		if b[fhTrace] != 0 {
+			return cast(str, b[fhTrace])
+		}
+		list := b[fhJoined]
+		if list != 0 {
+			for i := 1; i <= list[0]; i++ {
+				t := rt_fault_trace(list[i])
+				if len(t) > 0 {
+					return t
+				}
+			}
+		}
+		err = b[fhCause]
+	}
+	return ""
+}
+
+// rt_fault_copy copies err and its whole chain, to the ingot heap (keep, or across a pool
+// scope: release it with rt_fault_free) or, ingot false, to the current pool.
+func rt_fault_copy(err i64, ingot bool) i64 {
+	if err == 0 {
+		return 0
+	}
+	b := err - faultHead
+	size := faultHead + err[0] + 9
+	q := 0
+	if ingot {
+		q = rt_ingot_alloc(size)
+	} else {
+		q = rt_alloc(size)
+	}
+	memcpy(q, b, size)
+	q[fhCause] = rt_fault_copy(b[fhCause], ingot)
+	q[fhTrace] = rt_fault_copy(b[fhTrace], ingot)
+	list := b[fhJoined]
+	if list != 0 {
+		n := list[0]
+		nl := 0
+		if ingot {
+			nl = rt_ingot_alloc(8 * (n + 1))
+		} else {
+			nl = rt_alloc(8 * (n + 1))
+		}
+		nl[0] = n
+		for i := 1; i <= n; i++ {
+			nl[i] = rt_fault_copy(list[i], ingot)
+		}
+		q[fhJoined] = nl
+	}
+	return q + faultHead
+}
+
+// rt_fault_free releases a chain rt_fault_copy made on the ingot heap.
+func rt_fault_free(err i64) {
+	if err == 0 {
+		return
+	}
+	b := err - faultHead
+	rt_fault_free(b[fhCause])
+	rt_fault_free(b[fhTrace])
+	list := b[fhJoined]
+	if list != 0 {
+		for i := 1; i <= list[0]; i++ {
+			rt_fault_free(list[i])
+		}
+		free(list)
+	}
+	free(b)
+}
+
+// rt_keep_fault is keep() of a fault: a deep copy in the long-lived heap, identities kept.
+func rt_keep_fault(err i64) i64 {
+	return rt_fault_copy(err, true)
 }
 
 // ---- memory ----
@@ -2300,9 +2555,7 @@ func rt_fmt_out() {
 
 func rt_fmt_err() i64 {
 	f := rt_fmt_finish()
-	s := rt_str_new(f[fLen])
-	memcpy(s+8, f[fData], f[fLen])
-	return s
+	return rt_fault_raw(f[fData], f[fLen], 0, 0)
 }
 
 // ---- keep: copies into the long-lived ingot heap ----
@@ -2866,7 +3119,7 @@ func rt_guard_target() i64 {
 
 // rt_guard_land unwinds to guard g after a panic with msg and resumes its caller.
 func rt_guard_land(g i64, msg str) {
-	rt_land(g, cast(i64, "panic: "+msg))
+	rt_land(g, rt_fault_panic("panic: "+msg, ""))
 }
 
 // rt_land unwinds to the boundary of record g, which then gives fault word f, and resumes its
@@ -3100,7 +3353,7 @@ func rt_bnd_leave(b i64) {
 func rt_bnd_task(t i64, parent i64, kind i64) ! {
 	l := parent[bLimit]
 	if l != 0 && l[bTaskMax] > 0 && l[bTaskUsed] >= l[bTaskMax] {
-		fail "limit exceeded"
+		fail cast(fault, rt_fault_limit())
 	}
 	if l != 0 {
 		l[bTaskUsed]++
@@ -3209,9 +3462,9 @@ func rt_bnd_charge(n i64) {
 	if over[bKind]&bfRoot != 0 {
 		rt_panic("limit exceeded: the request's memory budget (TIN_REQUEST_MEMORY)")
 	}
-	rt_bnd_cancel(over, cast(fault, "limit exceeded"))
+	rt_bnd_cancel(over, cast(fault, rt_fault_limit()))
 	if over[bLand] != 0 {
-		rt_land(over[bLand], cast(i64, "limit exceeded"))
+		rt_land(over[bLand], rt_fault_limit())
 	}
 }
 
@@ -3267,7 +3520,7 @@ func rt_bnd_canceled(b i64) i64 {
 func rt_bnd_check() {
 	b := rt_bnd_current()
 	if b[bCancel] == 0 && b[bDeadline] > 0 && rt_mono_ns() >= b[bDeadline] {
-		rt_bnd_cancel(b[bDlOwner], cast(fault, "deadline exceeded"))
+		rt_bnd_cancel(b[bDlOwner], cast(fault, rt_fault_deadline()))
 	}
 }
 
@@ -3306,13 +3559,17 @@ func rt_wait_fault() i64 {
 	rt_bnd_check()
 	r := rt_bnd_current()[bCancel]
 	if r == 0 {
-		return cast(i64, "deadline exceeded")
+		return rt_fault_deadline()
 	}
-	m := cast(str, r)
-	if m == "deadline exceeded" || m == "limit exceeded" {
+	// Reasons compare by identity (notes/interface_faults.md), never by message.
+	id := rt_fault_ident(r)
+	if id == faultDeadline || id == faultLimit {
 		return r
 	}
-	return cast(i64, "canceled: " + m)
+	c := rt_fault_wrap(r, "canceled")
+	cb := c - faultHead
+	cb[fhIdent] = faultCanceled
+	return c
 }
 
 // rt_wait_msg is rt_wait_fault's message, for code that builds its fault later.

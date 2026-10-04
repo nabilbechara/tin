@@ -1,0 +1,64 @@
+// Package fault is fault chains and the standard sentinels, like Go's errors package: Wrap adds context and keeps the cause, Is walks the chain comparing identity, Join keeps several faults reachable. The runtime's sentinels are the variables Canceled, DeadlineExceeded, LimitExceeded, Overloaded, Draining and Panic; a package declares its own as `var ErrX = fault("msg")`. A function that makes a fault is declared ! here: its fault is the value (fail it, keep it in a variable, or test it). Layout and identities: notes/interface_faults.md.
+package fault
+
+// Canceled is the fault of a wait in a boundary that was cancelled.
+var Canceled = cast(fault, rt_fault_canceled())
+
+// DeadlineExceeded is the fault of a wait past the deadline (message "deadline exceeded").
+var DeadlineExceeded = cast(fault, rt_fault_deadline())
+
+// LimitExceeded is the fault of an exceeded budget or a bounded value too large.
+var LimitExceeded = cast(fault, rt_fault_limit())
+
+// Overloaded is the fault of work refused by load shedding.
+var Overloaded = cast(fault, rt_fault_overloaded())
+
+// Draining is the cause of cancellations while the server drains.
+var Draining = cast(fault, rt_fault_draining())
+
+// Panic is the identity of a panic converted to a fault by a guard; Backtrace reads its trace.
+var Panic = cast(fault, rt_fault_sentinel("panic", faultPanic))
+
+// Wrap is err with msg in front ("msg: cause"), err reachable as its cause; nil when err is nil.
+func Wrap(err fault, msg str) ! {
+	if err == nil {
+		return
+	}
+	fail cast(fault, rt_fault_wrap(cast(i64, err), msg))
+}
+
+// Is reports whether err or a fault in its chain (causes and joined faults) is target: the same sentinel, or the same fault.
+func Is(err fault, target fault) bool {
+	return rt_fault_is(cast(i64, err), cast(i64, target))
+}
+
+// Cause is the fault err wraps; nil when it wraps none (and for nil and a Join).
+func Cause(err fault) ! {
+	c := rt_fault_cause(cast(i64, err))
+	if c == 0 {
+		return
+	}
+	fail cast(fault, c)
+}
+
+// Join is one fault holding every non-nil fault of errs, each reachable by Is, the messages on separate lines; nil when all are nil.
+func Join(errs []fault) ! {
+	j := rt_fault_join(cast(i64, errs))
+	if j == 0 {
+		return
+	}
+	fail cast(fault, j)
+}
+
+// Message is the full message of err ("outer: inner" for a wrapped fault), "" for nil.
+func Message(err fault) str {
+	if err == nil {
+		return ""
+	}
+	return cast(str, err)
+}
+
+// Backtrace is the backtrace text of the panic in err's chain (a fault.Panic), "" for none.
+func Backtrace(err fault) str {
+	return rt_fault_trace(cast(i64, err))
+}

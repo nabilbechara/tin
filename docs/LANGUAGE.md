@@ -700,6 +700,20 @@ func main() {
   ```
 - `try` and `catch` cannot be nested inside another expression: bind the inner result
   first.
+- **Chains and sentinels** (package `fault`, notes/interface_faults.md). A package-level
+  `var ErrNotFound = fault("not found")` is a sentinel: each such declaration has its own
+  identity (`fault("...")` anywhere else is a compile error; use `fail("msg")`).
+  `fault.Wrap(err, "loading user {id}")` is a fault reading `loading user 7: not found`
+  whose cause is `err` (nil when `err` is nil); `fault.Is(err, ErrNotFound)` walks the
+  causes and joined faults and compares identity (a fault without identity matches only
+  itself); `fault.Cause`, `fault.Join([]fault{a, b})` (messages on separate lines) and
+  `fault.Message` complete it. Functions that make a fault are declared `!`: their fault is
+  the value, so `fail fault.Wrap(err, "context")` or `e := fault.Join(errs)`. The runtime's
+  sentinels are `fault.Canceled`, `fault.DeadlineExceeded` (every deadline wait fails with
+  it), `fault.LimitExceeded`, `fault.Overloaded`, `fault.Draining` and `fault.Panic`.
+  `switch err { case ErrNotFound: ... case fault.DeadlineExceeded, fault.Overloaded: ... }`
+  compares each case with `fault.Is` (`case nil:` matches no fault); `==` on faults still
+  compares the references.
 - `defer f(args)` evaluates `f` and its arguments when the defer statement runs and calls
   `f` when the function returns, last deferred first, on every return path including the
   returns `try` makes. A defer inside a loop is rejected (it would run once per function,
@@ -900,6 +914,7 @@ p := Pair[str, i64]{first: "k", second: 7}
 | `min(a, b)`, `max(a, b)` | of two numbers of the same type |
 | `panic(msg)` | stop the program |
 | `fail(msg)` | make a fault |
+| `fault(msg)` | declare a sentinel: only as `var ErrX = fault("msg")` at package level |
 | `keep(x)` | deep copy into long-lived memory (section 10) |
 | `print(...)`, `println(...)` | same as `say.Text` / `say.Line` |
 

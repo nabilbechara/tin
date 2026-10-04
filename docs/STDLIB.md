@@ -5,6 +5,7 @@ Generated from the comments in `lib/*/` by `tools/gendoc.py`.
 | package | role (Go equivalent) |
 |---|---|
 | [say](#say) | formatting and printing (fmt) |
+| [fault](#fault) | fault chains and standard sentinels (errors) |
 | [argo](#argo) | JSON (encoding/json) |
 | [io](#io) | streaming shapes (io) |
 | [anvil](#anvil) | HTTP/1.1 server (net/http) |
@@ -40,6 +41,17 @@ Generated from the comments in `lib/*/` by `tools/gendoc.py`.
 ## say
 
 Built into the compiler (formatting by static type, no reflection): `say.Line(a, b...)`, `say.Text(...)`, `say.Out(format, ...)`, `say.Fmt(format, ...) str`, `say.Str(x) str`, `say.Fault(format, ...) fault`, `say.To(fd, ...)`, `say.LineTo(fd, ...)`. See docs/LANGUAGE.md.
+
+## fault
+
+Package fault is fault chains and the standard sentinels, like Go's errors package: Wrap adds context and keeps the cause, Is walks the chain comparing identity, Join keeps several faults reachable. The runtime's sentinels are the variables Canceled, DeadlineExceeded, LimitExceeded, Overloaded, Draining and Panic; a package declares its own as `var ErrX = fault("msg")`. A function that makes a fault is declared ! here: its fault is the value (fail it, keep it in a variable, or test it). Layout and identities: notes/interface_faults.md.
+
+- `Wrap(err fault, msg str) !`: Wrap is err with msg in front ("msg: cause"), err reachable as its cause; nil when err is nil.
+- `Is(err fault, target fault) bool`: Is reports whether err or a fault in its chain (causes and joined faults) is target: the same sentinel, or the same fault.
+- `Cause(err fault) !`: Cause is the fault err wraps; nil when it wraps none (and for nil and a Join).
+- `Join(errs []fault) !`: Join is one fault holding every non-nil fault of errs, each reachable by Is, the messages on separate lines; nil when all are nil.
+- `Message(err fault) str`: Message is the full message of err ("outer: inner" for a wrapped fault), "" for nil.
+- `Backtrace(err fault) str`: Backtrace is the backtrace text of the panic in err's chain (a fault.Panic), "" for none.
 
 ## argo
 

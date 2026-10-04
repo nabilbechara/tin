@@ -957,6 +957,9 @@ fn check_pkg_vars(pkg, done) {
     }
 }
 
+var ck_sentinel;   // the initializer of the package-level var being checked: fault("...") there is a sentinel
+var sentinel_seq;  // numbers sentinel identities (the runtime's own are below 64)
+
 fn check_var(v) {
     set_file(v[D_FILE]);
     ck_legacy = !vec_get(file_v2, ck_file);
@@ -997,7 +1000,9 @@ fn check_var(v) {
     if s[S_TLS] {
         ck_fn = core_fn;
     }
+    ck_sentinel = init;
     let t = chk(init, s[S_TYPE]);
+    ck_sentinel = 0;
     if !s[S_TYPE] {
         s[S_TYPE] = default_type(t);
     }
@@ -3749,6 +3754,8 @@ fn lower_switch(s) {
             return;
         }
     }
+    // switch err { case ErrX: } compares each case with fault.Is (design_semantics section 2).
+    let faultsw = s[SW_TAG] && !ck_legacy && kind_of(chk(s[SW_TAG], 0)) == K_ERROR;
     let out = empty_block(pos);
     if s[SW_INIT] {
         vec_push(out[BLK_STMTS], s[SW_INIT]);
@@ -3789,6 +3796,10 @@ fn lower_switch(s) {
                     let id = node_new(EX_IDENT, pos);
                     id[ID_NAME] = "$sw";
                     e = binary_new(e[N_POS], "==", id, e);
+                    if faultsw {
+                        e[BIN_OP] = "$is";
+                        id[N_POS] = e[BIN_R][N_POS];
+                    }
                 }
                 if cond {
                     cond = binary_new(e[N_POS], "||", cond, e);
@@ -4601,7 +4612,10 @@ fn keep_fn(t) {
     let ret = node_new(ST_RETURN, pos);
     if k == K_DYN {
         ret[RET_VALUE] = mk_conv(pos, sym_ref_node(pos, x), CV_DYN_KEEP, t);
-    } else if k == K_STRING || k == K_ERROR {
+    } else if k == K_ERROR {
+        // A fault record with its chain (cause, joined faults, trace), identities kept.
+        ret[RET_VALUE] = rt_call(pos, "rt_keep_fault", args1(sym_ref_node(pos, x)), t);
+    } else if k == K_STRING {
         ret[RET_VALUE] = rt_call(pos, "rt_keep_str", args1(sym_ref_node(pos, x)), t);
     } else if k == K_FUNC {
         // A closure: its descriptor and captured variables, deep (rt_keep_closure, #170).

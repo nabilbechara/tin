@@ -17,8 +17,21 @@ JSON (`argo`) are ordinary library packages built on it.
 | map | pointer to an 80-byte header `[count, capacity, keys, values, control bytes, string keys?, shift, tombstones, hashes, region]`; open addressing, power-of-two capacity |
 | struct | pointer to its fields, laid out widest first with natural alignment, size rounded to 8 |
 | `?T` | the T pointer, or 0 for nil |
-| fault | a pointer to a str (the message), or 0 for nil |
+| fault | a pointer to a str holding the full message (`outer: inner` when wrapped), or 0 for nil; four words before the str hold the record `[trace, joined, identity, cause]` (notes/interface_faults.md) |
 | func value | the code address |
+
+A fault is still one word. `fail`, `fail(...)`, `say.Fault` and the `fault` package make it
+with `rt_fault_raw` (lib/runtime/runtime.tin): one allocation of
+`[trace][joined][identity][cause][len][bytes][NUL]`, and the word points at `len`, so every
+reader of the message (`say`, `{err}`, `err.Error()`, argo, `say.Str(err) == "..."`) sees a
+plain str. `identity` is nonzero for sentinels (the runtime's own are 1 to 6, package-level
+`fault("...")` declarations are numbered from 64 by the compiler), `cause` is the wrapped
+fault, `joined` points at `[n][fault]...` for `fault.Join`, and `trace` holds a panic's
+backtrace. `keep(err)` deep-copies the chain (`rt_keep_fault`). Runtime code makes the
+standard sentinels with `rt_fault_deadline()`, `rt_fault_canceled()`, `rt_fault_limit()`,
+`rt_fault_overloaded()`, `rt_fault_draining()` and `rt_fault_panic(msg, trace)` (each an
+i64 fault word: `fail cast(fault, rt_fault_deadline())`). The interface is
+notes/interface_faults.md.
 
 Map hashing is keyed with 128 random bits drawn once per process in `rt_init` (one key for
 every core, so a map built on one core is found on another): strings (and struct or enum
