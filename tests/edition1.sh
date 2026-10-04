@@ -53,4 +53,16 @@ if ! cmp -s tests/edition1/fault_wrap_bad.err "$tmp/fault_wrap_bad.err"; then
 	exit 1
 fi
 
+# Structured concurrency (#232): scopes, spawn, wait, cancel, first-fault cancellation.
+for name in scopes
+do
+	"$compiler" -edition 1 -o "$tmp/$name" "tests/edition1/run/$name.tin"
+	"$tmp/$name" >"$tmp/$name.out" 2>/dev/null
+	if ! cmp -s "tests/edition1/run/$name.out" "$tmp/$name.out"; then
+		echo "FAIL edition1/run/$name: output differs"
+		diff -u "tests/edition1/run/$name.out" "$tmp/$name.out" || true
+		exit 1
+	fi
+done
+
 echo "PASS edition 1 parser"

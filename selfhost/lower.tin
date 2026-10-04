@@ -308,7 +308,7 @@ fn chk_ident(e, want) {
 // runtime_use rejects user code naming a function only the standard library may use: a C
 // extern or one of the runtime's own (the trusted files outside any package).
 fn runtime_use(pos, f, name) {
-    if ck_legacy || ck_trusted || streq(name, "rt_pool_used") || streq(name, "rt_once") {
+    if ck_legacy || ck_trusted || streq(name, "rt_pool_used") || streq(name, "rt_once") || streq(name, "rt_scope_open") || streq(name, "rt_scope_close") {
         return;
     }
     if f[F_EXTERN] || (vec_get(file_trusted, f[F_FILE]) && load8(vec_get(file_pkgs, f[F_FILE])) == 0) {
@@ -1695,6 +1695,9 @@ fn chk_funclit(e) {
     f[F_CAPTURES] = vec_new();
     f[F_OUTER_SYMS] = vec_clone(sc_syms);
     f[F_ESCAPES] = e[LIT_ESCAPE];
+    if e[LIT_SCOPED] {
+        f[F_ESCAPES] = 0;
+    }
 
     let saved_fn = ck_fn;
     let saved_legacy = ck_legacy;
@@ -1825,6 +1828,9 @@ fn chk_unit(e, want) {
 fn chk_boundary(e) {
     let pos = e[N_POS];
     let kind = e[BOUND_KIND];
+    if !ck_legacy && kind == BOUND_PARALLEL {
+        return chk_parallel(e);
+    }
     if ck_legacy || (kind != BOUND_WITHIN && kind != BOUND_GUARD && kind != BOUND_LIMIT) {
         err_at(pos, "this boundary block is not supported yet");
         return ty_int;
@@ -1898,6 +1904,159 @@ fn chk_boundary(e) {
     c[N_TYPE] = rt;
     replace_node(e, c);
     return rt;
+}
+
+// chk_parallel lowers parallel { e1 \n e2 ... } (#232): each line is a closure run as a child
+// of an implicit scope, storing its value (a fault leaves the scope, cancelling the others);
+// a generated parallel$N(c1, c2, ...) waits for them and returns the tuple of values.
+fn chk_parallel(e) {
+    let pos = e[N_POS];
+    let stmts = e[BOUND_BODY][BLK_STMTS];
+    let lits = vec_new();
+    let vts = vec_new();
+    let i = 0;
+    while i < stmts[VEC_LEN] {
+        let st = vec_get(stmts, i);
+        if st[N_KIND] != ST_EXPR {
+            err_at(st[N_POS], "each line of parallel is an expression that runs as a child task");
+            return ty_int;
+        }
+        let x = st[ES_X];
+        if x[N_KIND] != EX_TRY && x[N_KIND] != EX_CATCH {
+            let tr = node_new(EX_TRY, x[N_POS]);
+            tr[TRY_X] = x;
+            tr[TRY_SOFT] = 1;
+            x = tr;
+        }
+        let bs = node_new(ST_BSTORE, st[N_POS]);
+        bs[ES_X] = x;
+        let body = empty_block(st[N_POS]);
+        vec_push(body[BLK_STMTS], bs);
+        let f = fn_new(st[N_POS], "func");
+        vec_push(f[F_PARAMS], "$r");
+        let it = node_new(TX_NAME, pos);
+        it[TX_B] = "i64";
+        vec_push(f[F_PTYPES], it);
+        let ft = node_new(TX_NAME, pos);
+        ft[TX_B] = "fault";
+        vec_push(f[F_RTYPES], ft);
+        f[F_BANG] = 1;
+        f[F_BODY] = body;
+        let lit = node_new(EX_FUNCLIT, st[N_POS]);
+        lit[LIT_FN] = f;
+        lit[LIT_ESCAPE] = 0;
+        let saved_t = bound_t;
+        bound_t = ty_void;
+        let ct = chk_funclit(lit);
+        if kind_of(bound_t) == K_VOID {
+            err_at(st[N_POS], "a parallel line must give a value");
+        }
+        vec_push(vts, bound_t);
+        bound_t = saved_t;
+        vec_push(lits, pair(lit, ct));
+        i = i + 1;
+    }
+    if lits[VEC_LEN] < 2 {
+        err_at(pos, "parallel needs at least two lines");
+        return ty_int;
+    }
+    let w = parallel_wrapper(pos, lits, vts);
+    let c = node_new(EX_CALL, pos);
+    c[CALL_NAME] = w[F_NAME];
+    c[CALL_FN] = w;
+    let args = vec_new();
+    i = 0;
+    while i < lits[VEC_LEN] {
+        vec_push(args, vec_get(vec_get(lits, i), 0));
+        i = i + 1;
+    }
+    c[CALL_ARGS] = args;
+    let results = vec_new();
+    i = 0;
+    while i < vts[VEC_LEN] {
+        vec_push(results, vec_get(vts, i));
+        i = i + 1;
+    }
+    vec_push(results, ty_error);
+    let rt = tuple_of(results);
+    c[N_TYPE] = rt;
+    replace_node(e, c);
+    return rt;
+}
+
+// parallel_wrapper builds parallel$N(c1..cn) (T1..Tn, fault): it spawns each ci with its own
+// 16-byte result cell in an implicit scope, waits for all of them, and returns the values.
+fn parallel_wrapper(pos, lits, vts) {
+    lifted_count = lifted_count + 1;
+    let f = fn_new(pos, "parallel");
+    let nb = buf_new();
+    buf_str(nb, "parallel$");
+    buf_int(nb, lifted_count);
+    buf_byte(nb, 0);
+    f[F_QNAME] = nb[VEC_DATA];
+    f[F_NAME] = nb[VEC_DATA];
+    f[F_LIFTED] = 2;
+    f[F_FILE] = ck_file;
+    f[F_BANG] = 1;
+    let n = lits[VEC_LEN];
+    let i = 0;
+    while i < n {
+        vec_push(f[F_PARAMS], "c");
+        vec_push(f[F_PTYPES], vec_get(vec_get(lits, i), 1));
+        vec_push(f[F_RTYPES], vec_get(vts, i));
+        i = i + 1;
+    }
+    vec_push(f[F_RTYPES], ty_error);
+    f[F_TYPE] = func_of(f[F_PTYPES], f[F_RTYPES], 0);
+    f[F_LOCALS] = vec_new();
+    f[F_BODY] = empty_block(pos);
+    vec_push(prog_fns, f);
+    let saved_fn = ck_fn;
+    ck_fn = f;
+    let syms = vec_new();
+    i = 0;
+    while i < n {
+        let cs = sym_new(SYM_LOCAL, "c", pos);
+        cs[S_TYPE] = vec_get(vec_get(lits, i), 1);
+        cs[S_SLOT] = i;
+        vec_push(f[F_LOCALS], cs);
+        vec_push(syms, cs);
+        i = i + 1;
+    }
+    f[F_SLOTS] = n;
+    let body = f[F_BODY][BLK_STMTS];
+    let r = temp(pos, rt_call(pos, "rt_alloc", args1(mk_int(pos, 16 * n, ty_int)), ty_int), ty_int);
+    vec_push(body, r);
+    let sc = temp(pos, rt_call(pos, "rt_scope_open_word", vec_new(), ty_int), ty_int);
+    vec_push(body, sc);
+    i = 0;
+    while i < n {
+        let at = mk_bin(pos, "+", sym_ref_node(pos, r[LET_SYM]), mk_int(pos, 16 * i, ty_int), ty_int);
+        let sa = args2(sym_ref_node(pos, sc[LET_SYM]), sym_ref_node(pos, vec_get(syms, i)));
+        vec_push(sa, at);
+        vec_push(body, expr_stmt(rt_call(pos, "rt_scope_spawn_arg", sa, ty_void)));
+        i = i + 1;
+    }
+    let fe = temp(pos, rt_call(pos, "rt_scope_close_word", args1(sym_ref_node(pos, sc[LET_SYM])), ty_error), ty_error);
+    vec_push(body, fe);
+    fe[LET_SYM][S_READS] = 1;
+    let ifs = node_new(ST_IF, pos);
+    ifs[IF_COND] = mk_bin(pos, "!=", sym_ref_node(pos, fe[LET_SYM]), mk_int(pos, 0, ty_error), ty_bool);
+    ifs[IF_THEN] = empty_block(pos);
+    vec_push(ifs[IF_THEN][BLK_STMTS], fault_return(pos, ifs[IF_THEN][BLK_STMTS], sym_ref_node(pos, fe[LET_SYM])));
+    vec_push(body, ifs);
+    let ret = node_new(ST_RETURN, pos);
+    let rv = vec_new();
+    i = 0;
+    while i < n {
+        vec_push(rv, mk_mem(pos, sym_ref_node(pos, r[LET_SYM]), 0, 0, 16 * i, vec_get(vts, i)));
+        i = i + 1;
+    }
+    vec_push(rv, mk_int(pos, 0, ty_error));
+    ret[RET_VALUES] = rv;
+    vec_push(body, ret);
+    ck_fn = saved_fn;
+    return f;
 }
 
 // bound_int_arg checks a boundary argument (a duration or a size) as an i64.

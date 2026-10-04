@@ -2758,7 +2758,8 @@ const tTimers = 50   // timer heap entries that still name this record
 const tRetired = 51  // 1: released over the cache cap; freed when its last timer entry pops
 const tBnd = 52      // the task's current boundary (notes/interface_boundaries.md), 0 before rt_bnd_task
 const tDefer = 53    // the task's defer chain (#230): records [next, defer$N, values...]
-const taskWords = 54
+const tChild = 54    // a scope's child task (#232): its record [task, body, fault, done, waiter, scope, next]
+const taskWords = 55
 
 const waitReady = 0
 const waitDeadline = 1
@@ -2786,6 +2787,7 @@ const bLand = 17    // unwind landing data (#230)
 const bRegion = 18  // 3 words: region mark at entry (#176)
 const bFault = 21   // the fault an unwind landed with
 const bOwnDl = 22   // this boundary's own deadline (mono ns); 0: none
+const bLive = 23    // a scope's children that have not finished (#232)
 const bndWords = 24
 
 const bkCore = 1
@@ -2878,6 +2880,7 @@ func rt_task_new(body func(i64), arg i64) i64 {
 	t[tTrim] = 0
 	t[tBnd] = 0
 	t[tDefer] = 0
+	t[tChild] = 0
 	for i := 0; i < 20; i++ {
 		t[tSave+i] = 0
 	}
@@ -2893,8 +2896,11 @@ func rt_task_entry() {
 	f(t[tArg])
 	rt_task_cleanups(0)
 	rt_bnd_task_end(t)
-	if __ctx()[ctxPoolExtra] != 0 || rt_pool_used() > 65536 { t[tTrim] = 1 }
-	rt_pool_reset()
+	// A scope's child allocates in its parent's pool (#232): that memory stays.
+	if t[tChild] == 0 {
+		if __ctx()[ctxPoolExtra] != 0 || rt_pool_used() > 65536 { t[tTrim] = 1 }
+		rt_pool_reset()
+	}
 	t[tDone] = 1
 	rt_task_swap(t, schedSave)
 }
@@ -2915,8 +2921,11 @@ func rt_task_panicked(t i64) bool {
 func rt_task_abort(t i64) {
 	rt_task_cleanups(0)
 	rt_bnd_task_end(t)
-	if __ctx()[ctxPoolExtra] != 0 || rt_pool_used() > 65536 { t[tTrim] = 1 }
-	rt_pool_reset()
+	// A scope's child allocates in its parent's pool (#232): that memory stays.
+	if t[tChild] == 0 {
+		if __ctx()[ctxPoolExtra] != 0 || rt_pool_used() > 65536 { t[tTrim] = 1 }
+		rt_pool_reset()
+	}
 	t[tDone] = 1
 	rt_task_swap(t, schedSave)
 }
@@ -2934,21 +2943,23 @@ func rt_task_run(t i64) bool {
 	schedPool[3] = c[ctxPoolMark]
 	schedPool[4] = c[ctxPoolExtra]
 	schedPool[5] = c[ctxFmt]
-	c[ctxBump] = t[tPool]
-	c[ctxEnd] = t[tPool+1]
-	c[ctxPoolBase] = t[tPool+2]
-	c[ctxPoolMark] = t[tPool+3]
-	c[ctxPoolExtra] = t[tPool+4]
+	// A scope's child runs in the pool of the task that owns its scope (or the core's own).
+	pw := rt_pool_words(t)
+	c[ctxBump] = pw[0]
+	c[ctxEnd] = pw[1]
+	c[ctxPoolBase] = pw[2]
+	c[ctxPoolMark] = pw[3]
+	c[ctxPoolExtra] = pw[4]
 	c[ctxFmt] = t[tFmt]
 	curTask = t
 	rt_task_swap(schedSave, t)
 	curTask = 0
 	if rt_task_sp(t) < t[tStack]+taskGuard+taskStack-16384 { t[tTrim] = 1 }
-	t[tPool] = c[ctxBump]
-	t[tPool+1] = c[ctxEnd]
-	t[tPool+2] = c[ctxPoolBase]
-	t[tPool+3] = c[ctxPoolMark]
-	t[tPool+4] = c[ctxPoolExtra]
+	pw[0] = c[ctxBump]
+	pw[1] = c[ctxEnd]
+	pw[2] = c[ctxPoolBase]
+	pw[3] = c[ctxPoolMark]
+	pw[4] = c[ctxPoolExtra]
 	t[tFmt] = c[ctxFmt]
 	c[ctxBump] = schedPool[0]
 	c[ctxEnd] = schedPool[1]
@@ -2957,6 +2968,18 @@ func rt_task_run(t i64) bool {
 	c[ctxPoolExtra] = schedPool[4]
 	c[ctxFmt] = schedPool[5]
 	return t[tDone] != 0
+}
+
+// rt_pool_words is where task t's pool words live: its own, or for a scope's child those of
+// the nearest task that is not a child (the core's own while a scope in main waits).
+func rt_pool_words(t i64) i64 {
+	for t != 0 && t[tChild] != 0 {
+		t = t[tChild][spScope][bTask]
+	}
+	if t == 0 {
+		return schedPool
+	}
+	return t + 8*tPool
 }
 
 // rt_task_yield switches from the running task back to the core; rt_task_run continues it.
@@ -3516,6 +3539,231 @@ func rt_bnd_set_limit(b i64, mem i64, tasks i64) {
 	b[bMemMax] = mem
 	b[bTaskMax] = tasks
 	b[bLimit] = b
+}
+
+// ---- scope and spawn: structured concurrency on the core (#232) ----
+//
+// scope s { ... } opens a scope boundary; s.spawn(f) starts f as a child task under it, on
+// this core. Children run when the current task waits; the scope's end waits for all of
+// them. The first child fault cancels the scope (so its other children) and is the scope's
+// fault. Children run on their own stacks and share their parent's memory.
+
+type scope struct {
+	b i64
+}
+
+// spawned is a child task started by spawn.
+type spawned struct {
+	r i64
+}
+
+const spTask = 0
+const spBody = 1
+const spFault = 2
+const spDone = 3
+const spWaiter = 4
+const spScope = 5
+const spNext = 6
+const spCanceled = 7 // cancelled through its handle: its fault is not the scope's
+const spArg = 8      // 1 + the argument of a body that takes one (parallel's result cell)
+const spWords = 9
+
+// rt_scope_open starts a scope boundary inside the current one.
+func rt_scope_open() scope {
+	return scope{b: rt_bnd_enter(bkScope)}
+}
+
+// spawn starts f as a child of scope s; it runs when the current task next waits.
+func (s scope) spawn(f func() !) spawned {
+	b := s.b
+	r := calloc(spWords, 8)
+	r[spBody] = cast(i64, f)
+	r[spScope] = b
+	r[spNext] = b[bLand]
+	b[bLand] = r
+	t := rt_task_new(rt_child_main, r)
+	r[spTask] = t
+	if rt_bnd_task(t, b, bkTask) != nil {
+		// Over the task budget of a limit around the scope (#235).
+		rt_task_free(t)
+		r[spTask] = 0
+		r[spFault] = rt_fault_limit()
+		r[spDone] = 1
+		rt_child_fault(b, r[spFault])
+		return spawned{r: r}
+	}
+	t[tChild] = r
+	rt_task_recover(t)
+	b[bLive]++
+	rt_task_queue(t)
+	return spawned{r: r}
+}
+
+// wait waits until the child has finished and gives its fault, if any.
+func (h spawned) wait() ! {
+	r := h.r
+	for r[spDone] == 0 {
+		rt_scope_block(r[spScope], r)
+	}
+	if r[spFault] != 0 {
+		fail cast(fault, r[spFault])
+	}
+}
+
+// cancel cancels the child (its waits fail with "canceled: canceled").
+func (h spawned) cancel() {
+	r := h.r
+	if r[spDone] == 0 && r[spTask] != 0 {
+		r[spCanceled] = 1
+		rt_bnd_cancel(rt_bnd_root(r[spTask]), cast(fault, rt_fault_canceled()))
+	}
+}
+
+// rt_scope_open_word and rt_scope_close_word are the scope calls of a parallel block's wrapper,
+// with the scope as a word and the fault as the result (#232).
+func rt_scope_open_word() i64 {
+	return rt_bnd_enter(bkScope)
+}
+
+func rt_scope_close_word(b i64) i64 {
+	rt_scope_close(scope{b: b}) catch err {
+		return cast(i64, err)
+	}
+	return 0
+}
+
+// rt_scope_spawn_arg starts body(arg) as a child of scope b (a parallel line).
+func rt_scope_spawn_arg(b i64, body func(i64) !, arg i64) {
+	h := scope{b: b}.spawn(cast(func() !, cast(i64, body)))
+	h.r[spArg] = arg + 1
+}
+
+// rt_scope_close waits for every child of s, leaves the scope and gives its first fault.
+func rt_scope_close(s scope) ! {
+	b := s.b
+	for b[bLive] > 0 {
+		rt_scope_block(b, 0)
+	}
+	f := b[bFault]
+	r := b[bLand]
+	for r != 0 {
+		n := r[spNext]
+		free(r)
+		r = n
+	}
+	b[bLand] = 0
+	b[bFault] = 0
+	rt_bnd_leave(b)
+	if f != 0 {
+		fail cast(fault, f)
+	}
+}
+
+// rt_scope_block lets children of b run until one finishes: a task parks (the child's end
+// wakes it); code on the core's own stack runs them itself.
+func rt_scope_block(b i64, r i64) {
+	if curTask != 0 {
+		if r != 0 {
+			r[spWaiter] = curTask
+		}
+		b[bTask] = curTask
+		if rt_bnd_current()[bCancel] != 0 {
+			// A cancelled wait returns at once: yield instead, so the children can finish.
+			rt_task_defer()
+		} else {
+			rt_task_park(0)
+		}
+		return
+	}
+	t := rt_task_take_ready()
+	if t == 0 {
+		now := rt_mono_ns()
+		t = rt_timer_pop(now)
+		if t == 0 {
+			next := rt_timer_next()
+			if next < 0 {
+				rt_panic("scope: every child is waiting for something only this scope could do")
+			}
+			rt_sleep_ns(next - now)
+			return
+		}
+	}
+	rt_task_resume(t)
+}
+
+// rt_task_resume runs task t until it waits or ends; an ended child is finished here.
+func rt_task_resume(t i64) {
+	if rt_task_run(t) {
+		rt_task_finish_child(t)
+	}
+}
+
+// rt_child_main is a child task's body: run the closure and keep its fault.
+func rt_child_main(r i64) {
+	if r[spArg] != 0 {
+		g := cast(func(i64) !, r[spBody])
+		g(r[spArg]-1) catch err {
+			r[spFault] = cast(i64, err)
+		}
+		return
+	}
+	f := cast(func() !, r[spBody])
+	f() catch err {
+		r[spFault] = cast(i64, err)
+	}
+}
+
+// rt_task_finish_child completes ended child task t: its fault reaches the scope, its
+// waiters wake, and the task is reused.
+func rt_task_finish_child(t i64) {
+	r := t[tChild]
+	if t[tPanicked] != 0 && r[spFault] == 0 {
+		r[spFault] = rt_fault_std(faultPanic, "panic")
+	}
+	r[spDone] = 1
+	r[spTask] = 0
+	b := r[spScope]
+	b[bLive]--
+	if r[spFault] != 0 && r[spCanceled] == 0 {
+		rt_child_fault(b, r[spFault])
+	}
+	if r[spWaiter] != 0 {
+		rt_task_wake(r[spWaiter])
+		r[spWaiter] = 0
+	}
+	if b[bLive] == 0 && b[bTask] != 0 {
+		rt_task_wake(b[bTask])
+	}
+	t[tChild] = 0
+	rt_task_free(t)
+}
+
+// rt_child_fault makes f the scope's fault (the first one wins) and cancels the scope.
+func rt_child_fault(b i64, f i64) {
+	if b[bFault] == 0 {
+		b[bFault] = f
+		rt_bnd_cancel(b, cast(fault, f))
+	}
+}
+
+// rt_task_queue puts task t on the core's ready queue, to run on the event loop's next turn.
+func rt_task_queue(t i64) {
+	if readyHead+readyN == readyCap {
+		if readyHead > 0 {
+			memmove(readyQ, readyQ+8*readyHead, 8*readyN)
+			readyHead = 0
+		} else {
+			readyCap = readyCap*2 + 64
+			readyQ = realloc(readyQ, 8*readyCap)
+		}
+	}
+	readyQ[readyHead+readyN] = t
+	readyN++
+}
+
+// rt_task_is_child reports whether t is a scope's child task (not a request).
+func rt_task_is_child(t i64) bool {
+	return t[tChild] != 0
 }
 
 // rt_bnd_deadline is b's effective deadline (mono ns), 0 for none.

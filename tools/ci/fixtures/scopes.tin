@@ -1,0 +1,53 @@
+package main
+
+import "anvil"
+import "say"
+import "tide"
+
+fn fetch(i i64, failAt i64) !str {
+	if i == failAt {
+		fail "child {i} failed"
+	}
+	try tide.Wait(100 * tide.Millisecond)
+	return "p{i}"
+}
+
+fn fetchAll(n i64, failAt i64) ![]str {
+	let pages = make([]str, n)
+	scope s {
+		for i in 0..n {
+			let k = i
+			s.spawn(fn() ! {
+				pages[k] = try fetch(k, failAt)
+			})
+		}
+	}
+	return pages
+}
+
+// fetch runs 4 children that each wait 50 ms: together they take about 50 ms.
+fn all(q anvil.Req, w mut anvil.Out) {
+	let pages = fetchAll(4, -1) catch err {
+		w.Status(500)
+		w.Text("fault: {err}")
+		return
+	}
+	w.Text(say.Str(pages))
+}
+
+// fail has one child fail at once: the others are cancelled instead of waiting 50 ms.
+fn fails(q anvil.Req, w mut anvil.Out) {
+	let pages = fetchAll(4, 2) catch err {
+		w.Text("fault: {err}")
+		return
+	}
+	w.Text("never {len(pages)}")
+}
+
+fn main() {
+	mut r = anvil.NewRouter()
+	r.Get("/all", all)
+	r.Get("/fail", fails)
+	let err = r.Serve(":0")
+	say.Line(err)
+}

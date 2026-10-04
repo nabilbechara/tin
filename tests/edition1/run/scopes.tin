@@ -1,0 +1,154 @@
+package main
+
+import "say"
+import "tide"
+
+mut order str = ""
+
+fn fetch(i i64) !str {
+	try tide.Wait((4 - i) * 30 * tide.Millisecond)
+	order = keep(order + "{i}")
+	if i == 7 {
+		fail "fetch {i} failed"
+	}
+	return "page{i}"
+}
+
+fn fetchAll(n i64) ![]str {
+	let pages = make([]str, n)
+	scope s {
+		for i in 0..n {
+			let k = i
+			s.spawn(fn() ! {
+				pages[k] = try fetch(k)
+			})
+		}
+	}
+	return pages
+}
+
+fn slowOrFail(i i64) ! {
+	if i == 0 {
+		fail "first child failed"
+	}
+	try tide.Wait(5 * tide.Second)
+}
+
+fn firstFault() ! {
+	scope s {
+		for i in 0..3 {
+			let k = i
+			s.spawn(fn() ! {
+				try slowOrFail(k)
+			})
+		}
+	}
+}
+
+fn handles() !str {
+	mut got str = ""
+	scope s {
+		let t = s.spawn(fn() ! {
+			try tide.Wait(5 * tide.Second)
+		})
+		let u = s.spawn(fn() ! {
+			try tide.Wait(tide.Millisecond)
+		})
+		try u.wait()
+		t.cancel()
+		t.wait() catch err {
+			got = keep("cancelled: {err}")
+		}
+	}
+	return got
+}
+
+fn tooMany(n i64) !i64 {
+	mut done i64 = 0
+	try limit tasks 4 {
+		scope s {
+			for i in 0..n {
+				s.spawn(fn() ! {
+					try tide.Wait(tide.Millisecond)
+					done += 1
+				})
+			}
+		}
+	}
+	return done
+}
+
+fn user(id i64) !str {
+	try tide.Wait(100 * tide.Millisecond)
+	return "user{id}"
+}
+
+fn orders(id i64) !i64 {
+	try tide.Wait(100 * tide.Millisecond)
+	if id < 0 {
+		fail "no orders for {id}"
+	}
+	return id * 3
+}
+
+fn profile(id i64) !str {
+	let (u, n) = try parallel {
+		user(id)
+		orders(id)
+	}
+	return "{u} has {n}"
+}
+
+fn mixed() !str {
+	let (a, b, c) = try parallel {
+		1 + 2
+		"x"
+		orders(2)
+	}
+	return "{a} {b} {c}"
+}
+
+fn main() {
+	let start = tide.Now()
+	let pages = fetchAll(4) catch err {
+		say.Line("never", err)
+		[]str{}
+	}
+	let ms = (tide.Now() - start) / tide.Millisecond
+	say.Line("pages:", pages, "overlapped:", ms < 250, "finish order:", order)
+	let t0 = tide.Now()
+	firstFault() catch err {
+		say.Line("scope fault:", err, "fast:", (tide.Now() - t0) / tide.Millisecond < 1000)
+	}
+	let h = handles() catch err {
+		"never {err}"
+	}
+	say.Line("handles:", h)
+	order = ""
+	let failed = fetchAll(8) catch err {
+		say.Line("fetchAll(8):", err)
+		[]str{}
+	}
+	say.Line("failed pages:", len(failed))
+	let four = tooMany(4) catch err {
+		say.Line("never", err)
+		0
+	}
+	say.Line("limit tasks 4, 4 spawns:", four)
+	tooMany(5) catch err {
+		say.Line("limit tasks 4, 5 spawns:", err)
+	}
+	let ps = tide.Now()
+	let p = profile(7) catch err {
+		"fault {err}"
+	}
+	say.Line("parallel:", p, "overlapped:", (tide.Now() - ps) / tide.Millisecond < 180)
+	let pf = profile(-1) catch err {
+		"fault {err}"
+	}
+	say.Line("parallel fault:", pf)
+	let m = mixed() catch err {
+		"fault {err}"
+	}
+	say.Line("parallel mixed:", m)
+}

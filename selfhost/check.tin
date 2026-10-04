@@ -1299,6 +1299,9 @@ fn collect_local_decls(stmts, names) {
             }
         } else if k == ST_BLOCK {
             collect_local_decls(s[BLK_STMTS], names);
+        } else if k == ST_SCOPE {
+            vec_push(names, s[SCOPE_NAME]);
+            collect_local_decls(s[SCOPE_BODY][BLK_STMTS], names);
         } else if k == ST_LIST {
             collect_local_decls(s[LIST_STMTS], names);
         } else if k == ST_IF {
@@ -1464,6 +1467,8 @@ fn scan_idents_in_stmt(s, inner_params, outer_names, cells) {
         scan_idents_in_expr(s[CM_CALL], inner_params, outer_names, cells);
     } else if k == ST_BLOCK {
         scan_idents_in_block(s, inner_params, outer_names, cells);
+    } else if k == ST_SCOPE {
+        scan_idents_in_block(s[SCOPE_BODY], inner_params, outer_names, cells);
     } else if k == ST_LIST {
         let stmts = s[LIST_STMTS];
         let i = 0;
@@ -1540,6 +1545,8 @@ fn scan_idents_in_expr(e, inner_params, outer_names, cells) {
         }
     } else if k == EX_FUNCLIT {
         scan_funclit_escaping_idents(e[LIT_FN], outer_names, cells);
+    } else if k == EX_BOUNDARY {
+        scan_idents_in_block(e[BOUND_BODY], inner_params, outer_names, cells);
     }
 }
 
@@ -1656,6 +1663,8 @@ fn scan_funclits_in_stmt(s, outer_names, cells) {
         scan_funclits_in_expr(s[CM_CALL], outer_names, cells);
     } else if k == ST_BLOCK {
         scan_funclits_in_block(s, outer_names, cells);
+    } else if k == ST_SCOPE {
+        scan_funclits_in_block(s[SCOPE_BODY], outer_names, cells);
     } else if k == ST_LIST {
         let stmts = s[LIST_STMTS];
         let i = 0;
@@ -1709,6 +1718,8 @@ fn scan_funclits_in_expr(e, outer_names, cells) {
     } else if k == EX_CATCH {
         scan_funclits_in_expr(e[CATCH_X], outer_names, cells);
         scan_funclits_in_block(e[CATCH_BODY], outer_names, cells);
+    } else if k == EX_BOUNDARY {
+        scan_funclits_in_block(e[BOUND_BODY], outer_names, cells);
     } else if k == EX_INTERP {
         let ia = e[INTERP_ARGS];
         if ia {
@@ -1772,6 +1783,9 @@ fn check_fn(f) {
     ck_escaping_cells = vec_new();
     len_aliases = vec_new();
     if f[F_BODY] {
+        if !ck_legacy {
+            mark_spawns(f[F_BODY][BLK_STMTS], vec_new());
+        }
         scan_captures(f, ck_escaping_cells);
     }
     start_scope();
@@ -1779,6 +1793,7 @@ fn check_fn(f) {
     f[F_LOCALS] = vec_new();
     let params = f[F_PARAMS];
     let i = 0;
+    ck_params_only = 1;
     while i < params[VEC_LEN] {
         let ps = declare_local(f[F_POS], vec_get(params, i), vec_get(f[F_PTYPES], i));
         ps[S_READS] = 1;
@@ -1787,6 +1802,15 @@ fn check_fn(f) {
             if ps[S_MUT] && !ck_legacy && !mut_capable(vec_get(f[F_PTYPES], i)) {
                 err_type(f[F_POS], str_cat3("parameter '", vec_get(params, i), "' is mut, but a value of type "), vec_get(f[F_PTYPES], i), " is passed by value: only structs, slices and maps can be modified through a parameter, so remove mut");
             }
+        }
+        i = i + 1;
+    }
+    ck_params_only = 0;
+    i = 0;
+    while i < params[VEC_LEN] {
+        let pn = vec_get(params, i);
+        if ck_escaping_cells && vec_has_str(ck_escaping_cells, pn) {
+            give_cell(vec_get(f[F_LOCALS], i), f[F_POS], pn);
         }
         i = i + 1;
     }
@@ -1808,6 +1832,12 @@ fn check_fn(f) {
         }
         i = i + 1;
     }
+    // The body shares the parameters' scope, so `let x` cannot silently hide parameter x.
+    ck_defers = 0;
+    ck_defer_mark = 0;
+    check_stmts(f[F_BODY][BLK_STMTS]);
+    // Captured parameters move into their cells first. These statements are already typed:
+    // checking them would declare a second $cell_ local, so they go in after the body is checked.
     if cell_inits[VEC_LEN] > 0 {
         let new_stmts = vec_new();
         i = 0;
@@ -1823,10 +1853,6 @@ fn check_fn(f) {
         }
         f[F_BODY][BLK_STMTS] = new_stmts;
     }
-    // The body shares the parameters' scope, so `let x` cannot silently hide parameter x.
-    ck_defers = 0;
-    ck_defer_mark = 0;
-    check_stmts(f[F_BODY][BLK_STMTS]);
     if f[F_BANG] && !ck_legacy && f[F_RTYPES][VEC_LEN] == 1 && !ends_in_return(f[F_BODY][BLK_STMTS]) {
         // A ! function that runs off its end succeeds.
         let r = node_new(ST_RETURN, f[F_POS]);
@@ -1948,7 +1974,17 @@ fn declare_local(pos, name, t) {
     s[S_SLOT] = ck_fn[F_SLOTS];
     ck_fn[F_SLOTS] = ck_fn[F_SLOTS] + 1;
     vec_push(ck_fn[F_LOCALS], s);
-    if ck_escaping_cells && vec_has_str(ck_escaping_cells, name) {
+    if ck_escaping_cells && vec_has_str(ck_escaping_cells, name) && !ck_params_only {
+        give_cell(s, pos, name);
+    }
+    return s;
+}
+
+var ck_params_only; // declaring parameters: their cells come after all of them (locals 0..n-1 are the parameters)
+
+// give_cell makes local s a cell: a hidden local holds the address of its pool word.
+fn give_cell(s, pos, name) {
+    if s {
         s[S_CELL] = 1;
         let csym = sym_new(SYM_LOCAL, str_cat3("$cell_", name, ""), pos);
         csym[S_TYPE] = ty_int;
@@ -1958,7 +1994,6 @@ fn declare_local(pos, name, t) {
         vec_push(ck_fn[F_LOCALS], csym);
         s[S_CELL_SYM] = csym;
     }
-    return s;
 }
 
 fn in_current_scope(name) {
@@ -2473,6 +2508,8 @@ fn check_stmt(s) {
         lower_go(s);
     } else if k == ST_ONCE {
         lower_once(s);
+    } else if k == ST_SCOPE {
+        lower_scope(s);
     } else if k == ST_DEFER {
         lower_defer(s);
     } else if k == ST_BSTORE {
@@ -2559,6 +2596,91 @@ fn lower_once(s) {
     ifs[IF_THEN] = s[BODY_BLOCK];
     replace_node(s, ifs);
     check_stmt(s);
+}
+
+// ---- scope (#232) ----
+//
+// scope s { body } is { let s = rt_scope_open(); { body }; try rt_scope_close(s) }: the
+// scope's end waits for its children and leaves with the first child's fault.
+
+fn lower_scope(s) {
+    let pos = s[N_POS];
+    let name = s[SCOPE_NAME];
+    let b = empty_block(pos);
+    let l = node_new(ST_LET, pos);
+    l[LET_NAME] = name;
+    let open = node_new(EX_CALL, pos);
+    open[CALL_ARGS] = vec_new();
+    open[CALL_NAME] = "rt_scope_open";
+    l[LET_INIT] = open;
+    vec_push(b[BLK_STMTS], l);
+    vec_push(b[BLK_STMTS], s[SCOPE_BODY]);
+    let close = node_new(EX_CALL, pos);
+    close[CALL_NAME] = "rt_scope_close";
+    let id = node_new(EX_IDENT, pos);
+    id[ID_NAME] = name;
+    close[CALL_ARGS] = vec_new();
+    vec_push(close[CALL_ARGS], id);
+    let tr = node_new(EX_TRY, pos);
+    tr[TRY_X] = close;
+    vec_push(b[BLK_STMTS], expr_stmt(tr));
+    replace_node(s, b);
+    check_scoped(s);
+}
+
+// mark_spawns keeps the closures passed to s.spawn inside scope s on the parent's frame (the
+// scope outlives its children, as for sift.Each), before captures are scanned.
+fn mark_spawns(v, names) {
+    let i = 0;
+    while i < v[VEC_LEN] {
+        let s = vec_get(v, i);
+        let k = s[N_KIND];
+        if k == ST_SCOPE {
+            let inner = vec_clone(names);
+            vec_push(inner, s[SCOPE_NAME]);
+            mark_spawns(s[SCOPE_BODY][BLK_STMTS], inner);
+        } else if k == ST_BLOCK {
+            mark_spawns(s[BLK_STMTS], names);
+        } else if k == ST_IF {
+            mark_spawns(s[IF_THEN][BLK_STMTS], names);
+            if s[IF_ELSE] {
+                let ev = vec_new();
+                vec_push(ev, s[IF_ELSE]);
+                mark_spawns(ev, names);
+            }
+        } else if k == ST_WHILE {
+            mark_spawns(s[WH_BODY][BLK_STMTS], names);
+        } else if k == ST_RANGE {
+            mark_spawns(s[RG_BODY][BLK_STMTS], names);
+        } else if k == ST_EXPR {
+            mark_spawn_call(s[ES_X], names);
+        } else if k == ST_LET {
+            mark_spawn_call(s[LET_INIT], names);
+        }
+        i = i + 1;
+    }
+}
+
+fn mark_spawn_call(e, names) {
+    if !e || names[VEC_LEN] == 0 {
+        return;
+    }
+    if e[N_KIND] == EX_TRY {
+        e = e[TRY_X];
+    }
+    if e[N_KIND] != EX_CALL || !e[CALL_CALLEE] {
+        return;
+    }
+    let x = e[CALL_CALLEE];
+    if x[N_KIND] != EX_SELECT || x[SEL_X][N_KIND] != EX_IDENT || !streq(x[SEL_NAME], "spawn") || !vec_has_str(names, x[SEL_X][ID_NAME]) {
+        return;
+    }
+    let args = e[CALL_ARGS];
+    if args[VEC_LEN] == 1 && vec_get(args, 0)[N_KIND] == EX_FUNCLIT {
+        // Its cells are made per spawn (pool memory, like any kept closure), but the scope
+        // ends before the request does, so request memory may be stored in them.
+        vec_get(args, 0)[LIT_SCOPED] = 1;
+    }
 }
 
 // ---- defer ----
@@ -3344,6 +3466,22 @@ fn lower_try_stmt(s, tr, mode, declared) {
         results = t[TY_FIELDS];
     } else if kind_of(t) != K_VOID {
         vec_push(results, t);
+    }
+    if mode == 5 && !handler && tr[TRY_SOFT] && (results[VEC_LEN] == 0 || kind_of(vec_get(results, results[VEC_LEN] - 1)) != K_ERROR) {
+        // A parallel line that cannot fail: its value, if any, is stored as is.
+        bound_t = ty_void;
+        if results[VEC_LEN] == 1 {
+            bound_t = default_type(t);
+            if is_untyped(t) {
+                reconvert(call, bound_t);
+            }
+            replace_node(s, bound_store(pos, call, bound_t));
+        } else if results[VEC_LEN] == 0 {
+            replace_node(s, expr_stmt(call));
+        } else {
+            err_at(pos, "a parallel line gives one value");
+        }
+        return;
     }
     if results[VEC_LEN] == 0 || kind_of(vec_get(results, results[VEC_LEN] - 1)) != K_ERROR {
         if handler {
