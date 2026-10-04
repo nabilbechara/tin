@@ -175,16 +175,18 @@ binary-trees uses 917 MB against 37 MB: a plain program never resets its pool.
 ### Signed division by ten (native Linux amd64)
 
 The dedicated `div10q` and `rem10` benchmarks isolate signed `/ 10` and `% 10` in a
-100-million-iteration loop. On the shared GitHub runner (AMD EPYC 9V74, Go 1.26.8),
+100-million-iteration loop. On the shared GitHub runner (Intel Xeon Platinum 8370C,
+Go 1.26.8),
 the head uses multiply-high lowering while the base uses hardware division:
 
 | operation | base Tin ms | head Tin ms | Go ms | head/base | head Tin/Go |
 |---|---:|---:|---:|---:|---:|
-| signed `i64 / 10` | 191.89 | 85.12 | 56.6 | 0.444 | 1.50 |
-| signed `i64 % 10` | 191.81 | 112.58 | 86.0 | 0.587 | 1.31 |
+| signed `i64 / 10` | 288.89 | 94.01 | 93.6 | 0.325 | 1.00 |
+| signed `i64 % 10` | 288.95 | 118.62 | 120.8 | 0.411 | 0.98 |
 
-The benchmark harness checks output on every timed run. The full CPU and HTTP base/head
-suites stayed within the 5% review threshold; arm64 is unchanged by this x64-only lowering.
+The benchmark harness checks output on every timed run. The full CPU suite stayed within
+the 5% review threshold. HTTP throughput was 2.6% above base for `/json` and 2.2% below
+base for `/plaintext`; arm64 is unchanged by this x64-only lowering.
 
 ## 3. Where Go still wins, and why
 
