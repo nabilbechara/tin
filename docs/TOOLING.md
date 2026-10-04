@@ -32,7 +32,7 @@ moving or deleting the tree breaks it.
 |---|---|
 | `tin FILE.tin [ARGS...]` | compile and run (temporary executable, removed after) |
 | `tin run A.tin B.tin -- ARGS` | compile several files as one program and run it |
-| `tin build FILE.tin... [-o OUT] [--target T]` | write an executable (default name: the first file without `.tin`) |
+| `tin build FILE.tin... [-o OUT] [--target T] [--strip]` | write an executable (default name: the first file without `.tin`); `--strip` leaves out a Linux executable's symbol table (§8) |
 | `tin asm FILE.tin...` | print the generated ARM64 assembly (clang syntax) |
 | `tin fix -edition 1 FILE.tin...` | rewrite edition-0 (Go-like) files to edition 1 in place (LANGUAGE.md §22) |
 | `tin audit secrets [-edition 1] FILE.tin...` | check the program and list every place a `secret` leaves the checker's protection: each `reveal(x)` and each secret passed to a library parameter declared `secret`, as `file:line:col: ...` sorted by position, then a count; exit status 1 (with the errors) when the program does not check |
@@ -266,6 +266,21 @@ Servers used: `examples/api.tin` (port 9180, `TIN_CORES=n`), `bench/http/fast` (
 A compiler change that breaks the compiler itself: build with the previous good
 compiler (`bin/s3/tinc` or the seed), never overwrite the seed until `make bootstrap`
 passes.
+
+**Profiling a Linux service** (#351). A Linux executable carries section headers and a
+symbol table (`.symtab`) naming every function as `pkg.Name`, `pkg.Type.Method` or a
+generated name (`keep$N`), with its size. The table is not loaded; it costs about 4% of
+the file (33 KiB of the compiler's 812 KiB) and `tin build --strip` (`tinc -strip`) leaves
+it out. `nm`, `addr2line -f`, `perf` and `gdb` read it:
+
+```sh
+perf record -g -p "$(pidof api)" -- sleep 10    # sample the running server for ten seconds
+perf report --sort symbol                         # time per Tin function
+```
+
+Frames are walked with the frame pointers Tin always keeps (`perf record -g`, or
+`--call-graph fp`). Source lines need DWARF `.debug_line`, which is not emitted yet:
+`perf annotate` and `gdb list` show machine code only.
 
 ### 8.1 Replaying a recorded request: `tin replay`
 
