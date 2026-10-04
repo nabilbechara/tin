@@ -729,3 +729,94 @@ if `cpu.max` has a quota, `n = min(n, max(1, ceil(quota/period)))`; fall back to
 | `glibc231.sh` | the same on Ubuntu 20.04 / glibc 2.31 | `out/linux-*-glibc2.31/glibc231.txt` |
 | `run_all.sh` | driver for everything above inside one container | `out/<plat>-glibc<ver>/` |
 | `out/*/libc_dynsyms.txt`, `libm_dynsyms.txt`, `libc_versions.txt`, `symbol_versions.txt`, `versions.txt` | full export tables and toolchain versions | |
+
+## Raw syscall backend (phase 3)
+
+Kernel errors are signed -4095..-1. `linux_result` records the positive error in
+reserved core word 10 (compiler: its own host error word) and returns -1. Successful
+calls preserve the previous error. All sizes and addresses are 64-bit.
+
+| Syscall | arm64 | amd64 |
+|---|---:|---:|
+| read | 63 | 0 |
+| write | 64 | 1 |
+| close | 57 | 3 |
+| openat | 56 | 257 |
+| unlinkat | 35 | 263 |
+| mkdirat | 34 | 258 |
+| renameat | 38 | 264 |
+| fstat | 80 | 5 |
+| newfstatat | 79 | 262 |
+| getcwd | 17 | 79 |
+| chdir | 49 | 80 |
+| getpid | 172 | 39 |
+| uname | 160 | 63 |
+| readlinkat | 78 | 267 |
+| mmap | 222 | 9 |
+| munmap | 215 | 11 |
+| mprotect | 226 | 10 |
+| madvise | 233 | 28 |
+| nanosleep | 101 | 35 |
+| ppoll | 73 | 271 |
+| pipe2 | 59 | 293 |
+| fcntl | 25 | 72 |
+| socket | 198 | 41 |
+| bind | 200 | 49 |
+| listen | 201 | 50 |
+| accept | 202 | 43 |
+| connect | 203 | 42 |
+| setsockopt | 208 | 54 |
+| getsockopt | 209 | 55 |
+| getsockname | 204 | 51 |
+| shutdown | 210 | 48 |
+| recvfrom | 207 | 45 |
+| epoll_create1 | 20 | 291 |
+| epoll_ctl | 21 | 233 |
+| epoll_pwait | 22 | 281 |
+| timerfd_create | 85 | 283 |
+| timerfd_settime | 86 | 286 |
+| clock_gettime | 113 | 228 |
+| getrandom | 278 | 318 |
+| sched_getaffinity | 123 | 204 |
+| sched_setaffinity | 122 | 203 |
+| rt_sigprocmask | 135 | 14 |
+| rt_sigaction | 134 | 13 |
+| rt_sigreturn | 139 | 15 |
+| sigaltstack | 132 | 131 |
+| signalfd4 | 74 | 289 |
+| getdents64 | 61 | 217 |
+| exit_group | 94 | 231 |
+
+arm64 uses x8 for the number, x0..x5 for arguments and x0 for the result; svc #0
+preserves Tin's x28. amd64 uses rax for the number/result, rdi,rsi,rdx,r10,r8,r9 for
+arguments; syscall clobbers rcx/r11 and preserves r15. The leaf receives a number
+plus six Tin arguments; amd64 loads the seventh function argument from [rsp+8].
+
+The kernel sigaction is 32 bytes: handler@0, flags@8, restorer@16, mask@24.
+The signal set is 8 bytes; SA_RESTORER=0x04000000, SA_ONSTACK=0x08000000,
+SA_SIGINFO=4 and SA_RESTART=0x10000000. rt_sigreturn leaves have no frame.
+stack_t remains sp@0, flags@8 (u32), size@16. linux_dirent64 is ino@0 (u64),
+off@8 (i64), reclen@16 (u16), type@18 (u8), NUL-terminated name@19; the next
+record starts at reclen. Entries are bounded by the returned getdents64 byte count.
+Unknown type falls back to lstat; directory buffers refill at 32 KiB.
+
+The syscall table agrees with Go's generated src/syscall/zsysnum_linux_{arm64,amd64}.go
+and the kernel UAPI. Existing stat offsets above apply to the kernel results too.
+open/creat use openat with AT_FDCWD=-100; mkdir/rename/unlink/readlink similarly use
+the *at calls. AT_SYMLINK_NOFOLLOW=256 and AT_REMOVEDIR=512. poll uses ppoll with
+a timespec (negative timeout: null), pipe uses pipe2, epoll_wait uses epoll_pwait.
+The sched_getaffinity wrapper normalizes its positive mask length to libc's zero
+success convention. getcwd normalizes its byte count to the supplied buffer pointer.
+
+O_DIRECTORY differs: arm64=0x4000, amd64=0x10000; O_CLOEXEC=0x80000 on both.
+The environment helpers still use libc and read its errno only for setenv/unsetenv
+failures until phase 5. The old Linux seed's stage-1 syscall fallback translates libc
+errno to a negative kernel result; generated syscall leaves never call that fallback.
+
+kill: arm64=129, amd64=62. AT_SYSINFO_EHDR=33 locates the vDSO ELF64 image.
+DT_HASH=4, DT_STRTAB=5, DT_SYMTAB=6, DT_STRSZ=10, DT_GNU_HASH=0x6ffffef5;
+SYMENT=24 and the clock symbols are __kernel_clock_gettime (arm64) and
+__vdso_clock_gettime (amd64), with the C signature int(clockid_t, timespec*).
+The vDSO lookup checks both hash forms, mapped bounds, symbol type and name.
+clock_gettime uses that entry when present and the syscall otherwise. Phase 3 still
+reads AT_SYSINFO_EHDR with libc getauxval; initial-stack auxv replaces it in phase 5.

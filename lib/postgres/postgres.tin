@@ -16,9 +16,7 @@ import "postgres/sasl"
 import "seal"
 import "wire"
 
-extern func close(fd i64) i64
 extern func strerror(e i64) i64
-extern func recv(fd i64, buf i64, n i64, flags i64) i64
 
 // Value is one column of a row.
 type Value enum {
@@ -286,7 +284,7 @@ func read_packet(c i64) !(i64, i64) {
 			memmove(c[cBuf], c[cBuf]+c[cS], avail)
 			c[cS] = 0; c[cE] = avail
 		}
-		k := read(c[cFd], c[cBuf]+c[cE], c[cCap]-c[cE])
+		k := rt_sys_read(c[cFd], c[cBuf]+c[cE], c[cCap]-c[cE])
 		if k > 0 { c[cE] += k; continue }
 		if k == 0 { fail "postgres: the server closed the connection" }
 		e := rt_errno()
@@ -339,7 +337,7 @@ func flush(c i64) ! {
 	at := 0
 	for at < c[cOutN] {
 		_ = try remaining(c[cUntil])
-		k := write(c[cFd], c[cOut]+at, c[cOutN]-at)
+		k := rt_sys_write(c[cFd], c[cOut]+at, c[cOutN]-at)
 		if k > 0 { at += k; continue }
 		e := rt_errno()
 		if e == EINTR { continue }
@@ -585,7 +583,7 @@ func (c Client) pool() i64 {
 
 func conn_free(c i64) {
 	if c[cFd] >= 0 {
-		close(c[cFd])
+		rt_sys_close(c[cFd])
 	}
 	free(c[cBuf])
 	free(c[cOut])
@@ -621,7 +619,7 @@ func dial(rec i64, until i64) !i64 {
 func alive(c i64) bool {
 	if c[cNext] != c[cE] { return false }
 	b := calloc(1, 8)
-	k := recv(c[cFd], b, 1, 2)
+	k := rt_sys_recv(c[cFd], b, 1, 2)
 	e := rt_errno()
 	free(b)
 	return k < 0 && (e == EAGAIN || e == EINTR)
@@ -629,7 +627,7 @@ func alive(c i64) bool {
 
 func (c Client) acquire(until i64) !i64 {
 	if !c.open {
-		fail "postgres: the client is not open (too many clients: open one per server, not per request)"
+		fail "postgres: the client is not rt_sys_open (too many clients: open one per server, not per request)"
 	}
 	p := c.pool()
 	for {
