@@ -3001,6 +3001,7 @@ func rt_task_panicked(t i64) bool {
 // rt_task_abort ends the running task t after a panic: its stack is abandoned where it is.
 func rt_task_abort(t i64) {
 	rt_task_cleanups(0)
+	rtPollSuspend = false
 	rt_bnd_task_end(t)
 	// A scope's child allocates in its parent's pool (#232): that memory stays.
 	if t[tChild] == 0 {
@@ -3184,6 +3185,8 @@ const gBnd = 67
 const gUnwinding = 68
 const guardWords = 69
 
+var rtPollSuspend bool // cleanups and defers finish without a second cancellation unwind.
+
 var guardStart i64  // per core: the record rt_guard_entry starts
 var guardStacks i64 // per core: free guard stacks, linked through their lowest word
 
@@ -3289,6 +3292,7 @@ func rt_land(g i64, f i64) {
 		rt_sys_exit(2)
 	}
 	g[gUnwinding] = 1
+	rtPollSuspend = true
 	rt_defer_run(g[gDefer])
 	if curTask != 0 {
 		rt_task_cleanups(g[gCleanup])
@@ -3309,6 +3313,7 @@ func rt_land(g i64, f i64) {
 	}
 	g[gFault] = f
 	__ctx()[ctxFmt] = g[gFmt]
+	rtPollSuspend = false
 	rt_task_swap(g+8*gScratch, g+8*gSave)
 }
 
@@ -3544,6 +3549,13 @@ func rt_bnd_task_end(t i64) {
 			if l != 0 {
 				l[bTaskUsed]--
 			}
+		}
+		g := b[bLand]
+		if g != 0 {
+			st := g[gStack]
+			(st + taskGuard)[0] = guardStacks
+			guardStacks = st
+			free(g)
 		}
 		rt_bnd_unlink(b)
 		if root {
@@ -3924,6 +3936,7 @@ func rt_bnd_target(origin i64) i64 {
 // rt_bnd_poll contains CPU-bound cancellation and preserves the server after a deadline.
 func rt_bnd_poll() {
 	__ctx()[ctxPoll] = 0
+	if rtPollSuspend { return }
 	if rtWatchDrainAt > 0 && rt_mono_ns() >= rtWatchDrainAt {
 		rt_bnd_cancel(rt_bnd_core(), cast(fault, "draining"))
 	}
@@ -3938,10 +3951,13 @@ func rt_bnd_poll() {
 		t[tRecover] = 0
 		t[tPanicked] = 1
 		if cast(str, f) == "deadline exceeded" { t[tPanicked] = 504 }
+		rtPollSuspend = true
 		rt_fault_say("request canceled: " + cast(str, f) + "\n")
 		rt_defer_run(0)
 		rt_task_abort(t)
 	}
+	// A draining event loop has no task to unwind; it completes shutdown itself.
+	if t == 0 { return }
 	rt_panic(cast(str, f))
 }
 
