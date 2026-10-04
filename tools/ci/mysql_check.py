@@ -405,14 +405,19 @@ def main():
     finally:
         srv.stop()
 
-    srv = Server(exe, env, 2)
+    # The load checks that every insert lands, not how fast a shared runner's MySQL is: against a
+    # real server a disk flush can hold a few inserts past the 1 s deadline (#133), so it gets
+    # 10 s there, and the slowest requests are logged.
+    srv = Server(exe, dict(env, TIN_DEADLINE_MS='10000') if real else env, 2)
     try:
         _, before, _ = srv.get('/count')
         errs = []
+        slow = []
 
         def adder(n):
             for i in range(n):
-                code, body, _ = srv.get('/add?name=u%d' % i)
+                code, body, dt = srv.get('/add?name=u%d' % i)
+                slow.append(dt)
                 if code != 200:
                     errs.append(body)
 
@@ -423,8 +428,8 @@ def main():
         for t in ts:
             t.join()
         _, after, _ = srv.get('/count')
-        print('1000 inserts from 20 clients on 2 cores: %.2f s, %d errors, count %s -> %s' %
-              (time.time() - t0, len(errs), before, after))
+        print('1000 inserts from 20 clients on 2 cores: %.2f s, %d errors, count %s -> %s; slowest %s s' %
+              (time.time() - t0, len(errs), before, after, ', '.join('%.2f' % x for x in sorted(slow)[-3:])))
         if errs or int(after) - int(before) != 1000:
             failures.append('inserts: %d errors %r, %s -> %s' % (len(errs), errs[:2], before, after))
     finally:
