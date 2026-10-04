@@ -1,0 +1,97 @@
+package main
+
+import "say"
+import "tide"
+
+mut log str = ""
+
+fn note(s str) {
+	log = keep(log + s)
+}
+
+fn step(i i64) ! {
+	try tide.Wait((3 - i) * 10 * tide.Millisecond)
+	note("{i}")
+}
+
+// waitAll waits for handles it is given: a parameter may hold them.
+fn waitAll(hs []spawned) ! {
+	for h in hs {
+		try h.wait()
+	}
+}
+
+// follow spawns, on a scope it is given, a child that waits for another task of that scope.
+fn follow(s scope, t spawned) {
+	s.spawn(fn() ! {
+		try t.wait()
+		note("f")
+	})
+}
+
+// collect keeps handles in a slice declared inside the scope and waits for them there.
+fn collect() ! {
+	scope s {
+		mut hs = []spawned{}
+		for i in 0..3 {
+			let k = i
+			hs = append(hs, s.spawn(fn() ! {
+				try step(k)
+			}))
+		}
+		try waitAll(hs)
+		note(";")
+	}
+}
+
+// nested: an inner scope's child waits for a task of the outer scope, and a helper spawns on
+// the outer scope a child that waits for another outer task.
+fn nested() ! {
+	scope outer {
+		let first = outer.spawn(fn() ! {
+			try step(2)
+		})
+		follow(outer, first)
+		scope inner {
+			inner.spawn(fn() ! {
+				try first.wait()
+				note("i")
+			})
+		}
+		note(";")
+	}
+}
+
+// latest keeps the most recent handle in an optional declared in the scope.
+fn latest() ! {
+	scope s {
+		mut last ?spawned = nil
+		for i in 0..3 {
+			let k = i
+			last = s.spawn(fn() ! {
+				try step(k)
+			})
+		}
+		if last != nil {
+			try last.wait()
+		}
+		note(";")
+	}
+}
+
+fn main() {
+	collect() catch err {
+		say.Line("fault", err)
+	}
+	say.Line("collect:", log)
+	log = ""
+	nested() catch err {
+		say.Line("fault", err)
+	}
+	say.Line("nested:", log)
+	log = ""
+	latest() catch err {
+		say.Line("fault", err)
+	}
+	say.Line("latest:", log)
+}
