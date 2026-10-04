@@ -3,6 +3,7 @@
 
 Needs a Redis and a MySQL with the users table (bench/v04/seed.py) and a wrk2 binary:
   REDIS_ADDR MYSQL_ADDR MYSQL_USER MYSQL_PASSWORD MYSQL_DATABASE WRK2 [CORES=4 ROUNDS=3 SECS=15]
+  [SERVER_CPUS=0,1 WRK_CPUS=2,3]  pin the servers and wrk2 to separate CPUs (taskset)
 
 Scenarios (random ids in 1..10000):
   cached   all reads hit Redis (warmed first)
@@ -10,7 +11,8 @@ Scenarios (random ids in 1..10000):
   mixed    cached reads with 0.5% /slow (50 ms) requests mixed in
 Each runs once at an open-ended rate (the maximum throughput) and once at a fixed rate,
 70% of the slower server's maximum, for the latency percentiles (wrk2 corrects for
-coordinated omission). Rounds alternate servers; the median of the rounds is reported."""
+coordinated omission). Rounds alternate servers; the median of the rounds is reported,
+with every round's value and the Tin/Go ratios after the table."""
 import os
 import re
 import statistics
@@ -29,6 +31,12 @@ CONNS = int(os.environ.get('CONNS', '256'))
 THREADS = os.environ.get('THREADS', '4')
 SCENARIOS = [('cached', '/users/', 0), ('db', '/db/users/', 0), ('mixed', '/users/', 0.5)]
 SERVERS = {'tin': ('users_tin', 9190), 'go': ('users_go', 9191)}
+SERVER_CPUS = os.environ.get('SERVER_CPUS', '')
+WRK_CPUS = os.environ.get('WRK_CPUS', '')
+
+
+def pinned(cpus, argv):
+    return ['taskset', '-c', cpus] + argv if cpus else argv
 
 
 def build():
@@ -41,7 +49,7 @@ def build():
 def start(name):
     exe, port = SERVERS[name]
     env = dict(os.environ, TIN_CORES=CORES, GOMAXPROCS=CORES, PORT=str(port))
-    p = subprocess.Popen([os.path.join(OUT, exe)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    p = subprocess.Popen(pinned(SERVER_CPUS, [os.path.join(OUT, exe)]), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(0.5)
     return p, port
 
@@ -53,9 +61,9 @@ def us(v):
 
 
 def wrk(port, prefix, slow, rate, secs):
-    r = subprocess.run([WRK, '-t' + THREADS, '-c%d' % CONNS, '-d%ds' % secs, '-R%d' % rate, '--latency',
-                          '-s', os.path.join(HERE, 'mix.lua'), 'http://127.0.0.1:%d' % port, '--', prefix, str(slow)],
-                         capture_output=True, text=True)
+    r = subprocess.run(pinned(WRK_CPUS, [WRK, '-t' + THREADS, '-c%d' % CONNS, '-d%ds' % secs, '-R%d' % rate, '--latency',
+                                         '-s', os.path.join(HERE, 'mix.lua'), 'http://127.0.0.1:%d' % port, '--', prefix, str(slow)]),
+                       capture_output=True, text=True)
     out = r.stdout
     m = re.search(r'Requests/sec:\s+([\d.]+)', out)
     if not m:
@@ -103,6 +111,8 @@ def main():
                     p.terminate()
                     p.wait()
     print('cores per server: %s, wrk2 -t%s -c%d, %d s per run, median of %d rounds' % (CORES, THREADS, CONNS, SECS, ROUNDS))
+    if SERVER_CPUS or WRK_CPUS:
+        print('server CPUs: %s, wrk2 CPUs: %s' % (SERVER_CPUS or 'any', WRK_CPUS or 'any'))
     print('%-8s %-4s %12s %10s %12s %10s %10s %10s %8s' % ('scenario', '', 'max req/s', 'req/cpu-s', 'fixed req/s', 'p50 ms', 'p99 ms', 'p99.9 ms', 'RSS MB'))
     for scen, _, _ in SCENARIOS:
         for name in SERVERS:
@@ -114,6 +124,22 @@ def main():
                 scen, name, med(x[0] for x in mx), med(x[3] for x in mx), fx[0][3],
                 med(x[1]['50.000'] for x in fx) / 1000, med(x[1]['99.000'] for x in fx) / 1000,
                 med(x[1]['99.900'] for x in fx) / 1000, med(x[2] for x in mx) / 1024, ' '.join(sorted(set(errs)))))
+    print()
+    print('every round (in run order): max req/s | fixed-rate p99 ms')
+    for scen, _, _ in SCENARIOS:
+        for name in SERVERS:
+            print('%-8s %-4s %s | %s' % (scen, name, ' '.join('%.0f' % x[0] for x in results[(scen, name, 'max')]),
+                                         ' '.join('%.2f' % (x[1]['99.000'] / 1000) for x in results[(scen, name, 'fixed')])))
+    print()
+    print('Tin/Go ratios of the medians (above 1: Tin higher)')
+    print('%-8s %10s %10s %10s %10s %10s' % ('scenario', 'max req/s', 'req/cpu-s', 'p50', 'p99', 'p99.9'))
+    for scen, _, _ in SCENARIOS:
+        def m(name, kind, f):
+            return statistics.median(f(x) for x in results[(scen, name, kind)])
+        cols = [m('tin', 'max', lambda x: x[0]) / m('go', 'max', lambda x: x[0]),
+                m('tin', 'max', lambda x: x[3]) / m('go', 'max', lambda x: x[3])]
+        cols += [m('tin', 'fixed', lambda x, k=k: x[1][k]) / m('go', 'fixed', lambda x, k=k: x[1][k]) for k in ('50.000', '99.000', '99.900')]
+        print('%-8s %10.2f %10.2f %10.2f %10.2f %10.2f' % tuple([scen] + cols))
 
 
 if __name__ == '__main__':
