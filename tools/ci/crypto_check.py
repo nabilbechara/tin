@@ -64,6 +64,36 @@ def ecdh(cases, file, op, size):
                           f"{file} {t['tcId']}"))
 
 
+def x25519(cases):
+    """Wycheproof X25519: valid and acceptable results must match, except an all-zero shared
+    secret (a low-order point), which must fail as TLS 1.3 requires."""
+    data = json.loads((VECTORS / 'x25519_test.json').read_text())
+    for group in data['testGroups']:
+        for t in group['tests']:
+            want = 'fault' if t['shared'] == '0' * 64 else t['shared']
+            cases.append((f"x25519 {t['private']} {t['public']}", lambda out, want=want: out == want, f"x25519 {t['tcId']}"))
+
+
+def aead(cases, file, kind):
+    """Wycheproof AEAD vectors: Seal gives ct||tag and Open the message for valid ones; Open
+    fails for invalid ones, and both fail for a bad nonce or key length. seal.AEAD takes only
+    12-byte nonces (like Go's cipher.NewGCM), so valid vectors with other nonce sizes must
+    fail too."""
+    data = json.loads((VECTORS / file).read_text())
+    for group in data['testGroups']:
+        for t in group['tests']:
+            if t['result'] == 'valid' and group['ivSize'] != 96:
+                t = dict(t, result='invalid')
+            args = f"{kind} {hx(bytes.fromhex(t['key']))} {hx(bytes.fromhex(t['iv']))} {hx(bytes.fromhex(t['aad']))}"
+            sealed = t['ct'] + t['tag']
+            name = f"{file} {t['tcId']}"
+            if t['result'] == 'valid':
+                cases.append((f"seal {args} {hx(bytes.fromhex(t['msg']))}", lambda out, want=sealed: out == want, name + ' seal'))
+                cases.append((f"open {args} {hx(bytes.fromhex(sealed))}", lambda out, want=t['msg']: out == want, name + ' open'))
+            else:
+                cases.append((f"open {args} {hx(bytes.fromhex(sealed))}", lambda out: out == 'fault', name + ' open'))
+
+
 def random_cases(cases):
     rng = random.Random(124)
     for name in ('sha256', 'sha384', 'sha512'):
@@ -94,6 +124,9 @@ def main():
     cases = []
     wycheproof(cases)
     ecdh(cases, 'ecdh_secp256r1_ecpoint_test.json', 'p256ecdh', 32)
+    x25519(cases)
+    aead(cases, 'chacha20_poly1305_test.json', 'chacha')
+    aead(cases, 'aes_gcm_test.json', 'aes')
     random_cases(cases)
     with tempfile.TemporaryDirectory(prefix='crypto-', dir=out) as tmp:
         exe = Path(tmp) / 'crypto_vectors'

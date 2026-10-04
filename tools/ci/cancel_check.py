@@ -59,7 +59,7 @@ def finished(s, want, seconds=2):
     assert got == (200, want), 'got %r, want %r' % (got, want)
 
 
-def checks(port, fifo):
+def checks(port, fifo, stdin):
     # Each client: the parked request ends with the cancel's fault, not after a timeout.
     for i, kind in enumerate(['tide', 'wire', 'redis', 'mysql', 'postgres', 'websocket', 'file'], 1):
         s = request(port, '/park/%d/%s' % (i, kind), timeout=10)
@@ -73,6 +73,47 @@ def checks(port, fifo):
             # Let the helper thread's blocked open finish; its late result is disposed.
             fd = os.open(fifo, os.O_WRONLY)
             os.close(fd)
+
+    # Waits that used to block the core (#316): a relay receive, stdin and a flume reader on
+    # a pipe. Each parks its task; another request is served meanwhile; a cancel ends it.
+    for i, kind in enumerate(['relay', 'stdin', 'flume'], 26):
+        s = request(port, '/park/%d/%s' % (i, kind), timeout=10)
+        assert pending(s), '%s: the wait ended before the cancel' % kind
+        assert response(request(port, '/plain', timeout=2)) == (200, b'plain ok'), \
+            '%s: the core stopped serving while the task waited' % kind
+        assert pending(s, .05), '%s: serving another request ended the wait' % kind
+        start = time.monotonic()
+        cancel(port, i)
+        finished(s, b'fault: canceled: test reason %d' % i)
+        print('%-9s cancelled wait ended in %.1f ms with "canceled: test reason %d"; the core '
+              'kept serving' % (kind, (time.monotonic() - start) * 1000, i))
+        # A within deadline ends the same wait with "deadline exceeded"; the request goes on.
+        status, body = response(request(port, '/within/%s' % kind, timeout=10))
+        assert status == 200, (kind, status, body)
+        parts = dict(p.split(': ', 1) for p in body.decode().split('; '))
+        assert parts['inner'] == 'deadline exceeded' and parts['after'] == 'ok', (kind, body)
+        assert 40 <= int(parts['ms']) < 1000, (kind, body)
+        print('%-9s block deadline: "deadline exceeded" after %s ms' % (kind, parts['ms']))
+
+    # relay.Next still receives: a parked task wakes with the message another request sends.
+    s = request(port, '/relay-next', timeout=10)
+    assert pending(s)
+    assert response(request(port, '/relay-send/hello')) == (200, b'sent')
+    finished(s, b'from 0: hello')
+    print('relay.Next: a parked task receives a message sent from another request')
+
+    # Input still arrives: a parked flume reader wakes with a line, ReadStdin at the end.
+    s = request(port, '/park/29/flume', timeout=10)
+    assert pending(s)
+    stdin.write(b'hi\n')
+    stdin.flush()
+    finished(s, b'no fault')
+    s = request(port, '/park/29/stdin', timeout=10)
+    assert pending(s)
+    stdin.write(b'rest')
+    stdin.close()
+    finished(s, b'no fault')
+    print('stdin: a parked flume reader and ReadStdin wake when input comes')
 
     # A task parked for a pooled connection (mysql Pool 1): the holder stays parked.
     holder = request(port, '/park/20/mysql', timeout=10)
@@ -243,13 +284,14 @@ def main():
         hole = Hole()
         port = ws.free_port()
         with (out / 'server.log').open('wb') as log:
-            server = subprocess.Popen([str(exe)], stdout=log, stderr=log,
+            # Stdin is a pipe nothing writes to, for the stdin and flume waits (#316).
+            server = subprocess.Popen([str(exe)], stdin=subprocess.PIPE, stdout=log, stderr=log,
                 env=dict(os.environ, PORT=str(port), TIN_CORES='1', TIN_GRACE='1',
                          TIN_DEADLINE_MS='20000', HOLE_ADDR='127.0.0.1:%d' % hole.port,
                          FIFO=str(fifo)))
             try:
                 eventually(lambda: server_ready(port, server))
-                checks(port, str(fifo))
+                checks(port, str(fifo), server.stdin)
                 assert server.poll() is None, 'server exited'
                 budget(exe)
                 handler_limit(directory)
