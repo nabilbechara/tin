@@ -2135,6 +2135,7 @@ fn x_gen_while(s) {
         emit1(X_JMP, cond_l);
     }
     x_label(body_l);
+    x_gen_poll();
     vec_push(g_loops, cont_l);
     vec_push(g_loops, end_l);
     x_gen_stmts(s[WH_BODY][BLK_STMTS]);
@@ -2731,6 +2732,50 @@ fn x_syscall_bytes(restorer) {
     return v;
 }
 
+// x_gen_poll is the r15 context load and cold, normally untaken branch.
+fn x_gen_poll() {
+    if !fn_polls(cur_gen_fn) { return; }
+    let slow = new_label();
+    let resume = new_label();
+    x_ld(XSCR, x_mem1(R15, 96), 3);
+    emit2(X_TEST, XSCR, XSCR);
+    emit2(X_JCC, XC_NE, slow);
+    x_label(resume);
+    vec_push(poll_sites, slow);
+    vec_push(poll_sites, resume);
+}
+
+// x_gen_poll_stubs realigns even frameless leaves and preserves their register homes.
+fn x_gen_poll_stubs() {
+    let f = find_fn("rt_bnd_poll");
+    let i = 0;
+    while i < poll_sites[VEC_LEN] {
+        x_label(vec_get(poll_sites, i));
+        let r = 0;
+        while r < 16 {
+            if x_caller_saved(r) && r != RSP { emit1(X_PUSH, r); }
+            r = r+1;
+        }
+        x_mov(XSCR, RSP);
+        emit2(X_ANDI, RSP, -16);
+        emit2(X_SUBI, RSP, 144);
+        x_st(XSCR, x_mem1(RSP, 128), 3);
+        r = 0;
+        while r < 16 { emit2(X_MOVSD_ST, FPR+r, x_mem1(RSP, 8*r)); r = r+1; }
+        emit1(X_CALL, x_sym(SK_FN, f[F_INDEX]));
+        r = 0;
+        while r < 16 { emit2(X_MOVSD_LD, FPR+r, x_mem1(RSP, 8*r)); r = r+1; }
+        x_ld(RSP, x_mem1(RSP, 128), 3);
+        r = 15;
+        while r >= 0 {
+            if x_caller_saved(r) && r != RSP { emit1(X_POP, r); }
+            r = r-1;
+        }
+        emit1(X_JMP, vec_get(poll_sites, i+1));
+        i = i+2;
+    }
+}
+
 fn x_gen_fn(f) {
     if tgt_linux && any_v2 {
         let bytes=syscall_fast_amd64(f[F_QNAME]);
@@ -2780,6 +2825,7 @@ fn x_gen_fn(f) {
     trap_label = 0;
     x_div_label = 0;
     trap_sites = vec_new();
+    poll_sites = vec_new();
     if getenv("TINC_TRACE") {
         let tb = buf_new();
         buf_str(tb, "gen ");
@@ -2809,6 +2855,7 @@ fn x_gen_fn(f) {
         }
         x_gen_dyn_table_init();
     }
+    x_gen_poll();
     let stmts = f[F_BODY][BLK_STMTS];
     let i = 0;
     while i < stmts[VEC_LEN] {
@@ -2860,6 +2907,7 @@ fn x_gen_fn(f) {
         }
         ts = ts + 1;
     }
+    x_gen_poll_stubs();
     x_finish_fn(f, nslots);
 }
 

@@ -2617,6 +2617,7 @@ fn gen_while(s) {
         emit1(I_B, cond_l);
     }
     label(body_l);
+    gen_poll();
     vec_push(g_loops, cont_l);
     vec_push(g_loops, end_l);
     gen_stmts(s[WH_BODY][BLK_STMTS]);
@@ -3512,6 +3513,63 @@ fn syscall_words(restorer) {
     return w;
 }
 
+// fn_polls keeps trusted runtime leaves and explicit @nopoll bodies uninterrupted.
+fn fn_polls(f) {
+    if !any_v2 || f == start_fn { return 0; }
+    let path = vec_get(files, f[F_FILE]);
+    let i = 0;
+    let n = strlen(path);
+    while i < n {
+        if (i+13 <= n && mem_eq(path + i, "/lib/runtime/", 13)) || (i == 0 && n >= 12 && mem_eq(path, "lib/runtime/", 12)) { return 0; }
+        i = i + 1;
+    }
+    let attrs = f[F_ATTRS];
+    i = 0;
+    while attrs && i < attrs[VEC_LEN] {
+        if streq(vec_get(vec_get(attrs, i), 1), "nopoll") { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+var poll_sites;
+
+// gen_poll branches to a cold stub; the ordinary path uses only the reserved scratch.
+fn gen_poll() {
+    if !fn_polls(cur_gen_fn) { return; }
+    let slow = new_label();
+    let resume = new_label();
+    emit3(I_LDR, X16, 28, 96);
+    emit2(I_CBNZ, X16, slow);
+    label(resume);
+    vec_push(poll_sites, slow);
+    vec_push(poll_sites, resume);
+}
+
+// gen_poll_stubs preserves leaf homes too: a stale watchdog write may return normally.
+fn gen_poll_stubs() {
+    let f = find_fn("rt_bnd_poll");
+    let i = 0;
+    while i < poll_sites[VEC_LEN] {
+        label(vec_get(poll_sites, i));
+        emit3(I_SUBI, SP, SP, 416);
+        let r = 0;
+        while r < 19 { emit3(I_STR, r, SP, 8*r); r = r+1; }
+        emit3(I_STR, LR, SP, 152);
+        r = 0;
+        while r < 32 { emit3(I_STRD, FPR+r, SP, 160+8*r); r = r+1; }
+        emit1(I_BL, f);
+        r = 0;
+        while r < 32 { emit3(I_LDRD, FPR+r, SP, 160+8*r); r = r+1; }
+        r = 0;
+        while r < 19 { emit3(I_LDR, r, SP, 8*r); r = r+1; }
+        emit3(I_LDR, LR, SP, 152);
+        emit3(I_ADDI, SP, SP, 416);
+        emit1(I_B, vec_get(poll_sites, i+1));
+        i = i+2;
+    }
+}
+
 fn gen_fn(f) {
     if tgt_linux && any_v2 {
         let words=syscall_fast_arm64(f[F_QNAME]);
@@ -3552,6 +3610,7 @@ fn gen_fn(f) {
     trap_label = 0;
     div_label = 0;
     trap_sites = vec_new();
+    poll_sites = vec_new();
     if getenv("TINC_TRACE") {
         let tb = buf_new();
         buf_str(tb, "gen ");
@@ -3568,7 +3627,8 @@ fn gen_fn(f) {
     let nslots = assign_homes(f);
     cg = vec_new();
     incoming_stack_loads = vec_new();
-    let early = early_exit(f);
+    let early = 0;
+    if !fn_polls(f) { early = early_exit(f); }
     let pre = cg;
     cg = vec_new();
     let locals = f[F_LOCALS];
@@ -3654,6 +3714,7 @@ fn gen_fn(f) {
         }
         gen_dyn_table_init();
     }
+    gen_poll();
     i = early;
     while i < stmts[VEC_LEN] {
         gen_stmt(vec_get(stmts, i));
@@ -3698,6 +3759,7 @@ fn gen_fn(f) {
         }
         ts = ts + 1;
     }
+    gen_poll_stubs();
     finish_fn(f, nslots, pre);
 }
 
