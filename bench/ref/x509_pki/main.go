@@ -17,6 +17,7 @@ package main
 import (
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
@@ -324,6 +325,22 @@ func main() {
 	add("good-rsa-root-ecdsa-intermediate", "www.example.com", "server", "leaf-under-ec-rsa", "inter-ec-under-rsa", "root", "OK 3")
 	add("ecdsa-intermediate-wrong-root", "www.example.com", "server", "leaf-under-ec-rsa", "inter-ec-under-rsa", "ec-root", "unknown-authority")
 
+	// Ed25519: a root, an intermediate and a leaf, and an Ed25519 leaf key under the RSA chain.
+	edRoot, edRootKey, err := ed25519.GenerateKey(rand.Reader)
+	check(err)
+	_ = edRoot
+	_, edInterKey, err := ed25519.GenerateKey(rand.Reader)
+	check(err)
+	_, edLeafKey, err := ed25519.GenerateKey(rand.Reader)
+	check(err)
+	ca("ed-root", "", func(s *spec) { s.key = edRootKey; s.alg = x509.PureEd25519 })
+	ca("ed-inter", "ed-root", func(s *spec) { s.key = edInterKey; s.alg = x509.PureEd25519 })
+	leaf("leaf-under-ed", "ed-inter", func(s *spec) { s.key = edLeafKey; s.alg = x509.PureEd25519 })
+	add("good-ed25519-chain", "www.example.com", "server", "leaf-under-ed", "ed-inter", "ed-root", "OK 3")
+	leaf("leaf-ed-badsig", "ed-inter", func(s *spec) { s.alg = x509.PureEd25519; s.corruptSig = true })
+	add("bad-ed25519-signature", "www.example.com", "server", "leaf-ed-badsig", "ed-inter", "ed-root", "signature")
+	add("ed25519-wrong-root", "www.example.com", "server", "leaf-under-ed", "ed-inter", "root", "unknown-authority")
+
 	// TLS 1.3 CertificateVerify-style RSA-PSS signatures by the leaf's key (salt = hash length).
 	var sigs []string
 	msg := []byte(strings.Repeat(" ", 64) + "TLS 1.3, server CertificateVerify\x00transcript")
@@ -349,6 +366,8 @@ func main() {
 		check(err)
 		sigs = append(sigs, fmt.Sprintf("%s %d %x %x", sc.cert, sc.code, msg, sig))
 	}
+	edSig := ed25519.Sign(edLeafKey, msg)
+	sigs = append(sigs, fmt.Sprintf("leaf-under-ed %d %x %x", 0x0807, msg, edSig))
 	check(os.WriteFile(filepath.Join(dir, "tls_sigs.txt"), []byte(strings.Join(sigs, "\n")+"\n"), 0o644))
 
 	out := fmt.Sprintf("now %d\n%s\n", now.Unix(), strings.Join(lines, "\n"))

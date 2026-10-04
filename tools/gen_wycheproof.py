@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Convert Wycheproof signature vectors to the compact files under tests/wycheproof/rsa/ and
-tests/wycheproof/ecdsa/.
+"""Convert Wycheproof signature vectors to the compact files under tests/wycheproof/rsa/,
+tests/wycheproof/ecdsa/ and tests/wycheproof/ed25519/.
 
 Usage: tools/gen_wycheproof.py PATH/TO/wycheproof   (a checkout of github.com/C2SP/wycheproof)
 
@@ -9,6 +9,7 @@ per test:
     group rsa-pkcs1 SHA-256 - KEYHEX          (KEYHEX: DER PKCS #1 RSAPublicKey)
     group rsa-pss SHA-256 32 KEYHEX           (salt length; MGF1 uses the same hash)
     group ecdsa SHA-256 P-256 KEYHEX          (KEYHEX: uncompressed point; signatures in DER)
+    group ed25519 - - KEYHEX                  (KEYHEX: 32-byte public key; MSG is the message itself)
     TCID valid|invalid|acceptable MSGHEX SIGHEX   ("-" for an empty field)
 Only groups whose hashes seal implements are kept (HASHES below). Standard library only;
 the output is deterministic. The vectors are Apache-2.0; tests/wycheproof/README.md names the
@@ -41,6 +42,7 @@ FILES = [
     'ecdsa_secp384r1_sha256_test.json',
     'ecdsa_secp384r1_sha384_test.json',
     'ecdsa_secp384r1_sha512_test.json',
+    'ed25519_test.json',
 ]
 
 
@@ -50,7 +52,7 @@ def convert(src, name):
     kept = 0
     for group in data['testGroups']:
         kind = group['type']
-        if group.get('sha') not in HASHES:
+        if kind != 'EddsaVerify' and group.get('sha') not in HASHES:
             continue
         if kind == 'RsassaPkcs1Verify':
             lines.append(f"group rsa-pkcs1 {group['sha']} - {group['publicKeyAsn']}")
@@ -58,6 +60,8 @@ def convert(src, name):
             if group.get('mgf') != 'MGF1' or group.get('mgfSha') != group['sha']:
                 continue
             lines.append(f"group rsa-pss {group['sha']} {group['sLen']} {group['publicKeyAsn']}")
+        elif kind == 'EddsaVerify':
+            lines.append(f"group ed25519 - - {group['publicKey']['pk']}")
         elif kind == 'EcdsaVerify':
             curve = CURVES[group['publicKey']['curve']]
             lines.append(f"group ecdsa {group['sha']} {curve} {group['publicKey']['uncompressed']}")

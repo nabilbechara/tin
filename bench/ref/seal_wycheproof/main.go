@@ -4,6 +4,7 @@ package main
 import (
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -24,7 +25,7 @@ var files = []string{
 	"rsa/rsa_pss_2048_sha256_mgf1_0", "rsa/rsa_pss_2048_sha256_mgf1_32", "rsa/rsa_pss_2048_sha384_mgf1_48",
 	"rsa/rsa_pss_4096_sha256_mgf1_32", "rsa/rsa_pss_4096_sha512_mgf1_64", "rsa/rsa_pss_misc",
 	"ecdsa/ecdsa_secp256r1_sha256", "ecdsa/ecdsa_secp256r1_sha512", "ecdsa/ecdsa_secp384r1_sha256",
-	"ecdsa/ecdsa_secp384r1_sha384", "ecdsa/ecdsa_secp384r1_sha512",
+	"ecdsa/ecdsa_secp384r1_sha384", "ecdsa/ecdsa_secp384r1_sha512", "ed25519/ed25519",
 }
 
 func unhex(s string) []byte {
@@ -85,6 +86,7 @@ func run(name string) {
 	kind, salt, h := "", -1, crypto.SHA256
 	var key *rsa.PublicKey
 	var eckey *ecdsa.PublicKey
+	var edkey ed25519.PublicKey
 	counts, passed := map[string]int{}, map[string]int{}
 	for _, ln := range strings.Split(string(text), "\n") {
 		if ln == "" || ln[0] == '#' {
@@ -93,6 +95,13 @@ func run(name string) {
 		f := strings.Fields(ln)
 		if f[0] == "group" {
 			kind, salt, h = f[1], -1, hashes[f[2]]
+			if f[2] == "-" {
+				h = crypto.SHA256
+			}
+			if kind == "ed25519" {
+				edkey = ed25519.PublicKey(unhex(f[4]))
+				continue
+			}
 			if kind == "ecdsa" {
 				c := elliptic.P256()
 				if f[3] == "P-384" {
@@ -112,10 +121,15 @@ func run(name string) {
 			continue
 		}
 		result := f[1]
-		digest := digestOf(h, unhex(f[2]))
+		var digest []byte
+		if kind != "ed25519" {
+			digest = digestOf(h, unhex(f[2]))
+		}
 		sig := unhex(f[3])
 		ok := false
-		if kind == "ecdsa" {
+		if kind == "ed25519" {
+			ok = len(edkey) == ed25519.PublicKeySize && ed25519.Verify(edkey, unhex(f[2]), sig)
+		} else if kind == "ecdsa" {
 			ok = eckey.X != nil && ecdsa.VerifyASN1(eckey, digest, sig)
 		} else if key != nil {
 			if kind == "rsa-pkcs1" {
