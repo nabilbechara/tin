@@ -820,3 +820,14 @@ __vdso_clock_gettime (amd64), with the C signature int(clockid_t, timespec*).
 The vDSO lookup checks both hash forms, mapped bounds, symbol type and name.
 clock_gettime uses that entry when present and the syscall otherwise. Phase 3 still
 reads AT_SYSINFO_EHDR with libc getauxval; initial-stack auxv replaces it in phase 5.
+
+Strict hot syscall leaves
+-------------------------
+Read/write/close/fcntl/accept/recvfrom/epoll_ctl/epoll_pwait/timerfd_settime and
+clock_gettime use direct whole-function leaves in strict Linux programs. Their
+numbers come from syscalls_linux_{arm64,amd64}.tin; gen_syscall_fast.py rejects
+relocations and emits syscall_fast.tin. Error -4095..-1 stores its positive value
+in context word 10 and returns -1; success preserves the previous error. The clock
+leaf receives the shared vDSO pointer in x2/rdx from a normal linker relocation,
+preserves id/timespec over the C-ABI call, and falls back for an absent/nonzero
+result. Both leaves preserve x28/r15 and all callee-saved registers.

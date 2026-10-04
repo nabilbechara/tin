@@ -306,3 +306,12 @@ with the raw syscall as fallback. This brings the phase 5 clock lookup forward t
 preserve the existing fast clock path during the syscall transition; libc getauxval
 still supplies auxv until initial-stack startup replaces it in phase 5.
 
+
+Phase 3 performance follow-up: both first-run native HTTP comparisons missed the
+0.95 req/s gate (arm64 0.932/0.931 and amd64 0.913/0.931 for JSON/plaintext). The
+required repeat is retained. Hot strict wrappers now emit direct syscall leaves with
+inline kernel-error translation, removing the legacy wrapper/result call chain. The
+clock leaf loads the shared vDSO pointer and calls its C ABI directly, retaining a
+raw clock_gettime fallback, argument preservation and ABI stack alignment. Legacy
+compiler wrappers retain their seed-compatible error storage. The relocation-free
+leaves are regenerated from the recorded per-CPU numbers by gen_syscall_fast.py.
