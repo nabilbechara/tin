@@ -32,13 +32,14 @@ is left. It is pool memory, never ingot memory, so:
 
 | word | name | meaning |
 |---|---|---|
-| 0-4 | `aBump`, `aEnd`, `aBase`, `aMark`, `aExtra` | the arena pool's words while they are not in the core context: while the task that entered it is switched out, and after `rt_arena_out` |
-| 5 | `aFmt` | the formatting state (`ctxFmt`) at entry, given back at exit |
-| 6 | `aCleanup` | the running task's cleanup chain (`tCleanup`) at entry |
-| 7 | `aOut` | 1 after `rt_arena_out`: the context holds the parent's pool again |
-| 8 | `aCharged` | pool bytes the arena charged to limit budgets |
+| 0-4 | `aBump` .. `aExtra` (`aBase` = 2, `aExtra` = 4) | the arena pool's words while they are not in the core context: while the code that entered it is switched out, and after `rt_arena_out` |
+| 5 | `aFmt` | the formatting state while the core stack is switched out in it (`rt_task_run`) |
+| 6 | `aFmt0` | the formatting state (`ctxFmt`) at entry, given back at exit |
+| 7 | `aCleanup` | the running task's cleanup chain (`tCleanup`) at entry |
+| 8 | `aOut` | 1 after `rt_arena_out`: the context holds the parent's pool again |
+| 9 | `aCharged` | pool bytes the arena charged to limit budgets (`rt_bnd_charge` notes them) |
 
-`arenaWords = 9`. A per-core count `arenaLive` of open arenas keeps every check below off the
+`arenaWords = 10`. A per-core count `arenaLive` of open arenas keeps every check below off the
 paths of programs without arenas.
 
 ## 3. Where a pool's words live (pool sharing)
@@ -53,10 +54,12 @@ home while the code using them is not running:
   loads it from there, so children that ran while the arena body waited are seen;
 - **the arena pool**: the record's words 0-4.
 
-`rt_task_run` loads and saves the running task's pool words at `rt_pool_home(t)`: the
-innermost arena entered by `t` itself (its boundary chain from `tBnd` up to its root),
-else `rt_pool_words(t)`. On the core stack (code in `main` waiting in a scope) the same rule
-uses `bndCur` instead of `schedPool`. With `arenaLive == 0` this is `rt_pool_words(t)`.
+`rt_task_run` loads the running task's pool words from `rt_pool_home(t)` (the innermost
+arena entered by `t` itself and not yet switched out, on its boundary chain from `tBnd` up
+to its root; else `rt_pool_words(t)`) and, after the task switches back, saves them at
+`rt_pool_home(t)` again, computed then (the task may have entered or left arenas). The core
+stack's own words go to `rt_pool_home(0)` (the same walk from `bndCur`, else `schedPool`).
+With no arena open before or after the run this is `rt_pool_words(t)` and `schedPool`.
 
 ## 4. Functions (lib/runtime/runtime.tin)
 
@@ -67,7 +70,9 @@ uses `bndCur` instead of `schedPool`. With `arenaLive == 0` this is `rt_pool_wor
 | `rt_arena_out(b i64)` | runs the cleanups registered inside the arena, saves the arena pool in the record and loads the parent pool into the context; arena memory stays readable |
 | `rt_arena_fault(f i64) i64` | `f` copied into the current (parent) pool, chain and identity kept (`rt_fault_copy(f, false)`); 0 stays 0 |
 | `rt_arena_close(b i64)` | frees the arena pool, gives its charges back to limit budgets, leaves the boundary |
-| `rt_arena_discard(b i64)` | leaving `b` on an unwind: after `rt_arena_out` if it has not run, then frees as `rt_arena_close` does, without leaving (the caller unlinks the record) |
+| `rt_arena_discard(b i64, f i64) i64` | leaving `b` on an unwind: switches to the parent pool if `rt_arena_out` has not run (without running cleanups: the unwind ran them), copies fault word `f` there, frees as `rt_arena_close` does without leaving (the caller unlinks the record) and returns the copy |
+| `rt_arena_task_end(t i64, b i64)` | `rt_arena_discard` for task `t` ending by panic; a scope child's `spFault` is the fault copied |
+| `rt_pool_home(t i64) i64` | where the pool words of task `t` (0: the core stack) live while it is not running (section 3) |
 
 Copy helpers the compiler's generated `arenacopy$N` uses, the pool twins of `rt_keep_str`,
 `rt_keep_raw`, `rt_keep_slice` and `rt_keep_map_new`: `rt_arena_str(s str) str`,
@@ -78,7 +83,8 @@ Copy helpers the compiler's generated `arenacopy$N` uses, the pool twins of `rt_
 
 `arena { body }` (edition 1) is a boundary block like `guard` and `limit`: the body becomes
 a closure `func($r i64) !` whose last expression is stored through `$r`, and a generated
-`boundary$N(c, a, a2)` runs it:
+`arena$N(c)` runs it. A body that cannot fail (no `try` or `fail` leaves the closure) makes
+the block's type its value's; one that can makes it `!T`, used with `try` or `catch`.
 
 ```
 r := rt_alloc(16)                // the result cell, in the parent pool
@@ -91,7 +97,8 @@ rt_arena_close(b)
 ```
 
 `arenacopy$N(x T) T` deep-copies `x` into the current pool, as `keep$N` does into the ingot
-heap. A value type that holds a func or dyn value, or a recursive type, is a compile error.
+heap. A value type that holds a func or dyn value, or a recursive type, is a compile error
+(`E315 ARENA_VALUE`).
 
 ## 6. Unwinding
 
@@ -115,4 +122,7 @@ Inside an arena's closure, and closures inside it:
   `RG_OUT`, or into a captured variable, is `E314 ARENA_ESCAPE`;
 - appending to, or inserting into, a slice or map that may be `RG_OUT` (and is not only
   long-lived) is `E314 ARENA_ESCAPE` whatever the value: growth would allocate in the arena.
-  Functions record which parameters they may grow (`rg_grows`) so a call is checked too.
+- calls are checked from three per-function tables, iterated with the other summaries:
+  the parameters a function may grow (`rg_grows`), store its own fresh memory into
+  (`rg_fstores`), and store another parameter into (`rg_pstores`), so `setLabel(mut box, s)`
+  is an escape only when `s` is arena memory.
