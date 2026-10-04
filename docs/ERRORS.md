@@ -496,6 +496,146 @@ example.tin:11:6: error E210 ARG_COUNT: Max expects 2 arguments, got 3
 Fix: pass one argument per parameter; to take any number of values, declare the last
 parameter variadic (`xs ...T`) or pass a slice.
 
+### E240 SECRET_TYPE
+
+`secret` qualifies a value: a number, `bool`, `str`, a slice or a map. A struct is not secret
+as a whole; its fields are.
+
+```tin edition=1
+package main
+
+type Login struct {
+	user str
+	pass str
+}
+
+fn main() {
+	let l secret Login = Login{user: "ann", pass: "pw"}
+	_ = l
+}
+```
+
+```text
+example.tin:9:8: error E240 SECRET_TYPE: secret qualifies numbers, bool, str, slices and maps, not Login: mark the struct's fields secret instead
+```
+
+Fix: declare the fields that hold secrets `secret` (`pass secret str`) and keep the struct plain.
+
+### E241 SECRET_SINK
+
+A secret never reaches a place that prints, formats, encodes or carries it: `say`, string
+formatting, `panic`, fault messages (`fail`, `wrap`, `fault`, `say.Fault`), `argo.Put`, and
+`copy` or `append` into a slice that is not secret. A value that holds a secret field counts.
+
+```tin edition=1
+package main
+
+import "say"
+
+fn main() {
+	let token secret str = "s3cr3t"
+	say.Line("token: {token}")
+}
+```
+
+```text
+example.tin:7:11: error E241 SECRET_SINK: say.Line would print secret value "token: {token}": leave it out, or reveal the secret on purpose
+```
+
+Fix: leave the secret out of the message, or write `reveal(x)` where showing it is intended
+(`tin audit secrets` lists every `reveal`).
+
+### E242 SECRET_TO_PLAIN
+
+A secret goes only where a secret is declared: a variable, parameter, field or result that is
+not `secret` does not take one. This is how logging and library calls that have not opted in
+are kept from secrets.
+
+```tin edition=1
+package main
+
+fn send(header str) i64 {
+	return len(header)
+}
+
+fn main() {
+	let token secret str = "s3cr3t"
+	_ = send(token)
+}
+```
+
+```text
+example.tin:9:11: error E242 SECRET_TO_PLAIN: cannot pass secret value token to send: its parameter header is not declared secret (declare it secret, or write reveal(token) to pass it on purpose)
+```
+
+Fix: declare the parameter or variable `secret`, or pass `reveal(x)` on purpose.
+
+### E243 SECRET_COMPARE
+
+`==`, `!=`, the orderings and `min`/`max` take time that depends on where two values first
+differ, which leaks a secret byte by byte, so they are errors on secrets.
+
+```tin edition=1
+package main
+
+import "say"
+
+fn main() {
+	let token secret str = "s3cr3t"
+	if token == "s3cr3t" {
+		say.Line("ok")
+	}
+}
+```
+
+```text
+example.tin:7:11: error E243 SECRET_COMPARE: cannot compare secret values with ==: use seal.Equal, which takes the same time whatever they hold
+```
+
+Fix: compare with `seal.Equal(a, b)`, which takes the same time whatever the values hold;
+to order secrets, reveal them on purpose first.
+
+### E244 SECRET_MAP_KEY
+
+A map lookup compares its key in time that depends on the key, so a map key cannot be
+secret.
+
+```tin edition=1
+package main
+
+fn main() {
+	let sessions = map[secret str]i64{}
+	_ = sessions
+}
+```
+
+```text
+example.tin:4:17: error E244 SECRET_MAP_KEY: a map key cannot be secret: a lookup compares it in time that depends on its value (key the map by a hash of it, such as seal.Sha256Hex)
+```
+
+Fix: key the map by a hash of the secret, such as `seal.Sha256Hex(token)`.
+
+### E245 REVEAL
+
+`reveal(x)` takes exactly one secret value and gives it back with its plain type. A value
+that is not secret, or a struct that only holds secret fields, has nothing to reveal.
+
+```tin edition=1
+package main
+
+fn main() {
+	let name = "ann"
+	_ = reveal(name)
+}
+```
+
+```text
+example.tin:5:6: error E245 REVEAL: reveal needs a secret value, not str
+```
+
+Fix: drop the `reveal` from a plain value; for a struct, reveal the secret field itself
+(`reveal(u.token)`).
+
 ## E4xx Faults and optionals
 
 ### E401 CATCH_PLACEMENT
