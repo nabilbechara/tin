@@ -15,3 +15,74 @@ API: `Sha512`, `Sha384`, `type Hash enum { SHA256, SHA384, SHA512 }`, `Sum`, `Si
 Tests: `tests/v2/seal_hkdf.tin` (FIPS 180-4, RFC 4231, RFC 5869, RFC 8448 values; Go twin
 `bench/ref/seal_hkdf`), and `tools/ci/crypto_check.py` (Wycheproof `hmac_sha*` and `hkdf_sha*`,
 and hashlib on every length from 0 to 299 bytes).
+
+## P-256 (#124 phase 1)
+
+API: `P256NewPrivateKey`, `P256PublicKey`, `P256ECDH`; internal field and point functions for
+ECDSA are listed in notes/tls.md.
+
+- `field.tin` is generic Montgomery arithmetic over 32-bit limbs (no 64x64->128 multiply is
+  needed), constant-time; `p256.tin` uses the complete formulas of Renes-Costello-Batina and a
+  4-bit fixed window with a full-table scan.
+- Performance gap: about 3.4 ms per ECDH on Linux x86-64 against Go's 70 us (assembly). The
+  next step is a P-256-specific unrolled multiplication; the internal API does not change.
+
+Tests: `tests/v2/seal_p256.tin` (Go twin `bench/ref/seal_p256`), and Wycheproof
+`ecdh_secp256r1_ecpoint` in `tools/ci/crypto_check.py`.
+
+## Signatures and certificates (#124 phase 2)
+
+API: `VerifyPKCS1v15`, `VerifyPSS`, `RSAKeyBits`, `ParseRSAPublicKeyDER`, `DecodePEM`
+(`PEMBlock`), `ParseCertificate`, `ParseCertificatesPEM`, `Certificate` (with `Name`,
+`SignatureAlgorithm`, `PublicKeyAlgorithm`, the `KeyUsage*` and `ExtKeyUsage*` constants),
+`Certificate.Verify` (`VerifyOptions`), `CheckSignature`, `CheckSignatureFrom`,
+`CheckTLSSignature`, `VerifyHostname`, `ParseIP`, `CertPool` (`NewCertPool`, `Add`, `AddPEM`,
+`Len`, `Certificates`), `SystemRoots`.
+
+- `der.tin` is a strict DER reader (minimal lengths and integers, one-byte tags); `x509.tin`
+  rejects every byte-flipped certificate Go rejects and a few more (Go ignores trailing bytes
+  inside names, after the TBS and after the signature).
+- RSA runs on `field.tin`'s `monty`; `bignum.tin`'s `monty_new` computes the Montgomery
+  constants of a modulus at run time. Keys of 2048 to 8192 bits, odd exponents up to 2^32.
+- Stricter than Go, on purpose: chains of at most 8 certificates, RSA keys of at least 2048
+  bits, a wildcard needs two labels after `*.`, a host name containing `*` never matches.
+- Gaps: ECDSA and Ed25519 signatures (next PR, on `p256.tin`, a P-384 `monty` and SHA-512),
+  name constraints on email, URI and directory names (a CA with them is refused when the leaf
+  has such names), CRLs and OCSP. Speed: RSA-2048 verification takes about 0.9 ms on Linux
+  x86-64 against Go's 30 us; a faster `monty.mul` (one pass per row over raw words) halves it.
+
+Tests: `tests/v2/seal_wycheproof.tin` (13 Wycheproof RSA files), `tests/v2/seal_x509.tin`
+(46 chain cases), `tests/v2/seal_certinfo.tin` (fields, IP parsing, PEM, host names), each
+with a Go twin, and `tools/ci/x509_check.py` (fresh PKI, mutated certificates, system roots).
+## X25519 and ChaCha20-Poly1305 (#124 phase 1)
+
+API: `X25519`, `X25519PublicKey`, `X25519NewPrivateKey`, `ChaCha20`, `type AEAD` with
+`NewChaCha20Poly1305`, `Seal`, `Open`, `NonceSize`, `Overhead`.
+
+- X25519 uses ten signed limbs in radix 2^25.5 so products fit in 64 bits; it fails on an
+  all-zero result (RFC 8446 7.4.2 requires the check). About 0.85 ms per operation on Linux
+  x86-64 before tuning.
+- ChaCha20 keeps the state in locals and xors eight bytes at a time; Poly1305 is the 26-bit
+  limb form (poly1305-donna). AES-GCM joins `AEAD` as another kind.
+
+Tests: `tests/v2/seal_x25519_chacha.tin` (RFC 7748, RFC 8439, every length class, tampering;
+the Go twin `bench/ref/seal_x25519_chacha` uses crypto/ecdh and an independent math/big
+Poly1305), and Wycheproof `x25519` and `chacha20_poly1305` in `tools/ci/crypto_check.py`.
+
+## AES-GCM (#124 phase 1)
+
+API: `NewAESGCM(key)` (16-, 24- or 32-byte keys) returning the same `AEAD` as ChaCha20-Poly1305.
+Nonces are 12 bytes only, like Go's `cipher.NewGCM`.
+
+- Software path (every CPU): bitsliced AES, four blocks in eight u64 planes. The S-box is
+  computed, not looked up: x^254 in GF(2^8) plus the affine map, generated as straight-line
+  ANDs and XORs by `tools/gen_aes_sbox.py` into `aes_sbox.tin`. The key schedule uses the same
+  circuit. GHASH uses 32x32 integer multiplications on operands with holes (BearSSL's
+  ctmul idea) and Karatsuba.
+- Performance gap: the software path is a constant-time fallback; on Linux x86-64 it runs at
+  about 8 MB/s (ChaCha20-Poly1305 about 38 MB/s), partly because the x86-64 backend keeps
+  only four locals in registers. The AES-NI/PCLMULQDQ and ARMv8 AES/PMULL paths come in
+  their own PR (they need hand-assembled functions in the code generators).
+
+Tests: `tests/v2/seal_aes.tin` (NIST GCM cases, every length class for all key sizes,
+tampering; Go twin `bench/ref/seal_aes`), and Wycheproof `aes_gcm` in `tools/ci/crypto_check.py`.

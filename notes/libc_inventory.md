@@ -71,9 +71,9 @@ an entry removed only when no Linux declaration or linker-added import remains.
 | `pipe` | `lib/anvil/anvil.tin`, `lib/relay/relay.tin`, `lib/runtime/runtime.tin` | 3 | removed | pipe2 | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
 | `poll` | `lib/relay/relay.tin`, `lib/runtime/runtime.tin`, `lib/wire/wire.tin` | 3 | removed | ppoll with timespec timeout | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
 | `posix_memalign` | `lib/runtime/runtime.tin` | 2 | removed | Tin mmap allocator or byte/word operations | Memory/OOM injection; overlap/alignment/microbenchmarks; bootstrap (phase 2) |
-| `pthread_attr_init` | `lib/runtime/runtime.tin` | 5 | active | Tin thread stack configuration | Thread stack/guard-page tests (phase 5) |
-| `pthread_attr_setstacksize` | `lib/runtime/runtime.tin` | 5 | active | Tin mmap stack and guard page | Thread stack/guard-page tests (phase 5) |
-| `pthread_create` | `lib/runtime/runtime.tin` | 5 | active | Raw clone with owned stacks and child trampoline | tools/ci/task_check.py; helper threads; thread-exit/stack-lifetime tests (phase 5) |
+| `pthread_attr_init` | `lib/runtime/runtime.tin` | 5 | removed | Tin thread stack configuration (`rt_thread_start` in runtime_linux.tin) | tools/ci/thread_check.py stacks, guard and reaping (phase 5) |
+| `pthread_attr_setstacksize` | `lib/runtime/runtime.tin` | 5 | removed | Tin mmap stack and guard page | tools/ci/thread_check.py stacks, guard and reaping (phase 5) |
+| `pthread_create` | `lib/runtime/runtime.tin` | 5 | removed | Raw clone (`rt_sys_clone` leaf) with parent-owned stacks and child trampoline | tools/ci/thread_check.py returning cores, masks, alternate stacks and child faults; task_check.py helper threads (phase 5) |
 | `pthread_sigmask` | `lib/runtime/runtime_linux.tin` | 3 | removed | rt_sigprocmask with kernel sigset_t | tools/ci/http_check.py shutdown; per-thread signal-mask tests (phase 3) |
 | `read` | `lib/runtime/runtime.tin`, `lib/std.tin` | 3 | removed | read raw syscall (per-architecture ABI) | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
 | `readdir` | `lib/quarry/quarry.tin`, `selfhost/main.tin` | 3 | removed | Tin linux_dirent64 parsing and buffer refills | tests/v2/quarry.tin; directory refill/unknown-type/symlink cases; bootstrap (phase 3) |

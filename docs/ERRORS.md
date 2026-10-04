@@ -28,9 +28,6 @@ example.tin:11:6: error E510 NOT_IN_UNION: type str does not satisfy the constra
 | E8xx | trusted code and standard-library-only features |
 | E9xx | building: targets, linking and limits |
 
-Codes are being added one compiler file at a time (#244); until that is finished, some
-errors still print as `error: message` without a code.
-
 Each entry below gives the rule, a program that breaks it with the exact output the compiler
 prints for it, and the fixes. `tools/ci/diagnostics_check.py` compiles every example and
 requires that output, and checks that the compiler, this page and the tests' expected

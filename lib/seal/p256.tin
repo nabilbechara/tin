@@ -1,0 +1,328 @@
+package seal
+
+// ---- NIST P-256 (secp256r1): field, points, scalar multiplication and ECDH ----
+// Points are projective (X:Y:Z) with x = X/Z, y = Y/Z; the identity is (0:1:0). Addition and
+// doubling are the complete formulas of Renes, Costello and Batina (2016, algorithms 4 and 6,
+// a = -3): no special cases, so no branch on a point's value. Scalar multiplication uses a
+// fixed 4-bit window and reads its table by scanning every entry, so it is constant-time in
+// the scalar. Phase 2 (ECDSA) uses p256_mul, p256_add, p256_affine and the scalar field p256n.
+
+var p256f = new_monty(
+	[]u64{0xffffffff, 0xffffffff, 0xffffffff, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0xffffffff},
+	[]u64{0x00000003, 0x00000000, 0xffffffff, 0xfffffffb, 0xfffffffe, 0xffffffff, 0xfffffffd, 0x00000004},
+	[]u64{0x00000001, 0x00000000, 0x00000000, 0xffffffff, 0xffffffff, 0xffffffff, 0xfffffffe, 0x00000000},
+	1)
+
+// p256n is arithmetic modulo the group order n.
+var p256n = new_monty(
+	[]u64{0xfc632551, 0xf3b9cac2, 0xa7179e84, 0xbce6faad, 0xffffffff, 0xffffffff, 0x00000000, 0xffffffff},
+	[]u64{0xbe79eea2, 0x83244c95, 0x49bd6fa6, 0x4699799c, 0x2b6bec59, 0x2845b239, 0xf3d95620, 0x66e12d94},
+	[]u64{0x039cdaaf, 0x0c46353d, 0x58e8617b, 0x43190552, 0x00000000, 0x00000000, 0xffffffff, 0x00000000},
+	0xee00bc4f)
+
+// The curve constant b and the base point, in Montgomery form.
+var p256b = []u64{0x29c4bddf, 0xd89cdf62, 0x78843090, 0xacf005cd, 0xf7212ed6, 0xe5a220ab, 0x04874834, 0xdc30061d}
+var p256gx = []u64{0x18a9143c, 0x79e730d4, 0x5fedb601, 0x75ba95fc, 0x77622510, 0x79fb732b, 0xa53755c6, 0x18905f76}
+var p256gy = []u64{0xce95560a, 0xddf25357, 0xba19e45c, 0x8b4ab8e4, 0xdd21f325, 0xd2e88688, 0x25885d85, 0x8571ff18}
+
+// p256pt is a point in projective coordinates (Montgomery form).
+type p256pt struct {
+	x []u64
+	y []u64
+	z []u64
+}
+
+// Scratch elements for the point formulas (per core; nothing here waits).
+var p256t = [][]u64{make([]u64, 8), make([]u64, 8), make([]u64, 8), make([]u64, 8), make([]u64, 8), make([]u64, 8), make([]u64, 8), make([]u64, 8)}
+
+func p256_identity() p256pt {
+	p := p256pt{x: make([]u64, 8), y: make([]u64, 8), z: make([]u64, 8)}
+	p256f.set(mut p.y, p256f.one)
+	return p
+}
+
+func p256_generator() p256pt {
+	p := p256_identity()
+	p256f.set(mut p.x, p256gx)
+	p256f.set(mut p.y, p256gy)
+	p256f.set(mut p.z, p256f.one)
+	return p
+}
+
+func p256_copy(r mut p256pt, p p256pt) {
+	p256f.set(mut r.x, p.x)
+	p256f.set(mut r.y, p.y)
+	p256f.set(mut r.z, p.z)
+}
+
+// p256_add sets r = p + q (complete: any inputs, including equal points and the identity); r
+// may alias p or q.
+func p256_add(r mut p256pt, p p256pt, q p256pt) {
+	t0 := p256t[0]
+	t1 := p256t[1]
+	t2 := p256t[2]
+	t3 := p256t[3]
+	t4 := p256t[4]
+	x3 := p256t[5]
+	y3 := p256t[6]
+	z3 := p256t[7]
+	p256f.mul(mut t0, p.x, q.x)
+	p256f.mul(mut t1, p.y, q.y)
+	p256f.mul(mut t2, p.z, q.z)
+	p256f.add(mut t3, p.x, p.y)
+	p256f.add(mut t4, q.x, q.y)
+	p256f.mul(mut t3, t3, t4)
+	p256f.add(mut t4, t0, t1)
+	p256f.sub(mut t3, t3, t4)
+	p256f.add(mut t4, p.y, p.z)
+	p256f.add(mut x3, q.y, q.z)
+	p256f.mul(mut t4, t4, x3)
+	p256f.add(mut x3, t1, t2)
+	p256f.sub(mut t4, t4, x3)
+	p256f.add(mut x3, p.x, p.z)
+	p256f.add(mut y3, q.x, q.z)
+	p256f.mul(mut x3, x3, y3)
+	p256f.add(mut y3, t0, t2)
+	p256f.sub(mut y3, x3, y3)
+	p256f.mul(mut z3, p256b, t2)
+	p256f.sub(mut x3, y3, z3)
+	p256f.add(mut z3, x3, x3)
+	p256f.add(mut x3, x3, z3)
+	p256f.sub(mut z3, t1, x3)
+	p256f.add(mut x3, t1, x3)
+	p256f.mul(mut y3, p256b, y3)
+	p256f.add(mut t1, t2, t2)
+	p256f.add(mut t2, t1, t2)
+	p256f.sub(mut y3, y3, t2)
+	p256f.sub(mut y3, y3, t0)
+	p256f.add(mut t1, y3, y3)
+	p256f.add(mut y3, t1, y3)
+	p256f.add(mut t1, t0, t0)
+	p256f.add(mut t0, t1, t0)
+	p256f.sub(mut t0, t0, t2)
+	p256f.mul(mut t1, t4, y3)
+	p256f.mul(mut t2, t0, y3)
+	p256f.mul(mut y3, x3, z3)
+	p256f.add(mut y3, y3, t2)
+	p256f.mul(mut x3, t3, x3)
+	p256f.sub(mut x3, x3, t1)
+	p256f.mul(mut z3, t4, z3)
+	p256f.mul(mut t1, t3, t0)
+	p256f.add(mut z3, z3, t1)
+	p256f.set(mut r.x, x3)
+	p256f.set(mut r.y, y3)
+	p256f.set(mut r.z, z3)
+}
+
+// p256_double sets r = 2p (complete); r may alias p.
+func p256_double(r mut p256pt, p p256pt) {
+	t0 := p256t[0]
+	t1 := p256t[1]
+	t2 := p256t[2]
+	t3 := p256t[3]
+	x3 := p256t[5]
+	y3 := p256t[6]
+	z3 := p256t[7]
+	p256f.mul(mut t0, p.x, p.x)
+	p256f.mul(mut t1, p.y, p.y)
+	p256f.mul(mut t2, p.z, p.z)
+	p256f.mul(mut t3, p.x, p.y)
+	p256f.add(mut t3, t3, t3)
+	p256f.mul(mut z3, p.x, p.z)
+	p256f.add(mut z3, z3, z3)
+	p256f.mul(mut y3, p256b, t2)
+	p256f.sub(mut y3, y3, z3)
+	p256f.add(mut x3, y3, y3)
+	p256f.add(mut y3, x3, y3)
+	p256f.sub(mut x3, t1, y3)
+	p256f.add(mut y3, t1, y3)
+	p256f.mul(mut y3, x3, y3)
+	p256f.mul(mut x3, x3, t3)
+	p256f.add(mut t3, t2, t2)
+	p256f.add(mut t2, t2, t3)
+	p256f.mul(mut z3, p256b, z3)
+	p256f.sub(mut z3, z3, t2)
+	p256f.sub(mut z3, z3, t0)
+	p256f.add(mut t3, z3, z3)
+	p256f.add(mut z3, z3, t3)
+	p256f.add(mut t3, t0, t0)
+	p256f.add(mut t0, t3, t0)
+	p256f.sub(mut t0, t0, t2)
+	p256f.mul(mut t0, t0, z3)
+	p256f.add(mut y3, y3, t0)
+	p256f.mul(mut t0, p.y, p.z)
+	p256f.add(mut t0, t0, t0)
+	p256f.mul(mut z3, t0, z3)
+	p256f.sub(mut x3, x3, z3)
+	p256f.mul(mut z3, t0, t1)
+	p256f.add(mut z3, z3, z3)
+	p256f.add(mut z3, z3, z3)
+	p256f.set(mut r.x, x3)
+	p256f.set(mut r.y, y3)
+	p256f.set(mut r.z, z3)
+}
+
+// p256_mul sets r = k*p for a 32-byte big-endian scalar k (any value), in time that does not
+// depend on k or p.
+func p256_mul(r mut p256pt, p p256pt, k []u8) {
+	table := make([]p256pt, 0, 16)
+	table = append(table, p256_identity())
+	for i := 1; i < 16; i++ {
+		e := p256_identity()
+		p256_add(mut e, table[i-1], p)
+		table = append(table, e)
+	}
+	acc := p256_identity()
+	sel := p256_identity()
+	for i := 0; i < 64; i++ {
+		if i > 0 {
+			p256_double(mut acc, acc)
+			p256_double(mut acc, acc)
+			p256_double(mut acc, acc)
+			p256_double(mut acc, acc)
+		}
+		w := u64(k[i/2])
+		if i%2 == 0 {
+			w = w >> 4
+		}
+		w = w & 15
+		// Read table[w] by touching every entry.
+		for j := 0; j < 16; j++ {
+			d := u64(j) ^ w
+			bit := 1 ^ ((d | (u64(0) - d)) >> 63)
+			e := table[j]
+			p256f.sel(mut sel.x, e.x, sel.x, bit)
+			p256f.sel(mut sel.y, e.y, sel.y, bit)
+			p256f.sel(mut sel.z, e.z, sel.z, bit)
+		}
+		p256_add(mut acc, acc, sel)
+	}
+	p256_copy(mut r, acc)
+}
+
+// p256_affine returns p's affine coordinates as 32-byte big-endian x and y, and 0 for the
+// identity (then x and y are zero), else 1.
+func p256_affine(p p256pt) ([]u8, []u8, u64) {
+	zi := p256f.elem()
+	p256f.inv(mut zi, p.z)
+	x := p256f.elem()
+	y := p256f.elem()
+	p256f.mul(mut x, p.x, zi)
+	p256f.mul(mut y, p.y, zi)
+	return p256f.to_bytes(x), p256f.to_bytes(y), 1 ^ p256f.is_zero(p.z)
+}
+
+// p256_decode reads an uncompressed (65 bytes, 0x04 x y) or compressed (33 bytes, 0x02 or
+// 0x03 x) point and checks that it is on the curve. The identity has no encoding.
+func p256_decode(b []u8) !p256pt {
+	p := p256_identity()
+	if len(b) == 65 && b[0] == 4 {
+		if p256f.from_bytes(mut p.x, b[1:33]) == 0 || p256f.from_bytes(mut p.y, b[33:65]) == 0 {
+			fail "seal: P-256 coordinate out of range"
+		}
+		rhs := p256_rhs(p.x)
+		y2 := p256f.elem()
+		p256f.mul(mut y2, p.y, p.y)
+		if p256f.equal(y2, rhs) == 0 {
+			fail "seal: P-256 point is not on the curve"
+		}
+		p256f.set(mut p.z, p256f.one)
+		return p
+	}
+	if len(b) == 33 && (b[0] == 2 || b[0] == 3) {
+		if p256f.from_bytes(mut p.x, b[1:33]) == 0 {
+			fail "seal: P-256 coordinate out of range"
+		}
+		rhs := p256_rhs(p.x)
+		// p = 3 mod 4, so a square root of rhs is rhs^((p+1)/4).
+		e := []u8{0x3f, 0xff, 0xff, 0xff, 0xc0, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+		p256f.exp(mut p.y, rhs, e)
+		y2 := p256f.elem()
+		p256f.mul(mut y2, p.y, p.y)
+		if p256f.equal(y2, rhs) == 0 {
+			fail "seal: P-256 point is not on the curve"
+		}
+		yb := p256f.to_bytes(p.y)
+		if (yb[31] & 1) != (b[0] & 1) {
+			p256f.sub(mut p.y, p256f.elem(), p.y)
+		}
+		p256f.set(mut p.z, p256f.one)
+		return p
+	}
+	fail "seal: invalid P-256 point encoding"
+}
+
+// p256_rhs is x^3 - 3x + b.
+func p256_rhs(x []u64) []u64 {
+	r := p256f.elem()
+	t := p256f.elem()
+	p256f.mul(mut r, x, x)
+	p256f.mul(mut r, r, x)
+	p256f.add(mut t, x, x)
+	p256f.add(mut t, t, x)
+	p256f.sub(mut r, r, t)
+	p256f.add(mut r, r, p256b)
+	return r
+}
+
+// p256_encode is the uncompressed encoding of p (65 bytes), or fails for the identity.
+func p256_encode(p p256pt) ![]u8 {
+	x, y, ok := p256_affine(p)
+	if ok == 0 {
+		fail "seal: P-256 point at infinity"
+	}
+	out := make([]u8, 0, 65)
+	out = append(out, 4)
+	out = append(out, x...)
+	out = append(out, y...)
+	return out
+}
+
+// p256_scalar_ok is 1 when k is 32 bytes in [1, n-1], else 0.
+func p256_scalar_ok(k []u8) u64 {
+	s := p256n.elem()
+	if p256n.from_bytes(mut s, k) == 0 {
+		return 0
+	}
+	return 1 ^ p256n.is_zero(s)
+}
+
+// P256NewPrivateKey returns a random P-256 private key: 32 big-endian bytes in [1, n-1].
+func P256NewPrivateKey() []u8 {
+	for {
+		k := RandomBytes(32)
+		if p256_scalar_ok(k) == 1 {
+			return k
+		}
+	}
+	return []u8{}
+}
+
+// P256PublicKey is the uncompressed public key (65 bytes) of a P-256 private key; it fails
+// unless priv is 32 bytes in [1, n-1]. Constant-time in priv.
+func P256PublicKey(priv secret []u8) ![]u8 {
+	if p256_scalar_ok(priv) == 0 {
+		fail "seal: invalid P-256 private key"
+	}
+	r := p256_identity()
+	p256_mul(mut r, p256_generator(), priv)
+	return try p256_encode(r)
+}
+
+// P256ECDH is the P-256 Diffie-Hellman shared secret (the 32-byte x coordinate of priv*peer).
+// peer is an uncompressed or compressed public key; it fails for an invalid private key, a
+// point not on the curve, or a result at infinity. Constant-time in priv.
+func P256ECDH(priv secret []u8, peer []u8) ![]u8 {
+	if p256_scalar_ok(priv) == 0 {
+		fail "seal: invalid P-256 private key"
+	}
+	q := try p256_decode(peer)
+	r := p256_identity()
+	p256_mul(mut r, q, priv)
+	x, _, ok := p256_affine(r)
+	if ok == 0 {
+		fail "seal: P-256 shared secret is the point at infinity"
+	}
+	return x
+}
