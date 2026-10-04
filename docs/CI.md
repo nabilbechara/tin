@@ -50,7 +50,7 @@ The issue audit checks GitHub for every exempted issue. Closing an issue while a
 
 ## Resolving an issue
 
-1. Add a small deterministic reproducer and the intended correct behavior. For a language/runtime bug, use `tests/regressions/NAME.tin` and an entry in `cases.json` with the issue number. Every `.tin` file must have exactly one entry; the runner discovers new cases without workflow edits.
+1. Add a small deterministic reproducer and the intended correct behavior. For a language/runtime bug, use `tests/regressions/NAME.tin` and an entry in `cases.json` with the issue number. Every `.tin` file must have exactly one entry; the runner discovers new cases without workflow edits. A request recorded in production becomes such a case with `tin replay CAPSULE --against FIXED.tin --save-test NAME --issue N` (docs/TOOLING.md §8.1, #242): the case names its capsule and the public key it is sealed under, and the runner replays it.
 2. Implement the fix. If the case already exists, remove its `known_failure` contract and keep its expected behavior. For non-Tin tooling bugs, extend `tools/ci/test_*.py`; unittest discovers them automatically. Issues #7 and #8 are covered by these harness tests.
 3. Run the commands below and include the regression test names in the PR. Expand the workflow only when the issue needs a new environment/tool, such as native amd64 or cgroup namespace fixtures.
 4. Let CI pass and merge the PR before closing the issue (a `Fixes #N` PR reference closes it on merge).
