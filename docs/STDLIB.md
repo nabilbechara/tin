@@ -1007,7 +1007,7 @@ Package policy is the with policies (design_semantics §7.1, notes/interface_pol
 - `Bind[V constraints.Any, T constraints.Any](s Slot[V], v V) BindPolicy[V, T]`: Bind is a policy that binds s to v for its block and the tasks the block spawns: with policy.Bind(requestID, id) { }.
 - `(b BindPolicy[V, T]) Run(body func() !T) !T`: Run binds the slot on the with block's boundary, then runs body once.
 - `type RetryPolicy[T constraints.Any] struct`: RetryPolicy runs its block again while it fails (Retry).
-- `Retry[T constraints.Any](attempts i64) RetryPolicy[T]`: Retry is a policy that runs its block up to attempts times while it fails and gives the last fault. A cancellation fault (or a cancelled boundary) ends it at once. The block's side effects run again on each attempt.
+- `Retry[T constraints.Any](attempts i64) RetryPolicy[T]`: Retry is a policy that runs its block up to attempts times while it fails and gives the last fault. A cancellation ends it at once: a cancellation fault from the block is given as it is, and a boundary cancelled (or past its deadline) between attempts gives the cancellation's fault. The block's side effects run again on each attempt.
 - `(r RetryPolicy[T]) Backoff(d i64) RetryPolicy[T]`: Backoff is r waiting d before the second attempt, and twice as long before each later one.
 - `(r RetryPolicy[T]) Run(body func() !T) !T`: Run runs body until it succeeds, attempts runs have failed, or the boundary is cancelled.
 - `SetTracer(f func(str, i64, fault))`: SetTracer sends this core's trace spans to f(name, duration in ns, fault or nil) instead of the log.

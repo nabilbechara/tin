@@ -72,7 +72,7 @@ type RetryPolicy[T constraints.Any] struct {
 	wait     i64
 }
 
-// Retry is a policy that runs its block up to attempts times while it fails and gives the last fault. A cancellation fault (or a cancelled boundary) ends it at once. The block's side effects run again on each attempt.
+// Retry is a policy that runs its block up to attempts times while it fails and gives the last fault. A cancellation ends it at once: a cancellation fault from the block is given as it is, and a boundary cancelled (or past its deadline) between attempts gives the cancellation's fault. The block's side effects run again on each attempt.
 func Retry[T constraints.Any](attempts i64) RetryPolicy[T] {
 	return RetryPolicy[T]{attempts: attempts, wait: 0}
 }
@@ -94,6 +94,9 @@ func (r RetryPolicy[T]) Run(body func() !T) !T {
 		if n >= r.attempts || canceled(err) {
 			fail err
 		}
+		if rt_bnd_stopped() {
+			fail cast(fault, rt_wait_fault())
+		}
 		if wait > 0 {
 			try tide.Wait(wait)
 			wait = wait * 2
@@ -102,9 +105,9 @@ func (r RetryPolicy[T]) Run(body func() !T) !T {
 	}
 }
 
-// canceled reports whether err ends the work instead of being worth another attempt.
+// canceled reports whether err is a cancellation, which no attempt can get past.
 func canceled(err fault) bool {
-	return fault.Is(err, fault.Canceled) || fault.Is(err, fault.DeadlineExceeded) || fault.Is(err, fault.LimitExceeded) || rt_bnd_stopped()
+	return fault.Is(err, fault.Canceled) || fault.Is(err, fault.DeadlineExceeded) || fault.Is(err, fault.LimitExceeded)
 }
 
 // ---- trace ----
