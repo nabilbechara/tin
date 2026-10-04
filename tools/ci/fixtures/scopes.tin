@@ -4,44 +4,52 @@ import "anvil"
 import "say"
 import "tide"
 
-fn fetch(i i64, failAt i64) !str {
+fn fetch(i i64, failAt i64, ms i64) !str {
 	if i == failAt {
 		fail "child {i} failed"
 	}
-	try tide.Wait(100 * tide.Millisecond)
+	try tide.Wait(ms * tide.Millisecond)
 	return "p{i}"
 }
 
-fn fetchAll(n i64, failAt i64) ![]str {
+// fetchAll gives the pages and the most children that were waiting at once in this request.
+fn fetchAll(n i64, failAt i64, ms i64) !str {
 	let pages = make([]str, n)
+	mut waiting i64 = 0
+	mut most i64 = 0
 	scope s {
 		for i in 0..n {
 			let k = i
 			s.spawn(fn() ! {
-				pages[k] = try fetch(k, failAt)
+				waiting += 1
+				if waiting > most {
+					most = waiting
+				}
+				pages[k] = try fetch(k, failAt, ms)
+				waiting -= 1
 			})
 		}
 	}
-	return pages
+	return "{pages} {most} at once"
 }
 
-// fetch runs 4 children that each wait 50 ms: together they take about 50 ms.
+// all runs 4 children that each wait 100 ms: all 4 are waiting at once.
 fn all(q anvil.Req, w mut anvil.Out) {
-	let pages = fetchAll(4, -1) catch err {
+	let got = fetchAll(4, -1, 100) catch err {
 		w.Status(500)
 		w.Text("fault: {err}")
 		return
 	}
-	w.Text(say.Str(pages))
+	w.Text(got)
 }
 
-// fail has one child fail at once: the others are cancelled instead of waiting 50 ms.
+// fails has one child fail at once: the others are cancelled instead of waiting 5 s.
 fn fails(q anvil.Req, w mut anvil.Out) {
-	let pages = fetchAll(4, 2) catch err {
+	let got = fetchAll(4, 2, 5000) catch err {
 		w.Text("fault: {err}")
 		return
 	}
-	w.Text("never {len(pages)}")
+	w.Text("never {got}")
 }
 
 fn main() {

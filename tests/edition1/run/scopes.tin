@@ -5,8 +5,24 @@ import "tide"
 
 mut order str = ""
 
+// Naps in progress and the most seen at once: overlap shows in the count, not the clock.
+mut napping i64 = 0
+mut most i64 = 0
+
+fn nap(ms i64) ! {
+	napping += 1
+	if napping > most {
+		most = napping
+	}
+	tide.Wait(ms * tide.Millisecond) catch err {
+		napping -= 1
+		fail err
+	}
+	napping -= 1
+}
+
 fn fetch(i i64) !str {
-	try tide.Wait((4 - i) * 30 * tide.Millisecond)
+	try nap((4 - i) * 30)
 	order = keep(order + "{i}")
 	if i == 7 {
 		fail "fetch {i} failed"
@@ -79,12 +95,12 @@ fn tooMany(n i64) !i64 {
 }
 
 fn user(id i64) !str {
-	try tide.Wait(100 * tide.Millisecond)
+	try nap(100)
 	return "user{id}"
 }
 
 fn orders(id i64) !i64 {
-	try tide.Wait(100 * tide.Millisecond)
+	try nap(100)
 	if id < 0 {
 		fail "no orders for {id}"
 	}
@@ -109,13 +125,11 @@ fn mixed() !str {
 }
 
 fn main() {
-	let start = tide.Now()
 	let pages = fetchAll(4) catch err {
 		say.Line("never", err)
 		[]str{}
 	}
-	let ms = (tide.Now() - start) / tide.Millisecond
-	say.Line("pages:", pages, "overlapped:", ms < 250, "finish order:", order)
+	say.Line("pages:", pages, "overlapped:", most == 4, "finish order:", order)
 	let t0 = tide.Now()
 	firstFault() catch err {
 		say.Line("scope fault:", err, "fast:", (tide.Now() - t0) / tide.Millisecond < 1000)
@@ -138,11 +152,11 @@ fn main() {
 	tooMany(5) catch err {
 		say.Line("limit tasks 4, 5 spawns:", err)
 	}
-	let ps = tide.Now()
+	most = 0
 	let p = profile(7) catch err {
 		"fault {err}"
 	}
-	say.Line("parallel:", p, "overlapped:", (tide.Now() - ps) / tide.Millisecond < 180)
+	say.Line("parallel:", p, "overlapped:", most == 2)
 	let pf = profile(-1) catch err {
 		"fault {err}"
 	}

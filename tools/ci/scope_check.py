@@ -21,15 +21,21 @@ def timed(port, path):
     return got, time.monotonic() - start
 
 
+ALL = b'[p0 p1 p2 p3] 4 at once'
+
+
 def checks(port):
+    # The children count how many of them are waiting at once, so overlap shows in the body
+    # rather than in timings a slow runner can stretch; the time bounds are far from the
+    # 5 s a sibling waits when a fault does not cancel it.
     (status, body), took = timed(port, '/all')
-    assert (status, body) == (200, b'[p0 p1 p2 p3]'), (status, body)
-    assert took < 0.3, 'four 100 ms children took %.3f s: their waits did not overlap' % took
-    print('fetchAll: 4 children waiting 100 ms each answered in %.0f ms' % (took * 1000))
+    assert (status, body) == (200, ALL), (status, body)
+    assert took < 0.5, 'four overlapping 100 ms children took %.3f s' % took
+    print('fetchAll: 4 children waiting 100 ms each, all at once, answered in %.0f ms' % (took * 1000))
 
     (status, body), took = timed(port, '/fail')
     assert (status, body) == (200, b'fault: child 2 failed'), (status, body)
-    assert took < 0.08, 'a child fault should cancel the 100 ms siblings at once (%.3f s)' % took
+    assert took < 0.5, 'a child fault should cancel the siblings that wait 5 s (%.3f s)' % took
     print('first fault: siblings cancelled, answered in %.1f ms' % (took * 1000))
 
     # Many requests with scopes on one core: each gets its own children and results.
@@ -44,7 +50,7 @@ def checks(port):
         t.join()
     took = time.monotonic() - start
     for path, got in results:
-        want = (200, b'[p0 p1 p2 p3]') if path == '/all' else (200, b'fault: child 2 failed')
+        want = (200, ALL) if path == '/all' else (200, b'fault: child 2 failed')
         assert got == want, (path, got)
     assert took < 2, '60 concurrent scoped requests took %.2f s' % took
     print('60 concurrent requests with scopes on one core: all correct in %.2f s' % took)
