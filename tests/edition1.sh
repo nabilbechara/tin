@@ -115,8 +115,9 @@ do
 	fi
 done
 
-# A task handle cannot outlive its scope (#232): each escape is a compile error.
-for name in scope_escape_bad
+# A task handle cannot outlive its scope, and detach captures only long-lived memory (#232):
+# each is a compile error.
+for name in scope_escape_bad detach_capture_bad
 do
 	if "$compiler" -edition 1 -o "$tmp/$name" "tests/edition1/$name.tin" >"$tmp/$name.out" 2>"$tmp/$name.err"; then
 		echo "FAIL edition1/$name: unexpectedly accepted"

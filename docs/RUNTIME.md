@@ -399,6 +399,10 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   outlives the request that started it (its closure and captures are `keep`-copied to the
   long-lived heap), runs when the event loop turns, is cancelled by the drain with the rest of
   the core, and logs its fault (`detached task failed: ...`) instead of passing it on.
+  What it captures must already be long-lived, as for a global: a capture that may hold
+  request memory is a compile error naming it, unless the block reads it only inside `keep()`
+  (`detach { flush(keep(event)) }`); otherwise keep it first (`let e = keep(event)`). A task
+  handle or a scope cannot be captured at all.
 - `select { let x = l.Recv() => ...; t.wait() => ...; after(d) => ...; canceled() => ... }`
   (#232) checks its arms in source order, so ties go to the first one; with none ready it
   watches every source (lanes and task handles wake it), parks until one does or the earliest
