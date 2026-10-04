@@ -5,39 +5,101 @@
 const schedSelectKind = "sched.select@1"
 
 // rt_sched_select is a select's state on tape tp: -2 recording; replaying, the recorded arm
-// (0 to n). A replay that diverged here, or before, runs the select live (-1): the first
-// divergence is what the replay reports.
+// (0 to n). The record is taken when the select ends (it was appended then): it is the next
+// record when the recorded select did not wait, else the one right after the running task's
+// next resume. A replay that diverged, or whose select record is not found, runs the select
+// live (-1): the first divergence is what the replay reports.
 func rt_sched_select(tp i64, site str, n i64) i64 {
 	if tp[tpMode] != tapeReplay {
 		return -2
 	}
-	pos, err := tape_next(tp, schedSelectKind, site)
-	if err != nil {
+	if tp[tpDiverged] != 0 {
+		return -1
+	}
+	pos := sched_select_at(tp, site)
+	if pos < 0 {
+		tape_diverge(tp, "replay: divergence at effect " + rt_i64str(tp[tpSeq]) + ": select at " + site + " has no record")
 		return -1
 	}
 	data := tape_data(tp, pos)
 	if len(data) != 8 {
-		tape_diverge(tp, "replay: divergence at effect " + rt_i64str(tp[tpSeq]-1) + ": select at " + site + " recorded " + rt_i64str(len(data)) + " bytes, not an arm")
+		tape_diverge(tp, "replay: divergence at effect " + rt_i64str(tp[tpSeq]) + ": select at " + site + " recorded " + rt_i64str(len(data)) + " bytes, not an arm")
 		return -1
 	}
 	arm := (cast(i64, data) + 8)[0]
 	if arm < 0 || arm > n {
-		tape_diverge(tp, "replay: divergence at effect " + rt_i64str(tp[tpSeq]-1) + ": select at " + site + " has " + rt_i64str(n) + " arms, recorded arm " + rt_i64str(arm))
+		tape_diverge(tp, "replay: divergence at effect " + rt_i64str(tp[tpSeq]) + ": select at " + site + " has " + rt_i64str(n) + " arms, recorded arm " + rt_i64str(arm))
 		return -1
 	}
 	return arm
 }
 
-// rt_sched_select_end appends the arm a recording select took; replaying, an arm other than
-// the recorded one (a cancelled boundary ends any select) is a divergence.
+// sched_select_at is the offset of the running task's record of the select at site: the next
+// record, or the one after its next sched.resume; -1 when there is none.
+func sched_select_at(tp i64, site str) i64 {
+	pos := tp[tpPos]
+	if sched_is(tp, pos, schedSelectKind, site) {
+		return pos
+	}
+	me := sched_num(curTask)
+	for pos < tp[tpLen] {
+		if sched_is(tp, pos, schedResumeKind, "") && sched_word(tp, pos) == me {
+			next := tape_skip(tp, pos)
+			if sched_is(tp, next, schedSelectKind, site) {
+				return next
+			}
+		}
+		pos = tape_skip(tp, pos)
+	}
+	return -1
+}
+
+// sched_is reports whether the record at pos has this kind and key.
+func sched_is(tp i64, pos i64, kind str, key str) bool {
+	if pos >= tp[tpLen] {
+		return false
+	}
+	b := tp[tpBuf]
+	rkind := tape_field(b, pos+8)
+	return rt_str_eq(rkind, kind) && rt_str_eq(tape_field(b, pos+16+len(rkind)), key)
+}
+
+// sched_word is the word result of the record at pos, or -1.
+func sched_word(tp i64, pos i64) i64 {
+	d := tape_data(tp, pos)
+	if len(d) != 8 {
+		return -1
+	}
+	return (cast(i64, d) + 8)[0]
+}
+
+// rt_select_now reports whether a replaying select's record is the next one: the recorded
+// select did not wait, so its after(d) arm counts as due whatever the clock says.
+func rt_select_now(site str) bool {
+	t := curTask
+	if t == 0 || t[tTape]&1 != 0 {
+		return false
+	}
+	tp := t[tTape]
+	return tp != 0 && sched_is(tp, tp[tpPos], schedSelectKind, site)
+}
+
+// rt_sched_select_end appends the arm a recording select took; replaying, it takes the
+// select's record, and an arm other than the recorded one (a cancelled boundary ends any
+// select) is a divergence.
 func rt_sched_select_end(tp i64, site str, state i64, arm i64) {
 	if state == -2 {
-		w := rt_alloc(8)
-		w[0] = arm
-		tape_add(tp, schedSelectKind, site, 0, 0, w, 8)
+		tape_add_word(tp, schedSelectKind, site, arm)
 		return
 	}
-	if state >= 0 && arm != state {
+	if state < 0 {
+		return
+	}
+	pos, err := tape_next(tp, schedSelectKind, site)
+	if err != nil {
+		return
+	}
+	if arm != sched_word(tp, pos) {
 		tape_diverge(tp, "replay: divergence at effect " + rt_i64str(tp[tpSeq]-1) + ": select at " + site + " took arm " + rt_i64str(arm) + ", recorded arm " + rt_i64str(state))
 	}
 }
@@ -49,4 +111,297 @@ func tape_data(tp i64, pos i64) str {
 	pos += 8 + (b + pos)[0]
 	pos += 8 + (b + pos)[0]
 	return tape_field(b, pos+16)
+}
+
+// ---- task numbers and resume order (sched.resume@1) ----
+
+const schedResumeKind = "sched.resume@1"
+
+// The scheduling state of a tape (tpSched), malloc'd words.
+const ssNext = 0  // the number the next child of the request gets
+const ssTasks = 1 // the request's tasks: [capacity, count, task...] (its first task, then children)
+const ssHeld = 2  // replaying: tasks woken before their turn, held off the run queue
+const ssWait = 3  // replaying: tasks whose effect or select is not the next record
+const ssWords = 4
+
+// sched_state is tape tp's scheduling state, made at first use.
+func sched_state(tp i64) i64 {
+	st := tp[tpSched]
+	if st == 0 {
+		st = calloc(ssWords, 8)
+		st[ssNext] = 1
+		st[ssTasks] = sched_list_new()
+		st[ssHeld] = sched_list_new()
+		st[ssWait] = sched_list_new()
+		tp[tpSched] = st
+	}
+	return st
+}
+
+// rt_sched_free frees tape tp's scheduling state.
+func rt_sched_free(tp i64) {
+	st := tp[tpSched]
+	if st == 0 {
+		return
+	}
+	free(st[ssTasks])
+	free(st[ssHeld])
+	free(st[ssWait])
+	free(st)
+	tp[tpSched] = 0
+}
+
+// A list is [capacity, count, task...], malloc'd; sched_list_add may move it.
+func sched_list_new() i64 {
+	l := malloc(8 * 10)
+	l[0] = 8
+	l[1] = 0
+	return l
+}
+
+func sched_list_add(st i64, w i64, t i64) {
+	l := st[w]
+	if l[1] == l[0] {
+		l = realloc(l, 8*(2+2*l[0]))
+		l[0] = 2 * l[0]
+		st[w] = l
+	}
+	l[2+l[1]] = t
+	l[1]++
+}
+
+func sched_list_has(l i64, t i64) bool {
+	for i := 0; i < l[1]; i++ {
+		if l[2+i] == t {
+			return true
+		}
+	}
+	return false
+}
+
+func sched_list_drop(l i64, t i64) {
+	for i := 0; i < l[1]; i++ {
+		if l[2+i] == t {
+			l[2+i] = l[2+l[1]-1]
+			l[1]--
+			return
+		}
+	}
+}
+
+// sched_num is task t's number in its request: 0 for the request's own task, else its spawn
+// number.
+func sched_num(t i64) i64 {
+	r := t[tChild]
+	if r == 0 {
+		return 0
+	}
+	return r[spNum]
+}
+
+// sched_know adds the request's first task (number 0) to the tasks of tp once it is seen.
+func sched_know(st i64, t i64) {
+	if sched_num(t) == 0 && !sched_list_has(st[ssTasks], t) {
+		sched_list_add(st, ssTasks, t)
+	}
+}
+
+// rt_sched_spawned gives child record r of a task on tape tp the next number of the request.
+func rt_sched_spawned(tp i64, r i64) {
+	st := sched_state(tp)
+	if curTask != 0 {
+		sched_know(st, curTask)
+	}
+	r[spNum] = st[ssNext]
+	st[ssNext]++
+	sched_list_add(st, ssTasks, r[spTask])
+}
+
+// rt_sched_ended drops child task t, which ended, from the tasks of tape tp.
+func rt_sched_ended(tp i64, t i64) {
+	st := tp[tpSched]
+	if st != 0 {
+		sched_list_drop(st[ssTasks], t)
+	}
+}
+
+// tape_add_word appends a record whose result is the word v.
+func tape_add_word(tp i64, kind str, key str, v i64) {
+	tape_word(tp, tp[tpSeq])
+	tape_bytes(tp, cast(i64, kind)+8, len(kind))
+	tape_bytes(tp, cast(i64, key)+8, len(key))
+	tape_word(tp, 0)
+	tape_word(tp, 0)
+	tape_word(tp, 8)
+	tape_word(tp, v)
+	tp[tpSeq]++
+}
+
+// rt_sched_resume is called before task t (with a tape) is switched in. Recording, it appends
+// sched.resume@1 with t's number. Replaying, t runs only when that is the next record (which
+// it takes); otherwise t is held until a record is taken, and false is returned. A task inside
+// an effect's live call (its tape suspended) is not an event.
+func rt_sched_resume(t i64) bool {
+	tp := t[tTape]
+	if tp&1 != 0 {
+		return true
+	}
+	if tp[tpMode] != tapeReplay {
+		tape_add_word(tp, schedResumeKind, "", sched_num(t))
+		return true
+	}
+	if tp[tpDiverged] != 0 {
+		return true
+	}
+	st := sched_state(tp)
+	sched_know(st, t)
+	pos := tp[tpPos]
+	if pos < tp[tpLen] {
+		b := tp[tpBuf]
+		rkind := tape_field(b, pos+8)
+		if rt_str_eq(rkind, schedResumeKind) {
+			data := tape_data(tp, pos)
+			if len(data) == 8 && (cast(i64, data) + 8)[0] == sched_num(t) {
+				tp[tpPos] = tape_skip(tp, pos)
+				tp[tpSeq]++
+				rt_sched_took(tp)
+				return true
+			}
+		}
+	}
+	sched_list_add(st, ssHeld, t)
+	sched_stall(tp, t)
+	return false
+}
+
+// rt_sched_held reports whether task t is held for its turn.
+func rt_sched_held(t i64) bool {
+	tp := t[tTape] & -2
+	return tp != 0 && tp[tpSched] != 0 && sched_list_has(tp[tpSched][ssHeld], t)
+}
+
+// rt_sched_took lets the tasks waiting for their turn try again: a record was taken.
+func rt_sched_took(tp i64) {
+	st := tp[tpSched]
+	if st == 0 {
+		return
+	}
+	sched_wake(st)
+}
+
+// rt_sched_release lets every waiting task of tape tp go on (the replay diverged).
+func rt_sched_release(tp i64) {
+	rt_sched_took(tp)
+}
+
+func sched_wake(st i64) {
+	h := st[ssHeld]
+	for h[1] > 0 {
+		h[1]--
+		rt_task_queue(h[2+h[1]])
+	}
+	w := st[ssWait]
+	for w[1] > 0 {
+		w[1]--
+		rt_task_wake(w[2+w[1]])
+	}
+}
+
+// rt_sched_wait_turn parks the running task until a record is taken, when its effect or
+// select is not the next record of replaying tape tp and another task of the request can
+// still move on; false when nothing can: the replay diverged.
+func rt_sched_wait_turn(tp i64) bool {
+	t := curTask
+	if t == 0 || t[tTape] != tp || tp[tpMode] != tapeReplay {
+		return false
+	}
+	st := sched_state(tp)
+	sched_know(st, t)
+	sched_list_add(st, ssWait, t)
+	if !sched_moving(tp, st) {
+		sched_list_drop(st[ssWait], t)
+		return false
+	}
+	// Its wake is not an event: in the recording it waited inside the effect's live call.
+	t[tTape] = tp | 1
+	if rt_bnd_current()[bCancel] != 0 {
+		rt_task_defer()
+	} else {
+		rt_task_park(0)
+	}
+	t[tTape] = tp
+	sched_list_drop(st[ssWait], t)
+	return true
+}
+
+// rt_sched_stopped is called when task t (with a tape) waited or ended: replaying, if no task
+// of its request can move on while some wait for their turn, the replay diverged.
+func rt_sched_stopped(t i64) {
+	tp := t[tTape] & -2
+	if tp == 0 || tp[tpMode] != tapeReplay || tp[tpDiverged] != 0 || tp[tpSched] == 0 {
+		return
+	}
+	sched_stall(tp, 0)
+}
+
+// sched_stall diverges replaying tape tp when tasks wait for their turn and none can move on.
+func sched_stall(tp i64, held i64) {
+	st := tp[tpSched]
+	if st[ssHeld][1]+st[ssWait][1] == 0 || sched_moving(tp, st) {
+		return
+	}
+	pos := tp[tpPos]
+	what := "nothing more"
+	if pos < tp[tpLen] {
+		b := tp[tpBuf]
+		rkind := tape_field(b, pos+8)
+		what = rkind + " " + tape_quote(tape_field(b, pos+16+len(rkind)))
+		if rt_str_eq(rkind, schedResumeKind) || rt_str_eq(rkind, schedSelectKind) {
+			d := tape_data(tp, pos)
+			if len(d) == 8 {
+				what = what + " " + rt_i64str((cast(i64, d) + 8)[0])
+			}
+		}
+	}
+	who := "no task of the request can go on"
+	if held != 0 {
+		who = "task " + rt_i64str(sched_num(held)) + " resumed"
+	}
+	tape_diverge(tp, "replay: divergence at effect " + rt_i64str(tp[tpSeq]) + ": " + who + ", recorded " + what)
+}
+
+// sched_moving reports whether a task of tape tp's request can move on without a record being
+// taken: it is ready or running, inside an effect's live call, waiting for a descriptor, or
+// waiting with a timer that will end its wait.
+func sched_moving(tp i64, st i64) bool {
+	l := st[ssTasks]
+	for i := 0; i < l[1]; i++ {
+		t := l[2+i]
+		if t[tTape]&-2 != tp || t[tDone] != 0 {
+			continue
+		}
+		if sched_list_has(st[ssHeld], t) || sched_list_has(st[ssWait], t) {
+			continue
+		}
+		if t[tWaiting] == 0 || t[tTape]&1 != 0 || t[tWaitFd] >= 0 {
+			return true
+		}
+		if sched_timed(t) {
+			return true
+		}
+	}
+	return false
+}
+
+// sched_timed reports whether a timer entry will end task t's current wait.
+func sched_timed(t i64) bool {
+	if t[tTimers] == 0 {
+		return false
+	}
+	for i := 0; i < timerN; i++ {
+		if timerHeap[3*i+1] == t && timerHeap[3*i+2] == t[tGen] {
+			return true
+		}
+	}
+	return false
 }
