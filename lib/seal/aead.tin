@@ -2,14 +2,19 @@ package seal
 
 // ---- authenticated encryption with associated data ----
 
-// AEAD is an authenticated cipher with its key (ChaCha20-Poly1305, later AES-GCM): Seal
-// encrypts and appends a 16-byte tag, Open checks the tag in constant time and decrypts.
+// AEAD is an authenticated cipher with its key (AES-GCM or ChaCha20-Poly1305): Seal encrypts
+// and appends a 16-byte tag, Open checks the tag in constant time and decrypts.
 type AEAD struct {
 	kind i64
-	key  []u8
+	key  []u8  // ChaCha20-Poly1305: the key
+	rk   []u64 // AES: the bitsliced round keys
+	nr   i64   // AES: the number of rounds
+	h0   u64   // GCM: H with its bits reversed, low half
+	h1   u64   // GCM: high half
 }
 
 const aeadChaCha = 1
+const aeadAESGCM = 2
 
 // NewChaCha20Poly1305 is the RFC 8439 AEAD with a 32-byte key.
 func NewChaCha20Poly1305(key secret []u8) !AEAD {
@@ -18,7 +23,7 @@ func NewChaCha20Poly1305(key secret []u8) !AEAD {
 	}
 	k := make([]u8, 32)
 	copy(k, key)
-	return AEAD{kind: aeadChaCha, key: k}
+	return AEAD{kind: aeadChaCha, key: k, rk: []u64{}}
 }
 
 // NonceSize is the nonce length in bytes (12).
@@ -37,6 +42,9 @@ func (a AEAD) Seal(nonce []u8, plaintext secret []u8, aad []u8) ![]u8 {
 	if len(nonce) != 12 {
 		fail "seal: AEAD nonce must be 12 bytes"
 	}
+	if a.kind == aeadAESGCM {
+		return gcm_seal(a, nonce, plaintext, aad)
+	}
 	return chacha_seal(a.key, nonce, plaintext, aad)
 }
 
@@ -45,6 +53,9 @@ func (a AEAD) Seal(nonce []u8, plaintext secret []u8, aad []u8) ![]u8 {
 func (a AEAD) Open(nonce []u8, sealed []u8, aad []u8) ![]u8 {
 	if len(nonce) != 12 {
 		fail "seal: AEAD nonce must be 12 bytes"
+	}
+	if a.kind == aeadAESGCM {
+		return try gcm_open(a, nonce, sealed, aad)
 	}
 	return try chacha_open(a.key, nonce, sealed, aad)
 }

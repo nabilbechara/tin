@@ -4,7 +4,11 @@
 //
 //	go run ./bench/ref/x509_pki DIR
 //
+<<<<<<< HEAD
 // tls_sigs.txt: "CERT SCHEME MSGHEX SIGHEX" lines, TLS 1.3 signatures by the named certificate's key.
+=======
+// tls_sigs.txt: "SCHEME MSGHEX SIGHEX" lines, RSA-PSS signatures by the "leaf" key.
+>>>>>>> origin/main
 //
 // cases.txt: a "now UNIX" line, then one line per case:
 //
@@ -302,6 +306,7 @@ func main() {
 	leaf("leaf-twin", "inter-twin-new", nil)
 	add("expired-and-valid-issuer", "www.example.com", "server", "leaf-twin", "inter-twin-old,inter-twin-new", "root", "OK 3")
 
+<<<<<<< HEAD
 	// ECDSA chains: P-256 root, P-384 intermediate; and an ECDSA intermediate under the RSA root.
 	ecRootKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	check(err)
@@ -324,6 +329,8 @@ func main() {
 	add("good-rsa-root-ecdsa-intermediate", "www.example.com", "server", "leaf-under-ec-rsa", "inter-ec-under-rsa", "root", "OK 3")
 	add("ecdsa-intermediate-wrong-root", "www.example.com", "server", "leaf-under-ec-rsa", "inter-ec-under-rsa", "ec-root", "unknown-authority")
 
+=======
+>>>>>>> origin/main
 	// TLS 1.3 CertificateVerify-style RSA-PSS signatures by the leaf's key (salt = hash length).
 	var sigs []string
 	msg := []byte(strings.Repeat(" ", 64) + "TLS 1.3, server CertificateVerify\x00transcript")
@@ -335,6 +342,7 @@ func main() {
 		d.Write(msg)
 		sig, err := rsa.SignPSS(rand.Reader, keys["leaf"].(*rsa.PrivateKey), sc.h, d.Sum(nil), &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash})
 		check(err)
+<<<<<<< HEAD
 		sigs = append(sigs, fmt.Sprintf("leaf %d %x %x", sc.code, msg, sig))
 	}
 	// ECDSA signatures (0x0403 with P-256 and SHA-256, 0x0503 with P-384 and SHA-384).
@@ -348,6 +356,9 @@ func main() {
 		sig, err := ecdsa.SignASN1(rand.Reader, keys[sc.cert].(*ecdsa.PrivateKey), d.Sum(nil))
 		check(err)
 		sigs = append(sigs, fmt.Sprintf("%s %d %x %x", sc.cert, sc.code, msg, sig))
+=======
+		sigs = append(sigs, fmt.Sprintf("%d %x %x", sc.code, msg, sig))
+>>>>>>> origin/main
 	}
 	check(os.WriteFile(filepath.Join(dir, "tls_sigs.txt"), []byte(strings.Join(sigs, "\n")+"\n"), 0o644))
 
