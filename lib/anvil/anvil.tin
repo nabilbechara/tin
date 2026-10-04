@@ -321,6 +321,7 @@ func serve_on(addr str, n i64) ! {
 	// SIGTERM and SIGINT are blocked in every thread (cores inherit this mask) and taken by
 	// core 0's event loop instead: a handler could run on any thread and no Tin code may.
 	rt_sig_block_term()
+	record_setup(n) // TIN_REPLAY_DIR: requests are recorded for replay (#241)
 	hearth.Run(n, core)
 }
 
@@ -1224,9 +1225,15 @@ func serve_one(c i64, p i64, n i64) i64 {
 	if gDeadlineMs > 0 {
 		rt_task_set_deadline(task, rt_mono_ns()+gDeadlineMs*1000000)
 	}
+	if gRecord {
+		record_start(task, p, total)
+	}
 	if rt_task_run(task) {
 		if rt_task_panicked(task) {
 			panicked(c, task)
+		}
+		if gRecord {
+			record_end(task)
 		}
 		rt_task_free(task)
 		if !alive || draining {
@@ -1275,6 +1282,9 @@ func run_request(c i64) {
 		gHandler(q, mut w)
 	}
 	if c[cHijack] == 0 {
+		if gRecord {
+			record_status(w.code)
+		}
 		respond_out(w, hd, keep10)
 	}
 }
@@ -1292,6 +1302,9 @@ func finish_request(c i64, task i64) {
 	free(task[tUser+1])
 	if rt_task_panicked(task) && c[cHijack] == 0 && c[cDead] == 0 {
 		panicked(c, task)
+	}
+	if gRecord {
+		record_end(task)
 	}
 	rt_task_free(task)
 	if c[cHijack] != 0 {

@@ -6,10 +6,14 @@ import hashlib
 import hmac
 import os
 from pathlib import Path
+import random
 import shutil
+import signal
+import socket
 import struct
 import subprocess
 import tempfile
+import time
 from suite import ROOT
 
 EXPECTED = '''\
@@ -186,6 +190,138 @@ def capsules(work, env):
           'the envelope opens with the key only; the spool bound deletes the oldest')
 
 
+def free_port():
+    """A free port below the ephemeral ranges (as task_check.py picks one)."""
+    for _ in range(500):
+        port = random.randint(20000, 30000)
+        with socket.socket() as s:
+            try:
+                s.bind(('127.0.0.1', port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError('no free port below the ephemeral range')
+
+
+def http(port, raw):
+    s = socket.create_connection(('127.0.0.1', port), timeout=10)
+    s.sendall(raw)
+    data = b''
+    while True:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+    s.close()
+    return data
+
+
+def recording(work, env):
+    """anvil records requests: the capsules of the ones that fail, panic or are sampled are kept,
+    with the request as received (secret headers as handles) and its effects in order."""
+    lib = work / 'lib/replayrecord'
+    lib.mkdir()
+    shutil.copy(ROOT / 'tools/ci/fixtures/replay_record_probe.tin', lib / 'probe.tin')
+    exe = work / 'replay_record'
+    subprocess.run([str(ROOT / 'bin/tinc'), '-o', str(exe), 'tools/ci/fixtures/replay_record.tin'],
+                   check=True, env=env, cwd=ROOT, timeout=60)
+    failures = []
+
+    def check(name, got, want):
+        if got != want:
+            failures.append(f'{name}: got {got!r}, want {want!r}')
+
+    def serve(spool, requests, **extra):
+        port = free_port()
+        run_env = {k: v for k, v in os.environ.items() if not k.startswith('TIN_REPLAY_')}
+        run_env.update(PORT=str(port), TIN_CORES='2', TIN_REPLAY_KEY=CAPSULE_KEY.hex())
+        if spool is not None:
+            run_env['TIN_REPLAY_DIR'] = str(spool)
+        run_env.update(extra)
+        server = subprocess.Popen([str(exe)], env=run_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        answers = []
+        try:
+            for _ in range(200):
+                try:
+                    socket.create_connection(('127.0.0.1', port), timeout=0.1).close()
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            for raw in requests:
+                answers.append(http(port, raw))
+        finally:
+            server.send_signal(signal.SIGTERM)
+            out, err = server.communicate(timeout=30)
+        return answers, err.decode()
+
+    def request(path, extra=''):
+        return (f'GET {path} HTTP/1.1\r\nHost: shop\r\nAuthorization: Bearer s3cr3t-token\r\n{extra}'
+                'Connection: close\r\n\r\n').encode()
+
+    def kept(spool):
+        out = {}
+        for p in sorted(spool.iterdir()):
+            body = open_capsule(p.read_bytes())
+            if body is None:
+                failures.append(f'{p.name}: does not open with the key')
+                continue
+            c = decode_body(body)
+            out[c['request'].split(b' ')[1].decode()] = c
+            for secret in SECRETS:
+                if secret in p.read_bytes() or secret in body:
+                    failures.append(f'secret text {secret!r} in capsule {p.name}')
+        return out
+
+    spool = work / 'spool-anvil'
+    paths = ['/cart/7', '/cart/7?fail=1', '/cart/8?panic=1', '/cart/9?wait=1&fail=1']
+    answers, err = serve(spool, [request(p, 'Cookie: sid=c00k1e\r\n') for p in paths])
+    check('statuses', [a.split(b' ')[1] for a in answers], [b'200', b'504', b'500', b'504'])
+    caps = kept(spool)
+    check('kept', sorted(caps), ['/cart/7?fail=1', '/cart/8?panic=1', '/cart/9?wait=1&fail=1'])
+    handle = secret_handle(b'Bearer s3cr3t-token')
+    charge = 'POST http://payments/charge\n\ncart=2 books'
+    c = caps.get('/cart/7?fail=1')
+    if c:
+        check('request as received', c['request'],
+              ('GET /cart/7?fail=1 HTTP/1.1\r\nHost: shop\r\nAuthorization: ' + handle + '\r\nCookie: ' +
+               secret_handle(b'sid=c00k1e') + '\r\nConnection: close\r\n\r\n').encode())
+        check('status and flags', (c['status'], c['flags'], c['panic']), (504, 0, b''))
+        check('effects in order', [e[1:] for e in c['effects']], [
+            ('redis@1', 'GET cart:7', 0, 0, b'2 books'),
+            ('wire.http@1', charge, 1, 2, b'payments: deadline exceeded')])
+        if abs(c['wall'] - time.time_ns()) > 600 * 10**9:
+            failures.append(f'wall clock {c["wall"]} is not now')
+        check('program', c['program'], str(exe).encode())
+    c = caps.get('/cart/8?panic=1')
+    if c:
+        check('panicked', (c['status'], c['flags'], c['panic'], len(c['effects'])),
+              (500, 1, b'checkout: cart 2 books', 1))
+    c = caps.get('/cart/9?wait=1&fail=1')
+    if c:
+        check('a request that waited', (c['status'], [e[1] for e in c['effects']]), (504, ['redis@1', 'wire.http@1']))
+    # TIN_REPLAY_SAMPLE=1 keeps a 200 too.
+    spool = work / 'spool-anvil-sample'
+    serve(spool, [request('/cart/3')], TIN_REPLAY_SAMPLE='1')
+    caps = kept(spool)
+    check('sampled', [(k, c['status'], c['flags']) for k, c in caps.items()], [('/cart/3', 200, 2)])
+    # Recording off: no spool, and the server answers the same.
+    answers, err = serve(None, [request('/cart/7?fail=1')])
+    check('off', answers[0].split(b' ')[1], b'504')
+    # A malformed key: the server serves, says once that recording is off, and writes nothing.
+    spool = work / 'spool-anvil-badkey'
+    answers, err = serve(spool, [request('/cart/7?fail=1')], TIN_REPLAY_KEY='zz')
+    check('bad key', (answers[0].split(b' ')[1], err.count('recording is off'), spool.exists()), (b'504', 1, False))
+    # A process that replays a capsule (TIN_REPLAY_CAPSULE, #242) records nothing.
+    spool = work / 'spool-anvil-replaying'
+    serve(spool, [], TIN_REPLAY_CAPSULE=str(work / 'none.tcap'))
+    check('replaying records nothing', spool.exists(), False)
+    (ROOT / 'bin/ci/replay/recording.log').write_text('\n'.join(failures))
+    if failures:
+        raise SystemExit('FAIL replay recording:\n' + '\n'.join(failures))
+    print('PASS replay recording: anvil keeps the capsules of failed, panicked and sampled requests, '
+          'with the request (secrets as handles) and its effects in order')
+
+
 def main():
     out = ROOT / 'bin/ci/replay'
     out.mkdir(parents=True, exist_ok=True)
@@ -206,6 +342,7 @@ def main():
             raise SystemExit('FAIL replay tapes: output differs\n--- want\n' + EXPECTED +
                              '--- got\n' + result.stdout)
         capsules(work, env)
+        recording(work, env)
     print('PASS replay tapes: record, replay without live calls, fault identity, divergence, live kinds, children share the tape, panics on it')
 
 
