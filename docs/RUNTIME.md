@@ -183,6 +183,9 @@ with the raw syscall as fallback. Generated
 Linux programs do not import syscall or the removed OS entry points.
 
 UTC calendar/Date formatting, errno messages and Linux backtrace lookup are Tin code.
+Darwin errno codes 0..106 use the stable Tin message table. Newer/unknown codes
+retain libSystem text because code assignments vary between macOS development releases.
+Linux errno messages use Tin exclusively.
 Linux TTY detection uses ioctl TCGETS, hostname uses uname, and sleeps use nanosleep.
 Environment, auxv, pthread startup and dynamic ELF remain for the final cutover.
 

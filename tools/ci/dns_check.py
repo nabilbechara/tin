@@ -270,7 +270,30 @@ def main():
                 assert listener.wait(timeout=5)==0,listener.stderr.read()
             finally:
                 if listener.poll() is None:listener.terminate();listener.wait(timeout=5)
-            print('PASS DNS: hosts precedence, A/AAAA, CNAMEs, compressed-name bounds, UDP/TCP fragments, NXDOMAIN, search, ndots, rotate, attempts, timeout, concurrent request deadlines')
+            client=work/'ipv6-client'
+            subprocess.run([str(compiler),'-o',str(client),'tools/ci/fixtures/ipv6_client.tin'],check=True,cwd=ROOT,env=dict(os.environ,TIN_ROOT=str(work)),timeout=60)
+            # Exercise connect's IPv6 family/length for both literals and AAAA answers.
+            with socket.socket(socket.AF_INET6,socket.SOCK_STREAM) as echo:
+                echo.bind(('::1',0));echo.listen(2);echo.settimeout(5)
+                chosen=echo.getsockname()[1]
+                def echo_clients():
+                    for _ in range(2):
+                        c,_=echo.accept()
+                        with c:
+                            c.settimeout(3);data=b''
+                            while len(data)<4:
+                                chunk=c.recv(4-len(data))
+                                assert chunk,'IPv6 client closed early'
+                                data+=chunk
+                            assert data==b'IPv6'
+                            c.sendall(data)
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    pending=pool.submit(echo_clients)
+                    for host in ('[::1]','v6.test.'):
+                        got=subprocess.run([str(client),host+':'+str(chosen)],env=env,capture_output=True,timeout=5)
+                        assert got.returncode==0 and got.stdout==b'IPv6\n',got
+                    pending.result(timeout=5)
+            print('PASS DNS: hosts precedence, A/AAAA, CNAMEs, compressed-name bounds, UDP/TCP fragments, IPv6 listen/dial, NXDOMAIN, search, ndots, rotate, attempts, timeout, concurrent request deadlines')
     finally:
         dns.close()
 
