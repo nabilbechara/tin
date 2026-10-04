@@ -190,14 +190,40 @@ def handler_limit(out):
         for path, got in results:
             assert got == (limited if path == '/limited' else (200, b'plain ok')), (path, got)
         assert len(results) == 24, results
+        # q.Body() into a bounded type (#240): up to the bound it is the body; past it,
+        # fault.LimitExceeded.
+        for body, want in ((b'sixteen bytes ok', b'upload 16: sixteen bytes ok'),
+                           (b'seventeen bytes!!', b'upload: length 17 is over the bound 16: limit exceeded true'),
+                           (b'x' * 100000, b'upload: length 100000 is over the bound 16: limit exceeded true'),
+                           (b'', b'upload 0: ')):
+            assert post(port, '/upload', body) == (200, want), (len(body), post(port, '/upload', body))
         assert server.poll() is None, 'server exited'
     finally:
         server.terminate()
         server.wait(timeout=5)
     err = server.stderr.read().decode(errors='replace')
     assert 'panic' not in err, err[-1000:]
+    # The body's length is checked before it is copied.
+    asm = subprocess.run([str(ROOT / 'bin/tinc'), '-edition', '1', '-S', 'tools/ci/fixtures/limits.tin'],
+                         cwd=ROOT, env=dict(os.environ, TIN_ROOT=str(ROOT)), check=True,
+                         capture_output=True, text=True).stdout
+    assert 'BodyBound' in asm, 'bound(q.Body()) copies the body before checking its length'
     print('handler limit: a limit block past its budget gives fault.LimitExceeded to its handler; '
-          'the server keeps serving')
+          'q.Body() into a bounded str is checked before it is copied; the server keeps serving')
+
+
+def post(port, path, body):
+    with socket.create_connection(('127.0.0.1', port), timeout=10) as s:
+        s.sendall(('POST %s HTTP/1.1\r\nHost: x\r\nContent-Length: %d\r\nConnection: close\r\n\r\n'
+                   % (path, len(body))).encode() + body)
+        data = b''
+        while True:
+            part = s.recv(65536)
+            if not part:
+                break
+            data += part
+    head, _, rest = data.partition(b'\r\n\r\n')
+    return int(head.split()[1]), rest
 
 
 def main():

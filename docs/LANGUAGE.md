@@ -1058,7 +1058,8 @@ err2 := argo.Get(text, mut xs)      // appends decoded elements
   assignment or a `return`) and which fails with `fault.LimitExceeded` when `x` is longer.
   A str literal within the bound fits. `append` and `+` give the unbounded type. `argo.Get`
   enforces bounds while reading: a str stops at its bound and a slice or map before the
-  element past it, failing with `fault.LimitExceeded` without reading the rest. `max` after
+  element past it, failing with `fault.LimitExceeded` without reading the rest, and
+  `try bound(q.Body())` checks an anvil request body's length before copying it. `max` after
   `[]T` or `map[K]V` bounds the slice or map; for a slice of bounded strs, name the element
   type (`type Tag str max 20`, then `[]Tag`).
 
