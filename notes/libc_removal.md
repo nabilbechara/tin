@@ -315,3 +315,29 @@ clock leaf loads the shared vDSO pointer and calls its C ABI directly, retaining
 raw clock_gettime fallback, argument preservation and ABI stack alignment. Legacy
 compiler wrappers retain their seed-compatible error storage. The relocation-free
 leaves are regenerated from the recorded per-CPU numbers by gen_syscall_fast.py.
+
+## Phase 4 implementation and validation
+
+Linux DNS is Tin code behind wire.resolve: hosts first, resolv.conf search/domain and
+ndots/timeout/attempts/rotate, A before AAAA, bounded CNAME/compression handling,
+connected UDP with transaction/question verification and TCP fallback on truncation.
+Socket waits and file helpers preserve request deadlines; an explicit DialTimeout also
+limits DNS and connect. The supported contract and differences from NSS/getaddrinfo
+are documented in STDLIB/PORTING. Test config overrides require TIN_DNS_TEST=1.
+Fake-server CI covers protocol/configuration cases, Go reference answers, IPv6 socket
+round trips, six overlapping deadline-bound queries, fast requests during those waits,
+and bounded RSS after 1000 lookups.
+
+The linker emits a dedicated read-only image-relative Tin backtrace table on both Linux
+CPUs. Native checks exercise every reached function's first/last instruction and gaps.
+Calendar fields and full HTTP Date text match Go and the former C path for 2010 cases;
+all errno text is compared to the host's former C API. TTY/hostname/affinity/page probes
+and compiler root discovery/path traversal compare exact behavior. Darwin keeps the
+existing libSystem OS/thread/DNS layer; shared memory/number/calendar/errno code stays
+seed-compatible. Pthreads, libc environment/auxv and dynamic ELF remain until phase 5.
+
+
+Darwin development compatibility: errno 107 is unknown on macOS 15.0.1 but is
+"Capabilities insufficient" on the current macos-15 runner. The fixed Darwin table
+keeps codes 0..106; newer/unknown codes retain libSystem spelling. Linux error text
+remains entirely Tin. The exact C comparison covers both development OS releases.

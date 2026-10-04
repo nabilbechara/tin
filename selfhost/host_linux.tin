@@ -13,12 +13,68 @@ fn host_dirent_name(ent) {
     return ent + 19;
 }
 
-extern fn sysconf(name);
+extern fn getauxval(key);
 fn host_mem_flags() { return 0x22; }
-fn host_mem_page() { return sysconf(30); }
+fn host_mem_page() { return getauxval(6); }
 
 var hostError;
 fn linux_set_errno(e) { hostError=e; }
 fn linux_get_errno() { return hostError; }
 fn linux_restorer_ptr() { return 0; }
 fn linux_vdso_clock(id,ts) { return linux_raw(linux_nr_clock_gettime(),id,ts,0,0,0,0); }
+
+// Canonicalization follows Linux symlinks before reducing .., with PATH_MAX and hop bounds.
+fn host_realpath_work(path, resolved, pending, target, merged, st) {
+    let n=strlen(path);
+    if n == 0 || n >= 4096 { return 0; }
+    if load8(path) == '/' { memcpy(pending,path,n+1); } else {
+        if !rt_sys_getcwd(target,4096) { return 0; }
+        let cwd=strlen(target);
+        if cwd+n+1 >= 4096 { return 0; }
+        memcpy(pending,target,cwd); store8(pending+cwd,'/'); memcpy(pending+cwd+1,path,n+1);
+    }
+    let used=1; store8(resolved,'/'); store8(resolved+1,0);
+    let cursor=0; let hops=0;
+    while 1 {
+        while load8(pending+cursor) == '/' { cursor=cursor+1; }
+        if load8(pending+cursor) == 0 { return resolved; }
+        let begin=cursor;
+        while load8(pending+cursor) != 0 && load8(pending+cursor) != '/' { cursor=cursor+1; }
+        let len=cursor-begin;
+        if len == 1 && load8(pending+begin) == '.' { continue; }
+        if len == 2 && load8(pending+begin) == '.' && load8(pending+begin+1) == '.' {
+            while used > 1 && load8(resolved+used-1) != '/' { used=used-1; }
+            if used > 1 { used=used-1; }
+            store8(resolved+used,0);
+            continue;
+        }
+        let parent=used;
+        if used > 1 { store8(resolved+used,'/'); used=used+1; }
+        if used+len >= 4096 { return 0; }
+        memcpy(resolved+used,pending+begin,len); used=used+len; store8(resolved+used,0);
+        if rt_sys_lstat(resolved,st) != 0 { return 0; }
+        let kind=linux_stat_type(st);
+        if kind == 10 {
+            hops=hops+1; if hops > 40 { return 0; }
+            let k=rt_sys_readlink(resolved,target,4096);
+            if k <= 0 || k >= 4096 { return 0; }
+            store8(target+k,0);
+            let rest=strlen(pending+cursor);
+            if k+rest >= 4096 { return 0; }
+            memcpy(merged,target,k); memcpy(merged+k,pending+cursor,rest+1);
+            memcpy(pending,merged,k+rest+1); cursor=0;
+            used=parent;
+            if load8(target) == '/' { used=1; }
+            store8(resolved+used,0);
+        } else if load8(pending+cursor) != 0 && kind != 4 { return 0; }
+    }
+    return 0;
+}
+
+fn host_realpath(path,resolved) {
+    let pending=calloc(4096,1); let target=calloc(4096,1);
+    let merged=calloc(4096,1); let st=calloc(256,1);
+    let result=host_realpath_work(path,resolved,pending,target,merged,st);
+    free(pending); free(target); free(merged); free(st);
+    return result;
+}
