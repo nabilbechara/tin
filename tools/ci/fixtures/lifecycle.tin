@@ -1,0 +1,76 @@
+package main
+
+import "anvil"
+import "hearth"
+import "quarry"
+import "say"
+import "tide"
+
+// Store stands for a connection pool: one per core, opened when the core starts.
+type Store struct {
+	core i64
+}
+
+fn (s Store) Close() ! {
+	say.Line("close store", s.core)
+}
+
+fn openStore() !Store {
+	if quarry.Getenv("STORE_FAIL") != "" {
+		fail "store unreachable"
+	}
+	return Store{core: hearth.ID()}
+}
+
+use store = openStore()
+
+on app.start {
+	if quarry.Getenv("START_FAIL") != "" {
+		fail "migration refused"
+	}
+	say.Line("app.start")
+}
+
+on core.start {
+	say.Line("core.start", store.core)
+}
+
+on core.stop {
+	say.Line("core.stop", store.core)
+}
+
+// app.stop runs after the drain cancelled everything: its own waits still work.
+on app.stop {
+	within 2s {
+		try tide.Wait(20ms)
+	} catch err {
+		say.Line("app.stop wait failed:", err)
+	}
+	say.Line("app.stop")
+}
+
+fn hello(q anvil.Req, w mut anvil.Out) {
+	w.Text("store {store.core}")
+}
+
+fn park(q anvil.Req, w mut anvil.Out) {
+	tide.Wait(30s) catch err {
+		w.Text("fault: {err}")
+		return
+	}
+	w.Text("woke")
+}
+
+fn drain(q anvil.Req, w mut anvil.Out) {
+	anvil.Drain(300ms)
+	w.Text("draining")
+}
+
+fn main() {
+	mut r = anvil.NewRouter()
+	r.Get("/hello", hello)
+	r.Get("/park", park)
+	r.Get("/drain", drain)
+	let err = r.Serve(":0")
+	say.Line("served", err)
+}

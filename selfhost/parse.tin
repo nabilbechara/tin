@@ -310,6 +310,10 @@ const USE_NAME = 2;
 const USE_INIT = 3;
 const ON_EVENT = 2;
 const ON_BODY = 3;
+const USE_FILE = 4; // the file of a use or on declaration (#238)
+const ON_FILE = 4;
+const USE_DECL = 7;  // a package-level use: its global's declaration
+const USE_STOP = 8;  // a package-level use: its close function (checker)
 const BODY_BLOCK = 2;
 const BLK_FLAT = 3;   // a checker-made block that opens no scope
 const CALL_STORE = 8; // a runtime call that stores into its first argument (region pass)
@@ -523,6 +527,7 @@ fn parse_mode(toks, edition) {
             vec_push(prog_shapes, parse_shape_decl());
         } else if p_edition1 && p_word("use") {
             vec_push(prog_uses, parse_use_decl());
+            use_global_decl(prog_uses);
         } else if p_edition1 && p_word("on") {
             vec_push(prog_ons, parse_on_decl());
         } else {
@@ -570,8 +575,19 @@ fn parse_use_decl() {
     u[USE_NAME] = p_expect_ident()[T_TEXT];
     p_expect("=");
     u[USE_INIT] = parse_expr(1);
+    u[USE_FILE] = cur_file;
     p_end();
     return u;
+}
+
+// use_global_decl declares the per-core global of the package-level use just parsed, in
+// source order among the other globals (#238).
+fn use_global_decl(uses) {
+    let u = vec_get(uses, uses[VEC_LEN] - 1);
+    let d = decl_new(u[N_POS], u[USE_NAME]);
+    d[D_INIT] = u[USE_INIT];
+    u[USE_DECL] = d;
+    vec_push(prog_vars, d);
 }
 
 fn parse_on_decl() {
@@ -582,6 +598,7 @@ fn parse_on_decl() {
     on[ON_EVENT] = parse_expr(1);
     p_nolit = saved;
     on[ON_BODY] = parse_block();
+    on[ON_FILE] = cur_file;
     return on;
 }
 
