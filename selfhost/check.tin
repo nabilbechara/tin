@@ -58,6 +58,7 @@ var tls_count;
 var ck_trusted;    // the file is part of the standard library
 var file_trusted;
 var safe_pairs;    // [index sym, slice sym] proven in range in the current loop body
+var len_aliases;   // [local length sym, slice/string sym] for unchanged len locals
 var dyn_tables;   // [concrete type, dyn type, keep function, methods, data slot index]
 var ck_escaping_cells; // variable names that must be allocated in heap cells
 
@@ -416,6 +417,7 @@ fn check() {
     sc_marks = vec_new();
     init_stmts = vec_new();
     safe_pairs = vec_new();
+    len_aliases = vec_new();
     dyn_tables = vec_new();
     let i = 0;
     while i < file_v2[VEC_LEN] {
@@ -1726,6 +1728,7 @@ fn check_fn_closure(f) {
     let saved_syms = vec_clone(sc_syms);
     let saved_marks = vec_clone(sc_marks);
     let saved_safe = safe_pairs;
+    let saved_len_aliases = len_aliases;
     let saved_cells = ck_escaping_cells;
 
     check_fn(f);
@@ -1740,6 +1743,7 @@ fn check_fn_closure(f) {
     sc_syms = saved_syms;
     sc_marks = saved_marks;
     safe_pairs = saved_safe;
+    len_aliases = saved_len_aliases;
     ck_escaping_cells = saved_cells;
 }
 
@@ -1751,6 +1755,7 @@ fn check_fn(f) {
     ck_loops = 0;
     ck_breaks = 0;
     ck_escaping_cells = vec_new();
+    len_aliases = vec_new();
     if f[F_BODY] {
         scan_captures(f, ck_escaping_cells);
     }
@@ -2359,6 +2364,11 @@ fn from_bits(e, t) {
 // ---- statements ----
 
 fn check_stmt(s) {
+    // A mut argument or a call through a closure can change a captured slice header.
+    // Clear cached len aliases before proving any later indexed access safe.
+    if stmt_may_change_slice(s, "") {
+        len_aliases = vec_new();
+    }
     let k = s[N_KIND];
     if k == ST_CONST {
         check_local_consts(s);
@@ -2707,6 +2717,7 @@ fn check_let(s) {
         return;
     }
     s[LET_SYM] = declare_local(pos, s[LET_NAME], t);
+    len_alias_remember(s[LET_SYM], init);
     if s[LET_SYM][S_CELL] {
         let sym = s[LET_SYM];
         let csym = sym[S_CELL_SYM];
@@ -2832,6 +2843,9 @@ fn check_assign(s) {
         }
         narrow_kill(target);
     }
+    if target[N_KIND] == EX_IDENT {
+        len_alias_invalidate(target[ID_REF]);
+    }
 }
 
 fn check_assignable(e, from, to) {
@@ -2890,6 +2904,9 @@ fn check_value(pos, t) {
 }
 
 fn check_multi(s) {
+    // Multi-assignment lowers through generated temporaries and can rebind either a
+    // remembered length or its source slice. Drop these local facts conservatively.
+    len_aliases = vec_new();
     let pos = s[N_POS];
     let targets = s[MU_TARGETS];
     let values = s[MU_VALUES];
@@ -3962,6 +3979,154 @@ fn pair(a, b) {
     return v;
 }
 
+fn len_alias_remember(sym, init) {
+    if !sym || sym[S_KIND] != SYM_LOCAL || sym[S_CELL] || !init || init[N_KIND] != EX_MEM || !init[MEM_HDR] || init[MEM_OFF] != 0 {
+        return;
+    }
+    let base = init[MEM_BASE];
+    if base[N_KIND] != EX_IDENT {
+        return;
+    }
+    let source = base[ID_REF];
+    if !source || source[S_KIND] != SYM_LOCAL || source[S_CELL] || (kind_of(source[S_TYPE]) != K_SLICE && kind_of(source[S_TYPE]) != K_STRING) {
+        return;
+    }
+    vec_push(len_aliases, pair(sym, source));
+}
+
+fn len_alias_source(sym) {
+    let i = len_aliases[VEC_LEN] - 1;
+    while i >= 0 {
+        let p = vec_get(len_aliases, i);
+        if vec_get(p, 0) == sym {
+            return vec_get(p, 1);
+        }
+        i = i - 1;
+    }
+    return 0;
+}
+
+fn len_alias_invalidate(sym) {
+    if !sym {
+        return;
+    }
+    let n = len_aliases[VEC_LEN];
+    let i = 0;
+    while i < n {
+        let p = vec_get(len_aliases, i);
+        let alias = vec_get(p, 0);
+        if alias == sym || vec_get(p, 1) == sym {
+            vec_push(len_aliases, pair(alias, 0));
+        }
+        i = i + 1;
+    }
+}
+
+// stmt_may_change_slice is conservative: explicit mut arguments and calls through
+// local function values can change a captured slice header, so they invalidate len facts.
+fn stmt_may_change_slice(s, name) {
+    if !s {
+        return 0;
+    }
+    let k = s[N_KIND];
+    if k == ST_BLOCK || k == ST_LIST {
+        let stmts = s[BLK_STMTS];
+        if k == ST_LIST { stmts = s[LIST_STMTS]; }
+        let i = 0;
+        while i < stmts[VEC_LEN] {
+            if stmt_may_change_slice(vec_get(stmts, i), name) { return 1; }
+            i = i + 1;
+        }
+        return 0;
+    }
+    if k == ST_LET { return expr_may_change_slice(s[LET_INIT], name); }
+    if k == ST_ASSIGN { return expr_may_change_slice(s[AS_TARGET], name) || expr_may_change_slice(s[AS_VALUE], name); }
+    if k == ST_MULTI {
+        let vals = s[MU_VALUES];
+        let i = 0;
+        while vals && i < vals[VEC_LEN] {
+            if expr_may_change_slice(vec_get(vals, i), name) { return 1; }
+            i = i + 1;
+        }
+        let targets = s[MU_TARGETS];
+        i = 0;
+        while targets && i < targets[VEC_LEN] {
+            if expr_may_change_slice(vec_get(targets, i), name) { return 1; }
+            i = i + 1;
+        }
+        return 0;
+    }
+    if k == ST_EXPR { return expr_may_change_slice(s[ES_X], name); }
+    if k == ST_IF {
+        return stmt_may_change_slice(s[IF_INIT], name) || expr_may_change_slice(s[IF_COND], name) || stmt_may_change_slice(s[IF_THEN], name) || stmt_may_change_slice(s[IF_ELSE], name);
+    }
+    if k == ST_WHILE {
+        return stmt_may_change_slice(s[WH_INIT], name) || expr_may_change_slice(s[WH_COND], name) || stmt_may_change_slice(s[WH_POST], name) || stmt_may_change_slice(s[WH_BODY], name);
+    }
+    if k == ST_RANGE {
+        return expr_may_change_slice(s[RG_EXPR], name) || stmt_may_change_slice(s[RG_BODY], name);
+    }
+    if k == ST_CALLMULTI { return expr_may_change_slice(s[CM_CALL], name); }
+    if k == ST_RETURN || k == ST_BREAK || k == ST_CONTINUE || k == ST_CONST {
+        return 0;
+    }
+    // Switch, defer and other less common control forms keep the existing checks.
+    return 1;
+}
+
+fn expr_may_change_slice(e, name) {
+    if !e { return 0; }
+    let k = e[N_KIND];
+    if k == EX_CALL {
+        let callee = e[CALL_CALLEE];
+        if callee {
+            if callee[N_KIND] == EX_IDENT {
+                let target = lookup_name(callee[ID_NAME]);
+                if target && target[S_KIND] == SYM_LOCAL && kind_of(target[S_TYPE]) == K_FUNC { return 1; }
+            } else if callee[N_KIND] == EX_SELECT {
+                let base = callee[SEL_X];
+                if base[N_KIND] != EX_IDENT { return 1; }
+                let target = lookup_name(base[ID_NAME]);
+                if target && target[S_KIND] == SYM_LOCAL { return 1; }
+            } else {
+                return 1;
+            }
+        } else if e[CALL_NAME] {
+            let target = lookup_name(e[CALL_NAME]);
+            if target && target[S_KIND] == SYM_LOCAL && kind_of(target[S_TYPE]) == K_FUNC { return 1; }
+        }
+        let args = e[CALL_ARGS];
+        let i = 0;
+        while args && i < args[VEC_LEN] {
+            let a = vec_get(args, i);
+            if a[N_KIND] == EX_MUTARG {
+                let target = a[MUTARG_X];
+                if !name || (target[N_KIND] == EX_IDENT && streq(target[ID_NAME], name)) { return 1; }
+            }
+            if expr_may_change_slice(a, name) { return 1; }
+            i = i + 1;
+        }
+        return expr_may_change_slice(callee, name);
+    }
+    if k == EX_BINARY { return expr_may_change_slice(e[BIN_L], name) || expr_may_change_slice(e[BIN_R], name); }
+    if k == EX_UNARY { return expr_may_change_slice(e[UN_X], name); }
+    if k == EX_CONV { return expr_may_change_slice(e[CV_X], name); }
+    if k == EX_SELECT { return expr_may_change_slice(e[SEL_X], name); }
+    if k == EX_INDEX { return expr_may_change_slice(e[IX_X], name) || expr_may_change_slice(e[IX_I], name); }
+    if k == EX_SLICE { return expr_may_change_slice(e[SL_X], name) || expr_may_change_slice(e[SL_LO], name) || expr_may_change_slice(e[SL_HI], name); }
+    if k == EX_MEM { return expr_may_change_slice(e[MEM_BASE], name) || expr_may_change_slice(e[MEM_INDEX], name) || expr_may_change_slice(e[MEM_LEN], name); }
+    if k == EX_ELEM { return expr_may_change_slice(e[ELEM_SEQ], name) || expr_may_change_slice(e[ELEM_IDX], name); }
+    if k == EX_MUTARG {
+        let target = e[MUTARG_X];
+        return !name || (target[N_KIND] == EX_IDENT && streq(target[ID_NAME], name)) || expr_may_change_slice(target, name);
+    }
+    if k == EX_INT || k == EX_STR || k == EX_IDENT || k == EX_FLOAT || k == EX_NIL || k == EX_TYPE || k == EX_FUNCREF || k == EX_REG {
+        return 0;
+    }
+    // Sequence, closure, composite, try/catch and unknown expressions are not proven pure here.
+    return 1;
+}
+
 // names_assigned reports whether any statement under s assigns to a variable named
 // a or b (shadowing declarations are fine: they make different symbols).
 fn names_assigned(s, a, b) {
@@ -4045,22 +4210,34 @@ fn mark_safe_index(e) {
     }
 }
 
-// len_bound matches a checked `i < len(x)` and returns [i sym, x sym], or 0.
+// len_bound matches `i < len(x)` or `i < n` where n remembers len(x), and
+// returns [i sym, x sym, remembered length sym], or 0.
 fn len_bound(c) {
     if c[N_KIND] != EX_BINARY || !streq(c[BIN_OP], "<") {
         return 0;
     }
     let l = c[BIN_L];
     let r = c[BIN_R];
-    if l[N_KIND] != EX_IDENT || r[N_KIND] != EX_MEM || !r[MEM_HDR] || r[MEM_OFF] != 0 || r[MEM_BASE][N_KIND] != EX_IDENT {
+    if l[N_KIND] != EX_IDENT {
         return 0;
     }
     let is = l[ID_REF];
-    let xs = r[MEM_BASE][ID_REF];
+    let xs = 0;
+    let length = 0;
+    if r[N_KIND] == EX_MEM && r[MEM_HDR] && r[MEM_OFF] == 0 && r[MEM_BASE][N_KIND] == EX_IDENT {
+        xs = r[MEM_BASE][ID_REF];
+    } else if r[N_KIND] == EX_IDENT {
+        length = r[ID_REF];
+        if length {
+            xs = len_alias_source(length);
+        }
+    }
     if !is || !xs || is[S_KIND] != SYM_LOCAL || xs[S_KIND] != SYM_LOCAL {
         return 0;
     }
-    return pair(is, xs);
+    let b = pair(is, xs);
+    vec_push(b, length);
+    return b;
 }
 
 // add_len_fact makes x[i] unchecked inside `if i < len(x) {...}` when i cannot be
@@ -4082,7 +4259,13 @@ fn add_len_fact(c, then) {
     if is_unsigned_t(is[S_TYPE]) {
         nonneg = 1;
     }
-    if nonneg && !names_assigned(then, is[S_NAME], vec_get(b, 1)[S_NAME]) {
+    let xs = vec_get(b, 1);
+    let length = vec_get(b, 2);
+    let stable = !names_assigned(then, is[S_NAME], xs[S_NAME]) && !stmt_may_change_slice(then, xs[S_NAME]);
+    if length && names_assigned(then, length[S_NAME], "") {
+        stable = 0;
+    }
+    if nonneg && stable {
         vec_push(safe_pairs, b);
     }
 }
@@ -4108,8 +4291,18 @@ fn lower_for_init(s) {
     check_cond(inner[WH_COND]);
     let saved = safe_pairs[VEC_LEN];
     let bound = len_bound(inner[WH_COND]);
-    if bound && !ck_legacy && init[N_KIND] == ST_LET && init[LET_SYM] == vec_get(bound, 0) && init[LET_INIT][N_KIND] == EX_INT && init[LET_INIT][INT_VAL] >= 0 && is_increment(inner[WH_POST], init[LET_NAME]) && !names_assigned(inner[WH_BODY], init[LET_NAME], vec_get(bound, 1)[S_NAME]) {
-        vec_push(safe_pairs, bound);
+    if bound && !ck_legacy && init[N_KIND] == ST_LET && init[LET_SYM] == vec_get(bound, 0) && init[LET_INIT][N_KIND] == EX_INT && init[LET_INIT][INT_VAL] >= 0 && is_increment(inner[WH_POST], init[LET_NAME]) {
+        let xs = vec_get(bound, 1);
+        let length = vec_get(bound, 2);
+        let stable = !names_assigned(inner[WH_BODY], init[LET_NAME], xs[S_NAME]) && !stmt_may_change_slice(inner[WH_BODY], xs[S_NAME]);
+        if length {
+            if names_assigned(inner[WH_BODY], length[S_NAME], xs[S_NAME]) || names_assigned(inner[WH_POST], length[S_NAME], xs[S_NAME]) || names_assigned(inner[WH_POST], xs[S_NAME], "") || stmt_may_change_slice(inner[WH_POST], xs[S_NAME]) {
+                stable = 0;
+            }
+        }
+        if stable {
+            vec_push(safe_pairs, pair(vec_get(bound, 0), xs));
+        }
     }
     ck_loops = ck_loops + 1;
     ck_breaks = ck_breaks + 1;
