@@ -36,8 +36,9 @@ API: `X25519`, `X25519PublicKey`, `X25519NewPrivateKey`, `ChaCha20`, `type AEAD`
 `NewChaCha20Poly1305`, `Seal`, `Open`, `NonceSize`, `Overhead`.
 
 - X25519 uses ten signed limbs in radix 2^25.5 so products fit in 64 bits; it fails on an
-  all-zero result (RFC 8446 7.4.2 requires the check). About 0.85 ms per operation on Linux
-  x86-64 before tuning.
+  all-zero result (RFC 8446 7.4.2 requires the check). `fe_mul` and `fe_sq` are straight-line
+  code from `tools/gen_fe25519.py` (no loop, branch or bounds check; squaring computes each
+  cross product once), about 3.5 times faster than the first looped version.
 - ChaCha20 keeps the state in locals and xors eight bytes at a time; Poly1305 is the 26-bit
   limb form (poly1305-donna). AES-GCM joins `AEAD` as another kind.
 
