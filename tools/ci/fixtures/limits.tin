@@ -1,0 +1,57 @@
+package main
+
+import "anvil"
+import "fault"
+import "say"
+import "tide"
+
+// hog allocates k slices of 8 MB.
+fn hog(k i64) i64 {
+	mut total i64 = 0
+	for i in 0..k {
+		let xs = make([]i64, 1000000)
+		total += len(xs)
+	}
+	return total
+}
+
+// limited waits, then allocates about 80 MB inside a 16 MiB limit: the block fails with
+// fault.LimitExceeded and the handler answers with it.
+fn limited(q anvil.Req, w mut anvil.Out) {
+	let n = limit memory 16mb {
+		try tide.Wait(5 * tide.Millisecond)
+		hog(10)
+	} catch err {
+		w.Text("limited: {err} {fault.Is(err, fault.LimitExceeded)}")
+		return
+	}
+	w.Text("never {n}")
+}
+
+// fits allocates 16 MB inside a 64 MiB limit and gets its value.
+fn fits(q anvil.Req, w mut anvil.Out) {
+	let n = limit memory 64mb {
+		hog(2)
+	} catch err {
+		w.Text("fault: {err}")
+		return
+	}
+	w.Text("fits {n}")
+}
+
+fn plain(q anvil.Req, w mut anvil.Out) {
+	tide.Wait(tide.Millisecond) catch err {
+		w.Text("fault: {err}")
+		return
+	}
+	w.Text("plain ok")
+}
+
+fn main() {
+	mut r = anvil.NewRouter()
+	r.Get("/limited", limited)
+	r.Get("/fits", fits)
+	r.Get("/plain", plain)
+	let err = r.Serve(":0")
+	say.Line(err)
+}
