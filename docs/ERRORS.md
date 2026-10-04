@@ -38,6 +38,11 @@ diagnostics agree on every code and name. Examples use the syntax of LANGUAGE.md
 and are compiled with `-edition 0`; an example opened with ```` ```tin edition=1 ```` is
 edition 1 syntax and is compiled with `-edition 1`.
 
+An example for an error about the command line or the installation shows its command in a
+```` ```sh ```` block (one line, `[VAR=value ...] tinc ARGS`), and a block opened with
+```` ```text file=NAME ```` (any language) is a file written next to the example, such as a
+`tin.lock`.
+
 ## E0xx Files, tokens and syntax
 
 ### E001 PACKAGE_CLAUSE
@@ -78,6 +83,21 @@ example.tin:6:1: error E002 IMPORT_ORDER: imports must precede declarations
 ```
 
 Fix: move the import up, under the package declaration.
+
+### E003 CANNOT_OPEN
+
+The compiler reads every file named on its command line and every file of the packages they
+import. Errors about the command line and the installation have no position.
+
+```sh
+tinc missing.tin
+```
+
+```text
+error E003 CANNOT_OPEN: cannot open missing.tin
+```
+
+Fix: check the path (it is relative to the current directory) and that the file is readable.
 
 ### E010 UNEXPECTED_CHARACTER
 
@@ -588,6 +608,51 @@ example.tin:5:1: error E101 REDECLARED: 'Reader' is declared as a shape twice
 ```
 
 Fix: rename one of the declarations, or merge them into one.
+
+### E110 UNKNOWN_PACKAGE
+
+An import path names a package in `vendor/`, in the standard library, or next to the
+program's first file; a path starting with `./` names a package next to the importing file
+(docs/PACKAGES.md).
+
+```tin
+package main
+
+import "geom"
+
+func main() {
+}
+```
+
+```text
+error E110 UNKNOWN_PACKAGE: unknown package "geom" (looked in the standard library, next to the importing file and in the program's directory)
+```
+
+Fix: correct the path; for a package in the program's own tree, write it relative to the
+importing file (`import "./geom"`).
+
+### E111 LOCK_MISMATCH
+
+When the project directory has a `tin.lock`, every source file outside the standard library
+must be listed in it with its SHA-256 hash (docs/PACKAGES.md), so changed or unexpected code
+does not build.
+
+```text file=tin.lock
+0000000000000000000000000000000000000000000000000000000000000000 example.tin
+```
+
+```tin
+package main
+
+func main() {
+}
+```
+
+```text
+error E111 LOCK_MISMATCH: tin.lock hash mismatch or missing entry for example.tin
+```
+
+Fix: review the change, then regenerate the file's entry (`shasum -a 256 example.tin`).
 
 ## E2xx Types, expressions and calls
 
@@ -1389,3 +1454,70 @@ example.tin:8:12: error E701 NOT_MUT: cannot modify parameter 'b': declare it mu
 
 Fix: declare the parameter `mut` (`func add(b mut Box, s str)`) and call it with `add(mut box, s)`, or
 return the new value instead.
+
+## E9xx Building
+
+### E901 UNKNOWN_TARGET
+
+`-target` takes one of the supported targets: `darwin-arm64`, `linux-arm64`, `linux-amd64`.
+
+```sh
+tinc -target windows-amd64 example.tin
+```
+
+```tin
+package main
+
+func main() {
+}
+```
+
+```text
+error E901 UNKNOWN_TARGET: unknown target windows-amd64 (darwin-arm64, linux-arm64, linux-amd64)
+```
+
+Fix: use one of the listed targets (docs/PORTING.md).
+
+### E902 UNKNOWN_EDITION
+
+`-edition` takes `0` (the syntax of docs/LANGUAGE.md) or `1` (Tin 1's syntax).
+
+```sh
+tinc -edition 2 example.tin
+```
+
+```tin
+package main
+
+func main() {
+}
+```
+
+```text
+error E902 UNKNOWN_EDITION: unknown edition 2 (expected 0 or 1)
+```
+
+Fix: pass `-edition 0` or `-edition 1`, or leave the flag out for edition 0.
+
+### E903 NO_RUNTIME
+
+Every program is built with the runtime package, `lib/runtime` under the Tin root: `$TIN_ROOT`,
+or the directory above the compiler's `bin/`.
+
+```sh
+TIN_ROOT=/nonexistent tinc example.tin
+```
+
+```tin
+package main
+
+func main() {
+}
+```
+
+```text
+error E903 NO_RUNTIME: the runtime package is missing: no lib/runtime in /nonexistent
+```
+
+Fix: set `TIN_ROOT` to the Tin checkout or installation, or run the compiler from its
+installed `bin/` (the `tin` command sets `TIN_ROOT` itself).

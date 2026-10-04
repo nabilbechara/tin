@@ -77,6 +77,16 @@ class DiagnosticsTests(unittest.TestCase):
         entry = dc.parse_doc(ENTRY.replace('```tin\n', '```tin edition=1\n'))[0]
         self.assertEqual(dc.example(entry)[:2], ('package main\n', '1'))
 
+    def test_command_and_files(self):
+        doc = ENTRY.replace('```tin\npackage main\n```', '```sh\nTIN_ROOT=/x tinc -edition 1 a.tin\n```\n\n```text file=tin.lock\nlock\n```')
+        entry = dc.parse_doc(doc)[0]
+        self.assertEqual(dc.example(entry)[0], None)
+        self.assertIsNone(dc.example(entry)[3])
+        self.assertEqual(dc.command(entry, 'tinc', '0'), ({'TIN_ROOT': '/x'}, ['tinc', '-edition', '1', 'a.tin']))
+        self.assertEqual([b[3] for b in entry['blocks']], [None, 'tin.lock', None])
+        entry = dc.parse_doc(ENTRY)[0]
+        self.assertEqual(dc.command(entry, 'tinc', '0'), ({}, ['tinc', '-edition', '0', '-o', 'example', 'example.tin']))
+
     def test_tree_agrees(self):
         problems, entries, _, _ = dc.check_static()
         self.assertEqual(problems, [])
