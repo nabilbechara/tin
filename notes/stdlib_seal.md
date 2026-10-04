@@ -44,3 +44,21 @@ API: `X25519`, `X25519PublicKey`, `X25519NewPrivateKey`, `ChaCha20`, `type AEAD`
 Tests: `tests/v2/seal_x25519_chacha.tin` (RFC 7748, RFC 8439, every length class, tampering;
 the Go twin `bench/ref/seal_x25519_chacha` uses crypto/ecdh and an independent math/big
 Poly1305), and Wycheproof `x25519` and `chacha20_poly1305` in `tools/ci/crypto_check.py`.
+
+## AES-GCM (#124 phase 1)
+
+API: `NewAESGCM(key)` (16-, 24- or 32-byte keys) returning the same `AEAD` as ChaCha20-Poly1305.
+Nonces are 12 bytes only, like Go's `cipher.NewGCM`.
+
+- Software path (every CPU): bitsliced AES, four blocks in eight u64 planes. The S-box is
+  computed, not looked up: x^254 in GF(2^8) plus the affine map, generated as straight-line
+  ANDs and XORs by `tools/gen_aes_sbox.py` into `aes_sbox.tin`. The key schedule uses the same
+  circuit. GHASH uses 32x32 integer multiplications on operands with holes (BearSSL's
+  ctmul idea) and Karatsuba.
+- Performance gap: the software path is a constant-time fallback; on Linux x86-64 it runs at
+  about 8 MB/s (ChaCha20-Poly1305 about 38 MB/s), partly because the x86-64 backend keeps
+  only four locals in registers. The AES-NI/PCLMULQDQ and ARMv8 AES/PMULL paths come in
+  their own PR (they need hand-assembled functions in the code generators).
+
+Tests: `tests/v2/seal_aes.tin` (NIST GCM cases, every length class for all key sizes,
+tampering; Go twin `bench/ref/seal_aes`), and Wycheproof `aes_gcm` in `tools/ci/crypto_check.py`.
