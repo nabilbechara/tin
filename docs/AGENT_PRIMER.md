@@ -1,16 +1,17 @@
-# Tin primer for agents (strict Tin)
+# Tin primer for agents (strict Tin, edition 1)
 
-Tin is a self-hosted, Go-like language that compiles to native code for Linux arm64 and
+Tin is a self-hosted language that compiles to native code for Linux arm64 and
 Linux x86-64 (production and benchmarks) and macOS arm64 (development only; see
 docs/PORTING.md, "Platform roles"). AI writes all Tin code: optimize for speed and
 robustness, not human ergonomics. Root: the repository checkout. Full reference:
 docs/LANGUAGE.md (language), docs/STDLIB.md (packages), docs/TOOLING.md (commands),
-docs/RUNTIME.md (memory, layouts, trusted code).
+docs/RUNTIME.md (memory, layouts, trusted code), docs/ERRORS.md (every diagnostic and its fix).
 
 ## Build and run
     tin FILE.tin                                   compile and run
     tin build FILE.tin -o bin/agent_NAME/prog      executable
     tin build --target linux-arm64 FILE.tin -o bin/linux/prog
+    tin fix -edition 1 FILE.tin                    rewrite edition-0 (Go-like) code to edition 1
     docker run --rm -v "$PWD/bin/linux":/w tin-debian-arm64 /w/prog
 When several agents work at once, each uses a frozen compiler (for example bin/tinc_agents, with
 TIN_ROOT set to the root) and its own output dir bin/agent_NAME/. Never run tools/v2test.sh,
@@ -18,86 +19,129 @@ never write bin/t, and never touch selfhost/, lib/runtime/, lib/anvil/, lib/argo
 lib/hearth/, Makefile or seed/ unless your task says so. If you hit a compiler bug, do NOT fix
 the compiler: write a minimal repro to notes/compiler_bugs_NAME.md and work around it.
 
-## Language (strict)
-- Files start `package main` (programs) or `package NAME` (lib/NAME.tin, imported with
-  `import "NAME"`, called as `NAME.Func`). `import "./geom"` imports a local file or directory
-  package. Capitalized names, methods and fields are exported; lower-case ones are private to their package.
-- Types: i8 i16 i32 i64 u8 u16 u32 u64, f64, f32 (exact float32 semantics, 4 bytes in slices), bool, str (immutable bytes), [N]T arrays, []T (reference
-  header; append mutates it in place and returns it), map[K]V (K = str, ints, bool, f64, or structs/enums of those, by value; insertion-ordered), struct (reference,
-  never nil; == compares identity), ?T optional (may be nil), fault (error; nil = ok), func(...) values
-  (top-level functions or literals without captures).
+## Language (strict, edition 1)
+- Files start `package main` (programs) or `package NAME` (lib/NAME/, imported with
+  `import "NAME"`, called as `NAME.Func`). One `import "path"` per line, before any declaration;
+  `import "./geom"` imports a local file or directory package; no aliases. Capitalized names,
+  methods and fields are exported; lower-case ones are private to their package. Names are camelCase.
+- Statements end at a newline (no semicolons); `//` comments only. Declarations: `fn`, `const`
+  (package level, one name each), `let` (a name never reassigned), `mut` (one that is), `type`,
+  `shape`, `use`, `on`. `let x = 1`, `mut n i64 = 0`, `let (a, b) = pair()`. Every local has an
+  initializer. Go's func, var, short declarations, switch, increments, while, go and iota do not
+  exist (`tin fix -edition 1` rewrites them).
+- Types: i8 i16 i32 i64 u8 u16 u32 u64, f64, f32 (exact float32 semantics, 4 bytes in slices), bool,
+  str (immutable bytes), [N]T arrays, []T (reference header; append mutates it in place and returns
+  it), map[K]V (K = str, ints, bool, f64, or structs/enums of those, by value; insertion-ordered),
+  struct (reference, never nil; == compares identity), ?T optional (may be nil), fault (error;
+  nil = ok), fn(A) R function values (top-level functions or literals, which may capture).
 - No implicit conversions: i64(x), u8(x), f64(x), str(c) for a rune/byte, str(bytes []u8). Untyped
   constants adapt and must fit. Conditions must be bool. Integer overflow wraps; division by zero
-  panics; shift counts are taken mod 64. Literals: 0x, 0b, 0o, 1_000.
-- Errors: a function that can fail returns `!T` (`!(A, B)`, or `!` for no value). Inside it, `return v`
-  succeeds and `fail "msg"` / `fail err` leaves with a fault (zero values for the rest); `return v, nil` and
-  `(T, fault)` result lists are compile errors. `v := try f()` passes a fault upward; `v := f() catch err { 0 }`
-  handles it in place (the block's last expression is the value, or the block leaves); `v, err := f()` also
-  works. Ignoring a fault is a compile error, and `_` cannot discard one. `fail("msg")` and
-  `say.Fault("fmt %d", x)` make fault values.
-- Optionals: `if p != nil { p.x }` narrows (also through && and ||, and `if p == nil { return }`). Narrow fields via a local. Using a ?T
-  without narrowing is a compile error. Map reads of missing keys return the zero value; use
-  `v, ok := m[k]` to tell.
-- Params are read-only unless declared `mut` (`func (b mut Buf) Add(...)`, `func f(xs mut []i64)`).
+  panics; shift counts are taken mod 64. Literals: 0x, 0b, 0o, 1_000; units `200ms` `5s` `1h`
+  (nanoseconds, for tide and `within`) and `64kb` `4mb` (bytes).
+- Structs: `type User struct {` one `name Type` per line `}`; literals always name fields:
+  `User{id: 1, name: "a"}`. `@json("id") id i64` sets a JSON key. Methods:
+  `fn (p Point) dist() f64`, `fn (p mut Point) move(dx i64)`.
+- Errors: a function that can fail returns `!T` (`!(A, B)`, or `!` for no value). Inside it,
+  `return v` succeeds and `fail "msg {x}"` / `fail err` leaves with a fault (zero values for the
+  rest); `return v, nil` and `(T, fault)` result lists are compile errors. `let v = try f()` passes a
+  fault upward; `let v = try f() wrap "loading {id}"` adds context; `let v = f() catch err { 0 }`
+  handles it in place (the block's last expression is the value, or the block leaves);
+  `let (v, err) = f()` also works. Ignoring a fault is a compile error, and `_` cannot discard one.
+  Sentinels: package-level `let ErrNotFound = fault("not found")`; `fault.Is(err, ErrNotFound)`,
+  `fault.Wrap(err, "ctx")`; runtime sentinels `fault.DeadlineExceeded`, `fault.Canceled`,
+  `fault.LimitExceeded`, `fault.Overloaded`, `fault.Panic`.
+- Loops: `for x in xs {}`, `for i, x in xs {}`, `for k, v in m {}`, `for i, c in text {}`,
+  `for i in 0..n {}` (half-open; no bounds checks on `xs[i]` for `0..len(xs)`),
+  `for i in (0..n).step(2) {}`, `for cond {}`, `for {}`; `outer: for ...` with `break outer` /
+  `continue outer`. `x += 1` (there is no increment operator).
+- `match` replaces switch and is an expression: `let s = match code { 200 => "ok" 404, 410 => "gone"
+  500..600 => "server" n if n < 0 => "bad" _ => "other" }` (one arm per line). Arms are
+  `pattern => expr` or `=> { block }`, or `return`/`break`/`continue`/`fail`/an assignment. On a
+  fault, arms compare with fault.Is: `match err { nil => ... ErrNotFound => ... _ => ... }`.
+- Optionals: `if p != nil { p.x }` narrows (also through && and ||, and `if p == nil { return }`);
+  `if let u = find(id) { u.name }` binds. Narrow fields via a local. Using a ?T without narrowing is
+  a compile error. Map reads of missing keys return the zero value; use `let (v, ok) = m[k]` to tell.
+- Params are read-only unless declared `mut` (`fn (b mut Buf) add(...)`, `fn f(xs mut []i64)`).
   Modifying a non-mut param's contents (fields, elements, append, map store) is a compile error. A call
   writes `mut` before every argument for a mut parameter: `f(mut xs)`, `sift.Ints(mut xs)`,
   `argo.Put(mut buf, v)`; receivers and append/copy/delete take none.
-- No `go` statements, no shared mutable globals: every global is per core (each core thread has its own
+- Enums: `type Shape enum {` one variant per line: `Circle(f64)`, `Rect(f64, f64)`, `Empty` `}`,
+  built as `Shape.Circle(2.0)`, read with `match s { Circle(r) => ... Rect(w, h) => ... Empty =>
+  ... }` (every variant or `_`; no field access). `==` by value; print as `Rect(3 4)`; JSON
+  `{"Rect":{"$0":3,"$1":4}}` / `"Empty"`.
+- Generics: `fn maxOf[T i64 | f64 | str](a T, b T) T`,
+  `fn mapAll[T constraints.Any, U constraints.Any](xs []T, f fn(T) U) []U`,
+  `type Stack[T constraints.Any] struct { items []T }` with `fn (s mut Stack[T]) push(x T)`;
+  `maxOf(1, 2)` (inferred) or `maxOf[i64](1, 2)`. Fully specialized. Constraints are imported shapes
+  such as `constraints.Any`, `constraints.Comparable` and `sift.Ordered`, or a union of concrete types.
+- Shapes: `shape Reader {` one `Read(buf mut []u8) !i64` per line `}`, structural; composed shapes
+  and named unions (`shape Num = i64 | f64`); generic shape calls are direct. `dyn S` opts into a
+  two-word object/table value and one indirect method call; conversion allocates nothing.
+- No threads and no shared mutable globals: every global is per core (each core thread has its own
   copy, initialized on every core). Concurrency is thread-per-core via hearth; messages via relay.
-  Function literals cannot capture, so clients a handler uses are globals opened in their initializer:
-  `var cache = redis.Open(redis.Options{Addr: quarry.Getenv("REDIS_ADDR")})` (one per core, lazy).
+  Clients a handler uses are package-level `use` resources (per core, opened at core start, closed at
+  stop): `use cache = redis.Open(redis.Options{Addr: quarry.Getenv("REDIS_ADDR")})`.
+- Tasks: `scope s { ... s.spawn(fn() ! { ... }) ... }` waits for every child (spawned in a loop,
+  each spawn captures its own loop variables); the first child fault cancels the rest and is the
+  scope's fault. `let t = s.spawn(fn() !T {...})`,
+  `try t.wait()`, `t.cancel()`. `let (a, b) = try parallel {` one call per line `}`. `select { let x =
+  l.Recv() => ... after(1s) => ... canceled() => ... }`. `lane.New[T](n)` is a queue between tasks.
+  `detach { flush(keep(event)) }` outlives the request.
+- Boundary blocks give their last expression: `let p = try within 200ms { try api.Get(id) }`
+  (deadline; waits fail with fault.DeadlineExceeded), `try limit memory 4mb, tasks 8 { ... }`,
+  `guard { ... } catch err { ... }` (a panic becomes fault.Panic), `with policy.Retry(3) { ... }`
+  (also policy.Cached, policy.Trace, policy.Bind). `return`/`break` cannot leave them.
+- Lifecycle: `on app.start { try migrate() }`, `on app.stop`, `on core.start`, `on core.stop`;
+  `once { ... }` runs the first time each core gets there; a function-level `use tx = db.Begin()`
+  closes tx when the function returns.
 - In anvil each request runs in its own task: a call that waits (tide.Wait, wire, quarry files, redis,
-  mysql, websocket Read) lets the core serve others. Requests have a deadline (TIN_DEADLINE_MS, default
-  30 s); waits past it fail with "deadline exceeded".
-- Services route with `r := anvil.NewRouter()` in main: ``r.Get(`/users/{id}`, user)`` (Post, Put, Patch,
-  Delete, Head, Options, Handle(method, ...), Any), `q.PathParam("id")` (%-decoded), a last `{path...}` or
-  `*` for the rest; patterns with {...} are raw strings. Static beats {name} beats the rest whatever the
-  order; a wrong method gets 405 + Allow, HEAD falls back to GET, a trailing slash is significant.
-  `r.Use(mw)`, mw a top-level `func(q anvil.Req, w mut anvil.Out, next func(anvil.Req, mut anvil.Out))`
-  that calls `next(q, mut w)`; it hands data on with `w.SetValue(k, v)` / `w.Value(k)`. Groups:
-  `r.Route("/api", func(g mut anvil.Router) { g.Use(auth); g.Get(...) })`, `r.Mount("/v2", sub)`;
-  `r.NotFound(h)`, `r.MethodNotAllowed(h)`. `err := r.Serve(":8080")` fails first on a bad or
-  conflicting pattern (`r.Check()`). Test without a server: `w := r.Run("GET", "/users/7", "")` then
-  `w.Code()`, `w.Header("Allow")`, `str(w.Body)`; `r.Match(method, path)` is the pattern that would serve.
+  mysql, postgres, websocket Read) lets the core serve others. Requests have a deadline
+  (TIN_DEADLINE_MS, default 30 s); waits past it fail with "deadline exceeded".
+- Services route with `let r = anvil.NewRouter()` in main: ``r.Get(`/users/{id}`, user)`` (Post, Put,
+  Patch, Delete, Head, Options, Handle(method, ...), Any), `q.PathParam("id")` (%-decoded), a last
+  `{path...}` or `*` for the rest; patterns with {...} are raw strings. Static beats {name} beats the
+  rest whatever the order; a wrong method gets 405 + Allow, HEAD falls back to GET, a trailing slash
+  is significant. `r.Use(mw)`, mw a top-level
+  `fn(q anvil.Req, w mut anvil.Out, next fn(anvil.Req, mut anvil.Out))` that calls `next(q, mut w)`;
+  it hands data on with `w.SetValue(k, v)` / `w.Value(k)`. Groups:
+  `r.Route("/api", fn(g mut anvil.Router) { g.Use(auth) ... })`, `r.Mount("/v2", sub)`;
+  `r.NotFound(h)`, `r.MethodNotAllowed(h)`. `try r.Serve(":8080")` fails first on a bad or
+  conflicting pattern (`r.Check()`). Test without a server: `let w = r.Run("GET", "/users/7", "")`
+  then `w.Code()`, `w.Header("Allow")`, `str(w.Body)`; `r.Match(method, path)` is the pattern that
+  would serve.
 - Memory: no GC. Allocations during a request go to the core's request pool (wiped per request);
   globals live in the long-lived ingot heap. Storing request memory into a global (or anything a global
   holds) without `keep(x)` is a compile error. keep() deep-copies into the ingot heap.
 - `make([]T, n)` starts elements at zero values ("" for str, an empty slice for []T). With a non-zero
   length it is a compile error for struct, map and func elements: use make([]T, 0, n) and append.
-- Builtins: len cap append make copy delete panic fail keep; say.Line(a, b...) prints space-separated
-  + newline; say.Text(...) no spaces/newline; say.Out(fmt, ...) printf; say.Fmt(fmt, ...) -> str;
-  say.Str(x) -> str; verbs %d %s %q %v %x %f %5.2f %-4s etc. Floats print like Go's %v.
-- Strings interpolate: "user {u.Name} has {n} items", "{price:.2} {id:x} [{name:-8}]"; {{ and }} are braces;
-  no quotes inside {...}; `raw` backquote strings do not interpolate (use them for text with braces of
-  its own, like the route pattern `/users/{id}`).
+- Builtins: len cap append make copy delete min max panic fail keep bound reveal; say.Line(a, b...)
+  prints space-separated + newline; say.Text(...) no spaces/newline; say.Out(fmt, ...) printf;
+  say.Fmt(fmt, ...) -> str; say.Str(x) -> str; verbs %d %s %q %v %x %f %5.2f %-4s etc. Floats print
+  like Go's %v.
+- Strings interpolate: "user {u.name} has {n} items", "{price:.2} {id:x} [{name:-8}]"; {{ and }} are
+  braces; no quotes inside {...}; `raw` backquote strings do not interpolate (use them for text with
+  braces of its own, like the route pattern `/users/{id}`).
 - Queries: where a parameter has type `query`, a literal keeps its values apart from its text:
   `db.Query("SELECT name FROM users WHERE id = {id}")` binds id, `cache.Do("SET user:{id} {body}")`
   sends three arguments. Passing a `str` there is a compile error; values must be integers, floats,
   str, bool or []u8, with no format spec.
-- for i := 0; i < n; i++ {}, for cond {}, for {}, for i, x := range slice/str/map {}, switch x { case a, b: }.
-  Methods: `func (p Point) Name() str`. Multiple returns. Composite literals T{F: v}, []T{...}, map[K]V{...}.
-- Enums: `type Shape enum { Circle(r f64), Rect(w, h f64), Empty }`, built as `Shape.Circle(2)`, read with
-  `switch s { case Circle(r): ... case Rect(w, h): ... case Empty: ... }` (every variant or default; no
-  field access). `==` by value; print as `Rect(3 4)`; JSON `{"Rect":{"w":3,"h":4}}` / `"Empty"`.
-- Generics: `func Max[T i64 | f64 | str](a T, b T) T`, `func Map[T constraints.Any, U constraints.Any](xs []T, f func(T) U) []U`,
-  `type Stack[T constraints.Any] struct { items []T }` with `func (s mut Stack[T]) Push(x T)`; `Max(1, 2)` (inferred)
-  or `Max[i64](1, 2)`. Fully specialized; `var zero T` is the zero value. Constraints are imported shapes
-  such as `constraints.Any`, `constraints.Comparable` and `sift.Ordered`, or a union of concrete types.
-- Shapes: structural method sets, composed shapes and named unions; generic shape calls are direct. `dyn S`
-  opts into a two-word object/table value and one indirect method call; conversion allocates nothing. `?dyn S`,
-  `[]dyn S`, `keep` and region checks work; map values and `!dyn` results are deferred.
-- Bounds checks are always on (removed when provably safe: range loops, i < len(s) loops). Panics print
-  the message, index and length, and a backtrace.
-- JSON: argo.Put(mut buf, v) encodes any value (encoder generated per type); `err := argo.Get(text, mut v)`
-  decodes into a struct, slice or map. Field names are the struct field names.
+- Bounded and secret values: `name str max 100` (a `bound(x)` call checks an unbounded value and fails
+  with fault.LimitExceeded; argo.Get enforces bounds while reading); `token secret str` is kept out of
+  say, faults, panics and argo at compile time; `reveal(x)` is the plain value; compare secrets with
+  `seal.Equal`.
+- Bounds checks are always on (removed when provably safe: `for x in xs`, `for i in 0..len(xs)`).
+  Panics print the message, index and length, and a backtrace.
+- JSON: argo.Put(mut buf, v) encodes any value (encoder generated per type);
+  `argo.Get(text, mut v) catch err { ... }` decodes into a struct, slice or map. Field names are the
+  struct field names, or their `@json("...")`.
 
 ## Trusted code (lib/*.tin only)
 Standard-library files may use cast(T, x) between i64 and refs, raw word indexing on an i64 pointer p[i]
-(8-byte words), load8(p)/store8(p, v), __ld(p, sizelog2), __st(p, v, sizelog2), `shared var` (one process-wide variable, not per core: the runtime's own state, set before cores
-start or synchronized by the code) and
-`extern func name(a i64, ...) i64` for libc. A str is a pointer to [len word][bytes][NUL]: bytes at
+(8-byte words), load8(p)/store8(p, v), __ld(p, sizelog2), __st(p, v, sizelog2), `shared let` (one
+process-wide value, not per core: the runtime's own state, set before cores start or synchronized by
+the code) and declarations of libc functions. A str is a pointer to [len word][bytes][NUL]: bytes at
 cast(i64, s)+8. A slice is a pointer to a header [len, cap, data, region]. C int returns: only low 32
-bits are defined -> i64(i32(x)). Variadic C functions need `...` in the extern. OS constants and
+bits are defined -> i64(i32(x)). Variadic C functions need `...` in the declaration. OS constants and
 differences go in NAME_darwin.tin / NAME_linux.tin (see docs/PORTING.md); never hard-code an errno or
 flag value in shared code. Runtime helpers you may call: rt_str_from_raw(p, n) str, rt_str_new(n) i64
 (len set, bytes at +8), rt_append_str(cast(i64, b), s), rt_slice_grow(h, need, esz), rt_alloc(n),
@@ -105,18 +149,20 @@ rt_ingot_alloc(n), rt_core_id(), rt_errno(). Prefer plain Tin over raw tricks un
 Keep comments one line, ending with a period.
 
 ## Standard library (import instead of re-implementing)
-say(fmt) twine(strings) glyph(utf8) mint(strconv) argo(JSON) anvil(HTTP server, router) wire(TCP, HTTP(S) client)
-tls(TLS 1.3 client)
-hearth(cores) relay(cross-core messages) tide(time) quarry(os/files/env) trail(paths) lever(flags/args)
-sift(sort/search) cairn(containers) gauge(math) dice(random) stamp(non-crypto hashes) seal(SHA-2,
-HMAC, HKDF, AES-GCM, ChaCha20-Poly1305, X25519, P-256, base64, hex, RSA-OAEP) ore(bytes) flume(buffered I/O) herald(logging) crucible(testing)
-redis(Redis client) mysql(MySQL client) websocket(WebSocket server via anvil, and client). Signatures:
+say(fmt) fault(error chains) twine(strings) glyph(utf8) mint(strconv) argo(JSON) anvil(HTTP server,
+router) wire(TCP, HTTP(S) client) tls(TLS 1.3 client) hearth(cores) relay(cross-core messages)
+task(deadline, cancellation) lane(queues between tasks) policy(with policies) tide(time)
+quarry(os/files/env) trail(paths) lever(flags/args) sift(sort/search) atlas(maps) cairn(containers)
+gauge(math) dice(random) stamp(non-crypto hashes) seal(SHA-2, HMAC, HKDF, AES-GCM,
+ChaCha20-Poly1305, X25519, P-256, base64, hex, RSA-OAEP, constant-time compare) ore(bytes)
+flume(buffered I/O) herald(logging) crucible(testing) redis(Redis client) mysql(MySQL client)
+postgres(PostgreSQL client) websocket(WebSocket server via anvil, and client). Signatures:
 docs/STDLIB.md.
 
 ## Tests in your own packages
-Go style: `NAME_test.tin` next to the code (same package), `func TestX(t mut crucible.T)` with
+Go style: `NAME_test.tin` next to the code (same package), `fn TestX(t mut crucible.T)` with
 `crucible.Equal(mut t, "label", got, want)`, `t.True`, `t.NoFault`, `t.HasFault`, `t.Error(msg)`;
-`func BenchmarkX(b mut crucible.B)` loops `b.N` times. Run with `tin test ./dir` (`-bench` too).
+`fn BenchmarkX(b mut crucible.B)` loops `b.N` times. Run with `tin test ./dir` (`-bench` too).
 
 ## Verification standard
 For every function, write an equivalent Go program (stdlib only) under bench/ref/NAME/ (its own
@@ -126,7 +172,7 @@ Include edge cases: empty inputs, max/min integers, invalid input producing faul
 Anything that touches the OS must also run on Linux (cross-compile and run in tin-debian-arm64).
 
 ## Deliverables per package
-- lib/NAME.tin (package NAME) with a one-line comment on every exported function.
+- lib/NAME/NAME.tin (package NAME) with a one-line comment on every exported function.
 - tests/v2/NAME.tin: a `package main` program exercising every function, printing results with
   say.Line (deterministic output; temporary files under /tmp/tin-test-*). Then save the expected
   output: run it, sort the output, and write it to tests/v2/NAME.out

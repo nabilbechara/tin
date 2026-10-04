@@ -3,21 +3,20 @@
 import os, re
 
 SKIP = {"runtime", "std", "fmt", "say"}
-ORDER = ["say", "fault", "argo", "io", "anvil", "hearth", "relay", "task", "lane", "wire", "tls", "twine", "glyph", "mint", "gauge", "bits",
+ORDER = ["say", "fault", "argo", "io", "anvil", "hearth", "relay", "task", "wire", "twine", "glyph", "mint", "gauge", "bits",
          "link", "ore", "flume", "quarry", "trail", "lever", "tide", "dice", "sift", "atlas", "cairn", "stamp",
-         "seal", "herald", "crucible", "constraints", "policy", "redis", "mysql", "postgres", "websocket", "replay"]
+         "seal", "herald", "crucible", "constraints", "policy", "redis", "mysql", "postgres", "websocket"]
 ROLE = {"say": "formatting and printing (fmt)", "fault": "fault chains and standard sentinels (errors)", "argo": "JSON (encoding/json)", "anvil": "HTTP/1.1 server (net/http)",
-        "hearth": "cores and threads (runtime)", "relay": "messages between cores (channels)", "task": "deadline and cancellation of the running code (context)", "lane": "bounded queues between tasks on a core (channels)", "wire": "TCP and HTTP client (net)", "tls": "TLS 1.3 client (crypto/tls)",
+        "hearth": "cores and threads (runtime)", "relay": "messages between cores (channels)", "task": "deadline and cancellation of the running code (context)", "wire": "TCP and HTTP client (net)",
         "twine": "strings (strings)", "glyph": "UTF-8 and Unicode (unicode/utf8, unicode)", "mint": "number and string conversion (strconv)",
         "gauge": "math (math)", "bits": "bit counting and manipulation (math/bits)", "link": "URLs and their escaping (net/url)", "io": "streaming shapes (io)", "ore": "byte slices (bytes)", "flume": "buffered I/O (bufio)",
         "quarry": "files, environment, process (os)", "trail": "paths (path/filepath)", "lever": "command-line flags (flag)",
         "tide": "time (time)", "dice": "random numbers (math/rand)", "sift": "sorting, searching and the generic slice functions (sort, slices, cmp)", "atlas": "functions on maps (maps)",
         "cairn": "containers (container/heap, sets, LRU)", "stamp": "hashes and checksums (hash/*)",
-        "seal": "crypto and encodings (crypto/sha256, sha512, hmac, hkdf, ecdh, rsa, x509, encoding/hex, base64, pem)", "herald": "logging (log/slog)",
+        "seal": "crypto and encodings (crypto/sha256, hmac, encoding/hex, base64)", "herald": "logging (log/slog)",
         "crucible": "testing helpers (testing)", "constraints": "named generic constraint shapes",
         "policy": "with policies and slots (context values, retry/cache/trace middleware)",
         "redis": "Redis client (go-redis)",
-        "replay": "production replay capsules (notes/interface_replay.md)",
         "mysql": "MySQL client (database/sql with go-sql-driver/mysql)",
         "postgres": "PostgreSQL client (database/sql with pgx)",
         "websocket": "WebSocket server and client (gorilla/websocket)"}
@@ -45,12 +44,13 @@ def parse(path):
             seen_pkg = True
             comment = []
             continue
-        m = re.match(r"^(?:func|fn) (\([a-z]+ (mut )?[A-Za-z0-9_\[\], ]+\) )?([A-Z][A-Za-z0-9_]*)(\[[^\]]*\])?\((.*)$", line)
+        # Edition 1 declares functions with fn (attributes such as @nopoll first); edition 0 with func.
+        m = re.match(r"^(?:@\w+(?:\([^)]*\))? )*(?:func|fn) (\([a-z]+ (mut )?[A-Za-z0-9_\[\], ]+\) )?([A-Z][A-Za-z0-9_]*)(\[[^\]]*\])?\((.*)$", line)
         t = re.match(r"^type ([A-Z][A-Za-z0-9_]*)", line)
         sh = re.match(r"^shape ([A-Z][A-Za-z0-9_]*)", line)
         c = re.match(r"^const ([A-Z][A-Za-z0-9_]*)", line)
         if m and seen_pkg:
-            sig = line.split(" ", 1)[1].rstrip(" {")
+            sig = re.sub(r"^(?:@\w+(?:\([^)]*\))? )*(?:func|fn) ", "", line).rstrip(" {")
             items.append(("func", sig, " ".join(c.strip() for c in comment)))
         elif t and seen_pkg:
             items.append(("type", line.rstrip(" {"), " ".join(c.strip() for c in comment)))
@@ -61,6 +61,22 @@ def parse(path):
         if not line.startswith("//"):
             comment = []
     return pkgdoc, items
+
+def fence(code):
+    """Append a package comment's example: Tin declarations (```tin), statements (```tin body,
+    which docs_check.py compiles inside a function), or program output (```text)."""
+    while code and not code[-1].strip():
+        code.pop()
+    if re.match(r"^(\d|\$ )", code[0]):
+        lang = "text"
+    elif any(re.match(r"^(fn|type|const|shape|on|import|package)\b", c) for c in code):
+        lang = "tin"
+    else:
+        lang = "tin body"
+    out.append("```" + lang)
+    out.extend(code)
+    out.append("```")
+    out.append("")
 
 out = ["# Tin standard library", "", "Generated from the comments in `lib/*/` by `tools/gendoc.py`.", ""]
 out.append("| package | role (Go equivalent) |")
@@ -94,16 +110,17 @@ for p in ORDER:
                 out.append(" ".join(text))
                 out.append("")
                 text.clear()
-        for c in doc:
+        for i, c in enumerate(doc):
+            # A blank comment line between two indented lines belongs to the example.
+            if code and not c.strip() and i + 1 < len(doc) and doc[i + 1].startswith("\t"):
+                code.append("")
+                continue
             if c.startswith("\t"):
                 flush_text()
                 code.append(c[1:])
             else:
                 if code:
-                    out.append("```go")
-                    out.extend(code)
-                    out.append("```")
-                    out.append("")
+                    fence(code)
                     code = []
                 if c.strip():
                     text.append(c.strip())
@@ -111,10 +128,7 @@ for p in ORDER:
                     flush_text()
         flush_text()
         if code:
-            out.append("```go")
-            out.extend(code)
-            out.append("```")
-            out.append("")
+            fence(code)
     for kind, sig, cm in items:
         out.append(f"- `{sig}`" + (f": {cm}" if cm else ""))
     out.append("")

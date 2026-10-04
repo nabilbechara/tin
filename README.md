@@ -1,6 +1,7 @@
 # Tin
 
-Tin is a compiled, Go-like language for servers and tools. Linux arm64/amd64 is the
+Tin is a compiled language for servers and tools, with Go's packages and blocks and a syntax
+of its own for what Go does not have (edition 1: `fn`, `let`/`mut`, `match`, `within`, `scope`). Linux arm64/amd64 is the
 production target: deployments and benchmarks are Linux. macOS arm64 is supported for
 development (writing, building and testing on a Mac) only. It is meant to be written by AI, so it trades human convenience for speed and robustness: the compiler
 rejects ignored errors, nil dereferences, request memory leaking into long-lived state, and
@@ -17,34 +18,50 @@ shared mutable state between threads.
 - **Strict**: sized integers with no implicit conversions, non-nil references, `?T`
   optionals, faults that must be handled (`try`), mandatory bounds checks (removed when
   proven safe), `defer`, generics by monomorphization.
+- **Servers in the language**: deadlines (`within 200ms { }`), budgets (`limit memory 4mb`),
+  structured tasks (`scope`, `parallel`, `select`), panic guards, `use`/`on` lifecycles,
+  `secret` values and bounded strings are checked by the compiler.
 
-```go
+```tin
 package main
 
-import "say"
-import "argo"
 import "anvil"
+import "argo"
+import "say"
+import "tide"
 
 type Message struct {
 	message str
 }
 
-func hello(q anvil.Req, w mut anvil.Out) {
+fn hello(q anvil.Req, w mut anvil.Out) {
 	w.Json()
 	argo.Put(mut w.Body, Message{message: "Hello, World!"})
 }
 
-func user(q anvil.Req, w mut anvil.Out) {
-	id := q.PathParam("id")
-	w.Text("user {id}")
+fn slow(id str) !str {
+	try tide.Wait(10ms)
+	return "user {id}"
 }
 
-func main() {
-	r := anvil.NewRouter()
+fn user(q anvil.Req, w mut anvil.Out) {
+	let id = q.PathParam("id")
+	let text = within 200ms {
+		try slow(id)
+	} catch err {
+		w.Status(504)
+		"timed out: {err}"
+	}
+	w.Text(text)
+}
+
+fn main() {
+	let r = anvil.NewRouter()
 	r.Get("/json", hello)
 	r.Get(`/users/{id}`, user) // a raw string: in "..." the {id} would interpolate
-	err := r.Serve(":8080")
-	say.Line("server:", err)
+	r.Serve(":8080") catch err {
+		say.Line("server:", err)
+	}
 }
 ```
 
@@ -71,14 +88,16 @@ multi-stage Dockerfiles. To build and test from a source checkout:
 make install                  # build bin/tinc from the seed and put `tin` on the PATH
 tin examples/api.tin          # compile and run
 tin build app.tin -o app      # native executable
-tin test ./mypkg               # run mypkg's *_test.tin tests (Go style)
+tin test ./mypkg              # run mypkg's *_test.tin tests (Go style)
+tin fix -edition 1 old.tin    # rewrite edition-0 (Go-like) code to edition 1
 tin suite                     # the compiler's strict test suite (tests/v2)
 make test                     # the strict suite
 make bootstrap                # tinc rebuilds itself twice; the binaries must be identical
 ```
 
 Documentation: [docs/README.md](docs/README.md), the index. The language reference is
-[docs/LANGUAGE.md](docs/LANGUAGE.md), the standard library [docs/STDLIB.md](docs/STDLIB.md)
+[docs/LANGUAGE.md](docs/LANGUAGE.md) (agents start with the short
+[docs/AGENT_PRIMER.md](docs/AGENT_PRIMER.md)), the standard library [docs/STDLIB.md](docs/STDLIB.md)
 (generated from the sources by `tools/gendoc.py`), commands and builds
 [docs/TOOLING.md](docs/TOOLING.md), targets and containers [docs/PORTING.md](docs/PORTING.md),
 the runtime [docs/RUNTIME.md](docs/RUNTIME.md), the compiler
@@ -198,7 +217,7 @@ binary-trees uses 917 MB against Go's 37 MB: a plain program never resets its po
 
 ## Layout
 
-```
+```text
 selfhost/    the compiler: lex, parse, check, lower, generics, region, inline, opt,
              gen + asm (arm64), gen_x64 + asm_x64, macho, elf, elf_x64
 lib/         the runtime and the standard library, one directory per package (see lib/README.md)

@@ -31,9 +31,10 @@ example.tin:11:6: error E510 NOT_IN_UNION: type str does not satisfy the constra
 Each entry below gives the rule, a program that breaks it with the exact output the compiler
 prints for it, and the fixes. `tools/ci/diagnostics_check.py` compiles every example and
 requires that output, and checks that the compiler, this page and the tests' expected
-diagnostics agree on every code and name. Examples use the syntax of LANGUAGE.md (edition 0)
-and are compiled with `-edition 0`; an example opened with ```` ```tin edition=1 ```` is
-edition 1 syntax and is compiled with `-edition 1`.
+diagnostics agree on every code and name. Examples are edition 1, the syntax of LANGUAGE.md,
+opened with ```` ```tin edition=1 ```` and compiled with `-edition 1`. A few diagnostics only
+edition 0 (the syntax before it) can produce; their examples are opened with
+the fence ```` ```tin edition=0 ```` and compiled with `-edition 0`.
 
 An example for an error about the command line or the installation shows its command in a
 ```` ```sh ```` block (one line, `[VAR=value ...] tinc ARGS`), and a block opened with
@@ -102,10 +103,10 @@ Fix: check the path (it is relative to the current directory) and that the file 
 Outside strings and comments, a program uses only the characters of Tin's tokens: letters,
 digits, `_`, operators and punctuation.
 
-```tin
+```tin edition=1
 package main
 
-func main() {
+fn main() {
 	let price = 5 $ 2
 	_ = price
 }
@@ -122,10 +123,10 @@ Fix: remove the character, or put the text in a string.
 A number literal uses only the digits of its base (`0x` hexadecimal, `0b` binary, `0o`
 octal), with `_` only between two digits, and an integer literal fits in 64 bits.
 
-```tin
+```tin edition=1
 package main
 
-func main() {
+fn main() {
 	let mask = 0x1g
 	_ = mask
 }
@@ -162,12 +163,12 @@ Fix: use one of the units (`30s`), or put a space or an operator between the num
 A string literal is closed by `"` on the line where it starts, a raw string by a backquote
 before the end of the file, and an escape sequence is complete.
 
-```tin
+```tin edition=1
 package main
 
 import "say"
 
-func main() {
+fn main() {
 	say.Line("hello)
 }
 ```
@@ -183,10 +184,10 @@ Fix: close the string; for text over several lines, use a raw backquote string o
 A character literal holds exactly one character or escape between single quotes: `'a'`,
 `'\n'`, `'é'`.
 
-```tin
+```tin edition=1
 package main
 
-func main() {
+fn main() {
 	let c = 'ab'
 	_ = c
 }
@@ -203,12 +204,12 @@ Fix: write one character, or use a string (`"ab"`) for more.
 A backslash in a string or character starts one of Go's escapes: `\n`, `\t`, `\r`, `\a`,
 `\b`, `\f`, `\v`, `\\`, `\'`, `\"`, up to three octal digits, `\xHH`, `\uHHHH` or `\UHHHHHHHH`.
 
-```tin
+```tin edition=1
 package main
 
 import "say"
 
-func main() {
+fn main() {
 	say.Line("C:\path")
 }
 ```
@@ -224,12 +225,12 @@ Fix: double the backslash (`"C:\\path"`), or use a raw backquote string, which h
 The parser found a token where the grammar needs something else. The message names what
 was expected and what was found (`found newline` when a line ended early).
 
-```tin
+```tin edition=1
 package main
 
 import "say"
 
-func main() {
+fn main() {
 	say.Line("total" 3)
 }
 ```
@@ -243,35 +244,36 @@ missing comma, operator, parenthesis or brace.
 
 ### E021 CONST_VALUES
 
-A constant declaration gives every name a value: one value per name.
+A constant declaration gives its name a value.
 
-```tin
+```tin edition=1
 package main
 
-const width, height = 640
+const width = 640
+const height
 
-func main() {
+fn main() {
 }
 ```
 
 ```text
-example.tin:3:7: error E021 CONST_VALUES: constant declaration count mismatch
+example.tin:4:7: error E021 CONST_VALUES: missing constant value
 ```
 
-Fix: give one value per name (`const width, height = 640, 480`), or declare each constant on its
-own.
+Fix: give the constant a value (`const height = 480`). (In edition 0, `const width, height = 640`
+also gives this code: one value per name.)
 
 ### E030 INTERPOLATION
 
 In a string, `{` starts a value that ends at the matching `}`, and one `{...}` holds one
 value (with an optional format spec, `{price:.2}`). A literal brace is written `{{` or `}}`.
 
-```tin
+```tin edition=1
 package main
 
 import "say"
 
-func main() {
+fn main() {
 	let n = 3
 	say.Line("total: {n")
 }
@@ -309,7 +311,7 @@ Fix: put the attribute on the function it is meant for, or remove it.
 
 A struct field takes only the attributes the language defines: `@json("name")`.
 
-```tin
+```tin edition=0 old-syntax
 package main
 
 type User struct {
@@ -324,20 +326,21 @@ func main() {
 example.tin:3:11: error E041 UNKNOWN_ATTRIBUTE: unknown struct attribute; supported attributes are @json("name")
 ```
 
-Fix: correct the spelling (`@json("id")`), or remove the attribute.
+Fix: correct the spelling (`@json("id")`), or remove the attribute. The example is edition 0:
+edition 1 does not reject unknown attributes yet.
 
 ### E042 ATTRIBUTE_ARGS
 
 `@json` takes one string literal: the field's name in JSON.
 
-```tin
+```tin edition=1
 package main
 
 type User struct {
-	ID i64 @json(1)
+	@json(1) id i64
 }
 
-func main() {
+fn main() {
 }
 ```
 
@@ -371,7 +374,7 @@ Fix: list the element types (`(i64, str)`), or leave the result out when there i
 Every field of an enum variant has a type. Names that share a type are listed before it:
 `Rect(w, h f64)`.
 
-```tin
+```tin edition=0 old-syntax
 package main
 
 type Shape enum { Rect(w, h,), Empty }
@@ -384,18 +387,19 @@ func main() {
 example.tin:3:12: error E044 ENUM_FIELD_TYPES: an enum variant's fields need types: Variant(name Type, ...)
 ```
 
-Fix: give the last field names their type: `Rect(w, h f64)`.
+Fix: give the last field names their type: `Rect(w, h f64)`. Edition 1 variants list only
+types (`Rect(f64, f64)`), so this is an edition 0 error.
 
 ### E045 EMPTY_ENUM
 
 An enum declares at least one variant.
 
-```tin
+```tin edition=1
 package main
 
 type Shape enum { }
 
-func main() {
+fn main() {
 }
 ```
 
@@ -519,10 +523,10 @@ Fix: use literal endpoints, or bind the value and test it in a guard.
 
 `defer` takes a function call, which runs when the function returns.
 
-```tin
+```tin edition=1
 package main
 
-func main() {
+fn main() {
 	let n = 1
 	defer n
 }
@@ -538,6 +542,8 @@ Fix: defer a call (`defer f.Close()`); wrap anything else in a function and defe
 
 Edition 1 replaces some edition 0 syntax; the message names the replacement:
 
+<!-- docs-check: old-syntax begin -->
+
 | edition 0 | edition 1 |
 |---|---|
 | `func` | `fn` (also for function types) |
@@ -550,7 +556,9 @@ Edition 1 replaces some edition 0 syntax; the message names the replacement:
 | positional struct literals `P{1, 2}` | `P{x: 1, y: 2}` |
 | `/* */` comments, `;` between statements | `//` comments, one statement per line |
 
-```tin edition=1
+<!-- docs-check: old-syntax end -->
+
+```tin edition=1 old-syntax
 package main
 
 func main() {
@@ -607,14 +615,14 @@ Fix: write the file in the syntax the statement needs (`tin fix -edition 1` conv
 A name is declared once in its scope. Two package-level declarations of one name, such as
 two shapes, are an error at the second one.
 
-```tin
+```tin edition=1
 package main
 
 shape Reader { Read(buf mut []u8) !i64 }
 
 shape Reader { Write(data []u8) !i64 }
 
-func main() {
+fn main() {
 }
 ```
 
@@ -629,14 +637,14 @@ Fix: rename one of the declarations, or merge them into one.
 The compiler's intrinsics (`load8`, `store8` and the names that start with `__`, which the
 standard library uses) are names of their own; a declaration cannot take one of them.
 
-```tin
+```tin edition=1
 package main
 
-func load8(p i64) i64 {
+fn load8(p i64) i64 {
 	return p
 }
 
-func main() {
+fn main() {
 }
 ```
 
@@ -651,11 +659,11 @@ Fix: give the declaration another name.
 Every name refers to a declaration in scope: a local, a parameter, a package-level
 declaration of this package, or an imported package.
 
-```tin
+```tin edition=1
 package main
 
-func main() {
-	var n Count
+fn main() {
+	let n Count = 0
 	_ = n
 }
 ```
@@ -671,12 +679,12 @@ Fix: declare the name before using it, correct its spelling, or import its packa
 A lower-case name is private to its package: only capitalized names, methods and fields
 are exported.
 
-```tin
+```tin edition=1
 package main
 
 import "twine"
 
-func main() {
+fn main() {
 	_ = twine.isASCII("abc")
 }
 ```
@@ -694,12 +702,12 @@ An import path names a package in `vendor/`, in the standard library, or next to
 program's first file; a path starting with `./` names a package next to the importing file
 (docs/PACKAGES.md).
 
-```tin
+```tin edition=1
 package main
 
 import "geom"
 
-func main() {
+fn main() {
 }
 ```
 
@@ -721,15 +729,15 @@ message names the file, the hash the lock records and the hash the file has.
 0000000000000000000000000000000000000000000000000000000000000000 example.tin
 ```
 
-```tin
+```tin edition=1
 package main
 
-func main() {
+fn main() {
 }
 ```
 
 ```text
-error E111 LOCK_MISMATCH: tin.lock hash mismatch for example.tin: the lock records sha256 0000000000000000000000000000000000000000000000000000000000000000, the file has 7531bb038e7638befa0dc8bdd22788bf076dbef70ab580b80adb3087074f96ba
+error E111 LOCK_MISMATCH: tin.lock hash mismatch for example.tin: the lock records sha256 0000000000000000000000000000000000000000000000000000000000000000, the file has 4eb9194b972df4b054a21723df19a9782709caaac26e7ba26e47ce961ac898a1
 ```
 
 Fix: review the change; if it is intended, run `tin vendor` to copy the dependency again and
@@ -741,12 +749,12 @@ An import path whose first element contains a dot (`github.com/ana/geo`) names a
 where it comes from. It is read only from `vendor/<path>` in the program's directory: never
 from the standard library, and never from the network (docs/PACKAGES.md).
 
-```tin
+```tin edition=1
 package main
 
 import "example.com/geo"
 
-func main() {
+fn main() {
 }
 ```
 
@@ -764,17 +772,17 @@ different packages under the same name would merge into one package.
 ```text file=vendor/example.com/say/say.tin
 package say
 
-func Hi() {
+fn Hi() {
 }
 ```
 
-```tin
+```tin edition=1
 package main
 
 import "say"
 import "example.com/say"
 
-func main() {
+fn main() {
 }
 ```
 
@@ -799,17 +807,17 @@ caps network
 ```text file=vendor/example.com/peek/peek.tin
 package peek
 
-func Up() bool {
+fn Up() bool {
 	return false
 }
 ```
 
-```tin
+```tin edition=1
 package main
 
 import "example.com/peek"
 
-func main() {
+fn main() {
 	peek.Up()
 }
 ```
@@ -834,7 +842,7 @@ caps net
 ```text file=vendor/example.com/peek/peek.tin
 package peek
 
-func Up() bool {
+fn Up() bool {
 	return false
 }
 ```
@@ -844,12 +852,12 @@ func Up() bool {
 caps example.com/peek
 ```
 
-```tin
+```tin edition=1
 package main
 
 import "example.com/peek"
 
-func main() {
+fn main() {
 	peek.Up()
 }
 ```
@@ -864,10 +872,10 @@ Fix: run `tin vendor`, and review the capability the dependency now asks for.
 
 A program has a `main` function, where it starts.
 
-```tin
+```tin edition=1
 package main
 
-func Main() {
+fn Main() {
 }
 ```
 
@@ -875,17 +883,17 @@ func Main() {
 error E120 NO_MAIN: no main function
 ```
 
-Fix: add `func main()` to the program's `package main`.
+Fix: add `fn main()` to the program's `package main`.
 
 ### E121 MAIN_SIGNATURE
 
 `main` takes no parameters (the program reads its arguments with `lever`; `(argc, argv)`
 is the legacy form the compiler itself uses), and it is not `extern`.
 
-```tin
+```tin edition=1
 package main
 
-func main(name str) {
+fn main(name str) {
 }
 ```
 
@@ -893,22 +901,22 @@ func main(name str) {
 example.tin:3:1: error E121 MAIN_SIGNATURE: main takes no parameters or (argc, argv)
 ```
 
-Fix: declare `func main()` and read the command line with the `lever` package.
+Fix: declare `fn main()` and read the command line with the `lever` package.
 
 ### E130 INIT_ORDER
 
 Constants and globals are initialized in declaration order, so an initializer uses only
 those declared before it.
 
-```tin
+```tin edition=1
 package main
 
 import "say"
 
-var total i64 = base * 2
-var base i64 = 21
+let total i64 = base * 2
+let base i64 = 21
 
-func main() {
+fn main() {
 	say.Line(total)
 }
 ```
@@ -923,14 +931,14 @@ Fix: move the declaration that is used above the one that uses it.
 
 A method belongs to a struct (or enum) type declared in the same package.
 
-```tin
+```tin edition=1
 package main
 
-func (n i64) Double() i64 {
+fn (n i64) Double() i64 {
 	return n * 2
 }
 
-func main() {
+fn main() {
 }
 ```
 
@@ -938,7 +946,7 @@ func main() {
 example.tin:3:1: error E140 RECEIVER: methods need a struct receiver, not i64
 ```
 
-Fix: write a function that takes the value (`func double(n i64) i64`), or declare a struct
+Fix: write a function that takes the value (`fn double(n i64) i64`), or declare a struct
 that holds it and give the struct the method.
 
 ## E2xx Types, expressions and calls
@@ -948,17 +956,17 @@ that holds it and give the struct the method.
 A map compares its keys by value, so a key is a `str`, a number, a `bool`, or a struct or
 enum made of those. Slices, maps and other references have no value to compare.
 
-```tin
+```tin edition=1
 package main
 
-func main() {
-	seen := map[[]i64]bool{}
+fn main() {
+	let seen = map[[]i64]bool{}
 	_ = len(seen)
 }
 ```
 
 ```text
-example.tin:4:10: error E201 MAP_KEY: a map key must compare by value (str, numbers, bool, or structs and enums of those), not []i64
+example.tin:4:13: error E201 MAP_KEY: a map key must compare by value (str, numbers, bool, or structs and enums of those), not []i64
 ```
 
 Fix: key the map by a value that stands for the slice, such as a `str` built from it, or a
@@ -969,19 +977,19 @@ struct of its fields.
 An array `[N]T` has a constant length of zero or more, and its rows of arrays hold numbers,
 `bool`s and `str`s.
 
-```tin
+```tin edition=1
 package main
 
 const size = -2
 
-func main() {
-	var grid [size]i64
-	_ = grid
+mut grid [size]i64
+
+fn main() {
 }
 ```
 
 ```text
-example.tin:6:11: error E202 ARRAY_TYPE: array length must not be negative
+example.tin:5:10: error E202 ARRAY_TYPE: array length must not be negative
 ```
 
 Fix: give the array a length of zero or more; for other elements, use a slice and `append`.
@@ -992,24 +1000,24 @@ Structs, maps, functions and `dyn` values are never nil, so they have no zero va
 variable of such a type needs an initializer, and an array or a slice made with a length
 cannot start with such elements.
 
-```tin
+```tin edition=1
 package main
 
 type Point struct {
 	x i64
 }
 
-func main() {
-	var p Point
-	_ = p
+mut p Point
+
+fn main() {
 }
 ```
 
 ```text
-example.tin:8:2: error E203 NO_ZERO_VALUE: a variable of type Point needs an initializer (it cannot be nil; use ?T for an optional)
+example.tin:7:5: error E203 NO_ZERO_VALUE: a variable of type Point needs an initializer (it cannot be nil; use ?T for an optional)
 ```
 
-Fix: initialize the variable (`p := Point{}`), use `?T` for a value that may be missing, or
+Fix: initialize the variable (`mut p = Point{}`), use `?T` for a value that may be missing, or
 make the slice empty with a capacity (`make([]T, 0, n)`) and `append`.
 
 ### E210 ARG_COUNT
@@ -1017,17 +1025,17 @@ make the slice empty with a capacity (`make([]T, 0, n)`) and `append`.
 A call passes exactly as many arguments as the function has parameters (a variadic
 parameter takes the rest).
 
-```tin
+```tin edition=1
 package main
 
-func Max[T i64 | f64](a T, b T) T {
+fn Max[T i64 | f64](a T, b T) T {
 	if a > b {
 		return a
 	}
 	return b
 }
 
-func main() {
+fn main() {
 	_ = Max(1, 2, 3)
 }
 ```
@@ -1043,15 +1051,15 @@ parameter variadic (`xs ...T`) or pass a slice.
 
 `xs...` passes a slice as the variadic parameter, so it is the last argument of a call.
 
-```tin
+```tin edition=1
 package main
 
-func sum(base i64, xs ...i64) i64 {
+fn sum(base i64, xs ...i64) i64 {
 	return base
 }
 
-func main() {
-	xs := []i64{1, 2}
+fn main() {
+	let xs = []i64{1, 2}
 	_ = sum(xs..., 3)
 }
 ```
@@ -1067,15 +1075,15 @@ Fix: put the spread slice last, and pass the other values before it.
 A selector reads a field the struct declares; an enum's values are read with `switch` or
 `match`, and other types have no fields.
 
-```tin
+```tin edition=1
 package main
 
 type User struct {
 	Name str
 }
 
-func main() {
-	u := User{Name: "ada"}
+fn main() {
+	let u = User{Name: "ada"}
 	_ = u.Email
 }
 ```
@@ -1090,15 +1098,15 @@ Fix: correct the field name, or add the field to the struct.
 
 A method call names a method of the value's type (or of its shape, for a `dyn` value).
 
-```tin
+```tin edition=1
 package main
 
 type User struct {
 	Name str
 }
 
-func main() {
-	u := User{Name: "ada"}
+fn main() {
+	let u = User{Name: "ada"}
 	u.Save()
 }
 ```
@@ -1107,17 +1115,17 @@ func main() {
 example.tin:9:3: error E214 METHOD: User has no method Save
 ```
 
-Fix: correct the method name, or declare the method (`func (u User) Save()`).
+Fix: correct the method name, or declare the method (`fn (u User) Save()`).
 
 ### E215 NOT_CALLABLE
 
 Only functions and function values can be called.
 
-```tin
+```tin edition=1
 package main
 
-func main() {
-	n := 3
+fn main() {
+	let n = 3
 	n()
 }
 ```
@@ -1134,7 +1142,7 @@ A composite literal names its type (`T{...}`), sets fields of a struct by name, 
 in a map literal, and builds only structs, slices, arrays and maps; an enum value is built
 with a variant (`Shape.Circle(2)`).
 
-```tin
+```tin edition=1
 package main
 
 type Point struct {
@@ -1142,14 +1150,14 @@ type Point struct {
 	Y i64
 }
 
-func main() {
-	p := Point{X: 1, Z: 2}
+fn main() {
+	let p = Point{X: 1, Z: 2}
 	_ = p
 }
 ```
 
 ```text
-example.tin:9:19: error E216 COMPOSITE: unknown field 'Z'
+example.tin:9:22: error E216 COMPOSITE: unknown field 'Z'
 ```
 
 Fix: set the fields the struct declares, by name.
@@ -1160,11 +1168,11 @@ The builtins take fixed kinds of arguments: `len(x)`, `append(s, v...)` on a sli
 `make([]T, n)` or `make(map[K]V)`, `copy(dst, src)`, `delete(m, k)`, `panic(v)` and
 `keep(v)`.
 
-```tin
+```tin edition=1
 package main
 
-func main() {
-	m := map[str]i64{}
+fn main() {
+	let m = map[str]i64{}
 	delete(m)
 }
 ```
@@ -1180,21 +1188,21 @@ Fix: give the builtin the arguments it takes (`delete(m, "k")`).
 A constant's value, an array length and a constant expression are computed by the compiler,
 so they use only literals, other constants and operators.
 
-```tin
+```tin edition=1
 package main
 
-func size() i64 {
+fn size() i64 {
 	return 4
 }
 
-const limit = size()
+const maxSize = size()
 
-func main() {
+fn main() {
 }
 ```
 
 ```text
-example.tin:7:15: error E220 NOT_CONSTANT: expression is not a constant
+example.tin:7:17: error E220 NOT_CONSTANT: expression is not a constant
 ```
 
 Fix: write the value with literals and constants, or make it a variable.
@@ -1204,12 +1212,12 @@ Fix: write the value with literals and constants, or make it a variable.
 An integer constant can be used where its value fits a number type; it cannot become a
 `str`, a `bool` or another non-number.
 
-```tin
+```tin edition=1
 package main
 
 const name str = 7
 
-func main() {
+fn main() {
 }
 ```
 
@@ -1223,13 +1231,13 @@ Fix: write a constant of the right kind (`const name = "7"`), or convert where i
 
 A constant expression that divides by zero (`/` or `%`) has no value.
 
-```tin
+```tin edition=1
 package main
 
 const parts = 0
 const share = 100 / parts
 
-func main() {
+fn main() {
 }
 ```
 
@@ -1243,11 +1251,11 @@ Fix: divide by a constant that is not zero.
 
 A constant fits the type it becomes: `300` is not a `u8`.
 
-```tin
+```tin edition=1
 package main
 
-func main() {
-	var b u8 = 300
+fn main() {
+	let b u8 = 300
 	_ = b
 }
 ```
@@ -1263,11 +1271,11 @@ Fix: use a wider type, or a value in range.
 A value is used where its type is expected: there are no implicit conversions, so an `i64`
 is not a `str`, an `i32` is not an `i64`, and `str max 3` is not `str max 2`.
 
-```tin
+```tin edition=1
 package main
 
-func main() {
-	var n i64 = "seven"
+fn main() {
+	let n i64 = "seven"
 	_ = n
 }
 ```
@@ -1284,18 +1292,18 @@ value's type.
 A conversion `T(x)` changes a value between number types, between a number and a rune or
 byte, or between `str` and `[]u8`; other conversions do not exist.
 
-```tin
+```tin edition=1
 package main
 
-func main() {
-	s := "12"
-	n := i64(s)
+fn main() {
+	let s = "12"
+	let n = i64(s)
 	_ = n
 }
 ```
 
 ```text
-example.tin:5:7: error E231 CONVERSION: cannot convert str to i64
+example.tin:5:10: error E231 CONVERSION: cannot convert str to i64
 ```
 
 Fix: parse text with `mint.Atoi(s)` (or `mint.ParseFloat`), and format a number with
@@ -1306,11 +1314,11 @@ Fix: parse text with `mint.Atoi(s)` (or `mint.ParseFloat`), and format a number 
 `if`, `for` and the other conditions take a `bool`; numbers, strings and optionals are not
 true or false by themselves.
 
-```tin
+```tin edition=1
 package main
 
-func main() {
-	n := 3
+fn main() {
+	mut n = 3
 	if n {
 		n = 0
 	}
@@ -1328,21 +1336,21 @@ Fix: compare explicitly (`if n != 0`, `if s != ""`, `if p != nil`).
 `nil` has no type of its own; it is a value of an optional (`?T`) or a fault, so it needs a
 type from where it goes.
 
-```tin
+```tin edition=1
 package main
 
-func main() {
-	x := nil
+fn main() {
+	let x = nil
 	_ = x
 }
 ```
 
 ```text
-example.tin:4:7: error E233 UNTYPED_NIL: nil needs an optional (?T) or fault type
-example.tin:4:7: error E233 UNTYPED_NIL: use of untyped nil
+example.tin:4:10: error E233 UNTYPED_NIL: nil needs an optional (?T) or fault type
+example.tin:4:10: error E233 UNTYPED_NIL: use of untyped nil
 ```
 
-Fix: write the type (`var x ?Point = nil`).
+Fix: write the type (`let x ?Point = nil`).
 
 ### E234 VALUE_COUNT
 
@@ -1350,19 +1358,19 @@ An assignment has one target per value, and places that take one value (a `try` 
 initializes a variable, a line of `parallel`, the last expression of a boundary block) get
 exactly one.
 
-```tin
+```tin edition=1
 package main
 
 import "say"
 
-func pair() (i64, i64) {
+fn pair() (i64, i64) {
 	return 1, 2
 }
 
-func main() {
-	a := 0
-	b := 0
-	c := 0
+fn main() {
+	let a = 0
+	let b = 0
+	let c = 0
 	a, b, c = pair()
 	say.Line(a, b, c)
 }
@@ -1378,19 +1386,19 @@ Fix: give as many names as there are values (use `_` for the ones you do not nee
 
 A type, or a package name on its own, is not a value.
 
-```tin
+```tin edition=1
 package main
 
 import "say"
 
-func main() {
-	x := say
+fn main() {
+	let x = say
 	_ = x
 }
 ```
 
 ```text
-example.tin:6:7: error E235 NOT_A_VALUE: use of package 'say' without a selector
+example.tin:6:10: error E235 NOT_A_VALUE: use of package 'say' without a selector
 ```
 
 Fix: select from the package (`say.Line`), or build a value of the type (`T{}`).
@@ -1401,12 +1409,12 @@ Each operator works on its own kinds of operands: arithmetic on numbers (and `+`
 `str`), `%`, bit operators and shifts on integers, `!`, `&&` and `||` on `bool`, and `<`,
 `<=`, `>`, `>=` on numbers and `str`.
 
-```tin
+```tin edition=1
 package main
 
-func main() {
-	ok := true
-	n := 3
+fn main() {
+	let ok = true
+	mut n = 3
 	if ok && n {
 		n = 0
 	}
@@ -1425,17 +1433,17 @@ Fix: compare to get a `bool` (`n != 0`), or convert the operand.
 structs (by identity), and enums whose variants hold such values. `dyn` values and
 functions do not compare.
 
-```tin
+```tin edition=1
 package main
 
 type Job enum {
-	Run(f func()),
-	Idle,
+	Run(fn())
+	Idle
 }
 
-func main() {
-	a := Job.Idle
-	b := Job.Idle
+fn main() {
+	let a = Job.Idle
+	let b = Job.Idle
 	_ = a == b
 }
 ```
@@ -1451,11 +1459,11 @@ Fix: compare the parts that have equality, or give the type a method that compar
 `x[i]` indexes a slice, an array, a `str` or a map, with an integer index (a map takes its
 key type); slicing `x[a:b]` works on slices, arrays and `str`.
 
-```tin
+```tin edition=1
 package main
 
-func main() {
-	xs := []i64{1, 2, 3}
+fn main() {
+	let xs = []i64{1, 2, 3}
 	_ = xs["1"]
 }
 ```
@@ -1470,22 +1478,22 @@ Fix: index with an integer (convert with `mint.Atoi` or `i64(x)`).
 
 An enum value is built with one of its variants, passing exactly the values it declares.
 
-```tin
+```tin edition=1
 package main
 
 type Shape enum {
-	Circle(r f64),
-	Rect(w, h f64),
+	Circle(f64)
+	Rect(f64, f64)
 }
 
-func main() {
-	s := Shape.Rect(2)
+fn main() {
+	let s = Shape.Rect(2.0)
 	_ = s
 }
 ```
 
 ```text
-example.tin:9:12: error E239 VARIANT: Shape.Rect takes 2 values, got 1
+example.tin:9:15: error E239 VARIANT: Shape.Rect takes 2 values, got 1
 ```
 
 Fix: pass every value of the variant (`Shape.Rect(2, 3)`), or use a variant the enum
@@ -1705,16 +1713,16 @@ Fix: write the bounded type: `let b str max 100 = try bound(raw)`.
 A function with results ends with a `return` (or `fail`, `panic`, or an `if`/`switch`/loop
 that does on every path), so it never runs off its end.
 
-```tin
+```tin edition=1
 package main
 
-func sign(n i64) i64 {
+fn sign(n i64) i64 {
 	if n < 0 {
 		return -1
 	}
 }
 
-func main() {
+fn main() {
 }
 ```
 
@@ -1728,11 +1736,11 @@ Fix: add the `return` for the remaining paths.
 
 `break` and `continue` (without a label) belong to the innermost `for` loop around them.
 
-```tin
+```tin edition=1
 package main
 
-func main() {
-	n := 1
+fn main() {
+	let n = 1
 	if n > 0 {
 		break
 	}
@@ -1750,14 +1758,14 @@ Fix: use `return` to leave the function, or move the statement into the loop.
 `return` gives one value per result of the function, and a function without results
 returns none.
 
-```tin
+```tin edition=1
 package main
 
-func both() (i64, str) {
+fn both() (i64, str) {
 	return 1
 }
 
-func main() {
+fn main() {
 }
 ```
 
@@ -1769,9 +1777,9 @@ Fix: return every result, in order (`return 1, "one"`).
 
 ### E263 RANGE
 
-`for ... range` walks a slice, an array, a `str` (by rune), a map or a count of integers.
+`for x in` walks a slice, an array, a `str` (by rune), a map or a count of integers.
 
-```tin
+```tin edition=1
 package main
 
 type Point struct {
@@ -1779,9 +1787,9 @@ type Point struct {
 	y i64
 }
 
-func main() {
-	p := Point{x: 1, y: 2}
-	for i := range p {
+fn main() {
+	let p = Point{x: 1, y: 2}
+	for i in p {
 		_ = i
 	}
 }
@@ -1799,13 +1807,13 @@ returns one.
 A deferred call runs once, when the function returns: so `defer` is not used in a loop,
 and a deferred call does not return a fault it would drop.
 
-```tin
+```tin edition=1
 package main
 
 import "say"
 
-func main() {
-	for i := 0; i < 3; i++ {
+fn main() {
+	for i in 0..3 {
 		defer say.Line(i)
 	}
 }
@@ -1823,14 +1831,14 @@ the fault rather than one that returns it.
 A parameter of type `query` (a database or Redis command) takes a string literal: the
 values in its `{...}` are sent apart from the text, so a value can never change the command.
 
-```tin
+```tin edition=1
 package main
 
-func run(q query) {
+fn run(q query) {
 }
 
-func main() {
-	text := "SELECT name FROM users WHERE id = 7"
+fn main() {
+	let text = "SELECT name FROM users WHERE id = 7"
 	run(text)
 }
 ```
@@ -1847,17 +1855,17 @@ Fix: write the value in the literal: `run("SELECT name FROM users WHERE id = {id
 fills a struct, slice or map from JSON; both need `import "argo"` and a type argo can
 encode (no functions, `dyn` values or maps with other keys than `str` and integers).
 
-```tin
+```tin edition=1
 package main
 
 import "argo"
 
 type Job struct {
-	Run func()
+	Run fn()
 }
 
-func main() {
-	buf := []u8{}
+fn main() {
+	let buf = []u8{}
 	argo.Put(mut buf, Job{Run: main})
 }
 ```
@@ -1873,13 +1881,13 @@ enums of those).
 
 `say.Out`, `say.Fmt` and the other printf-style calls take a format string first.
 
-```tin
+```tin edition=1
 package main
 
 import "say"
 
-func main() {
-	n := 3
+fn main() {
+	let n = 3
 	say.Out(n)
 }
 ```
@@ -1896,30 +1904,30 @@ A case of a `switch` or an arm of a `match` fits the value: a variant of the enu
 matches, with as many names as the variant has values, or a literal or range of a number or
 `str`.
 
-```tin
+```tin edition=1
 package main
 
 type Shape enum {
-	Circle(r f64),
-	Rect(w, h f64),
+	Circle(f64)
+	Rect(f64, f64)
 }
 
-func area(s Shape) f64 {
-	switch s {
-	case Circle(r):
-		return 3 * r * r
-	case Rect(w):
-		return 1
+fn area(s Shape) f64 {
+	return match s {
+		Circle(r) => 3.0 * r * r
+		Rect(w) => w
 	}
-	return 0
 }
 
-func main() {
+fn main() {
 }
 ```
 
 ```text
-example.tin:12:7: error E290 MATCH_PATTERN: Rect has 2 values, the case binds 1
+example.tin:11:3: error E290 MATCH_PATTERN: Rect has 2 values, the pattern has 1
+example.tin:9:9: error E291 MATCH_EXHAUSTIVE: match on Shape does not handle Rect (add the arms, or _)
+example.tin:11:14: error E103 UNDEFINED: undefined: w
+example.tin:11:14: error E230 TYPE_MISMATCH: cannot use i64 as f64
 ```
 
 Fix: name every value of the variant (`case Rect(w, h)`), and match only variants of the
@@ -1930,31 +1938,28 @@ enum.
 A `switch` on an enum, and a `match` that gives a value, handle every variant (or have a
 `default` / `_` arm), so adding a variant shows every place to update.
 
-```tin
+```tin edition=1
 package main
 
 type Light enum {
-	Red,
-	Amber,
-	Green,
+	Red
+	Amber
+	Green
 }
 
-func next(l Light) Light {
-	switch l {
-	case Red:
-		return Light.Green
-	case Green:
-		return Light.Amber
+fn next(l Light) Light {
+	return match l {
+		Red => Light.Green
+		Green => Light.Amber
 	}
-	return l
 }
 
-func main() {
+fn main() {
 }
 ```
 
 ```text
-example.tin:10:2: error E291 MATCH_EXHAUSTIVE: switch on Light does not handle Amber (add the cases, or a default)
+example.tin:10:9: error E291 MATCH_EXHAUSTIVE: match on Light does not handle Amber (add the arms, or _)
 ```
 
 Fix: add the missing cases, or a `default` arm when the rest share one answer.
@@ -2020,18 +2025,18 @@ Memory allocated during a request lives in the core's request pool, which is wip
 request ends. Storing it into a global, or into anything a global can reach, would leave a
 dangling reference, so `keep(x)` must copy it into the long-lived heap first.
 
-```tin
+```tin edition=1
 package main
 
 import "say"
 
-var last str
+mut last str
 
-func remember(name str) {
+fn remember(name str) {
 	last = name
 }
 
-func main() {
+fn main() {
 	remember(say.Fmt("user-%d", 7))
 }
 ```
@@ -2048,23 +2053,23 @@ A closure that may outlive the request (one passed to `keep`, stored in a global
 returned) holds its captured variables in long-lived memory, so storing request memory into
 one of them would dangle.
 
-```tin
+```tin edition=1
 package main
 
 import "say"
 
-func recorder() func(str) str {
-	last := "nobody"
-	return func(s str) str {
-		prev := last
+fn recorder() (fn(str) str) {
+	mut last = "nobody"
+	return fn(s str) str {
+		let prev = last
 		last = s
 		return prev
 	}
 }
 
-var rec func(str) str = keep(recorder())
+let rec fn(str) str = keep(recorder())
 
-func main() {
+fn main() {
 	say.Line(rec(say.Fmt("session-%d", 42)))
 }
 ```
@@ -2081,7 +2086,7 @@ A function that stores request memory into a `mut` parameter must be given an ar
 that lives no longer than the request. Passing a global, or anything long-lived, through
 that parameter would let request memory escape (the same rule as E310, through a call).
 
-```tin
+```tin edition=1
 package main
 
 import "say"
@@ -2090,13 +2095,13 @@ type Box struct {
 	Items []str
 }
 
-var box Box = Box{}
+let box Box = Box{}
 
-func put(b mut Box, s str) {
+fn put(b mut Box, s str) {
 	b.Items = append(b.Items, s)
 }
 
-func main() {
+fn main() {
 	put(mut box, say.Fmt("item-%d", 1))
 }
 ```
@@ -2112,14 +2117,14 @@ Fix: pass a local instead of the long-lived value, or make the function store `k
 `hearth.Reset()` frees the request pool, so a value allocated before the reset cannot be
 read after it.
 
-```tin
+```tin edition=1
 package main
 
 import "hearth"
 import "say"
 
-func main() {
-	s := say.Fmt("fresh-%d", 1)
+fn main() {
+	let s = say.Fmt("fresh-%d", 1)
 	hearth.Reset()
 	say.Line(s)
 }
@@ -2232,17 +2237,17 @@ instead of a handler), and build the rest after the block.
 `keep(x)` copies a value into the long-lived heap, following every reference in it; a type
 that contains itself through references would need a copy without end.
 
-```tin
+```tin edition=1
 package main
 
 type Node struct {
 	next ?Node
 }
 
-var head ?Node = nil
+mut head ?Node = nil
 
-func main() {
-	n := Node{next: nil}
+fn main() {
+	let n = Node{next: nil}
 	head = keep(n)
 }
 ```
@@ -2262,13 +2267,13 @@ build the structure in long-lived memory from kept parts.
 `catch` handles the fault of a whole statement, initializer, assignment or return value,
 not of a call in the middle of an expression.
 
-```tin
+```tin edition=1
 package main
 
 import "mint"
 import "say"
 
-func main() {
+fn main() {
 	say.Line(1 + (mint.Atoi("2") catch _ { 0 }))
 }
 ```
@@ -2284,14 +2289,14 @@ Fix: give the call its own statement (`let n = mint.Atoi("2") catch _ { 0 }`) an
 A function that can fail says so in its result: `!T` (or `!(A, B)`, or `!` for no value),
 not a `fault` in the result list.
 
-```tin
+```tin edition=1
 package main
 
-func parse() (i64, fault) {
+fn parse() (i64, fault) {
 	return 1, nil
 }
 
-func main() {
+fn main() {
 }
 ```
 
@@ -2299,23 +2304,23 @@ func main() {
 example.tin:3:1: error E402 FAULT_RESULT: write a result that can fail as !T (or ! when there is no value), not with a fault result
 ```
 
-Fix: write `func parse() !i64`, `return v` on success and `fail "msg"` on failure.
+Fix: write `fn parse() !i64`, `return v` on success and `fail "msg"` on failure.
 
 ### E403 TRY_PLACEMENT
 
 `try` passes a fault upward from a whole statement, initializer, assignment or return
 value, not from the middle of an expression.
 
-```tin
+```tin edition=1
 package main
 
 import "mint"
 
-func double(s str) !i64 {
+fn double(s str) !i64 {
 	return 2 * try mint.Atoi(s)
 }
 
-func main() {
+fn main() {
 }
 ```
 
@@ -2323,19 +2328,19 @@ func main() {
 example.tin:6:13: error E403 TRY_PLACEMENT: try is only allowed as a statement, an initializer, an assignment or a return
 ```
 
-Fix: give the call its own line (`n := try mint.Atoi(s)`), then use `n`.
+Fix: give the call its own line (`let n = try mint.Atoi(s)`), then use `n`.
 
 ### E410 UNCHECKED_FAULT
 
-A fault is never dropped: each call that can fail is checked (`try`, `catch` or `v, err :=`
+A fault is never dropped: each call that can fail is checked (`try`, `catch` or `let (v, err) =`
 and a test of `err`), a fault variable is read, and `_` cannot discard one.
 
-```tin
+```tin edition=1
 package main
 
 import "mint"
 
-func main() {
+fn main() {
 	mint.Atoi("12")
 }
 ```
@@ -2351,16 +2356,16 @@ Fix: pass it upward with `try`, handle it with `catch`, or test the `err` you as
 `try`, `fail` and `use` can leave the function with a fault, so the function's result says
 it can fail (`!T`).
 
-```tin
+```tin edition=1
 package main
 
 import "mint"
 
-func count(s str) i64 {
+fn count(s str) i64 {
 	return try mint.Atoi(s)
 }
 
-func main() {
+fn main() {
 }
 ```
 
@@ -2375,14 +2380,14 @@ with `catch`.
 
 In a function returning `!T`, `return` gives only the values; a fault leaves through `fail`.
 
-```tin
+```tin edition=1
 package main
 
-func load() !i64 {
+fn load() !i64 {
 	return 1, nil
 }
 
-func main() {
+fn main() {
 }
 ```
 
@@ -2421,18 +2426,18 @@ Fix: pass the fault upward with `try`: `try mint.Atoi(s) wrap "reading the count
 `try` and `catch` handle the fault of a call that can fail (one returning `!T`); a call
 that cannot fail needs neither.
 
-```tin
+```tin edition=1
 package main
 
-func two() i64 {
+fn two() i64 {
 	return 2
 }
 
-func twice() i64 {
+fn twice() i64 {
 	return two() catch _ { 0 }
 }
 
-func main() {
+fn main() {
 }
 ```
 
@@ -2447,14 +2452,14 @@ Fix: remove the `try` or `catch`.
 A `catch` block that gives the value of a call ends with that value, or leaves (`return`,
 `break`, `continue` or `fail`); when the call gives several values, the block leaves.
 
-```tin
+```tin edition=1
 package main
 
 import "mint"
 import "say"
 
-func main() {
-	n := mint.Atoi("x") catch _ {
+fn main() {
+	let n = mint.Atoi("x") catch _ {
 		say.Line("not a number")
 	}
 	say.Line(n)
@@ -2471,16 +2476,16 @@ Fix: end the block with the value to use (`0`), or leave from it.
 
 `fail` takes a `str` message or a fault.
 
-```tin
+```tin edition=1
 package main
 
-func check(n i64) ! {
+fn check(n i64) ! {
 	if n < 0 {
 		fail n
 	}
 }
 
-func main() {
+fn main() {
 }
 ```
 
@@ -2493,16 +2498,16 @@ Fix: `fail "negative count"`, or `fail say.Fault("bad count %d", n)`.
 ### E417 SENTINEL
 
 `fault("msg")` declares a sentinel fault that callers compare against: it is written at
-package level, as `var ErrX = fault("msg")`, with a `str` message.
+package level, as `let ErrX = fault("msg")`, with a `str` message.
 
-```tin
+```tin edition=1
 package main
 
-func find() ! {
+fn find() ! {
 	fail fault("not found")
 }
 
-func main() {
+fn main() {
 }
 ```
 
@@ -2510,7 +2515,7 @@ func main() {
 example.tin:4:7: error E417 SENTINEL: fault("...") declares a sentinel: write it at package level as var ErrX = fault("msg"), or use fail("msg") for a one-off fault
 ```
 
-Fix: declare `var ErrNotFound = fault("not found")` and `fail ErrNotFound`, or use
+Fix: declare `let ErrNotFound = fault("not found")` and `fail ErrNotFound`, or use
 `fail "not found"` for a one-off fault.
 
 ### E420 OPTIONAL_TYPE
@@ -2518,18 +2523,18 @@ Fix: declare `var ErrNotFound = fault("not found")` and `fail ErrNotFound`, or u
 Only references can be optional (`?T`): `str`, slices, maps, structs and `dyn` values. A
 number or a `bool` always has a value.
 
-```tin
+```tin edition=1
 package main
 
-func show(n ?i64) {
+fn show(n ?i64) {
 }
 
-func main() {
+fn main() {
 }
 ```
 
 ```text
-example.tin:3:13: error E420 OPTIONAL_TYPE: only references (str, slices, maps, structs, dyn) can be optional, not i64
+example.tin:3:11: error E420 OPTIONAL_TYPE: only references (str, slices, maps, structs, dyn) can be optional, not i64
 ```
 
 Fix: use a separate `bool` (or `v, ok`) for a missing number, or keep the number in a
@@ -2540,18 +2545,18 @@ struct and make the struct optional.
 An optional (`?T`) may be nil, so its fields and methods are used only after a check
 against nil narrows it.
 
-```tin
+```tin edition=1
 package main
 
 type User struct {
 	Name str
 }
 
-func show(u ?User) {
+fn show(u ?User) {
 	_ = u.Name
 }
 
-func main() {
+fn main() {
 }
 ```
 
@@ -2567,22 +2572,25 @@ Fix: check it first: `if u != nil { return u.Name }`.
 
 Type arguments go only to a type, function or shape that declares type parameters.
 
-```tin
+```tin edition=1
 package main
 
-type Point struct { x i64 }
+type Point struct {
+	x i64
+}
 
-func main() {
-	var p Point[i64]
-	_ = p
+fn show(p Point[i64]) {
+}
+
+fn main() {
 }
 ```
 
 ```text
-example.tin:6:8: error E501 NOT_GENERIC: 'Point' is not a generic type
+example.tin:7:11: error E501 NOT_GENERIC: 'Point' is not a generic type
 ```
 
-Fix: remove the type arguments (`var p Point`), or give the declaration type parameters
+Fix: remove the type arguments (`p Point`), or give the declaration type parameters
 (`type Point[T constraints.Any] struct { x T }`).
 
 ### E502 TYPE_ARG_COUNT
@@ -2591,7 +2599,7 @@ A generic type, function or shape gets one type argument per type parameter. A g
 shape named without its type arguments is the same error (`shape Getter needs type
 arguments, like Getter[...]`).
 
-```tin
+```tin edition=1
 package main
 
 import "constraints"
@@ -2601,14 +2609,15 @@ type Pair[K constraints.Any, V constraints.Any] struct {
 	value V
 }
 
-func main() {
-	var p Pair[str]
-	_ = p
+fn show(p Pair[str]) {
+}
+
+fn main() {
 }
 ```
 
 ```text
-example.tin:11:8: error E502 TYPE_ARG_COUNT: wrong number of type arguments for 'Pair'
+example.tin:10:11: error E502 TYPE_ARG_COUNT: wrong number of type arguments for 'Pair'
 ```
 
 Fix: give one type argument per parameter (`Pair[str, i64]`).
@@ -2619,16 +2628,16 @@ Generics are fully specialized, so a generic function that calls itself with a t
 from its own type parameter (`F[[]T]` inside `F[T]`) would need an endless series of
 instances. Calling itself with the same type arguments is fine.
 
-```tin
+```tin edition=1
 package main
 
 import "constraints"
 
-func Wrap[T constraints.Any](x T) i64 {
+fn Wrap[T constraints.Any](x T) i64 {
 	return Wrap([]T{x})
 }
 
-func main() {
+fn main() {
 	_ = Wrap(1)
 }
 ```
@@ -2644,23 +2653,22 @@ counter, a slice) instead of a type.
 
 Every type parameter must be inferable from the arguments, or given explicitly.
 
-```tin
+```tin edition=1
 package main
 
 import "constraints"
 
-func Zero[T constraints.Any]() T {
-	var z T
-	return z
+fn empty[T constraints.Any]() []T {
+	return make([]T, 0)
 }
 
-func main() {
-	_ = Zero()
+fn main() {
+	_ = empty()
 }
 ```
 
 ```text
-example.tin:11:6: error E504 CANNOT_INFER: cannot infer type parameter 'T' (give it explicitly: F[T](...))
+example.tin:10:6: error E504 CANNOT_INFER: cannot infer type parameter 'T' (give it explicitly: F[T](...))
 ```
 
 Fix: write the type arguments (`Zero[i64]()`), or pass an argument whose type names them.
@@ -2669,7 +2677,7 @@ Fix: write the type arguments (`Zero[i64]()`), or pass an argument whose type na
 
 The brackets after a generic function's name hold types.
 
-```tin
+```tin edition=0 old-syntax
 package main
 
 import "constraints"
@@ -2688,14 +2696,15 @@ func main() {
 example.tin:11:13: error E505 NOT_A_TYPE_ARG: expected a type argument
 ```
 
-Fix: put a type in the brackets (`Zero[i64]()`), and pass values in the parentheses.
+Fix: put a type in the brackets (`Zero[i64]()`), and pass values in the parentheses. The
+example is edition 0: edition 1 reads the brackets as types, so a value there is E020.
 
 ### E506 RECEIVER_TYPE_PARAMS
 
 A method of a generic type names the type's parameters in its receiver, one plain name each:
-`func (s mut Stack[T]) Push(x T)`. A method cannot be specialized for one type argument.
+`fn (s mut Stack[T]) Push(x T)`. A method cannot be specialized for one type argument.
 
-```tin
+```tin edition=1
 package main
 
 import "constraints"
@@ -2704,10 +2713,10 @@ type Stack[T constraints.Any] struct {
 	items []T
 }
 
-func (s mut Stack[[]T]) Push(x T) {
+fn (s mut Stack[[]T]) Push(x T) {
 }
 
-func main() {
+fn main() {
 }
 ```
 
@@ -2723,17 +2732,17 @@ A type argument must be one of the types its union constraint lists, whether the
 written in place (`[T i64 | f64]`) or named (`shape Number = i64 | f64`, printed as `type str
 is not in shape Number: want one of i64 | f64`).
 
-```tin
+```tin edition=1
 package main
 
-func Clamp[T i64 | f64](x T, hi T) T {
+fn Clamp[T i64 | f64](x T, hi T) T {
 	if x > hi {
 		return hi
 	}
 	return x
 }
 
-func main() {
+fn main() {
 	_ = Clamp("b", "a")
 }
 ```
@@ -2749,16 +2758,16 @@ Fix: pass values of a listed type (convert them: `f64(n)`), or add the type to t
 A type argument for `constraints.Comparable` must compare by value with `==`: numbers,
 `str`, `bool`, and structs and enums of those. Slices, maps and functions do not.
 
-```tin
+```tin edition=1
 package main
 
 import "constraints"
 
-func Equal[T constraints.Comparable](a T, b T) bool {
+fn Equal[T constraints.Comparable](a T, b T) bool {
 	return a == b
 }
 
-func main() {
+fn main() {
 	let xs = []i64{1}
 	_ = Equal(xs, xs)
 }
@@ -2775,18 +2784,18 @@ the elements.
 
 A type satisfies a shape only when it has every method the shape lists.
 
-```tin
+```tin edition=1
 package main
 
 shape Reader { Read(buf mut []u8) !i64 }
 
 type Empty struct { n i64 }
 
-func Use[R Reader](r R) i64 {
+fn Use[R Reader](r R) i64 {
 	return 0
 }
 
-func main() {
+fn main() {
 	_ = Use(Empty{n: 1})
 }
 ```
@@ -2802,22 +2811,22 @@ Fix: add the method with the signature the message gives, or pass a type that ha
 A method satisfies a shape only with exactly the shape's signature: the same parameter
 types, the same `mut` parameters and the same results, including `!`.
 
-```tin
+```tin edition=1
 package main
 
 shape Reader { Read(buf mut []u8) !i64 }
 
 type Odd struct { n i64 }
 
-func (o Odd) Read(buf []u8) i64 {
+fn (o Odd) Read(buf []u8) i64 {
 	return 0
 }
 
-func Use[R Reader](r R) i64 {
+fn Use[R Reader](r R) i64 {
 	return 0
 }
 
-func main() {
+fn main() {
 	_ = Use(Odd{n: 1})
 }
 ```
@@ -2833,23 +2842,23 @@ Fix: change the method to the signature the message gives.
 A `dyn S` value satisfies its own shape `S` (and `constraints.Any`) only: there is no
 conversion from one `dyn` shape to another, and no downcast to the concrete type.
 
-```tin
+```tin edition=1
 package main
 
 import "io"
 
 type Buf struct { n i64 }
 
-func (b Buf) Write(data []u8) !i64 {
+fn (b Buf) Write(data []u8) !i64 {
 	return len(data)
 }
 
-func Drain[R io.Reader](r R) i64 {
+fn Drain[R io.Reader](r R) i64 {
 	return 0
 }
 
-func main() {
-	var w dyn io.Writer = Buf{n: 1}
+fn main() {
+	let w dyn io.Writer = Buf{n: 1}
 	_ = Drain(w)
 }
 ```
@@ -2864,37 +2873,37 @@ Fix: pass the concrete value, or convert the concrete value to the `dyn` shape y
 
 A parameter has a name and a type, also when the type is `dyn S`.
 
-```tin
+```tin edition=1
 package main
 
 import "io"
 
-func Send(dyn io.Writer) i64 {
+fn Send(dyn io.Writer) i64 {
 	return 0
 }
 
-func main() {
+fn main() {
 }
 ```
 
 ```text
-example.tin:5:11: error E515 DYN_PARAM_NAME: a parameter of type dyn S needs a name: write w dyn S
+example.tin:5:9: error E515 DYN_PARAM_NAME: a parameter of type dyn S needs a name: write w dyn S
 ```
 
-Fix: name the parameter: `func Send(w dyn io.Writer)`.
+Fix: name the parameter: `fn Send(w dyn io.Writer)`.
 
 ### E516 DYN_OBJECT
 
 A `dyn S` value holds a struct or enum value together with its method table; numbers,
 strings and other types are not objects.
 
-```tin
+```tin edition=1
 package main
 
 shape Sized { Size() i64 }
 
-func main() {
-	var s dyn Sized = 3
+fn main() {
+	let s dyn Sized = 3
 	_ = s
 }
 ```
@@ -2909,28 +2918,28 @@ Fix: wrap the value in a struct that has the shape's methods.
 
 A constraint names a shape; `dyn S` is a value type, not a constraint.
 
-```tin
+```tin edition=1
 package main
 
 import "io"
 
 type Buf struct { n i64 }
 
-func (b Buf) Write(data []u8) !i64 {
+fn (b Buf) Write(data []u8) !i64 {
 	return len(data)
 }
 
-func Send[W dyn io.Writer](w W) i64 {
+fn Send[W dyn io.Writer](w W) i64 {
 	return 0
 }
 
-func main() {
+fn main() {
 	_ = Send(Buf{n: 1})
 }
 ```
 
 ```text
-example.tin:11:13: error E520 DYN_CONSTRAINT: a dyn type is not a constraint: name the shape
+example.tin:11:11: error E520 DYN_CONSTRAINT: a dyn type is not a constraint: name the shape
 ```
 
 Fix: write the shape as the constraint (`[W io.Writer]`), or drop the type parameter and
@@ -2941,14 +2950,14 @@ take a `dyn io.Writer` value.
 A union, named or written in a constraint, lists concrete types. A shape stands alone as a
 constraint, or is listed in a shape body.
 
-```tin
+```tin edition=1
 package main
 
 shape Reader { Read(buf mut []u8) !i64 }
 
 shape Input = str | Reader
 
-func main() {
+fn main() {
 }
 ```
 
@@ -2963,14 +2972,14 @@ Fix: list only concrete types in the union; to combine shapes, list them in a sh
 
 A shape body lists methods and other shapes by name; anything else is an error.
 
-```tin
+```tin edition=1
 package main
 
 type Sink struct { n i64 }
 
 shape Writer { Sink }
 
-func main() {
+fn main() {
 }
 ```
 
@@ -2984,14 +2993,14 @@ Fix: list the methods you need (`Write(data []u8) !i64`), or a shape that declar
 
 A shape cannot be composed of itself, directly or through the shapes it lists.
 
-```tin
+```tin edition=1
 package main
 
 shape A { B }
 
 shape B { A }
 
-func main() {
+fn main() {
 }
 ```
 
@@ -3005,17 +3014,20 @@ Fix: remove one of the listings, and declare the methods directly where they bel
 
 A shape declares each method name once, even with the same signature.
 
-```tin
+```tin edition=1
 package main
 
-shape Sizer { Size() i64; Size() i64 }
+shape Sizer {
+	Size() i64
+	Size() i64
+}
 
-func main() {
+fn main() {
 }
 ```
 
 ```text
-example.tin:3:27: error E524 SHAPE_METHOD_TWICE: shape Sizer declares Size twice
+example.tin:5:2: error E524 SHAPE_METHOD_TWICE: shape Sizer declares Size twice
 ```
 
 Fix: remove the second declaration.
@@ -3025,19 +3037,28 @@ Fix: remove the second declaration.
 When a shape lists other shapes, each method name must keep one signature across all of
 them and the shape's own methods.
 
-```tin
+```tin edition=1
 package main
 
-shape Counter { Len() i64 }
-shape Named { Len() str }
-shape Both { Counter; Named }
+shape Counter {
+	Len() i64
+}
 
-func main() {
+shape Named {
+	Len() str
+}
+
+shape Both {
+	Counter
+	Named
+}
+
+fn main() {
 }
 ```
 
 ```text
-example.tin:4:15: error E525 SHAPE_METHOD_CONFLICT: shape Both has two methods named Len with different signatures (one from a listed shape)
+example.tin:8:2: error E525 SHAPE_METHOD_CONFLICT: shape Both has two methods named Len with different signatures (one from a listed shape)
 ```
 
 Fix: rename one of the methods, or make the signatures the same.
@@ -3047,19 +3068,19 @@ Fix: rename one of the methods, or make the signatures the same.
 Some uses of `dyn` are planned but not built yet (#141): a `dyn` value in a map, a `!dyn`
 result, and formatting a `dyn` value.
 
-```tin
+```tin edition=1
 package main
 
 shape Sized { Size() i64 }
 
-func main() {
-	m := map[str]dyn Sized{}
+fn main() {
+	let m = map[str]dyn Sized{}
 	_ = len(m)
 }
 ```
 
 ```text
-example.tin:6:7: error E530 DYN_NOT_YET: a map value of type dyn is the next step: the map stores 16-byte slots with the table (#141)
+example.tin:6:10: error E530 DYN_NOT_YET: a map value of type dyn is the next step: the map stores 16-byte slots with the table (#141)
 ```
 
 Fix: keep the values in a `[]dyn S` and map the keys to indexes, or use the concrete type
@@ -3072,12 +3093,12 @@ until the feature lands.
 Globals are per core: each core thread has its own copy. A `shared` variable, which every
 core would see, is limited to the runtime's own state in the standard library.
 
-```tin
+```tin edition=1
 package main
 
-shared var hits i64 = 0
+shared let hits i64 = 0
 
-func main() {
+fn main() {
 }
 ```
 
@@ -3085,7 +3106,7 @@ func main() {
 example.tin:3:12: error E601 SHARED_GLOBAL: shared mutable state across cores is not allowed: globals are per core (use const, or relay messages)
 ```
 
-Fix: use a per-core global (`var hits i64`), a `const`, or send the data to the core that
+Fix: use a per-core global (`mut hits i64`), a `const`, or send the data to the core that
 owns it with `relay`.
 
 ### E602 GO
@@ -3093,7 +3114,7 @@ owns it with `relay`.
 There is no `go` statement: work runs per core (`hearth`), cores talk through `relay`, and
 a request's own concurrent work runs in a `scope` (edition 1).
 
-```tin
+```tin edition=0 old-syntax
 package main
 
 func work() {
@@ -3109,6 +3130,7 @@ example.tin:7:2: error E602 GO: go is not allowed: cores share nothing (run work
 ```
 
 Fix: spawn the work as a child of a scope, or run it per core with `hearth`.
+The example is edition 0: edition 1 reports `go` as E090 OLD_SYNTAX.
 
 ### E610 UNKNOWN_EVENT
 
@@ -3309,7 +3331,7 @@ other values before the block.
 ### E652 POLICY
 
 `with p { ... }` runs the block through a policy: a value of a concrete type with a method
-`Run(body func() !T) !T`, whose body gives what the block gives.
+`Run(body fn() !T) !T`, whose body gives what the block gives.
 
 ```tin edition=1
 package main
@@ -3382,18 +3404,18 @@ Fix: call `body()` inside `Run` (as often as the policy needs) and keep only its
 Parameters are read-only unless declared `mut`: changing a parameter's fields, elements or
 map entries, or appending to it, needs `mut` on the parameter (and at the call).
 
-```tin
+```tin edition=1
 package main
 
 type Box struct {
 	Items []str
 }
 
-func add(b Box, s str) {
+fn add(b Box, s str) {
 	b.Items = append(b.Items, s)
 }
 
-func main() {
+fn main() {
 	add(Box{}, "x")
 }
 ```
@@ -3402,7 +3424,7 @@ func main() {
 example.tin:8:12: error E701 NOT_MUT: cannot modify parameter 'b': declare it mut
 ```
 
-Fix: declare the parameter `mut` (`func add(b mut Box, s str)`) and call it with `add(mut box, s)`, or
+Fix: declare the parameter `mut` (`fn add(b mut Box, s str)`) and call it with `add(mut box, s)`, or
 return the new value instead.
 
 ### E702 MUT_VALUE_PARAM
@@ -3411,14 +3433,14 @@ A `mut` parameter lets a function change what the caller passed, which works for
 slices and maps (references). A number, `bool` or `str` is passed by value, so `mut` on it
 could not reach the caller.
 
-```tin
+```tin edition=1
 package main
 
-func bump(n mut i64) {
+fn bump(n mut i64) {
 	n = n + 1
 }
 
-func main() {
+fn main() {
 }
 ```
 
@@ -3426,7 +3448,7 @@ func main() {
 example.tin:3:1: error E702 MUT_VALUE_PARAM: parameter 'n' is mut, but a value of type i64 is passed by value: only structs, slices and maps can be modified through a parameter, so remove mut
 ```
 
-Fix: return the new value (`func bump(n i64) i64`), or keep the number in a struct and pass
+Fix: return the new value (`fn bump(n i64) i64`), or keep the number in a struct and pass
 the struct `mut`.
 
 ### E703 CAPTURE_MUT
@@ -3434,22 +3456,22 @@ the struct `mut`.
 A function literal cannot capture a `mut` parameter: it could outlive the call and modify
 the caller's value later.
 
-```tin
+```tin edition=1
 package main
 
-func fill(xs mut []i64) {
-	add := func(v i64) {
+fn fill(xs mut []i64) {
+	let add = fn(v i64) {
 		xs = append(xs, v)
 	}
 	add(1)
 }
 
-func main() {
+fn main() {
 }
 ```
 
 ```text
-example.tin:4:9: error E703 CAPTURE_MUT: a function literal cannot capture the mut parameter 'xs': copy it into a local first, or pass it as an argument
+example.tin:4:12: error E703 CAPTURE_MUT: a function literal cannot capture the mut parameter 'xs': copy it into a local first, or pass it as an argument
 ```
 
 Fix: copy it into a local first, or pass it to the literal as an argument.
@@ -3459,18 +3481,18 @@ Fix: copy it into a local first, or pass it to the literal as an argument.
 Assigning a whole new value to a `mut` parameter rebinds only this function's copy, and the
 caller would not see it; a `mut` parameter is changed through its fields and elements.
 
-```tin
+```tin edition=1
 package main
 
 type Box struct {
 	n i64
 }
 
-func reset(b mut Box) {
+fn reset(b mut Box) {
 	b = Box{n: 0}
 }
 
-func main() {
+fn main() {
 }
 ```
 
@@ -3485,15 +3507,15 @@ Fix: change the fields (`b.n = 0`), or return the new value.
 A call writes `mut` before an argument exactly when the parameter is `mut`, so every
 change a function can make to its arguments shows at the call.
 
-```tin
+```tin edition=1
 package main
 
-func add(xs mut []i64, v i64) {
+fn add(xs mut []i64, v i64) {
 	xs = append(xs, v)
 }
 
-func main() {
-	xs := []i64{}
+fn main() {
+	mut xs = []i64{}
 	add(xs, 1)
 }
 ```
@@ -3509,18 +3531,18 @@ Fix: write `add(mut xs, 1)`; remove `mut` before an argument whose parameter is 
 An assignment's target is a variable, a field, or an element of a slice, array or map;
 constants, functions and the bytes of a `str` cannot be assigned.
 
-```tin
+```tin edition=1
 package main
 
-const limit = 10
+const maxSize = 10
 
-func main() {
-	limit = 20
+fn main() {
+	maxSize = 20
 }
 ```
 
 ```text
-example.tin:6:2: error E710 NOT_ASSIGNABLE: cannot assign to constant 'limit'
+example.tin:6:2: error E710 NOT_ASSIGNABLE: cannot assign to constant 'maxSize'
 ```
 
 Fix: use a variable for a value that changes; build a new `str` instead of changing one.
@@ -3532,7 +3554,7 @@ Fix: use a variable for a value that changes; build a new `str` instead of chang
 `extern` declarations, raw memory access and the runtime's internals are only allowed in
 the standard library (`lib/`), which is trusted code.
 
-```tin
+```tin edition=0 old-syntax
 package main
 
 extern func getpid() i64
@@ -3547,16 +3569,17 @@ example.tin:3:8: error E801 TRUSTED_ONLY: extern is only allowed in the standard
 
 Fix: use the standard library package that wraps the call (`quarry` for the process and
 files).
+The example is edition 0: edition 1 reports `extern` as E090 OLD_SYNTAX.
 
 ### E802 RUNTIME_INTERNAL
 
 The runtime's own functions (`rt_...`, `memset`, `cast`) are internal: programs and
 packages use the standard library instead.
 
-```tin
+```tin edition=1
 package main
 
-func main() {
+fn main() {
 	_ = rt_core_id()
 }
 ```
@@ -3573,12 +3596,12 @@ vendored package whose `tin.mod` declares `caps unsafe` may use them, like `lib/
 `&x` takes the address of a variable, in the standard library only: it needs a variable
 name, not a constant or an expression.
 
-```tin
+```tin edition=1
 package main
 
 const size = 4
 
-func main() {
+fn main() {
 	_ = &size
 }
 ```
@@ -3609,9 +3632,8 @@ package peek
 
 import "wire"
 
-func Up(addr str) bool {
-	c, err := wire.Dial(addr)
-	if err != nil {
+fn Up(addr str) bool {
+	let c = wire.Dial(addr) catch _ {
 		return false
 	}
 	c.Close()
@@ -3619,19 +3641,19 @@ func Up(addr str) bool {
 }
 ```
 
-```tin
+```tin edition=1
 package main
 
 import "example.com/peek"
 import "say"
 
-func main() {
+fn main() {
 	say.Line(peek.Up("127.0.0.1:1"))
 }
 ```
 
 ```text
-vendor/example.com/peek/peek.tin:6:16: error E804 CAPABILITY: wire.Dial needs capability net (wire.Dial -> wire.DialTimeout -> wire.resolve), which package example.com/peek does not declare in its tin.mod (caps: none)
+vendor/example.com/peek/peek.tin:6:14: error E804 CAPABILITY: wire.Dial needs capability net (wire.Dial -> wire.DialTimeout -> wire.resolve), which package example.com/peek does not declare in its tin.mod (caps: none)
 ```
 
 Fix: if the dependency should dial, add `caps net` to its `tin.mod` (upstream) and run
@@ -3645,13 +3667,13 @@ package. `tin caps main.tin` prints what each package can reach.
 `-target` takes one of the supported targets: `darwin-arm64`, `linux-arm64`, `linux-amd64`.
 
 ```sh
-tinc -target windows-amd64 example.tin
+tinc -edition 1 -target windows-amd64 example.tin
 ```
 
-```tin
+```tin edition=1
 package main
 
-func main() {
+fn main() {
 }
 ```
 
@@ -3669,10 +3691,10 @@ Fix: use one of the listed targets (docs/PORTING.md).
 tinc -edition 2 example.tin
 ```
 
-```tin
+```tin edition=1
 package main
 
-func main() {
+fn main() {
 }
 ```
 
@@ -3688,13 +3710,13 @@ Every program is built with the runtime package, `lib/runtime` under the Tin roo
 or the directory above the compiler's `bin/`.
 
 ```sh
-TIN_ROOT=/nonexistent tinc example.tin
+TIN_ROOT=/nonexistent tinc -edition 1 example.tin
 ```
 
-```tin
+```tin edition=1
 package main
 
-func main() {
+fn main() {
 }
 ```
 
@@ -3711,13 +3733,13 @@ The compiler writes the executable to the `-o` path (`a.out` by default), so its
 must exist and be writable.
 
 ```sh
-tinc -o missing/example example.tin
+tinc -edition 1 -o missing/example example.tin
 ```
 
-```tin
+```tin edition=1
 package main
 
-func main() {
+fn main() {
 }
 ```
 
@@ -3749,7 +3771,7 @@ tinc -fix example.tin
 ```tin
 package main
 
-func main() {
+fn main() {
 }
 ```
 
@@ -3764,14 +3786,14 @@ Fix: use `tin fix -edition 1 FILES...`, or pass `-edition 1` and one file to `ti
 A function takes at most 8 parameters of each register kind (integers and references, and
 floats) and returns at most 8 results.
 
-```tin
+```tin edition=1
 package main
 
-func sum(a i64, b i64, c i64, d i64, e i64, f i64, g i64, h i64, i i64) i64 {
+fn sum(a i64, b i64, c i64, d i64, e i64, f i64, g i64, h i64, i i64) i64 {
 	return a + b + c + d + e + f + g + h + i
 }
 
-func main() {
+fn main() {
 }
 ```
 
