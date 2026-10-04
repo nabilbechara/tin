@@ -7428,7 +7428,7 @@ fn keep_fn(t) {
                     vec_push(ifs[IF_THEN][BLK_STMTS], assign_stmt(pos, field_store(pos, sym_ref_node(pos, out[LET_SYM]), t, fi), keep_call(pos, keep_fn(ft), src, ft)));
                     // The kept copy's slot owns what it holds (#176).
                     if rc_counted(ft) {
-                        vec_push(ifs[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, "rt_rc_inc", args1(mk_mem(pos, sym_ref_node(pos, out[LET_SYM]), 0, 0, field_offset(t, fi), ft)), ty_void)));
+                        vec_push(ifs[IF_THEN][BLK_STMTS], expr_stmt(rc_inc_call(pos, mk_mem(pos, sym_ref_node(pos, out[LET_SYM]), 0, 0, field_offset(t, fi), ft))));
                     }
                 }
                 kk = kk + 1;
@@ -7448,7 +7448,7 @@ fn keep_fn(t) {
                 vec_push(body, assign_stmt(pos, field_store(pos, sym_ref_node(pos, out[LET_SYM]), t, fi), keep_call(pos, keep_fn(ft), src, ft)));
                 // The kept copy's slot owns what it holds (#176).
                 if rc_counted(ft) {
-                    vec_push(body, expr_stmt(rt_call(pos, "rt_rc_inc", args1(mk_mem(pos, sym_ref_node(pos, out[LET_SYM]), 0, 0, field_offset(t, fi), ft)), ty_void)));
+                    vec_push(body, expr_stmt(rc_inc_call(pos, mk_mem(pos, sym_ref_node(pos, out[LET_SYM]), 0, 0, field_offset(t, fi), ft))));
                 }
             }
             fi = fi + 1;
@@ -7483,11 +7483,12 @@ fn keep_fn(t) {
         if is_ref(t[TY_ELEM]) || is_dyn_value(t[TY_ELEM]) {
             vv = keep_call(pos, keep_fn(t[TY_ELEM]), vv, t[TY_ELEM]);
         }
-        let setname = "rt_map_set";
         if kc {
-            setname = "rt_map_setk";
+            vec_push(live[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, "rt_map_setk", args3(sym_ref_node(pos, out[LET_SYM]), to_bits(kv), to_bits(vv)), ty_void)));
+        } else {
+            let setargs = args4(sym_ref_node(pos, out[LET_SYM]), to_bits(kv), to_bits(vv), mk_int(pos, 1, ty_int));
+            vec_push(live[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, "rt_map_set", setargs, ty_void)));
         }
-        vec_push(live[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, setname, args3(sym_ref_node(pos, out[LET_SYM]), to_bits(kv), to_bits(vv)), ty_void)));
         vec_push(wb[BLK_STMTS], live);
         vec_push(body, w);
         ret[RET_VALUE] = sym_ref_node(pos, out[LET_SYM]);
@@ -7530,17 +7531,28 @@ fn fn_ref_node(pos, f) {
     let n = node_new(EX_FUNCREF, pos);
     n[FR_FN] = f;
     n[N_TYPE] = f[F_TYPE];
+    // A drop can be lifted after the reachability pass (rc_mark), so mark it here.
+    mark_reach(f);
     return n;
+}
+
+// rc_inc_call emits rt_rc_inc(v).
+fn rc_inc_call(pos, v) {
+    let c = rt_call(pos, "rt_rc_inc", args1(v), ty_void);
+    mark_reach(c[CALL_FN]);
+    return c;
+}
+
+// rc_dec_call emits rt_rc_dec(v, drop).
+fn rc_dec_call(pos, v, drop) {
+    let c = rt_call(pos, "rt_rc_dec", args2(v, fn_ref_node(pos, drop)), ty_void);
+    mark_reach(c[CALL_FN]);
+    return c;
 }
 
 // rc_none is the runtime's own no-op drop: the drop of childless blocks.
 fn rc_none() {
     return find_fn("rt_rc_drop_none");
-}
-
-// rc_dec_call emits rt_rc_dec(v, drop).
-fn rc_dec_call(pos, v, drop) {
-    return rt_call(pos, "rt_rc_dec", args2(v, fn_ref_node(pos, drop)), ty_void);
 }
 
 // rc_map_bits is a map type's counted sides (#176): bit 0 the key side (str keys and
@@ -7739,7 +7751,7 @@ fn keep_each(pos, body, out, et) {
     vec_push(wb[BLK_STMTS], assign_stmt(pos, cell, keep_call(pos, keep_fn(et), cell2, et)));
     if rc_counted(et) {
         let cell3 = mk_mem(pos, sym_ref_node(pos, data[LET_SYM]), sym_ref_node(pos, j), type_width(et), 0, et);
-        vec_push(wb[BLK_STMTS], expr_stmt(rt_call(pos, "rt_rc_inc", args1(cell3), ty_void)));
+        vec_push(wb[BLK_STMTS], expr_stmt(rc_inc_call(pos, cell3)));
     }
     w[WH_BODY] = wb;
     vec_push(body, w);
