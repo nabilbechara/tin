@@ -1,0 +1,130 @@
+package main
+
+import "fault"
+import "lane"
+import "say"
+import "tide"
+
+mut order str = ""
+
+fn note(s str) {
+	order = keep(order + s)
+}
+
+// byHand: the body cancels the scope once one child has answered; the others stop waiting.
+fn byHand() !str {
+	mut got str = ""
+	scope s {
+		let fast = s.spawn(fn() !str {
+			try tide.Wait(tide.Millisecond)
+			return "first"
+		})
+		for i in 0..3 {
+			s.spawn(fn() ! {
+				tide.Wait(5 * tide.Second) catch err {
+					note("[{err}]")
+					fail err
+				}
+			})
+		}
+		let first = try fast.wait()
+		got = keep(first)
+		s.cancel("enough")
+	}
+	return got
+}
+
+// fromChild: a child cancels its own scope.
+fn fromChild() ! {
+	scope s {
+		s.spawn(fn() ! {
+			try tide.Wait(tide.Millisecond)
+			s.cancel("child says stop")
+		})
+		s.spawn(fn() ! {
+			try tide.Wait(5 * tide.Second)
+		})
+	}
+}
+
+// afterFault: a child's fault came first, so it stays the scope's fault.
+fn afterFault() ! {
+	scope s {
+		let t = s.spawn(fn() ! {
+			fail "child failed"
+		})
+		t.wait() catch _ {
+		}
+		s.cancel("too late")
+	}
+}
+
+// laneAndSelect: cancelling the scope ends a lane receive and a select in its children.
+fn laneAndSelect() ! {
+	mut l = lane.New[i64](1)
+	scope s {
+		s.spawn(fn() ! {
+			let v = l.Recv() catch err {
+				note("recv {err};")
+				fail err
+			}
+			note("got {v}")
+		})
+		s.spawn(fn() ! {
+			select {
+				after(5s) => { note("timer;") }
+				canceled() => { note("select canceled;") }
+			}
+		})
+		try tide.Wait(tide.Millisecond)
+		s.cancel("shutting down")
+	}
+}
+
+// yields: two children take turns at s.yield(); main lets a child run first.
+fn yields() !str {
+	order = ""
+	scope s {
+		for name in []str{"a", "b"} {
+			let n = name
+			s.spawn(fn() ! {
+				for i in 1..3 {
+					note("{n}{i} ")
+					s.yield()
+				}
+			})
+		}
+	}
+	scope m {
+		m.spawn(fn() ! {
+			note("child ")
+		})
+		m.yield()
+		note("main")
+	}
+	return order
+}
+
+fn main() {
+	let t0 = tide.Now()
+	let got = byHand() catch err {
+		say.Line("byHand:", err, "is canceled:", fault.Is(err, fault.Canceled), "children:", order)
+		""
+	}
+	say.Line("byHand result:", got, "fast:", (tide.Now() - t0) / tide.Millisecond < 1000)
+	fromChild() catch err {
+		say.Line("fromChild:", err, "is canceled:", fault.Is(err, fault.Canceled))
+	}
+	afterFault() catch err {
+		say.Line("afterFault:", err, "is canceled:", fault.Is(err, fault.Canceled))
+	}
+	order = ""
+	laneAndSelect() catch err {
+		say.Line("laneAndSelect:", err, "children:", order)
+	}
+	let y = yields() catch err {
+		"never {err}"
+	}
+	say.Line("yields:", y)
+	say.Line("total fast:", (tide.Now() - t0) / tide.Millisecond < 2000)
+}

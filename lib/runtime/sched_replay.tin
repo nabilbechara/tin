@@ -1,0 +1,52 @@
+// Scheduling replay (notes/interface_replay.md section 7, #243): the scheduling events of a
+// request on its tape. Recording, they are appended with the effects, in completion order;
+// replaying, they steer the request down the recorded path.
+
+const schedSelectKind = "sched.select@1"
+
+// rt_sched_select is a select's state on tape tp: -2 recording; replaying, the recorded arm
+// (0 to n). A replay that diverged here, or before, runs the select live (-1): the first
+// divergence is what the replay reports.
+func rt_sched_select(tp i64, site str, n i64) i64 {
+	if tp[tpMode] != tapeReplay {
+		return -2
+	}
+	pos, err := tape_next(tp, schedSelectKind, site)
+	if err != nil {
+		return -1
+	}
+	data := tape_data(tp, pos)
+	if len(data) != 8 {
+		tape_diverge(tp, "replay: divergence at effect " + rt_i64str(tp[tpSeq]-1) + ": select at " + site + " recorded " + rt_i64str(len(data)) + " bytes, not an arm")
+		return -1
+	}
+	arm := (cast(i64, data) + 8)[0]
+	if arm < 0 || arm > n {
+		tape_diverge(tp, "replay: divergence at effect " + rt_i64str(tp[tpSeq]-1) + ": select at " + site + " has " + rt_i64str(n) + " arms, recorded arm " + rt_i64str(arm))
+		return -1
+	}
+	return arm
+}
+
+// rt_sched_select_end appends the arm a recording select took; replaying, an arm other than
+// the recorded one (a cancelled boundary ends any select) is a divergence.
+func rt_sched_select_end(tp i64, site str, state i64, arm i64) {
+	if state == -2 {
+		w := rt_alloc(8)
+		w[0] = arm
+		tape_add(tp, schedSelectKind, site, 0, 0, w, 8)
+		return
+	}
+	if state >= 0 && arm != state {
+		tape_diverge(tp, "replay: divergence at effect " + rt_i64str(tp[tpSeq]-1) + ": select at " + site + " took arm " + rt_i64str(arm) + ", recorded arm " + rt_i64str(state))
+	}
+}
+
+// tape_data is the result bytes of the record at pos.
+func tape_data(tp i64, pos i64) str {
+	b := tp[tpBuf]
+	pos = pos + 8
+	pos += 8 + (b + pos)[0]
+	pos += 8 + (b + pos)[0]
+	return tape_field(b, pos+16)
+}
