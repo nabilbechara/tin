@@ -785,6 +785,7 @@ func rt_rc_dec(p i64, drop func(i64)) {
 		return
 	}
 	w := p - 8
+	if (w[0] & rcCount) == 0 || (w[0] & rcQ) != 0 { return }
 	c := w[0] - 1
 	w[0] = c
 	if (c & rcCount) != 0 {
@@ -1411,16 +1412,12 @@ func rt_slice_sub(s i64, lo i64, hi i64, esz i64, hasHi i64) i64 {
 	if lo < 0 || hi > s[0] || lo > hi {
 		rt_panic("slice bounds out of range")
 	}
-	if s[3] != 0 && s[2] != 0 {
-		// The sub shares its parent's backing array: its header holds a count of
-		// its own, so a grow of either cannot free the array under the other (#176).
-		rt_rc_inc(s[2])
-	}
 	h := rt_alloc(32)
 	h[0] = hi - lo
 	h[1] = s[1] - lo
 	h[2] = s[2] + lo*esz
-	h[3] = s[3]
+	// Sub-slice headers are request-local views and never own the backing block.
+	h[3] = 0
 	return h
 }
 
@@ -1735,7 +1732,7 @@ func rt_map_set(m i64, k i64, v i64, dup i64) {
 						rt_rc_dec(m[3][e0], cast(func(i64), m[13]))
 						rt_rc_inc(v)
 					}
-					if dup != 0 {
+					if dup != 0 && (m[14] & 1) != 0 {
 						rt_rc_drop_fresh(k)
 					}
 				}
@@ -1874,6 +1871,14 @@ func rt_map_del(m i64, k i64) {
 		m[0]--
 		m[7]++
 	}
+}
+
+// rt_map_release frees the auxiliary tables after a long-lived map's entries are dropped.
+func rt_map_release(m i64) {
+	if m == 0 || m[9] == 0 { return }
+	rt_ingot_free(m[2]); rt_ingot_free(m[3]); rt_ingot_free(m[4])
+	if m[8] != 0 { rt_ingot_free(m[8]) }
+	rt_ingot_free(m[12])
 }
 
 // rt_map_slots is how many entries a range over m walks (live and deleted, in order).

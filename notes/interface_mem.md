@@ -58,17 +58,18 @@ rt_rc_stats() (blocks, bytes, limbo)  // per-core diagnostics (roadmap 14.1)
 
 ## Maps and slices carry their own region
 
-- Map header word 9 (`m[9]`) is 1 for an ingot map, and words 13/14 hold `dropk`/`dropv`
-  (0 when that side has no counted kind). The map block is 120 bytes. `rt_map_make`
-  takes the two drops; `rt_keep_map_new(m, dropk, dropv)` passes them on. `rt_map_set`,
+- Map header word 9 (`m[9]`) is 1 for an ingot map; word 13 holds the value drop and
+  word 14 has counted-side bits (bit 0 keys, bit 1 values). The map block is 120 bytes.
+  `rt_map_make` remains unchanged; `rt_map_make_rc(isstr, drop, counted)` and
+  `rt_keep_map_new(m, drop, counted)` carry the metadata. `rt_map_set`,
   `rt_map_setk` and `rt_map_del` do the counting themselves when `m[9] != 0`: overwrite
   decs the old value, a new entry incs key (str keys) and value, delete decs both. No
   compiler marking is needed for maps: mixed-origin locals count correctly, because the
   map's own region word decides at runtime.
 - A slice header word 3 (`s[3]`, the region) gates slices: an ingot slice's backing array
-  holds one rc from its header (`rt_slice_make`, `rt_keep_slice` set it), `rt_slice_grow`
-  decs the old array (no drop: ownership of the elements moves with the array) and
-  `rt_slice_sub` incs the shared array. `rt_append_rc(s, v, esz, drop)` is `rt_append`
+  holds one rc from its header (`rt_slice_make`, `rt_keep_slice` set it), and
+  `rt_slice_grow` decs the old array. A sub-slice is a request-local view and does not
+  count or own the shared backing array. `rt_append_rc(s, v, esz)` is `rt_append`
   plus the element inc, for counted element types.
 
 ## Compiler side
