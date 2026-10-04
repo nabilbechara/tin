@@ -415,7 +415,7 @@ fn parse_mode(toks, edition) {
         if p_edition1 && p_saw_topdecl && p_is("import") {
             p_fail_code(p_peek()[T_POS], "E002 IMPORT_ORDER", "imports must precede declarations");
         }
-        if p_edition1 && !p_saw_package && !p_is("package") {
+        if p_edition1 && !p_saw_package && !p_is("package") && !vec_get(file_trusted, cur_file) {
             p_fail_code(p_peek()[T_POS], "E001 PACKAGE_CLAUSE", "edition 1 files start with a package declaration");
         }
         if p_edition1 && !p_is(";") && !p_is("package") && !p_is("import") {
@@ -469,11 +469,13 @@ fn parse_mode(toks, edition) {
             file_v2[VEC_DATA][cur_file] = 1;
             vec_push(prog_fns, parse_fn(0, 0));
         } else if p_is("extern") {
-            if p_edition1 {
+            // the standard library declares the OS functions it calls (macOS) and the
+            // instructions it lowers inline; other edition 1 code has no externs
+            if p_edition1 && !vec_get(file_trusted, cur_file) {
                 p_fail_code(p_peek()[T_POS], "E090 OLD_SYNTAX", "edition 1 does not use extern declarations");
             }
             p_next();
-            vec_push(prog_fns, parse_fn(1, p_is("fn")));
+            vec_push(prog_fns, parse_fn(1, !p_edition1 && p_is("fn")));
         } else if p_is("const") {
             p_next();
             if p_edition1 && p_is("(") {
@@ -498,7 +500,11 @@ fn parse_mode(toks, edition) {
             parse_group(0, prog_vars);
         } else if p_word("shared") {
             p_next();
-            if p_edition1 {
+            if p_edition1 && p_is("mut") {
+                // shared mutable state: the standard library only (the check reports E601)
+                p_next();
+                p_decl_mut = 1;
+            } else if p_edition1 {
                 p_expect("let");
                 p_decl_mut = 0;
             } else {
@@ -541,7 +547,7 @@ fn parse_mode(toks, edition) {
             p_fail_found_code(p_peek()[T_POS], "E020 UNEXPECTED", "expected a declaration (func, var, const, type, shape)", p_peek());
         }
     }
-    if p_edition1 && !p_saw_package {
+    if p_edition1 && !p_saw_package && !vec_get(file_trusted, cur_file) {
         p_fail_code(p_peek()[T_POS], "E001 PACKAGE_CLAUSE", "edition 1 files start with a package declaration");
     }
 }

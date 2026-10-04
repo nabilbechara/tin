@@ -8,6 +8,7 @@ var project_lock;
 var compiler_edition;
 var load_unsafe;     // the file being loaded is a vendored package granted unsafe: trusted, same edition
 var compiler_fix;
+var compiler_parse_only; // -parse-only: like -fix, a file under <root>/lib/ reads trusted
 
 // read_file returns a buffer holding the whole file, or 0 if it cannot be opened.
 fn try_read_file(path) {
@@ -135,18 +136,23 @@ fn load_file_trusted(path, trusted) {
     vec_push(file_cap_pkg, 0);
     cur_file = files[VEC_LEN] - 1;
     let edition = compiler_edition;
+    if edition < 0 {
+        // no -edition flag: the file says which edition it is written in
+        edition = source_edition(src[VEC_DATA], src[VEC_LEN]);
+    }
     if compiler_fix {
         edition = 0;
-        if fix_source_is_edition1(src[VEC_DATA], src[VEC_LEN]) {
+        if fix_source_is_edition1(src[VEC_DATA], src[VEC_LEN]) || source_edition(src[VEC_DATA], src[VEC_LEN]) {
             edition = 1;
         }
     }
-    if trusted && edition == 1 && !load_unsafe {
-        edition = 0;
-    }
-    if compiler_fix && edition == 0 && fix_in_lib(path) {
+    if (compiler_fix || compiler_parse_only) && !trusted && fix_in_lib(path) {
         trusted = 1;
         file_trusted[VEC_DATA][cur_file] = 1;
+    }
+    if trusted && !load_unsafe {
+        // a standard library file is read in the edition it is written in (#226)
+        edition = source_edition(src[VEC_DATA], src[VEC_LEN]);
     }
     let toks = lex(cur_file, src[VEC_DATA], src[VEC_LEN], edition);
     vec_push(file_sources, src);
@@ -586,7 +592,7 @@ fn main(argc, argv) {
     let parse_only = 0;
     let audit_secrets = 0;
     let fix_edition1 = 0;
-    compiler_edition = 0;
+    compiler_edition = -1;
     compiler_polls = 0;
     let polls_env = host_getenv("TINC_POLLS");
     if polls_env && load8(polls_env) == '1' { compiler_polls = 1; }
@@ -616,6 +622,7 @@ fn main(argc, argv) {
             compiler_polls = 1;
         } else if streq(a, "-parse-only") {
             parse_only = 1;
+            compiler_parse_only = 1;
         } else if streq(a, "-caps") {
             // tin caps: check the program, then print the capabilities each package can reach.
             caps_report = 1;
@@ -735,6 +742,43 @@ fn main(argc, argv) {
     return 0;
 }
 
+
+// source_edition is 1 for a file written in edition 1: no `func`, `var`, `:=` or `;` (outside
+// comments and strings), which edition 0 code and the compiler's legacy dialect always have.
+// A file of only constants and types reads the same in both.
+fn source_edition(src, n) {
+    let i = 0;
+    while i < n {
+        let c = load8(src + i);
+        if c == '/' && i + 1 < n && load8(src + i + 1) == '/' {
+            while i < n && load8(src + i) != '\n' { i = i + 1; }
+        } else if c == '/' && i + 1 < n && load8(src + i + 1) == '*' {
+            i = i + 2;
+            while i + 1 < n && !(load8(src + i) == '*' && load8(src + i + 1) == '/') { i = i + 1; }
+            i = i + 2;
+        } else if c == '"' || c == '`' || c == '\'' {
+            let quote = c;
+            i = i + 1;
+            while i < n && load8(src + i) != quote {
+                if quote != '`' && load8(src + i) == '\\' && i + 1 < n { i = i + 1; }
+                i = i + 1;
+            }
+            i = i + 1;
+        } else if c == ';' || (c == ':' && i + 1 < n && load8(src + i + 1) == '=') {
+            return 0;
+        } else if is_letter(c) {
+            let start = i;
+            while i < n && (is_letter(load8(src + i)) || is_digit(load8(src + i))) { i = i + 1; }
+            let len = i - start;
+            if (len == 4 && mem_eq(src + start, "func", 4)) || (len == 3 && mem_eq(src + start, "var", 3)) {
+                return 0;
+            }
+        } else {
+            i = i + 1;
+        }
+    }
+    return 1;
+}
 
 // fix_source_is_edition1 recognizes translated package files so repeated runs are a no-op.
 fn fix_source_is_edition1(src, n) {
