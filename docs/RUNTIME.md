@@ -362,6 +362,12 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   `fault.LimitExceeded` (by identity), otherwise a `fault.Canceled` fault reading
   `canceled: <reason>` whose cause is the reason (notes/interface_faults.md).
   `tools/ci/cancel_check.py` checks every client.
+- Deadlines (#233, edition 1): `within d { }` enters a `bkWithin` boundary whose deadline is
+  the earlier of `now + d` and the enclosing one (the request's `TIN_DEADLINE_MS`, an outer
+  `within`); waits past it fail with `fault.DeadlineExceeded`, which the block gives as its
+  fault. `task.Deadline()` is the effective deadline of the running code (`tide.Now()`
+  nanoseconds, 0 for none) and `task.Canceled()` the fault its next wait would fail with (nil
+  while it may go on), for code that does not wait or wants to stop at a point of its own.
 - `once { ... }` (#236) runs its block the first time each core reaches it (globals are per
   core, so this is the unit; process-wide one-time work belongs in `on app.start`).
 - Budgets (#235): `limit memory n, tasks k { }` counts the pool chunks and big blocks taken
