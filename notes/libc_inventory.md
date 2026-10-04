@@ -20,8 +20,8 @@ an entry removed only when no Linux declaration or linker-added import remains.
 
 | Symbol | Call-site files | Phase | Status | Replacement | Verification |
 |---|---|---:|---|---|---|
-| `__errno_location` | `lib/runtime/syscalls_linux.tin` | 5 | active | Temporary seed fallback and libc environment errors; removed with environment cutover | syscall_check.py forbids syscall imports; static ELF checks in phase 5 |
-| `__libc_start_main` | `selfhost/elf.tin`, `selfhost/elf_x64.tin` | 5 | active | Tin _start reads argc/argv/envp/auxv | Bootstrap fixed point; argv/environment and static ELF/container checks (phase 5) |
+| `__errno_location` | `lib/runtime/syscalls_linux.tin` | 5 | removed | The syscall leaf returns -errno; the seed refresh (#339) made the libc fallback dead | syscall_check.py forbids syscall imports; static_check.py: `bin/tinc` and every program are static |
+| `__libc_start_main` | `selfhost/elf.tin`, `selfhost/elf_x64.tin` | 5 | removed | Tin _start reads argc/argv/envp/auxv; the ELF writers emit only static executables and stop the link if a program would import anything | Bootstrap fixed point in an empty root; static_check.py (no PT_INTERP/PT_DYNAMIC, `FROM scratch`) |
 | `accept` | `lib/anvil/anvil.tin`, `lib/wire/wire.tin` | 3 | removed | accept raw syscall (per-architecture ABI) | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
 | `atoi` | `lib/anvil/anvil.tin` | 1 | removed | Tin decimal integer parser | Anvil environment integer parsing cases (phase 1) |
 | `bind` | `lib/anvil/anvil.tin`, `lib/wire/wire.tin` | 3 | removed | bind raw syscall (per-architecture ABI) | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
@@ -116,4 +116,4 @@ an entry removed only when no Linux declaration or linker-added import remains.
 | `sigaltstack` | `lib/runtime/runtime.tin` | 3 | removed | sigaltstack raw syscall | Existing native per-thread stack-overflow probes (issue #175) |
 | `munmap` | `lib/runtime/memory.tin` | 3 | removed | munmap raw syscall | memory_check.py; task_memory_check.py |
 | `madvise` | `lib/runtime/runtime.tin` | 3 | removed | madvise raw syscall | task_memory_check.py after heavy burst |
-| `syscall` | `lib/runtime/syscalls_linux.tin` | 5 | active | Seed-only fallback; generated leaf uses svc/syscall directly | syscall_check.py dynamic-import assertion; bootstrap; removed at final seed cutover |
+| `syscall` | `lib/runtime/syscalls_linux.tin` | 5 | removed | Generated leaf uses svc/syscall directly; the fallback went with the seed refresh (#339) | syscall_check.py dynamic-import assertion; bootstrap |

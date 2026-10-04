@@ -2,8 +2,8 @@
 
 | target | role | status | binary | notes |
 |---|---|---|---|---|
-| linux-arm64 | production, benchmarks | complete: all tests pass, self-hosts, server passes conformance; tested natively in CI | ELF PIE linked to glibc ≥ 2.34 (tested on 2.36 and 2.41) | container limits, graceful shutdown, `examples/k8s/` |
-| linux-amd64 | production, benchmarks | complete: all strict and regression tests pass and it self-hosts; tested natively in CI | ELF PIE (x86-64), glibc ≥ 2.34 | performance benchmarks on dedicated x86-64 hardware remain pending |
+| linux-arm64 | production, benchmarks | complete: all tests pass, self-hosts, server passes conformance; tested natively in CI | static ELF PIE: no libc, runs on any distribution, Alpine and `FROM scratch` | container limits, graceful shutdown, `examples/k8s/` |
+| linux-amd64 | production, benchmarks | complete: all strict and regression tests pass and it self-hosts; tested natively in CI | static ELF PIE (x86-64), no libc | performance benchmarks on dedicated x86-64 hardware remain pending |
 | darwin-arm64 | development only | complete | Mach-O, ad-hoc signed, linked to libSystem | the original target |
 
 **Platform roles.** Linux is the platform Tin programs are deployed on and the only one
@@ -35,26 +35,25 @@ handled in `gen.tin` by `tgt_linux`.
 
 ## 2. Linux arm64 executables
 
-- PIE (`ET_DYN`), interpreter `/lib/ld-linux-aarch64.so.1`, `DT_NEEDED` libc.so.6 (and
-  libm.so.6 only if the program imports a libm function, which the standard library no
-  longer does: the math package is Tin and `sqrt`, `floor` ... are instructions), SysV `DT_HASH`, `BIND_NOW`, one `R_AARCH64_GLOB_DAT` per imported function,
-  no PLT, no section headers, segments aligned to 64 KiB.
-- `_start` calls `__libc_start_main(main, argc, argv, 0, 0, rtld_fini, stack_end)`.
-- No symbol versions are emitted. On arm64, glibc binds unversioned references to the
-  base version GLIBC_2.17, which is correct for every function used.
-- Minimum glibc: 2.34 (the `stat`/`lstat`/`fstat` symbols appeared in 2.33, and
-  libpthread was merged into libc in 2.34). Debian 12+, Ubuntu 22.04+, RHEL 9+.
-- musl (Alpine) is not supported (dynamic loader and symbol differences); use
-  `debian:bookworm-slim` or a distroless glibc image.
+- Static PIE (`ET_DYN`): no `PT_INTERP`, no `PT_DYNAMIC`, no imports, no section headers,
+  segments aligned to 64 KiB. The program headers are `PT_PHDR`, three `PT_LOAD` and
+  `PT_GNU_STACK`.
+- Tin's `_start` passes the kernel's argc, argv and envp to main and exits with
+  `exit_group`. The runtime reads the environment and the auxiliary vector from the same
+  initial stack. System calls are `svc #0` leaves, and the vDSO clock is found through
+  `AT_SYSINFO_EHDR`.
+- No C library is involved, so any kernel the runtime supports will do: glibc and musl
+  distributions, distroless images and `FROM scratch` (#125). The linker stops with
+  E990 if a program would import a function; only the macOS runtime files declare
+  externs.
 
 ## 3. Linux amd64
 
 The plan (`notes/plan_linux.md`) and the work log (`notes/x64_progress.md`):
 - System V ABI (rdi, rsi, rdx, rcx, r8, r9; xmm0–7; `al` = vector registers for variadic
   calls). Core context in r15; rbp kept as the frame pointer.
-- `/lib64/ld-linux-x86-64.so.2`, `R_X86_64_GLOB_DAT`, and Verneed records, because
-  unversioned references bind to the oldest symbol version on x86-64 (for example
-  `realpath@GLIBC_2.2.5`).
+- A static PIE like arm64's: `_start` passes argc, argv and envp to main (rbp cleared, rsp
+  aligned to 16), and system calls are `syscall` leaves.
 - Layout differences: `struct epoll_event` is packed (12 bytes), `st_mode` is at offset
   24.
 - `seal.Sha256` uses the portable code until SHA-NI is added (also on arm64 CPUs without

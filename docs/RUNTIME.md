@@ -215,17 +215,17 @@ wrappers invoke a compiler-emitted leaf (`svc #0` / `syscall`) and turn kernel
 errno. Directory handles own a 32 KiB getdents64 buffer, validate each record before
 reading it, refill as needed, and resolve unknown types with lstat. The kernel signal
 set is 8 bytes; signal handlers return through Tin's frame-free rt_sigreturn leaf.
-Pthreads remain until the static cutover; libc environment failures still use its
-errno, and the old seed uses a libc syscall fallback only to build stage 1. Clock lookup reads the kernel vDSO from AT_SYSINFO_EHDR (libc auxv until phase 5),
-with the raw syscall as fallback. Generated
-Linux programs do not import syscall or the removed OS entry points.
+Cores are `clone` threads, and the environment and auxiliary vector come from the initial
+stack (`rt_getenv`, `rt_getauxval`). Clock lookup reads the kernel vDSO from AT_SYSINFO_EHDR,
+with the raw syscall as fallback. Linux programs import nothing: the ELF writers emit only
+static executables, and notes/libc_inventory.md has no active Linux entry left (#125).
+Externs remain only in the macOS runtime files.
 
 UTC calendar/Date formatting, errno messages and Linux backtrace lookup are Tin code.
 Darwin errno codes 0..106 use the stable Tin message table. Newer/unknown codes
 retain libSystem text because code assignments vary between macOS development releases.
 Linux errno messages use Tin exclusively.
 Linux TTY detection uses ioctl TCGETS, hostname uses uname, and sleeps use nanosleep.
-Environment, auxv, pthread startup and dynamic ELF remain for the final cutover.
 
 ## 9. The HTTP server: anvil
 

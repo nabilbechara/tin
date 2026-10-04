@@ -204,14 +204,17 @@ imports, the symbol table, an ad-hoc code signature with a SHA-256 page hash per
 Import calls go through 12-byte stubs (`adrp x16, got; ldr x16, [x16]; br x16`). The UUID
 is a hash of the code, so builds are reproducible.
 
-**ELF arm64** (`elf.tin`): a PIE (`ET_DYN`) with segments aligned to 64 KiB (any kernel
-page size): R (headers, interpreter, `.dynsym`, `.dynstr`, SysV hash, relocations), RX
-(`_start`, code, stubs, strings), RW (dynamic section, GOT, globals). `PT_PHDR`,
-`PT_INTERP` (`/lib/ld-linux-aarch64.so.1`), `PT_DYNAMIC`, `PT_GNU_STACK`. Imports are
-bound at load time by one `R_AARCH64_GLOB_DAT` relocation per GOT slot (`BIND_NOW`, no
-PLT). Tin functions are exported as `tin.<name>` with their sizes, so `dladdr` names
-backtrace frames. `_start` calls `__libc_start_main(main, argc, argv, 0, 0, rtld_fini,
-stack_end)`. No section headers are written (none are needed to run).
+**ELF arm64** (`elf.tin`) and **ELF x86-64** (`elf_x64.tin`): a static PIE (`ET_DYN`),
+with segments aligned to 64 KiB on arm64 (any kernel page size) and 4 KiB on x86-64:
+- R: headers, the function names (`tin.<name>`) and the backtrace records `[start, end,
+  name]` that the runtime reads to name frames;
+- RX: `_start`, code, strings and constants;
+- RW: globals and function descriptors.
+
+The program headers are `PT_PHDR`, three `PT_LOAD` and `PT_GNU_STACK`; there is no
+interpreter, dynamic section or GOT. `_start` passes the kernel's argc, argv and envp to
+main and calls `exit_group` with its result. A program that would import a function
+stops the link (E990). No section headers are written (none are needed to run).
 
 Differences the backend handles per target: variadic C arguments are on the stack on
 macOS and in registers on Linux (`arg_regs`, `gen_call`); C symbols have a leading

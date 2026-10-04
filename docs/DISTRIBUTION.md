@@ -1,9 +1,10 @@
 # Installing Tin and building containers
 
-Tin releases support macOS arm64, Linux arm64 and Linux amd64. Linux executables use
-glibc 2.34 or newer; Debian 12 and Ubuntu 22.04 or newer are suitable. Alpine/musl is
-not supported. A Kubernetes node can run the Debian-based image as long as its CPU
-architecture matches the image; its host distribution does not need to match Debian.
+Tin releases support macOS arm64, Linux arm64 and Linux amd64. Linux executables are
+static: they use no C library and no dynamic loader, so they run on any Linux of their CPU
+architecture, including Alpine (musl) and images built `FROM scratch` (#125; releases before
+the change linked glibc 2.34 or newer). A Kubernetes node can run the image as long as its
+CPU architecture matches; its host distribution does not matter.
 
 ## Install a compiler
 
@@ -41,7 +42,9 @@ docker run --rm -v "$PWD:/src" -w /src ghcr.io/yasserreslan/tin:0.4.0 build app.
 
 The compiler supports cross-compilation too: add `--target linux-amd64` or
 `--target linux-arm64` after `build app.tin`. For deployable images, use a multi-stage
-Dockerfile so the final image contains the application and glibc, without the compiler:
+Dockerfile so the final image contains the application without the compiler. Any final
+base works, `FROM scratch` included; a program that makes TLS connections also needs the
+CA certificates at `/etc/ssl/certs/ca-certificates.crt` (or one of the other usual paths):
 
 ```dockerfile
 FROM ghcr.io/yasserreslan/tin:0.4.0 AS build
