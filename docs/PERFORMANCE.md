@@ -421,18 +421,21 @@ exceeds issue #234's 2% budget. A function can opt out with edition-1 `@nopoll`.
 
 The initial [native Linux run](https://github.com/yasserreslan/tin/actions/runs/37197260096)
 compared base `b6333ef` with head `9759a6b`, with polls enabled in strict Tin code.
-The arm64 runner had four vCPUs, Neoverse-N2, Linux 6.17.0-1022-azure and Go 1.26.8.
+Both runners had four vCPUs, Linux 6.17.0-1022-azure and Go 1.26.8: Neoverse-N2
+on arm64 and AMD EPYC 9V74 on amd64.
 CPU measurements are medians of seven alternating runs per side. HTTP uses one server
 core, wrk on the same runner (`-t2 -c100`, 10 seconds), and medians of five alternating rounds.
 Only ratios on these shared runners are meaningful.
 
-| arm64 workload | base ms | polls ms | polls/base time |
+| architecture, workload | base ms | polls ms | polls/base time |
 |---|---:|---:|---:|
-| indexsum | 38.52 | 42.13 | 1.094 |
-| ordered_less | 30.20 | 32.73 | 1.084 |
-| sieve | 496.22 | 583.00 | 1.175 |
+| arm64 indexsum | 38.52 | 42.13 | 1.094 |
+| arm64 ordered_less | 30.20 | 32.73 | 1.084 |
+| arm64 sieve | 496.22 | 583.00 | 1.175 |
+| amd64 indexsum | 35.43 | 57.39 | 1.620 |
 
-HTTP head/base throughput was 0.985 for `/json` and 0.962 for `/plaintext`.
+HTTP head/base throughput was 0.985 for `/json` and 0.962 for `/plaintext` on arm64,
+and 0.952 and 1.028 respectively on amd64.
 Legacy programs without the strict runtime do not acquire safepoints; those CPU rows do
 not measure their cost. Output equality is checked on every timed repetition.
 

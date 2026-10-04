@@ -59,13 +59,39 @@ def run(exe, drain=False):
           ('drain' if drain else 'deadline', elapsed))
 
 
+def guard_cleanup(exe):
+    # A guard's defer may park; it must not suspend polling in another running task.
+    port = free_port()
+    proc = subprocess.Popen([str(exe)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        env=dict(os.environ, PORT=str(port), TIN_CORES='1', TIN_DEADLINE_MS='200'))
+    try:
+        eventually(lambda: server_ready(port, proc))
+        waiting = request(port, '/guard-wait', timeout=5)
+        time.sleep(.01)
+        spinning = request(port, '/spin', timeout=5)
+        start = time.monotonic()
+        assert response(spinning)[0] == 504
+        assert time.monotonic() - start < 1
+        assert response(waiting) == (200, b'guard ok')
+        assert response(request(port, '/plain')) == (200, b'ok')
+        print('PASS parked guard cleanup: another task still polls and the guard resumes')
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+
 def main():
     out = ROOT / 'bin/ci/poll'
     out.mkdir(parents=True, exist_ok=True)
     exe = out / 'server'
-    subprocess.run([str(ROOT / 'bin/tinc'), '-polls', '-o', str(exe),
+    subprocess.run([str(ROOT / 'bin/tinc'), '-polls', '-edition', '1', '-o', str(exe),
                     str(ROOT / 'tools/ci/fixtures/poll.tin')], check=True, cwd=ROOT)
     run(exe)
+    guard_cleanup(exe)
     if platform.system() == 'Linux':
         run(exe, drain=True)
 
