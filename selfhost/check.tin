@@ -1727,6 +1727,7 @@ fn check_fn_closure(f) {
     let saved_loops = ck_loops;
     let saved_breaks = ck_breaks;
     let saved_defers = ck_defers;
+    let saved_mark = ck_defer_mark;
     let saved_syms = vec_clone(sc_syms);
     let saved_marks = vec_clone(sc_marks);
     let saved_safe = safe_pairs;
@@ -1742,6 +1743,7 @@ fn check_fn_closure(f) {
     ck_loops = saved_loops;
     ck_breaks = saved_breaks;
     ck_defers = saved_defers;
+    ck_defer_mark = saved_mark;
     sc_syms = saved_syms;
     sc_marks = saved_marks;
     safe_pairs = saved_safe;
@@ -1812,6 +1814,7 @@ fn check_fn(f) {
     }
     // The body shares the parameters' scope, so `let x` cannot silently hide parameter x.
     ck_defers = 0;
+    ck_defer_mark = 0;
     check_stmts(f[F_BODY][BLK_STMTS]);
     if f[F_BANG] && !ck_legacy && f[F_RTYPES][VEC_LEN] == 1 && !ends_in_return(f[F_BODY][BLK_STMTS]) {
         // A ! function that runs off its end succeeds.
@@ -1822,6 +1825,7 @@ fn check_fn(f) {
     if ck_defers {
         finish_defers(f);
         ck_defers = 0;
+        ck_defer_mark = 0;
     }
     if !ck_legacy && f[F_RTYPES][VEC_LEN] > 0 && !ends_in_return(f[F_BODY][BLK_STMTS]) {
         err_quoted(f[F_POS], "function ", f[F_NAME], " is missing a return at the end");
@@ -2494,6 +2498,11 @@ fn check_local_consts(stmt) {
 // ones try makes) and the end of the function then run the flagged calls, last first.
 
 var ck_defers;   // the current function's defers: [flag, call]
+var ck_defer_mark; // the current function's defer chain mark ($m), when its defers use the chain
+
+// The defer chain (#230): each defer stores its callee and arguments in a record that a
+// generated defer$N(r) calls, pushed on the task's chain; returns run the chain down to the
+// function's mark, and a panic runs it too, so deferred calls also run while a panic unwinds.
 
 fn lower_defer(s) {
     let pos = s[N_POS];
@@ -2533,12 +2542,86 @@ fn lower_defer(s) {
         i = i + 1;
     }
     let flag = declare_local(pos, "$", ty_bool);
-    vec_push(b[BLK_STMTS], assign_stmt(pos, sym_ref_node(pos, flag), mk_int(pos, 1, ty_bool)));
     if !ck_defers {
         ck_defers = vec_new();
+        ck_defer_mark = declare_local(pos, "$", ty_int);
     }
+    defer_record(pos, b, call);
     vec_push(ck_defers, pair(flag, call));
     replace_node(s, b);
+}
+
+// defer_record stores call's callee and arguments (already in temps) in a chain record and
+// pushes it with a generated defer$N that makes the call from the record.
+fn defer_record(pos, b, call) {
+    let args = call[CALL_ARGS];
+    let n = args[VEC_LEN];
+    if call[CALL_CALLEE] {
+        n = n + 1;
+    }
+    let rec = temp(pos, rt_call(pos, "rt_defer_rec", args1(mk_int(pos, 2 * n, ty_int)), ty_int), ty_int);
+    vec_push(b[BLK_STMTS], rec);
+    let slot = 0;
+    if call[CALL_CALLEE] {
+        let ct = call[CALL_CALLEE][ID_REF][S_TYPE];
+        vec_push(b[BLK_STMTS], assign_stmt(pos, mk_mem(pos, sym_ref_node(pos, rec[LET_SYM]), 0, 0, 16 + 16 * slot, ct), sym_ref_node(pos, call[CALL_CALLEE][ID_REF])));
+        slot = slot + 1;
+    }
+    let i = 0;
+    while i < args[VEC_LEN] {
+        let a = vec_get(args, i)[ID_REF];
+        vec_push(b[BLK_STMTS], assign_stmt(pos, mk_mem(pos, sym_ref_node(pos, rec[LET_SYM]), 0, 0, 16 + 16 * slot, a[S_TYPE]), sym_ref_node(pos, a)));
+        slot = slot + 1;
+        i = i + 1;
+    }
+    let thunk = defer_thunk(pos, call);
+    let ref = node_new(EX_FUNCREF, pos);
+    ref[FR_FN] = thunk;
+    ref[N_TYPE] = thunk[F_TYPE];
+    vec_push(b[BLK_STMTS], expr_stmt(rt_call(pos, "rt_defer_push", args2(sym_ref_node(pos, rec[LET_SYM]), ref), ty_void)));
+}
+
+// defer_thunk builds defer$N(r), which makes call with the callee and arguments in record r.
+fn defer_thunk(pos, call) {
+    lifted_count = lifted_count + 1;
+    let f = fn_new(pos, "defer");
+    let nb = buf_new();
+    buf_str(nb, "defer$");
+    buf_int(nb, lifted_count);
+    buf_byte(nb, 0);
+    f[F_QNAME] = nb[VEC_DATA];
+    f[F_NAME] = nb[VEC_DATA];
+    f[F_LIFTED] = 2;
+    f[F_FILE] = ck_fn[F_FILE];
+    vec_push(f[F_PARAMS], "r");
+    vec_push(f[F_PTYPES], ty_int);
+    f[F_TYPE] = func_of(f[F_PTYPES], f[F_RTYPES], 0);
+    f[F_LOCALS] = vec_new();
+    f[F_BODY] = empty_block(pos);
+    vec_push(prog_fns, f);
+    let r = sym_new(SYM_LOCAL, "r", pos);
+    r[S_TYPE] = ty_int;
+    r[S_SLOT] = 0;
+    f[F_SLOTS] = 1;
+    vec_push(f[F_LOCALS], r);
+    let c = node_new(EX_CALL, pos);
+    replace_node(c, call);
+    let slot = 0;
+    if call[CALL_CALLEE] {
+        c[CALL_CALLEE] = mk_mem(pos, sym_ref_node(pos, r), 0, 0, 16 + 16 * slot, call[CALL_CALLEE][ID_REF][S_TYPE]);
+        slot = slot + 1;
+    }
+    let args = vec_new();
+    let i = 0;
+    while i < call[CALL_ARGS][VEC_LEN] {
+        let a = vec_get(call[CALL_ARGS], i)[ID_REF];
+        vec_push(args, mk_mem(pos, sym_ref_node(pos, r), 0, 0, 16 + 16 * slot, a[S_TYPE]));
+        slot = slot + 1;
+        i = i + 1;
+    }
+    c[CALL_ARGS] = args;
+    vec_push(f[F_BODY][BLK_STMTS], expr_stmt(c));
+    return f;
 }
 
 fn tuple_has_fault(t) {
@@ -2554,6 +2637,10 @@ fn tuple_has_fault(t) {
 
 // defer_calls appends the flagged deferred calls to stmts, last deferred first.
 fn defer_calls(pos, stmts) {
+    if ck_defer_mark {
+        vec_push(stmts, expr_stmt(rt_call(pos, "rt_defer_run", args1(sym_ref_node(pos, ck_defer_mark)), ty_void)));
+        return;
+    }
     let j = ck_defers[VEC_LEN] - 1;
     while j >= 0 {
         let d = vec_get(ck_defers, j);
@@ -2588,6 +2675,9 @@ fn finish_defers(f) {
     while i < ck_defers[VEC_LEN] {
         vec_push(init, let_stmt(pos, vec_get(vec_get(ck_defers, i), 0), mk_int(pos, 0, ty_bool)));
         i = i + 1;
+    }
+    if ck_defer_mark {
+        vec_push(init, let_stmt(pos, ck_defer_mark, rt_call(pos, "rt_defer_mark", vec_new(), ty_int)));
     }
     i = 0;
     while i < body[BLK_STMTS][VEC_LEN] {

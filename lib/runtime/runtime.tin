@@ -387,6 +387,9 @@ func rt_panic(msg str) {
 	rt_backtrace(__fp())
 	if t != 0 && t[tPanicked] == 0 && t[tRecoverable] != 0 {
 		t[tPanicked] = 1
+		// Unwind (#230): deferred calls innermost first, then cleanups (rt_task_abort). A
+		// panic while they run ends the process, after both messages.
+		rt_defer_run(0)
 		rt_task_abort(t)
 	}
 	rt_sys_exit(2)
@@ -2466,7 +2469,8 @@ const tTrim = 49     // observed heavy pool or suspended stack: discard cached p
 const tTimers = 50   // timer heap entries that still name this record
 const tRetired = 51  // 1: released over the cache cap; freed when its last timer entry pops
 const tBnd = 52      // the task's current boundary (notes/interface_boundaries.md), 0 before rt_bnd_task
-const taskWords = 53
+const tDefer = 53    // the task's defer chain (#230): records [next, defer$N, values...]
+const taskWords = 54
 
 const waitReady = 0
 const waitDeadline = 1
@@ -2529,6 +2533,7 @@ var bndFree i64     // per core: free boundary records
 var bndCur i64      // per core: the current boundary of code on the core's own stack (0: the root)
 var bndRoot i64     // per core: the core's root boundary
 var bndBack i64     // per core: the core's background boundary
+var coreDefer i64   // per core: the defer chain of code on the core's own stack
 
 // rt_task_swap stores the running registers into from and continues with those in to.
 func rt_task_swap(from i64, to i64) {
@@ -2562,6 +2567,7 @@ func rt_task_new(body func(i64), arg i64) i64 {
 	t[tRecoverable] = 0
 	t[tTrim] = 0
 	t[tBnd] = 0
+	t[tDefer] = 0
 	for i := 0; i < 20; i++ {
 		t[tSave+i] = 0
 	}
@@ -2692,6 +2698,52 @@ func rt_task_cleanup(f func(i64), arg i64) {
 	r[1] = cast(i64, f)
 	r[2] = arg
 	curTask[tCleanup] = r
+}
+
+// rt_defer_rec makes a defer record with n value words after its two header words.
+func rt_defer_rec(n i64) i64 {
+	return calloc(n+2, 8)
+}
+
+// rt_defer_push puts record r, made for the call call(r), on the running code's defer chain.
+func rt_defer_push(r i64, call func(i64)) {
+	r[1] = cast(i64, call)
+	if curTask != 0 {
+		r[0] = curTask[tDefer]
+		curTask[tDefer] = r
+		return
+	}
+	r[0] = coreDefer
+	coreDefer = r
+}
+
+// rt_defer_mark is the defer chain's head: a function's returns run the chain back to it.
+func rt_defer_mark() i64 {
+	if curTask != 0 {
+		return curTask[tDefer]
+	}
+	return coreDefer
+}
+
+// rt_defer_run makes the deferred calls registered since mark, last first.
+func rt_defer_run(mark i64) {
+	for {
+		r := coreDefer
+		if curTask != 0 {
+			r = curTask[tDefer]
+		}
+		if r == mark || r == 0 {
+			return
+		}
+		if curTask != 0 {
+			curTask[tDefer] = r[0]
+		} else {
+			coreDefer = r[0]
+		}
+		f := cast(func(i64), r[1])
+		f(r)
+		free(r)
+	}
 }
 
 func rt_task_cleanups(stop i64) {
