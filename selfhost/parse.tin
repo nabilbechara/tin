@@ -2229,6 +2229,22 @@ fn parse_boundary() {
         }
     } else if streq(word, "guard") {
         boundary[BOUND_KIND] = BOUND_GUARD;
+        if !p_is("{") {
+            // guard CALL (#142): the guard block { CALL } on one call.
+            let call = parse_unary();
+            let inner = call;
+            if inner[N_KIND] == EX_TRY {
+                inner = inner[TRY_X];
+            }
+            if inner[N_KIND] != EX_CALL {
+                p_fail_code(call[N_POS], "E020 UNEXPECTED", "guard needs a block or a call");
+            }
+            let st = node_new(ST_EXPR, call[N_POS]);
+            st[ES_X] = call;
+            boundary[BOUND_BODY] = empty_block(call[N_POS]);
+            vec_push(boundary[BOUND_BODY][BLK_STMTS], st);
+            return boundary;
+        }
     } else if streq(word, "arena") {
         boundary[BOUND_KIND] = BOUND_ARENA;
     } else if streq(word, "parallel") {
@@ -2250,6 +2266,10 @@ fn parse_boundary() {
 fn starts_boundary() {
     if !p_edition1 {
         return 0;
+    }
+    if p_word("guard") && (p_peek2()[T_KIND] == TK_IDENT || tok_is(p_peek2(), "try")) {
+        // guard CALL (#142).
+        return 1;
     }
     if p_word("guard") || p_word("arena") || p_word("parallel") {
         return tok_is(p_peek2(), "{");

@@ -1076,7 +1076,7 @@ func rt_panic(msg str) {
 		// A task root is an implicit guard (#230): a spawned child's fault is the panic with
 		// its message, as a guard's is (its scope's pool holds it).
 		if t[tChild] != 0 && t[tChild][spOwnPool] == 0 && t[tChild][spFault] == 0 {
-			t[tChild][spFault] = rt_fault_panic("panic: "+msg, "")
+			t[tChild][spFault] = rt_fault_panic("panic: "+msg, rt_backtrace_text(__fp()))
 		}
 		// Unwind (#230): deferred calls innermost first, then cleanups (rt_task_abort). A
 		// panic while they run ends the process, after both messages.
@@ -1123,6 +1123,43 @@ func rt_backtrace(fp i64) {
 		}
 		fp = next
 	}
+}
+
+// rt_backtrace_text is rt_backtrace's list of functions as text, one per line: the
+// backtrace a panic's fault carries (fault.Backtrace, #142).
+func rt_backtrace_text(fp i64) str {
+	info := calloc(4, 8)
+	out := ""
+	for k := 0; k < 64 && fp != 0; k++ {
+		ret := fp[1]
+		if ret == 0 {
+			break
+		}
+		name := cast(i64, "?") + 8
+		if rt_symbol_lookup(ret-4, info)&0xffffffff != 0 && info[2] != 0 {
+			name = info[2]
+			if load8(name) == 't' && load8(name+1) == 'i' && load8(name+2) == 'n' && load8(name+3) == '.' {
+				name = name + 4
+			}
+		}
+		if load8(name) == 'm' && load8(name+1) == 'a' && load8(name+2) == 'i' && load8(name+3) == 'n' && load8(name+4) == 0 {
+			break
+		}
+		skip := load8(name) == 'r' && load8(name+1) == 't' && load8(name+2) == '_'
+		if !skip {
+			if len(out) > 0 {
+				out = out + "\n"
+			}
+			out = out + rt_str_from_raw(name, strlen(name))
+		}
+		next := fp[0]
+		if next <= fp {
+			break
+		}
+		fp = next
+	}
+	free(info)
+	return out
 }
 
 func rt_err_str(e i64) str {
@@ -3961,7 +3998,7 @@ func rt_guard_target() i64 {
 
 // rt_guard_land unwinds to guard g after a panic with msg and resumes its caller.
 func rt_guard_land(g i64, msg str) {
-	rt_land(g, rt_fault_panic("panic: "+msg, ""))
+	rt_land(g, rt_fault_panic("panic: "+msg, rt_backtrace_text(__fp())))
 }
 
 // rt_bnd_landing distinguishes unwind stacks from a scope's child-list word.
