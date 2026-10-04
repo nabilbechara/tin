@@ -758,6 +758,125 @@ example.tin:5:6: error E245 REVEAL: reveal needs a secret value, not str
 Fix: drop the `reveal` from a plain value; for a struct, reveal the secret field itself
 (`reveal(u.token)`).
 
+## E3xx Memory and regions
+
+### E310 REQUEST_ESCAPE
+
+Memory allocated during a request lives in the core's request pool, which is wiped when the
+request ends. Storing it into a global, or into anything a global can reach, would leave a
+dangling reference, so `keep(x)` must copy it into the long-lived heap first.
+
+```tin
+package main
+
+import "say"
+
+var last str
+
+func remember(name str) {
+	last = name
+}
+
+func main() {
+	remember(say.Fmt("user-%d", 7))
+}
+```
+
+```text
+example.tin:8:2: error E310 REQUEST_ESCAPE: request memory stored into global 'last', which outlives the request: wrap the value in keep()
+```
+
+Fix: store `keep(x)` instead of `x`, or keep the value in a local that ends with the request.
+
+### E311 CAPTURE_ESCAPE
+
+A closure that may outlive the request (one passed to `keep`, stored in a global, or
+returned) holds its captured variables in long-lived memory, so storing request memory into
+one of them would dangle.
+
+```tin
+package main
+
+import "say"
+
+func recorder() func(str) str {
+	last := "nobody"
+	return func(s str) str {
+		prev := last
+		last = s
+		return prev
+	}
+}
+
+var rec func(str) str = keep(recorder())
+
+func main() {
+	say.Line(rec(say.Fmt("session-%d", 42)))
+}
+```
+
+```text
+example.tin:9:3: error E311 CAPTURE_ESCAPE: request memory stored into 'last', a captured variable of a closure that may outlive the request (keep() copies its variables into long-lived memory): wrap the value in keep(), or pass the closure only to functions that call it
+```
+
+Fix: store `keep(x)`, or pass the closure only to functions that call it during the request.
+
+### E312 ARG_ESCAPE
+
+A function that stores request memory into a `mut` parameter must be given an argument
+that lives no longer than the request. Passing a global, or anything long-lived, through
+that parameter would let request memory escape (the same rule as E310, through a call).
+
+```tin
+package main
+
+import "say"
+
+type Box struct {
+	Items []str
+}
+
+var box Box = Box{}
+
+func put(b mut Box, s str) {
+	b.Items = append(b.Items, s)
+}
+
+func main() {
+	put(mut box, say.Fmt("item-%d", 1))
+}
+```
+
+```text
+example.tin:16:2: error E312 ARG_ESCAPE: put stores request memory into its mut parameter 'b', but this argument may be long-lived: keep() the stored values inside put
+```
+
+Fix: pass a local instead of the long-lived value, or make the function store `keep(x)`.
+
+### E313 USE_AFTER_RESET
+
+`hearth.Reset()` frees the request pool, so a value allocated before the reset cannot be
+read after it.
+
+```tin
+package main
+
+import "hearth"
+import "say"
+
+func main() {
+	s := say.Fmt("fresh-%d", 1)
+	hearth.Reset()
+	say.Line(s)
+}
+```
+
+```text
+example.tin:9:11: error E313 USE_AFTER_RESET: 's' may hold request memory from before hearth.Reset(), which freed it, and is read after the reset: keep() the value before the reset, or create it after
+```
+
+Fix: `keep()` the value before the reset, or create it again after.
+
 ## E4xx Faults and optionals
 
 ### E401 CATCH_PLACEMENT
@@ -1240,3 +1359,33 @@ example.tin:4:15: error E525 SHAPE_METHOD_CONFLICT: shape Both has two methods n
 ```
 
 Fix: rename one of the methods, or make the signatures the same.
+
+## E7xx mut parameters
+
+### E701 NOT_MUT
+
+Parameters are read-only unless declared `mut`: changing a parameter's fields, elements or
+map entries, or appending to it, needs `mut` on the parameter (and at the call).
+
+```tin
+package main
+
+type Box struct {
+	Items []str
+}
+
+func add(b Box, s str) {
+	b.Items = append(b.Items, s)
+}
+
+func main() {
+	add(Box{}, "x")
+}
+```
+
+```text
+example.tin:8:12: error E701 NOT_MUT: cannot modify parameter 'b': declare it mut
+```
+
+Fix: declare the parameter `mut` (`func add(b mut Box, s str)`) and call it with `add(mut box, s)`, or
+return the new value instead.
