@@ -262,3 +262,29 @@ contains the machine details and raw samples.
 
 Other CPU benchmarks stayed within 5% of base. HTTP stayed within the workflow's 5% review
 threshold; the largest change was arm64 `/plaintext` at 0.958 head/base requests per second.
+
+## Single-byte string appends
+
+`append(b, s...)` on `[]u8` now emits a direct byte load/store when the appended string has
+length one. Longer strings still use `memcpy`, and capacity growth still uses the existing
+runtime path. The native Linux comparison used seven alternating CPU runs per side and five
+alternating HTTP rounds on GitHub-hosted amd64 and arm64 runners (Go 1.26.8; the load generator
+ran on the same machine). It compared base `7412ef6` (the then-current main plus conditional
+increment work) with head `d88cef5` (the same code plus the append optimization). See [workflow
+run 37163339932](https://github.com/yasserreslan/tin/actions/runs/37163339932) for raw samples,
+HTTP logs and machine details.
+
+| architecture | `strbuild` base ms | head ms | head/base time |
+|---|---:|---:|---:|
+| amd64 | 154.35 | 148.22 | 0.960 |
+| arm64 | 150.69 | 151.42 | 1.005 |
+
+The amd64 result is about 4% faster; arm64 showed no measurable change. Every other CPU
+benchmark stayed within 5% of its base.
+
+| architecture | path | base req/s | head req/s | head/base req/s |
+|---|---|---:|---:|---:|
+| amd64 | `/json` | 104705 | 105673 | 1.009 |
+| amd64 | `/plaintext` | 100077 | 107729 | 1.076 |
+| arm64 | `/json` | 177246 | 179926 | 1.015 |
+| arm64 | `/plaintext` | 175889 | 178189 | 1.013 |
