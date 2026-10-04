@@ -1106,8 +1106,12 @@ err2 := argo.Get(text, mut xs)      // appends decoded elements
   logging and any library function that did not opt in). `==`, `!=`, the orderings and
   `min`/`max` on secrets are errors: compare with `seal.Equal`, which takes constant time.
   A secret map key is an error. A struct is made secret field by field, not as a whole.
-  `tin audit secrets FILE.tin` lists every `reveal` and every secret passed to a library
-  parameter declared secret, so review knows where secrets leave.
+  A secret may be written into a query literal (`cache.Do("GET {token}")`): the value is
+  sent as itself, and the query's `Hidden` bits mark it, so a replay capsule holds its keyed
+  handle, never its text (#241).
+  `tin audit secrets FILE.tin` lists every `reveal`, every secret passed to a library
+  parameter declared secret and every secret sent in a query, so review knows where secrets
+  leave.
 
 ---
 

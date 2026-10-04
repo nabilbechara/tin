@@ -4937,6 +4937,7 @@ fn chk_query(e, want) {
     let pos = e[N_POS];
     let parts = vec_new();
     let args = vec_new();
+    let hidden = 0;
     if e[N_KIND] == EX_STR {
         let s = node_new(EX_STR, pos);
         s[STR_PTR] = e[STR_PTR];
@@ -4952,7 +4953,14 @@ fn chk_query(e, want) {
                 err_code_at(pos, "E280 QUERY", "a query value takes no format spec: it is sent as it is");
             }
             let a = vec_get(vals, i);
-            let qa = query_arg(a, chk(a, 0));
+            let at = chk(a, 0);
+            if is_secret(at) {
+                // Sent as itself; a replay key holds its handle instead (query.Hidden, #241).
+                hidden = hidden | secret_query_arg(a, at, args[VEC_LEN]);
+                at = plain_type(at);
+                a[N_TYPE] = at;
+            }
+            let qa = query_arg(a, at);
             if qa {
                 vec_push(args, qa);
             }
@@ -4977,6 +4985,10 @@ fn chk_query(e, want) {
     let keys = vec_new();
     vec_push(keys, ident_node(pos, "Parts"));
     vec_push(keys, ident_node(pos, "Args"));
+    if hidden {
+        vec_push(elems, mk_int(pos, hidden, ty_u64));
+        vec_push(keys, ident_node(pos, "Hidden"));
+    }
     let c = composite_of(tx_named(pos, "query"), elems, keys);
     replace_node(e, c);
     e[N_TYPE] = 0;

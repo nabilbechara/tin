@@ -738,10 +738,6 @@ func (c Client) exchange(cmds [][]str) !i64 {
 			fail "redis: an empty command"
 		}
 	}
-	tp := rt_tape()
-	if tp != 0 {
-		return try c.exchange_taped(tp, cmds)
-	}
 	l := c.line()
 	for _, a := range cmds {
 		encode(l, a)
@@ -777,10 +773,20 @@ var tapedClient i64
 var tapedCmds i64
 
 // exchange_taped records or replays one exchange as redis@1: the key is the commands (each word
-// as its length, ":" and its bytes), the result the raw replies; it returns a slot holding them.
-func (c Client) exchange_taped(tp i64, cmds [][]str) !i64 {
-	k := make([]u8, 0, 64)
+// as its length, ":" and its bytes; a value written with a secret is its handle), the result
+// the raw replies; it returns a slot holding them.
+func (c Client) exchange_taped(tp i64, cmds [][]str, qs []query) !i64 {
 	for _, a := range cmds {
+		if len(a) == 0 {
+			fail "redis: an empty command"
+		}
+	}
+	k := make([]u8, 0, 64)
+	for _, q := range qs {
+		a := words(q)
+		if q.Hidden != 0 {
+			a = key_words(q)
+		}
 		for i, w := range a {
 			if i > 0 {
 				k = append(k, ' ')
@@ -815,6 +821,19 @@ func exchange_live() !str {
 	return v
 }
 
+// key_words is words(q) with each value written with a secret replaced by its handle.
+func key_words(q query) []str {
+	args := make([]qarg, 0, len(q.Args))
+	for i, a := range q.Args {
+		if i < 64 && (q.Hidden>>u64(i))&1 != 0 {
+			args = append(args, qarg.Str(rt_secret_key(arg_text(a))))
+		} else {
+			args = append(args, a)
+		}
+	}
+	return words(query{Parts: q.Parts, Args: args})
+}
+
 // replies_fit reports whether v holds exactly n complete replies.
 func replies_fit(v str, n i64) bool {
 	p := cast(i64, v) + 8
@@ -831,6 +850,18 @@ func replies_fit(v str, n i64) bool {
 
 // Do sends one command and returns its reply; an error reply fails.
 func (c Client) Do(q query) !Reply {
+	tp := rt_tape()
+	if tp != 0 && c.open {
+		s := try c.exchange_taped(tp, [][]str{words(q)}, []query{q}) // recorded for replay (#241)
+		r, _ := reply_at(s[sMsg], 0)
+		free_slot(s)
+		switch r {
+		case Err(m):
+			fail "redis: {m}"
+		default:
+		}
+		return r
+	}
 	s := try c.exchange([][]str{words(q)})
 	r, _ := reply_at(s[sMsg], 0)
 	free_slot(s)
@@ -851,6 +882,13 @@ func (c Client) Pipe(qs []query) ![]Reply {
 	}
 	if len(cmds) == 0 {
 		return []Reply{}
+	}
+	tp := rt_tape()
+	if tp != 0 && c.open {
+		s := try c.exchange_taped(tp, cmds, qs) // recorded for replay (#241)
+		items, _ := reply_items(s[sMsg], 0, len(cmds))
+		free_slot(s)
+		return items
 	}
 	s := try c.exchange(cmds)
 	items, _ := reply_items(s[sMsg], 0, len(cmds))
