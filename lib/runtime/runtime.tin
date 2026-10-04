@@ -3303,6 +3303,37 @@ func rt_guard_land(g i64, msg str) {
 	rt_land(g, rt_fault_panic("panic: "+msg, ""))
 }
 
+// rt_bnd_landing distinguishes unwind stacks from a scope's child-list word.
+func rt_bnd_landing(b i64) i64 {
+	k := b[bKind]&255
+	if k == bkWithin || k == bkGuard || k == bkLimit { return b[bLand] }
+	return 0
+}
+
+// rt_bnd_join_scopes stops and joins children before their parent's defers run.
+func rt_bnd_join_scopes(target i64, f i64) {
+	b := rt_bnd_current()
+	for b != 0 {
+		if b[bKind]&255 == bkScope {
+			rt_bnd_cancel(b, cast(fault, f))
+			for b[bLive] > 0 { rt_scope_block(b, 0) }
+		}
+		if b == target || b[bKind]&bfRoot != 0 { break }
+		b = b[bParent]
+	}
+}
+
+// rt_scope_discard releases joined child handles after the unwinding defers finish.
+func rt_scope_discard(b i64) {
+	r := b[bLand]
+	for r != 0 {
+		n := r[spNext]
+		free(r)
+		r = n
+	}
+	b[bLand] = 0
+}
+
 // rt_land unwinds to the boundary of record g, which then gives fault word f, and resumes its
 // caller: deferred calls and cleanups registered since it began run, and the boundaries
 // entered inside it are left (their own stacks go back to the cache).
@@ -3312,6 +3343,7 @@ func rt_land(g i64, f i64) {
 		rt_sys_exit(2)
 	}
 	g[gUnwinding] = 1
+	rt_bnd_join_scopes(g[gBnd], f)
 	rt_defer_run(g[gDefer])
 	if curTask != 0 {
 		rt_task_cleanups(g[gCleanup])
@@ -3319,7 +3351,8 @@ func rt_land(g i64, f i64) {
 	b := g[gBnd]
 	for rt_bnd_current() != b {
 		in := rt_bnd_current()
-		ig := in[bLand]
+		if in[bKind]&255 == bkScope { rt_scope_discard(in) }
+		ig := rt_bnd_landing(in)
 		if ig != 0 {
 			st := ig[gStack]
 			(st + taskGuard)[0] = guardStacks
@@ -3568,7 +3601,8 @@ func rt_bnd_task_end(t i64) {
 				l[bTaskUsed]--
 			}
 		}
-		g := b[bLand]
+		if b[bKind]&255 == bkScope { rt_scope_discard(b) }
+		g := rt_bnd_landing(b)
 		if g != 0 {
 			st := g[gStack]
 			(st + taskGuard)[0] = guardStacks
@@ -3962,17 +3996,23 @@ func rt_bnd_poll() {
 	if b[bCancel] == 0 { return }
 	f := rt_wait_fault()
 	target := rt_bnd_target(b[bOrigin])
-	if target[bLand] != 0 {
-		if target[bLand][gUnwinding] != 0 { return }
-		rt_land(target[bLand], f)
+	g := rt_bnd_landing(target)
+	if g != 0 {
+		if g[gUnwinding] != 0 { return }
+		rt_land(g, f)
 	}
 	t := curTask
 	if t != 0 && t[tPanicked] != 0 { return }
 	if t != 0 && t[tRecoverable] != 0 {
 		t[tRecover] = 0
 		t[tPanicked] = 1
-		if rt_fault_ident(f) == faultDeadline { t[tPanicked] = 504 }
+		if t[tChild] != 0 {
+			t[tChild][spFault] = f
+		} else {
+			if rt_fault_ident(f) == faultDeadline { t[tPanicked] = 504 }
 			rt_fault_say("request canceled: " + cast(str, f) + "\n")
+		}
+		rt_bnd_join_scopes(rt_bnd_root(t), f)
 		rt_defer_run(0)
 		rt_task_abort(t)
 	}
