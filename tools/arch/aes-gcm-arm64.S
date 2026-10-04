@@ -40,6 +40,18 @@ aes_hw_ctr:
 9:	ret
 	.size aes_hw_ctr, .-aes_hw_ctr
 
+// aes_hw_subword(w w0) -> the AES S-box on each byte of w. AESE with a zero key on w in every
+// column is SubBytes(ShiftRows(state)), and ShiftRows moves nothing between equal columns.
+	.globl aes_hw_subword
+	.type aes_hw_subword, %function
+aes_hw_subword:
+	dup	v0.4s, w0
+	movi	v1.16b, #0
+	aese	v0.16b, v1.16b
+	umov	w0, v0.s[0]
+	ret
+	.size aes_hw_subword, .-aes_hw_subword
+
 // ghash_hw(state x0, h x1, data x2, nblocks x3): state = (state ^ block) * H for each
 // 16-byte block, in GCM's byte order in memory. Inside, RBIT on each byte turns a block into
 // a polynomial with x^i at bit i, so PMULL multiplies it directly; the product is reduced

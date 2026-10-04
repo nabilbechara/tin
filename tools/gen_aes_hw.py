@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regenerate selfhost/aes_hw.tin, seal's AES-CTR, GHASH and CPU-check leaves, from
 tools/arch/aes-gcm-*.S (needs clang). The code generators emit these bytes for the
-seal.aes_hw_ctr, seal.ghash_hw and seal.aes_hw_cpu placeholders."""
+seal.aes_hw_ctr, seal.aes_hw_subword, seal.ghash_hw and seal.aes_hw_cpu placeholders."""
 import argparse
 from pathlib import Path
 import struct
@@ -10,7 +10,7 @@ import tempfile
 from gen_memory_fast import functions
 
 ROOT = Path(__file__).resolve().parents[1]
-NAMES = {'arm64': ('aes_hw_ctr', 'ghash_hw'), 'amd64': ('aes_hw_cpu', 'aes_hw_ctr', 'ghash_hw')}
+NAMES = {'arm64': ('aes_hw_ctr', 'aes_hw_subword', 'ghash_hw'), 'amd64': ('aes_hw_cpu', 'aes_hw_ctr', 'aes_hw_subword', 'ghash_hw')}
 
 
 def generate():

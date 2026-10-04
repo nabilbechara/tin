@@ -61,6 +61,19 @@ aes_hw_ctr:
 9:	ret
 .size aes_hw_ctr, .-aes_hw_ctr
 
+// aes_hw_subword(w edi) -> the AES S-box on each byte of w: AESENCLAST with a zero key on w
+// in every column (ShiftRows moves nothing between equal columns).
+.global aes_hw_subword
+.type aes_hw_subword, @function
+aes_hw_subword:
+	movd xmm0, edi
+	pshufd xmm0, xmm0, 0
+	pxor xmm1, xmm1
+	aesenclast xmm0, xmm1
+	movd eax, xmm0
+	ret
+.size aes_hw_subword, .-aes_hw_subword
+
 // rbit reverses the bits of every byte of \x (PSHUFB on nibbles; xmm13 = 0x0f bytes,
 // xmm14 = reversed nibbles, xmm15 = reversed nibbles << 4; clobbers xmm8, xmm9).
 .macro rbit x
