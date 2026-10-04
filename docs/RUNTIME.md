@@ -320,8 +320,12 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   the deferred calls of every frame the panic leaves run, innermost first (#230: each `defer`
   puts a record on the task's defer chain, made by a generated `defer$N`; a return runs the
   chain back to its function's mark). A panic while they or the cleanups run ends the process
-  after printing both messages. A panic outside a request (main, a tick, a relay handler) or a
-  stack overflow still ends the process.
+  after printing both messages. Ticks (`anvil.OnTick`) and relay handlers (`anvil.OnRelay`)
+  are guarded implicitly too (#230): each tick, and each round of relay messages, runs through
+  `rt_guard_call` on a guard stack, so a panic in one logs `panic: ...` and its backtrace, runs
+  the deferred calls it registered, ends that tick or that message's handler, and the core goes
+  on (the remaining messages are handled at once). A panic in `main` outside a `guard`, or a
+  stack overflow, still ends the process.
 - A connection closed while its request waits is marked dead and freed when the task ends.
 - Finished tasks free overflow pool chunks and big blocks. Each core caches at most
   64 task records; excess records release their base pool and unmap their stacks.

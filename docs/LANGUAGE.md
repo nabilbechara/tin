@@ -833,7 +833,8 @@ There are no goroutines and no shared mutable state.
 - `anvil.Serve` runs one HTTP event loop per core; a connection stays on one core. A
   `Router` built in `main` is compiled once by `r.Serve` into a table every core reads.
   `anvil.OnRelay(h)` and `anvil.OnTick(ms, h)` run handlers on server cores between
-  requests.
+  requests; like a request, each is guarded implicitly: a panic in it runs its deferred calls,
+  is logged, and the core goes on.
 
 ---
 
