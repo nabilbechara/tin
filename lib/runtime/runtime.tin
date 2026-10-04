@@ -5222,10 +5222,14 @@ func rt_bnd_cancel(b i64, reason fault) {
 	if b[bCancel] != 0 {
 		return
 	}
+	if !rt_sched_cancel(b, reason) {
+		return // replaying: a deadline or a drain comes from the tape, not the clock (#243)
+	}
 	r := cast(i64, reason)
 	d := b
 	for {
-		if d[bCancel] == 0 {
+		// A drain reaching a request is that request's cancel on its tape (#243).
+		if d[bCancel] == 0 && (d == b || d[bKind]&255 != bkRequest || rt_sched_cancel(d, reason)) {
 			d[bCancel] = r
 			d[bOrigin] = b
 			t := d[bTask]
@@ -5411,7 +5415,7 @@ func rt_task_wait(fd i64, want i64, timeout i64) i64 {
 	if timeout > 0 {
 		wake = rt_mono_ns() + timeout
 	}
-	if t[tDeadline] > 0 && (wake < 0 || t[tDeadline] <= wake) {
+	if t[tDeadline] > 0 && (wake < 0 || t[tDeadline] <= wake) && (t[tTape] == 0 || rt_sched_clock(t)) {
 		wake = t[tDeadline]
 		t[tResult] = waitDeadline
 	}
@@ -5639,6 +5643,9 @@ func rt_timer_pop(now i64) i64 {
 			if t[tWaitFd] >= 0 {
 				waitCancel(t[tWaitFd])
 				t[tWaitFd] = -1
+			}
+			if t[tTape] != 0 && t[tResult] == waitDeadline {
+				rt_sched_deadline(t) // recording: the deadline's cancel goes on the tape before t resumes (#243)
 			}
 			return t
 		}

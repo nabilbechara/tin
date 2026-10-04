@@ -123,7 +123,8 @@ const ssTasks = 1 // the request's tasks: [capacity, count, task...] (its first 
 const ssHeld = 2  // replaying: tasks woken before their turn, held off the run queue
 const ssWait = 3  // replaying: tasks whose effect or select is not the next record
 const ssLive = 4  // replaying a tape with no sched.* record (from a build without them): 1
-const ssWords = 5
+const ssPump = 5  // replaying: 1 while a recorded cancel is applied
+const ssWords = 6
 
 // sched_state is tape tp's scheduling state, made at first use.
 func sched_state(tp i64) i64 {
@@ -279,6 +280,7 @@ func rt_sched_resume(t i64) bool {
 	}
 	st := sched_state(tp)
 	sched_know(st, t)
+	sched_pump(tp, st)
 	pos := tp[tpPos]
 	if pos < tp[tpLen] {
 		b := tp[tpBuf]
@@ -288,7 +290,7 @@ func rt_sched_resume(t i64) bool {
 			if len(data) == 8 && (cast(i64, data) + 8)[0] == sched_num(t) {
 				tp[tpPos] = tape_skip(tp, pos)
 				tp[tpSeq]++
-				rt_sched_took(tp)
+				sched_wake(st) // not sched_pump: what follows happened after t ran
 				return true
 			}
 		}
@@ -311,6 +313,9 @@ func rt_sched_took(tp i64) {
 		return
 	}
 	sched_wake(st)
+	if curTask == 0 {
+		sched_pump(tp, st) // between tasks: a recorded deadline that is next applies now
+	}
 }
 
 // rt_sched_release lets every waiting task of tape tp go on (the replay diverged).
@@ -341,6 +346,9 @@ func rt_sched_wait_turn(tp i64) bool {
 	}
 	st := sched_state(tp)
 	sched_know(st, t)
+	if sched_pump(tp, st) {
+		return true // a recorded deadline came first: try again under it
+	}
 	sched_list_add(st, ssWait, t)
 	if !sched_moving(tp, st) {
 		sched_list_drop(st[ssWait], t)
@@ -365,6 +373,7 @@ func rt_sched_stopped(t i64) {
 	if tp == 0 || tp[tpMode] != tapeReplay || tp[tpDiverged] != 0 || tp[tpSched] == 0 {
 		return
 	}
+	sched_pump(tp, tp[tpSched])
 	sched_stall(tp, 0)
 }
 
@@ -428,4 +437,192 @@ func sched_timed(t i64) bool {
 		}
 	}
 	return false
+}
+
+// ---- cancellations (sched.cancel@1) ----
+
+const schedCancelKind = "sched.cancel@1"
+
+// sched_bnd_kind is the name of boundary b's kind in a sched.cancel@1 key.
+func sched_bnd_kind(b i64) str {
+	k := b[bKind] & 255
+	if k == bkRequest {
+		return "request"
+	}
+	if k == bkTask {
+		return "task"
+	}
+	if k == bkGuard {
+		return "guard"
+	}
+	if k == bkWithin {
+		return "within"
+	}
+	if k == bkLimit {
+		return "limit"
+	}
+	if k == bkScope {
+		return "scope"
+	}
+	if k == bkArena {
+		return "arena"
+	}
+	if k == bkWith {
+		return "with"
+	}
+	if k == bkCore {
+		return "core"
+	}
+	return "background"
+}
+
+// sched_by_clock reports whether a cancel's reason comes from the clock or the outside (a
+// deadline, a drain): replaying, those come from the tape.
+func sched_by_clock(e i64) bool {
+	id := rt_fault_ident(e)
+	return id == faultDeadline || id == faultDraining
+}
+
+// rt_sched_cancel is called when boundary b is about to be cancelled with reason; false
+// leaves it as it is. Recording, a boundary of a request appends sched.cancel@1 (its kind and
+// its task's number; the reason as a fault). Replaying, a deadline or a drain does not cancel
+// by the clock (false): its record is applied when it is the next one (sched_pump). Any
+// other cancel must be the next record, which it takes; else the replay diverged.
+func rt_sched_cancel(b i64, reason fault) bool {
+	t := b[bTask]
+	if t == 0 {
+		return true
+	}
+	tp := t[tTape] & -2
+	if tp == 0 {
+		return true
+	}
+	e := cast(i64, reason)
+	key := sched_bnd_kind(b) + " " + rt_i64str(sched_num(t))
+	if tp[tpMode] != tapeReplay {
+		tape_add(tp, schedCancelKind, key, 1, fault_sentinel(e), e+8, e[0])
+		return true
+	}
+	if tp[tpDiverged] != 0 || sched_live(tp) || tp[tpSched][ssPump] != 0 {
+		return true
+	}
+	if sched_by_clock(e) {
+		sched_pump(tp, tp[tpSched]) // a task that runs past its deadline: the recorded one, if next
+		return false
+	}
+	pos := tp[tpPos]
+	if sched_is(tp, pos, schedCancelKind, key) {
+		tp[tpPos] = tape_skip(tp, pos)
+		tp[tpSeq]++
+		rt_sched_took(tp)
+		return true
+	}
+	tape_diverge(tp, "replay: divergence at effect " + rt_i64str(tp[tpSeq]) + ": got " + schedCancelKind + " " + tape_quote(key) + " (" + cast(str, e) + "), recorded " + sched_next_text(tp))
+	return true
+}
+
+// sched_next_text describes replaying tape tp's next record for a divergence message.
+func sched_next_text(tp i64) str {
+	pos := tp[tpPos]
+	if pos >= tp[tpLen] {
+		return "nothing more"
+	}
+	b := tp[tpBuf]
+	rkind := tape_field(b, pos+8)
+	return rkind + " " + tape_quote(tape_field(b, pos+16+len(rkind)))
+}
+
+// sched_pump applies the recorded deadlines and drains that are next on replaying tape tp:
+// each cancels its boundary (the innermost one of its kind in its task, not yet cancelled)
+// with the recorded reason. It runs when the recorded clock could have fired: between tasks,
+// or when the running task waits for its turn or finds its deadline past; true if it applied
+// one (or diverged).
+func sched_pump(tp i64, st i64) bool {
+	if st[ssPump] != 0 || tp[tpMode] != tapeReplay || tp[tpDiverged] != 0 || st[ssLive] != 0 {
+		return false
+	}
+	did := false
+	for {
+		pos := tp[tpPos]
+		if pos >= tp[tpLen] {
+			return did
+		}
+		b := tp[tpBuf]
+		rkind := tape_field(b, pos+8)
+		if !rt_str_eq(rkind, schedCancelKind) {
+			return did
+		}
+		key := tape_field(b, pos+16+len(rkind))
+		at := pos + 8 + 8 + len(rkind) + 8 + len(key)
+		ident := (b + at + 8)[0]
+		if ident != faultDeadline && ident != faultDraining {
+			return did
+		}
+		msg := tape_field(b, at+16)
+		d := sched_find_bnd(tp, st, key)
+		if d == 0 {
+			tape_diverge(tp, "replay: divergence at effect " + rt_i64str(tp[tpSeq]) + ": recorded " + schedCancelKind + " " + tape_quote(key) + ", and the request has no such boundary")
+			return true
+		}
+		tp[tpPos] = tape_skip(tp, pos)
+		tp[tpSeq]++
+		st[ssPump] = 1
+		rt_bnd_cancel(d, cast(fault, fault_rebuilt(msg, ident)))
+		st[ssPump] = 0
+		sched_wake(st)
+		did = true
+	}
+	return did
+}
+
+// sched_find_bnd is the boundary a recorded cancel key ("kind number") names: the innermost
+// boundary of that kind, not yet cancelled, of the request's task with that number; 0 if none.
+func sched_find_bnd(tp i64, st i64, key str) i64 {
+	sp := 0
+	for sp < len(key) && key[sp] != ' ' {
+		sp++
+	}
+	kind := key[:sp]
+	num := 0
+	for i := sp + 1; i < len(key); i++ {
+		num = num*10 + i64(key[i]-'0')
+	}
+	l := st[ssTasks]
+	for i := 0; i < l[1]; i++ {
+		t := l[2+i]
+		if t[tTape]&-2 != tp || t[tDone] != 0 || sched_num(t) != num {
+			continue
+		}
+		b := t[tBnd]
+		for b != 0 {
+			if b[bCancel] == 0 && rt_str_eq(sched_bnd_kind(b), kind) {
+				return b
+			}
+			if b[bKind]&bfRoot != 0 {
+				break
+			}
+			b = b[bParent]
+		}
+	}
+	return 0
+}
+
+// rt_sched_clock reports whether task t's waits are cut by its deadline: not while it
+// replays scheduling, where the deadline's cancel comes from the tape.
+func rt_sched_clock(t i64) bool {
+	tp := t[tTape] & -2
+	return tp == 0 || tp[tpMode] != tapeReplay || tp[tpDiverged] != 0 || sched_live(tp)
+}
+
+// rt_sched_deadline is called when a deadline ends task t's wait: recording, the deadline's
+// owner is cancelled now, so its record comes before t's resume, as a replay applies it.
+func rt_sched_deadline(t i64) {
+	tp := t[tTape] & -2
+	if tp == 0 || tp[tpMode] != tapeRecord {
+		return
+	}
+	b := t[tBnd]
+	if b != 0 && b[bCancel] == 0 && b[bDeadline] > 0 && rt_mono_ns() >= b[bDeadline] {
+		rt_bnd_cancel(b[bDlOwner], cast(fault, rt_fault_deadline()))
+	}
 }
