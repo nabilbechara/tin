@@ -1,5 +1,6 @@
 """Tests for the build tooling: the Makefile and the tin command."""
 import os
+import hashlib
 from pathlib import Path
 import shutil
 import subprocess
@@ -138,6 +139,38 @@ class TinCommandTests(unittest.TestCase):
     def test_single_file_form(self):
         self.assertEqual(self.tin('hello world.tin', 'x y', '*'), ['x y', '*'])
         self.assertEqual(self.tinc_args()[2:], ['hello world.tin'])
+
+
+class PackageResolutionTests(unittest.TestCase):
+    def test_vendor_precedes_library_and_lock_hashes_are_required(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            (project / 'vendor/dep').mkdir(parents=True)
+            main = project / 'main.tin'
+            dep = project / 'vendor/dep/dep.tin'
+            main.write_text('package main\nimport "dep"\nimport "say"\nfunc main() { say.Line(dep.Value()) }\n')
+            dep.write_text('package dep\nfunc Value() i64 { return 7 }\n')
+            output = project / 'program'
+            env = make_env(TIN_ROOT=str(ROOT))
+            command = [str(ROOT / 'bin/tinc'), '-o', str(output), str(main)]
+            result = subprocess.run(command, capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            ran = subprocess.run([str(output)], capture_output=True, text=True)
+            self.assertEqual(ran.stdout, '7\n')
+
+            entries = []
+            for source in (main, dep):
+                relative = source.relative_to(project).as_posix()
+                digest = hashlib.sha256(source.read_bytes()).hexdigest()
+                entries.append(f'{digest} {relative}\n')
+            (project / 'tin.lock').write_text(''.join(entries))
+            result = subprocess.run(command, capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+            dep.write_text('package dep\nfunc Value() i64 { return 8 }\n')
+            result = subprocess.run(command, capture_output=True, text=True, env=env)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('tin.lock hash mismatch', result.stderr)
 
 
 if __name__ == '__main__':
