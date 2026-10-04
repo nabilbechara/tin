@@ -1316,6 +1316,8 @@ fn collect_local_decls(stmts, names) {
             collect_local_decls(s[BODY_BLOCK][BLK_STMTS], names);
         } else if k == ST_LIST {
             collect_local_decls(s[LIST_STMTS], names);
+        } else if mt_stmt_expr(s) && mt_stmt_expr(s)[N_KIND] == EX_MATCH {
+            mt_collect_decls(mt_stmt_expr(s), names);
         } else if k == ST_IF {
             if s[IF_INIT] {
                 let tmp = vec_new();
@@ -1561,6 +1563,20 @@ fn scan_idents_in_expr(e, inner_params, outer_names, cells) {
         scan_funclit_escaping_idents(e[LIT_FN], outer_names, cells);
     } else if k == EX_BOUNDARY {
         scan_idents_in_block(e[BOUND_BODY], inner_params, outer_names, cells);
+    } else if k == EX_MATCH {
+        scan_idents_in_expr(e[MATCH_SUBJECT], inner_params, outer_names, cells);
+        let arms = e[MATCH_ARMS];
+        let ai = 0;
+        while ai < arms[VEC_LEN] {
+            let arm = vec_get(arms, ai);
+            scan_idents_in_expr(vec_get(arm, ARM_GUARD), inner_params, outer_names, cells);
+            if vec_get(arm, ARM_BLOCK) {
+                scan_idents_in_block(vec_get(arm, ARM_BODY), inner_params, outer_names, cells);
+            } else {
+                scan_idents_in_expr(vec_get(arm, ARM_BODY), inner_params, outer_names, cells);
+            }
+            ai = ai + 1;
+        }
     }
 }
 
@@ -1736,6 +1752,20 @@ fn scan_funclits_in_expr(e, outer_names, cells) {
         scan_funclits_in_block(e[CATCH_BODY], outer_names, cells);
     } else if k == EX_BOUNDARY {
         scan_funclits_in_block(e[BOUND_BODY], outer_names, cells);
+    } else if k == EX_MATCH {
+        scan_funclits_in_expr(e[MATCH_SUBJECT], outer_names, cells);
+        let arms = e[MATCH_ARMS];
+        let ai = 0;
+        while ai < arms[VEC_LEN] {
+            let arm = vec_get(arms, ai);
+            scan_funclits_in_expr(vec_get(arm, ARM_GUARD), outer_names, cells);
+            if vec_get(arm, ARM_BLOCK) {
+                scan_funclits_in_block(vec_get(arm, ARM_BODY), outer_names, cells);
+            } else {
+                scan_funclits_in_expr(vec_get(arm, ARM_BODY), outer_names, cells);
+            }
+            ai = ai + 1;
+        }
     } else if k == EX_INTERP {
         let ia = e[INTERP_ARGS];
         if ia {
@@ -2457,6 +2487,10 @@ fn check_stmt(s) {
             lower_try_stmt(s, x, 0, 0);
             return;
         }
+        if x[N_KIND] == EX_MATCH && !ck_legacy {
+            lower_match_stmt(s, x);
+            return;
+        }
         let t = chk(x, 0);
         if !ck_legacy && (kind_of(t) == K_ERROR || (kind_of(t) == K_TUPLE && kind_of(vec_get(t[TY_FIELDS], t[TY_FIELDS][VEC_LEN] - 1)) == K_ERROR)) {
             err_at(s[N_POS], "the fault this call returns is ignored (check it, or use try)");
@@ -2537,6 +2571,8 @@ fn check_stmt(s) {
         lower_defer(s);
     } else if k == ST_BSTORE {
         check_bstore(s);
+    } else if k == ST_MSTORE {
+        check_mstore(s);
     }
 }
 
@@ -2547,6 +2583,10 @@ fn check_bstore(s) {
     let x = s[ES_X];
     if x[N_KIND] == EX_TRY || x[N_KIND] == EX_CATCH || x[N_KIND] == EX_WRAP {
         lower_try_stmt(s, x, 5, 0);
+        return;
+    }
+    if x[N_KIND] == EX_MATCH {
+        check_match_tail(s, x);
         return;
     }
     let t = chk(x, 0);
@@ -2718,6 +2758,18 @@ fn mark_spawns(v, names) {
             mark_spawns(s[WH_BODY][BLK_STMTS], names);
         } else if k == ST_RANGE {
             mark_spawns(s[RG_BODY][BLK_STMTS], names);
+        } else if mt_stmt_expr(s) && mt_stmt_expr(s)[N_KIND] == EX_MATCH {
+            let arms = mt_stmt_expr(s)[MATCH_ARMS];
+            let ai = 0;
+            while ai < arms[VEC_LEN] {
+                let arm = vec_get(arms, ai);
+                if vec_get(arm, ARM_BLOCK) {
+                    mark_spawns(vec_get(arm, ARM_BODY)[BLK_STMTS], names);
+                } else {
+                    mark_spawn_call(vec_get(arm, ARM_BODY), names);
+                }
+                ai = ai + 1;
+            }
         } else if k == ST_EXPR {
             mark_spawn_call(s[ES_X], names);
         } else if k == ST_LET {
@@ -3311,6 +3363,10 @@ fn check_let(s) {
         lower_try_stmt(s, init, 1, t);
         return;
     }
+    if init && init[N_KIND] == EX_MATCH && !ck_legacy {
+        check_match_let(s, init, t);
+        return;
+    }
     if init {
         let it = chk(init, t);
         check_value(pos, it);
@@ -3419,6 +3475,10 @@ fn check_assign(s) {
     let v = s[AS_VALUE];
     if (v[N_KIND] == EX_TRY || v[N_KIND] == EX_CATCH || v[N_KIND] == EX_WRAP) && !ck_legacy {
         lower_try_stmt(s, v, 2, 0);
+        return;
+    }
+    if v[N_KIND] == EX_MATCH && !ck_legacy {
+        check_match_assign(s, target, v);
         return;
     }
     if target[N_KIND] == EX_IDENT && streq(target[ID_NAME], "_") {
@@ -3680,6 +3740,11 @@ fn check_return(s) {
     let pos = s[N_POS];
     if s[RET_VALUE] && (s[RET_VALUE][N_KIND] == EX_TRY || s[RET_VALUE][N_KIND] == EX_CATCH || s[RET_VALUE][N_KIND] == EX_WRAP) && !ck_legacy {
         lower_try_stmt(s, s[RET_VALUE], 4, 0);
+        return;
+    }
+    if s[RET_VALUE] && s[RET_VALUE][N_KIND] == EX_MATCH && !ck_legacy {
+        // return match ...: each arm returns its value (#225).
+        replace_node(s, lower_match(s[RET_VALUE], MATCH_RETURN, 0));
         return;
     }
     if f[F_BANG] && !ck_legacy {
@@ -4029,6 +4094,12 @@ fn catch_body(pos, c, temps, errsym, needv) {
     if valued && (n == 0 || vec_get(user, n - 1)[N_KIND] != ST_EXPR) {
         err_at(c[N_POS], "a catch block must end with the value to use, or leave (return, break, continue or fail)");
         return vec_new();
+    }
+    if valued && vec_get(user, n - 1)[ES_X][N_KIND] == EX_MATCH {
+        // A match as the block's value: its arms assign the value temp, and may leave (#225).
+        let ml = vec_get(user, n - 1);
+        user[VEC_DATA][n - 1] = assign_stmt(ml[N_POS], sym_ref_node(ml[N_POS], vec_get(temps, 0)), ml[ES_X]);
+        valued = 0;
     }
     let out = vec_new();
     push_scope();
@@ -4588,6 +4659,1007 @@ fn all_seen(seen) {
     return 1;
 }
 
+// ---- match (edition 1, #225) ----
+//
+// A match is lowered where it stands: as a statement, a let or assignment value, a return
+// value, or a catch or boundary block's last expression, where its arms may also leave
+// (return, break, continue, fail, try); inside any other expression it is an EX_SEQ whose
+// arms are expressions. A statement match a switch can express (constant, sentinel and
+// variant arms, `_` last, no guards, no break in an arm), or `match true { true if c => }`,
+// the translator's tagless switch, is lowered as that switch, so translated code keeps its
+// instructions. Any other match is an if-else chain over the subject: each arm tests its
+// patterns, declares its bindings, then runs its guard. A guarded arm that binds splits the
+// chain: the rest runs under a flag the arm clears when it is taken. break and continue in
+// an arm apply to the enclosing loop. A name in a pattern compares with a package-level
+// constant or variable (a sentinel), names a variant of an enum subject, or else binds;
+// naming a local variable is an error (compare with a guard).
+
+const MATCH_STMT = 0;   // no value
+const MATCH_VALUE = 1;  // each arm stores its value in the record's local
+const MATCH_RETURN = 2; // each arm returns its value
+const MATCH_TAIL = 3;   // a boundary block's last expression: a value, or none
+const MATCH_EXPR = 4;   // inside an expression: as MATCH_VALUE, with expression arms only
+const MR_SYM = 0;       // record: the value local
+const MR_MODE = 1;      // record: the mode
+const MR_HINT = 2;      // record: the type the context expects (MATCH_EXPR), or 0
+const MS_REC = 3;       // ST_MSTORE: the record of its match (ES_X is the value)
+
+var mt_seq;      // numbers the match locals that are assigned by name
+var mt_variant;  // the enum variant a pattern matches whole, or -1
+var mt_bool;     // a pattern's bool literal: 1 true, 2 false, 0 neither
+
+fn mt_name(prefix) {
+    mt_seq = mt_seq + 1;
+    let nb = buf_new();
+    buf_str(nb, prefix);
+    buf_int(nb, mt_seq);
+    buf_byte(nb, 0);
+    return nb[VEC_DATA];
+}
+
+fn mt_record(vs, mode, hint) {
+    let rec = vec_new();
+    vec_push(rec, vs);
+    vec_push(rec, mode);
+    vec_push(rec, hint);
+    return rec;
+}
+
+// mt_stmt_expr is the expression a statement carries at its top (a match or catch may be one).
+fn mt_stmt_expr(s) {
+    let k = s[N_KIND];
+    if k == ST_EXPR {
+        return s[ES_X];
+    }
+    if k == ST_LET {
+        return s[LET_INIT];
+    }
+    if k == ST_ASSIGN {
+        return s[AS_VALUE];
+    }
+    if k == ST_RETURN {
+        return s[RET_VALUE];
+    }
+    return 0;
+}
+
+// mt_breaks reports a break in stmts outside any loop of theirs: in a match arm it leaves
+// the enclosing loop, where a switch would take it for its own end.
+fn mt_breaks(v) {
+    let i = 0;
+    while i < v[VEC_LEN] {
+        let s = vec_get(v, i);
+        let k = s[N_KIND];
+        if k == ST_BREAK {
+            return 1;
+        }
+        if k == ST_BLOCK && mt_breaks(s[BLK_STMTS]) {
+            return 1;
+        }
+        if k == ST_IF && (mt_breaks(s[IF_THEN][BLK_STMTS]) || (s[IF_ELSE] && mt_breaks(vec_new_with(s[IF_ELSE])))) {
+            return 1;
+        }
+        let x = mt_stmt_expr(s);
+        if x && x[N_KIND] == EX_CATCH && mt_breaks(x[CATCH_BODY][BLK_STMTS]) {
+            return 1;
+        }
+        if x && x[N_KIND] == EX_MATCH && mt_arms_break(x) {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn mt_arms_break(m) {
+    let arms = m[MATCH_ARMS];
+    let i = 0;
+    while i < arms[VEC_LEN] {
+        let arm = vec_get(arms, i);
+        if vec_get(arm, ARM_BLOCK) && mt_breaks(vec_get(arm, ARM_BODY)[BLK_STMTS]) {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// mt_names_assigned reports whether an arm of m (or of a match nested in one) assigns a or b.
+fn mt_names_assigned(m, a, b) {
+    let arms = m[MATCH_ARMS];
+    let i = 0;
+    while i < arms[VEC_LEN] {
+        let arm = vec_get(arms, i);
+        let body = vec_get(arm, ARM_BODY);
+        if vec_get(arm, ARM_BLOCK) && names_assigned(body, a, b) {
+            return 1;
+        }
+        if !vec_get(arm, ARM_BLOCK) && body[N_KIND] == EX_MATCH && mt_names_assigned(body, a, b) {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// mt_collect_decls adds the names m's arms bind or declare (closures may capture them).
+fn mt_collect_decls(m, names) {
+    let arms = m[MATCH_ARMS];
+    let i = 0;
+    while i < arms[VEC_LEN] {
+        let arm = vec_get(arms, i);
+        let pats = vec_get(arm, ARM_PATTERNS);
+        let j = 0;
+        while j < pats[VEC_LEN] {
+            mt_pattern_names(vec_get(pats, j), names);
+            j = j + 1;
+        }
+        let body = vec_get(arm, ARM_BODY);
+        if vec_get(arm, ARM_BLOCK) {
+            collect_local_decls(body[BLK_STMTS], names);
+        } else if body[N_KIND] == EX_MATCH {
+            mt_collect_decls(body, names);
+        }
+        i = i + 1;
+    }
+}
+
+fn mt_pattern_names(p, names) {
+    if vec_get(p, PAT_KIND) == PAT_NAME_KIND && vec_get(p, PAT_NAME)[N_KIND] == EX_IDENT {
+        vec_push(names, vec_get(p, PAT_NAME)[ID_NAME]);
+    }
+    if vec_get(p, PAT_KIND) == PAT_VARIANT {
+        let kids = vec_get(p, PAT_CHILDREN);
+        let j = 0;
+        while j < kids[VEC_LEN] {
+            mt_pattern_names(vec_get(kids, j), names);
+            j = j + 1;
+        }
+    }
+}
+
+// mt_arm_block is an arm's body as a block: its own, or one holding its expression.
+fn mt_arm_block(arm) {
+    let b = vec_get(arm, ARM_BODY);
+    if vec_get(arm, ARM_BLOCK) {
+        return b;
+    }
+    let blk = empty_block(b[N_POS]);
+    vec_push(blk[BLK_STMTS], expr_stmt(b));
+    return blk;
+}
+
+// match_as_switch lowers a statement match that a switch expresses as that switch; it
+// returns 0, having changed nothing, for any other match.
+fn match_as_switch(s, m) {
+    let arms = m[MATCH_ARMS];
+    let subj = m[MATCH_SUBJECT];
+    if mt_arms_break(m) {
+        return 0;
+    }
+    let tagless = subj[N_KIND] == EX_IDENT && streq(subj[ID_NAME], "true");
+    let t = 0;
+    let vs = 0;
+    if !tagless {
+        t = chk(subj, 0);
+        if kind_of(t) == K_OPT || is_untyped(t) {
+            return 0;
+        }
+        if kind_of(t) == K_STRUCT && t[TY_ENUM] {
+            vs = t[TY_ENUM];
+        }
+    }
+    let seen = 0;
+    if vs {
+        seen = vec_filled(vs[VEC_LEN], 0);
+    }
+    let deflt = 0;
+    let cases = vec_new();
+    let n = arms[VEC_LEN];
+    let i = 0;
+    while i < n {
+        let arm = vec_get(arms, i);
+        let pats = vec_get(arm, ARM_PATTERNS);
+        let guard = vec_get(arm, ARM_GUARD);
+        let p0 = vec_get(pats, 0);
+        let exprs = vec_new();
+        if pats[VEC_LEN] == 1 && vec_get(p0, PAT_KIND) == PAT_WILD && !guard {
+            if i != n - 1 {
+                return 0;
+            }
+            exprs = 0;
+            deflt = 1;
+        } else if tagless {
+            let x = vec_get(p0, PAT_A);
+            if !guard || pats[VEC_LEN] != 1 || vec_get(p0, PAT_KIND) != PAT_LITERAL || x[N_KIND] != EX_IDENT || !streq(x[ID_NAME], "true") {
+                return 0;
+            }
+            vec_push(exprs, guard);
+        } else {
+            if guard {
+                return 0;
+            }
+            let j = 0;
+            while j < pats[VEC_LEN] {
+                let e = match_case_expr(vec_get(pats, j), t, seen, pats[VEC_LEN]);
+                if !e {
+                    return 0;
+                }
+                vec_push(exprs, e);
+                j = j + 1;
+            }
+        }
+        vec_push(cases, pair(exprs, mt_arm_block(arm)));
+        i = i + 1;
+    }
+    if seen && !deflt && !all_seen(seen) {
+        return 0;
+    }
+    // A match that ends its function and leaves from every arm needs no return after it.
+    let body = ck_fn[F_BODY][BLK_STMTS];
+    let frs = ck_fn[F_RTYPES];
+    let last = body[VEC_LEN] > 0 && vec_get(body, body[VEC_LEN] - 1) == s && frs[VEC_LEN] > 0 && !(ck_fn[F_BANG] && frs[VEC_LEN] == 1);
+    let pos = s[N_POS];
+    s[N_KIND] = ST_SWITCH;
+    s[SW_TAG] = subj;
+    if tagless {
+        s[SW_TAG] = 0;
+    }
+    s[SW_CASES] = cases;
+    s[SW_INIT] = 0;
+    lower_switch(s);
+    let all_return = deflt && !seen;
+    i = 0;
+    while i < cases[VEC_LEN] {
+        if !ends_in_return(vec_get(vec_get(cases, i), 1)[BLK_STMTS]) {
+            all_return = 0;
+        }
+        i = i + 1;
+    }
+    if last && all_return && s[N_KIND] == ST_BLOCK && !ends_in_return(s[BLK_STMTS]) {
+        vec_push(s[BLK_STMTS], expr_stmt(rt_call(pos, "rt_panic", args1(lit_string(pos, "unreachable match")), ty_void)));
+    }
+    return 1;
+}
+
+// match_case_expr is the switch case for pattern p of a match on t, or 0 when a switch
+// would read it differently. seen marks the enum variants already handled.
+fn match_case_expr(p, t, seen, npats) {
+    let k = vec_get(p, PAT_KIND);
+    if k == PAT_LITERAL {
+        if seen {
+            return 0;
+        }
+        return vec_get(p, PAT_A);
+    }
+    if k == PAT_NAME_KIND {
+        let x = vec_get(p, PAT_NAME);
+        if seen {
+            let name = x[SEL_NAME];
+            if x[N_KIND] == EX_IDENT {
+                name = x[ID_NAME];
+            }
+            let vi = enum_variant(t, name);
+            if vi < 0 || vec_get(seen, vi) {
+                return 0;
+            }
+            seen[VEC_DATA][vi] = 1;
+            return x;
+        }
+        if x[N_KIND] == EX_SELECT {
+            return x;
+        }
+        let sym = lookup_name(x[ID_NAME]);
+        if !sym || (sym[S_KIND] != SYM_GLOBAL && sym[S_KIND] != SYM_CONST) {
+            return 0;
+        }
+        return x;
+    }
+    if k != PAT_VARIANT || !seen {
+        return 0;
+    }
+    let nm = vec_get(p, PAT_NAME);
+    let name = nm[SEL_NAME];
+    if nm[N_KIND] == EX_IDENT {
+        name = nm[ID_NAME];
+    }
+    let vi = enum_variant(t, name);
+    if vi < 0 || vec_get(seen, vi) {
+        return 0;
+    }
+    let v = vec_get(t[TY_ENUM], vi);
+    let kids = vec_get(p, PAT_CHILDREN);
+    if kids[VEC_LEN] > 0 && kids[VEC_LEN] != vec_get(v, 2) {
+        return 0;
+    }
+    let args = vec_new();
+    let j = 0;
+    while j < kids[VEC_LEN] {
+        let kid = vec_get(kids, j);
+        let a = 0;
+        if vec_get(kid, PAT_KIND) == PAT_WILD {
+            a = node_new(EX_IDENT, vec_get(kid, PAT_POS));
+            a[ID_NAME] = "_";
+        } else if vec_get(kid, PAT_KIND) == PAT_NAME_KIND && vec_get(kid, PAT_NAME)[N_KIND] == EX_IDENT && npats == 1 {
+            a = vec_get(kid, PAT_NAME);
+            let ft = field_type(t, vec_get(v, 1) + j);
+            if kind_of(ft) == K_STRUCT && ft[TY_ENUM] && enum_variant(ft, a[ID_NAME]) >= 0 {
+                return 0;
+            }
+        } else {
+            return 0;
+        }
+        vec_push(args, a);
+        j = j + 1;
+    }
+    seen[VEC_DATA][vi] = 1;
+    let c = node_new(EX_CALL, vec_get(p, PAT_POS));
+    if nm[N_KIND] == EX_IDENT {
+        c[CALL_NAME] = nm[ID_NAME];
+    } else {
+        c[CALL_CALLEE] = nm;
+    }
+    c[CALL_ARGS] = args;
+    return c;
+}
+
+// lower_match_stmt lowers a match statement; its arms' values, if any, are dropped.
+fn lower_match_stmt(s, m) {
+    if match_as_switch(s, m) {
+        return;
+    }
+    replace_node(s, lower_match(m, MATCH_STMT, 0));
+}
+
+// match_valued lowers a match whose arms store into local vs, and returns the statements
+// that declare vs and run the match (vs has no type when every arm leaves).
+fn match_valued(pos, m, vs, mode, hint) {
+    let out = lower_match(m, mode, mt_record(vs, mode, hint));
+    let stmts = vec_new();
+    let t = vs[S_TYPE];
+    if t && kind_of(t) != K_VOID {
+        let zero = mk_int(pos, 0, t);
+        if is_float_t(t) || kind_of(t) == K_STRING {
+            zero = zero_value(pos, t);
+        }
+        vec_push(stmts, let_stmt(pos, vs, zero));
+    }
+    vec_push(stmts, out);
+    return stmts;
+}
+
+fn flat_block(pos, stmts) {
+    let b = empty_block(pos);
+    b[BLK_FLAT] = 1;
+    b[BLK_STMTS] = stmts;
+    return b;
+}
+
+// check_match_let lowers let x [T] = match ...: the arms store into a hidden local, x takes it.
+fn check_match_let(s, m, t) {
+    let pos = s[N_POS];
+    let vs = declare_local(pos, mt_name("$match"), t);
+    let stmts = match_valued(pos, m, vs, MATCH_VALUE, 0);
+    let l = node_new(ST_LET, pos);
+    l[LET_NAME] = s[LET_NAME];
+    l[LET_TYPE] = s[LET_TYPE];
+    l[LET_MUT] = s[LET_MUT];
+    if vs[S_TYPE] {
+        l[LET_INIT] = sym_ref_node(pos, vs);
+    } else if !t {
+        err_at(m[N_POS], "this match gives no value: every arm leaves");
+        replace_node(s, flat_block(pos, stmts));
+        return;
+    }
+    vec_push(stmts, l);
+    check_let(l);
+    replace_node(s, flat_block(pos, stmts));
+}
+
+// check_match_assign lowers target = match ...: the arms store into a hidden local first.
+fn check_match_assign(s, target, m) {
+    let pos = s[N_POS];
+    let t = 0;
+    if target[N_KIND] == EX_IDENT && target[N_TYPE] {
+        t = target[N_TYPE];
+    } else if target[N_KIND] == EX_IDENT && !streq(target[ID_NAME], "_") {
+        let sym = lookup_name(target[ID_NAME]);
+        if sym && sym[S_KIND] != SYM_FUNC {
+            t = sym[S_TYPE];
+        }
+    }
+    let vs = declare_local(pos, mt_name("$match"), t);
+    let stmts = match_valued(pos, m, vs, MATCH_VALUE, 0);
+    if vs[S_TYPE] {
+        let a = assign_stmt(pos, target, sym_ref_node(pos, vs));
+        vec_push(stmts, a);
+        check_assign(a);
+    }
+    replace_node(s, flat_block(pos, stmts));
+}
+
+// check_match_tail lowers a match that ends a boundary block: its value, if any, is the block's.
+fn check_match_tail(s, m) {
+    let pos = s[N_POS];
+    let vs = declare_local(pos, mt_name("$match"), 0);
+    let stmts = match_valued(pos, m, vs, MATCH_TAIL, 0);
+    let t = vs[S_TYPE];
+    bound_t = ty_void;
+    if t && kind_of(t) != K_VOID {
+        bound_t = t;
+        vec_push(stmts, bound_store(pos, sym_ref_node(pos, vs), t));
+    }
+    replace_node(s, flat_block(pos, stmts));
+}
+
+// chk_match lowers a match inside an expression to an EX_SEQ yielding its value.
+fn chk_match(e, want) {
+    let pos = e[N_POS];
+    let arms = e[MATCH_ARMS];
+    let i = 0;
+    while i < arms[VEC_LEN] {
+        let arm = vec_get(arms, i);
+        if vec_get(arm, ARM_BLOCK) {
+            err_at(vec_get(arm, ARM_BODY)[N_POS], "a match inside an expression has expression arms: give it a statement of its own (let v = match ...)");
+            return ty_int;
+        }
+        i = i + 1;
+    }
+    let hint = want;
+    if hint && (is_untyped(hint) || kind_of(hint) == K_VOID) {
+        hint = 0;
+    }
+    let vs = declare_local(pos, mt_name("$match"), 0);
+    let stmts = match_valued(pos, e, vs, MATCH_EXPR, hint);
+    let t = vs[S_TYPE];
+    if !t {
+        return ty_int;
+    }
+    replace_node(e, mk_seq(pos, stmts, sym_ref_node(pos, vs), t));
+    e[N_TYPE] = 0;
+    return t;
+}
+
+// check_mstore checks an arm's value and stores it in its match's local; the first value
+// gives the local its type unless the context did.
+fn check_mstore(s) {
+    let pos = s[N_POS];
+    let x = s[ES_X];
+    let rec = s[MS_REC];
+    let vs = vec_get(rec, MR_SYM);
+    let mode = vec_get(rec, MR_MODE);
+    let t = vs[S_TYPE];
+    let k = x[N_KIND];
+    if k == EX_MATCH && mode != MATCH_EXPR {
+        // A match as an arm's value stores into the same local.
+        replace_node(s, lower_match(x, mode, rec));
+        return;
+    }
+    if (k == EX_TRY || k == EX_CATCH || k == EX_WRAP) && mode != MATCH_EXPR {
+        // try in an arm: its value goes through a let of its own, then into the local.
+        let l = node_new(ST_LET, pos);
+        l[LET_NAME] = "$";
+        l[LET_INIT] = x;
+        if t && kind_of(t) == K_VOID {
+            err_at(pos, "the arms of this match must all give a value, or none");
+            return;
+        }
+        lower_try_stmt(l, x, 1, t);
+        if l[N_KIND] != ST_BLOCK {
+            return;
+        }
+        let ls = vec_get(l[BLK_STMTS], l[BLK_STMTS][VEC_LEN] - 1);
+        if ls[N_KIND] != ST_LET {
+            return;
+        }
+        if !t {
+            vs[S_TYPE] = ls[LET_SYM][S_TYPE];
+        }
+        let a = assign_stmt(pos, sym_ref_node(pos, vs), sym_ref_node(pos, ls[LET_SYM]));
+        vec_push(l[BLK_STMTS], a);
+        check_assign(a);
+        replace_node(s, l);
+        return;
+    }
+    let hint = t;
+    if !hint {
+        hint = vec_get(rec, MR_HINT);
+    }
+    if t && kind_of(t) == K_VOID {
+        hint = 0;
+    }
+    let vt = chk(x, hint);
+    if kind_of(vt) == K_VOID {
+        if mode == MATCH_TAIL && (!t || kind_of(t) == K_VOID) {
+            vs[S_TYPE] = ty_void;
+            replace_node(s, expr_stmt(x));
+            return;
+        }
+        err_at(pos, "this arm gives no value");
+        return;
+    }
+    if t && kind_of(t) == K_VOID {
+        err_at(pos, "the arms of this match must all give a value, or none");
+        return;
+    }
+    check_value(pos, vt);
+    if !t {
+        t = default_type(vt);
+        if kind_of(t) == K_NIL {
+            err_at(x[N_POS], "use of untyped nil: give the match a type (let v ?T = match ...)");
+            return;
+        }
+        vs[S_TYPE] = t;
+    }
+    let a = assign_stmt(pos, sym_ref_node(pos, vs), x);
+    check_assign(a);
+    replace_node(s, a);
+}
+
+// mt_void_arm notes a boundary-tail arm block that ends without a value.
+fn mt_void_arm(rec, pos) {
+    let vs = vec_get(rec, MR_SYM);
+    if vs[S_TYPE] && kind_of(vs[S_TYPE]) != K_VOID {
+        err_at(pos, "the arms of this match must all give a value, or none");
+        return;
+    }
+    vs[S_TYPE] = ty_void;
+}
+
+// mt_arm_body is an arm's body block for the mode: its value is stored, returned or dropped.
+fn mt_arm_body(arm, mode, rec) {
+    let b = vec_get(arm, ARM_BODY);
+    if !vec_get(arm, ARM_BLOCK) {
+        let blk = empty_block(b[N_POS]);
+        vec_push(blk[BLK_STMTS], mt_value(b[N_POS], b, mode, rec));
+        return blk;
+    }
+    if mode == MATCH_STMT {
+        return b;
+    }
+    let stmts = b[BLK_STMTS];
+    let n = stmts[VEC_LEN];
+    if n > 0 && vec_get(stmts, n - 1)[N_KIND] == ST_EXPR {
+        let last = vec_get(stmts, n - 1);
+        stmts[VEC_DATA][n - 1] = mt_value(last[N_POS], last[ES_X], mode, rec);
+    } else if ends_in_jump(stmts) {
+        return b;
+    } else if mode == MATCH_TAIL {
+        mt_void_arm(rec, b[N_POS]);
+    } else {
+        err_at(b[N_POS], "a match arm that gives a value ends with it, or leaves (return, break, continue or fail)");
+    }
+    return b;
+}
+
+fn mt_value(pos, x, mode, rec) {
+    if mode == MATCH_STMT {
+        return expr_stmt(x);
+    }
+    if mode == MATCH_RETURN {
+        let r = node_new(ST_RETURN, pos);
+        r[RET_VALUE] = x;
+        return r;
+    }
+    let ms = node_new(ST_MSTORE, pos);
+    ms[ES_X] = x;
+    ms[MS_REC] = rec;
+    return ms;
+}
+
+// A path is how a pattern reaches its value: [local name or 0, symbol, [[offset, type]...]].
+fn mt_path(name, sym) {
+    let p = vec_new();
+    vec_push(p, name);
+    vec_push(p, sym);
+    vec_push(p, vec_new());
+    return p;
+}
+
+fn mt_step(path, off, t) {
+    let steps = vec_clone(vec_get(path, 2));
+    vec_push(steps, pair(off, t));
+    let p = vec_new();
+    vec_push(p, vec_get(path, 0));
+    vec_push(p, vec_get(path, 1));
+    vec_push(p, steps);
+    return p;
+}
+
+// mt_node reads the value at path. A named local is read by name, so nil arms narrow it.
+fn mt_node(pos, path) {
+    let n = 0;
+    if vec_get(path, 0) {
+        n = node_new(EX_IDENT, pos);
+        n[ID_NAME] = vec_get(path, 0);
+    } else {
+        n = sym_ref_node(pos, vec_get(path, 1));
+    }
+    let steps = vec_get(path, 2);
+    let i = 0;
+    while i < steps[VEC_LEN] {
+        let st = vec_get(steps, i);
+        n = mk_mem(pos, n, 0, 0, vec_get(st, 0), vec_get(st, 1));
+        i = i + 1;
+    }
+    return n;
+}
+
+fn mt_is_enum(t) {
+    return kind_of(t) == K_STRUCT && t[TY_ENUM] != 0;
+}
+
+fn mt_compare(pos, path, t, x) {
+    let c = binary_new(pos, "==", mt_node(pos, path), x);
+    if kind_of(t) == K_ERROR {
+        // A fault arm compares with fault.Is, walking the chain (notes/interface_faults.md).
+        c[BIN_OP] = "$is";
+    }
+    return c;
+}
+
+// mt_pattern returns the condition under which pattern p matches the value at path (of type
+// t), or 0 when it always does; its bindings are added to binds. top is 0 inside a variant,
+// where a bare name always binds, as in a switch case. It sets mt_variant and mt_bool.
+fn mt_pattern(p, path, t, binds, top) {
+    let pos = vec_get(p, PAT_POS);
+    let k = vec_get(p, PAT_KIND);
+    mt_variant = -1;
+    mt_bool = 0;
+    if k == PAT_WILD {
+        return 0;
+    }
+    if k == PAT_LITERAL {
+        let x = vec_get(p, PAT_A);
+        if mt_is_enum(t) {
+            err_type(pos, "an arm of a match on ", t, " is a variant, like Name or Name(a, b)");
+            return 0;
+        }
+        if x[N_KIND] == EX_IDENT && kind_of(t) == K_BOOL {
+            mt_bool = 1;
+            if streq(x[ID_NAME], "false") {
+                mt_bool = 2;
+            }
+        }
+        return mt_compare(pos, path, t, x);
+    }
+    if k == PAT_RANGE {
+        if !is_numeric_t(t) && kind_of(t) != K_STRING {
+            err_type(pos, "a range pattern needs a number or a str, not ", t, "");
+            return 0;
+        }
+        let lo = binary_new(pos, ">=", mt_node(pos, path), vec_get(p, PAT_A));
+        let hi = binary_new(pos, "<", mt_node(pos, path), vec_get(p, PAT_B));
+        return binary_new(pos, "&&", lo, hi);
+    }
+    let x = vec_get(p, PAT_NAME);
+    let name = x[SEL_NAME];
+    if x[N_KIND] == EX_IDENT {
+        name = x[ID_NAME];
+    }
+    if k == PAT_VARIANT {
+        if !mt_is_enum(t) {
+            err_type(pos, "a variant pattern needs an enum value, not ", t, "");
+            return 0;
+        }
+        return mt_variant_test(pos, path, t, name, vec_get(p, PAT_CHILDREN), binds);
+    }
+    if x[N_KIND] == EX_SELECT {
+        if mt_is_enum(t) {
+            return mt_variant_test(pos, path, t, name, 0, binds);
+        }
+        return mt_compare(pos, path, t, x);
+    }
+    if mt_is_enum(t) && enum_variant(t, name) >= 0 {
+        return mt_variant_test(pos, path, t, name, 0, binds);
+    }
+    if top {
+        let sym = lookup_name(name);
+        if sym && (sym[S_KIND] == SYM_GLOBAL || sym[S_KIND] == SYM_CONST) {
+            return mt_compare(pos, path, t, x);
+        }
+        if sym && sym[S_KIND] == SYM_LOCAL {
+            let u = err_begin(pos);
+            buf_str(u, "'");
+            buf_str(u, name);
+            buf_str(u, "' is a variable, and a name in a pattern binds a new one: compare with a guard (v if v == ");
+            buf_str(u, name);
+            buf_str(u, ")");
+            err_end(u);
+            return 0;
+        }
+        if mt_is_enum(t) && load8(name) >= 'A' && load8(name) <= 'Z' {
+            let u = err_begin(pos);
+            type_name(u, t);
+            buf_str(u, " has no variant ");
+            buf_str(u, name);
+            err_end(u);
+            return 0;
+        }
+    }
+    let l = node_new(ST_LET, pos);
+    l[LET_NAME] = name;
+    l[LET_INIT] = mt_node(pos, path);
+    vec_push(binds, l);
+    return 0;
+}
+
+// mt_variant_test tests the tag of the enum value at path, then its values' patterns.
+fn mt_variant_test(pos, path, t, name, kids, binds) {
+    let vi = enum_variant(t, name);
+    if vi < 0 {
+        let u = err_begin(pos);
+        type_name(u, t);
+        buf_str(u, " has no variant ");
+        buf_str(u, name);
+        err_end(u);
+        return 0;
+    }
+    let v = vec_get(t[TY_ENUM], vi);
+    let tag = mk_mem(pos, mt_node(pos, path), 0, 0, field_offset(t, 0), ty_int);
+    let cond = mk_bin(pos, "==", tag, mk_int(pos, vi, ty_int), ty_bool);
+    let whole = 1;
+    if kids && kids[VEC_LEN] > 0 {
+        if kids[VEC_LEN] != vec_get(v, 2) {
+            let u = err_begin(pos);
+            buf_str(u, name);
+            buf_str(u, " has ");
+            buf_int(u, vec_get(v, 2));
+            buf_str(u, " values, the pattern has ");
+            buf_int(u, kids[VEC_LEN]);
+            err_end(u);
+            return cond;
+        }
+        let j = 0;
+        while j < kids[VEC_LEN] {
+            let fi = vec_get(v, 1) + j;
+            let ft = field_type(t, fi);
+            let c = mt_pattern(vec_get(kids, j), mt_step(path, field_offset(t, fi), ft), ft, binds, 0);
+            if c {
+                whole = 0;
+                cond = binary_new(pos, "&&", cond, c);
+            }
+            j = j + 1;
+        }
+    }
+    mt_variant = -1;
+    if whole {
+        mt_variant = vi;
+    }
+    mt_bool = 0;
+    return cond;
+}
+
+// lower_match lowers match m to a checked block. rec is the value record (MATCH_VALUE,
+// MATCH_TAIL, MATCH_EXPR), or 0.
+fn lower_match(m, mode, rec) {
+    let pos = m[N_POS];
+    let arms = m[MATCH_ARMS];
+    let subj = m[MATCH_SUBJECT];
+    let out = empty_block(pos);
+    push_scope();
+    let st = chk(subj, 0);
+    if is_untyped(st) {
+        st = default_type(st);
+        if kind_of(st) == K_NIL {
+            err_at(subj[N_POS], "use of untyped nil");
+            pop_scope();
+            return out;
+        }
+        reconvert(subj, st);
+    }
+    if kind_of(st) == K_VOID || kind_of(st) == K_TUPLE {
+        err_type(subj[N_POS], "cannot match on ", st, "");
+        pop_scope();
+        return out;
+    }
+    // The subject is read once into a hidden local, or, a local optional, read in place, so
+    // that a nil arm narrows it for the arms after; optionals are read by name to narrow.
+    let path = 0;
+    if kind_of(st) == K_OPT && subj[N_KIND] == EX_IDENT && subj[ID_REF] && subj[ID_REF][S_KIND] == SYM_LOCAL {
+        path = mt_path(subj[ID_NAME], 0);
+    } else if kind_of(st) == K_OPT {
+        let tmp = declare_local(pos, mt_name("$subject"), st);
+        vec_push(out[BLK_STMTS], let_stmt(pos, tmp, subj));
+        path = mt_path(tmp[S_NAME], 0);
+    } else {
+        let tmp = temp(pos, subj, st);
+        vec_push(out[BLK_STMTS], tmp);
+        path = mt_path(0, tmp[LET_SYM]);
+    }
+    let covered = 0;
+    if mt_is_enum(st) {
+        covered = vec_filled(st[TY_ENUM][VEC_LEN], 0);
+    }
+    let seen_true = 0;
+    let seen_false = 0;
+    let catchall = 0;
+    let goflag = 0;
+    let bodies = vec_new();
+    let chain = empty_block(pos);
+    let dest = chain[BLK_STMTS];
+    let last_if = 0;
+    let i = 0;
+    while i < arms[VEC_LEN] {
+        let arm = vec_get(arms, i);
+        let apos = vec_get(arm, ARM_POS);
+        let pats = vec_get(arm, ARM_PATTERNS);
+        let guard = vec_get(arm, ARM_GUARD);
+        if catchall {
+            err_at(apos, "this arm is never reached: an earlier arm matches every value");
+            break;
+        }
+        let binds = vec_new();
+        let test = 0;
+        let always = 0;
+        let j = 0;
+        while j < pats[VEC_LEN] {
+            let p = vec_get(pats, j);
+            let errs = error_count;
+            let c = mt_pattern(p, path, st, binds, 1);
+            if !c && error_count > errs {
+                // A pattern in error matches nothing, so the arms after it are not reported.
+                c = mk_int(apos, 0, ty_bool);
+            }
+            if mt_variant >= 0 {
+                if vec_get(covered, mt_variant) {
+                    err_quoted(vec_get(p, PAT_POS), "variant ", vec_get(vec_get(st[TY_ENUM], mt_variant), 0), " is already handled by an earlier arm");
+                }
+                if !guard {
+                    covered[VEC_DATA][mt_variant] = 1;
+                }
+            }
+            if !guard && mt_bool == 1 {
+                seen_true = 1;
+            }
+            if !guard && mt_bool == 2 {
+                seen_false = 1;
+            }
+            if !c {
+                always = 1;
+            } else if test {
+                test = binary_new(apos, "||", test, c);
+            } else {
+                test = c;
+            }
+            j = j + 1;
+        }
+        if always {
+            test = 0;
+        }
+        if pats[VEC_LEN] > 1 && binds[VEC_LEN] > 0 {
+            err_at(apos, "an arm with several patterns cannot bind names: give each its own arm");
+        }
+        let body = mt_arm_body(arm, mode, rec);
+        vec_push(bodies, body);
+        // The bindings come first in the arm's block.
+        if binds[VEC_LEN] > 0 && !guard {
+            let k2 = 0;
+            while k2 < body[BLK_STMTS][VEC_LEN] {
+                vec_push(binds, vec_get(body[BLK_STMTS], k2));
+                k2 = k2 + 1;
+            }
+            body[BLK_STMTS] = binds;
+        }
+        let stmt = 0;
+        if guard && binds[VEC_LEN] > 0 {
+            // if test { binds; if guard { $go = false; body } }  if $go { the other arms }
+            if !goflag {
+                goflag = declare_local(pos, mt_name("$go"), ty_bool);
+                vec_push(out[BLK_STMTS], let_stmt(pos, goflag, mk_int(pos, 1, ty_bool)));
+            }
+            let clear = assign_stmt(apos, sym_ref_node(apos, goflag), mk_int(apos, 0, ty_bool));
+            let taken = vec_new();
+            vec_push(taken, clear);
+            let k3 = 0;
+            while k3 < body[BLK_STMTS][VEC_LEN] {
+                vec_push(taken, vec_get(body[BLK_STMTS], k3));
+                k3 = k3 + 1;
+            }
+            body[BLK_STMTS] = taken;
+            let gif = node_new(ST_IF, apos);
+            gif[IF_COND] = guard;
+            gif[IF_THEN] = body;
+            let inner = empty_block(apos);
+            vec_push(binds, gif);
+            inner[BLK_STMTS] = binds;
+            stmt = inner;
+            if test {
+                stmt = node_new(ST_IF, apos);
+                stmt[IF_COND] = test;
+                stmt[IF_THEN] = inner;
+            }
+            let rest = node_new(ST_IF, apos);
+            rest[IF_COND] = sym_ref_node(apos, goflag);
+            rest[IF_THEN] = empty_block(apos);
+            let wrap = empty_block(apos);
+            vec_push(wrap[BLK_STMTS], stmt);
+            vec_push(wrap[BLK_STMTS], rest);
+            if last_if {
+                last_if[IF_ELSE] = wrap;
+            } else {
+                vec_push(dest, wrap);
+            }
+            dest = rest[IF_THEN][BLK_STMTS];
+            last_if = 0;
+        } else {
+            let cond = test;
+            if guard && cond {
+                cond = binary_new(apos, "&&", cond, guard);
+            } else if guard {
+                cond = guard;
+            }
+            stmt = body;
+            if cond {
+                stmt = node_new(ST_IF, apos);
+                stmt[IF_COND] = cond;
+                stmt[IF_THEN] = body;
+            } else {
+                catchall = 1;
+            }
+            if last_if {
+                last_if[IF_ELSE] = stmt;
+            } else {
+                vec_push(dest, stmt);
+            }
+            last_if = 0;
+            if cond {
+                last_if = stmt;
+            }
+        }
+        i = i + 1;
+    }
+    let exhaustive = catchall || (covered && all_seen(covered)) || (seen_true && seen_false);
+    if covered && !catchall && !all_seen(covered) {
+        let missing = buf_new();
+        let n = 0;
+        let v = 0;
+        while v < covered[VEC_LEN] {
+            if !vec_get(covered, v) {
+                if n > 0 {
+                    buf_str(missing, ", ");
+                }
+                buf_str(missing, vec_get(vec_get(st[TY_ENUM], v), 0));
+                n = n + 1;
+            }
+            v = v + 1;
+        }
+        buf_byte(missing, 0);
+        let u = err_begin(pos);
+        buf_str(u, "match on ");
+        type_name(u, st);
+        buf_str(u, " does not handle ");
+        buf_str(u, missing[VEC_DATA]);
+        buf_str(u, " (add the arms, or _)");
+        err_end(u);
+    } else if !exhaustive && (mode == MATCH_VALUE || mode == MATCH_RETURN || mode == MATCH_EXPR) {
+        err_at(pos, "a match that gives a value must handle every value: add a _ arm");
+    }
+    vec_push(out[BLK_STMTS], chain);
+    check_stmt(chain);
+    pop_scope();
+    if mode == MATCH_TAIL && !exhaustive {
+        let vt = vec_get(rec, MR_SYM)[S_TYPE];
+        if vt && kind_of(vt) != K_VOID {
+            err_at(pos, "a match that gives a value must handle every value: add a _ arm");
+        }
+    }
+    // Every value handled and every arm leaves: nothing runs after the match. (A return
+    // match that misses a value is an error already.)
+    let leaves = exhaustive || mode == MATCH_RETURN;
+    let b = 0;
+    while b < bodies[VEC_LEN] {
+        if !ends_in_jump(vec_get(bodies, b)[BLK_STMTS]) {
+            leaves = 0;
+        }
+        b = b + 1;
+    }
+    if leaves && !ends_in_return(out[BLK_STMTS]) {
+        vec_push(out[BLK_STMTS], expr_stmt(rt_call(pos, "rt_panic", args1(lit_string(pos, "unreachable match")), ty_void)));
+    }
+    return out;
+}
+
 // lower_go starts a thread running a call: the arguments are evaluated now and handed
 // to a lifted thunk that unpacks them on the new thread.
 fn lower_go(s) {
@@ -4813,6 +5885,10 @@ fn expr_may_change_slice(e, name) {
 fn names_assigned(s, a, b) {
     if !s {
         return 0;
+    }
+    let mx = mt_stmt_expr(s);
+    if mx && mx[N_KIND] == EX_MATCH && mt_names_assigned(mx, a, b) {
+        return 1;
     }
     let k = s[N_KIND];
     if k == ST_ASSIGN {
