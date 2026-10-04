@@ -469,6 +469,24 @@ def panics(exe, failures):
             failures.append('panics: %r, waiting request %r' % (got, slow.get('r')))
         if server.poll() is not None:
             failures.append('the server exited after a handler panicked')
+        # #230: each panic ran the deferred calls of the frames it left, innermost first.
+        r = request(port, 'GET', '/unwinds')
+        body = r[-1]
+        print('deferred calls run by the panics:', body)
+        if body != b'inner;handler;' * 3:
+            failures.append('defers during panics: %r' % body)
+        # A panic inside a deferred call while unwinding ends the process.
+        try:
+            request(port, 'GET', '/double')
+        except Exception:
+            pass
+        try:
+            code = server.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            code = None
+        print('panic while unwinding: exit', code)
+        if code != 2:
+            failures.append('a panic during unwinding did not end the process: %r' % code)
     finally:
         server.terminate()
         try:
@@ -479,6 +497,8 @@ def panics(exe, failures):
         err = server.stderr.read().decode(errors='replace')
         if err.count('panic: index out of range [5] with length 3') != 3:
             failures.append('panic messages on stderr: %r' % err[:2000])
+        if 'panic: first' not in err or 'panic: second' not in err:
+            failures.append('a panic during unwinding must print both messages: %r' % err[-2000:])
 
 
 def main():

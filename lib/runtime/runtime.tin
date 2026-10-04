@@ -385,8 +385,17 @@ func rt_panic(msg str) {
 	rt_write_all(2, cast(i64, msg)+8, len(msg))
 	rt_write_all(2, cast(i64, "\n")+8, 1)
 	rt_backtrace(__fp())
+	if g := rt_guard_target(); g != 0 {
+		if t != 0 && t[tRecoverable] != 0 {
+			t[tRecover] = 1
+		}
+		rt_guard_land(g, msg)
+	}
 	if t != 0 && t[tPanicked] == 0 && t[tRecoverable] != 0 {
 		t[tPanicked] = 1
+		// Unwind (#230): deferred calls innermost first, then cleanups (rt_task_abort). A
+		// panic while they run ends the process, after both messages.
+		rt_defer_run(0)
 		rt_task_abort(t)
 	}
 	rt_sys_exit(2)
@@ -2466,7 +2475,8 @@ const tTrim = 49     // observed heavy pool or suspended stack: discard cached p
 const tTimers = 50   // timer heap entries that still name this record
 const tRetired = 51  // 1: released over the cache cap; freed when its last timer entry pops
 const tBnd = 52      // the task's current boundary (notes/interface_boundaries.md), 0 before rt_bnd_task
-const taskWords = 53
+const tDefer = 53    // the task's defer chain (#230): records [next, defer$N, values...]
+const taskWords = 54
 
 const waitReady = 0
 const waitDeadline = 1
@@ -2529,6 +2539,7 @@ var bndFree i64     // per core: free boundary records
 var bndCur i64      // per core: the current boundary of code on the core's own stack (0: the root)
 var bndRoot i64     // per core: the core's root boundary
 var bndBack i64     // per core: the core's background boundary
+var coreDefer i64   // per core: the defer chain of code on the core's own stack
 
 // rt_task_swap stores the running registers into from and continues with those in to.
 func rt_task_swap(from i64, to i64) {
@@ -2562,6 +2573,7 @@ func rt_task_new(body func(i64), arg i64) i64 {
 	t[tRecoverable] = 0
 	t[tTrim] = 0
 	t[tBnd] = 0
+	t[tDefer] = 0
 	for i := 0; i < 20; i++ {
 		t[tSave+i] = 0
 	}
@@ -2692,6 +2704,158 @@ func rt_task_cleanup(f func(i64), arg i64) {
 	r[1] = cast(i64, f)
 	r[2] = arg
 	curTask[tCleanup] = r
+}
+
+// rt_defer_rec makes a defer record with n value words after its two header words.
+func rt_defer_rec(n i64) i64 {
+	return calloc(n+2, 8)
+}
+
+// rt_defer_push puts record r, made for the call call(r), on the running code's defer chain.
+func rt_defer_push(r i64, call func(i64)) {
+	r[1] = cast(i64, call)
+	if curTask != 0 {
+		r[0] = curTask[tDefer]
+		curTask[tDefer] = r
+		return
+	}
+	r[0] = coreDefer
+	coreDefer = r
+}
+
+// rt_defer_mark is the defer chain's head: a function's returns run the chain back to it.
+func rt_defer_mark() i64 {
+	if curTask != 0 {
+		return curTask[tDefer]
+	}
+	return coreDefer
+}
+
+// rt_defer_run makes the deferred calls registered since mark, last first.
+func rt_defer_run(mark i64) {
+	for {
+		r := coreDefer
+		if curTask != 0 {
+			r = curTask[tDefer]
+		}
+		if r == mark || r == 0 {
+			return
+		}
+		if curTask != 0 {
+			curTask[tDefer] = r[0]
+		} else {
+			coreDefer = r[0]
+		}
+		f := cast(func(i64), r[1])
+		f(r)
+		free(r)
+	}
+}
+
+// ---- guard: a panic inside the block becomes its fault (#230) ----
+//
+// rt_guard_call runs a guard block's closure on a stack of its own. A panic inside runs the
+// deferred calls and cleanups registered since the guard began, leaves the boundaries the
+// block entered, and switches back to the guard's caller with "panic: <message>"; the
+// abandoned stack is reused. A panic while that unwinding runs ends the process.
+
+const gSave = 0     // 20 words: the guard caller's registers
+const gCtx = 20     // 20 words: the guard stack's registers
+const gScratch = 40 // 20 words: the registers of a stack being left for good
+const gBody = 60
+const gArg = 61
+const gFault = 62
+const gDefer = 63
+const gCleanup = 64
+const gFmt = 65
+const gStack = 66
+const gBnd = 67
+const gUnwinding = 68
+const guardWords = 69
+
+var guardStart i64  // per core: the record rt_guard_entry starts
+var guardStacks i64 // per core: free guard stacks, linked through their lowest word
+
+func rt_guard_call(body func(i64) !, r i64) i64 {
+	g := calloc(guardWords, 8)
+	b := rt_bnd_enter(bkGuard | bfGuard)
+	b[bLand] = g
+	g[gBody] = cast(i64, body)
+	g[gArg] = r
+	g[gDefer] = rt_defer_mark()
+	if curTask != 0 {
+		g[gCleanup] = curTask[tCleanup]
+	}
+	g[gFmt] = __ctx()[ctxFmt]
+	g[gBnd] = b
+	st := guardStacks
+	if st != 0 {
+		guardStacks = (st + taskGuard)[0]
+	} else {
+		st = mem_map(taskStack+taskGuard, MAP_STACK)
+		if i64(i32(rt_sys_mprotect(st, taskGuard, 0))) != 0 {
+			mem_oom(taskStack + taskGuard)
+		}
+	}
+	g[gStack] = st
+	rt_ctx_init(g+8*gCtx, (st+taskStack+taskGuard)&-16, cast(i64, rt_guard_entry))
+	guardStart = g
+	rt_task_swap(g+8*gSave, g+8*gCtx)
+	f := g[gFault]
+	(st + taskGuard)[0] = guardStacks
+	guardStacks = st
+	rt_bnd_leave(b)
+	free(g)
+	return f
+}
+
+// rt_guard_entry runs a guard's closure on the guard stack, then switches back.
+func rt_guard_entry() {
+	g := guardStart
+	body := cast(func(i64) !, g[gBody])
+	body(g[gArg]) catch err {
+		g[gFault] = cast(i64, err)
+	}
+	rt_task_swap(g+8*gScratch, g+8*gSave)
+}
+
+// rt_guard_target is the guard record a panic here stops at, or 0 when the nearest guarding
+// boundary is a request, a task root or the core (the existing per-task recovery applies).
+func rt_guard_target() i64 {
+	if bndRoot == 0 && (curTask == 0 || curTask[tBnd] == 0) {
+		return 0
+	}
+	b := rt_bnd_current()
+	for b != 0 {
+		if b[bKind]&bfGuard != 0 {
+			if b[bKind]&255 == bkGuard {
+				return b[bLand]
+			}
+			return 0
+		}
+		b = b[bParent]
+	}
+	return 0
+}
+
+// rt_guard_land unwinds to guard g after a panic with msg and resumes its caller.
+func rt_guard_land(g i64, msg str) {
+	if g[gUnwinding] != 0 {
+		rt_flush()
+		rt_sys_exit(2)
+	}
+	g[gUnwinding] = 1
+	rt_defer_run(g[gDefer])
+	if curTask != 0 {
+		rt_task_cleanups(g[gCleanup])
+	}
+	b := g[gBnd]
+	for rt_bnd_current() != b {
+		rt_bnd_leave(rt_bnd_current())
+	}
+	g[gFault] = cast(i64, "panic: "+msg)
+	__ctx()[ctxFmt] = g[gFmt]
+	rt_task_swap(g+8*gScratch, g+8*gSave)
 }
 
 func rt_task_cleanups(stop i64) {
@@ -3075,14 +3239,31 @@ func rt_wait_msg() str {
 func rt_task_wait(fd i64, want i64, timeout i64) i64 {
 	t := curTask
 	if t == 0 || (fd >= 0 && cast(i64, waitHook) == 0) {
-		if rt_bnd_current()[bCancel] != 0 {
+		rt_bnd_check()
+		cb := rt_bnd_current()
+		if cb[bCancel] != 0 {
 			return waitDeadline
 		}
+		// A boundary deadline (within) shortens the wait; reaching it cancels its owner.
+		cut := false
+		if cb[bDeadline] > 0 {
+			left := cb[bDeadline] - rt_mono_ns()
+			if timeout <= 0 || left < timeout {
+				timeout = left
+				cut = true
+			}
+		}
+		r := waitTimeout
 		if fd < 0 {
 			rt_sleep_ns(timeout)
-			return waitTimeout
+		} else {
+			r = rt_poll_wait(fd, want, timeout)
 		}
-		return rt_poll_wait(fd, want, timeout)
+		if cut && r == waitTimeout {
+			rt_bnd_check()
+			return waitDeadline
+		}
+		return r
 	}
 	b := t[tBnd]
 	if b != 0 && b[bCancel] != 0 {

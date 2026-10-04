@@ -91,6 +91,9 @@ fn chk_kind(e, want) {
     if k == EX_FUNCLIT {
         return chk_funclit(e);
     }
+    if k == EX_BOUNDARY {
+        return chk_boundary(e);
+    }
     if k == EX_TYPE {
         err_at(e[N_POS], "type used as a value");
         return ty_int;
@@ -1761,6 +1764,184 @@ fn chk_funclit(e) {
     let seq = mk_seq(pos, stmts, desc_val, f[F_TYPE]);
     replace_node(e, seq);
     return f[F_TYPE];
+}
+
+// ---- boundary blocks: guard (#230) and within (#233) ----
+//
+// The block becomes a closure func($r i64) ! whose last expression is stored through $r, so
+// fail and try leave the block with a fault. A generated boundary$N(c, a) !T runs it inside
+// the boundary (a guard stack, or a boundary record with a deadline) and returns the value.
+
+fn chk_boundary(e) {
+    let pos = e[N_POS];
+    let kind = e[BOUND_KIND];
+    if ck_legacy || (kind != BOUND_WITHIN && kind != BOUND_GUARD) {
+        err_at(pos, "this boundary block is not supported yet");
+        return ty_int;
+    }
+    let arg = mk_int(pos, 0, ty_int);
+    if kind == BOUND_WITHIN {
+        arg = vec_get(e[BOUND_ARGS], 0);
+        let at = chk(arg, ty_int);
+        check_assignable(arg, at, ty_int);
+        if is_untyped(at) {
+            reconvert(arg, ty_int);
+        }
+    }
+    let body = e[BOUND_BODY];
+    bound_leaves(body[BLK_STMTS]);
+    let f = fn_new(pos, "func");
+    vec_push(f[F_PARAMS], "$r");
+    let it = node_new(TX_NAME, pos);
+    it[TX_B] = "i64";
+    vec_push(f[F_PTYPES], it);
+    let ft = node_new(TX_NAME, pos);
+    ft[TX_B] = "fault";
+    vec_push(f[F_RTYPES], ft);
+    f[F_BANG] = 1;
+    let stmts = body[BLK_STMTS];
+    let n = stmts[VEC_LEN];
+    if n > 0 && vec_get(stmts, n - 1)[N_KIND] == ST_EXPR {
+        let last = vec_get(stmts, n - 1);
+        let bs = node_new(ST_BSTORE, last[N_POS]);
+        bs[ES_X] = last[ES_X];
+        stmts[VEC_DATA][n - 1] = bs;
+    }
+    f[F_BODY] = body;
+    let lit = node_new(EX_FUNCLIT, pos);
+    lit[LIT_FN] = f;
+    lit[LIT_ESCAPE] = 0;
+    let saved_t = bound_t;
+    bound_t = ty_void;
+    let ct = chk_funclit(lit);
+    let vt = bound_t;
+    bound_t = saved_t;
+    let w = boundary_wrapper(pos, kind, ct, vt);
+    let c = node_new(EX_CALL, pos);
+    c[CALL_NAME] = w[F_NAME];
+    c[CALL_FN] = w;
+    c[CALL_ARGS] = args2(lit, arg);
+    let results = vec_new();
+    if kind_of(vt) != K_VOID {
+        vec_push(results, vt);
+    }
+    vec_push(results, ty_error);
+    let rt = ty_error;
+    if results[VEC_LEN] > 1 {
+        rt = tuple_of(results);
+    }
+    c[N_TYPE] = rt;
+    replace_node(e, c);
+    return rt;
+}
+
+// bound_leaves rejects a return that would leave a boundary block from inside it.
+fn bound_leaves(v) {
+    let i = 0;
+    while i < v[VEC_LEN] {
+        let s = vec_get(v, i);
+        let k = s[N_KIND];
+        if k == ST_RETURN {
+            err_at(s[N_POS], "return cannot leave a boundary block: its value is its last expression (use fail to leave it with a fault)");
+        } else if k == ST_BLOCK {
+            bound_leaves(s[BLK_STMTS]);
+        } else if k == ST_IF {
+            bound_leaves(s[IF_THEN][BLK_STMTS]);
+            if s[IF_ELSE] {
+                bound_leaves(vec_new_with(s[IF_ELSE]));
+            }
+        } else if k == ST_WHILE {
+            bound_leaves(s[WH_BODY][BLK_STMTS]);
+        } else if k == ST_RANGE {
+            bound_leaves(s[RG_BODY][BLK_STMTS]);
+        }
+        i = i + 1;
+    }
+}
+
+fn vec_new_with(x) {
+    let v = vec_new();
+    vec_push(v, x);
+    return v;
+}
+
+// boundary_wrapper builds boundary$N(c, a): it runs closure c (type ct) with a 16-byte result
+// cell inside the boundary and returns the value of type vt (ty_void: none) or the fault.
+fn boundary_wrapper(pos, kind, ct, vt) {
+    lifted_count = lifted_count + 1;
+    let f = fn_new(pos, "boundary");
+    let nb = buf_new();
+    buf_str(nb, "boundary$");
+    buf_int(nb, lifted_count);
+    buf_byte(nb, 0);
+    f[F_QNAME] = nb[VEC_DATA];
+    f[F_NAME] = nb[VEC_DATA];
+    f[F_LIFTED] = 2;
+    f[F_FILE] = ck_file;
+    f[F_BANG] = 1;
+    vec_push(f[F_PARAMS], "c");
+    vec_push(f[F_PTYPES], ct);
+    vec_push(f[F_PARAMS], "a");
+    vec_push(f[F_PTYPES], ty_int);
+    if kind_of(vt) != K_VOID {
+        vec_push(f[F_RTYPES], vt);
+    }
+    vec_push(f[F_RTYPES], ty_error);
+    f[F_TYPE] = func_of(f[F_PTYPES], f[F_RTYPES], 0);
+    f[F_LOCALS] = vec_new();
+    f[F_BODY] = empty_block(pos);
+    vec_push(prog_fns, f);
+    let saved_fn = ck_fn;
+    ck_fn = f;
+    let cs = sym_new(SYM_LOCAL, "c", pos);
+    cs[S_TYPE] = ct;
+    cs[S_SLOT] = 0;
+    let asym = sym_new(SYM_LOCAL, "a", pos);
+    asym[S_TYPE] = ty_int;
+    asym[S_SLOT] = 1;
+    f[F_SLOTS] = 2;
+    vec_push(f[F_LOCALS], cs);
+    vec_push(f[F_LOCALS], asym);
+    let body = f[F_BODY][BLK_STMTS];
+    let r = temp(pos, rt_call(pos, "rt_alloc", args1(mk_int(pos, 16, ty_int)), ty_int), ty_int);
+    vec_push(body, r);
+    let rref = sym_ref_node(pos, r[LET_SYM]);
+    let fe = 0;
+    if kind == BOUND_GUARD {
+        fe = temp(pos, rt_call(pos, "rt_guard_call", args2(sym_ref_node(pos, cs), rref), ty_error), ty_error);
+        vec_push(body, fe);
+    } else {
+        // within: a boundary whose deadline is the earlier of now + a and the enclosing one.
+        let b = temp(pos, rt_call(pos, "rt_bnd_enter", args1(mk_int(pos, 6, ty_int)), ty_int), ty_int);
+        vec_push(body, b);
+        let at = mk_bin(pos, "+", rt_call(pos, "rt_mono_ns", vec_new(), ty_int), sym_ref_node(pos, asym), ty_int);
+        vec_push(body, expr_stmt(rt_call(pos, "rt_bnd_set_deadline", args2(sym_ref_node(pos, b[LET_SYM]), at), ty_void)));
+        let call = node_new(EX_CALL, pos);
+        call[CALL_CALLEE] = sym_ref_node(pos, cs);
+        call[CALL_ARGS] = args1(sym_ref_node(pos, r[LET_SYM]));
+        call[N_TYPE] = ty_error;
+        fe = temp(pos, call, ty_error);
+        vec_push(body, fe);
+        vec_push(body, expr_stmt(rt_call(pos, "rt_bnd_leave", args1(sym_ref_node(pos, b[LET_SYM])), ty_void)));
+    }
+    fe[LET_SYM][S_READS] = 1;
+    let ifs = node_new(ST_IF, pos);
+    ifs[IF_COND] = mk_bin(pos, "!=", sym_ref_node(pos, fe[LET_SYM]), mk_int(pos, 0, ty_error), ty_bool);
+    ifs[IF_THEN] = empty_block(pos);
+    vec_push(ifs[IF_THEN][BLK_STMTS], fault_return(pos, ifs[IF_THEN][BLK_STMTS], sym_ref_node(pos, fe[LET_SYM])));
+    vec_push(body, ifs);
+    let ret = node_new(ST_RETURN, pos);
+    if kind_of(vt) == K_VOID {
+        ret[RET_VALUE] = mk_int(pos, 0, ty_error);
+    } else {
+        let rv = vec_new();
+        vec_push(rv, mk_mem(pos, sym_ref_node(pos, r[LET_SYM]), 0, 0, 0, vt));
+        vec_push(rv, mk_int(pos, 0, ty_error));
+        ret[RET_VALUES] = rv;
+    }
+    vec_push(body, ret);
+    ck_fn = saved_fn;
+    return f;
 }
 
 // ---- calls ----

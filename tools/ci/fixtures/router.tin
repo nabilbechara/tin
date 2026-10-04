@@ -91,8 +91,9 @@ func recurse(q anvil.Req, w mut anvil.Out) {
 }
 
 // boom panics, at once or after waiting ms (from the query): the request gets 500 and the
-// server keeps serving (#142).
+// server keeps serving (#142); its defers and pick's run while the panic unwinds (#230).
 func boom(q anvil.Req, w mut anvil.Out) {
+	defer note_unwind("handler;")
 	pause(q) catch err {
 		w.Status(504)
 		w.Text("{err}")
@@ -100,7 +101,33 @@ func boom(q anvil.Req, w mut anvil.Out) {
 	}
 	xs := []i64{1, 2, 3}
 	k := len(q.Param("k")) + 5
-	w.Text("never {xs[k]}")
+	w.Text("never {pick(xs, k)}")
+}
+
+var unwound str
+
+func note_unwind(s str) {
+	unwound = keep(unwound + s)
+}
+
+func pick(xs []i64, k i64) i64 {
+	defer note_unwind("inner;")
+	return xs[k]
+}
+
+// unwinds reports the deferred calls that ran during panics, in order.
+func unwinds(q anvil.Req, w mut anvil.Out) {
+	w.Text(unwound)
+}
+
+// double panics again in a deferred call while unwinding: the process ends (#230).
+func double(q anvil.Req, w mut anvil.Out) {
+	defer panic_again()
+	panic("first")
+}
+
+func panic_again() {
+	panic("second")
 }
 
 func fast(q anvil.Req, w mut anvil.Out) {
@@ -145,6 +172,8 @@ func main() {
 	r.Get(`/files/{path...}`, file)
 	r.Get("/fast", fast)
 	r.Get("/boom", boom)
+	r.Get("/unwinds", unwinds)
+	r.Get("/double", double)
 	r.Get("/recurse", recurse)
 	r.Get("/echo-head", echo_head)
 	r.Get(`/status/{code}`, status)
