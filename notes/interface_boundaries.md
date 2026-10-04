@@ -68,7 +68,8 @@ the per-core context words of section 6.
 | 17 | `bLand` | landing data for an unwind to this boundary, owned by #230 | #230 |
 | 18–20 | `bRegion` | region mark at entry, owned by #176 | #176 |
 | 21 | `bFault` | the fault an unwind landed with; read once by the landing code | #230 |
-| 22–23 | — | reserved (0) | — |
+| 22 | `bOwnDl` | this boundary's own deadline (mono ns); 0 = none | set_deadline |
+| 23 | — | reserved (0) | — |
 
 `bndWords = 24` (192 bytes). Records come from a per-core free list (`bndFree`) of ingot
 blocks and go back to it at leave, like task records; a boundary costs no pool memory, so its
@@ -105,7 +106,10 @@ boundary, `tBnd[bDeadline]`. Enter, leave and `rt_bnd_set_deadline` keep it equa
 
 ## 2. Functions
 
-All are per core and must be called on the owning core. `b` is a record address.
+All are per core and must be called on the owning core. `b` is a record address. A Tin
+function cannot return `fault`, so the runtime passes faults out as words (a fault is a
+pointer today; #229 keeps it one word) and callers `fail cast(fault, w)`. Until #229 lands,
+`rt_wait_fault` recognises the deadline and budget reasons by their messages.
 
 ### 2.1 Entering and leaving
 
@@ -126,7 +130,7 @@ record above the target instead.
 
 | function | does |
 |---|---|
-| `rt_bnd_set_deadline(b i64, at i64)` | sets `b`'s own deadline (mono ns, 0 = none); `bDeadline` becomes min(own, parent's) and `bDlOwner` follows. Called right after enter, before anything runs inside `b`. |
+| `rt_bnd_set_deadline(b i64, at i64)` | sets `b`'s own deadline (`bOwnDl`, mono ns, 0 = none); `b` and every boundary inside it recompute `bDeadline` = min(own, parent's) and `bDlOwner`, and a task whose current boundary changed gets the new `tDeadline`. Usually called right after enter; anvil's Hijack calls it on a running request (`at = 0`). |
 | `rt_bnd_deadline(b i64) i64` | the effective deadline (`task.Deadline()` reads it from the current boundary) |
 | `rt_task_set_deadline(t, at)` | **kept**: sets the deadline of `t`'s root (anvil's request deadline; `at = 0` on Hijack) |
 
@@ -139,8 +143,9 @@ A deadline is a cancellation scheduled in advance: when it passes, the runtime c
 | function | does |
 |---|---|
 | `rt_bnd_cancel(b i64, reason fault)` | if `b` is not cancelled: sets `bCancel = reason`, `bOrigin = b` on `b`, and on every descendant not already cancelled sets the same reason with `bOrigin = b`; ends the wait of every task waiting inside `b`'s subtree (`rt_task_interrupt`); sets `ctxWatch = -1` if the running task is inside it (section 6). The first reason wins; cancelling again does nothing. |
-| `rt_bnd_canceled(b i64) fault` | the reason, or nil. `task.Canceled()` is this on the current boundary, after `rt_bnd_check`. |
-| `rt_bnd_check()` | cancels the deadline owner if the current effective deadline has passed (one clock read); used by `task.Canceled()` and at wait entry. |
+| `rt_bnd_canceled(b i64) i64` | the reason as a fault word, or 0. `task.Canceled()` is this on the current boundary, after `rt_bnd_check`. |
+| `rt_bnd_check()` | cancels the deadline owner if the current effective deadline has passed (one clock read); used by `task.Canceled()` and after a wait ends by its deadline. |
+| `rt_bnd_stopped() bool` | `rt_bnd_check()`, then whether the current boundary is cancelled: for code that reads `tDeadline` itself (DNS, PBKDF2, `postgres` budgets, `rt_helper_run`). |
 | `rt_task_interrupt(t i64)` | ends any wait of `t` (fd, timer or park) as `waitDeadline` and queues `t` to run; does nothing if `t` is not waiting. Internal to cancel. |
 
 **Direction.** `rt_bnd_cancel` writes only `b` and its descendants. Nothing in the runtime
@@ -165,13 +170,13 @@ it. The fault to raise is new:
 
 | function | gives |
 |---|---|
-| `rt_wait_fault() fault` | the fault for a wait that returned `waitDeadline`, from the current boundary's reason: `fault.DeadlineExceeded` and `fault.LimitExceeded` directly; any other reason (an explicit cancel, a sibling's fault, `fault.Draining`) as `fault.Canceled` wrapping it (design_semantics §4). |
+| `rt_wait_fault() i64` | the fault (as a word: `fail cast(fault, rt_wait_fault())`) for a wait that returned `waitDeadline`, from the current boundary's reason: `fault.DeadlineExceeded` and `fault.LimitExceeded` directly; any other reason (an explicit cancel, a sibling's fault, `fault.Draining`) as `fault.Canceled` wrapping it (design_semantics §4). |
+| `rt_wait_msg() str` | its message, for clients that build their fault later (`mysql`, `postgres`, `websocket`). |
 
 The client change is one line per site, mechanical: `fail "deadline exceeded"` after a
-`waitDeadline` becomes `fail rt_wait_fault()`. The sites are `wire/wire.tin`,
+`waitDeadline` becomes `fail cast(fault, rt_wait_fault())`. The sites are `wire/wire.tin`,
 `wire/dns_linux.tin`, `redis`, `mysql`, `postgres`, `websocket`, `seal` (PBKDF2), `tide.Wait`
-and `rt_helper_run`; the code that reads `tDeadline` directly calls `rt_bnd_check()` and tests
-`rt_bnd_canceled(rt_bnd_current())` as well. Helper-thread jobs already survive an abandoned
+and `rt_helper_run`; the code that reads `tDeadline` directly also tests `rt_bnd_stopped()`. Helper-thread jobs already survive an abandoned
 wait (`jGone`), so a cancelled task never resumes into a finished job.
 
 On the core stack (no task), a wait cannot be woken by another task: it observes the deadline
