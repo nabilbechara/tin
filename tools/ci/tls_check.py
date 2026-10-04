@@ -1,0 +1,456 @@
+#!/usr/bin/env python3
+"""The TLS 1.3 client (lib/tls, #124): the RFC 8448 trace, interop with openssl s_server and
+Python's ssl module, KeyUpdate, timeouts, truncation, https:// in wire and wss:// in websocket.
+
+Certificates are generated here with the runner's openssl, so no key is checked in. Until
+X.509 verification lands (#124 phase 2) the interop runs use InsecureSkipVerify, and the
+default configuration must refuse every server."""
+import argparse
+import base64
+import hashlib
+import http.server
+import os
+import re
+import shutil
+import socket
+import ssl
+import struct
+import subprocess
+import tempfile
+import threading
+import time
+from pathlib import Path
+from suite import ROOT
+
+SUITES = ['TLS_AES_128_GCM_SHA256', 'TLS_AES_256_GCM_SHA384', 'TLS_CHACHA20_POLY1305_SHA256']
+GROUPS = {'X25519': 'X25519', 'P-256': 'P-256'}
+
+RFC8448 = '''handshake ok true X25519
+client hello sent as given true
+client Finished true
+server data after a ticket pong
+client data true
+server data after KeyUpdate after update
+client KeyUpdate true
+client data after KeyUpdate true
+close_notify true
+tampered record tls: record authentication failed
+bad_record_mac alert under the client handshake key true
+'''
+
+
+def openssl3():
+    """An OpenSSL 3 command line (s_server -tls1_3 with -ciphersuites and -groups), or None."""
+    for cand in (shutil.which('openssl'), '/opt/homebrew/opt/openssl@3/bin/openssl', '/usr/local/opt/openssl@3/bin/openssl'):
+        if cand and os.path.exists(cand):
+            out = subprocess.run([cand, 'version'], capture_output=True, text=True).stdout
+            if out.startswith('OpenSSL 3'):
+                return cand
+    return None
+
+
+def make_certs(openssl, work):
+    """Self-signed certificates for localhost and 127.0.0.1; returns {kind: (cert, key)}."""
+    kinds = {'rsa': ['-newkey', 'rsa:2048'], 'ecdsa': ['-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256'],
+             'ed25519': ['-newkey', 'ed25519']}
+    certs = {}
+    for kind, args in kinds.items():
+        cert, key = work / f'{kind}.pem', work / f'{kind}.key'
+        r = subprocess.run([openssl, 'req', '-x509', *args, '-keyout', str(key), '-out', str(cert), '-days', '30', '-nodes',
+                            '-subj', '/CN=localhost', '-addext', 'subjectAltName=DNS:localhost,IP:127.0.0.1'],
+                           capture_output=True)
+        if r.returncode == 0:
+            certs[kind] = (cert, key)
+    assert 'rsa' in certs and 'ecdsa' in certs, 'openssl could not make test certificates'
+    return certs
+
+
+def free_port():
+    s = socket.socket()
+    s.bind(('127.0.0.1', 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def wait_port(port, proc=None, limit=10):
+    end = time.time() + limit
+    while time.time() < end:
+        if proc is not None and proc.poll() is not None:
+            raise AssertionError(f'server exited: {proc.stdout.read() if proc.stdout else ""}')
+        try:
+            socket.create_connection(('127.0.0.1', port), timeout=0.2).close()
+            return
+        except OSError:
+            time.sleep(0.05)
+    raise AssertionError(f'port {port} never opened')
+
+
+def run(exe, *args, timeout=30):
+    r = subprocess.run([str(exe), *map(str, args)], capture_output=True, text=True, timeout=timeout)
+    assert r.returncode == 0, (args, r.returncode, r.stdout, r.stderr[-3000:])
+    return r.stdout
+
+
+def server_ctx(cert):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    ctx.load_cert_chain(str(cert[0]), str(cert[1]))
+    return ctx
+
+
+def serve_in_thread(target):
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    return t
+
+
+def rfc8448(compiler, work):
+    """Build the client with the probe in a private copy of lib/tls and run the trace."""
+    root = work / 'probe-root'
+    shutil.copytree(ROOT / 'lib', root / 'lib')
+    shutil.copy(ROOT / 'tools/ci/fixtures/tls_rfc8448_probe.tin', root / 'lib/tls/probe_rfc8448.tin')
+    exe = work / 'rfc8448'
+    subprocess.run([str(compiler), '-o', str(exe), 'tools/ci/fixtures/tls_rfc8448.tin'], check=True, cwd=ROOT,
+                   env=dict(os.environ, TIN_ROOT=str(root)), timeout=120)
+    out = run(exe)
+    assert out == RFC8448, out
+    print('PASS RFC 8448 trace: Finished both ways, application data, ticket, KeyUpdate, close_notify, bad_record_mac')
+
+
+def openssl_matrix(exe, openssl, certs):
+    """Every cipher suite and group against every certificate type, then ALPN and TLS 1.2."""
+    count = 0
+    for kind, cert in certs.items():
+        for suite in SUITES:
+            for group in GROUPS:
+                port = free_port()
+                proc = subprocess.Popen([openssl, 's_server', '-tls1_3', '-accept', str(port), '-cert', str(cert[0]), '-key', str(cert[1]),
+                                         '-www', '-quiet', '-ciphersuites', suite, '-groups', group],
+                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                try:
+                    wait_port(port, proc)
+                    out = run(exe, 'get', f'127.0.0.1:{port}')
+                finally:
+                    proc.kill()
+                    proc.wait()
+                want = f'ok {suite} {group} alpn= 1 true\n'
+                assert out == want, (kind, suite, group, out)
+                count += 1
+    print(f'PASS openssl s_server: {count} runs (certificates {", ".join(certs)}; every suite; X25519 and P-256 by HelloRetryRequest)')
+    port = free_port()
+    proc = subprocess.Popen([openssl, 's_server', '-tls1_3', '-accept', str(port), '-cert', str(certs['ecdsa'][0]), '-key', str(certs['ecdsa'][1]),
+                             '-www', '-quiet', '-alpn', 'http/1.1'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        wait_port(port, proc)
+        out = run(exe, 'get', f'127.0.0.1:{port}', 'http/1.1')
+        assert out.startswith('ok ') and ' alpn=http/1.1 ' in out, out
+        out = run(exe, 'get', f'127.0.0.1:{port}')
+        assert out.startswith('ok ') and ' alpn= ' in out, out
+    finally:
+        proc.kill()
+        proc.wait()
+    port = free_port()
+    proc = subprocess.Popen([openssl, 's_server', '-tls1_2', '-accept', str(port), '-cert', str(certs['ecdsa'][0]), '-key', str(certs['ecdsa'][1]),
+                             '-www', '-quiet'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        wait_port(port, proc)
+        out = run(exe, 'get', f'127.0.0.1:{port}')
+        assert out.startswith('fault tls: ') and 'protocol version' in out, out
+    finally:
+        proc.kill()
+        proc.wait()
+    print('PASS ALPN chosen and absent; a TLS 1.2-only server is refused')
+
+
+def keyupdate(exe, openssl, certs):
+    """An interactive s_server sends KeyUpdate with and without request_update; the client
+    reads on, answers and keeps writing on its next key."""
+    port = free_port()
+    proc = subprocess.Popen([openssl, 's_server', '-tls1_3', '-accept', str(port), '-cert', str(certs['ecdsa'][0]), '-key', str(certs['ecdsa'][1]),
+                             '-ign_eof'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    seen = []
+    lock = threading.Lock()
+
+    def reader():
+        for line in proc.stdout:
+            with lock:
+                seen.append(line.decode(errors='replace'))
+
+    serve_in_thread(reader)
+    try:
+        wait_port(port, proc)
+        client = subprocess.Popen([str(exe), 'keyupdate', f'127.0.0.1:{port}'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        def wait_for(text):
+            end = time.time() + 10
+            while time.time() < end:
+                with lock:
+                    if any(text in line for line in seen):
+                        return
+                time.sleep(0.05)
+            raise AssertionError(f'never saw {text!r}: {seen[-10:]}')
+
+        def say(line):
+            proc.stdin.write(line.encode())
+            proc.stdin.flush()
+            time.sleep(0.3)
+
+        wait_for('ping')
+        say('K\n')
+        say('one\n')
+        wait_for('after one')
+        say('k\n')
+        say('two\n')
+        wait_for('after two')
+        say('bye\n')
+        out, err = client.communicate(timeout=20)
+        assert client.returncode == 0, err
+        assert out == 'got one\ngot two\ngot bye\n', out
+        with lock:
+            text = ''.join(seen)
+        # s_server reports each KeyUpdate it sends (KEYUPDATE, or SSL_do_handshake -> 1 in 3.0).
+        after = text[text.index('ping'):]
+        assert after.count('KEYUPDATE') + after.count('SSL_do_handshake -> 1') >= 2, text[-2000:]
+    finally:
+        proc.kill()
+        proc.wait()
+    print('PASS KeyUpdate from the server, with and without request_update')
+
+
+def python_servers(exe, certs):
+    """Timeouts, truncation, a non-TLS server, https:// and wss:// against Python's ssl."""
+    # A server that accepts and never answers: the handshake times out after Config.Timeout.
+    quiet = socket.socket()
+    quiet.bind(('127.0.0.1', 0))
+    quiet.listen(4)
+    port = quiet.getsockname()[1]
+    out = run(exe, 'timeout', f'127.0.0.1:{port}', 300)
+    m = re.match(r'fault tls: read timed out (\d+)\n', out)
+    assert m and 250 <= int(m.group(1)) < 5000, out
+    quiet.close()
+    # A server that speaks HTTP instead of TLS.
+    plain = socket.socket()
+    plain.bind(('127.0.0.1', 0))
+    plain.listen(4)
+
+    def http_instead():
+        c, _ = plain.accept()
+        c.recv(4096)
+        c.sendall(b'HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n')
+        time.sleep(0.5)
+        c.close()
+
+    serve_in_thread(http_instead)
+    out = run(exe, 'get', f'127.0.0.1:{plain.getsockname()[1]}')
+    assert out.startswith('fault tls: unexpected record type 72'), out
+    plain.close()
+    # A server that closes TCP without close_notify: the read fails instead of a clean EOF.
+    ctx = server_ctx(certs['ecdsa'])
+    trunc = socket.socket()
+    trunc.bind(('127.0.0.1', 0))
+    trunc.listen(4)
+
+    def truncating():
+        c, _ = trunc.accept()
+        s = ctx.wrap_socket(c, server_side=True)
+        s.sendall(b'partial data')
+        time.sleep(0.2)
+        # Drop the socket under the TLS layer, so no close_notify is sent.
+        os.close(s.detach())
+
+    serve_in_thread(truncating)
+    out = run(exe, 'truncated', f'127.0.0.1:{trunc.getsockname()[1]}')
+    assert out == 'fault tls: connection closed by the peer without close_notify 12\n', out
+    trunc.close()
+    # Verification is the default: without X.509 support yet, every server is refused.
+    port = free_port()
+
+    class H(http.server.BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+
+        def do_GET(self):
+            body = b'hello over tls ' * 4096
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            data = self.rfile.read(int(self.headers['Content-Length']))
+            self.send_response(200)
+            self.send_header('Transfer-Encoding', 'chunked')
+            self.end_headers()
+            self.wfile.write(b'%x\r\n%s\r\n0\r\n\r\n' % (len(data), data))
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(('127.0.0.1', port), H)
+    srv.handle_error = lambda request, address: None  # the refused handshake of the verify run
+    srv.socket = ctx.wrap_socket(srv.socket, server_side=True, do_handshake_on_connect=False)
+    serve_in_thread(srv.serve_forever)
+    try:
+        wait_port(port)
+        out = run(exe, 'verify', f'127.0.0.1:{port}', 'localhost')
+        assert out.startswith('fault tls: certificate verification is not available yet'), out
+        want = hashlib.sha256(b'hello over tls ' * 4096).hexdigest()
+        out = run(exe, 'https', f'https://127.0.0.1:{port}/x')
+        assert out == f'get 200 {15 * 4096} {want}\npost 200 posted over tls\n', out
+    finally:
+        srv.shutdown()
+    # wss:// with a small WebSocket echo server over TLS.
+    ws = socket.socket()
+    ws.bind(('127.0.0.1', 0))
+    ws.listen(4)
+
+    def recv_exact(s, n):
+        b = b''
+        while len(b) < n:
+            chunk = s.recv(n - len(b))
+            if not chunk:
+                raise EOFError
+            b += chunk
+        return b
+
+    def wss_echo():
+        c, _ = ws.accept()
+        s = ctx.wrap_socket(c, server_side=True)
+        head = b''
+        while b'\r\n\r\n' not in head:
+            head += s.recv(1)
+        key = [ln.split(b':', 1)[1].strip() for ln in head.split(b'\r\n') if ln.lower().startswith(b'sec-websocket-key')][0]
+        accept = base64.b64encode(hashlib.sha1(key + b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest())
+        s.sendall(b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + b'\r\n\r\n')
+        while True:
+            b0, b1 = recv_exact(s, 2)
+            n = b1 & 127
+            if n == 126:
+                n = struct.unpack('>H', recv_exact(s, 2))[0]
+            mask = recv_exact(s, 4)
+            data = bytes(x ^ mask[i % 4] for i, x in enumerate(recv_exact(s, n)))
+            if b0 & 15 == 8:
+                s.sendall(bytes([0x88, len(data)]) + data)
+                s.close()
+                return
+            out = b'echo: ' + data
+            s.sendall(bytes([0x80 | (b0 & 15), len(out)]) + out)
+
+    serve_in_thread(wss_echo)
+    out = run(exe, 'wss', f'wss://127.0.0.1:{ws.getsockname()[1]}/chat')
+    assert out == 'wss true echo: hello wss\n', out
+    ws.close()
+    print('PASS handshake timeout, a non-TLS server, truncation without close_notify, verification by default, https:// and wss://')
+
+
+def http_get(port, path, timeout=10):
+    s = socket.create_connection(('127.0.0.1', port), timeout=timeout)
+    t0 = time.time()
+    s.sendall(('GET %s HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n' % path).encode())
+    data = b''
+    while True:
+        chunk = s.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+    s.close()
+    return time.time() - t0, data
+
+
+def request_tasks(compiler, work, certs):
+    """On one core, eight requests that each make a TLS handshake taking 0.5 s overlap, a
+    fast request answers meanwhile, and a request deadline ends a handshake that never
+    finishes."""
+    exe = work / 'tls_server'
+    subprocess.run([str(compiler), '-o', str(exe), 'tools/ci/fixtures/tls_server.tin'], check=True, cwd=ROOT,
+                   env=dict(os.environ, TIN_ROOT=str(ROOT)), timeout=120)
+    ctx = server_ctx(certs['ecdsa'])
+    slow = socket.socket()
+    slow.bind(('127.0.0.1', 0))
+    slow.listen(64)
+
+    def slow_handshake(c):
+        time.sleep(0.5)
+        try:
+            s = ctx.wrap_socket(c, server_side=True)
+            s.recv(4096)
+            s.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nslow')
+            s.close()
+        except (OSError, ssl.SSLError):
+            c.close()
+
+    def slow_server():
+        while True:
+            try:
+                c, _ = slow.accept()
+            except OSError:
+                return
+            serve_in_thread(lambda c=c: slow_handshake(c))
+
+    serve_in_thread(slow_server)
+    hole = socket.socket()
+    hole.bind(('127.0.0.1', 0))
+    hole.listen(64)
+    port = free_port()
+    server = subprocess.Popen([str(exe)], env=dict(os.environ, PORT=str(port), TIN_CORES='1', TIN_DEADLINE_MS='1500'))
+    try:
+        wait_port(port, server)
+        results = {}
+
+        def one(i):
+            results[i] = http_get(port, f'/fetch?port={slow.getsockname()[1]}')
+
+        threads = [threading.Thread(target=one, args=(i,)) for i in range(8)]
+        t0 = time.time()
+        for t in threads:
+            t.start()
+        time.sleep(0.1)
+        fast = [http_get(port, '/fast')[0] for _ in range(5)]
+        for t in threads:
+            t.join()
+        total = time.time() - t0
+        bodies = [d.split(b'\r\n\r\n', 1)[-1] for _, d in results.values()]
+        assert bodies == [b'via tls: slow'] * 8, bodies
+        assert total < 2.5, f'8 handshakes of 0.5 s took {total:.2f} s on one core: they did not overlap'
+        assert max(fast) < 0.4, f'a fast request waited {max(fast):.2f} s behind TLS handshakes'
+        took, data = http_get(port, f'/fetch?port={hole.getsockname()[1]}')
+        assert b'upstream: deadline exceeded' in data and 1.0 < took < 4.0, (took, data[-200:])
+    finally:
+        server.kill()
+        server.wait()
+        slow.close()
+        hole.close()
+    print(f'PASS request tasks: 8 slow handshakes overlap on one core ({total:.2f} s), /fast stays fast, the deadline ends a stuck handshake')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--compiler', default='bin/tinc')
+    args = parser.parse_args()
+    compiler = (ROOT / args.compiler).resolve()
+    out = ROOT / 'bin/ci/tls'
+    out.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='tls-', dir=out) as tmp:
+        work = Path(tmp)
+        exe = work / 'tls_client'
+        subprocess.run([str(compiler), '-o', str(exe), 'tools/ci/fixtures/tls_client.tin'], check=True, cwd=ROOT,
+                       env=dict(os.environ, TIN_ROOT=str(ROOT)), timeout=120)
+        subprocess.run([str(compiler), '-o', str(work / 'https_client'), 'examples/https_client.tin'], check=True, cwd=ROOT,
+                       env=dict(os.environ, TIN_ROOT=str(ROOT)), timeout=120)
+        rfc8448(compiler, work)
+        openssl = openssl3()
+        any_openssl = openssl or shutil.which('openssl')
+        assert any_openssl, 'tls_check needs an openssl command to make test certificates'
+        certs = make_certs(any_openssl, work)
+        python_servers(exe, certs)
+        request_tasks(compiler, work, certs)
+        if openssl:
+            openssl_matrix(exe, openssl, certs)
+            keyupdate(exe, openssl, certs)
+        else:
+            print('SKIP openssl s_server interop: no OpenSSL 3 command line on this runner')
+    print('tls: all checks passed')
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,32 @@
+// The server side of tools/ci/tls_check.py's request-task check: on one core,
+//   GET /fetch?port=N  fetches https://127.0.0.1:N/ with wire (TLS without verification)
+//   GET /fast          answers at once
+// TLS handshakes and reads wait like any other client call, so fetches overlap and /fast
+// answers while they wait.
+package main
+
+import "anvil"
+import "tls"
+import "wire"
+
+func fetch(q anvil.Req, w mut anvil.Out) {
+	opt := wire.Options{Timeout: 0, MaxBody: 0, TLS: tls.Config{InsecureSkipVerify: true}}
+	port := q.Param("port")
+	r := wire.DoWith("GET", "https://127.0.0.1:{port}/", []str{}, "", opt) catch err {
+		w.Status(502)
+		w.Text("upstream: {err}")
+		return
+	}
+	w.Text("via tls: {r.Body}")
+}
+
+func fast(q anvil.Req, w mut anvil.Out) {
+	w.Text("fast")
+}
+
+func main() {
+	r := anvil.NewRouter()
+	r.Get("/fetch", fetch)
+	r.Get("/fast", fast)
+	r.Serve(":9184") catch _ {}
+}

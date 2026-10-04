@@ -44,13 +44,38 @@ own constants and the same point code over it (phase 2).
 Exported: `P256NewPrivateKey`, `P256PublicKey`, `P256ECDH`, `Sha384`, `Sha512`, `Hmac`,
 `HkdfExtract`, `HkdfExpand`, `HkdfExpandLabel` (docs/STDLIB.md).
 
-## Phase 2 to phase 3: certificate verification (proposed; session B decides the names)
+## Phase 2 to phase 3: certificate verification
 
-The client calls, after the server's Certificate and CertificateVerify:
+Session B's `notes/interface_tls.md` (#304) defines the certificate API the client uses:
+`ParseCertificate`, `Certificate.Verify(VerifyOptions{DNSName, Roots, Intermediates, Now})`,
+`NewCertPool`/`AddPEM`/`SystemRoots` and `Certificate.CheckTLSSignature(scheme, signed, sig)`.
+The client calls them from one place, `verify_peer` in `lib/tls/verify.tin`, with the chain as
+received (DER, leaf first), the server name, the SignatureScheme and the CertificateVerify
+content (64 spaces, the context string, a zero byte, the transcript hash). Until that API is on
+main, `verify_peer` refuses every server unless `InsecureSkipVerify` is set.
 
-    verify_chain(chain [][]u8, host str, roots ?Roots, now_unix i64) !PublicKey
-    verify_signature(scheme u16, key PublicKey, msg []u8, sig []u8) !
+## lib/tls (phase 3)
 
-`chain` is the DER certificates in the order received; `scheme` is the TLS
-SignatureScheme code (0x0403 ecdsa_secp256r1_sha256, 0x0804 rsa_pss_rsae_sha256, 0x0807
-ed25519, ...). Until these land, phase 3 runs its tests with `InsecureSkipVerify`.
+| file | contents | used by the server (phase 5) |
+|---|---|---|
+| `tls.tin` | Config, Dial, Client, the public Conn methods | Conn methods |
+| `record.tin` | Conn state, socket I/O and waits, record protection, alerts, KeyUpdate | yes |
+| `schedule.tin` | cipher suites, key schedule, Finished MACs | yes |
+| `messages.tin` | wire-format reader/writer, ClientHello, parsers of the server's messages | the reader/writer |
+| `client.tin` | the client handshake | no |
+| `verify.tin` | the bridge to X.509 | no |
+
+Decisions:
+- A Conn changes only in place after the handshake (`seal.AEAD.Rekey`, copies into its own
+  slices), so the same Conn works in a request pool, a websocket's per-message pools and
+  `keep()`'s heap (the database clients, phase 4).
+- No middlebox-compatibility change_cipher_spec is sent; the server's is ignored during the
+  handshake. The session id is 32 random bytes (servers expect it).
+- The client offers only X25519 in its first key share and supported_groups lists P-256, so a
+  P-256-only server costs one HelloRetryRequest.
+- Signature schemes offered: ECDSA P-256/P-384, RSA-PSS SHA-256/384/512, Ed25519, and PKCS #1
+  v1.5 (for certificates only; a CertificateVerify with it is refused).
+- A server's CertificateRequest gets an empty Certificate (no client certificates yet).
+- After 2^24 records under one key the client sends KeyUpdate.
+
+Tests: `tools/ci/tls_check.py` (CI.md).

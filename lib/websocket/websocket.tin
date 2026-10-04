@@ -1,5 +1,5 @@
 // Package websocket is the WebSocket protocol (RFC 6455): Accept upgrades an anvil request,
-// Dial connects to a server. Messages are text or binary; pings are answered and
+// Dial connects to a server (ws://, or wss:// over TLS 1.3). Messages are text or binary; pings are answered and
 // fragments joined inside Read. Inside a request task a Read waits without blocking the
 // core, so one core holds many idle connections.
 //
@@ -16,6 +16,7 @@ import "anvil"
 import "glyph"
 import "say"
 import "seal"
+import "tls"
 import "twine"
 import "wire"
 
@@ -45,7 +46,8 @@ const sTimeout = 7 // ns a read or write may wait (0: no limit)
 const sWriting = 8 // a task is writing a frame: others wait their turn
 const sOwnFd = 9   // Close closes the descriptor (Dial); anvil closes Accept's
 const sMax = 10    // the largest message accepted
-const stWords = 11
+const sTls = 11    // a wss:// client: the tls.Conn (in the same pool) that every byte goes through
+const stWords = 12
 
 const guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -113,13 +115,24 @@ func Accept(q anvil.Req, w mut anvil.Out) !Conn {
 	return c
 }
 
-// Dial connects to a ws:// URL ("ws://host:port/path"). Close it when finished;
-// inside a request task, it is also closed automatically when its scope ends.
+// Dial connects to a ws:// or wss:// URL ("ws://host:port/path"); wss:// verifies the
+// server's certificate against the system's roots. Close it when finished; inside a request
+// task, it is also closed automatically when its scope ends.
 func Dial(url str) !Conn {
-	if !twine.HasPrefix(url, "ws://") {
-		fail "websocket: only ws:// URLs (no TLS)"
+	return try DialTLS(url, tls.Config{ServerName: "", RootCAs: "", ALPN: []str{}, Timeout: 0, InsecureSkipVerify: false})
+}
+
+// DialTLS is Dial with the TLS configuration of a wss:// URL (RootCAs, Timeout for the
+// handshake, InsecureSkipVerify for tests); the server name is the URL's host.
+func DialTLS(url str, cfg tls.Config) !Conn {
+	secure := twine.HasPrefix(url, "wss://")
+	if !secure && !twine.HasPrefix(url, "ws://") {
+		fail "websocket: only ws:// and wss:// URLs"
 	}
 	rest := url[5:]
+	if secure {
+		rest = url[6:]
+	}
 	slash := twine.IndexByte(rest, '/')
 	host := rest
 	path := "/"
@@ -128,11 +141,21 @@ func Dial(url str) !Conn {
 		path = rest[slash:]
 	}
 	addr := host
-	if twine.IndexByte(host, ':') < 0 {
+	if twine.LastIndexByte(host, ':') < 0 || twine.HasSuffix(host, "]") {
 		addr = host + ":80"
+		if secure {
+			addr = host + ":443"
+		}
 	}
-	wc := try wire.Dial(addr)
-	st := new_state(wc.Fd(), true)
+	st := 0
+	if secure {
+		tc := try tls.Dial(addr, cfg)
+		st = new_state(tc.Fd(), true)
+		st[sTls] = cast(i64, tc)
+	} else {
+		wc := try wire.Dial(addr)
+		st = new_state(wc.Fd(), true)
+	}
 	st[sOwnFd] = 1
 	c := Conn{open: true, st: st}
 	key := seal.B64(seal.RandomBytes(16))
@@ -197,6 +220,13 @@ func (c Conn) release() {
 }
 
 func release_state(st i64) {
+	if st[sTls] != 0 && st[sFd] >= 0 {
+		// close_notify, then the descriptor.
+		tc := cast(tls.Conn, st[sTls])
+		tc.Close()
+		st[sTls] = 0
+		st[sFd] = -1
+	}
 	if st[sOwnFd] != 0 && st[sFd] >= 0 {
 		rt_sys_close(st[sFd])
 		st[sFd] = -1
@@ -210,6 +240,10 @@ func release_state(st i64) {
 // SetTimeout limits every later read and write to ns nanoseconds (0: no limit).
 func (c Conn) SetTimeout(ns i64) {
 	c.st[sTimeout] = ns
+	if c.st[sTls] != 0 {
+		tc := cast(tls.Conn, c.st[sTls])
+		tc.SetTimeout(ns)
+	}
 }
 
 // SetMaxMessage sets the largest message Read accepts (default 16 MiB); a bigger one
@@ -234,6 +268,11 @@ func (c Conn) write_raw(p i64, n i64) ! {
 	st := c.st
 	if st[sBuf] == 0 {
 		fail "websocket: the connection is closed"
+	}
+	if st[sTls] != 0 {
+		tc := cast(tls.Conn, st[sTls])
+		try tc.Write(rt_str_from_raw(p, n))
+		return
 	}
 	for n > 0 {
 		k := rt_sys_write(st[sFd], p, n)
@@ -279,6 +318,19 @@ func (c Conn) fill() ! {
 			st[sCap] *= 2
 			st[sBuf] = realloc(st[sBuf], st[sCap])
 		}
+	}
+	if st[sTls] != 0 {
+		tc := cast(tls.Conn, st[sTls])
+		tmp := make([]u8, 0, st[sCap]-st[sE])
+		tc.Read(mut tmp, st[sCap]-st[sE]) catch e {
+			if wire.IsEOF(e) {
+				fail "websocket: closed (the peer went away)"
+			}
+			fail e
+		}
+		memcpy(st[sBuf]+st[sE], cast(i64, tmp)[2], len(tmp))
+		st[sE] += len(tmp)
+		return
 	}
 	for {
 		k := rt_sys_read(st[sFd], st[sBuf]+st[sE], st[sCap]-st[sE])

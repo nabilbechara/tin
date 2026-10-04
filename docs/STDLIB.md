@@ -13,6 +13,7 @@ Generated from the comments in `lib/*/` by `tools/gendoc.py`.
 | [relay](#relay) | messages between cores (channels) |
 | [task](#task) | deadline and cancellation of the running code (context) |
 | [wire](#wire) | TCP and HTTP client (net) |
+| [tls](#tls) | TLS 1.3 client (crypto/tls) |
 | [twine](#twine) | strings (strings) |
 | [glyph](#glyph) | UTF-8 and Unicode (unicode/utf8, unicode) |
 | [mint](#mint) | number and string conversion (strconv) |
@@ -249,6 +250,36 @@ r := try wire.Get("http://127.0.0.1:8080/json")
 - `Do(method str, url str, headers []str, body str) !Resp`: Do sends one request: headers is a list of name, value pairs. The method and header names must be tokens, and the URL and header values must not hold CR, LF, NUL or other control bytes (the URL no spaces either), or Do fails instead of sending a request an input could have split. Response bodies over DefaultMaxBody fail; DoWith sets a timeout and the limit.
 - `DoWith(method str, url str, headers []str, body str, opt Options) !Resp`: DoWith is Do with options: an overall timeout and a response size limit.
 - `(r Resp) Header(name str) str`: Header returns the response header name (any case), or "".
+
+## tls
+
+Package tls is TLS 1.3 (RFC 8446) for clients: tls.Dial connects and handshakes, and Conn reads and writes like wire.Conn. Cipher suites: TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256; key exchange X25519, or P-256 when the server asks for it. The server's certificate is verified by default. No 0-RTT, no resumption, no renegotiation and no TLS 1.2. Every wait lets the core serve other tasks and honours Config.Timeout during the handshake, SetTimeout afterwards and a request's deadline.
+
+```go
+c := try tls.Dial("example.com:443", tls.Config{ALPN: []str{"http/1.1"}})
+try c.Write("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+```
+
+- `type Conn struct`: Conn is a TLS 1.3 connection over a wire.Conn. After the handshake its memory only changes in place (record buffers made once, keys rewritten by seal.AEAD.Rekey), so a Conn stays valid wherever it lives: a request's pool, or keep()'s long-lived heap for a client that holds connections across requests.
+- `const TLS_AES_128_GCM_SHA256 = 0x1301`: TLS_AES_128_GCM_SHA256 is cipher suite 0x1301 (Conn.CipherSuite).
+- `const TLS_AES_256_GCM_SHA384 = 0x1302`: TLS_AES_256_GCM_SHA384 is cipher suite 0x1302.
+- `const TLS_CHACHA20_POLY1305_SHA256 = 0x1303`: TLS_CHACHA20_POLY1305_SHA256 is cipher suite 0x1303.
+- `type Config struct`: Config configures a client connection; the zero value verifies the server against the system's roots for the name in the address.
+- `Dial(addr str, cfg Config) !Conn`: Dial connects to "host:port" and runs the handshake. ServerName defaults to host.
+- `Client(conn wire.Conn, cfg Config) !Conn`: Client runs the handshake over an established connection, for protocols that switch to TLS mid-stream (MySQL, PostgreSQL). cfg.ServerName is required unless InsecureSkipVerify is set. The Conn owns conn from then on: its Close closes conn.
+- `(c mut Conn) SetTimeout(ns i64)`: SetTimeout limits every later read and write to ns nanoseconds (0: no limit).
+- `(c mut Conn) SetDeadline(at i64)`: SetDeadline makes every later wait fail once the monotonic clock (tide.Now) passes at (0: no deadline), whatever the per-call timeout: wire uses it for a whole HTTP call.
+- `(c Conn) ALPN() str`: ALPN is the application protocol the server chose ("" when none).
+- `(c Conn) CipherSuite() i64`: CipherSuite is the negotiated cipher suite (TLS_AES_128_GCM_SHA256 and so on).
+- `(c Conn) Group() str`: Group is the key exchange: "X25519", or "P-256" when the server asked for it.
+- `(c Conn) PeerCertificates() [][]u8`: PeerCertificates is the server's certificate chain as sent (DER, leaf first).
+- `(c Conn) Fd() i64`: Fd is the connection's descriptor (for waiting on it; never read or write it directly).
+- `(c Conn) Buffered() i64`: Buffered is how many decrypted bytes a Read returns without waiting.
+- `(c mut Conn) Read(buf mut []u8, max i64) !i64`: Read appends up to max bytes of application data to buf and returns how many; after the server's close_notify it fails with EOF (wire.IsEOF), and a connection the server drops without close_notify is a fault, not EOF (a truncation would otherwise look complete).
+- `(c mut Conn) ReadFull(n i64) !str`: ReadFull reads exactly n bytes.
+- `(c mut Conn) WriteBytes(b []u8) !`: WriteBytes sends all of b.
+- `(c mut Conn) Write(s str) !`: Write sends all of s.
+- `(c mut Conn) Close()`: Close sends close_notify and closes the connection; closing twice does nothing.
 
 ## twine
 
@@ -916,6 +947,8 @@ Package seal has cryptographic hashes (SHA-256, SHA-384, SHA-512, SHA-1), HMAC o
 - `(a AEAD) Overhead() i64`: Overhead is the tag length in bytes (16).
 - `(a AEAD) Seal(nonce []u8, plaintext secret []u8, aad []u8) ![]u8`: Seal encrypts plaintext and authenticates it with aad under a 12-byte nonce, returning the ciphertext followed by the tag. A nonce must never be used twice with one key.
 - `(a AEAD) Open(nonce []u8, sealed []u8, aad []u8) ![]u8`: Open checks the tag of sealed (ciphertext then tag) against aad and the nonce and returns the plaintext; it fails, revealing nothing else, when anything was changed.
+- `(a mut AEAD) Rekey(key secret []u8) !`: Rekey replaces a's key with key, of the same algorithm and length, reusing a's memory: an AEAD kept in long-lived memory (a connection's state) can change keys without allocating there.
+- `AESHardware() bool`: AESHardware reports whether AES-GCM runs on the CPU's AES instructions here (AES-NI and PCLMULQDQ, or ARMv8 AES and PMULL); without them it runs a slower constant-time software path and ChaCha20-Poly1305 is the faster choice.
 - `NewAESGCM(key secret []u8) !AEAD`: NewAESGCM is AES-GCM (16-byte tags, 12-byte nonces) with a 16-, 24- or 32-byte key (AES-128, AES-192 or AES-256).
 - `ChaCha20(key secret []u8, nonce []u8, counter u32, data []u8) ![]u8`: ChaCha20 XORs data with the ChaCha20 keystream (RFC 8439) for a 32-byte key, a 12-byte nonce and the initial block counter.
 - `type Hash enum { SHA256, SHA384, SHA512 }`: Hash names a SHA-2 function for Hmac and HKDF.
@@ -1147,7 +1180,7 @@ id := rows.Rows[0][0].Int()
 
 ## websocket
 
-Package websocket is the WebSocket protocol (RFC 6455): Accept upgrades an anvil request, Dial connects to a server. Messages are text or binary; pings are answered and fragments joined inside Read. Inside a request task a Read waits without blocking the core, so one core holds many idle connections.
+Package websocket is the WebSocket protocol (RFC 6455): Accept upgrades an anvil request, Dial connects to a server (ws://, or wss:// over TLS 1.3). Messages are text or binary; pings are answered and fragments joined inside Read. Inside a request task a Read waits without blocking the core, so one core holds many idle connections.
 
 ```go
 func handle(q anvil.Req, w mut anvil.Out) {
@@ -1162,7 +1195,8 @@ func echo(ws websocket.Conn, m websocket.Message) ! {
 - `type Message struct`: Message is one complete message.
 - `type Conn struct`: Conn is a WebSocket connection.
 - `Accept(q anvil.Req, w mut anvil.Out) !Conn`: Accept completes the opening handshake for request q and takes over its connection. A request that is not a WebSocket handshake gets a 400 (426 for another version) in w and fails. The connection and its buffers close when the handler returns.
-- `Dial(url str) !Conn`: Dial connects to a ws:// URL ("ws://host:port/path"). Close it when finished; inside a request task, it is also closed automatically when its scope ends.
+- `Dial(url str) !Conn`: Dial connects to a ws:// or wss:// URL ("ws://host:port/path"); wss:// verifies the server's certificate against the system's roots. Close it when finished; inside a request task, it is also closed automatically when its scope ends.
+- `DialTLS(url str, cfg tls.Config) !Conn`: DialTLS is Dial with the TLS configuration of a wss:// URL (RootCAs, Timeout for the handshake, InsecureSkipVerify for tests); the server name is the URL's host.
 - `(c Conn) SetTimeout(ns i64)`: SetTimeout limits every later read and write to ns nanoseconds (0: no limit).
 - `(c Conn) SetMaxMessage(n i64)`: SetMaxMessage sets the largest message Read accepts (default 16 MiB); a bigger one closes the connection with 1009.
 - `(c Conn) WriteText(s str) !`: WriteText sends s as a text message.
