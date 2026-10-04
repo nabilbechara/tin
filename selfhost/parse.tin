@@ -3107,8 +3107,10 @@ fn print_edition1(file, source, toks) {
     let i = 0;
     while i < toks[VEC_LEN] {
         let t = vec_get(toks, i);
-        if depth == 0 && (fx_kw(t, "func") || fx_kw(t, "var") || fx_kw(t, "const") || fx_kw(t, "type") || fx_kw(t, "import")) {
+        // a declaration starts a line (a func in a parameter's type does not)
+        if depth == 0 && (i == 0 || tok_is(vec_get(toks, i - 1), ";") || tok_is(vec_get(toks, i - 1), "}")) && (fx_kw(t, "func") || fx_kw(t, "var") || fx_kw(t, "const") || fx_kw(t, "type") || fx_kw(t, "import")) {
             top = i;
+            fx_top = i;
             if fx_kw(t, "func") {
                 let n = fx_next(toks, i);
                 if n < toks[VEC_LEN] && tok_is(vec_get(toks, n), "(") {
@@ -3758,9 +3760,25 @@ fn rewrite_for_range(toks, for_at, replacements, deletes, prefixes, suffixes) {
     if close < 0 || fx_assigns(toks, body, close, init_name[T_TEXT]) {
         return 0;
     }
+    // The bound is one operand of the `<`: a top-level &&, || or comparison belongs to the
+    // condition, and a call other than len may give another value on the next iteration.
     let b = cond_op_at + 1;
+    let depth = 0;
     while b < semi2 {
         let bt = vec_get(toks, b);
+        if fx_open(bt) {
+            depth = depth + 1;
+        } else if fx_close(bt) {
+            depth = depth - 1;
+        } else if depth == 0 && (tok_is(bt, "&&") || tok_is(bt, "||") || tok_is(bt, "==") || tok_is(bt, "!=") || tok_is(bt, "<") || tok_is(bt, "<=") || tok_is(bt, ">") || tok_is(bt, ">=")) {
+            return 0;
+        }
+        if tok_is(bt, "(") && b > cond_op_at + 1 {
+            let callee = vec_get(toks, b - 1);
+            if callee[T_KIND] == TK_IDENT && !streq(callee[T_TEXT], "len") {
+                return 0;
+            }
+        }
         if bt[T_KIND] == TK_IDENT && fx_assigns(toks, body, close, bt[T_TEXT]) {
             return 0;
         }
@@ -3870,6 +3888,9 @@ var fx_lead;  // text put into the trivia before token i, after its last blank l
 var fx_ind;   // tabs added after each newline in the trivia before token i (a block now nested)
 var fx_cur_ind; // fx_ind of the token whose trivia is being printed
 var fx_trusted; // the file is a trusted library file: `secret` before a type is the qualifier
+var fx_top;     // the top-level declaration being printed
+var fx_path;    // the translated file's path (set by main): its package's other files share names
+var fx_pkg_names; // the names the package's other files declare or hoist (read when first needed)
 var fx_hoisted; // [name, text] of the local constants already hoisted
 var fx_fn_name; // the name of the function being printed (prefixes a clashing local constant)
 var fx_rep;   // the printer's replacements, prefixes and suffixes (print_edition1)
@@ -4120,6 +4141,13 @@ fn rewrite_local_const(source, toks, at, top, replacements, level) {
     while k < fx_hoisted[VEC_LEN] {
         let h = vec_get(fx_hoisted, k);
         if streq(vec_get(h, 0), new) {
+            // already hoisted with this value: the statement goes, a comment on its line stays
+            let next = fx_next(toks, last);
+            let note = fx_take_line_comment(source, toks, last);
+            if note {
+                let ind = source_indent(source, vec_get(toks, at));
+                fx_triv[VEC_DATA][next] = str_cat3(str_cat3("\n", ind, note), fx_triv[VEC_DATA][next], "");
+            }
             fx_drop_statement(source, toks, at, last, replacements);
             return 1;
         }
@@ -4129,6 +4157,11 @@ fn rewrite_local_const(source, toks, at, top, replacements, level) {
     vec_push(h, new);
     vec_push(h, rest);
     vec_push(fx_hoisted, h);
+    // a comment after the constant on its line moves with it
+    let note = fx_take_line_comment(source, toks, last);
+    if note {
+        rest = str_cat3(rest, " ", note);
+    }
     fx_add(fx_lead, top, str_cat3("const ", new, str_cat3(" ", rest, "\n\n")));
     fx_drop_statement(source, toks, at, last, replacements);
     return 1;
@@ -4159,10 +4192,48 @@ fn fx_value_text(source, toks, a, b) {
     return str_slice(out[VEC_DATA], out[VEC_LEN]);
 }
 
+// fx_take_line_comment returns the // comment after token last on its line, or 0, and leaves
+// it out of the next token's trivia.
+fn fx_take_line_comment(source, toks, last) {
+    let next = fx_next(toks, last);
+    if next >= toks[VEC_LEN] {
+        return 0;
+    }
+    let i = vec_get(toks, last)[T_END];
+    let end = vec_get(toks, next)[T_START];
+    while i < end && (load8(source + i) == ' ' || load8(source + i) == '\t') {
+        i = i + 1;
+    }
+    if !(i + 1 < end && load8(source + i) == '/' && load8(source + i + 1) == '/') {
+        return 0;
+    }
+    let start = i;
+    while i < end && load8(source + i) != '\n' {
+        i = i + 1;
+    }
+    let note = str_slice(source + start, i - start);
+    if !fx_triv[VEC_DATA][next] {
+        fx_triv[VEC_DATA][next] = str_slice(source + i, end - i);
+    }
+    return note;
+}
+
 // fx_drop_statement removes tokens a..b and the line they stood on.
 fn fx_drop_statement(source, toks, a, b, replacements) {
     replacements[VEC_DATA][a] = "";
     fx_span[VEC_DATA][a] = b + 1;
+    let set = fx_triv[VEC_DATA][a];
+    if set {
+        // trivia an earlier rewrite already chose (a moved comment left out): drop its last line
+        let n = strlen(set);
+        while n > 0 && (load8(set + n - 1) == ' ' || load8(set + n - 1) == '\t') {
+            n = n - 1;
+        }
+        if n > 0 && load8(set + n - 1) == '\n' {
+            fx_triv[VEC_DATA][a] = str_slice(set, n - 1);
+        }
+        return 0;
+    }
     let prev = fx_prev(toks, a);
     let from = 0;
     if prev >= 0 {
@@ -4178,8 +4249,99 @@ fn fx_drop_statement(source, toks, a, b, replacements) {
     }
 }
 
-// fx_top_declares reports a package-level declaration of name in this file.
+// fx_top_declares reports a package-level declaration of name in this file or in another
+// file of its package (a library package: the files of a main directory are separate programs).
 fn fx_top_declares(toks, name) {
+    if fx_file_declares(toks, name) {
+        return 1;
+    }
+    if !fx_pkg_names {
+        fx_pkg_names = fx_sibling_names(toks);
+    }
+    let i = 0;
+    while i < fx_pkg_names[VEC_LEN] {
+        if streq(vec_get(fx_pkg_names, i), name) {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// fx_sibling_names lists what the other .tin files in the translated file's directory declare
+// at package level, and the local constants they would hoist there, when the package is not main.
+fn fx_sibling_names(toks) {
+    let names = vec_new();
+    let p = 0;
+    while p + 1 < toks[VEC_LEN] && !fx_kw(vec_get(toks, p), "package") {
+        p = p + 1;
+    }
+    if !fx_path || p + 1 >= toks[VEC_LEN] || streq(vec_get(toks, p + 1)[T_TEXT], "main") {
+        return names;
+    }
+    let dir = dir_of(fx_path);
+    let d = rt_sys_opendir(dir);
+    if !d {
+        return names;
+    }
+    let self = fx_base(fx_path);
+    while 1 {
+        let ent = rt_sys_readdir(d);
+        if !ent {
+            break;
+        }
+        let name = host_dirent_name(ent);
+        if ends_with(name, ".tin") && load8(name) != '.' && !streq(name, self) {
+            let src = try_read_file(cat_path(cat_path(dir, "/"), name));
+            if src {
+                let stoks = lex(0, src[VEC_DATA], src[VEC_LEN], source_edition(src[VEC_DATA], src[VEC_LEN]));
+                fx_collect_names(stoks, names);
+            }
+        }
+    }
+    rt_sys_closedir(d);
+    return names;
+}
+
+fn fx_base(path) {
+    let n = strlen(path);
+    let i = n;
+    while i > 0 && load8(path + i - 1) != '/' {
+        i = i - 1;
+    }
+    return path + i;
+}
+
+// fx_collect_names adds the names declared at package level in toks (const groups included)
+// and every constant declared inside a function.
+fn fx_collect_names(toks, names) {
+    let depth = 0;
+    let group = 0;
+    let i = 0;
+    while i < toks[VEC_LEN] {
+        let t = vec_get(toks, i);
+        let n = fx_next(toks, i);
+        if (fx_kw(t, "const") || fx_kw(t, "var")) && n < toks[VEC_LEN] && tok_is(vec_get(toks, n), "(") && depth == 0 {
+            group = 1;
+        } else if group && depth == 1 && t[T_KIND] == TK_IDENT && (i == 0 || tok_is(vec_get(toks, i - 1), ";") || tok_is(vec_get(toks, i - 1), "(")) {
+            vec_push(names, t[T_TEXT]);
+        }
+        if tok_is(t, "{") || tok_is(t, "(") || tok_is(t, "[") {
+            depth = depth + 1;
+        } else if tok_is(t, "}") || tok_is(t, ")") || tok_is(t, "]") {
+            depth = depth - 1;
+            if depth == 0 {
+                group = 0;
+            }
+        } else if n < toks[VEC_LEN] && vec_get(toks, n)[T_KIND] == TK_IDENT && (fx_kw(t, "const") || (depth == 0 && (fx_kw(t, "var") || fx_kw(t, "type") || fx_kw(t, "func") || fx_kw(t, "fn") || fx_kw(t, "let") || fx_kw(t, "mut")))) {
+            vec_push(names, vec_get(toks, n)[T_TEXT]);
+        }
+        i = i + 1;
+    }
+}
+
+// fx_file_declares reports a package-level declaration of name in this file.
+fn fx_file_declares(toks, name) {
     let depth = 0;
     let i = 0;
     while i < toks[VEC_LEN] {
@@ -4381,9 +4543,24 @@ fn fx_reserved(toks, i) {
         return n >= toks[VEC_LEN] || !tok_is(vec_get(toks, n), "{");
     }
     if streq(s, "keep") {
-        // the builtin keep(x) stays; a name spelled the same is renamed
+        // the builtin keep(x) stays; a name spelled the same is renamed, and so is every use
+        // of it in a declaration that has such a name (a parameter called like a function)
         let n = fx_next(toks, i);
-        return n >= toks[VEC_LEN] || !tok_is(vec_get(toks, n), "(");
+        if n >= toks[VEC_LEN] || !tok_is(vec_get(toks, n), "(") {
+            return 1;
+        }
+        let j = fx_top;
+        while j < i {
+            let u = vec_get(toks, j);
+            if u[T_KIND] == TK_IDENT && streq(u[T_TEXT], "keep") {
+                let un = fx_next(toks, j);
+                if un >= toks[VEC_LEN] || !tok_is(vec_get(toks, un), "(") {
+                    return 1;
+                }
+            }
+            j = j + 1;
+        }
+        return 0;
     }
     if streq(s, "secret") && fx_trusted {
         // `name secret T`, `) secret T`, `[]secret T`: the qualifier, the same word in edition 1
