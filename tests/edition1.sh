@@ -71,7 +71,7 @@ if ! cmp -s tests/edition1/boundary_fault_bad.err "$tmp/boundary_fault_bad.err";
 fi
 
 # Structured concurrency (#232): scopes, spawn, wait, cancel, first-fault cancellation.
-for name in scopes lanes selects
+for name in scopes lanes selects guards
 do
 	"$compiler" -edition 1 -o "$tmp/$name" "tests/edition1/run/$name.tin"
 	"$tmp/$name" >"$tmp/$name.out" 2>/dev/null

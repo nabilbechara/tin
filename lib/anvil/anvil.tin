@@ -444,10 +444,12 @@ func core(id i64) {
 				}
 			} else if fd == tick {
 				ev_timer_ack(tick)
-				gTick(id)
+				rt_guard_call(tick_guarded, id)
 				rt_pool_reset()
 			} else if fd == rfd {
-				relay.Drain(gRelay)
+				// A panic ends one message's handler; the rest are handled by the next round.
+				for rt_guard_call(relay_guarded, 0) != 0 {
+				}
 				rt_pool_reset()
 			} else if fd == myListen {
 				accept_all()
@@ -2002,6 +2004,17 @@ func OnRelay(h func(i64, str)) {
 func OnTick(ms i64, h func(i64)) {
 	gTick = h
 	gTickMs = ms
+}
+
+// tick_guarded runs one tick inside an implicit guard (#230): a panic in it is logged with its
+// backtrace, its deferred calls run, and the core goes on to its next event.
+func tick_guarded(id i64) ! {
+	gTick(id)
+}
+
+// relay_guarded handles the waiting relay messages inside an implicit guard, like a tick.
+func relay_guarded(unused i64) ! {
+	relay.Drain(gRelay)
 }
 
 // ---- Router ----

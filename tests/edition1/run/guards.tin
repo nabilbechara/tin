@@ -1,0 +1,63 @@
+package main
+
+import "fault"
+import "say"
+import "tide"
+
+// Task roots are guarded implicitly (#230): a panic in a spawned child runs its deferred calls
+// and becomes its fault, fault.Panic with the message, as in a guard block.
+mut log str = ""
+
+fn note(s str) {
+	log = keep(log + s)
+}
+
+fn third(xs []i64) i64 {
+	return xs[3]
+}
+
+fn child_done() {
+	note("child defer;")
+}
+
+// panicky panics after a deferred call.
+fn panicky() ! {
+	defer child_done()
+	let xs = []i64{1}
+	say.Line("never", third(xs))
+}
+
+// kids has one child panic: it is the scope's fault, and it cancels the other child.
+fn kids() ! {
+	scope s {
+		s.spawn(panicky)
+		s.spawn(fn() ! {
+			tide.Wait(tide.Second) catch err {
+				note("sibling: {err};")
+			}
+		})
+	}
+}
+
+// waited waits for a panicking child through its handle.
+fn waited() ! {
+	scope s {
+		let t = s.spawn(panicky)
+		t.wait() catch err {
+			note("wait: {err} {fault.Is(err, fault.Panic)};")
+		}
+	}
+}
+
+fn main() {
+	kids() catch err {
+		say.Line("scope:", err, fault.Is(err, fault.Panic))
+	}
+	say.Line("log:", log)
+	log = ""
+	waited() catch err {
+		say.Line("waited scope:", err)
+	}
+	say.Line("log:", log)
+	say.Line("main goes on")
+}
