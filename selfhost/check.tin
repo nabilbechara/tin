@@ -957,6 +957,9 @@ fn check_pkg_vars(pkg, done) {
     }
 }
 
+var ck_sentinel;   // the initializer of the package-level var being checked: fault("...") there is a sentinel
+var sentinel_seq;  // numbers sentinel identities (the runtime's own are below 64)
+
 fn check_var(v) {
     set_file(v[D_FILE]);
     ck_legacy = !vec_get(file_v2, ck_file);
@@ -997,7 +1000,9 @@ fn check_var(v) {
     if s[S_TLS] {
         ck_fn = core_fn;
     }
+    ck_sentinel = init;
     let t = chk(init, s[S_TYPE]);
+    ck_sentinel = 0;
     if !s[S_TYPE] {
         s[S_TYPE] = default_type(t);
     }
@@ -1509,6 +1514,9 @@ fn scan_idents_in_expr(e, inner_params, outer_names, cells) {
         scan_idents_in_expr(e[SL_HI], inner_params, outer_names, cells);
     } else if k == EX_TRY {
         scan_idents_in_expr(e[TRY_X], inner_params, outer_names, cells);
+    } else if k == EX_WRAP {
+        scan_idents_in_expr(e[WRAP_X], inner_params, outer_names, cells);
+        scan_idents_in_expr(e[WRAP_MESSAGE], inner_params, outer_names, cells);
     } else if k == EX_CATCH {
         scan_idents_in_expr(e[CATCH_X], inner_params, outer_names, cells);
         scan_idents_in_block(e[CATCH_BODY], inner_params, outer_names, cells);
@@ -1695,6 +1703,9 @@ fn scan_funclits_in_expr(e, outer_names, cells) {
         scan_funclits_in_expr(e[SL_HI], outer_names, cells);
     } else if k == EX_TRY {
         scan_funclits_in_expr(e[TRY_X], outer_names, cells);
+    } else if k == EX_WRAP {
+        scan_funclits_in_expr(e[WRAP_X], outer_names, cells);
+        scan_funclits_in_expr(e[WRAP_MESSAGE], outer_names, cells);
     } else if k == EX_CATCH {
         scan_funclits_in_expr(e[CATCH_X], outer_names, cells);
         scan_funclits_in_block(e[CATCH_BODY], outer_names, cells);
@@ -2388,7 +2399,7 @@ fn check_stmt(s) {
         check_fail(s);
     } else if k == ST_EXPR {
         let x = s[ES_X];
-        if (x[N_KIND] == EX_TRY || x[N_KIND] == EX_CATCH) && !ck_legacy {
+        if (x[N_KIND] == EX_TRY || x[N_KIND] == EX_CATCH || x[N_KIND] == EX_WRAP) && !ck_legacy {
             lower_try_stmt(s, x, 0, 0);
             return;
         }
@@ -2472,7 +2483,7 @@ fn check_stmt(s) {
 fn check_bstore(s) {
     let pos = s[N_POS];
     let x = s[ES_X];
-    if x[N_KIND] == EX_TRY || x[N_KIND] == EX_CATCH {
+    if x[N_KIND] == EX_TRY || x[N_KIND] == EX_CATCH || x[N_KIND] == EX_WRAP {
         lower_try_stmt(s, x, 5, 0);
         return;
     }
@@ -2808,7 +2819,7 @@ fn check_let(s) {
         t = resolve_type(s[LET_TYPE]);
     }
     let init = s[LET_INIT];
-    if init && (init[N_KIND] == EX_TRY || init[N_KIND] == EX_CATCH) && !ck_legacy {
+    if init && (init[N_KIND] == EX_TRY || init[N_KIND] == EX_CATCH || init[N_KIND] == EX_WRAP) && !ck_legacy {
         lower_try_stmt(s, init, 1, t);
         return;
     }
@@ -2918,7 +2929,7 @@ fn check_target(t) {
 fn check_assign(s) {
     let target = s[AS_TARGET];
     let v = s[AS_VALUE];
-    if (v[N_KIND] == EX_TRY || v[N_KIND] == EX_CATCH) && !ck_legacy {
+    if (v[N_KIND] == EX_TRY || v[N_KIND] == EX_CATCH || v[N_KIND] == EX_WRAP) && !ck_legacy {
         lower_try_stmt(s, v, 2, 0);
         return;
     }
@@ -3044,7 +3055,7 @@ fn check_multi(s) {
     let temps = vec_new();
     if values[VEC_LEN] == 1 && n > 1 {
         let v = vec_get(values, 0);
-        if (v[N_KIND] == EX_TRY || v[N_KIND] == EX_CATCH) && !ck_legacy {
+        if (v[N_KIND] == EX_TRY || v[N_KIND] == EX_CATCH || v[N_KIND] == EX_WRAP) && !ck_legacy {
             lower_try_stmt(s, v, 3, 0);
             return;
         }
@@ -3176,7 +3187,7 @@ fn check_return(s) {
     let f = ck_fn;
     let want = f[F_RTYPES];
     let pos = s[N_POS];
-    if s[RET_VALUE] && (s[RET_VALUE][N_KIND] == EX_TRY || s[RET_VALUE][N_KIND] == EX_CATCH) && !ck_legacy {
+    if s[RET_VALUE] && (s[RET_VALUE][N_KIND] == EX_TRY || s[RET_VALUE][N_KIND] == EX_CATCH || s[RET_VALUE][N_KIND] == EX_WRAP) && !ck_legacy {
         lower_try_stmt(s, s[RET_VALUE], 4, 0);
         return;
     }
@@ -3280,6 +3291,16 @@ fn check_return(s) {
 // returning; a value catch assigns the block's last expression to the result.
 fn lower_try_stmt(s, tr, mode, declared) {
     let pos = s[N_POS];
+    // try E wrap "msg" (edition 1): the fault passed upward is fault.Wrap(err, msg).
+    let wrapmsg = 0;
+    if tr[N_KIND] == EX_WRAP {
+        wrapmsg = tr[WRAP_MESSAGE];
+        if tr[WRAP_X][N_KIND] != EX_TRY {
+            err_at(tr[N_POS], "wrap adds context to the fault try passes upward: write try E wrap \"msg\"");
+            return;
+        }
+        tr = tr[WRAP_X];
+    }
     let call = tr[TRY_X];
     let handler = 0;
     if tr[N_KIND] == EX_CATCH {
@@ -3353,7 +3374,16 @@ fn lower_try_stmt(s, tr, mode, declared) {
         }
         ifs[IF_THEN][BLK_STMTS] = catch_body(pos, handler, temps, errsym, needv);
     } else {
-        vec_push(ifs[IF_THEN][BLK_STMTS], fault_return(pos, ifs[IF_THEN][BLK_STMTS], sym_ref_node(pos, errsym)));
+        let fx = sym_ref_node(pos, errsym);
+        if wrapmsg {
+            // The message is evaluated only on the fault path.
+            let mt = chk(wrapmsg, ty_string);
+            if kind_of(mt) != K_STRING {
+                err_type(wrapmsg[N_POS], "wrap needs a str message, not ", mt, "");
+            }
+            fx = rt_call(pos, "rt_fault_wrap", args2(fx, wrapmsg), ty_error);
+        }
+        vec_push(ifs[IF_THEN][BLK_STMTS], fault_return(pos, ifs[IF_THEN][BLK_STMTS], fx));
     }
     vec_push(stmts, ifs);
     if mode == 5 {
@@ -3749,6 +3779,8 @@ fn lower_switch(s) {
             return;
         }
     }
+    // switch err { case ErrX: } compares each case with fault.Is (design_semantics section 2).
+    let faultsw = s[SW_TAG] && !ck_legacy && kind_of(chk(s[SW_TAG], 0)) == K_ERROR;
     let out = empty_block(pos);
     if s[SW_INIT] {
         vec_push(out[BLK_STMTS], s[SW_INIT]);
@@ -3789,6 +3821,10 @@ fn lower_switch(s) {
                     let id = node_new(EX_IDENT, pos);
                     id[ID_NAME] = "$sw";
                     e = binary_new(e[N_POS], "==", id, e);
+                    if faultsw {
+                        e[BIN_OP] = "$is";
+                        id[N_POS] = e[BIN_R][N_POS];
+                    }
                 }
                 if cond {
                     cond = binary_new(e[N_POS], "||", cond, e);
@@ -4601,7 +4637,10 @@ fn keep_fn(t) {
     let ret = node_new(ST_RETURN, pos);
     if k == K_DYN {
         ret[RET_VALUE] = mk_conv(pos, sym_ref_node(pos, x), CV_DYN_KEEP, t);
-    } else if k == K_STRING || k == K_ERROR {
+    } else if k == K_ERROR {
+        // A fault record with its chain (cause, joined faults, trace), identities kept.
+        ret[RET_VALUE] = rt_call(pos, "rt_keep_fault", args1(sym_ref_node(pos, x)), t);
+    } else if k == K_STRING {
         ret[RET_VALUE] = rt_call(pos, "rt_keep_str", args1(sym_ref_node(pos, x)), t);
     } else if k == K_FUNC {
         // A closure: its descriptor and captured variables, deep (rt_keep_closure, #170).

@@ -223,11 +223,11 @@ func os_msg(what str, e i64) str {
 	return "websocket: {what}: {rt_str_from_raw(m, strlen(m))}"
 }
 
-func wait_fail(r i64) str {
+func wait_fail(r i64) ! {
 	if r == waitDeadline {
-		return rt_wait_msg()
+		fail cast(fault, rt_wait_fault())
 	}
-	return "websocket: timed out"
+	fail "websocket: timed out"
 }
 
 func (c Conn) write_raw(p i64, n i64) ! {
@@ -600,12 +600,12 @@ func (c Conn) Each(h func(Conn, Message) !) ! {
 			err = h(c, m)
 		}
 		if err != nil {
-			// The fault belongs to the message pool too: copy it across the scope boundary.
-			msg := rt_heap_str(say.Str(err))
+			// The fault belongs to the message pool too: copy it, with its chain, across the scope boundary.
+			held := rt_fault_copy(cast(i64, err), true)
 			rt_pool_leave(scope)
-			out := rt_str_from_raw(msg+8, msg[0])
-			free(msg)
-			fail out
+			out := rt_fault_copy(held, false)
+			rt_fault_free(held)
+			fail cast(fault, out)
 		}
 		rt_pool_scope_reset(scope)
 	}

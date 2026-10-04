@@ -544,6 +544,15 @@ fn chk_binary(e, want) {
     let l = e[BIN_L];
     let r = e[BIN_R];
     let pos = e[N_POS];
+    if streq(op, "$is") {
+        // A case of switch err { ... }: fault.Is, walking the chain and comparing identity.
+        let ft = unify(l, r, ty_error);
+        if kind_of(ft) == K_ERROR {
+            replace_node(e, rt_call(pos, "rt_fault_is", args2(l, r), ty_bool));
+            e[N_TYPE] = 0;
+        }
+        return ty_bool;
+    }
     if streq(op, "&&") || streq(op, "||") {
         let a = chk(l, ty_bool);
         // x != nil && x.f: the right side sees x narrowed.
@@ -2714,6 +2723,25 @@ fn chk_builtin(e, name, want) {
             err_type(pos, "fail needs a str message, not ", ft, "");
         }
         replace_node(e, rt_call(pos, "rt_fail", args1(arg0(e)), ty_error));
+        e[N_TYPE] = 0;
+        return ty_error;
+    }
+    if streq(name, "fault") && !ck_legacy {
+        // var ErrX = fault("msg") declares a sentinel: one identity per declaration (fault.Is).
+        if n != 1 {
+            err_at(pos, "fault needs a message: var ErrX = fault(\"...\")");
+            return ty_error;
+        }
+        if ck_sentinel != e {
+            err_at(pos, "fault(\"...\") declares a sentinel: write it at package level as var ErrX = fault(\"msg\"), or use fail(\"msg\") for a one-off fault");
+            return ty_error;
+        }
+        let st = chk(arg0(e), ty_string);
+        if kind_of(st) != K_STRING {
+            err_type(pos, "fault needs a str message, not ", st, "");
+        }
+        sentinel_seq = sentinel_seq + 1;
+        replace_node(e, rt_call(pos, "rt_fault_sentinel", args2(arg0(e), mk_int(pos, 63 + sentinel_seq, ty_int)), ty_error));
         e[N_TYPE] = 0;
         return ty_error;
     }
