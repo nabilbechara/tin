@@ -1,0 +1,76 @@
+package replayprobe
+
+import "fault"
+import "say"
+
+// Copied into a temporary lib/replayprobe by replay_check.py: drives the runtime's replay tape
+// (lib/runtime/replay.tin, notes/interface_replay.md) directly, before anvil and the clients use it.
+
+var ran i64
+var value str
+
+// liveBody is an effect body that counts its runs and gives value.
+func liveBody() !str {
+	ran++
+	return value
+}
+
+// timedOut is an effect body that fails with a deadline wrapped in its own message.
+func timedOut() !str {
+	ran++
+	try fault.Wrap(fault.DeadlineExceeded, "redis GET")
+	return ""
+}
+
+// records is a replaying tape that serves the records of tape tp.
+func records(tp i64) i64 {
+	rp := rt_tape_new(2)
+	rt_tape_load(rp, tp[1], tp[2])
+	return rp
+}
+
+func Run() {
+	tp := rt_tape_new(1)
+	value = "one"
+	a, err := rt_effect(tp, "test@1", "first", liveBody)
+	say.Line("record first:", a, err == nil, "ran", ran)
+	_, err = rt_effect(tp, "redis@1", "GET k", timedOut)
+	say.Line("record fault:", fault.Message(err), fault.Is(err, fault.DeadlineExceeded), "ran", ran)
+	say.Line("record word:", rt_effect_word(tp, "clock@1", "", 42))
+	say.Line("record bytes:", rt_effect_bytes(tp, "dice@1", "seed", "abc"))
+
+	ran = 0
+	rp := records(tp)
+	value = "other"
+	a, err = rt_effect(rp, "test@1", "first", liveBody)
+	say.Line("replay first:", a, err == nil)
+	value = "other"
+	_, err = rt_effect(rp, "redis@1", "GET k", liveBody)
+	say.Line("replay fault:", fault.Message(err), fault.Is(err, fault.DeadlineExceeded))
+	say.Line("replay word:", rt_effect_word(rp, "clock@1", "", 7))
+	say.Line("replay bytes:", rt_effect_bytes(rp, "dice@1", "seed", "xyz"))
+	say.Line("bodies run while replaying:", ran, "left:", rt_tape_left(rp), "diverged:", rt_tape_diverged(rp) != "")
+	value = "x"
+	_, err = rt_effect(rp, "test@1", "third", liveBody)
+	say.Line("past the end:", fault.Message(err))
+	value = "x"
+	_, err = rt_effect(rp, "test@1", "first", liveBody)
+	say.Line("sticky:", fault.Message(err) == rt_tape_diverged(rp), "ran", ran)
+
+	rq := records(tp)
+	value = "x"
+	_, err = rt_effect(rq, "test@1", "other", liveBody)
+	say.Line("mismatch:", fault.Message(err))
+
+	rl := records(tp)
+	rt_tape_live(rl, ",test,")
+	value = "fresh"
+	a, err = rt_effect(rl, "test@1", "first", liveBody)
+	say.Line("live kind:", a, "ran", ran)
+
+	say.Line("secret handle unkeyed:", rt_secret_key("hunter2"))
+	rt_tape_free(tp)
+	rt_tape_free(rp)
+	rt_tape_free(rq)
+	rt_tape_free(rl)
+}
