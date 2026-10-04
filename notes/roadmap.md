@@ -11,7 +11,21 @@
 linux-arm64 and linux-amd64 pass every suite and self-host; CI runs all three targets
 natively. All review issues (#1–#21, #43, #44) are fixed.
 
-## v0.5: syntax (notes/syntax_v05.md; phases 2–8 of #46)
+## Next milestone: Tin 1 (decided 2026-10-04)
+The server language of the design brief: one semantic model (notes/design_semantics.md) and a
+new syntax that replaces v0.5's Go syntax (notes/design_syntax.md). Order:
+1. Edition-1 parser, the `tin fix -edition 1` translator, one commit converting the repository,
+   the old parser removed; LANGUAGE.md, AGENT_PRIMER.md, README and examples rewritten
+   (design_syntax §12, §14; about 4 PRs).
+2. The semantic steps of design_semantics §16, in the new syntax (about 30 PRs): fault chains,
+   unwinding and `guard`, boundary records and cancellation, `scope`/`parallel`/`select`/`detach`,
+   `within`, safepoints, `limit`, long-lived reclamation (#176), `arena`/`once`, `with`, `use`/`on`
+   and the lifecycle, `secret`, bounded values, production replay, diagnostic codes.
+3. `selfhost/` moved to the new syntax.
+These supersede the overlapping parts of design_foundations.md (design_semantics §14) and the
+"Foundations" checklist below where they differ.
+
+## v0.5: syntax (notes/syntax_v05.md, superseded by notes/design_syntax.md; phases 2–8 of #46)
 Go syntax kept; adds `!T`/`fail`/`catch`, call-site `mut`, `for i := range n`, the
 capitalized-export rule, string interpolation, enums with exhaustive `switch`, more map key
 types with insertion order, `f32`, and Go-style `*_test.tin` tests.
