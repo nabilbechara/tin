@@ -409,6 +409,7 @@ func dns_lookup(name str, kind i64, config dnsConfig, start i64, limit i64) !dns
         if err != nil { return dnsAnswer{code:2,address:dnsAddress{}} }
         answer := dnsAnswer{code:2,address:dnsAddress{}}
         done := false
+        answered := false
         for attempt := 0; attempt < config.attempts && !done; attempt++ {
             for index := 0; index < len(config.servers); index++ {
                 until := rt_mono_ns()+config.timeout
@@ -419,12 +420,15 @@ func dns_lookup(name str, kind i64, config dnsConfig, start i64, limit i64) !dns
                     if limit > 0 && rt_mono_ns() >= limit { fail "wire: resolve timed out" }
                     continue
                 }
+                answered=true
                 if candidate.code == 2 || candidate.code == 4 { continue }
                 answer=candidate
                 done=true
                 break
             }
         }
+        // Code 5: no server replied at all; glibc ends the search there instead of trying other names.
+        if !done && !answered { return dnsAnswer{code:5,address:dnsAddress{}} }
         if answer.alias == "" { return answer }
         if fold_eq(answer.alias,current) { return dnsAnswer{code:2,address:dnsAddress{}} }
         current=answer.alias
@@ -458,6 +462,7 @@ func resolve(host str, port i64, sa i64, until i64) ! {
         for _, kind := range []i64{1,28} {
             answer := try dns_lookup(candidate,kind,config,start,limit)
             if answer.address.family != 0 { dns_sockaddr(sa,answer.address,port); return }
+            if answer.code == 5 { fail say.Fault("wire: cannot resolve %q: no DNS server answered",host) }
             if answer.code == 3 { break }
         }
     }

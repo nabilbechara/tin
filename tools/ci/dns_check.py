@@ -215,6 +215,10 @@ def main():
                     mark=len(dns.log)
                     assert lookup('dots.name')==v4
                     assert dns.log[mark][1]=='dots.name'
+                    # A timeout ends the search like glibc: no AAAA, no other search names.
+                    mark=len(dns.log)
+                    assert lookup('drop')==(502,b'wire: cannot resolve "drop": no DNS server answered')
+                    assert [x[1:3] for x in dns.log[mark:]]==[('drop.first.test',1)],dns.log[mark:]
                     config('ndots:3')
                     mark=len(dns.log)
                     assert lookup('many.dots.name')==v4
