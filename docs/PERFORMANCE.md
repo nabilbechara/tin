@@ -188,6 +188,27 @@ The benchmark harness checks output on every timed run. The full CPU suite staye
 the 5% review threshold. HTTP throughput was 2.6% above base for `/json` and 2.2% below
 base for `/plaintext`; arm64 is unchanged by this x64-only lowering.
 
+### Cached slice-length bounds checks (native Linux)
+
+The checker proves indexed accesses safe in counter loops bounded by a stable local
+length alias. It invalidates the proof when the slice or cached length is rebound, a
+mutating call can change the header, or an escaping callback can change a captured slice.
+The paired benchmarks produced identical output on every run.
+
+Measurements use the shared GitHub runners (Intel Xeon Platinum 8573C and Neoverse-N2,
+4 CPUs each, Go 1.26.8), with seven alternating runs per revision:
+
+| arch | benchmark | base Tin ms | head Tin ms | Go ms | head/base | head Tin/Go |
+|---|---|---:|---:|---:|---:|---:|
+| amd64 | `indexsum` | 37.04 | 36.50 | 37.8 | 0.986 | 0.966 |
+| arm64 | `indexsum` | 40.11 | 38.61 | 59.0 | 0.963 | 0.654 |
+| amd64 | `nbody` | 4443.14 | 4366.67 | 4444.3 | 0.983 | 0.983 |
+| arm64 | `nbody` | 3701.77 | 3571.38 | 3457.4 | 0.965 | 1.033 |
+
+All other CPU cases and both HTTP routes stayed within the 5% review threshold on both
+architectures. HTTP head/base throughput ratios were 1.011 (`/json`) and 1.001
+(`/plaintext`) on amd64, and 0.987 and 0.969 on arm64.
+
 ## 3. Where Go still wins, and why
 
 From `notes/bench_v2.md`, which has the assembly analysis:
@@ -196,8 +217,8 @@ From `notes/bench_v2.md`, which has the assembly analysis:
     loop variables live in stack slots;
   - stores through one struct invalidate loads of another (no alias analysis), so
     fields are reloaded;
-  - a few bounds checks the prover cannot remove (`j < n` where `n == len(s)` is only
-    known through a separate variable).
+  - bounds checks that require range or alias facts beyond a stable local length alias,
+    such as masked or modular indexes.
 - **string building:** single-byte string appends now have a direct byte path (see
   [Single-byte string appends](#single-byte-string-appends)); signed `/10` and `%10` use
   multiply-high on x64, while the arm64 backend and other divisors still use hardware
@@ -206,9 +227,9 @@ From `notes/bench_v2.md`, which has the assembly analysis:
   loops.
 
 Planned codegen work in order of payoff: a register allocator with loop-depth spill
-weights, length-fact bounds-check elimination, generalized division by constants via
-multiply-high, hoisting constant materialization, and alias information for struct
-fields.
+weights, range analysis for masked and modular indexes, generalized division by
+constants via multiply-high, hoisting constant materialization, and alias information
+for struct fields.
 
 ## 3b. Math functions (gauge)
 
