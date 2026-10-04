@@ -36,6 +36,411 @@ prints for it, and the fixes. `tools/ci/diagnostics_check.py` compiles every exa
 requires that output, and checks that the compiler, this page and the tests' expected
 diagnostics agree on every code and name.
 
+## E0xx Files, tokens and syntax
+
+### E001 PACKAGE_CLAUSE
+
+An edition 1 file starts with exactly one package declaration: `package main` for a
+program, `package NAME` for a library.
+
+```tin edition=1
+fn main() {
+}
+```
+
+```text
+example.tin:1:1: error E001 PACKAGE_CLAUSE: edition 1 files start with a package declaration
+```
+
+Fix: start the file with `package main` (or the package's name), and keep only one.
+
+### E002 IMPORT_ORDER
+
+Imports come right after the package declaration, before any other declaration.
+
+```tin edition=1
+package main
+
+fn helper() {
+}
+
+import "say"
+
+fn main() {
+	say.Line("hi")
+}
+```
+
+```text
+example.tin:6:1: error E002 IMPORT_ORDER: imports must precede declarations
+```
+
+Fix: move the import up, under the package declaration.
+
+### E020 UNEXPECTED
+
+The parser found a token where the grammar needs something else. The message names what
+was expected and what was found (`found newline` when a line ended early).
+
+```tin
+package main
+
+import "say"
+
+func main() {
+	say.Line("total" 3)
+}
+```
+
+```text
+example.tin:6:19: error E020 UNEXPECTED: expected ')', found a number
+```
+
+Fix: add or remove what the message names. The cause is often just before the position: a
+missing comma, operator, parenthesis or brace.
+
+### E021 CONST_VALUES
+
+A constant declaration gives every name a value: one value per name.
+
+```tin
+package main
+
+const width, height = 640
+
+func main() {
+}
+```
+
+```text
+example.tin:3:7: error E021 CONST_VALUES: constant declaration count mismatch
+```
+
+Fix: give one value per name (`const width, height = 640, 480`), or declare each constant on its
+own.
+
+### E030 INTERPOLATION
+
+In a string, `{` starts a value that ends at the matching `}`, and one `{...}` holds one
+value (with an optional format spec, `{price:.2}`). A literal brace is written `{{` or `}}`.
+
+```tin
+package main
+
+import "say"
+
+func main() {
+	let n = 3
+	say.Line("total: {n")
+}
+```
+
+```text
+example.tin:7:11: error E030 INTERPOLATION: a { in a string starts a value: close it with }, or write {{ for a brace
+```
+
+Fix: close the value with `}`, double a literal brace (`{{`, `}}`), or use a raw backquote string,
+which does not interpolate.
+
+### E040 ATTRIBUTE_PLACEMENT
+
+An attribute before a declaration (`@nopoll`) applies to a function, so it is followed by
+`fn`.
+
+```tin edition=1
+package main
+
+@nopoll
+let limit = 10
+
+fn main() {
+}
+```
+
+```text
+example.tin:4:1: error E040 ATTRIBUTE_PLACEMENT: attributes here must precede a function, found newline
+```
+
+Fix: put the attribute on the function it is meant for, or remove it.
+
+### E041 UNKNOWN_ATTRIBUTE
+
+A struct field takes only the attributes the language defines: `@json("name")`.
+
+```tin
+package main
+
+type User struct {
+	ID i64 @jsonn("id")
+}
+
+func main() {
+}
+```
+
+```text
+example.tin:3:11: error E041 UNKNOWN_ATTRIBUTE: unknown struct attribute; supported attributes are @json("name")
+```
+
+Fix: correct the spelling (`@json("id")`), or remove the attribute.
+
+### E042 ATTRIBUTE_ARGS
+
+`@json` takes one string literal: the field's name in JSON.
+
+```tin
+package main
+
+type User struct {
+	ID i64 @json(1)
+}
+
+func main() {
+}
+```
+
+```text
+example.tin:3:11: error E042 ATTRIBUTE_ARGS: @json expects one string field name
+```
+
+Fix: write the name as a string: `@json("id")`.
+
+### E043 EMPTY_TUPLE
+
+A tuple type lists at least one element type.
+
+```tin edition=1
+package main
+
+type Empty = ()
+
+fn main() {
+}
+```
+
+```text
+example.tin:3:14: error E043 EMPTY_TUPLE: a tuple type needs at least one element type
+```
+
+Fix: list the element types (`(i64, str)`), or leave the result out when there is none.
+
+### E044 ENUM_FIELD_TYPES
+
+Every field of an enum variant has a type. Names that share a type are listed before it:
+`Rect(w, h f64)`.
+
+```tin
+package main
+
+type Shape enum { Rect(w, h,), Empty }
+
+func main() {
+}
+```
+
+```text
+example.tin:3:12: error E044 ENUM_FIELD_TYPES: an enum variant's fields need types: Variant(name Type, ...)
+```
+
+Fix: give the last field names their type: `Rect(w, h f64)`.
+
+### E045 EMPTY_ENUM
+
+An enum declares at least one variant.
+
+```tin
+package main
+
+type Shape enum { }
+
+func main() {
+}
+```
+
+```text
+example.tin:3:12: error E045 EMPTY_ENUM: an enum needs at least one variant
+```
+
+Fix: list the variants (`type Shape enum { Circle(r f64), Empty }`), or use a struct.
+
+### E050 LABEL_PLACEMENT
+
+A label names a loop for `break` and `continue`, so it goes right before `for`.
+
+```tin edition=1
+package main
+
+fn main() {
+	let n = 1
+	outer: if n > 0 {
+	}
+}
+```
+
+```text
+example.tin:5:9: error E050 LABEL_PLACEMENT: a label must precede a loop, found 'if'
+```
+
+Fix: put the label on the loop it names, or remove it.
+
+### E051 EMPTY_SELECT
+
+A `select` waits for the first of its arms, so it needs at least one.
+
+```tin edition=1
+package main
+
+fn main() {
+	select {
+	}
+}
+```
+
+```text
+example.tin:4:2: error E051 EMPTY_SELECT: select needs at least one arm
+```
+
+Fix: add the arms to wait on, or remove the `select`.
+
+### E052 RANGE_LOOP
+
+A loop over an integer range binds one name (`for i in 0..n`); a stepped range binds one
+name and takes one step (`for i in (0..n).step(2)`).
+
+```tin edition=1
+package main
+
+import "say"
+
+fn main() {
+	for i, j in 0..3 {
+		say.Line(i, j)
+	}
+}
+```
+
+```text
+example.tin:6:2: error E052 RANGE_LOOP: an integer range loop has one binding
+```
+
+Fix: bind one name. To number the elements of a slice, range over the slice: `for i, x in xs`.
+
+### E053 EMPTY_MATCH
+
+A `match` needs at least one arm.
+
+```tin edition=1
+package main
+
+fn name(n i64) str {
+	return match n {
+	}
+}
+
+fn main() {
+}
+```
+
+```text
+example.tin:4:9: error E053 EMPTY_MATCH: match needs at least one arm
+```
+
+Fix: add the arms, ending with `_ => ...` when the arms do not cover every value.
+
+### E054 PATTERN
+
+A `match` arm's pattern is a literal, a range with literal endpoints (`1..10`), an enum
+variant with its bindings (`Circle(r)`), a name that binds the value, or `_`.
+
+```tin edition=1
+package main
+
+fn size(n i64) str {
+	let low = 0
+	return match n {
+		low..10 => "small"
+		_ => "large"
+	}
+}
+
+fn main() {
+}
+```
+
+```text
+example.tin:6:3: error E054 PATTERN: range patterns need literal endpoints
+```
+
+Fix: use literal endpoints, or bind the value and test it in a guard.
+
+### E055 DEFER_CALL
+
+`defer` takes a function call, which runs when the function returns.
+
+```tin
+package main
+
+func main() {
+	let n = 1
+	defer n
+}
+```
+
+```text
+example.tin:5:2: error E055 DEFER_CALL: expected a function call
+```
+
+Fix: defer a call (`defer f.Close()`); wrap anything else in a function and defer a call to it.
+
+### E090 OLD_SYNTAX
+
+Edition 1 replaces some edition 0 syntax; the message names the replacement:
+
+| edition 0 | edition 1 |
+|---|---|
+| `func` | `fn` (also for function types) |
+| `var`, `:=`, local `const` | `let` (or `mut` when it is assigned again) |
+| `x++`, `x--` | `x += 1`, `x -= 1` |
+| `while`, C-style `for` | `for cond { }`, `for i in 0..n { }` |
+| `switch` | `match` |
+| `go` | `scope` or `detach` |
+| `extern`, pointer types, channel types | none in user code |
+| positional struct literals `P{1, 2}` | `P{x: 1, y: 2}` |
+| `/* */` comments, `;` between statements | `//` comments, one statement per line |
+
+```tin edition=1
+package main
+
+func main() {
+}
+```
+
+```text
+example.tin:3:1: error E090 OLD_SYNTAX: edition 1 uses 'fn', not 'func'
+```
+
+Fix: write the edition 1 form the message names.
+
+### E091 ONE_PER_DECLARATION
+
+Edition 1 declares one name per declaration: one constant, global, type or import path
+each, and no grouped `( ... )` declarations.
+
+```tin edition=1
+package main
+
+let width, height = 640, 480
+
+fn main() {
+}
+```
+
+```text
+example.tin:3:5: error E091 ONE_PER_DECLARATION: edition 1 declares one name per declaration
+```
+
+Fix: split the declaration: `let width = 640` and `let height = 480` on their own lines.
+
 ## E1xx Names and declarations
 
 ### E101 REDECLARED
@@ -88,6 +493,30 @@ example.tin:11:6: error E210 ARG_COUNT: Max expects 2 arguments, got 3
 
 Fix: pass one argument per parameter; to take any number of values, declare the last
 parameter variadic (`xs ...T`) or pass a slice.
+
+## E4xx Faults and optionals
+
+### E401 CATCH_PLACEMENT
+
+`catch` handles the fault of a whole statement, initializer, assignment or return value,
+not of a call in the middle of an expression.
+
+```tin
+package main
+
+import "mint"
+import "say"
+
+func main() {
+	say.Line(1 + (mint.Atoi("2") catch _ { 0 }))
+}
+```
+
+```text
+example.tin:7:31: error E401 CATCH_PLACEMENT: catch goes on a whole statement, initializer, assignment or return value, not inside an expression
+```
+
+Fix: give the call its own statement (`let n = mint.Atoi("2") catch _ { 0 }`) and use the result.
 
 ## E5xx Generics, shapes and dyn
 
@@ -217,6 +646,33 @@ example.tin:11:13: error E505 NOT_A_TYPE_ARG: expected a type argument
 ```
 
 Fix: put a type in the brackets (`Zero[i64]()`), and pass values in the parentheses.
+
+### E506 RECEIVER_TYPE_PARAMS
+
+A method of a generic type names the type's parameters in its receiver, one plain name each:
+`func (s mut Stack[T]) Push(x T)`. A method cannot be specialized for one type argument.
+
+```tin
+package main
+
+import "constraints"
+
+type Stack[T constraints.Any] struct {
+	items []T
+}
+
+func (s mut Stack[[]T]) Push(x T) {
+}
+
+func main() {
+}
+```
+
+```text
+example.tin:9:1: error E506 RECEIVER_TYPE_PARAMS: a method's receiver lists its type's parameters by name, like (s Stack[T])
+```
+
+Fix: write the parameters by name (`Stack[T]`), or make the method a generic function.
 
 ### E510 NOT_IN_UNION
 
@@ -360,6 +816,29 @@ example.tin:17:6: error E514 DYN_WIDENING: a dyn value satisfies its own shape o
 ```
 
 Fix: pass the concrete value, or convert the concrete value to the `dyn` shape you need.
+
+### E515 DYN_PARAM_NAME
+
+A parameter has a name and a type, also when the type is `dyn S`.
+
+```tin
+package main
+
+import "io"
+
+func Send(dyn io.Writer) i64 {
+	return 0
+}
+
+func main() {
+}
+```
+
+```text
+example.tin:5:11: error E515 DYN_PARAM_NAME: a parameter of type dyn S needs a name: write w dyn S
+```
+
+Fix: name the parameter: `func Send(w dyn io.Writer)`.
 
 ### E520 DYN_CONSTRAINT
 
