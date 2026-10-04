@@ -1,4 +1,4 @@
-"""Generated crypto code matches its generators: the AES S-box circuit and the AES/GHASH leaves."""
+"""Generated crypto code matches its generators: the AES S-box circuit, the AES/GHASH leaves and the 2^255-19 field."""
 import platform
 import shutil
 import subprocess
@@ -13,6 +13,10 @@ class GeneratedCrypto(unittest.TestCase):
     def test_aes_sbox(self):
         got = subprocess.run([sys.executable, str(ROOT/'tools/gen_aes_sbox.py')], capture_output=True, check=True).stdout
         self.assertEqual(got, (ROOT/'lib/seal/aes_sbox.tin').read_bytes(), 'run tools/gen_aes_sbox.py > lib/seal/aes_sbox.tin')
+
+    def test_fe25519(self):
+        got = subprocess.run([sys.executable, str(ROOT/'tools/gen_fe25519.py')], capture_output=True, check=True).stdout
+        self.assertEqual(got, (ROOT/'lib/seal/fe25519.tin').read_bytes(), 'run tools/gen_fe25519.py > lib/seal/fe25519.tin')
 
     @unittest.skipUnless(shutil.which('clang') and platform.system() == 'Linux', 'needs clang on Linux')
     def test_aes_hw(self):
