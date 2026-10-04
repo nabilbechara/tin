@@ -3,6 +3,7 @@
 
 Private probes are appended to a temporary copy of lib/tide, never to the production API.
 The drain phase checks that the end of the grace period cancels waiting requests.
+The budget phases check TIN_REQUEST_MEMORY and a limit block inside a handler (#235).
 Every client points at a server that accepts connections and never answers, so each request
 parks in its client until /cancel/{i} cancels the boundary that request marked.
 """
@@ -163,6 +164,42 @@ def budget(exe):
     print('request budget: requests past TIN_REQUEST_MEMORY get 500; others are served')
 
 
+def handler_limit(out):
+    # A limit block in a handler (#235): past its memory budget it fails with fault.LimitExceeded,
+    # the handler answers with that fault, and the server goes on serving.
+    exe = out / 'limits'
+    subprocess.run([str(ROOT / 'bin/tinc'), '-edition', '1', '-o', str(exe), 'tools/ci/fixtures/limits.tin'],
+                   cwd=ROOT, env=dict(os.environ, TIN_ROOT=str(ROOT)), check=True)
+    port = ws.free_port()
+    server = subprocess.Popen([str(exe)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                              env=dict(os.environ, PORT=str(port), TIN_CORES='1'))
+    limited = (200, b'limited: limit exceeded true')
+    try:
+        eventually(lambda: server_ready(port, server))
+        got = [response(request(port, p)) for p in ('/limited', '/plain', '/fits', '/limited', '/plain')]
+        assert got == [limited, (200, b'plain ok'), (200, b'fits 2000000'), limited, (200, b'plain ok')], got
+        # Eighteen limit blocks wait on one core at once, then each passes its own budget.
+        results = []
+        def one(path):
+            results.append((path, response(request(port, path, timeout=10))))
+        threads = [threading.Thread(target=one, args=('/limited' if i % 4 else '/plain',)) for i in range(24)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        for path, got in results:
+            assert got == (limited if path == '/limited' else (200, b'plain ok')), (path, got)
+        assert len(results) == 24, results
+        assert server.poll() is None, 'server exited'
+    finally:
+        server.terminate()
+        server.wait(timeout=5)
+    err = server.stderr.read().decode(errors='replace')
+    assert 'panic' not in err, err[-1000:]
+    print('handler limit: a limit block past its budget gives fault.LimitExceeded to its handler; '
+          'the server keeps serving')
+
+
 def main():
     out = ROOT / 'bin/ci/cancel'
     out.mkdir(parents=True, exist_ok=True)
@@ -189,6 +226,7 @@ def main():
                 checks(port, str(fifo))
                 assert server.poll() is None, 'server exited'
                 budget(exe)
+                handler_limit(directory)
                 drain(port, server)
             finally:
                 server.terminate()
