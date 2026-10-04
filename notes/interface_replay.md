@@ -35,7 +35,7 @@ charged to a `limit`), owned by the request.
 
 | task word | meaning |
 |---|---|
-| `tTape = 55` | the task's tape, 0: none. `taskWords` becomes 56. |
+| `tTape = 56` | the task's tape, 0: none. `taskWords` becomes 57 (word 55 is `tScopeWait`, #232). |
 
 - anvil sets `tTape` on a request task before it first runs, when recording or replaying.
 - `s.spawn`, `parallel` (scope children, `bkTask` under a scope of a taped task) copy the
