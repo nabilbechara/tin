@@ -88,6 +88,7 @@ fn region_check() {
         }
         i = i + 1;
     }
+    with_body_check();
 }
 
 fn rg_sum_new() {
@@ -1305,4 +1306,194 @@ fn str_prefix(s, p) {
         i = i + 1;
     }
     return 1;
+}
+
+// ---- the body of a with policy (#237, notes/interface_policy.md §3) ----
+//
+// A with block's closure lives on its caller's frame, so the Run of its policy may only call
+// body, or pass it to a parameter that obeys the same rule (checked here, recursively). Any
+// other use in Run is reported there; a function Run passes body to is only judged.
+
+var wb_memo; // [function, parameter, state]: 1 checking or fine, 2 may keep it
+var wb_fn;   // the function being walked
+var wb_sym;  // its parameter
+var wb_bad;  // the parameter may be kept
+var wb_say;  // report each bad use (the Run of a with), or only judge
+
+fn with_body_check() {
+    if !with_runs {
+        return;
+    }
+    wb_memo = vec_new();
+    let i = 0;
+    while i < with_runs[VEC_LEN] {
+        wb_param_ok(vec_get(with_runs, i), 1, 1);
+        i = i + 2;
+    }
+}
+
+// wb_param_ok reports whether parameter i of f is only called or passed on to such parameters.
+fn wb_param_ok(f, i, say) {
+    let j = 0;
+    while j < wb_memo[VEC_LEN] {
+        if vec_get(wb_memo, j) == f && vec_get(wb_memo, j + 1) == i {
+            return vec_get(wb_memo, j + 2) == 1;
+        }
+        j = j + 3;
+    }
+    if !f || f[F_EXTERN] || !f[F_BODY] || !f[F_LOCALS] || i >= f[F_PARAMS][VEC_LEN] {
+        return 0;
+    }
+    vec_push(wb_memo, f);
+    vec_push(wb_memo, i);
+    let at = wb_memo[VEC_LEN];
+    vec_push(wb_memo, 1);
+    let saved_fn = wb_fn;
+    let saved_sym = wb_sym;
+    let saved_bad = wb_bad;
+    let saved_say = wb_say;
+    wb_fn = f;
+    wb_sym = vec_get(f[F_LOCALS], i);
+    wb_bad = 0;
+    wb_say = say;
+    wb_stmts(f[F_BODY][BLK_STMTS]);
+    let ok = !wb_bad;
+    if !ok {
+        wb_memo[VEC_DATA][at] = 2;
+    }
+    wb_fn = saved_fn;
+    wb_sym = saved_sym;
+    wb_bad = saved_bad;
+    wb_say = saved_say;
+    return ok;
+}
+
+// wb_keeps notes a use of the parameter other than a call; via names the function it was
+// passed to, or is 0.
+fn wb_keeps(pos, via) {
+    if wb_say && !wb_bad {
+        let m = err_begin(pos);
+        buf_str(m, wb_fn[F_QNAME]);
+        if via {
+            buf_str(m, " passes the body of a with block to ");
+            buf_str(m, via[F_QNAME]);
+            buf_str(m, ", which may keep it");
+        } else {
+            buf_str(m, " keeps the body of a with block");
+        }
+        buf_str(m, ": a policy may only call body, or pass it to a function that only calls it (the block's variables live on the caller's frame)");
+        err_end(m);
+    }
+    wb_bad = 1;
+}
+
+fn wb_stmts(v) {
+    let i = 0;
+    while i < v[VEC_LEN] {
+        wb_stmt(vec_get(v, i));
+        i = i + 1;
+    }
+}
+
+fn wb_stmt(s) {
+    let k = s[N_KIND];
+    if k == ST_BLOCK {
+        wb_stmts(s[BLK_STMTS]);
+    } else if k == ST_LET {
+        wb_expr(s[LET_INIT]);
+    } else if k == ST_ASSIGN {
+        if s[AS_TARGET][N_KIND] != EX_IDENT {
+            wb_expr(s[AS_TARGET]);
+        }
+        wb_expr(s[AS_VALUE]);
+    } else if k == ST_EXPR {
+        wb_expr(s[ES_X]);
+    } else if k == ST_IF {
+        wb_expr(s[IF_COND]);
+        wb_stmts(s[IF_THEN][BLK_STMTS]);
+        if s[IF_ELSE] {
+            wb_stmt(s[IF_ELSE]);
+        }
+    } else if k == ST_WHILE {
+        wb_expr(s[WH_COND]);
+        wb_stmts(s[WH_BODY][BLK_STMTS]);
+        if s[WH_POST] {
+            wb_stmt(s[WH_POST]);
+        }
+    } else if k == ST_RETURN {
+        wb_expr(s[RET_VALUE]);
+        if s[RET_VALUES] {
+            wb_exprs(s[RET_VALUES]);
+        }
+    } else if k == ST_CALLMULTI {
+        wb_expr(s[CM_CALL]);
+    }
+}
+
+fn wb_exprs(v) {
+    let i = 0;
+    while i < v[VEC_LEN] {
+        wb_expr(vec_get(v, i));
+        i = i + 1;
+    }
+}
+
+fn wb_is_param(e) {
+    return e && e[N_KIND] == EX_IDENT && e[ID_REF] == wb_sym;
+}
+
+fn wb_expr(e) {
+    if !e {
+        return;
+    }
+    let k = e[N_KIND];
+    if k == EX_IDENT {
+        if e[ID_REF] == wb_sym {
+            wb_keeps(e[N_POS], 0);
+        }
+    } else if k == EX_UNARY {
+        wb_expr(e[UN_X]);
+    } else if k == EX_BINARY {
+        wb_expr(e[BIN_L]);
+        wb_expr(e[BIN_R]);
+    } else if k == EX_CONV {
+        wb_expr(e[CV_X]);
+    } else if k == EX_MEM {
+        wb_expr(e[MEM_BASE]);
+        wb_expr(e[MEM_INDEX]);
+        wb_expr(e[MEM_LEN]);
+    } else if k == EX_ELEM {
+        wb_expr(e[ELEM_SEQ]);
+        wb_expr(e[ELEM_IDX]);
+    } else if k == EX_SEQ {
+        wb_stmts(e[SEQ_STMTS]);
+        wb_expr(e[SEQ_VALUE]);
+    } else if k == EX_INDEX {
+        wb_expr(e[IX_X]);
+        wb_expr(e[IX_I]);
+    } else if k == EX_CALL {
+        let callee = e[CALL_CALLEE];
+        if !wb_is_param(callee) {
+            wb_expr(callee);
+        }
+        let args = e[CALL_ARGS];
+        let i = 0;
+        while i < args[VEC_LEN] {
+            let a = vec_get(args, i);
+            if wb_is_param(a) {
+                let g = e[CALL_FN];
+                if !g || callee || e[CALL_INTRINSIC] {
+                    wb_keeps(a[N_POS], 0);
+                } else if !wb_param_ok(g, i, 0) && vec_get(file_trusted, g[F_FILE]) && load8(vec_get(file_pkgs, g[F_FILE])) == 0 {
+                    // A runtime helper (append, a store): the use itself keeps it.
+                    wb_keeps(a[N_POS], 0);
+                } else if !wb_param_ok(g, i, 0) {
+                    wb_keeps(a[N_POS], g);
+                }
+            } else {
+                wb_expr(a);
+            }
+            i = i + 1;
+        }
+    }
 }
