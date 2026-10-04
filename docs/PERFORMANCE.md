@@ -172,6 +172,22 @@ Mixed demo (`examples/demo.tin` vs `examples/demo_go`): 0.80 s against 1.01 s.
 
 binary-trees uses 917 MB against 37 MB: a plain program never resets its pool.
 
+### Signed division by ten (native Linux amd64)
+
+The dedicated `div10q` and `rem10` benchmarks isolate signed `/ 10` and `% 10` in a
+100-million-iteration loop. On the shared GitHub runner (Intel Xeon Platinum 8370C,
+Go 1.26.8),
+the head uses multiply-high lowering while the base uses hardware division:
+
+| operation | base Tin ms | head Tin ms | Go ms | head/base | head Tin/Go |
+|---|---:|---:|---:|---:|---:|
+| signed `i64 / 10` | 288.89 | 94.01 | 93.6 | 0.325 | 1.00 |
+| signed `i64 % 10` | 288.95 | 118.62 | 120.8 | 0.411 | 0.98 |
+
+The benchmark harness checks output on every timed run. The full CPU suite stayed within
+the 5% review threshold. HTTP throughput was 2.6% above base for `/json` and 2.2% below
+base for `/plaintext`; arm64 is unchanged by this x64-only lowering.
+
 ## 3. Where Go still wins, and why
 
 From `notes/bench_v2.md`, which has the assembly analysis:
@@ -182,13 +198,15 @@ From `notes/bench_v2.md`, which has the assembly analysis:
     fields are reloaded;
   - a few bounds checks the prover cannot remove (`j < n` where `n == len(s)` is only
     known through a separate variable).
-- **string building:** `append` of a single byte still checks capacity per call;
-  `% 10` uses a division where Go multiplies by a magic constant.
+- **string building:** single-byte string appends now have a direct byte path (see
+  [Single-byte string appends](#single-byte-string-appends)); signed `/10` and `%10` use
+  multiply-high on x64, while the arm64 backend and other divisors still use hardware
+  division.
 - **Constant materialization:** 64-bit constants are rebuilt with movz/movk inside
   loops.
 
 Planned codegen work in order of payoff: a register allocator with loop-depth spill
-weights, length-fact bounds-check elimination, division by constants via
+weights, length-fact bounds-check elimination, generalized division by constants via
 multiply-high, hoisting constant materialization, and alias information for struct
 fields.
 
@@ -330,3 +348,46 @@ benchmark stayed within 5% of its base.
 | amd64 | `/plaintext` | 100077 | 107729 | 1.076 |
 | arm64 | `/json` | 177246 | 179926 | 1.015 |
 | arm64 | `/plaintext` | 175889 | 178189 | 1.013 |
+
+## x64 floating-point register homes
+
+The x64 generator keeps local floating-point values in XMM8–XMM14 when the function has
+no calls inside loops. If it calls a helper outside loops, it saves and restores those
+homes around the call using the existing aligned spill slots. Functions with calls in
+loops retain the previous allocation strategy.
+
+The native Linux comparison used seven alternating CPU runs per side and five alternating
+HTTP rounds on GitHub-hosted shared runners: four vCPUs, AMD EPYC 7763 on amd64 and
+Neoverse-N2 on arm64, Go 1.26.8, with the load generator on the same runner. Run
+[37168100638](https://github.com/yasserreslan/tin/actions/runs/37168100638) produced an
+arm64 JSON CPU outlier; the rerun
+[37169504458](https://github.com/yasserreslan/tin/actions/runs/37169504458) did not reproduce
+it. A later run
+[37170940420](https://github.com/yasserreslan/tin/actions/runs/37170940420) measured a
+separate Intel amd64 attempt. Raw samples, machine details and HTTP logs are attached to
+these runs.
+
+| runner | `mandelbrot` base ms | head ms | head/base | head Tin ms | Go ms | Go/Tin |
+|---|---:|---:|---:|---:|---:|---:|
+| AMD EPYC 7763, run 1 | 3196.80 | 1555.19 | 0.486 | 1555.1 | 1148.6 | 0.739 |
+| AMD EPYC 7763, rerun | 3196.80 | 1554.77 | 0.486 | 1554.5 | 1148.5 | 0.739 |
+| Intel Xeon Platinum 8573C | 2285.67 | 3568.24 | 1.561 | — | — | — |
+| Neoverse-N2 control | 942.74 | 942.73 | 1.000 | 943.2 | 931.7 | 0.988 |
+
+The x64 change cuts the amd64 `mandelbrot` time by about 51%, consistently across both
+runs on AMD EPYC 7763. Tin remains about 1.35× slower than Go on that workload. A separate
+amd64 attempt on Intel Xeon Platinum 8573C measured a 56% regression; its seven samples per
+side clustered tightly, while the second attempt ran on AMD rather than Intel. Other CPU
+benchmarks stayed within 5% of base. Arm64 has no corresponding code-generation change:
+JSON measured 1.064 head/base in the first run and 0.935 in the rerun, opposite movements
+consistent with shared-runner timing noise; the other arm64 CPU results stayed within 5%.
+
+| architecture | `/json` run 1 | `/json` rerun | `/plaintext` run 1 | `/plaintext` rerun |
+|---|---:|---:|---:|---:|
+| amd64 head/base req/s | 0.977 | 0.951 | 0.963 | 1.049 |
+| arm64 head/base req/s | 0.991 | 0.993 | 0.984 | 1.023 |
+
+All HTTP results stayed within the 5% review threshold. The amd64 `/json` rerun is near
+the threshold at 0.951. The separate `strbuild` reference still has Tin at 148.5 ms versus
+Go at 87.2 ms (Go/Tin 0.587); reducing the remaining constant-modulo cost is a follow-up
+optimization target.

@@ -224,3 +224,120 @@ in your PRs, except #177 and #178, which belong to phase 2:
 - #172–#174, #183: anvil validation, timeouts and limits.
 - #176: long-lived reclamation, which builds on your phase 2 free API.
 - #124: TLS.
+
+## Phase 1 implementation and validation
+
+The compiler and runtime share `lib/runtime/number.tin`, written in the legacy function
+syntax so the committed seeds can compile it. Decimal parsing uses Eisel-Lemire's
+integer multiply/rounding path and an 800-digit exact decimal fallback; hexadecimal
+parsing rounds with a sticky tail. Precision formatting uses exact decimal shifts and
+nearest-even rounding. Shortest formatting finds the interval between adjacent floats;
+the existing small-number fast path remains. Scratch workspaces belong to each core,
+and conversion neither yields nor allocates after that workspace is initialized.
+
+`tools/ci/number_check.py` compares 221,604 generated cases with Go and 20,963 pinned
+finite cases from parse-number-fxx-test-data on every native CI target. It checks bits,
+errors, random decimal/hex values, midpoint ties, subnormals, signed zero, overlong tails,
+precision through 100, f32 and width/left/zero/plus flags. The long-integer mantissa case
+`1` followed by 2,000 zeroes and `e-2000` is checked with Go's exact `big.Rat` and
+nearest-even `big.Float.SetRat`: Go's capped strconv fallback returns zero for that
+input, whereas the exact result, Tin and the previous libc parser return one.
+`tests/v2/number.tin` also checks compiler literal bits and deterministic outputs against
+`bench/ref/number_smoke`. The packed power table is regenerated entirely with Python
+integers by `tools/gen_number_powers.py`; the Go adaptations retain their BSD license.
+
+## Phase 2 implementation and validation
+
+`lib/runtime/memory.tin` supplies the seed-compatible mmap heap and memory primitives
+for the compiler and runtime. Size-class headers preserve ownership across cores;
+remote frees queue to the owner's page source. Individual large mappings are unmapped
+on free. The public ingot free API and its lifetime boundary are in `docs/RUNTIME.md`;
+no owner-retirement or long-lived reclamation policy is introduced. Bulk copy/fill
+leaves use NEON on arm64 and REP on amd64, with bounded word scans for equality and
+byte search. The saved-register task layout and swap routines stay unchanged.
+
+`memory_check.py` checks Go-identical outputs, all byte alignments, overlapping moves,
+guard pages, allocator zeroing/realloc and cross-core returns. It injects 46 process-wide
+allocation/mapping failures only behind `TIN_ALLOC_TEST=1`; `oom-mapping.tin` also
+checks a real Linux mapping failure under the regression runner's virtual-memory limit.
+`task_memory_check.py` holds 300 heavy requests concurrently, then checks pool/stack
+page release and the 64-task cache cap. RSS acceptance is Linux-only. The benchmark
+suite adds matching Tin/Go memory cases at 16 B, 1 KiB and 1 MiB.
+
+Phase 2 performance repair: the first native Linux comparison missed the CPU gate in
+fannkuch, strbuild and the three memory microbenchmarks; its required rerun is retained.
+The seed-compatible Tin bodies now have bounded SSE2/NEON leaf replacements in both
+backends. Short copies load the complete range before storing (including overlapping
+memmove); 64-byte scans identify the first differing/matching byte. Guard-page tests now
+include copy/fill/scan lengths through 259 and overlap distances through 127 at lengths
+through 257. Machine code is reproducible from the checked-in relocation-free assembly
+with `python3 tools/gen_memory_fast.py --check`. No task swap or saved-register layout
+changes are involved.
+
+Phase 2 performance follow-up: the first native x86-64 run missed the 1 KiB memory gate
+(1.236 head/base); its required repeat is retained separately. Bounded AVX2 scans and
+medium copies now use a per-core capability cache, guarded by CPUID AVX/OSXSAVE, XGETBV
+XMM/YMM state, and CPUID AVX2. SSE2 remains the unsupported-CPU and legacy-compiler path.
+The corpus runs with automatic selection and forced SSE2, including guard pages and
+large overlaps. Native timing tables will be attached after the new head is measured.
+
+## Phase 3 implementation and validation
+
+Both backends emit raw syscall and signal-return leaves. The runtime and compiler
+share seed-compatible Linux wrappers with per-architecture numbers and directory
+flags; generic shared-library callers use rt_sys_* names. Darwin keeps its original
+foreign interfaces behind package/platform helpers, without raw calls. Linux errors
+come directly from kernel results and live in core word 10. Pthread creation remains.
+
+Directory iteration uses checked 32 KiB getdents64 records with refill, long-name
+validation and lstat for unknown types. The returning-signal probe supplies an
+SA_RESTORER leaf on both CPUs and confirms execution on an alternate stack. The
+strict suite, bootstrap, existing network/lifetime checks and syscall_check.py remain
+required. The latter compares Go outputs and forbids removed syscall imports in ELF.
+
+The checked-in old Linux seed needs a libc syscall fallback when building stage 1.
+Reachability excludes that body for compiler-emitted leaves, so generated programs
+do not import it. Its declarations remain honestly inventoried until phase 5's seed
+cutover. __errno_location also remains solely for failures of libc setenv/unsetenv,
+which the plan moves in phase 5; syscall errors never read it.
+
+Clock lookup uses AT_SYSINFO_EHDR and the kernel vDSO symbol tables (SysV and GNU),
+with the raw syscall as fallback. This brings the phase 5 clock lookup forward to
+preserve the existing fast clock path during the syscall transition; libc getauxval
+still supplies auxv until initial-stack startup replaces it in phase 5.
+
+
+Phase 3 performance follow-up: both first-run native HTTP comparisons missed the
+0.95 req/s gate (arm64 0.932/0.931 and amd64 0.913/0.931 for JSON/plaintext). The
+required repeat is retained. Hot strict wrappers now emit direct syscall leaves with
+inline kernel-error translation, removing the legacy wrapper/result call chain. The
+clock leaf loads the shared vDSO pointer and calls its C ABI directly, retaining a
+raw clock_gettime fallback, argument preservation and ABI stack alignment. Legacy
+compiler wrappers retain their seed-compatible error storage. The relocation-free
+leaves are regenerated from the recorded per-CPU numbers by gen_syscall_fast.py.
+
+## Phase 4 implementation and validation
+
+Linux DNS is Tin code behind wire.resolve: hosts first, resolv.conf search/domain and
+ndots/timeout/attempts/rotate, A before AAAA, bounded CNAME/compression handling,
+connected UDP with transaction/question verification and TCP fallback on truncation.
+Socket waits and file helpers preserve request deadlines; an explicit DialTimeout also
+limits DNS and connect. The supported contract and differences from NSS/getaddrinfo
+are documented in STDLIB/PORTING. Test config overrides require TIN_DNS_TEST=1.
+Fake-server CI covers protocol/configuration cases, Go reference answers, IPv6 socket
+round trips, six overlapping deadline-bound queries, fast requests during those waits,
+and bounded RSS after 1000 lookups.
+
+The linker emits a dedicated read-only image-relative Tin backtrace table on both Linux
+CPUs. Native checks exercise every reached function's first/last instruction and gaps.
+Calendar fields and full HTTP Date text match Go and the former C path for 2010 cases;
+all errno text is compared to the host's former C API. TTY/hostname/affinity/page probes
+and compiler root discovery/path traversal compare exact behavior. Darwin keeps the
+existing libSystem OS/thread/DNS layer; shared memory/number/calendar/errno code stays
+seed-compatible. Pthreads, libc environment/auxv and dynamic ELF remain until phase 5.
+
+
+Darwin development compatibility: errno 107 is unknown on macOS 15.0.1 but is
+"Capabilities insufficient" on the current macos-15 runner. The fixed Darwin table
+keeps codes 0..106; newer/unknown codes retain libSystem spelling. Linux error text
+remains entirely Tin. The exact C comparison covers both development OS releases.

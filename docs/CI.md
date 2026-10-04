@@ -6,8 +6,14 @@ Every push to `main` and every pull request runs native Linux arm64 (`ubuntu-24.
 
 - Clean build from the committed seed and two byte-identical self-hosted compiler rebuilds.
 - Every `tests/v2/*.tin`, including negative compilation tests and their exact diagnostics. Missing expected output, compiler crashes, process crashes, nonzero exit and timeouts fail. Each run uses fresh executable paths. `tests/v2/*_asm.tin` files are compiled with `-S` instead and their listing matched against the ordered `CHECK:`/`CHECK-NOT:` lines in `*_asm.check` (the CPU's section), so a codegen change that loses a direct call, or turns it into an indirect one, fails.
+- Exact number conversion: a generated Go `strconv`/`fmt` corpus and pinned parse-number-fxx hard cases check float bits, faults, ties, subnormals, long inputs, precision and f32/format flags on all three native targets (`number_check.py`).
+- Memory primitives (`memory_check.py`): Go twins check every alignment, overlap, zeroing, reallocation, guard-page boundaries and 1000 cross-core returns. Deterministic failure injection checks 46 allocation/mapping failures, including startup and later allocations (#178).
+- Task memory (`task_memory_check.py`): 300 concurrent heavy requests dirty pool and deep stack pages; after release, the cache holds at most 64 tasks and Linux RSS returns to within 32 MiB of baseline (#177). macOS checks task reuse and cache invariants.
+- Remaining helpers (`helpers_check.py`): exact errno messages, 2010 UTC/calendar values against Go and the former C output, hostname, PTYs/pipes/files, Linux affinity/page size and linker-symbol boundaries. `compiler_paths_check.py` checks copied installations, spaces/Unicode, symlink traversal and missing paths against Go/C.
+- Linux DNS (`dns_check.py`): fake UDP/TCP servers check hosts precedence, A/AAAA and IPv6 sockets, CNAMEs, malformed compression, wrong IDs, truncation/TCP fragments, NXDOMAIN, search/ndots, rotation/retries/timeouts, concurrent request deadlines and memory stability over 1000 lookups.
 - Memory regressions: bounds panics, allocation size overflow and negative lengths, large first allocations, single evaluation of allocation lengths, read-only and region checking through indirect calls, nested zero values, deep `keep` ownership and 200 request-pool reset/reuse cycles.
 - Linux HTTP framing/conformance, stable RSS over two million requests after warmup, and graceful shutdown. Throughput is reported, never used as a performance threshold.
+- Linux syscall ABI (`syscall_check.py`): kernel errors, mappings, poll, stat fields, 5004 long/linked directory entries with refills and forced unknown types, returning signal handlers on an alternate stack, independent core errors, and ELF assertions excluding libc syscall imports.
 - Request tasks (`task_check.py`): waits on one core overlap, fast requests stay fast behind waiting ones (timers, proxied `wire` calls, helper-thread file I/O), deadlines give 504, refused upstreams 502, and pipelined responses keep their order.
 - Router (`router_check.py`, server `tools/ci/fixtures/router.tin`): on one core and on two, 1200 keep-alive requests interleave routes whose middleware and handlers wait, and every answer must carry its own path parameter and middleware trace; waits in a routed handler or middleware overlap; 404, 405 with `Allow`, HEAD, bodies, a catch-all and pipelined order go through the router; and 20 WebSocket connections are accepted by a routed handler. The router's matching rules and errors are in `tests/v2/router.tin` and `router*_bad.tin`.
 - Runtime lifetimes (`lifetime_check.py`): overlapping formatting on one core, deadlines for running and queued helper jobs, safe late read/write completion after task reuse, per-message WebSocket pool bounds, fragmented/control traffic, retained `Read` results, and automatic buffer cleanup after 300 connection cycles. Private probes are injected into temporary library copies.
@@ -44,6 +50,7 @@ This avoids a bot rewriting Actions after closure: the regression becomes requir
 make bootstrap
 python3 -m unittest discover -s tools/ci -p 'test_*.py' -v
 tools/v2test.sh bin/tinc
+python3 tools/ci/number_check.py          # exact number bits/text against Go and hard cases
 python3 tools/ci/regressions.py
 python3 tools/ci/regressions.py --audit   # network; GH_TOKEN optional for public issues
 python3 tools/ci/http_check.py            # Linux HTTP/RSS/shutdown

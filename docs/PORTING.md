@@ -108,3 +108,15 @@ The plan (`notes/plan_linux.md`) and the work log (`notes/x64_progress.md`):
    `notes/linux_probe/`, and record them like `notes/linux_abi.md`.
 6. Tests: every `tests/v2` program must produce the same output on every target; the
    compiler must self-host there.
+
+## Linux DNS contract
+
+Linux uses Tin's resolver rather than glibc getaddrinfo: `/etc/hosts` first, then
+`/etc/resolv.conf` nameservers/search/domain and ndots/timeout/attempts/rotate options.
+A and AAAA use nonblocking UDP, with TCP fallback for truncation; every wait inside a
+request is limited by its deadline. Numeric IPv6 addresses and scope IDs are supported.
+The systemd-resolved stub works through its resolv.conf address. NSS modules such as
+mdns, ldap and nss-resolve are unsupported. Tin prefers IPv4 and returns the first usable
+address rather than glibc's RFC 6724 sorting; it performs no IDNA conversion, implicit
+hostname search-domain inference or answer caching. Bounds/defaults are in
+[the wire contract](STDLIB.md#wire). macOS keeps its existing libSystem DNS behavior.

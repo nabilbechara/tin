@@ -18,9 +18,6 @@ import "mint"
 import "say"
 import "wire"
 
-extern func close(fd i64) i64
-extern func strerror(e i64) i64
-extern func recv(fd i64, buf i64, n i64, flags i64) i64
 
 // Reply is one Redis reply.
 type Reply enum {
@@ -344,7 +341,7 @@ func set_err(s i64, msg str) {
 // fail_line closes the connection and fails every caller waiting on it.
 func fail_line(l i64, msg str) {
 	if l[lFd] >= 0 {
-		close(l[lFd])
+		rt_sys_close(l[lFd])
 		l[lFd] = -1
 	}
 	for l[lQN] > 0 {
@@ -364,7 +361,7 @@ func fail_line(l i64, msg str) {
 }
 
 func os_msg(what str, e i64) str {
-	m := strerror(e)
+	m := rt_sys_strerror(e)
 	return "redis: {what}: {rt_str_from_raw(m, strlen(m))}"
 }
 
@@ -653,10 +650,10 @@ func drive(l i64, s i64, rec i64) ! {
 		// An idle connection the server may have closed (a restart, an idle timeout): find
 		// out before sending, so the command goes on a new connection instead of failing.
 		b := calloc(1, 8)
-		k := recv(l[lFd], b, 1, 2)
+		k := rt_sys_recv(l[lFd], b, 1, 2)
 		free(b)
 		if k == 0 || (k < 0 && rt_errno() != EAGAIN && rt_errno() != EINTR) {
-			close(l[lFd])
+			rt_sys_close(l[lFd])
 			l[lFd] = -1
 		}
 	}
@@ -674,7 +671,7 @@ func drive(l i64, s i64, rec i64) ! {
 	for s[sState] == 0 {
 		fd := l[lFd]
 		if l[lWpos] < l[lOutN] {
-			k := write(fd, l[lOut]+l[lWpos], l[lOutN]-l[lWpos])
+			k := rt_sys_write(fd, l[lOut]+l[lWpos], l[lOutN]-l[lWpos])
 			if k > 0 {
 				l[lWpos] += k
 				if l[lWpos] == l[lOutN] {
@@ -706,7 +703,7 @@ func drive(l i64, s i64, rec i64) ! {
 			l[lIn] = realloc(l[lIn], c)
 			l[lInCap] = c
 		}
-		k := read(fd, l[lIn]+l[lInE], l[lInCap]-l[lInE])
+		k := rt_sys_read(fd, l[lIn]+l[lInE], l[lInCap]-l[lInE])
 		if k > 0 {
 			l[lInE] += k
 			continue
