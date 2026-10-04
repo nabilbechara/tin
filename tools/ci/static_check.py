@@ -96,7 +96,11 @@ def main(programs=()):
         got = subprocess.run([str(exe)], env={'STATIC_A': 'one'}, capture_output=True, text=True, timeout=30)
         assert got.returncode == 0 and got.stdout == ENV_WANT, got
         if os.uname().sysname == 'Linux':
-            assert_static(ROOT / 'bin/tinc')
+            # bin/tinc comes from the checked-in seed, which still links libc until the seed
+            # refresh (#125); the compiler that compiled itself (make bootstrap) is static.
+            built = ROOT / 'bin/s3/tinc'
+            assert built.exists(), 'run make bootstrap first: bin/s3/tinc is the compiler it builds'
+            assert_static(built)
     print('PASS static linux-arm64/amd64 images (no PT_INTERP, no PT_DYNAMIC); _start passes argc, argv and envp'
           + ('' if jailed is None else '; runs in an empty root')
           + '; a program using getenv/setenv and the compiler itself are static')
