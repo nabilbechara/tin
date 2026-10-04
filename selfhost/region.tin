@@ -15,6 +15,7 @@ const RG_FRESH = 1;   // may be a fresh allocation from the current request's po
 const RG_INGOT = 2;   // may be long-lived (a global or something reachable from one)
 const RG_UNK = 4;     // origin unknown: treated as long-lived when stored into
 const RG_EMB = 8;     // the value may point into request memory
+const RG_OUT = 16;    // in an arena's closure: made outside the arena (#236)
 const RG_P0 = 256;    // derived from parameter i: bit 8 + i
 const RG_MAXP = 48;
 
@@ -489,6 +490,10 @@ fn rg_store(c, co, ct, v, t, pos, gname) {
     if (v & RG_EMB) == 0 {
         return;
     }
+    if v != RG_EMB {
+        // A call's stores (rg_pass gives them RG_EMB) are checked by rg_arena_call.
+        rg_arena_store(c, v, pos);
+    }
     if (c & (RG_INGOT | RG_UNK)) != 0 && rg_report {
         if gname {
             err_code_quoted(pos, "E310 REQUEST_ESCAPE", "request memory stored into global ", gname, ", which outlives the request: wrap the value in keep()");
@@ -551,6 +556,10 @@ fn rg_cell_bits(i) {
     if !os || os[S_CAPTURED] {
         return RG_UNK | RG_EMB;
     }
+    if rg_is_arena(rg_fn) {
+        // Made outside the arena: what it holds is not the arena's fresh memory.
+        return ((os[S_REGION] | os[S_CAPBITS]) & ~RG_FRESH) | RG_OUT;
+    }
     return os[S_REGION] | os[S_CAPBITS];
 }
 
@@ -558,6 +567,9 @@ fn rg_cell_bits(i) {
 // the variable is the parent's local: the bits join it. A closure that may be kept must not
 // store request memory there: once kept, its variables are long-lived (#171).
 fn rg_cell_store(i, v, t, pos) {
+    if rg_in_arena() {
+        v = rg_arena_cell_store(i, v, t, pos);
+    }
     if rg_fn[F_ESCAPES] {
         if (v & RG_EMB) != 0 && has_ptr(t) && rg_report {
             let os = vec_get(rg_fn[F_CAPTURES], i);
@@ -777,6 +789,178 @@ fn rg_detach_check(f) {
                 err_quoted(d[F_POS], "detach captures ", os[S_NAME], ", which may hold request memory, but the detached task outlives the request: keep() it before the block (let v = keep(...)), or read it in the block only inside keep()");
             }
             j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// ---- arena: nothing made in it leaves it (#236, notes/interface_arena.md §7) ----
+//
+// An arena's closure reads its captured variables as RG_OUT (made outside the arena) instead
+// of RG_FRESH, so fresh bits there are the arena's own memory. Storing that into an object
+// from outside, or into a captured variable, is E314; so is growing (append, map insert) a
+// slice or map from outside, since the new array or table would be allocated in the arena.
+
+var rg_grows;   // [function, parameter bits]: the parameters (and what they hold) it may grow
+var rg_fstores; // [function, parameter bits]: the parameters it may store its own fresh memory into
+var rg_pstores; // [function, parameter i, parameter bits]: the parameters it may store into parameter i
+
+fn rg_is_arena(f) {
+    return ck_arenas && vec_has(ck_arenas, f);
+}
+
+// rg_in_arena reports whether the running function is an arena's closure or one inside it.
+fn rg_in_arena() {
+    let f = rg_fn;
+    while f {
+        if rg_is_arena(f) {
+            return 1;
+        }
+        f = f[F_PARENT];
+    }
+    return 0;
+}
+
+// rg_arena_made reports whether a value with bits v may be memory made in the arena.
+fn rg_arena_made(v) {
+    return (v & RG_FRESH) != 0 || ((v & RG_EMB) != 0 && (v & RG_OUT) == 0);
+}
+
+fn rg_arena_escape(pos, name) {
+    err_code_quoted(pos, "E314 ARENA_ESCAPE", "memory made in an arena stored into ", name, ", a variable from outside it, which outlives the arena: make the value the arena block's result (it is copied out), or keep() it");
+}
+
+// rg_arena_cell_store checks a store of bits v into captured variable i inside an arena and
+// returns the bits that join the variable (RG_OUT means nothing outside the arena).
+fn rg_arena_cell_store(i, v, t, pos) {
+    let os = vec_get(rg_fn[F_CAPTURES], i);
+    let outside = rg_is_arena(rg_fn) || (os && os[S_CAPTURED] && rg_is_arena(rg_fn[F_PARENT]));
+    if outside && !rg_fn[F_ESCAPES] && has_ptr(t) && rg_arena_made(v) && rg_report {
+        let name = "a captured variable";
+        if os {
+            name = os[S_NAME];
+        }
+        rg_arena_escape(pos, name);
+    }
+    return v & ~RG_OUT;
+}
+
+fn rg_grows_op(name) {
+    return streq(name, "rt_append") || streq(name, "rt_append_dyn") || streq(name, "rt_slice_appendn") || streq(name, "rt_append_str") || streq(name, "rt_map_set") || streq(name, "rt_map_setk");
+}
+
+// rg_grow notes that the running function may grow the slice or map with bits b.
+fn rg_grow(b, pos) {
+    let i = 0;
+    while i < rg_nparams && i < RG_MAXP {
+        if (b & (RG_P0 << i)) != 0 {
+            if !rg_grows {
+                rg_grows = vec_new();
+            }
+            if rg_merge(rg_grows, rg_fn, 1 << i) {
+                rg_changed = 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (b & RG_OUT) != 0 && (b & ~(RG_OUT | RG_INGOT)) != 0 && rg_report && rg_in_arena() {
+        err_code_at(pos, "E314 ARENA_ESCAPE", "a slice or map from outside an arena grows inside it (append or insert), so its new memory would be the arena's: grow it after the block, from the block's result");
+    }
+}
+
+// rg_arena_store notes a store of bits v into a container with bits c: in terms of the running
+// function's parameters, for its callers, and as E314 when it takes arena memory outside.
+fn rg_arena_store(c, v, pos) {
+    let i = 0;
+    while i < rg_nparams && i < RG_MAXP && i < 62 {
+        if (c & (RG_P0 << i)) != 0 {
+            if (v & RG_FRESH) != 0 {
+                if !rg_fstores {
+                    rg_fstores = vec_new();
+                }
+                if rg_merge(rg_fstores, rg_fn, 1 << i) {
+                    rg_changed = 1;
+                }
+            }
+            let j = 0;
+            let from = 0;
+            while j < rg_nparams && j < RG_MAXP && j < 62 {
+                if (v & (RG_P0 << j)) != 0 {
+                    from = from | (1 << j);
+                }
+                j = j + 1;
+            }
+            if from && rg_pstore_add(i, from) {
+                rg_changed = 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (c & (RG_INGOT | RG_UNK)) == 0 && (c & RG_OUT) != 0 && rg_report && rg_in_arena() && rg_arena_made(v) {
+        err_code_at(pos, "E314 ARENA_ESCAPE", "memory made in an arena stored into an object from outside it, which outlives the arena: make the value the arena block's result (it is copied out), or keep() it");
+    }
+}
+
+fn rg_pstore_add(i, from) {
+    if !rg_pstores {
+        rg_pstores = vec_new();
+    }
+    let k = 0;
+    while k < rg_pstores[VEC_LEN] {
+        if vec_get(rg_pstores, k) == rg_fn && vec_get(rg_pstores, k + 1) == i {
+            let old = vec_get(rg_pstores, k + 2);
+            rg_pstores[VEC_DATA][k + 2] = old | from;
+            return (old | from) != old;
+        }
+        k = k + 3;
+    }
+    vec_push(rg_pstores, rg_fn);
+    vec_push(rg_pstores, i);
+    vec_push(rg_pstores, from);
+    return 1;
+}
+
+fn rg_pstore_get(f, i) {
+    let k = 0;
+    while rg_pstores && k < rg_pstores[VEC_LEN] {
+        if vec_get(rg_pstores, k) == f && vec_get(rg_pstores, k + 1) == i {
+            return vec_get(rg_pstores, k + 2);
+        }
+        k = k + 3;
+    }
+    return 0;
+}
+
+// rg_arena_call applies what callee f may grow and store into its parameters to the call's
+// arguments (bits b): its own fresh memory, or another argument.
+fn rg_arena_call(f, b, pos) {
+    let g = 0;
+    let fs = 0;
+    if rg_grows {
+        g = rg_lookup(rg_grows, f);
+    }
+    if rg_fstores {
+        fs = rg_lookup(rg_fstores, f);
+    }
+    let i = 0;
+    while i < b[VEC_LEN] && i < RG_MAXP && i < 62 {
+        if (g & (1 << i)) != 0 {
+            rg_grow(vec_get(b, i), pos);
+        }
+        let v = 0;
+        if (fs & (1 << i)) != 0 {
+            v = RG_FRESH | RG_EMB;
+        }
+        let from = rg_pstore_get(f, i);
+        let j = 0;
+        while from && j < b[VEC_LEN] && j < 62 {
+            if (from & (1 << j)) != 0 {
+                v = v | vec_get(b, j);
+            }
+            j = j + 1;
+        }
+        if (v & RG_EMB) != 0 {
+            rg_arena_store(vec_get(b, i), v, pos);
         }
         i = i + 1;
     }
@@ -1107,6 +1291,7 @@ fn rg_call(e) {
         }
         i = i + 1;
     }
+    rg_arena_call(f, b, pos);
     rg_import(sum[1], args, b);
     let res = vec_new();
     let j = 0;
@@ -1245,6 +1430,9 @@ fn rg_runtime_call(e, name, b, pos) {
     if n > 0 {
         co = rg_owner(vec_get(args, 0));
         ct = rg_key(vec_get(args, 0)[N_TYPE]);
+    }
+    if n > 0 && rg_grows_op(name) {
+        rg_grow(b0, pos);
     }
     if streq(name, "rt_map_set") {
         rg_store(b0, co, ct, vec_get(b, 1), vec_get(args, 1)[N_TYPE], pos, 0);

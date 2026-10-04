@@ -813,6 +813,41 @@ What the checker tracks:
 Plain programs (no server) never reset their pool: memory is released when the program
 exits.
 
+**Arenas** (edition 1, #236). `arena { body }` runs its body in a sub-region of its own: a
+fresh pool, dropped when the block ends. The block's value (its last expression) is copied
+into the enclosing region, so it is all that leaves; a batch loop whose steps run in arenas
+keeps a flat footprint however many steps it takes, outside a request as well as inside one.
+
+```
+for path in paths {
+	total += arena {                    // each file's temporaries are freed after its step
+		countWords(load(path))
+	}
+}
+let names = try arena {                 // a body that can fail is a !T: try or catch it
+	let text = try quarry.ReadFile(path)
+	let doc = try parse(text)
+	doc.names                           // copied out; doc is freed with the arena
+}
+```
+
+- A body that cannot fail has the type of its value (none for a statement block); one whose
+  `try` or `fail` can leave it is a `!T`, used with `try` or `catch` like the other boundary
+  blocks. `return` cannot leave it. A panic passes through it (the arena is freed on the way)
+  to the nearest `guard`.
+- The value is deep-copied, like `keep`, but into the enclosing region. A recursive type, or
+  one holding a `func` or `dyn` value, cannot be the value (E315 ARENA_VALUE).
+- **Nothing else made in the arena may leave it** (E314 ARENA_ESCAPE): storing it into a
+  variable from outside the block, into a field, element or map entry of an object from
+  outside, or through a call's `mut` argument. Appending to or inserting into a slice or
+  map from outside is rejected whatever the value, since its new array or table would be
+  allocated in the arena: grow it after the block, from the block's value. Values from
+  outside may be read, and stored into objects from outside. `keep(x)` inside an arena still
+  copies into long-lived memory.
+- Scope children inside an arena allocate in it and end with their scope, inside the block.
+  The arena's memory counts toward an enclosing `limit memory`, and is given back when the
+  arena ends.
+
 ---
 
 ## 11. Concurrency: one thread per core, share nothing

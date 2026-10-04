@@ -943,6 +943,68 @@ example.tin:9:11: error E313 USE_AFTER_RESET: 's' may hold request memory from b
 
 Fix: `keep()` the value before the reset, or create it again after.
 
+### E314 ARENA_ESCAPE
+
+An `arena { }` block's memory is freed when the block ends, so nothing made in it may be
+stored into anything made outside it: a variable from outside the block, a field, element or
+map entry of an object from outside, or (through a call) a `mut` argument from outside.
+Appending to, or inserting into, a slice or map from outside the block is rejected too,
+whatever the value: the slice's new array or the map's new table would be allocated in the
+arena. Only the block's value leaves it, copied into the enclosing region.
+
+```tin edition=1
+package main
+
+import "say"
+
+fn main() {
+	mut last = ""
+	let n = arena {
+		let line = "line {len(last)}"
+		last = line
+		len(line)
+	}
+	say.Line(n, last)
+}
+```
+
+```text
+example.tin:9:3: error E314 ARENA_ESCAPE: memory made in an arena stored into 'last', a variable from outside it, which outlives the arena: make the value the arena block's result (it is copied out), or keep() it
+```
+
+Fix: make what must outlive the block its value (`last = arena { ... line }`), grow outside
+slices and maps after the block from its value, or `keep()` the value (long-lived memory).
+
+### E315 ARENA_VALUE
+
+An `arena { }` block's value is deep-copied out of the arena, so its type must be one the
+copy can follow: not recursive, and holding no `func` or `dyn` value.
+
+```tin edition=1
+package main
+
+import "say"
+
+type Node struct {
+	name str
+	next ?Node
+}
+
+fn main() {
+	let n = arena {
+		Node{name: "a", next: nil}
+	}
+	say.Line(n.name)
+}
+```
+
+```text
+example.tin:11:10: error E315 ARENA_VALUE: an arena block's value is copied out of the arena, but type Node is recursive, so it cannot be copied: return a value of a non-recursive type
+```
+
+Fix: return the data the caller needs (a slice of names instead of a linked list, a name
+instead of a handler), and build the rest after the block.
+
 ## E4xx Faults and optionals
 
 ### E401 CATCH_PLACEMENT

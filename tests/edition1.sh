@@ -232,4 +232,28 @@ do
 	fi
 done
 
+# arena { } (#236): values of every kind are copied out, faults pass with try and catch,
+# panics and limits discard the arena, and scope children that share a pool keep it while an
+# arena body waits. Memory made in an arena cannot leave it any other way (E314), and its
+# value must be a type the copy can follow (E315).
+"$compiler" -edition 1 -o "$tmp/arenas" tests/edition1/run/arenas.tin
+"$tmp/arenas" >"$tmp/arenas.out" 2>/dev/null
+if ! cmp -s tests/edition1/run/arenas.out "$tmp/arenas.out"; then
+	echo "FAIL edition1/run/arenas: output differs"
+	diff -u tests/edition1/run/arenas.out "$tmp/arenas.out" || true
+	exit 1
+fi
+for name in arena_bad arena_value_bad
+do
+	if "$compiler" -edition 1 -o "$tmp/$name" "tests/edition1/$name.tin" >"$tmp/$name.out" 2>"$tmp/$name.err"; then
+		echo "FAIL edition1/$name: unexpectedly accepted"
+		exit 1
+	fi
+	if ! cmp -s "tests/edition1/$name.err" "$tmp/$name.err"; then
+		echo "FAIL edition1/$name: diagnostic mismatch"
+		diff -u "tests/edition1/$name.err" "$tmp/$name.err" || true
+		exit 1
+	fi
+done
+
 echo "PASS edition 1 parser"
