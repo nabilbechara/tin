@@ -36,7 +36,7 @@ moving or deleting the tree breaks it.
 | `tin asm FILE.tin...` | print the generated ARM64 assembly (clang syntax) |
 | `tin audit secrets [-edition 1] FILE.tin...` | check the program and list every place a `secret` leaves the checker's protection: each `reveal(x)` and each secret passed to a library parameter declared `secret`, as `file:line:col: ...` sorted by position, then a count; exit status 1 (with the errors) when the program does not check |
 | `tin test [-bench] [DIR]` | build DIR (default `.`) with its `*_test.tin` files and run every `TestXxx(t mut crucible.T)`, then `BenchmarkXxx(b mut crucible.B)` with `-bench`; exit status 1 when a test fails, 2 for a wrong test signature (see §5.1) |
-| `tin replay CAPSULE --against BUILD [--live KIND]...` | run a recorded request again with every effect served from its capsule, and report the first divergence (see §8.1) |
+| `tin replay CAPSULE --against BUILD [--live KIND]... [--save-test NAME --issue N]` | run a recorded request again with every effect served from its capsule, and report the first divergence (see §8.1) |
 | `tin vendor [DIR]` | copy every package `DIR/tin.mod` requires (transitively, from local source directories) into `DIR/vendor/<path>` and write `DIR/tin.lock` with each vendored file's SHA-256 (see §2.1) |
 | `tin caps FILE.tin...` | check the program and print, per package, the capabilities (`net`, `files`, `spawn`, `exec`, `unsafe`) its exported functions can reach |
 | `tin suite` | run the compiler's strict test suite (`tools/v2test.sh`) |
@@ -282,6 +282,15 @@ TIN_REPLAY_KEY=<64 hex digits> tin replay spool/00001700000000000000-000-1.tcap 
 - Exit status: 0 when nothing diverged and every recorded effect was used; 3 when the replay
   diverged or left effects; 4 when the capsule cannot be read (wrong key or damaged, unsupported
   schema or kind, missing `TIN_REPLAY_KEY`); 2 for a usage error.
+- `--save-test NAME --issue N` (BUILD must be a `FILE.tin`, without `--live`) runs the replay. If
+  it exits 0, it turns the capsule into a regression case: `tests/regressions/NAME.tin` (a copy
+  of `FILE.tin`), `tests/regressions/NAME.tcap` (the capsule sealed again under a public test
+  key), and an entry in `cases.json` (`"replay": {"capsule", "key"}`; the expected output is this
+  replay's report and body). `tools/ci/regressions.py` runs the program with the replay switches
+  and checks the exit status and output, so CI replays the request on every change. Fix the bug
+  first, then save the replay against the fixed build: the case then fails if the old behaviour
+  comes back. The saved capsule can be read by anyone. Secret headers are already handles, but
+  check the request and the recorded results before you commit them.
 - Only the request is replayed. Code that runs before `Serve` (`main`, eager initializers,
   `use` resources, `on app.start`) runs as usual, live. A BUILD that never calls `Serve`
   ignores the capsule.
