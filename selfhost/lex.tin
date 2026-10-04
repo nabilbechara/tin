@@ -15,6 +15,7 @@ const T_VAL = 2;
 const T_POS = 3;
 const T_RAW = 4;   // a `raw` string literal (no interpolation)
 const T_DBL = 5;   // an escape produced a brace, which the text holds doubled ({{ or }}) so that it is not read as interpolation
+const T_UNIT = 6;  // edition 1 numeric unit suffix, or 0
 
 var lx_src;
 var lx_len;
@@ -22,11 +23,13 @@ var lx_i;
 var lx_line;
 var lx_col;
 var lx_file;
+var lx_edition;
 var lx_newline;
 var lx_esc_rune;
 
-fn lex(file, src, len) {
+fn lex(file, src, len, edition) {
     lx_file = file;
+    lx_edition = edition;
     lx_src = src;
     lx_len = len;
     lx_i = 0;
@@ -50,13 +53,14 @@ fn lex(file, src, len) {
 // T_TEXT holds the identifier, keyword, punctuation or decoded string bytes;
 // T_VAL holds an integer literal's value or a string literal's byte length.
 fn token_new(kind, text, val, pos) {
-    let t = malloc(48);
+    let t = malloc(56);
     t[T_KIND] = kind;
     t[T_TEXT] = text;
     t[T_VAL] = val;
     t[T_POS] = pos;
     t[T_RAW] = 0;
     t[T_DBL] = 0;
+    t[T_UNIT] = 0;
     return t;
 }
 
@@ -121,6 +125,21 @@ fn is_keyword(s) {
         }
         i = i + j + 1;
     }
+    if lx_edition {
+        let edition1 = "enum match within limit guard parallel detach secret shared fail catch keep ";
+        let n = strlen(s);
+        let i = 0;
+        while load8(edition1 + i) != 0 {
+            let j = 0;
+            while load8(edition1 + i + j) != ' ' {
+                j = j + 1;
+            }
+            if j == n && mem_eq(edition1 + i, s, n) {
+                return 1;
+            }
+            i = i + j + 1;
+        }
+    }
     return 0;
 }
 
@@ -130,6 +149,12 @@ fn is_three_char_punct(a, b, c) {
 }
 
 fn is_two_char_punct(a, b) {
+    if a == '.' && b == '.' {
+        return 1;
+    }
+    if (a == '?' && b == '?') || (a == '=' && b == '>') {
+        return 1;
+    }
     if b == '=' {
         return a == '=' || a == '!' || a == '<' || a == '>' || a == ':' || a == '+' || a == '-' || a == '*' || a == '/' || a == '%' || a == '&' || a == '|' || a == '^';
     }
@@ -163,6 +188,9 @@ fn lx_skip_space() {
                 lx_advance();
             }
         } else if c == '/' && lx_peek(1) == '*' {
+            if lx_edition {
+                lx_fail(pos_make(lx_file, lx_line, lx_col), "edition 1 supports // comments, not block comments");
+            }
             lx_advance();
             lx_advance();
             while lx_i < lx_len && !(lx_peek(0) == '*' && lx_peek(1) == '/') {
@@ -199,6 +227,9 @@ fn lex_next() {
         return token_new(TK_EOF, "", 0, pos);
     }
     let c = lx_peek(0);
+    if lx_edition && c == ';' {
+        lx_fail(pos, "edition 1 statements end at a newline, not a semicolon");
+    }
     if is_letter(c) {
         let start = lx_i;
         while is_letter(lx_peek(0)) || is_digit(lx_peek(0)) {
@@ -267,8 +298,29 @@ fn lex_float(pos, start) {
             lx_advance();
         }
     }
-    let text = str_slice(lx_src + start, lx_i - start);
-    return token_new(TK_FLOAT, text, float_bits(text), pos);
+    let number_end = lx_i;
+    let unit = 0;
+    if lx_edition && is_letter(lx_peek(0)) {
+        let unit_start = lx_i;
+        while is_letter(lx_peek(0)) {
+            lx_advance();
+        }
+        unit = unit_name(str_slice(lx_src + unit_start, lx_i - unit_start));
+        if !unit {
+            lx_fail(pos, "unknown numeric unit suffix");
+        }
+    }
+    let text = str_slice(lx_src + start, number_end - start);
+    let t = token_new(TK_FLOAT, text, float_bits(text), pos);
+    t[T_UNIT] = unit;
+    return t;
+}
+
+fn unit_name(s) {
+    if streq(s, "ns") || streq(s, "us") || streq(s, "ms") || streq(s, "s") || streq(s, "m") || streq(s, "h") || streq(s, "b") || streq(s, "kb") || streq(s, "mb") || streq(s, "gb") {
+        return s;
+    }
+    return 0;
 }
 
 fn lex_raw_string(pos) {
@@ -316,11 +368,27 @@ fn lex_number(pos) {
             return lex_float(pos, start);
         }
     }
-    while is_letter(lx_peek(0)) || is_digit(lx_peek(0)) {
-        lx_advance();
+    let number_end = lx_i;
+    let unit = 0;
+    if base == 10 && lx_edition && is_letter(lx_peek(0)) {
+        let unit_start = lx_i;
+        while is_letter(lx_peek(0)) {
+            lx_advance();
+        }
+        unit = unit_name(str_slice(lx_src + unit_start, lx_i - unit_start));
+        if !unit {
+            lx_fail(pos, "unknown numeric unit suffix");
+        }
+    } else {
+        while is_letter(lx_peek(0)) || is_digit(lx_peek(0)) {
+            lx_advance();
+        }
     }
     let s = lx_src + start;
     let n = lx_i - start;
+    if unit {
+        n = number_end - start;
+    }
     let val = 0;
     let ok = 1;
     let i = 0;
@@ -377,7 +445,9 @@ fn lex_number(pos) {
         buf_str(e, text);
         fatal(e);
     }
-    return token_new(TK_INT, text, val, pos);
+    let t = token_new(TK_INT, text, val, pos);
+    t[T_UNIT] = unit;
+    return t;
 }
 
 // lx_rune decodes the UTF-8 character starting at the current byte (already peeked
