@@ -5272,6 +5272,9 @@ var catch_seq;  // numbers the value temps of catch blocks
 // fault_return is `return zero values..., fault` for the current function; statements that
 // build zero values (a struct's fields) go into body before it.
 fn fault_return(pos, body, fault) {
+    if ck_fn == arena_check_fn {
+        arena_fail_count = arena_fail_count + 1;
+    }
     let frs = ck_fn[F_RTYPES];
     let ret = node_new(ST_RETURN, pos);
     if frs[VEC_LEN] == 1 {
@@ -7816,6 +7819,200 @@ fn keep_each(pos, body, out, et) {
     }
     w[WH_BODY] = wb;
     vec_push(body, w);
+}
+
+// ---- arena results: deep copies into the parent pool (#236, notes/interface_arena.md) ----
+
+var acopy_types;
+var acopy_fns;
+
+// arena_copyable reports whether a value of type t can be copied out of an arena: func and
+// dyn values cannot (their objects are not described by their type).
+fn arena_copyable(t, seen) {
+    let k = kind_of(t);
+    if k == K_FUNC || k == K_DYN {
+        return 0;
+    }
+    if k != K_STRUCT && k != K_SLICE && k != K_MAP && k != K_OPT {
+        return 1;
+    }
+    if vec_index(seen, t) >= 0 {
+        return 1;
+    }
+    vec_push(seen, t);
+    if k == K_STRUCT {
+        let fi = 0;
+        while fi < t[TY_FIELDS][VEC_LEN] {
+            if !arena_copyable(field_type(t, fi), seen) {
+                return 0;
+            }
+            fi = fi + 1;
+        }
+        return 1;
+    }
+    if k == K_MAP && !arena_copyable(t[TY_KEY], seen) {
+        return 0;
+    }
+    return arena_copyable(t[TY_ELEM], seen);
+}
+
+// arenacopy_fn returns (generating on first use) arenacopy$N(x T) T, which copies x and
+// everything it references into the current pool, as keep$N does into the ingot heap.
+fn arenacopy_fn(t) {
+    if !acopy_types {
+        acopy_types = vec_new();
+        acopy_fns = vec_new();
+    }
+    let i = 0;
+    while i < acopy_types[VEC_LEN] {
+        if vec_get(acopy_types, i) == t {
+            return vec_get(acopy_fns, i);
+        }
+        i = i + 1;
+    }
+    lifted_count = lifted_count + 1;
+    let pos = 0;
+    let f = fn_new(pos, "arenacopy");
+    let nb = buf_new();
+    buf_str(nb, "arenacopy$");
+    buf_int(nb, lifted_count);
+    buf_byte(nb, 0);
+    f[F_QNAME] = nb[VEC_DATA];
+    f[F_NAME] = nb[VEC_DATA];
+    f[F_LIFTED] = 2;
+    vec_push(f[F_PARAMS], "x");
+    vec_push(f[F_PTYPES], t);
+    vec_push(f[F_RTYPES], t);
+    f[F_TYPE] = func_of(f[F_PTYPES], f[F_RTYPES], 0);
+    f[F_LOCALS] = vec_new();
+    f[F_BODY] = empty_block(pos);
+    vec_push(acopy_types, t);
+    vec_push(acopy_fns, f);
+    vec_push(prog_fns, f);
+    let saved_fn = ck_fn;
+    ck_fn = f;
+    let x = sym_new(SYM_LOCAL, "x", pos);
+    x[S_TYPE] = t;
+    x[S_SLOT] = 0;
+    f[F_SLOTS] = 1;
+    vec_push(f[F_LOCALS], x);
+    let body = f[F_BODY][BLK_STMTS];
+    let k = kind_of(t);
+    let ret = node_new(ST_RETURN, pos);
+    if k == K_ERROR {
+        ret[RET_VALUE] = rt_call(pos, "rt_arena_fault", args1(sym_ref_node(pos, x)), t);
+    } else if k == K_STRING {
+        ret[RET_VALUE] = rt_call(pos, "rt_arena_str", args1(sym_ref_node(pos, x)), t);
+    } else if k == K_OPT {
+        let ifs = node_new(ST_IF, pos);
+        ifs[IF_COND] = mk_bin(pos, "==", sym_ref_node(pos, x), mk_int(pos, 0, t), ty_bool);
+        ifs[IF_THEN] = empty_block(pos);
+        let r0 = node_new(ST_RETURN, pos);
+        r0[RET_VALUE] = mk_int(pos, 0, t);
+        vec_push(ifs[IF_THEN][BLK_STMTS], r0);
+        vec_push(body, ifs);
+        ret[RET_VALUE] = keep_call(pos, arenacopy_fn(t[TY_ELEM]), sym_ref_node(pos, x), t);
+    } else if k == K_SLICE {
+        let et = t[TY_ELEM];
+        let out = temp(pos, rt_call(pos, "rt_arena_slice", args2(sym_ref_node(pos, x), mk_int(pos, type_width(et), ty_int)), t), t);
+        vec_push(body, out);
+        if is_ref(et) {
+            let n = temp(pos, mk_hdr(pos, sym_ref_node(pos, out[LET_SYM]), 0), ty_int);
+            vec_push(body, n);
+            let data = temp(pos, mk_hdr(pos, sym_ref_node(pos, out[LET_SYM]), 2), ty_int);
+            vec_push(body, data);
+            let j = declare_local(pos, "$", ty_int);
+            vec_push(body, let_stmt(pos, j, mk_int(pos, 0, ty_int)));
+            let w = node_new(ST_WHILE, pos);
+            w[WH_COND] = mk_bin(pos, "<", sym_ref_node(pos, j), sym_ref_node(pos, n[LET_SYM]), ty_bool);
+            w[WH_POST] = assign_stmt(pos, sym_ref_node(pos, j), mk_bin(pos, "+", sym_ref_node(pos, j), mk_int(pos, 1, ty_int), ty_int));
+            let wb = empty_block(pos);
+            let cell = mk_mem(pos, sym_ref_node(pos, data[LET_SYM]), sym_ref_node(pos, j), type_width(et), 0, et);
+            let cell2 = mk_mem(pos, sym_ref_node(pos, data[LET_SYM]), sym_ref_node(pos, j), type_width(et), 0, et);
+            vec_push(wb[BLK_STMTS], assign_stmt(pos, cell, keep_call(pos, arenacopy_fn(et), cell2, et)));
+            w[WH_BODY] = wb;
+            vec_push(body, w);
+        }
+        ret[RET_VALUE] = sym_ref_node(pos, out[LET_SYM]);
+    } else if k == K_STRUCT && t[TY_ENUM] {
+        let out = temp(pos, rt_call(pos, "rt_arena_raw", args2(sym_ref_node(pos, x), mk_int(pos, t[TY_SIZE], ty_int)), t), t);
+        vec_push(body, out);
+        let vs = t[TY_ENUM];
+        let vi = 0;
+        while vi < vs[VEC_LEN] {
+            let v = vec_get(vs, vi);
+            let ifs = node_new(ST_IF, pos);
+            ifs[IF_COND] = mk_bin(pos, "==", mk_mem(pos, sym_ref_node(pos, out[LET_SYM]), 0, 0, field_offset(t, 0), ty_int), mk_int(pos, vi, ty_int), ty_bool);
+            ifs[IF_THEN] = empty_block(pos);
+            let kk = 0;
+            while kk < vec_get(v, 2) {
+                let fi = vec_get(v, 1) + kk;
+                let ft = field_type(t, fi);
+                if is_ref(ft) {
+                    let src = mk_mem(pos, sym_ref_node(pos, out[LET_SYM]), 0, 0, field_offset(t, fi), ft);
+                    vec_push(ifs[IF_THEN][BLK_STMTS], assign_stmt(pos, field_store(pos, sym_ref_node(pos, out[LET_SYM]), t, fi), keep_call(pos, arenacopy_fn(ft), src, ft)));
+                }
+                kk = kk + 1;
+            }
+            vec_push(body, ifs);
+            vi = vi + 1;
+        }
+        ret[RET_VALUE] = sym_ref_node(pos, out[LET_SYM]);
+    } else if k == K_STRUCT {
+        let out = temp(pos, rt_call(pos, "rt_arena_raw", args2(sym_ref_node(pos, x), mk_int(pos, t[TY_SIZE], ty_int)), t), t);
+        vec_push(body, out);
+        let fi = 0;
+        while fi < t[TY_FIELDS][VEC_LEN] {
+            let ft = field_type(t, fi);
+            if is_ref(ft) {
+                let src = mk_mem(pos, sym_ref_node(pos, out[LET_SYM]), 0, 0, field_offset(t, fi), ft);
+                vec_push(body, assign_stmt(pos, field_store(pos, sym_ref_node(pos, out[LET_SYM]), t, fi), keep_call(pos, arenacopy_fn(ft), src, ft)));
+            }
+            fi = fi + 1;
+        }
+        ret[RET_VALUE] = sym_ref_node(pos, out[LET_SYM]);
+    } else if k == K_MAP {
+        // A new pool map, filled entry by entry with copied keys and values.
+        let out = temp(pos, rt_call(pos, "rt_arena_map_new", args1(sym_ref_node(pos, x)), t), t);
+        vec_push(body, out);
+        let slots = temp(pos, rt_call(pos, "rt_map_slots", args1(sym_ref_node(pos, x)), ty_int), ty_int);
+        vec_push(body, slots);
+        let j = declare_local(pos, "$", ty_int);
+        vec_push(body, let_stmt(pos, j, mk_int(pos, 0, ty_int)));
+        let w = node_new(ST_WHILE, pos);
+        w[WH_COND] = mk_bin(pos, "<", sym_ref_node(pos, j), sym_ref_node(pos, slots[LET_SYM]), ty_bool);
+        w[WH_POST] = assign_stmt(pos, sym_ref_node(pos, j), mk_bin(pos, "+", sym_ref_node(pos, j), mk_int(pos, 1, ty_int), ty_int));
+        let wb = empty_block(pos);
+        w[WH_BODY] = wb;
+        let live = node_new(ST_IF, pos);
+        live[IF_COND] = rt_call(pos, "rt_map_live", args2(sym_ref_node(pos, x), sym_ref_node(pos, j)), ty_bool);
+        live[IF_THEN] = empty_block(pos);
+        let kv = from_bits(rt_call(pos, "rt_map_key", args2(sym_ref_node(pos, x), sym_ref_node(pos, j)), ty_int), t[TY_KEY]);
+        let vv = from_bits(rt_call(pos, "rt_map_val", args2(sym_ref_node(pos, x), sym_ref_node(pos, j)), ty_int), t[TY_ELEM]);
+        let kc = key_composite(t[TY_KEY]);
+        if kc {
+            // An encoded key: rt_map_setk copies its bytes into the new map.
+            kv = from_bits(rt_call(pos, "rt_map_key", args2(sym_ref_node(pos, x), sym_ref_node(pos, j)), ty_int), ty_string);
+        } else if is_ref(t[TY_KEY]) {
+            kv = keep_call(pos, arenacopy_fn(t[TY_KEY]), kv, t[TY_KEY]);
+        }
+        if is_ref(t[TY_ELEM]) {
+            vv = keep_call(pos, arenacopy_fn(t[TY_ELEM]), vv, t[TY_ELEM]);
+        }
+        let setname = "rt_map_set";
+        if kc {
+            setname = "rt_map_setk";
+        }
+        vec_push(live[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, setname, args3(sym_ref_node(pos, out[LET_SYM]), to_bits(kv), to_bits(vv)), ty_void)));
+        vec_push(wb[BLK_STMTS], live);
+        vec_push(body, w);
+        ret[RET_VALUE] = sym_ref_node(pos, out[LET_SYM]);
+    } else {
+        ret[RET_VALUE] = sym_ref_node(pos, x);
+    }
+    vec_push(body, ret);
+    ck_fn = saved_fn;
+    return f;
 }
 
 // type_cycle reports whether t can reach itself through references (keep would not end).

@@ -1,6 +1,7 @@
 package seal
 
 import "bits"
+import "quarry"
 
 // ---- AES (FIPS 197) and GCM (SP 800-38D), constant-time software ----
 // AES runs bitsliced: four blocks at a time sit in eight u64 bit planes (plane i holds bit i
@@ -114,6 +115,9 @@ func aes_encrypt4(q mut []u64, rk []u64, nr i64) {
 
 // aes_sub_word is the S-box on each byte of w, in constant time.
 func aes_sub_word(w u32) u32 {
+	if gcm_hw {
+		return u32(aes_hw_subword(u64(w)))
+	}
 	q := make([]u64, 8)
 	for i := 0; i < 8; i++ {
 		for b := 0; b < 4; b++ {
@@ -181,6 +185,38 @@ func aes_bitslice_keys(rkb []u8) []u64 {
 		}
 	}
 	return out
+}
+
+// ---- the CPU's AES and carry-less multiply instructions ----
+// ARMv8 AESE/AESMC/PMULL and x86-64 AES-NI/PCLMULQDQ run in constant time. The compiler
+// replaces the four bodies below with hand-assembled code (selfhost/aes_hw.tin, generated
+// from tools/arch/aes-gcm-*.S); aes_hw (seal_<os>.tin) says whether the CPU has them, and
+// TIN_SEAL_SOFT=1 in the environment forces the software path (for tests).
+
+// gcm_hw is true when AES-GCM uses the CPU's instructions (decided once per core).
+var gcm_hw = aes_hw() && quarry.Getenv("TIN_SEAL_SOFT") != "1"
+
+// aes_hw_ctr XORs n 16-byte blocks at src with AES(rk, counter) into dst, incrementing the
+// counter block at ctr (big-endian, last four bytes) per block.
+func aes_hw_ctr(rk i64, nr i64, ctr i64, src i64, dst i64, n i64) {
+	rt_panic("seal: hardware AES is not available for this target")
+}
+
+// aes_hw_subword is the S-box on each byte of w, on the CPU's AES instructions.
+func aes_hw_subword(w u64) u64 {
+	rt_panic("seal: hardware AES is not available for this target")
+	return 0
+}
+
+// ghash_hw folds n 16-byte blocks at data into the GHASH state at state under H at h.
+func ghash_hw(state i64, h i64, data i64, n i64) {
+	rt_panic("seal: hardware GHASH is not available for this target")
+}
+
+// aes_hw_cpu is 1 when an x86-64 CPU has AES-NI, PCLMULQDQ, SSSE3 and SSE4.1 (CPUID).
+func aes_hw_cpu() i64 {
+	rt_panic("seal: CPUID is only available on x86-64")
+	return 0
 }
 
 // ---- GHASH ----
@@ -262,6 +298,25 @@ func ghash_blocks(y0 u64, y1 u64, h0 u64, h1 u64, p i64, n i64) (u64, u64) {
 // gcm_ctr XORs n bytes at src with the keystream from counter block j (incremented per
 // block, big-endian in its last four bytes) into dst.
 func gcm_ctr(a AEAD, dst i64, src i64, n i64, j mut []u8) {
+	if a.hw {
+		full := n / 16
+		jp := cast(i64, j)[2]
+		rkp := cast(i64, a.rkb)[2]
+		aes_hw_ctr(rkp, a.nr, jp, src, dst, full)
+		rest := n - 16*full
+		if rest > 0 {
+			blk := make([]u8, 16)
+			bp := cast(i64, blk)[2]
+			for i := 0; i < rest; i++ {
+				blk[i] = load8(src + 16*full + i)
+			}
+			aes_hw_ctr(rkp, a.nr, jp, bp, bp, 1)
+			for i := 0; i < rest; i++ {
+				store8(dst+16*full+i, blk[i])
+			}
+		}
+		return
+	}
 	q := make([]u64, 8)
 	ks := make([]u8, 64)
 	kp := cast(i64, ks)[2]
@@ -292,6 +347,9 @@ func gcm_ctr(a AEAD, dst i64, src i64, n i64, j mut []u8) {
 
 // gcm_tag is GHASH(aad, ct) xor E(J0).
 func gcm_tag(a AEAD, nonce []u8, aad []u8, ct i64, n i64) []u8 {
+	if a.hw {
+		return gcm_tag_hw(a, nonce, aad, ct, n)
+	}
 	y0, y1 := ghash_blocks(0, 0, a.h0, a.h1, cast(i64, aad)[2], len(aad))
 	y0, y1 = ghash_blocks(y0, y1, a.h0, a.h1, ct, n)
 	lens := make([]u8, 16)
@@ -315,6 +373,41 @@ func gcm_tag(a AEAD, nonce []u8, aad []u8, ct i64, n i64) []u8 {
 		tag[i] ^= ek[i]
 	}
 	return tag
+}
+
+// ghash_hw_bytes folds n bytes at p (zero-padded to 16) into the state at sp.
+func ghash_hw_bytes(sp i64, hp i64, p i64, n i64) {
+	full := n / 16
+	ghash_hw(sp, hp, p, full)
+	if n > 16*full {
+		pad := make([]u8, 16)
+		for i := 0; i < n-16*full; i++ {
+			pad[i] = load8(p + 16*full + i)
+		}
+		ghash_hw(sp, hp, cast(i64, pad)[2], 1)
+	}
+}
+
+// gcm_tag_hw is gcm_tag with the CPU's instructions.
+func gcm_tag_hw(a AEAD, nonce []u8, aad []u8, ct i64, n i64) []u8 {
+	st := make([]u8, 16)
+	sp := cast(i64, st)[2]
+	hp := cast(i64, a.hb)[2]
+	ghash_hw_bytes(sp, hp, cast(i64, aad)[2], len(aad))
+	ghash_hw_bytes(sp, hp, ct, n)
+	lens := make([]u8, 16)
+	for i := 0; i < 8; i++ {
+		lens[7-i] = u8(u64(len(aad)) * 8 >> u64(8*i))
+		lens[15-i] = u8(u64(n) * 8 >> u64(8*i))
+	}
+	ghash_hw(sp, hp, cast(i64, lens)[2], 1)
+	j0 := make([]u8, 16)
+	for i := 0; i < 12; i++ {
+		j0[i] = nonce[i]
+	}
+	j0[15] = 1
+	aes_hw_ctr(cast(i64, a.rkb)[2], a.nr, cast(i64, j0)[2], sp, sp, 1)
+	return st
 }
 
 // gcm_counter is J0 + 1: the counter block of the first data block.
@@ -365,7 +458,15 @@ func NewAESGCM(key secret []u8) !AEAD {
 		fail "seal: AES key must be 16, 24 or 32 bytes"
 	}
 	rkb := aes_expand(key)
-	a := AEAD{kind: aeadAESGCM, key: []u8{}, rk: aes_bitslice_keys(rkb), nr: len(key)/4 + 6}
+	nr := len(key)/4 + 6
+	if gcm_hw {
+		// H = E(0^128), in GCM's byte order for the hardware GHASH.
+		h := make([]u8, 16)
+		ctr := make([]u8, 16)
+		aes_hw_ctr(cast(i64, rkb)[2], nr, cast(i64, ctr)[2], cast(i64, h)[2], cast(i64, h)[2], 1)
+		return AEAD{kind: aeadAESGCM, rkb: rkb, nr: nr, hw: true, hb: h}
+	}
+	a := AEAD{kind: aeadAESGCM, rk: aes_bitslice_keys(rkb), nr: nr}
 	// H = E(0^128), kept with its bits reversed.
 	z := make([]u8, 64)
 	q := make([]u64, 8)
