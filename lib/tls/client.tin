@@ -1,0 +1,237 @@
+package tls
+
+import "say"
+import "seal"
+
+// ---- the client handshake (RFC 8446 section 2, full handshake without PSK) ----
+
+// hello holds the client's random choices for one handshake; the RFC 8448 trace test fixes
+// them and the ClientHello bytes (raw).
+type hello struct {
+	random  []u8
+	session []u8
+	x25519  []u8 // X25519 private key
+	raw     []u8 // a ClientHello to send as is (tests only; empty: build one)
+}
+
+func new_hello() hello {
+	return hello{random: seal.RandomBytes(32), session: seal.RandomBytes(32), x25519: seal.X25519NewPrivateKey(), raw: []u8{}}
+}
+
+// hsReader collects handshake messages from records.
+type hsReader struct {
+	buf []u8
+}
+
+// next returns the next handshake message (header and body) of the server's flight.
+func (h mut hsReader) next(c mut Conn) !(i64, []u8) {
+	for {
+		if len(h.buf) >= 4 {
+			n := i64(h.buf[1])<<16 | i64(h.buf[2])<<8 | i64(h.buf[3])
+			if n > 262144 {
+				fail alert_fault(alertDecodeError, "handshake message too large")
+			}
+			if len(h.buf) >= 4+n {
+				msg := clone(h.buf[:4+n])
+				rest := clone(h.buf[4+n:])
+				h.buf = rest
+				return i64(msg[0]), msg
+			}
+		}
+		typ, data := try c.read_record()
+		if typ == ctAlert {
+			try handle_alert(data)
+			fail "tls: handshake ended by close_notify"
+		}
+		if typ != ctHandshake {
+			fail alert_fault(alertUnexpectedMessage, say.Fmt("unexpected record type %d during the handshake", typ))
+		}
+		if len(data) == 0 {
+			fail alert_fault(alertUnexpectedMessage, "empty handshake record")
+		}
+		h.buf = cat(h.buf, data)
+	}
+	return 0, []u8{}
+}
+
+// empty is true when no partial message is buffered (keys may change only then).
+func (h hsReader) empty() bool {
+	return len(h.buf) == 0
+}
+
+// handle_alert fails with the peer's alert, or returns for close_notify.
+func handle_alert(data []u8) ! {
+	if len(data) != 2 {
+		fail alert_fault(alertDecodeError, "malformed alert")
+	}
+	if data[1] == alertCloseNotify {
+		return
+	}
+	fail say.Fault("tls: remote error: %s", alert_name(i64(data[1])))
+}
+
+// handshake runs the client side on c (a fresh connection) for server name name.
+func (c mut Conn) handshake(cfg Config, name str, hi hello) ! {
+	offered := suites()
+	group := groupX25519
+	priv := hi.x25519
+	share := try seal.X25519PublicKey(priv)
+	ch := hi.raw
+	if len(ch) == 0 {
+		ch = client_hello(hi.random, hi.session, offered, name, cfg.ALPN, group, share, []u8{})
+	}
+	transcript := clone(ch)
+	try c.write_records(ctHandshake, ch)
+	hr := hsReader{buf: []u8{}}
+	typ, msg := try hr.next(mut c)
+	if typ != hsServerHello {
+		fail alert_fault(alertUnexpectedMessage, "expected ServerHello")
+	}
+	sh := try parse_server_hello(msg[4:], hi.session)
+	retried := false
+	if sh.retry {
+		// HelloRetryRequest: answer once with a key share for the group the server asked for.
+		if !in_list(offered, sh.suite) {
+			fail alert_fault(alertIllegalParameter, "server chose a cipher suite that was not offered")
+		}
+		if sh.group != groupP256 {
+			fail alert_fault(alertIllegalParameter, "HelloRetryRequest asks for a group that was not offered or was already sent")
+		}
+		if len(hi.raw) != 0 {
+			fail alert_fault(alertInternalError, "a fixed ClientHello cannot be retried")
+		}
+		h := suite_hash(sh.suite)
+		// The transcript restarts with message_hash(ClientHello1), then the retry request.
+		first := handshake_msg(hsMessageHash, transcript_hash(h, transcript))
+		transcript = cat(first, msg)
+		group = groupP256
+		priv = seal.P256NewPrivateKey()
+		share = try seal.P256PublicKey(priv)
+		ch2 := client_hello(hi.random, hi.session, offered, name, cfg.ALPN, group, share, sh.cookie)
+		transcript = cat(transcript, ch2)
+		try c.write_records(ctHandshake, ch2)
+		retried = true
+		suite := sh.suite
+		typ, msg = try hr.next(mut c)
+		if typ != hsServerHello {
+			fail alert_fault(alertUnexpectedMessage, "expected ServerHello")
+		}
+		sh = try parse_server_hello(msg[4:], hi.session)
+		if sh.retry {
+			fail alert_fault(alertUnexpectedMessage, "a second HelloRetryRequest")
+		}
+		if sh.suite != suite {
+			fail alert_fault(alertIllegalParameter, "ServerHello changed the cipher suite of the HelloRetryRequest")
+		}
+	}
+	if !in_list(offered, sh.suite) {
+		fail alert_fault(alertIllegalParameter, "server chose a cipher suite that was not offered")
+	}
+	if sh.group != group || len(sh.share) == 0 {
+		fail alert_fault(alertIllegalParameter, "ServerHello key share is not for the group offered")
+	}
+	transcript = cat(transcript, msg)
+	c.suite = sh.suite
+	c.hash = suite_hash(sh.suite)
+	h := c.hash
+	shared := []u8{}
+	if group == groupX25519 {
+		shared = seal.X25519(priv, sh.share) catch _ {
+			fail alert_fault(alertIllegalParameter, "invalid X25519 key share")
+		}
+	} else {
+		if len(sh.share) != 65 || sh.share[0] != 4 {
+			fail alert_fault(alertIllegalParameter, "invalid P-256 key share")
+		}
+		shared = seal.P256ECDH(priv, sh.share) catch _ {
+			fail alert_fault(alertIllegalParameter, "invalid P-256 key share")
+		}
+	}
+	if !hr.empty() {
+		fail alert_fault(alertUnexpectedMessage, "handshake data before a key change")
+	}
+	sc := try handshake_secrets(h, shared, transcript_hash(h, transcript))
+	try c.set_read_key(sc.shs)
+	try c.set_write_key(sc.chs)
+	// The server's encrypted flight.
+	typ, msg = try hr.next(mut c)
+	if typ != hsEncryptedExtensions {
+		fail alert_fault(alertUnexpectedMessage, "expected EncryptedExtensions")
+	}
+	c.alpn = try parse_encrypted_extensions(msg[4:], cfg.ALPN, hello_extensions(ch))
+	transcript = cat(transcript, msg)
+	typ, msg = try hr.next(mut c)
+	requested := false
+	reqctx := []u8{}
+	if typ == hsCertificateRequest {
+		reqctx = try parse_certificate_request(msg[4:])
+		requested = true
+		transcript = cat(transcript, msg)
+		typ, msg = try hr.next(mut c)
+	}
+	if typ != hsCertificate {
+		fail alert_fault(alertUnexpectedMessage, "expected Certificate")
+	}
+	certs := try parse_certificate(msg[4:])
+	transcript = cat(transcript, msg)
+	typ, msg = try hr.next(mut c)
+	if typ != hsCertificateVerify {
+		fail alert_fault(alertUnexpectedMessage, "expected CertificateVerify")
+	}
+	cv := rdr{b: msg[4:]}
+	scheme := cv.u16v()
+	sig := cv.vec16()
+	if cv.bad || !cv.done() {
+		fail alert_fault(alertDecodeError, "malformed CertificateVerify")
+	}
+	if scheme == 0x0401 || scheme == 0x0501 || scheme == 0x0601 || !in_list(sigSchemes, scheme) {
+		fail alert_fault(alertIllegalParameter, "CertificateVerify uses a scheme that was not offered")
+	}
+	try verify_peer(cfg, name, certs, scheme, cv_content(transcript_hash(h, transcript)), sig)
+	c.certs = certs
+	transcript = cat(transcript, msg)
+	typ, msg = try hr.next(mut c)
+	if typ != hsFinished {
+		fail alert_fault(alertUnexpectedMessage, "expected Finished")
+	}
+	want := try finished_mac(h, sc.shs, transcript_hash(h, transcript))
+	if !seal.ConstantTimeEq(want, msg[4:]) {
+		fail alert_fault(alertDecryptError, "server Finished does not verify")
+	}
+	transcript = cat(transcript, msg)
+	if !hr.empty() {
+		fail alert_fault(alertUnexpectedMessage, "handshake data after the server Finished")
+	}
+	thash := transcript_hash(h, transcript)
+	cats := try derive_secret(h, sc.master, "c ap traffic", thash)
+	sap := try derive_secret(h, sc.master, "s ap traffic", thash)
+	try c.set_read_key(sap)
+	// The client's flight under its handshake keys: an empty Certificate if one was asked
+	// for (this client has none), then Finished.
+	flight := []u8{}
+	if requested {
+		body := make([]u8, 0, 8)
+		body = append(body, u8(len(reqctx)))
+		body = append(body, reqctx...)
+		body = append(body, 0, 0, 0)
+		cm := handshake_msg(hsCertificate, body)
+		flight = cat(flight, cm)
+		transcript = cat(transcript, cm)
+	}
+	fin := try finished_mac(h, sc.chs, transcript_hash(h, transcript))
+	flight = cat(flight, handshake_msg(hsFinished, fin))
+	try c.write_records(ctHandshake, flight)
+	try c.set_write_key(cats)
+	c.group = group
+	c.retried = retried
+	c.ready = true
+}
+
+func in_list(xs []i64, v i64) bool {
+	for _, x := range xs {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}

@@ -1,0 +1,242 @@
+// Package tls is TLS 1.3 (RFC 8446) for clients: tls.Dial connects and handshakes, and Conn
+// reads and writes like wire.Conn. Cipher suites: TLS_AES_128_GCM_SHA256,
+// TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256; key exchange X25519, or P-256 when
+// the server asks for it. The server's certificate is verified by default. No 0-RTT, no
+// resumption, no renegotiation and no TLS 1.2. Every wait lets the core serve other tasks and
+// honours Config.Timeout during the handshake, SetTimeout afterwards and a request's deadline.
+//
+//	c := try tls.Dial("example.com:443", tls.Config{ALPN: []str{"http/1.1"}})
+//	try c.Write("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+package tls
+
+import "say"
+import "wire"
+
+// Config configures a client connection; the zero value verifies the server against the
+// system's roots for the name in the address.
+type Config struct {
+	ServerName         str   // name sent in SNI and checked against the certificate (Dial: the host in addr)
+	RootCAs            str   // PEM certificates to trust in addition to the system's ("": the system's only)
+	ALPN               []str // application protocols to offer, most preferred first
+	Timeout            i64   // ns for connecting and the handshake (0: no limit; a request's deadline still applies)
+	InsecureSkipVerify bool  // FOR TESTS ONLY: accept any certificate for any name, which lets anyone in the path read and change the traffic
+}
+
+// Dial connects to "host:port" and runs the handshake. ServerName defaults to host.
+func Dial(addr str, cfg Config) !Conn {
+	tcp := try wire.DialTimeout(addr, cfg.Timeout)
+	name := cfg.ServerName
+	if name == "" {
+		name = host_of(addr)
+	}
+	return try start(tcp, cfg, name, new_hello())
+}
+
+// Client runs the handshake over an established connection, for protocols that switch to
+// TLS mid-stream (MySQL, PostgreSQL). cfg.ServerName is required unless InsecureSkipVerify
+// is set. The Conn owns conn from then on: its Close closes conn.
+func Client(conn wire.Conn, cfg Config) !Conn {
+	if cfg.ServerName == "" && !cfg.InsecureSkipVerify {
+		fail "tls: Client needs Config.ServerName"
+	}
+	return try start(conn, cfg, cfg.ServerName, new_hello())
+}
+
+// start handshakes on tcp; on failure it sends the alert and closes tcp.
+func start(tcp wire.Conn, cfg Config, name str, hi hello) !Conn {
+	c := new_conn(tcp)
+	if cfg.Timeout > 0 {
+		c.until = rt_mono_ns() + cfg.Timeout
+	}
+	pendingAlert = 0
+	err := c.handshake(cfg, name, hi)
+	if err != nil {
+		desc := pendingAlert
+		if desc == 0 {
+			desc = alertInternalError
+		}
+		c.fault_close(err, desc)
+		fail err
+	}
+	c.until = 0
+	return c
+}
+
+// host_of is the host in "host:port" ("[v6]:port" gives v6).
+func host_of(addr str) str {
+	colon := len(addr)
+	for i := 0; i < len(addr); i++ {
+		if addr[i] == ':' {
+			colon = i
+		}
+	}
+	h := addr[:colon]
+	if len(h) >= 2 && h[0] == '[' && h[len(h)-1] == ']' {
+		h = h[1 : len(h)-1]
+	}
+	return h
+}
+
+// SetTimeout limits every later read and write to ns nanoseconds (0: no limit).
+func (c mut Conn) SetTimeout(ns i64) {
+	c.timeout = ns
+}
+
+// SetDeadline makes every later wait fail once the monotonic clock (tide.Now) passes at
+// (0: no deadline), whatever the per-call timeout: wire uses it for a whole HTTP call.
+func (c mut Conn) SetDeadline(at i64) {
+	c.until = at
+}
+
+// ALPN is the application protocol the server chose ("" when none).
+func (c Conn) ALPN() str {
+	return c.alpn
+}
+
+// CipherSuite is the negotiated cipher suite (TLS_AES_128_GCM_SHA256 and so on).
+func (c Conn) CipherSuite() i64 {
+	return c.suite
+}
+
+// Group is the key exchange: "X25519", or "P-256" when the server asked for it.
+func (c Conn) Group() str {
+	if c.group == groupP256 {
+		return "P-256"
+	}
+	return "X25519"
+}
+
+// PeerCertificates is the server's certificate chain as sent (DER, leaf first).
+func (c Conn) PeerCertificates() [][]u8 {
+	return c.certs
+}
+
+// Fd is the connection's descriptor (for waiting on it; never read or write it directly).
+func (c Conn) Fd() i64 {
+	return c.fd
+}
+
+// Buffered is how many decrypted bytes a Read returns without waiting.
+func (c Conn) Buffered() i64 {
+	return c.pe - c.ps
+}
+
+// Read appends up to max bytes of application data to buf and returns how many; after the
+// server's close_notify it fails with EOF (wire.IsEOF), and a connection the server drops
+// without close_notify is a fault, not EOF (a truncation would otherwise look complete).
+func (c mut Conn) Read(buf mut []u8, max i64) !i64 {
+	if c.failure != "" {
+		fail say.Fault("%s", c.failure)
+	}
+	if c.closed {
+		fail "tls: read on a closed connection"
+	}
+	for c.pe == c.ps {
+		if c.eof {
+			fail "EOF"
+		}
+		typ, data, err := c.read_record()
+		if err != nil {
+			desc := pendingAlert
+			if desc == 0 {
+				desc = alertInternalError
+			}
+			c.fault_close(err, desc)
+			fail err
+		}
+		if typ == ctApplicationData {
+			if len(data) == 0 {
+				c.alertCt++
+				if c.alertCt > 32 {
+					fail c.abort(alertUnexpectedMessage, "too many empty records")
+				}
+				continue
+			}
+			c.alertCt = 0
+			copy(c.plain, data)
+			c.ps = 0
+			c.pe = len(data)
+		} else if typ == ctHandshake {
+			if len(data) == 0 {
+				fail c.abort(alertUnexpectedMessage, "empty handshake record")
+			}
+			e2 := c.post_handshake(data)
+			if e2 != nil {
+				desc := pendingAlert
+				if desc == 0 {
+					desc = alertInternalError
+				}
+				c.fault_close(e2, desc)
+				fail e2
+			}
+		} else if typ == ctAlert {
+			e3 := handle_alert(data)
+			if e3 != nil {
+				c.failure = say.Str(e3)
+				c.closed = true
+				c.tcp.Close()
+				fail e3
+			}
+			c.eof = true
+		} else {
+			fail c.abort(alertUnexpectedMessage, "unexpected record")
+		}
+	}
+	n := c.pe - c.ps
+	if n > max {
+		n = max
+	}
+	buf = append(buf, c.plain[c.ps:c.ps+n]...)
+	c.ps += n
+	return n
+}
+
+// ReadFull reads exactly n bytes.
+func (c mut Conn) ReadFull(n i64) !str {
+	b := make([]u8, 0, n)
+	for len(b) < n {
+		try c.Read(mut b, n-len(b))
+	}
+	return str(b)
+}
+
+// WriteBytes sends all of b.
+func (c mut Conn) WriteBytes(b []u8) ! {
+	if c.failure != "" {
+		fail say.Fault("%s", c.failure)
+	}
+	if c.closed {
+		fail "tls: write on a closed connection"
+	}
+	if c.wseq >= rekeyAfter {
+		e1 := c.send_key_update(false)
+		if e1 != nil {
+			c.fault_close(e1, alertInternalError)
+			fail e1
+		}
+	}
+	err := c.write_records(ctApplicationData, b)
+	if err != nil {
+		c.failure = say.Str(err)
+		c.closed = true
+		c.tcp.Close()
+		fail err
+	}
+}
+
+// Write sends all of s.
+func (c mut Conn) Write(s str) ! {
+	try c.WriteBytes([]u8(s))
+}
+
+// Close sends close_notify and closes the connection; closing twice does nothing.
+func (c mut Conn) Close() {
+	if c.closed {
+		return
+	}
+	if c.ready {
+		c.send_alert(alertCloseNotify)
+	}
+	c.closed = true
+	c.tcp.Close()
+}

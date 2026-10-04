@@ -44,20 +44,47 @@ own constants and the same point code over it (phase 2).
 Exported: `P256NewPrivateKey`, `P256PublicKey`, `P256ECDH`, `Sha384`, `Sha512`, `Hmac`,
 `HkdfExtract`, `HkdfExpand`, `HkdfExpandLabel` (docs/STDLIB.md).
 
-## Phase 2 to phase 3: certificate verification (session B; built in #304)
+## Phase 2 to phase 3: certificate verification
+
+Session B's `notes/interface_tls.md` (#304) defines the certificate API the client uses:
+`ParseCertificate`, `Certificate.Verify(VerifyOptions{DNSName, Roots, Intermediates, Now})`,
+`NewCertPool`/`AddPEM`/`SystemRoots` and `Certificate.CheckTLSSignature(scheme, signed, sig)`.
+The client calls them from one place, `verify_peer` in `lib/tls/verify.tin`, with the chain as
+received (DER, leaf first), the server name, the SignatureScheme and the CertificateVerify
+content (64 spaces, the context string, a zero byte, the transcript hash). Until that API is on
+main, `verify_peer` refuses every server unless `InsecureSkipVerify` is set.
 
 Phase 2's files: `der.tin` (strict DER reader), `bignum.tin` (`monty_new`: Montgomery constants
 computed at run time, so `field.tin`'s `monty` serves RSA moduli), `rsa.tin` (PKCS #1 v1.5 and
 PSS verification), `x509.tin` (PEM, certificates, pools, chains, host names),
 `roots_linux.tin` / `roots_darwin.tin` (system bundle paths), `ecdsa.tin` (`VerifyECDSA`),
-`p384.tin` (P-384 over a curve value); later `ed25519.tin`. All exported, in `seal`:
+`p384.tin` (P-384 over a curve value); later `ed25519.tin`. All exported, in `seal`.
 
-    ParseCertificate(der []u8) !Certificate              // one DER certificate
-    ParseCertificatesPEM(pem str) ![]Certificate
-    NewCertPool() CertPool; p.Add(c); p.AddPEM(pem) !i64; SystemRoots() !CertPool
-    c.Verify(VerifyOptions{DNSName, Roots, Intermediates, Now, KeyUsages, MaxChain}) ![]Certificate
-    c.CheckTLSSignature(scheme i64, signed []u8, sig []u8) !
+## lib/tls (phase 3)
 
+| file | contents | used by the server (phase 5) |
+|---|---|---|
+| `tls.tin` | Config, Dial, Client, the public Conn methods | Conn methods |
+| `record.tin` | Conn state, socket I/O and waits, record protection, alerts, KeyUpdate | yes |
+| `schedule.tin` | cipher suites, key schedule, Finished MACs | yes |
+| `messages.tin` | wire-format reader/writer, ClientHello, parsers of the server's messages | the reader/writer |
+| `client.tin` | the client handshake | no |
+| `verify.tin` | the bridge to X.509 | no |
+
+Decisions:
+- A Conn changes only in place after the handshake (`seal.AEAD.Rekey`, copies into its own
+  slices), so the same Conn works in a request pool, a websocket's per-message pools and
+  `keep()`'s heap (the database clients, phase 4).
+- No middlebox-compatibility change_cipher_spec is sent; the server's is ignored during the
+  handshake. The session id is 32 random bytes (servers expect it).
+- The client offers only X25519 in its first key share and supported_groups lists P-256, so a
+  P-256-only server costs one HelloRetryRequest.
+- Signature schemes offered: ECDSA P-256/P-384, RSA-PSS SHA-256/384/512, Ed25519, and PKCS #1
+  v1.5 (for certificates only; a CertificateVerify with it is refused).
+- A server's CertificateRequest gets an empty Certificate (no client certificates yet).
+- After 2^24 records under one key the client sends KeyUpdate.
+
+Tests: `tools/ci/tls_check.py` (CI.md).
 The client parses the Certificate message's entries with `ParseCertificate`, puts all but the
 first into an `Intermediates` pool, and calls `leaf.Verify` with `DNSName` set to the server
 name (an IP literal is checked against the IP SANs). `Roots` nil means `SystemRoots()` (read

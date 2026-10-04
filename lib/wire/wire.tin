@@ -7,6 +7,7 @@
 package wire
 
 import "say"
+import "tls"
 
 
 // Conn is a TCP connection.
@@ -379,8 +380,9 @@ func (l mut Listener) Close() {
 
 // Options configure one client call (DoWith); the zero value is what Do uses.
 type Options struct {
-	Timeout i64 // ns for the whole call: connect, send and the complete response (0: no limit; a request's deadline still applies)
-	MaxBody i64 // largest response body accepted, in bytes (0: DefaultMaxBody)
+	Timeout i64         // ns for the whole call: connect, send and the complete response (0: no limit; a request's deadline still applies)
+	MaxBody i64         // largest response body accepted, in bytes (0: DefaultMaxBody)
+	TLS     ?tls.Config // for https://: roots, ALPN, InsecureSkipVerify (nil: verify against the system's roots); the server name is the URL's host
 }
 
 // DefaultMaxBody is the largest response body Do accepts (64 MiB, anvil's request limit):
@@ -445,13 +447,14 @@ func DoWith(method str, url str, headers []str, body str, opt Options) !Resp {
 			}
 		}
 	}
-	if len(url) < 7 || url[:7] != "http://" {
-		if len(url) >= 8 && url[:8] == "https://" {
-			fail "wire: https is not supported yet"
-		}
-		fail say.Fault("wire: %q is not an http:// URL", url)
+	secure := len(url) >= 8 && url[:8] == "https://"
+	if !secure && (len(url) < 7 || url[:7] != "http://") {
+		fail say.Fault("wire: %q is not an http:// or https:// URL", url)
 	}
 	rest := url[7:]
+	if secure {
+		rest = url[8:]
+	}
 	slash := len(rest)
 	for i := 0; i < len(rest); i++ {
 		if rest[i] == '/' || rest[i] == '?' {
@@ -476,10 +479,10 @@ func DoWith(method str, url str, headers []str, body str, opt Options) !Resp {
 	}
 	if !hasport {
 		addr = hostport + ":80"
+		if secure {
+			addr = hostport + ":443"
+		}
 	}
-	c := try DialTimeout(addr, opt.Timeout)
-	defer c.Close()
-	c.until = until
 	req := make([]u8, 0, 256+len(body))
 	req = append(req, method...)
 	req = append(req, ' ')
@@ -500,12 +503,53 @@ func DoWith(method str, url str, headers []str, body str, opt Options) !Resp {
 	}
 	req = append(req, "\r\n"...)
 	req = append(req, body...)
+	if secure {
+		cfg := tls.Config{ServerName: "", RootCAs: "", ALPN: []str{}, Timeout: opt.Timeout, InsecureSkipVerify: false}
+		given := opt.TLS
+		if given != nil {
+			cfg.RootCAs = given.RootCAs
+			cfg.ALPN = given.ALPN
+			cfg.InsecureSkipVerify = given.InsecureSkipVerify
+		}
+		cfg.ServerName = tls_host(hostport)
+		tc := try tls.Dial(addr, cfg)
+		defer tc.Close()
+		tc.SetDeadline(until)
+		try tc.WriteBytes(req)
+		r, err := read_response(mut tc, method == "HEAD", limit)
+		if err != nil {
+			fail err
+		}
+		return r
+	}
+	c := try DialTimeout(addr, opt.Timeout)
+	defer c.Close()
+	c.until = until
 	try c.WriteBytes(req)
-	r, err := read_response(c, method == "HEAD", limit)
+	r, err := read_response(mut c, method == "HEAD", limit)
 	if err != nil {
 		fail err
 	}
 	return r
+}
+
+// tls_host is the host of "host[:port]" for SNI and certificate checks ("[v6]" gives v6).
+func tls_host(hostport str) str {
+	h := hostport
+	if len(h) > 0 && h[0] == '[' {
+		for i := 0; i < len(h); i++ {
+			if h[i] == ']' {
+				return h[1:i]
+			}
+		}
+		return h
+	}
+	for i := 0; i < len(h); i++ {
+		if h[i] == ':' {
+			return h[:i]
+		}
+	}
+	return h
 }
 
 // is_token reports whether s is an HTTP token (a method or header name, RFC 9110 5.6.2).
@@ -542,8 +586,11 @@ func find_crlf2(b []u8) i64 {
 	return -1
 }
 
+// stream is what the response reader needs from a connection: a TCP Conn or a tls.Conn.
+shape stream { Read(buf mut []u8, max i64) !i64 }
+
 // read_head reads until buf holds a complete header block and returns its length.
-func read_head(c Conn, buf mut []u8) !i64 {
+func read_head[S stream](c mut S, buf mut []u8) !i64 {
 	hend := find_crlf2(buf)
 	for hend < 0 {
 		if len(buf) > 1048576 {
@@ -567,11 +614,11 @@ func read_head(c Conn, buf mut []u8) !i64 {
 // maxInformational bounds the 1xx responses accepted before the final one (as Go does).
 const maxInformational = 5
 
-func read_response(c Conn, head bool, limit i64) !Resp {
+func read_response[S stream](c mut S, head bool, limit i64) !Resp {
 	buf := make([]u8, 0, 4096)
 	informational := 0
 	for {
-		hend := try read_head(c, mut buf)
+		hend := try read_head(mut c, mut buf)
 		h := str(buf[:hend])
 		if len(h) < 12 || h[:5] != "HTTP/" {
 			fail "wire: malformed response"
@@ -614,7 +661,7 @@ func read_response(c Conn, head bool, limit i64) !Resp {
 			fail "wire: both Transfer-Encoding and Content-Length"
 		}
 		if chunked {
-			b := try read_chunked(c, rest, limit)
+			b := try read_chunked(mut c, rest, limit)
 			r.Body = b
 			return r
 		}
@@ -622,7 +669,7 @@ func read_response(c Conn, head bool, limit i64) !Resp {
 			fail say.Fault("wire: response body of %d bytes is over the %d-byte limit", n, limit)
 		}
 		if n >= 0 {
-			b := try read_length(c, rest, n)
+			b := try read_length(mut c, rest, n)
 			r.Body = b
 			return r
 		}
@@ -767,7 +814,7 @@ func content_length(r Resp) !i64 {
 
 // read_length reads an n-byte body after the pending bytes, growing the buffer as data arrives
 // instead of reserving the announced size up front.
-func read_length(c Conn, pending []u8, n i64) !str {
+func read_length[S stream](c mut S, pending []u8, n i64) !str {
 	start := n
 	if start > 65536 {
 		start = 65536
@@ -808,7 +855,7 @@ func chunk_fault(err fault) ! {
 }
 
 // chunk_line reads until buf holds a CRLF-terminated line at pos and returns the index of its CR.
-func chunk_line(c Conn, buf mut []u8, pos i64) !i64 {
+func chunk_line[S stream](c mut S, buf mut []u8, pos i64) !i64 {
 	scan := pos
 	for {
 		for i := scan; i < len(buf); i++ {
@@ -877,10 +924,10 @@ func chunk_size(buf []u8, pos i64, end i64) !i64 {
 }
 
 // chunk_trailers reads the trailer fields after the last chunk up to the empty line; they are ignored.
-func chunk_trailers(c Conn, buf mut []u8, pos i64) ! {
+func chunk_trailers[S stream](c mut S, buf mut []u8, pos i64) ! {
 	start := pos
 	for {
-		end := try chunk_line(c, mut buf, pos)
+		end := try chunk_line(mut c, mut buf, pos)
 		if end == pos {
 			return
 		}
@@ -902,17 +949,17 @@ func chunk_trailers(c Conn, buf mut []u8, pos i64) ! {
 }
 
 // read_chunked decodes a chunked body; pending holds bytes already read.
-func read_chunked(c Conn, pending []u8, limit i64) !str {
+func read_chunked[S stream](c mut S, pending []u8, limit i64) !str {
 	buf := make([]u8, 0, len(pending)+4096)
 	buf = append(buf, pending...)
 	out := make([]u8, 0, 4096)
 	pos := 0
 	for {
-		end := try chunk_line(c, mut buf, pos)
+		end := try chunk_line(mut c, mut buf, pos)
 		size := try chunk_size(buf, pos, end)
 		pos = end + 2
 		if size == 0 {
-			try chunk_trailers(c, mut buf, pos)
+			try chunk_trailers(mut c, mut buf, pos)
 			return str(out)
 		}
 		if size > limit-len(out) {
