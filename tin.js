@@ -74,6 +74,9 @@
   }
 
   function ready() {
+    // On phones the contents panel starts closed.
+    var toc = document.querySelector('.side .toc');
+    if (toc && window.innerWidth <= 900) toc.open = false;
     var blocks = document.querySelectorAll('pre code.tin');
     for (var b = 0; b < blocks.length; b++) {
       var el = blocks[b], text = el.textContent;

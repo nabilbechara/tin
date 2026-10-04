@@ -1327,13 +1327,13 @@ FOOT = '''
 '''
 
 def syntax_page():
-    side = ['<aside class="side">']
+    side = ['<aside class="side"><details class="toc" open><summary>Contents</summary><nav>']
     for s in S:
         side.append(f'<h4>{s["n"]}</h4><a href="#{s["id"]}">{inline(s["title"])}</a><div class="sub">')
         for c in s["cards"]:
             side.append(f'<a href="#{c["id"]}">{inline(c["title"])}</a>')
         side.append("</div>")
-    side.append("</aside>")
+    side.append("</nav></details></aside>")
     main = ['<main class="main"><header><h1>The syntax of Tin</h1>',
             '<p>Every construct on one page: a short explanation, an example, and a <b>Deeper</b> arrow when there is more to say. Tin 1 (edition 1) spelling.</p>',
             '<div class="notice"><span>⚙</span><div><b>Status.</b> This is the Tin 1 syntax. Today the compiler takes it with <code>tin build --edition 1</code>; the repository converts in <a href="https://github.com/yasserreslan/tin/issues/226">#226</a>, after which it is the default.</div></div>',
