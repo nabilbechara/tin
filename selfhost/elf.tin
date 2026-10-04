@@ -22,6 +22,92 @@ fn el_phdr(p, typ, flags, off, vaddr, filesz, memsz, align) {
     return p + 56;
 }
 
+var link_strip;   // -strip: no section headers or symbol table (#351)
+
+// el_extra is what the symbol table of nfn functions, the section names and six section
+// headers add after the loaded image, which ends at data_end; 0 with -strip (#351).
+fn el_extra(data_end, nfn) {
+    if link_strip {
+        return 0;
+    }
+    let sh = align_up(align_up(data_end, 8) + 24 * (nfn + 1) + 39, 8);
+    return sh + 64 * 6 - data_end;
+}
+
+fn el_shdr(p, name, typ, flags, addr, off, size) {
+    put32(p, name);
+    put32(p + 4, typ);
+    put64(p + 8, flags);
+    put64(p + 16, addr);
+    put64(p + 24, off);
+    put64(p + 32, size);
+}
+
+fn el_shdr_link(p, link, info, align, entsize) {
+    put32(p + 40, link);
+    put32(p + 44, info);
+    put64(p + 48, align);
+    put64(p + 56, entsize);
+}
+
+// el_symbols writes, after the loaded image, a symbol table of the functions own (their
+// names are the backtrace names without "tin.", at name_off in the name table), the
+// section names, and the section headers .text, .data, .symtab, .strtab and .shstrtab, so
+// nm, perf and gdb name the functions of a running Linux service (#351). lay is
+// [data_end, names offset, names length, text start, code end, text end, data start].
+fn el_symbols(img, own, name_off, lay) {
+    let data_end = vec_get(lay, 0);
+    let sym = align_up(data_end, 8);
+    let n = own[VEC_LEN];
+    let i = 0;
+    while i < n {
+        let f = vec_get(own, i);
+        let end = vec_get(lay, 4);
+        if i + 1 < n {
+            end = vec_get(own, i + 1)[F_ADDR];
+        }
+        let s = img + sym + 24 * (i + 1);
+        put32(s, vec_get(name_off, i) + 4);
+        store8(s + 4, 0x12);
+        store8(s + 6, 1);
+        put64(s + 8, f[F_ADDR]);
+        put64(s + 16, end - f[F_ADDR]);
+        i = i + 1;
+    }
+    let shstr = sym + 24 * (n + 1);
+    let names = buf_new();
+    buf_byte(names, 0);
+    buf_str(names, ".text");
+    buf_byte(names, 0);
+    buf_str(names, ".data");
+    buf_byte(names, 0);
+    buf_str(names, ".symtab");
+    buf_byte(names, 0);
+    buf_str(names, ".strtab");
+    buf_byte(names, 0);
+    buf_str(names, ".shstrtab");
+    buf_byte(names, 0);
+    memcpy(img + shstr, names[VEC_DATA], names[VEC_LEN]);
+    let sh = align_up(shstr + 39, 8);
+    let p = img + sh + 64;
+    el_shdr(p, 1, 1, 6, vec_get(lay, 3), vec_get(lay, 3), vec_get(lay, 5) - vec_get(lay, 3));
+    el_shdr_link(p, 0, 0, 16, 0);
+    p = p + 64;
+    el_shdr(p, 7, 1, 3, vec_get(lay, 6), vec_get(lay, 6), data_end - vec_get(lay, 6));
+    el_shdr_link(p, 0, 0, 8, 0);
+    p = p + 64;
+    el_shdr(p, 13, 2, 0, 0, sym, 24 * (n + 1));
+    el_shdr_link(p, 4, 1, 8, 24);
+    p = p + 64;
+    el_shdr(p, 21, 3, 0, 0, vec_get(lay, 1), vec_get(lay, 2));
+    el_shdr_link(p, 0, 0, 1, 0);
+    p = p + 64;
+    el_shdr(p, 29, 3, 0, 0, shstr, 39);
+    el_shdr_link(p, 0, 0, 1, 0);
+    put64(img + 40, sh);
+    put32(img + 60, 6 | (5 << 16));
+}
+
 // el_check_static stops the link when the program would import a function: a Linux
 // executable is static, and only the macOS runtime files declare externs (#125).
 fn el_check_static() {
@@ -131,7 +217,8 @@ fn write_elf(path) {
     lk_data = data_addr;
     lk_fndescs = lk_data + 8 * nvars;
     let data_end = lk_fndescs + 16 * prog_fns[VEC_LEN] + 8;
-    let file_size = data_end;
+    let extra = el_extra(data_end, own[VEC_LEN]);
+    let file_size = data_end + extra;
     let img = calloc(file_size, 1);
 
     // ELF header.
@@ -174,6 +261,17 @@ fn write_elf(path) {
     }
 
     el_start_static(img + start_addr, start_addr, entry_fn()[F_ADDR]);
+    if extra {
+        let lay = vec_new();
+        vec_push(lay, data_end);
+        vec_push(lay, dynstr_off);
+        vec_push(lay, dstr[VEC_LEN]);
+        vec_push(lay, text_addr);
+        vec_push(lay, lk_stubs);
+        vec_push(lay, text_end);
+        vec_push(lay, data_addr);
+        el_symbols(img, own, name_off, lay);
+    }
 
     // Machine code.
     let q = img + start_addr + 4 * E_START_WORDS;

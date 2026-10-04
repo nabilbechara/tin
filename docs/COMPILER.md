@@ -214,7 +214,9 @@ with segments aligned to 64 KiB on arm64 (any kernel page size) and 4 KiB on x86
 The program headers are `PT_PHDR`, three `PT_LOAD` and `PT_GNU_STACK`; there is no
 interpreter, dynamic section or GOT. `_start` passes the kernel's argc, argv and envp to
 main and calls `exit_group` with its result. A program that would import a function
-stops the link (E990). No section headers are written (none are needed to run).
+stops the link (E990). After the loaded image come the section headers `.text`, `.data`,
+`.symtab`, `.strtab` (the backtrace names, read without their `tin.` prefix) and
+`.shstrtab`, for `nm`, `perf` and `gdb` (#351); `-strip` leaves them out.
 
 Differences the backend handles per target: variadic C arguments are on the stack on
 macOS and in registers on Linux (`arg_regs`, `gen_call`); C symbols have a leading

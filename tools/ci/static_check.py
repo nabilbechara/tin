@@ -78,6 +78,31 @@ def run_in_containers(work, exe):
     return True
 
 
+def symbols(work, envprog, machine):
+    """#351: a Linux executable carries a symbol table that nm and addr2line read (so perf and
+    gdb name its functions); -strip leaves it and the section headers out."""
+    nm, addr2line = shutil.which('nm'), shutil.which('addr2line')
+    if nm is None or addr2line is None:
+        assert os.environ.get('CI') != 'true', 'CI needs binutils for the symbol check'
+        return False
+    env = dict(os.environ, TIN_ROOT=str(ROOT))
+    exe, bare = work / 'symbols', work / 'symbols-stripped'
+    subprocess.run([str(ROOT / 'bin/tinc'), '-target', 'linux-' + machine, '-o', str(exe), str(envprog)],
+                   check=True, timeout=60, env=env)
+    subprocess.run([str(ROOT / 'bin/tinc'), '-strip', '-target', 'linux-' + machine, '-o', str(bare), str(envprog)],
+                   check=True, timeout=60, env=env)
+    listed = subprocess.run([nm, str(exe)], capture_output=True, text=True, timeout=30).stdout
+    names = {line.split()[-1]: line.split()[0] for line in listed.splitlines() if ' T ' in line}
+    assert 'main.main' in names and 'quarry.Getenv' in names, sorted(names)[:20]
+    found = subprocess.run([addr2line, '-f', '-e', str(exe), '0x' + names['main.main']],
+                           capture_output=True, text=True, timeout=30).stdout
+    assert found.splitlines()[0] == 'main.main', found
+    gone = subprocess.run([nm, str(bare)], capture_output=True, text=True, timeout=30)
+    assert gone.stdout == '' and 'no symbols' in gone.stderr, gone
+    assert bare.stat().st_size < exe.stat().st_size
+    return True
+
+
 def main(programs=()):
     out = ROOT / 'bin/ci/static'
     out.mkdir(parents=True, exist_ok=True)
@@ -119,6 +144,7 @@ def main(programs=()):
         got = subprocess.run([str(exe)], env={'STATIC_A': 'one'}, capture_output=True, text=True, timeout=30)
         assert got.returncode == 0 and got.stdout == ENV_WANT, got
         contained = False
+        named = False
         if os.uname().sysname == 'Linux':
             # The compiler is static at every stage: the checked-in seed, the bin/tinc it builds
             # and the compiler that compiled itself (make bootstrap).
@@ -127,10 +153,12 @@ def main(programs=()):
                 assert compiler.exists(), f'{compiler} is missing: run make bootstrap first'
                 assert_static(compiler)
             contained = run_in_containers(work, exe)
+            named = symbols(work, envprog, machine)
     print('PASS static linux-arm64/amd64 images (no PT_INTERP, no PT_DYNAMIC); _start passes argc, argv and envp'
           + ('' if jailed is None else '; runs in an empty root')
           + '; a program using getenv/setenv and the compiler (seed, bin/tinc, stage 3) are static'
-          + ('; the program runs on Alpine and FROM scratch' if contained else ''))
+          + ('; the program runs on Alpine and FROM scratch' if contained else '')
+          + ('; nm and addr2line name its functions, and -strip removes the symbols' if named else ''))
 
 
 if __name__ == '__main__':
