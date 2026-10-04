@@ -76,10 +76,14 @@ def x25519(cases):
 
 def aead(cases, file, kind):
     """Wycheproof AEAD vectors: Seal gives ct||tag and Open the message for valid ones; Open
-    fails for invalid ones, and both fail for a bad nonce or key length."""
+    fails for invalid ones, and both fail for a bad nonce or key length. seal.AEAD takes only
+    12-byte nonces (like Go's cipher.NewGCM), so valid vectors with other nonce sizes must
+    fail too."""
     data = json.loads((VECTORS / file).read_text())
     for group in data['testGroups']:
         for t in group['tests']:
+            if t['result'] == 'valid' and group['ivSize'] != 96:
+                t = dict(t, result='invalid')
             args = f"{kind} {hx(bytes.fromhex(t['key']))} {hx(bytes.fromhex(t['iv']))} {hx(bytes.fromhex(t['aad']))}"
             sealed = t['ct'] + t['tag']
             name = f"{file} {t['tcId']}"
@@ -122,6 +126,7 @@ def main():
     ecdh(cases, 'ecdh_secp256r1_ecpoint_test.json', 'p256ecdh', 32)
     x25519(cases)
     aead(cases, 'chacha20_poly1305_test.json', 'chacha')
+    aead(cases, 'aes_gcm_test.json', 'aes')
     random_cases(cases)
     with tempfile.TemporaryDirectory(prefix='crypto-', dir=out) as tmp:
         exe = Path(tmp) / 'crypto_vectors'
