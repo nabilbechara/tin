@@ -682,6 +682,42 @@ err := r.Serve(":8080")                        // fails first if a pattern is ba
   network or a local TLS proxy. SSL-only servers fail clearly. CancelRequest is not sent;
   a timed-out query loses its connection and the server detects that disconnect.
 
+### Recording requests for replay (#241)
+
+A server records requests so that a failure seen in production can be replayed later with
+`tin replay` (#242). The design is `notes/design_semantics.md` §12, and the names and byte
+layouts are in `notes/interface_replay.md`.
+
+- **Switches**, read once before the cores start. Recording is on when `TIN_REPLAY_DIR`
+  (the spool directory) and `TIN_REPLAY_KEY` (64 hex digits) are both set. A malformed key
+  prints one line on stderr and leaves recording off. `TIN_REPLAY_SAMPLE` (0 to 1) is the
+  fraction of successful requests to keep as well; requests ending in a 5xx or a panic are
+  always kept. `TIN_REPLAY_MAX_MB` (default 256) bounds the spool, deleting the oldest
+  capsules first. `TIN_REPLAY_SECRET_HEADERS` adds header names to `Authorization`,
+  `Proxy-Authorization` and `Cookie`, whose values are stored as keyed handles.
+  `TIN_REPLAY_DROP_HEADERS` names headers stored empty.
+- **The tape.** Each request task gets a tape, malloc'd and outside the request pool, that
+  holds a copy of the request bytes. Scope children share it. Every effect a client
+  performs is appended to it in completion order: clocks (`tide`), the request's random
+  seed (`dice`), `seal.RandomBytes`, `wire` (HTTP, dial, read, write), `redis`, `mysql`,
+  `postgres`, `websocket` and `quarry`. Each record holds its kind, its key (what was
+  asked) and its outcome (the result, or the fault with its runtime sentinel). A live call
+  runs with the tape suspended, so a client calling itself is recorded once.
+- **Secrets never reach a capsule as text.** Secret headers, the values of those headers
+  in `wire` keys, and secret values written into query literals (`query.Hidden`) are
+  stored as `tin-secret:` and 32 hex digits of HMAC-SHA256 under a key derived from
+  `TIN_REPLAY_KEY`. Logins (Redis `AUTH`, database passwords) happen inside the live call
+  and are never recorded.
+- **Capsules.** When a request task ends, `lib/replay` keeps its tape when the status is
+  500 or more, the request panicked, or it is in the sample. The capsule is written on the
+  core after the task ended, as `WALL-CORE-N.tcap` in the spool, via a `.tmp` file and a
+  rename. The body (the request, the status, the panic message and the effect records) is
+  encrypted with an HMAC-SHA256 keystream and authenticated by an HMAC tag, so a wrong key
+  or a changed byte is refused.
+- **Cost.** Off, each effect call site tests the running task's tape: one per-core load
+  and a branch. A request costs one shared load in anvil. On, a request copies its bytes
+  once, and each effect appends one record (about 110 ns on a 2.8 GHz x86-64).
+
 ## 10. JSON: argo
 
 - `argo.Put(mut b, v)` compiles to a call of a generated encoder `argo$N(b, x)` per type.
@@ -730,6 +766,9 @@ functions keep that rule, and grows as phase 1 lands.
 | `P256PublicKey`, `P256ECDH` and the field and point code under them (`field.tin`, `p256.tin`) | the private key and every coordinate | the validity checks of the key and the peer's point, whose results are public |
 
 | `monty_new` (`bignum.tin`: Montgomery constants for a modulus given at run time) | the modulus's value | its limb count and bit length |
+| `SignPKCS1v15`, `SignPSS` (`rsa_sign.tin`: CRT, base blinding by r^e, r^-1 by Fermat inversion in each prime, a public-key check of every signature) and `monty_exp_ct`, `monty_reduce`, `nat_mul_ct` under them | the private key, the message representative and r | the key's size; PSS's salt is random and public |
+| `SignECDSA`, `PrivateKey.SignTLS` (`ecdsa_sign.tin`: RFC 6979 nonces by `Hmac`, k·G by `p256_mul` or `ec_mul_ct`, k^-1 as k^(n-2) with the public exponent) | the private scalar and the nonce | the digest, and the (negligibly rare, public) retry when a nonce candidate is not below n |
+| `ParsePrivateKeyPEM`, `ParsePrivateKeyDER` | nothing: the key's encoding (lengths, tags) is parsed with ordinary branches | |
 
 `Sha1`, `Pbkdf2Sha256`, the hex and base64 codecs and the RSA-OAEP code are not
 constant-time and must not be used on secrets in a timing-sensitive protocol path.

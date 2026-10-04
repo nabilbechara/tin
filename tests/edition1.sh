@@ -198,6 +198,17 @@ if ! cmp -s tests/edition1/run/secrets.audit "$tmp/secrets.audit"; then
 	diff -u tests/edition1/run/secrets.audit "$tmp/secrets.audit" || true
 	exit 1
 fi
+# A secret value written into a query literal is sent as itself; query.Hidden marks it so a
+# replay key holds its handle (#241), and the audit lists it.
+"$compiler" -edition 1 -o "$tmp/secret_query" tests/edition1/run/secret_query.tin
+"$tmp/secret_query" >"$tmp/secret_query.out" 2>/dev/null
+"$compiler" -edition 1 -audit-secrets tests/edition1/run/secret_query.tin >"$tmp/secret_query.audit"
+if ! cmp -s tests/edition1/run/secret_query.out "$tmp/secret_query.out" || ! cmp -s tests/edition1/run/secret_query.audit "$tmp/secret_query.audit"; then
+	echo "FAIL edition1/run/secret_query: output or audit differs"
+	diff -u tests/edition1/run/secret_query.out "$tmp/secret_query.out" || true
+	diff -u tests/edition1/run/secret_query.audit "$tmp/secret_query.audit" || true
+	exit 1
+fi
 for name in secret_sinks secret_rules
 do
 	if "$compiler" -edition 1 -o "$tmp/$name" "tests/edition1/$name.tin" >"$tmp/$name.out" 2>"$tmp/$name.err"; then
