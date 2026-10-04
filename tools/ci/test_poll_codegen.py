@@ -50,12 +50,15 @@ fn main() {
                         self.assertGreaterEqual(body('spin').count('[x28, #96]'), 2)
                         self.assertIn('bl _rt_bnd_poll', body('spin'))
                     else:
-                        # The listing annotates the numeric function label with its name.
+                        # Resolve the function labels from the listing header.
                         def body(name):
                             match = re.search(r'^# (L\d+): ' + name + r'\n', text, re.M)
                             self.assertIsNotNone(match, text[:2000])
                             label = match.group(1)
                             section = text.split('\n' + label + ':\n', 1)[1]
-                            return re.split(r'^# L\d+: ', section, maxsplit=1, flags=re.M)[0]
+                            labels = re.findall(r'^# (L\d+): ', text, re.M)
+                            ends = [section.find('\n' + label + ':\n') for label in labels]
+                            ends = [end for end in ends if end >= 0]
+                            return section[:min(ends)] if ends else section
                         self.assertNotIn('[r15+0x60]', body('kernel'))
                         self.assertGreaterEqual(body('spin').count('[r15+0x60]'), 2)
