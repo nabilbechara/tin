@@ -39,7 +39,8 @@ for the thread's whole life (callee-saved in both ABIs, so C code never disturbs
 | 4 | ctxID | the core number |
 | 6 | ctxIngot | 1 while initializers run: allocations go to the ingot heap |
 | 7, 8, 9 | ctxPoolBase, ctxPoolMark, ctxPoolExtra | the pool's first chunk, its high-water mark, overflow chunks and big blocks |
-| 10–31 | reserved | preserve compiler offsets; heap state is a per-core global |
+| 11 | vector mode | x86-64 AVX2 capability after CPUID/OSXSAVE/XGETBV checks; zero on arm64 |
+| 10, 12–31 | reserved | preserve compiler offsets; heap state is a per-core global |
 | 32+ | | the core's copy of every per-core global (global i at word 32+i) |
 
 Context blocks are allocated on their own 128-byte cache lines (`rt_aligned_alloc`) so
@@ -77,6 +78,13 @@ ingot tables when they grow. The compiler uses the same memory core with a singl
 Every allocation and mapping checks its size and failure result. Failure writes
 `tin: out of memory (N bytes)` to stderr from static bytes and stack words, then exits
 with status 2. This path creates no context, pool, format frame or heap block.
+Memory leaves use bounded NEON on arm64 and SSE2 on x86-64. Strict x86-64 programs
+cache AVX2 availability in context word 11 after checking CPU support and OS-managed
+XMM/YMM state. Medium forward copies and long comparisons/scans use AVX2 when available;
+small operations and unsupported CPUs retain SSE2. Legacy compiler programs never read
+a Tin context register. `TIN_ALLOC_TEST=1 TIN_MEMORY_SCALAR=1` forces the SSE2 path for
+correctness checks.
+
 `TIN_ALLOC_TEST=1` enables the test-only `TIN_FAIL_ALLOC_AFTER=N` counter, including
 startup allocations and mappings. Without that explicit flag the variable is ignored.
 

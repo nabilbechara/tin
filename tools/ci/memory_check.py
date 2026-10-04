@@ -27,6 +27,9 @@ def main():
         result = subprocess.run([str(exe)], capture_output=True, timeout=30, cwd=ROOT)
         (out / 'memory.log').write_bytes(result.stdout + result.stderr)
         assert result.returncode == 0 and result.stdout == reference, result
+        scalar = subprocess.run([str(exe)], capture_output=True, timeout=30,
+            env=dict(env, TIN_ALLOC_TEST='1', TIN_MEMORY_SCALAR='1'), cwd=ROOT)
+        assert scalar.returncode == 0 and scalar.stdout == reference, scalar
         # Injection is process-wide and counts allocations/mappings, including startup.
         # It is enabled only by the explicit test flag; ordinary environments ignore it.
         failures = list(range(41)) + [64, 128, 512, 1024, 4096]

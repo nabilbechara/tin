@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate bounded SSE2/NEON leaves from their relocation-free assembly sources."""
+"""Regenerate bounded vector leaves from their relocation-free assembly sources."""
 import argparse
 from pathlib import Path
 import struct
@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 NAMES = ('memcpy', 'memmove', 'memset', 'memcmp', 'memchr')
 
 
-def functions(path):
+def functions(path, wanted):
     data = path.read_bytes()
     shoff = struct.unpack_from('<Q', data, 40)[0]
     size, count = struct.unpack_from('<HH', data, 58)
@@ -26,10 +26,10 @@ def functions(path):
         for off in range(s[4], s[4]+s[5], s[9]):
             name, info, other, section, value, length = struct.unpack_from('<IBBHQQ', data, off)
             name = names[name:names.index(0, name)].decode()
-            if name in NAMES:
+            if name in wanted:
                 start = sections[section][4] + value
                 result[name] = data[start:start+length]
-    assert set(result) == set(NAMES)
+    assert set(result) == set(wanted)
     return result
 
 
@@ -39,15 +39,25 @@ def generate():
         for arch, target in [('arm64', 'aarch64-linux-gnu'), ('amd64', 'x86_64-linux-gnu')]:
             obj = Path(tmp)/f'{arch}.o'
             subprocess.run(['clang', '-target', target, '-c', str(ROOT/f'tools/arch/memory-fast-{arch}.S'), '-o', str(obj)], check=True)
-            table = functions(obj)
+            wanted = NAMES + (('mem_avx2_supported',) if arch == 'amd64' else ())
+            table = functions(obj, wanted)
+            vectors = {}
+            if arch == 'amd64':
+                subprocess.run(['clang', '-target', target, '-DMEMORY_VECTOR', '-c',
+                    str(ROOT/f'tools/arch/memory-fast-{arch}.S'), '-o', str(obj)], check=True)
+                vectors = functions(obj, wanted)
             text += ['', f'fn memory_fast_{arch}(name) {{', '    let hex="";']
-            for name in NAMES:
+            for name in wanted:
                 data = table[name]
                 if arch == 'arm64':
                     data = ''.join(f'{v[0]:08x}' for v in struct.iter_unpack('<I', data))
                 else:
                     data = data.hex()
                 text.append(f'    if streq(name,"{name}") {{ hex="{data}"; }}')
+            # Legacy compiler programs have no Tin core context; never read their r15.
+            if vectors:
+                for name in ('memcpy', 'memmove', 'memcmp', 'memchr'):
+                    text.append(f'    if any_v2 && streq(name,"{name}") {{ hex="{vectors[name].hex()}"; }}')
             text += ['    let v=vec_new(); let i=0;', '    while load8(hex+i) != 0 {']
             if arch == 'arm64':
                 text.append('        raw(v,hex_word(hex+i)); i=i+8;')

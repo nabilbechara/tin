@@ -273,3 +273,10 @@ include copy/fill/scan lengths through 259 and overlap distances through 127 at 
 through 257. Machine code is reproducible from the checked-in relocation-free assembly
 with `python3 tools/gen_memory_fast.py --check`. No task swap or saved-register layout
 changes are involved.
+
+Phase 2 performance follow-up: the first native x86-64 run missed the 1 KiB memory gate
+(1.236 head/base); its required repeat is retained separately. Bounded AVX2 scans and
+medium copies now use a per-core capability cache, guarded by CPUID AVX/OSXSAVE, XGETBV
+XMM/YMM state, and CPUID AVX2. SSE2 remains the unsupported-CPU and legacy-compiler path.
+The corpus runs with automatic selection and forced SSE2, including guard pages and
+large overlaps. Native timing tables will be attached after the new head is measured.

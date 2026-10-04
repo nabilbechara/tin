@@ -9,9 +9,39 @@ jz .Lret_memcpy
 .Lforward_memcpy:
 cmp $128, %rdx
 jbe .Lsmall_memcpy
+#ifdef MEMORY_VECTOR
+cmp $4096, %rdx
+ja .Lrep_memcpy
+test %r15, %r15
+jz .Lrep_memcpy
+cmpq $1, 88(%r15)
+je .Lavx_memcpy
+.Lrep_memcpy:
+#endif
 mov %rdx, %rcx
 rep movsb
 ret
+#ifdef MEMORY_VECTOR
+// Medium copies avoid REP startup; all loads precede each overlapping store group.
+.Lavx_memcpy:
+vmovdqu 0(%rsi), %ymm0
+vmovdqu 32(%rsi), %ymm1
+vmovdqu 64(%rsi), %ymm2
+vmovdqu 96(%rsi), %ymm3
+vmovdqu %ymm0, 0(%rdi)
+vmovdqu %ymm1, 32(%rdi)
+vmovdqu %ymm2, 64(%rdi)
+vmovdqu %ymm3, 96(%rdi)
+add $128, %rdi
+add $128, %rsi
+sub $128, %rdx
+cmp $128, %rdx
+jae .Lavx_memcpy
+vzeroupper
+test %rdx, %rdx
+jz .Lret_memcpy
+jmp .Lsmall_memcpy
+#endif
 .Lsmall_memcpy:
 cmp $64, %rdx
 jbe .L64_memcpy
@@ -104,9 +134,39 @@ ret
 .Lforward_memmove:
 cmp $128, %rdx
 jbe .Lsmall_memmove
+#ifdef MEMORY_VECTOR
+cmp $4096, %rdx
+ja .Lrep_memmove
+test %r15, %r15
+jz .Lrep_memmove
+cmpq $1, 88(%r15)
+je .Lavx_memmove
+.Lrep_memmove:
+#endif
 mov %rdx, %rcx
 rep movsb
 ret
+#ifdef MEMORY_VECTOR
+// Medium copies avoid REP startup; all loads precede each overlapping store group.
+.Lavx_memmove:
+vmovdqu 0(%rsi), %ymm0
+vmovdqu 32(%rsi), %ymm1
+vmovdqu 64(%rsi), %ymm2
+vmovdqu 96(%rsi), %ymm3
+vmovdqu %ymm0, 0(%rdi)
+vmovdqu %ymm1, 32(%rdi)
+vmovdqu %ymm2, 64(%rdi)
+vmovdqu %ymm3, 96(%rdi)
+add $128, %rdi
+add $128, %rsi
+sub $128, %rdx
+cmp $128, %rdx
+jae .Lavx_memmove
+vzeroupper
+test %rdx, %rdx
+jz .Lret_memmove
+jmp .Lsmall_memmove
+#endif
 .Lsmall_memmove:
 cmp $64, %rdx
 jbe .L64_memmove
@@ -235,6 +295,14 @@ ret
 .global memcmp
 .type memcmp, @function
 memcmp:
+#ifdef MEMORY_VECTOR
+cmp $64, %rdx
+jb .L16_memcmp
+test %r15, %r15
+jz .L64_memcmp
+cmpq $1, 88(%r15)
+je .Lavx128_memcmp
+#endif
 .L64_memcmp:
 cmp $64, %rdx
 jb .L16_memcmp
@@ -298,6 +366,53 @@ ret
 .Ldiff_memcmp:
 movslq %eax, %rax
 ret
+#ifdef MEMORY_VECTOR
+.Lavx128_memcmp:
+cmp $128, %rdx
+jb .Lavx32_memcmp
+vmovdqu 0(%rdi), %ymm0
+vpcmpeqb 0(%rsi), %ymm0, %ymm0
+vmovdqu 32(%rdi), %ymm1
+vpcmpeqb 32(%rsi), %ymm1, %ymm1
+vmovdqu 64(%rdi), %ymm2
+vpcmpeqb 64(%rsi), %ymm2, %ymm2
+vmovdqu 96(%rdi), %ymm3
+vpcmpeqb 96(%rsi), %ymm3, %ymm3
+vpand %ymm1, %ymm0, %ymm0
+vpand %ymm3, %ymm2, %ymm2
+vpand %ymm2, %ymm0, %ymm0
+vpmovmskb %ymm0, %ecx
+cmp $-1, %ecx
+jne .Lavx32_memcmp
+add $128, %rdi
+add $128, %rsi
+sub $128, %rdx
+jmp .Lavx128_memcmp
+.Lavx32_memcmp:
+cmp $32, %rdx
+jb .Lavxtail_memcmp
+vmovdqu (%rdi), %ymm0
+vpcmpeqb (%rsi), %ymm0, %ymm0
+vpmovmskb %ymm0, %ecx
+cmp $-1, %ecx
+jne .Lavxfound_memcmp
+add $32, %rdi
+add $32, %rsi
+sub $32, %rdx
+jmp .Lavx32_memcmp
+.Lavxfound_memcmp:
+not %ecx
+bsf %ecx, %ecx
+movzbl (%rdi,%rcx), %eax
+movzbl (%rsi,%rcx), %r8d
+sub %r8d, %eax
+movslq %eax, %rax
+vzeroupper
+ret
+.Lavxtail_memcmp:
+vzeroupper
+jmp .L16_memcmp
+#endif
 .size memcmp, .-memcmp
 .global memchr
 .type memchr, @function
@@ -306,6 +421,16 @@ movd %esi, %xmm4
 punpcklbw %xmm4, %xmm4
 punpcklwd %xmm4, %xmm4
 pshufd $0, %xmm4, %xmm4
+#ifdef MEMORY_VECTOR
+cmp $64, %rdx
+jb .L16_memchr
+test %r15, %r15
+jz .L64_memchr
+cmpq $1, 88(%r15)
+jne .L64_memchr
+vpbroadcastb %xmm4, %ymm4
+jmp .Lavx128_memchr
+#endif
 .L64_memchr:
 cmp $64, %rdx
 jb .L16_memchr
@@ -356,4 +481,73 @@ ret
 .Lret_memchr:
 mov %rdi, %rax
 ret
+#ifdef MEMORY_VECTOR
+.Lavx128_memchr:
+cmp $128, %rdx
+jb .Lavx32_memchr
+vpcmpeqb 0(%rdi), %ymm4, %ymm0
+vpcmpeqb 32(%rdi), %ymm4, %ymm1
+vpcmpeqb 64(%rdi), %ymm4, %ymm2
+vpcmpeqb 96(%rdi), %ymm4, %ymm3
+vpor %ymm1, %ymm0, %ymm0
+vpor %ymm3, %ymm2, %ymm2
+vpor %ymm2, %ymm0, %ymm0
+vpmovmskb %ymm0, %ecx
+test %ecx, %ecx
+jnz .Lavx32_memchr
+add $128, %rdi
+sub $128, %rdx
+jmp .Lavx128_memchr
+.Lavx32_memchr:
+cmp $32, %rdx
+jb .Lavxtail_memchr
+vpcmpeqb (%rdi), %ymm4, %ymm0
+vpmovmskb %ymm0, %ecx
+test %ecx, %ecx
+jnz .Lavxfound_memchr
+add $32, %rdi
+sub $32, %rdx
+jmp .Lavx32_memchr
+.Lavxfound_memchr:
+bsf %ecx, %ecx
+lea (%rdi,%rcx), %rax
+vzeroupper
+ret
+.Lavxtail_memchr:
+vzeroupper
+jmp .L16_memchr
+#endif
 .size memchr, .-memchr
+
+// Check both AVX2 hardware and OS-managed XMM/YMM state before executing AVX.
+.global mem_avx2_supported
+.type mem_avx2_supported, @function
+mem_avx2_supported:
+push %rbx
+xor %eax, %eax
+cpuid
+cmp $7, %eax
+jb .Lno_avx2
+mov $1, %eax
+cpuid
+and $0x18000000, %ecx
+cmp $0x18000000, %ecx
+jne .Lno_avx2
+xor %ecx, %ecx
+xgetbv
+and $6, %eax
+cmp $6, %eax
+jne .Lno_avx2
+mov $7, %eax
+xor %ecx, %ecx
+cpuid
+shr $5, %ebx
+and $1, %ebx
+mov %ebx, %eax
+pop %rbx
+ret
+.Lno_avx2:
+xor %eax, %eax
+pop %rbx
+ret
+.size mem_avx2_supported, .-mem_avx2_supported
