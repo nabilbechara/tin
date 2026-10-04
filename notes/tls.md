@@ -49,8 +49,8 @@ Exported: `P256NewPrivateKey`, `P256PublicKey`, `P256ECDH`, `Sha384`, `Sha512`, 
 Phase 2's files: `der.tin` (strict DER reader), `bignum.tin` (`monty_new`: Montgomery constants
 computed at run time, so `field.tin`'s `monty` serves RSA moduli), `rsa.tin` (PKCS #1 v1.5 and
 PSS verification), `x509.tin` (PEM, certificates, pools, chains, host names),
-`roots_linux.tin` / `roots_darwin.tin` (system bundle paths); later `ecdsa.tin`, `p384.tin`,
-`ed25519.tin`. All exported, in `seal`:
+`roots_linux.tin` / `roots_darwin.tin` (system bundle paths), `ecdsa.tin` (`VerifyECDSA`),
+`p384.tin` (P-384 over a curve value); later `ed25519.tin`. All exported, in `seal`:
 
     ParseCertificate(der []u8) !Certificate              // one DER certificate
     ParseCertificatesPEM(pem str) ![]Certificate
@@ -66,7 +66,8 @@ once per core; `SSL_CERT_FILE` overrides the path); `Config.RootCAs` PEM goes in
 returns the chain, leaf first. Then `leaf.CheckTLSSignature(scheme, signed, sig)` checks
 CertificateVerify, `signed` being the 64 spaces, the context string, a zero byte and the
 transcript hash, as RFC 8446 §4.4.3 builds it. `scheme` is the SignatureScheme code
-(0x0804-0x0806 RSA-PSS now; 0x0403, 0x0503, 0x0807 when ECDSA and Ed25519 land). Faults start
+(0x0804-0x0806 RSA-PSS, 0x0403 ECDSA P-256 and 0x0503 ECDSA P-384, each checking that the
+certificate's key is on the scheme's curve; 0x0807 when Ed25519 lands). Faults start
 with "x509: " and name the reason: expired or not yet valid, the names the certificate is
 valid for, unknown authority, not a CA, bad signature, SHA-1, chain too long, path length,
 key usage, name constraints, unhandled critical extension.

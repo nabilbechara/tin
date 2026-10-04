@@ -124,8 +124,11 @@ stack has reset its pool (the end of a request or tick, `hearth.Reset()`). Then 
 children are dropped and it is freed. So `u := cache[k]` stays valid for the rest of the
 request even if another request replaces the entry. Values made while a core initializes
 its globals, and values stored where the compiler cannot count (through a parameter), are
-pinned: they are never freed. `hearth.RcStats()` reports the counted blocks, their bytes
-and the limbo length.
+pinned: they are never freed. A task that lives for a long time (a WebSocket, a `detach`
+loop) holds back releases on its core; past 2^20 queued blocks a core pins what it drops
+instead, so such a core leaks as before reclamation but its limbo stays bounded.
+`hearth.RcStats()` reports the counted blocks (pinned ones included), their bytes and the
+limbo length.
 
 ## 4. Cores and threads: hearth
 
@@ -687,14 +690,15 @@ functions keep that rule, and grows as phase 1 lands.
 constant-time and must not be used on secrets in a timing-sensitive protocol path.
 
 Signature verification and certificates (#124 phase 2) see only public data and are not
-constant-time by design: `VerifyPKCS1v15`, `VerifyPSS`, `ParseCertificate`, `DecodePEM`,
+constant-time by design: `VerifyPKCS1v15`, `VerifyPSS`, `VerifyECDSA` (and `p384.tin`'s
+curve code, used only for it), `ParseCertificate`, `DecodePEM`,
 `Certificate.Verify`, `CheckSignature`, `CheckTLSSignature` and `VerifyHostname`.
 Certificate policy: a chain is built from the leaf through `VerifyOptions.Intermediates` to
 `Roots` (default: the system bundle, read once per core from the paths in
 `roots_linux.tin`/`roots_darwin.tin` or `SSL_CERT_FILE`); every certificate must be within its
 validity period, intermediates must be CAs (basic constraints) allowed to sign certificates
 (key usage), path lengths, extended key usages and DNS/IP name constraints hold, signatures
-use SHA-256/384/512 (SHA-1 is refused) with RSA keys of 2048 to 8192 bits, no certificate
+use SHA-256/384/512 (SHA-1 is refused) with RSA keys of 2048 to 8192 bits or ECDSA P-256/P-384, no certificate
 has an unhandled critical extension, and the chain holds at most `MaxChain` (8) certificates.
 Host names follow RFC 6125: DNS SANs only (the common name is ignored), one leftmost `*`
 label over at least two more labels, IP literals against IP SANs. The parser is strict DER and
