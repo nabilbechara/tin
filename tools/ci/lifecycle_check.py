@@ -165,6 +165,32 @@ def admission(out):
           'the connection stays open; on server.overload and server.recovered run once each')
 
 
+def serve_in_say(out):
+    # #347: say.Line(anvil.Serve(...)) with a handler that keeps request data in a global used to
+    # segfault at SIGTERM (exit 2): say.Line's formatting frame was open while requests ran.
+    exe = out / 'serve_in_say'
+    subprocess.run([str(ROOT / 'bin/tinc'), '-o', str(exe), 'tools/ci/fixtures/serve_in_say.tin'],
+                   cwd=ROOT, env=dict(os.environ, TIN_ROOT=str(ROOT)), check=True)
+    port = ws.free_port()
+    server = subprocess.Popen([str(exe)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              env=dict(os.environ, PORT=str(port), TIN_CORES='1', TIN_GRACE='1'))
+    try:
+        eventually(lambda: server_ready(port, server))
+        for n in range(1, 4):
+            s = socket.create_connection(('127.0.0.1', port), timeout=10)
+            s.sendall(b'POST /add HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello')
+            status, _, body = answer(s)
+            s.close()
+            assert (status, body) == (200, b'len=%d' % n), (status, body)
+        server.send_signal(signal.SIGTERM)
+        stdout, stderr = server.communicate(timeout=30)
+    finally:
+        if server.poll() is None:
+            server.kill()
+    assert server.returncode == 0 and stdout == b'<nil>\n', (server.returncode, stdout, stderr[-1000:])
+    print('serve in say.Line: three kept requests, then SIGTERM: <nil> and exit 0 (#347)')
+
+
 def main():
     out = ROOT / 'bin/ci/lifecycle'
     out.mkdir(parents=True, exist_ok=True)
@@ -176,6 +202,7 @@ def main():
     run(exe, out, 'SIGTERM')
     run(exe, out, 'anvil.Drain')
     admission(out)
+    serve_in_say(out)
 
 
 if __name__ == '__main__':

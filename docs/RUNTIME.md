@@ -173,6 +173,11 @@ fires. Messages are copied into the receiver's request pool.
   `rt_flush()`.
 - Formatting uses a per-core frame: the compiler emits one `rt_fmt_*` call per argument
   by static type (`rt_fmt_i`, `_u`, `_s`, `_f`, `_b`, `_e`, slices, maps, structs).
+- No frame is open while user code runs: the compiler evaluates every argument that is more
+  than a literal or a name into a hidden local before the begin call (`say_hoist` in
+  lower.tin). The frame belongs to the core, so an argument that runs other tasks, such as
+  `say.Line(anvil.Serve(...))`, would otherwise share it with every request (#347). The
+  use-after-reset check sees those locals as assigned where they are evaluated.
 - Floats are printed in their shortest exact form. A fast path finds the fewest decimals
   k for which rint(|x|·10^k)/10^k == |x|, exact for values below 2^53. Otherwise
   the integer-only conversion core finds the shortest decimal in the interval between
