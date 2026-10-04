@@ -369,6 +369,15 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   budget leaves the block with `fault.LimitExceeded` at once (its defers and cleanups run).
   `TIN_REQUEST_MEMORY` (bytes, beyond a request's first pool chunk) bounds every request the
   same way; a request past it ends with 500 and the server goes on.
+- Scopes (Tin 1 #232, edition 1): `scope s { s.spawn(fn() ! { ... }) }`. A child is a task
+  on the same core with a root boundary under the scope's; it runs when its parent waits,
+  allocates in its parent's pool (children share the parent's region) and may store request
+  memory in what it captures. The scope's end waits for every child; the first child fault
+  cancels the scope, and so its other children, and is the scope's fault (`try` passes it
+  on). `t := s.spawn(f)` gives a handle with `t.wait() !` and `t.cancel()`; a child cancelled
+  through its handle does not fail the scope. In a server the event loop resumes children;
+  in `main` the scope's end runs them itself. Spawned closures make their captured variables
+  cells per spawn, so `for i in 0..n { let k = i; s.spawn(...) }` gives each child its own `k`.
 - Tasks can wait on each other: `rt_task_park(timeout)` waits until another task calls
   `rt_task_wake(t)`; woken tasks go on a per-core ready queue that the loop drains on its
   next turn (it does not block while the queue has tasks). `rt_task_defer()` puts the
