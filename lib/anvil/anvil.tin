@@ -70,6 +70,7 @@ type Req struct {
 	ep     i64 // the Router endpoint that matched (an rend), for PathParam and Pattern
 	tp     i64 // a chunked body's trailer field lines (#349), read by Header after the header block
 	tn     i64
+	cn     i64 // the connection record, for RemoteAddr and ClientIP (0: a request made in-process)
 }
 
 // Out is the response being built. Body is the response body; the status defaults to
@@ -109,7 +110,8 @@ const cDeadline = 14 // monotonic ns after which the sweep closes the connection
 const cStart = 15    // when the first bytes of the request still arriving came (0: none pending)
 const cLinger = 16   // 1: close after an error response by lingering (see linger); 2: lingering
 const cSent100 = 17  // the request still arriving was told 100 Continue
-const cWords = 18
+const cPeer = 18     // the peer's sockaddr (malloc'd, read when a handler first asks), -1: unknown (#355)
+const cWords = 19
 
 shared mut gListen i64
 shared mut gIP i64
@@ -756,6 +758,9 @@ fn free_conn(c i64) {
 	if c[cOut] != 0 {
 		free(c[cOut])
 	}
+	if c[cPeer] > 0 {
+		free(c[cPeer])
+	}
 	free(c)
 }
 
@@ -1350,7 +1355,7 @@ fn run_request(c i64) {
 	let p = pReq
 	let t = p + pTs
 	let tn = pTn
-	let q = Req{Method: method_str(p, pSp1), Path: "", Query: "", hp: p + pLe + 1, hn: pHend - pLe - 1, bp: p + pHend, bn: pCl, tp: p + pTr, tn: pTrLen}
+	let q = Req{Method: method_str(p, pSp1), Path: "", Query: "", hp: p + pLe + 1, hn: pHend - pLe - 1, bp: p + pHend, bn: pCl, tp: p + pTr, tn: pTrLen, cn: c}
 	let qm = memchr(t, '?', tn)
 	if qm == 0 {
 		q.Path = rt_str_from_raw(t, tn)
