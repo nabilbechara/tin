@@ -28,4 +28,17 @@ if ! cmp -s "$tmp/edition0.s" "$tmp/edition1.s"; then
 	exit 1
 fi
 
+# Boundary blocks run: guard turns a panic into a fault after the defers run; within
+# deadlines stop waits, nest, and leave the enclosing block alone (#230, #233).
+for name in boundaries
+do
+	"$compiler" -edition 1 -o "$tmp/$name" "tests/edition1/run/$name.tin"
+	"$tmp/$name" >"$tmp/$name.out" 2>/dev/null
+	if ! cmp -s "tests/edition1/run/$name.out" "$tmp/$name.out"; then
+		echo "FAIL edition1/run/$name: output differs"
+		diff -u "tests/edition1/run/$name.out" "$tmp/$name.out" || true
+		exit 1
+	fi
+done
+
 echo "PASS edition 1 parser"

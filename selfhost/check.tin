@@ -2462,7 +2462,40 @@ fn check_stmt(s) {
         lower_go(s);
     } else if k == ST_DEFER {
         lower_defer(s);
+    } else if k == ST_BSTORE {
+        check_bstore(s);
     }
+}
+
+// check_bstore checks the last expression of a boundary block's closure and stores its value
+// through the closure's parameter $r; bound_t records its type (ty_void: no value).
+fn check_bstore(s) {
+    let pos = s[N_POS];
+    let x = s[ES_X];
+    if x[N_KIND] == EX_TRY || x[N_KIND] == EX_CATCH {
+        lower_try_stmt(s, x, 5, 0);
+        return;
+    }
+    let t = chk(x, 0);
+    if kind_of(t) == K_VOID {
+        bound_t = ty_void;
+        replace_node(s, expr_stmt(x));
+        return;
+    }
+    if is_untyped(t) {
+        t = default_type(t);
+        reconvert(x, t);
+    }
+    bound_t = t;
+    replace_node(s, bound_store(pos, x, t));
+}
+
+var bound_t; // the value type of the boundary block being checked
+
+// bound_store writes v (of type t) through the boundary closure's parameter $r.
+fn bound_store(pos, v, t) {
+    let r = vec_get(ck_fn[F_LOCALS], 0);
+    return assign_stmt(pos, mk_mem(pos, sym_ref_node(pos, r), 0, 0, 0, t), v);
 }
 
 // Constants become literals at their uses and require no stack slot or runtime work.
@@ -3323,7 +3356,16 @@ fn lower_try_stmt(s, tr, mode, declared) {
         vec_push(ifs[IF_THEN][BLK_STMTS], fault_return(pos, ifs[IF_THEN][BLK_STMTS], sym_ref_node(pos, errsym)));
     }
     vec_push(stmts, ifs);
-    if mode == 1 {
+    if mode == 5 {
+        // A boundary block's last expression: its value, if any, goes through $r.
+        bound_t = ty_void;
+        if nvals == 1 {
+            bound_t = vec_get(temps, 0)[S_TYPE];
+            vec_push(stmts, bound_store(pos, sym_ref_node(pos, vec_get(temps, 0)), bound_t));
+        } else if nvals > 1 {
+            err_at(pos, "a boundary block's last expression gives one value");
+        }
+    } else if mode == 1 {
         if nvals != 1 {
             err_at(pos, "try here needs a call with exactly one result besides the fault");
             return;
