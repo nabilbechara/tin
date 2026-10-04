@@ -113,6 +113,7 @@ const I_RAW = 107;     // a=32-bit instruction word (hand-assembled code, e.g. S
 const I_FCVTSD = 108;  // a=dd b=dn: s(a) = single(d(b))
 const I_FCVTDS = 109;  // a=dd b=dn: d(a) = double(s(b))
 const I_FMOVWS = 110;  // a=xd b=dn: w(a) = bits of s(b)
+const I_CINC = 111;    // a=rd b=rn c=cond: rd = cond ? rn + 1 : rn
 const MK_SIGNED = 4;
 const MK_FLOAT = 8;
 const MK_SCALED = 16;
@@ -149,6 +150,8 @@ const SK_GOT = 3;
 const SK_TSTR = 4;   // Tin string literal: length word, bytes, NUL
 const SK_FN = 5;     // address of a function
 const SK_ZERO = 6;   // a static zeroed block: the shared empty slice header
+const SK_BTRACE = 8; // readonly Tin backtrace records
+const SK_IMAGE = 9;  // address of ELF image byte zero
 const SK_FNDESC = 7; // address of function descriptor: code and environment
 
 fn sym_ref(kind, index) {
@@ -239,6 +242,10 @@ fn pr_sym(b, sym) {
         buf_byte(b, '_');
         buf_str(b, vec_get(prog_fns, i)[F_QNAME]);
         buf_str(b, "$desc");
+    } else if kind == SK_BTRACE {
+        buf_str(b, "l_.backtrace");
+    } else if kind == SK_IMAGE {
+        buf_str(b, "l_.image");
     } else if kind == SK_ZERO {
         buf_str(b, "l_.zero");
     } else {
@@ -375,6 +382,13 @@ fn print_ins(b, ins) {
         pr_regs(b, "csel", x, y, z);
         buf_str(b, ", ");
         pr_cond(b, w);
+    } else if op == I_CINC {
+        buf_str(b, "\tcinc ");
+        pr_reg(b, x);
+        buf_str(b, ", ");
+        pr_reg(b, y);
+        buf_str(b, ", ");
+        pr_cond(b, z);
     } else if op == I_PRFM {
         buf_str(b, "\tprfm ");
         if x == 16 {
@@ -838,6 +852,9 @@ fn encode(ins, pc) {
     }
     if op == I_CSEL {
         return enc_rrr(0x9A800000, x, y, z) | (w << 12);
+    }
+    if op == I_CINC {
+        return enc_rrr(0x9A800400, x, y, y) | ((z ^ 1) << 12);
     }
     if op == I_PRFM {
         return enc_rrr(0xF8A07800, x, y, z);

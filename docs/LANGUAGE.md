@@ -948,6 +948,18 @@ c.Do(cmd)                      // error if cmd is a str: a query takes a string 
 
 ## 15. Printing and formatting: say
 
+Struct fields may carry checked compile-time attributes. The first supported attribute is
+`@json("name")`, which changes the JSON key emitted and accepted by `argo`; attributes do not
+add runtime metadata or change the struct layout. Unknown attributes and invalid arguments are
+compile errors.
+
+```go
+type User struct {
+    ID i64 @json("id")
+    Name str @json("display_name")
+}
+```
+
 `say` is built into the compiler: each argument is formatted by its static type, without
 interfaces or reflection.
 

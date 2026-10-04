@@ -3,7 +3,7 @@
 // System V ABI: arguments in rdi, rsi, rdx, rcx, r8, r9 and xmm0-xmm7, results in rax and
 // xmm0 (several results travel in rax, rdx, rcx, rsi, rdi, r8, r9, r10 as bits). Locals
 // whose address is never taken live in the callee-saved rbx, r12, r13, r14 (floats in
-// xmm8-xmm14 in leaf functions, else in frame slots); expressions evaluate into the
+// xmm8-xmm14 when calls stay outside loops, else in frame slots); expressions evaluate into the
 // temporaries rsi, rdi, r8, r9, r10 and leftover callee-saved registers, indexed by depth.
 // rax, rcx, rdx, r11 and xmm15 are scratch (rax/rdx for division, rcx for shift counts),
 // so they are never allocated. r15 holds the thread context, rbp the frame pointer.
@@ -399,8 +399,36 @@ fn x_shift_imm(op, dst, l, k) {
     }
 }
 
+// x_signed_div10 mirrors the exact signed multiply-high sequence used by Go.
+fn x_signed_div10(op, dst, l, c) {
+    x_mov(RAX, l)
+    x_load_imm(XSCR, -3689348814741910323)
+    emit1(X_IMULH, XSCR)
+    x_binop(X_ADD, RDX, RDX, l, 1)
+    emit2(X_SARI, RDX, 3)
+    x_mov(XSCR, l)
+    emit2(X_SARI, XSCR, 63)
+    emit2(X_SUB, RDX, XSCR)
+    if streq(op, "/") {
+        x_mov(dst, RDX)
+        if c < 0 {
+            emit1(X_NEG, dst)
+        }
+    } else {
+        let q10 = XSCR2
+        if dst == q10 {
+            q10 = RAX
+        }
+        emit3(X_IMUL_RRI, q10, RDX, 10)
+        x_mov(dst, l)
+        emit2(X_SUB, dst, q10)
+    }
+}
+
 fn x_binary_const(op, dst, l, c) {
-    if streq(op, "+") {
+    if !arith_unsigned && (streq(op, "/") || streq(op, "%")) && (c == 10 || c == -10) {
+        x_signed_div10(op, dst, l, c);
+    } else if streq(op, "+") {
         x_add_imm(dst, l, c);
     } else if streq(op, "-") && c != -9223372036854775807 - 1 {
         x_add_imm(dst, l, -c);
@@ -1339,6 +1367,11 @@ fn x_gen_runtime_intrinsic(e, dst, d) {
         }
         return 1;
     }
+    if streq(name,"__tin_symbols") || streq(name,"__image_base") {
+        let kind=SK_BTRACE; if streq(name,"__image_base") { kind=SK_IMAGE; }
+        emit2(X_LEA,dst,x64_mem_sym(x_sym(kind,0)));
+        return 1;
+    }
     if streq(name, "__empty") {
         emit2(X_LEA, dst, x64_mem_sym(x_sym(SK_ZERO, 0)));
         return 1;
@@ -1535,7 +1568,32 @@ fn x_caller_saved(r) {
     return r != RBX && (r < R12 || r > R14);
 }
 
-// x_save_temps pushes the live caller-saved temps below depth d before a call.
+// x_save_local_fp_homes preserves local float values assigned to caller-saved XMM8-XMM14.
+fn x_save_local_fp_homes() {
+    let locals = cur_gen_fn[F_LOCALS];
+    let i = 0;
+    while i < locals[VEC_LEN] {
+        let s = vec_get(locals, i);
+        if is_float_t(s[S_TYPE]) && s[S_REG] >= XMM + 8 && s[S_REG] <= XMM + 14 {
+            x_push(s[S_REG]);
+        }
+        i = i + 1;
+    }
+}
+
+fn x_restore_local_fp_homes() {
+    let locals = cur_gen_fn[F_LOCALS];
+    let i = locals[VEC_LEN] - 1;
+    while i >= 0 {
+        let s = vec_get(locals, i);
+        if is_float_t(s[S_TYPE]) && s[S_REG] >= XMM + 8 && s[S_REG] <= XMM + 14 {
+            x_pop(s[S_REG]);
+        }
+        i = i - 1;
+    }
+}
+
+// x_save_temps pushes the live caller-saved temps and local float homes before a call.
 fn x_save_temps(d) {
     let i = 0;
     while i < d {
@@ -1547,9 +1605,11 @@ fn x_save_temps(d) {
         }
         i = i + 1;
     }
+    x_save_local_fp_homes();
 }
 
 fn x_restore_temps(d) {
+    x_restore_local_fp_homes();
     let i = d - 1;
     while i >= 0 {
         if i < f_count {
@@ -1752,6 +1812,11 @@ fn x_gen_branch(e, target, d, when_true) {
         return;
     }
     let k = e[N_KIND];
+    if k == EX_SEQ {
+        x_gen_stmts(e[SEQ_STMTS]);
+        x_gen_branch(e[SEQ_VALUE], target, d, when_true);
+        return;
+    }
     if k == EX_UNARY && streq(e[UN_OP], "!") {
         x_gen_branch(e[UN_X], target, d, !when_true);
         return;
@@ -2112,6 +2177,8 @@ fn x_gen_stmt(s) {
         x_gen_assign(s);
     } else if k == ST_EXPR {
         x_gen_effect(s[ES_X]);
+    } else if k == ST_IF && x_try_if_increment(s) {
+        // The condition flags drive a conditional move of x + 1.
     } else if k == ST_IF && x_try_select(s) {
         // Done: both arms computed and picked with cmov.
     } else if k == ST_IF {
@@ -2212,6 +2279,30 @@ fn x_gen_flags(e, d) {
     if e[N_KIND] == EX_UNARY && streq(e[UN_OP], "!") {
         return x_gen_flags(e[UN_X], d) ^ 1;
     }
+    if e[N_KIND] == EX_SEQ {
+        let i = 0;
+        while i < d {
+            if i < t_count {
+                x_push(vec_get(t_regs, i));
+            }
+            if i < f_count {
+                x_push(vec_get(f_regs, i));
+            }
+            i = i + 1;
+        }
+        x_gen_stmts(e[SEQ_STMTS]);
+        i = d - 1;
+        while i >= 0 {
+            if i < f_count {
+                x_pop(vec_get(f_regs, i));
+            }
+            if i < t_count {
+                x_pop(vec_get(t_regs, i));
+            }
+            i = i - 1;
+        }
+        return x_gen_flags(e[SEQ_VALUE], d);
+    }
     if e[N_KIND] == EX_BINARY {
         let cc = x_cond(e[BIN_OP]);
         if (cc == XC_E || cc == XC_NE) && !e_fp(e[BIN_L]) && is_const(e[BIN_R]) && const_val(e[BIN_R]) == 0 && low_bits_test(e[BIN_L]) > 0 {
@@ -2229,13 +2320,33 @@ fn x_gen_flags(e, d) {
     return XC_NE;
 }
 
+fn x_try_if_increment(s) {
+    if x_float_cmp(s[IF_COND]) {
+        return 0;
+    }
+    let a = if_increment_assignment(s);
+    if !a {
+        return 0;
+    }
+    let x = a[AS_TARGET][ID_REF];
+    let cc = x_gen_flags(s[IF_COND], 0);
+    // LEA preserves the flags set by the condition and avoids spilling x + 1 while
+    // compiler-created condition sequences are evaluated.
+    emit2(X_LEA, XSCR, x_mem1(x[S_REG], 1));
+    emit3(X_CMOVCC, x[S_REG], XSCR, cc);
+    return 1;
+}
+
 // x_float_cmp reports whether c (under any number of !) compares floats, which cmov cannot
 // select on because of the unordered case.
 fn x_float_cmp(c) {
     while c[N_KIND] == EX_UNARY && streq(c[UN_OP], "!") {
         c = c[UN_X];
     }
-    return c[N_KIND] == EX_BINARY && x_cond(c[BIN_OP]) >= 0 && e_fp(c[BIN_L]);
+    if c[N_KIND] == EX_SEQ {
+        return x_float_cmp(c[SEQ_VALUE]);
+    }
+    return c[N_KIND] == EX_BINARY && x_cond(c[BIN_OP]) >= 0 && (e_fp(c[BIN_L]) || e_fp(c[BIN_R]));
 }
 
 // x_try_select compiles `if c { x = a; } else { x = b; }` as x = cmov(c, a, b), like
@@ -2348,11 +2459,43 @@ fn x_pending_src(srcs, done, r) {
     return 0;
 }
 
+// A non-leaf function can use caller-saved XMM homes when its calls stay outside loops.
+// x_save_temps preserves those homes around each call; keeping calls out of loops avoids
+// adding spills to a hot iteration.
+fn x_stmts_calls_in_loop(stmts) {
+    let i = 0;
+    while i < stmts[VEC_LEN] {
+        if x_stmt_calls_in_loop(vec_get(stmts, i)) {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn x_stmt_calls_in_loop(s) {
+    if !s {
+        return 0;
+    }
+    let k = s[N_KIND];
+    if k == ST_BLOCK {
+        return x_stmts_calls_in_loop(s[BLK_STMTS]);
+    }
+    if k == ST_IF {
+        return x_stmt_calls_in_loop(s[IF_THEN]) || x_stmt_calls_in_loop(s[IF_ELSE]);
+    }
+    if k == ST_WHILE {
+        return stmt_has_call(s);
+    }
+    return 0;
+}
+
 // x_assign_homes gives each local a register or frame slot and builds the temp pools.
 // It returns the number of frame slots.
 fn x_assign_homes(f) {
     let locals = f[F_LOCALS];
     let leaf = f[F_LEAF];
+    let fp_homes = leaf || !x_stmts_calls_in_loop(f[F_BODY][BLK_STMTS]);
     let pool = vec_new();
     vec_push(pool, RBX);
     vec_push(pool, R12);
@@ -2360,7 +2503,7 @@ fn x_assign_homes(f) {
     vec_push(pool, R14);
     let fpool = vec_new();
     let r = 8;
-    while leaf && r <= 14 {
+    while fp_homes && r <= 14 {
         vec_push(fpool, XMM + r);
         r = r + 1;
     }
@@ -2439,7 +2582,7 @@ fn x_assign_homes(f) {
         vec_push(f_regs, XMM + r);
         r = r + 1;
     }
-    if leaf {
+    if fp_homes {
         while fnext < fpool[VEC_LEN] {
             vec_push(f_regs, vec_get(fpool, fnext));
             fnext = fnext + 1;
@@ -2565,7 +2708,64 @@ fn x_task_swap_bytes() {
     return v;
 }
 
+// REP bulk memory loops preserve all callee-saved registers and r15.
+fn x_memory_bytes(fill) {
+    let hex="4889d148c1e106f3a4c3";
+    if fill { hex="4889f04889d148c1e106f3aac3"; }
+    let v=vec_new(); let i=0;
+    while load8(hex+i) != 0 {
+        vec_push(v,num_digit(load8(hex+i))*16+num_digit(load8(hex+i+1)));
+        i=i+2;
+    }
+    return v;
+}
+
+fn x_syscall_bytes(restorer) {
+    let hex="4889f84889f74889d64889ca4d89c24d89c84c8b4c24080f05c3";
+    if restorer { hex="48c7c00f0000000f05"; }
+    let v=vec_new(); let i=0;
+    while load8(hex+i) != 0 {
+        vec_push(v,num_digit(load8(hex+i))*16+num_digit(load8(hex+i+1)));
+        i=i+2;
+    }
+    return v;
+}
+
 fn x_gen_fn(f) {
+    if tgt_linux && any_v2 {
+        let bytes=syscall_fast_amd64(f[F_QNAME]);
+        if bytes != 0 {
+            x_out4(X_LABEL,vec_get(x_fn_labels,f[F_INDEX]),0,0,0);
+            if streq(f[F_QNAME],"rt_sys_clock_gettime") {
+                let s=lookup_global("rtVdsoClock");
+                x_out4(X_LOAD,RDX,x64_mem_sym(x_sym(SK_VAR,s[S_INDEX])),3,0);
+            }
+            let i=0;
+            while i < bytes[VEC_LEN] { x_out4(X_RAWB,vec_get(bytes,i),0,0,0); i=i+1; }
+            return;
+        }
+    }
+    if streq(f[F_QNAME],"memcpy") || streq(f[F_QNAME],"memmove") || streq(f[F_QNAME],"memset") || streq(f[F_QNAME],"memcmp") || streq(f[F_QNAME],"memchr") || streq(f[F_QNAME],"mem_avx2_supported") {
+        x_out4(X_LABEL,vec_get(x_fn_labels,f[F_INDEX]),0,0,0);
+        let bs=memory_fast_amd64(f[F_QNAME]); let i=0;
+        while i < bs[VEC_LEN] { x_out4(X_RAWB,vec_get(bs,i),0,0,0); i=i+1; }
+        return;
+    }
+
+    if tgt_linux && (streq(f[F_QNAME],"linux_raw") || streq(f[F_QNAME],"linux_restorer")) {
+        x_out4(X_LABEL,vec_get(x_fn_labels,f[F_INDEX]),0,0,0);
+        let bs=x_syscall_bytes(streq(f[F_QNAME],"linux_restorer"));
+        let i=0;
+        while i < bs[VEC_LEN] { x_out4(X_RAWB,vec_get(bs,i),0,0,0); i=i+1; }
+        return;
+    }
+    if streq(f[F_QNAME],"mem_copy64") || streq(f[F_QNAME],"mem_fill64") {
+        x_out4(X_LABEL,vec_get(x_fn_labels,f[F_INDEX]),0,0,0);
+        let bs=x_memory_bytes(streq(f[F_QNAME],"mem_fill64"));
+        let i=0;
+        while i < bs[VEC_LEN] { x_out4(X_RAWB,vec_get(bs,i),0,0,0); i=i+1; }
+        return;
+    }
     if streq(f[F_QNAME], "rt_task_swap") {
         x_out4(X_LABEL, vec_get(x_fn_labels, f[F_INDEX]), 0, 0, 0);
         let bs = x_task_swap_bytes();

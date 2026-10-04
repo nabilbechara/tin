@@ -1,17 +1,26 @@
 name: Benchmarks (Linux)
 
-# Reference benchmarks are Linux (docs/PERFORMANCE.md, "Benchmark policy"). This runs the CPU
-# suite (bench/v2, Tin vs Go) and the HTTP suite (anvil vs fasthttp vs net/http under wrk) on
-# both Linux CPUs and writes the tables to the job summary. GitHub-hosted runners are shared:
-# compare the ratios within one run, not absolute numbers across runs. Never a merge gate.
+# Native Linux measurements only; thresholds flag review, never bypass correctness CI.
 on:
   workflow_dispatch:
+    inputs:
+      base_ref:
+        description: Base revision (empty uses the selected revision's first parent)
+        type: string
+        default: ''
   schedule:
     - cron: '0 6 * * 1'
   pull_request:
     paths:
       - 'bench/**'
+      - 'lib/**'
+      - 'selfhost/**'
+      - 'tools/ci/test_benchmarks.py'
       - '.github/workflows/bench-linux.yml'
+
+defaults:
+  run:
+    shell: bash
 
 permissions:
   contents: read
@@ -24,7 +33,7 @@ jobs:
   bench:
     name: Linux ${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -36,6 +45,26 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve comparison revisions
+        id: revisions
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: ${{ inputs.base_ref }}
+        run: |
+          if [ -n "$PR_BASE" ]; then
+            base=$(git merge-base "$PR_BASE" HEAD)
+          else
+            base=$(git rev-parse --verify --end-of-options "${BASE_REF:-HEAD^}^{commit}")
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          { echo "Base: $base"; echo "Head: $(git rev-parse HEAD)"; } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ steps.revisions.outputs.base }}
+          path: bin/bench-base
           persist-credentials: false
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
@@ -43,37 +72,55 @@ jobs:
           cache: false
       - name: Install wrk
         run: sudo apt-get update -q && sudo apt-get install -y -q wrk
-      - name: Build Tin
-        run: make bootstrap
-      - name: Machine
+      - name: Build each revision from its own seed and source tree
         run: |
+          make bootstrap
+          make -C bin/bench-base bootstrap
+      - name: Machine and measurement settings
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          case "$(uname -m)" in arm64|aarch64) arch=arm64 ;; x86_64) arch=amd64 ;; *) exit 1 ;; esac
+          test "$arch" = "$EXPECTED_ARCH"
           {
-            echo "## Linux ${{ matrix.arch }} (${{ matrix.os }}, GitHub-hosted, shared)"
+            echo "## Linux $EXPECTED_ARCH ($RUNNER_OS, GitHub-hosted, shared)"
             echo '```'
             uname -srm
             lscpu | grep -E '^(Model name|CPU\(s\)):' || true
             go version
+            wrk --version || true
             echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-      - name: CPU suite (bench/v2, Tin vs Go, best of 3; speedup = Go time / Tin time)
+            echo 'CPU: 7 alternating runs per side; medians. HTTP: 1 server core, wrk -t2 -c100, 10 s, 5 alternating rounds; load generator on the same runner.'
+            echo 'CPU head/base is elapsed time (lower is faster); HTTP head/base is req/s (higher is faster). >5% regressions require a rerun and profile/maintainer review; timing is not an automatic merge gate.'
+          } | tee bin/bench-machine.txt
+          cat bin/bench-machine.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: CPU reference (Tin versus Go)
         run: |
-          RUNS=3 BENCH_DIR=bench/v2 python3 bench/run.py | tee bin/bench-cpu.txt
-          if grep -q 'OUTPUT MISMATCH' bin/bench-cpu.txt; then echo "Tin and Go outputs differ"; exit 1; fi
-          { echo '### CPU (bench/v2)'; echo '```'; cat bin/bench-cpu.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-      - name: HTTP suite (1 server core, wrk -t2 -c100, 10 s, median of 3 interleaved rounds)
+          BENCH_DIR=bench/v2 python3 bench/run.py --json bin/bench-cpu-reference.json | tee bin/bench-cpu-reference.txt
+          { echo '### CPU reference'; cat bin/bench-cpu-reference.txt; } >> "$GITHUB_STEP_SUMMARY"
+      - name: CPU base versus head
+        run: |
+          python3 bench/compare.py --base-root bin/bench-base --json bin/bench-cpu-compare.json | tee bin/bench-cpu-compare.txt
+          { echo '### CPU revision comparison'; cat bin/bench-cpu-compare.txt; } >> "$GITHUB_STEP_SUMMARY"
+      - name: HTTP reference (Tin versus Go)
         run: |
           ./tin build examples/api.tin -o bin/api
           go -C bench/http build -o "$GITHUB_WORKSPACE/bin/fast" ./fast
           go -C bench/http build -o "$GITHUB_WORKSPACE/bin/gonet" ./gonet
-          bench/http/run_wrk.sh 1 2 100 10 3 | tee bin/bench-http.txt
-          { echo '### HTTP (anvil vs fasthttp vs net/http)'; echo '```'; cat bin/bench-http.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-      - name: Keep the raw results
+          bench/http/run_wrk.sh 1 2 100 10 5 --json bin/bench-http-reference.json | tee bin/bench-http-reference.txt
+          { echo '### HTTP reference'; cat bin/bench-http-reference.txt; } >> "$GITHUB_STEP_SUMMARY"
+      - name: HTTP base versus head
+        run: |
+          python3 bench/compare.py --suite http --base-root bin/bench-base --json bin/bench-http-compare.json | tee bin/bench-http-compare.txt
+          { echo '### HTTP revision comparison'; cat bin/bench-http-compare.txt; } >> "$GITHUB_STEP_SUMMARY"
+      - name: Keep raw samples and server logs
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: bench-linux-${{ matrix.arch }}
           path: |
             bin/bench-*.txt
-            bin/wrk_results.txt
+            bin/bench-*.json
+            bin/wrk-*/*.log
           retention-days: 90
           if-no-files-found: ignore

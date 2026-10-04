@@ -3,9 +3,7 @@ package main
 import (
 	"cmp"
 	"fmt"
-	"os"
 	"slices"
-	"time"
 )
 
 func checksum(xs []int64) int64 {
@@ -30,22 +28,20 @@ func main() {
 	for i := 0; i < n; i++ {
 		fs[i] = float64(xs[i]>>20) / 1024.0
 	}
-	t0 := time.Now()
+
 	slices.Sort(xs)
-	t1 := time.Now()
+
 	fmt.Println("ints", slices.IsSorted(xs), checksum(xs), xs[0], xs[n-1])
-	t2 := time.Now()
+
 	slices.SortStableFunc(ys, cmp.Compare)
-	t3 := time.Now()
+
 	fmt.Println("stable", slices.IsSorted(ys), checksum(ys))
-	t4 := time.Now()
+
 	slices.Sort(fs)
-	t5 := time.Now()
+
 	fmt.Printf("f64s %.3f %.3f\n", fs[0], fs[n-1])
-	t6 := time.Now()
+
 	slices.Sort(xs)
-	t7 := time.Now()
+
 	fmt.Println("presorted", slices.IsSorted(xs))
-	// Timings go to stderr: stdout must match the Tin twin byte for byte (bench/run.py checks it).
-	fmt.Fprintf(os.Stderr, "ms ints %d stable %d f64s %d presorted %d\n", t1.Sub(t0).Milliseconds(), t3.Sub(t2).Milliseconds(), t5.Sub(t4).Milliseconds(), t7.Sub(t6).Milliseconds())
 }
