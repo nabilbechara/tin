@@ -33,7 +33,7 @@ an entry removed only when no Linux declaration or linker-added import remains.
 | `closedir` | `lib/quarry/quarry.tin`, `selfhost/main.tin` | 3 | removed | Tin directory cleanup and close syscall | tests/v2/quarry.tin; directory refill/unknown-type/symlink cases; bootstrap (phase 3) |
 | `connect` | `lib/wire/wire.tin` | 3 | removed | connect raw syscall (per-architecture ABI) | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
 | `creat` | `lib/std.tin` | 3 | removed | openat with create/truncate flags | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
-| `dladdr` | `lib/runtime/runtime.tin` | 4 | active | Linker-emitted Tin function symbol table | Exact panic backtrace and function-boundary tests (phase 4) |
+| `dladdr` | `lib/runtime/runtime.tin` | 4 | removed | Linker-emitted Tin function symbol table | Exact panic backtrace and function-boundary tests (phase 4) |
 | `epoll_create1` | `lib/anvil/anvil_linux.tin` | 3 | removed | epoll_create1 raw syscall (per-architecture ABI) | tools/ci/http_check.py and task_check.py (phase 3) |
 | `epoll_ctl` | `lib/anvil/anvil_linux.tin` | 3 | removed | epoll_ctl raw syscall (per-architecture ABI) | tools/ci/http_check.py and task_check.py (phase 3) |
 | `epoll_wait` | `lib/anvil/anvil_linux.tin` | 3 | removed | epoll_wait raw syscall (per-architecture ABI) | tools/ci/http_check.py and task_check.py (phase 3) |
@@ -41,19 +41,19 @@ an entry removed only when no Linux declaration or linker-added import remains.
 | `fcntl` | `lib/anvil/anvil.tin`, `lib/relay/relay.tin`, `lib/runtime/runtime.tin`, `lib/wire/wire.tin` | 3 | removed | fcntl raw syscall (per-architecture ABI) | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
 | `floor` | `lib/gauge/gauge.tin` | 0 | intrinsic | Hardware float intrinsic | tests/v2/gauge.tin and gauge_math.tin; both backend instruction checks |
 | `free` | `lib/runtime/runtime.tin`, `lib/std.tin` | 2 | removed | Tin mmap allocator or byte/word operations | Memory/OOM injection; overlap/alignment/microbenchmarks; bootstrap (phase 2) |
-| `freeaddrinfo` | `lib/wire/wire.tin` | 4 | active | Tin resolver result ownership | DNS repeated lookup memory stability (phase 4) |
+| `freeaddrinfo` | `lib/wire/wire.tin` | 4 | removed | Tin resolver result ownership | DNS repeated lookup memory stability (phase 4) |
 | `fstat` | `lib/quarry/quarry.tin` | 3 | removed | Per-architecture fstat syscall and kernel layout | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
-| `getaddrinfo` | `lib/wire/wire.tin` | 4 | active | Task-based hosts/resolv.conf UDP/TCP DNS resolver | tools/ci/dns_check.py fake DNS contract (phase 4) |
-| `getauxval` | `lib/runtime/vdso_linux.tin`, `lib/seal/seal_linux.tin` | 5 | active | Initial-stack auxv lookup | tests/v2/seal.tin; auxv/HWCAP/startup tests (phase 5) |
+| `getaddrinfo` | `lib/wire/wire.tin` | 4 | removed | Task-based hosts/resolv.conf UDP/TCP DNS resolver | tools/ci/dns_check.py fake DNS contract (phase 4) |
+| `getauxval` | `lib/runtime/vdso_linux.tin`, `lib/seal/seal_linux.tin`, `selfhost/host_linux.tin` | 5 | active | Initial-stack auxv lookup | tests/v2/seal.tin; auxv/HWCAP/startup tests (phase 5) |
 | `getcwd` | `lib/quarry/quarry.tin` | 3 | removed | getcwd raw syscall (per-architecture ABI) | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
 | `getenv` | `lib/anvil/anvil.tin`, `lib/quarry/quarry.tin`, `lib/runtime/memory_rt.tin`, `lib/runtime/runtime_linux.tin`, `selfhost/main.tin` | 5 | active | Tin environment initialized from envp | tests/v2/quarry.tin; compiler TIN_ROOT; cgroup/HTTP configuration (phase 5) |
-| `gethostname` | `lib/quarry/quarry.tin` | 4 | active | uname nodename | tests/v2/quarry.tin and uname comparison (phase 4) |
+| `gethostname` | `lib/quarry/quarry.tin` | 4 | removed | uname nodename | tests/v2/quarry.tin and uname comparison (phase 4) |
 | `getpid` | `lib/quarry/quarry.tin` | 3 | removed | getpid raw syscall (per-architecture ABI) | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
 | `getrandom` | `lib/runtime/runtime_linux.tin` | 3 | removed | getrandom raw syscall (per-architecture ABI) | tests/v2/dice.tin and seal.tin; interrupted/short reads (phase 3) |
 | `getsockname` | `lib/wire/wire.tin` | 3 | removed | getsockname raw syscall (per-architecture ABI) | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
 | `getsockopt` | `lib/wire/wire.tin` | 3 | removed | getsockopt raw syscall (per-architecture ABI) | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
-| `gmtime_r` | `lib/anvil/anvil.tin` | 4 | active | Tin UTC calendar decomposition | UTC calendar boundary Go twin; HTTP Date (phase 4) |
-| `isatty` | `lib/runtime/runtime.tin` | 4 | active | ioctl TCGETS | TTY/pipe/file probes (phase 4) |
+| `gmtime_r` | `lib/anvil/anvil.tin` | 4 | removed | Tin UTC calendar decomposition | UTC calendar boundary Go twin; HTTP Date (phase 4) |
+| `isatty` | `lib/runtime/runtime.tin` | 4 | removed | ioctl TCGETS | TTY/pipe/file probes (phase 4) |
 | `listen` | `lib/anvil/anvil.tin`, `lib/wire/wire.tin` | 3 | removed | listen raw syscall (per-architecture ABI) | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
 | `lstat` | `lib/quarry/quarry.tin` | 3 | removed | newfstatat with symlink-no-follow flag | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
 | `malloc` | `lib/relay/relay.tin`, `lib/runtime/runtime.tin`, `lib/std.tin` | 2 | removed | Tin mmap allocator or byte/word operations | Memory/OOM injection; overlap/alignment/microbenchmarks; bootstrap (phase 2) |
@@ -79,7 +79,7 @@ an entry removed only when no Linux declaration or linker-added import remains.
 | `readdir` | `lib/quarry/quarry.tin`, `selfhost/main.tin` | 3 | removed | Tin linux_dirent64 parsing and buffer refills | tests/v2/quarry.tin; directory refill/unknown-type/symlink cases; bootstrap (phase 3) |
 | `readlink` | `selfhost/host_linux.tin` | 3 | removed | readlink raw syscall (per-architecture ABI) | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
 | `realloc` | `lib/runtime/runtime.tin`, `lib/std.tin` | 2 | removed | Tin mmap allocator or byte/word operations | Memory/OOM injection; overlap/alignment/microbenchmarks; bootstrap (phase 2) |
-| `realpath` | `selfhost/main.tin` | 4 | active | Tin path canonicalization with symlink traversal | Compiler path discovery with symlinks and missing paths; bootstrap (phase 4) |
+| `realpath` | `selfhost/main.tin` | 4 | removed | Tin path canonicalization with symlink traversal | Compiler path discovery with symlinks and missing paths; bootstrap (phase 4) |
 | `recv` | `lib/mysql/mysql.tin`, `lib/postgres/postgres.tin`, `lib/redis/redis.tin` | 3 | removed | recv raw syscall (per-architecture ABI) | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
 | `rename` | `lib/quarry/quarry.tin` | 3 | removed | rename raw syscall (per-architecture ABI) | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
 | `rint` | `lib/gauge/gauge.tin`, `lib/runtime/runtime.tin` | 0 | intrinsic | Hardware float intrinsic | tests/v2/gauge.tin and gauge_math.tin; both backend instruction checks |
@@ -96,19 +96,19 @@ an entry removed only when no Linux declaration or linker-added import remains.
 | `sqrt` | `lib/dice/dice.tin`, `lib/gauge/gauge.tin` | 0 | intrinsic | Hardware float intrinsic | tests/v2/gauge.tin and gauge_math.tin; both backend instruction checks |
 | `stat` | `lib/quarry/quarry.tin` | 3 | removed | newfstatat pathname lookup | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
 | `strcmp` | `selfhost/main.tin` | 2 | removed | Tin mmap allocator or byte/word operations | Memory/OOM injection; overlap/alignment/microbenchmarks; bootstrap (phase 2) |
-| `strerror` | `lib/flume/flume.tin`, `lib/mysql/mysql.tin`, `lib/postgres/postgres.tin`, `lib/quarry/quarry.tin`, `lib/redis/redis.tin`, `lib/websocket/websocket.tin`, `lib/wire/wire.tin` | 4 | active | Per-OS Tin errno message table | tests/v2/quarry.tin; exact network/file error messages (phase 4) |
-| `strftime` | `lib/anvil/anvil.tin` | 4 | active | Tin time formatting | UTC calendar boundary Go twin; HTTP Date (phase 4) |
+| `strerror` | `lib/flume/flume.tin`, `lib/mysql/mysql.tin`, `lib/postgres/postgres.tin`, `lib/quarry/quarry.tin`, `lib/redis/redis.tin`, `lib/websocket/websocket.tin`, `lib/wire/wire.tin` | 4 | removed | Per-OS Tin errno message table | tests/v2/quarry.tin; exact network/file error messages (phase 4) |
+| `strftime` | `lib/anvil/anvil.tin` | 4 | removed | Tin time formatting | UTC calendar boundary Go twin; HTTP Date (phase 4) |
 | `strlen` | `lib/quarry/quarry.tin`, `lib/runtime/runtime.tin` | 2 | removed | Tin mmap allocator or byte/word operations | Memory/OOM injection; overlap/alignment/microbenchmarks; bootstrap (phase 2) |
 | `strtod` | `lib/runtime/runtime.tin`, `selfhost/lex.tin` | 1 | removed | Correctly rounded Tin float parser | tools/ci/number_check.py; tests/v2/mint.tin; bootstrap fixed point |
-| `sysconf` | `lib/runtime/runtime_linux.tin`, `selfhost/host_linux.tin` | 4 | active | Affinity mask and cgroup CPU limits; page size via auxv | CPU quota/affinity tests; page-size kernels (phases 4/5) |
-| `time` | `lib/anvil/anvil.tin` | 4 | active | clock_gettime CLOCK_REALTIME | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 4) |
+| `sysconf` | `lib/runtime/runtime_linux.tin`, `selfhost/host_linux.tin` | 4 | removed | Affinity mask and cgroup CPU limits; page size via auxv | CPU quota/affinity tests; page-size kernels (phases 4/5) |
+| `time` | `lib/anvil/anvil.tin` | 4 | removed | clock_gettime CLOCK_REALTIME | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 4) |
 | `timerfd_create` | `lib/anvil/anvil_linux.tin` | 3 | removed | timerfd_create raw syscall (per-architecture ABI) | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
 | `timerfd_settime` | `lib/anvil/anvil_linux.tin` | 3 | removed | timerfd_settime raw syscall (per-architecture ABI) | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
 | `trunc` | `lib/gauge/gauge.tin` | 0 | intrinsic | Hardware float intrinsic | tests/v2/gauge.tin and gauge_math.tin; both backend instruction checks |
 | `uname` | `selfhost/main.tin` | 3 | removed | uname raw syscall (per-architecture ABI) | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
 | `unlink` | `lib/quarry/quarry.tin`, `lib/std.tin` | 3 | removed | unlink raw syscall (per-architecture ABI) | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
 | `unsetenv` | `lib/quarry/quarry.tin` | 5 | active | Tin owned environment removal | tests/v2/quarry.tin deletion (phase 5) |
-| `usleep` | `lib/hearth/hearth.tin` | 4 | active | nanosleep with interruption handling | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 4) |
+| `usleep` | `lib/hearth/hearth.tin` | 4 | removed | nanosleep with interruption handling | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 4) |
 | `write` | `lib/runtime/runtime.tin`, `lib/std.tin` | 3 | removed | write raw syscall (per-architecture ABI) | Existing strict/runtime/protocol suites plus syscall edge-case Go twin (phase 3) |
 | `_exit` | `lib/runtime/memory.tin`, `lib/runtime/runtime.tin` | 3 | removed | exit_group raw syscall | Fault/stack-overflow diagnostics and nonzero exit (issue #175) |
 | `shutdown` | `lib/anvil/anvil.tin` | 3 | removed | shutdown raw syscall | HTTP conformance and graceful shutdown |

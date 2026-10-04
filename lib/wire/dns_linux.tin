@@ -233,7 +233,9 @@ func dns_decode_name(b []u8, start i64) !(str,i64) {
             if next < 0 { next=pos }
             return str(out),next
         }
-        if pos+n > len(b) || len(out)+n+1 > 254 { fail "short DNS label" }
+        extra := n
+        if len(out) > 0 { extra++ }
+        if pos+n > len(b) || len(out)+extra > 253 { fail "short DNS label" }
         if len(out) > 0 { out=append(out,'.') }
         out=append(out,b[pos:pos+n]...)
         pos+=n
@@ -297,9 +299,17 @@ func dns_response(b []u8, name str, kind i64, id i64) dnsAnswer {
     return bad
 }
 
-func dns_wait(fd i64, want i64, until i64) ! {
-    left := until-rt_mono_ns()
+func dns_budget(until i64) !i64 {
+    now := rt_mono_ns()
+    task := rt_task_current()
+    if task != 0 && task[tDeadline] > 0 && now >= task[tDeadline] { fail "deadline exceeded" }
+    left := until-now
     if left <= 0 { fail "DNS timed out" }
+    return left
+}
+
+func dns_wait(fd i64, want i64, until i64) ! {
+    left := try dns_budget(until)
     r := rt_task_wait(fd,want,left)
     if r == waitDeadline { fail "deadline exceeded" }
     if r == waitTimeout { fail "DNS timed out" }
@@ -309,6 +319,7 @@ func dns_send(fd i64, bytes []u8, until i64) ! {
     pos := i64(0)
     p := cast(i64,bytes)[2]
     for pos < len(bytes) {
+        left := try dns_budget(until)
         n := rt_sys_write(fd,p+pos,len(bytes)-pos)
         if n > 0 { pos+=n; continue }
         if n < 0 && errno() == 4 { continue }
@@ -322,6 +333,7 @@ func dns_read_exact(fd i64, n i64, until i64) ![]u8 {
     p := cast(i64,bytes)[2]
     got := i64(0)
     for got < n {
+        left := try dns_budget(until)
         k := rt_sys_read(fd,p+got,n-got)
         if k > 0 { got+=k; continue }
         if k < 0 && errno() == 4 { continue }
@@ -363,13 +375,21 @@ func dns_exchange(server str, port i64, query []u8, name str, kind i64, id i64, 
     if rt_sys_connect(fd,sa,rt_sockaddr_len(sa)) < 0 { fail "DNS connect failed" }
     try dns_send(fd,query,until)
     bytes := make([]u8,65535)
+    rejected := 0
     for {
+        left := try dns_budget(until)
         n := rt_sys_read(fd,cast(i64,bytes)[2],len(bytes))
         if n < 0 && errno() == 4 { continue }
         if n < 0 && errno() == EAGAIN { try dns_wait(fd,1,until); continue }
         if n < 12 { fail "DNS read failed" }
         packet := bytes[:n]
-        if dns_u16(packet,0) != id { continue }
+        if dns_u16(packet,0) != id {
+            rejected++
+            if rejected%16 == 0 && rt_task_current() != 0 {
+                if rt_task_wait(-1,0,1) == waitDeadline { fail "deadline exceeded" }
+            }
+            continue
+        }
         response := dns_response(packet,name,kind,id)
         if response.code == 4 {
             tcp := try dns_tcp(sa,query,until)
@@ -420,6 +440,9 @@ func resolve(host str, port i64, sa i64, until i64) ! {
     fromHosts := try dns_hosts(name)
     if fromHosts.family != 0 { dns_sockaddr(sa,fromHosts,port); return }
     config := try dns_config()
+    limit := until
+    task := rt_task_current()
+    if task != 0 && task[tDeadline] > 0 && (limit == 0 || task[tDeadline] < limit) { limit=task[tDeadline] }
     start := i64(0)
     if config.rotate { start=dnsRotation%len(config.servers); dnsRotation++ }
     candidates := make([]str,0,len(config.search)+1)
@@ -433,7 +456,7 @@ func resolve(host str, port i64, sa i64, until i64) ! {
     if !absolute && dots < config.ndots { candidates=append(candidates,name) }
     for _, candidate := range candidates {
         for _, kind := range []i64{1,28} {
-            answer := try dns_lookup(candidate,kind,config,start,until)
+            answer := try dns_lookup(candidate,kind,config,start,limit)
             if answer.address.family != 0 { dns_sockaddr(sa,answer.address,port); return }
             if answer.code == 3 { break }
         }
