@@ -902,6 +902,17 @@ fn map_set_call(pos, m, k, v, kt) {
     return rt_call(pos, "rt_map_set", args3(m, to_bits(k), to_bits(v)), ty_void);
 }
 
+// map_make_call makes a map of type t (#176): counted sides carry their drops, so the
+// runtime counts the entries of a long-lived map by itself (its m[9] decides).
+fn map_make_call(pos, t) {
+    let counted = rc_map_bits(t);
+    let isstr = mk_int(pos, map_str_keys(t[TY_KEY]), ty_int);
+    if counted == 0 {
+        return rt_call(pos, "rt_map_make", args1(isstr), t);
+    }
+    return rt_call(pos, "rt_map_make_rc", args3(isstr, fn_ref_node(pos, rc_map_drop(t)), mk_int(pos, counted, ty_int)), t);
+}
+
 // key_valid reports whether t can be a map key: str, numbers, bool, or structs and enums
 // made of those (compared by value).
 fn key_valid(t, path) {
@@ -1581,7 +1592,7 @@ fn chk_composite(e, want) {
         return t;
     }
     if k == K_MAP {
-        let m = temp(pos, rt_call(pos, "rt_map_make", args1(mk_int(pos, map_str_keys(t[TY_KEY]), ty_int)), t), t);
+        let m = temp(pos, map_make_call(pos, t), t);
         vec_push(stmts, m);
         let i = 0;
         while i < elems[VEC_LEN] {
@@ -3124,6 +3135,9 @@ fn chk_builtin(e, name, want) {
                 }
                 if is_dyn_value(et) {
                     acc = lower_append_dyn(pos, acc, a, st);
+                } else if rc_counted(et) {
+                    // The element's slot owns it (#176): a long-lived slice counts it.
+                    acc = rt_call(pos, "rt_append_rc", args3(acc, elem_bits(a, st[TY_ELEM]), mk_int(pos, elem_size(st), ty_int)), st);
                 } else {
                     acc = rt_call(pos, "rt_append", args3(acc, elem_bits(a, st[TY_ELEM]), mk_int(pos, elem_size(st), ty_int)), st);
                 }
@@ -3176,7 +3190,7 @@ fn chk_builtin(e, name, want) {
             return t;
         }
         if k == K_MAP {
-            replace_node(e, rt_call(pos, "rt_map_make", args1(mk_int(pos, map_str_keys(t[TY_KEY]), ty_int)), t));
+            replace_node(e, map_make_call(pos, t));
             return t;
         }
         err_type(pos, "cannot make ", t, "");
@@ -3841,7 +3855,7 @@ fn argo_new(pos, body, t) {
         return rt_call(pos, "rt_slice_make", args3(mk_int(pos, 0, ty_int), mk_int(pos, 0, ty_int), mk_int(pos, elem_size(t), ty_int)), t);
     }
     if k == K_MAP {
-        return rt_call(pos, "rt_map_make", args1(mk_int(pos, map_str_keys(t[TY_KEY]), ty_int)), t);
+        return map_make_call(pos, t);
     }
     if k != K_STRUCT {
         return mk_int(pos, 0, t);

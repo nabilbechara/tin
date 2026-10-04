@@ -7426,6 +7426,10 @@ fn keep_fn(t) {
                 if is_ref(ft) || is_dyn_value(ft) {
                     let src = mk_mem(pos, sym_ref_node(pos, out[LET_SYM]), 0, 0, field_offset(t, fi), ft);
                     vec_push(ifs[IF_THEN][BLK_STMTS], assign_stmt(pos, field_store(pos, sym_ref_node(pos, out[LET_SYM]), t, fi), keep_call(pos, keep_fn(ft), src, ft)));
+                    // The kept copy's slot owns what it holds (#176).
+                    if rc_counted(ft) {
+                        vec_push(ifs[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, "rt_rc_inc", args1(mk_mem(pos, sym_ref_node(pos, out[LET_SYM]), 0, 0, field_offset(t, fi), ft)), ty_void)));
+                    }
                 }
                 kk = kk + 1;
             }
@@ -7442,13 +7446,18 @@ fn keep_fn(t) {
             if is_ref(ft) || is_dyn_value(ft) {
                 let src = mk_mem(pos, sym_ref_node(pos, out[LET_SYM]), 0, 0, field_offset(t, fi), ft);
                 vec_push(body, assign_stmt(pos, field_store(pos, sym_ref_node(pos, out[LET_SYM]), t, fi), keep_call(pos, keep_fn(ft), src, ft)));
+                // The kept copy's slot owns what it holds (#176).
+                if rc_counted(ft) {
+                    vec_push(body, expr_stmt(rt_call(pos, "rt_rc_inc", args1(mk_mem(pos, sym_ref_node(pos, out[LET_SYM]), 0, 0, field_offset(t, fi), ft)), ty_void)));
+                }
             }
             fi = fi + 1;
         }
         ret[RET_VALUE] = sym_ref_node(pos, out[LET_SYM]);
     } else if k == K_MAP {
-        // A new ingot map, filled entry by entry with kept keys and values.
-        let out = temp(pos, rt_call(pos, "rt_keep_map_new", args1(sym_ref_node(pos, x)), t), t);
+        // A new ingot map, filled entry by entry with kept keys and values. Its counted
+        // sides carry their drops, so rt_map_set owns the entries' counts itself (#176).
+        let out = temp(pos, rt_call(pos, "rt_keep_map_new", args3(sym_ref_node(pos, x), fn_ref_node(pos, rc_map_drop(t)), mk_int(pos, rc_map_bits(t), ty_int)), t), t);
         vec_push(body, out);
         let slots = temp(pos, rt_call(pos, "rt_map_slots", args1(sym_ref_node(pos, x)), ty_int), ty_int);
         vec_push(body, slots);
@@ -7499,7 +7508,221 @@ fn keep_call(pos, f, arg, t) {
     return c;
 }
 
-// keep_each replaces every element of the (already copied) ingot slice out by a kept copy.
+// ---- drops: what a kept object's slots own (#176, notes/interface_mem.md) ----
+
+// rc_counted reports whether values of t own long-lived counts: str, slice, map, struct
+// (an enum with payloads is one) and opt of those. Func values (code pointers and kept
+// closures), faults and dyn objects are not counted yet (known gaps: they leak, never
+// corrupt).
+fn rc_counted(t) {
+    let k = kind_of(t);
+    if k == K_STRING || k == K_SLICE || k == K_MAP || k == K_STRUCT {
+        return 1;
+    }
+    if k == K_OPT {
+        return rc_counted(t[TY_ELEM]);
+    }
+    return 0;
+}
+
+// fn_ref_node is f as a func value argument (the runtime calls it with one word).
+fn fn_ref_node(pos, f) {
+    let n = node_new(EX_FUNCREF, pos);
+    n[FR_FN] = f;
+    n[N_TYPE] = f[F_TYPE];
+    return n;
+}
+
+// rc_none is the runtime's own no-op drop: the drop of childless blocks.
+fn rc_none() {
+    return find_fn("rt_rc_drop_none");
+}
+
+// rc_dec_call emits rt_rc_dec(v, drop).
+fn rc_dec_call(pos, v, drop) {
+    return rt_call(pos, "rt_rc_dec", args2(v, fn_ref_node(pos, drop)), ty_void);
+}
+
+// rc_map_bits is a map type's counted sides (#176): bit 0 the key side (str keys and
+// encoded struct or enum keys), bit 1 the value side.
+fn rc_map_bits(t) {
+    let b = 0;
+    if map_str_keys(t[TY_KEY]) {
+        b = b | 1;
+    }
+    if rc_counted(t[TY_ELEM]) {
+        b = b | 2;
+    }
+    return b;
+}
+
+// rc_map_drop is the value side's drop of a map type (the runtime's no-op when that
+// side is not counted).
+fn rc_map_drop(t) {
+    if rc_counted(t[TY_ELEM]) {
+        return drop_fn(t[TY_ELEM]);
+    }
+    return rc_none();
+}
+
+var drop_types;
+var drop_fns;
+var arrdrop_types;
+var arrdrop_fns;
+
+// drop_fn returns (generating on first use) drop$N(x T), the drop of blocks of type T:
+// one long-lived count leaves every counted child of x (fields, elements, entries); the
+// block itself rt_rc_dec already queued. A str has no children, so the runtime's own
+// no-op drop serves and map[str]str lifts no function at all.
+fn drop_fn(t) {
+    if kind_of(t) == K_STRING {
+        return rc_none();
+    }
+    if !drop_types {
+        drop_types = vec_new();
+        drop_fns = vec_new();
+    }
+    let i = 0;
+    while i < drop_types[VEC_LEN] {
+        if vec_get(drop_types, i) == t {
+            return vec_get(drop_fns, i);
+        }
+        i = i + 1;
+    }
+    let names = vec_new();
+    vec_push(names, "x");
+    let types = vec_new();
+    vec_push(types, t);
+    let f = lifted_fn("drop", names, types, vec_new());
+    vec_push(drop_types, t);
+    vec_push(drop_fns, f);
+    let saved_fn = ck_fn;
+    ck_fn = f;
+    let pos = 0;
+    let x = vec_get(f[F_LOCALS], 0);
+    rc_drop_body(pos, f[F_BODY][BLK_STMTS], sym_ref_node(pos, x), t);
+    ck_fn = saved_fn;
+    return f;
+}
+
+// rc_drop_body appends the releases of x's children to body: what one long-lived
+// reference to a value of type t holds.
+fn rc_drop_body(pos, body, x, t) {
+    let k = kind_of(t);
+    if k == K_SLICE {
+        let data = mk_hdr(pos, x, 2);
+        vec_push(body, expr_stmt(rc_dec_call(pos, data, arrdrop_fn(t[TY_ELEM]))));
+    } else if k == K_MAP {
+        let slots = temp(pos, rt_call(pos, "rt_map_slots", args1(x), ty_int), ty_int);
+        vec_push(body, slots);
+        let j = declare_local(pos, "$", ty_int);
+        vec_push(body, let_stmt(pos, j, mk_int(pos, 0, ty_int)));
+        let w = node_new(ST_WHILE, pos);
+        w[WH_COND] = mk_bin(pos, "<", sym_ref_node(pos, j), sym_ref_node(pos, slots[LET_SYM]), ty_bool);
+        w[WH_POST] = assign_stmt(pos, sym_ref_node(pos, j), mk_bin(pos, "+", sym_ref_node(pos, j), mk_int(pos, 1, ty_int), ty_int));
+        let wb = empty_block(pos);
+        w[WH_BODY] = wb;
+        let live = node_new(ST_IF, pos);
+        live[IF_COND] = rt_call(pos, "rt_map_live", args2(x, sym_ref_node(pos, j)), ty_bool);
+        live[IF_THEN] = empty_block(pos);
+        if (rc_map_bits(t) & 1) != 0 {
+            let kt = t[TY_KEY];
+            if key_composite(kt) {
+                kt = ty_string;
+            }
+            vec_push(live[IF_THEN][BLK_STMTS], expr_stmt(rc_dec_call(pos, from_bits(rt_call(pos, "rt_map_key", args2(x, sym_ref_node(pos, j)), ty_int), kt), rc_none())));
+        }
+        if rc_counted(t[TY_ELEM]) {
+            vec_push(live[IF_THEN][BLK_STMTS], expr_stmt(rc_dec_call(pos, from_bits(rt_call(pos, "rt_map_val", args2(x, sym_ref_node(pos, j)), ty_int), t[TY_ELEM]), drop_fn(t[TY_ELEM]))));
+        }
+        vec_push(wb[BLK_STMTS], live);
+        vec_push(body, w);
+    } else if k == K_OPT {
+        let ifs = node_new(ST_IF, pos);
+        ifs[IF_COND] = mk_bin(pos, "!=", x, mk_int(pos, 0, t), ty_bool);
+        ifs[IF_THEN] = empty_block(pos);
+        vec_push(ifs[IF_THEN][BLK_STMTS], expr_stmt(call_fn(pos, drop_fn(t[TY_ELEM]), args1(x), ty_void)));
+        vec_push(body, ifs);
+    } else if k == K_STRUCT && t[TY_ENUM] {
+        let vs = t[TY_ENUM];
+        let vi = 0;
+        while vi < vs[VEC_LEN] {
+            let v = vec_get(vs, vi);
+            let ifs = node_new(ST_IF, pos);
+            ifs[IF_COND] = mk_bin(pos, "==", mk_mem(pos, x, 0, 0, field_offset(t, 0), ty_int), mk_int(pos, vi, ty_int), ty_bool);
+            ifs[IF_THEN] = empty_block(pos);
+            let kk = 0;
+            while kk < vec_get(v, 2) {
+                let fi = vec_get(v, 1) + kk;
+                let ft = field_type(t, fi);
+                if rc_counted(ft) {
+                    vec_push(ifs[IF_THEN][BLK_STMTS], expr_stmt(rc_dec_call(pos, mk_mem(pos, x, 0, 0, field_offset(t, fi), ft), drop_fn(ft))));
+                }
+                kk = kk + 1;
+            }
+            vec_push(body, ifs);
+            vi = vi + 1;
+        }
+    } else if k == K_STRUCT {
+        let fi = 0;
+        while fi < t[TY_FIELDS][VEC_LEN] {
+            let ft = field_type(t, fi);
+            if rc_counted(ft) {
+                vec_push(body, expr_stmt(rc_dec_call(pos, mk_mem(pos, x, 0, 0, field_offset(t, fi), ft), drop_fn(ft))));
+            }
+            fi = fi + 1;
+        }
+    }
+}
+
+// arrdrop_fn returns (generating on first use) arrdrop$N(p i64), the drop of a slice
+// backing array of element type T: each element block loses its slot's count. Elements
+// of an uncounted type never had one: the no-op drop serves.
+fn arrdrop_fn(et) {
+    if !rc_counted(et) {
+        return rc_none();
+    }
+    if !arrdrop_types {
+        arrdrop_types = vec_new();
+        arrdrop_fns = vec_new();
+    }
+    let i = 0;
+    while i < arrdrop_types[VEC_LEN] {
+        if vec_get(arrdrop_types, i) == et {
+            return vec_get(arrdrop_fns, i);
+        }
+        i = i + 1;
+    }
+    let names = vec_new();
+    vec_push(names, "p");
+    let types = vec_new();
+    vec_push(types, ty_int);
+    let f = lifted_fn("arrdrop", names, types, vec_new());
+    vec_push(arrdrop_types, et);
+    vec_push(arrdrop_fns, f);
+    let saved_fn = ck_fn;
+    ck_fn = f;
+    let pos = 0;
+    let p = vec_get(f[F_LOCALS], 0);
+    let body = f[F_BODY][BLK_STMTS];
+    let n = temp(pos, rt_call(pos, "rt_rc_arr_n", args2(sym_ref_node(pos, p), mk_int(pos, type_width(et), ty_int)), ty_int), ty_int);
+    vec_push(body, n);
+    let j = declare_local(pos, "$", ty_int);
+    vec_push(body, let_stmt(pos, j, mk_int(pos, 0, ty_int)));
+    let w = node_new(ST_WHILE, pos);
+    w[WH_COND] = mk_bin(pos, "<", sym_ref_node(pos, j), sym_ref_node(pos, n[LET_SYM]), ty_bool);
+    w[WH_POST] = assign_stmt(pos, sym_ref_node(pos, j), mk_bin(pos, "+", sym_ref_node(pos, j), mk_int(pos, 1, ty_int), ty_int));
+    let wb = empty_block(pos);
+    w[WH_BODY] = wb;
+    let cell = mk_mem(pos, sym_ref_node(pos, p), sym_ref_node(pos, j), type_width(et), 0, et);
+    vec_push(wb[BLK_STMTS], expr_stmt(rc_dec_call(pos, cell, drop_fn(et))));
+    vec_push(body, w);
+    ck_fn = saved_fn;
+    return f;
+}
+
+// keep_each replaces every element of the (already copied) ingot slice out by a kept copy
+// whose slot owns it (#176).
 fn keep_each(pos, body, out, et) {
     let n = temp(pos, mk_hdr(pos, sym_ref_node(pos, out), 0), ty_int);
     vec_push(body, n);
@@ -7514,6 +7737,10 @@ fn keep_each(pos, body, out, et) {
     let cell = mk_mem(pos, sym_ref_node(pos, data[LET_SYM]), sym_ref_node(pos, j), type_width(et), 0, et);
     let cell2 = mk_mem(pos, sym_ref_node(pos, data[LET_SYM]), sym_ref_node(pos, j), type_width(et), 0, et);
     vec_push(wb[BLK_STMTS], assign_stmt(pos, cell, keep_call(pos, keep_fn(et), cell2, et)));
+    if rc_counted(et) {
+        let cell3 = mk_mem(pos, sym_ref_node(pos, data[LET_SYM]), sym_ref_node(pos, j), type_width(et), 0, et);
+        vec_push(wb[BLK_STMTS], expr_stmt(rt_call(pos, "rt_rc_inc", args1(cell3), ty_void)));
+    }
     w[WH_BODY] = wb;
     vec_push(body, w);
 }
