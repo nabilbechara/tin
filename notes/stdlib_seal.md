@@ -72,3 +72,21 @@ API: `X25519`, `X25519PublicKey`, `X25519NewPrivateKey`, `ChaCha20`, `type AEAD`
 Tests: `tests/v2/seal_x25519_chacha.tin` (RFC 7748, RFC 8439, every length class, tampering;
 the Go twin `bench/ref/seal_x25519_chacha` uses crypto/ecdh and an independent math/big
 Poly1305), and Wycheproof `x25519` and `chacha20_poly1305` in `tools/ci/crypto_check.py`.
+
+## Private keys and signing (#124 phase 5 prerequisites)
+
+API: `ParsePrivateKeyPEM`, `ParsePrivateKeyDER` (`PrivateKey` with `RSA ?RSAPrivateKey` and
+`EC ?ECPrivateKey`), `PrivateKey.MatchesCertificate`, `PrivateKey.SignTLS(scheme, msg)`,
+`SignPKCS1v15`, `SignPSS`, `SignECDSA`.
+
+- Formats: PKCS #8 (RSA, EC), PKCS #1 RSA (two primes), SEC 1 EC; P-256 and P-384. Refused:
+  RSA outside 2048–8192 bits, P-521, Ed25519 keys, encrypted keys, inconsistent keys (p*q must
+  be n, a test signature must verify, a SEC 1 public key must match the scalar).
+- The private parts are `secret` fields readable only inside seal.
+- RSA: CRT with base blinding; every signature is checked with the public key before it is
+  returned. ECDSA: RFC 6979 deterministic nonces (equal to Go's `Sign(nil, ...)` byte for byte).
+- Speed on Linux x86-64: RSA-2048 signing about 27 ms, P-256 about 2 ms, P-384 about 6 ms; Go
+  is about 1 ms, 20 us and 300 us. All of it is `monty.mul`; see the FIOS proposal in #124.
+
+Tests: `tests/v2/seal_sign.tin` (Go twin `bench/ref/seal_sign`, test keys in `tests/data/keys`
+labelled "TESTING KEY"), and `tools/ci/x509_check.py`, where Go verifies TLS signatures Tin made.
