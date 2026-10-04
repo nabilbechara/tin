@@ -78,7 +78,10 @@ func rt_effect(tp i64, kind str, key str, body func() !str) !str
 ```
 
 - **Recording:** runs `body`; appends `(seq, kind, key, outcome)` (3.3) where the outcome is
-  `body`'s result or fault; returns that result or fault unchanged.
+  `body`'s result or fault; returns that result or fault unchanged. `body` runs with the
+  calling task's tape **suspended** (`tTape` holds the tape with its low bit set, and
+  `rt_tape()` gives 0), so `body` may call the client's own public function again and that
+  live call is not recorded twice. `rt_tape_of(t)` gives a task's tape either way.
 - **Replaying:** takes the next record. If its `kind` and `key` equal the arguments, returns its
   result, or fails with its fault rebuilt (3.3), **without running `body`**. Otherwise it is a
   divergence (3.4). If the kind (before `@`) is in `tpLive`, `body` runs and its outcome is
@@ -137,11 +140,11 @@ replayer (#242) refuses a capsule with a kind or version this build does not lis
 | `tide.wall@1` | "" | word: wall ns | `tide.Wall` |
 | `dice.seed@1` | "" | word: the seed of this request's generator | `dice` package functions, at the first draw of a request (they then draw from `tpRand`, not the core's generator) |
 | `seal.random@1` | decimal n | the n bytes | `seal.RandomBytes` |
-| `wire.http@1` | method, " ", URL, then for each header "\n" name ": " value | word status, string head, string body | `wire.DoWith` (so `Get`, `Post`, `Do`) |
+| `wire.http@1` | method, " ", URL, then for each header "\n" name ": " value, then "\n\n" and the body | word status, string head, string body | `wire.DoWith` (so `Get`, `Post`, `Do`) |
 | `wire.dial@1` | address | word: the connection's number in this request (1, 2, ...) | `wire.Dial`, `DialTimeout` (raw TCP) |
 | `wire.read@1` | connection number, " ", max | the bytes (EOF: the `EOF` fault) | `Conn.Read` and what reads through it |
 | `wire.write@1` | connection number, " ", the bytes | "" | `Conn.Write`, `WriteBytes` |
-| `redis@1` | the commands: each word as a string, each command ended by "\n" | the raw RESP replies as received | the client's exchange (`Do`, `Pipe` and the helpers on them) |
+| `redis@1` | the commands: each word as its decimal length, ":" and its bytes, words separated by " ", each command ended by "\n" (`3:GET 6:cart:7\n`) | the raw RESP replies as received | `Do` and `Pipe` (so every helper on them) |
 | `mysql@1` | "Q " or "E " (Query or Exec), the query parts and arguments (section 5.3) | Rows or Result, encoded by the client | `Query`, `Exec`, and the same on `Tx`; `Begin`, `Commit`, `Rollback` as `mysql.tx@1` |
 | `postgres@1` | as `mysql@1` | as `mysql@1` | as `mysql@1` (`postgres.tx@1`) |
 | `websocket.dial@1`, `.read@1`, `.write@1` | as `wire.*`; read result: word kind, string data | | the client and an accepted connection |
