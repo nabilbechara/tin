@@ -105,7 +105,7 @@ fn ia_expr(e) {
         ia_exprs(e[CALL_ARGS]);
         let name = e[CALL_NAME];
         if !e[CALL_INTRINSIC] && name && !ia_fn[F_LEGACY] {
-            if streq(name, "rt_append") && e[CALL_ARGS][VEC_LEN] == 3 && vec_get(e[CALL_ARGS], 2)[N_KIND] == EX_INT {
+            if (streq(name, "rt_append") || streq(name, "rt_append_rc")) && e[CALL_ARGS][VEC_LEN] == 3 && vec_get(e[CALL_ARGS], 2)[N_KIND] == EX_INT {
                 ia_append(e);
             } else if streq(name, "rt_append_str") && e[CALL_ARGS][VEC_LEN] == 2 {
                 ia_append_str(e);
@@ -166,6 +166,14 @@ fn ia_append(e) {
     let slot = mk_mem(pos, ia_hdr(h, 2), ia_ref(n), esz, 0, elem_type_of_size(esz));
     vec_push(els[BLK_STMTS], assign_stmt(pos, slot, ia_ref(v)));
     vec_push(els[BLK_STMTS], assign_stmt(pos, ia_hdr(h, 0), mk_bin(pos, "+", ia_ref(n), mk_int(pos, 1, ty_int), ty_int)));
+    if streq(e[CALL_NAME], "rt_append_rc") {
+        // A counted element in a long-lived slice gains its slot's count (#176).
+        let lived = node_new(ST_IF, pos);
+        lived[IF_COND] = mk_bin(pos, "!=", ia_hdr(h, 3), mk_int(pos, 0, ty_int), ty_bool);
+        lived[IF_THEN] = empty_block(pos);
+        vec_push(lived[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, "rt_rc_inc", args1(ia_ref(v)), ty_void)));
+        vec_push(els[BLK_STMTS], lived);
+    }
     ifs[IF_ELSE] = els;
     vec_push(stmts, ifs);
     replace_node(e, mk_seq(pos, stmts, ia_ref(h), st));

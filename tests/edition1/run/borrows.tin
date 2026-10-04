@@ -1,0 +1,44 @@
+package main
+
+import "say"
+import "tide"
+
+// #176: main runs on the core's own stack, not in a task. A value it borrowed from a
+// long-lived map stays valid while a spawned child replaces the entry and ends.
+mut cache = map[str]str{}
+
+fn fill(i i64) {
+	cache["k"] = keep("value-{i}")
+}
+
+fn replace(i i64) ! {
+	try tide.Wait(1 * tide.Millisecond)
+	cache["k"] = keep("other-{i}")
+}
+
+fn round(i i64) !str {
+	fill(i)
+	let u = cache["k"]
+	scope s {
+		s.spawn(fn() ! {
+			try replace(i)
+		})
+	}
+	return u
+}
+
+fn main() {
+	mut last str = ""
+	for i in 0..20 {
+		let u = round(i) catch err {
+			say.Line("fault", err)
+			return
+		}
+		last = keep(u)
+		if u != "value-{i}" {
+			say.Line("borrowed value changed:", i, u)
+			return
+		}
+	}
+	say.Line("ok", last, cache["k"])
+}

@@ -146,13 +146,16 @@ fn mem_drain(heap) {
     mem_unlock(heap+16);
     while p != 0 {
         let next=p[0];
-        let k=mem_class((p-8)[0]+16);
+        let k=mem_class(((p-8)[0] & 140737488355327)+16);
         p[0]=heap[6+k]; heap[6+k]=p;
         p=next;
     }
 }
 
-// Every block has [owning heap, requested size] before its 16-byte-aligned payload.
+// Every block has [owning heap, size word] before its 16-byte-aligned payload. The size
+// word's bits 0-46 are the requested size; bits 47-62 belong to the long-lived reference
+// count (#176, notes/interface_mem.md), so every reader masks with 2^47-1. A fresh block
+// and a freelist reuse both start with a count of 0.
 fn mem_alloc(heap, n, zero) {
     mem_failpoint(n);
     if n < 0 || n > 70368744177664 { return mem_oom(n); }
@@ -180,7 +183,7 @@ fn mem_alloc(heap, n, zero) {
 fn mem_free(p, current) {
     if p == 0 { return; }
     let b=p-16;
-    let heap=b[0]; let n=b[1];
+    let heap=b[0]; let n=b[1] & 140737488355327;
     let k=mem_class(n+16);
     if k < 0 { rt_sys_munmap(b,(n+16+heap[1]-1) & -heap[1]); return; }
     if heap == current { p[0]=heap[6+k]; heap[6+k]=p; return; }
@@ -192,10 +195,10 @@ fn mem_free(p, current) {
 fn mem_realloc(heap, p, n) {
     if p == 0 { return mem_alloc(heap,n,0); }
     if n == 0 { mem_free(p,heap); return 0; }
-    let old=(p-8)[0];
+    let old=(p-8)[0] & 140737488355327;
     // Keep the recorded class stable; growing within it needs no mapping or copy.
     if n > old && mem_class(old+16) >= 0 && n+16 <= mem_class_size(mem_class(old+16)) {
-        mem_failpoint(n); (p-8)[0]=n; return p;
+        mem_failpoint(n); (p-8)[0]=(p-8)[0]-old+n; return p;
     }
     let q=mem_alloc(heap,n,0);
     let copy=old; if n < copy { copy=n; }
