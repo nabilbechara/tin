@@ -641,3 +641,22 @@ _start (ELF) or dyld (Mach-O) -> main (the generated __start):
   main.main()
   rt_exit()                   flush stdout, exit(0)
 ```
+
+## 12. Cryptography: constant-time code in seal
+
+TLS (#124) needs primitives whose running time and memory accesses do not depend on secret
+data. The rule in `lib/seal/`: no branch, loop bound or table index depends on a secret byte
+(key, plaintext, shared secret, MAC); lengths and public inputs may. The list below says which
+functions keep that rule, and grows as phase 1 lands.
+
+| function | constant-time in | not constant-time in |
+|---|---|---|
+| `Sha256`, `Sha384`, `Sha512`, `Sum` | the message bytes | its length |
+| `Hmac`, `HmacSha256` | the key and message bytes | their lengths |
+| `HkdfExtract`, `HkdfExpand`, `HkdfExpandLabel` | the key material | lengths, `info`, labels |
+| `ConstantTimeEq`, `Equal` | the bytes | the lengths |
+
+`Sha1`, `Pbkdf2Sha256`, the hex and base64 codecs and the RSA-OAEP code are not
+constant-time and must not be used on secrets in a timing-sensitive protocol path.
+Vectors: `tools/ci/crypto_check.py` runs the Wycheproof files in `tests/wycheproof/`
+(including the invalid inputs) and random inputs checked against Python's `hashlib`.

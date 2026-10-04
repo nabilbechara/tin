@@ -7,6 +7,7 @@
 #   tin asm FILE.tin...             print the generated ARM64 assembly
 #   tin audit secrets [-edition 1] FILE.tin...  list every reveal and secret library argument
 #   tin test [-bench] [DIR]         run DIR's *_test.tin tests (TestXxx, BenchmarkXxx)
+#   tin vendor [DIR]                copy tin.mod's requires into vendor/ and write tin.lock
 #   tin suite                       run the compiler's strict test suite (tests/v2)
 #   tin bootstrap                   rebuild the compiler with itself and check the fixed point
 #   tin version
@@ -126,6 +127,65 @@ case $1 in
     [ "$pkg" = main ] || entry=$pkg.TinTestMain
     "$tinc" -entry "$entry" -o "$exe" "$@" "$runner"
     "$exe" ;;
+  vendor)
+    # tin vendor [DIR]: copy every package DIR/tin.mod requires, and the packages their tin.mod
+    # files require, into DIR/vendor/<path>, then write DIR/tin.lock (docs/PACKAGES.md).
+    shift
+    [ $# -le 1 ] || { echo "tin: vendor: one project directory at a time" >&2; exit 2; }
+    proj=${1:-.}
+    [ -f "$proj/tin.mod" ] || { echo "tin: vendor: no tin.mod in $proj" >&2; exit 2; }
+    proj=$(cd "$proj" && pwd)
+    work=$(mktemp -d "$cache/vendor.XXXXXX"); trap 'rm -rf "$work"' EXIT
+    mkdir "$work/vendor"
+    # requires DIR appends "path<TAB>absolute source" for each require line of DIR/tin.mod.
+    requires() {
+      sed -n 's/^[[:space:]]*require[[:space:]]\{1,\}\([^[:space:]]\{1,\}\)[[:space:]]\{1,\}\(.*[^[:space:]]\)[[:space:]]*$/\1	\2/p' "$1/tin.mod" > "$work/req"
+      while IFS='	' read -r p s; do
+        case $s in /*) ;; *) s=$1/$s ;; esac
+        [ -d "$s" ] || { echo "tin: vendor: $1/tin.mod: require $p: $s is not a directory" >&2; return 1; }
+        printf '%s\t%s\n' "$p" "$(cd "$s" && pwd)" >> "$work/queue"
+      done < "$work/req"
+    }
+    : > "$work/queue"; : > "$work/done"
+    requires "$proj" || exit 1
+    while [ -s "$work/queue" ]; do
+      IFS='	' read -r p s < "$work/queue"
+      tail -n +2 "$work/queue" > "$work/rest"; mv "$work/rest" "$work/queue"
+      case $p in
+        /*|*..*|*//*|*/) echo "tin: vendor: bad import path '$p'" >&2; exit 1 ;;
+      esac
+      case ${p%%/*} in
+        *.*) ;;
+        *) echo "tin: vendor: require $p: an import path starts with a domain (example.com/name)" >&2; exit 1 ;;
+      esac
+      seen=$(awk -F '	' -v p="$p" '$1 == p { print $2; exit }' "$work/done")
+      if [ -n "$seen" ]; then
+        [ "$seen" = "$s" ] || { echo "tin: vendor: $p is required from two sources: $seen and $s" >&2; exit 1; }
+        continue
+      fi
+      printf '%s\t%s\n' "$p" "$s" >> "$work/done"
+      mkdir -p "$work/vendor/$p"
+      n=0
+      for f in "$s"/*.tin; do
+        case $f in *_test.tin) continue ;; esac
+        [ -f "$f" ] || continue
+        cp "$f" "$work/vendor/$p/"; n=$((n + 1))
+      done
+      [ "$n" -gt 0 ] || { echo "tin: vendor: require $p: no .tin files in $s" >&2; exit 1; }
+      if [ -f "$s/tin.mod" ]; then
+        cp "$s/tin.mod" "$work/vendor/$p/"
+        requires "$s" || exit 1
+      fi
+    done
+    rm -rf "$proj/vendor"
+    mv "$work/vendor" "$proj/vendor"
+    # The lock: entries the project keeps for its own files, then every vendored file, sorted.
+    {
+      [ ! -f "$proj/tin.lock" ] || awk 'length($1) == 64 && index($0, " vendor/") != 65' "$proj/tin.lock"
+      (cd "$proj" && find vendor -type f \( -name '*.tin' -o -name tin.mod \) | LC_ALL=C sort | while IFS= read -r f; do "$tinc" -hash "$f"; done)
+    } > "$work/lock"
+    mv "$work/lock" "$proj/tin.lock"
+    echo "tin: vendored $(wc -l < "$work/done" | tr -d ' ') packages into $proj/vendor" ;;
   suite)
     "$root/tools/v2test.sh" "$tinc" ;;
   bootstrap)
@@ -136,7 +196,7 @@ case $1 in
     host=$(uname -s | tr A-Z a-z)-$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
     echo "tin $version (self-hosted, $host, compiler $(cksum < "$tinc" | cut -d' ' -f1))" ;;
   ""|help|-h|--help)
-    sed -n '2,13p' "$self" | sed 's/^# \{0,1\}//' ;;
+    sed -n '2,14p' "$self" | sed 's/^# \{0,1\}//' ;;
   *.tin)
     f=$1; shift
     exe=$cache/run.$$; trap 'rm -f "$exe"' EXIT
