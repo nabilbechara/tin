@@ -3785,8 +3785,9 @@ Fix: pass a struct (or a slice) that holds the values.
 
 The code generator, assembler or linker met a case it cannot handle: a `dyn` value or
 argument in a place it cannot put it, an instruction it cannot encode, a branch out of range,
-code that changed size between layout and encoding, or a missing entry point. Assembler and
-linker messages start with `x64:` or `link:`.
+code that changed size between layout and encoding, a missing entry point, or a function
+import in a Linux executable (which is static). Assembler and linker messages start with
+`x64:` or `link:`.
 
 No example: only a compiler bug reaches this error.
 

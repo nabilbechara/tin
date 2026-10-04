@@ -10,8 +10,8 @@ RUN mkdir -p /out && tin build "$TIN_SOURCE" -o /out/api
 
 FROM debian:bookworm-slim
 
-# The binary is dynamically linked against glibc only (libc.so.6, libm.so.6), which the base
-# image provides; nothing else is installed. /bin/sleep (coreutils) serves the preStop hook.
+# The binary is static (no C library); the base image is here for /bin/sleep (coreutils),
+# which serves the preStop hook. Nothing else is installed.
 RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin tin
 COPY --from=build /out/api /app/api
 

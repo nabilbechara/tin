@@ -55,6 +55,29 @@ def run_in(root, exe, args, env):
     return subprocess.run(cmd, capture_output=True, timeout=30, env=env)
 
 
+def run_in_containers(work, exe):
+    """Runs exe in Alpine (musl, no glibc) and in an image built FROM scratch (no files at all)."""
+    docker = shutil.which('docker')
+    if docker is None or subprocess.run([docker, 'info'], capture_output=True).returncode != 0:
+        assert os.environ.get('CI') != 'true', 'CI needs docker for the Alpine and FROM scratch runs'
+        return False
+    image = work / 'image'
+    image.mkdir()
+    shutil.copy(exe, image / 'prog')
+    (image / 'Dockerfile').write_text('FROM scratch\nCOPY prog /prog\nENTRYPOINT ["/prog"]\n')
+    tag = 'tin-static-check:' + exe.name
+    subprocess.run([docker, 'build', '-q', '-t', tag, str(image)], check=True, capture_output=True, timeout=300)
+    runs = {
+        'scratch': [docker, 'run', '--rm', '-e', 'STATIC_A=one', tag],
+        'alpine': [docker, 'run', '--rm', '-e', 'STATIC_A=one', '-v', f'{image}:/w:ro', 'alpine:3.20', '/w/prog'],
+    }
+    for name, cmd in runs.items():
+        got = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        assert got.returncode == 0 and got.stdout == ENV_WANT, (name, got)
+    subprocess.run([docker, 'rmi', '-f', tag], capture_output=True)
+    return True
+
+
 def main(programs=()):
     out = ROOT / 'bin/ci/static'
     out.mkdir(parents=True, exist_ok=True)
@@ -95,15 +118,19 @@ def main(programs=()):
         exe = work / ('env-linux-' + ('arm64' if os.uname().machine in ('aarch64', 'arm64') else 'amd64'))
         got = subprocess.run([str(exe)], env={'STATIC_A': 'one'}, capture_output=True, text=True, timeout=30)
         assert got.returncode == 0 and got.stdout == ENV_WANT, got
+        contained = False
         if os.uname().sysname == 'Linux':
-            # bin/tinc comes from the checked-in seed, which still links libc until the seed
-            # refresh (#125); the compiler that compiled itself (make bootstrap) is static.
-            built = ROOT / 'bin/s3/tinc'
-            assert built.exists(), 'run make bootstrap first: bin/s3/tinc is the compiler it builds'
-            assert_static(built)
+            # The compiler is static at every stage: the checked-in seed, the bin/tinc it builds
+            # and the compiler that compiled itself (make bootstrap).
+            machine = 'arm64' if os.uname().machine in ('aarch64', 'arm64') else 'amd64'
+            for compiler in (ROOT / f'seed/tinc-linux-{machine}', ROOT / 'bin/tinc', ROOT / 'bin/s3/tinc'):
+                assert compiler.exists(), f'{compiler} is missing: run make bootstrap first'
+                assert_static(compiler)
+            contained = run_in_containers(work, exe)
     print('PASS static linux-arm64/amd64 images (no PT_INTERP, no PT_DYNAMIC); _start passes argc, argv and envp'
           + ('' if jailed is None else '; runs in an empty root')
-          + '; a program using getenv/setenv and the compiler itself are static')
+          + '; a program using getenv/setenv and the compiler (seed, bin/tinc, stage 3) are static'
+          + ('; the program runs on Alpine and FROM scratch' if contained else ''))
 
 
 if __name__ == '__main__':

@@ -1,17 +1,14 @@
-// ELF writer: a Linux x86-64 executable linked against glibc, laid out like elf.tin.
+// ELF writer: a static Linux x86-64 executable, laid out like elf.tin: Tin's own _start, no
+// interpreter, no dynamic section and no C library (#125).
 //
 // Layout (vaddr == file offset, segments 4 KiB aligned):
-//   R   : ELF header, program headers, interpreter path, dynsym, dynstr, hash, rela
-//   RX  : _start, the program's code, import stubs (jmp [rip + got]), C strings, Tin strings
-//   RW  : dynamic section, GOT, globals
-// Imports are bound at load time by R_X86_64_GLOB_DAT relocations on the GOT; every call to
-// an import goes through its 6-byte stub, so an import has an address like any function.
+//   R   : ELF header, program headers, function names, backtrace records
+//   RX  : _start, the program's code, C strings, Tin strings
+//   RW  : globals, function descriptors
 
 const EX64_ALIGN = 4096;
-const EX64_START_SIZE = 34;
 const EX64_START_STATIC = 35;
 const EX64_STUB_SIZE = 6;
-const R_X86_64_GLOB_DAT = 6;
 
 // x64_sym_hook resolves a symbol id from gen_x64's table for the encoder: string and
 // constant addresses, globals, GOT slots and functions (imports resolve to their stubs).
@@ -54,39 +51,6 @@ fn x64_sym_hook(id) {
     return lk_got + 8 * i;
 }
 
-// ex64_start writes _start at p (address at): __libc_start_main(main, argc, argv, 0, 0,
-// rtld_fini, stack_end) with the seventh argument on the stack, as glibc's crt1 does.
-fn ex64_start(p, at, main_addr, got_slot) {
-    store8(p, 0x31);
-    store8(p + 1, 0xed);
-    store8(p + 2, 0x49);
-    store8(p + 3, 0x89);
-    store8(p + 4, 0xd1);
-    store8(p + 5, 0x5e);
-    store8(p + 6, 0x48);
-    store8(p + 7, 0x89);
-    store8(p + 8, 0xe2);
-    store8(p + 9, 0x48);
-    store8(p + 10, 0x83);
-    store8(p + 11, 0xe4);
-    store8(p + 12, 0xf0);
-    store8(p + 13, 0x50);
-    store8(p + 14, 0x54);
-    store8(p + 15, 0x45);
-    store8(p + 16, 0x31);
-    store8(p + 17, 0xc0);
-    store8(p + 18, 0x31);
-    store8(p + 19, 0xc9);
-    store8(p + 20, 0x48);
-    store8(p + 21, 0x8d);
-    store8(p + 22, 0x3d);
-    put32(p + 23, main_addr - (at + 27));
-    store8(p + 27, 0xff);
-    store8(p + 28, 0x15);
-    put32(p + 29, got_slot - (at + 33));
-    store8(p + 33, 0xf4);
-}
-
 // ex64_start_static writes the static _start at p (address at): main(argc, argv, envp) from
 // the kernel's initial stack with rbp cleared and rsp aligned, then exit_group (231).
 fn ex64_start_static(p, at, main_addr) {
@@ -108,10 +72,7 @@ fn ex64_start_static(p, at, main_addr) {
 
 fn write_elf_x64(path) {
     let nvars = prog_vars[VEC_LEN];
-    let stat = el_static();
-    if !stat {
-        el_start_fn = el_import("__libc_start_main");
-    }
+    el_check_static();
     lk_imports = vec_new();
     lk_strs = 0;
     lk_tstrs = 0;
@@ -119,98 +80,37 @@ fn write_elf_x64(path) {
     lk_zero = 0;
     lk_got = 0;
     lk_data = 0;
-    let i = 0;
-    while i < prog_fns[VEC_LEN] {
-        let f = vec_get(prog_fns, i);
-        if f[F_EXTERN] && f[F_USED] {
-            f[F_GOT] = lk_imports[VEC_LEN];
-            vec_push(lk_imports, f);
-        }
-        i = i + 1;
-    }
-    let nimp = lk_imports[VEC_LEN];
 
-    // Dynamic symbols: null, the imports, then our functions (as tin.<name>, for backtraces).
+    // Function names (tin.<name>) and, after them, one backtrace record per function:
+    // [start, end, name offset] (the runtime's symbol table).
     let dstr = buf_new();
     buf_byte(dstr, 0);
-    let libc_at = dstr[VEC_LEN];
-    if !stat {
-        buf_str(dstr, "libc.so.6");
-        buf_byte(dstr, 0);
-    }
-    // libm is listed only when the program imports one of its functions.
-    let libm_at = 0;
-    let uses_libm = imports_libm(lk_imports);
-    if uses_libm {
-        libm_at = dstr[VEC_LEN];
-        buf_str(dstr, "libm.so.6");
-        buf_byte(dstr, 0);
-    }
-    let interp = "/lib64/ld-linux-x86-64.so.2";
-    if stat {
-        interp = "";
-    }
-    let names = vec_new();
     let name_off = vec_new();
-    vec_push(names, "");
-    vec_push(name_off, 0);
-    i = 0;
-    while i < nimp {
-        let nm = vec_get(lk_imports, i)[F_NAME];
-        vec_push(names, nm);
-        vec_push(name_off, dstr[VEC_LEN]);
-        buf_str(dstr, nm);
-        buf_byte(dstr, 0);
-        i = i + 1;
-    }
     let own = vec_new();
-    i = 0;
+    let i = 0;
     while i < prog_fns[VEC_LEN] {
         let f = vec_get(prog_fns, i);
         if !f[F_EXTERN] && f[F_REACH] {
             vec_push(own, f);
-            let b = buf_new();
-            buf_str(b, "tin.");
-            buf_str(b, f[F_QNAME]);
-            buf_byte(b, 0);
-            vec_push(names, b[VEC_DATA]);
             vec_push(name_off, dstr[VEC_LEN]);
-            buf_str(dstr, b[VEC_DATA]);
+            buf_str(dstr, "tin.");
+            buf_str(dstr, f[F_QNAME]);
             buf_byte(dstr, 0);
         }
         i = i + 1;
     }
-    let nsym = names[VEC_LEN];
 
-    // Read-only segment contents and their offsets.
-    // A static image keeps only the names (for backtraces): no dynsym, hash or relocations.
+    // Read-only segment: headers, names, backtrace records.
     let ph_off = 64;
-    let phnum = el_phnum(stat);
-    let interp_off = ph_off + 56 * phnum;
-    let dynsym_off = align_up(interp_off + strlen(interp) + 1, 8);
-    let dynstr_off = dynsym_off + 24 * nsym;
-    if stat {
-        dynstr_off = interp_off;
-    }
-    let hash_off = align_up(dynstr_off + dstr[VEC_LEN], 8);
-    let nbucket = nsym / 2 + 1;
-    let hash_size = 4 * (2 + nbucket + nsym);
-    if stat {
-        hash_size = 0;
-    }
-    let rela_off = align_up(hash_off + hash_size, 8);
-    let rela_size = 24 * nimp;
-    lk_btrace = align_up(rela_off+rela_size,8);
+    let phnum = 5;
+    let dynstr_off = ph_off + 56 * phnum;
+    lk_btrace = align_up(dynstr_off + dstr[VEC_LEN], 8);
     let ro_end = lk_btrace+8+24*own[VEC_LEN];
 
-    // Text segment: _start, code (laid out and relaxed first), stubs, strings, constants.
+    // Text segment: _start, code (laid out and relaxed first), strings, constants.
     let text_addr = align_up(ro_end, EX64_ALIGN);
     let start_addr = text_addr;
-    let start_size = EX64_START_SIZE;
-    if stat {
-        start_size = EX64_START_STATIC;
-    }
-    let code_addr = align_up(text_addr + start_size, 16);
+    let code_addr = align_up(text_addr + EX64_START_STATIC, 16);
     x64_syms = 0;
     x64_relocs = 0;
     let code_size = x64_layout(code, code_addr);
@@ -221,8 +121,7 @@ fn write_elf_x64(path) {
         i = i + 1;
     }
     let pc = code_addr + code_size;
-    lk_stubs = pc;
-    pc = pc + EX64_STUB_SIZE * nimp;
+    lk_stubs = pc;  // the end of the code: there are no import stubs
     lk_strs = vec_new();
     i = 0;
     while i < g_str_ptrs[VEC_LEN] {
@@ -242,15 +141,10 @@ fn write_elf_x64(path) {
     }
     let text_end = pc;
 
-    // Data segment: dynamic section, GOT, globals.
+    // Data segment: globals, then function descriptors.
     let data_addr = align_up(text_end, EX64_ALIGN);
-    let ndyn = 16;
-    if stat {
-        ndyn = 0;
-    }
-    let dyn_addr = data_addr;
-    lk_got = dyn_addr + 16 * ndyn;
-    lk_data = lk_got + 8 * nimp;
+    lk_got = data_addr;
+    lk_data = data_addr;
     lk_fndescs = lk_data + 8 * nvars;
     let data_end = lk_fndescs + 16 * prog_fns[VEC_LEN] + 8;
     let file_size = data_end;
@@ -274,45 +168,15 @@ fn write_elf_x64(path) {
     put32(img + 56, phnum | (64 << 16));
     put32(img + 60, 0);
 
-    // Program headers: PHDR, INTERP, LOAD R, LOAD RX, LOAD RW, DYNAMIC, GNU_STACK.
+    // Program headers: PHDR, LOAD R, LOAD RX, LOAD RW, GNU_STACK.
     let p = img + ph_off;
     p = el_phdr(p, 6, 4, ph_off, ph_off, 56 * phnum, 56 * phnum, 8);
-    if !stat {
-        p = el_phdr(p, 3, 4, interp_off, interp_off, strlen(interp) + 1, strlen(interp) + 1, 1);
-    }
     p = el_phdr(p, 1, 4, 0, 0, ro_end, ro_end, EX64_ALIGN);
     p = el_phdr(p, 1, 5, text_addr, text_addr, text_end - text_addr, text_end - text_addr, EX64_ALIGN);
     p = el_phdr(p, 1, 6, data_addr, data_addr, data_end - data_addr, data_end - data_addr, EX64_ALIGN);
-    if !stat {
-        p = el_phdr(p, 2, 6, dyn_addr, dyn_addr, 16 * ndyn, 16 * ndyn, 8);
-    }
     p = el_phdr(p, 0x6474e551, 6, 0, 0, 0, 0, 16);
-    memcpy(img + interp_off, interp, strlen(interp));
 
-    // Dynamic symbols (24 bytes each); dladdr needs st_size to cover each function.
-    i = 1;
-    if stat {
-        i = nsym;
-    }
-    while i < nsym {
-        let s = img + dynsym_off + 24 * i;
-        put32(s, vec_get(name_off, i));
-        store8(s + 4, 0x12);
-        if i > nimp {
-            let oi = i - 1 - nimp;
-            let f = vec_get(own, oi);
-            let end = lk_stubs;
-            if oi + 1 < own[VEC_LEN] {
-                end = vec_get(own, oi + 1)[F_ADDR];
-            }
-            store8(s + 6, 1);
-            put64(s + 8, f[F_ADDR]);
-            put64(s + 16, end - f[F_ADDR]);
-        }
-        i = i + 1;
-    }
     memcpy(img + dynstr_off, dstr[VEC_DATA], dstr[VEC_LEN]);
-    // Plain readonly records survive removal of the dynamic linker in phase 5.
     put64(img+lk_btrace,own[VEC_LEN]);
     i=0;
     while i < own[VEC_LEN] {
@@ -321,65 +185,12 @@ fn write_elf_x64(path) {
         if i+1 < own[VEC_LEN] { end=vec_get(own,i+1)[F_ADDR]; }
         let rec=img+lk_btrace+8+24*i;
         put64(rec,f[F_ADDR]); put64(rec+8,end);
-        put64(rec+16,dynstr_off+vec_get(name_off,nimp+1+i));
+        put64(rec+16,dynstr_off+vec_get(name_off,i));
         i=i+1;
     }
 
-
-    // SysV hash table over every dynamic symbol.
-    let hp = img + hash_off;
-    if !stat {
-        put32(hp, nbucket);
-        put32(hp + 4, nsym);
-    }
-    let buckets = hp + 8;
-    let chains = buckets + 4 * nbucket;
-    i = 1;
-    if stat {
-        i = nsym;
-    }
-    while i < nsym {
-        let b = el_hash(vec_get(names, i)) % nbucket;
-        put32(chains + 4 * i, load32(buckets + 4 * b));
-        put32(buckets + 4 * b, i);
-        i = i + 1;
-    }
-
-    // One GLOB_DAT relocation per GOT slot.
-    i = 0;
-    while i < nimp {
-        let r = img + rela_off + 24 * i;
-        put64(r, lk_got + 8 * i);
-        put64(r + 8, ((i + 1) << 32) | R_X86_64_GLOB_DAT);
-        put64(r + 16, 0);
-        i = i + 1;
-    }
-
-    // Dynamic section.
-    let d = img + dyn_addr;
-    if stat {
-        ex64_start_static(img + start_addr, start_addr, entry_fn()[F_ADDR]);
-    } else {
-        d = el_dyn(d, 1, libc_at);
-        if uses_libm {
-            d = el_dyn(d, 1, libm_at);
-        }
-        d = el_dyn(d, 4, hash_off);
-        d = el_dyn(d, 5, dynstr_off);
-        d = el_dyn(d, 6, dynsym_off);
-        d = el_dyn(d, 10, dstr[VEC_LEN]);
-        d = el_dyn(d, 11, 24);
-        d = el_dyn(d, 7, rela_off);
-        d = el_dyn(d, 8, rela_size);
-        d = el_dyn(d, 9, 24);
-        d = el_dyn(d, 30, 8);
-        d = el_dyn(d, 0x6ffffffb, 0x08000001);
-        d = el_dyn(d, 21, 0);
-        d = el_dyn(d, 0, 0);
-
-        // _start, then the machine code.
-        ex64_start(img + start_addr, start_addr, entry_fn()[F_ADDR], lk_got + 8 * el_start_fn[F_GOT]);
-    }
+    // _start, then the machine code.
+    ex64_start_static(img + start_addr, start_addr, entry_fn()[F_ADDR]);
     let out = buf_new();
     pc = code_addr;
     i = 0;
@@ -392,15 +203,6 @@ fn write_elf_x64(path) {
     }
     memcpy(img + code_addr, out[VEC_DATA], out[VEC_LEN]);
 
-    // Import stubs: jmp [rip + got slot].
-    i = 0;
-    while i < nimp {
-        let q = img + lk_stubs + EX64_STUB_SIZE * i;
-        store8(q, 0xff);
-        store8(q + 1, 0x25);
-        put32(q + 2, (lk_got + 8 * i) - (lk_stubs + EX64_STUB_SIZE * i + 6));
-        i = i + 1;
-    }
     i = 0;
     while i < g_str_ptrs[VEC_LEN] {
         memcpy(img + vec_get(lk_strs, i), vec_get(g_str_ptrs, i), vec_get(g_str_lens, i));
