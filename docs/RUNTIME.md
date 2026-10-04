@@ -378,6 +378,10 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   through its handle does not fail the scope. In a server the event loop resumes children;
   in `main` the scope's end runs them itself. Spawned closures make their captured variables
   cells per spawn, so `for i in 0..n { let k = i; s.spawn(...) }` gives each child its own `k`.
+- `detach { ... }` (#232) starts a task in the core's background boundary: it has its own pool,
+  outlives the request that started it (its closure and captures are `keep`-copied to the
+  long-lived heap), runs when the event loop turns, is cancelled by the drain with the rest of
+  the core, and logs its fault (`detached task failed: ...`) instead of passing it on.
 - Tasks can wait on each other: `rt_task_park(timeout)` waits until another task calls
   `rt_task_wake(t)`; woken tasks go on a per-core ready queue that the loop drains on its
   next turn (it does not block while the queue has tasks). `rt_task_defer()` puts the
