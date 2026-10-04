@@ -118,6 +118,7 @@ shared var gLoad i64    // live connections per core, one cache line each; a han
 shared var gStop i64    // 1 once SIGTERM or SIGINT started the graceful shutdown (core 0 only)
 shared var gDrained i64 // cores that stopped and have no connection left
 shared var gGrace i64   // seconds the shutdown waits for connections to finish (TIN_GRACE, default 25)
+shared var gReqMemory i64 // pool bytes a request may take beyond its first chunk (TIN_REQUEST_MEMORY, 0: no bound)
 shared var gTok i64     // 256 bytes: 1 for each byte a token (a field name) may hold (RFC 9110 5.6.2)
 shared var gHeaderMs i64   // a request's line and headers must arrive within this (0: no limit)
 shared var gReadMs i64     // the whole request, body included (0: no limit)
@@ -307,6 +308,7 @@ func serve_on(addr str, n i64) ! {
 	gMaxBody = env_int("TIN_MAX_BODY", gMaxBody)
 	gMaxBuffered = env_int("TIN_MAX_BUFFERED", gMaxBuffered)
 	gMaxConns = env_int("TIN_MAX_CONNS", gMaxConns)
+	gReqMemory = env_int("TIN_REQUEST_MEMORY", gReqMemory)
 	genv := getenv(cast(i64, "TIN_GRACE") + 8)
 	if genv != 0 && rt_decimal_integer(genv)&0xffffffff > 0 {
 		gGrace = rt_decimal_integer(genv) & 0xffffffff
@@ -1152,6 +1154,9 @@ func serve_one(c i64, p i64, n i64) i64 {
 		rt_task_free(task)
 		bad(c, 503)
 		return total
+	}
+	if gReqMemory > 0 {
+		rt_bnd_set_limit(task[tBnd], gReqMemory, 0)
 	}
 	// A panic in the handler ends its request with 500, not the server (#142).
 	rt_task_recover(task)
