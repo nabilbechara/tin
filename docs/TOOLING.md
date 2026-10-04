@@ -37,6 +37,7 @@ moving or deleting the tree breaks it.
 | `tin audit secrets [-edition 1] FILE.tin...` | check the program and list every place a `secret` leaves the checker's protection: each `reveal(x)` and each secret passed to a library parameter declared `secret`, as `file:line:col: ...` sorted by position, then a count; exit status 1 (with the errors) when the program does not check |
 | `tin test [-bench] [DIR]` | build DIR (default `.`) with its `*_test.tin` files and run every `TestXxx(t mut crucible.T)`, then `BenchmarkXxx(b mut crucible.B)` with `-bench`; exit status 1 when a test fails, 2 for a wrong test signature (see §5.1) |
 | `tin replay CAPSULE --against BUILD [--live KIND]... [--save-test NAME --issue N]` | run a recorded request again with every effect served from its capsule, and report the first divergence (see §8.1) |
+| `tin fix -edition 1 FILE.tin...` | translate each file to edition 1 in place. A file whose translation does not parse as edition 1, or changes when translated again, is left unchanged with the reason (for example a `const` in a nested block, which has to move by hand); exit status 1 when any file was left unchanged |
 | `tin vendor [DIR]` | copy every package `DIR/tin.mod` requires (transitively, from local source directories) into `DIR/vendor/<path>` and write `DIR/tin.lock` with each vendored file's SHA-256 (see §2.1) |
 | `tin caps FILE.tin...` | check the program and print, per package, the capabilities (`net`, `files`, `spawn`, `exec`, `unsafe`) its exported functions can reach |
 | `tin suite` | run the compiler's strict test suite (`tools/v2test.sh`) |
@@ -92,6 +93,8 @@ tinc [-o OUT] [-S] [-target darwin-arm64|linux-arm64|linux-amd64] FILE.tin...
   [ERRORS.md](ERRORS.md)), every error in one run; the exit code is 1. A compiler crash prints a backtrace only under a debugger (see §8).
 - `-caps`: check the program and print the capabilities each package can reach instead of
   building (`tin caps`; PACKAGES.md, "Capabilities").
+- `-fix -edition 1 FILE.tin` prints the file translated to edition 1 (`tin fix`, which also
+  checks the result before writing it).
 - `-hash FILE...` prints `<sha256> FILE` for each file (the `tin.lock` lines `tin vendor`
   writes) and builds nothing.
 - `TINC_TRACE=1` prints each function as it is generated (to find which one crashes the

@@ -301,4 +301,31 @@ if ! cmp -s tests/edition1/caps_bad.err "$tmp/caps_bad.err"; then
 	exit 1
 fi
 
+# tin fix -edition 1 (#225): an edition 0 program translates to the checked-in edition 1 file,
+# that file translates to itself, and both print the same lines.
+"$compiler" -fix -edition 1 tests/edition1/fix/translate.tin >"$tmp/translate_ed1.tin"
+if ! cmp -s tests/edition1/fix/translate_ed1.tin "$tmp/translate_ed1.tin"; then
+	echo "FAIL edition1/fix/translate: translation differs"
+	diff -u tests/edition1/fix/translate_ed1.tin "$tmp/translate_ed1.tin" || true
+	exit 1
+fi
+"$compiler" -fix -edition 1 tests/edition1/fix/translate_ed1.tin >"$tmp/translate_again.tin"
+if ! cmp -s tests/edition1/fix/translate_ed1.tin "$tmp/translate_again.tin"; then
+	echo "FAIL edition1/fix/translate: translating the edition 1 file changes it"
+	diff -u tests/edition1/fix/translate_ed1.tin "$tmp/translate_again.tin" || true
+	exit 1
+fi
+"$compiler" -o "$tmp/translate0" tests/edition1/fix/translate.tin
+"$compiler" -edition 1 -o "$tmp/translate1" tests/edition1/fix/translate_ed1.tin
+"$tmp/translate0" >"$tmp/translate0.out"
+"$tmp/translate1" >"$tmp/translate1.out"
+for side in translate0 translate1
+do
+	if ! cmp -s tests/edition1/fix/translate.out "$tmp/$side.out"; then
+		echo "FAIL edition1/fix/translate: $side output differs"
+		diff -u tests/edition1/fix/translate.out "$tmp/$side.out" || true
+		exit 1
+	fi
+done
+
 echo "PASS edition 1 parser"

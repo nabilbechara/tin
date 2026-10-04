@@ -16,6 +16,9 @@ const T_POS = 3;
 const T_RAW = 4;   // a `raw` string literal (no interpolation)
 const T_DBL = 5;   // an escape produced a brace, which the text holds doubled ({{ or }}) so that it is not read as interpolation
 const T_UNIT = 6;  // edition 1 numeric unit suffix, or 0
+const T_START = 7; // byte offset of the original token (synthetic semicolons have no span)
+const T_END = 8;   // byte offset just after the original token
+const T_SYNTH = 9; // inserted by the semicolon rule, not present in source
 
 var lx_src;
 var lx_len;
@@ -26,6 +29,7 @@ var lx_file;
 var lx_edition;
 var lx_newline;
 var lx_esc_rune;
+var lx_token_start;
 
 fn lex(file, src, len, edition) {
     lx_file = file;
@@ -40,7 +44,9 @@ fn lex(file, src, len, edition) {
     while 1 {
         let t = lex_next();
         if last && (lx_newline || t[T_KIND] == TK_EOF) && ends_statement(last) {
-            vec_push(toks, token_new(TK_PUNCT, ";", 1, t[T_POS]));
+            let semi = token_new(TK_PUNCT, ";", 1, t[T_POS]);
+            semi[T_SYNTH] = 1;
+            vec_push(toks, semi);
         }
         vec_push(toks, t);
         if t[T_KIND] == TK_EOF {
@@ -53,7 +59,7 @@ fn lex(file, src, len, edition) {
 // T_TEXT holds the identifier, keyword, punctuation or decoded string bytes;
 // T_VAL holds an integer literal's value or a string literal's byte length.
 fn token_new(kind, text, val, pos) {
-    let t = malloc(56);
+    let t = malloc(80);
     t[T_KIND] = kind;
     t[T_TEXT] = text;
     t[T_VAL] = val;
@@ -61,6 +67,9 @@ fn token_new(kind, text, val, pos) {
     t[T_RAW] = 0;
     t[T_DBL] = 0;
     t[T_UNIT] = 0;
+    t[T_START] = lx_token_start;
+    t[T_END] = lx_i;
+    t[T_SYNTH] = 0;
     return t;
 }
 
@@ -223,6 +232,7 @@ fn ends_statement(t) {
 
 fn lex_next() {
     lx_skip_space();
+    lx_token_start = lx_i;
     let pos = pos_make(lx_file, lx_line, lx_col);
     if lx_i >= lx_len {
         return token_new(TK_EOF, "", 0, pos);

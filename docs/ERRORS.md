@@ -3737,6 +3737,28 @@ No example: it takes a function with hundreds of local variables.
 Fix: split the function, or keep the values in a slice or a struct instead of separate
 locals.
 
+### E906 FIX_USAGE
+
+`tinc -fix` prints one file translated to edition 1 (`tin fix -edition 1 FILES...` runs it per
+file), so it takes `-edition 1` and exactly one file.
+
+```sh
+tinc -fix example.tin
+```
+
+```tin
+package main
+
+func main() {
+}
+```
+
+```text
+error E906 FIX_USAGE: -fix translates one file to edition 1: pass -edition 1 and exactly one file
+```
+
+Fix: use `tin fix -edition 1 FILES...`, or pass `-edition 1` and one file to `tinc -fix`.
+
 ### E907 TOO_MANY_PARAMS
 
 A function takes at most 8 parameters of each register kind (integers and references, and
