@@ -3,9 +3,10 @@
 
 Without a compiler it checks the codes only: every code the compiler prints (a string such as
 "E502 TYPE_ARG_COUNT" in selfhost/*.tin) is documented under that name, every documented code
-is printed by the compiler or retired, a number and a name each belong to one code, and every
-coded line in the tests' expected diagnostics is documented. Given a compiler, it also compiles
-each documented example and requires exactly the output the page shows.
+is printed by the compiler or retired, a number and a name each belong to one code, the
+compiler prints no error without a code, and every line of the tests' expected diagnostics
+carries a documented code. Given a compiler, it also compiles each documented example and
+requires exactly the output the page shows.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -32,6 +33,8 @@ FENCE_EDITION = re.compile(r'\bedition=(\d+)\b')
 FENCE_FILE = re.compile(r'\bfile=(\S+)')
 PRINTED = re.compile(r'\berror (E\d{3}) ([A-Z][A-Z0-9_]*): ')
 UNCODED = re.compile(r'(^|: )error: ')
+# The compiler's sources print errors only through the coded helpers (err_code and the like).
+SOURCE_UNCODED = re.compile(r'"error: ')
 
 
 def parse_doc(text):
@@ -142,12 +145,13 @@ def source_codes(root):
 
 
 def expected_diagnostics(root):
-    """(where, text) for every expected compiler diagnostic in the tests."""
+    """(where, text, whole) for every expected compiler diagnostic in the tests; whole is
+    False for a stderr_contains contract, which is part of a line."""
     found = []
     for pattern in ('tests/v2/*.err', 'tests/edition1/*.err'):
         for path in sorted(root.glob(pattern)):
             for number, line in enumerate(path.read_text().splitlines(), 1):
-                found.append((f'{path.relative_to(root)}:{number}', line))
+                found.append((f'{path.relative_to(root)}:{number}', line, True))
     cases = root / 'tests/regressions/cases.json'
     for case in json.loads(cases.read_text()) if cases.exists() else []:
         expected = case.get('expected', {})
@@ -155,7 +159,7 @@ def expected_diagnostics(root):
             continue
         for key in ('stderr', 'stderr_contains'):
             for line in expected.get(key, '').splitlines():
-                found.append((f"{cases.relative_to(root)}: {case['source']}", line))
+                found.append((f"{cases.relative_to(root)}: {case['source']}", line, key == 'stderr'))
     return found
 
 
@@ -187,8 +191,13 @@ def check_static(root=ROOT):
         if not e['retired'] and e['code'] not in printed:
             problems.append(f"{DOC}:{e['line']}: {e['code']} {e['name']} is not printed by the compiler "
                             '(mark it retired; never delete or reuse a code)')
+    for path in sorted((root / 'selfhost').glob('*.tin')):
+        for number, line in enumerate(path.read_text().splitlines(), 1):
+            if SOURCE_UNCODED.search(line):
+                problems.append(f'{path.relative_to(root)}:{number}: prints an error without a code '
+                                '(use err_code and a code from docs/ERRORS.md)')
     coded = uncoded = 0
-    for where, line in expected_diagnostics(root):
+    for where, line, whole in expected_diagnostics(root):
         found = PRINTED.findall(line)
         for code, name in found:
             entry = documented.get(code)
@@ -196,8 +205,9 @@ def check_static(root=ROOT):
                 problems.append(f'{where}: {code} {name} is not documented in {DOC}')
         if found:
             coded += 1
-        elif UNCODED.search(line):
+        elif whole or UNCODED.search(line):
             uncoded += 1
+            problems.append(f'{where}: an expected diagnostic without a code: {line}')
     return problems, entries, coded, uncoded
 
 
@@ -241,7 +251,7 @@ def main():
         return 1
     examples = 'and their examples ' if args.compiler else ''
     print(f'PASS diagnostics: {len(entries)} codes {examples}agree; '
-          f'{coded} of {coded + uncoded} expected diagnostics carry a code')
+          f'all {coded} expected diagnostics carry a code')
     return 0
 
 

@@ -34,8 +34,19 @@ class DiagnosticsTests(unittest.TestCase):
             return problems, coded, uncoded
 
     def test_agreement(self):
-        err = 'a.tin:1:1: error E501 NOT_GENERIC: x\na.tin:2:1: error: y\n'
-        self.assertEqual(self.problems(ENTRY, err=err), ([], 1, 1))
+        err = 'a.tin:1:1: error E501 NOT_GENERIC: x\nerror E501 NOT_GENERIC: y\n'
+        self.assertEqual(self.problems(ENTRY, err=err), ([], 2, 0))
+
+    def test_expected_diagnostic_needs_a_code(self):
+        for err in ('a.tin:2:1: error: y\n', 'error: y\n', 'a.tin:2:1: y\n'):
+            problems, coded, uncoded = self.problems(ENTRY, err=err)
+            self.assertTrue(any('without a code' in p for p in problems), (err, problems))
+            self.assertEqual((coded, uncoded), (0, 1))
+
+    def test_source_prints_only_coded_errors(self):
+        source = 'err_code(pos, "E501 NOT_GENERIC");\nbuf_str(b, "error: ");\n'
+        problems, _, _ = self.problems(ENTRY, source=source)
+        self.assertTrue(any('x.tin:2: prints an error without a code' in p for p in problems), problems)
 
     def test_undocumented_code(self):
         problems, _, _ = self.problems(ENTRY, source='err_code(pos, "E501 NOT_GENERIC");\nerr_code(pos, "E502 COUNT");\n')

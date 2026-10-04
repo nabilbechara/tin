@@ -484,35 +484,54 @@ fn cap_graph() {
 
 // cap_path appends how g reaches the capability bit: g -> ... -> the tagged entry point.
 fn cap_path(b, g, bit) {
-    let steps = 0;
-    while g && steps < 12 {
-        if steps > 0 {
+    let path = vec_new();
+    let found = cap_find(g, bit, path);
+    if path[VEC_LEN] == 0 {
+        vec_push(path, g);
+    }
+    let i = 0;
+    while i < path[VEC_LEN] {
+        let f = vec_get(path, i);
+        if i > 0 {
             buf_str(b, " -> ");
         }
-        if cap_tag(g) && !cap_sealed(g) {
-            buf_str(b, g[F_NAME]);
+        if cap_tag(f) && !cap_sealed(f) {
+            buf_str(b, f[F_NAME]);
         } else {
-            buf_str(b, g[F_QNAME]);
+            buf_str(b, f[F_QNAME]);
         }
-        if (cap_own(g) & bit) || cap_index(g) < 0 || cap_final(g) {
-            return;
-        }
-        let es = vec_get(cap_edges, cap_index(g));
-        let next = 0;
-        let j = 0;
-        while j < es[VEC_LEN] && !next {
-            let c = vec_get(vec_get(es, j), 0);
-            if c != g && (cap_mask_of(c) & bit) {
-                next = c;
-            }
-            j = j + 1;
-        }
-        g = next;
-        steps = steps + 1;
+        i = i + 1;
     }
-    if g {
+    if found == 2 {
         buf_str(b, " -> ...");
     }
+}
+
+// cap_find extends path from g to a function that owns the capability bit, trying g's calls in
+// order and never following a function already on the path (a cycle, such as an effect's
+// live call reaching back into its public function, #241): 1 found, 2 cut at 12 steps, 0 none.
+fn cap_find(g, bit, path) {
+    vec_push(path, g);
+    if (cap_own(g) & bit) || cap_index(g) < 0 || cap_final(g) {
+        return 1;
+    }
+    let es = vec_get(cap_edges, cap_index(g));
+    let j = 0;
+    while j < es[VEC_LEN] {
+        let c = vec_get(vec_get(es, j), 0);
+        if c != g && (cap_mask_of(c) & bit) && !vec_has(path, c) {
+            if path[VEC_LEN] >= 12 {
+                return 2;
+            }
+            let r = cap_find(c, bit, path);
+            if r {
+                return r;
+            }
+        }
+        j = j + 1;
+    }
+    path[VEC_LEN] = path[VEC_LEN] - 1;
+    return 0;
 }
 
 fn cap_violation(pos, p, g, need) {

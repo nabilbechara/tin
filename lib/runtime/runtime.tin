@@ -8,10 +8,6 @@
 
 extern func rint(x f64) f64
 
-extern func pthread_create(t i64, attr i64, f i64, arg i64) i64
-extern func pthread_attr_init(attr i64) i64
-extern func pthread_attr_setstacksize(attr i64, n i64) i64
-
 // Core context words: x28 points here, and the core's globals follow (the compiler
 // addresses global i at x28 + 8*(ctxWords+i), so every core has its own copy).
 const ctxBump = 0
@@ -93,6 +89,9 @@ const altStackSize = 65536
 // rt_altstack gives the calling thread a signal stack of its own, so rt_fault can run after
 // this thread's stack overflowed (every thread: the main one and each core and helper).
 func rt_altstack() {
+	if rt_altstack_ready() {
+		return
+	}
 	st := calloc(1, 32)
 	rt_stack_t(st, calloc(1, altStackSize), altStackSize)
 	rt_sys_sigaltstack(st, 0)
@@ -192,11 +191,7 @@ func rt_spawn_core(entry func(i64), arg i64) {
 	p[0] = cast(i64, entry)
 	p[1] = arg
 	p[2] = __atomic_add(&rtCores, 1)
-	attr := calloc(16, 8)
-	pthread_attr_init(attr)
-	pthread_attr_setstacksize(attr, 8388608)
-	t := calloc(1, 8)
-	if pthread_create(t, attr, cast(i64, rt_core_main), p)&0xffffffff != 0 {
+	if !rt_thread_start(cast(i64, rt_core_main), p) {
 		rt_panic("cannot start a core thread")
 	}
 }
@@ -212,11 +207,9 @@ func rt_watch_start() {
 	if !rtPollsEnabled { return }
 	if rtWatchStarted != 0 { return }
 	if __atomic_swap(&rtWatchStarted, 1) != 0 { return }
-	t := calloc(1, 8)
-	if pthread_create(t, 0, cast(i64, rt_watch_main), 0)&0xffffffff != 0 {
+	if !rt_thread_start(cast(i64, rt_watch_main), 0) {
 		rt_panic("cannot start the watchdog thread")
 	}
-	free(t)
 }
 
 // rt_watch_main never touches boundary records; its own context contains no Tin globals.
@@ -628,6 +621,9 @@ func rt_alloc_slow(n i64) i64 {
 	}
 	if c[ctxPoolBase] == 0 {
 		chunk := calloc(1, rt_chunk())
+		// The pool's first object starts at this heap block's payload: pin the chunk so
+		// the long-lived counts never treat pool memory as theirs (#176).
+		(chunk - 8)[0] = (chunk-8)[0] | rcPin
 		c[ctxPoolBase] = chunk
 		c[ctxBump] = chunk
 		c[ctxEnd] = chunk + rt_chunk()
@@ -768,6 +764,7 @@ const rcOne = 1 << 47             // one long-lived reference
 const rcCount = (1 << 62) - rcOne // the count's bits
 const rcPin = rcCount             // a saturated count: pinned for good
 const rcQ = 1 << 62               // set only while the block sits in the limbo
+const limboMax = 1 << 20          // per core: past this many queued blocks, a drop pins instead
 
 // rt_rc_mine reports whether p is a block of this core's heap, the only memory counted.
 func rt_rc_mine(p i64) bool {
@@ -860,6 +857,12 @@ func rt_rc_dec(p i64, drop func(i64)) {
 		w[0] = c
 		return
 	}
+	if rtRcLimbo >= limboMax {
+		// Release is held back (a long-lived task): leak the block as before #176 rather
+		// than grow the limbo without bound.
+		w[0] = (c & rcSize) | rcPin
+		return
+	}
 	rtRcBlocks--
 	rtRcBytes -= c & rcSize
 	w[0] = c | rcQ
@@ -899,7 +902,7 @@ func rt_rc_drop_fresh(p i64) {
 		return
 	}
 	w := p - 8
-	if (w[0] & (rcQ | rcCount)) != 0 {
+	if (w[0] & (rcQ | rcCount)) != 0 || rtRcLimbo >= limboMax {
 		return
 	}
 	w[0] = w[0] | rcQ
@@ -1076,7 +1079,7 @@ func rt_panic(msg str) {
 		// A task root is an implicit guard (#230): a spawned child's fault is the panic with
 		// its message, as a guard's is (its scope's pool holds it).
 		if t[tChild] != 0 && t[tChild][spOwnPool] == 0 && t[tChild][spFault] == 0 {
-			t[tChild][spFault] = rt_fault_panic("panic: "+msg, "")
+			t[tChild][spFault] = rt_fault_panic("panic: "+msg, rt_backtrace_text(__fp()))
 		}
 		// Unwind (#230): deferred calls innermost first, then cleanups (rt_task_abort). A
 		// panic while they run ends the process, after both messages.
@@ -1123,6 +1126,43 @@ func rt_backtrace(fp i64) {
 		}
 		fp = next
 	}
+}
+
+// rt_backtrace_text is rt_backtrace's list of functions as text, one per line: the
+// backtrace a panic's fault carries (fault.Backtrace, #142).
+func rt_backtrace_text(fp i64) str {
+	info := calloc(4, 8)
+	out := ""
+	for k := 0; k < 64 && fp != 0; k++ {
+		ret := fp[1]
+		if ret == 0 {
+			break
+		}
+		name := cast(i64, "?") + 8
+		if rt_symbol_lookup(ret-4, info)&0xffffffff != 0 && info[2] != 0 {
+			name = info[2]
+			if load8(name) == 't' && load8(name+1) == 'i' && load8(name+2) == 'n' && load8(name+3) == '.' {
+				name = name + 4
+			}
+		}
+		if load8(name) == 'm' && load8(name+1) == 'a' && load8(name+2) == 'i' && load8(name+3) == 'n' && load8(name+4) == 0 {
+			break
+		}
+		skip := load8(name) == 'r' && load8(name+1) == 't' && load8(name+2) == '_'
+		if !skip {
+			if len(out) > 0 {
+				out = out + "\n"
+			}
+			out = out + rt_str_from_raw(name, strlen(name))
+		}
+		next := fp[0]
+		if next <= fp {
+			break
+		}
+		fp = next
+	}
+	free(info)
+	return out
 }
 
 func rt_err_str(e i64) str {
@@ -3149,6 +3189,42 @@ func rt_keep_map_new(m i64, drop func(i64), counted i64) i64 {
 	return k
 }
 
+// rt_arena_str, rt_arena_raw, rt_arena_slice and rt_arena_map_new are the pool twins of the
+// rt_keep_ helpers: arenacopy$N copies an arena's result into the parent pool with them (#236).
+func rt_arena_str(s str) str {
+	n := len(s)
+	if n == 0 {
+		return ""
+	}
+	p := rt_alloc(n + 9)
+	p[0] = n
+	memcpy(p+8, cast(i64, s)+8, n)
+	return cast(str, p)
+}
+
+func rt_arena_raw(p i64, n i64) i64 {
+	q := rt_alloc(n)
+	memcpy(q, p, n)
+	return q
+}
+
+func rt_arena_slice(s i64, esz i64) i64 {
+	n := s[0]
+	h := rt_alloc(32)
+	h[0] = n
+	h[1] = n
+	h[3] = __ctx()[ctxIngot]
+	if n > 0 {
+		h[2] = rt_alloc(n*esz + 8)
+		memcpy(h[2], s[2], n*esz)
+	}
+	return h
+}
+
+func rt_arena_map_new(m i64) i64 {
+	return rt_map_make(m[5])
+}
+
 func rt_keep_closure(f i64) i64 {
 	if f == 0 {
 		return 0
@@ -3701,14 +3777,19 @@ func rt_task_run(t i64) bool {
 		schedPool = calloc(6, 8)
 	}
 	c := __ctx()
-	schedPool[0] = c[ctxBump]
-	schedPool[1] = c[ctxEnd]
-	schedPool[2] = c[ctxPoolBase]
-	schedPool[3] = c[ctxPoolMark]
-	schedPool[4] = c[ctxPoolExtra]
-	schedPool[5] = c[ctxFmt]
+	// The core stack's pool words go to its innermost arena while it is in one (#236).
+	sp := schedPool
+	if arenaLive > 0 { sp = rt_pool_home(0) }
+	sp[0] = c[ctxBump]
+	sp[1] = c[ctxEnd]
+	sp[2] = c[ctxPoolBase]
+	sp[3] = c[ctxPoolMark]
+	sp[4] = c[ctxPoolExtra]
+	sp[5] = c[ctxFmt]
 	// A scope's child runs in the pool of the task that owns its scope (or the core's own).
 	pw := rt_pool_words(t)
+	arenas := arenaLive
+	if arenas > 0 { pw = rt_pool_home(t) }
 	c[ctxBump] = pw[0]
 	c[ctxEnd] = pw[1]
 	c[ctxPoolBase] = pw[2]
@@ -3721,18 +3802,19 @@ func rt_task_run(t i64) bool {
 	curTask = 0
 	if rtPollsEnabled { rt_watch_switch() }
 	if rt_task_sp(t) < t[tStack]+taskGuard+taskStack-16384 { t[tTrim] = 1 }
+	if arenas > 0 || arenaLive > 0 { pw = rt_pool_home(t) }
 	pw[0] = c[ctxBump]
 	pw[1] = c[ctxEnd]
 	pw[2] = c[ctxPoolBase]
 	pw[3] = c[ctxPoolMark]
 	pw[4] = c[ctxPoolExtra]
 	t[tFmt] = c[ctxFmt]
-	c[ctxBump] = schedPool[0]
-	c[ctxEnd] = schedPool[1]
-	c[ctxPoolBase] = schedPool[2]
-	c[ctxPoolMark] = schedPool[3]
-	c[ctxPoolExtra] = schedPool[4]
-	c[ctxFmt] = schedPool[5]
+	c[ctxBump] = sp[0]
+	c[ctxEnd] = sp[1]
+	c[ctxPoolBase] = sp[2]
+	c[ctxPoolMark] = sp[3]
+	c[ctxPoolExtra] = sp[4]
+	c[ctxFmt] = sp[5]
 	return t[tDone] != 0
 }
 
@@ -3961,7 +4043,7 @@ func rt_guard_target() i64 {
 
 // rt_guard_land unwinds to guard g after a panic with msg and resumes its caller.
 func rt_guard_land(g i64, msg str) {
-	rt_land(g, rt_fault_panic("panic: "+msg, ""))
+	rt_land(g, rt_fault_panic("panic: "+msg, rt_backtrace_text(__fp())))
 }
 
 // rt_bnd_landing distinguishes unwind stacks from a scope's child-list word.
@@ -4013,6 +4095,7 @@ func rt_land(g i64, f i64) {
 	for rt_bnd_current() != b {
 		in := rt_bnd_current()
 		if in[bKind]&255 == bkScope { rt_scope_discard(in) }
+		if in[bKind]&255 == bkArena { f = rt_arena_discard(in, f) }
 		ig := rt_bnd_landing(in)
 		if ig != 0 {
 			st := ig[gStack]
@@ -4027,6 +4110,194 @@ func rt_land(g i64, f i64) {
 	g[gFault] = f
 	__ctx()[ctxFmt] = g[gFmt]
 	rt_task_swap(g+8*gScratch, g+8*gSave)
+}
+
+// ---- arena: a sub-region dropped on exit (#236, notes/interface_arena.md) ----
+//
+// An arena is a fresh pool. rt_arena_open writes the parent pool's words back to their home
+// (scope children sharing it keep using it while the body waits), the body runs, rt_arena_out
+// gives the context the parent pool again, the compiler copies the result there, and
+// rt_arena_close frees the arena. Unwinds discard arenas in rt_land and rt_bnd_task_end.
+
+const aBump = 0     // 5 words: the arena pool's words while they are not in the context
+const aBase = 2     // the arena pool's base chunk (with aBump)
+const aExtra = 4    // its extra chunks and big blocks
+const aFmt = 5      // the formatting state while the core stack is switched out (rt_task_run)
+const aFmt0 = 6     // the formatting state at entry
+const aCleanup = 7  // the running task's cleanup chain at entry
+const aOut = 8      // 1 after rt_arena_out: the context holds the parent pool
+const aCharged = 9  // pool bytes charged to limit budgets inside the arena
+const arenaWords = 10
+
+var arenaLive i64 // per core: open arenas
+
+// rt_pool_home is where the pool words of task t (0: the core stack) live while it is not
+// running: the innermost arena it entered and has not left, else rt_pool_words(t).
+func rt_pool_home(t i64) i64 {
+	if arenaLive > 0 {
+		b := bndCur
+		if t != 0 {
+			b = t[tBnd]
+		}
+		for b != 0 {
+			if b[bKind]&255 == bkArena && b[bTask] == t && b[bRegion][aOut] == 0 {
+				return b[bRegion]
+			}
+			if b[bKind]&bfRoot != 0 {
+				break
+			}
+			b = b[bParent]
+		}
+	}
+	return rt_pool_words(t)
+}
+
+// rt_pool_save stores the context's pool words at p.
+func rt_pool_save(p i64) {
+	c := __ctx()
+	p[0] = c[ctxBump]
+	p[1] = c[ctxEnd]
+	p[2] = c[ctxPoolBase]
+	p[3] = c[ctxPoolMark]
+	p[4] = c[ctxPoolExtra]
+}
+
+// rt_pool_load gives the context the pool words at p.
+func rt_pool_load(p i64) {
+	c := __ctx()
+	c[ctxBump] = p[0]
+	c[ctxEnd] = p[1]
+	c[ctxPoolBase] = p[2]
+	c[ctxPoolMark] = p[3]
+	c[ctxPoolExtra] = p[4]
+}
+
+// rt_arena_open enters an arena: a bkArena boundary whose allocations go to a fresh pool.
+func rt_arena_open() i64 {
+	if schedSave == 0 {
+		schedSave = calloc(20, 8)
+		schedPool = calloc(6, 8)
+	}
+	rt_pool_save(rt_pool_home(curTask))
+	b := rt_bnd_enter(bkArena)
+	a := calloc(arenaWords, 8)
+	c := __ctx()
+	a[aFmt0] = c[ctxFmt]
+	if curTask != 0 {
+		a[aCleanup] = curTask[tCleanup]
+	}
+	b[bRegion] = a
+	arenaLive++
+	c[ctxBump] = 0
+	c[ctxEnd] = 0
+	c[ctxPoolBase] = 0
+	c[ctxPoolMark] = 0
+	c[ctxPoolExtra] = 0
+	c[ctxFmt] = 0
+	return b
+}
+
+// rt_arena_run runs an arena block's closure and gives its fault as a word (0: none).
+func rt_arena_run(body func(i64) !, r i64) i64 {
+	body(r) catch err {
+		return cast(i64, err)
+	}
+	return 0
+}
+
+// rt_arena_out runs the cleanups registered inside arena b and gives the context the parent
+// pool again; the arena's memory stays readable until rt_arena_close.
+func rt_arena_out(b i64) {
+	a := b[bRegion]
+	if curTask != 0 {
+		rt_task_cleanups(a[aCleanup])
+	}
+	rt_arena_switch(a)
+}
+
+// rt_arena_switch saves the arena pool in its record and loads the parent pool.
+func rt_arena_switch(a i64) {
+	rt_pool_save(a)
+	a[aOut] = 1
+	rt_pool_load(rt_pool_home(curTask))
+	__ctx()[ctxFmt] = a[aFmt0]
+}
+
+// rt_arena_fault copies fault word f into the current pool (0 stays 0).
+func rt_arena_fault(f i64) i64 {
+	return rt_fault_copy(f, false)
+}
+
+// rt_arena_free frees arena record a's pool and gives its charges back to b's limit budgets.
+func rt_arena_free(b i64, a i64) {
+	for p := a[aExtra]; p != 0; {
+		next := p[0]
+		free(p)
+		p = next
+	}
+	if a[aBase] != 0 {
+		free(a[aBase])
+	}
+	if a[aCharged] != 0 {
+		for l := b[bLimit]; l != 0; {
+			l[bMemUsed] -= a[aCharged]
+			p := l[bParent]
+			if p == 0 {
+				break
+			}
+			l = p[bLimit]
+		}
+	}
+	free(a)
+	b[bRegion] = 0
+	arenaLive--
+}
+
+// rt_arena_close frees arena b after its result was copied out, and leaves it.
+func rt_arena_close(b i64) {
+	rt_arena_free(b, b[bRegion])
+	rt_bnd_leave(b)
+}
+
+// rt_arena_discard frees arena b on an unwind that leaves it (the caller unlinks b); fault
+// word f, which may have been made in the arena, comes back copied into the parent pool.
+func rt_arena_discard(b i64, f i64) i64 {
+	a := b[bRegion]
+	if a == 0 {
+		return f
+	}
+	if a[aOut] == 0 {
+		rt_arena_switch(a)
+	}
+	f = rt_fault_copy(f, false)
+	rt_arena_free(b, a)
+	return f
+}
+
+// rt_arena_task_end discards arena b of task t, which ends by panic: a scope child's fault,
+// made in the pool it was using, is copied into the parent pool first.
+func rt_arena_task_end(t i64, b i64) {
+	sp := t[tChild]
+	if sp != 0 && sp[spOwnPool] == 0 && sp[spFault] != 0 {
+		sp[spFault] = rt_arena_discard(b, sp[spFault])
+		return
+	}
+	rt_arena_discard(b, 0)
+}
+
+// rt_arena_charged notes pool bytes n charged to limit budgets inside the innermost arena.
+func rt_arena_charged(n i64) {
+	b := rt_bnd_current()
+	for b != 0 {
+		if b[bKind]&255 == bkArena && b[bRegion] != 0 && b[bRegion][aOut] == 0 {
+			b[bRegion][aCharged] += n
+			return
+		}
+		if b[bKind]&bfRoot != 0 {
+			return
+		}
+		b = b[bParent]
+	}
 }
 
 func rt_task_cleanups(stop i64) {
@@ -4288,6 +4559,7 @@ func rt_bnd_task_end(t i64) {
 			}
 		}
 		if b[bKind]&255 == bkScope { rt_scope_discard(b) }
+		if b[bKind]&255 == bkArena { rt_arena_task_end(t, b) }
 		g := rt_bnd_landing(b)
 		if g != 0 {
 			st := g[gStack]
@@ -4355,6 +4627,7 @@ func rt_bnd_charge(n i64) {
 		return
 	}
 	l := rt_bnd_current()[bLimit]
+	if l != 0 && arenaLive > 0 { rt_arena_charged(n) }
 	over := 0
 	for l != 0 {
 		l[bMemUsed] += n

@@ -15,6 +15,7 @@ type Conn struct {
 	fd      i64
 	timeout i64  // ns a read or write may wait (0: no limit; a request's deadline still applies)
 	until   i64  // monotonic ns after which every wait fails (0: none); set by DoWith's Timeout
+	tn      i64  // its number in a recorded or replayed request (wire.dial@1, #241), 0: none
 }
 
 // Listener accepts TCP connections.
@@ -108,6 +109,10 @@ func Dial(addr str) !Conn {
 
 // DialTimeout connects to "host:port", giving up after timeout nanoseconds (0: no limit).
 func DialTimeout(addr str, timeout i64) !Conn {
+	tp := rt_tape()
+	if tp != 0 {
+		return try dial_taped(tp, addr, timeout)
+	}
 	none := Conn{fd: -1}
 	host, port, err := split_addr(addr)
 	if err != nil {
@@ -193,6 +198,12 @@ func (c Conn) write_raw(p i64, n i64) ! {
 	if !c.open {
 		fail "wire: write on a closed connection"
 	}
+	if c.tn != 0 {
+		tp := rt_tape()
+		if tp != 0 {
+			return try c.write_taped(tp, p, n)
+		}
+	}
 	for n > 0 {
 		k := rt_sys_write(c.fd, p, n)
 		if k < 0 {
@@ -225,6 +236,12 @@ func (c Conn) WriteBytes(b []u8) ! {
 func (c Conn) Read(buf mut []u8, max i64) !i64 {
 	if !c.open {
 		fail "wire: read on a closed connection"
+	}
+	if c.tn != 0 {
+		tp := rt_tape()
+		if tp != 0 {
+			return try c.read_taped(tp, mut buf, max)
+		}
 	}
 	h := cast(i64, buf)
 	if h[0]+max > h[1] {
@@ -266,7 +283,9 @@ func (c Conn) ReadFull(n i64) !str {
 // Close closes the connection.
 func (c mut Conn) Close() {
 	if c.open {
-		rt_sys_close(c.fd)
+		if c.fd >= 0 {
+			rt_sys_close(c.fd)
+		}
 		c.open = false
 	}
 }
@@ -392,6 +411,10 @@ func Do(method str, url str, headers []str, body str) !Resp {
 
 // DoWith is Do with options: an overall timeout and a response size limit.
 func DoWith(method str, url str, headers []str, body str, opt Options) !Resp {
+	tp := rt_tape()
+	if tp != 0 {
+		return try http_taped(tp, method, url, headers, body, opt)
+	}
 	limit := opt.MaxBody
 	if limit <= 0 {
 		limit = DefaultMaxBody
@@ -958,4 +981,139 @@ func fold_eq(a str, b str) bool {
 		}
 	}
 	return true
+}
+
+// ---- recording and replay (notes/interface_replay.md, section 4; #241) ----
+
+// An effect's body runs at once, before it waits: these hand it its arguments (read at its
+// start) and hand back what it made (read as soon as it returns).
+var tapedCall i64 // the call an effect body makes (an httpCall, or a Conn for read and write)
+var tapedArg i64  // its number argument (max bytes, a dial's timeout, the bytes to write)
+var tapedLen i64  // how many bytes to write
+var tapedConn i64 // the connection a dial's body made
+
+// httpCall is one DoWith call, for its effect body.
+type httpCall struct {
+	method  str
+	url     str
+	headers []str
+	body    str
+	opt     Options
+}
+
+// http_taped records or replays one DoWith call as wire.http@1: the key is the request (the
+// values of secret headers as handles), the result the status, the head and the body.
+func http_taped(tp i64, method str, url str, headers []str, body str, opt Options) !Resp {
+	k := make([]u8, 0, 64+len(url)+len(body))
+	k = append(k, method...)
+	k = append(k, ' ')
+	k = append(k, url...)
+	for i := 0; i+1 < len(headers); i += 2 {
+		k = append(k, '\n')
+		k = append(k, headers[i]...)
+		k = append(k, ": "...)
+		if rt_secret_header(headers[i]) {
+			k = append(k, rt_secret_key(headers[i+1])...)
+		} else {
+			k = append(k, headers[i+1]...)
+		}
+	}
+	k = append(k, "\n\n"...)
+	k = append(k, body...)
+	tapedCall = cast(i64, httpCall{method: method, url: url, headers: headers, body: body, opt: opt})
+	v := try rt_effect(tp, "wire.http@1", str(k), http_live)
+	if len(v) < 24 {
+		fail "replay: wire.http@1 result is damaged"
+	}
+	hn := taped_word(v, 8)
+	if 16+hn+8 > len(v) || taped_word(v, 16+hn) != len(v)-24-hn {
+		fail "replay: wire.http@1 result is damaged"
+	}
+	return Resp{Status: taped_word(v, 0), head: v[16 : 16+hn], Body: v[24+hn:]}
+}
+
+func http_live() !str {
+	call := cast(httpCall, tapedCall)
+	r := try DoWith(call.method, call.url, call.headers, call.body, call.opt)
+	b := make([]u8, 0, 24+len(r.head)+len(r.Body))
+	b = taped_put(b, r.Status)
+	b = taped_put(b, len(r.head))
+	b = append(b, r.head...)
+	b = taped_put(b, len(r.Body))
+	b = append(b, r.Body...)
+	return str(b)
+}
+
+// dial_taped records or replays a dial as wire.dial@1, whose result is the connection's number
+// in the request; replaying, the connection has no socket and its reads and writes come from
+// the tape.
+func dial_taped(tp i64, addr str, timeout i64) !Conn {
+	tapedCall = cast(i64, addr)
+	tapedArg = timeout
+	tapedConn = 0
+	v := try rt_effect(tp, "wire.dial@1", addr, dial_live)
+	if len(v) != 8 {
+		fail "replay: wire.dial@1 result is damaged"
+	}
+	n := taped_word(v, 0)
+	if tapedConn != 0 {
+		c := cast(Conn, tapedConn)
+		tapedConn = 0
+		c.tn = n
+		return c
+	}
+	return Conn{open: true, fd: -1, tn: n}
+}
+
+func dial_live() !str {
+	c := try DialTimeout(cast(str, tapedCall), tapedArg)
+	tapedConn = cast(i64, c)
+	n := rt_tape_kinds(rt_tape_of(rt_task_current()), "wire.dial@1") + 1
+	return str(taped_put(make([]u8, 0, 8), n))
+}
+
+// read_taped records or replays one Read as wire.read@1 (key: the connection's number and max).
+func (c Conn) read_taped(tp i64, buf mut []u8, max i64) !i64 {
+	tapedCall = cast(i64, c)
+	tapedArg = max
+	v := try rt_effect(tp, "wire.read@1", rt_i64str(c.tn) + " " + rt_i64str(max), read_live)
+	buf = append(buf, v...)
+	return len(v)
+}
+
+func read_live() !str {
+	c := cast(Conn, tapedCall)
+	b := make([]u8, 0, tapedArg)
+	_ = try c.Read(mut b, tapedArg)
+	return str(b)
+}
+
+// write_taped records or replays one write as wire.write@1 (key: the connection's number and
+// the bytes).
+func (c Conn) write_taped(tp i64, p i64, n i64) ! {
+	tapedCall = cast(i64, c)
+	tapedArg = p
+	tapedLen = n
+	_ = try rt_effect(tp, "wire.write@1", rt_i64str(c.tn) + " " + rt_str_from_raw(p, n), write_live)
+}
+
+func write_live() !str {
+	c := cast(Conn, tapedCall)
+	try c.write_raw(tapedArg, tapedLen)
+	return ""
+}
+
+func taped_put(b []u8, v i64) []u8 {
+	for i := 0; i < 8; i++ {
+		b = append(b, u8(v >> (8 * i)))
+	}
+	return b
+}
+
+func taped_word(s str, at i64) i64 {
+	v := 0
+	for i := 7; i >= 0; i-- {
+		v = v<<8 | i64(s[at+i])
+	}
+	return v
 }
