@@ -54,7 +54,9 @@ shared var rtCoreInit func()
 shared var rtCores i64
 shared var rtCoresDone i64
 shared var rtHashK0 i64   // map hash key: random per process, so keys cannot be chosen to collide
-shared var rtWatchHead i64
+shared var rtWatchCores i64 // entries: context, previous generation, stopped, previous watch.
+shared var rtWatchCount i64
+shared var rtWatchCap i64
 shared var rtWatchLock i64
 shared var rtWatchStarted i64
 shared var rtWatchSignal i64 // Linux signalfd, published by anvil; never consumed here.
@@ -135,11 +137,22 @@ func rt_ctx_new(id i64) i64 {
 	ctx[ctxID] = id
 	ctx[ctxIngot] = 1
 	ctx[11] = rt_memory_vector_mode()
-	n := calloc(5, 8)
-	n[1] = ctx
 	rt_lock(&rtWatchLock)
-	n[0] = rtWatchHead
-	rtWatchHead = n
+	if rtWatchCount == rtWatchCap {
+		rtWatchCap = rtWatchCap*2 + 8
+		next := calloc(rtWatchCap, 32)
+		if rtWatchCores != 0 {
+			memcpy(next, rtWatchCores, 32*rtWatchCount)
+			free(rtWatchCores)
+		}
+		rtWatchCores = next
+	}
+	n := rtWatchCores + 32*rtWatchCount
+	n[0] = ctx
+	n[1] = 0
+	n[2] = 0
+	n[3] = 0
+	rtWatchCount++
 	rt_unlock(&rtWatchLock)
 	return ctx
 }
@@ -208,22 +221,23 @@ func rt_watch_main(arg i64) i64 {
 			}
 		}
 		rt_lock(&rtWatchLock)
-		n := rtWatchHead
-		for n != 0 {
-			c := n[1]
+		i := 0
+		for i < rtWatchCount {
+			n := rtWatchCores + 32*i
+			c := n[0]
 			gen := c[ctxRunGen]
 			watch := c[ctxWatch]
 			stopped := watch == -1 || (watch > 0 && now >= watch)
 			if rtWatchDrainAt > 0 && now >= rtWatchDrainAt { stopped = true }
-			if gen == n[2] && stopped && n[3] != 0 && n[4] == watch {
+			if gen == n[1] && stopped && n[2] != 0 && n[3] == watch {
 				// Recheck the generation immediately before publishing a poll.
 				if c[ctxRunGen] == gen { c[ctxPoll] = 1 }
 			}
-			n[2] = gen
-			n[3] = 0
-			if stopped { n[3] = 1 }
-			n[4] = watch
-			n = n[0]
+			n[1] = gen
+			n[2] = 0
+			if stopped { n[2] = 1 }
+			n[3] = watch
+			i++
 		}
 		rt_unlock(&rtWatchLock)
 	}
