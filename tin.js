@@ -73,14 +73,28 @@
     return out;
   }
 
+  function shell(src) {
+    // Plain mode for shell, YAML, JSON and program output: comments, strings, numbers.
+    var out = '', i = 0, n = src.length;
+    while (i < n) {
+      var c = src[i];
+      if ((c === '#' || (c === '/' && src[i + 1] === '/')) && (i === 0 || src[i - 1] === '\n' || src[i - 1] === ' ')) { var e = src.indexOf('\n', i); if (e < 0) e = n; out += span('tok-c', src.slice(i, e)); i = e; continue; }
+      if (c === '"') { var j = i + 1; while (j < n && src[j] !== '"' && src[j] !== '\n') { if (src[j] === '\\') j++; j++; } out += span('tok-s', src.slice(i, j + 1)); i = j + 1; continue; }
+      if (c === '$') { var k = i + 1; while (k < n && /[A-Za-z0-9_({})]/.test(src[k])) k++; out += span('tok-i', src.slice(i, k)); i = k; continue; }
+      if (/[0-9]/.test(c) && (i === 0 || !/[A-Za-z0-9_\-.]/.test(src[i - 1]))) { var m = i; while (m < n && /[0-9.]/.test(src[m])) m++; if (!/[A-Za-z_\-]/.test(src[m] || '')) { out += span('tok-n', src.slice(i, m)); i = m; continue; } }
+      out += esc(c); i++;
+    }
+    return out;
+  }
+
   function ready() {
     // On phones the contents panel starts closed.
     var toc = document.querySelector('.side .toc');
     if (toc && window.innerWidth <= 900) toc.open = false;
-    var blocks = document.querySelectorAll('pre code.tin');
+    var blocks = document.querySelectorAll('pre code.tin, pre code.sh');
     for (var b = 0; b < blocks.length; b++) {
       var el = blocks[b], text = el.textContent;
-      el.innerHTML = highlight(text);
+      el.innerHTML = el.classList.contains('sh') ? shell(text) : highlight(text);
       var btn = document.createElement('button');
       btn.className = 'copy'; btn.textContent = 'copy';
       btn.setAttribute('data-src', text);

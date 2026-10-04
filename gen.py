@@ -30,6 +30,7 @@ def body(items):
     for kind, val in items:
         if kind == "p": out.append(f"<p>{inline(val)}</p>")
         elif kind == "code": out.append(code(val))
+        elif kind == "sh": out.append(code(val, "sh"))
         elif kind == "rules": out.append(rules(val))
         elif kind == "table": out.append(table(*val))
     return "".join(out)
@@ -41,7 +42,7 @@ def card(c):
         deeper = (f'<details class="deeper"><summary>{ARROW}Deeper</summary><div class="body">'
                   f'{body(c["deeper"])}</div></details>')
     return (f'<article class="card" id="{c["id"]}"><h3>{inline(c["title"])}{sig}</h3>'
-            f'<p>{inline(c["text"])}</p>{code(c["code"]) if c.get("code") else ""}'
+            f'<p>{inline(c["text"])}</p>{code(c["code"], c.get("lang", "tin")) if c.get("code") else ""}'
             f'{rules(c["rules"]) if c.get("rules") else ""}{body(c.get("extra", []))}{deeper}</article>')
 
 # ---------------------------------------------------------------- content
@@ -1310,6 +1311,7 @@ def head(title, desc, active):
   <a class="brand" href="index.html"><img src="logo.svg" alt="">Tin</a>
   <nav>
     <a href="syntax.html"{' class="active"' if active=="syntax" else ""}>Syntax</a>
+    <a href="replay.html"{' class="active"' if active=="replay" else ""}>Replay</a>
     <a href="https://github.com/yasserreslan/tin/blob/main/docs/STDLIB.md">Standard library</a>
     <a href="https://github.com/yasserreslan/tin/blob/main/docs/RUNTIME.md">Runtime</a>
   </nav>
@@ -1326,25 +1328,35 @@ FOOT = '''
 </html>
 '''
 
-def syntax_page():
+def sections_page(secs, title, h1, lede, notice, active, desc):
     side = ['<aside class="side"><details class="toc" open><summary>Contents</summary><nav>']
-    for s in S:
+    for s in secs:
         side.append(f'<h4>{s["n"]}</h4><a href="#{s["id"]}">{inline(s["title"])}</a><div class="sub">')
         for c in s["cards"]:
             side.append(f'<a href="#{c["id"]}">{inline(c["title"])}</a>')
         side.append("</div>")
     side.append("</nav></details></aside>")
-    main = ['<main class="main"><header><h1>The syntax of Tin</h1>',
-            '<p>Every construct on one page: a short explanation, an example, and a <b>Deeper</b> arrow when there is more to say. Tin 1 (edition 1) spelling.</p>',
-            '<div class="notice"><span>⚙</span><div><b>Status.</b> This is the Tin 1 syntax. Today the compiler takes it with <code>tin build --edition 1</code>; the repository converts in <a href="https://github.com/yasserreslan/tin/issues/226">#226</a>, after which it is the default.</div></div>',
-            '</header>']
-    for s in S:
+    main = [f'<main class="main"><header><h1>{h1}</h1>', f'<p>{lede}</p>', notice, '</header>']
+    for s in secs:
         main.append(f'<section class="part" id="{s["id"]}"><h2><span class="n">{s["n"]}</span>{inline(s["title"])}</h2><p class="intro">{inline(s["intro"])}</p>')
         for c in s["cards"]:
             main.append(card(c))
         main.append("</section>")
     main.append("</main>")
-    return head("Tin · Syntax", "The syntax of Tin, construct by construct, with examples.", "syntax") + '<div class="docs">' + "".join(side) + "".join(main) + "</div>" + FOOT
+    return head(title, desc, active) + '<div class="docs">' + "".join(side) + "".join(main) + "</div>" + FOOT
+
+def syntax_page():
+    return sections_page(S, "Tin · Syntax", "The syntax of Tin",
+        'Every construct on one page: a short explanation, an example, and a <b>Deeper</b> arrow when there is more to say. Tin 1 (edition 1) spelling.',
+        '<div class="notice"><span>⚙</span><div><b>Status.</b> This is the Tin 1 syntax. Today the compiler takes it with <code>tin build --edition 1</code>; the repository converts in <a href="https://github.com/yasserreslan/tin/issues/226">#226</a>, after which it is the default.</div></div>',
+        "syntax", "The syntax of Tin, construct by construct, with examples.")
+
+def replay_page():
+    from replay_content import R
+    return sections_page(R, "Tin · Replay", "Production replay",
+        'A failed request, recorded in production, runs again on your machine with every external effect served from the recording. What it records, how it stays safe, and why it changes how you debug a service.',
+        '<div class="notice"><span>⏺</span><div><b>Built in.</b> Recording is part of the runtime and every standard client (<a href="https://github.com/yasserreslan/tin/issues/241">#241</a>); <code>tin replay</code> and <code>--save-test</code> are the tooling (<a href="https://github.com/yasserreslan/tin/issues/242">#242</a>); scheduling replay is <a href="https://github.com/yasserreslan/tin/issues/243">#243</a>. All merged.</div></div>',
+        "replay", "Production replay in Tin: capsules, effects, secrets, tin replay, divergence, and regression tests from real traffic.")
 
 HERO_CODE = '''
 package main
@@ -1382,9 +1394,10 @@ TILES = [
  ("policies", "with · use · on", "Policies and lifecycle", "Retry and trace as library policies; resources bound to scopes; typed lifecycle events."),
  ("server", "anvil · argo", "A service end to end", "Router, per-core database, deadline, JSON: the constructs together in forty lines."),
 ]
+REPLAY_TILE = '<a class="tile tile-wide" href="replay.html"><span class="k">tin replay · capsules</span><h3>Production replay</h3><p>Every 5xx is recorded with the answers it got from Redis, the clock and the upstreams. Run it again on your laptop, against the fix, with none of them running. Then keep it as a test.</p></a>'
 
 def index_page():
-    tiles = "".join(f'<a class="tile" href="syntax.html#{i}"><span class="k">{html.escape(k)}</span><h3>{html.escape(t)}</h3><p>{html.escape(d)}</p></a>' for i, k, t, d in TILES)
+    tiles = REPLAY_TILE + "".join(f'<a class="tile" href="syntax.html#{i}"><span class="k">{html.escape(k)}</span><h3>{html.escape(t)}</h3><p>{html.escape(d)}</p></a>' for i, k, t, d in TILES)
     return head("Tin", "Tin is a compiled language for servers: no GC, one thread per core, faults you must handle, memory the compiler checks.", "index") + f'''
 <section class="hero">
   <div>
@@ -1393,6 +1406,7 @@ def index_page():
     <p class="lede">Compiled, self-hosted, no garbage collector. One thread per core, faults you cannot ignore, request memory the compiler proves never leaks. Written to be written by machines, read by people.</p>
     <div class="actions">
       <a class="btn primary" href="syntax.html">Read the syntax →</a>
+      <a class="btn" href="replay.html">Production replay</a>
       <a class="btn" href="https://github.com/yasserreslan/tin#readme">Install</a>
     </div>
     <div class="pills">
@@ -1406,4 +1420,5 @@ def index_page():
 
 with open(os.path.join(HERE, "syntax.html"), "w") as f: f.write(syntax_page())
 with open(os.path.join(HERE, "index.html"), "w") as f: f.write(index_page())
+with open(os.path.join(HERE, "replay.html"), "w") as f: f.write(replay_page())
 print("sections", len(S), "cards", sum(len(s["cards"]) for s in S))
