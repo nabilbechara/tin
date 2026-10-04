@@ -3565,7 +3565,8 @@ const spWaiter = 4
 const spScope = 5
 const spNext = 6
 const spCanceled = 7 // cancelled through its handle: its fault is not the scope's
-const spWords = 8
+const spArg = 8      // 1 + the argument of a body that takes one (parallel's result cell)
+const spWords = 9
 
 // rt_scope_open starts a scope boundary inside the current one.
 func rt_scope_open() scope {
@@ -3616,6 +3617,25 @@ func (h spawned) cancel() {
 		r[spCanceled] = 1
 		rt_bnd_cancel(rt_bnd_root(r[spTask]), cast(fault, "canceled"))
 	}
+}
+
+// rt_scope_open_word and rt_scope_close_word are the scope calls of a parallel block's wrapper,
+// with the scope as a word and the fault as the result (#232).
+func rt_scope_open_word() i64 {
+	return rt_bnd_enter(bkScope)
+}
+
+func rt_scope_close_word(b i64) i64 {
+	rt_scope_close(scope{b: b}) catch err {
+		return cast(i64, err)
+	}
+	return 0
+}
+
+// rt_scope_spawn_arg starts body(arg) as a child of scope b (a parallel line).
+func rt_scope_spawn_arg(b i64, body func(i64) !, arg i64) {
+	h := scope{b: b}.spawn(cast(func() !, cast(i64, body)))
+	h.r[spArg] = arg + 1
 }
 
 // rt_scope_close waits for every child of s, leaves the scope and gives its first fault.
@@ -3680,6 +3700,13 @@ func rt_task_resume(t i64) {
 
 // rt_child_main is a child task's body: run the closure and keep its fault.
 func rt_child_main(r i64) {
+	if r[spArg] != 0 {
+		g := cast(func(i64) !, r[spBody])
+		g(r[spArg]-1) catch err {
+			r[spFault] = cast(i64, err)
+		}
+		return
+	}
 	f := cast(func() !, r[spBody])
 	f() catch err {
 		r[spFault] = cast(i64, err)
