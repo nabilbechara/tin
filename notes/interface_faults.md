@@ -50,8 +50,15 @@ p+8   bytes     > a plain str: the FULL message, "outer: inner" for a wrapped fa
   Constants `faultCanceled` .. `faultPanic` name them in the runtime. Runtime and library
   code produce one with `fail cast(fault, rt_fault_deadline())`; each call allocates a
   fresh record in the current region (identity, not the address, is what matches).
-  Every deadline wait in lib/ (tide, wire, DNS, seal, redis, mysql, postgres, websocket,
-  the runtime's helper jobs) now fails with `fault.DeadlineExceeded`.
+- **Boundaries (#231).** A wait that ends early fails with `rt_wait_fault()`: the cancel
+  reason itself when its identity is `DeadlineExceeded` or `LimitExceeded`; otherwise a
+  `fault.Canceled` record (message `canceled: <reason>`) whose cause is the reason, so
+  `fault.Is` matches both `Canceled` and the reason; `DeadlineExceeded` when nothing
+  cancelled the boundary. `rt_bnd_check` cancels a passed deadline with
+  `rt_fault_deadline()`, and a boundary out of task budget fails with `rt_fault_limit()`.
+  Reasons are compared by identity, never by message. So every deadline wait in lib/
+  (tide, wire, DNS, seal, redis, mysql, postgres, websocket, the runtime's helper jobs)
+  fails with `fault.DeadlineExceeded`. A drain should cancel with `rt_fault_draining()`.
 - **Package-level sentinels**: `var ErrNotFound = fault("not found")`. The checker numbers
   each such declaration from 64 up (`faultUserIdent`) and lowers it to
   `rt_fault_sentinel(msg, ident)`. A global is per core, so every core has its own copy
@@ -95,22 +102,30 @@ compares each case with `rt_fault_is($sw, case)` instead of `==` (selfhost/check
 (or `nil`). Cases are tried in order, so a fault that matches several cases (a Join) takes
 the first.
 
-## 5. `fault.Panic` payload (for #230)
+## 5. `fault.Panic` payload (#230)
 
-A panic converted by `guard` is `rt_fault_panic(msg, trace)`: ident 6, its message is the
-panic message exactly as `panic:` prints it without the `panic: ` prefix (for example
-`index out of range [5] with length 3`), and `trace` is the backtrace text exactly as `rt_backtrace` writes
-it after the `panic:` line today, stored as its own fault record in the trace word
-so `keep` copies it. `fault.Is(err, fault.Panic)` is true for it, through any wrapping;
-`fault.Backtrace(err)` returns the trace. A guard may wrap it further with `fault.Wrap`.
+A panic that a `guard` converts is `rt_fault_panic(msg, trace)` (`rt_guard_land`): identity
+6, message `panic: <message>` (the text #230's guard already produced, for example
+`panic: index out of range [5] with length 3`), and `trace` the backtrace text stored as its
+own fault record in the trace word, so `keep` copies it. The guard passes `""` for now (the
+backtrace is still printed only by the uncaught-panic path); a guard that captures it later
+passes it here and `fault.Backtrace(err)` returns it. `fault.Is(err, fault.Panic)` is true for
+it through any wrapping.
 
-## 6. Follow-ups (not in #229's first PR)
+## 6. `try E wrap "msg"` (edition 1)
 
-- `try E wrap "msg"`: the edition-1 parser (#252) produces `EX_WRAP` (`WRAP_X`,
-  `WRAP_MESSAGE`). Its lowering is `E catch err { fail fault.Wrap(err, msg) }`, that is,
-  in `lower_try_stmt` the fault path returns `rt_fault_wrap(err, msg)` instead of `err`,
-  with `msg` checked as a `str` and evaluated only on failure. Lands once #252 is merged.
-- `match` over faults (#252's node) lowers like `switch` above.
-- Producing `fault.Canceled`, `LimitExceeded`, `Overloaded`, `Draining` belongs to the
-  issues that add cancellation, budgets, admission and drain; they call the constructors
-  in section 2.
+The edition-1 parser (#252) reads `try E wrap "msg"` as `EX_WRAP` (`WRAP_X` the `try`,
+`WRAP_MESSAGE` the string). `lower_try_stmt` lowers it like `try E`, except that the fault
+path returns `rt_fault_wrap(err, msg)`: it is `E catch err { fail fault.Wrap(err, msg) }`,
+the message reads `msg: cause`, and `msg` is checked as a `str` and evaluated only on
+failure. It works wherever `try` does (statement, `let`, assignment, multiple assignment,
+`return`). `wrap` on anything but a `try` is a compile error. Tests:
+tests/edition1/run/fault_wrap.tin and tests/edition1/fault_wrap_bad.tin, run by
+tests/edition1.sh.
+
+## 7. Follow-ups
+
+- `match` over faults (#252's `EX_MATCH`) lowers like `switch` (section 4) once `match`
+  itself is lowered.
+- Producing `fault.Overloaded` and `fault.Draining` belongs to admission and drain (#238);
+  they call the constructors in section 2.

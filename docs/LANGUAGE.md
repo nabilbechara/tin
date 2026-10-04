@@ -714,6 +714,8 @@ func main() {
   `switch err { case ErrNotFound: ... case fault.DeadlineExceeded, fault.Overloaded: ... }`
   compares each case with `fault.Is` (`case nil:` matches no fault); `==` on faults still
   compares the references.
+  In edition 1, `let user = try load(id) wrap "loading user {id}"` is
+  `load(id) catch err { fail fault.Wrap(err, "loading user {id}") }`.
 - `defer f(args)` evaluates `f` and its arguments when the defer statement runs and calls
   `f` when the function returns, last deferred first, on every return path including the
   returns `try` makes. A defer inside a loop is rejected (it would run once per function,

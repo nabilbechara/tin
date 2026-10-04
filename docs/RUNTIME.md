@@ -358,11 +358,13 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   under it. `rt_bnd_cancel(b, reason)` cancels `b` and everything inside it (never its parent
   or siblings) and ends the waits of the tasks inside: `rt_task_wait` returns `waitDeadline`,
   and a wait in a boundary that is already cancelled returns it at once. Clients then fail
-  with `rt_wait_fault()`: `deadline exceeded` (or `limit exceeded`) itself, otherwise
-  `canceled: ` and the reason. `tools/ci/cancel_check.py` checks every client.
+  with `rt_wait_fault()`: the reason itself when it is `fault.DeadlineExceeded` or
+  `fault.LimitExceeded` (by identity), otherwise a `fault.Canceled` fault reading
+  `canceled: <reason>` whose cause is the reason (notes/interface_faults.md).
+  `tools/ci/cancel_check.py` checks every client.
 - Budgets (#235): `limit memory n, tasks k { }` counts the pool chunks and big blocks taken
   inside it (the bump fast path is not touched) and tasks started in it. Passing the memory
-  budget leaves the block with `limit exceeded` at once (its defers and cleanups run).
+  budget leaves the block with `fault.LimitExceeded` (`limit exceeded`) at once (its defers and cleanups run).
   `TIN_REQUEST_MEMORY` (bytes, beyond a request's first pool chunk) bounds every request the
   same way; a request past it ends with 500 and the server goes on.
 - Tasks can wait on each other: `rt_task_park(timeout)` waits until another task calls
