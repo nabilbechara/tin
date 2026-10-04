@@ -1,0 +1,672 @@
+// Package capabilities (#146, docs/PACKAGES.md): a vendored package's tin.mod declares what
+// it may do (net, files, spawn, exec, unsafe); the standard library's entry points to the
+// operating system are tagged with the capability they need, and a call from a vendored
+// package that can reach a capability its manifest does not declare is a compile error.
+
+const CAP_NET = 1;
+const CAP_FILES = 2;
+const CAP_SPAWN = 4;
+const CAP_EXEC = 8;
+const CAP_UNSAFE = 16;
+
+// A vendored package: its import path, declared capabilities and manifest (0 when it has none).
+const CP_PATH = 0;
+const CP_CAPS = 1;
+const CP_MANIFEST = 2;
+
+var file_cap_pkg;   // per loaded file: its vendored package record, or 0 (not restricted)
+var cap_pkgs;       // the vendored package records, one per import path
+var cap_edges;      // per function (by F_INDEX during the pass): vec of [callee, position]
+var cap_masks;      // per function: the capabilities it can reach
+var cap_cur;        // the edge list being filled by cap_walk_*
+var caps_report;    // tinc -caps: print each package's capabilities instead of building
+
+fn cap_name(bit) {
+    if bit == CAP_NET { return "net"; }
+    if bit == CAP_FILES { return "files"; }
+    if bit == CAP_SPAWN { return "spawn"; }
+    if bit == CAP_EXEC { return "exec"; }
+    return "unsafe";
+}
+
+fn cap_bit(name) {
+    let bit = 1;
+    while bit <= CAP_UNSAFE {
+        if streq(name, cap_name(bit)) {
+            return bit;
+        }
+        bit = bit * 2;
+    }
+    return 0;
+}
+
+// cap_list appends the capabilities in mask in their fixed order, separated by sep.
+fn cap_list(b, mask, sep) {
+    let bit = 1;
+    let first = 1;
+    while bit <= CAP_UNSAFE {
+        if mask & bit {
+            if !first {
+                buf_str(b, sep);
+            }
+            buf_str(b, cap_name(bit));
+            first = 0;
+        }
+        bit = bit * 2;
+    }
+}
+
+// ---- manifests ----
+
+// cap_word copies the word of line starting at i into a C string; out[0] is it, out[1] the
+// position after it (0 when the line has no more words).
+fn cap_word(line, i, out) {
+    while load8(line + i) == ' ' || load8(line + i) == '\t' || load8(line + i) == '\r' {
+        i = i + 1;
+    }
+    if load8(line + i) == 0 {
+        out[0] = 0;
+        return;
+    }
+    let w = buf_new();
+    while load8(line + i) != 0 && load8(line + i) != ' ' && load8(line + i) != '\t' && load8(line + i) != '\r' {
+        buf_byte(w, load8(line + i));
+        i = i + 1;
+    }
+    buf_byte(w, 0);
+    out[0] = w[VEC_DATA];
+    out[1] = i;
+}
+
+fn manifest_error(path, line_no, msg, word) {
+    let e = buf_new();
+    buf_str(e, path);
+    buf_byte(e, ':');
+    buf_int(e, line_no);
+    // A tin.mod is not a loaded source file, so its position is written here.
+    buf_str(e, ": error ");
+    buf_str(e, "E114 MANIFEST");
+    buf_str(e, ": ");
+    buf_str(e, msg);
+    if word {
+        buf_str(e, " '");
+        buf_str(e, word);
+        buf_byte(e, '\'');
+    }
+    buf_str(e, " (a tin.mod line is module PATH, require PATH SOURCE or caps net files spawn exec unsafe)");
+    fatal(e);
+}
+
+// manifest_caps reads a tin.mod and returns the capabilities its caps lines declare.
+fn manifest_caps(src, path) {
+    let data = src[VEC_DATA];
+    let n = src[VEC_LEN];
+    let caps = 0;
+    let line_no = 0;
+    let out = calloc(2, 8);
+    let i = 0;
+    while i < n {
+        line_no = line_no + 1;
+        let end = i;
+        while end < n && load8(data + end) != '\n' {
+            end = end + 1;
+        }
+        let lb = buf_new();
+        let j = i;
+        while j < end {
+            buf_byte(lb, load8(data + j));
+            j = j + 1;
+        }
+        buf_byte(lb, 0);
+        let line = lb[VEC_DATA];
+        cap_word(line, 0, out);
+        let w = out[0];
+        if w && !starts_with(w, "//") {
+            if streq(w, "caps") {
+                cap_word(line, out[1], out);
+                while out[0] {
+                    let bit = cap_bit(out[0]);
+                    if !bit {
+                        manifest_error(path, line_no, "unknown capability", out[0]);
+                    }
+                    caps = caps | bit;
+                    cap_word(line, out[1], out);
+                }
+            } else if streq(w, "module") || streq(w, "require") {
+                cap_word(line, out[1], out);
+                if !out[0] {
+                    manifest_error(path, line_no, "missing path after", w);
+                }
+            } else {
+                manifest_error(path, line_no, "unknown line", w);
+            }
+        }
+        i = end + 1;
+    }
+    return caps;
+}
+
+// lock_caps_line returns tin.lock's "caps PATH ..." line for an import path as a C string, or 0.
+fn lock_caps_line(ipath) {
+    let data = project_lock[VEC_DATA];
+    let n = project_lock[VEC_LEN];
+    let m = strlen(ipath);
+    let i = 0;
+    while i < n {
+        let end = i;
+        while end < n && load8(data + end) != '\n' {
+            end = end + 1;
+        }
+        if end - i >= 5 + m && bytes_equal(data + i, "caps ", 5) && bytes_equal(data + i + 5, ipath, m) && (end - i == 5 + m || load8(data + i + 5 + m) == ' ') {
+            let b = buf_new();
+            let j = i;
+            while j < end {
+                buf_byte(b, load8(data + j));
+                j = j + 1;
+            }
+            buf_byte(b, 0);
+            return b[VEC_DATA];
+        }
+        i = end + 1;
+    }
+    return 0;
+}
+
+// vendored_package returns the record of the package an import resolved to when it is under
+// the project's vendor/ (reading and locking its tin.mod the first time), or 0.
+fn vendored_package(ipath, found) {
+    let first = vec_get(found, 0);
+    let vroot = vendor_dir();
+    if !starts_with(first, vroot) {
+        return 0;
+    }
+    let i = 0;
+    while i < cap_pkgs[VEC_LEN] {
+        if streq(vec_get(cap_pkgs, i)[CP_PATH], ipath) {
+            return vec_get(cap_pkgs, i);
+        }
+        i = i + 1;
+    }
+    let rec = calloc(3, 8);
+    rec[CP_PATH] = ipath;
+    let manifest = cat_path(dir_of(first), "/tin.mod");
+    let src = try_read_file(manifest);
+    if src {
+        rec[CP_MANIFEST] = manifest;
+        // The manifest is vendored source too: the lock pins it like the code.
+        lock_has(manifest);
+        rec[CP_CAPS] = manifest_caps(src, manifest);
+    }
+    // The lock shows a reviewer each package's capabilities; it must say what the manifest says.
+    if project_lock {
+        let want = buf_new();
+        buf_str(want, "caps ");
+        buf_str(want, ipath);
+        if rec[CP_CAPS] {
+            buf_byte(want, ' ');
+            cap_list(want, rec[CP_CAPS], " ");
+        }
+        buf_byte(want, 0);
+        let got = lock_caps_line(ipath);
+        if (got || src) && !(got && streq(got, want[VEC_DATA])) {
+            let e = err_code(NO_POS, "E115 LOCK_CAPS");
+            buf_str(e, "tin.lock ");
+            if got {
+                buf_str(e, "says \"");
+                buf_str(e, got);
+                buf_str(e, "\"");
+            } else {
+                buf_str(e, "has no caps line");
+            }
+            buf_str(e, " for ");
+            buf_str(e, ipath);
+            buf_str(e, ", its manifest declares \"");
+            buf_str(e, want[VEC_DATA]);
+            buf_str(e, "\" (run tin vendor)");
+            fatal(e);
+        }
+    }
+    vec_push(cap_pkgs, rec);
+    return rec;
+}
+
+// ---- tags ----
+
+// cap_sealed is 1 + the capabilities of a standard-library function whose internals are
+// part of what it does, or 0: the DNS resolver reads /etc/hosts and /etc/resolv.conf as part
+// of net, and a server keeps a spare descriptor open on /dev/null to shed connections when
+// it runs out of them. What a sealed function calls is not followed.
+fn cap_sealed(f) {
+    if !vec_get(file_trusted, f[F_FILE]) || f[F_EXTERN] {
+        return 0;
+    }
+    let name = f[F_QNAME];
+    if streq(name, "wire.resolve") || streq(name, "anvil.serve_on") {
+        return 1 + CAP_NET;
+    }
+    if streq(name, "anvil.drop_one") {
+        return 1;
+    }
+    return 0;
+}
+
+// cap_tag is the capability a standard-library function needs by itself: the operating
+// system entry points (the runtime's rt_sys_* calls and the C functions lib/ declares extern)
+// that open a connection or a file, start a process or replace it. A tag is final.
+fn cap_tag(f) {
+    if !vec_get(file_trusted, f[F_FILE]) {
+        return 0;
+    }
+    let sealed = cap_sealed(f);
+    if sealed {
+        return sealed - 1;
+    }
+    // On macOS some packages wrap their own C calls as rt_sys_* (quarry.rt_sys_open): the
+    // declared name is what counts, so every target tags the same entry points.
+    let name = f[F_NAME];
+    if !f[F_EXTERN] {
+        if !starts_with(name, "rt_sys_") {
+            return 0;
+        }
+        name = name + 7;
+    }
+    if streq(name, "socket") || streq(name, "connect") || streq(name, "bind") || streq(name, "listen") || streq(name, "accept") || streq(name, "getaddrinfo") {
+        return CAP_NET;
+    }
+    if streq(name, "open") || streq(name, "creat") || streq(name, "opendir") || streq(name, "mkdir") || streq(name, "rmdir") || streq(name, "unlink") || streq(name, "rename") || streq(name, "stat") || streq(name, "lstat") || streq(name, "chdir") || streq(name, "readlink") {
+        return CAP_FILES;
+    }
+    if streq(name, "fork") || streq(name, "vfork") || streq(name, "posix_spawn") || streq(name, "posix_spawnp") {
+        return CAP_SPAWN;
+    }
+    if streq(name, "execve") || streq(name, "execv") || streq(name, "execvp") {
+        return CAP_EXEC;
+    }
+    return 0;
+}
+
+// cap_final reports a function whose capabilities are its tag alone: an entry point or a
+// sealed function.
+fn cap_final(f) {
+    return cap_sealed(f) || cap_tag(f);
+}
+
+// cap_runtime reports a function of the runtime package: its internal file reads (cgroup
+// limits, /proc) are not the program's, so only its tagged entry points carry a capability.
+fn cap_runtime(f) {
+    return vec_get(file_trusted, f[F_FILE]) && load8(vec_get(file_pkgs, f[F_FILE])) == 0;
+}
+
+// ---- the call graph ----
+
+fn cap_edge(g, pos) {
+    if !g {
+        return;
+    }
+    let rec = vec_new();
+    vec_push(rec, g);
+    vec_push(rec, pos);
+    vec_push(cap_cur, rec);
+}
+
+fn cap_walk_stmts(v) {
+    let i = 0;
+    while i < v[VEC_LEN] {
+        cap_walk_stmt(vec_get(v, i));
+        i = i + 1;
+    }
+}
+
+// cap_walk_stmt follows reach_stmt: the statements the checker leaves for the backend.
+fn cap_walk_stmt(s) {
+    if !s {
+        return;
+    }
+    let k = s[N_KIND];
+    if k == ST_BLOCK {
+        cap_walk_stmts(s[BLK_STMTS]);
+    } else if k == ST_LET {
+        cap_walk_expr(s[LET_INIT]);
+    } else if k == ST_ASSIGN {
+        cap_walk_expr(s[AS_TARGET]);
+        cap_walk_expr(s[AS_VALUE]);
+    } else if k == ST_EXPR {
+        cap_walk_expr(s[ES_X]);
+    } else if k == ST_IF {
+        cap_walk_expr(s[IF_COND]);
+        cap_walk_stmt(s[IF_THEN]);
+        cap_walk_stmt(s[IF_ELSE]);
+    } else if k == ST_WHILE {
+        cap_walk_expr(s[WH_COND]);
+        cap_walk_stmt(s[WH_BODY]);
+        cap_walk_stmt(s[WH_POST]);
+    } else if k == ST_RETURN {
+        cap_walk_expr(s[RET_VALUE]);
+        if s[RET_VALUES] {
+            cap_walk_exprs(s[RET_VALUES]);
+        }
+    } else if k == ST_CALLMULTI {
+        cap_walk_expr(s[CM_CALL]);
+    }
+}
+
+fn cap_walk_exprs(v) {
+    let i = 0;
+    while i < v[VEC_LEN] {
+        cap_walk_expr(vec_get(v, i));
+        i = i + 1;
+    }
+}
+
+// cap_walk_expr records every function a body calls or refers to (a function value or a dyn
+// table's methods can be called later, so referring counts as calling).
+fn cap_walk_expr(e) {
+    if !e {
+        return;
+    }
+    let k = e[N_KIND];
+    if k == EX_CALL {
+        cap_edge(e[CALL_FN], e[N_POS]);
+        cap_walk_expr(e[CALL_CALLEE]);
+        cap_walk_exprs(e[CALL_ARGS]);
+    } else if k == EX_FUNCREF {
+        cap_edge(e[FR_FN], e[N_POS]);
+    } else if k == EX_UNARY {
+        cap_walk_expr(e[UN_X]);
+    } else if k == EX_BINARY {
+        cap_walk_expr(e[BIN_L]);
+        cap_walk_expr(e[BIN_R]);
+    } else if k == EX_INDEX {
+        cap_walk_expr(e[IX_X]);
+        cap_walk_expr(e[IX_I]);
+    } else if k == EX_CONV {
+        if e[CV_KIND] == CV_DYN && e[CV_DYN_TABLE] >= 0 && e[CV_DYN_TABLE] < dyn_tables[VEC_LEN] {
+            let rec = vec_get(dyn_tables, e[CV_DYN_TABLE]);
+            cap_edge(vec_get(rec, 2), e[N_POS]);
+            let fns = vec_get(rec, 3);
+            let j = 0;
+            while j < fns[VEC_LEN] {
+                cap_edge(vec_get(fns, j), e[N_POS]);
+                j = j + 1;
+            }
+        }
+        cap_walk_expr(e[CV_X]);
+    } else if k == EX_SEQ {
+        cap_walk_stmts(e[SEQ_STMTS]);
+        cap_walk_expr(e[SEQ_VALUE]);
+    } else if k == EX_MEM {
+        cap_walk_expr(e[MEM_BASE]);
+        cap_walk_expr(e[MEM_INDEX]);
+        cap_walk_expr(e[MEM_LEN]);
+    } else if k == EX_ELEM {
+        cap_walk_expr(e[ELEM_SEQ]);
+        cap_walk_expr(e[ELEM_IDX]);
+    }
+}
+
+// cap_index is a function's position in prog_fns during the pass, or -1.
+fn cap_index(f) {
+    let i = f[F_INDEX];
+    if i >= 0 && i < prog_fns[VEC_LEN] && vec_get(prog_fns, i) == f {
+        return i;
+    }
+    return -1;
+}
+
+fn cap_mask_of(f) {
+    let i = cap_index(f);
+    if i < 0 {
+        return cap_tag(f);
+    }
+    return vec_get(cap_masks, i);
+}
+
+// cap_pkg_of is the vendored package that declares f, by its position: a function the
+// compiler generates (an encoder, the start code) has no line and belongs to no package.
+fn cap_pkg_of(f) {
+    let pos = f[F_POS];
+    if pos <= 0 || ((pos >> 16) & 0xffffffff) == 0 || (pos >> 48) >= file_cap_pkg[VEC_LEN] {
+        return 0;
+    }
+    return vec_get(file_cap_pkg, pos >> 48);
+}
+
+// cap_own is what a function needs by itself: its tag, or unsafe in a package that declares it.
+fn cap_own(f) {
+    let p = cap_pkg_of(f);
+    if p && (p[CP_CAPS] & CAP_UNSAFE) {
+        return cap_tag(f) | CAP_UNSAFE;
+    }
+    return cap_tag(f);
+}
+
+// cap_graph records every function's calls and computes what each can reach.
+fn cap_graph() {
+    cap_edges = vec_new();
+    cap_masks = vec_new();
+    let n = prog_fns[VEC_LEN];
+    let i = 0;
+    while i < n {
+        let f = vec_get(prog_fns, i);
+        f[F_INDEX] = i;
+        cap_cur = vec_new();
+        if f[F_BODY] && !f[F_EXTERN] && !is_template(f) && !cap_final(f) {
+            cap_walk_stmts(f[F_BODY][BLK_STMTS]);
+        }
+        vec_push(cap_edges, cap_cur);
+        vec_push(cap_masks, cap_own(f));
+        i = i + 1;
+    }
+    // Reachability to a fixed point; tagged functions and the runtime's own do not inherit.
+    let changed = 1;
+    while changed {
+        changed = 0;
+        i = 0;
+        while i < n {
+            let f = vec_get(prog_fns, i);
+            if !cap_final(f) && !cap_runtime(f) {
+                let m = vec_get(cap_masks, i);
+                let es = vec_get(cap_edges, i);
+                let j = 0;
+                while j < es[VEC_LEN] {
+                    m = m | cap_mask_of(vec_get(vec_get(es, j), 0));
+                    j = j + 1;
+                }
+                if m != vec_get(cap_masks, i) {
+                    cap_masks[VEC_DATA][i] = m;
+                    changed = 1;
+                }
+            }
+            i = i + 1;
+        }
+    }
+}
+
+// cap_path appends how g reaches the capability bit: g -> ... -> the tagged entry point.
+fn cap_path(b, g, bit) {
+    let steps = 0;
+    while g && steps < 12 {
+        if steps > 0 {
+            buf_str(b, " -> ");
+        }
+        if cap_tag(g) && !cap_sealed(g) {
+            buf_str(b, g[F_NAME]);
+        } else {
+            buf_str(b, g[F_QNAME]);
+        }
+        if (cap_own(g) & bit) || cap_index(g) < 0 || cap_final(g) {
+            return;
+        }
+        let es = vec_get(cap_edges, cap_index(g));
+        let next = 0;
+        let j = 0;
+        while j < es[VEC_LEN] && !next {
+            let c = vec_get(vec_get(es, j), 0);
+            if c != g && (cap_mask_of(c) & bit) {
+                next = c;
+            }
+            j = j + 1;
+        }
+        g = next;
+        steps = steps + 1;
+    }
+    if g {
+        buf_str(b, " -> ...");
+    }
+}
+
+fn cap_violation(pos, p, g, need) {
+    let bit = 1;
+    while !(need & bit) {
+        bit = bit * 2;
+    }
+    let e = err_code(pos, "E804 CAPABILITY");
+    buf_str(e, g[F_QNAME]);
+    buf_str(e, " needs capability ");
+    buf_str(e, cap_name(bit));
+    buf_str(e, " (");
+    cap_path(e, g, bit);
+    buf_str(e, "), which package ");
+    buf_str(e, p[CP_PATH]);
+    buf_str(e, " does not declare in its tin.mod (caps: ");
+    if p[CP_CAPS] {
+        cap_list(e, p[CP_CAPS], " ");
+    } else {
+        buf_str(e, "none");
+    }
+    buf_byte(e, ')');
+    err_end(e);
+}
+
+// cap_check_edges reports each call from package p, at site positions, that leaves the
+// package for code needing a capability p does not declare.
+fn cap_check_edges(p, es) {
+    let j = 0;
+    while j < es[VEC_LEN] {
+        let rec = vec_get(es, j);
+        let g = vec_get(rec, 0);
+        let m = cap_mask_of(g);
+        let need = m - (m & p[CP_CAPS]);
+        if need && cap_pkg_of(g) != p {
+            cap_violation(vec_get(rec, 1), p, g, need);
+        }
+        j = j + 1;
+    }
+}
+
+// cap_check_inits checks the package-level initializers of restricted packages.
+fn cap_check_inits(stmts) {
+    let i = 0;
+    while i < stmts[VEC_LEN] {
+        let a = vec_get(stmts, i);
+        let pos = a[N_POS];
+        if a[N_KIND] == ST_ASSIGN && a[AS_VALUE] {
+            pos = a[AS_VALUE][N_POS];
+        }
+        if pos != NO_POS && pos >= 0 {
+            let p = vec_get(file_cap_pkg, pos >> 48);
+            if p {
+                cap_cur = vec_new();
+                cap_walk_stmt(a);
+                cap_check_edges(p, cap_cur);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// check_capabilities runs after the checker when a vendored package is loaded (or for tinc
+// -caps): every call from a vendored package must stay within its declared capabilities.
+fn check_capabilities() {
+    let any = 0;
+    let i = 0;
+    while i < file_cap_pkg[VEC_LEN] {
+        if vec_get(file_cap_pkg, i) {
+            any = 1;
+        }
+        i = i + 1;
+    }
+    if !any && !caps_report {
+        return;
+    }
+    cap_graph();
+    i = 0;
+    while i < prog_fns[VEC_LEN] {
+        let f = vec_get(prog_fns, i);
+        let p = cap_pkg_of(f);
+        if p {
+            cap_check_edges(p, vec_get(cap_edges, i));
+        }
+        i = i + 1;
+    }
+    cap_check_inits(init_stmts);
+    cap_check_inits(core_stmts);
+}
+
+// cap_exported reports a function others can call: an exported function or method, or any
+// function of the program's own package.
+fn cap_exported(f) {
+    if load8(vec_get(file_pkgs, f[F_POS] >> 48)) == 0 {
+        return 1;
+    }
+    let c = load8(f[F_NAME]);
+    return c >= 'A' && c <= 'Z';
+}
+
+// print_capabilities prints the capabilities each package's exported functions can reach, one
+// "package caps" line each in name order ("main" for the program; the runtime is left out).
+fn print_capabilities() {
+    let names = vec_new();
+    let masks = vec_new();
+    let i = 0;
+    while i < prog_fns[VEC_LEN] {
+        let f = vec_get(prog_fns, i);
+        let pos = f[F_POS];
+        if pos > 0 && ((pos >> 16) & 0xffffffff) != 0 && (pos >> 48) < files[VEC_LEN] && !cap_runtime(f) && cap_exported(f) {
+            let name = vec_get(file_pkgs, pos >> 48);
+            if load8(name) == 0 {
+                name = "main";
+            }
+            let p = cap_pkg_of(f);
+            if p {
+                name = p[CP_PATH];
+            }
+            let k = 0;
+            while k < names[VEC_LEN] && !streq(vec_get(names, k), name) {
+                k = k + 1;
+            }
+            if k == names[VEC_LEN] {
+                vec_push(names, name);
+                vec_push(masks, 0);
+            }
+            masks[VEC_DATA][k] = vec_get(masks, k) | vec_get(cap_masks, i);
+        }
+        i = i + 1;
+    }
+    let order = vec_new();
+    i = 0;
+    while i < names[VEC_LEN] {
+        vec_push(order, i);
+        let j = order[VEC_LEN] - 1;
+        while j > 0 && c_positive(strcmp(vec_get(names, vec_get(order, j - 1)), vec_get(names, vec_get(order, j)))) {
+            let t = vec_get(order, j);
+            order[VEC_DATA][j] = vec_get(order, j - 1);
+            order[VEC_DATA][j - 1] = t;
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+    let out = buf_new();
+    i = 0;
+    while i < order[VEC_LEN] {
+        let k = vec_get(order, i);
+        buf_str(out, vec_get(names, k));
+        if vec_get(masks, k) {
+            buf_byte(out, ' ');
+            cap_list(out, vec_get(masks, k), " ");
+        }
+        buf_byte(out, '\n');
+        i = i + 1;
+    }
+    write_all(1, out);
+}

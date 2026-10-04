@@ -73,6 +73,10 @@ import "github.com/ana/geo"  // a dependency, by path: only from vendor/github.c
   `tin.mod` requires there, and `tin.lock` records each vendored file's SHA-256; a file
   whose hash differs is a compile error (docs/PACKAGES.md). Two import paths cannot load
   different packages with the same name.
+- **Capabilities:** a vendored package's `tin.mod` declares what it may do (`caps net files
+  spawn exec unsafe`). A call from it that can reach, through any package, a standard library
+  entry point needing another capability is a compile error at the call (`E804`); `unsafe`
+  lets it use the trusted operations of section 18.
 
 ### Program start
 
@@ -1144,7 +1148,9 @@ err2 := argo.Get(text, mut xs)      // appends decoded elements
 
 ## 18. Standard-library-only features
 
-Files under `lib/` are trusted and may use operations user code cannot:
+Files under `lib/` are trusted and may use operations user code cannot. So may a vendored
+package whose `tin.mod` declares `caps unsafe` (docs/PACKAGES.md); the packages that call it
+then need `unsafe` too.
 
 - `cast(T, x)` between `i64` and reference types (a str is a pointer to
   `[length word][bytes][NUL]`; a slice to a header `[len, cap, data, region]`);

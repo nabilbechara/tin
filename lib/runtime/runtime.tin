@@ -4682,6 +4682,34 @@ func (s scope) spawn(f func() !) spawned {
 	return spawned{r: r}
 }
 
+// cancel cancels scope s by hand (#143): its children's waits and its own fail with
+// "canceled: reason", and the scope's fault is that fault, unless a child failed first.
+func (s scope) cancel(reason str) {
+	b := s.b
+	if b[bFault] != 0 || b[bCancel] != 0 {
+		return
+	}
+	r := rt_fault_new(reason, 0, 0)
+	c := rt_fault_wrap(r, "canceled")
+	cb := c - faultHead
+	cb[fhIdent] = faultCanceled
+	b[bFault] = c
+	rt_bnd_cancel(b, cast(fault, r))
+}
+
+// yield lets the other ready tasks of this core run before the current one goes on (#143);
+// on the core's own stack it runs one ready task, if there is one.
+func (s scope) yield() {
+	if curTask != 0 {
+		rt_task_defer()
+		return
+	}
+	t := rt_task_take_ready()
+	if t != 0 {
+		rt_task_resume(t)
+	}
+}
+
 // wait waits until the child has finished and gives its fault, if any.
 func (h spawned) wait() ! {
 	r := h.r
