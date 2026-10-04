@@ -1771,7 +1771,7 @@ package main
 
 import "mint"
 
-fn read(s str) !i64 {
+fn readCount(s str) !i64 {
 	return mint.Atoi(s) wrap "reading the count"
 }
 
@@ -2463,12 +2463,12 @@ type Conn struct {
 	n i64
 }
 
-fn open() !Conn {
+fn connect() !Conn {
 	return Conn{n: 1}
 }
 
 fn work() ! {
-	use c = open()
+	use c = connect()
 	_ = c
 }
 
@@ -2498,13 +2498,13 @@ type Conn struct {
 fn (c Conn) Close() ! {
 }
 
-fn open() !Conn {
+fn connect() !Conn {
 	return Conn{n: 1}
 }
 
 fn work() ! {
 	for i in 0..3 {
-		use c = open()
+		use c = connect()
 	}
 }
 
