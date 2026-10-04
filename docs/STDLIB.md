@@ -143,9 +143,9 @@ fn main() {
 - `Admit(p fn(Load) bool)`: Admit sets the admission policy (call before Serve): after the built-in limits, p decides each new request before its handler runs; false answers 503 with Retry-After: 1 without running the handler. Every core calls p with its own Load.
 - `Limits(maxBody i64, maxBuffered i64, maxConns i64)`: Limits sets the largest request body in bytes (413 past it), the bytes of requests still arriving that one core may buffer (a new partial request past it gets 503 and close), and the connections per core (more are closed at accept; 0: no limit). Defaults 64 MiB, 256 MiB and 16384; TIN_MAX_BODY, TIN_MAX_BUFFERED and TIN_MAX_CONNS override them. Call before Serve.
 - `Deadline(ms i64)`: Deadline makes every request's waits (tide.Wait, client calls) fail with "deadline exceeded" once ms have passed since the request started (0: no deadline; call before Serve). TIN_DEADLINE_MS sets it too; the default is 30000.
-- `(q Req) Header(name str) str`: Header returns the value of the request header name (any case), or "".
+- `(q Req) Header(name str) str`: Header returns the value of the request header name (any case), or "". A chunked request's trailer fields are read after the header block's.
 - `(q Req) Hijack() !i64`: Hijack takes the request's connection out of HTTP for a protocol of its own (the websocket package uses it): the responses before this request are written, the core stops reading the connection and the request's deadline no longer applies. It returns the non-blocking descriptor, for the caller's I/O until the handler returns; then anvil closes it. The handler's Out is not sent.
-- `(q Req) Body() str`: Body returns the request body.
+- `(q Req) Body() str`: Body returns the request body (a chunked one decoded).
 - `(q Req) BodyBound(n i64) !str`: BodyBound returns the request body when it is at most n bytes, and otherwise fails with fault.LimitExceeded before copying any of it: the compiler calls it for q.Body() into a bounded type (try bound(q.Body()), #240).
 - `(q Req) Param(name str) str`: Param returns query parameter name, %-decoded, or "".
 - `(q Req) PathParam(name str) str`: PathParam returns path parameter name of the Router route that matched ({name}, {name...}, or "*" for a last *), %-decoded, or "".

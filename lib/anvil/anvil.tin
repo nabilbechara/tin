@@ -68,6 +68,8 @@ type Req struct {
 	bp     i64
 	bn     i64
 	ep     i64 // the Router endpoint that matched (an rend), for PathParam and Pattern
+	tp     i64 // a chunked body's trailer field lines (#349), read by Header after the header block
+	tn     i64
 }
 
 // Out is the response being built. Body is the response body; the status defaults to
@@ -188,6 +190,15 @@ mut pHead bool
 mut pTs i64      // the request target: offset in the request and length (absolute-form reduced to its path)
 mut pTn i64
 mut pKeep10 bool // an HTTP/1.0 request asked for keep-alive: the response must say so
+mut pTr i64      // a chunked request's trailer lines: offset in the request bytes and length (#349)
+mut pTrLen i64
+
+// chunk_scan's results for a complete chunked body (#349).
+mut ckLen i64    // the decoded body's length
+mut ckEnd i64    // the offset just after the trailer section's empty line
+mut ckTr i64     // the trailer field lines: offset and end
+mut ckTrEnd i64
+mut ckRecLen i64 // chunked_record's length
 
 fn c32(x i64) i64 {
 	return i64(i32(x))
@@ -1095,6 +1106,7 @@ fn serve_one(c i64, p i64, n i64) i64 {
 	mut pos = le + 1
 	mut cl = 0
 	mut seenCL = false
+	mut chunked = false
 	mut hend = 0
 	for {
 		mut e = memchr(p+pos, '\n', n-pos)
@@ -1174,8 +1186,25 @@ fn serve_one(c i64, p i64, n i64) i64 {
 				j = e
 			}
 		} else if f == 't' && kn == 17 && name_is(h, kn, "transfer-encoding") {
-			bad(c, 501)
-			return -1
+			// chunked is the only coding understood (RFC 9112 6.1, 7): another is 501, and chunked
+			// listed twice is malformed.
+			mut j = kn + 1
+			for j < vl && (load8(h+j) == ' ' || load8(h+j) == '\t') {
+				j += 1
+			}
+			mut e = vl
+			for e > j && (load8(h+e-1) == ' ' || load8(h+e-1) == '\t') {
+				e -= 1
+			}
+			if !name_is(h+j, e-j, "chunked") {
+				bad(c, 501)
+				return -1
+			}
+			if chunked {
+				bad(c, 400)
+				return -1
+			}
+			chunked = true
 		}
 		pos += l + 1
 	}
@@ -1184,7 +1213,35 @@ fn serve_one(c i64, p i64, n i64) i64 {
 		bad(c, 400)
 		return -1
 	}
-	let total = hend + cl
+	mut total = hend + cl
+	pTr = 0
+	pTrLen = 0
+	if chunked {
+		// Both framings at once is how requests are smuggled past a proxy (RFC 9112 6.3).
+		if seenCL {
+			bad(c, 400)
+			return -1
+		}
+		let r = chunk_scan(p, hend, n)
+		if r < 0 {
+			bad(c, -r)
+			return -1
+		}
+		if r == 0 {
+			c[cNeed] = 0
+			if expect100 && !http10 && c[cSent100] == 0 {
+				ob_room(32)
+				ob_str("HTTP/1.1 100 Continue\r\n\r\n")
+				c[cSent100] = 1
+			}
+			return 0
+		}
+		chunk_decode(p, hend)
+		cl = ckLen
+		total = ckEnd
+		pTr = ckTr
+		pTrLen = ckTrEnd - ckTr
+	}
 	if cl > gMaxBody {
 		bad(c, 413)
 		return -1
@@ -1252,7 +1309,14 @@ fn serve_one(c i64, p i64, n i64) i64 {
 		rt_task_set_deadline(task, rt_mono_ns()+gDeadlineMs*1000000)
 	}
 	if gRecord {
-		record_start(task, p, total)
+		if chunked {
+			// replay frames the recorded bytes again: keep the decoded form (#349)
+			let rec = chunked_record(p)
+			record_start(task, rec, ckRecLen)
+			free(rec)
+		} else {
+			record_start(task, p, total)
+		}
 	}
 	if rt_task_run(task) {
 		if rt_task_panicked(task) {
@@ -1286,7 +1350,7 @@ fn run_request(c i64) {
 	let p = pReq
 	let t = p + pTs
 	let tn = pTn
-	let q = Req{Method: method_str(p, pSp1), Path: "", Query: "", hp: p + pLe + 1, hn: pHend - pLe - 1, bp: p + pHend, bn: pCl}
+	let q = Req{Method: method_str(p, pSp1), Path: "", Query: "", hp: p + pLe + 1, hn: pHend - pLe - 1, bp: p + pHend, bn: pCl, tp: p + pTr, tn: pTrLen}
 	let qm = memchr(t, '?', tn)
 	if qm == 0 {
 		q.Path = rt_str_from_raw(t, tn)
@@ -1320,6 +1384,7 @@ fn rebase_request(task i64, delta i64) {
 	let q = cast(Req, task[tUser])
 	q.hp += delta
 	q.bp += delta
+	q.tp += delta
 }
 
 // finish_request completes connection c after its waiting task finished: write the
@@ -1620,6 +1685,154 @@ fn field_name(h i64, l i64) i64 {
 }
 
 // parse_cl parses a Content-Length value (n bytes at p): the length, -1 when it is not a plain decimal number.
+// chunk_scan reads a chunked body (RFC 9112 7.1) from offset at of the n bytes at p: 1 when
+// it is complete (ckLen, ckEnd, ckTr and ckTrEnd say where things are), 0 when more input
+// is needed, -400 when it is malformed and -413 past the body limit. Chunk extensions are
+// skipped; every line ends in CRLF, as a proxy that took a bare LF would frame differently.
+fn chunk_scan(p i64, at i64, n i64) i64 {
+	mut pos = at
+	mut total = 0
+	for {
+		if pos-at > gMaxBody+maxLine {
+			return -413
+		}
+		let e = memchr(p+pos, '\n', n-pos)
+		if e == 0 {
+			if n-pos > maxLine {
+				return -400
+			}
+			return 0
+		}
+		let l = e - (p + pos)
+		if l < 2 || load8(p+pos+l-1) != '\r' {
+			return -400
+		}
+		mut size = 0
+		mut d = 0
+		for d < l-1 && hexval(u8(load8(p+pos+d))) >= 0 {
+			if d >= 15 {
+				return -400
+			}
+			size = size*16 + hexval(u8(load8(p+pos+d)))
+			d += 1
+		}
+		if d == 0 {
+			return -400
+		}
+		if d < l-1 {
+			let x = load8(p + pos + d)
+			if (x != ';' && x != ' ' && x != '\t') || memchr(p+pos+d, '\r', l-1-d) != 0 || memchr(p+pos+d, 0, l-1-d) != 0 {
+				return -400
+			}
+		}
+		pos += l + 1
+		if size == 0 {
+			break
+		}
+		total += size
+		if total > gMaxBody {
+			return -413
+		}
+		if n-pos < size+2 {
+			return 0
+		}
+		if load8(p+pos+size) != '\r' || load8(p+pos+size+1) != '\n' {
+			return -400
+		}
+		pos += size + 2
+	}
+	// The trailer section: field lines like the header block's, then an empty line.
+	let tr = pos
+	for {
+		let e = memchr(p+pos, '\n', n-pos)
+		if e == 0 {
+			if n-tr > maxLine {
+				return -400
+			}
+			return 0
+		}
+		let l = e - (p + pos)
+		if l == 1 && load8(p+pos) == '\r' {
+			ckTrEnd = pos
+			pos += 2
+			break
+		}
+		if l < 2 || load8(p+pos+l-1) != '\r' || pos+l-tr > maxLine {
+			return -400
+		}
+		if field_name(p+pos, l) == 0 || memchr(p+pos, '\r', l-1) != 0 || memchr(p+pos, 0, l-1) != 0 {
+			return -400
+		}
+		pos += l + 1
+	}
+	ckLen = total
+	ckEnd = pos
+	ckTr = tr
+	return 1
+}
+
+// chunked_record is a decoded chunked request at p as replay records it (#349): the request
+// line and header block without Transfer-Encoding, a Content-Length for the decoded body,
+// the trailer fields, the empty line and the body, in a malloc'd buffer of ckRecLen bytes.
+fn chunked_record(p i64) i64 {
+	let b = malloc(pHend + 32 + pTrLen + pCl)
+	memcpy(b, p, pLe+1)
+	mut o = pLe + 1
+	mut pos = pLe + 1
+	for pos < pHend {
+		let e = memchr(p+pos, '\n', pHend-pos)
+		let l = e - (p + pos)
+		if l == 0 || (l == 1 && load8(p+pos) == '\r') {
+			break
+		}
+		let kn = field_name(p+pos, l)
+		if !(kn == 17 && name_is(p+pos, kn, "transfer-encoding")) {
+			memcpy(b+o, p+pos, l+1)
+			o += l + 1
+		}
+		pos += l + 1
+	}
+	let cl = say.Fmt("Content-Length: %d\r\n", pCl)
+	memcpy(b+o, cast(i64, cl)+8, len(cl))
+	o += len(cl)
+	memcpy(b+o, p+pTr, pTrLen)
+	o += pTrLen
+	store8(b+o, '\r')
+	store8(b+o+1, '\n')
+	o += 2
+	memcpy(b+o, p+pHend, pCl)
+	ckRecLen = o + pCl
+	return b
+}
+
+// chunk_decode moves a chunked body that chunk_scan accepted into place: the data of every
+// chunk right after the header block at offset at, then the trailer field lines (ckTr and
+// ckTrEnd move with them). Each move goes down, into bytes already read.
+fn chunk_decode(p i64, at i64) {
+	mut pos = at
+	mut out = at
+	for {
+		let e = memchr(p+pos, '\n', ckEnd-pos)
+		mut size = 0
+		mut d = 0
+		for hexval(u8(load8(p+pos+d))) >= 0 {
+			size = size*16 + hexval(u8(load8(p+pos+d)))
+			d += 1
+		}
+		pos = e - p + 1
+		if size == 0 {
+			break
+		}
+		memmove(p+out, p+pos, size)
+		out += size
+		pos += size + 2
+	}
+	let tn = ckTrEnd - ckTr
+	memmove(p+out, p+ckTr, tn)
+	ckTr = out
+	ckTrEnd = out + tn
+}
+
 fn parse_cl(p i64, n i64) i64 {
 	mut i = 0
 	for i < n && (load8(p+i) == ' ' || load8(p+i) == '\t') {
@@ -1870,10 +2083,21 @@ fn str_int(v i64) str {
 	return str(b)
 }
 
-// Header returns the value of the request header name (any case), or "".
+// Header returns the value of the request header name (any case), or "". A chunked request's
+// trailer fields are read after the header block's.
 fn (q Req) Header(name str) str {
-	mut p = q.hp
-	let end = q.hp + q.hn
+	let v = header_in(q.hp, q.hn, name)
+	if len(v) == 0 && q.tn > 0 {
+		// a chunked body's trailer fields come after the header block's (#349)
+		return header_in(q.tp, q.tn, name)
+	}
+	return v
+}
+
+// header_in is the value of the field name in the n bytes of field lines at hp, or "".
+fn header_in(hp i64, hn i64, name str) str {
+	mut p = hp
+	let end = hp + hn
 	for p < end {
 		let e = memchr(p, '\n', end-p)
 		if e == 0 {
@@ -1955,7 +2179,7 @@ fn (q Req) Hijack() !i64 {
 	return fd
 }
 
-// Body returns the request body.
+// Body returns the request body (a chunked one decoded).
 fn (q Req) Body() str {
 	return rt_str_from_raw(q.bp, q.bn)
 }
