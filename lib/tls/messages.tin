@@ -1,0 +1,438 @@
+package tls
+
+import "seal"
+
+// ---- reading and writing the wire format (RFC 8446 section 3) ----
+
+// rdr reads big-endian fields from b; a read past the end sets bad and gives zeros, so a
+// parser checks bad once at the end (decode_error).
+type rdr struct {
+	b   []u8
+	at  i64
+	bad bool
+}
+
+func (r mut rdr) u8v() i64 {
+	if r.at+1 > len(r.b) {
+		r.bad = true
+		return 0
+	}
+	v := i64(r.b[r.at])
+	r.at++
+	return v
+}
+
+func (r mut rdr) u16v() i64 {
+	if r.at+2 > len(r.b) {
+		r.bad = true
+		return 0
+	}
+	v := i64(r.b[r.at])<<8 | i64(r.b[r.at+1])
+	r.at += 2
+	return v
+}
+
+func (r mut rdr) u24v() i64 {
+	if r.at+3 > len(r.b) {
+		r.bad = true
+		return 0
+	}
+	v := i64(r.b[r.at])<<16 | i64(r.b[r.at+1])<<8 | i64(r.b[r.at+2])
+	r.at += 3
+	return v
+}
+
+// bytes reads n bytes (a view into b).
+func (r mut rdr) bytes(n i64) []u8 {
+	if n < 0 || r.at+n > len(r.b) {
+		r.bad = true
+		return []u8{}
+	}
+	v := r.b[r.at : r.at+n]
+	r.at += n
+	return v
+}
+
+func (r mut rdr) vec8() []u8 {
+	return r.bytes(r.u8v())
+}
+
+func (r mut rdr) vec16() []u8 {
+	return r.bytes(r.u16v())
+}
+
+func (r mut rdr) vec24() []u8 {
+	return r.bytes(r.u24v())
+}
+
+func (r rdr) done() bool {
+	return r.at == len(r.b)
+}
+
+func put16(b mut []u8, v i64) {
+	b = append(b, u8(v>>8), u8(v))
+}
+
+func put24(b mut []u8, v i64) {
+	b = append(b, u8(v>>16), u8(v>>8), u8(v))
+}
+
+// open_len appends a placeholder for an n-byte length and returns where it starts;
+// close_len fills it with the length of what was appended since.
+func open_len(b mut []u8, n i64) i64 {
+	at := len(b)
+	for i := 0; i < n; i++ {
+		b = append(b, 0)
+	}
+	return at
+}
+
+func close_len(b mut []u8, at i64, n i64) {
+	v := len(b) - at - n
+	for i := 0; i < n; i++ {
+		b[at+n-1-i] = u8(v >> (8 * i))
+	}
+}
+
+func cat(a []u8, b []u8) []u8 {
+	out := make([]u8, 0, len(a)+len(b))
+	out = append(out, a...)
+	out = append(out, b...)
+	return out
+}
+
+func clone(a []u8) []u8 {
+	out := make([]u8, len(a))
+	copy(out, a)
+	return out
+}
+
+// ---- handshake message and extension numbers ----
+
+const hsClientHello = 1
+const hsServerHello = 2
+const hsNewSessionTicket = 4
+const hsEncryptedExtensions = 8
+const hsCertificate = 11
+const hsCertificateRequest = 13
+const hsCertificateVerify = 15
+const hsFinished = 20
+const hsKeyUpdate = 24
+const hsMessageHash = 254
+
+const extServerName = 0
+const extSupportedGroups = 10
+const extSignatureAlgorithms = 13
+const extALPN = 16
+const extSupportedVersions = 43
+const extCookie = 44
+const extKeyShare = 51
+const extRecordSizeLimit = 28
+
+const groupX25519 = 0x001d
+const groupP256 = 0x0017
+
+// The SignatureSchemes offered: ECDSA, RSA-PSS and Ed25519 for CertificateVerify, and
+// PKCS #1 v1.5 for certificate signatures only.
+var sigSchemes = []i64{0x0403, 0x0503, 0x0804, 0x0805, 0x0806, 0x0807, 0x0401, 0x0501, 0x0601}
+
+// hrrRandom is the ServerHello.random of a HelloRetryRequest: SHA-256("HelloRetryRequest").
+const hrrRandom = "\xcf\x21\xad\x74\xe5\x9a\x61\x11\xbe\x1d\x8c\x02\x1e\x65\xb8\x91\xc2\xa2\x11\x16\x7a\xbb\x8c\x5e\x07\x9e\x09\xe2\xc8\xa8\x33\x9c"
+
+// is_ip reports whether name is an IP literal (no SNI is sent for one, RFC 6066 section 3).
+func is_ip(name str) bool {
+	if len(name) == 0 {
+		return false
+	}
+	digits := true
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c == ':' {
+			return true
+		}
+		if (c < '0' || c > '9') && c != '.' {
+			digits = false
+		}
+	}
+	return digits
+}
+
+// client_hello encodes a ClientHello. share is the key_share entry (group, key); cookie is the
+// HelloRetryRequest's cookie or empty.
+func client_hello(random []u8, session []u8, suites []i64, name str, alpn []str, group i64, share []u8, cookie []u8) []u8 {
+	b := make([]u8, 0, 512)
+	b = append(b, hsClientHello)
+	body := open_len(mut b, 3)
+	b = append(b, 3, 3)
+	b = append(b, random...)
+	b = append(b, u8(len(session)))
+	b = append(b, session...)
+	put16(mut b, 2*len(suites))
+	for _, s := range suites {
+		put16(mut b, s)
+	}
+	b = append(b, 1, 0)
+	exts := open_len(mut b, 2)
+	if name != "" && !is_ip(name) {
+		put16(mut b, extServerName)
+		e := open_len(mut b, 2)
+		l := open_len(mut b, 2)
+		b = append(b, 0)
+		put16(mut b, len(name))
+		b = append(b, name...)
+		close_len(mut b, l, 2)
+		close_len(mut b, e, 2)
+	}
+	put16(mut b, extSupportedGroups)
+	put16(mut b, 6)
+	put16(mut b, 4)
+	put16(mut b, groupX25519)
+	put16(mut b, groupP256)
+	put16(mut b, extSignatureAlgorithms)
+	put16(mut b, 2+2*len(sigSchemes))
+	put16(mut b, 2*len(sigSchemes))
+	for _, s := range sigSchemes {
+		put16(mut b, s)
+	}
+	if len(alpn) > 0 {
+		put16(mut b, extALPN)
+		e := open_len(mut b, 2)
+		l := open_len(mut b, 2)
+		for _, p := range alpn {
+			b = append(b, u8(len(p)))
+			b = append(b, p...)
+		}
+		close_len(mut b, l, 2)
+		close_len(mut b, e, 2)
+	}
+	put16(mut b, extSupportedVersions)
+	put16(mut b, 3)
+	b = append(b, 2, 3, 4)
+	if len(cookie) > 0 {
+		put16(mut b, extCookie)
+		put16(mut b, 2+len(cookie))
+		put16(mut b, len(cookie))
+		b = append(b, cookie...)
+	}
+	put16(mut b, extKeyShare)
+	put16(mut b, 2+4+len(share))
+	put16(mut b, 4+len(share))
+	put16(mut b, group)
+	put16(mut b, len(share))
+	b = append(b, share...)
+	close_len(mut b, exts, 2)
+	close_len(mut b, body, 3)
+	return b
+}
+
+// serverHello is what the client takes from a ServerHello or HelloRetryRequest.
+type serverHello struct {
+	retry   bool // a HelloRetryRequest
+	suite   i64
+	group   i64  // the key_share group (HelloRetryRequest: the group asked for)
+	share   []u8 // the server's key share (ServerHello)
+	cookie  []u8 // HelloRetryRequest
+	version i64  // supported_versions, 0 when absent
+}
+
+// parse_server_hello reads a ServerHello body; alert is set when it is malformed or not
+// what was offered.
+func parse_server_hello(body []u8, session []u8) !serverHello {
+	r := rdr{b: body}
+	sh := serverHello{share: []u8{}, cookie: []u8{}}
+	legacy := r.u16v()
+	random := r.bytes(32)
+	echo := r.vec8()
+	sh.suite = r.u16v()
+	comp := r.u8v()
+	exts := r.vec16()
+	if r.bad || !r.done() {
+		fail alert_fault(alertDecodeError, "malformed ServerHello")
+	}
+	sh.retry = str(random) == hrrRandom
+	if legacy != 0x0303 || comp != 0 {
+		fail alert_fault(alertIllegalParameter, "ServerHello has a bad legacy version or compression")
+	}
+	if !seal.ConstantTimeEq(echo, session) {
+		fail alert_fault(alertIllegalParameter, "ServerHello does not echo the session id")
+	}
+	seen := make([]i64, 0, 8)
+	er := rdr{b: exts}
+	for !er.bad && !er.done() {
+		typ := er.u16v()
+		data := er.vec16()
+		for _, s := range seen {
+			if s == typ {
+				fail alert_fault(alertIllegalParameter, "ServerHello repeats an extension")
+			}
+		}
+		seen = append(seen, typ)
+		x := rdr{b: data}
+		if typ == extSupportedVersions {
+			sh.version = x.u16v()
+		} else if typ == extKeyShare {
+			sh.group = x.u16v()
+			if !sh.retry {
+				sh.share = x.vec16()
+			}
+		} else if typ == extCookie && sh.retry {
+			sh.cookie = x.vec16()
+			if len(sh.cookie) == 0 {
+				x.bad = true
+			}
+		} else {
+			fail alert_fault(alertUnsupportedExtension, "ServerHello has an extension that was not offered")
+		}
+		if x.bad || !x.done() {
+			fail alert_fault(alertDecodeError, "malformed ServerHello extension")
+		}
+	}
+	if er.bad {
+		fail alert_fault(alertDecodeError, "malformed ServerHello extensions")
+	}
+	if sh.version != 0x0304 {
+		fail alert_fault(alertProtocolVersion, "server does not support TLS 1.3")
+	}
+	return sh
+}
+
+// hello_extensions lists the extension types of a ClientHello message.
+func hello_extensions(ch []u8) []i64 {
+	out := make([]i64, 0, 16)
+	r := rdr{b: ch}
+	r.bytes(4 + 2 + 32)
+	r.vec8()
+	r.vec16()
+	r.vec8()
+	er := rdr{b: r.vec16()}
+	for !r.bad && !er.bad && !er.done() {
+		out = append(out, er.u16v())
+		er.vec16()
+	}
+	return out
+}
+
+// parse_encrypted_extensions returns the negotiated ALPN protocol ("" for none). Only
+// extensions the ClientHello offered (offered) may appear, and of those only the ones
+// EncryptedExtensions may carry (RFC 8446 4.2).
+func parse_encrypted_extensions(body []u8, alpn []str, offered []i64) !str {
+	r := rdr{b: body}
+	exts := r.vec16()
+	if r.bad || !r.done() {
+		fail alert_fault(alertDecodeError, "malformed EncryptedExtensions")
+	}
+	proto := ""
+	seen := make([]i64, 0, 8)
+	er := rdr{b: exts}
+	for !er.bad && !er.done() {
+		typ := er.u16v()
+		data := er.vec16()
+		for _, s := range seen {
+			if s == typ {
+				fail alert_fault(alertIllegalParameter, "EncryptedExtensions repeats an extension")
+			}
+		}
+		seen = append(seen, typ)
+		if !in_list(offered, typ) {
+			fail alert_fault(alertUnsupportedExtension, "EncryptedExtensions has an extension that was not offered")
+		}
+		x := rdr{b: data}
+		if typ == extALPN {
+			list := rdr{b: x.vec16()}
+			p := str(list.vec8())
+			if list.bad || !list.done() || len(p) == 0 {
+				fail alert_fault(alertDecodeError, "malformed ALPN extension")
+			}
+			ok := false
+			for _, a := range alpn {
+				if a == p {
+					ok = true
+				}
+			}
+			if !ok {
+				fail alert_fault(alertIllegalParameter, "server chose an ALPN protocol that was not offered")
+			}
+			proto = p
+		} else if typ == extServerName {
+			if len(data) != 0 {
+				x.bad = true
+			}
+		} else if typ == extSupportedGroups || typ == extRecordSizeLimit {
+			// The server's groups are a hint; a record size limit is only offered by a fixed
+			// ClientHello (the RFC 8448 trace), whose limit is the default.
+			x.at = len(data)
+		} else {
+			fail alert_fault(alertIllegalParameter, "EncryptedExtensions has an extension it must not carry")
+		}
+		if x.bad || !x.done() {
+			fail alert_fault(alertDecodeError, "malformed EncryptedExtensions extension")
+		}
+	}
+	if er.bad {
+		fail alert_fault(alertDecodeError, "malformed EncryptedExtensions")
+	}
+	return proto
+}
+
+// parse_certificate returns the certificate chain (DER, leaf first) of a server Certificate.
+func parse_certificate(body []u8) ![][]u8 {
+	r := rdr{b: body}
+	ctx := r.vec8()
+	list := r.vec24()
+	if r.bad || !r.done() {
+		fail alert_fault(alertDecodeError, "malformed Certificate")
+	}
+	if len(ctx) != 0 {
+		fail alert_fault(alertIllegalParameter, "server Certificate has a request context")
+	}
+	certs := make([][]u8, 0, 4)
+	lr := rdr{b: list}
+	for !lr.bad && !lr.done() {
+		der := lr.vec24()
+		lr.vec16()
+		if len(der) == 0 {
+			lr.bad = true
+		}
+		certs = append(certs, der)
+	}
+	if lr.bad {
+		fail alert_fault(alertDecodeError, "malformed certificate list")
+	}
+	if len(certs) == 0 {
+		fail alert_fault(alertDecodeError, "server sent no certificate")
+	}
+	return certs
+}
+
+// parse_certificate_request returns the request context (the client answers with an empty
+// Certificate carrying it).
+func parse_certificate_request(body []u8) ![]u8 {
+	r := rdr{b: body}
+	ctx := r.vec8()
+	r.vec16()
+	if r.bad || !r.done() {
+		fail alert_fault(alertDecodeError, "malformed CertificateRequest")
+	}
+	return ctx
+}
+
+// cv_content is what a server's CertificateVerify signs (RFC 8446 section 4.4.3).
+func cv_content(transcript []u8) []u8 {
+	b := make([]u8, 0, 64+34+len(transcript))
+	for i := 0; i < 64; i++ {
+		b = append(b, 0x20)
+	}
+	b = append(b, "TLS 1.3, server CertificateVerify"...)
+	b = append(b, 0)
+	b = append(b, transcript...)
+	return b
+}
+
+// handshake_msg wraps body in a handshake header of type typ.
+func handshake_msg(typ i64, body []u8) []u8 {
+	b := make([]u8, 0, 4+len(body))
+	b = append(b, u8(typ))
+	put24(mut b, len(body))
+	b = append(b, body...)
+	return b
+}

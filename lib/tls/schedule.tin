@@ -1,0 +1,91 @@
+package tls
+
+import "seal"
+
+// ---- cipher suites and the key schedule (RFC 8446 sections 7.1 and 7.3) ----
+
+// TLS_AES_128_GCM_SHA256 is cipher suite 0x1301 (Conn.CipherSuite).
+const TLS_AES_128_GCM_SHA256 = 0x1301
+
+// TLS_AES_256_GCM_SHA384 is cipher suite 0x1302.
+const TLS_AES_256_GCM_SHA384 = 0x1302
+
+// TLS_CHACHA20_POLY1305_SHA256 is cipher suite 0x1303.
+const TLS_CHACHA20_POLY1305_SHA256 = 0x1303
+
+// suites lists the cipher suites offered, most preferred first: AES-GCM first on a CPU with
+// AES instructions, ChaCha20-Poly1305 first without them.
+func suites() []i64 {
+	if seal.AESHardware() {
+		return []i64{TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256}
+	}
+	return []i64{TLS_CHACHA20_POLY1305_SHA256, TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384}
+}
+
+func suite_hash(s i64) seal.Hash {
+	if s == TLS_AES_256_GCM_SHA384 {
+		return seal.Hash.SHA384
+	}
+	return seal.Hash.SHA256
+}
+
+func suite_key_len(s i64) i64 {
+	if s == TLS_AES_128_GCM_SHA256 {
+		return 16
+	}
+	return 32
+}
+
+func suite_aead(s i64, key []u8) !seal.AEAD {
+	if s == TLS_CHACHA20_POLY1305_SHA256 {
+		return try seal.NewChaCha20Poly1305(key)
+	}
+	return try seal.NewAESGCM(key)
+}
+
+// traffic_keys is the record key and IV of a traffic secret.
+func traffic_keys(s i64, h seal.Hash, secret []u8) !([]u8, []u8) {
+	key := try seal.HkdfExpandLabel(h, str(secret), "key", "", suite_key_len(s))
+	iv := try seal.HkdfExpandLabel(h, str(secret), "iv", "", 12)
+	return key, iv
+}
+
+// derive_secret is Derive-Secret(secret, label, messages) given the messages' hash.
+func derive_secret(h seal.Hash, secret []u8, label str, hash []u8) ![]u8 {
+	return try seal.HkdfExpandLabel(h, str(secret), label, str(hash), seal.Size(h))
+}
+
+// transcript_hash is the hash of the handshake messages so far.
+func transcript_hash(h seal.Hash, transcript []u8) []u8 {
+	return seal.Sum(h, str(transcript))
+}
+
+// finished_mac is the verify_data of a Finished message for a traffic secret.
+func finished_mac(h seal.Hash, secret []u8, thash []u8) ![]u8 {
+	key := try seal.HkdfExpandLabel(h, str(secret), "finished", "", seal.Size(h))
+	return seal.Hmac(h, str(key), str(thash))
+}
+
+// schedule holds the secrets of one handshake.
+type schedule struct {
+	h         seal.Hash
+	handshake []u8
+	master    []u8
+	chs       []u8
+	shs       []u8
+}
+
+// handshake_secrets runs the schedule up to the handshake traffic secrets: early secret
+// (no PSK), handshake secret from the shared secret, then the two traffic secrets over the
+// transcript through ServerHello.
+func handshake_secrets(h seal.Hash, shared []u8, thash []u8) !schedule {
+	zero := make([]u8, seal.Size(h))
+	early := seal.HkdfExtract(h, str(zero), str(zero))
+	derived := try derive_secret(h, early, "derived", seal.Sum(h, ""))
+	hs := seal.HkdfExtract(h, str(derived), str(shared))
+	chs := try derive_secret(h, hs, "c hs traffic", thash)
+	shs := try derive_secret(h, hs, "s hs traffic", thash)
+	derived2 := try derive_secret(h, hs, "derived", seal.Sum(h, ""))
+	master := seal.HkdfExtract(h, str(derived2), str(zero))
+	return schedule{h: h, handshake: hs, master: master, chs: chs, shs: shs}
+}

@@ -105,10 +105,11 @@ rt_ingot_alloc(n), rt_core_id(), rt_errno(). Prefer plain Tin over raw tricks un
 Keep comments one line, ending with a period.
 
 ## Standard library (import instead of re-implementing)
-say(fmt) twine(strings) glyph(utf8) mint(strconv) argo(JSON) anvil(HTTP server, router) wire(TCP, HTTP client)
+say(fmt) twine(strings) glyph(utf8) mint(strconv) argo(JSON) anvil(HTTP server, router) wire(TCP, HTTP(S) client)
+tls(TLS 1.3 client)
 hearth(cores) relay(cross-core messages) tide(time) quarry(os/files/env) trail(paths) lever(flags/args)
-sift(sort/search) cairn(containers) gauge(math) dice(random) stamp(non-crypto hashes) seal(SHA-256,
-HMAC, base64, hex, RSA-OAEP) ore(bytes) flume(buffered I/O) herald(logging) crucible(testing)
+sift(sort/search) cairn(containers) gauge(math) dice(random) stamp(non-crypto hashes) seal(SHA-2,
+HMAC, HKDF, AES-GCM, ChaCha20-Poly1305, X25519, P-256, base64, hex, RSA-OAEP) ore(bytes) flume(buffered I/O) herald(logging) crucible(testing)
 redis(Redis client) mysql(MySQL client) websocket(WebSocket server via anvil, and client). Signatures:
 docs/STDLIB.md.
 

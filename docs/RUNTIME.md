@@ -534,6 +534,33 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   retain all messages must manage their pool lifetime explicitly; `Each` is the stream
   API that supplies a safe per-message lifetime.
 
+### TLS connections: tls (#124)
+
+- `tls.Dial` connects with `wire` and runs the TLS 1.3 handshake on the socket; `tls.Client`
+  runs it over a `wire.Conn` that already exists. All I/O is the socket's non-blocking
+  `read`/`write` with `rt_task_wait` on `EAGAIN`, as for `wire`, so a handshake or a read waits
+  without holding the core; `Config.Timeout` bounds connect plus handshake, `SetTimeout` each
+  later wait, `SetDeadline` all of them, and a request's deadline or cancellation ends any of
+  them with `rt_wait_fault()`. The CPU work of a handshake (one X25519 or P-256 operation,
+  key derivation) runs on the core.
+- Memory: a `Conn` makes its record buffers (16 KiB + 256 bytes in, 16 KiB of decrypted data)
+  at the handshake and afterwards changes only in place: KeyUpdate rewrites the AEAD's keys
+  with `seal.AEAD.Rekey`, IVs and secrets are copied into the slices it has. So a `Conn` is
+  valid in whatever region holds it: the request pool for `wire.Get`, the caller's pool for a
+  `websocket` client (whose per-message pools come and go under it), or `keep()`'s heap for a
+  client that keeps connections across requests. Each `Read` or `Write` allocates its
+  temporaries (a record's ciphertext or plaintext) in the current pool.
+- Records: at most 16 KiB of plaintext; writes are sealed and sent in one `write`. After
+  2^24 records under one key the client sends KeyUpdate itself. Alerts are sent encrypted
+  once the handshake keys exist; a fatal alert or fault closes the socket and every later
+  call returns the same fault.
+- Verification is on by default and cannot be turned off by accident: until X.509 lands
+  (phase 2), `verify_peer` refuses every server unless `InsecureSkipVerify` is set.
+- `wire.DoWith` takes `https://` (port 443 by default) with `Options.TLS`; the response reader
+  is generic over a private `stream` shape, so the same code reads a `wire.Conn` and a
+  `tls.Conn`. `websocket.Dial` takes `wss://` (`DialTLS` with a `tls.Config`): the
+  connection's `fill` and `write_raw` go through the `tls.Conn` held in its state.
+
 ### Pooled clients: mysql (v0.4)
 
 - MySQL answers one statement at a time per connection, so each core keeps a pool per
@@ -729,6 +756,7 @@ functions keep that rule, and grows as phase 1 lands.
 | function | constant-time in | not constant-time in |
 |---|---|---|
 | `Sha256`, `Sha384`, `Sha512`, `Sum` | the message bytes | its length |
+| `tls`: record protection, the Finished check (`ConstantTimeEq`), the key schedule | keys, secrets, data and MACs | lengths, and the padding length of a received record |
 | `Hmac`, `HmacSha256` | the key and message bytes | their lengths |
 | `HkdfExtract`, `HkdfExpand`, `HkdfExpandLabel` | the key material | lengths, `info`, labels |
 | `ConstantTimeEq`, `Equal` | the bytes | the lengths |

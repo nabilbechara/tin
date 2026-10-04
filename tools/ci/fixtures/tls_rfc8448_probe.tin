@@ -1,0 +1,177 @@
+// Injected into a copy of lib/tls by tools/ci/tls_check.py: the client handshake against the
+// RFC 8448 section 3 trace ("Simple 1-RTT Handshake"). The probe plays the server with the
+// trace's records over a loopback socket, gives the client the trace's ClientHello and X25519
+// key, and checks every byte the client sends against the trace and the trace's keys.
+// Trace values via Erlang/OTP lib/ssl/test/tls_1_3_record_SUITE.erl, which quotes RFC 8448.
+package tls
+
+import "say"
+import "seal"
+import "wire"
+
+var rfcClientHello = "010000c00303cb34ecb1e78163ba1c38c6dacb196a6dffa21a8d9912ec18a2ef6283024dece700000613011303130201" +
+	"0000910000000b0009000006736572766572ff01000100000a00140012001d0017001800190100010101020103010400" +
+	"230000003300260024001d002099381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c002b00" +
+	"03020304000d0020001e040305030603020308040805080604010501060102010402050206020202002d00020101001c" +
+	"00024001"
+var rfcServerHelloRecord = "160303005a020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e269280013010000" +
+	"2e00330024001d0020c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304"
+var rfcEncryptedExtensions = "080000240022000a00140012001d00170018001901000101010201030104001c0002400100000000"
+var rfcCertificate = "0b0001b9000001b50001b0308201ac30820115a003020102020102300d06092a864886f70d01010b0500300e310c300a" +
+	"06035504031303727361301e170d3136303733303031323335395a170d3236303733303031323335395a300e310c300a" +
+	"0603550403130372736130819f300d06092a864886f70d010101050003818d0030818902818100b4bb498f8279303d98" +
+	"0836399b36c6988c0c68de55e1bdb826d3901a2461eafd2de49a91d015abbc9a95137ace6c1af19eaa6af98c7ced4312" +
+	"0998e187a80ee0ccb0524b1b018c3e0b63264d449a6d38e22a5fda430846748030530ef0461c8ca9d9efbfae8ea6d1d0" +
+	"3e2bd193eff0ab9a8002c47428a6d35a8d88d79f7f1e3f0203010001a31a301830090603551d1304023000300b060355" +
+	"1d0f0404030205a0300d06092a864886f70d01010b05000381810085aad2a0e5b9276b908c65f73a7267170618a54c5f" +
+	"8a7b337d2df7a594365417f2eae8f8a58c8f8172f9319cf36b7fd6c55b80f21a03015156726096fd335e5e67f2dbf102" +
+	"702e608ccae6bec1fc63a42a99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0a8b2f759409ba3eac9d91d402dcc0cc8" +
+	"f8961229ac9187b42b4de10000"
+var rfcCertificateVerify = "0f000084080400805a747c5d88fa9bd2e55ab085a61015b7211f824cd484145ab3ff52f1fda8477b0b7abc90db78e2d3" +
+	"3a5c141a078653fa6bef780c5ea248eeaaa785c4f394cab6d30bbe8d4859ee511f602957b15411ac027671459e46445c" +
+	"9ea58c181e818e95b8c3fb0bf3278409d3be152a3da5043e063dda65cdf5aea20d53dfacd42f74f3"
+var rfcServerFinished = "140000209b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718"
+var rfcClientFinished = "14000020a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61"
+var rfcServerHsKey = "3fce516009c21727d0f2e4e86ee403bc"
+var rfcServerHsIV = "5d313eb2671276ee13000b30"
+var rfcClientHsKey = "dbfaa693d1762c5b666af5d950258d01"
+var rfcClientHsIV = "5bd3c71b836e0b76bb73265f"
+var rfcServerApKey = "9f02283b6c9c07efc26bb9f2ac92e356"
+var rfcServerApIV = "cf782b88dd83549aadf1e984"
+var rfcClientApKey = "17422dda596ed5d9acd890e3c63f5051"
+var rfcClientApIV = "5b78923dee08579033e523d9"
+var rfcServerApSecret = "a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643"
+var rfcClientApSecret = "9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5"
+var rfcClientPrivate = "49af42ba7f7994852d713ef2784bcbcaa7911de26adc5642cb634540e7ea5005"
+
+func hexb(s str) []u8 {
+	b, err := seal.HexDecode(s)
+	if err != nil {
+		panic("probe: bad hex")
+	}
+	return b
+}
+
+// probe_seal encrypts one record the way the trace's server does.
+func probe_seal(key str, iv str, seq u64, typ u8, data []u8) []u8 {
+	inner := cat(data, []u8{typ})
+	n := len(inner) + 16
+	hdr := []u8{23, 3, 3, u8(n >> 8), u8(n)}
+	a := seal.NewAESGCM(hexb(key)) catch _ {
+		panic("probe: key")
+	}
+	ct := a.Seal(nonce(hexb(iv), seq), inner, hdr) catch _ {
+		panic("probe: seal")
+	}
+	return cat(hdr, ct)
+}
+
+// probe_open reads one record from srv and decrypts it with a trace key.
+func probe_open(srv wire.Conn, key []u8, iv []u8, seq u64) str {
+	hs := srv.ReadFull(5) catch e {
+		return say.Fmt("read: %v", e)
+	}
+	hdr := []u8(hs)
+	n := i64(hdr[3])<<8 | i64(hdr[4])
+	bs := srv.ReadFull(n) catch e {
+		return say.Fmt("read: %v", e)
+	}
+	body := []u8(bs)
+	a := seal.NewAESGCM(key) catch _ {
+		return "key"
+	}
+	pt := a.Open(nonce(iv, seq), body, hdr) catch _ {
+		return "bad record MAC"
+	}
+	return seal.Hex(pt)
+}
+
+func next_secret(s []u8) []u8 {
+	return seal.HkdfExpandLabel(seal.Hash.SHA256, str(s), "traffic upd", "", 32) catch _ {
+		[]u8{}
+	}
+}
+
+// RFC8448 prints one line per check.
+func RFC8448() {
+	l := wire.Listen("127.0.0.1:0") catch e {
+		say.Line("listen", e)
+		return
+	}
+	tcp := wire.Dial(say.Fmt("127.0.0.1:%d", l.Port())) catch e {
+		say.Line("dial", e)
+		return
+	}
+	srv := l.Accept() catch e {
+		say.Line("accept", e)
+		return
+	}
+	// The server's flight: ServerHello in the clear, then EncryptedExtensions, Certificate,
+	// CertificateVerify and Finished in one record under the server handshake key.
+	flight := cat(cat(hexb(rfcEncryptedExtensions), hexb(rfcCertificate)), cat(hexb(rfcCertificateVerify), hexb(rfcServerFinished)))
+	srv.WriteBytes(cat(hexb(rfcServerHelloRecord), probe_seal(rfcServerHsKey, rfcServerHsIV, 0, 22, flight))) catch e {
+		say.Line("write", e)
+	}
+	ch := hexb(rfcClientHello)
+	hi := hello{random: ch[6:38], session: []u8{}, x25519: hexb(rfcClientPrivate), raw: ch}
+	c := start(tcp, Config{InsecureSkipVerify: true}, "server", hi) catch e {
+		say.Line("handshake", e)
+		return
+	}
+	say.Line("handshake ok", c.CipherSuite() == TLS_AES_128_GCM_SHA256, c.Group())
+	ss := srv.ReadFull(5 + len(ch)) catch _ { "" }
+	sent := []u8(ss)
+	say.Line("client hello sent as given", len(sent) == 5+len(ch) && seal.Hex(sent[5:]) == rfcClientHello)
+	say.Line("client Finished", probe_open(srv, hexb(rfcClientHsKey), hexb(rfcClientHsIV), 0) == rfcClientFinished+"16")
+	// Application data both ways under the trace's application keys, after a NewSessionTicket
+	// that the client skips.
+	ticket := handshake_msg(hsNewSessionTicket, hexb("0000001efad6aac502000000080000000000000000" + "0000"))
+	srv.WriteBytes(cat(probe_seal(rfcServerApKey, rfcServerApIV, 0, 22, ticket), probe_seal(rfcServerApKey, rfcServerApIV, 1, 23, []u8("pong")))) catch _ {}
+	buf := make([]u8, 0, 16)
+	c.Read(mut buf, 16) catch e {
+		say.Line("read", e)
+	}
+	say.Line("server data after a ticket", str(buf))
+	c.Write("ping") catch e {
+		say.Line("write", e)
+	}
+	say.Line("client data", probe_open(srv, hexb(rfcClientApKey), hexb(rfcClientApIV), 0) == seal.Hex([]u8("ping"))+"17")
+	// KeyUpdate asking for one back: the client answers under its old key, then uses the next.
+	srv.WriteBytes(probe_seal(rfcServerApKey, rfcServerApIV, 2, 22, handshake_msg(hsKeyUpdate, []u8{1}))) catch _ {}
+	s2 := next_secret(hexb(rfcServerApSecret))
+	sk, siv, kesk := traffic_keys(TLS_AES_128_GCM_SHA256, seal.Hash.SHA256, s2)
+	if kesk != nil {
+		panic("probe: keys")
+	}
+	srv.WriteBytes(probe_seal(seal.Hex(sk), seal.Hex(siv), 0, 23, []u8("after update"))) catch _ {}
+	buf = buf[:0]
+	c.Read(mut buf, 64) catch e {
+		say.Line("read", e)
+	}
+	say.Line("server data after KeyUpdate", str(buf))
+	say.Line("client KeyUpdate", probe_open(srv, hexb(rfcClientApKey), hexb(rfcClientApIV), 1) == "1800000100"+"16")
+	c2 := next_secret(hexb(rfcClientApSecret))
+	ck, civ, keck := traffic_keys(TLS_AES_128_GCM_SHA256, seal.Hash.SHA256, c2)
+	if keck != nil {
+		panic("probe: keys")
+	}
+	c.Write("on the new key") catch _ {}
+	say.Line("client data after KeyUpdate", probe_open(srv, ck, civ, 0) == seal.Hex([]u8("on the new key"))+"17")
+	c.Close()
+	say.Line("close_notify", probe_open(srv, ck, civ, 1) == "010015")
+	// A changed byte in a record is bad_record_mac, sent as an alert, and the end of the Conn.
+	tcp2 := wire.Dial(say.Fmt("127.0.0.1:%d", l.Port())) catch e {
+		say.Line("dial", e)
+		return
+	}
+	srv2 := l.Accept() catch _ {
+		return
+	}
+	bad := cat(hexb(rfcServerHelloRecord), probe_seal(rfcServerHsKey, rfcServerHsIV, 0, 22, flight))
+	bad[len(bad)-20] ^= 1
+	srv2.WriteBytes(bad) catch _ {}
+	_, err := start(tcp2, Config{InsecureSkipVerify: true}, "server", hi)
+	say.Line("tampered record", err)
+	srv2.ReadFull(5 + len(ch)) catch _ {}
+	say.Line("bad_record_mac alert under the client handshake key", probe_open(srv2, hexb(rfcClientHsKey), hexb(rfcClientHsIV), 0) == "021415")
+}

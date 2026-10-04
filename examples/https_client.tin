@@ -1,0 +1,38 @@
+package main
+
+import "quarry"
+import "say"
+import "tls"
+import "wire"
+
+// An HTTPS client: fetch a URL over TLS 1.3 with wire, then talk TLS directly.
+//   tin examples/https_client.tin https://example.com/
+// The server's certificate is checked against the system's roots for the URL's host.
+func main() {
+	args := quarry.Args()
+	url := "https://example.com/"
+	if len(args) > 1 {
+		url = args[1]
+	}
+	r := wire.DoWith("GET", url, []str{}, "", wire.Options{Timeout: 10 * 1000000000}) catch err {
+		say.Line("GET failed:", err)
+		return
+	}
+	say.Line("status", r.Status, "bytes", len(r.Body), "content type", r.Header("Content-Type"))
+
+	// The same over a tls.Conn: ALPN, then HTTP/1.1 by hand.
+	c := tls.Dial("example.com:443", tls.Config{ALPN: []str{"http/1.1"}, Timeout: 10 * 1000000000}) catch err {
+		say.Line("dial failed:", err)
+		return
+	}
+	say.Line("negotiated", c.ALPN(), c.Group())
+	c.Write("HEAD / HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n") catch err {
+		say.Line("write failed:", err)
+	}
+	head := make([]u8, 0, 4096)
+	c.Read(mut head, 4096) catch err {
+		say.Line("read failed:", err)
+	}
+	say.Line(str(head))
+	c.Close()
+}

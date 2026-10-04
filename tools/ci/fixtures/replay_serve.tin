@@ -1,0 +1,59 @@
+package main
+
+import "anvil"
+import "fault"
+import "quarry"
+import "replayserve"
+import "tide"
+
+// A checkout service for replay_check.py (#242): it reads the cart, then charges the payment
+// service; a failed charge is a 500. CHECKOUT_SWAP=1 charges before reading the cart; ?wait=1
+// waits first (the request task parks and resumes), ?panic=1 panics after the charge.
+
+func cart(id str) !str {
+	return try replayserve.Effect("redis@1", "GET cart:" + id)
+}
+
+func charge(items str) !str {
+	return try replayserve.Effect("wire.http@1", "POST http://payments/charge\n\ncart=" + items)
+}
+
+func checkout(q anvil.Req, w mut anvil.Out) {
+	id := q.PathParam("id")
+	items := ""
+	if q.Param("wait") == "1" {
+		err := tide.Wait(20000000)
+		if err != nil {
+			w.Status(503)
+			return
+		}
+	}
+	if quarry.Getenv("CHECKOUT_SWAP") != "1" {
+		items = cart(id) catch err {
+			w.Status(502)
+			w.Text("cart: " + fault.Message(err) + "\n")
+			return
+		}
+	}
+	paid := charge(items) catch err {
+		w.Status(500)
+		if fault.Is(err, fault.DeadlineExceeded) {
+			w.Status(504)
+		}
+		w.Text("charge failed: " + fault.Message(err) + " (live calls {replayserve.LiveCalls()})\n")
+		return
+	}
+	if q.Param("panic") == "1" {
+		panic("checkout: paid " + paid)
+	}
+	w.Text("paid: " + paid + " for " + items + " (live calls {replayserve.LiveCalls()})\n")
+}
+
+func main() {
+	r := anvil.NewRouter()
+	r.Post(`/checkout/{id}`, checkout)
+	err := r.Serve(":8080")
+	if err != nil {
+		panic(fault.Message(err))
+	}
+}
