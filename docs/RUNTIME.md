@@ -661,6 +661,7 @@ functions keep that rule, and grows as phase 1 lands.
 | `ConstantTimeEq`, `Equal` | the bytes | the lengths |
 | `X25519`, `X25519PublicKey` | the scalar and the point (ladder with masked swaps; ten-limb field) | the final all-zero check, whose result is public |
 | `ChaCha20`, `AEAD.Seal` and `AEAD.Open` for ChaCha20-Poly1305 | the key, the data and the tag (the tag is compared with `ConstantTimeEq`) | the lengths |
+| `NewAESGCM`, `AEAD.Seal` and `AEAD.Open` for AES-GCM (software path: bitsliced AES with the S-box as GF(2^8) inversion, GHASH by multiplication with holes) | the key, the data and the tag | the lengths |
 | `P256PublicKey`, `P256ECDH` and the field and point code under them (`field.tin`, `p256.tin`) | the private key and every coordinate | the validity checks of the key and the peer's point, whose results are public |
 
 | `monty_new` (`bignum.tin`: Montgomery constants for a modulus given at run time) | the modulus's value | its limb count and bit length |
