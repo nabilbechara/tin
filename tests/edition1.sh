@@ -22,10 +22,13 @@ do
 	fi
 done
 
-"$compiler" -S -o "$tmp/edition0.out" tests/edition1/paired_edition0.tin >"$tmp/edition0.s"
+# Edition 0 is retired (#226): its C loops reach the compiler through tin fix, as range loops
+# that compile exactly like the ones written in edition 1.
+"$compiler" -fix -edition 1 tests/edition1/paired_edition0.tin >"$tmp/paired_fixed.tin"
+"$compiler" -edition 1 -S -o "$tmp/edition0.out" "$tmp/paired_fixed.tin" >"$tmp/edition0.s"
 "$compiler" -edition 1 -S -o "$tmp/edition1.out" tests/edition1/paired_edition1.tin >"$tmp/edition1.s"
 if ! cmp -s "$tmp/edition0.s" "$tmp/edition1.s"; then
-	echo "FAIL edition 1 parser: edition 0 and edition 1 range-loop assembly differs"
+	echo "FAIL edition 1 parser: translated edition 0 and edition 1 range-loop assembly differs"
 	diff -u "$tmp/edition0.s" "$tmp/edition1.s" || true
 	exit 1
 fi
@@ -317,11 +320,10 @@ if ! cmp -s tests/edition1/fix/translate_ed1.tin "$tmp/translate_again.tin"; the
 	diff -u tests/edition1/fix/translate_ed1.tin "$tmp/translate_again.tin" || true
 	exit 1
 fi
-"$compiler" -o "$tmp/translate0" tests/edition1/fix/translate.tin
+# translate.out is what the edition 0 program printed before edition 0 was retired (#226).
 "$compiler" -edition 1 -o "$tmp/translate1" tests/edition1/fix/translate_ed1.tin
-"$tmp/translate0" >"$tmp/translate0.out"
 "$tmp/translate1" >"$tmp/translate1.out"
-for side in translate0 translate1
+for side in translate1
 do
 	if ! cmp -s tests/edition1/fix/translate.out "$tmp/$side.out"; then
 		echo "FAIL edition1/fix/translate: $side output differs"
@@ -329,5 +331,18 @@ do
 		exit 1
 	fi
 done
+
+# Edition 0 is retired (#226): the compiler refuses it and names tin fix; tin fix still reads it.
+if "$compiler" -o "$tmp/retired" tests/edition1/edition0_retired.tin >"$tmp/retired.out" 2>"$tmp/retired.err"; then
+	echo "FAIL edition1/edition0_retired: unexpectedly accepted"
+	exit 1
+fi
+if ! cmp -s tests/edition1/edition0_retired.err "$tmp/retired.err"; then
+	echo "FAIL edition1/edition0_retired: diagnostic mismatch"
+	diff -u tests/edition1/edition0_retired.err "$tmp/retired.err" || true
+	exit 1
+fi
+"$compiler" -fix -edition 1 tests/edition1/edition0_retired.tin >"$tmp/retired_fixed.tin"
+"$compiler" -edition 1 -parse-only "$tmp/retired_fixed.tin"
 
 echo "PASS edition 1 parser"

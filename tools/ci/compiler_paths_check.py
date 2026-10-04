@@ -27,7 +27,7 @@ def main():
         (work/'launcher').symlink_to('tree link/bin/tinc')
         (work/'launcher chain').symlink_to('launcher')
         source=work/'hello.tin'
-        source.write_text('package main\nimport "say"\nfunc main() { say.Line("path discovery λ") }\n')
+        source.write_text('package main\nimport "say"\nfn main() { say.Line("path discovery λ") }\n')
         env=dict(os.environ)
         env.pop('TIN_ROOT',None)
         unrelated=work/'unrelated';unrelated.mkdir()
