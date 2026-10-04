@@ -39,8 +39,8 @@ for the thread's whole life (callee-saved in both ABIs, so C code never disturbs
 | 4 | ctxID | the core number |
 | 6 | ctxIngot | 1 while initializers run: allocations go to the ingot heap |
 | 7, 8, 9 | ctxPoolBase, ctxPoolMark, ctxPoolExtra | the pool's first chunk, its high-water mark, overflow chunks and big blocks |
-| 10–25 | ctxFree | ingot free lists, one per size class |
-| 26, 27 | ctxSlab, ctxSlabEnd | ingot slab bump |
+| 11 | vector mode | x86-64 AVX2 capability after CPUID/OSXSAVE/XGETBV checks; zero on arm64 |
+| 10, 12–31 | reserved | preserve compiler offsets; heap state is a per-core global |
 | 32+ | | the core's copy of every per-core global (global i at word 32+i) |
 
 Context blocks are allocated on their own 128-byte cache lines (`rt_aligned_alloc`) so
@@ -61,12 +61,32 @@ cores never share a line.
   create it after.
 - Plain programs never reset: they release everything at exit.
 
-**Ingot heap.** `rt_ingot_alloc(n)` serves blocks from 16 size classes (16, 32, 48, 64,
-96, 128, 192, 256 ... 3072, 4096 bytes including an 8-byte class header):
-- a block is taken from the class's free list, or else carved from a 1 MiB slab;
-- bigger blocks come from calloc with a -1 header;
-- `rt_ingot_free(p)` pushes a block onto its core's free list. Maps in the ingot heap
-  free their old tables when they grow. Blocks never cross cores.
+**Ingot heap.** `rt_ingot_alloc(n)` returns zeroed, 16-byte-aligned memory from the
+core's mmap heap. The 16 classes are 16, 32, 48, 64, 96, 128, 192, 256 ... 3072,
+4096 bytes, including a 16-byte `[owning heap, requested size]` header. Local free
+lists and 1 MiB slab bump sources live in the heap's own page mapping. Larger blocks
+have a page-rounded mapping of their own; `rt_ingot_free(p)` releases them with
+`munmap`. Request pool chunks use the same checked mapping allocator.
+
+`rt_ingot_free(p)` returns a small block directly when called on its owning core.
+A different core appends it to the owner's return queue under an atomic lock; the
+owner drains that queue before allocating. Blocks remain tied to their owner even
+when returned elsewhere. Heap pages and slabs live for the process lifetime; owner
+retirement and long-lived slab reclamation belong to #176. Maps release their old
+ingot tables when they grow. The compiler uses the same memory core with a single heap.
+
+Every allocation and mapping checks its size and failure result. Failure writes
+`tin: out of memory (N bytes)` to stderr from static bytes and stack words, then exits
+with status 2. This path creates no context, pool, format frame or heap block.
+Memory leaves use bounded NEON on arm64 and SSE2 on x86-64. Strict x86-64 programs
+cache AVX2 availability in context word 11 after checking CPU support and OS-managed
+XMM/YMM state. Medium forward copies and long comparisons/scans use AVX2 when available;
+small operations and unsupported CPUs retain SSE2. Legacy compiler programs never read
+a Tin context register. `TIN_ALLOC_TEST=1 TIN_MEMORY_SCALAR=1` forces the SSE2 path for
+correctness checks.
+
+`TIN_ALLOC_TEST=1` enables the test-only `TIN_FAIL_ALLOC_AFTER=N` counter, including
+startup allocations and mappings. Without that explicit flag the variable is ignored.
 
 **Initialization.**
 - `rt_init` creates core 0's context in ingot mode.
@@ -116,8 +136,8 @@ fires. Messages are copied into the receiver's request pool.
   by static type (`rt_fmt_i`, `_u`, `_s`, `_f`, `_b`, `_e`, slices, maps, structs).
 - Floats are printed in their shortest exact form. A fast path finds the fewest decimals
   k for which rint(|x|·10^k)/10^k == |x|, exact for values below 2^53. Otherwise
-  `num_shortest` (lib/runtime/number.tin) picks the shortest decimal inside the exact
-  rounding interval of the adjacent floats, in integer arithmetic (Go's algorithm).
+  the integer-only conversion core finds the shortest decimal in the interval between
+  adjacent floats. Precision formats use exact decimal shifts and nearest-even rounding.
   `rt_float_json` uses JSON's exponent rule.
 
 ## 7. Panics and backtraces
@@ -270,7 +290,14 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   the handler do not run (that needs unwinding: `guard`, #142), and a panic outside a request
   (main, a tick, a relay handler) or a stack overflow still ends the process.
 - A connection closed while its request waits is marked dead and freed when the task ends.
-- Finished tasks go on a per-core free list with their stacks and pools.
+- Finished tasks free overflow pool chunks and big blocks. Each core caches at most
+  64 task records; excess records release their base pool and unmap their stacks.
+  Heavy cached tasks discard complete base-pool and stack pages with
+  `madvise(MADV_DONTNEED)`; stack mappings are released if advice fails. Headers and
+  pool boundary pages remain intact. Light tasks reuse their zeroed pools and stack
+  pages without an extra syscall per request. Stale timer entries are invalidated
+  before a task record is released or reused. The 300-request burst check exercises
+  deep suspended stacks and dirty overflow pools, then verifies the Linux RSS bound.
 
 ### Non-blocking I/O and helper threads (v0.4)
 
