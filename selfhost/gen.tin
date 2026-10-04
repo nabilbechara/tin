@@ -2225,6 +2225,11 @@ fn gen_branch(e, target, d, when_true) {
         return;
     }
     let k = e[N_KIND];
+    if k == EX_SEQ {
+        gen_stmts(e[SEQ_STMTS]);
+        gen_branch(e[SEQ_VALUE], target, d, when_true);
+        return;
+    }
     if k == EX_UNARY && streq(e[UN_OP], "!") {
         gen_branch(e[UN_X], target, d, !when_true);
         return;
@@ -2648,6 +2653,8 @@ fn gen_stmt(s) {
         gen_assign(s);
     } else if k == ST_EXPR {
         gen_effect(s[ES_X]);
+    } else if k == ST_IF && try_if_increment(s) {
+        // The condition flags drive the backend's conditional increment.
     } else if k == ST_IF && try_select(s) {
         // done: both arms computed and picked with csel
     } else if k == ST_IF {
@@ -2795,10 +2802,112 @@ fn single_reg_assign(b) {
     return s;
 }
 
+// read_only_expr accepts pure expressions and checker-created sequences that only bind
+// local temporaries. It excludes calls and writes so the conditional increment cannot
+// reorder observable effects.
+fn read_only_expr(e) {
+    if !e {
+        return 1;
+    }
+    let k = e[N_KIND];
+    if k == EX_INT || k == EX_STR || k == EX_FLOAT || k == EX_FUNCREF || k == EX_IDENT {
+        return 1;
+    }
+    if k == EX_UNARY {
+        return read_only_expr(e[UN_X]);
+    }
+    if k == EX_BINARY {
+        return read_only_expr(e[BIN_L]) && read_only_expr(e[BIN_R]);
+    }
+    if k == EX_CONV {
+        return read_only_expr(e[CV_X]);
+    }
+    if k == EX_MEM {
+        return read_only_expr(e[MEM_BASE]) && read_only_expr(e[MEM_INDEX]) && read_only_expr(e[MEM_LEN]);
+    }
+    if k == EX_ELEM {
+        return read_only_expr(e[ELEM_SEQ]) && read_only_expr(e[ELEM_IDX]);
+    }
+    if k == EX_INDEX {
+        return read_only_expr(e[IX_X]) && read_only_expr(e[IX_I]);
+    }
+    if k == EX_SEQ {
+        let stmts = e[SEQ_STMTS];
+        let i = 0;
+        while i < stmts[VEC_LEN] {
+            let st = vec_get(stmts, i);
+            if st[N_KIND] != ST_LET || !read_only_expr(st[LET_INIT]) {
+                return 0;
+            }
+            i = i + 1;
+        }
+        return read_only_expr(e[SEQ_VALUE]);
+    }
+    return 0;
+}
+
+// if_increment_assignment returns the assignment in `if c { x++ }` when x is a
+// register-held 64-bit integer and c cannot write through calls or assignments.
+fn if_increment_assignment(s) {
+    if s[IF_ELSE] || !read_only_expr(s[IF_COND]) {
+        return 0;
+    }
+    let body = s[IF_THEN];
+    if body[BLK_STMTS][VEC_LEN] != 1 {
+        return 0;
+    }
+    let a = vec_get(body[BLK_STMTS], 0);
+    if a[N_KIND] != ST_ASSIGN || a[AS_TARGET][N_KIND] != EX_IDENT {
+        return 0;
+    }
+    let x = a[AS_TARGET][ID_REF];
+    let value = a[AS_VALUE];
+    if x[S_KIND] != SYM_LOCAL || x[S_REG] < 0 || !is_integer_t(x[S_TYPE]) || x[S_TYPE][TY_WIDTH] != 8 || value[N_KIND] != EX_BINARY || !streq(value[BIN_OP], "+") || value[BIN_L][N_KIND] != EX_IDENT || value[BIN_L][ID_REF] != x || !is_const(value[BIN_R]) || const_val(value[BIN_R]) != 1 {
+        return 0;
+    }
+    return a;
+}
+
+// try_if_increment compiles `if c { x++ }` to a conditional increment on arm64.
+fn try_if_increment(s) {
+    let a = if_increment_assignment(s);
+    if !a {
+        return 0;
+    }
+    let x = a[AS_TARGET][ID_REF];
+    let cc = gen_flags(s[IF_COND], 0);
+    emit3(I_CINC, x[S_REG], x[S_REG], cc);
+    return 1;
+}
+
 // gen_flags sets the flags for condition e and returns the condition code meaning true.
 fn gen_flags(e, d) {
     if e[N_KIND] == EX_UNARY && streq(e[UN_OP], "!") {
         return gen_flags(e[UN_X], d) ^ 1;
+    }
+    if e[N_KIND] == EX_SEQ {
+        let i = 0;
+        while i < d {
+            if i < t_count {
+                emit1(I_PUSH, vec_get(t_regs, i));
+            }
+            if i < f_count {
+                emit1(I_FPUSH, vec_get(f_regs, i));
+            }
+            i = i + 1;
+        }
+        gen_stmts(e[SEQ_STMTS]);
+        i = d - 1;
+        while i >= 0 {
+            if i < f_count {
+                emit1(I_FPOP, vec_get(f_regs, i));
+            }
+            if i < t_count {
+                emit1(I_POP, vec_get(t_regs, i));
+            }
+            i = i - 1;
+        }
+        return gen_flags(e[SEQ_VALUE], d);
     }
     if e[N_KIND] == EX_BINARY {
         let cc = cond_code(e[BIN_OP]);

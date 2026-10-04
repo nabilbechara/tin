@@ -245,3 +245,20 @@ round; the table shows four process runs on the Apple M3 Pro development machine
 The measured loop used zero pool bytes. `tests/v2/shapes_dyn_asm.tin` checks arm64 and
 amd64 assembly for exactly one indirect call in the dynamic method and no allocator call.
 These numbers describe this microbenchmark and machine; they are not a whole-program estimate.
+
+## Ordered comparisons and conditional increments
+
+`bench/v2/ordered_less` exercises the generic `sift.Less` comparison loop. A native Linux
+comparison used seven alternating runs per side and reported medians on GitHub-hosted
+`ubuntu-24.04` amd64 and `ubuntu-24.04-arm` runners (Go 1.26.8; load and server work stayed
+on each runner). The comparison was from base `e3dbf8c` to head `d27e0b5`, which includes
+the conditional-increment change. The [workflow run](https://github.com/yasserreslan/tin/actions/runs/37161195781)
+contains the machine details and raw samples.
+
+| architecture | base ms | head ms | head/base | head Tin ms | Go ms | Go/Tin |
+|---|---:|---:|---:|---:|---:|---:|
+| amd64 | 71.27 | 20.01 | 0.281 | 20.2 | 35.6 | 1.760 |
+| arm64 | 39.58 | 30.41 | 0.768 | 30.4 | 32.8 | 1.079 |
+
+Other CPU benchmarks stayed within 5% of base. HTTP stayed within the workflow's 5% review
+threshold; the largest change was arm64 `/plaintext` at 0.958 head/base requests per second.
