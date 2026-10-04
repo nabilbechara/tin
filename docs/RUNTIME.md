@@ -698,13 +698,15 @@ functions keep that rule, and grows as phase 1 lands.
 | `ConstantTimeEq`, `Equal` | the bytes | the lengths |
 | `X25519`, `X25519PublicKey` | the scalar and the point (ladder with masked swaps; ten-limb field) | the final all-zero check, whose result is public |
 | `ChaCha20`, `AEAD.Seal` and `AEAD.Open` for ChaCha20-Poly1305 | the key, the data and the tag (the tag is compared with `ConstantTimeEq`) | the lengths |
-| `NewAESGCM`, `AEAD.Seal` and `AEAD.Open` for AES-GCM (software path: bitsliced AES with the S-box as GF(2^8) inversion, GHASH by multiplication with holes) | the key, the data and the tag | the lengths |
+| `NewAESGCM`, `AEAD.Seal` and `AEAD.Open` for AES-GCM: on the CPU's AES-NI/PCLMULQDQ or ARMv8 AESE/AESMC/PMULL instructions when it has them (`selfhost/aes_hw.tin`), else bitsliced AES with the S-box as GF(2^8) inversion and GHASH by multiplication with holes | the key, the data and the tag | the lengths, and which path the CPU allows |
 | `P256PublicKey`, `P256ECDH` and the field and point code under them (`field.tin`, `p256.tin`) | the private key and every coordinate | the validity checks of the key and the peer's point, whose results are public |
 
 | `monty_new` (`bignum.tin`: Montgomery constants for a modulus given at run time) | the modulus's value | its limb count and bit length |
 
 `Sha1`, `Pbkdf2Sha256`, the hex and base64 codecs and the RSA-OAEP code are not
 constant-time and must not be used on secrets in a timing-sensitive protocol path.
+`TIN_SEAL_SOFT=1` in the environment makes AES-GCM use the software path even on a CPU with
+the instructions (for tests).
 
 Signature verification and certificates (#124 phase 2) see only public data and are not
 constant-time by design: `VerifyPKCS1v15`, `VerifyPSS`, `VerifyECDSA` (and `p384.tin`'s
