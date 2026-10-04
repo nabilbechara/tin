@@ -166,7 +166,7 @@ Ordered by import path, as `go list std` prints them.
 | `io` | 91+20 | partial | `io` declares Reader, Writer, Closer, Seeker, ReaderAt, WriterAt and the compositions; structural satisfaction, generic `Copy[R io.Reader, W io.Writer]`, and explicit `dyn io.Writer` calls are verified. The `io.Copy` package function, ReadAll, Pipe, MultiWriter, LimitReader, TeeReader and EOF as a sentinel fault remain future work (#141) |
 | `io/fs` | 2+0 | missing |  |  |
 | `io/ioutil` |  | n/a | quarry | deprecated in Go; quarry has ReadFile, WriteFile, ReadDir |
-| `iter` |  | missing |  | range over functions; `for range` covers slices, strings, maps and integers |
+| `iter` |  | missing |  | range over functions; `for x in` covers slices, strings, maps and integer ranges |
 | `log` | 7+2 | partial | herald | levels, output, clock; no Logger values |
 | `log/slog` |  | partial | herald | leveled lines with key and value pairs; no Handler, Group or LogValuer |
 | `log/syslog` |  | missing |  |  |

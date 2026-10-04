@@ -6,6 +6,7 @@ Every push to `main` and every pull request runs native Linux arm64 (`ubuntu-24.
 
 - Clean build from the committed seed and two byte-identical self-hosted compiler rebuilds.
 - Every `tests/v2/*.tin`, including negative compilation tests and their exact diagnostics. Missing expected output, compiler crashes, process crashes, nonzero exit and timeouts fail. Each run uses fresh executable paths. Diagnostic codes (`diagnostics_check.py`, run by `tools/v2test.sh`): every code the compiler prints is documented in `docs/ERRORS.md` under the same name, every documented code is printed or retired, the compiler prints no error without a code, every line of the `.err` files and of the exact compile-phase regression contracts carries a documented code, and each documented example compiles to exactly the diagnostic the page shows. `tests/v2/*_asm.tin` files are compiled with `-S` instead and their listing matched against the ordered `CHECK:`/`CHECK-NOT:` lines in `*_asm.check` (the CPU's section), so a codegen change that loses a direct call, or turns it into an indirect one, fails.
+- Docs (`docs_check.py`, Tin 1 #227): every fenced block in README.md and docs/ names its language, Tin code is fenced `tin`, no Tin code in the docs (blocks and inline code) or in `examples/` uses a form edition 1 removed, and every `tin` block of README.md and docs/ compiles with `-edition 1` (a block marked `error` must fail; docs/ERRORS.md examples are compiled by `diagnostics_check.py`). The block conventions (`body`, `file=NAME`, hidden `tin-prelude` comments) are in the script's header.
 - Exact number conversion: a generated Go `strconv`/`fmt` corpus and pinned parse-number-fxx hard cases check float bits, faults, ties, subnormals, long inputs, precision and f32/format flags on all three native targets (`number_check.py`).
 - Memory primitives (`memory_check.py`): Go twins check every alignment, overlap, zeroing, reallocation, guard-page boundaries and 1000 cross-core returns. Deterministic failure injection checks 46 allocation/mapping failures, including startup and later allocations (#178).
 - Task memory (`task_memory_check.py`): 300 concurrent heavy requests dirty pool and deep stack pages; after release, the cache holds at most 64 tasks and Linux RSS returns to within 32 MiB of baseline (#177). macOS checks task reuse and cache invariants.
@@ -34,7 +35,11 @@ Every push to `main` and every pull request runs native Linux arm64 (`ubuntu-24.
 - The v0.4 service benchmark (`.github/workflows/bench.yml`) is separate and runs only on demand: Redis and MySQL service containers, wrk2 built from source, Tin vs Go + chi. It is never a merge gate.
 - Linux benchmarks (`.github/workflows/bench-linux.yml`): the CPU suite (`bench/v2`) and the HTTP suite (`bench/http/run_wrk.sh`) on `ubuntu-24.04` and `ubuntu-24.04-arm`, weekly and on demand (Actions, Run workflow); it does not run on pull requests. Each job keeps Tin/Go reference measurements and compares the selected revision against its base using matching compiler/library trees. Reference performance is Linux only; macOS is a development platform (docs/PERFORMANCE.md, "Benchmark policy"). Output mismatches, crashes, timeouts and failed HTTP measurements fail the workflow; timing thresholds flag review and never act as an automatic merge gate. Raw JSON samples and HTTP logs are retained.
 - Harness self-tests ensure expected output cannot disguise crashes/timeouts or unexpectedly accepted negative programs. Benchmark self-tests check alternating medians, output equality on every repetition, matching revision library trees, and failed measurements.
+<!-- docs-check: old-syntax begin -->
+
 - The libc inventory guard (`test_libc_inventory.py`) checks Linux `extern func` and legacy `extern fn` declarations plus ELF startup imports against `notes/libc_inventory.md`; new, reintroduced, unassigned or stale entries fail.
+
+<!-- docs-check: old-syntax end -->
 
 The Python harness uses only the standard library. Shell entrypoints now require Python 3. Native runtime probes have a 20-second timeout, core dumps disabled, and a 512 MiB virtual-memory limit on Linux. The first-allocation crash reproducer is Linux-only: macOS can map writable memory beyond the undersized allocation, making a SIGSEGV expectation unreliable there. HTTP tests require `ps` (available on hosted Ubuntu).
 
@@ -63,6 +68,7 @@ This avoids a bot rewriting Actions after closure: the regression becomes requir
 make bootstrap
 python3 -m unittest discover -s tools/ci -p 'test_*.py' -v
 tools/v2test.sh bin/tinc
+python3 tools/ci/docs_check.py bin/tinc   # docs and examples in edition 1; docs code blocks compile
 python3 tools/ci/number_check.py          # exact number bits/text against Go and hard cases
 python3 tools/ci/regressions.py
 python3 tools/ci/regressions.py --audit   # network; GH_TOKEN optional for public issues

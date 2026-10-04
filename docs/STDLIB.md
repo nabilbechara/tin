@@ -12,9 +12,7 @@ Generated from the comments in `lib/*/` by `tools/gendoc.py`.
 | [hearth](#hearth) | cores and threads (runtime) |
 | [relay](#relay) | messages between cores (channels) |
 | [task](#task) | deadline and cancellation of the running code (context) |
-| [lane](#lane) | bounded queues between tasks on a core (channels) |
 | [wire](#wire) | TCP and HTTP client (net) |
-| [tls](#tls) | TLS 1.3 client (crypto/tls) |
 | [twine](#twine) | strings (strings) |
 | [glyph](#glyph) | UTF-8 and Unicode (unicode/utf8, unicode) |
 | [mint](#mint) | number and string conversion (strconv) |
@@ -32,7 +30,7 @@ Generated from the comments in `lib/*/` by `tools/gendoc.py`.
 | [atlas](#atlas) | functions on maps (maps) |
 | [cairn](#cairn) | containers (container/heap, sets, LRU) |
 | [stamp](#stamp) | hashes and checksums (hash/*) |
-| [seal](#seal) | crypto and encodings (crypto/sha256, sha512, hmac, hkdf, ecdh, rsa, x509, encoding/hex, base64, pem) |
+| [seal](#seal) | crypto and encodings (crypto/sha256, hmac, encoding/hex, base64) |
 | [herald](#herald) | logging (log/slog) |
 | [crucible](#crucible) | testing helpers (testing) |
 | [constraints](#constraints) | named generic constraint shapes |
@@ -41,7 +39,6 @@ Generated from the comments in `lib/*/` by `tools/gendoc.py`.
 | [mysql](#mysql) | MySQL client (database/sql with go-sql-driver/mysql) |
 | [postgres](#postgres) | PostgreSQL client (database/sql with pgx) |
 | [websocket](#websocket) | WebSocket server and client (gorilla/websocket) |
-| [replay](#replay) | production replay capsules (notes/interface_replay.md) |
 
 ## say
 
@@ -49,7 +46,7 @@ Built into the compiler (formatting by static type, no reflection): `say.Line(a,
 
 ## fault
 
-Package fault is fault chains and the standard sentinels, like Go's errors package: Wrap adds context and keeps the cause, Is walks the chain comparing identity, Join keeps several faults reachable. The runtime's sentinels are the variables Canceled, DeadlineExceeded, LimitExceeded, Overloaded, Draining and Panic; a package declares its own as `var ErrX = fault("msg")`. A function that makes a fault is declared ! here: its fault is the value (fail it, keep it in a variable, or test it). Layout and identities: notes/interface_faults.md.
+Package fault is fault chains and the standard sentinels, like Go's errors package: Wrap adds context and keeps the cause, Is walks the chain comparing identity, Join keeps several faults reachable. The runtime's sentinels are the variables Canceled, DeadlineExceeded, LimitExceeded, Overloaded, Draining and Panic; a package declares its own as `let ErrX = fault("msg")`. A function that makes a fault is declared ! here: its fault is the value (fail it, keep it in a variable, or test it). Layout and identities: notes/interface_faults.md.
 
 - `Wrap(err fault, msg str) !`: Wrap is err with msg in front ("msg: cause"), err reachable as its cause; nil when err is nil.
 - `Is(err fault, target fault) bool`: Is reports whether err or a fault in its chain (causes and joined faults) is target: the same sentinel, or the same fault.
@@ -92,38 +89,47 @@ Package anvil is an HTTP/1.1 server: one event loop per core (kqueue), share-not
 
 Core 0 accepts connections and deals them round-robin to every core through a pipe; from then on a connection belongs to one core for its whole life. Each core reads into one scratch buffer, parses requests in place, runs the handler, writes every response of the batch with one write, and wipes its request pool. Idle connections hold no buffers, only a 96-byte record.
 
-```go
-func handle(q anvil.Req, w mut anvil.Out) {
+```tin
+type Msg struct {
+	message str
+}
+
+fn handle(q anvil.Req, w mut anvil.Out) {
 	w.Type("application/json")
 	argo.Put(mut w.Body, Msg{message: "hi"})
 }
-func main() {
-	err := anvil.Serve(":8080", handle)
-	say.Line("server:", err)
+
+fn main() {
+	anvil.Serve(":8080", handle) catch err {
+		say.Line("server:", err)
+	}
 }
 ```
 
 A Router picks the handler by method and path pattern, and runs middleware around it. Patterns match whole segments: "users" itself, {id} any one non-empty segment, and a last {path...} or * the rest of the path. Static segments win over {name}, and {name} over the rest, segment by segment, whatever the order of registration. A path whose routes take other methods gets 405 with Allow, any other miss 404; HEAD falls back to GET. A trailing slash is part of the path: /users/ and /users are different routes. Write patterns with {...} as raw strings: in "..." the braces would interpolate.
 
-```go
-func user(q anvil.Req, w mut anvil.Out) {
-	id := q.PathParam("id")
+```tin
+fn user(q anvil.Req, w mut anvil.Out) {
+	let id = q.PathParam("id")
 	w.Text("user {id}")
 }
-func logged(q anvil.Req, w mut anvil.Out, next func(anvil.Req, mut anvil.Out)) {
+
+fn logged(q anvil.Req, w mut anvil.Out, next fn(anvil.Req, mut anvil.Out)) {
 	next(q, mut w)
 	say.Line(q.Method, q.Pattern(), w.Code())
 }
-func main() {
-	r := anvil.NewRouter()
+
+fn main() {
+	let r = anvil.NewRouter()
 	r.Use(logged)
 	r.Get(`/users/{id}`, user)
-	r.Route("/admin", func(g mut anvil.Router) {
-		g.Use(auth)
-		g.Delete(`/users/{id}`, remove)
+	r.Route("/admin", fn(g mut anvil.Router) {
+		g.Use(logged)
+		g.Delete(`/users/{id}`, user)
 	})
-	err := r.Serve(":8080")
-	say.Line("server:", err)
+	r.Serve(":8080") catch err {
+		say.Line("server:", err)
+	}
 }
 ```
 
@@ -194,10 +200,10 @@ Package hearth runs a program on every core: one thread per core, each with its 
 
 Package relay carries messages between cores, which share no memory. A message is a str copied into the receiving core's inbox (a lock-free multi-producer queue); the receiver gets its own copy in its request pool. Encode structs with argo.Put/argo.Get.
 
-```go
+```tin body
 relay.Send(2, "hello")              // from any core
-from, msg := relay.Recv()           // on core 2: blocks until a message arrives
-from, msg := try relay.Next()       // the same, but fails on a deadline or cancel
+let (from, msg) = relay.Recv()      // on core 2: blocks until a message arrives
+let (from, msg) = try relay.Next()  // the same, but fails on a deadline or cancel
 ```
 
 - `Send(to i64, msg str)`: Send copies msg into core to's inbox; it never blocks.
@@ -219,27 +225,14 @@ Package task reads the deadline and cancellation of the running code, which belo
 - `Deadline() i64`: Deadline is the effective deadline of the running code in tide.Now() nanoseconds (the earliest of its request's and every enclosing within block's), or 0 when it has none.
 - `Canceled() !`: Canceled is nil while the running code may go on, else the fault its next wait would fail with: fault.DeadlineExceeded once the deadline has passed, fault.LimitExceeded past a budget, or fault.Canceled wrapping the reason of a cancel or drain.
 
-## lane
-
-- `type Lane[T constraints.Any] struct`: Lane is a bounded queue between tasks on one core (design_semantics §6, #232). Send waits while it is full and Recv while it is empty; Close wakes every waiter. Waits take the task's deadline and cancellation like any other wait. A lane never crosses cores (relay does).
-- `New[T constraints.Any](capacity i64) Lane[T]`: New makes a lane that holds at most capacity values (at least one).
-- `(l mut Lane[T]) Send(v T) !`: Send puts v at the back, waiting while the lane is full; it fails once the lane is closed.
-- `(l mut Lane[T]) TrySend(v T) bool`: TrySend puts v at the back if there is room and reports whether it did.
-- `(l mut Lane[T]) Recv() !T`: Recv takes the value at the front, waiting while the lane is empty; it fails with "lane closed" once the lane is closed and empty.
-- `(l mut Lane[T]) Close()`: Close ends the lane: senders fail, receivers drain what is left and then fail.
-- `(l Lane[T]) Ready() bool`: Ready reports whether Recv would not wait: a value is there or the lane is closed (select).
-- `(l mut Lane[T]) Watch()`: Watch makes the next value or Close wake the running task without taking a value (select).
-- `(l mut Lane[T]) Unwatch()`: Unwatch withdraws Watch.
-- `(l Lane[T]) Len() i64`: Len is how many values wait in the lane.
-
 ## wire
 
 Package wire is TCP networking and a small HTTP/1.1 client. Calls block the calling core (servers should use anvil); every connection can carry a read/write timeout.
 
-```go
-c := try wire.Dial("127.0.0.1:6379")
+```tin body
+let c = try wire.Dial("127.0.0.1:6379")
 try c.Write("PING\r\n")
-r := try wire.Get("http://127.0.0.1:8080/json")
+let r = try wire.Get("http://127.0.0.1:8080/json")
 ```
 
 - `type Conn struct`: Conn is a TCP connection.
@@ -267,37 +260,6 @@ r := try wire.Get("http://127.0.0.1:8080/json")
 - `Do(method str, url str, headers []str, body str) !Resp`: Do sends one request: headers is a list of name, value pairs. The method and header names must be tokens, and the URL and header values must not hold CR, LF, NUL or other control bytes (the URL no spaces either), or Do fails instead of sending a request an input could have split. Response bodies over DefaultMaxBody fail; DoWith sets a timeout and the limit.
 - `DoWith(method str, url str, headers []str, body str, opt Options) !Resp`: DoWith is Do with options: an overall timeout and a response size limit.
 - `(r Resp) Header(name str) str`: Header returns the response header name (any case), or "".
-
-## tls
-
-Package tls is TLS 1.3 (RFC 8446) for clients: tls.Dial connects and handshakes, and Conn reads and writes like wire.Conn. Cipher suites: TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256; key exchange X25519, or P-256 when the server asks for it. The server's certificate is verified by default. No 0-RTT, no resumption, no renegotiation and no TLS 1.2. Every wait lets the core serve other tasks and honours Config.Timeout during the handshake, SetTimeout afterwards and a request's deadline.
-
-```go
-c := try tls.Dial("example.com:443", tls.Config{ALPN: []str{"http/1.1"}})
-try c.Write("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
-```
-
-- `type Conn struct`: Conn is a TLS 1.3 connection over a wire.Conn. After the handshake its memory only changes in place (record buffers made once, keys rewritten by seal.AEAD.Rekey), so a Conn stays valid wherever it lives: a request's pool, or keep()'s long-lived heap for a client that holds connections across requests.
-- `const TLS_AES_128_GCM_SHA256 = 0x1301`: TLS_AES_128_GCM_SHA256 is cipher suite 0x1301 (Conn.CipherSuite).
-- `const TLS_AES_256_GCM_SHA384 = 0x1302`: TLS_AES_256_GCM_SHA384 is cipher suite 0x1302.
-- `const TLS_CHACHA20_POLY1305_SHA256 = 0x1303`: TLS_CHACHA20_POLY1305_SHA256 is cipher suite 0x1303.
-- `type Config struct`: Config configures a client connection; the zero value verifies the server against the system's roots for the name in the address.
-- `Dial(addr str, cfg Config) !Conn`: Dial connects to "host:port" and runs the handshake. ServerName defaults to host.
-- `Client(conn wire.Conn, cfg Config) !Conn`: Client runs the handshake over an established connection, for protocols that switch to TLS mid-stream (MySQL, PostgreSQL). cfg.ServerName is required unless InsecureSkipVerify is set. The Conn owns conn from then on: its Close closes conn.
-- `(c mut Conn) SetTimeout(ns i64)`: SetTimeout limits every later read and write to ns nanoseconds (0: no limit).
-- `(c mut Conn) SetDeadline(at i64)`: SetDeadline makes every later wait fail once the monotonic clock (tide.Now) passes at (0: no deadline), whatever the per-call timeout: wire uses it for a whole HTTP call.
-- `(c Conn) ALPN() str`: ALPN is the application protocol the server chose ("" when none).
-- `(c Conn) CipherSuite() i64`: CipherSuite is the negotiated cipher suite (TLS_AES_128_GCM_SHA256 and so on).
-- `(c Conn) Group() str`: Group is the key exchange: "X25519", or "P-256" when the server asked for it.
-- `(c Conn) PeerCertificates() [][]u8`: PeerCertificates is the server's certificate chain as sent (DER, leaf first).
-- `(c Conn) Fd() i64`: Fd is the connection's descriptor (for waiting on it; never read or write it directly).
-- `(c Conn) Buffered() i64`: Buffered is how many decrypted bytes a Read returns without waiting.
-- `(c mut Conn) Read(buf mut []u8, max i64) !i64`: Read appends up to max bytes of application data to buf and returns how many; after the server's close_notify it fails with EOF (wire.IsEOF), and a connection the server drops without close_notify is a fault, not EOF (a truncation would otherwise look complete).
-- `(c mut Conn) ReadNow(buf mut []u8, max i64) !i64`: ReadNow is Read without waiting: it returns 0 when no application data can be had without waiting for the socket (then wait until Fd is readable and call it again). For clients that run their own non-blocking loop; data TLS has already buffered is always returned first.
-- `(c mut Conn) ReadFull(n i64) !str`: ReadFull reads exactly n bytes.
-- `(c mut Conn) WriteBytes(b []u8) !`: WriteBytes sends all of b.
-- `(c mut Conn) Write(s str) !`: Write sends all of s.
-- `(c mut Conn) Close()`: Close sends close_notify and closes the connection; closing twice does nothing.
 
 ## twine
 
@@ -1063,7 +1025,7 @@ Package seal has cryptographic hashes (SHA-256, SHA-384, SHA-512, SHA-1), HMAC o
 
 Package herald writes leveled log lines, one write(2) per line so cores never interleave:
 
-```go
+```text
 2026-10-01T11:22:05.123Z INFO core=2 listening addr=:8080
 ```
 
@@ -1088,8 +1050,8 @@ Package herald writes leveled log lines, one write(2) per line so cores never in
 
 Package crucible is for tests and micro-benchmarks: labeled checks that collect failures, Done to report them (exit status 1 on failure), and Bench to time a function.
 
-```go
-crucible.EqI("sum", Sum(2, 3), 5)
+```tin body
+crucible.EqI("sum", 2 + 3, 5)
 crucible.Done()
 ```
 
@@ -1162,10 +1124,10 @@ Package redis is a Redis client. Commands are queries: in c.Do("SET user:{id} {b
 
 Each core keeps one connection per Client. The requests a core serves at the same time share it: their commands are written together and the replies matched in order (pipelining), so a busy server makes few system calls per command. Inside a request task a call waits without blocking the core; outside one it blocks.
 
-```go
-var cache = redis.Open(redis.Options{Addr: "127.0.0.1:6379"})
+```tin body
+let cache = redis.Open(redis.Options{Addr: "127.0.0.1:6379"})
 try cache.Set("greeting", "hello")
-v, found := try cache.Get("greeting")
+let (v, found) = try cache.Get("greeting")
 ```
 
 Blocking commands (BLPOP, SUBSCRIBE, ...) would hold up the commands queued behind them and are not supported.
@@ -1191,10 +1153,12 @@ Package mysql is a MySQL client (tested with MySQL 8.0). Statements are queries:
 
 Each core keeps a pool of connections per Client (Options.Pool, default 16); a request task waits for a free one without blocking the core. Prepared statements are cached per connection. Authentication: caching_sha2_password (the MySQL 8 default, including the RSA key exchange when the server has no cached entry) and mysql_native_password. TLS is not supported.
 
-```go
-var db = mysql.Open(mysql.Options{Addr: "127.0.0.1:3306", User: "app", Password: pw, Database: "shop"})
-rows := try db.Query("SELECT id, name FROM users WHERE id = {id}")
-for _, r := range rows.Rows {
+```tin body
+let pw = quarry.Getenv("MYSQL_PASSWORD")
+let id = 7
+let db = mysql.Open(mysql.Options{Addr: "127.0.0.1:3306", User: "app", Password: pw, Database: "shop"})
+let rows = try db.Query("SELECT id, name FROM users WHERE id = {id}")
+for r in rows.Rows {
 	say.Line(r[0].Int(), r[1].Text())
 }
 ```
@@ -1224,10 +1188,12 @@ for _, r := range rows.Rows {
 
 Package postgres is a PostgreSQL protocol 3.0 client over TCP. Query interpolation binds binary parameters as $1, $2, ...; a plain str cannot be used as SQL. Connections are pooled per core (default 16) and waiting request tasks park without blocking it. Authentication supports SCRAM-SHA-256, MD5 and cleartext. Options.SSLMode turns on TLS 1.3 (SSLRequest): "require" encrypts, "verify-full" (the default when Options.TLS is set) also checks the server's certificate and name.
 
-```go
-var db = postgres.Open(postgres.Options{Addr: "127.0.0.1:5432", User: "app", Password: pw, Database: "shop"})
-rows := try db.Query("INSERT INTO users(name) VALUES ({name}) RETURNING id")
-id := rows.Rows[0][0].Int()
+```tin body
+let pw = quarry.Getenv("POSTGRES_PASSWORD")
+let name = "ana"
+let db = postgres.Open(postgres.Options{Addr: "127.0.0.1:5432", User: "app", Password: pw, Database: "shop"})
+let rows = try db.Query("INSERT INTO users(name) VALUES ({name}) RETURNING id")
+let id = rows.Rows[0][0].Int()
 ```
 
 - `type Value enum`: Value is one column of a row.
@@ -1255,12 +1221,13 @@ id := rows.Rows[0][0].Int()
 
 Package websocket is the WebSocket protocol (RFC 6455): Accept upgrades an anvil request, Dial connects to a server (ws://, or wss:// over TLS 1.3). Messages are text or binary; pings are answered and fragments joined inside Read. Inside a request task a Read waits without blocking the core, so one core holds many idle connections.
 
-```go
-func handle(q anvil.Req, w mut anvil.Out) {
-	ws := websocket.Accept(q, mut w) catch _ { return }
+```tin
+fn handle(q anvil.Req, w mut anvil.Out) {
+	let ws = websocket.Accept(q, mut w) catch _ { return }
 	ws.Each(echo) catch _ {}
 }
-func echo(ws websocket.Conn, m websocket.Message) ! {
+
+fn echo(ws websocket.Conn, m websocket.Message) ! {
 	try ws.WriteText("echo: {m.Data}")
 }
 ```
@@ -1280,24 +1247,3 @@ func echo(ws websocket.Conn, m websocket.Message) ! {
 - `IsClosed(err fault) bool`: IsClosed reports whether err is the normal end of a connection: the peer closed it.
 - `(c Conn) Read() !Message`: Read returns the next message; it answers pings and joins fragments on the way. When the peer closes, it answers the close and fails with "websocket: closed (code)". The returned message lives in the caller's pool. For a long-lived stream, use Each to reset message allocations after every callback without invalidating the Conn.
 - `(c Conn) Each(h fn(Conn, Message) !) !`: Each reads messages and calls h until a read or callback fails. Every callback has a reusable message pool: use keep() to retain its data after the callback returns. The Conn and all objects allocated before Each remain valid. Callbacks may wait. A closed peer returns the same IsClosed fault as Read; callback faults propagate.
-
-## replay
-
-Reading replay capsules (notes/interface_replay.md, section 6; #242): the envelope's tag and keystream, the body, and the effect kinds this build can replay. Writing capsules, the spool and the keys of secrets are #241's, next to this file.
-
-- `type Capsule struct`: Capsule is a decoded capsule: one recorded request and its effect records.
-- `const Kinds = ",sched.select@1,sched.resume@1,sched.cancel@1,tide.now@1,tide.wall@1,dice.seed@1,seal.random@1,wire.http@1,wire.dial@1,wire.read@1,wire.write@1,redis@1,mysql@1,mysql.tx@1,postgres@1,postgres.tx@1,websocket.dial@1,websocket.read@1,websocket.write@1,quarry.read@1,quarry.write@1,quarry.stat@1,quarry.dir@1,quarry.fs@1,"`: Kinds lists the effect kinds (name@version) this build replays (section 4); a capsule with any other kind is refused. The sched.* kinds are the request's scheduling (section 7, #243).
-- `Open(path str, keyHex str) !Capsule`: Open reads the capsule at path, encrypted under keyHex (the 64 hex digits of TIN_REPLAY_KEY).
-- `Key(keyHex str) !str`: Key is the 32 bytes a TIN_REPLAY_KEY value (64 hex digits) stands for.
-- `Unseal(data str, key str) !str`: Unseal checks a capsule envelope's tag under key and returns its decrypted body.
-- `Decode(body str) !Capsule`: Decode reads a capsule body (schema 1) and checks every effect record and its kind.
-- `Supported(kind str) bool`: Supported reports whether this build replays effect kind (name@version).
-- `Setup(cores i64) bool`: Setup reads the switches (TIN_REPLAY_DIR, TIN_REPLAY_KEY, TIN_REPLAY_SAMPLE, TIN_REPLAY_MAX_MB, TIN_REPLAY_SECRET_HEADERS, TIN_REPLAY_DROP_HEADERS) for a server on n cores, trims the spool and installs the keyed hash of secrets; it reports whether recording is on (never while TIN_REPLAY_CAPSULE replays a capsule). Call it before the cores start. A missing or malformed key, or a spool that cannot be made, prints one line on stderr and leaves recording off.
-- `On() bool`: On reports whether Setup turned recording on.
-- `Secret(s str) str`: Secret is the handle an effect key or a stored header holds instead of a secret's text: "tin-secret:" and the first 16 bytes of HMAC-SHA256(Ks, s) in hex (section 5.1).
-- `Wanted(status i64, panicked bool) i64`: Wanted is the flags a capsule of a request that ended with status is kept with (1 panicked, 2 sampled), or -1 when it is dropped: kept when the status is 500 or more, or it panicked, or it is in the TIN_REPLAY_SAMPLE fraction.
-- `Done(tp i64, core i64)`: Done ends the recording tape tp of a request served on core: its capsule is written when the request is kept (Wanted), and the tape is freed. A capsule that cannot be written prints one line on stderr; the server goes on.
-- `Write(tp i64, core i64, flags i64) !str`: Write writes the capsule of tape tp (recorded on core, with flags) into the spool, deleting the core's oldest capsules past its share of TIN_REPLAY_MAX_MB; it returns the capsule's path.
-- `Encode(tp i64, core i64, flags i64) str`: Encode is the capsule body of tape tp (section 6): the request with its secret headers as handles and its dropped headers empty, the panic, and the effect records.
-- `Seal(body str) str`: Seal is the envelope of a capsule body (section 6): the magic, a random nonce, the body under the HMAC-SHA256 keystream, and the tag over all of it.
-- `Scrub(req str) str`: Scrub is a request as a capsule stores it: the values of secret headers (section 1) become their handles and the values of dropped headers become empty; everything else is kept.
