@@ -32,7 +32,7 @@ Tests: `tests/v2/seal_p256.tin` (Go twin `bench/ref/seal_p256`), and Wycheproof
 
 ## Signatures and certificates (#124 phase 2)
 
-API: `VerifyPKCS1v15`, `VerifyPSS`, `RSAKeyBits`, `ParseRSAPublicKeyDER`, `DecodePEM`
+API: `VerifyPKCS1v15`, `VerifyPSS`, `VerifyECDSA`, `RSAKeyBits`, `ParseRSAPublicKeyDER`, `DecodePEM`
 (`PEMBlock`), `ParseCertificate`, `ParseCertificatesPEM`, `Certificate` (with `Name`,
 `SignatureAlgorithm`, `PublicKeyAlgorithm`, the `KeyUsage*` and `ExtKeyUsage*` constants),
 `Certificate.Verify` (`VerifyOptions`), `CheckSignature`, `CheckSignatureFrom`,
@@ -46,12 +46,16 @@ API: `VerifyPKCS1v15`, `VerifyPSS`, `RSAKeyBits`, `ParseRSAPublicKeyDER`, `Decod
   constants of a modulus at run time. Keys of 2048 to 8192 bits, odd exponents up to 2^32.
 - Stricter than Go, on purpose: chains of at most 8 certificates, RSA keys of at least 2048
   bits, a wildcard needs two labels after `*.`, a host name containing `*` never matches.
-- Gaps: ECDSA and Ed25519 signatures (next PR, on `p256.tin`, a P-384 `monty` and SHA-512),
+- ECDSA: P-256 on `p256.tin`'s points and `p256n`; P-384 on `p384.tin`, the same complete
+  formulas written once over a curve value with a `monty_new` field. u1*G + u2*Q uses 4-bit
+  windows skipping zero digits (public data). P-521 is not supported (no Web PKI root uses it).
+- Gaps: Ed25519 (waits for the 25519 field of X25519),
   name constraints on email, URI and directory names (a CA with them is refused when the leaf
   has such names), CRLs and OCSP. Speed: RSA-2048 verification takes about 0.9 ms on Linux
   x86-64 against Go's 30 us; a faster `monty.mul` (one pass per row over raw words) halves it.
 
-Tests: `tests/v2/seal_wycheproof.tin` (13 Wycheproof RSA files), `tests/v2/seal_x509.tin`
+Tests: `tests/v2/seal_wycheproof.tin` (13 Wycheproof RSA files), `seal_wycheproof_ecdsa.tin`
+(5 ECDSA files), `tests/v2/seal_x509.tin`
 (46 chain cases), `tests/v2/seal_certinfo.tin` (fields, IP parsing, PEM, host names), each
 with a Go twin, and `tools/ci/x509_check.py` (fresh PKI, mutated certificates, system roots).
 ## X25519 and ChaCha20-Poly1305 (#124 phase 1)

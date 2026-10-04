@@ -45,7 +45,8 @@ const sTimeout = 7 // ns a read or write may wait (0: no limit)
 const sWriting = 8 // a task is writing a frame: others wait their turn
 const sOwnFd = 9   // Close closes the descriptor (Dial); anvil closes Accept's
 const sMax = 10    // the largest message accepted
-const stWords = 11
+const sTn = 11     // its number in a recorded or replayed request (websocket.dial@1, #241); 0: accepted
+const stWords = 12
 
 const guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -116,6 +117,10 @@ func Accept(q anvil.Req, w mut anvil.Out) !Conn {
 // Dial connects to a ws:// URL ("ws://host:port/path"). Close it when finished;
 // inside a request task, it is also closed automatically when its scope ends.
 func Dial(url str) !Conn {
+	tp := rt_tape()
+	if tp != 0 {
+		return try dial_taped(tp, url) // recorded for replay (#241)
+	}
 	if !twine.HasPrefix(url, "ws://") {
 		fail "websocket: only ws:// URLs (no TLS)"
 	}
@@ -381,6 +386,9 @@ func (c Conn) send(op i64, p i64, n i64) ! {
 	if !c.open {
 		fail "websocket: the connection is not open"
 	}
+	if st[sFd] < 0 && st[sOwnFd] == 0 {
+		return // a replayed client connection has no socket: only its messages are on the tape
+	}
 	for st[sWriting] != 0 {
 		rt_task_defer()
 	}
@@ -397,11 +405,19 @@ func (c Conn) send(op i64, p i64, n i64) ! {
 
 // WriteText sends s as a text message.
 func (c Conn) WriteText(s str) ! {
+	tp := rt_tape()
+	if tp != 0 && c.open {
+		return try c.write_taped(tp, opText, cast(i64, s)+8, len(s)) // recorded for replay (#241)
+	}
 	return try c.send(opText, cast(i64, s)+8, len(s))
 }
 
 // WriteBinary sends b as a binary message.
 func (c Conn) WriteBinary(b []u8) ! {
+	tp := rt_tape()
+	if tp != 0 && c.open {
+		return try c.write_taped(tp, opBinary, cast(i64, b)[2], len(b)) // recorded for replay (#241)
+	}
 	return try c.send(opBinary, cast(i64, b)[2], len(b))
 }
 
@@ -460,6 +476,10 @@ func (c Conn) protocol_error(code i64, msg str) ! {
 func (c Conn) Read() !Message {
 	if !c.open {
 		fail "websocket: the connection is not open"
+	}
+	tp := rt_tape()
+	if tp != 0 {
+		return try c.read_taped(tp) // recorded for replay (#241)
 	}
 	st := c.st
 	if st[sBuf] == 0 {
@@ -609,4 +629,97 @@ func (c Conn) Each(h func(Conn, Message) !) ! {
 		}
 		rt_pool_scope_reset(scope)
 	}
+}
+
+// ---- recording and replay (notes/interface_replay.md, section 4; #241) ----
+
+// An effect's body runs at once, before it waits: these hand it its arguments and results.
+var tapedCall i64 // the URL to dial, or the Conn to read or write
+var tapedOp i64
+var tapedP i64
+var tapedN i64
+var tapedConn i64 // the connection a dial's body made
+
+// dial_taped records or replays Dial as websocket.dial@1 (key: the URL; result: the
+// connection's number in the request). Replaying, the connection has no socket.
+func dial_taped(tp i64, url str) !Conn {
+	tapedCall = cast(i64, url)
+	tapedConn = 0
+	v := try rt_effect(tp, "websocket.dial@1", url, dial_live)
+	if len(v) != 8 {
+		fail "replay: websocket.dial@1 result is damaged"
+	}
+	n := tword(v, 0)
+	if tapedConn != 0 {
+		c := cast(Conn, tapedConn)
+		tapedConn = 0
+		c.st[sTn] = n
+		return c
+	}
+	st := new_state(-1, true)
+	st[sTn] = n
+	return Conn{open: true, st: st}
+}
+
+func dial_live() !str {
+	c := try Dial(cast(str, tapedCall))
+	tapedConn = cast(i64, c)
+	n := rt_tape_kinds(rt_tape_of(rt_task_current()), "websocket.dial@1") + 1
+	return tput(make([]u8, 0, 8), n)
+}
+
+// read_taped records or replays Read as websocket.read@1 (key: the connection's number; result:
+// 1 text or 2 binary, then the data).
+func (c Conn) read_taped(tp i64) !Message {
+	tapedCall = cast(i64, c)
+	v := try rt_effect(tp, "websocket.read@1", rt_i64str(c.st[sTn]), read_live)
+	if len(v) < 16 || tword(v, 8) != len(v)-16 {
+		fail "replay: websocket.read@1 result is damaged"
+	}
+	return Message{Text: tword(v, 0) == 1, Data: v[16:]}
+}
+
+func read_live() !str {
+	c := cast(Conn, tapedCall)
+	m := try c.Read()
+	b := make([]u8, 0, 16+len(m.Data))
+	kind := 2
+	if m.Text {
+		kind = 1
+	}
+	b = append(b, tput(make([]u8, 0, 8), kind)...)
+	b = append(b, tput(make([]u8, 0, 8), len(m.Data))...)
+	b = append(b, m.Data...)
+	return str(b)
+}
+
+// write_taped records or replays a message write as websocket.write@1 (key: the connection's
+// number, " ", the bytes).
+func (c Conn) write_taped(tp i64, op i64, p i64, n i64) ! {
+	tapedCall = cast(i64, c)
+	tapedOp = op
+	tapedP = p
+	tapedN = n
+	_ = try rt_effect(tp, "websocket.write@1", rt_i64str(c.st[sTn]) + " " + rt_str_from_raw(p, n), write_live)
+}
+
+func write_live() !str {
+	c := cast(Conn, tapedCall)
+	try c.send(tapedOp, tapedP, tapedN)
+	return ""
+}
+
+func tput(b []u8, v i64) str {
+	for i := 0; i < 8; i++ {
+		b = append(b, u8(v >> (8 * i)))
+	}
+	return str(b)
+}
+
+func tword(s str, at i64) i64 {
+	v := 0
+	for i := 7; i >= 0; i-- {
+		v = v<<8 | i64(s[at+i])
+	}
+	return v
 }

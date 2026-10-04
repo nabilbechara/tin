@@ -1,105 +1,16 @@
 package main
 
-import "say"
-import "seal"
-import "quarry"
-import "twine"
+import "./wycheproofpkg"
 
-// Wycheproof signature vectors (tests/wycheproof/rsa, made by tools/gen_wycheproof.py); bench/ref/seal_wycheproof is the Go twin.
-var files = []str{
-	"rsa_signature_2048_sha256", "rsa_signature_2048_sha384", "rsa_signature_2048_sha512", "rsa_signature_3072_sha256",
-	"rsa_signature_4096_sha256", "rsa_signature_4096_sha384", "rsa_signature_4096_sha512",
-	"rsa_pss_2048_sha256_mgf1_0", "rsa_pss_2048_sha256_mgf1_32", "rsa_pss_2048_sha384_mgf1_48",
-	"rsa_pss_4096_sha256_mgf1_32", "rsa_pss_4096_sha512_mgf1_64", "rsa_pss_misc",
-}
-
-func hexOrEmpty(s str) []u8 {
-	if s == "-" {
-		return []u8{}
-	}
-	b, err := seal.HexDecode(s)
-	if err != nil {
-		return []u8{}
-	}
-	return b
-}
-
-func hashOf(name str) seal.Hash {
-	if name == "SHA-384" {
-		return seal.Hash.SHA384
-	}
-	if name == "SHA-512" {
-		return seal.Hash.SHA512
-	}
-	return seal.Hash.SHA256
-}
-
-func run(name str) {
-	text := quarry.ReadFile("tests/wycheproof/rsa/" + name + ".txt") catch err {
-		say.Line(name, "unreadable:", err)
-		return
-	}
-	kind := ""
-	h := seal.Hash.SHA256
-	salt := -1
-	keyOk := false
-	key := seal.RSAPublicKey{N: []u8{}, E: []u8{}}
-	counts := map[str]i64{}
-	passed := map[str]i64{}
-	for _, ln := range twine.Split(text, "\n") {
-		if ln == "" || ln[0] == '#' {
-			continue
-		}
-		f := twine.Fields(ln)
-		if f[0] == "group" {
-			kind = f[1]
-			h = hashOf(f[2])
-			salt = -1
-			if f[3] != "-" {
-				salt = mint_atoi(f[3])
-			}
-			k, err := seal.ParseRSAPublicKeyDER(hexOrEmpty(f[4]))
-			keyOk = err == nil
-			if keyOk {
-				key = k
-			}
-			continue
-		}
-		result := f[1]
-		msg := hexOrEmpty(f[2])
-		sig := hexOrEmpty(f[3])
-		digest := seal.Sum(h, str(msg))
-		ok := false
-		if keyOk {
-			if kind == "rsa-pkcs1" {
-				err := seal.VerifyPKCS1v15(key, h, digest, sig)
-				ok = err == nil
-			} else {
-				err := seal.VerifyPSS(key, h, digest, sig, salt)
-				ok = err == nil
-			}
-		}
-		counts[result] += 1
-		if ok {
-			passed[result] += 1
-		}
-		if (result == "valid" && !ok) || (result == "invalid" && ok) {
-			say.Line(name, "MISMATCH tcId", f[0], result, ok)
-		}
-	}
-	say.Line(name, "valid", passed["valid"], "/", counts["valid"], "invalid-accepted", passed["invalid"], "/", counts["invalid"], "acceptable-accepted", passed["acceptable"], "/", counts["acceptable"])
-}
-
-func mint_atoi(s str) i64 {
-	v := 0
-	for i := 0; i < len(s); i++ {
-		v = v*10 + i64(s[i]-'0')
-	}
-	return v
-}
-
+// Wycheproof RSA signature vectors (tests/wycheproof/rsa, made by tools/gen_wycheproof.py);
+// bench/ref/seal_wycheproof is the Go twin of this test and seal_wycheproof_ecdsa together.
 func main() {
-	for _, name := range files {
-		run(name)
+	for _, name := range []str{
+		"rsa/rsa_signature_2048_sha256", "rsa/rsa_signature_2048_sha384", "rsa/rsa_signature_2048_sha512", "rsa/rsa_signature_3072_sha256",
+		"rsa/rsa_signature_4096_sha256", "rsa/rsa_signature_4096_sha384", "rsa/rsa_signature_4096_sha512",
+		"rsa/rsa_pss_2048_sha256_mgf1_0", "rsa/rsa_pss_2048_sha256_mgf1_32", "rsa/rsa_pss_2048_sha384_mgf1_48",
+		"rsa/rsa_pss_4096_sha256_mgf1_32", "rsa/rsa_pss_4096_sha512_mgf1_64", "rsa/rsa_pss_misc",
+	} {
+		wycheproofpkg.Run(name)
 	}
 }
