@@ -1,0 +1,146 @@
+package main
+
+import "lane"
+import "say"
+import "schedprobe"
+import "tide"
+
+// race runs a select between a lane a child sends on after send ms and a timer of timer ms.
+fn race(send i64, timer i64) !str {
+	mut a = lane.New[str](1)
+	mut got str = ""
+	scope s {
+		let t = s.spawn(fn() ! {
+			try tide.Wait(send * tide.Millisecond)
+			try a.Send("lane")
+		})
+		select {
+			let x = a.Recv() => { got = x }
+			after(timer * tide.Millisecond) => { got = "timer" }
+		}
+		t.cancel()
+	}
+	return got
+}
+
+// other is a select at another site, to replay a tape it did not record.
+fn other() !str {
+	mut a = lane.New[str](1)
+	try a.Send("other")
+	select {
+		let x = a.Recv() => return x
+		after(1s) => return "timer"
+	}
+	return "none"
+}
+
+// bounded runs the race inside within ms: a long race leaves the select by the deadline.
+fn bounded(ms i64) !str {
+	let v = try within ms * tide.Millisecond {
+		try race(1000, 1000)
+	}
+	return v
+}
+
+type Run struct {
+	got str
+	tp i64
+}
+
+// taped runs f in a task whose tape records (rec 0) or replays tape rec (rec < 0: no tape).
+fn taped(rec i64, f fn(i64, i64, i64) !str, x i64, y i64, z i64) !Run {
+	mut got str = ""
+	mut tp i64 = 0
+	scope s {
+		s.spawn(fn() ! {
+			if rec == 0 {
+				tp = schedprobe.Record()
+			} else if rec > 0 {
+				tp = schedprobe.Replay(rec)
+			}
+			got = f(x, y, z) catch err {
+				"fault {err}"
+			}
+			schedprobe.Detach()
+		})
+	}
+	return Run{got: got, tp: tp}
+}
+
+fn raceOf(k i64, send i64, timer i64) !str {
+	return try race(send, timer)
+}
+
+fn otherOf(k i64, send i64, timer i64) !str {
+	return try other()
+}
+
+fn boundedOf(ms i64, send i64, timer i64) !str {
+	return try bounded(ms)
+}
+
+// forced records the race where one side surely wins, then replays it n times with the
+// timing that makes the other side win live: the replay takes the recorded branch.
+fn forced(name str, send i64, timer i64, rsend i64, rtimer i64, n i64) ! {
+	let rec = try taped(0, raceOf, 0, send, timer)
+	say.Line(name, "recorded:", rec.got, schedprobe.Events(rec.tp))
+	let live = try taped(-1, raceOf, 0, rsend, rtimer)
+	mut same i64 = 0
+	mut clean i64 = 0
+	for i in 0..n {
+		let r = try taped(rec.tp, raceOf, 0, rsend, rtimer)
+		if r.got == rec.got {
+			same += 1
+		}
+		if schedprobe.Diverged(r.tp) == "" && schedprobe.Left(r.tp) == 0 {
+			clean += 1
+		}
+		schedprobe.Free(r.tp)
+	}
+	say.Line(name, "live now:", live.got, "replayed:", same, "of", n, "took", rec.got, "clean:", clean)
+	schedprobe.Free(rec.tp)
+}
+
+fn checks() ! {
+	// No tape: a select runs as before.
+	let plain = try taped(-1, raceOf, 0, 0, 1000)
+	say.Line("no tape:", plain.got)
+
+	try forced("lane", 0, 1000, 40, 1, 20)
+	try forced("timer", 1000, 1, 0, 40, 20)
+
+	// A real race: the child's 1 to 3 ms wait against a 2 ms timer, recorded n times; each
+	// tape replays its own branch under both timings that would decide it live.
+	let n = 30
+	mut agreed i64 = 0
+	for i in 0..n {
+		let rec = try taped(0, raceOf, 0, 1 + i % 3, 2)
+		let a = try taped(rec.tp, raceOf, 0, 0, 30)
+		let b = try taped(rec.tp, raceOf, 0, 30, 0)
+		if a.got == rec.got && b.got == rec.got && schedprobe.Diverged(a.tp) == "" && schedprobe.Diverged(b.tp) == "" {
+			agreed += 1
+		}
+		schedprobe.Free(a.tp)
+		schedprobe.Free(b.tp)
+		schedprobe.Free(rec.tp)
+	}
+	say.Line("race:", agreed, "of", n, "recordings replayed their branch under both timings")
+
+	// A select left by its boundary's deadline records the arm count; its replay waits for the
+	// boundary to end it too.
+	let cut = try taped(0, boundedOf, 5, 0, 0)
+	say.Line("deadline recorded:", cut.got, schedprobe.Events(cut.tp))
+	let cutr = try taped(cut.tp, boundedOf, 20, 0, 0)
+	say.Line("deadline replayed:", cutr.got, "diverged:", schedprobe.Diverged(cutr.tp) != "")
+
+	// A tape replayed by a select at another site diverges, and that select runs live.
+	let rec = try taped(0, raceOf, 0, 0, 1000)
+	let wrong = try taped(rec.tp, otherOf, 0, 0, 0)
+	say.Line("other site:", wrong.got, schedprobe.Diverged(wrong.tp))
+}
+
+fn main() {
+	checks() catch err {
+		say.Line("fault:", err)
+	}
+}

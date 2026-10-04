@@ -77,7 +77,8 @@ cores never share a line.
 
 **Ingot heap.** `rt_ingot_alloc(n)` returns zeroed, 16-byte-aligned memory from the
 core's mmap heap. The 16 classes are 16, 32, 48, 64, 96, 128, 192, 256 ... 3072,
-4096 bytes, including a 16-byte `[owning heap, requested size]` header. Local free
+4096 bytes, including a 16-byte `[owning heap, size word]` header (the size word's bits
+47-62 hold the reclamation count, below). Local free
 lists and 1 MiB slab bump sources live in the heap's own page mapping. Larger blocks
 have a page-rounded mapping of their own; `rt_ingot_free(p)` releases them with
 `munmap`. Request pool chunks use the same checked mapping allocator.
@@ -85,9 +86,8 @@ have a page-rounded mapping of their own; `rt_ingot_free(p)` releases them with
 `rt_ingot_free(p)` returns a small block directly when called on its owning core.
 A different core appends it to the owner's return queue under an atomic lock; the
 owner drains that queue before allocating. Blocks remain tied to their owner even
-when returned elsewhere. Heap pages and slabs live for the process lifetime; owner
-retirement and long-lived slab reclamation belong to #176. Maps release their old
-ingot tables when they grow. The compiler uses the same memory core with a single heap.
+when returned elsewhere. Heap pages and slabs live for the process lifetime. Maps release
+their old ingot tables when they grow. The compiler uses the same memory core with a single heap.
 
 Every allocation and mapping checks its size and failure result. Failure writes
 `tin: out of memory (N bytes)` to stderr from static bytes and stack words, then exits
@@ -113,6 +113,19 @@ startup allocations and mappings. Without that explicit flag the variable is ign
 (`rt_keep_str`), structs (`rt_keep_raw`, then their reference fields), slices
 (`rt_keep_slice`, then elements) and maps (a new ingot map, entry by entry) into the
 ingot heap.
+
+**Reclaiming long-lived memory (#176, notes/interface_mem.md).** Each block of a core's
+heap counts the long-lived references to it in its size word. `keep$N` counts what its
+copy holds; stores into globals and provably long-lived containers count the new value and
+drop the old one; maps and long-lived slices count their own entries and elements. A
+block whose count falls to 0 waits in the core's limbo until everything that could have
+borrowed it is past: every task alive when it was dropped has ended, and the core's own
+stack has reset its pool (the end of a request or tick, `hearth.Reset()`). Then its
+children are dropped and it is freed. So `u := cache[k]` stays valid for the rest of the
+request even if another request replaces the entry. Values made while a core initializes
+its globals, and values stored where the compiler cannot count (through a parameter), are
+pinned: they are never freed. `hearth.RcStats()` reports the counted blocks, their bytes
+and the limbo length.
 
 ## 4. Cores and threads: hearth
 
@@ -385,7 +398,11 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   memory in what it captures. The scope's end waits for every child; the first child fault
   cancels the scope, and so its other children, and is the scope's fault (`try` passes it
   on). `t := s.spawn(f)` gives a handle with `t.wait() !` and `t.cancel()`; a child cancelled
-  through its handle does not fail the scope. A child with a value (`s.spawn(fn() !T { ... })`)
+  through its handle does not fail the scope. `s.cancel(reason)` (#143) cancels the scope by
+  hand: every wait inside it, its children's and its body's, fails with `canceled: reason`
+  (`fault.Is(err, fault.Canceled)`), and that is the scope's fault unless a child failed first.
+  `s.yield()` lets the core's other ready tasks run before the caller goes on (in `main`, one
+  of them). A child with a value (`s.spawn(fn() !T { ... })`)
   gives a `spawnedOf[T]` whose `t.wait() !T` is its value or its fault (waiting again gives the
   same value), usable in `select` like any handle. Leaving a scope body early, by `return` or
   a `try`'s fault, cancels and joins the children still running, then leaves the scope. In a server the event loop resumes children;
@@ -628,3 +645,23 @@ _start (ELF) or dyld (Mach-O) -> main (the generated __start):
   main.main()
   rt_exit()                   flush stdout, exit(0)
 ```
+
+## 12. Cryptography: constant-time code in seal
+
+TLS (#124) needs primitives whose running time and memory accesses do not depend on secret
+data. The rule in `lib/seal/`: no branch, loop bound or table index depends on a secret byte
+(key, plaintext, shared secret, MAC); lengths and public inputs may. The list below says which
+functions keep that rule, and grows as phase 1 lands.
+
+| function | constant-time in | not constant-time in |
+|---|---|---|
+| `Sha256`, `Sha384`, `Sha512`, `Sum` | the message bytes | its length |
+| `Hmac`, `HmacSha256` | the key and message bytes | their lengths |
+| `HkdfExtract`, `HkdfExpand`, `HkdfExpandLabel` | the key material | lengths, `info`, labels |
+| `ConstantTimeEq`, `Equal` | the bytes | the lengths |
+| `P256PublicKey`, `P256ECDH` and the field and point code under them (`field.tin`, `p256.tin`) | the private key and every coordinate | the validity checks of the key and the peer's point, whose results are public |
+
+`Sha1`, `Pbkdf2Sha256`, the hex and base64 codecs and the RSA-OAEP code are not
+constant-time and must not be used on secrets in a timing-sensitive protocol path.
+Vectors: `tools/ci/crypto_check.py` runs the Wycheproof files in `tests/wycheproof/`
+(including the invalid inputs) and random inputs checked against Python's `hashlib`.

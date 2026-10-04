@@ -1,0 +1,481 @@
+// Writing replay capsules (notes/interface_replay.md, sections 1, 5 and 6; #241): the switches,
+// the keyed hash of secrets, the capsule body and its envelope, and the bounded spool. Reading
+// capsules is #242's, next to this file.
+package replay
+
+import "quarry"
+import "say"
+import "seal"
+
+// The switches, read once by Setup before the cores start (malloc'd copies, shared by every core).
+shared var gOn bool         // recording is on
+shared var gDir str         // TIN_REPLAY_DIR
+shared var gKe str          // the keystream key: HMAC-SHA256(K, "tin replay enc")
+shared var gKm str          // the tag key: HMAC-SHA256(K, "tin replay mac")
+shared var gKs str          // the secret key: HMAC-SHA256(K, "tin replay secret")
+shared var gSample i64      // TIN_REPLAY_SAMPLE in parts per billion
+shared var gMaxBytes i64    // TIN_REPLAY_MAX_MB in bytes
+shared var gCores i64       // the cores sharing the spool's bound
+shared var gDrop str        // ",name,name," lower case: header values not stored
+shared var gSpool i64       // per core, 64 bytes: the capsules it keeps (section 6)
+shared var gProgram str     // argv[0]
+
+// Per core: its sampling generator.
+var sampleState u64
+
+const envMagic = "TINCAP\x01\x00"
+const schema = 1
+const flagPanicked = 1
+const flagSampled = 2
+const secretDefaults = "authorization,proxy-authorization,cookie"
+
+// A core's spool list, at gSpool + core*64: the capsules it keeps, oldest first.
+const spNames = 0 // malloc'd words: per capsule its name (a malloc'd str) and its size
+const spHead = 1  // the oldest entry still kept
+const spLen = 2   // entries used (head included)
+const spCap = 3
+const spBytes = 4 // bytes of the capsules kept
+const spCount = 5 // capsules this core wrote (the N of their names)
+
+// Setup reads the switches (TIN_REPLAY_DIR, TIN_REPLAY_KEY, TIN_REPLAY_SAMPLE, TIN_REPLAY_MAX_MB,
+// TIN_REPLAY_SECRET_HEADERS, TIN_REPLAY_DROP_HEADERS) for a server on n cores, trims the spool
+// and installs the keyed hash of secrets; it reports whether recording is on. Call it before
+// the cores start. A missing or malformed key, or a spool that cannot be made, prints one
+// line on stderr and leaves recording off.
+func Setup(cores i64) bool {
+	gOn = false
+	dir := quarry.Getenv("TIN_REPLAY_DIR")
+	if dir == "" {
+		return false
+	}
+	k, err := seal.HexDecode(quarry.Getenv("TIN_REPLAY_KEY"))
+	if err != nil || len(k) != 32 {
+		warn("replay: recording is off: TIN_REPLAY_KEY must be 64 hex digits")
+		return false
+	}
+	key := str(k)
+	if !quarry.IsDir(dir) {
+		quarry.MkdirAll(dir) catch err {
+			warn("replay: recording is off: " + say.Str(err))
+			return false
+		}
+	}
+	if cores < 1 {
+		cores = 1
+	}
+	gDir = held(dir)
+	gKe = held(str(seal.HmacSha256(key, "tin replay enc")))
+	gKm = held(str(seal.HmacSha256(key, "tin replay mac")))
+	gKs = held(str(seal.HmacSha256(key, "tin replay secret")))
+	gSample = fraction(quarry.Getenv("TIN_REPLAY_SAMPLE"))
+	gMaxBytes = 256 << 20
+	mb := quarry.Getenv("TIN_REPLAY_MAX_MB")
+	if mb != "" {
+		gMaxBytes = decimal(mb) << 20
+	}
+	gCores = cores
+	gDrop = held(list("", quarry.Getenv("TIN_REPLAY_DROP_HEADERS")))
+	args := quarry.Args()
+	gProgram = held("")
+	if len(args) > 0 {
+		gProgram = held(args[0])
+	}
+	rt_replay_setup(Secret, list(secretDefaults, quarry.Getenv("TIN_REPLAY_SECRET_HEADERS")))
+	gSpool = calloc(cores*8, 8)
+	trim_start()
+	gOn = true
+	return true
+}
+
+// On reports whether Setup turned recording on.
+func On() bool {
+	return gOn
+}
+
+// Secret is the handle an effect key or a stored header holds instead of a secret's text:
+// "tin-secret:" and the first 16 bytes of HMAC-SHA256(Ks, s) in hex (section 5.1).
+func Secret(s str) str {
+	h := seal.HmacSha256(gKs, s)
+	return "tin-secret:" + seal.Hex(h[:16])
+}
+
+// Wanted is the flags a capsule of a request that ended with status is kept with (1 panicked,
+// 2 sampled), or -1 when it is dropped: kept when the status is 500 or more, or it panicked,
+// or it is in the TIN_REPLAY_SAMPLE fraction.
+func Wanted(status i64, panicked bool) i64 {
+	if panicked {
+		return flagPanicked
+	}
+	if status >= 500 {
+		return 0
+	}
+	if gSample <= 0 {
+		return -1
+	}
+	if gSample >= 1000000000 || i64(next_sample()%1000000000) < gSample {
+		return flagSampled
+	}
+	return -1
+}
+
+// Done ends the recording tape tp of a request served on core: its capsule is written when the
+// request is kept (Wanted), and the tape is freed. A capsule that cannot be written prints one
+// line on stderr; the server goes on.
+func Done(tp i64, core i64) {
+	if tp == 0 {
+		return
+	}
+	flags := Wanted(tp[10], tp[11] != 0)
+	if flags >= 0 && gOn {
+		Write(tp, core, flags) catch err {
+			warn("replay: capsule not written: " + say.Str(err))
+			""
+		}
+	}
+	rt_tape_free(tp)
+}
+
+// Write writes the capsule of tape tp (recorded on core, with flags) into the spool, deleting
+// the core's oldest capsules past its share of TIN_REPLAY_MAX_MB; it returns the capsule's path.
+func Write(tp i64, core i64, flags i64) !str {
+	data := Seal(Encode(tp, core, flags))
+	wall := tp[13]
+	if wall == 0 {
+		wall = rt_wall_ns()
+	}
+	sp := gSpool + (core%gCores)*64
+	sp[spCount]++
+	name := pad(wall, 20) + "-" + pad(core, 3) + "-" + say.Str(sp[spCount]) + ".tcap"
+	path := gDir + "/" + name
+	try quarry.WriteFile(path + ".tmp", data)
+	quarry.Rename(path + ".tmp", path) catch err {
+		remove(path + ".tmp")
+		fail err
+	}
+	spool_add(sp, name, len(data))
+	spool_trim(sp, gMaxBytes / gCores)
+	return path
+}
+
+// Encode is the capsule body of tape tp (section 6): the request with its secret headers as
+// handles and its dropped headers empty, the panic, and the effect records.
+func Encode(tp i64, core i64, flags i64) str {
+	req := ""
+	if tp[8] != 0 {
+		req = rt_str_from_raw(tp[8], tp[9])
+	}
+	pan := ""
+	if tp[11] != 0 {
+		pan = rt_str_from_raw(tp[11], tp[12])
+	}
+	if pan != "" {
+		flags |= flagPanicked
+	}
+	b := make([]u8, 0, 256+len(req)+len(pan)+tp[2])
+	b = put_word(b, schema)
+	b = put_str(b, "dev")
+	b = put_str(b, gProgram)
+	b = put_word(b, tp[13])
+	b = put_word(b, core)
+	b = put_word(b, tp[10])
+	b = put_word(b, flags)
+	b = put_str(b, Scrub(req))
+	b = put_str(b, pan)
+	b = put_word(b, tp[4])
+	if tp[2] > 0 {
+		b = append(b, rt_str_from_raw(tp[1], tp[2])...)
+	}
+	return str(b)
+}
+
+// Seal is the envelope of a capsule body (section 6): the magic, a random nonce, the body under
+// the HMAC-SHA256 keystream, and the tag over all of it.
+func Seal(body str) str {
+	nonce := str(seal.RandomBytes(16))
+	out := make([]u8, 0, len(body)+56)
+	out = append(out, envMagic...)
+	out = append(out, nonce...)
+	for i := 0; i*32 < len(body); i++ {
+		ks := seal.HmacSha256(gKe, nonce + str(put_word(make([]u8, 0, 8), i)))
+		for j := 0; j < 32 && i*32+j < len(body); j++ {
+			out = append(out, body[i*32+j]^ks[j])
+		}
+	}
+	tag := seal.HmacSha256(gKm, str(out))
+	out = append(out, tag...)
+	return str(out)
+}
+
+// Scrub is a request as a capsule stores it: the values of secret headers (section 1) become
+// their handles and the values of dropped headers become empty; everything else is kept.
+func Scrub(req str) str {
+	i := 0
+	for i < len(req) && req[i] != '\n' {
+		i++
+	}
+	if i >= len(req) {
+		return req
+	}
+	b := make([]u8, 0, len(req)+64)
+	b = append(b, req[:i+1]...)
+	i++
+	for i < len(req) {
+		e := i
+		for e < len(req) && req[e] != '\n' {
+			e++
+		}
+		line := req[i:e]
+		if line == "" || line == "\r" {
+			// The end of the headers: the body is kept as received.
+			b = append(b, req[i:]...)
+			return str(b)
+		}
+		b = append(b, scrub_line(line)...)
+		if e < len(req) {
+			b = append(b, '\n')
+		}
+		i = e + 1
+	}
+	return str(b)
+}
+
+// scrub_line is one header line with its value hashed or dropped by the policy.
+func scrub_line(line str) str {
+	colon := -1
+	for i := 0; i < len(line); i++ {
+		if line[i] == ':' {
+			colon = i
+			break
+		}
+	}
+	if colon <= 0 {
+		return line
+	}
+	name := line[:colon]
+	cr := ""
+	stop := len(line)
+	if stop > 0 && line[stop-1] == '\r' {
+		cr = "\r"
+		stop--
+	}
+	v := colon + 1
+	for v < stop && (line[v] == ' ' || line[v] == '\t') {
+		v++
+	}
+	e := stop
+	for e > v && (line[e-1] == ' ' || line[e-1] == '\t') {
+		e--
+	}
+	if rt_has_word(gDrop, name) {
+		return name + ":" + cr
+	}
+	if rt_secret_header(name) {
+		return name + ": " + rt_secret_key(line[v:e]) + cr
+	}
+	return line
+}
+
+// ---- the spool ----
+
+// trim_start deletes the spool's oldest capsules (by name) while it holds more than
+// TIN_REPLAY_MAX_MB, then gives each core the capsules it wrote, to bound with its share.
+func trim_start() {
+	names := quarry.ReadDir(gDir) catch err {
+		warn("replay: spool not trimmed: " + say.Str(err))
+		return
+	}
+	sizes := make([]i64, 0, len(names))
+	total := 0
+	for _, n := range names {
+		s := 0
+		if is_capsule(n) {
+			sz, err := quarry.Size(gDir + "/" + n)
+			if err == nil {
+				s = sz
+			}
+		}
+		sizes = append(sizes, s)
+		total += s
+	}
+	for i, n := range names {
+		if !is_capsule(n) {
+			continue
+		}
+		if total > gMaxBytes {
+			remove(gDir + "/" + n)
+			total -= sizes[i]
+			continue
+		}
+		spool_add(gSpool + (core_of(n)%gCores)*64, n, sizes[i])
+	}
+}
+
+// is_capsule reports whether a spool file name is a capsule's (WALL-CORE-N.tcap).
+func is_capsule(name str) bool {
+	return len(name) > 25 && name[20] == '-' && name[24] == '-' && name[len(name)-5:] == ".tcap"
+}
+
+func core_of(name str) i64 {
+	return decimal(name[21:24])
+}
+
+// spool_add appends a capsule to a core's spool list.
+func spool_add(sp i64, name str, size i64) {
+	if sp[spLen] == sp[spCap] {
+		if sp[spHead] > 0 {
+			// Move the kept entries to the front before growing.
+			k := sp[spLen] - sp[spHead]
+			memmove(sp[spNames], sp[spNames]+sp[spHead]*16, k*16)
+			sp[spLen] = k
+			sp[spHead] = 0
+		}
+		if sp[spLen] == sp[spCap] {
+			c := sp[spCap] * 2
+			if c < 64 {
+				c = 64
+			}
+			sp[spNames] = realloc(sp[spNames], c*16)
+			sp[spCap] = c
+		}
+	}
+	e := sp[spNames] + sp[spLen]*16
+	e[0] = rt_raw_str(name)
+	e[1] = size
+	sp[spLen]++
+	sp[spBytes] += size
+}
+
+// spool_trim deletes a core's oldest capsules while they take more than max bytes; the newest
+// one stays even when it alone is larger.
+func spool_trim(sp i64, max i64) {
+	for sp[spBytes] > max && sp[spLen]-sp[spHead] > 1 {
+		e := sp[spNames] + sp[spHead]*16
+		remove(gDir + "/" + cast(str, e[0]))
+		sp[spBytes] -= e[1]
+		free(e[0])
+		sp[spHead]++
+	}
+}
+
+// ---- helpers ----
+
+// held is a malloc'd copy of s that outlives every pool (for the shared switches).
+func held(s str) str {
+	return cast(str, rt_raw_str(s))
+}
+
+// list is ",a,b," (lower case, spaces dropped) from the comma lists a and b.
+func list(a str, b str) str {
+	out := make([]u8, 0, len(a)+len(b)+3)
+	out = append(out, ',')
+	for _, s := range []str{a, b} {
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			if c == ',' {
+				if out[len(out)-1] != ',' {
+					out = append(out, ',')
+				}
+			} else if c != ' ' && c != '\t' {
+				if c >= 'A' && c <= 'Z' {
+					c += 32
+				}
+				out = append(out, c)
+			}
+		}
+		if out[len(out)-1] != ',' {
+			out = append(out, ',')
+		}
+	}
+	return str(out)
+}
+
+// fraction is a decimal fraction from 0 to 1 in parts per billion; anything else is 0.
+func fraction(s str) i64 {
+	whole := 0
+	part := 0
+	scale := 1000000000
+	dot := false
+	if s == "" {
+		return 0
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '.' && !dot {
+			dot = true
+		} else if c >= '0' && c <= '9' {
+			if !dot {
+				whole = whole*10 + i64(c-'0')
+				if whole > 1 {
+					return 1000000000
+				}
+			} else if scale > 1 {
+				scale /= 10
+				part += i64(c-'0') * scale
+			}
+		} else {
+			return 0
+		}
+	}
+	if whole >= 1 {
+		return 1000000000
+	}
+	return part
+}
+
+// decimal is the non-negative integer s, or 0.
+func decimal(s str) i64 {
+	v := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0
+		}
+		v = v*10 + i64(s[i]-'0')
+	}
+	return v
+}
+
+// pad is v in decimal with leading zeros to width digits.
+func pad(v i64, width i64) str {
+	s := say.Str(v)
+	for len(s) < width {
+		s = "0" + s
+	}
+	return s
+}
+
+func put_word(b []u8, v i64) []u8 {
+	for i := 0; i < 8; i++ {
+		b = append(b, u8(v >> (8 * i)))
+	}
+	return b
+}
+
+func put_str(b []u8, s str) []u8 {
+	b = put_word(b, len(s))
+	b = append(b, s...)
+	return b
+}
+
+// next_sample is the next draw of this core's sampling generator (xorshift64*).
+func next_sample() u64 {
+	if sampleState == 0 {
+		sampleState = u64(rt_mono_ns()) ^ 0x9e3779b97f4a7c15
+	}
+	sampleState ^= sampleState >> 12
+	sampleState ^= sampleState << 25
+	sampleState ^= sampleState >> 27
+	return sampleState * 0x2545f4914f6cdd1d
+}
+
+// remove deletes a spool file; one already gone is not an error.
+func remove(path str) {
+	err := quarry.Remove(path)
+	if err != nil {
+		return
+	}
+}
+
+func warn(msg str) {
+	m := msg + "\n"
+	rt_write_all(2, cast(i64, m)+8, len(m))
+}
