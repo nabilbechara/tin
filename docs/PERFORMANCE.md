@@ -73,9 +73,31 @@ Measured on an Apple M3 Pro (5 performance + 6 efficiency cores), Go 1.26, fasth
 machine as the server. Linux numbers come from an arm64 Debian container under Docker
 Desktop, running natively. Scripts: TOOLING.md §7.
 
+## v0.4 service benchmark
+
 The v0.4 service benchmark (`GET /users/{id}` through Redis over MySQL, Tin vs Go + chi
-under wrk2, `bench/v04`) is built but not yet measured on a quiet machine; its results
-will go here (issue #74).
+under wrk2, `bench/v04`) was run by [Benchmark v0.4 workflow run 37183295332](https://github.com/yasserreslan/tin/actions/runs/37183295332).
+It used Ubuntu 24.04 on an AMD EPYC 9V74 80-Core Processor (4 vCPUs exposed), Linux
+kernel `6.17.0-1022-azure`, Go 1.26.8, two server cores, wrk2 with 2 threads and 128
+connections, 20 seconds per sample, and the median of 3 alternating rounds. The load
+generator ran on the same runner as the servers. Redis 7.2 and MySQL 8.0 were local
+service containers.
+
+| scenario | server | max req/s | req/CPU-s | fixed req/s | p50 ms | p99 ms | p99.9 ms | RSS MB |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| cached | Tin | 108,804 | 75,457 | 19,849 | 1.11 | 2.21 | 2.51 | 66 |
+| cached | Go + chi | 28,356 | 21,424 | 19,849 | 1.49 | 6.11 | 17.79 | 27 |
+| db | Tin | 24,883 | 31,104 | 13,509 | 1.40 | 3.13 | 3.68 | 35 |
+| db | Go + chi | 19,300 | 17,545 | 13,509 | 2.51 | 6.06 | 7.44 | 24 |
+| mixed | Tin | 102,321 | 73,650 | 20,472 | 1.19 | 44.54 | 52.26 | 60 |
+| mixed | Go + chi | 29,247 | 21,664 | 20,472 | 1.41 | 44.86 | 53.28 | 25 |
+
+Tin's maximum throughput was 3.84x Go for cached reads, 1.29x for direct database
+reads, and 3.50x for the mixed workload. At the fixed rate, Tin had lower p50 and p99
+latency in every scenario; the mixed workload's p99 was effectively equal because its
+0.5% `/slow` requests dominate the tail. Tin used more RSS in this run, especially for
+the cached workload, so memory is an explicit tradeoff rather than an across-the-board
+win. This closes issue #74.
 
 ## 1. HTTP
 
