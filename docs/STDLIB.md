@@ -186,6 +186,7 @@ Package hearth runs a program on every core: one thread per core, each with its 
 - `PoolChunk() i64`: PoolChunk is the request pool chunk size in bytes each core uses (after pool_tune).
 - `PoolCapacity() i64`: PoolCapacity is the usable size in bytes of this core's current base pool chunk (0 before its first request allocation).
 - `Reset()`: Reset ends the current request: the core's pool is emptied for the next one.
+- `RcStats() (i64, i64, i64)`: RcStats reports what long-lived memory this core still counts (#176): the number of counted blocks, their bytes and how many dropped blocks wait in the limbo.
 
 ## relay
 
@@ -908,8 +909,16 @@ Package stamp computes non-cryptographic hashes and checksums: FNV-1a, CRC-32 (I
 
 ## seal
 
-Package seal has cryptographic hashes (SHA-256, SHA-1), HMAC-SHA256, PBKDF2-HMAC-SHA-256, constant-time comparison, secure random bytes, the hex and base64 encodings, and RSA-OAEP encryption with a public key.
+Package seal has cryptographic hashes (SHA-256, SHA-384, SHA-512, SHA-1), HMAC over any of the SHA-2 hashes, HKDF, PBKDF2-HMAC-SHA-256, constant-time comparison, secure random bytes, the hex and base64 encodings, and RSA-OAEP encryption with a public key.
 
+- `type Hash enum { SHA256, SHA384, SHA512 }`: Hash names a SHA-2 function for Hmac and HKDF.
+- `Sum(h Hash, s secret str) []u8`: Sum is the digest of s under h; s may be secret.
+- `Size(h Hash) i64`: Size is the length in bytes of h's digest.
+- `BlockSize(h Hash) i64`: BlockSize is the length in bytes of h's input block (the HMAC key block).
+- `Hmac(h Hash, key secret str, msg str) []u8`: Hmac is the HMAC of msg under key with hash h (RFC 2104); key may be secret.
+- `HkdfExtract(h Hash, salt str, ikm secret str) []u8`: HkdfExtract is HKDF-Extract(salt, ikm) (RFC 5869): a pseudorandom key of Size(h) bytes. An empty salt means Size(h) zero bytes. ikm may be secret.
+- `HkdfExpand(h Hash, prk secret str, info str, n i64) ![]u8`: HkdfExpand is HKDF-Expand(prk, info, n) (RFC 5869): n bytes, at most 255*Size(h). prk may be secret.
+- `HkdfExpandLabel(h Hash, key secret str, label str, context str, n i64) ![]u8`: HkdfExpandLabel is TLS 1.3's HKDF-Expand-Label(secret, label, context, n) (RFC 8446 section 7.1); label is given without the "tls13 " prefix. key may be secret.
 - `Sha256(s secret str) []u8`: Sha256 is the SHA-256 digest of s (32 bytes); s may be secret.
 - `Sha256Soft(s str) []u8`: Sha256Soft is SHA-256 in portable code (the reference the hardware path is tested against).
 - `Sha256Hex(s secret str) str`: Sha256Hex is the SHA-256 digest of s in lower-case hex; s may be secret.
@@ -929,6 +938,8 @@ Package seal has cryptographic hashes (SHA-256, SHA-1), HMAC-SHA256, PBKDF2-HMAC
 - `type RSAPublicKey struct`: RSAPublicKey is an RSA public key: modulus N and exponent E, as big-endian bytes.
 - `ParseRSAPublicKeyPEM(pem str) !RSAPublicKey`: ParseRSAPublicKeyPEM reads a PEM "PUBLIC KEY" (SubjectPublicKeyInfo) or "RSA PUBLIC KEY" (PKCS #1) block.
 - `EncryptOAEPSha1(key RSAPublicKey, msg []u8) ![]u8`: EncryptOAEPSha1 encrypts msg for key with RSA-OAEP (SHA-1, MGF1-SHA-1, empty label), as MySQL's caching_sha2_password and sha256_password expect.
+- `Sha512(s secret str) []u8`: Sha512 is the SHA-512 digest of s (64 bytes); s may be secret.
+- `Sha384(s secret str) []u8`: Sha384 is the SHA-384 digest of s (48 bytes); s may be secret.
 
 ## herald
 

@@ -1,0 +1,111 @@
+package seal
+
+// ---- HMAC over any SHA-2 hash, HKDF (RFC 5869) and TLS 1.3's HKDF-Expand-Label ----
+
+// Hash names a SHA-2 function for Hmac and HKDF.
+type Hash enum { SHA256, SHA384, SHA512 }
+
+// Sum is the digest of s under h; s may be secret.
+func Sum(h Hash, s secret str) []u8 {
+	switch h {
+	case SHA256:
+		return Sha256(s)
+	case SHA384:
+		return Sha384(s)
+	case SHA512:
+		return Sha512(s)
+	}
+	return []u8{}
+}
+
+// Size is the length in bytes of h's digest.
+func Size(h Hash) i64 {
+	switch h {
+	case SHA256:
+		return 32
+	case SHA384:
+		return 48
+	case SHA512:
+		return 64
+	}
+	return 0
+}
+
+// BlockSize is the length in bytes of h's input block (the HMAC key block).
+func BlockSize(h Hash) i64 {
+	switch h {
+	case SHA256:
+		return 64
+	case SHA384, SHA512:
+		return 128
+	}
+	return 0
+}
+
+// Hmac is the HMAC of msg under key with hash h (RFC 2104); key may be secret.
+func Hmac(h Hash, key secret str, msg str) []u8 {
+	bs := BlockSize(h)
+	k := []u8(key)
+	if len(k) > bs {
+		k = Sum(h, key)
+	}
+	ipad := make([]u8, bs, bs+len(msg))
+	opad := make([]u8, bs, bs+Size(h))
+	for i := 0; i < bs; i++ {
+		x := u8(0)
+		if i < len(k) {
+			x = k[i]
+		}
+		ipad[i] = x ^ 0x36
+		opad[i] = x ^ 0x5c
+	}
+	ipad = append(ipad, msg...)
+	inner := Sum(h, str(ipad))
+	opad = append(opad, inner...)
+	return Sum(h, str(opad))
+}
+
+// HkdfExtract is HKDF-Extract(salt, ikm) (RFC 5869): a pseudorandom key of Size(h) bytes. An
+// empty salt means Size(h) zero bytes. ikm may be secret.
+func HkdfExtract(h Hash, salt str, ikm secret str) []u8 {
+	s := salt
+	if len(s) == 0 {
+		s = str(make([]u8, Size(h)))
+	}
+	return Hmac(h, s, ikm)
+}
+
+// HkdfExpand is HKDF-Expand(prk, info, n) (RFC 5869): n bytes, at most 255*Size(h). prk may be
+// secret.
+func HkdfExpand(h Hash, prk secret str, info str, n i64) ![]u8 {
+	hs := Size(h)
+	if n < 0 || n > 255*hs {
+		fail "seal: HKDF output length out of range"
+	}
+	out := make([]u8, 0, n+hs)
+	t := make([]u8, 0, hs+len(info)+1)
+	for i := 1; len(out) < n; i++ {
+		t = append(t, info...)
+		t = append(t, u8(i))
+		block := Hmac(h, prk, str(t))
+		out = append(out, block...)
+		t = t[:0]
+		t = append(t, block...)
+	}
+	return out[:n]
+}
+
+// HkdfExpandLabel is TLS 1.3's HKDF-Expand-Label(secret, label, context, n) (RFC 8446 section
+// 7.1); label is given without the "tls13 " prefix. key may be secret.
+func HkdfExpandLabel(h Hash, key secret str, label str, context str, n i64) ![]u8 {
+	if n < 0 || n > 65535 || len(label)+6 > 255 || len(context) > 255 {
+		fail "seal: HKDF-Expand-Label argument out of range"
+	}
+	info := make([]u8, 0, 4+6+len(label)+len(context))
+	info = append(info, u8(n>>8), u8(n), u8(6+len(label)))
+	info = append(info, "tls13 "...)
+	info = append(info, label...)
+	info = append(info, u8(len(context)))
+	info = append(info, context...)
+	return try HkdfExpand(h, key, str(info), n)
+}

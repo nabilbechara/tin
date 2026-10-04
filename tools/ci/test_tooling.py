@@ -178,6 +178,39 @@ class PackageResolutionTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('tin.lock hash mismatch', result.stderr)
 
+    def test_vendor_refuses_bad_requires(self):
+        # tin vendor (#146): a require needs a domain path and one source; the build never fetches.
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            (work / 'a').mkdir()
+            (work / 'b').mkdir()
+            (work / 'a/a.tin').write_text('package a\n')
+            (work / 'b/a.tin').write_text('package a\n')
+            (work / 'b/tin.mod').write_text('require example.com/a ../a\n')
+            project = work / 'app'
+            project.mkdir()
+            env = make_env(TIN_ROOT=str(ROOT), TMPDIR=directory)
+
+            def vendor(manifest):
+                (project / 'tin.mod').write_text(manifest)
+                return subprocess.run(['sh', str(ROOT / 'tin'), 'vendor', str(project)],
+                                      capture_output=True, text=True, env=env)
+
+            result = vendor('require a ../a\n')
+            self.assertEqual(result.returncode, 1)
+            self.assertIn('an import path starts with a domain', result.stderr)
+            result = vendor('require example.com/a ../missing\n')
+            self.assertEqual(result.returncode, 1)
+            self.assertIn('is not a directory', result.stderr)
+            # b requires example.com/a from ../a while the project takes it from ../b.
+            result = vendor('require example.com/a ../b\nrequire example.com/b ../b\n')
+            self.assertEqual(result.returncode, 1)
+            self.assertIn('example.com/a is required from two sources', result.stderr)
+            self.assertFalse((project / 'vendor').exists())
+            result = vendor('// one dependency\nrequire example.com/a ../a\n')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((project / 'vendor/example.com/a/a.tin').read_text(), 'package a\n')
+
 
 if __name__ == '__main__':
     unittest.main()

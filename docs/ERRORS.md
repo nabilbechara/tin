@@ -715,9 +715,10 @@ importing file (`import "./geom"`).
 
 ### E111 LOCK_MISMATCH
 
-When the project directory has a `tin.lock`, every source file outside the standard library
-must be listed in it with its SHA-256 hash (docs/PACKAGES.md), so changed or unexpected code
-does not build.
+When the project directory has a `tin.lock`, every vendored source file (under `vendor/`) must
+be listed in it with its SHA-256 hash, and every other file the lock lists must still have the
+hash it records (docs/PACKAGES.md). A changed or unexpected dependency does not build; the
+message names the file, the hash the lock records and the hash the file has.
 
 ```text file=tin.lock
 0000000000000000000000000000000000000000000000000000000000000000 example.tin
@@ -731,10 +732,61 @@ func main() {
 ```
 
 ```text
-error E111 LOCK_MISMATCH: tin.lock hash mismatch or missing entry for example.tin
+error E111 LOCK_MISMATCH: tin.lock hash mismatch for example.tin: the lock records sha256 0000000000000000000000000000000000000000000000000000000000000000, the file has 7531bb038e7638befa0dc8bdd22788bf076dbef70ab580b80adb3087074f96ba
 ```
 
-Fix: review the change, then regenerate the file's entry (`shasum -a 256 example.tin`).
+Fix: review the change; if it is intended, run `tin vendor` to copy the dependency again and
+record the new hashes (or regenerate the entry with `shasum -a 256 example.tin`).
+
+### E112 NOT_VENDORED
+
+An import path whose first element contains a dot (`github.com/ana/geo`) names a package by
+where it comes from. It is read only from `vendor/<path>` in the program's directory: never
+from the standard library, and never from the network (docs/PACKAGES.md).
+
+```tin
+package main
+
+import "example.com/geo"
+
+func main() {
+}
+```
+
+```text
+error E112 NOT_VENDORED: package "example.com/geo" is not vendored: there is no vendor/example.com/geo in the program's directory (tin vendor copies it there; the build never fetches)
+```
+
+Fix: add the package to `tin.mod` with `require` and run `tin vendor`.
+
+### E113 PACKAGE_CONFLICT
+
+A package's name is the last element of its import path, and two import paths that load
+different packages under the same name would merge into one package.
+
+```text file=vendor/example.com/say/say.tin
+package say
+
+func Hi() {
+}
+```
+
+```tin
+package main
+
+import "say"
+import "example.com/say"
+
+func main() {
+}
+```
+
+```text
+error E113 PACKAGE_CONFLICT: import paths "say" and "example.com/say" are different packages with the same name say
+```
+
+Fix: import only one of them; a vendored package should not reuse the name of a standard
+package or of another dependency.
 
 ### E120 NO_MAIN
 
@@ -2007,6 +2059,40 @@ example.tin:9:11: error E313 USE_AFTER_RESET: 's' may hold request memory from b
 
 Fix: `keep()` the value before the reset, or create it again after.
 
+### E314 DETACH_ESCAPE
+
+A `detach` block runs as a task that outlives the request that started it, so what it
+captures must already be long-lived: request memory is an error unless it was kept first,
+or the block reads it only inside `keep()`.
+
+```tin edition=1
+package main
+
+mut flushed str = ""
+
+fn flush(s str) {
+	flushed = keep(flushed + s)
+}
+
+fn later(n i64) {
+	let msg = "job {n}"
+	detach {
+		flush(msg)
+	}
+}
+
+fn main() {
+	later(1)
+}
+```
+
+```text
+example.tin:11:2: error E314 DETACH_ESCAPE: detach captures 'msg', which may hold request memory, but the detached task outlives the request: keep() it before the block (let v = keep(...)), or read it in the block only inside keep()
+```
+
+Fix: `let kept = keep(msg)` before the block and use `kept` in it, or write `keep(msg)`
+inside the block.
+
 ### E320 KEEP_TYPE
 
 `keep(x)` copies a value into the long-lived heap, following every reference in it; a type
@@ -3117,6 +3203,43 @@ example.tin:11:11: error E652 POLICY: Plain is not a policy: with needs a value 
 
 Fix: use a policy from the `policy` package (`policy.Retry(3)`), or give the type the `Run`
 method.
+
+### E653 POLICY_BODY
+
+A policy's `Run` may only call its `body`, or pass it to a function that only calls it:
+the block's variables live on the caller's frame, so a body kept for later would outlive
+them.
+
+```tin edition=1
+package main
+
+import "say"
+
+type Saver struct {
+	saved []fn() !i64
+}
+
+fn (s mut Saver) Run(body fn() !i64) !i64 {
+	s.saved = append(s.saved, body)
+	return try body()
+}
+
+fn main() {
+	mut s = Saver{saved: []fn() !i64{}}
+	let a = with s {
+		1
+	} catch _ {
+		0
+	}
+	say.Line(a)
+}
+```
+
+```text
+example.tin:10:28: error E653 POLICY_BODY: Saver.Run keeps the body of a with block: a policy may only call body, or pass it to a function that only calls it (the block's variables live on the caller's frame)
+```
+
+Fix: call `body()` inside `Run` (as often as the policy needs) and keep only its results.
 
 ## E7xx mut parameters
 
