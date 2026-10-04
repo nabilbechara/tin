@@ -23,7 +23,9 @@ so payloads stay 16-byte aligned (docs/RUNTIME.md):
 
 **What is counted.** `rt_rc_*` act only on blocks whose heap word is this core's heap
 (`rt_rc_mine`: `(p-16)[0] == memoryHeap`). Static data, code pointers, request-pool memory
-and other cores' blocks are never counted, so no static data needs a header.
+and other cores' blocks are never counted, so no static data needs a header. A pool's base
+chunk is a heap block whose payload is the pool's first object, so `rt_alloc_slow` pins
+it when it makes it: every rc operation on pool memory is then a no-op.
 
 ## rc operations (lib/runtime/runtime.tin)
 
@@ -72,7 +74,10 @@ rt_rc_stats() (blocks, bytes, limbo)  // per-core diagnostics (roadmap 14.1), he
   when `rt_poll_wait` returns. So a borrowed `u := cache[k]` stays valid until the request
   (or task) that read it ends, however the entry is replaced meanwhile.
 - Known limit: a task that lives for a long time (a hijacked WebSocket, a `detach` loop,
-  a request with no deadline) holds back every release on its core until it ends. A core
+  a request with no deadline) holds back every release on its core until it ends. The
+  limbo is capped at `limboMax` (2^20) blocks per core: past it, `rt_rc_dec` pins a block
+  whose count reaches 0 and `rt_rc_drop_fresh` leaves it, so such a core leaks what it
+  drops (as before this interface) instead of also growing the queue. A core
   whose own stack never reaches a quiescent point (a CLI program that never calls
   `hearth.Reset`) never releases: what it drops leaks, as before this interface.
 

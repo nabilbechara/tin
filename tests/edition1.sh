@@ -36,8 +36,10 @@ fi
 # task.Deadline and task.Canceled read the innermost boundary; nested within takes the
 # earlier deadline (#233).
 # A value main borrowed from a long-lived map stays valid while a spawned child replaces
-# the entry and ends: the core's own stack is an epoch participant (#176).
-for name in boundaries fault_wrap once polls deadlines borrows
+# the entry and ends: the core's own stack is an epoch participant (#176). A detached task
+# that never ends holds back releases; past the limbo's cap drops are pinned (#176).
+# guard CALL is the guard block on one call, and a panic's fault carries its backtrace (#142).
+for name in boundaries fault_wrap once polls deadlines borrows guard_call limbo_cap
 do
 	polls=
 	[ "$name" != polls ] || polls=-polls
@@ -49,6 +51,17 @@ do
 		exit 1
 	fi
 done
+
+# guard takes a block or a call (#142).
+if "$compiler" -edition 1 -o "$tmp/guard_call_bad" tests/edition1/guard_call_bad.tin >"$tmp/guard_call_bad.out" 2>"$tmp/guard_call_bad.err"; then
+	echo "FAIL edition1/guard_call_bad: unexpectedly accepted"
+	exit 1
+fi
+if ! cmp -s tests/edition1/guard_call_bad.err "$tmp/guard_call_bad.err"; then
+	echo "FAIL edition1/guard_call_bad: diagnostic mismatch"
+	diff -u tests/edition1/guard_call_bad.err "$tmp/guard_call_bad.err" || true
+	exit 1
+fi
 
 # wrap without try is rejected (#229).
 if "$compiler" -edition 1 -o "$tmp/fault_wrap_bad" tests/edition1/fault_wrap_bad.tin >"$tmp/fault_wrap_bad.out" 2>"$tmp/fault_wrap_bad.err"; then

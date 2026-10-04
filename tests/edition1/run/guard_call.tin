@@ -1,0 +1,81 @@
+package main
+
+import "fault"
+import "say"
+import "twine"
+
+let ErrMissing = fault("missing")
+
+fn pick(xs []i64, i i64) i64 {
+	return xs[i]
+}
+
+// dig recurses, so it is never inlined and shows in the backtrace.
+fn dig(xs []i64, i i64, n i64) i64 {
+	if n > 0 {
+		return dig(xs, i, n - 1) + 1
+	}
+	return xs[i]
+}
+
+fn load(id i64) !i64 {
+	if id < 0 {
+		fail ErrMissing
+	}
+	return id * 2
+}
+
+// value: guard CALL is the guard block on one call, with type !T.
+fn value() !i64 {
+	let v = try guard pick([]i64{4, 5, 6}, 1)
+	return v
+}
+
+// try inside: a fault of the call is the guard's fault, not a panic.
+fn tried(id i64) !i64 {
+	let v = try guard try load(id)
+	return v
+}
+
+// child: a spawned task's panic is the scope's fault.Panic, with its backtrace.
+fn child(xs []i64) ! {
+	scope s {
+		s.spawn(fn() ! {
+			say.Line("never", dig(xs, 9, 1))
+		})
+	}
+}
+
+fn main() {
+	let xs = []i64{1, 2, 3}
+	let v = value() catch err {
+		say.Line("never", err)
+		0
+	}
+	say.Line("value:", v)
+	let w = guard dig(xs, 5, 2) catch err {
+		let bt = fault.Backtrace(err)
+		say.Line("panic:", err, "is panic:", fault.Is(err, fault.Panic))
+		say.Line("backtrace names dig:", twine.Contains(bt, "dig"))
+		-1
+	}
+	say.Line("after:", w)
+	let a = tried(4) catch err {
+		say.Line("never", err)
+		0
+	}
+	say.Line("tried:", a)
+	tried(-1) catch err {
+		say.Line("tried fault:", err, "missing:", fault.Is(err, ErrMissing), "panic:", fault.Is(err, fault.Panic))
+	}
+	let block = guard {
+		pick(xs, 9)
+	} catch err {
+		say.Line("block backtrace:", len(fault.Backtrace(err)) > 0)
+		0
+	}
+	say.Line("block:", block)
+	child(xs) catch err {
+		say.Line("child:", err, "backtrace names dig:", twine.Contains(fault.Backtrace(err), "dig"))
+	}
+}

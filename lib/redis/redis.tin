@@ -738,6 +738,10 @@ func (c Client) exchange(cmds [][]str) !i64 {
 			fail "redis: an empty command"
 		}
 	}
+	tp := rt_tape()
+	if tp != 0 {
+		return try c.exchange_taped(tp, cmds)
+	}
 	l := c.line()
 	for _, a := range cmds {
 		encode(l, a)
@@ -764,6 +768,65 @@ func (c Client) exchange(cmds [][]str) !i64 {
 		fail m
 	}
 	return s
+}
+
+// ---- recording and replay (notes/interface_replay.md, section 4; #241) ----
+
+// The client and commands of the exchange an effect body makes (read at its start).
+var tapedClient i64
+var tapedCmds i64
+
+// exchange_taped records or replays one exchange as redis@1: the key is the commands (each word
+// as its length, ":" and its bytes), the result the raw replies; it returns a slot holding them.
+func (c Client) exchange_taped(tp i64, cmds [][]str) !i64 {
+	k := make([]u8, 0, 64)
+	for _, a := range cmds {
+		for i, w := range a {
+			if i > 0 {
+				k = append(k, ' ')
+			}
+			k = append(k, mint.Itoa(len(w))...)
+			k = append(k, ':')
+			k = append(k, w...)
+		}
+		k = append(k, '\n')
+	}
+	tapedClient = cast(i64, c)
+	tapedCmds = cast(i64, cmds)
+	v := try rt_effect(tp, "redis@1", str(k), exchange_live)
+	if len(cmds) > 0 && !replies_fit(v, len(cmds)) {
+		fail "replay: redis@1 replies are damaged"
+	}
+	s := new_slot(len(cmds))
+	s[sMsg] = malloc(len(v) + 1)
+	memcpy(s[sMsg], cast(i64, v)+8, len(v))
+	s[sMsgN] = len(v)
+	s[sMsgCap] = len(v) + 1
+	s[sGot] = len(cmds)
+	s[sState] = 1
+	return s
+}
+
+func exchange_live() !str {
+	c := cast(Client, tapedClient)
+	s := try c.exchange(cast([][]str, tapedCmds))
+	v := rt_str_from_raw(s[sMsg], s[sMsgN])
+	free_slot(s)
+	return v
+}
+
+// replies_fit reports whether v holds exactly n complete replies.
+func replies_fit(v str, n i64) bool {
+	p := cast(i64, v) + 8
+	at := 0
+	for i := 0; i < n; i++ {
+		k := resp_len(p+at, len(v)-at)
+		if k <= 0 {
+			return false
+		}
+		at += k
+	}
+	return at == len(v)
 }
 
 // Do sends one command and returns its reply; an error reply fails.
