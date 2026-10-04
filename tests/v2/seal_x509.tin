@@ -1,0 +1,122 @@
+package main
+
+import "say"
+import "seal"
+import "quarry"
+import "twine"
+
+// Verifies every case of a test PKI made by bench/ref/x509_pki (default: the copy in
+// tests/data/x509; tools/ci/x509_check.py passes a fresh one). Prints "NAME OK n" or
+// "NAME FAIL class: fault"; bench/ref/seal_x509 is the Go twin (it prints the class only).
+
+var dir = "tests/data/x509"
+
+func load(name str) !seal.Certificate {
+	text := try quarry.ReadFile(dir + "/certs/" + name + ".pem")
+	certs := try seal.ParseCertificatesPEM(text)
+	return certs[0]
+}
+
+func pool(list str) !seal.CertPool {
+	p := seal.NewCertPool()
+	if list == "-" {
+		return p
+	}
+	for _, n := range twine.Split(list, ",") {
+		c := try load(n)
+		p.Add(c)
+	}
+	return p
+}
+
+func has(s str, part str) bool {
+	return twine.Contains(s, part)
+}
+
+// class names the kind of failure from the fault's text, in the classes cases.txt uses.
+func class(msg str) str {
+	if has(msg, "has expired") || has(msg, "not valid yet") {
+		return "time"
+	}
+	if has(msg, "is valid for") || has(msg, "not valid for any") || has(msg, "contains a wildcard") {
+		return "hostname"
+	}
+	if has(msg, "unknown authority") {
+		return "unknown-authority"
+	}
+	if has(msg, "RSA key too small") {
+		return "weak-key"
+	}
+	if has(msg, "SHA-1") {
+		return "sha1"
+	}
+	if has(msg, "not a CA") || has(msg, "may not sign certificates") {
+		return "not-ca"
+	}
+	if has(msg, "bad signature") {
+		return "signature"
+	}
+	if has(msg, "too long") {
+		return "too-long"
+	}
+	if has(msg, "path length") {
+		return "pathlen"
+	}
+	if has(msg, "key usage") {
+		return "eku"
+	}
+	if has(msg, "name constraints") {
+		return "constraints"
+	}
+	if has(msg, "critical extension") {
+		return "critical"
+	}
+	return "other"
+}
+
+func run(f []str, now i64) ! {
+	leaf := try load(f[3])
+	inter := try pool(f[4])
+	roots := try pool(f[5])
+	usage := []str{seal.ExtKeyUsageServerAuth}
+	if f[2] == "client" {
+		usage = []str{seal.ExtKeyUsageClientAuth}
+	} else if f[2] == "any" {
+		usage = []str{seal.ExtKeyUsageAny}
+	}
+	host := f[1]
+	if host == "-" {
+		host = ""
+	}
+	chain, err := leaf.Verify(seal.VerifyOptions{DNSName: host, Roots: roots, Intermediates: inter, Now: now, KeyUsages: usage})
+	if err != nil {
+		msg := say.Str(err)
+		say.Line(f[0], "FAIL", class(msg) + ":", msg)
+		return
+	}
+	say.Line(f[0], "OK", len(chain))
+}
+
+func main() {
+	args := quarry.Args()
+	if len(args) > 1 {
+		dir = keep(args[1])
+	}
+	text := quarry.ReadFile(dir + "/cases.txt") catch err {
+		say.Line("cases.txt:", err)
+		return
+	}
+	now := 0
+	for _, ln := range twine.Split(twine.TrimSpace(text), "\n") {
+		f := twine.Fields(ln)
+		if f[0] == "now" {
+			for i := 0; i < len(f[1]); i++ {
+				now = now*10 + i64(f[1][i]-'0')
+			}
+			continue
+		}
+		run(f, now) catch err {
+			say.Line(f[0], "ERROR", err)
+		}
+	}
+}

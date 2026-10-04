@@ -664,7 +664,24 @@ functions keep that rule, and grows as phase 1 lands.
 | `NewAESGCM`, `AEAD.Seal` and `AEAD.Open` for AES-GCM (software path: bitsliced AES with the S-box as GF(2^8) inversion, GHASH by multiplication with holes) | the key, the data and the tag | the lengths |
 | `P256PublicKey`, `P256ECDH` and the field and point code under them (`field.tin`, `p256.tin`) | the private key and every coordinate | the validity checks of the key and the peer's point, whose results are public |
 
+| `monty_new` (`bignum.tin`: Montgomery constants for a modulus given at run time) | the modulus's value | its limb count and bit length |
+
 `Sha1`, `Pbkdf2Sha256`, the hex and base64 codecs and the RSA-OAEP code are not
 constant-time and must not be used on secrets in a timing-sensitive protocol path.
+
+Signature verification and certificates (#124 phase 2) see only public data and are not
+constant-time by design: `VerifyPKCS1v15`, `VerifyPSS`, `ParseCertificate`, `DecodePEM`,
+`Certificate.Verify`, `CheckSignature`, `CheckTLSSignature` and `VerifyHostname`.
+Certificate policy: a chain is built from the leaf through `VerifyOptions.Intermediates` to
+`Roots` (default: the system bundle, read once per core from the paths in
+`roots_linux.tin`/`roots_darwin.tin` or `SSL_CERT_FILE`); every certificate must be within its
+validity period, intermediates must be CAs (basic constraints) allowed to sign certificates
+(key usage), path lengths, extended key usages and DNS/IP name constraints hold, signatures
+use SHA-256/384/512 (SHA-1 is refused) with RSA keys of 2048 to 8192 bits, no certificate
+has an unhandled critical extension, and the chain holds at most `MaxChain` (8) certificates.
+Host names follow RFC 6125: DNS SANs only (the common name is ignored), one leftmost `*`
+label over at least two more labels, IP literals against IP SANs. The parser is strict DER and
+rejects every certificate Go's `crypto/x509` rejects (`tools/ci/x509_check.py` checks this on
+byte-flipped certificates).
 Vectors: `tools/ci/crypto_check.py` runs the Wycheproof files in `tests/wycheproof/`
 (including the invalid inputs) and random inputs checked against Python's `hashlib`.
