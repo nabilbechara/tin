@@ -1,0 +1,112 @@
+package main
+
+import "lane"
+import "say"
+import "tide"
+
+fn tie() !str {
+	mut a = lane.New[str](2)
+	mut b = lane.New[str](2)
+	try b.Send("B")
+	try a.Send("A")
+	select {
+		let x = a.Recv() => return "first arm {x}"
+		let y = b.Recv() => return "second arm {y}"
+	}
+	return "none"
+}
+
+fn timeout() !str {
+	mut a = lane.New[str](1)
+	select {
+		let x = a.Recv() => return "got {x}"
+		after(30ms) => return "timeout"
+	}
+	return "none"
+}
+
+fn fromChild() !str {
+	mut a = lane.New[str](1)
+	mut got str = ""
+	scope s {
+		s.spawn(fn() ! {
+			try tide.Wait(10ms)
+			try a.Send("late")
+		})
+		select {
+			let x = a.Recv() => { got = x }
+			after(1s) => { got = "timeout" }
+		}
+	}
+	return got
+}
+
+fn handle() !str {
+	mut got str = ""
+	scope s {
+		let t = s.spawn(fn() ! {
+			try tide.Wait(5ms)
+		})
+		select {
+			t.wait() => { got = "child done" }
+			after(1s) => { got = "timeout" }
+		}
+	}
+	return got
+}
+
+fn cancelled() !str {
+	mut a = lane.New[str](1)
+	mut got str = "none"
+	within 20ms {
+		select {
+			let x = a.Recv() => { got = x }
+			canceled() => { got = "canceled arm" }
+		}
+	} catch _ {
+		got = "fault"
+	}
+	return got
+}
+
+fn cancelledNoArm() !str {
+	mut a = lane.New[str](1)
+	let v = try within 20ms {
+		select {
+			let x = a.Recv() => { say.Line("never", x) }
+		}
+		"after"
+	}
+	return v
+}
+
+fn show(name str, r str) {
+	say.Line(name + ":", r)
+}
+
+fn main() {
+	let r_tie = tie() catch err {
+		"fault {err}"
+	}
+	show("tie", r_tie)
+	let r_timeout = timeout() catch err {
+		"fault {err}"
+	}
+	show("timeout", r_timeout)
+	let r_fromChild = fromChild() catch err {
+		"fault {err}"
+	}
+	show("child", r_fromChild)
+	let r_handle = handle() catch err {
+		"fault {err}"
+	}
+	show("handle", r_handle)
+	let r_cancelled = cancelled() catch err {
+		"fault {err}"
+	}
+	show("canceled", r_cancelled)
+	let r_cancelledNoArm = cancelledNoArm() catch err {
+		"fault {err}"
+	}
+	show("no arm", r_cancelledNoArm)
+}

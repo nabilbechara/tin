@@ -61,6 +61,12 @@ def detach(port):
     print('detach: answered before the work ran; the work then saw its captured request path')
 
 
+def select(port):
+    (status, body), took = timed(port, '/select')
+    assert (status, body) == (200, b'job') and took < 0.5, (status, body, took)
+    print('select in a request: the lane value won after %.0f ms' % (took * 1000))
+
+
 def main():
     out = ROOT / 'bin/ci/scopes'
     out.mkdir(parents=True, exist_ok=True)
@@ -75,6 +81,7 @@ def main():
             eventually(lambda: server_ready(port, server))
             checks(port)
             detach(port)
+            select(port)
             assert server.poll() is None, 'server exited'
         finally:
             server.terminate()

@@ -36,6 +36,8 @@ const S_CELL = 24;     // symbol needs a heap cell (allocated via rt_alloc)
 const S_CELL_SYM = 25; // local symbol holding the cell address pointer
 const S_WORDS = 26;    // multi-word local slot allocation size (default 1)
 const S_CAPBITS = 27;  // region bits frame-local closures stored into this captured local (region pass)
+const S_CELL_OF = 28;  // a $cell_ local: the variable whose cell it holds
+const S_KEPT_CAP = 29; // captured by a closure that may be kept (its cell's contents are unknown)
 
 const MAX_PARAMS = 8;
 
@@ -63,7 +65,7 @@ var dyn_tables;   // [concrete type, dyn type, keep function, methods, data slot
 var ck_escaping_cells; // variable names that must be allocated in heap cells
 
 fn sym_new(kind, name, pos) {
-    let s = calloc(28, 8);
+    let s = calloc(30, 8);
     s[S_KIND] = kind;
     s[S_NAME] = name;
     s[S_POS] = pos;
@@ -2003,6 +2005,7 @@ fn give_cell(s, pos, name) {
         ck_fn[F_SLOTS] = ck_fn[F_SLOTS] + 1;
         vec_push(ck_fn[F_LOCALS], csym);
         s[S_CELL_SYM] = csym;
+        csym[S_CELL_OF] = s;
     }
 }
 
@@ -2078,6 +2081,7 @@ fn capture_sym(f, os) {
         os[S_ADDR] = 1;
         if f[F_ESCAPES] {
             os[S_CELL] = 1;
+            os[S_KEPT_CAP] = 1;
         }
     }
     if f == ck_fn {
@@ -2522,6 +2526,8 @@ fn check_stmt(s) {
         lower_scope(s);
     } else if k == ST_DETACH {
         lower_detach(s);
+    } else if k == ST_SELECT {
+        lower_select(s);
     } else if k == ST_DEFER {
         lower_defer(s);
     } else if k == ST_BSTORE {
@@ -2725,6 +2731,281 @@ fn mark_spawn_call(e, names) {
         // ends before the request does, so request memory may be stored in them.
         vec_get(args, 0)[LIT_SCOPED] = 1;
     }
+}
+
+// ---- select (#232) ----
+//
+// select { let x = w => body ... } checks the arms in source order (ties go to the first) and,
+// when none is ready, watches every source and parks until one wakes it; then the winning
+// arm takes its value (which cannot wait: nothing ran since it was ready) and its body runs.
+// Arms are lane receives (l.Recv()), task handles (t.wait()), after(d) and canceled().
+
+fn sel_ident(pos, name) {
+    let id = node_new(EX_IDENT, pos);
+    id[ID_NAME] = name;
+    return id;
+}
+
+fn sel_call(pos, name, args) {
+    let c = node_new(EX_CALL, pos);
+    c[CALL_NAME] = name;
+    c[CALL_ARGS] = args;
+    return c;
+}
+
+fn sel_method(pos, recv, name) {
+    let x = node_new(EX_SELECT, pos);
+    x[SEL_X] = sel_ident(pos, recv);
+    x[SEL_NAME] = name;
+    let c = node_new(EX_CALL, pos);
+    c[CALL_CALLEE] = x;
+    c[CALL_ARGS] = vec_new();
+    return c;
+}
+
+fn sel_let(pos, name, init) {
+    let l = node_new(ST_LET, pos);
+    l[LET_NAME] = name;
+    l[LET_INIT] = init;
+    return l;
+}
+
+fn sel_set(pos, name, v) {
+    let a = node_new(ST_ASSIGN, pos);
+    a[AS_TARGET] = sel_ident(pos, name);
+    let n = node_new(EX_INT, pos);
+    n[INT_VAL] = v;
+    a[AS_VALUE] = n;
+    return a;
+}
+
+fn sel_cmp(pos, name, op, v) {
+    let b = node_new(EX_BINARY, pos);
+    b[BIN_OP] = op;
+    b[BIN_L] = sel_ident(pos, name);
+    let n = node_new(EX_INT, pos);
+    n[INT_VAL] = v;
+    if v < 0 {
+        n[INT_VAL] = -v;
+        let u = node_new(EX_UNARY, pos);
+        u[UN_OP] = "-";
+        u[UN_X] = n;
+        b[BIN_R] = u;
+    } else {
+        b[BIN_R] = n;
+    }
+    return b;
+}
+
+fn sel_name(pos, kind, i) {
+    let nb = buf_new();
+    buf_str(nb, kind);
+    buf_int(nb, sel_seq);
+    buf_byte(nb, '_');
+    buf_int(nb, i);
+    buf_byte(nb, 0);
+    return nb[VEC_DATA];
+}
+
+var sel_seq;
+
+fn lower_select(s) {
+    let pos = s[N_POS];
+    sel_seq = sel_seq + 1;
+    let arms = s[SELECT_ARMS];
+    let n = arms[VEC_LEN];
+    let out = empty_block(pos);
+    let st = out[BLK_STMTS];
+    let kinds = vec_new();   // 1 lane, 2 handle, 3 after, 4 canceled
+    let srcs = vec_new();
+    let armv = sel_name(pos, "$sel", 0 - 1);
+    let i = 0;
+    while i < n {
+        let arm = vec_get(arms, i);
+        let w = vec_get(arm, SELECT_ARM_WAIT);
+        let apos = vec_get(arm, SELECT_ARM_POS);
+        let kind = 0;
+        let src = 0;
+        if w[N_KIND] == EX_CALL && w[CALL_CALLEE] && w[CALL_CALLEE][N_KIND] == EX_SELECT && w[CALL_ARGS][VEC_LEN] == 0 {
+            let m = w[CALL_CALLEE][SEL_NAME];
+            if streq(m, "Recv") || streq(m, "recv") {
+                kind = 1;
+            } else if streq(m, "wait") || streq(m, "Wait") {
+                kind = 2;
+            }
+            if kind {
+                // A plain variable is used as is; anything else is evaluated once, first.
+                let rx = w[CALL_CALLEE][SEL_X];
+                if rx[N_KIND] == EX_IDENT {
+                    src = rx[ID_NAME];
+                } else {
+                    src = sel_name(pos, "$sels", i);
+                    vec_push(st, sel_let(apos, src, rx));
+                }
+            }
+        } else if w[N_KIND] == EX_CALL && w[CALL_NAME] && streq(w[CALL_NAME], "after") && w[CALL_ARGS][VEC_LEN] == 1 {
+            kind = 3;
+            src = sel_name(pos, "$sels", i);
+            vec_push(st, sel_let(apos, src, sel_call(apos, "rt_select_deadline", w[CALL_ARGS])));
+        } else if w[N_KIND] == EX_CALL && w[CALL_NAME] && streq(w[CALL_NAME], "canceled") && w[CALL_ARGS][VEC_LEN] == 0 {
+            kind = 4;
+        }
+        if !kind {
+            err_at(apos, "a select arm waits on l.Recv(), t.wait(), after(d) or canceled()");
+            return;
+        }
+        if kind >= 2 && vec_get(arm, SELECT_ARM_NAME) && kind != 2 {
+            err_at(apos, "after(d) and canceled() give no value to bind");
+            return;
+        }
+        vec_push(kinds, kind);
+        vec_push(srcs, src);
+        i = i + 1;
+    }
+    let m1 = node_new(EX_UNARY, pos);
+    m1[UN_OP] = "-";
+    let one = node_new(EX_INT, pos);
+    one[INT_VAL] = 1;
+    m1[UN_X] = one;
+    vec_push(st, sel_let(pos, armv, m1));
+    // for $sel < 0 { readiness checks in order; else watch, park, unwatch }
+    let loop = node_new(ST_WHILE, pos);
+    loop[WH_COND] = sel_cmp(pos, armv, "<", 0);
+    loop[WH_BODY] = empty_block(pos);
+    let lb = loop[WH_BODY][BLK_STMTS];
+    let dl = sel_name(pos, "$seld", 0);
+    vec_push(lb, sel_let(pos, dl, node_new(EX_INT, pos)));
+    let chain = 0;
+    let last = 0;
+    i = 0;
+    while i < n {
+        let k = vec_get(kinds, i);
+        let cond = 0;
+        if k == 1 {
+            cond = sel_method(pos, vec_get(srcs, i), "Ready");
+        } else if k == 2 {
+            cond = sel_method(pos, vec_get(srcs, i), "ready");
+        } else if k == 3 {
+            let args = vec_new();
+            vec_push(args, sel_ident(pos, vec_get(srcs, i)));
+            cond = sel_call(pos, "rt_select_due", args);
+        } else {
+            cond = sel_call(pos, "rt_select_canceled", vec_new());
+        }
+        let ifs = node_new(ST_IF, pos);
+        ifs[IF_COND] = cond;
+        ifs[IF_THEN] = empty_block(pos);
+        vec_push(ifs[IF_THEN][BLK_STMTS], sel_set(pos, armv, i));
+        if last {
+            let eb = empty_block(pos);
+            vec_push(eb[BLK_STMTS], ifs);
+            last[IF_ELSE] = eb;
+        } else {
+            chain = ifs;
+        }
+        last = ifs;
+        i = i + 1;
+    }
+    // A cancelled boundary with no canceled() arm ends the select with its fault.
+    let cifs = node_new(ST_IF, pos);
+    cifs[IF_COND] = sel_call(pos, "rt_select_canceled", vec_new());
+    cifs[IF_THEN] = empty_block(pos);
+    vec_push(cifs[IF_THEN][BLK_STMTS], sel_set(pos, armv, n));
+    let eb = empty_block(pos);
+    vec_push(eb[BLK_STMTS], cifs);
+    last[IF_ELSE] = eb;
+    vec_push(lb, chain);
+    let wait = node_new(ST_IF, pos);
+    wait[IF_COND] = sel_cmp(pos, armv, "<", 0);
+    wait[IF_THEN] = empty_block(pos);
+    let wb = wait[IF_THEN][BLK_STMTS];
+    i = 0;
+    while i < n {
+        let k = vec_get(kinds, i);
+        if k == 1 {
+            vec_push(wb, expr_stmt(sel_method(pos, vec_get(srcs, i), "Watch")));
+        } else if k == 2 {
+            vec_push(wb, expr_stmt(sel_method(pos, vec_get(srcs, i), "watch")));
+        } else if k == 3 {
+            let a = node_new(ST_ASSIGN, pos);
+            a[AS_TARGET] = sel_ident(pos, dl);
+            let args = vec_new();
+            vec_push(args, sel_ident(pos, dl));
+            vec_push(args, sel_ident(pos, vec_get(srcs, i)));
+            a[AS_VALUE] = sel_call(pos, "rt_select_min", args);
+            vec_push(wb, a);
+        }
+        i = i + 1;
+    }
+    let pargs = vec_new();
+    vec_push(pargs, sel_ident(pos, dl));
+    vec_push(wb, expr_stmt(sel_call(pos, "rt_select_park", pargs)));
+    i = 0;
+    while i < n {
+        let k = vec_get(kinds, i);
+        if k == 1 {
+            vec_push(wb, expr_stmt(sel_method(pos, vec_get(srcs, i), "Unwatch")));
+        } else if k == 2 {
+            vec_push(wb, expr_stmt(sel_method(pos, vec_get(srcs, i), "unwatch")));
+        }
+        i = i + 1;
+    }
+    vec_push(lb, wait);
+    vec_push(st, loop);
+    // Then the winning arm: take its value and run its body.
+    i = 0;
+    while i <= n {
+        let ifs = node_new(ST_IF, pos);
+        ifs[IF_COND] = sel_cmp(pos, armv, "==", i);
+        ifs[IF_THEN] = empty_block(pos);
+        let tb = ifs[IF_THEN][BLK_STMTS];
+        if i == n {
+            let tr = node_new(EX_TRY, pos);
+            tr[TRY_X] = sel_call(pos, "rt_select_fail", vec_new());
+            vec_push(tb, expr_stmt(tr));
+        } else {
+            let arm = vec_get(arms, i);
+            let k = vec_get(kinds, i);
+            let name = vec_get(arm, SELECT_ARM_NAME);
+            if k == 1 || k == 2 {
+                let take = 0;
+                if k == 1 {
+                    take = sel_method(pos, vec_get(srcs, i), "Recv");
+                } else {
+                    take = sel_method(pos, vec_get(srcs, i), "wait");
+                }
+                let tr = node_new(EX_TRY, pos);
+                tr[TRY_X] = take;
+                if name {
+                    vec_push(tb, sel_let(pos, name, tr));
+                } else {
+                    if k == 1 {
+                        vec_push(tb, sel_let(pos, "_", tr));
+                    } else {
+                        vec_push(tb, expr_stmt(tr));
+                    }
+                }
+            }
+            let body = vec_get(arm, SELECT_ARM_BODY);
+            if vec_get(arm, SELECT_ARM_BLOCK) {
+                vec_push(tb, body);
+            } else if is_stmt_kind(body[N_KIND]) {
+                vec_push(tb, body);
+            } else {
+                vec_push(tb, expr_stmt(body));
+            }
+        }
+        vec_push(st, ifs);
+        i = i + 1;
+    }
+    replace_node(s, out);
+    check_scoped(s);
+}
+
+// is_stmt_kind tells a select arm's statement body (return, fail, break, continue) from an
+// expression body.
+fn is_stmt_kind(k) {
+    return k == ST_RETURN || k == ST_FAIL || k == ST_BREAK || k == ST_CONTINUE || k == ST_EXPR;
 }
 
 // ---- defer ----
