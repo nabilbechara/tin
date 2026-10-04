@@ -268,6 +268,38 @@ fn generics_declared() {
 
 // instantiate_fn returns the instance of template g for targs, declaring it on first use;
 // the main check loop checks its body later like any function's.
+// type_depth is how deeply t nests types (slices, optionals, maps, generic instances).
+fn type_depth(t, n) {
+    if !t || n > 64 {
+        return n;
+    }
+    let k = kind_of(t);
+    if k == K_SLICE || k == K_OPT {
+        return type_depth(t[TY_ELEM], n + 1);
+    }
+    if k == K_MAP {
+        let a = type_depth(t[TY_KEY], n + 1);
+        let b = type_depth(t[TY_ELEM], n + 1);
+        if a > b {
+            return a;
+        }
+        return b;
+    }
+    if k == K_STRUCT && t[TY_TARGS] {
+        let best = n + 1;
+        let i = 0;
+        while i < t[TY_TARGS][VEC_LEN] {
+            let x = type_depth(vec_get(t[TY_TARGS], i), n + 1);
+            if x > best {
+                best = x;
+            }
+            i = i + 1;
+        }
+        return best;
+    }
+    return n;
+}
+
 fn instantiate_fn(g, targs, pos) {
     if !g[F_INSTS] {
         g[F_INSTS] = vec_new();
@@ -282,6 +314,24 @@ fn instantiate_fn(g, targs, pos) {
     }
     if targs[VEC_LEN] != g[F_TPARAMS][VEC_LEN] {
         err_quoted(pos, "wrong number of type arguments for ", g[F_NAME], "");
+        return g;
+    }
+    // A generic that calls itself with a type built from its own type parameter (F[T] calling
+    // F[[]T]) would be instantiated forever: stop at a depth no real program reaches (#98).
+    let d = 0;
+    let k = 0;
+    while k < targs[VEC_LEN] {
+        let dk = type_depth(vec_get(targs, k), 0);
+        if dk > d {
+            d = dk;
+        }
+        k = k + 1;
+    }
+    if d > 48 || g[F_INSTS][VEC_LEN] >= 4096 {
+        if !g[F_INSTCYCLE] {
+            g[F_INSTCYCLE] = 1;
+            err_quoted(pos, "instantiating ", g[F_NAME], " does not end: it is instantiated with ever deeper type arguments (a generic function calling itself with a type built from its type parameter, such as F[[]T] inside F[T])");
+        }
         return g;
     }
     check_constraints(pos, g[F_TPARAMS], g[F_TCONS], targs, g[F_FILE]);
@@ -420,6 +470,11 @@ fn generic_call(e, g) {
         i = i + 1;
     }
     let inst = instantiate_fn(g, binds, e[N_POS]);
+    if inst == g && g[F_INSTCYCLE] {
+        // Reported already (an endless instantiation): no instance to check the call against;
+        // an untyped int keeps the surrounding expression from adding errors in the usual case.
+        return ty_uint;
+    }
     e[CALL_FN] = inst;
     e[CALL_CALLEE] = 0;
     e[CALL_NAME] = inst[F_QNAME];

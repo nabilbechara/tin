@@ -11,6 +11,7 @@ import hashlib
 import hmac
 import json
 import os
+import random
 from pathlib import Path
 import re
 import socket
@@ -429,9 +430,18 @@ class Session:
 
 
 def free_port():
-    with socket.socket() as s:
-        s.bind(('127.0.0.1', 0))
-        return s.getsockname()[1]
+    """A free port below the ephemeral ranges (Linux 32768+, macOS 49152+). A port the kernel
+    picks for bind(0) is an ephemeral one, which a client connection can take as its source
+    port before the server binds it ("cannot bind the address" under load)."""
+    for _ in range(500):
+        port = random.randint(20000, 30000)
+        with socket.socket() as s:
+            try:
+                s.bind(('127.0.0.1', port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError('no free port below the ephemeral range')
 
 
 class Server:

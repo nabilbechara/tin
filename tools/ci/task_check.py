@@ -2,6 +2,7 @@
 """Request tasks: on one core, waiting requests overlap and do not delay fast ones; deadlines
 cut waits short; pipelined responses stay in order behind a waiting request."""
 import os
+import random
 import socket
 import subprocess
 import sys
@@ -11,9 +12,18 @@ from suite import ROOT
 
 
 def free_port():
-    with socket.socket() as s:
-        s.bind(('127.0.0.1', 0))
-        return s.getsockname()[1]
+    """A free port below the ephemeral ranges (Linux 32768+, macOS 49152+). A port the kernel
+    picks for bind(0) is an ephemeral one, which a client connection can take as its source
+    port before the server binds it ("cannot bind the address" under load)."""
+    for _ in range(500):
+        port = random.randint(20000, 30000)
+        with socket.socket() as s:
+            try:
+                s.bind(('127.0.0.1', port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError('no free port below the ephemeral range')
 
 
 def fetch(port, raw, timeout=5):

@@ -1469,6 +1469,9 @@ fn chk_composite(e, want) {
             } else if fi >= nf {
                 err_at(pos, "too many values in struct literal");
                 return t;
+            } else if foreign_type(t) && is_private(vec_get(vec_get(t[TY_FIELDS], fi), 0)) {
+                // A positional value sets the field as surely as its name would (#96).
+                private_use(vec_get(elems, i)[N_POS], "field", vec_get(vec_get(t[TY_FIELDS], fi), 0), type_pkg(t));
             }
             set[VEC_DATA][fi] = 1;
             let ft = field_type(t, fi);
@@ -2300,6 +2303,10 @@ fn chk_builtin(e, name, want) {
         return st;
     }
     if streq(name, "make") {
+        if n < 1 || arg0(e)[N_KIND] != EX_TYPE {
+            err_at(pos, "make needs a slice or map type: make([]T, n), make([]T, n, capacity) or make(map[K]V)");
+            return ty_int;
+        }
         let t = resolve_type(arg0(e)[TYX]);
         let k = kind_of(t);
         if k == K_SLICE {
@@ -2344,6 +2351,10 @@ fn chk_builtin(e, name, want) {
         return t;
     }
     if streq(name, "new") {
+        if n != 1 || arg0(e)[N_KIND] != EX_TYPE {
+            err_at(pos, "new needs one struct type: new(T)");
+            return ty_int;
+        }
         let t = resolve_type(arg0(e)[TYX]);
         if kind_of(t) != K_STRUCT {
             err_type(pos, "new needs a struct type, not ", t, "");
@@ -2363,6 +2374,10 @@ fn chk_builtin(e, name, want) {
     if streq(name, "cast") {
         if !ck_legacy && !ck_trusted {
             err_at(pos, "cast is internal to the runtime");
+        }
+        if n != 2 || arg0(e)[N_KIND] != EX_TYPE {
+            err_at(pos, "cast needs a type and a value");
+            return ty_int;
         }
         let t = resolve_type(arg0(e)[TYX]);
         let x = vec_get(args, 1);
@@ -2384,6 +2399,10 @@ fn chk_builtin(e, name, want) {
         return t;
     }
     if streq(name, "delete") {
+        if n != 2 {
+            err_at(pos, "delete needs a map and a key");
+            return ty_void;
+        }
         let mt = chk(arg0(e), 0);
         if kind_of(mt) != K_MAP || n != 2 {
             err_at(pos, "delete needs a map and a key");
@@ -2398,6 +2417,10 @@ fn chk_builtin(e, name, want) {
         return ty_void;
     }
     if streq(name, "copy") {
+        if n != 2 {
+            err_at(pos, "copy needs a destination slice and a source (a slice or a str)");
+            return ty_int;
+        }
         let dt = chk(arg0(e), 0);
         let st = chk(vec_get(args, 1), 0);
         if kind_of(st) == K_STRING {
@@ -2408,6 +2431,10 @@ fn chk_builtin(e, name, want) {
         return ty_int;
     }
     if streq(name, "panic") {
+        if n != 1 {
+            err_at(pos, "panic needs one value: panic(\"message\") or panic(err)");
+            return ty_void;
+        }
         let pt = chk(arg0(e), ty_string);
         let msg = arg0(e);
         if kind_of(pt) == K_ERROR {
@@ -3454,6 +3481,8 @@ fn say_arg(a, prefix) {
         } else {
             suffix = "slp";
         }
+    } else if k == K_OPT && kind_of(t[TY_ELEM]) != K_STRUCT && kind_of(t[TY_ELEM]) != K_DYN {
+        return say_opt(a, t, prefix);
     } else if k == K_STRUCT || k == K_OPT {
         let st = t;
         if k == K_OPT {
@@ -3483,6 +3512,24 @@ fn say_arg(a, prefix) {
         x = mk_conv(pos, a, CV_SAME, ty_int);
     }
     return rt_call(pos, str_cat3(prefix, suffix, ""), args1(x), ty_void);
+}
+
+// say_opt prints an optional str, slice or map: <nil>, or its value as that type prints.
+fn say_opt(a, t, prefix) {
+    let pos = a[N_POS];
+    let stmts = vec_new();
+    let obj = temp(pos, mk_conv(pos, a, CV_SAME, ty_int), ty_int);
+    vec_push(stmts, obj);
+    let ifs = node_new(ST_IF, pos);
+    ifs[IF_COND] = mk_bin(pos, "==", sym_ref_node(pos, obj[LET_SYM]), mk_int(pos, 0, ty_int), ty_bool);
+    ifs[IF_THEN] = empty_block(pos);
+    vec_push(ifs[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, str_cat3(prefix, "argsep", ""), vec_new(), ty_void)));
+    vec_push(ifs[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, str_cat3(prefix, "raw", ""), args1(lit_string(pos, "<nil>")), ty_void)));
+    vec_push(ifs[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, str_cat3(prefix, "argend", ""), vec_new(), ty_void)));
+    ifs[IF_ELSE] = empty_block(pos);
+    vec_push(ifs[IF_ELSE][BLK_STMTS], expr_stmt(say_arg(mk_conv(pos, sym_ref_node(pos, obj[LET_SYM]), CV_SAME, t[TY_ELEM]), prefix)));
+    vec_push(stmts, ifs);
+    return mk_seq(pos, stmts, mk_int(pos, 0, ty_int), ty_void);
 }
 
 // say_struct prints {a b c} by formatting each field in turn (nil optionals print <nil>).
@@ -3567,6 +3614,8 @@ fn say_struct_fn(t, prefix) {
             vec_push(body, expr_stmt(call_fn(pos, say_enum_fn(ft, prefix), args1(fv), ty_void)));
         } else if kind_of(ft) == K_STRUCT {
             vec_push(body, expr_stmt(call_fn(pos, say_struct_fn(ft, prefix), args1(fv), ty_void)));
+        } else if kind_of(ft) == K_OPT && kind_of(ft[TY_ELEM]) != K_STRUCT && kind_of(ft[TY_ELEM]) != K_DYN {
+            vec_push(body, expr_stmt(say_opt(fv, ft, prefix)));
         } else if kind_of(ft) == K_OPT {
             vec_push(body, expr_stmt(rt_call(pos, str_cat3(prefix, "p", ""), args1(mk_conv(pos, fv, CV_SAME, ty_int)), ty_void)));
         } else {

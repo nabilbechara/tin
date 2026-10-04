@@ -7,6 +7,7 @@ connections. Runs against a small MySQL server written here (MYSQL_ADDR=host:por
 MYSQL_USER/MYSQL_PASSWORD/MYSQL_DATABASE uses a real one, for the checks it can do)."""
 import hashlib
 import os
+import random
 import re
 import socket
 import socketserver
@@ -305,9 +306,18 @@ class Session:
 
 
 def free_port():
-    with socket.socket() as s:
-        s.bind(('127.0.0.1', 0))
-        return s.getsockname()[1]
+    """A free port below the ephemeral ranges (Linux 32768+, macOS 49152+). A port the kernel
+    picks for bind(0) is an ephemeral one, which a client connection can take as its source
+    port before the server binds it ("cannot bind the address" under load)."""
+    for _ in range(500):
+        port = random.randint(20000, 30000)
+        with socket.socket() as s:
+            try:
+                s.bind(('127.0.0.1', port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError('no free port below the ephemeral range')
 
 
 class Server:
@@ -395,14 +405,19 @@ def main():
     finally:
         srv.stop()
 
-    srv = Server(exe, env, 2)
+    # The load checks that every insert lands, not how fast a shared runner's MySQL is: against a
+    # real server a disk flush can hold a few inserts past the 1 s deadline (#133), so it gets
+    # 10 s there, and the slowest requests are logged.
+    srv = Server(exe, dict(env, TIN_DEADLINE_MS='10000') if real else env, 2)
     try:
         _, before, _ = srv.get('/count')
         errs = []
+        slow = []
 
         def adder(n):
             for i in range(n):
-                code, body, _ = srv.get('/add?name=u%d' % i)
+                code, body, dt = srv.get('/add?name=u%d' % i)
+                slow.append(dt)
                 if code != 200:
                     errs.append(body)
 
@@ -413,8 +428,8 @@ def main():
         for t in ts:
             t.join()
         _, after, _ = srv.get('/count')
-        print('1000 inserts from 20 clients on 2 cores: %.2f s, %d errors, count %s -> %s' %
-              (time.time() - t0, len(errs), before, after))
+        print('1000 inserts from 20 clients on 2 cores: %.2f s, %d errors, count %s -> %s; slowest %s s' %
+              (time.time() - t0, len(errs), before, after, ', '.join('%.2f' % x for x in sorted(slow)[-3:])))
         if errs or int(after) - int(before) != 1000:
             failures.append('inserts: %d errors %r, %s -> %s' % (len(errs), errs[:2], before, after))
     finally:
