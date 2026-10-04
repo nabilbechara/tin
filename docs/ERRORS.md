@@ -1545,11 +1545,22 @@ error E904 CANNOT_CREATE: cannot create missing/example
 
 Fix: create the directory first, or choose a writable path.
 
+### E905 TOO_MANY_LOCALS
+
+On arm64 a function's stack frame (its local variables, temporaries and saved registers) is
+at most 4095 bytes, about 500 eight-byte locals.
+
+No example: it takes a function with hundreds of local variables.
+
+Fix: split the function, or keep the values in a slice or a struct instead of separate
+locals.
+
 ### E990 INTERNAL
 
-The assembler or linker met a case it cannot handle: an instruction it cannot encode, a
-branch out of range, code that changed size between layout and encoding, or a missing entry
-point. The message starts with `x64:` or `link:`.
+The code generator, assembler or linker met a case it cannot handle: a `dyn` value or
+argument in a place it cannot put it, an instruction it cannot encode, a branch out of range,
+code that changed size between layout and encoding, or a missing entry point. Assembler and
+linker messages start with `x64:` or `link:`.
 
 No example: only a compiler bug reaches this error.
 
