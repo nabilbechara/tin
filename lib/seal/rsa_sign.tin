@@ -10,48 +10,56 @@ import "say"
 // returned, so a fault in the arithmetic cannot leak a factor of n.
 
 // rsa_inv_prime sets z = x^-1 mod the prime of f (x^(p-2)), in constant time.
-func rsa_inv_prime(f mut monty, z mut []u64, x []u64, p secret []u8) {
-	e := make([]u8, 4*f.n)
-	pb := monty_bytes(f, p)
-	borrow := 2
-	for i := len(pb) - 1; i >= 0; i-- {
-		v := i64(pb[i]) - borrow
-		borrow = 0
-		if v < 0 {
-			v += 256
-			borrow = 1
+fn rsa_inv_prime(f mut monty, z mut []u64, x []u64, p secret []u8) {
+	let e = make([]u8, 4*f.n)
+	let pb = monty_bytes(f, p)
+	mut borrow = 2
+	{
+		mut i = len(pb) - 1
+		for i >= 0 {
+			mut v = i64(pb[i]) - borrow
+			borrow = 0
+			if v < 0 {
+				v += 256
+				borrow = 1
+			}
+			e[i] = u8(v)
+			i -= 1
 		}
-		e[i] = u8(v)
 	}
 	monty_exp_ct(mut f, mut z, x, e)
 }
 
 // rsa_crt_join returns m2 + q*(qinv*(m1 - m2) mod p) as nn limbs; m1 is mod p and m2 mod q,
 // both in Montgomery form of their fields.
-func rsa_crt_join(k mut RSAPrivateKey, m1 []u64, m2 []u64) []u64 {
-	m2plain := monty_plain(mut k.fq, m2)
-	m2p := k.fp.elem()
+fn rsa_crt_join(k mut RSAPrivateKey, m1 []u64, m2 []u64) []u64 {
+	let m2plain = monty_plain(mut k.fq, m2)
+	let m2p = k.fp.elem()
 	monty_reduce(mut k.fp, mut m2p, nat_to_be(m2plain))
-	h := k.fp.elem()
+	let h = k.fp.elem()
 	k.fp.sub(mut h, m1, m2p)
-	qi := k.fp.elem()
+	let qi = k.fp.elem()
 	monty_reduce(mut k.fp, mut qi, k.qinv)
 	k.fp.mul(mut h, h, qi)
-	hplain := monty_plain(mut k.fp, h)
-	m := nat_mul_ct(nat_from_be(k.q, k.fq.n), hplain)
+	let hplain = monty_plain(mut k.fp, h)
+	let m = nat_mul_ct(nat_from_be(k.q, k.fq.n), hplain)
 	nat_add_ct(mut m, m2plain)
-	out := make([]u64, k.fnm.n)
-	for j := 0; j < k.fnm.n && j < len(m); j++ {
-		out[j] = m[j]
+	let out = make([]u64, k.fnm.n)
+	{
+		mut j = 0
+		for j < k.fnm.n && j < len(m) {
+			out[j] = m[j]
+			j += 1
+		}
 	}
 	return out
 }
 
 // nat_to_be writes little-endian 32-bit limbs as big-endian bytes (4 per limb).
-func nat_to_be(x []u64) []u8 {
-	out := make([]u8, 4*len(x))
-	for j := 0; j < len(x); j++ {
-		k := 4*len(x) - 4*j
+fn nat_to_be(x []u64) []u8 {
+	let out = make([]u8, 4*len(x))
+	for j in 0..len(x) {
+		let k = 4*len(x) - 4*j
 		out[k-1] = u8(x[j])
 		out[k-2] = u8(x[j] >> 8)
 		out[k-3] = u8(x[j] >> 16)
@@ -61,58 +69,58 @@ func nat_to_be(x []u64) []u8 {
 }
 
 // rsa_private is em^d mod n, k bytes, for em < n.
-func rsa_private(k mut RSAPrivateKey, em secret []u8) ![]u8 {
-	size := (RSAKeyBits(k.Public) + 7) / 8
-	fnm := k.fnm
-	c := fnm.elem()
+fn rsa_private(k mut RSAPrivateKey, em secret []u8) ![]u8 {
+	let size = (RSAKeyBits(k.Public) + 7) / 8
+	let fnm = k.fnm
+	let c = fnm.elem()
 	if fnm.from_bytes(mut c, monty_bytes(fnm, em)) == 0 {
 		fail "seal: RSA message representative out of range"
 	}
 	// Blind: c' = c * r^e for a random r in [1, n).
-	r := fnm.elem()
+	let r = fnm.elem()
 	for {
 		monty_reduce(mut fnm, mut r, RandomBytes(4*fnm.n+16))
 		if fnm.is_zero(r) == 0 {
 			break
 		}
 	}
-	at := 0
+	mut at = 0
 	for at < len(k.Public.E) && k.Public.E[at] == 0 {
-		at++
+		at += 1
 	}
-	re := fnm.elem()
+	let re = fnm.elem()
 	fnm.set(mut re, r)
 	rsa_exp_pub(mut fnm, mut re, k.Public.E[at:])
 	fnm.mul(mut c, c, re)
-	cb := fnm.to_bytes(c)
+	let cb = fnm.to_bytes(c)
 	// CRT: m1 = c'^dp mod p, m2 = c'^dq mod q.
-	cp := k.fp.elem()
-	cq := k.fq.elem()
+	let cp = k.fp.elem()
+	let cq = k.fq.elem()
 	monty_reduce(mut k.fp, mut cp, cb)
 	monty_reduce(mut k.fq, mut cq, cb)
-	m1 := k.fp.elem()
-	m2 := k.fq.elem()
+	let m1 = k.fp.elem()
+	let m2 = k.fq.elem()
 	monty_exp_ct(mut k.fp, mut m1, cp, k.dp)
 	monty_exp_ct(mut k.fq, mut m2, cq, k.dq)
-	mb := rsa_crt_join(mut k, m1, m2)
+	let mb = rsa_crt_join(mut k, m1, m2)
 	// Unblind with r^-1 mod n, joined from r^-1 mod p and mod q.
-	rb := fnm.to_bytes(r)
-	rp := k.fp.elem()
-	rq := k.fq.elem()
+	let rb = fnm.to_bytes(r)
+	let rp = k.fp.elem()
+	let rq = k.fq.elem()
 	monty_reduce(mut k.fp, mut rp, rb)
 	monty_reduce(mut k.fq, mut rq, rb)
 	rsa_inv_prime(mut k.fp, mut rp, rp, k.p)
 	rsa_inv_prime(mut k.fq, mut rq, rq, k.q)
-	rinv := rsa_crt_join(mut k, rp, rq)
-	mm := fnm.elem()
-	ri := fnm.elem()
+	let rinv = rsa_crt_join(mut k, rp, rq)
+	let mm = fnm.elem()
+	let ri = fnm.elem()
 	fnm.mul(mut mm, mb, fnm.rr)
 	fnm.mul(mut ri, rinv, fnm.rr)
 	fnm.mul(mut mm, mm, ri)
-	sig := fnm.to_bytes(mm)
+	mut sig = fnm.to_bytes(mm)
 	sig = sig[len(sig)-size:]
 	// Check with the public key before releasing anything.
-	back := rsa_public(k.Public, sig) catch err {
+	let back = rsa_public(k.Public, sig) catch err {
 		fail say.Fault("seal: RSA signature self-check failed (%s)", err)
 	}
 	if !ConstantTimeEq(back, monty_bytes_len(em, size)) {
@@ -122,37 +130,37 @@ func rsa_private(k mut RSAPrivateKey, em secret []u8) ![]u8 {
 }
 
 // monty_bytes_len pads big-endian b with leading zeros to n bytes.
-func monty_bytes_len(b []u8, n i64) []u8 {
+fn monty_bytes_len(b []u8, n i64) []u8 {
 	if len(b) >= n {
 		return b[len(b)-n:]
 	}
-	out := make([]u8, n)
-	for i := 0; i < len(b); i++ {
+	let out = make([]u8, n)
+	for i in 0..len(b) {
 		out[n-len(b)+i] = b[i]
 	}
 	return out
 }
 
 // SignPKCS1v15 signs digest, a hash made with h, with RSASSA-PKCS1-v1_5 (deterministic).
-func SignPKCS1v15(k mut RSAPrivateKey, h Hash, digest []u8) ![]u8 {
+fn SignPKCS1v15(k mut RSAPrivateKey, h Hash, digest []u8) ![]u8 {
 	if len(digest) != Size(h) {
 		fail "seal: digest length does not match the hash"
 	}
-	size := (RSAKeyBits(k.Public) + 7) / 8
-	prefix := rsa_digest_info(h)
-	tlen := len(prefix) + len(digest)
+	let size = (RSAKeyBits(k.Public) + 7) / 8
+	let prefix = rsa_digest_info(h)
+	let tlen = len(prefix) + len(digest)
 	if size < tlen+11 {
 		fail "seal: RSA key too short for the digest"
 	}
-	em := make([]u8, size)
+	let em = make([]u8, size)
 	em[1] = 1
-	for i := 2; i < size-tlen-1; i++ {
+	for i in 2..size-tlen-1 {
 		em[i] = 0xff
 	}
-	for i := 0; i < len(prefix); i++ {
+	for i in 0..len(prefix) {
 		em[size-tlen+i] = prefix[i]
 	}
-	for i := 0; i < len(digest); i++ {
+	for i in 0..len(digest) {
 		em[size-len(digest)+i] = digest[i]
 	}
 	return try rsa_private(mut k, em)
@@ -160,33 +168,33 @@ func SignPKCS1v15(k mut RSAPrivateKey, h Hash, digest []u8) ![]u8 {
 
 // SignPSS signs digest, a hash made with h, with RSASSA-PSS: MGF1 over h and a random salt as
 // long as the digest (what TLS 1.3 requires).
-func SignPSS(k mut RSAPrivateKey, h Hash, digest []u8) ![]u8 {
-	hlen := Size(h)
+fn SignPSS(k mut RSAPrivateKey, h Hash, digest []u8) ![]u8 {
+	let hlen = Size(h)
 	if len(digest) != hlen {
 		fail "seal: digest length does not match the hash"
 	}
-	embits := RSAKeyBits(k.Public) - 1
-	emlen := (embits + 7) / 8
+	let embits = RSAKeyBits(k.Public) - 1
+	let emlen = (embits + 7) / 8
 	if emlen < 2*hlen+2 {
 		fail "seal: RSA key too short for PSS with this hash"
 	}
-	salt := RandomBytes(hlen)
-	mp := make([]u8, 8, 8+2*hlen)
+	let salt = RandomBytes(hlen)
+	mut mp = make([]u8, 8, 8+2*hlen)
 	mp = append(mp, digest...)
 	mp = append(mp, salt...)
-	hh := Sum(h, str(mp))
-	dblen := emlen - hlen - 1
-	db := make([]u8, dblen)
+	let hh = Sum(h, str(mp))
+	let dblen = emlen - hlen - 1
+	let db = make([]u8, dblen)
 	db[dblen-hlen-1] = 1
-	for i := 0; i < hlen; i++ {
+	for i in 0..hlen {
 		db[dblen-hlen+i] = salt[i]
 	}
-	mask := mgf1(h, hh, dblen)
-	for i := 0; i < dblen; i++ {
+	let mask = mgf1(h, hh, dblen)
+	for i in 0..dblen {
 		db[i] ^= mask[i]
 	}
 	db[0] &= u8(0xff >> u8(8*emlen-embits))
-	em := make([]u8, 0, emlen)
+	mut em = make([]u8, 0, emlen)
 	em = append(em, db...)
 	em = append(em, hh...)
 	em = append(em, 0xbc)

@@ -28,18 +28,18 @@ const Kinds = ",sched.select@1,sched.resume@1,sched.cancel@1,tide.now@1,tide.wal
 const magic = "TINCAP\x01\x00"
 
 // Open reads the capsule at path, encrypted under keyHex (the 64 hex digits of TIN_REPLAY_KEY).
-func Open(path str, keyHex str) !Capsule {
-	key := try Key(keyHex)
-	data := quarry.ReadFile(path) catch err {
+fn Open(path str, keyHex str) !Capsule {
+	let key = try Key(keyHex)
+	let data = quarry.ReadFile(path) catch err {
 		fail "capsule: " + say.Str(err)
 	}
-	body := try Unseal(data, key)
+	let body = try Unseal(data, key)
 	return try Decode(body)
 }
 
 // Key is the 32 bytes a TIN_REPLAY_KEY value (64 hex digits) stands for.
-func Key(keyHex str) !str {
-	b, err := seal.HexDecode(keyHex)
+fn Key(keyHex str) !str {
+	let (b, err) = seal.HexDecode(keyHex)
 	if err != nil || len(b) != 32 {
 		fail "capsule: TIN_REPLAY_KEY must be 64 hex digits"
 	}
@@ -47,53 +47,61 @@ func Key(keyHex str) !str {
 }
 
 // Unseal checks a capsule envelope's tag under key and returns its decrypted body.
-func Unseal(data str, key str) !str {
-	n := len(data)
+fn Unseal(data str, key str) !str {
+	let n = len(data)
 	if n < 8 || data[:8] != magic {
 		fail "capsule: not a capsule (no TINCAP header)"
 	}
 	if n < 56 {
 		fail "capsule: wrong key or damaged"
 	}
-	km := str(seal.HmacSha256(key, "tin replay mac"))
-	tag := seal.HmacSha256(km, data[:n-32])
-	diff := u8(0)
-	for i := 0; i < 32; i++ {
+	let km = str(seal.HmacSha256(key, "tin replay mac"))
+	let tag = seal.HmacSha256(km, data[:n-32])
+	mut diff = u8(0)
+	for i in 0..32 {
 		diff |= tag[i] ^ data[n-32+i]
 	}
 	if diff != 0 {
 		fail "capsule: wrong key or damaged"
 	}
-	ke := str(seal.HmacSha256(key, "tin replay enc"))
-	nonce := data[8:24]
-	ct := data[24 : n-32]
-	out := make([]u8, len(ct))
-	for i := 0; i*32 < len(ct); i++ {
-		ks := seal.HmacSha256(ke, nonce+word(i))
-		for j := 0; j < 32 && i*32+j < len(ct); j++ {
-			out[i*32+j] = ct[i*32+j] ^ ks[j]
+	let ke = str(seal.HmacSha256(key, "tin replay enc"))
+	let nonce = data[8:24]
+	let ct = data[24 : n-32]
+	let out = make([]u8, len(ct))
+	{
+		mut i = 0
+		for i*32 < len(ct) {
+			let ks = seal.HmacSha256(ke, nonce+word(i))
+			{
+			mut j = 0
+			for j < 32 && i*32+j < len(ct) {
+					out[i*32+j] = ct[i*32+j] ^ ks[j]
+					j += 1
+			}
+		}
+			i += 1
 		}
 	}
 	return str(out)
 }
 
 // word is v as 8 little-endian bytes.
-func word(v i64) str {
-	b := make([]u8, 8)
-	for i := 0; i < 8; i++ {
+fn word(v i64) str {
+	let b = make([]u8, 8)
+	for i in 0..8 {
 		b[i] = u8(v >> (8 * i))
 	}
 	return str(b)
 }
 
 // Decode reads a capsule body (schema 1) and checks every effect record and its kind.
-func Decode(body str) !Capsule {
-	r := reader{b: body, pos: 0}
-	schema := try r.word()
+fn Decode(body str) !Capsule {
+	let r = reader{b: body, pos: 0}
+	let schema = try r.word()
 	if schema != 1 {
 		fail "capsule: unsupported schema {schema} (this build reads schema 1)"
 	}
-	c := Capsule{}
+	let c = Capsule{}
 	c.Tin = try r.bytes()
 	c.Program = try r.bytes()
 	c.Wall = try r.word()
@@ -106,10 +114,10 @@ func Decode(body str) !Capsule {
 	if c.Count < 0 {
 		fail "capsule: damaged (effect count {c.Count})"
 	}
-	start := r.pos
-	for k := 0; k < c.Count; k++ {
-		seq := try r.word()
-		kind := try r.bytes()
+	let start = r.pos
+	for k in 0..c.Count {
+		let seq = try r.word()
+		let kind = try r.bytes()
 		_ = try r.bytes()
 		_ = try r.word()
 		_ = try r.word()
@@ -129,19 +137,23 @@ func Decode(body str) !Capsule {
 }
 
 // Supported reports whether this build replays effect kind (name@version).
-func Supported(kind str) bool {
+fn Supported(kind str) bool {
 	if len(kind) == 0 {
 		return false
 	}
-	for i := 0; i < len(kind); i++ {
+	for i in 0..len(kind) {
 		if kind[i] == ',' {
 			return false
 		}
 	}
-	n := len(kind)
-	for i := 0; i+n+1 < len(Kinds); i++ {
-		if Kinds[i] == ',' && Kinds[i+n+1] == ',' && Kinds[i+1:i+n+1] == kind {
-			return true
+	let n = len(kind)
+	{
+		mut i = 0
+		for i+n+1 < len(Kinds) {
+			if Kinds[i] == ',' && Kinds[i+n+1] == ',' && Kinds[i+1:i+n+1] == kind {
+				return true
+			}
+			i += 1
 		}
 	}
 	return false
@@ -153,24 +165,28 @@ type reader struct {
 	pos i64
 }
 
-func (r mut reader) word() !i64 {
+fn (r mut reader) word() !i64 {
 	if r.pos+8 > len(r.b) {
 		fail "capsule: damaged (truncated)"
 	}
-	v := 0
-	for i := 7; i >= 0; i-- {
-		v = v<<8 | i64(r.b[r.pos+i])
+	mut v = 0
+	{
+		mut i = 7
+		for i >= 0 {
+			v = v<<8 | i64(r.b[r.pos+i])
+			i -= 1
+		}
 	}
 	r.pos += 8
 	return v
 }
 
-func (r mut reader) bytes() !str {
-	n := try r.word()
+fn (r mut reader) bytes() !str {
+	let n = try r.word()
 	if n < 0 || n > len(r.b)-r.pos {
 		fail "capsule: damaged (truncated)"
 	}
-	s := r.b[r.pos : r.pos+n]
+	let s = r.b[r.pos : r.pos+n]
 	r.pos += n
 	return s
 }

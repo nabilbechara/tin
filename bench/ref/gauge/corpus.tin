@@ -7,16 +7,16 @@ import "say"
 import "gauge"
 import "quarry"
 
-var seed u64 = 88172645463325252
+mut seed u64 = 88172645463325252
 
-func next() u64 {
+fn next() u64 {
 	seed ^= seed >> 12
 	seed ^= seed << 25
 	seed ^= seed >> 27
 	return seed * 2685821657736338717
 }
 
-func edge() []f64 {
+fn edge() []f64 {
 	return []f64{
 		0, gauge.Copysign(0, -1), 1, -1, 0.5, -0.5, 2, -2, 3, 10, 100, 1e-3, 1e-10, 1e-300, 1e300, -1e300,
 		gauge.Inf(1), gauge.Inf(-1), gauge.NaN(), gauge.MaxF64, -gauge.MaxF64, gauge.SmallestNonzeroF64,
@@ -30,55 +30,59 @@ func edge() []f64 {
 	}
 }
 
-func inputs() []f64 {
-	xs := edge()
-	for i := 0; i < 20000; i++ {
-		v := next()
-		m := next()
-		switch v % 4 {
-		case 0:
-			xs = append(xs, f64(i64(m>>11)%2000001-1000000)/100000)
-		case 1:
-			e := i64(v>>8) % 121
-			if e < 0 {
-				e = -e
+fn inputs() []f64 {
+	mut xs = edge()
+	for i in 0..20000 {
+		let v = next()
+		let m = next()
+		match v % 4 {
+			0 => {
+				xs = append(xs, f64(i64(m>>11)%2000001-1000000)/100000)
 			}
-			e -= 60
-			bits := u64(1023+e)<<52 | m&0xfffffffffffff | (v>>20&1)<<63
-			xs = append(xs, gauge.F64frombits(bits))
-		case 2:
-			xs = append(xs, gauge.F64frombits(m))
-		default:
-			k := i64(v>>8)%8001 - 4000
-			xs = append(xs, f64(k)/8)
+			1 => {
+				mut e = i64(v>>8) % 121
+				if e < 0 {
+					e = -e
+				}
+				e -= 60
+				let bits = u64(1023+e)<<52 | m&0xfffffffffffff | (v>>20&1)<<63
+				xs = append(xs, gauge.F64frombits(bits))
+			}
+			2 => {
+				xs = append(xs, gauge.F64frombits(m))
+			}
+			_ => {
+				let k = i64(v>>8)%8001 - 4000
+				xs = append(xs, f64(k)/8)
+			}
 		}
 	}
 	return xs
 }
 
-func canon(f f64) u64 {
+fn canon(f f64) u64 {
 	if f != f {
 		return 0x7ff8000000000001
 	}
 	return gauge.F64bits(f)
 }
 
-func mix(h u64, b u64) u64 {
-	for i := 0; i < 8; i++ {
+fn mix(h u64, b u64) u64 {
+	for i in 0..8 {
 		h ^= (b >> u64(8*i)) & 0xff
 		h *= 1099511628211
 	}
 	return h
 }
 
-func hex(b u64) str {
+fn hex(b u64) str {
 	return say.Fmt("%016x", b)
 }
 
-func unary(name str, f func(f64) f64, xs []f64, dump bool) {
-	h := u64(14695981039346656037)
-	for i, x := range xs {
-		b := canon(f(x))
+fn unary(name str, f fn(f64) f64, xs []f64, dump bool) {
+	mut h = u64(14695981039346656037)
+	for i, x in xs {
+		let b = canon(f(x))
 		h = mix(h, b)
 		if dump {
 			say.Line(name, i, hex(gauge.F64bits(x)), hex(b))
@@ -89,18 +93,18 @@ func unary(name str, f func(f64) f64, xs []f64, dump bool) {
 	}
 }
 
-func binary(name str, f func(f64, f64) f64, xs []f64, dump bool) {
-	h := u64(14695981039346656037)
-	n := 0
-	for i, x := range xs {
-		js := []i64{(i*7 + 3) % len(xs), (i*13 + 1) % len(xs), i}
-		for _, j := range js {
-			b := canon(f(x, xs[j]))
+fn binary(name str, f fn(f64, f64) f64, xs []f64, dump bool) {
+	mut h = u64(14695981039346656037)
+	mut n = 0
+	for i, x in xs {
+		let js = []i64{(i*7 + 3) % len(xs), (i*13 + 1) % len(xs), i}
+		for _, j in js {
+			let b = canon(f(x, xs[j]))
 			h = mix(h, b)
 			if dump {
 				say.Line(name, say.Fmt("{i},{j}"), hex(gauge.F64bits(x)), hex(gauge.F64bits(xs[j])), hex(b))
 			}
-			n++
+			n += 1
 		}
 	}
 	if !dump {
@@ -108,13 +112,13 @@ func binary(name str, f func(f64, f64) f64, xs []f64, dump bool) {
 	}
 }
 
-func absPow(x f64, y f64) f64 {
+fn absPow(x f64, y f64) f64 {
 	return gauge.Pow(gauge.Abs(x), y)
 }
 
-func main() {
-	dump := len(quarry.Args()) > 1 && quarry.Args()[1] == "dump"
-	xs := inputs()
+fn main() {
+	let dump = len(quarry.Args()) > 1 && quarry.Args()[1] == "dump"
+	let xs = inputs()
 	unary("sin", gauge.Sin, xs, dump)
 	unary("cos", gauge.Cos, xs, dump)
 	unary("tan", gauge.Tan, xs, dump)
@@ -136,17 +140,17 @@ func main() {
 	binary("hypot", gauge.Hypot, xs, dump)
 	binary("mod", gauge.Mod, xs, dump)
 
-	h := u64(14695981039346656037)
-	n := 0
-	ys := []f64{2, 3, -2, 10, -7, 0.25, 1.5, -0.75, 100, 0.3333333333333333, 2.5, -1.5}
-	for i := 0; i < 2000; i++ {
-		for _, y := range ys {
-			b := canon(absPow(xs[i], y))
+	mut h = u64(14695981039346656037)
+	mut n = 0
+	let ys = []f64{2, 3, -2, 10, -7, 0.25, 1.5, -0.75, 100, 0.3333333333333333, 2.5, -1.5}
+	for i in 0..2000 {
+		for _, y in ys {
+			let b = canon(absPow(xs[i], y))
 			h = mix(h, b)
 			if dump {
 				say.Line("powi", n, hex(gauge.F64bits(gauge.Abs(xs[i]))), hex(gauge.F64bits(y)), hex(b))
 			}
-			n++
+			n += 1
 		}
 	}
 	if !dump {

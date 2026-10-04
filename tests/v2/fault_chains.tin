@@ -4,15 +4,15 @@ import "fault"
 import "say"
 
 // Two sentinels with the same message: identity, not text, tells them apart.
-var ErrNotFound = fault("not found")
-var ErrAlsoNotFound = fault("not found")
-var ErrDenied = fault("denied {1 + 1}")
+let ErrNotFound = fault("not found")
+let ErrAlsoNotFound = fault("not found")
+let ErrDenied = fault("denied {1 + 1}")
 
 type Item struct {
 	Name str
 }
 
-func find(key str) !Item {
+fn find(key str) !Item {
 	if key == "missing" {
 		fail ErrNotFound
 	}
@@ -25,43 +25,48 @@ func find(key str) !Item {
 	return Item{Name: key}
 }
 
-func load(id i64, key str) !Item {
-	it := find(key) catch err {
+fn load(id i64, key str) !Item {
+	let it = find(key) catch err {
 		fail fault.Wrap(err, "loading user {id}")
 	}
 	return it
 }
 
-func handle(key str) !str {
-	it := load(7, key) catch err {
+fn handle(key str) !str {
+	let it = load(7, key) catch err {
 		fail fault.Wrap(err, "handle")
 	}
 	return it.Name
 }
 
-func classify(err fault) str {
-	switch err {
-	case nil:
-		return "ok"
-	case ErrNotFound:
-		return "404"
-	case fault.DeadlineExceeded, fault.Overloaded:
-		return "503"
-	case ErrDenied:
-		return "403"
-	default:
-		return "500"
+fn classify(err fault) str {
+	match err {
+		nil => {
+			return "ok"
+		}
+		ErrNotFound => {
+			return "404"
+		}
+		fault.DeadlineExceeded, fault.Overloaded => {
+			return "503"
+		}
+		ErrDenied => {
+			return "403"
+		}
+		_ => {
+			return "500"
+		}
 	}
 	return "unreachable"
 }
 
-func q(s str) str {
+fn q(s str) str {
 	return say.Fmt("%q", s)
 }
 
-func main() {
+fn main() {
 	// Wrapped messages read outer: inner, and the chain keeps the sentinel reachable.
-	_, err := handle("missing")
+	let (_, err) = handle("missing")
 	say.Line("wrap message:", err)
 	say.Line("wrap str:", say.Str(err))
 	say.Line("wrap interp: {err}")
@@ -69,52 +74,52 @@ func main() {
 	say.Line("wrap is ErrAlsoNotFound:", fault.Is(err, ErrAlsoNotFound))
 	say.Line("wrap is ErrDenied:", fault.Is(err, ErrDenied))
 	say.Line("wrap classify:", classify(err))
-	c := fault.Cause(err)
+	let c = fault.Cause(err)
 	say.Line("cause 1:", c)
-	c2 := fault.Cause(c)
+	let c2 = fault.Cause(c)
 	say.Line("cause 2:", c2, fault.Is(c2, ErrNotFound))
-	c3 := fault.Cause(c2)
+	let c3 = fault.Cause(c2)
 	say.Line("cause 3 nil:", c3 == nil)
 	say.Line("message:", fault.Message(err))
 
-	_, err2 := handle("secret")
+	let (_, err2) = handle("secret")
 	say.Line("denied:", err2, classify(err2))
-	_, err3 := handle("bad")
+	let (_, err3) = handle("bad")
 	say.Line("plain:", err3, classify(err3), fault.Is(err3, ErrNotFound))
-	_, err4 := handle("ok")
+	let (_, err4) = handle("ok")
 	say.Line("success:", classify(err4), fault.Is(err4, nil), fault.Is(err4, ErrNotFound))
 
 	// Faults without identity match only themselves.
-	a := fail("same text")
-	b := fail("same text")
+	let a = fail("same text")
+	let b = fail("same text")
 	say.Line("plain self:", fault.Is(a, a), "plain other:", fault.Is(a, b))
-	wa := fault.Wrap(a, "outer")
+	let wa = fault.Wrap(a, "outer")
 	say.Line("plain through wrap:", fault.Is(wa, a), fault.Is(wa, b))
 	say.Line("nil target:", fault.Is(a, nil), "nil err:", fault.Is(nil, ErrNotFound))
 	say.Line("sentinel self:", fault.Is(ErrNotFound, ErrNotFound), fault.Is(ErrNotFound, ErrAlsoNotFound))
 
 	// Wrap of nil is nil; Message of nil is empty.
-	wn := fault.Wrap(nil, "context")
+	let wn = fault.Wrap(nil, "context")
 	say.Line("wrap nil:", wn == nil, q(fault.Message(nil)))
-	ws := fault.Wrap(ErrNotFound, "")
+	let ws = fault.Wrap(ErrNotFound, "")
 	say.Line("wrap empty msg:", q(fault.Message(ws)), fault.Is(ws, ErrNotFound))
 
 	// Join: every non-nil fault reachable, messages on separate lines.
-	d := fault.Wrap(fault.DeadlineExceeded, "dialing db")
-	j := fault.Join([]fault{err, nil, d})
+	let d = fault.Wrap(fault.DeadlineExceeded, "dialing db")
+	let j = fault.Join([]fault{err, nil, d})
 	say.Line("join message:", q(fault.Message(j)))
 	say.Line("join is:", fault.Is(j, ErrNotFound), fault.Is(j, fault.DeadlineExceeded), fault.Is(j, ErrDenied), fault.Is(j, fault.Canceled))
 	say.Line("join cause nil:", fault.Cause(j) == nil)
 	say.Line("join classify:", classify(j))
-	jn := fault.Join([]fault{nil, nil})
+	let jn = fault.Join([]fault{nil, nil})
 	say.Line("join all nil:", jn == nil)
-	je := fault.Join([]fault{})
+	let je = fault.Join([]fault{})
 	say.Line("join empty:", je == nil)
-	j1 := fault.Join([]fault{ErrDenied})
+	let j1 = fault.Join([]fault{ErrDenied})
 	say.Line("join one:", q(fault.Message(j1)), fault.Is(j1, ErrDenied))
-	wj := fault.Wrap(j, "request")
+	let wj = fault.Wrap(j, "request")
 	say.Line("wrapped join:", q(fault.Message(wj)), fault.Is(wj, fault.DeadlineExceeded), classify(wj))
-	nested := fault.Join([]fault{fault.Join([]fault{a, ErrDenied}), fault.Overloaded})
+	let nested = fault.Join([]fault{fault.Join([]fault{a, ErrDenied}), fault.Overloaded})
 	say.Line("nested join:", q(fault.Message(nested)), fault.Is(nested, a), fault.Is(nested, ErrDenied), fault.Is(nested, fault.Overloaded), fault.Is(nested, b))
 
 	// The runtime's sentinels: distinct identities and fixed messages.
@@ -124,11 +129,11 @@ func main() {
 	say.Line("backtrace none:", q(fault.Backtrace(err)))
 
 	// keep copies the whole chain and keeps identities.
-	k := keep(wj)
+	let k = keep(wj)
 	say.Line("kept:", q(fault.Message(k)), fault.Is(k, ErrNotFound), fault.Is(k, fault.DeadlineExceeded), fault.Is(k, ErrDenied))
 
 	// Formatted faults and printing are unchanged.
-	f := say.Fault("code %d", 42)
+	let f = say.Fault("code %d", 42)
 	say.Line("say.Fault:", f, fault.Is(fault.Wrap(f, "x"), f))
 	say.Line("error method:", err.Error())
 }

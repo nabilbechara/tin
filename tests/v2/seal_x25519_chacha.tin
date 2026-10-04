@@ -3,107 +3,111 @@ package main
 import "say"
 import "seal"
 
-func hx(s str) []u8 {
-	b, err := seal.HexDecode(s)
+fn hx(s str) []u8 {
+	let (b, err) = seal.HexDecode(s)
 	if err != nil {
 		panic("bad hex")
 	}
 	return b
 }
 
-func x25519(k []u8, u []u8) str {
-	s := seal.X25519(k, u) catch _ {
+fn x25519(k []u8, u []u8) str {
+	let s = seal.X25519(k, u) catch _ {
 		return "fault"
 	}
 	return seal.Hex(s)
 }
 
-func sealAEAD(key []u8, nonce []u8, pt []u8, aad []u8) str {
-	a := seal.NewChaCha20Poly1305(key) catch _ {
+fn sealAEAD(key []u8, nonce []u8, pt []u8, aad []u8) str {
+	let a = seal.NewChaCha20Poly1305(key) catch _ {
 		return "fault"
 	}
-	out := a.Seal(nonce, pt, aad) catch _ {
-		return "fault"
-	}
-	return seal.Hex(out)
-}
-
-func openAEAD(key []u8, nonce []u8, sealed []u8, aad []u8) str {
-	a := seal.NewChaCha20Poly1305(key) catch _ {
-		return "fault"
-	}
-	out := a.Open(nonce, sealed, aad) catch _ {
+	let out = a.Seal(nonce, pt, aad) catch _ {
 		return "fault"
 	}
 	return seal.Hex(out)
 }
 
-func seq(n i64, from i64) []u8 {
-	b := make([]u8, n)
-	for i := 0; i < n; i++ {
+fn openAEAD(key []u8, nonce []u8, sealed []u8, aad []u8) str {
+	let a = seal.NewChaCha20Poly1305(key) catch _ {
+		return "fault"
+	}
+	let out = a.Open(nonce, sealed, aad) catch _ {
+		return "fault"
+	}
+	return seal.Hex(out)
+}
+
+fn seq(n i64, from i64) []u8 {
+	let b = make([]u8, n)
+	for i in 0..n {
 		b[i] = u8(from + 7*i)
 	}
 	return b
 }
 
-func clone(b []u8) []u8 {
-	out := make([]u8, len(b))
+fn clone(b []u8) []u8 {
+	let out = make([]u8, len(b))
 	copy(out, b)
 	return out
 }
 
-func main() {
+fn main() {
 	// RFC 7748 section 5.2 and 6.1.
 	say.Line("x25519", x25519(hx("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4"), hx("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c")))
 	say.Line("x25519", x25519(hx("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d"), hx("e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493")))
-	a := hx("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
-	b := hx("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
-	nine := make([]u8, 32)
+	let a = hx("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a")
+	let b = hx("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb")
+	let nine = make([]u8, 32)
 	nine[0] = 9
-	pa := seal.X25519PublicKey(a) catch _ { []u8{} }
-	pb := seal.X25519PublicKey(b) catch _ { []u8{} }
+	let pa = seal.X25519PublicKey(a) catch _ { []u8{} }
+	let pb = seal.X25519PublicKey(b) catch _ { []u8{} }
 	say.Line("pub", seal.Hex(pa), seal.Hex(pb))
 	say.Line("dh", x25519(a, pb), x25519(b, pa))
-	k := clone(nine)
-	u := clone(nine)
-	for i := 1; i <= 1000; i++ {
-		r := hx(x25519(k, u))
-		u = k
-		k = r
-		if i == 1 || i == 1000 {
-			say.Line("iter", i, seal.Hex(k))
+	mut k = clone(nine)
+	mut u = clone(nine)
+	{
+		mut i = 1
+		for i <= 1000 {
+			let r = hx(x25519(k, u))
+			u = k
+			k = r
+			if i == 1 || i == 1000 {
+				say.Line("iter", i, seal.Hex(k))
+			}
+			i += 1
 		}
 	}
 	// A low-order point gives an all-zero secret, which must fail; so do wrong lengths.
 	say.Line("loworder", x25519(a, make([]u8, 32)), x25519(a, hx("e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800")))
 	say.Line("badlen", x25519(a[:31], nine), x25519(a, nine[:31]))
 	// RFC 8439 2.4.2 and 2.8.2.
-	sun := []u8("Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.")
-	key := hx("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
-	ct := seal.ChaCha20(key, hx("000000000000004a00000000"), 1, sun) catch _ { []u8{} }
+	let sun = []u8("Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.")
+	let key = hx("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+	let ct = seal.ChaCha20(key, hx("000000000000004a00000000"), 1, sun) catch _ { []u8{} }
 	say.Line("chacha20", seal.Hex(ct))
-	akey := hx("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
-	nonce := hx("070000004041424344454647")
-	aad := hx("50515253c0c1c2c3c4c5c6c7")
-	sealed := sealAEAD(akey, nonce, sun, aad)
+	let akey = hx("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+	let nonce = hx("070000004041424344454647")
+	let aad = hx("50515253c0c1c2c3c4c5c6c7")
+	let sealed = sealAEAD(akey, nonce, sun, aad)
 	say.Line("aead", sealed)
 	say.Line("open", openAEAD(akey, nonce, hx(sealed), aad) == seal.Hex(sun))
-	for _, n := range []i64{0, 1, 15, 16, 17, 63, 64, 65, 129, 1000} {
-		k := seq(32, n)
-		no := seq(12, 3*n)
-		ad := seq(n%20, 5)
-		pt := seq(n, 11)
-		s := sealAEAD(k, no, pt, ad)
-		sb := hx(s)
-		bad := clone(sb)
+	for _, n in []i64{0, 1, 15, 16, 17, 63, 64, 65, 129, 1000} {
+		let k = seq(32, n)
+		let no = seq(12, 3*n)
+		let ad = seq(n%20, 5)
+		let pt = seq(n, 11)
+		let s = sealAEAD(k, no, pt, ad)
+		let sb = hx(s)
+		let bad = clone(sb)
 		bad[len(bad)-1] ^= 0x80
-		badct := "fault"
+		mut badct = "fault"
 		if n > 0 {
-			bc := clone(sb)
+			let bc = clone(sb)
 			bc[0] ^= 1
 			badct = openAEAD(k, no, bc, ad)
 		}
-		ad2 := clone(ad)
+		mut ad2 = clone(ad)
 		ad2 = append(ad2, 0)
 		say.Line("len", n, s, openAEAD(k, no, sb, ad) == seal.Hex(pt), openAEAD(k, no, bad, ad), badct, openAEAD(k, no, sb, ad2), openAEAD(k, seq(12, 1), sb, ad))
 	}

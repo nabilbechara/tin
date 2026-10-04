@@ -3,80 +3,80 @@ package main
 import "say"
 import "seal"
 
-func hx(s str) []u8 {
-	b, err := seal.HexDecode(s)
+fn hx(s str) []u8 {
+	let (b, err) = seal.HexDecode(s)
 	if err != nil {
 		panic("bad hex")
 	}
 	return b
 }
 
-func sealGCM(key []u8, nonce []u8, pt []u8, aad []u8) str {
-	a := seal.NewAESGCM(key) catch _ {
+fn sealGCM(key []u8, nonce []u8, pt []u8, aad []u8) str {
+	let a = seal.NewAESGCM(key) catch _ {
 		return "fault"
 	}
-	out := a.Seal(nonce, pt, aad) catch _ {
-		return "fault"
-	}
-	return seal.Hex(out)
-}
-
-func openGCM(key []u8, nonce []u8, sealed []u8, aad []u8) str {
-	a := seal.NewAESGCM(key) catch _ {
-		return "fault"
-	}
-	out := a.Open(nonce, sealed, aad) catch _ {
+	let out = a.Seal(nonce, pt, aad) catch _ {
 		return "fault"
 	}
 	return seal.Hex(out)
 }
 
-func seq(n i64, from i64) []u8 {
-	b := make([]u8, n)
-	for i := 0; i < n; i++ {
+fn openGCM(key []u8, nonce []u8, sealed []u8, aad []u8) str {
+	let a = seal.NewAESGCM(key) catch _ {
+		return "fault"
+	}
+	let out = a.Open(nonce, sealed, aad) catch _ {
+		return "fault"
+	}
+	return seal.Hex(out)
+}
+
+fn seq(n i64, from i64) []u8 {
+	let b = make([]u8, n)
+	for i in 0..n {
 		b[i] = u8(from + 13*i)
 	}
 	return b
 }
 
-func clone(b []u8) []u8 {
-	out := make([]u8, len(b))
+fn clone(b []u8) []u8 {
+	let out = make([]u8, len(b))
 	copy(out, b)
 	return out
 }
 
-func main() {
+fn main() {
 	// NIST GCM spec test cases 1-4 (AES-128), 7-10 (AES-192) and 13-16 (AES-256).
-	pt := hx("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255")
-	aad := hx("feedfacedeadbeeffeedfacedeadbeefabaddad2")
-	nonce := hx("cafebabefacedbaddecaf888")
-	for _, k := range []str{"feffe9928665731c6d6a8f9467308308", "feffe9928665731c6d6a8f9467308308feffe9928665731c", "feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308"} {
-		zero := make([]u8, len(k)/2)
+	let pt = hx("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255")
+	let aad = hx("feedfacedeadbeeffeedfacedeadbeefabaddad2")
+	let nonce = hx("cafebabefacedbaddecaf888")
+	for _, k in []str{"feffe9928665731c6d6a8f9467308308", "feffe9928665731c6d6a8f9467308308feffe9928665731c", "feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308"} {
+		let zero = make([]u8, len(k)/2)
 		say.Line("nist", len(zero), sealGCM(zero, make([]u8, 12), []u8{}, []u8{}), sealGCM(zero, make([]u8, 12), make([]u8, 16), []u8{}))
 		say.Line("nist", len(zero), sealGCM(hx(k), nonce, pt, []u8{}))
 		say.Line("nist", len(zero), sealGCM(hx(k), nonce, pt[:60], aad))
 	}
-	for _, n := range []i64{0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 1000, 16384} {
-		for _, kl := range []i64{16, 24, 32} {
-			k := seq(kl, n)
-			no := seq(12, 3*n+kl)
-			ad := seq(n%37, 5)
-			p := seq(n, 11)
-			s := sealGCM(k, no, p, ad)
-			sb := hx(s)
-			bad := clone(sb)
+	for _, n in []i64{0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 1000, 16384} {
+		for _, kl in []i64{16, 24, 32} {
+			let k = seq(kl, n)
+			let no = seq(12, 3*n+kl)
+			let ad = seq(n%37, 5)
+			let p = seq(n, 11)
+			let s = sealGCM(k, no, p, ad)
+			let sb = hx(s)
+			let bad = clone(sb)
 			bad[len(bad)-1] ^= 0x01
-			badct := "fault"
+			mut badct = "fault"
 			if n > 0 {
-				bc := clone(sb)
+				let bc = clone(sb)
 				bc[n-1] ^= 0x40
 				badct = openGCM(k, no, bc, ad)
 			}
-			head := s
+			mut head = s
 			if len(head) > 96 {
 				head = head[len(head)-96:]
 			}
-			ad2 := clone(ad)
+			mut ad2 = clone(ad)
 			ad2 = append(ad2, 1)
 			say.Line("len", n, kl, head, openGCM(k, no, sb, ad) == seal.Hex(p), openGCM(k, no, bad, ad), badct, openGCM(k, no, sb, ad2), openGCM(k, seq(12, 2), sb, ad))
 		}

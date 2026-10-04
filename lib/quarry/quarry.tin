@@ -12,23 +12,23 @@ const eEXIST = 17
 const eINVAL = 22
 
 // Two stat buffers (struct stat is at most 144 bytes) and a path buffer, one set per core.
-var stbuf i64 = calloc(1, 256)
-var stbuf2 i64 = calloc(1, 256)
-var pathbuf i64 = calloc(1, 4096)
+let stbuf i64 = calloc(1, 256)
+let stbuf2 i64 = calloc(1, 256)
+let pathbuf i64 = calloc(1, 4096)
 
-func c32(x i64) i64 {
+fn c32(x i64) i64 {
 	return i64(i32(x))
 }
 
 // errno returns the error code of the libc call that just failed.
-func errno() i64 {
+fn errno() i64 {
 	return rt_errno()
 }
 
 // errnoText returns rt_sys_strerror(e) with its first letter lowered, which is Go's spelling of errno texts.
-func errnoText(e i64) str {
-	p := rt_sys_strerror(e)
-	s := rt_str_from_raw(p, strlen(p))
+fn errnoText(e i64) str {
+	let p = rt_sys_strerror(e)
+	let s = rt_str_from_raw(p, strlen(p))
 	if len(s) > 0 && s[0] >= 'A' && s[0] <= 'Z' {
 		store8(cast(i64, s)+8, i64(s[0])+32)
 	}
@@ -36,50 +36,50 @@ func errnoText(e i64) str {
 }
 
 // pathFault makes "op path: rt_sys_strerror(errno)" like Go's PathError.
-func pathFault(op str, path str) ! {
-	e := errnoText(errno())
+fn pathFault(op str, path str) ! {
+	let e = errnoText(errno())
 	fail say.Fault("%s %s: %s", op, path, e)
 }
 
 // badPath reports whether path holds a NUL byte, which no C path can carry.
-func badPath(path str) bool {
+fn badPath(path str) bool {
 	return len(path) > 0 && memchr(cast(i64, path)+8, 0, len(path)) != 0
 }
 
 // badKey reports an environment variable name the environment cannot hold: empty, or with
 // '=' or NUL in it (as POSIX setenv and unsetenv refuse them).
-func badKey(key str) bool {
+fn badKey(key str) bool {
 	return len(key) == 0 || memchr(cast(i64, key)+8, '=', len(key)) != 0 || badPath(key)
 }
 
 // invalidFault is the fault for a path with a NUL byte: "op path: invalid argument".
-func invalidFault(op str, path str) ! {
+fn invalidFault(op str, path str) ! {
 	fail say.Fault("%s %s: %s", op, path, errnoText(eINVAL))
 }
 
 // mode returns st_mode from the stat buffer st.
-func mode(st i64) i64 {
+fn mode(st i64) i64 {
 	return rt_stat_mode(st)
 }
 
 // isDirMode reports whether a st_mode value is a directory.
-func isDirMode(m i64) bool {
+fn isDirMode(m i64) bool {
 	return m&0xf000 == 0x4000
 }
 
 // Args returns the command line, program name first.
-func Args() []str {
-	out := make([]str, 0, rtArgc)
-	for i := 0; i < rtArgc; i++ {
-		p := rtArgv[i]
+fn Args() []str {
+	mut out = make([]str, 0, rtArgc)
+	for i in 0..rtArgc {
+		let p = rtArgv[i]
 		out = append(out, rt_str_from_raw(p, strlen(p)))
 	}
 	return out
 }
 
 // Getenv returns the value of environment variable key, or "" when it is unset.
-func Getenv(key str) str {
-	p := rt_getenv(rt_cstr(key))
+fn Getenv(key str) str {
+	let p = rt_getenv(rt_cstr(key))
 	if p == 0 {
 		return ""
 	}
@@ -87,8 +87,8 @@ func Getenv(key str) str {
 }
 
 // LookupEnv returns the value of key and whether it is set (an empty value is still set).
-func LookupEnv(key str) (str, bool) {
-	p := rt_getenv(rt_cstr(key))
+fn LookupEnv(key str) (str, bool) {
+	let p = rt_getenv(rt_cstr(key))
 	if p == 0 {
 		return "", false
 	}
@@ -96,43 +96,43 @@ func LookupEnv(key str) (str, bool) {
 }
 
 // Setenv sets environment variable key to value; an empty key or one holding '=' or NUL is a fault.
-func Setenv(key str, value str) ! {
+fn Setenv(key str, value str) ! {
 	if badKey(key) || badPath(value) {
 		fail say.Fault("setenv: %s", errnoText(eINVAL))
 	}
 	if c32(rt_setenv(rt_cstr(key), rt_cstr(value))) != 0 {
-		e := errnoText(rt_env_errno())
+		let e = errnoText(rt_env_errno())
 		fail say.Fault("setenv: %s", e)
 	}
 }
 
 // Unsetenv removes environment variable key.
-func Unsetenv(key str) ! {
+fn Unsetenv(key str) ! {
 	if badKey(key) {
 		fail say.Fault("unsetenv: %s", errnoText(eINVAL))
 	}
 	if c32(rt_unsetenv(rt_cstr(key))) != 0 {
-		e := errnoText(rt_env_errno())
+		let e = errnoText(rt_env_errno())
 		fail say.Fault("unsetenv: %s", e)
 	}
 }
 
 // readFd reads fd to its end into one str; hint is the expected size (0 when unknown).
-func readFd(fd i64, hint i64, path str) !str {
-	room := hint + 1
+fn readFd(fd i64, hint i64, path str) !str {
+	mut room = hint + 1
 	if room < 512 {
 		room = 512
 	}
-	p := rt_str_new(room)
-	got := 0
+	mut p = rt_str_new(room)
+	mut got = 0
 	for {
 		if got == room {
 			room *= 2
-			q := rt_str_new(room)
+			let q = rt_str_new(room)
 			memcpy(q+8, p+8, got)
 			p = q
 		}
-		n := rt_sys_read(fd, p+8+got, room-got)
+		let n = rt_sys_read(fd, p+8+got, room-got)
 		if n < 0 {
 			fail pathFault("read", path)
 		}
@@ -149,8 +149,8 @@ func readFd(fd i64, hint i64, path str) !str {
 }
 
 // ReadFile returns the whole content of the file at path.
-func ReadFile(path str) !str {
-	tp := rt_tape()
+fn ReadFile(path str) !str {
+	let tp = rt_tape()
 	if tp != 0 {
 		tapedA = cast(i64, path)
 		return try rt_effect(tp, "quarry.read@1", path, readLive) // recorded for replay (#241)
@@ -159,7 +159,7 @@ func ReadFile(path str) !str {
 		return try readFileHere(path)
 	}
 	// Inside a request task the read runs on a helper thread while the core serves others.
-	job := calloc(5, 8)
+	let job = calloc(5, 8)
 	job[0] = rt_heap_str(path)
 	try rt_helper_run(readJob, job, jobDrop)
 	return try jobResult(job)
@@ -167,8 +167,8 @@ func ReadFile(path str) !str {
 
 // readJob runs ReadFile on a helper thread, copying the result (or the fault's message)
 // into malloc'd memory the task turns back into a str.
-func readJob(job i64) {
-	s, err := readFileHere(cast(str, job[0]))
+fn readJob(job i64) {
+	let (s, err) = readFileHere(cast(str, job[0]))
 	if err != nil {
 		jobFault(job, err)
 		return
@@ -178,8 +178,8 @@ func readJob(job i64) {
 	job[2] = len(s)
 }
 
-func jobFault(job i64, err fault) {
-	m := say.Str(err)
+fn jobFault(job i64, err fault) {
+	let m = say.Str(err)
 	job[3] = malloc(len(m) + 1)
 	memcpy(job[3], cast(i64, m)+8, len(m))
 	job[4] = len(m)
@@ -187,23 +187,23 @@ func jobFault(job i64, err fault) {
 
 // Heap-owned inputs stay alive after a caller's deadline. The completion path uses
 // these same disposers for late results, which never enter the expired request pool.
-func jobDrop(job i64) {
+fn jobDrop(job i64) {
 	free(job[0])
 	free(job[1])
 	free(job[3])
 	free(job)
 }
 
-func writeDrop(job i64) {
+fn writeDrop(job i64) {
 	free(job[5])
 	jobDrop(job)
 }
 
 // jobResult copies the result into the caller's pool and releases the heap-owned job.
-func jobResult(job i64) !str {
-	m := ""
-	s := ""
-	bad := job[3] != 0
+fn jobResult(job i64) !str {
+	mut m = ""
+	mut s = ""
+	let bad = job[3] != 0
 	if bad {
 		m = rt_str_from_raw(job[3], job[4])
 	} else if job[1] != 0 {
@@ -216,19 +216,19 @@ func jobResult(job i64) !str {
 	return s
 }
 
-func readFileHere(path str) !str {
+fn readFileHere(path str) !str {
 	if badPath(path) {
 		fail invalidFault("open", path)
 	}
-	fd := c32(rt_sys_open(rt_cstr(path), oRdonly, 0))
+	let fd = c32(rt_sys_open(rt_cstr(path), oRdonly, 0))
 	if fd < 0 {
 		fail pathFault("open", path)
 	}
-	size := 0
+	mut size = 0
 	if c32(rt_sys_fstat(fd, stbuf)) == 0 && !isDirMode(mode(stbuf)) {
 		size = rt_stat_size(stbuf)
 	}
-	s, err := readFd(fd, size, path)
+	let (s, err) = readFd(fd, size, path)
 	rt_sys_close(fd)
 	if err != nil {
 		fail err
@@ -238,7 +238,7 @@ func readFileHere(path str) !str {
 
 // ReadStdin reads standard input to its end. Inside a task, from a pipe, socket or terminal,
 // it waits through rt_task_wait: the core serves others, and a deadline or cancel fails it.
-func ReadStdin() !str {
+fn ReadStdin() !str {
 	if rt_task_current() != 0 && waitable(0) {
 		return try readFdWait(0, "/dev/stdin")
 	}
@@ -246,30 +246,30 @@ func ReadStdin() !str {
 }
 
 // waitable reports whether fd is a pipe, socket or terminal, which a task can wait on.
-func waitable(fd i64) bool {
+fn waitable(fd i64) bool {
 	if c32(rt_sys_fstat(fd, stbuf)) != 0 {
 		return false
 	}
-	t := mode(stbuf) & 0xf000
+	let t = mode(stbuf) & 0xf000
 	return t == 0x1000 || t == 0xc000 || (t == 0x2000 && rt_isatty(fd))
 }
 
 // readFdWait is readFd for a waitable fd in a task: it waits for input before every read.
-func readFdWait(fd i64, path str) !str {
-	room := 512
-	p := rt_str_new(room)
-	got := 0
+fn readFdWait(fd i64, path str) !str {
+	mut room = 512
+	mut p = rt_str_new(room)
+	mut got = 0
 	for {
 		if got == room {
 			room *= 2
-			q := rt_str_new(room)
+			let q = rt_str_new(room)
 			memcpy(q+8, p+8, got)
 			p = q
 		}
 		if rt_task_wait(fd, 1, 0) == waitDeadline {
 			fail cast(fault, rt_wait_fault())
 		}
-		n := rt_sys_read(fd, p+8+got, room-got)
+		let n = rt_sys_read(fd, p+8+got, room-got)
 		if n < 0 {
 			if errno() == EAGAIN {
 				continue
@@ -289,20 +289,20 @@ func readFdWait(fd i64, path str) !str {
 }
 
 // writeAll creates or opens path with flags (mode 0644) and writes all of data to it.
-func writeAll(path str, data str, flags i64) ! {
+fn writeAll(path str, data str, flags i64) ! {
 	if badPath(path) {
 		fail invalidFault("open", path)
 	}
-	fd := c32(rt_sys_open(rt_cstr(path), flags, 420))
+	let fd = c32(rt_sys_open(rt_cstr(path), flags, 420))
 	if fd < 0 {
 		fail pathFault("open", path)
 	}
-	p := cast(i64, data) + 8
-	n := len(data)
+	mut p = cast(i64, data) + 8
+	mut n = len(data)
 	for n > 0 {
-		w := rt_sys_write(fd, p, n)
+		let w = rt_sys_write(fd, p, n)
 		if w < 0 {
-			f := pathFault("write", path)
+			let f = pathFault("write", path)
 			rt_sys_close(fd)
 			if f != nil {
 				fail f
@@ -318,8 +318,8 @@ func writeAll(path str, data str, flags i64) ! {
 }
 
 // WriteFile writes data to the file at path, creating it (mode 0644) or truncating it.
-func WriteFile(path str, data str) ! {
-	tp := rt_tape()
+fn WriteFile(path str, data str) ! {
+	let tp = rt_tape()
 	if tp != 0 {
 		return try writeTaped(tp, "w ", path, data, oWrite) // recorded for replay (#241)
 	}
@@ -327,8 +327,8 @@ func WriteFile(path str, data str) ! {
 }
 
 // AppendFile appends data to the file at path, creating it (mode 0644) when needed.
-func AppendFile(path str, data str) ! {
-	tp := rt_tape()
+fn AppendFile(path str, data str) ! {
+	let tp = rt_tape()
 	if tp != 0 {
 		return try writeTaped(tp, "a ", path, data, oAppend) // recorded for replay (#241)
 	}
@@ -336,11 +336,11 @@ func AppendFile(path str, data str) ! {
 }
 
 // writeVia is writeAll, on a helper thread when called from a request task.
-func writeVia(path str, data str, flags i64) ! {
+fn writeVia(path str, data str, flags i64) ! {
 	if rt_task_current() == 0 {
 		return try writeAll(path, data, flags)
 	}
-	job := calloc(7, 8)
+	let job = calloc(7, 8)
 	job[0] = rt_heap_str(path)
 	job[5] = rt_heap_str(data)
 	job[6] = flags
@@ -349,39 +349,39 @@ func writeVia(path str, data str, flags i64) ! {
 	_ = try jobResult(job)
 }
 
-func writeJob(job i64) {
-	err := writeAll(cast(str, job[0]), cast(str, job[5]), job[6])
+fn writeJob(job i64) {
+	let err = writeAll(cast(str, job[0]), cast(str, job[5]), job[6])
 	if err != nil {
 		jobFault(job, err)
 	}
 }
 
 // Exists reports whether path names an existing file or directory (symlinks are followed).
-func Exists(path str) bool {
-	tp := rt_tape()
+fn Exists(path str) bool {
+	let tp = rt_tape()
 	if tp != 0 {
 		return rt_effect_word(tp, "quarry.stat@1", "exists " + path, i64(existsLive(path))) != 0 // recorded for replay (#241)
 	}
 	return existsLive(path)
 }
 
-func existsLive(path str) bool {
+fn existsLive(path str) bool {
 	return !badPath(path) && c32(rt_sys_stat(rt_cstr(path), stbuf)) == 0
 }
 
 // IsDir reports whether path names a directory.
-func IsDir(path str) bool {
-	tp := rt_tape()
+fn IsDir(path str) bool {
+	let tp = rt_tape()
 	if tp != 0 {
-		live := existsLive(path) && isDirMode(mode(stbuf))
+		let live = existsLive(path) && isDirMode(mode(stbuf))
 		return rt_effect_word(tp, "quarry.stat@1", "isdir " + path, i64(live)) != 0 // recorded for replay (#241)
 	}
 	return Exists(path) && isDirMode(mode(stbuf))
 }
 
 // Size returns the size in bytes of the file at path.
-func Size(path str) !i64 {
-	tp := rt_tape()
+fn Size(path str) !i64 {
+	let tp = rt_tape()
 	if tp != 0 {
 		return try statTaped(tp, "size ", path, sizeLive) // recorded for replay (#241)
 	}
@@ -395,8 +395,8 @@ func Size(path str) !i64 {
 }
 
 // ModTime returns the modification time of path in seconds since the Unix epoch.
-func ModTime(path str) !i64 {
-	tp := rt_tape()
+fn ModTime(path str) !i64 {
+	let tp = rt_tape()
 	if tp != 0 {
 		return try statTaped(tp, "mtime ", path, mtimeLive) // recorded for replay (#241)
 	}
@@ -410,23 +410,23 @@ func ModTime(path str) !i64 {
 }
 
 // Remove deletes the file or empty directory at path.
-func Remove(path str) ! {
-	tp := rt_tape()
+fn Remove(path str) ! {
+	let tp = rt_tape()
 	if tp != 0 {
 		return try fsTaped(tp, "rm ", path, "", removeLive) // recorded for replay (#241)
 	}
 	if badPath(path) {
 		fail invalidFault("remove", path)
 	}
-	cp := rt_cstr(path)
+	let cp = rt_cstr(path)
 	if c32(rt_sys_unlink(cp)) == 0 {
 		return
 	}
-	e := errno()
+	mut e = errno()
 	if c32(rt_sys_rmdir(cp)) == 0 {
 		return
 	}
-	e1 := errno()
+	let e1 = errno()
 	if e1 != eNOTDIR {
 		e = e1
 	}
@@ -434,8 +434,8 @@ func Remove(path str) ! {
 }
 
 // RemoveAll deletes path and everything below it; a missing path is not a fault.
-func RemoveAll(path str) ! {
-	tp := rt_tape()
+fn RemoveAll(path str) ! {
+	let tp = rt_tape()
 	if tp != 0 {
 		return try fsTaped(tp, "rmall ", path, "", removeAllLive) // recorded for replay (#241)
 	}
@@ -449,11 +449,11 @@ func RemoveAll(path str) ! {
 		fail pathFault("lstat", path)
 	}
 	if isDirMode(mode(stbuf)) {
-		names, err := ReadDir(path)
+		let (names, err) = ReadDir(path)
 		if err != nil {
 			fail err
 		}
-		for _, name := range names {
+		for _, name in names {
 			try RemoveAll(path + "/" + name)
 		}
 	}
@@ -461,13 +461,13 @@ func RemoveAll(path str) ! {
 }
 
 // sameFile reports whether the two stat buffers describe the same inode.
-func sameFile(a i64, b i64) bool {
+fn sameFile(a i64, b i64) bool {
 	return rt_stat_ino(a) == rt_stat_ino(b) && rt_stat_dev(a) == rt_stat_dev(b)
 }
 
 // Rename moves oldpath to newpath, replacing a file there; like Go it never replaces a directory.
-func Rename(oldpath str, newpath str) ! {
-	tp := rt_tape()
+fn Rename(oldpath str, newpath str) ! {
+	let tp = rt_tape()
 	if tp != 0 {
 		return try fsTaped(tp, "mv ", oldpath, newpath, renameLive) // recorded for replay (#241)
 	}
@@ -476,7 +476,7 @@ func Rename(oldpath str, newpath str) ! {
 	}
 	if c32(rt_sys_lstat(rt_cstr(newpath), stbuf)) == 0 && isDirMode(mode(stbuf)) {
 		if c32(rt_sys_lstat(rt_cstr(oldpath), stbuf2)) != 0 {
-			e := errnoText(errno())
+			let e = errnoText(errno())
 			fail say.Fault("rename %s %s: %s", oldpath, newpath, e)
 		}
 		if newpath == oldpath || !sameFile(stbuf, stbuf2) {
@@ -484,14 +484,14 @@ func Rename(oldpath str, newpath str) ! {
 		}
 	}
 	if c32(rt_sys_rename(rt_cstr(oldpath), rt_cstr(newpath))) != 0 {
-		e := errnoText(errno())
+		let e = errnoText(errno())
 		fail say.Fault("rename %s %s: %s", oldpath, newpath, e)
 	}
 }
 
 // Mkdir creates the directory path (mode 0755); its parent must exist.
-func Mkdir(path str) ! {
-	tp := rt_tape()
+fn Mkdir(path str) ! {
+	let tp = rt_tape()
 	if tp != 0 {
 		return try fsTaped(tp, "mkdir ", path, "", mkdirLive) // recorded for replay (#241)
 	}
@@ -504,8 +504,8 @@ func Mkdir(path str) ! {
 }
 
 // MkdirAll creates path and any missing parents (mode 0755); an existing directory is fine.
-func MkdirAll(path str) ! {
-	tp := rt_tape()
+fn MkdirAll(path str) ! {
+	let tp = rt_tape()
 	if tp != 0 {
 		return try fsTaped(tp, "mkdirall ", path, "", mkdirAllLive) // recorded for replay (#241)
 	}
@@ -518,12 +518,12 @@ func MkdirAll(path str) ! {
 		}
 		fail say.Fault("mkdir %s: %s", path, errnoText(eNOTDIR))
 	}
-	i := len(path) - 1
+	mut i = len(path) - 1
 	for i >= 0 && path[i] == '/' {
-		i--
+		i -= 1
 	}
 	for i >= 0 && path[i] != '/' {
-		i--
+		i -= 1
 	}
 	if i < 0 {
 		i = 0
@@ -531,7 +531,7 @@ func MkdirAll(path str) ! {
 	if i > 0 {
 		try MkdirAll(path[0:i])
 	}
-	err := Mkdir(path)
+	let err = Mkdir(path)
 	if err != nil {
 		if c32(rt_sys_lstat(rt_cstr(path), stbuf)) == 0 && isDirMode(mode(stbuf)) {
 			return
@@ -544,40 +544,40 @@ func MkdirAll(path str) ! {
 }
 
 // sortStrs sorts a[lo:hi] bytewise in place (quicksort, insertion sort for short runs).
-func sortStrs(a mut []str, lo i64, hi i64) {
+fn sortStrs(a mut []str, lo i64, hi i64) {
 	for hi-lo > 12 {
-		mid := lo + (hi-lo)/2
+		let mid = lo + (hi-lo)/2
 		if rt_str_cmp(a[mid], a[lo]) < 0 {
-			t := a[mid]
+			let t = a[mid]
 			a[mid] = a[lo]
 			a[lo] = t
 		}
 		if rt_str_cmp(a[hi-1], a[lo]) < 0 {
-			t := a[hi-1]
+			let t = a[hi-1]
 			a[hi-1] = a[lo]
 			a[lo] = t
 		}
 		if rt_str_cmp(a[hi-1], a[mid]) < 0 {
-			t := a[hi-1]
+			let t = a[hi-1]
 			a[hi-1] = a[mid]
 			a[mid] = t
 		}
-		pivot := a[mid]
-		i := lo
-		j := hi - 1
+		let pivot = a[mid]
+		mut i = lo
+		mut j = hi - 1
 		for i <= j {
 			for rt_str_cmp(a[i], pivot) < 0 {
-				i++
+				i += 1
 			}
 			for rt_str_cmp(pivot, a[j]) < 0 {
-				j--
+				j -= 1
 			}
 			if i <= j {
-				t := a[i]
+				let t = a[i]
 				a[i] = a[j]
 				a[j] = t
-				i++
-				j--
+				i += 1
+				j -= 1
 			}
 		}
 		if j-lo < hi-i {
@@ -588,33 +588,33 @@ func sortStrs(a mut []str, lo i64, hi i64) {
 			hi = j + 1
 		}
 	}
-	for i := lo + 1; i < hi; i++ {
-		x := a[i]
-		j := i - 1
+	for i in lo + 1..hi {
+		let x = a[i]
+		mut j = i - 1
 		for j >= lo && rt_str_cmp(a[j], x) > 0 {
 			a[j+1] = a[j]
-			j--
+			j -= 1
 		}
 		a[j+1] = x
 	}
 }
 
 // SortStrs sorts a bytewise in place.
-func SortStrs(a mut []str) {
+fn SortStrs(a mut []str) {
 	sortStrs(mut a, 0, len(a))
 }
 
 // ReadDir returns the names in directory path, sorted bytewise, without "." and "..".
-func ReadDir(path str) ![]str {
-	tp := rt_tape()
+fn ReadDir(path str) ![]str {
+	let tp = rt_tape()
 	if tp != 0 {
 		return try readDirTaped(tp, path) // recorded for replay (#241)
 	}
-	out := make([]str, 0, 16)
+	mut out = make([]str, 0, 16)
 	if badPath(path) {
 		fail invalidFault("open", path)
 	}
-	d := rt_sys_opendir(rt_cstr(path))
+	let d = rt_sys_opendir(rt_cstr(path))
 	if d == 0 {
 		if errno() == eNOTDIR {
 			fail pathFault("fdopendir", path)
@@ -622,17 +622,17 @@ func ReadDir(path str) ![]str {
 		fail pathFault("open", path)
 	}
 	for {
-		ent := rt_sys_readdir(d)
+		let ent = rt_sys_readdir(d)
 		if ent == 0 {
 			break
 		}
-		name := rt_dirent_name(ent)
+		let name = rt_dirent_name(ent)
 		if name == "." || name == ".." {
 			continue
 		}
 		out = append(out, name)
 	}
-	direrr := rt_dir_error(d)
+	let direrr = rt_dir_error(d)
 	rt_sys_closedir(d)
 	if direrr != 0 { fail say.Fault("readdir %s: %s", path, errnoText(direrr)) }
 	sortStrs(mut out, 0, len(out))
@@ -640,20 +640,20 @@ func ReadDir(path str) ![]str {
 }
 
 // Getwd returns the current working directory ($PWD when it still names it, like Go).
-func Getwd() !str {
-	pwd := Getenv("PWD")
+fn Getwd() !str {
+	let pwd = Getenv("PWD")
 	if len(pwd) > 0 && pwd[0] == '/' && c32(rt_sys_stat(rt_cstr(pwd), stbuf)) == 0 && c32(rt_sys_stat(rt_cstr("."), stbuf2)) == 0 && sameFile(stbuf, stbuf2) {
 		return pwd
 	}
 	if rt_sys_getcwd(pathbuf, 4096) == 0 {
-		e := errnoText(errno())
+		let e = errnoText(errno())
 		fail say.Fault("getwd: %s", e)
 	}
 	return rt_str_from_raw(pathbuf, strlen(pathbuf))
 }
 
 // Chdir changes the current working directory to path.
-func Chdir(path str) ! {
+fn Chdir(path str) ! {
 	if badPath(path) {
 		fail invalidFault("chdir", path)
 	}
@@ -663,8 +663,8 @@ func Chdir(path str) ! {
 }
 
 // TempDir returns the directory for temporary files: $TMPDIR, or /tmp.
-func TempDir() str {
-	d := Getenv("TMPDIR")
+fn TempDir() str {
+	let d = Getenv("TMPDIR")
 	if len(d) == 0 {
 		return "/tmp"
 	}
@@ -672,9 +672,9 @@ func TempDir() str {
 }
 
 // Hostname returns the machine's host name.
-func Hostname() !str {
+fn Hostname() !str {
 	if c32(hostName(pathbuf, 1024)) != 0 {
-		e := errnoText(errno())
+		let e = errnoText(errno())
 		fail say.Fault("hostname: %s", e)
 	}
 	store8(pathbuf+1023, 0)
@@ -682,27 +682,27 @@ func Hostname() !str {
 }
 
 // Pid returns the process id.
-func Pid() i64 {
+fn Pid() i64 {
 	return c32(rt_sys_getpid())
 }
 
 // Exit flushes stdout and ends the program with status code.
-func Exit(code i64) {
+fn Exit(code i64) {
 	rt_flush()
 	rt_sys_exit(code)
 }
 
 // Eprint writes s to stderr.
-func Eprint(s str) {
+fn Eprint(s str) {
 	if len(s) > 0 {
 		rt_write_all(2, cast(i64, s)+8, len(s))
 	}
 }
 
 // Eprintln writes s and a newline to stderr in one write.
-func Eprintln(s str) {
-	n := len(s)
-	p := rt_alloc(n + 1)
+fn Eprintln(s str) {
+	let n = len(s)
+	let p = rt_alloc(n + 1)
 	if n > 0 {
 		memcpy(p, cast(i64, s)+8, n)
 	}
@@ -713,95 +713,95 @@ func Eprintln(s str) {
 // ---- recording and replay (notes/interface_replay.md, section 4; #241) ----
 
 // An effect's body runs at once, before it waits: these hand it its arguments.
-var tapedA i64
-var tapedB i64
-var tapedFlags i64
+mut tapedA i64
+mut tapedB i64
+mut tapedFlags i64
 
-func readLive() !str {
+fn readLive() !str {
 	return try ReadFile(cast(str, tapedA))
 }
 
 // writeTaped records or replays WriteFile or AppendFile as quarry.write@1.
-func writeTaped(tp i64, how str, path str, data str, flags i64) ! {
+fn writeTaped(tp i64, how str, path str, data str, flags i64) ! {
 	tapedA = cast(i64, path)
 	tapedB = cast(i64, data)
 	tapedFlags = flags
 	_ = try rt_effect(tp, "quarry.write@1", how + path + "\n" + data, writeLive)
 }
 
-func writeLive() !str {
+fn writeLive() !str {
 	try writeVia(cast(str, tapedA), cast(str, tapedB), tapedFlags)
 	return ""
 }
 
 // statTaped records or replays Size or ModTime as quarry.stat@1 (the result a word).
-func statTaped(tp i64, what str, path str, live func() !str) !i64 {
+fn statTaped(tp i64, what str, path str, live fn() !str) !i64 {
 	tapedA = cast(i64, path)
-	v := try rt_effect(tp, "quarry.stat@1", what + path, live)
+	let v = try rt_effect(tp, "quarry.stat@1", what + path, live)
 	if len(v) != 8 {
 		fail "replay: quarry.stat@1 result is damaged"
 	}
 	return tword(v, 0)
 }
 
-func sizeLive() !str {
-	n := try Size(cast(str, tapedA))
+fn sizeLive() !str {
+	let n = try Size(cast(str, tapedA))
 	return tput(make([]u8, 0, 8), n)
 }
 
-func mtimeLive() !str {
-	t := try ModTime(cast(str, tapedA))
+fn mtimeLive() !str {
+	let t = try ModTime(cast(str, tapedA))
 	return tput(make([]u8, 0, 8), t)
 }
 
 // fsTaped records or replays a change to the file system as quarry.fs@1 (a rename's two paths
 // on two lines).
-func fsTaped(tp i64, what str, path str, other str, live func() !str) ! {
+fn fsTaped(tp i64, what str, path str, other str, live fn() !str) ! {
 	tapedA = cast(i64, path)
 	tapedB = cast(i64, other)
-	key := what + path
+	mut key = what + path
 	if what == "mv " {
 		key = key + "\n" + other
 	}
 	_ = try rt_effect(tp, "quarry.fs@1", key, live)
 }
 
-func removeLive() !str {
+fn removeLive() !str {
 	try Remove(cast(str, tapedA))
 	return ""
 }
 
-func removeAllLive() !str {
+fn removeAllLive() !str {
 	try RemoveAll(cast(str, tapedA))
 	return ""
 }
 
-func renameLive() !str {
+fn renameLive() !str {
 	try Rename(cast(str, tapedA), cast(str, tapedB))
 	return ""
 }
 
-func mkdirLive() !str {
+fn mkdirLive() !str {
 	try Mkdir(cast(str, tapedA))
 	return ""
 }
 
-func mkdirAllLive() !str {
+fn mkdirAllLive() !str {
 	try MkdirAll(cast(str, tapedA))
 	return ""
 }
 
 // readDirTaped records or replays ReadDir as quarry.dir@1 (the names, each a string).
-func readDirTaped(tp i64, path str) ![]str {
+fn readDirTaped(tp i64, path str) ![]str {
 	tapedA = cast(i64, path)
-	v := try rt_effect(tp, "quarry.dir@1", path, readDirLive)
-	out := make([]str, 0, 16)
-	at := 0
+	let v = try rt_effect(tp, "quarry.dir@1", path, readDirLive)
+	mut out = make([]str, 0, 16)
+	mut at = 0
 	for at < len(v) {
 		if at+8 > len(v) {
 			fail "replay: quarry.dir@1 result is damaged"
 		}
-		n := tword(v, at)
+		let n = tword(v, at)
 		if n < 0 || at+8+n > len(v) {
 			fail "replay: quarry.dir@1 result is damaged"
 		}
@@ -811,27 +811,31 @@ func readDirTaped(tp i64, path str) ![]str {
 	return out
 }
 
-func readDirLive() !str {
-	names := try ReadDir(cast(str, tapedA))
-	b := make([]u8, 0, 256)
-	for _, n := range names {
+fn readDirLive() !str {
+	let names = try ReadDir(cast(str, tapedA))
+	mut b = make([]u8, 0, 256)
+	for _, n in names {
 		b = append(b, tput(make([]u8, 0, 8), len(n))...)
 		b = append(b, n...)
 	}
 	return str(b)
 }
 
-func tput(b []u8, v i64) str {
-	for i := 0; i < 8; i++ {
+fn tput(b []u8, v i64) str {
+	for i in 0..8 {
 		b = append(b, u8(v >> (8 * i)))
 	}
 	return str(b)
 }
 
-func tword(s str, at i64) i64 {
-	v := 0
-	for i := 7; i >= 0; i-- {
-		v = v<<8 | i64(s[at+i])
+fn tword(s str, at i64) i64 {
+	mut v = 0
+	{
+		mut i = 7
+		for i >= 0 {
+			v = v<<8 | i64(s[at+i])
+			i -= 1
+		}
 	}
 	return v
 }

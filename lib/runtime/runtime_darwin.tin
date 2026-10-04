@@ -1,16 +1,16 @@
 // macOS part of the runtime: every libSystem call, constant and struct layout that differs
 // from Linux sits here, behind rt_ helpers with the same names as in runtime_linux.tin.
 
-extern func __error() i64
-extern func clock_gettime_nsec_np(clock i64) i64
-extern func arc4random_buf(p i64, n i64)
-extern func sysconf(name i64) i64
-extern func setsockopt(fd i64, level i64, name i64, val i64, n i64) i64
-extern func pthread_set_qos_class_self_np(qos i64, rel i64) i64
-extern func pthread_sigmask(how i64, set i64, old i64) i64
-extern func pthread_create(t i64, attr i64, f i64, arg i64) i64
-extern func pthread_attr_init(attr i64) i64
-extern func pthread_attr_setstacksize(attr i64, n i64) i64
+extern fn __error() i64
+extern fn clock_gettime_nsec_np(clock i64) i64
+extern fn arc4random_buf(p i64, n i64)
+extern fn sysconf(name i64) i64
+extern fn setsockopt(fd i64, level i64, name i64, val i64, n i64) i64
+extern fn pthread_set_qos_class_self_np(qos i64, rel i64) i64
+extern fn pthread_sigmask(how i64, set i64, old i64) i64
+extern fn pthread_create(t i64, attr i64, f i64, arg i64) i64
+extern fn pthread_attr_init(attr i64) i64
+extern fn pthread_attr_setstacksize(attr i64, n i64) i64
 
 const EINTR = 4
 const EAGAIN = 35
@@ -37,32 +37,32 @@ const MAP_STACK = 0x1002 // MAP_PRIVATE | MAP_ANON
 const TARGET_X64 = false
 
 // rt_errno is the error code of the libc call that just failed.
-func rt_errno() i64 {
+fn rt_errno() i64 {
 	return i64(i32(__error()[0]))
 }
 
 // rt_mono_ns is a monotonic clock in nanoseconds (it stops while the machine sleeps).
-func rt_mono_ns() i64 {
+fn rt_mono_ns() i64 {
 	return clock_gettime_nsec_np(8)
 }
 
 // rt_wall_ns is the wall clock in nanoseconds since 1970.
-func rt_wall_ns() i64 {
+fn rt_wall_ns() i64 {
 	return clock_gettime_nsec_np(0)
 }
 
 // rt_random fills n bytes at p with cryptographically secure random bytes.
-func rt_random(p i64, n i64) {
+fn rt_random(p i64, n i64) {
 	arc4random_buf(p, n)
 }
 
 // rt_ncpus is the number of CPUs online.
-func rt_ncpus() i64 {
+fn rt_ncpus() i64 {
 	return sysconf(58) & 0xffffffff
 }
 
 // rt_sockaddr_in fills the 16-byte IPv4 address ip:port at sa (ip in host byte order).
-func rt_sockaddr_in(sa i64, ip i64, port i64) {
+fn rt_sockaddr_in(sa i64, ip i64, port i64) {
 	memset(sa, 0, 16)
 	store8(sa, 16)
 	store8(sa+1, 2)
@@ -75,62 +75,62 @@ func rt_sockaddr_in(sa i64, ip i64, port i64) {
 }
 
 // rt_ai_addr is the sockaddr of an addrinfo record.
-func rt_ai_addr(ai i64) i64 {
+fn rt_ai_addr(ai i64) i64 {
 	return (ai + 32)[0]
 }
 
 // rt_nosigpipe stops writes to a closed socket from raising SIGPIPE.
-func rt_nosigpipe(fd i64) {
-	one := calloc(1, 8)
+fn rt_nosigpipe(fd i64) {
+	let one = calloc(1, 8)
 	one[0] = 1
 	setsockopt(fd, 0xffff, 0x1022, one, 4)
 	free(one)
 }
 
 // struct stat fields (st is a 256-byte buffer filled by stat, lstat or fstat).
-func rt_stat_mode(st i64) i64 {
+fn rt_stat_mode(st i64) i64 {
 	return __ld(st+4, 1) & 0xffff
 }
 
-func rt_stat_size(st i64) i64 {
+fn rt_stat_size(st i64) i64 {
 	return (st + 96)[0]
 }
 
-func rt_stat_mtime(st i64) i64 {
+fn rt_stat_mtime(st i64) i64 {
 	return (st + 48)[0]
 }
 
-func rt_stat_dev(st i64) i64 {
+fn rt_stat_dev(st i64) i64 {
 	return __ld(st, 2) & 0xffffffff
 }
 
-func rt_stat_ino(st i64) i64 {
+fn rt_stat_ino(st i64) i64 {
 	return (st + 8)[0]
 }
 
 // rt_dirent_name is the name in a directory entry returned by readdir.
-func rt_dirent_name(ent i64) str {
+fn rt_dirent_name(ent i64) str {
 	return rt_str_from_raw(ent+21, __ld(ent+18, 1)&0xffff)
 }
 
-shared var rtPoolChunk i64   // request pool chunk size once a memory limit lowered it (0: the default)
+shared mut rtPoolChunk i64   // request pool chunk size once a memory limit lowered it (0: the default)
 
 // rt_mem_limit is the container memory limit in bytes: macOS has none, so 0.
-func rt_mem_limit() i64 {
+fn rt_mem_limit() i64 {
 	return 0
 }
 
 // rt_pin_setup is a no-op: macOS places threads itself (rt_core_qos asks for performance cores).
-func rt_pin_setup(n i64) {
+fn rt_pin_setup(n i64) {
 }
 
 // rt_core_qos asks macOS to keep this core's thread on a performance core.
-func rt_core_qos(id i64) {
+fn rt_core_qos(id i64) {
 	pthread_set_qos_class_self_np(0x21, 0)
 }
 
 // rt_stack_t fills a stack_t for sigaltstack: ss_sp, ss_size, ss_flags.
-func rt_stack_t(st i64, sp i64, n i64) {
+fn rt_stack_t(st i64, sp i64, n i64) {
 	st[0] = sp
 	st[1] = n
 	__st(st+16, 0, 2)
@@ -139,8 +139,8 @@ func rt_stack_t(st i64, sp i64, n i64) {
 // rt_fault_handlers installs h (sig, siginfo, ucontext) for SIGSEGV and SIGBUS on the signal
 // stack: struct sigaction is the handler, a 4-byte mask and 4-byte flags (SA_ONSTACK 0x1 |
 // SA_SIGINFO 0x40).
-func rt_fault_handlers(h i64) {
-	act := calloc(1, 16)
+fn rt_fault_handlers(h i64) {
+	let act = calloc(1, 16)
 	act[0] = h
 	__st(act+12, 0x41, 2)
 	sigaction(11, act, 0)
@@ -149,85 +149,85 @@ func rt_fault_handlers(h i64) {
 }
 
 // rt_fault_addr is siginfo_t's si_addr.
-func rt_fault_addr(info i64) i64 {
+fn rt_fault_addr(info i64) i64 {
 	return (info + 24)[0]
 }
 
-func rt_sigbus() i64 {
+fn rt_sigbus() i64 {
 	return 10
 }
 
 // rt_sig_block_term blocks SIGTERM and SIGINT in the calling thread; threads it creates inherit
 // the mask, so a server can take the signals from kqueue (EVFILT_SIGNAL) instead of a handler.
-func rt_sig_block_term() {
-	set := calloc(1, 128)
+fn rt_sig_block_term() {
+	let set = calloc(1, 128)
 	set[0] = 1<<14 | 1<<1
 	pthread_sigmask(1, set, 0)
 	free(set)
 }
 
 // rt_thread_start runs the function at code with arg on a new pthread with an 8 MiB stack.
-func rt_thread_start(code i64, arg i64) bool {
-	attr := calloc(16, 8)
+fn rt_thread_start(code i64, arg i64) bool {
+	let attr = calloc(16, 8)
 	pthread_attr_init(attr)
 	pthread_attr_setstacksize(attr, 8388608)
-	t := calloc(1, 8)
-	ok := pthread_create(t, attr, code, arg)&0xffffffff == 0
+	let t = calloc(1, 8)
+	let ok = pthread_create(t, attr, code, arg)&0xffffffff == 0
 	free(t)
 	free(attr)
 	return ok
 }
 
 // rt_threads_reap is a no-op: pthreads own their stacks on macOS.
-func rt_threads_reap() {}
+fn rt_threads_reap() {}
 
 // rt_altstack_ready is false: every macOS thread installs its own signal stack.
-func rt_altstack_ready() bool { return false }
+fn rt_altstack_ready() bool { return false }
 
 // rt_task_init sets a new task's saved registers (arm64: x19-x27, x29, x30, sp, d8-d15) so
 // the first switch into it enters rt_task_entry with sp at top.
-func rt_task_init(t i64, top i64) {
+fn rt_task_init(t i64, top i64) {
 	t[9] = 0
 	t[10] = cast(i64, rt_task_entry)
 	t[11] = top
 }
 
 // rt_page_size is the OS mapping page size.
-func rt_page_size() i64 { return sysconf(29) }
+fn rt_page_size() i64 { return sysconf(29) }
 
 const MEM_DONTNEED = 4
 
 // rt_task_sp reads the saved stack pointer without changing the swap layout.
-func rt_task_sp(t i64) i64 { return t[11] }
+fn rt_task_sp(t i64) i64 { return t[11] }
 
 // rt_ctx_init sets saved registers (arm64) so the first switch into t calls entry with sp at top.
-func rt_ctx_init(t i64, top i64, entry i64) {
+fn rt_ctx_init(t i64, top i64, entry i64) {
 	t[9] = 0
 	t[10] = entry
 	t[11] = top
 }
 
-func rt_env_errno() i64 { return rt_errno() }
+fn rt_env_errno() i64 { return rt_errno() }
 
-extern func getenv(name i64) i64
-extern func setenv(name i64, val i64, overwrite i64) i64
-extern func unsetenv(name i64) i64
+extern fn getenv(name i64) i64
+extern fn setenv(name i64, val i64, overwrite i64) i64
+extern fn unsetenv(name i64) i64
 
 // The environment stays in libSystem on macOS.
-func rt_os_start(argc i64, argv i64) {}
-func rt_getenv(name i64) i64 { return getenv(name) }
-func rt_setenv(name i64, value i64) i64 { return i64(i32(setenv(name, value, 1))) }
-func rt_unsetenv(name i64) i64 { return i64(i32(unsetenv(name))) }
-func rt_clock_setup() {}
+fn rt_os_start(argc i64, argv i64) {}
+fn rt_getenv(name i64) i64 { return getenv(name) }
+fn rt_setenv(name i64, value i64) i64 { return i64(i32(setenv(name, value, 1))) }
+fn rt_unsetenv(name i64) i64 { return i64(i32(unsetenv(name))) }
+fn rt_clock_setup() {}
 
-func rt_dir_error(d i64) i64 { return 0 }
-func rt_date_year_width() i64 { return 4 }
-extern func isatty(fd i64) i64
-func rt_isatty(fd i64) bool { return isatty(fd)&0xffffffff != 0 }
+fn rt_dir_error(d i64) i64 { return 0 }
+fn rt_date_year_width() i64 { return 4 }
+extern fn isatty(fd i64) i64
+fn rt_isatty(fd i64) bool { return isatty(fd)&0xffffffff != 0 }
 
-extern func dladdr(addr i64, info i64) i64
-func rt_symbol_lookup(addr i64, info i64) i64 { return dladdr(addr,info) }
+extern fn dladdr(addr i64, info i64) i64
+fn rt_symbol_lookup(addr i64, info i64) i64 { return dladdr(addr,info) }
 
 // Socket address family and length follow the native OS layout.
-func rt_sockaddr_family(sa i64) i64 { return i64(load8(sa+1)) }
-func rt_sockaddr_len(sa i64) i64 { return i64(load8(sa)) }
+fn rt_sockaddr_family(sa i64) i64 { return i64(load8(sa+1)) }
+fn rt_sockaddr_len(sa i64) i64 { return i64(load8(sa)) }

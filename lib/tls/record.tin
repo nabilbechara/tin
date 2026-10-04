@@ -34,66 +34,91 @@ const alertMissingExtension = 109
 const alertUnsupportedExtension = 110
 
 // pendingAlert is the alert the last alert_fault asked for (read at once by the caller).
-var pendingAlert = 0
+mut pendingAlert = 0
 
 // alert_fault returns "tls: msg" (for fail) and remembers the alert to send for it.
-func alert_fault(desc i64, msg str) str {
+fn alert_fault(desc i64, msg str) str {
 	pendingAlert = desc
 	return "tls: " + msg
 }
 
-func alert_name(d i64) str {
-	switch d {
-	case 0:
-		return "close notify"
-	case 10:
-		return "unexpected message"
-	case 20:
-		return "bad record MAC"
-	case 22:
-		return "record overflow"
-	case 40:
-		return "handshake failure"
-	case 42:
-		return "bad certificate"
-	case 43:
-		return "unsupported certificate"
-	case 44:
-		return "certificate revoked"
-	case 45:
-		return "certificate expired"
-	case 46:
-		return "certificate unknown"
-	case 47:
-		return "illegal parameter"
-	case 48:
-		return "unknown certificate authority"
-	case 49:
-		return "access denied"
-	case 50:
-		return "error decoding message"
-	case 51:
-		return "error decrypting message"
-	case 70:
-		return "protocol version not supported"
-	case 71:
-		return "insufficient security level"
-	case 80:
-		return "internal error"
-	case 86:
-		return "inappropriate fallback"
-	case 90:
-		return "user canceled"
-	case 109:
-		return "missing extension"
-	case 110:
-		return "unsupported extension"
-	case 112:
-		return "unrecognized name"
-	case 116:
-		return "certificate required"
-	case 120:
-		return "no application protocol"
+fn alert_name(d i64) str {
+	match d {
+		0 => {
+			return "close notify"
+		}
+		10 => {
+			return "unexpected message"
+		}
+		20 => {
+			return "bad record MAC"
+		}
+		22 => {
+			return "record overflow"
+		}
+		40 => {
+			return "handshake failure"
+		}
+		42 => {
+			return "bad certificate"
+		}
+		43 => {
+			return "unsupported certificate"
+		}
+		44 => {
+			return "certificate revoked"
+		}
+		45 => {
+			return "certificate expired"
+		}
+		46 => {
+			return "certificate unknown"
+		}
+		47 => {
+			return "illegal parameter"
+		}
+		48 => {
+			return "unknown certificate authority"
+		}
+		49 => {
+			return "access denied"
+		}
+		50 => {
+			return "error decoding message"
+		}
+		51 => {
+			return "error decrypting message"
+		}
+		70 => {
+			return "protocol version not supported"
+		}
+		71 => {
+			return "insufficient security level"
+		}
+		80 => {
+			return "internal error"
+		}
+		86 => {
+			return "inappropriate fallback"
+		}
+		90 => {
+			return "user canceled"
+		}
+		109 => {
+			return "missing extension"
+		}
+		110 => {
+			return "unsupported extension"
+		}
+		112 => {
+			return "unrecognized name"
+		}
+		116 => {
+			return "certificate required"
+		}
+		120 => {
+			return "no application protocol"
+		}
 	}
 	return say.Fmt("alert %d", d)
 }
@@ -137,7 +162,7 @@ type Conn struct {
 	alertCt i64 // records of alerts or empty data in a row (a peer cannot loop us forever)
 }
 
-func new_conn(tcp wire.Conn) Conn {
+fn new_conn(tcp wire.Conn) Conn {
 	return Conn{tcp: tcp, fd: tcp.Fd(), failure: "", riv: make([]u8, 12), rsecret: make([]u8, 0, 48),
 		wiv: make([]u8, 12), wsecret: make([]u8, 0, 48), in: make([]u8, 5+maxCiphertext+64),
 		plain: make([]u8, maxPlaintext), ph: make([]u8, 5), alpn: "", certs: make([][]u8, 0, 1), hash: seal.Hash.SHA256}
@@ -145,10 +170,10 @@ func new_conn(tcp wire.Conn) Conn {
 
 // wait blocks the task until the socket is readable (want 1) or writable (2), within the
 // per-call timeout and the handshake's deadline.
-func (c Conn) wait(want i64, what str) ! {
-	t := c.timeout
+fn (c Conn) wait(want i64, what str) ! {
+	mut t = c.timeout
 	if c.until > 0 {
-		left := c.until - rt_mono_ns()
+		let left = c.until - rt_mono_ns()
 		if left <= 0 {
 			fail "tls: {what} timed out"
 		}
@@ -156,7 +181,7 @@ func (c Conn) wait(want i64, what str) ! {
 			t = left
 		}
 	}
-	r := rt_task_wait(c.fd, want, t)
+	let r = rt_task_wait(c.fd, want, t)
 	if r == waitDeadline {
 		fail cast(fault, rt_wait_fault())
 	}
@@ -166,13 +191,13 @@ func (c Conn) wait(want i64, what str) ! {
 }
 
 // send writes all of b to the socket.
-func (c Conn) send(b []u8) ! {
-	p := cast(i64, b)[2]
-	n := len(b)
+fn (c Conn) send(b []u8) ! {
+	mut p = cast(i64, b)[2]
+	mut n = len(b)
 	for n > 0 {
-		k := rt_sys_write(c.fd, p, n)
+		let k = rt_sys_write(c.fd, p, n)
 		if k < 0 {
-			e := rt_errno()
+			let e = rt_errno()
 			if e == EINTR {
 				continue
 			}
@@ -180,7 +205,7 @@ func (c Conn) send(b []u8) ! {
 				try c.wait(2, "write")
 				continue
 			}
-			m := rt_sys_strerror(e)
+			let m = rt_sys_strerror(e)
 			fail say.Fault("tls: write: %s", rt_str_from_raw(m, strlen(m)))
 		}
 		p += k
@@ -189,12 +214,12 @@ func (c Conn) send(b []u8) ! {
 }
 
 // fill reads from the socket until n unconsumed bytes are buffered.
-func (c mut Conn) fill(n i64) ! {
+fn (c mut Conn) fill(n i64) ! {
 	try c.fill_some(n, true)
 }
 
 // fill_some is fill; without wait it returns false instead of waiting for the socket.
-func (c mut Conn) fill_some(n i64, wait bool) !bool {
+fn (c mut Conn) fill_some(n i64, wait bool) !bool {
 	if c.ine-c.ins >= n {
 		return true
 	}
@@ -203,9 +228,9 @@ func (c mut Conn) fill_some(n i64, wait bool) !bool {
 		c.ine -= c.ins
 		c.ins = 0
 	}
-	base := cast(i64, c.in)[2]
+	let base = cast(i64, c.in)[2]
 	for c.ine < n {
-		k := rt_sys_read(c.fd, base+c.ine, len(c.in)-c.ine)
+		let k = rt_sys_read(c.fd, base+c.ine, len(c.in)-c.ine)
 		if k > 0 {
 			c.ine += k
 			continue
@@ -213,7 +238,7 @@ func (c mut Conn) fill_some(n i64, wait bool) !bool {
 		if k == 0 {
 			fail "tls: connection closed by the peer without close_notify"
 		}
-		e := rt_errno()
+		let e = rt_errno()
 		if e == EINTR {
 			continue
 		}
@@ -224,16 +249,16 @@ func (c mut Conn) fill_some(n i64, wait bool) !bool {
 			try c.wait(1, "read")
 			continue
 		}
-		m := rt_sys_strerror(e)
+		let m = rt_sys_strerror(e)
 		fail say.Fault("tls: read: %s", rt_str_from_raw(m, strlen(m)))
 	}
 	return true
 }
 
 // nonce is the per-record nonce: the IV xor the sequence number (RFC 8446 5.3).
-func nonce(iv []u8, seq u64) []u8 {
-	n := clone(iv)
-	for i := 0; i < 8; i++ {
+fn nonce(iv []u8, seq u64) []u8 {
+	let n = clone(iv)
+	for i in 0..8 {
 		n[11-i] ^= u8(seq >> u64(8*i))
 	}
 	return n
@@ -241,47 +266,51 @@ func nonce(iv []u8, seq u64) []u8 {
 
 // seal_record encrypts one record of content type typ (or writes it in the clear before
 // keys exist) and appends it to out.
-func (c mut Conn) seal_record(out mut []u8, typ i64, data []u8) ! {
-	a := c.wr
+fn (c mut Conn) seal_record(out mut []u8, typ i64, data []u8) ! {
+	let a = c.wr
 	if a == nil {
 		out = append(out, u8(typ), 3, 3, u8(len(data)>>8), u8(len(data)))
 		out = append(out, data...)
 		return
 	}
-	inner := make([]u8, 0, len(data)+1)
+	mut inner = make([]u8, 0, len(data)+1)
 	inner = append(inner, data...)
 	inner = append(inner, u8(typ))
-	n := len(inner) + 16
-	hdr := []u8{ctApplicationData, 3, 3, u8(n >> 8), u8(n)}
-	sealed := try a.Seal(nonce(c.wiv, c.wseq), inner, hdr)
-	c.wseq++
+	let n = len(inner) + 16
+	let hdr = []u8{ctApplicationData, 3, 3, u8(n >> 8), u8(n)}
+	let sealed = try a.Seal(nonce(c.wiv, c.wseq), inner, hdr)
+	c.wseq += 1
 	out = append(out, hdr...)
 	out = append(out, sealed...)
 }
 
 // write_records sends data as records of type typ, at most 16 KiB each, in one write.
-func (c mut Conn) write_records(typ i64, data []u8) ! {
-	out := make([]u8, 0, len(data)+(len(data)/maxPlaintext+1)*22)
-	for off := 0; off == 0 || off < len(data); off += maxPlaintext {
-		end := off + maxPlaintext
-		if end > len(data) {
-			end = len(data)
+fn (c mut Conn) write_records(typ i64, data []u8) ! {
+	let out = make([]u8, 0, len(data)+(len(data)/maxPlaintext+1)*22)
+	{
+		mut off = 0
+		for off == 0 || off < len(data) {
+			mut end = off + maxPlaintext
+			if end > len(data) {
+				end = len(data)
+			}
+			try c.seal_record(mut out, typ, data[off:end])
+			off += maxPlaintext
 		}
-		try c.seal_record(mut out, typ, data[off:end])
 	}
 	try c.send(out)
 }
 
 // send_alert sends a fatal alert (or close_notify), ignoring write errors.
-func (c mut Conn) send_alert(desc i64) {
-	level := 2
+fn (c mut Conn) send_alert(desc i64) {
+	mut level = 2
 	if desc == alertCloseNotify || desc == alertUserCanceled {
 		level = 1
 	}
-	out := make([]u8, 0, 32)
-	err := c.seal_record(mut out, ctAlert, []u8{u8(level), u8(desc)})
+	let out = make([]u8, 0, 32)
+	let err = c.seal_record(mut out, ctAlert, []u8{u8(level), u8(desc)})
 	if err == nil {
-		saved := c.timeout
+		let saved = c.timeout
 		if c.timeout == 0 || c.timeout > 1000000000 {
 			c.timeout = 1000000000
 		}
@@ -292,22 +321,22 @@ func (c mut Conn) send_alert(desc i64) {
 
 // read_record returns the next record's content type and plaintext, decrypting it once read
 // keys exist. Change-cipher-spec records are skipped during the handshake.
-func (c mut Conn) read_record() !(i64, []u8) {
-	typ, data, _ := try c.next_record(true)
+fn (c mut Conn) read_record() !(i64, []u8) {
+	let (typ, data, _) = try c.next_record(true)
 	return typ, data
 }
 
 // next_record is read_record; without wait it gives false (and no record) when a whole record
 // is not buffered and the socket has nothing more yet.
-func (c mut Conn) next_record(wait bool) !(i64, []u8, bool) {
+fn (c mut Conn) next_record(wait bool) !(i64, []u8, bool) {
 	for {
-		more := try c.fill_some(5, wait)
+		mut more = try c.fill_some(5, wait)
 		if !more {
 			return 0, []u8{}, false
 		}
-		h := c.in[c.ins : c.ins+5]
-		typ := i64(h[0])
-		n := i64(h[3])<<8 | i64(h[4])
+		let h = c.in[c.ins : c.ins+5]
+		let typ = i64(h[0])
+		let n = i64(h[3])<<8 | i64(h[4])
 		if typ < ctChangeCipherSpec || typ > ctApplicationData {
 			fail alert_fault(alertUnexpectedMessage, say.Fmt("unexpected record type %d", typ))
 		}
@@ -318,8 +347,8 @@ func (c mut Conn) next_record(wait bool) !(i64, []u8, bool) {
 		if !more {
 			return 0, []u8{}, false
 		}
-		hdr := clone(c.in[c.ins : c.ins+5])
-		body := c.in[c.ins+5 : c.ins+5+n]
+		let hdr = clone(c.in[c.ins : c.ins+5])
+		let body = c.in[c.ins+5 : c.ins+5+n]
 		c.ins += 5 + n
 		if typ == ctChangeCipherSpec {
 			if c.ready || n != 1 || body[0] != 1 {
@@ -327,7 +356,7 @@ func (c mut Conn) next_record(wait bool) !(i64, []u8, bool) {
 			}
 			continue
 		}
-		a := c.rd
+		let a = c.rd
 		if a == nil {
 			if typ != ctHandshake && typ != ctAlert {
 				fail alert_fault(alertUnexpectedMessage, say.Fmt("unexpected record type %d", typ))
@@ -340,14 +369,14 @@ func (c mut Conn) next_record(wait bool) !(i64, []u8, bool) {
 		if typ != ctApplicationData {
 			fail alert_fault(alertUnexpectedMessage, say.Fmt("unexpected record type %d", typ))
 		}
-		pt := a.Open(nonce(c.riv, c.rseq), body, hdr) catch _ {
+		let pt = a.Open(nonce(c.riv, c.rseq), body, hdr) catch _ {
 			fail alert_fault(alertBadRecordMAC, "record authentication failed")
 		}
-		c.rseq++
+		c.rseq += 1
 		// The content type is the last non-zero byte; zeros after it are padding.
-		end := len(pt) - 1
+		mut end = len(pt) - 1
 		for end >= 0 && pt[end] == 0 {
-			end--
+			end -= 1
 		}
 		if end < 0 {
 			fail alert_fault(alertUnexpectedMessage, "record with no content type")
@@ -362,9 +391,9 @@ func (c mut Conn) next_record(wait bool) !(i64, []u8, bool) {
 
 // set_read_key and set_write_key install the keys of a traffic secret (in place once they
 // exist, so an established Conn allocates nothing new).
-func (c mut Conn) set_read_key(secret []u8) ! {
-	key, iv := try traffic_keys(c.suite, c.hash, secret)
-	a := c.rd
+fn (c mut Conn) set_read_key(secret_ []u8) ! {
+	let (key, iv) = try traffic_keys(c.suite, c.hash, secret_)
+	let a = c.rd
 	if a == nil {
 		c.rd = try suite_aead(c.suite, key)
 	} else {
@@ -373,12 +402,12 @@ func (c mut Conn) set_read_key(secret []u8) ! {
 	copy(c.riv, iv)
 	c.rseq = 0
 	c.rsecret = c.rsecret[:0]
-	c.rsecret = append(c.rsecret, secret...)
+	c.rsecret = append(c.rsecret, secret_...)
 }
 
-func (c mut Conn) set_write_key(secret []u8) ! {
-	key, iv := try traffic_keys(c.suite, c.hash, secret)
-	a := c.wr
+fn (c mut Conn) set_write_key(secret_ []u8) ! {
+	let (key, iv) = try traffic_keys(c.suite, c.hash, secret_)
+	let a = c.wr
 	if a == nil {
 		c.wr = try suite_aead(c.suite, key)
 	} else {
@@ -387,27 +416,27 @@ func (c mut Conn) set_write_key(secret []u8) ! {
 	copy(c.wiv, iv)
 	c.wseq = 0
 	c.wsecret = c.wsecret[:0]
-	c.wsecret = append(c.wsecret, secret...)
+	c.wsecret = append(c.wsecret, secret_...)
 }
 
 // send_key_update sends KeyUpdate and moves to the next write secret (RFC 8446 4.6.3).
-func (c mut Conn) send_key_update(request bool) ! {
-	r := 0
+fn (c mut Conn) send_key_update(request bool) ! {
+	mut r = 0
 	if request {
 		r = 1
 	}
 	try c.write_records(ctHandshake, handshake_msg(hsKeyUpdate, []u8{u8(r)}))
-	next := try seal.HkdfExpandLabel(c.hash, str(c.wsecret), "traffic upd", "", seal.Size(c.hash))
+	let next = try seal.HkdfExpandLabel(c.hash, str(c.wsecret), "traffic upd", "", seal.Size(c.hash))
 	try c.set_write_key(next)
 }
 
 // post_handshake handles handshake messages after the handshake: NewSessionTicket is
 // skipped (no resumption), KeyUpdate moves to the next read secret; anything else is fatal.
-func (c mut Conn) post_handshake(data []u8) ! {
-	i := 0
+fn (c mut Conn) post_handshake(data []u8) ! {
+	mut i = 0
 	for i < len(data) {
 		if c.phskip > 0 {
-			k := len(data) - i
+			mut k = len(data) - i
 			if k > c.phskip {
 				k = c.phskip
 			}
@@ -419,13 +448,13 @@ func (c mut Conn) post_handshake(data []u8) ! {
 			continue
 		}
 		c.ph[c.phn] = data[i]
-		c.phn++
-		i++
+		c.phn += 1
+		i += 1
 		if c.phn < 4 {
 			continue
 		}
-		typ := i64(c.ph[0])
-		n := i64(c.ph[1])<<16 | i64(c.ph[2])<<8 | i64(c.ph[3])
+		let typ = i64(c.ph[0])
+		let n = i64(c.ph[1])<<16 | i64(c.ph[2])<<8 | i64(c.ph[3])
 		if typ == hsNewSessionTicket {
 			if n == 0 {
 				fail alert_fault(alertDecodeError, "empty NewSessionTicket")
@@ -440,14 +469,14 @@ func (c mut Conn) post_handshake(data []u8) ! {
 			continue
 		}
 		c.phn = 0
-		req := c.ph[4]
+		let req = c.ph[4]
 		if req > 1 {
 			fail alert_fault(alertIllegalParameter, "bad KeyUpdate")
 		}
 		if i != len(data) {
 			fail alert_fault(alertUnexpectedMessage, "KeyUpdate not at the end of a record")
 		}
-		next := try seal.HkdfExpandLabel(c.hash, str(c.rsecret), "traffic upd", "", seal.Size(c.hash))
+		let next = try seal.HkdfExpandLabel(c.hash, str(c.rsecret), "traffic upd", "", seal.Size(c.hash))
 		try c.set_read_key(next)
 		if req == 1 {
 			try c.send_key_update(false)
@@ -457,7 +486,7 @@ func (c mut Conn) post_handshake(data []u8) ! {
 
 // fault_close records err as the connection's failure, sends the alert it asked for and
 // closes the socket; later calls fail with the same fault.
-func (c mut Conn) fault_close(err fault, desc i64) {
+fn (c mut Conn) fault_close(err fault, desc i64) {
 	if !c.closed {
 		c.send_alert(desc)
 		c.failure = say.Str(err)
@@ -467,8 +496,8 @@ func (c mut Conn) fault_close(err fault, desc i64) {
 }
 
 // abort ends the connection with alert desc and returns "tls: msg" to fail with.
-func (c mut Conn) abort(desc i64, msg str) str {
-	m := "tls: " + msg
+fn (c mut Conn) abort(desc i64, msg str) str {
+	let m = "tls: " + msg
 	if !c.closed {
 		c.send_alert(desc)
 		c.failure = m

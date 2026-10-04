@@ -9,31 +9,31 @@ import "say"
 
 // ec_mul_ct sets r = k*p for a big-endian scalar k of c.size bytes, in time that does not depend
 // on k or p (as p256_mul does for P-256).
-func ec_mul_ct(c mut ecCurve, p ecpt, k secret []u8) ecpt {
-	table := make([]ecpt, 0, 16)
+fn ec_mul_ct(c mut ecCurve, p ecpt, k secret []u8) ecpt {
+	mut table = make([]ecpt, 0, 16)
 	table = append(table, ec_identity(c))
-	for i := 1; i < 16; i++ {
-		e := ec_identity(c)
+	for i in 1..16 {
+		let e = ec_identity(c)
 		ec_add(mut c, mut e, table[i-1], p)
 		table = append(table, e)
 	}
-	acc := ec_identity(c)
-	sel := ec_identity(c)
-	for i := 0; i < 2*len(k); i++ {
+	let acc = ec_identity(c)
+	let sel = ec_identity(c)
+	for i in 0..2*len(k) {
 		if i > 0 {
-			for s := 0; s < 4; s++ {
+			for s in 0..4 {
 				ec_double(mut c, mut acc, acc)
 			}
 		}
-		w := u64(k[i/2])
+		mut w = u64(k[i/2])
 		if i%2 == 0 {
 			w = w >> 4
 		}
 		w = w & 15
-		for j := 0; j < 16; j++ {
-			d := u64(j) ^ w
-			bit := 1 ^ ((d | (u64(0) - d)) >> 63)
-			e := table[j]
+		for j in 0..16 {
+			let d = u64(j) ^ w
+			let bit = 1 ^ ((d | (u64(0) - d)) >> 63)
+			let e = table[j]
 			c.f.sel(mut sel.x, e.x, sel.x, bit)
 			c.f.sel(mut sel.y, e.y, sel.y, bit)
 			c.f.sel(mut sel.z, e.z, sel.z, bit)
@@ -44,19 +44,19 @@ func ec_mul_ct(c mut ecCurve, p ecpt, k secret []u8) ecpt {
 }
 
 // ec_encode is p's uncompressed encoding (0x04 x y), or fails for the identity.
-func ec_encode(c mut ecCurve, p ecpt) ![]u8 {
-	zi := c.f.elem()
+fn ec_encode(c mut ecCurve, p ecpt) ![]u8 {
+	let zi = c.f.elem()
 	c.f.inv(mut zi, p.z)
-	x := c.f.elem()
-	y := c.f.elem()
+	let x = c.f.elem()
+	let y = c.f.elem()
 	c.f.mul(mut x, p.x, zi)
 	c.f.mul(mut y, p.y, zi)
 	if c.f.is_zero(p.z) == 1 {
 		fail "seal: " + c.name + " point at infinity"
 	}
-	xb := c.f.to_bytes(x)
-	yb := c.f.to_bytes(y)
-	out := make([]u8, 0, 1+2*c.size)
+	let xb = c.f.to_bytes(x)
+	let yb = c.f.to_bytes(y)
+	mut out = make([]u8, 0, 1+2*c.size)
 	out = append(out, 4)
 	out = append(out, xb[len(xb)-c.size:]...)
 	out = append(out, yb[len(yb)-c.size:]...)
@@ -64,11 +64,11 @@ func ec_encode(c mut ecCurve, p ecpt) ![]u8 {
 }
 
 // ec_scalar_ok is 1 when d is size bytes in [1, n-1].
-func ec_scalar_ok(n mut monty, size i64, d secret []u8) u64 {
+fn ec_scalar_ok(n mut monty, size i64, d secret []u8) u64 {
 	if len(d) != size {
 		return 0
 	}
-	s := n.elem()
+	let s = n.elem()
 	if n.from_bytes(mut s, monty_bytes(n, d)) == 0 {
 		return 0
 	}
@@ -76,35 +76,35 @@ func ec_scalar_ok(n mut monty, size i64, d secret []u8) u64 {
 }
 
 // ec_public is the uncompressed public point d*G of a private scalar on curve.
-func ec_public(curve str, d secret []u8) ![]u8 {
+fn ec_public(curve str, d secret []u8) ![]u8 {
 	if curve == "P-256" {
 		return try P256PublicKey(d)
 	}
-	c := try p384_curve()
+	let c = try p384_curve()
 	if ec_scalar_ok(mut c.n, c.size, d) == 0 {
 		fail "seal: invalid P-384 private key"
 	}
-	r := ec_mul_ct(mut c, ec_generator(c), d)
+	let r = ec_mul_ct(mut c, ec_generator(c), d)
 	return try ec_encode(mut c, r)
 }
 
 // rfc6979_nonce is RFC 6979's deterministic k for private scalar x and digest over the order n
 // (size bytes; the order's bit length is 8*size for P-256 and P-384), with HMAC over h.
-func rfc6979_nonce(n mut monty, size i64, h Hash, x secret []u8, digest []u8) []u8 {
-	e := digest
+fn rfc6979_nonce(n mut monty, size i64, h Hash, x secret []u8, digest []u8) []u8 {
+	mut e = digest
 	if len(e) > size {
 		e = e[:size]
 	}
-	h1 := nat_to_be(ecdsa_reduce(n, monty_bytes(n, e)))
+	mut h1 = nat_to_be(ecdsa_reduce(n, monty_bytes(n, e)))
 	h1 = h1[len(h1)-size:]
-	hlen := Size(h)
-	v := make([]u8, hlen)
-	kk := make([]u8, hlen)
-	for i := 0; i < hlen; i++ {
+	let hlen = Size(h)
+	mut v = make([]u8, hlen)
+	mut kk = make([]u8, hlen)
+	for i in 0..hlen {
 		v[i] = 1
 	}
-	for round := 0; round < 2; round++ {
-		m := make([]u8, 0, hlen+1+2*size)
+	for round in 0..2 {
+		mut m = make([]u8, 0, hlen+1+2*size)
 		m = append(m, v...)
 		m = append(m, u8(round))
 		m = append(m, x...)
@@ -113,16 +113,16 @@ func rfc6979_nonce(n mut monty, size i64, h Hash, x secret []u8, digest []u8) []
 		v = Hmac(h, str(kk), str(v))
 	}
 	for {
-		t := make([]u8, 0, size+hlen)
+		mut t = make([]u8, 0, size+hlen)
 		for len(t) < size {
 			v = Hmac(h, str(kk), str(v))
 			t = append(t, v...)
 		}
-		cand := t[:size]
+		let cand = t[:size]
 		if ec_scalar_ok(mut n, size, cand) == 1 {
 			return cand
 		}
-		m := make([]u8, 0, hlen+1)
+		mut m = make([]u8, 0, hlen+1)
 		m = append(m, v...)
 		m = append(m, 0)
 		kk = Hmac(h, str(kk), str(m))
@@ -132,13 +132,13 @@ func rfc6979_nonce(n mut monty, size i64, h Hash, x secret []u8, digest []u8) []
 }
 
 // der_int appends a DER INTEGER holding the non-negative big-endian value b.
-func der_int(out []u8, b []u8) []u8 {
-	at := 0
+fn der_int(out []u8, b []u8) []u8 {
+	mut at = 0
 	for at < len(b)-1 && b[at] == 0 {
-		at++
+		at += 1
 	}
-	v := b[at:]
-	pad := 0
+	let v = b[at:]
+	mut pad = 0
 	if v[0]&0x80 != 0 {
 		pad = 1
 	}
@@ -152,52 +152,52 @@ func der_int(out []u8, b []u8) []u8 {
 // SignECDSA signs digest (a hash of the message, made with h) with k and returns a DER
 // ECDSA-Sig-Value. The nonce is RFC 6979's, derived with HMAC over h, so equal inputs give equal
 // signatures.
-func SignECDSA(k ECPrivateKey, h Hash, digest []u8) ![]u8 {
-	size := 32
-	n := p256n
+fn SignECDSA(k ECPrivateKey, h Hash, digest []u8) ![]u8 {
+	mut size = 32
+	mut n = p256n
 	if k.Curve == "P-384" {
-		c := try p384_curve()
+		let c = try p384_curve()
 		n = c.n
 		size = 48
 	} else if k.Curve != "P-256" {
 		fail "seal: ECDSA signing on " + k.Curve + " is not supported"
 	}
-	nonce := rfc6979_nonce(mut n, size, h, k.d, digest)
-	xr := []u8{}
+	let nonce = rfc6979_nonce(mut n, size, h, k.d, digest)
+	mut xr = []u8{}
 	if size == 32 {
-		r := p256_identity()
+		let r = p256_identity()
 		p256_mul(mut r, p256_generator(), nonce)
-		x, _, ok := p256_affine(r)
+		let (x, _, ok) = p256_affine(r)
 		if ok == 0 {
 			fail "seal: ECDSA nonce gave the point at infinity"
 		}
 		xr = x
 	} else {
-		c := try p384_curve()
-		r := ec_mul_ct(mut c, ec_generator(c), nonce)
-		x, ok := ec_affine_x(mut c, r)
+		let c = try p384_curve()
+		let r = ec_mul_ct(mut c, ec_generator(c), nonce)
+		let (x, ok) = ec_affine_x(mut c, r)
 		if ok == 0 {
 			fail "seal: ECDSA nonce gave the point at infinity"
 		}
 		xr = x
 	}
-	rl := ecdsa_reduce(n, monty_bytes(n, xr))
-	rm := n.elem()
+	let rl = ecdsa_reduce(n, monty_bytes(n, xr))
+	let rm = n.elem()
 	n.mul(mut rm, rl, n.rr)
 	if n.is_zero(rm) == 1 {
 		fail "seal: ECDSA r is zero"
 	}
-	e := digest
+	mut e = digest
 	if len(e) > size {
 		e = e[:size]
 	}
-	em := n.elem()
+	let em = n.elem()
 	n.mul(mut em, ecdsa_reduce(n, monty_bytes(n, e)), n.rr)
-	km := n.elem()
-	dm := n.elem()
+	let km = n.elem()
+	let dm = n.elem()
 	n.from_bytes(mut km, monty_bytes(n, nonce))
 	n.from_bytes(mut dm, monty_bytes(n, k.d))
-	s := n.elem()
+	let s = n.elem()
 	n.mul(mut s, rm, dm)
 	n.add(mut s, s, em)
 	n.inv(mut km, km)
@@ -205,28 +205,28 @@ func SignECDSA(k ECPrivateKey, h Hash, digest []u8) ![]u8 {
 	if n.is_zero(s) == 1 {
 		fail "seal: ECDSA s is zero"
 	}
-	rb := n.to_bytes(rm)
-	sb := n.to_bytes(s)
-	body := der_int([]u8{}, rb)
+	let rb = n.to_bytes(rm)
+	let sb = n.to_bytes(s)
+	mut body = der_int([]u8{}, rb)
 	body = der_int(body, sb)
-	out := []u8{derSequence, u8(len(body))}
+	let out = []u8{derSequence, u8(len(body))}
 	return append(out, body...)
 }
 
 // SignTLS signs msg (the bytes a TLS 1.3 CertificateVerify covers) with k under scheme: RSA-PSS
 // 0x0804-0x0806 for RSA keys, 0x0403 for P-256 and 0x0503 for P-384.
-func (k PrivateKey) SignTLS(scheme i64, msg []u8) ![]u8 {
-	h := Hash.SHA256
+fn (k PrivateKey) SignTLS(scheme i64, msg []u8) ![]u8 {
+	mut h = Hash.SHA256
 	if scheme == 0x0805 || scheme == 0x0503 {
 		h = Hash.SHA384
 	} else if scheme == 0x0806 {
 		h = Hash.SHA512
 	}
-	r := k.RSA
+	let r = k.RSA
 	if r != nil && scheme >= 0x0804 && scheme <= 0x0806 {
 		return try SignPSS(mut r, h, Sum(h, str(msg)))
 	}
-	e := k.EC
+	let e = k.EC
 	if e != nil && ((scheme == 0x0403 && e.Curve == "P-256") || (scheme == 0x0503 && e.Curve == "P-384")) {
 		return try SignECDSA(e, h, Sum(h, str(msg)))
 	}

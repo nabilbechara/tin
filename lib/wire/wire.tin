@@ -33,24 +33,24 @@ type Resp struct {
 	head   str
 }
 
-func errno() i64 {
+fn errno() i64 {
 	return rt_errno()
 }
 
-func os_fault(what str) ! {
-	m := rt_sys_strerror(errno())
+fn os_fault(what str) ! {
+	let m = rt_sys_strerror(errno())
 	fail say.Fault("wire: %s: %s", what, rt_str_from_raw(m, strlen(m)))
 }
 
 // EOF is the fault Read returns at the end of the stream.
-func IsEOF(err fault) bool {
+fn IsEOF(err fault) bool {
 	return err != nil && say.Str(err) == "EOF"
 }
 
 // split_addr cuts "host:port" (host may be empty).
-func split_addr(addr str) !(str, i64) {
-	colon := -1
-	for i := 0; i < len(addr); i++ {
+fn split_addr(addr str) !(str, i64) {
+	mut colon = -1
+	for i in 0..len(addr) {
 		if addr[i] == ':' {
 			colon = i
 		}
@@ -58,9 +58,9 @@ func split_addr(addr str) !(str, i64) {
 	if colon < 0 || colon == len(addr)-1 {
 		fail say.Fault("wire: address %q needs a port", addr)
 	}
-	port := 0
-	for i := colon + 1; i < len(addr); i++ {
-		c := addr[i]
+	mut port = 0
+	for i in colon + 1..len(addr) {
+		let c = addr[i]
 		if c < '0' || c > '9' || port > 65535 {
 			fail say.Fault("wire: bad port in %q", addr)
 		}
@@ -73,8 +73,8 @@ func split_addr(addr str) !(str, i64) {
 }
 
 // wait_io waits until fd is ready for a read (want 1) or write (2), within timeout ns.
-func wait_io(fd i64, want i64, timeout i64, what str) ! {
-	r := rt_task_wait(fd, want, timeout)
+fn wait_io(fd i64, want i64, timeout i64, what str) ! {
+	let r = rt_task_wait(fd, want, timeout)
 	if r == waitDeadline {
 		fail cast(fault, rt_wait_fault())
 	}
@@ -84,10 +84,10 @@ func wait_io(fd i64, want i64, timeout i64, what str) ! {
 }
 
 // wait is wait_io for c: the per-wait timeout, cut short by the call's overall limit.
-func (c Conn) wait(want i64, what str) ! {
-	t := c.timeout
+fn (c Conn) wait(want i64, what str) ! {
+	mut t = c.timeout
 	if c.until > 0 {
-		left := c.until - rt_mono_ns()
+		let left = c.until - rt_mono_ns()
 		if left <= 0 {
 			fail "wire: {what} timed out"
 		}
@@ -98,40 +98,40 @@ func (c Conn) wait(want i64, what str) ! {
 	try wait_io(c.fd, want, t, what)
 }
 
-func nonblocking(fd i64) {
-	flags := i64(i32(rt_sys_fcntl(fd, F_GETFL, 0)))
+fn nonblocking(fd i64) {
+	let flags = i64(i32(rt_sys_fcntl(fd, F_GETFL, 0)))
 	rt_sys_fcntl(fd, F_SETFL, flags|O_NONBLOCK)
 }
 
 // Dial connects to "host:port".
-func Dial(addr str) !Conn {
+fn Dial(addr str) !Conn {
 	return try DialTimeout(addr, 0)
 }
 
 // DialTimeout connects to "host:port", giving up after timeout nanoseconds (0: no limit).
-func DialTimeout(addr str, timeout i64) !Conn {
-	tp := rt_tape()
+fn DialTimeout(addr str, timeout i64) !Conn {
+	let tp = rt_tape()
 	if tp != 0 {
 		return try dial_taped(tp, addr, timeout)
 	}
-	none := Conn{fd: -1}
-	host, port, err := split_addr(addr)
+	let none = Conn{fd: -1}
+	let (host, port, err) = split_addr(addr)
 	if err != nil {
 		fail err
 	}
-	sa := calloc(1, 32)
+	let sa = calloc(1, 32)
 	defer free(sa)
-	until := i64(0)
+	mut until = i64(0)
 	if timeout > 0 { until = rt_mono_ns()+timeout }
-	e2 := resolve(host, port, sa, until)
+	let e2 = resolve(host, port, sa, until)
 	if e2 != nil {
 		fail e2
 	}
-	fd := i64(i32(rt_sys_socket(rt_sockaddr_family(sa), 1, 0)))
+	let fd = i64(i32(rt_sys_socket(rt_sockaddr_family(sa), 1, 0)))
 	if fd < 0 {
 		fail os_fault("socket")
 	}
-	one := calloc(1, 8)
+	let one = calloc(1, 8)
 	one[0] = 1
 	rt_nosigpipe(fd)
 	rt_sys_setsockopt(fd, 6, 1, one, 4)
@@ -140,32 +140,33 @@ func DialTimeout(addr str, timeout i64) !Conn {
 	nonblocking(fd)
 	if i64(i32(rt_sys_connect(fd, sa, rt_sockaddr_len(sa)))) < 0 {
 		if errno() != EINPROGRESS {
-			f2 := os_fault(say.Fmt("connect %s", addr))
+			let f2 = os_fault(say.Fmt("connect %s", addr))
 			rt_sys_close(fd)
 			if f2 != nil {
 				fail f2
 			}
 			return none
 		}
-		left := timeout
+		mut left = timeout
 		if until > 0 {
 			left = until-rt_mono_ns()
-			if left <= 0 { rt_sys_close(fd); fail "wire: connect {addr} timed out" }
+			if left <= 0 { rt_sys_close(fd)
+ fail "wire: connect {addr} timed out" }
 		}
-		werr := wait_io(fd, 2, left, "connect " + addr)
+		let werr = wait_io(fd, 2, left, "connect " + addr)
 		if werr != nil {
 			rt_sys_close(fd)
 			fail werr
 		}
-		soerr := calloc(1, 8)
-		ln := calloc(1, 8)
+		let soerr = calloc(1, 8)
+		let ln = calloc(1, 8)
 		ln[0] = 4
 		rt_sys_getsockopt(fd, SOL_SOCKET, SO_ERROR, soerr, ln)
-		code := i64(i32(soerr[0]))
+		let code = i64(i32(soerr[0]))
 		free(soerr)
 		free(ln)
 		if code != 0 {
-			m := rt_sys_strerror(code)
+			let m = rt_sys_strerror(code)
 			rt_sys_close(fd)
 			fail say.Fault("wire: connect %s: %s", addr, rt_str_from_raw(m, strlen(m)))
 		}
@@ -175,18 +176,18 @@ func DialTimeout(addr str, timeout i64) !Conn {
 
 // Fd is the connection's descriptor, for clients that do their own I/O on it (it stays
 // non-blocking; Close still closes it).
-func (c Conn) Fd() i64 {
+fn (c Conn) Fd() i64 {
 	return c.fd
 }
 
 // SetTimeout limits every later read and write to ns nanoseconds (0: no limit).
-func (c mut Conn) SetTimeout(ns i64) {
+fn (c mut Conn) SetTimeout(ns i64) {
 	c.timeout = ns
 }
 
 // SetNoDelay turns Nagle's algorithm off (true) or on.
-func (c Conn) SetNoDelay(on bool) {
-	v := calloc(1, 8)
+fn (c Conn) SetNoDelay(on bool) {
+	let v = calloc(1, 8)
 	if on {
 		v[0] = 1
 	}
@@ -195,20 +196,20 @@ func (c Conn) SetNoDelay(on bool) {
 }
 
 // WriteRaw sends n bytes at p.
-func (c Conn) write_raw(p i64, n i64) ! {
+fn (c Conn) write_raw(p i64, n i64) ! {
 	if !c.open {
 		fail "wire: write on a closed connection"
 	}
 	if c.tn != 0 {
-		tp := rt_tape()
+		let tp = rt_tape()
 		if tp != 0 {
 			return try c.write_taped(tp, p, n)
 		}
 	}
 	for n > 0 {
-		k := rt_sys_write(c.fd, p, n)
+		let k = rt_sys_write(c.fd, p, n)
 		if k < 0 {
-			e := errno()
+			let e = errno()
 			if e == 4 {
 				continue
 			}
@@ -224,32 +225,32 @@ func (c Conn) write_raw(p i64, n i64) ! {
 }
 
 // Write sends all of s.
-func (c Conn) Write(s str) ! {
+fn (c Conn) Write(s str) ! {
 	return try c.write_raw(cast(i64, s)+8, len(s))
 }
 
 // WriteBytes sends all of b.
-func (c Conn) WriteBytes(b []u8) ! {
+fn (c Conn) WriteBytes(b []u8) ! {
 	return try c.write_raw(cast(i64, b)[2], len(b))
 }
 
 // Read appends up to max bytes to buf and returns how many; at the end it returns 0 and EOF.
-func (c Conn) Read(buf mut []u8, max i64) !i64 {
+fn (c Conn) Read(buf mut []u8, max i64) !i64 {
 	if !c.open {
 		fail "wire: read on a closed connection"
 	}
 	if c.tn != 0 {
-		tp := rt_tape()
+		let tp = rt_tape()
 		if tp != 0 {
 			return try c.read_taped(tp, mut buf, max)
 		}
 	}
-	h := cast(i64, buf)
+	let h = cast(i64, buf)
 	if h[0]+max > h[1] {
 		rt_slice_grow(h, h[0]+max, 1)
 	}
 	for {
-		k := rt_sys_read(c.fd, h[2]+h[0], max)
+		let k = rt_sys_read(c.fd, h[2]+h[0], max)
 		if k > 0 {
 			h[0] += k
 			return k
@@ -257,7 +258,7 @@ func (c Conn) Read(buf mut []u8, max i64) !i64 {
 		if k == 0 {
 			fail "EOF"
 		}
-		e := errno()
+		let e = errno()
 		if e == 4 {
 			continue
 		}
@@ -270,10 +271,10 @@ func (c Conn) Read(buf mut []u8, max i64) !i64 {
 }
 
 // ReadFull reads exactly n bytes.
-func (c Conn) ReadFull(n i64) !str {
-	b := make([]u8, 0, n)
+fn (c Conn) ReadFull(n i64) !str {
+	let b = make([]u8, 0, n)
 	for len(b) < n {
-		_, err := c.Read(mut b, n-len(b))
+		let (_, err) = c.Read(mut b, n-len(b))
 		if err != nil {
 			fail err
 		}
@@ -282,7 +283,7 @@ func (c Conn) ReadFull(n i64) !str {
 }
 
 // Close closes the connection.
-func (c mut Conn) Close() {
+fn (c mut Conn) Close() {
 	if c.open {
 		if c.fd >= 0 {
 			rt_sys_close(c.fd)
@@ -292,28 +293,28 @@ func (c mut Conn) Close() {
 }
 
 // Listen opens a TCP listener on "host:port" (":0" picks a free port: see Port).
-func Listen(addr str) !Listener {
-	none := Listener{fd: -1}
-	host, port, err := split_addr(addr)
+fn Listen(addr str) !Listener {
+	let none = Listener{fd: -1}
+	let (host, port, err) = split_addr(addr)
 	if err != nil {
 		fail err
 	}
-	sa := calloc(1, 32)
+	let sa = calloc(1, 32)
 	defer free(sa)
-	e2 := resolve(host, port, sa, 0)
+	let e2 = resolve(host, port, sa, 0)
 	if e2 != nil {
 		fail e2
 	}
-	fd := i64(i32(rt_sys_socket(rt_sockaddr_family(sa), 1, 0)))
+	let fd = i64(i32(rt_sys_socket(rt_sockaddr_family(sa), 1, 0)))
 	if fd < 0 {
 		fail os_fault("socket")
 	}
-	one := calloc(1, 8)
+	let one = calloc(1, 8)
 	one[0] = 1
 	rt_sys_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, one, 4)
 	free(one)
 	if i64(i32(rt_sys_bind(fd, sa, rt_sockaddr_len(sa)))) < 0 {
-		f := os_fault(say.Fmt("bind %s", addr))
+		let f = os_fault(say.Fmt("bind %s", addr))
 		rt_sys_close(fd)
 		if f != nil {
 			fail f
@@ -321,14 +322,14 @@ func Listen(addr str) !Listener {
 		return none
 	}
 	if i64(i32(rt_sys_listen(fd, 1024))) < 0 {
-		f2 := os_fault("listen")
+		let f2 = os_fault("listen")
 		rt_sys_close(fd)
 		if f2 != nil {
 			fail f2
 		}
 		return none
 	}
-	ln := calloc(1, 8)
+	let ln = calloc(1, 8)
 	ln[0] = 32
 	rt_sys_getsockname(fd, sa, ln)
 	free(ln)
@@ -337,19 +338,19 @@ func Listen(addr str) !Listener {
 }
 
 // Port is the port the listener is bound to.
-func (l Listener) Port() i64 {
+fn (l Listener) Port() i64 {
 	return l.port
 }
 
 // Accept waits for the next connection.
-func (l Listener) Accept() !Conn {
+fn (l Listener) Accept() !Conn {
 	if !l.open {
 		fail "wire: accept on a closed listener"
 	}
 	for {
-		fd := i64(i32(rt_sys_accept(l.fd, 0, 0)))
+		let fd = i64(i32(rt_sys_accept(l.fd, 0, 0)))
 		if fd >= 0 {
-			one := calloc(1, 8)
+			let one = calloc(1, 8)
 			one[0] = 1
 			rt_nosigpipe(fd)
 			rt_sys_setsockopt(fd, 6, 1, one, 4)
@@ -357,7 +358,7 @@ func (l Listener) Accept() !Conn {
 			nonblocking(fd)
 			return Conn{open: true, fd: fd, timeout: 0}
 		}
-		e := errno()
+		let e = errno()
 		if e == EAGAIN {
 			try wait_io(l.fd, 1, 0, "accept")
 			continue
@@ -369,7 +370,7 @@ func (l Listener) Accept() !Conn {
 }
 
 // Close stops listening.
-func (l mut Listener) Close() {
+fn (l mut Listener) Close() {
 	if l.open {
 		rt_sys_close(l.fd)
 		l.open = false
@@ -390,16 +391,16 @@ type Options struct {
 const DefaultMaxBody = 67108864
 
 // Get fetches url.
-func Get(url str) !Resp {
+fn Get(url str) !Resp {
 	return try Do("GET", url, []str{}, "")
 }
 
 // Post sends body with content type ctype to url.
-func Post(url str, ctype str, body str) !Resp {
+fn Post(url str, ctype str, body str) !Resp {
 	return try Do("POST", url, []str{"Content-Type", ctype}, body)
 }
 
-func none_resp() Resp {
+fn none_resp() Resp {
 	return Resp{Body: "", head: ""}
 }
 
@@ -407,28 +408,28 @@ func none_resp() Resp {
 // must be tokens, and the URL and header values must not hold CR, LF, NUL or other control
 // bytes (the URL no spaces either), or Do fails instead of sending a request an input could
 // have split. Response bodies over DefaultMaxBody fail; DoWith sets a timeout and the limit.
-func Do(method str, url str, headers []str, body str) !Resp {
+fn Do(method str, url str, headers []str, body str) !Resp {
 	return try DoWith(method, url, headers, body, Options{Timeout: 0, MaxBody: 0})
 }
 
 // DoWith is Do with options: an overall timeout and a response size limit.
-func DoWith(method str, url str, headers []str, body str, opt Options) !Resp {
-	tp := rt_tape()
+fn DoWith(method str, url str, headers []str, body str, opt Options) !Resp {
+	let tp = rt_tape()
 	if tp != 0 {
 		return try http_taped(tp, method, url, headers, body, opt)
 	}
-	limit := opt.MaxBody
-	if limit <= 0 {
-		limit = DefaultMaxBody
+	mut limit_ = opt.MaxBody
+	if limit_ <= 0 {
+		limit_ = DefaultMaxBody
 	}
-	until := 0
+	mut until = 0
 	if opt.Timeout > 0 {
 		until = rt_mono_ns() + opt.Timeout
 	}
 	if !is_token(method) {
 		fail say.Fault("wire: invalid method %q", method)
 	}
-	for i := 0; i < len(url); i++ {
+	for i in 0..len(url) {
 		if url[i] <= ' ' || url[i] == 0x7f {
 			fail say.Fault("wire: invalid character in URL %q", url)
 		}
@@ -436,44 +437,48 @@ func DoWith(method str, url str, headers []str, body str, opt Options) !Resp {
 	if len(headers)%2 != 0 {
 		fail "wire: headers must be name, value pairs"
 	}
-	for i := 0; i+1 < len(headers); i += 2 {
-		if !is_token(headers[i]) {
-			fail say.Fault("wire: invalid header name %q", headers[i])
-		}
-		v := headers[i+1]
-		for k := 0; k < len(v); k++ {
-			if v[k] == '\r' || v[k] == '\n' || v[k] == 0 {
-				fail say.Fault("wire: invalid header value for %s", headers[i])
+	{
+		mut i = 0
+		for i+1 < len(headers) {
+			if !is_token(headers[i]) {
+				fail say.Fault("wire: invalid header name %q", headers[i])
 			}
+			let v = headers[i+1]
+			for k in 0..len(v) {
+				if v[k] == '\r' || v[k] == '\n' || v[k] == 0 {
+					fail say.Fault("wire: invalid header value for %s", headers[i])
+				}
+			}
+			i += 2
 		}
 	}
-	secure := len(url) >= 8 && url[:8] == "https://"
+	let secure = len(url) >= 8 && url[:8] == "https://"
 	if !secure && (len(url) < 7 || url[:7] != "http://") {
 		fail say.Fault("wire: %q is not an http:// or https:// URL", url)
 	}
-	rest := url[7:]
+	mut rest = url[7:]
 	if secure {
 		rest = url[8:]
 	}
-	slash := len(rest)
-	for i := 0; i < len(rest); i++ {
+	mut slash = len(rest)
+	for i in 0..len(rest) {
 		if rest[i] == '/' || rest[i] == '?' {
 			slash = i
 			break
 		}
 	}
-	hostport := rest[:slash]
-	path := "/"
+	let hostport = rest[:slash]
+	mut path = "/"
 	if slash < len(rest) {
 		path = rest[slash:]
 		if path[0] == '?' {
 			path = "/" + path
 		}
 	}
-	addr := hostport
-	hasport := false
-	brackets := len(hostport) > 0 && hostport[0] == '['
-	for i := 0; i < len(hostport); i++ {
+	mut addr = hostport
+	mut hasport = false
+	mut brackets = len(hostport) > 0 && hostport[0] == '['
+	for i in 0..len(hostport) {
 		if hostport[i] == ']' { brackets=false }
 		if hostport[i] == ':' && !brackets { hasport=true }
 	}
@@ -483,18 +488,22 @@ func DoWith(method str, url str, headers []str, body str, opt Options) !Resp {
 			addr = hostport + ":443"
 		}
 	}
-	req := make([]u8, 0, 256+len(body))
+	mut req = make([]u8, 0, 256+len(body))
 	req = append(req, method...)
 	req = append(req, ' ')
 	req = append(req, path...)
 	req = append(req, " HTTP/1.1\r\nHost: "...)
 	req = append(req, hostport...)
 	req = append(req, "\r\nUser-Agent: tin-wire\r\nConnection: close\r\n"...)
-	for i := 0; i+1 < len(headers); i += 2 {
-		req = append(req, headers[i]...)
-		req = append(req, ": "...)
-		req = append(req, headers[i+1]...)
-		req = append(req, "\r\n"...)
+	{
+		mut i = 0
+		for i+1 < len(headers) {
+			req = append(req, headers[i]...)
+			req = append(req, ": "...)
+			req = append(req, headers[i+1]...)
+			req = append(req, "\r\n"...)
+			i += 2
+		}
 	}
 	if len(body) > 0 || method == "POST" || method == "PUT" {
 		req = append(req, "Content-Length: "...)
@@ -504,29 +513,29 @@ func DoWith(method str, url str, headers []str, body str, opt Options) !Resp {
 	req = append(req, "\r\n"...)
 	req = append(req, body...)
 	if secure {
-		cfg := tls.Config{ServerName: "", RootCAs: "", ALPN: []str{}, Timeout: opt.Timeout, InsecureSkipVerify: false}
-		given := opt.TLS
+		let cfg = tls.Config{ServerName: "", RootCAs: "", ALPN: []str{}, Timeout: opt.Timeout, InsecureSkipVerify: false}
+		let given = opt.TLS
 		if given != nil {
 			cfg.RootCAs = given.RootCAs
 			cfg.ALPN = given.ALPN
 			cfg.InsecureSkipVerify = given.InsecureSkipVerify
 		}
 		cfg.ServerName = tls_host(hostport)
-		tc := try tls.Dial(addr, cfg)
+		let tc = try tls.Dial(addr, cfg)
 		defer tc.Close()
 		tc.SetDeadline(until)
 		try tc.WriteBytes(req)
-		r, err := read_response(mut tc, method == "HEAD", limit)
+		let (r, err) = read_response(mut tc, method == "HEAD", limit_)
 		if err != nil {
 			fail err
 		}
 		return r
 	}
-	c := try DialTimeout(addr, opt.Timeout)
+	let c = try DialTimeout(addr, opt.Timeout)
 	defer c.Close()
 	c.until = until
 	try c.WriteBytes(req)
-	r, err := read_response(mut c, method == "HEAD", limit)
+	let (r, err) = read_response(mut c, method == "HEAD", limit_)
 	if err != nil {
 		fail err
 	}
@@ -534,17 +543,17 @@ func DoWith(method str, url str, headers []str, body str, opt Options) !Resp {
 }
 
 // tls_host is the host of "host[:port]" for SNI and certificate checks ("[v6]" gives v6).
-func tls_host(hostport str) str {
-	h := hostport
+fn tls_host(hostport str) str {
+	let h = hostport
 	if len(h) > 0 && h[0] == '[' {
-		for i := 0; i < len(h); i++ {
+		for i in 0..len(h) {
 			if h[i] == ']' {
 				return h[1:i]
 			}
 		}
 		return h
 	}
-	for i := 0; i < len(h); i++ {
+	for i in 0..len(h) {
 		if h[i] == ':' {
 			return h[:i]
 		}
@@ -553,18 +562,18 @@ func tls_host(hostport str) str {
 }
 
 // is_token reports whether s is an HTTP token (a method or header name, RFC 9110 5.6.2).
-func is_token(s str) bool {
+fn is_token(s str) bool {
 	if len(s) == 0 {
 		return false
 	}
-	for i := 0; i < len(s); i++ {
-		c := s[i]
+	for i in 0..len(s) {
+		let c = s[i]
 		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
 			continue
 		}
-		ok := false
-		t := "!#$%&'*+-.^_`|~"
-		for j := 0; j < len(t); j++ {
+		mut ok = false
+		let t = "!#$%&'*+-.^_`|~"
+		for j in 0..len(t) {
 			if t[j] == c {
 				ok = true
 				break
@@ -577,8 +586,8 @@ func is_token(s str) bool {
 	return true
 }
 
-func find_crlf2(b []u8) i64 {
-	for i := 3; i < len(b); i++ {
+fn find_crlf2(b []u8) i64 {
+	for i in 3..len(b) {
 		if b[i] == '\n' && b[i-1] == '\r' && b[i-2] == '\n' && b[i-3] == '\r' {
 			return i + 1
 		}
@@ -590,13 +599,13 @@ func find_crlf2(b []u8) i64 {
 shape stream { Read(buf mut []u8, max i64) !i64 }
 
 // read_head reads until buf holds a complete header block and returns its length.
-func read_head[S stream](c mut S, buf mut []u8) !i64 {
-	hend := find_crlf2(buf)
+fn read_head[S stream](c mut S, buf mut []u8) !i64 {
+	mut hend = find_crlf2(buf)
 	for hend < 0 {
 		if len(buf) > 1048576 {
 			fail "wire: response headers too large"
 		}
-		_, err := c.Read(mut buf, 4096)
+		let (_, err) = c.Read(mut buf, 4096)
 		if err != nil {
 			if IsEOF(err) {
 				fail "wire: connection closed before the response headers"
@@ -614,32 +623,32 @@ func read_head[S stream](c mut S, buf mut []u8) !i64 {
 // maxInformational bounds the 1xx responses accepted before the final one (as Go does).
 const maxInformational = 5
 
-func read_response[S stream](c mut S, head bool, limit i64) !Resp {
-	buf := make([]u8, 0, 4096)
-	informational := 0
+fn read_response[S stream](c mut S, head bool, limit_ i64) !Resp {
+	mut buf = make([]u8, 0, 4096)
+	mut informational = 0
 	for {
-		hend := try read_head(mut c, mut buf)
-		h := str(buf[:hend])
+		let hend = try read_head(mut c, mut buf)
+		let h = str(buf[:hend])
 		if len(h) < 12 || h[:5] != "HTTP/" {
 			fail "wire: malformed response"
 		}
-		status := 0
-		for i := 9; i < 12; i++ {
-			d := h[i]
+		mut status = 0
+		for i in 9..12 {
+			let d = h[i]
 			if d < '0' || d > '9' {
 				fail "wire: malformed status line"
 			}
 			status = status*10 + i64(d-'0')
 		}
-		r := Resp{Status: status, Body: "", head: h}
-		rest := buf[hend:]
+		let r = Resp{Status: status, Body: "", head: h}
+		let rest = buf[hend:]
 		// A 1xx other than 101 precedes the final response: drop it and keep the bytes after it.
 		if status >= 100 && status < 200 && status != 101 {
-			informational++
+			informational += 1
 			if informational > maxInformational {
 				fail "wire: too many informational responses"
 			}
-			next := make([]u8, 0, len(rest)+4096)
+			mut next = make([]u8, 0, len(rest)+4096)
 			next = append(next, rest...)
 			buf = next
 			continue
@@ -648,11 +657,11 @@ func read_response[S stream](c mut S, head bool, limit i64) !Resp {
 		if head || status == 204 || status == 304 || status == 101 {
 			return r
 		}
-		chunked, err0 := transfer_coding(r)
+		let (chunked, err0) = transfer_coding(r)
 		if err0 != nil {
 			fail err0
 		}
-		n, err := content_length(r)
+		mut (n, err) = content_length(r)
 		if err != nil {
 			fail err
 		}
@@ -661,25 +670,25 @@ func read_response[S stream](c mut S, head bool, limit i64) !Resp {
 			fail "wire: both Transfer-Encoding and Content-Length"
 		}
 		if chunked {
-			b := try read_chunked(mut c, rest, limit)
+			let b = try read_chunked(mut c, rest, limit_)
 			r.Body = b
 			return r
 		}
-		if n > limit {
-			fail say.Fault("wire: response body of %d bytes is over the %d-byte limit", n, limit)
+		if n > limit_ {
+			fail say.Fault("wire: response body of %d bytes is over the %d-byte limit", n, limit_)
 		}
 		if n >= 0 {
-			b := try read_length(mut c, rest, n)
+			let b = try read_length(mut c, rest, n)
 			r.Body = b
 			return r
 		}
-		body2 := make([]u8, 0, 4096)
+		mut body2 = make([]u8, 0, 4096)
 		body2 = append(body2, rest...)
 		for {
-			if len(body2) > limit {
-				fail say.Fault("wire: response body is over the %d-byte limit", limit)
+			if len(body2) > limit_ {
+				fail say.Fault("wire: response body is over the %d-byte limit", limit_)
 			}
-			_, err := c.Read(mut body2, 65536)
+			let (_, err) = c.Read(mut body2, 65536)
 			if err != nil {
 				if IsEOF(err) {
 					break
@@ -698,17 +707,17 @@ func read_response[S stream](c mut S, head bool, limit i64) !Resp {
 // transfer_coding reports whether the response is chunked. Transfer-Encoding headers form one
 // comma-separated list of codings (case-insensitive, blanks ignored); wire decodes only
 // chunked, so a list that is not exactly "chunked" is a fault rather than raw bytes.
-func transfer_coding(r Resp) !bool {
-	seen := false
-	codings := 0
-	h := r.head
-	i := 0
+fn transfer_coding(r Resp) !bool {
+	mut seen = false
+	mut codings = 0
+	let h = r.head
+	mut i = 0
 	for i < len(h) {
-		j := i
+		mut j = i
 		for j < len(h) && h[j] != '\n' {
-			j++
+			j += 1
 		}
-		line := h[i:j]
+		mut line = h[i:j]
 		i = j + 1
 		if len(line) > 0 && line[len(line)-1] == '\r' {
 			line = line[:len(line)-1]
@@ -717,32 +726,32 @@ func transfer_coding(r Resp) !bool {
 			continue
 		}
 		seen = true
-		v := line[18:]
-		k := 0
+		let v = line[18:]
+		mut k = 0
 		for k <= len(v) {
-			e := k
+			mut e = k
 			for e < len(v) && v[e] != ',' {
-				e++
+				e += 1
 			}
-			a := k
-			b := e
+			mut a = k
+			mut b = e
 			for a < b && (v[a] == ' ' || v[a] == '\t') {
-				a++
+				a += 1
 			}
 			for b > a && (v[b-1] == ' ' || v[b-1] == '\t') {
-				b--
+				b -= 1
 			}
 			if b > a {
-				c := v[a:b]
-				semi := 0
+				let c = v[a:b]
+				mut semi = 0
 				for semi < len(c) && c[semi] != ';' {
-					semi++
+					semi += 1
 				}
-				name := c[:semi]
+				let name = c[:semi]
 				if !fold_eq(name, "chunked") || semi < len(c) {
 					fail say.Fmt("wire: unsupported Transfer-Encoding %q", c)
 				}
-				codings++
+				codings += 1
 			}
 			k = e + 1
 		}
@@ -764,16 +773,16 @@ const maxBodyLen = 1099511627776
 
 // content_length is the response's Content-Length: -1 when there is none. Repeated headers
 // must agree; anything but plain decimal digits (lists included) is a fault.
-func content_length(r Resp) !i64 {
-	n := -1
-	h := r.head
-	i := 0
+fn content_length(r Resp) !i64 {
+	mut n = -1
+	let h = r.head
+	mut i = 0
 	for i < len(h) {
-		j := i
+		mut j = i
 		for j < len(h) && h[j] != '\n' {
-			j++
+			j += 1
 		}
-		line := h[i:j]
+		mut line = h[i:j]
 		i = j + 1
 		if len(line) > 0 && line[len(line)-1] == '\r' {
 			line = line[:len(line)-1]
@@ -781,21 +790,21 @@ func content_length(r Resp) !i64 {
 		if len(line) <= 14 || line[14] != ':' || !fold_eq(line[:14], "content-length") {
 			continue
 		}
-		v := line[15:]
-		a := 0
+		let v = line[15:]
+		mut a = 0
 		for a < len(v) && (v[a] == ' ' || v[a] == '\t') {
-			a++
+			a += 1
 		}
-		e := len(v)
+		mut e = len(v)
 		for e > a && (v[e-1] == ' ' || v[e-1] == '\t') {
-			e--
+			e -= 1
 		}
 		if e == a || e-a > 13 {
 			fail "wire: bad Content-Length"
 		}
-		x := 0
-		for k := a; k < e; k++ {
-			d := v[k]
+		mut x = 0
+		for k in a..e {
+			let d = v[k]
 			if d < '0' || d > '9' {
 				fail "wire: bad Content-Length"
 			}
@@ -814,19 +823,19 @@ func content_length(r Resp) !i64 {
 
 // read_length reads an n-byte body after the pending bytes, growing the buffer as data arrives
 // instead of reserving the announced size up front.
-func read_length[S stream](c mut S, pending []u8, n i64) !str {
-	start := n
+fn read_length[S stream](c mut S, pending []u8, n i64) !str {
+	mut start = n
 	if start > 65536 {
 		start = 65536
 	}
-	body := make([]u8, 0, start)
+	mut body = make([]u8, 0, start)
 	body = append(body, pending...)
 	for len(body) < n {
-		want := n - len(body)
+		mut want = n - len(body)
 		if want > 65536 {
 			want = 65536
 		}
-		_, err := c.Read(mut body, want)
+		let (_, err) = c.Read(mut body, want)
 		if err != nil {
 			if IsEOF(err) {
 				fail "wire: response body truncated"
@@ -845,7 +854,7 @@ const maxChunkLine = 4096
 const maxTrailers = 1048576
 
 // chunk_fault names a connection that ends inside a chunked body.
-func chunk_fault(err fault) ! {
+fn chunk_fault(err fault) ! {
 	if IsEOF(err) {
 		fail "wire: chunked body truncated"
 	}
@@ -855,10 +864,10 @@ func chunk_fault(err fault) ! {
 }
 
 // chunk_line reads until buf holds a CRLF-terminated line at pos and returns the index of its CR.
-func chunk_line[S stream](c mut S, buf mut []u8, pos i64) !i64 {
-	scan := pos
+fn chunk_line[S stream](c mut S, buf mut []u8, pos i64) !i64 {
+	mut scan = pos
 	for {
-		for i := scan; i < len(buf); i++ {
+		for i in scan..len(buf) {
 			if buf[i] == '\n' {
 				if i == pos || buf[i-1] != '\r' {
 					fail "wire: malformed chunked body: line not ended by CRLF"
@@ -870,7 +879,7 @@ func chunk_line[S stream](c mut S, buf mut []u8, pos i64) !i64 {
 		if len(buf)-pos > maxChunkLine {
 			fail "wire: malformed chunked body: line too long"
 		}
-		_, err := c.Read(mut buf, 4096)
+		let (_, err) = c.Read(mut buf, 4096)
 		if err != nil {
 			fail chunk_fault(err)
 		}
@@ -878,9 +887,9 @@ func chunk_line[S stream](c mut S, buf mut []u8, pos i64) !i64 {
 }
 
 // visible reports whether buf[from:to] has no control characters other than tab.
-func visible(buf []u8, from i64, to i64) bool {
-	for i := from; i < to; i++ {
-		d := buf[i]
+fn visible(buf []u8, from i64, to i64) bool {
+	for i in from..to {
+		let d = buf[i]
 		if (d < ' ' && d != '\t') || d == 127 {
 			return false
 		}
@@ -889,12 +898,12 @@ func visible(buf []u8, from i64, to i64) bool {
 }
 
 // chunk_size parses buf[pos:end]: one or more hex digits, then optional ";" extensions.
-func chunk_size(buf []u8, pos i64, end i64) !i64 {
-	size := 0
-	i := pos
+fn chunk_size(buf []u8, pos i64, end i64) !i64 {
+	mut size = 0
+	mut i = pos
 	for i < end {
-		d := buf[i]
-		v := -1
+		let d = buf[i]
+		mut v = -1
 		if d >= '0' && d <= '9' {
 			v = i64(d - '0')
 		} else if d >= 'a' && d <= 'f' {
@@ -909,13 +918,13 @@ func chunk_size(buf []u8, pos i64, end i64) !i64 {
 			fail "wire: malformed chunked body: chunk size too large"
 		}
 		size = size*16 + v
-		i++
+		i += 1
 	}
 	if i == pos {
 		fail "wire: malformed chunked body: bad chunk size"
 	}
 	for i < end && (buf[i] == ' ' || buf[i] == '\t') {
-		i++
+		i += 1
 	}
 	if i < end && (buf[i] != ';' || !visible(buf, i, end)) {
 		fail "wire: malformed chunked body: bad chunk size"
@@ -924,15 +933,15 @@ func chunk_size(buf []u8, pos i64, end i64) !i64 {
 }
 
 // chunk_trailers reads the trailer fields after the last chunk up to the empty line; they are ignored.
-func chunk_trailers[S stream](c mut S, buf mut []u8, pos i64) ! {
-	start := pos
+fn chunk_trailers[S stream](c mut S, buf mut []u8, pos i64) ! {
+	let start = pos
 	for {
-		end := try chunk_line(mut c, mut buf, pos)
+		let end = try chunk_line(mut c, mut buf, pos)
 		if end == pos {
 			return
 		}
-		colon := -1
-		for i := pos; i < end; i++ {
+		mut colon = -1
+		for i in pos..end {
 			if buf[i] == ':' {
 				colon = i
 				break
@@ -949,29 +958,29 @@ func chunk_trailers[S stream](c mut S, buf mut []u8, pos i64) ! {
 }
 
 // read_chunked decodes a chunked body; pending holds bytes already read.
-func read_chunked[S stream](c mut S, pending []u8, limit i64) !str {
-	buf := make([]u8, 0, len(pending)+4096)
+fn read_chunked[S stream](c mut S, pending []u8, limit_ i64) !str {
+	mut buf = make([]u8, 0, len(pending)+4096)
 	buf = append(buf, pending...)
-	out := make([]u8, 0, 4096)
-	pos := 0
+	mut out = make([]u8, 0, 4096)
+	mut pos = 0
 	for {
-		end := try chunk_line(mut c, mut buf, pos)
-		size := try chunk_size(buf, pos, end)
+		let end = try chunk_line(mut c, mut buf, pos)
+		let size = try chunk_size(buf, pos, end)
 		pos = end + 2
 		if size == 0 {
 			try chunk_trailers(mut c, mut buf, pos)
 			return str(out)
 		}
-		if size > limit-len(out) {
-			fail say.Fault("wire: response body is over the %d-byte limit", limit)
+		if size > limit_-len(out) {
+			fail say.Fault("wire: response body is over the %d-byte limit", limit_)
 		}
 		// Read at most 64 KiB at a time so the buffer grows only as data arrives.
 		for len(buf)-pos < size+2 {
-			want := size + 2 - (len(buf) - pos)
+			mut want = size + 2 - (len(buf) - pos)
 			if want > 65536 {
 				want = 65536
 			}
-			_, err := c.Read(mut buf, want)
+			let (_, err) = c.Read(mut buf, want)
 			if err != nil {
 				fail chunk_fault(err)
 			}
@@ -985,23 +994,23 @@ func read_chunked[S stream](c mut S, pending []u8, limit i64) !str {
 }
 
 // Header returns the response header name (any case), or "".
-func (r Resp) Header(name str) str {
-	h := r.head
-	i := 0
+fn (r Resp) Header(name str) str {
+	let h = r.head
+	mut i = 0
 	for i < len(h) {
-		j := i
+		mut j = i
 		for j < len(h) && h[j] != '\n' {
-			j++
+			j += 1
 		}
-		line := h[i:j]
+		mut line = h[i:j]
 		if len(line) > 0 && line[len(line)-1] == '\r' {
 			line = line[:len(line)-1]
 		}
 		if len(line) > len(name) && line[len(name)] == ':' && fold_eq(line[:len(name)], name) {
-			v := line[len(name)+1:]
-			k := 0
+			let v = line[len(name)+1:]
+			mut k = 0
 			for k < len(v) && (v[k] == ' ' || v[k] == '\t') {
-				k++
+				k += 1
 			}
 			return v[k:]
 		}
@@ -1010,13 +1019,13 @@ func (r Resp) Header(name str) str {
 	return ""
 }
 
-func fold_eq(a str, b str) bool {
+fn fold_eq(a str, b str) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	for i := 0; i < len(a); i++ {
-		x := a[i]
-		y := b[i]
+	for i in 0..len(a) {
+		mut x = a[i]
+		mut y = b[i]
 		if x >= 'A' && x <= 'Z' {
 			x += 32
 		}
@@ -1034,10 +1043,10 @@ func fold_eq(a str, b str) bool {
 
 // An effect's body runs at once, before it waits: these hand it its arguments (read at its
 // start) and hand back what it made (read as soon as it returns).
-var tapedCall i64 // the call an effect body makes (an httpCall, or a Conn for read and write)
-var tapedArg i64  // its number argument (max bytes, a dial's timeout, the bytes to write)
-var tapedLen i64  // how many bytes to write
-var tapedConn i64 // the connection a dial's body made
+mut tapedCall i64 // the call an effect body makes (an httpCall, or a Conn for read and write)
+mut tapedArg i64  // its number argument (max bytes, a dial's timeout, the bytes to write)
+mut tapedLen i64  // how many bytes to write
+mut tapedConn i64 // the connection a dial's body made
 
 // httpCall is one DoWith call, for its effect body.
 type httpCall struct {
@@ -1050,39 +1059,43 @@ type httpCall struct {
 
 // http_taped records or replays one DoWith call as wire.http@1: the key is the request (the
 // values of secret headers as handles), the result the status, the head and the body.
-func http_taped(tp i64, method str, url str, headers []str, body str, opt Options) !Resp {
-	k := make([]u8, 0, 64+len(url)+len(body))
+fn http_taped(tp i64, method str, url str, headers []str, body str, opt Options) !Resp {
+	mut k = make([]u8, 0, 64+len(url)+len(body))
 	k = append(k, method...)
 	k = append(k, ' ')
 	k = append(k, url...)
-	for i := 0; i+1 < len(headers); i += 2 {
-		k = append(k, '\n')
-		k = append(k, headers[i]...)
-		k = append(k, ": "...)
-		if rt_secret_header(headers[i]) {
-			k = append(k, rt_secret_key(headers[i+1])...)
-		} else {
-			k = append(k, headers[i+1]...)
+	{
+		mut i = 0
+		for i+1 < len(headers) {
+			k = append(k, '\n')
+			k = append(k, headers[i]...)
+			k = append(k, ": "...)
+			if rt_secret_header(headers[i]) {
+				k = append(k, rt_secret_key(headers[i+1])...)
+			} else {
+				k = append(k, headers[i+1]...)
+			}
+			i += 2
 		}
 	}
 	k = append(k, "\n\n"...)
 	k = append(k, body...)
 	tapedCall = cast(i64, httpCall{method: method, url: url, headers: headers, body: body, opt: opt})
-	v := try rt_effect(tp, "wire.http@1", str(k), http_live)
+	let v = try rt_effect(tp, "wire.http@1", str(k), http_live)
 	if len(v) < 24 {
 		fail "replay: wire.http@1 result is damaged"
 	}
-	hn := taped_word(v, 8)
+	let hn = taped_word(v, 8)
 	if 16+hn+8 > len(v) || taped_word(v, 16+hn) != len(v)-24-hn {
 		fail "replay: wire.http@1 result is damaged"
 	}
 	return Resp{Status: taped_word(v, 0), head: v[16 : 16+hn], Body: v[24+hn:]}
 }
 
-func http_live() !str {
-	call := cast(httpCall, tapedCall)
-	r := try DoWith(call.method, call.url, call.headers, call.body, call.opt)
-	b := make([]u8, 0, 24+len(r.head)+len(r.Body))
+fn http_live() !str {
+	let call = cast(httpCall, tapedCall)
+	let r = try DoWith(call.method, call.url, call.headers, call.body, call.opt)
+	mut b = make([]u8, 0, 24+len(r.head)+len(r.Body))
 	b = taped_put(b, r.Status)
 	b = taped_put(b, len(r.head))
 	b = append(b, r.head...)
@@ -1094,17 +1107,17 @@ func http_live() !str {
 // dial_taped records or replays a dial as wire.dial@1, whose result is the connection's number
 // in the request; replaying, the connection has no socket and its reads and writes come from
 // the tape.
-func dial_taped(tp i64, addr str, timeout i64) !Conn {
+fn dial_taped(tp i64, addr str, timeout i64) !Conn {
 	tapedCall = cast(i64, addr)
 	tapedArg = timeout
 	tapedConn = 0
-	v := try rt_effect(tp, "wire.dial@1", addr, dial_live)
+	let v = try rt_effect(tp, "wire.dial@1", addr, dial_live)
 	if len(v) != 8 {
 		fail "replay: wire.dial@1 result is damaged"
 	}
-	n := taped_word(v, 0)
+	let n = taped_word(v, 0)
 	if tapedConn != 0 {
-		c := cast(Conn, tapedConn)
+		let c = cast(Conn, tapedConn)
 		tapedConn = 0
 		c.tn = n
 		return c
@@ -1112,55 +1125,59 @@ func dial_taped(tp i64, addr str, timeout i64) !Conn {
 	return Conn{open: true, fd: -1, tn: n}
 }
 
-func dial_live() !str {
-	c := try DialTimeout(cast(str, tapedCall), tapedArg)
+fn dial_live() !str {
+	let c = try DialTimeout(cast(str, tapedCall), tapedArg)
 	tapedConn = cast(i64, c)
-	n := rt_tape_kinds(rt_tape_of(rt_task_current()), "wire.dial@1") + 1
+	let n = rt_tape_kinds(rt_tape_of(rt_task_current()), "wire.dial@1") + 1
 	return str(taped_put(make([]u8, 0, 8), n))
 }
 
 // read_taped records or replays one Read as wire.read@1 (key: the connection's number and max).
-func (c Conn) read_taped(tp i64, buf mut []u8, max i64) !i64 {
+fn (c Conn) read_taped(tp i64, buf mut []u8, max i64) !i64 {
 	tapedCall = cast(i64, c)
 	tapedArg = max
-	v := try rt_effect(tp, "wire.read@1", rt_i64str(c.tn) + " " + rt_i64str(max), read_live)
+	let v = try rt_effect(tp, "wire.read@1", rt_i64str(c.tn) + " " + rt_i64str(max), read_live)
 	buf = append(buf, v...)
 	return len(v)
 }
 
-func read_live() !str {
-	c := cast(Conn, tapedCall)
-	b := make([]u8, 0, tapedArg)
+fn read_live() !str {
+	let c = cast(Conn, tapedCall)
+	let b = make([]u8, 0, tapedArg)
 	_ = try c.Read(mut b, tapedArg)
 	return str(b)
 }
 
 // write_taped records or replays one write as wire.write@1 (key: the connection's number and
 // the bytes).
-func (c Conn) write_taped(tp i64, p i64, n i64) ! {
+fn (c Conn) write_taped(tp i64, p i64, n i64) ! {
 	tapedCall = cast(i64, c)
 	tapedArg = p
 	tapedLen = n
 	_ = try rt_effect(tp, "wire.write@1", rt_i64str(c.tn) + " " + rt_str_from_raw(p, n), write_live)
 }
 
-func write_live() !str {
-	c := cast(Conn, tapedCall)
+fn write_live() !str {
+	let c = cast(Conn, tapedCall)
 	try c.write_raw(tapedArg, tapedLen)
 	return ""
 }
 
-func taped_put(b []u8, v i64) []u8 {
-	for i := 0; i < 8; i++ {
+fn taped_put(b []u8, v i64) []u8 {
+	for i in 0..8 {
 		b = append(b, u8(v >> (8 * i)))
 	}
 	return b
 }
 
-func taped_word(s str, at i64) i64 {
-	v := 0
-	for i := 7; i >= 0; i-- {
-		v = v<<8 | i64(s[at+i])
+fn taped_word(s str, at i64) i64 {
+	mut v = 0
+	{
+		mut i = 7
+		for i >= 0 {
+			v = v<<8 | i64(s[at+i])
+			i -= 1
+		}
 	}
 	return v
 }

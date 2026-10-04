@@ -2,73 +2,73 @@ package syscallprobe
 
 import "say"
 
-var seen i64
-var onAlt bool
-var alt i64
-shared var turn i64
+mut seen i64
+mut onAlt bool
+mut alt i64
+shared mut turn i64
 
-func handler(sig i64) {
-    seen++
+fn handler(sig i64) {
+    seen += 1
     // A leaf can retain the interrupted frame pointer; inspect its actual local stack.
-    marker := sig
-    here := cast(i64,&marker)
+    let marker = sig
+    let here = cast(i64,&marker)
     onAlt = here >= alt && here < alt+65536
 }
 
 // Run checks kernel errors, mapping boundaries, signal return and directory refills.
-func Run(path str) {
-    closeResult := rt_sys_close(-1)
+fn Run(path str) {
+    let closeResult = rt_sys_close(-1)
     say.Line("close", closeResult, rt_errno())
-    p := rt_sys_mmap(0,0,3,MAP_STACK,-1,0)
+    mut p = rt_sys_mmap(0,0,3,MAP_STACK,-1,0)
     say.Line("map error", p, rt_errno())
     p = mem_map(rt_page_size(),MAP_STACK)
     store8(p,71)
     store8(p+rt_page_size()-1,91)
     say.Line("mapping", load8(p), load8(p+rt_page_size()-1), rt_sys_munmap(p,rt_page_size()))
     say.Line("poll", rt_sys_poll(0,0,0), rt_sys_poll(0,0,1))
-    ts := calloc(2,8)
+    let ts = calloc(2,8)
     rt_sys_clock_gettime(0,ts)
-    wall := ts[0]>1600000000
-    mono := rt_mono_ns()
-    ordered := rt_mono_ns()>=mono
-    saved := rtVdsoClock
+    let wall = ts[0]>1600000000
+    let mono = rt_mono_ns()
+    let ordered = rt_mono_ns()>=mono
+    let saved = rtVdsoClock
     rtVdsoClock = 0
-    fallback := rt_mono_ns()>=mono
+    let fallback = rt_mono_ns()>=mono
     rt_sys_clock_gettime(-1,ts)
     say.Line("clock",wall,ordered,rt_errno(),fallback,saved != 0)
     rtVdsoClock = saved
     free(ts)
-    st := calloc(1,256)
-    file := path+"/file"
+    let st = calloc(1,256)
+    let file = path+"/file"
     say.Line("stat", rt_sys_stat(rt_cstr(file),st), rt_stat_size(st), rt_stat_mtime(st)>1600000000, linux_stat_type(st))
     free(st)
-    d := rt_sys_opendir(rt_cstr(path))
+    let d = rt_sys_opendir(rt_cstr(path))
     if d == 0 { panic("opendir") }
-    count := 0
-    bytes := 0
-    kinds := 0
+    mut count = 0
+    mut bytes = 0
+    mut kinds = 0
     for {
-        ent := rt_sys_readdir(d)
+        let ent = rt_sys_readdir(d)
         if ent == 0 { break }
-        name := rt_dirent_name(ent)
+        let name = rt_dirent_name(ent)
         if name == "." || name == ".." { continue }
         // Force DT_UNKNOWN through the same fallback used for such filesystems.
         store8(ent+18,0)
         linux_dir_type(d,ent)
-        count++
+        count += 1
         bytes += len(name)
         kinds += i64(load8(ent+18))
     }
     say.Line("directory",count,bytes,kinds,rt_dir_error(d))
     rt_sys_closedir(d)
     // Install a returning handler on a temporary alternate stack, then restore both.
-    oldStack := calloc(1,32)
-    stack := calloc(1,32)
+    let oldStack = calloc(1,32)
+    let stack = calloc(1,32)
     alt = mem_map(65536,MAP_STACK)
     rt_stack_t(stack,alt,65536)
     if rt_sys_sigaltstack(stack,oldStack) != 0 { panic("sigaltstack") }
-    act := calloc(4,8)
-    old := calloc(4,8)
+    let act = calloc(4,8)
+    let old = calloc(4,8)
     act[0] = cast(i64,handler)
     act[1] = 0x0c000004
     act[2] = linux_restorer_ptr()
@@ -84,7 +84,7 @@ func Run(path str) {
 }
 
 // Core checks that one kernel thread's failed syscall cannot replace another's error.
-func Core(id i64) {
+fn Core(id i64) {
     if id == 0 {
         rt_sys_close(-1)
         __atomic_store(&turn,1)

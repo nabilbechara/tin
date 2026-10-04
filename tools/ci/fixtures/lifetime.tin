@@ -6,14 +6,14 @@ import "say"
 import "tide"
 import "websocket"
 
-var saved str
+mut saved str
 
-func delayed(s str, ms i64) str {
-	tide.Wait(ms * tide.Millisecond) catch _ { return "timeout" }
+fn delayed(s str, ms i64) str {
+	tide.Wait(ms * 1ms) catch _ { return "timeout" }
 	return s
 }
 
-func echo(ws websocket.Conn, m websocket.Message) ! {
+fn echo(ws websocket.Conn, m websocket.Message) ! {
 	websocket.ProbeScopeResource()
 	if websocket.ProbePoolUsed() > len(m.Data)*2+65536 {
 		panic("message allocations accumulated")
@@ -25,7 +25,7 @@ func echo(ws websocket.Conn, m websocket.Message) ! {
 		saved = keep(m.Data)
 	}
 	if m.Text && m.Data == "wait" {
-		try tide.Wait(5 * tide.Millisecond)
+		try tide.Wait(5ms)
 	}
 	if m.Text {
 		try ws.WriteText(m.Data)
@@ -34,7 +34,7 @@ func echo(ws websocket.Conn, m websocket.Message) ! {
 	}
 }
 
-func handle(q anvil.Req, w mut anvil.Out) {
+fn handle(q anvil.Req, w mut anvil.Out) {
 	if q.Path == "/a" {
 		w.Text(say.Fmt("A:%s", delayed(q.Path, 100)))
 		return
@@ -44,16 +44,16 @@ func handle(q anvil.Req, w mut anvil.Out) {
 		return
 	}
 	if q.Path == "/file" || q.Path == "/write" {
-		path := quarry.Getenv("REVIEW_DIR") + "/" + q.Param("name")
+		let path = quarry.Getenv("REVIEW_DIR") + "/" + q.Param("name")
 		if q.Path == "/file" {
-			data := quarry.ReadFile(path) catch e {
+			let data = quarry.ReadFile(path) catch e {
 				w.Status(504)
 				w.Text(say.Str(e))
 				return
 			}
 			w.Text(data)
 		} else {
-			data := q.Param("data")
+			let data = q.Param("data")
 			quarry.WriteFile(path, "owned:{data}") catch e {
 				w.Status(504)
 				w.Text(say.Str(e))
@@ -64,24 +64,24 @@ func handle(q anvil.Req, w mut anvil.Out) {
 		return
 	}
 	if q.Path == "/ws" || q.Path == "/raw" || q.Path == "/close" {
-		ws := websocket.ProbeAccept(q, mut w) catch _ { return }
+		let ws = websocket.ProbeAccept(q, mut w) catch _ { return }
 		if q.Path == "/close" {
 			ws.Close()
 			ws.Close()
-			_, e := ws.Read()
+			let (_, e) = ws.Read()
 			if e == nil || !websocket.IsClosed(e) {
 				panic("Read after Close did not report closure")
 			}
 			return
 		}
 		if q.Path == "/raw" {
-			first := ws.Read() catch _ { return }
-			second := ws.Read() catch _ { return }
+			let first = ws.Read() catch _ { return }
+			let second = ws.Read() catch _ { return }
 			ws.WriteText("{first.Data}|{second.Data}") catch _ {}
 			return
 		}
-		before := "outer:" + q.Path
-		err := ws.Each(echo)
+		let before = "outer:" + q.Path
+		let err = ws.Each(echo)
 		if err != nil && !websocket.IsClosed(err) {
 			ws.WriteText("{before}|{err}") catch _ {}
 		}
@@ -94,7 +94,7 @@ func handle(q anvil.Req, w mut anvil.Out) {
 	w.Text("healthy")
 }
 
-func main() {
-	err := anvil.Serve(":0", handle)
+fn main() {
+	let err = anvil.Serve(":0", handle)
 	say.Line(err)
 }

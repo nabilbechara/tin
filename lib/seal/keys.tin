@@ -34,59 +34,59 @@ type PrivateKey struct {
 }
 
 // keys_rsa_pkcs1 parses an RSAPrivateKey (PKCS #1): two primes only.
-func keys_rsa_pkcs1(der []u8, from i64, to i64) !RSAPrivateKey {
-	sf, st := try der_expect(der, from, to, derSequence, "an RSA private key")
+fn keys_rsa_pkcs1(der []u8, from i64, to i64) !RSAPrivateKey {
+	let (sf, st) = try der_expect(der, from, to, derSequence, "an RSA private key")
 	if st != to {
 		fail "seal: trailing data after the RSA private key"
 	}
-	ver, p := try der_small_int(der, sf, st)
+	mut (ver, p) = try der_small_int(der, sf, st)
 	if ver != 0 {
 		fail "seal: multi-prime RSA keys are not supported"
 	}
-	vals := [][]u8{}
-	for i := 0; i < 8; i++ {
-		v, next := try der_posint(der, p, st)
+	mut vals = [][]u8{}
+	for i in 0..8 {
+		let (v, next) = try der_posint(der, p, st)
 		vals = append(vals, v)
 		p = next
 	}
 	if p != st {
 		fail "seal: trailing data in the RSA private key"
 	}
-	key := RSAPublicKey{N: vals[0], E: vals[1]}
-	bits := RSAKeyBits(key)
+	let key = RSAPublicKey{N: vals[0], E: vals[1]}
+	let bits = RSAKeyBits(key)
 	if bits < 2048 || bits > 8192 {
 		fail say.Fault("seal: RSA key size %d is not supported (2048 to 8192 bits)", bits)
 	}
-	fp := try monty_new(vals[3])
-	fq := try monty_new(vals[4])
-	fnm := try monty_new(vals[0])
-	k := RSAPrivateKey{Public: key, p: vals[3], q: vals[4], dp: monty_bytes(fp, vals[5]), dq: monty_bytes(fq, vals[6]),
+	let fp = try monty_new(vals[3])
+	let fq = try monty_new(vals[4])
+	let fnm = try monty_new(vals[0])
+	let k = RSAPrivateKey{Public: key, p: vals[3], q: vals[4], dp: monty_bytes(fp, vals[5]), dq: monty_bytes(fq, vals[6]),
 		qinv: vals[7], fp: fp, fq: fq, fnm: fnm}
 	try rsa_check_private(mut k)
 	return k
 }
 
 // rsa_check_private checks that p*q = n and that a test signature verifies.
-func rsa_check_private(k mut RSAPrivateKey) ! {
-	pl := nat_from_be(k.p, k.fp.n)
-	ql := nat_from_be(k.q, k.fq.n)
-	prod := nat_mul_ct(pl, ql)
-	nl := nat_from_be(k.Public.N, len(prod))
+fn rsa_check_private(k mut RSAPrivateKey) ! {
+	let pl = nat_from_be(k.p, k.fp.n)
+	let ql = nat_from_be(k.q, k.fq.n)
+	let prod = nat_mul_ct(pl, ql)
+	let nl = nat_from_be(k.Public.N, len(prod))
 	if !nat_eq(prod, nl) {
 		fail "seal: RSA private key: p*q is not n"
 	}
-	digest := Sha256("seal: RSA private key check")
-	sig := try SignPKCS1v15(mut k, Hash.SHA256, digest)
+	let digest = Sha256("seal: RSA private key check")
+	let sig = try SignPKCS1v15(mut k, Hash.SHA256, digest)
 	VerifyPKCS1v15(k.Public, Hash.SHA256, digest, sig) catch err {
 		fail say.Fault("seal: RSA private key does not match its public key (%s)", err)
 	}
 }
 
 // nat_from_be reads big-endian b into n little-endian 32-bit limbs (b must fit).
-func nat_from_be(b secret []u8, n i64) []u64 {
-	out := make([]u64, n)
-	for i := 0; i < len(b); i++ {
-		k := len(b) - 1 - i
+fn nat_from_be(b secret []u8, n i64) []u64 {
+	let out = make([]u64, n)
+	for i in 0..len(b) {
+		let k = len(b) - 1 - i
 		if k/4 < n {
 			out[k/4] |= u64(b[i]) << u64(8*(k%4))
 		}
@@ -95,26 +95,26 @@ func nat_from_be(b secret []u8, n i64) []u64 {
 }
 
 // keys_ec parses an ECPrivateKey (SEC 1); curve is the curve the PKCS #8 wrapper named, or "".
-func keys_ec(der []u8, from i64, to i64, curve str) !ECPrivateKey {
-	sf, st := try der_expect(der, from, to, derSequence, "an EC private key")
+fn keys_ec(der []u8, from i64, to i64, curve str) !ECPrivateKey {
+	let (sf, st) = try der_expect(der, from, to, derSequence, "an EC private key")
 	if st != to {
 		fail "seal: trailing data after the EC private key"
 	}
-	ver, p := try der_small_int(der, sf, st)
+	mut (ver, p) = try der_small_int(der, sf, st)
 	if ver != 1 {
 		fail "seal: bad EC private key version"
 	}
-	df, dt := try der_expect(der, p, st, derOctetString, "the private scalar")
+	let (df, dt) = try der_expect(der, p, st, derOctetString, "the private scalar")
 	p = dt
-	named := curve
-	pub := []u8{}
+	mut named = curve
+	mut pub = []u8{}
 	if p < st && der[p] == 0xa0 {
-		_, cf, ct := try der_read(der, p, st)
-		oid, end := try der_oid(der, cf, ct)
+		let (_, cf, ct) = try der_read(der, p, st)
+		let (oid, end) = try der_oid(der, cf, ct)
 		if end != ct {
 			fail "seal: bad EC private key parameters"
 		}
-		c := ""
+		mut c = ""
 		if oid == oidP256 {
 			c = "P-256"
 		} else if oid == oidP384 {
@@ -129,8 +129,8 @@ func keys_ec(der []u8, from i64, to i64, curve str) !ECPrivateKey {
 		p = ct
 	}
 	if p < st && der[p] == 0xa1 {
-		_, bf, bt := try der_read(der, p, st)
-		bits, end := try der_bits(der, bf, bt)
+		let (_, bf, bt) = try der_read(der, p, st)
+		let (bits, end) = try der_bits(der, bf, bt)
 		if end != bt {
 			fail "seal: bad EC public key in the private key"
 		}
@@ -143,26 +143,26 @@ func keys_ec(der []u8, from i64, to i64, curve str) !ECPrivateKey {
 	if named == "" {
 		fail "seal: EC private key without a curve"
 	}
-	size := 32
+	mut size = 32
 	if named == "P-384" {
 		size = 48
 	}
 	if dt-df != size {
 		fail "seal: EC private scalar has the wrong length"
 	}
-	d := der[df:dt]
-	computed := try ec_public(named, d)
+	let d = der[df:dt]
+	let computed = try ec_public(named, d)
 	if len(pub) > 0 && !nat_bytes_eq(pub, computed) {
 		fail "seal: EC private key does not match its public key"
 	}
 	return ECPrivateKey{Curve: named, Public: computed, d: d}
 }
 
-func nat_bytes_eq(a []u8, b []u8) bool {
+fn nat_bytes_eq(a []u8, b []u8) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	for i := 0; i < len(a); i++ {
+	for i in 0..len(a) {
 		if a[i] != b[i] {
 			return false
 		}
@@ -171,28 +171,28 @@ func nat_bytes_eq(a []u8, b []u8) bool {
 }
 
 // ParsePrivateKeyDER reads a PKCS #8 PrivateKeyInfo, a PKCS #1 RSAPrivateKey or a SEC 1 ECPrivateKey.
-func ParsePrivateKeyDER(der []u8) !PrivateKey {
-	sf, st := try der_expect(der, 0, len(der), derSequence, "a private key")
+fn ParsePrivateKeyDER(der []u8) !PrivateKey {
+	let (sf, st) = try der_expect(der, 0, len(der), derSequence, "a private key")
 	if st != len(der) {
 		fail "seal: trailing data after the private key"
 	}
-	_, p := try der_small_int(der, sf, st)
-	tag, _, _ := try der_read(der, p, st)
+	mut (_, p) = try der_small_int(der, sf, st)
+	let (tag, _, _) = try der_read(der, p, st)
 	if tag == derSequence {
 		// PKCS #8: version, algorithm, OCTET STRING with the key.
-		af, at := try der_expect(der, p, st, derSequence, "an algorithm identifier")
-		oid, q := try der_oid(der, af, at)
-		kf, kt := try der_expect(der, at, st, derOctetString, "the private key")
+		let (af, at) = try der_expect(der, p, st, derSequence, "an algorithm identifier")
+		let (oid, q) = try der_oid(der, af, at)
+		let (kf, kt) = try der_expect(der, at, st, derOctetString, "the private key")
 		if oid == oidRSA {
-			k := try keys_rsa_pkcs1(der, kf, kt)
+			let k = try keys_rsa_pkcs1(der, kf, kt)
 			return PrivateKey{Algorithm: PublicKeyAlgorithm.RSA, RSA: k}
 		}
 		if oid == oidECPublicKey {
-			curve, end := try der_oid(der, q, at)
+			let (curve, end) = try der_oid(der, q, at)
 			if end != at {
 				fail "seal: bad EC key parameters"
 			}
-			c := ""
+			mut c = ""
 			if curve == oidP256 {
 				c = "P-256"
 			} else if curve == oidP384 {
@@ -200,23 +200,23 @@ func ParsePrivateKeyDER(der []u8) !PrivateKey {
 			} else {
 				fail "seal: unsupported curve " + curve
 			}
-			k := try keys_ec(der, kf, kt, c)
+			let k = try keys_ec(der, kf, kt, c)
 			return PrivateKey{Algorithm: PublicKeyAlgorithm.ECDSA, EC: k}
 		}
 		fail "seal: unsupported private key algorithm " + oid
 	}
 	if tag == derOctetString {
-		k := try keys_ec(der, 0, len(der), "")
+		let k = try keys_ec(der, 0, len(der), "")
 		return PrivateKey{Algorithm: PublicKeyAlgorithm.ECDSA, EC: k}
 	}
-	k := try keys_rsa_pkcs1(der, 0, len(der))
+	let k = try keys_rsa_pkcs1(der, 0, len(der))
 	return PrivateKey{Algorithm: PublicKeyAlgorithm.RSA, RSA: k}
 }
 
 // ParsePrivateKeyPEM reads the first "PRIVATE KEY", "RSA PRIVATE KEY" or "EC PRIVATE KEY" block of pem.
-func ParsePrivateKeyPEM(pem str) !PrivateKey {
-	blocks := try DecodePEM(pem)
-	for _, b := range blocks {
+fn ParsePrivateKeyPEM(pem str) !PrivateKey {
+	let blocks = try DecodePEM(pem)
+	for _, b in blocks {
 		if b.Type == "PRIVATE KEY" || b.Type == "RSA PRIVATE KEY" || b.Type == "EC PRIVATE KEY" {
 			return try ParsePrivateKeyDER(b.Bytes)
 		}
@@ -228,12 +228,12 @@ func ParsePrivateKeyPEM(pem str) !PrivateKey {
 }
 
 // MatchesCertificate reports whether k is the private key of c's public key.
-func (k PrivateKey) MatchesCertificate(c Certificate) bool {
-	r := k.RSA
+fn (k PrivateKey) MatchesCertificate(c Certificate) bool {
+	let r = k.RSA
 	if r != nil {
 		return c.PublicKeyAlgorithm == PublicKeyAlgorithm.RSA && nat_bytes_eq(r.Public.N, c.RSAKey.N) && nat_bytes_eq(r.Public.E, c.RSAKey.E)
 	}
-	e := k.EC
+	let e = k.EC
 	if e != nil {
 		return c.PublicKeyAlgorithm == PublicKeyAlgorithm.ECDSA && c.Curve == e.Curve && nat_bytes_eq(e.Public, c.PublicKey)
 	}

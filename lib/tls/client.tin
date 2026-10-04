@@ -14,7 +14,7 @@ type hello struct {
 	raw     []u8 // a ClientHello to send as is (tests only; empty: build one)
 }
 
-func new_hello() hello {
+fn new_hello() hello {
 	return hello{random: seal.RandomBytes(32), session: seal.RandomBytes(32), x25519: seal.X25519NewPrivateKey(), raw: []u8{}}
 }
 
@@ -24,21 +24,21 @@ type hsReader struct {
 }
 
 // next returns the next handshake message (header and body) of the server's flight.
-func (h mut hsReader) next(c mut Conn) !(i64, []u8) {
+fn (h mut hsReader) next(c mut Conn) !(i64, []u8) {
 	for {
 		if len(h.buf) >= 4 {
-			n := i64(h.buf[1])<<16 | i64(h.buf[2])<<8 | i64(h.buf[3])
+			let n = i64(h.buf[1])<<16 | i64(h.buf[2])<<8 | i64(h.buf[3])
 			if n > 262144 {
 				fail alert_fault(alertDecodeError, "handshake message too large")
 			}
 			if len(h.buf) >= 4+n {
-				msg := clone(h.buf[:4+n])
-				rest := clone(h.buf[4+n:])
+				let msg = clone(h.buf[:4+n])
+				let rest = clone(h.buf[4+n:])
 				h.buf = rest
 				return i64(msg[0]), msg
 			}
 		}
-		typ, data := try c.read_record()
+		let (typ, data) = try c.read_record()
 		if typ == ctAlert {
 			try handle_alert(data)
 			fail "tls: handshake ended by close_notify"
@@ -55,12 +55,12 @@ func (h mut hsReader) next(c mut Conn) !(i64, []u8) {
 }
 
 // empty is true when no partial message is buffered (keys may change only then).
-func (h hsReader) empty() bool {
+fn (h hsReader) empty() bool {
 	return len(h.buf) == 0
 }
 
 // handle_alert fails with the peer's alert, or returns for close_notify.
-func handle_alert(data []u8) ! {
+fn handle_alert(data []u8) ! {
 	if len(data) != 2 {
 		fail alert_fault(alertDecodeError, "malformed alert")
 	}
@@ -71,24 +71,24 @@ func handle_alert(data []u8) ! {
 }
 
 // handshake runs the client side on c (a fresh connection) for server name name.
-func (c mut Conn) handshake(cfg Config, name str, hi hello) ! {
-	offered := suites()
-	group := groupX25519
-	priv := hi.x25519
-	share := try seal.X25519PublicKey(priv)
-	ch := hi.raw
+fn (c mut Conn) handshake(cfg Config, name str, hi hello) ! {
+	let offered = suites()
+	mut group = groupX25519
+	mut priv = hi.x25519
+	mut share = try seal.X25519PublicKey(priv)
+	mut ch = hi.raw
 	if len(ch) == 0 {
 		ch = client_hello(hi.random, hi.session, offered, name, cfg.ALPN, group, share, []u8{})
 	}
-	transcript := clone(ch)
+	mut transcript = clone(ch)
 	try c.write_records(ctHandshake, ch)
-	hr := hsReader{buf: []u8{}}
-	typ, msg := try hr.next(mut c)
+	let hr = hsReader{buf: []u8{}}
+	mut (typ, msg) = try hr.next(mut c)
 	if typ != hsServerHello {
 		fail alert_fault(alertUnexpectedMessage, "expected ServerHello")
 	}
-	sh := try parse_server_hello(msg[4:], hi.session)
-	retried := false
+	mut sh = try parse_server_hello(msg[4:], hi.session)
+	mut retried = false
 	if sh.retry {
 		// HelloRetryRequest: answer once with a key share for the group the server asked for.
 		if !in_list(offered, sh.suite) {
@@ -100,18 +100,18 @@ func (c mut Conn) handshake(cfg Config, name str, hi hello) ! {
 		if len(hi.raw) != 0 {
 			fail alert_fault(alertInternalError, "a fixed ClientHello cannot be retried")
 		}
-		h := suite_hash(sh.suite)
+		let h = suite_hash(sh.suite)
 		// The transcript restarts with message_hash(ClientHello1), then the retry request.
-		first := handshake_msg(hsMessageHash, transcript_hash(h, transcript))
+		let first = handshake_msg(hsMessageHash, transcript_hash(h, transcript))
 		transcript = cat(first, msg)
 		group = groupP256
 		priv = seal.P256NewPrivateKey()
 		share = try seal.P256PublicKey(priv)
-		ch2 := client_hello(hi.random, hi.session, offered, name, cfg.ALPN, group, share, sh.cookie)
+		let ch2 = client_hello(hi.random, hi.session, offered, name, cfg.ALPN, group, share, sh.cookie)
 		transcript = cat(transcript, ch2)
 		try c.write_records(ctHandshake, ch2)
 		retried = true
-		suite := sh.suite
+		let suite = sh.suite
 		typ, msg = try hr.next(mut c)
 		if typ != hsServerHello {
 			fail alert_fault(alertUnexpectedMessage, "expected ServerHello")
@@ -133,24 +133,24 @@ func (c mut Conn) handshake(cfg Config, name str, hi hello) ! {
 	transcript = cat(transcript, msg)
 	c.suite = sh.suite
 	c.hash = suite_hash(sh.suite)
-	h := c.hash
-	shared := []u8{}
+	let h = c.hash
+	mut shared_ = []u8{}
 	if group == groupX25519 {
-		shared = seal.X25519(priv, sh.share) catch _ {
+		shared_ = seal.X25519(priv, sh.share) catch _ {
 			fail alert_fault(alertIllegalParameter, "invalid X25519 key share")
 		}
 	} else {
 		if len(sh.share) != 65 || sh.share[0] != 4 {
 			fail alert_fault(alertIllegalParameter, "invalid P-256 key share")
 		}
-		shared = seal.P256ECDH(priv, sh.share) catch _ {
+		shared_ = seal.P256ECDH(priv, sh.share) catch _ {
 			fail alert_fault(alertIllegalParameter, "invalid P-256 key share")
 		}
 	}
 	if !hr.empty() {
 		fail alert_fault(alertUnexpectedMessage, "handshake data before a key change")
 	}
-	sc := try handshake_secrets(h, shared, transcript_hash(h, transcript))
+	let sc = try handshake_secrets(h, shared_, transcript_hash(h, transcript))
 	try c.set_read_key(sc.shs)
 	try c.set_write_key(sc.chs)
 	// The server's encrypted flight.
@@ -161,8 +161,8 @@ func (c mut Conn) handshake(cfg Config, name str, hi hello) ! {
 	c.alpn = try parse_encrypted_extensions(msg[4:], cfg.ALPN, hello_extensions(ch))
 	transcript = cat(transcript, msg)
 	typ, msg = try hr.next(mut c)
-	requested := false
-	reqctx := []u8{}
+	mut requested = false
+	mut reqctx = []u8{}
 	if typ == hsCertificateRequest {
 		reqctx = try parse_certificate_request(msg[4:])
 		requested = true
@@ -172,15 +172,15 @@ func (c mut Conn) handshake(cfg Config, name str, hi hello) ! {
 	if typ != hsCertificate {
 		fail alert_fault(alertUnexpectedMessage, "expected Certificate")
 	}
-	certs := try parse_certificate(msg[4:])
+	let certs = try parse_certificate(msg[4:])
 	transcript = cat(transcript, msg)
 	typ, msg = try hr.next(mut c)
 	if typ != hsCertificateVerify {
 		fail alert_fault(alertUnexpectedMessage, "expected CertificateVerify")
 	}
-	cv := rdr{b: msg[4:]}
-	scheme := cv.u16v()
-	sig := cv.vec16()
+	let cv = rdr{b: msg[4:]}
+	let scheme = cv.u16v()
+	let sig = cv.vec16()
 	if cv.bad || !cv.done() {
 		fail alert_fault(alertDecodeError, "malformed CertificateVerify")
 	}
@@ -194,7 +194,7 @@ func (c mut Conn) handshake(cfg Config, name str, hi hello) ! {
 	if typ != hsFinished {
 		fail alert_fault(alertUnexpectedMessage, "expected Finished")
 	}
-	want := try finished_mac(h, sc.shs, transcript_hash(h, transcript))
+	let want = try finished_mac(h, sc.shs, transcript_hash(h, transcript))
 	if !seal.ConstantTimeEq(want, msg[4:]) {
 		fail alert_fault(alertDecryptError, "server Finished does not verify")
 	}
@@ -202,23 +202,23 @@ func (c mut Conn) handshake(cfg Config, name str, hi hello) ! {
 	if !hr.empty() {
 		fail alert_fault(alertUnexpectedMessage, "handshake data after the server Finished")
 	}
-	thash := transcript_hash(h, transcript)
-	cats := try derive_secret(h, sc.master, "c ap traffic", thash)
-	sap := try derive_secret(h, sc.master, "s ap traffic", thash)
+	let thash = transcript_hash(h, transcript)
+	let cats = try derive_secret(h, sc.master, "c ap traffic", thash)
+	let sap = try derive_secret(h, sc.master, "s ap traffic", thash)
 	try c.set_read_key(sap)
 	// The client's flight under its handshake keys: an empty Certificate if one was asked
 	// for (this client has none), then Finished.
-	flight := []u8{}
+	mut flight = []u8{}
 	if requested {
-		body := make([]u8, 0, 8)
+		mut body = make([]u8, 0, 8)
 		body = append(body, u8(len(reqctx)))
 		body = append(body, reqctx...)
 		body = append(body, 0, 0, 0)
-		cm := handshake_msg(hsCertificate, body)
+		let cm = handshake_msg(hsCertificate, body)
 		flight = cat(flight, cm)
 		transcript = cat(transcript, cm)
 	}
-	fin := try finished_mac(h, sc.chs, transcript_hash(h, transcript))
+	let fin = try finished_mac(h, sc.chs, transcript_hash(h, transcript))
 	flight = cat(flight, handshake_msg(hsFinished, fin))
 	try c.write_records(ctHandshake, flight)
 	try c.set_write_key(cats)
@@ -227,8 +227,8 @@ func (c mut Conn) handshake(cfg Config, name str, hi hello) ! {
 	c.ready = true
 }
 
-func in_list(xs []i64, v i64) bool {
-	for _, x := range xs {
+fn in_list(xs []i64, v i64) bool {
+	for _, x in xs {
 		if x == v {
 			return true
 		}

@@ -21,9 +21,9 @@ type User struct {
 	created str
 }
 
-var cache = redis.Open(redis.Options{Addr: quarry.Getenv("REDIS_ADDR")})
+let cache = redis.Open(redis.Options{Addr: quarry.Getenv("REDIS_ADDR")})
 
-var db = mysql.Open(mysql.Options{
+let db = mysql.Open(mysql.Options{
 	Addr:     quarry.Getenv("MYSQL_ADDR"),
 	User:     quarry.Getenv("MYSQL_USER"),
 	Password: quarry.Getenv("MYSQL_PASSWORD"),
@@ -31,32 +31,32 @@ var db = mysql.Open(mysql.Options{
 	Pool:     16,
 })
 
-func upstream(w mut anvil.Out, err fault) {
+fn upstream(w mut anvil.Out, err fault) {
 	w.Status(502)
 	w.Text("{err}")
 }
 
 // from_db reads user id from MySQL and returns it as JSON ("" when there is none).
-func from_db(id i64) !str {
-	rows := try db.Query("SELECT id, name, email, score, created FROM users WHERE id = {id}")
+fn from_db(id i64) !str {
+	let rows = try db.Query("SELECT id, name, email, score, created FROM users WHERE id = {id}")
 	if len(rows.Rows) == 0 {
 		return ""
 	}
-	r := rows.Rows[0]
-	b := make([]u8, 0, 256)
+	let r = rows.Rows[0]
+	let b = make([]u8, 0, 256)
 	argo.Put(mut b, User{id: r[0].Int(), name: r[1].Text(), email: r[2].Text(), score: r[3].Float(), created: r[4].Text()})
 	return str(b)
 }
 
-func user(q anvil.Req, w mut anvil.Out, cached bool) {
-	id := mint.Atoi(q.PathParam("id")) catch _ {
+fn user(q anvil.Req, w mut anvil.Out, cached bool) {
+	let id = mint.Atoi(q.PathParam("id")) catch _ {
 		w.Status(404)
 		w.Text("no such user")
 		return
 	}
-	key := "user:{id}"
+	let key = "user:{id}"
 	if cached {
-		v, found := cache.Get(key) catch err {
+		let (v, found) = cache.Get(key) catch err {
 			upstream(mut w, err)
 			return
 		}
@@ -66,7 +66,7 @@ func user(q anvil.Req, w mut anvil.Out, cached bool) {
 			return
 		}
 	}
-	body := from_db(id) catch err {
+	let body = from_db(id) catch err {
 		upstream(mut w, err)
 		return
 	}
@@ -76,7 +76,7 @@ func user(q anvil.Req, w mut anvil.Out, cached bool) {
 		return
 	}
 	if cached {
-		cache.SetEx(key, body, 60*tide.Second) catch err {
+		cache.SetEx(key, body, 60s) catch err {
 			upstream(mut w, err)
 			return
 		}
@@ -85,24 +85,24 @@ func user(q anvil.Req, w mut anvil.Out, cached bool) {
 	w.Text(body)
 }
 
-func cached_user(q anvil.Req, w mut anvil.Out) {
+fn cached_user(q anvil.Req, w mut anvil.Out) {
 	user(q, mut w, true)
 }
 
-func db_user(q anvil.Req, w mut anvil.Out) {
+fn db_user(q anvil.Req, w mut anvil.Out) {
 	user(q, mut w, false)
 }
 
-func slow(q anvil.Req, w mut anvil.Out) {
-	tide.Wait(50 * tide.Millisecond) catch _ {}
+fn slow(q anvil.Req, w mut anvil.Out) {
+	tide.Wait(50ms) catch _ {}
 	w.Text("slow")
 }
 
-func main() {
-	r := anvil.NewRouter()
+fn main() {
+	let r = anvil.NewRouter()
 	r.Get(`/users/{id}`, cached_user)
 	r.Get(`/db/users/{id}`, db_user)
 	r.Get("/slow", slow)
-	err := r.Serve(":9190")
+	let err = r.Serve(":9190")
 	say.Line("server:", err)
 }

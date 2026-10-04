@@ -13,42 +13,42 @@ import "say"
 //   GET /set?key=K&value=V   stores V at K
 //   GET /twice?key=K         adds two to K in one MULTI/EXEC
 //   GET /sleep?ms=N          makes the server pause (DEBUG SLEEP)
-var c = redis.Open(options())
+let c = redis.Open(options())
 
 // options reads REDIS_URL, or REDIS_ADDR and REDIS_PASSWORD. REDIS_TLS_INSECURE=1 skips the
 // certificate check (tests against a self-signed server only).
-func options() redis.Options {
-	url := quarry.Getenv("REDIS_URL")
+fn options() redis.Options {
+	let url = quarry.Getenv("REDIS_URL")
 	if url == "" {
 		return redis.Options{Addr: quarry.Getenv("REDIS_ADDR"), Password: quarry.Getenv("REDIS_PASSWORD")}
 	}
-	o := redis.ParseURL(url) catch err {
+	let o = redis.ParseURL(url) catch err {
 		say.Line("REDIS_URL:", err)
 		return redis.Options{Addr: "", Password: ""}
 	}
-	t := o.TLS
+	let t = o.TLS
 	if t != nil && quarry.Getenv("REDIS_TLS_INSECURE") == "1" {
 		t.InsecureSkipVerify = true
 	}
 	return o
 }
 
-func upstream(w mut anvil.Out, err fault) {
+fn upstream(w mut anvil.Out, err fault) {
 	w.Status(502)
 	w.Text("{err}")
 }
 
-func incr(q anvil.Req, w mut anvil.Out) {
-	n := c.Incr(q.Param("key")) catch err {
+fn incr(q anvil.Req, w mut anvil.Out) {
+	let n = c.Incr(q.Param("key")) catch err {
 		upstream(mut w, err)
 		return
 	}
 	w.Text("{n}")
 }
 
-func get(q anvil.Req, w mut anvil.Out) {
-	key := q.Param("key")
-	v, found := c.Get(key) catch err {
+fn get(q anvil.Req, w mut anvil.Out) {
+	let key = q.Param("key")
+	let (v, found) = c.Get(key) catch err {
 		upstream(mut w, err)
 		return
 	}
@@ -60,7 +60,7 @@ func get(q anvil.Req, w mut anvil.Out) {
 	w.Text(v)
 }
 
-func set(q anvil.Req, w mut anvil.Out) {
+fn set(q anvil.Req, w mut anvil.Out) {
 	c.Set(q.Param("key"), q.Param("value")) catch err {
 		upstream(mut w, err)
 		return
@@ -68,20 +68,20 @@ func set(q anvil.Req, w mut anvil.Out) {
 	w.Text("ok")
 }
 
-func twice(q anvil.Req, w mut anvil.Out) {
-	key := q.Param("key")
+fn twice(q anvil.Req, w mut anvil.Out) {
+	let key = q.Param("key")
 	// MULTI ... EXEC in one Pipe: both increments happen together.
-	rs := c.Pipe([]query{"MULTI", "INCR {key}", "INCR {key}", "EXEC"}) catch err {
+	let rs = c.Pipe([]query{"MULTI", "INCR {key}", "INCR {key}", "EXEC"}) catch err {
 		upstream(mut w, err)
 		return
 	}
 	w.Text("{rs[3]}")
 }
 
-func sleep(q anvil.Req, w mut anvil.Out) {
+fn sleep(q anvil.Req, w mut anvil.Out) {
 	// The server pauses (it needs enable-debug-command): commands queued behind wait too.
-	ms := mint.Atoi(q.Param("ms")) catch _ { 100 }
-	secs := f64(ms) / 1000.0
+	let ms = mint.Atoi(q.Param("ms")) catch _ { 100 }
+	let secs = f64(ms) / 1000.0
 	_ = c.Do("DEBUG SLEEP {secs}") catch err {
 		upstream(mut w, err)
 		return
@@ -89,18 +89,18 @@ func sleep(q anvil.Req, w mut anvil.Out) {
 	w.Text("slept")
 }
 
-func no_route(q anvil.Req, w mut anvil.Out) {
+fn no_route(q anvil.Req, w mut anvil.Out) {
 	w.Text("no route {q.Path}")
 }
 
-func main() {
-	r := anvil.NewRouter()
+fn main() {
+	let r = anvil.NewRouter()
 	r.Get("/incr", incr)
 	r.Get("/get", get)
 	r.Get("/set", set)
 	r.Get("/twice", twice)
 	r.Get("/sleep", sleep)
 	r.NotFound(no_route)
-	err := r.Serve(":9184")
+	let err = r.Serve(":9184")
 	say.Line("server:", err)
 }

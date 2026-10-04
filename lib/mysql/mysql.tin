@@ -140,34 +140,34 @@ const capDeprecateEOF = 0x1000000
 const moreResults = 0x8
 const flagUnsigned = 0x20
 
-shared var nClients i64
-var pools i64 // per core: the pool of each Client, by id
+shared mut nClients i64
+mut pools i64 // per core: the pool of each Client, by id
 
 // tlsConns holds the TLS layer of this core's connections, by connection record. Removing
 // one releases its memory (counted long-lived memory, from keep).
-var tlsConns = make(map[i64]?tls.Conn)
+let tlsConns = make(map[i64]?tls.Conn)
 
-func keep_raw(s str) i64 {
-	p := malloc(len(s) + 1)
+fn keep_raw(s str) i64 {
+	let p = malloc(len(s) + 1)
 	memcpy(p, cast(i64, s)+8, len(s))
 	return p
 }
 
-func rec_str(rec i64, at i64) str {
+fn rec_str(rec i64, at i64) str {
 	return rt_str_from_raw(rec[at], rec[at+1])
 }
 
 // Open makes a client for the server in o. It connects on first use, on each core.
-func Open(o Options) Client {
-	addr := o.Addr
+fn Open(o Options) Client {
+	mut addr = o.Addr
 	if addr == "" {
 		addr = "127.0.0.1:3306"
 	}
-	id := __atomic_add(&nClients, 1)
+	let id = __atomic_add(&nClients, 1)
 	if id >= maxClients {
 		return Client{open: false, rec: 0}
 	}
-	rec := calloc(recWords, 8)
+	let rec = calloc(recWords, 8)
 	rec[rAddr] = keep_raw(addr)
 	rec[rAddrN] = len(addr)
 	rec[rUser] = keep_raw(o.User)
@@ -182,7 +182,7 @@ func Open(o Options) Client {
 	}
 	rec[rTimeout] = o.Timeout
 	rec[rID] = id
-	cfg := o.TLS
+	let cfg = o.TLS
 	if cfg != nil {
 		rec[rTls] = cast(i64, keep(cfg))
 	}
@@ -192,62 +192,76 @@ func Open(o Options) Client {
 // ---- values ----
 
 // IsNull reports whether v is NULL.
-func (v Value) IsNull() bool {
-	switch v {
-	case Null:
-		return true
-	default:
+fn (v Value) IsNull() bool {
+	match v {
+		Null => {
+			return true
+		}
+		_ => {
+		}
 	}
 	return false
 }
 
 // Int is v as an integer (a Text or Float converted, NULL and bad text 0).
-func (v Value) Int() i64 {
-	switch v {
-	case Int(n):
-		return n
-	case Float(f):
-		return i64(f)
-	case Text(s):
-		n := mint.ParseInt(s, 10) catch _ { 0 }
-		return n
-	case Null:
+fn (v Value) Int() i64 {
+	match v {
+		Int(n) => {
+			return n
+		}
+		Float(f) => {
+			return i64(f)
+		}
+		Text(s) => {
+			let n = mint.ParseInt(s, 10) catch _ { 0 }
+			return n
+		}
+		Null => {
+		}
 	}
 	return 0
 }
 
 // Float is v as a float.
-func (v Value) Float() f64 {
-	switch v {
-	case Int(n):
-		return f64(n)
-	case Float(f):
-		return f
-	case Text(s):
-		f := mint.ParseFloat(s) catch _ { 0.0 }
-		return f
-	case Null:
+fn (v Value) Float() f64 {
+	match v {
+		Int(n) => {
+			return f64(n)
+		}
+		Float(f) => {
+			return f
+		}
+		Text(s) => {
+			let f = mint.ParseFloat(s) catch _ { 0.0 }
+			return f
+		}
+		Null => {
+		}
 	}
 	return 0.0
 }
 
 // Text is v as text ("" for NULL).
-func (v Value) Text() str {
-	switch v {
-	case Int(n):
-		return mint.Itoa(n)
-	case Float(f):
-		return mint.FormatFloat(f, 'g', -1)
-	case Text(s):
-		return s
-	case Null:
+fn (v Value) Text() str {
+	match v {
+		Int(n) => {
+			return mint.Itoa(n)
+		}
+		Float(f) => {
+			return mint.FormatFloat(f, 'g', -1)
+		}
+		Text(s) => {
+			return s
+		}
+		Null => {
+		}
 	}
 	return ""
 }
 
 // Col is the index of the named column, or -1.
-func (r Rows) Col(name str) i64 {
-	for i, c := range r.Columns {
+fn (r Rows) Col(name str) i64 {
+	for i, c in r.Columns {
 		if c == name {
 			return i
 		}
@@ -257,33 +271,37 @@ func (r Rows) Col(name str) i64 {
 
 // ---- packets ----
 
-func os_msg(what str, e i64) str {
-	m := rt_sys_strerror(e)
+fn os_msg(what str, e i64) str {
+	let m = rt_sys_strerror(e)
 	return "mysql: {what}: {rt_str_from_raw(m, strlen(m))}"
 }
 
-func wait_msg(r i64) ! {
+fn wait_msg(r i64) ! {
 	if r == waitDeadline {
 		fail cast(fault, rt_wait_fault())
 	}
 	fail "mysql: timed out"
 }
 
-func le(p i64, n i64) i64 {
-	v := 0
-	for i := n - 1; i >= 0; i-- {
-		v = v<<8 | i64(load8(p+i))
+fn le(p i64, n i64) i64 {
+	mut v = 0
+	{
+		mut i = n - 1
+		for i >= 0 {
+			v = v<<8 | i64(load8(p+i))
+			i -= 1
+		}
 	}
 	return v
 }
 
 // read_packet returns the next packet's payload; it stays valid until the next call.
-func read_packet(c i64) !(i64, i64) {
+fn read_packet(c i64) !(i64, i64) {
 	c[cS] = c[cNext]
 	for {
-		avail := c[cE] - c[cS]
+		let avail = c[cE] - c[cS]
 		if avail >= 4 {
-			n := le(c[cBuf]+c[cS], 3)
+			let n = le(c[cBuf]+c[cS], 3)
 			if n == 0xffffff {
 				fail "mysql: packets of 16 MiB and more are not supported"
 			}
@@ -300,7 +318,7 @@ func read_packet(c i64) !(i64, i64) {
 					c[cS] = 0
 				}
 				if 4+n > c[cCap] {
-					cp := 4 + n + 16384
+					let cp = 4 + n + 16384
 					c[cBuf] = realloc(c[cBuf], cp)
 					c[cCap] = cp
 				}
@@ -313,22 +331,22 @@ func read_packet(c i64) !(i64, i64) {
 			c[cE] = avail
 			c[cS] = 0
 		}
-		tc := tlsConns[c]
+		let tc = tlsConns[c]
 		if tc != nil {
-			buf := make([]u8, 0, c[cCap]-c[cE])
-			got := try tc.ReadNow(mut buf, c[cCap]-c[cE])
+			let buf = make([]u8, 0, c[cCap]-c[cE])
+			let got = try tc.ReadNow(mut buf, c[cCap]-c[cE])
 			if got > 0 {
 				memcpy(c[cBuf]+c[cE], cast(i64, buf)[2], got)
 				c[cE] += got
 				continue
 			}
-			r := rt_task_wait(c[cFd], 1, c[cTimeout])
+			let r = rt_task_wait(c[cFd], 1, c[cTimeout])
 			if r != waitReady {
 				fail wait_msg(r)
 			}
 			continue
 		}
-		k := rt_sys_read(c[cFd], c[cBuf]+c[cE], c[cCap]-c[cE])
+		let k = rt_sys_read(c[cFd], c[cBuf]+c[cE], c[cCap]-c[cE])
 		if k > 0 {
 			c[cE] += k
 			continue
@@ -336,63 +354,63 @@ func read_packet(c i64) !(i64, i64) {
 		if k == 0 {
 			fail "mysql: the server closed the connection"
 		}
-		e := rt_errno()
+		let e = rt_errno()
 		if e == EINTR {
 			continue
 		}
 		if e != EAGAIN {
 			fail os_msg("read", e)
 		}
-		r := rt_task_wait(c[cFd], 1, c[cTimeout])
+		let r = rt_task_wait(c[cFd], 1, c[cTimeout])
 		if r != waitReady {
 			fail wait_msg(r)
 		}
 	}
 }
 
-func out_reserve(c i64, n i64) i64 {
+fn out_reserve(c i64, n i64) i64 {
 	if c[cOutN]+n > c[cOutCap] {
-		cp := c[cOutCap]*2 + n + 4096
+		let cp = c[cOutCap]*2 + n + 4096
 		c[cOut] = realloc(c[cOut], cp)
 		c[cOutCap] = cp
 	}
-	p := c[cOut] + c[cOutN]
+	let p = c[cOut] + c[cOutN]
 	c[cOutN] += n
 	return p
 }
 
-func begin_packet(c i64, seq i64) {
+fn begin_packet(c i64, seq i64) {
 	c[cSeq] = seq
 	c[cPkt] = c[cOutN]
 	out_reserve(c, 4)
 }
 
-func put_u8(c i64, v i64) {
+fn put_u8(c i64, v i64) {
 	store8(out_reserve(c, 1), v)
 }
 
-func put_le(c i64, v i64, n i64) {
-	p := out_reserve(c, n)
-	for i := 0; i < n; i++ {
+fn put_le(c i64, v i64, n i64) {
+	let p = out_reserve(c, n)
+	for i in 0..n {
 		store8(p+i, v>>(8*i))
 	}
 }
 
-func put_raw(c i64, p i64, n i64) {
+fn put_raw(c i64, p i64, n i64) {
 	if n > 0 {
 		memcpy(out_reserve(c, n), p, n)
 	}
 }
 
-func put_str(c i64, s str) {
+fn put_str(c i64, s str) {
 	put_raw(c, cast(i64, s)+8, len(s))
 }
 
-func put_bytes(c i64, b []u8) {
+fn put_bytes(c i64, b []u8) {
 	put_raw(c, cast(i64, b)[2], len(b))
 }
 
-func put_lenenc(c i64, v i64) {
+fn put_lenenc(c i64, v i64) {
 	if v < 251 {
 		put_u8(c, v)
 	} else if v < 65536 {
@@ -407,12 +425,12 @@ func put_lenenc(c i64, v i64) {
 	}
 }
 
-func end_packet(c i64) ! {
-	n := c[cOutN] - c[cPkt] - 4
+fn end_packet(c i64) ! {
+	let n = c[cOutN] - c[cPkt] - 4
 	if n >= 0xffffff {
 		fail "mysql: statements and parameters of 16 MiB and more are not supported"
 	}
-	p := c[cOut] + c[cPkt]
+	let p = c[cOut] + c[cPkt]
 	store8(p, n)
 	store8(p+1, n>>8)
 	store8(p+2, n>>16)
@@ -420,24 +438,24 @@ func end_packet(c i64) ! {
 	c[cSeq] = (c[cSeq] + 1) & 255
 }
 
-func flush(c i64) ! {
-	tc := tlsConns[c]
+fn flush(c i64) ! {
+	let tc = tlsConns[c]
 	if tc != nil {
-		err := tc.Write(rt_str_from_raw(c[cOut], c[cOutN]))
+		let err = tc.Write(rt_str_from_raw(c[cOut], c[cOutN]))
 		c[cOutN] = 0
 		if err != nil {
 			fail err
 		}
 		return
 	}
-	at := 0
+	mut at = 0
 	for at < c[cOutN] {
-		k := rt_sys_write(c[cFd], c[cOut]+at, c[cOutN]-at)
+		let k = rt_sys_write(c[cFd], c[cOut]+at, c[cOutN]-at)
 		if k > 0 {
 			at += k
 			continue
 		}
-		e := rt_errno()
+		let e = rt_errno()
 		if e == EINTR {
 			continue
 		}
@@ -445,7 +463,7 @@ func flush(c i64) ! {
 			c[cOutN] = 0
 			fail os_msg("write", e)
 		}
-		r := rt_task_wait(c[cFd], 2, c[cTimeout])
+		let r = rt_task_wait(c[cFd], 2, c[cTimeout])
 		if r != waitReady {
 			c[cOutN] = 0
 			fail wait_msg(r)
@@ -461,28 +479,28 @@ type cur struct {
 	end i64
 }
 
-func (k mut cur) u8() i64 {
+fn (k mut cur) u8() i64 {
 	if k.at >= k.end {
 		return 0
 	}
-	v := i64(load8(k.p + k.at))
-	k.at++
+	let v = i64(load8(k.p + k.at))
+	k.at += 1
 	return v
 }
 
-func (k mut cur) fixed(n i64) i64 {
+fn (k mut cur) fixed(n i64) i64 {
 	if k.at+n > k.end {
 		k.at = k.end
 		return 0
 	}
-	v := le(k.p+k.at, n)
+	let v = le(k.p+k.at, n)
 	k.at += n
 	return v
 }
 
 // lenenc reads a length-encoded integer; NULL (0xfb) is -1.
-func (k mut cur) lenenc() i64 {
-	b := k.u8()
+fn (k mut cur) lenenc() i64 {
+	let b = k.u8()
 	if b < 0xfb {
 		return b
 	}
@@ -498,43 +516,43 @@ func (k mut cur) lenenc() i64 {
 	return k.fixed(8)
 }
 
-func (k mut cur) bytes(n i64) str {
+fn (k mut cur) bytes(n i64) str {
 	if n < 0 || k.at+n > k.end {
 		n = k.end - k.at
 	}
-	s := rt_str_from_raw(k.p+k.at, n)
+	let s = rt_str_from_raw(k.p+k.at, n)
 	k.at += n
 	return s
 }
 
-func (k mut cur) lenstr() str {
+fn (k mut cur) lenstr() str {
 	return k.bytes(k.lenenc())
 }
 
-func (k mut cur) cstr() str {
-	e := k.at
+fn (k mut cur) cstr() str {
+	mut e = k.at
 	for e < k.end && load8(k.p+e) != 0 {
-		e++
+		e += 1
 	}
-	s := rt_str_from_raw(k.p+k.at, e-k.at)
+	let s = rt_str_from_raw(k.p+k.at, e-k.at)
 	k.at = e + 1
 	return s
 }
 
-func (k mut cur) rest() str {
+fn (k mut cur) rest() str {
 	return k.bytes(k.end - k.at)
 }
 
 // err_packet turns an ERR packet into a fault: "mysql: Error 1146 (42S02): ...".
-func err_packet(p i64, n i64) str {
-	k := cur{p: p, at: 1, end: n}
-	code := k.fixed(2)
-	state := ""
+fn err_packet(p i64, n i64) str {
+	let k = cur{p: p, at: 1, end: n}
+	let code = k.fixed(2)
+	mut state = ""
 	if k.at < k.end && load8(p+k.at) == '#' {
-		k.at++
+		k.at += 1
 		state = k.bytes(5)
 	}
-	msg := k.rest()
+	let msg = k.rest()
 	if state == "" {
 		return "mysql: Error {code}: {msg}"
 	}
@@ -543,40 +561,40 @@ func err_packet(p i64, n i64) str {
 
 // ---- authentication ----
 
-func xor_bytes(a []u8, b []u8) []u8 {
-	out := make([]u8, len(a))
-	for i := 0; i < len(a); i++ {
+fn xor_bytes(a []u8, b []u8) []u8 {
+	let out = make([]u8, len(a))
+	for i in 0..len(a) {
 		out[i] = a[i] ^ b[i%len(b)]
 	}
 	return out
 }
 
-func cat_bytes(a []u8, b []u8) str {
-	out := make([]u8, 0, len(a)+len(b))
-	for _, x := range a {
+fn cat_bytes(a []u8, b []u8) str {
+	mut out = make([]u8, 0, len(a)+len(b))
+	for _, x in a {
 		out = append(out, x)
 	}
-	for _, x := range b {
+	for _, x in b {
 		out = append(out, x)
 	}
 	return str(out)
 }
 
-func auth_data(plugin str, pass str, scramble []u8) []u8 {
+fn auth_data(plugin str, pass str, scramble []u8) []u8 {
 	if pass == "" {
 		return []u8{}
 	}
 	if plugin == "mysql_native_password" {
-		h1 := seal.Sha1(pass)
-		h2 := seal.Sha1(str(h1))
+		let h1 = seal.Sha1(pass)
+		let h2 = seal.Sha1(str(h1))
 		return xor_bytes(h1, seal.Sha1(cat_bytes(scramble, h2)))
 	}
-	h1 := seal.Sha256(pass)
-	h2 := seal.Sha256(str(h1))
+	let h1 = seal.Sha256(pass)
+	let h2 = seal.Sha256(str(h1))
 	return xor_bytes(h1, seal.Sha256(cat_bytes(h2, scramble)))
 }
 
-func send_raw(c i64, data []u8) ! {
+fn send_raw(c i64, data []u8) ! {
 	begin_packet(c, c[cSeq])
 	put_bytes(c, data)
 	try end_packet(c)
@@ -585,21 +603,21 @@ func send_raw(c i64, data []u8) ! {
 
 // full_auth sends the password RSA-encrypted with the server's public key, as
 // caching_sha2_password does without TLS when the server has no cached entry.
-func full_auth(c i64, rec i64, pass str, scramble []u8) ! {
+fn full_auth(c i64, rec i64, pass str, scramble []u8) ! {
 	if tlsConns[c] != nil {
 		// Over TLS the password goes as it is, NUL-terminated (no RSA key needed).
-		pw := make([]u8, 0, len(pass)+1)
+		mut pw = make([]u8, 0, len(pass)+1)
 		pw = append(pw, pass...)
 		pw = append(pw, 0)
 		try send_raw(c, pw)
 		return
 	}
-	pem := ""
+	mut pem = ""
 	if rec[rKeyN] > 0 {
 		pem = rec_str(rec, rKey)
 	} else {
 		try send_raw(c, []u8{2})
-		p, n := try read_packet(c)
+		let (p, n) = try read_packet(c)
 		if n == 0 || load8(p) != 1 {
 			if n > 0 && load8(p) == 0xff {
 				fail err_packet(p, n)
@@ -611,45 +629,49 @@ func full_auth(c i64, rec i64, pass str, scramble []u8) ! {
 		rec[rKey] = keep_raw(pem)
 		rec[rKeyN] = len(pem)
 	}
-	key := try seal.ParseRSAPublicKeyPEM(pem)
-	pw := make([]u8, 0, len(pass)+1)
-	for i := 0; i < len(pass); i++ {
+	let key = try seal.ParseRSAPublicKeyPEM(pem)
+	mut pw = make([]u8, 0, len(pass)+1)
+	for i in 0..len(pass) {
 		pw = append(pw, pass[i])
 	}
 	pw = append(pw, 0)
-	enc := try seal.EncryptOAEPSha1(key, xor_bytes(pw, scramble))
+	let enc = try seal.EncryptOAEPSha1(key, xor_bytes(pw, scramble))
 	try send_raw(c, enc)
 }
 
 // handshake reads the server's greeting, logs in and returns the agreed capabilities.
-func handshake(c i64, rec i64, w wire.Conn) ! {
-	p, n := try read_packet(c)
+fn handshake(c i64, rec i64, w wire.Conn) ! {
+	let (p, n) = try read_packet(c)
 	if n > 0 && load8(p) == 0xff {
 		fail err_packet(p, n)
 	}
-	k := cur{p: p, at: 0, end: n}
+	let k = cur{p: p, at: 0, end: n}
 	if k.u8() != 10 {
 		fail "mysql: unsupported protocol version"
 	}
 	_ = k.cstr()
 	_ = k.fixed(4)
-	scramble := []u8(k.bytes(8))
-	k.at++
-	caps := k.fixed(2)
+	mut scramble = []u8(k.bytes(8))
+	k.at += 1
+	mut caps = k.fixed(2)
 	_ = k.u8()
 	_ = k.fixed(2)
 	caps |= k.fixed(2) << 16
-	alen := k.u8()
+	let alen = k.u8()
 	k.at += 10
-	plugin := "mysql_native_password"
+	mut plugin = "mysql_native_password"
 	if caps&capSecureConnection != 0 {
-		m := alen - 8
+		mut m = alen - 8
 		if m < 13 {
 			m = 13
 		}
-		part := k.bytes(m)
-		for i := 0; i < len(part) && i < 12; i++ {
-			scramble = append(scramble, part[i])
+		let part = k.bytes(m)
+		{
+			mut i = 0
+			for i < len(part) && i < 12 {
+				scramble = append(scramble, part[i])
+				i += 1
+			}
 		}
 	}
 	if caps&capPluginAuth != 0 {
@@ -658,15 +680,15 @@ func handshake(c i64, rec i64, w wire.Conn) ! {
 	if caps&capProtocol41 == 0 {
 		fail "mysql: the server is too old (no protocol 4.1)"
 	}
-	user := rec_str(rec, rUser)
-	pass := rec_str(rec, rPass)
-	db := rec_str(rec, rDB)
-	want := capLongPassword | capLongFlag | capProtocol41 | capTransactions | capSecureConnection |
+	let user = rec_str(rec, rUser)
+	let pass = rec_str(rec, rPass)
+	let db = rec_str(rec, rDB)
+	mut want = capLongPassword | capLongFlag | capProtocol41 | capTransactions | capSecureConnection |
 		capMultiResults | capPluginAuth | capPluginAuthLenenc | capDeprecateEOF
 	if db != "" {
 		want |= capConnectWithDB
 	}
-	use := want & caps
+	mut use = want & caps
 	if rec[rTls] != 0 {
 		if caps&capSSL == 0 {
 			fail "mysql: the server does not support TLS"
@@ -677,18 +699,18 @@ func handshake(c i64, rec i64, w wire.Conn) ! {
 		put_le(c, use, 4)
 		put_le(c, 16777216, 4)
 		put_u8(c, 45)
-		for i := 0; i < 23; i++ {
+		for i in 0..23 {
 			put_u8(c, 0)
 		}
 		try end_packet(c)
 		try flush(c)
-		base := cast(tls.Config, rec[rTls])
-		name := base.ServerName
+		let base = cast(tls.Config, rec[rTls])
+		mut name = base.ServerName
 		if name == "" {
 			name = host_of(rec_str(rec, rAddr))
 		}
-		cfg := tls.Config{ServerName: name, RootCAs: base.RootCAs, ALPN: base.ALPN, Timeout: rec[rTimeout], InsecureSkipVerify: base.InsecureSkipVerify}
-		tc := try tls.Client(w, cfg)
+		let cfg = tls.Config{ServerName: name, RootCAs: base.RootCAs, ALPN: base.ALPN, Timeout: rec[rTimeout], InsecureSkipVerify: base.InsecureSkipVerify}
+		let tc = try tls.Client(w, cfg)
 		tc.SetTimeout(rec[rTimeout])
 		tlsConns[c] = keep(tc)
 	}
@@ -696,13 +718,13 @@ func handshake(c i64, rec i64, w wire.Conn) ! {
 	if plugin != "mysql_native_password" && plugin != "caching_sha2_password" {
 		plugin = "caching_sha2_password"
 	}
-	data := auth_data(plugin, pass, scramble)
+	let data = auth_data(plugin, pass, scramble)
 	begin_packet(c, c[cSeq])
 	put_le(c, use, 4)
 	put_le(c, 16777216, 4)
 	put_u8(c, 45)
 	put_raw(c, 0, 0)
-	for i := 0; i < 23; i++ {
+	for i in 0..23 {
 		put_u8(c, 0)
 	}
 	put_str(c, user)
@@ -724,11 +746,11 @@ func handshake(c i64, rec i64, w wire.Conn) ! {
 	try end_packet(c)
 	try flush(c)
 	for {
-		q, m := try read_packet(c)
+		let (q, m) = try read_packet(c)
 		if m == 0 {
 			fail "mysql: empty packet while logging in"
 		}
-		t := load8(q)
+		let t = load8(q)
 		if t == 0 {
 			return
 		}
@@ -737,12 +759,16 @@ func handshake(c i64, rec i64, w wire.Conn) ! {
 		}
 		if t == 0xfe {
 			// Auth switch: another plugin, with a new scramble.
-			ks := cur{p: q, at: 1, end: m}
+			let ks = cur{p: q, at: 1, end: m}
 			plugin = ks.cstr()
-			s := ks.rest()
+			let s = ks.rest()
 			scramble = []u8{}
-			for i := 0; i < len(s) && i < 20; i++ {
-				scramble = append(scramble, s[i])
+			{
+				mut i = 0
+				for i < len(s) && i < 20 {
+					scramble = append(scramble, s[i])
+					i += 1
+				}
 			}
 			if plugin != "mysql_native_password" && plugin != "caching_sha2_password" {
 				fail "mysql: unsupported authentication plugin {plugin}"
@@ -765,14 +791,14 @@ func handshake(c i64, rec i64, w wire.Conn) ! {
 }
 
 // host_of is the host in "host:port" ("[v6]:port" gives v6).
-func host_of(addr str) str {
-	colon := len(addr)
-	for i := 0; i < len(addr); i++ {
+fn host_of(addr str) str {
+	mut colon = len(addr)
+	for i in 0..len(addr) {
 		if addr[i] == ':' {
 			colon = i
 		}
 	}
-	h := addr[:colon]
+	mut h = addr[:colon]
 	if len(h) >= 2 && h[0] == '[' && h[len(h)-1] == ']' {
 		h = h[1 : len(h)-1]
 	}
@@ -781,12 +807,12 @@ func host_of(addr str) str {
 
 // ---- the pool ----
 
-func (c Client) pool() i64 {
+fn (c Client) pool() i64 {
 	if pools == 0 {
 		pools = calloc(maxClients+1, 8)
 	}
-	id := c.rec[rID]
-	p := pools[id]
+	let id = c.rec[rID]
+	mut p = pools[id]
 	if p == 0 {
 		p = calloc(poolWords, 8)
 		p[pIdle] = calloc(c.rec[rPool]+1, 8)
@@ -795,31 +821,31 @@ func (c Client) pool() i64 {
 	return p
 }
 
-func conn_free(c i64) {
+fn conn_free(c i64) {
 	delete(tlsConns, c)
 	if c[cFd] >= 0 {
 		rt_sys_close(c[cFd])
 	}
 	free(c[cBuf])
 	free(c[cOut])
-	st := c[cStmts]
-	for i := 0; i < c[cNStmts]; i++ {
+	let st = c[cStmts]
+	for i in 0..c[cNStmts] {
 		free(st[i*stmtWords])
 	}
 	free(st)
 	free(c)
 }
 
-func dial(rec i64) !i64 {
-	addr := rec_str(rec, rAddr)
-	w := try wire.DialTimeout(addr, rec[rTimeout])
-	c := calloc(connWords, 8)
+fn dial(rec i64) !i64 {
+	let addr = rec_str(rec, rAddr)
+	let w = try wire.DialTimeout(addr, rec[rTimeout])
+	let c = calloc(connWords, 8)
 	c[cFd] = w.Fd()
 	c[cCap] = 16384
 	c[cBuf] = malloc(c[cCap])
 	c[cStmts] = calloc(maxStmts*stmtWords, 8)
 	c[cTimeout] = rec[rTimeout]
-	err := handshake(c, rec, w)
+	let err = handshake(c, rec, w)
 	if err != nil {
 		conn_free(c)
 		fail err
@@ -829,68 +855,68 @@ func dial(rec i64) !i64 {
 
 // alive reports whether an idle connection is still open (the server may have closed it:
 // a restart, wait_timeout).
-func alive(c i64) bool {
-	tc := tlsConns[c]
+fn alive(c i64) bool {
+	let tc = tlsConns[c]
 	if tc != nil {
 		// Records may wait (session tickets): read them; data or an error means not idle.
-		buf := make([]u8, 0, 16)
-		got, err := tc.ReadNow(mut buf, 16)
+		let buf = make([]u8, 0, 16)
+		let (got, err) = tc.ReadNow(mut buf, 16)
 		return err == nil && got == 0
 	}
-	b := calloc(1, 8)
-	k := rt_sys_recv(c[cFd], b, 1, 2)
+	let b = calloc(1, 8)
+	let k = rt_sys_recv(c[cFd], b, 1, 2)
 	free(b)
 	return k < 0 && (rt_errno() == EAGAIN || rt_errno() == EINTR)
 }
 
-func (c Client) acquire() !i64 {
+fn (c Client) acquire() !i64 {
 	if !c.open {
 		fail "mysql: the client is not open (too many clients: open one per server, not per request)"
 	}
-	p := c.pool()
+	let p = c.pool()
 	for {
 		for p[pIdleN] > 0 {
-			p[pIdleN]--
-			idle := p[pIdle]
-			conn := idle[p[pIdleN]]
+			p[pIdleN] -= 1
+			let idle = p[pIdle]
+			let conn = idle[p[pIdleN]]
 			if alive(conn) {
 				return conn
 			}
 			conn_free(conn)
-			p[pTotal]--
+			p[pTotal] -= 1
 		}
 		if p[pTotal] < c.rec[rPool] || rt_task_current() == 0 {
-			p[pTotal]++
-			conn, err := dial(c.rec)
+			p[pTotal] += 1
+			let (conn, err) = dial(c.rec)
 			if err != nil {
-				p[pTotal]--
+				p[pTotal] -= 1
 				fail err
 			}
 			return conn
 		}
 		// Every connection is busy: wait for one.
-		w := calloc(4, 8)
+		let w = calloc(4, 8)
 		w[wTask] = rt_task_current()
 		if p[pWaitHead]+p[pWaitN] == p[pWaitCap] {
 			if p[pWaitHead] > 0 {
 				memmove(p[pWait], p[pWait]+8*p[pWaitHead], 8*p[pWaitN])
 				p[pWaitHead] = 0
 			} else {
-				cp := p[pWaitCap]*2 + 32
+				let cp = p[pWaitCap]*2 + 32
 				p[pWait] = realloc(p[pWait], 8*cp)
 				p[pWaitCap] = cp
 			}
 		}
-		q := p[pWait]
+		let q = p[pWait]
 		q[p[pWaitHead]+p[pWaitN]] = w
-		p[pWaitN]++
-		r := rt_task_park(c.rec[rTimeout])
+		p[pWaitN] += 1
+		let r = rt_task_park(c.rec[rTimeout])
 		if w[wDone] == 0 {
 			// Timed out: the releaser frees the entry when it reaches it.
 			w[wGone] = 1
 			fail wait_msg(r)
 		}
-		conn := w[wConn]
+		let conn = w[wConn]
 		free(w)
 		if conn != 0 {
 			return conn
@@ -900,12 +926,12 @@ func (c Client) acquire() !i64 {
 }
 
 // next_waiter is the first waiter still waiting, or 0.
-func next_waiter(p i64) i64 {
+fn next_waiter(p i64) i64 {
 	for p[pWaitN] > 0 {
-		q := p[pWait]
-		w := q[p[pWaitHead]]
-		p[pWaitHead]++
-		p[pWaitN]--
+		let q = p[pWait]
+		let w = q[p[pWaitHead]]
+		p[pWaitHead] += 1
+		p[pWaitN] -= 1
 		if p[pWaitN] == 0 {
 			p[pWaitHead] = 0
 		}
@@ -919,14 +945,14 @@ func next_waiter(p i64) i64 {
 }
 
 // release returns a connection to the pool; a broken one (ok false) is closed.
-func (c Client) release(conn i64, ok bool) {
-	p := c.pool()
+fn (c Client) release(conn i64, ok bool) {
+	let p = c.pool()
 	if !ok {
 		conn_free(conn)
-		p[pTotal]--
+		p[pTotal] -= 1
 		conn = 0
 	}
-	w := next_waiter(p)
+	let w = next_waiter(p)
 	if w != 0 {
 		w[wConn] = conn
 		w[wDone] = 1
@@ -934,26 +960,26 @@ func (c Client) release(conn i64, ok bool) {
 		return
 	}
 	if conn != 0 {
-		idle := p[pIdle]
+		let idle = p[pIdle]
 		idle[p[pIdleN]] = conn
-		p[pIdleN]++
+		p[pIdleN] += 1
 	}
 }
 
 // ---- statements ----
 
 // placeholders is the statement text with ? for each value.
-func placeholders(q query) str {
+fn placeholders(q query) str {
 	if len(q.Args) == 0 {
 		return q.Parts[0]
 	}
-	n := 0
-	for _, s := range q.Parts {
+	mut n = 0
+	for _, s in q.Parts {
 		n += len(s) + 1
 	}
-	b := make([]u8, 0, n)
-	for i, s := range q.Parts {
-		for j := 0; j < len(s); j++ {
+	mut b = make([]u8, 0, n)
+	for i, s in q.Parts {
+		for j in 0..len(s) {
 			b = append(b, s[j])
 		}
 		if i < len(q.Args) {
@@ -963,16 +989,16 @@ func placeholders(q query) str {
 	return str(b)
 }
 
-func text_hash(s str) i64 {
-	h := 1469598103934665603
-	for i := 0; i < len(s); i++ {
+fn text_hash(s str) i64 {
+	mut h = 1469598103934665603
+	for i in 0..len(s) {
 		h = (h ^ i64(s[i])) * 1099511628211
 	}
 	return h
 }
 
-func eq_raw(p i64, s str) bool {
-	for i := 0; i < len(s); i++ {
+fn eq_raw(p i64, s str) bool {
+	for i in 0..len(s) {
 		if load8(p+i) != s[i] {
 			return false
 		}
@@ -981,8 +1007,8 @@ func eq_raw(p i64, s str) bool {
 }
 
 // skip_until_eof reads n definition packets and, without DEPRECATE_EOF, the EOF after them.
-func skip_defs(c i64, n i64) ! {
-	for i := 0; i < n; i++ {
+fn skip_defs(c i64, n i64) ! {
+	for i in 0..n {
 		_, _ = try read_packet(c)
 	}
 	if n > 0 && c[cCaps]&capDeprecateEOF == 0 {
@@ -991,18 +1017,18 @@ func skip_defs(c i64, n i64) ! {
 }
 
 // prepare returns the cached statement for text, preparing it on first use: [id, params].
-func prepare(c i64, text str) !(i64, i64) {
-	h := text_hash(text)
-	st := c[cStmts]
-	for i := 0; i < c[cNStmts]; i++ {
-		e := st + 8*stmtWords*i
+fn prepare(c i64, text str) !(i64, i64) {
+	let h = text_hash(text)
+	let st = c[cStmts]
+	for i in 0..c[cNStmts] {
+		let e = st + 8*stmtWords*i
 		if e[2] == h && e[1] == len(text) && eq_raw(e[0], text) {
 			return e[3], e[4]
 		}
 	}
 	if c[cNStmts] == maxStmts {
-		for i := 0; i < maxStmts; i++ {
-			e := st + 8*stmtWords*i
+		for i in 0..maxStmts {
+			let e = st + 8*stmtWords*i
 			begin_packet(c, 0)
 			put_u8(c, 0x19)
 			put_le(c, e[3], 4)
@@ -1017,32 +1043,32 @@ func prepare(c i64, text str) !(i64, i64) {
 	put_str(c, text)
 	try end_packet(c)
 	try flush(c)
-	p, n := try read_packet(c)
+	let (p, n) = try read_packet(c)
 	if n > 0 && load8(p) == 0xff {
 		fail err_packet(p, n)
 	}
-	k := cur{p: p, at: 1, end: n}
-	id := k.fixed(4)
-	cols := k.fixed(2)
-	params := k.fixed(2)
+	let k = cur{p: p, at: 1, end: n}
+	let id = k.fixed(4)
+	let cols = k.fixed(2)
+	let params = k.fixed(2)
 	try skip_defs(c, params)
 	try skip_defs(c, cols)
-	e := st + 8*stmtWords*c[cNStmts]
+	let e = st + 8*stmtWords*c[cNStmts]
 	e[0] = keep_raw(text)
 	e[1] = len(text)
 	e[2] = h
 	e[3] = id
 	e[4] = params
-	c[cNStmts]++
+	c[cNStmts] += 1
 	return id, params
 }
 
-func f32_from_bits(b i64) f64 {
-	sign := (b >> 31) & 1
-	exp := (b >> 23) & 0xff
-	frac := b & 0x7fffff
+fn f32_from_bits(b i64) f64 {
+	let sign = (b >> 31) & 1
+	mut exp = (b >> 23) & 0xff
+	let frac = b & 0x7fffff
 	if exp == 0 {
-		v := f64(frac) / 8388608.0 / gauge.Pow(2.0, 126.0)
+		let v = f64(frac) / 8388608.0 / gauge.Pow(2.0, 126.0)
 		if sign == 1 {
 			return -v
 		}
@@ -1056,23 +1082,23 @@ func f32_from_bits(b i64) f64 {
 	return gauge.F64frombits(u64(sign<<63 | exp<<52 | frac<<29))
 }
 
-func pad2(v i64) str {
+fn pad2(v i64) str {
 	if v < 10 {
 		return "0{v}"
 	}
 	return "{v}"
 }
 
-func pad4(v i64) str {
-	s := "{v}"
+fn pad4(v i64) str {
+	mut s = "{v}"
 	for len(s) < 4 {
 		s = "0" + s
 	}
 	return s
 }
 
-func micros(v i64) str {
-	s := "{v}"
+fn micros(v i64) str {
+	mut s = "{v}"
 	for len(s) < 6 {
 		s = "0" + s
 	}
@@ -1080,24 +1106,24 @@ func micros(v i64) str {
 }
 
 // binary_value reads one value of a binary row for a column of type t.
-func binary_value(k mut cur, t i64, flags i64) Value {
-	unsigned := flags&flagUnsigned != 0
+fn binary_value(k mut cur, t i64, flags i64) Value {
+	let unsigned = flags&flagUnsigned != 0
 	if t == 0x01 {
-		v := k.fixed(1)
+		mut v = k.fixed(1)
 		if !unsigned && v >= 128 {
 			v -= 256
 		}
 		return Value.Int(v)
 	}
 	if t == 0x02 || t == 0x0d {
-		v := k.fixed(2)
+		mut v = k.fixed(2)
 		if !unsigned && t == 0x02 && v >= 32768 {
 			v -= 65536
 		}
 		return Value.Int(v)
 	}
 	if t == 0x03 || t == 0x09 {
-		v := k.fixed(4)
+		mut v = k.fixed(4)
 		if !unsigned && v >= 2147483648 {
 			v -= 4294967296
 		}
@@ -1113,14 +1139,14 @@ func binary_value(k mut cur, t i64, flags i64) Value {
 		return Value.Float(gauge.F64frombits(u64(k.fixed(8))))
 	}
 	if t == 0x07 || t == 0x0a || t == 0x0c {
-		n := k.u8()
-		y := 0
-		mo := 0
-		d := 0
-		h := 0
-		mi := 0
-		s := 0
-		us := 0
+		let n = k.u8()
+		mut y = 0
+		mut mo = 0
+		mut d = 0
+		mut h = 0
+		mut mi = 0
+		mut s = 0
+		mut us = 0
 		if n >= 4 {
 			y = k.fixed(2)
 			mo = k.u8()
@@ -1134,24 +1160,24 @@ func binary_value(k mut cur, t i64, flags i64) Value {
 		if n >= 11 {
 			us = k.fixed(4)
 		}
-		date := "{pad4(y)}-{pad2(mo)}-{pad2(d)}"
+		let date = "{pad4(y)}-{pad2(mo)}-{pad2(d)}"
 		if t == 0x0a {
 			return Value.Text(date)
 		}
-		out := "{date} {pad2(h)}:{pad2(mi)}:{pad2(s)}"
+		mut out = "{date} {pad2(h)}:{pad2(mi)}:{pad2(s)}"
 		if us != 0 {
 			out = out + micros(us)
 		}
 		return Value.Text(out)
 	}
 	if t == 0x0b {
-		n := k.u8()
-		neg := false
-		days := 0
-		h := 0
-		mi := 0
-		s := 0
-		us := 0
+		let n = k.u8()
+		mut neg = false
+		mut days = 0
+		mut h = 0
+		mut mi = 0
+		mut s = 0
+		mut us = 0
 		if n >= 8 {
 			neg = k.u8() == 1
 			days = k.fixed(4)
@@ -1162,7 +1188,7 @@ func binary_value(k mut cur, t i64, flags i64) Value {
 		if n >= 12 {
 			us = k.fixed(4)
 		}
-		out := "{pad2(days*24+h)}:{pad2(mi)}:{pad2(s)}"
+		mut out = "{pad2(days*24+h)}:{pad2(mi)}:{pad2(s)}"
 		if us != 0 {
 			out = out + micros(us)
 		}
@@ -1175,74 +1201,74 @@ func binary_value(k mut cur, t i64, flags i64) Value {
 }
 
 // text_value converts a text-protocol column of type t.
-func text_value(s str, t i64) Value {
+fn text_value(s str, t i64) Value {
 	if t == 0x01 || t == 0x02 || t == 0x03 || t == 0x08 || t == 0x09 || t == 0x0d {
-		n := mint.ParseInt(s, 10) catch _ {
-			u := mint.ParseUint(s, 10) catch _ { u64(0) }
+		let n = mint.ParseInt(s, 10) catch _ {
+			let u = mint.ParseUint(s, 10) catch _ { u64(0) }
 			i64(u)
 		}
 		return Value.Int(n)
 	}
 	if t == 0x04 || t == 0x05 {
-		f := mint.ParseFloat(s) catch _ { 0.0 }
+		let f = mint.ParseFloat(s) catch _ { 0.0 }
 		return Value.Float(f)
 	}
 	return Value.Text(s)
 }
 
 // ok_result reads an OK packet; it returns the result and the status flags.
-func ok_result(p i64, n i64) (Result, i64) {
-	k := cur{p: p, at: 1, end: n}
-	aff := k.lenenc()
-	last := k.lenenc()
-	status := k.fixed(2)
+fn ok_result(p i64, n i64) (Result, i64) {
+	let k = cur{p: p, at: 1, end: n}
+	let aff = k.lenenc()
+	let last = k.lenenc()
+	let status = k.fixed(2)
 	return Result{Affected: aff, LastID: last}, status
 }
 
-func is_end(p i64, n i64) bool {
+fn is_end(p i64, n i64) bool {
 	return n > 0 && n < 0xffffff && load8(p) == 0xfe
 }
 
-func end_status(c i64, p i64, n i64) i64 {
+fn end_status(c i64, p i64, n i64) i64 {
 	if c[cCaps]&capDeprecateEOF != 0 {
-		_, st := ok_result(p, n)
+		let (_, st) = ok_result(p, n)
 		return st
 	}
-	k := cur{p: p, at: 3, end: n}
+	let k = cur{p: p, at: 3, end: n}
 	return k.fixed(2)
 }
 
 // read_result reads a statement's response: rows (binary or text), or an OK.
-func read_result(c i64, binary bool) !(Rows, Result) {
-	rows := Rows{Columns: []str{}, Rows: [][]Value{}}
-	res := Result{Affected: 0, LastID: 0}
-	first := true
+fn read_result(c i64, binary bool) !(Rows, Result) {
+	mut rows = Rows{Columns: []str{}, Rows: [][]Value{}}
+	mut res = Result{Affected: 0, LastID: 0}
+	mut first = true
 	for {
-		p, n := try read_packet(c)
+		let (p, n) = try read_packet(c)
 		if n == 0 {
 			fail "mysql: empty response"
 		}
-		t := load8(p)
+		let t = load8(p)
 		if t == 0xff {
 			fail err_packet(p, n)
 		}
-		status := 0
+		mut status = 0
 		if t == 0 {
-			r, st := ok_result(p, n)
+			let (r, st) = ok_result(p, n)
 			if first {
 				res = r
 			}
 			status = st
 		} else {
-			k := cur{p: p, at: 0, end: n}
-			ncols := k.lenenc()
-			types := make([]i64, ncols)
-			flags := make([]i64, ncols)
-			names := make([]str, 0, ncols)
-			for i := 0; i < ncols; i++ {
-				q, m := try read_packet(c)
-				d := cur{p: q, at: 0, end: m}
-				for j := 0; j < 4; j++ {
+			let k = cur{p: p, at: 0, end: n}
+			let ncols = k.lenenc()
+			let types = make([]i64, ncols)
+			let flags = make([]i64, ncols)
+			mut names = make([]str, 0, ncols)
+			for i in 0..ncols {
+				let (q, m) = try read_packet(c)
+				let d = cur{p: q, at: 0, end: m}
+				for j in 0..4 {
 					_ = d.lenstr()
 				}
 				names = append(names, d.lenstr())
@@ -1256,9 +1282,9 @@ func read_result(c i64, binary bool) !(Rows, Result) {
 			if c[cCaps]&capDeprecateEOF == 0 {
 				_, _ = try read_packet(c)
 			}
-			out := [][]Value{}
+			mut out = [][]Value{}
 			for {
-				q, m := try read_packet(c)
+				let (q, m) = try read_packet(c)
 				if m > 0 && load8(q) == 0xff {
 					fail err_packet(q, m)
 				}
@@ -1266,14 +1292,14 @@ func read_result(c i64, binary bool) !(Rows, Result) {
 					status = end_status(c, q, m)
 					break
 				}
-				row := make([]Value, 0, ncols)
+				mut row = make([]Value, 0, ncols)
 				if binary {
-					d := cur{p: q, at: 1, end: m}
-					nb := (ncols + 9) / 8
-					bm := q + 1
+					let d = cur{p: q, at: 1, end: m}
+					let nb = (ncols + 9) / 8
+					let bm = q + 1
 					d.at = 1 + nb
-					for i := 0; i < ncols; i++ {
-						bit := i + 2
+					for i in 0..ncols {
+						let bit = i + 2
 						if (i64(load8(bm+bit/8))>>(bit%8))&1 == 1 {
 							row = append(row, Value.Null)
 							continue
@@ -1281,9 +1307,9 @@ func read_result(c i64, binary bool) !(Rows, Result) {
 						row = append(row, binary_value(mut d, types[i], flags[i]))
 					}
 				} else {
-					d := cur{p: q, at: 0, end: m}
-					for i := 0; i < ncols; i++ {
-						ln := d.lenenc()
+					let d = cur{p: q, at: 0, end: m}
+					for i in 0..ncols {
+						let ln = d.lenenc()
 						if ln < 0 {
 							row = append(row, Value.Null)
 							continue
@@ -1305,7 +1331,7 @@ func read_result(c i64, binary bool) !(Rows, Result) {
 }
 
 // run sends q on connection conn and reads its response.
-func run(conn i64, q query) !(Rows, Result) {
+fn run(conn i64, q query) !(Rows, Result) {
 	if len(q.Args) == 0 {
 		begin_packet(conn, 0)
 		put_u8(conn, 0x03)
@@ -1314,8 +1340,8 @@ func run(conn i64, q query) !(Rows, Result) {
 		try flush(conn)
 		return try read_result(conn, false)
 	}
-	text := placeholders(q)
-	id, params := try prepare(conn, text)
+	let text = placeholders(q)
+	let (id, params) = try prepare(conn, text)
 	if params != len(q.Args) {
 		fail "mysql: the statement has {params} placeholders but the query {len(q.Args)} values"
 	}
@@ -1324,43 +1350,53 @@ func run(conn i64, q query) !(Rows, Result) {
 	put_le(conn, id, 4)
 	put_u8(conn, 0)
 	put_le(conn, 1, 4)
-	nb := (params + 7) / 8
-	for i := 0; i < nb; i++ {
+	let nb = (params + 7) / 8
+	for i in 0..nb {
 		put_u8(conn, 0)
 	}
 	put_u8(conn, 1)
-	for _, a := range q.Args {
-		switch a {
-		case Int(_):
-			put_le(conn, 0x08, 2)
-		case Float(_):
-			put_le(conn, 0x05, 2)
-		case Str(_):
-			put_le(conn, 0xfe, 2)
-		case Bool(_):
-			put_le(conn, 0x01, 2)
-		case Bytes(_):
-			put_le(conn, 0xfc, 2)
+	for _, a in q.Args {
+		match a {
+			Int(_) => {
+				put_le(conn, 0x08, 2)
+			}
+			Float(_) => {
+				put_le(conn, 0x05, 2)
+			}
+			Str(_) => {
+				put_le(conn, 0xfe, 2)
+			}
+			Bool(_) => {
+				put_le(conn, 0x01, 2)
+			}
+			Bytes(_) => {
+				put_le(conn, 0xfc, 2)
+			}
 		}
 	}
-	for _, a := range q.Args {
-		switch a {
-		case Int(v):
-			put_le(conn, v, 8)
-		case Float(v):
-			put_le(conn, i64(gauge.F64bits(v)), 8)
-		case Str(v):
-			put_lenenc(conn, len(v))
-			put_str(conn, v)
-		case Bool(v):
-			if v {
-				put_u8(conn, 1)
-			} else {
-				put_u8(conn, 0)
+	for _, a in q.Args {
+		match a {
+			Int(v) => {
+				put_le(conn, v, 8)
 			}
-		case Bytes(v):
-			put_lenenc(conn, len(v))
-			put_bytes(conn, v)
+			Float(v) => {
+				put_le(conn, i64(gauge.F64bits(v)), 8)
+			}
+			Str(v) => {
+				put_lenenc(conn, len(v))
+				put_str(conn, v)
+			}
+			Bool(v) => {
+				if v {
+					put_u8(conn, 1)
+				} else {
+					put_u8(conn, 0)
+				}
+			}
+			Bytes(v) => {
+				put_lenenc(conn, len(v))
+				put_bytes(conn, v)
+			}
 		}
 	}
 	try end_packet(conn)
@@ -1369,14 +1405,14 @@ func run(conn i64, q query) !(Rows, Result) {
 }
 
 // Server errors leave a connection usable; I/O errors and timeouts do not.
-func usable(err fault) bool {
-	m := say.Str(err)
+fn usable(err fault) bool {
+	let m = say.Str(err)
 	return len(m) > 13 && m[:13] == "mysql: Error "
 }
 
-func (c Client) exec(q query) !(Rows, Result) {
-	conn := try c.acquire()
-	rows, res, err := run(conn, q)
+fn (c Client) exec(q query) !(Rows, Result) {
+	let conn = try c.acquire()
+	let (rows, res, err) = run(conn, q)
 	if err != nil {
 		c.release(conn, usable(err))
 		fail err
@@ -1386,41 +1422,41 @@ func (c Client) exec(q query) !(Rows, Result) {
 }
 
 // Query runs a statement and returns its rows.
-func (c Client) Query(q query) !Rows {
-	tp := rt_tape()
+fn (c Client) Query(q query) !Rows {
+	let tp = rt_tape()
 	if tp != 0 {
-		rows, _ := try c.exec_taped(tp, "Q ", q) // recorded for replay (#241)
+		let (rows, _) = try c.exec_taped(tp, "Q ", q) // recorded for replay (#241)
 		return rows
 	}
-	rows, _ := try c.exec(q)
+	let (rows, _) = try c.exec(q)
 	return rows
 }
 
 // Exec runs a statement and returns what it changed.
-func (c Client) Exec(q query) !Result {
-	tp := rt_tape()
+fn (c Client) Exec(q query) !Result {
+	let tp = rt_tape()
 	if tp != 0 {
-		_, res := try c.exec_taped(tp, "E ", q) // recorded for replay (#241)
+		let (_, res) = try c.exec_taped(tp, "E ", q) // recorded for replay (#241)
 		return res
 	}
-	_, res := try c.exec(q)
+	let (_, res) = try c.exec(q)
 	return res
 }
 
 // Ping checks that the server answers.
-func (c Client) Ping() ! {
+fn (c Client) Ping() ! {
 	_ = try c.Exec("DO 1")
 }
 
 // Begin starts a transaction; finish it with Commit or Rollback, or its connection stays
 // out of the pool.
-func (c Client) Begin() !Tx {
-	tp := rt_tape()
+fn (c Client) Begin() !Tx {
+	let tp = rt_tape()
 	if tp != 0 {
 		return try c.begin_taped(tp) // recorded for replay (#241)
 	}
-	conn := try c.acquire()
-	_, _, err := run(conn, "BEGIN")
+	let conn = try c.acquire()
+	let (_, _, err) = run(conn, "BEGIN")
 	if err != nil {
 		c.release(conn, usable(err))
 		fail err
@@ -1428,11 +1464,11 @@ func (c Client) Begin() !Tx {
 	return Tx{open: true, c: c, conn: conn}
 }
 
-func (t mut Tx) run(q query) !(Rows, Result) {
+fn (t mut Tx) run(q query) !(Rows, Result) {
 	if !t.open {
 		fail "mysql: the transaction is finished"
 	}
-	rows, res, err := run(t.conn, q)
+	let (rows, res, err) = run(t.conn, q)
 	if err != nil {
 		if !usable(err) {
 			t.c.release(t.conn, false)
@@ -1444,36 +1480,36 @@ func (t mut Tx) run(q query) !(Rows, Result) {
 }
 
 // Query runs a statement in the transaction and returns its rows.
-func (t mut Tx) Query(q query) !Rows {
-	tp := rt_tape()
+fn (t mut Tx) Query(q query) !Rows {
+	let tp = rt_tape()
 	if tp != 0 {
-		rows, _ := try t.run_taped(tp, "Q ", q) // recorded for replay (#241)
+		let (rows, _) = try t.run_taped(tp, "Q ", q) // recorded for replay (#241)
 		return rows
 	}
-	rows, _ := try t.run(q)
+	let (rows, _) = try t.run(q)
 	return rows
 }
 
 // Exec runs a statement in the transaction.
-func (t mut Tx) Exec(q query) !Result {
-	tp := rt_tape()
+fn (t mut Tx) Exec(q query) !Result {
+	let tp = rt_tape()
 	if tp != 0 {
-		_, res := try t.run_taped(tp, "E ", q) // recorded for replay (#241)
+		let (_, res) = try t.run_taped(tp, "E ", q) // recorded for replay (#241)
 		return res
 	}
-	_, res := try t.run(q)
+	let (_, res) = try t.run(q)
 	return res
 }
 
-func (t mut Tx) finish(q query) ! {
+fn (t mut Tx) finish(q query) ! {
 	_, _ = try t.run(q)
 	t.c.release(t.conn, true)
 	t.open = false
 }
 
 // Commit makes the transaction's changes permanent.
-func (t mut Tx) Commit() ! {
-	tp := rt_tape()
+fn (t mut Tx) Commit() ! {
+	let tp = rt_tape()
 	if tp != 0 {
 		return try t.finish_taped(tp, "commit", commit_live) // recorded for replay (#241)
 	}
@@ -1481,8 +1517,8 @@ func (t mut Tx) Commit() ! {
 }
 
 // Rollback undoes the transaction's changes.
-func (t mut Tx) Rollback() ! {
-	tp := rt_tape()
+fn (t mut Tx) Rollback() ! {
+	let tp = rt_tape()
 	if tp != 0 {
 		return try t.finish_taped(tp, "rollback", rollback_live) // recorded for replay (#241)
 	}
@@ -1492,48 +1528,52 @@ func (t mut Tx) Rollback() ! {
 // ---- recording and replay (notes/interface_replay.md, section 4; #241) ----
 
 // An effect's body runs at once, before it waits: these hand it its arguments.
-var tapedClient i64
-var tapedQuery i64
-var tapedTx i64
+mut tapedClient i64
+mut tapedQuery i64
+mut tapedTx i64
 
 // exec_taped records or replays one statement as mysql@1 (kind "Q " or "E ", then the query).
-func (c Client) exec_taped(tp i64, kind str, q query) !(Rows, Result) {
+fn (c Client) exec_taped(tp i64, kind str, q query) !(Rows, Result) {
 	tapedClient = cast(i64, c)
 	tapedQuery = cast(i64, q)
-	v := try rt_effect(tp, "mysql@1", rt_query_key(kind, q), exec_live)
+	let v = try rt_effect(tp, "mysql@1", rt_query_key(kind, q), exec_live)
 	return try untape(v)
 }
 
-func exec_live() !str {
-	c := cast(Client, tapedClient)
-	rows, res := try c.exec(cast(query, tapedQuery))
+fn exec_live() !str {
+	let c = cast(Client, tapedClient)
+	let (rows, res) = try c.exec(cast(query, tapedQuery))
 	return entape(rows, res)
 }
 
 // entape is a statement's outcome as a tape holds it: the columns, the rows (each value a tag,
 // 0 null, 1 int, 2 float, 3 text, and its payload), then the Result.
-func entape(rows Rows, res Result) str {
-	b := make([]u8, 0, 256)
+fn entape(rows Rows, res Result) str {
+	mut b = make([]u8, 0, 256)
 	b = tput(b, len(rows.Columns))
-	for _, col := range rows.Columns {
+	for _, col in rows.Columns {
 		b = tput_str(b, col)
 	}
 	b = tput(b, len(rows.Rows))
-	for _, row := range rows.Rows {
+	for _, row in rows.Rows {
 		b = tput(b, len(row))
-		for _, v := range row {
-			switch v {
-			case Null:
-				b = tput(b, 0)
-			case Int(x):
-				b = tput(b, 1)
-				b = tput(b, x)
-			case Float(x):
-				b = tput(b, 2)
-				b = tput(b, i64(gauge.F64bits(x)))
-			case Text(x):
-				b = tput(b, 3)
-				b = tput_str(b, x)
+		for _, v in row {
+			match v {
+				Null => {
+					b = tput(b, 0)
+				}
+				Int(x) => {
+					b = tput(b, 1)
+					b = tput(b, x)
+				}
+				Float(x) => {
+					b = tput(b, 2)
+					b = tput(b, i64(gauge.F64bits(x)))
+				}
+				Text(x) => {
+					b = tput(b, 3)
+					b = tput_str(b, x)
+				}
 			}
 		}
 	}
@@ -1543,35 +1583,47 @@ func entape(rows Rows, res Result) str {
 }
 
 // untape is entape's outcome again.
-func untape(v str) !(Rows, Result) {
-	k := tcur{s: v, pos: 0, bad: false}
-	cols := make([]str, 0, 8)
-	nc := k.word()
-	for i := 0; i < nc && !k.bad; i++ {
-		cols = append(cols, k.text())
+fn untape(v str) !(Rows, Result) {
+	let k = tcur{s: v, pos: 0, bad: false}
+	mut cols = make([]str, 0, 8)
+	let nc = k.word()
+	{
+		mut i = 0
+		for i < nc && !k.bad {
+			cols = append(cols, k.text())
+			i += 1
+		}
 	}
-	all := make([][]Value, 0, 8)
-	nr := k.word()
-	for i := 0; i < nr && !k.bad; i++ {
-		row := make([]Value, 0, 8)
-		n := k.word()
-		for j := 0; j < n && !k.bad; j++ {
-			t := k.word()
-			if t == 0 {
-				row = append(row, Value.Null)
-			} else if t == 1 {
-				row = append(row, Value.Int(k.word()))
-			} else if t == 2 {
-				row = append(row, Value.Float(gauge.F64frombits(u64(k.word()))))
-			} else if t == 3 {
-				row = append(row, Value.Text(k.text()))
-			} else {
-				k.bad = true
+	mut all = make([][]Value, 0, 8)
+	let nr = k.word()
+	{
+		mut i = 0
+		for i < nr && !k.bad {
+			mut row = make([]Value, 0, 8)
+			let n = k.word()
+			{
+			mut j = 0
+			for j < n && !k.bad {
+					let t = k.word()
+					if t == 0 {
+						row = append(row, Value.Null)
+					} else if t == 1 {
+						row = append(row, Value.Int(k.word()))
+					} else if t == 2 {
+						row = append(row, Value.Float(gauge.F64frombits(u64(k.word()))))
+					} else if t == 3 {
+						row = append(row, Value.Text(k.text()))
+					} else {
+						k.bad = true
+					}
+					j += 1
 			}
 		}
-		all = append(all, row)
+			all = append(all, row)
+			i += 1
+		}
 	}
-	res := Result{Affected: k.word(), LastID: 0}
+	let res = Result{Affected: k.word(), LastID: 0}
 	res.LastID = k.word()
 	if k.bad || k.pos != len(v) {
 		fail "replay: mysql@1 result is damaged"
@@ -1586,38 +1638,42 @@ type tcur struct {
 	bad bool
 }
 
-func (k mut tcur) word() i64 {
+fn (k mut tcur) word() i64 {
 	if k.pos+8 > len(k.s) {
 		k.bad = true
 		return 0
 	}
-	v := 0
-	for i := 7; i >= 0; i-- {
-		v = v<<8 | i64(k.s[k.pos+i])
+	mut v = 0
+	{
+		mut i = 7
+		for i >= 0 {
+			v = v<<8 | i64(k.s[k.pos+i])
+			i -= 1
+		}
 	}
 	k.pos += 8
 	return v
 }
 
-func (k mut tcur) text() str {
-	n := k.word()
+fn (k mut tcur) text() str {
+	let n = k.word()
 	if n < 0 || k.pos+n > len(k.s) {
 		k.bad = true
 		return ""
 	}
-	s := k.s[k.pos : k.pos+n]
+	let s = k.s[k.pos : k.pos+n]
 	k.pos += n
 	return s
 }
 
-func tput(b []u8, v i64) []u8 {
-	for i := 0; i < 8; i++ {
+fn tput(b []u8, v i64) []u8 {
+	for i in 0..8 {
 		b = append(b, u8(v >> (8 * i)))
 	}
 	return b
 }
 
-func tput_str(b []u8, s str) []u8 {
+fn tput_str(b []u8, s str) []u8 {
 	b = tput(b, len(s))
 	b = append(b, s...)
 	return b
@@ -1625,33 +1681,33 @@ func tput_str(b []u8, s str) []u8 {
 
 // begin_taped records or replays Begin as mysql.tx@1 "begin"; replaying, the Tx has no
 // connection and its statements come from the tape.
-func (c Client) begin_taped(tp i64) !Tx {
+fn (c Client) begin_taped(tp i64) !Tx {
 	tapedClient = cast(i64, c)
 	tapedTx = 0
 	_ = try rt_effect(tp, "mysql.tx@1", "begin", begin_live)
 	if tapedTx != 0 {
-		t := cast(Tx, tapedTx)
+		let t = cast(Tx, tapedTx)
 		tapedTx = 0
 		return t
 	}
 	return Tx{open: true, c: c, conn: 0}
 }
 
-func begin_live() !str {
-	c := cast(Client, tapedClient)
-	t := try c.Begin()
+fn begin_live() !str {
+	let c = cast(Client, tapedClient)
+	let t = try c.Begin()
 	tapedTx = cast(i64, t)
 	return ""
 }
 
 // run_taped records or replays a statement of the transaction as mysql@1.
-func (t mut Tx) run_taped(tp i64, kind str, q query) !(Rows, Result) {
+fn (t mut Tx) run_taped(tp i64, kind str, q query) !(Rows, Result) {
 	if !t.open {
 		fail "mysql: the transaction is finished"
 	}
 	tapedTx = cast(i64, t)
 	tapedQuery = cast(i64, q)
-	v, err := rt_effect(tp, "mysql@1", rt_query_key(kind, q), txrun_live)
+	let (v, err) = rt_effect(tp, "mysql@1", rt_query_key(kind, q), txrun_live)
 	if err != nil {
 		if !usable(err) {
 			t.open = false
@@ -1661,16 +1717,16 @@ func (t mut Tx) run_taped(tp i64, kind str, q query) !(Rows, Result) {
 	return try untape(v)
 }
 
-func txrun_live() !str {
-	t := cast(Tx, tapedTx)
-	rows, res := try t.run(cast(query, tapedQuery))
+fn txrun_live() !str {
+	let t = cast(Tx, tapedTx)
+	let (rows, res) = try t.run(cast(query, tapedQuery))
 	return entape(rows, res)
 }
 
 // finish_taped records or replays Commit or Rollback as mysql.tx@1.
-func (t mut Tx) finish_taped(tp i64, what str, live func() !str) ! {
+fn (t mut Tx) finish_taped(tp i64, what str, live fn() !str) ! {
 	tapedTx = cast(i64, t)
-	_, err := rt_effect(tp, "mysql.tx@1", what, live)
+	let (_, err) = rt_effect(tp, "mysql.tx@1", what, live)
 	if err == nil || !usable(err) {
 		t.open = false
 	}
@@ -1679,14 +1735,14 @@ func (t mut Tx) finish_taped(tp i64, what str, live func() !str) ! {
 	}
 }
 
-func commit_live() !str {
-	t := cast(Tx, tapedTx)
+fn commit_live() !str {
+	let t = cast(Tx, tapedTx)
 	try t.finish("COMMIT")
 	return ""
 }
 
-func rollback_live() !str {
-	t := cast(Tx, tapedTx)
+fn rollback_live() !str {
+	let t = cast(Tx, tapedTx)
 	try t.finish("ROLLBACK")
 	return ""
 }

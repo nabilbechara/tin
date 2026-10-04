@@ -1,8 +1,8 @@
 // anvil's event loop on macOS: kqueue (connections edge-triggered with EV_CLEAR).
 package anvil
 
-extern func kqueue() i64
-extern func kevent(kq i64, ch i64, nch i64, ev i64, nev i64, ts i64) i64
+extern fn kqueue() i64
+extern fn kevent(kq i64, ch i64, nch i64, ev i64, nev i64, ts i64) i64
 
 const evSize = 32
 const tickIdent = 1099511627776
@@ -12,7 +12,7 @@ const drainIdent = 1099511627777
 // macOS's SO_REUSEPORT does not balance, so core 0 deals.
 const ownListener = false
 
-func kadd(fd i64, filter i64, flags i64) {
+fn kadd(fd i64, filter i64, flags i64) {
 	change[0] = fd
 	change[1] = (filter & 0xffff) | (flags << 16)
 	change[2] = 0
@@ -20,37 +20,37 @@ func kadd(fd i64, filter i64, flags i64) {
 	kevent(kq, change, 1, 0, 0, 0)
 }
 
-var waitTs i64 // per core: the timespec ev_wait passes kevent
+mut waitTs i64 // per core: the timespec ev_wait passes kevent
 
-func ev_init() {
+fn ev_init() {
 	kq = c32(kqueue())
 	waitTs = malloc(16)
 }
 
 // ev_level watches fd for reading, level-triggered (listeners, pipes, wakers).
-func ev_level(fd i64) {
+fn ev_level(fd i64) {
 	kadd(fd, -1, 1)
 }
 
 // ev_conn watches a new connection for reading, edge-triggered.
-func ev_conn(fd i64) {
+fn ev_conn(fd i64) {
 	kadd(fd, -1, 0x21)
 }
 
 // ev_conn_write waits for room to write and stops reading (backpressure).
-func ev_conn_write(fd i64) {
+fn ev_conn_write(fd i64) {
 	kadd(fd, -2, 0x21)
 	kadd(fd, -1, 8)
 }
 
 // ev_conn_read goes back to reading once the output is written.
-func ev_conn_read(fd i64) {
+fn ev_conn_read(fd i64) {
 	kadd(fd, -2, 2)
 	kadd(fd, -1, 4)
 }
 
 // ev_timer fires every ms milliseconds; it returns the ident its events carry.
-func ev_timer(ms i64) i64 {
+fn ev_timer(ms i64) i64 {
 	change[0] = tickIdent
 	change[1] = (-7 & 0xffff) | (1 << 16)
 	change[2] = ms
@@ -59,11 +59,11 @@ func ev_timer(ms i64) i64 {
 	return tickIdent
 }
 
-func ev_timer_ack(id i64) {
+fn ev_timer_ack(id i64) {
 }
 
 // ev_drain_timer is a second periodic timer (the shutdown deadline check); it returns its ident.
-func ev_drain_timer(ms i64) i64 {
+fn ev_drain_timer(ms i64) i64 {
 	change[0] = drainIdent
 	change[1] = (-7 & 0xffff) | (1 << 16)
 	change[2] = ms
@@ -74,21 +74,21 @@ func ev_drain_timer(ms i64) i64 {
 
 // ev_signals makes SIGTERM and SIGINT (blocked in every thread) events of this core's kqueue:
 // EVFILT_SIGNAL records each delivery attempt even for a blocked signal.
-func ev_signals() {
+fn ev_signals() {
 	kadd(15, -6, 1)
 	kadd(2, -6, 1)
 }
 
 // ev_signal reports whether event i is a signal (its ident is the signal number, not an fd).
-func ev_signal(i i64) bool {
+fn ev_signal(i i64) bool {
 	return i64(i16((evs + i*evSize)[1])) == -6
 }
 
-func ev_signal_ack() {
+fn ev_signal_ack() {
 }
 
 // ev_wait waits for events, at most ms milliseconds (-1: no limit).
-func ev_wait(ms i64) i64 {
+fn ev_wait(ms i64) i64 {
 	if ms < 0 {
 		return c32(kevent(kq, 0, 0, evs, maxEvents, 0))
 	}
@@ -97,22 +97,22 @@ func ev_wait(ms i64) i64 {
 	return c32(kevent(kq, 0, 0, evs, maxEvents, waitTs))
 }
 
-func ev_fd(i i64) i64 {
+fn ev_fd(i i64) i64 {
 	return (evs + i*evSize)[0]
 }
 
 // ev_hangup reports EV_EOF: the peer closed (it may arrive with the last data).
-func ev_hangup(i i64) bool {
+fn ev_hangup(i i64) bool {
 	return ((evs+i*evSize)[1]>>16)&0x8000 != 0
 }
 
 // ev_writable reports a write-ready event (else it is readable, a timer or EOF).
-func ev_writable(i i64) bool {
+fn ev_writable(i i64) bool {
 	return i64(i16((evs + i*evSize)[1])) == -2
 }
 
 // ev_task_add watches fd once for a waiting request task: want 1 readable, 2 writable.
-func ev_task_add(fd i64, want i64) {
+fn ev_task_add(fd i64, want i64) {
 	if want == 1 {
 		kadd(fd, -1, 0x11)
 	} else {
@@ -121,7 +121,7 @@ func ev_task_add(fd i64, want i64) {
 }
 
 // ev_task_del stops watching fd for a task (a one-shot event that fired is gone already).
-func ev_task_del(fd i64) {
+fn ev_task_del(fd i64) {
 	kadd(fd, -1, 2)
 	kadd(fd, -2, 2)
 }

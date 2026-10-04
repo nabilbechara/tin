@@ -45,9 +45,9 @@ type Options struct {
 
 // ParseURL reads "redis://[[user]:password@]host[:port][/db]"; "rediss://" is the same over
 // TLS 1.3 (TLS is set, so the server's certificate is verified for host).
-func ParseURL(url str) !Options {
-	o := Options{Addr: "", Username: "", Password: "", DB: 0, Proto: 0, Timeout: 0, TLS: nil}
-	rest := ""
+fn ParseURL(url str) !Options {
+	let o = Options{Addr: "", Username: "", Password: "", DB: 0, Proto: 0, Timeout: 0, TLS: nil}
+	mut rest = ""
 	if len(url) >= 9 && url[:9] == "rediss://" {
 		rest = url[9:]
 		o.TLS = tls.Config{ServerName: "", RootCAs: "", ALPN: []str{}, Timeout: 0, InsecureSkipVerify: false}
@@ -56,26 +56,26 @@ func ParseURL(url str) !Options {
 	} else {
 		fail say.Fault("redis: %q is not a redis:// or rediss:// URL", url)
 	}
-	slash := len(rest)
-	for i := 0; i < len(rest); i++ {
+	mut slash = len(rest)
+	for i in 0..len(rest) {
 		if rest[i] == '/' {
 			slash = i
 			break
 		}
 	}
-	db := rest[slash:]
+	let db = rest[slash:]
 	rest = rest[:slash]
-	at := -1
-	for i := 0; i < len(rest); i++ {
+	mut at = -1
+	for i in 0..len(rest) {
 		if rest[i] == '@' {
 			at = i
 		}
 	}
 	if at >= 0 {
-		cred := rest[:at]
+		let cred = rest[:at]
 		rest = rest[at+1:]
-		colon := -1
-		for i := 0; i < len(cred); i++ {
+		mut colon = -1
+		for i in 0..len(cred) {
 			if cred[i] == ':' {
 				colon = i
 				break
@@ -91,9 +91,9 @@ func ParseURL(url str) !Options {
 	if rest == "" {
 		rest = "127.0.0.1"
 	}
-	hasport := false
-	brackets := false
-	for i := 0; i < len(rest); i++ {
+	mut hasport = false
+	mut brackets = false
+	for i in 0..len(rest) {
 		if rest[i] == '[' {
 			brackets = true
 		}
@@ -109,7 +109,7 @@ func ParseURL(url str) !Options {
 		o.Addr = rest + ":6379"
 	}
 	if len(db) > 1 {
-		n := mint.Atoi(db[1:]) catch _ {
+		let n = mint.Atoi(db[1:]) catch _ {
 			fail say.Fault("redis: bad database number in %q", url)
 		}
 		o.DB = n
@@ -173,30 +173,30 @@ const sErrN = 10
 const sHello = 11 // the connection's handshake: check it, then drop it
 const slotWords = 12
 
-shared var nClients i64
-var lines i64 // per core: the connection of each Client, by id
+shared mut nClients i64
+mut lines i64 // per core: the connection of each Client, by id
 
 // tlsLines holds each TLS connection of this core, by client id. Replacing or clearing one
 // releases the old connection's memory (it is counted long-lived memory, from keep).
-var tlsLines = make([]?tls.Conn, maxClients+1)
+let tlsLines = make([]?tls.Conn, maxClients+1)
 
-func keep_raw(s str) i64 {
-	p := malloc(len(s) + 1)
+fn keep_raw(s str) i64 {
+	let p = malloc(len(s) + 1)
 	memcpy(p, cast(i64, s)+8, len(s))
 	return p
 }
 
 // Open makes a client for the server in o. It connects on first use, on each core.
-func Open(o Options) Client {
-	addr := o.Addr
+fn Open(o Options) Client {
+	mut addr = o.Addr
 	if addr == "" {
 		addr = "127.0.0.1:6379"
 	}
-	id := __atomic_add(&nClients, 1)
+	let id = __atomic_add(&nClients, 1)
 	if id >= maxClients {
 		return Client{open: false, rec: 0}
 	}
-	rec := calloc(recWords, 8)
+	let rec = calloc(recWords, 8)
 	rec[rAddr] = keep_raw(addr)
 	rec[rAddrN] = len(addr)
 	rec[rUser] = keep_raw(o.Username)
@@ -207,19 +207,19 @@ func Open(o Options) Client {
 	rec[rProto] = o.Proto
 	rec[rTimeout] = o.Timeout
 	rec[rID] = id
-	cfg := o.TLS
+	let cfg = o.TLS
 	if cfg != nil {
 		rec[rTls] = cast(i64, keep(cfg))
 	}
 	return Client{open: true, rec: rec}
 }
 
-func (c Client) line() i64 {
+fn (c Client) line() i64 {
 	if lines == 0 {
 		lines = calloc(maxClients+1, 8)
 	}
-	id := c.rec[rID]
-	l := lines[id]
+	let id = c.rec[rID]
+	mut l = lines[id]
 	if l == 0 {
 		l = calloc(lineWords, 8)
 		l[lFd] = -1
@@ -231,36 +231,41 @@ func (c Client) line() i64 {
 
 // ---- commands ----
 
-func is_space(c u8) bool {
+fn is_space(c u8) bool {
 	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
 }
 
-func arg_text(a qarg) str {
-	switch a {
-	case Int(v):
-		return mint.Itoa(v)
-	case Float(v):
-		return mint.FormatFloat(v, 'g', -1)
-	case Str(v):
-		return v
-	case Bool(v):
-		if v {
-			return "1"
+fn arg_text(a qarg) str {
+	match a {
+		Int(v) => {
+			return mint.Itoa(v)
 		}
-		return "0"
-	case Bytes(v):
-		return str(v)
+		Float(v) => {
+			return mint.FormatFloat(v, 'g', -1)
+		}
+		Str(v) => {
+			return v
+		}
+		Bool(v) => {
+			if v {
+				return "1"
+			}
+			return "0"
+		}
+		Bytes(v) => {
+			return str(v)
+		}
 	}
 }
 
 // words splits a query into a command's arguments: the text at spaces, while a value is
 // always one argument (with the text right next to it: "user:{id}" is one).
-func words(q query) []str {
-	out := []str{}
-	cur := ""
-	have := false
-	for i, part := range q.Parts {
-		j := 0
+fn words(q query) []str {
+	mut out = []str{}
+	mut cur = ""
+	mut have = false
+	for i, part in q.Parts {
+		mut j = 0
 		for j < len(part) {
 			if is_space(part[j]) {
 				if have {
@@ -268,12 +273,12 @@ func words(q query) []str {
 					cur = ""
 					have = false
 				}
-				j++
+				j += 1
 				continue
 			}
-			k := j
+			mut k = j
 			for k < len(part) && !is_space(part[k]) {
-				k++
+				k += 1
 			}
 			cur = cur + part[j:k]
 			have = true
@@ -290,48 +295,52 @@ func words(q query) []str {
 	return out
 }
 
-func digits(v i64) i64 {
-	n := 1
+fn digits(v i64) i64 {
+	mut n = 1
 	for v >= 10 {
 		v /= 10
-		n++
+		n += 1
 	}
 	return n
 }
 
-func put_int(p i64, v i64) i64 {
-	n := digits(v)
-	for i := n - 1; i >= 0; i-- {
-		store8(p+i, '0'+v%10)
-		v /= 10
+fn put_int(p i64, v i64) i64 {
+	let n = digits(v)
+	{
+		mut i = n - 1
+		for i >= 0 {
+			store8(p+i, '0'+v%10)
+			v /= 10
+			i -= 1
+		}
 	}
 	return p + n
 }
 
-func out_reserve(l i64, n i64) i64 {
+fn out_reserve(l i64, n i64) i64 {
 	if l[lOutN]+n > l[lOutCap] {
-		c := l[lOutCap]*2 + n + 4096
+		let c = l[lOutCap]*2 + n + 4096
 		l[lOut] = realloc(l[lOut], c)
 		l[lOutCap] = c
 	}
-	p := l[lOut] + l[lOutN]
+	let p = l[lOut] + l[lOutN]
 	l[lOutN] += n
 	return p
 }
 
 // encode appends args as one RESP command to the connection's output.
-func encode(l i64, args []str) {
-	n := 3 + digits(len(args))
-	for _, a := range args {
+fn encode(l i64, args []str) {
+	mut n = 3 + digits(len(args))
+	for _, a in args {
 		n += 5 + digits(len(a)) + len(a)
 	}
-	p := out_reserve(l, n)
+	mut p = out_reserve(l, n)
 	store8(p, '*')
 	p = put_int(p+1, len(args))
 	store8(p, '\r')
 	store8(p+1, '\n')
 	p += 2
-	for _, a := range args {
+	for _, a in args {
 		store8(p, '$')
 		p = put_int(p+1, len(a))
 		store8(p, '\r')
@@ -346,14 +355,14 @@ func encode(l i64, args []str) {
 
 // ---- the queue of slots ----
 
-func new_slot(want i64) i64 {
-	s := calloc(slotWords, 8)
+fn new_slot(want i64) i64 {
+	let s = calloc(slotWords, 8)
 	s[sTask] = rt_task_current()
 	s[sWant] = want
 	return s
 }
 
-func free_slot(s i64) {
+fn free_slot(s i64) {
 	if s[sMsg] != 0 {
 		free(s[sMsg])
 	}
@@ -363,70 +372,70 @@ func free_slot(s i64) {
 	free(s)
 }
 
-func q_grow(l i64) {
+fn q_grow(l i64) {
 	if l[lQHead]+l[lQN] < l[lQCap] {
 		return
 	}
-	q := l[lQ]
+	let q = l[lQ]
 	if l[lQHead] > 0 {
 		memmove(q, q+8*l[lQHead], 8*l[lQN])
 		l[lQHead] = 0
 		return
 	}
-	c := l[lQCap]*2 + 32
+	let c = l[lQCap]*2 + 32
 	l[lQ] = realloc(q, 8*c)
 	l[lQCap] = c
 }
 
-func q_push(l i64, s i64) {
+fn q_push(l i64, s i64) {
 	q_grow(l)
-	q := l[lQ]
+	let q = l[lQ]
 	q[l[lQHead]+l[lQN]] = s
-	l[lQN]++
+	l[lQN] += 1
 }
 
-func q_push_front(l i64, s i64) {
+fn q_push_front(l i64, s i64) {
 	if l[lQHead] == 0 {
 		q_grow(l)
-		q := l[lQ]
+		let q = l[lQ]
 		memmove(q+8, q, 8*l[lQN])
 		l[lQHead] = 1
 	}
-	l[lQHead]--
-	q := l[lQ]
+	l[lQHead] -= 1
+	let q = l[lQ]
 	q[l[lQHead]] = s
-	l[lQN]++
+	l[lQN] += 1
 }
 
-func q_at(l i64, i i64) i64 {
-	q := l[lQ]
+fn q_at(l i64, i i64) i64 {
+	let q = l[lQ]
 	return q[l[lQHead]+i]
 }
 
-func q_pop(l i64) i64 {
-	s := q_at(l, 0)
-	l[lQHead]++
-	l[lQN]--
+fn q_pop(l i64) i64 {
+	let s = q_at(l, 0)
+	l[lQHead] += 1
+	l[lQN] -= 1
 	if l[lQN] == 0 {
 		l[lQHead] = 0
 	}
 	return s
 }
 
-func wake(s i64) {
-	t := s[sTask]
+fn wake(s i64) {
+	let t = s[sTask]
 	if t != 0 && t != rt_task_current() {
 		rt_task_wake(t)
 	}
 }
 
-func set_err(s i64, msg str) {
+fn set_err(s i64, msg str) {
 	s[sErr] = keep_raw(msg)
 	s[sErrN] = len(msg)
 }
 
 // fail_line closes the connection and fails every caller waiting on it.
-func fail_line(l i64, msg str) {
+fn fail_line(l i64, msg str) {
 	if l[lFd] >= 0 {
 		// A TLS connection is dropped without close_notify: the descriptor goes either way.
 		tlsLines[l[lID]] = nil
@@ -434,7 +443,7 @@ func fail_line(l i64, msg str) {
 		l[lFd] = -1
 	}
 	for l[lQN] > 0 {
-		s := q_pop(l)
+		let s = q_pop(l)
 		if s[sGone] != 0 || s[sHello] != 0 {
 			free_slot(s)
 			continue
@@ -449,16 +458,16 @@ func fail_line(l i64, msg str) {
 	l[lInE] = 0
 }
 
-func os_msg(what str, e i64) str {
-	m := rt_sys_strerror(e)
+fn os_msg(what str, e i64) str {
+	let m = rt_sys_strerror(e)
 	return "redis: {what}: {rt_str_from_raw(m, strlen(m))}"
 }
 
 // hand_off gives the connection's I/O to the first caller still waiting, if any.
-func hand_off(l i64) {
+fn hand_off(l i64) {
 	l[lBusy] = 0
-	for i := 0; i < l[lQN]; i++ {
-		s := q_at(l, i)
+	for i in 0..l[lQN] {
+		let s = q_at(l, i)
 		if s[sGone] == 0 && s[sHello] == 0 && s[sTask] != 0 && s[sTask] != rt_task_current() {
 			s[sOwner] = 1
 			l[lBusy] = 1
@@ -470,23 +479,23 @@ func hand_off(l i64) {
 
 // ---- replies ----
 
-func line_end(p i64, at i64) i64 {
+fn line_end(p i64, at i64) i64 {
 	for load8(p+at) != '\r' {
-		at++
+		at += 1
 	}
 	return at
 }
 
-func raw_int(p i64, from i64, to i64) i64 {
-	neg := false
+fn raw_int(p i64, from i64, to i64) i64 {
+	mut neg = false
 	if from < to && load8(p+from) == '-' {
 		neg = true
-		from++
+		from += 1
 	}
-	v := 0
+	mut v = 0
 	for from < to {
 		v = v*10 + i64(load8(p+from)) - '0'
-		from++
+		from += 1
 	}
 	if neg {
 		return -v
@@ -496,17 +505,17 @@ func raw_int(p i64, from i64, to i64) i64 {
 
 // resp_len is the length of the first complete reply in the n bytes at p: -1 while it
 // is incomplete, -2 when the bytes are not RESP.
-func resp_len(p i64, n i64) i64 {
-	need := 1
-	at := 0
+fn resp_len(p i64, n i64) i64 {
+	mut need = 1
+	mut at = 0
 	for need > 0 {
 		if at >= n {
 			return -1
 		}
-		t := load8(p + at)
-		e := at + 1
+		let t = load8(p + at)
+		mut e = at + 1
 		for e+1 < n && load8(p+e) != '\r' {
-			e++
+			e += 1
 		}
 		if e+1 >= n {
 			return -1
@@ -514,9 +523,9 @@ func resp_len(p i64, n i64) i64 {
 		if load8(p+e+1) != '\n' {
 			return -2
 		}
-		v := raw_int(p, at+1, e)
+		let v = raw_int(p, at+1, e)
 		at = e + 2
-		need--
+		need -= 1
 		if t == '$' || t == '=' || t == '!' {
 			if v >= 0 {
 				at += v + 2
@@ -541,10 +550,10 @@ func resp_len(p i64, n i64) i64 {
 	return at
 }
 
-func reply_items(p i64, at i64, n i64) ([]Reply, i64) {
-	items := make([]Reply, 0, n)
-	for i := 0; i < n; i++ {
-		r, next := reply_at(p, at)
+fn reply_items(p i64, at i64, n i64) ([]Reply, i64) {
+	mut items = make([]Reply, 0, n)
+	for i in 0..n {
+		let (r, next) = reply_at(p, at)
 		items = append(items, r)
 		at = next
 	}
@@ -552,11 +561,11 @@ func reply_items(p i64, at i64, n i64) ([]Reply, i64) {
 }
 
 // reply_at reads the complete reply at p+at; it returns the reply and where the next starts.
-func reply_at(p i64, at i64) (Reply, i64) {
-	t := load8(p + at)
-	e := line_end(p, at+1)
-	line := rt_str_from_raw(p+at+1, e-at-1)
-	next := e + 2
+fn reply_at(p i64, at i64) (Reply, i64) {
+	let t = load8(p + at)
+	let e = line_end(p, at+1)
+	let line = rt_str_from_raw(p+at+1, e-at-1)
+	let next = e + 2
 	if t == '+' || t == '(' {
 		return Reply.Str(line), next
 	}
@@ -573,7 +582,7 @@ func reply_at(p i64, at i64) (Reply, i64) {
 		return Reply.Bool(line == "t"), next
 	}
 	if t == ',' {
-		f := mint.ParseFloat(line) catch _ { 0.0 }
+		mut f = mint.ParseFloat(line) catch _ { 0.0 }
 		if line == "inf" {
 			f = 1.0e308 * 10.0
 		} else if line == "-inf" {
@@ -581,12 +590,12 @@ func reply_at(p i64, at i64) (Reply, i64) {
 		}
 		return Reply.Float(f), next
 	}
-	n := raw_int(p, at+1, e)
+	let n = raw_int(p, at+1, e)
 	if t == '$' || t == '=' || t == '!' {
 		if n < 0 {
 			return Reply.Nil, next
 		}
-		s := rt_str_from_raw(p+next, n)
+		mut s = rt_str_from_raw(p+next, n)
 		if t == '=' && n >= 4 {
 			s = s[4:]
 		}
@@ -599,22 +608,22 @@ func reply_at(p i64, at i64) (Reply, i64) {
 		return Reply.Nil, next
 	}
 	if t == '%' {
-		pairs, after := reply_items(p, next, 2*n)
+		let (pairs, after) = reply_items(p, next, 2*n)
 		return Reply.Map(pairs), after
 	}
 	if t == '|' {
-		_, after := reply_items(p, next, 2*n)
+		let (_, after) = reply_items(p, next, 2*n)
 		return reply_at(p, after)
 	}
-	items, after := reply_items(p, next, n)
+	let (items, after) = reply_items(p, next, n)
 	return Reply.Array(items), after
 }
 
 // deliver hands each complete reply to the slot at the front of the queue.
-func deliver(l i64) {
+fn deliver(l i64) {
 	for l[lQN] > 0 {
-		p := l[lIn] + l[lInS]
-		n := resp_len(p, l[lInE]-l[lInS])
+		let p = l[lIn] + l[lInS]
+		let n = resp_len(p, l[lInE]-l[lInS])
 		if n == -1 {
 			break
 		}
@@ -622,22 +631,22 @@ func deliver(l i64) {
 			fail_line(l, "redis: the server sent something that is not RESP")
 			return
 		}
-		s := q_at(l, 0)
+		let s = q_at(l, 0)
 		if s[sMsgN]+n > s[sMsgCap] {
-			c := s[sMsgCap]*2 + n
+			let c = s[sMsgCap]*2 + n
 			s[sMsg] = realloc(s[sMsg], c)
 			s[sMsgCap] = c
 		}
 		memcpy(s[sMsg]+s[sMsgN], p, n)
 		s[sMsgN] += n
 		l[lInS] += n
-		s[sGot]++
+		s[sGot] += 1
 		if s[sGot] < s[sWant] {
 			continue
 		}
 		q_pop(l)
 		if s[sHello] != 0 {
-			bad := hello_error(s)
+			let bad = hello_error(s)
 			free_slot(s)
 			if bad != "" {
 				fail_line(l, "redis: connecting: {bad}")
@@ -656,14 +665,16 @@ func deliver(l i64) {
 	}
 }
 
-func hello_error(s i64) str {
-	at := 0
+fn hello_error(s i64) str {
+	mut at = 0
 	for at < s[sMsgN] {
-		r, next := reply_at(s[sMsg], at)
-		switch r {
-		case Err(m):
-			return m
-		default:
+		let (r, next) = reply_at(s[sMsg], at)
+		match r {
+			Err(m) => {
+				return m
+			}
+			_ => {
+			}
 		}
 		at = next
 	}
@@ -673,24 +684,24 @@ func hello_error(s i64) str {
 // ---- the connection ----
 
 // connect dials and queues the handshake (HELLO or AUTH, then SELECT) ahead of everything.
-func connect(l i64, rec i64) ! {
-	addr := rt_str_from_raw(rec[rAddr], rec[rAddrN])
+fn connect(l i64, rec i64) ! {
+	let addr = rt_str_from_raw(rec[rAddr], rec[rAddrN])
 	if rec[rTls] != 0 {
-		base := cast(tls.Config, rec[rTls])
-		cfg := tls.Config{ServerName: base.ServerName, RootCAs: base.RootCAs, ALPN: base.ALPN, Timeout: rec[rTimeout], InsecureSkipVerify: base.InsecureSkipVerify}
-		tc := try tls.Dial(addr, cfg)
+		let base = cast(tls.Config, rec[rTls])
+		let cfg = tls.Config{ServerName: base.ServerName, RootCAs: base.RootCAs, ALPN: base.ALPN, Timeout: rec[rTimeout], InsecureSkipVerify: base.InsecureSkipVerify}
+		let tc = try tls.Dial(addr, cfg)
 		tc.SetTimeout(rec[rTimeout])
 		l[lFd] = tc.Fd()
 		tlsLines[l[lID]] = keep(tc)
 	} else {
-		conn := try wire.DialTimeout(addr, rec[rTimeout])
+		let conn = try wire.DialTimeout(addr, rec[rTimeout])
 		l[lFd] = conn.Fd()
 	}
-	user := rt_str_from_raw(rec[rUser], rec[rUserN])
-	pass := rt_str_from_raw(rec[rPass], rec[rPassN])
-	cmds := [][]str{}
+	mut user = rt_str_from_raw(rec[rUser], rec[rUserN])
+	let pass = rt_str_from_raw(rec[rPass], rec[rPassN])
+	mut cmds = [][]str{}
 	if rec[rProto] == 3 {
-		hello := []str{"HELLO", "3"}
+		mut hello = []str{"HELLO", "3"}
 		if pass != "" {
 			if user == "" {
 				user = "default"
@@ -712,25 +723,25 @@ func connect(l i64, rec i64) ! {
 		return
 	}
 	// The queued commands move behind the handshake.
-	queued := l[lOutN]
-	for _, c := range cmds {
+	let queued = l[lOutN]
+	for _, c in cmds {
 		encode(l, c)
 	}
-	n := l[lOutN] - queued
+	let n = l[lOutN] - queued
 	if queued > 0 {
-		tmp := malloc(n)
+		let tmp = malloc(n)
 		memcpy(tmp, l[lOut]+queued, n)
 		memmove(l[lOut]+n, l[lOut], queued)
 		memcpy(l[lOut], tmp, n)
 		free(tmp)
 	}
-	s := new_slot(len(cmds))
+	let s = new_slot(len(cmds))
 	s[sHello] = 1
 	q_push_front(l, s)
 }
 
 // give_up ends a wait that ran out of time: the slot stays queued for its replies.
-func give_up(l i64, s i64, r i64) ! {
+fn give_up(l i64, s i64, r i64) ! {
 	s[sGone] = 1
 	if s[sOwner] != 0 || l[lBusy] == 0 {
 		hand_off(l)
@@ -743,12 +754,12 @@ func give_up(l i64, s i64, r i64) ! {
 
 // drive does the connection's I/O until s has its replies: writes what is queued, reads,
 // and hands replies to their slots. Then it passes the I/O on to a caller still waiting.
-func drive(l i64, s i64, rec i64) ! {
+fn drive(l i64, s i64, rec i64) ! {
 	if l[lFd] >= 0 && l[lQN] == 1 && l[lOutN] > 0 && l[lWpos] == 0 && l[lInE] == 0 {
 		// An idle connection the server may have closed (a restart, an idle timeout): find
 		// out before sending, so the command goes on a new connection instead of failing.
-		b := calloc(1, 8)
-		k := rt_sys_recv(l[lFd], b, 1, 2)
+		let b = calloc(1, 8)
+		let k = rt_sys_recv(l[lFd], b, 1, 2)
 		free(b)
 		if k == 0 || (k < 0 && rt_errno() != EAGAIN && rt_errno() != EINTR) {
 			rt_sys_close(l[lFd])
@@ -756,7 +767,7 @@ func drive(l i64, s i64, rec i64) ! {
 		}
 	}
 	if l[lFd] < 0 {
-		err := connect(l, rec)
+		let err = connect(l, rec)
 		if err != nil {
 			fail_line(l, say.Str(err))
 			hand_off(l)
@@ -765,14 +776,14 @@ func drive(l i64, s i64, rec i64) ! {
 	}
 	// Let the core run the other requests of this turn first: their commands go out with ours.
 	rt_task_defer()
-	timeout := rec[rTimeout]
+	let timeout = rec[rTimeout]
 	for s[sState] == 0 {
-		fd := l[lFd]
-		tc := tlsLines[l[lID]]
+		let fd = l[lFd]
+		let tc = tlsLines[l[lID]]
 		if tc != nil && l[lWpos] < l[lOutN] {
 			// A TLS write waits inside tls (records cannot be half sent); a fault drops the
 			// connection.
-			err := tc.Write(rt_str_from_raw(l[lOut]+l[lWpos], l[lOutN]-l[lWpos]))
+			let err = tc.Write(rt_str_from_raw(l[lOut]+l[lWpos], l[lOutN]-l[lWpos]))
 			if err != nil {
 				fail_line(l, say.Str(err))
 				break
@@ -782,7 +793,7 @@ func drive(l i64, s i64, rec i64) ! {
 			continue
 		}
 		if l[lWpos] < l[lOutN] {
-			k := rt_sys_write(fd, l[lOut]+l[lWpos], l[lOutN]-l[lWpos])
+			let k = rt_sys_write(fd, l[lOut]+l[lWpos], l[lOutN]-l[lWpos])
 			if k > 0 {
 				l[lWpos] += k
 				if l[lWpos] == l[lOutN] {
@@ -791,12 +802,12 @@ func drive(l i64, s i64, rec i64) ! {
 				}
 				continue
 			}
-			e := rt_errno()
+			let e = rt_errno()
 			if e == EINTR {
 				continue
 			}
 			if e == EAGAIN {
-				r := rt_task_wait(fd, 2, timeout)
+				let r = rt_task_wait(fd, 2, timeout)
 				if r != waitReady {
 					fail give_up(l, s, r)
 				}
@@ -810,13 +821,13 @@ func drive(l i64, s i64, rec i64) ! {
 			continue
 		}
 		if l[lInE] == l[lInCap] {
-			c := l[lInCap]*2 + 16384
+			let c = l[lInCap]*2 + 16384
 			l[lIn] = realloc(l[lIn], c)
 			l[lInCap] = c
 		}
 		if tc != nil {
-			buf := make([]u8, 0, l[lInCap]-l[lInE])
-			got, rerr := tc.ReadNow(mut buf, l[lInCap]-l[lInE])
+			let buf = make([]u8, 0, l[lInCap]-l[lInE])
+			let (got, rerr) = tc.ReadNow(mut buf, l[lInCap]-l[lInE])
 			if rerr != nil {
 				fail_line(l, say.Str(rerr))
 				break
@@ -826,13 +837,13 @@ func drive(l i64, s i64, rec i64) ! {
 				l[lInE] += got
 				continue
 			}
-			r := rt_task_wait(fd, 1, timeout)
+			let r = rt_task_wait(fd, 1, timeout)
 			if r != waitReady {
 				fail give_up(l, s, r)
 			}
 			continue
 		}
-		k := rt_sys_read(fd, l[lIn]+l[lInE], l[lInCap]-l[lInE])
+		let k = rt_sys_read(fd, l[lIn]+l[lInE], l[lInCap]-l[lInE])
 		if k > 0 {
 			l[lInE] += k
 			continue
@@ -841,12 +852,12 @@ func drive(l i64, s i64, rec i64) ! {
 			fail_line(l, "redis: the server closed the connection")
 			break
 		}
-		e := rt_errno()
+		let e = rt_errno()
 		if e == EINTR {
 			continue
 		}
 		if e == EAGAIN {
-			r := rt_task_wait(fd, 1, timeout)
+			let r = rt_task_wait(fd, 1, timeout)
 			if r != waitReady {
 				fail give_up(l, s, r)
 			}
@@ -858,20 +869,20 @@ func drive(l i64, s i64, rec i64) ! {
 }
 
 // exchange sends commands and waits for their replies; it returns the finished slot.
-func (c Client) exchange(cmds [][]str) !i64 {
+fn (c Client) exchange(cmds [][]str) !i64 {
 	if !c.open {
 		fail "redis: the client is not open (too many clients: open one per server, not per request)"
 	}
-	for _, a := range cmds {
+	for _, a in cmds {
 		if len(a) == 0 {
 			fail "redis: an empty command"
 		}
 	}
-	l := c.line()
-	for _, a := range cmds {
+	let l = c.line()
+	for _, a in cmds {
 		encode(l, a)
 	}
-	s := new_slot(len(cmds))
+	let s = new_slot(len(cmds))
 	q_push(l, s)
 	if l[lBusy] == 0 {
 		l[lBusy] = 1
@@ -882,13 +893,13 @@ func (c Client) exchange(cmds [][]str) !i64 {
 			try drive(l, s, c.rec)
 			continue
 		}
-		r := rt_task_park(c.rec[rTimeout])
+		let r = rt_task_park(c.rec[rTimeout])
 		if r != waitReady {
 			fail give_up(l, s, r)
 		}
 	}
 	if s[sState] == 2 {
-		m := rt_str_from_raw(s[sErr], s[sErrN])
+		let m = rt_str_from_raw(s[sErr], s[sErrN])
 		free_slot(s)
 		fail m
 	}
@@ -898,25 +909,25 @@ func (c Client) exchange(cmds [][]str) !i64 {
 // ---- recording and replay (notes/interface_replay.md, section 4; #241) ----
 
 // The client and commands of the exchange an effect body makes (read at its start).
-var tapedClient i64
-var tapedCmds i64
+mut tapedClient i64
+mut tapedCmds i64
 
 // exchange_taped records or replays one exchange as redis@1: the key is the commands (each word
 // as its length, ":" and its bytes; a value written with a secret is its handle), the result
 // the raw replies; it returns a slot holding them.
-func (c Client) exchange_taped(tp i64, cmds [][]str, qs []query) !i64 {
-	for _, a := range cmds {
+fn (c Client) exchange_taped(tp i64, cmds [][]str, qs []query) !i64 {
+	for _, a in cmds {
 		if len(a) == 0 {
 			fail "redis: an empty command"
 		}
 	}
-	k := make([]u8, 0, 64)
-	for _, q := range qs {
-		a := words(q)
+	mut k = make([]u8, 0, 64)
+	for _, q in qs {
+		mut a = words(q)
 		if q.Hidden != 0 {
 			a = key_words(q)
 		}
-		for i, w := range a {
+		for i, w in a {
 			if i > 0 {
 				k = append(k, ' ')
 			}
@@ -928,11 +939,11 @@ func (c Client) exchange_taped(tp i64, cmds [][]str, qs []query) !i64 {
 	}
 	tapedClient = cast(i64, c)
 	tapedCmds = cast(i64, cmds)
-	v := try rt_effect(tp, "redis@1", str(k), exchange_live)
+	let v = try rt_effect(tp, "redis@1", str(k), exchange_live)
 	if len(cmds) > 0 && !replies_fit(v, len(cmds)) {
 		fail "replay: redis@1 replies are damaged"
 	}
-	s := new_slot(len(cmds))
+	let s = new_slot(len(cmds))
 	s[sMsg] = malloc(len(v) + 1)
 	memcpy(s[sMsg], cast(i64, v)+8, len(v))
 	s[sMsgN] = len(v)
@@ -942,18 +953,18 @@ func (c Client) exchange_taped(tp i64, cmds [][]str, qs []query) !i64 {
 	return s
 }
 
-func exchange_live() !str {
-	c := cast(Client, tapedClient)
-	s := try c.exchange(cast([][]str, tapedCmds))
-	v := rt_str_from_raw(s[sMsg], s[sMsgN])
+fn exchange_live() !str {
+	let c = cast(Client, tapedClient)
+	let s = try c.exchange(cast([][]str, tapedCmds))
+	let v = rt_str_from_raw(s[sMsg], s[sMsgN])
 	free_slot(s)
 	return v
 }
 
 // key_words is words(q) with each value written with a secret replaced by its handle.
-func key_words(q query) []str {
-	args := make([]qarg, 0, len(q.Args))
-	for i, a := range q.Args {
+fn key_words(q query) []str {
+	mut args = make([]qarg, 0, len(q.Args))
+	for i, a in q.Args {
 		if i < 64 && (q.Hidden>>u64(i))&1 != 0 {
 			args = append(args, qarg.Str(rt_secret_key(arg_text(a))))
 		} else {
@@ -964,11 +975,11 @@ func key_words(q query) []str {
 }
 
 // replies_fit reports whether v holds exactly n complete replies.
-func replies_fit(v str, n i64) bool {
-	p := cast(i64, v) + 8
-	at := 0
-	for i := 0; i < n; i++ {
-		k := resp_len(p+at, len(v)-at)
+fn replies_fit(v str, n i64) bool {
+	let p = cast(i64, v) + 8
+	mut at = 0
+	for i in 0..n {
+		let k = resp_len(p+at, len(v)-at)
 		if k <= 0 {
 			return false
 		}
@@ -978,117 +989,126 @@ func replies_fit(v str, n i64) bool {
 }
 
 // Do sends one command and returns its reply; an error reply fails.
-func (c Client) Do(q query) !Reply {
-	tp := rt_tape()
+fn (c Client) Do(q query) !Reply {
+	let tp = rt_tape()
 	if tp != 0 && c.open {
-		s := try c.exchange_taped(tp, [][]str{words(q)}, []query{q}) // recorded for replay (#241)
-		r, _ := reply_at(s[sMsg], 0)
+		let s = try c.exchange_taped(tp, [][]str{words(q)}, []query{q}) // recorded for replay (#241)
+		let (r, _) = reply_at(s[sMsg], 0)
 		free_slot(s)
-		switch r {
-		case Err(m):
-			fail "redis: {m}"
-		default:
+		match r {
+			Err(m) => {
+				fail "redis: {m}"
+			}
+			_ => {
+			}
 		}
 		return r
 	}
-	s := try c.exchange([][]str{words(q)})
-	r, _ := reply_at(s[sMsg], 0)
+	let s = try c.exchange([][]str{words(q)})
+	let (r, _) = reply_at(s[sMsg], 0)
 	free_slot(s)
-	switch r {
-	case Err(m):
-		fail "redis: {m}"
-	default:
+	match r {
+		Err(m) => {
+			fail "redis: {m}"
+		}
+		_ => {
+		}
 	}
 	return r
 }
 
 // Pipe sends commands together and returns their replies in order; error replies come
 // back as Err. The commands go out back to back, so MULTI ... EXEC in one Pipe is atomic.
-func (c Client) Pipe(qs []query) ![]Reply {
-	cmds := [][]str{}
-	for _, q := range qs {
+fn (c Client) Pipe(qs []query) ![]Reply {
+	mut cmds = [][]str{}
+	for _, q in qs {
 		cmds = append(cmds, words(q))
 	}
 	if len(cmds) == 0 {
 		return []Reply{}
 	}
-	tp := rt_tape()
+	let tp = rt_tape()
 	if tp != 0 && c.open {
-		s := try c.exchange_taped(tp, cmds, qs) // recorded for replay (#241)
-		items, _ := reply_items(s[sMsg], 0, len(cmds))
+		let s = try c.exchange_taped(tp, cmds, qs) // recorded for replay (#241)
+		let (items, _) = reply_items(s[sMsg], 0, len(cmds))
 		free_slot(s)
 		return items
 	}
-	s := try c.exchange(cmds)
-	items, _ := reply_items(s[sMsg], 0, len(cmds))
+	let s = try c.exchange(cmds)
+	let (items, _) = reply_items(s[sMsg], 0, len(cmds))
 	free_slot(s)
 	return items
 }
 
-func unexpected(cmd str, r Reply) ! {
+fn unexpected(cmd str, r Reply) ! {
 	fail "redis: unexpected reply to {cmd}: {r}"
 }
 
 // Get returns the value at key, and whether there is one.
-func (c Client) Get(key str) !(str, bool) {
-	r := try c.Do("GET {key}")
-	switch r {
-	case Str(v):
-		return v, true
-	case Nil:
-		return "", false
-	default:
+fn (c Client) Get(key str) !(str, bool) {
+	let r = try c.Do("GET {key}")
+	match r {
+		Str(v) => {
+			return v, true
+		}
+		Nil => {
+			return "", false
+		}
+		_ => {
+		}
 	}
 	fail unexpected("GET", r)
 }
 
 // Set stores value at key.
-func (c Client) Set(key str, value str) ! {
+fn (c Client) Set(key str, value str) ! {
 	_ = try c.Do("SET {key} {value}")
 }
 
 // SetEx stores value at key for ttl nanoseconds (at least a millisecond).
-func (c Client) SetEx(key str, value str, ttl i64) ! {
-	ms := ttl / 1000000
+fn (c Client) SetEx(key str, value str, ttl i64) ! {
+	mut ms = ttl / 1000000
 	if ms < 1 {
 		ms = 1
 	}
 	_ = try c.Do("SET {key} {value} PX {ms}")
 }
 
-func int_reply(cmd str, r Reply) !i64 {
-	switch r {
-	case Int(v):
-		return v
-	default:
+fn int_reply(cmd str, r Reply) !i64 {
+	match r {
+		Int(v) => {
+			return v
+		}
+		_ => {
+		}
 	}
 	fail unexpected(cmd, r)
 }
 
 // Del removes key; it returns how many keys it removed (0 or 1).
-func (c Client) Del(key str) !i64 {
-	r := try c.Do("DEL {key}")
+fn (c Client) Del(key str) !i64 {
+	let r = try c.Do("DEL {key}")
 	return try int_reply("DEL", r)
 }
 
 // Incr adds one to the integer at key and returns the result.
-func (c Client) Incr(key str) !i64 {
-	r := try c.Do("INCR {key}")
+fn (c Client) Incr(key str) !i64 {
+	let r = try c.Do("INCR {key}")
 	return try int_reply("INCR", r)
 }
 
 // Expire makes key expire after ttl nanoseconds; false when there is no such key.
-func (c Client) Expire(key str, ttl i64) !bool {
-	ms := ttl / 1000000
+fn (c Client) Expire(key str, ttl i64) !bool {
+	mut ms = ttl / 1000000
 	if ms < 1 {
 		ms = 1
 	}
-	r := try c.Do("PEXPIRE {key} {ms}")
-	n := try int_reply("PEXPIRE", r)
+	let r = try c.Do("PEXPIRE {key} {ms}")
+	let n = try int_reply("PEXPIRE", r)
 	return n == 1
 }
 
 // Ping checks that the server answers.
-func (c Client) Ping() ! {
+fn (c Client) Ping() ! {
 	_ = try c.Do("PING")
 }

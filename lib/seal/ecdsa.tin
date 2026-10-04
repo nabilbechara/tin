@@ -6,13 +6,13 @@ package seal
 // uses p384.tin's curve.
 
 // ecdsa_der reads a DER ECDSA-Sig-Value (SEQUENCE of two positive INTEGERs) into r and s.
-func ecdsa_der(sig []u8) !([]u8, []u8) {
-	from, to := try der_expect(sig, 0, len(sig), derSequence, "an ECDSA signature")
+fn ecdsa_der(sig []u8) !([]u8, []u8) {
+	let (from, to) = try der_expect(sig, 0, len(sig), derSequence, "an ECDSA signature")
 	if to != len(sig) {
 		fail "seal: trailing data after the ECDSA signature"
 	}
-	r, next := try der_posint(sig, from, to)
-	s, end := try der_posint(sig, next, to)
+	let (r, next) = try der_posint(sig, from, to)
+	let (s, end) = try der_posint(sig, next, to)
 	if end != to {
 		fail "seal: trailing data in the ECDSA signature"
 	}
@@ -20,16 +20,16 @@ func ecdsa_der(sig []u8) !([]u8, []u8) {
 }
 
 // ecdsa_reduce returns the 4n-byte big-endian b minus m if b >= m (b < 2m), as limbs; public data.
-func ecdsa_reduce(n monty, b []u8) []u64 {
-	x := make([]u64, n.n)
-	for j := 0; j < n.n; j++ {
-		k := 4*n.n - 4*j
+fn ecdsa_reduce(n monty, b []u8) []u64 {
+	let x = make([]u64, n.n)
+	for j in 0..n.n {
+		let k = 4*n.n - 4*j
 		x[j] = u64(b[k-1]) | u64(b[k-2])<<8 | u64(b[k-3])<<16 | u64(b[k-4])<<24
 	}
-	d := make([]u64, n.n)
-	bw := u64(0)
-	for j := 0; j < n.n; j++ {
-		s := x[j] - n.m[j] - bw
+	let d = make([]u64, n.n)
+	mut bw = u64(0)
+	for j in 0..n.n {
+		let s = x[j] - n.m[j] - bw
 		d[j] = s & 0xffffffff
 		bw = (s >> 32) & 1
 	}
@@ -41,31 +41,31 @@ func ecdsa_reduce(n monty, b []u8) []u64 {
 
 // ecdsa_scalars checks 1 <= r, s < n and returns u1 = e/s and u2 = r/s mod n as 4n-byte
 // big-endian numbers, e being the digest's leftmost size bytes.
-func ecdsa_scalars(n mut monty, size i64, digest []u8, r []u8, s []u8) !([]u8, []u8) {
-	rm := n.elem()
-	sm := n.elem()
+fn ecdsa_scalars(n mut monty, size i64, digest []u8, r []u8, s []u8) !([]u8, []u8) {
+	let rm = n.elem()
+	let sm = n.elem()
 	if len(r) > 4*n.n || len(s) > 4*n.n || n.from_bytes(mut rm, monty_bytes(n, r)) == 0 || n.from_bytes(mut sm, monty_bytes(n, s)) == 0 ||
 		n.is_zero(rm) == 1 || n.is_zero(sm) == 1 {
 		fail "seal: ECDSA signature out of range"
 	}
-	e := digest
+	mut e = digest
 	if len(e) > size {
 		e = e[:size]
 	}
-	el := ecdsa_reduce(n, monty_bytes(n, e))
-	em := n.elem()
+	let el = ecdsa_reduce(n, monty_bytes(n, e))
+	let em = n.elem()
 	n.mul(mut em, el, n.rr)
-	w := n.elem()
+	let w = n.elem()
 	n.inv(mut w, sm)
-	u1 := n.elem()
-	u2 := n.elem()
+	let u1 = n.elem()
+	let u2 = n.elem()
 	n.mul(mut u1, em, w)
 	n.mul(mut u2, rm, w)
 	return n.to_bytes(u1), n.to_bytes(u2)
 }
 
-func ecdsa_nibble(k []u8, i i64) i64 {
-	w := i64(k[i/2])
+fn ecdsa_nibble(k []u8, i i64) i64 {
+	let w = i64(k[i/2])
 	if i%2 == 0 {
 		return w >> 4
 	}
@@ -73,22 +73,22 @@ func ecdsa_nibble(k []u8, i i64) i64 {
 }
 
 // ecdsa_check compares the affine x of the result, reduced mod n, with r.
-func ecdsa_check(n monty, x []u8, ok u64, r []u8) ! {
+fn ecdsa_check(n monty, x []u8, ok u64, r []u8) ! {
 	if ok == 0 {
 		fail "seal: ECDSA signature verification failed"
 	}
-	v := ecdsa_reduce(n, monty_bytes(n, x))
-	want := ecdsa_reduce(n, monty_bytes(n, r))
+	let v = ecdsa_reduce(n, monty_bytes(n, x))
+	let want = ecdsa_reduce(n, monty_bytes(n, r))
 	if nat_eq(v, want) == false {
 		fail "seal: ECDSA signature verification failed"
 	}
 }
 
-func nat_eq(a []u64, b []u64) bool {
+fn nat_eq(a []u64, b []u64) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	for i := 0; i < len(a); i++ {
+	for i in 0..len(a) {
 		if a[i] != b[i] {
 			return false
 		}
@@ -97,31 +97,31 @@ func nat_eq(a []u64, b []u64) bool {
 }
 
 // ecdsa_verify_p256 checks (r, s) over digest for the P-256 public key pub.
-func ecdsa_verify_p256(pub []u8, digest []u8, r []u8, s []u8) ! {
-	q := try p256_decode(pub)
-	u1, u2 := try ecdsa_scalars(mut p256n, 32, digest, r, s)
-	tg := make([]p256pt, 0, 16)
-	tq := make([]p256pt, 0, 16)
+fn ecdsa_verify_p256(pub []u8, digest []u8, r []u8, s []u8) ! {
+	let q = try p256_decode(pub)
+	let (u1, u2) = try ecdsa_scalars(mut p256n, 32, digest, r, s)
+	mut tg = make([]p256pt, 0, 16)
+	mut tq = make([]p256pt, 0, 16)
 	tg = append(tg, p256_identity())
 	tq = append(tq, p256_identity())
-	g := p256_generator()
-	for i := 1; i < 16; i++ {
-		a := p256_identity()
+	let g = p256_generator()
+	for i in 1..16 {
+		let a = p256_identity()
 		p256_add(mut a, tg[i-1], g)
 		tg = append(tg, a)
-		b := p256_identity()
+		let b = p256_identity()
 		p256_add(mut b, tq[i-1], q)
 		tq = append(tq, b)
 	}
-	acc := p256_identity()
-	for i := 0; i < 64; i++ {
+	let acc = p256_identity()
+	for i in 0..64 {
 		if i > 0 {
-			for k := 0; k < 4; k++ {
+			for k in 0..4 {
 				p256_double(mut acc, acc)
 			}
 		}
-		w1 := ecdsa_nibble(u1, i)
-		w2 := ecdsa_nibble(u2, i)
+		let w1 = ecdsa_nibble(u1, i)
+		let w2 = ecdsa_nibble(u2, i)
 		if w1 != 0 {
 			p256_add(mut acc, acc, tg[w1])
 		}
@@ -129,37 +129,37 @@ func ecdsa_verify_p256(pub []u8, digest []u8, r []u8, s []u8) ! {
 			p256_add(mut acc, acc, tq[w2])
 		}
 	}
-	x, _, ok := p256_affine(acc)
+	let (x, _, ok) = p256_affine(acc)
 	try ecdsa_check(p256n, x, ok, r)
 }
 
 // ecdsa_verify_curve checks (r, s) over digest for pub on a p384.tin curve.
-func ecdsa_verify_curve(c mut ecCurve, pub []u8, digest []u8, r []u8, s []u8) ! {
-	q := try ec_decode(mut c, pub)
-	u1, u2 := try ecdsa_scalars(mut c.n, c.size, digest, r, s)
-	tg := make([]ecpt, 0, 16)
-	tq := make([]ecpt, 0, 16)
+fn ecdsa_verify_curve(c mut ecCurve, pub []u8, digest []u8, r []u8, s []u8) ! {
+	let q = try ec_decode(mut c, pub)
+	let (u1, u2) = try ecdsa_scalars(mut c.n, c.size, digest, r, s)
+	mut tg = make([]ecpt, 0, 16)
+	mut tq = make([]ecpt, 0, 16)
 	tg = append(tg, ec_identity(c))
 	tq = append(tq, ec_identity(c))
-	g := ec_generator(c)
-	for i := 1; i < 16; i++ {
-		a := ec_identity(c)
+	let g = ec_generator(c)
+	for i in 1..16 {
+		let a = ec_identity(c)
 		ec_add(mut c, mut a, tg[i-1], g)
 		tg = append(tg, a)
-		b := ec_identity(c)
+		let b = ec_identity(c)
 		ec_add(mut c, mut b, tq[i-1], q)
 		tq = append(tq, b)
 	}
-	acc := ec_identity(c)
-	digits := 2 * len(u1)
-	for i := 0; i < digits; i++ {
+	let acc = ec_identity(c)
+	let digits = 2 * len(u1)
+	for i in 0..digits {
 		if i > 0 {
-			for k := 0; k < 4; k++ {
+			for k in 0..4 {
 				ec_double(mut c, mut acc, acc)
 			}
 		}
-		w1 := ecdsa_nibble(u1, i)
-		w2 := ecdsa_nibble(u2, i)
+		let w1 = ecdsa_nibble(u1, i)
+		let w2 = ecdsa_nibble(u2, i)
 		if w1 != 0 {
 			ec_add(mut c, mut acc, acc, tg[w1])
 		}
@@ -167,21 +167,21 @@ func ecdsa_verify_curve(c mut ecCurve, pub []u8, digest []u8, r []u8, s []u8) ! 
 			ec_add(mut c, mut acc, acc, tq[w2])
 		}
 	}
-	x, ok := ec_affine_x(mut c, acc)
+	let (x, ok) = ec_affine_x(mut c, acc)
 	try ecdsa_check(c.n, x, ok, r)
 }
 
 // VerifyECDSA checks a DER-encoded ECDSA signature over digest (a hash of the message) by the
 // public key pub, an uncompressed point on curve ("P-256" or "P-384"). A digest longer than
 // the curve's order is truncated to its leftmost bytes, as FIPS 186-5 says.
-func VerifyECDSA(curve str, pub []u8, digest []u8, sig []u8) ! {
-	r, s := try ecdsa_der(sig)
+fn VerifyECDSA(curve str, pub []u8, digest []u8, sig []u8) ! {
+	let (r, s) = try ecdsa_der(sig)
 	if curve == "P-256" {
 		try ecdsa_verify_p256(pub, digest, r, s)
 		return
 	}
 	if curve == "P-384" {
-		c := try p384_curve()
+		let c = try p384_curve()
 		try ecdsa_verify_curve(mut c, pub, digest, r, s)
 		return
 	}

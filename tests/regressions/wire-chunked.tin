@@ -8,7 +8,7 @@ import "tide"
 import "wire"
 
 // body is the chunked body for path, as parts written 20 ms apart; the server closes after the last.
-func body(path str) []str {
+fn body(path str) []str {
 	if path == "/valid-split" {
 		return []str{"4\r", "\nwi", "ki\r", "\n5\r\npedia\r\n0\r\n", "\r\n"}
 	}
@@ -67,28 +67,28 @@ func body(path str) []str {
 }
 
 // serve answers each request with a chunked response until it sees /stop.
-func serve(l wire.Listener) ! {
+fn serve(l wire.Listener) ! {
 	for {
-		c := try l.Accept()
-		req := make([]u8, 0, 1024)
+		let c = try l.Accept()
+		let req = make([]u8, 0, 1024)
 		for {
-			_, err := c.Read(mut req, 1024)
+			let (_, err) = c.Read(mut req, 1024)
 			if err != nil {
 				fail err
 			}
-			s := str(req)
+			let s = str(req)
 			if len(s) >= 4 && s[len(s)-4:] == "\r\n\r\n" {
 				break
 			}
 		}
-		s := str(req)
-		sp := 4
+		let s = str(req)
+		mut sp = 4
 		for sp < len(s) && s[sp] != ' ' {
-			sp++
+			sp += 1
 		}
-		path := s[4:sp]
-		ok := c.Write("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n") == nil
-		for _, part := range body(path) {
+		let path = s[4:sp]
+		mut ok = c.Write("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n") == nil
+		for _, part in body(path) {
 			if !ok {
 				break
 			}
@@ -102,39 +102,39 @@ func serve(l wire.Listener) ! {
 	}
 }
 
-func show(err fault) str {
+fn show(err fault) str {
 	if err == nil {
 		return "nil"
 	}
 	return say.Str(err)
 }
 
-func worker(id i64) {
+fn worker(id i64) {
 	if id == 1 {
-		l, err := wire.Listen("127.0.0.1:0")
+		let (l, err) = wire.Listen("127.0.0.1:0")
 		if err != nil {
 			say.Line("listen", err)
 			return
 		}
 		relay.Send(0, mint.Itoa(l.Port()))
-		e2 := serve(l)
+		let e2 = serve(l)
 		if e2 != nil {
 			say.Line("serve error", e2)
 		}
 		l.Close()
 		return
 	}
-	_, port := relay.Recv()
-	base := "http://127.0.0.1:" + port
-	paths := []str{"/valid-split", "/extensions", "/leading-zeros", "/not-hex", "/empty-size", "/negative", "/space-first",
+	let (_, port) = relay.Recv()
+	let base = "http://127.0.0.1:" + port
+	let paths = []str{"/valid-split", "/extensions", "/leading-zeros", "/not-hex", "/empty-size", "/negative", "/space-first",
 		"/junk-after-size", "/control-in-ext", "/bare-lf", "/no-crlf-after-data", "/overflow", "/huge-truncated",
 		"/truncated-size", "/truncated-data", "/no-last-chunk", "/no-final-crlf", "/bad-trailer", "/stop"}
-	for _, p := range paths {
-		r, err := wire.Get(base + p)
+	for _, p in paths {
+		let (r, err) = wire.Get(base + p)
 		say.Line(p, r.Status, say.Fmt("%q", r.Body), show(err))
 	}
 }
 
-func main() {
+fn main() {
 	hearth.Run(2, worker)
 }
