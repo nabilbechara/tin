@@ -8,8 +8,6 @@ package wire
 
 import "say"
 
-extern func getaddrinfo(node i64, service i64, hints i64, res i64) i64
-extern func freeaddrinfo(res i64)
 
 // Conn is a TCP connection.
 type Conn struct {
@@ -72,84 +70,6 @@ func split_addr(addr str) !(str, i64) {
 	return addr[:colon], port
 }
 
-// resolve fills a sockaddr_in for host (dotted IPv4, "localhost" or a DNS name).
-func resolve(host str, port i64, sa i64) ! {
-	rt_sockaddr_in(sa, 0, port)
-	if host == "" || host == "localhost" {
-		if host == "localhost" {
-			rt_sockaddr_in(sa, 0x7f000001, port)
-		}
-		return
-	}
-	parts := 0
-	val := 0
-	octets := calloc(1, 8)
-	dotted := true
-	for i := 0; i < len(host); i++ {
-		c := host[i]
-		if c == '.' {
-			if parts >= 3 || val > 255 {
-				dotted = false
-				break
-			}
-			store8(octets+parts, val)
-			parts++
-			val = 0
-		} else if c >= '0' && c <= '9' {
-			val = val*10 + i64(c-'0')
-		} else {
-			dotted = false
-			break
-		}
-	}
-	if dotted && parts == 3 && val <= 255 {
-		store8(octets+3, val)
-		memcpy(sa+4, octets, 4)
-		free(octets)
-		return
-	}
-	free(octets)
-	// getaddrinfo blocks: inside a request task it runs on a helper thread.
-	job := calloc(3, 8)
-	job[0] = rt_heap_str(host)
-	job[1] = calloc(1, 16)
-	try rt_helper_run(dns_job, job, dns_drop)
-	ok := job[2] != 0
-	if ok {
-		memcpy(sa+4, job[1]+4, 4)
-	}
-	dns_drop(job)
-	if !ok {
-		fail say.Fault("wire: cannot resolve %q", host)
-	}
-}
-
-func dns_drop(job i64) {
-	free(job[0])
-	free(job[1])
-	free(job)
-}
-
-// dns_job resolves heap-owned inputs into its own sockaddr; job[2] is 1 on success.
-func dns_job(job i64) {
-	hints := calloc(1, 48)
-	__st(hints+4, 2, 2)
-	__st(hints+8, 1, 2)
-	res := calloc(1, 8)
-	rc := i64(i32(getaddrinfo(job[0]+8, 0, hints, res)))
-	free(hints)
-	if rc != 0 || res[0] == 0 {
-		free(res)
-		return
-	}
-	ai := res[0]
-	addr := rt_ai_addr(ai)
-	memcpy(job[1]+4, addr+4, 4)
-	freeaddrinfo(ai)
-	free(res)
-	job[2] = 1
-}
-
 // wait_io waits until fd is ready for a read (want 1) or write (2), within timeout ns.
 func wait_io(fd i64, want i64, timeout i64, what str) ! {
 	r := rt_task_wait(fd, want, timeout)
@@ -193,13 +113,15 @@ func DialTimeout(addr str, timeout i64) !Conn {
 	if err != nil {
 		fail err
 	}
-	sa := calloc(1, 16)
+	sa := calloc(1, 32)
 	defer free(sa)
-	e2 := resolve(host, port, sa)
+	until := i64(0)
+	if timeout > 0 { until = rt_mono_ns()+timeout }
+	e2 := resolve(host, port, sa, until)
 	if e2 != nil {
 		fail e2
 	}
-	fd := i64(i32(rt_sys_socket(2, 1, 0)))
+	fd := i64(i32(rt_sys_socket(rt_sockaddr_family(sa), 1, 0)))
 	if fd < 0 {
 		fail os_fault("socket")
 	}
@@ -210,7 +132,7 @@ func DialTimeout(addr str, timeout i64) !Conn {
 	free(one)
 	// Sockets are non-blocking: inside a request task a wait lets the core serve others.
 	nonblocking(fd)
-	if i64(i32(rt_sys_connect(fd, sa, 16))) < 0 {
+	if i64(i32(rt_sys_connect(fd, sa, rt_sockaddr_len(sa)))) < 0 {
 		if errno() != EINPROGRESS {
 			f2 := os_fault(say.Fmt("connect %s", addr))
 			rt_sys_close(fd)
@@ -219,7 +141,12 @@ func DialTimeout(addr str, timeout i64) !Conn {
 			}
 			return none
 		}
-		werr := wait_io(fd, 2, timeout, "connect " + addr)
+		left := timeout
+		if until > 0 {
+			left = until-rt_mono_ns()
+			if left <= 0 { rt_sys_close(fd); fail "wire: connect {addr} timed out" }
+		}
+		werr := wait_io(fd, 2, left, "connect " + addr)
 		if werr != nil {
 			rt_sys_close(fd)
 			fail werr
@@ -351,13 +278,13 @@ func Listen(addr str) !Listener {
 	if err != nil {
 		fail err
 	}
-	sa := calloc(1, 16)
+	sa := calloc(1, 32)
 	defer free(sa)
-	e2 := resolve(host, port, sa)
+	e2 := resolve(host, port, sa, 0)
 	if e2 != nil {
 		fail e2
 	}
-	fd := i64(i32(rt_sys_socket(2, 1, 0)))
+	fd := i64(i32(rt_sys_socket(rt_sockaddr_family(sa), 1, 0)))
 	if fd < 0 {
 		fail os_fault("socket")
 	}
@@ -365,7 +292,7 @@ func Listen(addr str) !Listener {
 	one[0] = 1
 	rt_sys_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, one, 4)
 	free(one)
-	if i64(i32(rt_sys_bind(fd, sa, 16))) < 0 {
+	if i64(i32(rt_sys_bind(fd, sa, rt_sockaddr_len(sa)))) < 0 {
 		f := os_fault(say.Fmt("bind %s", addr))
 		rt_sys_close(fd)
 		if f != nil {
@@ -382,7 +309,7 @@ func Listen(addr str) !Listener {
 		return none
 	}
 	ln := calloc(1, 8)
-	ln[0] = 16
+	ln[0] = 32
 	rt_sys_getsockname(fd, sa, ln)
 	free(ln)
 	nonblocking(fd)
