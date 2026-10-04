@@ -414,6 +414,12 @@ so the change is mechanical everywhere except the parser:
 5. **The compiler's own source** (`selfhost/`, written in the internal legacy dialect) moves last,
    with the same translator extended to the dialect; until then the dialect is accepted only for
    files the build marks as the compiler's.
+   **The standard library in edition 1** (#226): its files may also use three forms other code
+   cannot. `extern fn` declares the OS functions the macOS runtime calls and the instructions
+   that lower inline. `shared mut` is the runtime's mutable cross-core state; elsewhere it is
+   E601, as is any `shared` global outside the standard library. The runtime package's files
+   have no `package` clause. Each file is read in the edition it is written in: without
+   `-edition`, a file with no `func`, `var`, `:=` or `;` is edition 1.
 6. **Docs:** LANGUAGE.md is rewritten from this document; AGENT_PRIMER.md, README, STDLIB.md
    (regenerated) and every example follow in the same milestone.
 

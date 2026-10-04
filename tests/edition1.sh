@@ -6,8 +6,10 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 
 "$compiler" -edition 1 -parse-only tests/edition1/accepted.tin
+# Without -edition the file says which edition it is written in (#226).
+"$compiler" -parse-only tests/edition1/accepted.tin
 
-for name in legacy_func explicit_semicolon positional_literal short_declaration legacy_var block_comment unknown_unit unknown_integer_unit legacy_switch legacy_go legacy_increment legacy_channel legacy_pointer legacy_while legacy_c_loop legacy_extern grouped_import import_alias no_package grouped_const grouped_type import_after_decl grouped_global multiple_global_names multiple_const_names local_const missing_newline reserved_keyword invalid_match_expression invalid_match_range
+for name in legacy_func explicit_semicolon positional_literal short_declaration legacy_var block_comment unknown_unit unknown_integer_unit legacy_switch legacy_go legacy_increment legacy_channel legacy_pointer legacy_while legacy_c_loop grouped_import import_alias no_package grouped_const grouped_type import_after_decl grouped_global multiple_global_names multiple_const_names local_const missing_newline reserved_keyword invalid_match_expression invalid_match_range field_attr_bad
 do
 	if "$compiler" -edition 1 -parse-only "tests/edition1/$name.tin" >"$tmp/$name.out" 2>"$tmp/$name.err"; then
 		echo "FAIL edition1/$name: unexpectedly accepted"
@@ -270,7 +272,7 @@ if ! cmp -s tests/edition1/run/arenas.out "$tmp/arenas.out"; then
 	diff -u tests/edition1/run/arenas.out "$tmp/arenas.out" || true
 	exit 1
 fi
-for name in arena_bad arena_value_bad
+for name in arena_bad arena_value_bad shared_mut_bad legacy_extern
 do
 	if "$compiler" -edition 1 -o "$tmp/$name" "tests/edition1/$name.tin" >"$tmp/$name.out" 2>"$tmp/$name.err"; then
 		echo "FAIL edition1/$name: unexpectedly accepted"

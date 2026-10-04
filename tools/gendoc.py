@@ -45,12 +45,12 @@ def parse(path):
             seen_pkg = True
             comment = []
             continue
-        m = re.match(r"^func (\([a-z]+ (mut )?[A-Za-z0-9_\[\], ]+\) )?([A-Z][A-Za-z0-9_]*)(\[[^\]]*\])?\((.*)$", line)
+        m = re.match(r"^(?:func|fn) (\([a-z]+ (mut )?[A-Za-z0-9_\[\], ]+\) )?([A-Z][A-Za-z0-9_]*)(\[[^\]]*\])?\((.*)$", line)
         t = re.match(r"^type ([A-Z][A-Za-z0-9_]*)", line)
         sh = re.match(r"^shape ([A-Z][A-Za-z0-9_]*)", line)
         c = re.match(r"^const ([A-Z][A-Za-z0-9_]*)", line)
         if m and seen_pkg:
-            sig = line[len("func "):].rstrip(" {")
+            sig = line.split(" ", 1)[1].rstrip(" {")
             items.append(("func", sig, " ".join(c.strip() for c in comment)))
         elif t and seen_pkg:
             items.append(("type", line.rstrip(" {"), " ".join(c.strip() for c in comment)))

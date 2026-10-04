@@ -1271,7 +1271,7 @@ func echo(ws websocket.Conn, m websocket.Message) ! {
 Reading replay capsules (notes/interface_replay.md, section 6; #242): the envelope's tag and keystream, the body, and the effect kinds this build can replay. Writing capsules, the spool and the keys of secrets are #241's, next to this file.
 
 - `type Capsule struct`: Capsule is a decoded capsule: one recorded request and its effect records.
-- `const Kinds = ",tide.now@1,tide.wall@1,dice.seed@1,seal.random@1,wire.http@1,wire.dial@1,wire.read@1,wire.write@1,redis@1,mysql@1,mysql.tx@1,postgres@1,postgres.tx@1,websocket.dial@1,websocket.read@1,websocket.write@1,quarry.read@1,quarry.write@1,quarry.stat@1,quarry.dir@1,quarry.fs@1,"`: Kinds lists the effect kinds (name@version) this build replays (section 4); a capsule with any other kind is refused. sched.* kinds join the list with their replay (#243).
+- `const Kinds = ",sched.select@1,sched.resume@1,sched.cancel@1,tide.now@1,tide.wall@1,dice.seed@1,seal.random@1,wire.http@1,wire.dial@1,wire.read@1,wire.write@1,redis@1,mysql@1,mysql.tx@1,postgres@1,postgres.tx@1,websocket.dial@1,websocket.read@1,websocket.write@1,quarry.read@1,quarry.write@1,quarry.stat@1,quarry.dir@1,quarry.fs@1,"`: Kinds lists the effect kinds (name@version) this build replays (section 4); a capsule with any other kind is refused. The sched.* kinds are the request's scheduling (section 7, #243).
 - `Open(path str, keyHex str) !Capsule`: Open reads the capsule at path, encrypted under keyHex (the 64 hex digits of TIN_REPLAY_KEY).
 - `Key(keyHex str) !str`: Key is the 32 bytes a TIN_REPLAY_KEY value (64 hex digits) stands for.
 - `Unseal(data str, key str) !str`: Unseal checks a capsule envelope's tag under key and returns its decrypted body.
