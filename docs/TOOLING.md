@@ -88,8 +88,7 @@ tinc [-o OUT] [-S] [-target darwin-arm64|linux-arm64|linux-amd64] FILE.tin...
 - Strict programs get the package `lib/runtime/` (its `*_<os>.tin` and `*_<os>_<arch>.tin`
   files only for the target) automatically; imports are resolved as in LANGUAGE.md §1.
 - Errors print as `file:line:col: error E502 TYPE_ARG_COUNT: message` (code and name from
-  [ERRORS.md](ERRORS.md); errors not yet given a code print `error: message`), every error
-  in one run; the exit code is 1. A compiler crash prints a backtrace only under a debugger (see §8).
+  [ERRORS.md](ERRORS.md)), every error in one run; the exit code is 1. A compiler crash prints a backtrace only under a debugger (see §8).
 - `-caps`: check the program and print the capabilities each package can reach instead of
   building (`tin caps`; PACKAGES.md, "Capabilities").
 - `-hash FILE...` prints `<sha256> FILE` for each file (the `tin.lock` lines `tin vendor`

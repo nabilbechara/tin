@@ -7,7 +7,8 @@ import "say"
 
 const bufSize = 65536
 
-// Reader buffers reads from a file descriptor.
+// Reader buffers reads from a file descriptor. Inside a task it waits on a pipe, socket or
+// terminal through rt_task_wait, so a deadline or cancel fails the read (the next read retries).
 type Reader struct {
 	open bool // false for the zero Reader (a failed Open): it owns no descriptor
 	fd   i64
@@ -16,6 +17,8 @@ type Reader struct {
 	fill i64
 	eof  bool
 	err  fault
+	wait   i64  // 0 not checked yet, 1 a pipe, socket or terminal (tasks wait on it), 2 anything else
+	waited bool // err is a wait's deadline or cancel fault, which the next read clears
 }
 
 // Writer buffers writes to a file descriptor.
@@ -56,6 +59,10 @@ func (r mut Reader) Close() {
 
 // more reads the next chunk, keeping the unread bytes at the front; false at end or error.
 func (r mut Reader) more() bool {
+	if r.waited {
+		r.err = nil
+		r.waited = false
+	}
 	if r.eof || r.err != nil {
 		return false
 	}
@@ -76,7 +83,18 @@ func (r mut Reader) more() bool {
 		r.buf = bigger
 	}
 	h2 := cast(i64, r.buf)
+	// Inside a task a pipe, socket or terminal is waited on, so deadlines and cancels apply.
+	if rt_task_current() != 0 && r.waits() {
+		if rt_task_wait(r.fd, 1, 0) == waitDeadline {
+			r.err = cast(fault, rt_wait_fault())
+			r.waited = true
+			return false
+		}
+	}
 	n := rt_sys_read(r.fd, h2[2]+r.fill, len(r.buf)-r.fill)
+	if n < 0 && rt_errno() == EAGAIN && rt_task_current() != 0 && r.waits() {
+		return r.more()
+	}
 	if n < 0 {
 		r.err = errno_fault("read")
 		return false
@@ -87,6 +105,22 @@ func (r mut Reader) more() bool {
 	}
 	r.fill += n
 	return true
+}
+
+// waits reports whether the reader's descriptor is a pipe, socket or terminal.
+func (r mut Reader) waits() bool {
+	if r.wait == 0 {
+		r.wait = 2
+		st := calloc(1, 256)
+		if i64(i32(rt_sys_fstat(r.fd, st))) == 0 {
+			t := rt_stat_mode(st) & 0xf000
+			if t == 0x1000 || t == 0xc000 || (t == 0x2000 && rt_isatty(r.fd)) {
+				r.wait = 1
+			}
+		}
+		free(st)
+	}
+	return r.wait == 1
 }
 
 // Line returns the next line without its "\n" (or "\r\n"); ok is false at the end.
