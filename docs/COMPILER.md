@@ -10,7 +10,7 @@ ELF for Linux); no external toolchain is involved.
 
 | file | role |
 |---|---|
-| `util.tin` | vectors (`vec_*`), byte buffers (`buf_*`), errors (`err_begin`/`err_end`/`fatal`), byte-order helpers, target flags `tgt_linux`/`tgt_x64` |
+| `util.tin` | vectors (`vec_*`), byte buffers (`buf_*`), errors (`err_code(pos, "E502 TYPE_ARG_COUNT")`, documented in ERRORS.md, or the uncoded `err_begin`; then `err_end`/`fatal`), byte-order helpers, target flags `tgt_linux`/`tgt_x64` |
 | `lex.tin` | tokens; semicolon insertion; number, string and character literals |
 | `types.tin` | type records, interning (slices, maps, funcs), struct layout |
 | `parse.tin` | AST for both syntaxes; node/field constants (the source of truth for every node layout) |

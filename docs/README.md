@@ -3,6 +3,7 @@
 | document | read it for |
 |---|---|
 | [LANGUAGE.md](LANGUAGE.md) | the language reference: every type, statement, expression, rule and error, plus the grammar |
+| [ERRORS.md](ERRORS.md) | every compiler error code (`E502 TYPE_ARG_COUNT`): its rule, an example and the fix |
 | [STDLIB.md](STDLIB.md) | every standard-library package and exported name (generated from `lib/*.tin`) |
 | [TOOLING.md](TOOLING.md) | the `tin` command, `tinc`, make targets, tests, Docker, benchmarks, debugging, repository layout |
 | [DISTRIBUTION.md](DISTRIBUTION.md) | release archives, verified installer, builder images and source-to-container builds |
