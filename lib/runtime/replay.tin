@@ -469,8 +469,9 @@ func rt_secret_key(s str) str {
 }
 
 // rt_query_key is a query in an effect key (section 5.3): the parts and arguments in order,
-// each argument as I decimal, F float, S string, B true/false or X hex bytes, each part and
-// argument followed by a newline.
+// each argument as I decimal, F float, S string, B true/false, X hex bytes, or H and its
+// handle when it was written with a secret value (query.Hidden), each part and argument
+// followed by a newline.
 func rt_query_key(prefix str, q query) str {
 	b := make([]u8, 0, 64)
 	b = append(b, prefix...)
@@ -479,6 +480,12 @@ func rt_query_key(prefix str, q query) str {
 		b = append(b, part...)
 		b = append(b, '\n')
 		if i >= len(q.Args) {
+			continue
+		}
+		if i < 64 && (q.Hidden>>u64(i))&1 != 0 {
+			b = append(b, 'H')
+			b = append(b, rt_secret_key(rt_qarg_text(q.Args[i]))...)
+			b = append(b, '\n')
 			continue
 		}
 		switch q.Args[i] {
@@ -507,6 +514,25 @@ func rt_query_key(prefix str, q query) str {
 		b = append(b, '\n')
 	}
 	return str(b)
+}
+
+// rt_qarg_text is a query value as text, as its handle is computed from it.
+func rt_qarg_text(a qarg) str {
+	switch a {
+	case Int(v):
+		return rt_i64str(v)
+	case Float(v):
+		return rt_float_json(v)
+	case Str(v):
+		return v
+	case Bool(v):
+		if v {
+			return "true"
+		}
+		return "false"
+	case Bytes(v):
+		return str(v)
+	}
 }
 
 // rt_secret_header reports whether a header's value is stored as a handle.

@@ -64,8 +64,9 @@ API: `X25519`, `X25519PublicKey`, `X25519NewPrivateKey`, `ChaCha20`, `type AEAD`
 `NewChaCha20Poly1305`, `Seal`, `Open`, `NonceSize`, `Overhead`.
 
 - X25519 uses ten signed limbs in radix 2^25.5 so products fit in 64 bits; it fails on an
-  all-zero result (RFC 8446 7.4.2 requires the check). About 0.85 ms per operation on Linux
-  x86-64 before tuning.
+  all-zero result (RFC 8446 7.4.2 requires the check). `fe_mul` and `fe_sq` are straight-line
+  code from `tools/gen_fe25519.py` (no loop, branch or bounds check; squaring computes each
+  cross product once), about 3.5 times faster than the first looped version.
 - ChaCha20 keeps the state in locals and xors eight bytes at a time; Poly1305 is the 26-bit
   limb form (poly1305-donna). AES-GCM joins `AEAD` as another kind.
 
@@ -91,8 +92,24 @@ Nonces are 12 bytes only, like Go's `cipher.NewGCM`.
 Tests: `tests/v2/seal_aes.tin` (NIST GCM cases, every length class for all key sizes,
 tampering; Go twin `bench/ref/seal_aes`), and Wycheproof `aes_gcm` in `tools/ci/crypto_check.py`.
 
-## AES-GCM on the CPU's instructions (#124 phase 1)
+## Private keys and signing (#124 phase 5 prerequisites)
 
+API: `ParsePrivateKeyPEM`, `ParsePrivateKeyDER` (`PrivateKey` with `RSA ?RSAPrivateKey` and
+`EC ?ECPrivateKey`), `PrivateKey.MatchesCertificate`, `PrivateKey.SignTLS(scheme, msg)`,
+`SignPKCS1v15`, `SignPSS`, `SignECDSA`.
+
+- Formats: PKCS #8 (RSA, EC), PKCS #1 RSA (two primes), SEC 1 EC; P-256 and P-384. Refused:
+  RSA outside 2048–8192 bits, P-521, Ed25519 keys, encrypted keys, inconsistent keys (p*q must
+  be n, a test signature must verify, a SEC 1 public key must match the scalar).
+- The private parts are `secret` fields readable only inside seal.
+- RSA: CRT with base blinding; every signature is checked with the public key before it is
+  returned. ECDSA: RFC 6979 deterministic nonces (equal to Go's `Sign(nil, ...)` byte for byte).
+- Speed on Linux x86-64: RSA-2048 signing about 27 ms, P-256 about 2 ms, P-384 about 6 ms; Go
+  is about 1 ms, 20 us and 300 us. All of it is `monty.mul`; see the FIOS proposal in #124.
+
+Tests: `tests/v2/seal_sign.tin` (Go twin `bench/ref/seal_sign`, test keys in `tests/data/keys`
+labelled "TESTING KEY"), and `tools/ci/x509_check.py`, where Go verifies TLS signatures Tin made.
+## AES-GCM on the CPU's instructions (#124 phase 1)
 - `tools/arch/aes-gcm-{arm64,amd64}.S` hold three leaves (CTR with GCM's 32-bit counter,
   GHASH, and on x86-64 the CPUID check); `tools/gen_aes_hw.py` assembles them with clang into
   `selfhost/aes_hw.tin`, and `gen.tin` / `gen_x64.tin` emit those bytes for the placeholders
