@@ -1,4 +1,5 @@
 """Both native backends retain safepoints, including continue edges and @nopoll."""
+import os
 import re
 import subprocess
 import tempfile
@@ -40,9 +41,18 @@ fn main() {
             path.write_text(source)
             for arch in ('arm64', 'amd64'):
                 with self.subTest(arch=arch):
-                    text = subprocess.check_output([str(compiler), '-edition', '1', '-target',
+                    text = subprocess.check_output([str(compiler), '-polls', '-edition', '1', '-target',
                         'linux-' + arch, '-S', '-o', str(Path(tmp) / arch), str(path)],
-                        text=True, cwd=ROOT)
+                        text=True, cwd=ROOT, env=dict(os.environ, TINC_POLLS='0'))
+                    default = subprocess.check_output([str(compiler), '-edition', '1', '-target',
+                        'linux-' + arch, '-S', '-o', str(Path(tmp) / arch), str(path)],
+                        text=True, cwd=ROOT, env=dict(os.environ, TINC_POLLS='0'))
+                    enabled_env = subprocess.check_output([str(compiler), '-edition', '1', '-target',
+                        'linux-' + arch, '-S', '-o', str(Path(tmp) / arch), str(path)],
+                        text=True, cwd=ROOT, env=dict(os.environ, TINC_POLLS='1'))
+                    self.assertEqual(text, enabled_env)
+                    self.assertNotIn(' # rt_bnd_poll', default)
+                    self.assertNotIn('bl _rt_bnd_poll', default)
                     if arch == 'arm64':
                         def body(name):
                             return text.split('_' + name + ':', 1)[1].split('\n\t.p2align', 1)[0]

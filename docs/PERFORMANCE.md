@@ -412,3 +412,32 @@ All HTTP results stayed within the 5% review threshold. The amd64 `/json` rerun 
 the threshold at 0.951. The separate `strbuild` reference still has Tin at 148.5 ms versus
 Go at 87.2 ms (Go/Tin 0.587); reducing the remaining constant-modulo cost is a follow-up
 optimization target.
+
+## CPU cancellation safepoints
+
+Safepoints are opt-in (`tin build --polls`, `tin run --polls`, or `tinc -polls`;
+`TINC_POLLS=1` for build scripts). They remain off by default because the measured cost
+exceeds issue #234's 2% budget. A function can opt out with edition-1 `@nopoll`.
+
+The initial [native Linux run](https://github.com/yasserreslan/tin/actions/runs/37197260096)
+compared base `b6333ef` with head `9759a6b`, with polls enabled in strict Tin code.
+The arm64 runner had four vCPUs, Neoverse-N2, Linux 6.17.0-1022-azure and Go 1.26.8.
+CPU measurements are medians of seven alternating runs per side. HTTP uses one server
+core, wrk on the same runner (`-t2 -c100`, 10 seconds), and medians of five alternating rounds.
+Only ratios on these shared runners are meaningful.
+
+| arm64 workload | base ms | polls ms | polls/base time |
+|---|---:|---:|---:|
+| indexsum | 38.52 | 42.13 | 1.094 |
+| ordered_less | 30.20 | 32.73 | 1.084 |
+| sieve | 496.22 | 583.00 | 1.175 |
+
+HTTP head/base throughput was 0.985 for `/json` and 0.962 for `/plaintext`.
+Legacy programs without the strict runtime do not acquire safepoints; those CPU rows do
+not measure their cost. Output equality is checked on every timed repetition.
+
+The watchdog reads an array of core contexts every millisecond and writes only their
+poll words. The ordinary poll is a context load and a cold branch (x86-64 also tests the
+loaded word). Cold stubs preserve registers, including leaf-function homes. The compiler
+keeps existing allocation and register-home decisions; the poll check stays inside loops.
+The watchdog is started only for an opted-in executable.

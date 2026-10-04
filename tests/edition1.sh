@@ -35,7 +35,9 @@ fi
 # "msg" passes fault.Wrap(err, msg) upward (#229).
 for name in boundaries fault_wrap once polls
 do
-	"$compiler" -edition 1 -o "$tmp/$name" "tests/edition1/run/$name.tin"
+	polls=
+	[ "$name" != polls ] || polls=-polls
+	"$compiler" $polls -edition 1 -o "$tmp/$name" "tests/edition1/run/$name.tin"
 	"$tmp/$name" >"$tmp/$name.out" 2>/dev/null
 	if ! cmp -s "tests/edition1/run/$name.out" "$tmp/$name.out"; then
 		echo "FAIL edition1/run/$name: output differs"

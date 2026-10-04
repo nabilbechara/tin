@@ -59,6 +59,7 @@ shared var rtWatchCount i64
 shared var rtWatchCap i64
 shared var rtWatchLock i64
 shared var rtWatchStarted i64
+shared var rtPollsEnabled bool
 shared var rtWatchSignal i64 // Linux signalfd, published by anvil; never consumed here.
 shared var rtWatchGrace i64
 shared var rtWatchDrainAt i64
@@ -193,8 +194,16 @@ func rt_spawn_core(entry func(i64), arg i64) {
 	}
 }
 
+// rt_poll_enable is emitted at startup only for a program compiled with -polls.
+func rt_poll_enable() {
+	rtPollsEnabled = true
+	rt_watch_start()
+}
+
 // rt_watch_start starts one process-wide watchdog only when cancellable work begins.
 func rt_watch_start() {
+	if !rtPollsEnabled { return }
+	if rtWatchStarted != 0 { return }
 	if __atomic_swap(&rtWatchStarted, 1) != 0 { return }
 	t := calloc(1, 8)
 	if pthread_create(t, 0, cast(i64, rt_watch_main), 0)&0xffffffff != 0 {
@@ -246,6 +255,7 @@ func rt_watch_main(arg i64) i64 {
 
 // rt_watch_update publishes the running boundary's effective deadline or cancellation.
 func rt_watch_update() {
+	if !rtPollsEnabled { return }
 	b := rt_bnd_current()
 	w := b[bDeadline]
 	if b[bCancel] != 0 { w = -1 }
@@ -3048,11 +3058,10 @@ func rt_task_run(t i64) bool {
 	c[ctxPoolExtra] = pw[4]
 	c[ctxFmt] = t[tFmt]
 	curTask = t
-	rt_watch_start()
-	rt_watch_switch()
+	if rtPollsEnabled { rt_watch_switch() }
 	rt_task_swap(schedSave, t)
 	curTask = 0
-	rt_watch_switch()
+	if rtPollsEnabled { rt_watch_switch() }
 	if rt_task_sp(t) < t[tStack]+taskGuard+taskStack-16384 { t[tTrim] = 1 }
 	pw[0] = c[ctxBump]
 	pw[1] = c[ctxEnd]

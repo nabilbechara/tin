@@ -63,7 +63,7 @@ def main():
     out = ROOT / 'bin/ci/poll'
     out.mkdir(parents=True, exist_ok=True)
     exe = out / 'server'
-    subprocess.run([str(ROOT / 'bin/tinc'), '-o', str(exe),
+    subprocess.run([str(ROOT / 'bin/tinc'), '-polls', '-o', str(exe),
                     str(ROOT / 'tools/ci/fixtures/poll.tin')], check=True, cwd=ROOT)
     run(exe)
     if platform.system() == 'Linux':
