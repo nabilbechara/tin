@@ -1,8 +1,6 @@
 // Linux (glibc) part of the runtime: the same rt_ helpers as runtime_darwin.tin, with the
 // Linux calls, constants and struct layouts (arm64 and x86-64 share these values).
 
-extern func getenv(name i64) i64
-
 const EINTR = 4
 const EAGAIN = 11
 const EINPROGRESS = 115
@@ -32,8 +30,141 @@ var rtTimespec i64   // per core: the timespec clock_gettime fills
 func linux_set_errno(e i64) { if __ctx() != 0 { __ctx()[10] = e } }
 func linux_get_errno() i64 { if __ctx() == 0 { return 0 }; return __ctx()[10] }
 func rt_errno() i64 { return linux_get_errno() }
-// Environment calls retain libc until phase 5; their failure still uses libc TLS.
-func rt_env_errno() i64 { return __ld(__errno_location(),2)&0xffffffff }
+// Environment updates fail only on invalid names, which quarry rejects before calling.
+func rt_env_errno() i64 { return linux_get_errno() }
+
+// ---- process start: environment and auxiliary vector from the initial stack ----
+
+// The kernel places argv, NULL, envp, NULL, then auxv pairs ending in AT_NULL. rtEnviron is a
+// NULL-terminated array of "NAME=value" C strings: the kernel's until the first update.
+shared var rtEnviron i64
+shared var rtEnvCap i64
+shared var rtEnvLock i64
+shared var rtAuxv i64
+
+// rt_os_start finds envp and auxv past argv's NULL; it runs before anything reads them.
+func rt_os_start(argc i64, argv i64) {
+	if rtAuxv != 0 || argv == 0 {
+		return
+	}
+	env := argv + 8*(argc+1)
+	n := i64(0)
+	for env[n] != 0 {
+		n++
+	}
+	rtEnviron = env
+	rtAuxv = env + 8*(n+1)
+}
+
+// rt_getauxval is the auxv value of key (AT_PAGESZ, AT_HWCAP, ...), or 0 when absent.
+func rt_getauxval(key i64) i64 {
+	if rtAuxv == 0 {
+		return 0
+	}
+	for p := rtAuxv; p[0] != 0; p += 16 {
+		if p[0] == key {
+			return p[1]
+		}
+	}
+	return 0
+}
+
+// rt_env_value is the value in entry e when it is "name=value", or 0.
+func rt_env_value(e i64, name i64) i64 {
+	i := i64(0)
+	for {
+		c := load8(name + i)
+		if c == 0 {
+			break
+		}
+		if load8(e+i) != c {
+			return 0
+		}
+		i++
+	}
+	if load8(e+i) != '=' {
+		return 0
+	}
+	return e + i + 1
+}
+
+// rt_getenv is the value of the C string name as a C string, or 0 when it is unset.
+func rt_getenv(name i64) i64 {
+	env := rtEnviron
+	if env == 0 {
+		return 0
+	}
+	for i := i64(0); env[i] != 0; i++ {
+		v := rt_env_value(env[i], name)
+		if v != 0 {
+			return v
+		}
+	}
+	return 0
+}
+
+// rt_env_own returns the entry count after making rtEnviron an owned array with room for one
+// more entry. Old arrays and entries are never freed: another core may still be reading them.
+func rt_env_own() i64 {
+	n := i64(0)
+	for rtEnviron != 0 && rtEnviron[n] != 0 {
+		n++
+	}
+	if rtEnvCap < n+2 {
+		c := n*2 + 16
+		next := calloc(c, 8)
+		if n > 0 {
+			memcpy(next, rtEnviron, 8*n)
+		}
+		rtEnviron = next
+		rtEnvCap = c
+	}
+	return n
+}
+
+// rt_setenv sets name to value (C strings, name already validated); it returns 0.
+func rt_setenv(name i64, value i64) i64 {
+	nl := strlen(name)
+	vl := strlen(value)
+	e := malloc(nl + vl + 2)
+	memcpy(e, name, nl)
+	store8(e+nl, '=')
+	memcpy(e+nl+1, value, vl+1)
+	rt_lock(&rtEnvLock)
+	n := rt_env_own()
+	env := rtEnviron
+	for i := i64(0); i < n; i++ {
+		if rt_env_value(env[i], name) != 0 {
+			env[i] = e
+			rt_unlock(&rtEnvLock)
+			return 0
+		}
+	}
+	env[n+1] = 0
+	env[n] = e
+	rt_unlock(&rtEnvLock)
+	return 0
+}
+
+// rt_unsetenv removes every entry for name (a validated C string); it returns 0.
+func rt_unsetenv(name i64) i64 {
+	rt_lock(&rtEnvLock)
+	n := rt_env_own()
+	env := rtEnviron
+	j := i64(0)
+	for i := i64(0); i < n; i++ {
+		if rt_env_value(env[i], name) == 0 {
+			env[j] = env[i]
+			j++
+		}
+	}
+	for j < n {
+		env[j] = 0
+		j++
+	}
+	rt_unlock(&rtEnvLock)
+	return 0
+}
 func linux_restorer() {}
 func linux_restorer_ptr() i64 { return cast(i64,linux_restorer) }
 
@@ -427,7 +558,7 @@ func rt_pin_setup(n i64) {
 	if allowed <= 0 || n > allowed {
 		return
 	}
-	env := getenv(cast(i64, "TIN_PIN") + 8)
+	env := rt_getenv(cast(i64, "TIN_PIN") + 8)
 	rtPin = n == allowed || (env != 0 && load8(env) == '1')
 }
 
@@ -658,7 +789,7 @@ func rt_core_qos(id i64) {
 }
 
 // rt_page_size is the OS mapping page size.
-func rt_page_size() i64 { return getauxval(6) }
+func rt_page_size() i64 { return rt_getauxval(6) }
 func rt_date_year_width() i64 { return 1 }
 func rt_isatty(fd i64) bool {
     termios := calloc(1,64)
