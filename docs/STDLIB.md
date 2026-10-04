@@ -351,7 +351,7 @@ Package mint converts numbers and quoted strings to and from text (like Go's str
 - `ParseInt(s str, base i64) !i64`: ParseInt parses a signed integer in base 2..36, or base 0 for 0x/0o/0b prefixes and underscores.
 - `ParseUint(s str, base i64) !u64`: ParseUint parses an unsigned integer in base 2..36, or base 0 for 0x/0o/0b prefixes and underscores.
 - `ParseBool(s str) !bool`: ParseBool parses 1 t T TRUE true True and 0 f F FALSE false False.
-- `ParseFloat(s str) !f64`: ParseFloat parses a Go float literal (decimal or 0x hex with p exponent, underscores, inf/infinity/nan) via strtod.
+- `ParseFloat(s str) !f64`: ParseFloat parses a Go float literal (decimal or 0x hex with p exponent, underscores, inf/infinity/nan) with exact nearest-even rounding.
 - `F64frombits(b u64) f64`: F64frombits returns the f64 with bit pattern b.
 - `FormatFloat(f f64, fmt u8, prec i64) str`: FormatFloat formats f as 'f' (ddd.ddd), 'e' (d.ddde±dd) or 'g' (shortest of the two); prec -1 is the shortest text that reads back exactly.
 - `Quote(s str) str`: Quote returns s as a Go double-quoted literal with \n-style, \x, \u and \U escapes.

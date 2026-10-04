@@ -116,7 +116,8 @@ fires. Messages are copied into the receiver's request pool.
   by static type (`rt_fmt_i`, `_u`, `_s`, `_f`, `_b`, `_e`, slices, maps, structs).
 - Floats are printed in their shortest exact form. A fast path finds the fewest decimals
   k for which rint(|x|·10^k)/10^k == |x|, exact for values below 2^53. Otherwise
-  `snprintf("%.*e")` is tried at increasing precision and checked with `strtod`.
+  `num_shortest` (lib/runtime/number.tin) picks the shortest decimal inside the exact
+  rounding interval of the adjacent floats, in integer arithmetic (Go's algorithm).
   `rt_float_json` uses JSON's exponent rule.
 
 ## 7. Panics and backtraces
