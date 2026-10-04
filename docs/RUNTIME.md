@@ -256,7 +256,11 @@ close-after-write flag, writing flag, bytes needed. Idle connections hold no buf
   - request line;
   - headers, scanned with `memchr`; each name must be a token followed by `:`, and
     only `Content-Length`, `Connection` and `Transfer-Encoding` are interpreted;
-  - body.
+  - body. A `Transfer-Encoding: chunked` body (#349) is decoded in place once its last
+    chunk and trailer section have arrived: the data of each chunk moves down to follow the
+    header block, then the trailer field lines, which `Header` reads after the header
+    block's. Chunk extensions are skipped, every line must end in CRLF, and replay records
+    the decoded request (a `Content-Length`, the trailers as fields).
 - An incomplete request is copied into the connection's own buffer, sized to the
   request when its length is known (up to 64 MiB).
 - A hang-up reported with the last data closes the connection once its output is
@@ -285,13 +289,15 @@ reading resumes and buffered input is served.
 - A malformed request line (including control bytes such as a bare CR, NUL or tab, or a
   version other than `HTTP/1.<digit>`), a header line that is not `name: value` (no colon,
   whitespace before it, obs-fold, a name that is not a token), a CR or NUL inside a header
-  line, an HTTP/1.1 request without exactly one `Host`, or a bad `Content-Length` gets
-  400; `Transfer-Encoding` gets 501.
+  line, an HTTP/1.1 request without exactly one `Host`, a bad `Content-Length`, a malformed
+  chunked body, chunked listed twice, or chunked together with `Content-Length` (RFC 9112
+  6.3) gets 400; a transfer coding other than chunked gets 501.
 - A request with `Expect: 100-continue` whose body has not arrived gets
   `HTTP/1.1 100 Continue` first (clients such as curl and the AWS SDKs wait for it).
 - An absolute-form target (`GET http://host/path?q HTTP/1.1`) is routed on its path and
   query; an empty path is `/`.
-- Bodies are limited to 64 MiB by default (413); `anvil.Limits` or `TIN_MAX_BODY` changes it.
+- Bodies are limited to 64 MiB by default (413), a chunked body by its decoded length (and
+  its chunk framing by the limit plus 64 KiB); `anvil.Limits` or `TIN_MAX_BODY` changes it.
 - **Timeouts** (`anvil.Timeouts`, or the environment): a request's line and headers must
   arrive within 10 s of its first byte (`TIN_HEADER_TIMEOUT_MS`), and the whole request
   within 60 s (`TIN_READ_TIMEOUT_MS`); a keep-alive connection with no request in progress

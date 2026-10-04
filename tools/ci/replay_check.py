@@ -448,6 +448,14 @@ def recording(work, env):
     serve(spool, [request('/cart/3')], TIN_REPLAY_SAMPLE='1')
     caps = kept(spool)
     check('sampled', [(k, c['status'], c['flags']) for k, c in caps.items()], [('/cart/3', 200, 2)])
+    # A chunked request is kept decoded (#349), so a replay frames it the same way: a
+    # Content-Length for the decoded body, the trailer fields after the header block's.
+    spool = work / 'spool-anvil-chunked'
+    serve(spool, [b'POST /cart/4 HTTP/1.1\r\nHost: shop\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n'
+                  b'3\r\nabc\r\n2;x=1\r\nde\r\n0\r\nX-Note: t\r\n\r\n'], TIN_REPLAY_SAMPLE='1')
+    c = kept(spool).get('/cart/4')
+    check('chunked request kept decoded', c and c['request'],
+          b'POST /cart/4 HTTP/1.1\r\nHost: shop\r\nConnection: close\r\nContent-Length: 5\r\nX-Note: t\r\n\r\nabcde')
     # Recording off: no spool, and the server answers the same.
     answers, err = serve(None, [request('/cart/7?fail=1')])
     check('off', answers[0].split(b' ')[1], b'504')

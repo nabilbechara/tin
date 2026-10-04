@@ -345,16 +345,103 @@ func caseBodies() {
 	}
 }
 
+// caseChunked checks chunked request bodies (#349, RFC 9112 7.1): decoded for the handler,
+// framed exactly (a pipelined request after one still runs), trailers readable as headers,
+// and malformed or oversized ones refused.
 func caseChunked() {
-	raw := "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
-	rs, c, r, err := roundTrip(raw, false)
-	if err != nil {
-		result("transfer-encoding-chunked", false, "%v", err)
-		return
+	const head = "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n"
+	follow := "GET /json HTTP/1.1\r\nHost: x\r\n\r\n"
+	good := []struct {
+		name, body, agent string
+		length            int
+	}{
+		{"chunked", "5\r\nhello\r\n0\r\n\r\n", "", 5},
+		{"chunked-many-ext", "5;ext=1\r\nhello\r\n6 ; a=\"b\"\r\n world\r\n00\r\n\r\n", "", 11},
+		{"chunked-trailer", "5\r\nhello\r\n0\r\nUser-Agent: from-trailer\r\n\r\n", "from-trailer", 5},
+		{"chunked-hex", "1A\r\n" + strings.Repeat("x", 26) + "\r\n0\r\n\r\n", "", 26},
 	}
-	defer c.Close()
-	closed, why := closedSoon(c, r, time.Second)
-	result("transfer-encoding-chunked", rs.status == 501 && closed, "status %d, %s", rs.status, why)
+	for _, tc := range good {
+		rs, c, r, err := roundTrip(head+"\r\n"+tc.body+follow, false)
+		if err != nil {
+			result(tc.name, false, "%v", err)
+			continue
+		}
+		e, jerr := echoOf(rs)
+		rs2, err2 := readResp(r, false)
+		c.Close()
+		ok := rs.status == 200 && jerr == nil && e.Length == tc.length && e.Agent == tc.agent && err2 == nil && rs2.status == 200
+		result(tc.name, ok, "status %d, length %d, agent %q, follow-up %v", rs.status, e.Length, e.Agent, err2)
+	}
+	// One byte at a time: every partial chunk line and chunk waits for the rest.
+	{
+		c, r, err := dial()
+		if err != nil {
+			result("chunked-byte-at-a-time", false, "dial: %v", err)
+		} else {
+			raw := head + "\r\n" + "3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n"
+			for i := 0; i < len(raw); i++ {
+				c.Write([]byte{raw[i]})
+				time.Sleep(time.Millisecond)
+			}
+			rs, err := readResp(r, false)
+			ok := err == nil && rs.status == 200
+			e := echo{}
+			if ok {
+				e, err = echoOf(rs)
+				ok = err == nil && e.Length == 5
+			}
+			result("chunked-byte-at-a-time", ok, "length %d %v", e.Length, err)
+			c.Close()
+		}
+	}
+	// Expect: 100-continue works with chunked: the interim response comes before the body.
+	{
+		c, r, err := dial()
+		if err != nil {
+			result("chunked-expect-100", false, "dial: %v", err)
+		} else {
+			c.Write([]byte(head + "Expect: 100-continue\r\n\r\n"))
+			// The interim response is a status line and an empty line, with no body.
+			c.SetReadDeadline(time.Now().Add(5 * time.Second))
+			line, err := r.ReadString('\n')
+			blank, _ := r.ReadString('\n')
+			c.SetReadDeadline(time.Time{})
+			ok := err == nil && strings.HasPrefix(line, "HTTP/1.1 100 ") && blank == "\r\n"
+			if ok {
+				c.Write([]byte("5\r\nhello\r\n0\r\n\r\n"))
+				rs, err2 := readResp(r, false)
+				e, jerr := echoOf(rs)
+				ok = err2 == nil && rs.status == 200 && jerr == nil && e.Length == 5
+			}
+			result("chunked-expect-100", ok, "interim %v", err)
+			c.Close()
+		}
+	}
+	bad := []struct {
+		name, hdr, body string
+		status          int
+	}{
+		{"chunked-bad-size", "", "zz\r\nhello\r\n0\r\n\r\n", 400},
+		{"chunked-no-crlf-after-data", "", "5\r\nhelloXX0\r\n\r\n", 400},
+		{"chunked-bare-lf", "", "5\nhello\n0\n\n", 400},
+		{"chunked-huge-size", "", "FFFFFFFFF\r\nhello", 413},
+		{"chunked-and-content-length", "Content-Length: 5\r\n", "5\r\nhello\r\n0\r\n\r\n", 400},
+		{"transfer-encoding-gzip", "", "5\r\nhello\r\n0\r\n\r\n", 501},
+	}
+	for _, tc := range bad {
+		h := head
+		if tc.name == "transfer-encoding-gzip" {
+			h = "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n"
+		}
+		rs, c, r, err := roundTrip(h+tc.hdr+"\r\n"+tc.body+follow, false)
+		if err != nil {
+			result(tc.name, false, "%v", err)
+			continue
+		}
+		closed, why := closedSoon(c, r, time.Second)
+		c.Close()
+		result(tc.name, rs.status == tc.status && closed, "status %d, %s", rs.status, why)
+	}
 }
 
 func caseHTTP10() {
