@@ -71,6 +71,12 @@ class DiagnosticsTests(unittest.TestCase):
         problems, _, _ = self.problems(ENTRY.replace('## E5xx', '## E4xx'))
         self.assertTrue(any('## E5xx' in p for p in problems), problems)
 
+    def test_example_edition(self):
+        entry = dc.parse_doc(ENTRY)[0]
+        self.assertEqual(dc.example(entry)[1], '0')
+        entry = dc.parse_doc(ENTRY.replace('```tin\n', '```tin edition=1\n'))[0]
+        self.assertEqual(dc.example(entry)[:2], ('package main\n', '1'))
+
     def test_tree_agrees(self):
         problems, entries, _, _ = dc.check_static()
         self.assertEqual(problems, [])

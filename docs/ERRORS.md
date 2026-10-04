@@ -34,7 +34,9 @@ errors still print as `error: message` without a code.
 Each entry below gives the rule, a program that breaks it with the exact output the compiler
 prints for it, and the fixes. `tools/ci/diagnostics_check.py` compiles every example and
 requires that output, and checks that the compiler, this page and the tests' expected
-diagnostics agree on every code and name.
+diagnostics agree on every code and name. Examples use the syntax of LANGUAGE.md (edition 0)
+and are compiled with `-edition 0`; an example opened with ```` ```tin edition=1 ```` is
+edition 1 syntax and is compiled with `-edition 1`.
 
 ## E0xx Files, tokens and syntax
 
