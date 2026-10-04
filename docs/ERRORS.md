@@ -32,9 +32,8 @@ Each entry below gives the rule, a program that breaks it with the exact output 
 prints for it, and the fixes. `tools/ci/diagnostics_check.py` compiles every example and
 requires that output, and checks that the compiler, this page and the tests' expected
 diagnostics agree on every code and name. Examples are edition 1, the syntax of LANGUAGE.md,
-opened with ```` ```tin edition=1 ```` and compiled with `-edition 1`. A few diagnostics only
-edition 0 (the syntax before it) can produce; their examples are opened with
-the fence ```` ```tin edition=0 ```` and compiled with `-edition 0`.
+opened with ```` ```tin edition=1 ```` and compiled with `-edition 1`. Edition 0, the syntax
+before it, is retired (#226): only `tin fix -edition 1` reads it.
 
 An example for an error about the command line or the installation shows its command in a
 ```` ```sh ```` block (one line, `[VAR=value ...] tinc ARGS`), and a block opened with
@@ -311,23 +310,22 @@ Fix: put the attribute on the function it is meant for, or remove it.
 
 A struct field takes only the attributes the language defines: `@json("name")`.
 
-```tin edition=0 old-syntax
+```tin edition=1
 package main
 
 type User struct {
-	ID i64 @jsonn("id")
+	@jsonn("id") ID i64
 }
 
-func main() {
+fn main() {
 }
 ```
 
 ```text
-example.tin:3:11: error E041 UNKNOWN_ATTRIBUTE: unknown struct attribute; supported attributes are @json("name")
+example.tin:4:2: error E041 UNKNOWN_ATTRIBUTE: unknown struct attribute; supported attributes are @json("name")
 ```
 
-Fix: correct the spelling (`@json("id")`), or remove the attribute. The example is edition 0:
-edition 1 does not reject unknown attributes yet.
+Fix: correct the spelling (`@json("id")`), or remove the attribute.
 
 ### E042 ATTRIBUTE_ARGS
 
@@ -374,12 +372,12 @@ Fix: list the element types (`(i64, str)`), or leave the result out when there i
 Every field of an enum variant has a type. Names that share a type are listed before it:
 `Rect(w, h f64)`.
 
-```tin edition=0 old-syntax
+```tin edition=1
 package main
 
-type Shape enum { Rect(w, h,), Empty }
+type Shape enum { Rect(x f64, w, h,), Empty }
 
-func main() {
+fn main() {
 }
 ```
 
@@ -387,8 +385,8 @@ func main() {
 example.tin:3:12: error E044 ENUM_FIELD_TYPES: an enum variant's fields need types: Variant(name Type, ...)
 ```
 
-Fix: give the last field names their type: `Rect(w, h f64)`. Edition 1 variants list only
-types (`Rect(f64, f64)`), so this is an edition 0 error.
+Fix: give the last field names their type (`Rect(x f64, w, h f64)`), or list only types
+(`Rect(f64, f64, f64)`).
 
 ### E045 EMPTY_ENUM
 
@@ -2677,17 +2675,17 @@ Fix: write the type arguments (`Zero[i64]()`), or pass an argument whose type na
 
 The brackets after a generic function's name hold types.
 
-```tin edition=0 old-syntax
+```tin edition=1
 package main
 
 import "constraints"
 
-func Zero[T constraints.Any]() T {
-	var z T
+fn Zero[T constraints.Any]() T {
+	mut z T
 	return z
 }
 
-func main() {
+fn main() {
 	_ = Zero[1 + 2]()
 }
 ```
@@ -2696,8 +2694,7 @@ func main() {
 example.tin:11:13: error E505 NOT_A_TYPE_ARG: expected a type argument
 ```
 
-Fix: put a type in the brackets (`Zero[i64]()`), and pass values in the parentheses. The
-example is edition 0: edition 1 reads the brackets as types, so a value there is E020.
+Fix: put a type in the brackets (`Zero[i64]()`), and pass values in the parentheses.
 
 ### E506 RECEIVER_TYPE_PARAMS
 
@@ -3114,23 +3111,10 @@ owns it with `relay`.
 There is no `go` statement: work runs per core (`hearth`), cores talk through `relay`, and
 a request's own concurrent work runs in a `scope` (edition 1).
 
-```tin edition=0 old-syntax
-package main
-
-func work() {
-}
-
-func main() {
-	go work()
-}
-```
-
-```text
-example.tin:7:2: error E602 GO: go is not allowed: cores share nothing (run work per core with hearth, talk across cores with relay)
-```
+No example: `go` is edition 0 syntax, which is retired (#226); edition 1 reports E090
+OLD_SYNTAX for it and runs concurrent work in a `scope` or with `detach`.
 
 Fix: spawn the work as a child of a scope, or run it per core with `hearth`.
-The example is edition 0: edition 1 reports `go` as E090 OLD_SYNTAX.
 
 ### E610 UNKNOWN_EVENT
 
@@ -3554,12 +3538,12 @@ Fix: use a variable for a value that changes; build a new `str` instead of chang
 `extern` declarations, raw memory access and the runtime's internals are only allowed in
 the standard library (`lib/`), which is trusted code.
 
-```tin edition=0 old-syntax
+```tin edition=1 old-syntax
 package main
 
-extern func getpid() i64
+extern fn getpid() i64
 
-func main() {
+fn main() {
 }
 ```
 
@@ -3569,7 +3553,6 @@ example.tin:3:8: error E801 TRUSTED_ONLY: extern is only allowed in the standard
 
 Fix: use the standard library package that wraps the call (`quarry` for the process and
 files).
-The example is edition 0: edition 1 reports `extern` as E090 OLD_SYNTAX.
 
 ### E802 RUNTIME_INTERNAL
 
@@ -3702,7 +3685,8 @@ fn main() {
 error E902 UNKNOWN_EDITION: unknown edition 2 (expected 0 or 1)
 ```
 
-Fix: pass `-edition 0` or `-edition 1`, or leave the flag out for edition 0.
+Fix: pass `-edition 1`, or leave the flag out: each file is read in the edition it is written in.
+Edition 0 is retired (#226); `tin fix -edition 1` translates it.
 
 ### E903 NO_RUNTIME
 

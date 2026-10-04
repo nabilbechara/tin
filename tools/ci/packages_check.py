@@ -52,17 +52,17 @@ def main():
         work = Path(tmp)
         # Two dependencies, given as local source directories; geo requires units itself.
         write(work / 'src/units/units.tin', 'package units\n\n// Cm converts metres to centimetres.\n'
-              'func Cm(m i64) i64 {\n\treturn m * 100\n}\n')
+              'fn Cm(m i64) i64 {\n\treturn m * 100\n}\n')
         write(work / 'src/units/tin.mod', 'module example.com/units\n')
         write(work / 'src/geo/geo.tin', 'package geo\n\nimport "example.com/units"\n\n'
-              '// Area is in square centimetres.\nfunc Area(w i64, h i64) i64 {\n'
+              '// Area is in square centimetres.\nfn Area(w i64, h i64) i64 {\n'
               '\treturn units.Cm(w) * units.Cm(h)\n}\n')
         write(work / 'src/geo/geo_test.tin', 'package geo\n')
         write(work / 'src/geo/tin.mod', 'module example.com/geo\nrequire example.com/units ../units\n')
         app = work / 'app'
         write(app / 'tin.mod', 'module example.com/app\nrequire example.com/geo ../src/geo\n')
         write(app / 'main.tin', 'package main\n\nimport "example.com/geo"\nimport "say"\n\n'
-              'func main() {\n\tsay.Line("area", geo.Area(2, 3))\n}\n')
+              'fn main() {\n\tsay.Line("area", geo.Area(2, 3))\n}\n')
 
         result = run(['sh', tin, 'vendor', str(app)], work, env)
         expect(result.returncode == 0, 'tin vendor failed', result)
@@ -113,18 +113,18 @@ def main():
 
         # A dependency that dials without net is refused at its call, naming the path to the entry point.
         write(work / 'src/peek/peek.tin', 'package peek\n\nimport "wire"\n\n'
-              '// Up reports whether addr accepts a connection.\nfunc Up(addr str) bool {\n'
-              '\tc, err := wire.Dial(addr)\n\tif err != nil {\n\t\treturn false\n\t}\n\tc.Close()\n\treturn true\n}\n')
+              '// Up reports whether addr accepts a connection.\nfn Up(addr str) bool {\n'
+              '\tlet (c, err) = wire.Dial(addr)\n\tif err != nil {\n\t\treturn false\n\t}\n\tc.Close()\n\treturn true\n}\n')
         write(work / 'src/peek/tin.mod', 'module example.com/peek\n')
         write(app / 'tin.mod', 'module example.com/app\nrequire example.com/geo ../src/geo\n'
               'require example.com/peek ../src/peek\n')
         write(app / 'main.tin', 'package main\n\nimport "example.com/geo"\nimport "example.com/peek"\nimport "say"\n\n'
-              'func main() {\n\tsay.Line("area", geo.Area(2, 3), peek.Up("127.0.0.1:1"))\n}\n')
+              'fn main() {\n\tsay.Line("area", geo.Area(2, 3), peek.Up("127.0.0.1:1"))\n}\n')
         result = run(['sh', tin, 'vendor'], app, env)
         expect(result.returncode == 0, 'tin vendor with peek', result)
         expect('caps example.com/peek\n' in (app / 'tin.lock').read_text(), 'the lock lists peek with no capabilities')
         result = run(['sh', tin, 'build', 'main.tin', '-o', str(exe)], app, env, offline)
-        want = ('vendor/example.com/peek/peek.tin:7:16: error E804 CAPABILITY: wire.Dial needs capability net '
+        want = ('vendor/example.com/peek/peek.tin:7:21: error E804 CAPABILITY: wire.Dial needs capability net '
                 '(wire.Dial -> wire.DialTimeout -> wire.resolve), which package example.com/peek does not declare '
                 'in its tin.mod (caps: none)\n')
         expect(result.returncode == 1 and result.stderr == want, 'wire.Dial without net was not refused', result)

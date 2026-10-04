@@ -29,7 +29,7 @@ def check(archive, docker=False, image=None, skip_native=False):
         env = dict(os.environ)
         env.pop('TIN_ROOT', None)
         source = work / 'hello.tin'
-        source.write_text('package main\nimport "say"\nfunc main() { say.Line("release works") }\n')
+        source.write_text('package main\nimport "say"\nfn main() { say.Line("release works") }\n')
         if not skip_native:
             result = run([str(tree / 'tin'), str(source)], cwd=work, env=env, capture_output=True, text=True)
             assert result.stdout == 'release works\n', result.stdout

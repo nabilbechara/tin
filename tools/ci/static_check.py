@@ -15,10 +15,10 @@ ENV_PROGRAM = """package main
 import "quarry"
 import "say"
 
-func main() {
+fn main() {
 	say.Line("a", quarry.Getenv("STATIC_A"))
-	err := quarry.Setenv("STATIC_B", "two")
-	v, ok := quarry.LookupEnv("STATIC_B")
+	mut err = quarry.Setenv("STATIC_B", "two")
+	mut (v, ok) = quarry.LookupEnv("STATIC_B")
 	say.Line("b", v, ok, err)
 	err = quarry.Unsetenv("STATIC_A")
 	v, ok = quarry.LookupEnv("STATIC_A")

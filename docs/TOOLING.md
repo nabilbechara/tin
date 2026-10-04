@@ -80,12 +80,13 @@ parsed: `E111 LOCK_MISMATCH` names the file and both hashes. Review the change, 
 ## 3. The compiler, `tinc`
 
 ```text
-tinc [-o OUT] [-S] [-edition 0|1] [-target darwin-arm64|linux-arm64|linux-amd64] FILE.tin...
+tinc [-o OUT] [-S] [-edition 1] [-target darwin-arm64|linux-arm64|linux-amd64] FILE.tin...
 ```
 
 - `-o OUT`: write the executable (default `a.out`). `-S`: print assembly instead.
-- `-edition 1`: read the program's files as edition 1 (LANGUAGE.md); `-edition 0` is the
-  Go-like syntax before it. Standard-library files are read in the library's own edition.
+- `-edition 1`: read the program's files as edition 1 (LANGUAGE.md). Without the flag each
+  file is read in the edition it is written in. Edition 0, the Go-like syntax before it, is
+  retired (#226): the compiler refuses it (E090) and only `tin fix -edition 1` reads it.
 - `-audit-secrets`: check the program and print its secret audit instead of building
   (`tin audit secrets`; LANGUAGE.md §18).
 - The standard library is found through `$TIN_ROOT` or, without it, relative to the
