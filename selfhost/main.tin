@@ -11,6 +11,8 @@ extern fn strcmp(a, b);
 extern fn uname(buf);
 
 var lib_root;
+var project_root;
+var project_lock;
 
 // read_file returns a buffer holding the whole file, or 0 if it cannot be opened.
 fn try_read_file(path) {
@@ -244,6 +246,10 @@ fn resolve_import(ipath, from) {
     if load8(ipath) == '.' {
         return package_files(cat_path(cat_path(dir_of(from), "/"), ipath));
     }
+    let vendored = package_files(cat_path(cat_path(project_root, "/vendor/"), ipath));
+    if vendored {
+        return vendored;
+    }
     let std = package_files(cat_path(cat_path(lib_root, "/lib/"), ipath));
     if std {
         return std;
@@ -314,6 +320,84 @@ fn starts_with(s, prefix) {
     return 1;
 }
 
+fn bytes_equal(a, b, n) {
+    let i = 0;
+    while i < n {
+        if load8(a + i) != load8(b + i) {
+            return 0;
+        }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn hex_nibble(v) {
+    if v < 10 {
+        return '0' + v;
+    }
+    return 'a' + v - 10;
+}
+
+fn digest_hex(d) {
+    let out = buf_new();
+    let i = 0;
+    while i < 32 {
+        let v = load8(d + i);
+        buf_byte(out, hex_nibble(v >> 4));
+        buf_byte(out, hex_nibble(v & 15));
+        i = i + 1;
+    }
+    buf_byte(out, 0);
+    return out[VEC_DATA];
+}
+
+fn lock_has(path) {
+    if !project_lock {
+        return 1;
+    }
+    let rel = path;
+    let plen = strlen(project_root);
+    if starts_with(path, project_root) && load8(path + plen) == '/' {
+        rel = path + plen + 1;
+    }
+    let src = read_file(path);
+    let digest = calloc(32, 1);
+    sha256(src[VEC_DATA], src[VEC_LEN], digest);
+    let hex = digest_hex(digest);
+    let needle = buf_new();
+    buf_str(needle, hex);
+    buf_byte(needle, ' ');
+    buf_str(needle, rel);
+    buf_byte(needle, '\n');
+    let n = needle[VEC_LEN];
+    let i = 0;
+    while i + n <= project_lock[VEC_LEN] {
+        if bytes_equal(project_lock[VEC_DATA] + i, needle[VEC_DATA], n) {
+            return 1;
+        }
+        i = i + 1;
+    }
+    let e = err_begin(NO_POS);
+    buf_str(e, "tin.lock hash mismatch or missing entry for ");
+    buf_str(e, rel);
+    fatal(e);
+    return 0;
+}
+
+fn verify_lock() {
+    if !project_lock {
+        return;
+    }
+    let i = 0;
+    while i < files[VEC_LEN] {
+        let path = vec_get(files, i);
+        if !starts_with(path, cat_path(lib_root, "/lib/")) {
+            lock_has(path);
+        }
+        i = i + 1;
+    }
+}
+
 fn main(argc, argv) {
     files = vec_new();
     file_trusted = vec_new();
@@ -356,6 +440,8 @@ fn main(argc, argv) {
     }
     if v2 {
         lib_root = find_root();
+        project_root = dir_of(vec_get(files, 0));
+        project_lock = try_read_file(cat_path(project_root, "/tin.lock"));
         // The runtime is the package lib/runtime: every file of it for this OS and CPU.
         let rtfiles = package_files(cat_path(lib_root, "/lib/runtime"));
         if !rtfiles {
@@ -373,6 +459,7 @@ fn main(argc, argv) {
             rk = rk + 1;
         }
         load_imports();
+        verify_lock();
     }
     check();
     if error_count > 0 {
