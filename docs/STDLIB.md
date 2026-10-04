@@ -918,6 +918,9 @@ Package seal has cryptographic hashes (SHA-256, SHA-384, SHA-512, SHA-1), HMAC o
 - `HkdfExtract(h Hash, salt str, ikm secret str) []u8`: HkdfExtract is HKDF-Extract(salt, ikm) (RFC 5869): a pseudorandom key of Size(h) bytes. An empty salt means Size(h) zero bytes. ikm may be secret.
 - `HkdfExpand(h Hash, prk secret str, info str, n i64) ![]u8`: HkdfExpand is HKDF-Expand(prk, info, n) (RFC 5869): n bytes, at most 255*Size(h). prk may be secret.
 - `HkdfExpandLabel(h Hash, key secret str, label str, context str, n i64) ![]u8`: HkdfExpandLabel is TLS 1.3's HKDF-Expand-Label(secret, label, context, n) (RFC 8446 section 7.1); label is given without the "tls13 " prefix. key may be secret.
+- `P256NewPrivateKey() []u8`: P256NewPrivateKey returns a random P-256 private key: 32 big-endian bytes in [1, n-1].
+- `P256PublicKey(priv secret []u8) ![]u8`: P256PublicKey is the uncompressed public key (65 bytes) of a P-256 private key; it fails unless priv is 32 bytes in [1, n-1]. Constant-time in priv.
+- `P256ECDH(priv secret []u8, peer []u8) ![]u8`: P256ECDH is the P-256 Diffie-Hellman shared secret (the 32-byte x coordinate of priv*peer). peer is an uncompressed or compressed public key; it fails for an invalid private key, a point not on the curve, or a result at infinity. Constant-time in priv.
 - `Sha256(s secret str) []u8`: Sha256 is the SHA-256 digest of s (32 bytes); s may be secret.
 - `Sha256Soft(s str) []u8`: Sha256Soft is SHA-256 in portable code (the reference the hardware path is tested against).
 - `Sha256Hex(s secret str) str`: Sha256Hex is the SHA-256 digest of s in lower-case hex; s may be secret.
