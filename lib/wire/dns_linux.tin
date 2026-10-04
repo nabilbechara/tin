@@ -120,7 +120,7 @@ func dns_file(defaultPath str, override str) !str {
     }
     s, err := quarry.ReadFile(path)
     if err != nil {
-        if say.Str(err) == "deadline exceeded" { fail err }
+        if say.Str(err) == "deadline exceeded" || rt_bnd_stopped() { fail err }
         return ""
     }
     return s
@@ -302,7 +302,7 @@ func dns_response(b []u8, name str, kind i64, id i64) dnsAnswer {
 func dns_budget(until i64) !i64 {
     now := rt_mono_ns()
     task := rt_task_current()
-    if task != 0 && task[tDeadline] > 0 && now >= task[tDeadline] { fail "deadline exceeded" }
+    if task != 0 && ((task[tDeadline] > 0 && now >= task[tDeadline]) || rt_bnd_stopped()) { fail cast(fault, rt_wait_fault()) }
     left := until-now
     if left <= 0 { fail "DNS timed out" }
     return left
@@ -311,7 +311,7 @@ func dns_budget(until i64) !i64 {
 func dns_wait(fd i64, want i64, until i64) ! {
     left := try dns_budget(until)
     r := rt_task_wait(fd,want,left)
-    if r == waitDeadline { fail "deadline exceeded" }
+    if r == waitDeadline { fail cast(fault, rt_wait_fault()) }
     if r == waitTimeout { fail "DNS timed out" }
 }
 
@@ -386,7 +386,7 @@ func dns_exchange(server str, port i64, query []u8, name str, kind i64, id i64, 
         if dns_u16(packet,0) != id {
             rejected++
             if rejected%16 == 0 && rt_task_current() != 0 {
-                if rt_task_wait(-1,0,1) == waitDeadline { fail "deadline exceeded" }
+                if rt_task_wait(-1,0,1) == waitDeadline { fail cast(fault, rt_wait_fault()) }
             }
             continue
         }
@@ -416,7 +416,7 @@ func dns_lookup(name str, kind i64, config dnsConfig, start i64, limit i64) !dns
                 if limit > 0 && until > limit { until=limit }
                 candidate, err2 := dns_exchange(config.servers[(start+index)%len(config.servers)],config.port,query,current,kind,id,until)
                 if err2 != nil {
-                    if say.Str(err2) == "deadline exceeded" { fail err2 }
+                    if say.Str(err2) == "deadline exceeded" || rt_bnd_stopped() { fail err2 }
                     if limit > 0 && rt_mono_ns() >= limit { fail "wire: resolve timed out" }
                     continue
                 }

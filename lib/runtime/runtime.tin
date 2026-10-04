@@ -2465,11 +2465,49 @@ const tRecoverable = 48
 const tTrim = 49     // observed heavy pool or suspended stack: discard cached pages
 const tTimers = 50   // timer heap entries that still name this record
 const tRetired = 51  // 1: released over the cache cap; freed when its last timer entry pops
-const taskWords = 52
+const tBnd = 52      // the task's current boundary (notes/interface_boundaries.md), 0 before rt_bnd_task
+const taskWords = 53
 
 const waitReady = 0
 const waitDeadline = 1
 const waitTimeout = 2
+
+// Boundary records (notes/interface_boundaries.md): one per request, task and block boundary.
+const bParent = 0
+const bKind = 1     // kind in the low 8 bits, flags above
+const bTask = 2     // the task running in it; 0 on the core stack
+const bCancel = 3   // 0, or the reason it was cancelled (a fault)
+const bOrigin = 4   // the boundary whose cancellation reached this one
+const bDeadline = 5 // effective deadline (mono ns): min(own, parent's); 0: none
+const bDlOwner = 6  // the boundary whose own deadline is the effective one
+const bLimit = 7    // the innermost boundary with a budget at or above this one
+const bMemMax = 8
+const bMemUsed = 9
+const bTaskMax = 10
+const bTaskUsed = 11
+const bSlots = 12   // slot chain [next, key, value], inherited at entry
+const bChild = 13
+const bNext = 14
+const bPrev = 15
+const bCleanup = 16 // the task's cleanup chain head at entry
+const bLand = 17    // unwind landing data (#230)
+const bRegion = 18  // 3 words: region mark at entry (#176)
+const bFault = 21   // the fault an unwind landed with
+const bOwnDl = 22   // this boundary's own deadline (mono ns); 0: none
+const bndWords = 24
+
+const bkCore = 1
+const bkBackground = 2
+const bkRequest = 3
+const bkTask = 4
+const bkGuard = 5
+const bkWithin = 6
+const bkLimit = 7
+const bkScope = 8
+const bkArena = 9
+const bkWith = 10
+const bfRoot = 256
+const bfGuard = 512
 
 var curTask i64   // per core: the running task, 0 on the core's own stack
 var schedSave i64 // per core: the core's own registers while a task runs
@@ -2487,6 +2525,10 @@ var readyQ i64              // per core: tasks woken by another task, resumed by
 var readyHead i64
 var readyN i64
 var readyCap i64
+var bndFree i64     // per core: free boundary records
+var bndCur i64      // per core: the current boundary of code on the core's own stack (0: the root)
+var bndRoot i64     // per core: the core's root boundary
+var bndBack i64     // per core: the core's background boundary
 
 // rt_task_swap stores the running registers into from and continues with those in to.
 func rt_task_swap(from i64, to i64) {
@@ -2519,6 +2561,7 @@ func rt_task_new(body func(i64), arg i64) i64 {
 	t[tPanicked] = 0
 	t[tRecoverable] = 0
 	t[tTrim] = 0
+	t[tBnd] = 0
 	for i := 0; i < 20; i++ {
 		t[tSave+i] = 0
 	}
@@ -2533,6 +2576,7 @@ func rt_task_entry() {
 	f := cast(func(i64), t[tFn])
 	f(t[tArg])
 	rt_task_cleanups(0)
+	rt_bnd_task_end(t)
 	if __ctx()[ctxPoolExtra] != 0 || rt_pool_used() > 65536 { t[tTrim] = 1 }
 	rt_pool_reset()
 	t[tDone] = 1
@@ -2554,6 +2598,7 @@ func rt_task_panicked(t i64) bool {
 // rt_task_abort ends the running task t after a panic: its stack is abandoned where it is.
 func rt_task_abort(t i64) {
 	rt_task_cleanups(0)
+	rt_bnd_task_end(t)
 	if __ctx()[ctxPoolExtra] != 0 || rt_pool_used() > 65536 { t[tTrim] = 1 }
 	rt_pool_reset()
 	t[tDone] = 1
@@ -2715,6 +2760,312 @@ func rt_heap_str(s str) i64 {
 // rt_task_set_deadline makes every wait of task t give up at mono time at (0: never).
 func rt_task_set_deadline(t i64, at i64) {
 	t[tDeadline] = at
+	if t[tBnd] != 0 {
+		rt_bnd_set_deadline(rt_bnd_root(t), at)
+	}
+}
+
+// ---- boundaries: cancel state, deadline, budget and slots (notes/interface_boundaries.md) ----
+//
+// Every task and block boundary has a record, linked to its parent in a per-core tree.
+// Cancelling a record cancels its subtree, never its parent or siblings, and ends the waits
+// of the tasks inside it with waitDeadline; rt_wait_fault gives the fault they fail with.
+
+// rt_bnd_alloc takes a record from the core's free list; rt_bnd_new writes every word.
+func rt_bnd_alloc() i64 {
+	b := bndFree
+	if b == 0 {
+		return calloc(bndWords, 8)
+	}
+	bndFree = b[0]
+	return b
+}
+
+// rt_bnd_core is this core's root boundary, made the first time it is asked for.
+func rt_bnd_core() i64 {
+	if bndRoot == 0 {
+		bndRoot = calloc(bndWords, 8)
+		bndRoot[bKind] = bkCore | bfGuard
+	}
+	return bndRoot
+}
+
+// rt_bnd_background is this core's boundary for long-lived work (detach, ticks, handlers).
+func rt_bnd_background() i64 {
+	if bndBack == 0 {
+		bndBack = rt_bnd_new(rt_bnd_core(), bkBackground, 0)
+	}
+	return bndBack
+}
+
+// rt_bnd_current is the running task's current boundary, or the core stack's.
+func rt_bnd_current() i64 {
+	t := curTask
+	if t != 0 && t[tBnd] != 0 {
+		return t[tBnd]
+	}
+	if t == 0 && bndCur != 0 {
+		return bndCur
+	}
+	return rt_bnd_core()
+}
+
+// rt_bnd_new links a record for task t (0: the core stack) under parent, inheriting its state.
+func rt_bnd_new(parent i64, kind i64, t i64) i64 {
+	b := rt_bnd_alloc()
+	b[bParent] = parent
+	b[bKind] = kind
+	b[bTask] = t
+	b[bCancel] = parent[bCancel]
+	b[bOrigin] = parent[bOrigin]
+	b[bDeadline] = parent[bDeadline]
+	b[bDlOwner] = parent[bDlOwner]
+	b[bLimit] = parent[bLimit]
+	b[bMemMax] = 0
+	b[bMemUsed] = 0
+	b[bTaskMax] = 0
+	b[bTaskUsed] = 0
+	b[bSlots] = parent[bSlots]
+	b[bChild] = 0
+	b[bPrev] = 0
+	b[bCleanup] = 0
+	if t != 0 {
+		b[bCleanup] = t[tCleanup]
+	}
+	b[bLand] = 0
+	b[bRegion] = 0
+	b[bRegion+1] = 0
+	b[bRegion+2] = 0
+	b[bFault] = 0
+	b[bOwnDl] = 0
+	n := parent[bChild]
+	b[bNext] = n
+	if n != 0 {
+		n[bPrev] = b
+	}
+	parent[bChild] = b
+	return b
+}
+
+// rt_bnd_unlink takes b out of its parent's children and returns it to the free list.
+func rt_bnd_unlink(b i64) {
+	p := b[bParent]
+	if b[bPrev] != 0 {
+		b[bPrev][bNext] = b[bNext]
+	} else if p != 0 {
+		p[bChild] = b[bNext]
+	}
+	if b[bNext] != 0 {
+		b[bNext][bPrev] = b[bPrev]
+	}
+	b[0] = bndFree
+	bndFree = b
+}
+
+// rt_bnd_enter makes a child of the current boundary the current one.
+func rt_bnd_enter(kind i64) i64 {
+	t := curTask
+	b := rt_bnd_new(rt_bnd_current(), kind, t)
+	if t != 0 {
+		t[tBnd] = b
+	} else {
+		bndCur = b
+	}
+	return b
+}
+
+// rt_bnd_leave ends the current boundary b normally: its parent is current again.
+func rt_bnd_leave(b i64) {
+	t := b[bTask]
+	p := b[bParent]
+	if t != 0 {
+		t[tBnd] = p
+		t[tDeadline] = p[bDeadline]
+	} else if p == bndRoot {
+		bndCur = 0
+	} else {
+		bndCur = p
+	}
+	rt_bnd_unlink(b)
+}
+
+// rt_bnd_task gives task t a root boundary under parent before it first runs.
+func rt_bnd_task(t i64, parent i64, kind i64) ! {
+	l := parent[bLimit]
+	if l != 0 && l[bTaskMax] > 0 && l[bTaskUsed] >= l[bTaskMax] {
+		fail "limit exceeded"
+	}
+	if l != 0 {
+		l[bTaskUsed]++
+	}
+	b := rt_bnd_new(parent, kind | bfRoot | bfGuard, t)
+	b[bCleanup] = 0
+	t[tBnd] = b
+	t[tDeadline] = b[bDeadline]
+}
+
+// rt_bnd_root is the root boundary of task t.
+func rt_bnd_root(t i64) i64 {
+	b := t[tBnd]
+	for b != 0 && b[bKind] & bfRoot == 0 {
+		b = b[bParent]
+	}
+	return b
+}
+
+// rt_bnd_task_end leaves every boundary of the finished task t, its root last.
+func rt_bnd_task_end(t i64) {
+	b := t[tBnd]
+	for b != 0 {
+		p := b[bParent]
+		root := b[bKind] & bfRoot != 0
+		if root {
+			l := p[bLimit]
+			if l != 0 {
+				l[bTaskUsed]--
+			}
+		}
+		rt_bnd_unlink(b)
+		if root {
+			break
+		}
+		b = p
+	}
+	t[tBnd] = 0
+}
+
+// rt_bnd_set_deadline sets b's own deadline (mono ns, 0: none); b and everything inside it
+// take the earlier of their own and their parent's.
+func rt_bnd_set_deadline(b i64, at i64) {
+	b[bOwnDl] = at
+	d := b
+	for {
+		p := d[bParent]
+		own := d[bOwnDl]
+		if p != 0 && p[bDeadline] > 0 && (own == 0 || p[bDeadline] <= own) {
+			d[bDeadline] = p[bDeadline]
+			d[bDlOwner] = p[bDlOwner]
+		} else if own > 0 {
+			d[bDeadline] = own
+			d[bDlOwner] = d
+		} else {
+			d[bDeadline] = 0
+			d[bDlOwner] = 0
+		}
+		t := d[bTask]
+		if t != 0 && t[tBnd] == d {
+			t[tDeadline] = d[bDeadline]
+		}
+		if d[bChild] != 0 {
+			d = d[bChild]
+			continue
+		}
+		for d != b && d[bNext] == 0 {
+			d = d[bParent]
+		}
+		if d == b {
+			break
+		}
+		d = d[bNext]
+	}
+}
+
+// rt_bnd_deadline is b's effective deadline (mono ns), 0 for none.
+func rt_bnd_deadline(b i64) i64 {
+	return b[bDeadline]
+}
+
+// rt_bnd_cancel cancels b and everything inside it with reason, and ends their waits. The
+// first reason wins.
+func rt_bnd_cancel(b i64, reason fault) {
+	if b[bCancel] != 0 {
+		return
+	}
+	r := cast(i64, reason)
+	d := b
+	for {
+		if d[bCancel] == 0 {
+			d[bCancel] = r
+			d[bOrigin] = b
+			t := d[bTask]
+			if t != 0 && t[tBnd] == d {
+				rt_task_interrupt(t)
+			}
+			if d[bChild] != 0 {
+				d = d[bChild]
+				continue
+			}
+		}
+		for d != b && d[bNext] == 0 {
+			d = d[bParent]
+		}
+		if d == b {
+			break
+		}
+		d = d[bNext]
+	}
+}
+
+// rt_bnd_canceled is b's cancel reason (a fault word), or 0.
+func rt_bnd_canceled(b i64) i64 {
+	return b[bCancel]
+}
+
+// rt_bnd_check cancels the owner of the current deadline once it has passed.
+func rt_bnd_check() {
+	b := rt_bnd_current()
+	if b[bCancel] == 0 && b[bDeadline] > 0 && rt_mono_ns() >= b[bDeadline] {
+		rt_bnd_cancel(b[bDlOwner], cast(fault, "deadline exceeded"))
+	}
+}
+
+// rt_bnd_stopped reports whether the current boundary is cancelled or past its deadline.
+func rt_bnd_stopped() bool {
+	rt_bnd_check()
+	return rt_bnd_current()[bCancel] != 0
+}
+
+// rt_task_interrupt ends t's wait, whatever it waits for, as waitDeadline, and queues t.
+func rt_task_interrupt(t i64) {
+	if t[tWaiting] == 0 {
+		return
+	}
+	if t[tWaitFd] >= 0 {
+		waitCancel(t[tWaitFd])
+	}
+	rt_task_ready(t)
+	t[tResult] = waitDeadline
+	if readyHead+readyN == readyCap {
+		if readyHead > 0 {
+			memmove(readyQ, readyQ+8*readyHead, 8*readyN)
+			readyHead = 0
+		} else {
+			readyCap = readyCap*2 + 64
+			readyQ = realloc(readyQ, 8*readyCap)
+		}
+	}
+	readyQ[readyHead+readyN] = t
+	readyN++
+}
+
+// rt_wait_fault is the fault (a word: fail cast(fault, w)) a wait that returned waitDeadline
+// fails with: the deadline or budget fault itself, or "canceled: " and any other reason.
+func rt_wait_fault() i64 {
+	rt_bnd_check()
+	r := rt_bnd_current()[bCancel]
+	if r == 0 {
+		return cast(i64, "deadline exceeded")
+	}
+	m := cast(str, r)
+	if m == "deadline exceeded" || m == "limit exceeded" {
+		return r
+	}
+	return cast(i64, "canceled: " + m)
+}
+
+// rt_wait_msg is rt_wait_fault's message, for code that builds its fault later.
+func rt_wait_msg() str {
+	return cast(str, rt_wait_fault())
 }
 
 // rt_task_wait waits until fd is ready (want 1: readable, 2: writable; fd -1: no fd), the
@@ -2724,11 +3075,18 @@ func rt_task_set_deadline(t i64, at i64) {
 func rt_task_wait(fd i64, want i64, timeout i64) i64 {
 	t := curTask
 	if t == 0 || (fd >= 0 && cast(i64, waitHook) == 0) {
+		if rt_bnd_current()[bCancel] != 0 {
+			return waitDeadline
+		}
 		if fd < 0 {
 			rt_sleep_ns(timeout)
 			return waitTimeout
 		}
 		return rt_poll_wait(fd, want, timeout)
+	}
+	b := t[tBnd]
+	if b != 0 && b[bCancel] != 0 {
+		return waitDeadline
 	}
 	wake := -1
 	t[tResult] = waitTimeout
@@ -2749,6 +3107,9 @@ func rt_task_wait(fd i64, want i64, timeout i64) i64 {
 		waitHook(fd, want)
 	}
 	rt_task_yield()
+	if t[tResult] == waitDeadline && t[tBnd] != 0 {
+		rt_bnd_check()
+	}
 	return t[tResult]
 }
 
@@ -2997,9 +3358,9 @@ func rt_helper_run(f func(i64), arg i64, drop func(i64)) ! {
 		f(arg)
 		return
 	}
-	if t[tDeadline] > 0 && rt_mono_ns() >= t[tDeadline] {
+	if (t[tDeadline] > 0 && rt_mono_ns() >= t[tDeadline]) || rt_bnd_stopped() {
 		drop(arg)
-		fail "deadline exceeded"
+		fail cast(fault, rt_wait_fault())
 	}
 	rt_lock(&helperLock)
 	if !helperUp {
@@ -3041,7 +3402,7 @@ func rt_helper_run(f func(i64), arg i64, drop func(i64)) ! {
 	r := rt_task_park(0)
 	if r == waitDeadline {
 		job[jGone] = 1
-		fail "deadline exceeded"
+		fail cast(fault, rt_wait_fault())
 	}
 	free(job)
 }

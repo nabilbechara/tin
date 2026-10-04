@@ -1,0 +1,138 @@
+package main
+
+import "anvil"
+import "mint"
+import "mysql"
+import "postgres"
+import "quarry"
+import "redis"
+import "say"
+import "tide"
+import "websocket"
+import "wire"
+
+// Every client points at a server that accepts and never answers (cancel_check.py).
+var hole = quarry.Getenv("HOLE_ADDR")
+var rc = redis.Open(redis.Options{Addr: quarry.Getenv("HOLE_ADDR")})
+var mc = mysql.Open(mysql.Options{Addr: quarry.Getenv("HOLE_ADDR"), User: "tin", Pool: 1})
+var pc = postgres.Open(postgres.Options{Addr: quarry.Getenv("HOLE_ADDR"), User: "tin", Pool: 1})
+
+func slot(q anvil.Req) i64 {
+	i := mint.Atoi(q.PathParam("i")) catch _ { 0 }
+	return i
+}
+
+// wait_in waits in one client until the wait fails.
+func wait_in(kind str) ! {
+	switch kind {
+	case "tide":
+		try tide.Wait(10 * tide.Second)
+	case "wire":
+		c := try wire.Dial(hole)
+		buf := make([]u8, 16)
+		n := try c.Read(mut buf, 16)
+		say.Line(n)
+	case "redis":
+		r := try rc.Do("GET k")
+		say.Line(r)
+	case "mysql":
+		r := try mc.Exec("SELECT 1")
+		say.Line(r)
+	case "postgres":
+		r := try pc.Exec("SELECT 1")
+		say.Line(r)
+	case "websocket":
+		c := try websocket.Dial("ws://{hole}/")
+		say.Line(c)
+	case "file":
+		s := try quarry.ReadFile(quarry.Getenv("FIFO"))
+		say.Line(len(s))
+	}
+}
+
+// park waits in a client; /cancel/{i} cancels it.
+func park(q anvil.Req, w mut anvil.Out) {
+	tide.ProbeMark(slot(q))
+	wait_in(q.PathParam("kind")) catch err {
+		w.Text("fault: {err}")
+		return
+	}
+	w.Text("no fault")
+}
+
+func cancel(q anvil.Req, w mut anvil.Out) {
+	tide.ProbeCancel(slot(q), "test reason {slot(q)}")
+	w.Text("ok")
+}
+
+// nested cancels an inner block only: the request's own boundary must stay live.
+func nested(q anvil.Req, w mut anvil.Out) {
+	outer := tide.ProbeCurrent()
+	b := tide.ProbeEnter()
+	tide.ProbeMark(slot(q))
+	inner := ""
+	tide.Wait(10 * tide.Second) catch err {
+		inner = say.Str(err)
+	}
+	tide.ProbeLeave(b)
+	after := "ok"
+	tide.Wait(tide.Millisecond) catch err {
+		after = say.Str(err)
+	}
+	w.Text("inner: {inner}; outer: [{tide.ProbeCanceled(outer)}]; after: {after}")
+}
+
+// outer cancels the request's boundary while a block inside it waits.
+func outer(q anvil.Req, w mut anvil.Out) {
+	tide.ProbeMark(slot(q))
+	b := tide.ProbeEnter()
+	inner := ""
+	tide.Wait(10 * tide.Second) catch err {
+		inner = say.Str(err)
+	}
+	reason := tide.ProbeCanceled(b)
+	tide.ProbeLeave(b)
+	again := "ok"
+	tide.Wait(tide.Millisecond) catch err {
+		again = say.Str(err)
+	}
+	w.Text("inner: {inner}; block: {reason}; again: {again}")
+}
+
+// within gives a block a 50 ms deadline inside the request's longer one.
+func within(q anvil.Req, w mut anvil.Out) {
+	b := tide.ProbeEnter()
+	tide.ProbeDeadline(b, 50)
+	start := tide.Now()
+	inner := ""
+	tide.Wait(10 * tide.Second) catch err {
+		inner = say.Str(err)
+	}
+	ms := (tide.Now() - start) / tide.Millisecond
+	tide.ProbeLeave(b)
+	after := "ok"
+	tide.Wait(tide.Millisecond) catch err {
+		after = say.Str(err)
+	}
+	w.Text("inner: {inner}; ms: {ms}; after: {after}")
+}
+
+func plain(q anvil.Req, w mut anvil.Out) {
+	tide.Wait(tide.Millisecond) catch err {
+		w.Text("fault: {err}")
+		return
+	}
+	w.Text("plain ok")
+}
+
+func main() {
+	r := anvil.NewRouter()
+	r.Get(`/park/{i}/{kind}`, park)
+	r.Get(`/cancel/{i}`, cancel)
+	r.Get(`/nested/{i}`, nested)
+	r.Get(`/outer/{i}`, outer)
+	r.Get(`/within`, within)
+	r.Get(`/plain`, plain)
+	err := r.Serve(":0")
+	say.Line(err)
+}

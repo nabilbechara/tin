@@ -337,6 +337,13 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   reuse its task safely. A late completion calls `drop(job)` and never resumes the old
   task. Already-running system calls can still finish after the caller's deadline;
   their results are discarded. Outside a task the helper runs synchronously.
+- Boundaries (Tin 1, notes/interface_boundaries.md): each request task has a root boundary
+  record under its core's root, holding its deadline and cancel state; block boundaries nest
+  under it. `rt_bnd_cancel(b, reason)` cancels `b` and everything inside it (never its parent
+  or siblings) and ends the waits of the tasks inside: `rt_task_wait` returns `waitDeadline`,
+  and a wait in a boundary that is already cancelled returns it at once. Clients then fail
+  with `rt_wait_fault()`: `deadline exceeded` (or `limit exceeded`) itself, otherwise
+  `canceled: ` and the reason. `tools/ci/cancel_check.py` checks every client.
 - Tasks can wait on each other: `rt_task_park(timeout)` waits until another task calls
   `rt_task_wake(t)`; woken tasks go on a per-core ready queue that the loop drains on its
   next turn (it does not block while the queue has tasks). `rt_task_defer()` puts the
