@@ -1302,6 +1302,8 @@ fn collect_local_decls(stmts, names) {
         } else if k == ST_SCOPE {
             vec_push(names, s[SCOPE_NAME]);
             collect_local_decls(s[SCOPE_BODY][BLK_STMTS], names);
+        } else if k == ST_DETACH {
+            collect_local_decls(s[BODY_BLOCK][BLK_STMTS], names);
         } else if k == ST_LIST {
             collect_local_decls(s[LIST_STMTS], names);
         } else if k == ST_IF {
@@ -1469,6 +1471,8 @@ fn scan_idents_in_stmt(s, inner_params, outer_names, cells) {
         scan_idents_in_block(s, inner_params, outer_names, cells);
     } else if k == ST_SCOPE {
         scan_idents_in_block(s[SCOPE_BODY], inner_params, outer_names, cells);
+    } else if k == ST_DETACH {
+        scan_funclit_escaping_idents(detach_fn(s), outer_names, cells);
     } else if k == ST_LIST {
         let stmts = s[LIST_STMTS];
         let i = 0;
@@ -1665,6 +1669,8 @@ fn scan_funclits_in_stmt(s, outer_names, cells) {
         scan_funclits_in_block(s, outer_names, cells);
     } else if k == ST_SCOPE {
         scan_funclits_in_block(s[SCOPE_BODY], outer_names, cells);
+    } else if k == ST_DETACH {
+        scan_funclit_escaping_idents(detach_fn(s), outer_names, cells);
     } else if k == ST_LIST {
         let stmts = s[LIST_STMTS];
         let i = 0;
@@ -2510,6 +2516,8 @@ fn check_stmt(s) {
         lower_once(s);
     } else if k == ST_SCOPE {
         lower_scope(s);
+    } else if k == ST_DETACH {
+        lower_detach(s);
     } else if k == ST_DEFER {
         lower_defer(s);
     } else if k == ST_BSTORE {
@@ -2626,6 +2634,38 @@ fn lower_scope(s) {
     vec_push(b[BLK_STMTS], expr_stmt(tr));
     replace_node(s, b);
     check_scoped(s);
+}
+
+// detach { body } is rt_detach(keep(fn() ! { body })): a task in the core's background
+// boundary, outliving the request, so everything it captures is copied to the long-lived heap.
+fn lower_detach(s) {
+    let pos = s[N_POS];
+    let f = fn_new(pos, "func");
+    let ft = node_new(TX_NAME, pos);
+    ft[TX_B] = "fault";
+    vec_push(f[F_RTYPES], ft);
+    f[F_BANG] = 1;
+    f[F_BODY] = s[BODY_BLOCK];
+    let lit = node_new(EX_FUNCLIT, pos);
+    lit[LIT_FN] = f;
+    lit[LIT_ESCAPE] = 1;
+    let kc = node_new(EX_CALL, pos);
+    kc[CALL_NAME] = "keep";
+    kc[CALL_ARGS] = vec_new();
+    vec_push(kc[CALL_ARGS], lit);
+    let dc = node_new(EX_CALL, pos);
+    dc[CALL_NAME] = "rt_detach";
+    dc[CALL_ARGS] = vec_new();
+    vec_push(dc[CALL_ARGS], kc);
+    replace_node(s, expr_stmt(dc));
+    check_stmt(s);
+}
+
+// detach_fn is a stand-in for the closure a detach block becomes, for the capture scan.
+fn detach_fn(s) {
+    let f = fn_new(s[N_POS], "func");
+    f[F_BODY] = s[BODY_BLOCK];
+    return f;
 }
 
 // mark_spawns keeps the closures passed to s.spawn inside scope s on the parent's frame (the

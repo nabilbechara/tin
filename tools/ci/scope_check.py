@@ -50,6 +50,17 @@ def checks(port):
     print('60 concurrent requests with scopes on one core: all correct in %.2f s' % took)
 
 
+def detach(port):
+    # detach outlives its request: the response comes first, the work 20 ms later, and what
+    # it captured from the request is still intact.
+    (status, body), took = timed(port, '/later/one')
+    assert (status, body) == (200, b'detached') and took < 0.02, (status, body, took)
+    assert response(request(port, '/later/two'))[1] == b'detached'
+    assert response(request(port, '/failing'))[1] == b'detached'
+    eventually(lambda: response(request(port, '/seen'))[1] == b'/later/one;/later/two;')
+    print('detach: answered before the work ran; the work then saw its captured request path')
+
+
 def main():
     out = ROOT / 'bin/ci/scopes'
     out.mkdir(parents=True, exist_ok=True)
@@ -63,6 +74,7 @@ def main():
         try:
             eventually(lambda: server_ready(port, server))
             checks(port)
+            detach(port)
             assert server.poll() is None, 'server exited'
         finally:
             server.terminate()
@@ -71,6 +83,9 @@ def main():
             except subprocess.TimeoutExpired:
                 server.kill()
                 server.wait()
+    text = (out / 'server.log').read_text(errors='replace')
+    assert text.count('detached task failed: background work failed') == 1, text[-1000:]
+    print('detach: a failing detached task is logged once; the server kept serving')
 
 
 if __name__ == '__main__':
