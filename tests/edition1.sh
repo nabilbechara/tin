@@ -35,7 +35,9 @@ fi
 # "msg" passes fault.Wrap(err, msg) upward (#229).
 # task.Deadline and task.Canceled read the innermost boundary; nested within takes the
 # earlier deadline (#233).
-for name in boundaries fault_wrap once polls deadlines
+# A value main borrowed from a long-lived map stays valid while a spawned child replaces
+# the entry and ends: the core's own stack is an epoch participant (#176).
+for name in boundaries fault_wrap once polls deadlines borrows
 do
 	polls=
 	[ "$name" != polls ] || polls=-polls

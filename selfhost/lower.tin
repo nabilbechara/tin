@@ -51,7 +51,7 @@ fn chk_kind(e, want) {
             return want;
         }
         if !ck_legacy {
-            err_at(e[N_POS], "nil needs an optional (?T) or fault type");
+            err_code_at(e[N_POS], "E233 UNTYPED_NIL", "nil needs an optional (?T) or fault type");
         }
         return ty_nil;
     }
@@ -101,15 +101,15 @@ fn chk_kind(e, want) {
         return chk_unit(e, want);
     }
     if k == EX_TYPE {
-        err_at(e[N_POS], "type used as a value");
+        err_code_at(e[N_POS], "E235 NOT_A_VALUE", "type used as a value");
         return ty_int;
     }
     if k == EX_TRY {
-        err_at(e[N_POS], "try is only allowed as a statement, an initializer, an assignment or a return");
+        err_code_at(e[N_POS], "E403 TRY_PLACEMENT", "try is only allowed as a statement, an initializer, an assignment or a return");
         return ty_int;
     }
     if k == EX_CATCH {
-        err_at(e[N_POS], "catch is only allowed on a whole statement, initializer, assignment or return value");
+        err_code_at(e[N_POS], "E401 CATCH_PLACEMENT", "catch is only allowed on a whole statement, initializer, assignment or return value");
         return ty_int;
     }
     if k == EX_INTERP {
@@ -119,10 +119,10 @@ fn chk_kind(e, want) {
         return chk_interp(e, want);
     }
     if k == EX_MUTARG {
-        err_at(e[N_POS], "mut here does nothing: only an argument for a mut parameter takes mut");
+        err_code_at(e[N_POS], "E705 MUT_ARG", "mut here does nothing: only an argument for a mut parameter takes mut");
         return chk(e[MUTARG_X], want);
     }
-    err_at(e[N_POS], "unexpected expression");
+    err_code_at(e[N_POS], "E990 INTERNAL", "unexpected expression");
     return ty_int;
 }
 
@@ -275,7 +275,7 @@ fn adapt_int(e, want) {
     }
     if kind_of(want) == K_INT {
         if !int_fits(e[INT_VAL], want, e[8]) {
-            let m = err_begin(e[N_POS]);
+            let m = err_code(e[N_POS], "E223 CONST_OVERFLOW");
             buf_str(m, "constant ");
             buf_int(m, e[INT_VAL]);
             buf_str(m, " overflows ");
@@ -296,9 +296,9 @@ fn chk_ident(e, want) {
     let s = lookup_name(name);
     if !s {
         if import_pkg(name) {
-            err_quoted(e[N_POS], "use of package ", name, " without a selector");
+            err_code_quoted(e[N_POS], "E235 NOT_A_VALUE", "use of package ", name, " without a selector");
         } else {
-            let u = err_begin(e[N_POS]);
+            let u = err_code(e[N_POS], "E103 UNDEFINED");
             buf_str(u, "undefined: ");
             buf_str(u, name);
             err_end(u);
@@ -328,7 +328,7 @@ fn runtime_use(pos, f, name) {
         return;
     }
     if f[F_EXTERN] || (vec_get(file_trusted, f[F_FILE]) && load8(vec_get(file_pkgs, f[F_FILE])) == 0) {
-        err_quoted(pos, "", name, " is internal to the runtime");
+        err_code_quoted(pos, "E802 RUNTIME_INTERNAL", "", name, " is internal to the runtime");
     }
 }
 
@@ -337,7 +337,7 @@ fn use_sym(e, s, want) {
     let k = s[S_KIND];
     if k == SYM_FUNC {
         if ck_legacy || s[S_FN][F_LEGACY] {
-            err_quoted(e[N_POS], "function ", e[ID_NAME], " used as a value");
+            err_code_quoted(e[N_POS], "E235 NOT_A_VALUE", "function ", e[ID_NAME], " used as a value");
             return ty_int;
         }
         let f = s[S_FN];
@@ -348,7 +348,7 @@ fn use_sym(e, s, want) {
     }
     if k == SYM_CONST {
         if !s[S_DONE] {
-            err_quoted(e[N_POS], "constant ", e[ID_NAME], " used before its definition");
+            err_code_quoted(e[N_POS], "E130 INIT_ORDER", "constant ", e[ID_NAME], " used before its definition");
             return ty_int;
         }
         if s[S_EXPR] {
@@ -400,7 +400,7 @@ fn chk_unary(e, want) {
             return ct;
         }
         if x[N_KIND] != EX_IDENT {
-            err_at(e[N_POS], "'&' needs a variable name");
+            err_code_at(e[N_POS], "E803 ADDRESS_OF", "'&' needs a variable name");
             chk(x, 0);
             return ty_int;
         }
@@ -419,7 +419,7 @@ fn chk_unary(e, want) {
             return ty_int;
         }
         if x[N_KIND] != EX_IDENT || !x[ID_REF] {
-            err_quoted(e[N_POS], "cannot take the address of constant ", xname, "");
+            err_code_quoted(e[N_POS], "E803 ADDRESS_OF", "cannot take the address of constant ", xname, "");
             return ty_int;
         }
         if kind_of(xt) == K_STRUCT {
@@ -427,12 +427,12 @@ fn chk_unary(e, want) {
             return xt;
         }
         if !ck_legacy && !ck_trusted {
-            err_at(e[N_POS], "'&' on a variable is only allowed in the standard library");
+            err_code_at(e[N_POS], "E801 TRUSTED_ONLY", "'&' on a variable is only allowed in the standard library");
         }
         return ty_int;
     }
     if streq(op, "...") {
-        err_at(e[N_POS], "... is only allowed on the last argument of a call");
+        err_code_at(e[N_POS], "E211 VARIADIC_ARG", "... is only allowed on the last argument of a call");
         return ty_int;
     }
     let t = chk(x, want);
@@ -441,7 +441,7 @@ fn chk_unary(e, want) {
             return ty_int;
         }
         if !is_bool_t(t) {
-            err_type(e[N_POS], "operator ! needs a bool, not ", t, "");
+            err_code_type(e[N_POS], "E236 OPERATOR", "operator ! needs a bool, not ", t, "");
         }
         if is_secret(t) {
             return t;
@@ -450,7 +450,7 @@ fn chk_unary(e, want) {
     }
     if streq(op, "-") {
         if !is_numeric_t(t) && !ck_legacy {
-            err_type(e[N_POS], "operator - needs a number, not ", t, "");
+            err_code_type(e[N_POS], "E236 OPERATOR", "operator - needs a number, not ", t, "");
         }
         if x[N_KIND] == EX_FLOAT {
             replace_node(e, x);
@@ -465,7 +465,7 @@ fn chk_unary(e, want) {
         return t;
     }
     if !is_integer_t(t) && !ck_legacy {
-        err_type(e[N_POS], "operator ^ needs an integer, not ", t, "");
+        err_code_type(e[N_POS], "E236 OPERATOR", "operator ^ needs an integer, not ", t, "");
     }
     if x[N_KIND] == EX_INT && kind_of(t) == K_UINT {
         replace_node(e, mk_int(e[N_POS], ~x[INT_VAL], 0));
@@ -519,7 +519,7 @@ fn unify(l, r, want) {
         return secret_join(lt, rt);
     }
     if lt != rt && !ck_legacy {
-        err_types(l[N_POS], "mismatched types ", lt, " and ", rt);
+        err_code_types(l[N_POS], "E230 TYPE_MISMATCH", "mismatched types ", lt, " and ", rt);
     }
     return lt;
 }
@@ -592,7 +592,7 @@ fn chk_binary(e, want) {
             return ty_int;
         }
         if !is_bool_t(a) || !is_bool_t(b) {
-            err_at(pos, "operands of && and || must be bool");
+            err_code_at(pos, "E236 OPERATOR", "operands of && and || must be bool");
         }
         return ty_bool;
     }
@@ -600,10 +600,10 @@ fn chk_binary(e, want) {
         let st = chk(l, want);
         let ct = chk(r, ty_int);
         if !is_integer_t(st) && !ck_legacy {
-            err_type(pos, "cannot shift ", st, "");
+            err_code_type(pos, "E236 OPERATOR", "cannot shift ", st, "");
         }
         if !is_integer_t(ct) && !ck_legacy {
-            err_type(pos, "shift count must be an integer, not ", ct, "");
+            err_code_type(pos, "E236 OPERATOR", "shift count must be an integer, not ", ct, "");
         }
         if kind_of(ct) == K_UINT {
             reconvert(r, ty_int);
@@ -622,7 +622,7 @@ fn chk_binary(e, want) {
         return ty_bool;
     }
     if is_cmp_op(op) && kind_of(t) == K_DYN {
-        err_at(pos, "cannot compare dyn values: use a method on the shape (?dyn compares against nil)");
+        err_code_at(pos, "E237 COMPARE", "cannot compare dyn values: use a method on the shape (?dyn compares against nil)");
         return ty_bool;
     }
     if is_cmp_op(op) {
@@ -648,7 +648,7 @@ fn chk_binary(e, want) {
             return ty_int;
         }
         if ordered && !is_numeric_t(t) {
-            err_type(pos, "cannot order values of type ", t, "");
+            err_code_type(pos, "E236 OPERATOR", "cannot order values of type ", t, "");
         }
         if kind_of(t) == K_UINT {
             reconvert(l, ty_int);
@@ -659,7 +659,7 @@ fn chk_binary(e, want) {
     let k = kind_of(t);
     if k == K_STRING {
         if !streq(op, "+") {
-            err_quoted(pos, "operator ", op, " is not defined on str");
+            err_code_quoted(pos, "E236 OPERATOR", "operator ", op, " is not defined on str");
         }
         replace_node(e, rt_call(pos, "rt_str_cat", args2(l, r), ty_string));
         e[N_TYPE] = 0;
@@ -672,21 +672,21 @@ fn chk_binary(e, want) {
         return ty_int;
     }
     if !is_numeric_t(t) {
-        err_type(pos, "arithmetic on ", t, "");
+        err_code_type(pos, "E236 OPERATOR", "arithmetic on ", t, "");
     }
     if is_float_t(t) && (streq(op, "%") || streq(op, "&") || streq(op, "|") || streq(op, "^")) {
-        err_quoted(pos, "operator ", op, " is not defined on floats");
+        err_code_quoted(pos, "E236 OPERATOR", "operator ", op, " is not defined on floats");
     }
     if k == K_UINT && l[N_KIND] == EX_INT && r[N_KIND] == EX_INT {
         if (streq(op, "/") || streq(op, "%")) && r[INT_VAL] == 0 {
-            err_at(pos, "division by zero");
+            err_code_at(pos, "E222 DIVISION_BY_ZERO", "division by zero");
             return ty_uint;
         }
         replace_node(e, mk_int(pos, eval_binary(op, l[INT_VAL], r[INT_VAL]), 0));
         return ty_uint;
     }
     if k == K_INT && is_const_zero(r) && (streq(op, "/") || streq(op, "%")) {
-        err_at(pos, "division by zero");
+        err_code_at(pos, "E222 DIVISION_BY_ZERO", "division by zero");
     }
     if is_f32(t) {
         // f32 arithmetic is f64 arithmetic rounded to f32 after each step (exact for + - * /).
@@ -729,7 +729,7 @@ fn lower_enum_eq(e, op, l, r, t) {
     let pos = e[N_POS];
     let bad = enum_incomparable(t);
     if bad {
-        let u = err_begin(pos);
+        let u = err_code(pos, "E237 COMPARE");
         buf_str(u, "cannot compare ");
         type_name(u, t);
         buf_str(u, " values: a variant holds ");
@@ -899,7 +899,19 @@ fn map_set_call(pos, m, k, v, kt) {
     if key_composite(kt) {
         return rt_call(pos, "rt_map_setk", args3(m, key_in(k, kt), to_bits(v)), ty_void);
     }
-    return rt_call(pos, "rt_map_set", args3(m, to_bits(k), to_bits(v)), ty_void);
+    // dup: the caller keeps no reference to the key it passes.
+    return rt_call(pos, "rt_map_set", args4(m, to_bits(k), to_bits(v), mk_int(pos, 1, ty_int)), ty_void);
+}
+
+// map_make_call makes a map of type t (#176): counted sides carry their drops, so the
+// runtime counts the entries of a long-lived map by itself (its m[9] decides).
+fn map_make_call(pos, t) {
+    let counted = rc_map_bits(t);
+    let isstr = mk_int(pos, map_str_keys(t[TY_KEY]), ty_int);
+    if counted == 0 {
+        return rt_call(pos, "rt_map_make", args1(isstr), t);
+    }
+    return rt_call(pos, "rt_map_make_rc", args3(isstr, fn_ref_node(pos, rc_map_drop(t)), mk_int(pos, counted, ty_int)), t);
 }
 
 // key_valid reports whether t can be a map key: str, numbers, bool, or structs and enums
@@ -1159,7 +1171,7 @@ fn chk_index(e) {
     }
     let it = chk(e[IX_I], ty_int);
     if !is_integer_t(it) {
-        err_type(pos, "index must be an integer, not ", it, "");
+        err_code_type(pos, "E238 INDEX", "index must be an integer, not ", it, "");
     }
     if kind_of(it) == K_UINT {
         reconvert(e[IX_I], ty_int);
@@ -1182,7 +1194,7 @@ fn chk_index(e) {
         }
         return xt[TY_ELEM];
     }
-    err_type(pos, "cannot index ", xt, "");
+    err_code_type(pos, "E238 INDEX", "cannot index ", xt, "");
     return ty_int;
 }
 
@@ -1219,7 +1231,7 @@ fn chk_slice(e) {
         e[N_TYPE] = 0;
         return xt;
     }
-    err_type(pos, "cannot slice ", xt, "");
+    err_code_type(pos, "E238 INDEX", "cannot slice ", xt, "");
     return ty_int;
 }
 
@@ -1263,7 +1275,7 @@ fn private_use(pos, what, name, owner) {
     if ck_legacy {
         return;
     }
-    let m = err_begin(pos);
+    let m = err_code(pos, "E104 PRIVATE");
     buf_str(m, what);
     buf_str(m, " ");
     buf_str(m, name);
@@ -1337,7 +1349,7 @@ fn enum_construct(e, t, name, args) {
     let pos = e[N_POS];
     let vi = enum_variant(t, name);
     if vi < 0 {
-        let u = err_begin(pos);
+        let u = err_code(pos, "E239 VARIANT");
         type_name(u, t);
         buf_str(u, " has no variant ");
         buf_str(u, name);
@@ -1351,7 +1363,7 @@ fn enum_construct(e, t, name, args) {
     let first = vec_get(v, 1);
     let nf = vec_get(v, 2);
     if args[VEC_LEN] != nf {
-        let u = err_begin(pos);
+        let u = err_code(pos, "E239 VARIANT");
         type_name(u, t);
         buf_byte(u, '.');
         buf_str(u, name);
@@ -1404,7 +1416,7 @@ fn chk_select(e, want) {
         if pkg {
             let s = pkg_member(pkg, name);
             if !s {
-                let u = err_begin(pos);
+                let u = err_code(pos, "E103 UNDEFINED");
                 buf_str(u, "undefined: ");
                 buf_str(u, x[ID_NAME]);
                 buf_byte(u, '.');
@@ -1422,21 +1434,21 @@ fn chk_select(e, want) {
     }
     let xt = chk(x, 0);
     if kind_of(xt) == K_OPT {
-        err_type(pos, "cannot use a field of optional ", xt, " before checking it against nil");
+        err_code_type(pos, "E421 UNCHECKED_OPTIONAL", "cannot use a field of optional ", xt, " before checking it against nil");
         return ty_int;
     }
     if kind_of(xt) == K_STRUCT && xt[TY_ENUM] {
-        err_type(pos, "an enum's data is read with switch, not as a field of ", xt, "");
+        err_code_type(pos, "E213 FIELD", "an enum's data is read with switch, not as a field of ", xt, "");
         return ty_int;
     }
     if kind_of(xt) == K_DYN {
-        err_at(pos, "a method value on a dyn value needs the table: the next step (#141)");
+        err_code_at(pos, "E530 DYN_NOT_YET", "a method value on a dyn value needs the table: the next step (#141)");
         return ty_int;
     }
     if kind_of(xt) == K_STRUCT {
         let i = struct_field(xt, name);
         if i < 0 {
-            let u = err_begin(pos);
+            let u = err_code(pos, "E213 FIELD");
             type_name(u, xt);
             buf_str(u, " has no field ");
             buf_str(u, name);
@@ -1449,7 +1461,7 @@ fn chk_select(e, want) {
         replace_node(e, mk_mem(pos, x, 0, 0, field_offset(xt, i), 0));
         return field_type(xt, i);
     }
-    err_type(pos, "cannot select a field of ", xt, "");
+    err_code_type(pos, "E213 FIELD", "cannot select a field of ", xt, "");
     return ty_int;
 }
 
@@ -1495,7 +1507,7 @@ fn chk_composite(e, want) {
         t = resolve_type(tn);
     }
     if !t {
-        err_at(pos, "missing type in composite literal");
+        err_code_at(pos, "E216 COMPOSITE", "missing type in composite literal");
         return ty_int;
     }
     let elems = e[CL_ELEMS];
@@ -1503,7 +1515,7 @@ fn chk_composite(e, want) {
     let stmts = vec_new();
     let k = kind_of(t);
     if k == K_STRUCT && t[TY_ENUM] {
-        err_type(pos, "build an enum with one of its variants (", t, ".Variant(...)), not a composite literal");
+        err_code_type(pos, "E216 COMPOSITE", "build an enum with one of its variants (", t, ".Variant(...)), not a composite literal");
         return t;
     }
     if k == K_STRUCT {
@@ -1517,19 +1529,19 @@ fn chk_composite(e, want) {
             let key = vec_get(keys, i);
             if key {
                 if key[N_KIND] != EX_IDENT {
-                    err_at(key[N_POS], "expected a field name");
+                    err_code_at(key[N_POS], "E216 COMPOSITE", "expected a field name");
                     return t;
                 }
                 fi = struct_field(t, key[ID_NAME]);
                 if fi < 0 {
-                    err_quoted(key[N_POS], "unknown field ", key[ID_NAME], "");
+                    err_code_quoted(key[N_POS], "E216 COMPOSITE", "unknown field ", key[ID_NAME], "");
                     return t;
                 }
                 if is_private(key[ID_NAME]) && foreign_type(t) {
                     private_use(key[N_POS], "field", key[ID_NAME], type_pkg(t));
                 }
             } else if fi >= nf {
-                err_at(pos, "too many values in struct literal");
+                err_code_at(pos, "E216 COMPOSITE", "too many values in struct literal");
                 return t;
             } else if foreign_type(t) && is_private(vec_get(vec_get(t[TY_FIELDS], fi), 0)) {
                 // A positional value sets the field as surely as its name would (#96).
@@ -1581,14 +1593,14 @@ fn chk_composite(e, want) {
         return t;
     }
     if k == K_MAP {
-        let m = temp(pos, rt_call(pos, "rt_map_make", args1(mk_int(pos, map_str_keys(t[TY_KEY]), ty_int)), t), t);
+        let m = temp(pos, map_make_call(pos, t), t);
         vec_push(stmts, m);
         let i = 0;
         while i < elems[VEC_LEN] {
             let key = vec_get(keys, i);
             let v = vec_get(elems, i);
             if !key {
-                err_at(v[N_POS], "missing key in map literal");
+                err_code_at(v[N_POS], "E216 COMPOSITE", "missing key in map literal");
                 return t;
             }
             let kt = chk(key, t[TY_KEY]);
@@ -1607,7 +1619,7 @@ fn chk_composite(e, want) {
         replace_node(e, mk_seq(pos, stmts, sym_ref_node(pos, m[LET_SYM]), 0));
         return t;
     }
-    err_type(pos, "cannot build a composite literal of type ", t, "");
+    err_code_type(pos, "E216 COMPOSITE", "cannot build a composite literal of type ", t, "");
     return ty_int;
 }
 
@@ -1626,7 +1638,7 @@ fn init_zero_field(pos, stmts, obj, t, fi) {
     if k == K_STRING || k == K_SLICE {
         vec_push(stmts, assign_stmt(pos, field_store(pos, sym_ref_node(pos, obj), t, fi), zero_value(pos, ft)));
     } else if k == K_STRUCT || k == K_MAP || k == K_FUNC || k == K_DYN {
-        let m = err_begin(pos);
+        let m = err_code(pos, "E203 NO_ZERO_VALUE");
         buf_str(m, "field ");
         buf_str(m, vec_get(vec_get(t[TY_FIELDS], fi), 0));
         buf_str(m, " of type ");
@@ -1835,7 +1847,7 @@ fn chk_unit(e, want) {
     let pos = e[N_POS];
     let u = e[UNIT_NAME];
     if e[UNIT_FLOAT] {
-        err_at(pos, "a fractional unit literal is not supported yet: write it in a smaller unit (2500ms, not 2.5s)");
+        err_code_at(pos, "E012 NUMERIC_UNIT", "a fractional unit literal is not supported yet: write it in a smaller unit (2500ms, not 2.5s)");
         return ty_int;
     }
     let scale = 1;
@@ -1858,7 +1870,7 @@ fn chk_unit(e, want) {
     }
     let v = e[UNIT_VALUE];
     if v < 0 || (v > 0 && v > 9223372036854775807 / scale) {
-        err_at(pos, "unit literal out of range");
+        err_code_at(pos, "E012 NUMERIC_UNIT", "unit literal out of range");
         return ty_int;
     }
     let n = node_new(EX_INT, pos);
@@ -1883,7 +1895,7 @@ fn chk_boundary(e) {
         return chk_with(e);
     }
     if ck_legacy || (kind != BOUND_WITHIN && kind != BOUND_GUARD && kind != BOUND_LIMIT) {
-        err_at(pos, "this boundary block is not supported yet");
+        err_code_at(pos, "E650 BOUNDARY", "this boundary block is not supported yet");
         return ty_int;
     }
     let arg = mk_int(pos, 0, ty_int);
@@ -1903,7 +1915,7 @@ fn chk_boundary(e) {
             } else if streq(name, "tasks") {
                 arg2 = v;
             } else {
-                err_quoted(pos, "limit bounds are memory and tasks, not ", name, "");
+                err_code_quoted(pos, "E650 BOUNDARY", "limit bounds are memory and tasks, not ", name, "");
             }
             i = i + 1;
         }
@@ -1969,7 +1981,7 @@ fn chk_parallel(e) {
     while i < stmts[VEC_LEN] {
         let st = vec_get(stmts, i);
         if st[N_KIND] != ST_EXPR {
-            err_at(st[N_POS], "each line of parallel is an expression that runs as a child task");
+            err_code_at(st[N_POS], "E651 PARALLEL", "each line of parallel is an expression that runs as a child task");
             return ty_int;
         }
         let x = st[ES_X];
@@ -2000,7 +2012,7 @@ fn chk_parallel(e) {
         bound_t = ty_void;
         let ct = chk_funclit(lit);
         if kind_of(bound_t) == K_VOID {
-            err_at(st[N_POS], "a parallel line must give a value");
+            err_code_at(st[N_POS], "E651 PARALLEL", "a parallel line must give a value");
         }
         vec_push(vts, bound_t);
         bound_t = saved_t;
@@ -2008,7 +2020,7 @@ fn chk_parallel(e) {
         i = i + 1;
     }
     if lits[VEC_LEN] < 2 {
-        err_at(pos, "parallel needs at least two lines");
+        err_code_at(pos, "E651 PARALLEL", "parallel needs at least two lines");
         return ty_int;
     }
     let w = parallel_wrapper(pos, lits, vts);
@@ -2127,7 +2139,7 @@ fn bound_leaves(v) {
         let s = vec_get(v, i);
         let k = s[N_KIND];
         if k == ST_RETURN {
-            err_at(s[N_POS], "return cannot leave a boundary block: its value is its last expression (use fail to leave it with a fault)");
+            err_code_at(s[N_POS], "E650 BOUNDARY", "return cannot leave a boundary block: its value is its last expression (use fail to leave it with a fault)");
         } else if k == ST_BLOCK {
             bound_leaves(s[BLK_STMTS]);
         } else if k == ST_IF {
@@ -2305,7 +2317,7 @@ fn chk_with(e) {
     with_fill_calls = saved_calls;
     with_fill_t = saved_fill;
     if kind_of(pt) == K_DYN {
-        err_type(pe[N_POS], "a with policy is called directly so that its Run can be checked: use the concrete type, not ", pt, "");
+        err_code_type(pe[N_POS], "E652 POLICY", "a with policy is called directly so that its Run can be checked: use the concrete type, not ", pt, "");
         return with_failed(e, vt);
     }
     let run = 0;
@@ -2313,7 +2325,7 @@ fn chk_with(e) {
         run = find_fn(str_cat3(pt[TY_NAME], ".", "Run"));
     }
     if !run {
-        err_type(pe[N_POS], "", pt, " is not a policy: with needs a value with a method Run(body func() !T) !T");
+        err_code_type(pe[N_POS], "E652 POLICY", "", pt, " is not a policy: with needs a value with a method Run(body func() !T) !T");
         return with_failed(e, vt);
     }
     // Run(body func() !T) !T, or Run(body func() !) !: the body has Run's own results.
@@ -2326,7 +2338,7 @@ fn chk_with(e) {
     }
     let shaped = run[F_BANG] && rps[VEC_LEN] == 2 && vec_get(rps, 1) == bt && !vec_get(run[F_MUTS], 1);
     if !shaped || rrs[VEC_LEN] < 1 || rrs[VEC_LEN] > 2 || kind_of(vec_get(rrs, rrs[VEC_LEN] - 1)) != K_ERROR {
-        err_type(pe[N_POS], "", pt, " is not a policy: its Run must be Run(body func() !T) !T");
+        err_code_type(pe[N_POS], "E652 POLICY", "", pt, " is not a policy: its Run must be Run(body func() !T) !T");
         return with_failed(e, vt);
     }
     if kind_of(vt) != K_VOID && kind_of(tt) == K_VOID {
@@ -2334,7 +2346,7 @@ fn chk_with(e) {
         return with_failed(e, vt);
     }
     if kind_of(vt) != K_VOID && tt != vt {
-        err_types(pos, "the block gives a ", vt, ", but its policy runs a body of type ", bt);
+        err_code_types(pos, "E652 POLICY", "the block gives a ", vt, ", but its policy runs a body of type ", bt);
         return with_failed(e, vt);
     }
     if kind_of(vt) == K_VOID && kind_of(tt) != K_VOID && !with_scalar(tt) {
@@ -2378,7 +2390,7 @@ fn with_failed(e, vt) {
 
 // with_error reports a with block whose value does not fit its policy.
 fn with_error(pos, a, ta, b, tb, c) {
-    let m = err_begin(pos);
+    let m = err_code(pos, "E652 POLICY");
     buf_str(m, a);
     type_name(m, ta);
     buf_str(m, b);
@@ -2583,7 +2595,7 @@ fn chk_args(e, ptypes, variadic, legacy, mask) {
     let args = e[CALL_ARGS];
     let n = ptypes[VEC_LEN];
     if args[VEC_LEN] != n && !(variadic && args[VEC_LEN] >= n) {
-        let a = err_begin(e[N_POS]);
+        let a = err_code(e[N_POS], "E210 ARG_COUNT");
         if e[CALL_NAME] {
             buf_str(a, e[CALL_NAME]);
         } else {
@@ -2621,7 +2633,7 @@ fn chk_args(e, ptypes, variadic, legacy, mask) {
                 reconvert(a, want);
             }
         } else if i < n && legacy && is_float_t(at) {
-            err_at(a[N_POS], "cannot pass a f64 to an untyped (fn) parameter");
+            err_code_at(a[N_POS], "E230 TYPE_MISMATCH", "cannot pass a f64 to an untyped (fn) parameter");
         }
         if i >= n && is_untyped(at) {
             reconvert(a, default_type(at));
@@ -2640,7 +2652,7 @@ fn unwrap_mut(a) {
 }
 
 fn mut_arg_error(e, a, i, what) {
-    let m = err_begin(a[N_POS]);
+    let m = err_code(a[N_POS], "E705 MUT_ARG");
     buf_str(m, "argument ");
     if e[CALL_METHOD] {
         buf_int(m, i);
@@ -2711,7 +2723,7 @@ fn chk_call(e, want) {
             let n = intrinsic_arity(name);
             if n >= 0 {
                 if !ck_legacy && !ck_trusted {
-                    err_quoted(e[N_POS], "", name, " is internal to the runtime");
+                    err_code_quoted(e[N_POS], "E802 RUNTIME_INTERNAL", "", name, " is internal to the runtime");
                 }
                 e[CALL_INTRINSIC] = 1;
                 if e[CALL_ARGS][VEC_LEN] != n {
@@ -2737,13 +2749,13 @@ fn chk_call(e, want) {
             if tt {
                 return chk_conversion(e, tt);
             }
-            let u = err_begin(e[N_POS]);
+            let u = err_code(e[N_POS], "E103 UNDEFINED");
             buf_str(u, "undefined function: ");
             buf_str(u, name);
             err_end(u);
             return ty_int;
         }
-        err_quoted(e[N_POS], "", name, " is not a function");
+        err_code_quoted(e[N_POS], "E215 NOT_CALLABLE", "", name, " is not a function");
         return ty_int;
     }
     let gx = explicit_generic(callee);
@@ -2787,7 +2799,7 @@ fn chk_call(e, want) {
                 e[CALL_NAME] = ov[F_QNAME];
                 return direct_call(e, ov);
             }
-            let u = err_begin(e[N_POS]);
+            let u = err_code(e[N_POS], "E103 UNDEFINED");
             buf_str(u, "undefined: ");
             buf_str(u, x[ID_NAME]);
             buf_byte(u, '.');
@@ -2797,7 +2809,7 @@ fn chk_call(e, want) {
         }
         let xt = chk(x, 0);
         if kind_of(xt) == K_OPT {
-            err_type(e[N_POS], "cannot call a method of optional ", xt, " before checking it against nil");
+            err_code_type(e[N_POS], "E421 UNCHECKED_OPTIONAL", "cannot call a method of optional ", xt, " before checking it against nil");
             return ty_int;
         }
         if kind_of(xt) == K_STRUCT {
@@ -2828,7 +2840,7 @@ fn chk_call(e, want) {
                 e[CALL_CALLEE] = mk_mem(e[N_POS], x, 0, 0, field_offset(xt, fi), field_type(xt, fi));
                 return indirect_call(e);
             }
-            let u = err_begin(e[N_POS]);
+            let u = err_code(e[N_POS], "E214 METHOD");
             type_name(u, xt);
             buf_str(u, " has no method ");
             buf_str(u, m);
@@ -2843,7 +2855,7 @@ fn chk_call(e, want) {
         if kind_of(xt) == K_DYN {
             return lower_dyn_method_call(e, x, xt, m);
         }
-        err_type(e[N_POS], "cannot call a method on ", xt, "");
+        err_code_type(e[N_POS], "E214 METHOD", "cannot call a method on ", xt, "");
         return ty_int;
     }
     if callee[N_KIND] == EX_TYPE {
@@ -2859,7 +2871,7 @@ fn lower_dyn_method_call(e, receiver, dt, name) {
     let pos = e[N_POS];
     let info = dyn_shape_method(dt, name);
     if !info {
-        let m = err_begin(pos);
+        let m = err_code(pos, "E214 METHOD");
         buf_str(m, "dyn shape ");
         buf_str(m, dt[TY_GDECL][D_NAME]);
         buf_str(m, " has no method ");
@@ -2952,7 +2964,7 @@ fn indirect_call(e) {
     let callee = e[CALL_CALLEE];
     let ft = chk(callee, 0);
     if kind_of(ft) != K_FUNC {
-        err_type(e[N_POS], "cannot call a value of type ", ft, "");
+        err_code_type(e[N_POS], "E215 NOT_CALLABLE", "cannot call a value of type ", ft, "");
         return ty_int;
     }
     e[CALL_FN] = 0;
@@ -2992,7 +3004,7 @@ fn arg0(e) {
 fn chk_conversion(e, to) {
     let pos = e[N_POS];
     if e[CALL_ARGS][VEC_LEN] != 1 {
-        err_type(pos, "conversion to ", to, " needs exactly one argument");
+        err_code_type(pos, "E210 ARG_COUNT", "conversion to ", to, " needs exactly one argument");
         return to;
     }
     let x = arg0(e);
@@ -3058,7 +3070,7 @@ fn chk_conversion(e, to) {
         replace_node(e, mk_conv(pos, x, CV_SAME, to));
         return to;
     }
-    err_types(pos, "cannot convert ", from, " to ", to);
+    err_code_types(pos, "E231 CONVERSION", "cannot convert ", from, " to ", to);
     return to;
 }
 
@@ -3072,13 +3084,13 @@ fn chk_builtin(e, name, want) {
     }
     if streq(name, "len") || streq(name, "cap") {
         if n != 1 {
-            err_quoted(pos, "", name, " expects 1 argument");
+            err_code_quoted(pos, "E210 ARG_COUNT", "", name, " expects 1 argument");
             return ty_int;
         }
         let t = chk(arg0(e), 0);
         let k = kind_of(t);
         if k != K_STRING && k != K_SLICE && k != K_MAP {
-            err_type(pos, "invalid argument for len: ", t, "");
+            err_code_type(pos, "E217 BUILTIN_ARGS", "invalid argument for len: ", t, "");
         }
         let word = 0;
         if streq(name, "cap") {
@@ -3090,14 +3102,14 @@ fn chk_builtin(e, name, want) {
     }
     if streq(name, "append") {
         if n == 0 {
-            err_at(pos, "append needs a slice");
+            err_code_at(pos, "E217 BUILTIN_ARGS", "append needs a slice");
             return ty_int;
         }
         let st = chk(arg0(e), want);
         // append can grow a bounded slice past its bound: the result is unbounded (#240).
         st = unbounded(st);
         if kind_of(st) != K_SLICE {
-            err_type(pos, "first argument to append must be a slice, not ", st, "");
+            err_code_type(pos, "E217 BUILTIN_ARGS", "first argument to append must be a slice, not ", st, "");
             return ty_int;
         }
         let et = st[TY_ELEM];
@@ -3114,7 +3126,12 @@ fn chk_builtin(e, name, want) {
                     acc = rt_call(pos, "rt_append_str", args2(acc, a[UN_X]), st);
                 } else {
                     check_assignable(a[UN_X], at, st);
-                    acc = rt_call(pos, "rt_slice_appendn", args3(acc, a[UN_X], mk_int(pos, elem_size(st), ty_int)), st);
+                    let appendn = "rt_slice_appendn";
+                    if rc_counted(et) {
+                        // The elements' new slots own them (#176): a long-lived slice counts them.
+                        appendn = "rt_slice_appendn_rc";
+                    }
+                    acc = rt_call(pos, appendn, args3(acc, a[UN_X], mk_int(pos, elem_size(st), ty_int)), st);
                 }
             } else {
                 let vt = chk(a, et);
@@ -3124,6 +3141,9 @@ fn chk_builtin(e, name, want) {
                 }
                 if is_dyn_value(et) {
                     acc = lower_append_dyn(pos, acc, a, st);
+                } else if rc_counted(et) {
+                    // The element's slot owns it (#176): a long-lived slice counts it.
+                    acc = rt_call(pos, "rt_append_rc", args3(acc, elem_bits(a, st[TY_ELEM]), mk_int(pos, elem_size(st), ty_int)), st);
                 } else {
                     acc = rt_call(pos, "rt_append", args3(acc, elem_bits(a, st[TY_ELEM]), mk_int(pos, elem_size(st), ty_int)), st);
                 }
@@ -3136,14 +3156,14 @@ fn chk_builtin(e, name, want) {
     }
     if streq(name, "make") {
         if n < 1 || arg0(e)[N_KIND] != EX_TYPE {
-            err_at(pos, "make needs a slice or map type: make([]T, n), make([]T, n, capacity) or make(map[K]V)");
+            err_code_at(pos, "E217 BUILTIN_ARGS", "make needs a slice or map type: make([]T, n), make([]T, n, capacity) or make(map[K]V)");
             return ty_int;
         }
         let t = resolve_type(arg0(e)[TYX]);
         let k = kind_of(t);
         if k == K_SLICE {
             if n < 2 {
-                err_at(pos, "make of a slice needs a length");
+                err_code_at(pos, "E217 BUILTIN_ARGS", "make of a slice needs a length");
                 return t;
             }
             chk(vec_get(args, 1), ty_int);
@@ -3160,7 +3180,7 @@ fn chk_builtin(e, name, want) {
             let len0 = vec_get(args, 1);
             let zero_len = len0[N_KIND] == EX_INT && len0[INT_VAL] == 0;
             if !ck_legacy && !zero_len && (ek == K_STRUCT || ek == K_MAP || ek == K_FUNC || ek == K_DYN) {
-                err_type(pos, "make with a length would fill the slice with nil ", t[TY_ELEM], " values: use make([]T, 0, n) and append (or []?T)");
+                err_code_type(pos, "E203 NO_ZERO_VALUE", "make with a length would fill the slice with nil ", t[TY_ELEM], " values: use make([]T, 0, n) and append (or []?T)");
                 return t;
             }
             if !ck_legacy && !zero_len && ek == K_STRING {
@@ -3176,20 +3196,20 @@ fn chk_builtin(e, name, want) {
             return t;
         }
         if k == K_MAP {
-            replace_node(e, rt_call(pos, "rt_map_make", args1(mk_int(pos, map_str_keys(t[TY_KEY]), ty_int)), t));
+            replace_node(e, map_make_call(pos, t));
             return t;
         }
-        err_type(pos, "cannot make ", t, "");
+        err_code_type(pos, "E217 BUILTIN_ARGS", "cannot make ", t, "");
         return t;
     }
     if streq(name, "new") {
         if n != 1 || arg0(e)[N_KIND] != EX_TYPE {
-            err_at(pos, "new needs one struct type: new(T)");
+            err_code_at(pos, "E217 BUILTIN_ARGS", "new needs one struct type: new(T)");
             return ty_int;
         }
         let t = resolve_type(arg0(e)[TYX]);
         if kind_of(t) != K_STRUCT {
-            err_type(pos, "new needs a struct type, not ", t, "");
+            err_code_type(pos, "E217 BUILTIN_ARGS", "new needs a struct type, not ", t, "");
             return t;
         }
         // new(T) is T{}: fields that cannot be nil must still be set.
@@ -3205,10 +3225,10 @@ fn chk_builtin(e, name, want) {
     }
     if streq(name, "cast") {
         if !ck_legacy && !ck_trusted {
-            err_at(pos, "cast is internal to the runtime");
+            err_code_at(pos, "E802 RUNTIME_INTERNAL", "cast is internal to the runtime");
         }
         if n != 2 || arg0(e)[N_KIND] != EX_TYPE {
-            err_at(pos, "cast needs a type and a value");
+            err_code_at(pos, "E217 BUILTIN_ARGS", "cast needs a type and a value");
             return ty_int;
         }
         let t = resolve_type(arg0(e)[TYX]);
@@ -3232,12 +3252,12 @@ fn chk_builtin(e, name, want) {
     }
     if streq(name, "delete") {
         if n != 2 {
-            err_at(pos, "delete needs a map and a key");
+            err_code_at(pos, "E217 BUILTIN_ARGS", "delete needs a map and a key");
             return ty_void;
         }
         let mt = chk(arg0(e), 0);
         if kind_of(mt) != K_MAP || n != 2 {
-            err_at(pos, "delete needs a map and a key");
+            err_code_at(pos, "E217 BUILTIN_ARGS", "delete needs a map and a key");
             return ty_void;
         }
         let kt = chk(vec_get(args, 1), mt[TY_KEY]);
@@ -3250,7 +3270,7 @@ fn chk_builtin(e, name, want) {
     }
     if streq(name, "copy") {
         if n != 2 {
-            err_at(pos, "copy needs a destination slice and a source (a slice or a str)");
+            err_code_at(pos, "E217 BUILTIN_ARGS", "copy needs a destination slice and a source (a slice or a str)");
             return ty_int;
         }
         let dt = chk(arg0(e), 0);
@@ -3261,6 +3281,11 @@ fn chk_builtin(e, name, want) {
         }
         if kind_of(st) == K_STRING {
             replace_node(e, rt_call(pos, "rt_copy_str", args2(arg0(e), vec_get(args, 1)), ty_int));
+        } else if kind_of(dt) == K_SLICE && rc_counted(dt[TY_ELEM]) {
+            // Copied values gain their slots' counts and replaced ones lose theirs (#176).
+            let cargs = args3(arg0(e), vec_get(args, 1), mk_int(pos, elem_size(dt), ty_int));
+            vec_push(cargs, fn_ref_node(pos, drop_fn(dt[TY_ELEM])));
+            replace_node(e, rt_call(pos, "rt_slice_copy_rc", cargs, ty_int));
         } else {
             replace_node(e, rt_call(pos, "rt_slice_copy", args3(arg0(e), vec_get(args, 1), mk_int(pos, elem_size(dt), ty_int)), ty_int));
         }
@@ -3268,7 +3293,7 @@ fn chk_builtin(e, name, want) {
     }
     if streq(name, "panic") {
         if n != 1 {
-            err_at(pos, "panic needs one value: panic(\"message\") or panic(err)");
+            err_code_at(pos, "E217 BUILTIN_ARGS", "panic needs one value: panic(\"message\") or panic(err)");
             return ty_void;
         }
         let pdesc = secret_desc(arg0(e));
@@ -3285,14 +3310,14 @@ fn chk_builtin(e, name, want) {
     }
     if streq(name, "fail") {
         if n != 1 {
-            err_at(pos, "fail needs a message");
+            err_code_at(pos, "E416 FAIL_VALUE", "fail needs a message");
             return ty_error;
         }
         let fdesc = secret_desc(arg0(e));
         let ft = chk(arg0(e), ty_string);
         secret_sink(arg0(e)[N_POS], "fail would put ", " in a fault message", fdesc, ft);
         if kind_of(ft) != K_STRING {
-            err_type(pos, "fail needs a str message, not ", ft, "");
+            err_code_type(pos, "E416 FAIL_VALUE", "fail needs a str message, not ", ft, "");
         }
         replace_node(e, rt_call(pos, "rt_fail", args1(arg0(e)), ty_error));
         e[N_TYPE] = 0;
@@ -3301,18 +3326,18 @@ fn chk_builtin(e, name, want) {
     if streq(name, "fault") && !ck_legacy {
         // var ErrX = fault("msg") declares a sentinel: one identity per declaration (fault.Is).
         if n != 1 {
-            err_at(pos, "fault needs a message: var ErrX = fault(\"...\")");
+            err_code_at(pos, "E417 SENTINEL", "fault needs a message: var ErrX = fault(\"...\")");
             return ty_error;
         }
         if ck_sentinel != e {
-            err_at(pos, "fault(\"...\") declares a sentinel: write it at package level as var ErrX = fault(\"msg\"), or use fail(\"msg\") for a one-off fault");
+            err_code_at(pos, "E417 SENTINEL", "fault(\"...\") declares a sentinel: write it at package level as var ErrX = fault(\"msg\"), or use fail(\"msg\") for a one-off fault");
             return ty_error;
         }
         let sdesc = secret_desc(arg0(e));
         let st = chk(arg0(e), ty_string);
         secret_sink(arg0(e)[N_POS], "fault would put ", " in a fault message", sdesc, st);
         if kind_of(st) != K_STRING {
-            err_type(pos, "fault needs a str message, not ", st, "");
+            err_code_type(pos, "E417 SENTINEL", "fault needs a str message, not ", st, "");
         }
         sentinel_seq = sentinel_seq + 1;
         replace_node(e, rt_call(pos, "rt_fault_sentinel", args2(arg0(e), mk_int(pos, 63 + sentinel_seq, ty_int)), ty_error));
@@ -3321,7 +3346,7 @@ fn chk_builtin(e, name, want) {
     }
     if streq(name, "keep") {
         if n != 1 {
-            err_at(pos, "keep needs one value");
+            err_code_at(pos, "E217 BUILTIN_ARGS", "keep needs one value");
             return ty_int;
         }
         return lower_keep(e, want);
@@ -3346,7 +3371,7 @@ fn lower_minmax(e, name, want) {
     let args = e[CALL_ARGS];
     let n = args[VEC_LEN];
     if n == 0 {
-        err_quoted(pos, "", name, " needs arguments");
+        err_code_quoted(pos, "E210 ARG_COUNT", "", name, " needs arguments");
         return ty_int;
     }
     chk(arg0(e), want);
@@ -3363,7 +3388,7 @@ fn lower_minmax(e, name, want) {
     }
     secret_compare_error(pos, name, t, t);
     if !is_numeric_t(t) && kind_of(t) != K_STRING {
-        err_type(pos, "cannot compare ", t, "");
+        err_code_type(pos, "E237 COMPARE", "cannot compare ", t, "");
     }
     // acc := a; if b < acc { acc = b }  (compiled to csel)
     let stmts = vec_new();
@@ -3470,16 +3495,16 @@ fn lower_argo_put(e) {
     let pos = e[N_POS];
     let args = e[CALL_ARGS];
     if args[VEC_LEN] != 2 {
-        err_at(pos, "argo.Put takes a []u8 buffer and a value");
+        err_code_at(pos, "E281 ARGO", "argo.Put takes a []u8 buffer and a value");
         return ty_void;
     }
     let b = vec_get(args, 0);
     if !unwrap_mut(b) && !ck_legacy {
-        err_at(b[N_POS], "argo.Put appends to its buffer: write mut before it");
+        err_code_at(b[N_POS], "E281 ARGO", "argo.Put appends to its buffer: write mut before it");
     }
     let bt = chk(b, 0);
     if kind_of(bt) != K_SLICE || bt[TY_ELEM] != ty_byte {
-        err_type(pos, "argo.Put writes into a []u8, not ", bt, "");
+        err_code_type(pos, "E281 ARGO", "argo.Put writes into a []u8, not ", bt, "");
         return ty_void;
     }
     let v = vec_get(args, 1);
@@ -3511,7 +3536,7 @@ fn call_fn(pos, f, args, t) {
 fn argo_lib(pos, name) {
     let f = find_fn(name);
     if !f {
-        err_quoted(pos, "argo.Put needs package argo (", name, " is missing): import \"argo\"");
+        err_code_quoted(pos, "E281 ARGO", "argo.Put needs package argo (", name, " is missing): import \"argo\"");
     }
     return f;
 }
@@ -3563,11 +3588,11 @@ fn argo_fn(pos, t) {
     }
     let k = kind_of(t);
     if !(k == K_STRUCT || k == K_SLICE || k == K_MAP || k == K_OPT || k == K_ERROR || k == K_STRING || k == K_INT || k == K_BOOL || is_float_t(t)) {
-        err_type(pos, "argo cannot encode values of type ", t, "");
+        err_code_type(pos, "E281 ARGO", "argo cannot encode values of type ", t, "");
         return 0;
     }
     if k == K_MAP && kind_of(t[TY_KEY]) != K_STRING && kind_of(t[TY_KEY]) != K_INT {
-        err_type(pos, "argo encodes maps with str or integer keys, not ", t, "");
+        err_code_type(pos, "E281 ARGO", "argo encodes maps with str or integer keys, not ", t, "");
         return 0;
     }
     lifted_count = lifted_count + 1;
@@ -3773,23 +3798,23 @@ fn lower_argo_get(e) {
     let pos = e[N_POS];
     let args = e[CALL_ARGS];
     if args[VEC_LEN] != 2 {
-        err_at(pos, "argo.Get takes the JSON text and a struct, slice or map to fill");
+        err_code_at(pos, "E281 ARGO", "argo.Get takes the JSON text and a struct, slice or map to fill");
         return ty_error;
     }
     if !unwrap_mut(vec_get(args, 1)) && !ck_legacy {
-        err_at(vec_get(args, 1)[N_POS], "argo.Get fills its target: write mut before it");
+        err_code_at(vec_get(args, 1)[N_POS], "E281 ARGO", "argo.Get fills its target: write mut before it");
     }
     let s = vec_get(args, 0);
     let st = chk(s, ty_string);
     if kind_of(st) != K_STRING {
-        err_type(pos, "argo.Get reads JSON from a str, not ", st, "");
+        err_code_type(pos, "E281 ARGO", "argo.Get reads JSON from a str, not ", st, "");
         return ty_error;
     }
     let v = vec_get(args, 1);
     let t = chk(v, 0);
     let k = kind_of(t);
     if k != K_STRUCT && k != K_SLICE && k != K_MAP {
-        err_type(pos, "argo.Get fills a struct, slice or map (passed by reference), not ", t, "");
+        err_code_type(pos, "E281 ARGO", "argo.Get fills a struct, slice or map (passed by reference), not ", t, "");
         return ty_error;
     }
     let pt = argo_parser_type(pos);
@@ -3810,7 +3835,7 @@ fn argo_parser_type(pos) {
     if !argo_ptype {
         argo_ptype = find_type("argo.Parser");
         if !argo_ptype {
-            err_at(pos, "argo.Get needs package argo: import \"argo\"");
+            err_code_at(pos, "E281 ARGO", "argo.Get needs package argo: import \"argo\"");
         }
     }
     return argo_ptype;
@@ -3841,7 +3866,7 @@ fn argo_new(pos, body, t) {
         return rt_call(pos, "rt_slice_make", args3(mk_int(pos, 0, ty_int), mk_int(pos, 0, ty_int), mk_int(pos, elem_size(t), ty_int)), t);
     }
     if k == K_MAP {
-        return rt_call(pos, "rt_map_make", args1(mk_int(pos, map_str_keys(t[TY_KEY]), ty_int)), t);
+        return map_make_call(pos, t);
     }
     if k != K_STRUCT {
         return mk_int(pos, 0, t);
@@ -3886,7 +3911,7 @@ fn enum_zero(pos, body, t) {
     let i = 0;
     while i < enum_zeroing[VEC_LEN] {
         if vec_get(enum_zeroing, i) == t {
-            err_type(pos, "enum ", t, " has no zero value: give it a variant without data");
+            err_code_type(pos, "E281 ARGO", "enum ", t, " has no zero value: give it a variant without data");
             return sym_ref_node(pos, obj[LET_SYM]);
         }
         i = i + 1;
@@ -3956,7 +3981,7 @@ fn argo_value(pos, body, p, t) {
     if k == K_OPT {
         let et = t[TY_ELEM];
         if !is_ref(et) || kind_of(et) == K_FUNC {
-            err_type(pos, "argo.Get decodes optionals of references only, not ", t, "");
+            err_code_type(pos, "E281 ARGO", "argo.Get decodes optionals of references only, not ", t, "");
             return 0;
         }
         let out = declare_local(pos, "$", t);
@@ -3972,7 +3997,7 @@ fn argo_value(pos, body, p, t) {
         vec_push(body, ifs);
         return sym_ref_node(pos, out);
     }
-    err_type(pos, "argo.Get cannot decode values of type ", t, "");
+    err_code_type(pos, "E281 ARGO", "argo.Get cannot decode values of type ", t, "");
     return 0;
 }
 
@@ -4150,7 +4175,7 @@ fn argo_dfn(pos, t) {
     }
     let k = kind_of(t);
     if k == K_MAP && kind_of(t[TY_KEY]) != K_STRING {
-        err_type(pos, "argo.Get decodes maps with str keys, not ", t, "");
+        err_code_type(pos, "E281 ARGO", "argo.Get decodes maps with str keys, not ", t, "");
         return 0;
     }
     lifted_count = lifted_count + 1;
@@ -4281,7 +4306,7 @@ fn argo_dfn(pos, t) {
         argo_err_return(pos, wb3, p);
         let mv = argo_value(pos, wb3, p, t[TY_ELEM]);
         if mv {
-            vec_push(wb3, expr_stmt(rt_call(pos, "rt_map_set", args3(sym_ref_node(pos, x), sym_ref_node(pos, mk[LET_SYM]), to_bits(mv)), ty_void)));
+            vec_push(wb3, expr_stmt(rt_call(pos, "rt_map_set", args4(sym_ref_node(pos, x), sym_ref_node(pos, mk[LET_SYM]), to_bits(mv), mk_int(pos, 1, ty_int)), ty_void)));
         }
         argo_err_return(pos, wb3, p);
         argo_more(pos, wb3, p, '}');
@@ -4357,7 +4382,7 @@ fn say_arg(a, prefix) {
         let et = t[TY_ELEM];
         let ek = kind_of(et);
         if say_type_has_dyn(et) {
-            err_at(pos, "cannot format a slice of dyn values: give the shape a method that formats (#141)");
+            err_code_at(pos, "E530 DYN_NOT_YET", "cannot format a slice of dyn values: give the shape a method that formats (#141)");
             return ty_void;
         }
         if ek == K_STRING {
@@ -4384,13 +4409,13 @@ fn say_arg(a, prefix) {
         let st = t;
         if k == K_OPT {
             if kind_of(t[TY_ELEM]) == K_DYN {
-                err_at(pos, "cannot format a dyn value: give the shape a method that formats (#141)");
+                err_code_at(pos, "E530 DYN_NOT_YET", "cannot format a dyn value: give the shape a method that formats (#141)");
                 return ty_void;
             }
             st = t[TY_ELEM];
         }
         if say_type_has_dyn(st) {
-            err_at(pos, "cannot format a value holding a dyn value: give the shape a method that formats (#141)");
+            err_code_at(pos, "E530 DYN_NOT_YET", "cannot format a value holding a dyn value: give the shape a method that formats (#141)");
             return ty_void;
         }
         return say_struct(a, st, prefix);
@@ -4399,7 +4424,7 @@ fn say_arg(a, prefix) {
     } else if k == K_MAP {
         return say_map_sorted(a, t, prefix);
     } else if k == K_DYN {
-        err_at(pos, "cannot format a dyn value: give the shape a method that formats (#141)");
+        err_code_at(pos, "E530 DYN_NOT_YET", "cannot format a dyn value: give the shape a method that formats (#141)");
         return ty_void;
     } else if k != K_INT && k != K_UINT {
         suffix = "p";
@@ -4888,7 +4913,7 @@ fn query_arg(a, t) {
     } else if kind_of(t) == K_SLICE && t[TY_ELEM] == ty_byte {
         variant = "Bytes";
     } else {
-        err_type(pos, "a query value must be an integer, a float, a str, a bool or []u8, not ", t, "");
+        err_code_type(pos, "E280 QUERY", "a query value must be an integer, a float, a str, a bool or []u8, not ", t, "");
         return 0;
     }
     let v = a;
@@ -4924,7 +4949,7 @@ fn chk_query(e, want) {
         let i = 0;
         while i < vals[VEC_LEN] {
             if vec_get(specs, i) {
-                err_at(pos, "a query value takes no format spec: it is sent as it is");
+                err_code_at(pos, "E280 QUERY", "a query value takes no format spec: it is sent as it is");
             }
             let a = vec_get(vals, i);
             let qa = query_arg(a, chk(a, 0));
@@ -4988,7 +5013,7 @@ fn chk_interp(e, want) {
             let a = vec_get(vals, i);
             if a[N_KIND] == EX_IDENT && !interp_name_known(a[ID_NAME]) {
                 // Often meant as literal text, like a route pattern's {id}.
-                let u = err_begin(a[N_POS]);
+                let u = err_code(a[N_POS], "E103 UNDEFINED");
                 buf_str(u, "undefined: ");
                 buf_str(u, a[ID_NAME]);
                 buf_str(u, " (in a string, {");
@@ -5056,13 +5081,13 @@ fn lower_say(e, m, want) {
     secret_say_args(args, m);
     if printf {
         if args[VEC_LEN] <= first {
-            err_at(pos, "missing format");
+            err_code_at(pos, "E282 FORMAT", "missing format");
             return ty_void;
         }
         let f = vec_get(args, first);
         let ft = chk(f, ty_string);
         if kind_of(ft) != K_STRING {
-            err_at(f[N_POS], "format must be a str");
+            err_code_at(f[N_POS], "E282 FORMAT", "format must be a str");
         }
         vec_push(stmts, expr_stmt(rt_call(pos, "rt_fmt_begin", args1(f), ty_void)));
         first = first + 1;
@@ -5100,7 +5125,7 @@ fn lower_say(e, m, want) {
 }
 
 fn arity_error(e, want) {
-    let a = err_begin(e[N_POS]);
+    let a = err_code(e[N_POS], "E210 ARG_COUNT");
     buf_str(a, e[CALL_NAME]);
     buf_str(a, " expects ");
     buf_int(a, want);
@@ -5122,11 +5147,11 @@ fn chk_bound(e, want) {
         target = want;
     }
     if e[CALL_ARGS][VEC_LEN] != 1 {
-        err_at(pos, "bound takes one value");
+        err_code_at(pos, "E252 BOUND_CALL", "bound takes one value");
         return ty_error;
     }
     if !target || !target[TY_BOUND] {
-        err_at(pos, "bound needs a bounded destination to check against: write its type (let v str max 100 = try bound(x))");
+        err_code_at(pos, "E252 BOUND_CALL", "bound needs a bounded destination to check against: write its type (let v str max 100 = try bound(x))");
         return ty_error;
     }
     let plain = target[TY_BOUND];
@@ -5153,7 +5178,7 @@ fn chk_bound(e, want) {
         xt = plain;
     }
     if !assignable(xt, plain) {
-        err_types(pos, "bound cannot check ", xt, " against ", target);
+        err_code_types(pos, "E252 BOUND_CALL", "bound cannot check ", xt, " against ", target);
         return ty_error;
     }
     let w = bound_wrapper(pos, target);
