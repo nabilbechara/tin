@@ -2,11 +2,6 @@
 // for ticks, and one SO_REUSEPORT listener per core so the kernel balances connections.
 package anvil
 
-extern func epoll_create1(flags i64) i64
-extern func epoll_ctl(ep i64, op i64, fd i64, ev i64) i64
-extern func epoll_wait(ep i64, ev i64, n i64, timeout i64) i64
-extern func timerfd_create(clock i64, flags i64) i64
-extern func timerfd_settime(fd i64, flags i64, nv i64, old i64) i64
 
 // struct epoll_event's size and data offset differ per CPU: see anvil_linux_<arch>.tin.
 const epIn = 1
@@ -18,7 +13,7 @@ const epEt = 0x80000000
 const ownListener = true
 
 func ev_init() {
-	kq = c32(epoll_create1(0x80000))
+	kq = c32(rt_sys_epoll_create1(0x80000))
 }
 
 func ev_level(fd i64) {
@@ -38,13 +33,13 @@ func ev_conn_read(fd i64) {
 }
 
 func ev_timer(ms i64) i64 {
-	tfd := c32(timerfd_create(1, 0x800|0x80000))
+	tfd := c32(rt_sys_timerfd_create(1, 0x800|0x80000))
 	its := calloc(4, 8)
 	its[0] = ms / 1000
 	its[1] = (ms % 1000) * 1000000
 	its[2] = its[0]
 	its[3] = its[1]
-	timerfd_settime(tfd, 0, its, 0)
+	rt_sys_timerfd_settime(tfd, 0, its, 0)
 	free(its)
 	ev_level(tfd)
 	return tfd
@@ -52,7 +47,7 @@ func ev_timer(ms i64) i64 {
 
 // ev_timer_ack reads the timerfd's expiry count so it stops being readable.
 func ev_timer_ack(fd i64) {
-	read(fd, word+96, 8)
+	rt_sys_read(fd, word+96, 8)
 }
 
 // ev_drain_timer is a second periodic timer (the shutdown deadline check): another timerfd.
@@ -77,12 +72,12 @@ func ev_signal(i i64) bool {
 
 // ev_signal_ack reads the 128-byte signalfd_siginfo so the signalfd stops being readable.
 func ev_signal_ack() {
-	read(sigfd, word+128, 128)
+	rt_sys_read(sigfd, word+128, 128)
 }
 
 // ev_wait waits for events, at most ms milliseconds (-1: no limit).
 func ev_wait(ms i64) i64 {
-	return c32(epoll_wait(kq, evs, maxEvents, ms))
+	return c32(rt_sys_epoll_wait(kq, evs, maxEvents, ms))
 }
 
 // ev_hangup reports that the peer closed or reset (it may arrive with the last data).

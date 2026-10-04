@@ -3,26 +3,11 @@ package quarry
 
 import "say"
 
-extern func open(path i64, flags i64, ...) i64
-extern func close(fd i64) i64
-extern func fstat(fd i64, st i64) i64
-extern func stat(path i64, st i64) i64
-extern func lstat(path i64, st i64) i64
 extern func strerror(e i64) i64
 extern func getenv(name i64) i64
 extern func setenv(name i64, val i64, overwrite i64) i64
 extern func unsetenv(name i64) i64
-extern func getpid() i64
-extern func getcwd(buf i64, n i64) i64
-extern func chdir(path i64) i64
 extern func gethostname(buf i64, n i64) i64
-extern func mkdir(path i64, mode i64) i64
-extern func rmdir(path i64) i64
-extern func unlink(path i64) i64
-extern func rename(a i64, b i64) i64
-extern func opendir(path i64) i64
-extern func readdir(d i64) i64
-extern func closedir(d i64) i64
 
 const oRdonly = 0
 const oWrite = O_WRITE_CREATE
@@ -115,7 +100,7 @@ func Setenv(key str, value str) ! {
 		fail say.Fault("setenv: %s", errnoText(eINVAL))
 	}
 	if c32(setenv(rt_cstr(key), rt_cstr(value), 1)) != 0 {
-		e := errnoText(errno())
+		e := errnoText(rt_env_errno())
 		fail say.Fault("setenv: %s", e)
 	}
 }
@@ -126,7 +111,7 @@ func Unsetenv(key str) ! {
 		fail say.Fault("unsetenv: %s", errnoText(eINVAL))
 	}
 	if c32(unsetenv(rt_cstr(key))) != 0 {
-		e := errnoText(errno())
+		e := errnoText(rt_env_errno())
 		fail say.Fault("unsetenv: %s", e)
 	}
 }
@@ -146,7 +131,7 @@ func readFd(fd i64, hint i64, path str) !str {
 			memcpy(q+8, p+8, got)
 			p = q
 		}
-		n := read(fd, p+8+got, room-got)
+		n := rt_sys_read(fd, p+8+got, room-got)
 		if n < 0 {
 			fail pathFault("read", path)
 		}
@@ -229,16 +214,16 @@ func readFileHere(path str) !str {
 	if badPath(path) {
 		fail invalidFault("open", path)
 	}
-	fd := c32(open(rt_cstr(path), oRdonly))
+	fd := c32(rt_sys_open(rt_cstr(path), oRdonly, 0))
 	if fd < 0 {
 		fail pathFault("open", path)
 	}
 	size := 0
-	if c32(fstat(fd, stbuf)) == 0 && !isDirMode(mode(stbuf)) {
+	if c32(rt_sys_fstat(fd, stbuf)) == 0 && !isDirMode(mode(stbuf)) {
 		size = rt_stat_size(stbuf)
 	}
 	s, err := readFd(fd, size, path)
-	close(fd)
+	rt_sys_close(fd)
 	if err != nil {
 		fail err
 	}
@@ -255,17 +240,17 @@ func writeAll(path str, data str, flags i64) ! {
 	if badPath(path) {
 		fail invalidFault("open", path)
 	}
-	fd := c32(open(rt_cstr(path), flags, 420))
+	fd := c32(rt_sys_open(rt_cstr(path), flags, 420))
 	if fd < 0 {
 		fail pathFault("open", path)
 	}
 	p := cast(i64, data) + 8
 	n := len(data)
 	for n > 0 {
-		w := write(fd, p, n)
+		w := rt_sys_write(fd, p, n)
 		if w < 0 {
 			f := pathFault("write", path)
-			close(fd)
+			rt_sys_close(fd)
 			if f != nil {
 				fail f
 			}
@@ -274,7 +259,7 @@ func writeAll(path str, data str, flags i64) ! {
 		p += w
 		n -= w
 	}
-	if c32(close(fd)) < 0 {
+	if c32(rt_sys_close(fd)) < 0 {
 		fail pathFault("close", path)
 	}
 }
@@ -312,7 +297,7 @@ func writeJob(job i64) {
 
 // Exists reports whether path names an existing file or directory (symlinks are followed).
 func Exists(path str) bool {
-	return !badPath(path) && c32(stat(rt_cstr(path), stbuf)) == 0
+	return !badPath(path) && c32(rt_sys_stat(rt_cstr(path), stbuf)) == 0
 }
 
 // IsDir reports whether path names a directory.
@@ -325,7 +310,7 @@ func Size(path str) !i64 {
 	if badPath(path) {
 		fail invalidFault("stat", path)
 	}
-	if c32(stat(rt_cstr(path), stbuf)) != 0 {
+	if c32(rt_sys_stat(rt_cstr(path), stbuf)) != 0 {
 		fail pathFault("stat", path)
 	}
 	return rt_stat_size(stbuf)
@@ -336,7 +321,7 @@ func ModTime(path str) !i64 {
 	if badPath(path) {
 		fail invalidFault("stat", path)
 	}
-	if c32(stat(rt_cstr(path), stbuf)) != 0 {
+	if c32(rt_sys_stat(rt_cstr(path), stbuf)) != 0 {
 		fail pathFault("stat", path)
 	}
 	return rt_stat_mtime(stbuf)
@@ -348,11 +333,11 @@ func Remove(path str) ! {
 		fail invalidFault("remove", path)
 	}
 	cp := rt_cstr(path)
-	if c32(unlink(cp)) == 0 {
+	if c32(rt_sys_unlink(cp)) == 0 {
 		return
 	}
 	e := errno()
-	if c32(rmdir(cp)) == 0 {
+	if c32(rt_sys_rmdir(cp)) == 0 {
 		return
 	}
 	e1 := errno()
@@ -367,7 +352,7 @@ func RemoveAll(path str) ! {
 	if badPath(path) {
 		fail invalidFault("unlinkat", path)
 	}
-	if c32(lstat(rt_cstr(path), stbuf)) != 0 {
+	if c32(rt_sys_lstat(rt_cstr(path), stbuf)) != 0 {
 		if errno() == 2 {
 			return
 		}
@@ -395,8 +380,8 @@ func Rename(oldpath str, newpath str) ! {
 	if badPath(oldpath) || badPath(newpath) {
 		fail say.Fault("rename %s %s: %s", oldpath, newpath, errnoText(eINVAL))
 	}
-	if c32(lstat(rt_cstr(newpath), stbuf)) == 0 && isDirMode(mode(stbuf)) {
-		if c32(lstat(rt_cstr(oldpath), stbuf2)) != 0 {
+	if c32(rt_sys_lstat(rt_cstr(newpath), stbuf)) == 0 && isDirMode(mode(stbuf)) {
+		if c32(rt_sys_lstat(rt_cstr(oldpath), stbuf2)) != 0 {
 			e := errnoText(errno())
 			fail say.Fault("rename %s %s: %s", oldpath, newpath, e)
 		}
@@ -404,7 +389,7 @@ func Rename(oldpath str, newpath str) ! {
 			fail say.Fault("rename %s %s: %s", oldpath, newpath, errnoText(eEXIST))
 		}
 	}
-	if c32(rename(rt_cstr(oldpath), rt_cstr(newpath))) != 0 {
+	if c32(rt_sys_rename(rt_cstr(oldpath), rt_cstr(newpath))) != 0 {
 		e := errnoText(errno())
 		fail say.Fault("rename %s %s: %s", oldpath, newpath, e)
 	}
@@ -415,7 +400,7 @@ func Mkdir(path str) ! {
 	if badPath(path) {
 		fail invalidFault("mkdir", path)
 	}
-	if c32(mkdir(rt_cstr(path), 493)) != 0 {
+	if c32(rt_sys_mkdir(rt_cstr(path), 493)) != 0 {
 		fail pathFault("mkdir", path)
 	}
 }
@@ -425,7 +410,7 @@ func MkdirAll(path str) ! {
 	if badPath(path) {
 		fail invalidFault("mkdir", path)
 	}
-	if c32(stat(rt_cstr(path), stbuf)) == 0 {
+	if c32(rt_sys_stat(rt_cstr(path), stbuf)) == 0 {
 		if isDirMode(mode(stbuf)) {
 			return
 		}
@@ -446,7 +431,7 @@ func MkdirAll(path str) ! {
 	}
 	err := Mkdir(path)
 	if err != nil {
-		if c32(lstat(rt_cstr(path), stbuf)) == 0 && isDirMode(mode(stbuf)) {
+		if c32(rt_sys_lstat(rt_cstr(path), stbuf)) == 0 && isDirMode(mode(stbuf)) {
 			return
 		}
 		if err != nil {
@@ -523,7 +508,7 @@ func ReadDir(path str) ![]str {
 	if badPath(path) {
 		fail invalidFault("open", path)
 	}
-	d := opendir(rt_cstr(path))
+	d := rt_sys_opendir(rt_cstr(path))
 	if d == 0 {
 		if errno() == eNOTDIR {
 			fail pathFault("fdopendir", path)
@@ -531,7 +516,7 @@ func ReadDir(path str) ![]str {
 		fail pathFault("open", path)
 	}
 	for {
-		ent := readdir(d)
+		ent := rt_sys_readdir(d)
 		if ent == 0 {
 			break
 		}
@@ -541,7 +526,9 @@ func ReadDir(path str) ![]str {
 		}
 		out = append(out, name)
 	}
-	closedir(d)
+	direrr := rt_dir_error(d)
+	rt_sys_closedir(d)
+	if direrr != 0 { fail say.Fault("readdir %s: %s", path, errnoText(direrr)) }
 	sortStrs(mut out, 0, len(out))
 	return out
 }
@@ -549,10 +536,10 @@ func ReadDir(path str) ![]str {
 // Getwd returns the current working directory ($PWD when it still names it, like Go).
 func Getwd() !str {
 	pwd := Getenv("PWD")
-	if len(pwd) > 0 && pwd[0] == '/' && c32(stat(rt_cstr(pwd), stbuf)) == 0 && c32(stat(rt_cstr("."), stbuf2)) == 0 && sameFile(stbuf, stbuf2) {
+	if len(pwd) > 0 && pwd[0] == '/' && c32(rt_sys_stat(rt_cstr(pwd), stbuf)) == 0 && c32(rt_sys_stat(rt_cstr("."), stbuf2)) == 0 && sameFile(stbuf, stbuf2) {
 		return pwd
 	}
-	if getcwd(pathbuf, 4096) == 0 {
+	if rt_sys_getcwd(pathbuf, 4096) == 0 {
 		e := errnoText(errno())
 		fail say.Fault("getwd: %s", e)
 	}
@@ -564,7 +551,7 @@ func Chdir(path str) ! {
 	if badPath(path) {
 		fail invalidFault("chdir", path)
 	}
-	if c32(chdir(rt_cstr(path))) != 0 {
+	if c32(rt_sys_chdir(rt_cstr(path))) != 0 {
 		fail pathFault("chdir", path)
 	}
 }
@@ -581,7 +568,7 @@ func TempDir() str {
 // Hostname returns the machine's host name.
 func Hostname() !str {
 	if c32(gethostname(pathbuf, 1024)) != 0 {
-		e := errnoText(errno())
+		e := errnoText(rt_env_errno())
 		fail say.Fault("hostname: %s", e)
 	}
 	store8(pathbuf+1023, 0)
@@ -590,13 +577,13 @@ func Hostname() !str {
 
 // Pid returns the process id.
 func Pid() i64 {
-	return c32(getpid())
+	return c32(rt_sys_getpid())
 }
 
 // Exit flushes stdout and ends the program with status code.
 func Exit(code i64) {
 	rt_flush()
-	exit(code)
+	rt_sys_exit(code)
 }
 
 // Eprint writes s to stderr.

@@ -1,0 +1,99 @@
+package syscallprobe
+
+import "say"
+
+var seen i64
+var onAlt bool
+var alt i64
+shared var turn i64
+
+func handler(sig i64) {
+    seen++
+    // A leaf can retain the interrupted frame pointer; inspect its actual local stack.
+    marker := sig
+    here := cast(i64,&marker)
+    onAlt = here >= alt && here < alt+65536
+}
+
+// Run checks kernel errors, mapping boundaries, signal return and directory refills.
+func Run(path str) {
+    closeResult := rt_sys_close(-1)
+    say.Line("close", closeResult, rt_errno())
+    p := rt_sys_mmap(0,0,3,MAP_STACK,-1,0)
+    say.Line("map error", p, rt_errno())
+    p = mem_map(rt_page_size(),MAP_STACK)
+    store8(p,71)
+    store8(p+rt_page_size()-1,91)
+    say.Line("mapping", load8(p), load8(p+rt_page_size()-1), rt_sys_munmap(p,rt_page_size()))
+    say.Line("poll", rt_sys_poll(0,0,0), rt_sys_poll(0,0,1))
+    ts := calloc(2,8)
+    rt_sys_clock_gettime(0,ts)
+    wall := ts[0]>1600000000
+    mono := rt_mono_ns()
+    ordered := rt_mono_ns()>=mono
+    saved := rtVdsoClock
+    rtVdsoClock = 0
+    fallback := rt_mono_ns()>=mono
+    rt_sys_clock_gettime(-1,ts)
+    say.Line("clock",wall,ordered,rt_errno(),fallback,saved != 0)
+    rtVdsoClock = saved
+    free(ts)
+    st := calloc(1,256)
+    file := path+"/file"
+    say.Line("stat", rt_sys_stat(rt_cstr(file),st), rt_stat_size(st), rt_stat_mtime(st)>1600000000, linux_stat_type(st))
+    free(st)
+    d := rt_sys_opendir(rt_cstr(path))
+    if d == 0 { panic("opendir") }
+    count := 0
+    bytes := 0
+    kinds := 0
+    for {
+        ent := rt_sys_readdir(d)
+        if ent == 0 { break }
+        name := rt_dirent_name(ent)
+        if name == "." || name == ".." { continue }
+        // Force DT_UNKNOWN through the same fallback used for such filesystems.
+        store8(ent+18,0)
+        linux_dir_type(d,ent)
+        count++
+        bytes += len(name)
+        kinds += i64(load8(ent+18))
+    }
+    say.Line("directory",count,bytes,kinds,rt_dir_error(d))
+    rt_sys_closedir(d)
+    // Install a returning handler on a temporary alternate stack, then restore both.
+    oldStack := calloc(1,32)
+    stack := calloc(1,32)
+    alt = mem_map(65536,MAP_STACK)
+    rt_stack_t(stack,alt,65536)
+    if rt_sys_sigaltstack(stack,oldStack) != 0 { panic("sigaltstack") }
+    act := calloc(4,8)
+    old := calloc(4,8)
+    act[0] = cast(i64,handler)
+    act[1] = 0x0c000004
+    act[2] = linux_restorer_ptr()
+    if rt_sys_sigaction(10,act,old) != 0 { panic("sigaction") }
+    if linux_raw(linux_nr_kill(),rt_sys_getpid(),10,0,0,0,0) != 0 { panic("kill") }
+    say.Line("signal",seen,onAlt)
+    if rt_sys_sigaction(10,old,0) != 0 || rt_sys_sigaltstack(oldStack,0) != 0 { panic("signal restore") }
+    rt_sys_munmap(alt,65536)
+    free(act)
+    free(old)
+    free(stack)
+    free(oldStack)
+}
+
+// Core checks that one kernel thread's failed syscall cannot replace another's error.
+func Core(id i64) {
+    if id == 0 {
+        rt_sys_close(-1)
+        __atomic_store(&turn,1)
+        for __atomic_load(&turn) != 2 { __yield() }
+        say.Line("core errno",rt_errno())
+    } else {
+        for __atomic_load(&turn) != 1 { __yield() }
+        rt_sys_open(cast(i64,"/tin-syscall-path-does-not-exist")+8,0,0)
+        if rt_errno() != 2 { panic("child errno") }
+        __atomic_store(&turn,2)
+    }
+}
