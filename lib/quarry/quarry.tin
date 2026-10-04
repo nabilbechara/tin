@@ -147,6 +147,11 @@ func readFd(fd i64, hint i64, path str) !str {
 
 // ReadFile returns the whole content of the file at path.
 func ReadFile(path str) !str {
+	tp := rt_tape()
+	if tp != 0 {
+		tapedA = cast(i64, path)
+		return try rt_effect(tp, "quarry.read@1", path, readLive) // recorded for replay (#241)
+	}
 	if rt_task_current() == 0 {
 		return try readFileHere(path)
 	}
@@ -311,11 +316,19 @@ func writeAll(path str, data str, flags i64) ! {
 
 // WriteFile writes data to the file at path, creating it (mode 0644) or truncating it.
 func WriteFile(path str, data str) ! {
+	tp := rt_tape()
+	if tp != 0 {
+		return try writeTaped(tp, "w ", path, data, oWrite) // recorded for replay (#241)
+	}
 	return try writeVia(path, data, oWrite)
 }
 
 // AppendFile appends data to the file at path, creating it (mode 0644) when needed.
 func AppendFile(path str, data str) ! {
+	tp := rt_tape()
+	if tp != 0 {
+		return try writeTaped(tp, "a ", path, data, oAppend) // recorded for replay (#241)
+	}
 	return try writeVia(path, data, oAppend)
 }
 
@@ -342,16 +355,33 @@ func writeJob(job i64) {
 
 // Exists reports whether path names an existing file or directory (symlinks are followed).
 func Exists(path str) bool {
+	tp := rt_tape()
+	if tp != 0 {
+		return rt_effect_word(tp, "quarry.stat@1", "exists " + path, i64(existsLive(path))) != 0 // recorded for replay (#241)
+	}
+	return existsLive(path)
+}
+
+func existsLive(path str) bool {
 	return !badPath(path) && c32(rt_sys_stat(rt_cstr(path), stbuf)) == 0
 }
 
 // IsDir reports whether path names a directory.
 func IsDir(path str) bool {
+	tp := rt_tape()
+	if tp != 0 {
+		live := existsLive(path) && isDirMode(mode(stbuf))
+		return rt_effect_word(tp, "quarry.stat@1", "isdir " + path, i64(live)) != 0 // recorded for replay (#241)
+	}
 	return Exists(path) && isDirMode(mode(stbuf))
 }
 
 // Size returns the size in bytes of the file at path.
 func Size(path str) !i64 {
+	tp := rt_tape()
+	if tp != 0 {
+		return try statTaped(tp, "size ", path, sizeLive) // recorded for replay (#241)
+	}
 	if badPath(path) {
 		fail invalidFault("stat", path)
 	}
@@ -363,6 +393,10 @@ func Size(path str) !i64 {
 
 // ModTime returns the modification time of path in seconds since the Unix epoch.
 func ModTime(path str) !i64 {
+	tp := rt_tape()
+	if tp != 0 {
+		return try statTaped(tp, "mtime ", path, mtimeLive) // recorded for replay (#241)
+	}
 	if badPath(path) {
 		fail invalidFault("stat", path)
 	}
@@ -374,6 +408,10 @@ func ModTime(path str) !i64 {
 
 // Remove deletes the file or empty directory at path.
 func Remove(path str) ! {
+	tp := rt_tape()
+	if tp != 0 {
+		return try fsTaped(tp, "rm ", path, "", removeLive) // recorded for replay (#241)
+	}
 	if badPath(path) {
 		fail invalidFault("remove", path)
 	}
@@ -394,6 +432,10 @@ func Remove(path str) ! {
 
 // RemoveAll deletes path and everything below it; a missing path is not a fault.
 func RemoveAll(path str) ! {
+	tp := rt_tape()
+	if tp != 0 {
+		return try fsTaped(tp, "rmall ", path, "", removeAllLive) // recorded for replay (#241)
+	}
 	if badPath(path) {
 		fail invalidFault("unlinkat", path)
 	}
@@ -422,6 +464,10 @@ func sameFile(a i64, b i64) bool {
 
 // Rename moves oldpath to newpath, replacing a file there; like Go it never replaces a directory.
 func Rename(oldpath str, newpath str) ! {
+	tp := rt_tape()
+	if tp != 0 {
+		return try fsTaped(tp, "mv ", oldpath, newpath, renameLive) // recorded for replay (#241)
+	}
 	if badPath(oldpath) || badPath(newpath) {
 		fail say.Fault("rename %s %s: %s", oldpath, newpath, errnoText(eINVAL))
 	}
@@ -442,6 +488,10 @@ func Rename(oldpath str, newpath str) ! {
 
 // Mkdir creates the directory path (mode 0755); its parent must exist.
 func Mkdir(path str) ! {
+	tp := rt_tape()
+	if tp != 0 {
+		return try fsTaped(tp, "mkdir ", path, "", mkdirLive) // recorded for replay (#241)
+	}
 	if badPath(path) {
 		fail invalidFault("mkdir", path)
 	}
@@ -452,6 +502,10 @@ func Mkdir(path str) ! {
 
 // MkdirAll creates path and any missing parents (mode 0755); an existing directory is fine.
 func MkdirAll(path str) ! {
+	tp := rt_tape()
+	if tp != 0 {
+		return try fsTaped(tp, "mkdirall ", path, "", mkdirAllLive) // recorded for replay (#241)
+	}
 	if badPath(path) {
 		fail invalidFault("mkdir", path)
 	}
@@ -549,6 +603,10 @@ func SortStrs(a mut []str) {
 
 // ReadDir returns the names in directory path, sorted bytewise, without "." and "..".
 func ReadDir(path str) ![]str {
+	tp := rt_tape()
+	if tp != 0 {
+		return try readDirTaped(tp, path) // recorded for replay (#241)
+	}
 	out := make([]str, 0, 16)
 	if badPath(path) {
 		fail invalidFault("open", path)
@@ -647,4 +705,130 @@ func Eprintln(s str) {
 	}
 	store8(p+n, '\n')
 	rt_write_all(2, p, n+1)
+}
+
+// ---- recording and replay (notes/interface_replay.md, section 4; #241) ----
+
+// An effect's body runs at once, before it waits: these hand it its arguments.
+var tapedA i64
+var tapedB i64
+var tapedFlags i64
+
+func readLive() !str {
+	return try ReadFile(cast(str, tapedA))
+}
+
+// writeTaped records or replays WriteFile or AppendFile as quarry.write@1.
+func writeTaped(tp i64, how str, path str, data str, flags i64) ! {
+	tapedA = cast(i64, path)
+	tapedB = cast(i64, data)
+	tapedFlags = flags
+	_ = try rt_effect(tp, "quarry.write@1", how + path + "\n" + data, writeLive)
+}
+
+func writeLive() !str {
+	try writeVia(cast(str, tapedA), cast(str, tapedB), tapedFlags)
+	return ""
+}
+
+// statTaped records or replays Size or ModTime as quarry.stat@1 (the result a word).
+func statTaped(tp i64, what str, path str, live func() !str) !i64 {
+	tapedA = cast(i64, path)
+	v := try rt_effect(tp, "quarry.stat@1", what + path, live)
+	if len(v) != 8 {
+		fail "replay: quarry.stat@1 result is damaged"
+	}
+	return tword(v, 0)
+}
+
+func sizeLive() !str {
+	n := try Size(cast(str, tapedA))
+	return tput(make([]u8, 0, 8), n)
+}
+
+func mtimeLive() !str {
+	t := try ModTime(cast(str, tapedA))
+	return tput(make([]u8, 0, 8), t)
+}
+
+// fsTaped records or replays a change to the file system as quarry.fs@1 (a rename's two paths
+// on two lines).
+func fsTaped(tp i64, what str, path str, other str, live func() !str) ! {
+	tapedA = cast(i64, path)
+	tapedB = cast(i64, other)
+	key := what + path
+	if what == "mv " {
+		key = key + "\n" + other
+	}
+	_ = try rt_effect(tp, "quarry.fs@1", key, live)
+}
+
+func removeLive() !str {
+	try Remove(cast(str, tapedA))
+	return ""
+}
+
+func removeAllLive() !str {
+	try RemoveAll(cast(str, tapedA))
+	return ""
+}
+
+func renameLive() !str {
+	try Rename(cast(str, tapedA), cast(str, tapedB))
+	return ""
+}
+
+func mkdirLive() !str {
+	try Mkdir(cast(str, tapedA))
+	return ""
+}
+
+func mkdirAllLive() !str {
+	try MkdirAll(cast(str, tapedA))
+	return ""
+}
+
+// readDirTaped records or replays ReadDir as quarry.dir@1 (the names, each a string).
+func readDirTaped(tp i64, path str) ![]str {
+	tapedA = cast(i64, path)
+	v := try rt_effect(tp, "quarry.dir@1", path, readDirLive)
+	out := make([]str, 0, 16)
+	at := 0
+	for at < len(v) {
+		if at+8 > len(v) {
+			fail "replay: quarry.dir@1 result is damaged"
+		}
+		n := tword(v, at)
+		if n < 0 || at+8+n > len(v) {
+			fail "replay: quarry.dir@1 result is damaged"
+		}
+		out = append(out, v[at+8:at+8+n])
+		at += 8 + n
+	}
+	return out
+}
+
+func readDirLive() !str {
+	names := try ReadDir(cast(str, tapedA))
+	b := make([]u8, 0, 256)
+	for _, n := range names {
+		b = append(b, tput(make([]u8, 0, 8), len(n))...)
+		b = append(b, n...)
+	}
+	return str(b)
+}
+
+func tput(b []u8, v i64) str {
+	for i := 0; i < 8; i++ {
+		b = append(b, u8(v >> (8 * i)))
+	}
+	return str(b)
+}
+
+func tword(s str, at i64) i64 {
+	v := 0
+	for i := 7; i >= 0; i-- {
+		v = v<<8 | i64(s[at+i])
+	}
+	return v
 }
