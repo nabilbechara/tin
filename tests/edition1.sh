@@ -38,7 +38,8 @@ fi
 # A value main borrowed from a long-lived map stays valid while a spawned child replaces
 # the entry and ends: the core's own stack is an epoch participant (#176). A detached task
 # that never ends holds back releases; past the limbo's cap drops are pinned (#176).
-for name in boundaries fault_wrap once polls deadlines borrows limbo_cap
+# guard CALL is the guard block on one call, and a panic's fault carries its backtrace (#142).
+for name in boundaries fault_wrap once polls deadlines borrows guard_call limbo_cap
 do
 	polls=
 	[ "$name" != polls ] || polls=-polls
@@ -50,6 +51,17 @@ do
 		exit 1
 	fi
 done
+
+# guard takes a block or a call (#142).
+if "$compiler" -edition 1 -o "$tmp/guard_call_bad" tests/edition1/guard_call_bad.tin >"$tmp/guard_call_bad.out" 2>"$tmp/guard_call_bad.err"; then
+	echo "FAIL edition1/guard_call_bad: unexpectedly accepted"
+	exit 1
+fi
+if ! cmp -s tests/edition1/guard_call_bad.err "$tmp/guard_call_bad.err"; then
+	echo "FAIL edition1/guard_call_bad: diagnostic mismatch"
+	diff -u tests/edition1/guard_call_bad.err "$tmp/guard_call_bad.err" || true
+	exit 1
+fi
 
 # wrap without try is rejected (#229).
 if "$compiler" -edition 1 -o "$tmp/fault_wrap_bad" tests/edition1/fault_wrap_bad.tin >"$tmp/fault_wrap_bad.out" 2>"$tmp/fault_wrap_bad.err"; then
@@ -157,8 +169,9 @@ if ! cmp -s tests/edition1/use_bad.err "$tmp/use_bad.err"; then
 	exit 1
 fi
 
-# Structured concurrency (#232): scopes, spawn, wait, cancel, first-fault cancellation.
-for name in scopes lanes selects guards handles spawn_values
+# Structured concurrency (#232): scopes, spawn, wait, cancel, first-fault cancellation;
+# s.cancel(reason) and s.yield() (#143).
+for name in scopes lanes selects guards handles spawn_values scope_cancel
 do
 	"$compiler" -edition 1 -o "$tmp/$name" "tests/edition1/run/$name.tin"
 	"$tmp/$name" >"$tmp/$name.out" 2>/dev/null
@@ -234,5 +247,24 @@ do
 		exit 1
 	fi
 done
+
+# Packages (#146): an edition 1 program imports a vendored edition 1 package by path, and a
+# vendored edition 1 package that reaches a capability its tin.mod does not grant is refused.
+"$compiler" -edition 1 -o "$tmp/caps" tests/edition1/run/caps.tin
+"$tmp/caps" >"$tmp/caps.out" 2>/dev/null
+if ! cmp -s tests/edition1/run/caps.out "$tmp/caps.out"; then
+	echo "FAIL edition1/run/caps: output differs"
+	diff -u tests/edition1/run/caps.out "$tmp/caps.out" || true
+	exit 1
+fi
+if "$compiler" -edition 1 -o "$tmp/caps_bad" tests/edition1/caps_bad.tin >"$tmp/caps_bad.out" 2>"$tmp/caps_bad.err"; then
+	echo "FAIL edition1/caps_bad: unexpectedly accepted"
+	exit 1
+fi
+if ! cmp -s tests/edition1/caps_bad.err "$tmp/caps_bad.err"; then
+	echo "FAIL edition1/caps_bad: diagnostic mismatch"
+	diff -u tests/edition1/caps_bad.err "$tmp/caps_bad.err" || true
+	exit 1
+fi
 
 echo "PASS edition 1 parser"

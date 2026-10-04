@@ -49,6 +49,7 @@ import "say"          // the standard library: lib/say ... lib/wire
 import "./geom"       // relative to this file: ./geom.tin, or every .tin file in ./geom/
 import "util"         // not in the standard library: <directory of the program>/util(.tin)
 import u "util"       // with an alias
+import "github.com/ana/geo"  // a dependency, by path: only from vendor/github.com/ana/geo
 ```
 
 - A package is a file `name.tin` or a directory of `.tin` files. Directory files are read
@@ -66,6 +67,16 @@ import u "util"       // with an alias
   a compile error. Code the compiler generates (JSON encoding, printing, `keep`) may read
   private fields.
 - Imports must not form a cycle.
+- **Dependencies** are imported by path: an import whose first element contains a dot
+  (`"github.com/ana/geo"`) is read only from `vendor/<path>` in the program's directory,
+  never from the standard library or the network. `tin vendor` copies the packages
+  `tin.mod` requires there, and `tin.lock` records each vendored file's SHA-256; a file
+  whose hash differs is a compile error (docs/PACKAGES.md). Two import paths cannot load
+  different packages with the same name.
+- **Capabilities:** a vendored package's `tin.mod` declares what it may do (`caps net files
+  spawn exec unsafe`). A call from it that can reach, through any package, a standard library
+  entry point needing another capability is a compile error at the call (`E804`); `unsafe`
+  lets it use the trusted operations of section 18.
 
 ### Program start
 
@@ -1102,7 +1113,9 @@ err2 := argo.Get(text, mut xs)      // appends decoded elements
 
 ## 18. Standard-library-only features
 
-Files under `lib/` are trusted and may use operations user code cannot:
+Files under `lib/` are trusted and may use operations user code cannot. So may a vendored
+package whose `tin.mod` declares `caps unsafe` (docs/PACKAGES.md); the packages that call it
+then need `unsafe` too.
 
 - `cast(T, x)` between `i64` and reference types (a str is a pointer to
   `[length word][bytes][NUL]`; a slice to a header `[len, cap, data, region]`);

@@ -55,3 +55,32 @@ mov x0, #0
 ret
 3:
 RESULT rt_sys_clock_gettime, NR_CLOCK_GETTIME
+// clone(flags, stack, ptid, ctid, entry, arg): the child starts on the new stack with
+// entry and arg stored at its top, no inherited frame and no Tin context, and leaves with exit.
+LEAF rt_sys_clone, NR_CLONE
+stp x4, x5, [x1, #-16]!
+mov x4, x3
+mov x3, #0
+mov x8, #NR_CLONE
+svc #0
+cbz x0, 4f
+cmn x0, #4095
+b.cc 1f
+neg x0, x0
+cbz x28, 2f
+str x0, [x28, #80]
+2:
+mov x0, #-1
+1:
+ret
+4:
+ldp x9, x0, [sp], #16
+mov x28, #0
+mov x29, #0
+mov x30, #0
+blr x9
+mov x0, #0
+mov x8, #NR_EXIT
+svc #0
+brk #0
+.size rt_sys_clone, .-rt_sys_clone

@@ -1,0 +1,185 @@
+package seal
+
+// RSA signature verification: PKCS #1 v1.5 and PSS (RFC 8017), for X.509 and TLS.
+// Verification sees only public values, so it is not constant time.
+
+import "say"
+
+const oidRSA = "1.2.840.113549.1.1.1"
+
+// rsa_digest_info is the DER DigestInfo prefix PKCS #1 v1.5 puts before a digest made with h.
+func rsa_digest_info(h Hash) []u8 {
+	switch h {
+	case SHA256:
+		return []u8{0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20}
+	case SHA384:
+		return []u8{0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x02, 0x05, 0x00, 0x04, 0x30}
+	case SHA512:
+		return []u8{0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40}
+	}
+	return []u8{}
+}
+
+// RSAKeyBits is the size of key's modulus in bits.
+func RSAKeyBits(key RSAPublicKey) i64 {
+	at := 0
+	for at < len(key.N) && key.N[at] == 0 {
+		at++
+	}
+	if at == len(key.N) {
+		return 0
+	}
+	top := key.N[at]
+	bits := (len(key.N) - at - 1) * 8
+	for top != 0 {
+		bits++
+		top >>= 1
+	}
+	return bits
+}
+
+// rsa_public applies key to sig (sig^e mod n) after checking the key and that sig is k bytes and below n.
+func rsa_public(key RSAPublicKey, sig []u8) ![]u8 {
+	bits := RSAKeyBits(key)
+	if bits < 2048 {
+		fail say.Fault("seal: RSA key too small (%d bits; at least 2048 required)", bits)
+	}
+	if bits > 8192 {
+		fail say.Fault("seal: RSA key too large (%d bits; at most 8192)", bits)
+	}
+	at := 0
+	for at < len(key.E) && key.E[at] == 0 {
+		at++
+	}
+	e := key.E[at:]
+	if len(e) == 0 || len(e) > 4 || e[len(e)-1]&1 == 0 || (len(e) == 1 && e[0] < 3) {
+		fail "seal: unsupported RSA public exponent"
+	}
+	k := (bits + 7) / 8
+	if len(sig) != k {
+		fail "seal: RSA signature has the wrong length"
+	}
+	f := try monty_new(key.N)
+	z := f.elem()
+	if len(sig) > 4*f.n || f.from_bytes(mut z, monty_bytes(f, sig)) == 0 {
+		fail "seal: RSA signature out of range"
+	}
+	rsa_exp_pub(mut f, mut z, e)
+	out := f.to_bytes(z)
+	return out[len(out)-k:]
+}
+
+// rsa_exp_pub sets z = z^e in Montgomery form, square and multiply from e's top set bit; e is public.
+func rsa_exp_pub(f mut monty, z mut []u64, e []u8) {
+	base := f.elem()
+	f.set(mut base, z)
+	started := false
+	for i := 0; i < len(e)*8; i++ {
+		bit := (e[i/8] >> u8(7-i%8)) & 1
+		if started {
+			f.mul(mut z, z, z)
+			if bit == 1 {
+				f.mul(mut z, z, base)
+			}
+		} else if bit == 1 {
+			started = true
+		}
+	}
+}
+
+// VerifyPKCS1v15 checks an RSASSA-PKCS1-v1_5 signature over digest, a hash made with h.
+func VerifyPKCS1v15(key RSAPublicKey, h Hash, digest []u8, sig []u8) ! {
+	if len(digest) != Size(h) {
+		fail "seal: digest length does not match the hash"
+	}
+	em := try rsa_public(key, sig)
+	prefix := rsa_digest_info(h)
+	tlen := len(prefix) + len(digest)
+	k := len(em)
+	if k < tlen+11 {
+		fail "seal: RSA key too short for the digest"
+	}
+	// EM = 00 01 FF..FF 00 DigestInfo digest, compared byte for byte.
+	ok := em[0] == 0 && em[1] == 1 && em[k-tlen-1] == 0
+	for i := 2; i < k-tlen-1; i++ {
+		ok = ok && em[i] == 0xff
+	}
+	for i := 0; i < len(prefix); i++ {
+		ok = ok && em[k-tlen+i] == prefix[i]
+	}
+	for i := 0; i < len(digest); i++ {
+		ok = ok && em[k-len(digest)+i] == digest[i]
+	}
+	if !ok {
+		fail "seal: RSA PKCS #1 v1.5 signature verification failed"
+	}
+}
+
+// mgf1 is MGF1 over h: n bytes of mask from seed.
+func mgf1(h Hash, seed []u8, n i64) []u8 {
+	out := make([]u8, 0, n+Size(h))
+	b := make([]u8, len(seed)+4)
+	copy(b, seed)
+	for c := 0; len(out) < n; c++ {
+		b[len(seed)] = u8(c >> 24)
+		b[len(seed)+1] = u8(c >> 16)
+		b[len(seed)+2] = u8(c >> 8)
+		b[len(seed)+3] = u8(c)
+		for _, x := range Sum(h, str(b)) {
+			out = append(out, x)
+		}
+	}
+	return out[:n]
+}
+
+// VerifyPSS checks an RSASSA-PSS signature over digest, a hash made with h, with MGF1 over the same
+// hash. saltLen is the exact salt length, or -1 to accept any.
+func VerifyPSS(key RSAPublicKey, h Hash, digest []u8, sig []u8, saltLen i64) ! {
+	hlen := Size(h)
+	if len(digest) != hlen {
+		fail "seal: digest length does not match the hash"
+	}
+	m := try rsa_public(key, sig)
+	embits := RSAKeyBits(key) - 1
+	emlen := (embits + 7) / 8
+	// With embits a multiple of 8 the encoded message is one byte shorter than the modulus.
+	if len(m) > emlen {
+		if m[0] != 0 {
+			fail "seal: RSA PSS signature verification failed"
+		}
+		m = m[1:]
+	}
+	if emlen < hlen+2 || (saltLen >= 0 && emlen < hlen+saltLen+2) || m[emlen-1] != 0xbc {
+		fail "seal: RSA PSS signature verification failed"
+	}
+	dblen := emlen - hlen - 1
+	hh := m[dblen : dblen+hlen]
+	topmask := u8(0xff >> u8(8*emlen-embits))
+	if m[0] & ^topmask != 0 {
+		fail "seal: RSA PSS signature verification failed"
+	}
+	db := mgf1(h, hh, dblen)
+	for i := 0; i < dblen; i++ {
+		db[i] ^= m[i]
+	}
+	db[0] &= topmask
+	at := 0
+	for at < dblen && db[at] == 0 {
+		at++
+	}
+	if at == dblen || db[at] != 1 || (saltLen >= 0 && dblen-at-1 != saltLen) {
+		fail "seal: RSA PSS signature verification failed"
+	}
+	salt := db[at+1:]
+	mp := make([]u8, 8, 8+hlen+len(salt))
+	for _, x := range digest {
+		mp = append(mp, x)
+	}
+	for _, x := range salt {
+		mp = append(mp, x)
+	}
+	want := Sum(h, str(mp))
+	if !ConstantTimeEq(want, hh) {
+		fail "seal: RSA PSS signature verification failed"
+	}
+}

@@ -1,0 +1,102 @@
+// Runs the seal primitives over test vectors, one per input line (tools/ci/crypto_check.py):
+// "OP ARG..." (seal/open take KIND KEY NONCE AAD DATA) with byte arguments in hex ("-" for empty), printing one line per input: the
+// result in hex, "fault" or "ok"/"bad".
+package main
+
+import "mint"
+import "quarry"
+import "say"
+import "seal"
+import "twine"
+
+func hx(s str) []u8 {
+	if s == "-" {
+		return []u8{}
+	}
+	b, err := seal.HexDecode(s)
+	if err != nil {
+		panic("crypto_vectors: bad hex")
+	}
+	return b
+}
+
+func hash(name str) seal.Hash {
+	if name == "sha384" {
+		return seal.Hash.SHA384
+	}
+	if name == "sha512" {
+		return seal.Hash.SHA512
+	}
+	return seal.Hash.SHA256
+}
+
+func num(s str) i64 {
+	n, err := mint.Atoi(s)
+	if err != nil {
+		panic("crypto_vectors: bad number")
+	}
+	return n
+}
+
+func aead(kind str, key []u8) !seal.AEAD {
+	if kind == "chacha" {
+		return try seal.NewChaCha20Poly1305(key)
+	}
+	if kind == "aes" {
+		return try seal.NewAESGCM(key)
+	}
+	fail "unknown AEAD"
+}
+
+func run(f []str) str {
+	switch f[0] {
+	case "sha":
+		return seal.Hex(seal.Sum(hash(f[1]), str(hx(f[2]))))
+	case "hmac":
+		return seal.Hex(seal.Hmac(hash(f[1]), str(hx(f[2])), str(hx(f[3]))))
+	case "hkdf":
+		prk := seal.HkdfExtract(hash(f[1]), str(hx(f[3])), str(hx(f[2])))
+		okm := seal.HkdfExpand(hash(f[1]), str(prk), str(hx(f[4])), num(f[5])) catch _ {
+			return "fault"
+		}
+		return seal.Hex(okm)
+	case "p256ecdh":
+		shared := seal.P256ECDH(hx(f[1]), hx(f[2])) catch _ {
+			return "fault"
+		}
+		return seal.Hex(shared)
+	case "x25519":
+		shared := seal.X25519(hx(f[1]), hx(f[2])) catch _ {
+			return "fault"
+		}
+		return seal.Hex(shared)
+	case "seal", "open":
+		a := aead(f[1], hx(f[2])) catch _ {
+			return "fault"
+		}
+		if f[0] == "seal" {
+			out := a.Seal(hx(f[3]), hx(f[5]), hx(f[4])) catch _ {
+				return "fault"
+			}
+			return seal.Hex(out)
+		}
+		out := a.Open(hx(f[3]), hx(f[5]), hx(f[4])) catch _ {
+			return "fault"
+		}
+		return seal.Hex(out)
+	}
+	panic("crypto_vectors: unknown op")
+}
+
+func main() {
+	input := quarry.ReadStdin() catch e {
+		say.Line("stdin:", e)
+		return
+	}
+	for _, line := range twine.Split(input, "\n") {
+		if line == "" {
+			continue
+		}
+		say.Line(run(twine.Fields(line)))
+	}
+}
