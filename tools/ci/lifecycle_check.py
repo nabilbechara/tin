@@ -97,6 +97,73 @@ def run(exe, out, how):
     stopped(path.read_text(errors='replace'), how)
 
 
+def http(s, path):
+    s.sendall(('GET %s HTTP/1.1\r\nHost: x\r\n\r\n' % path).encode())
+
+
+def answer(s):
+    """Reads one response from s: (status, headers, body)."""
+    f = s.makefile('rb')
+    status = int(f.readline().split()[1])
+    headers = {}
+    while True:
+        h = f.readline()
+        if h in (b'\r\n', b''):
+            break
+        k, _, v = h.decode().partition(':')
+        headers[k.strip().lower()] = v.strip()
+    body = f.read(int(headers.get('content-length', '0')))
+    return status, headers, body
+
+
+def admission(out):
+    # A custom admission policy (#238): past two waiting requests on the core, new requests get
+    # 503 with Retry-After before their handler runs, the connection stays open, and requests
+    # are admitted again once the load drops.
+    exe = out / 'admit'
+    subprocess.run([str(ROOT / 'bin/tinc'), '-edition', '1', '-o', str(exe), 'tools/ci/fixtures/admit.tin'],
+                   cwd=ROOT, env=dict(os.environ, TIN_ROOT=str(ROOT)), check=True)
+    port = ws.free_port()
+    log = out / 'admit.out'
+    with log.open('wb') as stdout:
+        server = subprocess.Popen([str(exe)], stdout=stdout, stderr=subprocess.PIPE,
+                                  env=dict(os.environ, PORT=str(port), TIN_CORES='1'))
+    try:
+        eventually(lambda: server_ready(port, server))
+        conns = [socket.create_connection(('127.0.0.1', port), timeout=10) for _ in range(4)]
+        for s in conns:
+            http(s, '/slow')
+            time.sleep(0.05)
+        got = [answer(s) for s in conns]
+        assert [g[0] for g in got] == [200, 200, 503, 503], got
+        assert [g[2] for g in got] == [b'slow ok', b'slow ok', b'Service Unavailable', b'Service Unavailable'], got
+        assert got[2][1].get('retry-after') == '1' and got[3][1].get('retry-after') == '1', got
+        assert 'retry-after' not in got[0][1], got
+        # The refused connection stays open; with the load gone it is admitted again.
+        http(conns[2], '/fast')
+        status, _, body = answer(conns[2])
+        assert (status, body) == (200, b'fast ok'), (status, body)
+        for s in conns:
+            s.close()
+        # A second after the last refusal, an admitted request ends the overload.
+        time.sleep(1.1)
+        s = socket.create_connection(('127.0.0.1', port), timeout=10)
+        http(s, '/fast')
+        status, _, body = answer(s)
+        s.close()
+        assert (status, body) == (200, b'fast ok'), (status, body)
+        assert server.poll() is None, 'server exited'
+    finally:
+        server.terminate()
+        server.wait(timeout=5)
+    err = server.stderr.read().decode(errors='replace')
+    assert 'panic' not in err, err[-1000:]
+    events = [l for l in lines(log) if l in ('overload', 'recovered')]
+    assert events == ['overload', 'recovered'], (events, log.read_text())
+    print('admission: past the policy, requests get 503 with Retry-After and no handler; '
+          'the connection stays open; on server.overload and server.recovered run once each')
+
+
 def main():
     out = ROOT / 'bin/ci/lifecycle'
     out.mkdir(parents=True, exist_ok=True)
@@ -107,6 +174,7 @@ def main():
     startup_fails(exe, out, {'STORE_FAIL': '1'}, 'startup failed: use store: store unreachable')
     run(exe, out, 'SIGTERM')
     run(exe, out, 'anvil.Drain')
+    admission(out)
 
 
 if __name__ == '__main__':
