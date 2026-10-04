@@ -1,0 +1,38 @@
+package main
+
+// A detached task outlives the request that started it, so what it captures must already be
+// long-lived (#232): request memory is a compile error unless it was kept first, or the block
+// reads it only inside keep().
+
+import "say"
+
+mut flushed str = ""
+
+fn flush(s str) {
+	flushed = keep(flushed + s)
+}
+
+fn later(name str, n i64) {
+	let msg = "job {n}"
+	let kept = keep(msg)
+	detach {
+		flush(name) // a parameter: may be request memory
+	}
+	detach {
+		flush(msg) // made in this request's pool
+	}
+	detach {
+		flush(keep(msg)) // fine: read only inside keep()
+		flush(kept)      // fine: kept before the block
+		flush(flushed)   // fine: a global
+		say.Line(n)      // fine: not a reference
+	}
+	detach {
+		flush(keep(name))
+		flush(name) // also read as is
+	}
+}
+
+fn main() {
+	later("x", 1)
+}

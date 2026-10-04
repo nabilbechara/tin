@@ -144,6 +144,7 @@ fn rg_fn_pass(f, report) {
         rg_report = 1;
         rg_modrep = 0;
         rg_stmts(f[F_BODY][BLK_STMTS]);
+        rg_detach_check(f);
         rg_report = 0;
         if rg_sum[12] {
             rs_walk(f);
@@ -188,6 +189,7 @@ fn rg_stmt(s) {
     } else if k == ST_ASSIGN {
         let t = s[AS_TARGET];
         let v = rg_expr(s[AS_VALUE]);
+        rg_note_kept(t, v);
         let tk = t[N_KIND];
         if tk == EX_IDENT {
             rg_assign_sym(t[ID_REF], v, s[N_POS]);
@@ -617,9 +619,11 @@ fn rg_expr(e) {
         return x;
     }
     if k == EX_MEM && rg_cell_index(e) >= 0 {
+        rg_detach_read(rg_cell_index(e));
         return 0;
     }
     if k == EX_MEM && rg_cell_index(e[MEM_BASE]) >= 0 {
+        rg_detach_read(rg_cell_index(e[MEM_BASE]));
         if !has_ptr(e[N_TYPE]) {
             return 0;
         }
@@ -700,6 +704,82 @@ fn rg_expr(e) {
         return 0;
     }
     return 0;
+}
+
+// ---- detach captures only long-lived memory (#232) ----
+
+var rg_in_keep;     // evaluating keep()'s argument
+var rg_detach_raw;  // [detached closure, bits]: captures it reads other than inside keep()
+var rg_kept_bits;   // [variable a kept closure captures, what was stored into its cell]
+
+// rg_detach_read notes that the running function, when a detach block, reads its capture i.
+fn rg_detach_read(i) {
+    if rg_in_keep || !ck_detached || !vec_has(ck_detached, rg_fn) {
+        return;
+    }
+    if !rg_detach_raw {
+        rg_detach_raw = vec_new();
+    }
+    if i > 62 {
+        i = 62;
+    }
+    rg_merge(rg_detach_raw, rg_fn, 1 << i);
+}
+
+// rg_note_kept records what an assignment stores into the cell of a variable that a closure
+// which may be kept captures (reads of it go through the cell, so its bits are not tracked).
+fn rg_note_kept(t, v) {
+    if t[N_KIND] != EX_MEM || t[MEM_INDEX] || t[MEM_OFF] != 0 || t[MEM_BASE][N_KIND] != EX_IDENT || !t[MEM_BASE][ID_REF] {
+        return;
+    }
+    let os = t[MEM_BASE][ID_REF][S_CELL_OF];
+    if !os || !os[S_KEPT_CAP] {
+        return;
+    }
+    if !rg_kept_bits {
+        rg_kept_bits = vec_new();
+    }
+    rg_merge(rg_kept_bits, os, v);
+}
+
+// rg_capture_bits is what variable os of the running function (or its capture) may hold.
+fn rg_capture_bits(os) {
+    if os[S_CAPTURED] {
+        return rg_cell_bits(os[S_CAP_IDX]);
+    }
+    let b = os[S_REGION] | os[S_CAPBITS];
+    if rg_kept_bits {
+        b = b | rg_lookup(rg_kept_bits, os);
+    }
+    return b;
+}
+
+// rg_detach_check reports what a detach block in f captures that may hold request memory:
+// the detached task outlives the request, so the capture must be long-lived already
+// (keep() it first), unless the block reads it only inside keep() (design_semantics §6).
+fn rg_detach_check(f) {
+    let i = 0;
+    while ck_detached && i < ck_detached[VEC_LEN] {
+        let d = vec_get(ck_detached, i);
+        let caps = d[F_CAPTURES];
+        let raw = 0;
+        if rg_detach_raw {
+            raw = rg_lookup(rg_detach_raw, d);
+        }
+        let j = 0;
+        while d[F_PARENT] == f && caps && j < caps[VEC_LEN] {
+            let os = vec_get(caps, j);
+            let bit = 62;
+            if j < 62 {
+                bit = j;
+            }
+            if os && (raw & (1 << bit)) != 0 && has_ptr(os[S_TYPE]) && (rg_capture_bits(os) & RG_EMB) != 0 {
+                err_quoted(d[F_POS], "detach captures ", os[S_NAME], ", which may hold request memory, but the detached task outlives the request: keep() it before the block (let v = keep(...)), or read it in the block only inside keep()");
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
 }
 
 // ---- use after hearth.Reset() (#179) ----
@@ -914,6 +994,13 @@ fn rs_stmt(s) {
 }
 
 fn rg_call(e) {
+    if e[N_REGION] == R_OWNED && !rg_in_keep {
+        // keep(x): a detached block that reads a capture only in here uses a copy (#232).
+        rg_in_keep = 1;
+        let kb = rg_call(e);
+        rg_in_keep = 0;
+        return kb;
+    }
     let args = e[CALL_ARGS];
     let n = args[VEC_LEN];
     let b = vec_new();

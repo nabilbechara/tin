@@ -388,10 +388,21 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   through its handle does not fail the scope. In a server the event loop resumes children;
   in `main` the scope's end runs them itself. Spawned closures make their captured variables
   cells per spawn, so `for i in 0..n { let k = i; s.spawn(...) }` gives each child its own `k`.
+  A handle (`spawned`) and its scope cannot outlive the scope block, which frees the
+  children's records: the compiler keeps them in local variables and parameters (and local
+  slices, maps and optionals of them), never in a global, a field, a result, a type argument
+  or a `dyn` value; a value goes only into a variable declared inside its scope (an assignment,
+  a `mut` or scope argument, `append`, `copy`); a closure that may be kept, and `detach`, cannot
+  capture one; a child of scope `a` cannot capture a handle of a scope inside `a`; and a
+  `defer` inside a scope cannot use one. Any number of tasks may wait for one handle.
 - `detach { ... }` (#232) starts a task in the core's background boundary: it has its own pool,
   outlives the request that started it (its closure and captures are `keep`-copied to the
   long-lived heap), runs when the event loop turns, is cancelled by the drain with the rest of
   the core, and logs its fault (`detached task failed: ...`) instead of passing it on.
+  What it captures must already be long-lived, as for a global: a capture that may hold
+  request memory is a compile error naming it, unless the block reads it only inside `keep()`
+  (`detach { flush(keep(event)) }`); otherwise keep it first (`let e = keep(event)`). A task
+  handle or a scope cannot be captured at all.
 - `select { let x = l.Recv() => ...; t.wait() => ...; after(d) => ...; canceled() => ... }`
   (#232) checks its arms in source order, so ties go to the first one; with none ready it
   watches every source (lanes and task handles wake it), parks until one does or the earliest
