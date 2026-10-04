@@ -2471,6 +2471,8 @@ fn check_stmt(s) {
             err_at(s[N_POS], "go is not allowed: cores share nothing (run work per core with hearth, talk across cores with relay)");
         }
         lower_go(s);
+    } else if k == ST_ONCE {
+        lower_once(s);
     } else if k == ST_DEFER {
         lower_defer(s);
     } else if k == ST_BSTORE {
@@ -2534,6 +2536,29 @@ fn check_local_consts(stmt) {
         }
     }
     replace_node(stmt, empty_block(stmt[N_POS]));
+}
+
+// ---- once (#236) ----
+//
+// once { body } is if rt_once(N) { body }: the block runs the first time each core reaches it
+// (globals are per core, so this is the unit that matters; app-wide work is on app.start).
+
+var once_seq;
+
+fn lower_once(s) {
+    let pos = s[N_POS];
+    once_seq = once_seq + 1;
+    let c = node_new(EX_CALL, pos);
+    c[CALL_NAME] = "rt_once";
+    c[CALL_ARGS] = vec_new();
+    let n = node_new(EX_INT, pos);
+    n[INT_VAL] = once_seq;
+    vec_push(c[CALL_ARGS], n);
+    let ifs = node_new(ST_IF, pos);
+    ifs[IF_COND] = c;
+    ifs[IF_THEN] = s[BODY_BLOCK];
+    replace_node(s, ifs);
+    check_stmt(s);
 }
 
 // ---- defer ----
