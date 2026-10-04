@@ -910,6 +910,13 @@ Package stamp computes non-cryptographic hashes and checksums: FNV-1a, CRC-32 (I
 
 Package seal has cryptographic hashes (SHA-256, SHA-384, SHA-512, SHA-1), HMAC over any of the SHA-2 hashes, HKDF, PBKDF2-HMAC-SHA-256, constant-time comparison, secure random bytes, the hex and base64 encodings, and RSA-OAEP encryption with a public key.
 
+- `type AEAD struct`: AEAD is an authenticated cipher with its key (ChaCha20-Poly1305, later AES-GCM): Seal encrypts and appends a 16-byte tag, Open checks the tag in constant time and decrypts.
+- `NewChaCha20Poly1305(key secret []u8) !AEAD`: NewChaCha20Poly1305 is the RFC 8439 AEAD with a 32-byte key.
+- `(a AEAD) NonceSize() i64`: NonceSize is the nonce length in bytes (12).
+- `(a AEAD) Overhead() i64`: Overhead is the tag length in bytes (16).
+- `(a AEAD) Seal(nonce []u8, plaintext secret []u8, aad []u8) ![]u8`: Seal encrypts plaintext and authenticates it with aad under a 12-byte nonce, returning the ciphertext followed by the tag. A nonce must never be used twice with one key.
+- `(a AEAD) Open(nonce []u8, sealed []u8, aad []u8) ![]u8`: Open checks the tag of sealed (ciphertext then tag) against aad and the nonce and returns the plaintext; it fails, revealing nothing else, when anything was changed.
+- `ChaCha20(key secret []u8, nonce []u8, counter u32, data []u8) ![]u8`: ChaCha20 XORs data with the ChaCha20 keystream (RFC 8439) for a 32-byte key, a 12-byte nonce and the initial block counter.
 - `type Hash enum { SHA256, SHA384, SHA512 }`: Hash names a SHA-2 function for Hmac and HKDF.
 - `Sum(h Hash, s secret str) []u8`: Sum is the digest of s under h; s may be secret.
 - `Size(h Hash) i64`: Size is the length in bytes of h's digest.
@@ -942,6 +949,9 @@ Package seal has cryptographic hashes (SHA-256, SHA-384, SHA-512, SHA-1), HMAC o
 - `EncryptOAEPSha1(key RSAPublicKey, msg []u8) ![]u8`: EncryptOAEPSha1 encrypts msg for key with RSA-OAEP (SHA-1, MGF1-SHA-1, empty label), as MySQL's caching_sha2_password and sha256_password expect.
 - `Sha512(s secret str) []u8`: Sha512 is the SHA-512 digest of s (64 bytes); s may be secret.
 - `Sha384(s secret str) []u8`: Sha384 is the SHA-384 digest of s (48 bytes); s may be secret.
+- `X25519(scalar secret []u8, point []u8) ![]u8`: X25519 is the RFC 7748 function: the shared secret of a 32-byte private scalar and a peer's 32-byte public key. It fails for wrong lengths and when the result is all zeros (a low-order peer key), as TLS 1.3 requires. Constant-time in the scalar and the point.
+- `X25519NewPrivateKey() []u8`: X25519NewPrivateKey returns 32 random bytes to use as an X25519 private key.
+- `X25519PublicKey(priv secret []u8) ![]u8`: X25519PublicKey is the public key (32 bytes) of a 32-byte X25519 private key.
 
 ## herald
 

@@ -1,5 +1,5 @@
 // Runs the seal primitives over test vectors, one per input line (tools/ci/crypto_check.py):
-// "OP ARG..." with byte arguments in hex ("-" for empty), printing one line per input: the
+// "OP ARG..." (seal/open take KIND KEY NONCE AAD DATA) with byte arguments in hex ("-" for empty), printing one line per input: the
 // result in hex, "fault" or "ok"/"bad".
 package main
 
@@ -38,6 +38,13 @@ func num(s str) i64 {
 	return n
 }
 
+func aead(kind str, key []u8) !seal.AEAD {
+	if kind == "chacha" {
+		return try seal.NewChaCha20Poly1305(key)
+	}
+	fail "unknown AEAD"
+}
+
 func run(f []str) str {
 	switch f[0] {
 	case "sha":
@@ -55,6 +62,25 @@ func run(f []str) str {
 			return "fault"
 		}
 		return seal.Hex(shared)
+	case "x25519":
+		shared := seal.X25519(hx(f[1]), hx(f[2])) catch _ {
+			return "fault"
+		}
+		return seal.Hex(shared)
+	case "seal", "open":
+		a := aead(f[1], hx(f[2])) catch _ {
+			return "fault"
+		}
+		if f[0] == "seal" {
+			out := a.Seal(hx(f[3]), hx(f[5]), hx(f[4])) catch _ {
+				return "fault"
+			}
+			return seal.Hex(out)
+		}
+		out := a.Open(hx(f[3]), hx(f[5]), hx(f[4])) catch _ {
+			return "fault"
+		}
+		return seal.Hex(out)
 	}
 	panic("crypto_vectors: unknown op")
 }
