@@ -245,3 +245,21 @@ input, whereas the exact result, Tin and the previous libc parser return one.
 `tests/v2/number.tin` also checks compiler literal bits and deterministic outputs against
 `bench/ref/number_smoke`. The packed power table is regenerated entirely with Python
 integers by `tools/gen_number_powers.py`; the Go adaptations retain their BSD license.
+
+## Phase 2 implementation and validation
+
+`lib/runtime/memory.tin` supplies the seed-compatible mmap heap and memory primitives
+for the compiler and runtime. Size-class headers preserve ownership across cores;
+remote frees queue to the owner's page source. Individual large mappings are unmapped
+on free. The public ingot free API and its lifetime boundary are in `docs/RUNTIME.md`;
+no owner-retirement or long-lived reclamation policy is introduced. Bulk copy/fill
+leaves use NEON on arm64 and REP on amd64, with bounded word scans for equality and
+byte search. The saved-register task layout and swap routines stay unchanged.
+
+`memory_check.py` checks Go-identical outputs, all byte alignments, overlapping moves,
+guard pages, allocator zeroing/realloc and cross-core returns. It injects 46 process-wide
+allocation/mapping failures only behind `TIN_ALLOC_TEST=1`; `oom-mapping.tin` also
+checks a real Linux mapping failure under the regression runner's virtual-memory limit.
+`task_memory_check.py` holds 300 heavy requests concurrently, then checks pool/stack
+page release and the 64-task cache cap. RSS acceptance is Linux-only. The benchmark
+suite adds matching Tin/Go memory cases at 16 B, 1 KiB and 1 MiB.

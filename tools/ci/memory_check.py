@@ -29,7 +29,8 @@ def main():
         assert result.returncode == 0 and result.stdout == reference, result
         # Injection is process-wide and counts allocations/mappings, including startup.
         # It is enabled only by the explicit test flag; ordinary environments ignore it.
-        for after in range(41):
+        failures = list(range(41)) + [64, 128, 512, 1024, 4096]
+        for after in failures:
             result = subprocess.run([str(exe)], capture_output=True, timeout=10,
                 env=dict(env, TIN_ALLOC_TEST='1', TIN_FAIL_ALLOC_AFTER=str(after)), cwd=ROOT)
             assert result.returncode == 2, (after, result.returncode, result.stderr)
@@ -39,7 +40,7 @@ def main():
             env=dict(env, TIN_ALLOC_TEST='0', TIN_FAIL_ALLOC_AFTER='0'), cwd=ROOT)
         assert result.returncode == 0 and result.stdout == reference, result
         print('PASS memory: alignments, overlap, guard pages, zeroing, realloc, 1000 cross-core returns')
-        print('PASS #178: 41 deterministic allocation/mapping failures; test flag gates injection')
+        print(f'PASS #178: {len(failures)} deterministic allocation/mapping failures; test flag gates injection')
 
 
 if __name__ == '__main__':
