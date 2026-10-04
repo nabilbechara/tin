@@ -93,16 +93,29 @@ case $1 in
     }
     shift 2
     [ "$#" -gt 0 ] || { echo "tin: fix: no files" >&2; exit 2; }
+    # A file is rewritten only when its translation parses as edition 1 and translating it
+    # again changes nothing; otherwise it is left as it was and named (status 1 at the end).
+    status=0
     for f do
       [ -f "$f" ] || { echo "tin: fix: $f is not a file" >&2; exit 2; }
-      tmp=$(mktemp "$f.tinfix.XXXXXX")
+      tmp=$(mktemp "$f.tinfix.XXXXXX"); again=$(mktemp "$f.tinfix.XXXXXX")
       cp -p "$f" "$tmp"
       if ! "$tinc" -fix -edition 1 "$f" > "$tmp"; then
-        rm -f "$tmp"
-        exit 1
+        rm -f "$tmp" "$again"; status=1; continue
       fi
+      if ! "$tinc" -edition 1 -parse-only "$tmp" 2> "$again"; then
+        echo "tin: fix: $f left unchanged: its translation is not edition 1 yet:" >&2
+        sed "s|$tmp|$f (translated)|" "$again" >&2
+        rm -f "$tmp" "$again"; status=1; continue
+      fi
+      if ! "$tinc" -fix -edition 1 "$tmp" > "$again" || ! cmp -s "$tmp" "$again"; then
+        echo "tin: fix: $f left unchanged: translating it twice gives two results" >&2
+        rm -f "$tmp" "$again"; status=1; continue
+      fi
+      rm -f "$again"
       if cmp -s "$f" "$tmp"; then rm -f "$tmp"; else mv "$tmp" "$f"; fi
-    done ;;
+    done
+    exit $status ;;
   test)
     # tin test [-bench] [DIR]: build DIR's package with its *_test.tin files and a generated
     # runner, then run every TestXxx(t mut crucible.T) (and BenchmarkXxx with -bench).

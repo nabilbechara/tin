@@ -1116,7 +1116,7 @@ fn parse_enum_body(pos) {
         let first = fields[VEC_LEN];
         if p_is("(") {
             p_next();
-            if p_edition1 {
+            if p_edition1 && !enum_fields_named() {
                 let field_index = 0;
                 while !p_is(")") {
                     let ty = parse_type();
@@ -1171,6 +1171,35 @@ fn parse_enum_body(pos) {
     st[TX_A] = fields;
     st[TX_B] = variants;
     return st;
+}
+
+// enum_fields_named reports a variant whose fields have names (Circle(r f64), Rect(w, h f64)),
+// which edition 1 reads as edition 0 does: some field is a name followed by its type. Positional
+// fields (Failed(str, i64)) are types alone.
+fn enum_fields_named() {
+    let depth = 0;
+    let i = p_i;
+    while i + 1 < p_toks[VEC_LEN] {
+        let t = vec_get(p_toks, i);
+        if tok_is(t, "(") || tok_is(t, "[") {
+            depth = depth + 1;
+        } else if tok_is(t, ")") || tok_is(t, "]") {
+            if depth == 0 {
+                return 0;
+            }
+            depth = depth - 1;
+        } else if depth == 0 && t[T_KIND] == TK_IDENT {
+            let n = vec_get(p_toks, i + 1);
+            if n[T_KIND] == TK_IDENT || tok_is(n, "[") || tok_is(n, "?") || n[T_KIND] == TK_KEYWORD {
+                let prev = vec_get(p_toks, i - 1);
+                if tok_is(prev, "(") || tok_is(prev, ",") {
+                    return 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
 }
 
 fn enum_field_name(variant, index) {
@@ -1699,7 +1728,7 @@ fn parse_binding(pos, is_mut) {
         p_next();
         l[LET_INIT] = parse_catch(parse_expr(1));
     } else if !is_mut {
-        p_fail(pos, "let needs an initializer");
+        p_fail_code(pos, "E020 UNEXPECTED", "expected '=': a let needs a value (a mut without one starts at its zero value)");
     }
     l[LET_MUT] = is_mut;
     p_end();
@@ -2716,7 +2745,8 @@ fn composite_requires_keys(tyexpr) {
         return 1;
     }
     let t = tyexpr[TYX];
-    return t[N_KIND] == TX_STRUCT;
+    // A bare {...} element takes its type from the composite around it: unknown here.
+    return t != 0 && t[N_KIND] == TX_STRUCT;
 }
 
 // parse_elem reads a composite element; a bare {...} takes its type from the context.
@@ -3059,6 +3089,7 @@ fn print_edition1(file, source, toks) {
     fx_span = vec_filled(toks[VEC_LEN], 0);
     fx_triv = vec_filled(toks[VEC_LEN], 0);
     fx_lead = vec_filled(toks[VEC_LEN], 0);
+    fx_ind = vec_filled(toks[VEC_LEN], 0);
     fx_hoisted = vec_new();
     fx_rep = replacements;
     fx_pre = prefixes;
@@ -3097,13 +3128,11 @@ fn print_edition1(file, source, toks) {
         } else if fx_kw(t, "if") {
             rewrite_if_init(source, toks, i, replacements, prefixes, suffixes);
         } else if fx_kw(t, "const") && depth > 0 {
-            rewrite_local_const(source, toks, i, top, replacements);
+            rewrite_local_const(source, toks, i, top, replacements, depth);
         } else if fx_kw(t, "const") && depth == 0 {
             rewrite_const_group(source, toks, i);
         } else if tok_is(t, "@") && depth > 0 {
             rewrite_field_attr(source, toks, i);
-        } else if t[T_KIND] == TK_IDENT && streq(t[T_TEXT], "enum") && !fx_reserved(toks, i) {
-            rewrite_enum_fields(source, toks, i, replacements);
         } else if t[T_KIND] == TK_IDENT && streq(t[T_TEXT], "tide") && !replacements[VEC_DATA][i] {
             rewrite_tide_unit(toks, i, replacements);
         } else if fx_reserved(toks, i) && !replacements[VEC_DATA][i] {
@@ -3157,14 +3186,16 @@ fn print_edition1(file, source, toks) {
             i = i + 1;
             continue;
         }
+        fx_cur_ind = fx_ind[VEC_DATA][i];
         if fx_triv[VEC_DATA][i] {
-            buf_str(out, fx_triv[VEC_DATA][i]);
+            fx_put(out, fx_triv[VEC_DATA][i], strlen(fx_triv[VEC_DATA][i]));
             if fx_lead[VEC_DATA][i] {
                 buf_str(out, fx_lead[VEC_DATA][i]);
             }
         } else {
             fx_copy_trivia(out, source, cursor, t[T_START], fx_lead[VEC_DATA][i]);
         }
+        fx_cur_ind = 0;
         if prefixes[VEC_DATA][i] {
             buf_str(out, prefixes[VEC_DATA][i]);
         }
@@ -3189,8 +3220,14 @@ fn print_edition1(file, source, toks) {
             replacement = "=";
         } else if !replacement && t[T_KIND] == TK_PUNCT && streq(t[T_TEXT], "++") {
             replacement = "+= 1";
+            if t[T_START] == cursor {
+                replacement = " += 1";
+            }
         } else if !replacement && t[T_KIND] == TK_PUNCT && streq(t[T_TEXT], "--") {
             replacement = "-= 1";
+            if t[T_START] == cursor {
+                replacement = " -= 1";
+            }
         }
         if deletes[VEC_DATA][i] {
             // The original token span is omitted; its surrounding trivia remains in source.
@@ -3383,34 +3420,54 @@ fn rewrite_for_fallback(source, toks, for_at, replacements, deletes, prefixes, s
             return 0;
         }
     }
+    let find = source_indent(source, vec_get(toks, for_at));
     if has_init {
-        replacements[VEC_DATA][for_at] = "{\n";
+        replacements[VEC_DATA][for_at] = str_cat3("{\n", find, "\t");
+        fx_triv[VEC_DATA][init_start] = "";
         if init_start + 1 <= init_end && tok_is(vec_get(toks, init_start + 1), ":=") {
             prefixes[VEC_DATA][init_start] = "mut ";
             replacements[VEC_DATA][init_start + 1] = "=";
         }
-        replacements[VEC_DATA][semi1] = "\nfor ";
-        suffixes[VEC_DATA][body_close] = "\n}";
+        replacements[VEC_DATA][semi1] = str_cat3("\n", find, "\tfor ");
+        fx_triv[VEC_DATA][cond_start] = "";
+        suffixes[VEC_DATA][body_close] = str_cat3("\n", find, "}");
+        fx_nest(body, body_close);
     } else if has_cond {
-        replacements[VEC_DATA][semi1] = " ";
+        replacements[VEC_DATA][semi1] = "";
+        fx_triv[VEC_DATA][cond_start] = "";
     } else {
         replacements[VEC_DATA][semi1] = "true";
     }
     deletes[VEC_DATA][semi2] = 1;
+    fx_triv[VEC_DATA][semi2] = "";
+    fx_triv[VEC_DATA][body] = " ";
+    let extra = "";
+    if has_init {
+        extra = "\t";
+    }
     if has_post {
         i = post_start;
         while i <= post_end {
             deletes[VEC_DATA][i] = 1;
+            fx_triv[VEC_DATA][i] = "";
             i = i + 1
         }
         if has_cond {
             let close_token = vec_get(toks, body_close);
             let indent = source_indent(source, close_token);
             let b = buf_new();
-            buf_byte(b, '\n');
+            if source_has_newline(source, vec_get(toks, fx_prev(toks, body_close))[T_END], close_token[T_START]) {
+                buf_byte(b, '\t');
+            } else {
+                buf_byte(b, '\n');
+                buf_str(b, indent);
+                buf_str(b, extra);
+                buf_byte(b, '\t');
+            }
             buf_str(b, post);
             buf_byte(b, '\n');
             buf_str(b, indent);
+            buf_str(b, extra);
             prefixes[VEC_DATA][body_close] = str_slice(b[VEC_DATA], b[VEC_LEN]);
             i = body + 1;
             while i < body_close {
@@ -3424,6 +3481,7 @@ fn rewrite_for_fallback(source, toks, for_at, replacements, deletes, prefixes, s
                         buf_str(before, post);
                         buf_byte(before, '\n');
                         buf_str(before, ind);
+                        buf_str(before, extra);
                         prefixes[VEC_DATA][i] = str_slice(before[VEC_DATA], before[VEC_LEN]);
                     }
                 }
@@ -3552,6 +3610,7 @@ fn rewrite_switch(source, toks, switch_at, replacements, deletes, prefixes, suff
             j = j + 1;
         }
         if colon < 0 { return 0; }
+        fx_triv[VEC_DATA][fx_next(toks, at)] = "";
         if is_default {
             replacements[VEC_DATA][at] = "_";
             replacements[VEC_DATA][colon] = " => {";
@@ -3583,7 +3642,7 @@ fn rewrite_switch(source, toks, switch_at, replacements, deletes, prefixes, suff
             deletes[VEC_DATA][at] = 1;
             replacements[VEC_DATA][colon] = " => {";
         }
-        if i > 0 { prefixes[VEC_DATA][at] = "} "; }
+        if i > 0 { prefixes[VEC_DATA][at] = fx_arm_close(source, toks, at, "}\n", "\t"); }
         // Unlabelled breaks leave the switch in Go; each match arm already ends at its block.
         j = colon + 1;
         while j < next {
@@ -3599,7 +3658,9 @@ fn rewrite_switch(source, toks, switch_at, replacements, deletes, prefixes, suff
         }
         i = i + 1;
     }
-    prefixes[VEC_DATA][close] = "}";
+    // match arms sit one level deeper than the switch's cases did
+    fx_nest(body, close - 1);
+    prefixes[VEC_DATA][close] = fx_arm_close(source, toks, close, "\t}\n", "");
     if semi[0] >= 0 {
         rewrite_init(source, toks, switch_at, semi[0], close, "match");
     }
@@ -3683,6 +3744,20 @@ fn rewrite_for_range(toks, for_at, replacements, deletes, prefixes, suffixes) {
         return 0;
     }
     if step_start >= 0 && step_start >= body { return 0; }
+    // A range evaluates its bound once and owns its variable: the C loop's shape converts
+    // only when the body changes neither (else the fallback keeps the loop's meaning).
+    let close = matching_brace(toks, body);
+    if close < 0 || fx_assigns(toks, body, close, init_name[T_TEXT]) {
+        return 0;
+    }
+    let b = cond_op_at + 1;
+    while b < semi2 {
+        let bt = vec_get(toks, b);
+        if bt[T_KIND] == TK_IDENT && fx_assigns(toks, body, close, bt[T_TEXT]) {
+            return 0;
+        }
+        b = b + 1;
+    }
     replacements[VEC_DATA][init_op_at] = "in";
     replacements[VEC_DATA][semi1] = "..";
     deletes[VEC_DATA][cond_name_at] = 1;
@@ -3784,6 +3859,8 @@ fn token_has_initializer(toks, start) {
 var fx_span;  // fx_span[i] = j + 1: tokens i..j print as token i's replacement alone (0: none)
 var fx_triv;  // the trivia printed before token i instead of the source's (0: keep it)
 var fx_lead;  // text put into the trivia before token i, after its last blank line
+var fx_ind;   // tabs added after each newline in the trivia before token i (a block now nested)
+var fx_cur_ind; // fx_ind of the token whose trivia is being printed
 var fx_hoisted; // [name, text] of the local constants already hoisted
 var fx_fn_name; // the name of the function being printed (prefixes a clashing local constant)
 var fx_rep;   // the printer's replacements, prefixes and suffixes (print_edition1)
@@ -3890,6 +3967,7 @@ fn rewrite_init(source, toks, kw, semi, end, word) {
     fx_triv[VEC_DATA][fx_next(toks, kw)] = "";
     fx_rep[VEC_DATA][semi] = str_cat3("\n", ind, str_cat3("\t", word, ""));
     fx_add(fx_suf, end, str_cat3("\n", ind, "}"));
+    fx_nest(semi, end);
 }
 
 fn rewrite_if_init(source, toks, at, replacements, prefixes, suffixes) {
@@ -3966,93 +4044,18 @@ fn rewrite_for_each(source, toks, for_at, replacements, suffixes) {
     return 1;
 }
 
-// rewrite_enum_fields drops the field names of enum variants: edition 1 writes
-// Rect(f64, f64) where edition 0 wrote Rect(w, h f64) (fields are positional either way).
-fn rewrite_enum_fields(source, toks, enum_at, replacements) {
-    let open = fx_next(toks, enum_at);
-    if open >= toks[VEC_LEN] || !tok_is(vec_get(toks, open), "{") {
-        return 0;
-    }
-    let close = matching_brace(toks, open);
-    if close < 0 {
-        return 0;
-    }
-    let i = open + 1;
-    while i < close {
-        let t = vec_get(toks, i);
-        if tok_is(t, "(") {
-            let end = i;
-            let depth = 0;
-            while end < close {
-                let c = vec_get(toks, end);
-                if fx_open(c) {
-                    depth = depth + 1;
-                } else if fx_close(c) {
-                    depth = depth - 1;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                end = end + 1;
-            }
-            let types = buf_new();
-            let pending = 0;
-            let seg = fx_next(toks, i);
-            while seg < end {
-                // a segment runs to the next ',' at this level
-                let stop = seg;
-                let d = 0;
-                while stop < end {
-                    let c = vec_get(toks, stop);
-                    if fx_open(c) {
-                        d = d + 1;
-                    } else if fx_close(c) {
-                        d = d - 1;
-                    } else if d == 0 && tok_is(c, ",") {
-                        break;
-                    }
-                    stop = stop + 1;
-                }
-                let last = fx_prev(toks, stop);
-                if last == seg {
-                    pending = pending + 1;
-                } else {
-                    let ty = fx_text(source, toks, fx_next(toks, seg), last);
-                    let n = pending + 1;
-                    while n > 0 {
-                        if types[VEC_LEN] > 0 {
-                            buf_str(types, ", ");
-                        }
-                        buf_str(types, ty);
-                        n = n - 1;
-                    }
-                    pending = 0;
-                }
-                if stop >= end {
-                    break;
-                }
-                seg = fx_next(toks, stop);
-            }
-            if pending > 0 || types[VEC_LEN] == 0 {
-                return 0;
-            }
-            let first = fx_next(toks, i);
-            replacements[VEC_DATA][first] = str_slice(types[VEC_DATA], types[VEC_LEN]);
-            fx_span[VEC_DATA][first] = end;
-            i = end;
-        }
-        i = i + 1;
-    }
-    return 1;
-}
-
 // rewrite_local_const hoists `const name = value` out of a function to package level,
 // where edition 1 allows constants (a constant there compiles exactly as one inside). The
 // declaration goes before the top-level declaration holding it; a name already declared
-// at package level, or hoisted with another value, is left for the check to report.
-fn rewrite_local_const(source, toks, at, top, replacements) {
+// at package level, or hoisted with another value, gets the function's name in front.
+// Only a single-name constant in the function's own block moves: one in a nested block
+// may shadow a name the hoisted one would hide, so it stays, and edition 1 reports it.
+fn rewrite_local_const(source, toks, at, top, replacements, level) {
     let name = fx_next(toks, at);
-    if name >= toks[VEC_LEN] || vec_get(toks, name)[T_KIND] != TK_IDENT {
+    if level != 1 || name >= toks[VEC_LEN] || vec_get(toks, name)[T_KIND] != TK_IDENT {
+        return 0;
+    }
+    if tok_is(vec_get(toks, fx_next(toks, name)), ",") {
         return 0;
     }
     // the statement ends at the first semicolon outside brackets
@@ -4075,9 +4078,13 @@ fn rewrite_local_const(source, toks, at, top, replacements) {
         i = i + 1;
     }
     let nm = vec_get(toks, name)[T_TEXT];
+    if streq(nm, "_") {
+        fx_drop_statement(source, toks, at, last, replacements);
+        return 1;
+    }
     let rest = "";
     if fx_next(toks, name) <= last {
-        rest = fx_text(source, toks, fx_next(toks, name), last);
+        rest = fx_value_text(source, toks, fx_next(toks, name), last);
     }
     // the hoisted name: the same one unless the package level already has it, or another
     // function hoisted it with another value; then the function's name prefixes it
@@ -4116,6 +4123,31 @@ fn rewrite_local_const(source, toks, at, top, replacements) {
     fx_add(fx_lead, top, str_cat3("const ", new, str_cat3(" ", rest, "\n\n")));
     fx_drop_statement(source, toks, at, last, replacements);
     return 1;
+}
+
+// fx_value_text is the source of tokens a..b as it reads at package level: names renamed
+// so far (an earlier hoisted constant, a reserved word) are written with their new names.
+fn fx_value_text(source, toks, a, b) {
+    let out = buf_new();
+    let cursor = vec_get(toks, a)[T_START];
+    let i = a;
+    while i <= b {
+        let t = vec_get(toks, i);
+        if !t[T_SYNTH] {
+            buf_bytes(out, source + cursor, t[T_START] - cursor);
+            let p = fx_prev(toks, i);
+            if fx_rep[VEC_DATA][i] {
+                buf_str(out, fx_rep[VEC_DATA][i]);
+            } else if t[T_KIND] == TK_IDENT && (p < 0 || !tok_is(vec_get(toks, p), ".")) {
+                buf_str(out, fx_renamed(t[T_TEXT]));
+            } else {
+                buf_bytes(out, source + t[T_START], t[T_END] - t[T_START]);
+            }
+            cursor = t[T_END];
+        }
+        i = i + 1;
+    }
+    return str_slice(out[VEC_DATA], out[VEC_LEN]);
 }
 
 // fx_drop_statement removes tokens a..b and the line they stood on.
@@ -4279,6 +4311,7 @@ fn fx_copy_comments(out, source, a, b) {
                 let d = load8(source + i);
                 buf_byte(out, d);
                 if d == '\n' {
+                    fx_put_tabs(out);
                     buf_bytes(out, ind[VEC_DATA], ind[VEC_LEN]);
                     // skip the comment line's own indentation and a leading '*'
                     i = i + 1;
@@ -4289,9 +4322,15 @@ fn fx_copy_comments(out, source, a, b) {
                     if i < b && load8(source + i) == '*' && !(i + 1 < b && load8(source + i + 1) == '/') {
                         i = i + 1;
                     }
+                    if i < b && load8(source + i) != ' ' && load8(source + i) != '\n' && !(load8(source + i) == '*' && i + 1 < b && load8(source + i + 1) == '/') {
+                        buf_byte(out, ' ');
+                    }
                     continue;
                 }
                 i = i + 1;
+            }
+            while out[VEC_LEN] > 0 && (load8(out[VEC_DATA] + out[VEC_LEN] - 1) == ' ' || load8(out[VEC_DATA] + out[VEC_LEN] - 1) == '\t') {
+                out[VEC_LEN] = out[VEC_LEN] - 1;
             }
             i = i + 2;
             // code after the comment on the same line goes to a line of its own
@@ -4301,11 +4340,15 @@ fn fx_copy_comments(out, source, a, b) {
             }
             if j >= b || load8(source + j) != '\n' {
                 buf_byte(out, '\n');
+                fx_put_tabs(out);
                 buf_bytes(out, ind[VEC_DATA], ind[VEC_LEN]);
                 i = j;
             }
         } else {
             buf_byte(out, c);
+            if c == '\n' && i + 1 < b && load8(source + i + 1) != '\n' {
+                fx_put_tabs(out);
+            }
             i = i + 1;
         }
     }
@@ -4334,10 +4377,12 @@ fn fx_reserved(toks, i) {
 // rewrite_field_attr moves a struct field's trailing attribute (`Name str @json("n")`)
 // before the field, where edition 1 writes it (`@json("n") Name str`).
 fn rewrite_field_attr(source, toks, at) {
-    let prev = fx_prev(toks, at);
-    if prev < 0 || tok_is(vec_get(toks, prev), "{") || tok_is(vec_get(toks, prev), ";") || tok_is(vec_get(toks, prev), "(") {
+    // An attribute that starts its line (edition 1's place, after a synthetic ';') stays.
+    let raw = at - 1;
+    if raw < 0 || tok_is(vec_get(toks, raw), "{") || tok_is(vec_get(toks, raw), ";") || tok_is(vec_get(toks, raw), "(") {
         return 0;
     }
+    let prev = fx_prev(toks, at);
     let name = fx_next(toks, at);
     let last = name;
     let open = fx_next(toks, name);
@@ -4422,7 +4467,19 @@ fn rewrite_const_group(source, toks, at) {
             i = fx_next(toks, end);
             continue;
         }
-        // trivia before the spec, one level less indented
+        // trivia before the spec, one level less indented; the first starts the declaration
+        if index == 0 {
+            let q = cursor;
+            while q < vec_get(toks, i)[T_START] && (load8(source + q) == ' ' || load8(source + q) == '\t') {
+                q = q + 1;
+            }
+            if load8(source + q) == '\n' {
+                cursor = q + 1;
+                if load8(source + cursor) == '\t' {
+                    cursor = cursor + 1;
+                }
+            }
+        }
         fx_copy_dedent(out, source, cursor, vec_get(toks, i)[T_START]);
         let name = vec_get(toks, i);
         buf_str(out, "const ");
@@ -4459,6 +4516,9 @@ fn rewrite_const_group(source, toks, at) {
         i = fx_next(toks, end);
     }
     fx_copy_dedent(out, source, cursor, vec_get(toks, close)[T_START]);
+    while out[VEC_LEN] > 0 && (load8(out[VEC_DATA] + out[VEC_LEN] - 1) == '\n' || load8(out[VEC_DATA] + out[VEC_LEN] - 1) == ' ' || load8(out[VEC_DATA] + out[VEC_LEN] - 1) == '\t') {
+        out[VEC_LEN] = out[VEC_LEN] - 1;
+    }
     fx_rep[VEC_DATA][at] = str_slice(out[VEC_DATA], out[VEC_LEN]);
     fx_span[VEC_DATA][at] = close + 1;
     return 1;
@@ -4479,7 +4539,7 @@ fn fx_copy_dedent(out, source, a, b) {
 
 // fx_renamed is a name as the translator prints it: reserved words get a trailing '_'.
 fn fx_renamed(name) {
-    if streq(name, "match") || streq(name, "within") || streq(name, "limit") || streq(name, "guard") || streq(name, "parallel") || streq(name, "detach") || streq(name, "secret") {
+    if streq(name, "match") || streq(name, "within") || streq(name, "limit") || streq(name, "guard") || streq(name, "parallel") || streq(name, "detach") || streq(name, "secret") || streq(name, "shared") || streq(name, "enum") {
         return str_cat3(name, "_", "");
     }
     return name;
@@ -4527,4 +4587,83 @@ fn matching_paren(toks, open) {
         i = i + 1;
     }
     return toks[VEC_LEN] - 1;
+}
+
+// fx_assigns reports a change to name between tokens a and b: an assignment or increment
+// (name = ..., name += ..., name++), or name passed as mut.
+fn fx_assigns(toks, a, b, name) {
+    let i = a;
+    while i < b {
+        let t = vec_get(toks, i);
+        if t[T_KIND] == TK_IDENT && streq(t[T_TEXT], name) {
+            let p = fx_prev(toks, i);
+            let pt = 0;
+            if p >= 0 {
+                pt = vec_get(toks, p);
+            }
+            if pt && tok_is(pt, "mut") {
+                return 1;
+            }
+            if !pt || !tok_is(pt, ".") {
+                let n = fx_next(toks, i);
+                if n < toks[VEC_LEN] {
+                    let op = vec_get(toks, n);
+                    if tok_is(op, "=") || tok_is(op, ":=") || tok_is(op, "++") || tok_is(op, "--") || tok_is(op, "+=") || tok_is(op, "-=") || tok_is(op, "*=") || tok_is(op, "/=") || tok_is(op, "%=") || tok_is(op, "&=") || tok_is(op, "|=") || tok_is(op, "^=") || tok_is(op, "<<=") || tok_is(op, ">>=") {
+                        return 1;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// fx_put writes n bytes of trivia, adding fx_cur_ind tabs after each newline that does not
+// end an empty line.
+fn fx_put(out, p, n) {
+    let i = 0;
+    while i < n {
+        let c = load8(p + i);
+        buf_byte(out, c);
+        if c == '\n' && i + 1 < n && load8(p + i + 1) != '\n' {
+            fx_put_tabs(out);
+        }
+        i = i + 1;
+    }
+}
+
+// fx_arm_close is the text that closes a match arm before token at: on a line of its own when
+// the token starts a line, else "} ".
+fn fx_arm_close(source, toks, at, head, tail) {
+    let t = vec_get(toks, at);
+    if source_has_newline(source, vec_get(toks, fx_prev(toks, at))[T_END], t[T_START]) {
+        return str_cat3(head, source_indent(source, t), tail);
+    }
+    return "} ";
+}
+
+fn source_has_newline(source, a, b) {
+    while a < b {
+        if load8(source + a) == '\n' { return 1; }
+        a = a + 1;
+    }
+    return 0;
+}
+
+fn fx_put_tabs(out) {
+    let k = 0;
+    while k < fx_cur_ind {
+        buf_byte(out, '\t');
+        k = k + 1;
+    }
+}
+
+// fx_nest marks tokens a+1..b as one block deeper than in the source.
+fn fx_nest(a, b) {
+    let i = a + 1;
+    while i <= b && i < fx_ind[VEC_LEN] {
+        fx_ind[VEC_DATA][i] = fx_ind[VEC_DATA][i] + 1;
+        i = i + 1;
+    }
 }
