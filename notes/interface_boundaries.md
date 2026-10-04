@@ -274,6 +274,8 @@ The context block has spare words 12–31 (`ctxWords` stays 32; global offsets d
   current boundary's chain (value at word 2), or 0 when unbound (the language makes that a
   fault). Bindings vanish with their boundary; a value must be valid for the boundary's region,
   which the region checker proves (design_foundations §4).
+- Refined by `notes/interface_policy.md` §4 (#237): the key is the address of a
+  `policy.Slot[T]` object, and the value word is a reference to a cell holding the value.
 
 ---
 
