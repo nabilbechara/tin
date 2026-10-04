@@ -336,3 +336,8 @@ and compiler root discovery/path traversal compare exact behavior. Darwin keeps 
 existing libSystem OS/thread/DNS layer; shared memory/number/calendar/errno code stays
 seed-compatible. Pthreads, libc environment/auxv and dynamic ELF remain until phase 5.
 
+
+Darwin development compatibility: errno 107 is unknown on macOS 15.0.1 but is
+"Capabilities insufficient" on the current macos-15 runner. The fixed Darwin table
+keeps codes 0..106; newer/unknown codes retain libSystem spelling. Linux error text
+remains entirely Tin. The exact C comparison covers both development OS releases.
