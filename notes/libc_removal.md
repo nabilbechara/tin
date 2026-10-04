@@ -263,3 +263,13 @@ checks a real Linux mapping failure under the regression runner's virtual-memory
 `task_memory_check.py` holds 300 heavy requests concurrently, then checks pool/stack
 page release and the 64-task cache cap. RSS acceptance is Linux-only. The benchmark
 suite adds matching Tin/Go memory cases at 16 B, 1 KiB and 1 MiB.
+
+Phase 2 performance repair: the first native Linux comparison missed the CPU gate in
+fannkuch, strbuild and the three memory microbenchmarks; its required rerun is retained.
+The seed-compatible Tin bodies now have bounded SSE2/NEON leaf replacements in both
+backends. Short copies load the complete range before storing (including overlapping
+memmove); 64-byte scans identify the first differing/matching byte. Guard-page tests now
+include copy/fill/scan lengths through 259 and overlap distances through 127 at lengths
+through 257. Machine code is reproducible from the checked-in relocation-free assembly
+with `python3 tools/gen_memory_fast.py --check`. No task swap or saved-register layout
+changes are involved.
