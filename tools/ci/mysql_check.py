@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """The mysql client inside anvil: queries with bound values, a per-core pool whose waiters
-overlap on one core, deadlines that drop the connection, concurrent inserts, both auth
+overlap on one core, deadlines that drop the connection, a statement inside within blocks
+(#233, edition 1 fixture mysql_within.tin), concurrent inserts, both auth
 plugins (caching_sha2_password with the RSA exchange, and an auth switch to
 mysql_native_password), wrong passwords, and reconnecting after the server drops idle
 connections. Runs against a small MySQL server written here (MYSQL_ADDR=host:port with
@@ -347,6 +348,34 @@ class Server:
         self.p.wait(timeout=10)
 
 
+def within(out, env, failures):
+    """A statement inside within 50ms against a slow server fails with fault.DeadlineExceeded
+    after about 50 ms, nested blocks take the earlier deadline, and task.Deadline reads the
+    request's and the block's deadlines (#233; edition 1 fixture mysql_within.tin)."""
+    exe = out / 'mysql_within'
+    subprocess.run([str(ROOT / 'bin/tinc'), '-edition', '1', '-o', str(exe), 'tools/ci/fixtures/mysql_within.tin'],
+                   cwd=ROOT, check=True, env=dict(os.environ, TIN_ROOT=str(ROOT)))
+    srv = Server(exe, dict(env, TIN_DEADLINE_MS='5000'), 1)
+    try:
+        code, body, _ = srv.get('/request')
+        print('task.Deadline in a request: %r ms left of TIN_DEADLINE_MS=5000' % body)
+        if code != 200 or not 4500 < int(body) <= 5000:
+            failures.append('request deadline: %d %r' % (code, body))
+        for _ in range(3):
+            code, body, dt = srv.get('/within?ms=50')
+            print('3 s statement within 50ms: %d %r in %.3f s' % (code, body, dt))
+            m = re.fullmatch(rb'deadline exceeded; true; deadline (\d+) ms; took (\d+) ms; after ok', body)
+            if code != 200 or not m or int(m[1]) not in (50, 51) or not 45 <= int(m[2]) < 500 or dt > 1.5:
+                failures.append('within 50ms: %d %r %.3f' % (code, body, dt))
+        code, body, dt = srv.get('/nested')
+        print('3 s statement within 10s within 50ms: %d %r in %.3f s' % (code, body, dt))
+        m = re.fullmatch(rb'deadline exceeded; true; took (\d+) ms', body)
+        if code != 200 or not m or not 45 <= int(m[1]) < 500 or dt > 1.5:
+            failures.append('nested within: %d %r %.3f' % (code, body, dt))
+    finally:
+        srv.stop()
+
+
 def main():
     out = ROOT / 'bin/ci/mysql'
     out.mkdir(parents=True, exist_ok=True)
@@ -404,6 +433,8 @@ def main():
                 failures.append('no reconnect: %r' % codes)
     finally:
         srv.stop()
+
+    within(out, env, failures)
 
     # The load checks that every insert lands, not how fast a shared runner's MySQL is: against a
     # real server a disk flush can hold a few inserts past the 1 s deadline (#133), so it gets

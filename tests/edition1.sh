@@ -33,7 +33,9 @@ fi
 # "msg" passes fault.Wrap(err, msg) upward (#229).
 # deadlines stop waits, nest, and leave the enclosing block alone (#230, #233); try E wrap
 # "msg" passes fault.Wrap(err, msg) upward (#229).
-for name in boundaries fault_wrap once polls
+# task.Deadline and task.Canceled read the innermost boundary; nested within takes the
+# earlier deadline (#233).
+for name in boundaries fault_wrap once polls deadlines
 do
 	polls=
 	[ "$name" != polls ] || polls=-polls
@@ -54,6 +56,17 @@ fi
 if ! cmp -s tests/edition1/fault_wrap_bad.err "$tmp/fault_wrap_bad.err"; then
 	echo "FAIL edition1/fault_wrap_bad: diagnostic mismatch"
 	diff -u tests/edition1/fault_wrap_bad.err "$tmp/fault_wrap_bad.err" || true
+	exit 1
+fi
+
+# A call that can fail as a boundary block's last expression needs try or catch (#233).
+if "$compiler" -edition 1 -o "$tmp/boundary_fault_bad" tests/edition1/boundary_fault_bad.tin >"$tmp/boundary_fault_bad.out" 2>"$tmp/boundary_fault_bad.err"; then
+	echo "FAIL edition1/boundary_fault_bad: unexpectedly accepted"
+	exit 1
+fi
+if ! cmp -s tests/edition1/boundary_fault_bad.err "$tmp/boundary_fault_bad.err"; then
+	echo "FAIL edition1/boundary_fault_bad: diagnostic mismatch"
+	diff -u tests/edition1/boundary_fault_bad.err "$tmp/boundary_fault_bad.err" || true
 	exit 1
 fi
 
