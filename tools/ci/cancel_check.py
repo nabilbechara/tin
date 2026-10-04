@@ -112,6 +112,13 @@ def checks(port, fifo):
                 b'again: canceled: test reason 25')
     print('down: a cancelled request cancels its blocks; its next wait fails at once')
 
+    # Explicit cancellation also stops code which never reaches another wait.
+    start = time.monotonic()
+    assert response(request(port, "/cpu-cancel", timeout=5))[0] == 500
+    assert time.monotonic() - start < 1
+    assert response(request(port, "/plain")) == (200, b"plain ok")
+    print("CPU cancel: a self-cancelled spin unwinds; the server keeps serving")
+
     # A block deadline: the earlier deadline wins and is a deadline, not a cancel.
     status, body = response(request(port, '/within', timeout=10))
     assert status == 200, (status, body)
@@ -166,7 +173,7 @@ def main():
         with (directory / 'lib/tide/tide.tin').open('a') as f:
             f.write('\n' + (fixtures / 'cancel_probe.tin').read_text())
         exe = directory / 'server'
-        subprocess.run([str(ROOT / 'bin/tinc'), '-o', str(exe), str(fixtures / 'cancel.tin')],
+        subprocess.run([str(ROOT / 'bin/tinc'), '-polls', '-o', str(exe), str(fixtures / 'cancel.tin')],
                        cwd=ROOT, env=dict(os.environ, TIN_ROOT=str(directory)), check=True)
         fifo = directory / 'fifo'
         os.mkfifo(fifo)
@@ -190,6 +197,10 @@ def main():
                 except subprocess.TimeoutExpired:
                     server.kill()
                     server.wait()
+
+    log = (out / "server.log").read_text()
+    assert log.count("cpu cancel deferred") == 1, log[-2000:]
+    assert log.count("request canceled: canceled: cpu stop") == 1, log[-2000:]
 
 
 if __name__ == '__main__':

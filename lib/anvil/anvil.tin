@@ -497,6 +497,7 @@ func on_signal() {
 	}
 	gStop = 1
 	deadline = rt_mono_ns() + gGrace*1000000000
+	if rtWatchDrainAt == 0 || deadline < rtWatchDrainAt { rtWatchDrainAt = deadline }
 	word[3] = -1
 	for j := 1; j < gCores; j++ {
 		rt_sys_write(gPipes[2*j+1], word+24, 8)
@@ -1165,7 +1166,7 @@ func serve_one(c i64, p i64, n i64) i64 {
 	}
 	if rt_task_run(task) {
 		if rt_task_panicked(task) {
-			panicked(c)
+			panicked(c, task)
 		}
 		rt_task_free(task)
 		if !alive || draining {
@@ -1230,7 +1231,7 @@ func rebase_request(task i64, delta i64) {
 func finish_request(c i64, task i64) {
 	free(task[tUser+1])
 	if rt_task_panicked(task) && c[cHijack] == 0 && c[cDead] == 0 {
-		panicked(c)
+		panicked(c, task)
 	}
 	rt_task_free(task)
 	if c[cHijack] != 0 {
@@ -1486,10 +1487,11 @@ func parse_cl(p i64, n i64) i64 {
 
 // panicked answers a request whose handler panicked: 500, then the connection closes (the
 // panic and its backtrace are on stderr). Nothing of the handler's response was sent yet.
-func panicked(c i64) {
+func panicked(c i64, task i64) {
 	body := make([]u8, 0, 64)
-	w := Out{Body: body, code: 500, ctype: "text/plain; charset=utf-8", extra: make([]u8, 0), own: body}
-	w.Body = append(w.Body, status_text(500)...)
+	code := rt_task_failure_status(task)
+	w := Out{Body: body, code: code, ctype: "text/plain; charset=utf-8", extra: make([]u8, 0), own: body}
+	w.Body = append(w.Body, status_text(code)...)
 	respond_out(w, false, false)
 	c[cClose] = 1
 }
