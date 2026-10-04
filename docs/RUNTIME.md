@@ -519,6 +519,14 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   call returns the same fault.
 - Verification is on by default and cannot be turned off by accident: until X.509 lands
   (phase 2), `verify_peer` refuses every server unless `InsecureSkipVerify` is set.
+- The database clients keep each connection's `tls.Conn` in a per-core global (`tlsLines` by
+  client in redis, `tlsConns` by connection record in mysql and postgres) as a `keep()` copy:
+  replacing or deleting the entry when a connection is dropped releases its memory through the
+  long-lived reference counts (#176). Their own non-blocking loops read with
+  `tls.Conn.ReadNow`, which returns 0 instead of waiting (and never while TLS holds data), then
+  wait on the descriptor as before, so a caller that times out leaves the connection in step;
+  writes go through `Write`, which waits inside tls (a record is never half sent), and a failed
+  TLS write drops the connection.
 - `wire.DoWith` takes `https://` (port 443 by default) with `Options.TLS`; the response reader
   is generic over a private `stream` shape, so the same code reads a `wire.Conn` and a
   `tls.Conn`. `websocket.Dial` takes `wss://` (`DialTLS` with a `tls.Config`): the

@@ -7,6 +7,9 @@ import os
 import random
 import socket
 import socketserver
+import ssl
+import tempfile
+from pathlib import Path
 import subprocess
 import sys
 import threading
@@ -18,7 +21,7 @@ class Fake:
     """Just enough of Redis: strings, INCR, DEL, PEXPIRE, MULTI/EXEC, AUTH, HELLO, SELECT,
     DEBUG SLEEP. It counts reads, so the test can see commands arriving in batches."""
 
-    def __init__(self, password=''):
+    def __init__(self, password='', ctx=None):
         self.password = password
         self.data = {}
         self.lock = threading.Lock()
@@ -29,8 +32,14 @@ class Fake:
 
         class H(socketserver.BaseRequestHandler):
             def handle(self):
-                fake.conns.append(self.request)
-                fake.serve(self.request)
+                s = self.request
+                if ctx is not None:
+                    try:
+                        s = ctx.wrap_socket(s, server_side=True)
+                    except (OSError, ssl.SSLError):
+                        return
+                fake.conns.append(s)
+                fake.serve(s)
 
         socketserver.ThreadingTCPServer.allow_reuse_address = True
         socketserver.ThreadingTCPServer.request_queue_size = 256  # the default backlog of 5 resets bursts on macOS
@@ -231,13 +240,39 @@ def main():
     exe = out / 'redis'
     subprocess.run([str(ROOT / 'bin/tinc'), '-o', str(exe), 'examples/redis.tin'], cwd=ROOT, check=True,
                    env=dict(os.environ, TIN_ROOT=str(ROOT)))
-    real = os.environ.get('REDIS_ADDR')
-    fake = None if real else Fake()
+    failures = check(exe, None)
+    if not os.environ.get('REDIS_ADDR'):
+        # Once more over TLS 1.3: the fake server behind Python's ssl, the client on rediss://.
+        from tls_check import make_certs, openssl3
+        import shutil
+        with tempfile.TemporaryDirectory(prefix='redis-tls-', dir=out) as tmp:
+            certs = make_certs(openssl3() or shutil.which('openssl'), Path(tmp))
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+            ctx.load_cert_chain(str(certs['ecdsa'][0]), str(certs['ecdsa'][1]))
+            print('-- over TLS 1.3 (rediss://)')
+            failures += check(exe, ctx)
+    if failures:
+        sys.exit('\n'.join(failures))
+
+
+def env_for(port, ctx, password=''):
+    """How the example finds the server: REDIS_ADDR in the clear, REDIS_URL over TLS."""
+    if ctx is None:
+        return {'REDIS_ADDR': '127.0.0.1:%d' % port, 'REDIS_PASSWORD': password}
+    auth = ':%s@' % password if password else ''
+    return {'REDIS_ADDR': '', 'REDIS_URL': 'rediss://%s127.0.0.1:%d' % (auth, port), 'REDIS_TLS_INSECURE': '1'}
+
+
+def check(exe, ctx):
+    real = None if ctx is not None else os.environ.get('REDIS_ADDR')
+    fake = None if real else Fake(ctx=ctx)
     addr = real or '127.0.0.1:%d' % fake.port
+    extra = {} if real else env_for(fake.port, ctx)
     failures = []
     key = 'tin-check-%d' % os.getpid()
 
-    srv = Server(exe, addr, 2)
+    srv = Server(exe, addr, 2, extra)
     try:
         dt, errs = load(srv.port, key, 40, 100)
         code, body, _ = get(srv.port, '/get?key=' + key)
@@ -266,7 +301,7 @@ def main():
         srv.stop()
 
     # One core: the queued request shares the paused connection.
-    srv = Server(exe, addr, 1)
+    srv = Server(exe, addr, 1, extra)
     try:
         if fake:
             # A 1 s pause with a 500 ms deadline: the request gives up, and the replies that
@@ -303,9 +338,9 @@ def main():
         srv.stop()
 
     if fake:
-        locked = Fake(password='s3cret')
+        locked = Fake(password='s3cret', ctx=ctx)
         for pw, want in (('s3cret', 200), ('wrong', 502)):
-            srv = Server(exe, '127.0.0.1:%d' % locked.port, 1, {'REDIS_PASSWORD': pw})
+            srv = Server(exe, '127.0.0.1:%d' % locked.port, 1, env_for(locked.port, ctx, pw))
             try:
                 code, body, _ = get(srv.port, '/incr?key=a')
                 print('AUTH %s: %d %r' % (pw, code, body))
@@ -313,8 +348,7 @@ def main():
                     failures.append('AUTH %s: %d %r' % (pw, code, body))
             finally:
                 srv.stop()
-    if failures:
-        sys.exit('\n'.join(failures))
+    return failures
 
 
 if __name__ == '__main__':

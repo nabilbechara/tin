@@ -276,6 +276,7 @@ try c.Write("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
 - `(c Conn) Fd() i64`: Fd is the connection's descriptor (for waiting on it; never read or write it directly).
 - `(c Conn) Buffered() i64`: Buffered is how many decrypted bytes a Read returns without waiting.
 - `(c mut Conn) Read(buf mut []u8, max i64) !i64`: Read appends up to max bytes of application data to buf and returns how many; after the server's close_notify it fails with EOF (wire.IsEOF), and a connection the server drops without close_notify is a fault, not EOF (a truncation would otherwise look complete).
+- `(c mut Conn) ReadNow(buf mut []u8, max i64) !i64`: ReadNow is Read without waiting: it returns 0 when no application data can be had without waiting for the socket (then wait until Fd is readable and call it again). For clients that run their own non-blocking loop; data TLS has already buffered is always returned first.
 - `(c mut Conn) ReadFull(n i64) !str`: ReadFull reads exactly n bytes.
 - `(c mut Conn) WriteBytes(b []u8) !`: WriteBytes sends all of b.
 - `(c mut Conn) Write(s str) !`: Write sends all of s.
@@ -1100,6 +1101,7 @@ Blocking commands (BLPOP, SUBSCRIBE, ...) would hold up the commands queued behi
 
 - `type Reply enum`: Reply is one Redis reply.
 - `type Options struct`: Options says where and how to connect.
+- `ParseURL(url str) !Options`: ParseURL reads "redis://[[user]:password@]host[:port][/db]"; "rediss://" is the same over TLS 1.3 (TLS is set, so the server's certificate is verified for host).
 - `type Client struct`: Client sends commands to one Redis server. Open it in a global's initializer (which runs on every core) or once in main, not per request.
 - `Open(o Options) Client`: Open makes a client for the server in o. It connects on first use, on each core.
 - `(c Client) Do(q query) !Reply`: Do sends one command and returns its reply; an error reply fails.
@@ -1149,7 +1151,7 @@ for _, r := range rows.Rows {
 
 ## postgres
 
-Package postgres is a PostgreSQL protocol 3.0 client over TCP. Query interpolation binds binary parameters as $1, $2, ...; a plain str cannot be used as SQL. Connections are pooled per core (default 16) and waiting request tasks park without blocking it. Authentication supports SCRAM-SHA-256, MD5 and cleartext. TLS is not supported: use a trusted private network or a local TLS proxy. An SSL-only server is rejected.
+Package postgres is a PostgreSQL protocol 3.0 client over TCP. Query interpolation binds binary parameters as $1, $2, ...; a plain str cannot be used as SQL. Connections are pooled per core (default 16) and waiting request tasks park without blocking it. Authentication supports SCRAM-SHA-256, MD5 and cleartext. Options.SSLMode turns on TLS 1.3 (SSLRequest): "require" encrypts, "verify-full" (the default when Options.TLS is set) also checks the server's certificate and name.
 
 ```go
 var db = postgres.Open(postgres.Options{Addr: "127.0.0.1:5432", User: "app", Password: pw, Database: "shop"})

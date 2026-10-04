@@ -125,63 +125,43 @@ func (c Conn) Buffered() i64 {
 // server's close_notify it fails with EOF (wire.IsEOF), and a connection the server drops
 // without close_notify is a fault, not EOF (a truncation would otherwise look complete).
 func (c mut Conn) Read(buf mut []u8, max i64) !i64 {
+	try c.usable()
+	for c.pe == c.ps {
+		if c.eof {
+			fail "EOF"
+		}
+		try c.pump(true)
+	}
+	return c.take(mut buf, max)
+}
+
+// ReadNow is Read without waiting: it returns 0 when no application data can be had without
+// waiting for the socket (then wait until Fd is readable and call it again). For clients that
+// run their own non-blocking loop; data TLS has already buffered is always returned first.
+func (c mut Conn) ReadNow(buf mut []u8, max i64) !i64 {
+	try c.usable()
+	for c.pe == c.ps {
+		if c.eof {
+			fail "EOF"
+		}
+		more := try c.pump(false)
+		if !more {
+			return 0
+		}
+	}
+	return c.take(mut buf, max)
+}
+
+func (c Conn) usable() ! {
 	if c.failure != "" {
 		fail say.Fault("%s", c.failure)
 	}
 	if c.closed {
 		fail "tls: read on a closed connection"
 	}
-	for c.pe == c.ps {
-		if c.eof {
-			fail "EOF"
-		}
-		typ, data, err := c.read_record()
-		if err != nil {
-			desc := pendingAlert
-			if desc == 0 {
-				desc = alertInternalError
-			}
-			c.fault_close(err, desc)
-			fail err
-		}
-		if typ == ctApplicationData {
-			if len(data) == 0 {
-				c.alertCt++
-				if c.alertCt > 32 {
-					fail c.abort(alertUnexpectedMessage, "too many empty records")
-				}
-				continue
-			}
-			c.alertCt = 0
-			copy(c.plain, data)
-			c.ps = 0
-			c.pe = len(data)
-		} else if typ == ctHandshake {
-			if len(data) == 0 {
-				fail c.abort(alertUnexpectedMessage, "empty handshake record")
-			}
-			e2 := c.post_handshake(data)
-			if e2 != nil {
-				desc := pendingAlert
-				if desc == 0 {
-					desc = alertInternalError
-				}
-				c.fault_close(e2, desc)
-				fail e2
-			}
-		} else if typ == ctAlert {
-			e3 := handle_alert(data)
-			if e3 != nil {
-				c.failure = say.Str(e3)
-				c.closed = true
-				c.tcp.Close()
-				fail e3
-			}
-			c.eof = true
-		} else {
-			fail c.abort(alertUnexpectedMessage, "unexpected record")
-		}
-	}
+}
+
+func (c mut Conn) take(buf mut []u8, max i64) i64 {
 	n := c.pe - c.ps
 	if n > max {
 		n = max
@@ -189,6 +169,60 @@ func (c mut Conn) Read(buf mut []u8, max i64) !i64 {
 	buf = append(buf, c.plain[c.ps:c.ps+n]...)
 	c.ps += n
 	return n
+}
+
+// pump reads and handles one record (false, without wait, when none is complete yet).
+func (c mut Conn) pump(wait bool) !bool {
+	typ, data, ok, err := c.next_record(wait)
+	if err != nil {
+		desc := pendingAlert
+		if desc == 0 {
+			desc = alertInternalError
+		}
+		c.fault_close(err, desc)
+		fail err
+	}
+	if !ok {
+		return false
+	}
+	if typ == ctApplicationData {
+		if len(data) == 0 {
+			c.alertCt++
+			if c.alertCt > 32 {
+				fail c.abort(alertUnexpectedMessage, "too many empty records")
+			}
+			return true
+		}
+		c.alertCt = 0
+		copy(c.plain, data)
+		c.ps = 0
+		c.pe = len(data)
+	} else if typ == ctHandshake {
+		if len(data) == 0 {
+			fail c.abort(alertUnexpectedMessage, "empty handshake record")
+		}
+		e2 := c.post_handshake(data)
+		if e2 != nil {
+			desc := pendingAlert
+			if desc == 0 {
+				desc = alertInternalError
+			}
+			c.fault_close(e2, desc)
+			fail e2
+		}
+	} else if typ == ctAlert {
+		e3 := handle_alert(data)
+		if e3 != nil {
+			c.failure = say.Str(e3)
+			c.closed = true
+			c.tcp.Close()
+			fail e3
+		}
+		c.eof = true
+	} else {
+		fail c.abort(alertUnexpectedMessage, "unexpected record")
+	}
+	return true
 }
 
 // ReadFull reads exactly n bytes.

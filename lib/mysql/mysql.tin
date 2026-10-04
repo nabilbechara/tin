@@ -19,6 +19,7 @@ import "gauge"
 import "mint"
 import "say"
 import "seal"
+import "tls"
 import "wire"
 
 
@@ -50,6 +51,7 @@ type Options struct {
 	Database str
 	Pool     i64 // connections per core (default 16)
 	Timeout  i64 // ns a statement may wait (0: no limit; a request's deadline still applies)
+	TLS      ?tls.Config // require TLS 1.3 (CLIENT_SSL and SSLRequest); the server name is Addr's host unless TLS.ServerName is set
 }
 
 // Client runs statements on one MySQL server. Open it in a global's initializer (which
@@ -82,7 +84,8 @@ const rTimeout = 9
 const rID = 10
 const rKey = 11 // the server's RSA public key (PEM), once fetched
 const rKeyN = 12
-const recWords = 13
+const rTls = 13 // the kept tls.Config, or 0 for plain TCP
+const recWords = 14
 
 // A core's pool for one Client.
 const pIdle = 0 // a stack of idle connections
@@ -122,6 +125,7 @@ const stmtWords = 5
 const maxStmts = 256
 
 // Capability flags.
+const capSSL = 0x800
 const capLongPassword = 0x1
 const capLongFlag = 0x4
 const capConnectWithDB = 0x8
@@ -138,6 +142,10 @@ const flagUnsigned = 0x20
 
 shared var nClients i64
 var pools i64 // per core: the pool of each Client, by id
+
+// tlsConns holds the TLS layer of this core's connections, by connection record. Removing
+// one releases its memory (counted long-lived memory, from keep).
+var tlsConns = make(map[i64]?tls.Conn)
 
 func keep_raw(s str) i64 {
 	p := malloc(len(s) + 1)
@@ -174,6 +182,10 @@ func Open(o Options) Client {
 	}
 	rec[rTimeout] = o.Timeout
 	rec[rID] = id
+	cfg := o.TLS
+	if cfg != nil {
+		rec[rTls] = cast(i64, keep(cfg))
+	}
 	return Client{open: true, rec: rec}
 }
 
@@ -301,6 +313,21 @@ func read_packet(c i64) !(i64, i64) {
 			c[cE] = avail
 			c[cS] = 0
 		}
+		tc := tlsConns[c]
+		if tc != nil {
+			buf := make([]u8, 0, c[cCap]-c[cE])
+			got := try tc.ReadNow(mut buf, c[cCap]-c[cE])
+			if got > 0 {
+				memcpy(c[cBuf]+c[cE], cast(i64, buf)[2], got)
+				c[cE] += got
+				continue
+			}
+			r := rt_task_wait(c[cFd], 1, c[cTimeout])
+			if r != waitReady {
+				fail wait_msg(r)
+			}
+			continue
+		}
 		k := rt_sys_read(c[cFd], c[cBuf]+c[cE], c[cCap]-c[cE])
 		if k > 0 {
 			c[cE] += k
@@ -394,6 +421,15 @@ func end_packet(c i64) ! {
 }
 
 func flush(c i64) ! {
+	tc := tlsConns[c]
+	if tc != nil {
+		err := tc.Write(rt_str_from_raw(c[cOut], c[cOutN]))
+		c[cOutN] = 0
+		if err != nil {
+			fail err
+		}
+		return
+	}
 	at := 0
 	for at < c[cOutN] {
 		k := rt_sys_write(c[cFd], c[cOut]+at, c[cOutN]-at)
@@ -550,6 +586,14 @@ func send_raw(c i64, data []u8) ! {
 // full_auth sends the password RSA-encrypted with the server's public key, as
 // caching_sha2_password does without TLS when the server has no cached entry.
 func full_auth(c i64, rec i64, pass str, scramble []u8) ! {
+	if tlsConns[c] != nil {
+		// Over TLS the password goes as it is, NUL-terminated (no RSA key needed).
+		pw := make([]u8, 0, len(pass)+1)
+		pw = append(pw, pass...)
+		pw = append(pw, 0)
+		try send_raw(c, pw)
+		return
+	}
 	pem := ""
 	if rec[rKeyN] > 0 {
 		pem = rec_str(rec, rKey)
@@ -578,7 +622,7 @@ func full_auth(c i64, rec i64, pass str, scramble []u8) ! {
 }
 
 // handshake reads the server's greeting, logs in and returns the agreed capabilities.
-func handshake(c i64, rec i64) ! {
+func handshake(c i64, rec i64, w wire.Conn) ! {
 	p, n := try read_packet(c)
 	if n > 0 && load8(p) == 0xff {
 		fail err_packet(p, n)
@@ -623,6 +667,31 @@ func handshake(c i64, rec i64) ! {
 		want |= capConnectWithDB
 	}
 	use := want & caps
+	if rec[rTls] != 0 {
+		if caps&capSSL == 0 {
+			fail "mysql: the server does not support TLS"
+		}
+		use |= capSSL
+		// SSLRequest: the first 32 bytes of the login packet, then TLS on the same socket.
+		begin_packet(c, c[cSeq])
+		put_le(c, use, 4)
+		put_le(c, 16777216, 4)
+		put_u8(c, 45)
+		for i := 0; i < 23; i++ {
+			put_u8(c, 0)
+		}
+		try end_packet(c)
+		try flush(c)
+		base := cast(tls.Config, rec[rTls])
+		name := base.ServerName
+		if name == "" {
+			name = host_of(rec_str(rec, rAddr))
+		}
+		cfg := tls.Config{ServerName: name, RootCAs: base.RootCAs, ALPN: base.ALPN, Timeout: rec[rTimeout], InsecureSkipVerify: base.InsecureSkipVerify}
+		tc := try tls.Client(w, cfg)
+		tc.SetTimeout(rec[rTimeout])
+		tlsConns[c] = keep(tc)
+	}
 	c[cCaps] = use
 	if plugin != "mysql_native_password" && plugin != "caching_sha2_password" {
 		plugin = "caching_sha2_password"
@@ -695,6 +764,21 @@ func handshake(c i64, rec i64) ! {
 	}
 }
 
+// host_of is the host in "host:port" ("[v6]:port" gives v6).
+func host_of(addr str) str {
+	colon := len(addr)
+	for i := 0; i < len(addr); i++ {
+		if addr[i] == ':' {
+			colon = i
+		}
+	}
+	h := addr[:colon]
+	if len(h) >= 2 && h[0] == '[' && h[len(h)-1] == ']' {
+		h = h[1 : len(h)-1]
+	}
+	return h
+}
+
 // ---- the pool ----
 
 func (c Client) pool() i64 {
@@ -712,6 +796,7 @@ func (c Client) pool() i64 {
 }
 
 func conn_free(c i64) {
+	delete(tlsConns, c)
 	if c[cFd] >= 0 {
 		rt_sys_close(c[cFd])
 	}
@@ -734,7 +819,7 @@ func dial(rec i64) !i64 {
 	c[cBuf] = malloc(c[cCap])
 	c[cStmts] = calloc(maxStmts*stmtWords, 8)
 	c[cTimeout] = rec[rTimeout]
-	err := handshake(c, rec)
+	err := handshake(c, rec, w)
 	if err != nil {
 		conn_free(c)
 		fail err
@@ -745,6 +830,13 @@ func dial(rec i64) !i64 {
 // alive reports whether an idle connection is still open (the server may have closed it:
 // a restart, wait_timeout).
 func alive(c i64) bool {
+	tc := tlsConns[c]
+	if tc != nil {
+		// Records may wait (session tickets): read them; data or an error means not idle.
+		buf := make([]u8, 0, 16)
+		got, err := tc.ReadNow(mut buf, 16)
+		return err == nil && got == 0
+	}
 	b := calloc(1, 8)
 	k := rt_sys_recv(c[cFd], b, 1, 2)
 	free(b)

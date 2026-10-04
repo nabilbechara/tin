@@ -12,6 +12,9 @@ import random
 import re
 import socket
 import socketserver
+import ssl
+import tempfile
+from pathlib import Path
 import struct
 import subprocess
 import sys
@@ -35,7 +38,7 @@ AQIDAQAB
 -----END PUBLIC KEY-----
 """
 
-PROTO41, SECURE, PLUGIN, LENENC, WITHDB, NOEOF = 0x200, 0x8000, 0x80000, 0x200000, 0x8, 0x1000000
+PROTO41, SECURE, PLUGIN, LENENC, WITHDB, NOEOF, SSL = 0x200, 0x8000, 0x80000, 0x200000, 0x8, 0x1000000, 0x800
 CAPS = 0x1 | 0x4 | WITHDB | PROTO41 | 0x2000 | SECURE | 0x20000 | PLUGIN | LENENC | NOEOF
 
 
@@ -101,7 +104,9 @@ class Fake:
         b'SELECT SLEEP(?)': [(b'SLEEP(?)', 0x08)],
     }
 
-    def __init__(self):
+    def __init__(self, ctx=None):
+        self.ctx = ctx
+        self.tls_full_auths = 0
         self.users = {}
         self.next_id = 1
         self.lock = threading.Lock()
@@ -170,11 +175,21 @@ class Session:
 
     def run(self):
         scramble = os.urandom(20).replace(b'\x00', b'\x01')
+        caps = CAPS | (SSL if self.fake.ctx else 0)
         self.send(b'\x0a8.0.0-fake\x00' + struct.pack('<I', 7) + scramble[:8] + b'\x00' +
-                  struct.pack('<HBHHB', CAPS & 0xffff, 255, 2, CAPS >> 16, 21) + b'\x00' * 10 +
+                  struct.pack('<HBHHB', caps & 0xffff, 255, 2, caps >> 16, 21) + b'\x00' * 10 +
                   scramble[8:] + b'\x00' + b'caching_sha2_password\x00')
         p = self.recv()
         caps = struct.unpack('<I', p[:4])[0]
+        self.tls = False
+        if self.fake.ctx:
+            # SSLRequest (32 bytes with CLIENT_SSL), then the login packet over TLS.
+            assert len(p) == 32 and caps & SSL, 'the client should ask for TLS'
+            self.s = self.fake.ctx.wrap_socket(self.s, server_side=True)
+            self.tls = True
+            p = self.recv()
+            caps = struct.unpack('<I', p[:4])[0]
+            assert caps & SSL
         assert caps & NOEOF, 'the client should ask for DEPRECATE_EOF'
         at = 32
         e = p.index(b'\x00', at)
@@ -202,15 +217,22 @@ class Session:
         else:
             self.send(b'\x01\x04')
             q = self.recv()
-            if q == b'\x02':
-                f.key_requests += 1
-                self.send(b'\x01' + PEM.encode())
-                q = self.recv()
-            got = xor(oaep_decrypt(q), scramble)
-            good = got == pw + b'\x00'
-            if good:
-                f.full_auths += 1
-                f.cached.add(user)
+            if self.tls:
+                # Over TLS the whole password comes as it is.
+                good = q == pw + b'\x00'
+                if good:
+                    f.tls_full_auths += 1
+                    f.cached.add(user)
+            else:
+                if q == b'\x02':
+                    f.key_requests += 1
+                    self.send(b'\x01' + PEM.encode())
+                    q = self.recv()
+                got = xor(oaep_decrypt(q), scramble)
+                good = got == pw + b'\x00'
+                if good:
+                    f.full_auths += 1
+                    f.cached.add(user)
         if not good:
             return self.err(1045, b'28000', b"Access denied for user '" + user + b"'@'localhost' (using password: YES)")
         self.ok()
@@ -383,9 +405,28 @@ def main():
     subprocess.run([str(ROOT / 'bin/tinc'), '-o', str(exe), 'examples/mysql.tin'], cwd=ROOT, check=True,
                    env=dict(os.environ, TIN_ROOT=str(ROOT)))
     real = os.environ.get('MYSQL_ADDR')
-    fake = None if real else Fake()
+    failures = check(out, exe, real, None)
+    # Once more over TLS 1.3: SSLRequest, then the same checks. The fake server goes behind
+    # Python's ssl; a real MySQL 8 has TLS on with its own self-signed certificate.
+    from tls_check import make_certs, openssl3
+    import shutil
+    with tempfile.TemporaryDirectory(prefix='mysql-tls-', dir=out) as tmp:
+        certs = make_certs(openssl3() or shutil.which('openssl'), Path(tmp))
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        ctx.load_cert_chain(str(certs['ecdsa'][0]), str(certs['ecdsa'][1]))
+        print('-- over TLS 1.3 (SSLRequest)')
+        failures += check(out, exe, real, ctx)
+    if failures:
+        sys.exit('\n'.join(failures))
+
+
+def check(out, exe, real, ctx):
+    fake = None if real else Fake(ctx)
     env = {} if real else {'MYSQL_ADDR': '127.0.0.1:%d' % fake.port, 'MYSQL_USER': 'tin',
                            'MYSQL_PASSWORD': 'tinpass', 'MYSQL_DATABASE': 'tin'}
+    if ctx is not None:
+        env['MYSQL_TLS'] = 'insecure'
     failures = []
 
     srv = Server(exe, env, 1)
@@ -434,7 +475,8 @@ def main():
     finally:
         srv.stop()
 
-    within(out, env, failures)
+    if ctx is None:
+        within(out, env, failures)
 
     # The load checks that every insert lands, not how fast a shared runner's MySQL is: against a
     # real server a disk flush can hold a few inserts past the 1 s deadline (#133), so it gets
@@ -477,12 +519,17 @@ def main():
                     failures.append('%s/%s: %d %r' % (user, pw, code, body))
             finally:
                 srv.stop()
-        print('auth: %d full (RSA, %d key requests), %d fast, %d switches to mysql_native_password' %
-              (fake.full_auths, fake.key_requests, fake.fast_auths, fake.switches))
-        if fake.full_auths < 1 or fake.key_requests < 1 or fake.fast_auths < 1 or fake.switches < 1:
-            failures.append('auth paths not all taken')
-    if failures:
-        sys.exit('\n'.join(failures))
+        if ctx is None:
+            print('auth: %d full (RSA, %d key requests), %d fast, %d switches to mysql_native_password' %
+                  (fake.full_auths, fake.key_requests, fake.fast_auths, fake.switches))
+            if fake.full_auths < 1 or fake.key_requests < 1 or fake.fast_auths < 1 or fake.switches < 1:
+                failures.append('auth paths not all taken')
+        else:
+            print('auth over TLS: %d full (password in the clear, %d RSA), %d fast, %d switches to mysql_native_password' %
+                  (fake.tls_full_auths, fake.full_auths + fake.key_requests, fake.fast_auths, fake.switches))
+            if fake.tls_full_auths < 1 or fake.full_auths or fake.key_requests or fake.fast_auths < 1 or fake.switches < 1:
+                failures.append('auth paths over TLS not all taken')
+    return failures
 
 
 if __name__ == '__main__':
