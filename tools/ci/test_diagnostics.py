@@ -51,6 +51,10 @@ class DiagnosticsTests(unittest.TestCase):
         retired = ENTRY.split('Rule.')[0] + 'Retired: replaced by E502.\n'
         self.assertEqual(self.problems(retired, source='')[0], [])
 
+    def test_internal_error_needs_no_example(self):
+        internal = ENTRY.split('Rule.')[0] + 'No example: only a compiler bug reaches it.\n'
+        self.assertEqual(self.problems(internal)[0], [])
+
     def test_retired_code_is_never_reused(self):
         retired = ENTRY.split('Rule.')[0] + 'Retired: replaced by E502.\n'
         problems, _, _ = self.problems(retired)
