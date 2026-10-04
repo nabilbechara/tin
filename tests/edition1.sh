@@ -156,8 +156,9 @@ if ! cmp -s tests/edition1/use_bad.err "$tmp/use_bad.err"; then
 	exit 1
 fi
 
-# Structured concurrency (#232): scopes, spawn, wait, cancel, first-fault cancellation.
-for name in scopes lanes selects guards handles spawn_values
+# Structured concurrency (#232): scopes, spawn, wait, cancel, first-fault cancellation;
+# s.cancel(reason) and s.yield() (#143).
+for name in scopes lanes selects guards handles spawn_values scope_cancel
 do
 	"$compiler" -edition 1 -o "$tmp/$name" "tests/edition1/run/$name.tin"
 	"$tmp/$name" >"$tmp/$name.out" 2>/dev/null
