@@ -131,9 +131,10 @@ def admission(out):
     try:
         eventually(lambda: server_ready(port, server))
         conns = [socket.create_connection(('127.0.0.1', port), timeout=10) for _ in range(4)]
+        # Each request has started waiting (3 s) before the next arrives, even on a slow runner.
         for s in conns:
             http(s, '/slow')
-            time.sleep(0.05)
+            time.sleep(0.2)
         got = [answer(s) for s in conns]
         assert [g[0] for g in got] == [200, 200, 503, 503], got
         assert [g[2] for g in got] == [b'slow ok', b'slow ok', b'Service Unavailable', b'Service Unavailable'], got
@@ -155,7 +156,7 @@ def admission(out):
         assert server.poll() is None, 'server exited'
     finally:
         server.terminate()
-        server.wait(timeout=5)
+        server.wait(timeout=15)
     err = server.stderr.read().decode(errors='replace')
     assert 'panic' not in err, err[-1000:]
     events = [l for l in lines(log) if l in ('overload', 'recovered')]
