@@ -7,8 +7,11 @@ package seal
 type AEAD struct {
 	kind i64
 	key  []u8  // ChaCha20-Poly1305: the key
-	rk   []u64 // AES: the bitsliced round keys
+	rk   []u64 // AES in software: the bitsliced round keys
+	rkb  []u8  // AES on the CPU's instructions: the round keys as bytes
 	nr   i64   // AES: the number of rounds
+	hw   bool  // AES-GCM runs on the CPU's instructions
+	hb   []u8  // GCM on the CPU's instructions: H in GCM's byte order
 	h0   u64   // GCM: H with its bits reversed, low half
 	h1   u64   // GCM: high half
 }
@@ -23,7 +26,7 @@ func NewChaCha20Poly1305(key secret []u8) !AEAD {
 	}
 	k := make([]u8, 32)
 	copy(k, key)
-	return AEAD{kind: aeadChaCha, key: k, rk: []u64{}}
+	return AEAD{kind: aeadChaCha, key: k}
 }
 
 // NonceSize is the nonce length in bytes (12).
@@ -58,4 +61,29 @@ func (a AEAD) Open(nonce []u8, sealed []u8, aad []u8) ![]u8 {
 		return try gcm_open(a, nonce, sealed, aad)
 	}
 	return try chacha_open(a.key, nonce, sealed, aad)
+}
+
+// Rekey replaces a's key with key, of the same algorithm and length, reusing a's memory: an
+// AEAD kept in long-lived memory (a connection's state) can change keys without allocating
+// there.
+func (a mut AEAD) Rekey(key secret []u8) ! {
+	if a.kind == aeadChaCha {
+		if len(key) != 32 {
+			fail "seal: Rekey needs a key of the same length"
+		}
+		copy(a.key, key)
+		return
+	}
+	if len(key) != 4*(a.nr-6) {
+		fail "seal: Rekey needs a key of the same length"
+	}
+	b := try NewAESGCM(key)
+	if a.hw {
+		copy(a.rkb, b.rkb)
+		copy(a.hb, b.hb)
+		return
+	}
+	copy(a.rk, b.rk)
+	a.h0 = b.h0
+	a.h1 = b.h1
 }

@@ -3,11 +3,11 @@
 import os, re
 
 SKIP = {"runtime", "std", "fmt", "say"}
-ORDER = ["say", "fault", "argo", "io", "anvil", "hearth", "relay", "task", "wire", "twine", "glyph", "mint", "gauge", "bits",
+ORDER = ["say", "fault", "argo", "io", "anvil", "hearth", "relay", "task", "wire", "tls", "twine", "glyph", "mint", "gauge", "bits",
          "link", "ore", "flume", "quarry", "trail", "lever", "tide", "dice", "sift", "atlas", "cairn", "stamp",
          "seal", "herald", "crucible", "constraints", "policy", "redis", "mysql", "postgres", "websocket"]
 ROLE = {"say": "formatting and printing (fmt)", "fault": "fault chains and standard sentinels (errors)", "argo": "JSON (encoding/json)", "anvil": "HTTP/1.1 server (net/http)",
-        "hearth": "cores and threads (runtime)", "relay": "messages between cores (channels)", "task": "deadline and cancellation of the running code (context)", "wire": "TCP and HTTP client (net)",
+        "hearth": "cores and threads (runtime)", "relay": "messages between cores (channels)", "task": "deadline and cancellation of the running code (context)", "wire": "TCP and HTTP client (net)", "tls": "TLS 1.3 client (crypto/tls)",
         "twine": "strings (strings)", "glyph": "UTF-8 and Unicode (unicode/utf8, unicode)", "mint": "number and string conversion (strconv)",
         "gauge": "math (math)", "bits": "bit counting and manipulation (math/bits)", "link": "URLs and their escaping (net/url)", "io": "streaming shapes (io)", "ore": "byte slices (bytes)", "flume": "buffered I/O (bufio)",
         "quarry": "files, environment, process (os)", "trail": "paths (path/filepath)", "lever": "command-line flags (flag)",

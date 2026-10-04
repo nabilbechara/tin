@@ -71,3 +71,29 @@ certificate's key is on the scheme's curve, and 0x0807 Ed25519). Faults start
 with "x509: " and name the reason: expired or not yet valid, the names the certificate is
 valid for, unknown authority, not a CA, bad signature, SHA-1, chain too long, path length,
 key usage, name constraints, unhandled critical extension.
+
+## lib/tls (phase 3)
+
+| file | contents | used by the server (phase 5) |
+|---|---|---|
+| `tls.tin` | Config, Dial, Client, the public Conn methods | Conn methods |
+| `record.tin` | Conn state, socket I/O and waits, record protection, alerts, KeyUpdate | yes |
+| `schedule.tin` | cipher suites, key schedule, Finished MACs | yes |
+| `messages.tin` | wire-format reader/writer, ClientHello, parsers of the server's messages | the reader/writer |
+| `client.tin` | the client handshake | no |
+| `verify.tin` | the bridge to X.509 | no |
+
+Decisions:
+- A Conn changes only in place after the handshake (`seal.AEAD.Rekey`, copies into its own
+  slices), so the same Conn works in a request pool, a websocket's per-message pools and
+  `keep()`'s heap (the database clients, phase 4).
+- No middlebox-compatibility change_cipher_spec is sent; the server's is ignored during the
+  handshake. The session id is 32 random bytes (servers expect it).
+- The client offers only X25519 in its first key share and supported_groups lists P-256, so a
+  P-256-only server costs one HelloRetryRequest.
+- Signature schemes offered: ECDSA P-256/P-384, RSA-PSS SHA-256/384/512, Ed25519, and PKCS #1
+  v1.5 (for certificates only; a CertificateVerify with it is refused).
+- A server's CertificateRequest gets an empty Certificate (no client certificates yet).
+- After 2^24 records under one key the client sends KeyUpdate.
+
+Tests: `tools/ci/tls_check.py` (CI.md).

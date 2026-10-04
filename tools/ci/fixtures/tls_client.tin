@@ -1,0 +1,183 @@
+// The TLS client side of tools/ci/tls_check.py. One command per run:
+//   get ADDR [ALPN]       handshake (no verification), send an HTTP/1.0 GET, read to close_notify
+//   verify ADDR NAME      handshake with verification (the default), print the fault
+//   timeout ADDR MS       handshake with Config.Timeout, print the fault and how long it took
+//   keyupdate ADDR        talk to an interactive openssl s_server that sends KeyUpdates
+//   truncated ADDR        read until the peer closes TCP without close_notify
+//   https URL             wire GET of an https:// URL (no verification); POST with a body too
+//   wss URL               websocket DialTLS, one text message and its echo
+package main
+
+import "quarry"
+import "say"
+import "seal"
+import "tide"
+import "tls"
+import "websocket"
+import "wire"
+import "mint"
+
+func insecure() tls.Config {
+	return tls.Config{InsecureSkipVerify: true, Timeout: 10000000000}
+}
+
+func suite_name(s i64) str {
+	if s == tls.TLS_AES_128_GCM_SHA256 {
+		return "TLS_AES_128_GCM_SHA256"
+	}
+	if s == tls.TLS_AES_256_GCM_SHA384 {
+		return "TLS_AES_256_GCM_SHA384"
+	}
+	if s == tls.TLS_CHACHA20_POLY1305_SHA256 {
+		return "TLS_CHACHA20_POLY1305_SHA256"
+	}
+	return say.Fmt("%d", s)
+}
+
+func get(addr str, alpn str) {
+	cfg := insecure()
+	if alpn != "" {
+		cfg.ALPN = []str{"h2", alpn}
+	}
+	c := tls.Dial(addr, cfg) catch e {
+		say.Line("fault", e)
+		return
+	}
+	c.Write("GET / HTTP/1.0\r\n\r\n") catch e {
+		say.Line("fault", e)
+		return
+	}
+	buf := make([]u8, 0, 65536)
+	for {
+		c.Read(mut buf, 65536) catch e {
+			if !wire.IsEOF(e) {
+				say.Line("fault", e)
+				return
+			}
+			break
+		}
+	}
+	say.Line("ok", suite_name(c.CipherSuite()), c.Group(), "alpn="+c.ALPN(), len(c.PeerCertificates()), len(buf) > 0)
+	c.Close()
+}
+
+func verify(addr str, name str) {
+	_, err := tls.Dial(addr, tls.Config{ServerName: name, Timeout: 10000000000})
+	say.Line("fault", err)
+}
+
+func timeout(addr str, ms i64) {
+	t0 := tide.Now()
+	_, err := tls.Dial(addr, tls.Config{InsecureSkipVerify: true, Timeout: ms * 1000000})
+	say.Line("fault", err, tide.Milliseconds(tide.Since(t0)))
+}
+
+// read_until reads until the data ends with want and returns it without the last newline.
+func read_until(c mut tls.Conn, want str) str {
+	buf := make([]u8, 0, 256)
+	for {
+		c.Read(mut buf, 256) catch e {
+			return say.Fmt("fault %v", e)
+		}
+		s := str(buf)
+		if len(s) >= len(want) && s[len(s)-len(want):] == want {
+			return s[:len(s)-1]
+		}
+	}
+	return ""
+}
+
+func keyupdate(addr str) {
+	c := tls.Dial(addr, insecure()) catch e {
+		say.Line("fault", e)
+		return
+	}
+	// The check waits for this line on the server's output, then makes the server send
+	// KeyUpdate (request_update) and a line; the client answers on its next key.
+	c.Write("ping\n") catch e {
+		say.Line("fault", e)
+	}
+	say.Line("got", read_until(mut c, "one\n"))
+	c.Write("after one\n") catch e {
+		say.Line("fault", e)
+	}
+	say.Line("got", read_until(mut c, "two\n"))
+	c.Write("after two\n") catch e {
+		say.Line("fault", e)
+	}
+	say.Line("got", read_until(mut c, "bye\n"))
+	c.Close()
+}
+
+func truncated(addr str) {
+	c := tls.Dial(addr, insecure()) catch e {
+		say.Line("fault", e)
+		return
+	}
+	buf := make([]u8, 0, 1024)
+	for {
+		c.Read(mut buf, 1024) catch e {
+			say.Line("fault", e, len(buf))
+			return
+		}
+	}
+}
+
+func https(url str) {
+	opt := wire.Options{Timeout: 10000000000, TLS: insecure()}
+	r := wire.DoWith("GET", url, []str{}, "", opt) catch e {
+		say.Line("fault", e)
+		return
+	}
+	say.Line("get", r.Status, len(r.Body), seal.Sha256Hex(r.Body))
+	p := wire.DoWith("POST", url, []str{"Content-Type", "text/plain"}, "posted over tls", opt) catch e {
+		say.Line("fault", e)
+		return
+	}
+	say.Line("post", p.Status, p.Body)
+}
+
+func wss(url str) {
+	ws := websocket.DialTLS(url, insecure()) catch e {
+		say.Line("fault", e)
+		return
+	}
+	ws.WriteText("hello wss") catch e {
+		say.Line("fault", e)
+	}
+	m := ws.Read() catch e {
+		say.Line("fault", e)
+		return
+	}
+	say.Line("wss", m.Text, m.Data)
+	ws.Close()
+}
+
+func main() {
+	args := quarry.Args()
+	if len(args) < 3 {
+		say.Line("usage: tls_client COMMAND ARG...")
+		return
+	}
+	cmd := args[1]
+	if cmd == "get" {
+		alpn := ""
+		if len(args) > 3 {
+			alpn = args[3]
+		}
+		get(args[2], alpn)
+	} else if cmd == "verify" {
+		verify(args[2], args[3])
+	} else if cmd == "timeout" {
+		ms := mint.Atoi(args[3]) catch _ { 100 }
+		timeout(args[2], ms)
+	} else if cmd == "keyupdate" {
+		keyupdate(args[2])
+	} else if cmd == "truncated" {
+		truncated(args[2])
+	} else if cmd == "https" {
+		https(args[2])
+	} else if cmd == "wss" {
+		wss(args[2])
+	}
+}
