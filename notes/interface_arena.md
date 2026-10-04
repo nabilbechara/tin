@@ -17,8 +17,7 @@ An arena is a **fresh request pool**: the same bump chunks, extra chunks and big
 the pool of a request (docs/RUNTIME.md §3), made when the block is entered and freed when it
 is left. It is pool memory, never ingot memory, so:
 
-- `rt_rc_*` never count it (`rt_rc_mine` is false: the block has no heap header), and
-  nothing in #176's interface changes.
+- pool memory is never counted (#176), so nothing in #176's interface changes.
 - `keep(x)` inside an arena copies into the ingot heap as everywhere else.
 - Leaving an arena is **not** a quiescent point for the epoch limbo (#260): it frees only
   the arena's own chunks and never calls `rt_pool_reset`.
@@ -118,6 +117,8 @@ Inside an arena's closure, and closures inside it:
 
 - a captured variable reads as `RG_OUT` (bit 16) instead of `RG_FRESH`: it was made outside
   the arena. `RG_OUT` survives loads and holds, like the other non-fresh bits;
+- slicing a slice that may be `RG_OUT` gives `RG_OUT` too: `ys := xs[a:b]` shares `xs`'s
+  array, so `ys = append(ys, v)` with spare capacity would write into the outer array;
 - storing a value that may be fresh (made in the arena) into a container that may be
   `RG_OUT`, or into a captured variable, is `E314 ARENA_ESCAPE`;
 - appending to, or inserting into, a slice or map that may be `RG_OUT` (and is not only
