@@ -706,6 +706,9 @@ func main() {
   not per iteration: move the loop body into a function). Deferring a call that returns a
   fault is rejected (the fault would be lost: defer a function that handles it).
   Deferred calls must be plain function or method calls.
+- Deferred calls also run when a panic unwinds through their function inside a request (or
+  any task), innermost first, before the request's resource cleanups; a panic inside a deferred
+  call during that unwinding ends the process.
 - `panic("message")` stops the program with status 2 after printing `panic: message`
   and a backtrace of the calling functions (inlined functions do not appear). A failed
   bounds check prints `index out of range [5] with length 3`. Panics cannot be recovered.
