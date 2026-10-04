@@ -9,6 +9,7 @@
 
 const EX64_ALIGN = 4096;
 const EX64_START_SIZE = 34;
+const EX64_START_STATIC = 35;
 const EX64_STUB_SIZE = 6;
 const R_X86_64_GLOB_DAT = 6;
 
@@ -86,9 +87,31 @@ fn ex64_start(p, at, main_addr, got_slot) {
     store8(p + 33, 0xf4);
 }
 
+// ex64_start_static writes the static _start at p (address at): main(argc, argv, envp) from
+// the kernel's initial stack with rbp cleared and rsp aligned, then exit_group (231).
+fn ex64_start_static(p, at, main_addr) {
+    let code = "31ed488b3c24488d742408488d54fe084883e4f0e800000000";
+    let i = 0;
+    while load8(code + 2 * i) != 0 {
+        store8(p + i, num_digit(load8(code + 2 * i)) * 16 + num_digit(load8(code + 2 * i + 1)));
+        i = i + 1;
+    }
+    put32(p + 21, main_addr - (at + 25));
+    store8(p + 25, 0x89);
+    store8(p + 26, 0xc7);
+    store8(p + 27, 0xb8);
+    put32(p + 28, 231);
+    store8(p + 32, 0x0f);
+    store8(p + 33, 0x05);
+    store8(p + 34, 0xf4);
+}
+
 fn write_elf_x64(path) {
     let nvars = prog_vars[VEC_LEN];
-    el_start_fn = el_import("__libc_start_main");
+    let stat = el_static();
+    if !stat {
+        el_start_fn = el_import("__libc_start_main");
+    }
     lk_imports = vec_new();
     lk_strs = 0;
     lk_tstrs = 0;
@@ -111,8 +134,10 @@ fn write_elf_x64(path) {
     let dstr = buf_new();
     buf_byte(dstr, 0);
     let libc_at = dstr[VEC_LEN];
-    buf_str(dstr, "libc.so.6");
-    buf_byte(dstr, 0);
+    if !stat {
+        buf_str(dstr, "libc.so.6");
+        buf_byte(dstr, 0);
+    }
     // libm is listed only when the program imports one of its functions.
     let libm_at = 0;
     let uses_libm = imports_libm(lk_imports);
@@ -122,6 +147,9 @@ fn write_elf_x64(path) {
         buf_byte(dstr, 0);
     }
     let interp = "/lib64/ld-linux-x86-64.so.2";
+    if stat {
+        interp = "";
+    }
     let names = vec_new();
     let name_off = vec_new();
     vec_push(names, "");
@@ -155,13 +183,21 @@ fn write_elf_x64(path) {
     let nsym = names[VEC_LEN];
 
     // Read-only segment contents and their offsets.
+    // A static image keeps only the names (for backtraces): no dynsym, hash or relocations.
     let ph_off = 64;
-    let interp_off = ph_off + 56 * E_PHNUM;
+    let phnum = el_phnum(stat);
+    let interp_off = ph_off + 56 * phnum;
     let dynsym_off = align_up(interp_off + strlen(interp) + 1, 8);
     let dynstr_off = dynsym_off + 24 * nsym;
+    if stat {
+        dynstr_off = interp_off;
+    }
     let hash_off = align_up(dynstr_off + dstr[VEC_LEN], 8);
     let nbucket = nsym / 2 + 1;
     let hash_size = 4 * (2 + nbucket + nsym);
+    if stat {
+        hash_size = 0;
+    }
     let rela_off = align_up(hash_off + hash_size, 8);
     let rela_size = 24 * nimp;
     lk_btrace = align_up(rela_off+rela_size,8);
@@ -170,7 +206,11 @@ fn write_elf_x64(path) {
     // Text segment: _start, code (laid out and relaxed first), stubs, strings, constants.
     let text_addr = align_up(ro_end, EX64_ALIGN);
     let start_addr = text_addr;
-    let code_addr = align_up(text_addr + EX64_START_SIZE, 16);
+    let start_size = EX64_START_SIZE;
+    if stat {
+        start_size = EX64_START_STATIC;
+    }
+    let code_addr = align_up(text_addr + start_size, 16);
     x64_syms = 0;
     x64_relocs = 0;
     let code_size = x64_layout(code, code_addr);
@@ -205,6 +245,9 @@ fn write_elf_x64(path) {
     // Data segment: dynamic section, GOT, globals.
     let data_addr = align_up(text_end, EX64_ALIGN);
     let ndyn = 16;
+    if stat {
+        ndyn = 0;
+    }
     let dyn_addr = data_addr;
     lk_got = dyn_addr + 16 * ndyn;
     lk_data = lk_got + 8 * nimp;
@@ -228,22 +271,29 @@ fn write_elf_x64(path) {
     put64(img + 40, 0);
     put32(img + 48, 0);
     put32(img + 52, 64 | (56 << 16));
-    put32(img + 56, E_PHNUM | (64 << 16));
+    put32(img + 56, phnum | (64 << 16));
     put32(img + 60, 0);
 
     // Program headers: PHDR, INTERP, LOAD R, LOAD RX, LOAD RW, DYNAMIC, GNU_STACK.
     let p = img + ph_off;
-    p = el_phdr(p, 6, 4, ph_off, ph_off, 56 * E_PHNUM, 56 * E_PHNUM, 8);
-    p = el_phdr(p, 3, 4, interp_off, interp_off, strlen(interp) + 1, strlen(interp) + 1, 1);
+    p = el_phdr(p, 6, 4, ph_off, ph_off, 56 * phnum, 56 * phnum, 8);
+    if !stat {
+        p = el_phdr(p, 3, 4, interp_off, interp_off, strlen(interp) + 1, strlen(interp) + 1, 1);
+    }
     p = el_phdr(p, 1, 4, 0, 0, ro_end, ro_end, EX64_ALIGN);
     p = el_phdr(p, 1, 5, text_addr, text_addr, text_end - text_addr, text_end - text_addr, EX64_ALIGN);
     p = el_phdr(p, 1, 6, data_addr, data_addr, data_end - data_addr, data_end - data_addr, EX64_ALIGN);
-    p = el_phdr(p, 2, 6, dyn_addr, dyn_addr, 16 * ndyn, 16 * ndyn, 8);
+    if !stat {
+        p = el_phdr(p, 2, 6, dyn_addr, dyn_addr, 16 * ndyn, 16 * ndyn, 8);
+    }
     p = el_phdr(p, 0x6474e551, 6, 0, 0, 0, 0, 16);
     memcpy(img + interp_off, interp, strlen(interp));
 
     // Dynamic symbols (24 bytes each); dladdr needs st_size to cover each function.
     i = 1;
+    if stat {
+        i = nsym;
+    }
     while i < nsym {
         let s = img + dynsym_off + 24 * i;
         put32(s, vec_get(name_off, i));
@@ -278,11 +328,16 @@ fn write_elf_x64(path) {
 
     // SysV hash table over every dynamic symbol.
     let hp = img + hash_off;
-    put32(hp, nbucket);
-    put32(hp + 4, nsym);
+    if !stat {
+        put32(hp, nbucket);
+        put32(hp + 4, nsym);
+    }
     let buckets = hp + 8;
     let chains = buckets + 4 * nbucket;
     i = 1;
+    if stat {
+        i = nsym;
+    }
     while i < nsym {
         let b = el_hash(vec_get(names, i)) % nbucket;
         put32(chains + 4 * i, load32(buckets + 4 * b));
@@ -302,25 +357,29 @@ fn write_elf_x64(path) {
 
     // Dynamic section.
     let d = img + dyn_addr;
-    d = el_dyn(d, 1, libc_at);
-    if uses_libm {
-        d = el_dyn(d, 1, libm_at);
-    }
-    d = el_dyn(d, 4, hash_off);
-    d = el_dyn(d, 5, dynstr_off);
-    d = el_dyn(d, 6, dynsym_off);
-    d = el_dyn(d, 10, dstr[VEC_LEN]);
-    d = el_dyn(d, 11, 24);
-    d = el_dyn(d, 7, rela_off);
-    d = el_dyn(d, 8, rela_size);
-    d = el_dyn(d, 9, 24);
-    d = el_dyn(d, 30, 8);
-    d = el_dyn(d, 0x6ffffffb, 0x08000001);
-    d = el_dyn(d, 21, 0);
-    d = el_dyn(d, 0, 0);
+    if stat {
+        ex64_start_static(img + start_addr, start_addr, entry_fn()[F_ADDR]);
+    } else {
+        d = el_dyn(d, 1, libc_at);
+        if uses_libm {
+            d = el_dyn(d, 1, libm_at);
+        }
+        d = el_dyn(d, 4, hash_off);
+        d = el_dyn(d, 5, dynstr_off);
+        d = el_dyn(d, 6, dynsym_off);
+        d = el_dyn(d, 10, dstr[VEC_LEN]);
+        d = el_dyn(d, 11, 24);
+        d = el_dyn(d, 7, rela_off);
+        d = el_dyn(d, 8, rela_size);
+        d = el_dyn(d, 9, 24);
+        d = el_dyn(d, 30, 8);
+        d = el_dyn(d, 0x6ffffffb, 0x08000001);
+        d = el_dyn(d, 21, 0);
+        d = el_dyn(d, 0, 0);
 
-    // _start, then the machine code.
-    ex64_start(img + start_addr, start_addr, entry_fn()[F_ADDR], lk_got + 8 * el_start_fn[F_GOT]);
+        // _start, then the machine code.
+        ex64_start(img + start_addr, start_addr, entry_fn()[F_ADDR], lk_got + 8 * el_start_fn[F_GOT]);
+    }
     let out = buf_new();
     pc = code_addr;
     i = 0;
