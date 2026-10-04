@@ -256,6 +256,11 @@ TIN_REPLAY_KEY=<64 hex digits> tin replay spool/00001700000000000000-000-1.tcap 
 
 - `--against BUILD` is the program to run: a binary, or a `FILE.tin` that `tin` builds
   first. It can be a later build than the one that recorded the capsule.
+- Run it with the configuration the server was recording under (the same environment
+  variables, `TIN_REPLAY_SECRET_HEADERS` included): effect keys hold what the program sent,
+  such as a service's URL, so another address is a divergence. `examples/checkout.tin` is a
+  worked example: record a failed checkout against Redis and a payment service, then replay it
+  with neither running.
 - BUILD runs with `TIN_REPLAY_CAPSULE` set. Its `anvil.Serve` (or `Router.Serve`) does not
   listen. It opens the capsule, checks the tag under `TIN_REPLAY_KEY`, and refuses a schema or
   effect kind the build does not list (`replay.Kinds`). Then it sends the recorded request once
