@@ -89,8 +89,11 @@ The plan (`notes/plan_linux.md`) and the work log (`notes/x64_progress.md`):
   (signalfd on Linux, kqueue `EVFILT_SIGNAL` on macOS), so no asynchronous handler runs.
   Every core then stops accepting and finishes in-flight requests (responses carry
   `Connection: close`); idle keep-alive connections stay open until they send a request or
-  the grace period ends. The process exits within `TIN_GRACE` seconds (default 25, below Kubernetes' 30 s
-  `terminationGracePeriodSeconds`).
+  the grace period ends. At the end of the grace period (`TIN_GRACE` seconds, default 25, below
+  Kubernetes' 30 s `terminationGracePeriodSeconds`) every core cancels the work it still has with
+  `draining`: a request that waits wakes with `canceled: draining`, answers and finishes, and the
+  process exits 0. Code that never waits cannot see the cancel yet (safepoints, #234), so the
+  process exits at most one second later regardless.
 
 ## 5. Porting to another target
 

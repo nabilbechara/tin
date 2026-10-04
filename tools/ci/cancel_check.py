@@ -2,12 +2,14 @@
 """Boundary cancellation (#231): a cancel wakes a task parked in each client, and flows down only.
 
 Private probes are appended to a temporary copy of lib/tide, never to the production API.
+The drain phase checks that the end of the grace period cancels waiting requests.
 Every client points at a server that accepts connections and never answers, so each request
 parks in its client until /cancel/{i} cancels the boundary that request marked.
 """
 import os
 from pathlib import Path
 import select
+import signal
 import shutil
 import socket
 import subprocess
@@ -119,6 +121,23 @@ def checks(port, fifo):
     print('block deadline: "deadline exceeded" after %s ms; the request continues' % parts['ms'])
 
 
+def drain(port, server):
+    # At the end of the grace period (TIN_GRACE=1) waiting requests are cancelled with
+    # "draining", answer, and the server exits 0 instead of being cut off.
+    a = request(port, '/park/30/redis', timeout=10)
+    b = request(port, '/park/31/tide', timeout=10)
+    assert pending(a) and pending(b)
+    start = time.monotonic()
+    server.send_signal(signal.SIGTERM)
+    for s in (a, b):
+        finished(s, b'fault: canceled: draining', seconds=3)
+    took = time.monotonic() - start
+    assert 0.8 <= took < 2.5, 'cancelled after %.2f s, want about the 1 s grace' % took
+    code = server.wait(timeout=3)
+    assert code == 0, 'exit %d' % code
+    print('drain: waiting requests end with "canceled: draining" after %.2f s; exit 0' % took)
+
+
 def main():
     out = ROOT / 'bin/ci/cancel'
     out.mkdir(parents=True, exist_ok=True)
@@ -144,6 +163,7 @@ def main():
                 eventually(lambda: server_ready(port, server))
                 checks(port, str(fifo))
                 assert server.poll() is None, 'server exited'
+                drain(port, server)
             finally:
                 server.terminate()
                 try:
