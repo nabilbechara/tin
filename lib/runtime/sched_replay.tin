@@ -13,7 +13,7 @@ func rt_sched_select(tp i64, site str, n i64) i64 {
 	if tp[tpMode] != tapeReplay {
 		return -2
 	}
-	if tp[tpDiverged] != 0 {
+	if tp[tpDiverged] != 0 || sched_live(tp) {
 		return -1
 	}
 	pos := sched_select_at(tp, site)
@@ -122,7 +122,8 @@ const ssNext = 0  // the number the next child of the request gets
 const ssTasks = 1 // the request's tasks: [capacity, count, task...] (its first task, then children)
 const ssHeld = 2  // replaying: tasks woken before their turn, held off the run queue
 const ssWait = 3  // replaying: tasks whose effect or select is not the next record
-const ssWords = 4
+const ssLive = 4  // replaying a tape with no sched.* record (from a build without them): 1
+const ssWords = 5
 
 // sched_state is tape tp's scheduling state, made at first use.
 func sched_state(tp i64) i64 {
@@ -133,9 +134,32 @@ func sched_state(tp i64) i64 {
 		st[ssTasks] = sched_list_new()
 		st[ssHeld] = sched_list_new()
 		st[ssWait] = sched_list_new()
+		if tp[tpMode] == tapeReplay && !sched_any(tp) {
+			st[ssLive] = 1
+		}
 		tp[tpSched] = st
 	}
 	return st
+}
+
+// sched_any reports whether tape tp holds a scheduling record.
+func sched_any(tp i64) bool {
+	b := tp[tpBuf]
+	pos := 0
+	for pos < tp[tpLen] {
+		k := tape_field(b, pos+8)
+		if len(k) > 6 && k[:6] == "sched." {
+			return true
+		}
+		pos = tape_skip(tp, pos)
+	}
+	return false
+}
+
+// sched_live reports whether replaying tape tp runs its scheduling live: it has no sched.*
+// record, so it was recorded by a build that kept none.
+func sched_live(tp i64) bool {
+	return sched_state(tp)[ssLive] != 0
 }
 
 // rt_sched_free frees tape tp's scheduling state.
@@ -250,7 +274,7 @@ func rt_sched_resume(t i64) bool {
 		tape_add_word(tp, schedResumeKind, "", sched_num(t))
 		return true
 	}
-	if tp[tpDiverged] != 0 {
+	if tp[tpDiverged] != 0 || sched_live(tp) {
 		return true
 	}
 	st := sched_state(tp)
@@ -312,7 +336,7 @@ func sched_wake(st i64) {
 // still move on; false when nothing can: the replay diverged.
 func rt_sched_wait_turn(tp i64) bool {
 	t := curTask
-	if t == 0 || t[tTape] != tp || tp[tpMode] != tapeReplay {
+	if t == 0 || t[tTape] != tp || tp[tpMode] != tapeReplay || sched_live(tp) {
 		return false
 	}
 	st := sched_state(tp)

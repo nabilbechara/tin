@@ -76,6 +76,13 @@ fn effects(a i64, b i64, kb str) !str {
 	return seen
 }
 
+// single makes one effect, then races a select.
+fn single(a i64, b i64) !str {
+	let v = try schedprobe.Effect("a", a)
+	let r = try race(1, b)
+	return "{v} {r}"
+}
+
 type Run struct {
 	got str
 	tp i64
@@ -111,6 +118,10 @@ fn otherOf(k i64, send i64, timer i64) !str {
 
 fn boundedOf(ms i64, send i64, timer i64) !str {
 	return try bounded(ms)
+}
+
+fn singleOf(k i64, a i64, b i64) !str {
+	return try single(a, b)
 }
 
 fn orderOf(k i64, a i64, b i64) !str {
@@ -216,6 +227,16 @@ fn checks() ! {
 	say.Line("effects diverged:", bad.got, "|", schedprobe.Diverged(bad.tp))
 	schedprobe.Free(bad.tp)
 	schedprobe.Free(fx.tp)
+
+	// A tape with no scheduling records (a build without them recorded it) replays its effects
+	// and runs its scheduling live.
+	let one = try taped(0, singleOf, 0, 1, 1000)
+	let old = schedprobe.Strip(one.tp)
+	let oldr = try taped(old, singleOf, 0, 1, 1000)
+	say.Line("old tape:", oldr.got, "diverged:", schedprobe.Diverged(oldr.tp) != "", "left:", schedprobe.Left(oldr.tp))
+	schedprobe.Free(oldr.tp)
+	schedprobe.Free(old)
+	schedprobe.Free(one.tp)
 
 	// A tape replayed by a select at another site diverges, and that select runs live.
 	let rec = try taped(0, raceOf, 0, 1, 1000)

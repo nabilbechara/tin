@@ -26,6 +26,7 @@ order replayed: 20 of 20 gave ab and 20 of 20 gave ba
 effects recorded: v:b v:a  [sched.resume@1  1 sched.resume@1  2 test@1 b test@1 a sched.resume@1  0]
 effects replayed: 20 of 20 gave v:b v:a 
 effects diverged: fault replay: divergence at effect 2: got test@1 "a", recorded test@1 "b" | replay: divergence at effect 2: got test@1 "a", recorded test@1 "b"
+old tape: v:a lane diverged: false left: 0
 other site: other replay: divergence at effect 0: select at sched.tin:30 has no record
 '''
 
