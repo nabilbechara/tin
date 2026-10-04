@@ -362,6 +362,8 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   `fault.LimitExceeded` (by identity), otherwise a `fault.Canceled` fault reading
   `canceled: <reason>` whose cause is the reason (notes/interface_faults.md).
   `tools/ci/cancel_check.py` checks every client.
+- `once { ... }` (#236) runs its block the first time each core reaches it (globals are per
+  core, so this is the unit; process-wide one-time work belongs in `on app.start`).
 - Budgets (#235): `limit memory n, tasks k { }` counts the pool chunks and big blocks taken
   inside it (the bump fast path is not touched) and tasks started in it. Passing the memory
   budget leaves the block with `fault.LimitExceeded` at once (its defers and cleanups run).
