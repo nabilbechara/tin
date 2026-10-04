@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import resource
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,10 @@ def load_cases():
         for contract in [case['expected'], case.get('known_failure')]:
             if contract is not None and (contract.get('phase') not in ('compile', 'run') or 'exit' not in contract):
                 raise ValueError('Contracts require phase and exit')
+        replay = case.get('replay')
+        if replay is not None and (not isinstance(replay, dict) or set(replay) != {'capsule', 'key'}
+                                   or not (MANIFEST.parent / str(replay['capsule'])).is_file()):
+            raise ValueError(f'{case["source"]}: a replay case needs its capsule file and key (tin replay --save-test, #242)')
     return cases
 
 
@@ -63,14 +68,21 @@ def run_case(case, compiler, work, cross=None, docker=None):
     actual = {'phase': 'compile', 'exit': code, 'stdout': stdout.decode(errors='replace'), 'stderr': stderr.decode(errors='replace')}
     if code != 0 or case['expected']['phase'] == 'compile':
         return actual
+    env, docker_env = None, []
+    if 'replay' in case:
+        # A saved replay (#242): the program runs the capsule's request instead of serving.
+        shutil.copy(MANIFEST.parent / case['replay']['capsule'], work / case['replay']['capsule'])
+        env = {k: v for k, v in os.environ.items() if not k.startswith('TIN_REPLAY_')}
+        env.update(TIN_REPLAY_CAPSULE=str(work / case['replay']['capsule']), TIN_REPLAY_KEY=case['replay']['key'])
+        docker_env = ['-e', 'TIN_REPLAY_CAPSULE=/work/' + case['replay']['capsule'], '-e', 'TIN_REPLAY_KEY=' + case['replay']['key']]
     if docker:
         # Cross-built cases run in a container of the target with the same limits.
         command = ['docker', 'run', '--rm', '--platform', target.replace('-', '/'), '-v', str(work) + ':/work',
-                   '-w', '/work', docker, 'sh', '-c', 'ulimit -c 0; ulimit -v 524288; exec timeout 20 /work/' + exe.name]
+                   '-w', '/work'] + docker_env + [docker, 'sh', '-c', 'ulimit -c 0; ulimit -v 524288; exec timeout 20 /work/' + exe.name]
         code, stdout, stderr = execute(command, timeout=60)
         return {'phase': 'run', 'exit': code, 'stdout': stdout.decode(errors='replace'), 'stderr': stderr.decode(errors='replace')}
     try:
-        result = subprocess.run([str(exe)], cwd=ROOT, capture_output=True, timeout=20, preexec_fn=limits)
+        result = subprocess.run([str(exe)], cwd=ROOT, capture_output=True, timeout=20, preexec_fn=limits, env=env)
         return {'phase': 'run', 'exit': result.returncode, 'stdout': result.stdout.decode(errors='replace'), 'stderr': result.stderr.decode(errors='replace')}
     except subprocess.TimeoutExpired:
         return {'phase': 'run', 'exit': 124, 'stdout': '', 'stderr': 'CI timeout'}

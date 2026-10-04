@@ -36,8 +36,10 @@ fi
 # task.Deadline and task.Canceled read the innermost boundary; nested within takes the
 # earlier deadline (#233).
 # A value main borrowed from a long-lived map stays valid while a spawned child replaces
-# the entry and ends: the core's own stack is an epoch participant (#176).
-for name in boundaries fault_wrap once polls deadlines borrows
+# the entry and ends: the core's own stack is an epoch participant (#176). A detached task
+# that never ends holds back releases; past the limbo's cap drops are pinned (#176).
+# guard CALL is the guard block on one call, and a panic's fault carries its backtrace (#142).
+for name in boundaries fault_wrap once polls deadlines borrows guard_call limbo_cap
 do
 	polls=
 	[ "$name" != polls ] || polls=-polls
@@ -49,6 +51,17 @@ do
 		exit 1
 	fi
 done
+
+# guard takes a block or a call (#142).
+if "$compiler" -edition 1 -o "$tmp/guard_call_bad" tests/edition1/guard_call_bad.tin >"$tmp/guard_call_bad.out" 2>"$tmp/guard_call_bad.err"; then
+	echo "FAIL edition1/guard_call_bad: unexpectedly accepted"
+	exit 1
+fi
+if ! cmp -s tests/edition1/guard_call_bad.err "$tmp/guard_call_bad.err"; then
+	echo "FAIL edition1/guard_call_bad: diagnostic mismatch"
+	diff -u tests/edition1/guard_call_bad.err "$tmp/guard_call_bad.err" || true
+	exit 1
+fi
 
 # wrap without try is rejected (#229).
 if "$compiler" -edition 1 -o "$tmp/fault_wrap_bad" tests/edition1/fault_wrap_bad.tin >"$tmp/fault_wrap_bad.out" 2>"$tmp/fault_wrap_bad.err"; then
@@ -185,6 +198,17 @@ if ! cmp -s tests/edition1/run/secrets.audit "$tmp/secrets.audit"; then
 	diff -u tests/edition1/run/secrets.audit "$tmp/secrets.audit" || true
 	exit 1
 fi
+# A secret value written into a query literal is sent as itself; query.Hidden marks it so a
+# replay key holds its handle (#241), and the audit lists it.
+"$compiler" -edition 1 -o "$tmp/secret_query" tests/edition1/run/secret_query.tin
+"$tmp/secret_query" >"$tmp/secret_query.out" 2>/dev/null
+"$compiler" -edition 1 -audit-secrets tests/edition1/run/secret_query.tin >"$tmp/secret_query.audit"
+if ! cmp -s tests/edition1/run/secret_query.out "$tmp/secret_query.out" || ! cmp -s tests/edition1/run/secret_query.audit "$tmp/secret_query.audit"; then
+	echo "FAIL edition1/run/secret_query: output or audit differs"
+	diff -u tests/edition1/run/secret_query.out "$tmp/secret_query.out" || true
+	diff -u tests/edition1/run/secret_query.audit "$tmp/secret_query.audit" || true
+	exit 1
+fi
 for name in secret_sinks secret_rules
 do
 	if "$compiler" -edition 1 -o "$tmp/$name" "tests/edition1/$name.tin" >"$tmp/$name.out" 2>"$tmp/$name.err"; then
@@ -235,6 +259,29 @@ do
 	fi
 done
 
+# arena { } (#236): values of every kind are copied out, faults pass with try and catch,
+# panics and limits discard the arena, and scope children that share a pool keep it while an
+# arena body waits. Memory made in an arena cannot leave it any other way (E315), and its
+# value must be a type the copy can follow (E316).
+"$compiler" -edition 1 -o "$tmp/arenas" tests/edition1/run/arenas.tin
+"$tmp/arenas" >"$tmp/arenas.out" 2>/dev/null
+if ! cmp -s tests/edition1/run/arenas.out "$tmp/arenas.out"; then
+	echo "FAIL edition1/run/arenas: output differs"
+	diff -u tests/edition1/run/arenas.out "$tmp/arenas.out" || true
+	exit 1
+fi
+for name in arena_bad arena_value_bad
+do
+	if "$compiler" -edition 1 -o "$tmp/$name" "tests/edition1/$name.tin" >"$tmp/$name.out" 2>"$tmp/$name.err"; then
+		echo "FAIL edition1/$name: unexpectedly accepted"
+		exit 1
+	fi
+	if ! cmp -s "tests/edition1/$name.err" "$tmp/$name.err"; then
+		echo "FAIL edition1/$name: diagnostic mismatch"
+		diff -u "tests/edition1/$name.err" "$tmp/$name.err" || true
+		exit 1
+	fi
+done
 # Packages (#146): an edition 1 program imports a vendored edition 1 package by path, and a
 # vendored edition 1 package that reaches a capability its tin.mod does not grant is refused.
 "$compiler" -edition 1 -o "$tmp/caps" tests/edition1/run/caps.tin

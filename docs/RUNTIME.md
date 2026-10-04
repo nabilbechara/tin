@@ -109,6 +109,11 @@ startup allocations and mappings. Without that explicit flag the variable is ign
 - Each extra core runs `__core_init` (the per-core global initializers) in ingot mode,
   then switches to its pool.
 
+**Arenas.** An `arena { }` block (#236) allocates from a pool of its own, made when it is
+entered and freed (chunks and big blocks) when it ends; only its value, copied out by a
+generated `arenacopy$N`, survives. Arena memory is pool memory: it is never counted or
+reclaimed by the ingot heap's machinery. See section 9, "Arenas".
+
 **keep.** `keep(x)` calls a generated `keep$N` function per type. It copies strings
 (`rt_keep_str`), structs (`rt_keep_raw`, then their reference fields), slices
 (`rt_keep_slice`, then elements) and maps (a new ingot map, entry by entry) into the
@@ -124,8 +129,11 @@ stack has reset its pool (the end of a request or tick, `hearth.Reset()`). Then 
 children are dropped and it is freed. So `u := cache[k]` stays valid for the rest of the
 request even if another request replaces the entry. Values made while a core initializes
 its globals, and values stored where the compiler cannot count (through a parameter), are
-pinned: they are never freed. `hearth.RcStats()` reports the counted blocks, their bytes
-and the limbo length.
+pinned: they are never freed. A task that lives for a long time (a WebSocket, a `detach`
+loop) holds back releases on its core; past 2^20 queued blocks a core pins what it drops
+instead, so such a core leaks as before reclamation but its limbo stays bounded.
+`hearth.RcStats()` reports the counted blocks (pinned ones included), their bytes and the
+limbo length.
 
 ## 4. Cores and threads: hearth
 
@@ -150,7 +158,11 @@ Each core has a box in a process-wide array of 256 boxes. A box is:
 
 `Send(core, msg)` copies the message into a malloc'd node, links it, and writes one byte
 to the wake pipe only if the receiver set its waiting flag. `Recv()` pops, or sets the
-flag, re-checks (no lost wake-ups), then blocks in `poll` on the pipe. Event loops
+flag, re-checks (no lost wake-ups), then blocks in `poll` on the pipe: it stops the whole
+core and ignores deadlines and cancels. `Next()` does the same through
+`rt_task_wait(pipe, 1, 0)`, so inside a task the core serves others meanwhile, and a deadline
+(`within`, the request's) or a cancel fails it with `rt_wait_fault()` (#316); one task per core
+watches the pipe and the others look again every millisecond. Event loops
 register `relay.WakeFD()`, call `relay.Arm()` before sleeping and `relay.Drain(h)` when it
 fires. Messages are copied into the receiver's request pool.
 
@@ -339,6 +351,14 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   the deferred calls it registered, ends that tick or that message's handler, and the core goes
   on (the remaining messages are handled at once). A panic in `main` outside a `guard`, or a
   stack overflow, still ends the process.
+- `guard { ... }` (#230, edition 1) is a boundary that turns a panic inside it into a fault:
+  the panic's message goes to stderr with its backtrace, the deferred calls and the
+  resource-cleanup callbacks registered inside the guard run, and the guard's value is a
+  `fault.Panic` fault (`panic: <message>`) whose `fault.Backtrace(err)` is that backtrace, one
+  function per line (#142). Cleanups registered before the guard wait for their task's end.
+  `guard f(x)` (or `guard try f(x)`) is the same guard around one call (#142). A spawned
+  child's panic is its scope's fault in the same form. The guard does not yet discard the
+  memory the guarded code allocated: that waits for sub-regions (#236).
 - A connection closed while its request waits is marked dead and freed when the task ends.
 - Finished tasks free overflow pool chunks and big blocks. Each core caches at most
   64 task records; excess records release their base pool and unmap their stacks.
@@ -370,6 +390,11 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   reuse its task safely. A late completion calls `drop(job)` and never resumes the old
   task. Already-running system calls can still finish after the caller's deadline;
   their results are discarded. Outside a task the helper runs synchronously.
+- Standard input and streams (#316): inside a task, when the descriptor is a pipe, socket or
+  terminal, `quarry.ReadStdin` and `flume.Reader` wait with `rt_task_wait(fd, 1, 0)` before
+  each read and fail with `rt_wait_fault()`; a flume reader's wait fault is cleared by its next
+  read. Regular files, other devices and code outside a task read directly, as before.
+  `relay.Next` is the receive that waits the same way (§5).
 - Boundaries (Tin 1, notes/interface_boundaries.md): each request task has a root boundary
   record under its core's root, holding its deadline and cancel state; block boundaries nest
   under it. `rt_bnd_cancel(b, reason)` cancels `b` and everything inside it (never its parent
@@ -387,6 +412,18 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   while it may go on), for code that does not wait or wants to stop at a point of its own.
 - `once { ... }` (#236) runs its block the first time each core reaches it (globals are per
   core, so this is the unit; process-wide one-time work belongs in `on app.start`).
+- Arenas (#236, edition 1, notes/interface_arena.md): `arena { }` is `arena$N(c)`, which
+  opens a `bkArena` boundary with a fresh pool (`rt_arena_open`), runs the block's closure
+  (`rt_arena_run`), gives the context the parent pool back (`rt_arena_out`), copies the fault
+  (`rt_arena_fault`) and the value (a generated `arenacopy$N`, the pool twin of `keep$N`)
+  into it, and frees the arena's chunks (`rt_arena_close`). The record's `bRegion` points to
+  the arena's saved pool words. A pool's words have one home while its code is not running:
+  `rt_arena_open` writes the parent's back to theirs first, so scope children that share the
+  parent's pool keep allocating in it while the arena body waits, and `rt_task_run` keeps a
+  task's arena pool in its innermost arena (`rt_pool_home`). An unwind that passes through
+  an arena frees it: `rt_land` (guard, limit and within landings, with the landing fault
+  copied out first) and `rt_bnd_task_end` (a task ended by panic, with a scope child's fault
+  copied out). Its chunks charged to a `limit` are given back.
 - Budgets (#235): `limit memory n, tasks k { }` counts the pool chunks and big blocks taken
   inside it (the bump fast path is not touched) and tasks started in it. Passing the memory
   budget leaves the block with `fault.LimitExceeded` at once (its defers and cleanups run).
@@ -653,6 +690,42 @@ err := r.Serve(":8080")                        // fails first if a pattern is ba
   network or a local TLS proxy. SSL-only servers fail clearly. CancelRequest is not sent;
   a timed-out query loses its connection and the server detects that disconnect.
 
+### Recording requests for replay (#241)
+
+A server records requests so that a failure seen in production can be replayed later with
+`tin replay` (#242). The design is `notes/design_semantics.md` §12, and the names and byte
+layouts are in `notes/interface_replay.md`.
+
+- **Switches**, read once before the cores start. Recording is on when `TIN_REPLAY_DIR`
+  (the spool directory) and `TIN_REPLAY_KEY` (64 hex digits) are both set. A malformed key
+  prints one line on stderr and leaves recording off. `TIN_REPLAY_SAMPLE` (0 to 1) is the
+  fraction of successful requests to keep as well; requests ending in a 5xx or a panic are
+  always kept. `TIN_REPLAY_MAX_MB` (default 256) bounds the spool, deleting the oldest
+  capsules first. `TIN_REPLAY_SECRET_HEADERS` adds header names to `Authorization`,
+  `Proxy-Authorization` and `Cookie`, whose values are stored as keyed handles.
+  `TIN_REPLAY_DROP_HEADERS` names headers stored empty.
+- **The tape.** Each request task gets a tape, malloc'd and outside the request pool, that
+  holds a copy of the request bytes. Scope children share it. Every effect a client
+  performs is appended to it in completion order: clocks (`tide`), the request's random
+  seed (`dice`), `seal.RandomBytes`, `wire` (HTTP, dial, read, write), `redis`, `mysql`,
+  `postgres`, `websocket` and `quarry`. Each record holds its kind, its key (what was
+  asked) and its outcome (the result, or the fault with its runtime sentinel). A live call
+  runs with the tape suspended, so a client calling itself is recorded once.
+- **Secrets never reach a capsule as text.** Secret headers, the values of those headers
+  in `wire` keys, and secret values written into query literals (`query.Hidden`) are
+  stored as `tin-secret:` and 32 hex digits of HMAC-SHA256 under a key derived from
+  `TIN_REPLAY_KEY`. Logins (Redis `AUTH`, database passwords) happen inside the live call
+  and are never recorded.
+- **Capsules.** When a request task ends, `lib/replay` keeps its tape when the status is
+  500 or more, the request panicked, or it is in the sample. The capsule is written on the
+  core after the task ended, as `WALL-CORE-N.tcap` in the spool, via a `.tmp` file and a
+  rename. The body (the request, the status, the panic message and the effect records) is
+  encrypted with an HMAC-SHA256 keystream and authenticated by an HMAC tag, so a wrong key
+  or a changed byte is refused.
+- **Cost.** Off, each effect call site tests the running task's tape: one per-core load
+  and a branch. A request costs one shared load in anvil. On, a request copies its bytes
+  once, and each effect appends one record (about 110 ns on a 2.8 GHz x86-64).
+
 ## 10. JSON: argo
 
 - `argo.Put(mut b, v)` compiles to a call of a generated encoder `argo$N(b, x)` per type.
@@ -700,8 +773,30 @@ functions keep that rule, and grows as phase 1 lands.
 | `NewAESGCM`, `AEAD.Seal` and `AEAD.Open` for AES-GCM: on the CPU's AES-NI/PCLMULQDQ or ARMv8 AESE/AESMC/PMULL instructions when it has them (`selfhost/aes_hw.tin`), else bitsliced AES with the S-box as GF(2^8) inversion and GHASH by multiplication with holes | the key, the data and the tag | the lengths, and which path the CPU allows |
 | `P256PublicKey`, `P256ECDH` and the field and point code under them (`field.tin`, `p256.tin`) | the private key and every coordinate | the validity checks of the key and the peer's point, whose results are public |
 
+| `monty_new` (`bignum.tin`: Montgomery constants for a modulus given at run time) | the modulus's value | its limb count and bit length |
+| `SignPKCS1v15`, `SignPSS` (`rsa_sign.tin`: CRT, base blinding by r^e, r^-1 by Fermat inversion in each prime, a public-key check of every signature) and `monty_exp_ct`, `monty_reduce`, `nat_mul_ct` under them | the private key, the message representative and r | the key's size; PSS's salt is random and public |
+| `SignECDSA`, `PrivateKey.SignTLS` (`ecdsa_sign.tin`: RFC 6979 nonces by `Hmac`, k·G by `p256_mul` or `ec_mul_ct`, k^-1 as k^(n-2) with the public exponent) | the private scalar and the nonce | the digest, and the (negligibly rare, public) retry when a nonce candidate is not below n |
+| `ParsePrivateKeyPEM`, `ParsePrivateKeyDER` | nothing: the key's encoding (lengths, tags) is parsed with ordinary branches | |
+
 `Sha1`, `Pbkdf2Sha256`, the hex and base64 codecs and the RSA-OAEP code are not
 constant-time and must not be used on secrets in a timing-sensitive protocol path.
 `TIN_SEAL_SOFT=1` in the environment makes AES-GCM use the software path even on a CPU with
+the instructions (for tests).
+
+Signature verification and certificates (#124 phase 2) see only public data and are not
+constant-time by design: `VerifyPKCS1v15`, `VerifyPSS`, `VerifyECDSA` (and `p384.tin`'s
+curve code, used only for it), `ParseCertificate`, `DecodePEM`,
+`Certificate.Verify`, `CheckSignature`, `CheckTLSSignature` and `VerifyHostname`.
+Certificate policy: a chain is built from the leaf through `VerifyOptions.Intermediates` to
+`Roots` (default: the system bundle, read once per core from the paths in
+`roots_linux.tin`/`roots_darwin.tin` or `SSL_CERT_FILE`); every certificate must be within its
+validity period, intermediates must be CAs (basic constraints) allowed to sign certificates
+(key usage), path lengths, extended key usages and DNS/IP name constraints hold, signatures
+use SHA-256/384/512 (SHA-1 is refused) with RSA keys of 2048 to 8192 bits or ECDSA P-256/P-384, no certificate
+has an unhandled critical extension, and the chain holds at most `MaxChain` (8) certificates.
+Host names follow RFC 6125: DNS SANs only (the common name is ignored), one leftmost `*`
+label over at least two more labels, IP literals against IP SANs. The parser is strict DER and
+rejects every certificate Go's `crypto/x509` rejects (`tools/ci/x509_check.py` checks this on
+byte-flipped certificates).
 the instructions (for tests). Vectors: `tools/ci/crypto_check.py` runs the Wycheproof files in `tests/wycheproof/`
 (including the invalid inputs) and random inputs checked against Python's `hashlib`.

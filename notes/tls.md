@@ -54,6 +54,12 @@ received (DER, leaf first), the server name, the SignatureScheme and the Certifi
 content (64 spaces, the context string, a zero byte, the transcript hash). Until that API is on
 main, `verify_peer` refuses every server unless `InsecureSkipVerify` is set.
 
+Phase 2's files: `der.tin` (strict DER reader), `bignum.tin` (`monty_new`: Montgomery constants
+computed at run time, so `field.tin`'s `monty` serves RSA moduli), `rsa.tin` (PKCS #1 v1.5 and
+PSS verification), `x509.tin` (PEM, certificates, pools, chains, host names),
+`roots_linux.tin` / `roots_darwin.tin` (system bundle paths), `ecdsa.tin` (`VerifyECDSA`),
+`p384.tin` (P-384 over a curve value); later `ed25519.tin`. All exported, in `seal`.
+
 ## lib/tls (phase 3)
 
 | file | contents | used by the server (phase 5) |
@@ -92,3 +98,16 @@ Tests: `tools/ci/tls_check.py` (CI.md).
   to connect.
 - Known gap: a TLS write that times out drops the connection (a TLS record cannot be half
   written and resumed by the client's own loop); reads keep the connection in step.
+The client parses the Certificate message's entries with `ParseCertificate`, puts all but the
+first into an `Intermediates` pool, and calls `leaf.Verify` with `DNSName` set to the server
+name (an IP literal is checked against the IP SANs). `Roots` nil means `SystemRoots()` (read
+once per core; `SSL_CERT_FILE` overrides the path); `Config.RootCAs` PEM goes into a pool with
+`AddPEM`. `Now` 0 means the clock; `KeyUsages` empty means server authentication. `Verify`
+returns the chain, leaf first. Then `leaf.CheckTLSSignature(scheme, signed, sig)` checks
+CertificateVerify, `signed` being the 64 spaces, the context string, a zero byte and the
+transcript hash, as RFC 8446 §4.4.3 builds it. `scheme` is the SignatureScheme code
+(0x0804-0x0806 RSA-PSS, 0x0403 ECDSA P-256 and 0x0503 ECDSA P-384, each checking that the
+certificate's key is on the scheme's curve; 0x0807 when Ed25519 lands). Faults start
+with "x509: " and name the reason: expired or not yet valid, the names the certificate is
+valid for, unknown authority, not a CA, bad signature, SHA-1, chain too long, path length,
+key usage, name constraints, unhandled critical extension.

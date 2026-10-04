@@ -1,0 +1,171 @@
+package seal
+
+// Montgomery constants computed at run time, so field.tin's monty serves any odd modulus (RSA
+// moduli and curve primes without precomputed constants). monty_new takes time that depends only
+// on the modulus's limb count and bit length, never on its value beyond that.
+
+// monty_new prepares field.tin's Montgomery arithmetic modulo the odd big-endian number mod
+// (at least 64 bits; leading zero bytes are ignored).
+func monty_new(mod []u8) !monty {
+	at := 0
+	for at < len(mod) && mod[at] == 0 {
+		at++
+	}
+	b := mod[at:]
+	if len(b) < 8 || b[len(b)-1]&1 == 0 {
+		fail "seal: modulus must be odd and at least 64 bits"
+	}
+	n := (len(b) + 3) / 4
+	m := make([]u64, n)
+	for i := 0; i < len(b); i++ {
+		k := len(b) - 1 - i
+		m[k/4] |= u64(b[i]) << u64(8*(k%4))
+	}
+	// Newton's iteration doubles the correct low bits of m[0]^-1 mod 2^32 each step.
+	x := m[0]
+	for i := 0; i < 5; i++ {
+		x = (x * (2 - m[0]*x)) & 0xffffffff
+	}
+	f := new_monty(m, make([]u64, n), make([]u64, n), (0-x)&0xffffffff)
+	// R mod m: start from 2^(bits-1) < m and double up to 2^(32n), reducing each time.
+	bits := 32 * n
+	for (m[n-1]>>u64(31-(32*n-bits)))&1 == 0 {
+		bits--
+	}
+	acc := f.elem()
+	acc[(bits-1)/32] = u64(1) << u64((bits-1)%32)
+	for i := bits - 1; i < 32*n; i++ {
+		f.add(mut acc, acc, acc)
+	}
+	f.set(mut f.one, acc)
+	// R^2 mod m is 2^(32n) in Montgomery form: raise 2R mod m (2 in Montgomery form) to 32n.
+	f.add(mut acc, acc, acc)
+	e := 32 * n
+	eb := []u8{}
+	for k := 24; k >= 0; k -= 8 {
+		if len(eb) > 0 || (e>>u64(k))&0xff != 0 {
+			eb = append(eb, u8(e>>u64(k)))
+		}
+	}
+	f.exp(mut f.rr, acc, eb)
+	return f
+}
+
+// monty_bytes pads big-endian b with leading zeros to the 4n bytes from_bytes takes; b must fit.
+func monty_bytes(f monty, b secret []u8) []u8 {
+	if len(b) == 4*f.n {
+		return b
+	}
+	out := make([]u8, 4*f.n)
+	for i := 0; i < len(b) && i < 4*f.n; i++ {
+		out[4*f.n-1-i] = b[len(b)-1-i]
+	}
+	return out
+}
+
+// ---- constant-time helpers for private keys (RSA CRT, ECDSA signing) ----
+
+// monty_exp_ct sets z = x^e in Montgomery form with 4-bit fixed windows: every window squares
+// four times, reads all 16 table entries and multiplies once, so the time depends only on
+// len(e) and f.n, not on e or x. z may alias x.
+func monty_exp_ct(f mut monty, z mut []u64, x []u64, e secret []u8) {
+	n := f.n
+	table := make([]u64, 16*n)
+	prev := f.elem()
+	f.set(mut prev, f.one)
+	for j := 0; j < n; j++ {
+		table[j] = prev[j]
+	}
+	for k := 1; k < 16; k++ {
+		f.mul(mut prev, prev, x)
+		for j := 0; j < n; j++ {
+			table[k*n+j] = prev[j]
+		}
+	}
+	acc := f.elem()
+	f.set(mut acc, f.one)
+	sel := f.elem()
+	for i := 0; i < len(e)*2; i++ {
+		for s := 0; s < 4; s++ {
+			f.mul(mut acc, acc, acc)
+		}
+		w := u64(e[i/2]>>u8(4-4*(i%2))) & 15
+		for j := 0; j < n; j++ {
+			sel[j] = 0
+		}
+		for k := 0; k < 16; k++ {
+			d := u64(k) ^ w
+			mask := ((d | (0 - d)) >> 63) - 1
+			for j := 0; j < n; j++ {
+				sel[j] |= table[k*n+j] & mask
+			}
+		}
+		f.mul(mut acc, acc, sel)
+	}
+	f.set(mut z, acc)
+}
+
+// monty_reduce sets z to the big-endian number b (any length) mod m, in Montgomery form, in
+// time that depends only on len(b) and f.n: Horner's rule over 32-bit limbs, multiplying by
+// 2^32 with one Montgomery multiplication per limb.
+func monty_reduce(f mut monty, z mut []u64, b secret []u8) {
+	shift := f.elem()
+	two32 := []u8{1, 0, 0, 0, 0}
+	f.from_bytes(mut shift, monty_bytes(f, two32))
+	acc := f.elem()
+	limb := f.elem()
+	pad := (4 - len(b)%4) % 4
+	for i := 0; i < len(b)+pad; i += 4 {
+		f.mul(mut acc, acc, shift)
+		v := u64(0)
+		for k := 0; k < 4; k++ {
+			at := i + k - pad
+			c := u64(0)
+			if at >= 0 {
+				c = u64(b[at])
+			}
+			v = v<<8 | c
+		}
+		limb[0] = v
+		f.add(mut acc, acc, limb)
+	}
+	f.mul(mut z, acc, f.rr)
+}
+
+// nat_mul_ct is the full product of little-endian 32-bit limb numbers a and b, with fixed loops.
+func nat_mul_ct(a []u64, b []u64) []u64 {
+	out := make([]u64, len(a)+len(b))
+	for i := 0; i < len(a); i++ {
+		c := u64(0)
+		for j := 0; j < len(b); j++ {
+			s := out[i+j] + a[i]*b[j] + c
+			out[i+j] = s & 0xffffffff
+			c = s >> 32
+		}
+		out[i+len(b)] = c
+	}
+	return out
+}
+
+// nat_add_ct adds b into a (len(b) <= len(a)) with fixed loops; the carry out of a is dropped.
+func nat_add_ct(a mut []u64, b []u64) {
+	c := u64(0)
+	for j := 0; j < len(a); j++ {
+		bj := u64(0)
+		if j < len(b) {
+			bj = b[j]
+		}
+		s := a[j] + bj + c
+		a[j] = s & 0xffffffff
+		c = s >> 32
+	}
+}
+
+// monty_plain is x (Montgomery form) out of Montgomery form, as f.n limbs.
+func monty_plain(f mut monty, x []u64) []u64 {
+	one := f.elem()
+	one[0] = 1
+	y := f.elem()
+	f.mul(mut y, x, one)
+	return y
+}

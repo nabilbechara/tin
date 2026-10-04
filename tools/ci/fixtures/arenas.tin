@@ -1,0 +1,69 @@
+package main
+
+import "anvil"
+import "mint"
+import "quarry"
+import "say"
+import "tide"
+
+// step takes about 8 MB from the pool it runs in and writes every page of it.
+fn step(seed i64) i64 {
+	mut xs = make([]i64, 1000000)
+	for i in 0..len(xs) {
+		xs[i] = seed + i
+	}
+	return xs[len(xs) - 1] - seed
+}
+
+// batch runs steps steps, each in an arena of its own or (plain) in the pool around them.
+fn batch(steps i64, inArena bool) i64 {
+	mut total i64 = 0
+	for i in 0..steps {
+		if inArena {
+			total += arena {
+				step(i)
+			}
+		} else {
+			total += step(i)
+		}
+	}
+	return total
+}
+
+// work is a request that runs 8 arena steps of about 4 MB, each waiting inside its arena so
+// other requests' arenas interleave with it on the core, and answers with their values.
+fn work(q anvil.Req, w mut anvil.Out) {
+	mut parts = make([]str, 0, 8)
+	for i in 0..8 {
+		let part = arena {
+			mut xs = make([]i64, 500000)
+			for j in 0..len(xs) {
+				xs[j] = j
+			}
+			try tide.Wait(tide.Millisecond)
+			"{i}:{xs[len(xs) - 1]}"
+		} catch err {
+			w.Text("fault: {err}")
+			return
+		}
+		parts = append(parts, part)
+	}
+	let id = q.PathParam("id")
+	w.Text("work {id} {parts}")
+}
+
+fn main() {
+	let mode = quarry.Getenv("ARENA_BATCH")
+	if mode != "" {
+		let steps = mint.Atoi(quarry.Getenv("ARENA_STEPS")) catch err {
+			say.Line("bad ARENA_STEPS:", err)
+			return
+		}
+		say.Line("total", batch(steps, mode == "arena"))
+		return
+	}
+	mut r = anvil.NewRouter()
+	r.Get(`/work/{id}`, work)
+	let err = r.Serve(":0")
+	say.Line(err)
+}

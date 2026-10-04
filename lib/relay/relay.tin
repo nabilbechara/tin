@@ -4,6 +4,7 @@
 //
 //	relay.Send(2, "hello")              // from any core
 //	from, msg := relay.Recv()           // on core 2: blocks until a message arrives
+//	from, msg := try relay.Next()       // the same, but fails on a deadline or cancel
 package relay
 
 import "hearth"
@@ -92,7 +93,8 @@ func TryRecv() (i64, str, bool) {
 	return next[1], rt_str_from_raw(next+24, next[2]), true
 }
 
-// Recv blocks until a message for this core arrives and returns its sender and text.
+// Recv blocks until a message for this core arrives and returns its sender and text. It
+// blocks the whole core and ignores deadlines and cancels; use Next in tasks and within blocks.
 func Recv() (i64, str) {
 	b := box(rt_core_id())
 	for {
@@ -108,6 +110,44 @@ func Recv() (i64, str) {
 			return from2, msg2
 		}
 		wait_readable(b[3])
+		drain_pipe(b[3])
+	}
+}
+
+// nextWaiting is true while a task on this core waits on the wake pipe in Next.
+var nextWaiting = false
+
+// Next waits until a message for this core arrives and returns its sender and text. Unlike
+// Recv it waits through rt_task_wait: inside a task the core serves other tasks meanwhile,
+// and a deadline (within, the request's) or a cancel ends the wait with that fault. Under
+// anvil.OnRelay the event loop takes every message, so do not call Next there.
+func Next() !(i64, str) {
+	b := box(rt_core_id())
+	for {
+		from, msg, ok := TryRecv()
+		if ok {
+			return from, msg
+		}
+		// One task watches the pipe; others on this core look again every millisecond.
+		if nextWaiting {
+			if rt_task_wait(-1, 0, 1000000) == waitDeadline {
+				fail cast(fault, rt_wait_fault())
+			}
+			continue
+		}
+		// Ask senders to wake us, then look once more before sleeping (no lost wake-ups).
+		__atomic_store(b+16, 1)
+		from2, msg2, ok2 := TryRecv()
+		if ok2 {
+			__atomic_store(b+16, 0)
+			return from2, msg2
+		}
+		nextWaiting = true
+		r := rt_task_wait(b[3], 1, 0)
+		nextWaiting = false
+		if r == waitDeadline {
+			fail cast(fault, rt_wait_fault())
+		}
 		drain_pipe(b[3])
 	}
 }

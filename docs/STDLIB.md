@@ -12,6 +12,7 @@ Generated from the comments in `lib/*/` by `tools/gendoc.py`.
 | [hearth](#hearth) | cores and threads (runtime) |
 | [relay](#relay) | messages between cores (channels) |
 | [task](#task) | deadline and cancellation of the running code (context) |
+| [lane](#lane) | bounded queues between tasks on a core (channels) |
 | [wire](#wire) | TCP and HTTP client (net) |
 | [tls](#tls) | TLS 1.3 client (crypto/tls) |
 | [twine](#twine) | strings (strings) |
@@ -31,7 +32,7 @@ Generated from the comments in `lib/*/` by `tools/gendoc.py`.
 | [atlas](#atlas) | functions on maps (maps) |
 | [cairn](#cairn) | containers (container/heap, sets, LRU) |
 | [stamp](#stamp) | hashes and checksums (hash/*) |
-| [seal](#seal) | crypto and encodings (crypto/sha256, hmac, encoding/hex, base64) |
+| [seal](#seal) | crypto and encodings (crypto/sha256, sha512, hmac, hkdf, ecdh, rsa, x509, encoding/hex, base64, pem) |
 | [herald](#herald) | logging (log/slog) |
 | [crucible](#crucible) | testing helpers (testing) |
 | [constraints](#constraints) | named generic constraint shapes |
@@ -40,6 +41,7 @@ Generated from the comments in `lib/*/` by `tools/gendoc.py`.
 | [mysql](#mysql) | MySQL client (database/sql with go-sql-driver/mysql) |
 | [postgres](#postgres) | PostgreSQL client (database/sql with pgx) |
 | [websocket](#websocket) | WebSocket server and client (gorilla/websocket) |
+| [replay](#replay) | production replay capsules (notes/interface_replay.md) |
 
 ## say
 
@@ -195,13 +197,15 @@ Package relay carries messages between cores, which share no memory. A message i
 ```go
 relay.Send(2, "hello")              // from any core
 from, msg := relay.Recv()           // on core 2: blocks until a message arrives
+from, msg := try relay.Next()       // the same, but fails on a deadline or cancel
 ```
 
 - `Send(to i64, msg str)`: Send copies msg into core to's inbox; it never blocks.
 - `Broadcast(msg str)`: Broadcast sends msg to every other running core.
 - `Cores() i64`: Cores is the number of cores the program started.
 - `TryRecv() (i64, str, bool)`: TryRecv returns the next message for this core, if there is one.
-- `Recv() (i64, str)`: Recv blocks until a message for this core arrives and returns its sender and text.
+- `Recv() (i64, str)`: Recv blocks until a message for this core arrives and returns its sender and text. It blocks the whole core and ignores deadlines and cancels; use Next in tasks and within blocks.
+- `Next() !(i64, str)`: Next waits until a message for this core arrives and returns its sender and text. Unlike Recv it waits through rt_task_wait: inside a task the core serves other tasks meanwhile, and a deadline (within, the request's) or a cancel ends the wait with that fault. Under anvil.OnRelay the event loop takes every message, so do not call Next there.
 - `WakeFD() i64`: WakeFD is this core's wake-up descriptor, for event loops: after it turns readable, call Drain. Arm must be called before the loop blocks.
 - `Arm()`: Arm asks senders to wake this core through WakeFD (call just before blocking).
 - `Drain(h func(i64, str))`: Drain runs h on every waiting message (event loops call it after WakeFD fires).
@@ -214,6 +218,19 @@ Package task reads the deadline and cancellation of the running code, which belo
 
 - `Deadline() i64`: Deadline is the effective deadline of the running code in tide.Now() nanoseconds (the earliest of its request's and every enclosing within block's), or 0 when it has none.
 - `Canceled() !`: Canceled is nil while the running code may go on, else the fault its next wait would fail with: fault.DeadlineExceeded once the deadline has passed, fault.LimitExceeded past a budget, or fault.Canceled wrapping the reason of a cancel or drain.
+
+## lane
+
+- `type Lane[T constraints.Any] struct`: Lane is a bounded queue between tasks on one core (design_semantics §6, #232). Send waits while it is full and Recv while it is empty; Close wakes every waiter. Waits take the task's deadline and cancellation like any other wait. A lane never crosses cores (relay does).
+- `New[T constraints.Any](capacity i64) Lane[T]`: New makes a lane that holds at most capacity values (at least one).
+- `(l mut Lane[T]) Send(v T) !`: Send puts v at the back, waiting while the lane is full; it fails once the lane is closed.
+- `(l mut Lane[T]) TrySend(v T) bool`: TrySend puts v at the back if there is room and reports whether it did.
+- `(l mut Lane[T]) Recv() !T`: Recv takes the value at the front, waiting while the lane is empty; it fails with "lane closed" once the lane is closed and empty.
+- `(l mut Lane[T]) Close()`: Close ends the lane: senders fail, receivers drain what is left and then fail.
+- `(l Lane[T]) Ready() bool`: Ready reports whether Recv would not wait: a value is there or the lane is closed (select).
+- `(l mut Lane[T]) Watch()`: Watch makes the next value or Close wake the running task without taking a value (select).
+- `(l mut Lane[T]) Unwatch()`: Unwatch withdraws Watch.
+- `(l Lane[T]) Len() i64`: Len is how many values wait in the lane.
 
 ## wire
 
@@ -599,7 +616,7 @@ Package ore works on byte slices ([]u8), like Go's bytes. Functions that append 
 
 Package flume reads and writes file descriptors through 64 KiB buffers: lines, whole files and buffered output with one write per flush.
 
-- `type Reader struct`: Reader buffers reads from a file descriptor.
+- `type Reader struct`: Reader buffers reads from a file descriptor. Inside a task it waits on a pipe, socket or terminal through rt_task_wait, so a deadline or cancel fails the read (the next read retries).
 - `type Writer struct`: Writer buffers writes to a file descriptor.
 - `New(fd i64) Reader`: New reads from fd.
 - `Open(path str) !Reader`: Open reads the file at path.
@@ -628,7 +645,7 @@ Package quarry is the operating system interface (like Go's os): arguments, envi
 - `Setenv(key str, value str) !`: Setenv sets environment variable key to value; an empty key or one holding '=' or NUL is a fault.
 - `Unsetenv(key str) !`: Unsetenv removes environment variable key.
 - `ReadFile(path str) !str`: ReadFile returns the whole content of the file at path.
-- `ReadStdin() !str`: ReadStdin reads standard input to its end.
+- `ReadStdin() !str`: ReadStdin reads standard input to its end. Inside a task, from a pipe, socket or terminal, it waits through rt_task_wait: the core serves others, and a deadline or cancel fails it.
 - `WriteFile(path str, data str) !`: WriteFile writes data to the file at path, creating it (mode 0644) or truncating it.
 - `AppendFile(path str, data str) !`: AppendFile appends data to the file at path, creating it (mode 0644) when needed.
 - `Exists(path str) bool`: Exists reports whether path names an existing file or directory (symlinks are followed).
@@ -940,7 +957,7 @@ Package stamp computes non-cryptographic hashes and checksums: FNV-1a, CRC-32 (I
 
 ## seal
 
-Package seal has cryptographic hashes (SHA-256, SHA-384, SHA-512, SHA-1), HMAC over any of the SHA-2 hashes, HKDF, PBKDF2-HMAC-SHA-256, constant-time comparison, secure random bytes, the hex and base64 encodings, and RSA-OAEP encryption with a public key.
+Package seal has cryptographic hashes (SHA-256, SHA-384, SHA-512, SHA-1), HMAC over any of the SHA-2 hashes, HKDF, PBKDF2-HMAC-SHA-256, P-256 ECDH, RSA signature verification (PKCS #1 v1.5 and PSS), X.509 certificates with chain and host name verification, constant-time comparison, secure random bytes, the hex, base64 and PEM encodings, and RSA-OAEP encryption with a public key.
 
 - `type AEAD struct`: AEAD is an authenticated cipher with its key (AES-GCM or ChaCha20-Poly1305): Seal encrypts and appends a 16-byte tag, Open checks the tag in constant time and decrypts.
 - `NewChaCha20Poly1305(key secret []u8) !AEAD`: NewChaCha20Poly1305 is the RFC 8439 AEAD with a 32-byte key.
@@ -952,6 +969,10 @@ Package seal has cryptographic hashes (SHA-256, SHA-384, SHA-512, SHA-1), HMAC o
 - `AESHardware() bool`: AESHardware reports whether AES-GCM runs on the CPU's AES instructions here (AES-NI and PCLMULQDQ, or ARMv8 AES and PMULL); without them it runs a slower constant-time software path and ChaCha20-Poly1305 is the faster choice.
 - `NewAESGCM(key secret []u8) !AEAD`: NewAESGCM is AES-GCM (16-byte tags, 12-byte nonces) with a 16-, 24- or 32-byte key (AES-128, AES-192 or AES-256).
 - `ChaCha20(key secret []u8, nonce []u8, counter u32, data []u8) ![]u8`: ChaCha20 XORs data with the ChaCha20 keystream (RFC 8439) for a 32-byte key, a 12-byte nonce and the initial block counter.
+- `ParseRSAPublicKeyDER(der []u8) !RSAPublicKey`: ParseRSAPublicKeyDER reads a DER RSAPublicKey (PKCS #1) or SubjectPublicKeyInfo holding one.
+- `VerifyECDSA(curve str, pub []u8, digest []u8, sig []u8) !`: VerifyECDSA checks a DER-encoded ECDSA signature over digest (a hash of the message) by the public key pub, an uncompressed point on curve ("P-256" or "P-384"). A digest longer than the curve's order is truncated to its leftmost bytes, as FIPS 186-5 says.
+- `SignECDSA(k ECPrivateKey, h Hash, digest []u8) ![]u8`: SignECDSA signs digest (a hash of the message, made with h) with k and returns a DER ECDSA-Sig-Value. The nonce is RFC 6979's, derived with HMAC over h, so equal inputs give equal signatures.
+- `(k PrivateKey) SignTLS(scheme i64, msg []u8) ![]u8`: SignTLS signs msg (the bytes a TLS 1.3 CertificateVerify covers) with k under scheme: RSA-PSS 0x0804-0x0806 for RSA keys, 0x0403 for P-256 and 0x0503 for P-384.
 - `type Hash enum { SHA256, SHA384, SHA512 }`: Hash names a SHA-2 function for Hmac and HKDF.
 - `Sum(h Hash, s secret str) []u8`: Sum is the digest of s under h; s may be secret.
 - `Size(h Hash) i64`: Size is the length in bytes of h's digest.
@@ -960,9 +981,20 @@ Package seal has cryptographic hashes (SHA-256, SHA-384, SHA-512, SHA-1), HMAC o
 - `HkdfExtract(h Hash, salt str, ikm secret str) []u8`: HkdfExtract is HKDF-Extract(salt, ikm) (RFC 5869): a pseudorandom key of Size(h) bytes. An empty salt means Size(h) zero bytes. ikm may be secret.
 - `HkdfExpand(h Hash, prk secret str, info str, n i64) ![]u8`: HkdfExpand is HKDF-Expand(prk, info, n) (RFC 5869): n bytes, at most 255*Size(h). prk may be secret.
 - `HkdfExpandLabel(h Hash, key secret str, label str, context str, n i64) ![]u8`: HkdfExpandLabel is TLS 1.3's HKDF-Expand-Label(secret, label, context, n) (RFC 8446 section 7.1); label is given without the "tls13 " prefix. key may be secret.
+- `type RSAPrivateKey struct`: RSAPrivateKey is an RSA key with its CRT values; the private parts can only be read by seal.
+- `type ECPrivateKey struct`: ECPrivateKey is an ECDSA key on P-256 or P-384: the curve, the scalar and the uncompressed public point.
+- `type PrivateKey struct`: PrivateKey is an RSA or ECDSA private key, as ParsePrivateKeyPEM reads it.
+- `ParsePrivateKeyDER(der []u8) !PrivateKey`: ParsePrivateKeyDER reads a PKCS #8 PrivateKeyInfo, a PKCS #1 RSAPrivateKey or a SEC 1 ECPrivateKey.
+- `ParsePrivateKeyPEM(pem str) !PrivateKey`: ParsePrivateKeyPEM reads the first "PRIVATE KEY", "RSA PRIVATE KEY" or "EC PRIVATE KEY" block of pem.
+- `(k PrivateKey) MatchesCertificate(c Certificate) bool`: MatchesCertificate reports whether k is the private key of c's public key.
 - `P256NewPrivateKey() []u8`: P256NewPrivateKey returns a random P-256 private key: 32 big-endian bytes in [1, n-1].
 - `P256PublicKey(priv secret []u8) ![]u8`: P256PublicKey is the uncompressed public key (65 bytes) of a P-256 private key; it fails unless priv is 32 bytes in [1, n-1]. Constant-time in priv.
 - `P256ECDH(priv secret []u8, peer []u8) ![]u8`: P256ECDH is the P-256 Diffie-Hellman shared secret (the 32-byte x coordinate of priv*peer). peer is an uncompressed or compressed public key; it fails for an invalid private key, a point not on the curve, or a result at infinity. Constant-time in priv.
+- `RSAKeyBits(key RSAPublicKey) i64`: RSAKeyBits is the size of key's modulus in bits.
+- `VerifyPKCS1v15(key RSAPublicKey, h Hash, digest []u8, sig []u8) !`: VerifyPKCS1v15 checks an RSASSA-PKCS1-v1_5 signature over digest, a hash made with h.
+- `VerifyPSS(key RSAPublicKey, h Hash, digest []u8, sig []u8, saltLen i64) !`: VerifyPSS checks an RSASSA-PSS signature over digest, a hash made with h, with MGF1 over the same hash. saltLen is the exact salt length, or -1 to accept any.
+- `SignPKCS1v15(k mut RSAPrivateKey, h Hash, digest []u8) ![]u8`: SignPKCS1v15 signs digest, a hash made with h, with RSASSA-PKCS1-v1_5 (deterministic).
+- `SignPSS(k mut RSAPrivateKey, h Hash, digest []u8) ![]u8`: SignPSS signs digest, a hash made with h, with RSASSA-PSS: MGF1 over h and a random salt as long as the digest (what TLS 1.3 requires).
 - `Sha256(s secret str) []u8`: Sha256 is the SHA-256 digest of s (32 bytes); s may be secret.
 - `Sha256Soft(s str) []u8`: Sha256Soft is SHA-256 in portable code (the reference the hardware path is tested against).
 - `Sha256Hex(s secret str) str`: Sha256Hex is the SHA-256 digest of s in lower-case hex; s may be secret.
@@ -987,6 +1019,29 @@ Package seal has cryptographic hashes (SHA-256, SHA-384, SHA-512, SHA-1), HMAC o
 - `X25519(scalar secret []u8, point []u8) ![]u8`: X25519 is the RFC 7748 function: the shared secret of a 32-byte private scalar and a peer's 32-byte public key. It fails for wrong lengths and when the result is all zeros (a low-order peer key), as TLS 1.3 requires. Constant-time in the scalar and the point.
 - `X25519NewPrivateKey() []u8`: X25519NewPrivateKey returns 32 random bytes to use as an X25519 private key.
 - `X25519PublicKey(priv secret []u8) ![]u8`: X25519PublicKey is the public key (32 bytes) of a 32-byte X25519 private key.
+- `type PEMBlock struct`: PEMBlock is one "-----BEGIN TYPE-----" block: its type and decoded bytes.
+- `DecodePEM(text str) ![]PEMBlock`: DecodePEM returns every PEM block in text, in order; text between blocks is ignored.
+- `type SignatureAlgorithm enum`: SignatureAlgorithm is how a certificate is signed.
+- `type PublicKeyAlgorithm enum`: PublicKeyAlgorithm is the kind of key a certificate holds.
+- `type Name struct`: Name is a distinguished name: the common attributes, and the DER bytes chains are matched on.
+- `type Certificate struct`: Certificate is a parsed X.509 v1/v3 certificate. Times are Unix seconds.
+- `(n Name) String() str`: String formats n like "CN=example.com,O=Example,C=US".
+- `ParseCertificate(der []u8) !Certificate`: ParseCertificate parses one DER certificate. Slices in the result share der's memory.
+- `ParseCertificatesPEM(pem str) ![]Certificate`: ParseCertificatesPEM parses every CERTIFICATE block in pem (other blocks are skipped).
+- `(c Certificate) CheckSignature(alg SignatureAlgorithm, signed []u8, sig []u8) !`: CheckSignature checks that sig is c's key's signature of signed under alg. SHA-1 is refused.
+- `(c Certificate) CheckSignatureFrom(parent Certificate) !`: CheckSignatureFrom checks that parent signed c. It does not check that parent may sign.
+- `(c Certificate) CheckTLSSignature(scheme i64, signed []u8, sig []u8) !`: CheckTLSSignature checks a TLS 1.3 CertificateVerify signature by c's key: scheme is the SignatureScheme code and signed the bytes the peer signed (padding, context and transcript hash).
+- `type CertPool struct`: CertPool is a set of certificates indexed by subject, used for roots and intermediates.
+- `NewCertPool() CertPool`: NewCertPool returns an empty pool.
+- `(p mut CertPool) Add(c Certificate)`: Add adds c to the pool unless it is already there.
+- `(p mut CertPool) AddPEM(pem str) !i64`: AddPEM adds every certificate in pem that parses and returns how many were added; it fails only when none could be.
+- `(p CertPool) Len() i64`: Len is the number of certificates in the pool.
+- `(p CertPool) Certificates() []Certificate`: Certificates returns the pool's certificates in the order they were added.
+- `SystemRoots() !CertPool`: SystemRoots loads the operating system's trusted roots (SSL_CERT_FILE overrides the location) once per core and returns them.
+- `type VerifyOptions struct`: VerifyOptions controls Verify. Roots nil means the system roots; Now 0 means the clock; DNSName "" skips the host name check; KeyUsages empty means server authentication; MaxChain 0 means 8 certificates, leaf and root included.
+- `(c Certificate) Verify(opts VerifyOptions) ![]Certificate`: Verify builds a chain from c through opts.Intermediates to a trusted root and checks it: validity periods, CA and key-usage rules, path lengths, name constraints, signatures (no SHA-1), the chain length and the host name. The chain is returned leaf first, root last.
+- `ParseIP(s str) ?[]u8`: ParseIP parses dotted IPv4 (4 bytes) or IPv6 text (16 bytes), optionally in brackets; nil if invalid.
+- `(c Certificate) VerifyHostname(host str) !`: VerifyHostname checks that c is valid for host: an IP address against the IP SANs, otherwise a DNS name against the DNS SANs (case-insensitive, one leftmost "*" label followed by at least two labels; a host containing "*" never matches). The common name is not used.
 
 ## herald
 
@@ -1209,3 +1264,24 @@ func echo(ws websocket.Conn, m websocket.Message) ! {
 - `IsClosed(err fault) bool`: IsClosed reports whether err is the normal end of a connection: the peer closed it.
 - `(c Conn) Read() !Message`: Read returns the next message; it answers pings and joins fragments on the way. When the peer closes, it answers the close and fails with "websocket: closed (code)". The returned message lives in the caller's pool. For a long-lived stream, use Each to reset message allocations after every callback without invalidating the Conn.
 - `(c Conn) Each(h func(Conn, Message) !) !`: Each reads messages and calls h until a read or callback fails. Every callback has a reusable message pool: use keep() to retain its data after the callback returns. The Conn and all objects allocated before Each remain valid. Callbacks may wait. A closed peer returns the same IsClosed fault as Read; callback faults propagate.
+
+## replay
+
+Reading replay capsules (notes/interface_replay.md, section 6; #242): the envelope's tag and keystream, the body, and the effect kinds this build can replay. Writing capsules, the spool and the keys of secrets are #241's, next to this file.
+
+- `type Capsule struct`: Capsule is a decoded capsule: one recorded request and its effect records.
+- `const Kinds = ",tide.now@1,tide.wall@1,dice.seed@1,seal.random@1,wire.http@1,wire.dial@1,wire.read@1,wire.write@1,redis@1,mysql@1,mysql.tx@1,postgres@1,postgres.tx@1,websocket.dial@1,websocket.read@1,websocket.write@1,quarry.read@1,quarry.write@1,quarry.stat@1,quarry.dir@1,quarry.fs@1,"`: Kinds lists the effect kinds (name@version) this build replays (section 4); a capsule with any other kind is refused. sched.* kinds join the list with their replay (#243).
+- `Open(path str, keyHex str) !Capsule`: Open reads the capsule at path, encrypted under keyHex (the 64 hex digits of TIN_REPLAY_KEY).
+- `Key(keyHex str) !str`: Key is the 32 bytes a TIN_REPLAY_KEY value (64 hex digits) stands for.
+- `Unseal(data str, key str) !str`: Unseal checks a capsule envelope's tag under key and returns its decrypted body.
+- `Decode(body str) !Capsule`: Decode reads a capsule body (schema 1) and checks every effect record and its kind.
+- `Supported(kind str) bool`: Supported reports whether this build replays effect kind (name@version).
+- `Setup(cores i64) bool`: Setup reads the switches (TIN_REPLAY_DIR, TIN_REPLAY_KEY, TIN_REPLAY_SAMPLE, TIN_REPLAY_MAX_MB, TIN_REPLAY_SECRET_HEADERS, TIN_REPLAY_DROP_HEADERS) for a server on n cores, trims the spool and installs the keyed hash of secrets; it reports whether recording is on (never while TIN_REPLAY_CAPSULE replays a capsule). Call it before the cores start. A missing or malformed key, or a spool that cannot be made, prints one line on stderr and leaves recording off.
+- `On() bool`: On reports whether Setup turned recording on.
+- `Secret(s str) str`: Secret is the handle an effect key or a stored header holds instead of a secret's text: "tin-secret:" and the first 16 bytes of HMAC-SHA256(Ks, s) in hex (section 5.1).
+- `Wanted(status i64, panicked bool) i64`: Wanted is the flags a capsule of a request that ended with status is kept with (1 panicked, 2 sampled), or -1 when it is dropped: kept when the status is 500 or more, or it panicked, or it is in the TIN_REPLAY_SAMPLE fraction.
+- `Done(tp i64, core i64)`: Done ends the recording tape tp of a request served on core: its capsule is written when the request is kept (Wanted), and the tape is freed. A capsule that cannot be written prints one line on stderr; the server goes on.
+- `Write(tp i64, core i64, flags i64) !str`: Write writes the capsule of tape tp (recorded on core, with flags) into the spool, deleting the core's oldest capsules past its share of TIN_REPLAY_MAX_MB; it returns the capsule's path.
+- `Encode(tp i64, core i64, flags i64) str`: Encode is the capsule body of tape tp (section 6): the request with its secret headers as handles and its dropped headers empty, the panic, and the effect records.
+- `Seal(body str) str`: Seal is the envelope of a capsule body (section 6): the magic, a random nonce, the body under the HMAC-SHA256 keystream, and the tag over all of it.
+- `Scrub(req str) str`: Scrub is a request as a capsule stores it: the values of secret headers (section 1) become their handles and the values of dropped headers become empty; everything else is kept.

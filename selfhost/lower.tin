@@ -1894,6 +1894,9 @@ fn chk_boundary(e) {
     if !ck_legacy && kind == BOUND_WITH {
         return chk_with(e);
     }
+    if !ck_legacy && kind == BOUND_ARENA {
+        return chk_arena(e);
+    }
     if ck_legacy || (kind != BOUND_WITHIN && kind != BOUND_GUARD && kind != BOUND_LIMIT) {
         err_code_at(pos, "E650 BOUNDARY", "this boundary block is not supported yet");
         return ty_int;
@@ -2247,6 +2250,177 @@ fn boundary_wrapper(pos, kind, ct, vt) {
         let rv = vec_new();
         vec_push(rv, mk_mem(pos, sym_ref_node(pos, r[LET_SYM]), 0, 0, 0, vt));
         vec_push(rv, mk_int(pos, 0, ty_error));
+        ret[RET_VALUES] = rv;
+    }
+    vec_push(body, ret);
+    ck_fn = saved_fn;
+    return f;
+}
+
+// ---- arena (#236, notes/interface_arena.md) ----
+//
+// arena { body } becomes arena$N(c): c is the block's closure func($r i64) !, as for the other
+// boundary blocks. arena$N opens the arena, runs c, switches back to the parent pool, copies
+// the fault and the value there (arenacopy$N) and frees the arena. A block whose body cannot
+// fail has the type of its value; one that can is a !T, used with try or catch.
+
+var ck_arenas;        // the closures arena blocks became (region.tin: nothing else leaves them)
+var arena_check_fn;   // the arena closure being checked
+var arena_fail_count; // fault returns made in it (fault_return)
+
+fn chk_arena(e) {
+    let pos = e[N_POS];
+    let body = e[BOUND_BODY];
+    bound_leaves(body[BLK_STMTS]);
+    let f = fn_new(pos, "func");
+    vec_push(f[F_PARAMS], "$r");
+    let it = node_new(TX_NAME, pos);
+    it[TX_B] = "i64";
+    vec_push(f[F_PTYPES], it);
+    let ft = node_new(TX_NAME, pos);
+    ft[TX_B] = "fault";
+    vec_push(f[F_RTYPES], ft);
+    f[F_BANG] = 1;
+    let stmts = body[BLK_STMTS];
+    let n = stmts[VEC_LEN];
+    if n > 0 && vec_get(stmts, n - 1)[N_KIND] == ST_EXPR {
+        let last = vec_get(stmts, n - 1);
+        let bs = node_new(ST_BSTORE, last[N_POS]);
+        bs[ES_X] = last[ES_X];
+        stmts[VEC_DATA][n - 1] = bs;
+    }
+    f[F_BODY] = body;
+    if !ck_arenas {
+        ck_arenas = vec_new();
+    }
+    vec_push(ck_arenas, f);
+    let lit = node_new(EX_FUNCLIT, pos);
+    lit[LIT_FN] = f;
+    lit[LIT_ESCAPE] = 0;
+    let saved_t = bound_t;
+    let saved_fn = arena_check_fn;
+    let saved_count = arena_fail_count;
+    bound_t = ty_void;
+    arena_check_fn = f;
+    arena_fail_count = 0;
+    let ct = chk_funclit(lit);
+    let vt = bound_t;
+    let fails = arena_fail_count > 0;
+    bound_t = saved_t;
+    arena_check_fn = saved_fn;
+    arena_fail_count = saved_count;
+    arena_value_check(pos, vt);
+    let w = arena_wrapper(pos, ct, vt, fails);
+    let c = node_new(EX_CALL, pos);
+    c[CALL_NAME] = w[F_NAME];
+    c[CALL_FN] = w;
+    c[CALL_ARGS] = args1(lit);
+    let results = vec_new();
+    if kind_of(vt) != K_VOID {
+        vec_push(results, vt);
+    }
+    if fails {
+        vec_push(results, ty_error);
+    }
+    let rt = ty_void;
+    if results[VEC_LEN] == 1 {
+        rt = vec_get(results, 0);
+    } else if results[VEC_LEN] > 1 {
+        rt = tuple_of(results);
+    }
+    c[N_TYPE] = rt;
+    replace_node(e, c);
+    return rt;
+}
+
+// arena_value_check reports a value type the arena cannot copy out: one holding a func or dyn
+// value (their objects are not described by the type), or a recursive one.
+fn arena_value_check(pos, vt) {
+    let bad = "";
+    if !arena_copyable(vt, vec_new()) {
+        bad = " holds a func or dyn value, which cannot be copied: return the data it needs instead";
+    } else if type_cycle(vt, vec_new()) {
+        bad = " is recursive, so it cannot be copied: return a value of a non-recursive type";
+    }
+    if load8(bad) != 0 {
+        let m = err_code(pos, "E316 ARENA_VALUE");
+        buf_str(m, "an arena block's value is copied out of the arena, but type ");
+        type_name(m, vt);
+        buf_str(m, bad);
+        err_end(m);
+    }
+}
+
+// arena_wrapper builds arena$N(c): it runs closure c (type ct) with a 16-byte result cell in
+// a new arena and returns the copied value of type vt (ty_void: none), and the fault if fails.
+fn arena_wrapper(pos, ct, vt, fails) {
+    lifted_count = lifted_count + 1;
+    let f = fn_new(pos, "arena");
+    let nb = buf_new();
+    buf_str(nb, "arena$");
+    buf_int(nb, lifted_count);
+    buf_byte(nb, 0);
+    f[F_QNAME] = nb[VEC_DATA];
+    f[F_NAME] = nb[VEC_DATA];
+    f[F_LIFTED] = 2;
+    f[F_FILE] = ck_file;
+    f[F_BANG] = fails;
+    vec_push(f[F_PARAMS], "c");
+    vec_push(f[F_PTYPES], ct);
+    if kind_of(vt) != K_VOID {
+        vec_push(f[F_RTYPES], vt);
+    }
+    if fails {
+        vec_push(f[F_RTYPES], ty_error);
+    }
+    f[F_TYPE] = func_of(f[F_PTYPES], f[F_RTYPES], 0);
+    f[F_LOCALS] = vec_new();
+    f[F_BODY] = empty_block(pos);
+    vec_push(prog_fns, f);
+    let saved_fn = ck_fn;
+    ck_fn = f;
+    let cs = sym_new(SYM_LOCAL, "c", pos);
+    cs[S_TYPE] = ct;
+    cs[S_SLOT] = 0;
+    f[F_SLOTS] = 1;
+    vec_push(f[F_LOCALS], cs);
+    let body = f[F_BODY][BLK_STMTS];
+    let r = temp(pos, rt_call(pos, "rt_alloc", args1(mk_int(pos, 16, ty_int)), ty_int), ty_int);
+    vec_push(body, r);
+    let a = temp(pos, rt_call(pos, "rt_arena_open", vec_new(), ty_int), ty_int);
+    vec_push(body, a);
+    let fe = temp(pos, rt_call(pos, "rt_arena_run", args2(sym_ref_node(pos, cs), sym_ref_node(pos, r[LET_SYM])), ty_error), ty_error);
+    vec_push(body, fe);
+    fe[LET_SYM][S_READS] = 1;
+    vec_push(body, expr_stmt(rt_call(pos, "rt_arena_out", args1(sym_ref_node(pos, a[LET_SYM])), ty_void)));
+    vec_push(body, assign_stmt(pos, sym_ref_node(pos, fe[LET_SYM]), rt_call(pos, "rt_arena_fault", args1(sym_ref_node(pos, fe[LET_SYM])), ty_error)));
+    if is_ref(vt) {
+        let ifs = node_new(ST_IF, pos);
+        ifs[IF_COND] = mk_bin(pos, "==", sym_ref_node(pos, fe[LET_SYM]), mk_int(pos, 0, ty_error), ty_bool);
+        ifs[IF_THEN] = empty_block(pos);
+        let src = mk_mem(pos, sym_ref_node(pos, r[LET_SYM]), 0, 0, 0, vt);
+        vec_push(ifs[IF_THEN][BLK_STMTS], assign_stmt(pos, mk_mem(pos, sym_ref_node(pos, r[LET_SYM]), 0, 0, 0, vt), keep_call(pos, arenacopy_fn(vt), src, vt)));
+        vec_push(body, ifs);
+    }
+    vec_push(body, expr_stmt(rt_call(pos, "rt_arena_close", args1(sym_ref_node(pos, a[LET_SYM])), ty_void)));
+    if fails {
+        let ifs2 = node_new(ST_IF, pos);
+        ifs2[IF_COND] = mk_bin(pos, "!=", sym_ref_node(pos, fe[LET_SYM]), mk_int(pos, 0, ty_error), ty_bool);
+        ifs2[IF_THEN] = empty_block(pos);
+        vec_push(ifs2[IF_THEN][BLK_STMTS], fault_return(pos, ifs2[IF_THEN][BLK_STMTS], sym_ref_node(pos, fe[LET_SYM])));
+        vec_push(body, ifs2);
+    }
+    let ret = node_new(ST_RETURN, pos);
+    let rv = vec_new();
+    if kind_of(vt) != K_VOID {
+        vec_push(rv, mk_mem(pos, sym_ref_node(pos, r[LET_SYM]), 0, 0, 0, vt));
+    }
+    if fails {
+        vec_push(rv, mk_int(pos, 0, ty_error));
+    }
+    if rv[VEC_LEN] == 1 {
+        ret[RET_VALUE] = vec_get(rv, 0);
+    } else if rv[VEC_LEN] > 1 {
         ret[RET_VALUES] = rv;
     }
     vec_push(body, ret);
@@ -4937,6 +5111,7 @@ fn chk_query(e, want) {
     let pos = e[N_POS];
     let parts = vec_new();
     let args = vec_new();
+    let hidden = 0;
     if e[N_KIND] == EX_STR {
         let s = node_new(EX_STR, pos);
         s[STR_PTR] = e[STR_PTR];
@@ -4952,7 +5127,14 @@ fn chk_query(e, want) {
                 err_code_at(pos, "E280 QUERY", "a query value takes no format spec: it is sent as it is");
             }
             let a = vec_get(vals, i);
-            let qa = query_arg(a, chk(a, 0));
+            let at = chk(a, 0);
+            if is_secret(at) {
+                // Sent as itself; a replay key holds its handle instead (query.Hidden, #241).
+                hidden = hidden | secret_query_arg(a, at, args[VEC_LEN]);
+                at = plain_type(at);
+                a[N_TYPE] = at;
+            }
+            let qa = query_arg(a, at);
             if qa {
                 vec_push(args, qa);
             }
@@ -4977,6 +5159,10 @@ fn chk_query(e, want) {
     let keys = vec_new();
     vec_push(keys, ident_node(pos, "Parts"));
     vec_push(keys, ident_node(pos, "Args"));
+    if hidden {
+        vec_push(elems, mk_int(pos, hidden, ty_u64));
+        vec_push(keys, ident_node(pos, "Hidden"));
+    }
     let c = composite_of(tx_named(pos, "query"), elems, keys);
     replace_node(e, c);
     e[N_TYPE] = 0;
