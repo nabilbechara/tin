@@ -6,6 +6,7 @@
 #   tin build FILE.tin... [-o OUT] [--target T] [--polls]  executable (darwin-arm64, linux-arm64, linux-amd64)
 #   tin asm FILE.tin...             print the generated ARM64 assembly
 #   tin audit secrets [-edition 1] FILE.tin...  list every reveal and secret library argument
+#   tin fix -edition 1 FILES...    rewrite legacy syntax to edition 1
 #   tin test [-bench] [DIR]         run DIR's *_test.tin tests (TestXxx, BenchmarkXxx)
 #   tin replay CAPSULE --against BUILD [--live KIND]... [--save-test NAME --issue N]  replay a recorded request
 #   tin vendor [DIR]                copy tin.mod's requires into vendor/ and write tin.lock
@@ -84,6 +85,37 @@ case $1 in
     [ "${1:-}" = secrets ] || { echo "tin: audit: unknown audit '${1:-}' (try: tin audit secrets FILE.tin)" >&2; exit 2; }
     shift
     "$tinc" -audit-secrets "$@" ;;
+  fix)
+    shift
+    [ "$#" -ge 3 ] && [ "$1" = "-edition" ] && [ "$2" = "1" ] || {
+      echo "usage: tin fix -edition 1 FILES..." >&2
+      exit 2
+    }
+    shift 2
+    [ "$#" -gt 0 ] || { echo "tin: fix: no files" >&2; exit 2; }
+    # A file is rewritten only when its translation parses as edition 1 and translating it
+    # again changes nothing; otherwise it is left as it was and named (status 1 at the end).
+    status=0
+    for f do
+      [ -f "$f" ] || { echo "tin: fix: $f is not a file" >&2; exit 2; }
+      tmp=$(mktemp "$f.tinfix.XXXXXX"); again=$(mktemp "$f.tinfix.XXXXXX")
+      cp -p "$f" "$tmp"
+      if ! "$tinc" -fix -edition 1 "$f" > "$tmp"; then
+        rm -f "$tmp" "$again"; status=1; continue
+      fi
+      if ! "$tinc" -edition 1 -parse-only "$tmp" 2> "$again"; then
+        echo "tin: fix: $f left unchanged: its translation is not edition 1 yet:" >&2
+        sed "s|$tmp|$f (translated)|" "$again" >&2
+        rm -f "$tmp" "$again"; status=1; continue
+      fi
+      if ! "$tinc" -fix -edition 1 "$tmp" > "$again" || ! cmp -s "$tmp" "$again"; then
+        echo "tin: fix: $f left unchanged: translating it twice gives two results" >&2
+        rm -f "$tmp" "$again"; status=1; continue
+      fi
+      rm -f "$again"
+      if cmp -s "$f" "$tmp"; then rm -f "$tmp"; else mv "$tmp" "$f"; fi
+    done
+    exit $status ;;
   test)
     # tin test [-bench] [DIR]: build DIR's package with its *_test.tin files and a generated
     # runner, then run every TestXxx(t mut crucible.T) (and BenchmarkXxx with -bench).

@@ -12,6 +12,8 @@ var file_pkgs;     // per file: package name, "" for main
 var file_imports;  // per file: vec of [alias, path]
 var file_v2;       // per file: 1 when it declares a package or uses func
 var file_ed1;      // per file: 1 when parsed as edition 1 (generic instances re-parse with it)
+var file_sources;  // original byte buffers for the syntax-preserving edition-1 printer
+var file_tokens;   // token vectors paired with file_sources
 var cur_file;
 
 // Function declaration layout.
@@ -381,6 +383,8 @@ fn parse_setup() {
     file_imports = vec_new();
     file_v2 = vec_new();
     file_ed1 = vec_new();
+    file_sources = vec_new();
+    file_tokens = vec_new();
 }
 
 // parse keeps the edition-0 entry point stable. Tin 1 callers select the new grammar explicitly.
@@ -904,7 +908,7 @@ fn p_expect_ident() {
 
 fn starts_type() {
     let t = p_peek();
-    return t[T_KIND] == TK_IDENT || p_is("[") || p_is("map") || p_is("*") || p_is("func") || p_is("struct") || p_is("?") || p_is("mut") || (p_edition1 && p_word("secret"));
+    return t[T_KIND] == TK_IDENT || p_is("[") || p_is("map") || p_is("*") || p_is("func") || p_is("struct") || p_is("?") || p_is("mut") || (p_edition1 && (p_word("secret") || p_is("fn")));
 }
 
 fn parse_type() {
@@ -1112,7 +1116,7 @@ fn parse_enum_body(pos) {
         let first = fields[VEC_LEN];
         if p_is("(") {
             p_next();
-            if p_edition1 {
+            if p_edition1 && !enum_fields_named() {
                 let field_index = 0;
                 while !p_is(")") {
                     let ty = parse_type();
@@ -1167,6 +1171,35 @@ fn parse_enum_body(pos) {
     st[TX_A] = fields;
     st[TX_B] = variants;
     return st;
+}
+
+// enum_fields_named reports a variant whose fields have names (Circle(r f64), Rect(w, h f64)),
+// which edition 1 reads as edition 0 does: some field is a name followed by its type. Positional
+// fields (Failed(str, i64)) are types alone.
+fn enum_fields_named() {
+    let depth = 0;
+    let i = p_i;
+    while i + 1 < p_toks[VEC_LEN] {
+        let t = vec_get(p_toks, i);
+        if tok_is(t, "(") || tok_is(t, "[") {
+            depth = depth + 1;
+        } else if tok_is(t, ")") || tok_is(t, "]") {
+            if depth == 0 {
+                return 0;
+            }
+            depth = depth - 1;
+        } else if depth == 0 && t[T_KIND] == TK_IDENT {
+            let n = vec_get(p_toks, i + 1);
+            if n[T_KIND] == TK_IDENT || tok_is(n, "[") || tok_is(n, "?") || n[T_KIND] == TK_KEYWORD {
+                let prev = vec_get(p_toks, i - 1);
+                if tok_is(prev, "(") || tok_is(prev, ",") {
+                    return 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
 }
 
 fn enum_field_name(variant, index) {
@@ -1691,8 +1724,12 @@ fn parse_binding(pos, is_mut) {
     if !p_is("=") {
         l[LET_TYPE] = parse_type();
     }
-    p_expect("=");
-    l[LET_INIT] = parse_catch(parse_expr(1));
+    if p_is("=") {
+        p_next();
+        l[LET_INIT] = parse_catch(parse_expr(1));
+    } else if !is_mut {
+        p_fail_code(pos, "E020 UNEXPECTED", "expected '=': a let needs a value (a mut without one starts at its zero value)");
+    }
     l[LET_MUT] = is_mut;
     p_end();
     return l;
@@ -2155,6 +2192,7 @@ fn parse_for_edition1() {
         p_range_expr = 1;
         let src = parse_expr(1);
         p_range_expr = 0;
+        p_nolit = saved;  // the body allows composite literals again
         let body = parse_block();
         p_nolit = saved;
         if src[N_KIND] == EX_BINARY && streq(src[BIN_OP], "..") {
@@ -2195,6 +2233,7 @@ fn parse_for_edition1() {
     let w = node_new(ST_WHILE, pos);
     p_range_expr = 0;
     w[WH_COND] = parse_expr(1);
+    p_nolit = saved;
     w[WH_BODY] = parse_block();
     p_nolit = saved;
     w[WH_LABEL] = label;
@@ -2641,6 +2680,13 @@ fn parse_postfix() {
 }
 
 fn bracket_followed_by_call() {
+    // A literal cannot start a type: byName["x"]() indexes, then calls.
+    if p_i + 1 < p_toks[VEC_LEN] {
+        let k = vec_get(p_toks, p_i + 1)[T_KIND];
+        if k == TK_STRING || k == TK_INT || k == TK_FLOAT {
+            return 0;
+        }
+    }
     let depth = 0;
     let i = p_i;
     while i < p_toks[VEC_LEN] {
@@ -2701,7 +2747,8 @@ fn composite_requires_keys(tyexpr) {
         return 1;
     }
     let t = tyexpr[TYX];
-    return t[N_KIND] == TX_STRUCT;
+    // A bare {...} element takes its type from the composite around it: unknown here.
+    return t != 0 && t[N_KIND] == TX_STRUCT;
 }
 
 // parse_elem reads a composite element; a bare {...} takes its type from the context.
@@ -2901,6 +2948,13 @@ fn parse_primary() {
         keep[ID_NAME] = "keep";
         return keep;
     }
+    if p_edition1 && p_word("fail") && tok_is(p_peek2(), "(") {
+        // fail("text") as a value makes a fault, as in edition 0 (fail X leaves).
+        p_next();
+        let f = node_new(EX_IDENT, pos);
+        f[ID_NAME] = "fail";
+        return f;
+    }
     if p_edition1 && p_word("match") {
         return parse_match();
     }
@@ -3023,4 +3077,1609 @@ fn parse_primary() {
     }
     p_next();
     p_fail_found_code(pos, "E020 UNEXPECTED", "expected an expression", t);
+}
+
+
+// print_edition1 keeps source trivia byte-for-byte and changes only legacy token spans.
+// The parser has already validated the file with the edition-0 grammar.
+fn print_edition1(file, source, toks) {
+    let out = buf_new();
+    let prefixes = vec_filled(toks[VEC_LEN], 0);
+    let suffixes = vec_filled(toks[VEC_LEN], 0);
+    let replacements = vec_filled(toks[VEC_LEN], 0);
+    let deletes = vec_filled(toks[VEC_LEN], 0);
+    fx_span = vec_filled(toks[VEC_LEN], 0);
+    fx_triv = vec_filled(toks[VEC_LEN], 0);
+    fx_lead = vec_filled(toks[VEC_LEN], 0);
+    fx_ind = vec_filled(toks[VEC_LEN], 0);
+    fx_hoisted = vec_new();
+    fx_rep = replacements;
+    fx_pre = prefixes;
+    fx_suf = suffixes;
+    let depth = 0;
+    let top = 0;
+    let i = 0;
+    while i < toks[VEC_LEN] {
+        let t = vec_get(toks, i);
+        if depth == 0 && (fx_kw(t, "func") || fx_kw(t, "var") || fx_kw(t, "const") || fx_kw(t, "type") || fx_kw(t, "import")) {
+            top = i;
+            if fx_kw(t, "func") {
+                let n = fx_next(toks, i);
+                if n < toks[VEC_LEN] && tok_is(vec_get(toks, n), "(") {
+                    n = fx_next(toks, matching_paren(toks, n));
+                }
+                fx_fn_name = "fn";
+                if n < toks[VEC_LEN] && vec_get(toks, n)[T_KIND] == TK_IDENT {
+                    fx_fn_name = vec_get(toks, n)[T_TEXT];
+                }
+            }
+        }
+        if tok_is(t, "{") {
+            depth = depth + 1;
+        } else if tok_is(t, "}") {
+            depth = depth - 1;
+        }
+        if t[T_KIND] == TK_KEYWORD && streq(t[T_TEXT], "for") {
+            if !rewrite_for_each(source, toks, i, replacements, suffixes) && !rewrite_for_range(toks, i, replacements, deletes, prefixes, suffixes) {
+                rewrite_for_fallback(source, toks, i, replacements, deletes, prefixes, suffixes);
+            }
+        } else if t[T_KIND] == TK_KEYWORD && streq(t[T_TEXT], "while") {
+            rewrite_while(toks, i, replacements, deletes);
+        } else if t[T_KIND] == TK_KEYWORD && streq(t[T_TEXT], "switch") {
+            rewrite_switch(source, toks, i, replacements, deletes, prefixes, suffixes);
+        } else if fx_kw(t, "if") {
+            rewrite_if_init(source, toks, i, replacements, prefixes, suffixes);
+        } else if fx_kw(t, "const") && depth > 0 {
+            rewrite_local_const(source, toks, i, top, replacements, depth);
+        } else if fx_kw(t, "const") && depth == 0 {
+            rewrite_const_group(source, toks, i);
+        } else if tok_is(t, "@") && depth > 0 {
+            rewrite_field_attr(source, toks, i);
+        } else if t[T_KIND] == TK_IDENT && streq(t[T_TEXT], "tide") && !replacements[VEC_DATA][i] {
+            rewrite_tide_unit(toks, i, replacements);
+        } else if fx_reserved(toks, i) && !replacements[VEC_DATA][i] {
+            replacements[VEC_DATA][i] = str_cat3(t[T_TEXT], "_", "");
+        } else if !t[T_SYNTH] && tok_is(t, ";") && !replacements[VEC_DATA][i] && !deletes[VEC_DATA][i] {
+            replacements[VEC_DATA][i] = "\n";
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < toks[VEC_LEN] {
+        let t = vec_get(toks, i);
+        if !t[T_SYNTH] && streq(t[T_TEXT], ":=") && !replacements[VEC_DATA][i] {
+            let first = i - 1;
+            let count = 1;
+            let mutable = 0;
+            while first >= 2 && tok_is(vec_get(toks, first - 1), ",") && vec_get(toks, first - 2)[T_KIND] == TK_IDENT {
+                first = first - 2;
+                count = count + 1;
+            }
+            if first >= 0 && vec_get(toks, first)[T_KIND] == TK_IDENT {
+                let name_at = first;
+                while name_at < i {
+                    let name = vec_get(toks, name_at);
+                    if name[T_KIND] == TK_IDENT && token_name_assigned_after(toks, name[T_TEXT], i + 1) {
+                        mutable = 1;
+                    }
+                    name_at = name_at + 1;
+                }
+                if count == 1 {
+                    prefixes[VEC_DATA][first] = "let ";
+                    if mutable {
+                        prefixes[VEC_DATA][first] = "mut ";
+                    }
+                } else {
+                    prefixes[VEC_DATA][first] = "let (";
+                    if mutable {
+                        prefixes[VEC_DATA][first] = "mut (";
+                    }
+                    suffixes[VEC_DATA][i - 1] = ")";
+                }
+            }
+        }
+        i = i + 1;
+    }
+    let cursor = 0;
+    i = 0;
+    while i < toks[VEC_LEN] {
+        let t = vec_get(toks, i);
+        if t[T_SYNTH] || t[T_END] <= t[T_START] || t[T_START] < cursor {
+            i = i + 1;
+            continue;
+        }
+        fx_cur_ind = fx_ind[VEC_DATA][i];
+        if fx_triv[VEC_DATA][i] {
+            fx_put(out, fx_triv[VEC_DATA][i], strlen(fx_triv[VEC_DATA][i]));
+            if fx_lead[VEC_DATA][i] {
+                buf_str(out, fx_lead[VEC_DATA][i]);
+            }
+        } else {
+            fx_copy_trivia(out, source, cursor, t[T_START], fx_lead[VEC_DATA][i]);
+        }
+        fx_cur_ind = 0;
+        if prefixes[VEC_DATA][i] {
+            buf_str(out, prefixes[VEC_DATA][i]);
+        }
+        let replacement = replacements[VEC_DATA][i];
+        if !replacement && t[T_KIND] == TK_KEYWORD && streq(t[T_TEXT], "func") {
+            replacement = "fn";
+        } else if !replacement && t[T_KIND] == TK_KEYWORD && streq(t[T_TEXT], "var") {
+            replacement = "let";
+            let name_at = i + 1;
+            while name_at < toks[VEC_LEN] && vec_get(toks, name_at)[T_SYNTH] {
+                name_at = name_at + 1;
+            }
+            if name_at < toks[VEC_LEN] && vec_get(toks, name_at)[T_KIND] == TK_IDENT {
+                let name = vec_get(toks, name_at)[T_TEXT];
+                if token_name_assigned_after(toks, name, name_at + 1) || !token_has_initializer(toks, name_at + 1) {
+                    replacement = "mut";
+                }
+            } else {
+                replacement = "mut";
+            }
+        } else if !replacement && t[T_KIND] == TK_PUNCT && streq(t[T_TEXT], ":=") {
+            replacement = "=";
+        } else if !replacement && t[T_KIND] == TK_PUNCT && streq(t[T_TEXT], "++") {
+            replacement = "+= 1";
+            if t[T_START] == cursor {
+                replacement = " += 1";
+            }
+        } else if !replacement && t[T_KIND] == TK_PUNCT && streq(t[T_TEXT], "--") {
+            replacement = "-= 1";
+            if t[T_START] == cursor {
+                replacement = " -= 1";
+            }
+        }
+        if deletes[VEC_DATA][i] {
+            // The original token span is omitted; its surrounding trivia remains in source.
+        } else if replacement {
+            buf_str(out, replacement);
+        } else {
+            buf_bytes(out, source + t[T_START], t[T_END] - t[T_START]);
+        }
+        let last = i;
+        if fx_span[VEC_DATA][i] {
+            last = fx_span[VEC_DATA][i] - 1;
+            if suffixes[VEC_DATA][i] {
+                buf_str(out, suffixes[VEC_DATA][i]);
+            }
+        }
+        if suffixes[VEC_DATA][last] {
+            buf_str(out, suffixes[VEC_DATA][last]);
+        }
+        cursor = vec_get(toks, last)[T_END];
+        i = last + 1;
+    }
+    let source_len = 0;
+    if toks[VEC_LEN] > 0 {
+        source_len = vec_get(toks, toks[VEC_LEN] - 1)[T_END];
+    }
+    if cursor < source_len {
+        fx_copy_comments(out, source, cursor, source_len);
+    }
+    return out;
+}
+
+
+// matching_brace returns the closing brace paired with open_at, or -1 for invalid input.
+fn matching_brace(toks, open_at) {
+    let depth = 0;
+    let i = open_at;
+    while i < toks[VEC_LEN] {
+        let t = vec_get(toks, i);
+        if tok_is(t, "{") {
+            depth = depth + 1
+        } else if tok_is(t, "}") {
+            depth = depth - 1;
+            if depth == 0 { return i; }
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// loop_body_open finds the body brace for a C-style, range, or condition loop.
+fn loop_body_open(toks, loop_at) {
+    let semi_count = 0;
+    let parens = 0;
+    let brackets = 0;
+    let braces = 0;
+    let i = loop_at + 1;
+    while i < toks[VEC_LEN] {
+        let t = vec_get(toks, i);
+        if tok_is(t, "(") {
+            parens = parens + 1
+        } else if tok_is(t, ")") {
+            parens = parens - 1
+        } else if tok_is(t, "[") {
+            brackets = brackets + 1
+        } else if tok_is(t, "]") {
+            brackets = brackets - 1
+        } else if tok_is(t, "{") {
+            if braces == 0 && parens == 0 && brackets == 0 && (semi_count == 0 || semi_count >= 2) {
+                return i
+            }
+            braces = braces + 1
+        } else if tok_is(t, "}") && braces > 0 {
+            braces = braces - 1
+        } else if tok_is(t, ";") && parens == 0 && brackets == 0 && braces == 0 {
+            semi_count = semi_count + 1
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// token_inside_nested_loop reports whether target is inside another loop nested in outer_at.
+fn token_inside_nested_loop(toks, outer_at, body, close, target) {
+    let i = body + 1;
+    while i < target {
+        let t = vec_get(toks, i);
+        if (t[T_KIND] == TK_KEYWORD && (streq(t[T_TEXT], "for") || streq(t[T_TEXT], "while"))) && i != outer_at {
+            let open = loop_body_open(toks, i);
+            if open > i && open < target {
+                let end = matching_brace(toks, open);
+                if end > target { return 1; }
+            }
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// source_indent returns the whitespace before a token on its source line.
+fn source_indent(source, token) {
+    let start = token[T_START];
+    let i = start - 1;
+    while i >= 0 && load8(source + i) != '\n' { i = i - 1; }
+    i = i + 1;
+    let line = i;
+    while line < start && (load8(source + line) == ' ' || load8(source + line) == '\t') { line = line + 1; }
+    if line != start { return ""; }
+    return str_slice(source + i, start - i);
+}
+
+// loop_post_text prints the post statement in edition-1 assignment syntax.
+fn loop_post_text(source, toks, post_start, post_end, post_op_at) {
+    let b = buf_new();
+    let name = vec_get(toks, post_start)[T_TEXT];
+    let op = vec_get(toks, post_op_at);
+    if tok_is(op, "++") {
+        buf_str(b, name);
+        buf_str(b, " += 1");
+    } else if tok_is(op, "--") {
+        buf_str(b, name);
+        buf_str(b, " -= 1");
+    } else if tok_is(op, "+=") || tok_is(op, "-=") {
+        buf_str(b, name);
+        buf_byte(b, ' ');
+        buf_str(b, op[T_TEXT]);
+        buf_byte(b, ' ');
+        let first = vec_get(toks, post_op_at + 1)[T_START];
+        let last = vec_get(toks, post_end)[T_END];
+        buf_bytes(b, source + first, last - first);
+    } else {
+        let first = vec_get(toks, post_start)[T_START];
+        let last = vec_get(toks, post_end)[T_END];
+        buf_bytes(b, source + first, last - first);
+    }
+    return str_slice(b[VEC_DATA], b[VEC_LEN]);
+}
+
+// rewrite_for_fallback moves a C loop's init out and post into its body when it is not a range.
+fn rewrite_for_fallback(source, toks, for_at, replacements, deletes, prefixes, suffixes) {
+    let semi1 = -1;
+    let semi2 = -1;
+    let body = loop_body_open(toks, for_at);
+    if body < 0 { return 0; }
+    let parens = 0;
+    let brackets = 0;
+    let braces = 0;
+    let i = for_at + 1;
+    while i < body {
+        let t = vec_get(toks, i);
+        if tok_is(t, "(") {
+            parens = parens + 1
+        } else if tok_is(t, ")") {
+            parens = parens - 1
+        } else if tok_is(t, "[") {
+            brackets = brackets + 1
+        } else if tok_is(t, "]") {
+            brackets = brackets - 1
+        } else if tok_is(t, "{") {
+            braces = braces + 1
+        } else if tok_is(t, "}") && braces > 0 {
+            braces = braces - 1
+        } else if tok_is(t, ";") && parens == 0 && brackets == 0 && braces == 0 {
+            if semi1 < 0 {
+                semi1 = i
+            } else {
+                semi2 = i
+            }
+        }
+        i = i + 1
+    }
+    if semi1 < 0 || semi2 < 0 { return 0; }
+    let init_start = for_at + 1;
+    let init_end = semi1 - 1;
+    let cond_start = semi1 + 1;
+    let cond_end = semi2 - 1;
+    let post_start = semi2 + 1;
+    let post_end = body - 1;
+    let has_init = init_start <= init_end;
+    let has_cond = cond_start <= cond_end;
+    let has_post = post_start <= post_end;
+    let body_close = matching_brace(toks, body);
+    if body_close < 0 { return 0; }
+    let post = "";
+    let post_op_at = -1;
+    if has_post {
+        if vec_get(toks, post_start)[T_KIND] == TK_IDENT && post_start + 1 <= post_end {
+            post_op_at = post_start + 1;
+            post = loop_post_text(source, toks, post_start, post_end, post_op_at);
+        } else {
+            return 0;
+        }
+    }
+    let find = source_indent(source, vec_get(toks, for_at));
+    if has_init {
+        replacements[VEC_DATA][for_at] = str_cat3("{\n", find, "\t");
+        fx_triv[VEC_DATA][init_start] = "";
+        if init_start + 1 <= init_end && tok_is(vec_get(toks, init_start + 1), ":=") {
+            prefixes[VEC_DATA][init_start] = "mut ";
+            replacements[VEC_DATA][init_start + 1] = "=";
+        }
+        replacements[VEC_DATA][semi1] = str_cat3("\n", find, "\tfor ");
+        fx_triv[VEC_DATA][cond_start] = "";
+        suffixes[VEC_DATA][body_close] = str_cat3("\n", find, "}");
+        fx_nest(body, body_close);
+    } else if has_cond {
+        replacements[VEC_DATA][semi1] = "";
+        fx_triv[VEC_DATA][cond_start] = "";
+    } else {
+        replacements[VEC_DATA][semi1] = "true";
+    }
+    deletes[VEC_DATA][semi2] = 1;
+    fx_triv[VEC_DATA][semi2] = "";
+    fx_triv[VEC_DATA][body] = " ";
+    let extra = "";
+    if has_init {
+        extra = "\t";
+    }
+    if has_post {
+        i = post_start;
+        while i <= post_end {
+            deletes[VEC_DATA][i] = 1;
+            fx_triv[VEC_DATA][i] = "";
+            i = i + 1
+        }
+        if has_cond {
+            let close_token = vec_get(toks, body_close);
+            let indent = source_indent(source, close_token);
+            let b = buf_new();
+            if source_has_newline(source, vec_get(toks, fx_prev(toks, body_close))[T_END], close_token[T_START]) {
+                buf_byte(b, '\t');
+            } else {
+                buf_byte(b, '\n');
+                buf_str(b, indent);
+                buf_str(b, extra);
+                buf_byte(b, '\t');
+            }
+            buf_str(b, post);
+            buf_byte(b, '\n');
+            buf_str(b, indent);
+            buf_str(b, extra);
+            prefixes[VEC_DATA][body_close] = str_slice(b[VEC_DATA], b[VEC_LEN]);
+            i = body + 1;
+            while i < body_close {
+                let c = vec_get(toks, i);
+                if c[T_KIND] == TK_KEYWORD && streq(c[T_TEXT], "continue") && !token_inside_nested_loop(toks, for_at, body, body_close, i) {
+                    let next = i + 1;
+                    if next >= toks[VEC_LEN] || vec_get(toks, next)[T_KIND] != TK_IDENT {
+                        let token = c;
+                        let ind = source_indent(source, token);
+                        let before = buf_new();
+                        buf_str(before, post);
+                        buf_byte(before, '\n');
+                        buf_str(before, ind);
+                        buf_str(before, extra);
+                        prefixes[VEC_DATA][i] = str_slice(before[VEC_DATA], before[VEC_LEN]);
+                    }
+                }
+                i = i + 1
+            }
+        }
+    }
+    return 1
+}
+
+// rewrite_while maps Go-style while conditions to edition-1 for loops.
+fn rewrite_while(toks, at, replacements, deletes) {
+    replacements[VEC_DATA][at] = "for";
+    let next = at + 1;
+    if next < toks[VEC_LEN] && vec_get(toks, next)[T_KIND] == TK_INT && vec_get(toks, next)[T_VAL] == 1 && tok_is(vec_get(toks, next + 1), "{") {
+        deletes[VEC_DATA][next] = 1;
+    } else if next + 2 < toks[VEC_LEN] && tok_is(vec_get(toks, next), "(") && vec_get(toks, next + 1)[T_KIND] == TK_INT && vec_get(toks, next + 1)[T_VAL] == 1 && tok_is(vec_get(toks, next + 2), ")") {
+        deletes[VEC_DATA][next] = 1;
+        deletes[VEC_DATA][next + 1] = 1;
+        deletes[VEC_DATA][next + 2] = 1;
+    }
+    return 1
+}
+
+// rewrite_switch changes statement switches into block-valued match arms and removes their breaks.
+fn rewrite_switch(source, toks, switch_at, replacements, deletes, prefixes, suffixes) {
+    let body = -1;
+    let close = -1;
+    let direct_case = 0;
+    let i = switch_at + 1;
+    let parens = 0;
+    let brackets = 0;
+    let braces = 0;
+    while i < toks[VEC_LEN] {
+        let t = vec_get(toks, i);
+        if tok_is(t, "(") {
+            parens = parens + 1
+        } else if tok_is(t, ")") {
+            parens = parens - 1
+        } else if tok_is(t, "[") {
+            brackets = brackets + 1
+        } else if tok_is(t, "]") {
+            brackets = brackets - 1
+        } else if tok_is(t, "{") {
+            if braces == 0 && parens == 0 && brackets == 0 {
+                let end = matching_brace(toks, i);
+                if end < 0 { return 0; }
+                let depth = 0;
+                let j = i + 1;
+                while j < end {
+                    let c = vec_get(toks, j);
+                    if tok_is(c, "{") {
+                        depth = depth + 1
+                    } else if tok_is(c, "}") {
+                        depth = depth - 1
+                    } else if depth == 0 && c[T_KIND] == TK_KEYWORD && (streq(c[T_TEXT], "case") || streq(c[T_TEXT], "default")) {
+                        direct_case = 1
+                    }
+                    j = j + 1;
+                }
+                if direct_case { body = i; close = end; break; }
+            }
+            braces = braces + 1;
+        } else if tok_is(t, "}") && braces > 0 {
+            braces = braces - 1
+        }
+        i = i + 1;
+    }
+    if body < 0 { return 0; }
+    // switch init; subject { ... }: the init moves into a block around the match.
+    let semi = vec_filled(1, 0);
+    fx_body(toks, switch_at, semi);
+    if semi[0] >= body {
+        semi[0] = -1;
+    }
+    let subject = switch_at + 1;
+    if semi[0] >= 0 {
+        subject = fx_next(toks, semi[0]);
+    }
+    let expressionless = body == subject;
+    replacements[VEC_DATA][switch_at] = "match";
+    if expressionless { prefixes[VEC_DATA][body] = "true "; }
+    let arms = vec_new();
+    let depth = 0;
+    i = body + 1;
+    while i < close {
+        let t = vec_get(toks, i);
+        if tok_is(t, "{") {
+            depth = depth + 1
+        } else if tok_is(t, "}") {
+            depth = depth - 1
+        } else if depth == 0 && t[T_KIND] == TK_KEYWORD && (streq(t[T_TEXT], "case") || streq(t[T_TEXT], "default")) {
+            vec_push(arms, i)
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < arms[VEC_LEN] {
+        let at = vec_get(arms, i);
+        let is_default = streq(vec_get(toks, at)[T_TEXT], "default");
+        let next = close;
+        if i + 1 < arms[VEC_LEN] { next = vec_get(arms, i + 1); }
+        let par = 0;
+        let bracket = 0;
+        let curly = 0;
+        let colon = -1;
+        let j = at + 1;
+        while j < next {
+            let c = vec_get(toks, j);
+            if tok_is(c, "(") {
+                par = par + 1
+            } else if tok_is(c, ")") {
+                par = par - 1
+            } else if tok_is(c, "[") {
+                bracket = bracket + 1
+            } else if tok_is(c, "]") {
+                bracket = bracket - 1
+            } else if tok_is(c, "{") {
+                curly = curly + 1
+            } else if tok_is(c, "}") {
+                curly = curly - 1
+            } else if tok_is(c, ":") && par == 0 && bracket == 0 && curly == 0 {
+                colon = j
+                break
+            }
+            j = j + 1;
+        }
+        if colon < 0 { return 0; }
+        fx_triv[VEC_DATA][fx_next(toks, at)] = "";
+        if is_default {
+            replacements[VEC_DATA][at] = "_";
+            replacements[VEC_DATA][colon] = " => {";
+        } else if expressionless {
+            replacements[VEC_DATA][at] = "true if (";
+            j = at + 1;
+            par = 0; bracket = 0; curly = 0;
+            while j < colon {
+                let c = vec_get(toks, j);
+                if tok_is(c, "(") {
+                    par = par + 1
+                } else if tok_is(c, ")") {
+                    par = par - 1
+                } else if tok_is(c, "[") {
+                    bracket = bracket + 1
+                } else if tok_is(c, "]") {
+                    bracket = bracket - 1
+                } else if tok_is(c, "{") {
+                    curly = curly + 1
+                } else if tok_is(c, "}") {
+                    curly = curly - 1
+                } else if tok_is(c, ",") && par == 0 && bracket == 0 && curly == 0 {
+                    replacements[VEC_DATA][j] = "||"
+                }
+                j = j + 1;
+            }
+            replacements[VEC_DATA][colon] = ") => {";
+        } else {
+            deletes[VEC_DATA][at] = 1;
+            replacements[VEC_DATA][colon] = " => {";
+        }
+        if i > 0 { prefixes[VEC_DATA][at] = fx_arm_close(source, toks, at, "}\n", "\t"); }
+        // Unlabelled breaks leave the switch in Go; each match arm already ends at its block.
+        j = colon + 1;
+        while j < next {
+            let c = vec_get(toks, j);
+            if c[T_KIND] == TK_KEYWORD && streq(c[T_TEXT], "break") {
+                let following = j + 1;
+                while following < next && vec_get(toks, following)[T_SYNTH] { following = following + 1; }
+                if following >= next || vec_get(toks, following)[T_KIND] != TK_IDENT {
+                    deletes[VEC_DATA][j] = 1;
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    // match arms sit one level deeper than the switch's cases did
+    fx_nest(body, close - 1);
+    prefixes[VEC_DATA][close] = fx_arm_close(source, toks, close, "\t}\n", "");
+    if semi[0] >= 0 {
+        rewrite_init(source, toks, switch_at, semi[0], close, "match");
+    }
+    return 1;
+}
+
+// rewrite_for_range converts a simple ascending C loop into Tin 1's range form.
+fn rewrite_for_range(toks, for_at, replacements, deletes, prefixes, suffixes) {
+    let semi1 = -1;
+    let semi2 = -1;
+    let body = -1;
+    let parens = 0;
+    let brackets = 0;
+    let braces = 0;
+    let i = for_at + 1;
+    while i < toks[VEC_LEN] {
+        let t = vec_get(toks, i);
+        if tok_is(t, "(") {
+            parens = parens + 1
+        } else if tok_is(t, ")") {
+            parens = parens - 1
+        } else if tok_is(t, "[") {
+            brackets = brackets + 1
+        } else if tok_is(t, "]") {
+            brackets = brackets - 1
+        } else if tok_is(t, "{") {
+            if braces == 0 && parens == 0 && brackets == 0 && semi2 >= 0 {
+                body = i;
+                break;
+            }
+            braces = braces + 1;
+        } else if tok_is(t, "}") && braces > 0 {
+            braces = braces - 1
+        } else if tok_is(t, ";") && parens == 0 && brackets == 0 && braces == 0 {
+            if semi1 < 0 {
+                semi1 = i
+            } else {
+                semi2 = i
+            }
+        }
+        i = i + 1;
+    }
+    if semi1 < 0 || semi2 < 0 || body < 0 || semi1 <= for_at + 2 {
+        return 0;
+    }
+    let init_name = vec_get(toks, for_at + 1);
+    let init_op_at = for_at + 2;
+    let init_op = vec_get(toks, init_op_at);
+    if init_name[T_KIND] != TK_IDENT || !tok_is(init_op, ":=") {
+        return 0;
+    }
+    let cond_name_at = semi1 + 1;
+    let cond_op_at = cond_name_at + 1;
+    if cond_op_at >= semi2 || vec_get(toks, cond_name_at)[T_KIND] != TK_IDENT || !tok_is(vec_get(toks, cond_op_at), "<") || !streq(init_name[T_TEXT], vec_get(toks, cond_name_at)[T_TEXT]) || cond_op_at + 1 >= semi2 {
+        return 0;
+    }
+    let post_name_at = semi2 + 1;
+    if post_name_at >= body || vec_get(toks, post_name_at)[T_KIND] != TK_IDENT || !streq(init_name[T_TEXT], vec_get(toks, post_name_at)[T_TEXT]) {
+        return 0;
+    }
+    let post_op_at = post_name_at + 1;
+    if post_op_at >= body {
+        return 0;
+    }
+    let post_op = vec_get(toks, post_op_at);
+    let step_start = -1;
+    let negate_step = 0;
+    if tok_is(post_op, "++") {
+        if post_op_at + 1 != body { return 0; }
+    } else if tok_is(post_op, "+=") || tok_is(post_op, "-=") {
+        if post_op_at + 1 >= body { return 0; }
+        step_start = post_op_at + 1;
+        negate_step = tok_is(post_op, "-=");
+    } else if tok_is(post_op, "=") {
+        if post_op_at + 3 >= body || vec_get(toks, post_op_at + 1)[T_KIND] != TK_IDENT || !streq(init_name[T_TEXT], vec_get(toks, post_op_at + 1)[T_TEXT]) || (!tok_is(vec_get(toks, post_op_at + 2), "+") && !tok_is(vec_get(toks, post_op_at + 2), "-")) {
+            return 0;
+        }
+        step_start = post_op_at + 3;
+        negate_step = tok_is(vec_get(toks, post_op_at + 2), "-");
+    } else {
+        return 0;
+    }
+    if step_start >= 0 && step_start >= body { return 0; }
+    // A range evaluates its bound once and owns its variable: the C loop's shape converts
+    // only when the body changes neither (else the fallback keeps the loop's meaning).
+    let close = matching_brace(toks, body);
+    if close < 0 || fx_assigns(toks, body, close, init_name[T_TEXT]) {
+        return 0;
+    }
+    let b = cond_op_at + 1;
+    while b < semi2 {
+        let bt = vec_get(toks, b);
+        if bt[T_KIND] == TK_IDENT && fx_assigns(toks, body, close, bt[T_TEXT]) {
+            return 0;
+        }
+        b = b + 1;
+    }
+    replacements[VEC_DATA][init_op_at] = "in";
+    replacements[VEC_DATA][semi1] = "..";
+    deletes[VEC_DATA][cond_name_at] = 1;
+    deletes[VEC_DATA][cond_op_at] = 1;
+    deletes[VEC_DATA][semi2] = 1;
+    deletes[VEC_DATA][post_name_at] = 1;
+    // no spaces around '..' and none where tokens went
+    fx_triv[VEC_DATA][semi1] = "";
+    fx_triv[VEC_DATA][cond_name_at] = "";
+    fx_triv[VEC_DATA][cond_op_at] = "";
+    fx_triv[VEC_DATA][cond_op_at + 1] = "";
+    fx_triv[VEC_DATA][semi2] = "";
+    fx_triv[VEC_DATA][post_name_at] = "";
+    fx_triv[VEC_DATA][post_op_at] = "";
+    if post_op_at + 1 < body {
+        fx_triv[VEC_DATA][post_op_at + 1] = "";
+    }
+    let unit_step = 0;
+    if step_start >= 0 && step_start + 1 == body {
+        let step = vec_get(toks, step_start);
+        unit_step = step[T_KIND] == TK_INT && step[T_VAL] == 1 && !negate_step;
+    }
+    if step_start < 0 || unit_step {
+        deletes[VEC_DATA][post_op_at] = 1;
+        if step_start >= 0 {
+            if tok_is(post_op, "=") {
+                deletes[VEC_DATA][post_op_at + 1] = 1;
+                deletes[VEC_DATA][post_op_at + 2] = 1;
+            }
+            deletes[VEC_DATA][step_start] = 1;
+        }
+        return 1;
+    }
+    prefixes[VEC_DATA][init_op_at + 1] = "(";
+    suffixes[VEC_DATA][semi2 - 1] = ")";
+    if tok_is(post_op, "=") {
+        replacements[VEC_DATA][post_op_at] = ".step(";
+        deletes[VEC_DATA][post_op_at + 1] = 1;
+        deletes[VEC_DATA][post_op_at + 2] = 1;
+    } else if negate_step {
+        replacements[VEC_DATA][post_op_at] = ".step(-";
+    } else {
+        replacements[VEC_DATA][post_op_at] = ".step(";
+    }
+    suffixes[VEC_DATA][body - 1] = ")";
+    return 1;
+}
+
+// token_name_assigned_after reports any later assignment to name in the parsed file.
+// Over-marking a shadowed name as mutable is harmless to generated code; an assigned binding
+// must never be printed as immutable.
+fn token_name_assigned_after(toks, name, start) {
+    let i = start;
+    while i < toks[VEC_LEN] {
+        let t = vec_get(toks, i);
+        if !t[T_SYNTH] && t[T_KIND] == TK_IDENT && streq(t[T_TEXT], name) {
+            let prev = i - 1;
+            while prev >= 0 && vec_get(toks, prev)[T_SYNTH] {
+                prev = prev - 1;
+            }
+            let next = i + 1;
+            while next < toks[VEC_LEN] && vec_get(toks, next)[T_SYNTH] {
+                next = next + 1;
+            }
+            if (prev < 0 || !tok_is(vec_get(toks, prev), ".")) && next < toks[VEC_LEN] {
+                let op = vec_get(toks, next);
+                if tok_is(op, "=") || tok_is(op, ":=") || tok_is(op, "++") || tok_is(op, "--") || tok_is(op, "+=") || tok_is(op, "-=") || tok_is(op, "*=") || tok_is(op, "/=") || tok_is(op, "%=") || tok_is(op, "&=") || tok_is(op, "|=") || tok_is(op, "^=") || tok_is(op, "<<=") || tok_is(op, ">>=") {
+                    return 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// token_has_initializer reports whether a declaration's name is followed by '=' before its line ends.
+fn token_has_initializer(toks, start) {
+    let i = start;
+    while i < toks[VEC_LEN] {
+        let t = vec_get(toks, i);
+        if t[T_SYNTH] || tok_is(t, ";") || tok_is(t, "}") {
+            return 0;
+        }
+        if tok_is(t, "=") {
+            return 1;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ---- the edition-1 translator's structural rewrites (#225) ----
+//
+// The printer above changes token spans in place. These rules also replace several tokens
+// at once (fx_span), rewrite the trivia before a token (fx_triv), and put text into the
+// trivia before a top-level declaration (fx_lead: hoisted local constants).
+
+var fx_span;  // fx_span[i] = j + 1: tokens i..j print as token i's replacement alone (0: none)
+var fx_triv;  // the trivia printed before token i instead of the source's (0: keep it)
+var fx_lead;  // text put into the trivia before token i, after its last blank line
+var fx_ind;   // tabs added after each newline in the trivia before token i (a block now nested)
+var fx_cur_ind; // fx_ind of the token whose trivia is being printed
+var fx_trusted; // the file is a trusted library file: `secret` before a type is the qualifier
+var fx_hoisted; // [name, text] of the local constants already hoisted
+var fx_fn_name; // the name of the function being printed (prefixes a clashing local constant)
+var fx_rep;   // the printer's replacements, prefixes and suffixes (print_edition1)
+var fx_pre;
+var fx_suf;
+
+fn fx_add(v, i, text) {
+    let old = v[VEC_DATA][i];
+    if old {
+        v[VEC_DATA][i] = str_cat3(old, text, "");
+    } else {
+        v[VEC_DATA][i] = text;
+    }
+}
+
+fn fx_next(toks, i) {
+    let j = i + 1;
+    while j < toks[VEC_LEN] && vec_get(toks, j)[T_SYNTH] {
+        j = j + 1;
+    }
+    return j;
+}
+
+fn fx_prev(toks, i) {
+    let j = i - 1;
+    while j >= 0 && vec_get(toks, j)[T_SYNTH] {
+        j = j - 1;
+    }
+    return j;
+}
+
+// fx_text is the source text from token a's start to token b's end.
+fn fx_text(source, toks, a, b) {
+    let s = vec_get(toks, a)[T_START];
+    let e = vec_get(toks, b)[T_END];
+    return str_slice(source + s, e - s);
+}
+
+fn fx_kw(t, word) {
+    return t[T_KIND] == TK_KEYWORD && streq(t[T_TEXT], word);
+}
+
+fn fx_open(t) {
+    return tok_is(t, "(") || tok_is(t, "[") || tok_is(t, "{");
+}
+
+fn fx_close(t) {
+    return tok_is(t, ")") || tok_is(t, "]") || tok_is(t, "}");
+}
+
+// fx_body finds the block of the statement starting at kw: the first '{' outside brackets.
+// semi gets the first explicit ';' before it (an init statement), or -1.
+fn fx_body(toks, kw, semi) {
+    semi[0] = -1;
+    let depth = 0;
+    let i = kw + 1;
+    while i < toks[VEC_LEN] {
+        let t = vec_get(toks, i);
+        if tok_is(t, "{") && depth == 0 {
+            return i;
+        }
+        if fx_open(t) {
+            depth = depth + 1;
+        } else if fx_close(t) {
+            depth = depth - 1;
+        } else if depth == 0 && !t[T_SYNTH] && tok_is(t, ";") && semi[0] < 0 {
+            semi[0] = i;
+        }
+        i = i + 1;
+    }
+    return -1;
+}
+
+// fx_chain_end is the last '}' of the if/else chain whose first block opens at body.
+fn fx_chain_end(toks, body) {
+    let end = matching_brace(toks, body);
+    while end >= 0 {
+        let e = fx_next(toks, end);
+        if e >= toks[VEC_LEN] || !fx_kw(vec_get(toks, e), "else") {
+            return end;
+        }
+        let n = fx_next(toks, e);
+        if n < toks[VEC_LEN] && fx_kw(vec_get(toks, n), "if") {
+            let semi = vec_filled(1, 0);
+            let b = fx_body(toks, n, semi);
+            if b < 0 {
+                return -1;
+            }
+            end = matching_brace(toks, b);
+        } else {
+            return matching_brace(toks, n);
+        }
+    }
+    return end;
+}
+
+// rewrite_init moves the init statement of `if init; cond {` (or a switch's) into a block of
+// its own around the whole statement, so its names keep their scope:
+// `{ let x = init; if cond { ... } }`. word is what the statement starts with afterwards.
+fn rewrite_init(source, toks, kw, semi, end, word) {
+    let ind = source_indent(source, vec_get(toks, kw));
+    fx_add(fx_pre, kw, str_cat3("{\n", ind, "\t"));
+    fx_rep[VEC_DATA][kw] = "";
+    fx_triv[VEC_DATA][fx_next(toks, kw)] = "";
+    fx_rep[VEC_DATA][semi] = str_cat3("\n", ind, str_cat3("\t", word, ""));
+    fx_add(fx_suf, end, str_cat3("\n", ind, "}"));
+    fx_nest(semi, end);
+}
+
+fn rewrite_if_init(source, toks, at, replacements, prefixes, suffixes) {
+    let semi = vec_filled(1, 0);
+    let body = fx_body(toks, at, semi);
+    if body < 0 || semi[0] < 0 {
+        return 0;
+    }
+    let end = fx_chain_end(toks, body);
+    if end < 0 {
+        return 0;
+    }
+    rewrite_init(source, toks, at, semi[0], end, "if");
+    return 1;
+}
+
+// rewrite_for_each turns `for k, v := range x` into `for k, v in x`. One name is the index
+// or key alone, which edition 1 writes `for k, _ in x`; a range over an integer literal is
+// the range 0..n. An assignment form (`for k = range x`) has no edition-1 spelling.
+fn rewrite_for_each(source, toks, for_at, replacements, suffixes) {
+    let semi = vec_filled(1, 0);
+    let body = fx_body(toks, for_at, semi);
+    if body < 0 || semi[0] >= 0 {
+        return 0;
+    }
+    let r = -1;
+    let depth = 0;
+    let i = for_at + 1;
+    while i < body {
+        let t = vec_get(toks, i);
+        if fx_open(t) {
+            depth = depth + 1;
+        } else if fx_close(t) {
+            depth = depth - 1;
+        } else if depth == 0 && fx_kw(t, "range") {
+            r = i;
+            break;
+        }
+        i = i + 1;
+    }
+    if r < 0 {
+        return 0;
+    }
+    let x = fx_next(toks, r);
+    let int_bound = fx_next(toks, x) == body && vec_get(toks, x)[T_KIND] == TK_INT;
+    if r == fx_next(toks, for_at) {
+        replacements[VEC_DATA][r] = "_ in";
+        if int_bound {
+            replacements[VEC_DATA][r] = "_ in 0..";
+            fx_triv[VEC_DATA][x] = "";
+        }
+        return 1;
+    }
+    let op = fx_prev(toks, r);
+    if !tok_is(vec_get(toks, op), ":=") {
+        return 0;
+    }
+    let k = fx_next(toks, for_at);
+    let names = 1;
+    if fx_next(toks, k) != op {
+        names = 2;
+    }
+    replacements[VEC_DATA][op] = "in";
+    fx_span[VEC_DATA][op] = r + 1;
+    if int_bound {
+        if names != 1 {
+            return 0;
+        }
+        replacements[VEC_DATA][op] = "in 0..";
+        fx_triv[VEC_DATA][x] = "";
+    } else if names == 1 {
+        fx_add(suffixes, k, ", _");
+    }
+    return 1;
+}
+
+// rewrite_local_const hoists `const name = value` out of a function to package level,
+// where edition 1 allows constants (a constant there compiles exactly as one inside). The
+// declaration goes before the top-level declaration holding it; a name already declared
+// at package level, or hoisted with another value, gets the function's name in front.
+// Only a single-name constant in the function's own block moves: one in a nested block
+// may shadow a name the hoisted one would hide, so it stays, and edition 1 reports it.
+fn rewrite_local_const(source, toks, at, top, replacements, level) {
+    let name = fx_next(toks, at);
+    if level != 1 || name >= toks[VEC_LEN] || vec_get(toks, name)[T_KIND] != TK_IDENT {
+        return 0;
+    }
+    if tok_is(vec_get(toks, fx_next(toks, name)), ",") {
+        return 0;
+    }
+    // the statement ends at the first semicolon outside brackets
+    let depth = 0;
+    let last = name;
+    let i = name;
+    while i < toks[VEC_LEN] {
+        let t = vec_get(toks, i);
+        if fx_open(t) {
+            depth = depth + 1;
+        } else if fx_close(t) {
+            if depth == 0 {
+                break;
+            }
+            depth = depth - 1;
+        } else if depth == 0 && tok_is(t, ";") {
+            break;
+        }
+        last = i;
+        i = i + 1;
+    }
+    let nm = vec_get(toks, name)[T_TEXT];
+    if streq(nm, "_") {
+        fx_drop_statement(source, toks, at, last, replacements);
+        return 1;
+    }
+    let rest = "";
+    if fx_next(toks, name) <= last {
+        rest = fx_value_text(source, toks, fx_next(toks, name), last);
+    }
+    // the hoisted name: the same one unless the package level already has it, or another
+    // function hoisted it with another value; then the function's name prefixes it
+    let new = fx_renamed(nm);
+    let conflict = fx_top_declares(toks, nm);
+    let k = 0;
+    while k < fx_hoisted[VEC_LEN] {
+        let h = vec_get(fx_hoisted, k);
+        if streq(vec_get(h, 0), new) && !streq(vec_get(h, 1), rest) {
+            conflict = 1;
+        }
+        k = k + 1;
+    }
+    if conflict {
+        let up = buf_new();
+        buf_byte(up, load8(nm) - 32 * (load8(nm) >= 'a' && load8(nm) <= 'z'));
+        buf_str(up, nm + 1);
+        new = str_cat3(fx_fn_name, str_slice(up[VEC_DATA], up[VEC_LEN]), "");
+    }
+    if !streq(new, nm) {
+        fx_rename_uses(toks, last + 1, nm, new);
+    }
+    k = 0;
+    while k < fx_hoisted[VEC_LEN] {
+        let h = vec_get(fx_hoisted, k);
+        if streq(vec_get(h, 0), new) {
+            fx_drop_statement(source, toks, at, last, replacements);
+            return 1;
+        }
+        k = k + 1;
+    }
+    let h = vec_new();
+    vec_push(h, new);
+    vec_push(h, rest);
+    vec_push(fx_hoisted, h);
+    fx_add(fx_lead, top, str_cat3("const ", new, str_cat3(" ", rest, "\n\n")));
+    fx_drop_statement(source, toks, at, last, replacements);
+    return 1;
+}
+
+// fx_value_text is the source of tokens a..b as it reads at package level: names renamed
+// so far (an earlier hoisted constant, a reserved word) are written with their new names.
+fn fx_value_text(source, toks, a, b) {
+    let out = buf_new();
+    let cursor = vec_get(toks, a)[T_START];
+    let i = a;
+    while i <= b {
+        let t = vec_get(toks, i);
+        if !t[T_SYNTH] {
+            buf_bytes(out, source + cursor, t[T_START] - cursor);
+            let p = fx_prev(toks, i);
+            if fx_rep[VEC_DATA][i] {
+                buf_str(out, fx_rep[VEC_DATA][i]);
+            } else if t[T_KIND] == TK_IDENT && (p < 0 || !tok_is(vec_get(toks, p), ".")) {
+                buf_str(out, fx_renamed(t[T_TEXT]));
+            } else {
+                buf_bytes(out, source + t[T_START], t[T_END] - t[T_START]);
+            }
+            cursor = t[T_END];
+        }
+        i = i + 1;
+    }
+    return str_slice(out[VEC_DATA], out[VEC_LEN]);
+}
+
+// fx_drop_statement removes tokens a..b and the line they stood on.
+fn fx_drop_statement(source, toks, a, b, replacements) {
+    replacements[VEC_DATA][a] = "";
+    fx_span[VEC_DATA][a] = b + 1;
+    let prev = fx_prev(toks, a);
+    let from = 0;
+    if prev >= 0 {
+        from = vec_get(toks, prev)[T_END];
+    }
+    let to = vec_get(toks, a)[T_START];
+    let j = to;
+    while j > from && (load8(source + j - 1) == ' ' || load8(source + j - 1) == '\t') {
+        j = j - 1;
+    }
+    if j > from && load8(source + j - 1) == '\n' {
+        fx_triv[VEC_DATA][a] = str_slice(source + from, j - 1 - from);
+    }
+}
+
+// fx_top_declares reports a package-level declaration of name in this file.
+fn fx_top_declares(toks, name) {
+    let depth = 0;
+    let i = 0;
+    while i < toks[VEC_LEN] {
+        let t = vec_get(toks, i);
+        if tok_is(t, "{") || tok_is(t, "(") || tok_is(t, "[") {
+            depth = depth + 1;
+        } else if tok_is(t, "}") || tok_is(t, ")") || tok_is(t, "]") {
+            depth = depth - 1;
+        } else if depth == 0 && (fx_kw(t, "const") || fx_kw(t, "var") || fx_kw(t, "type") || fx_kw(t, "func")) {
+            let n = fx_next(toks, i);
+            if n < toks[VEC_LEN] && streq(vec_get(toks, n)[T_TEXT], name) {
+                return 1;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// fx_unit is the edition-1 unit of a tide duration constant, or 0.
+fn fx_unit(name) {
+    if streq(name, "Nanosecond") { return "ns"; }
+    if streq(name, "Microsecond") { return "us"; }
+    if streq(name, "Millisecond") { return "ms"; }
+    if streq(name, "Second") { return "s"; }
+    if streq(name, "Minute") { return "m"; }
+    if streq(name, "Hour") { return "h"; }
+    return 0;
+}
+
+// rewrite_tide_unit turns `n * tide.Millisecond` and `tide.Millisecond * n` (n an integer
+// literal) into the unit literal `nms`, and a lone `tide.Second` into `1s`.
+fn rewrite_tide_unit(toks, at, replacements) {
+    let dot = fx_next(toks, at);
+    let name = fx_next(toks, dot);
+    if name >= toks[VEC_LEN] || !tok_is(vec_get(toks, dot), ".") || vec_get(toks, name)[T_KIND] != TK_IDENT {
+        return 0;
+    }
+    let unit = fx_unit(vec_get(toks, name)[T_TEXT]);
+    if !unit {
+        return 0;
+    }
+    let prev = fx_prev(toks, at);
+    if prev >= 0 && tok_is(vec_get(toks, prev), ".") {
+        return 0;
+    }
+    let star = fx_prev(toks, at);
+    let lit = fx_prev(toks, star);
+    if lit >= 0 && tok_is(vec_get(toks, star), "*") && vec_get(toks, lit)[T_KIND] == TK_INT && !fx_binds_tighter(toks, fx_prev(toks, lit)) {
+        replacements[VEC_DATA][lit] = str_cat3(fx_int_text(vec_get(toks, lit)), unit, "");
+        fx_span[VEC_DATA][lit] = name + 1;
+        return 1;
+    }
+    let star2 = fx_next(toks, name);
+    let lit2 = fx_next(toks, star2);
+    if lit2 < toks[VEC_LEN] && tok_is(vec_get(toks, star2), "*") && vec_get(toks, lit2)[T_KIND] == TK_INT && !fx_binds_tighter(toks, prev) && !fx_binds_tighter(toks, fx_next(toks, lit2)) {
+        replacements[VEC_DATA][at] = str_cat3(fx_int_text(vec_get(toks, lit2)), unit, "");
+        fx_span[VEC_DATA][at] = lit2 + 1;
+        return 1;
+    }
+    if !fx_binds_tighter(toks, prev) && !fx_binds_tighter(toks, fx_next(toks, name)) {
+        replacements[VEC_DATA][at] = str_cat3("1", unit, "");
+        fx_span[VEC_DATA][at] = name + 1;
+        return 1;
+    }
+    return 0;
+}
+
+// fx_binds_tighter reports an operator next to a unit expression that binds more tightly
+// than '*' would after the rewrite (a unary minus, '.', an index).
+fn fx_binds_tighter(toks, i) {
+    if i < 0 || i >= toks[VEC_LEN] {
+        return 0;
+    }
+    let t = vec_get(toks, i);
+    return tok_is(t, ".") || tok_is(t, "/") || tok_is(t, "%") || tok_is(t, "[") || tok_is(t, "<<") || tok_is(t, ">>");
+}
+
+fn fx_int_text(t) {
+    let b = buf_new();
+    buf_int(b, t[T_VAL]);
+    return str_slice(b[VEC_DATA], b[VEC_LEN]);
+}
+
+// fx_copy_trivia copies the source between tokens, turning /* block comments */ into
+// line comments and putting lead (if any) after the trivia's last blank line.
+fn fx_copy_trivia(out, source, a, b, lead) {
+    let at = a;
+    if lead {
+        let k = b - 1;
+        at = -1;
+        while k > a {
+            if load8(source + k) == '\n' && load8(source + k - 1) == '\n' {
+                at = k + 1;
+                break;
+            }
+            k = k - 1;
+        }
+        if at < 0 {
+            at = a;
+            while at < b && load8(source + at) != '\n' {
+                at = at + 1;
+            }
+            if at < b {
+                at = at + 1;
+            }
+        }
+        fx_copy_comments(out, source, a, at);
+        buf_str(out, lead);
+    }
+    fx_copy_comments(out, source, at, b);
+}
+
+fn fx_copy_comments(out, source, a, b) {
+    let i = a;
+    while i < b {
+        let c = load8(source + i);
+        if c == '/' && i + 1 < b && load8(source + i + 1) == '/' {
+            while i < b && load8(source + i) != '\n' {
+                buf_byte(out, load8(source + i));
+                i = i + 1;
+            }
+        } else if c == '/' && i + 1 < b && load8(source + i + 1) == '*' {
+            // the indentation of the comment's first line, for the lines after it
+            let ls = i;
+            while ls > 0 && load8(source + ls - 1) != '\n' {
+                ls = ls - 1;
+            }
+            let ind = buf_new();
+            let q = ls;
+            while q < i && (load8(source + q) == ' ' || load8(source + q) == '\t') {
+                buf_byte(ind, load8(source + q));
+                q = q + 1;
+            }
+            i = i + 2;
+            buf_str(out, "//");
+            while i < b && !(load8(source + i) == '*' && i + 1 < b && load8(source + i + 1) == '/') {
+                let d = load8(source + i);
+                buf_byte(out, d);
+                if d == '\n' {
+                    fx_put_tabs(out);
+                    buf_bytes(out, ind[VEC_DATA], ind[VEC_LEN]);
+                    // skip the comment line's own indentation and a leading '*'
+                    i = i + 1;
+                    while i < b && (load8(source + i) == ' ' || load8(source + i) == '\t') {
+                        i = i + 1;
+                    }
+                    buf_str(out, "//");
+                    if i < b && load8(source + i) == '*' && !(i + 1 < b && load8(source + i + 1) == '/') {
+                        i = i + 1;
+                    }
+                    if i < b && load8(source + i) != ' ' && load8(source + i) != '\n' && !(load8(source + i) == '*' && i + 1 < b && load8(source + i + 1) == '/') {
+                        buf_byte(out, ' ');
+                    }
+                    continue;
+                }
+                i = i + 1;
+            }
+            while out[VEC_LEN] > 0 && (load8(out[VEC_DATA] + out[VEC_LEN] - 1) == ' ' || load8(out[VEC_DATA] + out[VEC_LEN] - 1) == '\t') {
+                out[VEC_LEN] = out[VEC_LEN] - 1;
+            }
+            i = i + 2;
+            // code after the comment on the same line goes to a line of its own
+            let j = i;
+            while j < b && (load8(source + j) == ' ' || load8(source + j) == '\t') {
+                j = j + 1;
+            }
+            if j >= b || load8(source + j) != '\n' {
+                buf_byte(out, '\n');
+                fx_put_tabs(out);
+                buf_bytes(out, ind[VEC_DATA], ind[VEC_LEN]);
+                i = j;
+            }
+        } else {
+            buf_byte(out, c);
+            if c == '\n' && i + 1 < b && load8(source + i + 1) != '\n' {
+                fx_put_tabs(out);
+            }
+            i = i + 1;
+        }
+    }
+}
+
+// fx_reserved reports the words edition 1 reserves that edition-0 code may use as names
+// (edition 0 has none of their constructs): such a name gets a trailing '_', the same in
+// every file, so a package's files still agree.
+fn fx_reserved(toks, i) {
+    let t = vec_get(toks, i);
+    if t[T_KIND] != TK_IDENT {
+        return 0;
+    }
+    let s = t[T_TEXT];
+    if streq(s, "shared") {
+        let n = fx_next(toks, i);
+        return n >= toks[VEC_LEN] || !fx_kw(vec_get(toks, n), "var");
+    }
+    if streq(s, "enum") {
+        let n = fx_next(toks, i);
+        return n >= toks[VEC_LEN] || !tok_is(vec_get(toks, n), "{");
+    }
+    if streq(s, "keep") {
+        // the builtin keep(x) stays; a name spelled the same is renamed
+        let n = fx_next(toks, i);
+        return n >= toks[VEC_LEN] || !tok_is(vec_get(toks, n), "(");
+    }
+    if streq(s, "secret") && fx_trusted {
+        // `name secret T`, `) secret T`, `[]secret T`: the qualifier, the same word in edition 1
+        let n = fx_next(toks, i);
+        let p = fx_prev(toks, i);
+        if n < toks[VEC_LEN] && p >= 0 && (vec_get(toks, n)[T_KIND] == TK_IDENT || tok_is(vec_get(toks, n), "[") || tok_is(vec_get(toks, n), "?")) && (vec_get(toks, p)[T_KIND] == TK_IDENT || tok_is(vec_get(toks, p), ")") || tok_is(vec_get(toks, p), "]")) {
+            return 0;
+        }
+    }
+    return streq(s, "match") || streq(s, "within") || streq(s, "limit") || streq(s, "guard") || streq(s, "parallel") || streq(s, "detach") || streq(s, "secret");
+}
+
+// rewrite_field_attr moves a struct field's trailing attribute (`Name str @json("n")`)
+// before the field, where edition 1 writes it (`@json("n") Name str`).
+fn rewrite_field_attr(source, toks, at) {
+    // An attribute that starts its line (edition 1's place, after a synthetic ';') stays.
+    let raw = at - 1;
+    if raw < 0 || tok_is(vec_get(toks, raw), "{") || tok_is(vec_get(toks, raw), ";") || tok_is(vec_get(toks, raw), "(") {
+        return 0;
+    }
+    let prev = fx_prev(toks, at);
+    let name = fx_next(toks, at);
+    let last = name;
+    let open = fx_next(toks, name);
+    if open < toks[VEC_LEN] && tok_is(vec_get(toks, open), "(") {
+        let depth = 0;
+        let j = open;
+        while j < toks[VEC_LEN] {
+            let c = vec_get(toks, j);
+            if tok_is(c, "(") {
+                depth = depth + 1;
+            } else if tok_is(c, ")") {
+                depth = depth - 1;
+                if depth == 0 {
+                    break;
+                }
+            }
+            j = j + 1;
+        }
+        last = j;
+    }
+    // the field starts after the previous line's ';' (a synthetic one too) or the '{'
+    let k = at - 1;
+    while k >= 0 && !tok_is(vec_get(toks, k), ";") && !tok_is(vec_get(toks, k), "{") {
+        k = k - 1;
+    }
+    let first = k + 1;
+    while first < at && vec_get(toks, first)[T_SYNTH] {
+        first = first + 1;
+    }
+    fx_add(fx_pre, first, str_cat3(fx_text(source, toks, at, last), " ", ""));
+    fx_rep[VEC_DATA][at] = "";
+    fx_span[VEC_DATA][at] = last + 1;
+    fx_triv[VEC_DATA][at] = "";
+    return 1;
+}
+
+// rewrite_const_group expands `const ( A T = iota; B; C )` into one declaration per name:
+// edition 1 has neither groups nor iota, so each value is written out with iota replaced
+// by its index and an omitted value repeating the previous one.
+fn rewrite_const_group(source, toks, at) {
+    let open = fx_next(toks, at);
+    if open >= toks[VEC_LEN] || !tok_is(vec_get(toks, open), "(") {
+        return 0;
+    }
+    let close = open;
+    let depth = 0;
+    while close < toks[VEC_LEN] {
+        let c = vec_get(toks, close);
+        if fx_open(c) {
+            depth = depth + 1;
+        } else if fx_close(c) {
+            depth = depth - 1;
+            if depth == 0 {
+                break;
+            }
+        }
+        close = close + 1;
+    }
+    let out = buf_new();
+    let spec_first = -1;  // the previous spec's type-and-value tokens, for repetition
+    let spec_last = -1;
+    let index = 0;
+    let i = fx_next(toks, open);
+    let cursor = vec_get(toks, open)[T_END];
+    while i < close {
+        // one spec: Name [Type] [= Expr], ending at a ';'
+        let end = i;
+        let d = 0;
+        while end < close {
+            let c = vec_get(toks, end);
+            if fx_open(c) {
+                d = d + 1;
+            } else if fx_close(c) {
+                d = d - 1;
+            } else if d == 0 && tok_is(c, ";") {
+                break;
+            }
+            end = end + 1;
+        }
+        let last = fx_prev(toks, end);
+        if last < i {
+            i = fx_next(toks, end);
+            continue;
+        }
+        // trivia before the spec, one level less indented; the first starts the declaration
+        if index == 0 {
+            let q = cursor;
+            while q < vec_get(toks, i)[T_START] && (load8(source + q) == ' ' || load8(source + q) == '\t') {
+                q = q + 1;
+            }
+            if load8(source + q) == '\n' {
+                cursor = q + 1;
+                if load8(source + cursor) == '\t' {
+                    cursor = cursor + 1;
+                }
+            }
+        }
+        fx_copy_dedent(out, source, cursor, vec_get(toks, i)[T_START]);
+        let name = vec_get(toks, i);
+        buf_str(out, "const ");
+        buf_str(out, fx_renamed(name[T_TEXT]));
+        let rest = fx_next(toks, i);
+        if rest <= last {
+            spec_first = rest;
+            spec_last = last;
+        }
+        if spec_first < 0 {
+            return 0;
+        }
+        let k = spec_first;
+        let prev_end = vec_get(toks, i)[T_END];
+        if rest > last {
+            buf_byte(out, ' ');
+            prev_end = vec_get(toks, spec_first)[T_START];
+        }
+        while k <= spec_last {
+            let c = vec_get(toks, k);
+            if !c[T_SYNTH] {
+                buf_bytes(out, source + prev_end, c[T_START] - prev_end);
+                if c[T_KIND] == TK_IDENT && streq(c[T_TEXT], "iota") {
+                    buf_int(out, index);
+                } else {
+                    buf_bytes(out, source + c[T_START], c[T_END] - c[T_START]);
+                }
+                prev_end = c[T_END];
+            }
+            k = k + 1;
+        }
+        cursor = vec_get(toks, last)[T_END];
+        index = index + 1;
+        i = fx_next(toks, end);
+    }
+    fx_copy_dedent(out, source, cursor, vec_get(toks, close)[T_START]);
+    while out[VEC_LEN] > 0 && (load8(out[VEC_DATA] + out[VEC_LEN] - 1) == '\n' || load8(out[VEC_DATA] + out[VEC_LEN] - 1) == ' ' || load8(out[VEC_DATA] + out[VEC_LEN] - 1) == '\t') {
+        out[VEC_LEN] = out[VEC_LEN] - 1;
+    }
+    fx_rep[VEC_DATA][at] = str_slice(out[VEC_DATA], out[VEC_LEN]);
+    fx_span[VEC_DATA][at] = close + 1;
+    return 1;
+}
+
+// fx_copy_dedent copies trivia with one tab less at each line start.
+fn fx_copy_dedent(out, source, a, b) {
+    let i = a;
+    while i < b {
+        let c = load8(source + i);
+        buf_byte(out, c);
+        i = i + 1;
+        if c == '\n' && i < b && load8(source + i) == '\t' {
+            i = i + 1;
+        }
+    }
+}
+
+// fx_renamed is a name as the translator prints it: reserved words get a trailing '_'.
+fn fx_renamed(name) {
+    if streq(name, "match") || streq(name, "within") || streq(name, "limit") || streq(name, "guard") || streq(name, "parallel") || streq(name, "detach") || streq(name, "secret") || streq(name, "shared") || streq(name, "enum") || streq(name, "keep") {
+        return str_cat3(name, "_", "");
+    }
+    return name;
+}
+
+// fx_rename_uses renames name to new in the function body after token from (up to the
+// body's closing brace), except where it follows a '.' (a field or a package member).
+fn fx_rename_uses(toks, from, name, new) {
+    let depth = 0;
+    let i = from;
+    while i < toks[VEC_LEN] {
+        let t = vec_get(toks, i);
+        if tok_is(t, "{") {
+            depth = depth + 1;
+        } else if tok_is(t, "}") {
+            if depth == 0 {
+                return 0;
+            }
+            depth = depth - 1;
+        } else if t[T_KIND] == TK_IDENT && streq(t[T_TEXT], name) {
+            let p = fx_prev(toks, i);
+            if p < 0 || !tok_is(vec_get(toks, p), ".") {
+                fx_rep[VEC_DATA][i] = new;
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// matching_paren returns the ')' that closes the '(' at open, or the last token.
+fn matching_paren(toks, open) {
+    let depth = 0;
+    let i = open;
+    while i < toks[VEC_LEN] {
+        let t = vec_get(toks, i);
+        if tok_is(t, "(") {
+            depth = depth + 1;
+        } else if tok_is(t, ")") {
+            depth = depth - 1;
+            if depth == 0 {
+                return i;
+            }
+        }
+        i = i + 1;
+    }
+    return toks[VEC_LEN] - 1;
+}
+
+// fx_assigns reports a change to name between tokens a and b: an assignment or increment
+// (name = ..., name += ..., name++), or name passed as mut.
+fn fx_assigns(toks, a, b, name) {
+    let i = a;
+    while i < b {
+        let t = vec_get(toks, i);
+        if t[T_KIND] == TK_IDENT && streq(t[T_TEXT], name) {
+            let p = fx_prev(toks, i);
+            let pt = 0;
+            if p >= 0 {
+                pt = vec_get(toks, p);
+            }
+            if pt && tok_is(pt, "mut") {
+                return 1;
+            }
+            if !pt || !tok_is(pt, ".") {
+                let n = fx_next(toks, i);
+                if n < toks[VEC_LEN] {
+                    let op = vec_get(toks, n);
+                    if tok_is(op, "=") || tok_is(op, ":=") || tok_is(op, "++") || tok_is(op, "--") || tok_is(op, "+=") || tok_is(op, "-=") || tok_is(op, "*=") || tok_is(op, "/=") || tok_is(op, "%=") || tok_is(op, "&=") || tok_is(op, "|=") || tok_is(op, "^=") || tok_is(op, "<<=") || tok_is(op, ">>=") {
+                        return 1;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// fx_put writes n bytes of trivia, adding fx_cur_ind tabs after each newline that does not
+// end an empty line.
+fn fx_put(out, p, n) {
+    let i = 0;
+    while i < n {
+        let c = load8(p + i);
+        buf_byte(out, c);
+        if c == '\n' && i + 1 < n && load8(p + i + 1) != '\n' {
+            fx_put_tabs(out);
+        }
+        i = i + 1;
+    }
+}
+
+// fx_arm_close is the text that closes a match arm before token at: on a line of its own when
+// the token starts a line, else "} ".
+fn fx_arm_close(source, toks, at, head, tail) {
+    let t = vec_get(toks, at);
+    if source_has_newline(source, vec_get(toks, fx_prev(toks, at))[T_END], t[T_START]) {
+        return str_cat3(head, source_indent(source, t), tail);
+    }
+    return "} ";
+}
+
+fn source_has_newline(source, a, b) {
+    while a < b {
+        if load8(source + a) == '\n' { return 1; }
+        a = a + 1;
+    }
+    return 0;
+}
+
+fn fx_put_tabs(out) {
+    let k = 0;
+    while k < fx_cur_ind {
+        buf_byte(out, '\t');
+        k = k + 1;
+    }
+}
+
+// fx_nest marks tokens a+1..b as one block deeper than in the source.
+fn fx_nest(a, b) {
+    let i = a + 1;
+    while i <= b && i < fx_ind[VEC_LEN] {
+        fx_ind[VEC_DATA][i] = fx_ind[VEC_DATA][i] + 1;
+        i = i + 1;
+    }
 }
