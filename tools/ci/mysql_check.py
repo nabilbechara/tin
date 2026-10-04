@@ -7,6 +7,7 @@ connections. Runs against a small MySQL server written here (MYSQL_ADDR=host:por
 MYSQL_USER/MYSQL_PASSWORD/MYSQL_DATABASE uses a real one, for the checks it can do)."""
 import hashlib
 import os
+import random
 import re
 import socket
 import socketserver
@@ -305,9 +306,18 @@ class Session:
 
 
 def free_port():
-    with socket.socket() as s:
-        s.bind(('127.0.0.1', 0))
-        return s.getsockname()[1]
+    """A free port below the ephemeral ranges (Linux 32768+, macOS 49152+). A port the kernel
+    picks for bind(0) is an ephemeral one, which a client connection can take as its source
+    port before the server binds it ("cannot bind the address" under load)."""
+    for _ in range(500):
+        port = random.randint(20000, 30000)
+        with socket.socket() as s:
+            try:
+                s.bind(('127.0.0.1', port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError('no free port below the ephemeral range')
 
 
 class Server:
