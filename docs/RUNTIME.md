@@ -398,7 +398,11 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   memory in what it captures. The scope's end waits for every child; the first child fault
   cancels the scope, and so its other children, and is the scope's fault (`try` passes it
   on). `t := s.spawn(f)` gives a handle with `t.wait() !` and `t.cancel()`; a child cancelled
-  through its handle does not fail the scope. A child with a value (`s.spawn(fn() !T { ... })`)
+  through its handle does not fail the scope. `s.cancel(reason)` (#143) cancels the scope by
+  hand: every wait inside it, its children's and its body's, fails with `canceled: reason`
+  (`fault.Is(err, fault.Canceled)`), and that is the scope's fault unless a child failed first.
+  `s.yield()` lets the core's other ready tasks run before the caller goes on (in `main`, one
+  of them). A child with a value (`s.spawn(fn() !T { ... })`)
   gives a `spawnedOf[T]` whose `t.wait() !T` is its value or its fault (waiting again gives the
   same value), usable in `select` like any handle. Leaving a scope body early, by `return` or
   a `try`'s fault, cancels and joins the children still running, then leaves the scope. In a server the event loop resumes children;
@@ -655,6 +659,7 @@ functions keep that rule, and grows as phase 1 lands.
 | `Hmac`, `HmacSha256` | the key and message bytes | their lengths |
 | `HkdfExtract`, `HkdfExpand`, `HkdfExpandLabel` | the key material | lengths, `info`, labels |
 | `ConstantTimeEq`, `Equal` | the bytes | the lengths |
+| `P256PublicKey`, `P256ECDH` and the field and point code under them (`field.tin`, `p256.tin`) | the private key and every coordinate | the validity checks of the key and the peer's point, whose results are public |
 
 `Sha1`, `Pbkdf2Sha256`, the hex and base64 codecs and the RSA-OAEP code are not
 constant-time and must not be used on secrets in a timing-sensitive protocol path.

@@ -50,6 +50,20 @@ def wycheproof(cases):
                               f"hkdf_{name} {t['tcId']}"))
 
 
+def ecdh(cases, file, op, size):
+    """Wycheproof ECDH vectors: valid ones give the shared secret, invalid ones a fault, and
+    acceptable ones (such as compressed points) either."""
+    data = json.loads((VECTORS / file).read_text())
+    for group in data['testGroups']:
+        for t in group['tests']:
+            priv = int(t['private'], 16).to_bytes(size, 'big') if t['private'] else b''
+            line = f"{op} {hx(priv)} {hx(bytes.fromhex(t['public']))}"
+            want, result = t['shared'], t['result']
+            cases.append((line, lambda out, want=want, result=result:
+                          out == want if result == 'valid' else out == 'fault' if result == 'invalid' else out in (want, 'fault'),
+                          f"{file} {t['tcId']}"))
+
+
 def random_cases(cases):
     rng = random.Random(124)
     for name in ('sha256', 'sha384', 'sha512'):
@@ -79,6 +93,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     cases = []
     wycheproof(cases)
+    ecdh(cases, 'ecdh_secp256r1_ecpoint_test.json', 'p256ecdh', 32)
     random_cases(cases)
     with tempfile.TemporaryDirectory(prefix='crypto-', dir=out) as tmp:
         exe = Path(tmp) / 'crypto_vectors'
