@@ -2007,6 +2007,40 @@ example.tin:9:11: error E313 USE_AFTER_RESET: 's' may hold request memory from b
 
 Fix: `keep()` the value before the reset, or create it again after.
 
+### E314 DETACH_ESCAPE
+
+A `detach` block runs as a task that outlives the request that started it, so what it
+captures must already be long-lived: request memory is an error unless it was kept first,
+or the block reads it only inside `keep()`.
+
+```tin edition=1
+package main
+
+mut flushed str = ""
+
+fn flush(s str) {
+	flushed = keep(flushed + s)
+}
+
+fn later(n i64) {
+	let msg = "job {n}"
+	detach {
+		flush(msg)
+	}
+}
+
+fn main() {
+	later(1)
+}
+```
+
+```text
+example.tin:11:2: error E314 DETACH_ESCAPE: detach captures 'msg', which may hold request memory, but the detached task outlives the request: keep() it before the block (let v = keep(...)), or read it in the block only inside keep()
+```
+
+Fix: `let kept = keep(msg)` before the block and use `kept` in it, or write `keep(msg)`
+inside the block.
+
 ### E320 KEEP_TYPE
 
 `keep(x)` copies a value into the long-lived heap, following every reference in it; a type
@@ -3117,6 +3151,43 @@ example.tin:11:11: error E652 POLICY: Plain is not a policy: with needs a value 
 
 Fix: use a policy from the `policy` package (`policy.Retry(3)`), or give the type the `Run`
 method.
+
+### E653 POLICY_BODY
+
+A policy's `Run` may only call its `body`, or pass it to a function that only calls it:
+the block's variables live on the caller's frame, so a body kept for later would outlive
+them.
+
+```tin edition=1
+package main
+
+import "say"
+
+type Saver struct {
+	saved []fn() !i64
+}
+
+fn (s mut Saver) Run(body fn() !i64) !i64 {
+	s.saved = append(s.saved, body)
+	return try body()
+}
+
+fn main() {
+	mut s = Saver{saved: []fn() !i64{}}
+	let a = with s {
+		1
+	} catch _ {
+		0
+	}
+	say.Line(a)
+}
+```
+
+```text
+example.tin:10:28: error E653 POLICY_BODY: Saver.Run keeps the body of a with block: a policy may only call body, or pass it to a function that only calls it (the block's variables live on the caller's frame)
+```
+
+Fix: call `body()` inside `Run` (as often as the policy needs) and keep only its results.
 
 ## E7xx mut parameters
 
