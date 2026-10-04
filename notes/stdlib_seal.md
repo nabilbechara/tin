@@ -29,3 +29,18 @@ ECDSA are listed in notes/tls.md.
 
 Tests: `tests/v2/seal_p256.tin` (Go twin `bench/ref/seal_p256`), and Wycheproof
 `ecdh_secp256r1_ecpoint` in `tools/ci/crypto_check.py`.
+
+## X25519 and ChaCha20-Poly1305 (#124 phase 1)
+
+API: `X25519`, `X25519PublicKey`, `X25519NewPrivateKey`, `ChaCha20`, `type AEAD` with
+`NewChaCha20Poly1305`, `Seal`, `Open`, `NonceSize`, `Overhead`.
+
+- X25519 uses ten signed limbs in radix 2^25.5 so products fit in 64 bits; it fails on an
+  all-zero result (RFC 8446 7.4.2 requires the check). About 0.85 ms per operation on Linux
+  x86-64 before tuning.
+- ChaCha20 keeps the state in locals and xors eight bytes at a time; Poly1305 is the 26-bit
+  limb form (poly1305-donna). AES-GCM joins `AEAD` as another kind.
+
+Tests: `tests/v2/seal_x25519_chacha.tin` (RFC 7748, RFC 8439, every length class, tampering;
+the Go twin `bench/ref/seal_x25519_chacha` uses crypto/ecdh and an independent math/big
+Poly1305), and Wycheproof `x25519` and `chacha20_poly1305` in `tools/ci/crypto_check.py`.
