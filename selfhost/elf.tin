@@ -181,7 +181,8 @@ fn write_elf(path) {
     let hash_size = 4 * (2 + nbucket + nsym);
     let rela_off = align_up(hash_off + hash_size, 8);
     let rela_size = 24 * nimp;
-    let ro_end = rela_off + rela_size;
+    lk_btrace = align_up(rela_off+rela_size,8);
+    let ro_end = lk_btrace+8+24*own[VEC_LEN];
 
     // Text segment: _start, code, stubs, strings, constants.
     let text_addr = align_up(ro_end, E_ALIGN);
@@ -284,6 +285,19 @@ fn write_elf(path) {
         i = i + 1;
     }
     memcpy(img + dynstr_off, dstr[VEC_DATA], dstr[VEC_LEN]);
+    // Plain readonly records survive removal of the dynamic linker in phase 5.
+    put64(img+lk_btrace,own[VEC_LEN]);
+    i=0;
+    while i < own[VEC_LEN] {
+        let f=vec_get(own,i);
+        let end=lk_stubs;
+        if i+1 < own[VEC_LEN] { end=vec_get(own,i+1)[F_ADDR]; }
+        let rec=img+lk_btrace+8+24*i;
+        put64(rec,f[F_ADDR]); put64(rec+8,end);
+        put64(rec+16,dynstr_off+vec_get(name_off,nimp+1+i));
+        i=i+1;
+    }
+
 
     // SysV hash table over every dynamic symbol.
     let hp = img + hash_off;
@@ -400,8 +414,8 @@ fn write_elf(path) {
         i = i + 1;
     }
 
-    unlink(path);
-    let fd = creat(path, 493);
+    rt_sys_unlink(path);
+    let fd = rt_sys_creat(path, 493);
     if (fd & 0x80000000) != 0 {
         let e = err_begin(NO_POS);
         buf_str(e, "cannot create ");
@@ -413,5 +427,5 @@ fn write_elf(path) {
     out[VEC_CAP] = file_size;
     out[VEC_DATA] = img;
     write_all(fd, out);
-    close(fd);
+    rt_sys_close(fd);
 }

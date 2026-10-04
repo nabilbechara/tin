@@ -1,18 +1,7 @@
 // Linux (glibc) part of the runtime: the same rt_ helpers as runtime_darwin.tin, with the
 // Linux calls, constants and struct layouts (arm64 and x86-64 share these values).
 
-extern func __errno_location() i64
-extern func clock_gettime(clock i64, ts i64) i64
-extern func getrandom(p i64, n i64, flags i64) i64
-extern func sysconf(name i64) i64
-extern func signal(sig i64, h i64) i64
-extern func sched_getaffinity(pid i64, n i64, set i64) i64
-extern func sched_setaffinity(pid i64, n i64, set i64) i64
-extern func open(path i64, flags i64, ...) i64
-extern func close(fd i64) i64
 extern func getenv(name i64) i64
-extern func pthread_sigmask(how i64, set i64, old i64) i64
-extern func signalfd(fd i64, mask i64, flags i64) i64
 
 const EINTR = 4
 const EAGAIN = 11
@@ -39,15 +28,20 @@ const MAP_STACK = 0x22 // MAP_PRIVATE | MAP_ANONYMOUS
 
 var rtTimespec i64   // per core: the timespec clock_gettime fills
 
-func rt_errno() i64 {
-	return i64(i32(__errno_location()[0]))
-}
+// Word 10 belongs to this kernel thread, including helpers; no architecture TLS is used.
+func linux_set_errno(e i64) { if __ctx() != 0 { __ctx()[10] = e } }
+func linux_get_errno() i64 { if __ctx() == 0 { return 0 }; return __ctx()[10] }
+func rt_errno() i64 { return linux_get_errno() }
+// Environment calls retain libc until phase 5; their failure still uses libc TLS.
+func rt_env_errno() i64 { return __ld(__errno_location(),2)&0xffffffff }
+func linux_restorer() {}
+func linux_restorer_ptr() i64 { return cast(i64,linux_restorer) }
 
 func rt_clock(id i64) i64 {
 	if rtTimespec == 0 {
 		rtTimespec = rt_ingot_alloc(16)
 	}
-	clock_gettime(id, rtTimespec)
+	rt_sys_clock_gettime(id, rtTimespec)
 	return rtTimespec[0]*1000000000 + rtTimespec[1]
 }
 
@@ -64,7 +58,7 @@ func rt_wall_ns() i64 {
 // rt_random fills n bytes at p from getrandom (which may return fewer bytes per call).
 func rt_random(p i64, n i64) {
 	for n > 0 {
-		k := getrandom(p, n, 0)
+		k := rt_sys_getrandom(p, n, 0)
 		if k <= 0 {
 			if rt_errno() == EINTR {
 				continue
@@ -84,19 +78,19 @@ shared var rtNcpus i64       // rt_ncpus once computed (before any core pins its
 
 // rt_read_file reads up to n-1 bytes of path into buf, NUL-terminated: the length, or -1 when it cannot be opened.
 func rt_read_file(path str, buf i64, n i64) i64 {
-	fd := i64(i32(open(cast(i64, path)+8, 0)))
+	fd := i64(i32(rt_sys_open(cast(i64, path)+8, 0, 0)))
 	if fd < 0 {
 		return -1
 	}
 	total := 0
 	for total < n-1 {
-		k := read(fd, buf+total, n-1-total)
+		k := rt_sys_read(fd, buf+total, n-1-total)
 		if k <= 0 {
 			break
 		}
 		total += k
 	}
-	close(fd)
+	rt_sys_close(fd)
 	store8(buf+total, 0)
 	return total
 }
@@ -356,15 +350,15 @@ func rt_cpu_quota() i64 {
 	return best
 }
 
-// rt_affinity_count fills the 128-byte cpu_set_t at set with the CPUs this thread may run on
+// rt_affinity_count fills the 4096-byte affinity mask at set with the CPUs this thread may run on
 // and returns how many there are (0 when the call fails).
 func rt_affinity_count(set i64) i64 {
-	memset(set, 0, 128)
-	if i64(i32(sched_getaffinity(0, 128, set))) != 0 {
+	memset(set, 0, 4096)
+	if i64(i32(rt_sys_sched_getaffinity(0, 4096, set))) != 0 {
 		return 0
 	}
 	n := 0
-	for i := 0; i < 128; i++ {
+	for i := 0; i < 4096; i++ {
 		b := i64(load8(set + i))
 		for b != 0 {
 			n += b & 1
@@ -374,20 +368,17 @@ func rt_affinity_count(set i64) i64 {
 	return n
 }
 
-// rt_ncpus is the number of CPUs this program may use: online CPUs, capped by the affinity
-// mask (cpuset) and by the cgroup CPU quota; never less than 1.
+// rt_ncpus is the number of CPUs this program may use: the affinity mask (cpuset),
+// capped by the cgroup CPU quota; never less than 1.
 func rt_ncpus() i64 {
 	if rtNcpus > 0 {
 		return rtNcpus
 	}
-	n := sysconf(84) & 0xffffffff
-	if n < 1 {
-		n = 1
-	}
-	set := calloc(1, 128)
+	n := 1
+	set := calloc(1, 4096)
 	a := rt_affinity_count(set)
 	free(set)
-	if a > 0 && a < n {
+	if a > 0 {
 		n = a
 	}
 	q := rt_cpu_quota()
@@ -429,7 +420,7 @@ func rt_pin_setup(n i64) {
 	rt_ncpus()
 	rtPin = false
 	if rtCPUMask == 0 {
-		rtCPUMask = calloc(1, 128)
+		rtCPUMask = calloc(1, 4096)
 	}
 	allowed := rt_affinity_count(rtCPUMask)
 	rtCPUCount = allowed
@@ -448,14 +439,14 @@ func rt_stack_t(st i64, sp i64, n i64) {
 }
 
 // rt_fault_handlers installs h (sig, siginfo, ucontext) for SIGSEGV and SIGBUS on the signal
-// stack: glibc's struct sigaction is the handler, a 128-byte mask, 4-byte flags (SA_ONSTACK
-// 0x08000000 | SA_SIGINFO 4) and the restorer, which glibc supplies.
+// stack, using the kernel's handler/flags/restorer/8-byte mask record.
 func rt_fault_handlers(h i64) {
-	act := calloc(1, 160)
+	act := calloc(4, 8)
 	act[0] = h
-	__st(act+136, 0x08000004, 2)
-	sigaction(11, act, 0)
-	sigaction(7, act, 0)
+	act[1] = 0x0c000004
+	act[2] = linux_restorer_ptr()
+	rt_sys_sigaction(11, act, 0)
+	rt_sys_sigaction(7, act, 0)
 	free(act)
 }
 
@@ -471,18 +462,18 @@ func rt_sigbus() i64 {
 // rt_sig_block_term blocks SIGTERM and SIGINT in the calling thread; threads it creates inherit
 // the mask, so a server can take the signals from a descriptor instead of a handler.
 func rt_sig_block_term() {
-	set := calloc(1, 128)
+	set := calloc(1, 8)
 	set[0] = 1<<14 | 1<<1
-	pthread_sigmask(0, set, 0)
+	rt_sys_pthread_sigmask(0, set, 0)
 	free(set)
 }
 
 // rt_signalfd returns a non-blocking descriptor that turns readable when a (blocked) SIGTERM or
 // SIGINT arrives; reading 128 bytes from it takes the signal (its number is the first u32).
 func rt_signalfd() i64 {
-	set := calloc(1, 128)
+	set := calloc(1, 8)
 	set[0] = 1<<14 | 1<<1
-	fd := i64(i32(signalfd(-1, set, 0x800|0x80000)))
+	fd := i64(i32(rt_sys_signalfd(-1, set, 0x800|0x80000)))
 	free(set)
 	return fd
 }
@@ -504,7 +495,7 @@ func rt_ai_addr(ai i64) i64 {
 
 // rt_nosigpipe: Linux has no per-socket flag, so SIGPIPE is ignored process-wide.
 func rt_nosigpipe(fd i64) {
-	signal(13, 1)
+	rt_sys_signal(13, 1)
 }
 
 // struct stat: st_mode's offset differs per CPU (runtime_linux_<arch>.tin); the rest is shared.
@@ -536,7 +527,7 @@ func rt_core_qos(id i64) {
 	}
 	cpu := -1
 	seen := 0
-	for i := 0; i < 1024 && cpu < 0; i++ {
+	for i := 0; i < 32768 && cpu < 0; i++ {
 		if (i64(load8(rtCPUMask+i/8))>>(i%8))&1 != 0 {
 			if seen == id {
 				cpu = i
@@ -547,13 +538,26 @@ func rt_core_qos(id i64) {
 	if cpu < 0 {
 		return
 	}
-	set := calloc(1, 128)
+	set := calloc(1, 4096)
 	store8(set+cpu/8, 1<<(cpu%8))
-	sched_setaffinity(0, 128, set)
+	rt_sys_sched_setaffinity(0, 4096, set)
 	free(set)
 }
 
 // rt_page_size is the OS mapping page size.
-func rt_page_size() i64 { return sysconf(30) }
+func rt_page_size() i64 { return getauxval(6) }
+func rt_date_year_width() i64 { return 1 }
+func rt_isatty(fd i64) bool {
+    termios := calloc(1,64)
+    result := linux_result(linux_raw(linux_nr_ioctl(),fd,0x5401,termios,0,0,0))
+    free(termios)
+    return result == 0
+}
 
 const MEM_DONTNEED = 4
+
+func rt_dir_error(d i64) i64 { return d[3] }
+
+// Socket address family and length follow the native OS layout.
+func rt_sockaddr_family(sa i64) i64 { return __ld(sa,1) }
+func rt_sockaddr_len(sa i64) i64 { if rt_sockaddr_family(sa) == 10 { return 28 }; return 16 }

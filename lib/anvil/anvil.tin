@@ -48,21 +48,7 @@ import "hearth"
 import "relay"
 import "say"
 
-extern func socket(domain i64, typ i64, proto i64) i64
-extern func setsockopt(fd i64, level i64, name i64, val i64, n i64) i64
-extern func bind(fd i64, addr i64, n i64) i64
-extern func listen(fd i64, backlog i64) i64
-extern func accept(fd i64, addr i64, n i64) i64
-extern func fcntl(fd i64, cmd i64, ...) i64
-extern func close(fd i64) i64
-extern func shutdown(fd i64, how i64) i64
-extern func pipe(fds i64) i64
-extern func signal(sig i64, h i64) i64
-extern func time(t i64) i64
-extern func gmtime_r(t i64, tm i64) i64
-extern func strftime(s i64, max i64, f i64, tm i64) i64
 extern func getenv(name i64) i64
-extern func open(path i64, flags i64, ...) i64
 
 // Req is the request being served. Its strings live in the request pool: keep() them
 // to store them anywhere long-lived.
@@ -165,7 +151,6 @@ var word i64
 var common i64      // "Server: anvil\r\nDate: ...\r\n"
 var commonLen i64
 var lastSec i64
-var tm i64
 var rr i64
 shared var gDeadlineMs i64 // a request's waits give up this long after it started (0: never)
 shared var gDeadlineSet bool
@@ -274,9 +259,9 @@ func serve_on(addr str, n i64) ! {
 	if fd == -3 {
 		fail "anvil: listen failed"
 	}
-	signal(13, 1)
+	rt_sys_signal(13, 1)
 	gListen = fd
-	gSpare = c32(open(cast(i64, "/dev/null")+8, 0))
+	gSpare = c32(rt_sys_open(cast(i64, "/dev/null")+8, 0, 0))
 	if n < 1 {
 		n = 1
 	}
@@ -290,10 +275,10 @@ func serve_on(addr str, n i64) ! {
 	}
 	fds := calloc(2, 4)
 	for i := 0; i < n; i++ {
-		pipe(fds)
+		rt_sys_pipe(fds)
 		gPipes[2*i] = __ld(fds, 2)
 		gPipes[2*i+1] = __ld(fds+4, 2)
-		fcntl(gPipes[2*i], F_SETFL, O_NONBLOCK)
+		rt_sys_fcntl(gPipes[2*i], F_SETFL, O_NONBLOCK)
 	}
 	gGrace = 25
 	if !gDeadlineSet {
@@ -335,29 +320,29 @@ func serve_on(addr str, n i64) ! {
 // open_listener binds a non-blocking listener on ip:port (SO_REUSEPORT, so every core
 // can have one on Linux); -1, -2, -3 report a socket, bind or listen failure.
 func open_listener(ip i64, port i64) i64 {
-	fd := c32(socket(2, 1, 0))
+	fd := c32(rt_sys_socket(2, 1, 0))
 	if fd < 0 {
 		return -1
 	}
 	one := calloc(1, 8)
 	one[0] = 1
-	setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, one, 4)
+	rt_sys_setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, one, 4)
 	if ownListener {
-		setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, one, 4)
+		rt_sys_setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, one, 4)
 	}
 	free(one)
 	sa := calloc(1, 16)
 	rt_sockaddr_in(sa, ip, port)
-	if c32(bind(fd, sa, 16)) < 0 {
-		close(fd)
+	if c32(rt_sys_bind(fd, sa, 16)) < 0 {
+		rt_sys_close(fd)
 		return -2
 	}
 	free(sa)
-	if c32(listen(fd, 4096)) < 0 {
-		close(fd)
+	if c32(rt_sys_listen(fd, 4096)) < 0 {
+		rt_sys_close(fd)
 		return -3
 	}
-	fcntl(fd, F_SETFL, O_NONBLOCK)
+	rt_sys_fcntl(fd, F_SETFL, O_NONBLOCK)
 	return fd
 }
 
@@ -375,8 +360,7 @@ func core(id i64) {
 	change = block
 	word = block + 128
 	common = block + 640
-	tm = block + 768
-	refresh_date(time(0))
+	refresh_date(rt_wall_seconds())
 	pr := gPipes[2*id]
 	ev_level(pr)
 	myListen = -1
@@ -401,10 +385,10 @@ func core(id i64) {
 	// through a pipe.
 	fdTask = calloc(65536, 8)
 	jfds := calloc(2, 4)
-	pipe(jfds)
+	rt_sys_pipe(jfds)
 	doneRd = i64(i32(__ld(jfds, 2)))
 	doneFd = i64(i32(__ld(jfds+4, 2)))
-	fcntl(doneRd, F_SETFL, O_NONBLOCK)
+	rt_sys_fcntl(doneRd, F_SETFL, O_NONBLOCK)
 	ev_level(doneRd)
 	waitHook = task_watch
 	waitCancel = task_unwatch
@@ -428,7 +412,7 @@ func core(id i64) {
 		if n <= 0 {
 			continue
 		}
-		now := time(0)
+		now := rt_wall_seconds()
 		if now != lastSec {
 			refresh_date(now)
 		}
@@ -442,7 +426,7 @@ func core(id i64) {
 				ev_timer_ack(drainTimer)
 				if rt_mono_ns() >= deadline {
 					rt_flush_core()
-					exit(0)
+					rt_sys_exit(0)
 				}
 			} else if fd == tick {
 				ev_timer_ack(tick)
@@ -495,13 +479,13 @@ func on_signal() {
 	ev_signal_ack()
 	if gStop != 0 {
 		rt_flush_core()
-		exit(0)
+		rt_sys_exit(0)
 	}
 	gStop = 1
 	deadline = rt_mono_ns() + gGrace*1000000000
 	word[3] = -1
 	for j := 1; j < gCores; j++ {
-		write(gPipes[2*j+1], word+24, 8)
+		rt_sys_write(gPipes[2*j+1], word+24, 8)
 	}
 	drainTimer = ev_drain_timer(100)
 	begin_drain()
@@ -515,7 +499,7 @@ func begin_drain() {
 	}
 	draining = true
 	if myListen >= 0 {
-		close(myListen)
+		rt_sys_close(myListen)
 		myListen = -1
 	}
 }
@@ -535,16 +519,16 @@ func drain_done() bool {
 
 func refresh_date(now i64) {
 	lastSec = now
-	word[0] = now
-	gmtime_r(word, tm)
 	s := "Server: anvil\r\n"
 	memcpy(common, cast(i64, s)+8, len(s))
-	commonLen = len(s) + c32(strftime(common+len(s), 100, cast(i64, "Date: %a, %d %b %Y %H:%M:%S GMT\r\n")+8, tm))
+	date := rt_http_date(now)
+	memcpy(common+len(s),cast(i64,date)+8,len(date))
+	commonLen = len(s)+len(date)
 }
 
 func accept_all() {
 	for k := 0; k < 64; k++ {
-		fd := c32(accept(myListen, 0, 0))
+		fd := c32(rt_sys_accept(myListen, 0, 0))
 		if fd < 0 {
 			e := errno()
 			if (e == 24 || e == 23) && gSpare >= 0 {
@@ -552,11 +536,11 @@ func accept_all() {
 			}
 			return
 		}
-		fcntl(fd, F_SETFL, O_NONBLOCK)
+		rt_sys_fcntl(fd, F_SETFL, O_NONBLOCK)
 		word[1] = 1
-		setsockopt(fd, 6, 1, word+8, 4)
+		rt_sys_setsockopt(fd, 6, 1, word+8, 4)
 		if fd >= 65536 {
-			close(fd)
+			rt_sys_close(fd)
 			continue
 		}
 		target := myID
@@ -573,7 +557,7 @@ func accept_all() {
 		}
 		if gMaxConns > 0 && __atomic_load(gLoad+target*128) >= gMaxConns {
 			// Full: close at once rather than let one client hold every descriptor.
-			close(fd)
+			rt_sys_close(fd)
 			continue
 		}
 		if target == myID {
@@ -581,7 +565,7 @@ func accept_all() {
 		} else {
 			__atomic_add(gLoad+target*128, 1)
 			word[2] = fd
-			write(gPipes[2*target+1], word+16, 8)
+			rt_sys_write(gPipes[2*target+1], word+16, 8)
 		}
 	}
 }
@@ -603,18 +587,18 @@ func least_loaded() i64 {
 // drop_one frees the spare fd to accept and close one waiting connection: the client gets
 // a clean close instead of hanging, and the level-triggered listen event stops spinning.
 func drop_one() {
-	close(gSpare)
-	fd := c32(accept(myListen, 0, 0))
+	rt_sys_close(gSpare)
+	fd := c32(rt_sys_accept(myListen, 0, 0))
 	if fd >= 0 {
-		close(fd)
+		rt_sys_close(fd)
 	}
-	gSpare = c32(open(cast(i64, "/dev/null")+8, 0))
+	gSpare = c32(rt_sys_open(cast(i64, "/dev/null")+8, 0, 0))
 }
 
 // take_handoffs registers the connections other cores dealt to this one (already counted
 // in this core's load by the sender).
 func take_handoffs(pr i64) {
-	n := read(pr, word+64, 256)
+	n := rt_sys_read(pr, word+64, 256)
 	for i := 0; i+8 <= n; i += 8 {
 		fd := (word + 64 + i)[0]
 		if fd == -1 {
@@ -648,7 +632,7 @@ func close_conn(c i64) {
 		return
 	}
 	fd := c[cFD]
-	close(fd)
+	rt_sys_close(fd)
 	conns[fd] = 0
 	if c[cTask] != 0 {
 		// Its request is still waiting: free the connection when the task ends.
@@ -683,7 +667,7 @@ func on_read_once(c i64) bool {
 	fd := c[cFD]
 	if c[cLinger] == 2 {
 		for {
-			n := read(fd, scr, scrSize)
+			n := rt_sys_read(fd, scr, scrSize)
 			if n == 0 || (n < 0 && errno() != EAGAIN && errno() != 4) {
 				close_conn(c)
 				return false
@@ -714,7 +698,7 @@ func on_read_once(c i64) bool {
 		}
 	}
 	want := cap - have
-	n := read(fd, buf+have, want)
+	n := rt_sys_read(fd, buf+have, want)
 	if n == 0 && c[cTask] != 0 {
 		// End of input while a request waits: answer it, then close.
 		c[cClose] = 1
@@ -817,7 +801,7 @@ func flush(c i64) bool {
 		obLen = 0
 		return true
 	}
-	w := write(c[cFD], ob, obLen)
+	w := rt_sys_write(c[cFD], ob, obLen)
 	if w < 0 {
 		if errno() != EAGAIN && errno() != 4 {
 			obLen = 0
@@ -859,7 +843,7 @@ func on_write(c i64) {
 	if c[cOut] == 0 {
 		return
 	}
-	w := write(c[cFD], c[cOut]+c[cOutOff], c[cOutLen]-c[cOutOff])
+	w := rt_sys_write(c[cFD], c[cOut]+c[cOutOff], c[cOutLen]-c[cOutOff])
 	if w < 0 {
 		if errno() != EAGAIN && errno() != 4 {
 			close_conn(c)
@@ -1220,7 +1204,7 @@ func finish_request(c i64, task i64) {
 	}
 	rt_task_free(task)
 	if c[cHijack] != 0 {
-		close(c[cFD])
+		rt_sys_close(c[cFD])
 		free_conn(c)
 		return
 	}
@@ -1264,7 +1248,7 @@ func task_unwatch(fd i64) {
 func take_jobs() {
 	buf := word
 	for {
-		n := read(doneRd, buf, 8)
+		n := rt_sys_read(doneRd, buf, 8)
 		if n != 8 {
 			return
 		}
@@ -1493,7 +1477,7 @@ const lingerMs = 2000
 // whatever arrives is read and dropped until the client closes or lingerMs pass (as nginx's
 // lingering close).
 func linger(c i64) {
-	shutdown(c[cFD], 1)
+	rt_sys_shutdown(c[cFD], 1)
 	c[cLinger] = 2
 	if c[cIn] != 0 {
 		bufBytes -= c[cInCap]
@@ -1716,7 +1700,7 @@ func (q Req) Hijack() !i64 {
 		obLen = 0
 	}
 	for c[cOut] != 0 && c[cOutOff] < c[cOutLen] {
-		k := write(fd, c[cOut]+c[cOutOff], c[cOutLen]-c[cOutOff])
+		k := rt_sys_write(fd, c[cOut]+c[cOutOff], c[cOutLen]-c[cOutOff])
 		if k > 0 {
 			c[cOutOff] += k
 			continue

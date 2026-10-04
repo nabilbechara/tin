@@ -1563,6 +1563,12 @@ fn gen_runtime_intrinsic(e, dst, d) {
         }
         return 1;
     }
+    if streq(name,"__tin_symbols") || streq(name,"__image_base") {
+        let kind=SK_BTRACE; if streq(name,"__image_base") { kind=SK_IMAGE; }
+        let symbol=sym_ref(kind,0);
+        emit2(I_ADRP,dst,symbol); emit3(I_ADDLO,dst,dst,symbol);
+        return 1;
+    }
     if streq(name, "__empty") {
         let z = sym_ref(SK_ZERO, 0);
         emit2(I_ADRP, dst, z);
@@ -3496,12 +3502,40 @@ fn memory_words(fill) {
     return w;
 }
 
+// Raw Linux leaves preserve the Tin context and all callee-saved registers.
+fn syscall_words(restorer) {
+    let w=vec_new();
+    if restorer { raw(w,0xd2801168); raw(w,0xd4000001); return w; }
+    raw(w,0xaa0003e8); raw(w,0xaa0103e0); raw(w,0xaa0203e1);
+    raw(w,0xaa0303e2); raw(w,0xaa0403e3); raw(w,0xaa0503e4);
+    raw(w,0xaa0603e5); raw(w,0xd4000001); raw(w,0xd65f03c0);
+    return w;
+}
+
 fn gen_fn(f) {
+    if tgt_linux && any_v2 {
+        let words=syscall_fast_arm64(f[F_QNAME]);
+        if words != 0 {
+            out4(I_FUNC,f,0,0,0);
+            if streq(f[F_QNAME],"rt_sys_clock_gettime") {
+                let s=lookup_global("rtVdsoClock");
+                let sym=sym_ref(SK_VAR,s[S_INDEX]);
+                out4(I_ADRP,2,sym,0,0); out4(I_LDRLO,2,2,sym,0);
+            }
+            let i=0;
+            while i < words[VEC_LEN] { out4(I_RAW,vec_get(words,i),0,0,0); i=i+1; }
+            return;
+        }
+    }
     if streq(f[F_QNAME],"memcpy") || streq(f[F_QNAME],"memmove") || streq(f[F_QNAME],"memset") || streq(f[F_QNAME],"memcmp") || streq(f[F_QNAME],"memchr") {
         gen_raw_fn(f,memory_fast_arm64(f[F_QNAME]));
         return;
     }
 
+    if tgt_linux && (streq(f[F_QNAME],"linux_raw") || streq(f[F_QNAME],"linux_restorer")) {
+        gen_raw_fn(f,syscall_words(streq(f[F_QNAME],"linux_restorer")));
+        return;
+    }
     if streq(f[F_QNAME],"mem_copy64") || streq(f[F_QNAME],"mem_fill64") {
         gen_raw_fn(f,memory_words(streq(f[F_QNAME],"mem_fill64")));
         return;
