@@ -364,7 +364,7 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   `tools/ci/cancel_check.py` checks every client.
 - Budgets (#235): `limit memory n, tasks k { }` counts the pool chunks and big blocks taken
   inside it (the bump fast path is not touched) and tasks started in it. Passing the memory
-  budget leaves the block with `fault.LimitExceeded` (`limit exceeded`) at once (its defers and cleanups run).
+  budget leaves the block with `fault.LimitExceeded` at once (its defers and cleanups run).
   `TIN_REQUEST_MEMORY` (bytes, beyond a request's first pool chunk) bounds every request the
   same way; a request past it ends with 500 and the server goes on.
 - Tasks can wait on each other: `rt_task_park(timeout)` waits until another task calls
