@@ -25,12 +25,8 @@ import (
 
 var names = []string{"root", "inter", "leaf", "leaf-pss", "inter-pss", "leaf-ec-key", "leaf-ec-key-P-384",
 	"leaf-ec-key-P-521", "inter-pathlen0", "inter-permit", "inter-exclude", "leaf-client", "inter-not-ca",
-<<<<<<< HEAD
 	"inter-no-bc", "inter-no-certsign", "leaf-critical", "leaf-cn-only", "leaf-sha1", "self-signed", "ec-root", "ec-inter",
 	"leaf-under-ec", "leaf-ec-sha1"}
-=======
-	"inter-no-bc", "inter-no-certsign", "leaf-critical", "leaf-cn-only", "leaf-sha1", "self-signed"}
->>>>>>> origin/main
 
 func join(xs []string) string {
 	if len(xs) == 0 {
@@ -102,7 +98,6 @@ func show(name string) {
 }
 
 func tlsSigs() {
-<<<<<<< HEAD
 	lines, _ := os.ReadFile("tests/data/x509/tls_sigs.txt")
 	for _, ln := range strings.Split(strings.TrimSpace(string(lines)), "\n") {
 		f := strings.Fields(ln)
@@ -146,34 +141,6 @@ func tlsSigs() {
 		sig[len(sig)-1] ^= 1
 		e3 := verify(scheme)
 		fmt.Println("tls", f[0], scheme, e1, e2, e3, e4)
-=======
-	text, _ := os.ReadFile("tests/data/x509/certs/leaf.pem")
-	blk, _ := pem.Decode(text)
-	c, err := x509.ParseCertificate(blk.Bytes)
-	if err != nil {
-		panic(err)
-	}
-	key := c.PublicKey.(*rsa.PublicKey)
-	lines, _ := os.ReadFile("tests/data/x509/tls_sigs.txt")
-	for _, ln := range strings.Split(strings.TrimSpace(string(lines)), "\n") {
-		f := strings.Fields(ln)
-		scheme, _ := strconv.Atoi(f[0])
-		h := map[int]crypto.Hash{0x0804: crypto.SHA256, 0x0805: crypto.SHA384, 0x0806: crypto.SHA512}[scheme]
-		msg, _ := hex.DecodeString(f[1])
-		sig, _ := hex.DecodeString(f[2])
-		verify := func() bool {
-			d := h.New()
-			d.Write(msg)
-			return rsa.VerifyPSS(key, h, d.Sum(nil), sig, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash}) == nil
-		}
-		e1 := verify()
-		msg[len(msg)-1] ^= 1
-		e2 := verify()
-		msg[len(msg)-1] ^= 1
-		sig[0] ^= 1
-		e3 := verify()
-		fmt.Println("tls", scheme, e1, e2, e3)
->>>>>>> origin/main
 	}
 }
 
