@@ -270,6 +270,7 @@ fn resolve_type(tx) {
     }
     if k == TX_MAP {
         let mkt = resolve_type(tx[TX_A]);
+        secret_map_key(tx[N_POS], mkt);
         if !ck_legacy && !key_valid(mkt, vec_new()) {
             err_type(tx[N_POS], "a map key must compare by value (str, numbers, bool, or structs and enums of those), not ", mkt, "");
         }
@@ -327,6 +328,9 @@ fn resolve_type(tx) {
             saw_dyn_pos = tx[N_POS];
         }
         return dyn_of(vec_get(inst, 0), vec_get(inst, 1));
+    }
+    if k == TX_SECRET {
+        return secret_type(tx);
     }
     err_at(tx[N_POS], "invalid type");
     return ty_int;
@@ -1809,6 +1813,7 @@ fn check_fn(f) {
     while i < params[VEC_LEN] {
         let ps = declare_local(f[F_POS], vec_get(params, i), vec_get(f[F_PTYPES], i));
         ps[S_READS] = 1;
+        secret_lib_param(ps);
         if f[F_MUTS] && i < f[F_MUTS][VEC_LEN] {
             ps[S_MUT] = vec_get(f[F_MUTS], i);
             if ps[S_MUT] && !ck_legacy && !mut_capable(vec_get(f[F_PTYPES], i)) {
@@ -3511,6 +3516,9 @@ fn check_assignable(e, from, to) {
             err_at(e[N_POS], "a query takes a string literal: put values in {...} so they are sent apart from the text, never pasted into it");
             return;
         }
+        if secret_assign_error(e, from, to) {
+            return;
+        }
         err_types(e[N_POS], "cannot use ", from, " as ", to);
     }
 }
@@ -3876,7 +3884,9 @@ fn lower_try_stmt(s, tr, mode, declared) {
         let fx = sym_ref_node(pos, errsym);
         if wrapmsg {
             // The message is evaluated only on the fault path.
+            let wdesc = secret_desc(wrapmsg);
             let mt = chk(wrapmsg, ty_string);
+            secret_sink(wrapmsg[N_POS], "wrap would put ", " in a fault message", wdesc, mt);
             if kind_of(mt) != K_STRING {
                 err_type(wrapmsg[N_POS], "wrap needs a str message, not ", mt, "");
             }
@@ -4062,7 +4072,9 @@ fn check_fail(s) {
         return;
     }
     let x = s[FAIL_X];
+    let fdesc = secret_desc(x);
     let t = chk(x, 0);
+    secret_sink(x[N_POS], "fail would put ", " in a fault message", fdesc, t);
     if kind_of(t) == K_STRING {
         x = rt_call(pos, "rt_fail", args1(x), ty_error);
     } else if kind_of(t) != K_ERROR {
@@ -4123,7 +4135,7 @@ fn lower_range(s) {
             vec_push(pre, range_bind(pos, key, sym_ref_node(pos, i), ty_int, s[RG_DEFINE]));
         }
         if k == K_SLICE && val {
-            let et = xt[TY_ELEM];
+            let et = secret_like(xt, xt[TY_ELEM]);
             let elem = mk_elem(pos, sym_ref_node(pos, ss), sym_ref_node(pos, i), et, 0);
             elem[ELEM_SAFE] = 1;
             vec_push(pre, range_bind(pos, val, elem, et, s[RG_DEFINE]));
@@ -4137,7 +4149,7 @@ fn lower_range(s) {
             step = sym_ref_node(pos, nexti[LET_SYM]);
             if val {
                 let rune = mk_conv(pos, mk_bin(pos, "&", sym_ref_node(pos, packed[LET_SYM]), mk_int(pos, 0xffffffff, ty_int), ty_int), CV_INT, ty_i32);
-                vec_push(pre, range_bind(pos, val, rune, ty_i32, s[RG_DEFINE]));
+                vec_push(pre, range_bind(pos, val, rune, secret_like(xt, ty_i32), s[RG_DEFINE]));
             }
         }
     } else if k == K_MAP {
@@ -4153,11 +4165,11 @@ fn lower_range(s) {
         vec_push(pre, live);
         if key {
             let kv = key_out(rt_call(pos, "rt_map_key", args2(sym_ref_node(pos, ss), sym_ref_node(pos, i)), ty_int), xt[TY_KEY]);
-            vec_push(pre, range_bind(pos, key, kv, xt[TY_KEY], s[RG_DEFINE]));
+            vec_push(pre, range_bind(pos, key, kv, secret_like(xt, xt[TY_KEY]), s[RG_DEFINE]));
         }
         if val {
             let vv = from_bits(rt_call(pos, "rt_map_val", args2(sym_ref_node(pos, ss), sym_ref_node(pos, i)), ty_int), xt[TY_ELEM]);
-            vec_push(pre, range_bind(pos, val, vv, xt[TY_ELEM], s[RG_DEFINE]));
+            vec_push(pre, range_bind(pos, val, vv, secret_like(xt, xt[TY_ELEM]), s[RG_DEFINE]));
         }
     } else {
         err_type(pos, "cannot range over ", xt, "");
