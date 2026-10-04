@@ -1,0 +1,72 @@
+package main
+
+import "anvil"
+import "lane"
+import "quarry"
+import "say"
+import "tide"
+
+// A server for sched_check.py's end to end case (#243): each request races a lane that a child
+// fills after send ms against a timer of timer ms, and answers with the branch it took.
+// RACE_MODE=lane or RACE_MODE=timer overrides every route's timing with one that makes that
+// side win live; the scheduling events stay the same (both sides still wait).
+
+fn race(send i64, timer i64) !str {
+	mut a = lane.New[str](1)
+	mut got str = ""
+	scope s {
+		let t = s.spawn(fn() ! {
+			try tide.Wait(send * tide.Millisecond)
+			try a.Send("lane")
+		})
+		select {
+			let x = a.Recv() => { got = x }
+			after(timer * tide.Millisecond) => { got = "timer" }
+		}
+		t.cancel()
+	}
+	return got
+}
+
+fn answer(w mut anvil.Out, send i64, timer i64) {
+	mut s = send
+	mut t = timer
+	let mode = quarry.Getenv("RACE_MODE")
+	if mode == "lane" {
+		s = 1
+		t = 40
+	} else if mode == "timer" {
+		s = 40
+		t = 1
+	}
+	let got = race(s, t) catch err {
+		w.Status(500)
+		w.Text("fault: {err}")
+		return
+	}
+	w.Text(got)
+}
+
+// lane: the lane surely wins live; timer: the timer surely does.
+fn laneWins(q anvil.Req, w mut anvil.Out) {
+	answer(mut w, 1, 1000)
+}
+
+fn timerWins(q anvil.Req, w mut anvil.Out) {
+	answer(mut w, 1000, 1)
+}
+
+// raced: a real race, the child's 1 to 3 ms against a 2 ms timer.
+fn raced(q anvil.Req, w mut anvil.Out) {
+	let n = len(q.PathParam("n"))
+	answer(mut w, 1 + n % 3, 2)
+}
+
+fn main() {
+	mut r = anvil.NewRouter()
+	r.Get("/lane", laneWins)
+	r.Get("/timer", timerWins)
+	r.Get(`/race/{n}`, raced)
+	let err = r.Serve(":0")
+	say.Line(err)
+}
