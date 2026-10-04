@@ -128,7 +128,7 @@ tests/edition1.sh.
 
 ## 7. Follow-ups
 
-- `match` over faults (#252's `EX_MATCH`) lowers like `switch` (section 4) once `match`
-  itself is lowered.
+- `match` over faults (#252's `EX_MATCH`) lowers like `switch` (section 4): each arm compares
+  with `rt_fault_is` (#225, tests/edition1/run/match.tin).
 - Producing `fault.Overloaded` and `fault.Draining` belongs to admission and drain (#238);
   they call the constructors in section 2.

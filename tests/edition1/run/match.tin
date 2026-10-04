@@ -1,0 +1,215 @@
+package main
+
+import "fault"
+import "say"
+
+type Shape enum {
+	Circle(f64)
+	Rect(f64, f64)
+	Empty
+}
+
+type Tree enum {
+	Leaf(i64)
+	Pair(Shape, i64)
+	Nothing
+}
+
+const Teapot = 418
+let ErrNotFound = fault("not found")
+let ErrDenied = fault("denied")
+let ErrOther = fault("other")
+
+// Literals, ranges, several patterns, a constant and _ as a value (let).
+fn label(code i64) str {
+	let s = match code {
+		200 => "ok"
+		204, 304 => "empty"
+		Teapot => "teapot"
+		400..500 => "client error"
+		500..600 => "server error"
+		_ => "other"
+	}
+	return s
+}
+
+// A guard that binds: a failed guard falls through to the later arms.
+fn bucket(n i64) i64 {
+	return match n {
+		x if x > 100 => x * 2
+		x if x < 0 => -x
+		7 => 70
+		_ => n
+	}
+}
+
+// Variants with bindings, a qualified variant, a bare one; every arm returns.
+fn area(s Shape) f64 {
+	match s {
+		Circle(r) => {
+			return 3.0 * r * r
+		}
+		Shape.Rect(w, h) => return w * h
+		Empty => return 0.0
+	}
+}
+
+// Nested variant and literal patterns inside a variant.
+fn describe(t Tree) str {
+	return match t {
+		Leaf(0) => "zero leaf"
+		Leaf(v) if v > 10 => "big leaf {v}"
+		Leaf(v) => "leaf {v}"
+		Pair(Circle(r), n) => "circle pair {r} {n}"
+		Pair(Rect(_, h), 2) => "rect pair two {h}"
+		Pair(_, n) => "other pair {n}"
+		Nothing => "nothing"
+	}
+}
+
+// A fault arm compares with fault.Is, so it matches through wrapping.
+fn kind(err fault) str {
+	match err {
+		nil => return "none"
+		ErrNotFound => return "missing"
+		fault.DeadlineExceeded, ErrDenied => return "refused"
+		e => return "other: {e}"
+	}
+}
+
+fn load(k str) !i64 {
+	match k {
+		"missing" => fail ErrNotFound
+		"denied" => fail fault.Wrap(ErrDenied, "loading")
+		"bad" => fail "bad key"
+		_ => return len(k)
+	}
+}
+
+// A match as a catch block's value; its arms may leave.
+fn fetch(k str) i64 {
+	let v = load(k) catch err {
+		match err {
+			ErrNotFound => 0
+			ErrDenied => -1
+			_ => return -99
+		}
+	}
+	return v
+}
+
+// A nil arm narrows a local optional for the arms after it.
+type User struct {
+	name str
+}
+
+fn greet(u ?User) str {
+	match u {
+		nil => return "nobody"
+		_ => return "hello {u.name}"
+	}
+}
+
+fn find(name str) ?User {
+	if name == "" {
+		return nil
+	}
+	return User{name: name}
+}
+
+// break and continue in an arm apply to the enclosing loop; assignment arms.
+fn scan(xs []i64) i64 {
+	mut total i64 = 0
+	mut last i64 = 0
+	for x in xs {
+		match x {
+			0 => continue
+			-1 => break
+			1..10 => total += x
+			_ => {
+				last = x
+			}
+		}
+	}
+	return total * 1000 + last
+}
+
+// The translator's tagless switch, a bool match, a str match and assignment.
+fn sign(n i64) str {
+	mut out = ""
+	match true {
+		true if n < 0 => out = "negative"
+		true if n == 0 => out = "zero"
+		_ => out = "positive"
+	}
+	let even = match n % 2 == 0 {
+		true => "even"
+		false => "odd"
+	}
+	mut word = ""
+	word = match out {
+		"zero" => "z"
+		_ => "nz"
+	}
+	return "{out} {even} {word}"
+}
+
+fn parse(s str) !i64 {
+	if s == "" {
+		fail "empty"
+	}
+	return len(s)
+}
+
+// try in an arm passes the fault upward; a match as an arm's value.
+fn measure(s str, deep bool) !i64 {
+	let n = match deep {
+		true => match s {
+			"x" => 100
+			_ => try parse(s)
+		}
+		false => 1
+	}
+	return n
+}
+
+fn main() {
+	for c in []i64{200, 204, 304, 418, 404, 503, 600} {
+		say.Line(c, label(c))
+	}
+	for n in []i64{150, -5, 7, 42} {
+		say.Line(n, bucket(n))
+	}
+	say.Line(area(Shape.Circle(1.0)), area(Shape.Rect(2.0, 3.0)), area(Shape.Empty))
+	say.Line(describe(Tree.Leaf(0)))
+	say.Line(describe(Tree.Leaf(12)))
+	say.Line(describe(Tree.Leaf(3)))
+	say.Line(describe(Tree.Pair(Shape.Circle(2.0), 5)))
+	say.Line(describe(Tree.Pair(Shape.Rect(1.0, 4.0), 2)))
+	say.Line(describe(Tree.Pair(Shape.Rect(1.0, 4.0), 3)))
+	say.Line(describe(Tree.Nothing))
+	say.Line(kind(nil), kind(ErrNotFound), kind(fault.Wrap(ErrDenied, "ctx")), kind(ErrOther))
+	say.Line(fetch("missing"), fetch("denied"), fetch("bad"), fetch("four"))
+	say.Line(greet(find("")), greet(find("ana")))
+	say.Line(scan([]i64{1, 0, 2, 50, 3, -1, 4}))
+	say.Line(sign(-3), "|", sign(0), "|", sign(8))
+	let a = measure("x", true) catch _ {
+		-1
+	}
+	let b = measure("", true) catch err {
+		say.Line("measure:", err)
+		-2
+	}
+	let c = measure("abc", true) catch _ {
+		-3
+	}
+	let d = measure("", false) catch _ {
+		-4
+	}
+	say.Line(a, b, c, d)
+	say.Line("expr:", match 3 {
+		1 => "one"
+		3 => "three"
+		_ => "many"
+	})
+}

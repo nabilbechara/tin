@@ -70,6 +70,25 @@ if ! cmp -s tests/edition1/boundary_fault_bad.err "$tmp/boundary_fault_bad.err";
 	exit 1
 fi
 
+# match (#225): literal, range, constant, sentinel, variant, nested, binding and guarded arms;
+# values in let, assignment, return, catch blocks and expressions; break and continue in arms.
+"$compiler" -edition 1 -o "$tmp/match" tests/edition1/run/match.tin
+"$tmp/match" >"$tmp/match.out" 2>/dev/null
+if ! cmp -s tests/edition1/run/match.out "$tmp/match.out"; then
+	echo "FAIL edition1/run/match: output differs"
+	diff -u tests/edition1/run/match.out "$tmp/match.out" || true
+	exit 1
+fi
+if "$compiler" -edition 1 -o "$tmp/match_bad" tests/edition1/match_bad.tin >"$tmp/match_bad.out" 2>"$tmp/match_bad.err"; then
+	echo "FAIL edition1/match_bad: unexpectedly accepted"
+	exit 1
+fi
+if ! cmp -s tests/edition1/match_bad.err "$tmp/match_bad.err"; then
+	echo "FAIL edition1/match_bad: diagnostic mismatch"
+	diff -u tests/edition1/match_bad.err "$tmp/match_bad.err" || true
+	exit 1
+fi
+
 # Structured concurrency (#232): scopes, spawn, wait, cancel, first-fault cancellation.
 for name in scopes lanes selects guards
 do
