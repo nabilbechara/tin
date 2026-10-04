@@ -9,12 +9,16 @@ Scenarios (random ids in 1..10000):
   cached   all reads hit Redis (warmed first)
   db       /db/users/{id}: every read is a MySQL prepared statement
   mixed    cached reads with 0.5% /slow (50 ms) requests mixed in
+Before every run Redis is emptied and the run warms its own cache, so all its keys are fresh:
+their 60 s TTL cannot expire during a run and send a burst of reads to MySQL. Redis snapshots
+(a fork every minute under the default config) are turned off for the same reason.
 Each runs once at an open-ended rate (the maximum throughput) and once at a fixed rate,
 70% of the slower server's maximum, for the latency percentiles (wrk2 corrects for
 coordinated omission). Rounds alternate servers; the median of the rounds is reported,
 with every round's value and the Tin/Go ratios after the table."""
 import os
 import re
+import socket
 import statistics
 import subprocess
 import sys
@@ -46,7 +50,17 @@ def build():
     subprocess.run(['go', 'build', '-o', os.path.join(OUT, 'users_go'), '.'], cwd=os.path.join(HERE, 'go'), check=True)
 
 
+def redis(*args):
+    host, port = os.environ['REDIS_ADDR'].rsplit(':', 1)
+    with socket.create_connection((host, int(port)), timeout=10) as c:
+        c.sendall(('*%d\r\n' % len(args) + ''.join('$%d\r\n%s\r\n' % (len(a), a) for a in args)).encode())
+        reply = c.recv(256)
+    if not reply.startswith(b'+OK'):
+        sys.exit('redis %s: %r' % (' '.join(args), reply))
+
+
 def start(name):
+    redis('FLUSHALL')
     exe, port = SERVERS[name]
     env = dict(os.environ, TIN_CORES=CORES, GOMAXPROCS=CORES, PORT=str(port))
     p = subprocess.Popen(pinned(SERVER_CPUS, [os.path.join(OUT, exe)]), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -85,6 +99,7 @@ def cpu_rss(pid):
 
 def main():
     build()
+    redis('CONFIG', 'SET', 'save', '')
     results = {}
     for scen, prefix, slow in SCENARIOS:
         for r in range(ROUNDS):
