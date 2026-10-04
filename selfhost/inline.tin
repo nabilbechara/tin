@@ -171,6 +171,18 @@ fn ia_append(e) {
     replace_node(e, mk_seq(pos, stmts, ia_ref(h), st));
 }
 
+fn ia_copy_str_chunk(pos, stmts, dst, src, off, lg) {
+    let word = ia_local(ty_int);
+    let dst_at = dst;
+    let src_at = src;
+    if off != 0 {
+        dst_at = mk_bin(pos, "+", dst, mk_int(pos, off, ty_int), ty_int);
+        src_at = mk_bin(pos, "+", src, mk_int(pos, off, ty_int), ty_int);
+    }
+    vec_push(stmts, let_stmt(pos, word, intrinsic_call(pos, "__ld", args2(src_at, mk_int(pos, lg, ty_int)), ty_int)));
+    vec_push(stmts, expr_stmt(intrinsic_call(pos, "__st", args3(dst_at, ia_ref(word), mk_int(pos, lg, ty_int)), ty_void)));
+}
+
 // ia_append_str: copy a one-byte string directly, and use memcpy for the rest.
 // Only a full slice takes the runtime growth path.
 fn ia_append_str(e) {
@@ -208,13 +220,20 @@ fn ia_append_str(e) {
     slow[CALL_ARGS] = args2(ia_ref(h), ia_ref(t));
     slow[N_TYPE] = st;
     let ifs = node_new(ST_IF, pos);
-    ifs[IF_COND] = mk_bin(pos, ">=", mk_bin(pos, "+", ia_ref(n), ia_ref(m), ty_int), ia_hdr(h, 1), ty_bool);
+    ifs[IF_COND] = mk_bin(pos, ">", mk_bin(pos, "+", ia_ref(n), ia_ref(m), ty_int), ia_hdr(h, 1), ty_bool);
     ifs[IF_THEN] = empty_block(pos);
     vec_push(ifs[IF_THEN][BLK_STMTS], assign_stmt(pos, ia_ref(h), slow));
     let els = empty_block(pos);
 
-    // Single-byte dynamic strings are common in builders. Avoid a libc call for them
-    // while keeping the general copy path unchanged.
+    let fallback = empty_block(pos);
+    let cp = node_new(EX_CALL, pos);
+    cp[CALL_NAME] = "memcpy";
+    cp[CALL_FN] = memcpy_fn;
+    cp[CALL_ARGS] = args3(mk_bin(pos, "+", ia_hdr(h, 2), ia_ref(n), ty_int), mk_bin(pos, "+", mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int), ia_ref(m));
+    cp[N_TYPE] = ty_int;
+    vec_push(fallback[BLK_STMTS], expr_stmt(cp));
+    // These lengths are common in builders. Avoid a libc call while keeping the
+    // general copy path unchanged and limiting every raw access to its exact width.
     let short = node_new(ST_IF, pos);
     short[IF_COND] = mk_bin(pos, "==", ia_ref(m), mk_int(pos, 1, ty_int), ty_bool);
     short[IF_THEN] = empty_block(pos);
@@ -223,14 +242,26 @@ fn ia_append_str(e) {
     vec_push(sb, let_stmt(pos, src, mk_bin(pos, "+", mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int)));
     vec_push(sb, let_stmt(pos, word, intrinsic_call(pos, "__ld", args2(ia_ref(src), mk_int(pos, 0, ty_int)), ty_int)));
     vec_push(sb, expr_stmt(intrinsic_call(pos, "__st", args3(ia_ref(dst), ia_ref(word), mk_int(pos, 0, ty_int)), ty_void)));
-    let long = empty_block(pos);
-    let cp = node_new(EX_CALL, pos);
-    cp[CALL_NAME] = "memcpy";
-    cp[CALL_FN] = memcpy_fn;
-    cp[CALL_ARGS] = args3(mk_bin(pos, "+", ia_hdr(h, 2), ia_ref(n), ty_int), mk_bin(pos, "+", mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int), ia_ref(m));
-    cp[N_TYPE] = ty_int;
-    vec_push(long[BLK_STMTS], expr_stmt(cp));
-    short[IF_ELSE] = long;
+    let two = node_new(ST_IF, pos);
+    two[IF_COND] = mk_bin(pos, "==", ia_ref(m), mk_int(pos, 2, ty_int), ty_bool);
+    two[IF_THEN] = empty_block(pos);
+    let two_dst = mk_bin(pos, "+", ia_hdr(h, 2), ia_ref(n), ty_int);
+    let two_src = mk_bin(pos, "+", mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int);
+    ia_copy_str_chunk(pos, two[IF_THEN][BLK_STMTS], two_dst, two_src, 0, 1);
+    let six = node_new(ST_IF, pos);
+    six[IF_COND] = mk_bin(pos, "==", ia_ref(m), mk_int(pos, 6, ty_int), ty_bool);
+    six[IF_THEN] = empty_block(pos);
+    let six_dst = mk_bin(pos, "+", ia_hdr(h, 2), ia_ref(n), ty_int);
+    let six_src = mk_bin(pos, "+", mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int);
+    ia_copy_str_chunk(pos, six[IF_THEN][BLK_STMTS], six_dst, six_src, 0, 2);
+    let tail_dst = mk_bin(pos, "+", ia_hdr(h, 2), ia_ref(n), ty_int);
+    let tail_src = mk_bin(pos, "+", mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int);
+    ia_copy_str_chunk(pos, six[IF_THEN][BLK_STMTS], tail_dst, tail_src, 4, 1);
+    six[IF_ELSE] = fallback;
+    two[IF_ELSE] = empty_block(pos);
+    vec_push(two[IF_ELSE][BLK_STMTS], six);
+    short[IF_ELSE] = empty_block(pos);
+    vec_push(short[IF_ELSE][BLK_STMTS], two);
     vec_push(els[BLK_STMTS], short);
     vec_push(els[BLK_STMTS], assign_stmt(pos, ia_hdr(h, 0), mk_bin(pos, "+", ia_ref(n), ia_ref(m), ty_int)));
     ifs[IF_ELSE] = els;
