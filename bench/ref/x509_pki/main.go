@@ -4,6 +4,8 @@
 //
 //	go run ./bench/ref/x509_pki DIR
 //
+// tls_sigs.txt: "SCHEME MSGHEX SIGHEX" lines, RSA-PSS signatures by the "leaf" key.
+//
 // cases.txt: a "now UNIX" line, then one line per case:
 //
 //	NAME HOST|- USAGE LEAF INTERMEDIATES|- ROOTS EXPECT
@@ -18,6 +20,8 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	_ "crypto/sha256"
+	_ "crypto/sha512"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
@@ -297,6 +301,21 @@ func main() {
 	ca("inter-twin-new", "root", func(s *spec) { s.cn = "Tin Test twin"; s.key = k })
 	leaf("leaf-twin", "inter-twin-new", nil)
 	add("expired-and-valid-issuer", "www.example.com", "server", "leaf-twin", "inter-twin-old,inter-twin-new", "root", "OK 3")
+
+	// TLS 1.3 CertificateVerify-style RSA-PSS signatures by the leaf's key (salt = hash length).
+	var sigs []string
+	msg := []byte(strings.Repeat(" ", 64) + "TLS 1.3, server CertificateVerify\x00transcript")
+	for _, sc := range []struct {
+		code int
+		h    crypto.Hash
+	}{{0x0804, crypto.SHA256}, {0x0805, crypto.SHA384}, {0x0806, crypto.SHA512}} {
+		d := sc.h.New()
+		d.Write(msg)
+		sig, err := rsa.SignPSS(rand.Reader, keys["leaf"].(*rsa.PrivateKey), sc.h, d.Sum(nil), &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash})
+		check(err)
+		sigs = append(sigs, fmt.Sprintf("%d %x %x", sc.code, msg, sig))
+	}
+	check(os.WriteFile(filepath.Join(dir, "tls_sigs.txt"), []byte(strings.Join(sigs, "\n")+"\n"), 0o644))
 
 	out := fmt.Sprintf("now %d\n%s\n", now.Unix(), strings.Join(lines, "\n"))
 	check(os.WriteFile(filepath.Join(dir, "cases.txt"), []byte(out), 0o644))

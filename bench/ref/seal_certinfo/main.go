@@ -7,15 +7,19 @@
 package main
 
 import (
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/rsa"
+	_ "crypto/sha256"
+	_ "crypto/sha512"
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -92,6 +96,36 @@ func show(name string) {
 		"exclude", join(c.ExcludedDNSDomains), "skid", len(c.SubjectKeyId), "akid", len(c.AuthorityKeyId))
 }
 
+func tlsSigs() {
+	text, _ := os.ReadFile("tests/data/x509/certs/leaf.pem")
+	blk, _ := pem.Decode(text)
+	c, err := x509.ParseCertificate(blk.Bytes)
+	if err != nil {
+		panic(err)
+	}
+	key := c.PublicKey.(*rsa.PublicKey)
+	lines, _ := os.ReadFile("tests/data/x509/tls_sigs.txt")
+	for _, ln := range strings.Split(strings.TrimSpace(string(lines)), "\n") {
+		f := strings.Fields(ln)
+		scheme, _ := strconv.Atoi(f[0])
+		h := map[int]crypto.Hash{0x0804: crypto.SHA256, 0x0805: crypto.SHA384, 0x0806: crypto.SHA512}[scheme]
+		msg, _ := hex.DecodeString(f[1])
+		sig, _ := hex.DecodeString(f[2])
+		verify := func() bool {
+			d := h.New()
+			d.Write(msg)
+			return rsa.VerifyPSS(key, h, d.Sum(nil), sig, &rsa.PSSOptions{SaltLength: rsa.PSSSaltLengthEqualsHash}) == nil
+		}
+		e1 := verify()
+		msg[len(msg)-1] ^= 1
+		e2 := verify()
+		msg[len(msg)-1] ^= 1
+		sig[0] ^= 1
+		e3 := verify()
+		fmt.Println("tls", scheme, e1, e2, e3)
+	}
+}
+
 func main() {
 	for _, n := range names {
 		show(n)
@@ -138,6 +172,7 @@ func main() {
 		}
 		fmt.Println("pem", i, len(parts), join(parts))
 	}
+	tlsSigs()
 	patterns := []string{"example.com", "*.example.com", "EXAMPLE.org.", "*.com", "w*.example.com", "*.*.example.com", "*", "a.*.example.com", "xn--bcher-kva.example"}
 	hosts := []string{"example.com", "www.example.com", "a.b.example.com", ".example.com", "example.org", "Example.ORG", "foo.com", "www.example.com.", "wx.example.com", "xn--bcher-kva.example", "*.example.com"}
 	for _, p := range patterns {

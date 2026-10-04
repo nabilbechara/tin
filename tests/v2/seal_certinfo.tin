@@ -3,6 +3,7 @@ package main
 import "say"
 import "seal"
 import "quarry"
+import "twine"
 
 // Parsed fields of the checked-in test PKI, ParseIP, DecodePEM and host name matching;
 // bench/ref/seal_certinfo is the Go twin.
@@ -51,6 +52,29 @@ func show(name str) ! {
 		"exclude", join(c.ExcludedDNSDomains), "skid", len(c.SubjectKeyId), "akid", len(c.AuthorityKeyId))
 }
 
+// tlsSigs checks the leaf's TLS 1.3 RSA-PSS signatures, and each with its message or signature changed.
+func tlsSigs() ! {
+	text := try quarry.ReadFile("tests/data/x509/certs/leaf.pem")
+	certs := try seal.ParseCertificatesPEM(text)
+	lines := try quarry.ReadFile("tests/data/x509/tls_sigs.txt")
+	for _, ln := range twine.Split(twine.TrimSpace(lines), "\n") {
+		f := twine.Fields(ln)
+		scheme := 0
+		for i := 0; i < len(f[0]); i++ {
+			scheme = scheme*10 + i64(f[0][i]-'0')
+		}
+		msg := try seal.HexDecode(f[1])
+		sig := try seal.HexDecode(f[2])
+		e1 := certs[0].CheckTLSSignature(scheme, msg, sig)
+		msg[len(msg)-1] ^= 1
+		e2 := certs[0].CheckTLSSignature(scheme, msg, sig)
+		msg[len(msg)-1] ^= 1
+		sig[0] ^= 1
+		e3 := certs[0].CheckTLSSignature(scheme, msg, sig)
+		say.Line("tls", scheme, e1 == nil, e2 == nil, e3 == nil)
+	}
+}
+
 func main() {
 	for _, n := range names {
 		show(n) catch err {
@@ -86,6 +110,9 @@ func main() {
 			parts = append(parts, b.Type+"="+seal.Hex(b.Bytes))
 		}
 		say.Line("pem", i, len(blocks), join(parts))
+	}
+	tlsSigs() catch err {
+		say.Line("tls ERROR", err)
 	}
 	cert := seal.Certificate{Issuer: seal.Name{}, Subject: seal.Name{}, SignatureAlgorithm: seal.SignatureAlgorithm.UnknownSignature,
 		PublicKeyAlgorithm: seal.PublicKeyAlgorithm.UnknownKey, RSAKey: seal.RSAPublicKey{N: []u8{}, E: []u8{}}}
