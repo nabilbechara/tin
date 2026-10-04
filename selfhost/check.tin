@@ -258,6 +258,9 @@ fn resolve_type(tx) {
         }
         return t;
     }
+    if (k == TX_SLICE || k == TX_ARRAY || k == TX_MAP) && bounded_elem(tx) {
+        return bounded_type(bounded_elem(tx));
+    }
     if k == TX_SLICE || k == TX_ARRAY {
         let et = resolve_type(tx[TX_A + (k == TX_ARRAY)]);
         if k == TX_ARRAY && kind_of(et) == K_DYN {
@@ -292,6 +295,9 @@ fn resolve_type(tx) {
             return inner;
         }
         return opt_of(inner);
+    }
+    if k == TX_MAX {
+        return bounded_type(tx);
     }
     if k == TX_CHAN {
         return chan_of(resolve_type(tx[TX_A]));
@@ -345,6 +351,110 @@ fn resolve_types(v) {
         i = i + 1;
     }
     return r;
+}
+
+// ---- bounded types (#240) ----
+
+// bounded_type resolves T max N: N is a constant length, T a str, slice or map.
+fn bounded_type(tx) {
+    let t = resolve_type(tx[TX_A]);
+    let k = kind_of(t);
+    if k != K_STRING && k != K_SLICE && k != K_MAP {
+        err_type(tx[N_POS], "max bounds the length of a str, a slice or a map, not ", t, "");
+        return t;
+    }
+    let x = tx[TX_B];
+    if x[N_KIND] == EX_UNIT {
+        chk_unit(x, ty_int);
+    }
+    let n = const_value(x, 0);
+    if n < 0 {
+        err_at(x[N_POS], "a bound must not be negative");
+        return t;
+    }
+    if t[TY_SECRET] {
+        // secret T max n: the bound goes inside, so the value stays secret.
+        return secret_of(bounded_of(t[TY_SECRET], n));
+    }
+    return bounded_of(t, n);
+}
+
+// bounded_elem reads []T max n and map[K]V max n, whose max the parser gave the element, as
+// the bounded slice or map (design_syntax: Type "max" Expr); 0 when the element has none.
+// A slice of bounded values is written with a named element type ([]Name).
+fn bounded_elem(tx) {
+    let ei = TX_B;
+    if tx[N_KIND] == TX_SLICE {
+        ei = TX_A;
+    }
+    let el = tx[ei];
+    if !el || el[N_KIND] != TX_MAX {
+        return 0;
+    }
+    let inner = node_new(tx[N_KIND], tx[N_POS]);
+    replace_node(inner, tx);
+    inner[ei] = el[TX_A];
+    let outer = node_new(TX_MAX, tx[N_POS]);
+    outer[TX_A] = inner;
+    outer[TX_B] = el[TX_B];
+    return outer;
+}
+
+// bounded_value handles a value for a bounded type: a str literal within the bound fits;
+// an unbounded value of the same type is reported (reports whether it handled e).
+fn bounded_value(e, from, to) {
+    if ck_legacy || !to || !to[TY_BOUND] || (from && from[TY_BOUND]) {
+        return 0;
+    }
+    if e[N_KIND] == EX_STR && kind_of(to) == K_STRING {
+        if e[STR_LEN] > to[TY_MAX] {
+            let m = err_begin(e[N_POS]);
+            buf_str(m, "this str is ");
+            buf_int(m, e[STR_LEN]);
+            buf_str(m, " bytes long, over the bound of ");
+            type_name(m, to);
+            err_end(m);
+        }
+        return 1;
+    }
+    if assignable(from, to[TY_BOUND]) {
+        let m = err_begin(e[N_POS]);
+        buf_str(m, "cannot use ");
+        type_name(m, from);
+        buf_str(m, " as ");
+        type_name(m, to);
+        buf_str(m, ": its length is unchecked (check it with bound(x), which fails with fault.LimitExceeded)");
+        err_end(m);
+        return 1;
+    }
+    return 0;
+}
+
+var bound_want; // the bounded type a bound(x) call being checked must produce
+
+// bound_target is the type the destination of try/catch statement s gives a bound(x) call.
+fn bound_target(s, call, mode, declared) {
+    if call[N_KIND] != EX_CALL || !call[CALL_NAME] || !streq(call[CALL_NAME], "bound") {
+        return 0;
+    }
+    if mode == 1 {
+        return declared;
+    }
+    if mode == 4 && ck_fn[F_RTYPES][VEC_LEN] == 2 {
+        return vec_get(ck_fn[F_RTYPES], 0);
+    }
+    if mode == 2 {
+        let tg = s[AS_TARGET];
+        if tg[N_KIND] == EX_IDENT {
+            let sy = lookup_name(tg[ID_NAME]);
+            if sy {
+                return sy[S_TYPE];
+            }
+        } else if tg[N_KIND] == EX_SELECT {
+            return chk(expr_clone(tg), 0);
+        }
+    }
+    return 0;
 }
 
 // array_len is N for an [N]T type expression, else 0 ([N]T is a []T that starts with N
@@ -4091,6 +4201,9 @@ fn check_assignable(e, from, to) {
         }
         return;
     }
+    if bounded_value(e, from, to) {
+        return;
+    }
     if !assignable(from, to) && !ck_legacy {
         if is_query_t(to) && kind_of(from) == K_STRING {
             err_at(e[N_POS], "a query takes a string literal: put values in {...} so they are sent apart from the text, never pasted into it");
@@ -4397,7 +4510,9 @@ fn lower_try_stmt(s, tr, mode, declared) {
         err_at(pos, "try needs the enclosing function to return a fault (write its result as !T)");
         return;
     }
+    bound_want = bound_target(s, call, mode, declared);
     let t = chk(call, 0);
+    bound_want = 0;
     let results = vec_new();
     if kind_of(t) == K_TUPLE {
         results = t[TY_FIELDS];

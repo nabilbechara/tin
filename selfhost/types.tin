@@ -17,6 +17,8 @@ const TY_TARGS = 10;   // generic instance: its type arguments
 const TY_GDECL = 11;   // generic instance: its declaration
 const TY_ENUM = 12;    // enum (a struct underneath): vec of [variant name, first field, field count]
 const TY_SECRET = 13;  // secret T: the plain T this twin qualifies (selfhost/secret.tin)
+const TY_BOUND = 14;   // bounded type (#240): the unbounded type it refines
+const TY_MAX = 15;     // bounded type: the largest length a value may have
 
 const K_INT = 1;
 const K_BOOL = 2;
@@ -63,7 +65,7 @@ var saw_dyn_pos;   // where the first dyn type was written, for the back ends' m
 var ty_secrets;    // secret twins, one per plain type (secret_of)
 
 fn ty_new(kind, name) {
-    let t = calloc(14, 8);
+    let t = calloc(TY_MAX + 1, 8);
     t[TY_KIND] = kind;
     t[TY_NAME] = name;
     t[TY_WIDTH] = 8;
@@ -410,6 +412,9 @@ fn assignable(from, to) {
     if to[TY_KIND] == K_OPT && is_secret(to[TY_ELEM]) && from && !from[TY_SECRET] && kind_of(from) != K_OPT && kind_of(from) != K_NIL {
         return assignable(from, to[TY_ELEM]);
     }
+    if to[TY_BOUND] || (from && from[TY_BOUND]) {
+        return bounded_assignable(from, to);
+    }
     let fk = kind_of(from);
     let tk = kind_of(to);
     if fk == K_UINT {
@@ -594,4 +599,69 @@ fn int_to_float_bits(v) {
         }
     }
     return (sign << 63) | ((top + 1023) << 52) | (mant & ((1 << 52) - 1));
+}
+
+// ---- bounded types (#240): str max 100, []Item max 1000, map[str]T max 50 ----
+//
+// A bounded type is a twin of its unbounded type (same kind and layout) that also records
+// a largest length. It is assignable to its unbounded type; the reverse needs bound(x).
+
+var ty_bounds; // [unbounded type, max, bounded type]
+
+// bounded_of is t refined to values of length at most max.
+fn bounded_of(t, max) {
+    if t[TY_BOUND] {
+        t = t[TY_BOUND];
+    }
+    if !ty_bounds {
+        ty_bounds = vec_new();
+    }
+    let i = 0;
+    while i < ty_bounds[VEC_LEN] {
+        let r = vec_get(ty_bounds, i);
+        if vec_get(r, 0) == t && vec_get(r, 1) == max {
+            return vec_get(r, 2);
+        }
+        i = i + 1;
+    }
+    let b = ty_new(t[TY_KIND], 0);
+    let w = 0;
+    while w < TY_SECRET {
+        b[w] = t[w];
+        w = w + 1;
+    }
+    b[TY_BOUND] = t;
+    b[TY_MAX] = max;
+    let nb = buf_new();
+    type_name(nb, t);
+    buf_str(nb, " max ");
+    buf_int(nb, max);
+    buf_byte(nb, 0);
+    b[TY_NAME] = nb[VEC_DATA];
+    let r = vec_new();
+    vec_push(r, t);
+    vec_push(r, max);
+    vec_push(r, b);
+    vec_push(ty_bounds, r);
+    return b;
+}
+
+// unbounded is t without its bound.
+fn unbounded(t) {
+    if t && t[TY_BOUND] {
+        return t[TY_BOUND];
+    }
+    return t;
+}
+
+// bounded_assignable: a bounded value goes where its unbounded type (or a looser bound of
+// it) is expected; nothing else becomes bounded without bound(x).
+fn bounded_assignable(from, to) {
+    if !to[TY_BOUND] {
+        return assignable(from[TY_BOUND], to);
+    }
+    if from && from[TY_BOUND] && from[TY_MAX] <= to[TY_MAX] {
+        return assignable(from[TY_BOUND], to[TY_BOUND]);
+    }
+    return 0;
 }

@@ -88,6 +88,24 @@ if ! cmp -s tests/edition1/match_bad.err "$tmp/match_bad.err"; then
 	diff -u tests/edition1/match_bad.err "$tmp/match_bad.err" || true
 	exit 1
 fi
+# Bounded values (#240): argo stops at a bound with fault.LimitExceeded, bound(x) checks a
+# length, and an unbounded value never becomes bounded without it.
+"$compiler" -edition 1 -o "$tmp/bounded" tests/edition1/run/bounded.tin
+"$tmp/bounded" >"$tmp/bounded.out" 2>/dev/null
+if ! cmp -s tests/edition1/run/bounded.out "$tmp/bounded.out"; then
+	echo "FAIL edition1/run/bounded: output differs"
+	diff -u tests/edition1/run/bounded.out "$tmp/bounded.out" || true
+	exit 1
+fi
+if "$compiler" -edition 1 -o "$tmp/bounded_bad" tests/edition1/bounded_bad.tin >"$tmp/bounded_bad.out" 2>"$tmp/bounded_bad.err"; then
+	echo "FAIL edition1/bounded_bad: unexpectedly accepted"
+	exit 1
+fi
+if ! cmp -s tests/edition1/bounded_bad.err "$tmp/bounded_bad.err"; then
+	echo "FAIL edition1/bounded_bad: diagnostic mismatch"
+	diff -u tests/edition1/bounded_bad.err "$tmp/bounded_bad.err" || true
+	exit 1
+fi
 
 # Structured concurrency (#232): scopes, spawn, wait, cancel, first-fault cancellation.
 for name in scopes lanes selects guards handles

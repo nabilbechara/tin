@@ -1051,6 +1051,16 @@ err2 := argo.Get(text, mut xs)      // appends decoded elements
   handler's stack is 256 KiB). Error messages name the offset: `argo: expected an integer
   in [0, 65535] at offset 8, found "7"`.
 - `argo.Str(b, s)` and `argo.Raw(b, json)` write pieces by hand.
+- **Bounded values** (edition 1, #240): `name str max 100`, `tags []str max 20`,
+  `map[str]i64 max 50` bound a length. A bounded value is assignable to its unbounded type
+  (and to a looser bound), never the reverse: an unbounded value becomes bounded only through
+  `bound(x)`, whose type is its destination's (`let n str max 100 = try bound(raw)`, an
+  assignment or a `return`) and which fails with `fault.LimitExceeded` when `x` is longer.
+  A str literal within the bound fits. `append` and `+` give the unbounded type. `argo.Get`
+  enforces bounds while reading: a str stops at its bound and a slice or map before the
+  element past it, failing with `fault.LimitExceeded` without reading the rest. `max` after
+  `[]T` or `map[K]V` bounds the slice or map; for a slice of bounded strs, name the element
+  type (`type Tag str max 20`, then `[]Tag`).
 
 ---
 
