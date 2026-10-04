@@ -339,6 +339,14 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   the deferred calls it registered, ends that tick or that message's handler, and the core goes
   on (the remaining messages are handled at once). A panic in `main` outside a `guard`, or a
   stack overflow, still ends the process.
+- `guard { ... }` (#230, edition 1) is a boundary that turns a panic inside it into a fault:
+  the panic's message goes to stderr with its backtrace, the deferred calls and the
+  resource-cleanup callbacks registered inside the guard run, and the guard's value is a
+  `fault.Panic` fault (`panic: <message>`) whose `fault.Backtrace(err)` is that backtrace, one
+  function per line (#142). Cleanups registered before the guard wait for their task's end.
+  `guard f(x)` (or `guard try f(x)`) is the same guard around one call (#142). A spawned
+  child's panic is its scope's fault in the same form. The guard does not yet discard the
+  memory the guarded code allocated: that waits for sub-regions (#236).
 - A connection closed while its request waits is marked dead and freed when the task ends.
 - Finished tasks free overflow pool chunks and big blocks. Each core caches at most
   64 task records; excess records release their base pool and unmap their stacks.

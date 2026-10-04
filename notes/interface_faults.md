@@ -110,9 +110,9 @@ the first.
 A panic that a `guard` converts is `rt_fault_panic(msg, trace)` (`rt_guard_land`): identity
 6, message `panic: <message>` (the text #230's guard already produced, for example
 `panic: index out of range [5] with length 3`), and `trace` the backtrace text stored as its
-own fault record in the trace word, so `keep` copies it. The guard passes `""` for now (the
-backtrace is still printed only by the uncaught-panic path); a guard that captures it later
-passes it here and `fault.Backtrace(err)` returns it. `fault.Is(err, fault.Panic)` is true for
+own fault record in the trace word, so `keep` copies it. The guard (and a spawned child's root)
+passes `rt_backtrace_text`, the functions `rt_backtrace` prints, one per line (#142), and
+`fault.Backtrace(err)` returns it. `fault.Is(err, fault.Panic)` is true for
 it through any wrapping.
 
 ## 6. `try E wrap "msg"` (edition 1)
