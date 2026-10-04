@@ -19,25 +19,26 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 DOC = Path('docs/ERRORS.md')
-# The examples use the syntax docs/LANGUAGE.md describes.
+# Examples use the syntax docs/LANGUAGE.md describes; a ```tin edition=1 block uses edition 1.
 EDITION = '0'
 
 SOURCE_CODE = re.compile(r'"(E\d{3}) ([A-Z][A-Z0-9_]*)"')
 HEADING = re.compile(r'^### (E\d{3}) ([A-Z][A-Z0-9_]*)$')
 GROUP = re.compile(r'^## E(\d)xx ')
-FENCE = re.compile(r'^```(\w*)\s*$')
+FENCE = re.compile(r'^```(\w*)(.*)$')
+FENCE_EDITION = re.compile(r'\bedition=(\d+)\b')
 PRINTED = re.compile(r'\berror (E\d{3}) ([A-Z][A-Z0-9_]*): ')
 UNCODED = re.compile(r'(^|: )error: ')
 
 
 def parse_doc(text):
     """The entries of the page in order: code, name, line, group digit, retired, fenced blocks."""
-    entries, entry, group, fence, block = [], None, None, None, []
+    entries, entry, group, fence, block, edition = [], None, None, None, [], EDITION
     for number, line in enumerate(text.splitlines(), 1):
         if fence is not None:
             if line.startswith('```'):
                 if entry is not None:
-                    entry['blocks'].append((fence, ''.join(l + '\n' for l in block)))
+                    entry['blocks'].append((fence, ''.join(l + '\n' for l in block), edition))
                 fence, block = None, []
             else:
                 block.append(line)
@@ -45,6 +46,8 @@ def parse_doc(text):
         match = FENCE.match(line)
         if match:
             fence = match.group(1)
+            found = FENCE_EDITION.search(match.group(2))
+            edition = found.group(1) if found else EDITION
             continue
         match = HEADING.match(line)
         if match:
@@ -65,12 +68,12 @@ def parse_doc(text):
 
 
 def example(entry):
-    """The program and expected output of an entry, or a problem."""
-    programs = [body for kind, body in entry['blocks'] if kind == 'tin']
-    outputs = [body for kind, body in entry['blocks'] if kind == 'text']
+    """The program, its edition and the expected output of an entry, or a problem."""
+    programs = [(body, edition) for kind, body, edition in entry['blocks'] if kind == 'tin']
+    outputs = [body for kind, body, _ in entry['blocks'] if kind == 'text']
     if len(programs) != 1 or len(outputs) != 1:
-        return None, None, 'needs exactly one ```tin example and one ```text output'
-    return programs[0], outputs[0], None
+        return None, None, None, 'needs exactly one ```tin example and one ```text output'
+    return programs[0][0], programs[0][1], outputs[0], None
 
 
 def check_doc(entries, problems):
@@ -93,7 +96,7 @@ def check_doc(entries, problems):
         names[e['name']] = e['code']
         if e['retired']:
             continue
-        program, output, why = example(e)
+        program, _, output, why = example(e)
         if why:
             problems.append(f'{where}: {why}')
             continue
@@ -175,12 +178,12 @@ def check_static(root=ROOT):
 
 def run_example(compiler, root, entry):
     """Compile one documented example; return a problem or None."""
-    program, output, _ = example(entry)
+    program, edition, output, _ = example(entry)
     with tempfile.TemporaryDirectory(prefix='diag-') as work:
         Path(work, 'example.tin').write_text(program)
         env = dict(os.environ, TIN_ROOT=str(root), LC_ALL='C')
         try:
-            result = subprocess.run([str(compiler), '-edition', EDITION, '-o', 'example', 'example.tin'],
+            result = subprocess.run([str(compiler), '-edition', edition, '-o', 'example', 'example.tin'],
                                     cwd=work, env=env, capture_output=True, timeout=60)
         except subprocess.TimeoutExpired:
             return f"{entry['code']} {entry['name']}: the example timed out"
@@ -198,7 +201,7 @@ def main():
     problems, entries, coded, uncoded = check_static()
     if args.compiler:
         compiler = Path(args.compiler).resolve()
-        live = [e for e in entries if not e['retired'] and not example(e)[2]]
+        live = [e for e in entries if not e['retired'] and not example(e)[3]]
         with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
             problems += [p for p in pool.map(lambda e: run_example(compiler, ROOT, e), live) if p]
     for problem in problems:
