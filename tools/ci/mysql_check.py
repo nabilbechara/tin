@@ -151,7 +151,9 @@ class Session:
 
     def recv(self):
         while len(self.buf) < 4 or len(self.buf) < 4 + int.from_bytes(self.buf[:3], 'little'):
-            d = self.s.recv(65536)
+            # SSLRequest can arrive with ClientHello: leave TLS bytes in the socket.
+            end = 4 if len(self.buf) < 4 else 4 + int.from_bytes(self.buf[:3], 'little')
+            d = self.s.recv(end - len(self.buf))
             if not d:
                 raise ConnectionError
             self.buf += d
@@ -185,7 +187,10 @@ class Session:
         if self.fake.ctx:
             # SSLRequest (32 bytes with CLIENT_SSL), then the login packet over TLS.
             assert len(p) == 32 and caps & SSL, 'the client should ask for TLS'
-            self.s = self.fake.ctx.wrap_socket(self.s, server_side=True)
+            plain = self.s
+            self.s = self.fake.ctx.wrap_socket(plain, server_side=True)
+            # wrap_socket detaches plain; reconnect checks must drop the live TLS socket.
+            self.fake.conns[self.fake.conns.index(plain)] = self.s
             self.tls = True
             p = self.recv()
             caps = struct.unpack('<I', p[:4])[0]
