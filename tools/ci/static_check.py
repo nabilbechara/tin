@@ -10,6 +10,22 @@ from suite import ROOT
 
 PT_DYNAMIC, PT_INTERP = 2, 3
 PROBE = 'fn main(argc, argv) { let envp = argv + 8 * (argc + 1); return argc * 10 + load8(envp[0]) - 64; }\n'
+ENV_PROGRAM = """package main
+
+import "quarry"
+import "say"
+
+func main() {
+	say.Line("a", quarry.Getenv("STATIC_A"))
+	err := quarry.Setenv("STATIC_B", "two")
+	v, ok := quarry.LookupEnv("STATIC_B")
+	say.Line("b", v, ok, err)
+	err = quarry.Unsetenv("STATIC_A")
+	v, ok = quarry.LookupEnv("STATIC_A")
+	say.Line("unset", v == "", ok, err)
+}
+"""
+ENV_WANT = 'a one\nb two true <nil>\nunset true false <nil>\n'
 
 
 def segments(path):
@@ -67,8 +83,23 @@ def main(programs=()):
             print('NOTE no chroot permission here: the empty-root run is skipped')
         else:
             assert jailed.returncode == 20 + ord('X') - 64, jailed
+        # A strict program that reads and changes its environment, and the compiler itself,
+        # link without libc too (#125): getenv, setenv and getauxval are the runtime's.
+        envprog = work / 'env.tin'
+        envprog.write_text(ENV_PROGRAM)
+        for target in ('linux-arm64', 'linux-amd64'):
+            exe = work / f'env-{target}'
+            subprocess.run([str(ROOT / 'bin/tinc'), '-target', target, '-o', str(exe), str(envprog)],
+                           check=True, timeout=60, env=dict(os.environ, TIN_ROOT=str(ROOT)))
+            assert_static(exe)
+        exe = work / ('env-linux-' + ('arm64' if os.uname().machine in ('aarch64', 'arm64') else 'amd64'))
+        got = subprocess.run([str(exe)], env={'STATIC_A': 'one'}, capture_output=True, text=True, timeout=30)
+        assert got.returncode == 0 and got.stdout == ENV_WANT, got
+        if os.uname().sysname == 'Linux':
+            assert_static(ROOT / 'bin/tinc')
     print('PASS static linux-arm64/amd64 images (no PT_INTERP, no PT_DYNAMIC); _start passes argc, argv and envp'
-          + ('' if jailed is None else '; runs in an empty root'))
+          + ('' if jailed is None else '; runs in an empty root')
+          + '; a program using getenv/setenv and the compiler itself are static')
 
 
 if __name__ == '__main__':
