@@ -84,7 +84,7 @@ fn generics_init() {
             set_file(f[F_FILE]);
             let d = find_generic(qual(ck_pkg, rx[TX_B]));
             if !d {
-                err_quoted(f[F_POS], "", rx[TX_B], " is not a generic type");
+                err_code_quoted(f[F_POS], "E501 NOT_GENERIC", "", rx[TX_B], " is not a generic type");
             } else {
                 vec_push(d[D_METHODS], f);
             }
@@ -126,12 +126,12 @@ fn generic_type_ref(tx) {
         }
     }
     if !d {
-        err_quoted(tx[N_POS], "", tx[TX_B], " is not a generic type");
+        err_code_quoted(tx[N_POS], "E501 NOT_GENERIC", "", tx[TX_B], " is not a generic type");
         return ty_int;
     }
     let targs = resolve_types(tx[TX_ARGS]);
     if targs[VEC_LEN] != d[D_TPARAMS][VEC_LEN] {
-        err_quoted(tx[N_POS], "wrong number of type arguments for ", tx[TX_B], "");
+        err_code_quoted(tx[N_POS], "E502 TYPE_ARG_COUNT", "wrong number of type arguments for ", tx[TX_B], "");
         return ty_int;
     }
     return instantiate_type(d, targs, tx[N_POS]);
@@ -169,7 +169,7 @@ fn check_constraints(pos, names, cons, targs, file) {
             let handled = 0;
             let cx = vec_get(c, 0);
             if c[VEC_LEN] == 1 && cx[N_KIND] == TX_DYN {
-                err_at(cx[N_POS], "a dyn type is not a constraint: name the shape");
+                err_code_at(cx[N_POS], "E520 DYN_CONSTRAINT", "a dyn type is not a constraint: name the shape");
                 handled = 1;
             }
             if !handled && c[VEC_LEN] == 1 && cx[N_KIND] == TX_NAME {
@@ -188,14 +188,14 @@ fn check_constraints(pos, names, cons, targs, file) {
                 while j < c[VEC_LEN] {
                     let mt = vec_get(c, j);
                     if shape_ref_name(mt) {
-                        err_quoted(mt[N_POS], "", shape_member_name(mt), " is a shape: a union constraint lists concrete types, and a shape goes in the constraint alone");
+                        err_code_quoted(mt[N_POS], "E521 SHAPE_IN_UNION", "", shape_member_name(mt), " is a shape: a union constraint lists concrete types, and a shape goes in the constraint alone");
                     } else if resolve_type(mt) == t {
                         ok = 1;
                     }
                     j = j + 1;
                 }
                 if !ok {
-                    let m = err_begin(pos);
+                    let m = err_code(pos, "E510 NOT_IN_UNION");
                     buf_str(m, "type ");
                     type_name(m, t);
                     buf_str(m, " does not satisfy the constraint of ");
@@ -313,7 +313,7 @@ fn instantiate_fn(g, targs, pos) {
         i = i + 1;
     }
     if targs[VEC_LEN] != g[F_TPARAMS][VEC_LEN] {
-        err_quoted(pos, "wrong number of type arguments for ", g[F_NAME], "");
+        err_code_quoted(pos, "E502 TYPE_ARG_COUNT", "wrong number of type arguments for ", g[F_NAME], "");
         return g;
     }
     // A generic that calls itself with a type built from its own type parameter (F[T] calling
@@ -330,7 +330,7 @@ fn instantiate_fn(g, targs, pos) {
     if d > 48 || g[F_INSTS][VEC_LEN] >= 4096 {
         if !g[F_INSTCYCLE] {
             g[F_INSTCYCLE] = 1;
-            err_quoted(pos, "instantiating ", g[F_NAME], " does not end: it is instantiated with ever deeper type arguments (a generic function calling itself with a type built from its type parameter, such as F[[]T] inside F[T])");
+            err_code_quoted(pos, "E503 ENDLESS_INSTANTIATION", "instantiating ", g[F_NAME], " does not end: it is instantiated with ever deeper type arguments (a generic function calling itself with a type built from its type parameter, such as F[[]T] inside F[T])");
         }
         return g;
     }
@@ -442,7 +442,7 @@ fn generic_call(e, g) {
     }
     let np = g[F_PTYPES][VEC_LEN];
     if args[VEC_LEN] != np {
-        let m = err_begin(e[N_POS]);
+        let m = err_code(e[N_POS], "E210 ARG_COUNT");
         buf_str(m, g[F_NAME]);
         buf_str(m, " expects ");
         buf_int(m, np);
@@ -464,7 +464,7 @@ fn generic_call(e, g) {
     i = 0;
     while i < binds[VEC_LEN] {
         if !vec_get(binds, i) {
-            err_quoted(e[N_POS], "cannot infer type parameter ", vec_get(g[F_TPARAMS], i), " (give it explicitly: F[T](...))");
+            err_code_quoted(e[N_POS], "E504 CANNOT_INFER", "cannot infer type parameter ", vec_get(g[F_TPARAMS], i), " (give it explicitly: F[T](...))");
             return ty_int;
         }
         i = i + 1;
@@ -543,7 +543,7 @@ fn index_targs(e) {
     while i < list[VEC_LEN] {
         let tx = expr_to_tx(vec_get(list, i));
         if !tx {
-            err_at(vec_get(list, i)[N_POS], "expected a type argument");
+            err_code_at(vec_get(list, i)[N_POS], "E505 NOT_A_TYPE_ARG", "expected a type argument");
             tx = node_new(TX_NAME, e[N_POS]);
             tx[TX_B] = "i64";
         }
@@ -617,7 +617,7 @@ fn shapes_init() {
         set_file(d[D_FILE]);
         let q = qual(ck_pkg, d[D_NAME]);
         if find_shape(q) {
-            err_quoted(d[D_POS], "", d[D_NAME], " is declared as a shape twice");
+            err_code_quoted(d[D_POS], "E101 REDECLARED", "", d[D_NAME], " is declared as a shape twice");
         } else {
             vec_push(ty_shapes, pair(q, d));
         }
@@ -750,13 +750,13 @@ fn shape_inst(tx) {
     }
     if !d[D_TPARAMS] {
         if tx[TX_ARGS] {
-            err_quoted(tx[N_POS], "shape ", tx[TX_B], " takes no type arguments");
+            err_code_quoted(tx[N_POS], "E501 NOT_GENERIC", "shape ", tx[TX_B], " takes no type arguments");
             return 0;
         }
         return pair(d, 0);
     }
     if !tx[TX_ARGS] {
-        let e = err_begin(tx[N_POS]);
+        let e = err_code(tx[N_POS], "E502 TYPE_ARG_COUNT");
         buf_str(e, "shape ");
         buf_str(e, tx[TX_B]);
         buf_str(e, " needs type arguments, like ");
@@ -766,7 +766,7 @@ fn shape_inst(tx) {
         return 0;
     }
     if tx[TX_ARGS][VEC_LEN] != d[D_TPARAMS][VEC_LEN] {
-        let e = err_begin(tx[N_POS]);
+        let e = err_code(tx[N_POS], "E502 TYPE_ARG_COUNT");
         buf_str(e, "wrong number of type arguments for shape ");
         buf_str(e, tx[TX_B]);
         buf_str(e, ": it takes ");
@@ -800,13 +800,13 @@ fn shape_inst_decl(tx) {
     }
     if !d[D_TPARAMS] {
         if tx[TX_ARGS] {
-            err_quoted(tx[N_POS], "shape ", tx[TX_B], " takes no type arguments");
+            err_code_quoted(tx[N_POS], "E501 NOT_GENERIC", "shape ", tx[TX_B], " takes no type arguments");
             return 0;
         }
         return pair(d, 0);
     }
     if !tx[TX_ARGS] {
-        let e = err_begin(tx[N_POS]);
+        let e = err_code(tx[N_POS], "E502 TYPE_ARG_COUNT");
         buf_str(e, "shape ");
         buf_str(e, tx[TX_B]);
         buf_str(e, " needs type arguments, like ");
@@ -816,7 +816,7 @@ fn shape_inst_decl(tx) {
         return 0;
     }
     if tx[TX_ARGS][VEC_LEN] != d[D_TPARAMS][VEC_LEN] {
-        let e = err_begin(tx[N_POS]);
+        let e = err_code(tx[N_POS], "E502 TYPE_ARG_COUNT");
         buf_str(e, "wrong number of type arguments for shape ");
         buf_str(e, tx[TX_B]);
         buf_str(e, ": it takes ");
@@ -958,13 +958,13 @@ fn shape_inst_soft(tx) {
     }
     if !d[D_TPARAMS] {
         if tx[TX_ARGS] {
-            err_quoted(tx[N_POS], "shape ", tx[TX_B], " takes no type arguments");
+            err_code_quoted(tx[N_POS], "E501 NOT_GENERIC", "shape ", tx[TX_B], " takes no type arguments");
             return 0;
         }
         return pair(d, 0);
     }
     if !tx[TX_ARGS] {
-        let e = err_begin(tx[N_POS]);
+        let e = err_code(tx[N_POS], "E502 TYPE_ARG_COUNT");
         buf_str(e, "shape ");
         buf_str(e, tx[TX_B]);
         buf_str(e, " needs type arguments, like ");
@@ -974,7 +974,7 @@ fn shape_inst_soft(tx) {
         return 0;
     }
     if tx[TX_ARGS][VEC_LEN] != d[D_TPARAMS][VEC_LEN] {
-        let e = err_begin(tx[N_POS]);
+        let e = err_code(tx[N_POS], "E502 TYPE_ARG_COUNT");
         buf_str(e, "wrong number of type arguments for shape ");
         buf_str(e, tx[TX_B]);
         buf_str(e, ": it takes ");
@@ -1086,7 +1086,7 @@ fn shape_collect(sd, bind, methods, owner, own) {
             let k = 0;
             while k < own[VEC_LEN] {
                 if streq(vec_get(own, k), f[F_NAME]) {
-                    let e0 = err_begin(f[F_POS]);
+                    let e0 = err_code(f[F_POS], "E524 SHAPE_METHOD_TWICE");
                     buf_str(e0, "shape ");
                     buf_str(e0, owner[D_NAME]);
                     buf_str(e0, " declares ");
@@ -1103,7 +1103,7 @@ fn shape_collect(sd, bind, methods, owner, own) {
         while j < methods[VEC_LEN] {
             let prev = vec_get(methods, j);
             if streq(vec_get(prev, 0), f[F_NAME]) && !shape_sig_same(vec_get(prev, 1), sig) {
-                let e = err_begin(f[F_POS]);
+                let e = err_code(f[F_POS], "E525 SHAPE_METHOD_CONFLICT");
                 buf_str(e, "shape ");
                 buf_str(e, owner[D_NAME]);
                 buf_str(e, " has two methods named ");
@@ -1236,7 +1236,7 @@ fn check_shape_decl(d, path) {
         while i < d[D_UNION][VEC_LEN] {
             let m = vec_get(d[D_UNION], i);
             if shape_ref_name(m) {
-                err_quoted(m[N_POS], "a named union lists concrete types, but ", shape_member_name(m), " is a shape: list shapes in a shape body instead");
+                err_code_quoted(m[N_POS], "E521 SHAPE_IN_UNION", "a named union lists concrete types, but ", shape_member_name(m), " is a shape: list shapes in a shape body instead");
                 mine = 1;
             }
             i = i + 1;
@@ -1251,7 +1251,7 @@ fn check_shape_decl(d, path) {
             if !sub {
                 let nm = shape_member_name(m);
                 if nm {
-                    let e = err_begin(m[N_POS]);
+                    let e = err_code(m[N_POS], "E522 NOT_A_SHAPE");
                     buf_str(e, "shape ");
                     buf_str(e, d[D_NAME]);
                     buf_str(e, " lists ");
@@ -1259,11 +1259,11 @@ fn check_shape_decl(d, path) {
                     buf_str(e, ", which is not a shape");
                     err_end(e);
                 } else {
-                    err_at(m[N_POS], "a shape lists another shape by name");
+                    err_code_at(m[N_POS], "E522 NOT_A_SHAPE", "a shape lists another shape by name");
                 }
                 mine = 1;
             } else if shape_on_path(path, sub) {
-                err_quoted(sub[D_POS], "shape ", sub[D_NAME], " is composed of itself (directly or through other shapes)");
+                err_code_quoted(sub[D_POS], "E523 SHAPE_CYCLE", "shape ", sub[D_NAME], " is composed of itself (directly or through other shapes)");
                 shape_mark_cycle(path, sub);
             } else {
                 // Reports a missing type argument, a wrong count or extra arguments.
@@ -1574,7 +1574,7 @@ fn check_shape(pos, t, sd, bind) {
         if key_valid(t, vec_new()) {
             return;
         }
-        let m = err_begin(pos);
+        let m = err_code(pos, "E511 NOT_COMPARABLE");
         buf_str(m, "type ");
         type_name(m, t);
         buf_str(m, " does not satisfy shape Comparable: it is not comparable");
@@ -1588,7 +1588,7 @@ fn check_shape(pos, t, sd, bind) {
         if constraints_shape(sd, "Any") {
             return;
         }
-        err_at(pos, "a dyn value satisfies its own shape only; dyn-to-dyn widening is the next step (#141)");
+        err_code_at(pos, "E514 DYN_WIDENING", "a dyn value satisfies its own shape only; dyn-to-dyn widening is the next step (#141)");
         return;
     }
     if shape_checking[VEC_LEN] == 0 {
@@ -1618,7 +1618,7 @@ fn check_shape(pos, t, sd, bind) {
             j = j + 1;
         }
         if !ok {
-            let m = err_begin(pos);
+            let m = err_code(pos, "E510 NOT_IN_UNION");
             buf_str(m, "type ");
             type_name(m, t);
             buf_str(m, " is not in shape ");
@@ -1686,7 +1686,7 @@ fn check_shape_method(pos, t, sd, want, bind) {
     }
     let cand = shape_method(t, want[F_NAME]);
     if !cand {
-        let m = err_begin(pos);
+        let m = err_code(pos, "E512 MISSING_METHOD");
         buf_str(m, "type ");
         type_name(m, t);
         buf_str(m, " does not satisfy shape ");
@@ -1704,7 +1704,7 @@ fn check_shape_method(pos, t, sd, want, bind) {
     let csig = shape_sig_of(cand, sm_declared, sm_bind);
     ck_state_restore(saved);
     if !shape_sig_same(wsig, csig) {
-        let m = err_begin(pos);
+        let m = err_code(pos, "E513 METHOD_SIGNATURE");
         buf_str(m, "type ");
         type_name(m, t);
         buf_str(m, " does not satisfy shape ");
