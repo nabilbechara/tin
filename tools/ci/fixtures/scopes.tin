@@ -44,10 +44,43 @@ fn fails(q anvil.Req, w mut anvil.Out) {
 	w.Text("never {len(pages)}")
 }
 
+mut flushed str = ""
+
+fn record(s str) {
+	flushed = keep(flushed + s + ";")
+}
+
+// later detaches work that outlives the request: it captures the request's path and runs
+// after the response, on the core's event loop.
+fn later(q anvil.Req, w mut anvil.Out) {
+	let path = q.Path
+	detach {
+		try tide.Wait(20 * tide.Millisecond)
+		record(path)
+	}
+	w.Text("detached")
+}
+
+// failing detaches work that fails: the fault is logged and the server goes on.
+fn failing(q anvil.Req, w mut anvil.Out) {
+	detach {
+		fail "background work failed"
+	}
+	w.Text("detached")
+}
+
+fn seen(q anvil.Req, w mut anvil.Out) {
+	w.Text(flushed)
+}
+
 fn main() {
 	mut r = anvil.NewRouter()
 	r.Get("/all", all)
 	r.Get("/fail", fails)
+	r.Get("/later/one", later)
+	r.Get("/later/two", later)
+	r.Get("/failing", failing)
+	r.Get("/seen", seen)
 	let err = r.Serve(":0")
 	say.Line(err)
 }

@@ -3002,7 +3002,7 @@ func rt_task_entry() {
 	rt_task_cleanups(0)
 	rt_bnd_task_end(t)
 	// A scope's child allocates in its parent's pool (#232): that memory stays.
-	if t[tChild] == 0 {
+	if t[tChild] == 0 || t[tChild][spOwnPool] != 0 {
 		if __ctx()[ctxPoolExtra] != 0 || rt_pool_used() > 65536 { t[tTrim] = 1 }
 		rt_pool_reset()
 	}
@@ -3027,7 +3027,7 @@ func rt_task_abort(t i64) {
 	rt_task_cleanups(0)
 	rt_bnd_task_end(t)
 	// A scope's child allocates in its parent's pool (#232): that memory stays.
-	if t[tChild] == 0 {
+	if t[tChild] == 0 || t[tChild][spOwnPool] != 0 {
 		if __ctx()[ctxPoolExtra] != 0 || rt_pool_used() > 65536 { t[tTrim] = 1 }
 		rt_pool_reset()
 	}
@@ -3080,7 +3080,7 @@ func rt_task_run(t i64) bool {
 // rt_pool_words is where task t's pool words live: its own, or for a scope's child those of
 // the nearest task that is not a child (the core's own while a scope in main waits).
 func rt_pool_words(t i64) i64 {
-	for t != 0 && t[tChild] != 0 {
+	for t != 0 && t[tChild] != 0 && t[tChild][spOwnPool] == 0 {
 		t = t[tChild][spScope][bTask]
 	}
 	if t == 0 {
@@ -3725,7 +3725,8 @@ const spScope = 5
 const spNext = 6
 const spCanceled = 7 // cancelled through its handle: its fault is not the scope's
 const spArg = 8      // 1 + the argument of a body that takes one (parallel's result cell)
-const spWords = 9
+const spOwnPool = 9  // a detached task: its own pool, and its fault is logged, not passed on
+const spWords = 10
 
 // rt_scope_open starts a scope boundary inside the current one.
 func rt_scope_open() scope {
@@ -3795,6 +3796,28 @@ func rt_scope_close_word(b i64) i64 {
 func rt_scope_spawn_arg(b i64, body func(i64) !, arg i64) {
 	h := scope{b: b}.spawn(cast(func() !, cast(i64, body)))
 	h.r[spArg] = arg + 1
+}
+
+// rt_detach starts f as a task in the core's background boundary (detach { }, #232). It has
+// its own pool, outlives the request that started it, runs when the core's event loop turns,
+// and is cancelled with the rest of the core by the drain. Its fault is logged.
+func rt_detach(f func() !) {
+	b := rt_bnd_background()
+	r := calloc(spWords, 8)
+	r[spBody] = cast(i64, f)
+	r[spScope] = b
+	r[spOwnPool] = 1
+	t := rt_task_new(rt_child_main, r)
+	r[spTask] = t
+	if rt_bnd_task(t, b, bkTask) != nil {
+		rt_task_free(t)
+		free(r)
+		return
+	}
+	t[tChild] = r
+	rt_task_recover(t)
+	b[bLive]++
+	rt_task_queue(t)
 }
 
 // rt_scope_close waits for every child of s, leaves the scope and gives its first fault.
@@ -3884,13 +3907,30 @@ func rt_child_main(r i64) {
 	f := cast(func() !, r[spBody])
 	f() catch err {
 		r[spFault] = cast(i64, err)
+		if r[spOwnPool] != 0 {
+			// A detached task's fault lives in its own pool: log it before the pool ends.
+			m := "detached task failed: " + say_fault(err) + "\n"
+			rt_write_all(2, cast(i64, m)+8, len(m))
+		}
 	}
+}
+
+func say_fault(err fault) str {
+	return cast(str, cast(i64, err))
 }
 
 // rt_task_finish_child completes ended child task t: its fault reaches the scope, its
 // waiters wake, and the task is reused.
 func rt_task_finish_child(t i64) {
 	r := t[tChild]
+	if r[spOwnPool] != 0 {
+		// A detached task: nobody waits for it (rt_child_main logged its fault).
+		r[spScope][bLive]--
+		free(r)
+		t[tChild] = 0
+		rt_task_free(t)
+		return
+	}
 	if t[tPanicked] != 0 && r[spFault] == 0 {
 		r[spFault] = rt_fault_std(faultPanic, "panic")
 	}
