@@ -1,30 +1,32 @@
 // find returns a record index for key in a sorted flat table, or -1.
-func find(table []i64, width i64, key i64) i64 {
-	lo := 0; hi := len(table)/width
+fn find(table []i64, width i64, key i64) i64 {
+	mut lo = 0
+ mut hi = len(table)/width
 	for lo < hi {
-		mid := (lo+hi)/2
+		let mid = (lo+hi)/2
 		if table[mid*width] < key { lo = mid+1 } else { hi = mid }
 	}
 	if lo*width < len(table) && table[lo*width] == key { return lo*width }
 	return -1
 }
 
-func within(table []i64, cp i64) bool {
-	lo := 0; hi := len(table)/2
+fn within_(table []i64, cp i64) bool {
+	mut lo = 0
+ mut hi = len(table)/2
 	for lo < hi {
-		mid := (lo+hi)/2
+		let mid = (lo+hi)/2
 		if table[mid*2+1] < cp { lo = mid+1 } else { hi = mid }
 	}
 	return lo*2 < len(table) && table[lo*2] <= cp
 }
 
-func ccc(cp i64) i64 {
-	i := find(combining, 2, cp)
+fn ccc(cp i64) i64 {
+	let i = find(combining, 2, cp)
 	if i < 0 { return 0 }
 	return combining[i+1]
 }
 
-func compose(a i64, b i64) i64 {
+fn compose(a i64, b i64) i64 {
 	// Hangul's algorithmic canonical composition (Unicode 3.2, section 3.11).
 	if a >= 0x1100 && a < 0x1113 && b >= 0x1161 && b < 0x1176 {
 		return 0xac00+((a-0x1100)*21+b-0x1161)*28
@@ -32,61 +34,73 @@ func compose(a i64, b i64) i64 {
 	if a >= 0xac00 && a <= 0xd7a3 && (a-0xac00)%28 == 0 && b > 0x11a7 && b < 0x11c3 {
 		return a+b-0x11a7
 	}
-	i := find(compositions, 2, (a<<21)|b)
+	let i = find(compositions, 2, (a<<21)|b)
 	if i < 0 { return -1 }
 	return compositions[i+1]
 }
 
 // Prep applies RFC 4013 SASLprep. PostgreSQL uses the original bytes when UTF-8 is
 // invalid or SASLprep rejects the password; this includes unassigned code points.
-func Prep(s str) str {
-	ascii := true
-	for i := 0; i < len(s); i++ { if s[i] >= 128 { ascii = false; break } }
+fn Prep(s str) str {
+	mut ascii = true
+	for i in 0..len(s) { if s[i] >= 128 { ascii = false
+ break } }
 	if ascii { return s }
-	runes := make([]i64, 0, len(s))
-	for at := 0; at < len(s); {
-		r, n := glyph.DecodeRune(s, at)
-		if r == glyph.RuneError && n == 1 { return s }
-		at += n
-		cp := i64(r)
-		if within(removed, cp) { continue }
-		if within(spaces, cp) { cp = 32 }
-		if cp >= 0xac00 && cp <= 0xd7a3 {
-			h := cp-0xac00
-			runes = append(runes, 0x1100+h/588, 0x1161+(h%588)/28)
-			if h%28 != 0 { runes = append(runes, 0x11a7+h%28) }
-		} else {
-			i := find(decomp, 3, cp)
-			if i < 0 { runes = append(runes, cp) } else {
-				for j := 0; j < decomp[i+2]; j++ { runes = append(runes, chars[decomp[i+1]+j]) }
+	mut runes = make([]i64, 0, len(s))
+	{
+		mut at = 0
+		for at < len(s) {
+			let (r, n) = glyph.DecodeRune(s, at)
+			if r == glyph.RuneError && n == 1 { return s }
+			at += n
+			mut cp = i64(r)
+			if within_(removed, cp) { continue }
+			if within_(spaces, cp) { cp = 32 }
+			if cp >= 0xac00 && cp <= 0xd7a3 {
+				let h = cp-0xac00
+				runes = append(runes, 0x1100+h/588, 0x1161+(h%588)/28)
+				if h%28 != 0 { runes = append(runes, 0x11a7+h%28) }
+			} else {
+				let i = find(decomp, 3, cp)
+				if i < 0 { runes = append(runes, cp) } else {
+					for j in 0..decomp[i+2] { runes = append(runes, chars[decomp[i+1]+j]) }
+				}
 			}
 		}
 	}
 	// Stable canonical ordering within each starter's combining sequence.
-	for i := 1; i < len(runes); i++ {
-		cc := ccc(runes[i]); j := i
+	for i in 1..len(runes) {
+		let cc = ccc(runes[i])
+ mut j = i
 		for cc != 0 && j > 0 && ccc(runes[j-1]) > cc {
-			x := runes[j-1]; runes[j-1] = runes[j]; runes[j] = x; j--
+			let x = runes[j-1]
+ runes[j-1] = runes[j]
+ runes[j] = x
+ j -= 1
 		}
 	}
-	norm := make([]i64, 0, len(runes))
-	starter := -1; lastCC := 0
-	for _, cp := range runes {
-		cc := ccc(cp); combined := -1
+	mut norm = make([]i64, 0, len(runes))
+	mut starter = -1
+ mut lastCC = 0
+	for _, cp in runes {
+		let cc = ccc(cp)
+ mut combined = -1
 		if starter >= 0 && (lastCC == 0 || lastCC < cc) { combined = compose(norm[starter], cp) }
 		if combined >= 0 { norm[starter] = combined } else {
 			if cc == 0 { starter = len(norm) }
-			norm = append(norm, cp); lastCC = cc
+			norm = append(norm, cp)
+ lastCC = cc
 		}
 	}
-	hasR := false; hasL := false
-	for _, cp := range norm {
-		if within(prohibited, cp) { return s }
-		if within(randal, cp) { hasR = true }
-		if within(lcat, cp) { hasL = true }
+	mut hasR = false
+ mut hasL = false
+	for _, cp in norm {
+		if within_(prohibited, cp) { return s }
+		if within_(randal, cp) { hasR = true }
+		if within_(lcat, cp) { hasL = true }
 	}
-	if hasR && (hasL || !within(randal, norm[0]) || !within(randal, norm[len(norm)-1])) { return s }
-	out := make([]u8, 0, len(s))
-	for _, cp := range norm { glyph.EncodeRune(mut out, i32(cp)) }
+	if hasR && (hasL || !within_(randal, norm[0]) || !within_(randal, norm[len(norm)-1])) { return s }
+	let out = make([]u8, 0, len(s))
+	for _, cp in norm { glyph.EncodeRune(mut out, i32(cp)) }
 	return str(out)
 }

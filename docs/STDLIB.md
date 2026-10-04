@@ -129,12 +129,12 @@ func main() {
 
 - `type Req struct`: Req is the request being served. Its strings live in the request pool: keep() them to store them anywhere long-lived.
 - `type Out struct`: Out is the response being built. Body is the response body; the status defaults to 200 and the content type to text/plain.
-- `Serve(addr str, h func(Req, mut Out)) !`: Serve listens on addr (":8080", "127.0.0.1:8080") and serves h on every core. It returns only if the server cannot start. TIN_CORES overrides the number of cores.
-- `ServeN(addr str, n i64, h func(Req, mut Out)) !`: ServeN is Serve on exactly n cores.
+- `Serve(addr str, h fn(Req, mut Out)) !`: Serve listens on addr (":8080", "127.0.0.1:8080") and serves h on every core. It returns only if the server cannot start. TIN_CORES overrides the number of cores.
+- `ServeN(addr str, n i64, h fn(Req, mut Out)) !`: ServeN is Serve on exactly n cores.
 - `Drain(grace i64)`: Drain starts the graceful shutdown from code, as SIGTERM does (#238): listeners close, the requests in flight finish, and after grace nanoseconds what is left is cancelled with fault.Draining; then the cores stop, Serve returns and the stop events run. Any core may call it; it does nothing outside a server or once a shutdown started.
 - `Timeouts(header i64, read i64, idle i64, write i64)`: Timeouts sets the connection timeouts in milliseconds; 0 turns one off. header: a request's line and headers must arrive within it (slowloris); read: the whole request, body included; idle: a keep-alive connection with no request in progress; write: a response the client stops reading (no progress for this long). A connection is closed when one passes; a request whose handler is running is governed by Deadline instead. Defaults 10000, 60000, 60000 and 30000; TIN_HEADER_TIMEOUT_MS, TIN_READ_TIMEOUT_MS, TIN_IDLE_TIMEOUT_MS and TIN_WRITE_TIMEOUT_MS override them. Call before Serve.
 - `type Load struct`: Load is what an admission policy sees of the core a new request arrived on: its waiting request tasks, live connections, bytes buffered for requests still arriving, and how many requests the policy refused so far (design_semantics §11).
-- `Admit(p func(Load) bool)`: Admit sets the admission policy (call before Serve): after the built-in limits, p decides each new request before its handler runs; false answers 503 with Retry-After: 1 without running the handler. Every core calls p with its own Load.
+- `Admit(p fn(Load) bool)`: Admit sets the admission policy (call before Serve): after the built-in limits, p decides each new request before its handler runs; false answers 503 with Retry-After: 1 without running the handler. Every core calls p with its own Load.
 - `Limits(maxBody i64, maxBuffered i64, maxConns i64)`: Limits sets the largest request body in bytes (413 past it), the bytes of requests still arriving that one core may buffer (a new partial request past it gets 503 and close), and the connections per core (more are closed at accept; 0: no limit). Defaults 64 MiB, 256 MiB and 16384; TIN_MAX_BODY, TIN_MAX_BUFFERED and TIN_MAX_CONNS override them. Call before Serve.
 - `Deadline(ms i64)`: Deadline makes every request's waits (tide.Wait, client calls) fail with "deadline exceeded" once ms have passed since the request started (0: no deadline; call before Serve). TIN_DEADLINE_MS sets it too; the default is 30000.
 - `(q Req) Header(name str) str`: Header returns the value of the request header name (any case), or "".
@@ -153,24 +153,24 @@ func main() {
 - `(w Out) Header(k str) str`: Header returns response header k as set so far (Type sets Content-Type, Head the rest), or "".
 - `(w mut Out) SetValue(key str, value str)`: SetValue stores value under key for the rest of the request: middleware hand data (a user id, a request id) to the handlers after them this way. Value reads it back.
 - `(w Out) Value(key str) str`: Value returns what SetValue stored under key in this request, or "".
-- `OnRelay(h func(i64, str))`: OnRelay makes every core run h(from, msg) for each relay message it receives (call before Serve). Handlers run between requests, with their own request pool.
-- `OnTick(ms i64, h func(i64))`: OnTick makes every core run h(core) every ms milliseconds (call before Serve).
+- `OnRelay(h fn(i64, str))`: OnRelay makes every core run h(from, msg) for each relay message it receives (call before Serve). Handlers run between requests, with their own request pool.
+- `OnTick(ms i64, h fn(i64))`: OnTick makes every core run h(core) every ms milliseconds (call before Serve).
 - `type Router struct`: Router sends each request to the handler routed for its method and path pattern, through the middleware added with Use. Build it in main (or in a function a global's initializer calls), then Serve it, or try requests on it with Run.
 - `NewRouter() Router`: NewRouter makes an empty router: every request gets 404 until routes are added.
-- `(r mut Router) Get(pattern str, h func(Req, mut Out))`: Get routes GET requests for pattern to h, and HEAD requests unless Head routes them.
-- `(r mut Router) Post(pattern str, h func(Req, mut Out))`: Post routes POST requests for pattern to h.
-- `(r mut Router) Put(pattern str, h func(Req, mut Out))`: Put routes PUT requests for pattern to h.
-- `(r mut Router) Patch(pattern str, h func(Req, mut Out))`: Patch routes PATCH requests for pattern to h.
-- `(r mut Router) Delete(pattern str, h func(Req, mut Out))`: Delete routes DELETE requests for pattern to h.
-- `(r mut Router) Head(pattern str, h func(Req, mut Out))`: Head routes HEAD requests for pattern to h (without it, they go to the GET route).
-- `(r mut Router) Options(pattern str, h func(Req, mut Out))`: Options routes OPTIONS requests for pattern to h.
-- `(r mut Router) Handle(method str, pattern str, h func(Req, mut Out))`: Handle routes requests with method (any HTTP method name, like "PROPFIND") for pattern to h.
-- `(r mut Router) Any(pattern str, h func(Req, mut Out))`: Any routes requests for pattern with every method to h; a route for the request's own method on the same pattern wins over it.
-- `(r mut Router) Use(mw func(Req, mut Out, func(Req, mut Out)))`: Use adds middleware mw to r. Middleware run in the order added, around every route of r and of the routers mounted in it, and around their 404 and 405 answers. Each gets next, the rest of the chain, and decides whether and when to call it.
-- `(r mut Router) Route(prefix str, build func(mut Router))`: Route groups routes under prefix ("/api"): build adds them to a new router mounted there.
+- `(r mut Router) Get(pattern str, h fn(Req, mut Out))`: Get routes GET requests for pattern to h, and HEAD requests unless Head routes them.
+- `(r mut Router) Post(pattern str, h fn(Req, mut Out))`: Post routes POST requests for pattern to h.
+- `(r mut Router) Put(pattern str, h fn(Req, mut Out))`: Put routes PUT requests for pattern to h.
+- `(r mut Router) Patch(pattern str, h fn(Req, mut Out))`: Patch routes PATCH requests for pattern to h.
+- `(r mut Router) Delete(pattern str, h fn(Req, mut Out))`: Delete routes DELETE requests for pattern to h.
+- `(r mut Router) Head(pattern str, h fn(Req, mut Out))`: Head routes HEAD requests for pattern to h (without it, they go to the GET route).
+- `(r mut Router) Options(pattern str, h fn(Req, mut Out))`: Options routes OPTIONS requests for pattern to h.
+- `(r mut Router) Handle(method str, pattern str, h fn(Req, mut Out))`: Handle routes requests with method (any HTTP method name, like "PROPFIND") for pattern to h.
+- `(r mut Router) Any(pattern str, h fn(Req, mut Out))`: Any routes requests for pattern with every method to h; a route for the request's own method on the same pattern wins over it.
+- `(r mut Router) Use(mw fn(Req, mut Out, fn(Req, mut Out)))`: Use adds middleware mw to r. Middleware run in the order added, around every route of r and of the routers mounted in it, and around their 404 and 405 answers. Each gets next, the rest of the chain, and decides whether and when to call it.
+- `(r mut Router) Route(prefix str, build fn(mut Router))`: Route groups routes under prefix ("/api"): build adds them to a new router mounted there.
 - `(r mut Router) Mount(prefix str, sub Router)`: Mount serves sub's routes under prefix: "/api" and "/users" make "/api/users", and "/api" and "" make "/api". r's middleware run before sub's, and sub's 404 and 405 answers (with its middleware) cover the paths under prefix.
-- `(r mut Router) NotFound(h func(Req, mut Out))`: NotFound sets the handler for the paths no route matches (under r's prefix when r is mounted); the status starts as 404.
-- `(r mut Router) MethodNotAllowed(h func(Req, mut Out))`: MethodNotAllowed sets the handler for the paths whose routes take other methods; the status starts as 405 and the Allow header lists those methods.
+- `(r mut Router) NotFound(h fn(Req, mut Out))`: NotFound sets the handler for the paths no route matches (under r's prefix when r is mounted); the status starts as 404.
+- `(r mut Router) MethodNotAllowed(h fn(Req, mut Out))`: MethodNotAllowed sets the handler for the paths whose routes take other methods; the status starts as 405 and the Allow header lists those methods.
 - `(r Router) Check() !`: Check fails with r's first bad pattern, conflicting route or misplaced mount, the error Serve would fail with before listening.
 - `(r Router) Serve(addr str) !`: Serve listens on addr and serves r on every core, like anvil.Serve. The routes are checked and compiled once, into a table every core reads; Serve fails with r's error, if any (see Check).
 - `(r Router) ServeN(addr str, n i64) !`: ServeN is Serve on exactly n cores.
@@ -184,7 +184,7 @@ Package hearth runs a program on every core: one thread per core, each with its 
 - `Cores() i64`: Cores is the number of CPUs this program may use: the CPUs online, capped on Linux by the affinity mask (cpuset) and the cgroup CPU quota (ceil of cpu.max quota/period); never 0.
 - `MemLimit() i64`: MemLimit is the memory limit in bytes the container (cgroup) imposes: 0 when there is none.
 - `ID() i64`: ID is the current core's number: 0 for the main core.
-- `Run(n i64, entry func(i64))`: Run starts entry(i) on cores 1..n-1, runs entry(0) here, then waits for every core. Before starting it sizes the request pools to the memory limit and decides whether cores pin themselves to CPUs (only when they map one-to-one onto the allowed CPUs, or TIN_PIN=1).
+- `Run(n i64, entry fn(i64))`: Run starts entry(i) on cores 1..n-1, runs entry(0) here, then waits for every core. Before starting it sizes the request pools to the memory limit and decides whether cores pin themselves to CPUs (only when they map one-to-one onto the allowed CPUs, or TIN_PIN=1).
 - `PoolChunk() i64`: PoolChunk is the request pool chunk size in bytes each core uses (after pool_tune).
 - `PoolCapacity() i64`: PoolCapacity is the usable size in bytes of this core's current base pool chunk (0 before its first request allocation).
 - `Reset()`: Reset ends the current request: the core's pool is emptied for the next one.
@@ -208,7 +208,7 @@ from, msg := try relay.Next()       // the same, but fails on a deadline or canc
 - `Next() !(i64, str)`: Next waits until a message for this core arrives and returns its sender and text. Unlike Recv it waits through rt_task_wait: inside a task the core serves other tasks meanwhile, and a deadline (within, the request's) or a cancel ends the wait with that fault. Under anvil.OnRelay the event loop takes every message, so do not call Next there.
 - `WakeFD() i64`: WakeFD is this core's wake-up descriptor, for event loops: after it turns readable, call Drain. Arm must be called before the loop blocks.
 - `Arm()`: Arm asks senders to wake this core through WakeFD (call just before blocking).
-- `Drain(h func(i64, str))`: Drain runs h on every waiting message (event loops call it after WakeFD fires).
+- `Drain(h fn(i64, str))`: Drain runs h on every waiting message (event loops call it after WakeFD fires).
 - `Received() i64`: Received is how many messages this core has taken from its inbox.
 - `Me() i64`: Me is this core's number.
 
@@ -354,20 +354,20 @@ Package twine manipulates UTF-8 strings (like Go's strings), with Unicode case m
 - `(b mut Builder) Grow(n i64)`: Grow makes room for n more bytes.
 - `(b mut Builder) Write(p []u8)`: Write appends p.
 - `(b mut Builder) Reset()`: Reset empties the Builder but keeps its capacity.
-- `Map(mapping func(i32) i32, s str) str`: Map returns s with every rune replaced by mapping(rune); a rune mapped to a negative value is dropped. Invalid UTF-8 bytes reach mapping as U+FFFD, and a rune mapped to it is written as U+FFFD.
+- `Map(mapping fn(i32) i32, s str) str`: Map returns s with every rune replaced by mapping(rune); a rune mapped to a negative value is dropped. Invalid UTF-8 bytes reach mapping as U+FFFD, and a rune mapped to it is written as U+FFFD.
 - `ToUpper(s str) str`: ToUpper returns s with every letter mapped to upper case.
 - `ToLower(s str) str`: ToLower returns s with every letter mapped to lower case.
 - `ToTitle(s str) str`: ToTitle returns s with every letter mapped to title case.
 - `Title(s str) str`: Title returns s with the first letter of each word mapped to title case. It cannot tell where words start in every script (the apostrophe in "they're" starts one): it is Go's deprecated strings.Title.
 - `EqualFold(s str, t str) bool`: EqualFold reports whether s and t are equal under Unicode simple case folding.
 - `Fields(s str) []str`: Fields splits s around runs of white space (Unicode's) and returns the non-empty pieces.
-- `FieldsFunc(s str, f func(i32) bool) []str`: FieldsFunc splits s around runs of runes for which f is true and returns the non-empty pieces.
-- `IndexFunc(s str, f func(i32) bool) i64`: IndexFunc returns the byte offset of the first rune for which f is true, or -1.
-- `LastIndexFunc(s str, f func(i32) bool) i64`: LastIndexFunc returns the byte offset of the last rune for which f is true, or -1.
-- `ContainsFunc(s str, f func(i32) bool) bool`: ContainsFunc reports whether f is true for any rune of s.
-- `TrimLeftFunc(s str, f func(i32) bool) str`: TrimLeftFunc returns s without the leading runes for which f is true.
-- `TrimRightFunc(s str, f func(i32) bool) str`: TrimRightFunc returns s without the trailing runes for which f is true.
-- `TrimFunc(s str, f func(i32) bool) str`: TrimFunc returns s without the leading and trailing runes for which f is true.
+- `FieldsFunc(s str, f fn(i32) bool) []str`: FieldsFunc splits s around runs of runes for which f is true and returns the non-empty pieces.
+- `IndexFunc(s str, f fn(i32) bool) i64`: IndexFunc returns the byte offset of the first rune for which f is true, or -1.
+- `LastIndexFunc(s str, f fn(i32) bool) i64`: LastIndexFunc returns the byte offset of the last rune for which f is true, or -1.
+- `ContainsFunc(s str, f fn(i32) bool) bool`: ContainsFunc reports whether f is true for any rune of s.
+- `TrimLeftFunc(s str, f fn(i32) bool) str`: TrimLeftFunc returns s without the leading runes for which f is true.
+- `TrimRightFunc(s str, f fn(i32) bool) str`: TrimRightFunc returns s without the trailing runes for which f is true.
+- `TrimFunc(s str, f fn(i32) bool) str`: TrimFunc returns s without the leading and trailing runes for which f is true.
 
 ## glyph
 
@@ -444,6 +444,8 @@ Package gauge is floating-point math and a few integer helpers (like Go's math);
 - `Acos(x f64) f64`: Acos returns the arccosine of x, in [0, Pi]. NaN for |x| > 1.
 - `Cbrt(x f64) f64`: Cbrt returns the cube root of x. Cbrt(±0) = ±0, Cbrt(±Inf) = ±Inf, Cbrt(NaN) = NaN.
 - `Exp(x f64) f64`: Exp returns e**x. Exp(+Inf) = +Inf, Exp(-Inf) = 0, Exp(NaN) = NaN; it overflows above 709.78.
+- `const Exp2Overflow = 1.0239999999999999e+03`
+- `const Exp2Underflow = -1.0740e+03`
 - `Exp2(x f64) f64`: Exp2 returns 2**x. Exp2(+Inf) = +Inf, Exp2(-Inf) = 0, Exp2(NaN) = NaN.
 - `F64bits(f f64) u64`: F64bits returns the IEEE 754 bit pattern of f.
 - `F64frombits(b u64) f64`: F64frombits returns the f64 with bit pattern b.
@@ -533,6 +535,7 @@ Package bits counts, rotates and reverses the bits of fixed-width unsigned integ
 - `Sub32(x u32, y u32, borrow u32) (u32, u32)`: Sub32 returns the difference x - y - borrow and the borrow out (0 or 1).
 - `Mul64(x u64, y u64) (u64, u64)`: Mul64 returns the 128-bit product of x and y as (high word, low word).
 - `Mul32(x u32, y u32) (u32, u32)`: Mul32 returns the 64-bit product of x and y as (high word, low word).
+- `const Div64Mask32 = two32 - 1`
 - `Div64(hi u64, lo u64, y u64) (u64, u64)`: Div64 returns the quotient and remainder of (hi, lo) divided by y. It panics for y == 0 (division by zero) and for y <= hi (the quotient does not fit in 64 bits).
 - `Div32(hi u32, lo u32, y u32) (u32, u32)`: Div32 returns the quotient and remainder of (hi, lo) divided by y. It panics for y == 0 and for y <= hi (the quotient does not fit in 32 bits).
 - `Rem64(hi u64, lo u64, y u64) u64`: Rem64 returns the remainder of (hi, lo) divided by y, for any hi (no overflow panic). It panics for y == 0.
@@ -807,7 +810,7 @@ Package sift sorts and searches slices and has the generic functions on them (li
 - `U64s(xs mut []u64)`: U64s sorts xs in increasing unsigned order.
 - `F64s(xs mut []f64)`: F64s sorts xs in increasing order with NaNs first, like Go's slices.Sort (-0 sorts before 0).
 - `Strs(xs mut []str)`: Strs sorts xs in increasing bytewise order.
-- `SortBy(xs mut []i64, less func(i64, i64) bool)`: SortBy sorts xs so that less(xs[i+1], xs[i]) is never true (less must be a strict weak order).
+- `SortBy(xs mut []i64, less fn(i64, i64) bool)`: SortBy sorts xs so that less(xs[i+1], xs[i]) is never true (less must be a strict weak order).
 - `HeapInts(xs mut []i64)`: HeapInts sorts xs in increasing order with heapsort (slower than Ints, no recursion, no extra memory).
 - `StableInts(xs mut []i64)`: StableInts sorts xs in increasing order with a merge sort that keeps equal elements in their original order.
 - `IsSortedInts(xs []i64) bool`: IsSortedInts reports whether xs is in increasing order.
@@ -823,31 +826,31 @@ Package sift sorts and searches slices and has the generic functions on them (li
 - `IndexInts(xs []i64, x i64) i64`: IndexInts returns the index of the first x in xs, or -1.
 - `ContainsStr(xs []str, x str) bool`: ContainsStr reports whether x occurs in xs.
 - `EqualInts(a []i64, b []i64) bool`: EqualInts reports whether a and b have the same length and elements.
-- `Map[T constraints.Any, U constraints.Any](xs []T, f func(T) U) []U`: Map returns f applied to each element of xs.
-- `Filter[T constraints.Any](xs []T, keep func(T) bool) []T`: Filter returns the elements of xs for which keep returns true, in order.
-- `Reduce[T constraints.Any, A constraints.Any](xs []T, start A, f func(A, T) A) A`: Reduce folds xs into one value: f(f(f(start, x0), x1), ...).
+- `Map[T constraints.Any, U constraints.Any](xs []T, f fn(T) U) []U`: Map returns f applied to each element of xs.
+- `Filter[T constraints.Any](xs []T, keep_ fn(T) bool) []T`: Filter returns the elements of xs for which keep returns true, in order.
+- `Reduce[T constraints.Any, A constraints.Any](xs []T, start A, f fn(A, T) A) A`: Reduce folds xs into one value: f(f(f(start, x0), x1), ...).
 - `shape Ordered = i64 | i32 | i16 | i8 | u64 | u32 | u16 | u8 | f64 | f32 | str`: Ordered is the set of built-in types with a total ordering operator.
 - `Sort[E Ordered](xs mut []E)`: Sort sorts xs in ascending order, in place. Floating-point NaNs sort first. It is not stable, and the order of equal elements is the same as Go's slices.Sort.
-- `SortFunc[E constraints.Any](xs mut []E, cmp func(E, E) i64)`: SortFunc sorts xs in place by cmp, which returns a negative number when a sorts before b, zero when they are equal and a positive number after. It is not stable.
-- `SortStableFunc[E constraints.Any](xs mut []E, cmp func(E, E) i64)`: SortStableFunc is SortFunc, keeping the original order of elements that compare equal.
+- `SortFunc[E constraints.Any](xs mut []E, cmp fn(E, E) i64)`: SortFunc sorts xs in place by cmp, which returns a negative number when a sorts before b, zero when they are equal and a positive number after. It is not stable.
+- `SortStableFunc[E constraints.Any](xs mut []E, cmp fn(E, E) i64)`: SortStableFunc is SortFunc, keeping the original order of elements that compare equal.
 - `IsSorted[E Ordered](xs []E) bool`: IsSorted reports whether xs is in ascending order.
-- `IsSortedFunc[E constraints.Any](xs []E, cmp func(E, E) i64) bool`: IsSortedFunc reports whether xs is sorted by cmp.
+- `IsSortedFunc[E constraints.Any](xs []E, cmp fn(E, E) i64) bool`: IsSortedFunc reports whether xs is sorted by cmp.
 - `Less[E Ordered](x E, y E) bool`: Less is cmp.Less: x < y, with NaN smaller than every other value (and so before them in Sort).
 - `Cmp[E Ordered](x E, y E) i64`: Cmp is cmp.Compare: -1 if x sorts before y, 0 if they are equal, +1 after. NaNs are equal to each other and sort before every other value.
 - `BinarySearch[E Ordered](xs []E, target E) (i64, bool)`: BinarySearch searches the sorted xs for target and returns the position where it is, or would be inserted, and whether it is there.
-- `BinarySearchFunc[E constraints.Any, T constraints.Any](xs []E, target T, cmp func(E, T) i64) (i64, bool)`: BinarySearchFunc is BinarySearch for a target of another type, ordered by cmp(element, target).
+- `BinarySearchFunc[E constraints.Any, T constraints.Any](xs []E, target T, cmp fn(E, T) i64) (i64, bool)`: BinarySearchFunc is BinarySearch for a target of another type, ordered by cmp(element, target).
 - `Min[E Ordered](xs []E) E`: Min returns the smallest element of xs; a NaN anywhere gives NaN. It panics if xs is empty. (-0 and +0 compare equal here, so a mix of them returns whichever comes first.)
 - `Max[E Ordered](xs []E) E`: Max returns the largest element of xs; a NaN anywhere gives NaN. It panics if xs is empty.
-- `MinFunc[E constraints.Any](xs []E, cmp func(E, E) i64) E`: MinFunc returns the first smallest element of xs by cmp. It panics if xs is empty.
-- `MaxFunc[E constraints.Any](xs []E, cmp func(E, E) i64) E`: MaxFunc returns the first largest element of xs by cmp. It panics if xs is empty.
+- `MinFunc[E constraints.Any](xs []E, cmp fn(E, E) i64) E`: MinFunc returns the first smallest element of xs by cmp. It panics if xs is empty.
+- `MaxFunc[E constraints.Any](xs []E, cmp fn(E, E) i64) E`: MaxFunc returns the first largest element of xs by cmp. It panics if xs is empty.
 - `Index[E constraints.Comparable](xs []E, v E) i64`: Index returns the position of the first element equal to v, or -1.
-- `IndexFunc[E constraints.Any](xs []E, f func(E) bool) i64`: IndexFunc returns the position of the first element for which f is true, or -1.
+- `IndexFunc[E constraints.Any](xs []E, f fn(E) bool) i64`: IndexFunc returns the position of the first element for which f is true, or -1.
 - `Contains[E constraints.Comparable](xs []E, v E) bool`: Contains reports whether v is in xs.
-- `ContainsFunc[E constraints.Any](xs []E, f func(E) bool) bool`: ContainsFunc reports whether f is true for some element of xs.
+- `ContainsFunc[E constraints.Any](xs []E, f fn(E) bool) bool`: ContainsFunc reports whether f is true for some element of xs.
 - `Equal[E constraints.Comparable](a []E, b []E) bool`: Equal reports whether a and b have the same length and equal elements.
-- `EqualFunc[A constraints.Any, B constraints.Any](a []A, b []B, eq func(A, B) bool) bool`: EqualFunc is Equal for two element types, with eq deciding.
+- `EqualFunc[A constraints.Any, B constraints.Any](a []A, b []B, eq fn(A, B) bool) bool`: EqualFunc is Equal for two element types, with eq deciding.
 - `Compare[E Ordered](a []E, b []E) i64`: Compare compares a and b element by element with Cmp, then by length: -1, 0 or +1.
-- `CompareFunc[A constraints.Any, B constraints.Any](a []A, b []B, cmp func(A, B) i64) i64`: CompareFunc is Compare for two element types, with cmp comparing elements.
+- `CompareFunc[A constraints.Any, B constraints.Any](a []A, b []B, cmp fn(A, B) i64) i64`: CompareFunc is Compare for two element types, with cmp comparing elements.
 - `Reverse[E constraints.Any](xs mut []E)`: Reverse reverses xs in place.
 - `Clone[E constraints.Any](xs []E) []E`: Clone returns a copy of xs that shares nothing with it.
 - `Grow[E constraints.Any](xs []E, n i64) []E`: Grow returns a copy of xs with room for n more elements before it has to grow again.
@@ -857,11 +860,11 @@ Package sift sorts and searches slices and has the generic functions on them (li
 - `Insert[E constraints.Any](xs mut []E, i i64, v E) []E`: Insert inserts v at position i (0 to len(xs)) and returns the longer slice. Like append, it grows xs in place, so every other reference to the same slice sees the new length.
 - `InsertAll[E constraints.Any](xs mut []E, i i64, vs []E) []E`: InsertAll inserts all of vs at position i and returns the longer slice (grown in place, as Insert).
 - `Delete[E constraints.Any](xs mut []E, i i64, j i64) []E`: Delete removes xs[i:j] and returns the shorter slice; the elements after j move down in place.
-- `DeleteFunc[E constraints.Any](xs mut []E, del func(E) bool) []E`: DeleteFunc removes the elements for which del is true, in place, and returns the shorter slice.
+- `DeleteFunc[E constraints.Any](xs mut []E, del fn(E) bool) []E`: DeleteFunc removes the elements for which del is true, in place, and returns the shorter slice.
 - `Replace[E constraints.Any](xs mut []E, i i64, j i64, vs []E) []E`: Replace replaces xs[i:j] with vs and returns the resulting slice (grown or shrunk in place).
 - `Compact[E constraints.Comparable](xs mut []E) []E`: Compact removes runs of equal consecutive elements, keeping the first of each run, in place, and returns the shorter slice.
-- `CompactFunc[E constraints.Any](xs mut []E, eq func(E, E) bool) []E`: CompactFunc is Compact with eq deciding which neighbours are equal.
-- `Each[E constraints.Any](xs []E, f func(E))`: Each calls f for every element of xs in ascending index order.
+- `CompactFunc[E constraints.Any](xs mut []E, eq fn(E, E) bool) []E`: CompactFunc is Compact with eq deciding which neighbours are equal.
+- `Each[E constraints.Any](xs []E, f fn(E))`: Each calls f for every element of xs in ascending index order.
 
 ## atlas
 
@@ -873,8 +876,8 @@ Package atlas is the functions on maps (like Go's maps): keys, values, copies an
 - `Clone[K constraints.Comparable, V constraints.Any](m map[K]V) map[K]V`: Clone returns a new map with the same entries, in the same order.
 - `Copy[K constraints.Comparable, V constraints.Any](dst mut map[K]V, src map[K]V)`: Copy adds every entry of src to dst, replacing the values of keys dst already has.
 - `Equal[K constraints.Comparable, V constraints.Comparable](a map[K]V, b map[K]V) bool`: Equal reports whether a and b have the same keys with equal values.
-- `EqualFunc[K constraints.Comparable, V1 constraints.Any, V2 constraints.Any](a map[K]V1, b map[K]V2, eq func(V1, V2) bool) bool`: EqualFunc is Equal with eq comparing the values, which may have different types.
-- `DeleteFunc[K constraints.Comparable, V constraints.Any](m mut map[K]V, del func(K, V) bool)`: DeleteFunc removes the entries for which del is true.
+- `EqualFunc[K constraints.Comparable, V1 constraints.Any, V2 constraints.Any](a map[K]V1, b map[K]V2, eq fn(V1, V2) bool) bool`: EqualFunc is Equal with eq comparing the values, which may have different types.
+- `DeleteFunc[K constraints.Comparable, V constraints.Any](m mut map[K]V, del fn(K, V) bool)`: DeleteFunc removes the entries for which del is true.
 
 ## cairn
 
@@ -1024,6 +1027,18 @@ Package seal has cryptographic hashes (SHA-256, SHA-384, SHA-512, SHA-1), HMAC o
 - `DecodePEM(text str) ![]PEMBlock`: DecodePEM returns every PEM block in text, in order; text between blocks is ignored.
 - `type SignatureAlgorithm enum`: SignatureAlgorithm is how a certificate is signed.
 - `type PublicKeyAlgorithm enum`: PublicKeyAlgorithm is the kind of key a certificate holds.
+- `const KeyUsageDigitalSignature = 1`: Key usage bits (KeyUsage), numbered as in RFC 5280 with bit 0 = digitalSignature.
+- `const KeyUsageContentCommitment = 2`
+- `const KeyUsageKeyEncipherment = 4`
+- `const KeyUsageDataEncipherment = 8`
+- `const KeyUsageKeyAgreement = 16`
+- `const KeyUsageCertSign = 32`
+- `const KeyUsageCRLSign = 64`
+- `const KeyUsageEncipherOnly = 128`
+- `const KeyUsageDecipherOnly = 256`
+- `const ExtKeyUsageAny = "2.5.29.37.0"`: Extended key usage OIDs.
+- `const ExtKeyUsageServerAuth = "1.3.6.1.5.5.7.3.1"`
+- `const ExtKeyUsageClientAuth = "1.3.6.1.5.5.7.3.2"`
 - `type Name struct`: Name is a distinguished name: the common attributes, and the DER bytes chains are matched on.
 - `type Certificate struct`: Certificate is a parsed X.509 v1/v3 certificate. Times are Unix seconds.
 - `(n Name) String() str`: String formats n like "CN=example.com,O=Example,C=US".
@@ -1058,7 +1073,7 @@ Package herald writes leveled log lines, one write(2) per line so cores never in
 - `const LError = 3`
 - `SetLevel(l i64)`: SetLevel drops lines below l (LDebug, LInfo, LWarn, LError) on this core.
 - `SetOutput(fd i64)`: SetOutput sends this core's lines to file descriptor fd.
-- `SetClock(f func() i64)`: SetClock replaces the clock (unix milliseconds), for tests.
+- `SetClock(f fn() i64)`: SetClock replaces the clock (unix milliseconds), for tests.
 - `Line(l i64, msg str, kv []str) str`: Line formats a log line (without writing it): timestamp, level, core, message, pairs.
 - `Log(l i64, msg str, kv []str)`: Log writes msg at level l with key/value pairs kv (k1, v1, k2, v2, ...).
 - `Debug(msg str)`: Debug logs msg at debug level.
@@ -1090,7 +1105,7 @@ crucible.Done()
 - `Failed() bool`: Failed reports whether any check failed so far.
 - `Checks() i64`: Checks is the number of checks run so far.
 - `Done()`: Done prints "ok N checks" or every failure, and exits with status 1 if any failed.
-- `Bench(label str, n i64, f func(i64))`: Bench runs f(i) for i in [0, n) and prints the time per call.
+- `Bench(label str, n i64, f fn(i64))`: Bench runs f(i) for i in [0, n) and prints the time per call.
 - `type T struct`: T is one running test: checks record failures in it, and the test continues.
 - `type B struct`: B is one running benchmark: run the measured code b.N times.
 - `(t mut T) Error(msg str)`: Error marks the test failed with msg (it keeps running).
@@ -1101,8 +1116,8 @@ crucible.Done()
 - `(t mut T) NoFault(label str, err fault)`: NoFault fails the test if err is not nil.
 - `(t mut T) HasFault(label str, err fault)`: HasFault fails the test if err is nil.
 - `Equal[V constraints.Comparable](t mut T, label str, got V, want V)`: Equal fails the test unless got == want; both are printed on failure.
-- `Run(name str, f func(mut T))`: Run runs one test and prints its result like go test -v.
-- `RunBench(name str, f func(mut B))`: RunBench runs one benchmark with b.N doubling until it takes at least 1 s, then prints the time per operation.
+- `Run(name str, f fn(mut T))`: Run runs one test and prints its result like go test -v.
+- `RunBench(name str, f fn(mut B))`: RunBench runs one benchmark with b.N doubling until it takes at least 1 s, then prints the time per operation.
 - `Finish()`: Finish prints PASS or FAIL and exits with status 1 when a test failed.
 
 ## constraints
@@ -1116,7 +1131,7 @@ Package constraints contains the named generic constraints used by the standard 
 
 Package policy is the with policies (design_semantics §7.1, notes/interface_policy.md): with p { body } calls p.Run(body) inside a boundary of its own, with the block as body. Slots are typed ambient values that Bind binds for a block and the tasks it spawns; Retry, Trace and Cached are the library policies.
 
-- `shape Policy[T constraints.Any] { Run(body func() !T) !T }`: Policy is what with p { body } needs of p: Run runs body (any number of times) and gives the block's value. Run may only call body, or pass it to a function that only calls it.
+- `shape Policy[T constraints.Any] { Run(body fn() !T) !T }`: Policy is what with p { body } needs of p: Run runs body (any number of times) and gives the block's value. Run may only call body, or pass it to a function that only calls it.
 - `type Slot[T constraints.Any] struct`: Slot is a typed ambient value: with policy.Bind(s, v) { } binds it for the block and the tasks the block spawns.
 - `NewSlot[T constraints.Any](name str) Slot[T]`: NewSlot makes a slot named name; declare it once, in a package-level let (one per core).
 - `(s Slot[T]) Name() str`: Name is the slot's name.
@@ -1124,22 +1139,22 @@ Package policy is the with policies (design_semantics §7.1, notes/interface_pol
 - `(s Slot[T]) Bound() bool`: Bound reports whether s is bound around the running code.
 - `type BindPolicy[V constraints.Any, T constraints.Any] struct`: BindPolicy binds a slot for its block (Bind).
 - `Bind[V constraints.Any, T constraints.Any](s Slot[V], v V) BindPolicy[V, T]`: Bind is a policy that binds s to v for its block and the tasks the block spawns: with policy.Bind(requestID, id) { }.
-- `(b BindPolicy[V, T]) Run(body func() !T) !T`: Run binds the slot on the with block's boundary, then runs body once.
+- `(b BindPolicy[V, T]) Run(body fn() !T) !T`: Run binds the slot on the with block's boundary, then runs body once.
 - `type RetryPolicy[T constraints.Any] struct`: RetryPolicy runs its block again while it fails (Retry).
 - `Retry[T constraints.Any](attempts i64) RetryPolicy[T]`: Retry is a policy that runs its block up to attempts times while it fails and gives the last fault. A cancellation ends it at once: a cancellation fault from the block is given as it is, and a boundary cancelled (or past its deadline) between attempts gives the cancellation's fault. The block's side effects run again on each attempt.
 - `(r RetryPolicy[T]) Backoff(d i64) RetryPolicy[T]`: Backoff is r waiting d before the second attempt, and twice as long before each later one.
-- `(r RetryPolicy[T]) Run(body func() !T) !T`: Run runs body until it succeeds, attempts runs have failed, or the boundary is cancelled.
-- `SetTracer(f func(str, i64, fault))`: SetTracer sends this core's trace spans to f(name, duration in ns, fault or nil) instead of the log.
+- `(r RetryPolicy[T]) Run(body fn() !T) !T`: Run runs body until it succeeds, attempts runs have failed, or the boundary is cancelled.
+- `SetTracer(f fn(str, i64, fault))`: SetTracer sends this core's trace spans to f(name, duration in ns, fault or nil) instead of the log.
 - `type TracePolicy[T constraints.Any] struct`: TracePolicy reports each run of its block (Trace).
 - `Trace[T constraints.Any](name str) TracePolicy[T]`: Trace is a policy that reports its block's name, duration and fault to the core's tracer (a herald line by default).
-- `(t TracePolicy[T]) Run(body func() !T) !T`: Run runs body once and reports it.
+- `(t TracePolicy[T]) Run(body fn() !T) !T`: Run runs body once and reports it.
 - `type Cache[T constraints.Any] struct`: Cache is a per-core store for Cached: declare it in a package-level let. Values are kept (copied to the long-lived heap).
 - `NewCache[T constraints.Any](max i64) Cache[T]`: NewCache makes a cache of at most max entries (at least one); a full cache drops its oldest entry.
 - `(c Cache[T]) Len() i64`: Len is the number of entries, fresh or expired.
 - `(c mut Cache[T]) Drop(key str)`: Drop removes key's entry.
 - `type CachedPolicy[T constraints.Any] struct`: CachedPolicy answers its block from a cache (Cached).
 - `Cached[T constraints.Any](c Cache[T], key str, ttl i64) CachedPolicy[T]`: Cached is a policy that gives the value cached under key while it is younger than ttl (ns), without running its block; otherwise it runs the block and caches a value it gives. Faults are not cached.
-- `(p mut CachedPolicy[T]) Run(body func() !T) !T`: Run gives the cached value, or runs body and caches its value.
+- `(p mut CachedPolicy[T]) Run(body fn() !T) !T`: Run gives the cached value, or runs body and caches its value.
 
 ## redis
 
@@ -1264,7 +1279,7 @@ func echo(ws websocket.Conn, m websocket.Message) ! {
 - `(c Conn) Close()`: Close sends a normal close (1000) and, for a client, closes the connection.
 - `IsClosed(err fault) bool`: IsClosed reports whether err is the normal end of a connection: the peer closed it.
 - `(c Conn) Read() !Message`: Read returns the next message; it answers pings and joins fragments on the way. When the peer closes, it answers the close and fails with "websocket: closed (code)". The returned message lives in the caller's pool. For a long-lived stream, use Each to reset message allocations after every callback without invalidating the Conn.
-- `(c Conn) Each(h func(Conn, Message) !) !`: Each reads messages and calls h until a read or callback fails. Every callback has a reusable message pool: use keep() to retain its data after the callback returns. The Conn and all objects allocated before Each remain valid. Callbacks may wait. A closed peer returns the same IsClosed fault as Read; callback faults propagate.
+- `(c Conn) Each(h fn(Conn, Message) !) !`: Each reads messages and calls h until a read or callback fails. Every callback has a reusable message pool: use keep() to retain its data after the callback returns. The Conn and all objects allocated before Each remain valid. Callbacks may wait. A closed peer returns the same IsClosed fault as Read; callback faults propagate.
 
 ## replay
 
