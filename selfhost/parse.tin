@@ -2192,6 +2192,7 @@ fn parse_for_edition1() {
         p_range_expr = 1;
         let src = parse_expr(1);
         p_range_expr = 0;
+        p_nolit = saved;  // the body allows composite literals again
         let body = parse_block();
         p_nolit = saved;
         if src[N_KIND] == EX_BINARY && streq(src[BIN_OP], "..") {
@@ -2232,6 +2233,7 @@ fn parse_for_edition1() {
     let w = node_new(ST_WHILE, pos);
     p_range_expr = 0;
     w[WH_COND] = parse_expr(1);
+    p_nolit = saved;
     w[WH_BODY] = parse_block();
     p_nolit = saved;
     w[WH_LABEL] = label;
@@ -3861,6 +3863,7 @@ var fx_triv;  // the trivia printed before token i instead of the source's (0: k
 var fx_lead;  // text put into the trivia before token i, after its last blank line
 var fx_ind;   // tabs added after each newline in the trivia before token i (a block now nested)
 var fx_cur_ind; // fx_ind of the token whose trivia is being printed
+var fx_trusted; // the file is a trusted library file: `secret` before a type is the qualifier
 var fx_hoisted; // [name, text] of the local constants already hoisted
 var fx_fn_name; // the name of the function being printed (prefixes a clashing local constant)
 var fx_rep;   // the printer's replacements, prefixes and suffixes (print_edition1)
@@ -4371,6 +4374,19 @@ fn fx_reserved(toks, i) {
         let n = fx_next(toks, i);
         return n >= toks[VEC_LEN] || !tok_is(vec_get(toks, n), "{");
     }
+    if streq(s, "keep") {
+        // the builtin keep(x) stays; a name spelled the same is renamed
+        let n = fx_next(toks, i);
+        return n >= toks[VEC_LEN] || !tok_is(vec_get(toks, n), "(");
+    }
+    if streq(s, "secret") && fx_trusted {
+        // `name secret T`, `) secret T`, `[]secret T`: the qualifier, the same word in edition 1
+        let n = fx_next(toks, i);
+        let p = fx_prev(toks, i);
+        if n < toks[VEC_LEN] && p >= 0 && (vec_get(toks, n)[T_KIND] == TK_IDENT || tok_is(vec_get(toks, n), "[") || tok_is(vec_get(toks, n), "?")) && (vec_get(toks, p)[T_KIND] == TK_IDENT || tok_is(vec_get(toks, p), ")") || tok_is(vec_get(toks, p), "]")) {
+            return 0;
+        }
+    }
     return streq(s, "match") || streq(s, "within") || streq(s, "limit") || streq(s, "guard") || streq(s, "parallel") || streq(s, "detach") || streq(s, "secret");
 }
 
@@ -4539,7 +4555,7 @@ fn fx_copy_dedent(out, source, a, b) {
 
 // fx_renamed is a name as the translator prints it: reserved words get a trailing '_'.
 fn fx_renamed(name) {
-    if streq(name, "match") || streq(name, "within") || streq(name, "limit") || streq(name, "guard") || streq(name, "parallel") || streq(name, "detach") || streq(name, "secret") || streq(name, "shared") || streq(name, "enum") {
+    if streq(name, "match") || streq(name, "within") || streq(name, "limit") || streq(name, "guard") || streq(name, "parallel") || streq(name, "detach") || streq(name, "secret") || streq(name, "shared") || streq(name, "enum") || streq(name, "keep") {
         return str_cat3(name, "_", "");
     }
     return name;

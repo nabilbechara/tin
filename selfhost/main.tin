@@ -146,6 +146,10 @@ fn load_file_trusted(path, trusted) {
     if trusted && edition == 1 && !load_unsafe {
         edition = 0;
     }
+    if compiler_fix && edition == 0 && fix_in_lib(path) {
+        trusted = 1;
+        file_trusted[VEC_DATA][cur_file] = 1;
+    }
     let toks = lex(cur_file, src[VEC_DATA], src[VEC_LEN], edition);
     vec_push(file_sources, src);
     vec_push(file_tokens, toks);
@@ -154,6 +158,19 @@ fn load_file_trusted(path, trusted) {
     } else {
         parse(toks);
     }
+}
+
+// fix_in_lib reports a standard library file (under <root>/lib/): -fix reads it trusted, as an
+// import loads it, so its edition 0 secret types parse.
+fn fix_in_lib(path) {
+    let real = calloc(4096, 1);
+    let root = calloc(4096, 1);
+    if !host_realpath(path, real) || !host_realpath(find_root(), root) {
+        return 0;
+    }
+    let lib = cat_path(root, "/lib/");
+    let n = strlen(lib);
+    return strlen(real) > n && mem_eq(real, lib, n);
 }
 
 fn is_loaded(path) {
@@ -634,6 +651,7 @@ fn main(argc, argv) {
         }
         let source = vec_get(file_sources, 0);
         let toks = vec_get(file_tokens, 0);
+        fx_trusted = vec_get(file_trusted, 0);
         let rewritten = print_edition1(0, source[VEC_DATA], toks);
         write_all(1, rewritten);
         return 0;
