@@ -35,9 +35,9 @@ fn other() !str {
 }
 
 // bounded runs the race inside within ms: a long race leaves the select by the deadline.
-fn bounded(ms i64) !str {
+fn bounded(ms i64, send i64, timer i64) !str {
 	let v = try within ms * tide.Millisecond {
-		try race(1000, 1000)
+		try race(send, timer)
 	}
 	return v
 }
@@ -117,7 +117,7 @@ fn otherOf(k i64, send i64, timer i64) !str {
 }
 
 fn boundedOf(ms i64, send i64, timer i64) !str {
-	return try bounded(ms)
+	return try bounded(ms, send, timer)
 }
 
 fn singleOf(k i64, a i64, b i64) !str {
@@ -199,10 +199,21 @@ fn checks() ! {
 
 	// A select left by its boundary's deadline records the arm count; its replay waits for the
 	// boundary to end it too.
-	let cut = try taped(0, boundedOf, 5, 0, 0)
+	let cut = try taped(0, boundedOf, 5, 1000, 1000)
 	say.Line("deadline recorded:", cut.got, schedprobe.Events(cut.tp))
-	let cutr = try taped(cut.tp, boundedOf, 20, 0, 0)
+	let cutr = try taped(cut.tp, boundedOf, 20, 1000, 1000)
 	say.Line("deadline replayed:", cutr.got, "diverged:", schedprobe.Diverged(cutr.tp) != "")
+
+	// Deadlines replay from the tape, not the clock: a 5 ms deadline recorded under a 10 s one
+	// still cuts the race, and a race that beat a 500 ms deadline still wins under a 1 ms one.
+	let cutLong = try taped(cut.tp, boundedOf, 10000, 1000, 1000)
+	say.Line("recorded deadline under 10 s:", cutLong.got, "diverged:", schedprobe.Diverged(cutLong.tp) != "", "left:", schedprobe.Left(cutLong.tp))
+	let kept = try taped(0, boundedOf, 500, 1, 1000)
+	let keptLive = try taped(-1, boundedOf, 1, 1, 1000)
+	let keptr = try replays(kept, boundedOf, 1, 1, 1000, 10)
+	say.Line("no deadline recorded:", kept.got, "live under 1 ms:", keptLive.got, "replayed under 1 ms:", keptr, "of 10")
+	schedprobe.Free(cutLong.tp)
+	schedprobe.Free(kept.tp)
 
 	// Resume order: children that wait 1 and 30 ms note themselves in that order; the replay
 	// keeps it when the waits are swapped.
