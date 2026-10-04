@@ -1875,6 +1875,9 @@ fn chk_boundary(e) {
     if !ck_legacy && kind == BOUND_PARALLEL {
         return chk_parallel(e);
     }
+    if !ck_legacy && kind == BOUND_WITH {
+        return chk_with(e);
+    }
     if ck_legacy || (kind != BOUND_WITHIN && kind != BOUND_GUARD && kind != BOUND_LIMIT) {
         err_at(pos, "this boundary block is not supported yet");
         return ty_int;
@@ -2233,6 +2236,339 @@ fn boundary_wrapper(pos, kind, ct, vt) {
     vec_push(body, ret);
     ck_fn = saved_fn;
     return f;
+}
+
+// ---- with policies (#237, notes/interface_policy.md) ----
+//
+// with p { body } is with$N(c, p): c is the block's closure func($r i64) !, as for the other
+// boundary blocks. with$N enters a bkWith boundary, calls p.Run with an adapter func() !T that
+// runs c and gives the value c stored, leaves the boundary and returns what Run gave.
+
+var with_fill_calls; // the policy calls whose open type parameters take with_fill_t (generic_call)
+var with_fill_t;
+var with_runs;       // [Run method, with position] pairs: Run may only call its body (region.tin)
+
+fn chk_with(e) {
+    let pos = e[N_POS];
+    let body = e[BOUND_BODY];
+    bound_leaves(body[BLK_STMTS]);
+    let f = fn_new(pos, "func");
+    vec_push(f[F_PARAMS], "$r");
+    let it = node_new(TX_NAME, pos);
+    it[TX_B] = "i64";
+    vec_push(f[F_PTYPES], it);
+    let ft = node_new(TX_NAME, pos);
+    ft[TX_B] = "fault";
+    vec_push(f[F_RTYPES], ft);
+    f[F_BANG] = 1;
+    let stmts = body[BLK_STMTS];
+    let n = stmts[VEC_LEN];
+    if n > 0 && vec_get(stmts, n - 1)[N_KIND] == ST_EXPR {
+        let last = vec_get(stmts, n - 1);
+        let bs = node_new(ST_BSTORE, last[N_POS]);
+        bs[ES_X] = last[ES_X];
+        stmts[VEC_DATA][n - 1] = bs;
+    }
+    f[F_BODY] = body;
+    let lit = node_new(EX_FUNCLIT, pos);
+    lit[LIT_FN] = f;
+    lit[LIT_ESCAPE] = 0;
+    let saved_t = bound_t;
+    bound_t = ty_void;
+    let ct = chk_funclit(lit);
+    let vt = bound_t;
+    bound_t = saved_t;
+    // The policy, after the block: the type parameters its constructor (and the calls whose
+    // receiver it is) leave open are the block's type, u8 for a block without a value.
+    let pe = vec_get(e[BOUND_ARGS], 0);
+    let saved_calls = with_fill_calls;
+    let saved_fill = with_fill_t;
+    with_fill_calls = vec_new();
+    with_fill_t = vt;
+    if kind_of(vt) == K_VOID {
+        with_fill_t = ty_byte;
+    }
+    let x = pe;
+    while x[N_KIND] == EX_CALL {
+        vec_push(with_fill_calls, x);
+        let cx = x[CALL_CALLEE];
+        if !cx || cx[N_KIND] != EX_SELECT {
+            break;
+        }
+        x = cx[SEL_X];
+    }
+    let pt = chk(pe, 0);
+    with_fill_calls = saved_calls;
+    with_fill_t = saved_fill;
+    if kind_of(pt) == K_DYN {
+        err_type(pe[N_POS], "a with policy is called directly so that its Run can be checked: use the concrete type, not ", pt, "");
+        return with_failed(e, vt);
+    }
+    let run = 0;
+    if kind_of(pt) == K_STRUCT {
+        run = find_fn(str_cat3(pt[TY_NAME], ".", "Run"));
+    }
+    if !run {
+        err_type(pe[N_POS], "", pt, " is not a policy: with needs a value with a method Run(body func() !T) !T");
+        return with_failed(e, vt);
+    }
+    // Run(body func() !T) !T, or Run(body func() !) !: the body has Run's own results.
+    let rps = run[F_PTYPES];
+    let rrs = run[F_RTYPES];
+    let bt = func_of(vec_new(), rrs, 0);
+    let tt = ty_void;
+    if rrs[VEC_LEN] == 2 {
+        tt = vec_get(rrs, 0);
+    }
+    let shaped = run[F_BANG] && rps[VEC_LEN] == 2 && vec_get(rps, 1) == bt && !vec_get(run[F_MUTS], 1);
+    if !shaped || rrs[VEC_LEN] < 1 || rrs[VEC_LEN] > 2 || kind_of(vec_get(rrs, rrs[VEC_LEN] - 1)) != K_ERROR {
+        err_type(pe[N_POS], "", pt, " is not a policy: its Run must be Run(body func() !T) !T");
+        return with_failed(e, vt);
+    }
+    if kind_of(vt) != K_VOID && kind_of(tt) == K_VOID {
+        with_error(pos, "the block gives a ", vt, ", but the Run of its policy ", pt, " runs a body without a value");
+        return with_failed(e, vt);
+    }
+    if kind_of(vt) != K_VOID && tt != vt {
+        err_types(pos, "the block gives a ", vt, ", but its policy runs a body of type ", bt);
+        return with_failed(e, vt);
+    }
+    if kind_of(vt) == K_VOID && kind_of(tt) != K_VOID && !with_scalar(tt) {
+        with_error(pos, "the block gives no value, but its policy ", pt, " needs one of type ", tt, "");
+        return with_failed(e, vt);
+    }
+    let w = with_wrapper(pos, ct, pt, bt, tt, vt);
+    let c = node_new(EX_CALL, pos);
+    c[CALL_NAME] = w[F_NAME];
+    c[CALL_FN] = w;
+    c[CALL_ARGS] = args2(lit, pe);
+    let rt = ty_error;
+    if kind_of(vt) != K_VOID {
+        let results = vec_new();
+        vec_push(results, vt);
+        vec_push(results, ty_error);
+        rt = tuple_of(results);
+    }
+    c[N_TYPE] = rt;
+    replace_node(e, c);
+    return rt;
+}
+
+// with_failed stands in for a with that was rejected: a call of the type the with would have,
+// so its catch or try reports nothing more.
+fn with_failed(e, vt) {
+    let rt = ty_error;
+    if kind_of(vt) != K_VOID {
+        let results = vec_new();
+        vec_push(results, vt);
+        vec_push(results, ty_error);
+        rt = tuple_of(results);
+    }
+    let c = node_new(EX_CALL, e[N_POS]);
+    c[CALL_NAME] = "with";
+    c[CALL_ARGS] = vec_new();
+    c[N_TYPE] = rt;
+    replace_node(e, c);
+    return rt;
+}
+
+// with_error reports a with block whose value does not fit its policy.
+fn with_error(pos, a, ta, b, tb, c) {
+    let m = err_begin(pos);
+    buf_str(m, a);
+    type_name(m, ta);
+    buf_str(m, b);
+    type_name(m, tb);
+    buf_str(m, c);
+    err_end(m);
+}
+
+// with_scalar reports whether a body without a value can give t's zero to its policy.
+fn with_scalar(t) {
+    let k = kind_of(t);
+    return k == K_INT || k == K_BYTE || k == K_BOOL || is_float_t(t);
+}
+
+// with_wrapper builds with$N(c, p) for policy type pt, whose Run takes a body of type bt
+// giving tt (ty_void: none); the with gives vt (ty_void: none). The adapter's descriptor
+// [code, 2, c, cell, 0] and the value cell live on with$N's frame, which outlives every run
+// of the body because Run cannot keep it (notes/interface_policy.md §3). p is mut so that a
+// Run with a mut receiver may change it; the region pass judges the with's own policy value.
+fn with_wrapper(pos, ct, pt, bt, tt, vt) {
+    let rmut = 1;
+    lifted_count = lifted_count + 1;
+    let f = fn_new(pos, "with");
+    let nb = buf_new();
+    buf_str(nb, "with$");
+    buf_int(nb, lifted_count);
+    buf_byte(nb, 0);
+    f[F_QNAME] = nb[VEC_DATA];
+    f[F_NAME] = nb[VEC_DATA];
+    f[F_LIFTED] = 2;
+    f[F_DONE] = 1;
+    f[F_FILE] = ck_file;
+    f[F_BANG] = 1;
+    vec_push(f[F_PARAMS], "c");
+    vec_push(f[F_PTYPES], ct);
+    vec_push(f[F_MUTS], 0);
+    vec_push(f[F_PARAMS], "$p");
+    vec_push(f[F_PTYPES], pt);
+    vec_push(f[F_MUTS], rmut);
+    if kind_of(vt) != K_VOID {
+        vec_push(f[F_RTYPES], vt);
+    }
+    vec_push(f[F_RTYPES], ty_error);
+    f[F_TYPE] = func_of_m(f[F_PTYPES], f[F_RTYPES], 0, mut_mask(f[F_MUTS]));
+    f[F_LOCALS] = vec_new();
+    f[F_BODY] = empty_block(pos);
+    vec_push(prog_fns, f);
+    let adapt = with_adapter(pos, f, ct, bt, tt, vt);
+    let saved_fn = ck_fn;
+    ck_fn = f;
+    let cs = sym_new(SYM_LOCAL, "c", pos);
+    cs[S_TYPE] = ct;
+    cs[S_SLOT] = 0;
+    cs[S_READS] = 1;
+    let ps = sym_new(SYM_LOCAL, "$p", pos);
+    ps[S_TYPE] = pt;
+    ps[S_SLOT] = 1;
+    ps[S_MUT] = rmut;
+    ps[S_READS] = 1;
+    f[F_SLOTS] = 2;
+    vec_push(f[F_LOCALS], cs);
+    vec_push(f[F_LOCALS], ps);
+    let body = f[F_BODY][BLK_STMTS];
+    let cell = declare_local(pos, "$cell", ty_int);
+    cell[S_ADDR] = 1;
+    cell[S_WORDS] = 2;
+    let desc = declare_local(pos, "$desc", ty_int);
+    desc[S_ADDR] = 1;
+    desc[S_WORDS] = 5;
+    let da = temp(pos, mk_unary(pos, "&", sym_ref_node(pos, desc)), ty_int);
+    vec_push(body, da);
+    let code = node_new(EX_FUNCREF, pos);
+    code[FR_FN] = adapt;
+    code[FR_RAW] = 1;
+    code[N_TYPE] = ty_int;
+    vec_push(body, assign_stmt(pos, mk_mem(pos, sym_ref_node(pos, da[LET_SYM]), 0, 0, 0, ty_int), code));
+    vec_push(body, assign_stmt(pos, mk_mem(pos, sym_ref_node(pos, da[LET_SYM]), 0, 0, 8, ty_int), mk_int(pos, 2, ty_int)));
+    vec_push(body, assign_stmt(pos, mk_mem(pos, sym_ref_node(pos, da[LET_SYM]), 0, 0, 16, ct), sym_ref_node(pos, cs)));
+    vec_push(body, assign_stmt(pos, mk_mem(pos, sym_ref_node(pos, da[LET_SYM]), 0, 0, 24, ty_int), mk_unary(pos, "&", sym_ref_node(pos, cell))));
+    vec_push(body, assign_stmt(pos, mk_mem(pos, sym_ref_node(pos, da[LET_SYM]), 0, 0, 32, ty_int), mk_int(pos, 0, ty_int)));
+    let dv = temp(pos, sym_ref_node(pos, da[LET_SYM]), bt);
+    vec_push(body, dv);
+    let bd = temp(pos, rt_call(pos, "rt_bnd_enter", args1(mk_int(pos, 10, ty_int)), ty_int), ty_int);
+    vec_push(body, bd);
+    // p.Run(adapter), checked like any method call.
+    let sel = node_new(EX_SELECT, pos);
+    sel[SEL_X] = sym_ref_node(pos, ps);
+    sel[SEL_NAME] = "Run";
+    let call = node_new(EX_CALL, pos);
+    call[CALL_CALLEE] = sel;
+    call[CALL_ARGS] = args1(sym_ref_node(pos, dv[LET_SYM]));
+    chk(call, 0);
+    if !with_runs {
+        with_runs = vec_new();
+    }
+    vec_push(with_runs, call[CALL_FN]);
+    vec_push(with_runs, pos);
+    let vs = 0;
+    let fes = 0;
+    if kind_of(tt) != K_VOID {
+        let cm = node_new(ST_CALLMULTI, pos);
+        cm[CM_CALL] = call;
+        cm[CM_SYMS] = vec_new();
+        vs = declare_local(pos, "$", tt);
+        fes = declare_local(pos, "$", ty_error);
+        vec_push(cm[CM_SYMS], vs);
+        vec_push(cm[CM_SYMS], fes);
+        call[N_TYPE] = ty_void;
+        vec_push(body, cm);
+    } else {
+        let fe = temp(pos, call, ty_error);
+        vec_push(body, fe);
+        fes = fe[LET_SYM];
+    }
+    fes[S_READS] = 1;
+    vec_push(body, expr_stmt(rt_call(pos, "rt_bnd_leave", args1(sym_ref_node(pos, bd[LET_SYM])), ty_void)));
+    let ifs = node_new(ST_IF, pos);
+    ifs[IF_COND] = mk_bin(pos, "!=", sym_ref_node(pos, fes), mk_int(pos, 0, ty_error), ty_bool);
+    ifs[IF_THEN] = empty_block(pos);
+    vec_push(ifs[IF_THEN][BLK_STMTS], fault_return(pos, ifs[IF_THEN][BLK_STMTS], sym_ref_node(pos, fes)));
+    vec_push(body, ifs);
+    let ret = node_new(ST_RETURN, pos);
+    if kind_of(vt) == K_VOID {
+        ret[RET_VALUE] = mk_int(pos, 0, ty_error);
+    } else {
+        let rv = vec_new();
+        vec_push(rv, sym_ref_node(pos, vs));
+        vec_push(rv, mk_int(pos, 0, ty_error));
+        ret[RET_VALUES] = rv;
+    }
+    vec_push(body, ret);
+    ck_fn = saved_fn;
+    return f;
+}
+
+// with_adapter builds with$N$body, the func() !T a policy runs: its closure environment (X17)
+// is with$N's descriptor; it calls the block's closure with the cell and gives the value.
+fn with_adapter(pos, w, ct, bt, tt, vt) {
+    let a = fn_new(pos, "func");
+    let nb = buf_new();
+    buf_str(nb, w[F_NAME]);
+    buf_str(nb, "$body");
+    buf_byte(nb, 0);
+    a[F_QNAME] = nb[VEC_DATA];
+    a[F_NAME] = nb[VEC_DATA];
+    a[F_LIFTED] = 2;
+    a[F_DONE] = 1;
+    a[F_FILE] = ck_file;
+    a[F_BANG] = 1;
+    let i = 0;
+    while i < bt[TY_RESULTS][VEC_LEN] {
+        vec_push(a[F_RTYPES], vec_get(bt[TY_RESULTS], i));
+        i = i + 1;
+    }
+    a[F_TYPE] = bt;
+    a[F_LOCALS] = vec_new();
+    a[F_BODY] = empty_block(pos);
+    vec_push(prog_fns, a);
+    let saved_fn = ck_fn;
+    ck_fn = a;
+    let env = declare_local(pos, "$env", ty_int);
+    env[S_READS] = 1;
+    a[F_ENV_SYM] = env;
+    let body = a[F_BODY][BLK_STMTS];
+    let call = node_new(EX_CALL, pos);
+    call[CALL_CALLEE] = mk_mem(pos, sym_ref_node(pos, env), 0, 0, 16, ct);
+    call[CALL_ARGS] = args1(mk_mem(pos, sym_ref_node(pos, env), 0, 0, 24, ty_int));
+    chk(call, 0);
+    let fe = temp(pos, call, ty_error);
+    vec_push(body, fe);
+    fe[LET_SYM][S_READS] = 1;
+    let ifs = node_new(ST_IF, pos);
+    ifs[IF_COND] = mk_bin(pos, "!=", sym_ref_node(pos, fe[LET_SYM]), mk_int(pos, 0, ty_error), ty_bool);
+    ifs[IF_THEN] = empty_block(pos);
+    vec_push(ifs[IF_THEN][BLK_STMTS], fault_return(pos, ifs[IF_THEN][BLK_STMTS], sym_ref_node(pos, fe[LET_SYM])));
+    vec_push(body, ifs);
+    let ret = node_new(ST_RETURN, pos);
+    if kind_of(tt) == K_VOID {
+        ret[RET_VALUE] = mk_int(pos, 0, ty_error);
+    } else {
+        let rv = vec_new();
+        if kind_of(vt) == K_VOID && is_float_t(tt) {
+            vec_push(rv, zero_value(pos, tt));
+        } else if kind_of(vt) == K_VOID {
+            vec_push(rv, mk_int(pos, 0, tt));
+        } else {
+            vec_push(rv, mk_mem(pos, mk_mem(pos, sym_ref_node(pos, env), 0, 0, 24, ty_int), 0, 0, 0, vt));
+        }
+        vec_push(rv, mk_int(pos, 0, ty_error));
+        ret[RET_VALUES] = rv;
+    }
+    vec_push(body, ret);
+    ck_fn = saved_fn;
+    return a;
 }
 
 // ---- calls ----

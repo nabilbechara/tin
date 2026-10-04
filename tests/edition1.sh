@@ -133,5 +133,23 @@ do
 		exit 1
 	fi
 done
+# with policies and bind (#237): retry, trace, cached, slots seen by spawned children and
+# parallel lines; a policy that keeps its body is a compile error.
+"$compiler" -edition 1 -o "$tmp/policies" tests/edition1/run/policies.tin
+"$tmp/policies" >"$tmp/policies.out" 2>/dev/null
+if ! cmp -s tests/edition1/run/policies.out "$tmp/policies.out"; then
+	echo "FAIL edition1/run/policies: output differs"
+	diff -u tests/edition1/run/policies.out "$tmp/policies.out" || true
+	exit 1
+fi
+if "$compiler" -edition 1 -o "$tmp/policy_keeps_body" tests/edition1/policy_keeps_body.tin >"$tmp/policy_keeps_body.out" 2>"$tmp/policy_keeps_body.err"; then
+	echo "FAIL edition1/policy_keeps_body: unexpectedly accepted"
+	exit 1
+fi
+if ! cmp -s tests/edition1/policy_keeps_body.err "$tmp/policy_keeps_body.err"; then
+	echo "FAIL edition1/policy_keeps_body: diagnostic mismatch"
+	diff -u tests/edition1/policy_keeps_body.err "$tmp/policy_keeps_body.err" || true
+	exit 1
+fi
 
 echo "PASS edition 1 parser"
