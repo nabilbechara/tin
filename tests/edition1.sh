@@ -106,6 +106,53 @@ if ! cmp -s tests/edition1/bounded_bad.err "$tmp/bounded_bad.err"; then
 	diff -u tests/edition1/bounded_bad.err "$tmp/bounded_bad.err" || true
 	exit 1
 fi
+# use and on (#238): package-level use opens per core and closes after main, function-level
+# use closes at return and joins Close's fault, and handlers run in lifecycle order.
+"$compiler" -edition 1 -o "$tmp/lifecycle" tests/edition1/run/lifecycle.tin
+"$tmp/lifecycle" >"$tmp/lifecycle.out" 2>"$tmp/lifecycle.err"
+if ! cmp -s tests/edition1/run/lifecycle.out "$tmp/lifecycle.out"; then
+	echo "FAIL edition1/run/lifecycle: output differs"
+	diff -u tests/edition1/run/lifecycle.out "$tmp/lifecycle.out" || true
+	exit 1
+fi
+if [ "$(tail -n 1 "$tmp/lifecycle.err")" != "on app.stop: second app.stop handler failed" ]; then
+	echo "FAIL edition1/run/lifecycle: a failing app.stop handler is not logged"
+	cat "$tmp/lifecycle.err"
+	exit 1
+fi
+# A fault while starting (a package-level use, on app.start, a panic in on core.start) ends
+# the process with status 1 and the message, before main runs.
+"$compiler" -edition 1 -o "$tmp/startup_fail" tests/edition1/run/startup_fail.tin
+startup_fails() {
+	status=0
+	env "$@" "$tmp/startup_fail" >"$tmp/startup.out" 2>"$tmp/startup.err" || status=$?
+	if [ "$status" != 1 ] || grep -q main "$tmp/startup.out"; then
+		echo "FAIL edition1/run/startup_fail ($*): exit $status, want 1 before main"
+		cat "$tmp/startup.out" "$tmp/startup.err"
+		exit 1
+	fi
+}
+startup_fails CONN_NAME=
+grep -qx 'startup failed: use conn: no address' "$tmp/startup.err" || { echo "FAIL startup_fail: use"; cat "$tmp/startup.err"; exit 1; }
+startup_fails CONN_NAME=db START_FAIL=1
+grep -qx 'startup failed: on app.start: migration refused' "$tmp/startup.err" || { echo "FAIL startup_fail: app.start"; cat "$tmp/startup.err"; exit 1; }
+startup_fails CONN_NAME=db CORE_PANIC=1
+grep -q '^startup failed: on core.start: panic: index out of range' "$tmp/startup.err" || { echo "FAIL startup_fail: core.start"; cat "$tmp/startup.err"; exit 1; }
+CONN_NAME=db "$tmp/startup_fail" >"$tmp/startup.out"
+if [ "$(cat "$tmp/startup.out")" != "$(printf 'open db\napp.start\nmain db\nclose db')" ]; then
+	echo "FAIL edition1/run/startup_fail: a clean start and stop differs"
+	cat "$tmp/startup.out"
+	exit 1
+fi
+if "$compiler" -edition 1 -o "$tmp/use_bad" tests/edition1/use_bad.tin >"$tmp/use_bad.out" 2>"$tmp/use_bad.err"; then
+	echo "FAIL edition1/use_bad: unexpectedly accepted"
+	exit 1
+fi
+if ! cmp -s tests/edition1/use_bad.err "$tmp/use_bad.err"; then
+	echo "FAIL edition1/use_bad: diagnostic mismatch"
+	diff -u tests/edition1/use_bad.err "$tmp/use_bad.err" || true
+	exit 1
+fi
 
 # Structured concurrency (#232): scopes, spawn, wait, cancel, first-fault cancellation.
 for name in scopes lanes selects guards handles

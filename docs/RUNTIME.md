@@ -408,6 +408,21 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   watches every source (lanes and task handles wake it), parks until one does or the earliest
   `after` comes, withdraws, and checks again. The winning arm then takes its value, which
   cannot wait. A cancelled boundary with no `canceled()` arm ends the select with its fault.
+- `use` and `on` (#238, edition 1). A package-level `use db = open()` is a per-core global
+  opened with the core's other globals, on core 0 and on every core `hearth.Run` starts (not on
+  helper threads); a fault there ends the process with `startup failed: use db: <msg>` and
+  status 1. `on app.start`, `on core.start`, `on core.stop` and `on app.stop` handlers run in
+  declaration order, each inside a guard under the core's background boundary (no bindings),
+  on the core's own stack, so a wait in one blocks its core (which serves nothing then). Order:
+  core 0's globals and uses, `app.start`, core 0's `core.start`, `main`; each other core opens
+  its uses and runs `core.start` before any core serves (a startup barrier in `hearth.Run`).
+  A fault (or a panic) in a start handler ends startup with status 1. When a core's entry
+  returns (after the drain), it runs `core.stop` and closes its uses, last opened first; after
+  `main` returns, core 0 does the same and then runs `app.stop`. Stop handlers get a fresh
+  core root, so the drain's cancellation does not stop their own waits; their faults are logged.
+  A function-level `use x = e` is `let x = try e` plus a deferred `x.Close()` (it also runs
+  while a panic unwinds); a fault from `Close` is joined after the function's own fault.
+  `anvil.Drain(d)` starts the same graceful shutdown as SIGTERM from code, with grace `d`.
 - Tasks can wait on each other: `rt_task_park(timeout)` waits until another task calls
   `rt_task_wake(t)`; woken tasks go on a per-core ready queue that the loop drains on its
   next turn (it does not block while the queue has tasks). `rt_task_defer()` puts the

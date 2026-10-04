@@ -1,0 +1,109 @@
+package main
+
+import "say"
+
+type Conn struct {
+	name str
+}
+
+fn (c Conn) Close() ! {
+	say.Line("close", c.name)
+	if c.name == "bad" || c.name == "worse" {
+		fail "close {c.name} failed"
+	}
+}
+
+fn connect(name str) !Conn {
+	if name == "" {
+		fail "no name"
+	}
+	say.Line("open", name)
+	return Conn{name: name}
+}
+
+use first = connect("first")
+use second = connect("second")
+
+on app.start {
+	say.Line("app.start: first is", first.name)
+}
+
+on core.start {
+	say.Line("core.start")
+}
+
+on core.stop {
+	say.Line("core.stop")
+}
+
+on app.stop {
+	say.Line("app.stop")
+}
+
+on app.stop {
+	fail "second app.stop handler failed"
+}
+
+// work closes b, then a, after its body; a fault from Close is the function's fault.
+fn work(other str) !str {
+	use a = connect("a")
+	use b = connect(other)
+	say.Line("working with", a.name, b.name)
+	return a.name + b.name
+}
+
+// failing fails after opening: the close fault is joined after the function's own.
+fn failing(other str) !i64 {
+	use a = connect(other)
+	if a.name != "" {
+		fail "failing failed"
+	}
+	return 1
+}
+
+// early returns before its use: nothing to close.
+fn early(n i64) !i64 {
+	if n < 0 {
+		return -1
+	}
+	use c = connect("c")
+	if n == 0 {
+		return 0
+	}
+	return n + len(c.name)
+}
+
+// guarded opens inside a guard block: a panic closes it on the way out.
+fn guarded() !i64 {
+	let v = try guard {
+		use g = connect("g")
+		let xs = []i64{1, 2, 3}
+		xs[len(g.name) + 5]
+	}
+	return v
+}
+
+fn show(other str) {
+	let v = work(other) catch err { "fault: {err}" }
+	say.Line("work:", v)
+}
+
+fn main() {
+	say.Line("main: second is", second.name)
+	show("b")
+	show("bad")
+	show("")
+	let f = failing("worse") catch err {
+		say.Line("failing:", err)
+		0
+	}
+	let e1 = early(-1) catch _ { 99 }
+	let e2 = early(0) catch _ { 99 }
+	let e3 = early(2) catch _ { 99 }
+	say.Line("early:", f, e1, e2, e3)
+	let g = guarded() catch err {
+		say.Line("guarded:", err)
+		0
+	}
+	say.Line("main ends", g)
+}

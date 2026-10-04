@@ -590,6 +590,7 @@ fn check() {
         i = i + 1;
     }
     shapes_declared();
+    lifecycle_decls();
     i = 0;
     let ndecl = prog_fns[VEC_LEN];
     while i < ndecl {
@@ -1098,6 +1099,11 @@ fn check_var(v) {
     if v[D_TYPE] {
         sb_forbid(v[D_POS], s[S_TYPE], "a global cannot hold ");
     }
+    let pu = use_global_of(v);
+    if pu {
+        check_use_global(v, s, pu);
+        return;
+    }
     let init = v[D_INIT];
     if !init && s[S_TLS] && array_len(v[D_TYPE]) > 0 {
         init = array_make(v[D_POS], s[S_TYPE], array_len(v[D_TYPE]));
@@ -1240,12 +1246,14 @@ fn make_start(main_fn) {
     cc[N_TYPE] = ty_void;
     vec_push(body[BLK_STMTS], expr_stmt(cc));
     vec_push(body[BLK_STMTS], expr_stmt(rt_call(pos, "rt_main_begin", vec_new(), ty_void)));
+    life_start(pos, body);
     let call = node_new(EX_CALL, pos);
     call[CALL_NAME] = "main";
     call[CALL_ARGS] = vec_new();
     call[CALL_FN] = main_fn;
     call[N_TYPE] = ty_void;
     vec_push(body[BLK_STMTS], expr_stmt(call));
+    life_stop(pos, body);
     vec_push(body[BLK_STMTS], expr_stmt(rt_call(pos, "rt_exit", vec_new(), ty_void)));
     vec_push(prog_fns, f);
     start_fn = f;
@@ -1421,6 +1429,8 @@ fn collect_local_decls(stmts, names) {
         let k = s[N_KIND];
         if k == ST_LET {
             vec_push(names, s[LET_NAME]);
+        } else if k == ST_USE {
+            vec_push(names, s[USE_NAME]);
         } else if k == ST_MULTI && s[MU_DEFINE] {
             let tg = s[MU_TARGETS];
             let j = 0;
@@ -1523,6 +1533,8 @@ fn scan_idents_in_stmt(s, inner_params, outer_names, cells) {
     let k = s[N_KIND];
     if k == ST_LET {
         scan_idents_in_expr(s[LET_INIT], inner_params, outer_names, cells);
+    } else if k == ST_USE {
+        scan_idents_in_expr(s[USE_INIT], inner_params, outer_names, cells);
     } else if k == ST_ASSIGN {
         scan_idents_in_expr(s[AS_TARGET], inner_params, outer_names, cells);
         scan_idents_in_expr(s[AS_VALUE], inner_params, outer_names, cells);
@@ -1739,6 +1751,8 @@ fn scan_funclits_in_stmt(s, outer_names, cells) {
     let k = s[N_KIND];
     if k == ST_LET {
         scan_funclits_in_expr(s[LET_INIT], outer_names, cells);
+    } else if k == ST_USE {
+        scan_funclits_in_expr(s[USE_INIT], outer_names, cells);
     } else if k == ST_ASSIGN {
         scan_funclits_in_expr(s[AS_TARGET], outer_names, cells);
         scan_funclits_in_expr(s[AS_VALUE], outer_names, cells);
@@ -2713,6 +2727,8 @@ fn check_stmt(s) {
         lower_detach(s);
     } else if k == ST_SELECT {
         lower_select(s);
+    } else if k == ST_USE {
+        lower_use(s);
     } else if k == ST_DEFER {
         lower_defer(s);
     } else if k == ST_BSTORE {
@@ -2889,6 +2905,419 @@ fn detach_fn(s) {
     let f = fn_new(s[N_POS], "func");
     f[F_BODY] = s[BODY_BLOCK];
     return f;
+}
+
+// ---- use and on: resources and lifecycle events (#238) ----
+//
+// on EVENT { body } becomes a function on$N() ! { body }. A package-level use x = e is a
+// per-core global whose initializer opens it on cores only (not helper threads), a fault
+// ending startup, and a function use$stop$N() ! { try x.Close() }. __start registers both
+// with rt_life_add in declaration order and runs the start events before main and the stop
+// events after it (rt_life_start, rt_life_stop); the runtime runs a core's own around its
+// entry. A function-level use x = e is let x = try e and a deferred use$close$N(x, cell)
+// whose fault every return joins into the function's fault (rt_use_take).
+
+const LIFE_APP_START = 1;
+const LIFE_APP_STOP = 2;
+const LIFE_CORE_START = 3;
+const LIFE_CORE_STOP = 4;
+const LIFE_USE_CLOSE = 5;
+
+var life_regs;  // [kind, function, label] for each handler and package-level use
+var use_cells;  // [function, cell local] for each function with a function-level use
+
+fn life_name(prefix, i) {
+    let nb = buf_new();
+    buf_str(nb, prefix);
+    buf_int(nb, i);
+    buf_byte(nb, 0);
+    return nb[VEC_DATA];
+}
+
+// life_event is the kind of an event expression (app.start ...), or 0 after an error.
+fn life_event(e) {
+    if e[N_KIND] == EX_SELECT && e[SEL_X][N_KIND] == EX_IDENT {
+        let a = e[SEL_X][ID_NAME];
+        let b = e[SEL_NAME];
+        if streq(a, "app") && streq(b, "start") {
+            return LIFE_APP_START;
+        }
+        if streq(a, "app") && streq(b, "stop") {
+            return LIFE_APP_STOP;
+        }
+        if streq(a, "core") && streq(b, "start") {
+            return LIFE_CORE_START;
+        }
+        if streq(a, "core") && streq(b, "stop") {
+            return LIFE_CORE_STOP;
+        }
+        if streq(a, "server") && (streq(b, "overload") || streq(b, "recovered")) {
+            err_at(e[N_POS], "on server.overload and server.recovered are not supported yet");
+            return 0;
+        }
+    }
+    err_at(e[N_POS], "unknown event: on takes app.start, app.stop, core.start or core.stop");
+    return 0;
+}
+
+// life_fn declares a lifecycle function NAME() ! { body } of file.
+fn life_fn(pos, file, name, body) {
+    let f = fn_new(pos, name);
+    f[F_FILE] = file;
+    let ft = node_new(TX_NAME, pos);
+    ft[TX_B] = "fault";
+    vec_push(f[F_RTYPES], ft);
+    f[F_BANG] = 1;
+    f[F_BODY] = body;
+    vec_push(prog_fns, f);
+    return f;
+}
+
+fn life_reg(kind, f, label) {
+    let r = vec_new();
+    vec_push(r, kind);
+    vec_push(r, f);
+    vec_push(r, label);
+    vec_push(life_regs, r);
+}
+
+// lifecycle_decls makes the functions of on handlers and package-level use closes, before
+// functions are declared.
+fn lifecycle_decls() {
+    life_regs = vec_new();
+    use_cells = vec_new();
+    let i = 0;
+    while i < prog_ons[VEC_LEN] {
+        let on = vec_get(prog_ons, i);
+        set_file(on[ON_FILE]);
+        let kind = life_event(on[ON_EVENT]);
+        if kind {
+            let f = life_fn(on[N_POS], on[ON_FILE], life_name("on$", i), on[ON_BODY]);
+            let e = on[ON_EVENT];
+            life_reg(kind, f, str_cat3("on ", str_cat3(e[SEL_X][ID_NAME], ".", e[SEL_NAME]), ""));
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < prog_uses[VEC_LEN] {
+        let u = vec_get(prog_uses, i);
+        let pos = u[N_POS];
+        let x = node_new(EX_SELECT, pos);
+        x[SEL_X] = node_new(EX_IDENT, pos);
+        x[SEL_X][ID_NAME] = u[USE_NAME];
+        x[SEL_NAME] = "Close";
+        let c = node_new(EX_CALL, pos);
+        c[CALL_CALLEE] = x;
+        c[CALL_ARGS] = vec_new();
+        let tr = node_new(EX_TRY, pos);
+        tr[TRY_X] = c;
+        let body = empty_block(pos);
+        vec_push(body[BLK_STMTS], expr_stmt(tr));
+        let f = life_fn(pos, u[USE_FILE], life_name("use$stop$", i), body);
+        u[USE_STOP] = f;
+        life_reg(LIFE_USE_CLOSE, f, str_cat3("use ", u[USE_NAME], ""));
+        i = i + 1;
+    }
+}
+
+// use_global_of is the package-level use whose global v is, or 0.
+fn use_global_of(v) {
+    if !prog_uses {
+        return 0;
+    }
+    let i = 0;
+    while i < prog_uses[VEC_LEN] {
+        let u = vec_get(prog_uses, i);
+        if u[USE_DECL] == v {
+            return u;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+// use_resource is T for a use initializer of type !T (else 0, reported).
+fn use_resource(pos, t) {
+    if kind_of(t) == K_TUPLE && t[TY_FIELDS][VEC_LEN] == 2 && kind_of(vec_get(t[TY_FIELDS], 1)) == K_ERROR {
+        return vec_get(t[TY_FIELDS], 0);
+    }
+    err_at(pos, "use needs a call that opens a resource and can fail (a function returning !T)");
+    return 0;
+}
+
+// use_check_close reports whether rt satisfies shape Resource { Close() ! }.
+fn use_check_close(pos, rt) {
+    if kind_of(rt) == K_DYN {
+        return 1;
+    }
+    let m = shape_method(rt, "Close");
+    if !m {
+        err_type(pos, "use needs a resource: ", rt, " has no method Close() !");
+        return 0;
+    }
+    if sm_declared && (m[F_PARAMS][VEC_LEN] != 1 || m[F_RTYPES][VEC_LEN] != 1 || kind_of(vec_get(m[F_RTYPES], 0)) != K_ERROR) {
+        err_type(pos, "use needs a resource: the Close method of ", rt, " must take nothing and return a fault (Close() !)");
+        return 0;
+    }
+    return 1;
+}
+
+// check_use_global types package-level use x = e: x = { $v; if rt_life_here() { $v, $f = e;
+// if $f != nil { rt_use_fail("use x", $f) } }; $v } in the core's initializer.
+fn check_use_global(v, s, u) {
+    let pos = v[D_POS];
+    let e = v[D_INIT];
+    start_scope();
+    ck_fn = core_fn;
+    let t = chk(e, 0);
+    let rt = use_resource(pos, t);
+    s[S_TYPE] = ty_int;
+    if !s[S_TLS] {
+        err_at(pos, "a package-level use is per core: it needs an edition 1 file");
+        rt = 0;
+    }
+    if !rt || !use_check_close(pos, rt) {
+        u[USE_STOP][F_BODY][BLK_STMTS][VEC_LEN] = 0;
+        return;
+    }
+    s[S_TYPE] = rt;
+    let vs = declare_local(pos, "$", rt);
+    let fs = declare_local(pos, "$", ty_error);
+    fs[S_READS] = 1;
+    let zero = mk_int(pos, 0, rt);
+    if is_float_t(rt) {
+        zero = zero_value(pos, rt);
+    }
+    let stmts = vec_new();
+    vec_push(stmts, let_stmt(pos, vs, zero));
+    let cm = node_new(ST_CALLMULTI, pos);
+    cm[CM_CALL] = e;
+    cm[CM_SYMS] = vec_new();
+    vec_push(cm[CM_SYMS], vs);
+    vec_push(cm[CM_SYMS], fs);
+    e[N_TYPE] = ty_void;
+    let failed = node_new(ST_IF, pos);
+    failed[IF_COND] = mk_bin(pos, "!=", sym_ref_node(pos, fs), mk_int(pos, 0, ty_error), ty_bool);
+    failed[IF_THEN] = empty_block(pos);
+    let label = lit_string(pos, str_cat3("use ", v[D_NAME], ""));
+    vec_push(failed[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, "rt_use_fail", args2(label, sym_ref_node(pos, fs)), ty_void)));
+    let here = node_new(ST_IF, pos);
+    here[IF_COND] = rt_call(pos, "rt_life_here", vec_new(), ty_bool);
+    here[IF_THEN] = empty_block(pos);
+    vec_push(here[IF_THEN][BLK_STMTS], cm);
+    vec_push(here[IF_THEN][BLK_STMTS], failed);
+    vec_push(stmts, here);
+    let target = node_new(EX_IDENT, pos);
+    target[ID_NAME] = s[S_NAME];
+    target[ID_REF] = s;
+    target[N_TYPE] = rt;
+    let a = node_new(ST_ASSIGN, pos);
+    a[AS_TARGET] = target;
+    a[AS_VALUE] = mk_seq(pos, stmts, sym_ref_node(pos, vs), rt);
+    s[S_UNINIT] = 1;
+    vec_push(core_stmts, a);
+}
+
+// lower_use lowers a function-level use x = e (see the section comment).
+fn lower_use(s) {
+    let pos = s[N_POS];
+    if ck_legacy {
+        err_at(pos, "use needs edition 1");
+        return;
+    }
+    if ck_loops > 0 {
+        err_at(pos, "use inside a loop would close once per function, not per iteration: move the loop body into a function");
+        return;
+    }
+    let frs = ck_fn[F_RTYPES];
+    if frs[VEC_LEN] == 0 || kind_of(vec_get(frs, frs[VEC_LEN] - 1)) != K_ERROR {
+        err_at(pos, "use needs the enclosing function to return a fault (write its result as !T): opening and closing a resource can fail");
+        return;
+    }
+    let name = s[USE_NAME];
+    let tr = node_new(EX_TRY, pos);
+    tr[TRY_X] = s[USE_INIT];
+    let l = node_new(ST_LET, pos);
+    l[LET_NAME] = name;
+    l[LET_INIT] = tr;
+    let out = empty_block(pos);
+    out[BLK_FLAT] = 1;
+    vec_push(out[BLK_STMTS], l);
+    replace_node(s, out);
+    let before = ck_fn[F_LOCALS][VEC_LEN];
+    check_stmt(l);
+    let xs = lookup_name_local(name);
+    if !xs || vec_index(ck_fn[F_LOCALS], xs) < before {
+        return;
+    }
+    let rt = xs[S_TYPE];
+    if !use_check_close(pos, rt) {
+        return;
+    }
+    let cf = use_close_fn(pos, rt);
+    if !cf {
+        return;
+    }
+    let xa = node_new(EX_IDENT, pos);
+    xa[ID_NAME] = name;
+    chk(xa, 0);
+    let call = node_new(EX_CALL, pos);
+    call[CALL_NAME] = cf[F_NAME];
+    call[CALL_FN] = cf;
+    call[CALL_ARGS] = args2(xa, sym_ref_node(pos, use_cell(pos)));
+    call[N_TYPE] = ty_void;
+    // As lower_defer, for a call already checked.
+    let b = empty_block(pos);
+    b[BLK_FLAT] = 1;
+    let args = call[CALL_ARGS];
+    let i = 0;
+    while i < args[VEC_LEN] {
+        let a = vec_get(args, i);
+        let at = temp(pos, a, a[N_TYPE]);
+        vec_push(b[BLK_STMTS], at);
+        args[VEC_DATA][i] = sym_ref_node(pos, at[LET_SYM]);
+        i = i + 1;
+    }
+    let flag = declare_local(pos, "$", ty_bool);
+    if !ck_defers {
+        ck_defers = vec_new();
+        ck_defer_mark = declare_local(pos, "$", ty_int);
+    }
+    defer_record(pos, b, call);
+    vec_push(ck_defers, pair(flag, call));
+    vec_push(out[BLK_STMTS], b);
+}
+
+// use_close_fn builds use$close$N($r T, $c i64) { rt_use_note($c, $r.Close()) }.
+fn use_close_fn(pos, rt) {
+    lifted_count = lifted_count + 1;
+    let name = life_name("use$close$", lifted_count);
+    let f = fn_new(pos, name);
+    f[F_QNAME] = name;
+    f[F_LIFTED] = 2;
+    f[F_DONE] = 1;
+    f[F_FILE] = ck_fn[F_FILE];
+    vec_push(f[F_PARAMS], "$r");
+    vec_push(f[F_PARAMS], "$c");
+    vec_push(f[F_PTYPES], rt);
+    vec_push(f[F_PTYPES], ty_int);
+    vec_push(f[F_MUTS], mut_capable(rt));
+    vec_push(f[F_MUTS], 0);
+    f[F_TYPE] = func_of(f[F_PTYPES], f[F_RTYPES], 0);
+    f[F_LOCALS] = vec_new();
+    f[F_SLOTS] = 0;
+    let saved = ck_fn;
+    ck_fn = f;
+    push_scope();
+    let rs = declare_local(pos, "$r", rt);
+    rs[S_READS] = 1;
+    rs[S_MUT] = mut_capable(rt);
+    let cs = declare_local(pos, "$c", ty_int);
+    cs[S_READS] = 1;
+    let x = node_new(EX_SELECT, pos);
+    x[SEL_X] = node_new(EX_IDENT, pos);
+    x[SEL_X][ID_NAME] = "$r";
+    x[SEL_NAME] = "Close";
+    let c = node_new(EX_CALL, pos);
+    c[CALL_CALLEE] = x;
+    c[CALL_ARGS] = vec_new();
+    let t = chk(c, 0);
+    pop_scope();
+    ck_fn = saved;
+    if kind_of(t) != K_ERROR {
+        err_type(pos, "use needs a resource: the Close method of ", rt, " must return a fault (Close() !)");
+        return 0;
+    }
+    f[F_BODY] = empty_block(pos);
+    vec_push(f[F_BODY][BLK_STMTS], expr_stmt(rt_call(pos, "rt_use_note", args2(sym_ref_node(pos, cs), c), ty_void)));
+    vec_push(prog_fns, f);
+    return f;
+}
+
+// use_cell_of is the cell local of function f's uses, or 0.
+fn use_cell_of(f) {
+    if !use_cells {
+        return 0;
+    }
+    let i = 0;
+    while i < use_cells[VEC_LEN] {
+        let p = vec_get(use_cells, i);
+        if vec_get(p, 0) == f {
+            return vec_get(p, 1);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn use_cell(pos) {
+    let c = use_cell_of(ck_fn);
+    if !c {
+        c = declare_local(pos, "$uc", ty_int);
+        c[S_READS] = 1;
+        vec_push(use_cells, pair(ck_fn, c));
+    }
+    return c;
+}
+
+// use_cell_init starts function f with its cell (finish_defers).
+fn use_cell_init(f, init) {
+    let c = use_cell_of(f);
+    if c {
+        vec_push(init, let_stmt(f[F_POS], c, rt_call(f[F_POS], "rt_use_cell", vec_new(), ty_int)));
+    }
+}
+
+// use_return makes return r (in block b, after the deferred calls ran) return the faults the
+// closes gave, joined after the function's own (defer_stmt).
+fn use_return(pos, b, r) {
+    let c = use_cell_of(ck_fn);
+    if !c {
+        return;
+    }
+    let old = r[RET_VALUE];
+    if r[RET_VALUES] {
+        old = vec_get(r[RET_VALUES], r[RET_VALUES][VEC_LEN] - 1);
+    }
+    let cf = temp(pos, rt_call(pos, "rt_use_take", args1(sym_ref_node(pos, c)), ty_error), ty_error);
+    cf[LET_SYM][S_READS] = 1;
+    vec_push(b[BLK_STMTS], cf);
+    let prev = mk_int(pos, 0, ty_error);
+    if old && old[N_KIND] == EX_IDENT && old[ID_REF] {
+        prev = sym_ref_node(pos, old[ID_REF]);
+    }
+    let ifs = node_new(ST_IF, pos);
+    ifs[IF_COND] = mk_bin(pos, "!=", sym_ref_node(pos, cf[LET_SYM]), mk_int(pos, 0, ty_error), ty_bool);
+    ifs[IF_THEN] = empty_block(pos);
+    let joined = rt_call(pos, "rt_use_join", args2(prev, sym_ref_node(pos, cf[LET_SYM])), ty_error);
+    vec_push(ifs[IF_THEN][BLK_STMTS], fault_return(pos, ifs[IF_THEN][BLK_STMTS], joined));
+    vec_push(b[BLK_STMTS], ifs);
+}
+
+// life_start registers the handlers and closes, then runs the start events (make_start).
+fn life_start(pos, body) {
+    if !life_regs || life_regs[VEC_LEN] == 0 {
+        return;
+    }
+    let i = 0;
+    while i < life_regs[VEC_LEN] {
+        let r = vec_get(life_regs, i);
+        let f = vec_get(r, 1);
+        let ref = node_new(EX_FUNCREF, pos);
+        ref[FR_FN] = f;
+        ref[N_TYPE] = f[F_TYPE];
+        let args = args3(mk_int(pos, vec_get(r, 0), ty_int), ref, lit_string(pos, vec_get(r, 2)));
+        vec_push(body[BLK_STMTS], expr_stmt(rt_call(pos, "rt_life_add", args, ty_void)));
+        i = i + 1;
+    }
+    vec_push(body[BLK_STMTS], expr_stmt(rt_call(pos, "rt_life_start", vec_new(), ty_void)));
+}
+
+// life_stop runs the stop events after main returns (make_start).
+fn life_stop(pos, body) {
+    if life_regs && life_regs[VEC_LEN] > 0 {
+        vec_push(body[BLK_STMTS], expr_stmt(rt_call(pos, "rt_life_stop", vec_new(), ty_void)));
+    }
 }
 
 // mark_spawns keeps the closures passed to s.spawn inside scope s on the parent's frame (the
@@ -3889,6 +4318,7 @@ fn finish_defers(f) {
     if ck_defer_mark {
         vec_push(init, let_stmt(pos, ck_defer_mark, rt_call(pos, "rt_defer_mark", vec_new(), ty_int)));
     }
+    use_cell_init(f, init);
     i = 0;
     while i < body[BLK_STMTS][VEC_LEN] {
         vec_push(init, vec_get(body[BLK_STMTS], i));
@@ -3946,6 +4376,7 @@ fn defer_stmt(s) {
             r[RET_VALUES] = vals;
         }
         defer_calls(pos, b[BLK_STMTS]);
+        use_return(pos, b, r);
         vec_push(b[BLK_STMTS], r);
         replace_node(s, b);
     }
