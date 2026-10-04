@@ -133,16 +133,18 @@ def main():
         subprocess.run([str(compiler), '-o', str(exe), 'tools/ci/fixtures/crypto_vectors.tin'], check=True, cwd=ROOT,
                        env=dict(os.environ, TIN_ROOT=str(ROOT)), timeout=120)
         data = ''.join(line + '\n' for line, _, _ in cases).encode()
-        got = subprocess.run([str(exe)], input=data, capture_output=True, timeout=600)
-        assert got.returncode == 0, got.stderr.decode(errors='replace')[:4000]
-        lines = got.stdout.decode().split('\n')[:-1]
-        assert len(lines) == len(cases), (len(lines), len(cases), got.stderr[:2000])
-        failed = [(name, line, o) for (line, check, name), o in zip(cases, lines) if not check(o if o != '-' else '')]
-        for name, line, o in failed[:20]:
-            print('FAIL', name, line[:200], '->', o[:200])
-        if failed:
-            raise SystemExit(f'crypto: {len(failed)} of {len(cases)} vectors failed')
-    print(f'crypto: {len(cases)} vectors passed')
+        # Once on the CPU's instructions where it has them, once on the software path.
+        for path, extra in (('default', {}), ('software', {'TIN_SEAL_SOFT': '1'})):
+            got = subprocess.run([str(exe)], input=data, capture_output=True, timeout=600, env=dict(os.environ, **extra))
+            assert got.returncode == 0, got.stderr.decode(errors='replace')[:4000]
+            lines = got.stdout.decode().split('\n')[:-1]
+            assert len(lines) == len(cases), (len(lines), len(cases), got.stderr[:2000])
+            failed = [(name, line, o) for (line, check, name), o in zip(cases, lines) if not check(o if o != '-' else '')]
+            for name, line, o in failed[:20]:
+                print('FAIL', path, name, line[:200], '->', o[:200])
+            if failed:
+                raise SystemExit(f'crypto ({path} path): {len(failed)} of {len(cases)} vectors failed')
+            print(f'crypto ({path} path): {len(cases)} vectors passed')
 
 
 if __name__ == '__main__':
