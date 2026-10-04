@@ -13,6 +13,7 @@ ELF for Linux); no external toolchain is involved.
 | `util.tin` | vectors (`vec_*`), byte buffers (`buf_*`), errors (`err_begin`/`err_end`/`fatal`), byte-order helpers, target flags `tgt_linux`/`tgt_x64` |
 | `lex.tin` | tokens; semicolon insertion; number, string and character literals |
 | `types.tin` | type records, interning (slices, maps, funcs), struct layout |
+| `secret.tin` | `secret T` (Tin 1, #239): secret twins of type records, propagation, the compile-time sinks, `reveal`, the secret audit |
 | `parse.tin` | AST for both syntaxes; node/field constants (the source of truth for every node layout) |
 | `check.tin` | declarations, packages, scopes, statements, the region bookkeeping fields, `try`/`defer`/`switch`/`range` lowering, `keep` generation, program start |
 | `lower.tin` | expression checking and lowering: strict typing, conversions, constant folding, builtins, `say`, `argo.Put`/`argo.Get` generation, map reads |

@@ -896,14 +896,15 @@ Package stamp computes non-cryptographic hashes and checksums: FNV-1a, CRC-32 (I
 
 Package seal has cryptographic hashes (SHA-256, SHA-1), HMAC-SHA256, PBKDF2-HMAC-SHA-256, constant-time comparison, secure random bytes, the hex and base64 encodings, and RSA-OAEP encryption with a public key.
 
-- `Sha256(s str) []u8`: Sha256 is the SHA-256 digest of s (32 bytes).
+- `Sha256(s secret str) []u8`: Sha256 is the SHA-256 digest of s (32 bytes); s may be secret.
 - `Sha256Soft(s str) []u8`: Sha256Soft is SHA-256 in portable code (the reference the hardware path is tested against).
-- `Sha256Hex(s str) str`: Sha256Hex is the SHA-256 digest of s in lower-case hex.
+- `Sha256Hex(s secret str) str`: Sha256Hex is the SHA-256 digest of s in lower-case hex; s may be secret.
 - `Sha1(s str) []u8`: Sha1 is the SHA-1 digest of s (20 bytes); use it only where a protocol requires it.
-- `HmacSha256(key str, msg str) []u8`: HmacSha256 is the HMAC-SHA256 of msg under key (32 bytes).
-- `Pbkdf2Sha256(password str, salt str, iterations i64, length i64) ![]u8`: Pbkdf2Sha256 derives length bytes using PBKDF2-HMAC-SHA-256. Iterations must be positive; length must be between 0 and 1 MiB. Temporary storage is reused between rounds, so memory usage does not grow with iterations. Choose the work factor for your protocol or password policy (this function does not choose one).
-- `Pbkdf2Sha256Timeout(password str, salt str, iterations i64, length i64, timeout i64) ![]u8`: Pbkdf2Sha256Timeout derives bytes like Pbkdf2Sha256, with a timeout in nanoseconds (<= 0: no limit). Both forms honor request deadlines and let other tasks run between batches of rounds. Scratch storage is released before any timeout fault returns.
-- `ConstantTimeEq(a []u8, b []u8) bool`: ConstantTimeEq compares a and b in time that depends only on their lengths.
+- `HmacSha256(key secret str, msg str) []u8`: HmacSha256 is the HMAC-SHA256 of msg under key (32 bytes); key may be secret.
+- `Pbkdf2Sha256(password secret str, salt str, iterations i64, length i64) ![]u8`: Pbkdf2Sha256 derives length bytes using PBKDF2-HMAC-SHA-256. Iterations must be positive; length must be between 0 and 1 MiB. Temporary storage is reused between rounds, so memory usage does not grow with iterations. Choose the work factor for your protocol or password policy (this function does not choose one). The password may be secret.
+- `Pbkdf2Sha256Timeout(password secret str, salt str, iterations i64, length i64, timeout i64) ![]u8`: Pbkdf2Sha256Timeout derives bytes like Pbkdf2Sha256, with a timeout in nanoseconds (<= 0: no limit). Both forms honor request deadlines and let other tasks run between batches of rounds. Scratch storage is released before any timeout fault returns.
+- `ConstantTimeEq(a secret []u8, b secret []u8) bool`: ConstantTimeEq compares a and b in time that depends only on their lengths; they may be secret.
+- `Equal(a secret str, b secret str) bool`: Equal reports whether a and b hold the same bytes, in time that depends only on their lengths. It is how secrets are compared: == on a secret is a compile error.
 - `RandomBytes(n i64) []u8`: RandomBytes returns n cryptographically secure random bytes.
 - `Hex(b []u8) str`: Hex encodes b in lower-case hexadecimal.
 - `HexDecode(s str) ![]u8`: HexDecode decodes hexadecimal text.

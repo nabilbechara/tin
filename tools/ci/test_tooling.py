@@ -75,6 +75,7 @@ while [ $# -gt 0 ]; do
   case $1 in
     -o) out=$2; shift 2 ;;
     -target) shift 2 ;;
+    -audit-secrets) exit 0 ;;
     *) [ -f "$1" ] || { echo "cannot open $1" >&2; exit 1; }; shift ;;
   esac
 done
@@ -139,6 +140,11 @@ class TinCommandTests(unittest.TestCase):
     def test_single_file_form(self):
         self.assertEqual(self.tin('hello world.tin', 'x y', '*'), ['x y', '*'])
         self.assertEqual(self.tinc_args()[2:], ['hello world.tin'])
+
+    def test_audit_secrets_passes_options_and_files(self):
+        # tin audit secrets (#239) hands its options and files to tinc -audit-secrets unchanged.
+        self.assertEqual(self.tin('audit', 'secrets', '-edition', '1', 'hello world.tin', 'b*.tin'), [])
+        self.assertEqual(self.tinc_args(), ['-audit-secrets', '-edition', '1', 'hello world.tin', 'b*.tin'])
 
 
 class PackageResolutionTests(unittest.TestCase):

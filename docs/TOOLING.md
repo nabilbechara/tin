@@ -34,6 +34,7 @@ moving or deleting the tree breaks it.
 | `tin run A.tin B.tin -- ARGS` | compile several files as one program and run it |
 | `tin build FILE.tin... [-o OUT] [--target T]` | write an executable (default name: the first file without `.tin`) |
 | `tin asm FILE.tin...` | print the generated ARM64 assembly (clang syntax) |
+| `tin audit secrets [-edition 1] FILE.tin...` | check the program and list every place a `secret` leaves the checker's protection: each `reveal(x)` and each secret passed to a library parameter declared `secret`, as `file:line:col: ...` sorted by position, then a count; exit status 1 (with the errors) when the program does not check |
 | `tin test [-bench] [DIR]` | build DIR (default `.`) with its `*_test.tin` files and run every `TestXxx(t mut crucible.T)`, then `BenchmarkXxx(b mut crucible.B)` with `-bench`; exit status 1 when a test fails, 2 for a wrong test signature (see §5.1) |
 | `tin suite` | run the compiler's strict test suite (`tools/v2test.sh`) |
 | `tin bootstrap` | rebuild the compiler with itself; the binaries must be identical |
@@ -53,6 +54,8 @@ tinc [-o OUT] [-S] [-target darwin-arm64|linux-arm64|linux-amd64] FILE.tin...
 ```
 
 - `-o OUT`: write the executable (default `a.out`). `-S`: print assembly instead.
+- `-audit-secrets`: check the program and print its secret audit instead of building
+  (`tin audit secrets`; LANGUAGE.md §17).
 - The standard library is found through `$TIN_ROOT` or, without it, relative to the
   executable (`<root>/bin/tinc` means `<root>/lib`). The `tin` script sets `TIN_ROOT`.
 - Strict programs get the package `lib/runtime/` (its `*_<os>.tin` and `*_<os>_<arch>.tin`
