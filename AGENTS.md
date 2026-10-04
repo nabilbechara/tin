@@ -22,9 +22,10 @@ and the files you must not touch. The CI and regression policy is in [docs/CI.md
 - **"No regression" or "faster" claims need Linux numbers:** Tin and Go (or before and
   after) on the same Linux machine in the same run, interleaved, as medians with the
   ratio. State the machine, CPU, kernel and Go version.
-- **For PRs that touch performance,** run `.github/workflows/bench-linux.yml` (Actions,
-  Run workflow, or a PR that changes `bench/`) and cite its summary. On GitHub's shared
-  runners only the ratios are meaningful.
+- **For PRs that touch performance,** run `.github/workflows/bench-linux.yml` by hand
+  (Actions, Run workflow, on the PR branch with `base_ref` set to its base; it does not
+  run on PRs automatically) and cite its summary. On GitHub's shared runners only the
+  ratios are meaningful.
 - The full rules are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md#benchmark-policy).
 
 ## Tin 1: rules for parallel work (strict)

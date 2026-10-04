@@ -1,0 +1,141 @@
+package lane
+
+import "constraints"
+
+// Lane is a bounded queue between tasks on one core (design_semantics §6, #232). Send waits
+// while it is full and Recv while it is empty; Close wakes every waiter. Waits take the
+// task's deadline and cancellation like any other wait. A lane never crosses cores (relay does).
+type Lane[T constraints.Any] struct {
+	buf    []T
+	head   i64
+	n      i64
+	closed bool
+	recv   []i64
+	send   []i64
+}
+
+// New makes a lane that holds at most capacity values (at least one).
+func New[T constraints.Any](capacity i64) Lane[T] {
+	if capacity < 1 {
+		capacity = 1
+	}
+	var zero T
+	buf := make([]T, 0, capacity)
+	for i := 0; i < capacity; i++ {
+		buf = append(buf, zero)
+	}
+	return Lane[T]{buf: buf, head: 0, n: 0, closed: false, recv: make([]i64, 0, 4), send: make([]i64, 0, 4)}
+}
+
+// Send puts v at the back, waiting while the lane is full; it fails once the lane is closed.
+func (l mut Lane[T]) Send(v T) ! {
+	for l.n == len(l.buf) && !l.closed {
+		try l.park(false)
+	}
+	if l.closed {
+		fail "lane closed"
+	}
+	l.buf[(l.head+l.n)%len(l.buf)] = v
+	l.n++
+	l.wake(true)
+}
+
+// TrySend puts v at the back if there is room and reports whether it did.
+func (l mut Lane[T]) TrySend(v T) bool {
+	if l.closed || l.n == len(l.buf) {
+		return false
+	}
+	l.buf[(l.head+l.n)%len(l.buf)] = v
+	l.n++
+	l.wake(true)
+	return true
+}
+
+// Recv takes the value at the front, waiting while the lane is empty; it fails with
+// "lane closed" once the lane is closed and empty.
+func (l mut Lane[T]) Recv() !T {
+	for l.n == 0 {
+		if l.closed {
+			fail "lane closed"
+		}
+		try l.park(true)
+	}
+	v := l.buf[l.head]
+	l.head = (l.head + 1) % len(l.buf)
+	l.n--
+	l.wake(false)
+	return v
+}
+
+// Close ends the lane: senders fail, receivers drain what is left and then fail.
+func (l mut Lane[T]) Close() {
+	l.closed = true
+	for len(l.recv) > 0 {
+		l.wake(true)
+	}
+	for len(l.send) > 0 {
+		l.wake(false)
+	}
+}
+
+// Len is how many values wait in the lane.
+func (l Lane[T]) Len() i64 {
+	return l.n
+}
+
+// park waits until a lane operation wakes this task (on the receive list, or the send list).
+// On the core's own stack (main) it lets the core's tasks run one step instead.
+func (l mut Lane[T]) park(recv bool) ! {
+	t := rt_task_current()
+	if t == 0 {
+		if rt_bnd_stopped() {
+			fail cast(fault, rt_wait_fault())
+		}
+		rt_core_step_until(rt_bnd_deadline(rt_bnd_current()))
+		if rt_bnd_stopped() {
+			fail cast(fault, rt_wait_fault())
+		}
+		return
+	}
+	if recv {
+		l.recv = append(l.recv, t)
+	} else {
+		l.send = append(l.send, t)
+	}
+	r := rt_task_park(0)
+	if recv {
+		l.recv = without(l.recv, t)
+	} else {
+		l.send = without(l.send, t)
+	}
+	if r == waitDeadline {
+		fail cast(fault, rt_wait_fault())
+	}
+}
+
+// wake wakes the longest waiting task on the receive (or send) list, if any.
+func (l mut Lane[T]) wake(recv bool) {
+	if recv && len(l.recv) > 0 {
+		t := l.recv[0]
+		l.recv = without(l.recv, t)
+		rt_task_wake(t)
+	} else if !recv && len(l.send) > 0 {
+		t := l.send[0]
+		l.send = without(l.send, t)
+		rt_task_wake(t)
+	}
+}
+
+// without is ts without its first t.
+func without(ts []i64, t i64) []i64 {
+	out := make([]i64, 0, len(ts))
+	gone := false
+	for _, x := range ts {
+		if x == t && !gone {
+			gone = true
+			continue
+		}
+		out = append(out, x)
+	}
+	return out
+}

@@ -58,7 +58,7 @@ if ! cmp -s tests/edition1/fault_wrap_bad.err "$tmp/fault_wrap_bad.err"; then
 fi
 
 # Structured concurrency (#232): scopes, spawn, wait, cancel, first-fault cancellation.
-for name in scopes
+for name in scopes lanes
 do
 	"$compiler" -edition 1 -o "$tmp/$name" "tests/edition1/run/$name.tin"
 	"$tmp/$name" >"$tmp/$name.out" 2>/dev/null

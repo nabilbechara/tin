@@ -18,9 +18,9 @@ development platform (docs/PORTING.md, "Platform roles").
   runners) only the ratios are meaningful; absolute numbers vary between runs.
 - **Continuous tracking:** `.github/workflows/bench-linux.yml` runs the CPU suite
   (`bench/v2`, Tin vs Go) and the HTTP suite (`bench/http/run_wrk.sh`, anvil vs fasthttp vs
-  net/http) on `ubuntu-24.04` (x86-64) and `ubuntu-24.04-arm` every week, on demand and on
-  pull requests that change `bench/`, `lib/` or `selfhost/`, and writes the tables to
-  the job summary. The same job compares the PR head with its merge base, each built
+  net/http) on `ubuntu-24.04` (x86-64) and `ubuntu-24.04-arm` every week and on demand (it
+  does not run on pull requests), and writes the tables to the job summary. The same
+  job compares the selected revision with a base revision, each built
   from its own seed, compiler, runtime and libraries. Manual runs accept `base_ref`;
   manual runs without it and scheduled runs compare against the first parent.
 - **Existing macOS numbers:** the sections below were measured on the macOS development
