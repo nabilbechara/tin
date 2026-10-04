@@ -1,0 +1,55 @@
+package main
+
+import "lane"
+import "say"
+import "tide"
+
+fn pipeline(n i64) !i64 {
+	mut jobs = lane.New[i64](2)
+	mut sum i64 = 0
+	scope s {
+		s.spawn(fn() ! {
+			for i in 1..n + 1 {
+				try jobs.Send(i)
+			}
+			jobs.Close()
+		})
+		s.spawn(fn() ! {
+			for {
+				let v = jobs.Recv() catch _ {
+					break
+				}
+				sum += v
+				try tide.Wait(tide.Millisecond)
+			}
+		})
+	}
+	return sum
+}
+
+fn slowRecv() !i64 {
+	mut l = lane.New[i64](1)
+	let v = try within 20ms {
+		try l.Recv()
+	}
+	return v
+}
+
+fn main() {
+	let s = pipeline(10) catch err {
+		say.Line("fault", err)
+		0
+	}
+	say.Line("sum:", s)
+	let f = slowRecv() catch err {
+		say.Line("recv deadline:", err)
+		0
+	}
+	say.Line("slow:", f)
+	mut m = lane.New[str](3)
+	say.Line(m.TrySend("a"), m.TrySend("b"), m.TrySend("c"), m.TrySend("d"), m.Len())
+	let first = m.Recv() catch _ {
+		"never"
+	}
+	say.Line("first:", first)
+}

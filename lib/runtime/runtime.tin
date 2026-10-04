@@ -3675,14 +3675,29 @@ func rt_scope_block(b i64, r i64) {
 		}
 		return
 	}
+	rt_core_step()
+}
+
+// rt_core_step lets the tasks of this core move on while code on the core's own stack (main)
+// waits for them: it runs one woken task or due timer, or sleeps until the next timer.
+func rt_core_step() {
+	rt_core_step_until(0)
+}
+
+// rt_core_step_until is rt_core_step for a wait with a deadline (mono ns, 0: none): with
+// nothing to run it sleeps no later than the deadline instead of reporting a deadlock.
+func rt_core_step_until(deadline i64) {
 	t := rt_task_take_ready()
 	if t == 0 {
 		now := rt_mono_ns()
 		t = rt_timer_pop(now)
 		if t == 0 {
 			next := rt_timer_next()
+			if deadline > 0 && (next < 0 || deadline < next) {
+				next = deadline
+			}
 			if next < 0 {
-				rt_panic("scope: every child is waiting for something only this scope could do")
+				rt_panic("deadlock: main waits for tasks that are all waiting for it")
 			}
 			rt_sleep_ns(next - now)
 			return
