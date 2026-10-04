@@ -1,6 +1,7 @@
 package main
 
 import "anvil"
+import "lane"
 import "say"
 import "tide"
 
@@ -73,6 +74,31 @@ fn seen(q anvil.Req, w mut anvil.Out) {
 	w.Text(flushed)
 }
 
+fn pick() !str {
+	mut jobs = lane.New[str](1)
+	mut got str = ""
+	scope s {
+		s.spawn(fn() ! {
+			try tide.Wait(10 * tide.Millisecond)
+			try jobs.Send("job")
+		})
+		select {
+			let j = jobs.Recv() => { got = j }
+			after(tide.Second) => { got = "timeout" }
+		}
+	}
+	return got
+}
+
+// picked runs a select inside the request: the child's value wins over the 1 s timer.
+fn picked(q anvil.Req, w mut anvil.Out) {
+	let got = pick() catch err {
+		w.Text("fault: {err}")
+		return
+	}
+	w.Text(got)
+}
+
 fn main() {
 	mut r = anvil.NewRouter()
 	r.Get("/all", all)
@@ -81,6 +107,7 @@ fn main() {
 	r.Get("/later/two", later)
 	r.Get("/failing", failing)
 	r.Get("/seen", seen)
+	r.Get("/select", picked)
 	let err = r.Serve(":0")
 	say.Line(err)
 }

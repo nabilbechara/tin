@@ -3820,6 +3820,72 @@ func rt_detach(f func() !) {
 	rt_task_queue(t)
 }
 
+// ---- select (#232): the runtime side of the lowering in check.tin ----
+
+// rt_select_deadline is when an after(d) arm becomes ready (mono ns).
+func rt_select_deadline(d i64) i64 {
+	return rt_mono_ns() + d
+}
+
+// rt_select_due reports whether an after arm's time has come.
+func rt_select_due(at i64) bool {
+	return rt_mono_ns() >= at
+}
+
+// rt_select_canceled reports whether the current boundary is cancelled or past its deadline.
+func rt_select_canceled() bool {
+	return rt_bnd_stopped()
+}
+
+// rt_select_min is the earlier of two deadlines (0: none).
+func rt_select_min(a i64, b i64) i64 {
+	if a == 0 || (b != 0 && b < a) {
+		return b
+	}
+	return a
+}
+
+// rt_select_park waits until a watched source wakes this task or deadline (mono ns, 0: none)
+// comes; on the core's own stack it runs the core's tasks one step instead.
+func rt_select_park(deadline i64) {
+	if curTask == 0 {
+		rt_core_step_until(rt_select_min(deadline, rt_bnd_deadline(rt_bnd_current())))
+		return
+	}
+	if deadline > 0 {
+		left := deadline - rt_mono_ns()
+		if left <= 0 {
+			return
+		}
+		rt_task_park(left)
+		return
+	}
+	rt_task_park(0)
+}
+
+// rt_select_fail leaves a select whose boundary was cancelled, with the wait's fault.
+func rt_select_fail() ! {
+	fail cast(fault, rt_wait_fault())
+}
+
+// ready reports whether the child has finished (a select arm on t.wait()).
+func (h spawned) ready() bool {
+	return h.r[spDone] != 0
+}
+
+// watch makes the child's end wake the running task (a select waiting on it).
+func (h spawned) watch() {
+	if h.r[spDone] == 0 && curTask != 0 {
+		h.r[spWaiter] = curTask
+	}
+}
+
+func (h spawned) unwatch() {
+	if h.r[spWaiter] == curTask {
+		h.r[spWaiter] = 0
+	}
+}
+
 // rt_scope_close waits for every child of s, leaves the scope and gives its first fault.
 func rt_scope_close(s scope) ! {
 	b := s.b
