@@ -2869,7 +2869,8 @@ const tRetired = 51  // 1: released over the cache cap; freed when its last time
 const tBnd = 52      // the task's current boundary (notes/interface_boundaries.md), 0 before rt_bnd_task
 const tDefer = 53    // the task's defer chain (#230): records [next, defer$N, values...]
 const tChild = 54    // a scope's child task (#232): its record [task, body, fault, done, waiter, scope, next]
-const taskWords = 55
+const tScopeWait = 55 // the scope whose end the task is parked for (#232), else 0
+const taskWords = 56
 
 const waitReady = 0
 const waitDeadline = 1
@@ -3333,7 +3334,7 @@ func rt_scope_discard(b i64) {
 	r := b[bLand]
 	for r != 0 {
 		n := r[spNext]
-		free(r)
+		rt_sp_free(r)
 		r = n
 	}
 	b[bLand] = 0
@@ -3731,7 +3732,8 @@ const spNext = 6
 const spCanceled = 7 // cancelled through its handle: its fault is not the scope's
 const spArg = 8      // 1 + the argument of a body that takes one (parallel's result cell)
 const spOwnPool = 9  // a detached task: its own pool, and its fault is logged, not passed on
-const spWords = 10
+const spMore = 10    // waiters beyond spWaiter: [capacity, count, task...], or 0
+const spWords = 11
 
 // rt_scope_open starts a scope boundary inside the current one.
 func rt_scope_open() scope {
@@ -3880,15 +3882,87 @@ func (h spawned) ready() bool {
 
 // watch makes the child's end wake the running task (a select waiting on it).
 func (h spawned) watch() {
-	if h.r[spDone] == 0 && curTask != 0 {
-		h.r[spWaiter] = curTask
+	if h.r[spDone] == 0 {
+		rt_sp_watch(h.r)
 	}
 }
 
 func (h spawned) unwatch() {
-	if h.r[spWaiter] == curTask {
-		h.r[spWaiter] = 0
+	rt_sp_unwatch(h.r)
+}
+
+// rt_sp_watch adds the running task to those child record r's end wakes: any number of
+// tasks may wait for one child (its parent, siblings, selects).
+func rt_sp_watch(r i64) {
+	t := curTask
+	if t == 0 || r[spWaiter] == t {
+		return
 	}
+	if r[spWaiter] == 0 {
+		r[spWaiter] = t
+		return
+	}
+	m := r[spMore]
+	if m == 0 {
+		m = calloc(6, 8)
+		m[0] = 4
+		r[spMore] = m
+	}
+	for i := 0; i < m[1]; i++ {
+		if m[2+i] == t {
+			return
+		}
+	}
+	if m[1] == m[0] {
+		m = realloc(m, 8*(2+2*m[0]))
+		m[0] = 2 * m[0]
+		r[spMore] = m
+	}
+	m[2+m[1]] = t
+	m[1]++
+}
+
+// rt_sp_unwatch removes the running task from r's waiters.
+func rt_sp_unwatch(r i64) {
+	t := curTask
+	if r[spWaiter] == t {
+		r[spWaiter] = 0
+	}
+	m := r[spMore]
+	if m == 0 {
+		return
+	}
+	for i := 0; i < m[1]; i++ {
+		if m[2+i] == t {
+			m[2+i] = m[2+m[1]-1]
+			m[1]--
+			return
+		}
+	}
+}
+
+// rt_sp_wake wakes every task waiting for r's child, which has ended.
+func rt_sp_wake(r i64) {
+	if r[spWaiter] != 0 {
+		rt_task_wake(r[spWaiter])
+		r[spWaiter] = 0
+	}
+	m := r[spMore]
+	if m == 0 {
+		return
+	}
+	for i := 0; i < m[1]; i++ {
+		rt_task_wake(m[2+i])
+	}
+	m[1] = 0
+}
+
+// rt_sp_free releases child record r.
+func rt_sp_free(r i64) {
+	if r[spMore] != 0 {
+		free(r[spMore])
+	}
+	free(r)
 }
 
 // rt_scope_close waits for every child of s, leaves the scope and gives its first fault.
@@ -3901,7 +3975,7 @@ func rt_scope_close(s scope) ! {
 	r := b[bLand]
 	for r != 0 {
 		n := r[spNext]
-		free(r)
+		rt_sp_free(r)
 		r = n
 	}
 	b[bLand] = 0
@@ -3913,18 +3987,25 @@ func rt_scope_close(s scope) ! {
 }
 
 // rt_scope_block lets children of b run until one finishes: a task parks (the child's end
-// wakes it); code on the core's own stack runs them itself.
+// wakes it); code on the core's own stack runs them itself. Waiting for child r, the task
+// may be any task of the core; waiting for the scope's end (r 0), it is the scope's own task.
 func rt_scope_block(b i64, r i64) {
 	if curTask != 0 {
+		t := curTask
 		if r != 0 {
-			r[spWaiter] = curTask
+			rt_sp_watch(r)
+		} else {
+			t[tScopeWait] = b
 		}
-		b[bTask] = curTask
 		if rt_bnd_current()[bCancel] != 0 {
 			// A cancelled wait returns at once: yield instead, so the children can finish.
 			rt_task_defer()
 		} else {
 			rt_task_park(0)
+		}
+		t[tScopeWait] = 0
+		if r != 0 {
+			rt_sp_unwatch(r)
 		}
 		return
 	}
@@ -4012,11 +4093,9 @@ func rt_task_finish_child(t i64) {
 	if r[spFault] != 0 && r[spCanceled] == 0 {
 		rt_child_fault(b, r[spFault])
 	}
-	if r[spWaiter] != 0 {
-		rt_task_wake(r[spWaiter])
-		r[spWaiter] = 0
-	}
-	if b[bLive] == 0 && b[bTask] != 0 {
+	rt_sp_wake(r)
+	if b[bLive] == 0 && b[bTask] != 0 && b[bTask][tScopeWait] == b {
+		// Only when it waits for the scope's end: any other wait of its own goes on.
 		rt_task_wake(b[bTask])
 	}
 	t[tChild] = 0

@@ -1,0 +1,84 @@
+package main
+
+// A task handle (and its scope) must not outlive the scope block (#232): each marked line is
+// a compile error.
+
+import "constraints"
+import "say"
+import "tide"
+
+mut held ?spawned = nil // a global
+
+type Box struct {
+	t ?spawned // a field
+}
+
+shape Waiter {
+	wait() !
+}
+
+fn work() ! {
+	try tide.Wait(tide.Millisecond)
+}
+
+fn give(s scope) spawned { // a result
+	return s.spawn(work)
+}
+
+fn stash(hs mut []spawned, t spawned) {
+	hs = append(hs, t)
+}
+
+fn helper(s scope, t spawned) {
+	s.spawn(fn() ! {
+		try t.wait()
+	})
+}
+
+fn identity[T constraints.Any](x T) T {
+	return x
+}
+
+fn run() ! {
+	mut outer ?spawned = nil
+	mut list = []spawned{}
+	scope a {
+		let first = a.spawn(work)
+		outer = first // declared before the scope
+		list = append(list, first)
+		stash(mut list, first)
+		let keepIt = fn() ! { // may be kept
+			try first.wait()
+		}
+		_ = keepIt
+		let later = fn() { // may be kept
+			a.spawn(work)
+		}
+		_ = later
+		detach {
+			first.cancel()
+		}
+		let w dyn Waiter = first
+		_ = w
+		let same = identity(first) // a type argument
+		_ = same
+		scope b {
+			let inner = b.spawn(work)
+			a.spawn(fn() ! { // a child of a, which outlives b
+				try inner.wait()
+			})
+			helper(a, inner) // helper may spawn on a a child that keeps inner
+			mut alsoFirst = first
+			alsoFirst = inner // fine: declared in b
+			_ = alsoFirst
+			defer inner.cancel() // runs when run returns
+		}
+	}
+	say.Line("done")
+}
+
+fn main() {
+	run() catch err {
+		say.Line(err)
+	}
+}

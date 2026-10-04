@@ -38,6 +38,7 @@ const S_WORDS = 26;    // multi-word local slot allocation size (default 1)
 const S_CAPBITS = 27;  // region bits frame-local closures stored into this captured local (region pass)
 const S_CELL_OF = 28;  // a $cell_ local: the variable whose cell it holds
 const S_KEPT_CAP = 29; // captured by a closure that may be kept (its cell's contents are unknown)
+const S_SCOPE_AT = 30; // how many scope blocks enclose its declaration (#232): task handles stay inside theirs
 
 const MAX_PARAMS = 8;
 
@@ -65,7 +66,7 @@ var dyn_tables;   // [concrete type, dyn type, keep function, methods, data slot
 var ck_escaping_cells; // variable names that must be allocated in heap cells
 
 fn sym_new(kind, name, pos) {
-    let s = calloc(30, 8);
+    let s = calloc(31, 8);
     s[S_KIND] = kind;
     s[S_NAME] = name;
     s[S_POS] = pos;
@@ -403,6 +404,9 @@ fn resolve_fields(st, tx) {
         let rec = vec_new();
         vec_push(rec, vec_get(f, 0));
         vec_push(rec, resolve_type(vec_get(f, 1)));
+        if vec_get(f, 1)[N_KIND] >= TX_NAME {
+            sb_forbid(vec_get(f, 1)[N_POS], vec_get(rec, 1), "a struct or enum field cannot hold ");
+        }
         // Slot 2 is the offset (layout_struct); [N]T fields start with N zero elements.
         vec_push(rec, 0);
         vec_push(rec, array_len(vec_get(f, 1)));
@@ -632,6 +636,12 @@ fn declare_fn(f) {
         i = i + 1;
     }
     let rtypes = resolve_types(f[F_RTYPES]);
+    let sbi = 0;
+    while !f[F_GENOF] && sbi < rtypes[VEC_LEN] {
+        // (A generic's instance: its type arguments were checked where it was used.)
+        sb_forbid(f[F_POS], vec_get(rtypes, sbi), "a function cannot return ");
+        sbi = sbi + 1;
+    }
     if !ck_legacy && !f[F_EXTERN] && f[F_BANG] {
         let ri = 0;
         while ri < rtypes[VEC_LEN] {
@@ -975,6 +985,9 @@ fn check_var(v) {
     if s[S_INDEX] != vec_index(prog_vars, v) {
         return;
     }
+    if v[D_TYPE] {
+        sb_forbid(v[D_POS], s[S_TYPE], "a global cannot hold ");
+    }
     let init = v[D_INIT];
     if !init && s[S_TLS] && array_len(v[D_TYPE]) > 0 {
         init = array_make(v[D_POS], s[S_TYPE], array_len(v[D_TYPE]));
@@ -1012,6 +1025,7 @@ fn check_var(v) {
     ck_sentinel = 0;
     if !s[S_TYPE] {
         s[S_TYPE] = default_type(t);
+        sb_forbid(v[D_POS], s[S_TYPE], "a global cannot hold ");
     }
     if !ck_legacy {
         check_assignable(init, t, s[S_TYPE]);
@@ -1771,6 +1785,12 @@ fn check_fn_closure(f) {
     let saved_safe = safe_pairs;
     let saved_len_aliases = len_aliases;
     let saved_cells = ck_escaping_cells;
+    let saved_depth = ck_scope_depth;
+    let saved_base = ck_fn_base;
+    // A closure's own variables (and its parameters, which a caller may fill with handles of
+    // scopes the closure never sees) count as deeper than anything it captures (#232).
+    ck_scope_depth = ck_scope_depth + 65536;
+    ck_fn_base = ck_scope_depth;
 
     check_fn(f);
 
@@ -1787,10 +1807,16 @@ fn check_fn_closure(f) {
     safe_pairs = saved_safe;
     len_aliases = saved_len_aliases;
     ck_escaping_cells = saved_cells;
+    ck_scope_depth = saved_depth;
+    ck_fn_base = saved_base;
 }
 
 fn check_fn(f) {
     set_file(f[F_FILE]);
+    if !f[F_PARENT] {
+        ck_scope_depth = 0;
+        ck_fn_base = 0;
+    }
     ck_tbind = f[F_TBIND];
     ck_fn = f;
     ck_legacy = f[F_LEGACY];
@@ -1800,7 +1826,7 @@ fn check_fn(f) {
     len_aliases = vec_new();
     if f[F_BODY] {
         if !ck_legacy {
-            mark_spawns(f[F_BODY][BLK_STMTS], vec_new());
+            mark_spawns(f[F_BODY][BLK_STMTS], sb_scope_params(f));
         }
         scan_captures(f, ck_escaping_cells);
     }
@@ -1987,6 +2013,7 @@ fn declare_scoped(s) {
 fn declare_local(pos, name, t) {
     let s = sym_new(SYM_LOCAL, name, pos);
     s[S_TYPE] = t;
+    s[S_SCOPE_AT] = ck_scope_depth;
     declare_scoped(s);
     s[S_SLOT] = ck_fn[F_SLOTS];
     ck_fn[F_SLOTS] = ck_fn[F_SLOTS] + 1;
@@ -2103,6 +2130,7 @@ fn capture_sym(f, os) {
         cs[S_CAPTURED] = 1;
         cs[S_CAP_IDX] = ci;
         cs[S_READS] = 1;
+        cs[S_SCOPE_AT] = os[S_SCOPE_AT];
         vec_push(sc_syms, cs);
         return cs;
     }
@@ -2111,6 +2139,7 @@ fn capture_sym(f, os) {
     cs[S_CAPTURED] = 1;
     cs[S_CAP_IDX] = ci;
     cs[S_READS] = 1;
+    cs[S_SCOPE_AT] = os[S_SCOPE_AT];
     return cs;
 }
 
@@ -2659,14 +2688,23 @@ fn lower_scope(s) {
     tr[TRY_X] = close;
     vec_push(b[BLK_STMTS], expr_stmt(tr));
     replace_node(s, b);
+    ck_scope_depth = ck_scope_depth + 1;
     check_scoped(s);
+    ck_scope_depth = ck_scope_depth - 1;
 }
 
 // detach { body } is rt_detach(keep(fn() ! { body })): a task in the core's background
 // boundary, outliving the request, so everything it captures is copied to the long-lived heap.
+// It cannot capture a task handle or a scope (sb_captures).
+var ck_detached; // the closures detach blocks became
+
 fn lower_detach(s) {
     let pos = s[N_POS];
     let f = fn_new(pos, "func");
+    if !ck_detached {
+        ck_detached = vec_new();
+    }
+    vec_push(ck_detached, f);
     let ft = node_new(TX_NAME, pos);
     ft[TX_B] = "fault";
     vec_push(f[F_RTYPES], ft);
@@ -2744,8 +2782,9 @@ fn mark_spawn_call(e, names) {
     let args = e[CALL_ARGS];
     if args[VEC_LEN] == 1 && vec_get(args, 0)[N_KIND] == EX_FUNCLIT {
         // Its cells are made per spawn (pool memory, like any kept closure), but the scope
-        // ends before the request does, so request memory may be stored in them.
-        vec_get(args, 0)[LIT_SCOPED] = 1;
+        // ends before the request does, so request memory may be stored in them. The mark is
+        // the scope's name: the child may use task handles of that scope or an outer one.
+        vec_get(args, 0)[LIT_SCOPED] = x[SEL_X][ID_NAME];
     }
 }
 
@@ -3024,6 +3063,473 @@ fn is_stmt_kind(k) {
     return k == ST_RETURN || k == ST_FAIL || k == ST_BREAK || k == ST_CONTINUE || k == ST_EXPR;
 }
 
+// ---- task handles stay in their scope (#232) ----
+//
+// A scope frees its children's records when it ends, so neither a task handle (spawned) nor
+// the scope itself may be reachable after the scope block. They are second-class values: they
+// live in local variables and parameters (and local slices, maps and optionals of them), never
+// in a global, a struct field, a result, a type argument or a dyn value. Every local remembers
+// how many scope blocks enclose its declaration (S_SCOPE_AT); a value is as deep as the deepest
+// such variable it reads, and may only be stored where it lives no longer: by an assignment,
+// through an argument for a mut parameter or a scope parameter (the callee may spawn children
+// that capture the other arguments), and by append and copy. A closure that may outlive the
+// scope (a kept or detached one) cannot capture one, a child spawned on scope s only those of s
+// or of a scope around it, and a deferred call none from a scope that ends before it runs.
+
+var ck_scope_depth; // scope blocks around the code being checked (a closure starts 65536 deeper)
+var ck_fn_base;     // ck_scope_depth where the current function's body starts
+var sb_types;       // [scope, spawned]: the runtime's types, once looked up
+
+// sb_type reports whether a value of type t is, or holds, a task handle or a scope.
+fn sb_type(t) {
+    if !t {
+        return 0;
+    }
+    let k = kind_of(t);
+    if k == K_OPT || k == K_SLICE {
+        return sb_type(t[TY_ELEM]);
+    }
+    if k == K_MAP {
+        return sb_type(t[TY_KEY]) || sb_type(t[TY_ELEM]);
+    }
+    if k != K_STRUCT {
+        return 0;
+    }
+    if !sb_types {
+        let sc = find_type("scope");
+        let sp = find_type("spawned");
+        if !sc || !sp {
+            return 0;
+        }
+        sb_types = vec_new();
+        vec_push(sb_types, sc);
+        vec_push(sb_types, sp);
+    }
+    return t == vec_get(sb_types, 0) || t == vec_get(sb_types, 1);
+}
+
+// sb_noun names what an sb_type holds, for diagnostics.
+fn sb_noun(t) {
+    let k = kind_of(t);
+    if k == K_OPT || k == K_SLICE {
+        return sb_noun(t[TY_ELEM]);
+    }
+    if k == K_MAP {
+        if sb_type(t[TY_KEY]) {
+            return sb_noun(t[TY_KEY]);
+        }
+        return sb_noun(t[TY_ELEM]);
+    }
+    if sb_types && t == vec_get(sb_types, 0) {
+        return "a scope";
+    }
+    return "a task handle";
+}
+
+// sb_forbid reports a task handle or scope of type t kept where it could outlive its scope.
+fn sb_forbid(pos, t, what) {
+    if ck_legacy || ck_trusted || !sb_type(t) {
+        return;
+    }
+    let e = err_begin(pos);
+    buf_str(e, what);
+    buf_str(e, sb_noun(t));
+    buf_str(e, " (");
+    type_name(e, t);
+    buf_str(e, "): it must not outlive its scope block, so it lives only in local variables and parameters");
+    err_end(e);
+}
+
+// sb_targs rejects task handles and scopes as type arguments (a generic could keep them).
+fn sb_targs(pos, targs) {
+    let i = 0;
+    while targs && i < targs[VEC_LEN] {
+        sb_forbid(pos, vec_get(targs, i), "a type argument cannot be ");
+        i = i + 1;
+    }
+}
+
+// sb_scope_params names f's scope parameters: a closure spawned on one is the scope's child.
+fn sb_scope_params(f) {
+    let names = vec_new();
+    let i = 0;
+    while i < f[F_PARAMS][VEC_LEN] && i < sb_len(f[F_PTYPES]) {
+        let t = vec_get(f[F_PTYPES], i);
+        if t && t[TY_KIND] < TX_NAME && sb_type(t) && t == vec_get(sb_types, 0) {
+            vec_push(names, vec_get(f[F_PARAMS], i));
+        }
+        i = i + 1;
+    }
+    return names;
+}
+
+// sb_lookup finds the variable a name means here without capturing it (lookup_name would).
+fn sb_lookup(name) {
+    let i = sc_syms[VEC_LEN] - 1;
+    while i >= 0 {
+        let s = vec_get(sc_syms, i);
+        if streq(s[S_NAME], name) {
+            return s;
+        }
+        i = i - 1;
+    }
+    let f = ck_fn;
+    while f && f[F_PARENT] {
+        let syms = f[F_OUTER_SYMS];
+        let j = sb_len(syms) - 1;
+        while j >= 0 {
+            let os = vec_get(syms, j);
+            if streq(os[S_NAME], name) {
+                return os;
+            }
+            j = j - 1;
+        }
+        f = f[F_PARENT];
+    }
+    return 0;
+}
+
+// sb_sym_depth is how deep the handles variable s holds may be: its declaration's depth.
+fn sb_sym_depth(s) {
+    if s && s[S_KIND] == SYM_LOCAL && sb_type(s[S_TYPE]) {
+        return s[S_SCOPE_AT];
+    }
+    return 0;
+}
+
+fn sb_max(a, b) {
+    if a > b {
+        return a;
+    }
+    return b;
+}
+
+fn sb_list_depth(v) {
+    let d = 0;
+    let i = 0;
+    while v && i < v[VEC_LEN] {
+        d = sb_max(d, sb_depth(vec_get(v, i)));
+        i = i + 1;
+    }
+    return d;
+}
+
+fn sb_len(v) {
+    if !v {
+        return 0;
+    }
+    return v[VEC_LEN];
+}
+
+fn sb_block_depth(b) {
+    let d = 0;
+    let i = 0;
+    while b && i < b[BLK_STMTS][VEC_LEN] {
+        d = sb_max(d, sb_stmt_depth(vec_get(b[BLK_STMTS], i)));
+        i = i + 1;
+    }
+    return d;
+}
+
+fn sb_stmt_depth(st) {
+    if !st {
+        return 0;
+    }
+    let k = st[N_KIND];
+    if k == ST_EXPR || k == ST_BSTORE {
+        return sb_depth(st[ES_X]);
+    }
+    if k == ST_LET {
+        return sb_depth(st[LET_INIT]);
+    }
+    if k == ST_ASSIGN {
+        return sb_depth(st[AS_VALUE]);
+    }
+    if k == ST_RETURN {
+        return sb_depth(st[RET_VALUE]);
+    }
+    if k == ST_IF {
+        return sb_max(sb_depth(st[IF_COND]), sb_max(sb_block_depth(st[IF_THEN]), sb_stmt_depth(st[IF_ELSE])));
+    }
+    if k == ST_BLOCK {
+        return sb_block_depth(st);
+    }
+    if k == ST_FAIL || k == ST_BREAK || k == ST_CONTINUE {
+        return 0;
+    }
+    return ck_scope_depth;
+}
+
+// sb_depth is the depth of the deepest task handle or scope expression e may give (0: none). It
+// takes unchecked and checked nodes; one it does not know is as deep as the code around it.
+fn sb_depth(e) {
+    if !e {
+        return 0;
+    }
+    let k = e[N_KIND];
+    if k == EX_INT || k == EX_FLOAT || k == EX_STR || k == EX_NIL || k == EX_INTERP || k == EX_UNIT || k == EX_TYPE || k == EX_FUNCLIT || k == EX_FUNCREF {
+        return 0;
+    }
+    if k == EX_IDENT {
+        if e[ID_REF] {
+            return sb_sym_depth(e[ID_REF]);
+        }
+        return sb_sym_depth(sb_lookup(e[ID_NAME]));
+    }
+    if k == ST_BLOCK {
+        return sb_block_depth(e);
+    }
+    if k == EX_SELECT {
+        return sb_depth(e[SEL_X]);
+    }
+    if k == EX_UNARY {
+        return sb_depth(e[UN_X]);
+    }
+    if k == EX_MUTARG {
+        return sb_depth(e[MUTARG_X]);
+    }
+    if k == EX_TRY {
+        return sb_depth(e[TRY_X]);
+    }
+    if k == EX_WRAP {
+        return sb_depth(e[WRAP_X]);
+    }
+    if k == EX_CONV {
+        return sb_depth(e[CV_X]);
+    }
+    if k == EX_BINARY {
+        return sb_max(sb_depth(e[BIN_L]), sb_depth(e[BIN_R]));
+    }
+    if k == EX_INDEX {
+        return sb_max(sb_depth(e[IX_X]), sb_depth(e[IX_I]));
+    }
+    if k == EX_SLICE {
+        return sb_max(sb_depth(e[SL_X]), sb_max(sb_depth(e[SL_LO]), sb_depth(e[SL_HI])));
+    }
+    if k == EX_COALESCE {
+        return sb_max(sb_depth(e[COAL_X]), sb_depth(e[COAL_FALLBACK]));
+    }
+    if k == EX_CATCH {
+        return sb_max(sb_depth(e[CATCH_X]), sb_block_depth(e[CATCH_BODY]));
+    }
+    if k == EX_BOUNDARY {
+        return sb_max(sb_list_depth(e[BOUND_ARGS]), sb_block_depth(e[BOUND_BODY]));
+    }
+    if k == EX_CALL {
+        return sb_max(sb_depth(e[CALL_CALLEE]), sb_list_depth(e[CALL_ARGS]));
+    }
+    if k == EX_COMPOSITE {
+        return sb_max(sb_list_depth(e[CL_ELEMS]), sb_list_depth(e[CL_KEYS]));
+    }
+    if k == EX_MEM && !e[MEM_INDEX] && e[MEM_OFF] == 0 && e[MEM_BASE][N_KIND] == EX_IDENT && e[MEM_BASE][ID_REF] && e[MEM_BASE][ID_REF][S_CELL_OF] {
+        // A variable kept in a cell.
+        return sb_sym_depth(e[MEM_BASE][ID_REF][S_CELL_OF]);
+    }
+    if k == EX_MEM && !e[MEM_INDEX] && e[MEM_OFF] == 0 && sb_env_index(e[MEM_BASE]) >= 0 {
+        // A captured variable, read through the closure's environment.
+        return sb_sym_depth(vec_get(ck_fn[F_CAPTURES], sb_env_index(e[MEM_BASE])));
+    }
+    return ck_scope_depth;
+}
+
+// sb_env_index is i when e reads the cell address of the current closure's capture i, or -1.
+fn sb_env_index(e) {
+    if !ck_fn || !ck_fn[F_ENV_SYM] || e[N_KIND] != EX_MEM || e[MEM_INDEX] || e[MEM_OFF] < 16 {
+        return -1;
+    }
+    let b = e[MEM_BASE];
+    if b[N_KIND] != EX_IDENT || b[ID_REF] != ck_fn[F_ENV_SYM] || e[MEM_OFF] / 8 - 2 >= sb_len(ck_fn[F_CAPTURES]) {
+        return -1;
+    }
+    return e[MEM_OFF] / 8 - 2;
+}
+
+// sb_root is the variable a target or argument stores into (x, x[i], x.f), or 0.
+fn sb_root(e) {
+    let k = e[N_KIND];
+    if k == EX_IDENT {
+        if e[ID_REF] {
+            return e[ID_REF];
+        }
+        return sb_lookup(e[ID_NAME]);
+    }
+    if k == EX_INDEX {
+        return sb_root(e[IX_X]);
+    }
+    if k == EX_SELECT {
+        return sb_root(e[SEL_X]);
+    }
+    if k == EX_MUTARG {
+        return sb_root(e[MUTARG_X]);
+    }
+    return 0;
+}
+
+// sb_store reports storing a value as deep as d into variable s, when s outlives the value.
+fn sb_store(pos, s, d) {
+    if !s || s[S_KIND] != SYM_LOCAL || !sb_type(s[S_TYPE]) || d <= s[S_SCOPE_AT] {
+        return;
+    }
+    let e = err_begin(pos);
+    buf_str(e, sb_noun(s[S_TYPE]));
+    buf_str(e, " cannot outlive its scope: '");
+    buf_str(e, s[S_NAME]);
+    buf_str(e, "' is declared outside the scope this value belongs to, which ends first; declare it inside that scope");
+    err_end(e);
+}
+
+// sb_assign checks target = value (before either is checked).
+fn sb_assign(pos, target, v) {
+    if ck_legacy || ck_trusted || !v || v[N_TYPE] {
+        // Checked values are the checker's own temporaries, checked where they were made.
+        return;
+    }
+    let root = sb_root(target);
+    if !root || !sb_type(root[S_TYPE]) {
+        return;
+    }
+    if v[N_KIND] == EX_CALL && v[CALL_NAME] && streq(v[CALL_NAME], "append") && sb_len(v[CALL_ARGS]) > 0 && sb_root(vec_get(v[CALL_ARGS], 0)) == root {
+        // xs = append(xs, ...): the call's own check covers what goes into xs.
+        return;
+    }
+    sb_store(pos, root, sb_depth(v));
+}
+
+// sb_holder is the variable argument a of a call keeps the other arguments in (i: its place,
+// counting a method's receiver as 0 when it has one), or 0.
+fn sb_holder(e, a, i) {
+    if a[N_KIND] == EX_MUTARG {
+        let r = sb_root(a);
+        if r && sb_type(r[S_TYPE]) {
+            return r;
+        }
+        return 0;
+    }
+    let r = sb_root(a);
+    if !r || r[S_KIND] != SYM_LOCAL || !sb_type(r[S_TYPE]) {
+        return 0;
+    }
+    if sb_types && r[S_TYPE] == vec_get(sb_types, 0) && a[N_KIND] == EX_IDENT {
+        return r;
+    }
+    if i == 0 && e[CALL_NAME] && (streq(e[CALL_NAME], "append") || streq(e[CALL_NAME], "copy")) {
+        return r;
+    }
+    return 0;
+}
+
+// sb_call checks a call before it is checked: no argument may hand a holder (sb_holder) a
+// task handle or scope that ends before the holder does.
+fn sb_call(e) {
+    if ck_legacy || ck_trusted {
+        return;
+    }
+    let xs = vec_new();
+    let x = e[CALL_CALLEE];
+    if x && x[N_KIND] == EX_SELECT {
+        vec_push(xs, x[SEL_X]);
+    }
+    let args = e[CALL_ARGS];
+    let i = 0;
+    while args && i < args[VEC_LEN] {
+        vec_push(xs, vec_get(args, i));
+        i = i + 1;
+    }
+    if xs[VEC_LEN] < 2 {
+        return;
+    }
+    let off = xs[VEC_LEN] - sb_len(args);
+    i = 0;
+    while i < xs[VEC_LEN] {
+        let h = sb_holder(e, vec_get(xs, i), i - off);
+        let j = 0;
+        while h && j < xs[VEC_LEN] {
+            let a = vec_get(xs, j);
+            if j != i && sb_depth(a) > h[S_SCOPE_AT] {
+                let m = err_begin(a[N_POS]);
+                buf_str(m, "a task handle cannot outlive its scope: this argument belongs to a scope that ends before '");
+                buf_str(m, h[S_NAME]);
+                buf_str(m, "', which the call may keep it in");
+                err_end(m);
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// sb_captures checks what closure f (made by literal e) captures: one that may outlive the
+// scope (kept or detached) no task handle or scope at all, and a child spawned on scope s only
+// those of s or of a scope around it.
+fn sb_captures(e, f) {
+    if ck_legacy || ck_trusted {
+        return;
+    }
+    let limit = -1;
+    if e[LIT_SCOPED] {
+        limit = 0;
+        let ss = sb_lookup(e[LIT_SCOPED]);
+        if ss {
+            limit = ss[S_SCOPE_AT];
+        }
+    } else if !f[F_ESCAPES] {
+        // Called only while its maker runs: it may use everything its maker sees.
+        return;
+    }
+    let caps = f[F_CAPTURES];
+    let i = 0;
+    while i < sb_len(caps) {
+        let os = vec_get(caps, i);
+        if os && sb_type(os[S_TYPE]) && (limit < 0 || os[S_SCOPE_AT] > limit) {
+            let m = err_begin(e[N_POS]);
+            if limit >= 0 {
+                buf_str(m, "a child of scope '");
+                buf_str(m, e[LIT_SCOPED]);
+                buf_str(m, "' cannot capture '");
+                buf_str(m, os[S_NAME]);
+                buf_str(m, "', ");
+                buf_str(m, sb_noun(os[S_TYPE]));
+                buf_str(m, " of a scope inside it: the child may outlive that scope");
+            } else if ck_detached && vec_has(ck_detached, f) {
+                buf_str(m, "detach cannot capture '");
+                buf_str(m, os[S_NAME]);
+                buf_str(m, "', ");
+                buf_str(m, sb_noun(os[S_TYPE]));
+                buf_str(m, ": a detached task outlives every scope");
+            } else {
+                buf_str(m, "a closure that may be kept cannot capture '");
+                buf_str(m, os[S_NAME]);
+                buf_str(m, "', ");
+                buf_str(m, sb_noun(os[S_TYPE]));
+                buf_str(m, ", which must not outlive its scope block: use it in a child spawned on the scope, or in a closure only passed to a call that runs it");
+            }
+            err_end(m);
+        }
+        i = i + 1;
+    }
+}
+
+// sb_defer checks a deferred call (already checked): it runs when the function returns, after
+// every scope inside the function has ended.
+fn sb_defer(pos, call) {
+    if ck_legacy || ck_trusted || ck_scope_depth == ck_fn_base {
+        return;
+    }
+    let d = sb_depth(call[CALL_CALLEE]);
+    let args = call[CALL_ARGS];
+    let i = 0;
+    while args && i < args[VEC_LEN] {
+        let a = vec_get(args, i);
+        if sb_type(a[N_TYPE]) {
+            d = sb_max(d, sb_depth(a));
+        }
+        i = i + 1;
+    }
+    if d > ck_fn_base {
+        err_at(pos, "defer runs when the function returns, after the scope of the task handle it uses has ended: make the call inside the scope instead");
+    }
+}
+
 // ---- defer ----
 //
 // defer f(a, b) evaluates f, a and b now and sets a flag; every return (including the
@@ -3057,6 +3563,7 @@ fn lower_defer(s) {
         err_at(pos, "defer needs a plain function call (wrap anything else in a function)");
         return;
     }
+    sb_defer(pos, call);
     let b = empty_block(pos);
     b[BLK_FLAT] = 1;
     if call[CALL_CALLEE] {
@@ -3417,6 +3924,7 @@ fn check_target(t) {
 fn check_assign(s) {
     let target = s[AS_TARGET];
     let v = s[AS_VALUE];
+    sb_assign(s[N_POS], target, v);
     if (v[N_KIND] == EX_TRY || v[N_KIND] == EX_CATCH || v[N_KIND] == EX_WRAP) && !ck_legacy {
         lower_try_stmt(s, v, 2, 0);
         return;
@@ -3473,6 +3981,9 @@ fn check_assign(s) {
 }
 
 fn check_assignable(e, from, to) {
+    if kind_of(to) == K_DYN || (kind_of(to) == K_OPT && kind_of(to[TY_ELEM]) == K_DYN) {
+        sb_forbid(e[N_POS], from, "a dyn value cannot hold ");
+    }
     // Concrete objects convert to dyn S implicitly where they satisfy the shape. A dyn
     // value keeps its exact shape; optionality can be added, but never removed.
     if is_dyn_value(to) && is_dyn_value(from) {
@@ -3544,6 +4055,14 @@ fn check_multi(s) {
     let stmts = out[BLK_STMTS];
     let n = targets[VEC_LEN];
     let temps = vec_new();
+    if !define && values[VEC_LEN] == n {
+        // The pairs go through temporaries: check each value against its target here.
+        let si = 0;
+        while si < n {
+            sb_assign(pos, vec_get(targets, si), vec_get(values, si));
+            si = si + 1;
+        }
+    }
     if values[VEC_LEN] == 1 && n > 1 {
         let v = vec_get(values, 0);
         if (v[N_KIND] == EX_TRY || v[N_KIND] == EX_CATCH || v[N_KIND] == EX_WRAP) && !ck_legacy {

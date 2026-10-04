@@ -71,7 +71,7 @@ if ! cmp -s tests/edition1/boundary_fault_bad.err "$tmp/boundary_fault_bad.err";
 fi
 
 # Structured concurrency (#232): scopes, spawn, wait, cancel, first-fault cancellation.
-for name in scopes lanes selects guards
+for name in scopes lanes selects guards handles
 do
 	"$compiler" -edition 1 -o "$tmp/$name" "tests/edition1/run/$name.tin"
 	"$tmp/$name" >"$tmp/$name.out" 2>/dev/null
@@ -111,6 +111,20 @@ do
 	fi
 	if "$compiler" -edition 1 -audit-secrets "tests/edition1/$name.tin" >/dev/null 2>&1; then
 		echo "FAIL edition1/$name: audit accepted a rejected program"
+		exit 1
+	fi
+done
+
+# A task handle cannot outlive its scope (#232): each escape is a compile error.
+for name in scope_escape_bad
+do
+	if "$compiler" -edition 1 -o "$tmp/$name" "tests/edition1/$name.tin" >"$tmp/$name.out" 2>"$tmp/$name.err"; then
+		echo "FAIL edition1/$name: unexpectedly accepted"
+		exit 1
+	fi
+	if ! cmp -s "tests/edition1/$name.err" "$tmp/$name.err"; then
+		echo "FAIL edition1/$name: diagnostic mismatch"
+		diff -u "tests/edition1/$name.err" "$tmp/$name.err" || true
 		exit 1
 	fi
 done
