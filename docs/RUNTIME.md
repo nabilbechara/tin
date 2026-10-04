@@ -150,7 +150,11 @@ Each core has a box in a process-wide array of 256 boxes. A box is:
 
 `Send(core, msg)` copies the message into a malloc'd node, links it, and writes one byte
 to the wake pipe only if the receiver set its waiting flag. `Recv()` pops, or sets the
-flag, re-checks (no lost wake-ups), then blocks in `poll` on the pipe. Event loops
+flag, re-checks (no lost wake-ups), then blocks in `poll` on the pipe: it stops the whole
+core and ignores deadlines and cancels. `Next()` does the same through
+`rt_task_wait(pipe, 1, 0)`, so inside a task the core serves others meanwhile, and a deadline
+(`within`, the request's) or a cancel fails it with `rt_wait_fault()` (#316); one task per core
+watches the pipe and the others look again every millisecond. Event loops
 register `relay.WakeFD()`, call `relay.Arm()` before sleeping and `relay.Drain(h)` when it
 fires. Messages are copied into the receiver's request pool.
 
@@ -339,6 +343,14 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   the deferred calls it registered, ends that tick or that message's handler, and the core goes
   on (the remaining messages are handled at once). A panic in `main` outside a `guard`, or a
   stack overflow, still ends the process.
+- `guard { ... }` (#230, edition 1) is a boundary that turns a panic inside it into a fault:
+  the panic's message goes to stderr with its backtrace, the deferred calls and the
+  resource-cleanup callbacks registered inside the guard run, and the guard's value is a
+  `fault.Panic` fault (`panic: <message>`) whose `fault.Backtrace(err)` is that backtrace, one
+  function per line (#142). Cleanups registered before the guard wait for their task's end.
+  `guard f(x)` (or `guard try f(x)`) is the same guard around one call (#142). A spawned
+  child's panic is its scope's fault in the same form. The guard does not yet discard the
+  memory the guarded code allocated: that waits for sub-regions (#236).
 - A connection closed while its request waits is marked dead and freed when the task ends.
 - Finished tasks free overflow pool chunks and big blocks. Each core caches at most
   64 task records; excess records release their base pool and unmap their stacks.
@@ -370,6 +382,11 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   reuse its task safely. A late completion calls `drop(job)` and never resumes the old
   task. Already-running system calls can still finish after the caller's deadline;
   their results are discarded. Outside a task the helper runs synchronously.
+- Standard input and streams (#316): inside a task, when the descriptor is a pipe, socket or
+  terminal, `quarry.ReadStdin` and `flume.Reader` wait with `rt_task_wait(fd, 1, 0)` before
+  each read and fail with `rt_wait_fault()`; a flume reader's wait fault is cleared by its next
+  read. Regular files, other devices and code outside a task read directly, as before.
+  `relay.Next` is the receive that waits the same way (§5).
 - Boundaries (Tin 1, notes/interface_boundaries.md): each request task has a root boundary
   record under its core's root, holding its deadline and cancel state; block boundaries nest
   under it. `rt_bnd_cancel(b, reason)` cancels `b` and everything inside it (never its parent
@@ -398,7 +415,11 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   memory in what it captures. The scope's end waits for every child; the first child fault
   cancels the scope, and so its other children, and is the scope's fault (`try` passes it
   on). `t := s.spawn(f)` gives a handle with `t.wait() !` and `t.cancel()`; a child cancelled
-  through its handle does not fail the scope. A child with a value (`s.spawn(fn() !T { ... })`)
+  through its handle does not fail the scope. `s.cancel(reason)` (#143) cancels the scope by
+  hand: every wait inside it, its children's and its body's, fails with `canceled: reason`
+  (`fault.Is(err, fault.Canceled)`), and that is the scope's fault unless a child failed first.
+  `s.yield()` lets the core's other ready tasks run before the caller goes on (in `main`, one
+  of them). A child with a value (`s.spawn(fn() !T { ... })`)
   gives a `spawnedOf[T]` whose `t.wait() !T` is its value or its fault (waiting again gives the
   same value), usable in `select` like any handle. Leaving a scope body early, by `return` or
   a `try`'s fault, cancels and joins the children still running, then leaves the scope. In a server the event loop resumes children;
@@ -655,8 +676,29 @@ functions keep that rule, and grows as phase 1 lands.
 | `Hmac`, `HmacSha256` | the key and message bytes | their lengths |
 | `HkdfExtract`, `HkdfExpand`, `HkdfExpandLabel` | the key material | lengths, `info`, labels |
 | `ConstantTimeEq`, `Equal` | the bytes | the lengths |
+| `X25519`, `X25519PublicKey` | the scalar and the point (ladder with masked swaps; ten-limb field) | the final all-zero check, whose result is public |
+| `ChaCha20`, `AEAD.Seal` and `AEAD.Open` for ChaCha20-Poly1305 | the key, the data and the tag (the tag is compared with `ConstantTimeEq`) | the lengths |
+| `NewAESGCM`, `AEAD.Seal` and `AEAD.Open` for AES-GCM (software path: bitsliced AES with the S-box as GF(2^8) inversion, GHASH by multiplication with holes) | the key, the data and the tag | the lengths |
+| `P256PublicKey`, `P256ECDH` and the field and point code under them (`field.tin`, `p256.tin`) | the private key and every coordinate | the validity checks of the key and the peer's point, whose results are public |
+
+| `monty_new` (`bignum.tin`: Montgomery constants for a modulus given at run time) | the modulus's value | its limb count and bit length |
 
 `Sha1`, `Pbkdf2Sha256`, the hex and base64 codecs and the RSA-OAEP code are not
 constant-time and must not be used on secrets in a timing-sensitive protocol path.
+
+Signature verification and certificates (#124 phase 2) see only public data and are not
+constant-time by design: `VerifyPKCS1v15`, `VerifyPSS`, `ParseCertificate`, `DecodePEM`,
+`Certificate.Verify`, `CheckSignature`, `CheckTLSSignature` and `VerifyHostname`.
+Certificate policy: a chain is built from the leaf through `VerifyOptions.Intermediates` to
+`Roots` (default: the system bundle, read once per core from the paths in
+`roots_linux.tin`/`roots_darwin.tin` or `SSL_CERT_FILE`); every certificate must be within its
+validity period, intermediates must be CAs (basic constraints) allowed to sign certificates
+(key usage), path lengths, extended key usages and DNS/IP name constraints hold, signatures
+use SHA-256/384/512 (SHA-1 is refused) with RSA keys of 2048 to 8192 bits, no certificate
+has an unhandled critical extension, and the chain holds at most `MaxChain` (8) certificates.
+Host names follow RFC 6125: DNS SANs only (the common name is ignored), one leftmost `*`
+label over at least two more labels, IP literals against IP SANs. The parser is strict DER and
+rejects every certificate Go's `crypto/x509` rejects (`tools/ci/x509_check.py` checks this on
+byte-flipped certificates).
 Vectors: `tools/ci/crypto_check.py` runs the Wycheproof files in `tests/wycheproof/`
 (including the invalid inputs) and random inputs checked against Python's `hashlib`.

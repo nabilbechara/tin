@@ -1,0 +1,128 @@
+package main
+
+import "say"
+import "seal"
+import "quarry"
+import "twine"
+
+// Parsed fields of the checked-in test PKI, ParseIP, DecodePEM and host name matching;
+// bench/ref/seal_certinfo is the Go twin.
+
+var names = []str{"root", "inter", "leaf", "leaf-pss", "inter-pss", "leaf-ec-key", "leaf-ec-key-P-384",
+	"leaf-ec-key-P-521", "inter-pathlen0", "inter-permit", "inter-exclude", "leaf-client", "inter-not-ca",
+	"inter-no-bc", "inter-no-certsign", "leaf-critical", "leaf-cn-only", "leaf-sha1", "self-signed"}
+
+func join(xs []str) str {
+	if len(xs) == 0 {
+		return "-"
+	}
+	out := ""
+	for i, x := range xs {
+		if i > 0 {
+			out = out + ","
+		}
+		out = out + x
+	}
+	return out
+}
+
+func ips(xs [][]u8) str {
+	parts := []str{}
+	for _, x := range xs {
+		parts = append(parts, seal.Hex(x))
+	}
+	return join(parts)
+}
+
+func show(name str) ! {
+	text := try quarry.ReadFile("tests/data/x509/certs/" + name + ".pem")
+	certs := try seal.ParseCertificatesPEM(text)
+	c := certs[0]
+	bits := 0
+	if c.PublicKeyAlgorithm == seal.PublicKeyAlgorithm.RSA {
+		bits = seal.RSAKeyBits(c.RSAKey)
+	}
+	say.Line(name, "v", c.Version+1, "cn", say.Fmt("%q", c.Subject.CommonName), "o", join(c.Subject.Organization),
+		"issuer", say.Fmt("%q", c.Issuer.CommonName), "nb", c.NotBefore, "na", c.NotAfter)
+	say.Line(name, "alg", c.SignatureAlgorithm, "key", c.PublicKeyAlgorithm, "curve", c.Curve, "bits", bits,
+		"siglen", len(c.Signature), "serial", seal.Hex(c.SerialNumber))
+	say.Line(name, "bc", c.BasicConstraintsValid, "ca", c.IsCA, "pathlen", c.MaxPathLen, "ku", c.KeyUsage,
+		"eku", join(c.ExtKeyUsage), "critical", join(c.UnhandledCritical))
+	say.Line(name, "dns", join(c.DNSNames), "ip", ips(c.IPAddresses), "permit", join(c.PermittedDNSDomains),
+		"exclude", join(c.ExcludedDNSDomains), "skid", len(c.SubjectKeyId), "akid", len(c.AuthorityKeyId))
+}
+
+// tlsSigs checks the leaf's TLS 1.3 RSA-PSS signatures, and each with its message or signature changed.
+func tlsSigs() ! {
+	text := try quarry.ReadFile("tests/data/x509/certs/leaf.pem")
+	certs := try seal.ParseCertificatesPEM(text)
+	lines := try quarry.ReadFile("tests/data/x509/tls_sigs.txt")
+	for _, ln := range twine.Split(twine.TrimSpace(lines), "\n") {
+		f := twine.Fields(ln)
+		scheme := 0
+		for i := 0; i < len(f[0]); i++ {
+			scheme = scheme*10 + i64(f[0][i]-'0')
+		}
+		msg := try seal.HexDecode(f[1])
+		sig := try seal.HexDecode(f[2])
+		e1 := certs[0].CheckTLSSignature(scheme, msg, sig)
+		msg[len(msg)-1] ^= 1
+		e2 := certs[0].CheckTLSSignature(scheme, msg, sig)
+		msg[len(msg)-1] ^= 1
+		sig[0] ^= 1
+		e3 := certs[0].CheckTLSSignature(scheme, msg, sig)
+		say.Line("tls", scheme, e1 == nil, e2 == nil, e3 == nil)
+	}
+}
+
+func main() {
+	for _, n := range names {
+		show(n) catch err {
+			say.Line(n, "ERROR", err)
+		}
+	}
+	for _, s := range []str{"192.0.2.1", "0.0.0.0", "255.255.255.255", "256.1.1.1", "1.2.3", "1.2.3.4.5", "01.2.3.4",
+		"1.2.3.04", "1..2.3", "::", "::1", "2001:db8::1", "[2001:db8::1]", "2001:db8:0:0:0:0:0:1", "1:2:3:4:5:6:7:8",
+		"1:2:3:4:5:6:7:8:9", "1::2::3", ":1", "1:", "::ffff:1.2.3.4", "fe80::1%eth0", "12345::", "g::1", "", "example.com"} {
+		ip := seal.ParseIP(s)
+		if ip == nil {
+			say.Line("ip", say.Fmt("%q", s), "nil")
+		} else {
+			say.Line("ip", say.Fmt("%q", s), seal.Hex(ip))
+		}
+	}
+	pems := []str{
+		"-----BEGIN A-----\nAAEC\n-----END A-----\n",
+		"junk\n-----BEGIN A-----\r\nAA\r\nEC\r\n-----END A-----\r\nmore\n-----BEGIN B-----\n-----END B-----\n",
+		"-----BEGIN A-----\nAAEC\n",
+		"-----BEGIN A-----\nAAEC\n-----END B-----\n",
+		"-----BEGIN A-----\nA!EC\n-----END A-----\n",
+		"no blocks here",
+	}
+	for i, p := range pems {
+		blocks, err := seal.DecodePEM(p)
+		if err != nil {
+			say.Line("pem", i, "error")
+			continue
+		}
+		parts := []str{}
+		for _, b := range blocks {
+			parts = append(parts, b.Type+"="+seal.Hex(b.Bytes))
+		}
+		say.Line("pem", i, len(blocks), join(parts))
+	}
+	tlsSigs() catch err {
+		say.Line("tls ERROR", err)
+	}
+	cert := seal.Certificate{Issuer: seal.Name{}, Subject: seal.Name{}, SignatureAlgorithm: seal.SignatureAlgorithm.UnknownSignature,
+		PublicKeyAlgorithm: seal.PublicKeyAlgorithm.UnknownKey, RSAKey: seal.RSAPublicKey{N: []u8{}, E: []u8{}}}
+	patterns := []str{"example.com", "*.example.com", "EXAMPLE.org.", "*.com", "w*.example.com", "*.*.example.com", "*", "a.*.example.com", "xn--bcher-kva.example"}
+	hosts := []str{"example.com", "www.example.com", "a.b.example.com", ".example.com", "example.org", "Example.ORG", "foo.com", "www.example.com.", "wx.example.com", "xn--bcher-kva.example", "*.example.com"}
+	for _, p := range patterns {
+		cert.DNSNames = []str{p}
+		for _, h := range hosts {
+			err := cert.VerifyHostname(h)
+			say.Line("host", say.Fmt("%q", p), say.Fmt("%q", h), err == nil)
+		}
+	}
+}

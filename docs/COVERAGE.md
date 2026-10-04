@@ -15,8 +15,8 @@ The inventory is the 176 packages `go list std` reports for Go 1.26 (without `in
 | design | Go's shape needs something Tin deliberately lacks; the replacement is named or still to be designed |
 | n/a | specific to Go's toolchain or runtime, with no counterpart to build |
 
-**Standard library, 176 packages:** 2 done, 45 partial, 7 design, 98 missing, 24 n/a.
-**Of the 87 packages koussa imports:** 2 done, 41 partial, 6 design, 38 missing, 0 n/a.
+**Standard library, 176 packages:** 4 done, 44 partial, 7 design, 97 missing, 24 n/a.
+**Of the 87 packages koussa imports:** 4 done, 40 partial, 6 design, 37 missing, 0 n/a.
 
 ## The language
 
@@ -26,8 +26,8 @@ The inventory is the 176 packages `go list std` reports for Go 1.26 (without `in
 | `min`, `max` | two arguments of one type; Go takes any number | partial |
 | `clear` |  | missing |
 | `complex`, `real`, `imag`, complex types | no complex type | missing |
-| `close`, channels | no channels: routines and messages, to be designed (relay between cores exists) | design |
-| `recover` | none: a panic ends the program. Per-request fault isolation is to be designed | design |
+| `close`, channels | `lane[T]` (package `lane`): a bounded queue between tasks on a core with `Send` and `Recv` that park, `TrySend` and `Close`; `select` over lanes; `relay` between cores (#143, #232) | done |
+| `recover` | `guard { }` and `guard f(x)` turn a panic into a `fault.Panic` fault (message and backtrace) after running defers and cleanups; requests, spawned tasks, ticks and relay handlers are guarded implicitly, so a panicking handler is a logged 500. No `recover` anywhere else, by design (#142, #230) | done |
 | integer and float types, `bool`, `string` | `i8` to `i64`, `u8` to `u64`, `f32`, `f64`, `bool`, `str`; no implicit conversions | done |
 | arrays `[N]T` | `[N]T` is a slice that starts with N zeros; no value semantics | partial |
 | slices, three-index slices | slices are references; the full slice expression `s[a:b:c]` is not documented | partial |
@@ -43,16 +43,16 @@ The inventory is the 176 packages `go list std` reports for Go 1.26 (without `in
 | named results, bare `return` | not documented | missing |
 | multiple results, `err` as a value | `!T` results with `fail`, `try` and `catch`; ignoring a fault is a compile error | done |
 | `defer` | yes, outside loops | partial |
-| `goroutines`, `go`, `select`, `sync` | none: routines to be designed on top of the per-request tasks | design |
+| `goroutines`, `go`, `select`, `sync` | structured concurrency on the core: `scope s { s.spawn(f) }` (handles with `wait` and `cancel`, the first fault cancels the siblings, `s.cancel(reason)`, `s.yield()`), `parallel { }`, `select`, `detach { }` for work that outlives a request; no detached `go` and no mutex, by design (#143, #232) | done |
 | labels, `goto`, `fallthrough` | none | design |
 | `switch`, `for`, `range` over slices, strings, maps, integers | yes; `switch` has no fallthrough | done |
 | range over functions and iterators |  | missing |
 | `iota`, typed and untyped constants | yes | done |
 | `init` functions, package variables | package variables initialize in declaration order; `init` is not documented | partial |
 | packages and imports, `internal` | directories under `lib/`, imports by name, `./` for local packages; an `internal` rule is not documented | partial |
-| modules, `go.mod`, versioned dependencies | path imports from `vendor/`, `tin.mod`, `tin vendor` and `tin.lock` content hashes (PACKAGES.md); no version resolution or fetching by design | partial |
+| modules, `go.mod`, versioned dependencies | path imports from `vendor/`, `tin.mod`, `tin vendor`, `tin.lock` content hashes and per-package capabilities checked at compile time (PACKAGES.md); no version resolution by design, no fetching from URLs yet | partial |
 | build tags, `GOOS`/`GOARCH` files | files ending `_darwin`, `_linux`, `_linux_arm64`, `_linux_amd64` | partial |
-| `unsafe`, `cgo` | no `unsafe`; `extern` only inside the standard library | design |
+| `unsafe`, `cgo` | no `unsafe`; `extern` and raw memory only inside the standard library and vendored packages whose `tin.mod` declares `caps unsafe` | design |
 | `reflect` | none: compile-time derivation | design |
 | `//go:embed`, `//go:generate` | none | missing |
 | `testing`, benchmarks, fuzzing | `tin test` with `crucible`; no fuzzing | partial |
@@ -78,7 +78,7 @@ Ordered by import path, as `go list std` prints them.
 | `container/heap` | 2+0 | partial | cairn | IntHeap and IntMaxHeap; no heap over any element type (generics now allow one) |
 | `container/list` | 1+1 | missing | cairn (deque, queue) | no doubly linked list with stable element handles |
 | `container/ring` |  | missing |  |  |
-| `context` | 3044+681 | missing | design: ambient task deadline and cancellation | every request task already has a deadline; the cancel signal, values and the scoped form are unbuilt |
+| `context` | 3044+681 | done | `within`, task, policy, fault | ambient, never a parameter: `within d { }` for deadlines, `task.Deadline()` and `task.Canceled()`, cancellation by `s.cancel(reason)` and `t.cancel()` that wakes every wait in the runtime and the clients, `fault.Canceled` and `fault.DeadlineExceeded`, typed slots (`policy.NewSlot`, `with policy.Bind(slot, v) { }`) inherited by spawned tasks; no `Background()` (#144, #231, #233, #237) |
 | `crypto` |  | n/a |  | the Hash registry and interfaces; there are no interfaces |
 | `crypto/aes` | 4+0 | missing |  |  |
 | `crypto/cipher` | 2+0 | missing |  | GCM, CTR, CBC |
@@ -129,7 +129,7 @@ Ordered by import path, as `go list std` prints them.
 | `encoding/json` | 297+76 | partial | argo | Put and Get are generated per type, fast; no decoding into a dynamic value, no field tags, no Indent, no streaming Encoder or Decoder, no RawMessage beyond Raw |
 | `encoding/pem` | 1+1 | missing |  |  |
 | `encoding/xml` | 52+8 | missing |  |  |
-| `errors` | 393+152 | partial | fault, try, catch, say.Fault | no Is, As, Unwrap or Join: a fault is a message, with no wrapping chain |
+| `errors` | 393+152 | done | fault, try, catch, say.Fault | fault chains: sentinels with identity (`let ErrX = fault("...")`), `fault.Is`, `Wrap`, `Cause`, `Join`, `Message`, `try E wrap "msg"`, `switch`/`match` over faults (#142, #229). No `As`, by design: structured results are enums |
 | `expvar` |  | missing |  |  |
 | `flag` | 1+0 | partial | lever | Str, Int, Bool, F64, Parse, Usage; no FlagSet, no Duration, no custom Value |
 | `fmt` | 944+127 | partial | say | Line, Fmt, Str, Fault and string interpolation with format specs, by static type; no Sscanf, Fscan or Scan, and no Stringer or Formatter (formatting is derived) |
@@ -195,7 +195,7 @@ Ordered by import path, as `go list std` prints them.
 | `net/rpc/jsonrpc` |  | missing |  | low priority |
 | `net/smtp` |  | missing |  |  |
 | `net/textproto` |  | missing |  |  |
-| `net/url` | 103+20 | partial | link | Parse, ParseRequestURI, URL (String, EscapedPath, EscapedFragment, Hostname, Port, RequestURI, Redacted, ResolveReference, Parse, JoinPath), Userinfo, Values (Get, Set, Add, Del, Has, Encode), ParseQuery, Query/Path Escape and Unescape, JoinPath, with Go's fault messages; User is an optional, Values is a struct over a map (methods need a struct), URL.Clone replaces copying by assignment; no *url.Error type (a fault carries its message only, until fault chains, #142), no MarshalBinary, AppendBinary or UnmarshalBinary |
+| `net/url` | 103+20 | partial | link | Parse, ParseRequestURI, URL (String, EscapedPath, EscapedFragment, Hostname, Port, RequestURI, Redacted, ResolveReference, Parse, JoinPath), Userinfo, Values (Get, Set, Add, Del, Has, Encode), ParseQuery, Query/Path Escape and Unescape, JoinPath, with Go's fault messages; User is an optional, Values is a struct over a map (methods need a struct), URL.Clone replaces copying by assignment; no *url.Error type (a fault carries its message; `link` does not wrap its causes yet), no MarshalBinary, AppendBinary or UnmarshalBinary |
 | `os` | 24+60 | partial | quarry | Args, environment, ReadFile, WriteFile, AppendFile, Mkdir, Remove, Rename, ReadDir, Getwd, Exit, Hostname, Pid; files are opened through flume (buffered) and there is no os.File type with Seek; no Stat and FileInfo, no Chmod, symlinks or pipes |
 | `os/exec` | 1+3 | missing |  |  |
 | `os/signal` | 1+0 | missing |  | anvil handles SIGTERM and SIGINT for graceful shutdown internally |
@@ -219,7 +219,7 @@ Ordered by import path, as `go list std` prints them.
 | `strconv` | 875+97 | partial | mint | Itoa, Atoi, ParseInt, ParseUint, ParseBool, ParseFloat, FormatInt, FormatUint, FormatFloat, Quote, Unquote and friends; no AppendFloat, AppendBool, QuoteToASCII, IsPrint, ParseComplex |
 | `strings` | 657+147 | partial | twine | every function except the iterator forms and Reader: Index family, Split family with SplitAfter, Fields and FieldsFunc, Map, Title, Unicode ToUpper, ToLower, ToTitle, EqualFold by SimpleFold, Trim family with Func forms, Cut, CutPrefix, CutSuffix, Replacer, Lines, ToValidUTF8, Clone, Builder (Cap, Grow, Write); Lines is a slice, not an iterator; no NewReader (with the io port), no ToUpperSpecial |
 | `structs` |  | n/a |  |  |
-| `sync` | 69+32 | design | share-nothing cores, relay | no Mutex or RWMutex by design; WaitGroup, Once, Pool and Map need routine-level equivalents |
+| `sync` | 69+32 | design | share-nothing cores, relay, scope, once | no Mutex or RWMutex by design (tasks on a core cannot race); a `scope` is the WaitGroup, `once { }` is per core; Pool and Map have no equivalent |
 | `sync/atomic` | 7+12 | missing |  | the runtime has atomic operations as compiler intrinsics; there is no public package |
 | `syscall` | 2+1 | missing |  | low priority |
 | `testing` | 4+1071 | partial | crucible, `tin test` | checks, Run, benchmarks; no t.Parallel, subtests with cleanup, TempDir, fuzzing, example tests |
@@ -250,8 +250,8 @@ The order comes from two things: what other work depends on, and what services i
 
 1. Closures that capture, as region objects.
 2. Shapes (structural interfaces, static by default, `dyn` when asked) for `io`, `sort`, `hash` and `database/sql/driver`.
-3. Fault chains (`fault.Is`, `Wrap`, `Join`, `try ... wrap`) and `guard` in place of `recover`.
-4. Tasks and scopes (structured concurrency on the core) and `context` as ambient deadline, cancellation and slots. `context` is imported by 3,725 koussa files, more than anything else.
+3. Fault chains (`fault.Is`, `Wrap`, `Join`, `try ... wrap`) and `guard` in place of `recover` (built: #142, Tin 1 #229 and #230).
+4. Tasks and scopes (structured concurrency on the core) and `context` as ambient deadline, cancellation and slots. `context` is imported by 3,725 koussa files, more than anything else (built: #143, #144, Tin 1 #231 to #233 and #237).
 5. Atomics for cross-core counters; no mutexes.
 6. Compile-time type information and attributes in place of `reflect` and struct tags, extending what `argo` does for JSON.
 

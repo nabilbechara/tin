@@ -114,10 +114,28 @@ Language and library checks live in `tests/v2/`, and protocol client checks in
 
 **Policy:** reference benchmarks are measured on Linux; macOS is a development platform
 and its numbers are not reference results (see
-[docs/PERFORMANCE.md](docs/PERFORMANCE.md#benchmark-policy)). The tables below were
-measured on the macOS development machine before this policy and are kept until Linux
-reference runs replace them; the Linux workflow `.github/workflows/bench-linux.yml`
+[docs/PERFORMANCE.md](docs/PERFORMANCE.md#benchmark-policy)). The tables after the v0.4
+service benchmark were measured on the macOS development machine before this policy and
+are kept until Linux reference runs replace them; the Linux workflow `.github/workflows/bench-linux.yml`
 tracks Tin/Go ratios on GitHub's Linux runners meanwhile.
+
+**v0.4 service benchmark on Linux** (`GET /users/{id}` through Redis over MySQL, Tin vs Go
++ chi under wrk2, `bench/v04`): GitHub `ubuntu-24.04` runner, AMD EPYC 7763 (4 vCPUs),
+Linux 6.17, Go 1.26.8, each server on 2 pinned cores, wrk2/Redis/MySQL on the other 2,
+median of 5 alternating rounds
+([run](https://github.com/yasserreslan/tin/actions/runs/37210593145)). On a shared runner
+only the Tin/Go ratios are meaningful (throughput above 1 and latency below 1 favour Tin):
+
+| scenario | max req/s | req per CPU-s | p99 at a fixed rate |
+|---|---:|---:|---:|
+| cached (Redis hit) | **3.72** | **3.60** | **0.56** |
+| db (MySQL prepared statement) | **1.23** | **1.75** | 1.30 |
+| mixed (0.5% 50 ms `/slow`) | **3.56** | **3.56** | 0.99 |
+
+The db p99 swings between runs (0.42 in the previous run): MySQL dominates it, so it is
+not a win either way. Tin uses more memory here (about 50 MB against 25 MB RSS). The mixed p99 is equal because
+wrk2's requests wait behind `/slow` on their own connection; details and absolute numbers
+are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md#v04-service-benchmark-linux).
 
 Apple M3 Pro (5 performance + 6 efficiency cores), Go 1.26, fasthttp 1.74, wrk 4.2, the
 load generator on the same machine. Run with `bench/http/run_wrk.sh` and

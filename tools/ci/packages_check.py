@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Packages (#146): tin vendor, offline builds from vendor/ and tin.lock hashes."""
+"""Packages (#146): tin vendor, offline builds from vendor/, tin.lock hashes and capabilities."""
 import argparse
 import hashlib
 import os
@@ -72,8 +72,11 @@ def main():
                f'tin vendor copied {vendored} (tests must stay out, requires are transitive)')
         lock = (app / 'tin.lock').read_text()
         want = ''.join(f'{hashlib.sha256((app / f).read_bytes()).hexdigest()} {f}\n' for f in vendored)
+        want += 'caps example.com/geo\ncaps example.com/units\n'
         expect(lock == want, f'tin.lock is\n{lock}instead of\n{want}')
 
+        source_tree = work / 'src-copy'
+        shutil.copytree(work / 'src', source_tree)
         # The sources are gone and there is no network: the build reads only vendor/.
         shutil.rmtree(work / 'src')
         exe = work / 'app-bin'
@@ -105,8 +108,51 @@ def main():
         want = (f'error E111 LOCK_MISMATCH: tin.lock has no entry for vendor/example.com/units/extra.tin '
                 f'(sha256 {extra}); every vendored file must be locked\n')
         expect(result.returncode == 1 and result.stderr == want, 'an unlocked vendored file was accepted', result)
+        units.unlink()
+        shutil.copytree(source_tree, work / 'src')
+
+        # A dependency that dials without net is refused at its call, naming the path to the entry point.
+        write(work / 'src/peek/peek.tin', 'package peek\n\nimport "wire"\n\n'
+              '// Up reports whether addr accepts a connection.\nfunc Up(addr str) bool {\n'
+              '\tc, err := wire.Dial(addr)\n\tif err != nil {\n\t\treturn false\n\t}\n\tc.Close()\n\treturn true\n}\n')
+        write(work / 'src/peek/tin.mod', 'module example.com/peek\n')
+        write(app / 'tin.mod', 'module example.com/app\nrequire example.com/geo ../src/geo\n'
+              'require example.com/peek ../src/peek\n')
+        write(app / 'main.tin', 'package main\n\nimport "example.com/geo"\nimport "example.com/peek"\nimport "say"\n\n'
+              'func main() {\n\tsay.Line("area", geo.Area(2, 3), peek.Up("127.0.0.1:1"))\n}\n')
+        result = run(['sh', tin, 'vendor'], app, env)
+        expect(result.returncode == 0, 'tin vendor with peek', result)
+        expect('caps example.com/peek\n' in (app / 'tin.lock').read_text(), 'the lock lists peek with no capabilities')
+        result = run(['sh', tin, 'build', 'main.tin', '-o', str(exe)], app, env, offline)
+        want = ('vendor/example.com/peek/peek.tin:7:16: error E804 CAPABILITY: wire.Dial needs capability net '
+                '(wire.Dial -> wire.DialTimeout -> wire.resolve), which package example.com/peek does not declare '
+                'in its tin.mod (caps: none)\n')
+        expect(result.returncode == 1 and result.stderr == want, 'wire.Dial without net was not refused', result)
+
+        # Granting net upstream and vendoring again shows the new capability in the lock, and builds.
+        write(work / 'src/peek/tin.mod', 'module example.com/peek\ncaps net\n')
+        before = (app / 'tin.lock').read_text()
+        result = run(['sh', tin, 'vendor'], app, env)
+        expect(result.returncode == 0, 'tin vendor after granting net', result)
+        after = (app / 'tin.lock').read_text()
+        expect('caps example.com/peek\n' in before and 'caps example.com/peek net\n' in after,
+               f'the lock does not show the new capability:\n{after}')
+        result = run(['sh', tin, 'build', 'main.tin', '-o', str(exe)], app, env, offline)
+        expect(result.returncode == 0, 'peek with net did not build', result)
+        ran = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30)
+        expect(ran.stdout == 'area 60000 false\n', f'the program printed {ran.stdout!r}')
+        result = run(['sh', tin, 'caps', 'main.tin'], app, env)
+        expect(result.returncode == 0 and 'example.com/geo\nexample.com/peek net\nexample.com/units\n' in result.stdout
+               and 'main net\n' in result.stdout and 'wire net\n' in result.stdout, 'tin caps', result)
+
+        # A lock whose caps line disagrees with the vendored manifest is refused.
+        (app / 'tin.lock').write_text(after.replace('caps example.com/peek net\n', 'caps example.com/peek\n'))
+        result = run(['sh', tin, 'build', 'main.tin', '-o', str(exe)], app, env, offline)
+        want = ('error E115 LOCK_CAPS: tin.lock says "caps example.com/peek" for example.com/peek, '
+                'its manifest declares "caps example.com/peek net" (run tin vendor)\n')
+        expect(result.returncode == 1 and result.stderr == want, 'a stale caps line was accepted', result)
     how = 'in a network namespace with no interfaces' if offline else 'with a dead proxy (no unprivileged network namespaces here)'
-    print(f'PASS packages: tin vendor, an offline build {how}, and tin.lock refusals')
+    print(f'PASS packages: tin vendor, an offline build {how}, tin.lock refusals and capabilities')
 
 
 if __name__ == '__main__':

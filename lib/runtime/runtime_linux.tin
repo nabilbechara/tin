@@ -468,6 +468,119 @@ func rt_sig_block_term() {
 	free(set)
 }
 
+// ---- threads: raw clone with parent-owned stacks (notes/design_nolibc_threads.md) ----
+
+// CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM |
+// CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID: the kernel clears the tid word at thread exit.
+const cloneThreadFlags = 0x350f00
+const threadStackSize = 8388608
+const threadGuard = 65536
+const SS_DISABLE = 2
+
+// Thread record words: tid (32 bits, cleared by the kernel), finished, stack, stack size,
+// alternate stack, entry code and a zero environment (a function value), argument, next
+// record, then the stack_t for sigaltstack.
+const thrTid = 0
+const thrDone = 1
+const thrStack = 2
+const thrSize = 3
+const thrAlt = 4
+const thrEntry = 5
+const thrArg = 7
+const thrNext = 8
+const thrAltT = 9
+const thrWords = 12
+
+shared var rtThreads i64
+shared var rtThreadLock i64
+
+// rt_thread_start runs the function at code with arg on a new kernel thread with an 8 MiB stack above a guard.
+func rt_thread_start(code i64, arg i64) bool {
+	rt_threads_reap()
+	page := rt_page_size()
+	guard := (threadGuard+page-1) & -page
+	size := guard + threadStackSize
+	base := mem_map(size, MAP_STACK)
+	if i64(i32(rt_sys_mprotect(base, guard, 0))) != 0 {
+		rt_sys_munmap(base, size)
+		return false
+	}
+	rec := calloc(thrWords, 8)
+	rec[thrStack] = base
+	rec[thrSize] = size
+	rec[thrAlt] = mem_map(altStackSize, MAP_STACK)
+	rec[thrEntry] = code
+	rec[thrArg] = arg
+	rt_lock(&rtThreadLock)
+	rec[thrNext] = rtThreads
+	rtThreads = rec
+	tid := rt_sys_clone(cloneThreadFlags, base+size, rec, rec, cast(i64, rt_thread_entry), rec)
+	if tid < 0 {
+		rtThreads = rec[thrNext]
+	}
+	rt_unlock(&rtThreadLock)
+	if tid < 0 {
+		rt_thread_free(rec)
+		return false
+	}
+	return true
+}
+
+// rt_thread_entry is a new thread's first Tin frame: its own signal stack, then the entry.
+func rt_thread_entry(rec i64) {
+	rt_stack_t(rec+8*thrAltT, rec[thrAlt], altStackSize)
+	rt_sys_sigaltstack(rec+8*thrAltT, 0)
+	entry := cast(func(i64) i64, rec+8*thrEntry)
+	entry(rec[thrArg])
+	__atomic_store(rec+8*thrDone, 1)
+}
+
+func rt_thread_free(rec i64) {
+	rt_sys_munmap(rec[thrStack], rec[thrSize])
+	rt_sys_munmap(rec[thrAlt], altStackSize)
+	free(rec)
+}
+
+// rt_threads_reap frees the stacks of threads whose entry returned, once the kernel cleared
+// their tid word (the thread no longer runs on them).
+func rt_threads_reap() {
+	rt_lock(&rtThreadLock)
+	prev := i64(0)
+	r := rtThreads
+	for r != 0 {
+		next := r[thrNext]
+		if __atomic_load(r+8*thrDone) == 0 {
+			prev = r
+		} else {
+			for {
+				tid := __atomic_load(r) & 0xffffffff
+				if tid == 0 {
+					break
+				}
+				rt_sys_futex_wait(r, tid)
+			}
+			if prev == 0 {
+				rtThreads = next
+			} else {
+				prev[thrNext] = next
+			}
+			rt_thread_free(r)
+		}
+		r = next
+	}
+	rt_unlock(&rtThreadLock)
+}
+
+// rt_altstack_ready reports whether this thread already has a signal stack (clone threads
+// install theirs from the record before their entry runs).
+func rt_altstack_ready() bool {
+	old := calloc(3, 8)
+	rt_sys_sigaltstack(0, old)
+	ready := __ld(old+8, 2)&SS_DISABLE == 0
+	free(old)
+	return ready
+}
+
 // rt_signalfd returns a non-blocking descriptor that turns readable when a (blocked) SIGTERM or
 // SIGINT arrives; reading 128 bytes from it takes the signal (its number is the first u32).
 func rt_signalfd() i64 {

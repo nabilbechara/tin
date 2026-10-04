@@ -38,6 +38,7 @@ moving or deleting the tree breaks it.
 | `tin test [-bench] [DIR]` | build DIR (default `.`) with its `*_test.tin` files and run every `TestXxx(t mut crucible.T)`, then `BenchmarkXxx(b mut crucible.B)` with `-bench`; exit status 1 when a test fails, 2 for a wrong test signature (see §5.1) |
 | `tin replay CAPSULE --against BUILD [--live KIND]...` | run a recorded request again with every effect served from its capsule, and report the first divergence (see §8.1) |
 | `tin vendor [DIR]` | copy every package `DIR/tin.mod` requires (transitively, from local source directories) into `DIR/vendor/<path>` and write `DIR/tin.lock` with each vendored file's SHA-256 (see §2.1) |
+| `tin caps FILE.tin...` | check the program and print, per package, the capabilities (`net`, `files`, `spawn`, `exec`, `unsafe`) its exported functions can reach |
 | `tin suite` | run the compiler's strict test suite (`tools/v2test.sh`) |
 | `tin bootstrap` | rebuild the compiler with itself; the binaries must be identical |
 | `tin version` | version and compiler checksum |
@@ -63,6 +64,12 @@ tin vendor                                   # vendor/github.com/ana/geo/... and
 tin build main.tin                           # offline; refuses a vendored file whose hash changed
 ```
 
+A dependency's own `tin.mod` declares its capabilities (`caps net files`). The compiler
+rejects a call from a vendored package that can reach anything else (`E804 CAPABILITY`,
+at the call, with the path to the entry point). `tin vendor` copies each package's
+capabilities into `tin.lock`, so an upgrade that asks for more shows up in review.
+`tin caps main.tin` prints what each package can reach.
+
 With a `tin.lock`, every vendored file must have the hash the lock records, and every
 other listed file is checked too. A changed byte stops the build before the file is
 parsed: `E111 LOCK_MISMATCH` names the file and both hashes. Review the change, then run
@@ -82,8 +89,9 @@ tinc [-o OUT] [-S] [-target darwin-arm64|linux-arm64|linux-amd64] FILE.tin...
 - Strict programs get the package `lib/runtime/` (its `*_<os>.tin` and `*_<os>_<arch>.tin`
   files only for the target) automatically; imports are resolved as in LANGUAGE.md §1.
 - Errors print as `file:line:col: error E502 TYPE_ARG_COUNT: message` (code and name from
-  [ERRORS.md](ERRORS.md); errors not yet given a code print `error: message`), every error
-  in one run; the exit code is 1. A compiler crash prints a backtrace only under a debugger (see §8).
+  [ERRORS.md](ERRORS.md)), every error in one run; the exit code is 1. A compiler crash prints a backtrace only under a debugger (see §8).
+- `-caps`: check the program and print the capabilities each package can reach instead of
+  building (`tin caps`; PACKAGES.md, "Capabilities").
 - `-hash FILE...` prints `<sha256> FILE` for each file (the `tin.lock` lines `tin vendor`
   writes) and builds nothing.
 - `TINC_TRACE=1` prints each function as it is generated (to find which one crashes the

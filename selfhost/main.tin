@@ -8,6 +8,7 @@ var lib_root;
 var project_root;
 var project_lock;
 var compiler_edition;
+var load_unsafe;     // the file being loaded is a vendored package granted unsafe: trusted, same edition
 
 // read_file returns a buffer holding the whole file, or 0 if it cannot be opened.
 fn try_read_file(path) {
@@ -92,7 +93,7 @@ fn set_target(t) {
 
 fn usage() {
     let u = buf_new();
-    buf_str(u, "usage: tinc [-polls] [-edition 0|1] [-parse-only] [-audit-secrets] [-S] [-o OUT] [-target darwin-arm64|linux-arm64|linux-amd64] FILE.tin...\n");
+    buf_str(u, "usage: tinc [-polls] [-edition 0|1] [-parse-only] [-audit-secrets] [-caps] [-hash FILE...] [-S] [-o OUT] [-target darwin-arm64|linux-arm64|linux-amd64] FILE.tin...\n");
     write_all(2, u);
     return 2;
 }
@@ -132,9 +133,10 @@ fn load_file_trusted(path, trusted) {
     let src = read_file(path);
     vec_push(files, path);
     vec_push(file_trusted, trusted);
+    vec_push(file_cap_pkg, 0);
     cur_file = files[VEC_LEN] - 1;
     let edition = compiler_edition;
-    if trusted && edition == 1 {
+    if trusted && edition == 1 && !load_unsafe {
         edition = 0;
     }
     let toks = lex(cur_file, src[VEC_DATA], src[VEC_LEN], edition);
@@ -252,9 +254,9 @@ fn resolve_import(ipath, from) {
     }
     // A path import (github.com/ana/geo) is read from vendor/ only: never lib/ or the network.
     if remote_path(ipath) {
-        return package_files(cat_path(cat_path(project_root, "/vendor/"), ipath));
+        return package_files(cat_path(vendor_dir(), ipath));
     }
-    let vendored = package_files(cat_path(cat_path(project_root, "/vendor/"), ipath));
+    let vendored = package_files(cat_path(vendor_dir(), ipath));
     if vendored {
         return vendored;
     }
@@ -263,6 +265,15 @@ fn resolve_import(ipath, from) {
         return std;
     }
     return package_files(cat_path(cat_path(dir_of(vec_get(files, 0)), "/"), ipath));
+}
+
+// vendor_dir is the project's vendor/ directory, with a trailing slash ("vendor/" when the
+// program is in the current directory, so paths in messages do not start with ./).
+fn vendor_dir() {
+    if streq(project_root, ".") {
+        return "vendor/";
+    }
+    return cat_path(project_root, "/vendor/");
 }
 
 // remote_path reports whether an import path names a package by where it comes from: its
@@ -340,6 +351,12 @@ fn load_imports() {
                 fatal(e);
             }
             check_pkg_home(ipath, found);
+            // A vendored package is restricted to its manifest's capabilities; a package a
+            // vendored file imports relatively is part of the same package.
+            let cpkg = vendored_package(ipath, found);
+            if !cpkg && load8(ipath) == '.' {
+                cpkg = vec_get(file_cap_pkg, f);
+            }
             let k = 0;
             while k < found[VEC_LEN] {
                 let path = vec_get(found, k);
@@ -349,8 +366,11 @@ fn load_imports() {
                     if !std {
                         lock_has(path);
                     }
-                    // Only the standard library may use the raw operations.
-                    load_file_trusted(path, std);
+                    // Only the standard library (and a package granted unsafe) may use the raw operations.
+                    load_unsafe = !std && cpkg && (cpkg[CP_CAPS] & CAP_UNSAFE);
+                    load_file_trusted(path, std || load_unsafe);
+                    load_unsafe = 0;
+                    file_cap_pkg[VEC_DATA][files[VEC_LEN] - 1] = cpkg;
                 }
                 k = k + 1;
             }
@@ -533,6 +553,8 @@ fn main(argc, argv) {
     }
     files = vec_new();
     file_trusted = vec_new();
+    file_cap_pkg = vec_new();
+    cap_pkgs = vec_new();
     parse_setup();
     types_init();
     let asm_only = 0;
@@ -568,6 +590,9 @@ fn main(argc, argv) {
             compiler_polls = 1;
         } else if streq(a, "-parse-only") {
             parse_only = 1;
+        } else if streq(a, "-caps") {
+            // tin caps: check the program, then print the capabilities each package can reach.
+            caps_report = 1;
         } else if streq(a, "-audit-secrets") {
             // tin audit secrets: check the program, then list every place a secret leaves.
             audit_secrets = 1;
@@ -625,6 +650,16 @@ fn main(argc, argv) {
     check();
     if error_count > 0 {
         return 1;
+    }
+    if v2 {
+        check_capabilities();
+        if error_count > 0 {
+            return 1;
+        }
+        if caps_report {
+            print_capabilities();
+            return 0;
+        }
     }
     if audit_secrets {
         secret_audit_print();

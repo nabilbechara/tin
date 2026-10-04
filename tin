@@ -9,6 +9,7 @@
 #   tin test [-bench] [DIR]         run DIR's *_test.tin tests (TestXxx, BenchmarkXxx)
 #   tin replay CAPSULE --against BUILD [--live KIND]...  replay a recorded request, effects from the capsule
 #   tin vendor [DIR]                copy tin.mod's requires into vendor/ and write tin.lock
+#   tin caps FILE.tin...            print the capabilities each package can reach
 #   tin suite                       run the compiler's strict test suite (tests/v2)
 #   tin bootstrap                   rebuild the compiler with itself and check the fixed point
 #   tin version
@@ -74,6 +75,10 @@ case $1 in
   asm)
     shift
     if legacy "$@"; then "$tinc" -S "$root/lib/std.tin" "$@"; else "$tinc" -S "$@"; fi ;;
+  caps)
+    shift
+    [ $# -gt 0 ] || { echo "tin: caps: no files" >&2; exit 2; }
+    "$tinc" -caps "$@" ;;
   audit)
     shift
     [ "${1:-}" = secrets ] || { echo "tin: audit: unknown audit '${1:-}' (try: tin audit secrets FILE.tin)" >&2; exit 2; }
@@ -204,13 +209,28 @@ case $1 in
         requires "$s" || exit 1
       fi
     done
-    rm -rf "$proj/vendor"
-    mv "$work/vendor" "$proj/vendor"
-    # The lock: entries the project keeps for its own files, then every vendored file, sorted.
+    # The lock: entries the project keeps for its own files, every vendored file, sorted, then
+    # each package's capabilities from its tin.mod, so a reviewer sees what an upgrade asks for.
+    LC_ALL=C sort "$work/done" > "$work/sorted"
     {
       [ ! -f "$proj/tin.lock" ] || awk 'length($1) == 64 && index($0, " vendor/") != 65' "$proj/tin.lock"
-      (cd "$proj" && find vendor -type f \( -name '*.tin' -o -name tin.mod \) | LC_ALL=C sort | while IFS= read -r f; do "$tinc" -hash "$f"; done)
+      (cd "$work" && find vendor -type f \( -name '*.tin' -o -name tin.mod \) | LC_ALL=C sort | while IFS= read -r f; do "$tinc" -hash "$f"; done)
+      while IFS='	' read -r p s; do
+        caps=
+        [ ! -f "$work/vendor/$p/tin.mod" ] || caps=$(awk '$1 == "caps" { for (i = 2; i <= NF; i++) print $i }' "$work/vendor/$p/tin.mod")
+        for c in $caps; do
+          case $c in net|files|spawn|exec|unsafe) ;; *) echo "tin: vendor: $p/tin.mod: unknown capability '$c' (net, files, spawn, exec, unsafe)" >&2; exit 1 ;; esac
+        done
+        line="caps $p"
+        for c in net files spawn exec unsafe; do
+          case " $(echo $caps) " in *" $c "*) line="$line $c" ;; esac
+        done
+        printf '%s\n' "$line"
+      done < "$work/sorted"
     } > "$work/lock"
+    # Nothing in the project changes until everything has been copied and hashed.
+    rm -rf "$proj/vendor"
+    mv "$work/vendor" "$proj/vendor"
     mv "$work/lock" "$proj/tin.lock"
     echo "tin: vendored $(wc -l < "$work/done" | tr -d ' ') packages into $proj/vendor" ;;
   suite)

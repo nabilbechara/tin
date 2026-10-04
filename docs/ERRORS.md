@@ -28,9 +28,6 @@ example.tin:11:6: error E510 NOT_IN_UNION: type str does not satisfy the constra
 | E8xx | trusted code and standard-library-only features |
 | E9xx | building: targets, linking and limits |
 
-Codes are being added one compiler file at a time (#244); until that is finished, some
-errors still print as `error: message` without a code.
-
 Each entry below gives the rule, a program that breaks it with the exact output the compiler
 prints for it, and the fixes. `tools/ci/diagnostics_check.py` compiles every example and
 requires that output, and checks that the compiler, this page and the tests' expected
@@ -787,6 +784,81 @@ error E113 PACKAGE_CONFLICT: import paths "say" and "example.com/say" are differ
 
 Fix: import only one of them; a vendored package should not reuse the name of a standard
 package or of another dependency.
+
+### E114 MANIFEST
+
+A vendored package's `tin.mod` is made of `module PATH`, `require PATH SOURCE` and
+`caps ...` lines (and `//` comments). Its capabilities are `net`, `files`, `spawn`, `exec`
+and `unsafe` (docs/PACKAGES.md).
+
+```text file=vendor/example.com/peek/tin.mod
+module example.com/peek
+caps network
+```
+
+```text file=vendor/example.com/peek/peek.tin
+package peek
+
+func Up() bool {
+	return false
+}
+```
+
+```tin
+package main
+
+import "example.com/peek"
+
+func main() {
+	peek.Up()
+}
+```
+
+```text
+vendor/example.com/peek/tin.mod:2: error E114 MANIFEST: unknown capability 'network' (a tin.mod line is module PATH, require PATH SOURCE or caps net files spawn exec unsafe)
+```
+
+Fix: correct the line in the package's source and run `tin vendor` again.
+
+### E115 LOCK_CAPS
+
+`tin.lock` has a `caps PATH ...` line for every vendored package, and it must name exactly
+the capabilities the vendored `tin.mod` declares, so a reviewer reading the lock sees what
+each dependency may do. `tin vendor` writes these lines.
+
+```text file=vendor/example.com/peek/tin.mod
+module example.com/peek
+caps net
+```
+
+```text file=vendor/example.com/peek/peek.tin
+package peek
+
+func Up() bool {
+	return false
+}
+```
+
+```text file=tin.lock
+243aa58c8a51ef9c086f7b67a8ec491bb556d1f9a8d0c5e70d0948967a79fbca vendor/example.com/peek/tin.mod
+caps example.com/peek
+```
+
+```tin
+package main
+
+import "example.com/peek"
+
+func main() {
+	peek.Up()
+}
+```
+
+```text
+error E115 LOCK_CAPS: tin.lock says "caps example.com/peek" for example.com/peek, its manifest declares "caps example.com/peek net" (run tin vendor)
+```
+
+Fix: run `tin vendor`, and review the capability the dependency now asks for.
 
 ### E120 NO_MAIN
 
@@ -3431,7 +3503,8 @@ func main() {
 example.tin:4:6: error E802 RUNTIME_INTERNAL: 'rt_core_id' is internal to the runtime
 ```
 
-Fix: use the standard library function that wraps it (`hearth.Core()` for the core).
+Fix: use the standard library function that wraps it (`hearth.Core()` for the core). A
+vendored package whose `tin.mod` declares `caps unsafe` may use them, like `lib/`.
 
 ### E803 ADDRESS_OF
 
@@ -3454,6 +3527,54 @@ example.tin:6:6: error E803 ADDRESS_OF: cannot take the address of constant 'siz
 
 Fix: programs pass structs, slices and maps by reference already; there is no `&` outside
 `lib/`.
+
+### E804 CAPABILITY
+
+A vendored package may only call code that stays within the capabilities its `tin.mod`
+declares (`net`, `files`, `spawn`, `exec`, `unsafe`; docs/PACKAGES.md). The standard
+library's entry points to the operating system are tagged with the capability they need,
+and the check follows calls and function values through every package, so calling
+another package's function that dials needs `net` too. Every function of a vendored
+package is checked, called or not. The error is at the call that leaves the package and
+shows the path to the tagged entry point.
+
+```text file=vendor/example.com/peek/tin.mod
+module example.com/peek
+```
+
+```text file=vendor/example.com/peek/peek.tin
+package peek
+
+import "wire"
+
+func Up(addr str) bool {
+	c, err := wire.Dial(addr)
+	if err != nil {
+		return false
+	}
+	c.Close()
+	return true
+}
+```
+
+```tin
+package main
+
+import "example.com/peek"
+import "say"
+
+func main() {
+	say.Line(peek.Up("127.0.0.1:1"))
+}
+```
+
+```text
+vendor/example.com/peek/peek.tin:6:16: error E804 CAPABILITY: wire.Dial needs capability net (wire.Dial -> wire.DialTimeout -> wire.resolve), which package example.com/peek does not declare in its tin.mod (caps: none)
+```
+
+Fix: if the dependency should dial, add `caps net` to its `tin.mod` (upstream) and run
+`tin vendor`; the lock then shows the new capability for review. Otherwise do not use the
+package. `tin caps main.tin` prints what each package can reach.
 
 ## E9xx Building
 

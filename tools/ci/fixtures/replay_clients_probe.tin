@@ -1,0 +1,89 @@
+package replayclients
+
+import "dice"
+import "fault"
+import "quarry"
+import "redis"
+import "replay"
+import "say"
+import "seal"
+import "tide"
+import "wire"
+
+// Copied into a temporary lib/replayclients by replay_check.py: one task records what the clients
+// do against live servers (#241), then the same code replays from that tape with no live call.
+
+var cache = redis.Open(redis.Options{Addr: quarry.Getenv("REDIS_ADDR"), Password: "r3d1s-pass"})
+var summary str
+var cartKey str
+
+// work uses every recorded client once and sums up what it got.
+func work() str {
+	t0 := tide.Now()
+	wall := tide.Wall()
+	roll := dice.Intn(1000000)
+	nonce := seal.Hex(seal.RandomBytes(8))
+	items, found, err := cache.Get(cartKey)
+	cart := say.Fmt("%s %v %v", items, found, err)
+	r, err2 := wire.Do("POST", "http://" + quarry.Getenv("HTTP_ADDR") + "/price", []str{"Authorization", "Bearer s3cr3t-token", "X-Trace", "t1"}, "cart=" + items)
+	price := say.Fmt("%d %q %v", r.Status, r.Body, err2)
+	echo := raw()
+	_, err3 := wire.Get("http://127.0.0.1:1/down")
+	return say.Fmt("now %d wall %d dice %d nonce %s | cart %s | price %s | raw %s | down %v | since %d", t0, wall, roll, nonce, cart, price, echo, err3, tide.Since(t0))
+}
+
+// raw talks to a TCP echo server with wire.Dial, Write and Read.
+func raw() str {
+	c, err := wire.Dial(quarry.Getenv("ECHO_ADDR"))
+	if err != nil {
+		return say.Str(err)
+	}
+	try_write := c.Write("PING 1\n")
+	buf := make([]u8, 0, 64)
+	n, rerr := c.Read(mut buf, 64)
+	c.Close()
+	return say.Fmt("%v %d %q %v", try_write, n, str(buf), rerr)
+}
+
+var gTape i64
+
+// inTask runs work in a task with tape tp and returns its summary.
+func inTask(tp i64) str {
+	gTape = tp
+	summary = ""
+	s := rt_scope_open()
+	s.spawn(func() ! {
+		rt_tape_set(curTask, gTape)
+		summary = work()
+		rt_tape_set(curTask, 0)
+	})
+	rt_scope_close(s) catch err {
+		say.Line("task:", fault.Message(err))
+	}
+	return summary
+}
+
+func Run() {
+	say.Line("recording on:", replay.Setup(1))
+	cartKey = "cart:7"
+	tp := rt_tape_new(1)
+	recorded := inTask(tp)
+	say.Line("recorded:", recorded)
+	say.Line("effects:", tp[4])
+	quarry.WriteFile(quarry.Getenv("TAPE_OUT"), rt_str_from_raw(tp[1], tp[2])) catch err {
+		say.Line("tape:", fault.Message(err))
+	}
+	rp := rt_tape_new(2)
+	rt_tape_load(rp, tp[1], tp[2])
+	replayed := inTask(rp)
+	say.Line("replayed same:", replayed == recorded, "left:", rt_tape_left(rp), "diverged:", rt_tape_diverged(rp))
+	if replayed != recorded {
+		say.Line("replayed:", replayed)
+	}
+	cartKey = "cart:8"
+	rq := rt_tape_new(2)
+	rt_tape_load(rq, tp[1], tp[2])
+	other := inTask(rq)
+	say.Line("other key:", rt_tape_diverged(rq))
+	say.Line("other summary:", other == "")
+}
