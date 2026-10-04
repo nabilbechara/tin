@@ -138,6 +138,7 @@ var draining bool     // this core stopped accepting; its connections close afte
 var reported bool     // this core counted itself in gDrained
 var deadline i64      // core 0: when the grace period ends (seconds)
 var drainTimer i64    // core 0: the timer that checks the deadline while draining
+var hardStop i64      // core 0: when the process exits although work is left (0: not yet canceled)
 var kq i64
 var myListen i64
 var conns i64
@@ -424,7 +425,18 @@ func core(id i64) {
 				take_handoffs(pr)
 			} else if fd == drainTimer {
 				ev_timer_ack(drainTimer)
-				if rt_mono_ns() >= deadline {
+				if hardStop == 0 && rt_mono_ns() >= deadline {
+					// The grace period is over: cancel what is left on every core with
+					// "draining"; waiting requests answer and finish (design_semantics §10).
+					hardStop = rt_mono_ns() + 1000000000
+					word[3] = -2
+					for j := 1; j < gCores; j++ {
+						rt_sys_write(gPipes[2*j+1], word+24, 8)
+					}
+					drain_cancel()
+				}
+				// Code that never waits cannot see the cancel until safepoints (#234) exist.
+				if hardStop != 0 && rt_mono_ns() >= hardStop {
 					rt_flush_core()
 					rt_sys_exit(0)
 				}
@@ -502,6 +514,11 @@ func begin_drain() {
 		rt_sys_close(myListen)
 		myListen = -1
 	}
+}
+
+// drain_cancel cancels every request and background task on this core with "draining".
+func drain_cancel() {
+	rt_bnd_cancel(rt_bnd_core(), cast(fault, "draining"))
 }
 
 // drain_done reports whether this core may stop: no connection is left (counted once in
@@ -603,6 +620,8 @@ func take_handoffs(pr i64) {
 		fd := (word + 64 + i)[0]
 		if fd == -1 {
 			begin_drain()
+		} else if fd == -2 {
+			drain_cancel()
 		} else {
 			add_conn(fd, false)
 		}
