@@ -16,6 +16,7 @@ package redis
 
 import "mint"
 import "say"
+import "tls"
 import "wire"
 
 
@@ -39,6 +40,81 @@ type Options struct {
 	DB       i64 // selected when not 0
 	Proto    i64 // 3 sends HELLO 3 and speaks RESP3; otherwise RESP2
 	Timeout  i64 // ns a command may wait (0: no limit; a request's deadline still applies)
+	TLS      ?tls.Config // connect over TLS 1.3 (the server name is Addr's host unless TLS.ServerName is set)
+}
+
+// ParseURL reads "redis://[[user]:password@]host[:port][/db]"; "rediss://" is the same over
+// TLS 1.3 (TLS is set, so the server's certificate is verified for host).
+func ParseURL(url str) !Options {
+	o := Options{Addr: "", Username: "", Password: "", DB: 0, Proto: 0, Timeout: 0, TLS: nil}
+	rest := ""
+	if len(url) >= 9 && url[:9] == "rediss://" {
+		rest = url[9:]
+		o.TLS = tls.Config{ServerName: "", RootCAs: "", ALPN: []str{}, Timeout: 0, InsecureSkipVerify: false}
+	} else if len(url) >= 8 && url[:8] == "redis://" {
+		rest = url[8:]
+	} else {
+		fail say.Fault("redis: %q is not a redis:// or rediss:// URL", url)
+	}
+	slash := len(rest)
+	for i := 0; i < len(rest); i++ {
+		if rest[i] == '/' {
+			slash = i
+			break
+		}
+	}
+	db := rest[slash:]
+	rest = rest[:slash]
+	at := -1
+	for i := 0; i < len(rest); i++ {
+		if rest[i] == '@' {
+			at = i
+		}
+	}
+	if at >= 0 {
+		cred := rest[:at]
+		rest = rest[at+1:]
+		colon := -1
+		for i := 0; i < len(cred); i++ {
+			if cred[i] == ':' {
+				colon = i
+				break
+			}
+		}
+		if colon < 0 {
+			o.Password = cred
+		} else {
+			o.Username = cred[:colon]
+			o.Password = cred[colon+1:]
+		}
+	}
+	if rest == "" {
+		rest = "127.0.0.1"
+	}
+	hasport := false
+	brackets := false
+	for i := 0; i < len(rest); i++ {
+		if rest[i] == '[' {
+			brackets = true
+		}
+		if rest[i] == ']' {
+			brackets = false
+		}
+		if rest[i] == ':' && !brackets {
+			hasport = true
+		}
+	}
+	o.Addr = rest
+	if !hasport {
+		o.Addr = rest + ":6379"
+	}
+	if len(db) > 1 {
+		n := mint.Atoi(db[1:]) catch _ {
+			fail say.Fault("redis: bad database number in %q", url)
+		}
+		o.DB = n
+	}
+	return o
 }
 
 // Client sends commands to one Redis server. Open it in a global's initializer (which
@@ -61,7 +137,8 @@ const rDB = 6
 const rProto = 7
 const rTimeout = 8
 const rID = 9
-const recWords = 10
+const rTls = 10   // the kept tls.Config, or 0 for plain TCP
+const recWords = 11
 
 // A core's connection for one Client.
 const lFd = 0
@@ -78,7 +155,8 @@ const lQHead = 10
 const lQN = 11
 const lQCap = 12
 const lBusy = 13  // a task is doing the connection's I/O
-const lineWords = 14
+const lID = 14    // the client's id: its TLS connection is tlsLines[id]
+const lineWords = 15
 
 // A slot: one caller's commands and the replies they get.
 const sTask = 0
@@ -97,6 +175,10 @@ const slotWords = 12
 
 shared var nClients i64
 var lines i64 // per core: the connection of each Client, by id
+
+// tlsLines holds each TLS connection of this core, by client id. Replacing or clearing one
+// releases the old connection's memory (it is counted long-lived memory, from keep).
+var tlsLines = make([]?tls.Conn, maxClients+1)
 
 func keep_raw(s str) i64 {
 	p := malloc(len(s) + 1)
@@ -125,6 +207,10 @@ func Open(o Options) Client {
 	rec[rProto] = o.Proto
 	rec[rTimeout] = o.Timeout
 	rec[rID] = id
+	cfg := o.TLS
+	if cfg != nil {
+		rec[rTls] = cast(i64, keep(cfg))
+	}
 	return Client{open: true, rec: rec}
 }
 
@@ -137,6 +223,7 @@ func (c Client) line() i64 {
 	if l == 0 {
 		l = calloc(lineWords, 8)
 		l[lFd] = -1
+		l[lID] = id
 		lines[id] = l
 	}
 	return l
@@ -341,6 +428,8 @@ func set_err(s i64, msg str) {
 // fail_line closes the connection and fails every caller waiting on it.
 func fail_line(l i64, msg str) {
 	if l[lFd] >= 0 {
+		// A TLS connection is dropped without close_notify: the descriptor goes either way.
+		tlsLines[l[lID]] = nil
 		rt_sys_close(l[lFd])
 		l[lFd] = -1
 	}
@@ -586,8 +675,17 @@ func hello_error(s i64) str {
 // connect dials and queues the handshake (HELLO or AUTH, then SELECT) ahead of everything.
 func connect(l i64, rec i64) ! {
 	addr := rt_str_from_raw(rec[rAddr], rec[rAddrN])
-	conn := try wire.DialTimeout(addr, rec[rTimeout])
-	l[lFd] = conn.Fd()
+	if rec[rTls] != 0 {
+		base := cast(tls.Config, rec[rTls])
+		cfg := tls.Config{ServerName: base.ServerName, RootCAs: base.RootCAs, ALPN: base.ALPN, Timeout: rec[rTimeout], InsecureSkipVerify: base.InsecureSkipVerify}
+		tc := try tls.Dial(addr, cfg)
+		tc.SetTimeout(rec[rTimeout])
+		l[lFd] = tc.Fd()
+		tlsLines[l[lID]] = keep(tc)
+	} else {
+		conn := try wire.DialTimeout(addr, rec[rTimeout])
+		l[lFd] = conn.Fd()
+	}
 	user := rt_str_from_raw(rec[rUser], rec[rUserN])
 	pass := rt_str_from_raw(rec[rPass], rec[rPassN])
 	cmds := [][]str{}
@@ -670,6 +768,19 @@ func drive(l i64, s i64, rec i64) ! {
 	timeout := rec[rTimeout]
 	for s[sState] == 0 {
 		fd := l[lFd]
+		tc := tlsLines[l[lID]]
+		if tc != nil && l[lWpos] < l[lOutN] {
+			// A TLS write waits inside tls (records cannot be half sent); a fault drops the
+			// connection.
+			err := tc.Write(rt_str_from_raw(l[lOut]+l[lWpos], l[lOutN]-l[lWpos]))
+			if err != nil {
+				fail_line(l, say.Str(err))
+				break
+			}
+			l[lWpos] = 0
+			l[lOutN] = 0
+			continue
+		}
 		if l[lWpos] < l[lOutN] {
 			k := rt_sys_write(fd, l[lOut]+l[lWpos], l[lOutN]-l[lWpos])
 			if k > 0 {
@@ -702,6 +813,24 @@ func drive(l i64, s i64, rec i64) ! {
 			c := l[lInCap]*2 + 16384
 			l[lIn] = realloc(l[lIn], c)
 			l[lInCap] = c
+		}
+		if tc != nil {
+			buf := make([]u8, 0, l[lInCap]-l[lInE])
+			got, rerr := tc.ReadNow(mut buf, l[lInCap]-l[lInE])
+			if rerr != nil {
+				fail_line(l, say.Str(rerr))
+				break
+			}
+			if got > 0 {
+				memcpy(l[lIn]+l[lInE], cast(i64, buf)[2], got)
+				l[lInE] += got
+				continue
+			}
+			r := rt_task_wait(fd, 1, timeout)
+			if r != waitReady {
+				fail give_up(l, s, r)
+			}
+			continue
 		}
 		k := rt_sys_read(fd, l[lIn]+l[lInE], l[lInCap]-l[lInE])
 		if k > 0 {

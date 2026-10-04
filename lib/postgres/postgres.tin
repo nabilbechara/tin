@@ -1,8 +1,9 @@
 // Package postgres is a PostgreSQL protocol 3.0 client over TCP. Query interpolation
 // binds binary parameters as $1, $2, ...; a plain str cannot be used as SQL. Connections
 // are pooled per core (default 16) and waiting request tasks park without blocking it.
-// Authentication supports SCRAM-SHA-256, MD5 and cleartext. TLS is not supported: use
-// a trusted private network or a local TLS proxy. An SSL-only server is rejected.
+// Authentication supports SCRAM-SHA-256, MD5 and cleartext. Options.SSLMode turns on TLS 1.3
+// (SSLRequest): "require" encrypts, "verify-full" (the default when Options.TLS is set) also
+// checks the server's certificate and name.
 //
 //	var db = postgres.Open(postgres.Options{Addr: "127.0.0.1:5432", User: "app", Password: pw, Database: "shop"})
 //	rows := try db.Query("INSERT INTO users(name) VALUES ({name}) RETURNING id")
@@ -14,6 +15,7 @@ import "mint"
 import "postgres/md5"
 import "postgres/sasl"
 import "seal"
+import "tls"
 import "wire"
 
 
@@ -44,6 +46,8 @@ type Options struct {
 	Database str
 	Pool     i64 // connections per core (default 16)
 	Timeout  i64 // ns for acquisition, login, preparation and execution (0: no limit)
+	SSLMode  str // "disable", "require" (TLS without checking the certificate) or "verify-full"; "" is disable, or verify-full when TLS is set
+	TLS      ?tls.Config // roots, server name and the like for TLS 1.3 (the server name is Addr's host unless set)
 }
 
 // Client runs statements on one PostgreSQL server. Open it in a global's initializer (which
@@ -72,7 +76,8 @@ const rDBN = 7
 const rPool = 8
 const rTimeout = 9
 const rID = 10
-const recWords = 11
+const rTls = 11 // the kept tls.Config for this client's sslmode, or 0 for plain TCP
+const recWords = 12
 
 // A core's pool for one Client.
 const pIdle = 0 // a stack of idle connections
@@ -119,6 +124,10 @@ const maxStmts = 256
 shared var nClients i64
 var pools i64 // per core: the pool of each Client, by id
 
+// tlsConns holds the TLS layer of this core's connections, by connection record. Removing
+// one releases its memory (counted long-lived memory, from keep).
+var tlsConns = make(map[i64]?tls.Conn)
+
 func keep_raw(s str) i64 {
 	p := malloc(len(s) + 1)
 	memcpy(p, cast(i64, s)+8, len(s))
@@ -154,6 +163,25 @@ func Open(o Options) Client {
 	}
 	rec[rTimeout] = o.Timeout
 	rec[rID] = id
+	mode := o.SSLMode
+	given := o.TLS
+	if mode == "" && given != nil {
+		mode = "verify-full"
+	}
+	if mode == "require" || mode == "verify-full" {
+		cfg := tls.Config{ServerName: "", RootCAs: "", ALPN: []str{}, Timeout: 0, InsecureSkipVerify: mode == "require"}
+		if given != nil {
+			cfg.ServerName = given.ServerName
+			cfg.RootCAs = given.RootCAs
+			if given.InsecureSkipVerify {
+				cfg.InsecureSkipVerify = true
+			}
+		}
+		rec[rTls] = cast(i64, keep(cfg))
+	} else if mode != "disable" && mode != "" {
+		// An unknown mode must not silently mean plain TCP: refuse every connection.
+		rec[rTls] = -1
+	}
 	return Client{open: true, rec: rec}
 }
 
@@ -283,6 +311,21 @@ func read_packet(c i64) !(i64, i64) {
 			memmove(c[cBuf], c[cBuf]+c[cS], avail)
 			c[cS] = 0; c[cE] = avail
 		}
+		tc := tlsConns[c]
+		if tc != nil {
+			tc.SetDeadline(c[cUntil])
+			buf := make([]u8, 0, c[cCap]-c[cE])
+			got := try tc.ReadNow(mut buf, c[cCap]-c[cE])
+			if got > 0 {
+				memcpy(c[cBuf]+c[cE], cast(i64, buf)[2], got)
+				c[cE] += got
+				continue
+			}
+			left := try remaining(c[cUntil])
+			r := rt_task_wait(c[cFd], 1, left)
+			if r != waitReady { fail wait_msg(r) }
+			continue
+		}
 		k := rt_sys_read(c[cFd], c[cBuf]+c[cE], c[cCap]-c[cE])
 		if k > 0 { c[cE] += k; continue }
 		if k == 0 { fail "postgres: the server closed the connection" }
@@ -333,6 +376,14 @@ func end_packet(c i64) ! {
 }
 
 func flush(c i64) ! {
+	tc := tlsConns[c]
+	if tc != nil {
+		tc.SetDeadline(c[cUntil])
+		err := tc.Write(rt_str_from_raw(c[cOut], c[cOutN]))
+		c[cOutN] = 0
+		if err != nil { fail err }
+		return
+	}
 	at := 0
 	for at < c[cOutN] {
 		_ = try remaining(c[cUntil])
@@ -547,7 +598,7 @@ func handshake(c i64, rec i64) ! {
 		if c[cKind] == 'E' {
 			message := try error_text(mut k)
 			if contains(message, "SSL") || contains(message, "no encryption") {
-				fail "{message}; postgres: TLS is not supported; use a local TLS proxy"
+				fail "{message}; postgres: the server requires TLS: set Options.SSLMode"
 			}
 			fail message
 		}
@@ -581,6 +632,7 @@ func (c Client) pool() i64 {
 }
 
 func conn_free(c i64) {
+	delete(tlsConns, c)
 	if c[cFd] >= 0 {
 		rt_sys_close(c[cFd])
 	}
@@ -605,6 +657,13 @@ func dial(rec i64, until i64) !i64 {
 	c[cBuf] = malloc(c[cCap])
 	c[cStmts] = calloc(maxStmts*stmtWords, 8)
 	c[cUntil] = until
+	if rec[rTls] != 0 {
+		e1 := start_tls(c, rec, w, until)
+		if e1 != nil {
+			conn_free(c)
+			fail e1
+		}
+	}
 	err := handshake(c, rec)
 	if err != nil {
 		conn_free(c)
@@ -613,10 +672,73 @@ func dial(rec i64, until i64) !i64 {
 	return c
 }
 
+// start_tls sends SSLRequest and, when the server answers S, runs the TLS handshake. The
+// answer is read alone, so no plaintext the server sent after it can reach the TLS layer.
+func start_tls(c i64, rec i64, w wire.Conn, until i64) ! {
+	if rec[rTls] < 0 {
+		fail "postgres: unknown sslmode (use disable, require or verify-full)"
+	}
+	begin_packet(c, 0)
+	put_be(c, 80877103, 4)
+	try end_packet(c)
+	try flush(c)
+	b := calloc(1, 8)
+	for {
+		k := rt_sys_read(c[cFd], b, 1)
+		if k == 1 { break }
+		e := rt_errno()
+		if k < 0 && e == EINTR { continue }
+		if k < 0 && e == EAGAIN {
+			left := remaining(until) catch err { free(b); fail err }
+			r := rt_task_wait(c[cFd], 1, left)
+			if r != waitReady { free(b); fail wait_msg(r) }
+			continue
+		}
+		free(b)
+		fail "postgres: the server closed the connection during SSLRequest"
+	}
+	answer := load8(b)
+	free(b)
+	if answer != 'S' {
+		fail "postgres: the server does not support TLS (sslmode needs it)"
+	}
+	base := cast(tls.Config, rec[rTls])
+	name := base.ServerName
+	if name == "" {
+		name = host_of(rec_str(rec, rAddr))
+	}
+	left := try remaining(until)
+	cfg := tls.Config{ServerName: name, RootCAs: base.RootCAs, ALPN: []str{}, Timeout: left, InsecureSkipVerify: base.InsecureSkipVerify}
+	tc := try tls.Client(w, cfg)
+	tlsConns[c] = keep(tc)
+}
+
+// host_of is the host in "host:port" ("[v6]:port" gives v6).
+func host_of(addr str) str {
+	colon := len(addr)
+	for i := 0; i < len(addr); i++ {
+		if addr[i] == ':' {
+			colon = i
+		}
+	}
+	h := addr[:colon]
+	if len(h) >= 2 && h[0] == '[' && h[len(h)-1] == ']' {
+		h = h[1 : len(h)-1]
+	}
+	return h
+}
+
 // alive reports whether an idle connection is still open (the server may have closed it:
 // a restart, wait_timeout).
 func alive(c i64) bool {
 	if c[cNext] != c[cE] { return false }
+	tc := tlsConns[c]
+	if tc != nil {
+		// Records may wait (session tickets): read them; data or an error means not idle.
+		buf := make([]u8, 0, 16)
+		got, err := tc.ReadNow(mut buf, 16)
+		return err == nil && got == 0
+	}
 	b := calloc(1, 8)
 	k := rt_sys_recv(c[cFd], b, 1, 2)
 	e := rt_errno()

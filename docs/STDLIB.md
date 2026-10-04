@@ -293,6 +293,7 @@ try c.Write("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
 - `(c Conn) Fd() i64`: Fd is the connection's descriptor (for waiting on it; never read or write it directly).
 - `(c Conn) Buffered() i64`: Buffered is how many decrypted bytes a Read returns without waiting.
 - `(c mut Conn) Read(buf mut []u8, max i64) !i64`: Read appends up to max bytes of application data to buf and returns how many; after the server's close_notify it fails with EOF (wire.IsEOF), and a connection the server drops without close_notify is a fault, not EOF (a truncation would otherwise look complete).
+- `(c mut Conn) ReadNow(buf mut []u8, max i64) !i64`: ReadNow is Read without waiting: it returns 0 when no application data can be had without waiting for the socket (then wait until Fd is readable and call it again). For clients that run their own non-blocking loop; data TLS has already buffered is always returned first.
 - `(c mut Conn) ReadFull(n i64) !str`: ReadFull reads exactly n bytes.
 - `(c mut Conn) WriteBytes(b []u8) !`: WriteBytes sends all of b.
 - `(c mut Conn) Write(s str) !`: Write sends all of s.
@@ -1156,6 +1157,7 @@ Blocking commands (BLPOP, SUBSCRIBE, ...) would hold up the commands queued behi
 
 - `type Reply enum`: Reply is one Redis reply.
 - `type Options struct`: Options says where and how to connect.
+- `ParseURL(url str) !Options`: ParseURL reads "redis://[[user]:password@]host[:port][/db]"; "rediss://" is the same over TLS 1.3 (TLS is set, so the server's certificate is verified for host).
 - `type Client struct`: Client sends commands to one Redis server. Open it in a global's initializer (which runs on every core) or once in main, not per request.
 - `Open(o Options) Client`: Open makes a client for the server in o. It connects on first use, on each core.
 - `(c Client) Do(q query) !Reply`: Do sends one command and returns its reply; an error reply fails.
@@ -1205,7 +1207,7 @@ for _, r := range rows.Rows {
 
 ## postgres
 
-Package postgres is a PostgreSQL protocol 3.0 client over TCP. Query interpolation binds binary parameters as $1, $2, ...; a plain str cannot be used as SQL. Connections are pooled per core (default 16) and waiting request tasks park without blocking it. Authentication supports SCRAM-SHA-256, MD5 and cleartext. TLS is not supported: use a trusted private network or a local TLS proxy. An SSL-only server is rejected.
+Package postgres is a PostgreSQL protocol 3.0 client over TCP. Query interpolation binds binary parameters as $1, $2, ...; a plain str cannot be used as SQL. Connections are pooled per core (default 16) and waiting request tasks park without blocking it. Authentication supports SCRAM-SHA-256, MD5 and cleartext. Options.SSLMode turns on TLS 1.3 (SSLRequest): "require" encrypts, "verify-full" (the default when Options.TLS is set) also checks the server's certificate and name.
 
 ```go
 var db = postgres.Open(postgres.Options{Addr: "127.0.0.1:5432", User: "app", Password: pw, Database: "shop"})
@@ -1275,3 +1277,12 @@ Reading replay capsules (notes/interface_replay.md, section 6; #242): the envelo
 - `Unseal(data str, key str) !str`: Unseal checks a capsule envelope's tag under key and returns its decrypted body.
 - `Decode(body str) !Capsule`: Decode reads a capsule body (schema 1) and checks every effect record and its kind.
 - `Supported(kind str) bool`: Supported reports whether this build replays effect kind (name@version).
+- `Setup(cores i64) bool`: Setup reads the switches (TIN_REPLAY_DIR, TIN_REPLAY_KEY, TIN_REPLAY_SAMPLE, TIN_REPLAY_MAX_MB, TIN_REPLAY_SECRET_HEADERS, TIN_REPLAY_DROP_HEADERS) for a server on n cores, trims the spool and installs the keyed hash of secrets; it reports whether recording is on (never while TIN_REPLAY_CAPSULE replays a capsule). Call it before the cores start. A missing or malformed key, or a spool that cannot be made, prints one line on stderr and leaves recording off.
+- `On() bool`: On reports whether Setup turned recording on.
+- `Secret(s str) str`: Secret is the handle an effect key or a stored header holds instead of a secret's text: "tin-secret:" and the first 16 bytes of HMAC-SHA256(Ks, s) in hex (section 5.1).
+- `Wanted(status i64, panicked bool) i64`: Wanted is the flags a capsule of a request that ended with status is kept with (1 panicked, 2 sampled), or -1 when it is dropped: kept when the status is 500 or more, or it panicked, or it is in the TIN_REPLAY_SAMPLE fraction.
+- `Done(tp i64, core i64)`: Done ends the recording tape tp of a request served on core: its capsule is written when the request is kept (Wanted), and the tape is freed. A capsule that cannot be written prints one line on stderr; the server goes on.
+- `Write(tp i64, core i64, flags i64) !str`: Write writes the capsule of tape tp (recorded on core, with flags) into the spool, deleting the core's oldest capsules past its share of TIN_REPLAY_MAX_MB; it returns the capsule's path.
+- `Encode(tp i64, core i64, flags i64) str`: Encode is the capsule body of tape tp (section 6): the request with its secret headers as handles and its dropped headers empty, the panic, and the effect records.
+- `Seal(body str) str`: Seal is the envelope of a capsule body (section 6): the magic, a random nonce, the body under the HMAC-SHA256 keystream, and the tag over all of it.
+- `Scrub(req str) str`: Scrub is a request as a capsule stores it: the values of secret headers (section 1) become their handles and the values of dropped headers become empty; everything else is kept.

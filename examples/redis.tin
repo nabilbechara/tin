@@ -6,13 +6,32 @@ import "quarry"
 import "redis"
 import "say"
 
-// A counter and key/value service over Redis (REDIS_ADDR, default 127.0.0.1:6379):
+// A counter and key/value service over Redis (REDIS_URL such as rediss://:pw@host:6380/0 for
+// TLS, or REDIS_ADDR, default 127.0.0.1:6379):
 //   GET /incr?key=K          adds one to K, answers the new value
 //   GET /get?key=K           the value at K, or 404
 //   GET /set?key=K&value=V   stores V at K
 //   GET /twice?key=K         adds two to K in one MULTI/EXEC
 //   GET /sleep?ms=N          makes the server pause (DEBUG SLEEP)
-var c = redis.Open(redis.Options{Addr: quarry.Getenv("REDIS_ADDR"), Password: quarry.Getenv("REDIS_PASSWORD")})
+var c = redis.Open(options())
+
+// options reads REDIS_URL, or REDIS_ADDR and REDIS_PASSWORD. REDIS_TLS_INSECURE=1 skips the
+// certificate check (tests against a self-signed server only).
+func options() redis.Options {
+	url := quarry.Getenv("REDIS_URL")
+	if url == "" {
+		return redis.Options{Addr: quarry.Getenv("REDIS_ADDR"), Password: quarry.Getenv("REDIS_PASSWORD")}
+	}
+	o := redis.ParseURL(url) catch err {
+		say.Line("REDIS_URL:", err)
+		return redis.Options{Addr: "", Password: ""}
+	}
+	t := o.TLS
+	if t != nil && quarry.Getenv("REDIS_TLS_INSECURE") == "1" {
+		t.InsecureSkipVerify = true
+	}
+	return o
+}
 
 func upstream(w mut anvil.Out, err fault) {
 	w.Status(502)

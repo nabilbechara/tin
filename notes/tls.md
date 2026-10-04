@@ -85,6 +85,19 @@ Decisions:
 - After 2^24 records under one key the client sends KeyUpdate.
 
 Tests: `tools/ci/tls_check.py` (CI.md).
+
+## Phase 4: TLS in the database clients
+
+- redis: `Options.TLS` and `ParseURL` (`redis://`, `rediss://user:pw@host:port/db`).
+- mysql: `Options.TLS`; CLIENT_SSL is required from the server, then the SSLRequest packet,
+  `tls.Client` on the socket and the login over TLS. `caching_sha2_password` full
+  authentication sends the NUL-terminated password instead of the RSA exchange.
+- postgres: `Options.SSLMode` (`disable`, `require`, `verify-full`; `verify-full` when
+  `Options.TLS` is set) and SSLRequest; the one-byte answer is read alone (no plaintext
+  injection after it); `require` never falls back to plain TCP, and an unknown mode refuses
+  to connect.
+- Known gap: a TLS write that times out drops the connection (a TLS record cannot be half
+  written and resumed by the client's own loop); reads keep the connection in step.
 The client parses the Certificate message's entries with `ParseCertificate`, puts all but the
 first into an `Intermediates` pool, and calls `leaf.Verify` with `DNSName` set to the server
 name (an IP literal is checked against the IP SANs). `Roots` nil means `SystemRoots()` (read

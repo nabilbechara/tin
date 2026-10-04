@@ -16,6 +16,8 @@ from pathlib import Path
 import re
 import socket
 import socketserver
+import ssl
+import tempfile
 import struct
 import subprocess
 import sys
@@ -72,7 +74,8 @@ class Reader:
 
 
 class Fake:
-    def __init__(self):
+    def __init__(self, ctx=None):
+        self.ctx = ctx
         self.users, self.next_id = {}, 1
         self.lock = threading.Lock()
         self.conns, self.errors = [], []
@@ -164,8 +167,21 @@ class Session:
 
     def auth(self):
         n = int.from_bytes(self.receive(4), 'big')
-        r = Reader(self.receive(n-4))
-        assert r.number(4) == 196608, 'protocol must be 3.0, no SSL negotiation'
+        body = self.receive(n-4)
+        if n == 8 and int.from_bytes(body, 'big') == 80877103:
+            # SSLRequest: S and TLS when this server has a certificate, N otherwise.
+            if self.f.ctx is None:
+                self.s.sendall(b'N')
+                return False
+            self.s.sendall(b'S')
+            self.s = self.f.ctx.wrap_socket(self.s, server_side=True)
+            n = int.from_bytes(self.receive(4), 'big')
+            body = self.receive(n-4)
+        elif self.f.ctx is not None:
+            self.error('28000', 'no pg_hba.conf entry for host, no encryption')
+            return False
+        r = Reader(body)
+        assert r.number(4) == 196608, 'protocol must be 3.0'
         opts = {}
         while True:
             key = r.string()
@@ -587,7 +603,7 @@ def main():
     try:
         shared(exe, env, fake)
         if fake:
-            cases = [('md5','tinpass',200,None),('clear','tinpass',200,None),('tin','wrong',502,b'28P01'),('unicode','I\u00adX e\u0301 \u1100\u1161\u11a8',200,None),('prohibited','\x07ª',200,None),('unknown','tinpass',502,b'authentication method 7'),('tls','tinpass',502,b'TLS is not supported'),('badnonce','tinpass',502,b'server nonce'),('badverifier','tinpass',502,b'server verifier'),('duplicate','tinpass',502,b'duplicate SCRAM'),('badcount','tinpass',502,b'iteration count'),('malformed','tinpass',502,b'message length'),('truncated','tinpass',502,b'unterminated string'),('oversized','tinpass',502,b'message length'),('badrow','tinpass',502,b'truncated message'),('badstatus','tinpass',502,b'transaction status'),('premature','tinpass',502,b'before authentication')]
+            cases = [('md5','tinpass',200,None),('clear','tinpass',200,None),('tin','wrong',502,b'28P01'),('unicode','I\u00adX e\u0301 \u1100\u1161\u11a8',200,None),('prohibited','\x07ª',200,None),('unknown','tinpass',502,b'authentication method 7'),('tls','tinpass',502,b'set Options.SSLMode'),('badnonce','tinpass',502,b'server nonce'),('badverifier','tinpass',502,b'server verifier'),('duplicate','tinpass',502,b'duplicate SCRAM'),('badcount','tinpass',502,b'iteration count'),('malformed','tinpass',502,b'message length'),('truncated','tinpass',502,b'unterminated string'),('oversized','tinpass',502,b'message length'),('badrow','tinpass',502,b'truncated message'),('badstatus','tinpass',502,b'transaction status'),('premature','tinpass',502,b'before authentication')]
             for user, password, code, contains in cases:
                 srv = Server(exe, dict(env, POSTGRES_USER=user, POSTGRES_PASSWORD=password))
                 try:
@@ -616,9 +632,50 @@ def main():
                 srv.stop()
             assert not fake.errors, fake.errors
             print('SCRAM, MD5, cleartext, Unicode, hostile auth/frames, absolute timeout: passed', flush=True)
+            # sslmode against a server without TLS: refused, never plain.
+            for mode, contains in (('require', b'does not support TLS'), ('verify-full', b'does not support TLS'), ('bogus', b'unknown sslmode')):
+                srv = Server(exe, dict(env, POSTGRES_SSLMODE=mode))
+                try:
+                    expect(srv, '/count', 502, contains=contains)
+                finally:
+                    srv.stop()
     finally:
         if fake:
             fake.close()
+    # Once more over TLS 1.3 (sslmode=require): the fake behind Python's ssl, or the real
+    # server (Ubuntu's PostgreSQL has ssl = on with its own certificate).
+    from tls_check import make_certs, openssl3
+    import shutil
+    with tempfile.TemporaryDirectory(prefix='postgres-tls-', dir=out) as tmp:
+        certs = make_certs(openssl3() or shutil.which('openssl'), Path(tmp))
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+        ctx.load_cert_chain(str(certs['ecdsa'][0]), str(certs['ecdsa'][1]))
+        tfake = None if real else Fake(ctx)
+        tenv = dict(env, POSTGRES_SSLMODE='require')
+        if tfake:
+            tenv['POSTGRES_ADDR'] = '127.0.0.1:%d' % tfake.port
+        try:
+            print('-- over TLS 1.3 (sslmode=require)', flush=True)
+            shared(exe, tenv, tfake)
+            if tfake:
+                # verify-full checks the certificate: refused until X.509 verification lands.
+                srv = Server(exe, dict(tenv, POSTGRES_SSLMODE='verify-full'))
+                try:
+                    expect(srv, '/count', 502, contains=b'certificate verification')
+                finally:
+                    srv.stop()
+                # A client without TLS against a TLS-only server gets the hint.
+                srv = Server(exe, dict(tenv, POSTGRES_SSLMODE='disable'))
+                try:
+                    expect(srv, '/count', 502, contains=b'set Options.SSLMode')
+                finally:
+                    srv.stop()
+                assert not tfake.errors, tfake.errors
+                print('sslmode: require over TLS, verify-full checks certificates, disable gets the hint: passed', flush=True)
+        finally:
+            if tfake:
+                tfake.close()
 
 
 if __name__ == '__main__':

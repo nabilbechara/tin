@@ -190,8 +190,13 @@ func (c Conn) send(b []u8) ! {
 
 // fill reads from the socket until n unconsumed bytes are buffered.
 func (c mut Conn) fill(n i64) ! {
+	try c.fill_some(n, true)
+}
+
+// fill_some is fill; without wait it returns false instead of waiting for the socket.
+func (c mut Conn) fill_some(n i64, wait bool) !bool {
 	if c.ine-c.ins >= n {
-		return
+		return true
 	}
 	if c.ins > 0 {
 		copy(c.in, c.in[c.ins:c.ine])
@@ -213,12 +218,16 @@ func (c mut Conn) fill(n i64) ! {
 			continue
 		}
 		if e == EAGAIN {
+			if !wait {
+				return false
+			}
 			try c.wait(1, "read")
 			continue
 		}
 		m := rt_sys_strerror(e)
 		fail say.Fault("tls: read: %s", rt_str_from_raw(m, strlen(m)))
 	}
+	return true
 }
 
 // nonce is the per-record nonce: the IV xor the sequence number (RFC 8446 5.3).
@@ -284,8 +293,18 @@ func (c mut Conn) send_alert(desc i64) {
 // read_record returns the next record's content type and plaintext, decrypting it once read
 // keys exist. Change-cipher-spec records are skipped during the handshake.
 func (c mut Conn) read_record() !(i64, []u8) {
+	typ, data, _ := try c.next_record(true)
+	return typ, data
+}
+
+// next_record is read_record; without wait it gives false (and no record) when a whole record
+// is not buffered and the socket has nothing more yet.
+func (c mut Conn) next_record(wait bool) !(i64, []u8, bool) {
 	for {
-		try c.fill(5)
+		more := try c.fill_some(5, wait)
+		if !more {
+			return 0, []u8{}, false
+		}
 		h := c.in[c.ins : c.ins+5]
 		typ := i64(h[0])
 		n := i64(h[3])<<8 | i64(h[4])
@@ -295,7 +314,10 @@ func (c mut Conn) read_record() !(i64, []u8) {
 		if n > maxCiphertext {
 			fail alert_fault(alertRecordOverflow, "record too large")
 		}
-		try c.fill(5 + n)
+		more = try c.fill_some(5+n, wait)
+		if !more {
+			return 0, []u8{}, false
+		}
 		hdr := clone(c.in[c.ins : c.ins+5])
 		body := c.in[c.ins+5 : c.ins+5+n]
 		c.ins += 5 + n
@@ -313,7 +335,7 @@ func (c mut Conn) read_record() !(i64, []u8) {
 			if n > maxPlaintext {
 				fail alert_fault(alertRecordOverflow, "record too large")
 			}
-			return typ, clone(body)
+			return typ, clone(body), true
 		}
 		if typ != ctApplicationData {
 			fail alert_fault(alertUnexpectedMessage, say.Fmt("unexpected record type %d", typ))
@@ -333,9 +355,9 @@ func (c mut Conn) read_record() !(i64, []u8) {
 		if end > maxPlaintext {
 			fail alert_fault(alertRecordOverflow, "record too large")
 		}
-		return i64(pt[end]), pt[:end]
+		return i64(pt[end]), pt[:end], true
 	}
-	return 0, []u8{}
+	return 0, []u8{}, false
 }
 
 // set_read_key and set_write_key install the keys of a traffic secret (in place once they
