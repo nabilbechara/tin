@@ -1,0 +1,272 @@
+package main
+
+import "say"
+import "tide"
+
+type Inner struct {
+	name str
+	tags []str
+}
+
+type Row struct {
+	name str
+	tags []str
+	counts map[str]i64
+	next ?Inner
+}
+
+type Shape enum {
+	Circle(f64)
+	Label(str)
+	Empty
+}
+
+fn words(n i64) []str {
+	mut out = make([]str, 0, n)
+	for i in 0..n {
+		out = append(out, "w{i}")
+	}
+	return out
+}
+
+fn lookup(name str) ?Inner {
+	if name == "here" {
+		return Inner{name: name, tags: words(1)}
+	}
+	return nil
+}
+
+fn parse(text str) !i64 {
+	if text == "bad" {
+		fail "cannot parse {text}"
+	}
+	return len(text)
+}
+
+// churn takes about 8 MB from the pool it runs in.
+fn churn() i64 {
+	let xs = make([]i64, 1000000)
+	return len(xs)
+}
+
+// Waiting inside an arena while children of an outer scope run in the shared pool.
+fn waitInArena() ! {
+	mut got = make([]str, 3)
+	scope sc {
+		for i in 0..3 {
+			let k = i
+			sc.spawn(fn() ! {
+				try tide.Wait((k + 1) * 5 * tide.Millisecond)
+				got[k] = "child{k}-" + words(2)[1]
+			})
+		}
+		let w = try arena {
+			try tide.Wait(30 * tide.Millisecond)
+			let tmp = words(50)
+			tmp[49]
+		}
+		say.Line("waited:", w)
+	}
+	say.Line("children:", got)
+}
+
+// A scope inside an arena: its children use the arena and end before it.
+fn scopeInArena() ! {
+	let inside = try arena {
+		mut parts = make([]str, 2)
+		scope s2 {
+			for i in 0..2 {
+				let k = i
+				s2.spawn(fn() ! {
+					try tide.Wait(5 * tide.Millisecond)
+					parts[k] = "p{k}"
+				})
+			}
+		}
+		parts[0] + parts[1]
+	}
+	say.Line("inside:", inside)
+}
+
+// Scope children that enter arenas of their own (and wait in them) while sharing a pool.
+fn childArenas() ! {
+	mut out = make([]str, 2)
+	scope s3 {
+		for i in 0..2 {
+			let k = i
+			s3.spawn(fn() ! {
+				let before = words(2)
+				let v = try arena {
+					try tide.Wait((2 - k) * 10 * tide.Millisecond)
+					let t = words(20)
+					t[19] + "/{k}"
+				}
+				out[k] = v + before[1]
+			})
+		}
+		try waitInArena()
+	}
+	say.Line("child arenas:", out)
+}
+
+// A scope child that panics inside an arena: the arena is discarded with the task, and the
+// child's fault (made while the arena was the pool) reaches the scope intact.
+fn childPanics() ! {
+	let held = words(3)
+	scope s4 {
+		s4.spawn(fn() ! {
+			let v = arena {
+				let xs = words(2)
+				xs[9]
+			}
+			say.Line("never", v)
+		})
+	}
+	say.Line("never", held)
+}
+
+fn main() {
+	// Values of every kind come out of the arena as copies in the parent pool.
+	let n = arena {
+		let ws = words(100)
+		len(ws)
+	}
+	say.Line("int:", n)
+	let s = arena {
+		let ws = words(3)
+		ws[0] + ws[1] + ws[2]
+	}
+	say.Line("str:", s)
+	let ws = arena {
+		words(4)
+	}
+	say.Line("slice:", ws, len(ws))
+	let row = arena {
+		mut counts = map[str]i64{}
+		for w in words(3) {
+			counts[w] = len(w)
+		}
+		let inner = Inner{name: "inner", tags: words(1)}
+		Row{name: "row" + "1", tags: words(2), counts: counts, next: inner}
+	}
+	say.Line("struct:", row.name, row.tags, row.counts)
+	let nx = row.next
+	if nx != nil {
+		say.Line("next:", nx.name, nx.tags)
+	}
+	let shapes = arena {
+		[]Shape{Shape.Circle(1.5), Shape.Label("l" + "abel"), Shape.Empty}
+	}
+	say.Line("enum:", shapes)
+	let grouped = arena {
+		mut m = map[str][]i64{}
+		for i in 0..6 {
+			let k = "k{i % 2}"
+			m[k] = append(m[k], i)
+		}
+		m
+	}
+	say.Line("map:", grouped)
+	let none = arena {
+		lookup("missing")
+	}
+	say.Line("nil:", none == nil)
+
+	// try and fail leave the arena with a fault copied out of it.
+	let good = arena {
+		try parse("hello")
+	} catch err {
+		say.Line("never:", err)
+		-1
+	}
+	say.Line("try ok:", good)
+	let bad = arena {
+		try parse("bad")
+	} catch err {
+		say.Line("fault:", err)
+		-1
+	}
+	say.Line("try bad:", bad)
+
+	// Nested arenas: each copies its value into the one around it.
+	let nested = arena {
+		let a = arena {
+			words(2)
+		}
+		let b = arena {
+			"{a[0]}+{a[1]}"
+		}
+		b + "!"
+	}
+	say.Line("nested:", nested)
+
+	// A panic inside an arena inside a guard: the guard gets the fault, the arena is gone,
+	// and the parent pool still holds what it held.
+	let before = words(3)
+	let g = guard {
+		arena {
+			let xs = words(2)
+			xs[5]
+		}
+	} catch err {
+		say.Line("guard:", err)
+		"none"
+	}
+	say.Line("after guard:", g, before, words(2))
+
+	// A batch loop: every step's memory is dropped when its arena ends.
+	mut total i64 = 0
+	for i in 0..50 {
+		total += arena {
+			churn()
+		}
+	}
+	say.Line("batch:", total)
+
+	// A limit around arenas: each arena's chunks are given back when it ends.
+	let lim = limit memory 64mb {
+		mut t i64 = 0
+		for i in 0..20 {
+			t += arena {
+				churn()
+			}
+		}
+		t
+	} catch err {
+		say.Line("limit:", err)
+		0
+	}
+	say.Line("limit total:", lim)
+	let over = limit memory 4mb {
+		arena {
+			churn()
+		}
+	} catch err {
+		say.Line("over:", err)
+		0
+	}
+	say.Line("over value:", over)
+
+	waitInArena() catch err {
+		say.Line("wait:", err)
+	}
+	scopeInArena() catch err {
+		say.Line("scope in arena:", err)
+	}
+
+	childArenas() catch err {
+		say.Line("child arenas:", err)
+	}
+
+	childPanics() catch err {
+		say.Line("child panic:", err)
+	}
+	say.Line("after child panic:", words(3))
+
+	once {
+		let first = arena {
+			"once"
+		}
+		say.Line(first)
+	}
+}
