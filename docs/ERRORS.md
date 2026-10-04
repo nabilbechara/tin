@@ -77,6 +77,128 @@ example.tin:6:1: error E002 IMPORT_ORDER: imports must precede declarations
 
 Fix: move the import up, under the package declaration.
 
+### E010 UNEXPECTED_CHARACTER
+
+Outside strings and comments, a program uses only the characters of Tin's tokens: letters,
+digits, `_`, operators and punctuation.
+
+```tin
+package main
+
+func main() {
+	let price = 5 $ 2
+	_ = price
+}
+```
+
+```text
+example.tin:4:16: error E010 UNEXPECTED_CHARACTER: unexpected character '$'
+```
+
+Fix: remove the character, or put the text in a string.
+
+### E011 INVALID_NUMBER
+
+A number literal uses only the digits of its base (`0x` hexadecimal, `0b` binary, `0o`
+octal), with `_` only between two digits, and an integer literal fits in 64 bits.
+
+```tin
+package main
+
+func main() {
+	let mask = 0x1g
+	_ = mask
+}
+```
+
+```text
+example.tin:4:13: error E011 INVALID_NUMBER: invalid number 0x1g
+```
+
+Fix: correct the digits, or write the number in a base whose digits it uses.
+
+### E012 NUMERIC_UNIT
+
+A unit directly after a number makes a typed constant. The units are `ns`, `us`, `ms`, `s`,
+`m` and `h` for durations and `b`, `kb`, `mb` and `gb` for sizes.
+
+```tin edition=1
+package main
+
+fn main() {
+	let timeout = 30sec
+	_ = timeout
+}
+```
+
+```text
+example.tin:4:16: error E012 NUMERIC_UNIT: unknown numeric unit suffix
+```
+
+Fix: use one of the units (`30s`), or put a space or an operator between the number and the name.
+
+### E013 UNTERMINATED
+
+A string literal is closed by `"` on the line where it starts, a raw string by a backquote
+before the end of the file, and an escape sequence is complete.
+
+```tin
+package main
+
+import "say"
+
+func main() {
+	say.Line("hello)
+}
+```
+
+```text
+example.tin:6:11: error E013 UNTERMINATED: unterminated string literal
+```
+
+Fix: close the string; for text over several lines, use a raw backquote string or `\n`.
+
+### E014 CHAR_LITERAL
+
+A character literal holds exactly one character or escape between single quotes: `'a'`,
+`'\n'`, `'é'`.
+
+```tin
+package main
+
+func main() {
+	let c = 'ab'
+	_ = c
+}
+```
+
+```text
+example.tin:4:10: error E014 CHAR_LITERAL: unterminated character literal
+```
+
+Fix: write one character, or use a string (`"ab"`) for more.
+
+### E015 ESCAPE
+
+A backslash in a string or character starts one of Go's escapes: `\n`, `\t`, `\r`, `\a`,
+`\b`, `\f`, `\v`, `\\`, `\'`, `\"`, up to three octal digits, `\xHH`, `\uHHHH` or `\UHHHHHHHH`.
+
+```tin
+package main
+
+import "say"
+
+func main() {
+	say.Line("C:\path")
+}
+```
+
+```text
+example.tin:6:11: error E015 ESCAPE: unknown escape sequence \p
+```
+
+Fix: double the backslash (`"C:\\path"`), or use a raw backquote string, which has no escapes.
+
 ### E020 UNEXPECTED
 
 The parser found a token where the grammar needs something else. The message names what

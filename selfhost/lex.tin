@@ -89,6 +89,13 @@ fn lx_fail(pos, msg) {
     fatal(e);
 }
 
+// lx_fail_code stops with a coded error (docs/ERRORS.md).
+fn lx_fail_code(pos, code, msg) {
+    let e = err_code(pos, code);
+    buf_str(e, msg);
+    fatal(e);
+}
+
 fn is_letter(c) {
     return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
 }
@@ -189,7 +196,7 @@ fn lx_skip_space() {
             }
         } else if c == '/' && lx_peek(1) == '*' {
             if lx_edition {
-                lx_fail(pos_make(lx_file, lx_line, lx_col), "edition 1 supports // comments, not block comments");
+                lx_fail_code(pos_make(lx_file, lx_line, lx_col), "E090 OLD_SYNTAX", "edition 1 supports // comments, not block comments");
             }
             lx_advance();
             lx_advance();
@@ -228,7 +235,7 @@ fn lex_next() {
     }
     let c = lx_peek(0);
     if lx_edition && c == ';' {
-        lx_fail(pos, "edition 1 statements end at a newline, not a semicolon");
+        lx_fail_code(pos, "E090 OLD_SYNTAX", "edition 1 statements end at a newline, not a semicolon");
     }
     if is_letter(c) {
         let start = lx_i;
@@ -271,7 +278,7 @@ fn lex_next() {
         lx_advance();
         return token_new(TK_PUNCT, one, 0, pos);
     }
-    let e = err_begin(pos);
+    let e = err_code(pos, "E010 UNEXPECTED_CHARACTER");
     buf_str(e, "unexpected character '");
     buf_byte(e, c);
     buf_byte(e, '\'');
@@ -292,7 +299,7 @@ fn lex_float(pos, start) {
             lx_advance();
         }
         if !is_digit(lx_peek(0)) {
-            lx_fail(pos, "invalid float literal");
+            lx_fail_code(pos, "E011 INVALID_NUMBER", "invalid float literal");
         }
         while is_digit(lx_peek(0)) {
             lx_advance();
@@ -307,7 +314,7 @@ fn lex_float(pos, start) {
         }
         unit = unit_name(str_slice(lx_src + unit_start, lx_i - unit_start));
         if !unit {
-            lx_fail(pos, "unknown numeric unit suffix");
+            lx_fail_code(pos, "E012 NUMERIC_UNIT", "unknown numeric unit suffix");
         }
     }
     let text = str_slice(lx_src + start, number_end - start);
@@ -328,7 +335,7 @@ fn lex_raw_string(pos) {
     let b = buf_new();
     while lx_peek(0) != '`' {
         if lx_i >= lx_len {
-            lx_fail(pos, "unterminated raw string literal");
+            lx_fail_code(pos, "E013 UNTERMINATED", "unterminated raw string literal");
         }
         let c = lx_advance();
         if c != '\r' {
@@ -377,7 +384,7 @@ fn lex_number(pos) {
         }
         unit = unit_name(str_slice(lx_src + unit_start, lx_i - unit_start));
         if !unit {
-            lx_fail(pos, "unknown numeric unit suffix");
+            lx_fail_code(pos, "E012 NUMERIC_UNIT", "unknown numeric unit suffix");
         }
     } else {
         while is_letter(lx_peek(0)) || is_digit(lx_peek(0)) {
@@ -440,7 +447,7 @@ fn lex_number(pos) {
     }
     let text = str_slice(s, n);
     if !ok {
-        let e = err_begin(pos);
+        let e = err_code(pos, "E011 INVALID_NUMBER");
         buf_str(e, "invalid number ");
         buf_str(e, text);
         fatal(e);
@@ -484,7 +491,7 @@ fn lex_char(pos) {
     let start = lx_i;
     lx_advance();
     if lx_i >= lx_len || lx_peek(0) == '\n' || lx_peek(0) == '\'' {
-        lx_fail(pos, "invalid character literal");
+        lx_fail_code(pos, "E014 CHAR_LITERAL", "invalid character literal");
     }
     let c = 0;
     if lx_peek(0) == '\\' {
@@ -496,7 +503,7 @@ fn lex_char(pos) {
         c = lx_advance();
     }
     if lx_peek(0) != '\'' {
-        lx_fail(pos, "unterminated character literal");
+        lx_fail_code(pos, "E014 CHAR_LITERAL", "unterminated character literal");
     }
     lx_advance();
     return token_new(TK_INT, str_slice(lx_src + start, lx_i - start), c, pos);
@@ -527,7 +534,7 @@ fn lex_string(pos) {
     let doubled = 0;
     while 1 {
         if lx_i >= lx_len || lx_peek(0) == '\n' {
-            lx_fail(pos, "unterminated string literal");
+            lx_fail_code(pos, "E013 UNTERMINATED", "unterminated string literal");
         }
         let c = lx_advance();
         if c == '"' {
@@ -560,7 +567,7 @@ fn lx_hex(pos, digits) {
     while digits > 0 {
         let c = lx_peek(0);
         if !is_hex_digit(c) {
-            lx_fail(pos, "invalid hex escape");
+            lx_fail_code(pos, "E015 ESCAPE", "invalid hex escape");
         }
         lx_advance();
         v = v * 16 + hex_value(c);
@@ -574,7 +581,7 @@ fn lx_hex(pos, digits) {
 fn lx_escape(pos) {
     lx_esc_rune = 0;
     if lx_i >= lx_len {
-        lx_fail(pos, "unterminated escape sequence");
+        lx_fail_code(pos, "E013 UNTERMINATED", "unterminated escape sequence");
     }
     let c = lx_advance();
     if c == 'n' { return '\n'; }
@@ -608,7 +615,7 @@ fn lx_escape(pos) {
         }
         return v & 255;
     }
-    let e = err_begin(pos);
+    let e = err_code(pos, "E015 ESCAPE");
     buf_str(e, "unknown escape sequence \\");
     buf_byte(e, c);
     fatal(e);
