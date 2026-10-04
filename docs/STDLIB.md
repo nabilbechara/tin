@@ -224,6 +224,23 @@ r := try wire.Get("http://127.0.0.1:8080/json")
 - `DoWith(method str, url str, headers []str, body str, opt Options) !Resp`: DoWith is Do with options: an overall timeout and a response size limit.
 - `(r Resp) Header(name str) str`: Header returns the response header name (any case), or "".
 
+
+Linux name resolution checks `/etc/hosts` before DNS and accepts IPv4 and bracketed IPv6
+literals (including IPv6 scope IDs). DNS reads `/etc/resolv.conf`: up to three `nameserver`
+addresses, `search`/`domain` (up to 32 suffixes), and `options ndots:N timeout:N attempts:N
+rotate`. Defaults are ndots 1, timeout 5 seconds, and two attempts; limits are 15, 30 and 5.
+A trailing dot disables search. Otherwise names meeting ndots are tried as absolute first;
+shorter names try the search list first. Each core rotates its starting server when requested.
+A queries precede AAAA, with IPv4 preferred in the hosts file; the first usable answer wins.
+CNAME chains are bounded to eight hops. UDP queries fall back to TCP on truncation.
+
+Inside anvil tasks, file reads and DNS socket waits yield while other requests run; the
+request deadline covers resolution. `DialTimeout` also bounds Linux DNS and connect waits.
+DNS supports the systemd-resolved stub in resolv.conf. It does not load NSS modules from
+`/etc/nsswitch.conf` (mdns, ldap, nss-resolve), apply RFC 6724 address sorting, perform
+IDNA conversion, infer search domains from the hostname, or cache answers. These are
+intentional differences from glibc `getaddrinfo`. macOS keeps its libSystem resolver.
+
 ## twine
 
 Package twine manipulates UTF-8 strings (like Go's strings), with Unicode case mapping, folding and white space from glyph's tables.
