@@ -1,36 +1,54 @@
 #!/usr/bin/env python3
-"""Build each benchmark with Tin and Go, check outputs match, report best-of-N times.
+"""Compare Tin and Go with alternating runs, output equality and medians.
 
-BENCH_DIR selects the directory (default bench/; bench/v2 is the CPU suite in the README).
-Reference numbers come from Linux (see docs/PERFORMANCE.md, "Benchmark policy")."""
-import os, subprocess, sys, time
+BENCH_DIR selects the suite (default bench/); RUNS defaults to seven.
+Reference performance numbers come from native Linux (docs/PERFORMANCE.md).
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BENCH = os.path.join(ROOT, os.environ.get("BENCH_DIR", "bench"))
-OUT = os.path.join(ROOT, "bin", "bench")
-TIN = os.path.join(ROOT, "tin")
-RUNS = int(os.environ.get("RUNS", "5"))
+from measure import benchmark_names, interleaved, tin_command
 
-def best(cmd, runs=RUNS):
-    times = []
-    out = None
-    for _ in range(runs):
-        t = time.perf_counter()
-        out = subprocess.run(cmd, check=True, capture_output=True).stdout
-        times.append(time.perf_counter() - t)
-    return min(times), out
+ROOT = Path(__file__).resolve().parents[1]
 
-os.makedirs(OUT, exist_ok=True)
-names = sorted(f[:-4] for f in os.listdir(BENCH) if f.endswith(".tin"))
-if len(sys.argv) > 1:
-    names = [n for n in names if n in sys.argv[1:]]
-print(f"{'bench':10} {'tin build':>10} {'go build':>10} {'tin run':>10} {'go run':>10} {'speedup':>8}")
-for name in names:
-    tin_exe, go_exe = os.path.join(OUT, name + "_tin"), os.path.join(OUT, name + "_go")
-    tb, _ = best([TIN, "build", os.path.join(BENCH, name + ".tin"), "-o", tin_exe], 3)
-    # Built from the benchmark's directory, so a go.mod there (bench/v2) is its module.
-    gb, _ = best(["go", "-C", BENCH, "build", "-o", go_exe, name + ".go"], 3)
-    tr, tout = best([tin_exe])
-    gr, gout = best([go_exe])
-    flag = "" if tout == gout else "  OUTPUT MISMATCH"
-    print(f"{name:10} {tb*1000:8.1f}ms {gb*1000:8.1f}ms {tr*1000:8.1f}ms {gr*1000:8.1f}ms {gr/tr:7.2f}x{flag}")
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('names', nargs='*')
+    parser.add_argument('--json', type=Path)
+    args = parser.parse_args()
+    directory = (ROOT / os.environ.get('BENCH_DIR', 'bench')).resolve()
+    runs = int(os.environ.get('RUNS', '7'))
+    if runs < 7:
+        parser.error('RUNS must be at least 7')
+    names = benchmark_names(directory, args.names)
+    subprocess.run(['make', '-s', 'bin/tinc'], cwd=ROOT, check=True)
+    output = ROOT / 'bin/bench'
+    output.mkdir(parents=True, exist_ok=True)
+    records = []
+    print('| benchmark | Tin build ms | Go build ms | Tin run ms | Go run ms | Go/Tin time |')
+    print('|---|---:|---:|---:|---:|---:|')
+    with tempfile.TemporaryDirectory(prefix='reference-', dir=output) as tmp:
+        for name in names:
+            tin_exe, go_exe = Path(tmp) / (name + '_tin'), Path(tmp) / (name + '_go')
+            builds = {'tin': tin_command(ROOT, directory / (name + '.tin'), tin_exe),
+                      'go': {'command': ['go', '-C', str(directory), 'build', '-o',
+                                         str(go_exe), name + '.go']}}
+            build, _ = interleaved(builds, 3, check_output=False)
+            timing, samples = interleaved({'tin': {'command': [str(tin_exe)]},
+                                           'go': {'command': [str(go_exe)]}}, runs)
+            ratio = timing['go'] / timing['tin']
+            print(f"| {name} | {build['tin'] * 1000:.1f} | {build['go'] * 1000:.1f} | "
+                  f"{timing['tin'] * 1000:.1f} | {timing['go'] * 1000:.1f} | {ratio:.3f} |", flush=True)
+            records.append({'benchmark': name, 'seconds': samples, 'go_over_tin': ratio})
+    if args.json:
+        args.json.parent.mkdir(parents=True, exist_ok=True)
+        args.json.write_text(json.dumps({'runs': runs, 'results': records}, indent=2) + '\n')
+
+
+if __name__ == '__main__':
+    main()
