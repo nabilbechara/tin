@@ -440,6 +440,9 @@ fn chk_unary(e, want) {
         if !is_bool_t(t) {
             err_type(e[N_POS], "operator ! needs a bool, not ", t, "");
         }
+        if is_secret(t) {
+            return t;
+        }
         return ty_bool;
     }
     if streq(op, "-") {
@@ -504,6 +507,10 @@ fn unify(l, r, want) {
     }
     if kind_of(lt) == K_UINT && kind_of(rt) == K_UINT {
         return ty_uint;
+    }
+    // An operation on a secret and a plain value of the same type is secret.
+    if lt != rt && secret_join(lt, rt) {
+        return secret_join(lt, rt);
     }
     if lt != rt && !ck_legacy {
         err_types(l[N_POS], "mismatched types ", lt, " and ", rt);
@@ -599,9 +606,15 @@ fn chk_binary(e, want) {
             replace_node(e, mk_int(pos, eval_binary(op, l[INT_VAL], r[INT_VAL]), 0));
             return ty_uint;
         }
+        if is_secret(ct) && !is_untyped(st) {
+            return secret_of(st);
+        }
         return st;
     }
     let t = unify(l, r, want);
+    if is_cmp_op(op) && secret_compare_error(pos, op, l[N_TYPE], r[N_TYPE]) {
+        return ty_bool;
+    }
     if is_cmp_op(op) && kind_of(t) == K_DYN {
         err_at(pos, "cannot compare dyn values: use a method on the shape (?dyn compares against nil)");
         return ty_bool;
@@ -644,6 +657,9 @@ fn chk_binary(e, want) {
         }
         replace_node(e, rt_call(pos, "rt_str_cat", args2(l, r), ty_string));
         e[N_TYPE] = 0;
+        if is_secret(t) {
+            return t;
+        }
         return ty_string;
     }
     if ck_legacy {
@@ -1130,6 +1146,9 @@ fn chk_index(e) {
         }
         replace_node(e, map_read(pos, x, e[IX_I], xt[TY_ELEM]));
         e[N_TYPE] = 0;
+        if is_secret(xt) {
+            return secret_of(xt[TY_ELEM]);
+        }
         return xt[TY_ELEM];
     }
     let it = chk(e[IX_I], ty_int);
@@ -1143,12 +1162,18 @@ fn chk_index(e) {
         replace_node(e, mk_elem(pos, x, e[IX_I], ty_byte, 1));
         mark_safe_index(e);
         e[N_TYPE] = 0;
+        if is_secret(xt) || is_secret(it) {
+            return secret_of(ty_byte);
+        }
         return ty_byte;
     }
     if k == K_SLICE {
         replace_node(e, mk_elem(pos, x, e[IX_I], xt[TY_ELEM], 0));
         mark_safe_index(e);
         e[N_TYPE] = 0;
+        if is_secret(xt) || is_secret(it) {
+            return secret_of(xt[TY_ELEM]);
+        }
         return xt[TY_ELEM];
     }
     err_type(pos, "cannot index ", xt, "");
@@ -1178,6 +1203,9 @@ fn chk_slice(e) {
     if kind_of(xt) == K_STRING {
         replace_node(e, rt_call(pos, "rt_str_sub", args4(x, lo, hi, has_hi), ty_string));
         e[N_TYPE] = 0;
+        if is_secret(xt) {
+            return xt;
+        }
         return ty_string;
     }
     if kind_of(xt) == K_SLICE {
@@ -2231,9 +2259,12 @@ fn chk_args(e, ptypes, variadic, legacy, mask) {
         if i < n {
             want = vec_get(ptypes, i);
         }
+        let adesc = secret_desc(a);
         let at = chk(a, want);
         if i < n && !legacy {
+            secret_arg(e, i, adesc, at, want);
             check_assignable(a, at, want);
+            secret_arg_done();
             if is_untyped(at) {
                 reconvert(a, want);
             }
@@ -2608,6 +2639,9 @@ fn chk_conversion(e, to) {
     }
     let x = arg0(e);
     let from = chk(x, to);
+    if saw_secret && (is_secret(from) || is_secret(to)) {
+        return secret_conversion(e, x, from, to);
+    }
     let fk = kind_of(from);
     let tk = kind_of(to);
     if from == to || (is_untyped(from) && assignable(from, to)) {
@@ -2710,6 +2744,9 @@ fn chk_builtin(e, name, want) {
             let a = vec_get(args, i);
             if a[N_KIND] == EX_UNARY && streq(a[UN_OP], "...") {
                 let at = chk(a[UN_X], st);
+                if kind_of(at) == K_STRING && et == ty_byte && is_secret(at) && !is_secret(st) {
+                    secret_sink_error(a[N_POS], "append would put ", " into a slice that is not secret", 0, at);
+                }
                 if kind_of(at) == K_STRING && et == ty_byte {
                     acc = rt_call(pos, "rt_append_str", args2(acc, a[UN_X]), st);
                 } else {
@@ -2718,7 +2755,7 @@ fn chk_builtin(e, name, want) {
                 }
             } else {
                 let vt = chk(a, et);
-                check_assignable(a, vt, et);
+                check_assignable(a, vt, secret_like(st, et));
                 if is_untyped(vt) {
                     reconvert(a, et);
                 }
@@ -2854,7 +2891,11 @@ fn chk_builtin(e, name, want) {
             return ty_int;
         }
         let dt = chk(arg0(e), 0);
+        let cdesc = secret_desc(vec_get(args, 1));
         let st = chk(vec_get(args, 1), 0);
+        if has_secret(st) && !has_secret(dt) {
+            secret_sink_error(vec_get(args, 1)[N_POS], "copy would put ", " into a slice that is not secret", cdesc, st);
+        }
         if kind_of(st) == K_STRING {
             replace_node(e, rt_call(pos, "rt_copy_str", args2(arg0(e), vec_get(args, 1)), ty_int));
         } else {
@@ -2867,7 +2908,9 @@ fn chk_builtin(e, name, want) {
             err_at(pos, "panic needs one value: panic(\"message\") or panic(err)");
             return ty_void;
         }
+        let pdesc = secret_desc(arg0(e));
         let pt = chk(arg0(e), ty_string);
+        secret_sink(arg0(e)[N_POS], "panic would print ", "", pdesc, pt);
         let msg = arg0(e);
         if kind_of(pt) == K_ERROR {
             msg = rt_call(pos, "rt_err_str", args1(msg), ty_string);
@@ -2882,7 +2925,9 @@ fn chk_builtin(e, name, want) {
             err_at(pos, "fail needs a message");
             return ty_error;
         }
+        let fdesc = secret_desc(arg0(e));
         let ft = chk(arg0(e), ty_string);
+        secret_sink(arg0(e)[N_POS], "fail would put ", " in a fault message", fdesc, ft);
         if kind_of(ft) != K_STRING {
             err_type(pos, "fail needs a str message, not ", ft, "");
         }
@@ -2900,7 +2945,9 @@ fn chk_builtin(e, name, want) {
             err_at(pos, "fault(\"...\") declares a sentinel: write it at package level as var ErrX = fault(\"msg\"), or use fail(\"msg\") for a one-off fault");
             return ty_error;
         }
+        let sdesc = secret_desc(arg0(e));
         let st = chk(arg0(e), ty_string);
+        secret_sink(arg0(e)[N_POS], "fault would put ", " in a fault message", sdesc, st);
         if kind_of(st) != K_STRING {
             err_type(pos, "fault needs a str message, not ", st, "");
         }
@@ -2915,6 +2962,9 @@ fn chk_builtin(e, name, want) {
             return ty_int;
         }
         return lower_keep(e, want);
+    }
+    if streq(name, "reveal") && !ck_legacy {
+        return secret_reveal(e);
     }
     if streq(name, "print") || streq(name, "println") {
         if streq(name, "println") {
@@ -2948,6 +2998,7 @@ fn lower_minmax(e, name, want) {
         reconvert(vec_get(args, i), t);
         i = i + 1;
     }
+    secret_compare_error(pos, name, t, t);
     if !is_numeric_t(t) && kind_of(t) != K_STRING {
         err_type(pos, "cannot compare ", t, "");
     }
@@ -3069,7 +3120,11 @@ fn lower_argo_put(e) {
         return ty_void;
     }
     let v = vec_get(args, 1);
+    let vdesc = secret_desc(v);
     let t = chk(v, 0);
+    if secret_sink(v[N_POS], "argo.Put would encode ", " as JSON", vdesc, t) {
+        return ty_void;
+    }
     if is_untyped(t) {
         t = reconvert(v, default_type(t));
     }
@@ -4600,7 +4655,7 @@ fn chk_interp(e, want) {
     call[CALL_ARGS] = args;
     replace_node(e, call);
     e[N_TYPE] = 0;
-    return lower_say(e, "Fmt", want);
+    return secret_interp_result(e, args, want);
 }
 
 fn lower_say(e, m, want) {
@@ -4615,6 +4670,7 @@ fn lower_say(e, m, want) {
     let printf = streq(m, "Out") || streq(m, "Fmt") || streq(m, "Fault") || streq(m, "To");
     let ln = streq(m, "Line") || streq(m, "LineTo");
     let stmts = vec_new();
+    secret_say_args(args, m);
     if printf {
         if args[VEC_LEN] <= first {
             err_at(pos, "missing format");

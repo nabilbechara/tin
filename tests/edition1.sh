@@ -82,4 +82,37 @@ do
 	fi
 done
 
+# secret T (#239): a secret computes like its plain type and reveal gives it back; every sink
+# rejects it at compile time; tinc -audit-secrets lists every reveal and every secret passed to
+# a library parameter declared secret.
+"$compiler" -edition 1 -o "$tmp/secrets" tests/edition1/run/secrets.tin
+"$tmp/secrets" >"$tmp/secrets.out" 2>/dev/null
+if ! cmp -s tests/edition1/run/secrets.out "$tmp/secrets.out"; then
+	echo "FAIL edition1/run/secrets: output differs"
+	diff -u tests/edition1/run/secrets.out "$tmp/secrets.out" || true
+	exit 1
+fi
+"$compiler" -edition 1 -audit-secrets tests/edition1/run/secrets.tin >"$tmp/secrets.audit"
+if ! cmp -s tests/edition1/run/secrets.audit "$tmp/secrets.audit"; then
+	echo "FAIL edition1/run/secrets: audit differs"
+	diff -u tests/edition1/run/secrets.audit "$tmp/secrets.audit" || true
+	exit 1
+fi
+for name in secret_sinks secret_rules
+do
+	if "$compiler" -edition 1 -o "$tmp/$name" "tests/edition1/$name.tin" >"$tmp/$name.out" 2>"$tmp/$name.err"; then
+		echo "FAIL edition1/$name: unexpectedly accepted"
+		exit 1
+	fi
+	if ! cmp -s "tests/edition1/$name.err" "$tmp/$name.err"; then
+		echo "FAIL edition1/$name: diagnostic mismatch"
+		diff -u "tests/edition1/$name.err" "$tmp/$name.err" || true
+		exit 1
+	fi
+	if "$compiler" -edition 1 -audit-secrets "tests/edition1/$name.tin" >/dev/null 2>&1; then
+		echo "FAIL edition1/$name: audit accepted a rejected program"
+		exit 1
+	fi
+done
+
 echo "PASS edition 1 parser"

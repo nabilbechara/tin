@@ -1072,6 +1072,20 @@ err2 := argo.Get(text, mut xs)      // appends decoded elements
   request handler` (or `panic: segmentation fault ...` outside a request) on stderr and
   status 2, after flushing the output printed before it. Threads have 8 MiB stacks; a
   request handler runs on its task's 256 KiB stack.
+- **Secrets** (edition 1, design_semantics §9): `secret T` qualifies a number, bool, str,
+  slice or map (`token secret str` in a struct, `fn sign(key secret []u8)`). The compiler
+  tracks it and the runtime never sees it: a secret computes exactly like its plain type.
+  A plain value may become secret; a secret becomes plain only through `reveal(x)`.
+  Operators, interpolation, indexing, slicing, conversions, `range` and map reads on a
+  secret give secrets; `len` and `cap` do not. These reject a secret (or a value holding
+  one, such as a struct with a secret field) at compile time: `say` formatting, `panic`,
+  fault messages (`fail`, `wrap`, `fault`, `say.Fault`), `argo.Put`, `copy`/`append` into
+  a plain slice, and every parameter, variable or result not declared `secret` (so
+  logging and any library function that did not opt in). `==`, `!=`, the orderings and
+  `min`/`max` on secrets are errors: compare with `seal.Equal`, which takes constant time.
+  A secret map key is an error. A struct is made secret field by field, not as a whole.
+  `tin audit secrets FILE.tin` lists every `reveal` and every secret passed to a library
+  parameter declared secret, so review knows where secrets leave.
 
 ---
 
@@ -1091,6 +1105,9 @@ Files under `lib/` are trusted and may use operations user code cannot:
   them (variadic C functions need `...` in the declaration); C int results are valid in
   the low 32 bits: convert with `i64(i32(x))`;
 - `shared var` (one process-wide variable, not per core) for the runtime's own state;
+- `secret` parameter types (`func Equal(a secret str, b secret str) bool`): callers may
+  pass secrets, and inside the function the parameter is its plain type. The library is
+  responsible for not leaking the value (section 17);
 - the runtime's `rt_` functions (see RUNTIME.md).
 
 User code that needs these goes through a library package.
