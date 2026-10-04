@@ -484,6 +484,61 @@ func rstr(p mut Parser) str {
 	return ""
 }
 
+// rstrmax is rstr for a str max n (#240): a string longer than n bytes (decoded) fails with
+// fault.LimitExceeded once its length passes n, without reading the rest of it.
+func rstrmax(p mut Parser, n i64) str {
+	ws(mut p)
+	s := p.s
+	i := p.i
+	if i >= len(s) || s[i] != '"' {
+		bad(mut p, "a string")
+		return ""
+	}
+	j := i + 1
+	count := 0
+	for j < len(s) && count <= n {
+		c := s[j]
+		if c == '"' {
+			return rstr(mut p)
+		}
+		if c == '\\' && j+1 < len(s) && s[j+1] == 'u' && j+6 <= len(s) {
+			r := hex4(s, j+2)
+			j += 6
+			if r >= 0xD800 && r < 0xDC00 && j+6 <= len(s) && s[j] == '\\' && s[j+1] == 'u' && hex4(s, j+2) >= 0xDC00 && hex4(s, j+2) < 0xE000 {
+				count += 4
+				j += 6
+			} else if r >= 0 && r < 0x80 {
+				count++
+			} else if r >= 0 && r < 0x800 {
+				count += 2
+			} else {
+				count += 3
+			}
+			continue
+		}
+		if c == '\\' {
+			j++
+		}
+		count++
+		j++
+	}
+	if count <= n {
+		// No closing quote: rstr reports the malformed string.
+		return rstr(mut p)
+	}
+	over(mut p, n)
+	return ""
+}
+
+// over records that the value at p is longer than its bound n (#240): fault.LimitExceeded,
+// and the parser stops.
+func over(p mut Parser, n i64) {
+	if p.err == nil {
+		p.err = cast(fault, rt_fault_wrap(rt_fault_limit(), say.Fmt("argo: the value at offset %d is longer than its bound %d", p.i, n)))
+	}
+	p.i = len(p.s)
+}
+
 func rint(p mut Parser) i64 {
 	ws(mut p)
 	s := p.s

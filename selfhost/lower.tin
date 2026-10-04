@@ -511,6 +511,9 @@ fn unify(l, r, want) {
     if kind_of(lt) == K_UINT && kind_of(rt) == K_UINT {
         return ty_uint;
     }
+    // A bounded operand counts as its unbounded type: the result may be longer (#240).
+    lt = unbounded(lt);
+    rt = unbounded(rt);
     // An operation on a secret and a plain value of the same type is secret.
     if lt != rt && secret_join(lt, rt) {
         return secret_join(lt, rt);
@@ -2721,6 +2724,9 @@ fn chk_builtin(e, name, want) {
     let pos = e[N_POS];
     let args = e[CALL_ARGS];
     let n = args[VEC_LEN];
+    if streq(name, "bound") && !ck_legacy {
+        return chk_bound(e, want);
+    }
     if streq(name, "len") || streq(name, "cap") {
         if n != 1 {
             err_quoted(pos, "", name, " expects 1 argument");
@@ -2745,6 +2751,8 @@ fn chk_builtin(e, name, want) {
             return ty_int;
         }
         let st = chk(arg0(e), want);
+        // append can grow a bounded slice past its bound: the result is unbounded (#240).
+        st = unbounded(st);
         if kind_of(st) != K_SLICE {
             err_type(pos, "first argument to append must be a slice, not ", st, "");
             return ty_int;
@@ -3559,6 +3567,10 @@ fn enum_zero(pos, body, t) {
 // when t cannot be decoded (an error is reported).
 fn argo_value(pos, body, p, t) {
     let k = kind_of(t);
+    if k == K_STRING && t[TY_BOUND] {
+        // A str max n stops reading at the bound (#240).
+        return call_fn(pos, argo_lib(pos, "argo.rstrmax"), args2(sym_ref_node(pos, p), mk_int(pos, t[TY_MAX], ty_int)), ty_string);
+    }
     if k == K_STRING {
         return argo_rd(pos, p, "argo.rstr", ty_string);
     }
@@ -3761,6 +3773,20 @@ fn argo_denum(pos, body, p, x, t) {
     vec_push(body, first);
 }
 
+// argo_bound stops decoding a bounded slice or map x before an element past its bound:
+// if len(x) >= max { argo.over(p, max); return } (#240).
+fn argo_bound(pos, body, p, x, t) {
+    if !t[TY_BOUND] {
+        return;
+    }
+    let ifs = node_new(ST_IF, pos);
+    ifs[IF_COND] = mk_bin(pos, ">=", mk_hdr(pos, sym_ref_node(pos, x), 0), mk_int(pos, t[TY_MAX], ty_int), ty_bool);
+    ifs[IF_THEN] = empty_block(pos);
+    vec_push(ifs[IF_THEN][BLK_STMTS], expr_stmt(call_fn(pos, argo_lib(pos, "argo.over"), args2(sym_ref_node(pos, p), mk_int(pos, t[TY_MAX], ty_int)), ty_void)));
+    vec_push(ifs[IF_THEN][BLK_STMTS], node_new(ST_RETURN, pos));
+    vec_push(body, ifs);
+}
+
 // argo_dfn returns (generating on first use) argo$dN(p mut argo.Parser, x mut T), which
 // fills x from the JSON value at p.
 fn argo_dfn(pos, t) {
@@ -3890,6 +3916,7 @@ fn argo_dfn(pos, t) {
         let w2 = forever(pos);
         vec_push(body, w2);
         let wb2 = w2[WH_BODY][BLK_STMTS];
+        argo_bound(pos, wb2, p, x, t);
         let ev = argo_value(pos, wb2, p, et);
         if ev {
             vec_push(wb2, expr_stmt(rt_call(pos, "rt_append", args3(sym_ref_node(pos, x), elem_bits(ev, t[TY_ELEM]), mk_int(pos, elem_size(t), ty_int)), t)));
@@ -3905,6 +3932,7 @@ fn argo_dfn(pos, t) {
         let w3 = forever(pos);
         vec_push(body, w3);
         let wb3 = w3[WH_BODY][BLK_STMTS];
+        argo_bound(pos, wb3, p, x, t);
         let mk = temp(pos, argo_rd(pos, p, "argo.rkey", ty_string), ty_string);
         vec_push(wb3, mk);
         argo_err_return(pos, wb3, p);
@@ -4736,4 +4764,92 @@ fn arity_error(e, want) {
     buf_str(a, " arguments, got ");
     buf_int(a, e[CALL_ARGS][VEC_LEN]);
     err_end(a);
+}
+
+// ---- bound(x) !T (#240) ----
+//
+// bound(x) checks x against the bounded type its destination has (let v str max 100 = try
+// bound(x), an assignment or a return): a generated bound$N(x) gives x as that type, or
+// fails with fault.LimitExceeded when x is longer than the bound.
+fn chk_bound(e, want) {
+    let pos = e[N_POS];
+    let target = bound_want;
+    bound_want = 0;
+    if (!target || !target[TY_BOUND]) && want && want[TY_BOUND] {
+        target = want;
+    }
+    if e[CALL_ARGS][VEC_LEN] != 1 {
+        err_at(pos, "bound takes one value");
+        return ty_error;
+    }
+    if !target || !target[TY_BOUND] {
+        err_at(pos, "bound needs a bounded destination to check against: write its type (let v str max 100 = try bound(x))");
+        return ty_error;
+    }
+    let plain = target[TY_BOUND];
+    let x = arg0(e);
+    let xt = chk(x, plain);
+    if is_untyped(xt) {
+        reconvert(x, plain);
+        xt = plain;
+    }
+    if !assignable(xt, plain) {
+        err_types(pos, "bound cannot check ", xt, " against ", target);
+        return ty_error;
+    }
+    let w = bound_wrapper(pos, target);
+    e[CALL_NAME] = w[F_NAME];
+    e[CALL_FN] = w;
+    let rts = vec_new();
+    vec_push(rts, target);
+    vec_push(rts, ty_error);
+    let rt = tuple_of(rts);
+    e[N_TYPE] = rt;
+    return rt;
+}
+
+// bound_wrapper builds bound$N(x T) (T max n, fault): x itself, or fault.LimitExceeded.
+fn bound_wrapper(pos, target) {
+    lifted_count = lifted_count + 1;
+    let f = fn_new(pos, "bound");
+    let nb = buf_new();
+    buf_str(nb, "bound$");
+    buf_int(nb, lifted_count);
+    buf_byte(nb, 0);
+    f[F_QNAME] = nb[VEC_DATA];
+    f[F_NAME] = nb[VEC_DATA];
+    f[F_LIFTED] = 2;
+    f[F_FILE] = ck_file;
+    let plain = target[TY_BOUND];
+    vec_push(f[F_PARAMS], "x");
+    vec_push(f[F_PTYPES], plain);
+    vec_push(f[F_RTYPES], target);
+    vec_push(f[F_RTYPES], ty_error);
+    f[F_TYPE] = func_of(f[F_PTYPES], f[F_RTYPES], 0);
+    f[F_LOCALS] = vec_new();
+    f[F_BODY] = empty_block(pos);
+    vec_push(prog_fns, f);
+    let saved_fn = ck_fn;
+    ck_fn = f;
+    let xs = sym_new(SYM_LOCAL, "x", pos);
+    xs[S_TYPE] = plain;
+    xs[S_SLOT] = 0;
+    vec_push(f[F_LOCALS], xs);
+    f[F_SLOTS] = 1;
+    let body = f[F_BODY][BLK_STMTS];
+    let over = node_new(ST_IF, pos);
+    let n = mk_hdr(pos, sym_ref_node(pos, xs), 0);
+    over[IF_COND] = mk_bin(pos, ">", n, mk_int(pos, target[TY_MAX], ty_int), ty_bool);
+    over[IF_THEN] = empty_block(pos);
+    let ob = over[IF_THEN][BLK_STMTS];
+    let fx = rt_call(pos, "rt_fault_over", args2(mk_hdr(pos, sym_ref_node(pos, xs), 0), mk_int(pos, target[TY_MAX], ty_int)), ty_error);
+    vec_push(ob, fault_return(pos, ob, fx));
+    vec_push(body, over);
+    let ret = node_new(ST_RETURN, pos);
+    let v = sym_ref_node(pos, xs);
+    v[N_TYPE] = target;
+    ret[RET_VALUES] = args2(v, mk_int(pos, 0, ty_error));
+    vec_push(body, ret);
+    ck_fn = saved_fn;
+    return f;
 }
