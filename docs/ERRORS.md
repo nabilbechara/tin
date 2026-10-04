@@ -586,6 +586,23 @@ example.tin:3:5: error E091 ONE_PER_DECLARATION: edition 1 declares one name per
 
 Fix: split the declaration: `let width = 640` and `let height = 480` on their own lines.
 
+### E092 NEWER_SYNTAX
+
+Some statements exist only in the newer syntax: `use` needs an edition 1 file, and `defer`
+needs a file written with `func` (the syntax of LANGUAGE.md).
+
+```tin
+fn main() {
+    defer main();
+}
+```
+
+```text
+example.tin:2:5: error E092 NEWER_SYNTAX: defer needs func syntax
+```
+
+Fix: write the file in the syntax the statement needs (`tin fix -edition 1` converts a file).
+
 ## E1xx Names and declarations
 
 ### E101 REDECLARED
@@ -609,6 +626,48 @@ example.tin:5:1: error E101 REDECLARED: 'Reader' is declared as a shape twice
 ```
 
 Fix: rename one of the declarations, or merge them into one.
+
+### E102 BUILTIN_NAME
+
+The compiler's intrinsics (`load8`, `store8` and the names that start with `__`, which the
+standard library uses) are names of their own; a declaration cannot take one of them.
+
+```tin
+package main
+
+func load8(p i64) i64 {
+	return p
+}
+
+func main() {
+}
+```
+
+```text
+example.tin:3:1: error E102 BUILTIN_NAME: 'load8' is a builtin and cannot be redeclared
+```
+
+Fix: give the declaration another name.
+
+### E103 UNDEFINED
+
+Every name refers to a declaration in scope: a local, a parameter, a package-level
+declaration of this package, or an imported package.
+
+```tin
+package main
+
+func main() {
+	var n Count
+	_ = n
+}
+```
+
+```text
+example.tin:4:8: error E103 UNDEFINED: undefined type 'Count'
+```
+
+Fix: declare the name before using it, correct its spelling, or import its package.
 
 ### E110 UNKNOWN_PACKAGE
 
@@ -655,7 +714,157 @@ error E111 LOCK_MISMATCH: tin.lock hash mismatch or missing entry for example.ti
 
 Fix: review the change, then regenerate the file's entry (`shasum -a 256 example.tin`).
 
+### E120 NO_MAIN
+
+A program has a `main` function, where it starts.
+
+```tin
+package main
+
+func Main() {
+}
+```
+
+```text
+error E120 NO_MAIN: no main function
+```
+
+Fix: add `func main()` to the program's `package main`.
+
+### E121 MAIN_SIGNATURE
+
+`main` takes no parameters (the program reads its arguments with `lever`; `(argc, argv)`
+is the legacy form the compiler itself uses), and it is not `extern`.
+
+```tin
+package main
+
+func main(name str) {
+}
+```
+
+```text
+example.tin:3:1: error E121 MAIN_SIGNATURE: main takes no parameters or (argc, argv)
+```
+
+Fix: declare `func main()` and read the command line with the `lever` package.
+
+### E130 INIT_ORDER
+
+Constants and globals are initialized in declaration order, so an initializer uses only
+those declared before it.
+
+```tin
+package main
+
+import "say"
+
+var total i64 = base * 2
+var base i64 = 21
+
+func main() {
+	say.Line(total)
+}
+```
+
+```text
+example.tin:5:17: error E130 INIT_ORDER: the initializer of 'total' uses 'base' before it is initialized (globals are initialized in declaration order)
+```
+
+Fix: move the declaration that is used above the one that uses it.
+
+### E140 RECEIVER
+
+A method belongs to a struct (or enum) type declared in the same package.
+
+```tin
+package main
+
+func (n i64) Double() i64 {
+	return n * 2
+}
+
+func main() {
+}
+```
+
+```text
+example.tin:3:1: error E140 RECEIVER: methods need a struct receiver, not i64
+```
+
+Fix: write a function that takes the value (`func double(n i64) i64`), or declare a struct
+that holds it and give the struct the method.
+
 ## E2xx Types, expressions and calls
+
+### E201 MAP_KEY
+
+A map compares its keys by value, so a key is a `str`, a number, a `bool`, or a struct or
+enum made of those. Slices, maps and other references have no value to compare.
+
+```tin
+package main
+
+func main() {
+	seen := map[[]i64]bool{}
+	_ = len(seen)
+}
+```
+
+```text
+example.tin:4:10: error E201 MAP_KEY: a map key must compare by value (str, numbers, bool, or structs and enums of those), not []i64
+```
+
+Fix: key the map by a value that stands for the slice, such as a `str` built from it, or a
+struct of its fields.
+
+### E202 ARRAY_TYPE
+
+An array `[N]T` has a constant length of zero or more, and its rows of arrays hold numbers,
+`bool`s and `str`s.
+
+```tin
+package main
+
+const size = -2
+
+func main() {
+	var grid [size]i64
+	_ = grid
+}
+```
+
+```text
+example.tin:6:11: error E202 ARRAY_TYPE: array length must not be negative
+```
+
+Fix: give the array a length of zero or more; for other elements, use a slice and `append`.
+
+### E203 NO_ZERO_VALUE
+
+Structs, maps, functions and `dyn` values are never nil, so they have no zero value: a
+variable of such a type needs an initializer, and an array or a slice made with a length
+cannot start with such elements.
+
+```tin
+package main
+
+type Point struct {
+	x i64
+}
+
+func main() {
+	var p Point
+	_ = p
+}
+```
+
+```text
+example.tin:8:2: error E203 NO_ZERO_VALUE: a variable of type Point needs an initializer (it cannot be nil; use ?T for an optional)
+```
+
+Fix: initialize the variable (`p := Point{}`), use `?T` for a value that may be missing, or
+make the slice empty with a capacity (`make([]T, 0, n)`) and `append`.
 
 ### E210 ARG_COUNT
 
@@ -683,6 +892,164 @@ example.tin:11:6: error E210 ARG_COUNT: Max expects 2 arguments, got 3
 
 Fix: pass one argument per parameter; to take any number of values, declare the last
 parameter variadic (`xs ...T`) or pass a slice.
+
+### E220 NOT_CONSTANT
+
+A constant's value, an array length and a constant expression are computed by the compiler,
+so they use only literals, other constants and operators.
+
+```tin
+package main
+
+func size() i64 {
+	return 4
+}
+
+const limit = size()
+
+func main() {
+}
+```
+
+```text
+example.tin:7:15: error E220 NOT_CONSTANT: expression is not a constant
+```
+
+Fix: write the value with literals and constants, or make it a variable.
+
+### E221 CONST_TYPE
+
+An integer constant can be used where its value fits a number type; it cannot become a
+`str`, a `bool` or another non-number.
+
+```tin
+package main
+
+const name str = 7
+
+func main() {
+}
+```
+
+```text
+example.tin:3:7: error E221 CONST_TYPE: cannot use an integer constant as str
+```
+
+Fix: write a constant of the right kind (`const name = "7"`), or convert where it is used.
+
+### E222 DIVISION_BY_ZERO
+
+A constant expression that divides by zero (`/` or `%`) has no value.
+
+```tin
+package main
+
+const parts = 0
+const share = 100 / parts
+
+func main() {
+}
+```
+
+```text
+example.tin:4:19: error E222 DIVISION_BY_ZERO: division by zero in constant expression
+```
+
+Fix: divide by a constant that is not zero.
+
+### E230 TYPE_MISMATCH
+
+A value is used where its type is expected: there are no implicit conversions, so an `i64`
+is not a `str`, an `i32` is not an `i64`, and `str max 3` is not `str max 2`.
+
+```tin
+package main
+
+func main() {
+	var n i64 = "seven"
+	_ = n
+}
+```
+
+```text
+example.tin:4:14: error E230 TYPE_MISMATCH: cannot use str as i64
+```
+
+Fix: convert explicitly (`i64(x)`, `str(b)`, `mint.Atoi(s)`), or give the variable the
+value's type.
+
+### E232 CONDITION
+
+`if`, `for` and the other conditions take a `bool`; numbers, strings and optionals are not
+true or false by themselves.
+
+```tin
+package main
+
+func main() {
+	n := 3
+	if n {
+		n = 0
+	}
+}
+```
+
+```text
+example.tin:5:5: error E232 CONDITION: condition must be a bool, not i64
+```
+
+Fix: compare explicitly (`if n != 0`, `if s != ""`, `if p != nil`).
+
+### E233 UNTYPED_NIL
+
+`nil` has no type of its own; it is a value of an optional (`?T`) or a fault, so it needs a
+type from where it goes.
+
+```tin
+package main
+
+func main() {
+	x := nil
+	_ = x
+}
+```
+
+```text
+example.tin:4:7: error: nil needs an optional (?T) or fault type
+example.tin:4:7: error E233 UNTYPED_NIL: use of untyped nil
+```
+
+Fix: write the type (`var x ?Point = nil`).
+
+### E234 VALUE_COUNT
+
+An assignment has one target per value, and places that take one value (a `try` that
+initializes a variable, a line of `parallel`, the last expression of a boundary block) get
+exactly one.
+
+```tin
+package main
+
+import "say"
+
+func pair() (i64, i64) {
+	return 1, 2
+}
+
+func main() {
+	a := 0
+	b := 0
+	c := 0
+	a, b, c = pair()
+	say.Line(a, b, c)
+}
+```
+
+```text
+example.tin:13:2: error E234 VALUE_COUNT: assignment count mismatch
+```
+
+Fix: give as many names as there are values (use `_` for the ones you do not need).
 
 ### E240 SECRET_TYPE
 
@@ -824,6 +1191,316 @@ example.tin:5:6: error E245 REVEAL: reveal needs a secret value, not str
 Fix: drop the `reveal` from a plain value; for a struct, reveal the secret field itself
 (`reveal(u.token)`).
 
+### E250 BOUND_TYPE
+
+`max N` bounds the length of a `str`, a slice or a map; the bound is a constant of zero or
+more.
+
+```tin edition=1
+package main
+
+fn main() {
+	let count i64 max 5 = 3
+	_ = count
+}
+```
+
+```text
+example.tin:4:12: error E250 BOUND_TYPE: max bounds the length of a str, a slice or a map, not i64
+```
+
+Fix: bound only a `str`, a slice or a map; check a number's range with an `if`.
+
+### E251 UNCHECKED_BOUND
+
+A value goes into a bounded type (`str max 8`) only when its length is known to fit: a
+literal that is short enough, or a value checked with `bound(x)`.
+
+```tin edition=1
+package main
+
+type User struct {
+	name str max 8
+}
+
+fn rename(u mut User, raw str) {
+	u.name = raw
+}
+
+fn main() {
+}
+```
+
+```text
+example.tin:8:11: error E251 UNCHECKED_BOUND: cannot use str as str max 8: its length is unchecked (check it with bound(x), which fails with fault.LimitExceeded)
+```
+
+Fix: check the length with `bound`, which fails with `fault.LimitExceeded` when it does not
+fit: `u.name = try bound(raw)`.
+
+### E260 MISSING_RETURN
+
+A function with results ends with a `return` (or `fail`, `panic`, or an `if`/`switch`/loop
+that does on every path), so it never runs off its end.
+
+```tin
+package main
+
+func sign(n i64) i64 {
+	if n < 0 {
+		return -1
+	}
+}
+
+func main() {
+}
+```
+
+```text
+example.tin:3:1: error E260 MISSING_RETURN: function 'sign' is missing a return at the end
+```
+
+Fix: add the `return` for the remaining paths.
+
+### E261 OUTSIDE_LOOP
+
+`break` and `continue` (without a label) belong to the innermost `for` loop around them.
+
+```tin
+package main
+
+func main() {
+	n := 1
+	if n > 0 {
+		break
+	}
+}
+```
+
+```text
+example.tin:6:3: error E261 OUTSIDE_LOOP: break outside a loop
+```
+
+Fix: use `return` to leave the function, or move the statement into the loop.
+
+### E262 RETURN_COUNT
+
+`return` gives one value per result of the function, and a function without results
+returns none.
+
+```tin
+package main
+
+func both() (i64, str) {
+	return 1
+}
+
+func main() {
+}
+```
+
+```text
+example.tin:4:2: error E262 RETURN_COUNT: wrong number of return values
+```
+
+Fix: return every result, in order (`return 1, "one"`).
+
+### E263 RANGE
+
+`for ... range` walks a slice, an array, a `str` (by rune), a map or a count of integers.
+
+```tin
+package main
+
+type Point struct {
+	x i64
+	y i64
+}
+
+func main() {
+	p := Point{x: 1, y: 2}
+	for i := range p {
+		_ = i
+	}
+}
+```
+
+```text
+example.tin:10:2: error E263 RANGE: cannot range over Point
+```
+
+Fix: range over a slice, map or `str` field of the value, or give the type a method that
+returns one.
+
+### E270 DEFER
+
+A deferred call runs once, when the function returns: so `defer` is not used in a loop,
+and a deferred call does not return a fault it would drop.
+
+```tin
+package main
+
+import "say"
+
+func main() {
+	for i := 0; i < 3; i++ {
+		defer say.Line(i)
+	}
+}
+```
+
+```text
+example.tin:7:3: error E270 DEFER: defer inside a loop would run once per function, not per iteration: move the loop body into a function
+```
+
+Fix: move the loop body into a function and `defer` there; defer a function that handles
+the fault rather than one that returns it.
+
+### E280 QUERY
+
+A parameter of type `query` (a database or Redis command) takes a string literal: the
+values in its `{...}` are sent apart from the text, so a value can never change the command.
+
+```tin
+package main
+
+func run(q query) {
+}
+
+func main() {
+	text := "SELECT name FROM users WHERE id = 7"
+	run(text)
+}
+```
+
+```text
+example.tin:8:6: error E280 QUERY: a query takes a string literal: put values in {...} so they are sent apart from the text, never pasted into it
+```
+
+Fix: write the value in the literal: `run("SELECT name FROM users WHERE id = {id}")`.
+
+### E290 MATCH_PATTERN
+
+A case of a `switch` or an arm of a `match` fits the value: a variant of the enum it
+matches, with as many names as the variant has values, or a literal or range of a number or
+`str`.
+
+```tin
+package main
+
+type Shape enum {
+	Circle(r f64),
+	Rect(w, h f64),
+}
+
+func area(s Shape) f64 {
+	switch s {
+	case Circle(r):
+		return 3 * r * r
+	case Rect(w):
+		return 1
+	}
+	return 0
+}
+
+func main() {
+}
+```
+
+```text
+example.tin:12:7: error E290 MATCH_PATTERN: Rect has 2 values, the case binds 1
+```
+
+Fix: name every value of the variant (`case Rect(w, h)`), and match only variants of the
+enum.
+
+### E291 MATCH_EXHAUSTIVE
+
+A `switch` on an enum, and a `match` that gives a value, handle every variant (or have a
+`default` / `_` arm), so adding a variant shows every place to update.
+
+```tin
+package main
+
+type Light enum {
+	Red,
+	Amber,
+	Green,
+}
+
+func next(l Light) Light {
+	switch l {
+	case Red:
+		return Light.Green
+	case Green:
+		return Light.Amber
+	}
+	return l
+}
+
+func main() {
+}
+```
+
+```text
+example.tin:10:2: error E291 MATCH_EXHAUSTIVE: switch on Light does not handle Amber (add the cases, or a default)
+```
+
+Fix: add the missing cases, or a `default` arm when the rest share one answer.
+
+### E292 MATCH_UNREACHABLE
+
+Every arm can be reached: an arm after one that matches every value, or a variant that an
+earlier arm already handles, never runs.
+
+```tin edition=1
+package main
+
+fn describe(n i64) str {
+	return match n {
+		_ => "any",
+		0 => "zero",
+	}
+}
+
+fn main() {
+}
+```
+
+```text
+example.tin:6:3: error E292 MATCH_UNREACHABLE: this arm is never reached: an earlier arm matches every value
+```
+
+Fix: remove the arm, or move the catch-all `_` arm last.
+
+### E293 MATCH_VALUE
+
+A `match` that gives a value has an arm that gives one, and then every arm gives one (or
+leaves with `return`, `break`, `continue` or `fail`).
+
+```tin edition=1
+package main
+
+import "say"
+
+fn main() {
+	let n = 2
+	let s = match n {
+		1 => "one",
+		_ => {
+			say.Line("other")
+		},
+	}
+	say.Line(s)
+}
+```
+
+```text
+example.tin:10:7: error E293 MATCH_VALUE: this arm gives no value
+```
+
+Fix: end each block arm with its value, or leave from it.
+
 ## E3xx Memory and regions
 
 ### E310 REQUEST_ESCAPE
@@ -943,6 +1620,34 @@ example.tin:9:11: error E313 USE_AFTER_RESET: 's' may hold request memory from b
 
 Fix: `keep()` the value before the reset, or create it again after.
 
+### E320 KEEP_TYPE
+
+`keep(x)` copies a value into the long-lived heap, following every reference in it; a type
+that contains itself through references would need a copy without end.
+
+```tin
+package main
+
+type Node struct {
+	next ?Node
+}
+
+var head ?Node = nil
+
+func main() {
+	n := Node{next: nil}
+	head = keep(n)
+}
+```
+
+```text
+example.tin:0:0: error E320 KEEP_TYPE: keep cannot copy the recursive type Node
+example.tin:0:0: error E320 KEEP_TYPE: keep cannot copy the recursive type ?Node
+```
+
+Fix: keep a flat value instead (an index into a kept slice, or the fields you need), or
+build the structure in long-lived memory from kept parts.
+
 ## E4xx Faults and optionals
 
 ### E401 CATCH_PLACEMENT
@@ -966,6 +1671,215 @@ example.tin:7:31: error E401 CATCH_PLACEMENT: catch goes on a whole statement, i
 ```
 
 Fix: give the call its own statement (`let n = mint.Atoi("2") catch _ { 0 }`) and use the result.
+
+### E402 FAULT_RESULT
+
+A function that can fail says so in its result: `!T` (or `!(A, B)`, or `!` for no value),
+not a `fault` in the result list.
+
+```tin
+package main
+
+func parse() (i64, fault) {
+	return 1, nil
+}
+
+func main() {
+}
+```
+
+```text
+example.tin:3:1: error E402 FAULT_RESULT: write a result that can fail as !T (or ! when there is no value), not with a fault result
+```
+
+Fix: write `func parse() !i64`, `return v` on success and `fail "msg"` on failure.
+
+### E410 UNCHECKED_FAULT
+
+A fault is never dropped: each call that can fail is checked (`try`, `catch` or `v, err :=`
+and a test of `err`), a fault variable is read, and `_` cannot discard one.
+
+```tin
+package main
+
+import "mint"
+
+func main() {
+	mint.Atoi("12")
+}
+```
+
+```text
+example.tin:6:6: error E410 UNCHECKED_FAULT: the fault this call returns is ignored (check it, or use try)
+```
+
+Fix: pass it upward with `try`, handle it with `catch`, or test the `err` you assign.
+
+### E411 NO_FAULT_RESULT
+
+`try`, `fail` and `use` can leave the function with a fault, so the function's result says
+it can fail (`!T`).
+
+```tin
+package main
+
+import "mint"
+
+func count(s str) i64 {
+	return try mint.Atoi(s)
+}
+
+func main() {
+}
+```
+
+```text
+example.tin:6:2: error E411 NO_FAULT_RESULT: try needs the enclosing function to return a fault (write its result as !T)
+```
+
+Fix: declare the result as `!i64` (and its callers check it), or handle the fault in place
+with `catch`.
+
+### E412 RETURN_FAULT
+
+In a function returning `!T`, `return` gives only the values; a fault leaves through `fail`.
+
+```tin
+package main
+
+func load() !i64 {
+	return 1, nil
+}
+
+func main() {
+}
+```
+
+```text
+example.tin:4:2: error E412 RETURN_FAULT: a !T function returns only its values: use fail to return a fault
+```
+
+Fix: write `return 1`, and `fail err` where the function fails.
+
+### E413 WRAP
+
+`try E wrap "msg"` adds context to the fault `try` passes upward, so `wrap` goes with a
+`try`, and its message is a `str`.
+
+```tin edition=1
+package main
+
+import "mint"
+
+fn readCount(s str) !i64 {
+	return mint.Atoi(s) wrap "reading the count"
+}
+
+fn main() {
+}
+```
+
+```text
+example.tin:6:22: error E413 WRAP: wrap adds context to the fault try passes upward: write try E wrap "msg"
+```
+
+Fix: pass the fault upward with `try`: `try mint.Atoi(s) wrap "reading the count"`.
+
+### E414 NOT_FALLIBLE
+
+`try` and `catch` handle the fault of a call that can fail (one returning `!T`); a call
+that cannot fail needs neither.
+
+```tin
+package main
+
+func two() i64 {
+	return 2
+}
+
+func twice() i64 {
+	return two() catch _ { 0 }
+}
+
+func main() {
+}
+```
+
+```text
+example.tin:8:2: error E414 NOT_FALLIBLE: catch needs a call whose result can be a fault (!T)
+```
+
+Fix: remove the `try` or `catch`.
+
+### E415 CATCH_VALUE
+
+A `catch` block that gives the value of a call ends with that value, or leaves (`return`,
+`break`, `continue` or `fail`); when the call gives several values, the block leaves.
+
+```tin
+package main
+
+import "mint"
+import "say"
+
+func main() {
+	n := mint.Atoi("x") catch _ {
+		say.Line("not a number")
+	}
+	say.Line(n)
+}
+```
+
+```text
+example.tin:8:6: error E415 CATCH_VALUE: a catch block must end with the value to use, or leave (return, break, continue or fail)
+```
+
+Fix: end the block with the value to use (`0`), or leave from it.
+
+### E416 FAIL_VALUE
+
+`fail` takes a `str` message or a fault.
+
+```tin
+package main
+
+func check(n i64) ! {
+	if n < 0 {
+		fail n
+	}
+}
+
+func main() {
+}
+```
+
+```text
+example.tin:5:3: error E416 FAIL_VALUE: fail needs a str message or a fault, not i64
+```
+
+Fix: `fail "negative count"`, or `fail say.Fault("bad count %d", n)`.
+
+### E420 OPTIONAL_TYPE
+
+Only references can be optional (`?T`): `str`, slices, maps, structs and `dyn` values. A
+number or a `bool` always has a value.
+
+```tin
+package main
+
+func show(n ?i64) {
+}
+
+func main() {
+}
+```
+
+```text
+example.tin:3:13: error E420 OPTIONAL_TYPE: only references (str, slices, maps, structs, dyn) can be optional, not i64
+```
+
+Fix: use a separate `bool` (or `v, ok`) for a missing number, or keep the number in a
+struct and make the struct optional.
 
 ## E5xx Generics, shapes and dyn
 
@@ -1289,6 +2203,28 @@ example.tin:5:11: error E515 DYN_PARAM_NAME: a parameter of type dyn S needs a n
 
 Fix: name the parameter: `func Send(w dyn io.Writer)`.
 
+### E516 DYN_OBJECT
+
+A `dyn S` value holds a struct or enum value together with its method table; numbers,
+strings and other types are not objects.
+
+```tin
+package main
+
+shape Sized { Size() i64 }
+
+func main() {
+	var s dyn Sized = 3
+	_ = s
+}
+```
+
+```text
+example.tin:6:20: error E516 DYN_OBJECT: only a struct or enum can be a dyn object, not untyped int
+```
+
+Fix: wrap the value in a struct that has the shape's methods.
+
 ### E520 DYN_CONSTRAINT
 
 A constraint names a shape; `dyn S` is a value type, not a constraint.
@@ -1426,6 +2362,216 @@ example.tin:4:15: error E525 SHAPE_METHOD_CONFLICT: shape Both has two methods n
 
 Fix: rename one of the methods, or make the signatures the same.
 
+### E530 DYN_NOT_YET
+
+Some uses of `dyn` are planned but not built yet (#141): a `dyn` value in a map, a `!dyn`
+result, and formatting a `dyn` value.
+
+```tin
+package main
+
+shape Sized { Size() i64 }
+
+func main() {
+	m := map[str]dyn Sized{}
+	_ = len(m)
+}
+```
+
+```text
+example.tin:6:7: error E530 DYN_NOT_YET: a map value of type dyn is the next step: the map stores 16-byte slots with the table (#141)
+```
+
+Fix: keep the values in a `[]dyn S` and map the keys to indexes, or use the concrete type
+until the feature lands.
+
+## E6xx Concurrency, boundaries and lifecycle
+
+### E601 SHARED_GLOBAL
+
+Globals are per core: each core thread has its own copy. A `shared` variable, which every
+core would see, is limited to the runtime's own state in the standard library.
+
+```tin
+package main
+
+shared var hits i64 = 0
+
+func main() {
+}
+```
+
+```text
+example.tin:3:12: error E601 SHARED_GLOBAL: shared mutable state across cores is not allowed: globals are per core (use const, or relay messages)
+```
+
+Fix: use a per-core global (`var hits i64`), a `const`, or send the data to the core that
+owns it with `relay`.
+
+### E602 GO
+
+There is no `go` statement: work runs per core (`hearth`), cores talk through `relay`, and
+a request's own concurrent work runs in a `scope` (edition 1).
+
+```tin
+package main
+
+func work() {
+}
+
+func main() {
+	go work()
+}
+```
+
+```text
+example.tin:7:2: error E602 GO: go is not allowed: cores share nothing (run work per core with hearth, talk across cores with relay)
+```
+
+Fix: spawn the work as a child of a scope, or run it per core with `hearth`.
+
+### E610 UNKNOWN_EVENT
+
+`on` runs a block at a lifecycle event: `app.start`, `app.stop`, `core.start`, `core.stop`,
+`server.overload` or `server.recovered`.
+
+```tin edition=1
+package main
+
+on app.begin {
+}
+
+fn main() {
+}
+```
+
+```text
+example.tin:3:7: error E610 UNKNOWN_EVENT: unknown event: on takes app.start, app.stop, core.start, core.stop, server.overload or server.recovered
+```
+
+Fix: use one of the listed events.
+
+### E620 USE_RESOURCE
+
+`use x = f()` opens a resource and closes it when the scope ends: `f` can fail (returns
+`!T`), and `T` has a method `Close() !`.
+
+```tin edition=1
+package main
+
+type Conn struct {
+	n i64
+}
+
+fn connect() !Conn {
+	return Conn{n: 1}
+}
+
+fn work() ! {
+	use c = connect()
+	_ = c
+}
+
+fn main() {
+}
+```
+
+```text
+example.tin:12:2: error E620 USE_RESOURCE: use needs a resource: Conn has no method Close() !
+```
+
+Fix: give the type a `Close() !` method, or open it with a plain `let` when there is
+nothing to close.
+
+### E621 USE_PLACEMENT
+
+A `use` closes its resource when the function returns, so it is not written in a loop,
+where it would close only once.
+
+```tin edition=1
+package main
+
+type Conn struct {
+	n i64
+}
+
+fn (c Conn) Close() ! {
+}
+
+fn connect() !Conn {
+	return Conn{n: 1}
+}
+
+fn work() ! {
+	for i in 0..3 {
+		use c = connect()
+	}
+}
+
+fn main() {
+}
+```
+
+```text
+example.tin:16:3: error E621 USE_PLACEMENT: use inside a loop would close once per function, not per iteration: move the loop body into a function
+```
+
+Fix: move the loop body into a function that has the `use`.
+
+### E630 SELECT_ARM
+
+An arm of `select` waits on `l.Recv()` (a lane), `t.wait()` (a task), `after(d)` or
+`canceled()`; `after` and `canceled` give no value to bind.
+
+```tin edition=1
+package main
+
+fn first() !str {
+	select {
+		let x = after(30ms) => return "late"
+	}
+	return "none"
+}
+
+fn main() {
+}
+```
+
+```text
+example.tin:5:3: error E630 SELECT_ARM: after(d) and canceled() give no value to bind
+```
+
+Fix: write `after(30ms) => ...` without a name.
+
+### E640 SCOPE_ESCAPE
+
+A scope and the task handles it gives (`spawned`) live only as long as the scope block, so
+they stay in local variables and parameters: no globals, fields, results, kept closures or
+detached tasks.
+
+```tin edition=1
+package main
+
+import "tide"
+
+fn work() ! {
+	try tide.Wait(tide.Millisecond)
+}
+
+fn give(s scope) spawned {
+	return s.spawn(work)
+}
+
+fn main() {
+}
+```
+
+```text
+example.tin:9:1: error E640 SCOPE_ESCAPE: a function cannot return a task handle (spawned): it must not outlive its scope block, so it lives only in local variables and parameters
+```
+
+Fix: wait for the task inside the scope block, and return its value rather than its handle.
+
 ## E7xx mut parameters
 
 ### E701 NOT_MUT
@@ -1455,6 +2601,125 @@ example.tin:8:12: error E701 NOT_MUT: cannot modify parameter 'b': declare it mu
 
 Fix: declare the parameter `mut` (`func add(b mut Box, s str)`) and call it with `add(mut box, s)`, or
 return the new value instead.
+
+### E702 MUT_VALUE_PARAM
+
+A `mut` parameter lets a function change what the caller passed, which works for structs,
+slices and maps (references). A number, `bool` or `str` is passed by value, so `mut` on it
+could not reach the caller.
+
+```tin
+package main
+
+func bump(n mut i64) {
+	n = n + 1
+}
+
+func main() {
+}
+```
+
+```text
+example.tin:3:1: error E702 MUT_VALUE_PARAM: parameter 'n' is mut, but a value of type i64 is passed by value: only structs, slices and maps can be modified through a parameter, so remove mut
+```
+
+Fix: return the new value (`func bump(n i64) i64`), or keep the number in a struct and pass
+the struct `mut`.
+
+### E703 CAPTURE_MUT
+
+A function literal cannot capture a `mut` parameter: it could outlive the call and modify
+the caller's value later.
+
+```tin
+package main
+
+func fill(xs mut []i64) {
+	add := func(v i64) {
+		xs = append(xs, v)
+	}
+	add(1)
+}
+
+func main() {
+}
+```
+
+```text
+example.tin:4:9: error E703 CAPTURE_MUT: a function literal cannot capture the mut parameter 'xs': copy it into a local first, or pass it as an argument
+```
+
+Fix: copy it into a local first, or pass it to the literal as an argument.
+
+### E704 MUT_PARAM_REBIND
+
+Assigning a whole new value to a `mut` parameter rebinds only this function's copy, and the
+caller would not see it; a `mut` parameter is changed through its fields and elements.
+
+```tin
+package main
+
+type Box struct {
+	n i64
+}
+
+func reset(b mut Box) {
+	b = Box{n: 0}
+}
+
+func main() {
+}
+```
+
+```text
+example.tin:8:2: error E704 MUT_PARAM_REBIND: cannot assign to mut parameter 'b': it would rebind only this function's copy, and the caller would not see it; modify its fields or elements, or return the new value
+```
+
+Fix: change the fields (`b.n = 0`), or return the new value.
+
+### E710 NOT_ASSIGNABLE
+
+An assignment's target is a variable, a field, or an element of a slice, array or map;
+constants, functions and the bytes of a `str` cannot be assigned.
+
+```tin
+package main
+
+const limit = 10
+
+func main() {
+	limit = 20
+}
+```
+
+```text
+example.tin:6:2: error E710 NOT_ASSIGNABLE: cannot assign to constant 'limit'
+```
+
+Fix: use a variable for a value that changes; build a new `str` instead of changing one.
+
+## E8xx Trusted code
+
+### E801 TRUSTED_ONLY
+
+`extern` declarations, raw memory access and the runtime's internals are only allowed in
+the standard library (`lib/`), which is trusted code.
+
+```tin
+package main
+
+extern func getpid() i64
+
+func main() {
+}
+```
+
+```text
+example.tin:3:8: error E801 TRUSTED_ONLY: extern is only allowed in the standard library
+```
+
+Fix: use the standard library package that wraps the call (`quarry` for the process and
+files).
 
 ## E9xx Building
 
@@ -1554,6 +2819,28 @@ No example: it takes a function with hundreds of local variables.
 
 Fix: split the function, or keep the values in a slice or a struct instead of separate
 locals.
+
+### E907 TOO_MANY_PARAMS
+
+A function takes at most 8 parameters of each register kind (integers and references, and
+floats) and returns at most 8 results.
+
+```tin
+package main
+
+func sum(a i64, b i64, c i64, d i64, e i64, f i64, g i64, h i64, i i64) i64 {
+	return a + b + c + d + e + f + g + h + i
+}
+
+func main() {
+}
+```
+
+```text
+example.tin:3:1: error E907 TOO_MANY_PARAMS: function 'sum' has 9 parameters, the limit is 8
+```
+
+Fix: pass a struct (or a slice) that holds the values.
 
 ### E990 INTERNAL
 

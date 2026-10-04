@@ -1,0 +1,43 @@
+package main
+
+import "anvil"
+import "say"
+import "tide"
+
+// A custom admission policy (#238, design_semantics §11): at most two requests may wait on a
+// core; past that, new requests get 503 with Retry-After before their handler runs. The first
+// refusal makes the server OVERLOADED (on server.overload); a request admitted a second after
+// the last refusal makes it RUNNING again (on server.recovered).
+
+on server.overload {
+	say.Line("overload")
+}
+
+on server.recovered {
+	say.Line("recovered")
+}
+
+fn admit(l anvil.Load) bool {
+	return l.Waiting < 2
+}
+
+fn slow(q anvil.Req, w mut anvil.Out) {
+	tide.Wait(3 * tide.Second) catch err {
+		w.Text("fault: {err}")
+		return
+	}
+	w.Text("slow ok")
+}
+
+fn fast(q anvil.Req, w mut anvil.Out) {
+	w.Text("fast ok")
+}
+
+fn main() {
+	anvil.Admit(admit)
+	mut r = anvil.NewRouter()
+	r.Get("/slow", slow)
+	r.Get("/fast", fast)
+	let err = r.Serve(":0")
+	say.Line(err)
+}

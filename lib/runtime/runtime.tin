@@ -1062,6 +1062,9 @@ func rt_panic(msg str) {
 	rt_write_all(2, cast(i64, msg)+8, len(msg))
 	rt_write_all(2, cast(i64, "\n")+8, 1)
 	rt_backtrace(__fp())
+	if t != 0 && t[tTape]&-2 != 0 {
+		rt_tape_panic(t[tTape]&-2, msg) // the capsule keeps the first panic (#241)
+	}
 	if g := rt_guard_target(); g != 0 {
 		if t != 0 && t[tRecoverable] != 0 {
 			t[tRecover] = 1
@@ -3393,6 +3396,8 @@ const lifeAppStop = 2
 const lifeCoreStart = 3
 const lifeCoreStop = 4
 const lifeUseClose = 5
+const lifeOverload = 6
+const lifeRecovered = 7
 
 shared var lifeFns i64   // [n, cap, then kind, function, label for each]; set before cores start
 shared var lifeCores i64 // the cores hearth.Run starts, core 0 included
@@ -3448,6 +3453,28 @@ func rt_life_run(kind i64, fatal bool) {
 			}
 		}
 	}
+}
+
+// rt_life_overload runs the on server.overload handlers (with recovered, the on
+// server.recovered ones) in a detached task of this core: the server is serving, so a handler
+// that waits must not hold the core up. Their faults are logged.
+func rt_life_overload(recovered bool) {
+	if lifeFns == 0 {
+		return
+	}
+	if recovered {
+		rt_detach(life_recovered)
+	} else {
+		rt_detach(life_overloaded)
+	}
+}
+
+func life_overloaded() ! {
+	rt_life_run(lifeOverload, false)
+}
+
+func life_recovered() ! {
+	rt_life_run(lifeRecovered, false)
 }
 
 // rt_life_fail ends startup with label's fault f: the message, then exit status 1.
@@ -4402,6 +4429,9 @@ func (s scope) spawn(f func() !) spawned {
 	r[spNext] = b[bLand]
 	b[bLand] = r
 	t := rt_task_new(rt_child_main, r)
+	if curTask != 0 {
+		t[tTape] = curTask[tTape] & -2 // a request's children share its replay tape (#241)
+	}
 	r[spTask] = t
 	if rt_bnd_task(t, b, bkTask) != nil {
 		// Over the task budget of a limit around the scope (#235).

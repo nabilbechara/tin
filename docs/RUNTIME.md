@@ -439,6 +439,15 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   A function-level `use x = e` is `let x = try e` plus a deferred `x.Close()` (it also runs
   while a panic unwinds); a fault from `Close` is joined after the function's own fault.
   `anvil.Drain(d)` starts the same graceful shutdown as SIGTERM from code, with grace `d`.
+- Admission (#238, design_semantics §11). `anvil.Admit(p)` (before `Serve`) sets a policy that
+  decides each new request after the built-in limits and before its handler runs, on the core
+  it arrived on: `p(anvil.Load)` sees that core's waiting request tasks, live connections, bytes
+  buffered for requests still arriving, and the requests it refused so far. `false` answers 503
+  with `Retry-After: 1` from static bytes (no allocation, no handler) and keeps the connection
+  when the client does. The first refusal on any core makes the server OVERLOADED and runs the
+  `on server.overload` handlers; once every shedding core has admitted a request at least a
+  second after its last refusal, the `on server.recovered` handlers run. These run in a
+  detached task of the core that saw the transition, so a wait in one does not hold the core.
 - Tasks can wait on each other: `rt_task_park(timeout)` waits until another task calls
   `rt_task_wake(t)`; woken tasks go on a per-core ready queue that the loop drains on its
   next turn (it does not block while the queue has tasks). `rt_task_defer()` puts the

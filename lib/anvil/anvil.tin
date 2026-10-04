@@ -111,6 +111,8 @@ shared var gCores i64
 shared var gRelay func(i64, str)
 shared var gRelayOn bool
 shared var gTick func(i64)
+shared var gAdmit func(Load) bool // the admission policy (Admit), nil: the built-in limits only
+shared var gOverCores i64 // cores whose admission policy is shedding (server.overload while > 0)
 shared var gTickMs i64
 shared var gPipes i64   // [read fd, write fd] per core
 shared var gSpare i64   // an fd core 0 closes to accept and drop a connection when out of fds
@@ -160,6 +162,8 @@ shared var gDeadlineSet bool
 
 const maxWaiting = 4096 // waiting request tasks per core; past it new requests get 503
 var waiting i64        // this core's request tasks that are waiting
+var shedCount i64      // requests this core's admission policy refused
+var shedAt i64         // when this core last shed (mono ns), 0: it is not overloaded
 
 var fdTask i64  // fd -> the request task waiting on it (client sockets)
 var doneRd i64  // the read end of this core's helper-job pipe
@@ -1179,6 +1183,19 @@ func serve_one(c i64, p i64, n i64) i64 {
 		bad(c, 503)
 		return total
 	}
+	if gAdmit != nil {
+		if !gAdmit(Load{Core: myID, Waiting: waiting, Conns: __atomic_load(gLoad + myID*128), Buffered: bufBytes, Shed: shedCount}) {
+			overloaded()
+			shed(c, sp1 == 4 && load8(p) == 'H' && bytes_are(p, 4, "HEAD"), http10 && alive)
+			if !alive {
+				c[cClose] = 1
+			}
+			return total
+		}
+		if shedAt != 0 && rt_mono_ns()-shedAt >= recoverNs {
+			recovered()
+		}
+	}
 	// The handler runs in a task: when it waits (tide.Wait, a client call) the core serves
 	// other connections, and this one's later requests queue until it finishes.
 	pReq = p
@@ -1454,6 +1471,68 @@ func Timeouts(header i64, read i64, idle i64, write i64) {
 	gIdleMs = idle
 	gWriteMs = write
 	gTimeoutsSet = true
+}
+
+// Load is what an admission policy sees of the core a new request arrived on: its waiting
+// request tasks, live connections, bytes buffered for requests still arriving, and how many
+// requests the policy refused so far (design_semantics §11).
+type Load struct {
+	Core     i64
+	Waiting  i64
+	Conns    i64
+	Buffered i64
+	Shed     i64
+}
+
+// Admit sets the admission policy (call before Serve): after the built-in limits, p decides
+// each new request before its handler runs; false answers 503 with Retry-After: 1 without
+// running the handler. Every core calls p with its own Load.
+func Admit(p func(Load) bool) {
+	gAdmit = p
+}
+
+// recoverNs is how long a core admits every request after its last refusal before it counts
+// as recovered: the hysteresis between server.overload and server.recovered.
+const recoverNs = 1000000000
+
+// overloaded notes that this core shed a request: the first core to shed makes the server
+// OVERLOADED and runs the on server.overload handlers.
+func overloaded() {
+	if shedAt == 0 && __atomic_add(&gOverCores, 1) == 0 {
+		rt_life_overload(false)
+	}
+	shedAt = rt_mono_ns()
+}
+
+// recovered notes that this core admitted a request recoverNs after it last shed: when no
+// core sheds any more the server is RUNNING again and the on server.recovered handlers run.
+func recovered() {
+	shedAt = 0
+	if __atomic_add(&gOverCores, -1) == 1 {
+		rt_life_overload(true)
+	}
+}
+
+// shed answers a request the admission policy refused from static bytes, so refusing
+// allocates nothing; the connection stays open when the client keeps it alive.
+func shed(c i64, hd bool, keep10 bool) {
+	shedCount++
+	ob_room(256)
+	ob_str("HTTP/1.1 503 Service Unavailable\r\n")
+	ob_raw(common, commonLen)
+	ob_str("Retry-After: 1\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 19\r\n")
+	if draining {
+		ob_str("Connection: close\r\n")
+	} else if keep10 {
+		ob_str("Connection: keep-alive\r\n")
+	}
+	ob_str("\r\n")
+	if !hd {
+		ob_str("Service Unavailable")
+	}
+	if draining {
+		c[cClose] = 1
+	}
 }
 
 // Limits sets the largest request body in bytes (413 past it), the bytes of requests still
