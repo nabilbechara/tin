@@ -66,16 +66,93 @@ with both compilers and their matching library trees. The shell entrypoint
 `bench/http/run_wrk.sh` keeps its positional arguments and also accepts
 `--base-api /path/to/base-server --head-api /path/to/head-server` (at least five rounds).
 
+## v0.4 service benchmark (Linux)
+
+`GET /users/{id}` through Redis over MySQL, Tin (`bench/v04/users.tin`) against Go + chi,
+go-redis and go-sql-driver/mysql (`bench/v04/go`), under wrk2 (`bench/v04/run.py`, workflow
+`.github/workflows/bench.yml`). Three scenarios over random ids 1..10000: **cached** (every
+read hits Redis), **db** (`/db/users/{id}`, a MySQL prepared statement per request) and
+**mixed** (cached reads with 0.5% `/slow` requests that answer after 50 ms). Each runs at an
+open-ended rate (maximum throughput, and requests per CPU-second of server time) and at a
+fixed rate of 70% of the slower server's maximum for the latency percentiles (wrk2 corrects
+for coordinated omission).
+
+**Machine:** GitHub-hosted `ubuntu-24.04` runner (image 20260927.320.1), AMD EPYC 7763,
+4 vCPUs (2 cores × 2 threads) under Hyper-V, Linux 6.17.0-1022-azure x86_64, Go 1.26.8,
+Redis 7.2.16, MySQL 8.0.46 (service containers), wrk2 giltene/wrk2@44a94c1, Tin 6e138af.
+**Placement:** each server has 2 cores (`TIN_CORES=2`, `GOMAXPROCS=2`) pinned to CPUs 0–1;
+wrk2 (2 threads, 128 connections), Redis and MySQL share CPUs 2–3. Each run is 20 s after a
+3 s warm-up; rounds alternate the servers, and Redis is emptied before every run so each run
+warms its own cache. The table is the median of 5 rounds,
+[workflow run 37210593145](https://github.com/yasserreslan/tin/actions/runs/37210593145).
+
+This is a shared runner, so **the ratios are the result**; absolute numbers vary between
+runs. Tin/Go ratios of the medians (throughput above 1 and latency below 1 favour Tin):
+
+| scenario | max req/s | req per CPU-s | p50 | p99 | p99.9 |
+|---|---:|---:|---:|---:|---:|
+| cached | **3.72** | **3.60** | 0.77 | 0.56 | 0.34 |
+| db | **1.23** | **1.75** | 1.21 | 1.30 | 0.89 |
+| mixed | **3.56** | **3.56** | 0.79 | 0.99 | 0.99 |
+
+An earlier run of the same workflow (run
+[37209296644](https://github.com/yasserreslan/tin/actions/runs/37209296644), 3 rounds,
+before Redis was emptied per run) gave 3.93 / 1.19 / 3.75 for max req/s and 3.74 / 1.72 /
+3.62 for req per CPU-s: the throughput ratios hold within a few percent between runs.
+
+Medians of this run, for scale only:
+
+| scenario | server | max req/s | req per CPU-s | fixed req/s | p50 ms | p99 ms | p99.9 ms | RSS MB |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| cached | Tin | 81,864 | 54,576 | 15,392 | 1.27 | 2.42 | 2.92 | 50 |
+| cached | Go + chi | 21,989 | 15,165 | 15,392 | 1.64 | 4.34 | 8.57 | 25 |
+| db | Tin | 17,157 | 21,446 | 9,773 | 1.98 | 5.45 | 6.51 | 28 |
+| db | Go + chi | 13,962 | 12,230 | 9,773 | 1.63 | 4.20 | 7.29 | 22 |
+| mixed | Tin | 78,636 | 54,187 | 15,444 | 1.23 | 42.43 | 52.06 | 48 |
+| mixed | Go + chi | 22,063 | 15,216 | 15,444 | 1.56 | 43.01 | 52.38 | 26 |
+
+What the numbers say:
+
+- **Cached reads:** Tin serves 3.7× the requests and 3.6× the requests per CPU-second, with
+  lower latency at every percentile. A core's requests share one Redis connection and their
+  commands go out together (`lib/redis`), where go-redis takes a pooled connection per
+  command. Tin's fixed-rate p99 was 2.41–2.45 ms in all 5 rounds.
+- **Database reads:** Tin's throughput lead is smaller (1.2×, 1.75× per CPU-second) because
+  MySQL does most of the work. Latency at the fixed rate is not a clear win either way: Tin's
+  p99 per round was 3.17–6.05 ms against Go's 4.10–7.53 ms, with the medians 5.45 against
+  4.20 here and 3.30 against 7.95 in the earlier run.
+- **Mixed:** the p99 (about 42 ms) and p99.9 (about 52 ms) are the same for both servers.
+  This is head-of-line blocking in the client, not the server: wrk2 sends one request at a
+  time per HTTP/1.1 connection, so the requests scheduled behind a 50 ms `/slow` on its
+  connection wait for it. At about 120 requests per second per connection, each `/slow`
+  delays about 6 of them, roughly 3% of all requests, which puts p99 inside that wait. The
+  servers themselves are not blocked: Tin's maximum throughput with `/slow` mixed in is 96%
+  of its cached-only rate (78.6k against 81.9k req/s), since a waiting request does not
+  hold up its core.
+- **Memory:** Tin's RSS is higher here (48–50 MB against 25–26 MB in the Redis scenarios,
+  28 against 22 MB for db; not broken down in this run), so memory is a trade-off in this
+  benchmark, not a win.
+
+**Tin's fixed-rate p99** (about 10 ms in the first noisy trial on a loaded Mac, issue #74)
+is not a problem in the Redis client's hand-off between waiting requests: on the runner it
+is 2.4 ms in every round. Two artifacts of the harness made the tails jump, for either
+server: all cached keys came from one warm-up with a 60 s TTL and expired together in the
+middle of a later run (a burst of MySQL reads), and the default Redis configuration forked
+a snapshot every minute. In run 37209296644, before the fix, Go had single rounds at 109 ms
+and 145 ms p99. `run.py` now empties Redis before every run and turns snapshots off. A
+route that does not touch Redis showed the same occasional spikes as `/users/{id}` in a
+side-by-side test on a shared VM, and Redis added about 1.5 ms at p99, its round trip.
+
+Run it yourself: Actions, Benchmark v0.4, Run workflow (inputs: rounds, seconds per run).
+Locally, `bench/v04/run.py` needs Redis, MySQL seeded by `bench/v04/seed.py` and a wrk2
+binary; `SERVER_CPUS` / `WRK_CPUS` pin the servers and wrk2 to separate CPUs.
+
 ## Measurement setup of the existing numbers (macOS development machine)
 
 Measured on an Apple M3 Pro (5 performance + 6 efficiency cores), Go 1.26, fasthttp
 1.74, wrk 4.2 (4.1 inside Linux containers), the load generator always on the same
 machine as the server. Linux numbers come from an arm64 Debian container under Docker
 Desktop, running natively. Scripts: TOOLING.md §7.
-
-The v0.4 service benchmark (`GET /users/{id}` through Redis over MySQL, Tin vs Go + chi
-under wrk2, `bench/v04`) is built but not yet measured on a quiet machine; its results
-will go here (issue #74).
 
 ## 1. HTTP
 

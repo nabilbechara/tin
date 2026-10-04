@@ -1,11 +1,13 @@
 package main
 
 import "anvil"
+import "flume"
 import "mint"
 import "mysql"
 import "postgres"
 import "quarry"
 import "redis"
+import "relay"
 import "say"
 import "tide"
 import "websocket"
@@ -47,6 +49,16 @@ func wait_in(kind str) ! {
 	case "file":
 		s := try quarry.ReadFile(quarry.Getenv("FIFO"))
 		say.Line(len(s))
+	case "relay":
+		from, msg := try relay.Next()
+		say.Line(from, msg)
+	case "stdin":
+		s := try quarry.ReadStdin()
+		say.Line(len(s))
+	case "flume":
+		r := flume.New(0)
+		line, ok := try r.Line()
+		say.Line(line, ok)
 	}
 }
 
@@ -117,6 +129,38 @@ func within(q anvil.Req, w mut anvil.Out) {
 	w.Text("inner: {inner}; ms: {ms}; after: {after}")
 }
 
+// within_in gives a block a 50 ms deadline around a wait in one client (#316).
+func within_in(q anvil.Req, w mut anvil.Out) {
+	b := tide.ProbeEnter()
+	tide.ProbeDeadline(b, 50)
+	start := tide.Now()
+	inner := "no fault"
+	wait_in(q.PathParam("kind")) catch err {
+		inner = say.Str(err)
+	}
+	ms := (tide.Now() - start) / tide.Millisecond
+	tide.ProbeLeave(b)
+	after := "ok"
+	tide.Wait(tide.Millisecond) catch err {
+		after = say.Str(err)
+	}
+	w.Text("inner: {inner}; ms: {ms}; after: {after}")
+}
+
+// relay_next waits in relay.Next until /relay-send gives this core a message (#316).
+func relay_next(q anvil.Req, w mut anvil.Out) {
+	from, msg := relay.Next() catch err {
+		w.Text("fault: {err}")
+		return
+	}
+	w.Text("from {from}: {msg}")
+}
+
+func relay_send(q anvil.Req, w mut anvil.Out) {
+	relay.Send(relay.Me(), q.PathParam("msg"))
+	w.Text("sent")
+}
+
 // hog takes about 64 MiB of request memory, past a TIN_REQUEST_MEMORY budget.
 func hog(q anvil.Req, w mut anvil.Out) {
 	total := 0
@@ -155,6 +199,9 @@ func main() {
 	r.Get(`/nested/{i}`, nested)
 	r.Get(`/outer/{i}`, outer)
 	r.Get(`/within`, within)
+	r.Get(`/within/{kind}`, within_in)
+	r.Get(`/relay-next`, relay_next)
+	r.Get(`/relay-send/{msg}`, relay_send)
 	r.Get(`/plain`, plain)
 	r.Get(`/hog`, hog)
 	r.Get(`/cpu-cancel`, cpu_cancel)
