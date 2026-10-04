@@ -11,7 +11,7 @@ func main() {
 	fmt.Println("map error -1 22")
 	fmt.Println("mapping 71 91 0")
 	fmt.Println("poll 0 0")
-	fmt.Println("clock true true 22 true")
+	fmt.Println("clock true true 22 true true")
 	st, err := os.Stat(filepath.Join(os.Args[1], "file"))
 	if err != nil {
 		panic(err)

@@ -1,5 +1,8 @@
 # Tin v0.5 syntax (decided 2026-10-01)
 
+> **Superseded** by [design_syntax.md](design_syntax.md) (2026-10-04) for the Tin 1 milestone. This
+> record stays as the description of the current syntax until the edition-1 parser lands.
+
 Theme: **Go, plus what matters made visible.** Tin keeps Go's syntax so models write it
 fluently, and adds a small set of features that show, where they happen, what can fail
 (`!T`, `try`, `catch`, `fail`), what gets modified (call-site `mut`) and every case of a
