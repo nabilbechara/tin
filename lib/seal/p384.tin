@@ -1,0 +1,218 @@
+package seal
+
+// ---- NIST P-384 (secp384r1) and short Weierstrass curves with a = -3 over a monty ----
+// The same complete formulas as p256.tin (Renes, Costello and Batina 2016, algorithms 4 and 6),
+// written once over a curve value, so P-384 needs only its constants. The Montgomery constants
+// come from monty_new on first use (once per core). Used for ECDSA verification: public data.
+
+// ecCurve is a curve y^2 = x^3 - 3x + b: its field, its scalars mod n and b and G in Montgomery form.
+type ecCurve struct {
+	name str
+	size i64
+	f monty
+	n monty
+	b []u64
+	gx []u64
+	gy []u64
+	t [][]u64
+}
+
+// ecpt is a projective point (X:Y:Z), coordinates in Montgomery form; the identity is (0:1:0).
+type ecpt struct {
+	x []u64
+	y []u64
+	z []u64
+}
+
+// ec_new builds a curve from big-endian hex p, n, b, Gx and Gy.
+func ec_new(name str, ph str, nh str, bh str, gxh str, gyh str) !ecCurve {
+	pb := try HexDecode(ph)
+	nb := try HexDecode(nh)
+	f := try monty_new(pb)
+	n := try monty_new(nb)
+	c := ecCurve{name: name, size: len(pb), f: f, n: n, b: f.elem(), gx: f.elem(), gy: f.elem()}
+	for i := 0; i < 8; i++ {
+		c.t = append(c.t, f.elem())
+	}
+	bb := try HexDecode(bh)
+	gx := try HexDecode(gxh)
+	gy := try HexDecode(gyh)
+	if c.f.from_bytes(mut c.b, monty_bytes(c.f, bb)) == 0 || c.f.from_bytes(mut c.gx, monty_bytes(c.f, gx)) == 0 ||
+		c.f.from_bytes(mut c.gy, monty_bytes(c.f, gy)) == 0 {
+		fail "seal: bad curve constants for " + name
+	}
+	return c
+}
+
+var p384cache ?ecCurve
+
+// p384_curve is P-384, built on first use.
+func p384_curve() !ecCurve {
+	c := p384cache
+	if c != nil {
+		return c
+	}
+	built := try ec_new("P-384",
+		"fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff",
+		"ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973",
+		"b3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875ac656398d8a2ed19d2a85c8edd3ec2aef",
+		"aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7",
+		"3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f")
+	p384cache = keep(built)
+	return built
+}
+
+func ec_identity(c ecCurve) ecpt {
+	p := ecpt{x: c.f.elem(), y: c.f.elem(), z: c.f.elem()}
+	c.f.set(mut p.y, c.f.one)
+	return p
+}
+
+func ec_generator(c ecCurve) ecpt {
+	p := ec_identity(c)
+	c.f.set(mut p.x, c.gx)
+	c.f.set(mut p.z, c.f.one)
+	c.f.set(mut p.y, c.gy)
+	return p
+}
+
+// ec_add sets r = p + q (complete); r may alias p or q.
+func ec_add(c mut ecCurve, r mut ecpt, p ecpt, q ecpt) {
+	t0 := c.t[0]
+	t1 := c.t[1]
+	t2 := c.t[2]
+	t3 := c.t[3]
+	t4 := c.t[4]
+	x3 := c.t[5]
+	y3 := c.t[6]
+	z3 := c.t[7]
+	c.f.mul(mut t0, p.x, q.x)
+	c.f.mul(mut t1, p.y, q.y)
+	c.f.mul(mut t2, p.z, q.z)
+	c.f.add(mut t3, p.x, p.y)
+	c.f.add(mut t4, q.x, q.y)
+	c.f.mul(mut t3, t3, t4)
+	c.f.add(mut t4, t0, t1)
+	c.f.sub(mut t3, t3, t4)
+	c.f.add(mut t4, p.y, p.z)
+	c.f.add(mut x3, q.y, q.z)
+	c.f.mul(mut t4, t4, x3)
+	c.f.add(mut x3, t1, t2)
+	c.f.sub(mut t4, t4, x3)
+	c.f.add(mut x3, p.x, p.z)
+	c.f.add(mut y3, q.x, q.z)
+	c.f.mul(mut x3, x3, y3)
+	c.f.add(mut y3, t0, t2)
+	c.f.sub(mut y3, x3, y3)
+	c.f.mul(mut z3, c.b, t2)
+	c.f.sub(mut x3, y3, z3)
+	c.f.add(mut z3, x3, x3)
+	c.f.add(mut x3, x3, z3)
+	c.f.sub(mut z3, t1, x3)
+	c.f.add(mut x3, t1, x3)
+	c.f.mul(mut y3, c.b, y3)
+	c.f.add(mut t1, t2, t2)
+	c.f.add(mut t2, t1, t2)
+	c.f.sub(mut y3, y3, t2)
+	c.f.sub(mut y3, y3, t0)
+	c.f.add(mut t1, y3, y3)
+	c.f.add(mut y3, t1, y3)
+	c.f.add(mut t1, t0, t0)
+	c.f.add(mut t0, t1, t0)
+	c.f.sub(mut t0, t0, t2)
+	c.f.mul(mut t1, t4, y3)
+	c.f.mul(mut t2, t0, y3)
+	c.f.mul(mut y3, x3, z3)
+	c.f.add(mut y3, y3, t2)
+	c.f.mul(mut x3, t3, x3)
+	c.f.sub(mut x3, x3, t1)
+	c.f.mul(mut z3, t4, z3)
+	c.f.mul(mut t1, t3, t0)
+	c.f.add(mut z3, z3, t1)
+	c.f.set(mut r.x, x3)
+	c.f.set(mut r.y, y3)
+	c.f.set(mut r.z, z3)
+}
+
+// ec_double sets r = 2p (complete); r may alias p.
+func ec_double(c mut ecCurve, r mut ecpt, p ecpt) {
+	t0 := c.t[0]
+	t1 := c.t[1]
+	t2 := c.t[2]
+	t3 := c.t[3]
+	x3 := c.t[5]
+	y3 := c.t[6]
+	z3 := c.t[7]
+	c.f.mul(mut t0, p.x, p.x)
+	c.f.mul(mut t1, p.y, p.y)
+	c.f.mul(mut t2, p.z, p.z)
+	c.f.mul(mut t3, p.x, p.y)
+	c.f.add(mut t3, t3, t3)
+	c.f.mul(mut z3, p.x, p.z)
+	c.f.add(mut z3, z3, z3)
+	c.f.mul(mut y3, c.b, t2)
+	c.f.sub(mut y3, y3, z3)
+	c.f.add(mut x3, y3, y3)
+	c.f.add(mut y3, x3, y3)
+	c.f.sub(mut x3, t1, y3)
+	c.f.add(mut y3, t1, y3)
+	c.f.mul(mut y3, x3, y3)
+	c.f.mul(mut x3, x3, t3)
+	c.f.add(mut t3, t2, t2)
+	c.f.add(mut t2, t2, t3)
+	c.f.mul(mut z3, c.b, z3)
+	c.f.sub(mut z3, z3, t2)
+	c.f.sub(mut z3, z3, t0)
+	c.f.add(mut t3, z3, z3)
+	c.f.add(mut z3, z3, t3)
+	c.f.add(mut t3, t0, t0)
+	c.f.add(mut t0, t3, t0)
+	c.f.sub(mut t0, t0, t2)
+	c.f.mul(mut t0, t0, z3)
+	c.f.add(mut y3, y3, t0)
+	c.f.mul(mut t0, p.y, p.z)
+	c.f.add(mut t0, t0, t0)
+	c.f.mul(mut z3, t0, z3)
+	c.f.sub(mut x3, x3, z3)
+	c.f.mul(mut z3, t0, t1)
+	c.f.add(mut z3, z3, z3)
+	c.f.add(mut z3, z3, z3)
+	c.f.set(mut r.x, x3)
+	c.f.set(mut r.y, y3)
+	c.f.set(mut r.z, z3)
+}
+
+// ec_decode reads an uncompressed point (0x04 x y) and checks that it is on the curve.
+func ec_decode(c mut ecCurve, b []u8) !ecpt {
+	p := ec_identity(c)
+	if len(b) != 1+2*c.size || b[0] != 4 {
+		fail "seal: invalid " + c.name + " point encoding"
+	}
+	if c.f.from_bytes(mut p.x, monty_bytes(c.f, b[1:1+c.size])) == 0 || c.f.from_bytes(mut p.y, monty_bytes(c.f, b[1+c.size:])) == 0 {
+		fail "seal: " + c.name + " coordinate out of range"
+	}
+	rhs := c.f.elem()
+	t := c.f.elem()
+	c.f.mul(mut rhs, p.x, p.x)
+	c.f.mul(mut rhs, rhs, p.x)
+	c.f.add(mut t, p.x, p.x)
+	c.f.add(mut t, t, p.x)
+	c.f.sub(mut rhs, rhs, t)
+	c.f.add(mut rhs, rhs, c.b)
+	c.f.mul(mut t, p.y, p.y)
+	if c.f.equal(t, rhs) == 0 {
+		fail "seal: " + c.name + " point is not on the curve"
+	}
+	c.f.set(mut p.z, c.f.one)
+	return p
+}
+
+// ec_affine_x is p's affine x as size big-endian bytes, and 0 for the identity, else 1.
+func ec_affine_x(c mut ecCurve, p ecpt) ([]u8, u64) {
+	zi := c.f.elem()
+	c.f.inv(mut zi, p.z)
+	x := c.f.elem()
+	c.f.mul(mut x, p.x, zi)
+	b := c.f.to_bytes(x)
+	return b[len(b)-c.size:], 1 ^ c.f.is_zero(p.z)
+}
