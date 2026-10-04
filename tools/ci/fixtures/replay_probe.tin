@@ -69,8 +69,35 @@ func Run() {
 	say.Line("live kind:", a, "ran", ran)
 
 	say.Line("secret handle unkeyed:", rt_secret_key("hunter2"))
+	children()
 	rt_tape_free(tp)
 	rt_tape_free(rp)
 	rt_tape_free(rq)
 	rt_tape_free(rl)
+}
+
+// children: a scope child shares its parent task's tape, and a panic's message goes on it.
+func children() {
+	s := rt_scope_open()
+	s.spawn(func() ! {
+		tp := rt_tape_new(1)
+		rt_tape_set(curTask, tp)
+		inner := rt_scope_open()
+		inner.spawn(func() ! {
+			say.Line("child shares the tape:", rt_tape() == tp)
+			panic("boom in child")
+		})
+		panicked := false
+		rt_scope_close(inner) catch err {
+			panicked = err != nil
+		}
+		say.Line("child panicked:", panicked, "message on the tape:", tp[11] != 0 && tp[12] == len("boom in child"))
+		rt_tape_set(curTask, 0)
+		rt_tape_free(tp)
+	})
+	ok := true
+	rt_scope_close(s) catch err {
+		ok = err == nil
+	}
+	say.Line("scope:", ok)
 }

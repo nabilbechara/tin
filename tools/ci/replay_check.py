@@ -23,6 +23,9 @@ sticky: true ran 0
 mismatch: replay: divergence at effect 0: got test@1 "other", recorded test@1 "first"
 live kind: fresh ran 1
 secret handle unkeyed: tin-secret:unkeyed
+child shares the tape: true
+child panicked: true message on the tape: true
+scope: true
 '''
 
 
@@ -45,7 +48,7 @@ def main():
         if result.stdout != EXPECTED:
             raise SystemExit('FAIL replay tapes: output differs\n--- want\n' + EXPECTED +
                              '--- got\n' + result.stdout)
-    print('PASS replay tapes: record, replay without live calls, fault identity, divergence, live kinds')
+    print('PASS replay tapes: record, replay without live calls, fault identity, divergence, live kinds, children share the tape, panics on it')
 
 
 if __name__ == '__main__':
