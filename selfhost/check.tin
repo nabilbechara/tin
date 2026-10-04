@@ -3522,6 +3522,38 @@ fn sel_name(pos, kind, i) {
 
 var sel_seq;
 
+// sel_site is a select's replay key (#243): its file's base name, ":" and its line.
+fn sel_site(pos) {
+    let f = vec_get(files, pos >> 48);
+    let i = 0;
+    let base = 0;
+    while load8(f + i) != 0 {
+        if load8(f + i) == '/' {
+            base = i + 1;
+        }
+        i = i + 1;
+    }
+    let b = buf_new();
+    buf_str(b, f + base);
+    buf_byte(b, ':');
+    buf_int(b, (pos >> 16) & 0xffffffff);
+    return str_node(pos, b);
+}
+
+// sel_gate is arm i's replay gate (#243): $selr < 0 (not replaying) || $selr == i.
+fn sel_gate(pos, r, i) {
+    return binary_new(pos, "||", sel_cmp(pos, r, "<", 0), sel_cmp(pos, r, "==", i));
+}
+
+// sel_gated runs stmt only when arm i's replay gate is open.
+fn sel_gated(pos, r, i, stmt) {
+    let ifs = node_new(ST_IF, pos);
+    ifs[IF_COND] = sel_gate(pos, r, i);
+    ifs[IF_THEN] = empty_block(pos);
+    vec_push(ifs[IF_THEN][BLK_STMTS], stmt);
+    return ifs;
+}
+
 fn lower_select(s) {
     let pos = s[N_POS];
     sel_seq = sel_seq + 1;
@@ -3581,6 +3613,14 @@ fn lower_select(s) {
     one[INT_VAL] = 1;
     m1[UN_X] = one;
     vec_push(st, sel_let(pos, armv, m1));
+    // Replay (#243): -1 off, -2 recording the winner, else the recorded arm, the only one taken.
+    let selr = sel_name(pos, "$selr", 0);
+    let rargs = vec_new();
+    vec_push(rargs, sel_site(pos));
+    let nlit = node_new(EX_INT, pos);
+    nlit[INT_VAL] = n;
+    vec_push(rargs, nlit);
+    vec_push(st, sel_let(pos, selr, sel_call(pos, "rt_select_begin", rargs)));
     // for $sel < 0 { readiness checks in order; else watch, park, unwatch }
     let loop = node_new(ST_WHILE, pos);
     loop[WH_COND] = sel_cmp(pos, armv, "<", 0);
@@ -3606,7 +3646,7 @@ fn lower_select(s) {
             cond = sel_call(pos, "rt_select_canceled", vec_new());
         }
         let ifs = node_new(ST_IF, pos);
-        ifs[IF_COND] = cond;
+        ifs[IF_COND] = binary_new(pos, "&&", sel_gate(pos, selr, i), cond);
         ifs[IF_THEN] = empty_block(pos);
         vec_push(ifs[IF_THEN][BLK_STMTS], sel_set(pos, armv, i));
         if last {
@@ -3636,9 +3676,9 @@ fn lower_select(s) {
     while i < n {
         let k = vec_get(kinds, i);
         if k == 1 {
-            vec_push(wb, expr_stmt(sel_method(pos, vec_get(srcs, i), "Watch")));
+            vec_push(wb, sel_gated(pos, selr, i, expr_stmt(sel_method(pos, vec_get(srcs, i), "Watch"))));
         } else if k == 2 {
-            vec_push(wb, expr_stmt(sel_method(pos, vec_get(srcs, i), "watch")));
+            vec_push(wb, sel_gated(pos, selr, i, expr_stmt(sel_method(pos, vec_get(srcs, i), "watch"))));
         } else if k == 3 {
             let a = node_new(ST_ASSIGN, pos);
             a[AS_TARGET] = sel_ident(pos, dl);
@@ -3646,7 +3686,7 @@ fn lower_select(s) {
             vec_push(args, sel_ident(pos, dl));
             vec_push(args, sel_ident(pos, vec_get(srcs, i)));
             a[AS_VALUE] = sel_call(pos, "rt_select_min", args);
-            vec_push(wb, a);
+            vec_push(wb, sel_gated(pos, selr, i, a));
         }
         i = i + 1;
     }
@@ -3657,14 +3697,24 @@ fn lower_select(s) {
     while i < n {
         let k = vec_get(kinds, i);
         if k == 1 {
-            vec_push(wb, expr_stmt(sel_method(pos, vec_get(srcs, i), "Unwatch")));
+            vec_push(wb, sel_gated(pos, selr, i, expr_stmt(sel_method(pos, vec_get(srcs, i), "Unwatch"))));
         } else if k == 2 {
-            vec_push(wb, expr_stmt(sel_method(pos, vec_get(srcs, i), "unwatch")));
+            vec_push(wb, sel_gated(pos, selr, i, expr_stmt(sel_method(pos, vec_get(srcs, i), "unwatch"))));
         }
         i = i + 1;
     }
     vec_push(lb, wait);
     vec_push(st, loop);
+    // if $selr != -1 { rt_select_end(site, $selr, $sel) }: record the winner, or check it.
+    let rec = node_new(ST_IF, pos);
+    rec[IF_COND] = sel_cmp(pos, selr, "!=", 0 - 1);
+    rec[IF_THEN] = empty_block(pos);
+    let eargs = vec_new();
+    vec_push(eargs, sel_site(pos));
+    vec_push(eargs, sel_ident(pos, selr));
+    vec_push(eargs, sel_ident(pos, armv));
+    vec_push(rec[IF_THEN][BLK_STMTS], expr_stmt(sel_call(pos, "rt_select_end", eargs)));
+    vec_push(st, rec);
     // Then the winning arm: take its value and run its body.
     i = 0;
     while i <= n {
