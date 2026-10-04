@@ -3126,7 +3126,12 @@ fn chk_builtin(e, name, want) {
                     acc = rt_call(pos, "rt_append_str", args2(acc, a[UN_X]), st);
                 } else {
                     check_assignable(a[UN_X], at, st);
-                    acc = rt_call(pos, "rt_slice_appendn", args3(acc, a[UN_X], mk_int(pos, elem_size(st), ty_int)), st);
+                    let appendn = "rt_slice_appendn";
+                    if rc_counted(et) {
+                        // The elements' new slots own them (#176): a long-lived slice counts them.
+                        appendn = "rt_slice_appendn_rc";
+                    }
+                    acc = rt_call(pos, appendn, args3(acc, a[UN_X], mk_int(pos, elem_size(st), ty_int)), st);
                 }
             } else {
                 let vt = chk(a, et);
@@ -3276,6 +3281,11 @@ fn chk_builtin(e, name, want) {
         }
         if kind_of(st) == K_STRING {
             replace_node(e, rt_call(pos, "rt_copy_str", args2(arg0(e), vec_get(args, 1)), ty_int));
+        } else if kind_of(dt) == K_SLICE && rc_counted(dt[TY_ELEM]) {
+            // Copied values gain their slots' counts and replaced ones lose theirs (#176).
+            let cargs = args3(arg0(e), vec_get(args, 1), mk_int(pos, elem_size(dt), ty_int));
+            vec_push(cargs, fn_ref_node(pos, drop_fn(dt[TY_ELEM])));
+            replace_node(e, rt_call(pos, "rt_slice_copy_rc", cargs, ty_int));
         } else {
             replace_node(e, rt_call(pos, "rt_slice_copy", args3(arg0(e), vec_get(args, 1), mk_int(pos, elem_size(dt), ty_int)), ty_int));
         }

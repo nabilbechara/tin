@@ -260,7 +260,7 @@ fn rg_stmt(s) {
 // rg_regrow reports whether x appends onto the slot target t names: append grows the
 // header in place and returns it, so storing the result back changes nothing.
 fn rg_regrow(t, x) {
-    while x[N_KIND] == EX_CALL && x[CALL_NAME] && (streq(x[CALL_NAME], "rt_append") || streq(x[CALL_NAME], "rt_append_rc") || streq(x[CALL_NAME], "rt_slice_appendn") || streq(x[CALL_NAME], "rt_append_str")) {
+    while x[N_KIND] == EX_CALL && x[CALL_NAME] && (streq(x[CALL_NAME], "rt_append") || streq(x[CALL_NAME], "rt_append_rc") || streq(x[CALL_NAME], "rt_slice_appendn") || streq(x[CALL_NAME], "rt_slice_appendn_rc") || streq(x[CALL_NAME], "rt_append_str")) {
         x = vec_get(x[CALL_ARGS], 0);
     }
     return rg_same(t, x);
@@ -1265,7 +1265,7 @@ fn rg_runtime_call(e, name, b, pos) {
         rg_store(b0, co, ct, vec_get(b, 1), et, pos, 0);
         return b0;
     }
-    if streq(name, "rt_slice_appendn") || streq(name, "rt_slice_copy") {
+    if streq(name, "rt_slice_appendn") || streq(name, "rt_slice_copy") || streq(name, "rt_slice_appendn_rc") || streq(name, "rt_slice_copy_rc") {
         let et = 0;
         let a1 = vec_get(args, 1);
         if kind_of(a1[N_TYPE]) == K_SLICE {
@@ -1503,21 +1503,24 @@ fn wb_expr(e) {
 // rc_mark runs after region_check, when the bits on every local are final. It wraps each
 // store whose destination is provably long-lived: an assignment to a global, and field
 // or element stores whose base ident is a global or a local left at exactly RG_INGOT
-// (one that can hold nothing else). A mixed origin (a parameter, anything unknown) is
-// left alone: counting a pool block would corrupt it, so such stores leak instead. In
-// __core_init every allocation is ingot or immortal and each target starts empty, so
-// there every counted store counts its value and none drops an old one.
+// (one that can hold nothing else). The store keeps the value it had: the new value's
+// count arrives and the old slot's count leaves, both before the store itself (the value
+// is bound to a temporary first, so it is evaluated once).
 //
-// The store keeps the value it had: the old slot's count leaves, the new value's count
-// arrives, both around the store itself (the value is bound to a temporary first, so it
-// is evaluated once). Map entries and append elements count themselves in the runtime
-// (rt_map_set, rt_append_rc), which decide by the container's own region word and need
-// no marking here. keep$N counts the fields, elements and entries of its copy itself,
-// so lifted functions are left alone.
+// A store whose destination may be long-lived but is not provably so (through a
+// parameter, a closure's cells, an element of an element) cannot be counted: the old
+// slot may never have had a count. Its value is pinned instead (rt_rc_pinned), so the
+// uncounted reference can leak the block but never outlive it. A store into a container
+// the region pass proved request-local needs neither.
+//
+// Map entries and append elements count themselves in the runtime (rt_map_set,
+// rt_append_rc, rt_slice_appendn_rc, rt_slice_copy_rc), which decide by the container's
+// own region word and need no marking here. keep$N counts the fields, elements and
+// entries of its copy itself, so lifted functions are left alone. __core_init is not
+// visited: what a core makes while it initializes starts pinned (rt_ingot_alloc).
 
 var rc_fn;
-var rc_init; // 1 in __core_init: every allocation there is ingot or immortal
-var rc_reach_ok;
+var rc_reach_ok; // 1 once reachability is final: rc_*_call may mark what they add
 
 fn rc_mark() {
     rc_reach_ok = 1;
@@ -1535,7 +1538,6 @@ fn rc_mark() {
         let f = vec_get(prog_fns, i);
         if f[F_REGSUM] && f[F_REACH] && f[F_LIFTED] != 2 {
             rc_fn = f;
-            rc_init = f == core_fn;
             ck_fn = f;
             rc_stmts(f[F_BODY][BLK_STMTS]);
         }
@@ -1555,6 +1557,9 @@ fn rc_stmts(v) {
             // The wrap leaves the store itself in place; skip it, the temporaries around
             // it carry the value expression (a composite literal's stores) instead.
             i = i + rc_assign(s, v, i) + 1;
+        } else if s && s[N_KIND] == ST_CALLMULTI {
+            rc_seq(s[CM_CALL]);
+            i = i + rc_callmulti(s, v, i) + 1;
         } else {
             rc_walk(s);
             i = i + 1;
@@ -1591,8 +1596,6 @@ fn rc_walk(s) {
         if s[RET_VALUE] {
             rc_seq(s[RET_VALUE]);
         }
-    } else if k == ST_CALLMULTI {
-        rc_seq(s[CM_CALL]);
     }
 }
 
@@ -1603,8 +1606,8 @@ fn rc_seq(e) {
     }
 }
 
-// rc_assign wraps the assignment at position i of stmts when its destination is
-// provably long-lived.
+// rc_assign counts or pins the assignment at position i of stmts, by what its
+// destination can be. It reports how many statements it spliced in before it.
 fn rc_assign(s, stmts, i) {
     let target = s[AS_TARGET];
     let val = s[AS_VALUE];
@@ -1614,54 +1617,59 @@ fn rc_assign(s, stmts, i) {
     let pos = s[N_POS];
     let t = target[N_TYPE];
     if !rc_counted(t) {
+        rc_seq(val);
         return 0;
     }
     let k = target[N_KIND];
-    if k == EX_IDENT && target[ID_REF] && target[ID_REF][S_KIND] == SYM_GLOBAL {
-        // g = v, or xs = append(xs, v): the append counts its own element and returns
-        // the same header, so the slot's count is already right and only the element
-        // form needs replacing.
-        if rc_append_into(val, target) {
-            return 0;
+    if k == EX_IDENT {
+        if target[ID_REF] && target[ID_REF][S_KIND] == SYM_GLOBAL {
+            // xs = append(xs, v): the append counts its own element and returns the same
+            // header, so the slot's count is already right.
+            if rc_append_into(val, target) {
+                return 0;
+            }
+            return rc_wrap(s, stmts, i, sym_ref_node(pos, target[ID_REF]), t, 0);
         }
-        return rc_wrap(s, stmts, i, sym_ref_node(pos, target[ID_REF]), t, 0);
+        // A local: the variable itself is not long-lived storage.
+        rc_seq(val);
+        return 0;
     }
     if k == EX_MEM {
-        if rc_init {
-            if rc_simple_base(target[MEM_BASE]) {
-                return rc_wrap(s, stmts, i, rc_field_read(pos, target, t), t, 0);
-            }
-            return 0;
-        }
-        if target[MEM_INDEX] == 0 && rc_ingot_base(target[MEM_BASE]) {
+        let base = target[MEM_BASE];
+        if target[MEM_INDEX] == 0 && rc_ingot_base(base) {
             return rc_wrap(s, stmts, i, rc_field_read(pos, target, t), t, 0);
         }
+        if !rc_local_base(base) {
+            rc_pin_value(s, t);
+        }
+        rc_seq(val);
         return 0;
     }
     if k == EX_ELEM {
-        // s[i] = v, already lowered to a bounds-checked element. The slice must be
-        // long-lived, and the index is bound to a temporary so the old value can be
-        // read back from the very same index, whatever the expression was.
+        // s[i] = v, already lowered to a bounds-checked element. The index is bound to a
+        // temporary so the old value is read back from the very same index.
         let seq = target[ELEM_SEQ];
-        if !rc_init && !rc_ingot_base(seq) {
-            return 0;
+        if rc_ingot_base(seq) {
+            let pre0 = vec_new();
+            let idx = temp(pos, target[ELEM_IDX], ty_int);
+            vec_push(pre0, idx);
+            target[ELEM_IDX] = sym_ref_node(pos, idx[LET_SYM]);
+            return rc_wrap(s, stmts, i, rc_elem_read(pos, target, t), t, pre0);
         }
-        if rc_init && !rc_simple_base(seq) {
-            return 0;
+        if !rc_local_base(seq) {
+            rc_pin_value(s, t);
         }
-        let pre0 = vec_new();
-        let idx = temp(pos, target[ELEM_IDX], ty_int);
-        vec_push(pre0, idx);
-        target[ELEM_IDX] = sym_ref_node(pos, idx[LET_SYM]);
-        return rc_wrap(s, stmts, i, rc_elem_read(pos, target, t), t, pre0);
+        rc_seq(val);
+        return 0;
     }
+    rc_seq(val);
     return 0;
 }
 
-// rc_wrap binds the stored value, then reads the old one and drops its count, counts
-// the new value and leaves the store itself last. oldRead 0 skips the old side, and
-// pre0 (0: none) holds statements the caller prepared (an index temporary). It reports
-// how many statements it spliced in.
+// rc_wrap binds the stored value, reads the old one, counts the new value, drops the old
+// one's count (in that order: a value stored over itself is never queued) and leaves the
+// store itself last. pre0 (0: none) holds statements the caller prepared (an index
+// temporary). It reports how many statements it spliced in.
 fn rc_wrap(s, stmts, i, oldRead, t, pre0) {
     let pos = s[N_POS];
     let val = s[AS_VALUE];
@@ -1677,16 +1685,46 @@ fn rc_wrap(s, stmts, i, oldRead, t, pre0) {
     vec_push(pre, v);
     // The store reads the temporary now, so the value expression is evaluated once.
     s[AS_VALUE] = sym_ref_node(pos, v[LET_SYM]);
-    if !rc_init && oldRead {
-        let old = temp(pos, oldRead, t);
-        vec_push(pre, old);
-        vec_push(pre, expr_stmt(rc_dec_call(pos, sym_ref_node(pos, old[LET_SYM]), drop_fn(t))));
-    }
+    let old = temp(pos, oldRead, t);
+    vec_push(pre, old);
     vec_push(pre, expr_stmt(rc_inc_call(pos, sym_ref_node(pos, v[LET_SYM]))));
+    vec_push(pre, expr_stmt(rc_dec_call(pos, sym_ref_node(pos, old[LET_SYM]), drop_fn(t))));
     rc_splice(stmts, i, pre);
     // A composite literal's own stores travel inside the bound value.
     rc_stmts(pre);
     return pre[VEC_LEN];
+}
+
+// rc_pin_value pins the value assignment s stores, in place: rt_rc_pinned returns its
+// argument, so the evaluation order of the store does not change.
+fn rc_pin_value(s, t) {
+    let c = rt_call(s[N_POS], "rt_rc_pinned", args1(s[AS_VALUE]), t);
+    mark_reach(c[CALL_FN]);
+    s[AS_VALUE] = c;
+}
+
+// rc_callmulti counts the globals a multiple assignment (a, g = f()) stores: each old
+// value is read before the call and loses its count after it, once the new one has
+// gained its own. It reports how many statements it spliced in around the call.
+fn rc_callmulti(s, stmts, i) {
+    let pos = s[N_POS];
+    let syms = s[CM_SYMS];
+    let pre = vec_new();
+    let post = vec_new();
+    let j = 0;
+    while j < syms[VEC_LEN] {
+        let g = vec_get(syms, j);
+        if g && g[S_KIND] == SYM_GLOBAL && rc_counted(g[S_TYPE]) {
+            let old = temp(pos, sym_ref_node(pos, g), g[S_TYPE]);
+            vec_push(pre, old);
+            vec_push(post, expr_stmt(rc_inc_call(pos, sym_ref_node(pos, g))));
+            vec_push(post, expr_stmt(rc_dec_call(pos, sym_ref_node(pos, old[LET_SYM]), drop_fn(g[S_TYPE]))));
+        }
+        j = j + 1;
+    }
+    rc_splice(stmts, i + 1, post);
+    rc_splice(stmts, i, pre);
+    return pre[VEC_LEN] + post[VEC_LEN];
 }
 
 // rc_splice puts pre before position i, moving the statements from i up.
@@ -1731,9 +1769,17 @@ fn rc_ingot_base(e) {
     return s[S_REGION] == RG_INGOT;
 }
 
-// rc_simple_base is any named base: in __core_init nothing else can hold memory.
-fn rc_simple_base(e) {
-    return e[N_KIND] == EX_IDENT && e[ID_REF] != 0;
+// rc_local_base reports whether the ident e names a container the region pass proved
+// request-local: a local whose objects are all fresh from the pool.
+fn rc_local_base(e) {
+    if e[N_KIND] != EX_IDENT || !e[ID_REF] {
+        return 0;
+    }
+    let s = e[ID_REF];
+    if s[S_KIND] == SYM_GLOBAL || s == rc_fn[F_ENV_SYM] {
+        return 0;
+    }
+    return s[S_REGION] != 0 && (s[S_REGION] & ~(RG_FRESH | RG_EMB)) == 0;
 }
 
 // rc_field_read reads the field the store writes (the base is a named ident).
@@ -1742,67 +1788,25 @@ fn rc_field_read(pos, target, t) {
     return mk_mem(pos, sym_ref_node(pos, base[ID_REF]), 0, 0, target[MEM_OFF], t);
 }
 
-// rc_index_read reads the element the store writes, when its index has no effect.
-fn rc_index_read(pos, target, t) {
-    let i = target[IX_I];
-    let base = target[IX_X];
-    let bref = sym_ref_node(pos, base[ID_REF]);
-    if i[N_KIND] == EX_IDENT && i[ID_REF] {
-        return mk_index(pos, bref, sym_ref_node(pos, i[ID_REF]), t);
-    }
-    if i[N_KIND] == EX_INT {
-        return mk_index(pos, bref, mk_int(pos, i[INT_VAL], ty_int), t);
-    }
-    return 0;
-}
-
-// rc_elem_read reads the element the store writes, when its index has no effect (the
-// slice itself is a name, so naming it twice costs nothing).
+// rc_elem_read reads the element the store writes; the slice and the index are names, so
+// naming them twice costs nothing.
 fn rc_elem_read(pos, target, t) {
     let seq = target[ELEM_SEQ];
-    if seq[N_KIND] != EX_IDENT || !seq[ID_REF] {
-        return 0;
-    }
-    let i = target[ELEM_IDX];
-    let idx = 0;
-    if i[N_KIND] == EX_IDENT && i[ID_REF] {
-        idx = sym_ref_node(pos, i[ID_REF]);
-    } else if i[N_KIND] == EX_INT {
-        idx = mk_int(pos, i[INT_VAL], ty_int);
-    }
-    if !idx {
-        // The index has effects: count the new value and leave the old one counting (a
-        // leak, never a corrupt free).
-        return 0;
-    }
     let n = node_new(EX_ELEM, pos);
     n[ELEM_SEQ] = sym_ref_node(pos, seq[ID_REF]);
-    n[ELEM_IDX] = idx;
+    n[ELEM_IDX] = sym_ref_node(pos, target[ELEM_IDX][ID_REF]);
     n[ELEM_SIZE] = target[ELEM_SIZE];
     n[ELEM_STR] = target[ELEM_STR];
     n[N_TYPE] = t;
     return n;
 }
 
-// rc_append_into replaces an append of a counted element type with rt_append_rc, which
-// counts the element when the slice is long-lived. It reports whether the append grows
-// the very slice being assigned (its count then stays as it is).
+// rc_append_into reports whether xs = append(xs, v) grows the very global being assigned:
+// rt_append_rc counted its element and returned the same header, so nothing else moves.
 fn rc_append_into(v, target) {
-    if v[N_KIND] != EX_CALL || !v[CALL_NAME] || (!streq(v[CALL_NAME], "rt_append") && !streq(v[CALL_NAME], "rt_append_rc")) {
+    if v[N_KIND] != EX_CALL || !v[CALL_NAME] || !streq(v[CALL_NAME], "rt_append_rc") {
         return 0;
     }
-    let st = v[N_TYPE];
-    if !st || kind_of(st) != K_SLICE || !rc_counted(st[TY_ELEM]) {
-        return 0;
-    }
-    let args = v[CALL_ARGS];
-    if args[VEC_LEN] != 3 {
-        return 0;
-    }
-    replace_node(v, rt_call(v[N_POS], "rt_append_rc", args3(vec_get(args, 0), vec_get(args, 1), vec_get(args, 2)), st));
-    let a0 = vec_get(args, 0);
-    if a0[N_KIND] == EX_IDENT && target[N_KIND] == EX_IDENT && a0[ID_REF] == target[ID_REF] {
-        return 1;
-    }
-    return 0;
+    let a0 = vec_get(v[CALL_ARGS], 0);
+    return a0[N_KIND] == EX_IDENT && a0[ID_REF] == target[ID_REF];
 }
