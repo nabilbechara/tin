@@ -132,11 +132,41 @@ def replay_mode(work, env):
     case('unsupported schema', seal(capsule_body(recorded, schema=2)), 4, '',
          'replay: capsule: unsupported schema 2 (this build reads schema 1)\n')
     case('truncated body', seal(capsule_body(recorded)[:-3]), 4, '', 'replay: capsule: damaged (truncated)\n')
+    # The driver: tin replay CAPSULE --against BUILD [--live KIND]... (exit 2 for a usage error).
+    capsule = work / 'driver.tcap'
+    capsule.write_bytes(seal(capsule_body(recorded)))
+    drive_env = dict(os.environ, TIN_REPLAY_KEY=KEY.hex())
+    drive_env.pop('TIN_REPLAY_CAPSULE', None)
+    drive_env.pop('TIN_REPLAY_LIVE', None)
+    live_divergence = ('replay: divergence at effect 1: got wire.http@1 "POST http://payments/charge\\n\\ncart=live", '
+                       'recorded wire.http@1 "POST http://payments/charge\\n\\ncart=2 books"')
+    for name, args, want_code, want_out, want_err in [
+        ('tin replay', ['--against', str(exe)], 0,
+         'replay: status 500 (recorded 500)\ncharge failed: payments: connection refused (live calls 0)\n', ''),
+        # A live cart gives another charge key: replay reports it rather than charging for real.
+        ('tin replay --live', ['--live', 'redis', '--against', str(exe), '--live', 'wire.http'], 3,
+         'replay: status 500 (recorded 500)\n' + live_divergence + '\nreplay: 1 recorded effects not served\n'
+         'charge failed: ' + live_divergence + ' (live calls 1)\n', ''),
+        ('tin replay without --against', [], 2, '', 'tin: replay: --against BUILD is needed'),
+        ('tin replay, missing value', ['--against'], 2, '', 'tin: replay: missing value after the last option'),
+    ]:
+        r = subprocess.run([str(ROOT / 'tin'), 'replay', str(capsule)] + args, capture_output=True, text=True,
+                           timeout=60, env=drive_env, cwd=work)
+        log.append(f'== {name}: exit {r.returncode}\n{r.stdout}{r.stderr}')
+        if r.returncode != want_code or r.stdout != want_out or want_err not in r.stderr:
+            failed += 1
+            print(f'FAIL replay mode: {name}\n--- want exit {want_code}\n{want_out}{want_err}\n'
+                  f'--- got exit {r.returncode}\n{r.stdout}{r.stderr}')
+    r = subprocess.run([str(ROOT / 'tin'), 'replay', str(work / 'missing.tcap'), '--against', str(exe)],
+                       capture_output=True, text=True, timeout=60, env=drive_env)
+    if r.returncode != 4 or 'no such file' not in r.stderr:
+        failed += 1
+        print(f'FAIL replay mode: tin replay of a missing capsule: exit {r.returncode}\n{r.stderr}')
     (ROOT / 'bin/ci/replay/replay_mode.log').write_text('\n'.join(log))
     if failed:
         raise SystemExit(f'FAIL replay mode: {failed} case(s)')
     print('PASS replay mode: recorded 500 and fault identity without live calls, call order divergence, '
-          'effects left, --live, unreadable capsules')
+          'effects left, --live, unreadable capsules, tin replay')
 
 
 def main():

@@ -7,6 +7,7 @@
 #   tin asm FILE.tin...             print the generated ARM64 assembly
 #   tin audit secrets [-edition 1] FILE.tin...  list every reveal and secret library argument
 #   tin test [-bench] [DIR]         run DIR's *_test.tin tests (TestXxx, BenchmarkXxx)
+#   tin replay CAPSULE --against BUILD [--live KIND]...  replay a recorded request, effects from the capsule
 #   tin suite                       run the compiler's strict test suite (tests/v2)
 #   tin bootstrap                   rebuild the compiler with itself and check the fixed point
 #   tin version
@@ -126,6 +127,32 @@ case $1 in
     [ "$pkg" = main ] || entry=$pkg.TinTestMain
     "$tinc" -entry "$entry" -o "$exe" "$@" "$runner"
     "$exe" ;;
+  replay)
+    # tin replay CAPSULE --against BUILD [--live KIND]...: run BUILD (a binary, or FILE.tin built
+    # here) on the capsule's request with every effect served from the capsule (#242; the
+    # report and the exit status, 0, 3 diverged or 4 unreadable, are the program's).
+    shift; capsule=; build=; live=; skip=
+    for a do
+      case $skip in b) build=$a; skip=; continue ;; l) live=${live:+$live,}$a; skip=; continue ;; esac
+      case $a in
+        --against|-against) skip=b ;;
+        --live|-live) skip=l ;;
+        -*) echo "tin: replay: unknown option $a" >&2; exit 2 ;;
+        *) [ -z "$capsule" ] || { echo "tin: replay: one capsule at a time" >&2; exit 2; }; capsule=$a ;;
+      esac
+    done
+    [ -z "$skip" ] || { echo "tin: replay: missing value after the last option" >&2; exit 2; }
+    [ -n "$capsule" ] || { echo "tin: replay: no capsule (try: tin replay CAPSULE --against BUILD)" >&2; exit 2; }
+    [ -f "$capsule" ] || { echo "tin: replay: $capsule: no such file" >&2; exit 4; }
+    [ -n "$build" ] || { echo "tin: replay: --against BUILD is needed (the program, or its FILE.tin)" >&2; exit 2; }
+    capsule=$(cd "$(dirname "$capsule")" && pwd)/$(basename "$capsule")
+    case $build in
+      *.tin) exe=$cache/replay.$$; trap 'rm -f "$exe"' EXIT; compile "$exe" "$build" ;;
+      */*) exe=$build ;;
+      *) exe=./$build ;;
+    esac
+    [ -x "$exe" ] || { echo "tin: replay: $build: not an executable" >&2; exit 2; }
+    TIN_REPLAY_CAPSULE=$capsule TIN_REPLAY_LIVE=$live "$exe" ;;
   suite)
     "$root/tools/v2test.sh" "$tinc" ;;
   bootstrap)
@@ -136,7 +163,7 @@ case $1 in
     host=$(uname -s | tr A-Z a-z)-$(uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
     echo "tin $version (self-hosted, $host, compiler $(cksum < "$tinc" | cut -d' ' -f1))" ;;
   ""|help|-h|--help)
-    sed -n '2,13p' "$self" | sed 's/^# \{0,1\}//' ;;
+    sed -n '2,14p' "$self" | sed 's/^# \{0,1\}//' ;;
   *.tin)
     f=$1; shift
     exe=$cache/run.$$; trap 'rm -f "$exe"' EXIT
