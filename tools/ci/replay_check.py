@@ -731,6 +731,51 @@ def more_clients(work, env):
           'connection and no file touched')
 
 
+def secret_queries(work, env):
+    """query.Hidden (section 5.3): secret values written into redis and mysql queries are sent as
+    themselves, while the tape's keys hold their handles; replayed, the keys match."""
+    sys.path.insert(0, str(ROOT / 'tools/ci'))
+    import mysql_check
+    lib = work / 'lib/replaysecret'
+    lib.mkdir()
+    shutil.copy(ROOT / 'tools/ci/fixtures/replay_secret_probe.tin', lib / 'probe.tin')
+    exe = work / 'replay_secret'
+    subprocess.run([str(ROOT / 'bin/tinc'), '-edition', '1', '-o', str(exe), 'tools/ci/fixtures/replay_secret.tin'],
+                   check=True, env=env, cwd=ROOT, timeout=120)
+    seen = []
+
+    def redis_seen(conn):
+        data = conn.recv(4096)
+        seen.append(data)
+        conn.sendall(b'$2\r\nok\r\n')
+
+    rsock, _ = serve_thread(redis_seen)
+    my = mysql_check.Fake()
+    tape = work / 'secret.tape'
+    run_env = {k: v for k, v in os.environ.items() if not k.startswith('TIN_REPLAY_')}
+    run_env.update(REDIS_ADDR='127.0.0.1:%d' % rsock.getsockname()[1], MYSQL_ADDR='127.0.0.1:%d' % my.port,
+                   TAPE_OUT=str(tape), TIN_REPLAY_DIR=str(work / 'spool-secret'), TIN_REPLAY_KEY=CAPSULE_KEY.hex())
+    r = subprocess.run([str(exe)], capture_output=True, text=True, timeout=120, env=run_env)
+    rsock.close()
+    (ROOT / 'bin/ci/replay/secret.log').write_text(r.stdout + r.stderr)
+    failures = []
+    check = lambda name, got, want: got == want or failures.append(f'{name}: got {got!r}, want {want!r}')
+    check('output', r.stdout, 'recording on: true\nrecorded: redis Str(ok) mysql 0 rows\n'
+          'replayed same: true left: 0 diverged: \n')
+    check('redis got the secret itself', b'$12\r\ns3cr3t-token\r\n' in b''.join(seen), True)
+    data = tape.read_bytes() if tape.exists() else b''
+    handle = secret_handle(b's3cr3t-token').encode()
+    check('redis key holds the handle', b'3:GET 43:' + handle + b'\n' in data, True)
+    check('mysql key holds the handle', b'Q SELECT id, name FROM users WHERE id = \nH' +
+          secret_handle(b'424242').encode() + b'\n\n' in data, True)
+    for secret in (b's3cr3t-token', b'424242'):
+        if secret in data:
+            failures.append(f'secret text {secret!r} on the tape')
+    if failures:
+        raise SystemExit('FAIL replay secret queries:\n' + '\n'.join(failures))
+    print('PASS replay secret queries: secret query values are sent as themselves and keyed by their handles; replay matches')
+
+
 def main():
     out = ROOT / 'bin/ci/replay'
     out.mkdir(parents=True, exist_ok=True)
@@ -755,6 +800,7 @@ def main():
         recording(work, env)
         clients(work, env)
         more_clients(work, env)
+        secret_queries(work, env)
     print('PASS replay tapes: record, replay without live calls, fault identity, divergence, live kinds, children share the tape, panics on it')
 
 
