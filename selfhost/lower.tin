@@ -1766,7 +1766,7 @@ fn chk_funclit(e) {
     return f[F_TYPE];
 }
 
-// ---- boundary blocks: guard (#230) and within (#233) ----
+// ---- boundary blocks: guard (#230), within (#233) and limit (#235) ----
 //
 // The block becomes a closure func($r i64) ! whose last expression is stored through $r, so
 // fail and try leave the block with a fault. A generated boundary$N(c, a) !T runs it inside
@@ -1775,17 +1775,30 @@ fn chk_funclit(e) {
 fn chk_boundary(e) {
     let pos = e[N_POS];
     let kind = e[BOUND_KIND];
-    if ck_legacy || (kind != BOUND_WITHIN && kind != BOUND_GUARD) {
+    if ck_legacy || (kind != BOUND_WITHIN && kind != BOUND_GUARD && kind != BOUND_LIMIT) {
         err_at(pos, "this boundary block is not supported yet");
         return ty_int;
     }
     let arg = mk_int(pos, 0, ty_int);
+    let arg2 = mk_int(pos, 0, ty_int);
     if kind == BOUND_WITHIN {
-        arg = vec_get(e[BOUND_ARGS], 0);
-        let at = chk(arg, ty_int);
-        check_assignable(arg, at, ty_int);
-        if is_untyped(at) {
-            reconvert(arg, ty_int);
+        arg = bound_int_arg(vec_get(e[BOUND_ARGS], 0));
+    }
+    if kind == BOUND_LIMIT {
+        // limit memory n, tasks k: each bound at most once.
+        let i = 0;
+        while i < e[BOUND_ARGS][VEC_LEN] {
+            let item = vec_get(e[BOUND_ARGS], i);
+            let name = vec_get(item, 0);
+            let v = bound_int_arg(vec_get(item, 1));
+            if streq(name, "memory") {
+                arg = v;
+            } else if streq(name, "tasks") {
+                arg2 = v;
+            } else {
+                err_quoted(pos, "limit bounds are memory and tasks, not ", name, "");
+            }
+            i = i + 1;
         }
     }
     let body = e[BOUND_BODY];
@@ -1820,7 +1833,9 @@ fn chk_boundary(e) {
     let c = node_new(EX_CALL, pos);
     c[CALL_NAME] = w[F_NAME];
     c[CALL_FN] = w;
-    c[CALL_ARGS] = args2(lit, arg);
+    let cargs = args2(lit, arg);
+    vec_push(cargs, arg2);
+    c[CALL_ARGS] = cargs;
     let results = vec_new();
     if kind_of(vt) != K_VOID {
         vec_push(results, vt);
@@ -1833,6 +1848,16 @@ fn chk_boundary(e) {
     c[N_TYPE] = rt;
     replace_node(e, c);
     return rt;
+}
+
+// bound_int_arg checks a boundary argument (a duration or a size) as an i64.
+fn bound_int_arg(a) {
+    let at = chk(a, ty_int);
+    check_assignable(a, at, ty_int);
+    if is_untyped(at) {
+        reconvert(a, ty_int);
+    }
+    return a;
 }
 
 // bound_leaves rejects a return that would leave a boundary block from inside it.
@@ -1883,6 +1908,8 @@ fn boundary_wrapper(pos, kind, ct, vt) {
     vec_push(f[F_PTYPES], ct);
     vec_push(f[F_PARAMS], "a");
     vec_push(f[F_PTYPES], ty_int);
+    vec_push(f[F_PARAMS], "a2");
+    vec_push(f[F_PTYPES], ty_int);
     if kind_of(vt) != K_VOID {
         vec_push(f[F_RTYPES], vt);
     }
@@ -1899,9 +1926,13 @@ fn boundary_wrapper(pos, kind, ct, vt) {
     let asym = sym_new(SYM_LOCAL, "a", pos);
     asym[S_TYPE] = ty_int;
     asym[S_SLOT] = 1;
-    f[F_SLOTS] = 2;
+    let a2sym = sym_new(SYM_LOCAL, "a2", pos);
+    a2sym[S_TYPE] = ty_int;
+    a2sym[S_SLOT] = 2;
+    f[F_SLOTS] = 3;
     vec_push(f[F_LOCALS], cs);
     vec_push(f[F_LOCALS], asym);
+    vec_push(f[F_LOCALS], a2sym);
     let body = f[F_BODY][BLK_STMTS];
     let r = temp(pos, rt_call(pos, "rt_alloc", args1(mk_int(pos, 16, ty_int)), ty_int), ty_int);
     vec_push(body, r);
@@ -1909,6 +1940,12 @@ fn boundary_wrapper(pos, kind, ct, vt) {
     let fe = 0;
     if kind == BOUND_GUARD {
         fe = temp(pos, rt_call(pos, "rt_guard_call", args2(sym_ref_node(pos, cs), rref), ty_error), ty_error);
+        vec_push(body, fe);
+    } else if kind == BOUND_LIMIT {
+        let la = args2(sym_ref_node(pos, cs), sym_ref_node(pos, r[LET_SYM]));
+        vec_push(la, sym_ref_node(pos, asym));
+        vec_push(la, sym_ref_node(pos, a2sym));
+        fe = temp(pos, rt_call(pos, "rt_limit_call", la, ty_error), ty_error);
         vec_push(body, fe);
     } else {
         // within: a boundary whose deadline is the earlier of now + a and the enclosing one.

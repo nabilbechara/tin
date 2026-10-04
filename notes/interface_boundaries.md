@@ -229,10 +229,13 @@ Only an **unwind** (section 4) gives the block a value the body did not produce:
   or a big block (`rt_alloc_slow`) adds its size to `bMemUsed` of `bLimit` and of every limiting
   boundary above it (each record's parent's `bLimit`); a discard subtracts what it frees. The
   bump fast path of `rt_alloc` is unchanged.
-- **Exceeding cancels; it never unwinds from the allocator.** The allocation succeeds,
-  `rt_bnd_cancel(limitBoundary, fault.LimitExceeded)` runs, and the work stops at its next
-  wait or poll. (Unwinding inside `rt_alloc` would leave runtime structures half-built.) A
-  request-wide budget (`TIN_REQUEST_MEMORY`) is the same budget on the request root.
+- **Exceeding cancels the boundary and leaves it** (changed in #235): `rt_bnd_cancel(limit,
+  fault.LimitExceeded)` runs, and a `limit` block, which runs on a stack of its own like a
+  `guard` (`rt_limit_call`), is left at once with that fault from inside `rt_alloc_slow`,
+  before the new chunk is handed out: its deferred calls and cleanups run. Waiting for the
+  next wait or poll was not enough while safepoints (#234) do not exist, since code that
+  allocates in a loop never waits. A request-wide budget (`TIN_REQUEST_MEMORY`) is the same
+  budget on the request root; passing it ends the request as a panic would (500).
 - **Tasks** are counted at `rt_bnd_task` (a fifth spawn in `limit tasks 4` fails with
   `fault.LimitExceeded`) and released when the task's root is left.
 

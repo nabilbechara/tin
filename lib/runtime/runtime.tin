@@ -225,6 +225,14 @@ func rt_alloc(n i64) i64 {
 func rt_alloc_slow(n i64) i64 {
 	if curTask != 0 && n > 65536 { curTask[tTrim] = 1 }
 	c := __ctx()
+	if c[ctxPoolBase] != 0 {
+		// Pool memory beyond the first chunk counts against limit budgets (#235).
+		if n >= bigAlloc || n+16 > rt_chunk() {
+			rt_bnd_charge(n + 16)
+		} else {
+			rt_bnd_charge(rt_chunk())
+		}
+	}
 	if c[ctxPoolBase] == 0 {
 		chunk := calloc(1, rt_chunk())
 		c[ctxPoolBase] = chunk
@@ -2777,9 +2785,27 @@ var guardStart i64  // per core: the record rt_guard_entry starts
 var guardStacks i64 // per core: free guard stacks, linked through their lowest word
 
 func rt_guard_call(body func(i64) !, r i64) i64 {
+	return rt_land_call(bkGuard|bfGuard, body, r, 0, 0)
+}
+
+// rt_limit_call runs a limit block's closure: pool memory taken inside it (and tasks started
+// in it) count against mem bytes and tasks (0: no bound). Passing the memory budget leaves the
+// block with "limit exceeded" (#235).
+func rt_limit_call(body func(i64) !, r i64, mem i64, tasks i64) i64 {
+	return rt_land_call(bkLimit, body, r, mem, tasks)
+}
+
+// rt_land_call runs body(r) on a stack of its own inside a new boundary of the given kind, so
+// a panic (guard) or a passed budget (limit) can leave it from anywhere inside.
+func rt_land_call(kind i64, body func(i64) !, r i64, mem i64, tasks i64) i64 {
 	g := calloc(guardWords, 8)
-	b := rt_bnd_enter(bkGuard | bfGuard)
+	b := rt_bnd_enter(kind)
 	b[bLand] = g
+	if mem > 0 || tasks > 0 {
+		b[bMemMax] = mem
+		b[bTaskMax] = tasks
+		b[bLimit] = b
+	}
 	g[gBody] = cast(i64, body)
 	g[gArg] = r
 	g[gDefer] = rt_defer_mark()
@@ -2840,6 +2866,13 @@ func rt_guard_target() i64 {
 
 // rt_guard_land unwinds to guard g after a panic with msg and resumes its caller.
 func rt_guard_land(g i64, msg str) {
+	rt_land(g, cast(i64, "panic: "+msg))
+}
+
+// rt_land unwinds to the boundary of record g, which then gives fault word f, and resumes its
+// caller: deferred calls and cleanups registered since it began run, and the boundaries
+// entered inside it are left (their own stacks go back to the cache).
+func rt_land(g i64, f i64) {
 	if g[gUnwinding] != 0 {
 		rt_flush()
 		rt_sys_exit(2)
@@ -2851,9 +2884,19 @@ func rt_guard_land(g i64, msg str) {
 	}
 	b := g[gBnd]
 	for rt_bnd_current() != b {
-		rt_bnd_leave(rt_bnd_current())
+		in := rt_bnd_current()
+		ig := in[bLand]
+		if ig != 0 {
+			st := ig[gStack]
+			(st + taskGuard)[0] = guardStacks
+			guardStacks = st
+		}
+		rt_bnd_leave(in)
+		if ig != 0 {
+			free(ig)
+		}
 	}
-	g[gFault] = cast(i64, "panic: "+msg)
+	g[gFault] = f
 	__ctx()[ctxFmt] = g[gFmt]
 	rt_task_swap(g+8*gScratch, g+8*gSave)
 }
@@ -3132,6 +3175,51 @@ func rt_bnd_set_deadline(b i64, at i64) {
 		}
 		d = d[bNext]
 	}
+}
+
+// rt_bnd_charge counts n pool bytes against every memory budget around the running code. Past
+// a limit block's budget the block is left with "limit exceeded"; past a request's
+// (TIN_REQUEST_MEMORY) the request ends as if it had panicked.
+func rt_bnd_charge(n i64) {
+	if bndRoot == 0 {
+		return
+	}
+	if curTask != 0 && curTask[tBnd] == 0 {
+		return
+	}
+	if curTask == 0 && bndCur == 0 {
+		return
+	}
+	l := rt_bnd_current()[bLimit]
+	over := 0
+	for l != 0 {
+		l[bMemUsed] += n
+		if over == 0 && l[bMemMax] > 0 && l[bMemUsed] > l[bMemMax] {
+			over = l
+		}
+		p := l[bParent]
+		if p == 0 {
+			break
+		}
+		l = p[bLimit]
+	}
+	if over == 0 {
+		return
+	}
+	if over[bKind]&bfRoot != 0 {
+		rt_panic("limit exceeded: the request's memory budget (TIN_REQUEST_MEMORY)")
+	}
+	rt_bnd_cancel(over, cast(fault, "limit exceeded"))
+	if over[bLand] != 0 {
+		rt_land(over[bLand], cast(i64, "limit exceeded"))
+	}
+}
+
+// rt_bnd_set_limit gives b a memory budget (bytes) and a task budget (0: no bound).
+func rt_bnd_set_limit(b i64, mem i64, tasks i64) {
+	b[bMemMax] = mem
+	b[bTaskMax] = tasks
+	b[bLimit] = b
 }
 
 // rt_bnd_deadline is b's effective deadline (mono ns), 0 for none.

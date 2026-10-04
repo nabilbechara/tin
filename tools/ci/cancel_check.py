@@ -138,6 +138,24 @@ def drain(port, server):
     print('drain: waiting requests end with "canceled: draining" after %.2f s; exit 0' % took)
 
 
+def budget(exe):
+    # TIN_REQUEST_MEMORY: a request past its memory budget ends with 500; the server goes on.
+    port = ws.free_port()
+    server = subprocess.Popen([str(exe)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        env=dict(os.environ, PORT=str(port), TIN_CORES='1', TIN_REQUEST_MEMORY=str(16 << 20)))
+    try:
+        eventually(lambda: server_ready(port, server))
+        got = [response(request(port, p))[0] for p in ('/hog', '/plain', '/hog', '/plain')]
+        assert got == [500, 200, 500, 200], got
+        assert server.poll() is None, 'server exited'
+    finally:
+        server.terminate()
+        server.wait(timeout=5)
+    err = server.stderr.read().decode(errors='replace')
+    assert err.count("limit exceeded: the request's memory budget") == 2, err[-1000:]
+    print('request budget: requests past TIN_REQUEST_MEMORY get 500; others are served')
+
+
 def main():
     out = ROOT / 'bin/ci/cancel'
     out.mkdir(parents=True, exist_ok=True)
@@ -163,6 +181,7 @@ def main():
                 eventually(lambda: server_ready(port, server))
                 checks(port, str(fifo))
                 assert server.poll() is None, 'server exited'
+                budget(exe)
                 drain(port, server)
             finally:
                 server.terminate()
