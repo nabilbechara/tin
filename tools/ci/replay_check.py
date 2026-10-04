@@ -295,7 +295,9 @@ def recording(work, env):
         check('program', c['program'], str(exe).encode())
     c = caps.get('/cart/8?panic=1')
     if c:
-        check('panicked', (c['status'], c['flags'], c['panic'], len(c['effects'])),
+        # Scheduling records (sched.*, #243) go on the tape too; count the effects alone.
+        effects = [e for e in c['effects'] if not e[1].startswith('sched.')]
+        check('panicked', (c['status'], c['flags'], c['panic'], len(effects)),
               (500, 1, b'checkout: cart 2 books', 1))
     c = caps.get('/cart/9?wait=1&fail=1')
     if c:
