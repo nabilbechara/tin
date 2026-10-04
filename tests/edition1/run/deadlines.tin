@@ -1,0 +1,104 @@
+package main
+
+import "fault"
+import "say"
+import "task"
+import "tide"
+
+mut log str = ""
+
+fn note(s str) {
+	log = keep(log + s)
+}
+
+// spin never waits: only task.Canceled stops it.
+fn spin() !i64 {
+	mut n i64 = 0
+	for {
+		try task.Canceled()
+		n += 1
+	}
+	return n
+}
+
+// siblings has its first child fail: the second, already cancelled, reads why.
+fn siblings() ! {
+	scope s {
+		s.spawn(fn() ! {
+			fail "first child failed"
+		})
+		s.spawn(fn() ! {
+			tide.Wait(tide.Second) catch _ {
+				note("wait ended;")
+			}
+			let c = task.Canceled()
+			note("{c}; {fault.Is(c, fault.Canceled)};")
+		})
+	}
+}
+
+// inherited gives a spawned child's deadline, which is its scope's.
+fn inherited() !bool {
+	mut same = false
+	try within 1h {
+		let mine = task.Deadline()
+		scope s {
+			s.spawn(fn() ! {
+				same = task.Deadline() == mine && mine > 0
+			})
+		}
+	}
+	return same
+}
+
+fn main() {
+	let none = task.Canceled()
+	say.Line("main: deadline", task.Deadline(), "canceled", none == nil)
+
+	let at = within 1h {
+		task.Deadline()
+	} catch _ {
+		0
+	}
+	let left = at - tide.Now()
+	say.Line("within 1h: deadline in an hour:", left > 59 * tide.Minute && left <= tide.Hour)
+
+	// The outer 50 ms is earlier than the inner hour, so it is the inner block's deadline too.
+	let start = tide.Now()
+	within 50ms {
+		let outer = task.Deadline()
+		within 1h {
+			say.Line("nested: inner deadline is the outer one:", task.Deadline() == outer)
+			try tide.Wait(5s)
+		} catch err {
+			say.Line("nested: inner wait:", err, fault.Is(err, fault.DeadlineExceeded))
+		}
+		let c = task.Canceled()
+		say.Line("nested: outer after it:", c, fault.Is(c, fault.DeadlineExceeded))
+	} catch err {
+		say.Line("never", err)
+	}
+	let ms = (tide.Now() - start) / tide.Millisecond
+	say.Line("nested: stopped at the outer 50 ms:", ms >= 40 && ms < 1000)
+
+	let spun = tide.Now()
+	let n = within 20ms {
+		try spin()
+	} catch err {
+		say.Line("spin:", err, fault.Is(err, fault.DeadlineExceeded))
+		-1
+	}
+	let sms = (tide.Now() - spun) / tide.Millisecond
+	say.Line("spin: value", n, "stopped after 20 ms:", sms >= 15 && sms < 1000)
+	let after = task.Canceled()
+	say.Line("after the blocks: deadline", task.Deadline(), "canceled", after == nil)
+
+	siblings() catch err {
+		say.Line("siblings:", err, "log:", log)
+	}
+	let same = inherited() catch err {
+		say.Line("never", err)
+		false
+	}
+	say.Line("spawned child: same deadline as its scope:", same)
+}

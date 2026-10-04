@@ -11,6 +11,7 @@ Generated from the comments in `lib/*/` by `tools/gendoc.py`.
 | [anvil](#anvil) | HTTP/1.1 server (net/http) |
 | [hearth](#hearth) | cores and threads (runtime) |
 | [relay](#relay) | messages between cores (channels) |
+| [task](#task) | deadline and cancellation of the running code (context) |
 | [wire](#wire) | TCP and HTTP client (net) |
 | [twine](#twine) | strings (strings) |
 | [glyph](#glyph) | UTF-8 and Unicode (unicode/utf8, unicode) |
@@ -199,6 +200,13 @@ from, msg := relay.Recv()           // on core 2: blocks until a message arrives
 - `Drain(h func(i64, str))`: Drain runs h on every waiting message (event loops call it after WakeFD fires).
 - `Received() i64`: Received is how many messages this core has taken from its inbox.
 - `Me() i64`: Me is this core's number.
+
+## task
+
+Package task reads the deadline and cancellation of the running code, which belong to its innermost boundary (the request, a `within` or `limit` block, a scope's child; Go's context.Context Deadline and Err, without passing a context). Waits already fail when either stops the code: these are for code that does not wait, or that wants to stop at a point of its own choosing.
+
+- `Deadline() i64`: Deadline is the effective deadline of the running code in tide.Now() nanoseconds (the earliest of its request's and every enclosing within block's), or 0 when it has none.
+- `Canceled() !`: Canceled is nil while the running code may go on, else the fault its next wait would fail with: fault.DeadlineExceeded once the deadline has passed, fault.LimitExceeded past a budget, or fault.Canceled wrapping the reason of a cancel or drain.
 
 ## wire
 
