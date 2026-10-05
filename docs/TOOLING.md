@@ -390,16 +390,20 @@ tables) from Go's `unicode/tables.go`; it needs a Go tree only to read that one 
 
 ## CPU cancellation safepoints
 
-`tin build --polls FILE.tin -o app` and `tin run --polls FILE.tin` enable CPU
-cancellation safepoints (`bin/tinc -polls` directly). `TINC_POLLS=1` enables the same
-compiler option for build scripts and benchmark harnesses. Polls are experimental and
-opt-in because native Linux measurements exceed the 2% performance budget; see
-[PERFORMANCE.md](PERFORMANCE.md#cpu-cancellation-safepoints).
+**A program that starts cores** (`anvil.Serve`, `hearth.Run`) gets CPU cancellation
+safepoints by default (#341): loop back-edges and function entries in its own code poll, so a
+handler that never waits cannot hold its core past its deadline or a drain. The standard
+library (`lib/`) does not poll: its loops are bounded by their input. `tin build --nopolls`
+(`tinc -nopolls`, or `TINC_POLLS=0`) turns them off. A program that starts no cores (a CLI,
+a benchmark) has no polls unless asked: `tin build --polls` / `tin run --polls`
+(`tinc -polls`, `TINC_POLLS=1`) put them in every function outside `lib/runtime/`. The cost
+is in [PERFORMANCE.md](PERFORMANCE.md#cpu-cancellation-safepoints).
 
-With polls, loop back-edges and function entries in user code observe watchdog cancellation.
+With polls, loop back-edges and function entries observe watchdog cancellation.
 A `within` deadline unwinds to its owner, runs defers, and returns its fault. A request
 spinning past its deadline gets HTTP 504 and the core serves queued requests. Linux SIGTERM
 drain also stops a spinning request at the grace deadline. `@nopoll fn kernel(...) ...`
 (edition 1) omits polls in that function; calls into other functions may still poll. Trusted
-`lib/runtime/` functions never poll. Without the option, waits still observe deadlines and
-cancellation; CPU-bound code has no cancellation guarantee.
+`lib/runtime/` functions never poll. Without polls, waits still observe deadlines and
+cancellation; CPU-bound code has no cancellation guarantee, and the monitor thread still ends
+the process at a SIGTERM that a held core 0 cannot read (#429).

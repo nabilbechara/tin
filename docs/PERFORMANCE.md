@@ -492,9 +492,11 @@ optimization target.
 
 ## CPU cancellation safepoints
 
-Safepoints are opt-in (`tin build --polls`, `tin run --polls`, or `tinc -polls`;
-`TINC_POLLS=1` for build scripts). They remain off by default because the measured cost
-exceeds issue #234's 2% budget. A function can opt out with edition-1 `@nopoll`.
+Safepoints are on by default in a program that starts cores, in its own code only (#341);
+the standard library and programs without cores (the CPU benchmarks below) have none, so
+their cost there is zero. `--nopolls` turns them off, `--polls` puts them everywhere outside
+`lib/runtime/`, and a function opts out with `@nopoll`. The cost below is for polls in every
+loop (the `--polls` form): a tight loop in a handler pays it; anvil and the rest of `lib/` do not.
 
 The initial [native Linux run](https://github.com/yasserreslan/tin/actions/runs/37197260096)
 compared base `b6333ef` with head `9759a6b`, with polls enabled in strict Tin code.

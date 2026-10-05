@@ -1254,8 +1254,9 @@ say.Line(profile, page, summary)
   enclosing one when that is earlier (the request's `TIN_DEADLINE_MS`, an outer `within`).
   Every wait inside (`tide.Wait`, `wire`, database and cache clients, file reads on helper
   threads, `select`) fails with `fault.DeadlineExceeded` past it, and the block gives that
-  fault. Code that does not wait checks `task.Canceled()`, or, built with `-polls`, is
-  stopped at its next safepoint ([TOOLING.md](TOOLING.md)).
+  fault. Code that does not wait is stopped at its next safepoint: a program that starts
+  cores polls in its own loops and function entries by default; elsewhere, check
+  `task.Canceled()` or build with `--polls` ([TOOLING.md](TOOLING.md)).
 - **`limit memory n, tasks k { }`**: a budget of pool memory and of tasks started inside
   (either bound alone is allowed). Passing it leaves the block with `fault.LimitExceeded`
   at once, after its defers and cleanups.

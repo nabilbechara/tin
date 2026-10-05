@@ -84,16 +84,45 @@ def guard_cleanup(exe):
             proc.wait()
 
 
+def polls_in(args, source):
+    """The poll loads in the arm64 listing of source, by function (a program's own code only)."""
+    listing = subprocess.run([str(ROOT / 'bin/tinc'), '-S', '-target', 'linux-arm64', '-o', os.devnull, *args, str(ROOT / source)],
+                             check=True, cwd=ROOT, capture_output=True, text=True, env=dict(os.environ, TINC_POLLS='')).stdout
+    by_fn, fn = {}, None
+    for line in listing.splitlines():
+        if line and not line.startswith(('\t', ' ', '.', 'L')) and line.endswith(':'):
+            fn = line[:-1].lstrip('_')
+        elif line.strip() == 'ldr x16, [x28, #96]':
+            by_fn[fn] = by_fn.get(fn, 0) + 1
+    return by_fn
+
+
+def defaults():
+    # #341: a program that starts cores polls in its own code without -polls; the standard
+    # library (anvil here) does not; -nopolls turns it off; a program without cores never polls.
+    on = polls_in([], 'tools/ci/fixtures/poll.tin')
+    assert on.get('spin', 0) >= 1 and on.get('main.main', 0) == 1, on
+    assert not [f for f in on if f.startswith(('anvil.', 'hearth.', 'rt_'))], on
+    assert polls_in(['-nopolls'], 'tools/ci/fixtures/poll.tin') == {}
+    assert polls_in([], 'bench/v2/indexsum.tin') == {}
+    print('PASS default polls: %d in a server program\'s own code, none in lib/, none with -nopolls '
+          'or in a program without cores' % sum(on.values()))
+
+
 def main():
     out = ROOT / 'bin/ci/poll'
     out.mkdir(parents=True, exist_ok=True)
-    exe = out / 'server'
-    subprocess.run([str(ROOT / 'bin/tinc'), '-polls', '-edition', '1', '-o', str(exe),
-                    str(ROOT / 'tools/ci/fixtures/poll.tin')], check=True, cwd=ROOT)
-    run(exe)
-    guard_cleanup(exe)
-    if platform.system() == 'Linux':
-        run(exe, drain=True)
+    defaults()
+    # Built with -polls, and with no flag at all: a server program polls by default (#341).
+    for flags, name in ((['-polls'], 'server'), ([], 'server-default')):
+        exe = out / name
+        subprocess.run([str(ROOT / 'bin/tinc'), *flags, '-edition', '1', '-o', str(exe),
+                        str(ROOT / 'tools/ci/fixtures/poll.tin')], check=True, cwd=ROOT,
+                       env=dict(os.environ, TINC_POLLS=''))
+        run(exe)
+        guard_cleanup(exe)
+        if platform.system() == 'Linux':
+            run(exe, drain=True)
 
 
 if __name__ == '__main__':

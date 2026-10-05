@@ -710,10 +710,44 @@ fn check() {
 	mark_reach(find_fn(cstr("rt_bounds_fail")))
 	mark_reach(find_fn(cstr("rt_bounds_fail2")))
 	mark_reach(find_fn(cstr("rt_div_fail")))
+	polls_for_cores()
 	if compiler_polls != 0 {
 		mark_reach(find_fn(cstr("rt_bnd_poll")))
 	}
 	check_init_order()
+}
+
+// polls_for_cores turns safepoints on in a program that starts cores (#341): a handler that
+// never waits must not hold its core past its deadline or a drain. Only user code polls (the
+// standard library's loops are bounded by their input); -nopolls or TINC_POLLS=0 keep it off.
+// __start was built before reachability was known, so its rt_poll_enable goes in here.
+fn polls_for_cores() {
+	if compiler_polls != 0 || polls_auto == 0 {
+		return
+	}
+	let run = find_fn(cstr("hearth.Run"))
+	if cast(i64, run) == 0 || cast(Fn, run).reach == 0 {
+		return
+	}
+	compiler_polls = 1
+	polls_user_only = 1
+	let body = cast(Block, cast(Fn, start_fn).body)
+	let pos = cast(Fn, start_fn).pos
+	mut out = []i64{}
+	mut i = 0
+	for i < len(body.stmts) {
+		let s = body.stmts[i]
+		out = append(out, s)
+		if cast(Node, s).kind == ST_EXPR {
+			let x = cast(ExprStmt, s).x
+			if cast(Node, x).kind == EX_CALL && streq(cast(Call, x).name, cstr("rt_init")) != 0 {
+				out = append(out, expr_stmt(cast(Node, rt_call(pos, cstr("rt_poll_enable"), cast(i64, []i64{}), ty_void))))
+			}
+		}
+		i = i + 1
+	}
+	body.stmts = out
+	mark_reach(find_fn(cstr("rt_poll_enable")))
 }
 
 // declare_template makes a generic function's name callable; instances are declared on use.

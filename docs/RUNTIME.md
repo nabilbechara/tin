@@ -342,9 +342,10 @@ turned once that passes 1.5 s: `anvil.StuckCores()` and `anvil.StuckFor()`; (b) 
 with status 0 when a shutdown (SIGTERM, SIGINT, `anvil.Drain`) was asked for and the cores have
 not finished it two seconds after the grace period (core 0 does that itself when it is healthy);
 (c) on Linux, where the signal is a descriptor, does the same when the signal has waited unread
-for 300 ms, which is what happens when core 0 is the held one. Not done: safepoints on by
-default (a spinning handler still holds its core until it ends, for the deadline to cancel it
-needs `-polls`).
+for 300 ms, which is what happens when core 0 is the held one. Safepoints are on by default in
+a program that starts cores (#341), so a spinning handler of its own code ends at its deadline
+with 504 and the core serves its queue; the monitor is the backstop for code built with
+`--nopolls`, `@nopoll` functions and long loops in the standard library.
 
 **Backpressure.** If the socket does not take everything, the remainder is kept in the
 connection, reading is disabled, and write readiness is awaited; when the output drains,

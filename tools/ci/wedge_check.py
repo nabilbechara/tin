@@ -46,7 +46,10 @@ def main():
     out = ROOT / 'bin/ci/wedge'
     out.mkdir(parents=True, exist_ok=True)
     exe = out / 'spin'
-    subprocess.run([str(ROOT / os.environ.get('TIN_COMPILER', 'bin/tinc')), '-o', str(exe), 'tools/ci/fixtures/spin.tin'],
+    # -nopolls: the monitor is the backstop for code that does not poll (@nopoll, the standard
+    # library); with polls, which a server program gets by default (#341), the spin would end at
+    # its deadline instead of holding the core.
+    subprocess.run([str(ROOT / os.environ.get('TIN_COMPILER', 'bin/tinc')), '-nopolls', '-o', str(exe), 'tools/ci/fixtures/spin.tin'],
                    cwd=ROOT, env=dict(os.environ, TIN_ROOT=str(ROOT)), check=True)
     if not sys.platform.startswith('linux'):
         print('SKIP held cores: on macOS core 0 accepts every connection, so a held core 0 serves nothing (Linux only)')

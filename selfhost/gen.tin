@@ -3605,9 +3605,14 @@ fn syscall_words(restorer i64) i64 {
 
 // fn_polls keeps trusted runtime leaves and explicit @nopoll bodies uninterrupted.
 shared mut compiler_polls i64
+shared mut polls_auto i64       // a program that starts cores gets polls without -polls (#341)
+shared mut polls_user_only i64  // they were turned on that way: the standard library (lib/) does not poll
 
 fn fn_polls(f Fn) i64 {
 	if compiler_polls == 0 || cast(i64, f) == start_fn {
+		return 0
+	}
+	if polls_user_only != 0 && file_in_lib(f.file) != 0 {
 		return 0
 	}
 	let path = files[f.file]
@@ -3631,6 +3636,17 @@ fn fn_polls(f Fn) i64 {
 }
 
 shared mut poll_sites []i64
+shared mut lib_files []i64 // per file: 1 in the standard library (<root>/lib/), 2 not, 0 not yet known
+
+fn file_in_lib(file i64) i64 {
+	if cast(i64, lib_files) == 0 {
+		lib_files = slice_filled(len(files), 0)
+	}
+	if lib_files[file] == 0 {
+		lib_files[file] = 2 - path_in_root_dir(files[file], cstr("/lib/"))
+	}
+	return i64(lib_files[file] == 1)
+}
 
 // gen_poll branches to a cold stub; the ordinary path uses only the reserved scratch.
 fn gen_poll() {
