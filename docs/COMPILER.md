@@ -40,8 +40,7 @@ Files under `selfhost/` are read as trusted code, like the runtime and the stand
 use `cast` and raw words (E802 otherwise). That is what lets a typed edition 1 file in `selfhost/` take
 the records the untyped files allocate (notes/design_typed_compiler.md, #228).
 
-`lib/std.tin` (legacy helpers: `strlen`, `streq`, `calloc` externs...) is part of every
-compiler build.
+The helpers the compiler's own sources share (`streq`, `cstr` for string literals) are in `util.tin`.
 
 ## 2. Pipeline
 

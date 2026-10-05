@@ -93,17 +93,6 @@ out.chmod(0o755)
             with self.assertRaisesRegex(ValueError, 'unknown benchmarks'):
                 measure.benchmark_names(Path(tmp), ['typo'])
 
-    def test_legacy_benchmarks_load_matching_std_library(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp).resolve()
-            source = root / 'legacy.tin'
-            source.write_text('fn main() { print(1); }')
-            command = measure.tin_command(root, source, root / 'out')
-            self.assertEqual(command['command'][-2:], [str(root / 'lib/std.tin'), str(source)])
-            source.write_text('package main\nfn main() {}')
-            command = measure.tin_command(root, source, root / 'out')
-            self.assertNotIn(str(root / 'lib/std.tin'), command['command'])
-
     def test_wrk_parser_rejects_errors_and_missing_measurements(self):
         valid = '  99%    1.50ms\n  100 requests in 1.00s, 20KB read\nRequests/sec: 100.00\n'
         self.assertEqual(http.parse_wrk(valid)['p99_us'], 1500)

@@ -9,7 +9,8 @@ seed=${2:-1}
 w=${X64FUZZ_DIR:-${TMPDIR:-/tmp}/x64fuzz}
 mkdir -p "$w" || exit 1
 w=$(cd "$w" && pwd)
-bin/tinc -o "$w/fuzz" lib/std.tin selfhost/util.tin selfhost/asm_x64.tin tools/x64fuzz/fuzz.tin || exit 1
+case $(uname -s) in Darwin) host=darwin ;; *) host=linux ;; esac
+bin/tinc -o "$w/fuzz" selfhost/util.tin "selfhost/host_$host.tin" selfhost/asm_x64.tin tools/x64fuzz/fuzz.tin || exit 1
 "$w/fuzz" "$w/out.bin" "$w/ours.txt" "$count" "$seed" || exit 1
 image=${X64FUZZ_IMAGE:-debian:bookworm-slim}
 install=

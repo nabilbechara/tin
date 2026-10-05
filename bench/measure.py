@@ -1,7 +1,6 @@
 """Shared checked, alternating-order timing for CPU reference and revision comparisons."""
 import os
 from pathlib import Path
-import re
 import statistics
 import subprocess
 import time
@@ -37,8 +36,6 @@ def interleaved(commands, runs, *, check_output=True):
 def tin_command(root, source, output, compiler=None):
     root = Path(root).resolve()
     sources = [str(source)]
-    if not re.search(r'^\s*package\s', Path(source).read_text(), re.M):
-        sources.insert(0, str(root / 'lib/std.tin'))
     return {'command': [str(Path(compiler).resolve() if compiler else root / 'bin/tinc'),
                         '-o', str(output), *sources],
             'cwd': str(root), 'env': dict(os.environ, TIN_ROOT=str(root), LC_ALL='C')}

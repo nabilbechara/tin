@@ -358,7 +358,7 @@ single-statement functions. `Ints` and `Strs` stay for programs that sort those 
 
 ## 4. Compile times and binary sizes
 
-The compiler (about 20k lines including `lib/std.tin`, all backends) builds itself in 0.07 s
+The compiler (about 35k lines, all backends) builds itself in 0.07 s
 (warm file cache; about 0.6 s cold).
 
 | program | Tin | Go |

@@ -49,8 +49,8 @@ Targets (`--target`): `darwin-arm64` (default on a Mac), `linux-arm64` (default 
 arm64 Linux), `linux-amd64` (supported and tested natively). Cross-compiling needs nothing extra: the
 compiler contains every backend and writes Mach-O or ELF itself.
 
-Programs without a `package` clause use the legacy syntax; `tin` adds `lib/std.tin` to
-them.
+Every program is edition 1: a file without a `package` clause is an error (E001). Old programs are
+translated with `tin fix -edition 1`.
 
 ### 2.1 Dependencies: `tin.mod`, `tin vendor`, `tin.lock`
 
