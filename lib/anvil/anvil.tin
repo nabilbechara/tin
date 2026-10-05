@@ -63,6 +63,7 @@
 package anvil
 
 import "hearth"
+import "quarry"
 import "relay"
 import "say"
 
@@ -120,7 +121,14 @@ const cStart = 15    // when the first bytes of the request still arriving came 
 const cLinger = 16   // 1: close after an error response by lingering (see linger); 2: lingering
 const cSent100 = 17  // the request still arriving was told 100 Continue
 const cPeer = 18     // the peer's sockaddr (malloc'd, read when a handler first asks), -1: unknown (#355)
-const cWords = 19
+const cStream = 19   // the response streams (#350): 0 no, 1 asked for, 2 chunked, 3 with a Content-Length, 4 until the connection closes, 5 broken
+const cStLen = 20    // Content-Length the handler set for the stream (-1: none)
+const cStSent = 21   // body bytes of a Content-Length stream sent so far
+const cStBuf = 22    // scratch the head and the chunk framing are built in (malloc'd)
+const cStCap = 23
+const cStPend = 24   // bytes of the response head in cStBuf that are not written yet
+const cStFlags = 25  // the request: 1 HEAD, 2 HTTP/1.0, 4 keep-alive asked in HTTP/1.0
+const cWords = 26
 
 shared mut gListen i64
 shared mut gIP i64
@@ -202,6 +210,7 @@ mut pHead bool
 mut pTs i64      // the request target: offset in the request and length (absolute-form reduced to its path)
 mut pTn i64
 mut pKeep10 bool // an HTTP/1.0 request asked for keep-alive: the response must say so
+mut pHttp10 bool // the request is HTTP/1.0
 mut pTr i64      // a chunked request's trailer lines: offset in the request bytes and length (#349)
 mut pTrLen i64
 
@@ -772,6 +781,9 @@ fn free_conn(c i64) {
 	if c[cPeer] > 0 {
 		free(c[cPeer])
 	}
+	if c[cStBuf] != 0 {
+		free(c[cStBuf])
+	}
 	free(c)
 }
 
@@ -1316,6 +1328,7 @@ fn serve_one(c i64, p i64, n i64) i64 {
 	pTs = ts
 	pTn = tn
 	pKeep10 = http10 && alive
+	pHttp10 = http10
 	let task = rt_task_new(run_request, c)
 	if gReplayTape != 0 {
 		rt_tape_set(task, gReplayTape) // the recorded request's effects come from its capsule (#242)
@@ -1345,7 +1358,11 @@ fn serve_one(c i64, p i64, n i64) i64 {
 		}
 	}
 	if rt_task_run(task) {
-		if rt_task_panicked(task) {
+		mut streamed = false
+		if c[cStream] != 0 {
+			streamed = stream_abort(c) // it ended in a panic or a cancel before it finished (#350)
+		}
+		if rt_task_panicked(task) && !streamed {
 			panicked(c, task)
 		}
 		if gRecord {
@@ -1389,6 +1406,7 @@ fn run_request(c i64) {
 	}
 	let hd = pHead
 	let keep10 = pKeep10
+	c[cStFlags] = i64(hd) | i64(pHttp10)<<1 | i64(keep10)<<2
 	let body = make([]u8, 0, 1024)
 	let w = Out{Body: body, code: 200, ctype: "text/plain; charset=utf-8", extra: make([]u8, 0, 256), own: body}
 	rt_task_current()[tUser] = cast(i64, q)
@@ -1401,7 +1419,11 @@ fn run_request(c i64) {
 		if gRecord {
 			record_status(w.code)
 		}
-		respond_out(w, hd, keep10)
+		if c[cStream] >= 2 {
+			stream_end(c, w)
+		} else {
+			respond_out(w, hd, keep10)
+		}
 	}
 }
 
@@ -1417,7 +1439,13 @@ fn rebase_request(task i64, delta i64) {
 // response, then serve the requests that queued behind it.
 fn finish_request(c i64, task i64) {
 	free(task[tUser+1])
-	if rt_task_panicked(task) && c[cHijack] == 0 && c[cDead] == 0 {
+	mut streamed = false
+	if c[cStream] != 0 {
+		// The handler ended in a panic or a cancel while it streamed: what was sent cannot be
+		// followed by an error page, so the connection closes.
+		streamed = stream_abort(c)
+	}
+	if rt_task_panicked(task) && c[cHijack] == 0 && c[cDead] == 0 && !streamed {
 		panicked(c, task)
 	}
 	if gRecord {
@@ -2225,6 +2253,536 @@ fn (q Req) Hijack() !i64 {
 	// From here the request always ends through finish_request, which closes it.
 	rt_task_defer()
 	return fd
+}
+
+// ---- streaming responses (#350) ----
+//
+// A handler that calls w.Stream() sends its response as it goes: the head goes out with the first
+// Write or Flush, each Write is one chunk (or part of a Content-Length body), and the handler's
+// return ends the response. The task writes to the socket itself and waits for it with
+// rt_task_wait when the client reads slowly, so a response is never held in the request pool;
+// for that it takes the connection out of the event loop until the response is over.
+
+// Stream switches the response to streaming. The status, content type and headers set so far
+// are sent with the first Write or Flush (set them before). The body is then written with Write
+// and Flush, in chunks (Transfer-Encoding: chunked), or as a plain body of the size Length gave;
+// an HTTP/1.0 client, which cannot read chunks, gets the body up to the end of the connection.
+// Each write waits for a slow client within the write timeout (TIN_WRITE_TIMEOUT_MS), and the
+// request deadline (TIN_DEADLINE_MS) counts from the last write, so a stream lives as long as it
+// keeps writing. Calling Stream again does nothing.
+fn (w mut Out) Stream() ! {
+	let c = stream_conn()
+	if c == 0 {
+		fail "anvil: Stream outside a request"
+	}
+	if c[cHijack] != 0 {
+		fail "anvil: the connection is hijacked"
+	}
+	if c[cStream] == 0 {
+		c[cStream] = 1
+		c[cStLen] = -1
+	}
+}
+
+// Length sets the size of the streamed body in bytes: the response then has a Content-Length
+// header instead of chunks, and the handler must write exactly n bytes. Call it after Stream
+// and before the first Write or Flush.
+fn (w mut Out) Length(n i64) ! {
+	let c = stream_conn()
+	if c == 0 || c[cStream] != 1 {
+		fail "anvil: Length is set after Stream and before the first Write"
+	}
+	if n < 0 {
+		fail "anvil: negative Length"
+	}
+	c[cStLen] = n
+}
+
+// Write sends b as part of the body, after the head if that is not out yet. It waits while the
+// client does not read, and fails when the client has closed the connection, stopped reading for
+// the write timeout, or the request was cancelled: the handler should stop then. Text appended to
+// the body with Text or argo.Put(mut w.Body, v) is sent by the next Write or Flush.
+fn (w mut Out) Write(b []u8) ! {
+	let c = stream_conn()
+	if c == 0 || c[cStream] == 0 {
+		fail "anvil: Write needs w.Stream() first"
+	}
+	try stream_flush_body(c, mut w)
+	let h = cast(i64, b)
+	try stream_put(c, w, h[2], h[0])
+}
+
+// WriteString is Write for a str.
+fn (w mut Out) WriteString(s str) ! {
+	let c = stream_conn()
+	if c == 0 || c[cStream] == 0 {
+		fail "anvil: WriteString needs w.Stream() first"
+	}
+	try stream_flush_body(c, mut w)
+	try stream_put(c, w, cast(i64, s)+8, len(s))
+}
+
+// Flush sends the head if it is not out yet and what Text or argo.Put put in the body so far,
+// as one chunk: with it a handler makes a client see an event now.
+fn (w mut Out) Flush() ! {
+	let c = stream_conn()
+	if c == 0 || c[cStream] == 0 {
+		fail "anvil: Flush needs w.Stream() first"
+	}
+	try stream_flush_body(c, mut w)
+	try stream_put(c, w, 0, 0)
+}
+
+// Abort ends a stream the handler cannot finish (its data source failed halfway): the connection
+// closes without the last chunk, so the client sees an incomplete response instead of a short one
+// that looks complete. Before the head is sent, the response is an ordinary one again.
+fn (w mut Out) Abort() {
+	let c = stream_conn()
+	if c != 0 && c[cStream] >= 2 && c[cStream] != 5 {
+		c[cStream] = 5
+		c[cClose] = 1
+	}
+}
+
+// Closed reports whether the client has closed the connection (a stream's handler asks between
+// events: a write only fails once the client's reset arrives).
+fn (w Out) Closed() bool {
+	let c = stream_conn()
+	if c == 0 {
+		return false
+	}
+	let b = calloc(1, 8)
+	let k = rt_sys_recv(c[cFD], b, 1, 2)
+	let e = errno()
+	free(b)
+	if k == 0 {
+		return true
+	}
+	return k < 0 && e != EAGAIN && e != 4
+}
+
+// stream_conn is the connection of the request the running task serves, 0 outside one.
+fn stream_conn() i64 {
+	let task = rt_task_current()
+	if task == 0 {
+		return 0
+	}
+	return task[tArg]
+}
+
+// stream_flush_body sends the body buffered in w (Text, argo.Put) and empties it.
+fn stream_flush_body(c i64, w mut Out) ! {
+	let h = cast(i64, w.Body)
+	if h[0] > 0 {
+		let n = h[0]
+		h[0] = 0
+		try stream_put(c, w, h[2], n)
+	}
+}
+
+const streamChunk = 65536
+
+// stream_put sends n bytes at p as body (n may be 0: only the head, if it is not out). The first
+// call builds and sends the head.
+fn stream_put(c i64, w Out, p i64, n i64) ! {
+	if c[cStream] == 5 {
+		fail "anvil: the stream is broken (the client went away or stopped reading)"
+	}
+	if c[cStream] == 1 {
+		try stream_begin(c, w)
+	}
+	let fl = c[cStFlags]
+	let mode = c[cStream]
+	mut off = p
+	mut left = n
+	if (fl & 1) != 0 {
+		// HEAD: the head, no body.
+		left = 0
+	}
+	if mode == 3 && c[cStSent]+left > c[cStLen] {
+		fail "anvil: more bytes written than the Content-Length"
+	}
+	for {
+		let piece = min(left, streamChunk)
+		if c[cStPend] == 0 && piece == 0 {
+			return
+		}
+		let buf = c[cStBuf]
+		mut out = c[cStPend]
+		mut direct = 0
+		if mode == 2 && piece > 0 {
+			out += put_hex(buf, out, piece)
+			memcpy(buf+out, off, piece)
+			out += piece
+			store8(buf+out, '\r')
+			store8(buf+out+1, '\n')
+			out += 2
+		} else if piece > 0 && out > 0 {
+			memcpy(buf+out, off, piece)
+			out += piece
+		} else if piece > 0 {
+			direct = 1
+		}
+		c[cStPend] = 0
+		if direct != 0 {
+			try stream_write_all(c, off, piece)
+		} else {
+			try stream_write_all(c, buf, out)
+		}
+		c[cStSent] += piece
+		off += piece
+		left -= piece
+		if left == 0 {
+			break
+		}
+	}
+	if gDeadlineMs > 0 {
+		rt_task_set_deadline(rt_task_current(), rt_mono_ns()+gDeadlineMs*1000000)
+	}
+}
+
+// put_hex writes v (> 0) in hexadecimal and CRLF at buf+at, and returns how many bytes that took.
+fn put_hex(buf i64, at i64, v i64) i64 {
+	mut nd = 1
+	mut t = v
+	for t >= 16 {
+		nd += 1
+		t /= 16
+	}
+	mut x = v
+	mut i = nd - 1
+	for i >= 0 {
+		let d = x % 16
+		if d < 10 {
+			store8(buf+at+i, '0'+d)
+		} else {
+			store8(buf+at+i, 'a'+d-10)
+		}
+		x /= 16
+		i -= 1
+	}
+	store8(buf+at+nd, '\r')
+	store8(buf+at+nd+1, '\n')
+	return nd + 2
+}
+
+// stream_begin takes the connection out of the event loop, writes what earlier pipelined responses
+// left, and builds the head of the streamed response in the connection's scratch buffer.
+fn stream_begin(c i64, w Out) ! {
+	if w.code < 200 || w.code == 204 || w.code == 304 {
+		fail "anvil: a response with this status has no body to stream"
+	}
+	let fd = c[cFD]
+	let fl = c[cStFlags]
+	if obLen > 0 {
+		pend_out(c, ob, obLen)
+		obLen = 0
+	}
+	ev_task_del(fd)
+	conns[fd] = 0
+	c[cWriting] = 0
+	c[cStream] = 5
+	// Whatever earlier pipelined responses left unwritten goes first.
+	for c[cOut] != 0 && c[cOutOff] < c[cOutLen] {
+		let k = rt_sys_write(fd, c[cOut]+c[cOutOff], c[cOutLen]-c[cOutOff])
+		if k > 0 {
+			c[cOutOff] += k
+			continue
+		}
+		try stream_wait(c, k, errno())
+	}
+	if c[cOut] != 0 {
+		free(c[cOut])
+		c[cOut] = 0
+		c[cOutLen] = 0
+		c[cOutOff] = 0
+	}
+	mut mode = 2
+	if c[cStLen] >= 0 {
+		mode = 3
+	} else if (fl & 2) != 0 {
+		mode = 4
+	}
+	let cap = streamChunk + 1024 + len(w.ctype) + len(w.extra)
+	let buf = malloc(cap)
+	c[cStBuf] = buf
+	c[cStCap] = cap
+	mut o = 0
+	o += put_str(buf, o, status_line(w.code))
+	memcpy(buf+o, common, commonLen)
+	o += commonLen
+	o += put_str(buf, o, "Content-Type: ")
+	o += put_str(buf, o, w.ctype)
+	o += put_str(buf, o, "\r\n")
+	let eh = cast(i64, w.extra)
+	if eh[0] > 0 {
+		memcpy(buf+o, eh[2], eh[0])
+		o += eh[0]
+	}
+	if mode == 2 {
+		o += put_str(buf, o, "Transfer-Encoding: chunked\r\n")
+	} else if mode == 3 {
+		o += put_str(buf, o, "Content-Length: ")
+		o += put_dec(buf, o, c[cStLen])
+		o += put_str(buf, o, "\r\n")
+	}
+	if draining || mode == 4 || ((fl & 2) != 0 && (fl & 4) == 0) {
+		o += put_str(buf, o, "Connection: close\r\n")
+	} else if (fl & 4) != 0 {
+		o += put_str(buf, o, "Connection: keep-alive\r\n")
+	}
+	o += put_str(buf, o, "\r\n")
+	c[cStPend] = o
+	c[cStSent] = 0
+	c[cStream] = mode
+}
+
+// stream_write_all writes n bytes at p to the client, waiting while it does not read.
+fn stream_write_all(c i64, p i64, n i64) ! {
+	mut done = 0
+	for done < n {
+		let k = rt_sys_write(c[cFD], p+done, n-done)
+		if k > 0 {
+			done += k
+			continue
+		}
+		try stream_wait(c, k, errno())
+	}
+}
+
+// stream_wait handles a write that moved nothing (k): wait for the socket to take more, or fail.
+// A failure leaves the stream broken and the connection to be closed.
+fn stream_wait(c i64, k i64, e i64) ! {
+	if k < 0 && e == 4 {
+		return
+	}
+	if k < 0 && e == EAGAIN {
+		mut ns = 0
+		if gWriteMs > 0 {
+			ns = gWriteMs * 1000000
+		}
+		let r = rt_task_wait(c[cFD], 2, ns)
+		if r == waitDeadline {
+			c[cStream] = 5
+			c[cClose] = 1
+			fail cast(fault, rt_wait_fault())
+		}
+		if r == waitTimeout {
+			c[cStream] = 5
+			c[cClose] = 1
+			fail "anvil: the client stopped reading"
+		}
+		return
+	}
+	c[cStream] = 5
+	c[cClose] = 1
+	fail "anvil: the client closed the connection"
+}
+
+// stream_end finishes a streamed response when the handler returns: the body still in w, the
+// last chunk, and the connection back in the event loop.
+fn stream_end(c i64, w Out) {
+	let fl = c[cStFlags]
+	let mode = c[cStream]
+	if mode == 2 || mode == 3 || mode == 4 {
+		let h = cast(i64, w.Body)
+		if h[0] > 0 {
+			stream_put(c, w, h[2], h[0]) catch _ {
+				c[cClose] = 1
+			}
+		}
+	}
+	if rt_bnd_stopped() && c[cStream] >= 2 && c[cStream] != 5 {
+		c[cStream] = 5 // cancelled, past its deadline or draining: the client must not see a complete body
+	}
+	let ended = c[cStream]
+	if ended == 2 && (fl & 1) == 0 {
+		ob_room(8)
+		ob_str("0\r\n\r\n")
+	} else if ended == 3 && (fl & 1) == 0 && c[cStSent] != c[cStLen] {
+		c[cClose] = 1 // a short body: the client cannot tell where it ends
+	} else if ended == 4 || ended == 5 {
+		c[cClose] = 1
+	}
+	stream_release(c)
+}
+
+// stream_abort ends a stream whose handler did not finish normally; it reports whether the head
+// was already sent (then the connection must close).
+fn stream_abort(c i64) bool {
+	let started = c[cStream] >= 2
+	if started {
+		c[cClose] = 1
+	}
+	stream_release(c)
+	return started
+}
+
+// stream_release frees the scratch buffer and, for a stream that took the connection out of the
+// event loop, puts it back.
+fn stream_release(c i64) {
+	let started = c[cStream] >= 2
+	if c[cStBuf] != 0 {
+		free(c[cStBuf])
+		c[cStBuf] = 0
+		c[cStCap] = 0
+		c[cStPend] = 0
+	}
+	if started && c[cDead] == 0 {
+		let fd = c[cFD]
+		conns[fd] = c
+		ev_conn(fd)
+	}
+	c[cStream] = 0
+}
+
+fn put_str(buf i64, at i64, s str) i64 {
+	memcpy(buf+at, cast(i64, s)+8, len(s))
+	return len(s)
+}
+
+// put_dec writes the decimal digits of v (>= 0) at buf+at and returns their count.
+fn put_dec(buf i64, at i64, v i64) i64 {
+	mut nd = 1
+	mut t = v
+	for t >= 10 {
+		nd += 1
+		t /= 10
+	}
+	mut x = v
+	mut i = nd - 1
+	for i >= 0 {
+		store8(buf+at+i, '0'+x%10)
+		x /= 10
+		i -= 1
+	}
+	return nd
+}
+
+// SendFile sends n bytes of the file at path, from byte off, as the body (n < 0: to the end of
+// the file). As the whole body of a response that is not streaming yet it starts the stream with
+// a Content-Length of n, so a download is `w.SendFile(path, 0, -1)`; in a stream already begun,
+// the bytes go out as chunks or as part of the Content-Length body. The file goes to the socket
+// with sendfile(2) in pieces of 1 MiB on a helper thread, so it is never read into the request
+// pool and a slow disk does not stop the core; each piece waits for a slow client within the
+// write timeout.
+fn (w mut Out) SendFile(path str, off i64, n i64) ! {
+	let c = stream_conn()
+	if c == 0 {
+		fail "anvil: SendFile outside a request"
+	}
+	if c[cHijack] != 0 {
+		fail "anvil: the connection is hijacked"
+	}
+	let size = try quarry.Size(path)
+	if off < 0 || off > size {
+		fail "anvil: SendFile starts past the end of the file"
+	}
+	mut count = n
+	if count < 0 {
+		count = size - off
+	}
+	if off + count > size {
+		fail "anvil: SendFile asks for more than the file holds"
+	}
+	if c[cStream] == 0 {
+		c[cStream] = 1
+		c[cStLen] = -1
+	}
+	if c[cStream] == 1 && c[cStLen] < 0 && len(w.Body) == 0 {
+		c[cStLen] = count
+	}
+	try stream_flush_body(c, mut w)
+	let fd = c32(rt_sys_open(rt_cstr(path), 0, 0))
+	if fd < 0 {
+		fail "anvil: SendFile cannot open the file"
+	}
+	let err = stream_file(c, w, fd, off, count)
+	rt_sys_close(fd)
+	if err != nil {
+		fail err
+	}
+}
+
+const sendfilePiece = 1048576
+
+// stream_file sends count bytes of file fd from off, framed as the stream needs.
+fn stream_file(c i64, w Out, fd i64, off i64, count i64) ! {
+	try stream_put(c, w, 0, 0) // the head, if it is not out
+	let mode = c[cStream]
+	if (c[cStFlags] & 1) != 0 {
+		return
+	}
+	if mode == 3 && c[cStSent]+count > c[cStLen] {
+		fail "anvil: more bytes written than the Content-Length"
+	}
+	mut left = count
+	mut at = off
+	for left > 0 {
+		let piece = min(left, sendfilePiece)
+		if mode == 2 {
+			let hn = put_hex(c[cStBuf], 0, piece)
+			try stream_write_all(c, c[cStBuf], hn)
+		}
+		mut sent = 0
+		for sent < piece {
+			let k = try sendfile_step(c, fd, at+sent, piece-sent)
+			sent += k
+		}
+		if mode == 2 {
+			store8(c[cStBuf], '\r')
+			store8(c[cStBuf]+1, '\n')
+			try stream_write_all(c, c[cStBuf], 2)
+		}
+		c[cStSent] += piece
+		at += piece
+		left -= piece
+		if gDeadlineMs > 0 {
+			rt_task_set_deadline(rt_task_current(), rt_mono_ns()+gDeadlineMs*1000000)
+		}
+	}
+}
+
+// sendfile_step moves some of the n bytes at off of file fd to the client on a helper thread,
+// waiting for the socket when it is full; it returns how many went.
+fn sendfile_step(c i64, fd i64, off i64, n i64) !i64 {
+	for {
+		let job = calloc(5, 8)
+		job[0] = fd
+		job[1] = c[cFD]
+		job[2] = off
+		job[3] = n
+		try rt_helper_run(sendfile_job, job, sendfile_drop)
+		let k = job[4]
+		free(job)
+		if k > 0 {
+			return k
+		}
+		if k == 0 {
+			c[cStream] = 5
+			c[cClose] = 1
+			fail "anvil: the file is shorter than it was when SendFile started"
+		}
+		if k == -EAGAIN || k == -4 {
+			if k == -EAGAIN {
+				try stream_wait(c, -1, EAGAIN)
+			}
+			continue
+		}
+		c[cStream] = 5
+		c[cClose] = 1
+		fail "anvil: sendfile failed"
+	}
+	return 0
+}
+
+fn sendfile_job(job i64) {
+	job[4] = os_sendfile(job[1], job[0], job[2], job[3])
+}
+
+// sendfile_drop frees a job whose request ended before the helper did.
+fn sendfile_drop(job i64) {
+	free(job)
 }
 
 // Body returns the request body (a chunked one decoded).

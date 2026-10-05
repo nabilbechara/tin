@@ -100,6 +100,12 @@ the compiler: write a minimal repro to notes/compiler_bugs_NAME.md and work arou
 - In anvil each request runs in its own task: a call that waits (tide.Wait, wire, quarry files, redis,
   mysql, postgres, websocket Read) lets the core serve others. Requests have a deadline
   (TIN_DEADLINE_MS, default 30 s); waits past it fail with "deadline exceeded".
+- Streaming a response (SSE, a download, a long job): set the status and headers, then
+  `try w.Stream()`, and `try w.WriteString(s)` / `try w.Write(bytes)` / `try w.Flush()` as data is ready;
+  `w.Length(n)` first for a body of known size (else chunked), `try w.SendFile(path, 0, -1)` for a file
+  (sendfile, never read into memory), `w.Closed()` to see a client that left, `w.Abort()` when the data
+  source fails half way. A write fails when the client stops reading (TIN_WRITE_TIMEOUT_MS) or the request
+  is cancelled: return then. The deadline restarts after each write. See examples/sse.tin.
 - Services route with `let r = anvil.NewRouter()` in main: ``r.Get(`/users/{id}`, user)`` (Post, Put,
   Patch, Delete, Head, Options, Handle(method, ...), Any), `q.PathParam("id")` (%-decoded), a last
   `{path...}` or `*` for the rest; patterns with {...} are raw strings. Static beats {name} beats the

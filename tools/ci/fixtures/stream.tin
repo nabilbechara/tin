@@ -1,0 +1,235 @@
+package main
+
+import "anvil"
+import "herald"
+import "mint"
+import "quarry"
+import "say"
+import "tide"
+import "twine"
+
+// #350: streaming responses. Routes for stream_check.py:
+//   /sse?n=N&ms=M      N server-sent events, M ms apart
+//   /chunks?n=N&size=S N chunks of S bytes (byte i of the stream is i % 251)
+//   /length?n=N        a Content-Length body of N bytes, written in pieces
+//   /short             Content-Length 10, only 5 bytes written
+//   /panic             one chunk, then a panic
+//   /unsent            Stream called, nothing written: an ordinary response
+//   /text              Text, Flush, Text: the buffered body goes out as chunks
+//   /endless           64 KiB chunks until a write fails (herald logs "endless stopped")
+//   /watch             waits for the client to go away (herald logs "watch saw closed")
+//   /file?name=&off=&n=  SendFile of a file in FILES_DIR (404 when it cannot be sent)
+//   /filechunk?name=   "head;", the file, ";tail" as one chunked stream
+//   /aborted           one chunk, then Abort
+//   /plain             an ordinary response
+
+fn num(q anvil.Req, name str, dflt i64) i64 {
+	let v = mint.Atoi(q.Param(name)) catch _ { dflt }
+	return v
+}
+
+fn pattern(size i64, start i64) []u8 {
+	let b = make([]u8, size)
+	for i in 0..size {
+		b[i] = u8((start + i) % 251)
+	}
+	return b
+}
+
+fn sse(q anvil.Req, w mut anvil.Out) {
+	w.Type("text/event-stream")
+	w.Head("Cache-Control", "no-cache")
+	w.Stream() catch _ {
+		return
+	}
+	let n = num(q, "n", 3)
+	let ms = num(q, "ms", 20)
+	for i in 0..n {
+		w.WriteString("data: tick {i}\n\n") catch _ {
+			return
+		}
+		tide.Wait(ms*1000000) catch _ {
+			return
+		}
+	}
+}
+
+fn chunks(q anvil.Req, w mut anvil.Out) {
+	w.Type("application/octet-stream")
+	w.Stream() catch _ {
+		return
+	}
+	let n = num(q, "n", 4)
+	let size = num(q, "size", 1000)
+	let b = pattern(size, 0)
+	for i in 0..n {
+		// every chunk repeats the pattern from its own start, so a reader checks each one
+		w.Write(b) catch _ {
+			return
+		}
+	}
+}
+
+fn length(q anvil.Req, w mut anvil.Out) {
+	w.Type("application/octet-stream")
+	w.Stream() catch _ {
+		return
+	}
+	let n = num(q, "n", 100000)
+	w.Length(n) catch _ {
+		return
+	}
+	let piece = 7000
+	mut sent = 0
+	for sent < n {
+		let k = min(piece, n-sent)
+		w.Write(pattern(k, sent)) catch _ {
+			return
+		}
+		sent += k
+	}
+}
+
+fn short(q anvil.Req, w mut anvil.Out) {
+	w.Stream() catch _ {
+		return
+	}
+	w.Length(10) catch _ {
+		return
+	}
+	w.WriteString("12345") catch _ {
+		return
+	}
+}
+
+fn crash(q anvil.Req, w mut anvil.Out) {
+	w.Stream() catch _ {
+		return
+	}
+	w.WriteString("partial") catch _ {
+		return
+	}
+	panic("boom")
+}
+
+fn unsent(q anvil.Req, w mut anvil.Out) {
+	w.Status(201)
+	w.Text("not streamed")
+	w.Stream() catch _ {
+		return
+	}
+}
+
+fn text(q anvil.Req, w mut anvil.Out) {
+	w.Stream() catch _ {
+		return
+	}
+	w.Text("one,")
+	w.Flush() catch _ {
+		return
+	}
+	w.Text("two,")
+	w.Flush() catch _ {
+		return
+	}
+	w.Text("three")
+}
+
+fn endless(q anvil.Req, w mut anvil.Out) {
+	w.Stream() catch _ {
+		return
+	}
+	let b = pattern(65536, 0)
+	for {
+		w.Write(b) catch err {
+			herald.Info("endless stopped: {err}")
+			return
+		}
+	}
+}
+
+fn watch(q anvil.Req, w mut anvil.Out) {
+	w.Stream() catch _ {
+		return
+	}
+	w.WriteString("watching\n") catch _ {
+		return
+	}
+	for i in 0..200 {
+		if w.Closed() {
+			herald.Info("watch saw closed")
+			return
+		}
+		tide.Wait(20000000) catch _ {
+			return
+		}
+	}
+	herald.Info("watch gave up")
+}
+
+fn file_path(q anvil.Req) str {
+	let name = q.Param("name")
+	if len(name) == 0 || twine.Contains(name, "/") {
+		return ""
+	}
+	return quarry.Getenv("FILES_DIR") + "/" + name
+}
+
+fn file(q anvil.Req, w mut anvil.Out) {
+	let path = file_path(q)
+	w.Type("application/octet-stream")
+	w.SendFile(path, num(q, "off", 0), num(q, "n", -1)) catch err {
+		herald.Info("file stopped: {err}")
+		w.Status(404)
+		return
+	}
+}
+
+fn filechunk(q anvil.Req, w mut anvil.Out) {
+	let path = file_path(q)
+	w.Stream() catch _ {
+		return
+	}
+	w.WriteString("head;") catch _ {
+		return
+	}
+	w.SendFile(path, 0, -1) catch err {
+		herald.Info("file stopped: {err}")
+		return
+	}
+	w.WriteString(";tail") catch _ {
+		return
+	}
+}
+
+fn aborted(q anvil.Req, w mut anvil.Out) {
+	w.Stream() catch _ {
+		return
+	}
+	w.WriteString("half") catch _ {
+		return
+	}
+	w.Abort()
+}
+
+fn plain(q anvil.Req, w mut anvil.Out) {
+	w.Text("plain")
+}
+
+fn main() {
+	let r = anvil.NewRouter()
+	r.Get("/sse", sse)
+	r.Get("/chunks", chunks)
+	r.Get("/length", length)
+	r.Get("/short", short)
+	r.Get("/panic", crash)
+	r.Get("/unsent", unsent)
+	r.Get("/text", text)
+	r.Get("/endless", endless)
+	r.Get("/watch", watch)
+	r.Get("/file", file)
+	r.Get("/filechunk", filechunk)
+	r.Get("/aborted", aborted)
+	r.Get("/plain", plain)
+	say.Line("server:", r.Serve(":" + quarry.Getenv("PORT")))
+}

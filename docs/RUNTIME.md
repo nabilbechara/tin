@@ -283,6 +283,24 @@ close-after-write flag, writing flag, bytes needed. Idle connections hold no buf
   `Content-Length` and the body (omitted for HEAD).
 - The buffer is reset per request and the request pool is wiped.
 - All responses produced from one read go out in one `write`.
+- **Streaming** (#350): a handler that calls `w.Stream()` writes its response itself, as it goes.
+  The first `Write`, `Flush` or `SendFile` takes the connection out of the event loop (its
+  descriptor leaves epoll or kqueue and `conns` for the duration, so no stale event reaches
+  it), writes the output earlier pipelined responses left, and builds the head in a
+  per-connection scratch buffer: `Transfer-Encoding: chunked`, or `Content-Length` when
+  `w.Length(n)` was called, or neither and `Connection: close` for an HTTP/1.0 client. Each write
+  goes straight to the socket from the handler's task (a chunk is framed in the scratch buffer,
+  at most 64 KiB at a time; a Content-Length body is written from the caller's memory) and waits
+  with `rt_task_wait` for a full socket, for at most the write timeout, so nothing is held in
+  the request pool. After every write the request deadline restarts, so it bounds the time between
+  writes, not the whole stream. `SendFile` moves a file with `sendfile(2)` in pieces of 1 MiB on
+  a helper thread (the same call on macOS), framed as chunks inside a chunked stream. When the
+  handler returns, the last chunk goes into the output buffer, the descriptor is registered again
+  and the connection goes on as after any response: the next pipelined request is served. A write
+  that fails, a cancel or a drain, `w.Abort()`, a body shorter than its `Content-Length`, a
+  panic, or an HTTP/1.0 stream all close the connection instead of ending the response, so the
+  client never takes a cut-off stream for a complete one. `w.Closed()` peeks at the socket to
+  see a client that left between two writes.
 
 **Backpressure.** If the socket does not take everything, the remainder is kept in the
 connection, reading is disabled, and write readiness is awaited; when the output drains,

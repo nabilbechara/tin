@@ -1,0 +1,66 @@
+package main
+
+import "anvil"
+import "herald"
+import "mint"
+import "quarry"
+import "say"
+import "tide"
+
+// Server-sent events over a streamed response (#350).
+//   GET /          a page that listens with EventSource
+//   GET /events    one "tick" event per interval, numbered; Last-Event-ID resumes the numbering
+//
+// The handler writes an event, waits for the next tick and looks at the client in between:
+// Closed tells at once that it went away, and a Write that fails (the client stopped reading, the
+// request was cancelled, the server is draining) ends the stream too. TICK_MS is the interval
+// (default 1000) and PORT the port.
+
+const page = `<!doctype html><title>ticks</title><ul id=l></ul><script>
+new EventSource('/events').addEventListener('tick', e => {
+  const li = document.createElement('li'); li.textContent = 'tick ' + e.data; l.append(li)
+})
+</script>`
+
+fn interval() i64 {
+	let ms = mint.Atoi(quarry.Getenv("TICK_MS")) catch _ { 1000 }
+	return ms * 1000000
+}
+
+fn index(q anvil.Req, w mut anvil.Out) {
+	w.Type("text/html; charset=utf-8")
+	w.Text(page)
+}
+
+fn events(q anvil.Req, w mut anvil.Out) {
+	w.Type("text/event-stream")
+	w.Head("Cache-Control", "no-cache")
+	w.Stream() catch err {
+		herald.Info("no stream: {err}")
+		return
+	}
+	// A client that reconnects says where it was: carry on from the next number.
+	mut n = mint.Atoi(q.Header("Last-Event-ID")) catch _ { 0 }
+	for {
+		n += 1
+		w.WriteString("id: {n}\nevent: tick\ndata: {n}\n\n") catch err {
+			herald.Info("stream ended: {err}")
+			return
+		}
+		tide.Wait(interval()) catch err {
+			herald.Info("stream cancelled: {err}")
+			return
+		}
+		if w.Closed() {
+			herald.Info("client left after {n} events")
+			return
+		}
+	}
+}
+
+fn main() {
+	let r = anvil.NewRouter()
+	r.Get("/", index)
+	r.Get("/events", events)
+	say.Line("server:", r.Serve(":" + quarry.Getenv("PORT")))
+}
