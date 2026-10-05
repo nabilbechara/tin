@@ -2908,7 +2908,10 @@ fn chk_call(e i64, want i64) i64 {
 				return lower_argo_put(e)
 			}
 			if streq(pkg, cstr("argo")) != 0 && streq(m, cstr("Get")) != 0 {
-				return lower_argo_get(e)
+				return lower_argo_get(e, 0)
+			}
+			if streq(pkg, cstr("argo")) != 0 && streq(m, cstr("GetStrict")) != 0 {
+				return lower_argo_get(e, 1)
 			}
 			let s = cast(Sym, pkg_member(pkg, m))
 			if cast(i64, s) != 0 && is_private(m) != 0 {
@@ -3920,7 +3923,11 @@ shared mut argo_dtypes Vec[i64]
 shared mut argo_dfns Vec[i64]
 shared mut argo_ptype i64
 
-fn lower_argo_get(e i64) i64 {
+// lower_argo_get lowers argo.Get and argo.GetStrict (strict != 0). A slice target is filled
+// in place and cut back to its length on a fault. Any other target is validated first (a
+// pass that stores nothing) and filled only when that succeeds, so a fault leaves the
+// target as it was.
+fn lower_argo_get(e i64, strict i64) i64 {
 	let pos = cast(Node, e).pos
 	let args = cast(Call, e).args
 	if args.len != 2 {
@@ -3949,11 +3956,46 @@ fn lower_argo_get(e i64) i64 {
 		return ty_error
 	}
 	let stmts = vec_new[i64]()
-	let p = temp(pos, cast(i64, call_fn(pos, argo_lib(pos, cstr("argo.parser")), args1(s), pt)), pt)
+	mut ctor = cstr("argo.parser")
+	if strict != 0 {
+		ctor = cstr("argo.strictly")
+	}
+	let p = temp(pos, cast(i64, call_fn(pos, argo_lib(pos, ctor), args1(s), pt)), pt)
 	vec_push(stmts, cast(i64, p))
-	vec_push(stmts, expr_stmt(call_fn(pos, cast(Fn, df), args2(sym_ref_node(pos, cast(Sym, p.sym)), v), ty_void)))
-	let fin = call_fn(pos, argo_lib(pos, cstr("argo.finish")), args1(sym_ref_node(pos, cast(Sym, p.sym))), ty_error)
-	replace_node(e, mk_seq(pos, cast(i64, stmts), cast(i64, fin), ty_error))
+	let ps = sym_ref_node(pos, cast(Sym, p.sym))
+	if k == K_SLICE {
+		// A slice only gains elements at its end: decode in place and cut it back on a fault.
+		let n0 = temp(pos, mk_hdr(pos, v, 0), ty_int)
+		vec_push(stmts, cast(i64, n0))
+		vec_push(stmts, expr_stmt(call_fn(pos, cast(Fn, df), args2(ps, v), ty_void)))
+		let r1 = temp(pos, cast(i64, call_fn(pos, argo_lib(pos, cstr("argo.finish")), args1(sym_ref_node(pos, cast(Sym, p.sym))), ty_error)), ty_error)
+		vec_push(stmts, cast(i64, r1))
+		let cut = cast(IfStmt, node_new(ST_IF, pos))
+		cut.cond = mk_bin(pos, cstr("!="), sym_ref_node(pos, cast(Sym, r1.sym)), mk_int(pos, 0, ty_error), ty_bool)
+		cut.then = empty_block(pos)
+		vec_push(cast(Block, cut.then).stmts, expr_stmt(call_fn(pos, argo_lib(pos, cstr("argo.cut")), args2(mk_conv(pos, v, CV_SAME, ty_int), sym_ref_node(pos, cast(Sym, n0.sym))), ty_void)))
+		vec_push(stmts, cast(i64, cut))
+		replace_node(e, mk_seq(pos, cast(i64, stmts), sym_ref_node(pos, cast(Sym, r1.sym)), ty_error))
+		return ty_error
+	}
+	// Pass one only validates: input that fails never touches the target.
+	let vf = argo_vfn(pos, cast(Ty, t))
+	if vf == 0 {
+		return ty_error
+	}
+	vec_push(stmts, expr_stmt(call_fn(pos, cast(Fn, vf), args1(ps), ty_void)))
+	let r = temp(pos, cast(i64, call_fn(pos, argo_lib(pos, cstr("argo.finish")), args1(sym_ref_node(pos, cast(Sym, p.sym))), ty_error)), ty_error)
+	vec_push(stmts, cast(i64, r))
+	// Pass two: the text is valid for this type, so it fills the target.
+	let ifs = cast(IfStmt, node_new(ST_IF, pos))
+	ifs.cond = mk_bin(pos, cstr("=="), sym_ref_node(pos, cast(Sym, r.sym)), mk_int(pos, 0, ty_error), ty_bool)
+	ifs.then = empty_block(pos)
+	let tb = cast(Block, ifs.then).stmts
+	vec_push(tb, expr_stmt(call_fn(pos, argo_lib(pos, cstr("argo.rewind")), args1(sym_ref_node(pos, cast(Sym, p.sym))), ty_void)))
+	vec_push(tb, expr_stmt(call_fn(pos, cast(Fn, df), args2(sym_ref_node(pos, cast(Sym, p.sym)), v), ty_void)))
+	vec_push(tb, assign_stmt(pos, sym_ref_node(pos, cast(Sym, r.sym)), cast(i64, call_fn(pos, argo_lib(pos, cstr("argo.finish")), args1(sym_ref_node(pos, cast(Sym, p.sym))), ty_error))))
+	vec_push(stmts, cast(i64, ifs))
+	replace_node(e, mk_seq(pos, cast(i64, stmts), sym_ref_node(pos, cast(Sym, r.sym)), ty_error))
 	return ty_error
 }
 
@@ -4244,7 +4286,7 @@ fn argo_denum(pos i64, body Vec[i64], p i64, x i64, t Ty) {
 				kk = kk + 1
 			}
 			let sb = cast(Block, empty_block(pos))
-			vec_push(cast(Vec[i64], sb.stmts), expr_stmt(call_fn(pos, argo_lib(pos, cstr("argo.rskip")), args1(sym_ref_node(pos, cast(Sym, p))), ty_void)))
+			vec_push(cast(Vec[i64], sb.stmts), expr_stmt(call_fn(pos, argo_lib(pos, cstr("argo.runknown")), args2(sym_ref_node(pos, cast(Sym, p)), sym_ref_node(pos, cast(Sym, key.sym))), ty_void)))
 			lastf.else_ = cast(i64, sb)
 			vec_push(wb, chain)
 			argo_more(pos, wb, p, '}')
@@ -4390,7 +4432,7 @@ fn argo_dfn(pos i64, t Ty) i64 {
 			last = br
 			fi = fi + 1
 		}
-		let skip = expr_stmt(call_fn(pos, argo_lib(pos, cstr("argo.rskip")), args1(sym_ref_node(pos, p)), ty_void))
+		let skip = expr_stmt(call_fn(pos, argo_lib(pos, cstr("argo.runknown")), args2(sym_ref_node(pos, p), sym_ref_node(pos, cast(Sym, key.sym))), ty_void))
 		if cast(i64, last) != 0 {
 			let sb = cast(Block, empty_block(pos))
 			vec_push(cast(Vec[i64], sb.stmts), skip)
@@ -4436,6 +4478,194 @@ fn argo_dfn(pos i64, t Ty) i64 {
 		}
 		argo_err_return(pos, wb3, cast(i64, p))
 		argo_more(pos, wb3, cast(i64, p), '}')
+	}
+	ck_fn = saved_fn
+	return cast(i64, f)
+}
+
+// ---- argo.Get pass one: a validator generated for each type ----
+// argo$vN(p mut argo.Parser) reads the JSON value at p the way argo$dN does, with the same
+// faults, but stores nothing: Get runs it first, so a fault never leaves the target half
+// filled, and decoding then cannot fail.
+shared mut argo_vtypes Vec[i64]
+shared mut argo_vfns Vec[i64]
+
+// argo_vval validates one value of type t at p (a Sym).
+fn argo_vval(pos i64, body Vec[i64], p i64, t Ty) {
+	let k = kind_of(t)
+	if k == K_STRUCT || k == K_SLICE || k == K_MAP {
+		let vf = argo_vfn(pos, t)
+		if vf != 0 {
+			vec_push(body, expr_stmt(call_fn(pos, cast(Fn, vf), args1(sym_ref_node(pos, cast(Sym, p))), ty_void)))
+		}
+		return
+	}
+	if k == K_OPT {
+		let et = t.elem
+		if is_ref(et) == 0 || kind_of(cast(Ty, et)) == K_FUNC {
+			return
+		}
+		let ifs = cast(IfStmt, node_new(ST_IF, pos))
+		ifs.cond = mk_unot(pos, argo_rd(pos, p, cstr("argo.rnull"), ty_bool))
+		ifs.then = empty_block(pos)
+		argo_vval(pos, cast(Block, ifs.then).stmts, p, cast(Ty, et))
+		vec_push(body, cast(i64, ifs))
+		return
+	}
+	if is_f32(t) != 0 || is_float_t(cast(i64, t)) != 0 {
+		// The grammar and the range, without converting (most numbers cannot overflow).
+		mut width = 300
+		if is_f32(t) != 0 {
+			width = 38
+		}
+		vec_push(body, expr_stmt(call_fn(pos, argo_lib(pos, cstr("argo.vfloat")), args2(sym_ref_node(pos, cast(Sym, p)), mk_int(pos, width, ty_int)), ty_void)))
+		return
+	}
+	let val = argo_value(pos, body, p, t)
+	if val != 0 {
+		vec_push(body, expr_stmt(cast(Node, val)))
+	}
+}
+
+// argo_vbound is argo_bound for a validator: cnt counts the elements read so far.
+fn argo_vbound(pos i64, body Vec[i64], p i64, cnt i64, t Ty) {
+	if t.bound == 0 {
+		return
+	}
+	let ifs = cast(IfStmt, node_new(ST_IF, pos))
+	ifs.cond = mk_bin(pos, cstr(">="), sym_ref_node(pos, cast(Sym, cnt)), mk_int(pos, t.max, ty_int), ty_bool)
+	ifs.then = empty_block(pos)
+	vec_push(cast(Block, ifs.then).stmts, expr_stmt(call_fn(pos, argo_lib(pos, cstr("argo.over")), args2(sym_ref_node(pos, cast(Sym, p)), mk_int(pos, t.max, ty_int)), ty_void)))
+	vec_push(cast(Block, ifs.then).stmts, node_new(ST_RETURN, pos))
+	vec_push(body, cast(i64, ifs))
+	vec_push(body, assign_stmt(pos, sym_ref_node(pos, cast(Sym, cnt)), mk_bin(pos, cstr("+"), sym_ref_node(pos, cast(Sym, cnt)), mk_int(pos, 1, ty_int), ty_int)))
+}
+
+// argo_vfn returns (generating on first use) argo$vN(p mut argo.Parser) for type t, or 0
+// when t cannot be decoded (argo_dfn reports that).
+fn argo_vfn(pos i64, t Ty) i64 {
+	if cast(i64, argo_vtypes) == 0 {
+		argo_vtypes = vec_new[i64]()
+		argo_vfns = vec_new[i64]()
+	}
+	mut i = 0
+	for i < argo_vtypes.len {
+		if cast(Ty, vec_get(argo_vtypes, i)) == t {
+			return vec_get(argo_vfns, i)
+		}
+		i = i + 1
+	}
+	let pt = argo_parser_type(pos)
+	let k = kind_of(t)
+	if pt == 0 || (k == K_MAP && kind_of(cast(Ty, t.key)) != K_STRING) {
+		return 0
+	}
+	lifted_count = lifted_count + 1
+	let f = fn_new(0, cstr("argo"))
+	let nb = buf_new()
+	buf_str(nb, cstr("argo$v"))
+	buf_int(nb, lifted_count)
+	buf_byte(nb, 0)
+	f.qname = nb.data
+	f.name = nb.data
+	f.lifted = 2
+	vec_push(cast(Vec[i64], f.params), cstr("p"))
+	vec_push(cast(Vec[i64], f.ptypes), pt)
+	vec_push(cast(Vec[i64], f.muts), 1)
+	f.type_ = func_of(cast(Vec[i64], f.ptypes), cast(Vec[i64], f.rtypes), 0)
+	f.locals = cast(Vec[Sym], vec_new[i64]())
+	f.body = empty_block(0)
+	vec_push(argo_vtypes, cast(i64, t))
+	vec_push(argo_vfns, cast(i64, f))
+	vec_push(prog_fns, cast(Fn, f))
+	let saved_fn = ck_fn
+	ck_fn = cast(Fn, f)
+	let ps = sym_new(SYM_LOCAL, cstr("p"), 0)
+	ps.type_ = pt
+	ps.slot = 0
+	ps.mut_ = 1
+	f.slots = 1
+	vec_push(cast(Vec[i64], f.locals), cast(i64, ps))
+	let p = cast(i64, ps)
+	let body = cast(Block, f.body).stmts
+	if k == K_STRUCT && t.enum_ != 0 {
+		// An enum's payload shapes are decoded into a scratch value.
+		let df = argo_dfn(pos, t)
+		if df != 0 {
+			let obj = temp(pos, argo_new(pos, body, t), cast(i64, t))
+			vec_push(body, cast(i64, obj))
+			vec_push(body, expr_stmt(call_fn(pos, cast(Fn, df), args2(sym_ref_node(pos, ps), sym_ref_node(pos, cast(Sym, obj.sym))), ty_void)))
+		}
+	} else if k == K_STRUCT {
+		let ifs = cast(IfStmt, node_new(ST_IF, pos))
+		ifs.cond = mk_unot(pos, argo_rd(pos, p, cstr("argo.robj"), ty_bool))
+		ifs.then = empty_block(pos)
+		vec_push(cast(Block, ifs.then).stmts, node_new(ST_RETURN, pos))
+		vec_push(body, cast(i64, ifs))
+		let w = forever(pos)
+		vec_push(body, cast(i64, w))
+		let wb = cast(Block, w.body).stmts
+		let key = temp(pos, argo_rd(pos, p, cstr("argo.rkey"), ty_string), ty_string)
+		vec_push(wb, cast(i64, key))
+		argo_err_return(pos, wb, p)
+		mut chain = 0
+		mut last = cast(IfStmt, 0)
+		mut fi = 0
+		for fi < cast(Vec[i64], t.fields).len {
+			mut fname = vec_get(cast(Vec[i64], vec_get(cast(Vec[i64], t.fields), fi)), 0)
+			let json_name = vec_get(cast(Vec[i64], vec_get(cast(Vec[i64], t.fields), fi)), 5)
+			if json_name != 0 {
+				fname = json_name
+			}
+			let br = cast(IfStmt, node_new(ST_IF, pos))
+			br.cond = rt_call(pos, cstr("rt_str_eq"), args2(sym_ref_node(pos, cast(Sym, key.sym)), lit_string(pos, fname)), ty_bool)
+			br.then = empty_block(pos)
+			argo_vval(pos, cast(Block, br.then).stmts, p, cast(Ty, field_type(t, fi)))
+			if cast(i64, last) != 0 {
+				let eb = cast(Block, empty_block(pos))
+				vec_push(cast(Vec[i64], eb.stmts), cast(i64, br))
+				last.else_ = cast(i64, eb)
+			} else {
+				chain = cast(i64, br)
+			}
+			last = br
+			fi = fi + 1
+		}
+		let skip = expr_stmt(call_fn(pos, argo_lib(pos, cstr("argo.runknown")), args2(sym_ref_node(pos, ps), sym_ref_node(pos, cast(Sym, key.sym))), ty_void))
+		if cast(i64, last) != 0 {
+			let sb = cast(Block, empty_block(pos))
+			vec_push(cast(Vec[i64], sb.stmts), skip)
+			last.else_ = cast(i64, sb)
+			vec_push(wb, chain)
+		} else {
+			vec_push(wb, skip)
+		}
+		argo_more(pos, wb, p, '}')
+	} else if k == K_SLICE || k == K_MAP {
+		let ifs = cast(IfStmt, node_new(ST_IF, pos))
+		mut opener = cstr("argo.rarr")
+		mut close = ']'
+		if k == K_MAP {
+			opener = cstr("argo.robj")
+			close = '}'
+		}
+		ifs.cond = mk_unot(pos, argo_rd(pos, p, opener, ty_bool))
+		ifs.then = empty_block(pos)
+		vec_push(cast(Block, ifs.then).stmts, node_new(ST_RETURN, pos))
+		vec_push(body, cast(i64, ifs))
+		let cnt = declare_local(pos, cstr("$"), ty_int)
+		vec_push(body, let_stmt(pos, cast(Sym, cnt), mk_int(pos, 0, ty_int)))
+		let w = forever(pos)
+		vec_push(body, cast(i64, w))
+		let wb = cast(Block, w.body).stmts
+		argo_vbound(pos, wb, p, cnt, t)
+		if k == K_MAP {
+			vec_push(wb, expr_stmt(cast(Node, argo_rd(pos, p, cstr("argo.rkey"), ty_string))))
+			argo_err_return(pos, wb, p)
+		}
+		argo_vval(pos, wb, p, cast(Ty, t.elem))
+		argo_err_return(pos, wb, p)
+		argo_more(pos, wb, p, close)
 	}
 	ck_fn = saved_fn
 	return cast(i64, f)

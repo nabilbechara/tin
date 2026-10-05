@@ -2,7 +2,8 @@
 // generates a dedicated encoder for v's type (fields in declaration order, no reflection,
 // no allocation). The w* writers below are what those encoders call. argo.Get(s, v) fills
 // v from the JSON text s with a decoder generated the same way; it returns a fault for
-// arrays and objects nested more than 512 deep, as each level takes stack.
+// arrays and objects nested more than 512 deep, as each level takes stack, and leaves v
+// unchanged on any fault. argo.GetStrict(s, v) also rejects unknown and duplicate members.
 package argo
 
 import "say"
@@ -243,14 +244,43 @@ fn wfloat32(b mut []u8, v f32) {
 const maxDepth = 512
 
 type Parser struct {
-	s     str
-	i     i64
-	depth i64 // arrays and objects open at i
-	err   fault
+	s      str
+	i      i64
+	depth  i64 // arrays and objects open at i
+	err    fault
+	strict bool         // GetStrict: unknown and duplicate keys are faults
+	keyAt  i64          // where the member name last read starts
+	scopes []i64        // ids of the objects with members open at i (strict only)
+	nscope i64          // objects opened so far (strict only)
+	seen   ?map[str]bool // "id:name" of every member read (strict only)
 }
 
 fn parser(s str) Parser {
 	return Parser{s: s}
+}
+
+// strictly is parser for GetStrict.
+fn strictly(s str) Parser {
+	return Parser{s: s, strict: true, seen: make(map[str]bool)}
+}
+
+// cut sets the length of the slice with header h back to n (Get decoded elements past it
+// and then failed).
+fn cut(h i64, n i64) {
+	h[0] = n
+}
+
+// rewind starts reading the same text again (the second pass of Get).
+fn rewind(p mut Parser) {
+	p.i = 0
+	p.depth = 0
+	p.err = nil
+	p.keyAt = 0
+	if p.strict {
+		p.scopes = []i64{}
+		p.nscope = 0
+		p.seen = make(map[str]bool)
+	}
 }
 
 fn finish(p mut Parser) ! {
@@ -265,7 +295,9 @@ fn finish(p mut Parser) ! {
 
 fn bad(p mut Parser, what str) {
 	if p.err == nil {
-		if p.i < len(p.s) {
+		if p.i < len(p.s) && p.s[p.i] >= 0x80 && utf8_seq(cast(i64, p.s)+8, p.i, len(p.s)) == 0 {
+			p.err = say.Fault("argo: invalid UTF-8 at offset %d (expected %s)", p.i, what)
+		} else if p.i < len(p.s) {
 			p.err = say.Fault("argo: expected %s at offset %d, found %q", what, p.i, str(p.s[p.i]))
 		} else {
 			p.err = say.Fault("argo: expected %s, found the end of the input", what)
@@ -321,6 +353,10 @@ fn nest(p mut Parser, close u8) bool {
 		return false
 	}
 	p.depth += 1
+	if p.strict && close == '}' {
+		p.nscope += 1
+		p.scopes = append(p.scopes, p.nscope)
+	}
 	return true
 }
 
@@ -336,6 +372,9 @@ fn rmore(p mut Parser, close u8) bool {
 		if c == close {
 			p.i += 1
 			p.depth -= 1
+			if p.strict && close == '}' {
+				p.scopes = p.scopes[:len(p.scopes)-1]
+			}
 			return false
 		}
 	}
@@ -345,6 +384,8 @@ fn rmore(p mut Parser, close u8) bool {
 
 // rkey reads a member name and its ':'.
 fn rkey(p mut Parser) str {
+	ws(mut p)
+	p.keyAt = p.i
 	let k = rstr(mut p)
 	ws(mut p)
 	if p.i >= len(p.s) || p.s[p.i] != ':' {
@@ -352,7 +393,35 @@ fn rkey(p mut Parser) str {
 		return ""
 	}
 	p.i += 1
+	if p.strict && p.err == nil && len(p.scopes) > 0 {
+		let seen = p.seen
+		if seen != nil {
+			let id = say.Fmt("%d:%s", p.scopes[len(p.scopes)-1], k)
+			if seen[id] {
+				fault_at(mut p, p.keyAt, say.Fmt("duplicate key %q", k))
+				return ""
+			}
+			seen[id] = true
+		}
+	}
 	return k
+}
+
+// runknown handles a member the target has no field for: skipped, or a fault when strict.
+fn runknown(p mut Parser, key str) {
+	if p.strict {
+		fault_at(mut p, p.keyAt, say.Fmt("unknown key %q", key))
+		return
+	}
+	rskip(mut p)
+}
+
+// fault_at records a fault with a reason at offset at, and the parser stops.
+fn fault_at(p mut Parser, at i64, what str) {
+	if p.err == nil {
+		p.err = say.Fault("argo: %s at offset %d", what, at)
+	}
+	p.i = len(p.s)
 }
 
 // renum reads an enum variant's name: a bare "Name", or the key of {"Name": ...}; boxed
@@ -436,6 +505,15 @@ fn rstr(p mut Parser) str {
 		if c == '\\' || c < 0x20 {
 			break
 		}
+		if c >= 0x80 {
+			let k = utf8_seq(cast(i64, s)+8, i, len(s))
+			if k == 0 {
+				fault_at(mut p, i, "invalid UTF-8")
+				return ""
+			}
+			i += k
+			continue
+		}
 		i += 1
 	}
 	mut b = make([]u8, 0, i-start+16)
@@ -450,6 +528,16 @@ fn rstr(p mut Parser) str {
 			p.i = i
 			bad(mut p, "an escaped control character")
 			return ""
+		}
+		if c >= 0x80 {
+			let k = utf8_seq(cast(i64, s)+8, i, len(s))
+			if k == 0 {
+				fault_at(mut p, i, "invalid UTF-8")
+				return ""
+			}
+			b = append(b, s[i:i+k]...)
+			i += k
+			continue
 		}
 		if c != '\\' {
 			b = append(b, c)
@@ -475,10 +563,14 @@ fn rstr(p mut Parser) str {
 			b = append(b, e)
 		} else if e == 'u' && i+4 <= len(s) && hex4(s, i) >= 0 {
 			mut r = hex4(s, i)
+			let at = i - 2
 			i += 4
 			if r >= 0xD800 && r < 0xDC00 && i+6 <= len(s) && s[i] == '\\' && s[i+1] == 'u' && hex4(s, i+2) >= 0xDC00 && hex4(s, i+2) < 0xE000 {
 				r = 0x10000 + (r-0xD800)<<10 + (hex4(s, i+2) - 0xDC00)
 				i += 6
+			} else if r >= 0xD800 && r < 0xE000 {
+				fault_at(mut p, at, say.Fmt("unpaired surrogate \\u%04x", r))
+				return ""
 			}
 			b = append(b, str(i32(r))...)
 		} else {
@@ -694,6 +786,30 @@ fn rfloat(p mut Parser) f64 {
 		return 0
 	}
 	return v
+}
+
+// vfloat checks what rfloat checks without converting a plain number: only a long one or
+// one with an exponent can overflow, and those take the full path.
+fn vfloat(p mut Parser, width i64) {
+	let at = rnum(mut p)
+	if p.err != nil || p.i-at <= width && !has_exp(p.s, at, p.i) {
+		return
+	}
+	p.i = at
+	if width == 38 {
+		rfloat32(mut p)
+	} else {
+		rfloat(mut p)
+	}
+}
+
+fn has_exp(s str, from i64, to i64) bool {
+	for i in from..to {
+		if s[i] == 'e' || s[i] == 'E' {
+			return true
+		}
+	}
+	return false
 }
 
 // rfloat32 reads a number that fits in f32.

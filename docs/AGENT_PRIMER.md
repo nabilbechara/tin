@@ -141,8 +141,9 @@ the compiler: write a minimal repro to notes/compiler_bugs_NAME.md and work arou
 - Bounds checks are always on (removed when provably safe: `for x in xs`, `for i in 0..len(xs)`).
   Panics print the message, index and length, and a backtrace.
 - JSON: argo.Put(mut buf, v) encodes any value (encoder generated per type);
-  `argo.Get(text, mut v) catch err { ... }` decodes into a struct, slice or map. Field names are the
-  struct field names, or their `@json("...")`.
+  `argo.Get(text, mut v) catch err { ... }` decodes into a struct, slice or map (a fault leaves v
+  unchanged; invalid UTF-8 and lone surrogates are faults); `argo.GetStrict` also rejects unknown and
+  duplicate members. Field names are the struct field names, or their `@json("...")`.
 
 ## Trusted code (lib/*.tin only)
 Standard-library files may use cast(T, x) between i64 and refs, raw word indexing on an i64 pointer p[i]

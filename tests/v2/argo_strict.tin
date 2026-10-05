@@ -1,0 +1,87 @@
+package main
+
+// argo.Get leaves its target unchanged on a fault (#354); argo.GetStrict also rejects
+// unknown and duplicate keys; invalid UTF-8 and unpaired surrogates are faults.
+
+import "argo"
+import "say"
+
+type Inner struct {
+	n i64
+}
+
+type T struct {
+	n     i64
+	name  str max 4
+	tags  []str
+	items []Inner
+	inner Inner
+	attrs map[str]i64
+}
+
+type Color enum {
+	Red
+	Rgb(r i64, g i64)
+}
+
+type Paint struct {
+	c Color
+}
+
+fn fresh() T {
+	return T{n: 7, name: "keep", tags: []str{"a"}, inner: Inner{n: 1}, attrs: make(map[str]i64)}
+}
+
+fn show(t T) {
+	say.Line(t.n, t.name, t.tags, len(t.items), t.inner.n, len(t.attrs))
+}
+
+fn main() {
+	// Duplicate and unknown keys: the last duplicate wins in Get, a fault in GetStrict.
+	let a = fresh()
+	say.Line(argo.Get(`{"n":1,"n":2,"zzz":3}`, mut a))
+	show(a)
+	let b = fresh()
+	say.Line(argo.GetStrict(`{"n":1,"n":2}`, mut b))
+	say.Line(argo.GetStrict(`{"n":1,"zzz":3}`, mut b))
+	say.Line(argo.GetStrict(`{"inner":{"n":1,"zz":2}}`, mut b))
+	say.Line(argo.GetStrict(`{"inner":{"n":1,"n":2}}`, mut b))
+	say.Line(argo.GetStrict(`{"attrs":{"k":1,"j":2,"k":3}}`, mut b))
+	say.Line(argo.GetStrict(`{"items":[{"n":1},{"n":2,"n":3}]}`, mut b))
+	show(b)
+	// The same key in sibling objects is fine.
+	let xs = []Inner{}
+	say.Line(argo.GetStrict(`[{"n":1},{"n":2}]`, mut xs), len(xs))
+	say.Line(argo.GetStrict(`{"n":5,"name":"ana","tags":["x","y"],"inner":{"n":9},"attrs":{"q":4}}`, mut b))
+	show(b)
+	// A fault leaves the target as it was.
+	let c = fresh()
+	say.Line(argo.Get(`{"n":9,"tags":["x","y"],"inner":{"n":5},"attrs":{"k":1},"name":1}`, mut c))
+	show(c)
+	let ys = []i64{9}
+	say.Line(argo.Get(`[1, 2, 3,]`, mut ys), ys)
+	say.Line(argo.Get(`[1, 2, 3]`, mut ys), ys)
+	let m = map[str]i64{"a": 1}
+	say.Line(argo.Get(`{"b":2,"c":"x"}`, mut m), len(m))
+	say.Line(argo.Get(`{"b":2,"c":3}`, mut m), len(m))
+	// A str max bound holds in both paths.
+	let d = fresh()
+	say.Line(argo.Get(`{"name":"toolong"}`, mut d), d.name)
+	say.Line(argo.GetStrict(`{"name":"toolong"}`, mut d), d.name)
+	say.Line(argo.GetStrict(`{"name":"fine"}`, mut d), d.name)
+	// Enums: variant objects are checked too.
+	let p = Paint{c: Color.Red}
+	say.Line(argo.GetStrict(`{"c":{"Rgb":{"r":1,"g":2,"b":3}}}`, mut p))
+	say.Line(argo.Get(`{"c":{"Rgb":{"r":1,"g":2,"b":3}}}`, mut p))
+	// Invalid UTF-8 and unpaired surrogates.
+	let e = fresh()
+	say.Line(argo.Get(`{"name":"a` + "\xff" + `b"}`, mut e), e.name)
+	say.Line(argo.Get(`{"name":"` + "\xc3" + `"}`, mut e))
+	say.Line(argo.Get(`{"name":"\ud800"}`, mut e))
+	say.Line(argo.Get(`{"name":"\udc00x"}`, mut e))
+	say.Line(argo.Get(`{"name":"\ud800A"}`, mut e))
+	say.Line(argo.Get(`{"name":"😀"}`, mut e), e.name)
+	say.Line(argo.Get(`{"zz":"` + "\xff" + `"}`, mut e))
+	say.Line(argo.Get("\xff", mut e))
+	say.Line(argo.Get(`{"tags":["caf` + "\xc3\xa9" + `"]}`, mut e), e.tags)
+}

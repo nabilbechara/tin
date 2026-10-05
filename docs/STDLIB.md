@@ -59,7 +59,7 @@ Package fault is fault chains and the standard sentinels, like Go's errors packa
 
 ## argo
 
-Package argo writes JSON. argo.Put(b, v) appends v to the []u8 buffer b; the compiler generates a dedicated encoder for v's type (fields in declaration order, no reflection, no allocation). The w* writers below are what those encoders call. argo.Get(s, v) fills v from the JSON text s with a decoder generated the same way; it returns a fault for arrays and objects nested more than 512 deep, as each level takes stack.
+Package argo writes JSON. argo.Put(b, v) appends v to the []u8 buffer b; the compiler generates a dedicated encoder for v's type (fields in declaration order, no reflection, no allocation). The w* writers below are what those encoders call. argo.Get(s, v) fills v from the JSON text s with a decoder generated the same way; it returns a fault for arrays and objects nested more than 512 deep, as each level takes stack, and leaves v unchanged on any fault. argo.GetStrict(s, v) also rejects unknown and duplicate members.
 
 - `Put(b mut []u8, v i64)`: Put appends v as JSON to b. The compiler replaces every call with a typed encoder.
 - `Str(b mut []u8, s str)`: Str appends s as a JSON string.

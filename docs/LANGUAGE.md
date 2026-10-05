@@ -1659,7 +1659,7 @@ fn main() {
 | `reveal(x)` | the plain value of a secret (section 18) |
 | `print(...)`, `println(...)` | same as `say.Text` / `say.Line` |
 
-Compiler-generated package functions: `say.*` (section 16), `argo.Put`, `argo.Get`
+Compiler-generated package functions: `say.*` (section 16), `argo.Put`, `argo.Get`, `argo.GetStrict`
 (section 17). Inside a `select`: `after(d)` and `canceled()`.
 
 ---
@@ -1824,6 +1824,18 @@ fn main() {
   are arrays and objects nested more than 512 deep (each level takes stack, and a request
   handler's stack is 256 KiB). Error messages name the offset: `argo: expected an integer
   in [0, 65535] at offset 8, found "7"`.
+- **A fault leaves the target as it was** (#354). `argo.Get` checks the text against the
+  type first, with a pass that stores nothing, and fills the target only when that passes,
+  so `[1, 2, 3,]` into a slice that held `[9]` fails and leaves `[9]`. A slice is instead
+  filled in place and cut back to its old length on a fault (no second pass). Text that
+  passes cannot fail while filling, except that a bound on a map that already holds
+  entries counts them.
+- `argo.GetStrict(text, mut v)` is `argo.Get` for an API boundary: an **unknown member**
+  and a **duplicate member** (`{"n":1,"n":2}`, a way to smuggle a parameter past a check
+  that reads the first value) are faults naming the key and its offset. `argo.Get` skips
+  unknown members and the last duplicate wins, as in Go. Both reject **invalid UTF-8** in
+  a string and an **unpaired surrogate** escape (`"\ud800"`), naming the offset, where Go
+  silently substitutes U+FFFD. Bounds (`str max 100`) are checked by both.
 - `argo.Str(b, s)` and `argo.Raw(b, json)` write pieces by hand.
 - **Bounded values** (#240): `name str max 100`, `tags []str max 20`,
   `map[str]i64 max 50` bound a length. A bounded value is assignable to its unbounded type
