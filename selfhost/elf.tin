@@ -54,16 +54,16 @@ fn el_shdr_link(p i64, link i64, info i64, align i64, entsize i64) {
 // section names, and the section headers .text, .data, .symtab, .strtab and .shstrtab, so
 // nm, perf and gdb name the functions of a running Linux service (#351). lay is
 // [data_end, names offset, names length, text start, code end, text end, data start].
-fn el_symbols(img i64, own i64, name_off i64, lay i64) {
+fn el_symbols(img i64, own Vec[Fn], name_off Vec[i64], lay Vec[i64]) {
 	let data_end = vec_get(lay, 0)
 	let sym = align_up(data_end, 8)
-	let n = own[VEC_LEN]
+	let n = own.len
 	mut i = 0
 	for i < n {
-		let f = cast(Fn, vec_get(own, i))
+		let f = vec_get(own, i)
 		mut end = vec_get(lay, 4)
 		if i + 1 < n {
-			end = cast(Fn, vec_get(own, i + 1)).addr
+			end = vec_get(own, i + 1).addr
 		}
 		let s = img + sym + 24 * (i + 1)
 		put32(s, vec_get(name_off, i) + 4)
@@ -86,7 +86,7 @@ fn el_symbols(img i64, own i64, name_off i64, lay i64) {
 	buf_byte(names, 0)
 	buf_str(names, cstr(".shstrtab"))
 	buf_byte(names, 0)
-	memcpy(img + shstr, names[VEC_DATA], names[VEC_LEN])
+	memcpy(img + shstr, names.data, names.len)
 	let sh = align_up(shstr + 39, 8)
 	mut p = img + sh + 64
 	el_shdr(p, 1, 1, 6, vec_get(lay, 3), vec_get(lay, 3), vec_get(lay, 5) - vec_get(lay, 3))
@@ -111,14 +111,14 @@ fn el_symbols(img i64, own i64, name_off i64, lay i64) {
 // executable is static, and only the macOS runtime files declare externs (#125).
 fn el_check_static() {
 	mut i = 0
-	for i < prog_fns[VEC_LEN] {
-		let f = cast(Fn, vec_get(prog_fns, i))
+	for i < prog_fns.len {
+		let f = vec_get(prog_fns, i)
 		if f.extern_ != 0 && f.used != 0 {
 			let b = buf_new()
 			buf_str(b, cstr("a Linux executable is static, but the program imports "))
 			buf_str(b, f.name)
 			buf_byte(b, 0)
-			link_fail(b[VEC_DATA])
+			link_fail(b.data)
 		}
 		i = i + 1
 	}
@@ -143,22 +143,22 @@ fn el_start_static(p i64, at i64, main_addr i64) {
 }
 
 fn write_elf(path i64) {
-	let nvars = prog_vars[VEC_LEN]
+	let nvars = prog_vars.len
 	el_check_static()
-	lk_imports = vec_new()
+	lk_imports = cast(Vec[Fn], vec_new[i64]())
 
 	// Function names (tin.<name>) and, after them, one backtrace record per function:
 	// [start, end, name offset] (the runtime's symbol table).
 	let dstr = buf_new()
 	buf_byte(dstr, 0)
-	let name_off = vec_new()
-	let own = vec_new()
+	let name_off = vec_new[i64]()
+	let own = vec_new[Fn]()
 	mut i = 0
-	for i < prog_fns[VEC_LEN] {
-		let f = cast(Fn, vec_get(prog_fns, i))
+	for i < prog_fns.len {
+		let f = vec_get(prog_fns, i)
 		if f.extern_ == 0 && f.reach != 0 {
-			vec_push(own, cast(i64, f))
-			vec_push(name_off, dstr[VEC_LEN])
+			vec_push(own, cast(Fn, f))
+			vec_push(name_off, dstr.len)
 			buf_str(dstr, cstr("tin."))
 			buf_str(dstr, f.qname)
 			buf_byte(dstr, 0)
@@ -170,8 +170,8 @@ fn write_elf(path i64) {
 	let ph_off = 64
 	let phnum = 5
 	let dynstr_off = ph_off + 56 * phnum
-	lk_btrace = align_up(dynstr_off + dstr[VEC_LEN], 8)
-	let ro_end = lk_btrace + 8 + 24 * own[VEC_LEN]
+	lk_btrace = align_up(dynstr_off + dstr.len, 8)
+	let ro_end = lk_btrace + 8 + 24 * cast(Vec[i64], own).len
 
 	// Text segment: _start, code, strings, constants.
 	let text_addr = align_up(ro_end, E_ALIGN)
@@ -179,21 +179,21 @@ fn write_elf(path i64) {
 	mut pc = text_addr + 4 * E_START_WORDS
 	lk_labels = vec_filled(g_labels + 1, 0)
 	i = 0
-	for i < code[VEC_LEN] {
+	for i < code.len {
 		let op = vec_get(code, i)
-		if op == I_LABEL {
-			lk_labels[VEC_DATA][vec_get(code, i + 1)] = pc
-		} else if op == I_FUNC {
-			cast(Fn, vec_get(code, i + 1)).addr = pc
+		if cast(i64, op) == I_LABEL {
+			lk_labels.data[vec_get(code, i + 1)] = pc
+		} else if cast(i64, op) == I_FUNC {
+			vec_get(code, i + 1).addr = pc
 		} else {
 			pc = pc + 4
 		}
 		i = i + 5
 	}
 	lk_stubs = pc // the end of the code: there are no import stubs
-	lk_strs = vec_new()
+	lk_strs = vec_new[i64]()
 	i = 0
-	for i < g_str_ptrs[VEC_LEN] {
+	for i < g_str_ptrs.len {
 		vec_push(lk_strs, pc)
 		pc = pc + vec_get(g_str_lens, i) + 1
 		i = i + 1
@@ -201,9 +201,9 @@ fn write_elf(path i64) {
 	pc = align_up(pc, 8)
 	lk_zero = pc
 	pc = pc + 32
-	lk_tstrs = vec_new()
+	lk_tstrs = vec_new[i64]()
 	i = 0
-	for i < g_tstr_ptrs[VEC_LEN] {
+	for i < g_tstr_ptrs.len {
 		vec_push(lk_tstrs, pc)
 		pc = align_up(pc + 8 + vec_get(g_tstr_lens, i) + 1, 8)
 		i = i + 1
@@ -215,8 +215,8 @@ fn write_elf(path i64) {
 	lk_got = data_addr
 	lk_data = data_addr
 	lk_fndescs = lk_data + 8 * nvars
-	let data_end = lk_fndescs + 16 * prog_fns[VEC_LEN] + 8
-	let extra = el_extra(data_end, own[VEC_LEN])
+	let data_end = lk_fndescs + 16 * prog_fns.len + 8
+	let extra = el_extra(data_end, cast(Vec[i64], own).len)
 	let file_size = data_end + extra
 	let img = calloc(file_size, 1)
 
@@ -246,14 +246,14 @@ fn write_elf(path i64) {
 	p = el_phdr(p, 1, 6, data_addr, data_addr, data_end - data_addr, data_end - data_addr, E_ALIGN)
 	p = el_phdr(p, 0x6474e551, 6, 0, 0, 0, 0, 16)
 
-	memcpy(img + dynstr_off, dstr[VEC_DATA], dstr[VEC_LEN])
-	put64(img + lk_btrace, own[VEC_LEN])
+	memcpy(img + dynstr_off, dstr.data, dstr.len)
+	put64(img + lk_btrace, cast(Vec[i64], own).len)
 	i = 0
-	for i < own[VEC_LEN] {
-		let f = cast(Fn, vec_get(own, i))
+	for i < cast(Vec[i64], own).len {
+		let f = vec_get(own, i)
 		mut end = lk_stubs
-		if i + 1 < own[VEC_LEN] {
-			end = cast(Fn, vec_get(own, i + 1)).addr
+		if i + 1 < cast(Vec[i64], own).len {
+			end = vec_get(own, i + 1).addr
 		}
 		let rec = img + lk_btrace + 8 + 24 * i
 		put64(rec, f.addr)
@@ -262,39 +262,39 @@ fn write_elf(path i64) {
 		i = i + 1
 	}
 
-	el_start_static(img + start_addr, start_addr, cast(Fn, entry_fn()).addr)
+	el_start_static(img + start_addr, start_addr, entry_fn().addr)
 	if extra != 0 {
-		let lay = vec_new()
+		let lay = vec_new[i64]()
 		vec_push(lay, data_end)
 		vec_push(lay, dynstr_off)
-		vec_push(lay, dstr[VEC_LEN])
+		vec_push(lay, dstr.len)
 		vec_push(lay, text_addr)
 		vec_push(lay, lk_stubs)
 		vec_push(lay, text_end)
 		vec_push(lay, data_addr)
-		el_symbols(img, own, name_off, lay)
+		el_symbols(img, cast(Vec[Fn], cast(Vec[i64], own)), cast(Vec[i64], name_off), cast(Vec[i64], lay))
 	}
 
 	// Machine code.
 	mut q = img + start_addr + 4 * E_START_WORDS
 	pc = start_addr + 4 * E_START_WORDS
 	i = 0
-	for i < code[VEC_LEN] {
+	for i < code.len {
 		let op = vec_get(code, i)
-		if op != I_LABEL && op != I_FUNC {
-			put32(q, encode(code[VEC_DATA] + 8 * i, pc))
+		if cast(i64, op) != I_LABEL && cast(i64, op) != I_FUNC {
+			put32(q, encode(code.data + 8 * i, pc))
 			q = q + 4
 			pc = pc + 4
 		}
 		i = i + 5
 	}
 	i = 0
-	for i < g_str_ptrs[VEC_LEN] {
+	for i < g_str_ptrs.len {
 		memcpy(img + vec_get(lk_strs, i), vec_get(g_str_ptrs, i), vec_get(g_str_lens, i))
 		i = i + 1
 	}
 	i = 0
-	for i < g_tstr_ptrs[VEC_LEN] {
+	for i < g_tstr_ptrs.len {
 		let at = img + vec_get(lk_tstrs, i)
 		put64(at, vec_get(g_tstr_lens, i))
 		memcpy(at + 8, vec_get(g_tstr_ptrs, i), vec_get(g_tstr_lens, i))
@@ -302,22 +302,22 @@ fn write_elf(path i64) {
 	}
 	i = 0
 	for i < nvars {
-		put64(img + lk_data + 8 * i, cast(Decl, vec_get(prog_vars, i)).val)
+		put64(img + lk_data + 8 * i, vec_get(prog_vars, i).val)
 		i = i + 1
 	}
 
 	rt_sys_unlink(path)
 	let fd = rt_sys_creat(path, 493)
 	if (fd & 0x80000000) != 0 {
-		let e = err_code(NO_POS, cstr("E904 CANNOT_CREATE"))
-		buf_str(e, cstr("cannot create "))
-		buf_str(e, path)
-		fatal(e)
+		let e = cast(Vec[i64], err_code(NO_POS, cstr("E904 CANNOT_CREATE")))
+		buf_str(cast(Buf, e), cstr("cannot create "))
+		buf_str(cast(Buf, e), path)
+		fatal(cast(Vec[i64], e))
 	}
-	let out = malloc(24)
-	out[VEC_LEN] = file_size
-	out[VEC_CAP] = file_size
-	out[VEC_DATA] = img
+	let out = cast(Vec[i64], malloc(24))
+	out.len = file_size
+	out.cap = file_size
+	out.data = img
 	write_all(fd, out)
 	rt_sys_close(fd)
 }

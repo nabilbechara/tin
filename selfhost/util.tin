@@ -21,29 +21,31 @@ const VEC_LEN = 0
 const VEC_CAP = 1
 const VEC_DATA = 2
 
-fn vec_new() i64 {
-	let v = malloc(24)
-	v[VEC_LEN] = 0
-	v[VEC_CAP] = 8
-	v[VEC_DATA] = malloc(64)
+fn vec_new[T Any]() Vec[T] {
+	let v = cast(Vec[T], malloc(24))
+	v.len = 0
+	v.cap = 8
+	v.data = malloc(64)
 	return v
 }
 
-fn vec_push(v i64, x i64) {
-	if v[VEC_LEN] == v[VEC_CAP] {
-		v[VEC_CAP] = v[VEC_CAP] * 2
-		v[VEC_DATA] = realloc(v[VEC_DATA], v[VEC_CAP] * 8)
+fn vec_push[T Any](v Vec[T], x T) {
+	if v.len == v.cap {
+		v.cap = v.cap * 2
+		v.data = realloc(v.data, v.cap * 8)
 	}
-	v[VEC_DATA][v[VEC_LEN]] = x
-	v[VEC_LEN] = v[VEC_LEN] + 1
+	let d = v.data
+	d[v.len] = cast(i64, x)
+	v.len = v.len + 1
 }
 
-fn vec_get(v i64, i i64) i64 {
-	return v[VEC_DATA][i]
+fn vec_get[T Any](v Vec[T], i i64) T {
+	let d = v.data
+	return cast(T, d[i])
 }
 
-fn vec_filled(n i64, x i64) i64 {
-	let v = vec_new()
+fn vec_filled[T Any](n i64, x T) Vec[T] {
+	let v = vec_new[T]()
 	mut i = 0
 	for i < n {
 		vec_push(v, x)
@@ -52,51 +54,51 @@ fn vec_filled(n i64, x i64) i64 {
 	return v
 }
 
-fn vec_clone(v i64) i64 {
-	let out = vec_new()
-	if v == 0 {
+fn vec_clone[T Any](v Vec[T]) Vec[T] {
+	let out = vec_new[T]()
+	if cast(i64, v) == 0 {
 		return out
 	}
 	mut i = 0
-	for i < v[VEC_LEN] {
+	for i < v.len {
 		vec_push(out, vec_get(v, i))
 		i = i + 1
 	}
 	return out
 }
 
-fn buf_new() i64 {
-	let b = malloc(24)
-	b[VEC_LEN] = 0
-	b[VEC_CAP] = 256
-	b[VEC_DATA] = malloc(256)
-	return b
+fn buf_new() Buf {
+	let b = cast(Vec[i64], malloc(24))
+	b.len = 0
+	b.cap = 256
+	b.data = malloc(256)
+	return cast(Buf, b)
 }
 
-fn buf_reserve(b i64, n i64) {
-	for b[VEC_LEN] + n > b[VEC_CAP] {
-		b[VEC_CAP] = b[VEC_CAP] * 2
-		b[VEC_DATA] = realloc(b[VEC_DATA], b[VEC_CAP])
+fn buf_reserve(b Buf, n i64) {
+	for b.len + n > b.cap {
+		b.cap = b.cap * 2
+		b.data = realloc(b.data, b.cap)
 	}
 }
 
-fn buf_byte(b i64, c i64) {
+fn buf_byte(b Buf, c i64) {
 	buf_reserve(b, 1)
-	store8(b[VEC_DATA] + b[VEC_LEN], c)
-	b[VEC_LEN] = b[VEC_LEN] + 1
+	store8(b.data + b.len, c)
+	b.len = b.len + 1
 }
 
-fn buf_bytes(b i64, s i64, n i64) {
+fn buf_bytes(b Buf, s i64, n i64) {
 	buf_reserve(b, n)
-	memcpy(b[VEC_DATA] + b[VEC_LEN], s, n)
-	b[VEC_LEN] = b[VEC_LEN] + n
+	memcpy(b.data + b.len, s, n)
+	b.len = b.len + n
 }
 
-fn buf_str(b i64, s i64) {
+fn buf_str(b Buf, s i64) {
 	buf_bytes(b, s, strlen(s))
 }
 
-fn buf_int(b i64, n i64) {
+fn buf_int(b Buf, n i64) {
 	if n < 0 {
 		buf_byte(b, '-')
 		if n / 10 != 0 {
@@ -134,10 +136,10 @@ fn mem_eq(a i64, b i64, n i64) i64 {
 	return 1
 }
 
-fn write_all(fd i64, b i64) {
+fn write_all(fd i64, b Vec[i64]) {
 	mut done = 0
-	for done < b[VEC_LEN] {
-		let n = rt_sys_write(fd, b[VEC_DATA] + done, b[VEC_LEN] - done)
+	for done < b.len {
+		let n = rt_sys_write(fd, b.data + done, b.len - done)
 		if n <= 0 {
 			rt_sys_exit(1)
 		}
@@ -148,7 +150,7 @@ fn write_all(fd i64, b i64) {
 // A position packs file index, line and column into one word.
 const NO_POS = -1
 
-shared mut files i64
+shared mut files Vec[i64]
 shared mut tgt_linux i64 // the target OS is Linux (else macOS)
 shared mut tgt_x64 i64 // the target CPU is x86-64 (else arm64)
 shared mut error_count i64
@@ -157,7 +159,7 @@ fn pos_make(file i64, line i64, col i64) i64 {
 	return (file << 48) | (line << 16) | col
 }
 
-fn buf_pos(b i64, pos i64) {
+fn buf_pos(b Buf, pos i64) {
 	buf_str(b, vec_get(files, pos >> 48))
 	buf_byte(b, ':')
 	buf_int(b, (pos >> 16) & 0xffffffff)
@@ -165,20 +167,20 @@ fn buf_pos(b i64, pos i64) {
 	buf_int(b, pos & 0xffff)
 }
 
-fn err_end(b i64) {
+fn err_end(b Buf) {
 	buf_byte(b, '\n')
-	write_all(2, b)
+	write_all(2, cast(Vec[i64], b))
 	error_count = error_count + 1
 }
 
-fn fatal(b i64) {
-	err_end(b)
+fn fatal(b Vec[i64]) {
+	err_end(cast(Buf, b))
 	rt_sys_exit(1)
 }
 
 // err_code starts an error with its code and name from docs/ERRORS.md, such as
 // "E502 TYPE_ARG_COUNT"; finish it with err_end (keep going) or fatal (stop).
-fn err_code(pos i64, code i64) i64 {
+fn err_code(pos i64, code i64) Buf {
 	let b = buf_new()
 	if pos != NO_POS {
 		buf_pos(b, pos)
@@ -187,14 +189,14 @@ fn err_code(pos i64, code i64) i64 {
 	buf_str(b, cstr("error "))
 	buf_str(b, code)
 	buf_str(b, cstr(": "))
-	return b
+	return cast(Buf, b)
 }
 
 // err_code_at reports a coded error whose whole message is MSG.
 fn err_code_at(pos i64, code i64, msg i64) {
 	let e = err_code(pos, code)
 	buf_str(e, msg)
-	err_end(e)
+	err_end(cast(Buf, e))
 }
 
 // err_code_quoted reports a coded PREFIX 'NAME' SUFFIX.
@@ -205,7 +207,7 @@ fn err_code_quoted(pos i64, code i64, prefix i64, name i64, suffix i64) {
 	buf_str(e, name)
 	buf_byte(e, '\'')
 	buf_str(e, suffix)
-	err_end(e)
+	err_end(cast(Buf, e))
 }
 
 // Little- and big-endian stores into a byte array.

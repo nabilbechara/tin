@@ -3,7 +3,7 @@
 //        tinc -S FILE.tin...         print assembly instead
 shared mut lib_root i64
 shared mut project_root i64
-shared mut project_lock i64
+shared mut project_lock Vec[i64]
 shared mut compiler_edition i64
 shared mut load_unsafe i64 // the file being loaded is a vendored package granted unsafe: trusted, same edition
 shared mut compiler_fix i64
@@ -19,25 +19,25 @@ fn try_read_file(path i64) i64 {
 	let b = buf_new()
 	for {
 		buf_reserve(b, 65536)
-		let n = rt_sys_read(fd, b[VEC_DATA] + b[VEC_LEN], 65536)
+		let n = rt_sys_read(fd, b.data + b.len, 65536)
 		if n <= 0 {
 			break
 		}
-		b[VEC_LEN] = b[VEC_LEN] + n
+		b.len = b.len + n
 	}
 	rt_sys_close(fd)
-	return b
+	return cast(i64, b)
 }
 
-fn read_file(path i64) i64 {
+fn read_file(path i64) Vec[i64] {
 	let b = try_read_file(path)
 	if b == 0 {
-		let e = err_code(NO_POS, cstr("E003 CANNOT_OPEN"))
-		buf_str(e, cstr("cannot open "))
-		buf_str(e, path)
-		fatal(e)
+		let e = cast(Vec[i64], err_code(NO_POS, cstr("E003 CANNOT_OPEN")))
+		buf_str(cast(Buf, e), cstr("cannot open "))
+		buf_str(cast(Buf, e), path)
+		fatal(cast(Vec[i64], e))
 	}
-	return b
+	return cast(Vec[i64], b)
 }
 
 // os_suffix is the file-name suffix of the target's OS-specific library files.
@@ -82,18 +82,18 @@ fn set_target(t i64) {
 		tgt_linux = 1
 		tgt_x64 = 1
 	} else {
-		let e = err_code(NO_POS, cstr("E901 UNKNOWN_TARGET"))
-		buf_str(e, cstr("unknown target "))
-		buf_str(e, t)
-		buf_str(e, cstr(" (darwin-arm64, linux-arm64, linux-amd64)"))
-		fatal(e)
+		let e = cast(Vec[i64], err_code(NO_POS, cstr("E901 UNKNOWN_TARGET")))
+		buf_str(cast(Buf, e), cstr("unknown target "))
+		buf_str(cast(Buf, e), t)
+		buf_str(cast(Buf, e), cstr(" (darwin-arm64, linux-arm64, linux-amd64)"))
+		fatal(cast(Vec[i64], e))
 	}
 }
 
 fn usage() i64 {
 	let u = buf_new()
 	buf_str(u, cstr("usage: tinc [-fix] [-polls] [-edition 0|1] [-parse-only] [-audit-secrets] [-caps] [-hash FILE...] [-S] [-o OUT] [-target darwin-arm64|linux-arm64|linux-amd64] FILE.tin...\n"))
-	write_all(2, u)
+	write_all(2, cast(Vec[i64], u))
 	return 2
 }
 
@@ -154,41 +154,41 @@ fn load_file_trusted(path i64, trusted_in i64) {
 	let src = read_file(path)
 	vec_push(files, path)
 	vec_push(file_trusted, trusted)
-	vec_push(file_cap_pkg, 0)
-	cur_file = files[VEC_LEN] - 1
+	vec_push(file_cap_pkg, cast(CapsRec, 0))
+	cur_file = files.len - 1
 	mut edition = compiler_edition
 	if edition < 0 {
 		// no -edition flag: the file says which edition it is written in
-		edition = source_edition(src[VEC_DATA], src[VEC_LEN])
+		edition = source_edition(src.data, src.len)
 	}
 	if compiler_fix != 0 {
 		edition = 0
-		if fix_source_is_edition1(src[VEC_DATA], src[VEC_LEN]) != 0 || source_edition(src[VEC_DATA], src[VEC_LEN]) != 0 {
+		if fix_source_is_edition1(src.data, src.len) != 0 || source_edition(src.data, src.len) != 0 {
 			edition = 1
 		}
 	}
 	if (compiler_fix != 0 || compiler_parse_only != 0) && trusted == 0 && fix_in_lib(path) != 0 {
 		trusted = 1
-		file_trusted[VEC_DATA][cur_file] = 1
+		file_trusted.data[cur_file] = 1
 	}
 	if trusted != 0 && load_unsafe == 0 {
 		// a standard library file is read in the edition it is written in (#226)
-		edition = source_edition(src[VEC_DATA], src[VEC_LEN])
+		edition = source_edition(src.data, src.len)
 	}
 	if edition == 0 && compiler_fix == 0 {
 		// edition 0 is retired (#226): only tin fix reads it
-		let e = err_code(NO_POS, cstr("E090 OLD_SYNTAX"))
-		buf_str(e, path)
-		buf_str(e, cstr(" is edition 0, which is retired: translate it with tin fix -edition 1"))
-		fatal(e)
+		let e = cast(Vec[i64], err_code(NO_POS, cstr("E090 OLD_SYNTAX")))
+		buf_str(cast(Buf, e), path)
+		buf_str(cast(Buf, e), cstr(" is edition 0, which is retired: translate it with tin fix -edition 1"))
+		fatal(cast(Vec[i64], e))
 	}
-	let toks = lex(cur_file, src[VEC_DATA], src[VEC_LEN], edition)
-	vec_push(file_sources, src)
+	let toks = lex(cur_file, src.data, src.len, edition)
+	vec_push(file_sources, cast(i64, src))
 	vec_push(file_tokens, toks)
 	if edition == 1 {
-		parse_edition1(toks)
+		parse_edition1(cast(Vec[i64], toks))
 	} else {
-		parse(toks)
+		parse(cast(Vec[i64], toks))
 	}
 }
 
@@ -207,7 +207,7 @@ fn fix_in_lib(path i64) i64 {
 
 fn is_loaded(path i64) i64 {
 	mut i = 0
-	for i < files[VEC_LEN] {
+	for i < files.len {
 		if streq(vec_get(files, i), path) != 0 {
 			return 1
 		}
@@ -221,7 +221,7 @@ fn cat_path(a i64, b i64) i64 {
 	buf_str(p, a)
 	buf_str(p, b)
 	buf_byte(p, 0)
-	return p[VEC_DATA]
+	return p.data
 }
 
 // dir_of is the directory part of a file path ("." when there is none).
@@ -241,7 +241,7 @@ fn dir_of(path i64) i64 {
 		j = j + 1
 	}
 	buf_byte(b, 0)
-	return b[VEC_DATA]
+	return b.data
 }
 
 fn ends_with(s i64, suffix i64) i64 {
@@ -256,7 +256,7 @@ fn package_files(base i64) i64 {
 	let single = cat_path(base, cstr(".tin"))
 	let probe = try_read_file(single)
 	if probe != 0 {
-		let one = vec_new()
+		let one = vec_new[i64]()
 		vec_push(one, single)
 		// name_linux.tin / name_darwin.tin: the target OS's part of the package.
 		let osf = cat_path(cat_path(base, os_suffix()), cstr(".tin"))
@@ -268,13 +268,13 @@ fn package_files(base i64) i64 {
 		if try_read_file(archf) != 0 {
 			vec_push(one, archf)
 		}
-		return one
+		return cast(i64, one)
 	}
 	let d = rt_sys_opendir(base)
 	if d == 0 {
 		return 0
 	}
-	let out = vec_new()
+	let out = vec_new[i64]()
 	for {
 		let ent = rt_sys_readdir(d)
 		if ent == 0 {
@@ -288,20 +288,20 @@ fn package_files(base i64) i64 {
 	rt_sys_closedir(d)
 	// Sorted, so builds do not depend on directory order.
 	mut i = 1
-	for i < out[VEC_LEN] {
+	for i < out.len {
 		mut j = i
 		for j > 0 && c_positive(strcmp(vec_get(out, j - 1), vec_get(out, j))) != 0 {
 			let t = vec_get(out, j)
-			out[VEC_DATA][j] = vec_get(out, j - 1)
-			out[VEC_DATA][j - 1] = t
+			out.data[j] = vec_get(out, j - 1)
+			out.data[j - 1] = t
 			j = j - 1
 		}
 		i = i + 1
 	}
-	if out[VEC_LEN] == 0 {
+	if out.len == 0 {
 		return 0
 	}
-	return out
+	return cast(i64, out)
 }
 
 // resolve_import finds an import's files: ./x and ../x next to the importing file,
@@ -347,76 +347,76 @@ fn remote_path(ipath i64) i64 {
 	return 0
 }
 
-shared mut pkg_homes i64 // [package name, real path of its first file, import path] per resolved import
+shared mut pkg_homes Vec[i64] // [package name, real path of its first file, import path] per resolved import
 
 // check_pkg_home rejects two import paths that load different packages under one name: they
 // would merge into one package.
-fn check_pkg_home(ipath i64, found i64) {
+fn check_pkg_home(ipath i64, found Vec[i64]) {
 	let name = path_pkg(ipath)
 	let real = calloc(4096, 1)
 	if host_realpath(vec_get(found, 0), real) == 0 {
 		return
 	}
 	mut i = 0
-	for i < pkg_homes[VEC_LEN] {
-		let h = vec_get(pkg_homes, i)
+	for i < pkg_homes.len {
+		let h = cast(Vec[i64], vec_get(pkg_homes, i))
 		if streq(vec_get(h, 0), name) != 0 {
 			if streq(vec_get(h, 1), real) == 0 {
-				let e = err_code(NO_POS, cstr("E113 PACKAGE_CONFLICT"))
-				buf_str(e, cstr("import paths \""))
-				buf_str(e, vec_get(h, 2))
-				buf_str(e, cstr("\" and \""))
-				buf_str(e, ipath)
-				buf_str(e, cstr("\" are different packages with the same name "))
-				buf_str(e, name)
-				fatal(e)
+				let e = cast(Vec[i64], err_code(NO_POS, cstr("E113 PACKAGE_CONFLICT")))
+				buf_str(cast(Buf, e), cstr("import paths \""))
+				buf_str(cast(Buf, e), vec_get(h, 2))
+				buf_str(cast(Buf, e), cstr("\" and \""))
+				buf_str(cast(Buf, e), ipath)
+				buf_str(cast(Buf, e), cstr("\" are different packages with the same name "))
+				buf_str(cast(Buf, e), name)
+				fatal(cast(Vec[i64], e))
 			}
 			return
 		}
 		i = i + 1
 	}
-	let rec = vec_new()
+	let rec = vec_new[i64]()
 	vec_push(rec, name)
 	vec_push(rec, real)
 	vec_push(rec, ipath)
-	vec_push(pkg_homes, rec)
+	vec_push(pkg_homes, cast(i64, rec))
 }
 
 // load_imports parses every package any loaded file imports, transitively.
 fn load_imports() {
-	pkg_homes = vec_new()
+	pkg_homes = vec_new[i64]()
 	mut f = 0
-	for f < files[VEC_LEN] {
-		let imps = vec_get(file_imports, f)
+	for f < files.len {
+		let imps = cast(Vec[i64], vec_get(file_imports, f))
 		mut i = 0
-		for i < imps[VEC_LEN] {
-			let ipath = vec_get(vec_get(imps, i), 1)
-			let found = resolve_import(ipath, vec_get(files, f))
-			if found == 0 && remote_path(ipath) != 0 {
-				let e = err_code(NO_POS, cstr("E112 NOT_VENDORED"))
-				buf_str(e, cstr("package \""))
-				buf_str(e, ipath)
-				buf_str(e, cstr("\" is not vendored: there is no vendor/"))
-				buf_str(e, ipath)
-				buf_str(e, cstr(" in the program's directory (tin vendor copies it there; the build never fetches)"))
-				fatal(e)
+		for i < imps.len {
+			let ipath = vec_get(cast(Vec[i64], vec_get(imps, i)), 1)
+			let found = cast(Vec[i64], resolve_import(ipath, vec_get(files, f)))
+			if cast(i64, found) == 0 && remote_path(ipath) != 0 {
+				let e = cast(Vec[i64], err_code(NO_POS, cstr("E112 NOT_VENDORED")))
+				buf_str(cast(Buf, e), cstr("package \""))
+				buf_str(cast(Buf, e), ipath)
+				buf_str(cast(Buf, e), cstr("\" is not vendored: there is no vendor/"))
+				buf_str(cast(Buf, e), ipath)
+				buf_str(cast(Buf, e), cstr(" in the program's directory (tin vendor copies it there; the build never fetches)"))
+				fatal(cast(Vec[i64], e))
 			}
-			if found == 0 {
-				let e = err_code(NO_POS, cstr("E110 UNKNOWN_PACKAGE"))
-				buf_str(e, cstr("unknown package \""))
-				buf_str(e, ipath)
-				buf_str(e, cstr("\" (looked in the standard library, next to the importing file and in the program's directory)"))
-				fatal(e)
+			if cast(i64, found) == 0 {
+				let e = cast(Vec[i64], err_code(NO_POS, cstr("E110 UNKNOWN_PACKAGE")))
+				buf_str(cast(Buf, e), cstr("unknown package \""))
+				buf_str(cast(Buf, e), ipath)
+				buf_str(cast(Buf, e), cstr("\" (looked in the standard library, next to the importing file and in the program's directory)"))
+				fatal(cast(Vec[i64], e))
 			}
 			check_pkg_home(ipath, found)
 			// A vendored package is restricted to its manifest's capabilities; a package a
 			// vendored file imports relatively is part of the same package.
 			mut cpkg = cast(CapsRec, vendored_package(ipath, found))
 			if cast(i64, cpkg) == 0 && i64(load8(ipath)) == '.' {
-				cpkg = cast(CapsRec, vec_get(file_cap_pkg, f))
+				cpkg = vec_get(file_cap_pkg, f)
 			}
 			mut k = 0
-			for k < found[VEC_LEN] {
+			for k < found.len {
 				let path = vec_get(found, k)
 				if is_loaded(path) == 0 {
 					let std = starts_with(path, cat_path(lib_root, cstr("/lib/")))
@@ -428,7 +428,7 @@ fn load_imports() {
 					load_unsafe = i64(std == 0 && cast(i64, cpkg) != 0 && (cpkg.caps & CAP_UNSAFE) != 0)
 					load_file_trusted(path, i64(std != 0 || load_unsafe != 0))
 					load_unsafe = 0
-					file_cap_pkg[VEC_DATA][files[VEC_LEN] - 1] = cast(i64, cpkg)
+					file_cap_pkg.data[files.len - 1] = cast(i64, cpkg)
 				}
 				k = k + 1
 			}
@@ -498,14 +498,14 @@ fn digest_hex(d i64) i64 {
 		i = i + 1
 	}
 	buf_byte(out, 0)
-	return out[VEC_DATA]
+	return out.data
 }
 
 // lock_entry returns the hash tin.lock records for a project-relative path (a C string of
 // 64 hex digits), or 0 when the lock has no line for it.
 fn lock_entry(rel i64) i64 {
-	let data = project_lock[VEC_DATA]
-	let n = project_lock[VEC_LEN]
+	let data = project_lock.data
+	let n = project_lock.len
 	let m = strlen(rel)
 	mut i = 0
 	for i < n {
@@ -522,7 +522,7 @@ fn lock_entry(rel i64) i64 {
 				j = j + 1
 			}
 			buf_byte(h, 0)
-			return h[VEC_DATA]
+			return h.data
 		}
 		i = end + 1
 	}
@@ -532,7 +532,7 @@ fn lock_entry(rel i64) i64 {
 // lock_has checks a loaded file against tin.lock: a vendored file must be listed with its
 // hash, and any other file the lock lists must still have the recorded hash.
 fn lock_has(path i64) i64 {
-	if project_lock == 0 {
+	if cast(i64, project_lock) == 0 {
 		return 1
 	}
 	mut rel = path
@@ -545,7 +545,7 @@ fn lock_has(path i64) i64 {
 	}
 	let src = read_file(path)
 	let digest = calloc(32, 1)
-	sha256(src[VEC_DATA], src[VEC_LEN], digest)
+	sha256(src.data, src.len, digest)
 	let hex = digest_hex(digest)
 	let want = lock_entry(rel)
 	if want != 0 && streq(want, hex) != 0 {
@@ -554,31 +554,31 @@ fn lock_has(path i64) i64 {
 	if want == 0 && starts_with(rel, cstr("vendor/")) == 0 {
 		return 1
 	}
-	let e = err_code(NO_POS, cstr("E111 LOCK_MISMATCH"))
+	let e = cast(Vec[i64], err_code(NO_POS, cstr("E111 LOCK_MISMATCH")))
 	if want != 0 {
-		buf_str(e, cstr("tin.lock hash mismatch for "))
-		buf_str(e, rel)
-		buf_str(e, cstr(": the lock records sha256 "))
-		buf_str(e, want)
-		buf_str(e, cstr(", the file has "))
-		buf_str(e, hex)
+		buf_str(cast(Buf, e), cstr("tin.lock hash mismatch for "))
+		buf_str(cast(Buf, e), rel)
+		buf_str(cast(Buf, e), cstr(": the lock records sha256 "))
+		buf_str(cast(Buf, e), want)
+		buf_str(cast(Buf, e), cstr(", the file has "))
+		buf_str(cast(Buf, e), hex)
 	} else {
-		buf_str(e, cstr("tin.lock has no entry for "))
-		buf_str(e, rel)
-		buf_str(e, cstr(" (sha256 "))
-		buf_str(e, hex)
-		buf_str(e, cstr("); every vendored file must be locked"))
+		buf_str(cast(Buf, e), cstr("tin.lock has no entry for "))
+		buf_str(cast(Buf, e), rel)
+		buf_str(cast(Buf, e), cstr(" (sha256 "))
+		buf_str(cast(Buf, e), hex)
+		buf_str(cast(Buf, e), cstr("); every vendored file must be locked"))
 	}
-	fatal(e)
+	fatal(cast(Vec[i64], e))
 	return 0
 }
 
 fn verify_lock() {
-	if project_lock == 0 {
+	if cast(i64, project_lock) == 0 {
 		return
 	}
 	mut i = 0
-	for i < files[VEC_LEN] {
+	for i < files.len {
 		let path = vec_get(files, i)
 		if starts_with(path, cat_path(lib_root, cstr("/lib/"))) == 0 {
 			lock_has(path)
@@ -594,14 +594,14 @@ fn print_hashes(argc i64, argv i64) i64 {
 	for i < argc {
 		let src = read_file(argv[i])
 		let digest = calloc(32, 1)
-		sha256(src[VEC_DATA], src[VEC_LEN], digest)
+		sha256(src.data, src.len, digest)
 		buf_str(out, digest_hex(digest))
 		buf_byte(out, ' ')
 		buf_str(out, argv[i])
 		buf_byte(out, '\n')
 		i = i + 1
 	}
-	write_all(1, out)
+	write_all(1, cast(Vec[i64], out))
 	return 0
 }
 
@@ -610,10 +610,10 @@ fn compiler_main(argc i64, argv i64) i64 {
 	if argc > 1 && streq(argv[1], cstr("-hash")) != 0 {
 		return print_hashes(argc, argv)
 	}
-	files = vec_new()
-	file_trusted = vec_new()
-	file_cap_pkg = vec_new()
-	cap_pkgs = vec_new()
+	files = vec_new[i64]()
+	file_trusted = vec_new[i64]()
+	file_cap_pkg = cast(Vec[CapsRec], vec_new[i64]())
+	cap_pkgs = cast(Vec[CapsRec], vec_new[i64]())
 	parse_setup()
 	types_init()
 	mut asm_only = 0
@@ -642,11 +642,11 @@ fn compiler_main(argc i64, argv i64) i64 {
 			} else if streq(argv[i], cstr("1")) != 0 {
 				compiler_edition = 1
 			} else {
-				let e = err_code(NO_POS, cstr("E902 UNKNOWN_EDITION"))
-				buf_str(e, cstr("unknown edition "))
-				buf_str(e, argv[i])
-				buf_str(e, cstr(" (expected 0 or 1)"))
-				fatal(e)
+				let e = cast(Vec[i64], err_code(NO_POS, cstr("E902 UNKNOWN_EDITION")))
+				buf_str(cast(Buf, e), cstr("unknown edition "))
+				buf_str(cast(Buf, e), argv[i])
+				buf_str(cast(Buf, e), cstr(" (expected 0 or 1)"))
+				fatal(cast(Vec[i64], e))
 			}
 		} else if streq(a, cstr("-polls")) != 0 {
 			compiler_polls = 1
@@ -679,20 +679,20 @@ fn compiler_main(argc i64, argv i64) i64 {
 		}
 		i = i + 1
 	}
-	if files[VEC_LEN] == 0 {
+	if files.len == 0 {
 		return usage()
 	}
 	if fix_edition1 != 0 {
-		if compiler_edition != 1 || files[VEC_LEN] != 1 {
-			let e = err_code(NO_POS, cstr("E906 FIX_USAGE"))
-			buf_str(e, cstr("-fix translates one file to edition 1: pass -edition 1 and exactly one file"))
-			fatal(e)
+		if compiler_edition != 1 || files.len != 1 {
+			let e = cast(Vec[i64], err_code(NO_POS, cstr("E906 FIX_USAGE")))
+			buf_str(cast(Buf, e), cstr("-fix translates one file to edition 1: pass -edition 1 and exactly one file"))
+			fatal(cast(Vec[i64], e))
 		}
-		let source = vec_get(file_sources, 0)
-		let toks = vec_get(file_tokens, 0)
+		let source = cast(Vec[i64], vec_get(file_sources, 0))
+		let toks = cast(Vec[i64], vec_get(file_tokens, 0))
 		fx_trusted = vec_get(file_trusted, 0)
 		fx_path = vec_get(files, 0)
-		let rewritten = print_edition1(0, source[VEC_DATA], toks)
+		let rewritten = cast(Vec[i64], print_edition1(0, source.data, cast(Vec[Token], toks)))
 		write_all(1, rewritten)
 		return 0
 	}
@@ -701,17 +701,17 @@ fn compiler_main(argc i64, argv i64) i64 {
 	}
 	lib_root = find_root()
 	project_root = dir_of(vec_get(files, 0))
-	project_lock = try_read_file(cat_path(project_root, cstr("/tin.lock")))
+	project_lock = cast(Vec[i64], try_read_file(cat_path(project_root, cstr("/tin.lock"))))
 	// The runtime is the package lib/runtime: every file of it for this OS and CPU.
-	let rtfiles = package_files(cat_path(lib_root, cstr("/lib/runtime")))
-	if rtfiles == 0 {
-		let e = err_code(NO_POS, cstr("E903 NO_RUNTIME"))
-		buf_str(e, cstr("the runtime package is missing: no lib/runtime in "))
-		buf_str(e, lib_root)
-		fatal(e)
+	let rtfiles = cast(Vec[i64], package_files(cat_path(lib_root, cstr("/lib/runtime"))))
+	if cast(i64, rtfiles) == 0 {
+		let e = cast(Vec[i64], err_code(NO_POS, cstr("E903 NO_RUNTIME")))
+		buf_str(cast(Buf, e), cstr("the runtime package is missing: no lib/runtime in "))
+		buf_str(cast(Buf, e), lib_root)
+		fatal(cast(Vec[i64], e))
 	}
 	mut rk = 0
-	for rk < rtfiles[VEC_LEN] {
+	for rk < rtfiles.len {
 		let rpath = vec_get(rtfiles, rk)
 		if is_loaded(rpath) == 0 {
 			load_file_trusted(rpath, 1)
@@ -753,9 +753,9 @@ fn compiler_main(argc i64, argv i64) i64 {
 		return 1
 	}
 	if asm_only != 0 && tgt_x64 != 0 {
-		write_all(1, print_asm_x64())
+		write_all(1, cast(Vec[i64], print_asm_x64()))
 	} else if asm_only != 0 {
-		write_all(1, print_asm())
+		write_all(1, cast(Vec[i64], print_asm()))
 	} else if tgt_x64 != 0 {
 		write_elf_x64(out_path)
 	} else if tgt_linux != 0 {

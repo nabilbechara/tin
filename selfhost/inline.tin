@@ -11,17 +11,17 @@ fn inline_appends(f Fn) {
 }
 
 fn ia_local(t i64) i64 {
-	let s = cast(Sym, sym_new(SYM_LOCAL, cstr("$"), 0))
+	let s = sym_new(SYM_LOCAL, cstr("$"), 0)
 	s.type_ = t
 	s.slot = cast(Fn, ia_fn).slots
 	cast(Fn, ia_fn).slots = cast(Fn, ia_fn).slots + 1
-	vec_push(cast(Fn, ia_fn).locals, cast(i64, s))
+	vec_push(cast(Fn, ia_fn).locals, cast(Sym, s))
 	return cast(i64, s)
 }
 
-fn ia_stmts(v i64) {
+fn ia_stmts(v Vec[i64]) {
 	mut i = 0
-	for i < v[VEC_LEN] {
+	for i < v.len {
 		ia_stmt(vec_get(v, i))
 		i = i + 1
 	}
@@ -58,7 +58,7 @@ fn ia_stmt(s i64) {
 		if cast(ReturnStmt, s).value != 0 {
 			ia_expr(cast(ReturnStmt, s).value)
 		}
-		if cast(ReturnStmt, s).values != 0 {
+		if cast(i64, cast(ReturnStmt, s).values) != 0 {
 			ia_exprs(cast(ReturnStmt, s).values)
 		}
 	} else if k == ST_CALLMULTI {
@@ -66,9 +66,9 @@ fn ia_stmt(s i64) {
 	}
 }
 
-fn ia_exprs(v i64) {
+fn ia_exprs(v Vec[i64]) {
 	mut i = 0
-	for i < v[VEC_LEN] {
+	for i < v.len {
 		ia_expr(vec_get(v, i))
 		i = i + 1
 	}
@@ -104,9 +104,9 @@ fn ia_expr(e i64) {
 		ia_exprs(cast(Call, e).args)
 		let name = cast(Call, e).name
 		if cast(Call, e).intrinsic == 0 && name != 0 && cast(Fn, ia_fn).generated == 0 {
-			if (streq(name, cstr("rt_append")) != 0 || streq(name, cstr("rt_append_rc")) != 0) && cast(Call, e).args[VEC_LEN] == 3 && cast(Node, vec_get(cast(Call, e).args, 2)).kind == EX_INT {
+			if (streq(name, cstr("rt_append")) != 0 || streq(name, cstr("rt_append_rc")) != 0) && cast(Call, e).args.len == 3 && cast(Node, vec_get(cast(Call, e).args, 2)).kind == EX_INT {
 				ia_append(e)
-			} else if streq(name, cstr("rt_append_str")) != 0 && cast(Call, e).args[VEC_LEN] == 2 {
+			} else if streq(name, cstr("rt_append_str")) != 0 && cast(Call, e).args.len == 2 {
 				ia_append_str(e)
 			}
 		}
@@ -148,14 +148,14 @@ fn ia_append(e i64) {
 	let h = ia_local(st)
 	let v = ia_local(vt)
 	let n = ia_local(ty_int)
-	let stmts = vec_new()
+	let stmts = vec_new[i64]()
 	vec_push(stmts, let_stmt(pos, cast(Sym, h), vec_get(args, 0)))
 	vec_push(stmts, let_stmt(pos, cast(Sym, v), vec_get(args, 1)))
 	vec_push(stmts, let_stmt(pos, cast(Sym, n), ia_hdr(h, 0)))
 	let slow = node_new(EX_CALL, pos)
 	cast(Call, slow).name = cast(Call, e).name
 	cast(Call, slow).fn_ = cast(Call, e).fn_
-	cast(Call, slow).args = args3(ia_ref(h), ia_ref(v), mk_int(pos, esz, ty_int))
+	cast(Call, slow).args = cast(Vec[i64], args3(ia_ref(h), ia_ref(v), mk_int(pos, esz, ty_int)))
 	cast(Node, slow).type_ = st
 	let ifs = cast(IfStmt, node_new(ST_IF, pos))
 	ifs.cond = mk_bin(pos, cstr(">="), ia_ref(n), ia_hdr(h, 1), ty_bool)
@@ -163,22 +163,22 @@ fn ia_append(e i64) {
 	vec_push(cast(Block, ifs.then).stmts, assign_stmt(pos, ia_ref(h), slow))
 	let els = cast(Block, empty_block(pos))
 	let slot = mk_mem(pos, ia_hdr(h, 2), ia_ref(n), esz, 0, elem_type_of_size(esz))
-	vec_push(els.stmts, assign_stmt(pos, slot, ia_ref(v)))
-	vec_push(els.stmts, assign_stmt(pos, ia_hdr(h, 0), mk_bin(pos, cstr("+"), ia_ref(n), mk_int(pos, 1, ty_int), ty_int)))
+	vec_push(cast(Vec[i64], els.stmts), assign_stmt(pos, slot, ia_ref(v)))
+	vec_push(cast(Vec[i64], els.stmts), assign_stmt(pos, ia_hdr(h, 0), mk_bin(pos, cstr("+"), ia_ref(n), mk_int(pos, 1, ty_int), ty_int)))
 	if streq(cast(Call, e).name, cstr("rt_append_rc")) != 0 {
 		// A counted element in a long-lived slice gains its slot's count (#176).
 		let lived = cast(IfStmt, node_new(ST_IF, pos))
 		lived.cond = mk_bin(pos, cstr("!="), ia_hdr(h, 3), mk_int(pos, 0, ty_int), ty_bool)
 		lived.then = empty_block(pos)
 		vec_push(cast(Block, lived.then).stmts, expr_stmt(cast(Node, rt_call(pos, cstr("rt_rc_inc"), args1(ia_ref(v)), ty_void))))
-		vec_push(els.stmts, cast(i64, lived))
+		vec_push(cast(Vec[i64], els.stmts), cast(i64, lived))
 	}
 	ifs.else_ = cast(i64, els)
 	vec_push(stmts, cast(i64, ifs))
-	replace_node(e, mk_seq(pos, stmts, ia_ref(h), st))
+	replace_node(e, mk_seq(pos, cast(i64, stmts), ia_ref(h), st))
 }
 
-fn ia_copy_str_chunk(pos i64, stmts i64, dst i64, src i64, off i64, lg i64) {
+fn ia_copy_str_chunk(pos i64, stmts Vec[i64], dst i64, src i64, off i64, lg i64) {
 	let word = ia_local(ty_int)
 	mut dst_at = dst
 	mut src_at = src
@@ -204,7 +204,7 @@ fn ia_append_str(e i64) {
 		ia_append_lit(e, cast(StrLit, lit))
 		return
 	}
-	let memcpy_fn = cast(Fn, find_fn(cstr("memcpy")))
+	let memcpy_fn = find_fn(cstr("memcpy"))
 	if cast(i64, memcpy_fn) == 0 {
 		return
 	}
@@ -216,7 +216,7 @@ fn ia_append_str(e i64) {
 	let dst = ia_local(ty_int)
 	let src = ia_local(ty_int)
 	let word = ia_local(ty_int)
-	let stmts = vec_new()
+	let stmts = vec_new[i64]()
 	vec_push(stmts, let_stmt(pos, cast(Sym, h), vec_get(args, 0)))
 	vec_push(stmts, let_stmt(pos, cast(Sym, t), vec_get(args, 1)))
 	vec_push(stmts, let_stmt(pos, cast(Sym, n), ia_hdr(h, 0)))
@@ -224,7 +224,7 @@ fn ia_append_str(e i64) {
 	let slow = node_new(EX_CALL, pos)
 	cast(Call, slow).name = cast(Call, e).name
 	cast(Call, slow).fn_ = cast(Call, e).fn_
-	cast(Call, slow).args = args2(ia_ref(h), ia_ref(t))
+	cast(Call, slow).args = cast(Vec[i64], args2(ia_ref(h), ia_ref(t)))
 	cast(Node, slow).type_ = st
 	let ifs = cast(IfStmt, node_new(ST_IF, pos))
 	ifs.cond = mk_bin(pos, cstr(">"), mk_bin(pos, cstr("+"), ia_ref(n), ia_ref(m), ty_int), ia_hdr(h, 1), ty_bool)
@@ -236,9 +236,9 @@ fn ia_append_str(e i64) {
 	let cp = node_new(EX_CALL, pos)
 	cast(Call, cp).name = cstr("memcpy")
 	cast(Call, cp).fn_ = cast(i64, memcpy_fn)
-	cast(Call, cp).args = args3(mk_bin(pos, cstr("+"), ia_hdr(h, 2), ia_ref(n), ty_int), mk_bin(pos, cstr("+"), mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int), ia_ref(m))
+	cast(Call, cp).args = cast(Vec[i64], args3(mk_bin(pos, cstr("+"), ia_hdr(h, 2), ia_ref(n), ty_int), mk_bin(pos, cstr("+"), mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int), ia_ref(m)))
 	cast(Node, cp).type_ = ty_int
-	vec_push(fallback.stmts, expr_stmt(cast(Node, cp)))
+	vec_push(cast(Vec[i64], fallback.stmts), expr_stmt(cast(Node, cp)))
 	// These lengths are common in builders. Avoid a libc call while keeping the
 	// general copy path unchanged and limiting every raw access to its exact width.
 	let short = cast(IfStmt, node_new(ST_IF, pos))
@@ -269,11 +269,11 @@ fn ia_append_str(e i64) {
 	vec_push(cast(Block, two.else_).stmts, cast(i64, six))
 	short.else_ = empty_block(pos)
 	vec_push(cast(Block, short.else_).stmts, cast(i64, two))
-	vec_push(els.stmts, cast(i64, short))
-	vec_push(els.stmts, assign_stmt(pos, ia_hdr(h, 0), mk_bin(pos, cstr("+"), ia_ref(n), ia_ref(m), ty_int)))
+	vec_push(cast(Vec[i64], els.stmts), cast(i64, short))
+	vec_push(cast(Vec[i64], els.stmts), assign_stmt(pos, ia_hdr(h, 0), mk_bin(pos, cstr("+"), ia_ref(n), ia_ref(m), ty_int)))
 	ifs.else_ = cast(i64, els)
 	vec_push(stmts, cast(i64, ifs))
-	replace_node(e, mk_seq(pos, stmts, ia_ref(h), st))
+	replace_node(e, mk_seq(pos, cast(i64, stmts), ia_ref(h), st))
 }
 
 // ---- small function inlining ----
@@ -284,13 +284,13 @@ fn ia_append_str(e i64) {
 // evaluated once into temps, in order.
 shared mut il_fn i64
 shared mut il_depth i64
-shared mut il_subst i64 // per callee param: the expression to use, or 0
+shared mut il_subst Vec[i64] // per callee param: the expression to use, or 0
 shared mut il_callee i64
 
 fn inline_small_calls() {
 	mut i = 0
-	for i < prog_fns[VEC_LEN] {
-		let f = cast(Fn, vec_get(prog_fns, i))
+	for i < prog_fns.len {
+		let f = vec_get(prog_fns, i)
 		if f.extern_ == 0 && f.reach != 0 && f.generated == 0 && f.body != 0 {
 			il_fn = cast(i64, f)
 			il_depth = 0
@@ -300,9 +300,9 @@ fn inline_small_calls() {
 	}
 }
 
-fn il_stmts(v i64) {
+fn il_stmts(v Vec[i64]) {
 	mut i = 0
-	for i < v[VEC_LEN] {
+	for i < v.len {
 		il_stmt(vec_get(v, i))
 		i = i + 1
 	}
@@ -339,9 +339,9 @@ fn il_stmt(s i64) {
 		if cast(ReturnStmt, s).value != 0 {
 			il_expr(cast(ReturnStmt, s).value)
 		}
-		if cast(ReturnStmt, s).values != 0 {
+		if cast(i64, cast(ReturnStmt, s).values) != 0 {
 			mut i = 0
-			for i < cast(ReturnStmt, s).values[VEC_LEN] {
+			for i < cast(ReturnStmt, s).values.len {
 				il_expr(vec_get(cast(ReturnStmt, s).values, i))
 				i = i + 1
 			}
@@ -380,7 +380,7 @@ fn il_expr(e i64) {
 		il_expr(cast(Call, e).callee)
 		let args = cast(Call, e).args
 		mut i = 0
-		for i < args[VEC_LEN] {
+		for i < args.len {
 			il_expr(vec_get(args, i))
 			i = i + 1
 		}
@@ -446,7 +446,7 @@ fn il_fold_boolean(e i64) {
 
 // il_float_intrinsic turns libm calls the hardware does in one instruction into intrinsics.
 fn il_float_intrinsic(e i64, f Fn) {
-	if cast(Call, e).args[VEC_LEN] != 1 || is_float_t(cast(Node, e).type_) == 0 {
+	if cast(Call, e).args.len != 1 || is_float_t(cast(Node, e).type_) == 0 {
 		return
 	}
 	let name = f.name
@@ -477,15 +477,15 @@ fn il_inlinable(f Fn) i64 {
 	if fn_polls(f) != 0 && fn_polls(cast(Fn, il_fn)) == 0 {
 		return 0
 	}
-	if f.extern_ != 0 || f.body == 0 || f.generated != 0 || f.variadic != 0 || f.rtypes[VEC_LEN] != 1 || f.env_sym != 0 {
+	if f.extern_ != 0 || f.body == 0 || f.generated != 0 || f.variadic != 0 || cast(Vec[i64], f.rtypes).len != 1 || f.env_sym != 0 {
 		return 0
 	}
 	let stmts = cast(Block, f.body).stmts
-	if stmts[VEC_LEN] != 1 {
+	if stmts.len != 1 {
 		return 0
 	}
 	let r = vec_get(stmts, 0)
-	if cast(Node, r).kind != ST_RETURN || cast(ReturnStmt, r).value == 0 || cast(ReturnStmt, r).values != 0 {
+	if cast(Node, r).kind != ST_RETURN || cast(ReturnStmt, r).value == 0 || cast(i64, cast(ReturnStmt, r).values) != 0 {
 		return 0
 	}
 	if il_substituted(f) != 0 {
@@ -552,7 +552,7 @@ fn il_size(e i64) i64 {
 		}
 		mut n = 3
 		mut i = 0
-		for i < cast(Call, e).args[VEC_LEN] {
+		for i < cast(Call, e).args.len {
 			n = n + il_size(vec_get(cast(Call, e).args, i))
 			i = i + 1
 		}
@@ -563,10 +563,10 @@ fn il_size(e i64) i64 {
 
 fn il_param_index(s i64) i64 {
 	let locals = cast(Fn, il_callee).locals
-	let np = cast(Fn, il_callee).params[VEC_LEN]
+	let np = cast(Fn, il_callee).params.len
 	mut i = 0
 	for i < np {
-		if vec_get(locals, i) == s {
+		if cast(i64, vec_get(locals, i)) == s {
 			return i
 		}
 		i = i + 1
@@ -600,7 +600,7 @@ fn il_uses(e i64, s i64) i64 {
 	if k == EX_CALL {
 		mut n = 0
 		mut i = 0
-		for i < cast(Call, e).args[VEC_LEN] {
+		for i < cast(Call, e).args.len {
 			n = n + il_uses(vec_get(cast(Call, e).args, i), s)
 			i = i + 1
 		}
@@ -639,8 +639,8 @@ fn il_expand(e i64, f Fn) {
 	let pos = cast(Node, e).pos
 	let args = cast(Call, e).args
 	let body = cast(ReturnStmt, vec_get(cast(Block, f.body).stmts, 0)).value
-	let np = f.params[VEC_LEN]
-	if args[VEC_LEN] != np {
+	let np = cast(Vec[i64], f.params).len
+	if args.len != np {
 		return
 	}
 	// A substituted argument runs at its use: after the temps and inside the body. A call
@@ -652,33 +652,33 @@ fn il_expand(e i64, f Fn) {
 		pure = i64(pure != 0 && il_pure(vec_get(args, i)) != 0)
 		i = i + 1
 	}
-	let stmts = vec_new()
+	let stmts = vec_new[i64]()
 	let subst = vec_filled(np, 0)
 	i = 0
 	for i < np {
 		let a = vec_get(args, i)
-		let p = cast(Sym, vec_get(f.locals, i))
+		let p = cast(Sym, vec_get(cast(Vec[i64], f.locals), i))
 		let ak = cast(Node, a).kind
 		let simple = i64(ak == EX_INT || ak == EX_FLOAT || ak == EX_STR || (ak == EX_IDENT && cast(IdentExpr, a).ref != 0 && cast(Sym, cast(IdentExpr, a).ref).kind == SYM_LOCAL && cast(Sym, cast(IdentExpr, a).ref).addr == 0))
 		if simple != 0 || (pure != 0 && il_uses(body, cast(i64, p)) == 1) {
-			subst[VEC_DATA][i] = a
+			cast(Vec[i64], subst).data[i] = a
 		} else {
 			let t = ia_local_in(cast(Fn, il_fn), p.type_)
 			vec_push(stmts, let_stmt(pos, cast(Sym, t), a))
-			subst[VEC_DATA][i] = sym_ref_node(pos, cast(Sym, t))
+			cast(Vec[i64], subst).data[i] = sym_ref_node(pos, cast(Sym, t))
 		}
 		i = i + 1
 	}
 	let saved = il_subst
 	let saved_callee = il_callee
-	il_subst = subst
+	il_subst = cast(Vec[i64], subst)
 	il_callee = cast(i64, f)
 	let copy_ = il_clone(body)
 	il_subst = saved
 	il_callee = saved_callee
 	let t = cast(Node, e).type_
-	if stmts[VEC_LEN] > 0 {
-		replace_node(e, mk_seq(pos, stmts, copy_, t))
+	if cast(Vec[i64], stmts).len > 0 {
+		replace_node(e, mk_seq(pos, cast(i64, stmts), copy_, t))
 	} else {
 		replace_node(e, copy_)
 		cast(Node, e).type_ = t
@@ -689,11 +689,11 @@ fn il_expand(e i64, f Fn) {
 }
 
 fn ia_local_in(f Fn, t i64) i64 {
-	let s = cast(Sym, sym_new(SYM_LOCAL, cstr("$"), 0))
+	let s = sym_new(SYM_LOCAL, cstr("$"), 0)
 	s.type_ = t
 	s.slot = f.slots
 	f.slots = f.slots + 1
-	vec_push(f.locals, cast(i64, s))
+	vec_push(cast(Vec[i64], f.locals), cast(i64, s))
 	return cast(i64, s)
 }
 
@@ -725,13 +725,13 @@ fn il_clone(e i64) i64 {
 		cast(ElemExpr, c).seq = il_clone(cast(ElemExpr, e).seq)
 		cast(ElemExpr, c).idx = il_clone(cast(ElemExpr, e).idx)
 	} else if k == EX_CALL {
-		let args = vec_new()
+		let args = vec_new[i64]()
 		mut i = 0
-		for i < cast(Call, e).args[VEC_LEN] {
+		for i < cast(Call, e).args.len {
 			vec_push(args, il_clone(vec_get(cast(Call, e).args, i)))
 			i = i + 1
 		}
-		cast(Call, c).args = args
+		cast(Call, c).args = cast(Vec[i64], args)
 	}
 	return c
 }
@@ -763,13 +763,13 @@ fn il_clone_plain(e i64) i64 {
 		cast(ElemExpr, c).seq = il_clone_plain(cast(ElemExpr, e).seq)
 		cast(ElemExpr, c).idx = il_clone_plain(cast(ElemExpr, e).idx)
 	} else if k == EX_CALL {
-		let args = vec_new()
+		let args = vec_new[i64]()
 		mut i = 0
-		for i < cast(Call, e).args[VEC_LEN] {
+		for i < cast(Call, e).args.len {
 			vec_push(args, il_clone_plain(vec_get(cast(Call, e).args, i)))
 			i = i + 1
 		}
-		cast(Call, c).args = args
+		cast(Call, c).args = cast(Vec[i64], args)
 	}
 	return c
 }
@@ -798,20 +798,20 @@ fn ia_append_lit(e i64, lit StrLit) {
 	let h = ia_local(st)
 	let n = ia_local(ty_int)
 	let p = ia_local(ty_int)
-	let stmts = vec_new()
+	let stmts = vec_new[i64]()
 	vec_push(stmts, let_stmt(pos, cast(Sym, h), vec_get(args, 0)))
 	vec_push(stmts, let_stmt(pos, cast(Sym, n), ia_hdr(h, 0)))
 	let slow = node_new(EX_CALL, pos)
 	cast(Call, slow).name = cast(Call, e).name
 	cast(Call, slow).fn_ = cast(Call, e).fn_
-	cast(Call, slow).args = args2(ia_ref(h), cast(i64, lit))
+	cast(Call, slow).args = cast(Vec[i64], args2(ia_ref(h), cast(i64, lit)))
 	cast(Node, slow).type_ = st
 	let ifs = cast(IfStmt, node_new(ST_IF, pos))
 	ifs.cond = mk_bin(pos, cstr(">"), mk_bin(pos, cstr("+"), ia_ref(n), mk_int(pos, len_, ty_int), ty_int), ia_hdr(h, 1), ty_bool)
 	ifs.then = empty_block(pos)
 	vec_push(cast(Block, ifs.then).stmts, assign_stmt(pos, ia_ref(h), slow))
 	let els = cast(Block, empty_block(pos))
-	let eb = els.stmts
+	let eb = cast(Vec[i64], els.stmts)
 	vec_push(eb, let_stmt(pos, cast(Sym, p), mk_bin(pos, cstr("+"), ia_hdr(h, 2), ia_ref(n), ty_int)))
 	mut off = 0
 	for off < len_ {
@@ -835,5 +835,5 @@ fn ia_append_lit(e i64, lit StrLit) {
 	vec_push(eb, assign_stmt(pos, ia_hdr(h, 0), mk_bin(pos, cstr("+"), ia_ref(n), mk_int(pos, len_, ty_int), ty_int)))
 	ifs.else_ = cast(i64, els)
 	vec_push(stmts, cast(i64, ifs))
-	replace_node(e, mk_seq(pos, stmts, ia_ref(h), st))
+	replace_node(e, mk_seq(pos, cast(i64, stmts), ia_ref(h), st))
 }

@@ -45,7 +45,7 @@ def main():
         # The probe is a strict program whose files sit in the tree's selfhost/, which is read trusted.
         shutil.copytree(ROOT/'selfhost',tree/'selfhost')
         shutil.copy(ROOT/'tools/ci/fixtures/path_probe.tin',tree/'selfhost/path_probe.tin')
-        sources=[str(tree/'selfhost/util.tin'),str(tree/'selfhost'/('host_'+osname+'.tin')),str(tree/'selfhost/path_probe.tin')]
+        sources=[str(tree/'selfhost/records.tin'),str(tree/'selfhost/util.tin'),str(tree/'selfhost'/('host_'+osname+'.tin')),str(tree/'selfhost/path_probe.tin')]
         subprocess.run([str(compiler),'-o',str(probe)]+sources,cwd=ROOT,env=dict(env,TIN_ROOT=str(tree)),check=True,timeout=60)
         paths=[str(tree/'bin/tinc'),str(work/'tree link/../file'),str(work/'tree link/bin/../../file'),
                '.',str(work/'launcher chain'),str(work/'loop'),str(work/'broken'),str(work/'file')+'/',

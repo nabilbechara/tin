@@ -1,18 +1,18 @@
 // Generics by monomorphization: each use of a generic function or type with new type
 // arguments re-parses the declaration's tokens and checks the copy with the type
 // parameters bound, so every instance is ordinary, fully specialized code.
-shared mut ck_tbind i64 // vec of [name, type]: type parameters in scope
-shared mut ty_generics i64 // vec of [qualified name, decl] for generic types
-shared mut gen_pending i64 // [method template, type args] waiting for functions to be declared
+shared mut ck_tbind Vec[i64] // vec of [name, type]: type parameters in scope
+shared mut ty_generics Vec[i64] // vec of [qualified name, decl] for generic types
+shared mut gen_pending Vec[i64] // [method template, type args] waiting for functions to be declared
 shared mut ck_decl_done i64
 
 fn tbind_lookup(name i64) i64 {
-	if ck_tbind == 0 {
+	if cast(i64, ck_tbind) == 0 {
 		return 0
 	}
 	mut i = 0
-	for i < ck_tbind[VEC_LEN] {
-		let p = vec_get(ck_tbind, i)
+	for i < ck_tbind.len {
+		let p = cast(Vec[i64], vec_get(cast(Vec[i64], ck_tbind), i))
 		if streq(vec_get(p, 0), name) != 0 {
 			return vec_get(p, 1)
 		}
@@ -21,22 +21,22 @@ fn tbind_lookup(name i64) i64 {
 	return 0
 }
 
-fn tbind_pairs(names i64, types i64) i64 {
-	let v = vec_new()
+fn tbind_pairs(names Vec[i64], types Vec[i64]) i64 {
+	let v = vec_new[i64]()
 	mut i = 0
-	for i < names[VEC_LEN] {
+	for i < names.len {
 		vec_push(v, pair(vec_get(names, i), vec_get(types, i)))
 		i = i + 1
 	}
-	return v
+	return cast(i64, v)
 }
 
-fn same_types(a i64, b i64) i64 {
-	if a[VEC_LEN] != b[VEC_LEN] {
+fn same_types(a Vec[i64], b Vec[i64]) i64 {
+	if a.len != b.len {
 		return 0
 	}
 	mut i = 0
-	for i < a[VEC_LEN] {
+	for i < a.len {
 		if vec_get(a, i) != vec_get(b, i) {
 			return 0
 		}
@@ -46,14 +46,14 @@ fn same_types(a i64, b i64) i64 {
 }
 
 // targs_name appends "[T1,T2]" to b.
-fn targs_name(b i64, targs i64) {
+fn targs_name(b Buf, targs Vec[Ty]) {
 	buf_byte(b, '[')
 	mut i = 0
-	for i < targs[VEC_LEN] {
+	for i < targs.len {
 		if i > 0 {
 			buf_byte(b, ',')
 		}
-		type_name(b, cast(Ty, vec_get(targs, i)))
+		type_name(b, vec_get(targs, i))
 		i = i + 1
 	}
 	buf_byte(b, ']')
@@ -61,47 +61,47 @@ fn targs_name(b i64, targs i64) {
 
 // generics_init registers generic types and gives them their method templates.
 fn generics_init() {
-	ty_generics = vec_new()
-	gen_pending = vec_new()
+	ty_generics = vec_new[i64]()
+	gen_pending = vec_new[i64]()
 	ck_decl_done = 0
 	mut i = 0
-	for i < prog_types[VEC_LEN] {
-		let d = cast(Decl, vec_get(prog_types, i))
+	for i < prog_types.len {
+		let d = vec_get(prog_types, i)
 		if d.tparams != 0 {
 			set_file(d.file)
-			d.insts = vec_new()
-			d.methods = vec_new()
+			d.insts = cast(i64, vec_new[i64]())
+			d.methods = cast(i64, vec_new[i64]())
 			vec_push(ty_generics, pair(qual(ck_pkg, d.name), cast(i64, d)))
 		}
 		i = i + 1
 	}
 	i = 0
-	for i < prog_fns[VEC_LEN] {
-		let f = cast(Fn, vec_get(prog_fns, i))
+	for i < prog_fns.len {
+		let f = vec_get(prog_fns, i)
 		let rx = f.recv
-		if rx != 0 && cast(Node, rx).kind == TX_NAME && cast(TypeExpr, rx).args != 0 {
+		if rx != 0 && cast(Node, rx).kind == TX_NAME && cast(i64, cast(TypeExpr, rx).args) != 0 {
 			set_file(f.file)
-			let d = cast(Decl, find_generic(qual(ck_pkg, cast(TypeExpr, rx).b)))
+			let d = find_generic(qual(ck_pkg, cast(i64, cast(TypeExpr, rx).b)))
 			if cast(i64, d) == 0 {
-				err_code_quoted(f.pos, cstr("E501 NOT_GENERIC"), cstr(""), cast(TypeExpr, rx).b, cstr(" is not a generic type"))
+				err_code_quoted(f.pos, cstr("E501 NOT_GENERIC"), cstr(""), cast(i64, cast(TypeExpr, rx).b), cstr(" is not a generic type"))
 			} else {
-				vec_push(d.methods, cast(i64, f))
+				vec_push(cast(Vec[i64], d.methods), cast(i64, f))
 			}
 		}
 		i = i + 1
 	}
 }
 
-fn find_generic(qname i64) i64 {
+fn find_generic(qname i64) Decl {
 	mut i = 0
-	for i < ty_generics[VEC_LEN] {
-		let p = vec_get(ty_generics, i)
+	for i < ty_generics.len {
+		let p = cast(Vec[i64], vec_get(ty_generics, i))
 		if streq(vec_get(p, 0), qname) != 0 {
-			return vec_get(p, 1)
+			return cast(Decl, vec_get(p, 1))
 		}
 		i = i + 1
 	}
-	return 0
+	return cast(Decl, 0)
 }
 
 fn is_template(f Fn) i64 {
@@ -111,80 +111,80 @@ fn is_template(f Fn) i64 {
 // generic_type_ref resolves Name[T...] in the current file.
 fn generic_type_ref(tx i64) i64 {
 	mut d = cast(Decl, 0)
-	if cast(TypeExpr, tx).a != 0 {
-		let pkg = import_pkg(cast(TypeExpr, tx).a)
+	if cast(i64, cast(TypeExpr, tx).a) != 0 {
+		let pkg = import_pkg(cast(i64, cast(TypeExpr, tx).a))
 		if pkg != 0 {
-			d = cast(Decl, find_generic(str_cat3(pkg, cstr("."), cast(TypeExpr, tx).b)))
+			d = find_generic(str_cat3(pkg, cstr("."), cast(i64, cast(TypeExpr, tx).b)))
 		}
 	} else {
 		if i64(load8(ck_pkg)) != 0 {
-			d = cast(Decl, find_generic(qual(ck_pkg, cast(TypeExpr, tx).b)))
+			d = find_generic(qual(ck_pkg, cast(i64, cast(TypeExpr, tx).b)))
 		}
 		if cast(i64, d) == 0 {
-			d = cast(Decl, find_generic(cast(TypeExpr, tx).b))
+			d = find_generic(cast(i64, cast(TypeExpr, tx).b))
 		}
 	}
 	if cast(i64, d) == 0 {
-		err_code_quoted(cast(Node, tx).pos, cstr("E501 NOT_GENERIC"), cstr(""), cast(TypeExpr, tx).b, cstr(" is not a generic type"))
+		err_code_quoted(cast(Node, tx).pos, cstr("E501 NOT_GENERIC"), cstr(""), cast(i64, cast(TypeExpr, tx).b), cstr(" is not a generic type"))
 		return ty_int
 	}
-	let targs = resolve_types(cast(TypeExpr, tx).args)
-	if targs[VEC_LEN] != d.tparams[VEC_LEN] {
-		err_code_quoted(cast(Node, tx).pos, cstr("E502 TYPE_ARG_COUNT"), cstr("wrong number of type arguments for "), cast(TypeExpr, tx).b, cstr(""))
+	let targs = resolve_types(cast(Vec[i64], cast(TypeExpr, tx).args))
+	if targs.len != cast(Vec[i64], d.tparams).len {
+		err_code_quoted(cast(Node, tx).pos, cstr("E502 TYPE_ARG_COUNT"), cstr("wrong number of type arguments for "), cast(i64, cast(TypeExpr, tx).b), cstr(""))
 		return ty_int
 	}
-	return instantiate_type(d, targs, cast(Node, tx).pos)
+	return instantiate_type(d, cast(Vec[i64], targs), cast(Node, tx).pos)
 }
 
 // Checker state an instantiation must not disturb.
-fn ck_state_save() i64 {
-	let s = vec_new()
+fn ck_state_save() Vec[i64] {
+	let s = vec_new[i64]()
 	vec_push(s, ck_file)
 	vec_push(s, cast(i64, ck_fn))
-	vec_push(s, ck_tbind)
-	return s
+	vec_push(s, cast(i64, ck_tbind))
+	return cast(Vec[i64], s)
 }
 
-fn ck_state_restore(s i64) {
-	set_file(vec_get(s, 0))
-	ck_fn = cast(Fn, vec_get(s, 1))
-	ck_tbind = vec_get(s, 2)
+fn ck_state_restore(s Vec[Fn]) {
+	set_file(cast(i64, vec_get(s, 0)))
+	ck_fn = vec_get(s, 1)
+	ck_tbind = cast(Vec[i64], vec_get(s, 2))
 }
 
-fn check_constraints(pos i64, names i64, cons i64, targs i64, file i64) {
+fn check_constraints(pos i64, names Vec[i64], cons Vec[i64], targs Vec[i64], file i64) {
 	let saved = ck_state_save()
 	set_file(file)
 	// A later constraint may mention an earlier parameter (`[T constraints.Any, S Seq[T]]`), so the
 	// type arguments in scope resolve while the constraints are checked.
-	ck_tbind = tbind_pairs(names, targs)
+	ck_tbind = cast(Vec[i64], tbind_pairs(names, targs))
 	mut i = 0
-	for i < names[VEC_LEN] {
-		let c = vec_get(cons, i)
-		if c != 0 {
+	for i < names.len {
+		let c = cast(Vec[i64], vec_get(cons, i))
+		if cast(i64, c) != 0 {
 			let t = vec_get(targs, i)
-			mut inst = 0
+			mut inst = cast(Vec[i64], 0)
 			mut handled = 0
 			let cx = cast(Node, vec_get(c, 0))
-			if c[VEC_LEN] == 1 && cx.kind == TX_DYN {
+			if c.len == 1 && cx.kind == TX_DYN {
 				err_code_at(cx.pos, cstr("E520 DYN_CONSTRAINT"), cstr("a dyn type is not a constraint: name the shape"))
 				handled = 1
 			}
-			if handled == 0 && c[VEC_LEN] == 1 && cx.kind == TX_NAME {
+			if handled == 0 && c.len == 1 && cx.kind == TX_NAME {
 				// A shape, with or without type arguments: Seq[i64] is an instance.
 				inst = shape_inst(cast(i64, cx))
 				// A name that is a shape but failed to instantiate was diagnosed there;
 				// do not go on to read it as a union member.
-				handled = i64(shape_ref_name(cast(TypeExpr, cx)) != 0)
+				handled = i64(cast(i64, shape_ref_name(cast(TypeExpr, cx))) != 0)
 			}
-			if inst != 0 {
-				check_shape(pos, cast(Ty, t), cast(Decl, vec_get(inst, 0)), vec_get(inst, 1))
+			if cast(i64, inst) != 0 {
+				check_shape(pos, cast(Ty, t), cast(Decl, vec_get(inst, 0)), cast(Vec[i64], vec_get(inst, 1)))
 			} else if handled != 0 {
 			} else {
 				mut ok = 0
 				mut j = 0
-				for j < c[VEC_LEN] {
+				for j < c.len {
 					let mt = cast(Node, vec_get(c, j))
-					if shape_ref_name(cast(TypeExpr, mt)) != 0 {
+					if cast(i64, shape_ref_name(cast(TypeExpr, mt))) != 0 {
 						err_code_quoted(mt.pos, cstr("E521 SHAPE_IN_UNION"), cstr(""), shape_member_name(cast(i64, mt)), cstr(" is a shape: a union constraint lists concrete types, and a shape goes in the constraint alone"))
 					} else if resolve_type(cast(i64, mt)) == t {
 						ok = 1
@@ -194,59 +194,59 @@ fn check_constraints(pos i64, names i64, cons i64, targs i64, file i64) {
 				if ok == 0 {
 					let m = err_code(pos, cstr("E510 NOT_IN_UNION"))
 					buf_str(m, cstr("type "))
-					type_name(m, cast(Ty, t))
+					type_name(cast(Buf, m), cast(Ty, t))
 					buf_str(m, cstr(" does not satisfy the constraint of "))
 					buf_str(m, vec_get(names, i))
-					err_end(m)
+					err_end(cast(Buf, m))
 				}
 			}
 		}
 		i = i + 1
 	}
-	ck_state_restore(saved)
+	ck_state_restore(cast(Vec[Fn], saved))
 }
 
-fn instantiate_type(d Decl, targs i64, pos i64) i64 {
+fn instantiate_type(d Decl, targs Vec[i64], pos i64) i64 {
 	sb_targs(pos, targs)
 	mut i = 0
-	for i < d.insts[VEC_LEN] {
-		let inst = vec_get(d.insts, i)
-		if same_types(vec_get(inst, 0), targs) != 0 {
+	for i < cast(Vec[i64], d.insts).len {
+		let inst = cast(Vec[i64], vec_get(cast(Vec[i64], d.insts), i))
+		if same_types(cast(Vec[i64], vec_get(inst, 0)), targs) != 0 {
 			return vec_get(inst, 1)
 		}
 		i = i + 1
 	}
-	check_constraints(pos, d.tparams, d.tcons, targs, d.file)
+	check_constraints(pos, cast(Vec[i64], d.tparams), cast(Vec[i64], d.tcons), targs, d.file)
 	let saved = ck_state_save()
 	set_file(d.file)
 	let nb = buf_new()
 	buf_str(nb, qual(ck_pkg, d.name))
-	targs_name(nb, targs)
+	targs_name(cast(Buf, nb), cast(Vec[Ty], targs))
 	buf_byte(nb, 0)
-	let name = nb[VEC_DATA]
+	let name = cast(Vec[i64], nb).data
 	mut t = cast(Ty, 0)
 	if cast(Node, d.type_).kind == TX_STRUCT {
 		t = cast(Ty, ty_new(K_STRUCT, name))
-		t.targs = targs
+		t.targs = cast(i64, targs)
 		t.gdecl = cast(i64, d)
 		name_type(name, cast(i64, t))
-		vec_push(d.insts, pair(targs, cast(i64, t)))
-		ck_tbind = tbind_pairs(d.tparams, targs)
+		vec_push(cast(Vec[i64], d.insts), pair(cast(i64, targs), cast(i64, t)))
+		ck_tbind = cast(Vec[i64], tbind_pairs(cast(Vec[i64], d.tparams), targs))
 		resolve_fields(t, cast(TypeExpr, d.type_))
 		layout_struct(t)
 	} else {
-		ck_tbind = tbind_pairs(d.tparams, targs)
+		ck_tbind = cast(Vec[i64], tbind_pairs(cast(Vec[i64], d.tparams), targs))
 		t = cast(Ty, resolve_type(d.type_))
-		vec_push(d.insts, pair(targs, cast(i64, t)))
+		vec_push(cast(Vec[i64], d.insts), pair(cast(i64, targs), cast(i64, t)))
 	}
-	ck_state_restore(saved)
+	ck_state_restore(cast(Vec[Fn], saved))
 	mut m = 0
-	for m < d.methods[VEC_LEN] {
-		let tmpl = vec_get(d.methods, m)
+	for m < cast(Vec[i64], d.methods).len {
+		let tmpl = vec_get(cast(Vec[i64], d.methods), m)
 		if ck_decl_done != 0 {
-			instantiate_fn(cast(Fn, tmpl), targs, pos)
+			instantiate_fn(cast(Fn, tmpl), cast(Vec[Ty], targs), pos)
 		} else {
-			vec_push(gen_pending, pair(tmpl, targs))
+			vec_push(gen_pending, pair(tmpl, cast(i64, targs)))
 		}
 		m = m + 1
 	}
@@ -257,9 +257,9 @@ fn instantiate_type(d Decl, targs i64, pos i64) i64 {
 fn generics_declared() {
 	ck_decl_done = 1
 	mut i = 0
-	for i < gen_pending[VEC_LEN] {
-		let p = vec_get(gen_pending, i)
-		instantiate_fn(cast(Fn, vec_get(p, 0)), vec_get(p, 1), 0)
+	for i < gen_pending.len {
+		let p = cast(Vec[i64], vec_get(gen_pending, i))
+		instantiate_fn(cast(Fn, vec_get(p, 0)), cast(Vec[Ty], cast(Vec[i64], vec_get(p, 1))), 0)
 		i = i + 1
 	}
 }
@@ -286,8 +286,8 @@ fn type_depth(t Ty, n i64) i64 {
 	if k == K_STRUCT && t.targs != 0 {
 		mut best = n + 1
 		mut i = 0
-		for i < t.targs[VEC_LEN] {
-			let x = type_depth(cast(Ty, vec_get(t.targs, i)), n + 1)
+		for i < cast(Vec[i64], t.targs).len {
+			let x = type_depth(cast(Ty, vec_get(cast(Vec[i64], t.targs), i)), n + 1)
 			if x > best {
 				best = x
 			}
@@ -298,53 +298,53 @@ fn type_depth(t Ty, n i64) i64 {
 	return n
 }
 
-fn instantiate_fn(g Fn, targs i64, pos i64) i64 {
-	sb_targs(pos, targs)
+fn instantiate_fn(g Fn, targs Vec[Ty], pos i64) Fn {
+	sb_targs(pos, cast(Vec[i64], targs))
 	if g.insts == 0 {
-		g.insts = vec_new()
+		g.insts = cast(i64, vec_new[i64]())
 	}
 	mut i = 0
-	for i < g.insts[VEC_LEN] {
-		let inst = vec_get(g.insts, i)
-		if same_types(vec_get(inst, 0), targs) != 0 {
-			return vec_get(inst, 1)
+	for i < cast(Vec[i64], g.insts).len {
+		let inst = cast(Vec[i64], vec_get(cast(Vec[i64], g.insts), i))
+		if same_types(cast(Vec[i64], vec_get(inst, 0)), cast(Vec[i64], targs)) != 0 {
+			return cast(Fn, vec_get(inst, 1))
 		}
 		i = i + 1
 	}
-	if targs[VEC_LEN] != g.tparams[VEC_LEN] {
+	if targs.len != cast(Vec[i64], g.tparams).len {
 		err_code_quoted(pos, cstr("E502 TYPE_ARG_COUNT"), cstr("wrong number of type arguments for "), g.name, cstr(""))
-		return cast(i64, g)
+		return cast(Fn, g)
 	}
 	// A generic that calls itself with a type built from its own type parameter (F[T] calling
 	// F[[]T]) would be instantiated forever: stop at a depth no real program reaches (#98).
 	mut d = 0
 	mut k = 0
-	for k < targs[VEC_LEN] {
-		let dk = type_depth(cast(Ty, vec_get(targs, k)), 0)
+	for k < targs.len {
+		let dk = type_depth(vec_get(targs, k), 0)
 		if dk > d {
 			d = dk
 		}
 		k = k + 1
 	}
-	if d > 48 || g.insts[VEC_LEN] >= 4096 {
+	if d > 48 || cast(Vec[i64], g.insts).len >= 4096 {
 		if g.instcycle == 0 {
 			g.instcycle = 1
 			err_code_quoted(pos, cstr("E503 ENDLESS_INSTANTIATION"), cstr("instantiating "), g.name, cstr(" does not end: it is instantiated with ever deeper type arguments (a generic function calling itself with a type built from its type parameter, such as F[[]T] inside F[T])"))
 		}
-		return cast(i64, g)
+		return cast(Fn, g)
 	}
-	check_constraints(pos, g.tparams, g.tcons, targs, g.file)
+	check_constraints(pos, cast(Vec[i64], g.tparams), cast(Vec[i64], g.tcons), cast(Vec[i64], targs), g.file)
 	let st_toks = p_toks
 	let st_i = p_i
 	let st_nolit = p_nolit
 	let st_file = cur_file
 	let st_ed1 = p_edition1
-	p_toks = g.toks
+	p_toks = cast(Vec[Token], cast(Vec[i64], g.toks))
 	p_i = g.tokat
 	p_nolit = 0
 	cur_file = g.file
 	// The template is read again in its own file's edition, not the last file parsed.
-	p_edition1 = i64(g.file < file_ed1[VEC_LEN] && vec_get(file_ed1, g.file) != 0)
+	p_edition1 = i64(g.file < file_ed1.len && vec_get(file_ed1, g.file) != 0)
 	let nf = cast(Fn, parse_fn(0))
 	p_toks = st_toks
 	p_i = st_i
@@ -352,41 +352,41 @@ fn instantiate_fn(g Fn, targs i64, pos i64) i64 {
 	cur_file = st_file
 	p_edition1 = st_ed1
 	nf.tparams = g.tparams
-	nf.tbind = tbind_pairs(g.tparams, targs)
+	nf.tbind = tbind_pairs(cast(Vec[i64], g.tparams), cast(Vec[i64], targs))
 	nf.genof = cast(i64, g)
 	nf.file = g.file
 	if nf.recv == 0 {
 		let nb = buf_new()
 		buf_str(nb, nf.name)
-		targs_name(nb, targs)
+		targs_name(cast(Buf, nb), targs)
 		buf_byte(nb, 0)
-		nf.name = nb[VEC_DATA]
+		nf.name = cast(Vec[i64], nb).data
 	}
-	vec_push(g.insts, pair(targs, cast(i64, nf)))
-	vec_push(prog_fns, cast(i64, nf))
+	vec_push(cast(Vec[i64], g.insts), pair(cast(i64, targs), cast(i64, nf)))
+	vec_push(prog_fns, cast(Fn, nf))
 	let saved = ck_state_save()
-	ck_tbind = nf.tbind
+	ck_tbind = cast(Vec[i64], nf.tbind)
 	declare_fn(nf)
-	ck_state_restore(saved)
-	return cast(i64, nf)
+	ck_state_restore(cast(Vec[Fn], saved))
+	return cast(Fn, nf)
 }
 
 // unify binds g's type parameters by matching type expression tx against type t.
-fn tunify(g Fn, binds i64, tx i64, t Ty, untyped_ok i64) {
+fn tunify(g Fn, binds Vec[i64], tx i64, t Ty, untyped_ok i64) {
 	if tx == 0 || cast(i64, t) == 0 {
 		return
 	}
 	let k = cast(Node, tx).kind
-	if k == TX_NAME && cast(TypeExpr, tx).a == 0 && cast(TypeExpr, tx).args == 0 {
+	if k == TX_NAME && cast(i64, cast(TypeExpr, tx).a) == 0 && cast(i64, cast(TypeExpr, tx).args) == 0 {
 		mut i = 0
-		for i < g.tparams[VEC_LEN] {
-			if streq(vec_get(g.tparams, i), cast(TypeExpr, tx).b) != 0 {
+		for i < cast(Vec[i64], g.tparams).len {
+			if streq(vec_get(cast(Vec[i64], g.tparams), i), cast(i64, cast(TypeExpr, tx).b)) != 0 {
 				if is_untyped(cast(i64, t)) != 0 {
 					if untyped_ok != 0 && vec_get(binds, i) == 0 {
-						binds[VEC_DATA][i] = default_type(cast(i64, t))
+						binds.data[i] = default_type(cast(i64, t))
 					}
 				} else if vec_get(binds, i) == 0 {
-					binds[VEC_DATA][i] = cast(i64, t)
+					binds.data[i] = cast(i64, t)
 				}
 				return
 			}
@@ -396,29 +396,29 @@ fn tunify(g Fn, binds i64, tx i64, t Ty, untyped_ok i64) {
 	}
 	let tk = kind_of(t)
 	if k == TX_SLICE && tk == K_SLICE {
-		tunify(g, binds, cast(TypeExpr, tx).a, cast(Ty, t.elem), untyped_ok)
+		tunify(g, binds, cast(i64, cast(TypeExpr, tx).a), cast(Ty, t.elem), untyped_ok)
 	} else if k == TX_OPT && tk == K_OPT {
-		tunify(g, binds, cast(TypeExpr, tx).a, cast(Ty, t.elem), untyped_ok)
+		tunify(g, binds, cast(i64, cast(TypeExpr, tx).a), cast(Ty, t.elem), untyped_ok)
 	} else if k == TX_MAP && tk == K_MAP {
-		tunify(g, binds, cast(TypeExpr, tx).a, cast(Ty, t.key), untyped_ok)
-		tunify(g, binds, cast(TypeExpr, tx).b, cast(Ty, t.elem), untyped_ok)
+		tunify(g, binds, cast(i64, cast(TypeExpr, tx).a), cast(Ty, t.key), untyped_ok)
+		tunify(g, binds, cast(i64, cast(TypeExpr, tx).b), cast(Ty, t.elem), untyped_ok)
 	} else if k == TX_FUNC && tk == K_FUNC {
 		let ps = cast(TypeExpr, tx).a
 		let rs = cast(TypeExpr, tx).b
 		mut j = 0
-		for ps != 0 && j < ps[VEC_LEN] && j < t.fields[VEC_LEN] {
-			tunify(g, binds, vec_get(ps, j), cast(Ty, vec_get(t.fields, j)), untyped_ok)
+		for cast(i64, ps) != 0 && j < cast(Vec[i64], ps).len && j < cast(Vec[i64], t.fields).len {
+			tunify(g, binds, vec_get(cast(Vec[i64], ps), j), cast(Ty, vec_get(cast(Vec[i64], t.fields), j)), untyped_ok)
 			j = j + 1
 		}
 		j = 0
-		for rs != 0 && j < rs[VEC_LEN] && j < t.results[VEC_LEN] {
-			tunify(g, binds, vec_get(rs, j), cast(Ty, vec_get(t.results, j)), untyped_ok)
+		for cast(i64, rs) != 0 && j < cast(Vec[i64], rs).len && j < cast(Vec[i64], t.results).len {
+			tunify(g, binds, vec_get(cast(Vec[i64], rs), j), cast(Ty, vec_get(cast(Vec[i64], t.results), j)), untyped_ok)
 			j = j + 1
 		}
-	} else if k == TX_NAME && cast(TypeExpr, tx).args != 0 && t.targs != 0 && kind_of(t) != K_DYN {
+	} else if k == TX_NAME && cast(i64, cast(TypeExpr, tx).args) != 0 && t.targs != 0 && kind_of(t) != K_DYN {
 		mut j2 = 0
-		for j2 < cast(TypeExpr, tx).args[VEC_LEN] && j2 < t.targs[VEC_LEN] {
-			tunify(g, binds, vec_get(cast(TypeExpr, tx).args, j2), cast(Ty, vec_get(t.targs, j2)), untyped_ok)
+		for j2 < cast(Vec[i64], cast(TypeExpr, tx).args).len && j2 < cast(Vec[i64], t.targs).len {
+			tunify(g, binds, vec_get(cast(Vec[i64], cast(TypeExpr, tx).args), j2), cast(Ty, vec_get(cast(Vec[i64], t.targs), j2)), untyped_ok)
 			j2 = j2 + 1
 		}
 	}
@@ -427,9 +427,9 @@ fn tunify(g Fn, binds i64, tx i64, t Ty, untyped_ok i64) {
 // generic_call checks call e of template g: arguments first, then the inferred instance.
 fn generic_call(e i64, g Fn) i64 {
 	let args = cast(Call, e).args
-	let atypes = vec_new()
+	let atypes = vec_new[Ty]()
 	mut i = 0
-	for i < args[VEC_LEN] {
+	for i < args.len {
 		mut a = vec_get(args, i)
 		if cast(Node, a).kind == EX_MUTARG {
 			// Infer from x in `mut x`; chk_args checks the mark after instantiation.
@@ -437,50 +437,50 @@ fn generic_call(e i64, g Fn) i64 {
 		}
 		let at = chk(cast(Node, a), 0)
 		check_value(cast(Node, a).pos, at)
-		vec_push(atypes, at)
+		vec_push(atypes, cast(Ty, at))
 		i = i + 1
 	}
-	let np = g.ptypes[VEC_LEN]
-	if args[VEC_LEN] != np {
+	let np = cast(Vec[i64], g.ptypes).len
+	if args.len != np {
 		let m = err_code(cast(Node, e).pos, cstr("E210 ARG_COUNT"))
 		buf_str(m, g.name)
 		buf_str(m, cstr(" expects "))
 		buf_int(m, np)
 		buf_str(m, cstr(" arguments, got "))
-		buf_int(m, args[VEC_LEN])
-		err_end(m)
+		buf_int(m, args.len)
+		err_end(cast(Buf, m))
 		return ty_int
 	}
-	let binds = vec_filled(g.tparams[VEC_LEN], 0)
+	let binds = vec_filled(cast(Vec[i64], g.tparams).len, 0)
 	mut pass = 0
 	for pass < 2 {
 		i = 0
 		for i < np {
-			tunify(g, binds, vec_get(g.ptypes, i), cast(Ty, vec_get(atypes, i)), pass)
+			tunify(g, cast(Vec[i64], binds), vec_get(cast(Vec[i64], g.ptypes), i), vec_get(atypes, i), pass)
 			i = i + 1
 		}
 		pass = pass + 1
 	}
 	// with p { }: the type parameters a policy constructor's arguments leave open are the
 	// block's type (#237, notes/interface_policy.md §2).
-	if with_fill_calls != 0 && vec_index(with_fill_calls, e) >= 0 {
+	if cast(i64, with_fill_calls) != 0 && vec_index(with_fill_calls, e) >= 0 {
 		i = 0
-		for i < binds[VEC_LEN] {
+		for i < cast(Vec[i64], binds).len {
 			if vec_get(binds, i) == 0 {
-				binds[VEC_DATA][i] = with_fill_t
+				cast(Vec[i64], binds).data[i] = with_fill_t
 			}
 			i = i + 1
 		}
 	}
 	i = 0
-	for i < binds[VEC_LEN] {
+	for i < cast(Vec[i64], binds).len {
 		if vec_get(binds, i) == 0 {
-			err_code_quoted(cast(Node, e).pos, cstr("E504 CANNOT_INFER"), cstr("cannot infer type parameter "), vec_get(g.tparams, i), cstr(" (give it explicitly: F[T](...))"))
+			err_code_quoted(cast(Node, e).pos, cstr("E504 CANNOT_INFER"), cstr("cannot infer type parameter "), vec_get(cast(Vec[i64], g.tparams), i), cstr(" (give it explicitly: F[T](...))"))
 			return ty_int
 		}
 		i = i + 1
 	}
-	let inst = cast(Fn, instantiate_fn(g, binds, cast(Node, e).pos))
+	let inst = instantiate_fn(g, cast(Vec[Ty], cast(Vec[i64], binds)), cast(Node, e).pos)
 	if inst == g && g.instcycle != 0 {
 		// Reported already (an endless instantiation): no instance to check the call against;
 		// an untyped int keeps the surrounding expression from adding errors in the usual case.
@@ -489,10 +489,10 @@ fn generic_call(e i64, g Fn) i64 {
 	cast(Call, e).fn_ = cast(i64, inst)
 	cast(Call, e).callee = 0
 	cast(Call, e).name = inst.qname
-	let ptypes = inst.ptypes
-	let mask = mut_mask(inst.muts)
+	let ptypes = cast(Vec[i64], inst.ptypes)
+	let mask = mut_mask(cast(Vec[i64], inst.muts))
 	i = 0
-	for i < args[VEC_LEN] {
+	for i < args.len {
 		mut a = vec_get(args, i)
 		let marked = unwrap_mut(a)
 		if !(i == 0 && cast(Call, e).method != 0) {
@@ -505,8 +505,8 @@ fn generic_call(e i64, g Fn) i64 {
 		}
 		let want = vec_get(ptypes, i)
 		let at = vec_get(atypes, i)
-		check_assignable(cast(Node, a), at, cast(Ty, want))
-		if is_untyped(at) != 0 {
+		check_assignable(cast(Node, a), cast(i64, at), cast(Ty, want))
+		if is_untyped(cast(i64, at)) != 0 {
 			reconvert(cast(Node, a), want)
 		}
 		i = i + 1
@@ -522,13 +522,13 @@ fn expr_to_tx(e i64) i64 {
 	}
 	if k == EX_IDENT {
 		let n = cast(TypeExpr, node_new(TX_NAME, cast(Node, e).pos))
-		n.b = cast(IdentExpr, e).name
+		n.b = cast(i64, cast(Vec[i64], cast(IdentExpr, e).name))
 		return cast(i64, n)
 	}
 	if k == EX_SELECT && cast(Node, cast(SelectExpr, e).x).kind == EX_IDENT {
 		let n2 = cast(TypeExpr, node_new(TX_NAME, cast(Node, e).pos))
-		n2.a = cast(IdentExpr, cast(SelectExpr, e).x).name
-		n2.b = cast(SelectExpr, e).name
+		n2.a = cast(i64, cast(Vec[i64], cast(IdentExpr, cast(SelectExpr, e).x).name))
+		n2.b = cast(i64, cast(Vec[i64], cast(SelectExpr, e).name))
 		return cast(i64, n2)
 	}
 	if k == EX_INDEX {
@@ -536,7 +536,7 @@ fn expr_to_tx(e i64) i64 {
 		if base == 0 || cast(Node, base).kind != TX_NAME {
 			return 0
 		}
-		cast(TypeExpr, base).args = index_targs(e)
+		cast(TypeExpr, base).args = cast(i64, cast(Vec[i64], index_targs(e)))
 		return base
 	}
 	return 0
@@ -544,24 +544,24 @@ fn expr_to_tx(e i64) i64 {
 
 // index_targs is the type expression list of X[A, B].
 fn index_targs(e i64) i64 {
-	let out = vec_new()
-	mut list = cast(IndexExpr, e).args
-	if list == 0 {
-		list = vec_new()
+	let out = vec_new[i64]()
+	mut list = cast(Vec[i64], cast(IndexExpr, e).args)
+	if cast(i64, list) == 0 {
+		list = vec_new[i64]()
 		vec_push(list, cast(IndexExpr, e).i)
 	}
 	mut i = 0
-	for i < list[VEC_LEN] {
+	for i < list.len {
 		mut tx = cast(TypeExpr, expr_to_tx(vec_get(list, i)))
 		if cast(i64, tx) == 0 {
 			err_code_at(cast(Node, vec_get(list, i)).pos, cstr("E505 NOT_A_TYPE_ARG"), cstr("expected a type argument"))
 			tx = cast(TypeExpr, node_new(TX_NAME, cast(Node, e).pos))
-			tx.b = cstr("i64")
+			tx.b = cast(i64, cast(Vec[i64], cstr("i64")))
 		}
 		vec_push(out, cast(i64, tx))
 		i = i + 1
 	}
-	return out
+	return cast(i64, out)
 }
 
 // explicit_generic returns the template a callee like F[T] or pkg.F[T] names, or 0.
@@ -574,7 +574,7 @@ fn explicit_generic(callee i64) i64 {
 		if lookup_name_local(cast(IdentExpr, x).name) != 0 {
 			return 0
 		}
-		let s = cast(Sym, lookup_name(cast(IdentExpr, x).name))
+		let s = lookup_name(cast(IdentExpr, x).name)
 		if cast(i64, s) != 0 && s.kind == SYM_FUNC && is_template(cast(Fn, s.fn_)) != 0 {
 			return s.fn_
 		}
@@ -599,31 +599,31 @@ fn explicit_generic(callee i64) i64 {
 // constraint: the type argument is concrete by then, and a call through the parameter
 // is already a direct call on it. `dyn` and generic shapes are later steps; both get a
 // diagnostic naming what is missing instead of being misread as ordinary types.
-shared mut ty_shapes i64 // vec of [qualified name, shape decl], like ty_named for types
+shared mut ty_shapes Vec[i64] // vec of [qualified name, shape decl], like ty_named for types
 shared mut sm_bind i64 // bindings that resolve the candidate method's signature
 shared mut sm_declared i64 // 1 when the candidate method has been declared (receiver prepended)
-shared mut shape_cycles i64 // shapes already reported in a composition cycle
-shared mut shape_validated i64 // shapes whose body has been validated (memo: composition is a DAG)
-shared mut shape_checking i64 // shapes on the current satisfaction path (a cycle guard)
-shared mut shape_checked i64 // shapes already checked in the current satisfaction tree
-shared mut shape_bad i64 // shapes whose signature did not resolve (reported once)
-shared mut shape_collecting i64 // (shape, bindings) pairs collected in the current flattening
+shared mut shape_cycles Vec[i64] // shapes already reported in a composition cycle
+shared mut shape_validated Vec[i64] // shapes whose body has been validated (memo: composition is a DAG)
+shared mut shape_checking Vec[i64] // shapes on the current satisfaction path (a cycle guard)
+shared mut shape_checked Vec[i64] // shapes already checked in the current satisfaction tree
+shared mut shape_bad Vec[i64] // shapes whose signature did not resolve (reported once)
+shared mut shape_collecting Vec[i64] // (shape, bindings) pairs collected in the current flattening
 shared mut shape_conflicts i64 // errors the current flattening attributed to the owner shape
-shared mut shape_placeholders i64 // the fresh types shape_sym_bind made for symbolic validation
+shared mut shape_placeholders Vec[i64] // the fresh types shape_sym_bind made for symbolic validation
 
 fn shapes_init() {
-	shape_placeholders = vec_new()
-	ty_shapes = vec_new()
-	shape_cycles = vec_new()
-	shape_validated = vec_new()
-	shape_checking = vec_new()
-	shape_checked = vec_new()
-	shape_bad = vec_new()
-	shape_collecting = vec_new()
+	shape_placeholders = vec_new[i64]()
+	ty_shapes = vec_new[i64]()
+	shape_cycles = vec_new[i64]()
+	shape_validated = vec_new[i64]()
+	shape_checking = vec_new[i64]()
+	shape_checked = vec_new[i64]()
+	shape_bad = vec_new[i64]()
+	shape_collecting = vec_new[i64]()
 	shape_conflicts = 0
 	mut i = 0
-	for i < prog_shapes[VEC_LEN] {
-		let d = cast(Decl, vec_get(prog_shapes, i))
+	for i < prog_shapes.len {
+		let d = vec_get(prog_shapes, i)
 		set_file(d.file)
 		let q = qual(ck_pkg, d.name)
 		if find_shape(q) != 0 {
@@ -634,19 +634,19 @@ fn shapes_init() {
 		i = i + 1
 	}
 	i = 0
-	for i < prog_shapes[VEC_LEN] {
-		let d = cast(Decl, vec_get(prog_shapes, i))
+	for i < prog_shapes.len {
+		let d = vec_get(prog_shapes, i)
 		if shape_on_path(shape_cycles, cast(i64, d)) == 0 {
-			check_shape_decl(d, vec_new())
+			check_shape_decl(d, vec_new[i64]())
 		}
 		i = i + 1
 	}
 }
 
 fn find_shape(qname i64) i64 {
-	mut i = ty_shapes[VEC_LEN] - 1
+	mut i = ty_shapes.len - 1
 	for i >= 0 {
-		let rec = vec_get(ty_shapes, i)
+		let rec = cast(Vec[i64], vec_get(ty_shapes, i))
 		if streq(vec_get(rec, 0), qname) != 0 {
 			return vec_get(rec, 1)
 		}
@@ -666,16 +666,16 @@ fn find_shape(qname i64) i64 {
 // remembered so satisfaction does not report them again.
 fn shapes_declared() {
 	mut i = 0
-	for i < prog_shapes[VEC_LEN] {
-		let d = cast(Decl, vec_get(prog_shapes, i))
+	for i < prog_shapes.len {
+		let d = vec_get(prog_shapes, i)
 		if shape_on_path(shape_bad, cast(i64, d)) == 0 {
 			let saved = ck_state_save()
 			set_file(d.file)
-			mut bind_ = 0
+			mut bind_ = cast(Vec[i64], 0)
 			if d.tparams != 0 {
-				bind_ = shape_sym_bind(d)
+				bind_ = cast(Vec[i64], shape_sym_bind(d))
 			}
-			ck_tbind = bind_
+			ck_tbind = cast(Vec[i64], bind_)
 			let before = error_count
 			mut j = 0
 			if d.unionkind != 0 {
@@ -683,9 +683,9 @@ fn shapes_declared() {
 				// it here would add a second, less useful message. The union is bad either
 				// way, so satisfaction skips it.
 				mut bad = 0
-				for j < d.union[VEC_LEN] {
-					let m = cast(Fn, vec_get(d.union, j))
-					if shape_ref_name(cast(TypeExpr, m)) != 0 {
+				for j < cast(Vec[i64], d.union).len {
+					let m = cast(Fn, vec_get(cast(Vec[i64], d.union), j))
+					if cast(i64, shape_ref_name(cast(TypeExpr, m))) != 0 {
 						bad = 1
 					} else {
 						resolve_type(cast(i64, m))
@@ -698,16 +698,16 @@ fn shapes_declared() {
 					}
 				}
 			} else {
-				for j < d.shape_[VEC_LEN] {
-					let m = cast(Fn, vec_get(d.shape_, j))
+				for j < cast(Vec[i64], d.shape_).len {
+					let m = cast(Fn, vec_get(cast(Vec[i64], d.shape_), j))
 					mut k = 0
-					for k < m.ptypes[VEC_LEN] {
-						resolve_type(vec_get(m.ptypes, k))
+					for k < cast(Vec[i64], m.ptypes).len {
+						resolve_type(vec_get(cast(Vec[i64], m.ptypes), k))
 						k = k + 1
 					}
 					k = 0
-					for k < m.rtypes[VEC_LEN] {
-						resolve_type(vec_get(m.rtypes, k))
+					for k < cast(Vec[i64], cast(Fn, m).rtypes).len {
+						resolve_type(vec_get(cast(Vec[i64], cast(Fn, m).rtypes), k))
 						k = k + 1
 					}
 					j = j + 1
@@ -726,7 +726,7 @@ fn shapes_declared() {
 					}
 				}
 			}
-			ck_state_restore(saved)
+			ck_state_restore(cast(Vec[Fn], saved))
 		}
 		i = i + 1
 	}
@@ -735,103 +735,103 @@ fn shapes_declared() {
 // shape_ref_name resolves a name (qualified or not) to a shape in scope, or 0. An
 // unqualified name resolves in the current package only: a package's own type must not
 // be shadowed by a shape of the same name in main, so there is no cross-package fallback.
-fn shape_ref_name(tx TypeExpr) i64 {
-	if tx.a != 0 {
-		let pkg = import_pkg(tx.a)
+fn shape_ref_name(tx TypeExpr) Decl {
+	if cast(i64, tx.a) != 0 {
+		let pkg = import_pkg(cast(i64, tx.a))
 		if pkg != 0 {
-			return find_shape(str_cat3(pkg, cstr("."), tx.b))
+			return cast(Decl, find_shape(str_cat3(pkg, cstr("."), cast(i64, tx.b))))
 		}
-		return 0
+		return cast(Decl, 0)
 	}
 	if i64(load8(ck_pkg)) != 0 {
-		return find_shape(qual(ck_pkg, tx.b))
+		return cast(Decl, find_shape(qual(ck_pkg, cast(i64, tx.b))))
 	}
-	return find_shape(tx.b)
+	return cast(Decl, find_shape(cast(i64, tx.b)))
 }
 
 // shape_inst resolves a shape reference, with or without type arguments, to a vec of
 // [decl, bindings]; bindings is 0 for a non-generic shape. Type arguments are resolved
 // and the shape's own parameter constraints are checked, so `Seq[i64]` is an instance
 // and `Seq` alone is an error. Returns 0 when the name is not a shape.
-fn shape_inst(tx i64) i64 {
-	let d = cast(Decl, shape_ref_name(cast(TypeExpr, tx)))
+fn shape_inst(tx i64) Vec[i64] {
+	let d = shape_ref_name(cast(TypeExpr, tx))
 	if cast(i64, d) == 0 {
-		return 0
+		return cast(Vec[i64], 0)
 	}
 	if d.tparams == 0 {
-		if cast(TypeExpr, tx).args != 0 {
-			err_code_quoted(cast(Node, tx).pos, cstr("E501 NOT_GENERIC"), cstr("shape "), cast(TypeExpr, tx).b, cstr(" takes no type arguments"))
-			return 0
+		if cast(i64, cast(TypeExpr, tx).args) != 0 {
+			err_code_quoted(cast(Node, tx).pos, cstr("E501 NOT_GENERIC"), cstr("shape "), cast(i64, cast(TypeExpr, tx).b), cstr(" takes no type arguments"))
+			return cast(Vec[i64], 0)
 		}
-		return pair(cast(i64, d), 0)
+		return cast(Vec[i64], pair(cast(i64, d), 0))
 	}
-	if cast(TypeExpr, tx).args == 0 {
+	if cast(i64, cast(TypeExpr, tx).args) == 0 {
 		let e = err_code(cast(Node, tx).pos, cstr("E502 TYPE_ARG_COUNT"))
 		buf_str(e, cstr("shape "))
-		buf_str(e, cast(TypeExpr, tx).b)
+		buf_str(e, cast(i64, cast(TypeExpr, tx).b))
 		buf_str(e, cstr(" needs type arguments, like "))
-		buf_str(e, cast(TypeExpr, tx).b)
+		buf_str(e, cast(i64, cast(TypeExpr, tx).b))
 		buf_str(e, cstr("[...]"))
-		err_end(e)
-		return 0
+		err_end(cast(Buf, e))
+		return cast(Vec[i64], 0)
 	}
-	if cast(TypeExpr, tx).args[VEC_LEN] != d.tparams[VEC_LEN] {
+	if cast(Vec[i64], cast(TypeExpr, tx).args).len != cast(Vec[i64], d.tparams).len {
 		let e = err_code(cast(Node, tx).pos, cstr("E502 TYPE_ARG_COUNT"))
 		buf_str(e, cstr("wrong number of type arguments for shape "))
-		buf_str(e, cast(TypeExpr, tx).b)
+		buf_str(e, cast(i64, cast(TypeExpr, tx).b))
 		buf_str(e, cstr(": it takes "))
-		buf_int(e, d.tparams[VEC_LEN])
-		err_end(e)
-		return 0
+		buf_int(e, cast(Vec[i64], d.tparams).len)
+		err_end(cast(Buf, e))
+		return cast(Vec[i64], 0)
 	}
 	let before = error_count
-	let targs = resolve_types(cast(TypeExpr, tx).args)
+	let targs = resolve_types(cast(Vec[i64], cast(TypeExpr, tx).args))
 	if error_count != before {
 		// A type argument that did not resolve was reported; bindings built from the
 		// fallback types would only add misleading errors.
-		return 0
+		return cast(Vec[i64], 0)
 	}
 	let before_cons = error_count
-	check_constraints(cast(Node, tx).pos, d.tparams, d.tcons, targs, d.file)
+	check_constraints(cast(Node, tx).pos, cast(Vec[i64], d.tparams), cast(Vec[i64], d.tcons), targs, d.file)
 	if error_count != before_cons {
 		// The arguments were reported; a pair built from them would only cause the same
 		// error again at use.
-		return 0
+		return cast(Vec[i64], 0)
 	}
-	return pair(cast(i64, d), tbind_pairs(d.tparams, targs))
+	return cast(Vec[i64], pair(cast(i64, d), tbind_pairs(cast(Vec[i64], d.tparams), targs)))
 }
 
 // shape_inst_decl is shape_inst for declaration validation: it checks the name and the
 // arity but not the type arguments' constraints, which a symbolic parameter cannot meet.
 fn shape_inst_decl(tx i64) i64 {
-	let d = cast(Decl, shape_ref_name(cast(TypeExpr, tx)))
+	let d = shape_ref_name(cast(TypeExpr, tx))
 	if cast(i64, d) == 0 {
 		return 0
 	}
 	if d.tparams == 0 {
-		if cast(TypeExpr, tx).args != 0 {
-			err_code_quoted(cast(Node, tx).pos, cstr("E501 NOT_GENERIC"), cstr("shape "), cast(TypeExpr, tx).b, cstr(" takes no type arguments"))
+		if cast(i64, cast(TypeExpr, tx).args) != 0 {
+			err_code_quoted(cast(Node, tx).pos, cstr("E501 NOT_GENERIC"), cstr("shape "), cast(i64, cast(TypeExpr, tx).b), cstr(" takes no type arguments"))
 			return 0
 		}
 		return pair(cast(i64, d), 0)
 	}
-	if cast(TypeExpr, tx).args == 0 {
+	if cast(i64, cast(TypeExpr, tx).args) == 0 {
 		let e = err_code(cast(Node, tx).pos, cstr("E502 TYPE_ARG_COUNT"))
 		buf_str(e, cstr("shape "))
-		buf_str(e, cast(TypeExpr, tx).b)
+		buf_str(e, cast(i64, cast(TypeExpr, tx).b))
 		buf_str(e, cstr(" needs type arguments, like "))
-		buf_str(e, cast(TypeExpr, tx).b)
+		buf_str(e, cast(i64, cast(TypeExpr, tx).b))
 		buf_str(e, cstr("[...]"))
-		err_end(e)
+		err_end(cast(Buf, e))
 		return 0
 	}
-	if cast(TypeExpr, tx).args[VEC_LEN] != d.tparams[VEC_LEN] {
+	if cast(Vec[i64], cast(TypeExpr, tx).args).len != cast(Vec[i64], d.tparams).len {
 		let e = err_code(cast(Node, tx).pos, cstr("E502 TYPE_ARG_COUNT"))
 		buf_str(e, cstr("wrong number of type arguments for shape "))
-		buf_str(e, cast(TypeExpr, tx).b)
+		buf_str(e, cast(i64, cast(TypeExpr, tx).b))
 		buf_str(e, cstr(": it takes "))
-		buf_int(e, d.tparams[VEC_LEN])
-		err_end(e)
+		buf_int(e, cast(Vec[i64], d.tparams).len)
+		err_end(cast(Buf, e))
 		return 0
 	}
 	return pair(cast(i64, d), 0)
@@ -842,19 +842,19 @@ fn shape_inst_decl(tx i64) i64 {
 // instance's own argument constraints impossible to check at declaration. A concrete
 // argument (`shape G[T constraints.Any] { A[f64] }`) and a parameter already bound to a real type
 // (`shape C[V constraints.Any] { A[V] }` used with `C[f64]`) are checked.
-fn shape_member_symbolic(m TypeExpr, sd Decl, bind_ i64) i64 {
-	if m.args == 0 || bind_ == 0 {
+fn shape_member_symbolic(m TypeExpr, sd Decl, bind_ Vec[i64]) i64 {
+	if cast(i64, m.args) == 0 || cast(i64, bind_) == 0 {
 		return 0
 	}
 	mut i = 0
-	for i < m.args[VEC_LEN] {
-		let arg = vec_get(m.args, i)
+	for i < cast(Vec[i64], m.args).len {
+		let arg = vec_get(cast(Vec[i64], m.args), i)
 		mut j = 0
-		for j < sd.tparams[VEC_LEN] {
-			let name = vec_get(sd.tparams, j)
-			let one = vec_new()
+		for j < cast(Vec[i64], sd.tparams).len {
+			let name = vec_get(cast(Vec[i64], sd.tparams), j)
+			let one = vec_new[i64]()
 			vec_push(one, name)
-			if shape_tx_mentions(arg, one) != 0 {
+			if shape_tx_mentions(arg, cast(Vec[i64], one)) != 0 {
 				let value = shape_bind_value(bind_, name)
 				if value != 0 && shape_on_path(shape_placeholders, value) != 0 {
 					return 1
@@ -867,10 +867,10 @@ fn shape_member_symbolic(m TypeExpr, sd Decl, bind_ i64) i64 {
 	return 0
 }
 
-fn shape_bind_value(bind_ i64, name i64) i64 {
+fn shape_bind_value(bind_ Vec[i64], name i64) i64 {
 	mut i = 0
-	for i < bind_[VEC_LEN] {
-		let p = vec_get(bind_, i)
+	for i < bind_.len {
+		let p = cast(Vec[i64], vec_get(bind_, i))
 		if streq(vec_get(p, 0), name) != 0 {
 			return vec_get(p, 1)
 		}
@@ -879,22 +879,22 @@ fn shape_bind_value(bind_ i64, name i64) i64 {
 	return 0
 }
 
-fn shape_tx_mentions(tx i64, names i64) i64 {
+fn shape_tx_mentions(tx i64, names Vec[i64]) i64 {
 	if tx == 0 {
 		return 0
 	}
 	let k = cast(Node, tx).kind
 	if k == TX_NAME {
 		mut i = 0
-		for i < names[VEC_LEN] {
-			if cast(TypeExpr, tx).a == 0 && streq(cast(TypeExpr, tx).b, vec_get(names, i)) != 0 {
+		for i < names.len {
+			if cast(i64, cast(TypeExpr, tx).a) == 0 && streq(cast(i64, cast(TypeExpr, tx).b), vec_get(names, i)) != 0 {
 				return 1
 			}
 			i = i + 1
 		}
 		mut j = 0
-		for cast(TypeExpr, tx).args != 0 && j < cast(TypeExpr, tx).args[VEC_LEN] {
-			if shape_tx_mentions(vec_get(cast(TypeExpr, tx).args, j), names) != 0 {
+		for cast(i64, cast(TypeExpr, tx).args) != 0 && j < cast(Vec[i64], cast(TypeExpr, tx).args).len {
+			if shape_tx_mentions(vec_get(cast(Vec[i64], cast(TypeExpr, tx).args), j), names) != 0 {
 				return 1
 			}
 			j = j + 1
@@ -905,19 +905,19 @@ fn shape_tx_mentions(tx i64, names i64) i64 {
 		return shape_tx_mentions(tx[TX_A + i64((k == TX_ARRAY))], names)
 	}
 	if k == TX_MAP {
-		return i64(shape_tx_mentions(cast(TypeExpr, tx).a, names) != 0 || shape_tx_mentions(cast(TypeExpr, tx).b, names) != 0)
+		return i64(shape_tx_mentions(cast(i64, cast(TypeExpr, tx).a), names) != 0 || shape_tx_mentions(cast(i64, cast(TypeExpr, tx).b), names) != 0)
 	}
 	if k == TX_OPT || k == TX_PTR || k == TX_CHAN {
-		return shape_tx_mentions(cast(TypeExpr, tx).a, names)
+		return shape_tx_mentions(cast(i64, cast(TypeExpr, tx).a), names)
 	}
 	if k == TX_FUNC {
-		return i64(shape_tx_list_mentions(cast(TypeExpr, tx).a, names) != 0 || shape_tx_list_mentions(cast(TypeExpr, tx).b, names) != 0)
+		return i64(shape_tx_list_mentions(cast(Vec[i64], cast(TypeExpr, tx).a), cast(Vec[i64], names)) != 0 || shape_tx_list_mentions(cast(Vec[i64], cast(TypeExpr, tx).b), cast(Vec[i64], names)) != 0)
 	}
 	if k == TX_STRUCT {
 		let fields = cast(TypeExpr, tx).a
 		mut i = 0
-		for fields != 0 && i < fields[VEC_LEN] {
-			if shape_tx_mentions(vec_get(vec_get(fields, i), 1), names) != 0 {
+		for cast(i64, fields) != 0 && i < cast(Vec[i64], fields).len {
+			if shape_tx_mentions(vec_get(cast(Vec[i64], vec_get(cast(Vec[i64], fields), i)), 1), names) != 0 {
 				return 1
 			}
 			i = i + 1
@@ -927,9 +927,9 @@ fn shape_tx_mentions(tx i64, names i64) i64 {
 	return 0
 }
 
-fn shape_tx_list_mentions(list i64, names i64) i64 {
+fn shape_tx_list_mentions(list Vec[i64], names Vec[i64]) i64 {
 	mut i = 0
-	for list != 0 && i < list[VEC_LEN] {
+	for cast(i64, list) != 0 && i < list.len {
 		if shape_tx_mentions(vec_get(list, i), names) != 0 {
 			return 1
 		}
@@ -945,17 +945,17 @@ fn shape_tx_list_mentions(list i64, names i64) i64 {
 // only; nothing is named after them. A struct keeps `?T` well formed, as T must be a
 // reference for that to be legal at an instantiation.
 fn shape_sym_bind(d Decl) i64 {
-	let bind_ = vec_new()
+	let bind_ = vec_new[i64]()
 	mut i = 0
-	for i < d.tparams[VEC_LEN] {
-		let ph = cast(Ty, ty_new(K_STRUCT, vec_get(d.tparams, i)))
+	for i < cast(Vec[i64], d.tparams).len {
+		let ph = cast(Ty, ty_new(K_STRUCT, vec_get(cast(Vec[i64], d.tparams), i)))
 		// A struct with no fields, not a null one: key_valid walks a map key's fields.
-		ph.fields = vec_new()
+		ph.fields = cast(i64, vec_new[i64]())
 		vec_push(shape_placeholders, cast(i64, ph))
-		vec_push(bind_, pair(vec_get(d.tparams, i), cast(i64, ph)))
+		vec_push(bind_, pair(vec_get(cast(Vec[i64], d.tparams), i), cast(i64, ph)))
 		i = i + 1
 	}
-	return bind_
+	return cast(i64, bind_)
 }
 
 // shape_inst_soft resolves a listed instance for declaration validation: it checks the
@@ -963,52 +963,52 @@ fn shape_sym_bind(d Decl) i64 {
 // a symbolic parameter cannot satisfy a union or a shape. The constraints are checked
 // again at every real instantiation.
 fn shape_inst_soft(tx i64) i64 {
-	let d = cast(Decl, shape_ref_name(cast(TypeExpr, tx)))
+	let d = shape_ref_name(cast(TypeExpr, tx))
 	if cast(i64, d) == 0 {
 		return 0
 	}
 	if d.tparams == 0 {
-		if cast(TypeExpr, tx).args != 0 {
-			err_code_quoted(cast(Node, tx).pos, cstr("E501 NOT_GENERIC"), cstr("shape "), cast(TypeExpr, tx).b, cstr(" takes no type arguments"))
+		if cast(i64, cast(TypeExpr, tx).args) != 0 {
+			err_code_quoted(cast(Node, tx).pos, cstr("E501 NOT_GENERIC"), cstr("shape "), cast(i64, cast(TypeExpr, tx).b), cstr(" takes no type arguments"))
 			return 0
 		}
 		return pair(cast(i64, d), 0)
 	}
-	if cast(TypeExpr, tx).args == 0 {
+	if cast(i64, cast(TypeExpr, tx).args) == 0 {
 		let e = err_code(cast(Node, tx).pos, cstr("E502 TYPE_ARG_COUNT"))
 		buf_str(e, cstr("shape "))
-		buf_str(e, cast(TypeExpr, tx).b)
+		buf_str(e, cast(i64, cast(TypeExpr, tx).b))
 		buf_str(e, cstr(" needs type arguments, like "))
-		buf_str(e, cast(TypeExpr, tx).b)
+		buf_str(e, cast(i64, cast(TypeExpr, tx).b))
 		buf_str(e, cstr("[...]"))
-		err_end(e)
+		err_end(cast(Buf, e))
 		return 0
 	}
-	if cast(TypeExpr, tx).args[VEC_LEN] != d.tparams[VEC_LEN] {
+	if cast(Vec[i64], cast(TypeExpr, tx).args).len != cast(Vec[i64], d.tparams).len {
 		let e = err_code(cast(Node, tx).pos, cstr("E502 TYPE_ARG_COUNT"))
 		buf_str(e, cstr("wrong number of type arguments for shape "))
-		buf_str(e, cast(TypeExpr, tx).b)
+		buf_str(e, cast(i64, cast(TypeExpr, tx).b))
 		buf_str(e, cstr(": it takes "))
-		buf_int(e, d.tparams[VEC_LEN])
-		err_end(e)
+		buf_int(e, cast(Vec[i64], d.tparams).len)
+		err_end(cast(Buf, e))
 		return 0
 	}
 	let before = error_count
-	let targs = resolve_types(cast(TypeExpr, tx).args)
+	let targs = resolve_types(cast(Vec[i64], cast(TypeExpr, tx).args))
 	if error_count != before {
 		return 0
 	}
-	return pair(cast(i64, d), tbind_pairs(d.tparams, targs))
+	return pair(cast(i64, d), tbind_pairs(cast(Vec[i64], d.tparams), targs))
 }
 
 // shape_collect_visited reports whether (shape, bindings) has been collected in the
 // current flattening, so a diamond is walked once and a generic instance is not confused
 // with another instance of the same shape.
-fn shape_collect_visited(sd i64, bind_ i64) i64 {
+fn shape_collect_visited(sd i64, bind_ Vec[i64]) i64 {
 	mut i = 0
-	for i < shape_collecting[VEC_LEN] {
-		let p = vec_get(shape_collecting, i)
-		if vec_get(p, 0) == sd && shape_bind_same(vec_get(p, 1), bind_) != 0 {
+	for i < shape_collecting.len {
+		let p = cast(Vec[i64], vec_get(shape_collecting, i))
+		if vec_get(p, 0) == sd && shape_bind_same(cast(Vec[i64], vec_get(p, 1)), bind_) != 0 {
 			return 1
 		}
 		i = i + 1
@@ -1016,16 +1016,16 @@ fn shape_collect_visited(sd i64, bind_ i64) i64 {
 	return 0
 }
 
-fn shape_bind_same(a i64, b i64) i64 {
-	if a == 0 || b == 0 {
+fn shape_bind_same(a Vec[i64], b Vec[i64]) i64 {
+	if cast(i64, a) == 0 || cast(i64, b) == 0 {
 		return i64(a == b)
 	}
-	if a[VEC_LEN] != b[VEC_LEN] {
+	if a.len != b.len {
 		return 0
 	}
 	mut i = 0
-	for i < a[VEC_LEN] {
-		if vec_get(vec_get(a, i), 1) != vec_get(vec_get(b, i), 1) {
+	for i < a.len {
+		if vec_get(cast(Vec[i64], vec_get(a, i)), 1) != vec_get(cast(Vec[i64], vec_get(b, i)), 1) {
 			return 0
 		}
 		i = i + 1
@@ -1038,40 +1038,40 @@ fn shape_bind_same(a i64, b i64) i64 {
 // give different signatures, or that one shape declares twice. Identical methods from
 // different listed shapes are allowed, as in Go. It returns how many errors it attributed
 // to the owner, so the caller can mark the owner bad without claiming a listed shape's.
-fn check_shape_conflicts(d i64, bind_ i64) i64 {
-	shape_collecting = vec_new()
+fn check_shape_conflicts(d i64, bind_ Vec[i64]) i64 {
+	shape_collecting = vec_new[i64]()
 	shape_conflicts = 0
-	shape_collect(cast(Decl, d), bind_, vec_new(), cast(Decl, d), vec_new())
+	shape_collect(cast(Decl, d), bind_, vec_new[i64](), cast(Decl, d), vec_new[i64]())
 	return shape_conflicts
 }
 
-fn shape_collect(sd Decl, bind_ i64, methods i64, owner Decl, own i64) {
+fn shape_collect(sd Decl, bind_ Vec[i64], methods Vec[i64], owner Decl, own Vec[i64]) {
 	if shape_on_path(shape_cycles, cast(i64, sd)) != 0 || shape_collect_visited(cast(i64, sd), bind_) != 0 || shape_on_path(shape_bad, cast(i64, sd)) != 0 {
 		return
 	}
-	vec_push(shape_collecting, pair(cast(i64, sd), bind_))
+	vec_push(shape_collecting, pair(cast(i64, sd), cast(i64, bind_)))
 	let saved = ck_state_save()
 	set_file(sd.file)
-	ck_tbind = bind_
+	ck_tbind = cast(Vec[i64], bind_)
 	mut i = 0
-	for i < sd.union[VEC_LEN] {
-		let m = cast(TypeExpr, vec_get(sd.union, i))
-		let base = cast(Decl, shape_ref_name(m))
+	for i < cast(Vec[i64], sd.union).len {
+		let m = cast(TypeExpr, vec_get(cast(Vec[i64], sd.union), i))
+		let base = shape_ref_name(cast(TypeExpr, m))
 		// A member that check_shape_decl already rejected (a bare generic shape, a
 		// non-generic one with arguments, a bad shape) is skipped so its error is not
 		// reported once per listing.
-		if cast(i64, base) != 0 && shape_on_path(shape_bad, cast(i64, base)) == 0 && ((base.tparams != 0 && m.args != 0) || (base.tparams == 0 && m.args == 0)) {
+		if cast(i64, base) != 0 && shape_on_path(shape_bad, cast(i64, base)) == 0 && ((base.tparams != 0 && cast(i64, m.args) != 0) || (base.tparams == 0 && cast(i64, m.args) == 0)) {
 			// Under symbolic arguments the constraints cannot be checked here; with real
 			// arguments (even inside a generic body) they can, and an error is sd's.
 			let before_inst = error_count
-			mut inst = 0
-			if shape_member_symbolic(m, sd, bind_) != 0 {
-				inst = shape_inst_soft(cast(i64, m))
+			mut inst = cast(Vec[i64], 0)
+			if shape_member_symbolic(cast(TypeExpr, m), sd, bind_) != 0 {
+				inst = cast(Vec[i64], shape_inst_soft(cast(i64, m)))
 			} else {
 				inst = shape_inst(cast(i64, m))
 			}
-			if inst != 0 {
-				shape_collect(cast(Decl, vec_get(inst, 0)), vec_get(inst, 1), methods, owner, vec_new())
+			if cast(i64, inst) != 0 {
+				shape_collect(cast(Decl, vec_get(inst, 0)), cast(Vec[i64], vec_get(inst, 1)), methods, owner, vec_new[i64]())
 			} else if error_count != before_inst && shape_on_path(shape_bad, cast(i64, sd)) == 0 {
 				vec_push(shape_bad, cast(i64, sd))
 			}
@@ -1079,23 +1079,23 @@ fn shape_collect(sd Decl, bind_ i64, methods i64, owner Decl, own i64) {
 		i = i + 1
 	}
 	i = 0
-	for i < sd.shape_[VEC_LEN] {
-		let f = cast(Fn, vec_get(sd.shape_, i))
+	for i < cast(Vec[i64], sd.shape_).len {
+		let f = cast(Fn, vec_get(cast(Vec[i64], sd.shape_), i))
 		let before = error_count
-		let sig = shape_sig_of(f, 0, bind_)
+		let sig = shape_sig_of(cast(Fn, f), 0, cast(Vec[i64], bind_))
 		if error_count != before {
 			// The failing signature is sd's, not the owner's that listed it.
 			if shape_on_path(shape_bad, cast(i64, sd)) == 0 {
 				vec_push(shape_bad, cast(i64, sd))
 			}
-			ck_state_restore(saved)
+			ck_state_restore(cast(Vec[Fn], saved))
 			return
 		}
 		if sd == owner {
 			// The same shape declaring one name twice is an error even when the two
 			// signatures are identical (a listed shape may repeat a method).
 			mut k = 0
-			for k < own[VEC_LEN] {
+			for k < own.len {
 				if streq(vec_get(own, k), f.name) != 0 {
 					let e0 = err_code(f.pos, cstr("E524 SHAPE_METHOD_TWICE"))
 					buf_str(e0, cstr("shape "))
@@ -1103,7 +1103,7 @@ fn shape_collect(sd Decl, bind_ i64, methods i64, owner Decl, own i64) {
 					buf_str(e0, cstr(" declares "))
 					buf_str(e0, f.name)
 					buf_str(e0, cstr(" twice"))
-					err_end(e0)
+					err_end(cast(Buf, e0))
 					shape_conflicts = shape_conflicts + 1
 				}
 				k = k + 1
@@ -1111,58 +1111,58 @@ fn shape_collect(sd Decl, bind_ i64, methods i64, owner Decl, own i64) {
 			vec_push(own, f.name)
 		}
 		mut j = 0
-		for j < methods[VEC_LEN] {
-			let prev = vec_get(methods, j)
-			if streq(vec_get(prev, 0), f.name) != 0 && shape_sig_same(vec_get(prev, 1), sig) == 0 {
+		for j < methods.len {
+			let prev = cast(Vec[i64], vec_get(methods, j))
+			if streq(vec_get(prev, 0), f.name) != 0 && shape_sig_same(cast(Vec[i64], vec_get(prev, 1)), sig) == 0 {
 				let e = err_code(f.pos, cstr("E525 SHAPE_METHOD_CONFLICT"))
 				buf_str(e, cstr("shape "))
 				buf_str(e, owner.name)
 				buf_str(e, cstr(" has two methods named "))
 				buf_str(e, f.name)
 				buf_str(e, cstr(" with different signatures (one from a listed shape)"))
-				err_end(e)
+				err_end(cast(Buf, e))
 				shape_conflicts = shape_conflicts + 1
 			}
 			j = j + 1
 		}
-		let rec = vec_new()
+		let rec = vec_new[i64]()
 		vec_push(rec, f.name)
-		vec_push(rec, sig)
+		vec_push(rec, cast(i64, sig))
 		vec_push(rec, cast(i64, f))
-		vec_push(rec, bind_)
+		vec_push(rec, cast(i64, bind_))
 		vec_push(rec, cast(i64, sd))
-		vec_push(methods, rec)
+		vec_push(methods, cast(i64, rec))
 		i = i + 1
 	}
-	ck_state_restore(saved)
+	ck_state_restore(cast(Vec[Fn], saved))
 }
 
 // dyn_table_add records the concrete methods behind one dyn shape. Its order is the
 // flattened shape order with repeated identical methods emitted once.
 fn dyn_table_add(t Ty, dt Ty, pos i64) i64 {
 	mut i = 0
-	for i < dyn_tables[VEC_LEN] {
-		let old = vec_get(dyn_tables, i)
+	for i < dyn_tables.len {
+		let old = cast(Vec[i64], vec_get(dyn_tables, i))
 		if cast(Ty, vec_get(old, 0)) == t && cast(Ty, vec_get(old, 1)) == dt {
 			return i
 		}
 		i = i + 1
 	}
 	let sd = dt.gdecl
-	let bind_ = dt.targs
-	let flat = vec_new()
-	shape_collecting = vec_new()
-	shape_collect(cast(Decl, sd), bind_, flat, cast(Decl, sd), vec_new())
-	let names = vec_new()
-	let fns = vec_new()
+	let bind_ = cast(Vec[i64], dt.targs)
+	let flat = vec_new[i64]()
+	shape_collecting = vec_new[i64]()
+	shape_collect(cast(Decl, sd), bind_, cast(Vec[i64], flat), cast(Decl, sd), vec_new[i64]())
+	let names = vec_new[i64]()
+	let fns = vec_new[i64]()
 	i = 0
-	for i < flat[VEC_LEN] {
-		let item = vec_get(flat, i)
+	for i < cast(Vec[i64], flat).len {
+		let item = cast(Vec[i64], vec_get(flat, i))
 		let name = vec_get(item, 0)
-		if vec_has_str(names, name) == 0 {
+		if vec_has_str(cast(Vec[i64], names), name) == 0 {
 			mut f = shape_method(t, name)
 			if f != 0 && is_template(cast(Fn, f)) != 0 {
-				f = instantiate_fn(cast(Fn, f), t.targs, pos)
+				f = cast(i64, instantiate_fn(cast(Fn, f), cast(Vec[Ty], cast(Vec[i64], t.targs)), pos))
 			}
 			if f != 0 {
 				vec_push(names, name)
@@ -1171,32 +1171,32 @@ fn dyn_table_add(t Ty, dt Ty, pos i64) i64 {
 		}
 		i = i + 1
 	}
-	let rec = vec_new()
+	let rec = vec_new[i64]()
 	vec_push(rec, cast(i64, t))
 	vec_push(rec, cast(i64, dt))
-	vec_push(rec, keep_fn(t))
-	vec_push(rec, fns)
+	vec_push(rec, cast(i64, keep_fn(t)))
+	vec_push(rec, cast(i64, fns))
 	vec_push(rec, -1)
-	vec_push(dyn_tables, rec)
-	return dyn_tables[VEC_LEN] - 1
+	vec_push(dyn_tables, cast(i64, rec))
+	return dyn_tables.len - 1
 }
 
 // dyn_shape_method returns [table method index, flattened signature] for a method on a
 // dyn shape. Slot zero is reserved for keep, so method indices start at one.
 fn dyn_shape_method(dt Ty, name i64) i64 {
 	let sd = dt.gdecl
-	let bind_ = dt.targs
-	let flat = vec_new()
-	shape_collecting = vec_new()
-	shape_collect(cast(Decl, sd), bind_, flat, cast(Decl, sd), vec_new())
-	let names = vec_new()
+	let bind_ = cast(Vec[i64], dt.targs)
+	let flat = vec_new[i64]()
+	shape_collecting = vec_new[i64]()
+	shape_collect(cast(Decl, sd), bind_, cast(Vec[i64], flat), cast(Decl, sd), vec_new[i64]())
+	let names = vec_new[i64]()
 	mut i = 0
-	for i < flat[VEC_LEN] {
-		let item = vec_get(flat, i)
+	for i < cast(Vec[i64], flat).len {
+		let item = cast(Vec[i64], vec_get(flat, i))
 		let method = vec_get(item, 0)
-		if vec_has_str(names, method) == 0 {
+		if vec_has_str(cast(Vec[i64], names), method) == 0 {
 			if streq(method, name) != 0 {
-				return pair(names[VEC_LEN] + 1, vec_get(item, 1))
+				return pair(cast(Vec[i64], names).len + 1, vec_get(item, 1))
 			}
 			vec_push(names, method)
 		}
@@ -1206,14 +1206,14 @@ fn dyn_shape_method(dt Ty, name i64) i64 {
 }
 
 fn dyn_table_mark(i i64) {
-	if i < 0 || i >= dyn_tables[VEC_LEN] {
+	if i < 0 || i >= dyn_tables.len {
 		return
 	}
-	let rec = vec_get(dyn_tables, i)
+	let rec = cast(Vec[i64], vec_get(dyn_tables, i))
 	mark_reach(cast(Fn, vec_get(rec, 2)))
-	let fns = vec_get(rec, 3)
+	let fns = cast(Vec[i64], vec_get(rec, 3))
 	mut j = 0
-	for j < fns[VEC_LEN] {
+	for j < fns.len {
 		mark_reach(cast(Fn, vec_get(fns, j)))
 		j = j + 1
 	}
@@ -1227,7 +1227,7 @@ fn dyn_table_mark(i i64) {
 // remembered, so a shared sub-shape is walked once and diamonds do not cost 2^depth.
 // A generic shape's body is validated with its parameters bound to fresh types, so a
 // listed instance may mention them (`shape B[U] { A[U] }`) and its own cycle is caught.
-fn check_shape_decl(d Decl, path i64) {
+fn check_shape_decl(d Decl, path Vec[i64]) {
 	if shape_on_path(shape_validated, cast(i64, d)) != 0 {
 		return
 	}
@@ -1238,15 +1238,15 @@ fn check_shape_decl(d Decl, path i64) {
 	// that shape's, and marking d too would skip its own signature checks in
 	// shapes_declared (and lose them).
 	mut mine = 0
-	mut bind_ = 0
+	mut bind_ = cast(Vec[i64], 0)
 	if d.tparams != 0 {
-		bind_ = shape_sym_bind(d)
+		bind_ = cast(Vec[i64], shape_sym_bind(d))
 	}
 	if d.unionkind != 0 {
 		mut i = 0
-		for i < d.union[VEC_LEN] {
-			let m = cast(Node, vec_get(d.union, i))
-			if shape_ref_name(cast(TypeExpr, m)) != 0 {
+		for i < cast(Vec[i64], d.union).len {
+			let m = cast(Node, vec_get(cast(Vec[i64], d.union), i))
+			if cast(i64, shape_ref_name(cast(TypeExpr, m))) != 0 {
 				err_code_quoted(m.pos, cstr("E521 SHAPE_IN_UNION"), cstr("a named union lists concrete types, but "), shape_member_name(cast(i64, m)), cstr(" is a shape: list shapes in a shape body instead"))
 				mine = 1
 			}
@@ -1254,11 +1254,11 @@ fn check_shape_decl(d Decl, path i64) {
 		}
 	} else {
 		vec_push(path, cast(i64, d))
-		ck_tbind = bind_
+		ck_tbind = cast(Vec[i64], bind_)
 		mut i = 0
-		for i < d.union[VEC_LEN] {
-			let m = cast(Node, vec_get(d.union, i))
-			let sub = cast(Decl, shape_ref_name(cast(TypeExpr, m)))
+		for i < cast(Vec[i64], d.union).len {
+			let m = cast(Node, vec_get(cast(Vec[i64], d.union), i))
+			let sub = shape_ref_name(cast(TypeExpr, m))
 			if cast(i64, sub) == 0 {
 				let nm = shape_member_name(cast(i64, m))
 				if nm != 0 {
@@ -1268,7 +1268,7 @@ fn check_shape_decl(d Decl, path i64) {
 					buf_str(e, cstr(" lists "))
 					buf_str(e, nm)
 					buf_str(e, cstr(", which is not a shape"))
-					err_end(e)
+					err_end(cast(Buf, e))
 				} else {
 					err_code_at(m.pos, cstr("E522 NOT_A_SHAPE"), cstr("a shape lists another shape by name"))
 				}
@@ -1288,21 +1288,21 @@ fn check_shape_decl(d Decl, path i64) {
 			}
 			i = i + 1
 		}
-		ck_tbind = saved[3]
-		path[VEC_LEN] = path[VEC_LEN] - 1
+		ck_tbind = cast(Vec[i64], cast(i64, saved)[3])
+		path.len = path.len - 1
 	}
 	if mine != 0 && shape_on_path(shape_bad, cast(i64, d)) == 0 {
 		vec_push(shape_bad, cast(i64, d))
 	}
-	ck_state_restore(saved)
+	ck_state_restore(cast(Vec[Fn], saved))
 }
 
 // shape_mark_cycle remembers the shapes from sub to the current top of path, the cycle
 // itself, so no later walk reports them again.
-fn shape_mark_cycle(path i64, sub i64) {
+fn shape_mark_cycle(path Vec[i64], sub i64) {
 	mut j = 0
 	mut marking = 0
-	for j < path[VEC_LEN] {
+	for j < path.len {
 		let on_ = vec_get(path, j)
 		if on_ == sub {
 			marking = 1
@@ -1320,12 +1320,12 @@ fn shape_member_name(m i64) i64 {
 	if cast(Node, m).kind != TX_NAME {
 		return 0
 	}
-	return cast(TypeExpr, m).b
+	return cast(i64, cast(TypeExpr, m).b)
 }
 
-fn shape_on_path(path i64, d i64) i64 {
+fn shape_on_path(path Vec[i64], d i64) i64 {
 	mut i = 0
-	for i < path[VEC_LEN] {
+	for i < path.len {
 		if vec_get(path, i) == d {
 			return 1
 		}
@@ -1338,11 +1338,11 @@ fn shape_on_path(path i64, d i64) i64 {
 // The key matters: resolving a union member can check the same shape against a nested
 // type while the outer check is in flight, and the outer type must not be suppressed by
 // it; two instantiations of one shape are different keys.
-fn shape_seen(v i64, sd i64, t i64, bind_ i64) i64 {
+fn shape_seen(v Vec[i64], sd i64, t i64, bind_ Vec[i64]) i64 {
 	mut i = 0
-	for i < v[VEC_LEN] {
-		let p = vec_get(v, i)
-		if vec_get(p, 0) == sd && vec_get(p, 1) == t && shape_bind_same(vec_get(p, 2), bind_) != 0 {
+	for i < v.len {
+		let p = cast(Vec[i64], vec_get(v, i))
+		if vec_get(p, 0) == sd && vec_get(p, 1) == t && shape_bind_same(cast(Vec[i64], vec_get(p, 2)), bind_) != 0 {
 			return 1
 		}
 		i = i + 1
@@ -1352,10 +1352,10 @@ fn shape_seen(v i64, sd i64, t i64, bind_ i64) i64 {
 
 // shape_seen_type reports whether the (shape, type) part of a key is on the path, under
 // any bindings.
-fn shape_seen_type(v i64, sd i64, t i64) i64 {
+fn shape_seen_type(v Vec[i64], sd i64, t i64) i64 {
 	mut i = 0
-	for i < v[VEC_LEN] {
-		let p = vec_get(v, i)
+	for i < v.len {
+		let p = cast(Vec[i64], vec_get(v, i))
 		if vec_get(p, 0) == sd && vec_get(p, 1) == t {
 			return 1
 		}
@@ -1382,10 +1382,10 @@ fn shape_method(t Ty, name i64) i64 {
 	}
 	let d = cast(Decl, t.gdecl)
 	if cast(i64, d) != 0 {
-		sm_bind = tbind_pairs(d.tparams, t.targs)
+		sm_bind = tbind_pairs(cast(Vec[i64], d.tparams), cast(Vec[i64], t.targs))
 		mut i = 0
-		for i < d.methods[VEC_LEN] {
-			let f = cast(Fn, vec_get(d.methods, i))
+		for i < cast(Vec[i64], d.methods).len {
+			let f = cast(Fn, vec_get(cast(Vec[i64], d.methods), i))
 			if streq(f.name, name) != 0 {
 				return cast(i64, f)
 			}
@@ -1393,7 +1393,7 @@ fn shape_method(t Ty, name i64) i64 {
 		}
 		return 0
 	}
-	let f = cast(Fn, find_fn(str_cat3(t.name, cstr("."), name)))
+	let f = find_fn(str_cat3(t.name, cstr("."), name))
 	if cast(i64, f) != 0 {
 		sm_declared = 1
 		return cast(i64, f)
@@ -1407,13 +1407,13 @@ fn shape_method(t Ty, name i64) i64 {
 // have no bindings here (shape_method finds those through their declaration).
 fn find_method_by_recv(t i64, name i64) i64 {
 	mut i = 0
-	for i < prog_fns[VEC_LEN] {
-		let f = cast(Fn, vec_get(prog_fns, i))
+	for i < prog_fns.len {
+		let f = vec_get(prog_fns, i)
 		if f.recv != 0 && f.tbind == 0 && f.tparams == 0 && f.name != 0 && streq(f.name, name) != 0 {
 			let saved = ck_state_save()
 			set_file(f.file)
 			let rt = resolve_type(f.recv)
-			ck_state_restore(saved)
+			ck_state_restore(cast(Vec[Fn], saved))
 			if rt == t {
 				return cast(i64, f)
 			}
@@ -1425,12 +1425,12 @@ fn find_method_by_recv(t i64, name i64) i64 {
 
 // shape_sig_type resolves one signature type expression; a declared function's types
 // are already resolved and are used as they are.
-fn shape_sig_type(x Node, bind_ i64) i64 {
+fn shape_sig_type(x Node, bind_ Vec[i64]) i64 {
 	if x.kind < 40 {
 		return cast(i64, x)
 	}
 	let saved = ck_tbind
-	ck_tbind = bind_
+	ck_tbind = cast(Vec[i64], bind_)
 	let t = resolve_type(cast(i64, x))
 	ck_tbind = saved
 	return t
@@ -1440,59 +1440,59 @@ fn shape_sig_type(x Node, bind_ i64) i64 {
 // mut result, fault] for a method. A declared method's parameter zero is its receiver,
 // which a shape's signature does not carry, so it is skipped; receiver mutability is
 // not part of satisfaction, only the call site's `mut` mark is.
-fn shape_sig_of(f Fn, declared i64, bind_ i64) i64 {
-	let ns = vec_new()
-	let ps = vec_new()
-	let ms = vec_new()
+fn shape_sig_of(f Fn, declared i64, bind_ Vec[i64]) Vec[i64] {
+	let ns = vec_new[i64]()
+	let ps = vec_new[i64]()
+	let ms = vec_new[i64]()
 	mut i = 0
 	if declared != 0 {
 		i = 1
 	}
-	for i < f.ptypes[VEC_LEN] {
-		vec_push(ns, vec_get(f.params, i))
-		vec_push(ps, shape_sig_type(cast(Node, vec_get(f.ptypes, i)), bind_))
-		vec_push(ms, vec_get(f.muts, i))
+	for i < cast(Vec[i64], f.ptypes).len {
+		vec_push(ns, vec_get(cast(Vec[i64], f.params), i))
+		vec_push(ps, shape_sig_type(cast(Node, vec_get(cast(Vec[i64], f.ptypes), i)), bind_))
+		vec_push(ms, vec_get(cast(Vec[i64], f.muts), i))
 		i = i + 1
 	}
-	let rs = vec_new()
+	let rs = vec_new[i64]()
 	i = 0
-	for i < f.rtypes[VEC_LEN] {
-		vec_push(rs, shape_sig_type(cast(Node, vec_get(f.rtypes, i)), bind_))
+	for i < cast(Vec[i64], f.rtypes).len {
+		vec_push(rs, shape_sig_type(cast(Node, vec_get(cast(Vec[i64], f.rtypes), i)), bind_))
 		i = i + 1
 	}
-	let sig = vec_new()
-	vec_push(sig, ns)
-	vec_push(sig, ps)
-	vec_push(sig, ms)
-	vec_push(sig, rs)
+	let sig = vec_new[i64]()
+	vec_push(sig, cast(i64, ns))
+	vec_push(sig, cast(i64, ps))
+	vec_push(sig, cast(i64, ms))
+	vec_push(sig, cast(i64, rs))
 	vec_push(sig, f.variadic)
 	vec_push(sig, f.mutres)
 	vec_push(sig, f.bang)
-	return sig
+	return cast(Vec[i64], sig)
 }
 
 // A signature is a vec of [param names, param types, param muts, result types,
 // variadic, mut result, fault], read with vec_get like every other vec.
-fn shape_sig_same(a i64, b i64) i64 {
-	let aps = vec_get(a, 1)
-	let bps = vec_get(b, 1)
-	if aps[VEC_LEN] != bps[VEC_LEN] || vec_get(a, 4) != vec_get(b, 4) || vec_get(a, 5) != vec_get(b, 5) || vec_get(a, 6) != vec_get(b, 6) {
+fn shape_sig_same(a Vec[i64], b Vec[i64]) i64 {
+	let aps = cast(Vec[i64], vec_get(a, 1))
+	let bps = cast(Vec[i64], vec_get(b, 1))
+	if aps.len != bps.len || vec_get(a, 4) != vec_get(b, 4) || vec_get(a, 5) != vec_get(b, 5) || vec_get(a, 6) != vec_get(b, 6) {
 		return 0
 	}
 	mut i = 0
-	for i < aps[VEC_LEN] {
-		if vec_get(aps, i) != vec_get(bps, i) || vec_get(vec_get(a, 2), i) != vec_get(vec_get(b, 2), i) {
+	for i < aps.len {
+		if vec_get(aps, i) != vec_get(bps, i) || vec_get(cast(Vec[i64], vec_get(a, 2)), i) != vec_get(cast(Vec[i64], vec_get(b, 2)), i) {
 			return 0
 		}
 		i = i + 1
 	}
-	let ars = vec_get(a, 3)
-	let brs = vec_get(b, 3)
-	if ars[VEC_LEN] != brs[VEC_LEN] {
+	let ars = cast(Vec[i64], vec_get(a, 3))
+	let brs = cast(Vec[i64], vec_get(b, 3))
+	if ars.len != brs.len {
 		return 0
 	}
 	i = 0
-	for i < ars[VEC_LEN] {
+	for i < ars.len {
 		if vec_get(ars, i) != vec_get(brs, i) {
 			return 0
 		}
@@ -1503,16 +1503,16 @@ fn shape_sig_same(a i64, b i64) i64 {
 
 // shape_sig_str writes a method signature the way it would be declared, so the error
 // can show both sides: `Read(buf mut []u8) !i64`.
-fn shape_sig_str(b i64, name i64, sig i64) {
-	let ns = vec_get(sig, 0)
-	let ps = vec_get(sig, 1)
-	let ms = vec_get(sig, 2)
-	let rs = vec_get(sig, 3)
+fn shape_sig_str(b Buf, name i64, sig Vec[i64]) {
+	let ns = cast(Vec[i64], vec_get(sig, 0))
+	let ps = cast(Vec[i64], vec_get(sig, 1))
+	let ms = cast(Vec[i64], vec_get(sig, 2))
+	let rs = cast(Vec[i64], vec_get(sig, 3))
 	let variadic = vec_get(sig, 4)
 	buf_str(b, name)
 	buf_byte(b, '(')
 	mut i = 0
-	for i < ps[VEC_LEN] {
+	for i < ps.len {
 		if i > 0 {
 			buf_str(b, cstr(", "))
 		}
@@ -1521,7 +1521,7 @@ fn shape_sig_str(b i64, name i64, sig i64) {
 			buf_str(b, pn)
 			buf_byte(b, ' ')
 		}
-		if variadic != 0 && i == ps[VEC_LEN] - 1 {
+		if variadic != 0 && i == ps.len - 1 {
 			buf_str(b, cstr("..."))
 		} else if vec_get(ms, i) != 0 {
 			buf_str(b, cstr("mut "))
@@ -1530,14 +1530,14 @@ fn shape_sig_str(b i64, name i64, sig i64) {
 		i = i + 1
 	}
 	buf_byte(b, ')')
-	mut n = rs[VEC_LEN]
+	mut n = rs.len
 	if vec_get(sig, 6) != 0 {
 		buf_str(b, cstr(" !"))
 		n = n - 1
 		if n == 1 {
 			type_name(b, cast(Ty, vec_get(rs, 0)))
 		} else if n > 1 {
-			shape_result_list(b, rs, n)
+			shape_result_list(b, cast(Vec[Ty], rs), n)
 		}
 	} else if n == 1 {
 		buf_byte(b, ' ')
@@ -1547,18 +1547,18 @@ fn shape_sig_str(b i64, name i64, sig i64) {
 		type_name(b, cast(Ty, vec_get(rs, 0)))
 	} else if n > 1 {
 		buf_byte(b, ' ')
-		shape_result_list(b, rs, n)
+		shape_result_list(b, cast(Vec[Ty], rs), n)
 	}
 }
 
-fn shape_result_list(b i64, rs i64, n i64) {
+fn shape_result_list(b Buf, rs Vec[Ty], n i64) {
 	buf_byte(b, '(')
 	mut i = 0
 	for i < n {
 		if i > 0 {
 			buf_str(b, cstr(", "))
 		}
-		type_name(b, cast(Ty, vec_get(rs, i)))
+		type_name(b, vec_get(rs, i))
 		i = i + 1
 	}
 	buf_byte(b, ')')
@@ -1576,23 +1576,23 @@ fn constraints_shape(sd Decl, name i64) i64 {
 	return i64(streq(vec_get(file_pkgs, sd.file), cstr("constraints")) != 0 && streq(sd.name, name) != 0)
 }
 
-fn check_shape(pos i64, t Ty, sd Decl, bind_ i64) {
+fn check_shape(pos i64, t Ty, sd Decl, bind_ Vec[i64]) {
 	if shape_on_path(shape_bad, cast(i64, sd)) != 0 || shape_on_path(shape_cycles, cast(i64, sd)) != 0 {
 		return
 	}
 	if constraints_shape(sd, cstr("Comparable")) != 0 {
-		if key_valid(t, vec_new()) != 0 {
+		if key_valid(t, cast(Vec[Ty], vec_new[i64]())) != 0 {
 			return
 		}
 		let m = err_code(pos, cstr("E511 NOT_COMPARABLE"))
 		buf_str(m, cstr("type "))
-		type_name(m, t)
+		type_name(cast(Buf, m), t)
 		buf_str(m, cstr(" does not satisfy shape Comparable: it is not comparable"))
-		err_end(m)
+		err_end(cast(Buf, m))
 		return
 	}
 	if kind_of(t) == K_DYN {
-		if cast(Decl, t.gdecl) == sd && shape_bind_same(t.targs, bind_) != 0 {
+		if cast(Decl, t.gdecl) == sd && shape_bind_same(cast(Vec[i64], t.targs), bind_) != 0 {
 			return
 		}
 		if constraints_shape(sd, cstr("Any")) != 0 {
@@ -1601,8 +1601,8 @@ fn check_shape(pos i64, t Ty, sd Decl, bind_ i64) {
 		err_code_at(pos, cstr("E514 DYN_WIDENING"), cstr("a dyn value satisfies its own shape only; dyn-to-dyn widening is the next step (#141)"))
 		return
 	}
-	if shape_checking[VEC_LEN] == 0 {
-		shape_checked = vec_new()
+	if shape_checking.len == 0 {
+		shape_checked = vec_new[i64]()
 	}
 	if shape_seen(shape_checking, cast(i64, sd), cast(i64, t), bind_) != 0 || shape_seen(shape_checked, cast(i64, sd), cast(i64, t), bind_) != 0 {
 		return
@@ -1613,16 +1613,16 @@ fn check_shape(pos i64, t Ty, sd Decl, bind_ i64) {
 	if shape_seen_type(shape_checking, cast(i64, sd), cast(i64, t)) != 0 {
 		return
 	}
-	vec_push(shape_checked, shape_key(cast(i64, sd), cast(i64, t), bind_))
-	vec_push(shape_checking, shape_key(cast(i64, sd), cast(i64, t), bind_))
+	vec_push(shape_checked, shape_key(cast(i64, sd), cast(i64, t), cast(i64, bind_)))
+	vec_push(shape_checking, shape_key(cast(i64, sd), cast(i64, t), cast(i64, bind_)))
 	let saved = ck_state_save()
 	set_file(sd.file)
-	ck_tbind = bind_
+	ck_tbind = cast(Vec[i64], bind_)
 	if sd.unionkind != 0 {
 		mut ok = 0
 		mut j = 0
-		for j < sd.union[VEC_LEN] {
-			if cast(Ty, resolve_type(vec_get(sd.union, j))) == t {
+		for j < cast(Vec[i64], sd.union).len {
+			if cast(Ty, resolve_type(vec_get(cast(Vec[i64], sd.union), j))) == t {
 				ok = 1
 			}
 			j = j + 1
@@ -1630,53 +1630,53 @@ fn check_shape(pos i64, t Ty, sd Decl, bind_ i64) {
 		if ok == 0 {
 			let m = err_code(pos, cstr("E510 NOT_IN_UNION"))
 			buf_str(m, cstr("type "))
-			type_name(m, t)
+			type_name(cast(Buf, m), t)
 			buf_str(m, cstr(" is not in shape "))
 			buf_str(m, sd.name)
 			buf_str(m, cstr(": want one of "))
-			shape_union_str(m, sd)
-			err_end(m)
+			shape_union_str(cast(Buf, m), sd)
+			err_end(cast(Buf, m))
 		}
-		shape_checking[VEC_LEN] = shape_checking[VEC_LEN] - 1
-		ck_state_restore(saved)
+		shape_checking.len = shape_checking.len - 1
+		ck_state_restore(cast(Vec[Fn], saved))
 		return
 	}
 	mut j = 0
-	for j < sd.union[VEC_LEN] {
-		let inst = shape_inst(vec_get(sd.union, j))
-		if inst != 0 {
-			check_shape(pos, t, cast(Decl, vec_get(inst, 0)), vec_get(inst, 1))
+	for j < cast(Vec[i64], sd.union).len {
+		let inst = shape_inst(vec_get(cast(Vec[i64], sd.union), j))
+		if cast(i64, inst) != 0 {
+			check_shape(pos, t, cast(Decl, vec_get(inst, 0)), cast(Vec[i64], vec_get(inst, 1)))
 		}
 		j = j + 1
 	}
 	mut i = 0
-	for i < sd.shape_[VEC_LEN] {
-		if check_shape_method(pos, cast(i64, t), sd, cast(Fn, vec_get(sd.shape_, i)), bind_) == 0 {
-			i = sd.shape_[VEC_LEN]
+	for i < cast(Vec[i64], sd.shape_).len {
+		if check_shape_method(pos, cast(i64, t), sd, cast(Fn, vec_get(cast(Vec[i64], sd.shape_), i)), cast(i64, bind_)) == 0 {
+			i = cast(Vec[i64], sd.shape_).len
 		} else {
 			i = i + 1
 		}
 	}
-	shape_checking[VEC_LEN] = shape_checking[VEC_LEN] - 1
-	ck_state_restore(saved)
+	shape_checking.len = shape_checking.len - 1
+	ck_state_restore(cast(Vec[Fn], saved))
 }
 
 // shape_key is the (shape, type, bindings) triple a satisfaction tree is memoized on.
 fn shape_key(sd i64, t i64, bind_ i64) i64 {
-	let k = vec_new()
+	let k = vec_new[i64]()
 	vec_push(k, sd)
 	vec_push(k, t)
 	vec_push(k, bind_)
-	return k
+	return cast(i64, k)
 }
 
-fn shape_union_str(b i64, sd Decl) {
+fn shape_union_str(b Buf, sd Decl) {
 	mut i = 0
-	for i < sd.union[VEC_LEN] {
+	for i < cast(Vec[i64], sd.union).len {
 		if i > 0 {
 			buf_str(b, cstr(" | "))
 		}
-		type_name(b, cast(Ty, resolve_type(vec_get(sd.union, i))))
+		type_name(b, cast(Ty, resolve_type(vec_get(cast(Vec[i64], sd.union), i))))
 		i = i + 1
 	}
 }
@@ -1687,7 +1687,7 @@ fn shape_union_str(b i64, sd Decl) {
 // the same missing type once per method.
 fn check_shape_method(pos i64, t i64, sd Decl, want Fn, bind_ i64) i64 {
 	let before = error_count
-	let wsig = shape_sig_of(want, 0, bind_)
+	let wsig = shape_sig_of(want, 0, cast(Vec[i64], bind_))
 	if error_count != before {
 		if shape_on_path(shape_bad, cast(i64, sd)) == 0 {
 			vec_push(shape_bad, cast(i64, sd))
@@ -1698,34 +1698,34 @@ fn check_shape_method(pos i64, t i64, sd Decl, want Fn, bind_ i64) i64 {
 	if cast(i64, cand) == 0 {
 		let m = err_code(pos, cstr("E512 MISSING_METHOD"))
 		buf_str(m, cstr("type "))
-		type_name(m, cast(Ty, t))
+		type_name(cast(Buf, m), cast(Ty, t))
 		buf_str(m, cstr(" does not satisfy shape "))
 		buf_str(m, sd.name)
 		buf_str(m, cstr(": it has no method "))
-		shape_sig_str(m, want.name, wsig)
+		shape_sig_str(cast(Buf, m), want.name, wsig)
 		buf_str(m, cstr("; fix-it: add method "))
-		shape_sig_str(m, want.name, wsig)
-		err_end(m)
+		shape_sig_str(cast(Buf, m), want.name, wsig)
+		err_end(cast(Buf, m))
 		return 1
 	}
 	// The candidate's types belong to the file that declares the method, not the shape's.
 	let saved = ck_state_save()
 	set_file(cand.file)
-	let csig = shape_sig_of(cand, sm_declared, sm_bind)
-	ck_state_restore(saved)
+	let csig = shape_sig_of(cand, sm_declared, cast(Vec[i64], sm_bind))
+	ck_state_restore(cast(Vec[Fn], saved))
 	if shape_sig_same(wsig, csig) == 0 {
 		let m = err_code(pos, cstr("E513 METHOD_SIGNATURE"))
 		buf_str(m, cstr("type "))
-		type_name(m, cast(Ty, t))
+		type_name(cast(Buf, m), cast(Ty, t))
 		buf_str(m, cstr(" does not satisfy shape "))
 		buf_str(m, sd.name)
 		buf_str(m, cstr(": method "))
-		shape_sig_str(m, want.name, csig)
+		shape_sig_str(cast(Buf, m), want.name, csig)
 		buf_str(m, cstr(" has the wrong signature, want "))
-		shape_sig_str(m, want.name, wsig)
+		shape_sig_str(cast(Buf, m), want.name, wsig)
 		buf_str(m, cstr("; fix-it: change the method signature to "))
-		shape_sig_str(m, want.name, wsig)
-		err_end(m)
+		shape_sig_str(cast(Buf, m), want.name, wsig)
+		err_end(cast(Buf, m))
 	}
 	return 1
 }

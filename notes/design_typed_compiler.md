@@ -156,3 +156,14 @@ cases and a byte-identical `-S` comparison. The seed is not touched until step 6
   A heuristic that typed fields from their uses also mistyped `TypeExpr.args` (a bitmask for function
   types) and crashed on `fn(mut T)`: field types must come from the writers, not only the readers.
 
+- **Vectors and buffers (step 2, #385), 2026-10-05.** `Vec[T]` (a generic struct over the `[len, cap, data]`
+  header, `shape Any {}` as its constraint) and `Buf` are declared in `selfhost/records.tin`; `vec_new[T]`,
+  `vec_push`, `vec_get` are generic over the element type and `buf_*` take a `Buf`. About 180 vectors have a
+  record element type (`Vec[Sym]`, `Vec[Decl]`, ...), the rest are `Vec[i64]` (words). Slices stay out of it on
+  purpose: a slice holds its elements inline, the compiler's vectors hold pointers to records, so `[]Node`
+  would change the data model, not type it. Measured: 375 of 375 listings identical, suite 210, compile of the
+  compiler 0.32 s (main 0.28 s: more casts to check), a user program 0.11 s either way. Typing more slots
+  by heuristics (from how readers cast them, or from the checker's mismatch errors) was tried and made the
+  cast count grow (12,000 to 15,000), so the remaining `cast(Vec[i64], ...)` boundaries go slot by slot, by hand,
+  as each pass is converted.
+

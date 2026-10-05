@@ -31,13 +31,13 @@ def generate():
                 data = table[name]
                 code = ''.join(f'{v[0]:08x}' for v in struct.iter_unpack('<I',data)) if arch=='arm64' else data.hex()
                 result += [f'\tif streq(name, cstr("{name}")) != 0 {{', f'\t\thex = cstr("{code}")', '\t}']
-            result += ['\tif i64(load8(hex)) == 0 {', '\t\treturn 0', '\t}', '\tlet v = vec_new()', '\tmut i = 0',
+            result += ['\tif i64(load8(hex)) == 0 {', '\t\treturn 0', '\t}', '\tlet v = vec_new[i64]()', '\tmut i = 0',
                        '\tfor i64(load8(hex + i)) != 0 {']
             if arch == 'arm64':
-                result += ['\t\traw(v, hex_word(hex + i))', '\t\ti = i + 8']
+                result += ['\t\traw(cast(Vec[i64], v), hex_word(hex + i))', '\t\ti = i + 8']
             else:
                 result += ['\t\tvec_push(v, num_digit(i64(load8(hex + i))) * 16 + num_digit(i64(load8(hex + i + 1))))', '\t\ti = i + 2']
-            result += ['\t}', '\treturn v', '}']
+            result += ['\t}', '\treturn cast(i64, v)', '}']
     return '\n'.join(result)+'\n'
 
 

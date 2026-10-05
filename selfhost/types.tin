@@ -57,11 +57,11 @@ shared mut ty_i32 i64
 shared mut ty_u16 i64
 shared mut ty_u32 i64
 shared mut ty_u64 i64
-shared mut ty_interned i64 // slice, map, chan and func types, shared by structure
-shared mut ty_named i64 // [qualified name, type]
+shared mut ty_interned Vec[Ty] // slice, map, chan and func types, shared by structure
+shared mut ty_named Vec[i64] // [qualified name, type]
 shared mut saw_dyn i64 // a dyn type was built: the back ends refuse it until step 3
 shared mut saw_dyn_pos i64 // where the first dyn type was written, for the back ends' message
-shared mut ty_secrets i64 // secret twins, one per plain type (secret_of)
+shared mut ty_secrets Vec[i64] // secret twins, one per plain type (secret_of)
 
 fn ty_new(kind i64, name i64) i64 {
 	let t = cast(Ty, calloc(TY_MAX + 1, 8))
@@ -80,8 +80,8 @@ fn int_type(name i64, width i64, signed i64) i64 {
 }
 
 fn types_init() {
-	ty_named = vec_new()
-	ty_interned = vec_new()
+	ty_named = vec_new[i64]()
+	ty_interned = cast(Vec[Ty], vec_new[i64]())
 	ty_int = int_type(cstr("i64"), 8, 1)
 	ty_i8 = int_type(cstr("i8"), 1, 1)
 	ty_i16 = int_type(cstr("i16"), 2, 1)
@@ -110,16 +110,16 @@ fn types_init() {
 }
 
 fn name_type(name i64, t i64) {
-	let rec = vec_new()
+	let rec = vec_new[i64]()
 	vec_push(rec, name)
 	vec_push(rec, t)
-	vec_push(ty_named, rec)
+	vec_push(ty_named, cast(i64, rec))
 }
 
 fn find_type(name i64) i64 {
-	mut i = ty_named[VEC_LEN] - 1
+	mut i = ty_named.len - 1
 	for i >= 0 {
-		let rec = vec_get(ty_named, i)
+		let rec = cast(Vec[i64], vec_get(ty_named, i))
 		if streq(vec_get(rec, 0), name) != 0 {
 			return vec_get(rec, 1)
 		}
@@ -128,12 +128,12 @@ fn find_type(name i64) i64 {
 	return 0
 }
 
-fn types_equal_vec(a i64, b i64) i64 {
-	if a[VEC_LEN] != b[VEC_LEN] {
+fn types_equal_vec(a Vec[i64], b Vec[i64]) i64 {
+	if a.len != b.len {
 		return 0
 	}
 	mut i = 0
-	for i < a[VEC_LEN] {
+	for i < a.len {
 		if vec_get(a, i) != vec_get(b, i) {
 			return 0
 		}
@@ -143,12 +143,12 @@ fn types_equal_vec(a i64, b i64) i64 {
 }
 
 // interned returns the shared type with this structure, creating it on first use.
-fn interned(kind i64, elem i64, key i64, params i64, results i64, variadic i64) i64 {
+fn interned(kind i64, elem i64, key i64, params Vec[i64], results Vec[i64], variadic i64) i64 {
 	mut i = 0
-	for i < ty_interned[VEC_LEN] {
-		let t = cast(Ty, vec_get(ty_interned, i))
+	for i < ty_interned.len {
+		let t = vec_get(ty_interned, i)
 		if t.kind == kind && t.elem == elem && t.key == key && t.variadic == variadic {
-			if kind != K_FUNC || (types_equal_vec(t.fields, params) != 0 && types_equal_vec(t.results, results) != 0) {
+			if kind != K_FUNC || (types_equal_vec(cast(Vec[i64], t.fields), params) != 0 && types_equal_vec(cast(Vec[i64], t.results), results) != 0) {
 				return cast(i64, t)
 			}
 		}
@@ -157,64 +157,64 @@ fn interned(kind i64, elem i64, key i64, params i64, results i64, variadic i64) 
 	let n = cast(Ty, ty_new(kind, 0))
 	n.elem = elem
 	n.key = key
-	n.fields = params
-	n.results = results
+	n.fields = cast(i64, params)
+	n.results = cast(i64, results)
 	n.variadic = variadic
-	vec_push(ty_interned, cast(i64, n))
+	vec_push(ty_interned, cast(Ty, n))
 	return cast(i64, n)
 }
 
 fn slice_of(elem i64) i64 {
-	return interned(K_SLICE, elem, 0, 0, 0, 0)
+	return interned(K_SLICE, elem, 0, cast(Vec[i64], 0), cast(Vec[i64], 0), 0)
 }
 
 fn map_of(key i64, val i64) i64 {
-	return interned(K_MAP, val, key, 0, 0, 0)
+	return interned(K_MAP, val, key, cast(Vec[i64], 0), cast(Vec[i64], 0), 0)
 }
 
 fn chan_of(elem i64) i64 {
-	return interned(K_CHAN, elem, 0, 0, 0, 0)
+	return interned(K_CHAN, elem, 0, cast(Vec[i64], 0), cast(Vec[i64], 0), 0)
 }
 
 fn opt_of(elem i64) i64 {
-	return interned(K_OPT, elem, 0, 0, 0, 0)
+	return interned(K_OPT, elem, 0, cast(Vec[i64], 0), cast(Vec[i64], 0), 0)
 }
 
 // dyn_of is the type of a dyn S value: the shape declaration in TY_GDECL and the
 // instance's bindings in TY_TARGS (0 for a non-generic shape). It is two words, and
 // saw_dyn makes the back ends refuse the program until size-16 values are generated
 // (notes/design_dyn.md, staging step 2).
-fn dyn_of(sd i64, bind_ i64) i64 {
+fn dyn_of(sd i64, bind_ Vec[i64]) i64 {
 	mut i = 0
-	for i < ty_interned[VEC_LEN] {
-		let t = cast(Ty, vec_get(ty_interned, i))
-		if t.kind == K_DYN && t.gdecl == sd && shape_bind_same(t.targs, bind_) != 0 {
+	for i < ty_interned.len {
+		let t = vec_get(ty_interned, i)
+		if t.kind == K_DYN && t.gdecl == sd && shape_bind_same(cast(Vec[i64], t.targs), bind_) != 0 {
 			return cast(i64, t)
 		}
 		i = i + 1
 	}
 	let n = cast(Ty, ty_new(K_DYN, 0))
 	n.gdecl = sd
-	n.targs = bind_
-	vec_push(ty_interned, cast(i64, n))
+	n.targs = cast(i64, bind_)
+	vec_push(ty_interned, cast(Ty, n))
 	saw_dyn = 1
 	return cast(i64, n)
 }
 
-fn func_of(params i64, results i64, variadic i64) i64 {
+fn func_of(params Vec[i64], results Vec[i64], variadic i64) i64 {
 	return interned(K_FUNC, 0, 0, params, results, variadic)
 }
 
 // func_of_m is func_of for a function whose parameters in mask (bit i: parameter i) are mut.
-fn func_of_m(params i64, results i64, variadic i64, mask i64) i64 {
+fn func_of_m(params Vec[i64], results Vec[i64], variadic i64, mask i64) i64 {
 	return interned(K_FUNC, 0, mask, params, results, variadic)
 }
 
 // mut_mask turns a function's F_MUTS flags into a func type's mut mask.
-fn mut_mask(muts i64) i64 {
+fn mut_mask(muts Vec[i64]) i64 {
 	mut m = 0
 	mut i = 0
-	for muts != 0 && i < muts[VEC_LEN] && i < 63 {
+	for cast(i64, muts) != 0 && i < muts.len && i < 63 {
 		if vec_get(muts, i) != 0 {
 			m = m | (1 << i)
 		}
@@ -432,7 +432,7 @@ fn assignable(from Ty, to Ty) i64 {
 	return 0
 }
 
-fn type_name(b i64, t Ty) {
+fn type_name(b Buf, t Ty) {
 	if cast(i64, t) == 0 {
 		buf_str(b, cstr("int"))
 		return
@@ -449,15 +449,15 @@ fn type_name(b i64, t Ty) {
 		if cast(i64, sd) != 0 {
 			buf_str(b, sd.name)
 		}
-		let bind_ = t.targs
-		if bind_ != 0 {
+		let bind_ = cast(Vec[i64], t.targs)
+		if cast(i64, bind_) != 0 {
 			buf_byte(b, '[')
 			mut i = 0
-			for i < bind_[VEC_LEN] {
+			for i < bind_.len {
 				if i > 0 {
 					buf_byte(b, ',')
 				}
-				type_name(b, cast(Ty, vec_get(vec_get(bind_, i), 1)))
+				type_name(b, cast(Ty, vec_get(cast(Vec[i64], vec_get(bind_, i)), 1)))
 				i = i + 1
 			}
 			buf_byte(b, ']')
@@ -485,9 +485,9 @@ fn type_name(b i64, t Ty) {
 			buf_str(b, cstr("func"))
 		}
 		buf_byte(b, '(')
-		let ps = t.fields
+		let ps = cast(Vec[i64], t.fields)
 		mut i = 0
-		for i < ps[VEC_LEN] {
+		for i < ps.len {
 			if i > 0 {
 				buf_str(b, cstr(", "))
 			}
@@ -498,10 +498,10 @@ fn type_name(b i64, t Ty) {
 			i = i + 1
 		}
 		buf_byte(b, ')')
-		if k == K_FUNC && t.results[VEC_LEN] == 1 {
+		if k == K_FUNC && cast(Vec[i64], t.results).len == 1 {
 			buf_byte(b, ' ')
-			type_name(b, cast(Ty, vec_get(t.results, 0)))
-		} else if k == K_FUNC && t.results[VEC_LEN] > 1 {
+			type_name(b, cast(Ty, vec_get(cast(Vec[i64], t.results), 0)))
+		} else if k == K_FUNC && cast(Vec[i64], t.results).len > 1 {
 			buf_byte(b, ' ')
 			type_name(b, cast(Ty, tuple_of(t.results)))
 		}
@@ -512,10 +512,10 @@ fn type_name(b i64, t Ty) {
 
 // struct_field returns the index of field name in struct type t, or -1.
 fn struct_field(t Ty, name i64) i64 {
-	let fs = t.fields
+	let fs = cast(Vec[i64], t.fields)
 	mut i = 0
-	for i < fs[VEC_LEN] {
-		if streq(vec_get(vec_get(fs, i), 0), name) != 0 {
+	for i < fs.len {
+		if streq(vec_get(cast(Vec[i64], vec_get(fs, i)), 0), name) != 0 {
 			return i
 		}
 		i = i + 1
@@ -524,28 +524,28 @@ fn struct_field(t Ty, name i64) i64 {
 }
 
 fn field_type(t Ty, i i64) i64 {
-	return vec_get(vec_get(t.fields, i), 1)
+	return vec_get(cast(Vec[i64], vec_get(cast(Vec[i64], t.fields), i)), 1)
 }
 
 fn field_offset(t Ty, i i64) i64 {
-	return vec_get(vec_get(t.fields, i), 2)
+	return vec_get(cast(Vec[i64], vec_get(cast(Vec[i64], t.fields), i)), 2)
 }
 
 // layout_struct assigns field offsets: widest fields first, each naturally aligned, so
 // structs pack without padding holes; the object size rounds up to 8.
 fn layout_struct(t Ty) {
-	let fs = t.fields
+	let fs = cast(Vec[i64], t.fields)
 	mut off = 0
 	mut w = 16
 	for w >= 1 {
 		mut i = 0
-		for i < fs[VEC_LEN] {
-			let f = vec_get(fs, i)
+		for i < fs.len {
+			let f = cast(Vec[i64], vec_get(fs, i))
 			if type_width(cast(Ty, vec_get(f, 1))) == w {
-				for f[VEC_LEN] < 3 {
+				for f.len < 3 {
 					vec_push(f, 0)
 				}
-				f[VEC_DATA][2] = off
+				f.data[2] = off
 				off = off + w
 			}
 			i = i + 1
@@ -602,7 +602,7 @@ fn int_to_float_bits(v i64) i64 {
 //
 // A bounded type is a twin of its unbounded type (same kind and layout) that also records
 // a largest length. It is assignable to its unbounded type; the reverse needs bound(x).
-shared mut ty_bounds i64 // [unbounded type, max, bounded type]
+shared mut ty_bounds Vec[i64] // [unbounded type, max, bounded type]
 
 // bounded_of is t refined to values of length at most max.
 fn bounded_of(t_in i64, max_ i64) i64 {
@@ -610,14 +610,14 @@ fn bounded_of(t_in i64, max_ i64) i64 {
 	if t.bound != 0 {
 		t = cast(Ty, t.bound)
 	}
-	if ty_bounds == 0 {
-		ty_bounds = vec_new()
+	if cast(i64, ty_bounds) == 0 {
+		ty_bounds = vec_new[i64]()
 	}
 	mut i = 0
-	for i < ty_bounds[VEC_LEN] {
-		let r = vec_get(ty_bounds, i)
-		if cast(Ty, vec_get(r, 0)) == t && vec_get(r, 1) == max_ {
-			return vec_get(r, 2)
+	for i < ty_bounds.len {
+		let r = vec_get(cast(Vec[i64], ty_bounds), i)
+		if cast(Ty, vec_get(cast(Vec[i64], r), 0)) == t && vec_get(cast(Vec[i64], r), 1) == max_ {
+			return vec_get(cast(Vec[i64], r), 2)
 		}
 		i = i + 1
 	}
@@ -630,16 +630,16 @@ fn bounded_of(t_in i64, max_ i64) i64 {
 	b.bound = cast(i64, t)
 	b.max = max_
 	let nb = buf_new()
-	type_name(nb, t)
+	type_name(cast(Buf, nb), t)
 	buf_str(nb, cstr(" max "))
 	buf_int(nb, max_)
 	buf_byte(nb, 0)
-	b.name = nb[VEC_DATA]
-	let r = vec_new()
+	b.name = cast(Vec[i64], nb).data
+	let r = vec_new[i64]()
 	vec_push(r, cast(i64, t))
 	vec_push(r, max_)
 	vec_push(r, cast(i64, b))
-	vec_push(ty_bounds, r)
+	vec_push(cast(Vec[i64], ty_bounds), cast(i64, r))
 	return cast(i64, b)
 }
 

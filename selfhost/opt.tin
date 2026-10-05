@@ -6,9 +6,9 @@ fn analyze_fn(f Fn) {
 	an_fn = cast(i64, f)
 	an_depth = 0
 	f.leaf = 1
-	let locals = f.locals
+	let locals = cast(Vec[i64], f.locals)
 	mut i = 0
-	for i < locals[VEC_LEN] {
+	for i < locals.len {
 		let s = cast(Sym, vec_get(locals, i))
 		s.uses = 0
 		s.addr = 0
@@ -29,9 +29,9 @@ fn an_use(s Sym) {
 	s.uses = s.uses + w
 }
 
-fn an_stmts(stmts i64) {
+fn an_stmts(stmts Vec[i64]) {
 	mut i = 0
-	for i < stmts[VEC_LEN] {
+	for i < stmts.len {
 		an_stmt(vec_get(stmts, i))
 		i = i + 1
 	}
@@ -73,22 +73,22 @@ fn an_stmt(s i64) {
 		if cast(ReturnStmt, s).value != 0 {
 			an_expr(cast(ReturnStmt, s).value)
 		}
-		if cast(ReturnStmt, s).values != 0 {
+		if cast(i64, cast(ReturnStmt, s).values) != 0 {
 			an_exprs(cast(ReturnStmt, s).values)
 		}
 	} else if k == ST_CALLMULTI {
 		an_expr(cast(CallMultiStmt, s).call)
 		mut i = 0
-		for i < cast(CallMultiStmt, s).syms[VEC_LEN] {
-			an_use(cast(Sym, vec_get(cast(CallMultiStmt, s).syms, i)))
+		for i < cast(CallMultiStmt, s).syms.len {
+			an_use(vec_get(cast(CallMultiStmt, s).syms, i))
 			i = i + 1
 		}
 	}
 }
 
-fn an_exprs(v i64) {
+fn an_exprs(v Vec[i64]) {
 	mut i = 0
-	for i < v[VEC_LEN] {
+	for i < v.len {
 		an_expr(vec_get(v, i))
 		i = i + 1
 	}
@@ -135,7 +135,7 @@ fn an_expr(e i64) {
 		}
 		let args = cast(Call, e).args
 		mut i = 0
-		for i < args[VEC_LEN] {
+		for i < args.len {
 			an_expr(vec_get(args, i))
 			i = i + 1
 		}
@@ -151,10 +151,10 @@ fn an_expr(e i64) {
 // of the form x[a + b] with x and a invariant become (x + a*8)[b], so the row address
 // is computed once per loop instead of once per element.
 shared mut lc_fn i64
-shared mut lc_assigned i64
-shared mut lc_exprs i64
-shared mut lc_syms i64
-shared mut lc_pre i64
+shared mut lc_assigned Vec[i64]
+shared mut lc_exprs Vec[i64]
+shared mut lc_syms Vec[Sym]
+shared mut lc_pre Vec[i64]
 shared mut lc_calls i64 // the loop makes calls, so headers may change under it
 
 fn licm_fn(f Fn) {
@@ -172,9 +172,9 @@ fn licm_fn(f Fn) {
 // 155ms -> 133ms). Go does not do this.
 const PF_AHEAD = 4
 
-fn prefetch_block(stmts i64) {
+fn prefetch_block(stmts Vec[i64]) {
 	mut i = 0
-	for i < stmts[VEC_LEN] {
+	for i < stmts.len {
 		let s = vec_get(stmts, i)
 		let k = cast(Node, s).kind
 		if k == ST_WHILE && cast(WhileStmt, s).once_ != 0 {
@@ -202,9 +202,9 @@ fn prefetch_block(stmts i64) {
 	}
 }
 
-fn has_loop(stmts i64) i64 {
+fn has_loop(stmts Vec[i64]) i64 {
 	mut i = 0
-	for i < stmts[VEC_LEN] {
+	for i < stmts.len {
 		let s = vec_get(stmts, i)
 		let k = cast(Node, s).kind
 		if k == ST_WHILE && cast(WhileStmt, s).once_ == 0 {
@@ -221,9 +221,9 @@ fn has_loop(stmts i64) i64 {
 				return 1
 			}
 			if cast(IfStmt, s).else_ != 0 {
-				let one = vec_new()
+				let one = vec_new[i64]()
 				vec_push(one, cast(IfStmt, s).else_)
-				if has_loop(one) != 0 {
+				if has_loop(cast(Vec[i64], one)) != 0 {
 					return 1
 				}
 			}
@@ -242,23 +242,23 @@ fn prefetch_loop(w i64) {
 		return
 	}
 	let body0 = cast(Block, cast(WhileStmt, w).body).stmts
-	let body = vec_new()
+	let body = vec_new[i64]()
 	mut bi = 0
-	for bi < body0[VEC_LEN] {
+	for bi < body0.len {
 		vec_push(body, vec_get(body0, bi))
 		bi = bi + 1
 	}
 	if cast(WhileStmt, w).post != 0 {
 		vec_push(body, cast(WhileStmt, w).post)
 	}
-	lc_assigned = vec_new()
-	lc_calls = stmts_have_call(body)
-	collect_assigned(body)
+	lc_assigned = vec_new[i64]()
+	lc_calls = stmts_have_call(cast(Vec[i64], body))
+	collect_assigned(cast(Vec[i64], body))
 	// The induction step: a top-level `j = j + step` with step invariant.
 	mut j = cast(Sym, 0)
 	mut step = 0
 	mut i = 0
-	for i < body[VEC_LEN] {
+	for i < cast(Vec[i64], body).len {
 		let s = vec_get(body, i)
 		if cast(Node, s).kind == ST_ASSIGN && is_reg_local(cast(AssignStmt, s).target) != 0 {
 			let v = cast(AssignStmt, s).value
@@ -270,7 +270,7 @@ fn prefetch_loop(w i64) {
 		}
 		i = i + 1
 	}
-	if cast(i64, j) == 0 || count_assigns(body, cast(i64, j)) != 1 {
+	if cast(i64, j) == 0 || count_assigns(cast(i64, body), cast(i64, j)) != 1 {
 		return
 	}
 	if is_const(step) != 0 && const_val(step) < 8 && const_val(step) > -8 {
@@ -279,7 +279,7 @@ fn prefetch_loop(w i64) {
 	// The strided access: x[j] = ... with x invariant.
 	mut target = 0
 	i = 0
-	for i < body[VEC_LEN] {
+	for i < cast(Vec[i64], body).len {
 		let s = vec_get(body, i)
 		if cast(Node, s).kind == ST_ASSIGN && cast(Node, cast(AssignStmt, s).target).kind == EX_INDEX {
 			let ix = cast(IndexExpr, cast(AssignStmt, s).target)
@@ -306,30 +306,30 @@ fn prefetch_loop(w i64) {
 	jref.ref = cast(i64, j)
 	let call = cast(Call, node_new(EX_CALL, pos))
 	call.name = cstr("__prefetchw")
-	call.args = vec_new()
+	call.args = vec_new[i64]()
 	call.intrinsic = 1
 	if cast(Node, target).kind == EX_ELEM {
-		vec_push(call.args, mk_hdr(pos, node_copy(cast(ElemExpr, target).seq), 2))
+		vec_push(cast(Vec[i64], call.args), mk_hdr(pos, node_copy(cast(ElemExpr, target).seq), 2))
 	} else {
-		vec_push(call.args, node_copy(cast(IndexExpr, target).x))
+		vec_push(cast(Vec[i64], call.args), node_copy(cast(IndexExpr, target).x))
 	}
-	vec_push(call.args, binary_node(pos, cstr("+"), cast(i64, jref), binary_node(pos, cstr("*"), node_copy(step), cast(i64, ahead))))
+	vec_push(cast(Vec[i64], call.args), binary_node(pos, cstr("+"), cast(i64, jref), binary_node(pos, cstr("*"), node_copy(step), cast(i64, ahead))))
 	let st = cast(ExprStmt, node_new(ST_EXPR, pos))
 	st.x = cast(i64, call)
-	let nb = vec_new()
+	let nb = vec_new[i64]()
 	vec_push(nb, cast(i64, st))
 	i = 0
-	for i < body0[VEC_LEN] {
+	for i < body0.len {
 		vec_push(nb, vec_get(body0, i))
 		i = i + 1
 	}
-	cast(Block, cast(WhileStmt, w).body).stmts = nb
+	cast(Block, cast(WhileStmt, w).body).stmts = cast(Vec[i64], nb)
 }
 
 fn count_assigns(stmts i64, sym i64) i64 {
 	mut n = 0
 	mut i = 0
-	for i < lc_assigned[VEC_LEN] {
+	for i < lc_assigned.len {
 		if vec_get(lc_assigned, i) == sym {
 			n = n + 1
 		}
@@ -339,16 +339,16 @@ fn count_assigns(stmts i64, sym i64) i64 {
 }
 
 fn licm_block(b Block) {
-	let stmts = b.stmts
-	let result = vec_new()
+	let stmts = cast(Vec[i64], b.stmts)
+	let result = vec_new[i64]()
 	mut i = 0
-	for i < stmts[VEC_LEN] {
+	for i < stmts.len {
 		let s = vec_get(stmts, i)
 		licm_nested(s)
 		if cast(Node, s).kind == ST_WHILE && cast(WhileStmt, s).once_ == 0 {
-			let pre = licm_loop(cast(WhileStmt, s))
+			let pre = cast(Vec[i64], licm_loop(cast(WhileStmt, s)))
 			mut j = 0
-			for j < pre[VEC_LEN] {
+			for j < pre.len {
 				vec_push(result, vec_get(pre, j))
 				j = j + 1
 			}
@@ -356,7 +356,7 @@ fn licm_block(b Block) {
 		vec_push(result, s)
 		i = i + 1
 	}
-	b.stmts = result
+	b.stmts = cast(Vec[i64], result)
 }
 
 fn licm_nested(s i64) {
@@ -375,30 +375,30 @@ fn licm_nested(s i64) {
 
 // licm_loop rewrites loop w in place and returns the lets to run before it.
 fn licm_loop(w WhileStmt) i64 {
-	lc_assigned = vec_new()
-	lc_exprs = vec_new()
-	lc_syms = vec_new()
-	lc_pre = vec_new()
+	lc_assigned = vec_new[i64]()
+	lc_exprs = vec_new[i64]()
+	lc_syms = cast(Vec[Sym], vec_new[i64]())
+	lc_pre = vec_new[i64]()
 	lc_calls = i64(stmts_have_call(cast(Block, w.body).stmts) != 0 || contains_call(w.cond) != 0 || stmt_has_call(w.post) != 0)
 	collect_assigned(cast(Block, w.body).stmts)
 	if w.post != 0 {
-		let one = vec_new()
+		let one = vec_new[i64]()
 		vec_push(one, w.post)
-		collect_assigned(one)
+		collect_assigned(cast(Vec[i64], one))
 	}
 	hoist_expr(w.cond)
 	hoist_stmts(cast(Block, w.body).stmts)
 	if w.post != 0 {
-		let two = vec_new()
+		let two = vec_new[i64]()
 		vec_push(two, w.post)
-		hoist_stmts(two)
+		hoist_stmts(cast(Vec[i64], two))
 	}
-	return lc_pre
+	return cast(i64, lc_pre)
 }
 
-fn collect_assigned(stmts i64) {
+fn collect_assigned(stmts Vec[i64]) {
 	mut i = 0
-	for i < stmts[VEC_LEN] {
+	for i < stmts.len {
 		let s = vec_get(stmts, i)
 		let k = cast(Node, s).kind
 		if k == ST_LET {
@@ -420,14 +420,14 @@ fn collect_assigned(stmts i64) {
 		} else if k == ST_WHILE {
 			collect_assigned(cast(Block, cast(WhileStmt, s).body).stmts)
 			if cast(WhileStmt, s).post != 0 {
-				let one = vec_new()
+				let one = vec_new[i64]()
 				vec_push(one, cast(WhileStmt, s).post)
-				collect_assigned(one)
+				collect_assigned(cast(Vec[i64], one))
 			}
 		} else if k == ST_CALLMULTI {
 			mut j = 0
-			for j < cast(CallMultiStmt, s).syms[VEC_LEN] {
-				vec_push(lc_assigned, vec_get(cast(CallMultiStmt, s).syms, j))
+			for j < cast(CallMultiStmt, s).syms.len {
+				vec_push(lc_assigned, cast(i64, vec_get(cast(CallMultiStmt, s).syms, j)))
 				j = j + 1
 			}
 		}
@@ -437,7 +437,7 @@ fn collect_assigned(stmts i64) {
 
 fn is_assigned(s i64) i64 {
 	mut i = 0
-	for i < lc_assigned[VEC_LEN] {
+	for i < lc_assigned.len {
 		if vec_get(lc_assigned, i) == s {
 			return 1
 		}
@@ -512,9 +512,9 @@ fn op_cost(e i64) i64 {
 	return 0
 }
 
-fn hoist_stmts(stmts i64) {
+fn hoist_stmts(stmts Vec[i64]) {
 	mut i = 0
-	for i < stmts[VEC_LEN] {
+	for i < stmts.len {
 		let s = vec_get(stmts, i)
 		let k = cast(Node, s).kind
 		if k == ST_LET {
@@ -537,17 +537,17 @@ fn hoist_stmts(stmts i64) {
 			if els != 0 && cast(Node, els).kind == ST_BLOCK {
 				hoist_stmts(cast(Block, els).stmts)
 			} else if els != 0 {
-				let one = vec_new()
+				let one = vec_new[i64]()
 				vec_push(one, els)
-				hoist_stmts(one)
+				hoist_stmts(cast(Vec[i64], one))
 			}
 		} else if k == ST_WHILE {
 			hoist_expr(cast(WhileStmt, s).cond)
 			hoist_stmts(cast(Block, cast(WhileStmt, s).body).stmts)
 			if cast(WhileStmt, s).post != 0 {
-				let one = vec_new()
+				let one = vec_new[i64]()
 				vec_push(one, cast(WhileStmt, s).post)
-				hoist_stmts(one)
+				hoist_stmts(cast(Vec[i64], one))
 			}
 		} else if k == ST_CALLMULTI {
 			hoist_expr(cast(CallMultiStmt, s).call)
@@ -591,7 +591,7 @@ fn hoist_expr(e i64) {
 	} else if k == EX_CALL {
 		let args = cast(Call, e).args
 		mut i = 0
-		for i < args[VEC_LEN] {
+		for i < args.len {
 			hoist_expr(vec_get(args, i))
 			i = i + 1
 		}
@@ -632,26 +632,26 @@ fn index_rewrite(e i64) {
 fn replace_with_temp(e i64) {
 	mut s = cast(Sym, 0)
 	mut i = 0
-	for i < lc_exprs[VEC_LEN] && cast(i64, s) == 0 {
+	for i < lc_exprs.len && cast(i64, s) == 0 {
 		if expr_equal(vec_get(lc_exprs, i), e) != 0 {
-			s = cast(Sym, vec_get(lc_syms, i))
+			s = vec_get(lc_syms, i)
 		}
 		i = i + 1
 	}
 	if cast(i64, s) == 0 {
 		let moved = node_copy(e)
-		s = cast(Sym, sym_new(SYM_LOCAL, cstr("licm"), cast(Node, e).pos))
+		s = sym_new(SYM_LOCAL, cstr("licm"), cast(Node, e).pos)
 		s.type_ = cast(Node, e).type_
 		s.slot = cast(Fn, lc_fn).slots
 		cast(Fn, lc_fn).slots = cast(Fn, lc_fn).slots + 1
-		vec_push(cast(Fn, lc_fn).locals, cast(i64, s))
+		vec_push(cast(Fn, lc_fn).locals, cast(Sym, s))
 		let l = cast(LetStmt, node_new(ST_LET, cast(Node, e).pos))
 		l.name = cstr("licm")
 		l.init = moved
 		l.sym = cast(i64, s)
 		vec_push(lc_pre, cast(i64, l))
 		vec_push(lc_exprs, moved)
-		vec_push(lc_syms, cast(i64, s))
+		vec_push(lc_syms, cast(Sym, s))
 	}
 	let t = cast(Node, e).type_
 	cast(Node, e).kind = EX_IDENT

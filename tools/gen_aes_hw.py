@@ -29,12 +29,12 @@ def generate():
                 else:
                     data = data.hex()
                 text += [f'\tif streq(name, cstr("seal.{name}")) != 0 {{', f'\t\thex = cstr("{data}")', '\t}']
-            text += ['\tif hex == 0 {', '\t\treturn 0', '\t}', '\tlet v = vec_new()', '\tmut i = 0', '\tfor i64(load8(hex + i)) != 0 {']
+            text += ['\tif hex == 0 {', '\t\treturn 0', '\t}', '\tlet v = vec_new[i64]()', '\tmut i = 0', '\tfor i64(load8(hex + i)) != 0 {']
             if arch == 'arm64':
-                text += ['\t\traw(v, hex_word(hex + i))', '\t\ti = i + 8']
+                text += ['\t\traw(cast(Vec[i64], v), hex_word(hex + i))', '\t\ti = i + 8']
             else:
                 text += ['\t\tvec_push(v, num_digit(i64(load8(hex + i))) * 16 + num_digit(i64(load8(hex + i + 1))))', '\t\ti = i + 2']
-            text += ['\t}', '\treturn v', '}']
+            text += ['\t}', '\treturn cast(i64, v)', '}']
     return '\n'.join(text)+'\n'
 
 
