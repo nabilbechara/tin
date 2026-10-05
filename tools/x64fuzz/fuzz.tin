@@ -132,12 +132,12 @@ fn rnd_shift() i64 {
 	return rnd_below(64)
 }
 
-fn emit(code i64, op i64, a i64, b i64, c i64, d i64) {
-	vec_push(code, op)
-	vec_push(code, a)
-	vec_push(code, b)
-	vec_push(code, c)
-	vec_push(code, d)
+fn emit(code []i64, op i64, a i64, b i64, c i64, d i64) {
+	code = append(code, op)
+	code = append(code, a)
+	code = append(code, b)
+	code = append(code, c)
+	code = append(code, d)
 }
 
 const N_CASES = 73
@@ -160,7 +160,7 @@ fn rnd_label(nlabels i64, near i64) i64 {
 
 const N_EDGE_LABELS = 32
 
-fn fill(code i64, n i64) {
+fn fill(code []i64, n i64) {
 	mut i = 0
 	for i < n {
 		emit(code, X_RET, 0, 0, 0, 0)
@@ -171,7 +171,7 @@ fn fill(code i64, n i64) {
 // gen_edges appends branches whose targets sit right at the rel8 boundary in both directions,
 // and chains of branches to one label that only shrink over several relaxation passes; it
 // defines labels 0 to N_EDGE_LABELS - 1.
-fn gen_edges(code i64) {
+fn gen_edges(code []i64) {
 	mut l = 0
 	mut n = 124
 	for n <= 130 {
@@ -221,7 +221,7 @@ fn gen_edges(code i64) {
 
 // gen_ins appends one random instruction, choosing uniformly over every op and form;
 // near is the id of the next label to be defined.
-fn gen_ins(code i64, nlabels i64, nsyms i64, near i64) {
+fn gen_ins(code []i64, nlabels i64, nsyms i64, near i64) {
 	let k = rnd_below(N_CASES)
 	if k == 0 {
 		emit(code, X_MOV_RR, rnd_gpr(), rnd_gpr(), 0, 0)
@@ -344,7 +344,7 @@ fn parse_int(s i64) i64 {
 	return n
 }
 
-fn write_file(path i64, b i64) {
+fn write_file(path i64, b []u8) {
 	let fd = rt_sys_creat(path, 420)
 	if fd < 0 {
 		complain(cstr("x64fuzz: cannot create output file"))
@@ -369,7 +369,7 @@ fn run(argc i64, argv i64) i64 {
 	}
 	let nlabels = count / 8 + 1
 	let nsyms = 16
-	let code = vec_new()
+	let code = []i64{}
 	gen_edges(code)
 	label_lo = N_EDGE_LABELS
 	mut next_label = label_lo
@@ -389,10 +389,10 @@ fn run(argc i64, argv i64) i64 {
 	// Symbols get addresses anywhere in the code once its size is known.
 	let size = x64_layout(code, 0)
 	let passes = x64_passes
-	x64_syms = vec_new()
+	x64_syms = []i64{}
 	i = 0
 	for i < nsyms {
-		vec_push(x64_syms, rnd_below(size + 1))
+		x64_syms = append(x64_syms, rnd_below(size + 1))
 		i = i + 1
 	}
 	let bin = buf_new()
@@ -400,8 +400,8 @@ fn run(argc i64, argv i64) i64 {
 	mut pc = 0
 	mut shorts = 0
 	i = 0
-	for i < code[VEC_LEN] {
-		let ins = code[VEC_DATA] + 8 * i
+	for i < len(code) {
+		let ins = slice_data(code) + 8 * i
 		if (ins[0] == X_JMP || ins[0] == X_JCC) && ins[4] != 0 {
 			shorts = shorts + 1
 		}
@@ -415,7 +415,7 @@ fn run(argc i64, argv i64) i64 {
 	}
 	// x64_assemble must produce the very same bytes.
 	let again = x64_assemble(code, 0)
-	if again[VEC_LEN] != bin[VEC_LEN] || mem_eq(again[VEC_DATA], bin[VEC_DATA], bin[VEC_LEN]) == 0 {
+	if len(again) != len(bin) || mem_eq(slice_data(again), slice_data(bin), len(bin)) == 0 {
 		complain(cstr("x64fuzz: x64_assemble disagrees with x64_encode"))
 		return 1
 	}
@@ -425,15 +425,15 @@ fn run(argc i64, argv i64) i64 {
 	if argc > 5 {
 		let sym = buf_new()
 		i = 0
-		for i < code[VEC_LEN] {
-			x64_print(sym, code[VEC_DATA] + 8 * i, -1)
+		for i < len(code) {
+			x64_print(sym, slice_data(code) + 8 * i, -1)
 			i = i + 5
 		}
 		write_file(argv[5], sym)
 	}
 	let msg = buf_new()
 	buf_str(msg, cstr("x64fuzz: "))
-	buf_int(msg, code[VEC_LEN] / 5)
+	buf_int(msg, len(code) / 5)
 	buf_str(msg, cstr(" instructions, "))
 	buf_int(msg, nlabels)
 	buf_str(msg, cstr(" labels, "))
@@ -441,7 +441,7 @@ fn run(argc i64, argv i64) i64 {
 	buf_str(msg, cstr(" short branches after "))
 	buf_int(msg, passes)
 	buf_str(msg, cstr(" relaxation passes, "))
-	buf_int(msg, x64_relocs[VEC_LEN] / 3)
+	buf_int(msg, len(x64_relocs) / 3)
 	buf_str(msg, cstr(" relocations, "))
 	buf_int(msg, size)
 	buf_str(msg, cstr(" bytes\n"))

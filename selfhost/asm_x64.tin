@@ -162,39 +162,39 @@ fn x64_mem_disp(m i64) i64 {
 // Label and symbol addresses: x64_labels is filled by x64_layout; symbols come from the
 // x64_syms vector when it is set, else from x64_sym_hook (the linker's resolver).
 // x64_relocs, when set, collects (address of disp32, sym, address the disp is relative to).
-shared mut x64_labels Vec[i64]
-shared mut x64_syms Vec[i64]
-shared mut x64_relocs Vec[i64]
+shared mut x64_labels []i64
+shared mut x64_syms []i64
+shared mut x64_relocs []i64
 shared mut x64_base i64 // address of byte 0 of the buffer being encoded into
-shared mut x64_scratch Vec[i64] // buffer used to measure instructions
+shared mut x64_scratch []i64 // buffer used to measure instructions
 shared mut x64_passes i64 // relaxation passes the last x64_layout took
 
 fn x64_label_addr(l i64) i64 {
-	if cast(i64, x64_labels) == 0 || l >= x64_labels.len {
+	if cast(i64, x64_labels) == 0 || l >= len(x64_labels) {
 		return 0
 	}
-	return vec_get(cast(Vec[i64], x64_labels), l)
+	return cast([]i64, x64_labels)[l]
 }
 
 fn x64_sym_addr(s i64) i64 {
 	if cast(i64, x64_syms) == 0 {
 		return x64_sym_hook(s)
 	}
-	if s >= x64_syms.len {
+	if s >= len(x64_syms) {
 		return 0
 	}
-	return vec_get(cast(Vec[i64], x64_syms), s)
+	return cast([]i64, x64_syms)[s]
 }
 
 fn x64_fail(msg i64) {
-	let e = cast(Vec[i64], err_code(NO_POS, cstr("E990 INTERNAL")))
-	buf_str(cast(Buf, e), cstr("x64: "))
-	buf_str(cast(Buf, e), msg)
-	fatal(cast(Vec[i64], e))
+	let e = cast([]i64, err_code(NO_POS, cstr("E990 INTERNAL")))
+	buf_str(cast([]u8, e), cstr("x64: "))
+	buf_str(cast([]u8, e), msg)
+	fatal(cast([]u8, e))
 }
 
 // ---- text printer (Intel syntax, as objdump -M intel prints it) ----
-fn x64_pr_hex(b Buf, v i64) {
+fn x64_pr_hex(b []u8, v i64) {
 	buf_str(b, cstr("0x"))
 	mut k = 60
 	for k > 0 && ((v >> k) & 15) == 0 {
@@ -207,7 +207,7 @@ fn x64_pr_hex(b Buf, v i64) {
 }
 
 // x64_pr_signed prints +0xN or -0xN as objdump does for displacements.
-fn x64_pr_signed(b Buf, v i64) {
+fn x64_pr_signed(b []u8, v i64) {
 	if v < 0 {
 		buf_byte(b, '-')
 		x64_pr_hex(b, -v)
@@ -218,7 +218,7 @@ fn x64_pr_signed(b Buf, v i64) {
 }
 
 // x64_pr_reg prints a register of the given size log2 (3 = 64 bits).
-fn x64_pr_reg(b Buf, r i64, size i64) {
+fn x64_pr_reg(b []u8, r i64, size i64) {
 	if r >= XMM {
 		buf_str(b, cstr("xmm"))
 		buf_int(b, r - XMM)
@@ -247,11 +247,11 @@ fn x64_pr_reg(b Buf, r i64, size i64) {
 	}
 }
 
-fn x64_pr_cond(b Buf, c i64) {
+fn x64_pr_cond(b []u8, c i64) {
 	buf_str(b, cstr("o\0\0no\0b\0\0ae\0e\0\0ne\0be\0a\0\0s\0\0ns\0p\0\0np\0l\0\0ge\0le\0g\0") + 3 * c)
 }
 
-fn x64_pr_ptr(b Buf, size i64) {
+fn x64_pr_ptr(b []u8, size i64) {
 	if size == 3 {
 		buf_str(b, cstr("QWORD PTR "))
 	} else if size == 2 {
@@ -265,7 +265,7 @@ fn x64_pr_ptr(b Buf, size i64) {
 
 // x64_pr_mem prints [base+index*scale+disp]; end is the address after the instruction,
 // which rip-relative operands are measured from (negative: print the label instead).
-fn x64_pr_mem(b Buf, m i64, end i64) {
+fn x64_pr_mem(b []u8, m i64, end i64) {
 	let base = x64_mem_base(m)
 	let index = x64_mem_index(m)
 	let disp = x64_mem_disp(m)
@@ -305,7 +305,7 @@ fn x64_pr_mem(b Buf, m i64, end i64) {
 	buf_byte(b, ']')
 }
 
-fn x64_pr_rr(b Buf, name i64, rd i64, rs i64, size i64) {
+fn x64_pr_rr(b []u8, name i64, rd i64, rs i64, size i64) {
 	buf_str(b, name)
 	buf_byte(b, ' ')
 	x64_pr_reg(b, rd, size)
@@ -313,7 +313,7 @@ fn x64_pr_rr(b Buf, name i64, rd i64, rs i64, size i64) {
 	x64_pr_reg(b, rs, size)
 }
 
-fn x64_pr_ri(b Buf, name i64, rd i64, imm i64, size i64) {
+fn x64_pr_ri(b []u8, name i64, rd i64, imm i64, size i64) {
 	buf_str(b, name)
 	buf_byte(b, ' ')
 	x64_pr_reg(b, rd, size)
@@ -322,7 +322,7 @@ fn x64_pr_ri(b Buf, name i64, rd i64, imm i64, size i64) {
 }
 
 // x64_pr_rm prints NAME reg,SIZE PTR [mem] (reg first) or NAME SIZE PTR [mem],reg.
-fn x64_pr_rm(b Buf, name i64, r i64, rsize i64, m i64, msize i64, reg_first i64, end i64) {
+fn x64_pr_rm(b []u8, name i64, r i64, rsize i64, m i64, msize i64, reg_first i64, end i64) {
 	buf_str(b, name)
 	buf_byte(b, ' ')
 	if reg_first != 0 {
@@ -337,7 +337,7 @@ fn x64_pr_rm(b Buf, name i64, r i64, rsize i64, m i64, msize i64, reg_first i64,
 	}
 }
 
-fn x64_pr_target(b Buf, addr i64, label i64, pc i64) {
+fn x64_pr_target(b []u8, addr i64, label i64, pc i64) {
 	if pc < 0 {
 		buf_byte(b, 'L')
 		buf_int(b, label)
@@ -376,19 +376,19 @@ fn x64_size(ins i64, pc i64) i64 {
 		return 6
 	}
 	if cast(i64, x64_scratch) == 0 {
-		x64_scratch = cast(Vec[i64], buf_new())
+		x64_scratch = cast([]i64, buf_new())
 	}
 	let relocs = x64_relocs
-	x64_relocs = cast(Vec[i64], 0)
-	x64_scratch.len = 0
-	let n = x64_encode(ins, pc, cast(Vec[i64], x64_scratch))
+	x64_relocs = cast([]i64, 0)
+	slice_truncate(x64_scratch, 0)
+	let n = x64_encode(ins, pc, cast([]u8, cast([]i64, x64_scratch)))
 	x64_relocs = relocs
 	return n
 }
 
 // x64_print appends one line of Intel-syntax assembly for ins at pc (labels print nothing).
 // With a negative pc branch targets and rip-relative operands print as L<label>/S<sym>.
-fn x64_print(b Vec[i64], ins i64, pc i64) {
+fn x64_print(b []u8, ins i64, pc i64) {
 	let op = ins[0]
 	let x = ins[1]
 	let y = ins[2]
@@ -396,9 +396,9 @@ fn x64_print(b Vec[i64], ins i64, pc i64) {
 	let w = ins[4]
 	if op == X_LABEL {
 		if pc < 0 {
-			buf_byte(cast(Buf, b), 'L')
-			buf_int(cast(Buf, b), x)
-			buf_str(cast(Buf, b), cstr(":\n"))
+			buf_byte(cast([]u8, b), 'L')
+			buf_int(cast([]u8, b), x)
+			buf_str(cast([]u8, b), cstr(":\n"))
 		}
 		return
 	}
@@ -407,149 +407,149 @@ fn x64_print(b Vec[i64], ins i64, pc i64) {
 		end = pc + x64_size(ins, pc)
 	}
 	if op == X_MOV_RR {
-		x64_pr_rr(cast(Buf, b), cstr("mov"), x, y, 3)
+		x64_pr_rr(cast([]u8, b), cstr("mov"), x, y, 3)
 	} else if op == X_MOV_RI {
 		if y >= 0 && y <= 0xffffffff {
-			x64_pr_ri(cast(Buf, b), cstr("mov"), x, y, 2)
+			x64_pr_ri(cast([]u8, b), cstr("mov"), x, y, 2)
 		} else if x64_fits32(y) != 0 {
-			x64_pr_ri(cast(Buf, b), cstr("mov"), x, y, 3)
+			x64_pr_ri(cast([]u8, b), cstr("mov"), x, y, 3)
 		} else {
-			x64_pr_ri(cast(Buf, b), cstr("movabs"), x, y, 3)
+			x64_pr_ri(cast([]u8, b), cstr("movabs"), x, y, 3)
 		}
 	} else if op == X_LOAD {
-		x64_pr_load(cast(Vec[i64], b), x, y, z, end)
+		x64_pr_load(b, x, y, z, end)
 	} else if op == X_STORE {
-		x64_pr_rm(cast(Buf, b), cstr("mov"), x, z, y, z, 0, end)
+		x64_pr_rm(cast([]u8, b), cstr("mov"), x, z, y, z, 0, end)
 	} else if op == X_LEA {
-		buf_str(cast(Buf, b), cstr("lea "))
-		x64_pr_reg(cast(Buf, b), x, 3)
-		buf_byte(cast(Buf, b), ',')
-		x64_pr_mem(cast(Buf, b), y, end)
+		buf_str(cast([]u8, b), cstr("lea "))
+		x64_pr_reg(cast([]u8, b), x, 3)
+		buf_byte(cast([]u8, b), ',')
+		x64_pr_mem(cast([]u8, b), y, end)
 	} else if op >= X_ADD && op <= X_TEST {
-		x64_pr_rr(cast(Buf, b), x64_alu_name(op - X_ADD), x, y, 3)
+		x64_pr_rr(cast([]u8, b), x64_alu_name(op - X_ADD), x, y, 3)
 	} else if op >= X_ADDI && op <= X_TESTI {
-		x64_pr_ri(cast(Buf, b), x64_alu_name(op - X_ADDI), x, y, 3)
+		x64_pr_ri(cast([]u8, b), x64_alu_name(op - X_ADDI), x, y, 3)
 	} else if op >= X_ADDM && op <= X_TESTM {
-		x64_pr_rm(cast(Buf, b), x64_alu_name(op - X_ADDM), x, 3, y, 3, i64(op != X_TESTM), end)
+		x64_pr_rm(cast([]u8, b), x64_alu_name(op - X_ADDM), x, 3, y, 3, i64(op != X_TESTM), end)
 	} else if op == X_IMUL_RR {
-		x64_pr_rr(cast(Buf, b), cstr("imul"), x, y, 3)
+		x64_pr_rr(cast([]u8, b), cstr("imul"), x, y, 3)
 	} else if op == X_IMUL_RRI {
-		x64_pr_rr(cast(Buf, b), cstr("imul"), x, y, 3)
-		buf_byte(cast(Buf, b), ',')
-		x64_pr_hex(cast(Buf, b), z)
+		x64_pr_rr(cast([]u8, b), cstr("imul"), x, y, 3)
+		buf_byte(cast([]u8, b), ',')
+		x64_pr_hex(cast([]u8, b), z)
 	} else if op == X_IDIV || op == X_DIV || op == X_IMULH || op == X_NEG || op == X_NOT || op == X_CALL_R || op == X_PUSH || op == X_POP {
-		buf_str(cast(Buf, b), x64_unary_name(op))
-		buf_byte(cast(Buf, b), ' ')
-		x64_pr_reg(cast(Buf, b), x, 3)
+		buf_str(cast([]u8, b), x64_unary_name(op))
+		buf_byte(cast([]u8, b), ' ')
+		x64_pr_reg(cast([]u8, b), x, 3)
 	} else if op == X_CQO {
-		buf_str(cast(Buf, b), cstr("cqo"))
+		buf_str(cast([]u8, b), cstr("cqo"))
 	} else if op >= X_SHL && op <= X_SAR {
-		buf_str(cast(Buf, b), cstr("shl\0shr\0sar") + 4 * (op - X_SHL))
-		buf_byte(cast(Buf, b), ' ')
-		x64_pr_reg(cast(Buf, b), x, 3)
-		buf_str(cast(Buf, b), cstr(",cl"))
+		buf_str(cast([]u8, b), cstr("shl\0shr\0sar") + 4 * (op - X_SHL))
+		buf_byte(cast([]u8, b), ' ')
+		x64_pr_reg(cast([]u8, b), x, 3)
+		buf_str(cast([]u8, b), cstr(",cl"))
 	} else if op >= X_SHLI && op <= X_SARI {
-		x64_pr_ri(cast(Buf, b), cstr("shl\0shr\0sar") + 4 * (op - X_SHLI), x, y & 0xff, 3)
+		x64_pr_ri(cast([]u8, b), cstr("shl\0shr\0sar") + 4 * (op - X_SHLI), x, y & 0xff, 3)
 	} else if op == X_SETCC {
-		buf_str(cast(Buf, b), cstr("set"))
-		x64_pr_cond(cast(Buf, b), y)
-		buf_byte(cast(Buf, b), ' ')
-		x64_pr_reg(cast(Buf, b), x, 0)
+		buf_str(cast([]u8, b), cstr("set"))
+		x64_pr_cond(cast([]u8, b), y)
+		buf_byte(cast([]u8, b), ' ')
+		x64_pr_reg(cast([]u8, b), x, 0)
 	} else if op == X_CMOVCC {
-		buf_str(cast(Buf, b), cstr("cmov"))
-		x64_pr_cond(cast(Buf, b), z)
-		buf_byte(cast(Buf, b), ' ')
-		x64_pr_reg(cast(Buf, b), x, 3)
-		buf_byte(cast(Buf, b), ',')
-		x64_pr_reg(cast(Buf, b), y, 3)
+		buf_str(cast([]u8, b), cstr("cmov"))
+		x64_pr_cond(cast([]u8, b), z)
+		buf_byte(cast([]u8, b), ' ')
+		x64_pr_reg(cast([]u8, b), x, 3)
+		buf_byte(cast([]u8, b), ',')
+		x64_pr_reg(cast([]u8, b), y, 3)
 	} else if op == X_JMP {
-		buf_str(cast(Buf, b), cstr("jmp "))
-		x64_pr_target(cast(Buf, b), x64_label_addr(x), x, pc)
+		buf_str(cast([]u8, b), cstr("jmp "))
+		x64_pr_target(cast([]u8, b), x64_label_addr(x), x, pc)
 	} else if op == X_JCC {
-		buf_byte(cast(Buf, b), 'j')
-		x64_pr_cond(cast(Buf, b), x)
-		buf_byte(cast(Buf, b), ' ')
-		x64_pr_target(cast(Buf, b), x64_label_addr(y), y, pc)
+		buf_byte(cast([]u8, b), 'j')
+		x64_pr_cond(cast([]u8, b), x)
+		buf_byte(cast([]u8, b), ' ')
+		x64_pr_target(cast([]u8, b), x64_label_addr(y), y, pc)
 	} else if op == X_CALL {
-		buf_str(cast(Buf, b), cstr("call "))
+		buf_str(cast([]u8, b), cstr("call "))
 		if pc < 0 {
-			buf_byte(cast(Buf, b), 'S')
-			buf_int(cast(Buf, b), x)
+			buf_byte(cast([]u8, b), 'S')
+			buf_int(cast([]u8, b), x)
 			// Name the callee in the listing: the symbolic label alone hides which
 			// function a direct call reaches, which lit-style checks need to see.
 			let cn = x64_call_name(x)
 			if cn != 0 {
-				buf_str(cast(Buf, b), cstr("  # "))
-				buf_str(cast(Buf, b), cn)
+				buf_str(cast([]u8, b), cstr("  # "))
+				buf_str(cast([]u8, b), cn)
 			}
 		} else {
-			x64_pr_hex(cast(Buf, b), x64_sym_addr(x))
+			x64_pr_hex(cast([]u8, b), x64_sym_addr(x))
 		}
 	} else if op == X_RET {
-		buf_str(cast(Buf, b), cstr("ret"))
+		buf_str(cast([]u8, b), cstr("ret"))
 	} else if op == X_SXT {
 		if z == 2 {
-			buf_str(cast(Buf, b), cstr("movsxd "))
+			buf_str(cast([]u8, b), cstr("movsxd "))
 		} else {
-			buf_str(cast(Buf, b), cstr("movsx "))
+			buf_str(cast([]u8, b), cstr("movsx "))
 		}
-		x64_pr_reg(cast(Buf, b), x, 3)
-		buf_byte(cast(Buf, b), ',')
-		x64_pr_reg(cast(Buf, b), y, z)
+		x64_pr_reg(cast([]u8, b), x, 3)
+		buf_byte(cast([]u8, b), ',')
+		x64_pr_reg(cast([]u8, b), y, z)
 	} else if op == X_ZXT {
 		if z == 2 {
-			x64_pr_rr(cast(Buf, b), cstr("mov"), x, y, 2)
+			x64_pr_rr(cast([]u8, b), cstr("mov"), x, y, 2)
 		} else {
-			buf_str(cast(Buf, b), cstr("movzx "))
-			x64_pr_reg(cast(Buf, b), x, 2)
-			buf_byte(cast(Buf, b), ',')
-			x64_pr_reg(cast(Buf, b), y, z)
+			buf_str(cast([]u8, b), cstr("movzx "))
+			x64_pr_reg(cast([]u8, b), x, 2)
+			buf_byte(cast([]u8, b), ',')
+			x64_pr_reg(cast([]u8, b), y, z)
 		}
 	} else if op >= X_MOVSD && op <= X_ANDPD {
-		x64_pr_sse(cast(Vec[i64], b), op, x, y, end)
+		x64_pr_sse(b, op, x, y, end)
 	} else if op == X_ROUNDSD {
-		x64_pr_rr(cast(Buf, b), cstr("roundsd"), x, y, 3)
-		buf_byte(cast(Buf, b), ',')
-		x64_pr_hex(cast(Buf, b), z)
+		x64_pr_rr(cast([]u8, b), cstr("roundsd"), x, y, 3)
+		buf_byte(cast([]u8, b), ',')
+		x64_pr_hex(cast([]u8, b), z)
 	} else if op == X_PREFETCHW || op == X_PREFETCHT0 {
 		if op == X_PREFETCHW {
-			buf_str(cast(Buf, b), cstr("prefetchw BYTE PTR "))
+			buf_str(cast([]u8, b), cstr("prefetchw BYTE PTR "))
 		} else {
-			buf_str(cast(Buf, b), cstr("prefetcht0 BYTE PTR "))
+			buf_str(cast([]u8, b), cstr("prefetcht0 BYTE PTR "))
 		}
-		x64_pr_mem(cast(Buf, b), x, end)
+		x64_pr_mem(cast([]u8, b), x, end)
 	} else if op == X_LOCK_XADD {
-		x64_pr_rm(cast(Buf, b), cstr("lock xadd"), x, 3, y, 3, 0, end)
+		x64_pr_rm(cast([]u8, b), cstr("lock xadd"), x, 3, y, 3, 0, end)
 	} else if op == X_XCHG {
-		x64_pr_rm(cast(Buf, b), cstr("xchg"), x, 3, y, 3, 0, end)
+		x64_pr_rm(cast([]u8, b), cstr("xchg"), x, 3, y, 3, 0, end)
 	} else if op == X_LOCK_CMPXCHG {
-		x64_pr_rm(cast(Buf, b), cstr("lock cmpxchg"), x, 3, y, 3, 0, end)
+		x64_pr_rm(cast([]u8, b), cstr("lock cmpxchg"), x, 3, y, 3, 0, end)
 	} else if op == X_MFENCE {
-		buf_str(cast(Buf, b), cstr("mfence"))
+		buf_str(cast([]u8, b), cstr("mfence"))
 	} else if op == X_PAUSE {
-		buf_str(cast(Buf, b), cstr("pause"))
+		buf_str(cast([]u8, b), cstr("pause"))
 	} else if op == X_UD2 {
-		buf_str(cast(Buf, b), cstr("ud2"))
+		buf_str(cast([]u8, b), cstr("ud2"))
 	} else if op == X_MOVSS_LD {
-		x64_pr_rm(cast(Buf, b), cstr("movss"), x, 3, y, 2, 1, end)
+		x64_pr_rm(cast([]u8, b), cstr("movss"), x, 3, y, 2, 1, end)
 	} else if op == X_MOVSS_ST {
-		x64_pr_rm(cast(Buf, b), cstr("movss"), x, 3, y, 2, 0, end)
+		x64_pr_rm(cast([]u8, b), cstr("movss"), x, 3, y, 2, 0, end)
 	} else if op == X_CVTSD2SS {
-		x64_pr_rr(cast(Buf, b), cstr("cvtsd2ss"), x, y, 3)
+		x64_pr_rr(cast([]u8, b), cstr("cvtsd2ss"), x, y, 3)
 	} else if op == X_CVTSS2SD {
-		x64_pr_rr(cast(Buf, b), cstr("cvtss2sd"), x, y, 3)
+		x64_pr_rr(cast([]u8, b), cstr("cvtss2sd"), x, y, 3)
 	} else if op == X_RAWB {
-		buf_str(cast(Buf, b), cstr(".byte "))
-		x64_pr_hex(cast(Buf, b), x)
+		buf_str(cast([]u8, b), cstr(".byte "))
+		x64_pr_hex(cast([]u8, b), x)
 	} else if op == X_MOVD_RX {
-		buf_str(cast(Buf, b), cstr("movd "))
-		x64_pr_reg(cast(Buf, b), x, 2)
-		buf_byte(cast(Buf, b), ',')
-		x64_pr_reg(cast(Buf, b), y, 3)
+		buf_str(cast([]u8, b), cstr("movd "))
+		x64_pr_reg(cast([]u8, b), x, 2)
+		buf_byte(cast([]u8, b), ',')
+		x64_pr_reg(cast([]u8, b), y, 3)
 	} else {
 		x64_fail(cstr("cannot print instruction"))
 	}
-	buf_byte(cast(Buf, b), '\n')
+	buf_byte(cast([]u8, b), '\n')
 }
 
 fn x64_alu_name(i i64) i64 {
@@ -582,43 +582,43 @@ fn x64_unary_name(op i64) i64 {
 }
 
 // x64_pr_load prints the mov/movzx/movsx/movsxd form a sized load uses.
-fn x64_pr_load(b Vec[i64], rt i64, m i64, kind i64, end i64) {
+fn x64_pr_load(b []u8, rt i64, m i64, kind i64, end i64) {
 	let size = kind & 3
 	let signed = kind & XK_SIGNED
 	if size == 3 {
-		x64_pr_rm(cast(Buf, b), cstr("mov"), rt, 3, m, 3, 1, end)
+		x64_pr_rm(cast([]u8, b), cstr("mov"), rt, 3, m, 3, 1, end)
 	} else if signed != 0 && size == 2 {
-		x64_pr_rm(cast(Buf, b), cstr("movsxd"), rt, 3, m, 2, 1, end)
+		x64_pr_rm(cast([]u8, b), cstr("movsxd"), rt, 3, m, 2, 1, end)
 	} else if signed != 0 {
-		x64_pr_rm(cast(Buf, b), cstr("movsx"), rt, 3, m, size, 1, end)
+		x64_pr_rm(cast([]u8, b), cstr("movsx"), rt, 3, m, size, 1, end)
 	} else if size == 2 {
-		x64_pr_rm(cast(Buf, b), cstr("mov"), rt, 2, m, 2, 1, end)
+		x64_pr_rm(cast([]u8, b), cstr("mov"), rt, 2, m, 2, 1, end)
 	} else {
-		x64_pr_rm(cast(Buf, b), cstr("movzx"), rt, 2, m, size, 1, end)
+		x64_pr_rm(cast([]u8, b), cstr("movzx"), rt, 2, m, size, 1, end)
 	}
 }
 
-fn x64_pr_sse(b Vec[i64], op i64, x i64, y i64, end i64) {
+fn x64_pr_sse(b []u8, op i64, x i64, y i64, end i64) {
 	if op == X_MOVSD_LD {
-		x64_pr_rm(cast(Buf, b), cstr("movsd"), x, 3, y, 3, 1, end)
+		x64_pr_rm(cast([]u8, b), cstr("movsd"), x, 3, y, 3, 1, end)
 	} else if op == X_MOVSD_ST {
-		x64_pr_rm(cast(Buf, b), cstr("movsd"), x, 3, y, 3, 0, end)
+		x64_pr_rm(cast([]u8, b), cstr("movsd"), x, 3, y, 3, 0, end)
 	} else if op == X_MOVSD {
-		x64_pr_rr(cast(Buf, b), cstr("movsd"), x, y, 3)
+		x64_pr_rr(cast([]u8, b), cstr("movsd"), x, y, 3)
 	} else if op >= X_ADDSD && op <= X_SQRTSD {
-		x64_pr_rr(cast(Buf, b), cstr("addsd\0\0subsd\0\0mulsd\0\0divsd\0\0sqrtsd") + 7 * (op - X_ADDSD), x, y, 3)
+		x64_pr_rr(cast([]u8, b), cstr("addsd\0\0subsd\0\0mulsd\0\0divsd\0\0sqrtsd") + 7 * (op - X_ADDSD), x, y, 3)
 	} else if op == X_UCOMISD {
-		x64_pr_rr(cast(Buf, b), cstr("ucomisd"), x, y, 3)
+		x64_pr_rr(cast([]u8, b), cstr("ucomisd"), x, y, 3)
 	} else if op == X_CVTSI2SD {
-		x64_pr_rr(cast(Buf, b), cstr("cvtsi2sd"), x, y, 3)
+		x64_pr_rr(cast([]u8, b), cstr("cvtsi2sd"), x, y, 3)
 	} else if op == X_CVTTSD2SI {
-		x64_pr_rr(cast(Buf, b), cstr("cvttsd2si"), x, y, 3)
+		x64_pr_rr(cast([]u8, b), cstr("cvttsd2si"), x, y, 3)
 	} else if op == X_MOVQ {
-		x64_pr_rr(cast(Buf, b), cstr("movq"), x, y, 3)
+		x64_pr_rr(cast([]u8, b), cstr("movq"), x, y, 3)
 	} else if op == X_XORPD {
-		x64_pr_rr(cast(Buf, b), cstr("xorpd"), x, y, 3)
+		x64_pr_rr(cast([]u8, b), cstr("xorpd"), x, y, 3)
 	} else {
-		x64_pr_rr(cast(Buf, b), cstr("andpd"), x, y, 3)
+		x64_pr_rr(cast([]u8, b), cstr("andpd"), x, y, 3)
 	}
 }
 
@@ -636,20 +636,20 @@ fn x64_byte_reg(r i64) i64 {
 	return i64(r >= RSP && r <= RDI)
 }
 
-fn x64_imm32(out Buf, v i64) {
+fn x64_imm32(out []u8, v i64) {
 	buf_byte(out, v)
 	buf_byte(out, v >> 8)
 	buf_byte(out, v >> 16)
 	buf_byte(out, v >> 24)
 }
 
-fn x64_imm64(out Vec[i64], v i64) {
-	x64_imm32(cast(Buf, out), v)
-	x64_imm32(cast(Buf, out), v >> 32)
+fn x64_imm64(out []u8, v i64) {
+	x64_imm32(cast([]u8, out), v)
+	x64_imm32(cast([]u8, out), v >> 32)
 }
 
 // x64_rex emits a REX prefix when any of W, R, X, B is set or force asks for an empty one.
-fn x64_rex(out Buf, w i64, r i64, x i64, b i64, force i64) {
+fn x64_rex(out []u8, w i64, r i64, x i64, b i64, force i64) {
 	let rex = 0x40 | (w << 3) | (((r >> 3) & 1) << 2) | (((x >> 3) & 1) << 1) | ((b >> 3) & 1)
 	if rex != 0x40 || force != 0 {
 		buf_byte(out, rex)
@@ -657,7 +657,7 @@ fn x64_rex(out Buf, w i64, r i64, x i64, b i64, force i64) {
 }
 
 // x64_opcode emits a one-, two- (0F xx) or three-byte (0F 3A xx) opcode.
-fn x64_opcode(out Buf, opc i64) {
+fn x64_opcode(out []u8, opc i64) {
 	if opc > 0xffff {
 		buf_byte(out, opc >> 16)
 	}
@@ -667,14 +667,14 @@ fn x64_opcode(out Buf, opc i64) {
 	buf_byte(out, opc)
 }
 
-fn x64_prefix(out Buf, pfx i64) {
+fn x64_prefix(out []u8, pfx i64) {
 	if pfx != 0 {
 		buf_byte(out, pfx)
 	}
 }
 
 // x64_rr emits PFX REX OPC ModRM for a register rm operand; reg may be a /digit.
-fn x64_rr(out Buf, pfx i64, w i64, opc i64, reg i64, rm i64, force i64) {
+fn x64_rr(out []u8, pfx i64, w i64, opc i64, reg i64, rm i64, force i64) {
 	let r = x64_rn(reg)
 	let m = x64_rn(rm)
 	x64_prefix(out, pfx)
@@ -684,39 +684,39 @@ fn x64_rr(out Buf, pfx i64, w i64, opc i64, reg i64, rm i64, force i64) {
 }
 
 // x64_rm emits PFX REX OPC ModRM [SIB] [disp] for a memory rm operand.
-fn x64_rm(out Vec[i64], pfx i64, w i64, opc i64, reg i64, m i64, force i64) {
+fn x64_rm(out []u8, pfx i64, w i64, opc i64, reg i64, m i64, force i64) {
 	let r = x64_rn(reg)
 	let base = x64_mem_base(m)
 	let index = x64_mem_index(m)
-	x64_prefix(cast(Buf, out), pfx)
+	x64_prefix(cast([]u8, out), pfx)
 	if base >= XM_RIP {
-		x64_rex(cast(Buf, out), w, r, 0, 0, force)
+		x64_rex(cast([]u8, out), w, r, 0, 0, force)
 	} else {
-		x64_rex(cast(Buf, out), w, r, index, base, force)
+		x64_rex(cast([]u8, out), w, r, index, base, force)
 	}
-	x64_opcode(cast(Buf, out), opc)
-	x64_modrm_mem(cast(Buf, out), r, m)
+	x64_opcode(cast([]u8, out), opc)
+	x64_modrm_mem(cast([]u8, out), r, m)
 }
 
 // x64_modrm_mem emits the ModRM byte, the SIB byte when needed and the displacement.
 // rsp/r12 as base need a SIB byte; rbp/r13 as base always need a displacement.
-fn x64_modrm_mem(out Buf, r i64, m i64) {
+fn x64_modrm_mem(out []u8, r i64, m i64) {
 	let base = x64_mem_base(m)
 	let index = x64_mem_index(m)
 	let disp = x64_mem_disp(m)
 	let rfield = (r & 7) << 3
 	if base >= XM_RIP {
 		buf_byte(out, rfield | 5)
-		let here = x64_base + out.len
+		let here = x64_base + len(out)
 		mut target = 0
 		if base == XM_RIP {
 			target = x64_label_addr(disp)
 		} else {
 			target = x64_sym_addr(disp)
 			if cast(i64, x64_relocs) != 0 {
-				vec_push(x64_relocs, here)
-				vec_push(x64_relocs, disp)
-				vec_push(x64_relocs, here + 4)
+				x64_relocs = append(x64_relocs, here)
+				x64_relocs = append(x64_relocs, disp)
+				x64_relocs = append(x64_relocs, here + 4)
 			}
 		}
 		x64_imm32(out, target - (here + 4))
@@ -764,8 +764,8 @@ fn x64_alu_digit(i i64) i64 {
 }
 
 // x64_rel emits a rel8 or rel32 branch displacement to target from the end of the instruction.
-fn x64_rel(out Buf, target i64, short i64) {
-	let here = x64_base + out.len
+fn x64_rel(out []u8, target i64, short i64) {
+	let here = x64_base + len(out)
 	if short != 0 {
 		let d = target - (here + 1)
 		if x64_fits8(d) == 0 {
@@ -778,8 +778,8 @@ fn x64_rel(out Buf, target i64, short i64) {
 }
 
 // x64_encode appends the machine code of ins at address pc to out and returns its length.
-fn x64_encode(ins i64, pc i64, out Vec[i64]) i64 {
-	let start = out.len
+fn x64_encode(ins i64, pc i64, out []u8) i64 {
+	let start = len(out)
 	x64_base = pc - start
 	let op = ins[0]
 	let x = ins[1]
@@ -790,185 +790,185 @@ fn x64_encode(ins i64, pc i64, out Vec[i64]) i64 {
 		return 0
 	}
 	if op == X_MOV_RR {
-		x64_rr(cast(Buf, out), 0, 1, 0x89, y, x, 0)
+		x64_rr(cast([]u8, out), 0, 1, 0x89, y, x, 0)
 	} else if op == X_MOV_RI {
 		if y >= 0 && y <= 0xffffffff {
-			x64_rex(cast(Buf, out), 0, 0, 0, x, 0)
-			buf_byte(cast(Buf, out), 0xB8 + (x & 7))
-			x64_imm32(cast(Buf, out), y)
+			x64_rex(cast([]u8, out), 0, 0, 0, x, 0)
+			buf_byte(cast([]u8, out), 0xB8 + (x & 7))
+			x64_imm32(cast([]u8, out), y)
 		} else if x64_fits32(y) != 0 {
-			x64_rr(cast(Buf, out), 0, 1, 0xC7, 0, x, 0)
-			x64_imm32(cast(Buf, out), y)
+			x64_rr(cast([]u8, out), 0, 1, 0xC7, 0, x, 0)
+			x64_imm32(cast([]u8, out), y)
 		} else {
-			x64_rex(cast(Buf, out), 1, 0, 0, x, 0)
-			buf_byte(cast(Buf, out), 0xB8 + (x & 7))
-			x64_imm64(cast(Vec[i64], out), y)
+			x64_rex(cast([]u8, out), 1, 0, 0, x, 0)
+			buf_byte(cast([]u8, out), 0xB8 + (x & 7))
+			x64_imm64(out, y)
 		}
 	} else if op == X_LOAD {
-		x64_enc_load(cast(Vec[i64], out), x, y, z)
+		x64_enc_load(out, x, y, z)
 	} else if op == X_STORE {
 		if z == 3 {
-			x64_rm(cast(Vec[i64], out), 0, 1, 0x89, x, y, 0)
+			x64_rm(out, 0, 1, 0x89, x, y, 0)
 		} else if z == 2 {
-			x64_rm(cast(Vec[i64], out), 0, 0, 0x89, x, y, 0)
+			x64_rm(out, 0, 0, 0x89, x, y, 0)
 		} else if z == 1 {
-			x64_rm(cast(Vec[i64], out), 0x66, 0, 0x89, x, y, 0)
+			x64_rm(out, 0x66, 0, 0x89, x, y, 0)
 		} else {
-			x64_rm(cast(Vec[i64], out), 0, 0, 0x88, x, y, x64_byte_reg(x))
+			x64_rm(out, 0, 0, 0x88, x, y, x64_byte_reg(x))
 		}
 	} else if op == X_LEA {
-		x64_rm(cast(Vec[i64], out), 0, 1, 0x8D, x, y, 0)
+		x64_rm(out, 0, 1, 0x8D, x, y, 0)
 	} else if op >= X_ADD && op <= X_TEST {
-		x64_rr(cast(Buf, out), 0, 1, x64_alu_mr(op - X_ADD), y, x, 0)
+		x64_rr(cast([]u8, out), 0, 1, x64_alu_mr(op - X_ADD), y, x, 0)
 	} else if op >= X_ADDI && op <= X_TESTI {
-		x64_enc_alu_imm(cast(Buf, out), op - X_ADDI, x, y)
+		x64_enc_alu_imm(cast([]u8, out), op - X_ADDI, x, y)
 	} else if op >= X_ADDM && op <= X_TESTM {
-		x64_rm(cast(Vec[i64], out), 0, 1, x64_alu_rm(op - X_ADDM), x, y, 0)
+		x64_rm(out, 0, 1, x64_alu_rm(op - X_ADDM), x, y, 0)
 	} else if op == X_IMUL_RR {
-		x64_rr(cast(Buf, out), 0, 1, 0x0FAF, x, y, 0)
+		x64_rr(cast([]u8, out), 0, 1, 0x0FAF, x, y, 0)
 	} else if op == X_IMUL_RRI {
 		if x64_fits8(z) != 0 {
-			x64_rr(cast(Buf, out), 0, 1, 0x6B, x, y, 0)
-			buf_byte(cast(Buf, out), z)
+			x64_rr(cast([]u8, out), 0, 1, 0x6B, x, y, 0)
+			buf_byte(cast([]u8, out), z)
 		} else {
-			x64_rr(cast(Buf, out), 0, 1, 0x69, x, y, 0)
-			x64_imm32(cast(Buf, out), z)
+			x64_rr(cast([]u8, out), 0, 1, 0x69, x, y, 0)
+			x64_imm32(cast([]u8, out), z)
 		}
 	} else if op == X_IDIV {
-		x64_rr(cast(Buf, out), 0, 1, 0xF7, 7, x, 0)
+		x64_rr(cast([]u8, out), 0, 1, 0xF7, 7, x, 0)
 	} else if op == X_IMULH {
-		x64_rr(cast(Buf, out), 0, 1, 0xF7, 5, x, 0)
+		x64_rr(cast([]u8, out), 0, 1, 0xF7, 5, x, 0)
 	} else if op == X_DIV {
-		x64_rr(cast(Buf, out), 0, 1, 0xF7, 6, x, 0)
+		x64_rr(cast([]u8, out), 0, 1, 0xF7, 6, x, 0)
 	} else if op == X_CQO {
-		buf_byte(cast(Buf, out), 0x48)
-		buf_byte(cast(Buf, out), 0x99)
+		buf_byte(cast([]u8, out), 0x48)
+		buf_byte(cast([]u8, out), 0x99)
 	} else if op == X_NEG {
-		x64_rr(cast(Buf, out), 0, 1, 0xF7, 3, x, 0)
+		x64_rr(cast([]u8, out), 0, 1, 0xF7, 3, x, 0)
 	} else if op == X_NOT {
-		x64_rr(cast(Buf, out), 0, 1, 0xF7, 2, x, 0)
+		x64_rr(cast([]u8, out), 0, 1, 0xF7, 2, x, 0)
 	} else if op >= X_SHL && op <= X_SAR {
-		x64_rr(cast(Buf, out), 0, 1, 0xD3, x64_shift_digit(op - X_SHL), x, 0)
+		x64_rr(cast([]u8, out), 0, 1, 0xD3, x64_shift_digit(op - X_SHL), x, 0)
 	} else if op >= X_SHLI && op <= X_SARI {
-		x64_rr(cast(Buf, out), 0, 1, 0xC1, x64_shift_digit(op - X_SHLI), x, 0)
-		buf_byte(cast(Buf, out), y)
+		x64_rr(cast([]u8, out), 0, 1, 0xC1, x64_shift_digit(op - X_SHLI), x, 0)
+		buf_byte(cast([]u8, out), y)
 	} else if op == X_SETCC {
-		x64_rr(cast(Buf, out), 0, 0, 0x0F90 + y, 0, x, x64_byte_reg(x))
+		x64_rr(cast([]u8, out), 0, 0, 0x0F90 + y, 0, x, x64_byte_reg(x))
 	} else if op == X_CMOVCC {
-		x64_rr(cast(Buf, out), 0, 1, 0x0F40 + z, x, y, 0)
+		x64_rr(cast([]u8, out), 0, 1, 0x0F40 + z, x, y, 0)
 	} else if op == X_JMP {
 		if w != 0 {
-			buf_byte(cast(Buf, out), 0xEB)
+			buf_byte(cast([]u8, out), 0xEB)
 		} else {
-			buf_byte(cast(Buf, out), 0xE9)
+			buf_byte(cast([]u8, out), 0xE9)
 		}
-		x64_rel(cast(Buf, out), x64_label_addr(x), w)
+		x64_rel(cast([]u8, out), x64_label_addr(x), w)
 	} else if op == X_JCC {
 		if w != 0 {
-			buf_byte(cast(Buf, out), 0x70 + x)
+			buf_byte(cast([]u8, out), 0x70 + x)
 		} else {
-			buf_byte(cast(Buf, out), 0x0F)
-			buf_byte(cast(Buf, out), 0x80 + x)
+			buf_byte(cast([]u8, out), 0x0F)
+			buf_byte(cast([]u8, out), 0x80 + x)
 		}
-		x64_rel(cast(Buf, out), x64_label_addr(y), w)
+		x64_rel(cast([]u8, out), x64_label_addr(y), w)
 	} else if op == X_CALL {
-		buf_byte(cast(Buf, out), 0xE8)
-		let here = x64_base + out.len
+		buf_byte(cast([]u8, out), 0xE8)
+		let here = x64_base + len(out)
 		if cast(i64, x64_relocs) != 0 {
-			vec_push(x64_relocs, here)
-			vec_push(x64_relocs, x)
-			vec_push(x64_relocs, here + 4)
+			x64_relocs = append(x64_relocs, here)
+			x64_relocs = append(x64_relocs, x)
+			x64_relocs = append(x64_relocs, here + 4)
 		}
-		x64_imm32(cast(Buf, out), x64_sym_addr(x) - (here + 4))
+		x64_imm32(cast([]u8, out), x64_sym_addr(x) - (here + 4))
 	} else if op == X_CALL_R {
-		x64_rr(cast(Buf, out), 0, 0, 0xFF, 2, x, 0)
+		x64_rr(cast([]u8, out), 0, 0, 0xFF, 2, x, 0)
 	} else if op == X_RET {
-		buf_byte(cast(Buf, out), 0xC3)
+		buf_byte(cast([]u8, out), 0xC3)
 	} else if op == X_PUSH {
-		x64_rex(cast(Buf, out), 0, 0, 0, x, 0)
-		buf_byte(cast(Buf, out), 0x50 + (x & 7))
+		x64_rex(cast([]u8, out), 0, 0, 0, x, 0)
+		buf_byte(cast([]u8, out), 0x50 + (x & 7))
 	} else if op == X_POP {
-		x64_rex(cast(Buf, out), 0, 0, 0, x, 0)
-		buf_byte(cast(Buf, out), 0x58 + (x & 7))
+		x64_rex(cast([]u8, out), 0, 0, 0, x, 0)
+		buf_byte(cast([]u8, out), 0x58 + (x & 7))
 	} else if op == X_SXT {
 		if z == 0 {
-			x64_rr(cast(Buf, out), 0, 1, 0x0FBE, x, y, 0)
+			x64_rr(cast([]u8, out), 0, 1, 0x0FBE, x, y, 0)
 		} else if z == 1 {
-			x64_rr(cast(Buf, out), 0, 1, 0x0FBF, x, y, 0)
+			x64_rr(cast([]u8, out), 0, 1, 0x0FBF, x, y, 0)
 		} else {
-			x64_rr(cast(Buf, out), 0, 1, 0x63, x, y, 0)
+			x64_rr(cast([]u8, out), 0, 1, 0x63, x, y, 0)
 		}
 	} else if op == X_ZXT {
 		if z == 0 {
-			x64_rr(cast(Buf, out), 0, 0, 0x0FB6, x, y, x64_byte_reg(y))
+			x64_rr(cast([]u8, out), 0, 0, 0x0FB6, x, y, x64_byte_reg(y))
 		} else if z == 1 {
-			x64_rr(cast(Buf, out), 0, 0, 0x0FB7, x, y, 0)
+			x64_rr(cast([]u8, out), 0, 0, 0x0FB7, x, y, 0)
 		} else {
-			x64_rr(cast(Buf, out), 0, 0, 0x89, y, x, 0)
+			x64_rr(cast([]u8, out), 0, 0, 0x89, y, x, 0)
 		}
 	} else if op == X_MOVSD {
-		x64_rr(cast(Buf, out), 0xF2, 0, 0x0F10, x, y, 0)
+		x64_rr(cast([]u8, out), 0xF2, 0, 0x0F10, x, y, 0)
 	} else if op == X_MOVSD_LD {
-		x64_rm(cast(Vec[i64], out), 0xF2, 0, 0x0F10, x, y, 0)
+		x64_rm(out, 0xF2, 0, 0x0F10, x, y, 0)
 	} else if op == X_MOVSD_ST {
-		x64_rm(cast(Vec[i64], out), 0xF2, 0, 0x0F11, x, y, 0)
+		x64_rm(out, 0xF2, 0, 0x0F11, x, y, 0)
 	} else if op >= X_ADDSD && op <= X_SQRTSD {
-		x64_rr(cast(Buf, out), 0xF2, 0, 0x0F00 | i64(load8(cstr("\x58\x5c\x59\x5e\x51") + (op - X_ADDSD))), x, y, 0)
+		x64_rr(cast([]u8, out), 0xF2, 0, 0x0F00 | i64(load8(cstr("\x58\x5c\x59\x5e\x51") + (op - X_ADDSD))), x, y, 0)
 	} else if op == X_UCOMISD {
-		x64_rr(cast(Buf, out), 0x66, 0, 0x0F2E, x, y, 0)
+		x64_rr(cast([]u8, out), 0x66, 0, 0x0F2E, x, y, 0)
 	} else if op == X_CVTSI2SD {
-		x64_rr(cast(Buf, out), 0xF2, 1, 0x0F2A, x, y, 0)
+		x64_rr(cast([]u8, out), 0xF2, 1, 0x0F2A, x, y, 0)
 	} else if op == X_CVTTSD2SI {
-		x64_rr(cast(Buf, out), 0xF2, 1, 0x0F2C, x, y, 0)
+		x64_rr(cast([]u8, out), 0xF2, 1, 0x0F2C, x, y, 0)
 	} else if op == X_MOVQ {
 		if x >= XMM {
-			x64_rr(cast(Buf, out), 0x66, 1, 0x0F6E, x, y, 0)
+			x64_rr(cast([]u8, out), 0x66, 1, 0x0F6E, x, y, 0)
 		} else {
-			x64_rr(cast(Buf, out), 0x66, 1, 0x0F7E, y, x, 0)
+			x64_rr(cast([]u8, out), 0x66, 1, 0x0F7E, y, x, 0)
 		}
 	} else if op == X_XORPD {
-		x64_rr(cast(Buf, out), 0x66, 0, 0x0F57, x, y, 0)
+		x64_rr(cast([]u8, out), 0x66, 0, 0x0F57, x, y, 0)
 	} else if op == X_ANDPD {
-		x64_rr(cast(Buf, out), 0x66, 0, 0x0F54, x, y, 0)
+		x64_rr(cast([]u8, out), 0x66, 0, 0x0F54, x, y, 0)
 	} else if op == X_ROUNDSD {
-		x64_rr(cast(Buf, out), 0x66, 0, 0x0F3A0B, x, y, 0)
-		buf_byte(cast(Buf, out), z)
+		x64_rr(cast([]u8, out), 0x66, 0, 0x0F3A0B, x, y, 0)
+		buf_byte(cast([]u8, out), z)
 	} else if op == X_PREFETCHW {
-		x64_rm(cast(Vec[i64], out), 0, 0, 0x0F0D, 1, x, 0)
+		x64_rm(out, 0, 0, 0x0F0D, 1, x, 0)
 	} else if op == X_PREFETCHT0 {
-		x64_rm(cast(Vec[i64], out), 0, 0, 0x0F18, 1, x, 0)
+		x64_rm(out, 0, 0, 0x0F18, 1, x, 0)
 	} else if op == X_LOCK_XADD {
-		x64_rm(cast(Vec[i64], out), 0xF0, 1, 0x0FC1, x, y, 0)
+		x64_rm(out, 0xF0, 1, 0x0FC1, x, y, 0)
 	} else if op == X_XCHG {
-		x64_rm(cast(Vec[i64], out), 0, 1, 0x87, x, y, 0)
+		x64_rm(out, 0, 1, 0x87, x, y, 0)
 	} else if op == X_LOCK_CMPXCHG {
-		x64_rm(cast(Vec[i64], out), 0xF0, 1, 0x0FB1, x, y, 0)
+		x64_rm(out, 0xF0, 1, 0x0FB1, x, y, 0)
 	} else if op == X_MFENCE {
-		buf_byte(cast(Buf, out), 0x0F)
-		buf_byte(cast(Buf, out), 0xAE)
-		buf_byte(cast(Buf, out), 0xF0)
+		buf_byte(cast([]u8, out), 0x0F)
+		buf_byte(cast([]u8, out), 0xAE)
+		buf_byte(cast([]u8, out), 0xF0)
 	} else if op == X_PAUSE {
-		buf_byte(cast(Buf, out), 0xF3)
-		buf_byte(cast(Buf, out), 0x90)
+		buf_byte(cast([]u8, out), 0xF3)
+		buf_byte(cast([]u8, out), 0x90)
 	} else if op == X_UD2 {
-		buf_byte(cast(Buf, out), 0x0F)
-		buf_byte(cast(Buf, out), 0x0B)
+		buf_byte(cast([]u8, out), 0x0F)
+		buf_byte(cast([]u8, out), 0x0B)
 	} else if op == X_MOVSS_LD {
-		x64_rm(cast(Vec[i64], out), 0xF3, 0, 0x0F10, x, y, 0)
+		x64_rm(out, 0xF3, 0, 0x0F10, x, y, 0)
 	} else if op == X_MOVSS_ST {
-		x64_rm(cast(Vec[i64], out), 0xF3, 0, 0x0F11, x, y, 0)
+		x64_rm(out, 0xF3, 0, 0x0F11, x, y, 0)
 	} else if op == X_CVTSD2SS {
-		x64_rr(cast(Buf, out), 0xF2, 0, 0x0F5A, x, y, 0)
+		x64_rr(cast([]u8, out), 0xF2, 0, 0x0F5A, x, y, 0)
 	} else if op == X_CVTSS2SD {
-		x64_rr(cast(Buf, out), 0xF3, 0, 0x0F5A, x, y, 0)
+		x64_rr(cast([]u8, out), 0xF3, 0, 0x0F5A, x, y, 0)
 	} else if op == X_MOVD_RX {
-		x64_rr(cast(Buf, out), 0x66, 0, 0x0F7E, y, x, 0)
+		x64_rr(cast([]u8, out), 0x66, 0, 0x0F7E, y, x, 0)
 	} else if op == X_RAWB {
-		buf_byte(cast(Buf, out), x)
+		buf_byte(cast([]u8, out), x)
 	} else {
 		x64_fail(cstr("cannot encode instruction"))
 	}
-	return out.len - start
+	return len(out) - start
 }
 
 fn x64_shift_digit(i i64) i64 {
@@ -976,7 +976,7 @@ fn x64_shift_digit(i i64) i64 {
 }
 
 // x64_enc_load picks mov, movzx, movsx or movsxd for a sized load into rt.
-fn x64_enc_load(out Vec[i64], rt i64, m i64, kind i64) {
+fn x64_enc_load(out []u8, rt i64, m i64, kind i64) {
 	let size = kind & 3
 	let signed = kind & XK_SIGNED
 	if size == 3 {
@@ -997,7 +997,7 @@ fn x64_enc_load(out Vec[i64], rt i64, m i64, kind i64) {
 }
 
 // x64_enc_alu_imm emits the 83 ib form when the immediate fits a byte, else 81 id (test: F7 id).
-fn x64_enc_alu_imm(out Buf, i i64, rd i64, imm i64) {
+fn x64_enc_alu_imm(out []u8, i i64, rd i64, imm i64) {
 	if i == X_TESTI - X_ADDI {
 		x64_rr(out, 0, 1, 0xF7, 0, rd, 0)
 		x64_imm32(out, imm)
@@ -1012,13 +1012,13 @@ fn x64_enc_alu_imm(out Buf, i i64, rd i64, imm i64) {
 
 // ---- layout ----
 // x64_place assigns every label its address with the current branch forms and returns the code size.
-fn x64_place(code Vec[i64], base i64) i64 {
+fn x64_place(code []i64, base i64) i64 {
 	mut pc = base
 	mut i = 0
-	for i < code.len {
-		let ins = code.data + 8 * i
+	for i < len(code) {
+		let ins = slice_data(code) + 8 * i
 		if ins[0] == X_LABEL {
-			x64_labels.data[ins[1]] = pc
+			x64_labels[ins[1]] = pc
 		} else {
 			pc = pc + x64_size(ins, pc)
 		}
@@ -1030,12 +1030,12 @@ fn x64_place(code Vec[i64], base i64) i64 {
 // x64_relax shrinks every rel32 branch whose target is within rel8 range and returns whether any
 // changed; distances all come from the placement before this pass (sizes are measured before a
 // branch is flipped), and since shrinking only moves targets closer a branch that fits keeps fitting.
-fn x64_relax(code Vec[i64], base i64) i64 {
+fn x64_relax(code []i64, base i64) i64 {
 	mut changed = 0
 	mut pc = base
 	mut i = 0
-	for i < code.len {
-		let ins = code.data + 8 * i
+	for i < len(code) {
+		let ins = slice_data(code) + 8 * i
 		let op = ins[0]
 		let len_ = x64_size(ins, pc)
 		if (op == X_JMP || op == X_JCC) && ins[4] == 0 {
@@ -1065,17 +1065,17 @@ fn x64_relax(code Vec[i64], base i64) i64 {
 
 // x64_layout lays code (a flat vector of five-word instructions) out from base: it assigns
 // label addresses into x64_labels, shrinks branches to rel8 until nothing changes and returns the size.
-fn x64_layout(code Vec[i64], base i64) i64 {
+fn x64_layout(code []i64, base i64) i64 {
 	mut n = 0
 	mut i = 0
-	for i < code.len {
-		let ins = code.data + 8 * i
+	for i < len(code) {
+		let ins = slice_data(code) + 8 * i
 		if ins[0] == X_LABEL && ins[1] >= n {
 			n = ins[1] + 1
 		}
 		i = i + 5
 	}
-	x64_labels = vec_filled(n, 0)
+	x64_labels = slice_filled(n, 0)
 	x64_passes = 0
 	mut size = x64_place(code, base)
 	for x64_relax(code, base) != 0 {
@@ -1087,15 +1087,15 @@ fn x64_layout(code Vec[i64], base i64) i64 {
 
 // x64_assemble lays code out at base and returns a buffer with its machine code; relocations
 // against symbols are left in x64_relocs.
-fn x64_assemble(code Vec[i64], base i64) i64 {
+fn x64_assemble(code []i64, base i64) []u8 {
 	x64_layout(code, base)
-	x64_relocs = vec_new[i64]()
+	x64_relocs = []i64{}
 	let out = buf_new()
 	mut pc = base
 	mut i = 0
-	for i < code.len {
-		pc = pc + x64_encode(code.data + 8 * i, pc, cast(Vec[i64], out))
+	for i < len(code) {
+		pc = pc + x64_encode(slice_data(code) + 8 * i, pc, out)
 		i = i + 5
 	}
-	return cast(i64, out)
+	return cast([]u8, cast(i64, out))
 }

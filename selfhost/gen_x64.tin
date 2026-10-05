@@ -24,8 +24,8 @@ const XP_RET = 100 // pseudo return, expanded into the epilogue by x_finish_fn
 
 shared mut mm_scale i64 // x_gen_mem_addr result: the index scale (1, 2, 4 or 8)
 shared mut cmp_unord i64 // x_gen_compare result: 1 when unordered means false, 2 when true
-shared mut x_syms Vec[i64] // symbol table: id -> sym_ref word (memory operands only hold 32 bits)
-shared mut x_fn_labels Vec[i64] // function index -> entry label
+shared mut x_syms []i64 // symbol table: id -> sym_ref word (memory operands only hold 32 bits)
+shared mut x_fn_labels []i64 // function index -> entry label
 shared mut x_nstack i64 // stack parameters of the current function
 shared mut x_div_label i64 // the current function's divide-by-zero stub, once used
 
@@ -35,26 +35,26 @@ fn x_label(l i64) {
 
 // x_sym registers a sym_ref word and returns the id instructions refer to it by.
 fn x_sym(kind i64, index i64) i64 {
-	vec_push(x_syms, sym_ref(kind, index))
-	return x_syms.len - 1
+	x_syms = append(x_syms, sym_ref(kind, index))
+	return len(x_syms) - 1
 }
 
 // x64_fn_name returns the name of the function a direct call's symbol id refers to, for
 // the -S listing; 0 for any other symbol kind or an unset table. x_syms is owned here,
 // so asm_x64.tin (which the encoder fuzzer builds alone) only sees the wrapper.
 fn x64_fn_name(id i64) i64 {
-	if cast(i64, x_syms) == 0 || id < 0 || id >= x_syms.len {
+	if cast(i64, x_syms) == 0 || id < 0 || id >= len(x_syms) {
 		return 0
 	}
-	let sym = vec_get(cast(Vec[i64], x_syms), id)
+	let sym = cast([]i64, x_syms)[id]
 	if sym >> 32 != SK_FN {
 		return 0
 	}
 	let index = sym & 0xffffffff
-	if index >= prog_fns.len {
+	if index >= len(prog_fns) {
 		return 0
 	}
-	let f = vec_get(prog_fns, index)
+	let f = prog_fns[index]
 	if f.qname != 0 {
 		return f.qname
 	}
@@ -735,8 +735,8 @@ fn x_gen_dyn_pair(e i64, obj i64, tab i64, d i64) {
 	}
 	if k == EX_CONV && cast(Conv, e).kind == CV_DYN {
 		x_gen_to(cast(Conv, e).x, obj, d)
-		let rec = cast(Vec[i64], vec_get(dyn_tables, cast(Conv, e).dyn_table))
-		emit2(X_LEA, tab, x64_mem_sym(x_sym(SK_VAR, vec_get(rec, 4))))
+		let rec = cast([]i64, dyn_tables[cast(Conv, e).dyn_table])
+		emit2(X_LEA, tab, x64_mem_sym(x_sym(SK_VAR, rec[4])))
 		return
 	}
 	if k == EX_CONV && cast(Conv, e).kind == CV_DYN_KEEP {
@@ -1240,10 +1240,10 @@ fn x_gen_seq(e i64, dst i64, d i64) {
 	mut i = 0
 	for i < d {
 		if i < t_count {
-			x_push(vec_get(t_regs, i))
+			x_push(t_regs[i])
 		}
 		if i < f_count {
-			x_push(vec_get(f_regs, i))
+			x_push(f_regs[i])
 		}
 		i = i + 1
 	}
@@ -1251,10 +1251,10 @@ fn x_gen_seq(e i64, dst i64, d i64) {
 	i = d - 1
 	for i >= 0 {
 		if i < f_count {
-			x_pop(vec_get(f_regs, i))
+			x_pop(f_regs[i])
 		}
 		if i < t_count {
-			x_pop(vec_get(t_regs, i))
+			x_pop(t_regs[i])
 		}
 		i = i - 1
 	}
@@ -1296,12 +1296,12 @@ fn x_am_operand() i64 {
 fn x_gen_intrinsic(e Call, dst i64, d i64) {
 	let name = e.name
 	if streq(name, cstr("__prefetchw")) != 0 {
-		x_gen_pair(vec_get(cast(Vec[i64], e.args), 0), vec_get(cast(Vec[i64], e.args), 1), d)
+		x_gen_pair(e.args[0], e.args[1], d)
 		emit1(X_PREFETCHW, x64_mem(pl, pr, 8, 0))
 		return
 	}
 	if streq(name, cstr("load8")) != 0 {
-		x_gen_addr8(vec_get(cast(Vec[i64], e.args), 0), d)
+		x_gen_addr8(e.args[0], d)
 		emit3(X_LOAD, dst, x_am_operand(), 0)
 		return
 	}
@@ -1369,7 +1369,7 @@ fn x_float_intrinsic(name i64, dst i64, x i64) i64 {
 // Runtime intrinsics: the thread context register and atomics for lib/runtime.tin.
 fn x_gen_runtime_intrinsic(e Call, dst i64, d i64) i64 {
 	let name = e.name
-	let args = cast(Vec[i64], e.args)
+	let args = e.args
 	if streq(name, cstr("__ctx")) != 0 {
 		x_mov(dst, XCTX)
 		return 1
@@ -1379,20 +1379,20 @@ fn x_gen_runtime_intrinsic(e Call, dst i64, d i64) i64 {
 		return 1
 	}
 	if i64(load8(name)) == '_' && i64(load8(name + 1)) == '_' && i64(load8(name + 2)) == 'f' {
-		let fx = x_gen_val(vec_get(args, 0), d)
+		let fx = x_gen_val(args[0], d)
 		if x_float_intrinsic(name, dst, fx) != 0 {
 			return 1
 		}
 	}
 	if streq(name, cstr("__st")) != 0 {
 		// __st(p, v, sizelog2): a raw sized store for the runtime.
-		x_gen_pair(vec_get(args, 0), vec_get(args, 1), d)
-		emit3(X_STORE, pr, x_mem1(pl, 0), const_val(vec_get(args, 2)))
+		x_gen_pair(args[0], args[1], d)
+		emit3(X_STORE, pr, x_mem1(pl, 0), const_val(args[2]))
 		return 1
 	}
 	if streq(name, cstr("__ld")) != 0 {
-		let p = x_gen_val(vec_get(args, 0), d)
-		let k = vec_get(args, 1)
+		let p = x_gen_val(args[0], d)
+		let k = args[1]
 		if is_const(k) != 0 {
 			emit3(X_LOAD, dst, x_mem1(p, 0), const_val(k))
 		} else {
@@ -1413,12 +1413,12 @@ fn x_gen_runtime_intrinsic(e Call, dst i64, d i64) i64 {
 		return 1
 	}
 	if streq(name, cstr("__set_ctx")) != 0 {
-		x_gen_to(vec_get(args, 0), XCTX, d)
+		x_gen_to(args[0], XCTX, d)
 		return 1
 	}
 	if streq(name, cstr("__atomic_add")) != 0 {
 		// Returns the old value: lock xadd adds r11 to [p] and leaves the old value in r11.
-		x_gen_pair(vec_get(args, 0), vec_get(args, 1), d)
+		x_gen_pair(args[0], args[1], d)
 		x_mov(XSCR, pr)
 		emit2(X_LOCK_XADD, XSCR, x_mem1(pl, 0))
 		if dst >= 0 {
@@ -1428,11 +1428,11 @@ fn x_gen_runtime_intrinsic(e Call, dst i64, d i64) i64 {
 	}
 	if streq(name, cstr("__atomic_cas")) != 0 {
 		// __atomic_cas(p, old, new) returns the value found at p.
-		let p = x_gen_val(vec_get(args, 0), d)
+		let p = x_gen_val(args[0], d)
 		let d1 = next_depth(p, d)
-		let o = x_gen_val(vec_get(args, 1), d1)
+		let o = x_gen_val(args[1], d1)
 		let d2 = next_depth(o, d1)
-		mut n = x_gen_val(vec_get(args, 2), d2)
+		mut n = x_gen_val(args[2], d2)
 		if n == RAX {
 			x_mov(XSCR, n)
 			n = XSCR
@@ -1445,7 +1445,7 @@ fn x_gen_runtime_intrinsic(e Call, dst i64, d i64) i64 {
 		return 1
 	}
 	if streq(name, cstr("__atomic_swap")) != 0 {
-		x_gen_pair(vec_get(args, 0), vec_get(args, 1), d)
+		x_gen_pair(args[0], args[1], d)
 		x_mov(XSCR, pr)
 		emit2(X_XCHG, XSCR, x_mem1(pl, 0))
 		if dst >= 0 {
@@ -1454,13 +1454,13 @@ fn x_gen_runtime_intrinsic(e Call, dst i64, d i64) i64 {
 		return 1
 	}
 	if streq(name, cstr("__atomic_load")) != 0 {
-		let p = x_gen_val(vec_get(args, 0), d)
+		let p = x_gen_val(args[0], d)
 		emit3(X_LOAD, dst, x_mem1(p, 0), 3)
 		return 1
 	}
 	if streq(name, cstr("__atomic_store")) != 0 {
 		// xchg is a full barrier, like stlr.
-		x_gen_pair(vec_get(args, 0), vec_get(args, 1), d)
+		x_gen_pair(args[0], args[1], d)
 		x_mov(XSCR, pr)
 		emit2(X_XCHG, XSCR, x_mem1(pl, 0))
 		return 1
@@ -1474,8 +1474,8 @@ fn x_gen_runtime_intrinsic(e Call, dst i64, d i64) i64 {
 
 // x_gen_store8 stores a byte and, when dst >= 0, also yields the stored value.
 fn x_gen_store8(e Call, dst i64, d i64) {
-	let p = vec_get(cast(Vec[i64], e.args), 0)
-	let v = vec_get(cast(Vec[i64], e.args), 1)
+	let p = e.args[0]
+	let v = e.args[1]
 	mut base = 0
 	mut index = -1
 	mut off = 0
@@ -1529,37 +1529,37 @@ fn x_res_reg(i i64) i64 {
 // counted separately, or -1 for an argument that goes on the stack.
 fn x_arg_regs(e Call) i64 {
 	let ptypes = call_ptypes(e)
-	let n = cast(Vec[i64], e.args).len
-	let regs = vec_new[i64]()
+	let n = len(e.args)
+	let regs = []i64{}
 	mut ni = 0
 	mut nf = 0
 	mut i = 0
 	for i < n {
-		let t = cast(Node, vec_get(cast(Vec[i64], e.args), i)).type_
-		mut fp = i64(i < ptypes.len && is_float_t(vec_get(ptypes, i)) != 0)
-		if i >= ptypes.len {
-			fp = e_fp(cast(Node, vec_get(cast(Vec[i64], e.args), i)))
+		let t = cast(Node, e.args[i]).type_
+		mut fp = i64(i < len(ptypes) && is_float_t(ptypes[i]) != 0)
+		if i >= len(ptypes) {
+			fp = e_fp(cast(Node, e.args[i]))
 		}
-		if i < ptypes.len && is_dyn_value(cast(Ty, t)) != 0 {
+		if i < len(ptypes) && is_dyn_value(cast(Ty, t)) != 0 {
 			if ni + 1 < 6 {
-				vec_push(regs, x_int_arg(ni))
+				regs = append(regs, x_int_arg(ni))
 				ni = ni + 2
 			} else {
-				vec_push(regs, -1)
+				regs = append(regs, -1)
 				ni = 6
 			}
 		} else if fp != 0 {
 			if nf < 8 {
-				vec_push(regs, XMM + nf)
+				regs = append(regs, XMM + nf)
 			} else {
-				vec_push(regs, -1)
+				regs = append(regs, -1)
 			}
 			nf = nf + 1
 		} else {
 			if ni < 6 {
-				vec_push(regs, x_int_arg(ni))
+				regs = append(regs, x_int_arg(ni))
 			} else {
-				vec_push(regs, -1)
+				regs = append(regs, -1)
 			}
 			ni = ni + 1
 		}
@@ -1568,21 +1568,21 @@ fn x_arg_regs(e Call) i64 {
 	return cast(i64, regs)
 }
 
-fn x_arg_regs2(e Call, areg Vec[i64]) i64 {
+fn x_arg_regs2(e Call, areg []i64) i64 {
 	let ptypes = call_ptypes(e)
-	let n = cast(Vec[i64], e.args).len
-	let regs = vec_filled(n, -1)
+	let n = len(e.args)
+	let regs = slice_filled(n, -1)
 	mut ni = 0
 	mut nf = 0
 	mut i = 0
 	for i < n {
-		mut fp = i64(i < ptypes.len && is_float_t(vec_get(ptypes, i)) != 0)
-		if i >= ptypes.len {
-			fp = e_fp(cast(Node, vec_get(cast(Vec[i64], e.args), i)))
+		mut fp = i64(i < len(ptypes) && is_float_t(ptypes[i]) != 0)
+		if i >= len(ptypes) {
+			fp = e_fp(cast(Node, e.args[i]))
 		}
-		if i < ptypes.len && is_dyn_value(cast(Ty, cast(Node, vec_get(cast(Vec[i64], e.args), i)).type_)) != 0 {
-			if vec_get(areg, i) >= 0 {
-				regs.data[i] = x_int_arg(ni + 1)
+		if i < len(ptypes) && is_dyn_value(cast(Ty, cast(Node, e.args[i]).type_)) != 0 {
+			if areg[i] >= 0 {
+				regs[i] = x_int_arg(ni + 1)
 			}
 			ni = ni + 2
 		} else if fp != 0 {
@@ -1607,8 +1607,8 @@ fn x_caller_saved(r i64) i64 {
 fn x_save_local_fp_homes() {
 	let locals = cast(Fn, cur_gen_fn).locals
 	mut i = 0
-	for i < locals.len {
-		let s = vec_get(locals, i)
+	for i < len(locals) {
+		let s = locals[i]
 		if is_float_t(s.type_) != 0 && s.reg >= XMM + 8 && s.reg <= XMM + 14 {
 			x_push(s.reg)
 		}
@@ -1618,9 +1618,9 @@ fn x_save_local_fp_homes() {
 
 fn x_restore_local_fp_homes() {
 	let locals = cast(Fn, cur_gen_fn).locals
-	mut i = locals.len - 1
+	mut i = len(locals) - 1
 	for i >= 0 {
-		let s = vec_get(locals, i)
+		let s = locals[i]
 		if is_float_t(s.type_) != 0 && s.reg >= XMM + 8 && s.reg <= XMM + 14 {
 			x_pop(s.reg)
 		}
@@ -1632,11 +1632,11 @@ fn x_restore_local_fp_homes() {
 fn x_save_temps(d i64) {
 	mut i = 0
 	for i < d {
-		if i < t_count && x_caller_saved(vec_get(t_regs, i)) != 0 {
-			x_push(vec_get(t_regs, i))
+		if i < t_count && x_caller_saved(t_regs[i]) != 0 {
+			x_push(t_regs[i])
 		}
 		if i < f_count {
-			x_push(vec_get(f_regs, i))
+			x_push(f_regs[i])
 		}
 		i = i + 1
 	}
@@ -1648,10 +1648,10 @@ fn x_restore_temps(d i64) {
 	mut i = d - 1
 	for i >= 0 {
 		if i < f_count {
-			x_pop(vec_get(f_regs, i))
+			x_pop(f_regs[i])
 		}
-		if i < t_count && x_caller_saved(vec_get(t_regs, i)) != 0 {
-			x_pop(vec_get(t_regs, i))
+		if i < t_count && x_caller_saved(t_regs[i]) != 0 {
+			x_pop(t_regs[i])
 		}
 		i = i - 1
 	}
@@ -1667,13 +1667,13 @@ fn x_gen_call(e i64, d i64) {
 		return
 	}
 	let args = cast(Call, e).args
-	let n = args.len
-	let areg = cast(Vec[i64], x_arg_regs(cast(Call, e)))
-	let areg2 = cast(Vec[i64], x_arg_regs2(cast(Call, e), areg))
+	let n = len(args)
+	let areg = cast([]i64, x_arg_regs(cast(Call, e)))
+	let areg2 = cast([]i64, x_arg_regs2(cast(Call, e), areg))
 	let f = cast(Fn, cast(Call, e).fn_)
 	x_save_temps(d)
-	let stackoffs = vec_filled(n, -1)
-	let pushslots = vec_filled(n, -1)
+	let stackoffs = slice_filled(n, -1)
+	let pushslots = slice_filled(n, -1)
 	mut stack_words = 0
 	mut stage_slot = 0
 	if cast(i64, f) == 0 {
@@ -1682,23 +1682,23 @@ fn x_gen_call(e i64, d i64) {
 	mut nvec = 0
 	mut i = 0
 	for i < n {
-		let a = cast(Node, vec_get(args, i))
-		pushslots.data[i] = stage_slot
+		let a = cast(Node, args[i])
+		pushslots[i] = stage_slot
 		if is_dyn_value(cast(Ty, a.type_)) != 0 {
 			stage_slot = stage_slot + 2
 		} else {
 			stage_slot = stage_slot + 1
 		}
-		if vec_get(areg, i) < 0 {
+		if areg[i] < 0 {
 			if is_dyn_value(cast(Ty, a.type_)) != 0 {
 				stack_words = align_up(stack_words, 2)
-				stackoffs.data[i] = 8 * stack_words
+				stackoffs[i] = 8 * stack_words
 				stack_words = stack_words + 2
 			} else {
-				stackoffs.data[i] = 8 * stack_words
+				stackoffs[i] = 8 * stack_words
 				stack_words = stack_words + 1
 			}
-		} else if vec_get(areg, i) >= XMM {
+		} else if areg[i] >= XMM {
 			nvec = nvec + 1
 		}
 		i = i + 1
@@ -1714,7 +1714,7 @@ fn x_gen_call(e i64, d i64) {
 	}
 	i = 0
 	for i < n {
-		let a = cast(Node, vec_get(args, i))
+		let a = cast(Node, args[i])
 		if is_dyn_value(cast(Ty, a.type_)) != 0 {
 			let r0 = treg(d)
 			let r1 = treg(d + 1)
@@ -1728,24 +1728,24 @@ fn x_gen_call(e i64, d i64) {
 	}
 	i = n - 1
 	for i >= 0 {
-		let a = cast(Node, vec_get(args, i))
-		let r = vec_get(areg, i)
-		let pushslot = vec_get(pushslots, i)
+		let a = cast(Node, args[i])
+		let r = areg[i]
+		let pushslot = pushslots[i]
 		if is_dyn_value(cast(Ty, a.type_)) != 0 {
 			if r >= 0 {
-				x_pop(vec_get(areg2, i))
+				x_pop(areg2[i])
 				x_pop(r)
 			} else {
 				x_pop(XSCR)
-				x_st(XSCR, x_mem1(RSP, 16 * (pushslot + 1) + vec_get(stackoffs, i) + 8), 3)
+				x_st(XSCR, x_mem1(RSP, 16 * (pushslot + 1) + stackoffs[i] + 8), 3)
 				x_pop(XSCR)
-				x_st(XSCR, x_mem1(RSP, 16 * pushslot + vec_get(stackoffs, i)), 3)
+				x_st(XSCR, x_mem1(RSP, 16 * pushslot + stackoffs[i]), 3)
 			}
 		} else if r >= 0 {
 			x_pop(r)
 		} else {
 			x_pop(XSCR)
-			x_st(XSCR, x_mem1(RSP, 16 * pushslot + vec_get(stackoffs, i)), 3)
+			x_st(XSCR, x_mem1(RSP, 16 * pushslot + stackoffs[i]), 3)
 		}
 		i = i - 1
 	}
@@ -2143,15 +2143,15 @@ fn x_gen_while(s WhileStmt) {
 	if s.once_ != 0 {
 		// A switch: break leaves it, continue goes to the enclosing loop.
 		mut cont = -1
-		if g_loops.len >= 2 {
-			cont = vec_get(g_loops, g_loops.len - 2)
+		if len(g_loops) >= 2 {
+			cont = g_loops[len(g_loops) - 2]
 		}
-		vec_push(g_loops, cont)
-		vec_push(g_loops, end_l)
-		vec_push(g_loop_labels, 0)
+		g_loops = append(g_loops, cont)
+		g_loops = append(g_loops, end_l)
+		g_loop_labels = append(g_loop_labels, 0)
 		x_gen_stmts(cast(Block, s.body).stmts)
-		g_loops.len = g_loops.len - 2
-		g_loop_labels.len = g_loop_labels.len - 1
+		slice_truncate(g_loops, len(g_loops) - 2)
+		slice_truncate(g_loop_labels, len(g_loop_labels) - 1)
 		x_label(end_l)
 		return
 	}
@@ -2171,12 +2171,12 @@ fn x_gen_while(s WhileStmt) {
 	}
 	x_label(body_l)
 	x_gen_poll()
-	vec_push(g_loops, cont_l)
-	vec_push(g_loops, end_l)
-	vec_push(g_loop_labels, s.label)
+	g_loops = append(g_loops, cont_l)
+	g_loops = append(g_loops, end_l)
+	g_loop_labels = append(g_loop_labels, s.label)
 	x_gen_stmts(cast(Block, s.body).stmts)
-	g_loops.len = g_loops.len - 2
-	g_loop_labels.len = g_loop_labels.len - 1
+	slice_truncate(g_loops, len(g_loops) - 2)
+	slice_truncate(g_loop_labels, len(g_loop_labels) - 1)
 	x_label(post_l)
 	if s.post != 0 {
 		x_gen_stmt(s.post)
@@ -2190,16 +2190,16 @@ fn x_gen_while(s WhileStmt) {
 	x_label(end_l)
 }
 
-fn x_gen_stmts(stmts Vec[i64]) {
+fn x_gen_stmts(stmts []i64) {
 	mut i = 0
-	for i < stmts.len {
-		x_gen_stmt(vec_get(stmts, i))
+	for i < len(stmts) {
+		x_gen_stmt(stmts[i])
 		i = i + 1
 	}
 }
 
 fn x_result_reg(f Fn) i64 {
-	if cast(Vec[i64], f.rtypes).len == 1 && is_float_t(vec_get(cast(Vec[i64], f.rtypes), 0)) != 0 {
+	if len(f.rtypes) == 1 && is_float_t(f.rtypes[0]) != 0 {
 		return XMM
 	}
 	return RAX
@@ -2237,24 +2237,24 @@ fn x_gen_stmt(s i64) {
 	} else if k == ST_RETURN {
 		x_gen_return(cast(ReturnStmt, s))
 	} else if k == ST_BREAK && cast(BreakStmt, s).label != 0 {
-		emit1(X_JMP, vec_get(g_loops, 2 * loop_with_label(cast(BreakStmt, s).label) + 1))
+		emit1(X_JMP, g_loops[2 * loop_with_label(cast(BreakStmt, s).label) + 1])
 	} else if k == ST_CONTINUE && cast(ContinueStmt, s).label != 0 {
-		emit1(X_JMP, vec_get(g_loops, 2 * loop_with_label(cast(ContinueStmt, s).label)))
+		emit1(X_JMP, g_loops[2 * loop_with_label(cast(ContinueStmt, s).label)])
 	} else if k == ST_BREAK {
-		emit1(X_JMP, vec_get(g_loops, g_loops.len - 1))
+		emit1(X_JMP, g_loops[len(g_loops) - 1])
 	} else if k == ST_CONTINUE {
 		// A switch block passes continue on to the loop around it.
-		mut i = g_loops.len - 2
-		for vec_get(g_loops, i) < 0 {
+		mut i = len(g_loops) - 2
+		for g_loops[i] < 0 {
 			i = i - 2
 		}
-		emit1(X_JMP, vec_get(g_loops, i))
+		emit1(X_JMP, g_loops[i])
 	} else if k == ST_CALLMULTI {
 		x_gen_call(cast(CallMultiStmt, s).call, 0)
 		let syms = cast(CallMultiStmt, s).syms
 		mut i = 0
-		for i < syms.len {
-			let sym = vec_get(syms, i)
+		for i < len(syms) {
+			let sym = syms[i]
 			if sym.reg >= 0 {
 				x_mov(sym.reg, x_res_reg(i))
 			} else if sym.reg == REG_SLOT {
@@ -2270,13 +2270,13 @@ fn x_gen_stmt(s i64) {
 fn x_gen_return(s ReturnStmt) {
 	let f = cur_gen_fn
 	if cast(i64, s.values) != 0 {
-		let vals = cast(Vec[i64], s.values)
-		let lanes = vec_new[i64]()
+		let vals = s.values
+		let lanes = []i64{}
 		mut nlanes = 0
 		mut i = 0
-		for i < vals.len {
-			let v = cast(Node, vec_get(vals, i))
-			vec_push(lanes, nlanes)
+		for i < len(vals) {
+			let v = cast(Node, vals[i])
+			lanes = append(lanes, nlanes)
 			if is_dyn_value(cast(Ty, v.type_)) != 0 {
 				let r0 = treg(0)
 				let r1 = treg(1)
@@ -2290,10 +2290,10 @@ fn x_gen_return(s ReturnStmt) {
 			}
 			i = i + 1
 		}
-		i = vals.len - 1
+		i = len(vals) - 1
 		for i >= 0 {
-			let v = cast(Node, vec_get(vals, i))
-			let start = vec_get(lanes, i)
+			let v = cast(Node, vals[i])
+			let start = lanes[i]
 			if is_dyn_value(cast(Ty, v.type_)) != 0 {
 				x_pop(x_res_reg(start + 1))
 				x_pop(x_res_reg(start))
@@ -2324,10 +2324,10 @@ fn x_gen_flags(e i64, d i64) i64 {
 		mut i = 0
 		for i < d {
 			if i < t_count {
-				x_push(vec_get(t_regs, i))
+				x_push(t_regs[i])
 			}
 			if i < f_count {
-				x_push(vec_get(f_regs, i))
+				x_push(f_regs[i])
 			}
 			i = i + 1
 		}
@@ -2335,10 +2335,10 @@ fn x_gen_flags(e i64, d i64) i64 {
 		i = d - 1
 		for i >= 0 {
 			if i < f_count {
-				x_pop(vec_get(f_regs, i))
+				x_pop(f_regs[i])
 			}
 			if i < t_count {
-				x_pop(vec_get(t_regs, i))
+				x_pop(t_regs[i])
 			}
 			i = i - 1
 		}
@@ -2448,19 +2448,19 @@ fn x_try_select(s IfStmt) i64 {
 // ---- functions ----
 // x_par_move performs the moves dsts[i] = srcs[i] in parallel: a destination is written
 // only once no pending move still reads it, and a cycle is broken through a scratch register.
-fn x_par_move(dsts Vec[i64], srcs Vec[i64]) {
-	let n = dsts.len
-	let done = vec_filled(n, 0)
+fn x_par_move(dsts []i64, srcs []i64) {
+	let n = len(dsts)
+	let done = slice_filled(n, 0)
 	mut left = n
 	for left > 0 {
 		mut progress = 0
 		mut i = 0
 		for i < n {
-			if vec_get(done, i) == 0 {
-				let dst = vec_get(dsts, i)
-				if dst == vec_get(srcs, i) || x_pending_src(srcs, cast(Vec[i64], done), dst) == 0 {
-					x_mov(dst, vec_get(srcs, i))
-					cast(Vec[i64], done).data[i] = 1
+			if done[i] == 0 {
+				let dst = dsts[i]
+				if dst == srcs[i] || x_pending_src(srcs, cast([]i64, done), dst) == 0 {
+					x_mov(dst, srcs[i])
+					cast([]i64, done)[i] = 1
 					left = left - 1
 					progress = 1
 				}
@@ -2469,10 +2469,10 @@ fn x_par_move(dsts Vec[i64], srcs Vec[i64]) {
 		}
 		if left > 0 && progress == 0 {
 			i = 0
-			for vec_get(done, i) != 0 {
+			for done[i] != 0 {
 				i = i + 1
 			}
-			let blocked = vec_get(dsts, i)
+			let blocked = dsts[i]
 			mut scr = XSCR
 			if is_fp(blocked) != 0 {
 				scr = XFSCR
@@ -2480,8 +2480,8 @@ fn x_par_move(dsts Vec[i64], srcs Vec[i64]) {
 			x_mov(scr, blocked)
 			mut j = 0
 			for j < n {
-				if vec_get(done, j) == 0 && vec_get(srcs, j) == blocked {
-					srcs.data[j] = scr
+				if done[j] == 0 && srcs[j] == blocked {
+					srcs[j] = scr
 				}
 				j = j + 1
 			}
@@ -2489,10 +2489,10 @@ fn x_par_move(dsts Vec[i64], srcs Vec[i64]) {
 	}
 }
 
-fn x_pending_src(srcs Vec[i64], done Vec[i64], r i64) i64 {
+fn x_pending_src(srcs []i64, done []i64, r i64) i64 {
 	mut j = 0
-	for j < srcs.len {
-		if vec_get(done, j) == 0 && vec_get(srcs, j) == r {
+	for j < len(srcs) {
+		if done[j] == 0 && srcs[j] == r {
 			return 1
 		}
 		j = j + 1
@@ -2503,10 +2503,10 @@ fn x_pending_src(srcs Vec[i64], done Vec[i64], r i64) i64 {
 // A non-leaf function can use caller-saved XMM homes when its calls stay outside loops.
 // x_save_temps preserves those homes around each call; keeping calls out of loops avoids
 // adding spills to a hot iteration.
-fn x_stmts_calls_in_loop(stmts Vec[i64]) i64 {
+fn x_stmts_calls_in_loop(stmts []i64) i64 {
 	mut i = 0
-	for i < stmts.len {
-		if x_stmt_calls_in_loop(vec_get(stmts, i)) != 0 {
+	for i < len(stmts) {
+		if x_stmt_calls_in_loop(stmts[i]) != 0 {
 			return 1
 		}
 		i = i + 1
@@ -2534,24 +2534,24 @@ fn x_stmt_calls_in_loop(s i64) i64 {
 // x_assign_homes gives each local a register or frame slot and builds the temp pools.
 // It returns the number of frame slots.
 fn x_assign_homes(f Fn) i64 {
-	let locals = cast(Vec[i64], f.locals)
+	let locals = cast([]i64, f.locals)
 	let leaf = f.leaf
 	let fp_homes = i64(leaf != 0 || x_stmts_calls_in_loop(cast(Block, f.body).stmts) == 0)
-	let pool = vec_new[i64]()
-	vec_push(pool, RBX)
-	vec_push(pool, R12)
-	vec_push(pool, R13)
-	vec_push(pool, R14)
-	let fpool = vec_new[i64]()
+	let pool = []i64{}
+	pool = append(pool, RBX)
+	pool = append(pool, R12)
+	pool = append(pool, R13)
+	pool = append(pool, R14)
+	let fpool = []i64{}
 	mut r = 8
 	for fp_homes != 0 && r <= 14 {
-		vec_push(fpool, XMM + r)
+		fpool = append(fpool, XMM + r)
 		r = r + 1
 	}
 	mut nslots = 0
 	mut i = 0
-	for i < locals.len {
-		let s = cast(Sym, vec_get(locals, i))
+	for i < len(locals) {
+		let s = cast(Sym, locals[i])
 		s.reg = REG_DEAD
 		if is_dyn_value(cast(Ty, s.type_)) != 0 {
 			s.addr = 1
@@ -2574,8 +2574,8 @@ fn x_assign_homes(f Fn) i64 {
 	for {
 		mut best = cast(Sym, 0)
 		i = 0
-		for i < locals.len {
-			let c = cast(Sym, vec_get(locals, i))
+		for i < len(locals) {
+			let c = cast(Sym, locals[i])
 			if cast(Sym, c).reg == REG_DEAD && cast(Sym, c).uses > 0 && (cast(i64, best) == 0 || c.uses > best.uses) {
 				best = cast(Sym, c)
 			}
@@ -2584,12 +2584,12 @@ fn x_assign_homes(f Fn) i64 {
 		if cast(i64, best) == 0 {
 			break
 		}
-		if is_float_t(best.type_) != 0 && fnext < fpool.len {
-			best.reg = vec_get(fpool, fnext)
+		if is_float_t(best.type_) != 0 && fnext < len(fpool) {
+			best.reg = fpool[fnext]
 			used_fregs = used_fregs | (1 << (best.reg - XMM))
 			fnext = fnext + 1
-		} else if is_float_t(best.type_) == 0 && next < pool.len {
-			best.reg = vec_get(pool, next)
+		} else if is_float_t(best.type_) == 0 && next < len(pool) {
+			best.reg = pool[next]
 			used_regs = used_regs | (1 << best.reg)
 			next = next + 1
 		} else {
@@ -2601,59 +2601,59 @@ fn x_assign_homes(f Fn) i64 {
 	// Leftover callee-saved registers survive calls for free; caller-saved ones cost
 	// nothing in the prologue. Prefer whichever this function needs.
 	let cross = i64(leaf == 0 && stmts_cross_calls(cast(Block, f.body).stmts) != 0)
-	t_regs = vec_new[i64]()
-	f_regs = vec_new[i64]()
+	t_regs = []i64{}
+	f_regs = []i64{}
 	if cross != 0 {
-		for next < pool.len {
-			vec_push(t_regs, vec_get(pool, next))
+		for next < len(pool) {
+			t_regs = append(t_regs, pool[next])
 			next = next + 1
 		}
 	}
-	vec_push(t_regs, RSI)
-	vec_push(t_regs, RDI)
-	vec_push(t_regs, R8)
-	vec_push(t_regs, R9)
-	vec_push(t_regs, R10)
-	for next < pool.len {
-		vec_push(t_regs, vec_get(pool, next))
+	t_regs = append(t_regs, RSI)
+	t_regs = append(t_regs, RDI)
+	t_regs = append(t_regs, R8)
+	t_regs = append(t_regs, R9)
+	t_regs = append(t_regs, R10)
+	for next < len(pool) {
+		t_regs = append(t_regs, pool[next])
 		next = next + 1
 	}
 	r = 1
 	for r <= 7 {
-		vec_push(f_regs, XMM + r)
+		f_regs = append(f_regs, XMM + r)
 		r = r + 1
 	}
 	if fp_homes != 0 {
-		for fnext < fpool.len {
-			vec_push(f_regs, vec_get(fpool, fnext))
+		for fnext < len(fpool) {
+			f_regs = append(f_regs, fpool[fnext])
 			fnext = fnext + 1
 		}
 	} else {
 		r = 8
 		for r <= 14 {
-			vec_push(f_regs, XMM + r)
+			f_regs = append(f_regs, XMM + r)
 			r = r + 1
 		}
 	}
-	t_count = t_regs.len
-	f_count = f_regs.len
+	t_count = len(t_regs)
+	f_count = len(f_regs)
 	return nslots
 }
 
 // x_entry_moves moves the parameters from their argument registers (or stack slots at
 // [rbp + 16 + 8k]) into their homes; register moves run in parallel.
 fn x_entry_moves(f Fn) {
-	let locals = cast(Vec[i64], f.locals)
-	let dsts = vec_new[i64]()
-	let srcs = vec_new[i64]()
-	let stack_syms = vec_new[i64]()
+	let locals = cast([]i64, f.locals)
+	let dsts = []i64{}
+	let srcs = []i64{}
+	let stack_syms = []i64{}
 	mut ni = 0
 	mut nf = 0
 	x_nstack = 0
 	mut i = 0
-	for i < cast(Vec[i64], f.params).len {
-		let s = cast(Sym, vec_get(locals, i))
-		let pt = vec_get(cast(Vec[i64], f.ptypes), i)
+	for i < len(f.params) {
+		let s = cast(Sym, locals[i])
+		let pt = f.ptypes[i]
 		if is_dyn_value(cast(Ty, pt)) != 0 {
 			if ni + 1 < 6 {
 				let r0 = x_int_arg(ni)
@@ -2694,22 +2694,22 @@ fn x_entry_moves(f Fn) {
 			ni = ni + 1
 		}
 		if src < 0 {
-			vec_push(stack_syms, cast(i64, s))
-			vec_push(stack_syms, 16 + 8 * x_nstack)
+			stack_syms = append(stack_syms, cast(i64, s))
+			stack_syms = append(stack_syms, 16 + 8 * x_nstack)
 			x_nstack = x_nstack + 1
 		} else if cast(Sym, s).reg >= 0 {
-			vec_push(dsts, cast(Sym, s).reg)
-			vec_push(srcs, src)
+			dsts = append(dsts, cast(Sym, s).reg)
+			srcs = append(srcs, src)
 		} else if cast(Sym, s).reg == REG_SLOT {
 			x_slot_store(src, s.off)
 		}
 		i = i + 1
 	}
-	x_par_move(cast(Vec[i64], dsts), cast(Vec[i64], srcs))
+	x_par_move(cast([]i64, dsts), cast([]i64, srcs))
 	i = 0
-	for i < stack_syms.len {
-		let s = cast(Sym, vec_get(stack_syms, i))
-		let off = vec_get(stack_syms, i + 1)
+	for i < len(stack_syms) {
+		let s = cast(Sym, stack_syms[i])
+		let off = stack_syms[i + 1]
 		if s.reg >= 0 {
 			x_slot_load(cast(Sym, s).reg, cast(i64, off))
 		} else if cast(Sym, s).reg == REG_SLOT {
@@ -2732,7 +2732,7 @@ fn x_entry_moves(f Fn) {
 // to, and return on the other stack (r15, the core context, is the same on both).
 fn x_task_swap_bytes() i64 {
 	let hex = cstr("48891f48896f084c8967104c896f184c89772048896728488b1e488b6e084c8b66104c8b6e184c8b7620488b6628c3")
-	let v = vec_new[i64]()
+	let v = []i64{}
 	mut i = 0
 	for i64(load8(hex + i)) != 0 {
 		mut hi = i64(load8(hex + i)) - '0'
@@ -2743,7 +2743,7 @@ fn x_task_swap_bytes() i64 {
 		if i64(load8(hex + i + 1)) >= 'a' {
 			lo = i64(load8(hex + i + 1)) - 'a' + 10
 		}
-		vec_push(v, hi * 16 + lo)
+		v = append(v, hi * 16 + lo)
 		i = i + 2
 	}
 	return cast(i64, v)
@@ -2755,10 +2755,10 @@ fn x_memory_bytes(fill i64) i64 {
 	if fill != 0 {
 		hex = cstr("4889f04889d148c1e106f3aac3")
 	}
-	let v = vec_new[i64]()
+	let v = []i64{}
 	mut i = 0
 	for i64(load8(hex + i)) != 0 {
-		vec_push(v, num_digit(i64(load8(hex + i))) * 16 + num_digit(i64(load8(hex + i + 1))))
+		v = append(v, num_digit(i64(load8(hex + i))) * 16 + num_digit(i64(load8(hex + i + 1))))
 		i = i + 2
 	}
 	return cast(i64, v)
@@ -2769,10 +2769,10 @@ fn x_syscall_bytes(restorer i64) i64 {
 	if restorer != 0 {
 		hex = cstr("48c7c00f0000000f05")
 	}
-	let v = vec_new[i64]()
+	let v = []i64{}
 	mut i = 0
 	for i64(load8(hex + i)) != 0 {
-		vec_push(v, num_digit(i64(load8(hex + i))) * 16 + num_digit(i64(load8(hex + i + 1))))
+		v = append(v, num_digit(i64(load8(hex + i))) * 16 + num_digit(i64(load8(hex + i + 1))))
 		i = i + 2
 	}
 	return cast(i64, v)
@@ -2789,16 +2789,16 @@ fn x_gen_poll() {
 	emit2(X_TEST, XSCR, XSCR)
 	emit2(X_JCC, XC_NE, slow)
 	x_label(resume)
-	vec_push(poll_sites, slow)
-	vec_push(poll_sites, resume)
+	poll_sites = append(poll_sites, slow)
+	poll_sites = append(poll_sites, resume)
 }
 
 // x_gen_poll_stubs realigns even frameless leaves and preserves their register homes.
 fn x_gen_poll_stubs() {
 	let f = find_fn(cstr("rt_bnd_poll"))
 	mut i = 0
-	for i < poll_sites.len {
-		x_label(vec_get(poll_sites, i))
+	for i < len(poll_sites) {
+		x_label(poll_sites[i])
 		mut r = 0
 		for r < 16 {
 			if x_caller_saved(r) != 0 && r != RSP {
@@ -2829,75 +2829,75 @@ fn x_gen_poll_stubs() {
 			}
 			r = r - 1
 		}
-		emit1(X_JMP, vec_get(poll_sites, i + 1))
+		emit1(X_JMP, poll_sites[i + 1])
 		i = i + 2
 	}
 }
 
 fn x_gen_fn(f Fn) {
 	if tgt_linux != 0 {
-		let bytes = cast(Vec[i64], syscall_fast_amd64(f.qname))
+		let bytes = cast([]i64, syscall_fast_amd64(f.qname))
 		if cast(i64, bytes) != 0 {
-			x_out4(X_LABEL, vec_get(x_fn_labels, f.index), 0, 0, 0)
+			x_out4(X_LABEL, x_fn_labels[f.index], 0, 0, 0)
 			if streq(f.qname, cstr("rt_sys_clock_gettime")) != 0 {
 				let s = lookup_global(cstr("rtVdsoClock"))
 				x_out4(X_LOAD, RDX, x64_mem_sym(x_sym(SK_VAR, s.index)), 3, 0)
 			}
 			mut i = 0
-			for i < bytes.len {
-				x_out4(X_RAWB, vec_get(bytes, i), 0, 0, 0)
+			for i < len(bytes) {
+				x_out4(X_RAWB, bytes[i], 0, 0, 0)
 				i = i + 1
 			}
 			return
 		}
 	}
 	if streq(f.qname, cstr("memcpy")) != 0 || streq(f.qname, cstr("memmove")) != 0 || streq(f.qname, cstr("memset")) != 0 || streq(f.qname, cstr("memcmp")) != 0 || streq(f.qname, cstr("memchr")) != 0 || streq(f.qname, cstr("mem_avx2_supported")) != 0 {
-		x_out4(X_LABEL, vec_get(x_fn_labels, f.index), 0, 0, 0)
-		let bs = cast(Vec[i64], memory_fast_amd64(f.qname))
+		x_out4(X_LABEL, x_fn_labels[f.index], 0, 0, 0)
+		let bs = cast([]i64, memory_fast_amd64(f.qname))
 		mut i = 0
-		for i < bs.len {
-			x_out4(X_RAWB, vec_get(bs, i), 0, 0, 0)
+		for i < len(bs) {
+			x_out4(X_RAWB, bs[i], 0, 0, 0)
 			i = i + 1
 		}
 		return
 	}
 
 	if tgt_linux != 0 && (streq(f.qname, cstr("linux_raw")) != 0 || streq(f.qname, cstr("linux_restorer")) != 0) {
-		x_out4(X_LABEL, vec_get(x_fn_labels, f.index), 0, 0, 0)
-		let bs = cast(Vec[i64], x_syscall_bytes(streq(f.qname, cstr("linux_restorer"))))
+		x_out4(X_LABEL, x_fn_labels[f.index], 0, 0, 0)
+		let bs = cast([]i64, x_syscall_bytes(streq(f.qname, cstr("linux_restorer"))))
 		mut i = 0
-		for i < bs.len {
-			x_out4(X_RAWB, vec_get(bs, i), 0, 0, 0)
+		for i < len(bs) {
+			x_out4(X_RAWB, bs[i], 0, 0, 0)
 			i = i + 1
 		}
 		return
 	}
 	if streq(f.qname, cstr("mem_copy64")) != 0 || streq(f.qname, cstr("mem_fill64")) != 0 {
-		x_out4(X_LABEL, vec_get(x_fn_labels, f.index), 0, 0, 0)
-		let bs = cast(Vec[i64], x_memory_bytes(streq(f.qname, cstr("mem_fill64"))))
+		x_out4(X_LABEL, x_fn_labels[f.index], 0, 0, 0)
+		let bs = cast([]i64, x_memory_bytes(streq(f.qname, cstr("mem_fill64"))))
 		mut i = 0
-		for i < bs.len {
-			x_out4(X_RAWB, vec_get(bs, i), 0, 0, 0)
+		for i < len(bs) {
+			x_out4(X_RAWB, bs[i], 0, 0, 0)
 			i = i + 1
 		}
 		return
 	}
 	if aes_hw_amd64(f.qname) != 0 {
-		x_out4(X_LABEL, vec_get(x_fn_labels, f.index), 0, 0, 0)
-		let bs = cast(Vec[i64], aes_hw_amd64(f.qname))
+		x_out4(X_LABEL, x_fn_labels[f.index], 0, 0, 0)
+		let bs = cast([]i64, aes_hw_amd64(f.qname))
 		mut i = 0
-		for i < bs.len {
-			x_out4(X_RAWB, vec_get(bs, i), 0, 0, 0)
+		for i < len(bs) {
+			x_out4(X_RAWB, bs[i], 0, 0, 0)
 			i = i + 1
 		}
 		return
 	}
 	if streq(f.qname, cstr("rt_task_swap")) != 0 {
-		x_out4(X_LABEL, vec_get(x_fn_labels, f.index), 0, 0, 0)
-		let bs = cast(Vec[i64], x_task_swap_bytes())
+		x_out4(X_LABEL, x_fn_labels[f.index], 0, 0, 0)
+		let bs = cast([]i64, x_task_swap_bytes())
 		mut i = 0
-		for i < bs.len {
-			x_out4(X_RAWB, vec_get(bs, i), 0, 0, 0)
+		for i < len(bs) {
+			x_out4(X_RAWB, bs[i], 0, 0, 0)
 			i = i + 1
 		}
 		return
@@ -2905,29 +2905,29 @@ fn x_gen_fn(f Fn) {
 	cur_gen_fn = cast(i64, f)
 	trap_label = 0
 	x_div_label = 0
-	trap_sites = vec_new[i64]()
-	poll_sites = vec_new[i64]()
+	trap_sites = []i64{}
+	poll_sites = []i64{}
 	if host_getenv(cstr("TINC_TRACE")) != 0 {
 		let tb = buf_new()
 		buf_str(tb, cstr("gen "))
 		buf_str(tb, f.qname)
 		buf_byte(tb, '\n')
-		write_all(2, cast(Vec[i64], tb))
+		write_all(2, cast([]u8, cast([]i64, tb)))
 	}
 	inline_appends(f)
 	licm_fn(f)
 	analyze_fn(f)
 	used_regs = 0
 	used_fregs = 0
-	g_loops.len = 0
-	g_loop_labels.len = 0
+	slice_truncate(g_loops, 0)
+	slice_truncate(g_loop_labels, 0)
 	let nslots = x_assign_homes(f)
-	cg = vec_new[i64]()
+	cg = []i64{}
 	x_entry_moves(f)
 	if cast(i64, cast(Fn, f)) == cast(i64, entry_fn()) {
 		mut di = 0
-		for di < prog_fns.len {
-			let df = vec_get(prog_fns, di)
+		for di < len(prog_fns) {
+			let df = prog_fns[di]
 			if df.extern_ == 0 && df.reach != 0 {
 				emit2(X_LEA, RAX, x64_mem_sym(x_sym(SK_FN, di)))
 				emit2(X_LEA, RDX, x64_mem_sym(x_sym(SK_FNDESC, di)))
@@ -2940,8 +2940,8 @@ fn x_gen_fn(f Fn) {
 	x_gen_poll()
 	let stmts = cast(Block, f.body).stmts
 	mut i = 0
-	for i < stmts.len {
-		x_gen_stmt(vec_get(stmts, i))
+	for i < len(stmts) {
+		x_gen_stmt(stmts[i])
 		i = i + 1
 	}
 	x_load_imm(RAX, 0)
@@ -2969,17 +2969,17 @@ fn x_gen_fn(f Fn) {
 	// and the stack is realigned since a frameless leaf may jump here.
 	mut ts = 0
 	let bf2 = find_fn(cstr("rt_bounds_fail2"))
-	for ts < trap_sites.len {
-		let site = cast(Vec[i64], vec_get(trap_sites, ts))
-		x_label(vec_get(site, 0))
-		mut ireg = vec_get(site, 1)
+	for ts < len(trap_sites) {
+		let site = cast([]i64, trap_sites[ts])
+		x_label(site[0])
+		mut ireg = site[1]
 		if ireg < 0 {
-			x_load_imm(XSCR, vec_get(site, 3))
+			x_load_imm(XSCR, site[3])
 			ireg = XSCR
 		}
 		emit2(X_SUBI, RSP, 16)
 		x_st(ireg, x_mem1(RSP, 0), 3)
-		x_st(vec_get(site, 2), x_mem1(RSP, 8), 3)
+		x_st(site[2], x_mem1(RSP, 8), 3)
 		x_ld(RDI, x_mem1(RSP, 0), 3)
 		x_ld(RSI, x_mem1(RSP, 8), 3)
 		emit2(X_ANDI, RSP, -16)
@@ -2995,20 +2995,20 @@ fn x_gen_fn(f Fn) {
 
 fn x_gen_dyn_table_init() {
 	mut i = 0
-	for i < dyn_tables.len {
-		let rec = cast(Vec[i64], vec_get(dyn_tables, i))
-		let base = vec_get(rec, 4)
-		let fns = vec_new[Fn]()
-		vec_push(fns, cast(Fn, vec_get(rec, 2)))
-		let methods = cast(Vec[i64], vec_get(rec, 3))
+	for i < len(dyn_tables) {
+		let rec = cast([]i64, dyn_tables[i])
+		let base = rec[4]
+		let fns = []Fn{}
+		fns = append(fns, cast(Fn, rec[2]))
+		let methods = cast([]i64, rec[3])
 		mut j = 0
-		for j < methods.len {
-			vec_push(fns, cast(Fn, vec_get(methods, j)))
+		for j < len(methods) {
+			fns = append(fns, cast(Fn, methods[j]))
 			j = j + 1
 		}
 		j = 0
-		for j < fns.len {
-			let f = vec_get(fns, j)
+		for j < len(fns) {
+			let f = fns[j]
 			if cast(i64, f) != 0 {
 				emit2(X_LEA, RAX, x64_mem_sym(x_sym(SK_FNDESC, f.index)))
 				x_st(RAX, x64_mem_sym(x_sym(SK_VAR, base + j)), 3)
@@ -3020,19 +3020,19 @@ fn x_gen_dyn_table_init() {
 }
 
 fn x_out4(op i64, a i64, b i64, c i64, d i64) {
-	vec_push(code, cast(Fn, op))
-	vec_push(code, cast(Fn, a))
-	vec_push(code, cast(Fn, b))
-	vec_push(code, cast(Fn, c))
-	vec_push(code, cast(Fn, d))
+	code = append(code, cast(Fn, op))
+	code = append(code, cast(Fn, a))
+	code = append(code, cast(Fn, b))
+	code = append(code, cast(Fn, c))
+	code = append(code, cast(Fn, d))
 }
 
 // x_branch_to_next reports whether the jump at instruction i only skips labels to reach its target.
 fn x_branch_to_next(i i64, n i64) i64 {
-	let target = vec_get(cg, 5 * i + 1)
+	let target = cg[5 * i + 1]
 	mut j = i + 1
-	for j < n && vec_get(cg, 5 * j) == X_LABEL {
-		if vec_get(cg, 5 * j + 1) == target {
+	for j < n && cg[5 * j] == X_LABEL {
+		if cg[5 * j + 1] == target {
 			return 1
 		}
 		j = j + 1
@@ -3043,8 +3043,8 @@ fn x_branch_to_next(i i64, n i64) i64 {
 // x_label_follows reports whether only labels separate instruction i from label l.
 fn x_label_follows(i i64, n i64, l i64) i64 {
 	mut j = i
-	for j < n && vec_get(cg, 5 * j) == X_LABEL {
-		if vec_get(cg, 5 * j + 1) == l {
+	for j < n && cg[5 * j] == X_LABEL {
+		if cg[5 * j + 1] == l {
 			return 1
 		}
 		j = j + 1
@@ -3054,17 +3054,17 @@ fn x_label_follows(i i64, n i64, l i64) i64 {
 
 // x_finish_fn wraps the body in its prologue and epilogues and drops unreachable code.
 fn x_finish_fn(f Fn, nslots i64) {
-	let saved = vec_new[i64]()
+	let saved = []i64{}
 	mut r = 0
 	for r < 16 {
 		if ((used_regs >> r) & 1) != 0 && x_caller_saved(r) == 0 {
-			vec_push(saved, r)
+			saved = append(saved, r)
 		}
 		r = r + 1
 	}
-	let frame = align_up(8 * (nslots + saved.len), 16)
-	let frameless = i64(f.leaf != 0 && nslots == 0 && saved.len == 0 && x_nstack == 0)
-	x_out4(X_LABEL, vec_get(x_fn_labels, f.index), 0, 0, 0)
+	let frame = align_up(8 * (nslots + len(saved)), 16)
+	let frameless = i64(f.leaf != 0 && nslots == 0 && len(saved) == 0 && x_nstack == 0)
+	x_out4(X_LABEL, x_fn_labels[f.index], 0, 0, 0)
 	if frameless == 0 {
 		x_out4(X_PUSH, RBP, 0, 0, 0)
 		x_out4(X_MOV_RR, RBP, RSP, 0, 0)
@@ -3072,16 +3072,16 @@ fn x_finish_fn(f Fn, nslots i64) {
 			x_out4(X_SUBI, RSP, frame, 0, 0)
 		}
 		mut j = 0
-		for j < saved.len {
-			x_out4(X_STORE, vec_get(saved, j), x_mem1(RBP, -8 * (nslots + j + 1)), 3, 0)
+		for j < len(saved) {
+			x_out4(X_STORE, saved[j], x_mem1(RBP, -8 * (nslots + j + 1)), 3, 0)
 			j = j + 1
 		}
 	}
-	let n = cg.len / 5
+	let n = len(cg) / 5
 	mut dead = 0
 	mut i = 0
 	for i < n {
-		let op = vec_get(cg, 5 * i)
+		let op = cg[5 * i]
 		if op == X_LABEL {
 			dead = 0
 		}
@@ -3090,16 +3090,16 @@ fn x_finish_fn(f Fn, nslots i64) {
 			continue
 		}
 		// jcc L1; jmp L2; L1:  becomes  j!cc L2; L1:
-		if op == X_JCC && i + 1 < n && vec_get(cg, 5 * (i + 1)) == X_JMP && x_label_follows(i + 2, n, vec_get(cg, 5 * i + 2)) != 0 {
-			x_out4(X_JCC, vec_get(cg, 5 * i + 1) ^ 1, vec_get(cg, 5 * (i + 1) + 1), 0, 0)
+		if op == X_JCC && i + 1 < n && cg[5 * (i + 1)] == X_JMP && x_label_follows(i + 2, n, cg[5 * i + 2]) != 0 {
+			x_out4(X_JCC, cg[5 * i + 1] ^ 1, cg[5 * (i + 1) + 1], 0, 0)
 			i = i + 2
 			continue
 		}
 		if op == XP_RET {
 			if frameless == 0 {
 				mut j = 0
-				for j < saved.len {
-					x_out4(X_LOAD, vec_get(saved, j), x_mem1(RBP, -8 * (nslots + j + 1)), 3, 0)
+				for j < len(saved) {
+					x_out4(X_LOAD, saved[j], x_mem1(RBP, -8 * (nslots + j + 1)), 3, 0)
 					j = j + 1
 				}
 				x_out4(X_MOV_RR, RSP, RBP, 0, 0)
@@ -3109,7 +3109,7 @@ fn x_finish_fn(f Fn, nslots i64) {
 			dead = 1
 		} else {
 			let k = 5 * i
-			x_out4(op, vec_get(cg, k + 1), vec_get(cg, k + 2), vec_get(cg, k + 3), vec_get(cg, k + 4))
+			x_out4(op, cg[k + 1], cg[k + 2], cg[k + 3], cg[k + 4])
 			if op == X_JMP {
 				dead = 1
 			}
@@ -3119,26 +3119,26 @@ fn x_finish_fn(f Fn, nslots i64) {
 }
 
 fn generate_x64() {
-	code = cast(Vec[Fn], vec_new[i64]())
+	code = cast([]Fn, []i64{})
 	g_labels = 0
-	g_str_ptrs = vec_new[i64]()
-	g_str_lens = vec_new[i64]()
-	g_tstr_ptrs = vec_new[i64]()
-	g_tstr_lens = vec_new[i64]()
-	g_loops = vec_new[i64]()
-	g_loop_labels = vec_new[i64]()
-	x_syms = vec_new[i64]()
-	x_fn_labels = vec_new[i64]()
+	g_str_ptrs = []i64{}
+	g_str_lens = []i64{}
+	g_tstr_ptrs = []i64{}
+	g_tstr_lens = []i64{}
+	g_loops = []i64{}
+	g_loop_labels = []i64{}
+	x_syms = []i64{}
+	x_fn_labels = []i64{}
 	mut i = 0
-	for i < prog_fns.len {
-		vec_get(prog_fns, i).index = i
-		vec_push(x_fn_labels, new_label())
+	for i < len(prog_fns) {
+		prog_fns[i].index = i
+		x_fn_labels = append(x_fn_labels, new_label())
 		i = i + 1
 	}
 	inline_small_calls()
 	i = 0
-	for i < prog_fns.len {
-		let f = vec_get(prog_fns, i)
+	for i < len(prog_fns) {
+		let f = prog_fns[i]
 		if f.extern_ == 0 && f.reach != 0 {
 			x_gen_fn(f)
 		}
@@ -3150,11 +3150,11 @@ fn generate_x64() {
 fn print_asm_x64() i64 {
 	let b = buf_new()
 	mut i = 0
-	for i < prog_fns.len {
-		let f = vec_get(prog_fns, i)
+	for i < len(prog_fns) {
+		let f = prog_fns[i]
 		if f.extern_ == 0 && f.reach != 0 {
 			buf_str(b, cstr("# L"))
-			buf_int(b, vec_get(x_fn_labels, i))
+			buf_int(b, x_fn_labels[i])
 			buf_str(b, cstr(": "))
 			buf_str(b, f.qname)
 			buf_byte(b, '\n')
@@ -3162,8 +3162,8 @@ fn print_asm_x64() i64 {
 		i = i + 1
 	}
 	i = 0
-	for i < code.len {
-		x64_print(cast(Vec[i64], b), code.data + 8 * i, -1)
+	for i < len(code) {
+		x64_print(b, slice_data(code) + 8 * i, -1)
 		i = i + 5
 	}
 	return cast(i64, b)

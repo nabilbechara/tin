@@ -14,14 +14,14 @@ const EX64_STUB_SIZE = 6
 // Before the linker has placed anything the tables are empty and every address is 0,
 // which is fine while x64_layout only measures instructions.
 fn x64_sym_hook(id i64) i64 {
-	let sym = vec_get(x_syms, id)
+	let sym = x_syms[id]
 	let kind = sym >> 32
 	let i = sym & 0xffffffff
 	if kind == SK_STR {
 		if cast(i64, lk_strs) == 0 {
 			return 0
 		}
-		return vec_get(lk_strs, i)
+		return lk_strs[i]
 	}
 	if kind == SK_VAR {
 		return lk_data + 8 * i
@@ -30,10 +30,10 @@ fn x64_sym_hook(id i64) i64 {
 		if cast(i64, lk_tstrs) == 0 {
 			return 0
 		}
-		return vec_get(lk_tstrs, i)
+		return lk_tstrs[i]
 	}
 	if kind == SK_FN {
-		let f = vec_get(prog_fns, i)
+		let f = prog_fns[i]
 		if f.extern_ != 0 {
 			return lk_stubs + EX64_STUB_SIZE * f.got
 		}
@@ -74,11 +74,11 @@ fn ex64_start_static(p i64, at i64, main_addr i64) {
 }
 
 fn write_elf_x64(path i64) {
-	let nvars = prog_vars.len
+	let nvars = len(prog_vars)
 	el_check_static()
-	lk_imports = cast(Vec[Fn], vec_new[i64]())
-	lk_strs = cast(Vec[i64], 0)
-	lk_tstrs = cast(Vec[i64], 0)
+	lk_imports = cast([]Fn, []i64{})
+	lk_strs = cast([]i64, 0)
+	lk_tstrs = cast([]i64, 0)
 	lk_stubs = 0
 	lk_zero = 0
 	lk_got = 0
@@ -88,14 +88,14 @@ fn write_elf_x64(path i64) {
 	// [start, end, name offset] (the runtime's symbol table).
 	let dstr = buf_new()
 	buf_byte(dstr, 0)
-	let name_off = vec_new[i64]()
-	let own = vec_new[Fn]()
+	let name_off = []i64{}
+	let own = []Fn{}
 	mut i = 0
-	for i < prog_fns.len {
-		let f = vec_get(prog_fns, i)
+	for i < len(prog_fns) {
+		let f = prog_fns[i]
 		if f.extern_ == 0 && f.reach != 0 {
-			vec_push(own, cast(Fn, f))
-			vec_push(name_off, dstr.len)
+			own = append(own, cast(Fn, f))
+			name_off = append(name_off, len(dstr))
 			buf_str(dstr, cstr("tin."))
 			buf_str(dstr, f.qname)
 			buf_byte(dstr, 0)
@@ -107,39 +107,39 @@ fn write_elf_x64(path i64) {
 	let ph_off = 64
 	let phnum = 5
 	let dynstr_off = ph_off + 56 * phnum
-	lk_btrace = align_up(dynstr_off + dstr.len, 8)
-	let ro_end = lk_btrace + 8 + 24 * cast(Vec[i64], own).len
+	lk_btrace = align_up(dynstr_off + len(dstr), 8)
+	let ro_end = lk_btrace + 8 + 24 * len(cast([]i64, own))
 
 	// Text segment: _start, code (laid out and relaxed first), strings, constants.
 	let text_addr = align_up(ro_end, EX64_ALIGN)
 	let start_addr = text_addr
 	let code_addr = align_up(text_addr + EX64_START_STATIC, 16)
-	x64_syms = cast(Vec[i64], 0)
-	x64_relocs = cast(Vec[i64], 0)
-	let code_size = x64_layout(cast(Vec[i64], code), code_addr)
+	x64_syms = cast([]i64, 0)
+	x64_relocs = cast([]i64, 0)
+	let code_size = x64_layout(cast([]i64, code), code_addr)
 	i = 0
-	for i < cast(Vec[i64], own).len {
-		let f = vec_get(own, i)
-		f.addr = x64_label_addr(vec_get(x_fn_labels, f.index))
+	for i < len(cast([]i64, own)) {
+		let f = own[i]
+		f.addr = x64_label_addr(x_fn_labels[f.index])
 		i = i + 1
 	}
 	mut pc = code_addr + code_size
 	lk_stubs = pc // the end of the code: there are no import stubs
-	lk_strs = vec_new[i64]()
+	lk_strs = []i64{}
 	i = 0
-	for i < g_str_ptrs.len {
-		vec_push(lk_strs, pc)
-		pc = pc + vec_get(g_str_lens, i) + 1
+	for i < len(g_str_ptrs) {
+		lk_strs = append(lk_strs, pc)
+		pc = pc + g_str_lens[i] + 1
 		i = i + 1
 	}
 	pc = align_up(pc, 8)
 	lk_zero = pc
 	pc = pc + 32
-	lk_tstrs = vec_new[i64]()
+	lk_tstrs = []i64{}
 	i = 0
-	for i < g_tstr_ptrs.len {
-		vec_push(lk_tstrs, pc)
-		pc = align_up(pc + 8 + vec_get(g_tstr_lens, i) + 1, 8)
+	for i < len(g_tstr_ptrs) {
+		lk_tstrs = append(lk_tstrs, pc)
+		pc = align_up(pc + 8 + g_tstr_lens[i] + 1, 8)
 		i = i + 1
 	}
 	let text_end = pc
@@ -149,8 +149,8 @@ fn write_elf_x64(path i64) {
 	lk_got = data_addr
 	lk_data = data_addr
 	lk_fndescs = lk_data + 8 * nvars
-	let data_end = lk_fndescs + 16 * prog_fns.len + 8
-	let extra = el_extra(data_end, cast(Vec[i64], own).len)
+	let data_end = lk_fndescs + 16 * len(prog_fns) + 8
+	let extra = el_extra(data_end, len(cast([]i64, own)))
 	let file_size = data_end + extra
 	let img = calloc(file_size, 1)
 
@@ -180,77 +180,77 @@ fn write_elf_x64(path i64) {
 	p = el_phdr(p, 1, 6, data_addr, data_addr, data_end - data_addr, data_end - data_addr, EX64_ALIGN)
 	p = el_phdr(p, 0x6474e551, 6, 0, 0, 0, 0, 16)
 
-	memcpy(img + dynstr_off, dstr.data, dstr.len)
-	put64(img + lk_btrace, cast(Vec[i64], own).len)
+	memcpy(img + dynstr_off, slice_data(dstr), len(dstr))
+	put64(img + lk_btrace, len(cast([]i64, own)))
 	i = 0
-	for i < cast(Vec[i64], own).len {
-		let f = vec_get(own, i)
+	for i < len(cast([]i64, own)) {
+		let f = own[i]
 		mut end = lk_stubs
-		if i + 1 < cast(Vec[i64], own).len {
-			end = vec_get(own, i + 1).addr
+		if i + 1 < len(cast([]i64, own)) {
+			end = own[i + 1].addr
 		}
 		let rec = img + lk_btrace + 8 + 24 * i
 		put64(rec, f.addr)
 		put64(rec + 8, end)
-		put64(rec + 16, dynstr_off + vec_get(name_off, i))
+		put64(rec + 16, dynstr_off + name_off[i])
 		i = i + 1
 	}
 
 	// _start, then the machine code.
 	ex64_start_static(img + start_addr, start_addr, entry_fn().addr)
 	if extra != 0 {
-		let lay = vec_new[i64]()
-		vec_push(lay, data_end)
-		vec_push(lay, dynstr_off)
-		vec_push(lay, dstr.len)
-		vec_push(lay, text_addr)
-		vec_push(lay, lk_stubs)
-		vec_push(lay, text_end)
-		vec_push(lay, data_addr)
-		el_symbols(img, cast(Vec[Fn], cast(Vec[i64], own)), cast(Vec[i64], name_off), cast(Vec[i64], lay))
+		let lay = []i64{}
+		lay = append(lay, data_end)
+		lay = append(lay, dynstr_off)
+		lay = append(lay, len(dstr))
+		lay = append(lay, text_addr)
+		lay = append(lay, lk_stubs)
+		lay = append(lay, text_end)
+		lay = append(lay, data_addr)
+		el_symbols(img, cast([]Fn, cast([]i64, own)), cast([]i64, name_off), cast([]i64, lay))
 	}
 	let out = buf_new()
 	pc = code_addr
 	i = 0
-	for i < code.len {
-		pc = pc + x64_encode(code.data + 8 * i, pc, cast(Vec[i64], out))
+	for i < len(code) {
+		pc = pc + x64_encode(slice_data(code) + 8 * i, pc, out)
 		i = i + 5
 	}
-	if cast(Vec[i64], out).len != code_size {
+	if len(out) != code_size {
 		link_fail(cstr("x86-64 code size changed between layout and encoding"))
 	}
-	memcpy(img + code_addr, cast(Vec[i64], out).data, cast(Vec[i64], out).len)
+	memcpy(img + code_addr, slice_data(out), len(out))
 
 	i = 0
-	for i < g_str_ptrs.len {
-		memcpy(img + vec_get(lk_strs, i), vec_get(g_str_ptrs, i), vec_get(g_str_lens, i))
+	for i < len(g_str_ptrs) {
+		memcpy(img + lk_strs[i], g_str_ptrs[i], g_str_lens[i])
 		i = i + 1
 	}
 	i = 0
-	for i < g_tstr_ptrs.len {
-		let at = img + vec_get(lk_tstrs, i)
-		put64(at, vec_get(g_tstr_lens, i))
-		memcpy(at + 8, vec_get(g_tstr_ptrs, i), vec_get(g_tstr_lens, i))
+	for i < len(g_tstr_ptrs) {
+		let at = img + lk_tstrs[i]
+		put64(at, g_tstr_lens[i])
+		memcpy(at + 8, g_tstr_ptrs[i], g_tstr_lens[i])
 		i = i + 1
 	}
 	i = 0
 	for i < nvars {
-		put64(img + lk_data + 8 * i, vec_get(prog_vars, i).val)
+		put64(img + lk_data + 8 * i, prog_vars[i].val)
 		i = i + 1
 	}
 
 	rt_sys_unlink(path)
 	let fd = rt_sys_creat(path, 493)
 	if (fd & 0x80000000) != 0 {
-		let e = cast(Vec[i64], err_code(NO_POS, cstr("E904 CANNOT_CREATE")))
-		buf_str(cast(Buf, e), cstr("cannot create "))
-		buf_str(cast(Buf, e), path)
-		fatal(cast(Vec[i64], e))
+		let e = cast([]i64, err_code(NO_POS, cstr("E904 CANNOT_CREATE")))
+		buf_str(cast([]u8, e), cstr("cannot create "))
+		buf_str(cast([]u8, e), path)
+		fatal(cast([]u8, e))
 	}
-	let w = cast(Vec[i64], malloc(24))
-	w.len = file_size
-	w.cap = file_size
-	w.data = img
-	write_all(fd, w)
+	let wh = cast(SliceHdr, malloc(24))
+	wh.len = file_size
+	wh.cap = file_size
+	wh.data = img
+	write_all(fd, cast([]u8, wh))
 	rt_sys_close(fd)
 }

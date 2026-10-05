@@ -10,11 +10,11 @@ const CAP_UNSAFE = 16
 
 // A vendored package: its import path, declared capabilities and manifest (0 when it has none).
 
-shared mut file_cap_pkg Vec[CapsRec] // per loaded file: its vendored package record, or 0 (not restricted)
-shared mut cap_pkgs Vec[CapsRec] // the vendored package records, one per import path
-shared mut cap_edges Vec[i64] // per function (by F_INDEX during the pass): vec of [callee, position]
-shared mut cap_masks Vec[i64] // per function: the capabilities it can reach
-shared mut cap_cur Vec[i64] // the edge list being filled by cap_walk_*
+shared mut file_cap_pkg []CapsRec // per loaded file: its vendored package record, or 0 (not restricted)
+shared mut cap_pkgs []CapsRec // the vendored package records, one per import path
+shared mut cap_edges []i64 // per function (by F_INDEX during the pass): vec of [callee, position]
+shared mut cap_masks []i64 // per function: the capabilities it can reach
+shared mut cap_cur []i64 // the edge list being filled by cap_walk_*
 shared mut caps_report i64 // tinc -caps: print each package's capabilities instead of building
 
 fn cap_name(bit i64) i64 {
@@ -45,7 +45,7 @@ fn cap_bit(name i64) i64 {
 }
 
 // cap_list appends the capabilities in mask in their fixed order, separated by sep.
-fn cap_list(b Buf, mask i64, sep i64) {
+fn cap_list(b []u8, mask i64, sep i64) {
 	mut bit = 1
 	mut first = 1
 	for bit <= CAP_UNSAFE {
@@ -78,7 +78,7 @@ fn cap_word(line i64, i_in i64, out i64) {
 		i = i + 1
 	}
 	buf_byte(w, 0)
-	out[0] = w.data
+	out[0] = slice_data(w)
 	out[1] = i
 }
 
@@ -98,13 +98,13 @@ fn manifest_error(path i64, line_no i64, msg i64, word i64) {
 		buf_byte(e, '\'')
 	}
 	buf_str(e, cstr(" (a tin.mod line is module PATH, require PATH SOURCE or caps net files spawn exec unsafe)"))
-	fatal(cast(Vec[i64], e))
+	fatal(e)
 }
 
 // manifest_caps reads a tin.mod and returns the capabilities its caps lines declare.
-fn manifest_caps(src Vec[i64], path i64) i64 {
-	let data = src.data
-	let n = src.len
+fn manifest_caps(src []u8, path i64) i64 {
+	let data = slice_data(src)
+	let n = len(src)
 	mut caps = 0
 	mut line_no = 0
 	let out = calloc(2, 8)
@@ -122,7 +122,7 @@ fn manifest_caps(src Vec[i64], path i64) i64 {
 			j = j + 1
 		}
 		buf_byte(lb, 0)
-		let line = lb.data
+		let line = slice_data(lb)
 		cap_word(line, 0, out)
 		let w = out[0]
 		if w != 0 && starts_with(w, cstr("//")) == 0 {
@@ -152,8 +152,8 @@ fn manifest_caps(src Vec[i64], path i64) i64 {
 
 // lock_caps_line returns tin.lock's "caps PATH ..." line for an import path as a C string, or 0.
 fn lock_caps_line(ipath i64) i64 {
-	let data = project_lock.data
-	let n = project_lock.len
+	let data = slice_data(project_lock)
+	let n = len(project_lock)
 	let m = strlen(ipath)
 	mut i = 0
 	for i < n {
@@ -169,7 +169,7 @@ fn lock_caps_line(ipath i64) i64 {
 				j = j + 1
 			}
 			buf_byte(b, 0)
-			return b.data
+			return slice_data(b)
 		}
 		i = end + 1
 	}
@@ -178,28 +178,28 @@ fn lock_caps_line(ipath i64) i64 {
 
 // vendored_package returns the record of the package an import resolved to when it is under
 // the project's vendor/ (reading and locking its tin.mod the first time), or 0.
-fn vendored_package(ipath i64, found Vec[i64]) i64 {
-	let first = vec_get(found, 0)
+fn vendored_package(ipath i64, found []i64) i64 {
+	let first = found[0]
 	let vroot = vendor_dir()
 	if starts_with(first, vroot) == 0 {
 		return 0
 	}
 	mut i = 0
-	for i < cap_pkgs.len {
-		if streq(vec_get(cap_pkgs, i).path, ipath) != 0 {
-			return cast(i64, vec_get(cap_pkgs, i))
+	for i < len(cap_pkgs) {
+		if streq(cap_pkgs[i].path, ipath) != 0 {
+			return cast(i64, cap_pkgs[i])
 		}
 		i = i + 1
 	}
 	let rec = cast(CapsRec, calloc(3, 8))
 	rec.path = ipath
 	let manifest = cat_path(dir_of(first), cstr("/tin.mod"))
-	let src = cast(Vec[i64], try_read_file(manifest))
+	let src = cast([]i64, try_read_file(manifest))
 	if cast(i64, src) != 0 {
 		rec.manifest = manifest
 		// The manifest is vendored source too: the lock pins it like the code.
 		lock_has(manifest)
-		rec.caps = manifest_caps(src, manifest)
+		rec.caps = manifest_caps(cast([]u8, src), manifest)
 	}
 	// The lock shows a reviewer each package's capabilities; it must say what the manifest says.
 	if cast(i64, project_lock) != 0 {
@@ -208,29 +208,29 @@ fn vendored_package(ipath i64, found Vec[i64]) i64 {
 		buf_str(want, ipath)
 		if rec.caps != 0 {
 			buf_byte(want, ' ')
-			cap_list(cast(Buf, want), rec.caps, cstr(" "))
+			cap_list(cast([]u8, want), rec.caps, cstr(" "))
 		}
 		buf_byte(want, 0)
 		let got = lock_caps_line(ipath)
-		if (got != 0 || cast(i64, src) != 0) && !(got != 0 && streq(got, cast(Vec[i64], want).data) != 0) {
-			let e = cast(Vec[i64], err_code(NO_POS, cstr("E115 LOCK_CAPS")))
-			buf_str(cast(Buf, e), cstr("tin.lock "))
+		if (got != 0 || cast(i64, src) != 0) && !(got != 0 && streq(got, slice_data(want)) != 0) {
+			let e = cast([]i64, err_code(NO_POS, cstr("E115 LOCK_CAPS")))
+			buf_str(cast([]u8, e), cstr("tin.lock "))
 			if got != 0 {
-				buf_str(cast(Buf, e), cstr("says \""))
-				buf_str(cast(Buf, e), got)
-				buf_str(cast(Buf, e), cstr("\""))
+				buf_str(cast([]u8, e), cstr("says \""))
+				buf_str(cast([]u8, e), got)
+				buf_str(cast([]u8, e), cstr("\""))
 			} else {
-				buf_str(cast(Buf, e), cstr("has no caps line"))
+				buf_str(cast([]u8, e), cstr("has no caps line"))
 			}
-			buf_str(cast(Buf, e), cstr(" for "))
-			buf_str(cast(Buf, e), ipath)
-			buf_str(cast(Buf, e), cstr(", its manifest declares \""))
-			buf_str(cast(Buf, e), cast(Vec[i64], want).data)
-			buf_str(cast(Buf, e), cstr("\" (run tin vendor)"))
-			fatal(cast(Vec[i64], e))
+			buf_str(cast([]u8, e), cstr(" for "))
+			buf_str(cast([]u8, e), ipath)
+			buf_str(cast([]u8, e), cstr(", its manifest declares \""))
+			buf_str(cast([]u8, e), slice_data(want))
+			buf_str(cast([]u8, e), cstr("\" (run tin vendor)"))
+			fatal(cast([]u8, e))
 		}
 	}
-	vec_push(cap_pkgs, cast(CapsRec, rec))
+	cap_pkgs = append(cap_pkgs, cast(CapsRec, rec))
 	return cast(i64, rec)
 }
 
@@ -240,7 +240,7 @@ fn vendored_package(ipath i64, found Vec[i64]) i64 {
 // of net, and a server keeps a spare descriptor open on /dev/null to shed connections when
 // it runs out of them. What a sealed function calls is not followed.
 fn cap_sealed(f Fn) i64 {
-	if vec_get(file_trusted, f.file) == 0 || f.extern_ != 0 {
+	if file_trusted[f.file] == 0 || f.extern_ != 0 {
 		return 0
 	}
 	let name = f.qname
@@ -257,7 +257,7 @@ fn cap_sealed(f Fn) i64 {
 // system entry points (the runtime's rt_sys_* calls and the C functions lib/ declares extern)
 // that open a connection or a file, start a process or replace it. A tag is final.
 fn cap_tag(f Fn) i64 {
-	if vec_get(file_trusted, f.file) == 0 {
+	if file_trusted[f.file] == 0 {
 		return 0
 	}
 	let sealed = cap_sealed(f)
@@ -297,7 +297,7 @@ fn cap_final(f i64) i64 {
 // cap_runtime reports a function of the runtime package: its internal file reads (cgroup
 // limits, /proc) are not the program's, so only its tagged entry points carry a capability.
 fn cap_runtime(f Fn) i64 {
-	return i64(vec_get(file_trusted, f.file) != 0 && i64(load8(vec_get(file_pkgs, f.file))) == 0)
+	return i64(file_trusted[f.file] != 0 && i64(load8(file_pkgs[f.file])) == 0)
 }
 
 // ---- the call graph ----
@@ -305,16 +305,16 @@ fn cap_edge(g i64, pos i64) {
 	if g == 0 {
 		return
 	}
-	let rec = vec_new[i64]()
-	vec_push(rec, g)
-	vec_push(rec, pos)
-	vec_push(cap_cur, cast(i64, rec))
+	let rec = []i64{}
+	rec = append(rec, g)
+	rec = append(rec, pos)
+	cap_cur = append(cap_cur, cast(i64, rec))
 }
 
-fn cap_walk_stmts(v Vec[i64]) {
+fn cap_walk_stmts(v []i64) {
 	mut i = 0
-	for i < v.len {
-		cap_walk_stmt(vec_get(v, i))
+	for i < len(v) {
+		cap_walk_stmt(v[i])
 		i = i + 1
 	}
 }
@@ -352,10 +352,10 @@ fn cap_walk_stmt(s i64) {
 	}
 }
 
-fn cap_walk_exprs(v Vec[i64]) {
+fn cap_walk_exprs(v []i64) {
 	mut i = 0
-	for i < v.len {
-		cap_walk_expr(vec_get(v, i))
+	for i < len(v) {
+		cap_walk_expr(v[i])
 		i = i + 1
 	}
 }
@@ -382,13 +382,13 @@ fn cap_walk_expr(e i64) {
 		cap_walk_expr(cast(IndexExpr, e).x)
 		cap_walk_expr(cast(IndexExpr, e).i)
 	} else if k == EX_CONV {
-		if cast(Conv, e).kind == CV_DYN && cast(Conv, e).dyn_table >= 0 && cast(Conv, e).dyn_table < dyn_tables.len {
-			let rec = cast(Vec[i64], vec_get(dyn_tables, cast(Conv, e).dyn_table))
-			cap_edge(vec_get(rec, 2), cast(Node, e).pos)
-			let fns = cast(Vec[i64], vec_get(rec, 3))
+		if cast(Conv, e).kind == CV_DYN && cast(Conv, e).dyn_table >= 0 && cast(Conv, e).dyn_table < len(dyn_tables) {
+			let rec = cast([]i64, dyn_tables[cast(Conv, e).dyn_table])
+			cap_edge(rec[2], cast(Node, e).pos)
+			let fns = cast([]i64, rec[3])
 			mut j = 0
-			for j < fns.len {
-				cap_edge(vec_get(fns, j), cast(Node, e).pos)
+			for j < len(fns) {
+				cap_edge(fns[j], cast(Node, e).pos)
 				j = j + 1
 			}
 		}
@@ -409,7 +409,7 @@ fn cap_walk_expr(e i64) {
 // cap_index is a function's position in prog_fns during the pass, or -1.
 fn cap_index(f Fn) i64 {
 	let i = f.index
-	if i >= 0 && i < prog_fns.len && cast(i64, vec_get(prog_fns, i)) == cast(i64, f) {
+	if i >= 0 && i < len(prog_fns) && cast(i64, prog_fns[i]) == cast(i64, f) {
 		return i
 	}
 	return -1
@@ -420,17 +420,17 @@ fn cap_mask_of(f i64) i64 {
 	if i < 0 {
 		return cap_tag(cast(Fn, f))
 	}
-	return vec_get(cap_masks, i)
+	return cap_masks[i]
 }
 
 // cap_pkg_of is the vendored package that declares f, by its position: a function the
 // compiler generates (an encoder, the start code) has no line and belongs to no package.
 fn cap_pkg_of(f Fn) CapsRec {
 	let pos = f.pos
-	if pos <= 0 || ((pos >> 16) & 0xffffffff) == 0 || (pos >> 48) >= file_cap_pkg.len {
+	if pos <= 0 || ((pos >> 16) & 0xffffffff) == 0 || (pos >> 48) >= len(file_cap_pkg) {
 		return cast(CapsRec, 0)
 	}
-	return vec_get(file_cap_pkg, pos >> 48)
+	return file_cap_pkg[pos >> 48]
 }
 
 // cap_own is what a function needs by itself: its tag, or unsafe in a package that declares it.
@@ -444,19 +444,19 @@ fn cap_own(f i64) i64 {
 
 // cap_graph records every function's calls and computes what each can reach.
 fn cap_graph() {
-	cap_edges = vec_new[i64]()
-	cap_masks = vec_new[i64]()
-	let n = prog_fns.len
+	cap_edges = []i64{}
+	cap_masks = []i64{}
+	let n = len(prog_fns)
 	mut i = 0
 	for i < n {
-		let f = vec_get(prog_fns, i)
+		let f = prog_fns[i]
 		f.index = i
-		cap_cur = vec_new[i64]()
+		cap_cur = []i64{}
 		if f.body != 0 && f.extern_ == 0 && is_template(f) == 0 && cap_final(cast(i64, f)) == 0 {
 			cap_walk_stmts(cast(Block, f.body).stmts)
 		}
-		vec_push(cap_edges, cast(i64, cap_cur))
-		vec_push(cap_masks, cap_own(cast(i64, f)))
+		cap_edges = append(cap_edges, cast(i64, cap_cur))
+		cap_masks = append(cap_masks, cap_own(cast(i64, f)))
 		i = i + 1
 	}
 	// Reachability to a fixed point; tagged functions and the runtime's own do not inherit.
@@ -465,17 +465,17 @@ fn cap_graph() {
 		changed = 0
 		i = 0
 		for i < n {
-			let f = vec_get(prog_fns, i)
+			let f = prog_fns[i]
 			if cap_final(cast(i64, f)) == 0 && cap_runtime(f) == 0 {
-				mut m = vec_get(cap_masks, i)
-				let es = cast(Vec[i64], vec_get(cap_edges, i))
+				mut m = cap_masks[i]
+				let es = cast([]i64, cap_edges[i])
 				mut j = 0
-				for j < es.len {
-					m = m | cap_mask_of(vec_get(cast(Vec[i64], vec_get(es, j)), 0))
+				for j < len(es) {
+					m = m | cap_mask_of(cast([]i64, es[j])[0])
 					j = j + 1
 				}
-				if m != vec_get(cap_masks, i) {
-					cap_masks.data[i] = m
+				if m != cap_masks[i] {
+					cap_masks[i] = m
 					changed = 1
 				}
 			}
@@ -485,15 +485,15 @@ fn cap_graph() {
 }
 
 // cap_path appends how g reaches the capability bit: g -> ... -> the tagged entry point.
-fn cap_path(b Buf, g i64, bit i64) {
-	let path = vec_new[Fn]()
-	let found = cap_find(g, bit, cast(Vec[i64], path))
-	if cast(Vec[i64], path).len == 0 {
-		vec_push(path, cast(Fn, g))
+fn cap_path(b []u8, g i64, bit i64) {
+	let path = []Fn{}
+	let found = cap_find(g, bit, cast([]i64, path))
+	if len(cast([]i64, path)) == 0 {
+		path = append(path, cast(Fn, g))
 	}
 	mut i = 0
-	for i < cast(Vec[i64], path).len {
-		let f = vec_get(path, i)
+	for i < len(cast([]i64, path)) {
+		let f = path[i]
 		if i > 0 {
 			buf_str(b, cstr(" -> "))
 		}
@@ -512,17 +512,17 @@ fn cap_path(b Buf, g i64, bit i64) {
 // cap_find extends path from g to a function that owns the capability bit, trying g's calls in
 // order and never following a function already on the path (a cycle, such as an effect's
 // live call reaching back into its public function, #241): 1 found, 2 cut at 12 steps, 0 none.
-fn cap_find(g i64, bit i64, path Vec[i64]) i64 {
-	vec_push(path, g)
+fn cap_find(g i64, bit i64, path []i64) i64 {
+	path = append(path, g)
 	if (cap_own(g) & bit) != 0 || cap_index(cast(Fn, g)) < 0 || cap_final(g) != 0 {
 		return 1
 	}
-	let es = cast(Vec[i64], vec_get(cap_edges, cap_index(cast(Fn, g))))
+	let es = cast([]i64, cap_edges[cap_index(cast(Fn, g))])
 	mut j = 0
-	for j < es.len {
-		let c = vec_get(cast(Vec[i64], vec_get(es, j)), 0)
-		if c != g && (cap_mask_of(c) & bit) != 0 && vec_has(path, c) == 0 {
-			if path.len >= 12 {
+	for j < len(es) {
+		let c = cast([]i64, es[j])[0]
+		if c != g && (cap_mask_of(c) & bit) != 0 && slice_has(path, c) == 0 {
+			if len(path) >= 12 {
 				return 2
 			}
 			let r = cap_find(c, bit, path)
@@ -532,7 +532,7 @@ fn cap_find(g i64, bit i64, path Vec[i64]) i64 {
 		}
 		j = j + 1
 	}
-	path.len = path.len - 1
+	slice_truncate(path, len(path) - 1)
 	return 0
 }
 
@@ -546,48 +546,48 @@ fn cap_violation(pos i64, p CapsRec, g Fn, need i64) {
 	buf_str(e, cstr(" needs capability "))
 	buf_str(e, cap_name(bit))
 	buf_str(e, cstr(" ("))
-	cap_path(cast(Buf, e), cast(i64, g), bit)
+	cap_path(cast([]u8, e), cast(i64, g), bit)
 	buf_str(e, cstr("), which package "))
 	buf_str(e, p.path)
 	buf_str(e, cstr(" does not declare in its tin.mod (caps: "))
 	if p.caps != 0 {
-		cap_list(cast(Buf, e), p.caps, cstr(" "))
+		cap_list(cast([]u8, e), p.caps, cstr(" "))
 	} else {
 		buf_str(e, cstr("none"))
 	}
 	buf_byte(e, ')')
-	err_end(cast(Buf, e))
+	err_end(cast([]u8, e))
 }
 
 // cap_check_edges reports each call from package p, at site positions, that leaves the
 // package for code needing a capability p does not declare.
-fn cap_check_edges(p CapsRec, es Vec[i64]) {
+fn cap_check_edges(p CapsRec, es []i64) {
 	mut j = 0
-	for j < es.len {
-		let rec = cast(Vec[i64], vec_get(es, j))
-		let g = vec_get(rec, 0)
+	for j < len(es) {
+		let rec = cast([]i64, es[j])
+		let g = rec[0]
 		let m = cap_mask_of(g)
 		let need = m - (m & p.caps)
 		if need != 0 && cast(i64, cap_pkg_of(cast(Fn, g))) != cast(i64, p) {
-			cap_violation(vec_get(rec, 1), p, cast(Fn, g), need)
+			cap_violation(rec[1], p, cast(Fn, g), need)
 		}
 		j = j + 1
 	}
 }
 
 // cap_check_inits checks the package-level initializers of restricted packages.
-fn cap_check_inits(stmts Vec[i64]) {
+fn cap_check_inits(stmts []i64) {
 	mut i = 0
-	for i < stmts.len {
-		let a = vec_get(stmts, i)
+	for i < len(stmts) {
+		let a = stmts[i]
 		mut pos = cast(Node, a).pos
 		if cast(Node, a).kind == ST_ASSIGN && cast(AssignStmt, a).value != 0 {
 			pos = cast(Node, cast(AssignStmt, a).value).pos
 		}
 		if pos != NO_POS && pos >= 0 {
-			let p = vec_get(file_cap_pkg, pos >> 48)
+			let p = file_cap_pkg[pos >> 48]
 			if cast(i64, p) != 0 {
-				cap_cur = vec_new[i64]()
+				cap_cur = []i64{}
 				cap_walk_stmt(a)
 				cap_check_edges(cast(CapsRec, p), cap_cur)
 			}
@@ -601,8 +601,8 @@ fn cap_check_inits(stmts Vec[i64]) {
 fn check_capabilities() {
 	mut any = 0
 	mut i = 0
-	for i < file_cap_pkg.len {
-		if cast(i64, vec_get(file_cap_pkg, i)) != 0 {
+	for i < len(file_cap_pkg) {
+		if cast(i64, file_cap_pkg[i]) != 0 {
 			any = 1
 		}
 		i = i + 1
@@ -612,11 +612,11 @@ fn check_capabilities() {
 	}
 	cap_graph()
 	i = 0
-	for i < prog_fns.len {
-		let f = vec_get(prog_fns, i)
+	for i < len(prog_fns) {
+		let f = prog_fns[i]
 		let p = cap_pkg_of(cast(Fn, f))
 		if cast(i64, p) != 0 {
-			cap_check_edges(cast(CapsRec, p), cast(Vec[i64], vec_get(cap_edges, i)))
+			cap_check_edges(cast(CapsRec, p), cast([]i64, cap_edges[i]))
 		}
 		i = i + 1
 	}
@@ -627,7 +627,7 @@ fn check_capabilities() {
 // cap_exported reports a function others can call: an exported function or method, or any
 // function of the program's own package.
 fn cap_exported(f Fn) i64 {
-	if i64(load8(vec_get(file_pkgs, f.pos >> 48))) == 0 {
+	if i64(load8(file_pkgs[f.pos >> 48])) == 0 {
 		return 1
 	}
 	let c = i64(load8(f.name))
@@ -637,14 +637,14 @@ fn cap_exported(f Fn) i64 {
 // print_capabilities prints the capabilities each package's exported functions can reach, one
 // "package caps" line each in name order ("main" for the program; the runtime is left out).
 fn print_capabilities() {
-	let names = vec_new[i64]()
-	let masks = vec_new[i64]()
+	let names = []i64{}
+	let masks = []i64{}
 	mut i = 0
-	for i < prog_fns.len {
-		let f = vec_get(prog_fns, i)
+	for i < len(prog_fns) {
+		let f = prog_fns[i]
 		let pos = f.pos
-		if pos > 0 && ((pos >> 16) & 0xffffffff) != 0 && (pos >> 48) < files.len && cap_runtime(f) == 0 && cap_exported(f) != 0 {
-			mut name = vec_get(file_pkgs, pos >> 48)
+		if pos > 0 && ((pos >> 16) & 0xffffffff) != 0 && (pos >> 48) < len(files) && cap_runtime(f) == 0 && cap_exported(f) != 0 {
+			mut name = file_pkgs[pos >> 48]
 			if i64(load8(name)) == 0 {
 				name = cstr("main")
 			}
@@ -653,41 +653,41 @@ fn print_capabilities() {
 				name = p.path
 			}
 			mut k = 0
-			for k < names.len && streq(vec_get(names, k), name) == 0 {
+			for k < len(names) && streq(names[k], name) == 0 {
 				k = k + 1
 			}
-			if k == names.len {
-				vec_push(names, name)
-				vec_push(masks, 0)
+			if k == len(names) {
+				names = append(names, name)
+				masks = append(masks, 0)
 			}
-			masks.data[k] = vec_get(masks, k) | vec_get(cap_masks, i)
+			masks[k] = masks[k] | cap_masks[i]
 		}
 		i = i + 1
 	}
-	let order = vec_new[i64]()
+	let order = []i64{}
 	i = 0
-	for i < names.len {
-		vec_push(order, i)
-		mut j = order.len - 1
-		for j > 0 && c_positive(strcmp(vec_get(names, vec_get(order, j - 1)), vec_get(names, vec_get(order, j)))) != 0 {
-			let t = vec_get(order, j)
-			order.data[j] = vec_get(order, j - 1)
-			order.data[j - 1] = t
+	for i < len(names) {
+		order = append(order, i)
+		mut j = len(order) - 1
+		for j > 0 && c_positive(strcmp(names[order[j - 1]], names[order[j]])) != 0 {
+			let t = order[j]
+			order[j] = order[j - 1]
+			order[j - 1] = t
 			j = j - 1
 		}
 		i = i + 1
 	}
 	let out = buf_new()
 	i = 0
-	for i < order.len {
-		mut k = vec_get(order, i)
-		buf_str(out, vec_get(names, k))
-		if vec_get(masks, k) != 0 {
+	for i < len(order) {
+		mut k = order[i]
+		buf_str(out, names[k])
+		if masks[k] != 0 {
 			buf_byte(out, ' ')
-			cap_list(cast(Buf, out), vec_get(masks, k), cstr(" "))
+			cap_list(cast([]u8, out), masks[k], cstr(" "))
 		}
 		buf_byte(out, '\n')
 		i = i + 1
 	}
-	write_all(1, cast(Vec[i64], out))
+	write_all(1, cast([]u8, out))
 }

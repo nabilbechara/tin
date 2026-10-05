@@ -167,3 +167,15 @@ cases and a byte-identical `-S` comparison. The seed is not touched until step 6
   cast count grow (12,000 to 15,000), so the remaining `cast(Vec[i64], ...)` boundaries go slot by slot, by hand,
   as each pass is converted.
 
+- **Correction, 2026-10-05: vectors are slices (step 2, #385).** The earlier entry says slices would change the
+  data model. That was wrong: a slice of structs is `[len, cap, data]` with `data` an array of pointers to the
+  objects (measured with a probe), exactly the layout of the compiler's vectors, and a slice header is shared
+  by reference (`append` grows it in place). So `vec_new/vec_get/vec_push` and `Vec[T]` are gone: vectors are
+  `[]T` (`[]i64` where the elements are words, `[]Sym`, `[]Decl`, ... where known), indexed and appended with
+  the language's own operations, and byte buffers are `[]u8` grown with `append`. `selfhost/util.tin` keeps
+  the helpers a slice does not have (`slice_truncate`, `slice_data`, `slice_filled`, `slice_clone`,
+  `buf_reserve`); `SliceHdr` is the typed view the few places that build or resize a slice by hand use.
+  Bounds-checked indexing found two latent bugs: field entries of enum payloads were one word short (read one
+  past the end as 0) and the amd64 back end asks for a temporary past the end of its pool (#460). Measured:
+  378 of 378 listings identical, suite 211, compile of the compiler 0.33 s (0.32 s before).
+

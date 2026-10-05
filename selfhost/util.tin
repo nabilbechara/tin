@@ -18,84 +18,79 @@ fn streq(a i64, b i64) i64 {
 // Data structures for the self-hosted compiler: word vectors, byte buffers, positions, errors.
 // Vectors and buffers share one header layout; vectors count words, buffers count bytes.
 
-fn vec_new[T Any]() Vec[T] {
-	let v = cast(Vec[T], malloc(24))
-	v.len = 0
-	v.cap = 8
-	v.data = malloc(64)
-	return v
+// slice_truncate shortens (or, up to its capacity, lengthens) v in place: every holder of the slice sees it.
+fn slice_truncate[T Any](v []T, n i64) {
+	cast(SliceHdr, v).len = n
 }
 
-fn vec_push[T Any](v Vec[T], x T) {
-	if v.len == v.cap {
-		v.cap = v.cap * 2
-		v.data = realloc(v.data, v.cap * 8)
-	}
-	let d = v.data
-	d[v.len] = cast(i64, x)
-	v.len = v.len + 1
+// slice_data is the address of v's first element.
+fn slice_data[T Any](v []T) i64 {
+	return cast(SliceHdr, v).data
 }
 
-fn vec_get[T Any](v Vec[T], i i64) T {
-	let d = v.data
-	return cast(T, d[i])
-}
-
-fn vec_filled[T Any](n i64, x T) Vec[T] {
-	let v = vec_new[T]()
+// slice_filled is a slice of n copies of x.
+fn slice_filled[T Any](n i64, x T) []T {
+	mut v = []T{}
 	mut i = 0
 	for i < n {
-		vec_push(v, x)
+		v = append(v, x)
 		i = i + 1
 	}
 	return v
 }
 
-fn vec_clone[T Any](v Vec[T]) Vec[T] {
-	let out = vec_new[T]()
+// slice_clone is a copy of v (an empty slice for a nil one).
+fn slice_clone[T Any](v []T) []T {
+	mut out = []T{}
 	if cast(i64, v) == 0 {
 		return out
 	}
 	mut i = 0
-	for i < v.len {
-		vec_push(out, vec_get(v, i))
+	for i < len(v) {
+		out = append(out, v[i])
 		i = i + 1
 	}
 	return out
 }
 
-fn buf_new() Buf {
-	let b = cast(Vec[i64], malloc(24))
-	b.len = 0
-	b.cap = 256
-	b.data = malloc(256)
-	return cast(Buf, b)
+// Byte buffers are []u8 slices: appending grows the shared header in place, so a buffer passed to
+// a helper grows for its caller too.
+fn buf_new() []u8 {
+	return make([]u8, 0, 256)
 }
 
-fn buf_reserve(b Buf, n i64) {
-	for b.len + n > b.cap {
-		b.cap = b.cap * 2
-		b.data = realloc(b.data, b.cap)
+// buf_reserve makes room for n more bytes at the end of b (buf_extend then counts the ones a system call wrote).
+fn buf_reserve(b []u8, n i64) {
+	if len(b) + n > cap(b) {
+		let h = cast(SliceHdr, b)
+		let grown = make([]u8, len(b), 2 * cap(b) + n)
+		copy(grown, b)
+		h.cap = cap(grown)
+		h.data = slice_data(grown)
 	}
 }
 
-fn buf_byte(b Buf, c i64) {
-	buf_reserve(b, 1)
-	store8(b.data + b.len, c)
-	b.len = b.len + 1
+fn buf_extend(b []u8, n i64) {
+	cast(SliceHdr, b).len = len(b) + n
 }
 
-fn buf_bytes(b Buf, s i64, n i64) {
-	buf_reserve(b, n)
-	memcpy(b.data + b.len, s, n)
-	b.len = b.len + n
+fn buf_byte(b []u8, c i64) {
+	b = append(b, u8(c))
 }
 
-fn buf_str(b Buf, s i64) {
+fn buf_bytes(b []u8, s i64, n i64) {
+	mut i = 0
+	for i < n {
+		b = append(b, load8(s + i))
+		i = i + 1
+	}
+}
+
+fn buf_str(b []u8, s i64) {
 	buf_bytes(b, s, strlen(s))
 }
 
-fn buf_int(b Buf, n i64) {
+fn buf_int(b []u8, n i64) {
 	if n < 0 {
 		buf_byte(b, '-')
 		if n / 10 != 0 {
@@ -133,10 +128,10 @@ fn mem_eq(a i64, b i64, n i64) i64 {
 	return 1
 }
 
-fn write_all(fd i64, b Vec[i64]) {
+fn write_all(fd i64, b []u8) {
 	mut done = 0
-	for done < b.len {
-		let n = rt_sys_write(fd, b.data + done, b.len - done)
+	for done < len(b) {
+		let n = rt_sys_write(fd, slice_data(b) + done, len(b) - done)
 		if n <= 0 {
 			rt_sys_exit(1)
 		}
@@ -147,7 +142,7 @@ fn write_all(fd i64, b Vec[i64]) {
 // A position packs file index, line and column into one word.
 const NO_POS = -1
 
-shared mut files Vec[i64]
+shared mut files []i64
 shared mut tgt_linux i64 // the target OS is Linux (else macOS)
 shared mut tgt_x64 i64 // the target CPU is x86-64 (else arm64)
 shared mut error_count i64
@@ -156,28 +151,28 @@ fn pos_make(file i64, line i64, col i64) i64 {
 	return (file << 48) | (line << 16) | col
 }
 
-fn buf_pos(b Buf, pos i64) {
-	buf_str(b, vec_get(files, pos >> 48))
+fn buf_pos(b []u8, pos i64) {
+	buf_str(b, files[pos >> 48])
 	buf_byte(b, ':')
 	buf_int(b, (pos >> 16) & 0xffffffff)
 	buf_byte(b, ':')
 	buf_int(b, pos & 0xffff)
 }
 
-fn err_end(b Buf) {
+fn err_end(b []u8) {
 	buf_byte(b, '\n')
-	write_all(2, cast(Vec[i64], b))
+	write_all(2, cast([]u8, b))
 	error_count = error_count + 1
 }
 
-fn fatal(b Vec[i64]) {
-	err_end(cast(Buf, b))
+fn fatal(b []u8) {
+	err_end(cast([]u8, b))
 	rt_sys_exit(1)
 }
 
 // err_code starts an error with its code and name from docs/ERRORS.md, such as
 // "E502 TYPE_ARG_COUNT"; finish it with err_end (keep going) or fatal (stop).
-fn err_code(pos i64, code i64) Buf {
+fn err_code(pos i64, code i64) []u8 {
 	let b = buf_new()
 	if pos != NO_POS {
 		buf_pos(b, pos)
@@ -186,14 +181,14 @@ fn err_code(pos i64, code i64) Buf {
 	buf_str(b, cstr("error "))
 	buf_str(b, code)
 	buf_str(b, cstr(": "))
-	return cast(Buf, b)
+	return cast([]u8, b)
 }
 
 // err_code_at reports a coded error whose whole message is MSG.
 fn err_code_at(pos i64, code i64, msg i64) {
 	let e = err_code(pos, code)
 	buf_str(e, msg)
-	err_end(cast(Buf, e))
+	err_end(cast([]u8, e))
 }
 
 // err_code_quoted reports a coded PREFIX 'NAME' SUFFIX.
@@ -204,7 +199,7 @@ fn err_code_quoted(pos i64, code i64, prefix i64, name i64, suffix i64) {
 	buf_str(e, name)
 	buf_byte(e, '\'')
 	buf_str(e, suffix)
-	err_end(cast(Buf, e))
+	err_end(cast([]u8, e))
 }
 
 // Little- and big-endian stores into a byte array.

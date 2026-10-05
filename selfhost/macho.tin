@@ -9,11 +9,11 @@ const CMDS_SIZE = 1016
 const NCMDS = 13
 const SIG_PAGE = 4096
 
-shared mut lk_labels Vec[i64] // label -> address
-shared mut lk_imports Vec[Fn] // extern fns that are called
+shared mut lk_labels []i64 // label -> address
+shared mut lk_imports []Fn // extern fns that are called
 shared mut lk_stubs i64 // address of the first import stub
-shared mut lk_strs Vec[i64] // string literal -> address
-shared mut lk_tstrs Vec[i64] // Tin string literal -> address of its length word
+shared mut lk_strs []i64 // string literal -> address
+shared mut lk_tstrs []i64 // Tin string literal -> address of its length word
 shared mut lk_btrace i64 // readonly Tin backtrace table (ELF only)
 shared mut lk_zero i64 // 32 zero bytes: the empty slice header every empty slice shares
 shared mut lk_fndescs i64 // function descriptors: [code, env] pairs
@@ -22,14 +22,14 @@ shared mut lk_data i64
 shared mut mo i64 // the output file image
 
 fn link_fail(msg i64) {
-	let e = cast(Vec[i64], err_code(NO_POS, cstr("E990 INTERNAL")))
-	buf_str(cast(Buf, e), cstr("link: "))
-	buf_str(cast(Buf, e), msg)
-	fatal(cast(Vec[i64], e))
+	let e = cast([]i64, err_code(NO_POS, cstr("E990 INTERNAL")))
+	buf_str(cast([]u8, e), cstr("link: "))
+	buf_str(cast([]u8, e), msg)
+	fatal(cast([]u8, e))
 }
 
 fn label_addr(l i64) i64 {
-	return vec_get(lk_labels, l)
+	return lk_labels[l]
 }
 
 fn call_addr(f Fn) i64 {
@@ -43,16 +43,16 @@ fn sym_addr(sym i64) i64 {
 	let kind = sym >> 32
 	let i = sym & 0xffffffff
 	if kind == SK_STR {
-		return vec_get(lk_strs, i)
+		return lk_strs[i]
 	}
 	if kind == SK_VAR {
 		return lk_data + 8 * i
 	}
 	if kind == SK_TSTR {
-		return vec_get(lk_tstrs, i)
+		return lk_tstrs[i]
 	}
 	if kind == SK_FN {
-		return vec_get(prog_fns, i).addr
+		return prog_fns[i].addr
 	}
 	if kind == SK_FNDESC {
 		return lk_fndescs + 16 * i
@@ -103,7 +103,7 @@ fn w_section(p i64, name i64, seg i64, addr i64, size i64, align i64, flags i64)
 	return p + 80
 }
 
-fn uleb(b Buf, v_in i64) {
+fn uleb(b []u8, v_in i64) {
 	mut v = v_in
 	for v >= 128 {
 		buf_byte(b, (v & 127) | 128)
@@ -115,8 +115,8 @@ fn uleb(b Buf, v_in i64) {
 // entry_fn is the function dyld starts: main, or __start for programs with a runtime.
 fn entry_fn() Fn {
 	mut i = 0
-	for i < prog_fns.len {
-		let f = vec_get(prog_fns, i)
+	for i < len(prog_fns) {
+		let f = prog_fns[i]
 		if streq(f.qname, cstr("main")) != 0 && f.extern_ == 0 {
 			return cast(Fn, f)
 		}
@@ -127,31 +127,31 @@ fn entry_fn() Fn {
 }
 
 fn write_executable(path i64) {
-	let nvars = prog_vars.len
-	lk_imports = cast(Vec[Fn], vec_new[i64]())
+	let nvars = len(prog_vars)
+	lk_imports = cast([]Fn, []i64{})
 	mut i = 0
-	for i < prog_fns.len {
-		let f = vec_get(prog_fns, i)
+	for i < len(prog_fns) {
+		let f = prog_fns[i]
 		if f.extern_ != 0 && f.used != 0 {
-			f.got = lk_imports.len
-			vec_push(lk_imports, cast(Fn, f))
+			f.got = len(lk_imports)
+			lk_imports = append(lk_imports, cast(Fn, f))
 		}
 		i = i + 1
 	}
-	let nimp = lk_imports.len
+	let nimp = len(lk_imports)
 
 	// Addresses: code, stubs, strings, then the data segment.
 	let text_off = align_up(32 + CMDS_SIZE, 16)
 	let text_addr = TEXT_BASE + text_off
-	lk_labels = vec_filled(g_labels + 1, 0)
+	lk_labels = slice_filled(g_labels + 1, 0)
 	mut pc = text_addr
 	i = 0
-	for i < code.len {
-		let op = vec_get(code, i)
+	for i < len(code) {
+		let op = code[i]
 		if cast(i64, op) == I_LABEL {
-			lk_labels.data[vec_get(code, i + 1)] = pc
+			lk_labels[cast(i64, code[i + 1])] = pc
 		} else if cast(i64, op) == I_FUNC {
-			vec_get(code, i + 1).addr = pc
+			code[i + 1].addr = pc
 		} else {
 			pc = pc + 4
 		}
@@ -160,11 +160,11 @@ fn write_executable(path i64) {
 	lk_stubs = pc
 	pc = pc + 12 * nimp
 	let text_end = pc
-	lk_strs = vec_new[i64]()
+	lk_strs = []i64{}
 	i = 0
-	for i < g_str_ptrs.len {
-		vec_push(lk_strs, pc)
-		pc = pc + vec_get(g_str_lens, i) + 1
+	for i < len(g_str_ptrs) {
+		lk_strs = append(lk_strs, pc)
+		pc = pc + g_str_lens[i] + 1
 		i = i + 1
 	}
 	let cstr_end = pc
@@ -172,11 +172,11 @@ fn write_executable(path i64) {
 	let const_start = pc
 	lk_zero = pc
 	pc = pc + 32
-	lk_tstrs = vec_new[i64]()
+	lk_tstrs = []i64{}
 	i = 0
-	for i < g_tstr_ptrs.len {
-		vec_push(lk_tstrs, pc)
-		pc = align_up(pc + 8 + vec_get(g_tstr_lens, i) + 1, 8)
+	for i < len(g_tstr_ptrs) {
+		lk_tstrs = append(lk_tstrs, pc)
+		pc = align_up(pc + 8 + g_tstr_lens[i] + 1, 8)
 		i = i + 1
 	}
 	let const_end = pc
@@ -185,7 +185,7 @@ fn write_executable(path i64) {
 	lk_got = data_vm
 	lk_data = data_vm + 8 * nimp
 	lk_fndescs = lk_data + 8 * nvars
-	let data_size = align_up(8 * (nimp + nvars) + 16 * prog_fns.len + 8, PAGE)
+	let data_size = align_up(8 * (nimp + nvars) + 16 * len(prog_fns) + 8, PAGE)
 	let link_off = text_size + data_size
 
 	// Linkedit contents: bind opcodes, then function symbols and their names.
@@ -195,34 +195,34 @@ fn write_executable(path i64) {
 	for i < nimp {
 		buf_byte(bind_, 0x40)
 		buf_byte(bind_, '_')
-		buf_str(bind_, vec_get(lk_imports, i).name)
+		buf_str(bind_, lk_imports[i].name)
 		buf_byte(bind_, 0)
 		buf_byte(bind_, 0x51)
 		buf_byte(bind_, 0x72)
-		uleb(cast(Buf, bind_), 8 * i)
+		uleb(cast([]u8, bind_), 8 * i)
 		buf_byte(bind_, 0x90)
 		i = i + 1
 	}
 	buf_byte(bind_, 0)
-	let bind_size = align_up(cast(Vec[i64], bind_).len, 8)
+	let bind_size = align_up(len(bind_), 8)
 	let syms = buf_new()
 	let strs = buf_new()
 	buf_byte(strs, ' ')
 	buf_byte(strs, 0)
 	mut nsyms = 0
 	i = 0
-	for i < prog_fns.len {
-		let f = vec_get(prog_fns, i)
+	for i < len(prog_fns) {
+		let f = prog_fns[i]
 		if f.extern_ == 0 && f.reach != 0 {
 			buf_reserve(syms, 16)
-			let s = syms.data + syms.len
-			put32(s, strs.len)
+			let s = slice_data(syms) + len(syms)
+			put32(s, len(strs))
 			store8(s + 4, 0x0e)
 			store8(s + 5, 1)
 			store8(s + 6, 0)
 			store8(s + 7, 0)
 			put64(s + 8, f.addr)
-			syms.len = syms.len + 16
+			slice_truncate(syms, len(syms) + 16)
 			buf_byte(strs, '_')
 			buf_str(strs, f.qname)
 			buf_byte(strs, 0)
@@ -231,8 +231,8 @@ fn write_executable(path i64) {
 		i = i + 1
 	}
 	let sym_off = link_off + bind_size
-	let str_off = sym_off + syms.len
-	let str_size = align_up(strs.len, 8)
+	let str_off = sym_off + len(syms)
+	let str_size = align_up(len(strs), 8)
 	let sig_off = align_up(str_off + str_size, 16)
 	mut ident = path
 	i = 0
@@ -266,7 +266,7 @@ fn write_executable(path i64) {
 	p = w_section(p, cstr("__const"), cstr("__TEXT"), const_start, const_end - const_start, 3, 0)
 	p = w_segment(p, cstr("__DATA"), data_vm, data_size, text_size, data_size, 3, 2)
 	p = w_section(p, cstr("__got"), cstr("__DATA"), lk_got, 8 * nimp, 3, 0)
-	p = w_section(p, cstr("__data"), cstr("__DATA"), lk_data, 8 * nvars + 16 * prog_fns.len, 3, 0)
+	p = w_section(p, cstr("__data"), cstr("__DATA"), lk_data, 8 * nvars + 16 * len(prog_fns), 3, 0)
 	p = w_segment(p, cstr("__LINKEDIT"), data_vm + data_size, align_up(link_size, PAGE), link_off, link_size, 1, 0)
 	put32(p, 0x80000022)
 	put32(p + 4, 48)
@@ -322,57 +322,57 @@ fn write_executable(path i64) {
 	mut q = mo + text_off
 	i = 0
 	pc = text_addr
-	for i < code.len {
-		let op = vec_get(code, i)
+	for i < len(code) {
+		let op = code[i]
 		if cast(i64, op) != I_LABEL && cast(i64, op) != I_FUNC {
-			put32(q, encode(code.data + 8 * i, pc))
+			put32(q, encode(slice_data(code) + 8 * i, pc))
 			q = q + 4
 			pc = pc + 4
 		}
 		i = i + 5
 	}
-	let stub = vec_new[i64]()
-	vec_push(stub, I_ADRP)
-	vec_push(stub, X16)
-	vec_push(stub, 0)
-	vec_push(stub, 0)
-	vec_push(stub, 0)
+	let stub = []i64{}
+	stub = append(stub, I_ADRP)
+	stub = append(stub, X16)
+	stub = append(stub, 0)
+	stub = append(stub, 0)
+	stub = append(stub, 0)
 	i = 0
 	for i < nimp {
 		let got = sym_ref(SK_GOT, i)
-		stub.data[0] = I_ADRP
-		stub.data[1] = X16
-		stub.data[2] = got
-		put32(q, encode(stub.data, pc))
-		stub.data[0] = I_LDRLO
-		stub.data[2] = X16
-		stub.data[3] = got
-		put32(q + 4, encode(stub.data, pc + 4))
+		stub[0] = I_ADRP
+		stub[1] = X16
+		stub[2] = got
+		put32(q, encode(slice_data(stub), pc))
+		stub[0] = I_LDRLO
+		stub[2] = X16
+		stub[3] = got
+		put32(q + 4, encode(slice_data(stub), pc + 4))
 		put32(q + 8, 0xD61F0200)
 		q = q + 12
 		pc = pc + 12
 		i = i + 1
 	}
 	i = 0
-	for i < g_str_ptrs.len {
-		memcpy(mo + vec_get(lk_strs, i) - TEXT_BASE, vec_get(g_str_ptrs, i), vec_get(g_str_lens, i))
+	for i < len(g_str_ptrs) {
+		memcpy(mo + lk_strs[i] - TEXT_BASE, g_str_ptrs[i], g_str_lens[i])
 		i = i + 1
 	}
 	i = 0
-	for i < g_tstr_ptrs.len {
-		let at = mo + vec_get(lk_tstrs, i) - TEXT_BASE
-		put64(at, vec_get(g_tstr_lens, i))
-		memcpy(at + 8, vec_get(g_tstr_ptrs, i), vec_get(g_tstr_lens, i))
+	for i < len(g_tstr_ptrs) {
+		let at = mo + lk_tstrs[i] - TEXT_BASE
+		put64(at, g_tstr_lens[i])
+		memcpy(at + 8, g_tstr_ptrs[i], g_tstr_lens[i])
 		i = i + 1
 	}
 	i = 0
 	for i < nvars {
-		put64(mo + text_size + 8 * nimp + 8 * i, vec_get(prog_vars, i).val)
+		put64(mo + text_size + 8 * nimp + 8 * i, prog_vars[i].val)
 		i = i + 1
 	}
-	memcpy(mo + link_off, cast(Vec[i64], bind_).data, cast(Vec[i64], bind_).len)
-	memcpy(mo + sym_off, syms.data, syms.len)
-	memcpy(mo + str_off, strs.data, strs.len)
+	memcpy(mo + link_off, slice_data(bind_), len(bind_))
+	memcpy(mo + sym_off, slice_data(syms), len(syms))
+	memcpy(mo + str_off, slice_data(strs), len(strs))
 
 	// The UUID is a hash of the code, so identical builds are byte-identical.
 	let digest = malloc(32)
@@ -421,15 +421,15 @@ fn write_executable(path i64) {
 	rt_sys_unlink(path)
 	let fd = rt_sys_creat(path, 493)
 	if (fd & 0x80000000) != 0 {
-		let e = cast(Vec[i64], err_code(NO_POS, cstr("E904 CANNOT_CREATE")))
-		buf_str(cast(Buf, e), cstr("cannot create "))
-		buf_str(cast(Buf, e), path)
-		fatal(cast(Vec[i64], e))
+		let e = cast([]i64, err_code(NO_POS, cstr("E904 CANNOT_CREATE")))
+		buf_str(cast([]u8, e), cstr("cannot create "))
+		buf_str(cast([]u8, e), path)
+		fatal(cast([]u8, e))
 	}
-	let img = cast(Vec[i64], malloc(24))
-	img.len = file_size
-	img.cap = file_size
-	img.data = mo
-	write_all(fd, img)
+	let imgh = cast(SliceHdr, malloc(24))
+	imgh.len = file_size
+	imgh.cap = file_size
+	imgh.data = mo
+	write_all(fd, cast([]u8, imgh))
 	rt_sys_close(fd)
 }
