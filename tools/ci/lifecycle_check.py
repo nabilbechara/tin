@@ -9,6 +9,7 @@ then on app.stop runs (its own waits still work) and the process exits 0. anvil.
 does the same from a handler.
 """
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -217,7 +218,11 @@ def client_addr(out):
                 got.append(client)
         finally:
             server.terminate()
-            server.wait(timeout=15)
+            _, stderr = server.communicate(timeout=15)
+        # The access log of the anvil docs: a herald line per request, in order, with the client.
+        logged = re.findall(r' INFO core=0 request method=GET route=/addr status=200 client=(\S+)$',
+                            stderr.decode(), re.M)
+        assert logged == got, ('the access log carries the client', logged, got)
         return got
 
     xff = lambda v: 'X-Forwarded-For: %s\r\n' % v

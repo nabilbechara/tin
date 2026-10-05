@@ -57,14 +57,16 @@ charged to a `limit`), owned by the request.
 | 13 | `tpWall` | wall clock (ns) when the request started |
 | 14 | `tpLive` | replaying: the `TIN_REPLAY_LIVE` kinds (a malloc'd comma list), 0: none |
 | 15 | `tpSched` | reserved for #243 (scheduling state) |
+| 16 | `tpPeer` | the request's peer as `q.RemoteAddr()` gives it (`ip:port`, `[ip6]:port`), a malloc'd str, 0: none (#355) |
 
-`tpWords = 16`. Functions (all in `lib/runtime/replay.tin`, a new file of the runtime package):
+`tpWords = 17`. Functions (all in `lib/runtime/replay.tin`, a new file of the runtime package):
 
 | function | does |
 |---|---|
 | `rt_tape() i64` | the running task's tape, 0 when off: one per-core load and a branch. Every effect call site tests it first, so recording off costs that and nothing else. |
 | `rt_tape_new(mode i64) i64` | a zeroed tape |
 | `rt_tape_free(tp i64)` | frees the tape and everything it owns |
+| `rt_tape_peer_set(tp i64, peer str)`, `rt_tape_peer(tp i64) str` | keep and read `tpPeer` ("" when none) |
 | `rt_tape_load(tp i64, p i64, n i64)` | replaying: the effect section of a decoded capsule becomes the records to serve (copied) |
 | `rt_tape_diverged(tp i64) str` | the first divergence, "" if none |
 | `rt_tape_left(tp i64) i64` | replaying: recorded effects not yet served (a replay that ends with some left diverged too) |
@@ -181,7 +183,8 @@ handle itself) hashes to the recorded handle: the same keys compare equal.
 
 - **Request headers** named in the secret list (section 1) are stored with their value
   replaced by its handle; on replay the handler reads the handle as the header's value.
-  Dropped headers are stored empty. The body and the URL are stored as received.
+  Dropped headers are stored empty. The body and the URL are stored as received, and so is the
+  peer address (#355): like the request, it is encrypted at rest.
 - **`wire.http@1` keys**: the values of headers in the same list.
 - **Library parameters declared `secret`** that reach a key: always their handle.
 - **Query arguments (5.3).**
@@ -230,7 +233,7 @@ library.)
 **Body.**
 
 ```
-word   schema      1
+word   schema      2 (1 has no peer)
 string tin         the Tin version (`VERSION`, "dev")
 string program     argv[0]
 word   wall        tpWall
@@ -239,9 +242,13 @@ word   status      tpStatus (500 or 504 after a panic)
 word   flags       1 panicked, 2 sampled
 string request     the request bytes with secret headers as handles (5.2)
 string panic       the panic message, "" if none
+string peer        schema 2: the address the request's connection came from (`ip:port`), "" if unknown
 word   count       effect records
 ...    records     section 3.3
 ```
+
+Schema 2 added `peer` (#355). This build writes schema 2 and reads schemas 1 and 2; a schema 1
+capsule has no peer.
 
 ## 7. Scheduling events (#243)
 
@@ -302,7 +309,9 @@ replay: divergence at effect N: ...        (only if diverged)
 replay: K recorded effects not served      (only if some are left)
 ```
 
-then the response body. Exit status: 0 when nothing diverged, 3 when it diverged, 4 when the
+then the response body. The replayed request's `q.RemoteAddr()` and `q.ClientIP()` answer from the
+capsule's peer, not from the socket replay sends the request on ("" for a schema 1 capsule, which
+has none; `ClientIP` applies the program's `TrustedProxies` to the recorded headers). Exit status: 0 when nothing diverged, 3 when it diverged, 4 when the
 capsule cannot be read (wrong key, damaged, an unsupported schema or kind). `--save-test NAME`
 is #242's.
 

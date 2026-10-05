@@ -5,10 +5,13 @@ import "fault"
 import "quarry"
 import "replayserve"
 import "tide"
+import "twine"
 
 // A checkout service for replay_check.py (#242): it reads the cart, then charges the payment
 // service; a failed charge is a 500. CHECKOUT_SWAP=1 charges before reading the cart; ?wait=1
 // waits first (the request task parks and resumes), ?panic=1 panics after the charge.
+// /who answers the request's RemoteAddr and ClientIP (#355); TRUST lists the trusted proxy
+// networks, comma-separated.
 
 fn cart(id str) !str {
 	return try replayserve.Effect("redis@1", "GET cart:" + id)
@@ -49,9 +52,20 @@ fn checkout(q anvil.Req, w mut anvil.Out) {
 	w.Text("paid: " + paid + " for " + items + " (live calls {replayserve.LiveCalls()})\n")
 }
 
+fn who(q anvil.Req, w mut anvil.Out) {
+	w.Text("peer {q.RemoteAddr()} client {q.ClientIP()}\n")
+}
+
 fn main() {
+	let trust = quarry.Getenv("TRUST")
+	if len(trust) > 0 {
+		anvil.TrustedProxies(twine.Split(trust, ",")) catch err {
+			panic(fault.Message(err))
+		}
+	}
 	let r = anvil.NewRouter()
 	r.Post(`/checkout/{id}`, checkout)
+	r.Get("/who", who)
 	let err = r.Serve(":8080")
 	if err != nil {
 		panic(fault.Message(err))

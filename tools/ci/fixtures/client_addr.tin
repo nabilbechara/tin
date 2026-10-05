@@ -1,12 +1,21 @@
 package main
 
 import "anvil"
+import "herald"
 import "quarry"
 import "say"
 import "twine"
 
 // #355: /addr answers the connection's RemoteAddr and the request's ClientIP; TRUST lists the
-// trusted proxy networks, comma-separated.
+// trusted proxy networks, comma-separated. `logged` is the access log of the anvil docs: a herald
+// line per request with the client.
+fn logged(q anvil.Req, w mut anvil.Out, next fn(anvil.Req, mut anvil.Out)) {
+	next(q, mut w)
+	herald.Log(herald.LInfo, "request", []str{
+		"method", q.Method, "route", q.Pattern(), "status", say.Str(w.Code()), "client", q.ClientIP(),
+	})
+}
+
 fn addr(q anvil.Req, w mut anvil.Out) {
 	w.Text("{q.RemoteAddr()} {q.ClientIP()}")
 }
@@ -20,6 +29,7 @@ fn main() {
 		}
 	}
 	let r = anvil.NewRouter()
+	r.Use(logged)
 	r.Get("/addr", addr)
 	let err = r.Serve(":" + quarry.Getenv("PORT"))
 	say.Line(err)

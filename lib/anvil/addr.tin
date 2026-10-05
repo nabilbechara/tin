@@ -26,9 +26,15 @@ fn TrustedProxies(cidrs []str) ! {
 
 // RemoteAddr is the address the request's connection comes from, "ip:port" ("[ip]:port"
 // for IPv6, and an IPv4 client of an IPv6 listener as IPv4), or "" for a request made in
-// the process. It is read once per connection.
+// the process. It is read once per connection. A request replayed from a capsule (#242) gets
+// the address it was recorded with, "" when the capsule is older than that (schema 1).
 fn (q Req) RemoteAddr() str {
-	let (ip, port, ok) = peer_ip(q.cn)
+	return peer_string(q.cn)
+}
+
+// peer_string is RemoteAddr of the connection record c, "" when it has no peer.
+fn peer_string(c i64) str {
+	let (ip, port, ok) = peer_ip(c)
 	if !ok {
 		return ""
 	}
@@ -142,6 +148,11 @@ fn trim_space(s str) str {
 // peer_ip is the connection's peer address as 16 bytes (IPv4 mapped into IPv6) and its
 // port, read with getpeername the first time and kept in the connection record.
 fn peer_ip(c i64) ([]u8, i64, bool) {
+	if gReplayTape != 0 {
+		// A replay (#242) sends its one request from a socket of its own: the peer is the
+		// recorded one, not that socket's.
+		return recorded_peer()
+	}
 	mut ip = make([]u8, 16)
 	if c == 0 {
 		return ip, 0, false
@@ -173,6 +184,38 @@ fn peer_ip(c i64) ([]u8, i64, bool) {
 	}
 	for k in 0..16 {
 		ip[k] = u8(load8(sa + 8 + k))
+	}
+	return ip, port, true
+}
+
+// recorded_peer is the peer a replayed request was recorded with, in the form peer_ip gives;
+// false when the capsule has none.
+fn recorded_peer() ([]u8, i64, bool) {
+	let none = make([]u8, 16)
+	let s = rt_tape_peer(gReplayTape)
+	mut colon = -1
+	for k in 0..len(s) {
+		if s[k] == ':' {
+			colon = k
+		}
+	}
+	if colon <= 0 || colon+1 >= len(s) || colon+6 < len(s) {
+		return none, 0, false
+	}
+	mut port = 0
+	for k in colon+1..len(s) {
+		if s[k] < '0' || s[k] > '9' {
+			return none, 0, false
+		}
+		port = port*10 + i64(s[k]-'0')
+	}
+	mut host = s[:colon]
+	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		host = host[1 : len(host)-1]
+	}
+	let (ip, ok) = ip_parse(host)
+	if !ok || port > 65535 {
+		return none, 0, false
 	}
 	return ip, port, true
 }

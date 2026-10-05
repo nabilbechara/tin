@@ -17,6 +17,7 @@ type Capsule struct {
 	Flags   i64 // 1 panicked, 2 sampled
 	Request str // the request bytes, secret headers as handles
 	Panic   str // the panic message, "" if none
+	Peer    str // the address the request came from ("ip:port"), "" if unknown (schema 1)
 	Count   i64 // effect records
 	Effects str // the effect records (section 3.3), as rt_tape_load takes them
 }
@@ -94,12 +95,12 @@ fn word(v i64) str {
 	return str(b)
 }
 
-// Decode reads a capsule body (schema 1) and checks every effect record and its kind.
+// Decode reads a capsule body (schema 1 or 2) and checks every effect record and its kind.
 fn Decode(body str) !Capsule {
 	let r = reader{b: body, pos: 0}
 	let schema = try r.word()
-	if schema != 1 {
-		fail "capsule: unsupported schema {schema} (this build reads schema 1)"
+	if schema != 1 && schema != 2 {
+		fail "capsule: unsupported schema {schema} (this build reads schemas 1 and 2)"
 	}
 	let c = Capsule{}
 	c.Tin = try r.bytes()
@@ -110,6 +111,9 @@ fn Decode(body str) !Capsule {
 	c.Flags = try r.word()
 	c.Request = try r.bytes()
 	c.Panic = try r.bytes()
+	if schema >= 2 {
+		c.Peer = try r.bytes()
+	}
 	c.Count = try r.word()
 	if c.Count < 0 {
 		fail "capsule: damaged (effect count {c.Count})"

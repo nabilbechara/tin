@@ -56,11 +56,15 @@ def string(b):
     return word(len(b)) + b
 
 
-def capsule_body(effects, status=500, request=REQUEST, schema=1):
+def capsule_body(effects, status=500, request=REQUEST, schema=1, peer=''):
     """A capsule body (notes/interface_replay.md, section 6) with these (kind, key, outcome,
-    ident, data) effect records (section 3.3)."""
+    ident, data) effect records (section 3.3). Schema 2 adds the peer after the panic (#355);
+    schema 1 capsules, which have none, are still read."""
     out = word(schema) + string('dev') + string('replay_serve') + word(1700000000000000000) + word(0)
-    out += word(status) + word(0) + string(request) + string('') + word(len(effects))
+    out += word(status) + word(0) + string(request) + string('')
+    if schema >= 2:
+        out += string(peer)
+    out += word(len(effects))
     for seq, (kind, key, outcome, ident, data) in enumerate(effects):
         out += word(seq) + string(kind) + string(key) + word(outcome) + word(ident) + string(data)
     return out
@@ -137,8 +141,24 @@ def replay_mode(work, env):
     case('not a capsule', b'GET / HTTP/1.1\r\n\r\n', 4, '', 'replay: capsule: not a capsule (no TINCAP header)\n')
     case('unsupported kind', seal(capsule_body([('redis@9', 'GET cart:7', 0, 0, '2 books')])), 4, '',
          'replay: capsule: effect 0 has kind redis@9, which this build cannot replay\n')
-    case('unsupported schema', seal(capsule_body(recorded, schema=2)), 4, '',
-         'replay: capsule: unsupported schema 2 (this build reads schema 1)\n')
+    case('unsupported schema', seal(capsule_body(recorded, schema=3)), 4, '',
+         'replay: capsule: unsupported schema 3 (this build reads schemas 1 and 2)\n')
+    case('schema 2 capsule', seal(capsule_body(recorded, schema=2, peer='203.0.113.9:51234')), 0,
+         'replay: status 500 (recorded 500)\ncharge failed: payments: connection refused (live calls 0)\n')
+    # The peer (#355): a replayed request sees the address it was recorded with, not the socket
+    # the replay sends it from; a schema 1 capsule has none, and RemoteAddr and ClientIP say so.
+    who = b'GET /who HTTP/1.1\r\nHost: shop\r\nX-Forwarded-For: 198.51.100.4\r\n\r\n'
+    trust = {'TRUST': '203.0.113.0/24,2001:db8::/32'}
+    case('peer replayed', seal(capsule_body([], 200, who, 2, '203.0.113.9:51234')), 0,
+         'replay: status 200 (recorded 200)\npeer 203.0.113.9:51234 client 198.51.100.4\n', extra=trust)
+    case('peer untrusted', seal(capsule_body([], 200, who, 2, '203.0.113.9:51234')), 0,
+         'replay: status 200 (recorded 200)\npeer 203.0.113.9:51234 client 203.0.113.9\n')
+    case('peer IPv6', seal(capsule_body([], 200, who, 2, '[2001:db8::7]:4000')), 0,
+         'replay: status 200 (recorded 200)\npeer [2001:db8::7]:4000 client 198.51.100.4\n', extra=trust)
+    case('peer from a schema 1 capsule', seal(capsule_body([], 200, who, 1)), 0,
+         'replay: status 200 (recorded 200)\npeer  client \n', extra=trust)
+    case('peer malformed', seal(capsule_body([], 200, who, 2, 'not an address')), 0,
+         'replay: status 200 (recorded 200)\npeer  client \n', extra=trust)
     case('truncated body', seal(capsule_body(recorded)[:-3]), 4, '', 'replay: capsule: damaged (truncated)\n')
     # The driver: tin replay CAPSULE --against BUILD [--live KIND]... (exit 2 for a usage error).
     capsule = work / 'driver.tcap'
@@ -215,7 +235,10 @@ def decode_body(body):
         return s
 
     c = {'schema': word(), 'tin': string(), 'program': string(), 'wall': word(), 'core': word(),
-         'status': word(), 'flags': word(), 'request': string(), 'panic': string(), 'count': word()}
+         'status': word(), 'flags': word(), 'request': string(), 'panic': string()}
+    if c['schema'] >= 2:
+        c['peer'] = string()
+    c['count'] = word()
     c['effects'] = []
     for _ in range(c['count']):
         c['effects'].append((word(), string().decode(), string().decode(), word(), word(), string()))
@@ -270,7 +293,7 @@ def capsules(work, env):
             want_req = ('POST /checkout/7?x=1 HTTP/1.1\r\nHost: shop\r\nAuthorization: ' + secret_handle(b'Bearer s3cr3t-token') +
                         '\r\nCookie: ' + secret_handle(b'sid=c00k1e') + '\r\nX-Api-Key: ' + secret_handle(b'k-123-secret') +
                         '\r\nX-Email:\r\nContent-Length: 9\r\n\r\ncart=7&x=').encode()
-            check('schema', first['schema'], 1)
+            check('schema and peer', (first['schema'], first['peer']), (2, b''))
             check('tin', first['tin'], b'dev')
             check('program', first['program'], str(exe).encode())
             check('wall, core, status, flags', (first['wall'], first['core'], first['status'], first['flags']),
@@ -344,8 +367,10 @@ def free_port():
     raise RuntimeError('no free port below the ephemeral range')
 
 
-def http(port, raw):
+def http(port, raw, local_ports=None):
     s = socket.create_connection(('127.0.0.1', port), timeout=10)
+    if local_ports is not None:
+        local_ports.append(s.getsockname()[1])
     s.sendall(raw)
     data = b''
     while True:
@@ -381,6 +406,7 @@ def recording(work, env):
         run_env.update(extra)
         server = subprocess.Popen([str(exe)], env=run_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         answers = []
+        local_ports = []
         try:
             for _ in range(200):
                 try:
@@ -389,10 +415,11 @@ def recording(work, env):
                 except OSError:
                     time.sleep(0.05)
             for raw in requests:
-                answers.append(http(port, raw))
+                answers.append(http(port, raw, local_ports))
         finally:
             server.send_signal(signal.SIGTERM)
             out, err = server.communicate(timeout=30)
+        serve.local_ports = local_ports
         return answers, err.decode()
 
     def request(path, extra=''):
@@ -418,6 +445,9 @@ def recording(work, env):
     answers, err = serve(spool, [request(p, 'Cookie: sid=c00k1e\r\n') for p in paths])
     check('statuses', [a.split(b' ')[1] for a in answers], [b'200', b'504', b'500', b'504'])
     caps = kept(spool)
+    # The capsule holds the connection's peer: the client socket's own address (#355).
+    check('schema and peers', [(caps[p]['schema'], caps[p]['peer']) for p in paths[1:] if p in caps],
+          [(2, b'127.0.0.1:%d' % port) for port in serve.local_ports[1:]])
     check('kept', sorted(caps), ['/cart/7?fail=1', '/cart/8?panic=1', '/cart/9?wait=1&fail=1'])
     handle = secret_handle(b'Bearer s3cr3t-token')
     charge = 'POST http://payments/charge\n\ncart=2 books'

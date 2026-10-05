@@ -304,6 +304,9 @@ TIN_REPLAY_KEY=<64 hex digits> tin replay spool/00001700000000000000-000-1.tcap 
   through the handler or router on one core. Every effect that goes through the replay hook
   gets its recorded result or fault, and none is performed. The clients (clock, randomness,
   HTTP, Redis, SQL, files) join the hook in #241's recording slices.
+- The request's peer is the recorded one: `q.RemoteAddr()` and `q.ClientIP()` answer as they
+  did when it was recorded (`ClientIP` with this build's `anvil.TrustedProxies`). A capsule of
+  schema 1 has no peer, and both answer "".
 - Replay stops at the first **divergence**: an effect whose kind or key differs from the next
   recorded one (a different call, or a different order), or an effect after the last one. From
   then on every effect of the request fails with the divergence; replay never falls through to

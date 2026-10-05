@@ -116,7 +116,9 @@ fn user(q anvil.Req, w mut anvil.Out) {
 
 fn logged(q anvil.Req, w mut anvil.Out, next fn(anvil.Req, mut anvil.Out)) {
 	next(q, mut w)
-	say.Line(q.Method, q.Pattern(), w.Code())
+	herald.Log(herald.LInfo, "request", []str{
+		"method", q.Method, "route", q.Pattern(), "status", say.Str(w.Code()), "client", q.ClientIP(),
+	})
 }
 
 fn main() {
@@ -133,8 +135,16 @@ fn main() {
 }
 ```
 
+The middleware writes one herald line per request, with the client's address as client:
+
+```text
+2026-10-05T09:00:00.000Z INFO core=0 request method=GET route=/users/{id} status=200 client=203.0.113.7
+```
+
+q.ClientIP() is the connection's peer unless the peer is one of the TrustedProxies: behind a proxy of yours, call TrustedProxies first, or every line carries the proxy's address.
+
 - `TrustedProxies(cidrs []str) !`: TrustedProxies sets the proxies whose X-Forwarded-For and Forwarded headers ClientIP believes, as networks ("10.0.0.0/8", "fd00::/8") or single addresses. Call it before Serve. With none (the default) ClientIP is the connection's peer: the headers are written by the client and prove nothing unless a proxy you run replaced them.
-- `(q Req) RemoteAddr() str`: RemoteAddr is the address the request's connection comes from, "ip:port" ("[ip]:port" for IPv6, and an IPv4 client of an IPv6 listener as IPv4), or "" for a request made in the process. It is read once per connection.
+- `(q Req) RemoteAddr() str`: RemoteAddr is the address the request's connection comes from, "ip:port" ("[ip]:port" for IPv6, and an IPv4 client of an IPv6 listener as IPv4), or "" for a request made in the process. It is read once per connection. A request replayed from a capsule (#242) gets the address it was recorded with, "" when the capsule is older than that (schema 1).
 - `(q Req) ClientIP() str`: ClientIP is the client's IP address: the connection's peer, or, when the peer is one of the TrustedProxies, the rightmost address of X-Forwarded-For (else Forwarded's for=) that is not a trusted proxy. A malformed entry ends the walk at the peer. "" for a request made in the process.
 - `type Req struct`: Req is the request being served. Its strings live in the request pool: keep() them to store them anywhere long-lived.
 - `type Out struct`: Out is the response being built. Body is the response body; the status defaults to 200 and the content type to text/plain.
