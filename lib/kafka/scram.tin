@@ -1,0 +1,114 @@
+package kafka
+
+import "mint"
+import "seal"
+
+// SCRAM-SHA-256 and SCRAM-SHA-512 (RFC 5802, RFC 7677) as Kafka speaks them: no channel binding,
+// the password used as its UTF-8 bytes (Kafka's ScramFormatter does no SASLprep).
+
+fn scramHash(mech i64) seal.Hash {
+	if mech == 2 {
+		return seal.Hash.SHA512
+	}
+	return seal.Hash.SHA256
+}
+
+// saslName escapes a user name for the n= attribute.
+fn saslName(s str) str {
+	mut out = make([]u8, 0, len(s))
+	for i in 0..len(s) {
+		if s[i] == '=' {
+			out = append(out, "=3D"...)
+		} else if s[i] == ',' {
+			out = append(out, "=2C"...)
+		} else {
+			out = append(out, s[i])
+		}
+	}
+	return str(out)
+}
+
+// scramAttr is the value of attribute a in a SCRAM message ("" when absent).
+fn scramAttr(msg str, a u8) str {
+	mut at = 0
+	for at < len(msg) {
+		mut end = at
+		for end < len(msg) && msg[end] != ',' {
+			end += 1
+		}
+		if end-at >= 2 && msg[at] == a && msg[at+1] == '=' {
+			return msg[at+2 : end]
+		}
+		at = end + 1
+	}
+	return ""
+}
+
+// pbkdf2 is PBKDF2 (RFC 8018) with HMAC over h, giving h's digest size in bytes.
+fn pbkdf2(h seal.Hash, pass str, salt str, iterations i64) []u8 {
+	let n = seal.Size(h)
+	mut u = seal.Hmac(h, pass, salt + "\x00\x00\x00\x01")
+	mut t = make([]u8, n)
+	for i in 0..n {
+		t[i] = u[i]
+	}
+	for k in 1..iterations {
+		u = seal.Hmac(h, pass, str(u))
+		for i in 0..n {
+			t[i] = t[i] ^ u[i]
+		}
+	}
+	return t
+}
+
+// scramProof computes the client's final message and the server signature it must send back,
+// from the client-first-bare, the server-first message and the password.
+fn scramProof(h seal.Hash, bare str, serverFirst str, nonce str, pass str) !(str, []u8) {
+	let r = scramAttr(serverFirst, 'r')
+	let s = scramAttr(serverFirst, 's')
+	let it = scramAttr(serverFirst, 'i')
+	if scramAttr(serverFirst, 'e') != "" {
+		fail "{authFailed}: {scramAttr(serverFirst, 'e')}"
+	}
+	if len(r) <= len(nonce) || r[:len(nonce)] != nonce {
+		fail "{authFailed}: the server's nonce does not extend ours"
+	}
+	let iterations = mint.Atoi(it) catch _ { 0 }
+	if iterations < 1 || iterations > 1000000 {
+		fail "{authFailed}: SCRAM iteration count {it} is outside 1..1000000"
+	}
+	let salt = seal.B64Decode(s) catch _ {
+		fail "{authFailed}: the SCRAM salt is not base64"
+	}
+	let salted = pbkdf2(h, pass, str(salt), iterations)
+	let clientKey = seal.Hmac(h, str(salted), "Client Key")
+	let stored = seal.Sum(h, str(clientKey))
+	let final = "c=biws,r={r}"
+	let message = "{bare},{serverFirst},{final}"
+	let sig = seal.Hmac(h, str(stored), message)
+	mut proof = make([]u8, len(clientKey))
+	for i in 0..len(clientKey) {
+		proof[i] = clientKey[i] ^ sig[i]
+	}
+	let serverSig = seal.Hmac(h, str(seal.Hmac(h, str(salted), "Server Key")), message)
+	return "{final},p={seal.B64(proof)}", serverSig
+}
+
+// scram authenticates the connection with SCRAM over SaslAuthenticate.
+fn scram(l i64, client str, mech i64, user str, pass str, timeout i64) ! {
+	let h = scramHash(mech)
+	let nonce = seal.B64(seal.RandomBytes(24))
+	let bare = "n={saslName(user)},r={nonce}"
+	let serverFirst = try sasl_step(l, client, "n,,{bare}", timeout)
+	let (final, serverSig) = try scramProof(h, bare, serverFirst, nonce, pass)
+	let serverFinal = try sasl_step(l, client, final, timeout)
+	if scramAttr(serverFinal, 'e') != "" {
+		fail "{authFailed}: {scramAttr(serverFinal, 'e')}"
+	}
+	let v = seal.B64Decode(scramAttr(serverFinal, 'v')) catch _ {
+		fail "{authFailed}: the server's signature is not base64"
+	}
+	if !seal.ConstantTimeEq(v, serverSig) {
+		fail "{authFailed}: the server's signature is wrong (it does not know the password)"
+	}
+}

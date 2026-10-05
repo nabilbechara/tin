@@ -1,0 +1,125 @@
+package main
+
+import "anvil"
+import "fault"
+import "hearth"
+import "kafka"
+import "mint"
+import "quarry"
+import "say"
+import "tide"
+
+// A produce and consume service over Kafka (KAFKA_ADDR, default 127.0.0.1:9092; KAFKA_USER and
+// KAFKA_PASSWORD turn on SASL/PLAIN). Every core is also a member of the consumer group
+// "tin-example" on KAFKA_TOPIC (default "events"), counting what it consumes.
+//   GET /send?topic=T&key=K&value=V       appends a record, answers "partition offset"
+//   GET /fetch?topic=T&partition=P&offset=O   the records from O on, one per line
+//   GET /offsets?topic=T&partition=P      "first next": the range the partition holds
+//   GET /consumed                         records this core's group member has consumed
+let bus = kafka.Open(options())
+
+fn options() kafka.Options {
+	mut addr = quarry.Getenv("KAFKA_ADDR")
+	if addr == "" {
+		addr = "127.0.0.1:9092"
+	}
+	return kafka.Options{Brokers: []str{addr}, ClientID: "tin-example", Username: quarry.Getenv("KAFKA_USER"), Password: quarry.Getenv("KAFKA_PASSWORD"), Timeout: 10s}
+}
+
+fn topic() str {
+	let t = quarry.Getenv("KAFKA_TOPIC")
+	if t == "" {
+		return "events"
+	}
+	return t
+}
+
+// consumed counts, per core, the records this core's group member has read.
+mut consumed i64
+
+// The group member of this core runs in a task of its own; the drain cancels it, and Close
+// hands its partitions to the other members.
+on core.start {
+	detach {
+		consume() catch err {
+			say.Line("consumer on core", hearth.ID(), "stopped:", err)
+		}
+	}
+}
+
+fn consume() ! {
+	let g = try bus.Group(kafka.GroupOptions{Group: "tin-example", Topics: []str{topic()}})
+	for {
+		let (rs, err) = g.Poll(1s)
+		if err == nil {
+			consumed += len(rs)
+			continue
+		}
+		if fault.Is(err, fault.Canceled) || fault.Is(err, fault.DeadlineExceeded) {
+			// The drain: leave the group so the other members take the partitions now.
+			let cerr = g.Close()
+			if cerr != nil {
+				say.Line("leaving the group:", cerr)
+			}
+			fail err
+		}
+		// A broker restarting, a coordinator moving: the next Poll reconnects and rejoins.
+		say.Line("consumer on core", hearth.ID(), err)
+		try tide.Wait(1s)
+	}
+}
+
+fn upstream(w mut anvil.Out, err fault) {
+	w.Status(502)
+	w.Text("{err}")
+}
+
+fn send(q anvil.Req, w mut anvil.Out) {
+	let ack = bus.Send(q.Param("topic"), kafka.Message{Key: q.Param("key"), Value: q.Param("value")}) catch err {
+		upstream(mut w, err)
+		return
+	}
+	w.Text("{ack.Partition} {ack.Offset}")
+}
+
+fn fetch(q anvil.Req, w mut anvil.Out) {
+	let p = mint.Atoi(q.Param("partition")) catch _ { 0 }
+	let off = mint.Atoi(q.Param("offset")) catch _ { 0 }
+	let rs = bus.Fetch(q.Param("topic"), p, off, 1s) catch err {
+		upstream(mut w, err)
+		return
+	}
+	mut out = ""
+	for _, r in rs {
+		out = out + "{r.Offset} {r.Key} {r.Value}\n"
+	}
+	w.Text(out)
+}
+
+fn offsets(q anvil.Req, w mut anvil.Out) {
+	let p = mint.Atoi(q.Param("partition")) catch _ { 0 }
+	let (first, next) = bus.Offsets(q.Param("topic"), p) catch err {
+		upstream(mut w, err)
+		return
+	}
+	w.Text("{first} {next}")
+}
+
+fn count(q anvil.Req, w mut anvil.Out) {
+	w.Text("{consumed}")
+}
+
+fn no_route(q anvil.Req, w mut anvil.Out) {
+	w.Text("no route {q.Path}")
+}
+
+fn main() {
+	let r = anvil.NewRouter()
+	r.Get("/send", send)
+	r.Get("/fetch", fetch)
+	r.Get("/offsets", offsets)
+	r.Get("/consumed", count)
+	r.NotFound(no_route)
+	let err = r.Serve(":9186")
+	say.Line("server:", err)
+}

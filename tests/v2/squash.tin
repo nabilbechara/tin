@@ -1,0 +1,140 @@
+package main
+
+import "fault"
+import "say"
+import "seal"
+import "squash"
+import "stamp"
+
+// DEFLATE, gzip and zlib against Go (bench/ref/squash prints the same lines with compress/flate,
+// compress/gzip and compress/zlib): vectors Go wrote and vectors this package wrote, decoded by
+// both; round trips at every level; damaged and cut input; output limits.
+
+fn text(n i64) str {
+	mut b = make([]u8, 0, n+64)
+	mut i = 0
+	for len(b) < n {
+		b = append(b, "record {i}: the quick brown fox {i*7%13}; "...)
+		i += 1
+	}
+	return str(b[:n])
+}
+
+fn noise(n i64) str {
+	mut b = make([]u8, 0, n)
+	mut x u64 = 12345
+	for i in 0..n {
+		x = x*6364136223846793005 + 1442695040888963407
+		b = append(b, u8(x >> 56))
+	}
+	return str(b)
+}
+
+fn zeros(n i64) str {
+	return str(make([]u8, n))
+}
+
+fn hx(h str) str {
+	let b = seal.HexDecode(h) catch _ { []u8{} }
+	return str(b)
+}
+
+fn show(label str, s str, err fault) {
+	if err != nil {
+		say.Line(label, "error")
+		return
+	}
+	say.Line(label, len(s), stamp.Crc32(s))
+}
+
+fn decode(label str, kind str, data str) {
+	if kind == "gzip" {
+		let (s, err) = squash.Gunzip(data, 1 << 30)
+		show(label, s, err)
+	} else if kind == "zlib" {
+		let (s, err) = squash.Unzlib(data, 1 << 30)
+		show(label, s, err)
+	} else {
+		let (s, err) = squash.Inflate(data, 1 << 30)
+		show(label, s, err)
+	}
+}
+
+fn compress(kind str, s str, level i64) str {
+	if kind == "gzip" {
+		return squash.Gzip(s, level)
+	}
+	if kind == "zlib" {
+		return squash.Zlib(s, level)
+	}
+	return squash.Deflate(s, level)
+}
+
+fn limited(kind str, data str, max i64) bool {
+	mut err fault = nil
+	if kind == "gzip" {
+		let (_, e) = squash.Gunzip(data, max)
+		err = e
+	} else if kind == "zlib" {
+		let (_, e) = squash.Unzlib(data, max)
+		err = e
+	} else {
+		let (_, e) = squash.Inflate(data, max)
+		err = e
+	}
+	return err != nil && fault.Is(err, fault.LimitExceeded)
+}
+
+fn main() {
+	decode("go gzip two members", "gzip", hx("1f8b08000000000002ff84d15d0ac2400c04e0abe4089dee4f5bbd8d7545115c5c143dbe2f92bc4cc8fb47c8cc8cb6f77196e920af6b93e7fbb6dfe534fae72197fe95e9287f000e160533075090385815640e660585834d41e52029589c272de7ca4556b039272c289c328b09a74d5856387d561329dc2c47a3a144aba146b38196fa0b0000ffffdc529ee5580200001f8b08000000000004ff002c01d3fe1c43e2d5538fcb64d030fdfb29d37a55a95f615c0716388aa783da414b74f3080ce7c3487c362f11d74a2a0ecc52da0284baebc2378f59037b3553ce2820e9db8bb2829219b5f81fdc4966b1e6d19d2d46176c9aae1b83d6fab0f7f63be9d606b12ac9c39ebfb425c6af2cdff78607064eb3caa1873d55194f23db8c6074e924cec00b7ffdbe4e15897c8f9d97961d883f759b179cf3ac27b3337fb22ae15e88000b963ffabd51234cda8001a5abf651691ead5ef873151ad479a28924f01fcaa37173ff2d467468f9468d0020a81ce23cf9f493fdb81968cb812b0cc8efe9d0485fab715f7a756a282717964880c0c3f745341439e872ab31e01b954dfc391f8daaea459253c99e1b7db48cb153e5d889f3ece5a6328500c686f1e8c5304f7129766ca10845a927c4f0ece8010000ffff57bff1a02c010000"))
+	decode("go gzip with name comment extra", "gzip", hx("1f8b081c0000000000ff020078796e6f7465732e747874006120636f6d6d656e74002a4a4dce2f4a5130b05228c94855282ccd4cce56482aca2fcf5348cbaf5030b056802a30c4aec01caec008bb02436b852240000000ffff0b36177c64000000"))
+	decode("go zlib", "zlib", hx("789c74d14b0a02311084e1abf411a667262fbd8d31a2080683a2c77723dd5954ed3f42eaefd16a1f67590ef2ba3679be6ff52ea7d13f0fb9f4af2c47f903c52019583150031b06d9c08ec16a2060500c440c3603897cd277662c7603853ce14395c40c2e484df5ad4a7a461724e8743352d48fa624e9348634f5b3298cfa0b0000ffff7446c800"))
+	decode("go deflate stored", "deflate", hx("002c01d3fe1c43e2d5538fcb64d030fdfb29d37a55a95f615c0716388aa783da414b74f3080ce7c3487c362f11d74a2a0ecc52da0284baebc2378f59037b3553ce2820e9db8bb2829219b5f81fdc4966b1e6d19d2d46176c9aae1b83d6fab0f7f63be9d606b12ac9c39ebfb425c6af2cdff78607064eb3caa1873d55194f23db8c6074e924cec00b7ffdbe4e15897c8f9d97961d883f759b179cf3ac27b3337fb22ae15e88000b963ffabd51234cda8001a5abf651691ead5ef873151ad479a28924f01fcaa37173ff2d467468f9468d0020a81ce23cf9f493fdb81968cb812b0cc8efe9d0485fab715f7a756a282717964880c0c3f745341439e872ab31e01b954dfc391f8daaea459253c99e1b7db48cb153e5d889f3ece5a6328500c686f1e8c5304f7129766ca10845a927c4f0ece8010000ffff"))
+	decode("go deflate level 5", "deflate", hx("74d14b0a02311084e1abf411a667262fbd8d31a2080683a2c77723dd5954ed3f42eaefd16a1f67590ef2ba3679be6ff52ea7d13f0fb9f4af2c47f903c52019583150031b06d9c08ec16a2060500c440c3603897cd277662c7603853ce14395c40c2e484df5ad4a7a461724e8743352d48fa624e9348634f5b3298cfa0b0000ffff"))
+	decode("tin gzip", "gzip", hx("1f8b08000000000000ff75d14b0a80300c45d1ad6409c67f7537d68a22582c8a2edf89241de4cd0fa5ef26051fd34cc540d71ae8bc37bfd394e273d0125f2a46fa01dba01350da80055436e805d4362805343670025a1b54023af049ddd9dba216e0c0133a9441cc4605a8c9ba9541cf5605089add0c14d5a331489a8d014df56c6c46fd00dc529ee558020000"))
+	decode("tin zlib", "zlib", hx("78da012c01d3fe1c43e2d5538fcb64d030fdfb29d37a55a95f615c0716388aa783da414b74f3080ce7c3487c362f11d74a2a0ecc52da0284baebc2378f59037b3553ce2820e9db8bb2829219b5f81fdc4966b1e6d19d2d46176c9aae1b83d6fab0f7f63be9d606b12ac9c39ebfb425c6af2cdff78607064eb3caa1873d55194f23db8c6074e924cec00b7ffdbe4e15897c8f9d97961d883f759b179cf3ac27b3337fb22ae15e88000b963ffabd51234cda8001a5abf651691ead5ef873151ad479a28924f01fcaa37173ff2d467468f9468d0020a81ce23cf9f493fdb81968cb812b0cc8efe9d0485fab715f7a756a282717964880c0c3f745341439e872ab31e01b954dfc391f8daaea459253c99e1b7db48cb153e5d889f3ece5a6328500c686f1e8c5304f7129766ca10845a927c4f0ece85ebe970e"))
+	decode("tin deflate", "deflate", hx("75d1b90d80400c44d1565c02c37d74c32510122b5620289f04d904e3fc25f3274e4388a324ad9ccb24c7b50e9bf431dcbbcce191a4930f80834a41ca0114641cd40a720e520505078d8292834c41c5016c67cd45aea0e10036144eccc2845313b6154ecfd28413d4b6c0296aa7c149fa1be334b5db40a3be"))
+	decode("tin deflate stored", "deflate", hx("012c01d3fe1c43e2d5538fcb64d030fdfb29d37a55a95f615c0716388aa783da414b74f3080ce7c3487c362f11d74a2a0ecc52da0284baebc2378f59037b3553ce2820e9db8bb2829219b5f81fdc4966b1e6d19d2d46176c9aae1b83d6fab0f7f63be9d606b12ac9c39ebfb425c6af2cdff78607064eb3caa1873d55194f23db8c6074e924cec00b7ffdbe4e15897c8f9d97961d883f759b179cf3ac27b3337fb22ae15e88000b963ffabd51234cda8001a5abf651691ead5ef873151ad479a28924f01fcaa37173ff2d467468f9468d0020a81ce23cf9f493fdb81968cb812b0cc8efe9d0485fab715f7a756a282717964880c0c3f745341439e872ab31e01b954dfc391f8daaea459253c99e1b7db48cb153e5d889f3ece5a6328500c686f1e8c5304f7129766ca10845a927c4f0ece8"))
+
+	let names = []str{"text0", "text1", "text600", "text70000", "noise300", "noise70000", "zeros200000"}
+	let inputs = []str{text(0), text(1), text(600), text(70000), noise(300), noise(70000), zeros(200000)}
+	for _, kind in []str{"gzip", "zlib", "deflate"} {
+		for i, s in inputs {
+			for _, lv in []i64{0, 1, 6, 9} {
+				let c = compress(kind, s, lv)
+				mut ok = false
+				if kind == "gzip" {
+					let (b, e) = squash.Gunzip(c, 1 << 30)
+					ok = e == nil && b == s
+				} else if kind == "zlib" {
+					let (b, e) = squash.Unzlib(c, 1 << 30)
+					ok = e == nil && b == s
+				} else {
+					let (b, e) = squash.Inflate(c, 1 << 30)
+					ok = e == nil && b == s
+				}
+				say.Line("roundtrip", kind, names[i], "level", lv, ok)
+			}
+		}
+		let big = text(70000)
+		for _, lv in []i64{1, 6, 9} {
+			say.Line("text70000 under a third", kind, "level", lv, len(compress(kind, big, lv)) < len(big)/3)
+		}
+		let rnd = noise(70000)
+		say.Line("noise70000 grows by at most 64 bytes", kind, len(compress(kind, rnd, 6)) <= len(rnd)+64)
+		say.Line("limit", kind, limited(kind, compress(kind, big, 6), 1000))
+		say.Line("no limit hit at the exact size", kind, !limited(kind, compress(kind, big, 6), 70000))
+	}
+
+	let g = hx("1f8b08000000000000ff75d14b0a80300c45d1ad6409c67f7537d68a22582c8a2edf89241de4cd0fa5ef26051fd34cc540d71ae8bc37bfd394e273d0125f2a46fa01dba01350da80055436e805d4362805343670025a1b54023af049ddd9dba216e0c0133a9441cc4605a8c9ba9541cf5605089add0c14d5a331489a8d014df56c6c46fd00dc529ee558020000")
+	mut bad = make([]u8, 0, len(g))
+	bad = append(bad, g...)
+	bad[len(bad)/2] = bad[len(bad)/2] ^ 0x10
+	decode("damaged gzip", "gzip", str(bad))
+	let z = hx("78da012c01d3fe1c43e2d5538fcb64d030fdfb29d37a55a95f615c0716388aa783da414b74f3080ce7c3487c362f11d74a2a0ecc52da0284baebc2378f59037b3553ce2820e9db8bb2829219b5f81fdc4966b1e6d19d2d46176c9aae1b83d6fab0f7f63be9d606b12ac9c39ebfb425c6af2cdff78607064eb3caa1873d55194f23db8c6074e924cec00b7ffdbe4e15897c8f9d97961d883f759b179cf3ac27b3337fb22ae15e88000b963ffabd51234cda8001a5abf651691ead5ef873151ad479a28924f01fcaa37173ff2d467468f9468d0020a81ce23cf9f493fdb81968cb812b0cc8efe9d0485fab715f7a756a282717964880c0c3f745341439e872ab31e01b954dfc391f8daaea459253c99e1b7db48cb153e5d889f3ece5a6328500c686f1e8c5304f7129766ca10845a927c4f0ece85ebe970e")
+	decode("cut zlib", "zlib", z[:len(z)-5])
+	decode("cut gzip", "gzip", g[:len(g)-3])
+	decode("text is not gzip", "gzip", "hello, world")
+	decode("empty is not gzip", "gzip", "")
+	decode("empty is not zlib", "zlib", "")
+}

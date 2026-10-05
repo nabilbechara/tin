@@ -1,0 +1,785 @@
+package kafka
+
+import "squash"
+import "stamp"
+
+// The Kafka wire format: big-endian integers, length-prefixed strings and arrays, and the
+// record batch (magic 2) with zig-zag varints inside.
+
+// API keys and the one version of each that this client speaks: the last version before tagged
+// fields (notes/design_kafka.md, section 2).
+const apiProduce = 0
+const apiFetch = 1
+const apiListOffsets = 2
+const apiMetadata = 3
+const apiOffsetCommit = 8
+const apiOffsetFetch = 9
+const apiFindCoordinator = 10
+const apiJoinGroup = 11
+const apiHeartbeat = 12
+const apiLeaveGroup = 13
+const apiSyncGroup = 14
+const apiDescribeGroups = 15
+const apiListGroups = 16
+const apiSaslHandshake = 17
+const apiApiVersions = 18
+const apiCreateTopics = 19
+const apiDeleteTopics = 20
+const apiDeleteRecords = 21
+const apiInitProducerId = 22
+const apiAddPartitionsToTxn = 24
+const apiAddOffsetsToTxn = 25
+const apiEndTxn = 26
+const apiTxnOffsetCommit = 28
+const apiDescribeConfigs = 32
+const apiSaslAuthenticate = 36
+const apiCreatePartitions = 37
+const apiDeleteGroups = 42
+const apiIncrementalAlterConfigs = 44
+const apiCount = 45
+
+// version is the version this client sends of api, -1 for one it does not use.
+fn version(api i64) i64 {
+	return match api {
+		0 => 7
+		1 => 10
+		2 => 4
+		3 => 7
+		8 => 7
+		9 => 5
+		10 => 2
+		11 => 5
+		12 => 3
+		13 => 3
+		14 => 3
+		15 => 4
+		16 => 2
+		17 => 1
+		18 => 2
+		19 => 4
+		20 => 3
+		21 => 1
+		22 => 1
+		24 => 1
+		25 => 1
+		26 => 1
+		28 => 2
+		32 => 2
+		36 => 1
+		37 => 1
+		42 => 1
+		44 => 0
+		_ => -1
+	}
+}
+
+fn apiName(api i64) str {
+	return match api {
+		0 => "Produce"
+		1 => "Fetch"
+		2 => "ListOffsets"
+		3 => "Metadata"
+		8 => "OffsetCommit"
+		9 => "OffsetFetch"
+		10 => "FindCoordinator"
+		11 => "JoinGroup"
+		12 => "Heartbeat"
+		13 => "LeaveGroup"
+		14 => "SyncGroup"
+		15 => "DescribeGroups"
+		16 => "ListGroups"
+		17 => "SaslHandshake"
+		18 => "ApiVersions"
+		19 => "CreateTopics"
+		20 => "DeleteTopics"
+		21 => "DeleteRecords"
+		22 => "InitProducerId"
+		24 => "AddPartitionsToTxn"
+		25 => "AddOffsetsToTxn"
+		26 => "EndTxn"
+		28 => "TxnOffsetCommit"
+		32 => "DescribeConfigs"
+		36 => "SaslAuthenticate"
+		37 => "CreatePartitions"
+		42 => "DeleteGroups"
+		44 => "IncrementalAlterConfigs"
+		_ => "request {api}"
+	}
+}
+
+// ---- encoding ----
+
+fn put8(b mut []u8, v i64) {
+	b = append(b, u8(v))
+}
+
+fn put16(b mut []u8, v i64) {
+	b = append(b, u8(v>>8), u8(v))
+}
+
+fn put32(b mut []u8, v i64) {
+	b = append(b, u8(v>>24), u8(v>>16), u8(v>>8), u8(v))
+}
+
+fn put64(b mut []u8, v i64) {
+	put32(mut b, v>>32)
+	put32(mut b, v)
+}
+
+fn putBool(b mut []u8, v bool) {
+	if v {
+		b = append(b, 1)
+	} else {
+		b = append(b, 0)
+	}
+}
+
+// putStr writes a string with its int16 length.
+fn putStr(b mut []u8, s str) {
+	put16(mut b, len(s))
+	b = append(b, s...)
+}
+
+// putNullStr writes a nullable string: "" is null.
+fn putNullStr(b mut []u8, s str) {
+	if s == "" {
+		put16(mut b, -1)
+		return
+	}
+	putStr(mut b, s)
+}
+
+// putBytes writes bytes with their int32 length.
+fn putBytes(b mut []u8, s str) {
+	put32(mut b, len(s))
+	b = append(b, s...)
+}
+
+fn putStrs(b mut []u8, xs []str) {
+	put32(mut b, len(xs))
+	for _, x in xs {
+		putStr(mut b, x)
+	}
+}
+
+fn putInts(b mut []u8, xs []i64) {
+	put32(mut b, len(xs))
+	for _, x in xs {
+		put32(mut b, x)
+	}
+}
+
+// putUvarint writes an unsigned varint.
+fn putUvarint(b mut []u8, v u64) {
+	mut x = v
+	for x >= 0x80 {
+		b = append(b, u8(x)|0x80)
+		x = x >> 7
+	}
+	b = append(b, u8(x))
+}
+
+// putVarint writes a signed zig-zag varint.
+fn putVarint(b mut []u8, v i64) {
+	putUvarint(mut b, (u64(v)<<1)^u64(v>>63))
+}
+
+// ---- decoding ----
+
+// dec reads a response. A read past the end sets bad and returns zero values, so a caller
+// checks bad once at the end instead of after every field.
+type dec struct {
+	s   str
+	pos i64
+	bad bool
+}
+
+fn newDec(s str) dec {
+	return dec{s: s, pos: 0, bad: false}
+}
+
+fn (d mut dec) need(n i64) bool {
+	if d.bad || n < 0 || d.pos+n > len(d.s) {
+		d.bad = true
+		return false
+	}
+	return true
+}
+
+fn (d mut dec) i8() i64 {
+	if !d.need(1) {
+		return 0
+	}
+	let v = i64(i8(d.s[d.pos]))
+	d.pos += 1
+	return v
+}
+
+fn (d mut dec) bool() bool {
+	return d.i8() != 0
+}
+
+fn (d mut dec) i16() i64 {
+	if !d.need(2) {
+		return 0
+	}
+	let v = i64(i16(u16(d.s[d.pos])<<8 | u16(d.s[d.pos+1])))
+	d.pos += 2
+	return v
+}
+
+fn (d mut dec) i32() i64 {
+	if !d.need(4) {
+		return 0
+	}
+	let p = d.pos
+	let v = u32(d.s[p])<<24 | u32(d.s[p+1])<<16 | u32(d.s[p+2])<<8 | u32(d.s[p+3])
+	d.pos += 4
+	return i64(i32(v))
+}
+
+fn (d mut dec) i64() i64 {
+	let hi = d.i32()
+	let lo = d.i32()
+	return (hi << 32) | (lo & 0xffffffff)
+}
+
+// str reads an int16-prefixed string; a null string (length -1) is "".
+fn (d mut dec) str() str {
+	let n = d.i16()
+	if n <= 0 || !d.need(n) {
+		return ""
+	}
+	let s = d.s[d.pos : d.pos+n]
+	d.pos += n
+	return s
+}
+
+// count reads an array's length; null (-1) is 0. Every element takes at least one byte, so a
+// length past the rest of the response is damage, not a reason to allocate.
+fn (d mut dec) count() i64 {
+	let n = d.i32()
+	if n < 0 {
+		return 0
+	}
+	if n > len(d.s)-d.pos {
+		d.bad = true
+		return 0
+	}
+	return n
+}
+
+// bytes reads an int32-prefixed byte string; null is "".
+fn (d mut dec) bytes() str {
+	let n = d.i32()
+	if n <= 0 || !d.need(n) {
+		return ""
+	}
+	let s = d.s[d.pos : d.pos+n]
+	d.pos += n
+	return s
+}
+
+fn (d mut dec) strs() []str {
+	let n = d.count()
+	mut out = make([]str, 0, n)
+	for i in 0..n {
+		out = append(out, d.str())
+	}
+	return out
+}
+
+fn (d mut dec) ints() []i64 {
+	let n = d.count()
+	mut out = make([]i64, 0, n)
+	for i in 0..n {
+		out = append(out, d.i32())
+	}
+	return out
+}
+
+fn (d mut dec) skipInts() {
+	let n = d.count()
+	if d.need(4 * n) {
+		d.pos += 4 * n
+	}
+}
+
+fn (d mut dec) uvarint() u64 {
+	mut x u64 = 0
+	mut shift u64 = 0
+	for i in 0..10 {
+		if !d.need(1) {
+			return 0
+		}
+		let c = d.s[d.pos]
+		d.pos += 1
+		x = x | (u64(c&0x7f) << shift)
+		if c < 0x80 {
+			return x
+		}
+		shift += 7
+	}
+	d.bad = true
+	return 0
+}
+
+fn (d mut dec) varint() i64 {
+	let u = d.uvarint()
+	return i64(u>>1) ^ -i64(u&1)
+}
+
+// vbytes reads varint-prefixed bytes (a record's key, value or header); -1 is null.
+fn (d mut dec) vbytes() (str, bool) {
+	let n = d.varint()
+	if n < 0 {
+		return "", true
+	}
+	if !d.need(n) {
+		return "", false
+	}
+	let s = d.s[d.pos : d.pos+n]
+	d.pos += n
+	return s, false
+}
+
+// ---- requests ----
+
+// request starts a request: the size (patched by finish), the header and the client id.
+fn request(api i64, ver i64, corr i64, client str) []u8 {
+	mut b = make([]u8, 0, 256)
+	put32(mut b, 0)
+	put16(mut b, api)
+	put16(mut b, ver)
+	put32(mut b, corr)
+	putStr(mut b, client)
+	return b
+}
+
+// finish writes the frame size into the first four bytes.
+fn finish(b mut []u8) {
+	let n = len(b) - 4
+	b[0] = u8(n >> 24)
+	b[1] = u8(n >> 16)
+	b[2] = u8(n >> 8)
+	b[3] = u8(n)
+}
+
+// ---- records ----
+
+// Message is one record to send.
+type Message struct {
+	Key       str // "" is a null key
+	Value     str
+	Headers   []Header
+	Timestamp i64 // ms since the epoch; 0 means now
+}
+
+// Header is a record header.
+type Header struct {
+	Key   str
+	Value str
+}
+
+// Record is a record read from a partition.
+type Record struct {
+	Topic       str
+	Partition   i64
+	Offset      i64
+	Timestamp   i64 // ms since the epoch
+	Key         str // "" when the record has no key
+	Value       str
+	Headers     []Header
+	LeaderEpoch i64
+}
+
+// Compression codecs, as the record batch attributes number them.
+type Compression enum {
+	None
+	Gzip
+	Snappy
+	Lz4
+	Zstd
+}
+
+fn codecNumber(c Compression) i64 {
+	return match c {
+		None => 0
+		Gzip => 1
+		Snappy => 2
+		Lz4 => 3
+		Zstd => 4
+	}
+}
+
+// batchInfo is what goes into a batch header besides its records.
+type batchInfo struct {
+	codec         i64
+	producerID    i64 // -1: none
+	producerEpoch i64
+	baseSeq       i64
+	transactional bool
+}
+
+// encodeRecordTail is a record without its length, attributes and deltas: key, value, headers.
+fn encodeRecordTail(m Message) []u8 {
+	mut r = make([]u8, 0, 16+len(m.Key)+len(m.Value))
+	if m.Key == "" {
+		putVarint(mut r, -1)
+	} else {
+		putVarint(mut r, len(m.Key))
+		r = append(r, m.Key...)
+	}
+	putVarint(mut r, len(m.Value))
+	r = append(r, m.Value...)
+	putVarint(mut r, len(m.Headers))
+	for _, h in m.Headers {
+		putVarint(mut r, len(h.Key))
+		r = append(r, h.Key...)
+		putVarint(mut r, len(h.Value))
+		r = append(r, h.Value...)
+	}
+	return r
+}
+
+// encodeRecord appends one record (length, attributes, deltas and tail).
+fn encodeRecord(b mut []u8, tail str, delta i64, tsDelta i64) {
+	mut head = make([]u8, 0, 24)
+	put8(mut head, 0)
+	putVarint(mut head, tsDelta)
+	putVarint(mut head, delta)
+	putVarint(mut b, len(head)+len(tail))
+	b = append(b, head...)
+	b = append(b, tail...)
+}
+
+// buildBatch makes a record batch from records already encoded (by encodeRecord, deltas from
+// 0) with their first and largest timestamps.
+fn buildBatch(records []u8, n i64, first i64, maxTs i64, info batchInfo) []u8 {
+	mut payload = records
+	if info.codec != 0 {
+		payload = compress(info.codec, str(records))
+	}
+	mut attrs = info.codec
+	if info.transactional {
+		attrs = attrs | 0x10
+	}
+	mut body = make([]u8, 0, len(payload)+40)
+	put16(mut body, attrs)
+	put32(mut body, n-1)              // last offset delta
+	put64(mut body, first)            // first timestamp
+	put64(mut body, maxTs)            // max timestamp
+	put64(mut body, info.producerID)
+	put16(mut body, info.producerEpoch)
+	put32(mut body, info.baseSeq)
+	put32(mut body, n)
+	body = append(body, payload...)
+	let crc = stamp.Crc32C(str(body))
+	mut b = make([]u8, 0, len(body)+21)
+	put64(mut b, 0)                   // base offset
+	put32(mut b, len(body)+9)         // batch length: from the leader epoch on
+	put32(mut b, -1)                  // partition leader epoch
+	put8(mut b, 2)                    // magic
+	put32(mut b, i64(crc))
+	b = append(b, body...)
+	return b
+}
+
+// encodeBatch writes ms as one record batch.
+fn encodeBatch(ms []Message, now i64, info batchInfo) []u8 {
+	mut first = now
+	mut maxTs = now
+	for i, m in ms {
+		let ts = tsOf(m, now)
+		if i == 0 || ts < first {
+			first = ts
+		}
+		if i == 0 || ts > maxTs {
+			maxTs = ts
+		}
+	}
+	mut recs = make([]u8, 0, 64+len(ms)*32)
+	for i, m in ms {
+		encodeRecord(mut recs, str(encodeRecordTail(m)), i, tsOf(m, now)-first)
+	}
+	return buildBatch(recs, len(ms), first, maxTs, info)
+}
+
+fn tsOf(m Message, now i64) i64 {
+	if m.Timestamp > 0 {
+		return m.Timestamp
+	}
+	return now
+}
+
+fn be32(s str, at i64) i64 {
+	let v = u32(s[at])<<24 | u32(s[at+1])<<16 | u32(s[at+2])<<8 | u32(s[at+3])
+	return i64(i32(v))
+}
+
+fn be64(s str, at i64) i64 {
+	return (be32(s, at) << 32) | (be32(s, at+4) & 0xffffffff)
+}
+
+// abortedTxn is one entry of a fetch response's aborted transactions.
+type abortedTxn struct {
+	producerID  i64
+	firstOffset i64
+}
+
+// readFilter says which records a fetch keeps: those from offset on, and with committed set, none
+// of an aborted transaction (as the Java consumer's read_committed does).
+type readFilter struct {
+	from      i64
+	committed bool
+	aborted   []abortedTxn
+}
+
+// decodeBatches reads the record batches of one fetched partition into records. The broker may
+// end the data in the middle of a batch (it cuts at the byte limit): that last, partial batch is
+// dropped and the next fetch starts at it. next is the offset after the last batch read (control
+// batches and skipped ones count), so a fetch that returns only markers still moves on.
+fn decodeBatches(data str, topic str, partition i64, f readFilter, max i64) !([]Record, i64) {
+	mut out = []Record{}
+	mut next = f.from
+	mut at = 0
+	mut aborting = []i64{} // producers whose aborted transaction is open at this point
+	mut pending = f.aborted
+	for at+12 <= len(data) {
+		let baseOffset = be64(data, at)
+		let batchLen = be32(data, at+8)
+		if batchLen < 0 {
+			fail "kafka: a record batch has length {batchLen}"
+		}
+		if at+12+batchLen > len(data) {
+			break
+		}
+		let batch = data[at+12 : at+12+batchLen]
+		at += 12 + batchLen
+		if len(batch) < 49 {
+			fail "kafka: a record batch is {len(batch)} bytes, shorter than its header"
+		}
+		let lastOffset = baseOffset + be32(batch, 11)
+		if lastOffset+1 > next {
+			next = lastOffset + 1
+		}
+		let attrs = be32(batch, 9) >> 16 & 0xffff
+		let pid = be64(batch, 31)
+		if f.committed {
+			// Transactions aborted at or before this batch become open.
+			mut rest = []abortedTxn{}
+			for _, a in pending {
+				if a.firstOffset <= lastOffset {
+					aborting = append(aborting, a.producerID)
+				} else {
+					rest = append(rest, a)
+				}
+			}
+			pending = rest
+		}
+		if attrs&0x20 != 0 {
+			// A control batch: a commit or abort marker closes its producer's transaction.
+			if f.committed && attrs&0x10 != 0 {
+				mut stay = []i64{}
+				for _, p in aborting {
+					if p != pid {
+						stay = append(stay, p)
+					}
+				}
+				aborting = stay
+			}
+			continue
+		}
+		if f.committed && attrs&0x10 != 0 {
+			mut skip = false
+			for _, p in aborting {
+				if p == pid {
+					skip = true
+				}
+			}
+			if skip {
+				continue
+			}
+		}
+		try decodeBatch(batch, baseOffset, topic, partition, f.from, max, mut out)
+	}
+	return out, next
+}
+
+// decodeBatch decodes one batch (the bytes after its length field) onto out.
+fn decodeBatch(batch str, baseOffset i64, topic str, partition i64, from i64, max i64, out mut []Record) ! {
+	let magic = i64(batch[4])
+	if magic != 2 {
+		fail "kafka: record batch magic {magic} is not supported (the broker sent a message format older than 0.11)"
+	}
+	let crc = u32(be32(batch, 5))
+	let body = batch[9:]
+	if stamp.Crc32C(body) != crc {
+		fail "kafka: a record batch failed its CRC-32C check"
+	}
+	let epoch = be32(batch, 0)
+	let attrs = be32(batch, 9) >> 16 & 0xffff
+	let codec = attrs & 7
+	let firstTs = be64(batch, 15)
+	let maxTs = be64(batch, 23)
+	let logAppend = attrs & 8 != 0
+	let n = be32(batch, 45)
+	mut recs = batch[49:]
+	if codec != 0 {
+		recs = try decompress(codec, recs, max)
+	}
+	if n < 0 || n > len(recs) {
+		fail "kafka: a record batch claims {n} records"
+	}
+	mut d = newDec(recs)
+	for r in 0..n {
+		let size = d.varint()
+		let end = d.pos + size
+		if d.bad || size < 0 || end > len(d.s) {
+			fail "kafka: a record is cut short"
+		}
+		d.i8() // attributes
+		let tsDelta = d.varint()
+		let offDelta = d.varint()
+		let (key, _) = d.vbytes()
+		let (val, _) = d.vbytes()
+		let hn = d.varint()
+		mut hs = []Header{}
+		if hn > 0 && hn < size {
+			for j in 0..hn {
+				let (hk, _) = d.vbytes()
+				let (hv, _) = d.vbytes()
+				hs = append(hs, Header{Key: hk, Value: hv})
+			}
+		}
+		if d.bad || d.pos != end {
+			fail "kafka: a record does not match its length"
+		}
+		let off = baseOffset + offDelta
+		if off < from {
+			continue
+		}
+		mut ts = firstTs + tsDelta
+		if logAppend {
+			ts = maxTs
+		}
+		out = append(out, Record{Topic: topic, Partition: partition, Offset: off, Timestamp: ts, Key: key, Value: val, Headers: hs, LeaderEpoch: epoch})
+	}
+}
+
+// ---- partitioning ----
+
+// Murmur2 is the hash Kafka's default partitioner uses for keys (Java's Utils.murmur2),
+// so a key lands on the same partition here as from the Java client.
+fn Murmur2(data str) i64 {
+	let seed u32 = 0x9747b28c
+	let m u32 = 0x5bd1e995
+	let length = len(data)
+	mut h u32 = seed ^ u32(length)
+	let nblocks = length / 4
+	for i in 0..nblocks {
+		let p = i * 4
+		mut k u32 = u32(data[p]) | u32(data[p+1])<<8 | u32(data[p+2])<<16 | u32(data[p+3])<<24
+		k = k * m
+		k = k ^ (k >> 24)
+		k = k * m
+		h = h * m
+		h = h ^ k
+	}
+	let tail = nblocks * 4
+	let rest = length & 3
+	if rest == 3 {
+		h = h ^ (u32(data[tail+2]) << 16)
+	}
+	if rest >= 2 {
+		h = h ^ (u32(data[tail+1]) << 8)
+	}
+	if rest >= 1 {
+		h = h ^ u32(data[tail])
+		h = h * m
+	}
+	h = h ^ (h >> 13)
+	h = h * m
+	h = h ^ (h >> 15)
+	return i64(i32(h))
+}
+
+// PartitionFor is the partition Kafka's default partitioner picks for key among n partitions.
+fn PartitionFor(key str, n i64) i64 {
+	return (Murmur2(key) & 0x7fffffff) % n
+}
+
+// EncodeBatch is ms as one record batch (format 2) compressed with c, the bytes Kafka stores and
+// sends, with offsets counted from 0. A message whose Timestamp is 0 gets now (ms since the epoch).
+fn EncodeBatch(ms []Message, now i64, c Compression) str {
+	return str(encodeBatch(ms, now, batchInfo{codec: codecNumber(c), producerID: -1, producerEpoch: -1, baseSeq: -1, transactional: false}))
+}
+
+// DecodeBatches reads the record batches in data, as a Fetch response carries them, with any
+// codec. A batch the data ends in the middle of is dropped; a damaged one, a changed byte
+// (CRC-32C) or an old message format fails. Control batches (transaction markers) are skipped.
+fn DecodeBatches(data str) ![]Record {
+	let (rs, _) = try decodeBatches(data, "", 0, readFilter{from: 0, committed: false, aborted: []abortedTxn{}}, 1 << 30)
+	return rs
+}
+
+// ---- compression (Kafka's framing of each codec) ----
+
+// The xerial snappy-java stream header Kafka's Java client writes before snappy blocks.
+const xerialMagic = "\x82SNAPPY\x00"
+const xerialBlock = 32768
+
+fn compress(codec i64, s str) []u8 {
+	mut out = make([]u8, 0, len(s)/2+32)
+	if codec == 1 {
+		out = append(out, squash.Gzip(s, squash.Default)...)
+	} else if codec == 2 {
+		out = append(out, xerialMagic...)
+		put32(mut out, 1)
+		put32(mut out, 1)
+		mut at = 0
+		for at < len(s) {
+			let end = min(at+xerialBlock, len(s))
+			let blk = squash.Snappy(s[at:end])
+			put32(mut out, len(blk))
+			out = append(out, blk...)
+			at = end
+		}
+	} else if codec == 3 {
+		out = append(out, squash.Lz4NoChecksum(s)...)
+	} else {
+		out = append(out, squash.Zstd(s, 3)...)
+	}
+	return out
+}
+
+fn decompress(codec i64, s str, max i64) !str {
+	if codec == 1 {
+		return try squash.Gunzip(s, max)
+	}
+	if codec == 2 {
+		if len(s) >= 16 && s[:8] == xerialMagic {
+			mut out = make([]u8, 0, len(s)*3)
+			mut at = 16
+			for at+4 <= len(s) {
+				let n = be32(s, at)
+				at += 4
+				if n < 0 || at+n > len(s) {
+					fail "kafka: a snappy block runs past its batch"
+				}
+				let blk = try squash.Unsnappy(s[at:at+n], max-len(out))
+				out = append(out, blk...)
+				at += n
+			}
+			return str(out)
+		}
+		return try squash.Unsnappy(s, max)
+	}
+	if codec == 3 {
+		return try squash.Unlz4(s, max)
+	}
+	if codec == 4 {
+		return try squash.Unzstd(s, max)
+	}
+	fail "kafka: record batch compression codec {codec} is not defined"
+}

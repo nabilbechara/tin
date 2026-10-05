@@ -1,0 +1,463 @@
+package squash
+
+import "stamp"
+
+// Zstandard encoding: blocks of up to 128 KiB, matches from hash chains over a 1 MiB window,
+// literals Huffman-coded (four streams) when that is smaller, sequences coded with the format's
+// predefined FSE tables, and a content checksum. A block that does not shrink is stored raw.
+
+const zMatchWindow = 1048576
+const zHashBits = 17
+
+// ---- FSE encoding (the reference's FSE_buildCTable and FSE_encodeSymbol) ----
+
+type fseCTable struct {
+	log        i64
+	state      []i64
+	deltaBits  []i64
+	deltaFind  []i64
+}
+
+fn fseCBuild(norm []i64, log i64) fseCTable {
+	let size = 1 << log
+	let spread = fseSpread(norm, log)
+	mut cumul = make([]i64, len(norm)+1)
+	for s, p in norm {
+		if p == -1 {
+			cumul[s+1] = cumul[s] + 1
+		} else {
+			cumul[s+1] = cumul[s] + p
+		}
+	}
+	mut state = make([]i64, size)
+	for u in 0..size {
+		let s = spread[u]
+		state[cumul[s]] = size + u
+		cumul[s] += 1
+	}
+	mut db = make([]i64, len(norm))
+	mut df = make([]i64, len(norm))
+	mut total = 0
+	for s, p in norm {
+		if p == 0 {
+			db[s] = ((log + 1) << 16) - size
+		} else if p == -1 || p == 1 {
+			db[s] = (log << 16) - size
+			df[s] = total - 1
+			total += 1
+		} else {
+			let maxOut = log - highbit(p-1)
+			let minPlus = p << maxOut
+			db[s] = (maxOut << 16) - minPlus
+			df[s] = total - p
+			total += p
+		}
+	}
+	return fseCTable{log: log, state: state, deltaBits: db, deltaFind: df}
+}
+
+fn fseInit(t fseCTable, sym i64) i64 {
+	let nb = (t.deltaBits[sym] + (1 << 15)) >> 16
+	let v = (nb << 16) - t.deltaBits[sym]
+	return t.state[(v >> nb) + t.deltaFind[sym]]
+}
+
+fn fseEncode(w mut bitWriter, t fseCTable, st i64, sym i64) i64 {
+	let nb = (st + t.deltaBits[sym]) >> 16
+	w.put(st & ((1 << nb) - 1), nb)
+	return t.state[(st >> nb) + t.deltaFind[sym]]
+}
+
+let llCT = fseCBuild(llDefault, 6)
+let mlCT = fseCBuild(mlDefault, 6)
+let ofCT = fseCBuild(ofDefault, 5)
+
+fn llCode(ll i64) i64 {
+	if ll < 16 {
+		return ll
+	}
+	mut c = 35
+	for llBase[c] > ll {
+		c -= 1
+	}
+	return c
+}
+
+fn mlCode(ml i64) i64 {
+	if ml < 35 {
+		return ml - 3
+	}
+	mut c = 52
+	for mlBase[c] > ml {
+		c -= 1
+	}
+	return c
+}
+
+// ---- Huffman literals ----
+
+// zHuffCodes are a literal code: per byte its length and code (0 length: unused), and the
+// direct weight description; ok is false when the code cannot be described that way.
+fn zHuffCodes(lits []u8) ([]i64, []i64, []u8, bool) {
+	mut freq = make([]i64, 256)
+	for _, b in lits {
+		freq[b] += 1
+	}
+	mut distinct = 0
+	mut maxSym = 0
+	for s, f in freq {
+		if f > 0 {
+			distinct += 1
+			maxSym = s
+		}
+	}
+	if distinct < 2 || maxSym > 128 {
+		return []i64{}, []i64{}, []u8{}, false
+	}
+	let lens = huffLengths(freq, 11)
+	mut maxBits = 0
+	for _, l in lens {
+		maxBits = max(maxBits, l)
+	}
+	mut weights = make([]i64, maxSym+1)
+	for s in 0..maxSym+1 {
+		if lens[s] > 0 {
+			weights[s] = maxBits + 1 - lens[s]
+		}
+	}
+	// The decoder's table: lowest weights first, symbols in order; a code is its first index.
+	mut codesOut = make([]i64, 256)
+	mut pos = 0
+	for w in 1..maxBits+1 {
+		for s in 0..maxSym+1 {
+			if weights[s] != w {
+				continue
+			}
+			codesOut[s] = pos >> (w - 1)
+			pos += 1 << (w - 1)
+		}
+	}
+	// Direct representation: every weight but the last symbol's, four bits each.
+	let n = maxSym
+	mut desc = make([]u8, 0, 1+(n+1)/2)
+	desc = append(desc, u8(127+n))
+	mut i = 0
+	for i < n {
+		mut b = weights[i] << 4
+		if i+1 < n {
+			b = b | weights[i+1]
+		}
+		desc = append(desc, u8(b))
+		i += 2
+	}
+	return lens, codesOut, desc, true
+}
+
+fn huffEncode(lits []u8, from i64, to i64, lens []i64, cs []i64) []u8 {
+	mut w = bitWriter{out: make([]u8, 0, (to-from)/2+8), acc: 0, n: 0}
+	mut i = to - 1
+	for i >= from {
+		let b = lits[i]
+		w.put(cs[i64(b)], lens[i64(b)])
+		i -= 1
+	}
+	w.put(1, 1)
+	w.flush()
+	return w.out
+}
+
+// literalsSection writes the block's literals: Huffman-coded when smaller, else raw (or RLE).
+fn literalsSection(out mut []u8, lits []u8) {
+	let n = len(lits)
+	mut same = n > 0
+	for _, b in lits {
+		if b != lits[0] {
+			same = false
+			break
+		}
+	}
+	if same {
+		literalsHeader(mut out, 1, n)
+		out = append(out, lits[0])
+		return
+	}
+	let (lens, cs, desc, ok) = zHuffCodes(lits)
+	if ok && n >= 64 {
+		mut body = make([]u8, 0, n)
+		body = append(body, desc...)
+		if n < 256 {
+			body = append(body, huffEncode(lits, 0, n, lens, cs)...)
+		} else {
+			let seg = (n + 3) / 4
+			let a = huffEncode(lits, 0, seg, lens, cs)
+			let b = huffEncode(lits, seg, 2*seg, lens, cs)
+			let c = huffEncode(lits, 2*seg, 3*seg, lens, cs)
+			let d = huffEncode(lits, 3*seg, n, lens, cs)
+			if len(a) < 65536 && len(b) < 65536 && len(c) < 65536 {
+				body = append(body, u8(len(a)), u8(len(a)>>8), u8(len(b)), u8(len(b)>>8), u8(len(c)), u8(len(c)>>8))
+				body = append(body, a...)
+				body = append(body, b...)
+				body = append(body, c...)
+				body = append(body, d...)
+			} else {
+				body = body[:0]
+			}
+		}
+		let comp = len(body)
+		if comp > 0 && comp+5 < n {
+			mut sf = 0
+			if n >= 256 {
+				sf = 1
+				if n > 1023 || comp > 1023 {
+					sf = 2
+				}
+				if n > 16383 || comp > 16383 {
+					sf = 3
+				}
+			}
+			if sf <= 1 {
+				let h = 2 | (sf << 2) | (n << 4) | (comp << 14)
+				out = append(out, u8(h), u8(h>>8), u8(h>>16))
+			} else if sf == 2 {
+				let h = 2 | (sf << 2) | (n << 4) | (comp << 18)
+				out = append(out, u8(h), u8(h>>8), u8(h>>16), u8(h>>24))
+			} else {
+				let h = 2 | (sf << 2) | (n << 4) | (comp << 22)
+				out = append(out, u8(h), u8(h>>8), u8(h>>16), u8(h>>24), u8(h>>32))
+			}
+			out = append(out, body...)
+			return
+		}
+	}
+	literalsHeader(mut out, 0, n)
+	out = append(out, lits...)
+}
+
+// literalsHeader writes a raw (kind 0) or RLE (kind 1) literals header for n bytes.
+fn literalsHeader(out mut []u8, kind i64, n i64) {
+	if n < 32 {
+		out = append(out, u8(kind|(n<<3)))
+	} else if n < 4096 {
+		out = append(out, u8(kind|(1<<2)|((n&15)<<4)), u8(n>>4))
+	} else {
+		out = append(out, u8(kind|(3<<2)|((n&15)<<4)), u8(n>>4), u8(n>>12))
+	}
+}
+
+// ---- blocks and frames ----
+
+// Zstd compresses data as one Zstandard frame at level (Store to Best; Store writes raw blocks).
+fn Zstd(data str, level i64) str {
+	let n = len(data)
+	mut out = make([]u8, 0, n/2+64)
+	out = append(out, 0x28, 0xb5, 0x2f, 0xfd)
+	// Up to 8 MiB the whole content is the window (single segment); beyond, an 8 MiB window.
+	let single = n <= 8388608
+	mut fhd = 0x04
+	mut fcsSize = 0
+	if single {
+		fhd = fhd | 0x20
+		if n < 256 {
+			fcsSize = 1
+		} else if n < 65536+256 {
+			fhd = fhd | 0x40
+			fcsSize = 2
+		} else {
+			fhd = fhd | 0x80
+			fcsSize = 4
+		}
+	} else {
+		fhd = fhd | 0xc0
+		fcsSize = 8
+	}
+	out = append(out, u8(fhd))
+	if !single {
+		out = append(out, u8(13 << 3)) // 2^23 bytes
+	}
+	mut fcs = n
+	if fcsSize == 2 {
+		fcs -= 256
+	}
+	for k in 0..fcsSize {
+		out = append(out, u8(fcs >> (8*k)))
+	}
+	let lv = min(max(level, 0), 9)
+	mut m = zMatcher{head: make([]i64, 0), prev: make([]i64, 0), chain: chainOf[lv], nice: niceOf[lv]}
+	if lv > 0 {
+		m.head = make([]i64, 1 << zHashBits)
+		for i in 0..len(m.head) {
+			m.head[i] = -1
+		}
+		m.prev = make([]i64, zMatchWindow)
+	}
+	mut at = 0
+	for {
+		let end = min(at+zstdBlockMax, n)
+		let last = end == n
+		if lv == 0 || end-at < 16 {
+			zRawBlock(mut out, data, at, end, last)
+		} else {
+			zBlock(mut out, data, at, end, last, mut m)
+		}
+		at = end
+		if last {
+			break
+		}
+	}
+	let h = i64(stamp.Xxh64(data, 0) & 0xffffffff)
+	out = append(out, u8(h), u8(h>>8), u8(h>>16), u8(h>>24))
+	return str(out)
+}
+
+fn zBlockHeader(out mut []u8, kind i64, size i64, last bool) {
+	mut h = (kind << 1) | (size << 3)
+	if last {
+		h = h | 1
+	}
+	out = append(out, u8(h), u8(h>>8), u8(h>>16))
+}
+
+fn zRawBlock(out mut []u8, s str, from i64, to i64, last bool) {
+	zBlockHeader(mut out, 0, to-from, last)
+	out = append(out, s[from:to]...)
+}
+
+fn zHash(s str, i i64) i64 {
+	let v = i64(s[i]) | i64(s[i+1])<<8 | i64(s[i+2])<<16 | i64(s[i+3])<<24
+	return ((v * 2654435761) >> (32 - zHashBits)) & ((1 << zHashBits) - 1)
+}
+
+fn zInsert(s str, i i64, head mut []i64, prev mut []i64) {
+	if i+4 > len(s) {
+		return
+	}
+	let h = zHash(s, i)
+	prev[i & (zMatchWindow - 1)] = head[h]
+	head[h] = i
+}
+
+// zFind is the longest match at i that ends by end, as length<<32 | offset (0: none of 4+).
+fn zFind(s str, i i64, end i64, head []i64, prev []i64, chain i64, nice i64) i64 {
+	if i+4 > end {
+		return 0
+	}
+	let room = end - i
+	mut best = 0
+	mut bestOff = 0
+	mut cand = head[zHash(s, i)]
+	mut left = chain
+	for cand >= 0 && i-cand < zMatchWindow && left > 0 && best < room {
+		if s[cand+best] == s[i+best] {
+			mut l = 0
+			for l < room && s[cand+l] == s[i+l] {
+				l += 1
+			}
+			if l > best {
+				best = l
+				bestOff = i - cand
+				if l >= nice {
+					break
+				}
+			}
+		}
+		let p = prev[cand & (zMatchWindow - 1)]
+		if p >= cand {
+			break
+		}
+		cand = p
+		left -= 1
+	}
+	if best < 4 {
+		return 0
+	}
+	return (best << 32) | bestOff
+}
+
+// zMatcher is the match finder's state, kept across a frame's blocks.
+type zMatcher struct {
+	head  []i64
+	prev  []i64
+	chain i64
+	nice  i64
+}
+
+fn zBlock(out mut []u8, s str, from i64, to i64, last bool, mt mut zMatcher) {
+	mut lits = make([]u8, 0, to-from)
+	mut seqLL = make([]i64, 0, 256)
+	mut seqOff = make([]i64, 0, 256)
+	mut seqML = make([]i64, 0, 256)
+	mut anchor = from
+	mut i = from
+	for i < to {
+		let m = zFind(s, i, to, mt.head, mt.prev, mt.chain, mt.nice)
+		zInsert(s, i, mut mt.head, mut mt.prev)
+		if m == 0 {
+			i += 1
+			continue
+		}
+		let length = m >> 32
+		let off = m & 0xffffffff
+		lits = append(lits, s[anchor:i]...)
+		seqLL = append(seqLL, i-anchor)
+		seqOff = append(seqOff, off)
+		seqML = append(seqML, length)
+		for k in 1..length {
+			zInsert(s, i+k, mut mt.head, mut mt.prev)
+		}
+		i += length
+		anchor = i
+	}
+	lits = append(lits, s[anchor:to]...)
+	mut body = make([]u8, 0, (to-from)/2+64)
+	literalsSection(mut body, lits)
+	let nseq = len(seqLL)
+	if nseq < 128 {
+		body = append(body, u8(nseq))
+	} else if nseq < 0x7f00 {
+		body = append(body, u8((nseq>>8)+128), u8(nseq))
+	} else {
+		let k = nseq - 0x7f00
+		body = append(body, 255, u8(k), u8(k>>8))
+	}
+	if nseq > 0 {
+		body = append(body, 0) // predefined tables for all three
+		mut w = bitWriter{out: make([]u8, 0, nseq*4+8), acc: 0, n: 0}
+		let lastI = nseq - 1
+		let ll0 = llCode(seqLL[lastI])
+		let ml0 = mlCode(seqML[lastI])
+		let ob0 = seqOff[lastI] + 3
+		let of0 = highbit(ob0)
+		mut sml = fseInit(mlCT, ml0)
+		mut sof = fseInit(ofCT, of0)
+		mut sll = fseInit(llCT, ll0)
+		w.put(seqLL[lastI]-llBase[ll0], llBits[ll0])
+		w.put(seqML[lastI]-mlBase[ml0], mlBits[ml0])
+		w.put(ob0-(1<<of0), of0)
+		mut k = nseq - 2
+		for k >= 0 {
+			let llc = llCode(seqLL[k])
+			let mlc = mlCode(seqML[k])
+			let ob = seqOff[k] + 3
+			let ofc = highbit(ob)
+			sof = fseEncode(mut w, ofCT, sof, ofc)
+			sml = fseEncode(mut w, mlCT, sml, mlc)
+			sll = fseEncode(mut w, llCT, sll, llc)
+			w.put(seqLL[k]-llBase[llc], llBits[llc])
+			w.put(seqML[k]-mlBase[mlc], mlBits[mlc])
+			w.put(ob-(1<<ofc), ofc)
+			k -= 1
+		}
+		w.put(sml & ((1 << mlCT.log) - 1), mlCT.log)
+		w.put(sof & ((1 << ofCT.log) - 1), ofCT.log)
+		w.put(sll & ((1 << llCT.log) - 1), llCT.log)
+		w.put(1, 1)
+		w.flush()
+		body = append(body, w.out...)
+	}
+	if len(body) >= to-from {
+		zRawBlock(mut out, s, from, to, last)
+		return
+	}
+	zBlockHeader(mut out, 2, len(body), last)
+	out = append(out, body...)
+}

@@ -1,0 +1,451 @@
+package kafka
+
+import "fault"
+
+// Administration: topics, partitions, records, groups and configs.
+
+// TopicSpec describes a topic to create.
+type TopicSpec struct {
+	Name       str
+	Partitions i64
+	Replicas   i64      // replication factor (-1: the broker's default)
+	Configs    []Config // topic configs to set, by Name and Value
+}
+
+// Config is one configuration entry.
+type Config struct {
+	Name      str
+	Value     str
+	ReadOnly  bool
+	Default   bool // the value is the default (not set on this resource)
+	Sensitive bool // the broker hides the value
+}
+
+// Resource is what a config belongs to.
+type Resource enum {
+	Topic
+	Broker
+}
+
+fn resourceType(r Resource) i64 {
+	return match r {
+		Topic => 2
+		Broker => 4
+	}
+}
+
+// GroupListing is one group a cluster knows.
+type GroupListing struct {
+	Group        str
+	ProtocolType str // "consumer" for consumer groups
+}
+
+// GroupMember is one member of a described group.
+type GroupMember struct {
+	MemberID   str
+	InstanceID str
+	ClientID   str
+	Host       str
+	Assigned   []TopicPartition
+}
+
+// GroupDescription is the state of a group.
+type GroupDescription struct {
+	Group    str
+	State    str // Stable, PreparingRebalance, CompletingRebalance, Empty, Dead
+	Protocol str // the assignor in use
+	Members  []GroupMember
+}
+
+// CreateTopic makes a topic. It fails with ErrTopicExists when there already is one.
+fn (c Client) CreateTopic(name str, partitions i64, replicas i64) ! {
+	try c.CreateTopics([]TopicSpec{TopicSpec{Name: name, Partitions: partitions, Replicas: replicas, Configs: []Config{}}})
+}
+
+// CreateTopics makes topics; the first failure fails the call (ErrTopicExists for one that exists).
+fn (c Client) CreateTopics(specs []TopicSpec) ! {
+	mut body = make([]u8, 0, 64)
+	put32(mut body, len(specs))
+	for _, t in specs {
+		putStr(mut body, t.Name)
+		put32(mut body, t.Partitions)
+		put16(mut body, t.Replicas)
+		put32(mut body, 0) // no explicit assignments
+		put32(mut body, len(t.Configs))
+		for _, cf in t.Configs {
+			putStr(mut body, cf.Name)
+			putNullStr(mut body, cf.Value)
+		}
+	}
+	put32(mut body, 30000)
+	putBool(mut body, false)
+	let addr = try c.controllerAddr()
+	let resp = try c.call(addr, apiCreateTopics, body, 30000000000, false)
+	mut d = newDec(resp)
+	d.i32()
+	let nt = d.count()
+	for i in 0..nt {
+		let name = d.str()
+		let code = d.i16()
+		let msg = d.str()
+		if code != 0 {
+			if msg != "" {
+				fail kerr(code, "create topic {name} ({msg})")
+			}
+			fail kerr(code, "create topic {name}")
+		}
+	}
+	if d.bad {
+		fail damaged("create topics")
+	}
+}
+
+// DeleteTopics removes topics.
+fn (c Client) DeleteTopics(names []str) ! {
+	mut body = make([]u8, 0, 64)
+	putStrs(mut body, names)
+	put32(mut body, 30000)
+	let addr = try c.controllerAddr()
+	let resp = try c.call(addr, apiDeleteTopics, body, 30000000000, false)
+	mut d = newDec(resp)
+	d.i32()
+	let nt = d.count()
+	for i in 0..nt {
+		let name = d.str()
+		let code = d.i16()
+		if code != 0 {
+			fail kerr(code, "delete topic {name}")
+		}
+	}
+	if d.bad {
+		fail damaged("delete topics")
+	}
+}
+
+// ListTopics is the names of the cluster's topics (internal ones too).
+fn (c Client) ListTopics() ![]str {
+	mut body = make([]u8, 0, 8)
+	put32(mut body, -1) // every topic
+	putBool(mut body, false)
+	let resp = try c.anyCall(apiMetadata, body, 0)
+	mut d = newDec(resp)
+	d.i32()
+	let nb = d.count()
+	for i in 0..nb {
+		d.i32()
+		d.str()
+		d.i32()
+		d.str()
+	}
+	d.str()
+	d.i32()
+	mut out = []str{}
+	let nt = d.count()
+	for i in 0..nt {
+		d.i16()
+		let name = d.str()
+		d.bool()
+		let np = d.count()
+		for j in 0..np {
+			d.i16()
+			d.i32()
+			d.i32()
+			d.i32()
+			d.skipInts()
+			d.skipInts()
+			d.skipInts()
+		}
+		out = append(out, name)
+	}
+	if d.bad {
+		fail damaged("metadata")
+	}
+	return out
+}
+
+// CreatePartitions grows topic to total partitions.
+fn (c Client) CreatePartitions(topic str, total i64) ! {
+	mut body = make([]u8, 0, 64)
+	put32(mut body, 1)
+	putStr(mut body, topic)
+	put32(mut body, total)
+	put32(mut body, -1) // assignments: the broker's choice
+	put32(mut body, 30000)
+	putBool(mut body, false)
+	let addr = try c.controllerAddr()
+	let resp = try c.call(addr, apiCreatePartitions, body, 30000000000, false)
+	mut d = newDec(resp)
+	d.i32()
+	let n = d.count()
+	for i in 0..n {
+		let name = d.str()
+		let code = d.i16()
+		let msg = d.str()
+		if code != 0 {
+			fail kerr(code, "create partitions of {name} ({msg})")
+		}
+	}
+	if d.bad {
+		fail damaged("create partitions")
+	}
+	try c.refresh([]str{topic})
+}
+
+// DeleteRecords deletes the records of the partition before offset; it returns the partition's
+// new first offset.
+fn (c Client) DeleteRecords(topic str, partition i64, before i64) !i64 {
+	let addr = try c.leader(topic, partition)
+	mut body = make([]u8, 0, 64)
+	put32(mut body, 1)
+	putStr(mut body, topic)
+	put32(mut body, 1)
+	put32(mut body, partition)
+	put64(mut body, before)
+	put32(mut body, 30000)
+	let resp = try c.call(addr, apiDeleteRecords, body, 30000000000, false)
+	mut d = newDec(resp)
+	d.i32()
+	mut low = -1
+	mut code = 0
+	let nt = d.count()
+	for i in 0..nt {
+		d.str()
+		let np = d.count()
+		for j in 0..np {
+			d.i32()
+			low = d.i64()
+			code = d.i16()
+		}
+	}
+	if d.bad {
+		fail damaged("delete records")
+	}
+	if code != 0 {
+		fail kerr(code, "delete records of {topic}/{partition}")
+	}
+	return low
+}
+
+// ListGroups lists the groups of the whole cluster (each broker knows those it coordinates).
+fn (c Client) ListGroups() ![]GroupListing {
+	try c.refresh([]str{})
+	let v = views[c.rec[rID]]
+	mut addrs = c.bootstrap()
+	if v != nil {
+		addrs = []str{}
+		let ns = v.nodes
+		for _, n in ns {
+			addrs = append(addrs, n.addr)
+		}
+	}
+	mut out = []GroupListing{}
+	for _, a in addrs {
+		let resp = try c.call(a, apiListGroups, make([]u8, 0), 0, false)
+		mut d = newDec(resp)
+		d.i32()
+		let code = d.i16()
+		if code != 0 {
+			fail kerr(code, "list groups at {a}")
+		}
+		let n = d.count()
+		for i in 0..n {
+			let g = d.str()
+			let pt = d.str()
+			out = append(out, GroupListing{Group: g, ProtocolType: pt})
+		}
+		if d.bad {
+			fail damaged("list groups")
+		}
+	}
+	return out
+}
+
+// DescribeGroup is the state, protocol and members of group.
+fn (c Client) DescribeGroup(group str) !GroupDescription {
+	mut body = make([]u8, 0, 32)
+	putStrs(mut body, []str{group})
+	putBool(mut body, false)
+	let resp = try c.coordCall(group, 0, apiDescribeGroups, body, 0, describeCode)
+	mut d = newDec(resp)
+	d.i32()
+	let ng = d.count()
+	for i in 0..ng {
+		let code = d.i16()
+		let g = d.str()
+		let state = d.str()
+		d.str() // protocol type
+		let protocol = d.str()
+		mut ms = []GroupMember{}
+		let nm = d.count()
+		for j in 0..nm {
+			let mid = d.str()
+			let inst = d.str()
+			let cid = d.str()
+			let host = d.str()
+			d.bytes() // metadata
+			let asg = d.bytes()
+			let parts = decodeAssignment(asg) catch _ { []TopicPartition{} }
+			ms = append(ms, GroupMember{MemberID: mid, InstanceID: inst, ClientID: cid, Host: host, Assigned: parts})
+		}
+		d.i32() // authorized operations
+		if d.bad {
+			fail damaged("describe groups")
+		}
+		if code != 0 {
+			fail kerr(code, "describe group {g}")
+		}
+		return GroupDescription{Group: g, State: state, Protocol: protocol, Members: ms}
+	}
+	fail damaged("describe groups")
+}
+
+fn describeCode(r str) i64 {
+	mut d = newDec(r)
+	d.i32()
+	if d.count() == 0 {
+		return 0
+	}
+	return d.i16()
+}
+
+// DeleteGroups removes empty groups and their committed offsets.
+fn (c Client) DeleteGroups(groups []str) ! {
+	for _, g in groups {
+		mut body = make([]u8, 0, 32)
+		putStrs(mut body, []str{g})
+		let resp = try c.coordCall(g, 0, apiDeleteGroups, body, 0, deleteGroupsCode)
+		let code = deleteGroupsCode(resp)
+		if code != 0 {
+			fail kerr(code, "delete group {g}")
+		}
+	}
+}
+
+fn deleteGroupsCode(r str) i64 {
+	mut d = newDec(r)
+	d.i32()
+	let n = d.count()
+	for i in 0..n {
+		d.str()
+		let code = d.i16()
+		if code != 0 {
+			return code
+		}
+	}
+	return 0
+}
+
+// DescribeConfigs is the configuration of a topic or a broker (a broker by its node id).
+fn (c Client) DescribeConfigs(kind Resource, name str) ![]Config {
+	mut body = make([]u8, 0, 32)
+	put32(mut body, 1)
+	put8(mut body, resourceType(kind))
+	putStr(mut body, name)
+	put32(mut body, -1) // every key
+	putBool(mut body, false)
+	let addr = try c.configAddr(kind, name)
+	let resp = try c.call(addr, apiDescribeConfigs, body, 0, false)
+	mut d = newDec(resp)
+	d.i32()
+	mut out = []Config{}
+	let nr = d.count()
+	for i in 0..nr {
+		let code = d.i16()
+		let msg = d.str()
+		d.i8()
+		d.str()
+		if code != 0 {
+			fail kerr(code, "describe configs of {name} ({msg})")
+		}
+		let nc = d.count()
+		for j in 0..nc {
+			let k = d.str()
+			let v = d.str()
+			let ro = d.bool()
+			let source = d.i8()
+			let sens = d.bool()
+			let ns = d.count()
+			for x in 0..ns {
+				d.str()
+				d.str()
+				d.i8()
+			}
+			out = append(out, Config{Name: k, Value: v, ReadOnly: ro, Default: source == 5, Sensitive: sens})
+		}
+	}
+	if d.bad {
+		fail damaged("describe configs")
+	}
+	return out
+}
+
+// configAddr is where a config request for a resource goes: a broker's to that broker.
+fn (c Client) configAddr(kind Resource, name str) !str {
+	match kind {
+		Broker => {
+			try c.refresh([]str{})
+			let id = mint_atoi(name)
+			let a = c.nodeAddr(id)
+			if a != "" {
+				return a
+			}
+		}
+		Topic => {
+		}
+	}
+	return try c.controllerAddr()
+}
+
+fn mint_atoi(s str) i64 {
+	mut v = 0
+	for i in 0..len(s) {
+		if s[i] < '0' || s[i] > '9' {
+			return -1
+		}
+		v = v*10 + i64(s[i]-'0')
+	}
+	return v
+}
+
+// SetConfig sets one config of a topic or a broker (IncrementalAlterConfigs: the others stay).
+fn (c Client) SetConfig(kind Resource, name str, key str, value str) ! {
+	try c.alterConfig(kind, name, key, value, 0)
+}
+
+// ResetConfig removes one config of a topic or a broker, back to its default.
+fn (c Client) ResetConfig(kind Resource, name str, key str) ! {
+	try c.alterConfig(kind, name, key, "", 1)
+}
+
+fn (c Client) alterConfig(kind Resource, name str, key str, value str, op i64) ! {
+	mut body = make([]u8, 0, 64)
+	put32(mut body, 1)
+	put8(mut body, resourceType(kind))
+	putStr(mut body, name)
+	put32(mut body, 1)
+	putStr(mut body, key)
+	put8(mut body, op)
+	if op == 1 {
+		put16(mut body, -1)
+	} else {
+		putStr(mut body, value)
+	}
+	putBool(mut body, false)
+	let addr = try c.configAddr(kind, name)
+	let resp = try c.call(addr, apiIncrementalAlterConfigs, body, 0, false)
+	mut d = newDec(resp)
+	d.i32()
+	let n = d.count()
+	for i in 0..n {
+		let code = d.i16()
+		let msg = d.str()
+		d.i8()
+		d.str()
+		if code != 0 {
+			fail kerr(code, "set config {key} of {name} ({msg})")
+		}
+	}
+	if d.bad {
+		fail damaged("alter configs")
+	}
+}

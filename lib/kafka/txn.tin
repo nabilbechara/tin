@@ -1,0 +1,414 @@
+package kafka
+
+import "fault"
+import "tide"
+
+// Transactions: a transactional producer writes to several partitions (and commits a group's
+// offsets) all or nothing. Its transactional id is the caller's; producers are per core, so a
+// service with several cores gives each its own id (notes/design_kafka.md, section 5).
+
+// Txn is this core's transactional producer for one transactional id.
+type Txn struct {
+	c  Client
+	id i64
+}
+
+type txnPart struct {
+	topic     str
+	partition i64
+	seq       i64
+}
+
+type txnState struct {
+	txid    str
+	timeout i64 // ms
+	pid     i64
+	epoch   i64
+	open    bool
+	seqs    []txnPart // every partition written by this producer id, with its next sequence
+	added   []txnPart // the partitions added to the open transaction
+	group   str       // the group whose offsets the open transaction commits ("" for none)
+}
+
+const maxTxns = 64
+
+let txns = make([]?txnState, maxTxns)
+mut nTxns i64
+
+// Transactional makes this core's producer for transactional id txid (timeout: how long the
+// broker lets a transaction stay open, default 60 s). It fences any older producer with the
+// same id, and aborts what that one left open.
+fn (c Client) Transactional(txid str, timeout i64) !Txn {
+	if txid == "" {
+		fail "kafka: a transactional producer needs an id"
+	}
+	if nTxns >= maxTxns {
+		fail "kafka: more than {maxTxns} transactional producers on this core"
+	}
+	let ms = dflt(timeout, 60000000000) / 1000000
+	let id = nTxns
+	nTxns += 1
+	txns[id] = keep(txnState{txid: txid, timeout: ms, pid: -1, epoch: -1, open: false, seqs: []txnPart{}, added: []txnPart{}, group: ""})
+	let t = Txn{c: c, id: id}
+	try t.initID()
+	return t
+}
+
+fn (t Txn) get() !txnState {
+	let s = txns[t.id]
+	if s == nil {
+		fail "kafka: this transactional producer belongs to another core"
+	}
+	return s
+}
+
+fn (t Txn) put(s txnState) {
+	txns[t.id] = keep(s)
+}
+
+fn txnCode(r str) i64 {
+	mut d = newDec(r)
+	d.i32()
+	return d.i16()
+}
+
+// initID gets a producer id and epoch for the transactional id from its coordinator.
+fn (t Txn) initID() ! {
+	let c = t.c
+	mut s = try t.get()
+	mut body = make([]u8, 0, 32)
+	putNullStr(mut body, s.txid)
+	put32(mut body, s.timeout)
+	for attempt in 0..coordAttempts {
+		let resp = try c.coordCall(s.txid, 1, apiInitProducerId, body, 0, txnCode)
+		mut d = newDec(resp)
+		d.i32()
+		let code = d.i16()
+		let pid = d.i64()
+		let epoch = d.i16()
+		if d.bad {
+			fail damaged("init producer id")
+		}
+		if code == 51 && attempt+1 < coordAttempts && backoff(attempt) {
+			continue
+		}
+		if code != 0 {
+			fail kerr(code, "init transactional id {s.txid}")
+		}
+		s.pid = pid
+		s.epoch = epoch
+		s.seqs = []txnPart{}
+		s.added = []txnPart{}
+		s.open = false
+		t.put(s)
+		return
+	}
+	fail fault.Wrap(ErrTransaction, "kafka: the coordinator of {s.txid} stayed busy")
+}
+
+// Begin starts a transaction.
+fn (t Txn) Begin() ! {
+	mut s = try t.get()
+	if s.open {
+		fail fault.Wrap(ErrTransaction, "kafka: a transaction is already open")
+	}
+	s.open = true
+	s.added = []txnPart{}
+	s.group = ""
+	t.put(s)
+}
+
+// Send writes one record in the open transaction.
+fn (t Txn) Send(topic str, m Message) !Ack {
+	let acks = try t.SendBatch(topic, []Message{m})
+	return acks[0]
+}
+
+// SendBatch writes records in the open transaction, one batch per partition; readers with
+// ReadCommitted see them only once the transaction commits.
+fn (t Txn) SendBatch(topic str, ms []Message) ![]Ack {
+	let c = t.c
+	let s0 = try t.get()
+	if !s0.open {
+		fail fault.Wrap(ErrTransaction, "kafka: no transaction is open (call Begin)")
+	}
+	let n = try c.partitions(topic)
+	rr = (rr + 1) % n
+	mut parts = make([]i64, 0, len(ms))
+	for _, m in ms {
+		if m.Key != "" {
+			parts = append(parts, PartitionFor(m.Key, n))
+		} else {
+			parts = append(parts, rr)
+		}
+	}
+	// Add the new partitions to the transaction first.
+	mut fresh = []i64{}
+	for _, p in parts {
+		mut known = false
+		let ad = s0.added
+		for _, a in ad {
+			if a.topic == topic && a.partition == p {
+				known = true
+			}
+		}
+		for _, f in fresh {
+			if f == p {
+				known = true
+			}
+		}
+		if !known {
+			fresh = append(fresh, p)
+		}
+	}
+	if len(fresh) > 0 {
+		try t.addPartitions(topic, fresh)
+	}
+	mut acks = make([]Ack, 0, len(ms))
+	for i in 0..len(ms) {
+		acks = append(acks, Ack{Partition: parts[i], Offset: -1})
+	}
+	mut done = make([]bool, len(ms))
+	let now = tide.Wall() / 1000000
+	for i in 0..len(ms) {
+		if done[i] {
+			continue
+		}
+		let p = parts[i]
+		mut group = []Message{}
+		mut at = []i64{}
+		for j in i..len(ms) {
+			if parts[j] == p {
+				group = append(group, ms[j])
+				at = append(at, j)
+				done[j] = true
+			}
+		}
+		let base = try t.produce(topic, p, group, now)
+		for k, j in at {
+			mut off = -1
+			if base >= 0 {
+				off = base + k
+			}
+			acks[j] = Ack{Partition: p, Offset: off}
+		}
+	}
+	return acks
+}
+
+fn (t Txn) addPartitions(topic str, ps []i64) ! {
+	let c = t.c
+	mut s = try t.get()
+	mut body = make([]u8, 0, 64)
+	putStr(mut body, s.txid)
+	put64(mut body, s.pid)
+	put16(mut body, s.epoch)
+	put32(mut body, 1)
+	putStr(mut body, topic)
+	putInts(mut body, ps)
+	for attempt in 0..coordAttempts {
+		let resp = try c.coordCall(s.txid, 1, apiAddPartitionsToTxn, body, 0, noCode)
+		mut d = newDec(resp)
+		d.i32()
+		mut code = 0
+		let nt = d.count()
+		for i in 0..nt {
+			d.str()
+			let np = d.count()
+			for j in 0..np {
+				d.i32()
+				let e = d.i16()
+				if e != 0 && code == 0 {
+					code = e
+				}
+			}
+		}
+		if d.bad {
+			fail damaged("add partitions to transaction")
+		}
+		if (code == 51 || code == 14 || code == 15 || code == 16) && attempt+1 < coordAttempts && backoff(attempt) {
+			continue
+		}
+		if code != 0 {
+			fail kerr(code, "add {topic} {ps} to transaction {s.txid}")
+		}
+		for _, p in ps {
+			s.added = append(s.added, txnPart{topic: topic, partition: p, seq: 0})
+		}
+		t.put(s)
+		return
+	}
+	fail fault.Wrap(ErrTransaction, "kafka: the coordinator of {s.txid} stayed busy")
+}
+
+// produce sends one transactional batch and advances the partition's sequence.
+fn (t Txn) produce(topic str, p i64, ms []Message, now i64) !i64 {
+	let c = t.c
+	mut s = try t.get()
+	mut seq = 0
+	mut idx = -1
+	let sq = s.seqs
+	for i, x in sq {
+		if x.topic == topic && x.partition == p {
+			seq = x.seq
+			idx = i
+		}
+	}
+	let info = batchInfo{codec: c.rec[rCodec], producerID: s.pid, producerEpoch: s.epoch, baseSeq: seq, transactional: true}
+	let batch = encodeBatch(ms, now, info)
+	for attempt in 0..maxAttempts {
+		let (base, err) = c.produceOnce(topic, p, batch, -1, s.txid)
+		if err == nil {
+			mut seqs = []txnPart{}
+			for i, x in sq {
+				if i == idx {
+					seqs = append(seqs, txnPart{topic: x.topic, partition: x.partition, seq: (seq + len(ms)) & 0x7fffffff})
+				} else {
+					seqs = append(seqs, x)
+				}
+			}
+			if idx < 0 {
+				seqs = append(seqs, txnPart{topic: topic, partition: p, seq: len(ms)})
+			}
+			s.seqs = seqs
+			t.put(s)
+			return base
+		}
+		if !c.retry(err, topic, attempt) {
+			fail err
+		}
+	}
+	fail "kafka: transactional produce to {topic}/{p} failed"
+}
+
+// SendOffsets commits a consumer group's offsets as part of the open transaction
+// (consume-transform-produce): they become the group's committed offsets only if the
+// transaction commits.
+fn (t Txn) SendOffsets(group str, offsets []TopicPartition) ! {
+	let c = t.c
+	mut s = try t.get()
+	if !s.open {
+		fail fault.Wrap(ErrTransaction, "kafka: no transaction is open (call Begin)")
+	}
+	if s.group != group {
+		mut body = make([]u8, 0, 64)
+		putStr(mut body, s.txid)
+		put64(mut body, s.pid)
+		put16(mut body, s.epoch)
+		putStr(mut body, group)
+		mut ok = false
+		for attempt in 0..coordAttempts {
+			let resp = try c.coordCall(s.txid, 1, apiAddOffsetsToTxn, body, 0, txnCode)
+			let code = txnCode(resp)
+			if code == 51 && attempt+1 < coordAttempts && backoff(attempt) {
+				continue
+			}
+			if code != 0 {
+				fail kerr(code, "add offsets of {group} to transaction {s.txid}")
+			}
+			ok = true
+			break
+		}
+		if !ok {
+			fail fault.Wrap(ErrTransaction, "kafka: the coordinator of {s.txid} stayed busy")
+		}
+		s.group = group
+		t.put(s)
+	}
+	// TxnOffsetCommit goes to the group's coordinator.
+	mut topics = []str{}
+	for _, o in offsets {
+		mut seen = false
+		for _, x in topics {
+			if x == o.Topic {
+				seen = true
+			}
+		}
+		if !seen {
+			topics = append(topics, o.Topic)
+		}
+	}
+	mut b = make([]u8, 0, 128)
+	putStr(mut b, s.txid)
+	putStr(mut b, group)
+	put64(mut b, s.pid)
+	put16(mut b, s.epoch)
+	put32(mut b, len(topics))
+	for _, tp in topics {
+		putStr(mut b, tp)
+		mut n = 0
+		for _, o in offsets {
+			if o.Topic == tp {
+				n += 1
+			}
+		}
+		put32(mut b, n)
+		for _, o in offsets {
+			if o.Topic != tp {
+				continue
+			}
+			put32(mut b, o.Partition)
+			put64(mut b, o.Offset)
+			put32(mut b, -1)
+			putNullStr(mut b, "")
+		}
+	}
+	for attempt in 0..coordAttempts {
+		let resp = try c.coordCall(group, 0, apiTxnOffsetCommit, b, 0, commitCode)
+		let code = commitCode(resp)
+		if code == 51 && attempt+1 < coordAttempts && backoff(attempt) {
+			continue
+		}
+		if code != 0 {
+			fail kerr(code, "transactional offset commit of {group}")
+		}
+		return
+	}
+	fail fault.Wrap(ErrTransaction, "kafka: the coordinator of {group} stayed busy")
+}
+
+// Commit commits the open transaction: its records become visible to ReadCommitted readers and
+// its offsets the group's.
+fn (t Txn) Commit() ! {
+	try t.end(true)
+}
+
+// Abort discards the open transaction.
+fn (t Txn) Abort() ! {
+	try t.end(false)
+}
+
+fn (t Txn) end(commit bool) ! {
+	let c = t.c
+	mut s = try t.get()
+	if !s.open {
+		fail fault.Wrap(ErrTransaction, "kafka: no transaction is open")
+	}
+	if len(s.added) > 0 || s.group != "" {
+		mut body = make([]u8, 0, 48)
+		putStr(mut body, s.txid)
+		put64(mut body, s.pid)
+		put16(mut body, s.epoch)
+		putBool(mut body, commit)
+		mut ok = false
+		for attempt in 0..coordAttempts {
+			let resp = try c.coordCall(s.txid, 1, apiEndTxn, body, 0, txnCode)
+			let code = txnCode(resp)
+			if code == 51 && attempt+1 < coordAttempts && backoff(attempt) {
+				continue
+			}
+			if code != 0 {
+				fail kerr(code, "end transaction {s.txid}")
+			}
+			ok = true
+			break
+		}
+		if !ok {
+			fail fault.Wrap(ErrTransaction, "kafka: the coordinator of {s.txid} stayed busy")
+		}
+	}
+	s.open = false
+	s.added = []txnPart{}
+	s.group = ""
+	t.put(s)
+}

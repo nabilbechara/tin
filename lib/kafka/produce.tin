@@ -1,0 +1,626 @@
+package kafka
+
+import "fault"
+import "say"
+import "tide"
+
+// The producer. Each core keeps, per client and partition, an accumulator: the records waiting
+// to be sent and the callers waiting for them. One batch per partition is in flight at a time;
+// records sent meanwhile wait and go out together in the next batch, so batches grow with load.
+// That also keeps an idempotent producer's sequence numbers in order: a retried batch goes out
+// again with its sequence before any later one.
+
+// An accumulator (calloc'd words).
+const aClient = 0
+const aTopic = 1
+const aTopicN = 2
+const aPart = 3
+const aBuf = 4     // pending records: [timestamp: 8 bytes][tail length: 4][tail] ...
+const aBufN = 5
+const aBufCap = 6
+const aWait = 7    // the waiter of each pending record, in order
+const aWaitN = 8
+const aWaitCap = 9
+const aBusy = 10   // a batch of this partition is in flight
+const aSeq = 11    // the next sequence number (idempotence)
+const aPidGen = 12 // the producer id generation aSeq counts for
+const accWords = 13
+
+// A waiter (calloc'd words): one record's caller.
+const wTask = 0
+const wState = 1   // 0 waiting, 1 sent, 2 failed
+const wOffset = 2
+const wErr = 3
+const wErrN = 4
+const wOwner = 5   // the caller must send the next batch of this partition
+const wGone = 6    // the caller gave up: free the waiter when its record is done
+const wAcc = 7
+const waiterWords = 8
+
+// The per-core accumulator table: open addressing on (client, topic, partition).
+mut accTable i64
+mut accCap i64
+mut accN i64
+
+// The per-core producer id of each client (idempotence): id, epoch, generation.
+mut producers i64
+
+fn wr64(p i64, v i64) {
+	for k in 0..8 {
+		store8(p+k, (v >> (8*k)) & 255)
+	}
+}
+
+fn rd64(p i64) i64 {
+	mut v = 0
+	for k in 0..8 {
+		v = v | (i64(load8(p+k)) << (8*k))
+	}
+	return v
+}
+
+fn accHash(client i64, topic str, p i64) i64 {
+	return (Murmur2(topic) & 0x7fffffff) ^ (p * 40503) ^ (client * 2654435761)
+}
+
+// accFor finds or makes the accumulator of (client, topic, partition) on this core.
+fn accFor(client i64, topic str, p i64) i64 {
+	if accTable == 0 || accN*2 >= accCap {
+		accGrow()
+	}
+	mut i = accHash(client, topic, p) & (accCap - 1)
+	for {
+		let a = accTable[i]
+		if a == 0 {
+			let n = calloc(accWords, 8)
+			n[aClient] = client
+			n[aTopic] = keep_raw(topic)
+			n[aTopicN] = len(topic)
+			n[aPart] = p
+			accTable[i] = n
+			accN += 1
+			return n
+		}
+		if a[aClient] == client && a[aPart] == p && a[aTopicN] == len(topic) && raw_str(a[aTopic], a[aTopicN]) == topic {
+			return a
+		}
+		i = (i + 1) & (accCap - 1)
+	}
+}
+
+fn accGrow() {
+	let old = accTable
+	let oldCap = accCap
+	mut cap = oldCap * 2
+	if cap == 0 {
+		cap = 256
+	}
+	accTable = calloc(cap, 8)
+	accCap = cap
+	for i in 0..oldCap {
+		let a = old[i]
+		if a == 0 {
+			continue
+		}
+		mut j = accHash(a[aClient], raw_str(a[aTopic], a[aTopicN]), a[aPart]) & (cap - 1)
+		for accTable[j] != 0 {
+			j = (j + 1) & (cap - 1)
+		}
+		accTable[j] = a
+	}
+	if old != 0 {
+		free(old)
+	}
+}
+
+// accAdd queues one record and returns its waiter.
+fn accAdd(a i64, m Message, now i64) i64 {
+	let tail = encodeRecordTail(m)
+	let need = 12 + len(tail)
+	if a[aBufN]+need > a[aBufCap] {
+		let cap = (a[aBufN]+need)*2 + 1024
+		a[aBuf] = realloc(a[aBuf], cap)
+		a[aBufCap] = cap
+	}
+	let p = a[aBuf] + a[aBufN]
+	wr64(p, tsOf(m, now))
+	store8(p+8, len(tail) & 255)
+	store8(p+9, (len(tail) >> 8) & 255)
+	store8(p+10, (len(tail) >> 16) & 255)
+	store8(p+11, (len(tail) >> 24) & 255)
+	memcpy(p+12, cast(i64, tail)[2], len(tail))
+	a[aBufN] += need
+	let w = calloc(waiterWords, 8)
+	w[wTask] = rt_task_current()
+	w[wAcc] = a
+	if a[aWaitN] == a[aWaitCap] {
+		let cap = a[aWaitCap]*2 + 16
+		a[aWait] = realloc(a[aWait], 8*cap)
+		a[aWaitCap] = cap
+	}
+	let ws = a[aWait]
+	ws[a[aWaitN]] = w
+	a[aWaitN] += 1
+	return w
+}
+
+fn waiterDone(w i64, state i64, offset i64, msg str) {
+	w[wState] = state
+	w[wOffset] = offset
+	if msg != "" {
+		w[wErr] = keep_raw(msg)
+		w[wErrN] = len(msg)
+	}
+	if w[wGone] != 0 {
+		freeWaiter(w)
+		return
+	}
+	let t = w[wTask]
+	if t != 0 && t != rt_task_current() {
+		rt_task_wake(t)
+	}
+}
+
+fn freeWaiter(w i64) {
+	if w[wErr] != 0 {
+		free(w[wErr])
+	}
+	free(w)
+}
+
+// handOffAcc lets the first caller with records still pending send the next batch.
+fn handOffAcc(a i64) {
+	a[aBusy] = 0
+	if a[aWaitN] == 0 {
+		return
+	}
+	let ws = a[aWait]
+	let w = ws[0]
+	a[aBusy] = 1
+	w[wOwner] = 1
+	let t = w[wTask]
+	if t != 0 && t != rt_task_current() {
+		rt_task_wake(t)
+	}
+}
+
+// ---- producer ids ----
+
+fn (c Client) producerSlot() i64 {
+	if producers == 0 {
+		producers = calloc(maxClients*3, 8)
+		for i in 0..maxClients {
+			producers[3*i] = -1
+		}
+	}
+	return producers + 24*c.rec[rID]
+}
+
+// producerID is this core's idempotent producer id and epoch for the client, asking for one when
+// there is none yet.
+fn (c Client) producerID() !(i64, i64, i64) {
+	let s = c.producerSlot()
+	if s[0] >= 0 {
+		return s[0], s[1], s[2]
+	}
+	mut body = make([]u8, 0, 16)
+	putNullStr(mut body, "")
+	put32(mut body, 60000)
+	for attempt in 0..maxAttempts {
+		let (resp, err) = c.anyCall(apiInitProducerId, body, 0)
+		if err != nil {
+			if !c.retry(err, "", attempt) {
+				fail err
+			}
+			continue
+		}
+		mut d = newDec(resp)
+		d.i32() // throttle
+		let code = d.i16()
+		let pid = d.i64()
+		let epoch = d.i16()
+		if d.bad {
+			fail damaged("init producer id")
+		}
+		if code != 0 {
+			let kf = kerr(code, "init producer id")
+			if fault.Is(kf, ErrCoordinator) && attempt+1 < maxAttempts && backoff(attempt) {
+				continue
+			}
+			fail kf
+		}
+		s[0] = pid
+		s[1] = epoch
+		s[2] += 1
+		return pid, epoch, s[2]
+	}
+	fail "kafka: no producer id"
+}
+
+// resetProducer drops this core's producer id: the next batch asks for a new one and every
+// partition's sequence starts again.
+fn (c Client) resetProducer() {
+	let s = c.producerSlot()
+	s[0] = -1
+}
+
+// ---- sending ----
+
+// Send appends one record to topic and returns where it went. A record with a key goes to the
+// partition the key hashes to; one without goes to one partition per call, in turn.
+fn (c Client) Send(topic str, m Message) !Ack {
+	let acks = try c.SendBatch(topic, []Message{m})
+	return acks[0]
+}
+
+// SendTo appends one record to a chosen partition of topic.
+fn (c Client) SendTo(topic str, partition i64, m Message) !Ack {
+	let acks = try c.sendParts(topic, []Message{m}, []i64{partition})
+	return acks[0]
+}
+
+// SendBatchTo appends records to a chosen partition of topic, in one batch with what other tasks
+// of this core send there meanwhile.
+fn (c Client) SendBatchTo(topic str, partition i64, ms []Message) ![]Ack {
+	mut parts = make([]i64, 0, len(ms))
+	for i in 0..len(ms) {
+		parts = append(parts, partition)
+	}
+	return try c.sendParts(topic, ms, parts)
+}
+
+// rr is the partition for records without a key, per core: the next call takes the next one.
+mut rr i64
+
+// SendBatch appends records to topic and returns where each went, in order. Records of one
+// partition go in one batch (with what other tasks of this core send meanwhile). A failed batch
+// fails the call; records of other partitions may already be written.
+fn (c Client) SendBatch(topic str, ms []Message) ![]Ack {
+	if len(ms) == 0 {
+		return []Ack{}
+	}
+	if !c.open {
+		fail "kafka: the client is not open (too many clients: open one per cluster, not per request)"
+	}
+	let n = try c.partitions(topic)
+	if n < 1 {
+		fail fault.Wrap(ErrUnknownTopic, "kafka: topic {topic} has no partitions")
+	}
+	rr = (rr + 1) % n
+	mut parts = make([]i64, 0, len(ms))
+	for _, m in ms {
+		if m.Key != "" {
+			parts = append(parts, PartitionFor(m.Key, n))
+		} else {
+			parts = append(parts, rr)
+		}
+	}
+	return try c.sendParts(topic, ms, parts)
+}
+
+fn (c Client) sendParts(topic str, ms []Message, parts []i64) ![]Ack {
+	if len(ms) == 0 {
+		return []Ack{}
+	}
+	if !c.open {
+		fail "kafka: the client is not open (too many clients: open one per cluster, not per request)"
+	}
+	let now = tide.Wall() / 1000000
+	if rt_tape() != 0 {
+		return try c.sendTaped(topic, ms, parts, now)
+	}
+	let id = c.rec[rID]
+	mut ws = make([]i64, 0, len(ms))
+	for i, m in ms {
+		let a = accFor(id, topic, parts[i])
+		ws = append(ws, accAdd(a, m, now))
+	}
+	// A partition no batch is in flight for: our first record there sends it.
+	for _, w in ws {
+		let a = w[wAcc]
+		if a[aBusy] == 0 {
+			a[aBusy] = 1
+			w[wOwner] = 1
+		}
+	}
+	for {
+		mut pending = 0
+		mut owned = 0
+		for _, w in ws {
+			if w[wState] != 0 {
+				continue
+			}
+			pending += 1
+			if w[wOwner] != 0 {
+				w[wOwner] = 0
+				owned = w
+				break
+			}
+		}
+		if pending == 0 {
+			break
+		}
+		if owned != 0 {
+			c.flush(owned[wAcc])
+			continue
+		}
+		let r = rt_task_park(c.rec[rTimeout])
+		if r != waitReady {
+			// Leave the records to whoever sends them; their outcome is no longer ours.
+			for _, w in ws {
+				if w[wState] == 0 {
+					w[wGone] = 1
+				} else {
+					freeWaiter(w)
+				}
+			}
+			if r == waitDeadline {
+				fail cast(fault, rt_wait_fault())
+			}
+			fail "kafka: timed out"
+		}
+	}
+	mut acks = make([]Ack, 0, len(ms))
+	mut msg = ""
+	for i, w in ws {
+		if w[wState] == 2 && msg == "" {
+			msg = raw_str(w[wErr], w[wErrN])
+		}
+		acks = append(acks, Ack{Partition: parts[i], Offset: w[wOffset]})
+		freeWaiter(w)
+	}
+	if msg != "" {
+		fail produceFault(msg)
+	}
+	return acks
+}
+
+// produceFault turns a failed batch's message back into a fault the caller can test.
+fn produceFault(msg str) ! {
+	for _, e in []fault{ErrMessageTooLarge, ErrNotEnoughReplicas, ErrUnknownTopic, ErrNotLeader, ErrLeaderNotAvailable, ErrTimedOut, ErrNetwork, ErrFenced, ErrProducerState, ErrAuth} {
+		let m = say.Str(e)
+		if len(msg) >= len(m) && contains(msg, m) {
+			fail fault.Wrap(e, msg)
+		}
+	}
+	fail msg
+}
+
+fn contains(s str, sub str) bool {
+	if len(sub) == 0 {
+		return true
+	}
+	for i in 0..len(s)-len(sub)+1 {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
+// flush sends the next batch of accumulator a (the caller owns it), then hands the partition on
+// to the caller of the next pending record. Records whose callers gave up are sent here too.
+fn (c Client) flush(a i64) {
+	// Let the other tasks of this turn add their records, and wait out the linger (a cancelled
+	// wait cuts it short; the batch still goes out for the others).
+	rt_task_defer()
+	if c.rec[rLinger] > 0 {
+		let lerr = tide.Wait(c.rec[rLinger])
+		if lerr != nil {
+			// Cancelled: send now.
+		}
+	}
+	for {
+		c.sendNext(a)
+		if a[aWaitN] == 0 {
+			a[aBusy] = 0
+			return
+		}
+		let ws = a[aWait]
+		let w = ws[0]
+		if w[wGone] == 0 {
+			handOffAcc(a)
+			return
+		}
+	}
+}
+
+// sendNext sends one batch: the oldest pending records of a, as many as fit.
+fn (c Client) sendNext(a i64) {
+	// Take the records that fit in one batch (at least one).
+	let buf = a[aBuf]
+	mut used = 0
+	mut k = 0
+	let total = a[aWaitN]
+	for k < total {
+		let tl = i64(load8(buf+used+8)) | i64(load8(buf+used+9))<<8 | i64(load8(buf+used+10))<<16 | i64(load8(buf+used+11))<<24
+		if k > 0 && used+12+tl > c.rec[rBatchMax] {
+			break
+		}
+		used += 12 + tl
+		k += 1
+	}
+	// The records, with deltas from the first.
+	mut first = 0
+	mut maxTs = 0
+	{
+		mut at = 0
+		for i in 0..k {
+			let ts = rd64(buf+at)
+			let tl = i64(load8(buf+at+8)) | i64(load8(buf+at+9))<<8 | i64(load8(buf+at+10))<<16 | i64(load8(buf+at+11))<<24
+			if i == 0 || ts < first {
+				first = ts
+			}
+			if i == 0 || ts > maxTs {
+				maxTs = ts
+			}
+			at += 12 + tl
+		}
+	}
+	mut recs = make([]u8, 0, used+k*8)
+	{
+		mut at = 0
+		for i in 0..k {
+			let ts = rd64(buf+at)
+			let tl = i64(load8(buf+at+8)) | i64(load8(buf+at+9))<<8 | i64(load8(buf+at+10))<<16 | i64(load8(buf+at+11))<<24
+			encodeRecord(mut recs, raw_str(buf+at+12, tl), i, ts-first)
+			at += 12 + tl
+		}
+	}
+	// The waiters of the batch leave the accumulator; later records move up.
+	mut batch = make([]i64, 0, k)
+	let wsArr = a[aWait]
+	for i in 0..k {
+		batch = append(batch, wsArr[i])
+	}
+	memmove(a[aBuf], a[aBuf]+used, a[aBufN]-used)
+	a[aBufN] -= used
+	memmove(a[aWait], a[aWait]+8*k, 8*(a[aWaitN]-k))
+	a[aWaitN] -= k
+	let topic = raw_str(a[aTopic], a[aTopicN])
+	let part = a[aPart]
+	let (base, err) = c.produceBatch(a, topic, part, recs, k, first, maxTs)
+	if err != nil {
+		let m = say.Str(err)
+		for _, w in batch {
+			waiterDone(w, 2, -1, m)
+		}
+	} else {
+		for i, w in batch {
+			mut off = -1
+			if base >= 0 {
+				off = base + i
+			}
+			waiterDone(w, 1, off, "")
+		}
+	}
+}
+
+// produceBatch sends one batch of k records to its partition's leader, retrying what can be
+// retried, and returns the offset of its first record (-1 when the broker does not say).
+fn (c Client) produceBatch(a i64, topic str, part i64, recs []u8, k i64, first i64, maxTs i64) !i64 {
+	let acks = c.rec[rAcks]
+	mut info = batchInfo{codec: c.rec[rCodec], producerID: -1, producerEpoch: -1, baseSeq: -1, transactional: false}
+	mut seqTaken = false
+	for attempt in 0..maxAttempts {
+		if c.rec[rIdem] != 0 && !seqTaken {
+			let (pid, epoch, gen) = try c.producerID()
+			if a[aPidGen] != gen {
+				a[aPidGen] = gen
+				a[aSeq] = 0
+			}
+			info.producerID = pid
+			info.producerEpoch = epoch
+			info.baseSeq = a[aSeq]
+			a[aSeq] = (a[aSeq] + k) & 0x7fffffff
+			seqTaken = true
+		}
+		let batch = buildBatch(recs, k, first, maxTs, info)
+		let (base, err) = c.produceOnce(topic, part, batch, acks, "")
+		if err == nil {
+			return base
+		}
+		if fault.Is(err, ErrProducerState) || fault.Is(err, ErrFenced) {
+			// The broker lost this producer's sequence (its state expired, or a leader moved
+			// without it): start a new producer id. The batch may already be written.
+			c.resetProducer()
+			seqTaken = false
+			if attempt+1 < maxAttempts {
+				continue
+			}
+		}
+		if !c.retry(err, topic, attempt) {
+			fail err
+		}
+	}
+	fail "kafka: produce to {topic}/{part} failed"
+}
+
+// produceOnce sends one Produce request; txid is the transactional id ("" for none).
+fn (c Client) produceOnce(topic str, part i64, batch []u8, acks i64, txid str) !i64 {
+	let addr = try c.leader(topic, part)
+	mut body = make([]u8, 0, len(batch)+64)
+	putNullStr(mut body, txid)
+	put16(mut body, acks)
+	put32(mut body, 30000)         // the broker's own timeout, ms
+	put32(mut body, 1)
+	putStr(mut body, topic)
+	put32(mut body, 1)
+	put32(mut body, part)
+	putBytes(mut body, str(batch))
+	let resp = try c.call(addr, apiProduce, body, 30000000000, acks == 0)
+	if acks == 0 {
+		return -1
+	}
+	mut d = newDec(resp)
+	mut base = -1
+	mut code = 0
+	let nt = d.count()
+	for i in 0..nt {
+		d.str()
+		let np = d.count()
+		for j in 0..np {
+			d.i32()
+			code = d.i16()
+			base = d.i64()
+			d.i64() // log append time
+			d.i64() // log start offset
+		}
+	}
+	d.i32() // throttle
+	if d.bad {
+		fail damaged("produce")
+	}
+	if code == 46 {
+		// DUPLICATE_SEQUENCE_NUMBER: an earlier attempt of this batch was written.
+		return -1
+	}
+	if code != 0 {
+		fail kerr(code, "produce to {topic}/{part}")
+	}
+	return base
+}
+
+// sendTaped sends for a recorded or replayed request: one batch per partition, sent by this
+// request alone and without a producer id, so its effects depend on the request only and not on
+// what other requests of the core sent before (notes/interface_replay.md, kafka@1).
+fn (c Client) sendTaped(topic str, ms []Message, parts []i64, now i64) ![]Ack {
+	mut acks = make([]Ack, 0, len(ms))
+	for i in 0..len(ms) {
+		acks = append(acks, Ack{Partition: parts[i], Offset: -1})
+	}
+	mut done = make([]bool, len(ms))
+	for i in 0..len(ms) {
+		if done[i] {
+			continue
+		}
+		let p = parts[i]
+		mut group = []Message{}
+		mut at = []i64{}
+		for j in i..len(ms) {
+			if parts[j] == p {
+				group = append(group, ms[j])
+				at = append(at, j)
+				done[j] = true
+			}
+		}
+		let batch = encodeBatch(group, now, batchInfo{codec: c.rec[rCodec], producerID: -1, producerEpoch: -1, baseSeq: -1, transactional: false})
+		mut base = -1
+		for attempt in 0..maxAttempts {
+			let (b, err) = c.produceOnce(topic, p, batch, c.rec[rAcks], "")
+			if err == nil {
+				base = b
+				break
+			}
+			if !c.retry(err, topic, attempt) {
+				fail err
+			}
+		}
+		for k, j in at {
+			if base >= 0 {
+				acks[j].Offset = base + k
+			}
+		}
+	}
+	return acks
+}
