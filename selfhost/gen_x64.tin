@@ -8,3090 +8,3153 @@
 // rax, rcx, rdx, r11 and xmm15 are scratch (rax/rdx for division, rcx for shift counts),
 // so they are never allocated. r15 holds the thread context, rbp the frame pointer.
 // Pushes reserve 16 bytes so the stack stays aligned at every call.
+const R8 = 8
+const R9 = 9
+const R10 = 10
+const R11 = 11
+const R12 = 12
+const R13 = 13
+const R14 = 14
+const R15 = 15
+const XSCR = 11 // r11: the first scratch register (gen.tin's x16)
+const XSCR2 = 1 // rcx: the second scratch register (gen.tin's x17)
+const XCTX = 15 // r15: the thread context (gen.tin's x28)
+const XFSCR = 79 // xmm15: float scratch
+const XP_RET = 100 // pseudo return, expanded into the epilogue by x_finish_fn
 
-const R8 = 8;
-const R9 = 9;
-const R10 = 10;
-const R11 = 11;
-const R12 = 12;
-const R13 = 13;
-const R14 = 14;
-const R15 = 15;
-const XSCR = 11;        // r11: the first scratch register (gen.tin's x16)
-const XSCR2 = 1;        // rcx: the second scratch register (gen.tin's x17)
-const XCTX = 15;        // r15: the thread context (gen.tin's x28)
-const XFSCR = 79;       // xmm15: float scratch
-const XP_RET = 100;     // pseudo return, expanded into the epilogue by x_finish_fn
+shared mut mm_scale i64 // x_gen_mem_addr result: the index scale (1, 2, 4 or 8)
+shared mut cmp_unord i64 // x_gen_compare result: 1 when unordered means false, 2 when true
+shared mut x_syms i64 // symbol table: id -> sym_ref word (memory operands only hold 32 bits)
+shared mut x_fn_labels i64 // function index -> entry label
+shared mut x_nstack i64 // stack parameters of the current function
+shared mut x_div_label i64 // the current function's divide-by-zero stub, once used
 
-var mm_scale;       // x_gen_mem_addr result: the index scale (1, 2, 4 or 8)
-var cmp_unord;      // x_gen_compare result: 1 when unordered means false, 2 when true
-var x_syms;         // symbol table: id -> sym_ref word (memory operands only hold 32 bits)
-var x_fn_labels;    // function index -> entry label
-var x_nstack;       // stack parameters of the current function
-var x_div_label;    // the current function's divide-by-zero stub, once used
-
-fn x_label(l) {
-    emit1(X_LABEL, l);
+fn x_label(l i64) {
+	emit1(X_LABEL, l)
 }
 
 // x_sym registers a sym_ref word and returns the id instructions refer to it by.
-fn x_sym(kind, index) {
-    vec_push(x_syms, sym_ref(kind, index));
-    return x_syms[VEC_LEN] - 1;
+fn x_sym(kind i64, index i64) i64 {
+	vec_push(x_syms, sym_ref(kind, index))
+	return x_syms[VEC_LEN] - 1
 }
 
 // x64_fn_name returns the name of the function a direct call's symbol id refers to, for
 // the -S listing; 0 for any other symbol kind or an unset table. x_syms is owned here,
 // so asm_x64.tin (which the encoder fuzzer builds alone) only sees the wrapper.
-fn x64_fn_name(id) {
-    if !x_syms || id < 0 || id >= x_syms[VEC_LEN] {
-        return 0;
-    }
-    let sym = vec_get(x_syms, id);
-    if sym >> 32 != SK_FN {
-        return 0;
-    }
-    let index = sym & 0xffffffff;
-    if index >= prog_fns[VEC_LEN] {
-        return 0;
-    }
-    let f = vec_get(prog_fns, index);
-    if f[F_QNAME] {
-        return f[F_QNAME];
-    }
-    return 0;
+fn x64_fn_name(id i64) i64 {
+	if x_syms == 0 || id < 0 || id >= x_syms[VEC_LEN] {
+		return 0
+	}
+	let sym = vec_get(x_syms, id)
+	if sym >> 32 != SK_FN {
+		return 0
+	}
+	let index = sym & 0xffffffff
+	if index >= prog_fns[VEC_LEN] {
+		return 0
+	}
+	let f = vec_get(prog_fns, index)
+	if f[F_QNAME] != 0 {
+		return f[F_QNAME]
+	}
+	return 0
 }
 
-fn x_mem1(base, off) {
-    return x64_mem(base, XM_NONE, 1, off);
+fn x_mem1(base i64, off i64) i64 {
+	return x64_mem(base, XM_NONE, 1, off)
 }
 
 // x_mov copies between registers of either class (across classes it moves the bits).
-fn x_mov(dst, src) {
-    if dst == src {
-        return;
-    }
-    if is_fp(dst) && is_fp(src) {
-        emit2(X_MOVSD, dst, src);
-    } else if is_fp(dst) || is_fp(src) {
-        emit2(X_MOVQ, dst, src);
-    } else {
-        emit2(X_MOV_RR, dst, src);
-    }
+fn x_mov(dst i64, src i64) {
+	if dst == src {
+		return
+	}
+	if is_fp(dst) != 0 && is_fp(src) != 0 {
+		emit2(X_MOVSD, dst, src)
+	} else if is_fp(dst) != 0 || is_fp(src) != 0 {
+		emit2(X_MOVQ, dst, src)
+	} else {
+		emit2(X_MOV_RR, dst, src)
+	}
 }
 
-fn x_load_imm(dst, v) {
-    if is_fp(dst) {
-        if v == 0 {
-            emit2(X_XORPD, dst, dst);
-        } else {
-            emit2(X_MOV_RI, XSCR, v);
-            emit2(X_MOVQ, dst, XSCR);
-        }
-        return;
-    }
-    emit2(X_MOV_RI, dst, v);
+fn x_load_imm(dst i64, v i64) {
+	if is_fp(dst) != 0 {
+		if v == 0 {
+			emit2(X_XORPD, dst, dst)
+		} else {
+			emit2(X_MOV_RI, XSCR, v)
+			emit2(X_MOVQ, dst, XSCR)
+		}
+		return
+	}
+	emit2(X_MOV_RI, dst, v)
 }
 
 // x_ld loads from memory operand m: a sized integer load (kind as X_LOAD) or a double.
-fn x_ld(dst, m, kind) {
-    if is_fp(dst) && (kind & 3) == 2 {
-        // An f32 in memory becomes the f64 with the same value in a register.
-        emit2(X_MOVSS_LD, dst, m);
-        emit2(X_CVTSS2SD, dst, dst);
-    } else if is_fp(dst) {
-        emit2(X_MOVSD_LD, dst, m);
-    } else {
-        emit3(X_LOAD, dst, m, kind);
-    }
+fn x_ld(dst i64, m i64, kind i64) {
+	if is_fp(dst) != 0 && (kind & 3) == 2 {
+		// An f32 in memory becomes the f64 with the same value in a register.
+		emit2(X_MOVSS_LD, dst, m)
+		emit2(X_CVTSS2SD, dst, dst)
+	} else if is_fp(dst) != 0 {
+		emit2(X_MOVSD_LD, dst, m)
+	} else {
+		emit3(X_LOAD, dst, m, kind)
+	}
 }
 
-fn x_st(src, m, size) {
-    if is_fp(src) && size == 2 {
-        emit2(X_CVTSD2SS, XFSCR, src);
-        emit2(X_MOVSS_ST, XFSCR, m);
-    } else if is_fp(src) {
-        emit2(X_MOVSD_ST, src, m);
-    } else {
-        emit3(X_STORE, src, m, size);
-    }
+fn x_st(src i64, m i64, size i64) {
+	if is_fp(src) != 0 && size == 2 {
+		emit2(X_CVTSD2SS, XFSCR, src)
+		emit2(X_MOVSS_ST, XFSCR, m)
+	} else if is_fp(src) != 0 {
+		emit2(X_MOVSD_ST, src, m)
+	} else {
+		emit3(X_STORE, src, m, size)
+	}
 }
 
 // x_push and x_pop spill through 16-byte slots so rsp stays 16-byte aligned.
-fn x_push(r) {
-    emit2(X_SUBI, RSP, 16);
-    x_st(r, x_mem1(RSP, 0), 3);
+fn x_push(r i64) {
+	emit2(X_SUBI, RSP, 16)
+	x_st(r, x_mem1(RSP, 0), 3)
 }
 
-fn x_pop(r) {
-    x_ld(r, x_mem1(RSP, 0), 3);
-    emit2(X_ADDI, RSP, 16);
+fn x_pop(r i64) {
+	x_ld(r, x_mem1(RSP, 0), 3)
+	emit2(X_ADDI, RSP, 16)
 }
 
-fn x_slot_load(dst, off) {
-    x_ld(dst, x_mem1(RBP, off), 3);
+fn x_slot_load(dst i64, off i64) {
+	x_ld(dst, x_mem1(RBP, off), 3)
 }
 
-fn x_slot_store(r, off) {
-    x_st(r, x_mem1(RBP, off), 3);
+fn x_slot_store(r i64, off i64) {
+	x_st(r, x_mem1(RBP, off), 3)
 }
 
 // ---- conditions ----
-
-fn x_cond(op) {
-    if streq(op, "==") { return XC_E; }
-    if streq(op, "!=") { return XC_NE; }
-    if streq(op, "<") { return XC_L; }
-    if streq(op, "<=") { return XC_LE; }
-    if streq(op, ">") { return XC_G; }
-    if streq(op, ">=") { return XC_GE; }
-    return -1;
+fn x_cond(op i64) i64 {
+	if streq(op, cstr("==")) != 0 {
+		return XC_E
+	}
+	if streq(op, cstr("!=")) != 0 {
+		return XC_NE
+	}
+	if streq(op, cstr("<")) != 0 {
+		return XC_L
+	}
+	if streq(op, cstr("<=")) != 0 {
+		return XC_LE
+	}
+	if streq(op, cstr(">")) != 0 {
+		return XC_G
+	}
+	if streq(op, cstr(">=")) != 0 {
+		return XC_GE
+	}
+	return -1
 }
 
-fn x_ucond(op) {
-    if streq(op, "<") { return XC_B; }
-    if streq(op, "<=") { return XC_BE; }
-    if streq(op, ">") { return XC_A; }
-    if streq(op, ">=") { return XC_AE; }
-    return x_cond(op);
+fn x_ucond(op i64) i64 {
+	if streq(op, cstr("<")) != 0 {
+		return XC_B
+	}
+	if streq(op, cstr("<=")) != 0 {
+		return XC_BE
+	}
+	if streq(op, cstr(">")) != 0 {
+		return XC_A
+	}
+	if streq(op, cstr(">=")) != 0 {
+		return XC_AE
+	}
+	return x_cond(op)
 }
 
 // x_swap_cc is the condition for the same comparison with its operands exchanged.
-fn x_swap_cc(cc) {
-    if cc == XC_L { return XC_G; }
-    if cc == XC_G { return XC_L; }
-    if cc == XC_LE { return XC_GE; }
-    if cc == XC_GE { return XC_LE; }
-    if cc == XC_B { return XC_A; }
-    if cc == XC_A { return XC_B; }
-    if cc == XC_BE { return XC_AE; }
-    if cc == XC_AE { return XC_BE; }
-    return cc;
+fn x_swap_cc(cc i64) i64 {
+	if cc == XC_L {
+		return XC_G
+	}
+	if cc == XC_G {
+		return XC_L
+	}
+	if cc == XC_LE {
+		return XC_GE
+	}
+	if cc == XC_GE {
+		return XC_LE
+	}
+	if cc == XC_B {
+		return XC_A
+	}
+	if cc == XC_A {
+		return XC_B
+	}
+	if cc == XC_BE {
+		return XC_AE
+	}
+	if cc == XC_AE {
+		return XC_BE
+	}
+	return cc
 }
 
 // x_jcc branches to target when cc holds; after a float compare (unord != 0) an unordered
 // result makes == false and != true, which takes a parity check as well.
-fn x_jcc(cc, unord, target) {
-    if unord == 0 || (cc != XC_E && cc != XC_NE) {
-        emit2(X_JCC, cc, target);
-    } else if cc == XC_E {
-        let skip = new_label();
-        emit2(X_JCC, XC_P, skip);
-        emit2(X_JCC, XC_E, target);
-        x_label(skip);
-    } else {
-        emit2(X_JCC, XC_P, target);
-        emit2(X_JCC, XC_NE, target);
-    }
+fn x_jcc(cc i64, unord i64, target i64) {
+	if unord == 0 || (cc != XC_E && cc != XC_NE) {
+		emit2(X_JCC, cc, target)
+	} else if cc == XC_E {
+		let skip = new_label()
+		emit2(X_JCC, XC_P, skip)
+		emit2(X_JCC, XC_E, target)
+		x_label(skip)
+	} else {
+		emit2(X_JCC, XC_P, target)
+		emit2(X_JCC, XC_NE, target)
+	}
 }
 
 // x_setcc materializes cc as 0 or 1 in dst.
-fn x_setcc(dst, cc, unord) {
-    emit2(X_SETCC, dst, cc);
-    emit3(X_ZXT, dst, dst, 0);
-    if unord != 0 && cc == XC_E {
-        emit2(X_SETCC, XSCR, XC_NP);
-        emit3(X_ZXT, XSCR, XSCR, 0);
-        emit2(X_AND, dst, XSCR);
-    } else if unord != 0 && cc == XC_NE {
-        emit2(X_SETCC, XSCR, XC_P);
-        emit3(X_ZXT, XSCR, XSCR, 0);
-        emit2(X_OR, dst, XSCR);
-    }
+fn x_setcc(dst i64, cc i64, unord i64) {
+	emit2(X_SETCC, dst, cc)
+	emit3(X_ZXT, dst, dst, 0)
+	if unord != 0 && cc == XC_E {
+		emit2(X_SETCC, XSCR, XC_NP)
+		emit3(X_ZXT, XSCR, XSCR, 0)
+		emit2(X_AND, dst, XSCR)
+	} else if unord != 0 && cc == XC_NE {
+		emit2(X_SETCC, XSCR, XC_P)
+		emit3(X_ZXT, XSCR, XSCR, 0)
+		emit2(X_OR, dst, XSCR)
+	}
 }
 
-fn x_cmp_imm(a, c) {
-    if x64_fits32(c) {
-        emit2(X_CMPI, a, c);
-    } else {
-        x_load_imm(XSCR, c);
-        emit2(X_CMP, a, XSCR);
-    }
+fn x_cmp_imm(a i64, c i64) {
+	if x64_fits32(c) != 0 {
+		emit2(X_CMPI, a, c)
+	} else {
+		x_load_imm(XSCR, c)
+		emit2(X_CMP, a, XSCR)
+	}
 }
 
 // x_test_imm tests a against a mask (an imm32 is sign-extended, so big masks go through r11).
-fn x_test_imm(a, mask) {
-    if mask >= 0 && mask <= 0x7fffffff {
-        emit2(X_TESTI, a, mask);
-    } else {
-        x_load_imm(XSCR, mask);
-        emit2(X_TEST, a, XSCR);
-    }
+fn x_test_imm(a i64, mask i64) {
+	if mask >= 0 && mask <= 0x7fffffff {
+		emit2(X_TESTI, a, mask)
+	} else {
+		x_load_imm(XSCR, mask)
+		emit2(X_TEST, a, XSCR)
+	}
 }
 
 // ---- arithmetic ----
-
 // x_binop emits dst = a op b with a two-operand instruction; the scratch register of the
 // class covers dst aliasing the right operand of a non-commutative operation.
-fn x_binop(op, dst, a, b, comm) {
-    if dst == a {
-        emit2(op, dst, b);
-        return;
-    }
-    if dst == b {
-        if comm {
-            emit2(op, dst, a);
-            return;
-        }
-        let scr = XSCR;
-        if is_fp(dst) {
-            scr = XFSCR;
-        }
-        x_mov(scr, b);
-        x_mov(dst, a);
-        emit2(op, dst, scr);
-        return;
-    }
-    x_mov(dst, a);
-    emit2(op, dst, b);
+fn x_binop(op i64, dst i64, a i64, b i64, comm i64) {
+	if dst == a {
+		emit2(op, dst, b)
+		return
+	}
+	if dst == b {
+		if comm != 0 {
+			emit2(op, dst, a)
+			return
+		}
+		mut scr = XSCR
+		if is_fp(dst) != 0 {
+			scr = XFSCR
+		}
+		x_mov(scr, b)
+		x_mov(dst, a)
+		emit2(op, dst, scr)
+		return
+	}
+	x_mov(dst, a)
+	emit2(op, dst, b)
 }
 
 // x_shift emits dst = a shifted by the count in register b (the count must be in cl).
-fn x_shift(op, dst, a, b) {
-    if b == RCX {
-        if dst == RCX {
-            x_mov(XSCR, a);
-            emit1(op, XSCR);
-            x_mov(RCX, XSCR);
-        } else {
-            x_mov(dst, a);
-            emit1(op, dst);
-        }
-        return;
-    }
-    if dst == RCX {
-        x_mov(XSCR, a);
-        x_mov(RCX, b);
-        emit1(op, XSCR);
-        x_mov(RCX, XSCR);
-        return;
-    }
-    if a == RCX {
-        x_mov(XSCR, a);
-        a = XSCR;
-    }
-    x_mov(RCX, b);
-    x_mov(dst, a);
-    emit1(op, dst);
+fn x_shift(op i64, dst i64, a_in i64, b i64) {
+	mut a = a_in
+	if b == RCX {
+		if dst == RCX {
+			x_mov(XSCR, a)
+			emit1(op, XSCR)
+			x_mov(RCX, XSCR)
+		} else {
+			x_mov(dst, a)
+			emit1(op, dst)
+		}
+		return
+	}
+	if dst == RCX {
+		x_mov(XSCR, a)
+		x_mov(RCX, b)
+		emit1(op, XSCR)
+		x_mov(RCX, XSCR)
+		return
+	}
+	if a == RCX {
+		x_mov(XSCR, a)
+		a = XSCR
+	}
+	x_mov(RCX, b)
+	x_mov(dst, a)
+	emit1(op, dst)
 }
 
 // x_div_stub is the label of the current function's divide-by-zero panic stub.
-fn x_div_stub() {
-    if !x_div_label {
-        x_div_label = new_label();
-    }
-    return x_div_label;
+fn x_div_stub() i64 {
+	if x_div_label == 0 {
+		x_div_label = new_label()
+	}
+	return x_div_label
 }
 
 // x_divide emits dst = a / b (or a % b with rem) through rdx:rax, panicking on a zero divisor
 // in strict code (legacy code gets 0, or a for the remainder) and giving the wrapped result
 // for the most negative value / -1, as the arm64 instructions do.
-fn x_divide(dst, a, b, unsigned, rem) {
-    if b == RAX || b == RDX {
-        x_mov(RCX, b);
-        b = RCX;
-    }
-    let strict = !cur_gen_fn[F_LEGACY];
-    let zero_l = 0;
-    if strict {
-        zero_l = x_div_stub();
-    } else {
-        zero_l = new_label();
-    }
-    let done_l = new_label();
-    let neg_l = 0;
-    if !unsigned {
-        neg_l = new_label();
-        emit2(X_CMPI, b, -1);
-        emit2(X_JCC, XC_E, neg_l);
-    }
-    emit2(X_TEST, b, b);
-    emit2(X_JCC, XC_E, zero_l);
-    x_mov(RAX, a);
-    if unsigned {
-        emit2(X_XOR, RDX, RDX);
-        emit1(X_DIV, b);
-    } else {
-        emit1(X_CQO, 0);
-        emit1(X_IDIV, b);
-    }
-    if rem {
-        x_mov(dst, RDX);
-    } else {
-        x_mov(dst, RAX);
-    }
-    emit1(X_JMP, done_l);
-    if !unsigned {
-        x_label(neg_l);
-        if rem {
-            x_load_imm(dst, 0);
-        } else {
-            x_mov(dst, a);
-            emit1(X_NEG, dst);
-        }
-        emit1(X_JMP, done_l);
-    }
-    if !strict {
-        x_label(zero_l);
-        if rem {
-            x_mov(dst, a);
-        } else {
-            x_load_imm(dst, 0);
-        }
-    }
-    x_label(done_l);
+fn x_divide(dst i64, a i64, b_in i64, unsigned i64, rem i64) {
+	mut b = b_in
+	if b == RAX || b == RDX {
+		x_mov(RCX, b)
+		b = RCX
+	}
+	let strict = i64(cur_gen_fn[F_LEGACY] == 0)
+	mut zero_l = 0
+	if strict != 0 {
+		zero_l = x_div_stub()
+	} else {
+		zero_l = new_label()
+	}
+	let done_l = new_label()
+	mut neg_l = 0
+	if unsigned == 0 {
+		neg_l = new_label()
+		emit2(X_CMPI, b, -1)
+		emit2(X_JCC, XC_E, neg_l)
+	}
+	emit2(X_TEST, b, b)
+	emit2(X_JCC, XC_E, zero_l)
+	x_mov(RAX, a)
+	if unsigned != 0 {
+		emit2(X_XOR, RDX, RDX)
+		emit1(X_DIV, b)
+	} else {
+		emit1(X_CQO, 0)
+		emit1(X_IDIV, b)
+	}
+	if rem != 0 {
+		x_mov(dst, RDX)
+	} else {
+		x_mov(dst, RAX)
+	}
+	emit1(X_JMP, done_l)
+	if unsigned == 0 {
+		x_label(neg_l)
+		if rem != 0 {
+			x_load_imm(dst, 0)
+		} else {
+			x_mov(dst, a)
+			emit1(X_NEG, dst)
+		}
+		emit1(X_JMP, done_l)
+	}
+	if strict == 0 {
+		x_label(zero_l)
+		if rem != 0 {
+			x_mov(dst, a)
+		} else {
+			x_load_imm(dst, 0)
+		}
+	}
+	x_label(done_l)
 }
 
 // x_arith emits dst = a op b for integer registers (arith_unsigned picks the unsigned forms).
-fn x_arith(op, dst, a, b) {
-    if streq(op, "+") {
-        x_binop(X_ADD, dst, a, b, 1);
-    } else if streq(op, "-") {
-        x_binop(X_SUB, dst, a, b, 0);
-    } else if streq(op, "*") {
-        x_binop(X_IMUL_RR, dst, a, b, 1);
-    } else if streq(op, "/") {
-        x_divide(dst, a, b, arith_unsigned, 0);
-    } else if streq(op, "%") {
-        x_divide(dst, a, b, arith_unsigned, 1);
-    } else if streq(op, "&") {
-        x_binop(X_AND, dst, a, b, 1);
-    } else if streq(op, "|") {
-        x_binop(X_OR, dst, a, b, 1);
-    } else if streq(op, "^") {
-        x_binop(X_XOR, dst, a, b, 1);
-    } else if streq(op, "<<") {
-        x_shift(X_SHL, dst, a, b);
-    } else if arith_unsigned {
-        x_shift(X_SHR, dst, a, b);
-    } else {
-        x_shift(X_SAR, dst, a, b);
-    }
+fn x_arith(op i64, dst i64, a i64, b i64) {
+	if streq(op, cstr("+")) != 0 {
+		x_binop(X_ADD, dst, a, b, 1)
+	} else if streq(op, cstr("-")) != 0 {
+		x_binop(X_SUB, dst, a, b, 0)
+	} else if streq(op, cstr("*")) != 0 {
+		x_binop(X_IMUL_RR, dst, a, b, 1)
+	} else if streq(op, cstr("/")) != 0 {
+		x_divide(dst, a, b, arith_unsigned, 0)
+	} else if streq(op, cstr("%")) != 0 {
+		x_divide(dst, a, b, arith_unsigned, 1)
+	} else if streq(op, cstr("&")) != 0 {
+		x_binop(X_AND, dst, a, b, 1)
+	} else if streq(op, cstr("|")) != 0 {
+		x_binop(X_OR, dst, a, b, 1)
+	} else if streq(op, cstr("^")) != 0 {
+		x_binop(X_XOR, dst, a, b, 1)
+	} else if streq(op, cstr("<<")) != 0 {
+		x_shift(X_SHL, dst, a, b)
+	} else if arith_unsigned != 0 {
+		x_shift(X_SHR, dst, a, b)
+	} else {
+		x_shift(X_SAR, dst, a, b)
+	}
 }
 
-fn x_add_imm(dst, l, c) {
-    if c == 0 {
-        x_mov(dst, l);
-    } else if x64_fits32(c) && dst == l {
-        emit2(X_ADDI, dst, c);
-    } else if x64_fits32(c) {
-        emit2(X_LEA, dst, x_mem1(l, c));
-    } else {
-        x_load_imm(XSCR, c);
-        x_binop(X_ADD, dst, l, XSCR, 1);
-    }
+fn x_add_imm(dst i64, l i64, c i64) {
+	if c == 0 {
+		x_mov(dst, l)
+	} else if x64_fits32(c) != 0 && dst == l {
+		emit2(X_ADDI, dst, c)
+	} else if x64_fits32(c) != 0 {
+		emit2(X_LEA, dst, x_mem1(l, c))
+	} else {
+		x_load_imm(XSCR, c)
+		x_binop(X_ADD, dst, l, XSCR, 1)
+	}
 }
 
 // x_round_bias leaves l + (2^k - 1 if l < 0) in r11, so an arithmetic shift by k rounds
 // toward zero the way idiv does.
-fn x_round_bias(l, k) {
-    x_mov(XSCR, l);
-    emit2(X_SARI, XSCR, 63);
-    emit2(X_SHRI, XSCR, 64 - k);
-    emit2(X_ADD, XSCR, l);
+fn x_round_bias(l i64, k i64) {
+	x_mov(XSCR, l)
+	emit2(X_SARI, XSCR, 63)
+	emit2(X_SHRI, XSCR, 64 - k)
+	emit2(X_ADD, XSCR, l)
 }
 
 // x_shift_imm emits dst = l shifted by the constant k.
-fn x_shift_imm(op, dst, l, k) {
-    x_mov(dst, l);
-    if k != 0 {
-        emit2(op, dst, k);
-    }
+fn x_shift_imm(op i64, dst i64, l i64, k i64) {
+	x_mov(dst, l)
+	if k != 0 {
+		emit2(op, dst, k)
+	}
 }
 
 // x_signed_div10 mirrors the exact signed multiply-high sequence used by Go.
-fn x_signed_div10(op, dst, l, c) {
-    x_mov(RAX, l)
-    x_load_imm(XSCR, -3689348814741910323)
-    emit1(X_IMULH, XSCR)
-    x_binop(X_ADD, RDX, RDX, l, 1)
-    emit2(X_SARI, RDX, 3)
-    x_mov(XSCR, l)
-    emit2(X_SARI, XSCR, 63)
-    emit2(X_SUB, RDX, XSCR)
-    if streq(op, "/") {
-        x_mov(dst, RDX)
-        if c < 0 {
-            emit1(X_NEG, dst)
-        }
-    } else {
-        let q10 = XSCR2
-        if dst == q10 {
-            q10 = RAX
-        }
-        emit3(X_IMUL_RRI, q10, RDX, 10)
-        x_mov(dst, l)
-        emit2(X_SUB, dst, q10)
-    }
+fn x_signed_div10(op i64, dst i64, l i64, c i64) {
+	x_mov(RAX, l)
+	x_load_imm(XSCR, -3689348814741910323)
+	emit1(X_IMULH, XSCR)
+	x_binop(X_ADD, RDX, RDX, l, 1)
+	emit2(X_SARI, RDX, 3)
+	x_mov(XSCR, l)
+	emit2(X_SARI, XSCR, 63)
+	emit2(X_SUB, RDX, XSCR)
+	if streq(op, cstr("/")) != 0 {
+		x_mov(dst, RDX)
+		if c < 0 {
+			emit1(X_NEG, dst)
+		}
+	} else {
+		mut q10 = XSCR2
+		if dst == q10 {
+			q10 = RAX
+		}
+		emit3(X_IMUL_RRI, q10, RDX, 10)
+		x_mov(dst, l)
+		emit2(X_SUB, dst, q10)
+	}
 }
 
-fn x_binary_const(op, dst, l, c) {
-    if !arith_unsigned && (streq(op, "/") || streq(op, "%")) && (c == 10 || c == -10) {
-        x_signed_div10(op, dst, l, c);
-    } else if streq(op, "+") {
-        x_add_imm(dst, l, c);
-    } else if streq(op, "-") && c != -9223372036854775807 - 1 {
-        x_add_imm(dst, l, -c);
-    } else if streq(op, "*") {
-        let k = pow2_log(c);
-        if c == 0 {
-            x_load_imm(dst, 0);
-        } else if c == 1 {
-            x_mov(dst, l);
-        } else if c == -1 {
-            x_mov(dst, l);
-            emit1(X_NEG, dst);
-        } else if k >= 0 {
-            x_shift_imm(X_SHLI, dst, l, k);
-        } else if x64_fits32(c) {
-            emit3(X_IMUL_RRI, dst, l, c);
-        } else {
-            x_load_imm(XSCR, c);
-            x_binop(X_IMUL_RR, dst, l, XSCR, 1);
-        }
-    } else if streq(op, "/") {
-        let k = pow2_log(c);
-        if c == 1 {
-            x_mov(dst, l);
-        } else if c == -1 {
-            x_mov(dst, l);
-            emit1(X_NEG, dst);
-        } else if c == 0 && !cur_gen_fn[F_LEGACY] {
-            emit1(X_JMP, x_div_stub());
-        } else if c == 0 {
-            x_load_imm(dst, 0);
-        } else if k > 0 {
-            x_round_bias(l, k);
-            emit2(X_SARI, XSCR, k);
-            x_mov(dst, XSCR);
-        } else {
-            x_load_imm(XSCR2, c);
-            x_divide(dst, l, XSCR2, 0, 0);
-        }
-    } else if streq(op, "%") {
-        let m = c;
-        if m < 0 && m != -9223372036854775807 - 1 {
-            m = -m;
-        }
-        let k = pow2_log(m);
-        if m == 1 {
-            x_load_imm(dst, 0);
-        } else if c == 0 && !cur_gen_fn[F_LEGACY] {
-            emit1(X_JMP, x_div_stub());
-        } else if c == 0 {
-            x_mov(dst, l);
-        } else if k > 0 {
-            x_round_bias(l, k);
-            emit2(X_SARI, XSCR, k);
-            emit2(X_SHLI, XSCR, k);
-            x_mov(dst, l);
-            emit2(X_SUB, dst, XSCR);
-        } else {
-            x_load_imm(XSCR2, c);
-            x_divide(dst, l, XSCR2, 0, 1);
-        }
-    } else if streq(op, "<<") {
-        x_shift_imm(X_SHLI, dst, l, c & 63);
-    } else if streq(op, ">>") {
-        x_shift_imm(X_SARI, dst, l, c & 63);
-    } else if streq(op, "&") && x64_fits32(c) {
-        x_mov(dst, l);
-        emit2(X_ANDI, dst, c);
-    } else if (streq(op, "|") || streq(op, "^")) && c == 0 {
-        x_mov(dst, l);
-    } else if (streq(op, "|") || streq(op, "^")) && x64_fits32(c) {
-        x_mov(dst, l);
-        if streq(op, "|") {
-            emit2(X_ORI, dst, c);
-        } else {
-            emit2(X_XORI, dst, c);
-        }
-    } else {
-        x_load_imm(XSCR2, c);
-        x_arith(op, dst, l, XSCR2);
-    }
+fn x_binary_const(op i64, dst i64, l i64, c i64) {
+	if arith_unsigned == 0 && (streq(op, cstr("/")) != 0 || streq(op, cstr("%")) != 0) && (c == 10 || c == -10) {
+		x_signed_div10(op, dst, l, c)
+	} else if streq(op, cstr("+")) != 0 {
+		x_add_imm(dst, l, c)
+	} else if streq(op, cstr("-")) != 0 && c != -9223372036854775807 - 1 {
+		x_add_imm(dst, l, -c)
+	} else if streq(op, cstr("*")) != 0 {
+		let k = pow2_log(c)
+		if c == 0 {
+			x_load_imm(dst, 0)
+		} else if c == 1 {
+			x_mov(dst, l)
+		} else if c == -1 {
+			x_mov(dst, l)
+			emit1(X_NEG, dst)
+		} else if k >= 0 {
+			x_shift_imm(X_SHLI, dst, l, k)
+		} else if x64_fits32(c) != 0 {
+			emit3(X_IMUL_RRI, dst, l, c)
+		} else {
+			x_load_imm(XSCR, c)
+			x_binop(X_IMUL_RR, dst, l, XSCR, 1)
+		}
+	} else if streq(op, cstr("/")) != 0 {
+		let k = pow2_log(c)
+		if c == 1 {
+			x_mov(dst, l)
+		} else if c == -1 {
+			x_mov(dst, l)
+			emit1(X_NEG, dst)
+		} else if c == 0 && cur_gen_fn[F_LEGACY] == 0 {
+			emit1(X_JMP, x_div_stub())
+		} else if c == 0 {
+			x_load_imm(dst, 0)
+		} else if k > 0 {
+			x_round_bias(l, k)
+			emit2(X_SARI, XSCR, k)
+			x_mov(dst, XSCR)
+		} else {
+			x_load_imm(XSCR2, c)
+			x_divide(dst, l, XSCR2, 0, 0)
+		}
+	} else if streq(op, cstr("%")) != 0 {
+		mut m = c
+		if m < 0 && m != -9223372036854775807 - 1 {
+			m = -m
+		}
+		let k = pow2_log(m)
+		if m == 1 {
+			x_load_imm(dst, 0)
+		} else if c == 0 && cur_gen_fn[F_LEGACY] == 0 {
+			emit1(X_JMP, x_div_stub())
+		} else if c == 0 {
+			x_mov(dst, l)
+		} else if k > 0 {
+			x_round_bias(l, k)
+			emit2(X_SARI, XSCR, k)
+			emit2(X_SHLI, XSCR, k)
+			x_mov(dst, l)
+			emit2(X_SUB, dst, XSCR)
+		} else {
+			x_load_imm(XSCR2, c)
+			x_divide(dst, l, XSCR2, 0, 1)
+		}
+	} else if streq(op, cstr("<<")) != 0 {
+		x_shift_imm(X_SHLI, dst, l, c & 63)
+	} else if streq(op, cstr(">>")) != 0 {
+		x_shift_imm(X_SARI, dst, l, c & 63)
+	} else if streq(op, cstr("&")) != 0 && x64_fits32(c) != 0 {
+		x_mov(dst, l)
+		emit2(X_ANDI, dst, c)
+	} else if (streq(op, cstr("|")) != 0 || streq(op, cstr("^")) != 0) && c == 0 {
+		x_mov(dst, l)
+	} else if (streq(op, cstr("|")) != 0 || streq(op, cstr("^")) != 0) && x64_fits32(c) != 0 {
+		x_mov(dst, l)
+		if streq(op, cstr("|")) != 0 {
+			emit2(X_ORI, dst, c)
+		} else {
+			emit2(X_XORI, dst, c)
+		}
+	} else {
+		x_load_imm(XSCR2, c)
+		x_arith(op, dst, l, XSCR2)
+	}
 }
 
 // x_uconst handles unsigned division, modulo and right shift by constants.
-fn x_uconst(op, dst, l, c) {
-    let k = pow2_log(c);
-    if streq(op, "/") && k >= 0 {
-        x_shift_imm(X_SHRI, dst, l, k);
-        return 1;
-    }
-    if streq(op, "%") && k > 0 {
-        x_mov(dst, l);
-        if k <= 31 {
-            emit2(X_ANDI, dst, (1 << k) - 1);
-        } else {
-            x_load_imm(XSCR, (1 << k) - 1);
-            emit2(X_AND, dst, XSCR);
-        }
-        return 1;
-    }
-    if streq(op, ">>") {
-        x_shift_imm(X_SHRI, dst, l, c & 63);
-        return 1;
-    }
-    if streq(op, "/") || streq(op, "%") {
-        x_load_imm(XSCR2, c);
-        x_arith(op, dst, l, XSCR2);
-        return 1;
-    }
-    return 0;
+fn x_uconst(op i64, dst i64, l i64, c i64) i64 {
+	let k = pow2_log(c)
+	if streq(op, cstr("/")) != 0 && k >= 0 {
+		x_shift_imm(X_SHRI, dst, l, k)
+		return 1
+	}
+	if streq(op, cstr("%")) != 0 && k > 0 {
+		x_mov(dst, l)
+		if k <= 31 {
+			emit2(X_ANDI, dst, (1 << k) - 1)
+		} else {
+			x_load_imm(XSCR, (1 << k) - 1)
+			emit2(X_AND, dst, XSCR)
+		}
+		return 1
+	}
+	if streq(op, cstr(">>")) != 0 {
+		x_shift_imm(X_SHRI, dst, l, c & 63)
+		return 1
+	}
+	if streq(op, cstr("/")) != 0 || streq(op, cstr("%")) != 0 {
+		x_load_imm(XSCR2, c)
+		x_arith(op, dst, l, XSCR2)
+		return 1
+	}
+	return 0
 }
 
 // x_canon keeps narrow integer results canonical: sign-extended for i8/i16/i32,
 // zero-extended for u8/u16/u32, so wrapping matches the declared width.
-fn x_canon(t, r) {
-    if !t || t[TY_KIND] != K_INT || t[TY_WIDTH] == 8 || is_fp(r) {
-        return;
-    }
-    if t[TY_SIGNED] {
-        emit3(X_SXT, r, r, width_log2(t[TY_WIDTH]));
-    } else {
-        emit3(X_ZXT, r, r, width_log2(t[TY_WIDTH]));
-    }
+fn x_canon(t i64, r i64) {
+	if t == 0 || t[TY_KIND] != K_INT || t[TY_WIDTH] == 8 || is_fp(r) != 0 {
+		return
+	}
+	if t[TY_SIGNED] != 0 {
+		emit3(X_SXT, r, r, width_log2(t[TY_WIDTH]))
+	} else {
+		emit3(X_ZXT, r, r, width_log2(t[TY_WIDTH]))
+	}
 }
 
-fn x_mask(e, dst) {
-    x_canon(e[N_TYPE], dst);
+fn x_mask(e i64, dst i64) {
+	x_canon(e[N_TYPE], dst)
 }
 
 // ---- expressions ----
-
 // x_gen_val returns a register holding e: a local's own register, or temp depth d.
-fn x_gen_val(e, d) {
-    let k = e[N_KIND];
-    if k == EX_REG {
-        return e[REG_NUM];
-    }
-    if k == EX_IDENT && e[ID_REF][S_KIND] == SYM_LOCAL && e[ID_REF][S_REG] >= 0 {
-        return e[ID_REF][S_REG];
-    }
-    let r = 0;
-    if e_fp(e) {
-        r = freg(d);
-    } else {
-        r = treg(d);
-    }
-    x_gen_to(e, r, d);
-    return r;
+fn x_gen_val(e i64, d i64) i64 {
+	let k = e[N_KIND]
+	if k == EX_REG {
+		return e[REG_NUM]
+	}
+	if k == EX_IDENT && e[ID_REF][S_KIND] == SYM_LOCAL && e[ID_REF][S_REG] >= 0 {
+		return e[ID_REF][S_REG]
+	}
+	mut r = 0
+	if e_fp(e) != 0 {
+		r = freg(d)
+	} else {
+		r = treg(d)
+	}
+	x_gen_to(e, r, d)
+	return r
 }
 
 // x_gen_to computes e into dst using temps from depth d up; dst is written last.
-fn x_gen_to(e, dst, d) {
-    let k = e[N_KIND];
-    if k == EX_INT {
-        x_load_imm(dst, e[INT_VAL]);
-    } else if k == EX_FLOAT {
-        x_load_imm(dst, e[FL_BITS]);
-    } else if k == EX_STR {
-        let sym = 0;
-        if kind_of(e[N_TYPE]) == K_STRING {
-            sym = x_sym(SK_TSTR, tstring_index(e[STR_PTR], e[STR_LEN]));
-        } else {
-            sym = x_sym(SK_STR, string_index(e[STR_PTR], e[STR_LEN]));
-        }
-        emit2(X_LEA, dst, x64_mem_sym(sym));
-    } else if k == EX_IDENT {
-        x_gen_ident(e, dst);
-    } else if k == EX_REG {
-        x_mov(dst, e[REG_NUM]);
-    } else if k == EX_UNARY {
-        x_gen_unary(e, dst, d);
-    } else if k == EX_BINARY {
-        x_gen_binary(e, dst, d);
-    } else if k == EX_INDEX {
-        x_gen_index_load(e, dst, d);
-    } else if k == EX_CONV && (e[CV_KIND] == CV_DYN || e[CV_KIND] == CV_DYN_KEEP || e[CV_KIND] == CV_DYN_OBJECT || e[CV_KIND] == CV_DYN_DESC || (e[CV_KIND] == CV_SAME && is_dyn_value(e[N_TYPE]))) {
-        x_gen_dyn_pair(e, dst, XSCR2, d);
-    } else if k == EX_CONV && e[CV_KIND] == CV_DYN_TABLE_WORD {
-        let spare = XSCR;
-        if dst == XSCR {
-            spare = XSCR2;
-        }
-        x_gen_dyn_pair(e[CV_X], spare, dst, d);
-    } else if k == EX_CONV {
-        x_gen_conv(e, dst, d);
-    } else if k == EX_MEM {
-        if is_dyn_value(e[N_TYPE]) {
-            x_gen_dyn_pair(e, dst, XSCR2, d);
-        } else {
-            x_gen_mem_addr(e, d);
-            x_emit_load(dst, e[N_TYPE]);
-        }
-    } else if k == EX_ELEM {
-        if is_dyn_value(e[N_TYPE]) {
-            x_gen_dyn_pair(e, dst, XSCR2, d);
-        } else {
-            x_gen_elem_addr(e, d);
-            x_emit_load(dst, e[N_TYPE]);
-        }
-    } else if k == EX_SEQ {
-        x_gen_seq(e, dst, d);
-    } else if k == EX_FUNCREF {
-        let kind = SK_FNDESC;
-        if e[FR_RAW] {
-            kind = SK_FN;
-        }
-        emit2(X_LEA, dst, x64_mem_sym(x_sym(kind, e[FR_FN][F_INDEX])));
-    } else if e[CALL_INTRINSIC] {
-        x_gen_intrinsic(e, dst, d);
-    } else {
-        x_gen_call(e, d);
-        if is_fp(dst) {
-            x_mov(dst, XMM);
-        } else {
-            x_mov(dst, RAX);
-        }
-    }
+fn x_gen_to(e i64, dst i64, d i64) {
+	let k = e[N_KIND]
+	if k == EX_INT {
+		x_load_imm(dst, e[INT_VAL])
+	} else if k == EX_FLOAT {
+		x_load_imm(dst, e[FL_BITS])
+	} else if k == EX_STR {
+		mut sym = 0
+		if kind_of(e[N_TYPE]) == K_STRING {
+			sym = x_sym(SK_TSTR, tstring_index(e[STR_PTR], e[STR_LEN]))
+		} else {
+			sym = x_sym(SK_STR, string_index(e[STR_PTR], e[STR_LEN]))
+		}
+		emit2(X_LEA, dst, x64_mem_sym(sym))
+	} else if k == EX_IDENT {
+		x_gen_ident(e, dst)
+	} else if k == EX_REG {
+		x_mov(dst, e[REG_NUM])
+	} else if k == EX_UNARY {
+		x_gen_unary(e, dst, d)
+	} else if k == EX_BINARY {
+		x_gen_binary(e, dst, d)
+	} else if k == EX_INDEX {
+		x_gen_index_load(e, dst, d)
+	} else if k == EX_CONV && (e[CV_KIND] == CV_DYN || e[CV_KIND] == CV_DYN_KEEP || e[CV_KIND] == CV_DYN_OBJECT || e[CV_KIND] == CV_DYN_DESC || (e[CV_KIND] == CV_SAME && is_dyn_value(e[N_TYPE]) != 0)) {
+		x_gen_dyn_pair(e, dst, XSCR2, d)
+	} else if k == EX_CONV && e[CV_KIND] == CV_DYN_TABLE_WORD {
+		mut spare = XSCR
+		if dst == XSCR {
+			spare = XSCR2
+		}
+		x_gen_dyn_pair(e[CV_X], spare, dst, d)
+	} else if k == EX_CONV {
+		x_gen_conv(e, dst, d)
+	} else if k == EX_MEM {
+		if is_dyn_value(e[N_TYPE]) != 0 {
+			x_gen_dyn_pair(e, dst, XSCR2, d)
+		} else {
+			x_gen_mem_addr(e, d)
+			x_emit_load(dst, e[N_TYPE])
+		}
+	} else if k == EX_ELEM {
+		if is_dyn_value(e[N_TYPE]) != 0 {
+			x_gen_dyn_pair(e, dst, XSCR2, d)
+		} else {
+			x_gen_elem_addr(e, d)
+			x_emit_load(dst, e[N_TYPE])
+		}
+	} else if k == EX_SEQ {
+		x_gen_seq(e, dst, d)
+	} else if k == EX_FUNCREF {
+		mut kind = SK_FNDESC
+		if e[FR_RAW] != 0 {
+			kind = SK_FN
+		}
+		emit2(X_LEA, dst, x64_mem_sym(x_sym(kind, e[FR_FN][F_INDEX])))
+	} else if e[CALL_INTRINSIC] != 0 {
+		x_gen_intrinsic(e, dst, d)
+	} else {
+		x_gen_call(e, d)
+		if is_fp(dst) != 0 {
+			x_mov(dst, XMM)
+		} else {
+			x_mov(dst, RAX)
+		}
+	}
 }
 
 // x_gen_dyn_addr computes the address of a two-word field or slice element. x86 has no
 // addressing mode for a scale of 16, so a dyn slice index is multiplied explicitly.
-fn x_gen_dyn_addr(e, d) {
-    if e[N_KIND] == EX_ELEM {
-        x_gen_elem_addr(e, d);
-    } else {
-        x_gen_mem_addr(e, d);
-    }
-    let base = mm_base;
-    let idx = mm_index;
-    let scale = mm_scale;
-    let off = mm_off;
-    if idx >= 0 {
-        if base == XSCR {
-            x_mov(XSCR2, base);
-            base = XSCR2;
-        }
-        emit3(X_IMUL_RRI, XSCR, idx, scale);
-        emit2(X_ADD, XSCR, base);
-        if off != 0 {
-            x_add_imm(XSCR, XSCR, off);
-        }
-    } else {
-        emit2(X_LEA, XSCR, x_mem1(base, off));
-    }
+fn x_gen_dyn_addr(e i64, d i64) {
+	if e[N_KIND] == EX_ELEM {
+		x_gen_elem_addr(e, d)
+	} else {
+		x_gen_mem_addr(e, d)
+	}
+	mut base = mm_base
+	let idx = mm_index
+	let scale = mm_scale
+	let off = mm_off
+	if idx >= 0 {
+		if base == XSCR {
+			x_mov(XSCR2, base)
+			base = XSCR2
+		}
+		emit3(X_IMUL_RRI, XSCR, idx, scale)
+		emit2(X_ADD, XSCR, base)
+		if off != 0 {
+			x_add_imm(XSCR, XSCR, off)
+		}
+	} else {
+		emit2(X_LEA, XSCR, x_mem1(base, off))
+	}
 }
 
 // x_gen_dyn_pair computes a dyn value as adjacent object and table words.
-fn x_gen_dyn_pair(e, obj, tab, d) {
-    let k = e[N_KIND];
-    if k == EX_CONV && e[CV_KIND] == CV_DYN_OBJECT {
-        let spare = XSCR2;
-        if obj == XSCR2 {
-            spare = XSCR;
-        }
-        x_gen_dyn_pair(e[CV_X], obj, spare, d);
-        return;
-    }
-    if k == EX_CONV && e[CV_KIND] == CV_DYN_TABLE_WORD {
-        let spare = XSCR;
-        if tab == XSCR {
-            spare = XSCR2;
-        }
-        x_gen_dyn_pair(e[CV_X], spare, tab, d);
-        return;
-    }
-    if k == EX_CONV && e[CV_KIND] == CV_DYN_DESC {
-        x_gen_dyn_pair(e[CV_X], RAX, RDX, d);
-        x_ld(obj, x_mem1(RDX, 8 * e[CV_DYN_INDEX]), 3);
-        return;
-    }
-    if k == EX_CONV && e[CV_KIND] == CV_DYN {
-        x_gen_to(e[CV_X], obj, d);
-        let rec = vec_get(dyn_tables, e[CV_DYN_TABLE]);
-        emit2(X_LEA, tab, x64_mem_sym(x_sym(SK_VAR, vec_get(rec, 4))));
-        return;
-    }
-    if k == EX_CONV && e[CV_KIND] == CV_DYN_KEEP {
-        x_gen_dyn_pair(e[CV_X], obj, tab, d);
-        let done = new_label();
-        emit2(X_TEST, obj, obj);
-        emit2(X_JCC, XC_E, done);
-        x_push(tab);
-        x_ld(XSCR, x_mem1(tab, 0), 3);
-        x_ld(XSCR2, x_mem1(XSCR, 0), 3);
-        x_save_temps(d);
-        x_mov(x_int_arg(0), obj);
-        emit1(X_CALL_R, XSCR2);
-        x_restore_temps(d);
-        x_mov(obj, RAX);
-        x_pop(tab);
-        x_label(done);
-        return;
-    }
-    if k == EX_SEQ {
-        x_gen_seq(e, -1, d);
-        x_gen_dyn_pair(e[SEQ_VALUE], obj, tab, d);
-        return;
-    }
-    if k == EX_CALL {
-        x_gen_call(e, d);
-        x_mov(obj, RAX);
-        x_mov(tab, RDX);
-        return;
-    }
-    if k == EX_CONV && e[CV_KIND] == CV_SAME {
-        x_gen_dyn_pair(e[CV_X], obj, tab, d);
-        return;
-    }
-    if k == EX_IDENT {
-        let s = e[ID_REF];
-        if s[S_KIND] == SYM_LOCAL {
-            x_slot_load(obj, s[S_OFF]);
-            x_slot_load(tab, s[S_OFF] + 8);
-        } else if s[S_TLS] {
-            x_ld(obj, x_mem1(XCTX, tls_off(s)), 3);
-            x_ld(tab, x_mem1(XCTX, tls_off(s) + 8), 3);
-        } else {
-            x_ld(obj, x64_mem_sym(x_sym(SK_VAR, s[S_INDEX])), 3);
-            x_ld(tab, x64_mem_sym(x_sym(SK_VAR, s[S_WORDS])), 3);
-        }
-        return;
-    }
-    if k == EX_MEM || k == EX_ELEM {
-        x_gen_dyn_addr(e, d);
-        x_ld(obj, x_mem1(XSCR, 0), 3);
-        x_ld(tab, x_mem1(XSCR, 8), 3);
-        return;
-    }
-    if k == EX_INT && is_const(e) && const_val(e) == 0 {
-        x_load_imm(obj, 0);
-        x_load_imm(tab, 0);
-        return;
-    }
-    err_code_at(e[N_POS], "E990 INTERNAL", "unsupported dyn value location in amd64 code generation");
+fn x_gen_dyn_pair(e i64, obj i64, tab i64, d i64) {
+	let k = e[N_KIND]
+	if k == EX_CONV && e[CV_KIND] == CV_DYN_OBJECT {
+		mut spare = XSCR2
+		if obj == XSCR2 {
+			spare = XSCR
+		}
+		x_gen_dyn_pair(e[CV_X], obj, spare, d)
+		return
+	}
+	if k == EX_CONV && e[CV_KIND] == CV_DYN_TABLE_WORD {
+		mut spare = XSCR
+		if tab == XSCR {
+			spare = XSCR2
+		}
+		x_gen_dyn_pair(e[CV_X], spare, tab, d)
+		return
+	}
+	if k == EX_CONV && e[CV_KIND] == CV_DYN_DESC {
+		x_gen_dyn_pair(e[CV_X], RAX, RDX, d)
+		x_ld(obj, x_mem1(RDX, 8 * e[CV_DYN_INDEX]), 3)
+		return
+	}
+	if k == EX_CONV && e[CV_KIND] == CV_DYN {
+		x_gen_to(e[CV_X], obj, d)
+		let rec = vec_get(dyn_tables, e[CV_DYN_TABLE])
+		emit2(X_LEA, tab, x64_mem_sym(x_sym(SK_VAR, vec_get(rec, 4))))
+		return
+	}
+	if k == EX_CONV && e[CV_KIND] == CV_DYN_KEEP {
+		x_gen_dyn_pair(e[CV_X], obj, tab, d)
+		let done = new_label()
+		emit2(X_TEST, obj, obj)
+		emit2(X_JCC, XC_E, done)
+		x_push(tab)
+		x_ld(XSCR, x_mem1(tab, 0), 3)
+		x_ld(XSCR2, x_mem1(XSCR, 0), 3)
+		x_save_temps(d)
+		x_mov(x_int_arg(0), obj)
+		emit1(X_CALL_R, XSCR2)
+		x_restore_temps(d)
+		x_mov(obj, RAX)
+		x_pop(tab)
+		x_label(done)
+		return
+	}
+	if k == EX_SEQ {
+		x_gen_seq(e, -1, d)
+		x_gen_dyn_pair(e[SEQ_VALUE], obj, tab, d)
+		return
+	}
+	if k == EX_CALL {
+		x_gen_call(e, d)
+		x_mov(obj, RAX)
+		x_mov(tab, RDX)
+		return
+	}
+	if k == EX_CONV && e[CV_KIND] == CV_SAME {
+		x_gen_dyn_pair(e[CV_X], obj, tab, d)
+		return
+	}
+	if k == EX_IDENT {
+		let s = e[ID_REF]
+		if s[S_KIND] == SYM_LOCAL {
+			x_slot_load(obj, s[S_OFF])
+			x_slot_load(tab, s[S_OFF] + 8)
+		} else if s[S_TLS] != 0 {
+			x_ld(obj, x_mem1(XCTX, tls_off(s)), 3)
+			x_ld(tab, x_mem1(XCTX, tls_off(s) + 8), 3)
+		} else {
+			x_ld(obj, x64_mem_sym(x_sym(SK_VAR, s[S_INDEX])), 3)
+			x_ld(tab, x64_mem_sym(x_sym(SK_VAR, s[S_WORDS])), 3)
+		}
+		return
+	}
+	if k == EX_MEM || k == EX_ELEM {
+		x_gen_dyn_addr(e, d)
+		x_ld(obj, x_mem1(XSCR, 0), 3)
+		x_ld(tab, x_mem1(XSCR, 8), 3)
+		return
+	}
+	if k == EX_INT && is_const(e) != 0 && const_val(e) == 0 {
+		x_load_imm(obj, 0)
+		x_load_imm(tab, 0)
+		return
+	}
+	err_code_at(e[N_POS], cstr("E990 INTERNAL"), cstr("unsupported dyn value location in amd64 code generation"))
 }
 
-fn x_gen_ident(e, dst) {
-    let s = e[ID_REF];
-    let k = s[S_KIND];
-    if k == SYM_LOCAL {
-        if s[S_REG] >= 0 {
-            x_mov(dst, s[S_REG]);
-        } else {
-            x_slot_load(dst, s[S_OFF]);
-        }
-    } else if k == SYM_GLOBAL && s[S_TLS] {
-        x_ld(dst, x_mem1(XCTX, tls_off(s)), 3);
-    } else if k == SYM_GLOBAL {
-        x_ld(dst, x64_mem_sym(x_sym(SK_VAR, s[S_INDEX])), 3);
-    } else {
-        x_load_imm(dst, s[S_VAL]);
-    }
+fn x_gen_ident(e i64, dst i64) {
+	let s = e[ID_REF]
+	let k = s[S_KIND]
+	if k == SYM_LOCAL {
+		if s[S_REG] >= 0 {
+			x_mov(dst, s[S_REG])
+		} else {
+			x_slot_load(dst, s[S_OFF])
+		}
+	} else if k == SYM_GLOBAL && s[S_TLS] != 0 {
+		x_ld(dst, x_mem1(XCTX, tls_off(s)), 3)
+	} else if k == SYM_GLOBAL {
+		x_ld(dst, x64_mem_sym(x_sym(SK_VAR, s[S_INDEX])), 3)
+	} else {
+		x_load_imm(dst, s[S_VAL])
+	}
 }
 
 // x_gen_pair evaluates two operands into pl and pr. pr may be rax/xmm0 (a call result) or
 // a scratch register (a spill), so the caller must consume both right away.
-fn x_gen_pair(lexp, rexp, d) {
-    let l = x_gen_val(lexp, d);
-    let d2 = next_depth(l, d);
-    let rfp = e_fp(rexp);
-    let r = 0;
-    if is_real_call(rexp) {
-        x_gen_call(rexp, d2);
-        if rfp {
-            r = XMM;
-        } else {
-            r = RAX;
-        }
-    } else if !room(d2, rfp) {
-        x_push(l);
-        let rr = x_gen_val(rexp, d);
-        if rfp {
-            x_mov(XFSCR, rr);
-            r = XFSCR;
-        } else {
-            x_mov(XSCR, rr);
-            r = XSCR;
-        }
-        x_pop(l);
-    } else {
-        r = x_gen_val(rexp, d2);
-    }
-    pl = l;
-    pr = r;
+fn x_gen_pair(lexp i64, rexp i64, d i64) {
+	let l = x_gen_val(lexp, d)
+	let d2 = next_depth(l, d)
+	let rfp = e_fp(rexp)
+	mut r = 0
+	if is_real_call(rexp) != 0 {
+		x_gen_call(rexp, d2)
+		if rfp != 0 {
+			r = XMM
+		} else {
+			r = RAX
+		}
+	} else if room(d2, rfp) == 0 {
+		x_push(l)
+		let rr = x_gen_val(rexp, d)
+		if rfp != 0 {
+			x_mov(XFSCR, rr)
+			r = XFSCR
+		} else {
+			x_mov(XSCR, rr)
+			r = XSCR
+		}
+		x_pop(l)
+	} else {
+		r = x_gen_val(rexp, d2)
+	}
+	pl = l
+	pr = r
 }
 
-fn x_gen_unary(e, dst, d) {
-    let op = e[UN_OP];
-    if streq(op, "&") {
-        let s = e[UN_X][ID_REF];
-        if s[S_KIND] == SYM_LOCAL {
-            emit2(X_LEA, dst, x_mem1(RBP, s[S_OFF]));
-        } else if s[S_TLS] {
-            emit2(X_LEA, dst, x_mem1(XCTX, tls_off(s)));
-        } else {
-            emit2(X_LEA, dst, x64_mem_sym(x_sym(SK_VAR, s[S_INDEX])));
-        }
-        return;
-    }
-    if is_const(e) {
-        x_load_imm(dst, const_val(e));
-        return;
-    }
-    let x = x_gen_val(e[UN_X], d);
-    if is_fp(dst) {
-        // Negation flips the sign bit.
-        x_load_imm(XSCR, 1 << 63);
-        emit2(X_MOVQ, XFSCR, XSCR);
-        x_mov(dst, x);
-        emit2(X_XORPD, dst, XFSCR);
-        return;
-    }
-    if streq(op, "-") {
-        x_mov(dst, x);
-        emit1(X_NEG, dst);
-    } else if streq(op, "~") {
-        x_mov(dst, x);
-        emit1(X_NOT, dst);
-    } else {
-        emit2(X_TEST, x, x);
-        x_setcc(dst, XC_E, 0);
-        return;
-    }
-    x_mask(e, dst);
+fn x_gen_unary(e i64, dst i64, d i64) {
+	let op = e[UN_OP]
+	if streq(op, cstr("&")) != 0 {
+		let s = e[UN_X][ID_REF]
+		if s[S_KIND] == SYM_LOCAL {
+			emit2(X_LEA, dst, x_mem1(RBP, s[S_OFF]))
+		} else if s[S_TLS] != 0 {
+			emit2(X_LEA, dst, x_mem1(XCTX, tls_off(s)))
+		} else {
+			emit2(X_LEA, dst, x64_mem_sym(x_sym(SK_VAR, s[S_INDEX])))
+		}
+		return
+	}
+	if is_const(e) != 0 {
+		x_load_imm(dst, const_val(e))
+		return
+	}
+	let x = x_gen_val(e[UN_X], d)
+	if is_fp(dst) != 0 {
+		// Negation flips the sign bit.
+		x_load_imm(XSCR, 1 << 63)
+		emit2(X_MOVQ, XFSCR, XSCR)
+		x_mov(dst, x)
+		emit2(X_XORPD, dst, XFSCR)
+		return
+	}
+	if streq(op, cstr("-")) != 0 {
+		x_mov(dst, x)
+		emit1(X_NEG, dst)
+	} else if streq(op, cstr("~")) != 0 {
+		x_mov(dst, x)
+		emit1(X_NOT, dst)
+	} else {
+		emit2(X_TEST, x, x)
+		x_setcc(dst, XC_E, 0)
+		return
+	}
+	x_mask(e, dst)
 }
 
-fn x_gen_binary(e, dst, d) {
-    if is_const(e) {
-        x_load_imm(dst, const_val(e));
-        return;
-    }
-    let op = e[BIN_OP];
-    if streq(op, "&&") || streq(op, "||") {
-        let f = new_label();
-        let end = new_label();
-        x_gen_cond(e, f, d);
-        x_load_imm(dst, 1);
-        emit1(X_JMP, end);
-        x_label(f);
-        x_load_imm(dst, 0);
-        x_label(end);
-        return;
-    }
-    if x_cond(op) >= 0 {
-        x_gen_compare(e, d);
-        x_setcc(dst, cmp_cc, cmp_unord);
-        return;
-    }
-    if is_fp(dst) {
-        x_gen_fbinary(e, dst, d);
-        return;
-    }
-    let l = e[BIN_L];
-    let r = e[BIN_R];
-    let comm = streq(op, "+") || streq(op, "*") || streq(op, "&") || streq(op, "|") || streq(op, "^");
-    if comm && is_const(l) {
-        let t = l;
-        l = r;
-        r = t;
-    }
-    if is_const(r) {
-        let c = const_val(r);
-        let lv = x_gen_val(l, d);
-        arith_unsigned = e_unsigned(e);
-        if arith_unsigned && x_uconst(op, dst, lv, c) {
-            x_mask(e, dst);
-            return;
-        }
-        x_binary_const(op, dst, lv, c);
-        x_mask(e, dst);
-        return;
-    }
-    x_gen_pair(l, r, d);
-    arith_unsigned = e_unsigned(e);
-    x_arith(op, dst, pl, pr);
-    x_mask(e, dst);
+fn x_gen_binary(e i64, dst i64, d i64) {
+	if is_const(e) != 0 {
+		x_load_imm(dst, const_val(e))
+		return
+	}
+	let op = e[BIN_OP]
+	if streq(op, cstr("&&")) != 0 || streq(op, cstr("||")) != 0 {
+		let f = new_label()
+		let end = new_label()
+		x_gen_cond(e, f, d)
+		x_load_imm(dst, 1)
+		emit1(X_JMP, end)
+		x_label(f)
+		x_load_imm(dst, 0)
+		x_label(end)
+		return
+	}
+	if x_cond(op) >= 0 {
+		x_gen_compare(e, d)
+		x_setcc(dst, cmp_cc, cmp_unord)
+		return
+	}
+	if is_fp(dst) != 0 {
+		x_gen_fbinary(e, dst, d)
+		return
+	}
+	mut l = e[BIN_L]
+	mut r = e[BIN_R]
+	let comm = i64(streq(op, cstr("+")) != 0 || streq(op, cstr("*")) != 0 || streq(op, cstr("&")) != 0 || streq(op, cstr("|")) != 0 || streq(op, cstr("^")) != 0)
+	if comm != 0 && is_const(l) != 0 {
+		let t = l
+		l = r
+		r = t
+	}
+	if is_const(r) != 0 {
+		let c = const_val(r)
+		let lv = x_gen_val(l, d)
+		arith_unsigned = e_unsigned(e)
+		if arith_unsigned != 0 && x_uconst(op, dst, lv, c) != 0 {
+			x_mask(e, dst)
+			return
+		}
+		x_binary_const(op, dst, lv, c)
+		x_mask(e, dst)
+		return
+	}
+	x_gen_pair(l, r, d)
+	arith_unsigned = e_unsigned(e)
+	x_arith(op, dst, pl, pr)
+	x_mask(e, dst)
 }
 
-fn x_gen_fbinary(e, dst, d) {
-    let op = e[BIN_OP];
-    x_gen_pair(e[BIN_L], e[BIN_R], d);
-    if streq(op, "+") {
-        x_binop(X_ADDSD, dst, pl, pr, 1);
-    } else if streq(op, "-") {
-        x_binop(X_SUBSD, dst, pl, pr, 0);
-    } else if streq(op, "*") {
-        x_binop(X_MULSD, dst, pl, pr, 1);
-    } else {
-        x_binop(X_DIVSD, dst, pl, pr, 0);
-    }
+fn x_gen_fbinary(e i64, dst i64, d i64) {
+	let op = e[BIN_OP]
+	x_gen_pair(e[BIN_L], e[BIN_R], d)
+	if streq(op, cstr("+")) != 0 {
+		x_binop(X_ADDSD, dst, pl, pr, 1)
+	} else if streq(op, cstr("-")) != 0 {
+		x_binop(X_SUBSD, dst, pl, pr, 0)
+	} else if streq(op, cstr("*")) != 0 {
+		x_binop(X_MULSD, dst, pl, pr, 1)
+	} else {
+		x_binop(X_DIVSD, dst, pl, pr, 0)
+	}
 }
 
 // x_gen_compare sets the flags for comparison e and leaves its condition in cmp_cc (and
 // cmp_unord, see x_jcc). Float operands are compared so that NaN compares false like Go:
 // ucomisd leaves CF set when unordered, so < and <= test the swapped operands with a/ae.
-fn x_gen_compare(e, d) {
-    let l = e[BIN_L];
-    let r = e[BIN_R];
-    let op = e[BIN_OP];
-    if e_fp(l) || e_fp(r) {
-        x_gen_pair(l, r, d);
-        // Set after the operands, which may contain comparisons of their own.
-        cmp_unord = 0;
-        if streq(op, "<") || streq(op, "<=") {
-            emit2(X_UCOMISD, pr, pl);
-        } else {
-            emit2(X_UCOMISD, pl, pr);
-        }
-        if streq(op, "<") || streq(op, ">") {
-            cmp_cc = XC_A;
-        } else if streq(op, "<=") || streq(op, ">=") {
-            cmp_cc = XC_AE;
-        } else if streq(op, "==") {
-            cmp_cc = XC_E;
-            cmp_unord = 1;
-        } else {
-            cmp_cc = XC_NE;
-            cmp_unord = 2;
-        }
-        return;
-    }
-    let cc = x_cond(op);
-    if e_unsigned(l) || e_unsigned(r) {
-        cc = x_ucond(op);
-    }
-    if is_const(l) {
-        let t = l;
-        l = r;
-        r = t;
-        cc = x_swap_cc(cc);
-    }
-    if is_const(r) {
-        let a = x_gen_val(l, d);
-        x_cmp_imm(a, const_val(r));
-    } else {
-        x_gen_pair(l, r, d);
-        emit2(X_CMP, pl, pr);
-    }
-    cmp_cc = cc;
-    cmp_unord = 0;
+fn x_gen_compare(e i64, d i64) {
+	mut l = e[BIN_L]
+	mut r = e[BIN_R]
+	let op = e[BIN_OP]
+	if e_fp(l) != 0 || e_fp(r) != 0 {
+		x_gen_pair(l, r, d)
+		// Set after the operands, which may contain comparisons of their own.
+		cmp_unord = 0
+		if streq(op, cstr("<")) != 0 || streq(op, cstr("<=")) != 0 {
+			emit2(X_UCOMISD, pr, pl)
+		} else {
+			emit2(X_UCOMISD, pl, pr)
+		}
+		if streq(op, cstr("<")) != 0 || streq(op, cstr(">")) != 0 {
+			cmp_cc = XC_A
+		} else if streq(op, cstr("<=")) != 0 || streq(op, cstr(">=")) != 0 {
+			cmp_cc = XC_AE
+		} else if streq(op, cstr("==")) != 0 {
+			cmp_cc = XC_E
+			cmp_unord = 1
+		} else {
+			cmp_cc = XC_NE
+			cmp_unord = 2
+		}
+		return
+	}
+	mut cc = x_cond(op)
+	if e_unsigned(l) != 0 || e_unsigned(r) != 0 {
+		cc = x_ucond(op)
+	}
+	if is_const(l) != 0 {
+		let t = l
+		l = r
+		r = t
+		cc = x_swap_cc(cc)
+	}
+	if is_const(r) != 0 {
+		let a = x_gen_val(l, d)
+		x_cmp_imm(a, const_val(r))
+	} else {
+		x_gen_pair(l, r, d)
+		emit2(X_CMP, pl, pr)
+	}
+	cmp_cc = cc
+	cmp_unord = 0
 }
 
-fn x_gen_index_load(e, dst, d) {
-    let ix = e[IX_I];
-    if is_const(ix) && x64_fits32(const_val(ix) * 8) {
-        let base = x_gen_val(e[IX_X], d);
-        x_ld(dst, x_mem1(base, const_val(ix) * 8), 3);
-        return;
-    }
-    x_gen_pair(e[IX_X], ix, d);
-    x_ld(dst, x64_mem(pl, pr, 8, 0), 3);
+fn x_gen_index_load(e i64, dst i64, d i64) {
+	let ix = e[IX_I]
+	if is_const(ix) != 0 && x64_fits32(const_val(ix) * 8) != 0 {
+		let base = x_gen_val(e[IX_X], d)
+		x_ld(dst, x_mem1(base, const_val(ix) * 8), 3)
+		return
+	}
+	x_gen_pair(e[IX_X], ix, d)
+	x_ld(dst, x64_mem(pl, pr, 8, 0), 3)
 }
 
-fn x_gen_conv(e, dst, d) {
-    let k = e[CV_KIND];
-    let x = e[CV_X];
-    if k == CV_LEN || k == CV_CAP {
-        // Header word 0 (len) or 1 (cap); a nil string, slice or map has length 0.
-        let p = x_gen_val(x, d);
-        x_mov(dst, p);
-        let skip = new_label();
-        emit2(X_TEST, dst, dst);
-        emit2(X_JCC, XC_E, skip);
-        x_ld(dst, x_mem1(dst, 8 * (k == CV_CAP)), 3);
-        x_label(skip);
-        return;
-    }
-    let v = x_gen_val(x, d);
-    if k == CV_ROUND32 {
-        emit2(X_CVTSD2SS, dst, v);
-        emit2(X_CVTSS2SD, dst, dst);
-        return;
-    }
-    if k == CV_F2BITS32 {
-        emit2(X_CVTSD2SS, XFSCR, v);
-        emit2(X_MOVD_RX, dst, XFSCR);
-        return;
-    }
-    if k == CV_I2F {
-        if is_unsigned_t(x[N_TYPE]) && x[N_TYPE][TY_WIDTH] == 8 {
-            x_cvt_u2f(dst, v);
-        } else {
-            emit2(X_CVTSI2SD, dst, v);
-        }
-    } else if k == CV_F2I {
-        if is_unsigned_t(e[N_TYPE]) && e[N_TYPE][TY_WIDTH] == 8 {
-            x_cvt_f2u(dst, v);
-        } else {
-            emit2(X_CVTTSD2SI, dst, v);
-        }
-        x_canon(e[N_TYPE], dst);
-    } else if k == CV_TOBYTE {
-        emit3(X_ZXT, dst, v, 0);
-    } else if k == CV_INT {
-        // Values are kept canonical, so widening is free; narrowing re-canonicalizes.
-        x_mov(dst, v);
-        if type_width(e[N_TYPE]) < type_width(x[N_TYPE]) || is_unsigned_t(e[N_TYPE]) != is_unsigned_t(x[N_TYPE]) {
-            x_canon(e[N_TYPE], dst);
-        }
-    } else {
-        x_mov(dst, v);
-    }
+fn x_gen_conv(e i64, dst i64, d i64) {
+	let k = e[CV_KIND]
+	let x = e[CV_X]
+	if k == CV_LEN || k == CV_CAP {
+		// Header word 0 (len) or 1 (cap); a nil string, slice or map has length 0.
+		let p = x_gen_val(x, d)
+		x_mov(dst, p)
+		let skip = new_label()
+		emit2(X_TEST, dst, dst)
+		emit2(X_JCC, XC_E, skip)
+		x_ld(dst, x_mem1(dst, 8 * i64((k == CV_CAP))), 3)
+		x_label(skip)
+		return
+	}
+	let v = x_gen_val(x, d)
+	if k == CV_ROUND32 {
+		emit2(X_CVTSD2SS, dst, v)
+		emit2(X_CVTSS2SD, dst, dst)
+		return
+	}
+	if k == CV_F2BITS32 {
+		emit2(X_CVTSD2SS, XFSCR, v)
+		emit2(X_MOVD_RX, dst, XFSCR)
+		return
+	}
+	if k == CV_I2F {
+		if is_unsigned_t(x[N_TYPE]) != 0 && x[N_TYPE][TY_WIDTH] == 8 {
+			x_cvt_u2f(dst, v)
+		} else {
+			emit2(X_CVTSI2SD, dst, v)
+		}
+	} else if k == CV_F2I {
+		if is_unsigned_t(e[N_TYPE]) != 0 && e[N_TYPE][TY_WIDTH] == 8 {
+			x_cvt_f2u(dst, v)
+		} else {
+			emit2(X_CVTTSD2SI, dst, v)
+		}
+		x_canon(e[N_TYPE], dst)
+	} else if k == CV_TOBYTE {
+		emit3(X_ZXT, dst, v, 0)
+	} else if k == CV_INT {
+		// Values are kept canonical, so widening is free; narrowing re-canonicalizes.
+		x_mov(dst, v)
+		if type_width(e[N_TYPE]) < type_width(x[N_TYPE]) || is_unsigned_t(e[N_TYPE]) != is_unsigned_t(x[N_TYPE]) {
+			x_canon(e[N_TYPE], dst)
+		}
+	} else {
+		x_mov(dst, v)
+	}
 }
 
 // x_cvt_u2f converts an unsigned 64-bit value: a negative word is halved (keeping the low
 // bit for rounding), converted and doubled.
-fn x_cvt_u2f(dst, v) {
-    let neg_l = new_label();
-    let done_l = new_label();
-    emit2(X_TEST, v, v);
-    emit2(X_JCC, XC_S, neg_l);
-    emit2(X_CVTSI2SD, dst, v);
-    emit1(X_JMP, done_l);
-    x_label(neg_l);
-    x_mov(XSCR, v);
-    emit2(X_SHRI, XSCR, 1);
-    x_mov(XSCR2, v);
-    emit2(X_ANDI, XSCR2, 1);
-    emit2(X_OR, XSCR, XSCR2);
-    emit2(X_CVTSI2SD, dst, XSCR);
-    emit2(X_ADDSD, dst, dst);
-    x_label(done_l);
+fn x_cvt_u2f(dst i64, v i64) {
+	let neg_l = new_label()
+	let done_l = new_label()
+	emit2(X_TEST, v, v)
+	emit2(X_JCC, XC_S, neg_l)
+	emit2(X_CVTSI2SD, dst, v)
+	emit1(X_JMP, done_l)
+	x_label(neg_l)
+	x_mov(XSCR, v)
+	emit2(X_SHRI, XSCR, 1)
+	x_mov(XSCR2, v)
+	emit2(X_ANDI, XSCR2, 1)
+	emit2(X_OR, XSCR, XSCR2)
+	emit2(X_CVTSI2SD, dst, XSCR)
+	emit2(X_ADDSD, dst, dst)
+	x_label(done_l)
 }
 
 // x_cvt_f2u truncates to an unsigned 64-bit value: from 2^63 up, half the value is
 // converted and doubled (such doubles are even integers, so nothing is lost).
-fn x_cvt_f2u(dst, v) {
-    let small_l = new_label();
-    let done_l = new_label();
-    x_load_imm(XSCR, 0x43e0000000000000);
-    emit2(X_MOVQ, XFSCR, XSCR);
-    emit2(X_UCOMISD, v, XFSCR);
-    emit2(X_JCC, XC_B, small_l);
-    x_load_imm(XSCR, 0x3fe0000000000000);
-    emit2(X_MOVQ, XFSCR, XSCR);
-    emit2(X_MULSD, XFSCR, v);
-    emit2(X_CVTTSD2SI, dst, XFSCR);
-    emit2(X_SHLI, dst, 1);
-    emit1(X_JMP, done_l);
-    x_label(small_l);
-    emit2(X_CVTTSD2SI, dst, v);
-    x_label(done_l);
+fn x_cvt_f2u(dst i64, v i64) {
+	let small_l = new_label()
+	let done_l = new_label()
+	x_load_imm(XSCR, 0x43e0000000000000)
+	emit2(X_MOVQ, XFSCR, XSCR)
+	emit2(X_UCOMISD, v, XFSCR)
+	emit2(X_JCC, XC_B, small_l)
+	x_load_imm(XSCR, 0x3fe0000000000000)
+	emit2(X_MOVQ, XFSCR, XSCR)
+	emit2(X_MULSD, XFSCR, v)
+	emit2(X_CVTTSD2SI, dst, XFSCR)
+	emit2(X_SHLI, dst, 1)
+	emit1(X_JMP, done_l)
+	x_label(small_l)
+	emit2(X_CVTTSD2SI, dst, v)
+	x_label(done_l)
 }
 
 // ---- sized memory ----
-
 // x_mem_kind is the X_LOAD kind of a type: size log2, with XK_SIGNED for narrow signed ints.
-fn x_mem_kind(t) {
-    let w = type_width(t);
-    let k = width_log2(w);
-    if w < 8 && t[TY_KIND] == K_INT && t[TY_SIGNED] {
-        k = k | XK_SIGNED;
-    }
-    return k;
+fn x_mem_kind(t i64) i64 {
+	let w = type_width(t)
+	mut k = width_log2(w)
+	if w < 8 && t[TY_KIND] == K_INT && t[TY_SIGNED] != 0 {
+		k = k | XK_SIGNED
+	}
+	return k
 }
 
 // x_mem_operand packs the address parts left by x_gen_mem_addr or x_gen_elem_addr.
-fn x_mem_operand() {
-    if mm_index < 0 {
-        return x_mem1(mm_base, mm_off);
-    }
-    return x64_mem(mm_base, mm_index, mm_scale, mm_off);
+fn x_mem_operand() i64 {
+	if mm_index < 0 {
+		return x_mem1(mm_base, mm_off)
+	}
+	return x64_mem(mm_base, mm_index, mm_scale, mm_off)
 }
 
-fn x_emit_load(dst, t) {
-    x_ld(dst, x_mem_operand(), x_mem_kind(t));
+fn x_emit_load(dst i64, t i64) {
+	x_ld(dst, x_mem_operand(), x_mem_kind(t))
 }
 
-fn x_emit_store(v, t) {
-    x_st(v, x_mem_operand(), width_log2(type_width(t)));
+fn x_emit_store(v i64, t i64) {
+	x_st(v, x_mem_operand(), width_log2(type_width(t)))
 }
 
-fn x_scale_ok(s) {
-    return s == 1 || s == 2 || s == 4 || s == 8;
+fn x_scale_ok(s i64) i64 {
+	return i64(s == 1 || s == 2 || s == 4 || s == 8)
 }
 
 // x_gen_mem_addr evaluates an EX_MEM address into mm_base plus mm_index * mm_scale plus
 // mm_off. Registers may be r11 (scratch), so the caller must use them at once.
-fn x_gen_mem_addr(e, d) {
-    let base = x_gen_val(e[MEM_BASE], d);
-    let off = e[MEM_OFF];
-    let ix = e[MEM_INDEX];
-    let scale = e[MEM_SCALE];
-    // A checked constant index stays in a register for its bounds check.
-    if ix && is_const(ix) && !e[MEM_LEN] {
-        off = off + const_val(ix) * scale;
-        ix = 0;
-    }
-    // The address parts are set last: the index and length may contain other accesses.
-    let mi = -1;
-    let ms = 1;
-    if ix {
-        let idx = x_gen_val(ix, next_depth(base, d));
-        if e[MEM_LEN] {
-            x_bounds_check(idx, e[MEM_LEN], next_depth(idx, next_depth(base, d)));
-        }
-        if x_scale_ok(scale) {
-            mi = idx;
-            ms = scale;
-        } else {
-            emit3(X_IMUL_RRI, XSCR, idx, scale);
-            emit2(X_ADD, XSCR, base);
-            base = XSCR;
-        }
-    }
-    mm_base = base;
-    mm_index = mi;
-    mm_scale = ms;
-    mm_off = off;
+fn x_gen_mem_addr(e i64, d i64) {
+	mut base = x_gen_val(e[MEM_BASE], d)
+	mut off = e[MEM_OFF]
+	mut ix = e[MEM_INDEX]
+	let scale = e[MEM_SCALE]
+	// A checked constant index stays in a register for its bounds check.
+	if ix != 0 && is_const(ix) != 0 && e[MEM_LEN] == 0 {
+		off = off + const_val(ix) * scale
+		ix = 0
+	}
+	// The address parts are set last: the index and length may contain other accesses.
+	mut mi = -1
+	mut ms = 1
+	if ix != 0 {
+		let idx = x_gen_val(ix, next_depth(base, d))
+		if e[MEM_LEN] != 0 {
+			x_bounds_check(idx, e[MEM_LEN], next_depth(idx, next_depth(base, d)))
+		}
+		if x_scale_ok(scale) != 0 {
+			mi = idx
+			ms = scale
+		} else {
+			emit3(X_IMUL_RRI, XSCR, idx, scale)
+			emit2(X_ADD, XSCR, base)
+			base = XSCR
+		}
+	}
+	mm_base = base
+	mm_index = mi
+	mm_scale = ms
+	mm_off = off
 }
 
 // x_bounds_check traps unless idx is below the length expression (an unsigned compare
 // also catches negative indexes).
-fn x_bounds_check(idx, lenexpr, d) {
-    let lr = 0;
-    if lenexpr[N_KIND] == EX_IDENT && lenexpr[ID_REF][S_KIND] == SYM_LOCAL && lenexpr[ID_REF][S_REG] >= 0 {
-        lr = lenexpr[ID_REF][S_REG];
-    } else {
-        x_gen_to(lenexpr, XSCR2, d);
-        lr = XSCR2;
-    }
-    emit2(X_CMP, idx, lr);
-    emit2(X_JCC, XC_AE, trap_at(idx, lr, 0));
+fn x_bounds_check(idx i64, lenexpr i64, d i64) {
+	mut lr = 0
+	if lenexpr[N_KIND] == EX_IDENT && lenexpr[ID_REF][S_KIND] == SYM_LOCAL && lenexpr[ID_REF][S_REG] >= 0 {
+		lr = lenexpr[ID_REF][S_REG]
+	} else {
+		x_gen_to(lenexpr, XSCR2, d)
+		lr = XSCR2
+	}
+	emit2(X_CMP, idx, lr)
+	emit2(X_JCC, XC_AE, trap_at(idx, lr, 0))
 }
 
 // x_gen_elem_addr evaluates a slice or string element address (with its bounds check)
 // into mm_base/mm_index/mm_scale/mm_off.
-fn x_gen_elem_addr(e, d) {
-    let h = x_gen_val(e[ELEM_SEQ], d);
-    let d1 = next_depth(h, d);
-    let size = e[ELEM_SIZE];
-    let ix = e[ELEM_IDX];
-    let first = 0;
-    if e[ELEM_STR] {
-        first = 8;
-    }
-    if is_const(ix) {
-        let c = const_val(ix);
-        if !e[ELEM_SAFE] {
-            x_ld(XSCR2, x_mem1(h, 0), 3);
-            x_cmp_imm(XSCR2, c);
-            emit2(X_JCC, XC_BE, trap_at(-1, XSCR2, c));
-        }
-        if e[ELEM_STR] {
-            mm_base = h;
-        } else {
-            x_ld(XSCR, x_mem1(h, 16), 3);
-            mm_base = XSCR;
-        }
-        mm_index = -1;
-        mm_scale = size;
-        mm_off = first + c * size;
-        return;
-    }
-    let idx = x_gen_val(ix, d1);
-    if !e[ELEM_SAFE] {
-        x_ld(XSCR2, x_mem1(h, 0), 3);
-        emit2(X_CMP, idx, XSCR2);
-        emit2(X_JCC, XC_AE, trap_at(idx, XSCR2, 0));
-    }
-    if e[ELEM_STR] {
-        mm_base = h;
-    } else {
-        x_ld(XSCR, x_mem1(h, 16), 3);
-        mm_base = XSCR;
-    }
-    // Set after generating the index, which may itself be an element or field access.
-    mm_index = idx;
-    mm_scale = size;
-    mm_off = first;
+fn x_gen_elem_addr(e i64, d i64) {
+	let h = x_gen_val(e[ELEM_SEQ], d)
+	let d1 = next_depth(h, d)
+	let size = e[ELEM_SIZE]
+	let ix = e[ELEM_IDX]
+	mut first = 0
+	if e[ELEM_STR] != 0 {
+		first = 8
+	}
+	if is_const(ix) != 0 {
+		let c = const_val(ix)
+		if e[ELEM_SAFE] == 0 {
+			x_ld(XSCR2, x_mem1(h, 0), 3)
+			x_cmp_imm(XSCR2, c)
+			emit2(X_JCC, XC_BE, trap_at(-1, XSCR2, c))
+		}
+		if e[ELEM_STR] != 0 {
+			mm_base = h
+		} else {
+			x_ld(XSCR, x_mem1(h, 16), 3)
+			mm_base = XSCR
+		}
+		mm_index = -1
+		mm_scale = size
+		mm_off = first + c * size
+		return
+	}
+	let idx = x_gen_val(ix, d1)
+	if e[ELEM_SAFE] == 0 {
+		x_ld(XSCR2, x_mem1(h, 0), 3)
+		emit2(X_CMP, idx, XSCR2)
+		emit2(X_JCC, XC_AE, trap_at(idx, XSCR2, 0))
+	}
+	if e[ELEM_STR] != 0 {
+		mm_base = h
+	} else {
+		x_ld(XSCR, x_mem1(h, 16), 3)
+		mm_base = XSCR
+	}
+	// Set after generating the index, which may itself be an element or field access.
+	mm_index = idx
+	mm_scale = size
+	mm_off = first
 }
 
 // x_gen_seq runs a checker-made statement list, then computes its value. The statements
 // use temps from depth 0, so live temps below d are saved around them.
-fn x_gen_seq(e, dst, d) {
-    let i = 0;
-    while i < d {
-        if i < t_count {
-            x_push(vec_get(t_regs, i));
-        }
-        if i < f_count {
-            x_push(vec_get(f_regs, i));
-        }
-        i = i + 1;
-    }
-    x_gen_stmts(e[SEQ_STMTS]);
-    i = d - 1;
-    while i >= 0 {
-        if i < f_count {
-            x_pop(vec_get(f_regs, i));
-        }
-        if i < t_count {
-            x_pop(vec_get(t_regs, i));
-        }
-        i = i - 1;
-    }
-    let v = e[SEQ_VALUE];
-    if dst >= 0 && kind_of(e[N_TYPE]) != K_VOID {
-        x_gen_to(v, dst, d);
-    } else {
-        x_gen_effect(v);
-    }
+fn x_gen_seq(e i64, dst i64, d i64) {
+	mut i = 0
+	for i < d {
+		if i < t_count {
+			x_push(vec_get(t_regs, i))
+		}
+		if i < f_count {
+			x_push(vec_get(f_regs, i))
+		}
+		i = i + 1
+	}
+	x_gen_stmts(e[SEQ_STMTS])
+	i = d - 1
+	for i >= 0 {
+		if i < f_count {
+			x_pop(vec_get(f_regs, i))
+		}
+		if i < t_count {
+			x_pop(vec_get(t_regs, i))
+		}
+		i = i - 1
+	}
+	let v = e[SEQ_VALUE]
+	if dst >= 0 && kind_of(e[N_TYPE]) != K_VOID {
+		x_gen_to(v, dst, d)
+	} else {
+		x_gen_effect(v)
+	}
 }
 
 // x_gen_addr8 picks a byte address for p: am_base plus am_index, or plus am_off.
-fn x_gen_addr8(p, d) {
-    if p[N_KIND] == EX_BINARY && streq(p[BIN_OP], "+") {
-        let r = p[BIN_R];
-        if is_const(r) && x64_fits32(const_val(r)) {
-            am_base = x_gen_val(p[BIN_L], d);
-            am_index = -1;
-            am_off = const_val(r);
-            return;
-        }
-        x_gen_pair(p[BIN_L], r, d);
-        am_base = pl;
-        am_index = pr;
-        return;
-    }
-    am_base = x_gen_val(p, d);
-    am_index = -1;
-    am_off = 0;
+fn x_gen_addr8(p i64, d i64) {
+	if p[N_KIND] == EX_BINARY && streq(p[BIN_OP], cstr("+")) != 0 {
+		let r = p[BIN_R]
+		if is_const(r) != 0 && x64_fits32(const_val(r)) != 0 {
+			am_base = x_gen_val(p[BIN_L], d)
+			am_index = -1
+			am_off = const_val(r)
+			return
+		}
+		x_gen_pair(p[BIN_L], r, d)
+		am_base = pl
+		am_index = pr
+		return
+	}
+	am_base = x_gen_val(p, d)
+	am_index = -1
+	am_off = 0
 }
 
-fn x_am_operand() {
-    if am_index < 0 {
-        return x_mem1(am_base, am_off);
-    }
-    return x64_mem(am_base, am_index, 1, 0);
+fn x_am_operand() i64 {
+	if am_index < 0 {
+		return x_mem1(am_base, am_off)
+	}
+	return x64_mem(am_base, am_index, 1, 0)
 }
 
-fn x_gen_intrinsic(e, dst, d) {
-    let name = e[CALL_NAME];
-    if streq(name, "__prefetchw") {
-        x_gen_pair(vec_get(e[CALL_ARGS], 0), vec_get(e[CALL_ARGS], 1), d);
-        emit1(X_PREFETCHW, x64_mem(pl, pr, 8, 0));
-        return;
-    }
-    if streq(name, "load8") {
-        x_gen_addr8(vec_get(e[CALL_ARGS], 0), d);
-        emit3(X_LOAD, dst, x_am_operand(), 0);
-        return;
-    }
-    if x_gen_runtime_intrinsic(e, dst, d) {
-        return;
-    }
-    x_gen_store8(e, dst, d);
+fn x_gen_intrinsic(e i64, dst i64, d i64) {
+	let name = e[CALL_NAME]
+	if streq(name, cstr("__prefetchw")) != 0 {
+		x_gen_pair(vec_get(e[CALL_ARGS], 0), vec_get(e[CALL_ARGS], 1), d)
+		emit1(X_PREFETCHW, x64_mem(pl, pr, 8, 0))
+		return
+	}
+	if streq(name, cstr("load8")) != 0 {
+		x_gen_addr8(vec_get(e[CALL_ARGS], 0), d)
+		emit3(X_LOAD, dst, x_am_operand(), 0)
+		return
+	}
+	if x_gen_runtime_intrinsic(e, dst, d) != 0 {
+		return
+	}
+	x_gen_store8(e, dst, d)
 }
 
 // x_float_intrinsic emits the float intrinsics: sqrtsd, andpd with the sign mask for
 // __fabs, roundsd for the rounding modes it has, and a trunc-and-adjust sequence for
 // __frinta (round half away from zero).
-fn x_float_intrinsic(name, dst, x) {
-    if streq(name, "__fsqrt") {
-        emit2(X_SQRTSD, dst, x);
-        return 1;
-    }
-    if streq(name, "__fabs") {
-        x_load_imm(XSCR, 0x7fffffffffffffff);
-        emit2(X_MOVQ, XFSCR, XSCR);
-        x_mov(dst, x);
-        emit2(X_ANDPD, dst, XFSCR);
-        return 1;
-    }
-    if streq(name, "__frintm") {
-        emit3(X_ROUNDSD, dst, x, XR_FLOOR);
-        return 1;
-    }
-    if streq(name, "__frintp") {
-        emit3(X_ROUNDSD, dst, x, XR_CEIL);
-        return 1;
-    }
-    if streq(name, "__frintz") {
-        emit3(X_ROUNDSD, dst, x, XR_TRUNC);
-        return 1;
-    }
-    if streq(name, "__frintn") {
-        emit3(X_ROUNDSD, dst, x, XR_NEAREST);
-        return 1;
-    }
-    if streq(name, "__frinta") {
-        // t = trunc(x); if |x - t| >= 0.5 then t += sign(x) * 1.0.
-        let done_l = new_label();
-        x_mov(XFSCR, x);
-        emit3(X_ROUNDSD, dst, x, XR_TRUNC);
-        emit2(X_SUBSD, XFSCR, dst);
-        emit2(X_MOVQ, XSCR, XFSCR);
-        x_load_imm(XSCR2, 0x7fffffffffffffff);
-        emit2(X_AND, XSCR2, XSCR);
-        x_load_imm(RAX, 0x3fe0000000000000);
-        emit2(X_CMP, XSCR2, RAX);
-        emit2(X_JCC, XC_B, done_l);
-        x_load_imm(XSCR2, 1 << 63);
-        emit2(X_AND, XSCR, XSCR2);
-        x_load_imm(XSCR2, 0x3ff0000000000000);
-        emit2(X_OR, XSCR, XSCR2);
-        emit2(X_MOVQ, XFSCR, XSCR);
-        emit2(X_ADDSD, dst, XFSCR);
-        x_label(done_l);
-        return 1;
-    }
-    return 0;
+fn x_float_intrinsic(name i64, dst i64, x i64) i64 {
+	if streq(name, cstr("__fsqrt")) != 0 {
+		emit2(X_SQRTSD, dst, x)
+		return 1
+	}
+	if streq(name, cstr("__fabs")) != 0 {
+		x_load_imm(XSCR, 0x7fffffffffffffff)
+		emit2(X_MOVQ, XFSCR, XSCR)
+		x_mov(dst, x)
+		emit2(X_ANDPD, dst, XFSCR)
+		return 1
+	}
+	if streq(name, cstr("__frintm")) != 0 {
+		emit3(X_ROUNDSD, dst, x, XR_FLOOR)
+		return 1
+	}
+	if streq(name, cstr("__frintp")) != 0 {
+		emit3(X_ROUNDSD, dst, x, XR_CEIL)
+		return 1
+	}
+	if streq(name, cstr("__frintz")) != 0 {
+		emit3(X_ROUNDSD, dst, x, XR_TRUNC)
+		return 1
+	}
+	if streq(name, cstr("__frintn")) != 0 {
+		emit3(X_ROUNDSD, dst, x, XR_NEAREST)
+		return 1
+	}
+	if streq(name, cstr("__frinta")) != 0 {
+		// t = trunc(x); if |x - t| >= 0.5 then t += sign(x) * 1.0.
+		let done_l = new_label()
+		x_mov(XFSCR, x)
+		emit3(X_ROUNDSD, dst, x, XR_TRUNC)
+		emit2(X_SUBSD, XFSCR, dst)
+		emit2(X_MOVQ, XSCR, XFSCR)
+		x_load_imm(XSCR2, 0x7fffffffffffffff)
+		emit2(X_AND, XSCR2, XSCR)
+		x_load_imm(RAX, 0x3fe0000000000000)
+		emit2(X_CMP, XSCR2, RAX)
+		emit2(X_JCC, XC_B, done_l)
+		x_load_imm(XSCR2, 1 << 63)
+		emit2(X_AND, XSCR, XSCR2)
+		x_load_imm(XSCR2, 0x3ff0000000000000)
+		emit2(X_OR, XSCR, XSCR2)
+		emit2(X_MOVQ, XFSCR, XSCR)
+		emit2(X_ADDSD, dst, XFSCR)
+		x_label(done_l)
+		return 1
+	}
+	return 0
 }
 
 // Runtime intrinsics: the thread context register and atomics for lib/runtime.tin.
-fn x_gen_runtime_intrinsic(e, dst, d) {
-    let name = e[CALL_NAME];
-    let args = e[CALL_ARGS];
-    if streq(name, "__ctx") {
-        x_mov(dst, XCTX);
-        return 1;
-    }
-    if streq(name, "__fp") {
-        x_mov(dst, RBP);
-        return 1;
-    }
-    if load8(name) == '_' && load8(name + 1) == '_' && load8(name + 2) == 'f' {
-        let fx = x_gen_val(vec_get(args, 0), d);
-        if x_float_intrinsic(name, dst, fx) {
-            return 1;
-        }
-    }
-    if streq(name, "__st") {
-        // __st(p, v, sizelog2): a raw sized store for the runtime.
-        x_gen_pair(vec_get(args, 0), vec_get(args, 1), d);
-        emit3(X_STORE, pr, x_mem1(pl, 0), const_val(vec_get(args, 2)));
-        return 1;
-    }
-    if streq(name, "__ld") {
-        let p = x_gen_val(vec_get(args, 0), d);
-        let k = vec_get(args, 1);
-        if is_const(k) {
-            emit3(X_LOAD, dst, x_mem1(p, 0), const_val(k));
-        } else {
-            emit3(X_LOAD, dst, x_mem1(p, 0), 3);
-        }
-        return 1;
-    }
-    if streq(name,"__tin_symbols") || streq(name,"__image_base") {
-        let kind=SK_BTRACE; if streq(name,"__image_base") { kind=SK_IMAGE; }
-        emit2(X_LEA,dst,x64_mem_sym(x_sym(kind,0)));
-        return 1;
-    }
-    if streq(name, "__empty") {
-        emit2(X_LEA, dst, x64_mem_sym(x_sym(SK_ZERO, 0)));
-        return 1;
-    }
-    if streq(name, "__set_ctx") {
-        x_gen_to(vec_get(args, 0), XCTX, d);
-        return 1;
-    }
-    if streq(name, "__atomic_add") {
-        // Returns the old value: lock xadd adds r11 to [p] and leaves the old value in r11.
-        x_gen_pair(vec_get(args, 0), vec_get(args, 1), d);
-        x_mov(XSCR, pr);
-        emit2(X_LOCK_XADD, XSCR, x_mem1(pl, 0));
-        if dst >= 0 {
-            x_mov(dst, XSCR);
-        }
-        return 1;
-    }
-    if streq(name, "__atomic_cas") {
-        // __atomic_cas(p, old, new) returns the value found at p.
-        let p = x_gen_val(vec_get(args, 0), d);
-        let d1 = next_depth(p, d);
-        let o = x_gen_val(vec_get(args, 1), d1);
-        let d2 = next_depth(o, d1);
-        let n = x_gen_val(vec_get(args, 2), d2);
-        if n == RAX {
-            x_mov(XSCR, n);
-            n = XSCR;
-        }
-        x_mov(RAX, o);
-        emit2(X_LOCK_CMPXCHG, n, x_mem1(p, 0));
-        if dst >= 0 {
-            x_mov(dst, RAX);
-        }
-        return 1;
-    }
-    if streq(name, "__atomic_swap") {
-        x_gen_pair(vec_get(args, 0), vec_get(args, 1), d);
-        x_mov(XSCR, pr);
-        emit2(X_XCHG, XSCR, x_mem1(pl, 0));
-        if dst >= 0 {
-            x_mov(dst, XSCR);
-        }
-        return 1;
-    }
-    if streq(name, "__atomic_load") {
-        let p = x_gen_val(vec_get(args, 0), d);
-        emit3(X_LOAD, dst, x_mem1(p, 0), 3);
-        return 1;
-    }
-    if streq(name, "__atomic_store") {
-        // xchg is a full barrier, like stlr.
-        x_gen_pair(vec_get(args, 0), vec_get(args, 1), d);
-        x_mov(XSCR, pr);
-        emit2(X_XCHG, XSCR, x_mem1(pl, 0));
-        return 1;
-    }
-    if streq(name, "__yield") {
-        emit1(X_PAUSE, 0);
-        return 1;
-    }
-    return 0;
+fn x_gen_runtime_intrinsic(e i64, dst i64, d i64) i64 {
+	let name = e[CALL_NAME]
+	let args = e[CALL_ARGS]
+	if streq(name, cstr("__ctx")) != 0 {
+		x_mov(dst, XCTX)
+		return 1
+	}
+	if streq(name, cstr("__fp")) != 0 {
+		x_mov(dst, RBP)
+		return 1
+	}
+	if i64(load8(name)) == '_' && i64(load8(name + 1)) == '_' && i64(load8(name + 2)) == 'f' {
+		let fx = x_gen_val(vec_get(args, 0), d)
+		if x_float_intrinsic(name, dst, fx) != 0 {
+			return 1
+		}
+	}
+	if streq(name, cstr("__st")) != 0 {
+		// __st(p, v, sizelog2): a raw sized store for the runtime.
+		x_gen_pair(vec_get(args, 0), vec_get(args, 1), d)
+		emit3(X_STORE, pr, x_mem1(pl, 0), const_val(vec_get(args, 2)))
+		return 1
+	}
+	if streq(name, cstr("__ld")) != 0 {
+		let p = x_gen_val(vec_get(args, 0), d)
+		let k = vec_get(args, 1)
+		if is_const(k) != 0 {
+			emit3(X_LOAD, dst, x_mem1(p, 0), const_val(k))
+		} else {
+			emit3(X_LOAD, dst, x_mem1(p, 0), 3)
+		}
+		return 1
+	}
+	if streq(name, cstr("__tin_symbols")) != 0 || streq(name, cstr("__image_base")) != 0 {
+		mut kind = SK_BTRACE
+		if streq(name, cstr("__image_base")) != 0 {
+			kind = SK_IMAGE
+		}
+		emit2(X_LEA, dst, x64_mem_sym(x_sym(kind, 0)))
+		return 1
+	}
+	if streq(name, cstr("__empty")) != 0 {
+		emit2(X_LEA, dst, x64_mem_sym(x_sym(SK_ZERO, 0)))
+		return 1
+	}
+	if streq(name, cstr("__set_ctx")) != 0 {
+		x_gen_to(vec_get(args, 0), XCTX, d)
+		return 1
+	}
+	if streq(name, cstr("__atomic_add")) != 0 {
+		// Returns the old value: lock xadd adds r11 to [p] and leaves the old value in r11.
+		x_gen_pair(vec_get(args, 0), vec_get(args, 1), d)
+		x_mov(XSCR, pr)
+		emit2(X_LOCK_XADD, XSCR, x_mem1(pl, 0))
+		if dst >= 0 {
+			x_mov(dst, XSCR)
+		}
+		return 1
+	}
+	if streq(name, cstr("__atomic_cas")) != 0 {
+		// __atomic_cas(p, old, new) returns the value found at p.
+		let p = x_gen_val(vec_get(args, 0), d)
+		let d1 = next_depth(p, d)
+		let o = x_gen_val(vec_get(args, 1), d1)
+		let d2 = next_depth(o, d1)
+		mut n = x_gen_val(vec_get(args, 2), d2)
+		if n == RAX {
+			x_mov(XSCR, n)
+			n = XSCR
+		}
+		x_mov(RAX, o)
+		emit2(X_LOCK_CMPXCHG, n, x_mem1(p, 0))
+		if dst >= 0 {
+			x_mov(dst, RAX)
+		}
+		return 1
+	}
+	if streq(name, cstr("__atomic_swap")) != 0 {
+		x_gen_pair(vec_get(args, 0), vec_get(args, 1), d)
+		x_mov(XSCR, pr)
+		emit2(X_XCHG, XSCR, x_mem1(pl, 0))
+		if dst >= 0 {
+			x_mov(dst, XSCR)
+		}
+		return 1
+	}
+	if streq(name, cstr("__atomic_load")) != 0 {
+		let p = x_gen_val(vec_get(args, 0), d)
+		emit3(X_LOAD, dst, x_mem1(p, 0), 3)
+		return 1
+	}
+	if streq(name, cstr("__atomic_store")) != 0 {
+		// xchg is a full barrier, like stlr.
+		x_gen_pair(vec_get(args, 0), vec_get(args, 1), d)
+		x_mov(XSCR, pr)
+		emit2(X_XCHG, XSCR, x_mem1(pl, 0))
+		return 1
+	}
+	if streq(name, cstr("__yield")) != 0 {
+		emit1(X_PAUSE, 0)
+		return 1
+	}
+	return 0
 }
 
 // x_gen_store8 stores a byte and, when dst >= 0, also yields the stored value.
-fn x_gen_store8(e, dst, d) {
-    let p = vec_get(e[CALL_ARGS], 0);
-    let v = vec_get(e[CALL_ARGS], 1);
-    let base = 0;
-    let index = -1;
-    let off = 0;
-    let dv = d;
-    if p[N_KIND] == EX_BINARY && streq(p[BIN_OP], "+") && is_const(p[BIN_R]) && x64_fits32(const_val(p[BIN_R])) {
-        off = const_val(p[BIN_R]);
-        base = x_gen_val(p[BIN_L], d);
-        dv = next_depth(base, d);
-    } else if p[N_KIND] == EX_BINARY && streq(p[BIN_OP], "+") && d + 3 <= t_count {
-        base = x_gen_val(p[BIN_L], d);
-        index = x_gen_val(p[BIN_R], next_depth(base, d));
-        dv = next_depth(index, next_depth(base, d));
-    } else {
-        base = x_gen_val(p, d);
-        dv = next_depth(base, d);
-    }
-    let val = 0;
-    if dv >= t_count {
-        // Too deep for another temp: keep the address on the stack meanwhile.
-        x_push(base);
-        x_mov(XSCR, x_gen_val(v, d));
-        x_pop(base);
-        val = XSCR;
-    } else if is_const(v) && const_val(v) == 0 {
-        x_load_imm(XSCR, 0);
-        val = XSCR;
-    } else {
-        val = x_gen_val(v, dv);
-    }
-    if index >= 0 {
-        emit3(X_STORE, val, x64_mem(base, index, 1, 0), 0);
-    } else {
-        emit3(X_STORE, val, x_mem1(base, off), 0);
-    }
-    if dst >= 0 {
-        x_mov(dst, val);
-    }
+fn x_gen_store8(e i64, dst i64, d i64) {
+	let p = vec_get(e[CALL_ARGS], 0)
+	let v = vec_get(e[CALL_ARGS], 1)
+	mut base = 0
+	mut index = -1
+	mut off = 0
+	mut dv = d
+	if p[N_KIND] == EX_BINARY && streq(p[BIN_OP], cstr("+")) != 0 && is_const(p[BIN_R]) != 0 && x64_fits32(const_val(p[BIN_R])) != 0 {
+		off = const_val(p[BIN_R])
+		base = x_gen_val(p[BIN_L], d)
+		dv = next_depth(base, d)
+	} else if p[N_KIND] == EX_BINARY && streq(p[BIN_OP], cstr("+")) != 0 && d + 3 <= t_count {
+		base = x_gen_val(p[BIN_L], d)
+		index = x_gen_val(p[BIN_R], next_depth(base, d))
+		dv = next_depth(index, next_depth(base, d))
+	} else {
+		base = x_gen_val(p, d)
+		dv = next_depth(base, d)
+	}
+	mut val = 0
+	if dv >= t_count {
+		// Too deep for another temp: keep the address on the stack meanwhile.
+		x_push(base)
+		x_mov(XSCR, x_gen_val(v, d))
+		x_pop(base)
+		val = XSCR
+	} else if is_const(v) != 0 && const_val(v) == 0 {
+		x_load_imm(XSCR, 0)
+		val = XSCR
+	} else {
+		val = x_gen_val(v, dv)
+	}
+	if index >= 0 {
+		emit3(X_STORE, val, x64_mem(base, index, 1, 0), 0)
+	} else {
+		emit3(X_STORE, val, x_mem1(base, off), 0)
+	}
+	if dst >= 0 {
+		x_mov(dst, val)
+	}
 }
 
 // ---- calls ----
-
-fn x_int_arg(i) {
-    return load8("\x07\x06\x02\x01\x08\x09" + i);
+fn x_int_arg(i i64) i64 {
+	return i64(load8(cstr("\x07\x06\x02\x01\x08\x09") + i))
 }
 
 // x_res_reg is where result i of a call with several results travels.
-fn x_res_reg(i) {
-    return load8("\x00\x02\x01\x06\x07\x08\x09\x0a" + i);
+fn x_res_reg(i i64) i64 {
+	return i64(load8(cstr("\x00\x02\x01\x06\x07\x08\x09\x0a") + i))
 }
 
 // x_arg_regs gives each argument its register: rdi, rsi, rdx, rcx, r8, r9 and xmm0-xmm7
 // counted separately, or -1 for an argument that goes on the stack.
-fn x_arg_regs(e) {
-    let ptypes = call_ptypes(e);
-    let n = e[CALL_ARGS][VEC_LEN];
-    let regs = vec_new();
-    let ni = 0;
-    let nf = 0;
-    let i = 0;
-    while i < n {
-        let t = vec_get(e[CALL_ARGS], i)[N_TYPE];
-        let fp = i < ptypes[VEC_LEN] && is_float_t(vec_get(ptypes, i));
-        if i >= ptypes[VEC_LEN] {
-            fp = e_fp(vec_get(e[CALL_ARGS], i));
-        }
-        if i < ptypes[VEC_LEN] && is_dyn_value(t) {
-            if ni + 1 < 6 {
-                vec_push(regs, x_int_arg(ni));
-                ni = ni + 2;
-            } else {
-                vec_push(regs, -1);
-                ni = 6;
-            }
-        } else if fp {
-            if nf < 8 {
-                vec_push(regs, XMM + nf);
-            } else {
-                vec_push(regs, -1);
-            }
-            nf = nf + 1;
-        } else {
-            if ni < 6 {
-                vec_push(regs, x_int_arg(ni));
-            } else {
-                vec_push(regs, -1);
-            }
-            ni = ni + 1;
-        }
-        i = i + 1;
-    }
-    return regs;
+fn x_arg_regs(e i64) i64 {
+	let ptypes = call_ptypes(e)
+	let n = e[CALL_ARGS][VEC_LEN]
+	let regs = vec_new()
+	mut ni = 0
+	mut nf = 0
+	mut i = 0
+	for i < n {
+		let t = vec_get(e[CALL_ARGS], i)[N_TYPE]
+		mut fp = i64(i < ptypes[VEC_LEN] && is_float_t(vec_get(ptypes, i)) != 0)
+		if i >= ptypes[VEC_LEN] {
+			fp = e_fp(vec_get(e[CALL_ARGS], i))
+		}
+		if i < ptypes[VEC_LEN] && is_dyn_value(t) != 0 {
+			if ni + 1 < 6 {
+				vec_push(regs, x_int_arg(ni))
+				ni = ni + 2
+			} else {
+				vec_push(regs, -1)
+				ni = 6
+			}
+		} else if fp != 0 {
+			if nf < 8 {
+				vec_push(regs, XMM + nf)
+			} else {
+				vec_push(regs, -1)
+			}
+			nf = nf + 1
+		} else {
+			if ni < 6 {
+				vec_push(regs, x_int_arg(ni))
+			} else {
+				vec_push(regs, -1)
+			}
+			ni = ni + 1
+		}
+		i = i + 1
+	}
+	return regs
 }
 
-fn x_arg_regs2(e, areg) {
-    let ptypes = call_ptypes(e);
-    let n = e[CALL_ARGS][VEC_LEN];
-    let regs = vec_filled(n, -1);
-    let ni = 0;
-    let nf = 0;
-    let i = 0;
-    while i < n {
-        let fp = i < ptypes[VEC_LEN] && is_float_t(vec_get(ptypes, i));
-        if i >= ptypes[VEC_LEN] {
-            fp = e_fp(vec_get(e[CALL_ARGS], i));
-        }
-        if i < ptypes[VEC_LEN] && is_dyn_value(vec_get(e[CALL_ARGS], i)[N_TYPE]) {
-            if vec_get(areg, i) >= 0 {
-                regs[VEC_DATA][i] = x_int_arg(ni + 1);
-            }
-            ni = ni + 2;
-        } else if fp {
-            nf = nf + 1;
-        } else {
-            ni = ni + 1;
-        }
-        i = i + 1;
-    }
-    return regs;
+fn x_arg_regs2(e i64, areg i64) i64 {
+	let ptypes = call_ptypes(e)
+	let n = e[CALL_ARGS][VEC_LEN]
+	let regs = vec_filled(n, -1)
+	mut ni = 0
+	mut nf = 0
+	mut i = 0
+	for i < n {
+		mut fp = i64(i < ptypes[VEC_LEN] && is_float_t(vec_get(ptypes, i)) != 0)
+		if i >= ptypes[VEC_LEN] {
+			fp = e_fp(vec_get(e[CALL_ARGS], i))
+		}
+		if i < ptypes[VEC_LEN] && is_dyn_value(vec_get(e[CALL_ARGS], i)[N_TYPE]) != 0 {
+			if vec_get(areg, i) >= 0 {
+				regs[VEC_DATA][i] = x_int_arg(ni + 1)
+			}
+			ni = ni + 2
+		} else if fp != 0 {
+			nf = nf + 1
+		} else {
+			ni = ni + 1
+		}
+		i = i + 1
+	}
+	return regs
 }
 
 // x_caller_saved reports whether a call clobbers r (homes are the callee-saved rbx, r12-r14).
-fn x_caller_saved(r) {
-    if is_fp(r) {
-        return 1;
-    }
-    return r != RBX && (r < R12 || r > R14);
+fn x_caller_saved(r i64) i64 {
+	if is_fp(r) != 0 {
+		return 1
+	}
+	return i64(r != RBX && (r < R12 || r > R14))
 }
 
 // x_save_local_fp_homes preserves local float values assigned to caller-saved XMM8-XMM14.
 fn x_save_local_fp_homes() {
-    let locals = cur_gen_fn[F_LOCALS];
-    let i = 0;
-    while i < locals[VEC_LEN] {
-        let s = vec_get(locals, i);
-        if is_float_t(s[S_TYPE]) && s[S_REG] >= XMM + 8 && s[S_REG] <= XMM + 14 {
-            x_push(s[S_REG]);
-        }
-        i = i + 1;
-    }
+	let locals = cur_gen_fn[F_LOCALS]
+	mut i = 0
+	for i < locals[VEC_LEN] {
+		let s = vec_get(locals, i)
+		if is_float_t(s[S_TYPE]) != 0 && s[S_REG] >= XMM + 8 && s[S_REG] <= XMM + 14 {
+			x_push(s[S_REG])
+		}
+		i = i + 1
+	}
 }
 
 fn x_restore_local_fp_homes() {
-    let locals = cur_gen_fn[F_LOCALS];
-    let i = locals[VEC_LEN] - 1;
-    while i >= 0 {
-        let s = vec_get(locals, i);
-        if is_float_t(s[S_TYPE]) && s[S_REG] >= XMM + 8 && s[S_REG] <= XMM + 14 {
-            x_pop(s[S_REG]);
-        }
-        i = i - 1;
-    }
+	let locals = cur_gen_fn[F_LOCALS]
+	mut i = locals[VEC_LEN] - 1
+	for i >= 0 {
+		let s = vec_get(locals, i)
+		if is_float_t(s[S_TYPE]) != 0 && s[S_REG] >= XMM + 8 && s[S_REG] <= XMM + 14 {
+			x_pop(s[S_REG])
+		}
+		i = i - 1
+	}
 }
 
 // x_save_temps pushes the live caller-saved temps and local float homes before a call.
-fn x_save_temps(d) {
-    let i = 0;
-    while i < d {
-        if i < t_count && x_caller_saved(vec_get(t_regs, i)) {
-            x_push(vec_get(t_regs, i));
-        }
-        if i < f_count {
-            x_push(vec_get(f_regs, i));
-        }
-        i = i + 1;
-    }
-    x_save_local_fp_homes();
+fn x_save_temps(d i64) {
+	mut i = 0
+	for i < d {
+		if i < t_count && x_caller_saved(vec_get(t_regs, i)) != 0 {
+			x_push(vec_get(t_regs, i))
+		}
+		if i < f_count {
+			x_push(vec_get(f_regs, i))
+		}
+		i = i + 1
+	}
+	x_save_local_fp_homes()
 }
 
-fn x_restore_temps(d) {
-    x_restore_local_fp_homes();
-    let i = d - 1;
-    while i >= 0 {
-        if i < f_count {
-            x_pop(vec_get(f_regs, i));
-        }
-        if i < t_count && x_caller_saved(vec_get(t_regs, i)) {
-            x_pop(vec_get(t_regs, i));
-        }
-        i = i - 1;
-    }
+fn x_restore_temps(d i64) {
+	x_restore_local_fp_homes()
+	mut i = d - 1
+	for i >= 0 {
+		if i < f_count {
+			x_pop(vec_get(f_regs, i))
+		}
+		if i < t_count && x_caller_saved(vec_get(t_regs, i)) != 0 {
+			x_pop(vec_get(t_regs, i))
+		}
+		i = i - 1
+	}
 }
 
 // x_gen_call leaves the result in rax (or xmm0 for a float). Live temps are saved first;
 // then the callee and every argument are evaluated left to right and pushed, and popped in
 // reverse into their registers (or copied into the stack-argument area reserved below the
 // pushes), so evaluating one argument can never clobber another.
-fn x_gen_call(e, d) {
-    if e[N_KIND] == EX_SEQ {
-        x_gen_seq(e, -1, d);
-        return;
-    }
-    let args = e[CALL_ARGS];
-    let n = args[VEC_LEN];
-    let areg = x_arg_regs(e);
-    let areg2 = x_arg_regs2(e, areg);
-    let f = e[CALL_FN];
-    x_save_temps(d);
-    let stackoffs = vec_filled(n, -1);
-    let pushslots = vec_filled(n, -1);
-    let stack_words = 0;
-    let stage_slot = 0;
-    if !f {
-        stage_slot = 1;
-    }
-    let nvec = 0;
-    let i = 0;
-    while i < n {
-        let a = vec_get(args, i);
-        pushslots[VEC_DATA][i] = stage_slot;
-        if is_dyn_value(a[N_TYPE]) {
-            stage_slot = stage_slot + 2;
-        } else {
-            stage_slot = stage_slot + 1;
-        }
-        if vec_get(areg, i) < 0 {
-            if is_dyn_value(a[N_TYPE]) {
-                stack_words = align_up(stack_words, 2);
-                stackoffs[VEC_DATA][i] = 8 * stack_words;
-                stack_words = stack_words + 2;
-            } else {
-                stackoffs[VEC_DATA][i] = 8 * stack_words;
-                stack_words = stack_words + 1;
-            }
-        } else if vec_get(areg, i) >= XMM {
-            nvec = nvec + 1;
-        }
-        i = i + 1;
-    }
-    let area = align_up(8 * stack_words, 16);
-    if area > 0 {
-        emit2(X_SUBI, RSP, area);
-    }
-    let callee_slot = 0;
-    if !f {
-        x_push(x_gen_val(e[CALL_CALLEE], d));
-        callee_slot = 16;
-    }
-    i = 0;
-    while i < n {
-        let a = vec_get(args, i);
-        if is_dyn_value(a[N_TYPE]) {
-            let r0 = treg(d);
-            let r1 = treg(d + 1);
-            x_gen_dyn_pair(a, r0, r1, d);
-            x_push(r0);
-            x_push(r1);
-        } else {
-            x_push(x_gen_val(a, d));
-        }
-        i = i + 1;
-    }
-    i = n - 1;
-    while i >= 0 {
-        let a = vec_get(args, i);
-        let r = vec_get(areg, i);
-        let pushslot = vec_get(pushslots, i);
-        if is_dyn_value(a[N_TYPE]) {
-            if r >= 0 {
-                x_pop(vec_get(areg2, i));
-                x_pop(r);
-            } else {
-                x_pop(XSCR);
-                x_st(XSCR, x_mem1(RSP, 16 * (pushslot + 1) + vec_get(stackoffs, i) + 8), 3);
-                x_pop(XSCR);
-                x_st(XSCR, x_mem1(RSP, 16 * pushslot + vec_get(stackoffs, i)), 3);
-            }
-        } else if r >= 0 {
-            x_pop(r);
-        } else {
-            x_pop(XSCR);
-            x_st(XSCR, x_mem1(RSP, 16 * pushslot + vec_get(stackoffs, i)), 3);
-        }
-        i = i - 1;
-    }
-    if !f {
-        x_pop(RAX);
-    }
-    if f {
-        if f[F_EXTERN] {
-            // al counts the vector registers a variadic callee must save.
-            x_load_imm(RAX, nvec);
-        }
-        emit1(X_CALL, x_sym(SK_FN, f[F_INDEX]));
-        f[F_USED] = 1;
-    } else {
-        emit2(X_MOV_RR, R11, RAX);
-        x_ld(RAX, x_mem1(R11, 0), 3);
-        emit1(X_CALL_R, RAX);
-    }
-    if area > 0 {
-        emit2(X_ADDI, RSP, area);
-    }
-    x_restore_temps(d);
+fn x_gen_call(e i64, d i64) {
+	if e[N_KIND] == EX_SEQ {
+		x_gen_seq(e, -1, d)
+		return
+	}
+	let args = e[CALL_ARGS]
+	let n = args[VEC_LEN]
+	let areg = x_arg_regs(e)
+	let areg2 = x_arg_regs2(e, areg)
+	let f = e[CALL_FN]
+	x_save_temps(d)
+	let stackoffs = vec_filled(n, -1)
+	let pushslots = vec_filled(n, -1)
+	mut stack_words = 0
+	mut stage_slot = 0
+	if f == 0 {
+		stage_slot = 1
+	}
+	mut nvec = 0
+	mut i = 0
+	for i < n {
+		let a = vec_get(args, i)
+		pushslots[VEC_DATA][i] = stage_slot
+		if is_dyn_value(a[N_TYPE]) != 0 {
+			stage_slot = stage_slot + 2
+		} else {
+			stage_slot = stage_slot + 1
+		}
+		if vec_get(areg, i) < 0 {
+			if is_dyn_value(a[N_TYPE]) != 0 {
+				stack_words = align_up(stack_words, 2)
+				stackoffs[VEC_DATA][i] = 8 * stack_words
+				stack_words = stack_words + 2
+			} else {
+				stackoffs[VEC_DATA][i] = 8 * stack_words
+				stack_words = stack_words + 1
+			}
+		} else if vec_get(areg, i) >= XMM {
+			nvec = nvec + 1
+		}
+		i = i + 1
+	}
+	let area = align_up(8 * stack_words, 16)
+	if area > 0 {
+		emit2(X_SUBI, RSP, area)
+	}
+	mut callee_slot = 0
+	if f == 0 {
+		x_push(x_gen_val(e[CALL_CALLEE], d))
+		callee_slot = 16
+	}
+	i = 0
+	for i < n {
+		let a = vec_get(args, i)
+		if is_dyn_value(a[N_TYPE]) != 0 {
+			let r0 = treg(d)
+			let r1 = treg(d + 1)
+			x_gen_dyn_pair(a, r0, r1, d)
+			x_push(r0)
+			x_push(r1)
+		} else {
+			x_push(x_gen_val(a, d))
+		}
+		i = i + 1
+	}
+	i = n - 1
+	for i >= 0 {
+		let a = vec_get(args, i)
+		let r = vec_get(areg, i)
+		let pushslot = vec_get(pushslots, i)
+		if is_dyn_value(a[N_TYPE]) != 0 {
+			if r >= 0 {
+				x_pop(vec_get(areg2, i))
+				x_pop(r)
+			} else {
+				x_pop(XSCR)
+				x_st(XSCR, x_mem1(RSP, 16 * (pushslot + 1) + vec_get(stackoffs, i) + 8), 3)
+				x_pop(XSCR)
+				x_st(XSCR, x_mem1(RSP, 16 * pushslot + vec_get(stackoffs, i)), 3)
+			}
+		} else if r >= 0 {
+			x_pop(r)
+		} else {
+			x_pop(XSCR)
+			x_st(XSCR, x_mem1(RSP, 16 * pushslot + vec_get(stackoffs, i)), 3)
+		}
+		i = i - 1
+	}
+	if f == 0 {
+		x_pop(RAX)
+	}
+	if f != 0 {
+		if f[F_EXTERN] != 0 {
+			// al counts the vector registers a variadic callee must save.
+			x_load_imm(RAX, nvec)
+		}
+		emit1(X_CALL, x_sym(SK_FN, f[F_INDEX]))
+		f[F_USED] = 1
+	} else {
+		emit2(X_MOV_RR, R11, RAX)
+		x_ld(RAX, x_mem1(R11, 0), 3)
+		emit1(X_CALL_R, RAX)
+	}
+	if area > 0 {
+		emit2(X_ADDI, RSP, area)
+	}
+	x_restore_temps(d)
 }
 
 // ---- conditions ----
-
 // x_gen_cmp_branch branches to target when comparison e evaluates to when_true.
-fn x_gen_cmp_branch(e, target, d, when_true) {
-    if e_fp(e[BIN_L]) || e_fp(e[BIN_R]) {
-        x_gen_compare(e, d);
-        if when_true {
-            x_jcc(cmp_cc, cmp_unord, target);
-        } else {
-            x_jcc(cmp_cc ^ 1, cmp_unord, target);
-        }
-        return;
-    }
-    let cc = x_cond(e[BIN_OP]);
-    let l = e[BIN_L];
-    let r = e[BIN_R];
-    let unsigned = e_unsigned(l) || e_unsigned(r);
-    if unsigned {
-        cc = x_ucond(e[BIN_OP]);
-    }
-    if is_const(l) {
-        let t = l;
-        l = r;
-        r = t;
-        cc = x_swap_cc(cc);
-    }
-    if is_const(r) && const_val(r) == 0 && !(unsigned && cc != XC_E && cc != XC_NE) {
-        if cc == XC_E || cc == XC_NE {
-            let on_zero = (cc == XC_E) == when_true;
-            let k = low_bits_test(l);
-            if k > 0 {
-                x_test_imm(x_gen_val(l[BIN_L], d), (1 << k) - 1);
-            } else {
-                let z = x_gen_val(l, d);
-                emit2(X_TEST, z, z);
-            }
-            if on_zero {
-                emit2(X_JCC, XC_E, target);
-            } else {
-                emit2(X_JCC, XC_NE, target);
-            }
-            return;
-        }
-        if cc == XC_L || cc == XC_GE {
-            let on_neg = (cc == XC_L) == when_true;
-            let s = x_gen_val(l, d);
-            emit2(X_TEST, s, s);
-            if on_neg {
-                emit2(X_JCC, XC_S, target);
-            } else {
-                emit2(X_JCC, XC_NS, target);
-            }
-            return;
-        }
-    }
-    x_gen_compare(e, d);
-    if when_true {
-        emit2(X_JCC, cmp_cc, target);
-    } else {
-        emit2(X_JCC, cmp_cc ^ 1, target);
-    }
+fn x_gen_cmp_branch(e i64, target i64, d i64, when_true i64) {
+	if e_fp(e[BIN_L]) != 0 || e_fp(e[BIN_R]) != 0 {
+		x_gen_compare(e, d)
+		if when_true != 0 {
+			x_jcc(cmp_cc, cmp_unord, target)
+		} else {
+			x_jcc(cmp_cc ^ 1, cmp_unord, target)
+		}
+		return
+	}
+	mut cc = x_cond(e[BIN_OP])
+	mut l = e[BIN_L]
+	mut r = e[BIN_R]
+	let unsigned = i64(e_unsigned(l) != 0 || e_unsigned(r) != 0)
+	if unsigned != 0 {
+		cc = x_ucond(e[BIN_OP])
+	}
+	if is_const(l) != 0 {
+		let t = l
+		l = r
+		r = t
+		cc = x_swap_cc(cc)
+	}
+	if is_const(r) != 0 && const_val(r) == 0 && !(unsigned != 0 && cc != XC_E && cc != XC_NE) {
+		if cc == XC_E || cc == XC_NE {
+			let on_zero = i64(i64((cc == XC_E)) == when_true)
+			let k = low_bits_test(l)
+			if k > 0 {
+				x_test_imm(x_gen_val(l[BIN_L], d), (1 << k) - 1)
+			} else {
+				let z = x_gen_val(l, d)
+				emit2(X_TEST, z, z)
+			}
+			if on_zero != 0 {
+				emit2(X_JCC, XC_E, target)
+			} else {
+				emit2(X_JCC, XC_NE, target)
+			}
+			return
+		}
+		if cc == XC_L || cc == XC_GE {
+			let on_neg = i64(i64((cc == XC_L)) == when_true)
+			let s = x_gen_val(l, d)
+			emit2(X_TEST, s, s)
+			if on_neg != 0 {
+				emit2(X_JCC, XC_S, target)
+			} else {
+				emit2(X_JCC, XC_NS, target)
+			}
+			return
+		}
+	}
+	x_gen_compare(e, d)
+	if when_true != 0 {
+		emit2(X_JCC, cmp_cc, target)
+	} else {
+		emit2(X_JCC, cmp_cc ^ 1, target)
+	}
 }
 
 // x_gen_cond branches to f when e is false and falls through when it is true.
-fn x_gen_cond(e, f, d) {
-    x_gen_branch(e, f, d, 0);
+fn x_gen_cond(e i64, f i64, d i64) {
+	x_gen_branch(e, f, d, 0)
 }
 
 // x_gen_branch branches to target when e's truth equals when_true.
-fn x_gen_branch(e, target, d, when_true) {
-    if is_const(e) {
-        if (const_val(e) != 0) == when_true {
-            emit1(X_JMP, target);
-        }
-        return;
-    }
-    let k = e[N_KIND];
-    if k == EX_SEQ {
-        x_gen_stmts(e[SEQ_STMTS]);
-        x_gen_branch(e[SEQ_VALUE], target, d, when_true);
-        return;
-    }
-    if k == EX_UNARY && streq(e[UN_OP], "!") {
-        x_gen_branch(e[UN_X], target, d, !when_true);
-        return;
-    }
-    if k == EX_BINARY {
-        let op = e[BIN_OP];
-        let is_and = streq(op, "&&");
-        if is_and || streq(op, "||") {
-            // Branching on the operator's own sense chains; the other sense skips ahead.
-            if is_and != when_true {
-                x_gen_branch(e[BIN_L], target, d, when_true);
-                x_gen_branch(e[BIN_R], target, d, when_true);
-            } else {
-                let skip = new_label();
-                x_gen_branch(e[BIN_L], skip, d, !when_true);
-                x_gen_branch(e[BIN_R], target, d, when_true);
-                x_label(skip);
-            }
-            return;
-        }
-        if x_cond(op) >= 0 {
-            x_gen_cmp_branch(e, target, d, when_true);
-            return;
-        }
-        if streq(op, "&") && is_const(e[BIN_R]) && pow2_log(const_val(e[BIN_R])) >= 0 {
-            x_test_imm(x_gen_val(e[BIN_L], d), const_val(e[BIN_R]));
-            if when_true {
-                emit2(X_JCC, XC_NE, target);
-            } else {
-                emit2(X_JCC, XC_E, target);
-            }
-            return;
-        }
-    }
-    let v = x_gen_val(e, d);
-    if is_fp(v) {
-        emit2(X_XORPD, XFSCR, XFSCR);
-        emit2(X_UCOMISD, v, XFSCR);
-    } else {
-        emit2(X_TEST, v, v);
-    }
-    if when_true {
-        emit2(X_JCC, XC_NE, target);
-    } else {
-        emit2(X_JCC, XC_E, target);
-    }
+fn x_gen_branch(e i64, target i64, d i64, when_true i64) {
+	if is_const(e) != 0 {
+		if i64((const_val(e) != 0)) == when_true {
+			emit1(X_JMP, target)
+		}
+		return
+	}
+	let k = e[N_KIND]
+	if k == EX_SEQ {
+		x_gen_stmts(e[SEQ_STMTS])
+		x_gen_branch(e[SEQ_VALUE], target, d, when_true)
+		return
+	}
+	if k == EX_UNARY && streq(e[UN_OP], cstr("!")) != 0 {
+		x_gen_branch(e[UN_X], target, d, i64(when_true == 0))
+		return
+	}
+	if k == EX_BINARY {
+		let op = e[BIN_OP]
+		let is_and = streq(op, cstr("&&"))
+		if is_and != 0 || streq(op, cstr("||")) != 0 {
+			// Branching on the operator's own sense chains; the other sense skips ahead.
+			if is_and != when_true {
+				x_gen_branch(e[BIN_L], target, d, when_true)
+				x_gen_branch(e[BIN_R], target, d, when_true)
+			} else {
+				let skip = new_label()
+				x_gen_branch(e[BIN_L], skip, d, i64(when_true == 0))
+				x_gen_branch(e[BIN_R], target, d, when_true)
+				x_label(skip)
+			}
+			return
+		}
+		if x_cond(op) >= 0 {
+			x_gen_cmp_branch(e, target, d, when_true)
+			return
+		}
+		if streq(op, cstr("&")) != 0 && is_const(e[BIN_R]) != 0 && pow2_log(const_val(e[BIN_R])) >= 0 {
+			x_test_imm(x_gen_val(e[BIN_L], d), const_val(e[BIN_R]))
+			if when_true != 0 {
+				emit2(X_JCC, XC_NE, target)
+			} else {
+				emit2(X_JCC, XC_E, target)
+			}
+			return
+		}
+	}
+	let v = x_gen_val(e, d)
+	if is_fp(v) != 0 {
+		emit2(X_XORPD, XFSCR, XFSCR)
+		emit2(X_UCOMISD, v, XFSCR)
+	} else {
+		emit2(X_TEST, v, v)
+	}
+	if when_true != 0 {
+		emit2(X_JCC, XC_NE, target)
+	} else {
+		emit2(X_JCC, XC_E, target)
+	}
 }
 
 // ---- statements ----
-
-fn x_gen_effect(e) {
-    if !has_effects(e) {
-        return;
-    }
-    if is_real_call(e) {
-        x_gen_call(e, 0);
-    } else if e[N_KIND] == EX_SEQ {
-        x_gen_seq(e, -1, 0);
-    } else if e[N_KIND] == EX_CALL && (streq(e[CALL_NAME], "__prefetchw") || streq(e[CALL_NAME], "store8")) {
-        x_gen_intrinsic(e, -1, 0);
-    } else if e[N_KIND] == EX_CALL && e[CALL_INTRINSIC] {
-        let r = 0;
-        if e_fp(e) {
-            r = freg(0);
-        } else {
-            r = treg(0);
-        }
-        x_gen_intrinsic(e, r, 0);
-    } else {
-        x_gen_val(e, 0);
-    }
+fn x_gen_effect(e i64) {
+	if has_effects(e) == 0 {
+		return
+	}
+	if is_real_call(e) != 0 {
+		x_gen_call(e, 0)
+	} else if e[N_KIND] == EX_SEQ {
+		x_gen_seq(e, -1, 0)
+	} else if e[N_KIND] == EX_CALL && (streq(e[CALL_NAME], cstr("__prefetchw")) != 0 || streq(e[CALL_NAME], cstr("store8")) != 0) {
+		x_gen_intrinsic(e, -1, 0)
+	} else if e[N_KIND] == EX_CALL && e[CALL_INTRINSIC] != 0 {
+		mut r = 0
+		if e_fp(e) != 0 {
+			r = freg(0)
+		} else {
+			r = treg(0)
+		}
+		x_gen_intrinsic(e, r, 0)
+	} else {
+		x_gen_val(e, 0)
+	}
 }
 
-fn x_assign_local(s, v) {
-    if is_dyn_value(s[S_TYPE]) {
-        let r0 = treg(0);
-        let r1 = treg(1);
-        x_gen_dyn_pair(v, r0, r1, 0);
-        if s[S_REG] == REG_SLOT {
-            x_slot_store(r0, s[S_OFF]);
-            x_slot_store(r1, s[S_OFF] + 8);
-        } else {
-            err_code_at(s[S_POS], "E990 INTERNAL", "dyn local is not in a two-word frame slot");
-        }
-        return;
-    }
-    if s[S_REG] >= 0 {
-        x_gen_to(v, s[S_REG], 0);
-    } else if s[S_REG] == REG_SLOT {
-        x_slot_store(x_gen_val(v, 0), s[S_OFF]);
-    } else {
-        x_gen_effect(v);
-    }
+fn x_assign_local(s i64, v i64) {
+	if is_dyn_value(s[S_TYPE]) != 0 {
+		let r0 = treg(0)
+		let r1 = treg(1)
+		x_gen_dyn_pair(v, r0, r1, 0)
+		if s[S_REG] == REG_SLOT {
+			x_slot_store(r0, s[S_OFF])
+			x_slot_store(r1, s[S_OFF] + 8)
+		} else {
+			err_code_at(s[S_POS], cstr("E990 INTERNAL"), cstr("dyn local is not in a two-word frame slot"))
+		}
+		return
+	}
+	if s[S_REG] >= 0 {
+		x_gen_to(v, s[S_REG], 0)
+	} else if s[S_REG] == REG_SLOT {
+		x_slot_store(x_gen_val(v, 0), s[S_OFF])
+	} else {
+		x_gen_effect(v)
+	}
 }
 
 // x_gen_store_mem stores v through an EX_MEM or EX_ELEM target. The address parts are
 // computed into stable temps first; a[i] = a[i] op x loads the element only once.
-fn x_gen_store_mem(t, v) {
-    if is_dyn_value(t[N_TYPE]) {
-        x_gen_dyn_addr(t, 0);
-        x_push(XSCR);
-        let r0 = treg(0);
-        let r1 = treg(1);
-        x_gen_dyn_pair(v, r0, r1, 0);
-        x_pop(XSCR);
-        x_st(r0, x_mem1(XSCR, 0), 3);
-        x_st(r1, x_mem1(XSCR, 8), 3);
-        return;
-    }
-    let fpv = e_fp(t);
-    let base = 0;
-    let idx = -1;
-    let scale = 1;
-    let off = 0;
-    let d = 0;
-    let size = type_width(t[N_TYPE]);
-    if t[N_KIND] == EX_ELEM {
-        let h = x_gen_val(t[ELEM_SEQ], 0);
-        d = next_depth(h, 0);
-        let ix = t[ELEM_IDX];
-        if is_const(ix) && !t[ELEM_SAFE] {
-            idx = treg(d);
-            x_load_imm(idx, const_val(ix));
-            d = d + 1;
-        } else if !is_const(ix) {
-            idx = x_gen_val(ix, d);
-            d = next_depth(idx, d);
-        }
-        if !t[ELEM_SAFE] {
-            x_ld(XSCR2, x_mem1(h, 0), 3);
-            emit2(X_CMP, idx, XSCR2);
-            emit2(X_JCC, XC_AE, trap_at(idx, XSCR2, 0));
-        }
-        scale = size;
-        if t[ELEM_STR] {
-            base = h;
-            off = 8;
-        } else {
-            base = treg(d);
-            d = d + 1;
-            x_ld(base, x_mem1(h, 16), 3);
-        }
-        if is_const(ix) {
-            off = off + const_val(ix) * size;
-            idx = -1;
-        }
-    } else {
-        base = x_gen_val(t[MEM_BASE], 0);
-        d = next_depth(base, 0);
-        off = t[MEM_OFF];
-        let ix = t[MEM_INDEX];
-        if ix && is_const(ix) && !t[MEM_LEN] {
-            off = off + const_val(ix) * t[MEM_SCALE];
-        } else if ix {
-            idx = x_gen_val(ix, d);
-            d = next_depth(idx, d);
-            if t[MEM_LEN] {
-                x_bounds_check(idx, t[MEM_LEN], d);
-            }
-            if x_scale_ok(t[MEM_SCALE]) {
-                scale = t[MEM_SCALE];
-            } else {
-                let nb = treg(d);
-                d = d + 1;
-                emit3(X_IMUL_RRI, nb, idx, t[MEM_SCALE]);
-                emit2(X_ADD, nb, base);
-                base = nb;
-                idx = -1;
-            }
-        }
-    }
-    let val = 0;
-    if v[N_KIND] == EX_BINARY && d + 2 < t_count && d + 2 < f_count && !has_effects(t) && expr_equal(v[BIN_L], t) {
-        let cur = 0;
-        if fpv {
-            cur = freg(d);
-        } else {
-            cur = treg(d);
-        }
-        mm_base = base;
-        mm_index = idx;
-        mm_scale = scale;
-        mm_off = off;
-        x_emit_load(cur, t[N_TYPE]);
-        let saved = node_copy(v[BIN_L]);
-        v[BIN_L][N_KIND] = EX_REG;
-        v[BIN_L][REG_NUM] = cur;
-        x_gen_to(v, cur, d + 1);
-        node_restore(v[BIN_L], saved);
-        val = cur;
-    } else if !fpv && is_const(v) && const_val(v) == 0 {
-        x_load_imm(XSCR, 0);
-        val = XSCR;
-    } else {
-        val = x_gen_val(v, d);
-    }
-    mm_base = base;
-    mm_index = idx;
-    mm_scale = scale;
-    mm_off = off;
-    x_emit_store(val, t[N_TYPE]);
+fn x_gen_store_mem(t i64, v i64) {
+	if is_dyn_value(t[N_TYPE]) != 0 {
+		x_gen_dyn_addr(t, 0)
+		x_push(XSCR)
+		let r0 = treg(0)
+		let r1 = treg(1)
+		x_gen_dyn_pair(v, r0, r1, 0)
+		x_pop(XSCR)
+		x_st(r0, x_mem1(XSCR, 0), 3)
+		x_st(r1, x_mem1(XSCR, 8), 3)
+		return
+	}
+	let fpv = e_fp(t)
+	mut base = 0
+	mut idx = -1
+	mut scale = 1
+	mut off = 0
+	mut d = 0
+	let size = type_width(t[N_TYPE])
+	if t[N_KIND] == EX_ELEM {
+		let h = x_gen_val(t[ELEM_SEQ], 0)
+		d = next_depth(h, 0)
+		let ix = t[ELEM_IDX]
+		if is_const(ix) != 0 && t[ELEM_SAFE] == 0 {
+			idx = treg(d)
+			x_load_imm(idx, const_val(ix))
+			d = d + 1
+		} else if is_const(ix) == 0 {
+			idx = x_gen_val(ix, d)
+			d = next_depth(idx, d)
+		}
+		if t[ELEM_SAFE] == 0 {
+			x_ld(XSCR2, x_mem1(h, 0), 3)
+			emit2(X_CMP, idx, XSCR2)
+			emit2(X_JCC, XC_AE, trap_at(idx, XSCR2, 0))
+		}
+		scale = size
+		if t[ELEM_STR] != 0 {
+			base = h
+			off = 8
+		} else {
+			base = treg(d)
+			d = d + 1
+			x_ld(base, x_mem1(h, 16), 3)
+		}
+		if is_const(ix) != 0 {
+			off = off + const_val(ix) * size
+			idx = -1
+		}
+	} else {
+		base = x_gen_val(t[MEM_BASE], 0)
+		d = next_depth(base, 0)
+		off = t[MEM_OFF]
+		let ix = t[MEM_INDEX]
+		if ix != 0 && is_const(ix) != 0 && t[MEM_LEN] == 0 {
+			off = off + const_val(ix) * t[MEM_SCALE]
+		} else if ix != 0 {
+			idx = x_gen_val(ix, d)
+			d = next_depth(idx, d)
+			if t[MEM_LEN] != 0 {
+				x_bounds_check(idx, t[MEM_LEN], d)
+			}
+			if x_scale_ok(t[MEM_SCALE]) != 0 {
+				scale = t[MEM_SCALE]
+			} else {
+				let nb = treg(d)
+				d = d + 1
+				emit3(X_IMUL_RRI, nb, idx, t[MEM_SCALE])
+				emit2(X_ADD, nb, base)
+				base = nb
+				idx = -1
+			}
+		}
+	}
+	mut val = 0
+	if v[N_KIND] == EX_BINARY && d + 2 < t_count && d + 2 < f_count && has_effects(t) == 0 && expr_equal(v[BIN_L], t) != 0 {
+		mut cur = 0
+		if fpv != 0 {
+			cur = freg(d)
+		} else {
+			cur = treg(d)
+		}
+		mm_base = base
+		mm_index = idx
+		mm_scale = scale
+		mm_off = off
+		x_emit_load(cur, t[N_TYPE])
+		let saved = node_copy(v[BIN_L])
+		v[BIN_L][N_KIND] = EX_REG
+		v[BIN_L][REG_NUM] = cur
+		x_gen_to(v, cur, d + 1)
+		node_restore(v[BIN_L], saved)
+		val = cur
+	} else if fpv == 0 && is_const(v) != 0 && const_val(v) == 0 {
+		x_load_imm(XSCR, 0)
+		val = XSCR
+	} else {
+		val = x_gen_val(v, d)
+	}
+	mm_base = base
+	mm_index = idx
+	mm_scale = scale
+	mm_off = off
+	x_emit_store(val, t[N_TYPE])
 }
 
-fn x_gen_store_index(t, v) {
-    let base = x_gen_val(t[IX_X], 0);
-    let d = next_depth(base, 0);
-    let ix = t[IX_I];
-    let index = -1;
-    let off = 0;
-    if is_const(ix) && x64_fits32(const_val(ix) * 8) {
-        off = const_val(ix) * 8;
-    } else {
-        index = x_gen_val(ix, d);
-        d = next_depth(index, d);
-    }
-    let m = 0;
-    if index < 0 {
-        m = x_mem1(base, off);
-    } else {
-        m = x64_mem(base, index, 8, 0);
-    }
-    let fpv = e_fp(v) || e_fp(t);
-    let val = 0;
-    if v[N_KIND] == EX_BINARY && d + 1 < t_count && d + 1 < f_count && !has_effects(t) && expr_equal(v[BIN_L], t) {
-        // a[i] = a[i] op x: load the element once and update it in a register.
-        let cur = 0;
-        if fpv {
-            cur = freg(d);
-        } else {
-            cur = treg(d);
-        }
-        x_ld(cur, m, 3);
-        let saved = node_copy(v[BIN_L]);
-        v[BIN_L][N_KIND] = EX_REG;
-        v[BIN_L][REG_NUM] = cur;
-        x_gen_to(v, cur, d + 1);
-        node_restore(v[BIN_L], saved);
-        val = cur;
-    } else if !fpv && is_const(v) && const_val(v) == 0 {
-        x_load_imm(XSCR, 0);
-        val = XSCR;
-    } else {
-        val = x_gen_val(v, d);
-    }
-    x_st(val, m, 3);
+fn x_gen_store_index(t i64, v i64) {
+	let base = x_gen_val(t[IX_X], 0)
+	mut d = next_depth(base, 0)
+	let ix = t[IX_I]
+	mut index = -1
+	mut off = 0
+	if is_const(ix) != 0 && x64_fits32(const_val(ix) * 8) != 0 {
+		off = const_val(ix) * 8
+	} else {
+		index = x_gen_val(ix, d)
+		d = next_depth(index, d)
+	}
+	mut m = 0
+	if index < 0 {
+		m = x_mem1(base, off)
+	} else {
+		m = x64_mem(base, index, 8, 0)
+	}
+	let fpv = i64(e_fp(v) != 0 || e_fp(t) != 0)
+	mut val = 0
+	if v[N_KIND] == EX_BINARY && d + 1 < t_count && d + 1 < f_count && has_effects(t) == 0 && expr_equal(v[BIN_L], t) != 0 {
+		// a[i] = a[i] op x: load the element once and update it in a register.
+		mut cur = 0
+		if fpv != 0 {
+			cur = freg(d)
+		} else {
+			cur = treg(d)
+		}
+		x_ld(cur, m, 3)
+		let saved = node_copy(v[BIN_L])
+		v[BIN_L][N_KIND] = EX_REG
+		v[BIN_L][REG_NUM] = cur
+		x_gen_to(v, cur, d + 1)
+		node_restore(v[BIN_L], saved)
+		val = cur
+	} else if fpv == 0 && is_const(v) != 0 && const_val(v) == 0 {
+		x_load_imm(XSCR, 0)
+		val = XSCR
+	} else {
+		val = x_gen_val(v, d)
+	}
+	x_st(val, m, 3)
 }
 
-fn x_gen_assign(s) {
-    let t = s[AS_TARGET];
-    let v = s[AS_VALUE];
-    if t[N_KIND] == EX_INDEX {
-        x_gen_store_index(t, v);
-        return;
-    }
-    if t[N_KIND] == EX_MEM || t[N_KIND] == EX_ELEM {
-        x_gen_store_mem(t, v);
-        return;
-    }
-    let sym = t[ID_REF];
-    if sym[S_KIND] == SYM_LOCAL {
-        x_assign_local(sym, v);
-        return;
-    }
-    if is_dyn_value(sym[S_TYPE]) {
-        let r0 = treg(0);
-        let r1 = treg(1);
-        x_gen_dyn_pair(v, r0, r1, 0);
-        if sym[S_TLS] {
-            x_st(r0, x_mem1(XCTX, tls_off(sym)), 3);
-            x_st(r1, x_mem1(XCTX, tls_off(sym) + 8), 3);
-        } else {
-            x_st(r0, x64_mem_sym(x_sym(SK_VAR, sym[S_INDEX])), 3);
-            x_st(r1, x64_mem_sym(x_sym(SK_VAR, sym[S_WORDS])), 3);
-        }
-        return;
-    }
-    let r = x_gen_val(v, 0);
-    if sym[S_TLS] {
-        x_st(r, x_mem1(XCTX, tls_off(sym)), 3);
-        return;
-    }
-    x_st(r, x64_mem_sym(x_sym(SK_VAR, sym[S_INDEX])), 3);
+fn x_gen_assign(s i64) {
+	let t = s[AS_TARGET]
+	let v = s[AS_VALUE]
+	if t[N_KIND] == EX_INDEX {
+		x_gen_store_index(t, v)
+		return
+	}
+	if t[N_KIND] == EX_MEM || t[N_KIND] == EX_ELEM {
+		x_gen_store_mem(t, v)
+		return
+	}
+	let sym = t[ID_REF]
+	if sym[S_KIND] == SYM_LOCAL {
+		x_assign_local(sym, v)
+		return
+	}
+	if is_dyn_value(sym[S_TYPE]) != 0 {
+		let r0 = treg(0)
+		let r1 = treg(1)
+		x_gen_dyn_pair(v, r0, r1, 0)
+		if sym[S_TLS] != 0 {
+			x_st(r0, x_mem1(XCTX, tls_off(sym)), 3)
+			x_st(r1, x_mem1(XCTX, tls_off(sym) + 8), 3)
+		} else {
+			x_st(r0, x64_mem_sym(x_sym(SK_VAR, sym[S_INDEX])), 3)
+			x_st(r1, x64_mem_sym(x_sym(SK_VAR, sym[S_WORDS])), 3)
+		}
+		return
+	}
+	let r = x_gen_val(v, 0)
+	if sym[S_TLS] != 0 {
+		x_st(r, x_mem1(XCTX, tls_off(sym)), 3)
+		return
+	}
+	x_st(r, x64_mem_sym(x_sym(SK_VAR, sym[S_INDEX])), 3)
 }
 
-fn x_gen_while(s) {
-    let cond = s[WH_COND];
-    let body_l = new_label();
-    let cond_l = new_label();
-    let post_l = new_label();
-    let end_l = new_label();
-    if s[WH_ONCE] {
-        // A switch: break leaves it, continue goes to the enclosing loop.
-        let cont = -1;
-        if g_loops[VEC_LEN] >= 2 {
-            cont = vec_get(g_loops, g_loops[VEC_LEN] - 2);
-        }
-        vec_push(g_loops, cont);
-        vec_push(g_loops, end_l);
-        x_gen_stmts(s[WH_BODY][BLK_STMTS]);
-        g_loops[VEC_LEN] = g_loops[VEC_LEN] - 2;
-        x_label(end_l);
-        return;
-    }
-    if is_const(cond) && const_val(cond) == 0 {
-        return;
-    }
-    let forever = is_const(cond);
-    let cont_l = cond_l;
-    if s[WH_POST] {
-        cont_l = post_l;
-    } else if forever {
-        cont_l = body_l;
-    }
-    // Rotated loop: the test sits at the bottom, so each iteration takes one branch.
-    if !forever {
-        emit1(X_JMP, cond_l);
-    }
-    x_label(body_l);
-    x_gen_poll();
-    vec_push(g_loops, cont_l);
-    vec_push(g_loops, end_l);
-    x_gen_stmts(s[WH_BODY][BLK_STMTS]);
-    g_loops[VEC_LEN] = g_loops[VEC_LEN] - 2;
-    x_label(post_l);
-    if s[WH_POST] {
-        x_gen_stmt(s[WH_POST]);
-    }
-    if forever {
-        emit1(X_JMP, body_l);
-    } else {
-        x_label(cond_l);
-        x_gen_branch(cond, body_l, 0, 1);
-    }
-    x_label(end_l);
+fn x_gen_while(s i64) {
+	let cond = s[WH_COND]
+	let body_l = new_label()
+	let cond_l = new_label()
+	let post_l = new_label()
+	let end_l = new_label()
+	if s[WH_ONCE] != 0 {
+		// A switch: break leaves it, continue goes to the enclosing loop.
+		mut cont = -1
+		if g_loops[VEC_LEN] >= 2 {
+			cont = vec_get(g_loops, g_loops[VEC_LEN] - 2)
+		}
+		vec_push(g_loops, cont)
+		vec_push(g_loops, end_l)
+		x_gen_stmts(s[WH_BODY][BLK_STMTS])
+		g_loops[VEC_LEN] = g_loops[VEC_LEN] - 2
+		x_label(end_l)
+		return
+	}
+	if is_const(cond) != 0 && const_val(cond) == 0 {
+		return
+	}
+	let forever = is_const(cond)
+	mut cont_l = cond_l
+	if s[WH_POST] != 0 {
+		cont_l = post_l
+	} else if forever != 0 {
+		cont_l = body_l
+	}
+	// Rotated loop: the test sits at the bottom, so each iteration takes one branch.
+	if forever == 0 {
+		emit1(X_JMP, cond_l)
+	}
+	x_label(body_l)
+	x_gen_poll()
+	vec_push(g_loops, cont_l)
+	vec_push(g_loops, end_l)
+	x_gen_stmts(s[WH_BODY][BLK_STMTS])
+	g_loops[VEC_LEN] = g_loops[VEC_LEN] - 2
+	x_label(post_l)
+	if s[WH_POST] != 0 {
+		x_gen_stmt(s[WH_POST])
+	}
+	if forever != 0 {
+		emit1(X_JMP, body_l)
+	} else {
+		x_label(cond_l)
+		x_gen_branch(cond, body_l, 0, 1)
+	}
+	x_label(end_l)
 }
 
-fn x_gen_stmts(stmts) {
-    let i = 0;
-    while i < stmts[VEC_LEN] {
-        x_gen_stmt(vec_get(stmts, i));
-        i = i + 1;
-    }
+fn x_gen_stmts(stmts i64) {
+	mut i = 0
+	for i < stmts[VEC_LEN] {
+		x_gen_stmt(vec_get(stmts, i))
+		i = i + 1
+	}
 }
 
-fn x_result_reg(f) {
-    if f[F_RTYPES][VEC_LEN] == 1 && is_float_t(vec_get(f[F_RTYPES], 0)) {
-        return XMM;
-    }
-    return RAX;
+fn x_result_reg(f i64) i64 {
+	if f[F_RTYPES][VEC_LEN] == 1 && is_float_t(vec_get(f[F_RTYPES], 0)) != 0 {
+		return XMM
+	}
+	return RAX
 }
 
-fn x_gen_stmt(s) {
-    let k = s[N_KIND];
-    if k == ST_BLOCK {
-        x_gen_stmts(s[BLK_STMTS]);
-    } else if k == ST_LET {
-        x_assign_local(s[LET_SYM], s[LET_INIT]);
-    } else if k == ST_ASSIGN {
-        x_gen_assign(s);
-    } else if k == ST_EXPR {
-        x_gen_effect(s[ES_X]);
-    } else if k == ST_IF && x_try_if_increment(s) {
-        // The condition flags drive a conditional move of x + 1.
-    } else if k == ST_IF && x_try_select(s) {
-        // Done: both arms computed and picked with cmov.
-    } else if k == ST_IF {
-        let else_l = new_label();
-        x_gen_cond(s[IF_COND], else_l, 0);
-        x_gen_stmts(s[IF_THEN][BLK_STMTS]);
-        if s[IF_ELSE] {
-            let end_l = new_label();
-            emit1(X_JMP, end_l);
-            x_label(else_l);
-            x_gen_stmt(s[IF_ELSE]);
-            x_label(end_l);
-        } else {
-            x_label(else_l);
-        }
-    } else if k == ST_WHILE {
-        x_gen_while(s);
-    } else if k == ST_RETURN {
-        x_gen_return(s);
-    } else if k == ST_BREAK {
-        emit1(X_JMP, vec_get(g_loops, g_loops[VEC_LEN] - 1));
-    } else if k == ST_CONTINUE {
-        // A switch block passes continue on to the loop around it.
-        let i = g_loops[VEC_LEN] - 2;
-        while vec_get(g_loops, i) < 0 {
-            i = i - 2;
-        }
-        emit1(X_JMP, vec_get(g_loops, i));
-    } else if k == ST_CALLMULTI {
-        x_gen_call(s[CM_CALL], 0);
-        let syms = s[CM_SYMS];
-        let i = 0;
-        while i < syms[VEC_LEN] {
-            let sym = vec_get(syms, i);
-            if sym[S_REG] >= 0 {
-                x_mov(sym[S_REG], x_res_reg(i));
-            } else if sym[S_REG] == REG_SLOT {
-                x_slot_store(x_res_reg(i), sym[S_OFF]);
-            }
-            i = i + 1;
-        }
-    }
+fn x_gen_stmt(s i64) {
+	let k = s[N_KIND]
+	if k == ST_BLOCK {
+		x_gen_stmts(s[BLK_STMTS])
+	} else if k == ST_LET {
+		x_assign_local(s[LET_SYM], s[LET_INIT])
+	} else if k == ST_ASSIGN {
+		x_gen_assign(s)
+	} else if k == ST_EXPR {
+		x_gen_effect(s[ES_X])
+	} else if k == ST_IF && x_try_if_increment(s) != 0 {
+		// The condition flags drive a conditional move of x + 1.
+	} else if k == ST_IF && x_try_select(s) != 0 {
+		// Done: both arms computed and picked with cmov.
+	} else if k == ST_IF {
+		let else_l = new_label()
+		x_gen_cond(s[IF_COND], else_l, 0)
+		x_gen_stmts(s[IF_THEN][BLK_STMTS])
+		if s[IF_ELSE] != 0 {
+			let end_l = new_label()
+			emit1(X_JMP, end_l)
+			x_label(else_l)
+			x_gen_stmt(s[IF_ELSE])
+			x_label(end_l)
+		} else {
+			x_label(else_l)
+		}
+	} else if k == ST_WHILE {
+		x_gen_while(s)
+	} else if k == ST_RETURN {
+		x_gen_return(s)
+	} else if k == ST_BREAK {
+		emit1(X_JMP, vec_get(g_loops, g_loops[VEC_LEN] - 1))
+	} else if k == ST_CONTINUE {
+		// A switch block passes continue on to the loop around it.
+		mut i = g_loops[VEC_LEN] - 2
+		for vec_get(g_loops, i) < 0 {
+			i = i - 2
+		}
+		emit1(X_JMP, vec_get(g_loops, i))
+	} else if k == ST_CALLMULTI {
+		x_gen_call(s[CM_CALL], 0)
+		let syms = s[CM_SYMS]
+		mut i = 0
+		for i < syms[VEC_LEN] {
+			let sym = vec_get(syms, i)
+			if sym[S_REG] >= 0 {
+				x_mov(sym[S_REG], x_res_reg(i))
+			} else if sym[S_REG] == REG_SLOT {
+				x_slot_store(x_res_reg(i), sym[S_OFF])
+			}
+			i = i + 1
+		}
+	}
 }
 
 // Several results are pushed in order and popped into rax, rdx, rcx, rsi, rdi, r8, r9, r10
 // (floats as bits); a single result goes to rax or xmm0.
-fn x_gen_return(s) {
-    let f = cur_gen_fn;
-    if s[RET_VALUES] {
-        let vals = s[RET_VALUES];
-        let lanes = vec_new();
-        let nlanes = 0;
-        let i = 0;
-        while i < vals[VEC_LEN] {
-            let v = vec_get(vals, i);
-            vec_push(lanes, nlanes);
-            if is_dyn_value(v[N_TYPE]) {
-                let r0 = treg(0);
-                let r1 = treg(1);
-                x_gen_dyn_pair(v, r0, r1, 0);
-                x_push(r0);
-                x_push(r1);
-                nlanes = nlanes + 2;
-            } else {
-                x_push(x_gen_val(v, 0));
-                nlanes = nlanes + 1;
-            }
-            i = i + 1;
-        }
-        i = vals[VEC_LEN] - 1;
-        while i >= 0 {
-            let v = vec_get(vals, i);
-            let start = vec_get(lanes, i);
-            if is_dyn_value(v[N_TYPE]) {
-                x_pop(x_res_reg(start + 1));
-                x_pop(x_res_reg(start));
-            } else {
-                x_pop(x_res_reg(start));
-            }
-            i = i - 1;
-        }
-    } else if s[RET_VALUE] {
-        if is_dyn_value(s[RET_VALUE][N_TYPE]) {
-            x_gen_dyn_pair(s[RET_VALUE], RAX, RDX, 0);
-        } else {
-            x_gen_to(s[RET_VALUE], x_result_reg(f), 0);
-        }
-    } else {
-        x_load_imm(RAX, 0);
-    }
-    emit1(XP_RET, 0);
+fn x_gen_return(s i64) {
+	let f = cur_gen_fn
+	if s[RET_VALUES] != 0 {
+		let vals = s[RET_VALUES]
+		let lanes = vec_new()
+		mut nlanes = 0
+		mut i = 0
+		for i < vals[VEC_LEN] {
+			let v = vec_get(vals, i)
+			vec_push(lanes, nlanes)
+			if is_dyn_value(v[N_TYPE]) != 0 {
+				let r0 = treg(0)
+				let r1 = treg(1)
+				x_gen_dyn_pair(v, r0, r1, 0)
+				x_push(r0)
+				x_push(r1)
+				nlanes = nlanes + 2
+			} else {
+				x_push(x_gen_val(v, 0))
+				nlanes = nlanes + 1
+			}
+			i = i + 1
+		}
+		i = vals[VEC_LEN] - 1
+		for i >= 0 {
+			let v = vec_get(vals, i)
+			let start = vec_get(lanes, i)
+			if is_dyn_value(v[N_TYPE]) != 0 {
+				x_pop(x_res_reg(start + 1))
+				x_pop(x_res_reg(start))
+			} else {
+				x_pop(x_res_reg(start))
+			}
+			i = i - 1
+		}
+	} else if s[RET_VALUE] != 0 {
+		if is_dyn_value(s[RET_VALUE][N_TYPE]) != 0 {
+			x_gen_dyn_pair(s[RET_VALUE], RAX, RDX, 0)
+		} else {
+			x_gen_to(s[RET_VALUE], x_result_reg(f), 0)
+		}
+	} else {
+		x_load_imm(RAX, 0)
+	}
+	emit1(XP_RET, 0)
 }
 
 // ---- if-conversion ----
-
 // x_gen_flags sets the flags for condition e and returns the condition code meaning true.
-fn x_gen_flags(e, d) {
-    if e[N_KIND] == EX_UNARY && streq(e[UN_OP], "!") {
-        return x_gen_flags(e[UN_X], d) ^ 1;
-    }
-    if e[N_KIND] == EX_SEQ {
-        let i = 0;
-        while i < d {
-            if i < t_count {
-                x_push(vec_get(t_regs, i));
-            }
-            if i < f_count {
-                x_push(vec_get(f_regs, i));
-            }
-            i = i + 1;
-        }
-        x_gen_stmts(e[SEQ_STMTS]);
-        i = d - 1;
-        while i >= 0 {
-            if i < f_count {
-                x_pop(vec_get(f_regs, i));
-            }
-            if i < t_count {
-                x_pop(vec_get(t_regs, i));
-            }
-            i = i - 1;
-        }
-        return x_gen_flags(e[SEQ_VALUE], d);
-    }
-    if e[N_KIND] == EX_BINARY {
-        let cc = x_cond(e[BIN_OP]);
-        if (cc == XC_E || cc == XC_NE) && !e_fp(e[BIN_L]) && is_const(e[BIN_R]) && const_val(e[BIN_R]) == 0 && low_bits_test(e[BIN_L]) > 0 {
-            let l = e[BIN_L];
-            x_test_imm(x_gen_val(l[BIN_L], d), (1 << low_bits_test(l)) - 1);
-            return cc;
-        }
-        if cc >= 0 {
-            x_gen_compare(e, d);
-            return cmp_cc;
-        }
-    }
-    let v = x_gen_val(e, d);
-    emit2(X_TEST, v, v);
-    return XC_NE;
+fn x_gen_flags(e i64, d i64) i64 {
+	if e[N_KIND] == EX_UNARY && streq(e[UN_OP], cstr("!")) != 0 {
+		return x_gen_flags(e[UN_X], d) ^ 1
+	}
+	if e[N_KIND] == EX_SEQ {
+		mut i = 0
+		for i < d {
+			if i < t_count {
+				x_push(vec_get(t_regs, i))
+			}
+			if i < f_count {
+				x_push(vec_get(f_regs, i))
+			}
+			i = i + 1
+		}
+		x_gen_stmts(e[SEQ_STMTS])
+		i = d - 1
+		for i >= 0 {
+			if i < f_count {
+				x_pop(vec_get(f_regs, i))
+			}
+			if i < t_count {
+				x_pop(vec_get(t_regs, i))
+			}
+			i = i - 1
+		}
+		return x_gen_flags(e[SEQ_VALUE], d)
+	}
+	if e[N_KIND] == EX_BINARY {
+		let cc = x_cond(e[BIN_OP])
+		if (cc == XC_E || cc == XC_NE) && e_fp(e[BIN_L]) == 0 && is_const(e[BIN_R]) != 0 && const_val(e[BIN_R]) == 0 && low_bits_test(e[BIN_L]) > 0 {
+			let l = e[BIN_L]
+			x_test_imm(x_gen_val(l[BIN_L], d), (1 << low_bits_test(l)) - 1)
+			return cc
+		}
+		if cc >= 0 {
+			x_gen_compare(e, d)
+			return cmp_cc
+		}
+	}
+	let v = x_gen_val(e, d)
+	emit2(X_TEST, v, v)
+	return XC_NE
 }
 
-fn x_try_if_increment(s) {
-    if x_float_cmp(s[IF_COND]) {
-        return 0;
-    }
-    let a = if_increment_assignment(s);
-    if !a {
-        return 0;
-    }
-    let x = a[AS_TARGET][ID_REF];
-    let cc = x_gen_flags(s[IF_COND], 0);
-    // LEA preserves the flags set by the condition and avoids spilling x + 1 while
-    // compiler-created condition sequences are evaluated.
-    emit2(X_LEA, XSCR, x_mem1(x[S_REG], 1));
-    emit3(X_CMOVCC, x[S_REG], XSCR, cc);
-    return 1;
+fn x_try_if_increment(s i64) i64 {
+	if x_float_cmp(s[IF_COND]) != 0 {
+		return 0
+	}
+	let a = if_increment_assignment(s)
+	if a == 0 {
+		return 0
+	}
+	let x = a[AS_TARGET][ID_REF]
+	let cc = x_gen_flags(s[IF_COND], 0)
+	// LEA preserves the flags set by the condition and avoids spilling x + 1 while
+	// compiler-created condition sequences are evaluated.
+	emit2(X_LEA, XSCR, x_mem1(x[S_REG], 1))
+	emit3(X_CMOVCC, x[S_REG], XSCR, cc)
+	return 1
 }
 
 // x_float_cmp reports whether c (under any number of !) compares floats, which cmov cannot
 // select on because of the unordered case.
-fn x_float_cmp(c) {
-    while c[N_KIND] == EX_UNARY && streq(c[UN_OP], "!") {
-        c = c[UN_X];
-    }
-    if c[N_KIND] == EX_SEQ {
-        return x_float_cmp(c[SEQ_VALUE]);
-    }
-    return c[N_KIND] == EX_BINARY && x_cond(c[BIN_OP]) >= 0 && (e_fp(c[BIN_L]) || e_fp(c[BIN_R]));
+fn x_float_cmp(c_in i64) i64 {
+	mut c = c_in
+	for c[N_KIND] == EX_UNARY && streq(c[UN_OP], cstr("!")) != 0 {
+		c = c[UN_X]
+	}
+	if c[N_KIND] == EX_SEQ {
+		return x_float_cmp(c[SEQ_VALUE])
+	}
+	return i64(c[N_KIND] == EX_BINARY && x_cond(c[BIN_OP]) >= 0 && (e_fp(c[BIN_L]) != 0 || e_fp(c[BIN_R]) != 0))
 }
 
 // x_try_select compiles `if c { x = a; } else { x = b; }` as x = cmov(c, a, b), like
 // Go's branchelim: both values are cheap, so computing both beats a mispredicted branch.
-fn x_try_select(s) {
-    let c = s[IF_COND];
-    if has_effects(c) || contains_call(c) || is_const(c) || e_fp(c) {
-        return 0;
-    }
-    if c[N_KIND] == EX_BINARY && (streq(c[BIN_OP], "&&") || streq(c[BIN_OP], "||")) {
-        return 0;
-    }
-    if x_float_cmp(c) {
-        return 0;
-    }
-    let ta = single_reg_assign(s[IF_THEN]);
-    if !ta {
-        return 0;
-    }
-    let x = ta[AS_TARGET][ID_REF];
-    if is_fp(x[S_REG]) {
-        return 0;
-    }
-    let fb = 0;
-    if s[IF_ELSE] {
-        if s[IF_ELSE][N_KIND] != ST_BLOCK {
-            return 0;
-        }
-        fb = single_reg_assign(s[IF_ELSE]);
-        if !fb || fb[AS_TARGET][ID_REF] != x {
-            return 0;
-        }
-    }
-    if op_cost(ta[AS_VALUE]) > 6 || (fb && op_cost(fb[AS_VALUE]) > 6) || t_count < 4 || f_count < 4 {
-        return 0;
-    }
-    let a = x_gen_val(ta[AS_VALUE], 0);
-    let d = next_depth(a, 0);
-    let b = x[S_REG];
-    if fb {
-        b = x_gen_val(fb[AS_VALUE], d);
-        d = next_depth(b, d);
-    }
-    let cc = x_gen_flags(c, d);
-    let xr = x[S_REG];
-    if xr == a {
-        emit3(X_CMOVCC, xr, b, cc ^ 1);
-    } else if xr == b {
-        emit3(X_CMOVCC, xr, a, cc);
-    } else {
-        emit2(X_MOV_RR, xr, b);
-        emit3(X_CMOVCC, xr, a, cc);
-    }
-    return 1;
+fn x_try_select(s i64) i64 {
+	let c = s[IF_COND]
+	if has_effects(c) != 0 || contains_call(c) != 0 || is_const(c) != 0 || e_fp(c) != 0 {
+		return 0
+	}
+	if c[N_KIND] == EX_BINARY && (streq(c[BIN_OP], cstr("&&")) != 0 || streq(c[BIN_OP], cstr("||")) != 0) {
+		return 0
+	}
+	if x_float_cmp(c) != 0 {
+		return 0
+	}
+	let ta = single_reg_assign(s[IF_THEN])
+	if ta == 0 {
+		return 0
+	}
+	let x = ta[AS_TARGET][ID_REF]
+	if is_fp(x[S_REG]) != 0 {
+		return 0
+	}
+	mut fb = 0
+	if s[IF_ELSE] != 0 {
+		if s[IF_ELSE][N_KIND] != ST_BLOCK {
+			return 0
+		}
+		fb = single_reg_assign(s[IF_ELSE])
+		if fb == 0 || fb[AS_TARGET][ID_REF] != x {
+			return 0
+		}
+	}
+	if op_cost(ta[AS_VALUE]) > 6 || (fb != 0 && op_cost(fb[AS_VALUE]) > 6) || t_count < 4 || f_count < 4 {
+		return 0
+	}
+	let a = x_gen_val(ta[AS_VALUE], 0)
+	mut d = next_depth(a, 0)
+	mut b = x[S_REG]
+	if fb != 0 {
+		b = x_gen_val(fb[AS_VALUE], d)
+		d = next_depth(b, d)
+	}
+	let cc = x_gen_flags(c, d)
+	let xr = x[S_REG]
+	if xr == a {
+		emit3(X_CMOVCC, xr, b, cc ^ 1)
+	} else if xr == b {
+		emit3(X_CMOVCC, xr, a, cc)
+	} else {
+		emit2(X_MOV_RR, xr, b)
+		emit3(X_CMOVCC, xr, a, cc)
+	}
+	return 1
 }
 
 // ---- functions ----
-
 // x_par_move performs the moves dsts[i] = srcs[i] in parallel: a destination is written
 // only once no pending move still reads it, and a cycle is broken through a scratch register.
-fn x_par_move(dsts, srcs) {
-    let n = dsts[VEC_LEN];
-    let done = vec_filled(n, 0);
-    let left = n;
-    while left > 0 {
-        let progress = 0;
-        let i = 0;
-        while i < n {
-            if !vec_get(done, i) {
-                let dst = vec_get(dsts, i);
-                if dst == vec_get(srcs, i) || !x_pending_src(srcs, done, dst) {
-                    x_mov(dst, vec_get(srcs, i));
-                    done[VEC_DATA][i] = 1;
-                    left = left - 1;
-                    progress = 1;
-                }
-            }
-            i = i + 1;
-        }
-        if left > 0 && !progress {
-            i = 0;
-            while vec_get(done, i) {
-                i = i + 1;
-            }
-            let blocked = vec_get(dsts, i);
-            let scr = XSCR;
-            if is_fp(blocked) {
-                scr = XFSCR;
-            }
-            x_mov(scr, blocked);
-            let j = 0;
-            while j < n {
-                if !vec_get(done, j) && vec_get(srcs, j) == blocked {
-                    srcs[VEC_DATA][j] = scr;
-                }
-                j = j + 1;
-            }
-        }
-    }
+fn x_par_move(dsts i64, srcs i64) {
+	let n = dsts[VEC_LEN]
+	let done = vec_filled(n, 0)
+	mut left = n
+	for left > 0 {
+		mut progress = 0
+		mut i = 0
+		for i < n {
+			if vec_get(done, i) == 0 {
+				let dst = vec_get(dsts, i)
+				if dst == vec_get(srcs, i) || x_pending_src(srcs, done, dst) == 0 {
+					x_mov(dst, vec_get(srcs, i))
+					done[VEC_DATA][i] = 1
+					left = left - 1
+					progress = 1
+				}
+			}
+			i = i + 1
+		}
+		if left > 0 && progress == 0 {
+			i = 0
+			for vec_get(done, i) != 0 {
+				i = i + 1
+			}
+			let blocked = vec_get(dsts, i)
+			mut scr = XSCR
+			if is_fp(blocked) != 0 {
+				scr = XFSCR
+			}
+			x_mov(scr, blocked)
+			mut j = 0
+			for j < n {
+				if vec_get(done, j) == 0 && vec_get(srcs, j) == blocked {
+					srcs[VEC_DATA][j] = scr
+				}
+				j = j + 1
+			}
+		}
+	}
 }
 
-fn x_pending_src(srcs, done, r) {
-    let j = 0;
-    while j < srcs[VEC_LEN] {
-        if !vec_get(done, j) && vec_get(srcs, j) == r {
-            return 1;
-        }
-        j = j + 1;
-    }
-    return 0;
+fn x_pending_src(srcs i64, done i64, r i64) i64 {
+	mut j = 0
+	for j < srcs[VEC_LEN] {
+		if vec_get(done, j) == 0 && vec_get(srcs, j) == r {
+			return 1
+		}
+		j = j + 1
+	}
+	return 0
 }
 
 // A non-leaf function can use caller-saved XMM homes when its calls stay outside loops.
 // x_save_temps preserves those homes around each call; keeping calls out of loops avoids
 // adding spills to a hot iteration.
-fn x_stmts_calls_in_loop(stmts) {
-    let i = 0;
-    while i < stmts[VEC_LEN] {
-        if x_stmt_calls_in_loop(vec_get(stmts, i)) {
-            return 1;
-        }
-        i = i + 1;
-    }
-    return 0;
+fn x_stmts_calls_in_loop(stmts i64) i64 {
+	mut i = 0
+	for i < stmts[VEC_LEN] {
+		if x_stmt_calls_in_loop(vec_get(stmts, i)) != 0 {
+			return 1
+		}
+		i = i + 1
+	}
+	return 0
 }
 
-fn x_stmt_calls_in_loop(s) {
-    if !s {
-        return 0;
-    }
-    let k = s[N_KIND];
-    if k == ST_BLOCK {
-        return x_stmts_calls_in_loop(s[BLK_STMTS]);
-    }
-    if k == ST_IF {
-        return x_stmt_calls_in_loop(s[IF_THEN]) || x_stmt_calls_in_loop(s[IF_ELSE]);
-    }
-    if k == ST_WHILE {
-        return stmt_has_call(s);
-    }
-    return 0;
+fn x_stmt_calls_in_loop(s i64) i64 {
+	if s == 0 {
+		return 0
+	}
+	let k = s[N_KIND]
+	if k == ST_BLOCK {
+		return x_stmts_calls_in_loop(s[BLK_STMTS])
+	}
+	if k == ST_IF {
+		return i64(x_stmt_calls_in_loop(s[IF_THEN]) != 0 || x_stmt_calls_in_loop(s[IF_ELSE]) != 0)
+	}
+	if k == ST_WHILE {
+		return stmt_has_call(s)
+	}
+	return 0
 }
 
 // x_assign_homes gives each local a register or frame slot and builds the temp pools.
 // It returns the number of frame slots.
-fn x_assign_homes(f) {
-    let locals = f[F_LOCALS];
-    let leaf = f[F_LEAF];
-    let fp_homes = leaf || !x_stmts_calls_in_loop(f[F_BODY][BLK_STMTS]);
-    let pool = vec_new();
-    vec_push(pool, RBX);
-    vec_push(pool, R12);
-    vec_push(pool, R13);
-    vec_push(pool, R14);
-    let fpool = vec_new();
-    let r = 8;
-    while fp_homes && r <= 14 {
-        vec_push(fpool, XMM + r);
-        r = r + 1;
-    }
-    let nslots = 0;
-    let i = 0;
-    while i < locals[VEC_LEN] {
-        let s = vec_get(locals, i);
-        s[S_REG] = REG_DEAD;
-        if is_dyn_value(s[S_TYPE]) {
-            s[S_ADDR] = 1;
-            s[S_WORDS] = 2;
-        }
-        if s[S_ADDR] {
-            s[S_REG] = REG_SLOT;
-            let nw = 1;
-            if s[S_WORDS] > 1 {
-                nw = s[S_WORDS];
-            }
-            nslots = nslots + nw;
-            s[S_OFF] = -8 * nslots;
-        }
-        i = i + 1;
-    }
-    // Hand out registers by descending loop-weighted use count.
-    let next = 0;
-    let fnext = 0;
-    while 1 {
-        let best = 0;
-        i = 0;
-        while i < locals[VEC_LEN] {
-            let c = vec_get(locals, i);
-            if c[S_REG] == REG_DEAD && c[S_USES] > 0 && (!best || c[S_USES] > best[S_USES]) {
-                best = c;
-            }
-            i = i + 1;
-        }
-        if !best {
-            break;
-        }
-        if is_float_t(best[S_TYPE]) && fnext < fpool[VEC_LEN] {
-            best[S_REG] = vec_get(fpool, fnext);
-            used_fregs = used_fregs | (1 << (best[S_REG] - XMM));
-            fnext = fnext + 1;
-        } else if !is_float_t(best[S_TYPE]) && next < pool[VEC_LEN] {
-            best[S_REG] = vec_get(pool, next);
-            used_regs = used_regs | (1 << best[S_REG]);
-            next = next + 1;
-        } else {
-            best[S_REG] = REG_SLOT;
-            best[S_OFF] = -8 - 8 * nslots;
-            nslots = nslots + 1;
-        }
-    }
-    // Leftover callee-saved registers survive calls for free; caller-saved ones cost
-    // nothing in the prologue. Prefer whichever this function needs.
-    let cross = !leaf && stmts_cross_calls(f[F_BODY][BLK_STMTS]);
-    t_regs = vec_new();
-    f_regs = vec_new();
-    if cross {
-        while next < pool[VEC_LEN] {
-            vec_push(t_regs, vec_get(pool, next));
-            next = next + 1;
-        }
-    }
-    vec_push(t_regs, RSI);
-    vec_push(t_regs, RDI);
-    vec_push(t_regs, R8);
-    vec_push(t_regs, R9);
-    vec_push(t_regs, R10);
-    while next < pool[VEC_LEN] {
-        vec_push(t_regs, vec_get(pool, next));
-        next = next + 1;
-    }
-    r = 1;
-    while r <= 7 {
-        vec_push(f_regs, XMM + r);
-        r = r + 1;
-    }
-    if fp_homes {
-        while fnext < fpool[VEC_LEN] {
-            vec_push(f_regs, vec_get(fpool, fnext));
-            fnext = fnext + 1;
-        }
-    } else {
-        r = 8;
-        while r <= 14 {
-            vec_push(f_regs, XMM + r);
-            r = r + 1;
-        }
-    }
-    t_count = t_regs[VEC_LEN];
-    f_count = f_regs[VEC_LEN];
-    return nslots;
+fn x_assign_homes(f i64) i64 {
+	let locals = f[F_LOCALS]
+	let leaf = f[F_LEAF]
+	let fp_homes = i64(leaf != 0 || x_stmts_calls_in_loop(f[F_BODY][BLK_STMTS]) == 0)
+	let pool = vec_new()
+	vec_push(pool, RBX)
+	vec_push(pool, R12)
+	vec_push(pool, R13)
+	vec_push(pool, R14)
+	let fpool = vec_new()
+	mut r = 8
+	for fp_homes != 0 && r <= 14 {
+		vec_push(fpool, XMM + r)
+		r = r + 1
+	}
+	mut nslots = 0
+	mut i = 0
+	for i < locals[VEC_LEN] {
+		let s = vec_get(locals, i)
+		s[S_REG] = REG_DEAD
+		if is_dyn_value(s[S_TYPE]) != 0 {
+			s[S_ADDR] = 1
+			s[S_WORDS] = 2
+		}
+		if s[S_ADDR] != 0 {
+			s[S_REG] = REG_SLOT
+			mut nw = 1
+			if s[S_WORDS] > 1 {
+				nw = s[S_WORDS]
+			}
+			nslots = nslots + nw
+			s[S_OFF] = -8 * nslots
+		}
+		i = i + 1
+	}
+	// Hand out registers by descending loop-weighted use count.
+	mut next = 0
+	mut fnext = 0
+	for {
+		mut best = 0
+		i = 0
+		for i < locals[VEC_LEN] {
+			let c = vec_get(locals, i)
+			if c[S_REG] == REG_DEAD && c[S_USES] > 0 && (best == 0 || c[S_USES] > best[S_USES]) {
+				best = c
+			}
+			i = i + 1
+		}
+		if best == 0 {
+			break
+		}
+		if is_float_t(best[S_TYPE]) != 0 && fnext < fpool[VEC_LEN] {
+			best[S_REG] = vec_get(fpool, fnext)
+			used_fregs = used_fregs | (1 << (best[S_REG] - XMM))
+			fnext = fnext + 1
+		} else if is_float_t(best[S_TYPE]) == 0 && next < pool[VEC_LEN] {
+			best[S_REG] = vec_get(pool, next)
+			used_regs = used_regs | (1 << best[S_REG])
+			next = next + 1
+		} else {
+			best[S_REG] = REG_SLOT
+			best[S_OFF] = -8 - 8 * nslots
+			nslots = nslots + 1
+		}
+	}
+	// Leftover callee-saved registers survive calls for free; caller-saved ones cost
+	// nothing in the prologue. Prefer whichever this function needs.
+	let cross = i64(leaf == 0 && stmts_cross_calls(f[F_BODY][BLK_STMTS]) != 0)
+	t_regs = vec_new()
+	f_regs = vec_new()
+	if cross != 0 {
+		for next < pool[VEC_LEN] {
+			vec_push(t_regs, vec_get(pool, next))
+			next = next + 1
+		}
+	}
+	vec_push(t_regs, RSI)
+	vec_push(t_regs, RDI)
+	vec_push(t_regs, R8)
+	vec_push(t_regs, R9)
+	vec_push(t_regs, R10)
+	for next < pool[VEC_LEN] {
+		vec_push(t_regs, vec_get(pool, next))
+		next = next + 1
+	}
+	r = 1
+	for r <= 7 {
+		vec_push(f_regs, XMM + r)
+		r = r + 1
+	}
+	if fp_homes != 0 {
+		for fnext < fpool[VEC_LEN] {
+			vec_push(f_regs, vec_get(fpool, fnext))
+			fnext = fnext + 1
+		}
+	} else {
+		r = 8
+		for r <= 14 {
+			vec_push(f_regs, XMM + r)
+			r = r + 1
+		}
+	}
+	t_count = t_regs[VEC_LEN]
+	f_count = f_regs[VEC_LEN]
+	return nslots
 }
 
 // x_entry_moves moves the parameters from their argument registers (or stack slots at
 // [rbp + 16 + 8k]) into their homes; register moves run in parallel.
-fn x_entry_moves(f) {
-    let locals = f[F_LOCALS];
-    let dsts = vec_new();
-    let srcs = vec_new();
-    let stack_syms = vec_new();
-    let ni = 0;
-    let nf = 0;
-    x_nstack = 0;
-    let i = 0;
-    while i < f[F_PARAMS][VEC_LEN] {
-        let s = vec_get(locals, i);
-        let pt = vec_get(f[F_PTYPES], i);
-        if is_dyn_value(pt) {
-            if ni + 1 < 6 {
-                let r0 = x_int_arg(ni);
-                let r1 = x_int_arg(ni + 1);
-                ni = ni + 2;
-                if s[S_REG] == REG_SLOT {
-                    x_slot_store(r0, s[S_OFF]);
-                    x_slot_store(r1, s[S_OFF] + 8);
-                } else {
-                    err_code_at(s[S_POS], "E990 INTERNAL", "dyn parameter is not in a two-word frame slot");
-                }
-            } else {
-                ni = 6;
-                x_nstack = align_up(x_nstack, 2);
-                x_slot_load(XSCR, 16 + 8 * x_nstack);
-                x_slot_load(XSCR2, 24 + 8 * x_nstack);
-                if s[S_REG] == REG_SLOT {
-                    x_slot_store(XSCR, s[S_OFF]);
-                    x_slot_store(XSCR2, s[S_OFF] + 8);
-                } else {
-                    err_code_at(s[S_POS], "E990 INTERNAL", "dyn parameter is not in a two-word frame slot");
-                }
-                x_nstack = x_nstack + 2;
-            }
-            i = i + 1;
-            continue;
-        }
-        let src = -1;
-        if is_float_t(pt) {
-            if nf < 8 {
-                src = XMM + nf;
-            }
-            nf = nf + 1;
-        } else {
-            if ni < 6 {
-                src = x_int_arg(ni);
-            }
-            ni = ni + 1;
-        }
-        if src < 0 {
-            vec_push(stack_syms, s);
-            vec_push(stack_syms, 16 + 8 * x_nstack);
-            x_nstack = x_nstack + 1;
-        } else if s[S_REG] >= 0 {
-            vec_push(dsts, s[S_REG]);
-            vec_push(srcs, src);
-        } else if s[S_REG] == REG_SLOT {
-            x_slot_store(src, s[S_OFF]);
-        }
-        i = i + 1;
-    }
-    x_par_move(dsts, srcs);
-    i = 0;
-    while i < stack_syms[VEC_LEN] {
-        let s = vec_get(stack_syms, i);
-        let off = vec_get(stack_syms, i + 1);
-        if s[S_REG] >= 0 {
-            x_slot_load(s[S_REG], off);
-        } else if s[S_REG] == REG_SLOT {
-            x_slot_load(XSCR, off);
-            x_slot_store(XSCR, s[S_OFF]);
-        }
-        i = i + 2;
-    }
-    if f[F_ENV_SYM] {
-        let es = f[F_ENV_SYM];
-        if es[S_REG] >= 0 {
-            x_mov(es[S_REG], R11);
-        } else if es[S_REG] == REG_SLOT {
-            x_slot_store(R11, es[S_OFF]);
-        }
-    }
+fn x_entry_moves(f i64) {
+	let locals = f[F_LOCALS]
+	let dsts = vec_new()
+	let srcs = vec_new()
+	let stack_syms = vec_new()
+	mut ni = 0
+	mut nf = 0
+	x_nstack = 0
+	mut i = 0
+	for i < f[F_PARAMS][VEC_LEN] {
+		let s = vec_get(locals, i)
+		let pt = vec_get(f[F_PTYPES], i)
+		if is_dyn_value(pt) != 0 {
+			if ni + 1 < 6 {
+				let r0 = x_int_arg(ni)
+				let r1 = x_int_arg(ni + 1)
+				ni = ni + 2
+				if s[S_REG] == REG_SLOT {
+					x_slot_store(r0, s[S_OFF])
+					x_slot_store(r1, s[S_OFF] + 8)
+				} else {
+					err_code_at(s[S_POS], cstr("E990 INTERNAL"), cstr("dyn parameter is not in a two-word frame slot"))
+				}
+			} else {
+				ni = 6
+				x_nstack = align_up(x_nstack, 2)
+				x_slot_load(XSCR, 16 + 8 * x_nstack)
+				x_slot_load(XSCR2, 24 + 8 * x_nstack)
+				if s[S_REG] == REG_SLOT {
+					x_slot_store(XSCR, s[S_OFF])
+					x_slot_store(XSCR2, s[S_OFF] + 8)
+				} else {
+					err_code_at(s[S_POS], cstr("E990 INTERNAL"), cstr("dyn parameter is not in a two-word frame slot"))
+				}
+				x_nstack = x_nstack + 2
+			}
+			i = i + 1
+			continue
+		}
+		mut src = -1
+		if is_float_t(pt) != 0 {
+			if nf < 8 {
+				src = XMM + nf
+			}
+			nf = nf + 1
+		} else {
+			if ni < 6 {
+				src = x_int_arg(ni)
+			}
+			ni = ni + 1
+		}
+		if src < 0 {
+			vec_push(stack_syms, s)
+			vec_push(stack_syms, 16 + 8 * x_nstack)
+			x_nstack = x_nstack + 1
+		} else if s[S_REG] >= 0 {
+			vec_push(dsts, s[S_REG])
+			vec_push(srcs, src)
+		} else if s[S_REG] == REG_SLOT {
+			x_slot_store(src, s[S_OFF])
+		}
+		i = i + 1
+	}
+	x_par_move(dsts, srcs)
+	i = 0
+	for i < stack_syms[VEC_LEN] {
+		let s = vec_get(stack_syms, i)
+		let off = vec_get(stack_syms, i + 1)
+		if s[S_REG] >= 0 {
+			x_slot_load(s[S_REG], off)
+		} else if s[S_REG] == REG_SLOT {
+			x_slot_load(XSCR, off)
+			x_slot_store(XSCR, s[S_OFF])
+		}
+		i = i + 2
+	}
+	if f[F_ENV_SYM] != 0 {
+		let es = f[F_ENV_SYM]
+		if es[S_REG] >= 0 {
+			x_mov(es[S_REG], R11)
+		} else if es[S_REG] == REG_SLOT {
+			x_slot_store(R11, es[S_OFF])
+		}
+	}
 }
 
 // rt_task_swap(from rdi, to rsi): store rbx, rbp, r12-r14 and rsp at from, load them from
 // to, and return on the other stack (r15, the core context, is the same on both).
-fn x_task_swap_bytes() {
-    let hex = "48891f48896f084c8967104c896f184c89772048896728488b1e488b6e084c8b66104c8b6e184c8b7620488b6628c3";
-    let v = vec_new();
-    let i = 0;
-    while load8(hex + i) != 0 {
-        let hi = load8(hex + i) - '0';
-        if load8(hex + i) >= 'a' {
-            hi = load8(hex + i) - 'a' + 10;
-        }
-        let lo = load8(hex + i + 1) - '0';
-        if load8(hex + i + 1) >= 'a' {
-            lo = load8(hex + i + 1) - 'a' + 10;
-        }
-        vec_push(v, hi * 16 + lo);
-        i = i + 2;
-    }
-    return v;
+fn x_task_swap_bytes() i64 {
+	let hex = cstr("48891f48896f084c8967104c896f184c89772048896728488b1e488b6e084c8b66104c8b6e184c8b7620488b6628c3")
+	let v = vec_new()
+	mut i = 0
+	for i64(load8(hex + i)) != 0 {
+		mut hi = i64(load8(hex + i)) - '0'
+		if i64(load8(hex + i)) >= 'a' {
+			hi = i64(load8(hex + i)) - 'a' + 10
+		}
+		mut lo = i64(load8(hex + i + 1)) - '0'
+		if i64(load8(hex + i + 1)) >= 'a' {
+			lo = i64(load8(hex + i + 1)) - 'a' + 10
+		}
+		vec_push(v, hi * 16 + lo)
+		i = i + 2
+	}
+	return v
 }
 
 // REP bulk memory loops preserve all callee-saved registers and r15.
-fn x_memory_bytes(fill) {
-    let hex="4889d148c1e106f3a4c3";
-    if fill { hex="4889f04889d148c1e106f3aac3"; }
-    let v=vec_new(); let i=0;
-    while load8(hex+i) != 0 {
-        vec_push(v,num_digit(load8(hex+i))*16+num_digit(load8(hex+i+1)));
-        i=i+2;
-    }
-    return v;
+fn x_memory_bytes(fill i64) i64 {
+	mut hex = cstr("4889d148c1e106f3a4c3")
+	if fill != 0 {
+		hex = cstr("4889f04889d148c1e106f3aac3")
+	}
+	let v = vec_new()
+	mut i = 0
+	for i64(load8(hex + i)) != 0 {
+		vec_push(v, num_digit(i64(load8(hex + i))) * 16 + num_digit(i64(load8(hex + i + 1))))
+		i = i + 2
+	}
+	return v
 }
 
-fn x_syscall_bytes(restorer) {
-    let hex="4889f84889f74889d64889ca4d89c24d89c84c8b4c24080f05c3";
-    if restorer { hex="48c7c00f0000000f05"; }
-    let v=vec_new(); let i=0;
-    while load8(hex+i) != 0 {
-        vec_push(v,num_digit(load8(hex+i))*16+num_digit(load8(hex+i+1)));
-        i=i+2;
-    }
-    return v;
+fn x_syscall_bytes(restorer i64) i64 {
+	mut hex = cstr("4889f84889f74889d64889ca4d89c24d89c84c8b4c24080f05c3")
+	if restorer != 0 {
+		hex = cstr("48c7c00f0000000f05")
+	}
+	let v = vec_new()
+	mut i = 0
+	for i64(load8(hex + i)) != 0 {
+		vec_push(v, num_digit(i64(load8(hex + i))) * 16 + num_digit(i64(load8(hex + i + 1))))
+		i = i + 2
+	}
+	return v
 }
 
 // x_gen_poll is the r15 context load and cold, normally untaken branch.
 fn x_gen_poll() {
-    if !fn_polls(cur_gen_fn) { return; }
-    let slow = new_label();
-    let resume = new_label();
-    x_ld(XSCR, x_mem1(R15, 96), 3);
-    emit2(X_TEST, XSCR, XSCR);
-    emit2(X_JCC, XC_NE, slow);
-    x_label(resume);
-    vec_push(poll_sites, slow);
-    vec_push(poll_sites, resume);
+	if fn_polls(cur_gen_fn) == 0 {
+		return
+	}
+	let slow = new_label()
+	let resume = new_label()
+	x_ld(XSCR, x_mem1(R15, 96), 3)
+	emit2(X_TEST, XSCR, XSCR)
+	emit2(X_JCC, XC_NE, slow)
+	x_label(resume)
+	vec_push(poll_sites, slow)
+	vec_push(poll_sites, resume)
 }
 
 // x_gen_poll_stubs realigns even frameless leaves and preserves their register homes.
 fn x_gen_poll_stubs() {
-    let f = find_fn("rt_bnd_poll");
-    let i = 0;
-    while i < poll_sites[VEC_LEN] {
-        x_label(vec_get(poll_sites, i));
-        let r = 0;
-        while r < 16 {
-            if x_caller_saved(r) && r != RSP { emit1(X_PUSH, r); }
-            r = r+1;
-        }
-        x_mov(XSCR, RSP);
-        emit2(X_ANDI, RSP, -16);
-        emit2(X_SUBI, RSP, 144);
-        x_st(XSCR, x_mem1(RSP, 128), 3);
-        r = 0;
-        while r < 16 { emit2(X_MOVSD_ST, FPR+r, x_mem1(RSP, 8*r)); r = r+1; }
-        emit1(X_CALL, x_sym(SK_FN, f[F_INDEX]));
-        r = 0;
-        while r < 16 { emit2(X_MOVSD_LD, FPR+r, x_mem1(RSP, 8*r)); r = r+1; }
-        x_ld(RSP, x_mem1(RSP, 128), 3);
-        r = 15;
-        while r >= 0 {
-            if x_caller_saved(r) && r != RSP { emit1(X_POP, r); }
-            r = r-1;
-        }
-        emit1(X_JMP, vec_get(poll_sites, i+1));
-        i = i+2;
-    }
+	let f = find_fn(cstr("rt_bnd_poll"))
+	mut i = 0
+	for i < poll_sites[VEC_LEN] {
+		x_label(vec_get(poll_sites, i))
+		mut r = 0
+		for r < 16 {
+			if x_caller_saved(r) != 0 && r != RSP {
+				emit1(X_PUSH, r)
+			}
+			r = r + 1
+		}
+		x_mov(XSCR, RSP)
+		emit2(X_ANDI, RSP, -16)
+		emit2(X_SUBI, RSP, 144)
+		x_st(XSCR, x_mem1(RSP, 128), 3)
+		r = 0
+		for r < 16 {
+			emit2(X_MOVSD_ST, FPR + r, x_mem1(RSP, 8 * r))
+			r = r + 1
+		}
+		emit1(X_CALL, x_sym(SK_FN, f[F_INDEX]))
+		r = 0
+		for r < 16 {
+			emit2(X_MOVSD_LD, FPR + r, x_mem1(RSP, 8 * r))
+			r = r + 1
+		}
+		x_ld(RSP, x_mem1(RSP, 128), 3)
+		r = 15
+		for r >= 0 {
+			if x_caller_saved(r) != 0 && r != RSP {
+				emit1(X_POP, r)
+			}
+			r = r - 1
+		}
+		emit1(X_JMP, vec_get(poll_sites, i + 1))
+		i = i + 2
+	}
 }
 
-fn x_gen_fn(f) {
-    if tgt_linux && any_v2 {
-        let bytes=syscall_fast_amd64(f[F_QNAME]);
-        if bytes != 0 {
-            x_out4(X_LABEL,vec_get(x_fn_labels,f[F_INDEX]),0,0,0);
-            if streq(f[F_QNAME],"rt_sys_clock_gettime") {
-                let s=lookup_global("rtVdsoClock");
-                x_out4(X_LOAD,RDX,x64_mem_sym(x_sym(SK_VAR,s[S_INDEX])),3,0);
-            }
-            let i=0;
-            while i < bytes[VEC_LEN] { x_out4(X_RAWB,vec_get(bytes,i),0,0,0); i=i+1; }
-            return;
-        }
-    }
-    if streq(f[F_QNAME],"memcpy") || streq(f[F_QNAME],"memmove") || streq(f[F_QNAME],"memset") || streq(f[F_QNAME],"memcmp") || streq(f[F_QNAME],"memchr") || streq(f[F_QNAME],"mem_avx2_supported") {
-        x_out4(X_LABEL,vec_get(x_fn_labels,f[F_INDEX]),0,0,0);
-        let bs=memory_fast_amd64(f[F_QNAME]); let i=0;
-        while i < bs[VEC_LEN] { x_out4(X_RAWB,vec_get(bs,i),0,0,0); i=i+1; }
-        return;
-    }
+fn x_gen_fn(f i64) {
+	if tgt_linux != 0 && any_v2 != 0 {
+		let bytes = syscall_fast_amd64(f[F_QNAME])
+		if bytes != 0 {
+			x_out4(X_LABEL, vec_get(x_fn_labels, f[F_INDEX]), 0, 0, 0)
+			if streq(f[F_QNAME], cstr("rt_sys_clock_gettime")) != 0 {
+				let s = lookup_global(cstr("rtVdsoClock"))
+				x_out4(X_LOAD, RDX, x64_mem_sym(x_sym(SK_VAR, s[S_INDEX])), 3, 0)
+			}
+			mut i = 0
+			for i < bytes[VEC_LEN] {
+				x_out4(X_RAWB, vec_get(bytes, i), 0, 0, 0)
+				i = i + 1
+			}
+			return
+		}
+	}
+	if streq(f[F_QNAME], cstr("memcpy")) != 0 || streq(f[F_QNAME], cstr("memmove")) != 0 || streq(f[F_QNAME], cstr("memset")) != 0 || streq(f[F_QNAME], cstr("memcmp")) != 0 || streq(f[F_QNAME], cstr("memchr")) != 0 || streq(f[F_QNAME], cstr("mem_avx2_supported")) != 0 {
+		x_out4(X_LABEL, vec_get(x_fn_labels, f[F_INDEX]), 0, 0, 0)
+		let bs = memory_fast_amd64(f[F_QNAME])
+		mut i = 0
+		for i < bs[VEC_LEN] {
+			x_out4(X_RAWB, vec_get(bs, i), 0, 0, 0)
+			i = i + 1
+		}
+		return
+	}
 
-    if tgt_linux && (streq(f[F_QNAME],"linux_raw") || streq(f[F_QNAME],"linux_restorer")) {
-        x_out4(X_LABEL,vec_get(x_fn_labels,f[F_INDEX]),0,0,0);
-        let bs=x_syscall_bytes(streq(f[F_QNAME],"linux_restorer"));
-        let i=0;
-        while i < bs[VEC_LEN] { x_out4(X_RAWB,vec_get(bs,i),0,0,0); i=i+1; }
-        return;
-    }
-    if streq(f[F_QNAME],"mem_copy64") || streq(f[F_QNAME],"mem_fill64") {
-        x_out4(X_LABEL,vec_get(x_fn_labels,f[F_INDEX]),0,0,0);
-        let bs=x_memory_bytes(streq(f[F_QNAME],"mem_fill64"));
-        let i=0;
-        while i < bs[VEC_LEN] { x_out4(X_RAWB,vec_get(bs,i),0,0,0); i=i+1; }
-        return;
-    }
-    if aes_hw_amd64(f[F_QNAME]) {
-        x_out4(X_LABEL, vec_get(x_fn_labels, f[F_INDEX]), 0, 0, 0);
-        let bs = aes_hw_amd64(f[F_QNAME]);
-        let i = 0;
-        while i < bs[VEC_LEN] {
-            x_out4(X_RAWB, vec_get(bs, i), 0, 0, 0);
-            i = i + 1;
-        }
-        return;
-    }
-    if streq(f[F_QNAME], "rt_task_swap") {
-        x_out4(X_LABEL, vec_get(x_fn_labels, f[F_INDEX]), 0, 0, 0);
-        let bs = x_task_swap_bytes();
-        let i = 0;
-        while i < bs[VEC_LEN] {
-            x_out4(X_RAWB, vec_get(bs, i), 0, 0, 0);
-            i = i + 1;
-        }
-        return;
-    }
-    cur_gen_fn = f;
-    trap_label = 0;
-    x_div_label = 0;
-    trap_sites = vec_new();
-    poll_sites = vec_new();
-    if host_getenv("TINC_TRACE") {
-        let tb = buf_new();
-        buf_str(tb, "gen ");
-        buf_str(tb, f[F_QNAME]);
-        buf_byte(tb, '\n');
-        write_all(2, tb);
-    }
-    inline_appends(f);
-    licm_fn(f);
-    analyze_fn(f);
-    used_regs = 0;
-    used_fregs = 0;
-    g_loops[VEC_LEN] = 0;
-    let nslots = x_assign_homes(f);
-    cg = vec_new();
-    x_entry_moves(f);
-    if f == entry_fn() {
-        let di = 0;
-        while di < prog_fns[VEC_LEN] {
-            let df = vec_get(prog_fns, di);
-            if !df[F_EXTERN] && df[F_REACH] {
-                emit2(X_LEA, RAX, x64_mem_sym(x_sym(SK_FN, di)));
-                emit2(X_LEA, RDX, x64_mem_sym(x_sym(SK_FNDESC, di)));
-                x_st(RAX, x_mem1(RDX, 0), 3);
-            }
-            di = di + 1;
-        }
-        x_gen_dyn_table_init();
-    }
-    x_gen_poll();
-    let stmts = f[F_BODY][BLK_STMTS];
-    let i = 0;
-    while i < stmts[VEC_LEN] {
-        x_gen_stmt(vec_get(stmts, i));
-        i = i + 1;
-    }
-    x_load_imm(RAX, 0);
-    emit1(XP_RET, 0);
-    if trap_label {
-        // The cold path every failed bounds check jumps to.
-        x_label(trap_label);
-        let bf = find_fn("rt_bounds_fail");
-        if bf {
-            emit1(X_CALL, x_sym(SK_FN, bf[F_INDEX]));
-            bf[F_USED] = 1;
-        }
-    }
-    if x_div_label {
-        // The cold path every zero divisor in strict code jumps to (realigned like the stubs below).
-        x_label(x_div_label);
-        emit2(X_ANDI, RSP, -16);
-        let df = find_fn("rt_div_fail");
-        if df {
-            emit1(X_CALL, x_sym(SK_FN, df[F_INDEX]));
-            df[F_USED] = 1;
-        }
-    }
-    // Per-site stubs: the index and length go through the stack into rdi/rsi (any registers),
-    // and the stack is realigned since a frameless leaf may jump here.
-    let ts = 0;
-    let bf2 = find_fn("rt_bounds_fail2");
-    while ts < trap_sites[VEC_LEN] {
-        let site = vec_get(trap_sites, ts);
-        x_label(vec_get(site, 0));
-        let ireg = vec_get(site, 1);
-        if ireg < 0 {
-            x_load_imm(XSCR, vec_get(site, 3));
-            ireg = XSCR;
-        }
-        emit2(X_SUBI, RSP, 16);
-        x_st(ireg, x_mem1(RSP, 0), 3);
-        x_st(vec_get(site, 2), x_mem1(RSP, 8), 3);
-        x_ld(RDI, x_mem1(RSP, 0), 3);
-        x_ld(RSI, x_mem1(RSP, 8), 3);
-        emit2(X_ANDI, RSP, -16);
-        if bf2 {
-            emit1(X_CALL, x_sym(SK_FN, bf2[F_INDEX]));
-            bf2[F_USED] = 1;
-        }
-        ts = ts + 1;
-    }
-    x_gen_poll_stubs();
-    x_finish_fn(f, nslots);
+	if tgt_linux != 0 && (streq(f[F_QNAME], cstr("linux_raw")) != 0 || streq(f[F_QNAME], cstr("linux_restorer")) != 0) {
+		x_out4(X_LABEL, vec_get(x_fn_labels, f[F_INDEX]), 0, 0, 0)
+		let bs = x_syscall_bytes(streq(f[F_QNAME], cstr("linux_restorer")))
+		mut i = 0
+		for i < bs[VEC_LEN] {
+			x_out4(X_RAWB, vec_get(bs, i), 0, 0, 0)
+			i = i + 1
+		}
+		return
+	}
+	if streq(f[F_QNAME], cstr("mem_copy64")) != 0 || streq(f[F_QNAME], cstr("mem_fill64")) != 0 {
+		x_out4(X_LABEL, vec_get(x_fn_labels, f[F_INDEX]), 0, 0, 0)
+		let bs = x_memory_bytes(streq(f[F_QNAME], cstr("mem_fill64")))
+		mut i = 0
+		for i < bs[VEC_LEN] {
+			x_out4(X_RAWB, vec_get(bs, i), 0, 0, 0)
+			i = i + 1
+		}
+		return
+	}
+	if aes_hw_amd64(f[F_QNAME]) != 0 {
+		x_out4(X_LABEL, vec_get(x_fn_labels, f[F_INDEX]), 0, 0, 0)
+		let bs = aes_hw_amd64(f[F_QNAME])
+		mut i = 0
+		for i < bs[VEC_LEN] {
+			x_out4(X_RAWB, vec_get(bs, i), 0, 0, 0)
+			i = i + 1
+		}
+		return
+	}
+	if streq(f[F_QNAME], cstr("rt_task_swap")) != 0 {
+		x_out4(X_LABEL, vec_get(x_fn_labels, f[F_INDEX]), 0, 0, 0)
+		let bs = x_task_swap_bytes()
+		mut i = 0
+		for i < bs[VEC_LEN] {
+			x_out4(X_RAWB, vec_get(bs, i), 0, 0, 0)
+			i = i + 1
+		}
+		return
+	}
+	cur_gen_fn = f
+	trap_label = 0
+	x_div_label = 0
+	trap_sites = vec_new()
+	poll_sites = vec_new()
+	if host_getenv(cstr("TINC_TRACE")) != 0 {
+		let tb = buf_new()
+		buf_str(tb, cstr("gen "))
+		buf_str(tb, f[F_QNAME])
+		buf_byte(tb, '\n')
+		write_all(2, tb)
+	}
+	inline_appends(f)
+	licm_fn(f)
+	analyze_fn(f)
+	used_regs = 0
+	used_fregs = 0
+	g_loops[VEC_LEN] = 0
+	let nslots = x_assign_homes(f)
+	cg = vec_new()
+	x_entry_moves(f)
+	if f == entry_fn() {
+		mut di = 0
+		for di < prog_fns[VEC_LEN] {
+			let df = vec_get(prog_fns, di)
+			if df[F_EXTERN] == 0 && df[F_REACH] != 0 {
+				emit2(X_LEA, RAX, x64_mem_sym(x_sym(SK_FN, di)))
+				emit2(X_LEA, RDX, x64_mem_sym(x_sym(SK_FNDESC, di)))
+				x_st(RAX, x_mem1(RDX, 0), 3)
+			}
+			di = di + 1
+		}
+		x_gen_dyn_table_init()
+	}
+	x_gen_poll()
+	let stmts = f[F_BODY][BLK_STMTS]
+	mut i = 0
+	for i < stmts[VEC_LEN] {
+		x_gen_stmt(vec_get(stmts, i))
+		i = i + 1
+	}
+	x_load_imm(RAX, 0)
+	emit1(XP_RET, 0)
+	if trap_label != 0 {
+		// The cold path every failed bounds check jumps to.
+		x_label(trap_label)
+		let bf = find_fn(cstr("rt_bounds_fail"))
+		if bf != 0 {
+			emit1(X_CALL, x_sym(SK_FN, bf[F_INDEX]))
+			bf[F_USED] = 1
+		}
+	}
+	if x_div_label != 0 {
+		// The cold path every zero divisor in strict code jumps to (realigned like the stubs below).
+		x_label(x_div_label)
+		emit2(X_ANDI, RSP, -16)
+		let df = find_fn(cstr("rt_div_fail"))
+		if df != 0 {
+			emit1(X_CALL, x_sym(SK_FN, df[F_INDEX]))
+			df[F_USED] = 1
+		}
+	}
+	// Per-site stubs: the index and length go through the stack into rdi/rsi (any registers),
+	// and the stack is realigned since a frameless leaf may jump here.
+	mut ts = 0
+	let bf2 = find_fn(cstr("rt_bounds_fail2"))
+	for ts < trap_sites[VEC_LEN] {
+		let site = vec_get(trap_sites, ts)
+		x_label(vec_get(site, 0))
+		mut ireg = vec_get(site, 1)
+		if ireg < 0 {
+			x_load_imm(XSCR, vec_get(site, 3))
+			ireg = XSCR
+		}
+		emit2(X_SUBI, RSP, 16)
+		x_st(ireg, x_mem1(RSP, 0), 3)
+		x_st(vec_get(site, 2), x_mem1(RSP, 8), 3)
+		x_ld(RDI, x_mem1(RSP, 0), 3)
+		x_ld(RSI, x_mem1(RSP, 8), 3)
+		emit2(X_ANDI, RSP, -16)
+		if bf2 != 0 {
+			emit1(X_CALL, x_sym(SK_FN, bf2[F_INDEX]))
+			bf2[F_USED] = 1
+		}
+		ts = ts + 1
+	}
+	x_gen_poll_stubs()
+	x_finish_fn(f, nslots)
 }
 
 fn x_gen_dyn_table_init() {
-    let i = 0;
-    while i < dyn_tables[VEC_LEN] {
-        let rec = vec_get(dyn_tables, i);
-        let base = vec_get(rec, 4);
-        let fns = vec_new();
-        vec_push(fns, vec_get(rec, 2));
-        let methods = vec_get(rec, 3);
-        let j = 0;
-        while j < methods[VEC_LEN] {
-            vec_push(fns, vec_get(methods, j));
-            j = j + 1;
-        }
-        j = 0;
-        while j < fns[VEC_LEN] {
-            let f = vec_get(fns, j);
-            if f {
-                emit2(X_LEA, RAX, x64_mem_sym(x_sym(SK_FNDESC, f[F_INDEX])));
-                x_st(RAX, x64_mem_sym(x_sym(SK_VAR, base + j)), 3);
-            }
-            j = j + 1;
-        }
-        i = i + 1;
-    }
+	mut i = 0
+	for i < dyn_tables[VEC_LEN] {
+		let rec = vec_get(dyn_tables, i)
+		let base = vec_get(rec, 4)
+		let fns = vec_new()
+		vec_push(fns, vec_get(rec, 2))
+		let methods = vec_get(rec, 3)
+		mut j = 0
+		for j < methods[VEC_LEN] {
+			vec_push(fns, vec_get(methods, j))
+			j = j + 1
+		}
+		j = 0
+		for j < fns[VEC_LEN] {
+			let f = vec_get(fns, j)
+			if f != 0 {
+				emit2(X_LEA, RAX, x64_mem_sym(x_sym(SK_FNDESC, f[F_INDEX])))
+				x_st(RAX, x64_mem_sym(x_sym(SK_VAR, base + j)), 3)
+			}
+			j = j + 1
+		}
+		i = i + 1
+	}
 }
 
-fn x_out4(op, a, b, c, d) {
-    vec_push(code, op);
-    vec_push(code, a);
-    vec_push(code, b);
-    vec_push(code, c);
-    vec_push(code, d);
+fn x_out4(op i64, a i64, b i64, c i64, d i64) {
+	vec_push(code, op)
+	vec_push(code, a)
+	vec_push(code, b)
+	vec_push(code, c)
+	vec_push(code, d)
 }
 
 // x_branch_to_next reports whether the jump at instruction i only skips labels to reach its target.
-fn x_branch_to_next(i, n) {
-    let target = vec_get(cg, 5 * i + 1);
-    let j = i + 1;
-    while j < n && vec_get(cg, 5 * j) == X_LABEL {
-        if vec_get(cg, 5 * j + 1) == target {
-            return 1;
-        }
-        j = j + 1;
-    }
-    return 0;
+fn x_branch_to_next(i i64, n i64) i64 {
+	let target = vec_get(cg, 5 * i + 1)
+	mut j = i + 1
+	for j < n && vec_get(cg, 5 * j) == X_LABEL {
+		if vec_get(cg, 5 * j + 1) == target {
+			return 1
+		}
+		j = j + 1
+	}
+	return 0
 }
 
 // x_label_follows reports whether only labels separate instruction i from label l.
-fn x_label_follows(i, n, l) {
-    let j = i;
-    while j < n && vec_get(cg, 5 * j) == X_LABEL {
-        if vec_get(cg, 5 * j + 1) == l {
-            return 1;
-        }
-        j = j + 1;
-    }
-    return 0;
+fn x_label_follows(i i64, n i64, l i64) i64 {
+	mut j = i
+	for j < n && vec_get(cg, 5 * j) == X_LABEL {
+		if vec_get(cg, 5 * j + 1) == l {
+			return 1
+		}
+		j = j + 1
+	}
+	return 0
 }
 
 // x_finish_fn wraps the body in its prologue and epilogues and drops unreachable code.
-fn x_finish_fn(f, nslots) {
-    let saved = vec_new();
-    let r = 0;
-    while r < 16 {
-        if ((used_regs >> r) & 1) && !x_caller_saved(r) {
-            vec_push(saved, r);
-        }
-        r = r + 1;
-    }
-    let frame = align_up(8 * (nslots + saved[VEC_LEN]), 16);
-    let frameless = f[F_LEAF] && nslots == 0 && saved[VEC_LEN] == 0 && x_nstack == 0;
-    x_out4(X_LABEL, vec_get(x_fn_labels, f[F_INDEX]), 0, 0, 0);
-    if !frameless {
-        x_out4(X_PUSH, RBP, 0, 0, 0);
-        x_out4(X_MOV_RR, RBP, RSP, 0, 0);
-        if frame > 0 {
-            x_out4(X_SUBI, RSP, frame, 0, 0);
-        }
-        let j = 0;
-        while j < saved[VEC_LEN] {
-            x_out4(X_STORE, vec_get(saved, j), x_mem1(RBP, -8 * (nslots + j + 1)), 3, 0);
-            j = j + 1;
-        }
-    }
-    let n = cg[VEC_LEN] / 5;
-    let dead = 0;
-    let i = 0;
-    while i < n {
-        let op = vec_get(cg, 5 * i);
-        if op == X_LABEL {
-            dead = 0;
-        }
-        if dead || (op == X_JMP && x_branch_to_next(i, n)) {
-            i = i + 1;
-            continue;
-        }
-        // jcc L1; jmp L2; L1:  becomes  j!cc L2; L1:
-        if op == X_JCC && i + 1 < n && vec_get(cg, 5 * (i + 1)) == X_JMP && x_label_follows(i + 2, n, vec_get(cg, 5 * i + 2)) {
-            x_out4(X_JCC, vec_get(cg, 5 * i + 1) ^ 1, vec_get(cg, 5 * (i + 1) + 1), 0, 0);
-            i = i + 2;
-            continue;
-        }
-        if op == XP_RET {
-            if !frameless {
-                let j = 0;
-                while j < saved[VEC_LEN] {
-                    x_out4(X_LOAD, vec_get(saved, j), x_mem1(RBP, -8 * (nslots + j + 1)), 3, 0);
-                    j = j + 1;
-                }
-                x_out4(X_MOV_RR, RSP, RBP, 0, 0);
-                x_out4(X_POP, RBP, 0, 0, 0);
-            }
-            x_out4(X_RET, 0, 0, 0, 0);
-            dead = 1;
-        } else {
-            let k = 5 * i;
-            x_out4(op, vec_get(cg, k + 1), vec_get(cg, k + 2), vec_get(cg, k + 3), vec_get(cg, k + 4));
-            if op == X_JMP {
-                dead = 1;
-            }
-        }
-        i = i + 1;
-    }
+fn x_finish_fn(f i64, nslots i64) {
+	let saved = vec_new()
+	mut r = 0
+	for r < 16 {
+		if ((used_regs >> r) & 1) != 0 && x_caller_saved(r) == 0 {
+			vec_push(saved, r)
+		}
+		r = r + 1
+	}
+	let frame = align_up(8 * (nslots + saved[VEC_LEN]), 16)
+	let frameless = i64(f[F_LEAF] != 0 && nslots == 0 && saved[VEC_LEN] == 0 && x_nstack == 0)
+	x_out4(X_LABEL, vec_get(x_fn_labels, f[F_INDEX]), 0, 0, 0)
+	if frameless == 0 {
+		x_out4(X_PUSH, RBP, 0, 0, 0)
+		x_out4(X_MOV_RR, RBP, RSP, 0, 0)
+		if frame > 0 {
+			x_out4(X_SUBI, RSP, frame, 0, 0)
+		}
+		mut j = 0
+		for j < saved[VEC_LEN] {
+			x_out4(X_STORE, vec_get(saved, j), x_mem1(RBP, -8 * (nslots + j + 1)), 3, 0)
+			j = j + 1
+		}
+	}
+	let n = cg[VEC_LEN] / 5
+	mut dead = 0
+	mut i = 0
+	for i < n {
+		let op = vec_get(cg, 5 * i)
+		if op == X_LABEL {
+			dead = 0
+		}
+		if dead != 0 || (op == X_JMP && x_branch_to_next(i, n) != 0) {
+			i = i + 1
+			continue
+		}
+		// jcc L1; jmp L2; L1:  becomes  j!cc L2; L1:
+		if op == X_JCC && i + 1 < n && vec_get(cg, 5 * (i + 1)) == X_JMP && x_label_follows(i + 2, n, vec_get(cg, 5 * i + 2)) != 0 {
+			x_out4(X_JCC, vec_get(cg, 5 * i + 1) ^ 1, vec_get(cg, 5 * (i + 1) + 1), 0, 0)
+			i = i + 2
+			continue
+		}
+		if op == XP_RET {
+			if frameless == 0 {
+				mut j = 0
+				for j < saved[VEC_LEN] {
+					x_out4(X_LOAD, vec_get(saved, j), x_mem1(RBP, -8 * (nslots + j + 1)), 3, 0)
+					j = j + 1
+				}
+				x_out4(X_MOV_RR, RSP, RBP, 0, 0)
+				x_out4(X_POP, RBP, 0, 0, 0)
+			}
+			x_out4(X_RET, 0, 0, 0, 0)
+			dead = 1
+		} else {
+			let k = 5 * i
+			x_out4(op, vec_get(cg, k + 1), vec_get(cg, k + 2), vec_get(cg, k + 3), vec_get(cg, k + 4))
+			if op == X_JMP {
+				dead = 1
+			}
+		}
+		i = i + 1
+	}
 }
 
 fn generate_x64() {
-    code = vec_new();
-    g_labels = 0;
-    g_str_ptrs = vec_new();
-    g_str_lens = vec_new();
-    g_tstr_ptrs = vec_new();
-    g_tstr_lens = vec_new();
-    g_loops = vec_new();
-    x_syms = vec_new();
-    x_fn_labels = vec_new();
-    let i = 0;
-    while i < prog_fns[VEC_LEN] {
-        vec_get(prog_fns, i)[F_INDEX] = i;
-        vec_push(x_fn_labels, new_label());
-        i = i + 1;
-    }
-    inline_small_calls();
-    i = 0;
-    while i < prog_fns[VEC_LEN] {
-        let f = vec_get(prog_fns, i);
-        if !f[F_EXTERN] && f[F_REACH] {
-            x_gen_fn(f);
-        }
-        i = i + 1;
-    }
+	code = vec_new()
+	g_labels = 0
+	g_str_ptrs = vec_new()
+	g_str_lens = vec_new()
+	g_tstr_ptrs = vec_new()
+	g_tstr_lens = vec_new()
+	g_loops = vec_new()
+	x_syms = vec_new()
+	x_fn_labels = vec_new()
+	mut i = 0
+	for i < prog_fns[VEC_LEN] {
+		vec_get(prog_fns, i)[F_INDEX] = i
+		vec_push(x_fn_labels, new_label())
+		i = i + 1
+	}
+	inline_small_calls()
+	i = 0
+	for i < prog_fns[VEC_LEN] {
+		let f = vec_get(prog_fns, i)
+		if f[F_EXTERN] == 0 && f[F_REACH] != 0 {
+			x_gen_fn(f)
+		}
+		i = i + 1
+	}
 }
 
 // print_asm_x64 renders the program as Intel-syntax assembly with symbolic labels (tinc -S).
-fn print_asm_x64() {
-    let b = buf_new();
-    let i = 0;
-    while i < prog_fns[VEC_LEN] {
-        let f = vec_get(prog_fns, i);
-        if !f[F_EXTERN] && f[F_REACH] {
-            buf_str(b, "# L");
-            buf_int(b, vec_get(x_fn_labels, i));
-            buf_str(b, ": ");
-            buf_str(b, f[F_QNAME]);
-            buf_byte(b, '\n');
-        }
-        i = i + 1;
-    }
-    i = 0;
-    while i < code[VEC_LEN] {
-        x64_print(b, code[VEC_DATA] + 8 * i, -1);
-        i = i + 5;
-    }
-    return b;
+fn print_asm_x64() i64 {
+	let b = buf_new()
+	mut i = 0
+	for i < prog_fns[VEC_LEN] {
+		let f = vec_get(prog_fns, i)
+		if f[F_EXTERN] == 0 && f[F_REACH] != 0 {
+			buf_str(b, cstr("# L"))
+			buf_int(b, vec_get(x_fn_labels, i))
+			buf_str(b, cstr(": "))
+			buf_str(b, f[F_QNAME])
+			buf_byte(b, '\n')
+		}
+		i = i + 1
+	}
+	i = 0
+	for i < code[VEC_LEN] {
+		x64_print(b, code[VEC_DATA] + 8 * i, -1)
+		i = i + 5
+	}
+	return b
 }

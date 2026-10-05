@@ -1,121 +1,171 @@
 // The compiler's own Linux host calls (see host_darwin.tin).
-
-
-fn host_exe_path(buf, n) {
-    let k = rt_sys_readlink("/proc/self/exe", buf, n - 1);
-    if (k & 0x80000000) != 0 {
-        k = 0;
-    }
-    store8(buf + (k & 0xffffffff), 0);
+fn host_exe_path(buf i64, n i64) {
+	mut k = rt_sys_readlink(cstr("/proc/self/exe"), buf, n - 1)
+	if (k & 0x80000000) != 0 {
+		k = 0
+	}
+	store8(buf + (k & 0xffffffff), 0)
 }
 
-fn host_dirent_name(ent) {
-    return ent + 19;
+fn host_dirent_name(ent i64) i64 {
+	return ent + 19
 }
 
 // The environment and the auxiliary vector follow argv's NULL on the initial stack (the same
 // layout under glibc's start and Tin's own _start); host_start records where, first thing in
 // main, so the compiler needs no libc getenv or getauxval (#125).
-var host_envp;
-var host_auxv;
+shared mut host_envp i64
+shared mut host_auxv i64
 
-fn host_start(argc, argv) {
-    let env = argv + 8 * (argc + 1);
-    let n = 0;
-    while env[n] != 0 {
-        n = n + 1;
-    }
-    host_envp = env;
-    host_auxv = env + 8 * (n + 1);
+fn host_start(argc i64, argv i64) {
+	let env = argv + 8 * (argc + 1)
+	mut n = 0
+	for env[n] != 0 {
+		n = n + 1
+	}
+	host_envp = env
+	host_auxv = env + 8 * (n + 1)
 }
 
 // host_getenv is the value of the C string name as a C string, or 0 when it is unset.
-fn host_getenv(name) {
-    if !host_envp {
-        return 0;
-    }
-    let i = 0;
-    while host_envp[i] != 0 {
-        let e = host_envp[i];
-        let k = 0;
-        while load8(name + k) != 0 && load8(e + k) == load8(name + k) {
-            k = k + 1;
-        }
-        if load8(name + k) == 0 && load8(e + k) == '=' {
-            return e + k + 1;
-        }
-        i = i + 1;
-    }
-    return 0;
+fn host_getenv(name i64) i64 {
+	if host_envp == 0 {
+		return 0
+	}
+	mut i = 0
+	for host_envp[i] != 0 {
+		let e = host_envp[i]
+		mut k = 0
+		for i64(load8(name + k)) != 0 && i64(load8(e + k)) == i64(load8(name + k)) {
+			k = k + 1
+		}
+		if i64(load8(name + k)) == 0 && i64(load8(e + k)) == '=' {
+			return e + k + 1
+		}
+		i = i + 1
+	}
+	return 0
 }
 
 // host_auxval is the auxv value of key (6: AT_PAGESZ), or 0 when absent.
-fn host_auxval(key) {
-    if !host_auxv {
-        return 0;
-    }
-    let p = host_auxv;
-    while p[0] != 0 {
-        if p[0] == key {
-            return p[1];
-        }
-        p = p + 16;
-    }
-    return 0;
+fn host_auxval(key i64) i64 {
+	if host_auxv == 0 {
+		return 0
+	}
+	mut p = host_auxv
+	for p[0] != 0 {
+		if p[0] == key {
+			return p[1]
+		}
+		p = p + 16
+	}
+	return 0
 }
 
 // Canonicalization follows Linux symlinks before reducing .., with PATH_MAX and hop bounds.
-fn host_realpath_work(path, resolved, pending, target, merged, st) {
-    let n=strlen(path);
-    if n == 0 || n >= 4096 { return 0; }
-    if load8(path) == '/' { memcpy(pending,path,n+1); } else {
-        if !rt_sys_getcwd(target,4096) { return 0; }
-        let cwd=strlen(target);
-        if cwd+n+1 >= 4096 { return 0; }
-        memcpy(pending,target,cwd); store8(pending+cwd,'/'); memcpy(pending+cwd+1,path,n+1);
-    }
-    let used=1; store8(resolved,'/'); store8(resolved+1,0);
-    let cursor=0; let hops=0;
-    while 1 {
-        while load8(pending+cursor) == '/' { cursor=cursor+1; }
-        if load8(pending+cursor) == 0 { return resolved; }
-        let begin=cursor;
-        while load8(pending+cursor) != 0 && load8(pending+cursor) != '/' { cursor=cursor+1; }
-        let len=cursor-begin;
-        if len == 1 && load8(pending+begin) == '.' { continue; }
-        if len == 2 && load8(pending+begin) == '.' && load8(pending+begin+1) == '.' {
-            while used > 1 && load8(resolved+used-1) != '/' { used=used-1; }
-            if used > 1 { used=used-1; }
-            store8(resolved+used,0);
-            continue;
-        }
-        let parent=used;
-        if used > 1 { store8(resolved+used,'/'); used=used+1; }
-        if used+len >= 4096 { return 0; }
-        memcpy(resolved+used,pending+begin,len); used=used+len; store8(resolved+used,0);
-        if rt_sys_lstat(resolved,st) != 0 { return 0; }
-        let kind=linux_stat_type(st);
-        if kind == 10 {
-            hops=hops+1; if hops > 40 { return 0; }
-            let k=rt_sys_readlink(resolved,target,4096);
-            if k <= 0 || k >= 4096 { return 0; }
-            store8(target+k,0);
-            let rest=strlen(pending+cursor);
-            if k+rest >= 4096 { return 0; }
-            memcpy(merged,target,k); memcpy(merged+k,pending+cursor,rest+1);
-            memcpy(pending,merged,k+rest+1); cursor=0;
-            used=parent;
-            if load8(target) == '/' { used=1; }
-            store8(resolved+used,0);
-        } else if load8(pending+cursor) != 0 && kind != 4 { return 0; }
-    }
-    return 0;
+fn host_realpath_work(path i64, resolved i64, pending i64, target i64, merged i64, st i64) i64 {
+	let n = strlen(path)
+	if n == 0 || n >= 4096 {
+		return 0
+	}
+	if i64(load8(path)) == '/' {
+		memcpy(pending, path, n + 1)
+	} else {
+		if rt_sys_getcwd(target, 4096) == 0 {
+			return 0
+		}
+		let cwd = strlen(target)
+		if cwd + n + 1 >= 4096 {
+			return 0
+		}
+		memcpy(pending, target, cwd)
+		store8(pending + cwd, '/')
+		memcpy(pending + cwd + 1, path, n + 1)
+	}
+	mut used = 1
+	store8(resolved, '/')
+	store8(resolved + 1, 0)
+	mut cursor = 0
+	mut hops = 0
+	for {
+		for i64(load8(pending + cursor)) == '/' {
+			cursor = cursor + 1
+		}
+		if i64(load8(pending + cursor)) == 0 {
+			return resolved
+		}
+		let begin = cursor
+		for i64(load8(pending + cursor)) != 0 && i64(load8(pending + cursor)) != '/' {
+			cursor = cursor + 1
+		}
+		let len_ = cursor - begin
+		if len_ == 1 && i64(load8(pending + begin)) == '.' {
+			continue
+		}
+		if len_ == 2 && i64(load8(pending + begin)) == '.' && i64(load8(pending + begin + 1)) == '.' {
+			for used > 1 && i64(load8(resolved + used - 1)) != '/' {
+				used = used - 1
+			}
+			if used > 1 {
+				used = used - 1
+			}
+			store8(resolved + used, 0)
+			continue
+		}
+		let parent = used
+		if used > 1 {
+			store8(resolved + used, '/')
+			used = used + 1
+		}
+		if used + len_ >= 4096 {
+			return 0
+		}
+		memcpy(resolved + used, pending + begin, len_)
+		used = used + len_
+		store8(resolved + used, 0)
+		if rt_sys_lstat(resolved, st) != 0 {
+			return 0
+		}
+		let kind = linux_stat_type(st)
+		if kind == 10 {
+			hops = hops + 1
+			if hops > 40 {
+				return 0
+			}
+			let k = rt_sys_readlink(resolved, target, 4096)
+			if k <= 0 || k >= 4096 {
+				return 0
+			}
+			store8(target + k, 0)
+			let rest = strlen(pending + cursor)
+			if k + rest >= 4096 {
+				return 0
+			}
+			memcpy(merged, target, k)
+			memcpy(merged + k, pending + cursor, rest + 1)
+			memcpy(pending, merged, k + rest + 1)
+			cursor = 0
+			used = parent
+			if i64(load8(target)) == '/' {
+				used = 1
+			}
+			store8(resolved + used, 0)
+		} else if i64(load8(pending + cursor)) != 0 && kind != 4 {
+			return 0
+		}
+	}
+	return 0
 }
 
-fn host_realpath(path,resolved) {
-    let pending=calloc(4096,1); let target=calloc(4096,1);
-    let merged=calloc(4096,1); let st=calloc(256,1);
-    let result=host_realpath_work(path,resolved,pending,target,merged,st);
-    free(pending); free(target); free(merged); free(st);
-    return result;
+fn host_realpath(path i64, resolved i64) i64 {
+	let pending = calloc(4096, 1)
+	let target = calloc(4096, 1)
+	let merged = calloc(4096, 1)
+	let st = calloc(256, 1)
+	let result = host_realpath_work(path, resolved, pending, target, merged, st)
+	free(pending)
+	free(target)
+	free(merged)
+	free(st)
+	return result
 }

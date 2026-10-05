@@ -1,874 +1,903 @@
 // tinc: the self-hosted Tin compiler.
 // Usage: tinc [-o OUT] FILE.tin...   write a native executable (default a.out)
 //        tinc -S FILE.tin...         print assembly instead
-
-var lib_root;
-var project_root;
-var project_lock;
-var compiler_edition;
-var load_unsafe;     // the file being loaded is a vendored package granted unsafe: trusted, same edition
-var compiler_fix;
-var compiler_parse_only; // -parse-only: like -fix, a file under <root>/lib/ reads trusted
+shared mut lib_root i64
+shared mut project_root i64
+shared mut project_lock i64
+shared mut compiler_edition i64
+shared mut load_unsafe i64 // the file being loaded is a vendored package granted unsafe: trusted, same edition
+shared mut compiler_fix i64
+shared mut compiler_parse_only i64 // -parse-only: like -fix, a file under <root>/lib/ reads trusted
 
 // read_file returns a buffer holding the whole file, or 0 if it cannot be opened.
-fn try_read_file(path) {
-    let fd = rt_sys_open(path, 0, 0);
-    // open returns a C int: only the low 32 bits of x0 are defined.
-    if (fd & 0x80000000) != 0 {
-        return 0;
-    }
-    let b = buf_new();
-    while 1 {
-        buf_reserve(b, 65536);
-        let n = rt_sys_read(fd, b[VEC_DATA] + b[VEC_LEN], 65536);
-        if n <= 0 {
-            break;
-        }
-        b[VEC_LEN] = b[VEC_LEN] + n;
-    }
-    rt_sys_close(fd);
-    return b;
+fn try_read_file(path i64) i64 {
+	let fd = rt_sys_open(path, 0, 0)
+	// open returns a C int: only the low 32 bits of x0 are defined.
+	if (fd & 0x80000000) != 0 {
+		return 0
+	}
+	let b = buf_new()
+	for {
+		buf_reserve(b, 65536)
+		let n = rt_sys_read(fd, b[VEC_DATA] + b[VEC_LEN], 65536)
+		if n <= 0 {
+			break
+		}
+		b[VEC_LEN] = b[VEC_LEN] + n
+	}
+	rt_sys_close(fd)
+	return b
 }
 
-fn read_file(path) {
-    let b = try_read_file(path);
-    if !b {
-        let e = err_code(NO_POS, "E003 CANNOT_OPEN");
-        buf_str(e, "cannot open ");
-        buf_str(e, path);
-        fatal(e);
-    }
-    return b;
+fn read_file(path i64) i64 {
+	let b = try_read_file(path)
+	if b == 0 {
+		let e = err_code(NO_POS, cstr("E003 CANNOT_OPEN"))
+		buf_str(e, cstr("cannot open "))
+		buf_str(e, path)
+		fatal(e)
+	}
+	return b
 }
 
 // os_suffix is the file-name suffix of the target's OS-specific library files.
-fn os_suffix() {
-    if tgt_linux {
-        return "_linux";
-    }
-    return "_darwin";
+fn os_suffix() i64 {
+	if tgt_linux != 0 {
+		return cstr("_linux")
+	}
+	return cstr("_darwin")
 }
 
 // arch_suffix is the file-name suffix of the target's CPU-specific library files.
-fn arch_suffix() {
-    if tgt_x64 {
-        return "_amd64";
-    }
-    return "_arm64";
+fn arch_suffix() i64 {
+	if tgt_x64 != 0 {
+		return cstr("_amd64")
+	}
+	return cstr("_arm64")
 }
 
 // host_is_linux asks uname which kernel the compiler is running on.
-fn host_is_linux() {
-    let u = calloc(1280, 1);
-    rt_sys_uname(u);
-    return load8(u) == 'L';
+fn host_is_linux() i64 {
+	let u = calloc(1280, 1)
+	rt_sys_uname(u)
+	return i64(i64(load8(u)) == 'L')
 }
 
 // host_is_x64 asks uname whether a Linux host's CPU is x86-64 (machine is the fifth 65-byte field).
-fn host_is_x64() {
-    let u = calloc(1280, 1);
-    rt_sys_uname(u);
-    return load8(u) == 'L' && streq(u + 4 * 65, "x86_64");
+fn host_is_x64() i64 {
+	let u = calloc(1280, 1)
+	rt_sys_uname(u)
+	return i64(i64(load8(u)) == 'L' && streq(u + 4 * 65, cstr("x86_64")) != 0)
 }
 
 // set_target parses darwin-arm64, linux-arm64 or linux-amd64.
-fn set_target(t) {
-    if streq(t, "darwin-arm64") {
-        tgt_linux = 0;
-        tgt_x64 = 0;
-    } else if streq(t, "linux-arm64") {
-        tgt_linux = 1;
-        tgt_x64 = 0;
-    } else if streq(t, "linux-amd64") {
-        tgt_linux = 1;
-        tgt_x64 = 1;
-    } else {
-        let e = err_code(NO_POS, "E901 UNKNOWN_TARGET");
-        buf_str(e, "unknown target ");
-        buf_str(e, t);
-        buf_str(e, " (darwin-arm64, linux-arm64, linux-amd64)");
-        fatal(e);
-    }
+fn set_target(t i64) {
+	if streq(t, cstr("darwin-arm64")) != 0 {
+		tgt_linux = 0
+		tgt_x64 = 0
+	} else if streq(t, cstr("linux-arm64")) != 0 {
+		tgt_linux = 1
+		tgt_x64 = 0
+	} else if streq(t, cstr("linux-amd64")) != 0 {
+		tgt_linux = 1
+		tgt_x64 = 1
+	} else {
+		let e = err_code(NO_POS, cstr("E901 UNKNOWN_TARGET"))
+		buf_str(e, cstr("unknown target "))
+		buf_str(e, t)
+		buf_str(e, cstr(" (darwin-arm64, linux-arm64, linux-amd64)"))
+		fatal(e)
+	}
 }
 
-fn usage() {
-    let u = buf_new();
-    buf_str(u, "usage: tinc [-fix] [-polls] [-edition 0|1] [-parse-only] [-audit-secrets] [-caps] [-hash FILE...] [-S] [-o OUT] [-target darwin-arm64|linux-arm64|linux-amd64] FILE.tin...\n");
-    write_all(2, u);
-    return 2;
+fn usage() i64 {
+	let u = buf_new()
+	buf_str(u, cstr("usage: tinc [-fix] [-polls] [-edition 0|1] [-parse-only] [-audit-secrets] [-caps] [-hash FILE...] [-S] [-o OUT] [-target darwin-arm64|linux-arm64|linux-amd64] FILE.tin...\n"))
+	write_all(2, u)
+	return 2
 }
 
 // find_root locates the Tin tree (with lib/) from $TIN_ROOT or this executable's path.
-fn find_root() {
-    let env = host_getenv("TIN_ROOT");
-    if env {
-        return env;
-    }
-    let raw = calloc(4096, 1);
-    host_exe_path(raw, 4096);
-    let real = calloc(4096, 1);
-    if !host_realpath(raw, real) {
-        return ".";
-    }
-    // .../bin/tinc -> ...
-    let n = strlen(real);
-    let cut = 0;
-    let i = n - 1;
-    while i > 0 && cut < 2 {
-        if load8(real + i) == '/' {
-            cut = cut + 1;
-            store8(real + i, 0);
-        }
-        i = i - 1;
-    }
-    return real;
+fn find_root() i64 {
+	let env = host_getenv(cstr("TIN_ROOT"))
+	if env != 0 {
+		return env
+	}
+	let raw = calloc(4096, 1)
+	host_exe_path(raw, 4096)
+	let real = calloc(4096, 1)
+	if host_realpath(raw, real) == 0 {
+		return cstr(".")
+	}
+	// .../bin/tinc -> ...
+	let n = strlen(real)
+	mut cut = 0
+	mut i = n - 1
+	for i > 0 && cut < 2 {
+		if i64(load8(real + i)) == '/' {
+			cut = cut + 1
+			store8(real + i, 0)
+		}
+		i = i - 1
+	}
+	return real
 }
 
-fn load_file(path) {
-    // The compiler's own typed files (selfhost/, #228) use raw words and cast like the runtime does.
-    load_file_trusted(path, path_in_root_dir(path, "/selfhost/"));
+fn load_file(path i64) {
+	// The compiler's own typed files (selfhost/, #228) use raw words and cast like the runtime does.
+	load_file_trusted(path, path_in_root_dir(path, cstr("/selfhost/")))
 }
 
 // path_in_root_dir reports whether the file at path is under <root><dir>, the Tin tree that
 // find_root locates (dir starts and ends with a slash).
-fn path_in_root_dir(path, dir) {
-    let real = calloc(4096, 1);
-    let root = calloc(4096, 1);
-    if !host_realpath(path, real) || !host_realpath(find_root(), root) {
-        return 0;
-    }
-    let prefix = cat_path(root, dir);
-    let n = strlen(prefix);
-    return strlen(real) > n && mem_eq(real, prefix, n);
+fn path_in_root_dir(path i64, dir i64) i64 {
+	let real = calloc(4096, 1)
+	let root = calloc(4096, 1)
+	if host_realpath(path, real) == 0 || host_realpath(find_root(), root) == 0 {
+		return 0
+	}
+	let prefix = cat_path(root, dir)
+	let n = strlen(prefix)
+	return i64(strlen(real) > n && mem_eq(real, prefix, n) != 0)
 }
 
 // Standard library files may use the runtime's raw memory operations.
-fn load_file_trusted(path, trusted) {
-    let src = read_file(path);
-    vec_push(files, path);
-    vec_push(file_trusted, trusted);
-    vec_push(file_cap_pkg, 0);
-    cur_file = files[VEC_LEN] - 1;
-    let edition = compiler_edition;
-    if edition < 0 {
-        // no -edition flag: the file says which edition it is written in
-        edition = source_edition(src[VEC_DATA], src[VEC_LEN]);
-    }
-    if compiler_fix {
-        edition = 0;
-        if fix_source_is_edition1(src[VEC_DATA], src[VEC_LEN]) || source_edition(src[VEC_DATA], src[VEC_LEN]) {
-            edition = 1;
-        }
-    }
-    if (compiler_fix || compiler_parse_only) && !trusted && fix_in_lib(path) {
-        trusted = 1;
-        file_trusted[VEC_DATA][cur_file] = 1;
-    }
-    if trusted && !load_unsafe {
-        // a standard library file is read in the edition it is written in (#226)
-        edition = source_edition(src[VEC_DATA], src[VEC_LEN]);
-    }
-    if edition == 0 && !compiler_fix && source_has_word(src[VEC_DATA], src[VEC_LEN], "package") + source_has_word(src[VEC_DATA], src[VEC_LEN], "func") > 0 {
-        // edition 0 is retired (#226): only tin fix reads it; the compiler's own legacy dialect
-        // (no package clause, no func) stays until selfhost/ moves to edition 1 (#228)
-        let e = err_code(NO_POS, "E090 OLD_SYNTAX");
-        buf_str(e, path);
-        buf_str(e, " is edition 0, which is retired: translate it with tin fix -edition 1");
-        fatal(e);
-    }
-    let toks = lex(cur_file, src[VEC_DATA], src[VEC_LEN], edition);
-    vec_push(file_sources, src);
-    vec_push(file_tokens, toks);
-    if edition == 1 {
-        parse_edition1(toks);
-    } else {
-        parse(toks);
-    }
+fn load_file_trusted(path i64, trusted_in i64) {
+	mut trusted = trusted_in
+	let src = read_file(path)
+	vec_push(files, path)
+	vec_push(file_trusted, trusted)
+	vec_push(file_cap_pkg, 0)
+	cur_file = files[VEC_LEN] - 1
+	mut edition = compiler_edition
+	if edition < 0 {
+		// no -edition flag: the file says which edition it is written in
+		edition = source_edition(src[VEC_DATA], src[VEC_LEN])
+	}
+	if compiler_fix != 0 {
+		edition = 0
+		if fix_source_is_edition1(src[VEC_DATA], src[VEC_LEN]) != 0 || source_edition(src[VEC_DATA], src[VEC_LEN]) != 0 {
+			edition = 1
+		}
+	}
+	if (compiler_fix != 0 || compiler_parse_only != 0) && trusted == 0 && fix_in_lib(path) != 0 {
+		trusted = 1
+		file_trusted[VEC_DATA][cur_file] = 1
+	}
+	if trusted != 0 && load_unsafe == 0 {
+		// a standard library file is read in the edition it is written in (#226)
+		edition = source_edition(src[VEC_DATA], src[VEC_LEN])
+	}
+	if edition == 0 && compiler_fix == 0 && source_has_word(src[VEC_DATA], src[VEC_LEN], cstr("package")) + source_has_word(src[VEC_DATA], src[VEC_LEN], cstr("func")) > 0 {
+		// edition 0 is retired (#226): only tin fix reads it; the compiler's own legacy dialect
+		// (no package clause, no func) stays until selfhost/ moves to edition 1 (#228)
+		let e = err_code(NO_POS, cstr("E090 OLD_SYNTAX"))
+		buf_str(e, path)
+		buf_str(e, cstr(" is edition 0, which is retired: translate it with tin fix -edition 1"))
+		fatal(e)
+	}
+	let toks = lex(cur_file, src[VEC_DATA], src[VEC_LEN], edition)
+	vec_push(file_sources, src)
+	vec_push(file_tokens, toks)
+	if edition == 1 {
+		parse_edition1(toks)
+	} else {
+		parse(toks)
+	}
 }
 
 // fix_in_lib reports a standard library file (under <root>/lib/): -fix reads it trusted, as an
 // import loads it, so its edition 0 secret types parse.
-fn fix_in_lib(path) {
-    let real = calloc(4096, 1);
-    let root = calloc(4096, 1);
-    if !host_realpath(path, real) || !host_realpath(find_root(), root) {
-        return 0;
-    }
-    let lib = cat_path(root, "/lib/");
-    let n = strlen(lib);
-    return strlen(real) > n && mem_eq(real, lib, n);
+fn fix_in_lib(path i64) i64 {
+	let real = calloc(4096, 1)
+	let root = calloc(4096, 1)
+	if host_realpath(path, real) == 0 || host_realpath(find_root(), root) == 0 {
+		return 0
+	}
+	let lib = cat_path(root, cstr("/lib/"))
+	let n = strlen(lib)
+	return i64(strlen(real) > n && mem_eq(real, lib, n) != 0)
 }
 
-fn is_loaded(path) {
-    let i = 0;
-    while i < files[VEC_LEN] {
-        if streq(vec_get(files, i), path) {
-            return 1;
-        }
-        i = i + 1;
-    }
-    return 0;
+fn is_loaded(path i64) i64 {
+	mut i = 0
+	for i < files[VEC_LEN] {
+		if streq(vec_get(files, i), path) != 0 {
+			return 1
+		}
+		i = i + 1
+	}
+	return 0
 }
 
-fn cat_path(a, b) {
-    let p = buf_new();
-    buf_str(p, a);
-    buf_str(p, b);
-    buf_byte(p, 0);
-    return p[VEC_DATA];
+fn cat_path(a i64, b i64) i64 {
+	let p = buf_new()
+	buf_str(p, a)
+	buf_str(p, b)
+	buf_byte(p, 0)
+	return p[VEC_DATA]
 }
 
 // dir_of is the directory part of a file path ("." when there is none).
-fn dir_of(path) {
-    let n = strlen(path);
-    let i = n - 1;
-    while i >= 0 && load8(path + i) != '/' {
-        i = i - 1;
-    }
-    if i < 0 {
-        return ".";
-    }
-    let b = buf_new();
-    let j = 0;
-    while j < i {
-        buf_byte(b, load8(path + j));
-        j = j + 1;
-    }
-    buf_byte(b, 0);
-    return b[VEC_DATA];
+fn dir_of(path i64) i64 {
+	let n = strlen(path)
+	mut i = n - 1
+	for i >= 0 && i64(load8(path + i)) != '/' {
+		i = i - 1
+	}
+	if i < 0 {
+		return cstr(".")
+	}
+	let b = buf_new()
+	mut j = 0
+	for j < i {
+		buf_byte(b, i64(load8(path + j)))
+		j = j + 1
+	}
+	buf_byte(b, 0)
+	return b[VEC_DATA]
 }
 
-fn ends_with(s, suffix) {
-    let n = strlen(s);
-    let m = strlen(suffix);
-    return n >= m && streq(s + n - m, suffix);
+fn ends_with(s i64, suffix i64) i64 {
+	let n = strlen(s)
+	let m = strlen(suffix)
+	return i64(n >= m && streq(s + n - m, suffix) != 0)
 }
 
 // package_files returns the files of the package at base: base.tin, or every .tin file in
 // the directory base (tests excluded), sorted; 0 if neither exists.
-fn package_files(base) {
-    let single = cat_path(base, ".tin");
-    let probe = try_read_file(single);
-    if probe {
-        let one = vec_new();
-        vec_push(one, single);
-        // name_linux.tin / name_darwin.tin: the target OS's part of the package.
-        let osf = cat_path(cat_path(base, os_suffix()), ".tin");
-        if try_read_file(osf) {
-            vec_push(one, osf);
-        }
-        // name_linux_amd64.tin: the part that depends on the CPU too (struct layouts).
-        let archf = cat_path(cat_path(cat_path(base, os_suffix()), arch_suffix()), ".tin");
-        if try_read_file(archf) {
-            vec_push(one, archf);
-        }
-        return one;
-    }
-    let d = rt_sys_opendir(base);
-    if !d {
-        return 0;
-    }
-    let out = vec_new();
-    while 1 {
-        let ent = rt_sys_readdir(d);
-        if !ent {
-            break;
-        }
-        let name = host_dirent_name(ent);
-        if ends_with(name, ".tin") && !ends_with(name, "_test.tin") && load8(name) != '.' && !other_os_file(name) {
-            vec_push(out, cat_path(cat_path(base, "/"), name));
-        }
-    }
-    rt_sys_closedir(d);
-    // Sorted, so builds do not depend on directory order.
-    let i = 1;
-    while i < out[VEC_LEN] {
-        let j = i;
-        while j > 0 && c_positive(strcmp(vec_get(out, j - 1), vec_get(out, j))) {
-            let t = vec_get(out, j);
-            out[VEC_DATA][j] = vec_get(out, j - 1);
-            out[VEC_DATA][j - 1] = t;
-            j = j - 1;
-        }
-        i = i + 1;
-    }
-    if out[VEC_LEN] == 0 {
-        return 0;
-    }
-    return out;
+fn package_files(base i64) i64 {
+	let single = cat_path(base, cstr(".tin"))
+	let probe = try_read_file(single)
+	if probe != 0 {
+		let one = vec_new()
+		vec_push(one, single)
+		// name_linux.tin / name_darwin.tin: the target OS's part of the package.
+		let osf = cat_path(cat_path(base, os_suffix()), cstr(".tin"))
+		if try_read_file(osf) != 0 {
+			vec_push(one, osf)
+		}
+		// name_linux_amd64.tin: the part that depends on the CPU too (struct layouts).
+		let archf = cat_path(cat_path(cat_path(base, os_suffix()), arch_suffix()), cstr(".tin"))
+		if try_read_file(archf) != 0 {
+			vec_push(one, archf)
+		}
+		return one
+	}
+	let d = rt_sys_opendir(base)
+	if d == 0 {
+		return 0
+	}
+	let out = vec_new()
+	for {
+		let ent = rt_sys_readdir(d)
+		if ent == 0 {
+			break
+		}
+		let name = host_dirent_name(ent)
+		if ends_with(name, cstr(".tin")) != 0 && ends_with(name, cstr("_test.tin")) == 0 && i64(load8(name)) != '.' && other_os_file(name) == 0 {
+			vec_push(out, cat_path(cat_path(base, cstr("/")), name))
+		}
+	}
+	rt_sys_closedir(d)
+	// Sorted, so builds do not depend on directory order.
+	mut i = 1
+	for i < out[VEC_LEN] {
+		mut j = i
+		for j > 0 && c_positive(strcmp(vec_get(out, j - 1), vec_get(out, j))) != 0 {
+			let t = vec_get(out, j)
+			out[VEC_DATA][j] = vec_get(out, j - 1)
+			out[VEC_DATA][j - 1] = t
+			j = j - 1
+		}
+		i = i + 1
+	}
+	if out[VEC_LEN] == 0 {
+		return 0
+	}
+	return out
 }
 
 // resolve_import finds an import's files: ./x and ../x next to the importing file,
 // otherwise the standard library, then the main program's directory.
-fn resolve_import(ipath, from) {
-    if load8(ipath) == '.' {
-        return package_files(cat_path(cat_path(dir_of(from), "/"), ipath));
-    }
-    // A path import (github.com/ana/geo) is read from vendor/ only: never lib/ or the network.
-    if remote_path(ipath) {
-        return package_files(cat_path(vendor_dir(), ipath));
-    }
-    let vendored = package_files(cat_path(vendor_dir(), ipath));
-    if vendored {
-        return vendored;
-    }
-    let std = package_files(cat_path(cat_path(lib_root, "/lib/"), ipath));
-    if std {
-        return std;
-    }
-    return package_files(cat_path(cat_path(dir_of(vec_get(files, 0)), "/"), ipath));
+fn resolve_import(ipath i64, from i64) i64 {
+	if i64(load8(ipath)) == '.' {
+		return package_files(cat_path(cat_path(dir_of(from), cstr("/")), ipath))
+	}
+	// A path import (github.com/ana/geo) is read from vendor/ only: never lib/ or the network.
+	if remote_path(ipath) != 0 {
+		return package_files(cat_path(vendor_dir(), ipath))
+	}
+	let vendored = package_files(cat_path(vendor_dir(), ipath))
+	if vendored != 0 {
+		return vendored
+	}
+	let std = package_files(cat_path(cat_path(lib_root, cstr("/lib/")), ipath))
+	if std != 0 {
+		return std
+	}
+	return package_files(cat_path(cat_path(dir_of(vec_get(files, 0)), cstr("/")), ipath))
 }
 
 // vendor_dir is the project's vendor/ directory, with a trailing slash ("vendor/" when the
 // program is in the current directory, so paths in messages do not start with ./).
-fn vendor_dir() {
-    if streq(project_root, ".") {
-        return "vendor/";
-    }
-    return cat_path(project_root, "/vendor/");
+fn vendor_dir() i64 {
+	if streq(project_root, cstr(".")) != 0 {
+		return cstr("vendor/")
+	}
+	return cat_path(project_root, cstr("/vendor/"))
 }
 
 // remote_path reports whether an import path names a package by where it comes from: its
 // first element contains a dot ("github.com/ana/geo", docs/PACKAGES.md).
-fn remote_path(ipath) {
-    let i = 0;
-    while load8(ipath + i) != 0 && load8(ipath + i) != '/' {
-        if load8(ipath + i) == '.' {
-            return i > 0;
-        }
-        i = i + 1;
-    }
-    return 0;
+fn remote_path(ipath i64) i64 {
+	mut i = 0
+	for i64(load8(ipath + i)) != 0 && i64(load8(ipath + i)) != '/' {
+		if i64(load8(ipath + i)) == '.' {
+			return i64(i > 0)
+		}
+		i = i + 1
+	}
+	return 0
 }
 
-var pkg_homes; // [package name, real path of its first file, import path] per resolved import
+shared mut pkg_homes i64 // [package name, real path of its first file, import path] per resolved import
 
 // check_pkg_home rejects two import paths that load different packages under one name: they
 // would merge into one package.
-fn check_pkg_home(ipath, found) {
-    let name = path_pkg(ipath);
-    let real = calloc(4096, 1);
-    if !host_realpath(vec_get(found, 0), real) {
-        return;
-    }
-    let i = 0;
-    while i < pkg_homes[VEC_LEN] {
-        let h = vec_get(pkg_homes, i);
-        if streq(vec_get(h, 0), name) {
-            if !streq(vec_get(h, 1), real) {
-                let e = err_code(NO_POS, "E113 PACKAGE_CONFLICT");
-                buf_str(e, "import paths \"");
-                buf_str(e, vec_get(h, 2));
-                buf_str(e, "\" and \"");
-                buf_str(e, ipath);
-                buf_str(e, "\" are different packages with the same name ");
-                buf_str(e, name);
-                fatal(e);
-            }
-            return;
-        }
-        i = i + 1;
-    }
-    let rec = vec_new();
-    vec_push(rec, name);
-    vec_push(rec, real);
-    vec_push(rec, ipath);
-    vec_push(pkg_homes, rec);
+fn check_pkg_home(ipath i64, found i64) {
+	let name = path_pkg(ipath)
+	let real = calloc(4096, 1)
+	if host_realpath(vec_get(found, 0), real) == 0 {
+		return
+	}
+	mut i = 0
+	for i < pkg_homes[VEC_LEN] {
+		let h = vec_get(pkg_homes, i)
+		if streq(vec_get(h, 0), name) != 0 {
+			if streq(vec_get(h, 1), real) == 0 {
+				let e = err_code(NO_POS, cstr("E113 PACKAGE_CONFLICT"))
+				buf_str(e, cstr("import paths \""))
+				buf_str(e, vec_get(h, 2))
+				buf_str(e, cstr("\" and \""))
+				buf_str(e, ipath)
+				buf_str(e, cstr("\" are different packages with the same name "))
+				buf_str(e, name)
+				fatal(e)
+			}
+			return
+		}
+		i = i + 1
+	}
+	let rec = vec_new()
+	vec_push(rec, name)
+	vec_push(rec, real)
+	vec_push(rec, ipath)
+	vec_push(pkg_homes, rec)
 }
 
 // load_imports parses every package any loaded file imports, transitively.
 fn load_imports() {
-    pkg_homes = vec_new();
-    let f = 0;
-    while f < files[VEC_LEN] {
-        let imps = vec_get(file_imports, f);
-        let i = 0;
-        while i < imps[VEC_LEN] {
-            let ipath = vec_get(vec_get(imps, i), 1);
-            let found = resolve_import(ipath, vec_get(files, f));
-            if !found && remote_path(ipath) {
-                let e = err_code(NO_POS, "E112 NOT_VENDORED");
-                buf_str(e, "package \"");
-                buf_str(e, ipath);
-                buf_str(e, "\" is not vendored: there is no vendor/");
-                buf_str(e, ipath);
-                buf_str(e, " in the program's directory (tin vendor copies it there; the build never fetches)");
-                fatal(e);
-            }
-            if !found {
-                let e = err_code(NO_POS, "E110 UNKNOWN_PACKAGE");
-                buf_str(e, "unknown package \"");
-                buf_str(e, ipath);
-                buf_str(e, "\" (looked in the standard library, next to the importing file and in the program's directory)");
-                fatal(e);
-            }
-            check_pkg_home(ipath, found);
-            // A vendored package is restricted to its manifest's capabilities; a package a
-            // vendored file imports relatively is part of the same package.
-            let cpkg = vendored_package(ipath, found);
-            if !cpkg && load8(ipath) == '.' {
-                cpkg = vec_get(file_cap_pkg, f);
-            }
-            let k = 0;
-            while k < found[VEC_LEN] {
-                let path = vec_get(found, k);
-                if !is_loaded(path) {
-                    let std = starts_with(path, cat_path(lib_root, "/lib/"));
-                    // A changed dependency is reported by its hash before it is parsed.
-                    if !std {
-                        lock_has(path);
-                    }
-                    // Only the standard library (and a package granted unsafe) may use the raw operations.
-                    load_unsafe = !std && cpkg && (cpkg[CP_CAPS] & CAP_UNSAFE);
-                    load_file_trusted(path, std || load_unsafe);
-                    load_unsafe = 0;
-                    file_cap_pkg[VEC_DATA][files[VEC_LEN] - 1] = cpkg;
-                }
-                k = k + 1;
-            }
-            i = i + 1;
-        }
-        f = f + 1;
-    }
+	pkg_homes = vec_new()
+	mut f = 0
+	for f < files[VEC_LEN] {
+		let imps = vec_get(file_imports, f)
+		mut i = 0
+		for i < imps[VEC_LEN] {
+			let ipath = vec_get(vec_get(imps, i), 1)
+			let found = resolve_import(ipath, vec_get(files, f))
+			if found == 0 && remote_path(ipath) != 0 {
+				let e = err_code(NO_POS, cstr("E112 NOT_VENDORED"))
+				buf_str(e, cstr("package \""))
+				buf_str(e, ipath)
+				buf_str(e, cstr("\" is not vendored: there is no vendor/"))
+				buf_str(e, ipath)
+				buf_str(e, cstr(" in the program's directory (tin vendor copies it there; the build never fetches)"))
+				fatal(e)
+			}
+			if found == 0 {
+				let e = err_code(NO_POS, cstr("E110 UNKNOWN_PACKAGE"))
+				buf_str(e, cstr("unknown package \""))
+				buf_str(e, ipath)
+				buf_str(e, cstr("\" (looked in the standard library, next to the importing file and in the program's directory)"))
+				fatal(e)
+			}
+			check_pkg_home(ipath, found)
+			// A vendored package is restricted to its manifest's capabilities; a package a
+			// vendored file imports relatively is part of the same package.
+			mut cpkg = vendored_package(ipath, found)
+			if cpkg == 0 && i64(load8(ipath)) == '.' {
+				cpkg = vec_get(file_cap_pkg, f)
+			}
+			mut k = 0
+			for k < found[VEC_LEN] {
+				let path = vec_get(found, k)
+				if is_loaded(path) == 0 {
+					let std = starts_with(path, cat_path(lib_root, cstr("/lib/")))
+					// A changed dependency is reported by its hash before it is parsed.
+					if std == 0 {
+						lock_has(path)
+					}
+					// Only the standard library (and a package granted unsafe) may use the raw operations.
+					load_unsafe = i64(std == 0 && cpkg != 0 && (cpkg[CP_CAPS] & CAP_UNSAFE) != 0)
+					load_file_trusted(path, i64(std != 0 || load_unsafe != 0))
+					load_unsafe = 0
+					file_cap_pkg[VEC_DATA][files[VEC_LEN] - 1] = cpkg
+				}
+				k = k + 1
+			}
+			i = i + 1
+		}
+		f = f + 1
+	}
 }
 
 // other_os_file reports whether a file belongs to the other OS (x_linux.tin on macOS).
-fn other_os_file(name) {
-    if tgt_linux {
-        return ends_with(name, "_darwin.tin") || ends_with(name, other_arch_suffix());
-    }
-    return ends_with(name, "_linux.tin") || ends_with(name, "_linux_arm64.tin") || ends_with(name, "_linux_amd64.tin");
+fn other_os_file(name i64) i64 {
+	if tgt_linux != 0 {
+		return i64(ends_with(name, cstr("_darwin.tin")) != 0 || ends_with(name, other_arch_suffix()) != 0)
+	}
+	return i64(ends_with(name, cstr("_linux.tin")) != 0 || ends_with(name, cstr("_linux_arm64.tin")) != 0 || ends_with(name, cstr("_linux_amd64.tin")) != 0)
 }
 
-fn other_arch_suffix() {
-    if tgt_x64 {
-        return "_arm64.tin";
-    }
-    return "_amd64.tin";
+fn other_arch_suffix() i64 {
+	if tgt_x64 != 0 {
+		return cstr("_arm64.tin")
+	}
+	return cstr("_amd64.tin")
 }
 
 // c_positive reports whether a C int result (low 32 bits) is above zero.
-fn c_positive(r) {
-    let w = r & 0xffffffff;
-    return w != 0 && (w & 0x80000000) == 0;
+fn c_positive(r i64) i64 {
+	let w = r & 0xffffffff
+	return i64(w != 0 && (w & 0x80000000) == 0)
 }
 
-fn starts_with(s, prefix) {
-    let i = 0;
-    while load8(prefix + i) != 0 {
-        if load8(s + i) != load8(prefix + i) {
-            return 0;
-        }
-        i = i + 1;
-    }
-    return 1;
+fn starts_with(s i64, prefix i64) i64 {
+	mut i = 0
+	for i64(load8(prefix + i)) != 0 {
+		if i64(load8(s + i)) != i64(load8(prefix + i)) {
+			return 0
+		}
+		i = i + 1
+	}
+	return 1
 }
 
-fn bytes_equal(a, b, n) {
-    let i = 0;
-    while i < n {
-        if load8(a + i) != load8(b + i) {
-            return 0;
-        }
-        i = i + 1;
-    }
-    return 1;
+fn bytes_equal(a i64, b i64, n i64) i64 {
+	mut i = 0
+	for i < n {
+		if i64(load8(a + i)) != i64(load8(b + i)) {
+			return 0
+		}
+		i = i + 1
+	}
+	return 1
 }
 
-fn hex_nibble(v) {
-    if v < 10 {
-        return '0' + v;
-    }
-    return 'a' + v - 10;
+fn hex_nibble(v i64) i64 {
+	if v < 10 {
+		return '0' + v
+	}
+	return 'a' + v - 10
 }
 
-fn digest_hex(d) {
-    let out = buf_new();
-    let i = 0;
-    while i < 32 {
-        let v = load8(d + i);
-        buf_byte(out, hex_nibble(v >> 4));
-        buf_byte(out, hex_nibble(v & 15));
-        i = i + 1;
-    }
-    buf_byte(out, 0);
-    return out[VEC_DATA];
+fn digest_hex(d i64) i64 {
+	let out = buf_new()
+	mut i = 0
+	for i < 32 {
+		let v = i64(load8(d + i))
+		buf_byte(out, hex_nibble(v >> 4))
+		buf_byte(out, hex_nibble(v & 15))
+		i = i + 1
+	}
+	buf_byte(out, 0)
+	return out[VEC_DATA]
 }
 
 // lock_entry returns the hash tin.lock records for a project-relative path (a C string of
 // 64 hex digits), or 0 when the lock has no line for it.
-fn lock_entry(rel) {
-    let data = project_lock[VEC_DATA];
-    let n = project_lock[VEC_LEN];
-    let m = strlen(rel);
-    let i = 0;
-    while i < n {
-        let end = i;
-        while end < n && load8(data + end) != '\n' {
-            end = end + 1;
-        }
-        // <64 hex> <path>: the path runs to the end of the line.
-        if end - i == 65 + m && load8(data + i + 64) == ' ' && bytes_equal(data + i + 65, rel, m) {
-            let h = buf_new();
-            let j = 0;
-            while j < 64 {
-                buf_byte(h, load8(data + i + j));
-                j = j + 1;
-            }
-            buf_byte(h, 0);
-            return h[VEC_DATA];
-        }
-        i = end + 1;
-    }
-    return 0;
+fn lock_entry(rel i64) i64 {
+	let data = project_lock[VEC_DATA]
+	let n = project_lock[VEC_LEN]
+	let m = strlen(rel)
+	mut i = 0
+	for i < n {
+		mut end = i
+		for end < n && i64(load8(data + end)) != '\n' {
+			end = end + 1
+		}
+		// <64 hex> <path>: the path runs to the end of the line.
+		if end - i == 65 + m && i64(load8(data + i + 64)) == ' ' && bytes_equal(data + i + 65, rel, m) != 0 {
+			let h = buf_new()
+			mut j = 0
+			for j < 64 {
+				buf_byte(h, i64(load8(data + i + j)))
+				j = j + 1
+			}
+			buf_byte(h, 0)
+			return h[VEC_DATA]
+		}
+		i = end + 1
+	}
+	return 0
 }
 
 // lock_has checks a loaded file against tin.lock: a vendored file must be listed with its
 // hash, and any other file the lock lists must still have the recorded hash.
-fn lock_has(path) {
-    if !project_lock {
-        return 1;
-    }
-    let rel = path;
-    let plen = strlen(project_root);
-    if starts_with(path, project_root) && load8(path + plen) == '/' {
-        rel = path + plen + 1;
-    }
-    while starts_with(rel, "./") {
-        rel = rel + 2;
-    }
-    let src = read_file(path);
-    let digest = calloc(32, 1);
-    sha256(src[VEC_DATA], src[VEC_LEN], digest);
-    let hex = digest_hex(digest);
-    let want = lock_entry(rel);
-    if want && streq(want, hex) {
-        return 1;
-    }
-    if !want && !starts_with(rel, "vendor/") {
-        return 1;
-    }
-    let e = err_code(NO_POS, "E111 LOCK_MISMATCH");
-    if want {
-        buf_str(e, "tin.lock hash mismatch for ");
-        buf_str(e, rel);
-        buf_str(e, ": the lock records sha256 ");
-        buf_str(e, want);
-        buf_str(e, ", the file has ");
-        buf_str(e, hex);
-    } else {
-        buf_str(e, "tin.lock has no entry for ");
-        buf_str(e, rel);
-        buf_str(e, " (sha256 ");
-        buf_str(e, hex);
-        buf_str(e, "); every vendored file must be locked");
-    }
-    fatal(e);
-    return 0;
+fn lock_has(path i64) i64 {
+	if project_lock == 0 {
+		return 1
+	}
+	mut rel = path
+	let plen = strlen(project_root)
+	if starts_with(path, project_root) != 0 && i64(load8(path + plen)) == '/' {
+		rel = path + plen + 1
+	}
+	for starts_with(rel, cstr("./")) != 0 {
+		rel = rel + 2
+	}
+	let src = read_file(path)
+	let digest = calloc(32, 1)
+	sha256(src[VEC_DATA], src[VEC_LEN], digest)
+	let hex = digest_hex(digest)
+	let want = lock_entry(rel)
+	if want != 0 && streq(want, hex) != 0 {
+		return 1
+	}
+	if want == 0 && starts_with(rel, cstr("vendor/")) == 0 {
+		return 1
+	}
+	let e = err_code(NO_POS, cstr("E111 LOCK_MISMATCH"))
+	if want != 0 {
+		buf_str(e, cstr("tin.lock hash mismatch for "))
+		buf_str(e, rel)
+		buf_str(e, cstr(": the lock records sha256 "))
+		buf_str(e, want)
+		buf_str(e, cstr(", the file has "))
+		buf_str(e, hex)
+	} else {
+		buf_str(e, cstr("tin.lock has no entry for "))
+		buf_str(e, rel)
+		buf_str(e, cstr(" (sha256 "))
+		buf_str(e, hex)
+		buf_str(e, cstr("); every vendored file must be locked"))
+	}
+	fatal(e)
+	return 0
 }
 
 fn verify_lock() {
-    if !project_lock {
-        return;
-    }
-    let i = 0;
-    while i < files[VEC_LEN] {
-        let path = vec_get(files, i);
-        if !starts_with(path, cat_path(lib_root, "/lib/")) {
-            lock_has(path);
-        }
-        i = i + 1;
-    }
+	if project_lock == 0 {
+		return
+	}
+	mut i = 0
+	for i < files[VEC_LEN] {
+		let path = vec_get(files, i)
+		if starts_with(path, cat_path(lib_root, cstr("/lib/"))) == 0 {
+			lock_has(path)
+		}
+		i = i + 1
+	}
 }
 
 // print_hashes prints "<sha256> <path>" for each file, the lines tin vendor writes to tin.lock.
-fn print_hashes(argc, argv) {
-    let out = buf_new();
-    let i = 2;
-    while i < argc {
-        let src = read_file(argv[i]);
-        let digest = calloc(32, 1);
-        sha256(src[VEC_DATA], src[VEC_LEN], digest);
-        buf_str(out, digest_hex(digest));
-        buf_byte(out, ' ');
-        buf_str(out, argv[i]);
-        buf_byte(out, '\n');
-        i = i + 1;
-    }
-    write_all(1, out);
-    return 0;
+fn print_hashes(argc i64, argv i64) i64 {
+	let out = buf_new()
+	mut i = 2
+	for i < argc {
+		let src = read_file(argv[i])
+		let digest = calloc(32, 1)
+		sha256(src[VEC_DATA], src[VEC_LEN], digest)
+		buf_str(out, digest_hex(digest))
+		buf_byte(out, ' ')
+		buf_str(out, argv[i])
+		buf_byte(out, '\n')
+		i = i + 1
+	}
+	write_all(1, out)
+	return 0
 }
 
-fn compiler_main(argc, argv) {
-    host_start(argc, argv);
-    if argc > 1 && streq(argv[1], "-hash") {
-        return print_hashes(argc, argv);
-    }
-    files = vec_new();
-    file_trusted = vec_new();
-    file_cap_pkg = vec_new();
-    cap_pkgs = vec_new();
-    parse_setup();
-    types_init();
-    let asm_only = 0;
-    let parse_only = 0;
-    let audit_secrets = 0;
-    let fix_edition1 = 0;
-    compiler_edition = -1;
-    compiler_polls = 0;
-    let polls_env = host_getenv("TINC_POLLS");
-    if polls_env && load8(polls_env) == '1' { compiler_polls = 1; }
-    let out_path = "a.out";
-    tgt_linux = host_is_linux();
-    tgt_x64 = host_is_x64();
-    let i = 1;
-    while i < argc {
-        let a = argv[i];
-        if streq(a, "-target") && i + 1 < argc {
-            i = i + 1;
-            set_target(argv[i]);
-        } else if streq(a, "-edition") && i + 1 < argc {
-            i = i + 1;
-            if streq(argv[i], "0") {
-                compiler_edition = 0;
-            } else if streq(argv[i], "1") {
-                compiler_edition = 1;
-            } else {
-                let e = err_code(NO_POS, "E902 UNKNOWN_EDITION");
-                buf_str(e, "unknown edition ");
-                buf_str(e, argv[i]);
-                buf_str(e, " (expected 0 or 1)");
-                fatal(e);
-            }
-        } else if streq(a, "-polls") {
-            compiler_polls = 1;
-        } else if streq(a, "-parse-only") {
-            parse_only = 1;
-            compiler_parse_only = 1;
-        } else if streq(a, "-caps") {
-            // tin caps: check the program, then print the capabilities each package can reach.
-            caps_report = 1;
-        } else if streq(a, "-audit-secrets") {
-            // tin audit secrets: check the program, then list every place a secret leaves.
-            audit_secrets = 1;
-        } else if streq(a, "-fix") {
-            fix_edition1 = 1;
-            compiler_fix = 1;
-        } else if streq(a, "-entry") && i + 1 < argc {
-            // -entry pkg.Name: start the program at that function instead of main (tin test).
-            i = i + 1;
-            entry_name = argv[i];
-        } else if streq(a, "-strip") {
-            // -strip: a Linux executable without section headers and symbol table (#351)
-            link_strip = 1;
-        } else if streq(a, "-S") {
-            asm_only = 1;
-        } else if streq(a, "-o") && i + 1 < argc {
-            i = i + 1;
-            out_path = argv[i];
-        } else {
-            load_file(a);
-        }
-        i = i + 1;
-    }
-    if files[VEC_LEN] == 0 {
-        return usage();
-    }
-    if fix_edition1 {
-        if compiler_edition != 1 || files[VEC_LEN] != 1 {
-            let e = err_code(NO_POS, "E906 FIX_USAGE");
-            buf_str(e, "-fix translates one file to edition 1: pass -edition 1 and exactly one file");
-            fatal(e);
-        }
-        let source = vec_get(file_sources, 0);
-        let toks = vec_get(file_tokens, 0);
-        fx_trusted = vec_get(file_trusted, 0);
-        fx_path = vec_get(files, 0);
-        let rewritten = print_edition1(0, source[VEC_DATA], toks);
-        write_all(1, rewritten);
-        return 0;
-    }
-    if parse_only {
-        return 0;
-    }
-    let v2 = 0;
-    i = 0;
-    while i < file_v2[VEC_LEN] {
-        if vec_get(file_v2, i) {
-            v2 = 1;
-        }
-        i = i + 1;
-    }
-    if v2 {
-        lib_root = find_root();
-        project_root = dir_of(vec_get(files, 0));
-        project_lock = try_read_file(cat_path(project_root, "/tin.lock"));
-        // The runtime is the package lib/runtime: every file of it for this OS and CPU.
-        let rtfiles = package_files(cat_path(lib_root, "/lib/runtime"));
-        if !rtfiles {
-            let e = err_code(NO_POS, "E903 NO_RUNTIME");
-            buf_str(e, "the runtime package is missing: no lib/runtime in ");
-            buf_str(e, lib_root);
-            fatal(e);
-        }
-        let rk = 0;
-        while rk < rtfiles[VEC_LEN] {
-            let rpath = vec_get(rtfiles, rk);
-            if !is_loaded(rpath) {
-                load_file_trusted(rpath, 1);
-            }
-            rk = rk + 1;
-        }
-        load_imports();
-        verify_lock();
-    }
-    check();
-    if error_count > 0 {
-        return 1;
-    }
-    if v2 {
-        check_capabilities();
-        if error_count > 0 {
-            return 1;
-        }
-        if caps_report {
-            print_capabilities();
-            return 0;
-        }
-    }
-    if audit_secrets {
-        secret_audit_print();
-        return 0;
-    }
-    if v2 {
-        region_check();
-        if error_count > 0 {
-            return 1;
-        }
-        rc_mark();
-        if error_count > 0 {
-            return 1;
-        }
-    }
-    generate();
-    if error_count > 0 {
-        return 1;
-    }
-    if asm_only && tgt_x64 {
-        write_all(1, print_asm_x64());
-    } else if asm_only {
-        write_all(1, print_asm());
-    } else if tgt_x64 {
-        write_elf_x64(out_path);
-    } else if tgt_linux {
-        write_elf(out_path);
-    } else {
-        write_executable(out_path);
-    }
-    return 0;
+fn compiler_main(argc i64, argv i64) i64 {
+	host_start(argc, argv)
+	if argc > 1 && streq(argv[1], cstr("-hash")) != 0 {
+		return print_hashes(argc, argv)
+	}
+	files = vec_new()
+	file_trusted = vec_new()
+	file_cap_pkg = vec_new()
+	cap_pkgs = vec_new()
+	parse_setup()
+	types_init()
+	mut asm_only = 0
+	mut parse_only = 0
+	mut audit_secrets = 0
+	mut fix_edition1 = 0
+	compiler_edition = -1
+	compiler_polls = 0
+	let polls_env = host_getenv(cstr("TINC_POLLS"))
+	if polls_env != 0 && i64(load8(polls_env)) == '1' {
+		compiler_polls = 1
+	}
+	mut out_path = cstr("a.out")
+	tgt_linux = host_is_linux()
+	tgt_x64 = host_is_x64()
+	mut i = 1
+	for i < argc {
+		let a = argv[i]
+		if streq(a, cstr("-target")) != 0 && i + 1 < argc {
+			i = i + 1
+			set_target(argv[i])
+		} else if streq(a, cstr("-edition")) != 0 && i + 1 < argc {
+			i = i + 1
+			if streq(argv[i], cstr("0")) != 0 {
+				compiler_edition = 0
+			} else if streq(argv[i], cstr("1")) != 0 {
+				compiler_edition = 1
+			} else {
+				let e = err_code(NO_POS, cstr("E902 UNKNOWN_EDITION"))
+				buf_str(e, cstr("unknown edition "))
+				buf_str(e, argv[i])
+				buf_str(e, cstr(" (expected 0 or 1)"))
+				fatal(e)
+			}
+		} else if streq(a, cstr("-polls")) != 0 {
+			compiler_polls = 1
+		} else if streq(a, cstr("-parse-only")) != 0 {
+			parse_only = 1
+			compiler_parse_only = 1
+		} else if streq(a, cstr("-caps")) != 0 {
+			// tin caps: check the program, then print the capabilities each package can reach.
+			caps_report = 1
+		} else if streq(a, cstr("-audit-secrets")) != 0 {
+			// tin audit secrets: check the program, then list every place a secret leaves.
+			audit_secrets = 1
+		} else if streq(a, cstr("-fix")) != 0 {
+			fix_edition1 = 1
+			compiler_fix = 1
+		} else if streq(a, cstr("-entry")) != 0 && i + 1 < argc {
+			// -entry pkg.Name: start the program at that function instead of main (tin test).
+			i = i + 1
+			entry_name = argv[i]
+		} else if streq(a, cstr("-strip")) != 0 {
+			// -strip: a Linux executable without section headers and symbol table (#351)
+			link_strip = 1
+		} else if streq(a, cstr("-S")) != 0 {
+			asm_only = 1
+		} else if streq(a, cstr("-o")) != 0 && i + 1 < argc {
+			i = i + 1
+			out_path = argv[i]
+		} else {
+			load_file(a)
+		}
+		i = i + 1
+	}
+	if files[VEC_LEN] == 0 {
+		return usage()
+	}
+	if fix_edition1 != 0 {
+		if compiler_edition != 1 || files[VEC_LEN] != 1 {
+			let e = err_code(NO_POS, cstr("E906 FIX_USAGE"))
+			buf_str(e, cstr("-fix translates one file to edition 1: pass -edition 1 and exactly one file"))
+			fatal(e)
+		}
+		let source = vec_get(file_sources, 0)
+		let toks = vec_get(file_tokens, 0)
+		fx_trusted = vec_get(file_trusted, 0)
+		fx_path = vec_get(files, 0)
+		let rewritten = print_edition1(0, source[VEC_DATA], toks)
+		write_all(1, rewritten)
+		return 0
+	}
+	if parse_only != 0 {
+		return 0
+	}
+	mut v2 = 0
+	i = 0
+	for i < file_v2[VEC_LEN] {
+		if vec_get(file_v2, i) != 0 {
+			v2 = 1
+		}
+		i = i + 1
+	}
+	if v2 != 0 {
+		lib_root = find_root()
+		project_root = dir_of(vec_get(files, 0))
+		project_lock = try_read_file(cat_path(project_root, cstr("/tin.lock")))
+		// The runtime is the package lib/runtime: every file of it for this OS and CPU.
+		let rtfiles = package_files(cat_path(lib_root, cstr("/lib/runtime")))
+		if rtfiles == 0 {
+			let e = err_code(NO_POS, cstr("E903 NO_RUNTIME"))
+			buf_str(e, cstr("the runtime package is missing: no lib/runtime in "))
+			buf_str(e, lib_root)
+			fatal(e)
+		}
+		mut rk = 0
+		for rk < rtfiles[VEC_LEN] {
+			let rpath = vec_get(rtfiles, rk)
+			if is_loaded(rpath) == 0 {
+				load_file_trusted(rpath, 1)
+			}
+			rk = rk + 1
+		}
+		load_imports()
+		verify_lock()
+	}
+	check()
+	if error_count > 0 {
+		return 1
+	}
+	if v2 != 0 {
+		check_capabilities()
+		if error_count > 0 {
+			return 1
+		}
+		if caps_report != 0 {
+			print_capabilities()
+			return 0
+		}
+	}
+	if audit_secrets != 0 {
+		secret_audit_print()
+		return 0
+	}
+	if v2 != 0 {
+		region_check()
+		if error_count > 0 {
+			return 1
+		}
+		rc_mark()
+		if error_count > 0 {
+			return 1
+		}
+	}
+	generate()
+	if error_count > 0 {
+		return 1
+	}
+	if asm_only != 0 && tgt_x64 != 0 {
+		write_all(1, print_asm_x64())
+	} else if asm_only != 0 {
+		write_all(1, print_asm())
+	} else if tgt_x64 != 0 {
+		write_elf_x64(out_path)
+	} else if tgt_linux != 0 {
+		write_elf(out_path)
+	} else {
+		write_executable(out_path)
+	}
+	return 0
 }
-
 
 // source_has_word reports whether the word appears in src outside comments and strings.
-fn source_has_word(src, n, word) {
-    let wn = strlen(word);
-    let i = 0;
-    while i < n {
-        let c = load8(src + i);
-        if c == '/' && i + 1 < n && load8(src + i + 1) == '/' {
-            while i < n && load8(src + i) != '\n' { i = i + 1; }
-        } else if c == '/' && i + 1 < n && load8(src + i + 1) == '*' {
-            i = i + 2;
-            while i + 1 < n && !(load8(src + i) == '*' && load8(src + i + 1) == '/') { i = i + 1; }
-            i = i + 2;
-        } else if c == '"' || c == '`' || c == '\'' {
-            let quote = c;
-            i = i + 1;
-            while i < n && load8(src + i) != quote {
-                if quote != '`' && load8(src + i) == '\\' && i + 1 < n { i = i + 1; }
-                i = i + 1;
-            }
-            i = i + 1;
-        } else if is_letter(c) {
-            let start = i;
-            while i < n && (is_letter(load8(src + i)) || is_digit(load8(src + i))) { i = i + 1; }
-            if i - start == wn && mem_eq(src + start, word, wn) {
-                return 1;
-            }
-        } else {
-            i = i + 1;
-        }
-    }
-    return 0;
+fn source_has_word(src i64, n i64, word i64) i64 {
+	let wn = strlen(word)
+	mut i = 0
+	for i < n {
+		let c = i64(load8(src + i))
+		if c == '/' && i + 1 < n && i64(load8(src + i + 1)) == '/' {
+			for i < n && i64(load8(src + i)) != '\n' {
+				i = i + 1
+			}
+		} else if c == '/' && i + 1 < n && i64(load8(src + i + 1)) == '*' {
+			i = i + 2
+			for i + 1 < n && !(i64(load8(src + i)) == '*' && i64(load8(src + i + 1)) == '/') {
+				i = i + 1
+			}
+			i = i + 2
+		} else if c == '"' || c == '`' || c == '\'' {
+			let quote = c
+			i = i + 1
+			for i < n && i64(load8(src + i)) != quote {
+				if quote != '`' && i64(load8(src + i)) == '\\' && i + 1 < n {
+					i = i + 1
+				}
+				i = i + 1
+			}
+			i = i + 1
+		} else if is_letter(c) != 0 {
+			let start = i
+			for i < n && (is_letter(i64(load8(src + i))) != 0 || is_digit(i64(load8(src + i))) != 0) {
+				i = i + 1
+			}
+			if i - start == wn && mem_eq(src + start, word, wn) != 0 {
+				return 1
+			}
+		} else {
+			i = i + 1
+		}
+	}
+	return 0
 }
 
 // source_edition is 1 for a file written in edition 1: no `func`, `var`, `:=` or `;` (outside
 // comments and strings), which edition 0 code and the compiler's legacy dialect always have.
 // A file of only constants and types reads the same in both.
-fn source_edition(src, n) {
-    let i = 0;
-    while i < n {
-        let c = load8(src + i);
-        if c == '/' && i + 1 < n && load8(src + i + 1) == '/' {
-            while i < n && load8(src + i) != '\n' { i = i + 1; }
-        } else if c == '/' && i + 1 < n && load8(src + i + 1) == '*' {
-            i = i + 2;
-            while i + 1 < n && !(load8(src + i) == '*' && load8(src + i + 1) == '/') { i = i + 1; }
-            i = i + 2;
-        } else if c == '"' || c == '`' || c == '\'' {
-            let quote = c;
-            i = i + 1;
-            while i < n && load8(src + i) != quote {
-                if quote != '`' && load8(src + i) == '\\' && i + 1 < n { i = i + 1; }
-                i = i + 1;
-            }
-            i = i + 1;
-        } else if c == ';' || (c == ':' && i + 1 < n && load8(src + i + 1) == '=') {
-            return 0;
-        } else if is_letter(c) {
-            let start = i;
-            while i < n && (is_letter(load8(src + i)) || is_digit(load8(src + i))) { i = i + 1; }
-            let len = i - start;
-            if (len == 4 && mem_eq(src + start, "func", 4)) || (len == 3 && mem_eq(src + start, "var", 3)) {
-                return 0;
-            }
-        } else {
-            i = i + 1;
-        }
-    }
-    return 1;
+fn source_edition(src i64, n i64) i64 {
+	mut i = 0
+	for i < n {
+		let c = i64(load8(src + i))
+		if c == '/' && i + 1 < n && i64(load8(src + i + 1)) == '/' {
+			for i < n && i64(load8(src + i)) != '\n' {
+				i = i + 1
+			}
+		} else if c == '/' && i + 1 < n && i64(load8(src + i + 1)) == '*' {
+			i = i + 2
+			for i + 1 < n && !(i64(load8(src + i)) == '*' && i64(load8(src + i + 1)) == '/') {
+				i = i + 1
+			}
+			i = i + 2
+		} else if c == '"' || c == '`' || c == '\'' {
+			let quote = c
+			i = i + 1
+			for i < n && i64(load8(src + i)) != quote {
+				if quote != '`' && i64(load8(src + i)) == '\\' && i + 1 < n {
+					i = i + 1
+				}
+				i = i + 1
+			}
+			i = i + 1
+		} else if c == ';' || (c == ':' && i + 1 < n && i64(load8(src + i + 1)) == '=') {
+			return 0
+		} else if is_letter(c) != 0 {
+			let start = i
+			for i < n && (is_letter(i64(load8(src + i))) != 0 || is_digit(i64(load8(src + i))) != 0) {
+				i = i + 1
+			}
+			let len_ = i - start
+			if (len_ == 4 && mem_eq(src + start, cstr("func"), 4) != 0) || (len_ == 3 && mem_eq(src + start, cstr("var"), 3) != 0) {
+				return 0
+			}
+		} else {
+			i = i + 1
+		}
+	}
+	return 1
 }
 
 // fix_source_is_edition1 recognizes translated package files so repeated runs are a no-op.
-fn fix_source_is_edition1(src, n) {
-    let saw_package = 0;
-    let saw_function = 0;
-    let i = 0;
-    while i < n {
-        let c = load8(src + i);
-        if c == '/' && i + 1 < n && load8(src + i + 1) == '/' {
-            while i < n && load8(src + i) != '\n' { i = i + 1; }
-        } else if c == '/' && i + 1 < n && load8(src + i + 1) == '*' {
-            i = i + 2;
-            while i + 1 < n && !(load8(src + i) == '*' && load8(src + i + 1) == '/') { i = i + 1; }
-            i = i + 2;
-        } else if c == '"' || c == '`' || c == '\'' {
-            let quote = c;
-            i = i + 1;
-            while i < n && load8(src + i) != quote {
-                if quote == '"' && load8(src + i) == '\\' && i + 1 < n { i = i + 1; }
-                i = i + 1;
-            }
-            i = i + 1;
-        } else if is_letter(c) {
-            let start = i;
-            while i < n && (is_letter(load8(src + i)) || is_digit(load8(src + i))) { i = i + 1; }
-            let len = i - start;
-            if len == 7 && mem_eq(src + start, "package", 7) { saw_package = 1; }
-            if len == 2 && mem_eq(src + start, "fn", 2) { saw_function = 1; }
-        } else {
-            i = i + 1;
-        }
-    }
-    return saw_package && saw_function;
+fn fix_source_is_edition1(src i64, n i64) i64 {
+	mut saw_package = 0
+	mut saw_function = 0
+	mut i = 0
+	for i < n {
+		let c = i64(load8(src + i))
+		if c == '/' && i + 1 < n && i64(load8(src + i + 1)) == '/' {
+			for i < n && i64(load8(src + i)) != '\n' {
+				i = i + 1
+			}
+		} else if c == '/' && i + 1 < n && i64(load8(src + i + 1)) == '*' {
+			i = i + 2
+			for i + 1 < n && !(i64(load8(src + i)) == '*' && i64(load8(src + i + 1)) == '/') {
+				i = i + 1
+			}
+			i = i + 2
+		} else if c == '"' || c == '`' || c == '\'' {
+			let quote = c
+			i = i + 1
+			for i < n && i64(load8(src + i)) != quote {
+				if quote == '"' && i64(load8(src + i)) == '\\' && i + 1 < n {
+					i = i + 1
+				}
+				i = i + 1
+			}
+			i = i + 1
+		} else if is_letter(c) != 0 {
+			let start = i
+			for i < n && (is_letter(i64(load8(src + i))) != 0 || is_digit(i64(load8(src + i))) != 0) {
+				i = i + 1
+			}
+			let len_ = i - start
+			if len_ == 7 && mem_eq(src + start, cstr("package"), 7) != 0 {
+				saw_package = 1
+			}
+			if len_ == 2 && mem_eq(src + start, cstr("fn"), 2) != 0 {
+				saw_function = 1
+			}
+		} else {
+			i = i + 1
+		}
+	}
+	return i64(saw_package != 0 && saw_function != 0)
 }

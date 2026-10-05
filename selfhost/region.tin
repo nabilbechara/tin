@@ -10,793 +10,797 @@
 // Functions are summarized (which parameters they store into and what they store, what
 // their containers hold, and where their results come from) and the summaries are
 // iterated to a fixed point.
+const RG_FRESH = 1 // may be a fresh allocation from the current request's pool
+const RG_INGOT = 2 // may be long-lived (a global or something reachable from one)
+const RG_UNK = 4 // origin unknown: treated as long-lived when stored into
+const RG_EMB = 8 // the value may point into request memory
+const RG_OUT = 16 // in an arena's closure: made outside the arena (#236)
+const RG_P0 = 256 // derived from parameter i: bit 8 + i
+const RG_MAXP = 48
 
-const RG_FRESH = 1;   // may be a fresh allocation from the current request's pool
-const RG_INGOT = 2;   // may be long-lived (a global or something reachable from one)
-const RG_UNK = 4;     // origin unknown: treated as long-lived when stored into
-const RG_EMB = 8;     // the value may point into request memory
-const RG_OUT = 16;    // in an arena's closure: made outside the arena (#236)
-const RG_P0 = 256;    // derived from parameter i: bit 8 + i
-const RG_MAXP = 48;
+const F_REGSUM = 26 // [sink param bits, held pairs, result bits 0..7, sink records, store records]
 
-const F_REGSUM = 26;  // [sink param bits, held pairs, result bits 0..7, sink records, store records]
+shared mut rg_fn i64
+shared mut rg_sum i64
+shared mut rg_report i64
+shared mut rg_changed i64 // a summary grew: another round is needed
+shared mut rg_lchanged i64 // a local's bits grew
+shared mut rg_nparams i64
+shared mut rg_multi i64 // per-result bits of the last call (for ST_CALLMULTI)
+shared mut rg_modrep i64 // parameters already reported as modified
+shared mut rg_held i64 // [type, bits] pairs: origins held by containers that may not be long-lived
+shared mut rg_fnsum i64 // the summaries of all functions used as values, joined (indirect calls)
+shared mut rs_active i64 // the use-after-reset walk is running (rs_walk)
+shared mut rs_dead i64 // locals that may hold request memory from before a hearth.Reset()
+shared mut rs_said i64 // locals already reported
+shared mut rs_cur i64 // [local, bits] of each local's latest assignment on the walk (else S_REGION)
 
-var rg_fn;
-var rg_sum;
-var rg_report;
-var rg_changed;   // a summary grew: another round is needed
-var rg_lchanged;  // a local's bits grew
-var rg_nparams;
-var rg_multi;     // per-result bits of the last call (for ST_CALLMULTI)
-var rg_modrep;    // parameters already reported as modified
-var rg_held;      // [type, bits] pairs: origins held by containers that may not be long-lived
-var rg_fnsum;     // the summaries of all functions used as values, joined (indirect calls)
-var rs_active;    // the use-after-reset walk is running (rs_walk)
-var rs_dead;      // locals that may hold request memory from before a hearth.Reset()
-var rs_said;      // locals already reported
-var rs_cur;       // [local, bits] of each local's latest assignment on the walk (else S_REGION)
-
-fn has_ptr(t) {
-    let k = kind_of(t);
-    if k == K_OPT {
-        return has_ptr(t[TY_ELEM]);
-    }
-    if k == K_DYN {
-        // A dyn value's bits are its object's; the table is static.
-        return 1;
-    }
-    return k == K_STRING || k == K_STRUCT || k == K_SLICE || k == K_MAP || k == K_ERROR || k == K_FUNC;
+fn has_ptr(t i64) i64 {
+	let k = kind_of(t)
+	if k == K_OPT {
+		return has_ptr(t[TY_ELEM])
+	}
+	if k == K_DYN {
+		// A dyn value's bits are its object's; the table is static.
+		return 1
+	}
+	return i64(k == K_STRING || k == K_STRUCT || k == K_SLICE || k == K_MAP || k == K_ERROR || k == K_FUNC)
 }
 
-fn rg_analyzable(f) {
-    return !f[F_EXTERN] && f[F_BODY] && !f[F_LEGACY] && !is_template(f);
+fn rg_analyzable(f i64) i64 {
+	return i64(f[F_EXTERN] == 0 && f[F_BODY] != 0 && f[F_LEGACY] == 0 && is_template(f) == 0)
 }
 
-fn is_keep_fn(f) {
-    let n = f[F_QNAME];
-    return n && load8(n) == 'k' && load8(n + 1) == 'e' && load8(n + 2) == 'e' && load8(n + 3) == 'p' && load8(n + 4) == '$';
+fn is_keep_fn(f i64) i64 {
+	let n = f[F_QNAME]
+	return i64(n != 0 && i64(load8(n)) == 'k' && i64(load8(n + 1)) == 'e' && i64(load8(n + 2)) == 'e' && i64(load8(n + 3)) == 'p' && i64(load8(n + 4)) == '$')
 }
 
 fn region_check() {
-    let i = 0;
-    while i < prog_fns[VEC_LEN] {
-        let f = vec_get(prog_fns, i);
-        if rg_analyzable(f) {
-            f[F_REGSUM] = rg_sum_new();
-        }
-        i = i + 1;
-    }
-    rg_fnsum = rg_sum_new();
-    let round = 0;
-    rg_changed = 1;
-    while rg_changed && round < 60 {
-        rg_changed = 0;
-        i = 0;
-        while i < prog_fns[VEC_LEN] {
-            let f = vec_get(prog_fns, i);
-            if f[F_REGSUM] && f[F_REACH] {
-                rg_fn_pass(f, 0);
-            }
-            i = i + 1;
-        }
-        round = round + 1;
-    }
-    i = 0;
-    while i < prog_fns[VEC_LEN] {
-        let f = vec_get(prog_fns, i);
-        if f[F_REGSUM] && f[F_REACH] {
-            rg_fn_pass(f, 1);
-        }
-        i = i + 1;
-    }
-    with_body_check();
+	mut i = 0
+	for i < prog_fns[VEC_LEN] {
+		let f = vec_get(prog_fns, i)
+		if rg_analyzable(f) != 0 {
+			f[F_REGSUM] = rg_sum_new()
+		}
+		i = i + 1
+	}
+	rg_fnsum = rg_sum_new()
+	mut round = 0
+	rg_changed = 1
+	for rg_changed != 0 && round < 60 {
+		rg_changed = 0
+		i = 0
+		for i < prog_fns[VEC_LEN] {
+			let f = vec_get(prog_fns, i)
+			if f[F_REGSUM] != 0 && f[F_REACH] != 0 {
+				rg_fn_pass(f, 0)
+			}
+			i = i + 1
+		}
+		round = round + 1
+	}
+	i = 0
+	for i < prog_fns[VEC_LEN] {
+		let f = vec_get(prog_fns, i)
+		if f[F_REGSUM] != 0 && f[F_REACH] != 0 {
+			rg_fn_pass(f, 1)
+		}
+		i = i + 1
+	}
+	with_body_check()
 }
 
-fn rg_sum_new() {
-    let sum = calloc(13, 8);  // [12]: the function resets the request pool (hearth.Reset)
-    sum[1] = vec_new();
-    sum[10] = vec_new();
-    sum[11] = vec_new();
-    return sum;
+fn rg_sum_new() i64 {
+	let sum = calloc(13, 8) // [12]: the function resets the request pool (hearth.Reset)
+	sum[1] = vec_new()
+	sum[10] = vec_new()
+	sum[11] = vec_new()
+	return sum
 }
 
-fn rg_fn_pass(f, report) {
-    rg_fn = f;
-    rg_sum = f[F_REGSUM];
-    if is_keep_fn(f) {
-        rg_sum[2] = RG_INGOT;
-        return;
-    }
-    set_file(f[F_FILE]);
-    rg_report = 0;
-    let locals = f[F_LOCALS];
-    rg_nparams = f[F_PARAMS][VEC_LEN];
-    let i = 0;
-    while i < locals[VEC_LEN] {
-        let s = vec_get(locals, i);
-        // A captured local also holds what frame-local closures stored into it.
-        s[S_REGION] = s[S_CAPBITS];
-        if i < rg_nparams && has_ptr(s[S_TYPE]) {
-            s[S_REGION] = RG_EMB | RG_UNK;
-            if i < RG_MAXP {
-                s[S_REGION] = RG_EMB | (RG_P0 << i);
-            }
-        }
-        i = i + 1;
-    }
-    rg_held = vec_new();
-    let iter = 0;
-    rg_lchanged = 1;
-    while rg_lchanged && iter < 30 {
-        rg_lchanged = 0;
-        rg_stmts(f[F_BODY][BLK_STMTS]);
-        iter = iter + 1;
-    }
-    // Callers can reach what is held only through the parameters and results.
-    i = 0;
-    while i < rg_held[VEC_LEN] {
-        let t = vec_get(rg_held, i);
-        if rg_visible(f, t) && rg_merge(rg_sum[1], t, vec_get(rg_held, i + 1)) {
-            rg_changed = 1;
-        }
-        i = i + 2;
-    }
-    if report && !vec_get(file_trusted, f[F_FILE]) {
-        rg_report = 1;
-        rg_modrep = 0;
-        rg_stmts(f[F_BODY][BLK_STMTS]);
-        rg_detach_check(f);
-        rg_report = 0;
-        if rg_sum[12] {
-            rs_walk(f);
-        }
-    }
+fn rg_fn_pass(f i64, report i64) {
+	rg_fn = f
+	rg_sum = f[F_REGSUM]
+	if is_keep_fn(f) != 0 {
+		rg_sum[2] = RG_INGOT
+		return
+	}
+	set_file(f[F_FILE])
+	rg_report = 0
+	let locals = f[F_LOCALS]
+	rg_nparams = f[F_PARAMS][VEC_LEN]
+	mut i = 0
+	for i < locals[VEC_LEN] {
+		let s = vec_get(locals, i)
+		// A captured local also holds what frame-local closures stored into it.
+		s[S_REGION] = s[S_CAPBITS]
+		if i < rg_nparams && has_ptr(s[S_TYPE]) != 0 {
+			s[S_REGION] = RG_EMB | RG_UNK
+			if i < RG_MAXP {
+				s[S_REGION] = RG_EMB | (RG_P0 << i)
+			}
+		}
+		i = i + 1
+	}
+	rg_held = vec_new()
+	mut iter = 0
+	rg_lchanged = 1
+	for rg_lchanged != 0 && iter < 30 {
+		rg_lchanged = 0
+		rg_stmts(f[F_BODY][BLK_STMTS])
+		iter = iter + 1
+	}
+	// Callers can reach what is held only through the parameters and results.
+	i = 0
+	for i < rg_held[VEC_LEN] {
+		let t = vec_get(rg_held, i)
+		if rg_visible(f, t) != 0 && rg_merge(rg_sum[1], t, vec_get(rg_held, i + 1)) != 0 {
+			rg_changed = 1
+		}
+		i = i + 2
+	}
+	if report != 0 && vec_get(file_trusted, f[F_FILE]) == 0 {
+		rg_report = 1
+		rg_modrep = 0
+		rg_stmts(f[F_BODY][BLK_STMTS])
+		rg_detach_check(f)
+		rg_report = 0
+		if rg_sum[12] != 0 {
+			rs_walk(f)
+		}
+	}
 }
 
-fn rg_stmts(v) {
-    let i = 0;
-    while i < v[VEC_LEN] {
-        rg_stmt(vec_get(v, i));
-        i = i + 1;
-    }
+fn rg_stmts(v i64) {
+	mut i = 0
+	for i < v[VEC_LEN] {
+		rg_stmt(vec_get(v, i))
+		i = i + 1
+	}
 }
 
-fn rg_local(s, bits) {
-    if !has_ptr(s[S_TYPE]) {
-        return;
-    }
-    if (s[S_REGION] | bits) != s[S_REGION] {
-        s[S_REGION] = s[S_REGION] | bits;
-        rg_lchanged = 1;
-    }
+fn rg_local(s i64, bits i64) {
+	if has_ptr(s[S_TYPE]) == 0 {
+		return
+	}
+	if (s[S_REGION] | bits) != s[S_REGION] {
+		s[S_REGION] = s[S_REGION] | bits
+		rg_lchanged = 1
+	}
 }
 
-fn rg_assign_sym(s, bits, pos) {
-    if s[S_KIND] == SYM_LOCAL {
-        rg_local(s, bits);
-    } else if s[S_KIND] == SYM_GLOBAL {
-        rg_store(RG_INGOT, 0, 0, bits, 0, pos, s[S_NAME]);
-    }
+fn rg_assign_sym(s i64, bits i64, pos i64) {
+	if s[S_KIND] == SYM_LOCAL {
+		rg_local(s, bits)
+	} else if s[S_KIND] == SYM_GLOBAL {
+		rg_store(RG_INGOT, 0, 0, bits, 0, pos, s[S_NAME])
+	}
 }
 
-fn rg_stmt(s) {
-    let k = s[N_KIND];
-    if k == ST_BLOCK {
-        rg_stmts(s[BLK_STMTS]);
-    } else if k == ST_LET {
-        if s[LET_INIT] {
-            rg_local(s[LET_SYM], rg_expr(s[LET_INIT]));
-        }
-    } else if k == ST_ASSIGN {
-        let t = s[AS_TARGET];
-        let v = rg_expr(s[AS_VALUE]);
-        rg_note_kept(t, v);
-        let tk = t[N_KIND];
-        if tk == EX_IDENT {
-            rg_assign_sym(t[ID_REF], v, s[N_POS]);
-        } else if rg_regrow(t, s[AS_VALUE]) {
-            // The slot gets back the object it held; the append checked what it added.
-        } else if tk == EX_MEM && rg_cell_index(t[MEM_BASE]) >= 0 {
-            rg_cell_store(rg_cell_index(t[MEM_BASE]), v, t[N_TYPE], s[N_POS]);
-        } else if tk == EX_MEM && rg_own_cell(t) {
-            // The parent's own store into a variable it keeps in a cell.
-            rg_local(rg_own_cell(t), v);
-        } else if tk == EX_MEM {
-            let c = rg_expr(t[MEM_BASE]);
-            if t[MEM_INDEX] {
-                rg_expr(t[MEM_INDEX]);
-            }
-            rg_store(c, rg_owner(t[MEM_BASE]), rg_key(t[MEM_BASE][N_TYPE]), v, t[N_TYPE], s[N_POS], 0);
-        } else if tk == EX_ELEM {
-            let c2 = rg_expr(t[ELEM_SEQ]);
-            rg_expr(t[ELEM_IDX]);
-            rg_store(c2, rg_owner(t[ELEM_SEQ]), rg_key(t[ELEM_SEQ][N_TYPE]), v, t[N_TYPE], s[N_POS], 0);
-        } else {
-            rg_expr(t);
-        }
-    } else if k == ST_EXPR {
-        rg_expr(s[ES_X]);
-    } else if k == ST_IF {
-        rg_expr(s[IF_COND]);
-        rg_stmts(s[IF_THEN][BLK_STMTS]);
-        if s[IF_ELSE] {
-            rg_stmt(s[IF_ELSE]);
-        }
-    } else if k == ST_WHILE {
-        rg_expr(s[WH_COND]);
-        rg_stmts(s[WH_BODY][BLK_STMTS]);
-        if s[WH_POST] {
-            rg_stmt(s[WH_POST]);
-        }
-    } else if k == ST_RETURN {
-        if s[RET_VALUE] {
-            rg_result(0, rg_expr(s[RET_VALUE]));
-        }
-        if s[RET_VALUES] {
-            let i = 0;
-            while i < s[RET_VALUES][VEC_LEN] {
-                rg_result(i, rg_expr(vec_get(s[RET_VALUES], i)));
-                i = i + 1;
-            }
-        }
-    } else if k == ST_CALLMULTI {
-        rg_expr(s[CM_CALL]);
-        let bits = rg_multi;
-        let syms = s[CM_SYMS];
-        let j = 0;
-        while j < syms[VEC_LEN] {
-            let sy = vec_get(syms, j);
-            if sy {
-                let b = RG_UNK | RG_EMB;
-                if bits && j < 8 {
-                    b = vec_get(bits, j);
-                }
-                rg_assign_sym(sy, b, s[N_POS]);
-            }
-            j = j + 1;
-        }
-    }
+fn rg_stmt(s i64) {
+	let k = s[N_KIND]
+	if k == ST_BLOCK {
+		rg_stmts(s[BLK_STMTS])
+	} else if k == ST_LET {
+		if s[LET_INIT] != 0 {
+			rg_local(s[LET_SYM], rg_expr(s[LET_INIT]))
+		}
+	} else if k == ST_ASSIGN {
+		let t = s[AS_TARGET]
+		let v = rg_expr(s[AS_VALUE])
+		rg_note_kept(t, v)
+		let tk = t[N_KIND]
+		if tk == EX_IDENT {
+			rg_assign_sym(t[ID_REF], v, s[N_POS])
+		} else if rg_regrow(t, s[AS_VALUE]) != 0 {
+			// The slot gets back the object it held; the append checked what it added.
+		} else if tk == EX_MEM && rg_cell_index(t[MEM_BASE]) >= 0 {
+			rg_cell_store(rg_cell_index(t[MEM_BASE]), v, t[N_TYPE], s[N_POS])
+		} else if tk == EX_MEM && rg_own_cell(t) != 0 {
+			// The parent's own store into a variable it keeps in a cell.
+			rg_local(rg_own_cell(t), v)
+		} else if tk == EX_MEM {
+			let c = rg_expr(t[MEM_BASE])
+			if t[MEM_INDEX] != 0 {
+				rg_expr(t[MEM_INDEX])
+			}
+			rg_store(c, rg_owner(t[MEM_BASE]), rg_key(t[MEM_BASE][N_TYPE]), v, t[N_TYPE], s[N_POS], 0)
+		} else if tk == EX_ELEM {
+			let c2 = rg_expr(t[ELEM_SEQ])
+			rg_expr(t[ELEM_IDX])
+			rg_store(c2, rg_owner(t[ELEM_SEQ]), rg_key(t[ELEM_SEQ][N_TYPE]), v, t[N_TYPE], s[N_POS], 0)
+		} else {
+			rg_expr(t)
+		}
+	} else if k == ST_EXPR {
+		rg_expr(s[ES_X])
+	} else if k == ST_IF {
+		rg_expr(s[IF_COND])
+		rg_stmts(s[IF_THEN][BLK_STMTS])
+		if s[IF_ELSE] != 0 {
+			rg_stmt(s[IF_ELSE])
+		}
+	} else if k == ST_WHILE {
+		rg_expr(s[WH_COND])
+		rg_stmts(s[WH_BODY][BLK_STMTS])
+		if s[WH_POST] != 0 {
+			rg_stmt(s[WH_POST])
+		}
+	} else if k == ST_RETURN {
+		if s[RET_VALUE] != 0 {
+			rg_result(0, rg_expr(s[RET_VALUE]))
+		}
+		if s[RET_VALUES] != 0 {
+			mut i = 0
+			for i < s[RET_VALUES][VEC_LEN] {
+				rg_result(i, rg_expr(vec_get(s[RET_VALUES], i)))
+				i = i + 1
+			}
+		}
+	} else if k == ST_CALLMULTI {
+		rg_expr(s[CM_CALL])
+		let bits = rg_multi
+		let syms = s[CM_SYMS]
+		mut j = 0
+		for j < syms[VEC_LEN] {
+			let sy = vec_get(syms, j)
+			if sy != 0 {
+				mut b = RG_UNK | RG_EMB
+				if bits != 0 && j < 8 {
+					b = vec_get(bits, j)
+				}
+				rg_assign_sym(sy, b, s[N_POS])
+			}
+			j = j + 1
+		}
+	}
 }
 
 // rg_regrow reports whether x appends onto the slot target t names: append grows the
 // header in place and returns it, so storing the result back changes nothing.
-fn rg_regrow(t, x) {
-    while x[N_KIND] == EX_CALL && x[CALL_NAME] && (streq(x[CALL_NAME], "rt_append") || streq(x[CALL_NAME], "rt_append_rc") || streq(x[CALL_NAME], "rt_slice_appendn") || streq(x[CALL_NAME], "rt_slice_appendn_rc") || streq(x[CALL_NAME], "rt_append_str")) {
-        x = vec_get(x[CALL_ARGS], 0);
-    }
-    return rg_same(t, x);
+fn rg_regrow(t i64, x_in i64) i64 {
+	mut x = x_in
+	for x[N_KIND] == EX_CALL && x[CALL_NAME] != 0 && (streq(x[CALL_NAME], cstr("rt_append")) != 0 || streq(x[CALL_NAME], cstr("rt_append_rc")) != 0 || streq(x[CALL_NAME], cstr("rt_slice_appendn")) != 0 || streq(x[CALL_NAME], cstr("rt_slice_appendn_rc")) != 0 || streq(x[CALL_NAME], cstr("rt_append_str")) != 0) {
+		x = vec_get(x[CALL_ARGS], 0)
+	}
+	return rg_same(t, x)
 }
 
 // rg_same reports whether two expressions name the same slot: one variable, or the same
 // field or element of the same slot, indexed by one variable or constant.
-fn rg_same(a, b) {
-    let k = a[N_KIND];
-    if k != b[N_KIND] {
-        return 0;
-    }
-    if k == EX_IDENT {
-        return a[ID_REF] && a[ID_REF] == b[ID_REF];
-    }
-    if k == EX_INT {
-        return a[INT_VAL] == b[INT_VAL];
-    }
-    if k == EX_MEM {
-        return !a[MEM_INDEX] && !b[MEM_INDEX] && a[MEM_OFF] == b[MEM_OFF] && rg_same(a[MEM_BASE], b[MEM_BASE]);
-    }
-    if k == EX_ELEM {
-        return rg_same(a[ELEM_SEQ], b[ELEM_SEQ]) && rg_same(a[ELEM_IDX], b[ELEM_IDX]);
-    }
-    return 0;
+fn rg_same(a i64, b i64) i64 {
+	let k = a[N_KIND]
+	if k != b[N_KIND] {
+		return 0
+	}
+	if k == EX_IDENT {
+		return i64(a[ID_REF] != 0 && a[ID_REF] == b[ID_REF])
+	}
+	if k == EX_INT {
+		return i64(a[INT_VAL] == b[INT_VAL])
+	}
+	if k == EX_MEM {
+		return i64(a[MEM_INDEX] == 0 && b[MEM_INDEX] == 0 && a[MEM_OFF] == b[MEM_OFF] && rg_same(a[MEM_BASE], b[MEM_BASE]) != 0)
+	}
+	if k == EX_ELEM {
+		return i64(rg_same(a[ELEM_SEQ], b[ELEM_SEQ]) != 0 && rg_same(a[ELEM_IDX], b[ELEM_IDX]) != 0)
+	}
+	return 0
 }
 
-fn rg_result(i, bits) {
-    if i >= 8 {
-        return;
-    }
-    if (rg_sum[2 + i] | bits) != rg_sum[2 + i] {
-        rg_sum[2 + i] = rg_sum[2 + i] | bits;
-        rg_changed = 1;
-    }
+fn rg_result(i i64, bits i64) {
+	if i >= 8 {
+		return
+	}
+	if (rg_sum[2 + i] | bits) != rg_sum[2 + i] {
+		rg_sum[2 + i] = rg_sum[2 + i] | bits
+		rg_changed = 1
+	}
 }
 
 // rg_load is what a pointer of type t read out of a container with bits b may be: anything
 // held by long-lived memory is long-lived (the pass keeps it so); anything else may be
 // ember, or whatever such containers were given (rg_hold).
-fn rg_load(b, t) {
-    let r = b & ~RG_EMB;
-    if (b & ~RG_INGOT) != 0 {
-        r = r | RG_EMB;
-    }
-    if b != RG_INGOT {
-        r = r | rg_lookup(rg_held, rg_key(t));
-    }
-    return r;
+fn rg_load(b i64, t i64) i64 {
+	mut r = b & ~RG_EMB
+	if (b & ~RG_INGOT) != 0 {
+		r = r | RG_EMB
+	}
+	if b != RG_INGOT {
+		r = r | rg_lookup(rg_held, rg_key(t))
+	}
+	return r
 }
 
 // rg_key is the type held objects are filed under: an optional holds the same objects as
 // its element. Strings and faults cannot be modified, so where they come from no longer
 // matters once they are in a container: 0.
-fn rg_key(t) {
-    if kind_of(t) == K_OPT {
-        t = t[TY_ELEM];
-    }
-    let k = kind_of(t);
-    if k == K_STRUCT || k == K_SLICE || k == K_MAP || k == K_DYN {
-        return t;
-    }
-    return 0;
+fn rg_key(t_in i64) i64 {
+	mut t = t_in
+	if kind_of(t) == K_OPT {
+		t = t[TY_ELEM]
+	}
+	let k = kind_of(t)
+	if k == K_STRUCT || k == K_SLICE || k == K_MAP || k == K_DYN {
+		return t
+	}
+	return 0
 }
 
 // rg_owner is the type of the object an expression reads out of (a field's struct, an
 // element's slice), or 0 when the expression is not such a read.
-fn rg_owner(e) {
-    let k = e[N_KIND];
-    if k == EX_MEM && has_ptr(e[MEM_BASE][N_TYPE]) {
-        return rg_key(e[MEM_BASE][N_TYPE]);
-    }
-    if k == EX_ELEM {
-        return rg_key(e[ELEM_SEQ][N_TYPE]);
-    }
-    return 0;
+fn rg_owner(e i64) i64 {
+	let k = e[N_KIND]
+	if k == EX_MEM && has_ptr(e[MEM_BASE][N_TYPE]) != 0 {
+		return rg_key(e[MEM_BASE][N_TYPE])
+	}
+	if k == EX_ELEM {
+		return rg_key(e[ELEM_SEQ][N_TYPE])
+	}
+	return 0
 }
 
 // rg_merge adds bits to type t's entry in the pair vector h and reports whether it grew.
-fn rg_merge(h, t, bits) {
-    let i = 0;
-    while i < h[VEC_LEN] {
-        if vec_get(h, i) == t {
-            let old = vec_get(h, i + 1);
-            h[VEC_DATA][i + 1] = old | bits;
-            return (old | bits) != old;
-        }
-        i = i + 2;
-    }
-    vec_push(h, t);
-    vec_push(h, bits);
-    return 1;
+fn rg_merge(h i64, t i64, bits i64) i64 {
+	mut i = 0
+	for i < h[VEC_LEN] {
+		if vec_get(h, i) == t {
+			let old = vec_get(h, i + 1)
+			h[VEC_DATA][i + 1] = old | bits
+			return i64((old | bits) != old)
+		}
+		i = i + 2
+	}
+	vec_push(h, t)
+	vec_push(h, bits)
+	return 1
 }
 
-fn rg_lookup(h, t) {
-    let i = 0;
-    while t && i < h[VEC_LEN] {
-        if vec_get(h, i) == t {
-            return vec_get(h, i + 1);
-        }
-        i = i + 2;
-    }
-    return 0;
+fn rg_lookup(h i64, t i64) i64 {
+	mut i = 0
+	for t != 0 && i < h[VEC_LEN] {
+		if vec_get(h, i) == t {
+			return vec_get(h, i + 1)
+		}
+		i = i + 2
+	}
+	return 0
 }
 
 // rg_hold records that a container that may not be long-lived now holds a value of type t
 // with bits v. Fresh and ember origins are what reads out of such a container give anyway;
 // long-lived, unknown and parameter origins must come back out with the value.
-fn rg_hold(t, v) {
-    let k = rg_key(t);
-    let b = v & ~(RG_FRESH | RG_EMB);
-    if k && b && rg_merge(rg_held, k, b) {
-        rg_lchanged = 1;
-    }
+fn rg_hold(t i64, v i64) {
+	let k = rg_key(t)
+	let b = v & ~(RG_FRESH | RG_EMB)
+	if k != 0 && b != 0 && rg_merge(rg_held, k, b) != 0 {
+		rg_lchanged = 1
+	}
 }
 
 // rg_reaches reports whether a value of type from leads, through one or more fields,
 // elements or map values, to an object of key type to (seen guards recursive types).
-fn rg_reaches(from, to, seen) {
-    if kind_of(from) == K_OPT {
-        from = from[TY_ELEM];
-    }
-    if vec_index(seen, from) >= 0 {
-        return 0;
-    }
-    vec_push(seen, from);
-    let k = kind_of(from);
-    if k == K_SLICE || k == K_MAP {
-        return rg_key(from[TY_ELEM]) == to || rg_reaches(from[TY_ELEM], to, seen);
-    }
-    let i = 0;
-    while k == K_STRUCT && from[TY_FIELDS] && i < from[TY_FIELDS][VEC_LEN] {
-        let t = field_type(from, i);
-        if rg_key(t) == to || rg_reaches(t, to, seen) {
-            return 1;
-        }
-        i = i + 1;
-    }
-    return 0;
+fn rg_reaches(from_in i64, to i64, seen i64) i64 {
+	mut from = from_in
+	if kind_of(from) == K_OPT {
+		from = from[TY_ELEM]
+	}
+	if vec_index(seen, from) >= 0 {
+		return 0
+	}
+	vec_push(seen, from)
+	let k = kind_of(from)
+	if k == K_SLICE || k == K_MAP {
+		return i64(rg_key(from[TY_ELEM]) == to || rg_reaches(from[TY_ELEM], to, seen) != 0)
+	}
+	mut i = 0
+	for k == K_STRUCT && from[TY_FIELDS] != 0 && i < from[TY_FIELDS][VEC_LEN] {
+		let t = field_type(from, i)
+		if rg_key(t) == to || rg_reaches(t, to, seen) != 0 {
+			return 1
+		}
+		i = i + 1
+	}
+	return 0
 }
 
 // rg_deep widens the bits b of an argument of type t with the held pairs reachable from t
 // (what the containers inside it may hold) that lie on a way to an object of type v held
 // by an object of type o (o 0: by anything; o and v 0: any object inside the argument).
-fn rg_deep(b, t, o, v) {
-    if b == RG_INGOT {
-        // Long-lived memory holds only long-lived memory.
-        return b;
-    }
-    let i = 0;
-    while i < rg_held[VEC_LEN] {
-        let h = vec_get(rg_held, i);
-        let on = (!o && !v) || h == o || h == v;
-        if !on && o {
-            on = rg_reaches(h, o, vec_new());
-        } else if !on {
-            on = rg_reaches(h, v, vec_new());
-        }
-        if on && rg_reaches(t, h, vec_new()) {
-            b = b | vec_get(rg_held, i + 1);
-        }
-        i = i + 2;
-    }
-    return b;
+fn rg_deep(b_in i64, t i64, o i64, v i64) i64 {
+	mut b = b_in
+	if b == RG_INGOT {
+		// Long-lived memory holds only long-lived memory.
+		return b
+	}
+	mut i = 0
+	for i < rg_held[VEC_LEN] {
+		let h = vec_get(rg_held, i)
+		mut on_ = i64((o == 0 && v == 0) || h == o || h == v)
+		if on_ == 0 && o != 0 {
+			on_ = rg_reaches(h, o, vec_new())
+		} else if on_ == 0 {
+			on_ = rg_reaches(h, v, vec_new())
+		}
+		if on_ != 0 && rg_reaches(t, h, vec_new()) != 0 {
+			b = b | vec_get(rg_held, i + 1)
+		}
+		i = i + 2
+	}
+	return b
 }
 
 // rg_visible reports whether f's callers can reach objects of key type t: through its
 // parameters or its results.
-fn rg_visible(f, t) {
-    let i = 0;
-    while i < f[F_PTYPES][VEC_LEN] {
-        let p = vec_get(f[F_PTYPES], i);
-        if rg_key(p) == t || rg_reaches(p, t, vec_new()) {
-            return 1;
-        }
-        i = i + 1;
-    }
-    i = 0;
-    while i < f[F_RTYPES][VEC_LEN] {
-        let r = vec_get(f[F_RTYPES], i);
-        if rg_key(r) == t || rg_reaches(r, t, vec_new()) {
-            return 1;
-        }
-        i = i + 1;
-    }
-    return 0;
+fn rg_visible(f i64, t i64) i64 {
+	mut i = 0
+	for i < f[F_PTYPES][VEC_LEN] {
+		let p = vec_get(f[F_PTYPES], i)
+		if rg_key(p) == t || rg_reaches(p, t, vec_new()) != 0 {
+			return 1
+		}
+		i = i + 1
+	}
+	i = 0
+	for i < f[F_RTYPES][VEC_LEN] {
+		let r = vec_get(f[F_RTYPES], i)
+		if rg_key(r) == t || rg_reaches(r, t, vec_new()) != 0 {
+			return 1
+		}
+		i = i + 1
+	}
+	return 0
 }
 
 // rg_record notes in recs, triples [param, holder type, type], that the function stores
 // into an object of type t held by an object of type o (0: unknown) inside parameter i.
-fn rg_record(recs, i, o, t) {
-    let j = 0;
-    while j < recs[VEC_LEN] {
-        if vec_get(recs, j) == i && vec_get(recs, j + 1) == o && vec_get(recs, j + 2) == t {
-            return;
-        }
-        j = j + 3;
-    }
-    vec_push(recs, i);
-    vec_push(recs, o);
-    vec_push(recs, t);
-    rg_changed = 1;
+fn rg_record(recs i64, i i64, o i64, t i64) {
+	mut j = 0
+	for j < recs[VEC_LEN] {
+		if vec_get(recs, j) == i && vec_get(recs, j + 1) == o && vec_get(recs, j + 2) == t {
+			return
+		}
+		j = j + 3
+	}
+	vec_push(recs, i)
+	vec_push(recs, o)
+	vec_push(recs, t)
+	rg_changed = 1
 }
 
-fn rg_param_name(i) {
-    return vec_get(rg_fn[F_LOCALS], i)[S_NAME];
+fn rg_param_name(i i64) i64 {
+	return vec_get(rg_fn[F_LOCALS], i)[S_NAME]
 }
 
 // rg_store checks a store of a value with bits v and type t into a container with bits c,
 // an object of type ct held by an object of type co (see rg_record).
-fn rg_store(c, co, ct, v, t, pos, gname) {
-    let i = 0;
-    while i < rg_nparams && i < RG_MAXP {
-        if (c & (RG_P0 << i)) != 0 {
-            if rg_report && !vec_get(rg_fn[F_MUTS], i) && (rg_modrep & (1 << i)) == 0 {
-                rg_modrep = rg_modrep | (1 << i);
-                err_code_quoted(pos, "E701 NOT_MUT", "cannot modify parameter ", rg_param_name(i), ": declare it mut");
-            }
-            rg_record(rg_sum[11], i, co, ct);
-        }
-        i = i + 1;
-    }
-    if c != RG_INGOT {
-        rg_hold(t, v);
-    }
-    if (v & RG_EMB) == 0 {
-        return;
-    }
-    if v != RG_EMB {
-        // A call's stores (rg_pass gives them RG_EMB) are checked by rg_arena_call.
-        rg_arena_store(c, v, pos);
-    }
-    if (c & (RG_INGOT | RG_UNK)) != 0 && rg_report {
-        if gname {
-            err_code_quoted(pos, "E310 REQUEST_ESCAPE", "request memory stored into global ", gname, ", which outlives the request: wrap the value in keep()");
-        } else {
-            err_code_at(pos, "E310 REQUEST_ESCAPE", "request memory stored into long-lived memory (it may be reachable from a global): wrap the value in keep()");
-        }
-    }
-    i = 0;
-    while i < rg_nparams && i < RG_MAXP {
-        if (c & (RG_P0 << i)) != 0 {
-            if (rg_sum[0] & (1 << i)) == 0 {
-                rg_sum[0] = rg_sum[0] | (1 << i);
-                rg_changed = 1;
-            }
-            rg_record(rg_sum[10], i, co, ct);
-        }
-        i = i + 1;
-    }
+fn rg_store(c i64, co i64, ct i64, v i64, t i64, pos i64, gname i64) {
+	mut i = 0
+	for i < rg_nparams && i < RG_MAXP {
+		if (c & (RG_P0 << i)) != 0 {
+			if rg_report != 0 && vec_get(rg_fn[F_MUTS], i) == 0 && (rg_modrep & (1 << i)) == 0 {
+				rg_modrep = rg_modrep | (1 << i)
+				err_code_quoted(pos, cstr("E701 NOT_MUT"), cstr("cannot modify parameter "), rg_param_name(i), cstr(": declare it mut"))
+			}
+			rg_record(rg_sum[11], i, co, ct)
+		}
+		i = i + 1
+	}
+	if c != RG_INGOT {
+		rg_hold(t, v)
+	}
+	if (v & RG_EMB) == 0 {
+		return
+	}
+	if v != RG_EMB {
+		// A call's stores (rg_pass gives them RG_EMB) are checked by rg_arena_call.
+		rg_arena_store(c, v, pos)
+	}
+	if (c & (RG_INGOT | RG_UNK)) != 0 && rg_report != 0 {
+		if gname != 0 {
+			err_code_quoted(pos, cstr("E310 REQUEST_ESCAPE"), cstr("request memory stored into global "), gname, cstr(", which outlives the request: wrap the value in keep()"))
+		} else {
+			err_code_at(pos, cstr("E310 REQUEST_ESCAPE"), cstr("request memory stored into long-lived memory (it may be reachable from a global): wrap the value in keep()"))
+		}
+	}
+	i = 0
+	for i < rg_nparams && i < RG_MAXP {
+		if (c & (RG_P0 << i)) != 0 {
+			if (rg_sum[0] & (1 << i)) == 0 {
+				rg_sum[0] = rg_sum[0] | (1 << i)
+				rg_changed = 1
+			}
+			rg_record(rg_sum[10], i, co, ct)
+		}
+		i = i + 1
+	}
 }
 
 // rg_own_cell is the variable e reads or writes when e is the word of a cell the running
 // function made for one of its own variables, which no closure that may be kept captures; or 0.
-fn rg_own_cell(e) {
-    if e[N_KIND] != EX_MEM || e[MEM_INDEX] || e[MEM_OFF] != 0 {
-        return 0;
-    }
-    let b = e[MEM_BASE];
-    if b[N_KIND] != EX_IDENT || !b[ID_REF] {
-        return 0;
-    }
-    let os = b[ID_REF][S_CELL_OF];
-    if !os || os[S_KEPT_CAP] {
-        return 0;
-    }
-    return os;
+fn rg_own_cell(e i64) i64 {
+	if e[N_KIND] != EX_MEM || e[MEM_INDEX] != 0 || e[MEM_OFF] != 0 {
+		return 0
+	}
+	let b = e[MEM_BASE]
+	if b[N_KIND] != EX_IDENT || b[ID_REF] == 0 {
+		return 0
+	}
+	let os = b[ID_REF][S_CELL_OF]
+	if os == 0 || os[S_KEPT_CAP] != 0 {
+		return 0
+	}
+	return os
 }
 
 // rg_cell_index is i when e is the address of captured variable i, read from the closure's
 // environment ($env word 2 + i), or -1.
-fn rg_cell_index(e) {
-    if !rg_fn[F_PARENT] || !rg_fn[F_ENV_SYM] || e[N_KIND] != EX_MEM || e[MEM_INDEX] {
-        return -1;
-    }
-    let b = e[MEM_BASE];
-    if b[N_KIND] != EX_IDENT || b[ID_REF] != rg_fn[F_ENV_SYM] || e[MEM_OFF] < 16 {
-        return -1;
-    }
-    return e[MEM_OFF] / 8 - 2;
+fn rg_cell_index(e i64) i64 {
+	if rg_fn[F_PARENT] == 0 || rg_fn[F_ENV_SYM] == 0 || e[N_KIND] != EX_MEM || e[MEM_INDEX] != 0 {
+		return -1
+	}
+	let b = e[MEM_BASE]
+	if b[N_KIND] != EX_IDENT || b[ID_REF] != rg_fn[F_ENV_SYM] || e[MEM_OFF] < 16 {
+		return -1
+	}
+	return e[MEM_OFF] / 8 - 2
 }
 
 // rg_cell_bits is what captured variable i may hold. A closure that is only passed to functions
 // that call it (sift.Each and the like) lives no longer than its parent's frame: the variable
 // holds what the parent and such closures put there. Any other closure may be kept, which copies
 // its variables into long-lived memory, so their origin is unknown.
-fn rg_cell_bits(i) {
-    if rg_fn[F_ESCAPES] {
-        return RG_UNK | RG_EMB;
-    }
-    let os = vec_get(rg_fn[F_CAPTURES], i);
-    if !os || os[S_CAPTURED] {
-        return RG_UNK | RG_EMB;
-    }
-    if rg_is_arena(rg_fn) {
-        // Made outside the arena: what it holds is not the arena's fresh memory.
-        return ((os[S_REGION] | os[S_CAPBITS]) & ~RG_FRESH) | RG_OUT;
-    }
-    return os[S_REGION] | os[S_CAPBITS];
+fn rg_cell_bits(i i64) i64 {
+	if rg_fn[F_ESCAPES] != 0 {
+		return RG_UNK | RG_EMB
+	}
+	let os = vec_get(rg_fn[F_CAPTURES], i)
+	if os == 0 || os[S_CAPTURED] != 0 {
+		return RG_UNK | RG_EMB
+	}
+	if rg_is_arena(rg_fn) != 0 {
+		// Made outside the arena: what it holds is not the arena's fresh memory.
+		return ((os[S_REGION] | os[S_CAPBITS]) & ~RG_FRESH) | RG_OUT
+	}
+	return os[S_REGION] | os[S_CAPBITS]
 }
 
 // rg_cell_store checks an assignment of bits v to captured variable i. In a frame-local closure
 // the variable is the parent's local: the bits join it. A closure that may be kept must not
 // store request memory there: once kept, its variables are long-lived (#171).
-fn rg_cell_store(i, v, t, pos) {
-    if rg_in_arena() {
-        v = rg_arena_cell_store(i, v, t, pos);
-    }
-    if rg_fn[F_ESCAPES] {
-        if (v & RG_EMB) != 0 && has_ptr(t) && rg_report {
-            let os = vec_get(rg_fn[F_CAPTURES], i);
-            let name = "a captured variable";
-            if os {
-                name = os[S_NAME];
-            }
-            err_code_quoted(pos, "E311 CAPTURE_ESCAPE", "request memory stored into ", name, ", a captured variable of a closure that may outlive the request (keep() copies its variables into long-lived memory): wrap the value in keep(), or pass the closure only to functions that call it");
-        }
-        return;
-    }
-    let os = vec_get(rg_fn[F_CAPTURES], i);
-    if os && !os[S_CAPTURED] && (os[S_CAPBITS] | v) != os[S_CAPBITS] {
-        os[S_CAPBITS] = os[S_CAPBITS] | v;
-        rg_changed = 1;
-    }
+fn rg_cell_store(i i64, v_in i64, t i64, pos i64) {
+	mut v = v_in
+	if rg_in_arena() != 0 {
+		v = rg_arena_cell_store(i, v, t, pos)
+	}
+	if rg_fn[F_ESCAPES] != 0 {
+		if (v & RG_EMB) != 0 && has_ptr(t) != 0 && rg_report != 0 {
+			let os = vec_get(rg_fn[F_CAPTURES], i)
+			mut name = cstr("a captured variable")
+			if os != 0 {
+				name = os[S_NAME]
+			}
+			err_code_quoted(pos, cstr("E311 CAPTURE_ESCAPE"), cstr("request memory stored into "), name, cstr(", a captured variable of a closure that may outlive the request (keep() copies its variables into long-lived memory): wrap the value in keep(), or pass the closure only to functions that call it"))
+		}
+		return
+	}
+	let os = vec_get(rg_fn[F_CAPTURES], i)
+	if os != 0 && os[S_CAPTURED] == 0 && (os[S_CAPBITS] | v) != os[S_CAPBITS] {
+		os[S_CAPBITS] = os[S_CAPBITS] | v
+		rg_changed = 1
+	}
 }
 
-fn rg_expr(e) {
-    let k = e[N_KIND];
-    if k == EX_IDENT {
-        let s = e[ID_REF];
-        if !s {
-            return 0;
-        }
-        if s[S_KIND] == SYM_LOCAL {
-            if rs_active && vec_has(rs_dead, s) && !vec_has(rs_said, s) {
-                vec_push(rs_said, s);
-                err_code_quoted(e[N_POS], "E313 USE_AFTER_RESET", "", s[S_NAME], " may hold request memory from before hearth.Reset(), which freed it, and is read after the reset: keep() the value before the reset, or create it after");
-            }
-            return s[S_REGION];
-        }
-        if s[S_KIND] == SYM_GLOBAL {
-            return RG_INGOT;
-        }
-        return 0;
-    }
-    if k == EX_UNARY {
-        rg_expr(e[UN_X]);
-        return 0;
-    }
-    if k == EX_BINARY {
-        rg_expr(e[BIN_L]);
-        rg_expr(e[BIN_R]);
-        if has_ptr(e[N_TYPE]) {
-            return RG_FRESH | RG_EMB;
-        }
-        return 0;
-    }
-    if k == EX_CONV {
-        let x = rg_expr(e[CV_X]);
-        if e[CV_KIND] == CV_DYN_KEEP {
-            return RG_INGOT;
-        }
-        if has_ptr(e[N_TYPE]) && !has_ptr(e[CV_X][N_TYPE]) {
-            // A raw word turned into a reference (standard library only): origin unknown.
-            return x | RG_UNK | RG_EMB;
-        }
-        return x;
-    }
-    if k == EX_MEM && rg_cell_index(e) >= 0 {
-        rg_detach_read(rg_cell_index(e));
-        return 0;
-    }
-    if k == EX_MEM && rg_cell_index(e[MEM_BASE]) >= 0 {
-        rg_detach_read(rg_cell_index(e[MEM_BASE]));
-        if !has_ptr(e[N_TYPE]) {
-            return 0;
-        }
-        return rg_cell_bits(rg_cell_index(e[MEM_BASE]));
-    }
-    if k == EX_MEM && rg_own_cell(e) {
-        // The parent reading a variable it keeps in a cell for closures that cannot outlive it
-        // (frame-local ones and a scope's children): the variable holds what was stored in it.
-        let os = rg_own_cell(e);
-        if !has_ptr(e[N_TYPE]) {
-            return 0;
-        }
-        return os[S_REGION] | os[S_CAPBITS];
-    }
-    if k == EX_MEM {
-        let b = rg_expr(e[MEM_BASE]);
-        if e[MEM_INDEX] {
-            rg_expr(e[MEM_INDEX]);
-        }
-        if e[MEM_LEN] {
-            rg_expr(e[MEM_LEN]);
-        }
-        if !has_ptr(e[N_TYPE]) {
-            return 0;
-        }
-        if !has_ptr(e[MEM_BASE][N_TYPE]) {
-            return b | RG_UNK | RG_EMB;
-        }
-        return rg_load(b, e[N_TYPE]);
-    }
-    if k == EX_ELEM {
-        let b2 = rg_expr(e[ELEM_SEQ]);
-        rg_expr(e[ELEM_IDX]);
-        if !has_ptr(e[N_TYPE]) {
-            return 0;
-        }
-        return rg_load(b2, e[N_TYPE]);
-    }
-    if k == EX_SEQ {
-        if rs_active {
-            // the reset walk: a let in the sequence is a fresh assignment, after any reset
-            rs_stmts(e[SEQ_STMTS]);
-        } else {
-            rg_stmts(e[SEQ_STMTS]);
-        }
-        let v = rg_expr(e[SEQ_VALUE]);
-        if e[N_REGION] == R_OWNED {
-            return RG_INGOT;
-        }
-        if has_ptr(e[N_TYPE]) {
-            return v | RG_FRESH | RG_EMB;
-        }
-        return v;
-    }
-    if k == EX_CALL {
-        return rg_call(e);
-    }
-    if k == EX_FUNCREF && e[FR_FN][F_REGSUM] {
-        // A call through a function value may run this function.
-        let g = e[FR_FN][F_REGSUM];
-        let i = 0;
-        while i < g[1][VEC_LEN] {
-            if rg_merge(rg_fnsum[1], vec_get(g[1], i), vec_get(g[1], i + 1)) {
-                rg_changed = 1;
-            }
-            i = i + 2;
-        }
-        i = 0;
-        while i < g[10][VEC_LEN] {
-            rg_record(rg_fnsum[10], vec_get(g[10], i), vec_get(g[10], i + 1), vec_get(g[10], i + 2));
-            i = i + 3;
-        }
-        i = 0;
-        while i < g[11][VEC_LEN] {
-            rg_record(rg_fnsum[11], vec_get(g[11], i), vec_get(g[11], i + 1), vec_get(g[11], i + 2));
-            i = i + 3;
-        }
-        return 0;
-    }
-    if k == EX_INDEX {
-        rg_expr(e[IX_X]);
-        rg_expr(e[IX_I]);
-        return 0;
-    }
-    return 0;
+fn rg_expr(e i64) i64 {
+	let k = e[N_KIND]
+	if k == EX_IDENT {
+		let s = e[ID_REF]
+		if s == 0 {
+			return 0
+		}
+		if s[S_KIND] == SYM_LOCAL {
+			if rs_active != 0 && vec_has(rs_dead, s) != 0 && vec_has(rs_said, s) == 0 {
+				vec_push(rs_said, s)
+				err_code_quoted(e[N_POS], cstr("E313 USE_AFTER_RESET"), cstr(""), s[S_NAME], cstr(" may hold request memory from before hearth.Reset(), which freed it, and is read after the reset: keep() the value before the reset, or create it after"))
+			}
+			return s[S_REGION]
+		}
+		if s[S_KIND] == SYM_GLOBAL {
+			return RG_INGOT
+		}
+		return 0
+	}
+	if k == EX_UNARY {
+		rg_expr(e[UN_X])
+		return 0
+	}
+	if k == EX_BINARY {
+		rg_expr(e[BIN_L])
+		rg_expr(e[BIN_R])
+		if has_ptr(e[N_TYPE]) != 0 {
+			return RG_FRESH | RG_EMB
+		}
+		return 0
+	}
+	if k == EX_CONV {
+		let x = rg_expr(e[CV_X])
+		if e[CV_KIND] == CV_DYN_KEEP {
+			return RG_INGOT
+		}
+		if has_ptr(e[N_TYPE]) != 0 && has_ptr(e[CV_X][N_TYPE]) == 0 {
+			// A raw word turned into a reference (standard library only): origin unknown.
+			return x | RG_UNK | RG_EMB
+		}
+		return x
+	}
+	if k == EX_MEM && rg_cell_index(e) >= 0 {
+		rg_detach_read(rg_cell_index(e))
+		return 0
+	}
+	if k == EX_MEM && rg_cell_index(e[MEM_BASE]) >= 0 {
+		rg_detach_read(rg_cell_index(e[MEM_BASE]))
+		if has_ptr(e[N_TYPE]) == 0 {
+			return 0
+		}
+		return rg_cell_bits(rg_cell_index(e[MEM_BASE]))
+	}
+	if k == EX_MEM && rg_own_cell(e) != 0 {
+		// The parent reading a variable it keeps in a cell for closures that cannot outlive it
+		// (frame-local ones and a scope's children): the variable holds what was stored in it.
+		let os = rg_own_cell(e)
+		if has_ptr(e[N_TYPE]) == 0 {
+			return 0
+		}
+		return os[S_REGION] | os[S_CAPBITS]
+	}
+	if k == EX_MEM {
+		let b = rg_expr(e[MEM_BASE])
+		if e[MEM_INDEX] != 0 {
+			rg_expr(e[MEM_INDEX])
+		}
+		if e[MEM_LEN] != 0 {
+			rg_expr(e[MEM_LEN])
+		}
+		if has_ptr(e[N_TYPE]) == 0 {
+			return 0
+		}
+		if has_ptr(e[MEM_BASE][N_TYPE]) == 0 {
+			return b | RG_UNK | RG_EMB
+		}
+		return rg_load(b, e[N_TYPE])
+	}
+	if k == EX_ELEM {
+		let b2 = rg_expr(e[ELEM_SEQ])
+		rg_expr(e[ELEM_IDX])
+		if has_ptr(e[N_TYPE]) == 0 {
+			return 0
+		}
+		return rg_load(b2, e[N_TYPE])
+	}
+	if k == EX_SEQ {
+		if rs_active != 0 {
+			// the reset walk: a let in the sequence is a fresh assignment, after any reset
+			rs_stmts(e[SEQ_STMTS])
+		} else {
+			rg_stmts(e[SEQ_STMTS])
+		}
+		let v = rg_expr(e[SEQ_VALUE])
+		if e[N_REGION] == R_OWNED {
+			return RG_INGOT
+		}
+		if has_ptr(e[N_TYPE]) != 0 {
+			return v | RG_FRESH | RG_EMB
+		}
+		return v
+	}
+	if k == EX_CALL {
+		return rg_call(e)
+	}
+	if k == EX_FUNCREF && e[FR_FN][F_REGSUM] != 0 {
+		// A call through a function value may run this function.
+		let g = e[FR_FN][F_REGSUM]
+		mut i = 0
+		for i < g[1][VEC_LEN] {
+			if rg_merge(rg_fnsum[1], vec_get(g[1], i), vec_get(g[1], i + 1)) != 0 {
+				rg_changed = 1
+			}
+			i = i + 2
+		}
+		i = 0
+		for i < g[10][VEC_LEN] {
+			rg_record(rg_fnsum[10], vec_get(g[10], i), vec_get(g[10], i + 1), vec_get(g[10], i + 2))
+			i = i + 3
+		}
+		i = 0
+		for i < g[11][VEC_LEN] {
+			rg_record(rg_fnsum[11], vec_get(g[11], i), vec_get(g[11], i + 1), vec_get(g[11], i + 2))
+			i = i + 3
+		}
+		return 0
+	}
+	if k == EX_INDEX {
+		rg_expr(e[IX_X])
+		rg_expr(e[IX_I])
+		return 0
+	}
+	return 0
 }
 
 // ---- detach captures only long-lived memory (#232) ----
-
-var rg_in_keep;     // evaluating keep()'s argument
-var rg_detach_raw;  // [detached closure, bits]: captures it reads other than inside keep()
-var rg_kept_bits;   // [variable a kept closure captures, what was stored into its cell]
+shared mut rg_in_keep i64 // evaluating keep()'s argument
+shared mut rg_detach_raw i64 // [detached closure, bits]: captures it reads other than inside keep()
+shared mut rg_kept_bits i64 // [variable a kept closure captures, what was stored into its cell]
 
 // rg_detach_read notes that the running function, when a detach block, reads its capture i.
-fn rg_detach_read(i) {
-    if rg_in_keep || !ck_detached || !vec_has(ck_detached, rg_fn) {
-        return;
-    }
-    if !rg_detach_raw {
-        rg_detach_raw = vec_new();
-    }
-    if i > 62 {
-        i = 62;
-    }
-    rg_merge(rg_detach_raw, rg_fn, 1 << i);
+fn rg_detach_read(i_in i64) {
+	mut i = i_in
+	if rg_in_keep != 0 || ck_detached == 0 || vec_has(ck_detached, rg_fn) == 0 {
+		return
+	}
+	if rg_detach_raw == 0 {
+		rg_detach_raw = vec_new()
+	}
+	if i > 62 {
+		i = 62
+	}
+	rg_merge(rg_detach_raw, rg_fn, 1 << i)
 }
 
 // rg_note_kept records what an assignment stores into the cell of a variable that a closure
 // which may be kept captures (reads of it go through the cell, so its bits are not tracked).
-fn rg_note_kept(t, v) {
-    if t[N_KIND] != EX_MEM || t[MEM_INDEX] || t[MEM_OFF] != 0 || t[MEM_BASE][N_KIND] != EX_IDENT || !t[MEM_BASE][ID_REF] {
-        return;
-    }
-    let os = t[MEM_BASE][ID_REF][S_CELL_OF];
-    if !os || !os[S_KEPT_CAP] {
-        return;
-    }
-    if !rg_kept_bits {
-        rg_kept_bits = vec_new();
-    }
-    rg_merge(rg_kept_bits, os, v);
+fn rg_note_kept(t i64, v i64) {
+	if t[N_KIND] != EX_MEM || t[MEM_INDEX] != 0 || t[MEM_OFF] != 0 || t[MEM_BASE][N_KIND] != EX_IDENT || t[MEM_BASE][ID_REF] == 0 {
+		return
+	}
+	let os = t[MEM_BASE][ID_REF][S_CELL_OF]
+	if os == 0 || os[S_KEPT_CAP] == 0 {
+		return
+	}
+	if rg_kept_bits == 0 {
+		rg_kept_bits = vec_new()
+	}
+	rg_merge(rg_kept_bits, os, v)
 }
 
 // rg_capture_bits is what variable os of the running function (or its capture) may hold.
-fn rg_capture_bits(os) {
-    if os[S_CAPTURED] {
-        return rg_cell_bits(os[S_CAP_IDX]);
-    }
-    let b = os[S_REGION] | os[S_CAPBITS];
-    if rg_kept_bits {
-        b = b | rg_lookup(rg_kept_bits, os);
-    }
-    return b;
+fn rg_capture_bits(os i64) i64 {
+	if os[S_CAPTURED] != 0 {
+		return rg_cell_bits(os[S_CAP_IDX])
+	}
+	mut b = os[S_REGION] | os[S_CAPBITS]
+	if rg_kept_bits != 0 {
+		b = b | rg_lookup(rg_kept_bits, os)
+	}
+	return b
 }
 
 // rg_detach_check reports what a detach block in f captures that may hold request memory:
 // the detached task outlives the request, so the capture must be long-lived already
 // (keep() it first), unless the block reads it only inside keep() (design_semantics §6).
-fn rg_detach_check(f) {
-    let i = 0;
-    while ck_detached && i < ck_detached[VEC_LEN] {
-        let d = vec_get(ck_detached, i);
-        let caps = d[F_CAPTURES];
-        let raw = 0;
-        if rg_detach_raw {
-            raw = rg_lookup(rg_detach_raw, d);
-        }
-        let j = 0;
-        while d[F_PARENT] == f && caps && j < caps[VEC_LEN] {
-            let os = vec_get(caps, j);
-            let bit = 62;
-            if j < 62 {
-                bit = j;
-            }
-            if os && (raw & (1 << bit)) != 0 && has_ptr(os[S_TYPE]) && (rg_capture_bits(os) & RG_EMB) != 0 {
-                err_code_quoted(d[F_POS], "E314 DETACH_ESCAPE", "detach captures ", os[S_NAME], ", which may hold request memory, but the detached task outlives the request: keep() it before the block (let v = keep(...)), or read it in the block only inside keep()");
-            }
-            j = j + 1;
-        }
-        i = i + 1;
-    }
+fn rg_detach_check(f i64) {
+	mut i = 0
+	for ck_detached != 0 && i < ck_detached[VEC_LEN] {
+		let d = vec_get(ck_detached, i)
+		let caps = d[F_CAPTURES]
+		mut raw = 0
+		if rg_detach_raw != 0 {
+			raw = rg_lookup(rg_detach_raw, d)
+		}
+		mut j = 0
+		for d[F_PARENT] == f && caps != 0 && j < caps[VEC_LEN] {
+			let os = vec_get(caps, j)
+			mut bit = 62
+			if j < 62 {
+				bit = j
+			}
+			if os != 0 && (raw & (1 << bit)) != 0 && has_ptr(os[S_TYPE]) != 0 && (rg_capture_bits(os) & RG_EMB) != 0 {
+				err_code_quoted(d[F_POS], cstr("E314 DETACH_ESCAPE"), cstr("detach captures "), os[S_NAME], cstr(", which may hold request memory, but the detached task outlives the request: keep() it before the block (let v = keep(...)), or read it in the block only inside keep()"))
+			}
+			j = j + 1
+		}
+		i = i + 1
+	}
 }
 
 // ---- arena: nothing made in it leaves it (#236, notes/interface_arena.md §7) ----
@@ -805,700 +809,698 @@ fn rg_detach_check(f) {
 // of RG_FRESH, so fresh bits there are the arena's own memory. Storing that into an object
 // from outside, or into a captured variable, is E315; so is growing (append, map insert) a
 // slice or map from outside, since the new array or table would be allocated in the arena.
+shared mut rg_grows i64 // [function, parameter bits]: the parameters (and what they hold) it may grow
+shared mut rg_fstores i64 // [function, parameter bits]: the parameters it may store its own fresh memory into
+shared mut rg_pstores i64 // [function, parameter i, parameter bits]: the parameters it may store into parameter i
 
-var rg_grows;   // [function, parameter bits]: the parameters (and what they hold) it may grow
-var rg_fstores; // [function, parameter bits]: the parameters it may store its own fresh memory into
-var rg_pstores; // [function, parameter i, parameter bits]: the parameters it may store into parameter i
-
-fn rg_is_arena(f) {
-    return ck_arenas && vec_has(ck_arenas, f);
+fn rg_is_arena(f i64) i64 {
+	return i64(ck_arenas != 0 && vec_has(ck_arenas, f) != 0)
 }
 
 // rg_in_arena reports whether the running function is an arena's closure or one inside it.
-fn rg_in_arena() {
-    let f = rg_fn;
-    while f {
-        if rg_is_arena(f) {
-            return 1;
-        }
-        f = f[F_PARENT];
-    }
-    return 0;
+fn rg_in_arena() i64 {
+	mut f = rg_fn
+	for f != 0 {
+		if rg_is_arena(f) != 0 {
+			return 1
+		}
+		f = f[F_PARENT]
+	}
+	return 0
 }
 
 // rg_arena_made reports whether a value with bits v may be memory made in the arena.
-fn rg_arena_made(v) {
-    return (v & RG_FRESH) != 0 || ((v & RG_EMB) != 0 && (v & RG_OUT) == 0);
+fn rg_arena_made(v i64) i64 {
+	return i64((v & RG_FRESH) != 0 || ((v & RG_EMB) != 0 && (v & RG_OUT) == 0))
 }
 
-fn rg_arena_escape(pos, name) {
-    err_code_quoted(pos, "E315 ARENA_ESCAPE", "memory made in an arena stored into ", name, ", a variable from outside it, which outlives the arena: make the value the arena block's result (it is copied out), or keep() it");
+fn rg_arena_escape(pos i64, name i64) {
+	err_code_quoted(pos, cstr("E315 ARENA_ESCAPE"), cstr("memory made in an arena stored into "), name, cstr(", a variable from outside it, which outlives the arena: make the value the arena block's result (it is copied out), or keep() it"))
 }
 
 // rg_arena_cell_store checks a store of bits v into captured variable i inside an arena and
 // returns the bits that join the variable (RG_OUT means nothing outside the arena).
-fn rg_arena_cell_store(i, v, t, pos) {
-    let os = vec_get(rg_fn[F_CAPTURES], i);
-    let outside = rg_is_arena(rg_fn) || (os && os[S_CAPTURED] && rg_is_arena(rg_fn[F_PARENT]));
-    if outside && !rg_fn[F_ESCAPES] && has_ptr(t) && rg_arena_made(v) && rg_report {
-        let name = "a captured variable";
-        if os {
-            name = os[S_NAME];
-        }
-        rg_arena_escape(pos, name);
-    }
-    return v & ~RG_OUT;
+fn rg_arena_cell_store(i i64, v i64, t i64, pos i64) i64 {
+	let os = vec_get(rg_fn[F_CAPTURES], i)
+	let outside = i64(rg_is_arena(rg_fn) != 0 || (os != 0 && os[S_CAPTURED] != 0 && rg_is_arena(rg_fn[F_PARENT]) != 0))
+	if outside != 0 && rg_fn[F_ESCAPES] == 0 && has_ptr(t) != 0 && rg_arena_made(v) != 0 && rg_report != 0 {
+		mut name = cstr("a captured variable")
+		if os != 0 {
+			name = os[S_NAME]
+		}
+		rg_arena_escape(pos, name)
+	}
+	return v & ~RG_OUT
 }
 
-fn rg_grows_op(name) {
-    return streq(name, "rt_append") || streq(name, "rt_append_rc") || streq(name, "rt_append_dyn") || streq(name, "rt_slice_appendn") || streq(name, "rt_slice_appendn_rc") || streq(name, "rt_append_str") || streq(name, "rt_map_set") || streq(name, "rt_map_setk");
+fn rg_grows_op(name i64) i64 {
+	return i64(streq(name, cstr("rt_append")) != 0 || streq(name, cstr("rt_append_rc")) != 0 || streq(name, cstr("rt_append_dyn")) != 0 || streq(name, cstr("rt_slice_appendn")) != 0 || streq(name, cstr("rt_slice_appendn_rc")) != 0 || streq(name, cstr("rt_append_str")) != 0 || streq(name, cstr("rt_map_set")) != 0 || streq(name, cstr("rt_map_setk")) != 0)
 }
 
 // rg_grow notes that the running function may grow the slice or map with bits b.
-fn rg_grow(b, pos) {
-    let i = 0;
-    while i < rg_nparams && i < RG_MAXP {
-        if (b & (RG_P0 << i)) != 0 {
-            if !rg_grows {
-                rg_grows = vec_new();
-            }
-            if rg_merge(rg_grows, rg_fn, 1 << i) {
-                rg_changed = 1;
-            }
-        }
-        i = i + 1;
-    }
-    if (b & RG_OUT) != 0 && (b & ~(RG_OUT | RG_INGOT)) != 0 && rg_report && rg_in_arena() {
-        err_code_at(pos, "E315 ARENA_ESCAPE", "a slice or map from outside an arena grows inside it (append or insert), so its new memory would be the arena's: grow it after the block, from the block's result");
-    }
+fn rg_grow(b i64, pos i64) {
+	mut i = 0
+	for i < rg_nparams && i < RG_MAXP {
+		if (b & (RG_P0 << i)) != 0 {
+			if rg_grows == 0 {
+				rg_grows = vec_new()
+			}
+			if rg_merge(rg_grows, rg_fn, 1 << i) != 0 {
+				rg_changed = 1
+			}
+		}
+		i = i + 1
+	}
+	if (b & RG_OUT) != 0 && (b & ~(RG_OUT | RG_INGOT)) != 0 && rg_report != 0 && rg_in_arena() != 0 {
+		err_code_at(pos, cstr("E315 ARENA_ESCAPE"), cstr("a slice or map from outside an arena grows inside it (append or insert), so its new memory would be the arena's: grow it after the block, from the block's result"))
+	}
 }
 
 // rg_arena_store notes a store of bits v into a container with bits c: in terms of the running
 // function's parameters, for its callers, and as E315 when it takes arena memory outside.
-fn rg_arena_store(c, v, pos) {
-    let i = 0;
-    while i < rg_nparams && i < RG_MAXP && i < 62 {
-        if (c & (RG_P0 << i)) != 0 {
-            if (v & RG_FRESH) != 0 {
-                if !rg_fstores {
-                    rg_fstores = vec_new();
-                }
-                if rg_merge(rg_fstores, rg_fn, 1 << i) {
-                    rg_changed = 1;
-                }
-            }
-            let j = 0;
-            let from = 0;
-            while j < rg_nparams && j < RG_MAXP && j < 62 {
-                if (v & (RG_P0 << j)) != 0 {
-                    from = from | (1 << j);
-                }
-                j = j + 1;
-            }
-            if from && rg_pstore_add(i, from) {
-                rg_changed = 1;
-            }
-        }
-        i = i + 1;
-    }
-    if (c & (RG_INGOT | RG_UNK)) == 0 && (c & RG_OUT) != 0 && rg_report && rg_in_arena() && rg_arena_made(v) {
-        err_code_at(pos, "E315 ARENA_ESCAPE", "memory made in an arena stored into an object from outside it, which outlives the arena: make the value the arena block's result (it is copied out), or keep() it");
-    }
+fn rg_arena_store(c i64, v i64, pos i64) {
+	mut i = 0
+	for i < rg_nparams && i < RG_MAXP && i < 62 {
+		if (c & (RG_P0 << i)) != 0 {
+			if (v & RG_FRESH) != 0 {
+				if rg_fstores == 0 {
+					rg_fstores = vec_new()
+				}
+				if rg_merge(rg_fstores, rg_fn, 1 << i) != 0 {
+					rg_changed = 1
+				}
+			}
+			mut j = 0
+			mut from = 0
+			for j < rg_nparams && j < RG_MAXP && j < 62 {
+				if (v & (RG_P0 << j)) != 0 {
+					from = from | (1 << j)
+				}
+				j = j + 1
+			}
+			if from != 0 && rg_pstore_add(i, from) != 0 {
+				rg_changed = 1
+			}
+		}
+		i = i + 1
+	}
+	if (c & (RG_INGOT | RG_UNK)) == 0 && (c & RG_OUT) != 0 && rg_report != 0 && rg_in_arena() != 0 && rg_arena_made(v) != 0 {
+		err_code_at(pos, cstr("E315 ARENA_ESCAPE"), cstr("memory made in an arena stored into an object from outside it, which outlives the arena: make the value the arena block's result (it is copied out), or keep() it"))
+	}
 }
 
-fn rg_pstore_add(i, from) {
-    if !rg_pstores {
-        rg_pstores = vec_new();
-    }
-    let k = 0;
-    while k < rg_pstores[VEC_LEN] {
-        if vec_get(rg_pstores, k) == rg_fn && vec_get(rg_pstores, k + 1) == i {
-            let old = vec_get(rg_pstores, k + 2);
-            rg_pstores[VEC_DATA][k + 2] = old | from;
-            return (old | from) != old;
-        }
-        k = k + 3;
-    }
-    vec_push(rg_pstores, rg_fn);
-    vec_push(rg_pstores, i);
-    vec_push(rg_pstores, from);
-    return 1;
+fn rg_pstore_add(i i64, from i64) i64 {
+	if rg_pstores == 0 {
+		rg_pstores = vec_new()
+	}
+	mut k = 0
+	for k < rg_pstores[VEC_LEN] {
+		if vec_get(rg_pstores, k) == rg_fn && vec_get(rg_pstores, k + 1) == i {
+			let old = vec_get(rg_pstores, k + 2)
+			rg_pstores[VEC_DATA][k + 2] = old | from
+			return i64((old | from) != old)
+		}
+		k = k + 3
+	}
+	vec_push(rg_pstores, rg_fn)
+	vec_push(rg_pstores, i)
+	vec_push(rg_pstores, from)
+	return 1
 }
 
-fn rg_pstore_get(f, i) {
-    let k = 0;
-    while rg_pstores && k < rg_pstores[VEC_LEN] {
-        if vec_get(rg_pstores, k) == f && vec_get(rg_pstores, k + 1) == i {
-            return vec_get(rg_pstores, k + 2);
-        }
-        k = k + 3;
-    }
-    return 0;
+fn rg_pstore_get(f i64, i i64) i64 {
+	mut k = 0
+	for rg_pstores != 0 && k < rg_pstores[VEC_LEN] {
+		if vec_get(rg_pstores, k) == f && vec_get(rg_pstores, k + 1) == i {
+			return vec_get(rg_pstores, k + 2)
+		}
+		k = k + 3
+	}
+	return 0
 }
 
 // rg_arena_call applies what callee f may grow and store into its parameters to the call's
 // arguments (bits b): its own fresh memory, or another argument.
-fn rg_arena_call(f, b, pos) {
-    let g = 0;
-    let fs = 0;
-    if rg_grows {
-        g = rg_lookup(rg_grows, f);
-    }
-    if rg_fstores {
-        fs = rg_lookup(rg_fstores, f);
-    }
-    let i = 0;
-    while i < b[VEC_LEN] && i < RG_MAXP && i < 62 {
-        if (g & (1 << i)) != 0 {
-            rg_grow(vec_get(b, i), pos);
-        }
-        let v = 0;
-        if (fs & (1 << i)) != 0 {
-            v = RG_FRESH | RG_EMB;
-        }
-        let from = rg_pstore_get(f, i);
-        let j = 0;
-        while from && j < b[VEC_LEN] && j < 62 {
-            if (from & (1 << j)) != 0 {
-                v = v | vec_get(b, j);
-            }
-            j = j + 1;
-        }
-        if (v & RG_EMB) != 0 {
-            rg_arena_store(vec_get(b, i), v, pos);
-        }
-        i = i + 1;
-    }
+fn rg_arena_call(f i64, b i64, pos i64) {
+	mut g = 0
+	mut fs = 0
+	if rg_grows != 0 {
+		g = rg_lookup(rg_grows, f)
+	}
+	if rg_fstores != 0 {
+		fs = rg_lookup(rg_fstores, f)
+	}
+	mut i = 0
+	for i < b[VEC_LEN] && i < RG_MAXP && i < 62 {
+		if (g & (1 << i)) != 0 {
+			rg_grow(vec_get(b, i), pos)
+		}
+		mut v = 0
+		if (fs & (1 << i)) != 0 {
+			v = RG_FRESH | RG_EMB
+		}
+		let from = rg_pstore_get(f, i)
+		mut j = 0
+		for from != 0 && j < b[VEC_LEN] && j < 62 {
+			if (from & (1 << j)) != 0 {
+				v = v | vec_get(b, j)
+			}
+			j = j + 1
+		}
+		if (v & RG_EMB) != 0 {
+			rg_arena_store(vec_get(b, i), v, pos)
+		}
+		i = i + 1
+	}
 }
 
 // ---- use after hearth.Reset() (#179) ----
-
 // rg_resets notes that the function being analyzed resets the request pool (its callers do
 // too), and in rs_walk marks every local that may hold request memory as freed.
 fn rg_resets() {
-    if !rg_sum[12] {
-        rg_sum[12] = 1;
-        rg_changed = 1;
-    }
-    if !rs_active {
-        return;
-    }
-    let locals = rg_fn[F_LOCALS];
-    let i = 0;
-    while i < locals[VEC_LEN] {
-        let s = vec_get(locals, i);
-        if has_ptr(s[S_TYPE]) && (rs_bits(rs_cur, s) & RG_EMB) != 0 && !vec_has(rs_dead, s) {
-            vec_push(rs_dead, s);
-        }
-        i = i + 1;
-    }
+	if rg_sum[12] == 0 {
+		rg_sum[12] = 1
+		rg_changed = 1
+	}
+	if rs_active == 0 {
+		return
+	}
+	let locals = rg_fn[F_LOCALS]
+	mut i = 0
+	for i < locals[VEC_LEN] {
+		let s = vec_get(locals, i)
+		if has_ptr(s[S_TYPE]) != 0 && (rs_bits(rs_cur, s) & RG_EMB) != 0 && vec_has(rs_dead, s) == 0 {
+			vec_push(rs_dead, s)
+		}
+		i = i + 1
+	}
 }
 
 // rs_bits is what local s may hold on the walk: its latest assignment's bits, else all of them.
-fn rs_bits(cur, s) {
-    let i = 0;
-    while i < cur[VEC_LEN] {
-        if vec_get(cur, i) == s {
-            return vec_get(cur, i + 1);
-        }
-        i = i + 2;
-    }
-    return s[S_REGION];
+fn rs_bits(cur i64, s i64) i64 {
+	mut i = 0
+	for i < cur[VEC_LEN] {
+		if vec_get(cur, i) == s {
+			return vec_get(cur, i + 1)
+		}
+		i = i + 2
+	}
+	return s[S_REGION]
 }
 
-fn rs_assign(s, bits) {
-    let i = 0;
-    while i < rs_cur[VEC_LEN] {
-        if vec_get(rs_cur, i) == s {
-            rs_cur[VEC_DATA][i + 1] = bits;
-            vec_drop(rs_dead, s);
-            return;
-        }
-        i = i + 2;
-    }
-    vec_push(rs_cur, s);
-    vec_push(rs_cur, bits);
-    vec_drop(rs_dead, s);
+fn rs_assign(s i64, bits i64) {
+	mut i = 0
+	for i < rs_cur[VEC_LEN] {
+		if vec_get(rs_cur, i) == s {
+			rs_cur[VEC_DATA][i + 1] = bits
+			vec_drop(rs_dead, s)
+			return
+		}
+		i = i + 2
+	}
+	vec_push(rs_cur, s)
+	vec_push(rs_cur, bits)
+	vec_drop(rs_dead, s)
 }
 
 // rs_join merges two walk states: a local is freed if it is on either path, and may hold
 // what either path assigned.
-fn rs_join(dead_a, cur_a, dead_b, cur_b) {
-    vec_union(dead_a, dead_b);
-    let out = vec_new();
-    let i = 0;
-    while i < cur_a[VEC_LEN] {
-        let s = vec_get(cur_a, i);
-        vec_push(out, s);
-        vec_push(out, vec_get(cur_a, i + 1) | rs_bits(cur_b, s));
-        i = i + 2;
-    }
-    i = 0;
-    while i < cur_b[VEC_LEN] {
-        let s = vec_get(cur_b, i);
-        if rs_bits(out, s) == s[S_REGION] && !rs_has_entry(out, s) {
-            vec_push(out, s);
-            vec_push(out, vec_get(cur_b, i + 1) | s[S_REGION]);
-        }
-        i = i + 2;
-    }
-    rs_dead = dead_a;
-    rs_cur = out;
+fn rs_join(dead_a i64, cur_a i64, dead_b i64, cur_b i64) {
+	vec_union(dead_a, dead_b)
+	let out = vec_new()
+	mut i = 0
+	for i < cur_a[VEC_LEN] {
+		let s = vec_get(cur_a, i)
+		vec_push(out, s)
+		vec_push(out, vec_get(cur_a, i + 1) | rs_bits(cur_b, s))
+		i = i + 2
+	}
+	i = 0
+	for i < cur_b[VEC_LEN] {
+		let s = vec_get(cur_b, i)
+		if rs_bits(out, s) == s[S_REGION] && rs_has_entry(out, s) == 0 {
+			vec_push(out, s)
+			vec_push(out, vec_get(cur_b, i + 1) | s[S_REGION])
+		}
+		i = i + 2
+	}
+	rs_dead = dead_a
+	rs_cur = out
 }
 
-fn rs_has_entry(cur, s) {
-    let i = 0;
-    while i < cur[VEC_LEN] {
-        if vec_get(cur, i) == s {
-            return 1;
-        }
-        i = i + 2;
-    }
-    return 0;
+fn rs_has_entry(cur i64, s i64) i64 {
+	mut i = 0
+	for i < cur[VEC_LEN] {
+		if vec_get(cur, i) == s {
+			return 1
+		}
+		i = i + 2
+	}
+	return 0
 }
 
-fn vec_has(v, x) {
-    let i = 0;
-    while i < v[VEC_LEN] {
-        if vec_get(v, i) == x {
-            return 1;
-        }
-        i = i + 1;
-    }
-    return 0;
+fn vec_has(v i64, x i64) i64 {
+	mut i = 0
+	for i < v[VEC_LEN] {
+		if vec_get(v, i) == x {
+			return 1
+		}
+		i = i + 1
+	}
+	return 0
 }
 
-fn vec_drop(v, x) {
-    let i = 0;
-    while i < v[VEC_LEN] {
-        if vec_get(v, i) == x {
-            v[VEC_DATA][i] = vec_get(v, v[VEC_LEN] - 1);
-            v[VEC_LEN] = v[VEC_LEN] - 1;
-            return;
-        }
-        i = i + 1;
-    }
+fn vec_drop(v i64, x i64) {
+	mut i = 0
+	for i < v[VEC_LEN] {
+		if vec_get(v, i) == x {
+			v[VEC_DATA][i] = vec_get(v, v[VEC_LEN] - 1)
+			v[VEC_LEN] = v[VEC_LEN] - 1
+			return
+		}
+		i = i + 1
+	}
 }
 
-fn vec_union(a, b) {
-    let i = 0;
-    while i < b[VEC_LEN] {
-        if !vec_has(a, vec_get(b, i)) {
-            vec_push(a, vec_get(b, i));
-        }
-        i = i + 1;
-    }
+fn vec_union(a i64, b i64) {
+	mut i = 0
+	for i < b[VEC_LEN] {
+		if vec_has(a, vec_get(b, i)) == 0 {
+			vec_push(a, vec_get(b, i))
+		}
+		i = i + 1
+	}
 }
 
 // rs_walk follows f's statements in order: after a reset, a local that may hold request
 // memory is freed until it is assigned again; reading it then is an error. Loop bodies are
 // walked twice so a read before the reset in the next iteration is seen; branches join.
-fn rs_walk(f) {
-    rs_active = 1;
-    rs_dead = vec_new();
-    rs_said = vec_new();
-    rs_cur = vec_new();
-    rs_stmts(f[F_BODY][BLK_STMTS]);
-    rs_active = 0;
+fn rs_walk(f i64) {
+	rs_active = 1
+	rs_dead = vec_new()
+	rs_said = vec_new()
+	rs_cur = vec_new()
+	rs_stmts(f[F_BODY][BLK_STMTS])
+	rs_active = 0
 }
 
-fn rs_stmts(v) {
-    let i = 0;
-    while i < v[VEC_LEN] {
-        rs_stmt(vec_get(v, i));
-        i = i + 1;
-    }
+fn rs_stmts(v i64) {
+	mut i = 0
+	for i < v[VEC_LEN] {
+		rs_stmt(vec_get(v, i))
+		i = i + 1
+	}
 }
 
-fn rs_stmt(s) {
-    let k = s[N_KIND];
-    if k == ST_BLOCK {
-        rs_stmts(s[BLK_STMTS]);
-    } else if k == ST_LET {
-        let lb = 0;
-        if s[LET_INIT] {
-            lb = rg_expr(s[LET_INIT]);
-        }
-        rs_assign(s[LET_SYM], lb);
-    } else if k == ST_ASSIGN {
-        let ab = rg_expr(s[AS_VALUE]);
-        let t = s[AS_TARGET];
-        if t[N_KIND] == EX_IDENT && t[ID_REF] {
-            rs_assign(t[ID_REF], ab);
-        } else {
-            rg_expr(t);
-        }
-    } else if k == ST_EXPR {
-        rg_expr(s[ES_X]);
-    } else if k == ST_IF {
-        rg_expr(s[IF_COND]);
-        let dead0 = vec_clone(rs_dead);
-        let cur0 = vec_clone(rs_cur);
-        rs_stmts(s[IF_THEN][BLK_STMTS]);
-        let dead1 = rs_dead;
-        let cur1 = rs_cur;
-        rs_dead = dead0;
-        rs_cur = cur0;
-        if s[IF_ELSE] {
-            rs_stmt(s[IF_ELSE]);
-        }
-        rs_join(rs_dead, rs_cur, dead1, cur1);
-    } else if k == ST_WHILE {
-        // Twice, so the next iteration sees what this one freed; then joined with the path
-        // that skips the loop.
-        let dead0 = vec_clone(rs_dead);
-        let cur0 = vec_clone(rs_cur);
-        let pass = 0;
-        while pass < 2 {
-            rg_expr(s[WH_COND]);
-            rs_stmts(s[WH_BODY][BLK_STMTS]);
-            if s[WH_POST] {
-                rs_stmt(s[WH_POST]);
-            }
-            pass = pass + 1;
-        }
-        rs_join(rs_dead, rs_cur, dead0, cur0);
-    } else if k == ST_RETURN {
-        if s[RET_VALUE] {
-            rg_expr(s[RET_VALUE]);
-        }
-        if s[RET_VALUES] {
-            let i = 0;
-            while i < s[RET_VALUES][VEC_LEN] {
-                rg_expr(vec_get(s[RET_VALUES], i));
-                i = i + 1;
-            }
-        }
-    } else if k == ST_CALLMULTI {
-        rg_expr(s[CM_CALL]);
-        let syms = s[CM_SYMS];
-        let j = 0;
-        while j < syms[VEC_LEN] {
-            if vec_get(syms, j) {
-                rs_assign(vec_get(syms, j), vec_get(syms, j)[S_REGION]);
-            }
-            j = j + 1;
-        }
-    }
+fn rs_stmt(s i64) {
+	let k = s[N_KIND]
+	if k == ST_BLOCK {
+		rs_stmts(s[BLK_STMTS])
+	} else if k == ST_LET {
+		mut lb = 0
+		if s[LET_INIT] != 0 {
+			lb = rg_expr(s[LET_INIT])
+		}
+		rs_assign(s[LET_SYM], lb)
+	} else if k == ST_ASSIGN {
+		let ab = rg_expr(s[AS_VALUE])
+		let t = s[AS_TARGET]
+		if t[N_KIND] == EX_IDENT && t[ID_REF] != 0 {
+			rs_assign(t[ID_REF], ab)
+		} else {
+			rg_expr(t)
+		}
+	} else if k == ST_EXPR {
+		rg_expr(s[ES_X])
+	} else if k == ST_IF {
+		rg_expr(s[IF_COND])
+		let dead0 = vec_clone(rs_dead)
+		let cur0 = vec_clone(rs_cur)
+		rs_stmts(s[IF_THEN][BLK_STMTS])
+		let dead1 = rs_dead
+		let cur1 = rs_cur
+		rs_dead = dead0
+		rs_cur = cur0
+		if s[IF_ELSE] != 0 {
+			rs_stmt(s[IF_ELSE])
+		}
+		rs_join(rs_dead, rs_cur, dead1, cur1)
+	} else if k == ST_WHILE {
+		// Twice, so the next iteration sees what this one freed; then joined with the path
+		// that skips the loop.
+		let dead0 = vec_clone(rs_dead)
+		let cur0 = vec_clone(rs_cur)
+		mut pass = 0
+		for pass < 2 {
+			rg_expr(s[WH_COND])
+			rs_stmts(s[WH_BODY][BLK_STMTS])
+			if s[WH_POST] != 0 {
+				rs_stmt(s[WH_POST])
+			}
+			pass = pass + 1
+		}
+		rs_join(rs_dead, rs_cur, dead0, cur0)
+	} else if k == ST_RETURN {
+		if s[RET_VALUE] != 0 {
+			rg_expr(s[RET_VALUE])
+		}
+		if s[RET_VALUES] != 0 {
+			mut i = 0
+			for i < s[RET_VALUES][VEC_LEN] {
+				rg_expr(vec_get(s[RET_VALUES], i))
+				i = i + 1
+			}
+		}
+	} else if k == ST_CALLMULTI {
+		rg_expr(s[CM_CALL])
+		let syms = s[CM_SYMS]
+		mut j = 0
+		for j < syms[VEC_LEN] {
+			if vec_get(syms, j) != 0 {
+				rs_assign(vec_get(syms, j), vec_get(syms, j)[S_REGION])
+			}
+			j = j + 1
+		}
+	}
 }
 
-fn rg_call(e) {
-    if e[N_REGION] == R_OWNED && !rg_in_keep {
-        // keep(x): a detached block that reads a capture only in here uses a copy (#232).
-        rg_in_keep = 1;
-        let kb = rg_call(e);
-        rg_in_keep = 0;
-        return kb;
-    }
-    let args = e[CALL_ARGS];
-    let n = args[VEC_LEN];
-    let b = vec_new();
-    let i = 0;
-    while i < n {
-        vec_push(b, rg_expr(vec_get(args, i)));
-        i = i + 1;
-    }
-    rg_multi = 0;
-    if e[CALL_INTRINSIC] {
-        return 0;
-    }
-    let pos = e[N_POS];
-    if e[CALL_DYN_SHAPE] {
-        return rg_dyn_call(e, args, b, pos);
-    }
-    if e[CALL_CALLEE] {
-        rg_expr(e[CALL_CALLEE]);
-        // The callee is unknown: a mut argument may be modified and may receive request
-        // memory, and the call may do what any function used as a value does (rg_fnsum).
-        let ct = e[CALL_CALLEE][N_TYPE];
-        let mask = 0;
-        if ct && ct[TY_KIND] == K_FUNC {
-            mask = ct[TY_KEY];
-        }
-        i = 0;
-        while i < n && i < 63 {
-            if (mask & (1 << i)) != 0 {
-                let saved = rg_report;
-                if rg_report && ((vec_get(b, i) | rg_pass(rg_fnsum[10], i, args, b, -1, pos)) & (RG_INGOT | RG_UNK)) != 0 {
-                    let m = err_code(pos, "E312 ARG_ESCAPE");
-                    buf_str(m, "a call through a function value may store request memory into its mut argument ");
-                    buf_int(m, i + 1);
-                    buf_str(m, ", which may be long-lived: call the function directly or pass request-owned memory");
-                    err_end(m);
-                    rg_report = 0;
-                }
-                let a = vec_get(args, i);
-                rg_store(vec_get(b, i), rg_owner(a), rg_key(a[N_TYPE]), RG_EMB, 0, pos, 0);
-                rg_pass(rg_fnsum[10], i, args, b, RG_EMB, pos);
-                rg_pass(rg_fnsum[11], i, args, b, 0, pos);
-                rg_report = saved;
-            }
-            i = i + 1;
-        }
-        rg_import(rg_fnsum[1], args, b);
-        if has_ptr(e[N_TYPE]) {
-            return RG_UNK | RG_EMB;
-        }
-        return 0;
-    }
-    let f = e[CALL_FN];
-    let name = e[CALL_NAME];
-    if f && f[F_QNAME] {
-        name = f[F_QNAME];
-    }
-    if (name && streq(name, "hearth.Reset")) || (f && f[F_REGSUM] && f[F_REGSUM][12] && !vec_get(file_trusted, f[F_FILE])) {
-        rg_resets();
-    }
-    if e[N_REGION] == R_OWNED || (f && is_keep_fn(f)) || (name && str_prefix(name, "rt_keep")) {
-        return RG_INGOT;
-    }
-    if name && str_prefix(name, "rt_") {
-        return rg_runtime_call(e, name, b, pos);
-    }
-    let sum = 0;
-    if f {
-        sum = f[F_REGSUM];
-    }
-    if !sum {
-        if has_ptr(e[N_TYPE]) {
-            return RG_UNK | RG_EMB;
-        }
-        return 0;
-    }
-    i = 0;
-    while i < n && i < RG_MAXP {
-        let mutp = f[F_MUTS] && i < f[F_MUTS][VEC_LEN] && vec_get(f[F_MUTS], i);
-        if (sum[0] & (1 << i)) != 0 {
-            let saved = rg_report;
-            if rg_report && (rg_pass(sum[10], i, args, b, -1, pos) & (RG_INGOT | RG_UNK)) != 0 {
-                let m = err_code(pos, "E312 ARG_ESCAPE");
-                buf_str(m, name);
-                buf_str(m, " stores request memory into its mut parameter '");
-                buf_str(m, vec_get(f[F_LOCALS], i)[S_NAME]);
-                if vec_get(file_trusted, f[F_FILE]) {
-                    // The standard library cannot be changed by its caller: the argument must.
-                    buf_str(m, "', but this argument may be long-lived: pass request memory (a local) instead");
-                } else {
-                    buf_str(m, "', but this argument may be long-lived: keep() the stored values inside ");
-                    buf_str(m, name);
-                }
-                err_end(m);
-                rg_report = 0;
-            }
-            rg_pass(sum[10], i, args, b, RG_EMB, pos);
-            rg_report = saved;
-        } else if mutp {
-            let a = vec_get(args, i);
-            rg_store(vec_get(b, i), rg_owner(a), rg_key(a[N_TYPE]), 0, 0, pos, 0);
-        }
-        if mutp {
-            rg_pass(sum[11], i, args, b, 0, pos);
-        }
-        i = i + 1;
-    }
-    rg_arena_call(f, b, pos);
-    rg_import(sum[1], args, b);
-    let res = vec_new();
-    let j = 0;
-    while j < 8 {
-        let rt = 0;
-        if j < f[F_RTYPES][VEC_LEN] {
-            rt = vec_get(f[F_RTYPES], j);
-        }
-        vec_push(res, rg_subst(sum[2 + j], args, b, rt));
-        j = j + 1;
-    }
-    rg_multi = res;
-    if !has_ptr(e[N_TYPE]) {
-        return 0;
-    }
-    return vec_get(res, 0);
+fn rg_call(e i64) i64 {
+	if e[N_REGION] == R_OWNED && rg_in_keep == 0 {
+		// keep(x): a detached block that reads a capture only in here uses a copy (#232).
+		rg_in_keep = 1
+		let kb = rg_call(e)
+		rg_in_keep = 0
+		return kb
+	}
+	let args = e[CALL_ARGS]
+	let n = args[VEC_LEN]
+	let b = vec_new()
+	mut i = 0
+	for i < n {
+		vec_push(b, rg_expr(vec_get(args, i)))
+		i = i + 1
+	}
+	rg_multi = 0
+	if e[CALL_INTRINSIC] != 0 {
+		return 0
+	}
+	let pos = e[N_POS]
+	if e[CALL_DYN_SHAPE] != 0 {
+		return rg_dyn_call(e, args, b, pos)
+	}
+	if e[CALL_CALLEE] != 0 {
+		rg_expr(e[CALL_CALLEE])
+		// The callee is unknown: a mut argument may be modified and may receive request
+		// memory, and the call may do what any function used as a value does (rg_fnsum).
+		let ct = e[CALL_CALLEE][N_TYPE]
+		mut mask = 0
+		if ct != 0 && ct[TY_KIND] == K_FUNC {
+			mask = ct[TY_KEY]
+		}
+		i = 0
+		for i < n && i < 63 {
+			if (mask & (1 << i)) != 0 {
+				let saved = rg_report
+				if rg_report != 0 && ((vec_get(b, i) | rg_pass(rg_fnsum[10], i, args, b, -1, pos)) & (RG_INGOT | RG_UNK)) != 0 {
+					let m = err_code(pos, cstr("E312 ARG_ESCAPE"))
+					buf_str(m, cstr("a call through a function value may store request memory into its mut argument "))
+					buf_int(m, i + 1)
+					buf_str(m, cstr(", which may be long-lived: call the function directly or pass request-owned memory"))
+					err_end(m)
+					rg_report = 0
+				}
+				let a = vec_get(args, i)
+				rg_store(vec_get(b, i), rg_owner(a), rg_key(a[N_TYPE]), RG_EMB, 0, pos, 0)
+				rg_pass(rg_fnsum[10], i, args, b, RG_EMB, pos)
+				rg_pass(rg_fnsum[11], i, args, b, 0, pos)
+				rg_report = saved
+			}
+			i = i + 1
+		}
+		rg_import(rg_fnsum[1], args, b)
+		if has_ptr(e[N_TYPE]) != 0 {
+			return RG_UNK | RG_EMB
+		}
+		return 0
+	}
+	let f = e[CALL_FN]
+	mut name = e[CALL_NAME]
+	if f != 0 && f[F_QNAME] != 0 {
+		name = f[F_QNAME]
+	}
+	if (name != 0 && streq(name, cstr("hearth.Reset")) != 0) || (f != 0 && f[F_REGSUM] != 0 && f[F_REGSUM][12] != 0 && vec_get(file_trusted, f[F_FILE]) == 0) {
+		rg_resets()
+	}
+	if e[N_REGION] == R_OWNED || (f != 0 && is_keep_fn(f) != 0) || (name != 0 && str_prefix(name, cstr("rt_keep")) != 0) {
+		return RG_INGOT
+	}
+	if name != 0 && str_prefix(name, cstr("rt_")) != 0 {
+		return rg_runtime_call(e, name, b, pos)
+	}
+	mut sum = 0
+	if f != 0 {
+		sum = f[F_REGSUM]
+	}
+	if sum == 0 {
+		if has_ptr(e[N_TYPE]) != 0 {
+			return RG_UNK | RG_EMB
+		}
+		return 0
+	}
+	i = 0
+	for i < n && i < RG_MAXP {
+		let mutp = i64(f[F_MUTS] != 0 && i < f[F_MUTS][VEC_LEN] && vec_get(f[F_MUTS], i) != 0)
+		if (sum[0] & (1 << i)) != 0 {
+			let saved = rg_report
+			if rg_report != 0 && (rg_pass(sum[10], i, args, b, -1, pos) & (RG_INGOT | RG_UNK)) != 0 {
+				let m = err_code(pos, cstr("E312 ARG_ESCAPE"))
+				buf_str(m, name)
+				buf_str(m, cstr(" stores request memory into its mut parameter '"))
+				buf_str(m, vec_get(f[F_LOCALS], i)[S_NAME])
+				if vec_get(file_trusted, f[F_FILE]) != 0 {
+					// The standard library cannot be changed by its caller: the argument must.
+					buf_str(m, cstr("', but this argument may be long-lived: pass request memory (a local) instead"))
+				} else {
+					buf_str(m, cstr("', but this argument may be long-lived: keep() the stored values inside "))
+					buf_str(m, name)
+				}
+				err_end(m)
+				rg_report = 0
+			}
+			rg_pass(sum[10], i, args, b, RG_EMB, pos)
+			rg_report = saved
+		} else if mutp != 0 {
+			let a = vec_get(args, i)
+			rg_store(vec_get(b, i), rg_owner(a), rg_key(a[N_TYPE]), 0, 0, pos, 0)
+		}
+		if mutp != 0 {
+			rg_pass(sum[11], i, args, b, 0, pos)
+		}
+		i = i + 1
+	}
+	rg_arena_call(f, b, pos)
+	rg_import(sum[1], args, b)
+	let res = vec_new()
+	mut j = 0
+	for j < 8 {
+		mut rt = 0
+		if j < f[F_RTYPES][VEC_LEN] {
+			rt = vec_get(f[F_RTYPES], j)
+		}
+		vec_push(res, rg_subst(sum[2 + j], args, b, rt))
+		j = j + 1
+	}
+	rg_multi = res
+	if has_ptr(e[N_TYPE]) == 0 {
+		return 0
+	}
+	return vec_get(res, 0)
 }
 
 // A dyn call can target any concrete method table for its shape. Join the region
 // summaries of those methods using each table's concrete receiver type.
-fn rg_dyn_call(e, args, b, pos) {
-    let shape = e[CALL_DYN_SHAPE];
-    let index = e[CALL_DYN_INDEX] - 1;
-    let saved_fn = e[CALL_FN];
-    let saved_callee = e[CALL_CALLEE];
-    let saved_shape = e[CALL_DYN_SHAPE];
-    let saved_index = e[CALL_DYN_INDEX];
-    let saved_type = vec_get(args, 0)[N_TYPE];
-    let joined = vec_new();
-    let j = 0;
-    while j < 8 {
-        vec_push(joined, 0);
-        j = j + 1;
-    }
-    let result = 0;
-    let found = 0;
-    let i = 0;
-    while i < dyn_tables[VEC_LEN] {
-        let rec = vec_get(dyn_tables, i);
-        let methods = vec_get(rec, 3);
-        if vec_get(rec, 1) == shape && index >= 0 && index < methods[VEC_LEN] {
-            let f = vec_get(methods, index);
-            if f {
-                found = 1;
-                e[CALL_FN] = f;
-                e[CALL_CALLEE] = 0;
-                e[CALL_DYN_SHAPE] = 0;
-                e[CALL_DYN_INDEX] = 0;
-                vec_get(args, 0)[N_TYPE] = vec_get(rec, 0);
-                result = result | rg_call(e);
-                let ri = 0;
-                while ri < 8 {
-                    joined[VEC_DATA][ri] = vec_get(joined, ri) | vec_get(rg_multi, ri);
-                    ri = ri + 1;
-                }
-            }
-        }
-        i = i + 1;
-    }
-    e[CALL_FN] = saved_fn;
-    e[CALL_CALLEE] = saved_callee;
-    e[CALL_DYN_SHAPE] = saved_shape;
-    e[CALL_DYN_INDEX] = saved_index;
-    vec_get(args, 0)[N_TYPE] = saved_type;
-    if !found {
-        if has_ptr(e[N_TYPE]) {
-            return RG_UNK | RG_EMB;
-        }
-        return 0;
-    }
-    rg_multi = joined;
-    return result;
+fn rg_dyn_call(e i64, args i64, b i64, pos i64) i64 {
+	let shape_ = e[CALL_DYN_SHAPE]
+	let index = e[CALL_DYN_INDEX] - 1
+	let saved_fn = e[CALL_FN]
+	let saved_callee = e[CALL_CALLEE]
+	let saved_shape = e[CALL_DYN_SHAPE]
+	let saved_index = e[CALL_DYN_INDEX]
+	let saved_type = vec_get(args, 0)[N_TYPE]
+	let joined = vec_new()
+	mut j = 0
+	for j < 8 {
+		vec_push(joined, 0)
+		j = j + 1
+	}
+	mut result = 0
+	mut found = 0
+	mut i = 0
+	for i < dyn_tables[VEC_LEN] {
+		let rec = vec_get(dyn_tables, i)
+		let methods = vec_get(rec, 3)
+		if vec_get(rec, 1) == shape_ && index >= 0 && index < methods[VEC_LEN] {
+			let f = vec_get(methods, index)
+			if f != 0 {
+				found = 1
+				e[CALL_FN] = f
+				e[CALL_CALLEE] = 0
+				e[CALL_DYN_SHAPE] = 0
+				e[CALL_DYN_INDEX] = 0
+				vec_get(args, 0)[N_TYPE] = vec_get(rec, 0)
+				result = result | rg_call(e)
+				mut ri = 0
+				for ri < 8 {
+					joined[VEC_DATA][ri] = vec_get(joined, ri) | vec_get(rg_multi, ri)
+					ri = ri + 1
+				}
+			}
+		}
+		i = i + 1
+	}
+	e[CALL_FN] = saved_fn
+	e[CALL_CALLEE] = saved_callee
+	e[CALL_DYN_SHAPE] = saved_shape
+	e[CALL_DYN_INDEX] = saved_index
+	vec_get(args, 0)[N_TYPE] = saved_type
+	if found == 0 {
+		if has_ptr(e[N_TYPE]) != 0 {
+			return RG_UNK | RG_EMB
+		}
+		return 0
+	}
+	rg_multi = joined
+	return result
 }
 
 // rg_pass applies a callee's records (rg_record) for argument i: each names an object
 // inside the argument, whose bits (rg_deep) are joined into the result, and v (unless -1)
 // is stored into each.
-fn rg_pass(recs, i, args, b, v, pos) {
-    let all = 0;
-    let j = 0;
-    while j < recs[VEC_LEN] {
-        if vec_get(recs, j) == i {
-            let o = vec_get(recs, j + 1);
-            let t = vec_get(recs, j + 2);
-            let c = rg_deep(vec_get(b, i), vec_get(args, i)[N_TYPE], o, t);
-            all = all | c;
-            if v != -1 {
-                rg_store(c, o, t, v, 0, pos, 0);
-            }
-        }
-        j = j + 3;
-    }
-    return all;
+fn rg_pass(recs i64, i i64, args i64, b i64, v i64, pos i64) i64 {
+	mut all = 0
+	mut j = 0
+	for j < recs[VEC_LEN] {
+		if vec_get(recs, j) == i {
+			let o = vec_get(recs, j + 1)
+			let t = vec_get(recs, j + 2)
+			let c = rg_deep(vec_get(b, i), vec_get(args, i)[N_TYPE], o, t)
+			all = all | c
+			if v != -1 {
+				rg_store(c, o, t, v, 0, pos, 0)
+			}
+		}
+		j = j + 3
+	}
+	return all
 }
 
 // rg_import adds a callee's held pairs to the caller's, in terms of the call's arguments.
-fn rg_import(h, args, b) {
-    let i = 0;
-    while i < h[VEC_LEN] {
-        let t = vec_get(h, i);
-        rg_hold(t, rg_subst(vec_get(h, i + 1), args, b, t));
-        i = i + 2;
-    }
+fn rg_import(h i64, args i64, b i64) {
+	mut i = 0
+	for i < h[VEC_LEN] {
+		let t = vec_get(h, i)
+		rg_hold(t, rg_subst(vec_get(h, i + 1), args, b, t))
+		i = i + 2
+	}
 }
 
 // rg_subst replaces a summary's parameter bits with the bits of the call's arguments (b),
 // for a value of type t: a parameter's bits stand for everything reachable from it, so
 // they also take what the argument's containers hold on the way to a t (rg_deep).
-fn rg_subst(r, args, b, t) {
-    let v = rg_key(t);
-    let out = r & 0xff;
-    let i = 0;
-    while i < b[VEC_LEN] && i < RG_MAXP {
-        if (r & (RG_P0 << i)) != 0 {
-            let x = vec_get(b, i);
-            if v || !t {
-                x = rg_deep(x, vec_get(args, i)[N_TYPE], 0, v);
-            }
-            out = out | x;
-        }
-        i = i + 1;
-    }
-    return out;
+fn rg_subst(r i64, args i64, b i64, t i64) i64 {
+	let v = rg_key(t)
+	mut out = r & 0xff
+	mut i = 0
+	for i < b[VEC_LEN] && i < RG_MAXP {
+		if (r & (RG_P0 << i)) != 0 {
+			mut x = vec_get(b, i)
+			if v != 0 || t == 0 {
+				x = rg_deep(x, vec_get(args, i)[N_TYPE], 0, v)
+			}
+			out = out | x
+		}
+		i = i + 1
+	}
+	return out
 }
 
-fn rg_runtime_call(e, name, b, pos) {
-    let n = b[VEC_LEN];
-    let b0 = 0;
-    if n > 0 {
-        b0 = vec_get(b, 0);
-    }
-    // Stores go into the object of argument 0.
-    let args = e[CALL_ARGS];
-    let co = 0;
-    let ct = 0;
-    if n > 0 {
-        co = rg_owner(vec_get(args, 0));
-        ct = rg_key(vec_get(args, 0)[N_TYPE]);
-    }
-    if n > 0 && rg_grows_op(name) {
-        rg_grow(b0, pos);
-    }
-    if streq(name, "rt_map_set") {
-        rg_store(b0, co, ct, vec_get(b, 1), vec_get(args, 1)[N_TYPE], pos, 0);
-        rg_store(b0, co, ct, vec_get(b, 2), vec_get(args, 2)[N_TYPE], pos, 0);
-        return 0;
-    }
-    if streq(name, "rt_map_setk") {
-        // The encoded key is copied into the map's region; only the value is stored.
-        rg_store(b0, co, ct, vec_get(b, 2), vec_get(args, 2)[N_TYPE], pos, 0);
-        return 0;
-    }
-    if streq(name, "rt_append") || streq(name, "rt_append_rc") {
-        rg_store(b0, co, ct, vec_get(b, 1), vec_get(args, 1)[N_TYPE], pos, 0);
-        return b0;
-    }
-    if streq(name, "rt_append_dyn") {
-        let et = vec_get(args, 0)[N_TYPE][TY_ELEM];
-        rg_store(b0, co, ct, vec_get(b, 1), et, pos, 0);
-        return b0;
-    }
-    if streq(name, "rt_slice_appendn") || streq(name, "rt_slice_copy") || streq(name, "rt_slice_appendn_rc") || streq(name, "rt_slice_copy_rc") {
-        let et = 0;
-        let a1 = vec_get(args, 1);
-        if kind_of(a1[N_TYPE]) == K_SLICE {
-            et = a1[N_TYPE][TY_ELEM];
-        }
-        if has_ptr(et) {
-            rg_store(b0, co, ct, rg_load(vec_get(b, 1), et), et, pos, 0);
-        } else {
-            rg_store(b0, co, ct, 0, 0, pos, 0);
-        }
-        return b0;
-    }
-    if streq(name, "rt_append_str") || streq(name, "rt_copy_str") || streq(name, "rt_map_del") {
-        rg_store(b0, co, ct, 0, 0, pos, 0);
-        return b0;
-    }
-    if streq(name, "rt_map_get") || streq(name, "rt_map_key") || streq(name, "rt_map_val") {
-        if has_ptr(e[N_TYPE]) {
-            return rg_load(b0, e[N_TYPE]);
-        }
-        return 0;
-    }
-    if streq(name, "rt_slice_sub") {
-        return b0 | RG_FRESH | RG_EMB;
-    }
-    if has_ptr(e[N_TYPE]) {
-        return RG_FRESH | RG_EMB;
-    }
-    return 0;
+fn rg_runtime_call(e i64, name i64, b i64, pos i64) i64 {
+	let n = b[VEC_LEN]
+	mut b0 = 0
+	if n > 0 {
+		b0 = vec_get(b, 0)
+	}
+	// Stores go into the object of argument 0.
+	let args = e[CALL_ARGS]
+	mut co = 0
+	mut ct = 0
+	if n > 0 {
+		co = rg_owner(vec_get(args, 0))
+		ct = rg_key(vec_get(args, 0)[N_TYPE])
+	}
+	if n > 0 && rg_grows_op(name) != 0 {
+		rg_grow(b0, pos)
+	}
+	if streq(name, cstr("rt_map_set")) != 0 {
+		rg_store(b0, co, ct, vec_get(b, 1), vec_get(args, 1)[N_TYPE], pos, 0)
+		rg_store(b0, co, ct, vec_get(b, 2), vec_get(args, 2)[N_TYPE], pos, 0)
+		return 0
+	}
+	if streq(name, cstr("rt_map_setk")) != 0 {
+		// The encoded key is copied into the map's region; only the value is stored.
+		rg_store(b0, co, ct, vec_get(b, 2), vec_get(args, 2)[N_TYPE], pos, 0)
+		return 0
+	}
+	if streq(name, cstr("rt_append")) != 0 || streq(name, cstr("rt_append_rc")) != 0 {
+		rg_store(b0, co, ct, vec_get(b, 1), vec_get(args, 1)[N_TYPE], pos, 0)
+		return b0
+	}
+	if streq(name, cstr("rt_append_dyn")) != 0 {
+		mut et = vec_get(args, 0)[N_TYPE][TY_ELEM]
+		rg_store(b0, co, ct, vec_get(b, 1), et, pos, 0)
+		return b0
+	}
+	if streq(name, cstr("rt_slice_appendn")) != 0 || streq(name, cstr("rt_slice_copy")) != 0 || streq(name, cstr("rt_slice_appendn_rc")) != 0 || streq(name, cstr("rt_slice_copy_rc")) != 0 {
+		mut et = 0
+		let a1 = vec_get(args, 1)
+		if kind_of(a1[N_TYPE]) == K_SLICE {
+			et = a1[N_TYPE][TY_ELEM]
+		}
+		if has_ptr(et) != 0 {
+			rg_store(b0, co, ct, rg_load(vec_get(b, 1), et), et, pos, 0)
+		} else {
+			rg_store(b0, co, ct, 0, 0, pos, 0)
+		}
+		return b0
+	}
+	if streq(name, cstr("rt_append_str")) != 0 || streq(name, cstr("rt_copy_str")) != 0 || streq(name, cstr("rt_map_del")) != 0 {
+		rg_store(b0, co, ct, 0, 0, pos, 0)
+		return b0
+	}
+	if streq(name, cstr("rt_map_get")) != 0 || streq(name, cstr("rt_map_key")) != 0 || streq(name, cstr("rt_map_val")) != 0 {
+		if has_ptr(e[N_TYPE]) != 0 {
+			return rg_load(b0, e[N_TYPE])
+		}
+		return 0
+	}
+	if streq(name, cstr("rt_slice_sub")) != 0 {
+		return b0 | RG_FRESH | RG_EMB
+	}
+	if has_ptr(e[N_TYPE]) != 0 {
+		return RG_FRESH | RG_EMB
+	}
+	return 0
 }
 
-fn str_prefix(s, p) {
-    let i = 0;
-    while load8(p + i) != 0 {
-        if load8(s + i) != load8(p + i) {
-            return 0;
-        }
-        i = i + 1;
-    }
-    return 1;
+fn str_prefix(s i64, p i64) i64 {
+	mut i = 0
+	for i64(load8(p + i)) != 0 {
+		if i64(load8(s + i)) != i64(load8(p + i)) {
+			return 0
+		}
+		i = i + 1
+	}
+	return 1
 }
 
 // ---- the body of a with policy (#237, notes/interface_policy.md §3) ----
@@ -1506,189 +1508,188 @@ fn str_prefix(s, p) {
 // A with block's closure lives on its caller's frame, so the Run of its policy may only call
 // body, or pass it to a parameter that obeys the same rule (checked here, recursively). Any
 // other use in Run is reported there; a function Run passes body to is only judged.
-
-var wb_memo; // [function, parameter, state]: 1 checking or fine, 2 may keep it
-var wb_fn;   // the function being walked
-var wb_sym;  // its parameter
-var wb_bad;  // the parameter may be kept
-var wb_say;  // report each bad use (the Run of a with), or only judge
+shared mut wb_memo i64 // [function, parameter, state]: 1 checking or fine, 2 may keep it
+shared mut wb_fn i64 // the function being walked
+shared mut wb_sym i64 // its parameter
+shared mut wb_bad i64 // the parameter may be kept
+shared mut wb_say i64 // report each bad use (the Run of a with), or only judge
 
 fn with_body_check() {
-    if !with_runs {
-        return;
-    }
-    wb_memo = vec_new();
-    let i = 0;
-    while i < with_runs[VEC_LEN] {
-        wb_param_ok(vec_get(with_runs, i), 1, 1);
-        i = i + 2;
-    }
+	if with_runs == 0 {
+		return
+	}
+	wb_memo = vec_new()
+	mut i = 0
+	for i < with_runs[VEC_LEN] {
+		wb_param_ok(vec_get(with_runs, i), 1, 1)
+		i = i + 2
+	}
 }
 
 // wb_param_ok reports whether parameter i of f is only called or passed on to such parameters.
-fn wb_param_ok(f, i, say) {
-    let j = 0;
-    while j < wb_memo[VEC_LEN] {
-        if vec_get(wb_memo, j) == f && vec_get(wb_memo, j + 1) == i {
-            return vec_get(wb_memo, j + 2) == 1;
-        }
-        j = j + 3;
-    }
-    if !f || f[F_EXTERN] || !f[F_BODY] || !f[F_LOCALS] || i >= f[F_PARAMS][VEC_LEN] {
-        return 0;
-    }
-    vec_push(wb_memo, f);
-    vec_push(wb_memo, i);
-    let at = wb_memo[VEC_LEN];
-    vec_push(wb_memo, 1);
-    let saved_fn = wb_fn;
-    let saved_sym = wb_sym;
-    let saved_bad = wb_bad;
-    let saved_say = wb_say;
-    wb_fn = f;
-    wb_sym = vec_get(f[F_LOCALS], i);
-    wb_bad = 0;
-    wb_say = say;
-    wb_stmts(f[F_BODY][BLK_STMTS]);
-    let ok = !wb_bad;
-    if !ok {
-        wb_memo[VEC_DATA][at] = 2;
-    }
-    wb_fn = saved_fn;
-    wb_sym = saved_sym;
-    wb_bad = saved_bad;
-    wb_say = saved_say;
-    return ok;
+fn wb_param_ok(f i64, i i64, say i64) i64 {
+	mut j = 0
+	for j < wb_memo[VEC_LEN] {
+		if vec_get(wb_memo, j) == f && vec_get(wb_memo, j + 1) == i {
+			return i64(vec_get(wb_memo, j + 2) == 1)
+		}
+		j = j + 3
+	}
+	if f == 0 || f[F_EXTERN] != 0 || f[F_BODY] == 0 || f[F_LOCALS] == 0 || i >= f[F_PARAMS][VEC_LEN] {
+		return 0
+	}
+	vec_push(wb_memo, f)
+	vec_push(wb_memo, i)
+	let at = wb_memo[VEC_LEN]
+	vec_push(wb_memo, 1)
+	let saved_fn = wb_fn
+	let saved_sym = wb_sym
+	let saved_bad = wb_bad
+	let saved_say = wb_say
+	wb_fn = f
+	wb_sym = vec_get(f[F_LOCALS], i)
+	wb_bad = 0
+	wb_say = say
+	wb_stmts(f[F_BODY][BLK_STMTS])
+	let ok = i64(wb_bad == 0)
+	if ok == 0 {
+		wb_memo[VEC_DATA][at] = 2
+	}
+	wb_fn = saved_fn
+	wb_sym = saved_sym
+	wb_bad = saved_bad
+	wb_say = saved_say
+	return ok
 }
 
 // wb_keeps notes a use of the parameter other than a call; via names the function it was
 // passed to, or is 0.
-fn wb_keeps(pos, via) {
-    if wb_say && !wb_bad {
-        let m = err_code(pos, "E653 POLICY_BODY");
-        buf_str(m, wb_fn[F_QNAME]);
-        if via {
-            buf_str(m, " passes the body of a with block to ");
-            buf_str(m, via[F_QNAME]);
-            buf_str(m, ", which may keep it");
-        } else {
-            buf_str(m, " keeps the body of a with block");
-        }
-        buf_str(m, ": a policy may only call body, or pass it to a function that only calls it (the block's variables live on the caller's frame)");
-        err_end(m);
-    }
-    wb_bad = 1;
+fn wb_keeps(pos i64, via i64) {
+	if wb_say != 0 && wb_bad == 0 {
+		let m = err_code(pos, cstr("E653 POLICY_BODY"))
+		buf_str(m, wb_fn[F_QNAME])
+		if via != 0 {
+			buf_str(m, cstr(" passes the body of a with block to "))
+			buf_str(m, via[F_QNAME])
+			buf_str(m, cstr(", which may keep it"))
+		} else {
+			buf_str(m, cstr(" keeps the body of a with block"))
+		}
+		buf_str(m, cstr(": a policy may only call body, or pass it to a function that only calls it (the block's variables live on the caller's frame)"))
+		err_end(m)
+	}
+	wb_bad = 1
 }
 
-fn wb_stmts(v) {
-    let i = 0;
-    while i < v[VEC_LEN] {
-        wb_stmt(vec_get(v, i));
-        i = i + 1;
-    }
+fn wb_stmts(v i64) {
+	mut i = 0
+	for i < v[VEC_LEN] {
+		wb_stmt(vec_get(v, i))
+		i = i + 1
+	}
 }
 
-fn wb_stmt(s) {
-    let k = s[N_KIND];
-    if k == ST_BLOCK {
-        wb_stmts(s[BLK_STMTS]);
-    } else if k == ST_LET {
-        wb_expr(s[LET_INIT]);
-    } else if k == ST_ASSIGN {
-        if s[AS_TARGET][N_KIND] != EX_IDENT {
-            wb_expr(s[AS_TARGET]);
-        }
-        wb_expr(s[AS_VALUE]);
-    } else if k == ST_EXPR {
-        wb_expr(s[ES_X]);
-    } else if k == ST_IF {
-        wb_expr(s[IF_COND]);
-        wb_stmts(s[IF_THEN][BLK_STMTS]);
-        if s[IF_ELSE] {
-            wb_stmt(s[IF_ELSE]);
-        }
-    } else if k == ST_WHILE {
-        wb_expr(s[WH_COND]);
-        wb_stmts(s[WH_BODY][BLK_STMTS]);
-        if s[WH_POST] {
-            wb_stmt(s[WH_POST]);
-        }
-    } else if k == ST_RETURN {
-        wb_expr(s[RET_VALUE]);
-        if s[RET_VALUES] {
-            wb_exprs(s[RET_VALUES]);
-        }
-    } else if k == ST_CALLMULTI {
-        wb_expr(s[CM_CALL]);
-    }
+fn wb_stmt(s i64) {
+	let k = s[N_KIND]
+	if k == ST_BLOCK {
+		wb_stmts(s[BLK_STMTS])
+	} else if k == ST_LET {
+		wb_expr(s[LET_INIT])
+	} else if k == ST_ASSIGN {
+		if s[AS_TARGET][N_KIND] != EX_IDENT {
+			wb_expr(s[AS_TARGET])
+		}
+		wb_expr(s[AS_VALUE])
+	} else if k == ST_EXPR {
+		wb_expr(s[ES_X])
+	} else if k == ST_IF {
+		wb_expr(s[IF_COND])
+		wb_stmts(s[IF_THEN][BLK_STMTS])
+		if s[IF_ELSE] != 0 {
+			wb_stmt(s[IF_ELSE])
+		}
+	} else if k == ST_WHILE {
+		wb_expr(s[WH_COND])
+		wb_stmts(s[WH_BODY][BLK_STMTS])
+		if s[WH_POST] != 0 {
+			wb_stmt(s[WH_POST])
+		}
+	} else if k == ST_RETURN {
+		wb_expr(s[RET_VALUE])
+		if s[RET_VALUES] != 0 {
+			wb_exprs(s[RET_VALUES])
+		}
+	} else if k == ST_CALLMULTI {
+		wb_expr(s[CM_CALL])
+	}
 }
 
-fn wb_exprs(v) {
-    let i = 0;
-    while i < v[VEC_LEN] {
-        wb_expr(vec_get(v, i));
-        i = i + 1;
-    }
+fn wb_exprs(v i64) {
+	mut i = 0
+	for i < v[VEC_LEN] {
+		wb_expr(vec_get(v, i))
+		i = i + 1
+	}
 }
 
-fn wb_is_param(e) {
-    return e && e[N_KIND] == EX_IDENT && e[ID_REF] == wb_sym;
+fn wb_is_param(e i64) i64 {
+	return i64(e != 0 && e[N_KIND] == EX_IDENT && e[ID_REF] == wb_sym)
 }
 
-fn wb_expr(e) {
-    if !e {
-        return;
-    }
-    let k = e[N_KIND];
-    if k == EX_IDENT {
-        if e[ID_REF] == wb_sym {
-            wb_keeps(e[N_POS], 0);
-        }
-    } else if k == EX_UNARY {
-        wb_expr(e[UN_X]);
-    } else if k == EX_BINARY {
-        wb_expr(e[BIN_L]);
-        wb_expr(e[BIN_R]);
-    } else if k == EX_CONV {
-        wb_expr(e[CV_X]);
-    } else if k == EX_MEM {
-        wb_expr(e[MEM_BASE]);
-        wb_expr(e[MEM_INDEX]);
-        wb_expr(e[MEM_LEN]);
-    } else if k == EX_ELEM {
-        wb_expr(e[ELEM_SEQ]);
-        wb_expr(e[ELEM_IDX]);
-    } else if k == EX_SEQ {
-        wb_stmts(e[SEQ_STMTS]);
-        wb_expr(e[SEQ_VALUE]);
-    } else if k == EX_INDEX {
-        wb_expr(e[IX_X]);
-        wb_expr(e[IX_I]);
-    } else if k == EX_CALL {
-        let callee = e[CALL_CALLEE];
-        if !wb_is_param(callee) {
-            wb_expr(callee);
-        }
-        let args = e[CALL_ARGS];
-        let i = 0;
-        while i < args[VEC_LEN] {
-            let a = vec_get(args, i);
-            if wb_is_param(a) {
-                let g = e[CALL_FN];
-                if !g || callee || e[CALL_INTRINSIC] {
-                    wb_keeps(a[N_POS], 0);
-                } else if !wb_param_ok(g, i, 0) && vec_get(file_trusted, g[F_FILE]) && load8(vec_get(file_pkgs, g[F_FILE])) == 0 {
-                    // A runtime helper (append, a store): the use itself keeps it.
-                    wb_keeps(a[N_POS], 0);
-                } else if !wb_param_ok(g, i, 0) {
-                    wb_keeps(a[N_POS], g);
-                }
-            } else {
-                wb_expr(a);
-            }
-            i = i + 1;
-        }
-    }
+fn wb_expr(e i64) {
+	if e == 0 {
+		return
+	}
+	let k = e[N_KIND]
+	if k == EX_IDENT {
+		if e[ID_REF] == wb_sym {
+			wb_keeps(e[N_POS], 0)
+		}
+	} else if k == EX_UNARY {
+		wb_expr(e[UN_X])
+	} else if k == EX_BINARY {
+		wb_expr(e[BIN_L])
+		wb_expr(e[BIN_R])
+	} else if k == EX_CONV {
+		wb_expr(e[CV_X])
+	} else if k == EX_MEM {
+		wb_expr(e[MEM_BASE])
+		wb_expr(e[MEM_INDEX])
+		wb_expr(e[MEM_LEN])
+	} else if k == EX_ELEM {
+		wb_expr(e[ELEM_SEQ])
+		wb_expr(e[ELEM_IDX])
+	} else if k == EX_SEQ {
+		wb_stmts(e[SEQ_STMTS])
+		wb_expr(e[SEQ_VALUE])
+	} else if k == EX_INDEX {
+		wb_expr(e[IX_X])
+		wb_expr(e[IX_I])
+	} else if k == EX_CALL {
+		let callee = e[CALL_CALLEE]
+		if wb_is_param(callee) == 0 {
+			wb_expr(callee)
+		}
+		let args = e[CALL_ARGS]
+		mut i = 0
+		for i < args[VEC_LEN] {
+			let a = vec_get(args, i)
+			if wb_is_param(a) != 0 {
+				let g = e[CALL_FN]
+				if g == 0 || callee != 0 || e[CALL_INTRINSIC] != 0 {
+					wb_keeps(a[N_POS], 0)
+				} else if wb_param_ok(g, i, 0) == 0 && vec_get(file_trusted, g[F_FILE]) != 0 && i64(load8(vec_get(file_pkgs, g[F_FILE]))) == 0 {
+					// A runtime helper (append, a store): the use itself keeps it.
+					wb_keeps(a[N_POS], 0)
+				} else if wb_param_ok(g, i, 0) == 0 {
+					wb_keeps(a[N_POS], g)
+				}
+			} else {
+				wb_expr(a)
+			}
+			i = i + 1
+		}
+	}
 }
 
 // ---- long-lived stores: the counts around them (#176, notes/interface_mem.md) ----
@@ -1711,295 +1712,294 @@ fn wb_expr(e) {
 // own region word and need no marking here. keep$N counts the fields, elements and
 // entries of its copy itself, so lifted functions are left alone. __core_init is not
 // visited: what a core makes while it initializes starts pinned (rt_ingot_alloc).
-
-var rc_fn;
-var rc_reach_ok; // 1 once reachability is final: rc_*_call may mark what they add
+shared mut rc_fn i64
+shared mut rc_reach_ok i64 // 1 once reachability is final: rc_*_call may mark what they add
 
 fn rc_mark() {
-    rc_reach_ok = 1;
-    let saved_fn = ck_fn;
-    let saved_marks = sc_marks;
-    let saved_syms = sc_syms;
-    let saved_cells = ck_escaping_cells;
-    // declare_local reads the current scope; give the wrapped temporaries one of their own.
-    sc_marks = vec_new();
-    vec_push(sc_marks, 0);
-    sc_syms = vec_new();
-    ck_escaping_cells = vec_new();
-    let i = 0;
-    while i < prog_fns[VEC_LEN] {
-        let f = vec_get(prog_fns, i);
-        if f[F_REGSUM] && f[F_REACH] && f[F_LIFTED] != 2 {
-            rc_fn = f;
-            ck_fn = f;
-            rc_stmts(f[F_BODY][BLK_STMTS]);
-        }
-        i = i + 1;
-    }
-    ck_fn = saved_fn;
-    sc_marks = saved_marks;
-    sc_syms = saved_syms;
-    ck_escaping_cells = saved_cells;
+	rc_reach_ok = 1
+	let saved_fn = ck_fn
+	let saved_marks = sc_marks
+	let saved_syms = sc_syms
+	let saved_cells = ck_escaping_cells
+	// declare_local reads the current scope; give the wrapped temporaries one of their own.
+	sc_marks = vec_new()
+	vec_push(sc_marks, 0)
+	sc_syms = vec_new()
+	ck_escaping_cells = vec_new()
+	mut i = 0
+	for i < prog_fns[VEC_LEN] {
+		let f = vec_get(prog_fns, i)
+		if f[F_REGSUM] != 0 && f[F_REACH] != 0 && f[F_LIFTED] != 2 {
+			rc_fn = f
+			ck_fn = f
+			rc_stmts(f[F_BODY][BLK_STMTS])
+		}
+		i = i + 1
+	}
+	ck_fn = saved_fn
+	sc_marks = saved_marks
+	sc_syms = saved_syms
+	ck_escaping_cells = saved_cells
 }
 
-fn rc_stmts(v) {
-    let i = 0;
-    while i < v[VEC_LEN] {
-        let s = vec_get(v, i);
-        if s && s[N_KIND] == ST_ASSIGN {
-            // The wrap leaves the store itself in place; skip it, the temporaries around
-            // it carry the value expression (a composite literal's stores) instead.
-            i = i + rc_assign(s, v, i) + 1;
-        } else if s && s[N_KIND] == ST_CALLMULTI {
-            rc_seq(s[CM_CALL]);
-            i = i + rc_callmulti(s, v, i) + 1;
-        } else {
-            rc_walk(s);
-            i = i + 1;
-        }
-    }
+fn rc_stmts(v i64) {
+	mut i = 0
+	for i < v[VEC_LEN] {
+		let s = vec_get(v, i)
+		if s != 0 && s[N_KIND] == ST_ASSIGN {
+			// The wrap leaves the store itself in place; skip it, the temporaries around
+			// it carry the value expression (a composite literal's stores) instead.
+			i = i + rc_assign(s, v, i) + 1
+		} else if s != 0 && s[N_KIND] == ST_CALLMULTI {
+			rc_seq(s[CM_CALL])
+			i = i + rc_callmulti(s, v, i) + 1
+		} else {
+			rc_walk(s)
+			i = i + 1
+		}
+	}
 }
 
 // rc_walk reaches the stores nested in a statement (a composite literal carries them
 // inside an EX_SEQ).
-fn rc_walk(s) {
-    if !s {
-        return;
-    }
-    let k = s[N_KIND];
-    if k == ST_BLOCK {
-        rc_stmts(s[BLK_STMTS]);
-    } else if k == ST_LIST {
-        rc_stmts(s[LIST_STMTS]);
-    } else if k == ST_LET {
-        rc_seq(s[LET_INIT]);
-    } else if k == ST_EXPR {
-        rc_seq(s[ES_X]);
-    } else if k == ST_IF {
-        rc_stmts(s[IF_THEN][BLK_STMTS]);
-        if s[IF_ELSE] {
-            rc_walk(s[IF_ELSE]);
-        }
-    } else if k == ST_WHILE {
-        rc_stmts(s[WH_BODY][BLK_STMTS]);
-        if s[WH_POST] {
-            rc_walk(s[WH_POST]);
-        }
-    } else if k == ST_RETURN {
-        if s[RET_VALUE] {
-            rc_seq(s[RET_VALUE]);
-        }
-    }
+fn rc_walk(s i64) {
+	if s == 0 {
+		return
+	}
+	let k = s[N_KIND]
+	if k == ST_BLOCK {
+		rc_stmts(s[BLK_STMTS])
+	} else if k == ST_LIST {
+		rc_stmts(s[LIST_STMTS])
+	} else if k == ST_LET {
+		rc_seq(s[LET_INIT])
+	} else if k == ST_EXPR {
+		rc_seq(s[ES_X])
+	} else if k == ST_IF {
+		rc_stmts(s[IF_THEN][BLK_STMTS])
+		if s[IF_ELSE] != 0 {
+			rc_walk(s[IF_ELSE])
+		}
+	} else if k == ST_WHILE {
+		rc_stmts(s[WH_BODY][BLK_STMTS])
+		if s[WH_POST] != 0 {
+			rc_walk(s[WH_POST])
+		}
+	} else if k == ST_RETURN {
+		if s[RET_VALUE] != 0 {
+			rc_seq(s[RET_VALUE])
+		}
+	}
 }
 
-fn rc_seq(e) {
-    if e && e[N_KIND] == EX_SEQ {
-        rc_stmts(e[SEQ_STMTS]);
-        rc_seq(e[SEQ_VALUE]);
-    }
+fn rc_seq(e i64) {
+	if e != 0 && e[N_KIND] == EX_SEQ {
+		rc_stmts(e[SEQ_STMTS])
+		rc_seq(e[SEQ_VALUE])
+	}
 }
 
 // rc_assign counts or pins the assignment at position i of stmts, by what its
 // destination can be. It reports how many statements it spliced in before it.
-fn rc_assign(s, stmts, i) {
-    let target = s[AS_TARGET];
-    let val = s[AS_VALUE];
-    if !target || !val {
-        return 0;
-    }
-    let pos = s[N_POS];
-    let t = target[N_TYPE];
-    if !rc_counted(t) {
-        rc_seq(val);
-        return 0;
-    }
-    let k = target[N_KIND];
-    if k == EX_IDENT {
-        if target[ID_REF] && target[ID_REF][S_KIND] == SYM_GLOBAL {
-            // xs = append(xs, v): the append counts its own element and returns the same
-            // header, so the slot's count is already right.
-            if rc_append_into(val, target) {
-                return 0;
-            }
-            return rc_wrap(s, stmts, i, sym_ref_node(pos, target[ID_REF]), t, 0);
-        }
-        // A local: the variable itself is not long-lived storage.
-        rc_seq(val);
-        return 0;
-    }
-    if k == EX_MEM {
-        let base = target[MEM_BASE];
-        if target[MEM_INDEX] == 0 && rc_ingot_base(base) {
-            return rc_wrap(s, stmts, i, rc_field_read(pos, target, t), t, 0);
-        }
-        if !rc_local_base(base) {
-            rc_pin_value(s, t);
-        }
-        rc_seq(val);
-        return 0;
-    }
-    if k == EX_ELEM {
-        // s[i] = v, already lowered to a bounds-checked element. The index is bound to a
-        // temporary so the old value is read back from the very same index.
-        let seq = target[ELEM_SEQ];
-        if rc_ingot_base(seq) {
-            let pre0 = vec_new();
-            let idx = temp(pos, target[ELEM_IDX], ty_int);
-            vec_push(pre0, idx);
-            target[ELEM_IDX] = sym_ref_node(pos, idx[LET_SYM]);
-            return rc_wrap(s, stmts, i, rc_elem_read(pos, target, t), t, pre0);
-        }
-        if !rc_local_base(seq) {
-            rc_pin_value(s, t);
-        }
-        rc_seq(val);
-        return 0;
-    }
-    rc_seq(val);
-    return 0;
+fn rc_assign(s i64, stmts i64, i i64) i64 {
+	let target = s[AS_TARGET]
+	let val = s[AS_VALUE]
+	if target == 0 || val == 0 {
+		return 0
+	}
+	let pos = s[N_POS]
+	let t = target[N_TYPE]
+	if rc_counted(t) == 0 {
+		rc_seq(val)
+		return 0
+	}
+	let k = target[N_KIND]
+	if k == EX_IDENT {
+		if target[ID_REF] != 0 && target[ID_REF][S_KIND] == SYM_GLOBAL {
+			// xs = append(xs, v): the append counts its own element and returns the same
+			// header, so the slot's count is already right.
+			if rc_append_into(val, target) != 0 {
+				return 0
+			}
+			return rc_wrap(s, stmts, i, sym_ref_node(pos, target[ID_REF]), t, 0)
+		}
+		// A local: the variable itself is not long-lived storage.
+		rc_seq(val)
+		return 0
+	}
+	if k == EX_MEM {
+		let base = target[MEM_BASE]
+		if target[MEM_INDEX] == 0 && rc_ingot_base(base) != 0 {
+			return rc_wrap(s, stmts, i, rc_field_read(pos, target, t), t, 0)
+		}
+		if rc_local_base(base) == 0 {
+			rc_pin_value(s, t)
+		}
+		rc_seq(val)
+		return 0
+	}
+	if k == EX_ELEM {
+		// s[i] = v, already lowered to a bounds-checked element. The index is bound to a
+		// temporary so the old value is read back from the very same index.
+		let seq = target[ELEM_SEQ]
+		if rc_ingot_base(seq) != 0 {
+			let pre0 = vec_new()
+			let idx = temp(pos, target[ELEM_IDX], ty_int)
+			vec_push(pre0, idx)
+			target[ELEM_IDX] = sym_ref_node(pos, idx[LET_SYM])
+			return rc_wrap(s, stmts, i, rc_elem_read(pos, target, t), t, pre0)
+		}
+		if rc_local_base(seq) == 0 {
+			rc_pin_value(s, t)
+		}
+		rc_seq(val)
+		return 0
+	}
+	rc_seq(val)
+	return 0
 }
 
 // rc_wrap binds the stored value, reads the old one, counts the new value, drops the old
 // one's count (in that order: a value stored over itself is never queued) and leaves the
 // store itself last. pre0 (0: none) holds statements the caller prepared (an index
 // temporary). It reports how many statements it spliced in.
-fn rc_wrap(s, stmts, i, oldRead, t, pre0) {
-    let pos = s[N_POS];
-    let val = s[AS_VALUE];
-    let pre = vec_new();
-    if pre0 {
-        let p = 0;
-        while p < pre0[VEC_LEN] {
-            vec_push(pre, vec_get(pre0, p));
-            p = p + 1;
-        }
-    }
-    let v = temp(pos, val, t);
-    vec_push(pre, v);
-    // The store reads the temporary now, so the value expression is evaluated once.
-    s[AS_VALUE] = sym_ref_node(pos, v[LET_SYM]);
-    let old = temp(pos, oldRead, t);
-    vec_push(pre, old);
-    vec_push(pre, expr_stmt(rc_inc_call(pos, sym_ref_node(pos, v[LET_SYM]))));
-    vec_push(pre, expr_stmt(rc_dec_call(pos, sym_ref_node(pos, old[LET_SYM]), drop_fn(t))));
-    rc_splice(stmts, i, pre);
-    // A composite literal's own stores travel inside the bound value.
-    rc_stmts(pre);
-    return pre[VEC_LEN];
+fn rc_wrap(s i64, stmts i64, i i64, oldRead i64, t i64, pre0 i64) i64 {
+	let pos = s[N_POS]
+	let val = s[AS_VALUE]
+	let pre = vec_new()
+	if pre0 != 0 {
+		mut p = 0
+		for p < pre0[VEC_LEN] {
+			vec_push(pre, vec_get(pre0, p))
+			p = p + 1
+		}
+	}
+	let v = temp(pos, val, t)
+	vec_push(pre, v)
+	// The store reads the temporary now, so the value expression is evaluated once.
+	s[AS_VALUE] = sym_ref_node(pos, v[LET_SYM])
+	let old = temp(pos, oldRead, t)
+	vec_push(pre, old)
+	vec_push(pre, expr_stmt(rc_inc_call(pos, sym_ref_node(pos, v[LET_SYM]))))
+	vec_push(pre, expr_stmt(rc_dec_call(pos, sym_ref_node(pos, old[LET_SYM]), drop_fn(t))))
+	rc_splice(stmts, i, pre)
+	// A composite literal's own stores travel inside the bound value.
+	rc_stmts(pre)
+	return pre[VEC_LEN]
 }
 
 // rc_pin_value pins the value assignment s stores, in place: rt_rc_pinned returns its
 // argument, so the evaluation order of the store does not change.
-fn rc_pin_value(s, t) {
-    let c = rt_call(s[N_POS], "rt_rc_pinned", args1(s[AS_VALUE]), t);
-    mark_reach(c[CALL_FN]);
-    s[AS_VALUE] = c;
+fn rc_pin_value(s i64, t i64) {
+	let c = rt_call(s[N_POS], cstr("rt_rc_pinned"), args1(s[AS_VALUE]), t)
+	mark_reach(c[CALL_FN])
+	s[AS_VALUE] = c
 }
 
 // rc_callmulti counts the globals a multiple assignment (a, g = f()) stores: each old
 // value is read before the call and loses its count after it, once the new one has
 // gained its own. It reports how many statements it spliced in around the call.
-fn rc_callmulti(s, stmts, i) {
-    let pos = s[N_POS];
-    let syms = s[CM_SYMS];
-    let pre = vec_new();
-    let post = vec_new();
-    let j = 0;
-    while j < syms[VEC_LEN] {
-        let g = vec_get(syms, j);
-        if g && g[S_KIND] == SYM_GLOBAL && rc_counted(g[S_TYPE]) {
-            let old = temp(pos, sym_ref_node(pos, g), g[S_TYPE]);
-            vec_push(pre, old);
-            vec_push(post, expr_stmt(rc_inc_call(pos, sym_ref_node(pos, g))));
-            vec_push(post, expr_stmt(rc_dec_call(pos, sym_ref_node(pos, old[LET_SYM]), drop_fn(g[S_TYPE]))));
-        }
-        j = j + 1;
-    }
-    rc_splice(stmts, i + 1, post);
-    rc_splice(stmts, i, pre);
-    return pre[VEC_LEN] + post[VEC_LEN];
+fn rc_callmulti(s i64, stmts i64, i i64) i64 {
+	let pos = s[N_POS]
+	let syms = s[CM_SYMS]
+	let pre = vec_new()
+	let post = vec_new()
+	mut j = 0
+	for j < syms[VEC_LEN] {
+		let g = vec_get(syms, j)
+		if g != 0 && g[S_KIND] == SYM_GLOBAL && rc_counted(g[S_TYPE]) != 0 {
+			let old = temp(pos, sym_ref_node(pos, g), g[S_TYPE])
+			vec_push(pre, old)
+			vec_push(post, expr_stmt(rc_inc_call(pos, sym_ref_node(pos, g))))
+			vec_push(post, expr_stmt(rc_dec_call(pos, sym_ref_node(pos, old[LET_SYM]), drop_fn(g[S_TYPE]))))
+		}
+		j = j + 1
+	}
+	rc_splice(stmts, i + 1, post)
+	rc_splice(stmts, i, pre)
+	return pre[VEC_LEN] + post[VEC_LEN]
 }
 
 // rc_splice puts pre before position i, moving the statements from i up.
-fn rc_splice(stmts, i, pre) {
-    let n = stmts[VEC_LEN];
-    let k = pre[VEC_LEN];
-    if k == 0 {
-        return;
-    }
-    if n + k > stmts[VEC_CAP] {
-        while n + k > stmts[VEC_CAP] {
-            stmts[VEC_CAP] = stmts[VEC_CAP] * 2;
-        }
-        stmts[VEC_DATA] = realloc(stmts[VEC_DATA], stmts[VEC_CAP] * 8);
-    }
-    let j = n - 1;
-    while j >= i {
-        stmts[VEC_DATA][j + k] = stmts[VEC_DATA][j];
-        j = j - 1;
-    }
-    let m = 0;
-    while m < k {
-        stmts[VEC_DATA][i + m] = vec_get(pre, m);
-        m = m + 1;
-    }
-    stmts[VEC_LEN] = n + k;
+fn rc_splice(stmts i64, i i64, pre i64) {
+	let n = stmts[VEC_LEN]
+	let k = pre[VEC_LEN]
+	if k == 0 {
+		return
+	}
+	if n + k > stmts[VEC_CAP] {
+		for n + k > stmts[VEC_CAP] {
+			stmts[VEC_CAP] = stmts[VEC_CAP] * 2
+		}
+		stmts[VEC_DATA] = realloc(stmts[VEC_DATA], stmts[VEC_CAP] * 8)
+	}
+	mut j = n - 1
+	for j >= i {
+		stmts[VEC_DATA][j + k] = stmts[VEC_DATA][j]
+		j = j - 1
+	}
+	mut m = 0
+	for m < k {
+		stmts[VEC_DATA][i + m] = vec_get(pre, m)
+		m = m + 1
+	}
+	stmts[VEC_LEN] = n + k
 }
 
 // rc_ingot_base reports whether the ident e names a container that can hold nothing but
 // long-lived values: a global, or a local the region pass left at exactly RG_INGOT.
-fn rc_ingot_base(e) {
-    if e[N_KIND] != EX_IDENT || !e[ID_REF] {
-        return 0;
-    }
-    let s = e[ID_REF];
-    if s[S_KIND] == SYM_GLOBAL {
-        return 1;
-    }
-    if s == rc_fn[F_ENV_SYM] {
-        return 0;
-    }
-    return s[S_REGION] == RG_INGOT;
+fn rc_ingot_base(e i64) i64 {
+	if e[N_KIND] != EX_IDENT || e[ID_REF] == 0 {
+		return 0
+	}
+	let s = e[ID_REF]
+	if s[S_KIND] == SYM_GLOBAL {
+		return 1
+	}
+	if s == rc_fn[F_ENV_SYM] {
+		return 0
+	}
+	return i64(s[S_REGION] == RG_INGOT)
 }
 
 // rc_local_base reports whether the ident e names a container the region pass proved
 // request-local: a local whose objects are all fresh from the pool.
-fn rc_local_base(e) {
-    if e[N_KIND] != EX_IDENT || !e[ID_REF] {
-        return 0;
-    }
-    let s = e[ID_REF];
-    if s[S_KIND] == SYM_GLOBAL || s == rc_fn[F_ENV_SYM] {
-        return 0;
-    }
-    return s[S_REGION] != 0 && (s[S_REGION] & ~(RG_FRESH | RG_EMB)) == 0;
+fn rc_local_base(e i64) i64 {
+	if e[N_KIND] != EX_IDENT || e[ID_REF] == 0 {
+		return 0
+	}
+	let s = e[ID_REF]
+	if s[S_KIND] == SYM_GLOBAL || s == rc_fn[F_ENV_SYM] {
+		return 0
+	}
+	return i64(s[S_REGION] != 0 && (s[S_REGION] & ~(RG_FRESH | RG_EMB)) == 0)
 }
 
 // rc_field_read reads the field the store writes (the base is a named ident).
-fn rc_field_read(pos, target, t) {
-    let base = target[MEM_BASE];
-    return mk_mem(pos, sym_ref_node(pos, base[ID_REF]), 0, 0, target[MEM_OFF], t);
+fn rc_field_read(pos i64, target i64, t i64) i64 {
+	let base = target[MEM_BASE]
+	return mk_mem(pos, sym_ref_node(pos, base[ID_REF]), 0, 0, target[MEM_OFF], t)
 }
 
 // rc_elem_read reads the element the store writes; the slice and the index are names, so
 // naming them twice costs nothing.
-fn rc_elem_read(pos, target, t) {
-    let seq = target[ELEM_SEQ];
-    let n = node_new(EX_ELEM, pos);
-    n[ELEM_SEQ] = sym_ref_node(pos, seq[ID_REF]);
-    n[ELEM_IDX] = sym_ref_node(pos, target[ELEM_IDX][ID_REF]);
-    n[ELEM_SIZE] = target[ELEM_SIZE];
-    n[ELEM_STR] = target[ELEM_STR];
-    n[N_TYPE] = t;
-    return n;
+fn rc_elem_read(pos i64, target i64, t i64) i64 {
+	let seq = target[ELEM_SEQ]
+	let n = node_new(EX_ELEM, pos)
+	n[ELEM_SEQ] = sym_ref_node(pos, seq[ID_REF])
+	n[ELEM_IDX] = sym_ref_node(pos, target[ELEM_IDX][ID_REF])
+	n[ELEM_SIZE] = target[ELEM_SIZE]
+	n[ELEM_STR] = target[ELEM_STR]
+	n[N_TYPE] = t
+	return n
 }
 
 // rc_append_into reports whether xs = append(xs, v) grows the very global being assigned:
 // rt_append_rc counted its element and returned the same header, so nothing else moves.
-fn rc_append_into(v, target) {
-    if v[N_KIND] != EX_CALL || !v[CALL_NAME] || !streq(v[CALL_NAME], "rt_append_rc") {
-        return 0;
-    }
-    let a0 = vec_get(v[CALL_ARGS], 0);
-    return a0[N_KIND] == EX_IDENT && a0[ID_REF] == target[ID_REF];
+fn rc_append_into(v i64, target i64) i64 {
+	if v[N_KIND] != EX_CALL || v[CALL_NAME] == 0 || streq(v[CALL_NAME], cstr("rt_append_rc")) == 0 {
+		return 0
+	}
+	let a0 = vec_get(v[CALL_ARGS], 0)
+	return i64(a0[N_KIND] == EX_IDENT && a0[ID_REF] == target[ID_REF])
 }

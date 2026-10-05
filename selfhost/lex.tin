@@ -1,641 +1,659 @@
 // Lexer: source bytes to a vector of tokens ending in TK_EOF.
-
-const TK_EOF = 0;
-const TK_IDENT = 1;
-const TK_INT = 2;
-const TK_STRING = 3;
-const TK_KEYWORD = 4;
-const TK_PUNCT = 5;
-const TK_FLOAT = 6;   // T_TEXT holds the literal text, T_VAL its IEEE-754 bits
+const TK_EOF = 0
+const TK_IDENT = 1
+const TK_INT = 2
+const TK_STRING = 3
+const TK_KEYWORD = 4
+const TK_PUNCT = 5
+const TK_FLOAT = 6 // T_TEXT holds the literal text, T_VAL its IEEE-754 bits
 
 // Token layout.
-const T_KIND = 0;
-const T_TEXT = 1;
-const T_VAL = 2;
-const T_POS = 3;
-const T_RAW = 4;   // a `raw` string literal (no interpolation)
-const T_DBL = 5;   // an escape produced a brace, which the text holds doubled ({{ or }}) so that it is not read as interpolation
-const T_UNIT = 6;  // edition 1 numeric unit suffix, or 0
-const T_START = 7; // byte offset of the original token (synthetic semicolons have no span)
-const T_END = 8;   // byte offset just after the original token
-const T_SYNTH = 9; // inserted by the semicolon rule, not present in source
+const T_KIND = 0
+const T_TEXT = 1
+const T_VAL = 2
+const T_POS = 3
+const T_RAW = 4 // a `raw` string literal (no interpolation)
+const T_DBL = 5 // an escape produced a brace, which the text holds doubled ({{ or }}) so that it is not read as interpolation
+const T_UNIT = 6 // edition 1 numeric unit suffix, or 0
+const T_START = 7 // byte offset of the original token (synthetic semicolons have no span)
+const T_END = 8 // byte offset just after the original token
+const T_SYNTH = 9 // inserted by the semicolon rule, not present in source
 
-var lx_src;
-var lx_len;
-var lx_i;
-var lx_line;
-var lx_col;
-var lx_file;
-var lx_edition;
-var lx_newline;
-var lx_esc_rune;
-var lx_token_start;
+shared mut lx_src i64
+shared mut lx_len i64
+shared mut lx_i i64
+shared mut lx_line i64
+shared mut lx_col i64
+shared mut lx_file i64
+shared mut lx_edition i64
+shared mut lx_newline i64
+shared mut lx_esc_rune i64
+shared mut lx_token_start i64
 
-fn lex(file, src, len, edition) {
-    lx_file = file;
-    lx_edition = edition;
-    lx_src = src;
-    lx_len = len;
-    lx_i = 0;
-    lx_line = 1;
-    lx_col = 1;
-    let toks = vec_new();
-    let last = 0;
-    while 1 {
-        let t = lex_next();
-        if last && (lx_newline || t[T_KIND] == TK_EOF) && ends_statement(last) {
-            let semi = token_new(TK_PUNCT, ";", 1, t[T_POS]);
-            semi[T_SYNTH] = 1;
-            vec_push(toks, semi);
-        }
-        vec_push(toks, t);
-        if t[T_KIND] == TK_EOF {
-            return toks;
-        }
-        last = t;
-    }
+fn lex(file i64, src i64, len_ i64, edition i64) i64 {
+	lx_file = file
+	lx_edition = edition
+	lx_src = src
+	lx_len = len_
+	lx_i = 0
+	lx_line = 1
+	lx_col = 1
+	let toks = vec_new()
+	mut last = 0
+	for {
+		let t = lex_next()
+		if last != 0 && (lx_newline != 0 || t[T_KIND] == TK_EOF) && ends_statement(last) != 0 {
+			let semi = token_new(TK_PUNCT, cstr(";"), 1, t[T_POS])
+			semi[T_SYNTH] = 1
+			vec_push(toks, semi)
+		}
+		vec_push(toks, t)
+		if t[T_KIND] == TK_EOF {
+			return toks
+		}
+		last = t
+	}
 }
 
 // T_TEXT holds the identifier, keyword, punctuation or decoded string bytes;
 // T_VAL holds an integer literal's value or a string literal's byte length.
-fn token_new(kind, text, val, pos) {
-    let t = malloc(80);
-    t[T_KIND] = kind;
-    t[T_TEXT] = text;
-    t[T_VAL] = val;
-    t[T_POS] = pos;
-    t[T_RAW] = 0;
-    t[T_DBL] = 0;
-    t[T_UNIT] = 0;
-    t[T_START] = lx_token_start;
-    t[T_END] = lx_i;
-    t[T_SYNTH] = 0;
-    return t;
+fn token_new(kind i64, text i64, val i64, pos i64) i64 {
+	let t = malloc(80)
+	t[T_KIND] = kind
+	t[T_TEXT] = text
+	t[T_VAL] = val
+	t[T_POS] = pos
+	t[T_RAW] = 0
+	t[T_DBL] = 0
+	t[T_UNIT] = 0
+	t[T_START] = lx_token_start
+	t[T_END] = lx_i
+	t[T_SYNTH] = 0
+	return t
 }
 
-fn lx_peek(off) {
-    if lx_i + off < lx_len {
-        return load8(lx_src + lx_i + off);
-    }
-    return 0;
+fn lx_peek(off i64) i64 {
+	if lx_i + off < lx_len {
+		return i64(load8(lx_src + lx_i + off))
+	}
+	return 0
 }
 
-fn lx_advance() {
-    let c = load8(lx_src + lx_i);
-    lx_i = lx_i + 1;
-    if c == '\n' {
-        lx_line = lx_line + 1;
-        lx_col = 1;
-    } else {
-        lx_col = lx_col + 1;
-    }
-    return c;
+fn lx_advance() i64 {
+	let c = i64(load8(lx_src + lx_i))
+	lx_i = lx_i + 1
+	if c == '\n' {
+		lx_line = lx_line + 1
+		lx_col = 1
+	} else {
+		lx_col = lx_col + 1
+	}
+	return c
 }
 
 // lx_fail_code stops with a coded error (docs/ERRORS.md).
-fn lx_fail_code(pos, code, msg) {
-    let e = err_code(pos, code);
-    buf_str(e, msg);
-    fatal(e);
+fn lx_fail_code(pos i64, code i64, msg i64) {
+	let e = err_code(pos, code)
+	buf_str(e, msg)
+	fatal(e)
 }
 
-fn is_letter(c) {
-    return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+fn is_letter(c i64) i64 {
+	return i64(c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))
 }
 
-fn is_digit(c) {
-    return c >= '0' && c <= '9';
+fn is_digit(c i64) i64 {
+	return i64(c >= '0' && c <= '9')
 }
 
-fn is_hex_digit(c) {
-    return is_digit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+fn is_hex_digit(c i64) i64 {
+	return i64(is_digit(c) != 0 || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))
 }
 
-fn hex_value(c) {
-    if is_digit(c) {
-        return c - '0';
-    }
-    if c >= 'a' {
-        return c - 'a' + 10;
-    }
-    return c - 'A' + 10;
+fn hex_value(c i64) i64 {
+	if is_digit(c) != 0 {
+		return c - '0'
+	}
+	if c >= 'a' {
+		return c - 'a' + 10
+	}
+	return c - 'A' + 10
 }
 
-fn is_keyword(s) {
-    let words = "fn extern const var let if else while return break continue func type struct for range import package map true false nil switch case default go defer try mut ";
-    let n = strlen(s);
-    let i = 0;
-    while load8(words + i) != 0 {
-        let j = 0;
-        while load8(words + i + j) != ' ' {
-            j = j + 1;
-        }
-        if j == n && mem_eq(words + i, s, n) {
-            return 1;
-        }
-        i = i + j + 1;
-    }
-    if lx_edition {
-        let edition1 = "enum match within limit guard parallel detach secret shared fail catch keep ";
-        let n = strlen(s);
-        let i = 0;
-        while load8(edition1 + i) != 0 {
-            let j = 0;
-            while load8(edition1 + i + j) != ' ' {
-                j = j + 1;
-            }
-            if j == n && mem_eq(edition1 + i, s, n) {
-                return 1;
-            }
-            i = i + j + 1;
-        }
-    }
-    return 0;
+fn is_keyword(s i64) i64 {
+	let words = cstr("fn extern const var let if else while return break continue func type struct for range import package map true false nil switch case default go defer try mut ")
+	let n = strlen(s)
+	mut i = 0
+	for i64(load8(words + i)) != 0 {
+		mut j = 0
+		for i64(load8(words + i + j)) != ' ' {
+			j = j + 1
+		}
+		if j == n && mem_eq(words + i, s, n) != 0 {
+			return 1
+		}
+		i = i + j + 1
+	}
+	if lx_edition != 0 {
+		let edition1 = cstr("enum match within limit guard parallel detach secret shared fail catch keep ")
+		let n = strlen(s)
+		mut i = 0
+		for i64(load8(edition1 + i)) != 0 {
+			mut j = 0
+			for i64(load8(edition1 + i + j)) != ' ' {
+				j = j + 1
+			}
+			if j == n && mem_eq(edition1 + i, s, n) != 0 {
+				return 1
+			}
+			i = i + j + 1
+		}
+	}
+	return 0
 }
 
 // Punctuation, longest first: lex_next tries three characters, then two, then one.
-fn is_three_char_punct(a, b, c) {
-    return (a == '<' && b == '<' && c == '=') || (a == '>' && b == '>' && c == '=') || (a == '.' && b == '.' && c == '.');
+fn is_three_char_punct(a i64, b i64, c i64) i64 {
+	return i64((a == '<' && b == '<' && c == '=') || (a == '>' && b == '>' && c == '=') || (a == '.' && b == '.' && c == '.'))
 }
 
-fn is_two_char_punct(a, b) {
-    if a == '.' && b == '.' {
-        return 1;
-    }
-    if (a == '?' && b == '?') || (a == '=' && b == '>') {
-        return 1;
-    }
-    if b == '=' {
-        return a == '=' || a == '!' || a == '<' || a == '>' || a == ':' || a == '+' || a == '-' || a == '*' || a == '/' || a == '%' || a == '&' || a == '|' || a == '^';
-    }
-    return (a == '<' && b == '<') || (a == '>' && b == '>') || (a == '&' && b == '&') || (a == '|' && b == '|') || (a == '+' && b == '+') || (a == '-' && b == '-');
+fn is_two_char_punct(a i64, b i64) i64 {
+	if a == '.' && b == '.' {
+		return 1
+	}
+	if (a == '?' && b == '?') || (a == '=' && b == '>') {
+		return 1
+	}
+	if b == '=' {
+		return i64(a == '=' || a == '!' || a == '<' || a == '>' || a == ':' || a == '+' || a == '-' || a == '*' || a == '/' || a == '%' || a == '&' || a == '|' || a == '^')
+	}
+	return i64((a == '<' && b == '<') || (a == '>' && b == '>') || (a == '&' && b == '&') || (a == '|' && b == '|') || (a == '+' && b == '+') || (a == '-' && b == '-'))
 }
 
-fn is_one_char_punct(c) {
-    let s = "(){}[],;=<>+-*/%&|^~!.:?@";
-    let i = 0;
-    while load8(s + i) != 0 {
-        if load8(s + i) == c {
-            return 1;
-        }
-        i = i + 1;
-    }
-    return 0;
+fn is_one_char_punct(c i64) i64 {
+	let s = cstr("(){{}}[],;=<>+-*/%&|^~!.:?@")
+	mut i = 0
+	for i64(load8(s + i)) != 0 {
+		if i64(load8(s + i)) == c {
+			return 1
+		}
+		i = i + 1
+	}
+	return 0
 }
 
 // lx_skip_space skips blanks and comments, noting in lx_newline whether it crossed a line end.
 fn lx_skip_space() {
-    lx_newline = 0;
-    while lx_i < lx_len {
-        let c = lx_peek(0);
-        if c == '\n' {
-            lx_newline = 1;
-            lx_advance();
-        } else if c == ' ' || c == '\t' || c == '\r' {
-            lx_advance();
-        } else if c == '/' && lx_peek(1) == '/' {
-            while lx_i < lx_len && lx_peek(0) != '\n' {
-                lx_advance();
-            }
-        } else if c == '/' && lx_peek(1) == '*' {
-            if lx_edition {
-                lx_fail_code(pos_make(lx_file, lx_line, lx_col), "E090 OLD_SYNTAX", "edition 1 supports // comments, not block comments");
-            }
-            lx_advance();
-            lx_advance();
-            while lx_i < lx_len && !(lx_peek(0) == '*' && lx_peek(1) == '/') {
-                if lx_peek(0) == '\n' {
-                    lx_newline = 1;
-                }
-                lx_advance();
-            }
-            lx_advance();
-            lx_advance();
-        } else {
-            return;
-        }
-    }
+	lx_newline = 0
+	for lx_i < lx_len {
+		let c = lx_peek(0)
+		if c == '\n' {
+			lx_newline = 1
+			lx_advance()
+		} else if c == ' ' || c == '\t' || c == '\r' {
+			lx_advance()
+		} else if c == '/' && lx_peek(1) == '/' {
+			for lx_i < lx_len && lx_peek(0) != '\n' {
+				lx_advance()
+			}
+		} else if c == '/' && lx_peek(1) == '*' {
+			if lx_edition != 0 {
+				lx_fail_code(pos_make(lx_file, lx_line, lx_col), cstr("E090 OLD_SYNTAX"), cstr("edition 1 supports // comments, not block comments"))
+			}
+			lx_advance()
+			lx_advance()
+			for lx_i < lx_len && !(lx_peek(0) == '*' && lx_peek(1) == '/') {
+				if lx_peek(0) == '\n' {
+					lx_newline = 1
+				}
+				lx_advance()
+			}
+			lx_advance()
+			lx_advance()
+		} else {
+			return
+		}
+	}
 }
 
 // Go's semicolon rule: a line break after one of these tokens ends the statement.
-fn ends_statement(t) {
-    let k = t[T_KIND];
-    if k == TK_IDENT || k == TK_INT || k == TK_FLOAT || k == TK_STRING {
-        return 1;
-    }
-    let s = t[T_TEXT];
-    if k == TK_KEYWORD {
-        return streq(s, "break") || streq(s, "continue") || streq(s, "return") || streq(s, "true") || streq(s, "false") || streq(s, "nil");
-    }
-    return k == TK_PUNCT && (streq(s, ")") || streq(s, "]") || streq(s, "}") || streq(s, "++") || streq(s, "--"));
+fn ends_statement(t i64) i64 {
+	let k = t[T_KIND]
+	if k == TK_IDENT || k == TK_INT || k == TK_FLOAT || k == TK_STRING {
+		return 1
+	}
+	let s = t[T_TEXT]
+	if k == TK_KEYWORD {
+		return i64(streq(s, cstr("break")) != 0 || streq(s, cstr("continue")) != 0 || streq(s, cstr("return")) != 0 || streq(s, cstr("true")) != 0 || streq(s, cstr("false")) != 0 || streq(s, cstr("nil")) != 0)
+	}
+	return i64(k == TK_PUNCT && (streq(s, cstr(")")) != 0 || streq(s, cstr("]")) != 0 || streq(s, cstr("}}")) != 0 || streq(s, cstr("++")) != 0 || streq(s, cstr("--")) != 0))
 }
 
-fn lex_next() {
-    lx_skip_space();
-    lx_token_start = lx_i;
-    let pos = pos_make(lx_file, lx_line, lx_col);
-    if lx_i >= lx_len {
-        return token_new(TK_EOF, "", 0, pos);
-    }
-    let c = lx_peek(0);
-    if lx_edition && c == ';' {
-        lx_fail_code(pos, "E090 OLD_SYNTAX", "edition 1 statements end at a newline, not a semicolon");
-    }
-    if is_letter(c) {
-        let start = lx_i;
-        while is_letter(lx_peek(0)) || is_digit(lx_peek(0)) {
-            lx_advance();
-        }
-        let text = str_slice(lx_src + start, lx_i - start);
-        if is_keyword(text) {
-            return token_new(TK_KEYWORD, text, 0, pos);
-        }
-        return token_new(TK_IDENT, text, 0, pos);
-    }
-    if is_digit(c) || (c == '.' && is_digit(lx_peek(1))) {
-        return lex_number(pos);
-    }
-    if c == '`' {
-        return lex_raw_string(pos);
-    }
-    if lx_i + 2 < lx_len && is_three_char_punct(c, lx_peek(1), lx_peek(2)) {
-        let three = str_slice(lx_src + lx_i, 3);
-        lx_advance();
-        lx_advance();
-        lx_advance();
-        return token_new(TK_PUNCT, three, 0, pos);
-    }
-    if c == '\'' {
-        return lex_char(pos);
-    }
-    if c == '"' {
-        return lex_string(pos);
-    }
-    if lx_i + 1 < lx_len && is_two_char_punct(c, lx_peek(1)) {
-        let two = str_slice(lx_src + lx_i, 2);
-        lx_advance();
-        lx_advance();
-        return token_new(TK_PUNCT, two, 0, pos);
-    }
-    if is_one_char_punct(c) {
-        let one = str_slice(lx_src + lx_i, 1);
-        lx_advance();
-        return token_new(TK_PUNCT, one, 0, pos);
-    }
-    let e = err_code(pos, "E010 UNEXPECTED_CHARACTER");
-    buf_str(e, "unexpected character '");
-    buf_byte(e, c);
-    buf_byte(e, '\'');
-    fatal(e);
+fn lex_next() i64 {
+	lx_skip_space()
+	lx_token_start = lx_i
+	let pos = pos_make(lx_file, lx_line, lx_col)
+	if lx_i >= lx_len {
+		return token_new(TK_EOF, cstr(""), 0, pos)
+	}
+	let c = lx_peek(0)
+	if lx_edition != 0 && c == ';' {
+		lx_fail_code(pos, cstr("E090 OLD_SYNTAX"), cstr("edition 1 statements end at a newline, not a semicolon"))
+	}
+	if is_letter(c) != 0 {
+		let start = lx_i
+		for is_letter(lx_peek(0)) != 0 || is_digit(lx_peek(0)) != 0 {
+			lx_advance()
+		}
+		let text = str_slice(lx_src + start, lx_i - start)
+		if is_keyword(text) != 0 {
+			return token_new(TK_KEYWORD, text, 0, pos)
+		}
+		return token_new(TK_IDENT, text, 0, pos)
+	}
+	if is_digit(c) != 0 || (c == '.' && is_digit(lx_peek(1)) != 0) {
+		return lex_number(pos)
+	}
+	if c == '`' {
+		return lex_raw_string(pos)
+	}
+	if lx_i + 2 < lx_len && is_three_char_punct(c, lx_peek(1), lx_peek(2)) != 0 {
+		let three = str_slice(lx_src + lx_i, 3)
+		lx_advance()
+		lx_advance()
+		lx_advance()
+		return token_new(TK_PUNCT, three, 0, pos)
+	}
+	if c == '\'' {
+		return lex_char(pos)
+	}
+	if c == '"' {
+		return lex_string(pos)
+	}
+	if lx_i + 1 < lx_len && is_two_char_punct(c, lx_peek(1)) != 0 {
+		let two = str_slice(lx_src + lx_i, 2)
+		lx_advance()
+		lx_advance()
+		return token_new(TK_PUNCT, two, 0, pos)
+	}
+	if is_one_char_punct(c) != 0 {
+		let one = str_slice(lx_src + lx_i, 1)
+		lx_advance()
+		return token_new(TK_PUNCT, one, 0, pos)
+	}
+	let e = err_code(pos, cstr("E010 UNEXPECTED_CHARACTER"))
+	buf_str(e, cstr("unexpected character '"))
+	buf_byte(e, c)
+	buf_byte(e, '\'')
+	fatal(e)
+	return 0
 }
 
 // lex_float scans the fraction and exponent of a float literal starting at start.
-fn lex_float(pos, start) {
-    if lx_peek(0) == '.' {
-        lx_advance();
-        while is_digit(lx_peek(0)) {
-            lx_advance();
-        }
-    }
-    if lx_peek(0) == 'e' || lx_peek(0) == 'E' {
-        lx_advance();
-        if lx_peek(0) == '+' || lx_peek(0) == '-' {
-            lx_advance();
-        }
-        if !is_digit(lx_peek(0)) {
-            lx_fail_code(pos, "E011 INVALID_NUMBER", "invalid float literal");
-        }
-        while is_digit(lx_peek(0)) {
-            lx_advance();
-        }
-    }
-    let number_end = lx_i;
-    let unit = 0;
-    if lx_edition && is_letter(lx_peek(0)) {
-        let unit_start = lx_i;
-        while is_letter(lx_peek(0)) {
-            lx_advance();
-        }
-        unit = unit_name(str_slice(lx_src + unit_start, lx_i - unit_start));
-        if !unit {
-            lx_fail_code(pos, "E012 NUMERIC_UNIT", "unknown numeric unit suffix");
-        }
-    }
-    let text = str_slice(lx_src + start, number_end - start);
-    let t = token_new(TK_FLOAT, text, float_bits(text), pos);
-    t[T_UNIT] = unit;
-    return t;
+fn lex_float(pos i64, start i64) i64 {
+	if lx_peek(0) == '.' {
+		lx_advance()
+		for is_digit(lx_peek(0)) != 0 {
+			lx_advance()
+		}
+	}
+	if lx_peek(0) == 'e' || lx_peek(0) == 'E' {
+		lx_advance()
+		if lx_peek(0) == '+' || lx_peek(0) == '-' {
+			lx_advance()
+		}
+		if is_digit(lx_peek(0)) == 0 {
+			lx_fail_code(pos, cstr("E011 INVALID_NUMBER"), cstr("invalid float literal"))
+		}
+		for is_digit(lx_peek(0)) != 0 {
+			lx_advance()
+		}
+	}
+	let number_end = lx_i
+	mut unit_ = 0
+	if lx_edition != 0 && is_letter(lx_peek(0)) != 0 {
+		let unit_start = lx_i
+		for is_letter(lx_peek(0)) != 0 {
+			lx_advance()
+		}
+		unit_ = unit_name(str_slice(lx_src + unit_start, lx_i - unit_start))
+		if unit_ == 0 {
+			lx_fail_code(pos, cstr("E012 NUMERIC_UNIT"), cstr("unknown numeric unit suffix"))
+		}
+	}
+	let text = str_slice(lx_src + start, number_end - start)
+	let t = token_new(TK_FLOAT, text, float_bits(text), pos)
+	t[T_UNIT] = unit_
+	return t
 }
 
-fn unit_name(s) {
-    if streq(s, "ns") || streq(s, "us") || streq(s, "ms") || streq(s, "s") || streq(s, "m") || streq(s, "h") || streq(s, "b") || streq(s, "kb") || streq(s, "mb") || streq(s, "gb") {
-        return s;
-    }
-    return 0;
+fn unit_name(s i64) i64 {
+	if streq(s, cstr("ns")) != 0 || streq(s, cstr("us")) != 0 || streq(s, cstr("ms")) != 0 || streq(s, cstr("s")) != 0 || streq(s, cstr("m")) != 0 || streq(s, cstr("h")) != 0 || streq(s, cstr("b")) != 0 || streq(s, cstr("kb")) != 0 || streq(s, cstr("mb")) != 0 || streq(s, cstr("gb")) != 0 {
+		return s
+	}
+	return 0
 }
 
-fn lex_raw_string(pos) {
-    lx_advance();
-    let b = buf_new();
-    while lx_peek(0) != '`' {
-        if lx_i >= lx_len {
-            lx_fail_code(pos, "E013 UNTERMINATED", "unterminated raw string literal");
-        }
-        let c = lx_advance();
-        if c != '\r' {
-            buf_byte(b, c);
-        }
-    }
-    lx_advance();
-    buf_byte(b, 0);
-    let rt = token_new(TK_STRING, b[VEC_DATA], b[VEC_LEN] - 1, pos);
-    rt[T_RAW] = 1;
-    return rt;
+fn lex_raw_string(pos i64) i64 {
+	lx_advance()
+	let b = buf_new()
+	for lx_peek(0) != '`' {
+		if lx_i >= lx_len {
+			lx_fail_code(pos, cstr("E013 UNTERMINATED"), cstr("unterminated raw string literal"))
+		}
+		let c = lx_advance()
+		if c != '\r' {
+			buf_byte(b, c)
+		}
+	}
+	lx_advance()
+	buf_byte(b, 0)
+	let rt = token_new(TK_STRING, b[VEC_DATA], b[VEC_LEN] - 1, pos)
+	rt[T_RAW] = 1
+	return rt
 }
 
-fn lex_number(pos) {
-    let start = lx_i;
-    if lx_peek(0) == '.' {
-        return lex_float(pos, start);
-    }
-    // 0x, 0o and 0b prefixes; '_' may separate digits (1_000_000).
-    let base = 10;
-    if lx_peek(0) == '0' && (lx_peek(1) == 'x' || lx_peek(1) == 'X') {
-        base = 16;
-    } else if lx_peek(0) == '0' && (lx_peek(1) == 'o' || lx_peek(1) == 'O') {
-        base = 8;
-    } else if lx_peek(0) == '0' && (lx_peek(1) == 'b' || lx_peek(1) == 'B') {
-        base = 2;
-    }
-    if base != 10 {
-        lx_advance();
-        lx_advance();
-    } else {
-        while is_digit(lx_peek(0)) || (lx_peek(0) == '_' && is_digit(lx_peek(1))) {
-            lx_advance();
-        }
-        let after = lx_peek(1);
-        if (lx_peek(0) == '.' && !is_letter(after) && after != '.') || lx_peek(0) == 'e' || lx_peek(0) == 'E' {
-            return lex_float(pos, start);
-        }
-    }
-    let number_end = lx_i;
-    let unit = 0;
-    if base == 10 && lx_edition && is_letter(lx_peek(0)) {
-        let unit_start = lx_i;
-        while is_letter(lx_peek(0)) {
-            lx_advance();
-        }
-        unit = unit_name(str_slice(lx_src + unit_start, lx_i - unit_start));
-        if !unit {
-            lx_fail_code(pos, "E012 NUMERIC_UNIT", "unknown numeric unit suffix");
-        }
-    } else {
-        while is_letter(lx_peek(0)) || is_digit(lx_peek(0)) {
-            lx_advance();
-        }
-    }
-    let s = lx_src + start;
-    let n = lx_i - start;
-    if unit {
-        n = number_end - start;
-    }
-    let val = 0;
-    let ok = 1;
-    let i = 0;
-    if base != 10 {
-        i = 2;
-        if n == 2 {
-            ok = 0;
-        }
-    }
-    let shift = 4;
-    if base == 8 {
-        shift = 3;
-    } else if base == 2 {
-        shift = 1;
-    }
-    let prev_digit = 0;
-    while i < n && ok {
-        let d = load8(s + i);
-        if d == '_' {
-            // A separator must sit between two digits.
-            if !prev_digit || i + 1 >= n || load8(s + i + 1) == '_' {
-                ok = 0;
-            }
-            prev_digit = 0;
-        } else if base == 10 {
-            // Literals up to 2^64-1 are allowed; above 2^63-1 they keep their 64-bit pattern.
-            if !is_digit(d) || val > 1844674407370955161 || (val == 1844674407370955161 && d - '0' > 5) {
-                ok = 0;
-            } else {
-                val = val * 10 + d - '0';
-            }
-            prev_digit = 1;
-        } else {
-            let dv = -1;
-            if is_hex_digit(d) {
-                dv = hex_value(d);
-            }
-            if dv < 0 || dv >= base || ((val >> (64 - shift)) & ((1 << shift) - 1)) != 0 {
-                ok = 0;
-            } else {
-                val = (val << shift) | dv;
-            }
-            prev_digit = 1;
-        }
-        i = i + 1;
-    }
-    if !prev_digit {
-        ok = 0;
-    }
-    let text = str_slice(s, n);
-    if !ok {
-        let e = err_code(pos, "E011 INVALID_NUMBER");
-        buf_str(e, "invalid number ");
-        buf_str(e, text);
-        fatal(e);
-    }
-    let t = token_new(TK_INT, text, val, pos);
-    t[T_UNIT] = unit;
-    return t;
+fn lex_number(pos i64) i64 {
+	let start = lx_i
+	if lx_peek(0) == '.' {
+		return lex_float(pos, start)
+	}
+	// 0x, 0o and 0b prefixes; '_' may separate digits (1_000_000).
+	mut base = 10
+	if lx_peek(0) == '0' && (lx_peek(1) == 'x' || lx_peek(1) == 'X') {
+		base = 16
+	} else if lx_peek(0) == '0' && (lx_peek(1) == 'o' || lx_peek(1) == 'O') {
+		base = 8
+	} else if lx_peek(0) == '0' && (lx_peek(1) == 'b' || lx_peek(1) == 'B') {
+		base = 2
+	}
+	if base != 10 {
+		lx_advance()
+		lx_advance()
+	} else {
+		for is_digit(lx_peek(0)) != 0 || (lx_peek(0) == '_' && is_digit(lx_peek(1)) != 0) {
+			lx_advance()
+		}
+		let after = lx_peek(1)
+		if (lx_peek(0) == '.' && is_letter(after) == 0 && after != '.') || lx_peek(0) == 'e' || lx_peek(0) == 'E' {
+			return lex_float(pos, start)
+		}
+	}
+	let number_end = lx_i
+	mut unit_ = 0
+	if base == 10 && lx_edition != 0 && is_letter(lx_peek(0)) != 0 {
+		let unit_start = lx_i
+		for is_letter(lx_peek(0)) != 0 {
+			lx_advance()
+		}
+		unit_ = unit_name(str_slice(lx_src + unit_start, lx_i - unit_start))
+		if unit_ == 0 {
+			lx_fail_code(pos, cstr("E012 NUMERIC_UNIT"), cstr("unknown numeric unit suffix"))
+		}
+	} else {
+		for is_letter(lx_peek(0)) != 0 || is_digit(lx_peek(0)) != 0 {
+			lx_advance()
+		}
+	}
+	let s = lx_src + start
+	mut n = lx_i - start
+	if unit_ != 0 {
+		n = number_end - start
+	}
+	mut val = 0
+	mut ok = 1
+	mut i = 0
+	if base != 10 {
+		i = 2
+		if n == 2 {
+			ok = 0
+		}
+	}
+	mut shift = 4
+	if base == 8 {
+		shift = 3
+	} else if base == 2 {
+		shift = 1
+	}
+	mut prev_digit = 0
+	for i < n && ok != 0 {
+		let d = i64(load8(s + i))
+		if d == '_' {
+			// A separator must sit between two digits.
+			if prev_digit == 0 || i + 1 >= n || i64(load8(s + i + 1)) == '_' {
+				ok = 0
+			}
+			prev_digit = 0
+		} else if base == 10 {
+			// Literals up to 2^64-1 are allowed; above 2^63-1 they keep their 64-bit pattern.
+			if is_digit(d) == 0 || val > 1844674407370955161 || (val == 1844674407370955161 && d - '0' > 5) {
+				ok = 0
+			} else {
+				val = val * 10 + d - '0'
+			}
+			prev_digit = 1
+		} else {
+			mut dv = -1
+			if is_hex_digit(d) != 0 {
+				dv = hex_value(d)
+			}
+			if dv < 0 || dv >= base || ((val >> (64 - shift)) & ((1 << shift) - 1)) != 0 {
+				ok = 0
+			} else {
+				val = (val << shift) | dv
+			}
+			prev_digit = 1
+		}
+		i = i + 1
+	}
+	if prev_digit == 0 {
+		ok = 0
+	}
+	let text = str_slice(s, n)
+	if ok == 0 {
+		let e = err_code(pos, cstr("E011 INVALID_NUMBER"))
+		buf_str(e, cstr("invalid number "))
+		buf_str(e, text)
+		fatal(e)
+	}
+	let t = token_new(TK_INT, text, val, pos)
+	t[T_UNIT] = unit_
+	return t
 }
 
 // lx_rune decodes the UTF-8 character starting at the current byte (already peeked
 // as c >= 0x80) and consumes it.
-fn lx_rune(pos) {
-    let c = lx_advance();
-    let n = 0;
-    let r = 0;
-    if c >= 0xf0 {
-        n = 3;
-        r = c & 7;
-    } else if c >= 0xe0 {
-        n = 2;
-        r = c & 15;
-    } else if c >= 0xc0 {
-        n = 1;
-        r = c & 31;
-    } else {
-        return 0xfffd;
-    }
-    while n > 0 {
-        let d = lx_peek(0);
-        if (d & 0xc0) != 0x80 {
-            return 0xfffd;
-        }
-        lx_advance();
-        r = (r << 6) | (d & 63);
-        n = n - 1;
-    }
-    return r;
+fn lx_rune(pos i64) i64 {
+	let c = lx_advance()
+	mut n = 0
+	mut r = 0
+	if c >= 0xf0 {
+		n = 3
+		r = c & 7
+	} else if c >= 0xe0 {
+		n = 2
+		r = c & 15
+	} else if c >= 0xc0 {
+		n = 1
+		r = c & 31
+	} else {
+		return 0xfffd
+	}
+	for n > 0 {
+		let d = lx_peek(0)
+		if (d & 0xc0) != 0x80 {
+			return 0xfffd
+		}
+		lx_advance()
+		r = (r << 6) | (d & 63)
+		n = n - 1
+	}
+	return r
 }
 
-fn lex_char(pos) {
-    let start = lx_i;
-    lx_advance();
-    if lx_i >= lx_len || lx_peek(0) == '\n' || lx_peek(0) == '\'' {
-        lx_fail_code(pos, "E014 CHAR_LITERAL", "invalid character literal");
-    }
-    let c = 0;
-    if lx_peek(0) == '\\' {
-        lx_advance();
-        c = lx_escape(pos);
-    } else if lx_peek(0) >= 0x80 {
-        c = lx_rune(pos);
-    } else {
-        c = lx_advance();
-    }
-    if lx_peek(0) != '\'' {
-        lx_fail_code(pos, "E014 CHAR_LITERAL", "unterminated character literal");
-    }
-    lx_advance();
-    return token_new(TK_INT, str_slice(lx_src + start, lx_i - start), c, pos);
+fn lex_char(pos i64) i64 {
+	let start = lx_i
+	lx_advance()
+	if lx_i >= lx_len || lx_peek(0) == '\n' || lx_peek(0) == '\'' {
+		lx_fail_code(pos, cstr("E014 CHAR_LITERAL"), cstr("invalid character literal"))
+	}
+	mut c = 0
+	if lx_peek(0) == '\\' {
+		lx_advance()
+		c = lx_escape(pos)
+	} else if lx_peek(0) >= 0x80 {
+		c = lx_rune(pos)
+	} else {
+		c = lx_advance()
+	}
+	if lx_peek(0) != '\'' {
+		lx_fail_code(pos, cstr("E014 CHAR_LITERAL"), cstr("unterminated character literal"))
+	}
+	lx_advance()
+	return token_new(TK_INT, str_slice(lx_src + start, lx_i - start), c, pos)
 }
 
 // buf_utf8 appends rune r encoded as UTF-8.
-fn buf_utf8(b, r) {
-    if r < 0x80 {
-        buf_byte(b, r);
-    } else if r < 0x800 {
-        buf_byte(b, 0xc0 | (r >> 6));
-        buf_byte(b, 0x80 | (r & 63));
-    } else if r < 0x10000 {
-        buf_byte(b, 0xe0 | (r >> 12));
-        buf_byte(b, 0x80 | ((r >> 6) & 63));
-        buf_byte(b, 0x80 | (r & 63));
-    } else {
-        buf_byte(b, 0xf0 | (r >> 18));
-        buf_byte(b, 0x80 | ((r >> 12) & 63));
-        buf_byte(b, 0x80 | ((r >> 6) & 63));
-        buf_byte(b, 0x80 | (r & 63));
-    }
+fn buf_utf8(b i64, r i64) {
+	if r < 0x80 {
+		buf_byte(b, r)
+	} else if r < 0x800 {
+		buf_byte(b, 0xc0 | (r >> 6))
+		buf_byte(b, 0x80 | (r & 63))
+	} else if r < 0x10000 {
+		buf_byte(b, 0xe0 | (r >> 12))
+		buf_byte(b, 0x80 | ((r >> 6) & 63))
+		buf_byte(b, 0x80 | (r & 63))
+	} else {
+		buf_byte(b, 0xf0 | (r >> 18))
+		buf_byte(b, 0x80 | ((r >> 12) & 63))
+		buf_byte(b, 0x80 | ((r >> 6) & 63))
+		buf_byte(b, 0x80 | (r & 63))
+	}
 }
 
-fn lex_string(pos) {
-    lx_advance();
-    let b = buf_new();
-    let doubled = 0;
-    while 1 {
-        if lx_i >= lx_len || lx_peek(0) == '\n' {
-            lx_fail_code(pos, "E013 UNTERMINATED", "unterminated string literal");
-        }
-        let c = lx_advance();
-        if c == '"' {
-            // The NUL makes T_TEXT usable as a C string; T_VAL keeps the real length.
-            buf_byte(b, 0);
-            let st = token_new(TK_STRING, b[VEC_DATA], b[VEC_LEN] - 1, pos);
-            st[T_DBL] = doubled;
-            return st;
-        }
-        if c == '\\' {
-            let e = lx_escape(pos);
-            if e == '{' || e == '}' {
-                // An escaped brace is text, not interpolation: double it as the source would.
-                buf_byte(b, e);
-                doubled = 1;
-            }
-            if lx_esc_rune {
-                buf_utf8(b, e);
-            } else {
-                buf_byte(b, e);
-            }
-        } else {
-            buf_byte(b, c);
-        }
-    }
+fn lex_string(pos i64) i64 {
+	lx_advance()
+	let b = buf_new()
+	mut doubled = 0
+	for {
+		if lx_i >= lx_len || lx_peek(0) == '\n' {
+			lx_fail_code(pos, cstr("E013 UNTERMINATED"), cstr("unterminated string literal"))
+		}
+		let c = lx_advance()
+		if c == '"' {
+			// The NUL makes T_TEXT usable as a C string; T_VAL keeps the real length.
+			buf_byte(b, 0)
+			let st = token_new(TK_STRING, b[VEC_DATA], b[VEC_LEN] - 1, pos)
+			st[T_DBL] = doubled
+			return st
+		}
+		if c == '\\' {
+			let e = lx_escape(pos)
+			if e == '{' || e == '}' {
+				// An escaped brace is text, not interpolation: double it as the source would.
+				buf_byte(b, e)
+				doubled = 1
+			}
+			if lx_esc_rune != 0 {
+				buf_utf8(b, e)
+			} else {
+				buf_byte(b, e)
+			}
+		} else {
+			buf_byte(b, c)
+		}
+	}
 }
 
-fn lx_hex(pos, digits) {
-    let v = 0;
-    while digits > 0 {
-        let c = lx_peek(0);
-        if !is_hex_digit(c) {
-            lx_fail_code(pos, "E015 ESCAPE", "invalid hex escape");
-        }
-        lx_advance();
-        v = v * 16 + hex_value(c);
-        digits = digits - 1;
-    }
-    return v;
+fn lx_hex(pos i64, digits_in i64) i64 {
+	mut digits = digits_in
+	mut v = 0
+	for digits > 0 {
+		let c = lx_peek(0)
+		if is_hex_digit(c) == 0 {
+			lx_fail_code(pos, cstr("E015 ESCAPE"), cstr("invalid hex escape"))
+		}
+		lx_advance()
+		v = v * 16 + hex_value(c)
+		digits = digits - 1
+	}
+	return v
 }
 
 // lx_escape reads the escape after a backslash. \u and \U give runes (lx_esc_rune is
 // set, so strings encode them as UTF-8); every other escape is one byte.
-fn lx_escape(pos) {
-    lx_esc_rune = 0;
-    if lx_i >= lx_len {
-        lx_fail_code(pos, "E013 UNTERMINATED", "unterminated escape sequence");
-    }
-    let c = lx_advance();
-    if c == 'n' { return '\n'; }
-    if c == 't' { return '\t'; }
-    if c == 'r' { return '\r'; }
-    if c == 'a' { return 7; }
-    if c == 'b' { return 8; }
-    if c == 'f' { return 12; }
-    if c == 'v' { return 11; }
-    if c == '\\' || c == '\'' || c == '"' {
-        return c;
-    }
-    if c == 'x' {
-        return lx_hex(pos, 2);
-    }
-    if c == 'u' {
-        lx_esc_rune = 1;
-        return lx_hex(pos, 4);
-    }
-    if c == 'U' {
-        lx_esc_rune = 1;
-        return lx_hex(pos, 8);
-    }
-    if c >= '0' && c <= '7' {
-        // \0 alone is NUL; three octal digits are a byte, as in Go.
-        let v = c - '0';
-        let n = 1;
-        while n < 3 && lx_peek(0) >= '0' && lx_peek(0) <= '7' {
-            v = v * 8 + lx_advance() - '0';
-            n = n + 1;
-        }
-        return v & 255;
-    }
-    let e = err_code(pos, "E015 ESCAPE");
-    buf_str(e, "unknown escape sequence \\");
-    buf_byte(e, c);
-    fatal(e);
+fn lx_escape(pos i64) i64 {
+	lx_esc_rune = 0
+	if lx_i >= lx_len {
+		lx_fail_code(pos, cstr("E013 UNTERMINATED"), cstr("unterminated escape sequence"))
+	}
+	let c = lx_advance()
+	if c == 'n' {
+		return '\n'
+	}
+	if c == 't' {
+		return '\t'
+	}
+	if c == 'r' {
+		return '\r'
+	}
+	if c == 'a' {
+		return 7
+	}
+	if c == 'b' {
+		return 8
+	}
+	if c == 'f' {
+		return 12
+	}
+	if c == 'v' {
+		return 11
+	}
+	if c == '\\' || c == '\'' || c == '"' {
+		return c
+	}
+	if c == 'x' {
+		return lx_hex(pos, 2)
+	}
+	if c == 'u' {
+		lx_esc_rune = 1
+		return lx_hex(pos, 4)
+	}
+	if c == 'U' {
+		lx_esc_rune = 1
+		return lx_hex(pos, 8)
+	}
+	if c >= '0' && c <= '7' {
+		// \0 alone is NUL; three octal digits are a byte, as in Go.
+		mut v = c - '0'
+		mut n = 1
+		for n < 3 && lx_peek(0) >= '0' && lx_peek(0) <= '7' {
+			v = v * 8 + lx_advance() - '0'
+			n = n + 1
+		}
+		return v & 255
+	}
+	let e = err_code(pos, cstr("E015 ESCAPE"))
+	buf_str(e, cstr("unknown escape sequence \\"))
+	buf_byte(e, c)
+	fatal(e)
+	return 0
 }
 
 // float_bits converts a float literal to IEEE-754 bits. Exact for the common case of at
 // most 15 significant digits and a decimal exponent within +-22 (Clinger's fast path),
 // with the same integer-only, correctly rounded conversion core at every stage.
-fn float_bits(text) {
-    return parse_float_bits(text);
+fn float_bits(text i64) i64 {
+	return parse_float_bits(text)
 }
 
-var lexNumberScratch;
+shared mut lexNumberScratch i64
 
 // parse_float_bits shares the exact integer conversion core with the runtime.
-fn parse_float_bits(text) {
-    if !lexNumberScratch { lexNumberScratch = calloc(1,4096); }
-    return num_parse_bits(text,lexNumberScratch,0);
+fn parse_float_bits(text i64) i64 {
+	if lexNumberScratch == 0 {
+		lexNumberScratch = calloc(1, 4096)
+	}
+	return num_parse_bits(text, lexNumberScratch, 0)
 }

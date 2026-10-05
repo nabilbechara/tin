@@ -1,226 +1,230 @@
+// cstr is the address of a string literal's bytes: the untyped C-string word the compiler's records hold.
+fn cstr(s str) i64 {
+	return cast(i64, s) + 8
+}
+
 // Data structures for the self-hosted compiler: word vectors, byte buffers, positions, errors.
-
 // Vectors and buffers share one header layout; vectors count words, buffers count bytes.
-const VEC_LEN = 0;
-const VEC_CAP = 1;
-const VEC_DATA = 2;
+const VEC_LEN = 0
+const VEC_CAP = 1
+const VEC_DATA = 2
 
-fn vec_new() {
-    let v = malloc(24);
-    v[VEC_LEN] = 0;
-    v[VEC_CAP] = 8;
-    v[VEC_DATA] = malloc(64);
-    return v;
+fn vec_new() i64 {
+	let v = malloc(24)
+	v[VEC_LEN] = 0
+	v[VEC_CAP] = 8
+	v[VEC_DATA] = malloc(64)
+	return v
 }
 
-fn vec_push(v, x) {
-    if v[VEC_LEN] == v[VEC_CAP] {
-        v[VEC_CAP] = v[VEC_CAP] * 2;
-        v[VEC_DATA] = realloc(v[VEC_DATA], v[VEC_CAP] * 8);
-    }
-    v[VEC_DATA][v[VEC_LEN]] = x;
-    v[VEC_LEN] = v[VEC_LEN] + 1;
+fn vec_push(v i64, x i64) {
+	if v[VEC_LEN] == v[VEC_CAP] {
+		v[VEC_CAP] = v[VEC_CAP] * 2
+		v[VEC_DATA] = realloc(v[VEC_DATA], v[VEC_CAP] * 8)
+	}
+	v[VEC_DATA][v[VEC_LEN]] = x
+	v[VEC_LEN] = v[VEC_LEN] + 1
 }
 
-fn vec_get(v, i) {
-    return v[VEC_DATA][i];
+fn vec_get(v i64, i i64) i64 {
+	return v[VEC_DATA][i]
 }
 
-fn vec_filled(n, x) {
-    let v = vec_new();
-    let i = 0;
-    while i < n {
-        vec_push(v, x);
-        i = i + 1;
-    }
-    return v;
+fn vec_filled(n i64, x i64) i64 {
+	let v = vec_new()
+	mut i = 0
+	for i < n {
+		vec_push(v, x)
+		i = i + 1
+	}
+	return v
 }
 
-fn vec_clone(v) {
-    let out = vec_new();
-    if !v {
-        return out;
-    }
-    let i = 0;
-    while i < v[VEC_LEN] {
-        vec_push(out, vec_get(v, i));
-        i = i + 1;
-    }
-    return out;
+fn vec_clone(v i64) i64 {
+	let out = vec_new()
+	if v == 0 {
+		return out
+	}
+	mut i = 0
+	for i < v[VEC_LEN] {
+		vec_push(out, vec_get(v, i))
+		i = i + 1
+	}
+	return out
 }
 
-fn buf_new() {
-    let b = malloc(24);
-    b[VEC_LEN] = 0;
-    b[VEC_CAP] = 256;
-    b[VEC_DATA] = malloc(256);
-    return b;
+fn buf_new() i64 {
+	let b = malloc(24)
+	b[VEC_LEN] = 0
+	b[VEC_CAP] = 256
+	b[VEC_DATA] = malloc(256)
+	return b
 }
 
-fn buf_reserve(b, n) {
-    while b[VEC_LEN] + n > b[VEC_CAP] {
-        b[VEC_CAP] = b[VEC_CAP] * 2;
-        b[VEC_DATA] = realloc(b[VEC_DATA], b[VEC_CAP]);
-    }
+fn buf_reserve(b i64, n i64) {
+	for b[VEC_LEN] + n > b[VEC_CAP] {
+		b[VEC_CAP] = b[VEC_CAP] * 2
+		b[VEC_DATA] = realloc(b[VEC_DATA], b[VEC_CAP])
+	}
 }
 
-fn buf_byte(b, c) {
-    buf_reserve(b, 1);
-    store8(b[VEC_DATA] + b[VEC_LEN], c);
-    b[VEC_LEN] = b[VEC_LEN] + 1;
+fn buf_byte(b i64, c i64) {
+	buf_reserve(b, 1)
+	store8(b[VEC_DATA] + b[VEC_LEN], c)
+	b[VEC_LEN] = b[VEC_LEN] + 1
 }
 
-fn buf_bytes(b, s, n) {
-    buf_reserve(b, n);
-    memcpy(b[VEC_DATA] + b[VEC_LEN], s, n);
-    b[VEC_LEN] = b[VEC_LEN] + n;
+fn buf_bytes(b i64, s i64, n i64) {
+	buf_reserve(b, n)
+	memcpy(b[VEC_DATA] + b[VEC_LEN], s, n)
+	b[VEC_LEN] = b[VEC_LEN] + n
 }
 
-fn buf_str(b, s) {
-    buf_bytes(b, s, strlen(s));
+fn buf_str(b i64, s i64) {
+	buf_bytes(b, s, strlen(s))
 }
 
-fn buf_int(b, n) {
-    if n < 0 {
-        buf_byte(b, '-');
-        if n / 10 != 0 {
-            buf_int(b, -(n / 10));
-        }
-        buf_byte(b, '0' - n % 10);
-        return;
-    }
-    if n >= 10 {
-        buf_int(b, n / 10);
-    }
-    buf_byte(b, '0' + n % 10);
+fn buf_int(b i64, n i64) {
+	if n < 0 {
+		buf_byte(b, '-')
+		if n / 10 != 0 {
+			buf_int(b, -(n / 10))
+		}
+		buf_byte(b, '0' - n % 10)
+		return
+	}
+	if n >= 10 {
+		buf_int(b, n / 10)
+	}
+	buf_byte(b, '0' + n % 10)
 }
 
 // str_slice copies n bytes into a new NUL-terminated string.
-fn str_slice(s, n) {
-    let r = malloc(n + 1);
-    let i = 0;
-    while i < n {
-        store8(r + i, load8(s + i));
-        i = i + 1;
-    }
-    store8(r + n, 0);
-    return r;
+fn str_slice(s i64, n i64) i64 {
+	let r = malloc(n + 1)
+	mut i = 0
+	for i < n {
+		store8(r + i, i64(load8(s + i)))
+		i = i + 1
+	}
+	store8(r + n, 0)
+	return r
 }
 
-fn mem_eq(a, b, n) {
-    let i = 0;
-    while i < n {
-        if load8(a + i) != load8(b + i) {
-            return 0;
-        }
-        i = i + 1;
-    }
-    return 1;
+fn mem_eq(a i64, b i64, n i64) i64 {
+	mut i = 0
+	for i < n {
+		if i64(load8(a + i)) != i64(load8(b + i)) {
+			return 0
+		}
+		i = i + 1
+	}
+	return 1
 }
 
-fn write_all(fd, b) {
-    let done = 0;
-    while done < b[VEC_LEN] {
-        let n = rt_sys_write(fd, b[VEC_DATA] + done, b[VEC_LEN] - done);
-        if n <= 0 {
-            rt_sys_exit(1);
-        }
-        done = done + n;
-    }
+fn write_all(fd i64, b i64) {
+	mut done = 0
+	for done < b[VEC_LEN] {
+		let n = rt_sys_write(fd, b[VEC_DATA] + done, b[VEC_LEN] - done)
+		if n <= 0 {
+			rt_sys_exit(1)
+		}
+		done = done + n
+	}
 }
 
 // A position packs file index, line and column into one word.
-const NO_POS = -1;
+const NO_POS = -1
 
-var files;
-var tgt_linux;   // the target OS is Linux (else macOS)
-var tgt_x64;     // the target CPU is x86-64 (else arm64)
-var error_count;
+shared mut files i64
+shared mut tgt_linux i64 // the target OS is Linux (else macOS)
+shared mut tgt_x64 i64 // the target CPU is x86-64 (else arm64)
+shared mut error_count i64
 
-fn pos_make(file, line, col) {
-    return (file << 48) | (line << 16) | col;
+fn pos_make(file i64, line i64, col i64) i64 {
+	return (file << 48) | (line << 16) | col
 }
 
-fn buf_pos(b, pos) {
-    buf_str(b, vec_get(files, pos >> 48));
-    buf_byte(b, ':');
-    buf_int(b, (pos >> 16) & 0xffffffff);
-    buf_byte(b, ':');
-    buf_int(b, pos & 0xffff);
+fn buf_pos(b i64, pos i64) {
+	buf_str(b, vec_get(files, pos >> 48))
+	buf_byte(b, ':')
+	buf_int(b, (pos >> 16) & 0xffffffff)
+	buf_byte(b, ':')
+	buf_int(b, pos & 0xffff)
 }
 
-fn err_end(b) {
-    buf_byte(b, '\n');
-    write_all(2, b);
-    error_count = error_count + 1;
+fn err_end(b i64) {
+	buf_byte(b, '\n')
+	write_all(2, b)
+	error_count = error_count + 1
 }
 
-fn fatal(b) {
-    err_end(b);
-    rt_sys_exit(1);
+fn fatal(b i64) {
+	err_end(b)
+	rt_sys_exit(1)
 }
 
 // err_code starts an error with its code and name from docs/ERRORS.md, such as
 // "E502 TYPE_ARG_COUNT"; finish it with err_end (keep going) or fatal (stop).
-fn err_code(pos, code) {
-    let b = buf_new();
-    if pos != NO_POS {
-        buf_pos(b, pos);
-        buf_str(b, ": ");
-    }
-    buf_str(b, "error ");
-    buf_str(b, code);
-    buf_str(b, ": ");
-    return b;
+fn err_code(pos i64, code i64) i64 {
+	let b = buf_new()
+	if pos != NO_POS {
+		buf_pos(b, pos)
+		buf_str(b, cstr(": "))
+	}
+	buf_str(b, cstr("error "))
+	buf_str(b, code)
+	buf_str(b, cstr(": "))
+	return b
 }
 
 // err_code_at reports a coded error whose whole message is MSG.
-fn err_code_at(pos, code, msg) {
-    let e = err_code(pos, code);
-    buf_str(e, msg);
-    err_end(e);
+fn err_code_at(pos i64, code i64, msg i64) {
+	let e = err_code(pos, code)
+	buf_str(e, msg)
+	err_end(e)
 }
 
 // err_code_quoted reports a coded PREFIX 'NAME' SUFFIX.
-fn err_code_quoted(pos, code, prefix, name, suffix) {
-    let e = err_code(pos, code);
-    buf_str(e, prefix);
-    buf_byte(e, '\'');
-    buf_str(e, name);
-    buf_byte(e, '\'');
-    buf_str(e, suffix);
-    err_end(e);
+fn err_code_quoted(pos i64, code i64, prefix i64, name i64, suffix i64) {
+	let e = err_code(pos, code)
+	buf_str(e, prefix)
+	buf_byte(e, '\'')
+	buf_str(e, name)
+	buf_byte(e, '\'')
+	buf_str(e, suffix)
+	err_end(e)
 }
 
 // Little- and big-endian stores into a byte array.
-fn put32(p, v) {
-    store8(p, v);
-    store8(p + 1, v >> 8);
-    store8(p + 2, v >> 16);
-    store8(p + 3, v >> 24);
+fn put32(p i64, v i64) {
+	store8(p, v)
+	store8(p + 1, v >> 8)
+	store8(p + 2, v >> 16)
+	store8(p + 3, v >> 24)
 }
 
-fn put64(p, v) {
-    put32(p, v);
-    put32(p + 4, v >> 32);
+fn put64(p i64, v i64) {
+	put32(p, v)
+	put32(p + 4, v >> 32)
 }
 
-fn load32(p) {
-    return load8(p) | (load8(p + 1) << 8) | (load8(p + 2) << 16) | (load8(p + 3) << 24);
+fn load32(p i64) i64 {
+	return i64(load8(p)) | (i64(load8(p + 1)) << 8) | (i64(load8(p + 2)) << 16) | (i64(load8(p + 3)) << 24)
 }
 
-fn put32be(p, v) {
-    store8(p, v >> 24);
-    store8(p + 1, v >> 16);
-    store8(p + 2, v >> 8);
-    store8(p + 3, v);
+fn put32be(p i64, v i64) {
+	store8(p, v >> 24)
+	store8(p + 1, v >> 16)
+	store8(p + 2, v >> 8)
+	store8(p + 3, v)
 }
 
-fn put64be(p, v) {
-    put32be(p, v >> 32);
-    put32be(p + 4, v);
+fn put64be(p i64, v i64) {
+	put32be(p, v >> 32)
+	put32be(p + 4, v)
 }
 
-fn align_up(n, a) {
-    return (n + a - 1) & ~(a - 1);
+fn align_up(n i64, a i64) i64 {
+	return (n + a - 1) & ~(a - 1)
 }

@@ -20,24 +20,24 @@ def generate():
     with tempfile.TemporaryDirectory() as tmp:
         for arch, target in [('arm64', 'aarch64-linux-gnu'), ('amd64', 'x86_64-linux-gnu')]:
             source = (ROOT/f'lib/runtime/syscalls_linux_{arch}.tin').read_text()
-            numbers = dict(re.findall(r'fn linux_nr_(\w+)\(\) \{ return (\d+); \}',source))
+            numbers = dict(re.findall(r'fn linux_nr_(\w+)\(\)(?: i64)? \{\s*return (\d+);?\s*\}',source))
             obj = Path(tmp)/f'{arch}.o'
             subprocess.run(['clang', '-target', target,
                 *[f'-DNR_{n.upper()}={numbers[n]}' for n in DEFINES], '-c',
                 str(ROOT/f'tools/arch/syscall-fast-{arch}.S'), '-o', str(obj)], check=True)
             table = functions(obj, NAMES)
-            result += ['', f'fn syscall_fast_{arch}(name) {{', '    let hex="";']
+            result += ['', f'fn syscall_fast_{arch}(name i64) i64 {{', '\tmut hex = cstr("")']
             for name in NAMES:
                 data = table[name]
                 code = ''.join(f'{v[0]:08x}' for v in struct.iter_unpack('<I',data)) if arch=='arm64' else data.hex()
-                result.append(f'    if streq(name,"{name}") {{ hex="{code}"; }}')
-            result += ['    if load8(hex) == 0 { return 0; }', '    let v=vec_new(); let i=0;',
-                       '    while load8(hex+i) != 0 {']
+                result += [f'\tif streq(name, cstr("{name}")) != 0 {{', f'\t\thex = cstr("{code}")', '\t}']
+            result += ['\tif i64(load8(hex)) == 0 {', '\t\treturn 0', '\t}', '\tlet v = vec_new()', '\tmut i = 0',
+                       '\tfor i64(load8(hex + i)) != 0 {']
             if arch == 'arm64':
-                result.append('        raw(v,hex_word(hex+i)); i=i+8;')
+                result += ['\t\traw(v, hex_word(hex + i))', '\t\ti = i + 8']
             else:
-                result.append('        vec_push(v,num_digit(load8(hex+i))*16+num_digit(load8(hex+i+1))); i=i+2;')
-            result += ['    }', '    return v;', '}']
+                result += ['\t\tvec_push(v, num_digit(i64(load8(hex + i))) * 16 + num_digit(i64(load8(hex + i + 1))))', '\t\ti = i + 2']
+            result += ['\t}', '\treturn v', '}']
     return '\n'.join(result)+'\n'
 
 

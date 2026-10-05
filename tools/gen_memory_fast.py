@@ -46,24 +46,24 @@ def generate():
                 subprocess.run(['clang', '-target', target, '-DMEMORY_VECTOR', '-c',
                     str(ROOT/f'tools/arch/memory-fast-{arch}.S'), '-o', str(obj)], check=True)
                 vectors = functions(obj, wanted)
-            text += ['', f'fn memory_fast_{arch}(name) {{', '    let hex="";']
+            text += ['', f'fn memory_fast_{arch}(name i64) i64 {{', '\tmut hex = cstr("")']
             for name in wanted:
                 data = table[name]
                 if arch == 'arm64':
                     data = ''.join(f'{v[0]:08x}' for v in struct.iter_unpack('<I', data))
                 else:
                     data = data.hex()
-                text.append(f'    if streq(name,"{name}") {{ hex="{data}"; }}')
-            # Legacy compiler programs have no Tin core context; never read their r15.
+                text += [f'\tif streq(name, cstr("{name}")) != 0 {{', f'\t\thex = cstr("{data}")', '\t}']
+            # The compiler's own build has no Tin core context to read from r15 unless asked: any_v2 says whether vector leaves are wanted.
             if vectors:
                 for name in ('memcpy', 'memmove', 'memcmp', 'memchr'):
-                    text.append(f'    if any_v2 && streq(name,"{name}") {{ hex="{vectors[name].hex()}"; }}')
-            text += ['    let v=vec_new(); let i=0;', '    while load8(hex+i) != 0 {']
+                    text += [f'\tif any_v2 != 0 && streq(name, cstr("{name}")) != 0 {{', f'\t\thex = cstr("{vectors[name].hex()}")', '\t}']
+            text += ['\tlet v = vec_new()', '\tmut i = 0', '\tfor i64(load8(hex + i)) != 0 {']
             if arch == 'arm64':
-                text.append('        raw(v,hex_word(hex+i)); i=i+8;')
+                text += ['\t\traw(v, hex_word(hex + i))', '\t\ti = i + 8']
             else:
-                text.append('        vec_push(v,num_digit(load8(hex+i))*16+num_digit(load8(hex+i+1))); i=i+2;')
-            text += ['    }', '    return v;', '}']
+                text += ['\t\tvec_push(v, num_digit(i64(load8(hex + i))) * 16 + num_digit(i64(load8(hex + i + 1))))', '\t\ti = i + 2']
+            text += ['\t}', '\treturn v', '}']
     return '\n'.join(text)+'\n'
 
 

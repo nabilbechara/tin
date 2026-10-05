@@ -1,138 +1,185 @@
 // SHA-256 (FIPS 180-4), needed for the code signature's page hashes.
 // Words are kept below 2^32 in 64-bit integers, so >> acts as a logical shift.
+const M32 = 0xffffffff
 
-const M32 = 0xffffffff;
-
-var sha_k;
-var sha_w;
-var sha_h;
-var sha_tail;
+shared mut sha_k i64
+shared mut sha_w i64
+shared mut sha_h i64
+shared mut sha_tail i64
 
 fn sha_setup() {
-    let k = malloc(64 * 8);
-    k[0] = 0x428a2f98; k[1] = 0x71374491; k[2] = 0xb5c0fbcf; k[3] = 0xe9b5dba5;
-    k[4] = 0x3956c25b; k[5] = 0x59f111f1; k[6] = 0x923f82a4; k[7] = 0xab1c5ed5;
-    k[8] = 0xd807aa98; k[9] = 0x12835b01; k[10] = 0x243185be; k[11] = 0x550c7dc3;
-    k[12] = 0x72be5d74; k[13] = 0x80deb1fe; k[14] = 0x9bdc06a7; k[15] = 0xc19bf174;
-    k[16] = 0xe49b69c1; k[17] = 0xefbe4786; k[18] = 0x0fc19dc6; k[19] = 0x240ca1cc;
-    k[20] = 0x2de92c6f; k[21] = 0x4a7484aa; k[22] = 0x5cb0a9dc; k[23] = 0x76f988da;
-    k[24] = 0x983e5152; k[25] = 0xa831c66d; k[26] = 0xb00327c8; k[27] = 0xbf597fc7;
-    k[28] = 0xc6e00bf3; k[29] = 0xd5a79147; k[30] = 0x06ca6351; k[31] = 0x14292967;
-    k[32] = 0x27b70a85; k[33] = 0x2e1b2138; k[34] = 0x4d2c6dfc; k[35] = 0x53380d13;
-    k[36] = 0x650a7354; k[37] = 0x766a0abb; k[38] = 0x81c2c92e; k[39] = 0x92722c85;
-    k[40] = 0xa2bfe8a1; k[41] = 0xa81a664b; k[42] = 0xc24b8b70; k[43] = 0xc76c51a3;
-    k[44] = 0xd192e819; k[45] = 0xd6990624; k[46] = 0xf40e3585; k[47] = 0x106aa070;
-    k[48] = 0x19a4c116; k[49] = 0x1e376c08; k[50] = 0x2748774c; k[51] = 0x34b0bcb5;
-    k[52] = 0x391c0cb3; k[53] = 0x4ed8aa4a; k[54] = 0x5b9cca4f; k[55] = 0x682e6ff3;
-    k[56] = 0x748f82ee; k[57] = 0x78a5636f; k[58] = 0x84c87814; k[59] = 0x8cc70208;
-    k[60] = 0x90befffa; k[61] = 0xa4506ceb; k[62] = 0xbef9a3f7; k[63] = 0xc67178f2;
-    sha_k = k;
-    sha_w = malloc(64 * 8);
-    sha_h = malloc(8 * 8);
-    sha_tail = malloc(128);
+	let k = malloc(64 * 8)
+	k[0] = 0x428a2f98
+	k[1] = 0x71374491
+	k[2] = 0xb5c0fbcf
+	k[3] = 0xe9b5dba5
+	k[4] = 0x3956c25b
+	k[5] = 0x59f111f1
+	k[6] = 0x923f82a4
+	k[7] = 0xab1c5ed5
+	k[8] = 0xd807aa98
+	k[9] = 0x12835b01
+	k[10] = 0x243185be
+	k[11] = 0x550c7dc3
+	k[12] = 0x72be5d74
+	k[13] = 0x80deb1fe
+	k[14] = 0x9bdc06a7
+	k[15] = 0xc19bf174
+	k[16] = 0xe49b69c1
+	k[17] = 0xefbe4786
+	k[18] = 0x0fc19dc6
+	k[19] = 0x240ca1cc
+	k[20] = 0x2de92c6f
+	k[21] = 0x4a7484aa
+	k[22] = 0x5cb0a9dc
+	k[23] = 0x76f988da
+	k[24] = 0x983e5152
+	k[25] = 0xa831c66d
+	k[26] = 0xb00327c8
+	k[27] = 0xbf597fc7
+	k[28] = 0xc6e00bf3
+	k[29] = 0xd5a79147
+	k[30] = 0x06ca6351
+	k[31] = 0x14292967
+	k[32] = 0x27b70a85
+	k[33] = 0x2e1b2138
+	k[34] = 0x4d2c6dfc
+	k[35] = 0x53380d13
+	k[36] = 0x650a7354
+	k[37] = 0x766a0abb
+	k[38] = 0x81c2c92e
+	k[39] = 0x92722c85
+	k[40] = 0xa2bfe8a1
+	k[41] = 0xa81a664b
+	k[42] = 0xc24b8b70
+	k[43] = 0xc76c51a3
+	k[44] = 0xd192e819
+	k[45] = 0xd6990624
+	k[46] = 0xf40e3585
+	k[47] = 0x106aa070
+	k[48] = 0x19a4c116
+	k[49] = 0x1e376c08
+	k[50] = 0x2748774c
+	k[51] = 0x34b0bcb5
+	k[52] = 0x391c0cb3
+	k[53] = 0x4ed8aa4a
+	k[54] = 0x5b9cca4f
+	k[55] = 0x682e6ff3
+	k[56] = 0x748f82ee
+	k[57] = 0x78a5636f
+	k[58] = 0x84c87814
+	k[59] = 0x8cc70208
+	k[60] = 0x90befffa
+	k[61] = 0xa4506ceb
+	k[62] = 0xbef9a3f7
+	k[63] = 0xc67178f2
+	sha_k = k
+	sha_w = malloc(64 * 8)
+	sha_h = malloc(8 * 8)
+	sha_tail = malloc(128)
 }
 
-fn rotr(x, n) {
-    return ((x >> n) | (x << (32 - n))) & M32;
+fn rotr(x i64, n i64) i64 {
+	return ((x >> n) | (x << (32 - n))) & M32
 }
 
-fn be32(p) {
-    return (load8(p) << 24) | (load8(p + 1) << 16) | (load8(p + 2) << 8) | load8(p + 3);
+fn be32(p i64) i64 {
+	return (i64(load8(p)) << 24) | (i64(load8(p + 1)) << 16) | (i64(load8(p + 2)) << 8) | i64(load8(p + 3))
 }
 
-fn sha_block(p) {
-    let w = sha_w;
-    let k = sha_k;
-    let t = 0;
-    while t < 16 {
-        w[t] = be32(p + 4 * t);
-        t = t + 1;
-    }
-    while t < 64 {
-        let a15 = w[t - 15];
-        let a2 = w[t - 2];
-        let s0 = rotr(a15, 7) ^ rotr(a15, 18) ^ (a15 >> 3);
-        let s1 = rotr(a2, 17) ^ rotr(a2, 19) ^ (a2 >> 10);
-        w[t] = (w[t - 16] + s0 + w[t - 7] + s1) & M32;
-        t = t + 1;
-    }
-    let h = sha_h;
-    let a = h[0];
-    let b = h[1];
-    let c = h[2];
-    let d = h[3];
-    let e = h[4];
-    let f = h[5];
-    let g = h[6];
-    let hh = h[7];
-    t = 0;
-    while t < 64 {
-        let big1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
-        let ch = (e & f) ^ (~e & g);
-        let t1 = (hh + big1 + ch + k[t] + w[t]) & M32;
-        let big0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
-        let maj = (a & b) ^ (a & c) ^ (b & c);
-        let t2 = (big0 + maj) & M32;
-        hh = g;
-        g = f;
-        f = e;
-        e = (d + t1) & M32;
-        d = c;
-        c = b;
-        b = a;
-        a = (t1 + t2) & M32;
-        t = t + 1;
-    }
-    h[0] = (h[0] + a) & M32;
-    h[1] = (h[1] + b) & M32;
-    h[2] = (h[2] + c) & M32;
-    h[3] = (h[3] + d) & M32;
-    h[4] = (h[4] + e) & M32;
-    h[5] = (h[5] + f) & M32;
-    h[6] = (h[6] + g) & M32;
-    h[7] = (h[7] + hh) & M32;
+fn sha_block(p i64) {
+	let w = sha_w
+	let k = sha_k
+	mut t = 0
+	for t < 16 {
+		w[t] = be32(p + 4 * t)
+		t = t + 1
+	}
+	for t < 64 {
+		let a15 = w[t - 15]
+		let a2 = w[t - 2]
+		let s0 = rotr(a15, 7) ^ rotr(a15, 18) ^ (a15 >> 3)
+		let s1 = rotr(a2, 17) ^ rotr(a2, 19) ^ (a2 >> 10)
+		w[t] = (w[t - 16] + s0 + w[t - 7] + s1) & M32
+		t = t + 1
+	}
+	let h = sha_h
+	mut a = h[0]
+	mut b = h[1]
+	mut c = h[2]
+	mut d = h[3]
+	mut e = h[4]
+	mut f = h[5]
+	mut g = h[6]
+	mut hh = h[7]
+	t = 0
+	for t < 64 {
+		let big1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)
+		let ch = (e & f) ^ (~e & g)
+		let t1 = (hh + big1 + ch + k[t] + w[t]) & M32
+		let big0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)
+		let maj = (a & b) ^ (a & c) ^ (b & c)
+		let t2 = (big0 + maj) & M32
+		hh = g
+		g = f
+		f = e
+		e = (d + t1) & M32
+		d = c
+		c = b
+		b = a
+		a = (t1 + t2) & M32
+		t = t + 1
+	}
+	h[0] = (h[0] + a) & M32
+	h[1] = (h[1] + b) & M32
+	h[2] = (h[2] + c) & M32
+	h[3] = (h[3] + d) & M32
+	h[4] = (h[4] + e) & M32
+	h[5] = (h[5] + f) & M32
+	h[6] = (h[6] + g) & M32
+	h[7] = (h[7] + hh) & M32
 }
 
 // sha256 writes the 32-byte digest of n bytes at p to out.
-fn sha256(p, n, out) {
-    if !sha_k {
-        sha_setup();
-    }
-    let h = sha_h;
-    h[0] = 0x6a09e667;
-    h[1] = 0xbb67ae85;
-    h[2] = 0x3c6ef372;
-    h[3] = 0xa54ff53a;
-    h[4] = 0x510e527f;
-    h[5] = 0x9b05688c;
-    h[6] = 0x1f83d9ab;
-    h[7] = 0x5be0cd19;
-    let i = 0;
-    while i + 64 <= n {
-        sha_block(p + i);
-        i = i + 64;
-    }
-    let tail = sha_tail;
-    let j = 0;
-    while j < 128 {
-        store8(tail + j, 0);
-        j = j + 1;
-    }
-    let rest = n - i;
-    memcpy(tail, p + i, rest);
-    store8(tail + rest, 0x80);
-    let size = 64;
-    if rest + 9 > 64 {
-        size = 128;
-    }
-    put64be(tail + size - 8, n * 8);
-    sha_block(tail);
-    if size == 128 {
-        sha_block(tail + 64);
-    }
-    j = 0;
-    while j < 8 {
-        put32be(out + 4 * j, h[j]);
-        j = j + 1;
-    }
+fn sha256(p i64, n i64, out i64) {
+	if sha_k == 0 {
+		sha_setup()
+	}
+	let h = sha_h
+	h[0] = 0x6a09e667
+	h[1] = 0xbb67ae85
+	h[2] = 0x3c6ef372
+	h[3] = 0xa54ff53a
+	h[4] = 0x510e527f
+	h[5] = 0x9b05688c
+	h[6] = 0x1f83d9ab
+	h[7] = 0x5be0cd19
+	mut i = 0
+	for i + 64 <= n {
+		sha_block(p + i)
+		i = i + 64
+	}
+	let tail = sha_tail
+	mut j = 0
+	for j < 128 {
+		store8(tail + j, 0)
+		j = j + 1
+	}
+	let rest = n - i
+	memcpy(tail, p + i, rest)
+	store8(tail + rest, 0x80)
+	mut size = 64
+	if rest + 9 > 64 {
+		size = 128
+	}
+	put64be(tail + size - 8, n * 8)
+	sha_block(tail)
+	if size == 128 {
+		sha_block(tail + 64)
+	}
+	j = 0
+	for j < 8 {
+		put32be(out + 4 * j, h[j])
+		j = j + 1
+	}
 }

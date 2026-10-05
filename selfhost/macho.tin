@@ -3,428 +3,433 @@
 // Layout:  __PAGEZERO | __TEXT (headers, __text with import stubs, __cstring)
 //          | __DATA (__got, __data) | __LINKEDIT (bind info, symbols, code signature)
 // Imports are bound by dyld from libSystem through the GOT, like Go's internal linker.
+const PAGE = 16384
+const TEXT_BASE = 0x100000000
+const CMDS_SIZE = 1016
+const NCMDS = 13
+const SIG_PAGE = 4096
 
-const PAGE = 16384;
-const TEXT_BASE = 0x100000000;
-const CMDS_SIZE = 1016;
-const NCMDS = 13;
-const SIG_PAGE = 4096;
+shared mut lk_labels i64 // label -> address
+shared mut lk_imports i64 // extern fns that are called
+shared mut lk_stubs i64 // address of the first import stub
+shared mut lk_strs i64 // string literal -> address
+shared mut lk_tstrs i64 // Tin string literal -> address of its length word
+shared mut lk_btrace i64 // readonly Tin backtrace table (ELF only)
+shared mut lk_zero i64 // 32 zero bytes: the empty slice header every empty slice shares
+shared mut lk_fndescs i64 // function descriptors: [code, env] pairs
+shared mut lk_got i64
+shared mut lk_data i64
+shared mut mo i64 // the output file image
 
-var lk_labels;    // label -> address
-var lk_imports;   // extern fns that are called
-var lk_stubs;     // address of the first import stub
-var lk_strs;      // string literal -> address
-var lk_tstrs;     // Tin string literal -> address of its length word
-var lk_btrace;   // readonly Tin backtrace table (ELF only)
-var lk_zero;      // 32 zero bytes: the empty slice header every empty slice shares
-var lk_fndescs;   // function descriptors: [code, env] pairs
-var lk_got;
-var lk_data;
-var mo;           // the output file image
-
-fn link_fail(msg) {
-    let e = err_code(NO_POS, "E990 INTERNAL");
-    buf_str(e, "link: ");
-    buf_str(e, msg);
-    fatal(e);
+fn link_fail(msg i64) {
+	let e = err_code(NO_POS, cstr("E990 INTERNAL"))
+	buf_str(e, cstr("link: "))
+	buf_str(e, msg)
+	fatal(e)
 }
 
-fn label_addr(l) {
-    return vec_get(lk_labels, l);
+fn label_addr(l i64) i64 {
+	return vec_get(lk_labels, l)
 }
 
-fn call_addr(f) {
-    if f[F_EXTERN] {
-        return lk_stubs + 12 * f[F_GOT];
-    }
-    return f[F_ADDR];
+fn call_addr(f i64) i64 {
+	if f[F_EXTERN] != 0 {
+		return lk_stubs + 12 * f[F_GOT]
+	}
+	return f[F_ADDR]
 }
 
-fn sym_addr(sym) {
-    let kind = sym >> 32;
-    let i = sym & 0xffffffff;
-    if kind == SK_STR {
-        return vec_get(lk_strs, i);
-    }
-    if kind == SK_VAR {
-        return lk_data + 8 * i;
-    }
-    if kind == SK_TSTR {
-        return vec_get(lk_tstrs, i);
-    }
-    if kind == SK_FN {
-        return vec_get(prog_fns, i)[F_ADDR];
-    }
-    if kind == SK_FNDESC {
-        return lk_fndescs + 16 * i;
-    }
-    if kind == SK_BTRACE { return lk_btrace; }
-    if kind == SK_IMAGE { return 0; }
-    if kind == SK_ZERO {
-        return lk_zero;
-    }
-    return lk_got + 8 * i;
+fn sym_addr(sym i64) i64 {
+	let kind = sym >> 32
+	let i = sym & 0xffffffff
+	if kind == SK_STR {
+		return vec_get(lk_strs, i)
+	}
+	if kind == SK_VAR {
+		return lk_data + 8 * i
+	}
+	if kind == SK_TSTR {
+		return vec_get(lk_tstrs, i)
+	}
+	if kind == SK_FN {
+		return vec_get(prog_fns, i)[F_ADDR]
+	}
+	if kind == SK_FNDESC {
+		return lk_fndescs + 16 * i
+	}
+	if kind == SK_BTRACE {
+		return lk_btrace
+	}
+	if kind == SK_IMAGE {
+		return 0
+	}
+	if kind == SK_ZERO {
+		return lk_zero
+	}
+	return lk_got + 8 * i
 }
 
-fn w_name16(p, s) {
-    let i = 0;
-    while load8(s + i) != 0 {
-        store8(p + i, load8(s + i));
-        i = i + 1;
-    }
+fn w_name16(p i64, s i64) {
+	mut i = 0
+	for i64(load8(s + i)) != 0 {
+		store8(p + i, i64(load8(s + i)))
+		i = i + 1
+	}
 }
 
 // w_segment writes an LC_SEGMENT_64 header and returns where its sections go.
-fn w_segment(p, name, vmaddr, vmsize, fileoff, filesize, prot, nsects) {
-    put32(p, 0x19);
-    put32(p + 4, 72 + 80 * nsects);
-    w_name16(p + 8, name);
-    put64(p + 24, vmaddr);
-    put64(p + 32, vmsize);
-    put64(p + 40, fileoff);
-    put64(p + 48, filesize);
-    put32(p + 56, prot);
-    put32(p + 60, prot);
-    put32(p + 64, nsects);
-    return p + 72;
+fn w_segment(p i64, name i64, vmaddr i64, vmsize i64, fileoff i64, filesize i64, prot i64, nsects i64) i64 {
+	put32(p, 0x19)
+	put32(p + 4, 72 + 80 * nsects)
+	w_name16(p + 8, name)
+	put64(p + 24, vmaddr)
+	put64(p + 32, vmsize)
+	put64(p + 40, fileoff)
+	put64(p + 48, filesize)
+	put32(p + 56, prot)
+	put32(p + 60, prot)
+	put32(p + 64, nsects)
+	return p + 72
 }
 
-fn w_section(p, name, seg, addr, size, align, flags) {
-    w_name16(p, name);
-    w_name16(p + 16, seg);
-    put64(p + 32, addr);
-    put64(p + 40, size);
-    put32(p + 48, addr - TEXT_BASE);
-    put32(p + 52, align);
-    put32(p + 64, flags);
-    return p + 80;
+fn w_section(p i64, name i64, seg i64, addr i64, size i64, align i64, flags i64) i64 {
+	w_name16(p, name)
+	w_name16(p + 16, seg)
+	put64(p + 32, addr)
+	put64(p + 40, size)
+	put32(p + 48, addr - TEXT_BASE)
+	put32(p + 52, align)
+	put32(p + 64, flags)
+	return p + 80
 }
 
-fn uleb(b, v) {
-    while v >= 128 {
-        buf_byte(b, (v & 127) | 128);
-        v = v >> 7;
-    }
-    buf_byte(b, v);
+fn uleb(b i64, v_in i64) {
+	mut v = v_in
+	for v >= 128 {
+		buf_byte(b, (v & 127) | 128)
+		v = v >> 7
+	}
+	buf_byte(b, v)
 }
 
 // entry_fn is the function dyld starts: main, or __start for programs with a runtime.
-fn entry_fn() {
-    let i = 0;
-    while i < prog_fns[VEC_LEN] {
-        let f = vec_get(prog_fns, i);
-        if streq(f[F_QNAME], "main") && !f[F_EXTERN] {
-            return f;
-        }
-        i = i + 1;
-    }
-    link_fail("no entry point");
+fn entry_fn() i64 {
+	mut i = 0
+	for i < prog_fns[VEC_LEN] {
+		let f = vec_get(prog_fns, i)
+		if streq(f[F_QNAME], cstr("main")) != 0 && f[F_EXTERN] == 0 {
+			return f
+		}
+		i = i + 1
+	}
+	link_fail(cstr("no entry point"))
+	return 0
 }
 
-fn write_executable(path) {
-    let nvars = prog_vars[VEC_LEN];
-    lk_imports = vec_new();
-    let i = 0;
-    while i < prog_fns[VEC_LEN] {
-        let f = vec_get(prog_fns, i);
-        if f[F_EXTERN] && f[F_USED] {
-            f[F_GOT] = lk_imports[VEC_LEN];
-            vec_push(lk_imports, f);
-        }
-        i = i + 1;
-    }
-    let nimp = lk_imports[VEC_LEN];
+fn write_executable(path i64) {
+	let nvars = prog_vars[VEC_LEN]
+	lk_imports = vec_new()
+	mut i = 0
+	for i < prog_fns[VEC_LEN] {
+		let f = vec_get(prog_fns, i)
+		if f[F_EXTERN] != 0 && f[F_USED] != 0 {
+			f[F_GOT] = lk_imports[VEC_LEN]
+			vec_push(lk_imports, f)
+		}
+		i = i + 1
+	}
+	let nimp = lk_imports[VEC_LEN]
 
-    // Addresses: code, stubs, strings, then the data segment.
-    let text_off = align_up(32 + CMDS_SIZE, 16);
-    let text_addr = TEXT_BASE + text_off;
-    lk_labels = vec_filled(g_labels + 1, 0);
-    let pc = text_addr;
-    i = 0;
-    while i < code[VEC_LEN] {
-        let op = vec_get(code, i);
-        if op == I_LABEL {
-            lk_labels[VEC_DATA][vec_get(code, i + 1)] = pc;
-        } else if op == I_FUNC {
-            vec_get(code, i + 1)[F_ADDR] = pc;
-        } else {
-            pc = pc + 4;
-        }
-        i = i + 5;
-    }
-    lk_stubs = pc;
-    pc = pc + 12 * nimp;
-    let text_end = pc;
-    lk_strs = vec_new();
-    i = 0;
-    while i < g_str_ptrs[VEC_LEN] {
-        vec_push(lk_strs, pc);
-        pc = pc + vec_get(g_str_lens, i) + 1;
-        i = i + 1;
-    }
-    let cstr_end = pc;
-    pc = align_up(pc, 8);
-    let const_start = pc;
-    lk_zero = pc;
-    pc = pc + 32;
-    lk_tstrs = vec_new();
-    i = 0;
-    while i < g_tstr_ptrs[VEC_LEN] {
-        vec_push(lk_tstrs, pc);
-        pc = align_up(pc + 8 + vec_get(g_tstr_lens, i) + 1, 8);
-        i = i + 1;
-    }
-    let const_end = pc;
-    let text_size = align_up(const_end - TEXT_BASE, PAGE);
-    let data_vm = TEXT_BASE + text_size;
-    lk_got = data_vm;
-    lk_data = data_vm + 8 * nimp;
-    lk_fndescs = lk_data + 8 * nvars;
-    let data_size = align_up(8 * (nimp + nvars) + 16 * prog_fns[VEC_LEN] + 8, PAGE);
-    let link_off = text_size + data_size;
+	// Addresses: code, stubs, strings, then the data segment.
+	let text_off = align_up(32 + CMDS_SIZE, 16)
+	let text_addr = TEXT_BASE + text_off
+	lk_labels = vec_filled(g_labels + 1, 0)
+	mut pc = text_addr
+	i = 0
+	for i < code[VEC_LEN] {
+		let op = vec_get(code, i)
+		if op == I_LABEL {
+			lk_labels[VEC_DATA][vec_get(code, i + 1)] = pc
+		} else if op == I_FUNC {
+			vec_get(code, i + 1)[F_ADDR] = pc
+		} else {
+			pc = pc + 4
+		}
+		i = i + 5
+	}
+	lk_stubs = pc
+	pc = pc + 12 * nimp
+	let text_end = pc
+	lk_strs = vec_new()
+	i = 0
+	for i < g_str_ptrs[VEC_LEN] {
+		vec_push(lk_strs, pc)
+		pc = pc + vec_get(g_str_lens, i) + 1
+		i = i + 1
+	}
+	let cstr_end = pc
+	pc = align_up(pc, 8)
+	let const_start = pc
+	lk_zero = pc
+	pc = pc + 32
+	lk_tstrs = vec_new()
+	i = 0
+	for i < g_tstr_ptrs[VEC_LEN] {
+		vec_push(lk_tstrs, pc)
+		pc = align_up(pc + 8 + vec_get(g_tstr_lens, i) + 1, 8)
+		i = i + 1
+	}
+	let const_end = pc
+	let text_size = align_up(const_end - TEXT_BASE, PAGE)
+	let data_vm = TEXT_BASE + text_size
+	lk_got = data_vm
+	lk_data = data_vm + 8 * nimp
+	lk_fndescs = lk_data + 8 * nvars
+	let data_size = align_up(8 * (nimp + nvars) + 16 * prog_fns[VEC_LEN] + 8, PAGE)
+	let link_off = text_size + data_size
 
-    // Linkedit contents: bind opcodes, then function symbols and their names.
-    let bind = buf_new();
-    buf_byte(bind, 0x11);
-    i = 0;
-    while i < nimp {
-        buf_byte(bind, 0x40);
-        buf_byte(bind, '_');
-        buf_str(bind, vec_get(lk_imports, i)[F_NAME]);
-        buf_byte(bind, 0);
-        buf_byte(bind, 0x51);
-        buf_byte(bind, 0x72);
-        uleb(bind, 8 * i);
-        buf_byte(bind, 0x90);
-        i = i + 1;
-    }
-    buf_byte(bind, 0);
-    let bind_size = align_up(bind[VEC_LEN], 8);
-    let syms = buf_new();
-    let strs = buf_new();
-    buf_byte(strs, ' ');
-    buf_byte(strs, 0);
-    let nsyms = 0;
-    i = 0;
-    while i < prog_fns[VEC_LEN] {
-        let f = vec_get(prog_fns, i);
-        if !f[F_EXTERN] && f[F_REACH] {
-            buf_reserve(syms, 16);
-            let s = syms[VEC_DATA] + syms[VEC_LEN];
-            put32(s, strs[VEC_LEN]);
-            store8(s + 4, 0x0e);
-            store8(s + 5, 1);
-            store8(s + 6, 0);
-            store8(s + 7, 0);
-            put64(s + 8, f[F_ADDR]);
-            syms[VEC_LEN] = syms[VEC_LEN] + 16;
-            buf_byte(strs, '_');
-            buf_str(strs, f[F_QNAME]);
-            buf_byte(strs, 0);
-            nsyms = nsyms + 1;
-        }
-        i = i + 1;
-    }
-    let sym_off = link_off + bind_size;
-    let str_off = sym_off + syms[VEC_LEN];
-    let str_size = align_up(strs[VEC_LEN], 8);
-    let sig_off = align_up(str_off + str_size, 16);
-    let ident = path;
-    i = 0;
-    while load8(path + i) != 0 {
-        if load8(path + i) == '/' {
-            ident = path + i + 1;
-        }
-        i = i + 1;
-    }
-    let npages = (sig_off + SIG_PAGE - 1) / SIG_PAGE;
-    let cd_size = 88 + strlen(ident) + 1 + 32 * npages;
-    let sig_size = 20 + cd_size;
-    let file_size = sig_off + sig_size;
-    let link_size = file_size - link_off;
+	// Linkedit contents: bind opcodes, then function symbols and their names.
+	let bind_ = buf_new()
+	buf_byte(bind_, 0x11)
+	i = 0
+	for i < nimp {
+		buf_byte(bind_, 0x40)
+		buf_byte(bind_, '_')
+		buf_str(bind_, vec_get(lk_imports, i)[F_NAME])
+		buf_byte(bind_, 0)
+		buf_byte(bind_, 0x51)
+		buf_byte(bind_, 0x72)
+		uleb(bind_, 8 * i)
+		buf_byte(bind_, 0x90)
+		i = i + 1
+	}
+	buf_byte(bind_, 0)
+	let bind_size = align_up(bind_[VEC_LEN], 8)
+	let syms = buf_new()
+	let strs = buf_new()
+	buf_byte(strs, ' ')
+	buf_byte(strs, 0)
+	mut nsyms = 0
+	i = 0
+	for i < prog_fns[VEC_LEN] {
+		let f = vec_get(prog_fns, i)
+		if f[F_EXTERN] == 0 && f[F_REACH] != 0 {
+			buf_reserve(syms, 16)
+			let s = syms[VEC_DATA] + syms[VEC_LEN]
+			put32(s, strs[VEC_LEN])
+			store8(s + 4, 0x0e)
+			store8(s + 5, 1)
+			store8(s + 6, 0)
+			store8(s + 7, 0)
+			put64(s + 8, f[F_ADDR])
+			syms[VEC_LEN] = syms[VEC_LEN] + 16
+			buf_byte(strs, '_')
+			buf_str(strs, f[F_QNAME])
+			buf_byte(strs, 0)
+			nsyms = nsyms + 1
+		}
+		i = i + 1
+	}
+	let sym_off = link_off + bind_size
+	let str_off = sym_off + syms[VEC_LEN]
+	let str_size = align_up(strs[VEC_LEN], 8)
+	let sig_off = align_up(str_off + str_size, 16)
+	mut ident = path
+	i = 0
+	for i64(load8(path + i)) != 0 {
+		if i64(load8(path + i)) == '/' {
+			ident = path + i + 1
+		}
+		i = i + 1
+	}
+	let npages = (sig_off + SIG_PAGE - 1) / SIG_PAGE
+	let cd_size = 88 + strlen(ident) + 1 + 32 * npages
+	let sig_size = 20 + cd_size
+	let file_size = sig_off + sig_size
+	let link_size = file_size - link_off
 
-    mo = calloc(file_size, 1);
+	mo = calloc(file_size, 1)
 
-    // Mach header and load commands.
-    put32(mo, 0xfeedfacf);
-    put32(mo + 4, 0x0100000c);
-    put32(mo + 8, 0);
-    put32(mo + 12, 2);
-    put32(mo + 16, NCMDS);
-    put32(mo + 20, CMDS_SIZE);
-    put32(mo + 24, 0x00200085);
-    let p = mo + 32;
-    p = w_segment(p, "__PAGEZERO", 0, TEXT_BASE, 0, 0, 0, 0);
-    p = w_segment(p, "__TEXT", TEXT_BASE, text_size, 0, text_size, 5, 3);
-    p = w_section(p, "__text", "__TEXT", text_addr, text_end - text_addr, 2, 0x80000400);
-    p = w_section(p, "__cstring", "__TEXT", text_end, cstr_end - text_end, 0, 2);
-    p = w_section(p, "__const", "__TEXT", const_start, const_end - const_start, 3, 0);
-    p = w_segment(p, "__DATA", data_vm, data_size, text_size, data_size, 3, 2);
-    p = w_section(p, "__got", "__DATA", lk_got, 8 * nimp, 3, 0);
-    p = w_section(p, "__data", "__DATA", lk_data, 8 * nvars + 16 * prog_fns[VEC_LEN], 3, 0);
-    p = w_segment(p, "__LINKEDIT", data_vm + data_size, align_up(link_size, PAGE), link_off, link_size, 1, 0);
-    put32(p, 0x80000022);
-    put32(p + 4, 48);
-    put32(p + 16, link_off);
-    put32(p + 20, bind_size);
-    p = p + 48;
-    put32(p, 0x2);
-    put32(p + 4, 24);
-    put32(p + 8, sym_off);
-    put32(p + 12, nsyms);
-    put32(p + 16, str_off);
-    put32(p + 20, str_size);
-    p = p + 24;
-    put32(p, 0xb);
-    put32(p + 4, 80);
-    put32(p + 12, nsyms);
-    put32(p + 16, nsyms);
-    put32(p + 24, nsyms);
-    p = p + 80;
-    put32(p, 0xe);
-    put32(p + 4, 32);
-    put32(p + 8, 12);
-    w_name16(p + 12, "/usr/lib/dyld");
-    p = p + 32;
-    put32(p, 0x1b);
-    put32(p + 4, 24);
-    let uuid_at = p + 8;
-    p = p + 24;
-    put32(p, 0x32);
-    put32(p + 4, 24);
-    put32(p + 8, 1);
-    put32(p + 12, 0x000b0000);
-    put32(p + 16, 0x000e0000);
-    p = p + 24;
-    put32(p, 0x80000028);
-    put32(p + 4, 24);
-    put64(p + 8, entry_fn()[F_ADDR] - TEXT_BASE);
-    p = p + 24;
-    put32(p, 0xc);
-    put32(p + 4, 56);
-    put32(p + 8, 24);
-    put32(p + 12, 2);
-    put32(p + 16, 0x10000);
-    put32(p + 20, 0x10000);
-    w_name16(p + 24, "/usr/lib/libSystem.B.dylib");
-    p = p + 56;
-    put32(p, 0x1d);
-    put32(p + 4, 16);
-    put32(p + 8, sig_off);
-    put32(p + 12, sig_size);
+	// Mach header and load commands.
+	put32(mo, 0xfeedfacf)
+	put32(mo + 4, 0x0100000c)
+	put32(mo + 8, 0)
+	put32(mo + 12, 2)
+	put32(mo + 16, NCMDS)
+	put32(mo + 20, CMDS_SIZE)
+	put32(mo + 24, 0x00200085)
+	mut p = mo + 32
+	p = w_segment(p, cstr("__PAGEZERO"), 0, TEXT_BASE, 0, 0, 0, 0)
+	p = w_segment(p, cstr("__TEXT"), TEXT_BASE, text_size, 0, text_size, 5, 3)
+	p = w_section(p, cstr("__text"), cstr("__TEXT"), text_addr, text_end - text_addr, 2, 0x80000400)
+	p = w_section(p, cstr("__cstring"), cstr("__TEXT"), text_end, cstr_end - text_end, 0, 2)
+	p = w_section(p, cstr("__const"), cstr("__TEXT"), const_start, const_end - const_start, 3, 0)
+	p = w_segment(p, cstr("__DATA"), data_vm, data_size, text_size, data_size, 3, 2)
+	p = w_section(p, cstr("__got"), cstr("__DATA"), lk_got, 8 * nimp, 3, 0)
+	p = w_section(p, cstr("__data"), cstr("__DATA"), lk_data, 8 * nvars + 16 * prog_fns[VEC_LEN], 3, 0)
+	p = w_segment(p, cstr("__LINKEDIT"), data_vm + data_size, align_up(link_size, PAGE), link_off, link_size, 1, 0)
+	put32(p, 0x80000022)
+	put32(p + 4, 48)
+	put32(p + 16, link_off)
+	put32(p + 20, bind_size)
+	p = p + 48
+	put32(p, 0x2)
+	put32(p + 4, 24)
+	put32(p + 8, sym_off)
+	put32(p + 12, nsyms)
+	put32(p + 16, str_off)
+	put32(p + 20, str_size)
+	p = p + 24
+	put32(p, 0xb)
+	put32(p + 4, 80)
+	put32(p + 12, nsyms)
+	put32(p + 16, nsyms)
+	put32(p + 24, nsyms)
+	p = p + 80
+	put32(p, 0xe)
+	put32(p + 4, 32)
+	put32(p + 8, 12)
+	w_name16(p + 12, cstr("/usr/lib/dyld"))
+	p = p + 32
+	put32(p, 0x1b)
+	put32(p + 4, 24)
+	let uuid_at = p + 8
+	p = p + 24
+	put32(p, 0x32)
+	put32(p + 4, 24)
+	put32(p + 8, 1)
+	put32(p + 12, 0x000b0000)
+	put32(p + 16, 0x000e0000)
+	p = p + 24
+	put32(p, 0x80000028)
+	put32(p + 4, 24)
+	put64(p + 8, entry_fn()[F_ADDR] - TEXT_BASE)
+	p = p + 24
+	put32(p, 0xc)
+	put32(p + 4, 56)
+	put32(p + 8, 24)
+	put32(p + 12, 2)
+	put32(p + 16, 0x10000)
+	put32(p + 20, 0x10000)
+	w_name16(p + 24, cstr("/usr/lib/libSystem.B.dylib"))
+	p = p + 56
+	put32(p, 0x1d)
+	put32(p + 4, 16)
+	put32(p + 8, sig_off)
+	put32(p + 12, sig_size)
 
-    // Machine code, then the import stubs: adrp x16, got; ldr x16, [x16, got]; br x16.
-    let q = mo + text_off;
-    i = 0;
-    pc = text_addr;
-    while i < code[VEC_LEN] {
-        let op = vec_get(code, i);
-        if op != I_LABEL && op != I_FUNC {
-            put32(q, encode(code[VEC_DATA] + 8 * i, pc));
-            q = q + 4;
-            pc = pc + 4;
-        }
-        i = i + 5;
-    }
-    let stub = vec_new();
-    vec_push(stub, I_ADRP);
-    vec_push(stub, X16);
-    vec_push(stub, 0);
-    vec_push(stub, 0);
-    vec_push(stub, 0);
-    i = 0;
-    while i < nimp {
-        let got = sym_ref(SK_GOT, i);
-        stub[VEC_DATA][0] = I_ADRP;
-        stub[VEC_DATA][1] = X16;
-        stub[VEC_DATA][2] = got;
-        put32(q, encode(stub[VEC_DATA], pc));
-        stub[VEC_DATA][0] = I_LDRLO;
-        stub[VEC_DATA][2] = X16;
-        stub[VEC_DATA][3] = got;
-        put32(q + 4, encode(stub[VEC_DATA], pc + 4));
-        put32(q + 8, 0xD61F0200);
-        q = q + 12;
-        pc = pc + 12;
-        i = i + 1;
-    }
-    i = 0;
-    while i < g_str_ptrs[VEC_LEN] {
-        memcpy(mo + vec_get(lk_strs, i) - TEXT_BASE, vec_get(g_str_ptrs, i), vec_get(g_str_lens, i));
-        i = i + 1;
-    }
-    i = 0;
-    while i < g_tstr_ptrs[VEC_LEN] {
-        let at = mo + vec_get(lk_tstrs, i) - TEXT_BASE;
-        put64(at, vec_get(g_tstr_lens, i));
-        memcpy(at + 8, vec_get(g_tstr_ptrs, i), vec_get(g_tstr_lens, i));
-        i = i + 1;
-    }
-    i = 0;
-    while i < nvars {
-        put64(mo + text_size + 8 * nimp + 8 * i, vec_get(prog_vars, i)[D_VAL]);
-        i = i + 1;
-    }
-    memcpy(mo + link_off, bind[VEC_DATA], bind[VEC_LEN]);
-    memcpy(mo + sym_off, syms[VEC_DATA], syms[VEC_LEN]);
-    memcpy(mo + str_off, strs[VEC_DATA], strs[VEC_LEN]);
+	// Machine code, then the import stubs: adrp x16, got; ldr x16, [x16, got]; br x16.
+	mut q = mo + text_off
+	i = 0
+	pc = text_addr
+	for i < code[VEC_LEN] {
+		let op = vec_get(code, i)
+		if op != I_LABEL && op != I_FUNC {
+			put32(q, encode(code[VEC_DATA] + 8 * i, pc))
+			q = q + 4
+			pc = pc + 4
+		}
+		i = i + 5
+	}
+	let stub = vec_new()
+	vec_push(stub, I_ADRP)
+	vec_push(stub, X16)
+	vec_push(stub, 0)
+	vec_push(stub, 0)
+	vec_push(stub, 0)
+	i = 0
+	for i < nimp {
+		let got = sym_ref(SK_GOT, i)
+		stub[VEC_DATA][0] = I_ADRP
+		stub[VEC_DATA][1] = X16
+		stub[VEC_DATA][2] = got
+		put32(q, encode(stub[VEC_DATA], pc))
+		stub[VEC_DATA][0] = I_LDRLO
+		stub[VEC_DATA][2] = X16
+		stub[VEC_DATA][3] = got
+		put32(q + 4, encode(stub[VEC_DATA], pc + 4))
+		put32(q + 8, 0xD61F0200)
+		q = q + 12
+		pc = pc + 12
+		i = i + 1
+	}
+	i = 0
+	for i < g_str_ptrs[VEC_LEN] {
+		memcpy(mo + vec_get(lk_strs, i) - TEXT_BASE, vec_get(g_str_ptrs, i), vec_get(g_str_lens, i))
+		i = i + 1
+	}
+	i = 0
+	for i < g_tstr_ptrs[VEC_LEN] {
+		let at = mo + vec_get(lk_tstrs, i) - TEXT_BASE
+		put64(at, vec_get(g_tstr_lens, i))
+		memcpy(at + 8, vec_get(g_tstr_ptrs, i), vec_get(g_tstr_lens, i))
+		i = i + 1
+	}
+	i = 0
+	for i < nvars {
+		put64(mo + text_size + 8 * nimp + 8 * i, vec_get(prog_vars, i)[D_VAL])
+		i = i + 1
+	}
+	memcpy(mo + link_off, bind_[VEC_DATA], bind_[VEC_LEN])
+	memcpy(mo + sym_off, syms[VEC_DATA], syms[VEC_LEN])
+	memcpy(mo + str_off, strs[VEC_DATA], strs[VEC_LEN])
 
-    // The UUID is a hash of the code, so identical builds are byte-identical.
-    let digest = malloc(32);
-    sha256(mo + text_off, const_end - text_addr, digest);
-    memcpy(uuid_at, digest, 16);
-    store8(uuid_at + 6, (load8(uuid_at + 6) & 15) | 0x40);
-    store8(uuid_at + 8, (load8(uuid_at + 8) & 63) | 0x80);
+	// The UUID is a hash of the code, so identical builds are byte-identical.
+	let digest = malloc(32)
+	sha256(mo + text_off, const_end - text_addr, digest)
+	memcpy(uuid_at, digest, 16)
+	store8(uuid_at + 6, (i64(load8(uuid_at + 6)) & 15) | 0x40)
+	store8(uuid_at + 8, (i64(load8(uuid_at + 8)) & 63) | 0x80)
 
-    // Ad-hoc code signature: a CodeDirectory hashing every 4 KiB page before it.
-    let sig = mo + sig_off;
-    put32be(sig, 0xfade0cc0);
-    put32be(sig + 4, sig_size);
-    put32be(sig + 8, 1);
-    put32be(sig + 12, 0);
-    put32be(sig + 16, 20);
-    let cd = sig + 20;
-    let hash_off = 88 + strlen(ident) + 1;
-    put32be(cd, 0xfade0c02);
-    put32be(cd + 4, cd_size);
-    put32be(cd + 8, 0x20400);
-    put32be(cd + 12, 0x20002);
-    put32be(cd + 16, hash_off);
-    put32be(cd + 20, 88);
-    put32be(cd + 24, 0);
-    put32be(cd + 28, npages);
-    put32be(cd + 32, sig_off);
-    store8(cd + 36, 32);
-    store8(cd + 37, 2);
-    store8(cd + 38, 0);
-    store8(cd + 39, 12);
-    put64be(cd + 64, 0);
-    put64be(cd + 72, text_size);
-    put64be(cd + 80, 1);
-    memcpy(cd + 88, ident, strlen(ident));
-    i = 0;
-    while i < npages {
-        let n = SIG_PAGE;
-        if sig_off - i * SIG_PAGE < n {
-            n = sig_off - i * SIG_PAGE;
-        }
-        sha256(mo + i * SIG_PAGE, n, cd + hash_off + 32 * i);
-        i = i + 1;
-    }
+	// Ad-hoc code signature: a CodeDirectory hashing every 4 KiB page before it.
+	let sig = mo + sig_off
+	put32be(sig, 0xfade0cc0)
+	put32be(sig + 4, sig_size)
+	put32be(sig + 8, 1)
+	put32be(sig + 12, 0)
+	put32be(sig + 16, 20)
+	let cd = sig + 20
+	let hash_off = 88 + strlen(ident) + 1
+	put32be(cd, 0xfade0c02)
+	put32be(cd + 4, cd_size)
+	put32be(cd + 8, 0x20400)
+	put32be(cd + 12, 0x20002)
+	put32be(cd + 16, hash_off)
+	put32be(cd + 20, 88)
+	put32be(cd + 24, 0)
+	put32be(cd + 28, npages)
+	put32be(cd + 32, sig_off)
+	store8(cd + 36, 32)
+	store8(cd + 37, 2)
+	store8(cd + 38, 0)
+	store8(cd + 39, 12)
+	put64be(cd + 64, 0)
+	put64be(cd + 72, text_size)
+	put64be(cd + 80, 1)
+	memcpy(cd + 88, ident, strlen(ident))
+	i = 0
+	for i < npages {
+		mut n = SIG_PAGE
+		if sig_off - i * SIG_PAGE < n {
+			n = sig_off - i * SIG_PAGE
+		}
+		sha256(mo + i * SIG_PAGE, n, cd + hash_off + 32 * i)
+		i = i + 1
+	}
 
-    // A fresh inode keeps the kernel from reusing a stale cached signature.
-    rt_sys_unlink(path);
-    let fd = rt_sys_creat(path, 493);
-    if (fd & 0x80000000) != 0 {
-        let e = err_code(NO_POS, "E904 CANNOT_CREATE");
-        buf_str(e, "cannot create ");
-        buf_str(e, path);
-        fatal(e);
-    }
-    let img = malloc(24);
-    img[VEC_LEN] = file_size;
-    img[VEC_CAP] = file_size;
-    img[VEC_DATA] = mo;
-    write_all(fd, img);
-    rt_sys_close(fd);
+	// A fresh inode keeps the kernel from reusing a stale cached signature.
+	rt_sys_unlink(path)
+	let fd = rt_sys_creat(path, 493)
+	if (fd & 0x80000000) != 0 {
+		let e = err_code(NO_POS, cstr("E904 CANNOT_CREATE"))
+		buf_str(e, cstr("cannot create "))
+		buf_str(e, path)
+		fatal(e)
+	}
+	let img = malloc(24)
+	img[VEC_LEN] = file_size
+	img[VEC_CAP] = file_size
+	img[VEC_DATA] = mo
+	write_all(fd, img)
+	rt_sys_close(fd)
 }

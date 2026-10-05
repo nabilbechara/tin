@@ -5,7 +5,7 @@ import re
 ROOT = Path(__file__).resolve().parents[2]
 TARGETS = ('linux-arm64', 'linux-amd64')
 EXTERN = re.compile(r'\bextern\s+(?:func|fn)\s+([A-Za-z_][A-Za-z_0-9]*)\s*\(')
-IMPORT = re.compile(r'\bel_import\s*\(\s*"([A-Za-z_][A-Za-z_0-9]*)"\s*\)')
+IMPORT = re.compile(r'\bel_import\s*\(\s*(?:cstr\s*\(\s*)?"([A-Za-z_][A-Za-z_0-9]*)"\s*\)')
 LEXEME = re.compile(r'"(?:\\.|[^"\\])*"|`[^`]*`|//[^\n]*|/\*.*?\*/', re.S)
 
 

@@ -21,20 +21,20 @@ def generate():
             subprocess.run(['clang', '-target', target, '-c', str(ROOT/f'tools/arch/aes-gcm-{arch}.S'), '-o', str(obj)], check=True)
             table = functions(obj, NAMES[arch])
             text += ['', f'// aes_hw_{arch} is the machine code of seal.NAME (NAME without the package), or 0.',
-                     f'fn aes_hw_{arch}(name) {{', '    let hex=0;']
+                     f'fn aes_hw_{arch}(name i64) i64 {{', '\tmut hex = 0']
             for name in NAMES[arch]:
                 data = table[name]
                 if arch == 'arm64':
                     data = ''.join(f'{v[0]:08x}' for v in struct.iter_unpack('<I', data))
                 else:
                     data = data.hex()
-                text.append(f'    if streq(name,"seal.{name}") {{ hex="{data}"; }}')
-            text += ['    if !hex { return 0; }', '    let v=vec_new(); let i=0;', '    while load8(hex+i) != 0 {']
+                text += [f'\tif streq(name, cstr("seal.{name}")) != 0 {{', f'\t\thex = cstr("{data}")', '\t}']
+            text += ['\tif hex == 0 {', '\t\treturn 0', '\t}', '\tlet v = vec_new()', '\tmut i = 0', '\tfor i64(load8(hex + i)) != 0 {']
             if arch == 'arm64':
-                text.append('        raw(v,hex_word(hex+i)); i=i+8;')
+                text += ['\t\traw(v, hex_word(hex + i))', '\t\ti = i + 8']
             else:
-                text.append('        vec_push(v,num_digit(load8(hex+i))*16+num_digit(load8(hex+i+1))); i=i+2;')
-            text += ['    }', '    return v;', '}']
+                text += ['\t\tvec_push(v, num_digit(i64(load8(hex + i))) * 16 + num_digit(i64(load8(hex + i + 1))))', '\t\ti = i + 2']
+            text += ['\t}', '\treturn v', '}']
     return '\n'.join(text)+'\n'
 
 
