@@ -476,17 +476,45 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   `rt_task_wait` on `EAGAIN`. `Conn.SetTimeout` bounds each wait; past it the call fails
   with `wire: read timed out` (or connect/write), past the deadline with `deadline exceeded`.
 - Linux DNS uses nonblocking UDP/TCP sockets and task waits (docs/STDLIB.md, wire contract).
-- Work with no non-blocking form (macOS DNS `getaddrinfo`, file reads and writes in `quarry`)
-  goes to shared helper threads: as many as there are cores, at least 4 (`TIN_HELPERS` sets the
+- Work with no non-blocking form (macOS DNS `getaddrinfo`, `quarry` file reads and writes that
+  do not go through io_uring (below), anvil's `SendFile`) goes to shared helper threads: as many
+  as there are cores, at least 4 (`TIN_HELPERS` sets the
   number, 1 to 256). `rt_helper_run(f, job, drop)` queues a heap-owned job, signals a
   non-blocking wake pipe and parks within the request deadline. A core may have 4096 jobs out
   at once; its next task waits for one to finish (woken by the completion on its own core),
-  within its deadline, instead of failing (#357). Not done: `io_uring` on Linux.
+  within its deadline, instead of failing (#357).
   A helper runs `f(job)` and writes the completion to the owning core's done pipe.
   Inputs and results live outside request pools, so an expired request may return and
   reuse its task safely. A late completion calls `drop(job)` and never resumes the old
   task. Already-running system calls can still finish after the caller's deadline;
   their results are discarded. Outside a task the helper runs synchronously.
+- File I/O through io_uring (Linux, #357, `lib/runtime/uring_linux.tin`): inside a server's
+  task, `quarry.ReadFile`, `WriteFile` and `AppendFile` use the core's own ring, made the first
+  time one of its tasks opens a file (256 submission and 4096 completion entries, no SQPOLL
+  thread; raw `io_uring_setup`/`enter`/`register`, 425 to 427 on both CPUs). Each operation
+  (openat, read, write, close) is one submission and one `io_uring_enter`; the task then takes
+  every completion already posted, so data in the page cache, read with a length of exactly
+  the file's size (a short read of a regular file would make the kernel finish it on a
+  worker), arrives without a wait. Otherwise the task parks (`rt_task_park`) until the core's
+  event loop sees the ring's descriptor readable (anvil watches it, level-triggered, through
+  `ringHook`) and `rt_ring_reap` wakes it. An open that creates or truncates, and any operation
+  the file system cannot do without blocking, runs on the kernel's io-wq workers, threads of
+  the process named `iou-wrk-*`. The ring's head and tail are u32 words read with acquire and
+  written with release order through the 64-bit atomics on their aligned words. Buffers the
+  kernel writes or reads are heap memory: a task whose deadline or cancel ends its wait leaves
+  the operation to the ring, whose completion frees the buffer and closes the descriptor (or
+  the one a late open made). A core has at most 4096 operations in flight; its next task
+  waits for one to end, within its deadline. The stat after the open and the close of a file
+  read run on the core (local file systems answer them from memory). Helper threads keep: a
+  FIFO, whose ring open does not wait for a writer (the helper's own open does, and the ring's
+  descriptor stays open until it returns, so a waiting writer always sees a reader); files on
+  FUSE, virtiofs, 9p and CIFS mounts, whose stat and close wait for a daemon or a server (mount
+  points from `/proc/self/mountinfo`, read once per core and matched by the path as written,
+  relative paths through `getcwd`); `TIN_IO_URING=0`; and kernels without io_uring, its
+  operations (5.6) or its features (5.5), or that refuse it (`io_uring_disabled`, or a seccomp
+  profile: the default ones of recent Docker and containerd releases refuse io_uring, so a
+  container under them uses the helper threads unless its profile allows the three calls).
+  With the ring a FIFO read may hold one descriptor per waiting request.
 - Standard input and streams (#316): inside a task, when the descriptor is a pipe, socket or
   terminal, `quarry.ReadStdin` and `flume.Reader` wait with `rt_task_wait(fd, 1, 0)` before
   each read and fail with `rt_wait_fault()`; a flume reader's wait fault is cleared by its next

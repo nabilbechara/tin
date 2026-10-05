@@ -1,0 +1,346 @@
+// io_uring for quarry's file reads and writes on Linux (#357). A core makes its own ring the
+// first time one of its request tasks opens a file (one ring per core, no SQPOLL thread). A task
+// submits one operation and takes every completion already posted: data in the page cache is
+// read during the submit, so the task goes on at once. Otherwise it parks; the event loop
+// watches the ring's descriptor and the completion wakes the task. TIN_IO_URING=0, a kernel
+// without io_uring or its operations (before 5.6), or one that refuses it (seccomp, EPERM) keep
+// the helper threads. The system call numbers are the same on arm64 and x86-64.
+
+const sysIoUringSetup = 425
+const sysIoUringEnter = 426
+const sysIoUringRegister = 427
+const ringEntries = 256    // submission queue entries: one operation goes in per enter
+const ringCqEntries = 4096 // completion queue entries: at least ringMaxOps, so it never overflows
+const ringMaxOps = 4096    // operations a core may have in flight; its next task waits for one to end
+const ringGone = -4096     // an rt_ring_* result: the task's deadline or a cancel ended its wait
+const ringOpOpen = 18      // IORING_OP_OPENAT
+const ringOpClose = 19
+const ringOpRead = 22
+const ringOpWrite = 23
+const ringAtCwd = -100     // AT_FDCWD
+
+mut ringFd i64       // per core: the ring's descriptor (valid while ringState is 1)
+mut ringHook fn(i64) // per core (set by a server): watch the ring's descriptor for reading, level-triggered
+mut ringState i64     // per core: 0 not tried, 1 ready, 2 not available
+mut ringSqTail i64    // addresses in the mapped rings, and the two masks
+mut ringSqMask i64
+mut ringSqArray i64
+mut ringSqes i64
+mut ringCqHead i64
+mut ringCqTail i64
+mut ringCqMask i64
+mut ringCqes i64
+mut ringTail i64      // the next submission index (only this core writes it)
+mut ringHead i64      // the next completion index (only this core reads completions)
+mut ringInflight i64
+mut ringWaitHead i64  // tasks waiting for room: records [task, next, gone]
+mut ringWaitTail i64
+
+// An operation's record (heap; its address is the user_data of its completion).
+const roTask = 0
+const roRes = 1
+const roDone = 2
+const roGone = 3  // 1: its task gave up; the completion releases what it holds
+const roKind = 4
+const roFd = 5    // a descriptor to close if its task gave up, or -1
+const roOwn = 6   // a buffer to free if its task gave up, or 0
+const roWords = 7
+
+// ring_load32 reads a u32 the kernel writes, with acquire order (an atomic load of its aligned word).
+fn ring_load32(p i64) i64 {
+	let a = p & -8
+	let w = __atomic_load(a)
+	if p == a {
+		return w & 0xffffffff
+	}
+	return (w >> 32) & 0xffffffff
+}
+
+// ring_store32 writes a u32 the kernel reads, with release order: a compare-and-swap of its
+// aligned word keeps the other half as it is (the kernel may write it).
+fn ring_store32(p i64, v i64) {
+	let a = p & -8
+	for {
+		let old = __atomic_load(a)
+		mut nw = (old & -4294967296) | (v & 0xffffffff)
+		if p != a {
+			nw = (old & 0xffffffff) | ((v & 0xffffffff) << 32)
+		}
+		if __atomic_cas(a, old, nw) == old {
+			return
+		}
+	}
+}
+
+fn ring_u32(p i64) i64 {
+	return __ld(p, 2) & 0xffffffff
+}
+
+// rt_ring_ready reports whether the running task's file operations go through this core's ring:
+// inside a server's task, on a kernel that has io_uring, unless TIN_IO_URING=0.
+fn rt_ring_ready() bool {
+	if ringState == 1 {
+		return curTask != 0
+	}
+	if ringState == 2 || curTask == 0 || cast(i64, ringHook) == 0 {
+		return false
+	}
+	return ring_setup()
+}
+
+// ring_setup makes this core's ring once: io_uring_setup, the probe for its four operations, the
+// two mappings, and the event loop's watch on its descriptor. False: use the helper threads.
+fn ring_setup() bool {
+	ringState = 2
+	let env = rt_getenv(cast(i64, "TIN_IO_URING") + 8)
+	if env != 0 && i64(load8(env)) == '0' && i64(load8(env+1)) == 0 {
+		return false
+	}
+	let p = calloc(15, 8) // struct io_uring_params, 120 bytes
+	__st(p+4, ringCqEntries, 2)
+	__st(p+8, 8|16, 2) // IORING_SETUP_CQSIZE | IORING_SETUP_CLAMP
+	let fd = linux_raw(sysIoUringSetup, ringEntries, p, 0, 0, 0, 0)
+	if fd < 0 {
+		free(p)
+		return false
+	}
+	// SINGLE_MMAP, NODROP and SUBMIT_STABLE (5.5): a path is copied when its operation is submitted.
+	if ring_u32(p+20)&7 != 7 || !ring_probe(fd) {
+		rt_sys_close(fd)
+		free(p)
+		return false
+	}
+	let sqN = ring_u32(p)
+	let cqN = ring_u32(p+4)
+	let sqo = p + 40
+	let cqo = p + 80
+	let size = max(ring_u32(sqo+24)+sqN*4, ring_u32(cqo+20)+cqN*16)
+	let ring = rt_sys_mmap(0, size, 3, 1|0x8000, fd, 0) // PROT_READ|PROT_WRITE, MAP_SHARED|MAP_POPULATE
+	if ring < 0 {
+		rt_sys_close(fd)
+		free(p)
+		return false
+	}
+	let sqes = rt_sys_mmap(0, sqN*64, 3, 1|0x8000, fd, 0x10000000) // IORING_OFF_SQES
+	if sqes < 0 {
+		rt_sys_munmap(ring, size)
+		rt_sys_close(fd)
+		free(p)
+		return false
+	}
+	ringSqTail = ring + ring_u32(sqo+4)
+	ringSqMask = ring_u32(ring + ring_u32(sqo+8))
+	ringSqArray = ring + ring_u32(sqo+24)
+	ringSqes = sqes
+	ringCqHead = ring + ring_u32(cqo)
+	ringCqTail = ring + ring_u32(cqo+4)
+	ringCqMask = ring_u32(ring + ring_u32(cqo+8))
+	ringCqes = ring + ring_u32(cqo+20)
+	ringTail = ring_load32(ringSqTail)
+	ringHead = ring_load32(ringCqHead)
+	free(p)
+	ringFd = fd
+	ringHook(fd)
+	ringState = 1
+	return true
+}
+
+// ring_probe reports whether the kernel's io_uring has openat, close, read and write.
+fn ring_probe(fd i64) bool {
+	let n = 64
+	let pr = calloc(2+n, 8) // struct io_uring_probe: 16 bytes, then 8 per operation
+	mut ok = linux_raw(sysIoUringRegister, fd, 8, pr, n, 0, 0) >= 0 // IORING_REGISTER_PROBE
+	ok = ok && ring_has(pr, ringOpOpen) && ring_has(pr, ringOpClose) && ring_has(pr, ringOpRead) && ring_has(pr, ringOpWrite)
+	free(pr)
+	return ok
+}
+
+// ring_has reports whether a probe result marks operation op IO_URING_OP_SUPPORTED.
+fn ring_has(pr i64, op i64) bool {
+	return __ld(pr+16+op*8+2, 1)&1 != 0
+}
+
+// ring_submit puts one operation in the submission queue and enters the kernel: 1, or -errno
+// when the kernel took nothing (the entry is withdrawn).
+fn ring_submit(op i64, kind i64, fd i64, addr i64, n i64, off i64, flags i64) i64 {
+	let idx = ringTail & ringSqMask
+	let sqe = ringSqes + idx*64
+	sqe[0] = kind | ((fd & 0xffffffff) << 32) // opcode, flags 0, ioprio 0, fd
+	sqe[1] = off
+	sqe[2] = addr
+	sqe[3] = (n & 0xffffffff) | ((flags & 0xffffffff) << 32) // len, open_flags or rw_flags
+	sqe[4] = op
+	sqe[5] = 0
+	sqe[6] = 0
+	sqe[7] = 0
+	__st(ringSqArray+idx*4, idx, 2)
+	let before = ringTail
+	ringTail = (ringTail + 1) & 0xffffffff
+	ring_store32(ringSqTail, ringTail)
+	for {
+		let r = linux_raw(sysIoUringEnter, ringFd, 1, 0, 0, 0, 0)
+		if r == 1 {
+			return 1
+		}
+		if r != -EINTR {
+			// Without SQPOLL the kernel reads the queue only inside io_uring_enter.
+			ringTail = before
+			ring_store32(ringSqTail, before)
+			if r >= 0 {
+				return -EAGAIN
+			}
+			return r
+		}
+	}
+	return -EAGAIN
+}
+
+// rt_ring_reap takes every completion posted on this core's ring: the task of a finished
+// operation is woken (the event loop resumes it), and an operation whose task gave up releases
+// what it held. The event loop calls it when the ring's descriptor is readable.
+fn rt_ring_reap() {
+	if ringState != 1 {
+		return
+	}
+	mut head = ringHead
+	mut tail = ring_load32(ringCqTail)
+	for head != tail {
+		for head != tail {
+			let cqe = ringCqes + (head & ringCqMask)*16
+			let op = cqe[0]
+			let res = i64(i32(__ld(cqe+8, 2)))
+			head = (head + 1) & 0xffffffff
+			if op != 0 {
+				ring_done(op, res)
+			}
+		}
+		tail = ring_load32(ringCqTail)
+	}
+	ringHead = head
+	ring_store32(ringCqHead, head)
+}
+
+// ring_room notes that an operation ended: a task waiting for room goes first now that there is
+// some (records of tasks that gave up are freed on the way).
+fn ring_room() {
+	ringInflight -= 1
+	for ringWaitHead != 0 {
+		let w = ringWaitHead
+		ringWaitHead = w[1]
+		if ringWaitHead == 0 {
+			ringWaitTail = 0
+		}
+		if w[2] != 0 {
+			free(w)
+			continue
+		}
+		rt_task_wake(w[0])
+		break
+	}
+}
+
+fn ring_done(op i64, res i64) {
+	ring_room()
+	if op[roGone] != 0 {
+		// Its task gave up: the kernel is done with the buffer and the descriptor now.
+		if op[roKind] == ringOpOpen && res >= 0 {
+			rt_sys_close(res)
+		}
+		if op[roFd] >= 0 {
+			rt_sys_close(op[roFd])
+		}
+		free(op[roOwn])
+		free(op)
+		return
+	}
+	op[roRes] = res
+	op[roDone] = 1
+	if op[roTask] != curTask {
+		rt_task_wake(op[roTask])
+	}
+}
+
+// ring_call runs one operation for the running task and waits for its result: >= 0, -errno,
+// or ringGone when the task's deadline or a cancel ended the wait. After ringGone the ring
+// closes closeFd (when >= 0) and frees own once the kernel no longer uses them.
+fn ring_call(kind i64, fd i64, addr i64, n i64, off i64, flags i64, closeFd i64, own i64) i64 {
+	let t = curTask
+	if (t[tDeadline] > 0 && rt_mono_ns() >= t[tDeadline]) || rt_bnd_stopped() {
+		ring_release(kind, fd, closeFd, own)
+		return ringGone
+	}
+	// At most ringMaxOps operations of this core are in flight; the next task waits for one to
+	// end, within its deadline, as for helper jobs.
+	for ringInflight >= ringMaxOps {
+		let w = calloc(3, 8)
+		w[0] = t
+		if ringWaitTail == 0 {
+			ringWaitHead = w
+		} else {
+			ringWaitTail[1] = w
+		}
+		ringWaitTail = w
+		if rt_task_park(0) == waitDeadline {
+			w[2] = 1 // the waker frees the record when it reaches it
+			ring_release(kind, fd, closeFd, own)
+			return ringGone
+		}
+		free(w)
+	}
+	let op = calloc(roWords, 8)
+	op[roTask] = t
+	op[roKind] = kind
+	op[roFd] = closeFd
+	op[roOwn] = own
+	ringInflight += 1
+	let r = ring_submit(op, kind, fd, addr, n, off, flags)
+	if r != 1 {
+		ringInflight -= 1
+		free(op)
+		return r
+	}
+	rt_ring_reap()
+	for op[roDone] == 0 {
+		if rt_task_park(0) == waitDeadline && op[roDone] == 0 {
+			op[roGone] = 1
+			return ringGone
+		}
+	}
+	let res = op[roRes]
+	free(op)
+	return res
+}
+
+// ring_release gives up an operation that was never submitted, as its completion would have.
+fn ring_release(kind i64, fd i64, closeFd i64, own i64) {
+	if kind == ringOpClose {
+		rt_sys_close(fd)
+	}
+	if closeFd >= 0 {
+		rt_sys_close(closeFd)
+	}
+	free(own)
+}
+
+// rt_ring_open opens path (a NUL-terminated string, copied when submitted) with flags and mode:
+// the descriptor, -errno, or ringGone.
+fn rt_ring_open(path i64, flags i64, mode i64) i64 {
+	return ring_call(ringOpOpen, ringAtCwd, path, mode, 0, flags, -1, 0)
+}
+
+// rt_ring_read reads up to n bytes of fd at its position into buf, which must be heap memory
+// that own frees: the count, 0 at the end, -errno, or ringGone (the ring then closes fd and
+// frees own).
+fn rt_ring_read(fd i64, buf i64, n i64, own i64) i64 {
+	return ring_call(ringOpRead, fd, buf, n, -1, 0, fd, own)
+}
+
+// rt_ring_write writes up to n bytes of buf to fd at its position, as rt_ring_read reads.
+fn rt_ring_write(fd i64, buf i64, n i64, own i64) i64 {
+	return ring_call(ringOpWrite, fd, buf, n, -1, 0, fd, own)
+}
+
+// rt_ring_close closes fd: 0, -errno (a write the file system reports late), or ringGone.
+fn rt_ring_close(fd i64) i64 {
+	return ring_call(ringOpClose, fd, 0, 0, 0, 0, -1, 0)
+}

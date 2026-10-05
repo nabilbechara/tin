@@ -41,6 +41,11 @@ fn pathFault(op str, path str) ! {
 	fail say.Fault("%s %s: %s", op, path, e)
 }
 
+// pathFaultCode is pathFault for error code e (an io_uring result is -e).
+fn pathFaultCode(op str, path str, e i64) ! {
+	fail say.Fault("%s %s: %s", op, path, errnoText(e))
+}
+
 // badPath reports whether path holds a NUL byte, which no C path can carry.
 fn badPath(path str) bool {
 	return len(path) > 0 && memchr(cast(i64, path)+8, 0, len(path)) != 0
@@ -156,19 +161,200 @@ fn ReadFile(path str) !str {
 		return try rt_effect(tp, "quarry.read@1", path, readLive) // recorded for replay (#241)
 	}
 	if rt_task_current() == 0 {
-		return try readFileHere(path)
+		return try readFileHere(path, -1)
 	}
-	// Inside a request task the read runs on a helper thread while the core serves others.
-	let job = calloc(5, 8)
+	// Inside a request task the read goes through the core's io_uring (Linux, #357), or runs
+	// on a helper thread; either way the core serves others meanwhile.
+	if useRing(path) {
+		return try readRing(path)
+	}
+	return try readOnHelper(path, -1)
+}
+
+// Mount points of file systems whose stat and close can wait for a user-space daemon or a
+// remote server (FUSE, virtiofs, 9p, CIFS): a file under one keeps the helper threads, so a core
+// never waits for them in its own thread (#357). Read from /proc/self/mountinfo, per core, when
+// the core first uses its ring; matched against the path as written.
+mut slowMounts []str
+mut slowMountsRead bool
+
+// useRing reports whether this task's operation on path goes through the core's io_uring.
+fn useRing(path str) bool {
+	if !rt_ring_ready() {
+		return false
+	}
+	if !slowMountsRead {
+		slowMountsRead = true
+		let (text, err) = readFileHere("/proc/self/mountinfo", -1)
+		if err == nil {
+			slowMounts = keep(slowMountsIn(text))
+		}
+	}
+	if len(slowMounts) == 0 {
+		return true
+	}
+	mut abs = path
+	if len(path) == 0 || path[0] != '/' {
+		if rt_sys_getcwd(pathbuf, 4096) == 0 {
+			return false
+		}
+		abs = rt_str_from_raw(pathbuf, strlen(pathbuf)) + "/" + path
+	}
+	return !underAny(abs, slowMounts)
+}
+
+// underAny reports whether the absolute path p is one of dirs or inside one of them.
+fn underAny(p str, dirs []str) bool {
+	for d in dirs {
+		let n = len(d)
+		if d == "/" || (len(p) >= n && p[0:n] == d && (len(p) == n || p[n] == '/')) {
+			return true
+		}
+	}
+	return false
+}
+
+// slowMountsIn lists the mount points of slow file systems in mountinfo text, whose lines are
+// "id parent major:minor root mountpoint options [tags...] - fstype source options".
+fn slowMountsIn(text str) []str {
+	mut out = make([]str, 0, 4)
+	mut start = 0
+	for i in 0..len(text)+1 {
+		if i < len(text) && text[i] != '\n' {
+			continue
+		}
+		let fields = splitSpaces(text[start:i])
+		start = i + 1
+		for k in 5..len(fields)-1 {
+			if fields[k] == "-" {
+				let t = fields[k+1]
+				if t == "fuse" || t == "fuseblk" || (len(t) > 5 && t[0:5] == "fuse.") || t == "virtiofs" || t == "9p" || t == "cifs" || t == "smb3" {
+					out = append(out, unescapeMount(fields[4]))
+				}
+				break
+			}
+		}
+	}
+	return out
+}
+
+fn splitSpaces(line str) []str {
+	mut out = make([]str, 0, 12)
+	mut start = 0
+	for i in 0..len(line)+1 {
+		if i == len(line) || line[i] == ' ' {
+			if i > start {
+				out = append(out, line[start:i])
+			}
+			start = i + 1
+		}
+	}
+	return out
+}
+
+// unescapeMount undoes mountinfo's octal escapes (\040 for a space, \134 for a backslash).
+fn unescapeMount(s str) str {
+	mut b = make([]u8, 0, len(s))
+	mut i = 0
+	for i < len(s) {
+		if s[i] == '\\' && i+3 < len(s) && s[i+1] >= '0' && s[i+1] <= '3' && s[i+2] >= '0' && s[i+2] <= '7' && s[i+3] >= '0' && s[i+3] <= '7' {
+			b = append(b, u8(i64(s[i+1]-'0')*64 + i64(s[i+2]-'0')*8 + i64(s[i+3]-'0')))
+			i += 4
+		} else {
+			b = append(b, s[i])
+			i += 1
+		}
+	}
+	return str(b)
+}
+
+// readOnHelper reads path on a helper thread. held (>= 0) is a descriptor of the same FIFO,
+// open until the helper's own open returns, so a writer waiting for a reader never sees none.
+fn readOnHelper(path str, held i64) !str {
+	let job = calloc(6, 8)
 	job[0] = rt_heap_str(path)
-	try rt_helper_run(readJob, job, jobDrop)
+	job[5] = held + 1
+	try rt_helper_run(readJob, job, readDrop)
 	return try jobResult(job)
+}
+
+// readRing is ReadFile through the core's io_uring: the open and each read wait for their
+// completion (data in the page cache arrives during the submit). The buffer is heap memory,
+// which the ring frees if the task's deadline passes while the kernel still writes to it. A
+// FIFO goes to a helper thread, whose open waits for a writer (the ring's open does not).
+fn readRing(path str) !str {
+	if badPath(path) {
+		fail invalidFault("open", path)
+	}
+	let fd = rt_ring_open(rt_cstr(path), oRdonly, 0)
+	if fd == ringGone {
+		fail cast(fault, rt_wait_fault())
+	}
+	if fd < 0 {
+		fail pathFaultCode("open", path, -fd)
+	}
+	mut size = 0
+	if c32(rt_sys_fstat(fd, stbuf)) == 0 {
+		if mode(stbuf)&0xf000 == 0x1000 {
+			return try readOnHelper(path, fd)
+		}
+		if !isDirMode(mode(stbuf)) {
+			size = rt_stat_size(stbuf)
+		}
+	}
+	mut room = size + 1
+	if room < 512 {
+		room = 512
+	}
+	mut buf = malloc(room)
+	mut got = 0
+	for {
+		if got == room {
+			room *= 2
+			let more = malloc(room)
+			memcpy(more, buf, got)
+			free(buf)
+			buf = more
+		}
+		// Never past the size the file had: the kernel completes a short read of a regular file
+		// on one of its workers, while a read of exactly what is there completes during the submit.
+		mut ask = room - got
+		if got < size {
+			ask = size - got
+		}
+		if ask > 1073741824 {
+			ask = 1073741824 // the length field is 32 bits
+		}
+		let n = rt_ring_read(fd, buf+got, ask, buf)
+		if n == ringGone {
+			fail cast(fault, rt_wait_fault()) // the ring closes fd and frees buf
+		}
+		if n < 0 {
+			rt_sys_close(fd)
+			free(buf)
+			fail pathFaultCode("read", path, -n)
+		}
+		if n == 0 {
+			break
+		}
+		got += n
+	}
+	rt_sys_close(fd)
+	if got == 0 {
+		free(buf)
+		return ""
+	}
+	let s = rt_str_from_raw(buf, got)
+	free(buf)
+	return s
 }
 
 // readJob runs ReadFile on a helper thread, copying the result (or the fault's message)
 // into malloc'd memory the task turns back into a str.
 fn readJob(job i64) {
-	let (s, err) = readFileHere(cast(str, job[0]))
+	let held = job[5] - 1
+	job[5] = 0
+	let (s, err) = readFileHere(cast(str, job[0]), held)
 	if err != nil {
 		jobFault(job, err)
 		return
@@ -199,6 +385,14 @@ fn writeDrop(job i64) {
 	jobDrop(job)
 }
 
+// readDrop also closes a held FIFO descriptor that no helper took (the job never ran).
+fn readDrop(job i64) {
+	if job[5] > 0 {
+		rt_sys_close(job[5] - 1)
+	}
+	jobDrop(job)
+}
+
 // jobResult copies the result into the caller's pool and releases the heap-owned job.
 fn jobResult(job i64) !str {
 	mut m = ""
@@ -216,11 +410,18 @@ fn jobResult(job i64) !str {
 	return s
 }
 
-fn readFileHere(path str) !str {
+// readFileHere reads path where it runs; held (>= 0) is closed once its open returns.
+fn readFileHere(path str, held i64) !str {
 	if badPath(path) {
+		if held >= 0 {
+			rt_sys_close(held)
+		}
 		fail invalidFault("open", path)
 	}
 	let fd = c32(rt_sys_open(rt_cstr(path), oRdonly, 0))
+	if held >= 0 {
+		rt_sys_close(held)
+	}
 	if fd < 0 {
 		fail pathFault("open", path)
 	}
@@ -335,10 +536,14 @@ fn AppendFile(path str, data str) ! {
 	return try writeVia(path, data, oAppend)
 }
 
-// writeVia is writeAll, on a helper thread when called from a request task.
+// writeVia is writeAll, through the core's io_uring or on a helper thread when called from a
+// request task.
 fn writeVia(path str, data str, flags i64) ! {
 	if rt_task_current() == 0 {
 		return try writeAll(path, data, flags)
+	}
+	if useRing(path) {
+		return try writeRing(path, data, flags)
 	}
 	let job = calloc(7, 8)
 	job[0] = rt_heap_str(path)
@@ -347,6 +552,55 @@ fn writeVia(path str, data str, flags i64) ! {
 	try rt_helper_run(writeJob, job, writeDrop)
 	free(job[5])
 	_ = try jobResult(job)
+}
+
+// writeRing is writeAll through the core's io_uring (#357). The data is copied to heap memory
+// the ring frees if the task's deadline passes while the kernel still reads it. An open that
+// creates or truncates runs on the kernel's own workers, so a FIFO's waits for a reader.
+fn writeRing(path str, data str, flags i64) ! {
+	if badPath(path) {
+		fail invalidFault("open", path)
+	}
+	let fd = rt_ring_open(rt_cstr(path), flags, 420)
+	if fd == ringGone {
+		fail cast(fault, rt_wait_fault())
+	}
+	if fd < 0 {
+		fail pathFaultCode("open", path, -fd)
+	}
+	let n = len(data)
+	if n > 0 {
+		let buf = malloc(n)
+		memcpy(buf, cast(i64, data)+8, n)
+		mut done = 0
+		for done < n {
+			mut ask = n - done
+			if ask > 1073741824 {
+				ask = 1073741824 // the length field is 32 bits
+			}
+			let w = rt_ring_write(fd, buf+done, ask, buf)
+			if w == ringGone {
+				fail cast(fault, rt_wait_fault()) // the ring closes fd and frees buf
+			}
+			if w <= 0 {
+				rt_sys_close(fd)
+				free(buf)
+				if w == 0 {
+					fail say.Fault("write %s: unexpected EOF", path)
+				}
+				fail pathFaultCode("write", path, -w)
+			}
+			done += w
+		}
+		free(buf)
+	}
+	let c = rt_ring_close(fd)
+	if c == ringGone {
+		fail cast(fault, rt_wait_fault())
+	}
+	if c < 0 {
+		fail pathFaultCode("close", path, -c)
+	}
 }
 
 fn writeJob(job i64) {

@@ -1,0 +1,33 @@
+package main
+
+import "quarry"
+import "say"
+
+// #357: which mounts keep quarry's file calls on helper threads (file_io_check.py builds this
+// against a copy of lib/quarry with tools/ci/fixtures/mounts_probe.tin appended).
+
+const info = `22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+23 22 0:21 / /proc rw,nosuid shared:2 - proc proc rw
+30 22 0:40 / /mnt/s3 rw,nosuid,nodev shared:9 - fuse.s3fs s3fs rw,user_id=0
+31 22 0:41 / /mnt/my\040files rw shared:10 master:3 - fuse fuse rw
+32 22 0:42 / /srv/share rw - cifs //host/share rw
+33 22 0:43 /Users/me /src rw - virtiofs src rw
+34 22 0:44 / /data rw - nfs4 host:/data rw
+35 22 0:45 / /tmp rw - tmpfs tmpfs rw
+36 22 0:46 / /9 rw - 9p 9p rw
+37 22 0:47 / /blk rw - fuseblk /dev/sdb1 rw
+38 22 0:48 / /fusex rw - fusectl fusectl rw`
+
+fn main() {
+	let slow = quarry.ProbeSlowMounts(info)
+	for m in slow {
+		say.Line("slow: [{m}]")
+	}
+	for p in []str{"/mnt/s3", "/mnt/s3/a.txt", "/mnt/s3x/a.txt", "/mnt/my files/b", "/srv/share/c", "/src/lib/x.tin", "/data/d", "/tmp/e", "/9/f", "/blk/g", "/fusex/h", "/"} {
+		say.Line("{p}: {quarry.ProbeUnder(p, slow)}")
+	}
+	let root = quarry.ProbeUnder("/etc/hosts", []str{"/"})
+	say.Line("a slow root holds every path: {root}")
+	let none = quarry.ProbeSlowMounts("")
+	say.Line("empty mountinfo: {len(none)}")
+}

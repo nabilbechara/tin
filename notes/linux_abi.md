@@ -327,6 +327,13 @@ with every probed name in `out/merged_consts.md`. `*` = Linux differs from darwi
 | `PR_SET_NAME PR_GET_NAME` | 15 16 | same |
 | `SYS_write SYS_clock_gettime SYS_getrandom SYS_epoll_create1 SYS_epoll_ctl SYS_epoll_pwait SYS_sched_getaffinity SYS_exit_group SYS_gettid SYS_futex` | 64 113 278 20 21 22 123 94 178 98 | **1 228 318 291 233 281 204 231 186 202** |
 | `SYS_epoll_wait` | n/a (only `epoll_pwait`) | 232 |
+| `SYS_io_uring_setup SYS_io_uring_enter SYS_io_uring_register` (#357) | 425 426 427 | same |
+| `IORING_SETUP_CQSIZE IORING_SETUP_CLAMP` / `IORING_REGISTER_PROBE` / `IO_URING_OP_SUPPORTED` | 8 16 / 8 / 1 | same |
+| `IORING_FEAT_SINGLE_MMAP NODROP SUBMIT_STABLE` (all three required: 5.5) | 1 2 4 | same |
+| `IORING_OP_OPENAT CLOSE READ WRITE` (5.6) | 18 19 22 23 | same |
+| `IORING_OFF_SQ_RING IORING_OFF_SQES`; `AT_FDCWD` | 0 0x10000000; -100 | same |
+| `struct io_uring_params` (120 bytes): sq_entries, cq_entries, flags, features @0 4 8 20; `sq_off` @40 (head tail ring_mask ring_entries flags dropped array, u32 each), `cq_off` @80 (head tail ring_mask ring_entries overflow cqes) | same | same |
+| `struct io_uring_sqe` (64 bytes): opcode u8 @0, fd s32 @4, off u64 @8 (-1: the file position), addr @16, len u32 @24 (openat: mode), op flags u32 @28, user_data @32; `struct io_uring_cqe` (16): user_data @0, res s32 @8 | same | same |
 
 ### 2.6 kqueue constants Tin uses today (darwin only, for the translation table)
 

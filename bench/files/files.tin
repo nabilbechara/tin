@@ -1,0 +1,36 @@
+package main
+
+import "anvil"
+import "mint"
+import "quarry"
+import "say"
+
+// bench/files (#357): GET /read?n=N reads N of the files $FILES_DIR/f0 .. f{$FILES_COUNT-1}, one
+// after another, with quarry.ReadFile (each core goes on where its last request stopped) and
+// answers the bytes read. run.py drives it.
+
+mut next i64 = 0
+
+fn read(q anvil.Req, w mut anvil.Out) {
+	let dir = quarry.Getenv("FILES_DIR")
+	let count = mint.Atoi(quarry.Getenv("FILES_COUNT")) catch _ { 10000 }
+	let n = mint.Atoi(q.Param("n")) catch _ { 100 }
+	let start = next
+	next = (next + n) % count
+	mut total = 0
+	for i in 0..n {
+		let s = quarry.ReadFile("{dir}/f{(start + i) % count}") catch err {
+			w.Status(500)
+			w.Text("{err}")
+			return
+		}
+		total += len(s)
+	}
+	w.Text("{total}")
+}
+
+fn main() {
+	let r = anvil.NewRouter()
+	r.Get("/read", read)
+	say.Line(r.Serve(":" + quarry.Getenv("PORT")))
+}

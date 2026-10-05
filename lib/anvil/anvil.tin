@@ -196,6 +196,7 @@ mut shedAt i64         // when this core last shed (mono ns), 0: it is not overl
 
 mut fdTask i64  // fd -> the request task waiting on it (client sockets)
 mut doneRd i64  // the read end of this core's helper-job pipe
+mut ringRd i64  // this core's io_uring descriptor once a task made the ring (Linux, #357), else -1
 
 mut head bool
 // The request serve_one hands to the task it starts (read before the task first waits).
@@ -446,6 +447,8 @@ fn core(id i64) {
 	doneFd = i64(i32(__ld(jfds+4, 2)))
 	rt_sys_fcntl(doneRd, F_SETFL, O_NONBLOCK)
 	ev_level(doneRd)
+	ringRd = -1
+	ringHook = ring_watch
 	waitHook = task_watch
 	waitCancel = task_unwatch
 	drainTimer = -1
@@ -519,6 +522,8 @@ fn core(id i64) {
 				accept_all()
 			} else if fd == doneRd {
 				take_jobs()
+			} else if fd == ringRd {
+				rt_ring_reap()
 			} else if fd >= 0 && fd < 65536 && fdTask[fd] != 0 {
 				let task = fdTask[fd]
 				fdTask[fd] = 0
@@ -1527,6 +1532,13 @@ fn take_jobs() {
 			resume_task(task)
 		}
 	}
+}
+
+// ring_watch is the runtime's ring hook: watch the io_uring a task just made on this core; its
+// completions wake their tasks, which the next turn of the loop resumes.
+fn ring_watch(fd i64) {
+	ringRd = fd
+	ev_level(fd)
 }
 
 // run_timers resumes every task whose wait is over.

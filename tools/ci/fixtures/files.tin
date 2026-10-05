@@ -4,9 +4,13 @@ import "anvil"
 import "mint"
 import "quarry"
 import "say"
+import "tide"
 
-// #357: /files?n=N&file=PATH reads PATH in N tasks at once (quarry.ReadFile runs on helper
-// threads) and counts the successes; /ok answers. file_io_check.py runs it.
+// #357: /files?n=N&file=PATH reads PATH in N tasks at once (quarry.ReadFile goes through the
+// core's io_uring on Linux, else helper threads) and counts the successes; /writes does the same
+// with WriteFile; /check reads and writes files of many sizes and reports what it got; /park
+// ends a WriteFile parked on a FIFO with a within deadline and with a scope cancel; /ok answers.
+// file_io_check.py runs it.
 
 fn readAll(n i64, path str) !str {
 	mut ok i64 = 0
@@ -39,6 +43,174 @@ fn files(q anvil.Req, w mut anvil.Out) {
 	w.Text(got)
 }
 
+fn writeAll(n i64, path str) !str {
+	mut ok i64 = 0
+	mut bad i64 = 0
+	mut first str = ""
+	scope s {
+		for i in 0..n {
+			s.spawn(fn() ! {
+				quarry.WriteFile(path, "x") catch err {
+					bad += 1
+					if first == "" {
+						first = "{err}"
+					}
+					return
+				}
+				ok += 1
+			})
+		}
+	}
+	return "ok={ok} bad={bad} first={first}"
+}
+
+fn writes(q anvil.Req, w mut anvil.Out) {
+	let n = mint.Atoi(q.Param("n")) catch _ { 10 }
+	let got = writeAll(n, q.Param("file")) catch err {
+		w.Status(500)
+		w.Text("{err}")
+		return
+	}
+	w.Text(got)
+}
+
+// pattern is n deterministic bytes, so a misplaced or lost chunk shows.
+fn pattern(n i64, seed i64) str {
+	mut b = make([]u8, n)
+	for i in 0..n {
+		b[i] = u8('a' + (i*7 + i/251 + seed) % 26)
+	}
+	return str(b)
+}
+
+// faultOf is err's text with dir shown as D, or "ok".
+fn faultOf(err fault, dir str) str {
+	if err == nil {
+		return "ok"
+	}
+	let s = "{err}"
+	if len(s) >= len(dir) {
+		for i in 0..len(s)-len(dir)+1 {
+			if s[i:i+len(dir)] == dir {
+				return s[0:i] + "D" + s[i+len(dir):]
+			}
+		}
+	}
+	return s
+}
+
+fn check(q anvil.Req, w mut anvil.Out) {
+	let d = q.Param("dir")
+	mut out = ""
+	// Sizes around the first read's size and a page, and a file of several megabytes.
+	for n in []i64{0, 1, 511, 512, 513, 4095, 4096, 4097, 65536, 3145731} {
+		let data = pattern(n, n)
+		let p = "{d}/size{n}"
+		let werr = quarry.WriteFile(p, data)
+		let (got, rerr) = quarry.ReadFile(p)
+		out += "size {n}: write {faultOf(werr, d)}, read {faultOf(rerr, d)}, same {got == data}\n"
+	}
+	let a = "{d}/append"
+	let e1 = quarry.WriteFile(a, "one\n")
+	let e2 = quarry.AppendFile(a, "two\n")
+	let e3 = quarry.AppendFile("{d}/append-new", "made by append\n")
+	let (got, e4) = quarry.ReadFile(a)
+	let (made, e5) = quarry.ReadFile("{d}/append-new")
+	let same = got == "one\ntwo\n" && made == "made by append\n"
+	out += "append: {faultOf(e1, d)} {faultOf(e2, d)} {faultOf(e3, d)} {faultOf(e4, d)} {faultOf(e5, d)} {same}\n"
+	let t = "{d}/trunc"
+	let e6 = quarry.WriteFile(t, "a much longer first content")
+	let e7 = quarry.WriteFile(t, "short")
+	let (short, e8) = quarry.ReadFile(t)
+	out += "truncate: {faultOf(e6, d)} {faultOf(e7, d)} {faultOf(e8, d)} {short}\n"
+	let (_, m1) = quarry.ReadFile("{d}/missing")
+	out += "missing: {faultOf(m1, d)}\n"
+	let (_, m2) = quarry.ReadFile(d)
+	out += "directory: {faultOf(m2, d)}\n"
+	let m3 = quarry.WriteFile("{d}/nodir/x", "x")
+	out += "write into a missing directory: {faultOf(m3, d)}\n"
+	let m4 = quarry.WriteFile(d, "x")
+	out += "write a directory: {faultOf(m4, d)}\n"
+	let m5 = quarry.AppendFile(d, "x")
+	out += "append to a directory: {faultOf(m5, d)}\n"
+	// A file whose size reads as 0 but has content (Linux /proc): the buffer grows as it reads.
+	if quarry.Exists("/proc/self/maps") {
+		let (maps, m6) = quarry.ReadFile("/proc/self/maps")
+		out += "proc: {faultOf(m6, d)} {len(maps) > 512}\n"
+	} else {
+		out += "proc: none\n"
+	}
+	// Many tasks write and read back files of their own at once.
+	let many = manyTasks(d) catch err { "{err}" }
+	out += "500 tasks: {many}\n"
+	w.Text(out)
+}
+
+// manyTasks writes and reads back a file of its own in each of 500 tasks at once.
+fn manyTasks(d str) !str {
+	mut bad i64 = 0
+	mut first = ""
+	scope s {
+		for i in 0..500 {
+			s.spawn(fn() ! {
+				let p = "{d}/task{i}"
+				let data = pattern(i*37 % 9000, i)
+				quarry.WriteFile(p, data) catch err {
+					bad += 1
+					first = "{err}"
+					return
+				}
+				let back = quarry.ReadFile(p) catch err {
+					bad += 1
+					first = "{err}"
+					return
+				}
+				if back != data {
+					bad += 1
+					first = "task {i} read {len(back)} bytes, wrote {len(data)}"
+				}
+			})
+		}
+	}
+	return "bad {bad} {first}"
+}
+
+// park ends a WriteFile parked on a FIFO nobody reads twice: by a within deadline, then by a
+// scope cancel. A FIFO opened to write waits for a reader (on a kernel worker with io_uring).
+fn park(q anvil.Req, w mut anvil.Out) {
+	let path = q.Param("file")
+	let start = tide.Now()
+	mut inner = "no fault"
+	within 300ms {
+		try quarry.WriteFile(path, "x")
+	} catch err {
+		inner = "{err}"
+	}
+	let ms = (tide.Now() - start) / tide.Millisecond
+	let child = cancelled(path)
+	w.Text("within: {inner} {ms >= 250 && ms < 2000}; cancel: {child}")
+}
+
+// cancelled is the fault of a WriteFile its scope cancels while it waits, then the scope's own.
+fn cancelled(path str) str {
+	mut child = "no fault"
+	let run = fn() ! {
+		scope s {
+			s.spawn(fn() ! {
+				quarry.WriteFile(path, "x") catch err {
+					child = "{err}"
+				}
+			})
+			tide.Wait(100ms) catch _ {}
+			s.cancel("stop")
+		}
+	}
+	run() catch err {
+		return "{child} (scope: {err})"
+	}
+	return "{child} (scope: no fault)"
+}
+
 fn ok(q anvil.Req, w mut anvil.Out) {
 	w.Text("ok")
 }
@@ -46,6 +218,9 @@ fn ok(q anvil.Req, w mut anvil.Out) {
 fn main() {
 	let r = anvil.NewRouter()
 	r.Get("/files", files)
+	r.Get("/writes", writes)
+	r.Get("/check", check)
+	r.Get("/park", park)
 	r.Get("/ok", ok)
 	say.Line(r.Serve(":" + quarry.Getenv("PORT")))
 }

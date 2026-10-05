@@ -554,6 +554,31 @@ bytes of a slab each instead of a page-rounded 8192, and the memory of deleted v
 reused instead of unmapped. These are not same-machine before and after figures: run
 `.github/workflows/bench-linux.yml` for those.
 
+## File reads through io_uring (Linux)
+
+`quarry.ReadFile` in a request task goes through the core's own io_uring ring on Linux (#357);
+the helper threads are the fallback (`TIN_IO_URING=0`, kernels or seccomp profiles that refuse
+io_uring, FIFOs and network mounts). `bench/files` reads 10000 files of 4 KiB, 1000 per request
+over 4 connections per core, in 5 alternating rounds of 3 s per side; the table gives medians.
+[Run 37350232975](https://github.com/yasserreslan/tin/actions/runs/37350232975), GitHub's
+4-vCPU runners (Linux 6.17.0-1022-azure, AMD EPYC 9V74 and Neoverse-N2); only ratios mean anything there.
+
+| cores | amd64 helper files/s | amd64 io_uring files/s | io_uring/helper | arm64 helper files/s | arm64 io_uring files/s | io_uring/helper |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 158401 | 101909 | 0.64x | 181622 | 161346 | 0.89x |
+| 2 | 185771 | 195836 | 1.05x | 275430 | 292280 | 1.06x |
+| 4 | 76655 | 317049 | 4.14x | 136593 | 559164 | 4.09x |
+| 8 | 165514 | 303163 | 1.83x | 265550 | 550220 | 2.07x |
+
+- Scaling from one core to four: io_uring 3.11x (amd64) and 3.47x (arm64); the helper threads
+  0.48x and 0.75x, as every core queues on the same few threads. Eight cores on four vCPUs add
+  nothing to either.
+- CPU per 1000 files: io_uring 9.8 to 12.8 ms (amd64) and 6.2 to 7.0 ms (arm64), about half
+  of the helper path's 17.1 to 23.6 and 11.8 to 14.5 ms.
+- On one core io_uring is slower (0.64x, 0.89x): the helper path then runs the reads on other
+  CPUs in parallel with the core, which a 4-vCPU runner has to spare. Serving cores take
+  those CPUs away, so the multi-core rows are the production case.
+
 ## Map growth without stalls (Linux)
 
 A map rebuilt its entries and index when full, so inserting into a map of 2^21 entries stalled

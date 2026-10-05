@@ -238,7 +238,8 @@ see [docs/PORTING.md](docs/PORTING.md).
 
 v0.4: each anvil request runs in its own task with its own stack and pool, so a handler
 that waits (`tide.Wait`, `wire`, `quarry` files, `redis`, `mysql`, `postgres`, `websocket`) lets its
-core serve other requests meanwhile. Sockets are non-blocking; DNS and file I/O go to
-helper threads; every request has a deadline. Statements and commands are `query`
+core serve other requests meanwhile. Sockets are non-blocking; file I/O goes through each
+core's io_uring on Linux (helper threads elsewhere and for FIFOs and FUSE mounts), macOS DNS
+to helper threads; every request has a deadline. Statements and commands are `query`
 values, so a value is always sent apart from the text. See
 [docs/RUNTIME.md](docs/RUNTIME.md) and [notes/roadmap.md](notes/roadmap.md).

@@ -167,12 +167,14 @@ def main():
                        cwd=ROOT, env=dict(os.environ, TIN_ROOT=str(directory)), check=True)
         port = ws.free_port()
         # Formatting's 300 ms wait needs a longer initial deadline; separate helper
-        # requests below run on a second server with a 100 ms request deadline.
+        # requests below run on a second server with a 100 ms request deadline. Their files
+        # stay on the helper threads (TIN_IO_URING=0): a regular file's read through io_uring
+        # never queues behind blocked helpers. file_io_check.py covers io_uring's deadlines.
         for deadline, run in [('1000', 'format'), ('100', 'all')]:
             with (out / (run + '.log')).open('wb') as log:
                 server = subprocess.Popen([str(exe)], stdout=log, stderr=log,
                     env=dict(os.environ, PORT=str(port), TIN_CORES='1', TIN_GRACE='1',
-                             TIN_DEADLINE_MS=deadline, REVIEW_DIR=str(directory)))
+                             TIN_DEADLINE_MS=deadline, REVIEW_DIR=str(directory), TIN_IO_URING='0'))
                 try:
                     eventually(lambda: server_ready(port, server))
                     if run == 'format':
