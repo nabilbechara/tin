@@ -419,7 +419,7 @@ fn (l mut Listener) Close() {
 type Options struct {
 	Timeout i64         // ns for the whole call: connect, send and the complete response (0: no limit; a request's deadline still applies)
 	MaxBody i64         // largest response body accepted, in bytes (0: DefaultMaxBody)
-	TLS     ?tls.Config // for https://: roots, ALPN, InsecureSkipVerify (nil: verify against the system's roots); the server name is the URL's host
+	TLS     ?tls.Config // for https://: roots, ALPN (default http/1.1; a server that picks another protocol is refused), InsecureSkipVerify (nil: verify against the system's roots); the server name is the URL's host
 	MaxIdle i64         // idle keep-alive connections kept per core and host after a call (0: 8; negative: none, every call dials and sends Connection: close)
 }
 
@@ -663,15 +663,22 @@ fn attempt_tls(k call, opt Options, usePool bool) !Resp {
 			return try exchange_tls(mut kept, k, true)
 		}
 	}
-	let cfg = tls.Config{ServerName: "", RootCAs: "", ALPN: []str{}, Timeout: opt.Timeout, InsecureSkipVerify: false}
+	// ALPN offers http/1.1 (#478): some servers and gateways refuse a client that offers none.
+	let cfg = tls.Config{ServerName: "", RootCAs: "", ALPN: []str{"http/1.1"}, Timeout: opt.Timeout, InsecureSkipVerify: false}
 	let given = opt.TLS
 	if given != nil {
 		cfg.RootCAs = given.RootCAs
-		cfg.ALPN = given.ALPN
+		if len(given.ALPN) > 0 {
+			cfg.ALPN = given.ALPN
+		}
 		cfg.InsecureSkipVerify = given.InsecureSkipVerify
 	}
 	cfg.ServerName = tls_host(k.hostport)
 	let tc = try tls.Dial(k.addr, cfg)
+	if tc.ALPN() != "" && tc.ALPN() != "http/1.1" {
+		tc.Close()
+		fail say.Fault("wire: the server chose %q by ALPN; wire speaks HTTP/1.1", tc.ALPN())
+	}
 	return try exchange_tls(mut tc, k, false)
 }
 

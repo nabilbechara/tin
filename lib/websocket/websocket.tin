@@ -134,7 +134,8 @@ fn Dial(url str) !Conn {
 }
 
 // DialTLS is Dial with the TLS configuration of a wss:// URL (RootCAs, Timeout for the
-// handshake, InsecureSkipVerify for tests); the server name is the URL's host.
+// handshake, InsecureSkipVerify for tests); the server name is the URL's host, and ALPN offers
+// http/1.1 whatever cfg.ALPN says (the upgrade is HTTP/1.1).
 fn DialTLS(url str, cfg tls.Config) !Conn {
 	let secure = twine.HasPrefix(url, "wss://")
 	if !secure && !twine.HasPrefix(url, "ws://") {
@@ -160,7 +161,10 @@ fn DialTLS(url str, cfg tls.Config) !Conn {
 	}
 	mut st = 0
 	if secure {
-		let tc = try tls.Dial(addr, cfg)
+		// A WebSocket here is an HTTP/1.1 upgrade: ALPN offers http/1.1 alone (#478).
+		let wcfg = tls.Config{ServerName: cfg.ServerName, RootCAs: cfg.RootCAs, ALPN: []str{"http/1.1"}, Timeout: cfg.Timeout,
+			InsecureSkipVerify: cfg.InsecureSkipVerify}
+		let tc = try tls.Dial(addr, wcfg)
 		st = new_state(tc.Fd(), true)
 		st[sTls] = cast(i64, tc)
 	} else {

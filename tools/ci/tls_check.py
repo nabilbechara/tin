@@ -248,6 +248,35 @@ def resumption(exe, openssl, certs, work):
     print('PASS resumption: a server that lost its ticket keys gets a full handshake, then resumption again')
 
 
+KEYLOG_LABELS = ('CLIENT_HANDSHAKE_TRAFFIC_SECRET', 'SERVER_HANDSHAKE_TRAFFIC_SECRET', 'CLIENT_TRAFFIC_SECRET_0',
+                 'SERVER_TRAFFIC_SECRET_0')
+
+
+def keylog_lines(path):
+    """The TLS 1.3 traffic-secret lines of an NSS key log, sorted (OpenSSL also writes EXPORTER_SECRET)."""
+    return sorted(l for l in path.read_text().splitlines() if l.split(' ', 1)[0] in KEYLOG_LABELS)
+
+
+def keylog(exe, openssl, certs, work):
+    """SSLKEYLOGFILE (#478): the client logs the same four secrets openssl s_server logs."""
+    cert = certs['ecdsa']
+    mine, theirs = work / 'keylog-client.txt', work / 'keylog-s_server.txt'
+    port = free_port()
+    proc = subprocess.Popen([openssl, 's_server', '-tls1_3', '-accept', str(port), '-cert', str(cert[0]), '-key', str(cert[1]),
+                             '-www', '-quiet', '-keylogfile', str(theirs)],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        wait_port(port, proc)
+        out = run(exe, 'resume', f'127.0.0.1:{port}', 1, cert[0], env={'SSLKEYLOGFILE': str(mine)})
+        assert out.startswith('resumed false'), out
+    finally:
+        proc.kill()
+        proc.wait()
+    a, b = keylog_lines(mine), keylog_lines(theirs)
+    assert len(a) == 4 and a == b, (a, b)
+    print('PASS SSLKEYLOGFILE: the client logs the four TLS 1.3 traffic secrets openssl s_server logs for the connection')
+
+
 def keyupdate(exe, openssl, certs):
     """An interactive s_server sends KeyUpdate with and without request_update; the client
     reads on, answers and keeps writing on its next key."""
@@ -332,6 +361,9 @@ def python_servers(exe, certs):
     plain.close()
     # A server that closes TCP without close_notify: the read fails instead of a clean EOF.
     ctx = server_ctx(certs['ecdsa'])
+    # The servers below speak ALPN, to see what wire and websocket offer (#478).
+    ctx.set_alpn_protocols(['http/1.1'])
+    alpn_seen = []
     trunc = socket.socket()
     trunc.bind(('127.0.0.1', 0))
     trunc.listen(4)
@@ -355,6 +387,7 @@ def python_servers(exe, certs):
         protocol_version = 'HTTP/1.1'
 
         def do_GET(self):
+            alpn_seen.append(self.connection.selected_alpn_protocol())
             body = b'hello over tls ' * 4096
             self.send_response(200)
             self.send_header('Content-Length', str(len(body)))
@@ -384,6 +417,7 @@ def python_servers(exe, certs):
         want = hashlib.sha256(b'hello over tls ' * 4096).hexdigest()
         out = run(exe, 'https', f'https://127.0.0.1:{port}/x')
         assert out == f'get 200 {15 * 4096} {want}\npost 200 posted over tls\n', out
+        assert alpn_seen == ['http/1.1'], ('wire offers ALPN http/1.1', alpn_seen)
     finally:
         srv.shutdown()
     # wss:// with a small WebSocket echo server over TLS.
@@ -403,6 +437,7 @@ def python_servers(exe, certs):
     def wss_echo():
         c, _ = ws.accept()
         s = ctx.wrap_socket(c, server_side=True)
+        alpn_seen.append(s.selected_alpn_protocol())
         head = b''
         while b'\r\n\r\n' not in head:
             head += s.recv(1)
@@ -426,8 +461,10 @@ def python_servers(exe, certs):
     serve_in_thread(wss_echo)
     out = run(exe, 'wss', f'wss://127.0.0.1:{ws.getsockname()[1]}/chat')
     assert out == 'wss true echo: hello wss\n', out
+    assert alpn_seen == ['http/1.1', 'http/1.1'], ('websocket offers ALPN http/1.1', alpn_seen)
     ws.close()
-    print('PASS handshake timeout, a non-TLS server, truncation without close_notify, verification by default, https:// and wss://')
+    print('PASS handshake timeout, a non-TLS server, truncation without close_notify, verification by default, https:// and wss:// '
+          '(both offering ALPN http/1.1)')
 
 
 def http_get(port, path, timeout=10):
@@ -535,6 +572,7 @@ def main():
             openssl_matrix(exe, openssl, certs)
             verified(exe, openssl, certs)
             resumption(exe, openssl, certs, work)
+            keylog(exe, openssl, certs, work)
             keyupdate(exe, openssl, certs)
         else:
             print('SKIP openssl s_server interop: no OpenSSL 3 command line on this runner')

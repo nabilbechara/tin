@@ -332,6 +332,8 @@ try c.Write("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
 - `(c Conn) ALPN() str`: ALPN is the application protocol the server chose ("" when none).
 - `(c Conn) CipherSuite() i64`: CipherSuite is the negotiated cipher suite (TLS_AES_128_GCM_SHA256 and so on).
 - `(c Conn) Group() str`: Group is the key exchange: "X25519", or "P-256" when the server asked for it.
+- `const VersionTLS13 = 0x0304`: VersionTLS13 is TLS 1.3's protocol version (Conn.Version).
+- `(c Conn) Version() i64`: Version is the negotiated protocol version: VersionTLS13.
 - `(c Conn) Resumed() bool`: Resumed reports whether the handshake resumed an earlier session with a ticket: the server's certificate was checked on that session, and PeerCertificates is empty.
 - `(c Conn) PeerCertificates() [][]u8`: PeerCertificates is the server's certificate chain as sent (DER, leaf first).
 - `(c Conn) Fd() i64`: Fd is the connection's descriptor (for waiting on it; never read or write it directly).
@@ -1438,7 +1440,7 @@ fn echo(ws websocket.Conn, m websocket.Message) ! {
 - `type Conn struct`: Conn is a WebSocket connection.
 - `Accept(q anvil.Req, w mut anvil.Out) !Conn`: Accept completes the opening handshake for request q and takes over its connection. A request that is not a WebSocket handshake gets a 400 (426 for another version) in w and fails. The connection and its buffers close when the handler returns.
 - `Dial(url str) !Conn`: Dial connects to a ws:// or wss:// URL ("ws://host:port/path"); wss:// verifies the server's certificate against the system's roots. Close it when finished; inside a request task, it is also closed automatically when its scope ends.
-- `DialTLS(url str, cfg tls.Config) !Conn`: DialTLS is Dial with the TLS configuration of a wss:// URL (RootCAs, Timeout for the handshake, InsecureSkipVerify for tests); the server name is the URL's host.
+- `DialTLS(url str, cfg tls.Config) !Conn`: DialTLS is Dial with the TLS configuration of a wss:// URL (RootCAs, Timeout for the handshake, InsecureSkipVerify for tests); the server name is the URL's host, and ALPN offers http/1.1 whatever cfg.ALPN says (the upgrade is HTTP/1.1).
 - `(c Conn) SetTimeout(ns i64)`: SetTimeout limits every later read and write to ns nanoseconds (0: no limit).
 - `(c Conn) SetMaxMessage(n i64)`: SetMaxMessage sets the largest message Read accepts (default 16 MiB); a bigger one closes the connection with 1009.
 - `(c Conn) WriteText(s str) !`: WriteText sends s as a text message.

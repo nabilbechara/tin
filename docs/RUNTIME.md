@@ -800,6 +800,15 @@ over TLS with ALPN `h2`.
   is generic over a private `stream` shape, so the same code reads a `wire.Conn` and a
   `tls.Conn`. `websocket.Dial` takes `wss://` (`DialTLS` with a `tls.Config`): the
   connection's `fill` and `write_raw` go through the `tls.Conn` held in its state.
+- ALPN (#478): `wire` offers `http/1.1` unless `Options.TLS` names other protocols, and fails a
+  connection on which the server chose a protocol other than HTTP/1.1. `websocket` always offers
+  `http/1.1` alone, since its upgrade is an HTTP/1.1 request. Some gateways refuse a client
+  that offers no ALPN.
+- `SSLKEYLOGFILE` (#478): when it names a file, every handshake, client or server, appends its
+  four traffic secrets in the NSS key log format (`CLIENT_HANDSHAKE_TRAFFIC_SECRET`,
+  `SERVER_HANDSHAKE_TRAFFIC_SECRET`, `CLIENT_TRAFFIC_SECRET_0`, `SERVER_TRAFFIC_SECRET_0`), which
+  Wireshark reads to decrypt a capture. It is for debugging only, since it gives away the
+  traffic. A missing file is created with mode 0644: create it first to keep it private.
 
 ### HTTPS: anvil.ServeTLS (#124)
 

@@ -1,0 +1,40 @@
+package tls
+
+import "quarry"
+import "seal"
+
+// ---- SSLKEYLOGFILE (#478) ----
+//
+// When the environment variable SSLKEYLOGFILE names a file, every handshake, client or server,
+// appends its four traffic secrets there in the NSS key log format that Wireshark, curl, browsers
+// and OpenSSL's -keylogfile use: "LABEL <client random, hex> <secret, hex>". It is for debugging a
+// connection and gives away everything sent over it: never set it in production. A missing file
+// is created with mode 0644; create it first with tighter permissions to keep it private.
+
+// keylog_file is SSLKEYLOGFILE, or "" when it is not set.
+fn keylog_file() str {
+	let p = rt_getenv(cast(i64, "SSLKEYLOGFILE") + 8)
+	if p == 0 {
+		return ""
+	}
+	mut n = 0
+	for load8(p+n) != 0 {
+		n += 1
+	}
+	return rt_str_from_raw(p, n)
+}
+
+// keylog appends the secrets of one handshake: handshake traffic secrets chs and shs, application
+// traffic secrets cats and sats, for the ClientHello random.
+fn keylog(random []u8, chs []u8, shs []u8, cats []u8, sats []u8) {
+	let path = keylog_file()
+	if path == "" {
+		return
+	}
+	let r = seal.Hex(random)
+	mut text = "CLIENT_HANDSHAKE_TRAFFIC_SECRET " + r + " " + seal.Hex(chs) + "\n"
+	text += "SERVER_HANDSHAKE_TRAFFIC_SECRET " + r + " " + seal.Hex(shs) + "\n"
+	text += "CLIENT_TRAFFIC_SECRET_0 " + r + " " + seal.Hex(cats) + "\n"
+	text += "SERVER_TRAFFIC_SECRET_0 " + r + " " + seal.Hex(sats) + "\n"
+	quarry.AppendFile(path, text) catch _ {}
+}

@@ -588,6 +588,22 @@ def example(openssl, compiler, client, certs, work):
     print('PASS examples/https_server.tin: HTTPS verified by OpenSSL, wss:// echo')
 
 
+def server_keylog(openssl, exe, certs, work):
+    """SSLKEYLOGFILE on the server (#478): anvil logs the four secrets openssl s_client logs."""
+    from tls_check import keylog_lines
+    cert = certs['ecdsa']
+    mine, theirs = work / 'keylog-anvil.txt', work / 'keylog-s_client.txt'
+    srv = Server(exe, cert, work, env={'SSLKEYLOGFILE': str(mine)})
+    try:
+        rc, out = s_client(openssl, srv.port, ['-keylogfile', str(theirs)], get('/fast'))
+        assert rc == 0 and '\r\n\r\nfast' in out, out[-1500:]
+    finally:
+        srv.stop()
+    a, b = keylog_lines(mine), keylog_lines(theirs)
+    assert len(a) == 4 and a == b, (a, b)
+    print('PASS SSLKEYLOGFILE: anvil logs the four TLS 1.3 traffic secrets openssl s_client logs for the connection')
+
+
 def bad_config(exe, certs, work):
     for name, pair, want in (('a key of another certificate', (certs['ecdsa'][0], certs['rsa'][1]), 'does not belong'),
                              ('an Ed25519 key', certs['ed25519'], 'server: ')):
@@ -632,6 +648,7 @@ def main():
         memory(openssl, exe, certs, work)
         example(openssl, compiler, client, certs, work)
         bad_config(exe, certs, work)
+        server_keylog(openssl, exe, certs, work)
         if PY_TLS13:
             python_clients(exe, certs, work)
             shutdown(exe, certs, work)
