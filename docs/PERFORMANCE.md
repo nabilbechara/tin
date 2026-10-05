@@ -498,6 +498,12 @@ their cost there is zero. `--nopolls` turns them off, `--polls` puts them everyw
 `lib/runtime/`, and a function opts out with `@nopoll`. The cost below is for polls in every
 loop (the `--polls` form): a tight loop in a handler pays it; anvil and the rest of `lib/` do not.
 
+The default form was measured in [run 37340338604](https://github.com/yasserreslan/tin/actions/runs/37340338604)
+(#341, head against main on the same runners, Linux 6.17.0-1022-azure, AMD EPYC and
+Neoverse-N2). HTTP head/base throughput of the anvil server programs, which now poll in
+their own code, was 1.012 (`/json`) and 1.003 (`/plaintext`) on amd64 and 0.994 and 0.996 on
+arm64; the CPU benchmarks, which start no cores, stayed between 0.982 and 1.018.
+
 The initial [native Linux run](https://github.com/yasserreslan/tin/actions/runs/37197260096)
 compared base `b6333ef` with head `9759a6b`, with polls enabled in strict Tin code.
 Both runners had four vCPUs, Linux 6.17.0-1022-azure and Go 1.26.8: Neoverse-N2
