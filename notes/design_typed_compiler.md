@@ -136,3 +136,20 @@ cases and a byte-identical `-S` comparison. The seed is not touched until step 6
   parent commit, strict suite 203, seed-built Linux flow on arm64 and amd64. The constants still exist for
   the vectors and for untyped code; removing them follows the vectors (#385).
 
+- **Measured 2026-10-05: typed records slowed the compiler, and what to do about it.** After the records step
+  the compiler needed 0.94 s to compile itself, against 0.57 s before (median of 5, darwin-arm64). The
+  profile was one function: `lookup_global`, a linear scan with a string compare per global, reached from
+  `lookup_name` in every expression the checker visits (`expr_may_change_slice` re-resolves names on each
+  walk, and the `cast(...)` calls the typed records need deepen those walks). The scan is now a hash index
+  (`gtab`, open addressing): 0.28 s, and a user program such as `tests/v2/router.tin` compiles in 0.10 s
+  instead of 0.25 s. `tools/compare_compilers.sh` still reports 357 of 357 listings identical.
+- **Rule for steps 2 to 4 (a finding from the vector attempt).** A struct-typed or slice-typed global or
+  record field is a counted slot: every store goes through `rt_rc_inc` / `rt_rc_dec` (#176), and
+  `rt_rc_unqueue` scans the limbo list linearly. Typing the compiler's vector globals and record fields as
+  `Vec[T]` made one bootstrap compile 2.6 times slower (5.5 s against 2.1 s), with `rt_rc_unqueue` at 75 % of
+  the samples. Locals and parameters of struct type are not counted and cost nothing. So until the compiler
+  has an uncounted reference (a trusted-code escape from the counts, or a distinct `ref` type), records keep
+  `i64` for fields that hold records, vectors or strings, and only locals, parameters and results are typed.
+  A heuristic that typed fields from their uses also mistyped `TypeExpr.args` (a bitmask for function
+  types) and crashed on `fn(mut T)`: field types must come from the writers, not only the readers.
+

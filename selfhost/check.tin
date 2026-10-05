@@ -124,16 +124,69 @@ fn qual(pkg i64, name i64) i64 {
 	return str_cat3(pkg, cstr("."), name)
 }
 
-fn lookup_global(name i64) i64 {
+// The global names are indexed by an open-addressing table (power-of-two size, at most half
+// full) so that a lookup costs one hash and about one string compare instead of a scan of
+// every global: the checker resolves a name for almost every expression it visits.
+shared mut gtab i64 // slots hold the Sym, 0 when free
+shared mut gtab_size i64
+shared mut gtab_used i64
+
+fn name_hash(s i64) i64 {
+	mut h = 1469598103934665603
 	mut i = 0
-	for i < globals[VEC_LEN] {
-		let s = cast(Sym, vec_get(globals, i))
-		if streq(s.name, name) != 0 {
-			return cast(i64, s)
+	for {
+		let c = i64(load8(s + i))
+		if c == 0 {
+			break
 		}
+		h = (h ^ c) * 1099511628211
 		i = i + 1
 	}
-	return 0
+	return h ^ (h >> 29)
+}
+
+fn gtab_slot(name i64) i64 {
+	mut i = name_hash(name) & (gtab_size - 1)
+	for gtab[i] != 0 {
+		if streq(cast(Sym, gtab[i]).name, name) != 0 {
+			return i
+		}
+		i = (i + 1) & (gtab_size - 1)
+	}
+	return i
+}
+
+fn gtab_add(s i64) {
+	if gtab_size == 0 || (gtab_used + 1) * 2 > gtab_size {
+		let old = gtab
+		let old_size = gtab_size
+		gtab_size = 1024
+		if old_size * 2 > gtab_size {
+			gtab_size = old_size * 2
+		}
+		gtab = calloc(gtab_size, 8)
+		gtab_used = 0
+		mut j = 0
+		for j < old_size {
+			if old[j] != 0 {
+				gtab_add(old[j])
+			}
+			j = j + 1
+		}
+		if old != 0 {
+			free(old)
+		}
+	}
+	let i = gtab_slot(cast(Sym, s).name)
+	gtab[i] = s
+	gtab_used = gtab_used + 1
+}
+
+fn lookup_global(name i64) i64 {
+	if gtab_size == 0 {
+		return 0
+	}
+	return gtab[gtab_slot(name)]
 }
 
 fn find_fn(name i64) i64 {
@@ -161,6 +214,7 @@ fn declare_global(s Sym) {
 		return
 	}
 	vec_push(globals, cast(i64, s))
+	gtab_add(cast(i64, s))
 }
 
 fn set_file(f i64) {
@@ -515,6 +569,9 @@ fn resolve_fields(st Ty, tx TypeExpr) {
 // ---- declarations ----
 fn check() {
 	globals = vec_new()
+	gtab = 0
+	gtab_size = 0
+	gtab_used = 0
 	sc_syms = vec_new()
 	sc_marks = vec_new()
 	init_stmts = vec_new()
