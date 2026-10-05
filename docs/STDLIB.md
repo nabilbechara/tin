@@ -1164,7 +1164,9 @@ Blocking commands (BLPOP, SUBSCRIBE, ...) would hold up the commands queued behi
 
 Package mysql is a MySQL client (tested with MySQL 8.0). Statements are queries: in db.Query("SELECT name FROM users WHERE id = {id}") the text becomes "... id = ?" and id a bound parameter of a prepared statement, so a value can never change a statement.
 
-Each core keeps a pool of connections per Client (Options.Pool, default 16); a request task waits for a free one without blocking the core. Prepared statements are cached per connection. Authentication: caching_sha2_password (the MySQL 8 default, including the RSA key exchange when the server has no cached entry) and mysql_native_password. Options.TLS connects over TLS 1.3 (SSLRequest), verifying the server's certificate and name.
+Each core keeps a pool of connections per Client (Options.Pool, default max(2, 64/cores); Options.MaxTotal caps them for the process); a request task waits for a free one without blocking the core. Prepared statements are cached per connection. Authentication: caching_sha2_password (the MySQL 8 default, including the RSA key exchange when the server has no cached entry) and mysql_native_password. Options.TLS connects over TLS 1.3 (SSLRequest), verifying the server's certificate and name.
+
+Sizing: a Client opened in a global's initializer is opened on every core, so a 32-core pod with Pool 16 may open 512 connections to one server, and a fleet of pods multiplies that. Pool, when not set, is max(2, 64/cores) per core: about 64 for the process, at least 2 on each core. Options.MaxTotal caps the connections of the whole process, over all cores (Clients with the same address, user, database and MaxTotal share one cap): a core at the cap waits, within the request's deadline and Options.Timeout, until a connection is released or a core that has one idle gives up its slot. Set MaxTotal to at least the number of cores that serve database requests; below that, cores share connections by closing and dialing again.
 
 ```tin body
 let pw = quarry.Getenv("MYSQL_PASSWORD")
@@ -1199,7 +1201,9 @@ for r in rows.Rows {
 
 ## postgres
 
-Package postgres is a PostgreSQL protocol 3.0 client over TCP. Query interpolation binds binary parameters as $1, $2, ...; a plain str cannot be used as SQL. Connections are pooled per core (default 16) and waiting request tasks park without blocking it. Authentication supports SCRAM-SHA-256, MD5 and cleartext. Options.SSLMode turns on TLS 1.3 (SSLRequest): "require" encrypts, "verify-full" (the default when Options.TLS is set) also checks the server's certificate and name.
+Package postgres is a PostgreSQL protocol 3.0 client over TCP. Query interpolation binds binary parameters as $1, $2, ...; a plain str cannot be used as SQL. Connections are pooled per core (Options.Pool, default max(2, 64/cores); Options.MaxTotal caps them for the process) and waiting request tasks park without blocking it. Authentication supports SCRAM-SHA-256, MD5 and cleartext. Options.SSLMode turns on TLS 1.3 (SSLRequest): "require" encrypts, "verify-full" (the default when Options.TLS is set) also checks the server's certificate and name.
+
+Sizing: a Client opened in a global's initializer is opened on every core, so a 32-core pod with Pool 16 may open 512 connections to one server, and a fleet of pods multiplies that. Pool, when not set, is max(2, 64/cores) per core: about 64 for the process, at least 2 on each core. Options.MaxTotal caps the connections of the whole process, over all cores (Clients with the same address, user, database and MaxTotal share one cap): a core at the cap waits, within the request's deadline and Options.Timeout, until a connection is released or a core that has one idle gives up its slot. Set MaxTotal to at least the number of cores that serve database requests; below that, cores share connections by closing and dialing again.
 
 ```tin body
 let pw = quarry.Getenv("POSTGRES_PASSWORD")

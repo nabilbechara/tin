@@ -1,0 +1,52 @@
+package main
+
+import "anvil"
+import "mint"
+import "postgres"
+import "quarry"
+import "say"
+
+// #359: a service for postgres_check.py that holds statements open and counts the connections
+// its user has on the server. POSTGRES_POOL and POSTGRES_MAX_TOTAL are Options.Pool and
+// Options.MaxTotal (unset: the defaults).
+let db = postgres.Open(postgres.Options{
+	Addr:     quarry.Getenv("POSTGRES_ADDR"),
+	User:     quarry.Getenv("POSTGRES_USER"),
+	Password: quarry.Getenv("POSTGRES_PASSWORD"),
+	Database: quarry.Getenv("POSTGRES_DATABASE"),
+	Pool:     env_int("POSTGRES_POOL"),
+	MaxTotal: env_int("POSTGRES_MAX_TOTAL"),
+})
+
+fn env_int(name str) i64 {
+	let n = mint.Atoi(quarry.Getenv(name)) catch _ { 0 }
+	return n
+}
+
+fn sleep(q anvil.Req, w mut anvil.Out) {
+	let ms = mint.Atoi(q.Param("ms")) catch _ { 100 }
+	let secs = f64(ms) / 1000.0
+	_ = db.Query("SELECT pg_sleep({secs})") catch err {
+		w.Status(502)
+		w.Text("{err}")
+		return
+	}
+	w.Text("slept")
+}
+
+fn connections(q anvil.Req, w mut anvil.Out) {
+	let rows = db.Query("SELECT COUNT(*) FROM pg_stat_activity WHERE usename = current_user AND datname = current_database()") catch err {
+		w.Status(502)
+		w.Text("{err}")
+		return
+	}
+	w.Text(rows.Rows[0][0].Text())
+}
+
+fn main() {
+	let r = anvil.NewRouter()
+	r.Get("/sleep", sleep)
+	r.Get("/connections", connections)
+	let err = r.Serve(":" + quarry.Getenv("PORT"))
+	say.Line("server:", err)
+}

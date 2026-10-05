@@ -600,9 +600,17 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
 ### Pooled clients: mysql (v0.4)
 
 - MySQL answers one statement at a time per connection, so each core keeps a pool per
-  `mysql.Client` (`Options.Pool`, default 16). A task takes an idle connection (checked
-  with `MSG_PEEK`), dials a new one while under the limit, or parks in the pool's FIFO;
-  a released connection goes straight to the first waiter still waiting.
+  `mysql.Client` (`Options.Pool`, default `max(2, 64/cores)`). A task takes an idle connection
+  (checked with `MSG_PEEK`), dials a new one while under the limit, or parks in the pool's
+  FIFO; a released connection goes straight to the first waiter still waiting.
+- `Options.MaxTotal` caps the connections of the whole process (every core's Client with the
+  same address, user, database and cap shares one counter, an atomic compare-and-swap). A core
+  at the cap with an idle connection of another core available takes that slot: it shuts the
+  socket down under a lock (the server sees the close at once) and the owner frees the record
+  when it next pops it, so no descriptor number is reused under a core that still holds it. With
+  every connection busy the task looks again every 2 ms until its deadline. The server's own
+  count can run a connection or two over the cap while it notices a close.
+- `redis.Client` keeps one connection per core and has no pool to size.
 - The task that holds a connection does its I/O directly (`rt_task_wait` on `EAGAIN`) and
   builds rows in its own pool. A server error (an ERR packet) leaves the connection usable;
   an I/O error, a timeout or the deadline closes it, since its state is unknown.
@@ -716,7 +724,8 @@ try r.Serve(":8080")                           // fails first if a pattern is ba
 
 ### Pooled clients: postgres
 
-- `postgres.Client` keeps a FIFO pool per core (`Options.Pool`, default 16). Socket
+- `postgres.Client` keeps a FIFO pool per core (`Options.Pool`, default `max(2, 64/cores)`;
+  `Options.MaxTotal` caps the process, as for mysql). Socket
   buffers and the 256-entry named statement cache are heap-owned; returned rows live
   in the calling task's pool. Idle sockets are checked with nonblocking `MSG_PEEK`.
   Waiters park, and a failed dial or a dropped connection wakes the next waiter to retry.

@@ -81,12 +81,15 @@ class Fake:
         self.conns, self.errors = [], []
         self.parses = self.closes = self.auths = 0
         self.max_statements = 0
+        self.open = self.peak = 0 # connections now, and the most at once since reset_peak (#359)
         fake = self
 
         class Handler(socketserver.BaseRequestHandler):
             def handle(self):
                 with fake.lock:
                     fake.conns.append(self.request)
+                    fake.open += 1
+                    fake.peak = max(fake.peak, fake.open)
                 try:
                     Session(fake, self.request).run()
                 except (OSError, ConnectionError):
@@ -94,6 +97,9 @@ class Fake:
                 except Exception as exc:
                     with fake.lock:
                         fake.errors.append(repr(exc))
+                finally:
+                    with fake.lock:
+                        fake.open -= 1
 
         class TCP(socketserver.ThreadingTCPServer):
             allow_reuse_address = True
@@ -105,6 +111,10 @@ class Fake:
         self.srv = TCP(('127.0.0.1', 0), Handler)
         self.port = self.srv.server_address[1]
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def reset_peak(self):
+        with self.lock:
+            self.peak = self.open
 
     def drop_all(self):
         with self.lock:
@@ -590,6 +600,80 @@ def shared(exe, env, fake):
         srv.stop()
 
 
+def pool_cap(out, env, fake):
+    """#359: Options.MaxTotal caps the connections of the whole process, whatever the core count,
+    and Pool defaults to max(2, 64/cores) per core. fixtures/pool_cap_postgres.tin holds
+    statements open; the fake counts the connections it has at once, a real server is asked
+    through pg_stat_activity."""
+    exe = out/'pool_cap'
+    subprocess.run([str(ROOT/'bin/tinc'), '-o', str(exe), 'tools/ci/fixtures/pool_cap_postgres.tin'], cwd=ROOT, check=True, env=dict(os.environ, TIN_ROOT=str(ROOT)))
+
+    def run(cores, extra, requests, ms, workers=None):
+        """The most connections at once while `requests` statements of `ms` ms run, `workers` at a
+        time (all together by default)."""
+        # Earlier servers' sessions may still be running a statement (a 3 s pg_sleep): not ours.
+        for _ in range(200):
+            if not fake or fake.open == 0:
+                break
+            time.sleep(.05)
+        srv = Server(exe, dict(env, TIN_DEADLINE_MS='20000', **extra), cores)
+        seen, stop = [], threading.Event()
+
+        def sample():
+            while not stop.is_set():
+                code, body, _ = srv.get('/connections')
+                if code == 200:
+                    seen.append(int(body))
+                time.sleep(.05)
+        sampler = threading.Thread(target=sample) if not fake else None
+        try:
+            for _ in range(200):
+                if fake or srv.get('/connections')[1] == b'1':
+                    break
+                time.sleep(.05)
+            if fake:
+                fake.reset_peak()
+            if sampler:
+                sampler.start()
+            with ThreadPoolExecutor(max_workers=workers or requests) as pool:
+                results = list(pool.map(lambda _: srv.get('/sleep?ms=%d' % ms), range(requests)))
+            assert all(r[0] == 200 for r in results), [r for r in results if r[0] != 200][:3]
+            run.slowest = max(r[2] for r in results)
+        finally:
+            stop.set()
+            if sampler:
+                sampler.join()
+            srv.stop()
+        return fake.peak if fake else max(seen)
+
+    # A core that takes the slot of another's idle connection shuts that socket down and dials
+    # its own; the server notices the close a moment after the new connection arrives, so its
+    # count may run one or two over the cap while that happens (the process never holds more).
+    slack = 2
+    # Eight cores, four per core, six for the process: the cap holds, and every request is
+    # served even though two cores can hold none of them at a time.
+    peak = run(8, {'POSTGRES_POOL': '4', 'POSTGRES_MAX_TOTAL': '6'}, 48, 150)
+    assert 5 <= peak <= 6 + slack, ('MaxTotal 6 on 8 cores', peak)
+    print('8 cores, Pool 4, MaxTotal 6: 48 statements, at most %d connections: passed' % peak, flush=True)
+    # One request at a time, spread over eight cores by new connections, with four connections for
+    # the process: a core that has none finds them idle on the others and takes the slot of one,
+    # at once (it would otherwise wait for a release on cores that serve nothing else).
+    peak = run(8, {'POSTGRES_POOL': '4', 'POSTGRES_MAX_TOTAL': '4'}, 32, 5, workers=1)
+    assert peak <= 4 + slack and run.slowest < 1.5, ('quiet cores at the cap', peak, run.slowest)
+    print('8 cores, MaxTotal 4: 32 statements one after the other, at most %d connections, slowest %.2f s: passed' % (peak, run.slowest), flush=True)
+    # The cap alone (Pool unset): 64/8 = 8 per core would allow 64.
+    peak = run(8, {'POSTGRES_POOL': '', 'POSTGRES_MAX_TOTAL': '10'}, 48, 150)
+    assert 8 <= peak <= 10 + slack, ('MaxTotal 10 on 8 cores', peak)
+    # No cap: Pool is max(2, 64/cores) per core: 32 on two cores, 64 for the process.
+    peak = run(2, {'POSTGRES_POOL': '', 'POSTGRES_MAX_TOTAL': ''}, 100, 700)
+    assert 58 <= peak <= 66, ('default Pool on 2 cores', peak) # the sampler's own connection may make 65
+    print('2 cores, default Pool: 100 statements, %d connections (2 x 32): passed' % peak, flush=True)
+    # 64 or more cores: at least 2 each, so 1 core gets 64 and 32 cores get 2 (checked on 32).
+    peak = run(32, {'POSTGRES_POOL': '', 'POSTGRES_MAX_TOTAL': ''}, 100, 700)
+    assert 58 <= peak <= 66, ('default Pool on 32 cores', peak)
+    print('32 cores, default Pool: 100 statements, %d connections (32 x 2): passed' % peak, flush=True)
+
+
 def main():
     out = ROOT/'bin/ci/postgres'; out.mkdir(parents=True, exist_ok=True)
     source = (ROOT/'examples/postgres.tin').read_text()
@@ -602,6 +686,7 @@ def main():
     env = {} if real else {'POSTGRES_ADDR': '127.0.0.1:%d' % fake.port, 'POSTGRES_USER': 'tin', 'POSTGRES_PASSWORD': 'tinpass', 'POSTGRES_DATABASE': 'tin'}
     try:
         shared(exe, env, fake)
+        pool_cap(out, env, fake)
         if fake:
             cases = [('md5','tinpass',200,None),('clear','tinpass',200,None),('tin','wrong',502,b'28P01'),('unicode','I\u00adX e\u0301 \u1100\u1161\u11a8',200,None),('prohibited','\x07ª',200,None),('unknown','tinpass',502,b'authentication method 7'),('tls','tinpass',502,b'set Options.SSLMode'),('badnonce','tinpass',502,b'server nonce'),('badverifier','tinpass',502,b'server verifier'),('duplicate','tinpass',502,b'duplicate SCRAM'),('badcount','tinpass',502,b'iteration count'),('malformed','tinpass',502,b'message length'),('truncated','tinpass',502,b'unterminated string'),('oversized','tinpass',502,b'message length'),('badrow','tinpass',502,b'truncated message'),('badstatus','tinpass',502,b'transaction status'),('premature','tinpass',502,b'before authentication')]
             for user, password, code, contains in cases:

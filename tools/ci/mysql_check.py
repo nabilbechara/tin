@@ -116,11 +116,15 @@ class Fake:
         self.switches = 0
         self.key_requests = 0
         self.conns = []
+        self.open = self.peak = 0 # connections now, and the most at once since reset_peak (#359)
         fake = self
 
         class H(socketserver.BaseRequestHandler):
             def handle(self):
                 fake.conns.append(self.request)
+                with fake.lock:
+                    fake.open += 1
+                    fake.peak = max(fake.peak, fake.open)
                 session = Session(fake, self.request)
                 try:
                     session.run()
@@ -128,6 +132,8 @@ class Fake:
                     pass
                 finally:
                     session.s.close()
+                    with fake.lock:
+                        fake.open -= 1
 
         socketserver.ThreadingTCPServer.allow_reuse_address = True
         socketserver.ThreadingTCPServer.request_queue_size = 256  # the default backlog of 5 resets bursts on macOS
@@ -135,6 +141,10 @@ class Fake:
         self.srv.daemon_threads = True
         self.port = self.srv.server_address[1]
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+
+    def reset_peak(self):
+        with self.lock:
+            self.peak = self.open
 
     def drop_all(self):
         for c in self.conns:
@@ -378,6 +388,99 @@ class Server:
         self.p.wait(timeout=10)
 
 
+def pool_cap(out, env, fake, failures):
+    """#359: Options.MaxTotal caps the connections of the whole process, whatever the core count,
+    and Pool defaults to max(2, 64/cores) per core. fixtures/pool_cap_mysql.tin holds statements
+    open; the fake counts the connections it has at once, a real server is asked through
+    information_schema.PROCESSLIST."""
+    exe = out / 'mysql_pool_cap'
+    subprocess.run([str(ROOT / 'bin/tinc'), '-o', str(exe), 'tools/ci/fixtures/pool_cap_mysql.tin'], cwd=ROOT,
+                   check=True, env=dict(os.environ, TIN_ROOT=str(ROOT)))
+
+    def run(cores, extra, requests, ms, workers=None):
+        """The most connections at once while `requests` statements of `ms` ms run, `workers` at a
+        time (all together by default)."""
+        # Earlier servers' sessions may still be running a statement (a 3 s SLEEP): not ours.
+        for _ in range(200):
+            if not fake or fake.open == 0:
+                break
+            time.sleep(0.05)
+        srv = Server(exe, dict(env, TIN_DEADLINE_MS='20000', **extra), cores)
+        seen, stop = [], threading.Event()
+        codes = []
+        slowest = [0]
+
+        def sample():
+            while not stop.is_set():
+                code, body, _ = srv.get('/connections')
+                if code == 200:
+                    seen.append(int(body))
+                time.sleep(0.05)
+
+        def one(_):
+            codes.append(srv.get('/sleep?ms=%d' % ms)[0])
+
+        sampler = None if fake else threading.Thread(target=sample)
+        try:
+            for _ in range(200):
+                if fake or srv.get('/connections')[1] == b'1':
+                    break
+                time.sleep(0.05)
+            if fake:
+                fake.reset_peak()
+            if sampler:
+                sampler.start()
+            if workers == 1:
+                for i in range(requests):
+                    t0 = time.time()
+                    one(i)
+                    slowest[0] = max(slowest[0], time.time() - t0)
+            else:
+                ts = [threading.Thread(target=one, args=(i,)) for i in range(requests)]
+                for t in ts:
+                    t.start()
+                for t in ts:
+                    t.join()
+        finally:
+            stop.set()
+            if sampler:
+                sampler.join()
+            srv.stop()
+        if codes.count(200) != requests:
+            failures.append('pool cap: %d of %d statements failed (%r)' % (requests - codes.count(200), requests, sorted(set(codes))))
+        run.slowest = slowest[0]
+        return fake.peak if fake else max(seen or [0])
+
+    # A core that takes the slot of another's idle connection shuts that socket down and dials
+    # its own; the server notices the close a moment after the new connection arrives, so its
+    # count may run one or two over the cap while that happens (the process never holds more).
+    slack = 2
+    # Eight cores, four per core, six for the process: the cap holds, and every request is
+    # served even though two cores can hold none of them at a time.
+    peak = run(8, {'MYSQL_POOL': '4', 'MYSQL_MAX_TOTAL': '6'}, 48, 150)
+    print('8 cores, Pool 4, MaxTotal 6: 48 statements, at most %d connections' % peak)
+    if not 5 <= peak <= 6 + slack:
+        failures.append('MaxTotal 6 on 8 cores: %d connections' % peak)
+    # One request at a time, spread over eight cores by new connections, with four connections for
+    # the process: a core that has none finds them idle on the others and takes the slot of one,
+    # at once (it would otherwise wait for a release on cores that serve nothing else).
+    peak = run(8, {'MYSQL_POOL': '4', 'MYSQL_MAX_TOTAL': '4'}, 32, 5, workers=1)
+    print('8 cores, MaxTotal 4: 32 statements one after the other, at most %d connections, slowest %.2f s' % (peak, run.slowest))
+    if peak > 4 + slack or run.slowest > 1.5:
+        failures.append('quiet cores at the cap: %d connections, slowest %.2f s' % (peak, run.slowest))
+    # The cap alone (Pool unset): 64/8 = 8 per core would allow 64.
+    peak = run(8, {'MYSQL_POOL': '', 'MYSQL_MAX_TOTAL': '10'}, 48, 150)
+    print('8 cores, default Pool, MaxTotal 10: 48 statements, at most %d connections' % peak)
+    if not 8 <= peak <= 10 + slack:
+        failures.append('MaxTotal 10 on 8 cores: %d connections' % peak)
+    # No cap: Pool is max(2, 64/cores) per core: 32 on two cores, 2 on thirty-two.
+    for cores in (2, 32):
+        peak = run(cores, {'MYSQL_POOL': '', 'MYSQL_MAX_TOTAL': ''}, 100, 700)
+        print('%d cores, default Pool: 100 statements, %d connections (%d x %d)' % (cores, peak, cores, 64 // cores))
+        if not 58 <= peak <= 66: # a real server's count includes the sampler's own connection
+            failures.append('default Pool on %d cores: %d connections, want about 64' % (cores, peak))
+
+
 def within(out, env, failures):
     """A statement inside within 50ms against a slow server fails with fault.DeadlineExceeded
     after about 50 ms, nested blocks take the earlier deadline, and task.Deadline reads the
@@ -485,6 +588,7 @@ def check(out, exe, real, ctx):
 
     if ctx is None:
         within(out, env, failures)
+        pool_cap(out, env, fake, failures)
 
     # The load checks that every insert lands, not how fast a shared runner's MySQL is: against a
     # real server a disk flush can hold a few inserts past the 1 s deadline (#133), so it gets

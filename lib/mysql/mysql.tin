@@ -2,11 +2,20 @@
 // db.Query("SELECT name FROM users WHERE id = {id}") the text becomes "... id = ?" and id a
 // bound parameter of a prepared statement, so a value can never change a statement.
 //
-// Each core keeps a pool of connections per Client (Options.Pool, default 16); a request
-// task waits for a free one without blocking the core. Prepared statements are cached per
-// connection. Authentication: caching_sha2_password (the MySQL 8 default, including the
+// Each core keeps a pool of connections per Client (Options.Pool, default max(2, 64/cores);
+// Options.MaxTotal caps them for the process); a request task waits for a free one without
+// blocking the core. Prepared statements are cached per connection. Authentication: caching_sha2_password (the MySQL 8 default, including the
 // RSA key exchange when the server has no cached entry) and mysql_native_password.
 // Options.TLS connects over TLS 1.3 (SSLRequest), verifying the server's certificate and name.
+//
+// Sizing: a Client opened in a global's initializer is opened on every core, so a 32-core pod
+// with Pool 16 may open 512 connections to one server, and a fleet of pods multiplies that.
+// Pool, when not set, is max(2, 64/cores) per core: about 64 for the process, at least 2 on
+// each core. Options.MaxTotal caps the connections of the whole process, over all cores (Clients
+// with the same address, user, database and MaxTotal share one cap): a core at the cap waits,
+// within the request's deadline and Options.Timeout, until a connection is released or a core
+// that has one idle gives up its slot. Set MaxTotal to at least the number of cores that serve
+// database requests; below that, cores share connections by closing and dialing again.
 //
 //	let pw = quarry.Getenv("MYSQL_PASSWORD")
 //	let id = 7
@@ -51,7 +60,8 @@ type Options struct {
 	User     str
 	Password str
 	Database str
-	Pool     i64 // connections per core (default 16)
+	Pool     i64 // connections per core (default max(2, 64/cores))
+	MaxTotal i64 // connections for the whole process, over all cores (0: no cap)
 	Timeout  i64 // ns a statement may wait (0: no limit; a request's deadline still applies)
 	TLS      ?tls.Config // require TLS 1.3 (CLIENT_SSL and SSLRequest); the server name is Addr's host unless TLS.ServerName is set
 }
@@ -87,7 +97,8 @@ const rID = 10
 const rKey = 11 // the server's RSA public key (PEM), once fetched
 const rKeyN = 12
 const rTls = 13 // the kept tls.Config, or 0 for plain TCP
-const recWords = 14
+const rCap = 14 // the cap record of Options.MaxTotal (see cap_record), 0: no cap
+const recWords = 15
 
 // A core's pool for one Client.
 const pIdle = 0 // a stack of idle connections
@@ -121,7 +132,8 @@ const cStmts = 11 // cached statements: [text ptr, len, hash, id, params] each
 const cNStmts = 12
 const cTimeout = 13
 const cPkt = 14 // the start of the packet being written
-const connWords = 15
+const cStolen = 15 // another core took this idle connection's slot (MaxTotal): free it, do not use it
+const connWords = 16
 
 const stmtWords = 5
 const maxStmts = 256
@@ -178,9 +190,9 @@ fn Open(o Options) Client {
 	rec[rPassN] = len(o.Password)
 	rec[rDB] = keep_raw(o.Database)
 	rec[rDBN] = len(o.Database)
-	rec[rPool] = o.Pool
-	if o.Pool <= 0 {
-		rec[rPool] = 16
+	rec[rPool] = o.Pool // 0: default_pool(), which needs the core count, known only when the cores run
+	if o.MaxTotal > 0 {
+		rec[rCap] = cap_record(addr + "\x00" + o.User + "\x00" + o.Database + "\x00" + mint.Itoa(o.MaxTotal), o.MaxTotal)
 	}
 	rec[rTimeout] = o.Timeout
 	rec[rID] = id
@@ -817,10 +829,192 @@ fn (c Client) pool() i64 {
 	mut p = pools[id]
 	if p == 0 {
 		p = calloc(poolWords, 8)
-		p[pIdle] = calloc(c.rec[rPool]+1, 8)
+		p[pIdle] = calloc(pool_cap(c.rec)+1, 8)
 		pools[id] = p
 	}
 	return p
+}
+
+// ---- the process-wide cap (Options.MaxTotal) ----
+//
+// A Client opened in a global's initializer is opened once per core, each with its own record,
+// so the cap cannot live in the record. It is a cap record shared by every Client with the same
+// address, user, database and MaxTotal: the count of connections of all cores, and the list of
+// those that sit idle in some core's pool. A core that finds the cap reached while all its own
+// connections are busy (or it has none) takes a slot from that list: it shuts the idle
+// connection's socket down and the core that owns it frees the record when it next looks at it.
+
+const kKey = 0
+const kKeyN = 1
+const kMax = 2
+const kTotal = 3 // connections of all cores (atomic)
+const kLock = 4
+const kIdle = 5 // [kMax] connections idle in some core's pool, 0 for a free place (under kLock)
+const capWords = 6
+
+shared mut capLock i64
+shared mut capTab i64 // [maxClients]: the cap records, in the order they were first made
+shared mut capN i64
+
+// cap_record is the cap record for key, made on first use.
+fn cap_record(key str, max i64) i64 {
+	for __atomic_swap(&capLock, 1) != 0 {
+		__yield()
+	}
+	if capTab == 0 {
+		capTab = calloc(maxClients, 8)
+	}
+	mut k = 0
+	for i in 0..capN {
+		let r = capTab[i]
+		if rt_str_from_raw(r[kKey], r[kKeyN]) == key {
+			k = r
+			break
+		}
+	}
+	if k == 0 && capN < maxClients {
+		k = calloc(capWords, 8)
+		k[kKey] = keep_raw(key)
+		k[kKeyN] = len(key)
+		k[kMax] = max
+		k[kIdle] = calloc(max, 8)
+		capTab[capN] = k
+		capN += 1
+	}
+	__atomic_store(&capLock, 0)
+	return k
+}
+
+fn cap_lock(k i64) {
+	for __atomic_swap(k + 8*kLock, 1) != 0 {
+		__yield()
+	}
+}
+
+fn cap_unlock(k i64) {
+	__atomic_store(k + 8*kLock, 0)
+}
+
+// default_pool is the connections one core may hold when Options.Pool is not set: 64 shared
+// among the cores hearth.Run started (a program that never ran it counts as one), at least 2.
+fn default_pool() i64 {
+	mut n = lifeCores
+	if n < 1 {
+		n = 1
+	}
+	if 64/n < 2 {
+		return 2
+	}
+	return 64 / n
+}
+
+// pool_cap is the connections one core of the client rec may hold.
+fn pool_cap(rec i64) i64 {
+	if rec[rPool] > 0 {
+		return rec[rPool]
+	}
+	return default_pool()
+}
+
+// reserve takes one of the process's MaxTotal connections for one about to be dialed; false when
+// every core together hold them all.
+fn reserve(rec i64) bool {
+	let k = rec[rCap]
+	if k == 0 {
+		return true
+	}
+	for {
+		let n = __atomic_load(k + 8*kTotal)
+		if n >= k[kMax] {
+			return false
+		}
+		if __atomic_cas(k + 8*kTotal, n, n+1) == n {
+			return true
+		}
+	}
+	return false
+}
+
+// unreserve gives back what reserve took, for a connection that was closed or never dialed.
+fn unreserve(rec i64) {
+	let k = rec[rCap]
+	if k != 0 {
+		__atomic_add(k + 8*kTotal, -1)
+	}
+}
+
+// idle_add lists conn, just put in this core's idle stack, as one another core may take.
+fn idle_add(rec i64, conn i64) {
+	let k = rec[rCap]
+	if k == 0 {
+		return
+	}
+	cap_lock(k)
+	let idle = k[kIdle]
+	for i in 0..k[kMax] {
+		if idle[i] == 0 {
+			idle[i] = conn
+			break
+		}
+	}
+	cap_unlock(k)
+}
+
+// idle_claim takes conn, just popped from this core's idle stack, off the list; false when
+// another core took its slot meanwhile (the socket is shut down: free the record and go on).
+fn idle_claim(rec i64, conn i64) bool {
+	let k = rec[rCap]
+	if k == 0 {
+		return true
+	}
+	cap_lock(k)
+	let idle = k[kIdle]
+	for i in 0..k[kMax] {
+		if idle[i] == conn {
+			idle[i] = 0
+			break
+		}
+	}
+	let stolen = conn[cStolen]
+	cap_unlock(k)
+	return stolen == 0
+}
+
+// steal_idle takes the slot of a connection idle in some core's pool: it shuts the socket down
+// (the server sees the close at once; the owner still holds the record and the descriptor, so
+// the descriptor number cannot be reused under it) and gives its place in the count back.
+fn steal_idle(rec i64) bool {
+	let k = rec[rCap]
+	if k == 0 {
+		return false
+	}
+	cap_lock(k)
+	let idle = k[kIdle]
+	mut took = false
+	for i in 0..k[kMax] {
+		if idle[i] != 0 {
+			let conn = idle[i]
+			idle[i] = 0
+			conn[cStolen] = 1
+			rt_sys_shutdown(conn[cFd], 2)
+			__atomic_add(k + 8*kTotal, -1)
+			took = true
+			break
+		}
+	}
+	cap_unlock(k)
+	return took
+}
+
+// wait_for_slot parks the task for at most 2 ms (less when its time is nearly up): every
+// connection is busy, so it looks again for a place or an idle connection. It returns how the
+// wait ended (waitDeadline: the request's deadline or cancel).
+fn wait_for_slot(left i64) i64 {
+	mut step = 2000000
+	if left > 0 && left < step {
+		step = left
+	}
+	return rt_task_park(step)
 }
 
 fn conn_free(c i64) {
@@ -876,25 +1070,62 @@ fn (c Client) acquire() !i64 {
 		fail "mysql: the client is not open (too many clients: open one per server, not per request)"
 	}
 	let p = c.pool()
+	mut gaveUp = 0 // when a core waiting at the MaxTotal cap stops looking (Options.Timeout), 0: not yet set
 	for {
 		for p[pIdleN] > 0 {
 			p[pIdleN] -= 1
 			let idle = p[pIdle]
 			let conn = idle[p[pIdleN]]
+			if !idle_claim(c.rec, conn) {
+				// Another core took its slot (MaxTotal) and shut it down; the count is already given back.
+				conn_free(conn)
+				p[pTotal] -= 1
+				continue
+			}
 			if alive(conn) {
 				return conn
 			}
 			conn_free(conn)
 			p[pTotal] -= 1
+			unreserve(c.rec)
 		}
-		if p[pTotal] < c.rec[rPool] || rt_task_current() == 0 {
-			p[pTotal] += 1
-			let (conn, err) = dial(c.rec)
-			if err != nil {
-				p[pTotal] -= 1
-				fail err
+		if p[pTotal] < pool_cap(c.rec) || rt_task_current() == 0 {
+			if reserve(c.rec) {
+				p[pTotal] += 1
+				let (conn, err) = dial(c.rec)
+				if err != nil {
+					p[pTotal] -= 1
+					unreserve(c.rec)
+					fail err
+				}
+				return conn
 			}
-			return conn
+			// MaxTotal connections exist already, on the other cores: take the slot of one that sits
+			// idle. With none, and none of its own to wait for, this core looks again until a
+			// connection is released somewhere or its time is up.
+			if steal_idle(c.rec) {
+				continue
+			}
+			if rt_task_current() == 0 {
+				fail "mysql: MaxTotal connections are in use"
+			}
+			if p[pTotal] == 0 {
+				if gaveUp == 0 && c.rec[rTimeout] > 0 {
+					gaveUp = rt_mono_ns() + c.rec[rTimeout]
+				}
+				if gaveUp > 0 && rt_mono_ns() >= gaveUp {
+					fail "mysql: timed out"
+				}
+				mut left = 0
+				if gaveUp > 0 {
+					left = gaveUp - rt_mono_ns()
+				}
+				let r = wait_for_slot(left)
+				if r == waitDeadline {
+					fail wait_msg(r)
+				}
+				continue
+			}
 		}
 		// Every connection is busy: wait for one.
 		let w = calloc(4, 8)
@@ -952,6 +1183,7 @@ fn (c Client) release(conn i64, ok bool) {
 	if !ok {
 		conn_free(conn)
 		p[pTotal] -= 1
+		unreserve(c.rec)
 		conn = 0
 	}
 	let w = next_waiter(p)
@@ -965,6 +1197,7 @@ fn (c Client) release(conn i64, ok bool) {
 		let idle = p[pIdle]
 		idle[p[pIdleN]] = conn
 		p[pIdleN] += 1
+		idle_add(c.rec, conn)
 	}
 }
 
