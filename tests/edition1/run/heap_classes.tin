@@ -1,0 +1,99 @@
+package main
+
+import "hearth"
+import "say"
+
+// #345: long-lived blocks from a few bytes to tens of MiB, around every class boundary, keep
+// their contents while other blocks are made and dropped: a block served from a slab, from a
+// kept mapping or from a mapping of its own never overlaps another.
+
+mut blocks = make([][]u8, 300)
+mut sums = make([]i64, 300)
+
+// next is a small deterministic generator.
+mut seed i64 = 12345
+
+fn next(n i64) i64 {
+	seed = (seed * 6364136223846793005 + 1442695040888963407) & 0x7fffffffffffffff
+	return (seed >> 16) % n
+}
+
+fn pick() i64 {
+	// Sizes near class boundaries (the header is 16 bytes), then anywhere up to 600 KiB.
+	let edges = []i64{16, 48, 64, 80, 4064, 4080, 4096, 5104, 5120, 6128, 8176, 8192, 10224, 65520, 65536, 131056, 262112, 262128, 262144, 262160, 327664, 327680, 524272, 1048576}
+	let r = next(4)
+	if r == 0 {
+		return edges[next(len(edges))]
+	}
+	if r == 1 {
+		return 1 + next(5000)
+	}
+	return 1 + next(600000)
+}
+
+fn fill(size i64, tag i64) []u8 {
+	let b = make([]u8, size)
+	for i in 0..size {
+		if i % 509 == 0 || i == size-1 {
+			b[i] = u8(tag + i)
+		}
+	}
+	return keep(b)
+}
+
+fn check(b []u8, tag i64) bool {
+	for i in 0..len(b) {
+		let want = u8(0)
+		if i % 509 == 0 || i == len(b)-1 {
+			if b[i] != u8(tag + i) {
+				return false
+			}
+		} else if b[i] != want {
+			return false
+		}
+	}
+	return true
+}
+
+fn main() {
+	let slots = 300
+	mut bad = 0
+	for round in 0..6 {
+		for i in 0..400 {
+			hearth.Reset()
+			let s = next(slots)
+			blocks[s] = fill(pick(), s + round)
+			sums[s] = s + round
+		}
+		for s in 0..slots {
+			if len(blocks[s]) > 0 && !check(blocks[s], sums[s]) {
+				bad += 1
+			}
+		}
+	}
+	// A few blocks over 64 MiB, which keep no mapping.
+	for i in 0..3 {
+		hearth.Reset()
+		blocks[i] = fill(70000000 + i, 7+i)
+		sums[i] = 7 + i
+	}
+	hearth.Reset()
+	for s in 0..slots {
+		if len(blocks[s]) > 0 && !check(blocks[s], sums[s]) {
+			bad += 1
+		}
+	}
+	// Growth in place and by copy keeps the contents.
+	mut grow = []u8{}
+	mut grew = true
+	for i in 0..700000 {
+		grow = append(grow, u8(i % 251))
+	}
+	for i in 0..len(grow) {
+		if grow[i] != u8(i % 251) {
+			grew = false
+		}
+	}
+	let (slabs, large, maps) = hearth.HeapStats()
+	say.Line("corrupted", bad, "grown", grew, "slabs", slabs > 0, "large", large > 0, "mappings", maps > 0)
+}

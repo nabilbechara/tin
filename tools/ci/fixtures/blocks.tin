@@ -1,0 +1,114 @@
+package main
+
+import "flume"
+import "hearth"
+import "mint"
+import "quarry"
+import "say"
+import "tide"
+import "twine"
+
+// #345: long-lived blocks above 4 KiB. blocks <mode> <size> <count> keeps count values of size
+// bytes in a global map and prints what the heap and the process hold; heap_check.py runs it.
+//   churn  keep and overwrite one key count times
+//   fill   keep count distinct keys, delete every other one, then keep that many again
+//   large  allocate and drop a block of size bytes count times (no map)
+//   build  only build the value in request memory count times (what the others spend besides keeping)
+
+mut cache = map[str]str{}
+mut slot = []u8{}
+
+// mappings is the lines of /proc/self/maps (0 where there is none), rss the resident bytes.
+fn proc(path str, key str) i64 {
+	let text = flume.ReadFile(path) catch _ { "" }
+	if key == "" {
+		return len(twine.Split(text, "\n")) - 1
+	}
+	for _, line in twine.Split(text, "\n") {
+		if twine.HasPrefix(line, key) {
+			let f = twine.Fields(line)
+			let kb = mint.Atoi(f[1]) catch _ { 0 }
+			return kb * 1024
+		}
+	}
+	return 0
+}
+
+fn report(mode str, size i64, count i64, ms i64) {
+	let (slabs, large, maps) = hearth.HeapStats()
+	say.Line("mode", mode, "size", size, "count", count, "ms", ms, "entries", len(cache),
+		"slabs", slabs, "large", large, "heapmaps", maps, "maps", proc("/proc/self/maps", ""),
+		"rss", proc("/proc/self/status", "VmRSS:"))
+}
+
+fn churn(size i64, count i64) {
+	let t0 = tide.Now()
+	for i in 0..count {
+		hearth.Reset()
+		cache[keep("k")] = keep(twine.Repeat("x", size))
+	}
+	report("churn", size, count, tide.Since(t0) / tide.Millisecond)
+}
+
+fn fill(size i64, count i64) {
+	let t0 = tide.Now()
+	for i in 0..count {
+		hearth.Reset()
+		cache[keep("k{i}")] = keep(twine.Repeat("x", size))
+	}
+	report("fill", size, count, tide.Since(t0) / tide.Millisecond)
+	// Delete every other entry: the dropped values are freed at the next reset.
+	for i in 0..count {
+		if i % 2 == 0 {
+			delete(cache, "k{i}")
+		}
+	}
+	hearth.Reset()
+	report("deleted", size, count, tide.Since(t0) / tide.Millisecond)
+	// Then keep that many again.
+	for i in 0..count {
+		if i % 2 == 0 {
+			hearth.Reset()
+			cache[keep("j{i}")] = keep(twine.Repeat("y", size))
+		}
+	}
+	hearth.Reset()
+	report("refill", size, count, tide.Since(t0) / tide.Millisecond)
+}
+
+fn build(size i64, count i64) {
+	let t0 = tide.Now()
+	for i in 0..count {
+		hearth.Reset()
+		let v = twine.Repeat("x", size)
+		if len(v) != size {
+			return
+		}
+	}
+	report("build", size, count, tide.Since(t0) / tide.Millisecond)
+}
+
+fn large(size i64, count i64) {
+	let t0 = tide.Now()
+	for i in 0..count {
+		hearth.Reset()
+		slot = keep(make([]u8, size))
+	}
+	report("large", size, count, tide.Since(t0) / tide.Millisecond)
+}
+
+fn main() {
+	let args = quarry.Args()
+	let mode = args[1]
+	let size = mint.Atoi(args[2]) catch _ { 5000 }
+	let count = mint.Atoi(args[3]) catch _ { 1000 }
+	if mode == "churn" {
+		churn(size, count)
+	} else if mode == "fill" {
+		fill(size, count)
+	} else if mode == "build" {
+		build(size, count)
+	} else {
+		large(size, count)
+	}
+}

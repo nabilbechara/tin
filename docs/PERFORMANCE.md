@@ -520,3 +520,25 @@ poll words. The ordinary poll is a context load and a cold branch (x86-64 also t
 loaded word). Cold stubs preserve registers, including leaf-function homes. The compiler
 keeps existing allocation and register-home decisions; the poll check stays inside loops.
 The watchdog is started only for an opted-in executable.
+
+## Long-lived blocks above 4 KiB (Linux arm64)
+
+The ingot heap served only blocks up to 4 KiB from slabs: a bigger kept value had a
+page-rounded mapping of its own, unmapped when dropped (#345). The classes now continue to
+256 KiB about 25% apart, and the mappings of blocks up to 4 MiB are kept for reuse
+(`tools/ci/heap_check.py`, fixture `blocks.tin`; docker `debian:bookworm` on Apple silicon,
+arm64, one core; "base" is main at `baae526`).
+
+| workload | base | now |
+|---|---:|---:|
+| 200000 keep + overwrite of one 5000-byte value (less 2.5 s to build it) | 499 ms | about 100 ms |
+| 60000 distinct 5000-byte values kept, RSS | 497 MB | 317 MB |
+| the same after deleting every other one, mappings in /proc/self/maps | 30008 | 11 |
+| the same, kept again: RSS | 505 MB | 323 MB |
+| 20000 times a 300000-byte block made and dropped | 802 ms | 289 ms |
+| 5000 times a 1000000-byte block made and dropped | 697 ms | 273 ms |
+| 300 times an 8000000-byte block made and dropped (above 4 MiB: unchanged) | 163 ms | 180 ms |
+
+The 5000-byte values take 5120 bytes of a slab each instead of a page-rounded 8192, and the
+memory of deleted values is reused instead of unmapped, which is what left 30008 mappings
+(the default `vm.max_map_count` is 65530) after half of them were deleted.

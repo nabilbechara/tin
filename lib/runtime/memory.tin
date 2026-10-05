@@ -194,6 +194,9 @@ fn mem_map(n i64, flags i64) i64 {
 	return p
 }
 
+// mem_class is the size class of a block of sz bytes with its header: 16 bytes apart up to 64,
+// then four classes per doubling pair up to 4 KiB (k 0 to 15), then four per doubling, 25%
+// apart, up to 256 KiB (k 16 to 39, #345). Bigger blocks have no class (-1).
 fn mem_class(sz i64) i64 {
 	if sz <= 64 {
 		return ((sz + 15) >> 4) - 1
@@ -210,12 +213,26 @@ fn mem_class(sz i64) i64 {
 		s = s * 2
 		k = k + 2
 	}
-	return -1
+	if sz > 262144 {
+		return -1
+	}
+	mut base = 4096
+	mut i = 0
+	for sz > 2 * base {
+		base = base * 2
+		i = i + 1
+	}
+	let step = base >> 2
+	return 16 + (i << 2) + (sz - base + step - 1) / step - 1
 }
 
 fn mem_class_size(k i64) i64 {
 	if k < 4 {
 		return 16 * (k + 1)
+	}
+	if k >= 16 {
+		let m = k - 16
+		return (1024 << (m >> 2)) * (5 + (m & 3))
 	}
 	let j = k - 4
 	let s = 64 << (j >> 1)
@@ -225,8 +242,52 @@ fn mem_class_size(k i64) i64 {
 	return s * 2
 }
 
+// mem_fl is the heap word of class k's free list.
+fn mem_fl(k i64) i64 {
+	if k < 16 {
+		return 6 + k
+	}
+	return 10 + k
+}
+
+// Blocks above the largest class are mappings of their own. Up to 4 MiB a mapping is rounded
+// up to one of 16 sizes (four per doubling from 256 KiB) so that a freed one serves any block of
+// its class, and a heap keeps up to largeCacheCap bytes of them for reuse instead of unmapping;
+// bigger blocks map exactly their pages and are unmapped when freed.
+const largeCacheCap = 8388608
+
+// mem_large_class is the mapping class of a block of sz bytes with its header, or -1 above 4 MiB.
+fn mem_large_class(sz i64) i64 {
+	if sz > 4194304 {
+		return -1
+	}
+	mut base = 262144
+	mut i = 0
+	for sz > 2 * base {
+		base = base * 2
+		i = i + 1
+	}
+	let step = base >> 2
+	return (i << 2) + (sz - base + step - 1) / step - 1
+}
+
+fn mem_large_size(lk i64) i64 {
+	return (65536 << (lk >> 2)) * (5 + (lk & 3))
+}
+
+// mem_map_size is the bytes a block above the largest class maps for sz bytes with its header.
+fn mem_map_size(page i64, sz i64) i64 {
+	let lk = mem_large_class(sz)
+	if lk >= 0 {
+		return mem_large_size(lk)
+	}
+	return (sz + page - 1) & -page
+}
+
 // Heap words: flags, page size, return lock/head, slab bump/end, 16 local free lists, then
-// (word 22) the bytes of slabs and large blocks it has mapped (#356).
+// (word 22) the bytes of slabs and large blocks it has mapped (#356), 23 the bytes of its slabs,
+// 24 how many mappings it holds, 25 the bytes of large mappings cached for reuse, the free lists
+// of classes 16 to 39 (words 26 to 49) and of the large mapping classes (words 50 to 65).
 fn mem_heap_new(flags i64, page i64) i64 {
 	let p = mem_map(page, flags)
 	p[0] = flags
@@ -255,8 +316,8 @@ fn mem_drain(heap i64) {
 	for p != 0 {
 		let next = p[0]
 		let k = mem_class(((p - 8)[0] & 140737488355327) + 16)
-		p[0] = heap[6 + k]
-		heap[6 + k] = p
+		p[0] = heap[mem_fl(k)]
+		heap[mem_fl(k)] = p
 		p = next
 	}
 }
@@ -277,14 +338,30 @@ fn mem_alloc(heap i64, n_in i64, zero i64) i64 {
 	let k = mem_class(n + 16)
 	mut b = 0
 	if k < 0 {
-		let size = (n + 16 + heap[1] - 1) & -heap[1]
+		let size = mem_map_size(heap[1], n + 16)
+		let lk = mem_large_class(n + 16)
+		if lk >= 0 && heap[50 + lk] != 0 {
+			// A mapping kept from an earlier block of its class: no system call.
+			b = heap[50 + lk]
+			heap[50 + lk] = b[0]
+			heap[25] -= size
+			__atomic_add(&memoryCached, 0 - size)
+			b[0] = heap
+			b[1] = n
+			if zero != 0 {
+				memset(b + 16, 0, n)
+			}
+			return b + 16
+		}
 		b = mem_map(size, heap[0])
 		mem_mapped(heap, size)
+		__atomic_add(heap + 192, 1)
 	} else {
 		mem_drain(heap)
-		let p = heap[6 + k]
+		let fl = mem_fl(k)
+		let p = heap[fl]
 		if p != 0 {
-			heap[6 + k] = p[0]
+			heap[fl] = p[0]
 			(p - 8)[0] = n
 			if zero != 0 {
 				memset(p, 0, n)
@@ -293,10 +370,17 @@ fn mem_alloc(heap i64, n_in i64, zero i64) i64 {
 		}
 		let bs = mem_class_size(k)
 		if heap[4] + bs > heap[5] {
-			let slab = mem_map(1048576, heap[0])
-			mem_mapped(heap, 1048576)
-			heap[4] = slab
-			heap[5] = slab + 1048576
+			// A slab holds at least 16 blocks of the class it was made for.
+			mut slab = 1048576
+			if bs * 16 > slab {
+				slab = bs * 16
+			}
+			let m = mem_map(slab, heap[0])
+			mem_mapped(heap, slab)
+			__atomic_add(heap + 192, 1)
+			heap[23] += slab
+			heap[4] = m
+			heap[5] = m + slab
 		}
 		b = heap[4]
 		heap[4] = b + bs
@@ -315,13 +399,23 @@ fn mem_free(p i64, current i64) {
 	let n = b[1] & 140737488355327
 	let k = mem_class(n + 16)
 	if k < 0 {
-		mem_mapped(heap, 0 - ((n + 16 + heap[1] - 1) & -heap[1]))
-		rt_sys_munmap(b, (n + 16 + heap[1] - 1) & -heap[1])
+		let size = mem_map_size(heap[1], n + 16)
+		let lk = mem_large_class(n + 16)
+		if lk >= 0 && heap == current && heap[25] + size <= largeCacheCap {
+			b[0] = heap[50 + lk]
+			heap[50 + lk] = b
+			heap[25] += size
+			__atomic_add(&memoryCached, size)
+			return
+		}
+		mem_mapped(heap, 0 - size)
+		__atomic_add(heap + 192, -1)
+		rt_sys_munmap(b, size)
 		return
 	}
 	if heap == current {
-		p[0] = heap[6 + k]
-		heap[6 + k] = p
+		p[0] = heap[mem_fl(k)]
+		heap[mem_fl(k)] = p
 		return
 	}
 	mem_lock(heap + 16)
@@ -339,11 +433,21 @@ fn mem_realloc(heap i64, p i64, n i64) i64 {
 		return 0
 	}
 	let old = (p - 8)[0] & 140737488355327
-	// Keep the recorded class stable; growing within it needs no mapping or copy.
-	if n > old && mem_class(old + 16) >= 0 && n + 16 <= mem_class_size(mem_class(old + 16)) {
-		mem_failpoint(n)
-		(p - 8)[0] = (p - 8)[0] - old + n
-		return p
+	// Keep the recorded class stable; growing within it (or within a large block's mapping)
+	// needs no mapping or copy.
+	if n > old {
+		let ok = mem_class(old + 16)
+		mut cap = 0
+		if ok >= 0 {
+			cap = mem_class_size(ok)
+		} else {
+			cap = mem_map_size((p - 16)[0][1], old + 16)
+		}
+		if n + 16 <= cap {
+			mem_failpoint(n)
+			(p - 8)[0] = (p - 8)[0] - old + n
+			return p
+		}
 	}
 	let q = mem_alloc(heap, n, 0)
 	mut copy_ = old

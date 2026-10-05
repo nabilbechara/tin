@@ -76,12 +76,19 @@ cores never share a line.
 - Plain programs never reset: they release everything at exit.
 
 **Ingot heap.** `rt_ingot_alloc(n)` returns zeroed, 16-byte-aligned memory from the
-core's mmap heap. The 16 classes are 16, 32, 48, 64, 96, 128, 192, 256 ... 3072,
-4096 bytes, including a 16-byte `[owning heap, size word]` header (the size word's bits
-47-62 hold the reclamation count, below). Local free
-lists and 1 MiB slab bump sources live in the heap's own page mapping. Larger blocks
-have a page-rounded mapping of their own; `rt_ingot_free(p)` releases them with
-`munmap`. Request pool chunks use the same checked mapping allocator.
+core's mmap heap. There are 40 classes, including a 16-byte `[owning heap, size word]`
+header (the size word's bits 47-62 hold the reclamation count, below): 16, 32, 48, 64,
+96, 128, 192, 256 ... 3072, 4096 bytes, then four per doubling about 25% apart (5120, 6144,
+7168, 8192, 10240 ... 229376, 262144; #345), so a 5 KB value takes 5120 bytes, not a page-
+rounded 8192. Local free lists and the slab bump source live in the heap's own page mapping;
+a slab is 1 MiB, or 16 blocks of the class it was made for when that is more. A block above
+the largest class has a mapping of its own: up to 4 MiB it is rounded to one of 16 sizes
+(256 KiB to 4 MiB, four per doubling) and a heap keeps up to 8 MiB of freed ones for reuse
+(they do not count toward the memory bounds below), so churn of such blocks makes no
+system calls and does not fragment the address space; a bigger block maps exactly its
+pages, and `rt_ingot_free(p)` releases it with `munmap`. `hearth.HeapStats()` reports a core's
+slab bytes, large-block bytes (live and kept) and mapping count. Request pool chunks use the
+same checked mapping allocator.
 
 `rt_ingot_free(p)` returns a small block directly when called on its owning core.
 A different core appends it to the owner's return queue under an atomic lock; the

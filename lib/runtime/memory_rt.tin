@@ -5,6 +5,7 @@ shared mut memoryFailAfter i64 = -1
 shared mut memoryAllocCount i64
 shared mut memoryVectorScalar i64
 shared mut memoryMapped i64 // bytes every heap has mapped: slabs and large blocks (#356)
+shared mut memoryCached i64 // of those, the large mappings heaps keep for reuse (#345)
 mut memoryHeap i64
 
 fn mem_failpoint(n i64) {
@@ -25,14 +26,25 @@ fn rt_memory_mapped(p i64) i64 {
     if p == 0 { return 0 }
     let heap = (p-16)[0]
     let n = ((p-8)[0]&140737488355327)+16
-    if mem_class(n) >= 0 { return 0 }
-    return (n+heap[1]-1)&-heap[1]
+    let k = mem_class(n)
+    if k >= 16 { return mem_class_size(k) }
+    if k >= 0 { return 0 }
+    return mem_map_size(heap[1], n)
+}
+
+// rt_heap_stats is what this core's heap has from the system (#345): the bytes of its slabs, the
+// bytes of its large blocks (live ones and the mappings it keeps for reuse) and how many mappings
+// that is in all.
+fn rt_heap_stats() (i64, i64, i64) {
+    if memoryHeap == 0 { return 0, 0, 0 }
+    let slabs = __atomic_load(memoryHeap+184)
+    return slabs, __atomic_load(memoryHeap+176) - slabs, __atomic_load(memoryHeap+192)
 }
 
 // rt_memory_heap_mapped is the bytes this core's heap has mapped (#356).
 fn rt_memory_heap_mapped() i64 {
     if memoryHeap == 0 { return 0 }
-    return __atomic_load(memoryHeap+176)
+    return __atomic_load(memoryHeap+176) - memoryHeap[25]
 }
 
 fn rt_memory_test_setup() {

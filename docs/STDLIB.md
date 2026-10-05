@@ -217,6 +217,7 @@ Package hearth runs a program on every core: one thread per core, each with its 
 - `PoolChunk() i64`: PoolChunk is the request pool chunk size in bytes each core uses (after pool_tune).
 - `PoolCapacity() i64`: PoolCapacity is the usable size in bytes of this core's current base pool chunk (0 before its first request allocation).
 - `Reset()`: Reset ends the current request: the core's pool is emptied for the next one.
+- `HeapStats() (i64, i64, i64)`: HeapStats reports what this core's long-lived heap has from the system (#345): the bytes of its slabs (blocks up to 256 KiB), the bytes of the mappings of its larger blocks (those in use and those kept for reuse) and the number of mappings in all.
 - `RcStats() (i64, i64, i64)`: RcStats reports what long-lived memory this core still counts (#176): the number of counted blocks, their bytes and how many dropped blocks wait in the limbo.
 
 ## relay
