@@ -35,7 +35,7 @@ shared mut dyn_tables Vec[i64] // [concrete type, dyn type, keep function, metho
 shared mut ck_escaping_cells Vec[i64] // variable names that must be allocated in heap cells
 
 fn sym_new(kind i64, name i64, pos i64) Sym {
-	let s = cast(Sym, calloc(31, 8))
+	let s = cast(Sym, calloc(35, 8))
 	s.kind = kind
 	s.name = name
 	s.pos = pos
@@ -4630,6 +4630,73 @@ fn check_cond(c Node) {
 	}
 }
 
+// ---- slice aliases (#352): `mut ys = xs` makes one slice with two names, and append to either
+// grows both. In user code, reading a name after append grew the slice it shares is E641. ----
+
+fn alias_slice_local(s Sym) i64 {
+	return i64(cast(i64, s) != 0 && s.kind == SYM_LOCAL && s.captured == 0 && s.cell == 0 && kind_of(cast(Ty, s.type_)) == K_SLICE)
+}
+
+// alias_unlink makes a stop sharing a slice with another name.
+fn alias_unlink(a Sym) {
+	let p = cast(Sym, a.alias)
+	if cast(i64, p) != 0 && p.alias2 == cast(i64, a) {
+		p.alias2 = 0
+	}
+	let q = cast(Sym, a.alias2)
+	if cast(i64, q) != 0 && q.alias == cast(i64, a) {
+		q.alias = 0
+	}
+	a.alias = 0
+	a.alias2 = 0
+	a.stale = 0
+}
+
+// alias_link notes that a now names the slice b names.
+fn alias_link(a Sym, b Sym) {
+	if ck_trusted != 0 || alias_slice_local(a) == 0 || alias_slice_local(b) == 0 || cast(i64, a) == cast(i64, b) {
+		return
+	}
+	alias_unlink(a)
+	a.alias = cast(i64, b)
+	b.alias2 = cast(i64, a)
+}
+
+// alias_grown notes that append grew the slice v names: every other name for it changed too.
+fn alias_grown(pos i64, v Sym) {
+	if ck_trusted != 0 || alias_slice_local(v) == 0 {
+		return
+	}
+	let p = cast(Sym, v.alias)
+	if cast(i64, p) != 0 {
+		p.stale = pos
+		p.stale_by = cast(i64, v)
+	}
+	let q = cast(Sym, v.alias2)
+	if cast(i64, q) != 0 {
+		q.stale = pos
+		q.stale_by = cast(i64, v)
+	}
+}
+
+// alias_read reports a read of a name whose slice append grew through another name.
+fn alias_read(pos i64, s Sym) {
+	if s.stale == 0 {
+		return
+	}
+	let by = cast(Sym, s.stale_by)
+	s.stale = 0
+	let u = err_code(pos, cstr("E641 SLICE_ALIAS"))
+	buf_str(u, cstr("'"))
+	buf_str(u, s.name)
+	buf_str(u, cstr("' is the same slice as '"))
+	buf_str(u, by.name)
+	buf_str(u, cstr("', which append has grown since: '"))
+	buf_str(u, s.name)
+	buf_str(u, cstr("' changed too; copy the slice (sift.Clone) when two independent slices are meant"))
+	err_end(cast(Buf, u))
+}
+
 fn check_let(s i64) {
 	let pos = cast(Node, s).pos
 	mut t = 0
@@ -4675,6 +4742,9 @@ fn check_let(s i64) {
 		return
 	}
 	cast(LetStmt, s).sym = declare_local(pos, cast(LetStmt, s).name, t)
+	if cast(i64, init) != 0 && init.kind == EX_IDENT && ck_trusted == 0 {
+		alias_link(cast(Sym, cast(LetStmt, s).sym), lookup_name(cast(IdentExpr, init).name))
+	}
 	len_alias_remember(cast(Sym, cast(LetStmt, s).sym), cast(i64, init))
 	if cast(Sym, cast(LetStmt, s).sym).cell != 0 {
 		let sym = cast(Sym, cast(LetStmt, s).sym)
@@ -4752,6 +4822,17 @@ fn check_assign(s i64) {
 	let target = cast(AssignStmt, s).target
 	let v = cast(Node, cast(AssignStmt, s).value)
 	shared_let_write(cast(Node, s).pos, target)
+	if ck_trusted == 0 && cast(Node, target).kind == EX_IDENT {
+		let ts = lookup_name(cast(IdentExpr, target).name)
+		if alias_slice_local(ts) != 0 {
+			if v.kind == EX_IDENT {
+				alias_link(ts, lookup_name(cast(IdentExpr, v).name))
+			} else if !(v.kind == EX_CALL && cast(Call, v).name != 0 && streq(cast(Call, v).name, cstr("append")) != 0 && cast(Call, v).args.len > 0 && cast(Node, vec_get(cast(Call, v).args, 0)).kind == EX_IDENT && streq(cast(IdentExpr, vec_get(cast(Call, v).args, 0)).name, cast(IdentExpr, target).name) != 0) {
+				// xs = something else: xs no longer shares a slice with another name
+				alias_unlink(ts)
+			}
+		}
+	}
 	sb_assign(cast(Node, s).pos, target, cast(i64, v))
 	if (v.kind == EX_TRY || v.kind == EX_CATCH || v.kind == EX_WRAP) {
 		lower_try_stmt(s, cast(i64, v), 2, 0)

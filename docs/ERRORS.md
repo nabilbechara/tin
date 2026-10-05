@@ -3328,6 +3328,33 @@ example.tin:9:1: error E640 SCOPE_ESCAPE: a function cannot return a task handle
 
 Fix: wait for the task inside the scope block, and return its value rather than its handle.
 
+### E641 SLICE_ALIAS
+
+A slice is a reference: after `mut ys = xs` the two names are one slice, and `append` to
+either grows both. Reading the other name after the append is almost always a mistake
+(a "snapshot" that changed), so user code may not.
+
+```tin edition=1
+package main
+
+import "say"
+
+fn main() {
+	mut xs = []i64{1, 2, 3}
+	mut ys = xs
+	xs = append(xs, 4)
+	say.Line(len(ys))
+}
+```
+
+```text
+example.tin:9:15: error E641 SLICE_ALIAS: 'ys' is the same slice as 'xs', which append has grown since: 'ys' changed too; copy the slice (sift.Clone) when two independent slices are meant
+```
+
+Fix: take a copy for the snapshot (`mut ys = sift.Clone(xs)`), or stop using the old name.
+The check follows plain names inside one function: a slice reached through a field, a
+parameter's other callers or a closure is not tracked.
+
 ### E650 BOUNDARY
 
 A boundary block (`within`, `limit`, `guard`) gives its value with its last expression and

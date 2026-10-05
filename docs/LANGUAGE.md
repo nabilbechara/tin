@@ -223,7 +223,11 @@ ys = append(ys, 2)   // xs sees the new element too: append grows the header in 
 ```
 
 Use `keep(x)` (a deep copy into long-lived memory) or explicit copies (`copy`,
-`ore.Clone`, a new literal) when independent values are needed.
+`ore.Clone`, `sift.Clone`, a new literal) when independent values are needed.
+
+Slices stay references (#352), so the trap is guarded rather than removed: in user code, once
+`append` has grown a slice that another local name shares (`mut ys = xs`), reading that other
+name is E641 (`ys` would have changed under you). Take `sift.Clone(xs)` for a snapshot.
 
 ### Slices
 
