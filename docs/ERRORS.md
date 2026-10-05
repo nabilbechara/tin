@@ -1766,6 +1766,9 @@ example.tin:6:3: error E261 OUTSIDE_LOOP: break outside a loop
 
 Fix: use `return` to leave the function, or move the statement into the loop.
 
+A labeled `break outer` or `continue outer` needs an enclosing loop of the same function
+labeled `outer`; otherwise the message is `break names no enclosing loop: outer`.
+
 ### E262 RETURN_COUNT
 
 `return` gives one value per result of the function, and a function without results

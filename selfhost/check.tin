@@ -47,6 +47,7 @@ shared mut sc_marks Vec[i64]
 shared mut ck_fn Fn
 shared mut ck_loops i64
 shared mut ck_breaks i64 // loops plus switches
+shared mut ck_labels Vec[i64] // the label of each enclosing loop of this function (0: none)
 shared mut ck_file i64
 shared mut ck_pkg i64
 shared mut init_stmts Vec[i64] // global initializers run by __start
@@ -1991,6 +1992,7 @@ fn check_fn_closure(f i64) {
 	let saved_tbind = ck_tbind
 	let saved_loops = ck_loops
 	let saved_breaks = ck_breaks
+	let saved_labels = ck_labels
 	let saved_defers = ck_defers
 	let saved_mark = ck_defer_mark
 	let saved_syms = vec_clone(sc_syms)
@@ -2012,6 +2014,7 @@ fn check_fn_closure(f i64) {
 	ck_tbind = saved_tbind
 	ck_loops = saved_loops
 	ck_breaks = saved_breaks
+	ck_labels = saved_labels
 	ck_defers = saved_defers
 	ck_defer_mark = saved_mark
 	sc_syms = cast(Vec[Sym], cast(Vec[i64], saved_syms))
@@ -2033,6 +2036,7 @@ fn check_fn(f Fn) {
 	ck_fn = cast(Fn, f)
 	ck_loops = 0
 	ck_breaks = 0
+	ck_labels = vec_new[i64]()
 	ck_escaping_cells = vec_new[i64]()
 	len_aliases = vec_new[i64]()
 	if f.body != 0 {
@@ -2730,12 +2734,14 @@ fn check_stmt(s i64) {
 		check_cond(cast(Node, cast(WhileStmt, s).cond))
 		ck_loops = ck_loops + 1
 		ck_breaks = ck_breaks + 1
+		vec_push(ck_labels, cast(WhileStmt, s).label)
 		check_scoped(cast(Block, cast(WhileStmt, s).body))
 		if cast(WhileStmt, s).post != 0 {
 			push_scope()
 			check_stmt(cast(WhileStmt, s).post)
 			pop_scope()
 		}
+		ck_labels.len = ck_labels.len - 1
 		ck_loops = ck_loops - 1
 		ck_breaks = ck_breaks - 1
 	} else if k == ST_RANGE {
@@ -2747,10 +2753,14 @@ fn check_stmt(s i64) {
 	} else if k == ST_BREAK {
 		if ck_breaks == 0 {
 			err_code_at(cast(Node, s).pos, cstr("E261 OUTSIDE_LOOP"), cstr("break outside a loop"))
+		} else if cast(BreakStmt, s).label != 0 {
+			check_loop_label(cast(Node, s).pos, cstr("break"), cast(BreakStmt, s).label)
 		}
 	} else if k == ST_CONTINUE {
 		if ck_loops == 0 {
 			err_code_at(cast(Node, s).pos, cstr("E261 OUTSIDE_LOOP"), cstr("continue outside a loop"))
+		} else if cast(ContinueStmt, s).label != 0 {
+			check_loop_label(cast(Node, s).pos, cstr("continue"), cast(ContinueStmt, s).label)
 		}
 	} else if k == ST_BLOCK && cast(Block, s).flat != 0 {
 		check_stmts(cast(Block, s).stmts)
@@ -5486,6 +5496,7 @@ fn lower_range(s i64) {
 	}
 	w.cond = mk_bin(pos, cstr("<"), sym_ref_node(pos, cast(Sym, i)), limit_, ty_bool)
 	w.post = assign_stmt(pos, sym_ref_node(pos, cast(Sym, i)), step)
+	w.label = cast(RangeStmt, s).label
 	let nb = cast(Block, empty_block(pos))
 	mut j = 0
 	for j < pre.len {
@@ -5500,6 +5511,7 @@ fn lower_range(s i64) {
 	let saved = safe_pairs.len
 	ck_loops = ck_loops + 1
 	ck_breaks = ck_breaks + 1
+	vec_push(ck_labels, w.label)
 	push_scope()
 	check_pre_stmts(cast(Vec[i64], nb.stmts))
 	if (k == K_SLICE || k == K_STRING) && key != 0 && cast(Node, key).kind == EX_IDENT && cast(RangeStmt, s).define != 0 && xname != 0 && names_assigned(body, xname, cast(IdentExpr, key).name) == 0 {
@@ -5512,9 +5524,23 @@ fn lower_range(s i64) {
 	check_stmt(body)
 	safe_pairs.len = saved
 	pop_scope()
+	ck_labels.len = ck_labels.len - 1
 	ck_loops = ck_loops - 1
 	ck_breaks = ck_breaks - 1
 	pop_scope()
+}
+
+// check_loop_label reports a labeled break or continue whose label names no enclosing loop.
+fn check_loop_label(pos i64, what i64, name i64) {
+	mut i = ck_labels.len - 1
+	for i >= 0 {
+		let l = vec_get(ck_labels, i)
+		if l != 0 && streq(l, name) != 0 {
+			return
+		}
+		i = i - 1
+	}
+	err_code_at(pos, cstr("E261 OUTSIDE_LOOP"), str_cat3(what, cstr(" names no enclosing loop: "), name))
 }
 
 // check_pre_stmts declares the already-checked lets a lowered loop puts before its
@@ -7280,6 +7306,7 @@ fn lower_for_init(s i64) {
 	}
 	ck_loops = ck_loops + 1
 	ck_breaks = ck_breaks + 1
+	vec_push(ck_labels, inner.label)
 	check_scoped(cast(Block, inner.body))
 	safe_pairs.len = saved
 	if inner.post != 0 {
@@ -7309,6 +7336,7 @@ fn lower_for_init(s i64) {
 			}
 		}
 	}
+	ck_labels.len = ck_labels.len - 1
 	ck_loops = ck_loops - 1
 	ck_breaks = ck_breaks - 1
 	pop_scope()

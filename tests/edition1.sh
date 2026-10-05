@@ -44,7 +44,8 @@ fi
 # the entry and ends: the core's own stack is an epoch participant (#176). A detached task
 # that never ends holds back releases; past the limbo's cap drops are pinned (#176).
 # guard CALL is the guard block on one call, and a panic's fault carries its backtrace (#142).
-for name in boundaries fault_wrap once polls deadlines borrows guard_call limbo_cap
+# A labeled break or continue acts on the loop its label names, through every loop form.
+for name in boundaries fault_wrap once polls deadlines borrows guard_call limbo_cap labels
 do
 	polls=
 	[ "$name" != polls ] || polls=-polls
@@ -65,6 +66,17 @@ fi
 if ! cmp -s tests/edition1/guard_call_bad.err "$tmp/guard_call_bad.err"; then
 	echo "FAIL edition1/guard_call_bad: diagnostic mismatch"
 	diff -u tests/edition1/guard_call_bad.err "$tmp/guard_call_bad.err" || true
+	exit 1
+fi
+
+# A label that names no enclosing loop of the function is rejected.
+if "$compiler" -edition 1 -o "$tmp/labels_bad" tests/edition1/labels_bad.tin >"$tmp/labels_bad.out" 2>"$tmp/labels_bad.err"; then
+	echo "FAIL edition1/labels_bad: unexpectedly accepted"
+	exit 1
+fi
+if ! cmp -s tests/edition1/labels_bad.err "$tmp/labels_bad.err"; then
+	echo "FAIL edition1/labels_bad: diagnostic mismatch"
+	diff -u tests/edition1/labels_bad.err "$tmp/labels_bad.err" || true
 	exit 1
 fi
 
