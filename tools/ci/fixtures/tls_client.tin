@@ -4,6 +4,9 @@
 //   timeout ADDR MS       handshake with Config.Timeout, print the fault and how long it took
 //   keyupdate ADDR        talk to an interactive openssl s_server that sends KeyUpdates
 //   truncated ADDR        read until the peer closes TCP without close_notify
+//   resume ADDR N [ROOTS]  N connections in a row (HTTP/1.0 GET each), one line each: whether it resumed
+//                         a session, the suite, the group, the certificates seen; ROOTS is a PEM file
+//                         to verify against (for the name "localhost") instead of no verification
 //   https URL             wire GET of an https:// URL (no verification); POST with a body too
 //   wss URL               websocket DialTLS, one text message and its echo
 package main
@@ -59,6 +62,39 @@ fn get(addr str, alpn str) {
 	}
 	say.Line("ok", suite_name(c.CipherSuite()), c.Group(), "alpn="+c.ALPN(), len(c.PeerCertificates()), len(buf) > 0)
 	c.Close()
+}
+
+fn resume(addr str, n i64, roots str) {
+	for i in 0..n {
+		mut cfg = insecure()
+		if roots != "" {
+			let pem = quarry.ReadFile(roots) catch e {
+				say.Line("fault", e)
+				return
+			}
+			cfg = tls.Config{ServerName: "localhost", RootCAs: pem, Timeout: 10000000000}
+		}
+		let c = tls.Dial(addr, cfg) catch e {
+			say.Line("fault", e)
+			return
+		}
+		c.Write("GET / HTTP/1.0\r\n\r\n") catch e {
+			say.Line("fault", e)
+			return
+		}
+		let buf = make([]u8, 0, 65536)
+		for {
+			c.Read(mut buf, 65536) catch e {
+				if !wire.IsEOF(e) {
+					say.Line("fault", e)
+					return
+				}
+				break
+			}
+		}
+		say.Line("resumed", c.Resumed(), suite_name(c.CipherSuite()), c.Group(), len(c.PeerCertificates()), len(buf) > 0)
+		c.Close()
+	}
 }
 
 fn verify(addr str, name str) {
@@ -175,6 +211,13 @@ fn main() {
 		keyupdate(args[2])
 	} else if cmd == "truncated" {
 		truncated(args[2])
+	} else if cmd == "resume" {
+		let n = mint.Atoi(args[3]) catch _ { 3 }
+		mut roots = ""
+		if len(args) > 4 {
+			roots = args[4]
+		}
+		resume(args[2], n, roots)
 	} else if cmd == "https" {
 		https(args[2])
 	} else if cmd == "wss" {

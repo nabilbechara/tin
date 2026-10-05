@@ -127,6 +127,8 @@ const extALPN = 16
 const extSupportedVersions = 43
 const extCookie = 44
 const extKeyShare = 51
+const extPSKModes = 45
+const extPreSharedKey = 41
 const extRecordSizeLimit = 28
 
 const groupX25519 = 0x001d
@@ -157,9 +159,25 @@ fn is_ip(name str) bool {
 	return digits
 }
 
-// client_hello encodes a ClientHello. share is the key_share entry (group, key); cookie is the
-// HelloRetryRequest's cookie or empty.
-fn client_hello(random []u8, session []u8, suites []i64, name str, alpn []str, group i64, share []u8, cookie []u8) []u8 {
+// pskOffer is a ticket offered in a ClientHello: its identity, the obfuscated age and the hash size
+// the binder takes (the binder itself is filled in once the bytes before it are known).
+type pskOffer struct {
+	identity []u8
+	age      i64
+	hlen     i64
+}
+
+// chOptions are the optional parts of a ClientHello: the HelloRetryRequest's cookie, and a PSK.
+type chOptions struct {
+	cookie []u8
+	offer  ?pskOffer
+}
+
+// client_hello encodes a ClientHello. share is the key_share entry (group, key). With a PSK
+// offer it ends with psk_key_exchange_modes and pre_shared_key, whose binder is zeros: the
+// caller computes it over the message without its last binders_len(offer) bytes.
+fn client_hello(random []u8, session []u8, suites []i64, name str, alpn []str, group i64, share []u8, opt chOptions) []u8 {
+	let cookie = opt.cookie
 	mut b = make([]u8, 0, 512)
 	b = append(b, hsClientHello)
 	let body = open_len(mut b, 3)
@@ -220,9 +238,34 @@ fn client_hello(random []u8, session []u8, suites []i64, name str, alpn []str, g
 	put16(mut b, group)
 	put16(mut b, len(share))
 	b = append(b, share...)
+	let offer = opt.offer
+	if offer != nil {
+		put16(mut b, extPSKModes)
+		put16(mut b, 2)
+		b = append(b, 1, 1) // psk_dhe_ke
+		put16(mut b, extPreSharedKey)
+		let e = open_len(mut b, 2)
+		let ids = open_len(mut b, 2)
+		put16(mut b, len(offer.identity))
+		b = append(b, offer.identity...)
+		b = append(b, u8(offer.age>>24), u8(offer.age>>16), u8(offer.age>>8), u8(offer.age))
+		close_len(mut b, ids, 2)
+		let bs = open_len(mut b, 2)
+		b = append(b, u8(offer.hlen))
+		for i in 0..offer.hlen {
+			b = append(b, 0)
+		}
+		close_len(mut b, bs, 2)
+		close_len(mut b, e, 2)
+	}
 	close_len(mut b, exts, 2)
 	close_len(mut b, body, 3)
 	return b
+}
+
+// binders_len is how many bytes at the end of a ClientHello with a PSK offer are binders.
+fn binders_len(hlen i64) i64 {
+	return 2 + 1 + hlen
 }
 
 // serverHello is what the client takes from a ServerHello or HelloRetryRequest.
@@ -233,6 +276,7 @@ type serverHello struct {
 	share   []u8 // the server's key share (ServerHello)
 	cookie  []u8 // HelloRetryRequest
 	version i64  // supported_versions, 0 when absent
+	psk     bool // the server accepted the PSK offered (pre_shared_key with identity 0)
 }
 
 // parse_server_hello reads a ServerHello body; alert is set when it is malformed or not
@@ -275,6 +319,11 @@ fn parse_server_hello(body []u8, session []u8) !serverHello {
 			if !sh.retry {
 				sh.share = x.vec16()
 			}
+		} else if typ == extPreSharedKey && !sh.retry {
+			if x.u16v() != 0 {
+				fail alert_fault(alertIllegalParameter, "ServerHello selects a PSK identity that was not offered")
+			}
+			sh.psk = true
 		} else if typ == extCookie && sh.retry {
 			sh.cookie = x.vec16()
 			if len(sh.cookie) == 0 {
