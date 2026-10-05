@@ -7,36 +7,7 @@ const SYM_CONST = 2
 const SYM_FUNC = 3
 
 // Symbol layout.
-const S_KIND = 0
-const S_NAME = 1
-const S_POS = 2
-const S_SLOT = 3
-const S_VAL = 4
-const S_DONE = 5
-const S_FN = 6
-const S_INDEX = 7 // global var: index in prog_vars
-const S_REG = 8 // local home: register, REG_SLOT or REG_DEAD (set by codegen)
-const S_OFF = 9 // local home: frame offset when in a slot
-const S_USES = 10 // loop-weighted use count (set by analysis)
-const S_ADDR = 11 // address taken with &
-const S_TYPE = 12
-const S_DECL = 13 // const: its declaration
-const S_EXPR = 14 // non-integer const: its checked value expression
-const S_READS = 15 // times the variable is read (faults must be read)
-const S_SAFE = 16 // index proven within this slice's bounds (range/loop proofs)
-const S_MUT = 17 // mut parameter
 const S_REGION = 18
-const S_TLS = 19 // per-core global: slot + 1 in the core's context block
-const S_BIG = 20 // integer constant above 2^63-1 (its bits look negative)
-const S_UNINIT = 21 // global: its startup initializer has not run yet (check_init_order)
-const S_CAPTURED = 22 // captured variable proxy symbol inside closure
-const S_CAP_IDX = 23 // capture index in enclosing closure's capture list
-const S_CELL = 24 // symbol needs a heap cell (allocated via rt_alloc)
-const S_CELL_SYM = 25 // local symbol holding the cell address pointer
-const S_WORDS = 26 // multi-word local slot allocation size (default 1)
-const S_CAPBITS = 27 // region bits frame-local closures stored into this captured local (region pass)
-const S_CELL_OF = 28 // a $cell_ local: the variable whose cell it holds
-const S_KEPT_CAP = 29 // captured by a closure that may be kept (its cell's contents are unknown)
 const S_SCOPE_AT = 30 // how many scope blocks enclose its declaration (#232): task handles stay inside theirs
 
 const MAX_PARAMS = 8
@@ -886,7 +857,7 @@ fn check_const_value(c Decl) {
 			s.type_ = want
 			if is_integer_t(want) != 0 {
 				let value = mk_int(c.pos, v, 0)
-				value[8] = s.big
+				cast(IntLit, value).big = s.big
 				adapt_int(value, want)
 			}
 		}
@@ -981,7 +952,7 @@ fn const_value_b(e i64, iota i64) i64 {
 	let k = cast(Node, e).kind
 	cv_big = 0
 	if k == EX_INT {
-		cv_big = e[8]
+		cv_big = cast(IntLit, e).big
 		return cast(IntLit, e).val
 	}
 	if k == EX_IDENT {
@@ -1306,7 +1277,6 @@ fn make_start(main_fn Fn) {
 }
 
 // ---- reachability ----
-const F_INITWALK = 27 // walked by check_init_order
 shared mut reach_init Sym // the global whose initializer check_init_order walks (0: reachability)
 
 fn mark_reach(f Fn) {
@@ -1759,11 +1729,11 @@ fn scan_idents_in_expr(e i64, inner_params Vec[i64], outer_names Vec[i64], cells
 		mut ai = 0
 		for ai < arms.len {
 			let arm = cast(Vec[i64], vec_get(arms, ai))
-			scan_idents_in_expr(vec_get(arm, ARM_GUARD), inner_params, outer_names, cells)
-			if vec_get(arm, ARM_BLOCK) != 0 {
-				scan_idents_in_block(cast(Block, vec_get(arm, ARM_BODY)), cast(Vec[i64], inner_params), cast(Vec[i64], outer_names), cast(Vec[i64], cells))
+			scan_idents_in_expr(cast(MatchArm, arm).guard_, inner_params, outer_names, cells)
+			if cast(MatchArm, arm).block != 0 {
+				scan_idents_in_block(cast(Block, cast(MatchArm, arm).body), cast(Vec[i64], inner_params), cast(Vec[i64], outer_names), cast(Vec[i64], cells))
 			} else {
-				scan_idents_in_expr(vec_get(arm, ARM_BODY), inner_params, outer_names, cells)
+				scan_idents_in_expr(cast(MatchArm, arm).body, inner_params, outer_names, cells)
 			}
 			ai = ai + 1
 		}
@@ -1957,11 +1927,11 @@ fn scan_funclits_in_expr(e i64, outer_names i64, cells Vec[i64]) {
 		mut ai = 0
 		for ai < arms.len {
 			let arm = cast(Vec[i64], vec_get(arms, ai))
-			scan_funclits_in_expr(vec_get(arm, ARM_GUARD), outer_names, cells)
-			if vec_get(arm, ARM_BLOCK) != 0 {
-				scan_funclits_in_block(cast(Block, vec_get(arm, ARM_BODY)), outer_names, cast(i64, cells))
+			scan_funclits_in_expr(cast(MatchArm, arm).guard_, outer_names, cells)
+			if cast(MatchArm, arm).block != 0 {
+				scan_funclits_in_block(cast(Block, cast(MatchArm, arm).body), outer_names, cast(i64, cells))
 			} else {
-				scan_funclits_in_expr(vec_get(arm, ARM_BODY), outer_names, cells)
+				scan_funclits_in_expr(cast(MatchArm, arm).body, outer_names, cells)
 			}
 			ai = ai + 1
 		}
@@ -2518,10 +2488,8 @@ const CV_LEN = 6 // null-safe header word 0 (len of string, slice, map)
 const CV_CAP = 7 // null-safe header word 1
 const CV_DYN = 12 // concrete struct reference plus its (type, shape) table
 const CV_DYN_KEEP = 13 // call the table's keep entry and preserve its table word
-const CV_DYN_TABLE = 5 // registered table index for CV_DYN
 const CV_DYN_OBJECT = 14 // the object word of a checked dyn value
 const CV_DYN_DESC = 15 // a method descriptor loaded from a dyn value's table
-const CV_DYN_INDEX = 7 // method slot in a CV_DYN_DESC table
 const CV_DYN_TABLE_WORD = 16 // the table word of a checked dyn value
 
 fn intrinsic_call(pos i64, name i64, args i64, t i64) i64 {
@@ -2835,7 +2803,7 @@ fn bound_store(pos i64, v i64, t i64) i64 {
 
 // Constants become literals at their uses and require no stack slot or runtime work.
 fn check_local_consts(stmt Node) {
-	let decls = cast(Vec[i64], cast(i64, stmt)[2])
+	let decls = cast(ConstStmt, stmt).decls
 	mut i = 0
 	for i < decls.len {
 		mut start = i
@@ -3445,10 +3413,10 @@ fn mark_spawns(v Vec[i64], names Vec[i64]) {
 			mut ai = 0
 			for ai < arms.len {
 				let arm = cast(Vec[i64], vec_get(arms, ai))
-				if vec_get(arm, ARM_BLOCK) != 0 {
-					mark_spawns(cast(Vec[i64], cast(Block, vec_get(arm, ARM_BODY)).stmts), names)
+				if cast(MatchArm, arm).block != 0 {
+					mark_spawns(cast(Vec[i64], cast(Block, cast(MatchArm, arm).body).stmts), names)
 				} else {
-					mark_spawn_call(vec_get(arm, ARM_BODY), names)
+					mark_spawn_call(cast(MatchArm, arm).body, names)
 				}
 				ai = ai + 1
 			}
@@ -3605,8 +3573,8 @@ fn lower_select(s i64) {
 	mut i = 0
 	for i < n {
 		let arm = cast(Vec[i64], vec_get(arms, i))
-		let w = vec_get(arm, SELECT_ARM_WAIT)
-		let apos = vec_get(arm, SELECT_ARM_POS)
+		let w = cast(SelectArm, arm).wait
+		let apos = cast(SelectArm, arm).pos
 		mut kind = 0
 		mut src = 0
 		if cast(Node, w).kind == EX_CALL && cast(Call, w).callee != 0 && cast(Node, cast(Call, w).callee).kind == EX_SELECT && cast(Call, w).args.len == 0 {
@@ -3637,7 +3605,7 @@ fn lower_select(s i64) {
 			err_code_at(apos, cstr("E630 SELECT_ARM"), cstr("a select arm waits on l.Recv(), t.wait(), after(d) or canceled()"))
 			return
 		}
-		if kind >= 2 && vec_get(arm, SELECT_ARM_NAME) != 0 && kind != 2 {
+		if kind >= 2 && cast(SelectArm, arm).name != 0 && kind != 2 {
 			err_code_at(apos, cstr("E630 SELECT_ARM"), cstr("after(d) and canceled() give no value to bind"))
 			return
 		}
@@ -3772,7 +3740,7 @@ fn lower_select(s i64) {
 		} else {
 			let arm = cast(Vec[i64], vec_get(arms, i))
 			let k = vec_get(kinds, i)
-			let name = vec_get(arm, SELECT_ARM_NAME)
+			let name = cast(SelectArm, arm).name
 			if k == 1 || k == 2 {
 				mut take = 0
 				if k == 1 {
@@ -3792,8 +3760,8 @@ fn lower_select(s i64) {
 					}
 				}
 			}
-			let body = cast(Node, vec_get(arm, SELECT_ARM_BODY))
-			if vec_get(arm, SELECT_ARM_BLOCK) != 0 {
+			let body = cast(Node, cast(SelectArm, arm).body)
+			if cast(SelectArm, arm).block != 0 {
 				vec_push(tb, cast(i64, body))
 			} else if is_stmt_kind(body.kind) != 0 {
 				vec_push(tb, cast(i64, body))
@@ -5551,9 +5519,9 @@ fn check_pre_stmts(stmts Vec[i64]) {
 		let s = vec_get(stmts, i)
 		if cast(Node, s).kind == ST_LET && cast(LetStmt, s).sym != 0 {
 			vec_push(sc_syms, cast(Sym, cast(LetStmt, s).sym))
-		} else if cast(Node, s).kind == ST_BLOCK && cast(Block, s).flat != 0 && s[4] != 0 {
+		} else if cast(Node, s).kind == ST_BLOCK && cast(Block, s).flat != 0 && cast(Block, s).cellsym != 0 {
 			// a celled range variable: its cell sym is already a local, the variable itself enters scope
-			vec_push(sc_syms, cast(Sym, s[4]))
+			vec_push(sc_syms, cast(Sym, cast(Block, s).cellsym))
 		} else if cast(Node, s).kind == ST_IF && cast(Node, cast(IfStmt, s).cond).type_ != 0 {
 		} else {
 			check_stmt(s)
@@ -5593,7 +5561,7 @@ fn range_bind(pos i64, target i64, value i64, t i64, define i64) i64 {
 			vec_push(cast(Vec[i64], blk.stmts), let_stmt(pos, csym, alloc_call))
 			vec_push(cast(Vec[i64], blk.stmts), assign_stmt(pos, mk_mem(pos, sym_ref_node(pos, csym), 0, 0, 0, t), value))
 			blk.flat = 1
-			cast(i64, blk)[4] = cast(i64, sym)
+			blk.cellsym = cast(i64, sym)
 			return cast(i64, blk)
 		}
 		return cast(i64, l)
@@ -5944,7 +5912,6 @@ const MATCH_EXPR = 4 // inside an expression: as MATCH_VALUE, with expression ar
 const MR_SYM = 0 // record: the value local
 const MR_MODE = 1 // record: the mode
 const MR_HINT = 2 // record: the type the context expects (MATCH_EXPR), or 0
-const MS_REC = 3 // ST_MSTORE: the record of its match (ES_X is the value)
 
 shared mut mt_seq i64 // numbers the match locals that are assigned by name
 shared mut mt_variant i64 // the enum variant a pattern matches whole, or -1
@@ -5960,10 +5927,10 @@ fn mt_name(prefix i64) i64 {
 }
 
 fn mt_record(vs i64, mode i64, hint i64) i64 {
-	let rec = vec_new[i64]()
-	vec_push(rec, vs)
-	vec_push(rec, mode)
-	vec_push(rec, hint)
+	let rec = cast(MatchRec, calloc(3, 8))
+	rec.sym = vs
+	rec.mode = mode
+	rec.hint = hint
 	return cast(i64, rec)
 }
 
@@ -6018,7 +5985,7 @@ fn mt_arms_break(m MatchExpr) i64 {
 	mut i = 0
 	for i < arms.len {
 		let arm = cast(Vec[i64], vec_get(arms, i))
-		if vec_get(arm, ARM_BLOCK) != 0 && mt_breaks(cast(Vec[i64], cast(Block, vec_get(arm, ARM_BODY)).stmts)) != 0 {
+		if cast(MatchArm, arm).block != 0 && mt_breaks(cast(Vec[i64], cast(Block, cast(MatchArm, arm).body).stmts)) != 0 {
 			return 1
 		}
 		i = i + 1
@@ -6032,11 +5999,11 @@ fn mt_names_assigned(m MatchExpr, a i64, b i64) i64 {
 	mut i = 0
 	for i < arms.len {
 		let arm = cast(Vec[i64], vec_get(arms, i))
-		let body = cast(Node, vec_get(arm, ARM_BODY))
-		if vec_get(arm, ARM_BLOCK) != 0 && names_assigned(cast(i64, body), a, b) != 0 {
+		let body = cast(Node, cast(MatchArm, arm).body)
+		if cast(MatchArm, arm).block != 0 && names_assigned(cast(i64, body), a, b) != 0 {
 			return 1
 		}
-		if vec_get(arm, ARM_BLOCK) == 0 && body.kind == EX_MATCH && mt_names_assigned(cast(MatchExpr, body), a, b) != 0 {
+		if cast(MatchArm, arm).block == 0 && body.kind == EX_MATCH && mt_names_assigned(cast(MatchExpr, body), a, b) != 0 {
 			return 1
 		}
 		i = i + 1
@@ -6050,14 +6017,14 @@ fn mt_collect_decls(m MatchExpr, names Vec[i64]) {
 	mut i = 0
 	for i < arms.len {
 		let arm = cast(Vec[i64], vec_get(arms, i))
-		let pats = cast(Vec[i64], vec_get(arm, ARM_PATTERNS))
+		let pats = cast(Vec[i64], cast(MatchArm, arm).patterns)
 		mut j = 0
 		for j < pats.len {
 			mt_pattern_names(cast(Vec[i64], vec_get(pats, j)), names)
 			j = j + 1
 		}
-		let body = vec_get(arm, ARM_BODY)
-		if vec_get(arm, ARM_BLOCK) != 0 {
+		let body = cast(MatchArm, arm).body
+		if cast(MatchArm, arm).block != 0 {
 			collect_local_decls(cast(Block, body).stmts, names)
 		} else if cast(Node, body).kind == EX_MATCH {
 			mt_collect_decls(cast(MatchExpr, body), names)
@@ -6067,11 +6034,11 @@ fn mt_collect_decls(m MatchExpr, names Vec[i64]) {
 }
 
 fn mt_pattern_names(p Vec[i64], names Vec[i64]) {
-	if vec_get(p, PAT_KIND) == PAT_NAME_KIND && cast(Node, vec_get(p, PAT_NAME)).kind == EX_IDENT {
-		vec_push(names, cast(IdentExpr, vec_get(p, PAT_NAME)).name)
+	if cast(Pattern, p).kind == PAT_NAME_KIND && cast(Node, cast(Pattern, p).name).kind == EX_IDENT {
+		vec_push(names, cast(IdentExpr, cast(Pattern, p).name).name)
 	}
-	if vec_get(p, PAT_KIND) == PAT_VARIANT {
-		let kids = cast(Vec[i64], vec_get(p, PAT_CHILDREN))
+	if cast(Pattern, p).kind == PAT_VARIANT {
+		let kids = cast(Vec[i64], cast(Pattern, p).children)
 		mut j = 0
 		for j < kids.len {
 			mt_pattern_names(cast(Vec[i64], vec_get(kids, j)), names)
@@ -6082,12 +6049,12 @@ fn mt_pattern_names(p Vec[i64], names Vec[i64]) {
 
 // mt_arm_block is an arm's body as a block: its own, or one holding its expression.
 fn mt_arm_block(arm Vec[Node]) i64 {
-	let b = vec_get(arm, ARM_BODY)
-	if cast(i64, vec_get(arm, ARM_BLOCK)) != 0 {
+	let b = cast(MatchArm, arm).body
+	if cast(i64, cast(MatchArm, arm).block) != 0 {
 		return cast(i64, b)
 	}
-	let blk = cast(Block, empty_block(b.pos))
-	vec_push(cast(Vec[i64], blk.stmts), expr_stmt(b))
+	let blk = cast(Block, empty_block(cast(Node, b).pos))
+	vec_push(cast(Vec[i64], blk.stmts), expr_stmt(cast(Node, b)))
 	return cast(i64, blk)
 }
 
@@ -6121,19 +6088,19 @@ fn match_as_switch(s i64, m MatchExpr) i64 {
 	mut i = 0
 	for i < n {
 		let arm = cast(Vec[i64], vec_get(arms, i))
-		let pats = cast(Vec[i64], vec_get(arm, ARM_PATTERNS))
-		let guard_ = vec_get(arm, ARM_GUARD)
+		let pats = cast(Vec[i64], cast(MatchArm, arm).patterns)
+		let guard_ = cast(MatchArm, arm).guard_
 		let p0 = cast(Vec[i64], vec_get(pats, 0))
 		mut exprs = vec_new[i64]()
-		if pats.len == 1 && vec_get(p0, PAT_KIND) == PAT_WILD && guard_ == 0 {
+		if pats.len == 1 && cast(Pattern, p0).kind == PAT_WILD && guard_ == 0 {
 			if i != n - 1 {
 				return 0
 			}
 			exprs = cast(Vec[i64], 0)
 			deflt = 1
 		} else if tagless != 0 {
-			let x = vec_get(p0, PAT_A)
-			if guard_ == 0 || pats.len != 1 || vec_get(p0, PAT_KIND) != PAT_LITERAL || cast(Node, x).kind != EX_IDENT || streq(cast(IdentExpr, x).name, cstr("true")) == 0 {
+			let x = cast(Pattern, p0).a
+			if guard_ == 0 || pats.len != 1 || cast(Pattern, p0).kind != PAT_LITERAL || cast(Node, x).kind != EX_IDENT || streq(cast(IdentExpr, x).name, cstr("true")) == 0 {
 				return 0
 			}
 			vec_push(exprs, guard_)
@@ -6187,15 +6154,15 @@ fn match_as_switch(s i64, m MatchExpr) i64 {
 // match_case_expr is the switch case for pattern p of a match on t, or 0 when a switch
 // would read it differently. seen marks the enum variants already handled.
 fn match_case_expr(p Vec[i64], t Ty, seen Vec[i64], npats i64) i64 {
-	let k = vec_get(p, PAT_KIND)
+	let k = cast(Pattern, p).kind
 	if k == PAT_LITERAL {
 		if cast(i64, seen) != 0 {
 			return 0
 		}
-		return vec_get(p, PAT_A)
+		return cast(Pattern, p).a
 	}
 	if k == PAT_NAME_KIND {
-		let x = vec_get(p, PAT_NAME)
+		let x = cast(Pattern, p).name
 		if cast(i64, seen) != 0 {
 			mut name = cast(SelectExpr, x).name
 			if cast(Node, x).kind == EX_IDENT {
@@ -6220,7 +6187,7 @@ fn match_case_expr(p Vec[i64], t Ty, seen Vec[i64], npats i64) i64 {
 	if k != PAT_VARIANT || cast(i64, seen) == 0 {
 		return 0
 	}
-	let nm = vec_get(p, PAT_NAME)
+	let nm = cast(Pattern, p).name
 	mut name = cast(SelectExpr, nm).name
 	if cast(Node, nm).kind == EX_IDENT {
 		name = cast(IdentExpr, nm).name
@@ -6230,7 +6197,7 @@ fn match_case_expr(p Vec[i64], t Ty, seen Vec[i64], npats i64) i64 {
 		return 0
 	}
 	let v = cast(Vec[i64], vec_get(cast(Vec[i64], t.enum_), vi))
-	let kids = cast(Vec[i64], vec_get(p, PAT_CHILDREN))
+	let kids = cast(Vec[i64], cast(Pattern, p).children)
 	if kids.len > 0 && kids.len != vec_get(v, 2) {
 		return 0
 	}
@@ -6239,11 +6206,11 @@ fn match_case_expr(p Vec[i64], t Ty, seen Vec[i64], npats i64) i64 {
 	for j < kids.len {
 		let kid = cast(Vec[i64], vec_get(kids, j))
 		mut a = cast(IdentExpr, 0)
-		if vec_get(kid, PAT_KIND) == PAT_WILD {
-			a = cast(IdentExpr, node_new(EX_IDENT, vec_get(kid, PAT_POS)))
+		if cast(Pattern, kid).kind == PAT_WILD {
+			a = cast(IdentExpr, node_new(EX_IDENT, cast(Pattern, kid).pos))
 			a.name = cstr("_")
-		} else if vec_get(kid, PAT_KIND) == PAT_NAME_KIND && cast(Node, vec_get(kid, PAT_NAME)).kind == EX_IDENT && npats == 1 {
-			a = cast(IdentExpr, vec_get(kid, PAT_NAME))
+		} else if cast(Pattern, kid).kind == PAT_NAME_KIND && cast(Node, cast(Pattern, kid).name).kind == EX_IDENT && npats == 1 {
+			a = cast(IdentExpr, cast(Pattern, kid).name)
 			let ft = cast(Ty, field_type(t, vec_get(v, 1) + j))
 			if kind_of(ft) == K_STRUCT && ft.enum_ != 0 && enum_variant(ft, a.name) >= 0 {
 				return 0
@@ -6255,7 +6222,7 @@ fn match_case_expr(p Vec[i64], t Ty, seen Vec[i64], npats i64) i64 {
 		j = j + 1
 	}
 	seen.data[vi] = 1
-	let c = cast(Call, node_new(EX_CALL, vec_get(p, PAT_POS)))
+	let c = cast(Call, node_new(EX_CALL, cast(Pattern, p).pos))
 	if cast(Node, nm).kind == EX_IDENT {
 		c.name = cast(IdentExpr, nm).name
 	} else {
@@ -6361,8 +6328,8 @@ fn chk_match(e i64, want i64) i64 {
 	mut i = 0
 	for i < arms.len {
 		let arm = cast(Vec[i64], vec_get(arms, i))
-		if vec_get(arm, ARM_BLOCK) != 0 {
-			err_code_at(cast(Node, vec_get(arm, ARM_BODY)).pos, cstr("E293 MATCH_VALUE"), cstr("a match inside an expression has expression arms: give it a statement of its own (let v = match ...)"))
+		if cast(MatchArm, arm).block != 0 {
+			err_code_at(cast(Node, cast(MatchArm, arm).body).pos, cstr("E293 MATCH_VALUE"), cstr("a match inside an expression has expression arms: give it a statement of its own (let v = match ...)"))
 			return ty_int
 		}
 		i = i + 1
@@ -6388,8 +6355,8 @@ fn check_mstore(s i64) {
 	let pos = cast(Node, s).pos
 	let x = cast(Node, cast(ExprStmt, s).x)
 	let rec = cast(Vec[i64], cast(MatchStmtRec, s).rec)
-	let vs = cast(Sym, vec_get(rec, MR_SYM))
-	let mode = vec_get(rec, MR_MODE)
+	let vs = cast(Sym, cast(MatchRec, rec).sym)
+	let mode = cast(MatchRec, rec).mode
 	mut t = vs.type_
 	let k = x.kind
 	if k == EX_MATCH && mode != MATCH_EXPR {
@@ -6425,7 +6392,7 @@ fn check_mstore(s i64) {
 	}
 	mut hint = t
 	if hint == 0 {
-		hint = vec_get(rec, MR_HINT)
+		hint = cast(MatchRec, rec).hint
 	}
 	if t != 0 && kind_of(cast(Ty, t)) == K_VOID {
 		hint = 0
@@ -6459,8 +6426,8 @@ fn check_mstore(s i64) {
 }
 
 // mt_void_arm notes a boundary-tail arm block that ends without a value.
-fn mt_void_arm(rec Vec[Sym], pos i64) {
-	let vs = vec_get(rec, MR_SYM)
+fn mt_void_arm(rec MatchRec, pos i64) {
+	let vs = cast(Sym, rec.sym)
 	if vs.type_ != 0 && kind_of(cast(Ty, vs.type_)) != K_VOID {
 		err_code_at(pos, cstr("E293 MATCH_VALUE"), cstr("the arms of this match must all give a value, or none"))
 		return
@@ -6470,8 +6437,8 @@ fn mt_void_arm(rec Vec[Sym], pos i64) {
 
 // mt_arm_body is an arm's body block for the mode: its value is stored, returned or dropped.
 fn mt_arm_body(arm Vec[i64], mode i64, rec Vec[i64]) i64 {
-	let b = vec_get(arm, ARM_BODY)
-	if vec_get(arm, ARM_BLOCK) == 0 {
+	let b = cast(MatchArm, arm).body
+	if cast(MatchArm, arm).block == 0 {
 		let blk = cast(Block, empty_block(cast(Node, b).pos))
 		vec_push(cast(Vec[i64], blk.stmts), mt_value(cast(Node, b).pos, b, mode, cast(i64, rec)))
 		return cast(i64, blk)
@@ -6487,7 +6454,7 @@ fn mt_arm_body(arm Vec[i64], mode i64, rec Vec[i64]) i64 {
 	} else if ends_in_jump(cast(Vec[Node], stmts)) != 0 {
 		return b
 	} else if mode == MATCH_TAIL {
-		mt_void_arm(cast(Vec[Sym], rec), cast(Node, b).pos)
+		mt_void_arm(cast(MatchRec, cast(Vec[Sym], rec)), cast(Node, b).pos)
 	} else {
 		err_code_at(cast(Node, b).pos, cstr("E293 MATCH_VALUE"), cstr("a match arm that gives a value ends with it, or leaves (return, break, continue or fail)"))
 	}
@@ -6564,15 +6531,15 @@ fn mt_compare(pos i64, path Vec[i64], t i64, x i64) i64 {
 // t), or 0 when it always does; its bindings are added to binds. top is 0 inside a variant,
 // where a bare name always binds, as in a switch case. It sets mt_variant and mt_bool.
 fn mt_pattern(p Vec[i64], path Vec[i64], t i64, binds Vec[i64], top i64) i64 {
-	let pos = vec_get(p, PAT_POS)
-	let k = vec_get(p, PAT_KIND)
+	let pos = cast(Pattern, p).pos
+	let k = cast(Pattern, p).kind
 	mt_variant = -1
 	mt_bool = 0
 	if k == PAT_WILD {
 		return 0
 	}
 	if k == PAT_LITERAL {
-		let x = vec_get(p, PAT_A)
+		let x = cast(Pattern, p).a
 		if mt_is_enum(cast(Ty, t)) != 0 {
 			err_code_type(pos, cstr("E290 MATCH_PATTERN"), cstr("an arm of a match on "), t, cstr(" is a variant, like Name or Name(a, b)"))
 			return 0
@@ -6590,11 +6557,11 @@ fn mt_pattern(p Vec[i64], path Vec[i64], t i64, binds Vec[i64], top i64) i64 {
 			err_code_type(pos, cstr("E290 MATCH_PATTERN"), cstr("a range pattern needs a number or a str, not "), t, cstr(""))
 			return 0
 		}
-		let lo = binary_new(pos, cstr(">="), mt_node(pos, cast(Vec[Sym], path)), vec_get(p, PAT_A))
-		let hi = binary_new(pos, cstr("<"), mt_node(pos, cast(Vec[Sym], path)), vec_get(p, PAT_B))
+		let lo = binary_new(pos, cstr(">="), mt_node(pos, cast(Vec[Sym], path)), cast(Pattern, p).a)
+		let hi = binary_new(pos, cstr("<"), mt_node(pos, cast(Vec[Sym], path)), cast(Pattern, p).b)
 		return binary_new(pos, cstr("&&"), lo, hi)
 	}
-	let x = vec_get(p, PAT_NAME)
+	let x = cast(Pattern, p).name
 	mut name = cast(SelectExpr, x).name
 	if cast(Node, x).kind == EX_IDENT {
 		name = cast(IdentExpr, x).name
@@ -6604,7 +6571,7 @@ fn mt_pattern(p Vec[i64], path Vec[i64], t i64, binds Vec[i64], top i64) i64 {
 			err_code_type(pos, cstr("E290 MATCH_PATTERN"), cstr("a variant pattern needs an enum value, not "), t, cstr(""))
 			return 0
 		}
-		return mt_variant_test(pos, path, cast(Ty, t), name, cast(Vec[i64], vec_get(p, PAT_CHILDREN)), cast(Vec[i64], binds))
+		return mt_variant_test(pos, path, cast(Ty, t), name, cast(Vec[i64], cast(Pattern, p).children), cast(Vec[i64], binds))
 	}
 	if cast(Node, x).kind == EX_SELECT {
 		if mt_is_enum(cast(Ty, t)) != 0 {
@@ -6744,9 +6711,9 @@ fn lower_match(m i64, mode i64, rec Vec[Sym]) i64 {
 	mut i = 0
 	for i < arms.len {
 		let arm = cast(Vec[i64], vec_get(arms, i))
-		let apos = vec_get(arm, ARM_POS)
-		let pats = cast(Vec[i64], vec_get(arm, ARM_PATTERNS))
-		let guard_ = vec_get(arm, ARM_GUARD)
+		let apos = cast(MatchArm, arm).pos
+		let pats = cast(Vec[i64], cast(MatchArm, arm).patterns)
+		let guard_ = cast(MatchArm, arm).guard_
 		if catchall != 0 {
 			err_code_at(apos, cstr("E292 MATCH_UNREACHABLE"), cstr("this arm is never reached: an earlier arm matches every value"))
 			break
@@ -6765,7 +6732,7 @@ fn lower_match(m i64, mode i64, rec Vec[Sym]) i64 {
 			}
 			if mt_variant >= 0 {
 				if vec_get(covered, mt_variant) != 0 {
-					err_code_quoted(vec_get(p, PAT_POS), cstr("E292 MATCH_UNREACHABLE"), cstr("variant "), vec_get(cast(Vec[i64], vec_get(cast(Vec[i64], st.enum_), mt_variant)), 0), cstr(" is already handled by an earlier arm"))
+					err_code_quoted(cast(Pattern, p).pos, cstr("E292 MATCH_UNREACHABLE"), cstr("variant "), vec_get(cast(Vec[i64], vec_get(cast(Vec[i64], st.enum_), mt_variant)), 0), cstr(" is already handled by an earlier arm"))
 				}
 				if guard_ == 0 {
 					covered.data[mt_variant] = 1
@@ -6901,7 +6868,7 @@ fn lower_match(m i64, mode i64, rec Vec[Sym]) i64 {
 	check_stmt(cast(i64, chain))
 	pop_scope()
 	if mode == MATCH_TAIL && exhaustive == 0 {
-		let vt = vec_get(rec, MR_SYM).type_
+		let vt = cast(Sym, cast(MatchRec, rec).sym).type_
 		if vt != 0 && kind_of(cast(Ty, vt)) != K_VOID {
 			err_code_at(pos, cstr("E291 MATCH_EXHAUSTIVE"), cstr("a match that gives a value must handle every value: add a _ arm"))
 		}

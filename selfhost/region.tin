@@ -18,7 +18,6 @@ const RG_OUT = 16 // in an arena's closure: made outside the arena (#236)
 const RG_P0 = 256 // derived from parameter i: bit 8 + i
 const RG_MAXP = 48
 
-const F_REGSUM = 26 // [sink param bits, held pairs, result bits 0..7, sink records, store records]
 
 shared mut rg_fn i64
 shared mut rg_sum i64
@@ -2022,7 +2021,7 @@ shared mut cg_in_main i64 // 1 while walking main's tree (record stores, follow 
 fn core_global_check() {
 	let run = find_fn(cstr("hearth.Run"))
 	let m = find_fn(cstr("main"))
-	if cast(i64, run) == 0 || cast(i64, run)[F_REACH] == 0 || cast(i64, m) == 0 || cast(i64, m)[F_BODY] == 0 {
+	if cast(i64, run) == 0 || cast(Fn, cast(i64, run)).reach == 0 || cast(i64, m) == 0 || cast(Fn, cast(i64, m)).body == 0 {
 		return
 	}
 	cg_seen = vec_new[i64]()
@@ -2037,8 +2036,8 @@ fn core_global_check() {
 	mut i = 0
 	for i < prog_fns.len {
 		let f = vec_get(prog_fns, i)
-		if cast(i64, f)[F_REACH] != 0 && cast(i64, f)[F_EXTERN] == 0 && cast(i64, f)[F_BODY] != 0 && cast(i64, f)[F_GENERATED] == 0 && vec_has(cg_seen, cast(i64, f)) == 0 {
-			cg_stmts(cast(Vec[i64], cast(i64, f)[F_BODY][BLK_STMTS]))
+		if cast(Fn, cast(i64, f)).reach != 0 && cast(Fn, cast(i64, f)).extern_ == 0 && cast(Fn, cast(i64, f)).body != 0 && cast(Fn, cast(i64, f)).generated == 0 && vec_has(cg_seen, cast(i64, f)) == 0 {
+			cg_stmts(cast(Vec[i64], cast(Block, cast(Fn, cast(i64, f)).body).stmts))
 		}
 		i = i + 1
 	}
@@ -2046,7 +2045,7 @@ fn core_global_check() {
 	for i < cg_stores.len {
 		let g = vec_get(cg_stores, i)
 		if vec_has(cg_refs, g) != 0 {
-			err_code_quoted(vec_get(cg_stores, i + 1), cstr("E131 CORE_GLOBAL"), cstr("global "), g[S_NAME], cstr(" is assigned here, in code that runs on core 0 only (main and what it calls): the other cores keep the initializer's value. Assign it in its initializer, in `on core.start` or in `once`"))
+			err_code_quoted(vec_get(cg_stores, i + 1), cstr("E131 CORE_GLOBAL"), cstr("global "), cast(Sym, g).name, cstr(" is assigned here, in code that runs on core 0 only (main and what it calls): the other cores keep the initializer's value. Assign it in its initializer, in `on core.start` or in `once`"))
 		}
 		i = i + 2
 	}
@@ -2055,33 +2054,33 @@ fn core_global_check() {
 // cg_visit walks f (main, or a user function reached from it) once. Library functions are
 // trusted code: their own per-core state is theirs to manage, so they are not entered.
 fn cg_visit(f i64) {
-	if f == 0 || f[F_EXTERN] != 0 || f[F_BODY] == 0 || f[F_GENERATED] != 0 || vec_has(cg_seen, f) != 0 || vec_get(file_trusted, f[F_FILE]) != 0 {
+	if f == 0 || cast(Fn, f).extern_ != 0 || cast(Fn, f).body == 0 || cast(Fn, f).generated != 0 || vec_has(cg_seen, f) != 0 || vec_get(file_trusted, cast(Fn, f).file) != 0 {
 		return
 	}
 	vec_push(cg_seen, f)
-	cg_stmts(cast(Vec[i64], f[F_BODY][BLK_STMTS]))
+	cg_stmts(cast(Vec[i64], cast(Block, cast(Fn, f).body).stmts))
 }
 
 // cg_root is the per-core global a store into e lands in (the ident itself, or the base of a
 // field, element or index chain), or 0.
 fn cg_root(e i64) i64 {
 	for e != 0 {
-		let k = e[N_KIND]
+		let k = cast(Node, e).kind
 		if k == EX_IDENT {
-			let s = e[ID_REF]
-			if s != 0 && s[S_KIND] == SYM_GLOBAL && s[S_TLS] != 0 {
+			let s = cast(IdentExpr, e).ref
+			if s != 0 && cast(Sym, s).kind == SYM_GLOBAL && cast(Sym, s).tls != 0 {
 				return s
 			}
 			return 0
 		}
 		if k == EX_MEM {
-			e = e[MEM_BASE]
+			e = cast(MemExpr, e).base
 		} else if k == EX_ELEM {
-			e = e[ELEM_SEQ]
+			e = cast(ElemExpr, e).seq
 		} else if k == EX_INDEX {
-			e = e[IX_X]
+			e = cast(IndexExpr, e).x
 		} else if k == EX_CONV {
-			e = e[CV_X]
+			e = cast(Conv, e).x
 		} else {
 			return 0
 		}
@@ -2109,46 +2108,46 @@ fn cg_stmt(s i64) {
 	if s == 0 {
 		return
 	}
-	let k = s[N_KIND]
+	let k = cast(Node, s).kind
 	if k == ST_BLOCK {
-		cg_stmts(cast(Vec[i64], s[BLK_STMTS]))
+		cg_stmts(cast(Vec[i64], cast(Block, s).stmts))
 	} else if k == ST_LET {
-		cg_expr(s[LET_INIT])
+		cg_expr(cast(LetStmt, s).init)
 	} else if k == ST_ASSIGN {
 		if cg_in_main != 0 {
-			cg_store(s[AS_TARGET], s[N_POS])
+			cg_store(cast(AssignStmt, s).target, cast(Node, s).pos)
 		}
-		cg_expr(s[AS_TARGET])
-		cg_expr(s[AS_VALUE])
+		cg_expr(cast(AssignStmt, s).target)
+		cg_expr(cast(AssignStmt, s).value)
 	} else if k == ST_EXPR {
-		cg_expr(s[ES_X])
+		cg_expr(cast(ExprStmt, s).x)
 	} else if k == ST_IF {
-		cg_expr(s[IF_COND])
-		cg_stmt(s[IF_THEN])
-		cg_stmt(s[IF_ELSE])
+		cg_expr(cast(IfStmt, s).cond)
+		cg_stmt(cast(IfStmt, s).then)
+		cg_stmt(cast(IfStmt, s).else_)
 	} else if k == ST_WHILE {
-		cg_expr(s[WH_COND])
-		cg_stmt(s[WH_BODY])
-		cg_stmt(s[WH_POST])
+		cg_expr(cast(WhileStmt, s).cond)
+		cg_stmt(cast(WhileStmt, s).body)
+		cg_stmt(cast(WhileStmt, s).post)
 	} else if k == ST_RETURN {
-		cg_expr(s[RET_VALUE])
-		if s[RET_VALUES] != 0 {
-			cg_exprs(cast(Vec[i64], s[RET_VALUES]))
+		cg_expr(cast(ReturnStmt, s).value)
+		if cast(i64, cast(ReturnStmt, s).values) != 0 {
+			cg_exprs(cast(Vec[i64], cast(ReturnStmt, s).values))
 		}
 	} else if k == ST_CALLMULTI {
 		if cg_in_main != 0 {
-			let syms = cast(Vec[i64], s[CM_SYMS])
+			let syms = cast(Vec[i64], cast(CallMultiStmt, s).syms)
 			mut i = 0
 			for i < syms.len {
 				let t = vec_get(syms, i)
-				if t != 0 && t[S_KIND] == SYM_GLOBAL && t[S_TLS] != 0 {
+				if t != 0 && cast(Sym, t).kind == SYM_GLOBAL && cast(Sym, t).tls != 0 {
 					vec_push(cg_stores, t)
-					vec_push(cg_stores, s[N_POS])
+					vec_push(cg_stores, cast(Node, s).pos)
 				}
 				i = i + 1
 			}
 		}
-		cg_expr(s[CM_CALL])
+		cg_expr(cast(CallMultiStmt, s).call)
 	}
 }
 
@@ -2164,42 +2163,42 @@ fn cg_expr(e i64) {
 	if e == 0 {
 		return
 	}
-	let k = e[N_KIND]
+	let k = cast(Node, e).kind
 	if k == EX_CALL {
 		if cg_in_main != 0 {
 			// A runtime call that stores into its first argument (a map insert, an in-place
 			// append) writes the global that argument names.
-			if e[CALL_STORE] != 0 && e[CALL_ARGS] != 0 && cast(Vec[i64], e[CALL_ARGS]).len > 0 {
-				cg_store(vec_get(cast(Vec[i64], e[CALL_ARGS]), 0), e[N_POS])
+			if cast(Call, e).store != 0 && cast(i64, cast(Call, e).args) != 0 && cast(Vec[i64], cast(Call, e).args).len > 0 {
+				cg_store(vec_get(cast(Vec[i64], cast(Call, e).args), 0), cast(Node, e).pos)
 			}
-			cg_visit(e[CALL_FN])
+			cg_visit(cast(Call, e).fn_)
 		}
-		cg_expr(e[CALL_CALLEE])
-		cg_exprs(cast(Vec[i64], e[CALL_ARGS]))
+		cg_expr(cast(Call, e).callee)
+		cg_exprs(cast(Vec[i64], cast(Call, e).args))
 	} else if k == EX_IDENT {
-		let s = e[ID_REF]
-		if cg_in_main == 0 && s != 0 && s[S_KIND] == SYM_GLOBAL && s[S_TLS] != 0 && vec_has(cg_refs, s) == 0 {
+		let s = cast(IdentExpr, e).ref
+		if cg_in_main == 0 && s != 0 && cast(Sym, s).kind == SYM_GLOBAL && cast(Sym, s).tls != 0 && vec_has(cg_refs, s) == 0 {
 			vec_push(cg_refs, s)
 		}
 	} else if k == EX_UNARY {
-		cg_expr(e[UN_X])
+		cg_expr(cast(Unary, e).x)
 	} else if k == EX_BINARY {
-		cg_expr(e[BIN_L])
-		cg_expr(e[BIN_R])
+		cg_expr(cast(Binary, e).l)
+		cg_expr(cast(Binary, e).r)
 	} else if k == EX_INDEX {
-		cg_expr(e[IX_X])
-		cg_expr(e[IX_I])
+		cg_expr(cast(IndexExpr, e).x)
+		cg_expr(cast(IndexExpr, e).i)
 	} else if k == EX_CONV {
-		cg_expr(e[CV_X])
+		cg_expr(cast(Conv, e).x)
 	} else if k == EX_SEQ {
-		cg_stmts(cast(Vec[i64], e[SEQ_STMTS]))
-		cg_expr(e[SEQ_VALUE])
+		cg_stmts(cast(Vec[i64], cast(SeqExpr, e).stmts))
+		cg_expr(cast(SeqExpr, e).value)
 	} else if k == EX_MEM {
-		cg_expr(e[MEM_BASE])
-		cg_expr(e[MEM_INDEX])
-		cg_expr(e[MEM_LEN])
+		cg_expr(cast(MemExpr, e).base)
+		cg_expr(cast(MemExpr, e).index)
+		cg_expr(cast(MemExpr, e).len)
 	} else if k == EX_ELEM {
-		cg_expr(e[ELEM_SEQ])
-		cg_expr(e[ELEM_IDX])
+		cg_expr(cast(ElemExpr, e).seq)
+		cg_expr(cast(ElemExpr, e).idx)
 	}
 }

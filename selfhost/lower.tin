@@ -143,12 +143,12 @@ fn fold_compare(e i64) i64 {
 	}
 	let l = cast(Binary, e).l
 	let r = cast(Binary, e).r
-	if fold_const(l) == 0 || fold_const(r) == 0 || cast(Node, l).kind != EX_INT || cast(Node, r).kind != EX_INT || l[7] != 0 || r[7] != 0 {
+	if fold_const(l) == 0 || fold_const(r) == 0 || cast(Node, l).kind != EX_INT || cast(Node, r).kind != EX_INT || cast(IntLit, l).char_ != 0 || cast(IntLit, r).char_ != 0 {
 		return 0
 	}
 	mut a = cast(IntLit, l).val
 	mut b = cast(IntLit, r).val
-	if l[8] != 0 || r[8] != 0 {
+	if cast(IntLit, l).big != 0 || cast(IntLit, r).big != 0 {
 		a = a ^ (1 << 63)
 		b = b ^ (1 << 63)
 	}
@@ -170,7 +170,7 @@ fn fold_const(e i64) i64 {
 		}
 		mut big = s.big
 		replace_node(e, mk_int(cast(Node, e).pos, s.val, 0))
-		e[8] = big
+		cast(IntLit, e).big = big
 		return 1
 	}
 	mut v = 0
@@ -195,7 +195,7 @@ fn fold_const(e i64) i64 {
 		}
 		let a = l.val
 		let b = r.val
-		let ub = i64(cast(i64, l)[8] != 0 || cast(i64, r)[8] != 0)
+		let ub = i64(cast(IntLit, l).big != 0 || cast(IntLit, r).big != 0)
 		if ub != 0 && (streq(op, cstr(">>")) != 0 || streq(op, cstr("/")) != 0 || streq(op, cstr("%")) != 0) {
 			if (streq(op, cstr("/")) != 0 || streq(op, cstr("%")) != 0) && b == 0 {
 				return 0
@@ -203,10 +203,10 @@ fn fold_const(e i64) i64 {
 			v = eval_unsigned(op, a, b)
 			cast(Node, e).kind = EX_INT
 			cast(IntLit, e).val = v
-			e[3] = 0
-			e[4] = 0
-			e[7] = 0
-			e[8] = i64(v < 0)
+			cast(IntLit, e).w3 = 0
+			cast(IntLit, e).w4 = 0
+			cast(IntLit, e).char_ = 0
+			cast(IntLit, e).big = i64(v < 0)
 			return 1
 		}
 		if streq(op, cstr("+")) != 0 {
@@ -239,14 +239,14 @@ fn fold_const(e i64) i64 {
 	}
 	mut big = 0
 	if k == EX_BINARY {
-		big = i64((cast(Binary, e).l[8] != 0 || cast(Binary, e).r[8] != 0) && v < 0)
+		big = i64((cast(IntLit, cast(Binary, e).l).big != 0 || cast(IntLit, cast(Binary, e).r).big != 0) && v < 0)
 	}
 	cast(Node, e).kind = EX_INT
 	cast(IntLit, e).val = v
-	e[3] = 0
-	e[4] = 0
-	e[7] = 0
-	e[8] = big
+	cast(IntLit, e).w3 = 0
+	cast(IntLit, e).w4 = 0
+	cast(IntLit, e).char_ = 0
+	cast(IntLit, e).big = big
 	return 1
 }
 
@@ -266,7 +266,7 @@ fn adapt_int(e i64, want_in i64) i64 {
 		return ty_float
 	}
 	if kind_of(cast(Ty, want)) == K_INT {
-		if int_fits(cast(IntLit, e).val, cast(Ty, want), e[8]) == 0 {
+		if int_fits(cast(IntLit, e).val, cast(Ty, want), cast(IntLit, e).big) == 0 {
 			let m = err_code(cast(Node, e).pos, cstr("E223 CONST_OVERFLOW"))
 			buf_str(m, cstr("constant "))
 			buf_int(m, cast(IntLit, e).val)
@@ -347,7 +347,7 @@ fn use_sym(e i64, s Sym, want i64) i64 {
 		let t = s.type_
 		replace_node(e, mk_int(cast(Node, e).pos, v, 0))
 		cast(IdentExpr, e).ref = cast(i64, s)
-		e[8] = s.big
+		cast(IntLit, e).big = s.big
 		if kind_of(cast(Ty, t)) == K_UINT {
 			return chk_kind(e, want)
 		}
@@ -2117,8 +2117,8 @@ fn bound_leaves(v Vec[i64]) {
 			let arms = cast(MatchExpr, mt_stmt_expr(s)).arms
 			mut ai = 0
 			for ai < arms.len {
-				if vec_get(cast(Vec[i64], vec_get(arms, ai)), ARM_BLOCK) != 0 {
-					bound_leaves(cast(Vec[i64], cast(Block, vec_get(cast(Vec[i64], vec_get(arms, ai)), ARM_BODY)).stmts))
+				if cast(MatchArm, cast(Vec[i64], vec_get(arms, ai))).block != 0 {
+					bound_leaves(cast(Vec[i64], cast(Block, cast(MatchArm, cast(Vec[i64], vec_get(arms, ai))).body).stmts))
 				}
 				ai = ai + 1
 			}
