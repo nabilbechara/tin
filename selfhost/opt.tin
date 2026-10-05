@@ -2,31 +2,31 @@
 shared mut an_fn i64
 shared mut an_depth i64
 
-fn analyze_fn(f i64) {
-	an_fn = f
+fn analyze_fn(f Fn) {
+	an_fn = cast(i64, f)
 	an_depth = 0
-	f[F_LEAF] = 1
-	let locals = f[F_LOCALS]
+	f.leaf = 1
+	let locals = f.locals
 	mut i = 0
 	for i < locals[VEC_LEN] {
-		let s = vec_get(locals, i)
-		s[S_USES] = 0
-		s[S_ADDR] = 0
+		let s = cast(Sym, vec_get(locals, i))
+		s.uses = 0
+		s.addr = 0
 		i = i + 1
 	}
-	an_stmts(f[F_BODY][BLK_STMTS])
+	an_stmts(cast(Block, f.body).stmts)
 }
 
 // A use inside k nested loops counts 8^k, so inner-loop variables win registers.
-fn an_use(s i64) {
-	if s[S_KIND] != SYM_LOCAL {
+fn an_use(s Sym) {
+	if s.kind != SYM_LOCAL {
 		return
 	}
 	mut w = 512
 	if an_depth < 3 {
 		w = 1 << (3 * an_depth)
 	}
-	s[S_USES] = s[S_USES] + w
+	s.uses = s.uses + w
 }
 
 fn an_stmts(stmts i64) {
@@ -38,49 +38,49 @@ fn an_stmts(stmts i64) {
 }
 
 fn an_stmt(s i64) {
-	let k = s[N_KIND]
+	let k = cast(Node, s).kind
 	if k == ST_BLOCK {
-		an_stmts(s[BLK_STMTS])
+		an_stmts(cast(Block, s).stmts)
 	} else if k == ST_LET {
-		an_expr(s[LET_INIT])
-		an_use(s[LET_SYM])
+		an_expr(cast(LetStmt, s).init)
+		an_use(cast(Sym, cast(LetStmt, s).sym))
 	} else if k == ST_ASSIGN {
-		let t = s[AS_TARGET]
-		if t[N_KIND] == EX_IDENT {
-			an_use(t[ID_REF])
+		let t = cast(AssignStmt, s).target
+		if cast(Node, t).kind == EX_IDENT {
+			an_use(cast(Sym, cast(IdentExpr, t).ref))
 		} else {
 			an_expr(t)
 		}
-		an_expr(s[AS_VALUE])
+		an_expr(cast(AssignStmt, s).value)
 	} else if k == ST_EXPR {
-		an_expr(s[ES_X])
+		an_expr(cast(ExprStmt, s).x)
 	} else if k == ST_IF {
-		an_expr(s[IF_COND])
-		an_stmts(s[IF_THEN][BLK_STMTS])
-		if s[IF_ELSE] != 0 {
-			an_stmt(s[IF_ELSE])
+		an_expr(cast(IfStmt, s).cond)
+		an_stmts(cast(Block, cast(IfStmt, s).then).stmts)
+		if cast(IfStmt, s).else_ != 0 {
+			an_stmt(cast(IfStmt, s).else_)
 		}
 	} else if k == ST_WHILE {
-		let loop_ = i64(s[WH_ONCE] == 0)
+		let loop_ = i64(cast(WhileStmt, s).once_ == 0)
 		an_depth = an_depth + loop_
-		an_expr(s[WH_COND])
-		an_stmts(s[WH_BODY][BLK_STMTS])
-		if s[WH_POST] != 0 {
-			an_stmt(s[WH_POST])
+		an_expr(cast(WhileStmt, s).cond)
+		an_stmts(cast(Block, cast(WhileStmt, s).body).stmts)
+		if cast(WhileStmt, s).post != 0 {
+			an_stmt(cast(WhileStmt, s).post)
 		}
 		an_depth = an_depth - loop_
 	} else if k == ST_RETURN {
-		if s[RET_VALUE] != 0 {
-			an_expr(s[RET_VALUE])
+		if cast(ReturnStmt, s).value != 0 {
+			an_expr(cast(ReturnStmt, s).value)
 		}
-		if s[RET_VALUES] != 0 {
-			an_exprs(s[RET_VALUES])
+		if cast(ReturnStmt, s).values != 0 {
+			an_exprs(cast(ReturnStmt, s).values)
 		}
 	} else if k == ST_CALLMULTI {
-		an_expr(s[CM_CALL])
+		an_expr(cast(CallMultiStmt, s).call)
 		mut i = 0
-		for i < s[CM_SYMS][VEC_LEN] {
-			an_use(vec_get(s[CM_SYMS], i))
+		for i < cast(CallMultiStmt, s).syms[VEC_LEN] {
+			an_use(cast(Sym, vec_get(cast(CallMultiStmt, s).syms, i)))
 			i = i + 1
 		}
 	}
@@ -95,45 +95,45 @@ fn an_exprs(v i64) {
 }
 
 fn an_expr(e i64) {
-	let k = e[N_KIND]
+	let k = cast(Node, e).kind
 	if k == EX_IDENT {
-		an_use(e[ID_REF])
+		an_use(cast(Sym, cast(IdentExpr, e).ref))
 	} else if k == EX_UNARY {
-		let x = e[UN_X]
-		if streq(e[UN_OP], cstr("&")) != 0 && x[ID_REF][S_KIND] == SYM_LOCAL {
-			x[ID_REF][S_ADDR] = 1
+		let x = cast(IdentExpr, cast(Unary, e).x)
+		if streq(cast(Unary, e).op, cstr("&")) != 0 && cast(Sym, x.ref).kind == SYM_LOCAL {
+			cast(Sym, x.ref).addr = 1
 		}
-		an_expr(x)
+		an_expr(cast(i64, x))
 	} else if k == EX_BINARY {
-		an_expr(e[BIN_L])
-		an_expr(e[BIN_R])
+		an_expr(cast(Binary, e).l)
+		an_expr(cast(Binary, e).r)
 	} else if k == EX_INDEX {
-		an_expr(e[IX_X])
-		an_expr(e[IX_I])
+		an_expr(cast(IndexExpr, e).x)
+		an_expr(cast(IndexExpr, e).i)
 	} else if k == EX_CONV {
-		an_expr(e[CV_X])
+		an_expr(cast(Conv, e).x)
 	} else if k == EX_MEM {
-		an_expr(e[MEM_BASE])
-		if e[MEM_INDEX] != 0 {
-			an_expr(e[MEM_INDEX])
+		an_expr(cast(MemExpr, e).base)
+		if cast(MemExpr, e).index != 0 {
+			an_expr(cast(MemExpr, e).index)
 		}
-		if e[MEM_LEN] != 0 {
-			an_expr(e[MEM_LEN])
+		if cast(MemExpr, e).len != 0 {
+			an_expr(cast(MemExpr, e).len)
 		}
 	} else if k == EX_ELEM {
-		an_expr(e[ELEM_SEQ])
-		an_expr(e[ELEM_IDX])
+		an_expr(cast(ElemExpr, e).seq)
+		an_expr(cast(ElemExpr, e).idx)
 	} else if k == EX_SEQ {
-		an_stmts(e[SEQ_STMTS])
-		an_expr(e[SEQ_VALUE])
+		an_stmts(cast(SeqExpr, e).stmts)
+		an_expr(cast(SeqExpr, e).value)
 	} else if k == EX_CALL {
-		if e[CALL_INTRINSIC] == 0 {
-			an_fn[F_LEAF] = 0
+		if cast(Call, e).intrinsic == 0 {
+			cast(Fn, an_fn).leaf = 0
 		}
-		if e[CALL_CALLEE] != 0 {
-			an_expr(e[CALL_CALLEE])
+		if cast(Call, e).callee != 0 {
+			an_expr(cast(Call, e).callee)
 		}
-		let args = e[CALL_ARGS]
+		let args = cast(Call, e).args
 		mut i = 0
 		for i < args[VEC_LEN] {
 			an_expr(vec_get(args, i))
@@ -157,11 +157,11 @@ shared mut lc_syms i64
 shared mut lc_pre i64
 shared mut lc_calls i64 // the loop makes calls, so headers may change under it
 
-fn licm_fn(f i64) {
+fn licm_fn(f Fn) {
 	analyze_fn(f)
-	lc_fn = f
-	prefetch_block(f[F_BODY][BLK_STMTS])
-	licm_block(f[F_BODY])
+	lc_fn = cast(i64, f)
+	prefetch_block(cast(Block, f.body).stmts)
+	licm_block(cast(Block, f.body))
 }
 
 // ---- strided prefetch ----
@@ -176,26 +176,26 @@ fn prefetch_block(stmts i64) {
 	mut i = 0
 	for i < stmts[VEC_LEN] {
 		let s = vec_get(stmts, i)
-		let k = s[N_KIND]
-		if k == ST_WHILE && s[WH_ONCE] != 0 {
-			prefetch_block(s[WH_BODY][BLK_STMTS])
+		let k = cast(Node, s).kind
+		if k == ST_WHILE && cast(WhileStmt, s).once_ != 0 {
+			prefetch_block(cast(Block, cast(WhileStmt, s).body).stmts)
 		} else if k == ST_WHILE {
-			if has_loop(s[WH_BODY][BLK_STMTS]) != 0 {
-				prefetch_block(s[WH_BODY][BLK_STMTS])
+			if has_loop(cast(Block, cast(WhileStmt, s).body).stmts) != 0 {
+				prefetch_block(cast(Block, cast(WhileStmt, s).body).stmts)
 			} else {
 				prefetch_loop(s)
 			}
 		} else if k == ST_BLOCK {
-			prefetch_block(s[BLK_STMTS])
+			prefetch_block(cast(Block, s).stmts)
 		} else if k == ST_IF {
-			prefetch_block(s[IF_THEN][BLK_STMTS])
-			mut els = s[IF_ELSE]
-			for els != 0 && els[N_KIND] == ST_IF {
-				prefetch_block(els[IF_THEN][BLK_STMTS])
-				els = els[IF_ELSE]
+			prefetch_block(cast(Block, cast(IfStmt, s).then).stmts)
+			mut els = cast(IfStmt, s).else_
+			for els != 0 && cast(Node, els).kind == ST_IF {
+				prefetch_block(cast(Block, cast(IfStmt, els).then).stmts)
+				els = cast(IfStmt, els).else_
 			}
 			if els != 0 {
-				prefetch_block(els[BLK_STMTS])
+				prefetch_block(cast(Block, els).stmts)
 			}
 		}
 		i = i + 1
@@ -206,23 +206,23 @@ fn has_loop(stmts i64) i64 {
 	mut i = 0
 	for i < stmts[VEC_LEN] {
 		let s = vec_get(stmts, i)
-		let k = s[N_KIND]
-		if k == ST_WHILE && s[WH_ONCE] == 0 {
+		let k = cast(Node, s).kind
+		if k == ST_WHILE && cast(WhileStmt, s).once_ == 0 {
 			return 1
 		}
-		if k == ST_WHILE && has_loop(s[WH_BODY][BLK_STMTS]) != 0 {
+		if k == ST_WHILE && has_loop(cast(Block, cast(WhileStmt, s).body).stmts) != 0 {
 			return 1
 		}
-		if k == ST_BLOCK && has_loop(s[BLK_STMTS]) != 0 {
+		if k == ST_BLOCK && has_loop(cast(Block, s).stmts) != 0 {
 			return 1
 		}
 		if k == ST_IF {
-			if has_loop(s[IF_THEN][BLK_STMTS]) != 0 {
+			if has_loop(cast(Block, cast(IfStmt, s).then).stmts) != 0 {
 				return 1
 			}
-			if s[IF_ELSE] != 0 {
+			if cast(IfStmt, s).else_ != 0 {
 				let one = vec_new()
-				vec_push(one, s[IF_ELSE])
+				vec_push(one, cast(IfStmt, s).else_)
 				if has_loop(one) != 0 {
 					return 1
 				}
@@ -234,43 +234,43 @@ fn has_loop(stmts i64) i64 {
 }
 
 fn is_reg_local(e i64) i64 {
-	return i64(e[N_KIND] == EX_IDENT && e[ID_REF][S_KIND] == SYM_LOCAL && e[ID_REF][S_ADDR] == 0)
+	return i64(cast(Node, e).kind == EX_IDENT && cast(Sym, cast(IdentExpr, e).ref).kind == SYM_LOCAL && cast(Sym, cast(IdentExpr, e).ref).addr == 0)
 }
 
 fn prefetch_loop(w i64) {
-	if w[WH_ONCE] != 0 {
+	if cast(WhileStmt, w).once_ != 0 {
 		return
 	}
-	let body0 = w[WH_BODY][BLK_STMTS]
+	let body0 = cast(Block, cast(WhileStmt, w).body).stmts
 	let body = vec_new()
 	mut bi = 0
 	for bi < body0[VEC_LEN] {
 		vec_push(body, vec_get(body0, bi))
 		bi = bi + 1
 	}
-	if w[WH_POST] != 0 {
-		vec_push(body, w[WH_POST])
+	if cast(WhileStmt, w).post != 0 {
+		vec_push(body, cast(WhileStmt, w).post)
 	}
 	lc_assigned = vec_new()
 	lc_calls = stmts_have_call(body)
 	collect_assigned(body)
 	// The induction step: a top-level `j = j + step` with step invariant.
-	mut j = 0
+	mut j = cast(Sym, 0)
 	mut step = 0
 	mut i = 0
 	for i < body[VEC_LEN] {
 		let s = vec_get(body, i)
-		if s[N_KIND] == ST_ASSIGN && is_reg_local(s[AS_TARGET]) != 0 {
-			let v = s[AS_VALUE]
-			let t = s[AS_TARGET][ID_REF]
-			if v[N_KIND] == EX_BINARY && streq(v[BIN_OP], cstr("+")) != 0 && v[BIN_L][N_KIND] == EX_IDENT && v[BIN_L][ID_REF] == t && invariant(v[BIN_R]) != 0 {
-				j = t
-				step = v[BIN_R]
+		if cast(Node, s).kind == ST_ASSIGN && is_reg_local(cast(AssignStmt, s).target) != 0 {
+			let v = cast(AssignStmt, s).value
+			let t = cast(IdentExpr, cast(AssignStmt, s).target).ref
+			if cast(Node, v).kind == EX_BINARY && streq(cast(Binary, v).op, cstr("+")) != 0 && cast(Node, cast(Binary, v).l).kind == EX_IDENT && cast(IdentExpr, cast(Binary, v).l).ref == t && invariant(cast(Binary, v).r) != 0 {
+				j = cast(Sym, t)
+				step = cast(Binary, v).r
 			}
 		}
 		i = i + 1
 	}
-	if j == 0 || count_assigns(body, j) != 1 {
+	if cast(i64, j) == 0 || count_assigns(body, cast(i64, j)) != 1 {
 		return
 	}
 	if is_const(step) != 0 && const_val(step) < 8 && const_val(step) > -8 {
@@ -281,16 +281,16 @@ fn prefetch_loop(w i64) {
 	i = 0
 	for i < body[VEC_LEN] {
 		let s = vec_get(body, i)
-		if s[N_KIND] == ST_ASSIGN && s[AS_TARGET][N_KIND] == EX_INDEX {
-			let ix = s[AS_TARGET]
-			if (is_reg_local(ix[IX_X]) != 0 || ix[IX_X][IX_HDR] != 0) && invariant(ix[IX_X]) != 0 && ix[IX_I][N_KIND] == EX_IDENT && ix[IX_I][ID_REF] == j {
-				target = ix
+		if cast(Node, s).kind == ST_ASSIGN && cast(Node, cast(AssignStmt, s).target).kind == EX_INDEX {
+			let ix = cast(IndexExpr, cast(AssignStmt, s).target)
+			if (is_reg_local(ix.x) != 0 || cast(IndexExpr, ix.x).hdr != 0) && invariant(ix.x) != 0 && cast(Node, ix.i).kind == EX_IDENT && cast(Sym, cast(IdentExpr, ix.i).ref) == j {
+				target = cast(i64, ix)
 			}
 		}
-		if s[N_KIND] == ST_ASSIGN && s[AS_TARGET][N_KIND] == EX_ELEM {
-			let el = s[AS_TARGET]
-			if is_reg_local(el[ELEM_SEQ]) != 0 && invariant(el[ELEM_SEQ]) != 0 && el[ELEM_SIZE] == 8 && el[ELEM_IDX][N_KIND] == EX_IDENT && el[ELEM_IDX][ID_REF] == j {
-				target = el
+		if cast(Node, s).kind == ST_ASSIGN && cast(Node, cast(AssignStmt, s).target).kind == EX_ELEM {
+			let el = cast(ElemExpr, cast(AssignStmt, s).target)
+			if is_reg_local(el.seq) != 0 && invariant(el.seq) != 0 && el.size == 8 && cast(Node, el.idx).kind == EX_IDENT && cast(Sym, cast(IdentExpr, el.idx).ref) == j {
+				target = cast(i64, el)
 			}
 		}
 		i = i + 1
@@ -298,32 +298,32 @@ fn prefetch_loop(w i64) {
 	if target == 0 {
 		return
 	}
-	let pos = w[N_POS]
-	let ahead = node_new(EX_INT, pos)
-	ahead[INT_VAL] = PF_AHEAD
-	let jref = node_new(EX_IDENT, pos)
-	jref[ID_NAME] = j[S_NAME]
-	jref[ID_REF] = j
-	let call = node_new(EX_CALL, pos)
-	call[CALL_NAME] = cstr("__prefetchw")
-	call[CALL_ARGS] = vec_new()
-	call[CALL_INTRINSIC] = 1
-	if target[N_KIND] == EX_ELEM {
-		vec_push(call[CALL_ARGS], mk_hdr(pos, node_copy(target[ELEM_SEQ]), 2))
+	let pos = cast(Node, w).pos
+	let ahead = cast(IntLit, node_new(EX_INT, pos))
+	ahead.val = PF_AHEAD
+	let jref = cast(IdentExpr, node_new(EX_IDENT, pos))
+	jref.name = j.name
+	jref.ref = cast(i64, j)
+	let call = cast(Call, node_new(EX_CALL, pos))
+	call.name = cstr("__prefetchw")
+	call.args = vec_new()
+	call.intrinsic = 1
+	if cast(Node, target).kind == EX_ELEM {
+		vec_push(call.args, mk_hdr(pos, node_copy(cast(ElemExpr, target).seq), 2))
 	} else {
-		vec_push(call[CALL_ARGS], node_copy(target[IX_X]))
+		vec_push(call.args, node_copy(cast(IndexExpr, target).x))
 	}
-	vec_push(call[CALL_ARGS], binary_node(pos, cstr("+"), jref, binary_node(pos, cstr("*"), node_copy(step), ahead)))
-	let st = node_new(ST_EXPR, pos)
-	st[ES_X] = call
+	vec_push(call.args, binary_node(pos, cstr("+"), cast(i64, jref), binary_node(pos, cstr("*"), node_copy(step), cast(i64, ahead))))
+	let st = cast(ExprStmt, node_new(ST_EXPR, pos))
+	st.x = cast(i64, call)
 	let nb = vec_new()
-	vec_push(nb, st)
+	vec_push(nb, cast(i64, st))
 	i = 0
 	for i < body0[VEC_LEN] {
 		vec_push(nb, vec_get(body0, i))
 		i = i + 1
 	}
-	w[WH_BODY][BLK_STMTS] = nb
+	cast(Block, cast(WhileStmt, w).body).stmts = nb
 }
 
 fn count_assigns(stmts i64, sym i64) i64 {
@@ -338,15 +338,15 @@ fn count_assigns(stmts i64, sym i64) i64 {
 	return n
 }
 
-fn licm_block(b i64) {
-	let stmts = b[BLK_STMTS]
+fn licm_block(b Block) {
+	let stmts = b.stmts
 	let result = vec_new()
 	mut i = 0
 	for i < stmts[VEC_LEN] {
 		let s = vec_get(stmts, i)
 		licm_nested(s)
-		if s[N_KIND] == ST_WHILE && s[WH_ONCE] == 0 {
-			let pre = licm_loop(s)
+		if cast(Node, s).kind == ST_WHILE && cast(WhileStmt, s).once_ == 0 {
+			let pre = licm_loop(cast(WhileStmt, s))
 			mut j = 0
 			for j < pre[VEC_LEN] {
 				vec_push(result, vec_get(pre, j))
@@ -356,41 +356,41 @@ fn licm_block(b i64) {
 		vec_push(result, s)
 		i = i + 1
 	}
-	b[BLK_STMTS] = result
+	b.stmts = result
 }
 
 fn licm_nested(s i64) {
-	let k = s[N_KIND]
+	let k = cast(Node, s).kind
 	if k == ST_BLOCK {
-		licm_block(s)
+		licm_block(cast(Block, s))
 	} else if k == ST_IF {
-		licm_block(s[IF_THEN])
-		if s[IF_ELSE] != 0 {
-			licm_nested(s[IF_ELSE])
+		licm_block(cast(Block, cast(IfStmt, s).then))
+		if cast(IfStmt, s).else_ != 0 {
+			licm_nested(cast(IfStmt, s).else_)
 		}
 	} else if k == ST_WHILE {
-		licm_block(s[WH_BODY])
+		licm_block(cast(Block, cast(WhileStmt, s).body))
 	}
 }
 
 // licm_loop rewrites loop w in place and returns the lets to run before it.
-fn licm_loop(w i64) i64 {
+fn licm_loop(w WhileStmt) i64 {
 	lc_assigned = vec_new()
 	lc_exprs = vec_new()
 	lc_syms = vec_new()
 	lc_pre = vec_new()
-	lc_calls = i64(stmts_have_call(w[WH_BODY][BLK_STMTS]) != 0 || contains_call(w[WH_COND]) != 0 || stmt_has_call(w[WH_POST]) != 0)
-	collect_assigned(w[WH_BODY][BLK_STMTS])
-	if w[WH_POST] != 0 {
+	lc_calls = i64(stmts_have_call(cast(Block, w.body).stmts) != 0 || contains_call(w.cond) != 0 || stmt_has_call(w.post) != 0)
+	collect_assigned(cast(Block, w.body).stmts)
+	if w.post != 0 {
 		let one = vec_new()
-		vec_push(one, w[WH_POST])
+		vec_push(one, w.post)
 		collect_assigned(one)
 	}
-	hoist_expr(w[WH_COND])
-	hoist_stmts(w[WH_BODY][BLK_STMTS])
-	if w[WH_POST] != 0 {
+	hoist_expr(w.cond)
+	hoist_stmts(cast(Block, w.body).stmts)
+	if w.post != 0 {
 		let two = vec_new()
-		vec_push(two, w[WH_POST])
+		vec_push(two, w.post)
 		hoist_stmts(two)
 	}
 	return lc_pre
@@ -400,34 +400,34 @@ fn collect_assigned(stmts i64) {
 	mut i = 0
 	for i < stmts[VEC_LEN] {
 		let s = vec_get(stmts, i)
-		let k = s[N_KIND]
+		let k = cast(Node, s).kind
 		if k == ST_LET {
-			vec_push(lc_assigned, s[LET_SYM])
-		} else if k == ST_ASSIGN && s[AS_TARGET][N_KIND] == EX_IDENT {
-			vec_push(lc_assigned, s[AS_TARGET][ID_REF])
+			vec_push(lc_assigned, cast(LetStmt, s).sym)
+		} else if k == ST_ASSIGN && cast(Node, cast(AssignStmt, s).target).kind == EX_IDENT {
+			vec_push(lc_assigned, cast(IdentExpr, cast(AssignStmt, s).target).ref)
 		} else if k == ST_BLOCK {
-			collect_assigned(s[BLK_STMTS])
+			collect_assigned(cast(Block, s).stmts)
 		} else if k == ST_IF {
-			collect_assigned(s[IF_THEN][BLK_STMTS])
-			mut els = s[IF_ELSE]
-			for els != 0 && els[N_KIND] == ST_IF {
-				collect_assigned(els[IF_THEN][BLK_STMTS])
-				els = els[IF_ELSE]
+			collect_assigned(cast(Block, cast(IfStmt, s).then).stmts)
+			mut els = cast(IfStmt, s).else_
+			for els != 0 && cast(Node, els).kind == ST_IF {
+				collect_assigned(cast(Block, cast(IfStmt, els).then).stmts)
+				els = cast(IfStmt, els).else_
 			}
 			if els != 0 {
-				collect_assigned(els[BLK_STMTS])
+				collect_assigned(cast(Block, els).stmts)
 			}
 		} else if k == ST_WHILE {
-			collect_assigned(s[WH_BODY][BLK_STMTS])
-			if s[WH_POST] != 0 {
+			collect_assigned(cast(Block, cast(WhileStmt, s).body).stmts)
+			if cast(WhileStmt, s).post != 0 {
 				let one = vec_new()
-				vec_push(one, s[WH_POST])
+				vec_push(one, cast(WhileStmt, s).post)
 				collect_assigned(one)
 			}
 		} else if k == ST_CALLMULTI {
 			mut j = 0
-			for j < s[CM_SYMS][VEC_LEN] {
-				vec_push(lc_assigned, vec_get(s[CM_SYMS], j))
+			for j < cast(CallMultiStmt, s).syms[VEC_LEN] {
+				vec_push(lc_assigned, vec_get(cast(CallMultiStmt, s).syms, j))
 				j = j + 1
 			}
 		}
@@ -447,66 +447,66 @@ fn is_assigned(s i64) i64 {
 }
 
 fn invariant(e i64) i64 {
-	let k = e[N_KIND]
+	let k = cast(Node, e).kind
 	if k == EX_INT {
 		return 1
 	}
 	if k == EX_IDENT {
-		let s = e[ID_REF]
-		if s[S_KIND] == SYM_CONST {
+		let s = cast(Sym, cast(IdentExpr, e).ref)
+		if s.kind == SYM_CONST {
 			return 1
 		}
-		return i64(s[S_KIND] == SYM_LOCAL && s[S_ADDR] == 0 && is_assigned(s) == 0)
+		return i64(s.kind == SYM_LOCAL && s.addr == 0 && is_assigned(cast(i64, s)) == 0)
 	}
 	if k == EX_UNARY {
-		return i64(streq(e[UN_OP], cstr("&")) == 0 && invariant(e[UN_X]) != 0)
+		return i64(streq(cast(Unary, e).op, cstr("&")) == 0 && invariant(cast(Unary, e).x) != 0)
 	}
 	if k == EX_BINARY {
-		return i64(streq(e[BIN_OP], cstr("&&")) == 0 && streq(e[BIN_OP], cstr("||")) == 0 && may_panic(e) == 0 && invariant(e[BIN_L]) != 0 && invariant(e[BIN_R]) != 0)
+		return i64(streq(cast(Binary, e).op, cstr("&&")) == 0 && streq(cast(Binary, e).op, cstr("||")) == 0 && may_panic(cast(Binary, e)) == 0 && invariant(cast(Binary, e).l) != 0 && invariant(cast(Binary, e).r) != 0)
 	}
 	if k == EX_FLOAT {
 		return 1
 	}
 	if k == EX_CONV {
-		if (e[CV_KIND] == CV_LEN || e[CV_KIND] == CV_CAP) && lc_calls != 0 {
+		if (cast(Conv, e).kind == CV_LEN || cast(Conv, e).kind == CV_CAP) && lc_calls != 0 {
 			return 0
 		}
-		return invariant(e[CV_X])
+		return invariant(cast(Conv, e).x)
 	}
-	if k == EX_INDEX && e[IX_HDR] != 0 {
+	if k == EX_INDEX && cast(IndexExpr, e).hdr != 0 {
 		// Slice and string headers only change through runtime calls.
-		return i64(lc_calls == 0 && invariant(e[IX_X]) != 0)
+		return i64(lc_calls == 0 && invariant(cast(IndexExpr, e).x) != 0)
 	}
-	if k == EX_MEM && e[MEM_HDR] != 0 {
-		return i64(lc_calls == 0 && e[MEM_INDEX] == 0 && invariant(e[MEM_BASE]) != 0)
+	if k == EX_MEM && cast(MemExpr, e).hdr != 0 {
+		return i64(lc_calls == 0 && cast(MemExpr, e).index == 0 && invariant(cast(MemExpr, e).base) != 0)
 	}
 	return 0
 }
 
 // op_cost estimates the instructions an expression needs; multiplies and divides count triple.
 fn op_cost(e i64) i64 {
-	let k = e[N_KIND]
+	let k = cast(Node, e).kind
 	if k == EX_BINARY {
-		let op = e[BIN_OP]
+		let op = cast(Binary, e).op
 		mut c = 1
 		if streq(op, cstr("*")) != 0 || streq(op, cstr("/")) != 0 || streq(op, cstr("%")) != 0 {
 			c = 3
 		}
-		return c + op_cost(e[BIN_L]) + op_cost(e[BIN_R])
+		return c + op_cost(cast(Binary, e).l) + op_cost(cast(Binary, e).r)
 	}
 	if k == EX_UNARY {
-		return 1 + op_cost(e[UN_X])
+		return 1 + op_cost(cast(Unary, e).x)
 	}
 	if k == EX_CONV {
-		return 1 + op_cost(e[CV_X])
+		return 1 + op_cost(cast(Conv, e).x)
 	}
 	if k == EX_INDEX {
-		return 2 + op_cost(e[IX_X])
+		return 2 + op_cost(cast(IndexExpr, e).x)
 	}
 	if k == EX_MEM {
-		return 2 + op_cost(e[MEM_BASE])
+		return 2 + op_cost(cast(MemExpr, e).base)
 	}
-	if k == EX_FLOAT && e[FL_BITS] != 0 {
+	if k == EX_FLOAT && cast(FloatLit, e).bits != 0 {
 		return 2
 	}
 	return 0
@@ -516,41 +516,41 @@ fn hoist_stmts(stmts i64) {
 	mut i = 0
 	for i < stmts[VEC_LEN] {
 		let s = vec_get(stmts, i)
-		let k = s[N_KIND]
+		let k = cast(Node, s).kind
 		if k == ST_LET {
-			hoist_expr(s[LET_INIT])
+			hoist_expr(cast(LetStmt, s).init)
 		} else if k == ST_ASSIGN {
-			hoist_expr(s[AS_TARGET])
-			hoist_expr(s[AS_VALUE])
+			hoist_expr(cast(AssignStmt, s).target)
+			hoist_expr(cast(AssignStmt, s).value)
 		} else if k == ST_EXPR {
-			hoist_expr(s[ES_X])
+			hoist_expr(cast(ExprStmt, s).x)
 		} else if k == ST_RETURN {
-			if s[RET_VALUE] != 0 {
-				hoist_expr(s[RET_VALUE])
+			if cast(ReturnStmt, s).value != 0 {
+				hoist_expr(cast(ReturnStmt, s).value)
 			}
 		} else if k == ST_BLOCK {
-			hoist_stmts(s[BLK_STMTS])
+			hoist_stmts(cast(Block, s).stmts)
 		} else if k == ST_IF {
-			hoist_expr(s[IF_COND])
-			hoist_stmts(s[IF_THEN][BLK_STMTS])
-			let els = s[IF_ELSE]
-			if els != 0 && els[N_KIND] == ST_BLOCK {
-				hoist_stmts(els[BLK_STMTS])
+			hoist_expr(cast(IfStmt, s).cond)
+			hoist_stmts(cast(Block, cast(IfStmt, s).then).stmts)
+			let els = cast(IfStmt, s).else_
+			if els != 0 && cast(Node, els).kind == ST_BLOCK {
+				hoist_stmts(cast(Block, els).stmts)
 			} else if els != 0 {
 				let one = vec_new()
 				vec_push(one, els)
 				hoist_stmts(one)
 			}
 		} else if k == ST_WHILE {
-			hoist_expr(s[WH_COND])
-			hoist_stmts(s[WH_BODY][BLK_STMTS])
-			if s[WH_POST] != 0 {
+			hoist_expr(cast(WhileStmt, s).cond)
+			hoist_stmts(cast(Block, cast(WhileStmt, s).body).stmts)
+			if cast(WhileStmt, s).post != 0 {
 				let one = vec_new()
-				vec_push(one, s[WH_POST])
+				vec_push(one, cast(WhileStmt, s).post)
 				hoist_stmts(one)
 			}
 		} else if k == ST_CALLMULTI {
-			hoist_expr(s[CM_CALL])
+			hoist_expr(cast(CallMultiStmt, s).call)
 		}
 		i = i + 1
 	}
@@ -560,36 +560,36 @@ fn hoist_expr(e i64) {
 	if e == 0 {
 		return
 	}
-	mut k = e[N_KIND]
-	if (k == EX_BINARY || k == EX_UNARY || k == EX_CONV || k == EX_FLOAT || (k == EX_INDEX && e[IX_HDR] != 0) || (k == EX_MEM && e[MEM_HDR] != 0)) && invariant(e) != 0 && is_const(e) == 0 && op_cost(e) >= 2 {
+	mut k = cast(Node, e).kind
+	if (k == EX_BINARY || k == EX_UNARY || k == EX_CONV || k == EX_FLOAT || (k == EX_INDEX && cast(IndexExpr, e).hdr != 0) || (k == EX_MEM && cast(MemExpr, e).hdr != 0)) && invariant(e) != 0 && is_const(e) == 0 && op_cost(e) >= 2 {
 		replace_with_temp(e)
 		return
 	}
 	if k == EX_ELEM {
 		elem_specialize(e)
-		k = e[N_KIND]
+		k = cast(Node, e).kind
 	}
 	if k == EX_INDEX {
 		index_rewrite(e)
-		hoist_expr(e[IX_X])
-		hoist_expr(e[IX_I])
+		hoist_expr(cast(IndexExpr, e).x)
+		hoist_expr(cast(IndexExpr, e).i)
 	} else if k == EX_MEM {
 		mem_rewrite(e)
-		hoist_expr(e[MEM_BASE])
-		hoist_expr(e[MEM_INDEX])
-		hoist_expr(e[MEM_LEN])
+		hoist_expr(cast(MemExpr, e).base)
+		hoist_expr(cast(MemExpr, e).index)
+		hoist_expr(cast(MemExpr, e).len)
 	} else if k == EX_ELEM {
-		hoist_expr(e[ELEM_SEQ])
-		hoist_expr(e[ELEM_IDX])
+		hoist_expr(cast(ElemExpr, e).seq)
+		hoist_expr(cast(ElemExpr, e).idx)
 	} else if k == EX_UNARY {
-		hoist_expr(e[UN_X])
+		hoist_expr(cast(Unary, e).x)
 	} else if k == EX_BINARY {
-		hoist_expr(e[BIN_L])
-		hoist_expr(e[BIN_R])
+		hoist_expr(cast(Binary, e).l)
+		hoist_expr(cast(Binary, e).r)
 	} else if k == EX_CONV {
-		hoist_expr(e[CV_X])
+		hoist_expr(cast(Conv, e).x)
 	} else if k == EX_CALL {
-		let args = e[CALL_ARGS]
+		let args = cast(Call, e).args
 		mut i = 0
 		for i < args[VEC_LEN] {
 			hoist_expr(vec_get(args, i))
@@ -599,121 +599,121 @@ fn hoist_expr(e i64) {
 }
 
 fn binary_node(pos i64, op i64, l i64, r i64) i64 {
-	let b = node_new(EX_BINARY, pos)
-	b[BIN_OP] = op
-	b[BIN_L] = l
-	b[BIN_R] = r
-	return b
+	let b = cast(Binary, node_new(EX_BINARY, pos))
+	b.op = op
+	b.l = l
+	b.r = r
+	return cast(i64, b)
 }
 
 // index_rewrite turns x[a + b] into (x + (a << 3))[b] when x and a are invariant and b is not.
 fn index_rewrite(e i64) {
-	let ix = e[IX_I]
-	if ix[N_KIND] != EX_BINARY || streq(ix[BIN_OP], cstr("+")) == 0 || invariant(e[IX_X]) == 0 {
+	let ix = cast(IndexExpr, e).i
+	if cast(Node, ix).kind != EX_BINARY || streq(cast(Binary, ix).op, cstr("+")) == 0 || invariant(cast(IndexExpr, e).x) == 0 {
 		return
 	}
-	mut a = ix[BIN_L]
-	mut b = ix[BIN_R]
+	mut a = cast(Binary, ix).l
+	mut b = cast(Binary, ix).r
 	if invariant(b) != 0 && invariant(a) == 0 {
-		a = ix[BIN_R]
-		b = ix[BIN_L]
+		a = cast(Binary, ix).r
+		b = cast(Binary, ix).l
 	}
 	if invariant(a) == 0 || invariant(b) != 0 {
 		return
 	}
-	let three = node_new(EX_INT, e[N_POS])
-	three[INT_VAL] = 3
-	e[IX_X] = binary_node(e[N_POS], cstr("+"), e[IX_X], binary_node(e[N_POS], cstr("<<"), a, three))
-	e[IX_I] = b
+	let three = cast(IntLit, node_new(EX_INT, cast(Node, e).pos))
+	three.val = 3
+	cast(IndexExpr, e).x = binary_node(cast(Node, e).pos, cstr("+"), cast(IndexExpr, e).x, binary_node(cast(Node, e).pos, cstr("<<"), a, cast(i64, three)))
+	cast(IndexExpr, e).i = b
 }
 
 // replace_with_temp moves e into a let before the loop and turns e into a read of it,
 // reusing the temp of an identical expression hoisted earlier from the same loop.
 fn replace_with_temp(e i64) {
-	mut s = 0
+	mut s = cast(Sym, 0)
 	mut i = 0
-	for i < lc_exprs[VEC_LEN] && s == 0 {
+	for i < lc_exprs[VEC_LEN] && cast(i64, s) == 0 {
 		if expr_equal(vec_get(lc_exprs, i), e) != 0 {
-			s = vec_get(lc_syms, i)
+			s = cast(Sym, vec_get(lc_syms, i))
 		}
 		i = i + 1
 	}
-	if s == 0 {
+	if cast(i64, s) == 0 {
 		let moved = node_copy(e)
-		s = sym_new(SYM_LOCAL, cstr("licm"), e[N_POS])
-		s[S_TYPE] = e[N_TYPE]
-		s[S_SLOT] = lc_fn[F_SLOTS]
-		lc_fn[F_SLOTS] = lc_fn[F_SLOTS] + 1
-		vec_push(lc_fn[F_LOCALS], s)
-		let l = node_new(ST_LET, e[N_POS])
-		l[LET_NAME] = cstr("licm")
-		l[LET_INIT] = moved
-		l[LET_SYM] = s
-		vec_push(lc_pre, l)
+		s = cast(Sym, sym_new(SYM_LOCAL, cstr("licm"), cast(Node, e).pos))
+		s.type_ = cast(Node, e).type_
+		s.slot = cast(Fn, lc_fn).slots
+		cast(Fn, lc_fn).slots = cast(Fn, lc_fn).slots + 1
+		vec_push(cast(Fn, lc_fn).locals, cast(i64, s))
+		let l = cast(LetStmt, node_new(ST_LET, cast(Node, e).pos))
+		l.name = cstr("licm")
+		l.init = moved
+		l.sym = cast(i64, s)
+		vec_push(lc_pre, cast(i64, l))
 		vec_push(lc_exprs, moved)
-		vec_push(lc_syms, s)
+		vec_push(lc_syms, cast(i64, s))
 	}
-	let t = e[N_TYPE]
-	e[N_KIND] = EX_IDENT
-	e[ID_NAME] = s[S_NAME]
-	e[ID_REF] = s
+	let t = cast(Node, e).type_
+	cast(Node, e).kind = EX_IDENT
+	cast(IdentExpr, e).name = s.name
+	cast(IdentExpr, e).ref = cast(i64, s)
 	e[4] = 0
 	e[5] = 0
-	e[N_TYPE] = t
+	cast(Node, e).type_ = t
 	e[7] = 0
 }
 
 // elem_specialize turns s[i] in a loop that cannot change s into a plain load from the
 // hoisted data pointer, checked against the hoisted length.
 fn elem_specialize(e i64) {
-	let x = e[ELEM_SEQ]
+	let x = cast(ElemExpr, e).seq
 	if lc_calls != 0 || invariant(x) == 0 || is_reg_local(x) == 0 {
 		return
 	}
-	let pos = e[N_POS]
-	mut data = 0
-	if e[ELEM_STR] != 0 {
-		data = binary_node(pos, cstr("+"), node_copy(x), int_node(pos, 8))
-		data[N_TYPE] = ty_int
+	let pos = cast(Node, e).pos
+	mut data = cast(Node, 0)
+	if cast(ElemExpr, e).str != 0 {
+		data = cast(Node, binary_node(pos, cstr("+"), node_copy(x), int_node(pos, 8)))
+		data.type_ = ty_int
 	} else {
-		data = mk_hdr(pos, node_copy(x), 2)
+		data = cast(Node, mk_hdr(pos, node_copy(x), 2))
 	}
 	mut lenx = 0
-	if e[ELEM_SAFE] == 0 {
+	if cast(ElemExpr, e).safe == 0 {
 		lenx = mk_hdr(pos, node_copy(x), 0)
 	}
-	let idx = e[ELEM_IDX]
-	let size = e[ELEM_SIZE]
-	let t = e[N_TYPE]
-	let m = mk_mem(pos, data, idx, size, 0, t)
-	m[MEM_LEN] = lenx
-	replace_node(e, m)
+	let idx = cast(ElemExpr, e).idx
+	let size = cast(ElemExpr, e).size
+	let t = cast(Node, e).type_
+	let m = cast(MemExpr, mk_mem(pos, cast(i64, data), idx, size, 0, t))
+	m.len = lenx
+	replace_node(e, cast(i64, m))
 }
 
 fn int_node(pos i64, v i64) i64 {
 	let n = node_new(EX_INT, pos)
-	n[INT_VAL] = v
-	n[N_TYPE] = ty_int
+	cast(IntLit, n).val = v
+	cast(Node, n).type_ = ty_int
 	return n
 }
 
 // mem_rewrite turns base[a + b] (unchecked) with base and a invariant into
 // (base + a*scale)[b], so the row address is computed once per loop.
 fn mem_rewrite(e i64) {
-	let ix = e[MEM_INDEX]
-	if ix == 0 || e[MEM_LEN] != 0 || ix[N_KIND] != EX_BINARY || streq(ix[BIN_OP], cstr("+")) == 0 || invariant(e[MEM_BASE]) == 0 {
+	let ix = cast(MemExpr, e).index
+	if ix == 0 || cast(MemExpr, e).len != 0 || cast(Node, ix).kind != EX_BINARY || streq(cast(Binary, ix).op, cstr("+")) == 0 || invariant(cast(MemExpr, e).base) == 0 {
 		return
 	}
-	mut a = ix[BIN_L]
-	mut b = ix[BIN_R]
+	mut a = cast(Binary, ix).l
+	mut b = cast(Binary, ix).r
 	if invariant(b) != 0 && invariant(a) == 0 {
-		a = ix[BIN_R]
-		b = ix[BIN_L]
+		a = cast(Binary, ix).r
+		b = cast(Binary, ix).l
 	}
 	if invariant(a) == 0 || invariant(b) != 0 {
 		return
 	}
-	let sh = int_node(e[N_POS], width_log2(e[MEM_SCALE]))
-	e[MEM_BASE] = binary_node(e[N_POS], cstr("+"), e[MEM_BASE], binary_node(e[N_POS], cstr("<<"), a, sh))
-	e[MEM_INDEX] = b
+	let sh = int_node(cast(Node, e).pos, width_log2(cast(MemExpr, e).scale))
+	cast(MemExpr, e).base = binary_node(cast(Node, e).pos, cstr("+"), cast(MemExpr, e).base, binary_node(cast(Node, e).pos, cstr("<<"), a, sh))
+	cast(MemExpr, e).index = b
 }

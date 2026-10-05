@@ -5,18 +5,18 @@
 // changes no safety checks.
 shared mut ia_fn i64
 
-fn inline_appends(f i64) {
-	ia_fn = f
-	ia_stmts(f[F_BODY][BLK_STMTS])
+fn inline_appends(f Fn) {
+	ia_fn = cast(i64, f)
+	ia_stmts(cast(Block, f.body).stmts)
 }
 
 fn ia_local(t i64) i64 {
-	let s = sym_new(SYM_LOCAL, cstr("$"), 0)
-	s[S_TYPE] = t
-	s[S_SLOT] = ia_fn[F_SLOTS]
-	ia_fn[F_SLOTS] = ia_fn[F_SLOTS] + 1
-	vec_push(ia_fn[F_LOCALS], s)
-	return s
+	let s = cast(Sym, sym_new(SYM_LOCAL, cstr("$"), 0))
+	s.type_ = t
+	s.slot = cast(Fn, ia_fn).slots
+	cast(Fn, ia_fn).slots = cast(Fn, ia_fn).slots + 1
+	vec_push(cast(Fn, ia_fn).locals, cast(i64, s))
+	return cast(i64, s)
 }
 
 fn ia_stmts(v i64) {
@@ -28,41 +28,41 @@ fn ia_stmts(v i64) {
 }
 
 fn ia_stmt(s i64) {
-	let k = s[N_KIND]
+	let k = cast(Node, s).kind
 	if k == ST_BLOCK {
-		ia_stmts(s[BLK_STMTS])
+		ia_stmts(cast(Block, s).stmts)
 	} else if k == ST_LET {
-		if s[LET_INIT] != 0 {
-			ia_expr(s[LET_INIT])
+		if cast(LetStmt, s).init != 0 {
+			ia_expr(cast(LetStmt, s).init)
 		}
 	} else if k == ST_ASSIGN {
-		if s[AS_TARGET][N_KIND] != EX_IDENT {
-			ia_expr(s[AS_TARGET])
+		if cast(Node, cast(AssignStmt, s).target).kind != EX_IDENT {
+			ia_expr(cast(AssignStmt, s).target)
 		}
-		ia_expr(s[AS_VALUE])
+		ia_expr(cast(AssignStmt, s).value)
 	} else if k == ST_EXPR {
-		ia_expr(s[ES_X])
+		ia_expr(cast(ExprStmt, s).x)
 	} else if k == ST_IF {
-		ia_expr(s[IF_COND])
-		ia_stmts(s[IF_THEN][BLK_STMTS])
-		if s[IF_ELSE] != 0 {
-			ia_stmt(s[IF_ELSE])
+		ia_expr(cast(IfStmt, s).cond)
+		ia_stmts(cast(Block, cast(IfStmt, s).then).stmts)
+		if cast(IfStmt, s).else_ != 0 {
+			ia_stmt(cast(IfStmt, s).else_)
 		}
 	} else if k == ST_WHILE {
-		ia_expr(s[WH_COND])
-		ia_stmts(s[WH_BODY][BLK_STMTS])
-		if s[WH_POST] != 0 {
-			ia_stmt(s[WH_POST])
+		ia_expr(cast(WhileStmt, s).cond)
+		ia_stmts(cast(Block, cast(WhileStmt, s).body).stmts)
+		if cast(WhileStmt, s).post != 0 {
+			ia_stmt(cast(WhileStmt, s).post)
 		}
 	} else if k == ST_RETURN {
-		if s[RET_VALUE] != 0 {
-			ia_expr(s[RET_VALUE])
+		if cast(ReturnStmt, s).value != 0 {
+			ia_expr(cast(ReturnStmt, s).value)
 		}
-		if s[RET_VALUES] != 0 {
-			ia_exprs(s[RET_VALUES])
+		if cast(ReturnStmt, s).values != 0 {
+			ia_exprs(cast(ReturnStmt, s).values)
 		}
 	} else if k == ST_CALLMULTI {
-		ia_expr(s[CM_CALL])
+		ia_expr(cast(CallMultiStmt, s).call)
 	}
 }
 
@@ -78,35 +78,35 @@ fn ia_expr(e i64) {
 	if e == 0 {
 		return
 	}
-	let k = e[N_KIND]
+	let k = cast(Node, e).kind
 	if k == EX_UNARY {
-		ia_expr(e[UN_X])
+		ia_expr(cast(Unary, e).x)
 	} else if k == EX_BINARY {
-		ia_expr(e[BIN_L])
-		ia_expr(e[BIN_R])
+		ia_expr(cast(Binary, e).l)
+		ia_expr(cast(Binary, e).r)
 	} else if k == EX_CONV {
-		ia_expr(e[CV_X])
+		ia_expr(cast(Conv, e).x)
 	} else if k == EX_MEM {
-		ia_expr(e[MEM_BASE])
-		ia_expr(e[MEM_INDEX])
-		ia_expr(e[MEM_LEN])
+		ia_expr(cast(MemExpr, e).base)
+		ia_expr(cast(MemExpr, e).index)
+		ia_expr(cast(MemExpr, e).len)
 	} else if k == EX_ELEM {
-		ia_expr(e[ELEM_SEQ])
-		ia_expr(e[ELEM_IDX])
+		ia_expr(cast(ElemExpr, e).seq)
+		ia_expr(cast(ElemExpr, e).idx)
 	} else if k == EX_SEQ {
-		ia_stmts(e[SEQ_STMTS])
-		ia_expr(e[SEQ_VALUE])
+		ia_stmts(cast(SeqExpr, e).stmts)
+		ia_expr(cast(SeqExpr, e).value)
 	} else if k == EX_INDEX {
-		ia_expr(e[IX_X])
-		ia_expr(e[IX_I])
+		ia_expr(cast(IndexExpr, e).x)
+		ia_expr(cast(IndexExpr, e).i)
 	} else if k == EX_CALL {
-		ia_expr(e[CALL_CALLEE])
-		ia_exprs(e[CALL_ARGS])
-		let name = e[CALL_NAME]
-		if e[CALL_INTRINSIC] == 0 && name != 0 && ia_fn[F_GENERATED] == 0 {
-			if (streq(name, cstr("rt_append")) != 0 || streq(name, cstr("rt_append_rc")) != 0) && e[CALL_ARGS][VEC_LEN] == 3 && vec_get(e[CALL_ARGS], 2)[N_KIND] == EX_INT {
+		ia_expr(cast(Call, e).callee)
+		ia_exprs(cast(Call, e).args)
+		let name = cast(Call, e).name
+		if cast(Call, e).intrinsic == 0 && name != 0 && cast(Fn, ia_fn).generated == 0 {
+			if (streq(name, cstr("rt_append")) != 0 || streq(name, cstr("rt_append_rc")) != 0) && cast(Call, e).args[VEC_LEN] == 3 && cast(Node, vec_get(cast(Call, e).args, 2)).kind == EX_INT {
 				ia_append(e)
-			} else if streq(name, cstr("rt_append_str")) != 0 && e[CALL_ARGS][VEC_LEN] == 2 {
+			} else if streq(name, cstr("rt_append_str")) != 0 && cast(Call, e).args[VEC_LEN] == 2 {
 				ia_append_str(e)
 			}
 		}
@@ -114,7 +114,7 @@ fn ia_expr(e i64) {
 }
 
 fn ia_ref(s i64) i64 {
-	return sym_ref_node(0, s)
+	return sym_ref_node(0, cast(Sym, s))
 }
 
 fn ia_hdr(h i64, word i64) i64 {
@@ -137,11 +137,11 @@ fn elem_type_of_size(esz i64) i64 {
 // ia_append: h := s; v := x; n := h.len; if n >= h.cap { h = rt_append(h, v, esz) }
 // else { h.data[n] = v; h.len = n + 1 }; value h.
 fn ia_append(e i64) {
-	let pos = e[N_POS]
-	let args = e[CALL_ARGS]
-	let st = e[N_TYPE]
-	let esz = vec_get(args, 2)[INT_VAL]
-	mut vt = vec_get(args, 1)[N_TYPE]
+	let pos = cast(Node, e).pos
+	let args = cast(Call, e).args
+	let st = cast(Node, e).type_
+	let esz = cast(IntLit, vec_get(args, 2)).val
+	mut vt = cast(Node, vec_get(args, 1)).type_
 	if vt == 0 || is_float_t(vt) != 0 {
 		vt = ty_int
 	}
@@ -149,32 +149,32 @@ fn ia_append(e i64) {
 	let v = ia_local(vt)
 	let n = ia_local(ty_int)
 	let stmts = vec_new()
-	vec_push(stmts, let_stmt(pos, h, vec_get(args, 0)))
-	vec_push(stmts, let_stmt(pos, v, vec_get(args, 1)))
-	vec_push(stmts, let_stmt(pos, n, ia_hdr(h, 0)))
+	vec_push(stmts, let_stmt(pos, cast(Sym, h), vec_get(args, 0)))
+	vec_push(stmts, let_stmt(pos, cast(Sym, v), vec_get(args, 1)))
+	vec_push(stmts, let_stmt(pos, cast(Sym, n), ia_hdr(h, 0)))
 	let slow = node_new(EX_CALL, pos)
-	slow[CALL_NAME] = e[CALL_NAME]
-	slow[CALL_FN] = e[CALL_FN]
-	slow[CALL_ARGS] = args3(ia_ref(h), ia_ref(v), mk_int(pos, esz, ty_int))
-	slow[N_TYPE] = st
-	let ifs = node_new(ST_IF, pos)
-	ifs[IF_COND] = mk_bin(pos, cstr(">="), ia_ref(n), ia_hdr(h, 1), ty_bool)
-	ifs[IF_THEN] = empty_block(pos)
-	vec_push(ifs[IF_THEN][BLK_STMTS], assign_stmt(pos, ia_ref(h), slow))
-	let els = empty_block(pos)
+	cast(Call, slow).name = cast(Call, e).name
+	cast(Call, slow).fn_ = cast(Call, e).fn_
+	cast(Call, slow).args = args3(ia_ref(h), ia_ref(v), mk_int(pos, esz, ty_int))
+	cast(Node, slow).type_ = st
+	let ifs = cast(IfStmt, node_new(ST_IF, pos))
+	ifs.cond = mk_bin(pos, cstr(">="), ia_ref(n), ia_hdr(h, 1), ty_bool)
+	ifs.then = empty_block(pos)
+	vec_push(cast(Block, ifs.then).stmts, assign_stmt(pos, ia_ref(h), slow))
+	let els = cast(Block, empty_block(pos))
 	let slot = mk_mem(pos, ia_hdr(h, 2), ia_ref(n), esz, 0, elem_type_of_size(esz))
-	vec_push(els[BLK_STMTS], assign_stmt(pos, slot, ia_ref(v)))
-	vec_push(els[BLK_STMTS], assign_stmt(pos, ia_hdr(h, 0), mk_bin(pos, cstr("+"), ia_ref(n), mk_int(pos, 1, ty_int), ty_int)))
-	if streq(e[CALL_NAME], cstr("rt_append_rc")) != 0 {
+	vec_push(els.stmts, assign_stmt(pos, slot, ia_ref(v)))
+	vec_push(els.stmts, assign_stmt(pos, ia_hdr(h, 0), mk_bin(pos, cstr("+"), ia_ref(n), mk_int(pos, 1, ty_int), ty_int)))
+	if streq(cast(Call, e).name, cstr("rt_append_rc")) != 0 {
 		// A counted element in a long-lived slice gains its slot's count (#176).
-		let lived = node_new(ST_IF, pos)
-		lived[IF_COND] = mk_bin(pos, cstr("!="), ia_hdr(h, 3), mk_int(pos, 0, ty_int), ty_bool)
-		lived[IF_THEN] = empty_block(pos)
-		vec_push(lived[IF_THEN][BLK_STMTS], expr_stmt(rt_call(pos, cstr("rt_rc_inc"), args1(ia_ref(v)), ty_void)))
-		vec_push(els[BLK_STMTS], lived)
+		let lived = cast(IfStmt, node_new(ST_IF, pos))
+		lived.cond = mk_bin(pos, cstr("!="), ia_hdr(h, 3), mk_int(pos, 0, ty_int), ty_bool)
+		lived.then = empty_block(pos)
+		vec_push(cast(Block, lived.then).stmts, expr_stmt(cast(Node, rt_call(pos, cstr("rt_rc_inc"), args1(ia_ref(v)), ty_void))))
+		vec_push(els.stmts, cast(i64, lived))
 	}
-	ifs[IF_ELSE] = els
-	vec_push(stmts, ifs)
+	ifs.else_ = cast(i64, els)
+	vec_push(stmts, cast(i64, ifs))
 	replace_node(e, mk_seq(pos, stmts, ia_ref(h), st))
 }
 
@@ -186,29 +186,29 @@ fn ia_copy_str_chunk(pos i64, stmts i64, dst i64, src i64, off i64, lg i64) {
 		dst_at = mk_bin(pos, cstr("+"), dst, mk_int(pos, off, ty_int), ty_int)
 		src_at = mk_bin(pos, cstr("+"), src, mk_int(pos, off, ty_int), ty_int)
 	}
-	vec_push(stmts, let_stmt(pos, word, intrinsic_call(pos, cstr("__ld"), args2(src_at, mk_int(pos, lg, ty_int)), ty_int)))
-	vec_push(stmts, expr_stmt(intrinsic_call(pos, cstr("__st"), args3(dst_at, ia_ref(word), mk_int(pos, lg, ty_int)), ty_void)))
+	vec_push(stmts, let_stmt(pos, cast(Sym, word), intrinsic_call(pos, cstr("__ld"), args2(src_at, mk_int(pos, lg, ty_int)), ty_int)))
+	vec_push(stmts, expr_stmt(cast(Node, intrinsic_call(pos, cstr("__st"), args3(dst_at, ia_ref(word), mk_int(pos, lg, ty_int)), ty_void))))
 }
 
 // ia_append_str: copy a one-byte string directly, and use memcpy for the rest.
 // Only a full slice takes the runtime growth path.
 fn ia_append_str(e i64) {
-	let pos = e[N_POS]
-	let args = e[CALL_ARGS]
-	mut st = e[N_TYPE]
-	if st == 0 || kind_of(st) != K_SLICE {
+	let pos = cast(Node, e).pos
+	let args = cast(Call, e).args
+	mut st = cast(Node, e).type_
+	if st == 0 || kind_of(cast(Ty, st)) != K_SLICE {
 		st = slice_of(ty_byte)
 	}
 	let lit = vec_get(args, 1)
-	if lit[N_KIND] == EX_STR && lit[STR_LEN] > 0 && lit[STR_LEN] <= 32 {
-		ia_append_lit(e, lit)
+	if cast(Node, lit).kind == EX_STR && cast(StrLit, lit).len > 0 && cast(StrLit, lit).len <= 32 {
+		ia_append_lit(e, cast(StrLit, lit))
 		return
 	}
-	let memcpy_fn = find_fn(cstr("memcpy"))
-	if memcpy_fn == 0 {
+	let memcpy_fn = cast(Fn, find_fn(cstr("memcpy")))
+	if cast(i64, memcpy_fn) == 0 {
 		return
 	}
-	memcpy_fn[F_USED] = 1
+	memcpy_fn.used = 1
 	let h = ia_local(st)
 	let t = ia_local(ty_string)
 	let n = ia_local(ty_int)
@@ -217,62 +217,62 @@ fn ia_append_str(e i64) {
 	let src = ia_local(ty_int)
 	let word = ia_local(ty_int)
 	let stmts = vec_new()
-	vec_push(stmts, let_stmt(pos, h, vec_get(args, 0)))
-	vec_push(stmts, let_stmt(pos, t, vec_get(args, 1)))
-	vec_push(stmts, let_stmt(pos, n, ia_hdr(h, 0)))
-	vec_push(stmts, let_stmt(pos, m, mk_mem(pos, ia_ref(t), 0, 0, 0, ty_int)))
+	vec_push(stmts, let_stmt(pos, cast(Sym, h), vec_get(args, 0)))
+	vec_push(stmts, let_stmt(pos, cast(Sym, t), vec_get(args, 1)))
+	vec_push(stmts, let_stmt(pos, cast(Sym, n), ia_hdr(h, 0)))
+	vec_push(stmts, let_stmt(pos, cast(Sym, m), mk_mem(pos, ia_ref(t), 0, 0, 0, ty_int)))
 	let slow = node_new(EX_CALL, pos)
-	slow[CALL_NAME] = e[CALL_NAME]
-	slow[CALL_FN] = e[CALL_FN]
-	slow[CALL_ARGS] = args2(ia_ref(h), ia_ref(t))
-	slow[N_TYPE] = st
-	let ifs = node_new(ST_IF, pos)
-	ifs[IF_COND] = mk_bin(pos, cstr(">"), mk_bin(pos, cstr("+"), ia_ref(n), ia_ref(m), ty_int), ia_hdr(h, 1), ty_bool)
-	ifs[IF_THEN] = empty_block(pos)
-	vec_push(ifs[IF_THEN][BLK_STMTS], assign_stmt(pos, ia_ref(h), slow))
-	let els = empty_block(pos)
+	cast(Call, slow).name = cast(Call, e).name
+	cast(Call, slow).fn_ = cast(Call, e).fn_
+	cast(Call, slow).args = args2(ia_ref(h), ia_ref(t))
+	cast(Node, slow).type_ = st
+	let ifs = cast(IfStmt, node_new(ST_IF, pos))
+	ifs.cond = mk_bin(pos, cstr(">"), mk_bin(pos, cstr("+"), ia_ref(n), ia_ref(m), ty_int), ia_hdr(h, 1), ty_bool)
+	ifs.then = empty_block(pos)
+	vec_push(cast(Block, ifs.then).stmts, assign_stmt(pos, ia_ref(h), slow))
+	let els = cast(Block, empty_block(pos))
 
-	let fallback = empty_block(pos)
+	let fallback = cast(Block, empty_block(pos))
 	let cp = node_new(EX_CALL, pos)
-	cp[CALL_NAME] = cstr("memcpy")
-	cp[CALL_FN] = memcpy_fn
-	cp[CALL_ARGS] = args3(mk_bin(pos, cstr("+"), ia_hdr(h, 2), ia_ref(n), ty_int), mk_bin(pos, cstr("+"), mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int), ia_ref(m))
-	cp[N_TYPE] = ty_int
-	vec_push(fallback[BLK_STMTS], expr_stmt(cp))
+	cast(Call, cp).name = cstr("memcpy")
+	cast(Call, cp).fn_ = cast(i64, memcpy_fn)
+	cast(Call, cp).args = args3(mk_bin(pos, cstr("+"), ia_hdr(h, 2), ia_ref(n), ty_int), mk_bin(pos, cstr("+"), mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int), ia_ref(m))
+	cast(Node, cp).type_ = ty_int
+	vec_push(fallback.stmts, expr_stmt(cast(Node, cp)))
 	// These lengths are common in builders. Avoid a libc call while keeping the
 	// general copy path unchanged and limiting every raw access to its exact width.
-	let short = node_new(ST_IF, pos)
-	short[IF_COND] = mk_bin(pos, cstr("=="), ia_ref(m), mk_int(pos, 1, ty_int), ty_bool)
-	short[IF_THEN] = empty_block(pos)
-	let sb = short[IF_THEN][BLK_STMTS]
-	vec_push(sb, let_stmt(pos, dst, mk_bin(pos, cstr("+"), ia_hdr(h, 2), ia_ref(n), ty_int)))
-	vec_push(sb, let_stmt(pos, src, mk_bin(pos, cstr("+"), mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int)))
-	vec_push(sb, let_stmt(pos, word, intrinsic_call(pos, cstr("__ld"), args2(ia_ref(src), mk_int(pos, 0, ty_int)), ty_int)))
-	vec_push(sb, expr_stmt(intrinsic_call(pos, cstr("__st"), args3(ia_ref(dst), ia_ref(word), mk_int(pos, 0, ty_int)), ty_void)))
-	let two = node_new(ST_IF, pos)
-	two[IF_COND] = mk_bin(pos, cstr("=="), ia_ref(m), mk_int(pos, 2, ty_int), ty_bool)
-	two[IF_THEN] = empty_block(pos)
+	let short = cast(IfStmt, node_new(ST_IF, pos))
+	short.cond = mk_bin(pos, cstr("=="), ia_ref(m), mk_int(pos, 1, ty_int), ty_bool)
+	short.then = empty_block(pos)
+	let sb = cast(Block, short.then).stmts
+	vec_push(sb, let_stmt(pos, cast(Sym, dst), mk_bin(pos, cstr("+"), ia_hdr(h, 2), ia_ref(n), ty_int)))
+	vec_push(sb, let_stmt(pos, cast(Sym, src), mk_bin(pos, cstr("+"), mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int)))
+	vec_push(sb, let_stmt(pos, cast(Sym, word), intrinsic_call(pos, cstr("__ld"), args2(ia_ref(src), mk_int(pos, 0, ty_int)), ty_int)))
+	vec_push(sb, expr_stmt(cast(Node, intrinsic_call(pos, cstr("__st"), args3(ia_ref(dst), ia_ref(word), mk_int(pos, 0, ty_int)), ty_void))))
+	let two = cast(IfStmt, node_new(ST_IF, pos))
+	two.cond = mk_bin(pos, cstr("=="), ia_ref(m), mk_int(pos, 2, ty_int), ty_bool)
+	two.then = empty_block(pos)
 	let two_dst = mk_bin(pos, cstr("+"), ia_hdr(h, 2), ia_ref(n), ty_int)
 	let two_src = mk_bin(pos, cstr("+"), mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int)
-	ia_copy_str_chunk(pos, two[IF_THEN][BLK_STMTS], two_dst, two_src, 0, 1)
-	let six = node_new(ST_IF, pos)
-	six[IF_COND] = mk_bin(pos, cstr("=="), ia_ref(m), mk_int(pos, 6, ty_int), ty_bool)
-	six[IF_THEN] = empty_block(pos)
+	ia_copy_str_chunk(pos, cast(Block, two.then).stmts, two_dst, two_src, 0, 1)
+	let six = cast(IfStmt, node_new(ST_IF, pos))
+	six.cond = mk_bin(pos, cstr("=="), ia_ref(m), mk_int(pos, 6, ty_int), ty_bool)
+	six.then = empty_block(pos)
 	let six_dst = mk_bin(pos, cstr("+"), ia_hdr(h, 2), ia_ref(n), ty_int)
 	let six_src = mk_bin(pos, cstr("+"), mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int)
-	ia_copy_str_chunk(pos, six[IF_THEN][BLK_STMTS], six_dst, six_src, 0, 2)
+	ia_copy_str_chunk(pos, cast(Block, six.then).stmts, six_dst, six_src, 0, 2)
 	let tail_dst = mk_bin(pos, cstr("+"), ia_hdr(h, 2), ia_ref(n), ty_int)
 	let tail_src = mk_bin(pos, cstr("+"), mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int)
-	ia_copy_str_chunk(pos, six[IF_THEN][BLK_STMTS], tail_dst, tail_src, 4, 1)
-	six[IF_ELSE] = fallback
-	two[IF_ELSE] = empty_block(pos)
-	vec_push(two[IF_ELSE][BLK_STMTS], six)
-	short[IF_ELSE] = empty_block(pos)
-	vec_push(short[IF_ELSE][BLK_STMTS], two)
-	vec_push(els[BLK_STMTS], short)
-	vec_push(els[BLK_STMTS], assign_stmt(pos, ia_hdr(h, 0), mk_bin(pos, cstr("+"), ia_ref(n), ia_ref(m), ty_int)))
-	ifs[IF_ELSE] = els
-	vec_push(stmts, ifs)
+	ia_copy_str_chunk(pos, cast(Block, six.then).stmts, tail_dst, tail_src, 4, 1)
+	six.else_ = cast(i64, fallback)
+	two.else_ = empty_block(pos)
+	vec_push(cast(Block, two.else_).stmts, cast(i64, six))
+	short.else_ = empty_block(pos)
+	vec_push(cast(Block, short.else_).stmts, cast(i64, two))
+	vec_push(els.stmts, cast(i64, short))
+	vec_push(els.stmts, assign_stmt(pos, ia_hdr(h, 0), mk_bin(pos, cstr("+"), ia_ref(n), ia_ref(m), ty_int)))
+	ifs.else_ = cast(i64, els)
+	vec_push(stmts, cast(i64, ifs))
 	replace_node(e, mk_seq(pos, stmts, ia_ref(h), st))
 }
 
@@ -290,11 +290,11 @@ shared mut il_callee i64
 fn inline_small_calls() {
 	mut i = 0
 	for i < prog_fns[VEC_LEN] {
-		let f = vec_get(prog_fns, i)
-		if f[F_EXTERN] == 0 && f[F_REACH] != 0 && f[F_GENERATED] == 0 && f[F_BODY] != 0 {
-			il_fn = f
+		let f = cast(Fn, vec_get(prog_fns, i))
+		if f.extern_ == 0 && f.reach != 0 && f.generated == 0 && f.body != 0 {
+			il_fn = cast(i64, f)
 			il_depth = 0
-			il_stmts(f[F_BODY][BLK_STMTS])
+			il_stmts(cast(Block, f.body).stmts)
 		}
 		i = i + 1
 	}
@@ -309,45 +309,45 @@ fn il_stmts(v i64) {
 }
 
 fn il_stmt(s i64) {
-	let k = s[N_KIND]
+	let k = cast(Node, s).kind
 	if k == ST_BLOCK {
-		il_stmts(s[BLK_STMTS])
+		il_stmts(cast(Block, s).stmts)
 	} else if k == ST_LET {
-		if s[LET_INIT] != 0 {
-			il_expr(s[LET_INIT])
+		if cast(LetStmt, s).init != 0 {
+			il_expr(cast(LetStmt, s).init)
 		}
 	} else if k == ST_ASSIGN {
-		if s[AS_TARGET][N_KIND] != EX_IDENT {
-			il_expr(s[AS_TARGET])
+		if cast(Node, cast(AssignStmt, s).target).kind != EX_IDENT {
+			il_expr(cast(AssignStmt, s).target)
 		}
-		il_expr(s[AS_VALUE])
+		il_expr(cast(AssignStmt, s).value)
 	} else if k == ST_EXPR {
-		il_expr(s[ES_X])
+		il_expr(cast(ExprStmt, s).x)
 	} else if k == ST_IF {
-		il_expr(s[IF_COND])
-		il_stmts(s[IF_THEN][BLK_STMTS])
-		if s[IF_ELSE] != 0 {
-			il_stmt(s[IF_ELSE])
+		il_expr(cast(IfStmt, s).cond)
+		il_stmts(cast(Block, cast(IfStmt, s).then).stmts)
+		if cast(IfStmt, s).else_ != 0 {
+			il_stmt(cast(IfStmt, s).else_)
 		}
 	} else if k == ST_WHILE {
-		il_expr(s[WH_COND])
-		il_stmts(s[WH_BODY][BLK_STMTS])
-		if s[WH_POST] != 0 {
-			il_stmt(s[WH_POST])
+		il_expr(cast(WhileStmt, s).cond)
+		il_stmts(cast(Block, cast(WhileStmt, s).body).stmts)
+		if cast(WhileStmt, s).post != 0 {
+			il_stmt(cast(WhileStmt, s).post)
 		}
 	} else if k == ST_RETURN {
-		if s[RET_VALUE] != 0 {
-			il_expr(s[RET_VALUE])
+		if cast(ReturnStmt, s).value != 0 {
+			il_expr(cast(ReturnStmt, s).value)
 		}
-		if s[RET_VALUES] != 0 {
+		if cast(ReturnStmt, s).values != 0 {
 			mut i = 0
-			for i < s[RET_VALUES][VEC_LEN] {
-				il_expr(vec_get(s[RET_VALUES], i))
+			for i < cast(ReturnStmt, s).values[VEC_LEN] {
+				il_expr(vec_get(cast(ReturnStmt, s).values, i))
 				i = i + 1
 			}
 		}
 	} else if k == ST_CALLMULTI {
-		il_expr(s[CM_CALL])
+		il_expr(cast(CallMultiStmt, s).call)
 	}
 }
 
@@ -355,40 +355,40 @@ fn il_expr(e i64) {
 	if e == 0 {
 		return
 	}
-	let k = e[N_KIND]
+	let k = cast(Node, e).kind
 	if k == EX_UNARY {
-		il_expr(e[UN_X])
+		il_expr(cast(Unary, e).x)
 	} else if k == EX_BINARY {
-		il_expr(e[BIN_L])
-		il_expr(e[BIN_R])
+		il_expr(cast(Binary, e).l)
+		il_expr(cast(Binary, e).r)
 	} else if k == EX_CONV {
-		il_expr(e[CV_X])
+		il_expr(cast(Conv, e).x)
 	} else if k == EX_MEM {
-		il_expr(e[MEM_BASE])
-		il_expr(e[MEM_INDEX])
-		il_expr(e[MEM_LEN])
+		il_expr(cast(MemExpr, e).base)
+		il_expr(cast(MemExpr, e).index)
+		il_expr(cast(MemExpr, e).len)
 	} else if k == EX_ELEM {
-		il_expr(e[ELEM_SEQ])
-		il_expr(e[ELEM_IDX])
+		il_expr(cast(ElemExpr, e).seq)
+		il_expr(cast(ElemExpr, e).idx)
 	} else if k == EX_SEQ {
-		il_stmts(e[SEQ_STMTS])
-		il_expr(e[SEQ_VALUE])
+		il_stmts(cast(SeqExpr, e).stmts)
+		il_expr(cast(SeqExpr, e).value)
 	} else if k == EX_INDEX {
-		il_expr(e[IX_X])
-		il_expr(e[IX_I])
+		il_expr(cast(IndexExpr, e).x)
+		il_expr(cast(IndexExpr, e).i)
 	} else if k == EX_CALL {
-		il_expr(e[CALL_CALLEE])
-		let args = e[CALL_ARGS]
+		il_expr(cast(Call, e).callee)
+		let args = cast(Call, e).args
 		mut i = 0
 		for i < args[VEC_LEN] {
 			il_expr(vec_get(args, i))
 			i = i + 1
 		}
-		let f = e[CALL_FN]
-		if e[CALL_INTRINSIC] == 0 && e[CALL_CALLEE] == 0 && f != 0 {
-			if f[F_EXTERN] != 0 {
+		let f = cast(Fn, cast(Call, e).fn_)
+		if cast(Call, e).intrinsic == 0 && cast(Call, e).callee == 0 && cast(i64, f) != 0 {
+			if f.extern_ != 0 {
 				il_float_intrinsic(e, f)
-			} else if il_depth < 4 && f != il_fn && il_inlinable(f) != 0 {
+			} else if il_depth < 4 && cast(i64, f) != il_fn && il_inlinable(f) != 0 {
 				il_expand(e, f)
 			}
 		}
@@ -400,31 +400,31 @@ fn il_expr(e i64) {
 // For a non-float value x is always equal to itself. After generic inlining this removes
 // the NaN checks from ordered comparisons specialized for integers and strings.
 fn il_fold_reflexive_cmp(e i64) {
-	if e == 0 || e[N_KIND] != EX_BINARY || (streq(e[BIN_OP], cstr("==")) == 0 && streq(e[BIN_OP], cstr("!=")) == 0) {
+	if e == 0 || cast(Node, e).kind != EX_BINARY || (streq(cast(Binary, e).op, cstr("==")) == 0 && streq(cast(Binary, e).op, cstr("!=")) == 0) {
 		return
 	}
-	let l = e[BIN_L]
-	let r = e[BIN_R]
-	if l[N_KIND] != EX_IDENT || r[N_KIND] != EX_IDENT || l[ID_REF] == 0 || l[ID_REF] != r[ID_REF] || l[ID_REF][S_KIND] != SYM_LOCAL || is_float_t(l[N_TYPE]) != 0 {
+	let l = cast(Binary, e).l
+	let r = cast(Binary, e).r
+	if cast(Node, l).kind != EX_IDENT || cast(Node, r).kind != EX_IDENT || cast(IdentExpr, l).ref == 0 || cast(IdentExpr, l).ref != cast(IdentExpr, r).ref || cast(Sym, cast(IdentExpr, l).ref).kind != SYM_LOCAL || is_float_t(cast(Node, l).type_) != 0 {
 		return
 	}
-	let value = streq(e[BIN_OP], cstr("=="))
-	replace_node(e, mk_int(e[N_POS], value, ty_bool))
+	let value = streq(cast(Binary, e).op, cstr("=="))
+	replace_node(e, mk_int(cast(Node, e).pos, value, ty_bool))
 }
 
 // Remove constant identities introduced by ordered comparisons, such as
 // `x < y || (x != x && y == y)` specializing to an integer type.
 fn il_fold_boolean(e i64) {
-	if e == 0 || e[N_KIND] != EX_BINARY {
+	if e == 0 || cast(Node, e).kind != EX_BINARY {
 		return
 	}
-	let op = e[BIN_OP]
-	let l = e[BIN_L]
-	let r = e[BIN_R]
+	let op = cast(Binary, e).op
+	let l = cast(Binary, e).l
+	let r = cast(Binary, e).r
 	if streq(op, cstr("&&")) != 0 {
 		if is_const(l) != 0 {
 			if const_val(l) == 0 {
-				replace_node(e, mk_int(e[N_POS], 0, ty_bool))
+				replace_node(e, mk_int(cast(Node, e).pos, 0, ty_bool))
 			} else {
 				replace_node(e, r)
 			}
@@ -434,7 +434,7 @@ fn il_fold_boolean(e i64) {
 	} else if streq(op, cstr("||")) != 0 {
 		if is_const(l) != 0 {
 			if const_val(l) != 0 {
-				replace_node(e, mk_int(e[N_POS], 1, ty_bool))
+				replace_node(e, mk_int(cast(Node, e).pos, 1, ty_bool))
 			} else {
 				replace_node(e, r)
 			}
@@ -445,11 +445,11 @@ fn il_fold_boolean(e i64) {
 }
 
 // il_float_intrinsic turns libm calls the hardware does in one instruction into intrinsics.
-fn il_float_intrinsic(e i64, f i64) {
-	if e[CALL_ARGS][VEC_LEN] != 1 || is_float_t(e[N_TYPE]) == 0 {
+fn il_float_intrinsic(e i64, f Fn) {
+	if cast(Call, e).args[VEC_LEN] != 1 || is_float_t(cast(Node, e).type_) == 0 {
 		return
 	}
-	let name = f[F_NAME]
+	let name = f.name
 	mut op = 0
 	if streq(name, cstr("sqrt")) != 0 {
 		op = cstr("__fsqrt")
@@ -467,39 +467,39 @@ fn il_float_intrinsic(e i64, f i64) {
 		op = cstr("__frintn")
 	}
 	if op != 0 {
-		e[CALL_NAME] = op
-		e[CALL_INTRINSIC] = 1
-		e[CALL_FN] = 0
+		cast(Call, e).name = op
+		cast(Call, e).intrinsic = 1
+		cast(Call, e).fn_ = 0
 	}
 }
 
-fn il_inlinable(f i64) i64 {
-	if fn_polls(f) != 0 && fn_polls(il_fn) == 0 {
+fn il_inlinable(f Fn) i64 {
+	if fn_polls(f) != 0 && fn_polls(cast(Fn, il_fn)) == 0 {
 		return 0
 	}
-	if f[F_EXTERN] != 0 || f[F_BODY] == 0 || f[F_GENERATED] != 0 || f[F_VARIADIC] != 0 || f[F_RTYPES][VEC_LEN] != 1 || f[F_ENV_SYM] != 0 {
+	if f.extern_ != 0 || f.body == 0 || f.generated != 0 || f.variadic != 0 || f.rtypes[VEC_LEN] != 1 || f.env_sym != 0 {
 		return 0
 	}
-	let stmts = f[F_BODY][BLK_STMTS]
+	let stmts = cast(Block, f.body).stmts
 	if stmts[VEC_LEN] != 1 {
 		return 0
 	}
 	let r = vec_get(stmts, 0)
-	if r[N_KIND] != ST_RETURN || r[RET_VALUE] == 0 || r[RET_VALUES] != 0 {
+	if cast(Node, r).kind != ST_RETURN || cast(ReturnStmt, r).value == 0 || cast(ReturnStmt, r).values != 0 {
 		return 0
 	}
 	if il_substituted(f) != 0 {
 		return 0
 	}
-	il_callee = f
-	return i64(il_size(r[RET_VALUE]) <= 40)
+	il_callee = cast(i64, f)
+	return i64(il_size(cast(ReturnStmt, r).value) <= 40)
 }
 
 // il_substituted reports a function whose body the back end replaces by hand-written code (linux_raw,
 // the vector and syscall leaves, the AES and SHA-256 leaves, the task switch): its source body is only
 // a placeholder, so inlining it would run the placeholder.
-fn il_substituted(f i64) i64 {
-	let n = f[F_QNAME]
+fn il_substituted(f Fn) i64 {
+	let n = f.qname
 	if streq(n, cstr("linux_raw")) != 0 || streq(n, cstr("linux_restorer")) != 0 || streq(n, cstr("mem_avx2_supported")) != 0 || streq(n, cstr("mem_copy64")) != 0 || streq(n, cstr("mem_fill64")) != 0 || streq(n, cstr("rt_task_swap")) != 0 || streq(n, cstr("seal.hw_blocks")) != 0 {
 		return 1
 	}
@@ -514,46 +514,46 @@ fn il_size(e i64) i64 {
 	if e == 0 {
 		return 0
 	}
-	let k = e[N_KIND]
+	let k = cast(Node, e).kind
 	if k == EX_INT || k == EX_FLOAT || k == EX_STR || k == EX_FUNCREF {
 		return 1
 	}
 	if k == EX_IDENT {
-		let s = e[ID_REF]
-		if s == 0 {
+		let s = cast(Sym, cast(IdentExpr, e).ref)
+		if cast(i64, s) == 0 {
 			return 1000
 		}
-		if s[S_KIND] == SYM_LOCAL && il_param_index(s) < 0 {
+		if s.kind == SYM_LOCAL && il_param_index(cast(i64, s)) < 0 {
 			return 1000
 		}
 		return 1
 	}
 	if k == EX_UNARY {
-		if streq(e[UN_OP], cstr("&")) != 0 {
+		if streq(cast(Unary, e).op, cstr("&")) != 0 {
 			return 1000
 		}
-		return 1 + il_size(e[UN_X])
+		return 1 + il_size(cast(Unary, e).x)
 	}
 	if k == EX_BINARY {
-		return 1 + il_size(e[BIN_L]) + il_size(e[BIN_R])
+		return 1 + il_size(cast(Binary, e).l) + il_size(cast(Binary, e).r)
 	}
 	if k == EX_CONV {
-		return 1 + il_size(e[CV_X])
+		return 1 + il_size(cast(Conv, e).x)
 	}
 	if k == EX_MEM {
-		return 1 + il_size(e[MEM_BASE]) + il_size(e[MEM_INDEX]) + il_size(e[MEM_LEN])
+		return 1 + il_size(cast(MemExpr, e).base) + il_size(cast(MemExpr, e).index) + il_size(cast(MemExpr, e).len)
 	}
 	if k == EX_ELEM {
-		return 1 + il_size(e[ELEM_SEQ]) + il_size(e[ELEM_IDX])
+		return 1 + il_size(cast(ElemExpr, e).seq) + il_size(cast(ElemExpr, e).idx)
 	}
 	if k == EX_CALL {
-		if e[CALL_CALLEE] != 0 || e[CALL_FN] == il_callee {
+		if cast(Call, e).callee != 0 || cast(Call, e).fn_ == il_callee {
 			return 1000
 		}
 		mut n = 3
 		mut i = 0
-		for i < e[CALL_ARGS][VEC_LEN] {
-			n = n + il_size(vec_get(e[CALL_ARGS], i))
+		for i < cast(Call, e).args[VEC_LEN] {
+			n = n + il_size(vec_get(cast(Call, e).args, i))
 			i = i + 1
 		}
 		return n
@@ -562,8 +562,8 @@ fn il_size(e i64) i64 {
 }
 
 fn il_param_index(s i64) i64 {
-	let locals = il_callee[F_LOCALS]
-	let np = il_callee[F_PARAMS][VEC_LEN]
+	let locals = cast(Fn, il_callee).locals
+	let np = cast(Fn, il_callee).params[VEC_LEN]
 	mut i = 0
 	for i < np {
 		if vec_get(locals, i) == s {
@@ -578,30 +578,30 @@ fn il_uses(e i64, s i64) i64 {
 	if e == 0 {
 		return 0
 	}
-	let k = e[N_KIND]
+	let k = cast(Node, e).kind
 	if k == EX_IDENT {
-		return i64(e[ID_REF] == s)
+		return i64(cast(IdentExpr, e).ref == s)
 	}
 	if k == EX_UNARY {
-		return il_uses(e[UN_X], s)
+		return il_uses(cast(Unary, e).x, s)
 	}
 	if k == EX_BINARY {
-		return il_uses(e[BIN_L], s) + il_uses(e[BIN_R], s)
+		return il_uses(cast(Binary, e).l, s) + il_uses(cast(Binary, e).r, s)
 	}
 	if k == EX_CONV {
-		return il_uses(e[CV_X], s)
+		return il_uses(cast(Conv, e).x, s)
 	}
 	if k == EX_MEM {
-		return il_uses(e[MEM_BASE], s) + il_uses(e[MEM_INDEX], s) + il_uses(e[MEM_LEN], s)
+		return il_uses(cast(MemExpr, e).base, s) + il_uses(cast(MemExpr, e).index, s) + il_uses(cast(MemExpr, e).len, s)
 	}
 	if k == EX_ELEM {
-		return il_uses(e[ELEM_SEQ], s) + il_uses(e[ELEM_IDX], s)
+		return il_uses(cast(ElemExpr, e).seq, s) + il_uses(cast(ElemExpr, e).idx, s)
 	}
 	if k == EX_CALL {
 		mut n = 0
 		mut i = 0
-		for i < e[CALL_ARGS][VEC_LEN] {
-			n = n + il_uses(vec_get(e[CALL_ARGS], i), s)
+		for i < cast(Call, e).args[VEC_LEN] {
+			n = n + il_uses(vec_get(cast(Call, e).args, i), s)
 			i = i + 1
 		}
 		return n
@@ -613,33 +613,33 @@ fn il_pure(e i64) i64 {
 	if e == 0 {
 		return 1
 	}
-	let k = e[N_KIND]
+	let k = cast(Node, e).kind
 	if k == EX_INT || k == EX_FLOAT || k == EX_STR || k == EX_FUNCREF {
 		return 1
 	}
 	if k == EX_IDENT {
-		return i64(e[ID_REF] != 0 && e[ID_REF][S_KIND] != SYM_GLOBAL)
+		return i64(cast(IdentExpr, e).ref != 0 && cast(Sym, cast(IdentExpr, e).ref).kind != SYM_GLOBAL)
 	}
 	if k == EX_UNARY {
-		return i64(streq(e[UN_OP], cstr("&")) == 0 && il_pure(e[UN_X]) != 0)
+		return i64(streq(cast(Unary, e).op, cstr("&")) == 0 && il_pure(cast(Unary, e).x) != 0)
 	}
 	if k == EX_BINARY {
-		return i64(may_panic(e) == 0 && il_pure(e[BIN_L]) != 0 && il_pure(e[BIN_R]) != 0)
+		return i64(may_panic(cast(Binary, e)) == 0 && il_pure(cast(Binary, e).l) != 0 && il_pure(cast(Binary, e).r) != 0)
 	}
 	if k == EX_CONV {
-		return il_pure(e[CV_X])
+		return il_pure(cast(Conv, e).x)
 	}
 	if k == EX_MEM {
-		return i64(il_pure(e[MEM_BASE]) != 0 && il_pure(e[MEM_INDEX]) != 0 && il_pure(e[MEM_LEN]) != 0)
+		return i64(il_pure(cast(MemExpr, e).base) != 0 && il_pure(cast(MemExpr, e).index) != 0 && il_pure(cast(MemExpr, e).len) != 0)
 	}
 	return 0
 }
 
-fn il_expand(e i64, f i64) {
-	let pos = e[N_POS]
-	let args = e[CALL_ARGS]
-	let body = vec_get(f[F_BODY][BLK_STMTS], 0)[RET_VALUE]
-	let np = f[F_PARAMS][VEC_LEN]
+fn il_expand(e i64, f Fn) {
+	let pos = cast(Node, e).pos
+	let args = cast(Call, e).args
+	let body = cast(ReturnStmt, vec_get(cast(Block, f.body).stmts, 0)).value
+	let np = f.params[VEC_LEN]
 	if args[VEC_LEN] != np {
 		return
 	}
@@ -657,81 +657,81 @@ fn il_expand(e i64, f i64) {
 	i = 0
 	for i < np {
 		let a = vec_get(args, i)
-		let p = vec_get(f[F_LOCALS], i)
-		let ak = a[N_KIND]
-		let simple = i64(ak == EX_INT || ak == EX_FLOAT || ak == EX_STR || (ak == EX_IDENT && a[ID_REF] != 0 && a[ID_REF][S_KIND] == SYM_LOCAL && a[ID_REF][S_ADDR] == 0))
-		if simple != 0 || (pure != 0 && il_uses(body, p) == 1) {
+		let p = cast(Sym, vec_get(f.locals, i))
+		let ak = cast(Node, a).kind
+		let simple = i64(ak == EX_INT || ak == EX_FLOAT || ak == EX_STR || (ak == EX_IDENT && cast(IdentExpr, a).ref != 0 && cast(Sym, cast(IdentExpr, a).ref).kind == SYM_LOCAL && cast(Sym, cast(IdentExpr, a).ref).addr == 0))
+		if simple != 0 || (pure != 0 && il_uses(body, cast(i64, p)) == 1) {
 			subst[VEC_DATA][i] = a
 		} else {
-			let t = ia_local_in(il_fn, p[S_TYPE])
-			vec_push(stmts, let_stmt(pos, t, a))
-			subst[VEC_DATA][i] = sym_ref_node(pos, t)
+			let t = ia_local_in(cast(Fn, il_fn), p.type_)
+			vec_push(stmts, let_stmt(pos, cast(Sym, t), a))
+			subst[VEC_DATA][i] = sym_ref_node(pos, cast(Sym, t))
 		}
 		i = i + 1
 	}
 	let saved = il_subst
 	let saved_callee = il_callee
 	il_subst = subst
-	il_callee = f
+	il_callee = cast(i64, f)
 	let copy_ = il_clone(body)
 	il_subst = saved
 	il_callee = saved_callee
-	let t = e[N_TYPE]
+	let t = cast(Node, e).type_
 	if stmts[VEC_LEN] > 0 {
 		replace_node(e, mk_seq(pos, stmts, copy_, t))
 	} else {
 		replace_node(e, copy_)
-		e[N_TYPE] = t
+		cast(Node, e).type_ = t
 	}
 	il_depth = il_depth + 1
 	il_expr(e)
 	il_depth = il_depth - 1
 }
 
-fn ia_local_in(f i64, t i64) i64 {
-	let s = sym_new(SYM_LOCAL, cstr("$"), 0)
-	s[S_TYPE] = t
-	s[S_SLOT] = f[F_SLOTS]
-	f[F_SLOTS] = f[F_SLOTS] + 1
-	vec_push(f[F_LOCALS], s)
-	return s
+fn ia_local_in(f Fn, t i64) i64 {
+	let s = cast(Sym, sym_new(SYM_LOCAL, cstr("$"), 0))
+	s.type_ = t
+	s.slot = f.slots
+	f.slots = f.slots + 1
+	vec_push(f.locals, cast(i64, s))
+	return cast(i64, s)
 }
 
 fn il_clone(e i64) i64 {
 	if e == 0 {
 		return 0
 	}
-	let k = e[N_KIND]
-	if k == EX_IDENT && e[ID_REF] != 0 && e[ID_REF][S_KIND] == SYM_LOCAL {
-		let pi = il_param_index(e[ID_REF])
+	let k = cast(Node, e).kind
+	if k == EX_IDENT && cast(IdentExpr, e).ref != 0 && cast(Sym, cast(IdentExpr, e).ref).kind == SYM_LOCAL {
+		let pi = il_param_index(cast(IdentExpr, e).ref)
 		if pi >= 0 {
 			return il_dup(vec_get(il_subst, pi))
 		}
 	}
-	let c = node_new(k, e[N_POS])
+	let c = node_new(k, cast(Node, e).pos)
 	replace_node(c, e)
 	if k == EX_UNARY {
-		c[UN_X] = il_clone(e[UN_X])
+		cast(Unary, c).x = il_clone(cast(Unary, e).x)
 	} else if k == EX_BINARY {
-		c[BIN_L] = il_clone(e[BIN_L])
-		c[BIN_R] = il_clone(e[BIN_R])
+		cast(Binary, c).l = il_clone(cast(Binary, e).l)
+		cast(Binary, c).r = il_clone(cast(Binary, e).r)
 	} else if k == EX_CONV {
-		c[CV_X] = il_clone(e[CV_X])
+		cast(Conv, c).x = il_clone(cast(Conv, e).x)
 	} else if k == EX_MEM {
-		c[MEM_BASE] = il_clone(e[MEM_BASE])
-		c[MEM_INDEX] = il_clone(e[MEM_INDEX])
-		c[MEM_LEN] = il_clone(e[MEM_LEN])
+		cast(MemExpr, c).base = il_clone(cast(MemExpr, e).base)
+		cast(MemExpr, c).index = il_clone(cast(MemExpr, e).index)
+		cast(MemExpr, c).len = il_clone(cast(MemExpr, e).len)
 	} else if k == EX_ELEM {
-		c[ELEM_SEQ] = il_clone(e[ELEM_SEQ])
-		c[ELEM_IDX] = il_clone(e[ELEM_IDX])
+		cast(ElemExpr, c).seq = il_clone(cast(ElemExpr, e).seq)
+		cast(ElemExpr, c).idx = il_clone(cast(ElemExpr, e).idx)
 	} else if k == EX_CALL {
 		let args = vec_new()
 		mut i = 0
-		for i < e[CALL_ARGS][VEC_LEN] {
-			vec_push(args, il_clone(vec_get(e[CALL_ARGS], i)))
+		for i < cast(Call, e).args[VEC_LEN] {
+			vec_push(args, il_clone(vec_get(cast(Call, e).args, i)))
 			i = i + 1
 		}
-		c[CALL_ARGS] = args
+		cast(Call, c).args = args
 	}
 	return c
 }
@@ -745,41 +745,41 @@ fn il_clone_plain(e i64) i64 {
 	if e == 0 {
 		return 0
 	}
-	let k = e[N_KIND]
-	let c = node_new(k, e[N_POS])
+	let k = cast(Node, e).kind
+	let c = node_new(k, cast(Node, e).pos)
 	replace_node(c, e)
 	if k == EX_UNARY {
-		c[UN_X] = il_clone_plain(e[UN_X])
+		cast(Unary, c).x = il_clone_plain(cast(Unary, e).x)
 	} else if k == EX_BINARY {
-		c[BIN_L] = il_clone_plain(e[BIN_L])
-		c[BIN_R] = il_clone_plain(e[BIN_R])
+		cast(Binary, c).l = il_clone_plain(cast(Binary, e).l)
+		cast(Binary, c).r = il_clone_plain(cast(Binary, e).r)
 	} else if k == EX_CONV {
-		c[CV_X] = il_clone_plain(e[CV_X])
+		cast(Conv, c).x = il_clone_plain(cast(Conv, e).x)
 	} else if k == EX_MEM {
-		c[MEM_BASE] = il_clone_plain(e[MEM_BASE])
-		c[MEM_INDEX] = il_clone_plain(e[MEM_INDEX])
-		c[MEM_LEN] = il_clone_plain(e[MEM_LEN])
+		cast(MemExpr, c).base = il_clone_plain(cast(MemExpr, e).base)
+		cast(MemExpr, c).index = il_clone_plain(cast(MemExpr, e).index)
+		cast(MemExpr, c).len = il_clone_plain(cast(MemExpr, e).len)
 	} else if k == EX_ELEM {
-		c[ELEM_SEQ] = il_clone_plain(e[ELEM_SEQ])
-		c[ELEM_IDX] = il_clone_plain(e[ELEM_IDX])
+		cast(ElemExpr, c).seq = il_clone_plain(cast(ElemExpr, e).seq)
+		cast(ElemExpr, c).idx = il_clone_plain(cast(ElemExpr, e).idx)
 	} else if k == EX_CALL {
 		let args = vec_new()
 		mut i = 0
-		for i < e[CALL_ARGS][VEC_LEN] {
-			vec_push(args, il_clone_plain(vec_get(e[CALL_ARGS], i)))
+		for i < cast(Call, e).args[VEC_LEN] {
+			vec_push(args, il_clone_plain(vec_get(cast(Call, e).args, i)))
 			i = i + 1
 		}
-		c[CALL_ARGS] = args
+		cast(Call, c).args = args
 	}
 	return c
 }
 
 // lit_word is the little-endian value of size bytes of literal lit at off.
-fn lit_word(lit i64, off i64, size i64) i64 {
+fn lit_word(lit StrLit, off i64, size i64) i64 {
 	mut v = 0
 	mut i = size - 1
 	for i >= 0 {
-		v = (v << 8) | i64(load8(lit[STR_PTR] + off + i))
+		v = (v << 8) | i64(load8(lit.ptr + off + i))
 		i = i - 1
 	}
 	return v
@@ -787,32 +787,32 @@ fn lit_word(lit i64, off i64, size i64) i64 {
 
 // ia_append_lit appends a short string literal with constant stores: two to four
 // instructions for a JSON key instead of a memcpy call.
-fn ia_append_lit(e i64, lit i64) {
-	let pos = e[N_POS]
-	let args = e[CALL_ARGS]
-	mut st = e[N_TYPE]
-	if st == 0 || kind_of(st) != K_SLICE {
+fn ia_append_lit(e i64, lit StrLit) {
+	let pos = cast(Node, e).pos
+	let args = cast(Call, e).args
+	mut st = cast(Node, e).type_
+	if st == 0 || kind_of(cast(Ty, st)) != K_SLICE {
 		st = slice_of(ty_byte)
 	}
-	let len_ = lit[STR_LEN]
+	let len_ = lit.len
 	let h = ia_local(st)
 	let n = ia_local(ty_int)
 	let p = ia_local(ty_int)
 	let stmts = vec_new()
-	vec_push(stmts, let_stmt(pos, h, vec_get(args, 0)))
-	vec_push(stmts, let_stmt(pos, n, ia_hdr(h, 0)))
+	vec_push(stmts, let_stmt(pos, cast(Sym, h), vec_get(args, 0)))
+	vec_push(stmts, let_stmt(pos, cast(Sym, n), ia_hdr(h, 0)))
 	let slow = node_new(EX_CALL, pos)
-	slow[CALL_NAME] = e[CALL_NAME]
-	slow[CALL_FN] = e[CALL_FN]
-	slow[CALL_ARGS] = args2(ia_ref(h), lit)
-	slow[N_TYPE] = st
-	let ifs = node_new(ST_IF, pos)
-	ifs[IF_COND] = mk_bin(pos, cstr(">"), mk_bin(pos, cstr("+"), ia_ref(n), mk_int(pos, len_, ty_int), ty_int), ia_hdr(h, 1), ty_bool)
-	ifs[IF_THEN] = empty_block(pos)
-	vec_push(ifs[IF_THEN][BLK_STMTS], assign_stmt(pos, ia_ref(h), slow))
-	let els = empty_block(pos)
-	let eb = els[BLK_STMTS]
-	vec_push(eb, let_stmt(pos, p, mk_bin(pos, cstr("+"), ia_hdr(h, 2), ia_ref(n), ty_int)))
+	cast(Call, slow).name = cast(Call, e).name
+	cast(Call, slow).fn_ = cast(Call, e).fn_
+	cast(Call, slow).args = args2(ia_ref(h), cast(i64, lit))
+	cast(Node, slow).type_ = st
+	let ifs = cast(IfStmt, node_new(ST_IF, pos))
+	ifs.cond = mk_bin(pos, cstr(">"), mk_bin(pos, cstr("+"), ia_ref(n), mk_int(pos, len_, ty_int), ty_int), ia_hdr(h, 1), ty_bool)
+	ifs.then = empty_block(pos)
+	vec_push(cast(Block, ifs.then).stmts, assign_stmt(pos, ia_ref(h), slow))
+	let els = cast(Block, empty_block(pos))
+	let eb = els.stmts
+	vec_push(eb, let_stmt(pos, cast(Sym, p), mk_bin(pos, cstr("+"), ia_hdr(h, 2), ia_ref(n), ty_int)))
 	mut off = 0
 	for off < len_ {
 		mut size = 8
@@ -829,11 +829,11 @@ fn ia_append_lit(e i64, lit i64) {
 		}
 		let addr = mk_bin(pos, cstr("+"), ia_ref(p), mk_int(pos, off, ty_int), ty_int)
 		let st3 = intrinsic_call(pos, cstr("__st"), args3(addr, mk_int(pos, lit_word(lit, off, size), ty_int), mk_int(pos, lg, ty_int)), ty_void)
-		vec_push(eb, expr_stmt(st3))
+		vec_push(eb, expr_stmt(cast(Node, st3)))
 		off = off + size
 	}
 	vec_push(eb, assign_stmt(pos, ia_hdr(h, 0), mk_bin(pos, cstr("+"), ia_ref(n), mk_int(pos, len_, ty_int), ty_int)))
-	ifs[IF_ELSE] = els
-	vec_push(stmts, ifs)
+	ifs.else_ = cast(i64, els)
+	vec_push(stmts, cast(i64, ifs))
 	replace_node(e, mk_seq(pos, stmts, ia_ref(h), st))
 }

@@ -189,29 +189,29 @@ fn vendored_package(ipath i64, found i64) i64 {
 	}
 	mut i = 0
 	for i < cap_pkgs[VEC_LEN] {
-		if streq(vec_get(cap_pkgs, i)[CP_PATH], ipath) != 0 {
+		if streq(cast(CapsRec, vec_get(cap_pkgs, i)).path, ipath) != 0 {
 			return vec_get(cap_pkgs, i)
 		}
 		i = i + 1
 	}
-	let rec = calloc(3, 8)
-	rec[CP_PATH] = ipath
+	let rec = cast(CapsRec, calloc(3, 8))
+	rec.path = ipath
 	let manifest = cat_path(dir_of(first), cstr("/tin.mod"))
 	let src = try_read_file(manifest)
 	if src != 0 {
-		rec[CP_MANIFEST] = manifest
+		rec.manifest = manifest
 		// The manifest is vendored source too: the lock pins it like the code.
 		lock_has(manifest)
-		rec[CP_CAPS] = manifest_caps(src, manifest)
+		rec.caps = manifest_caps(src, manifest)
 	}
 	// The lock shows a reviewer each package's capabilities; it must say what the manifest says.
 	if project_lock != 0 {
 		let want = buf_new()
 		buf_str(want, cstr("caps "))
 		buf_str(want, ipath)
-		if rec[CP_CAPS] != 0 {
+		if rec.caps != 0 {
 			buf_byte(want, ' ')
-			cap_list(want, rec[CP_CAPS], cstr(" "))
+			cap_list(want, rec.caps, cstr(" "))
 		}
 		buf_byte(want, 0)
 		let got = lock_caps_line(ipath)
@@ -233,8 +233,8 @@ fn vendored_package(ipath i64, found i64) i64 {
 			fatal(e)
 		}
 	}
-	vec_push(cap_pkgs, rec)
-	return rec
+	vec_push(cap_pkgs, cast(i64, rec))
+	return cast(i64, rec)
 }
 
 // ---- tags ----
@@ -242,11 +242,11 @@ fn vendored_package(ipath i64, found i64) i64 {
 // part of what it does, or 0: the DNS resolver reads /etc/hosts and /etc/resolv.conf as part
 // of net, and a server keeps a spare descriptor open on /dev/null to shed connections when
 // it runs out of them. What a sealed function calls is not followed.
-fn cap_sealed(f i64) i64 {
-	if vec_get(file_trusted, f[F_FILE]) == 0 || f[F_EXTERN] != 0 {
+fn cap_sealed(f Fn) i64 {
+	if vec_get(file_trusted, f.file) == 0 || f.extern_ != 0 {
 		return 0
 	}
-	let name = f[F_QNAME]
+	let name = f.qname
 	if streq(name, cstr("wire.resolve")) != 0 || streq(name, cstr("anvil.serve_on")) != 0 {
 		return 1 + CAP_NET
 	}
@@ -259,8 +259,8 @@ fn cap_sealed(f i64) i64 {
 // cap_tag is the capability a standard-library function needs by itself: the operating
 // system entry points (the runtime's rt_sys_* calls and the C functions lib/ declares extern)
 // that open a connection or a file, start a process or replace it. A tag is final.
-fn cap_tag(f i64) i64 {
-	if vec_get(file_trusted, f[F_FILE]) == 0 {
+fn cap_tag(f Fn) i64 {
+	if vec_get(file_trusted, f.file) == 0 {
 		return 0
 	}
 	let sealed = cap_sealed(f)
@@ -269,8 +269,8 @@ fn cap_tag(f i64) i64 {
 	}
 	// On macOS some packages wrap their own C calls as rt_sys_* (quarry.rt_sys_open): the
 	// declared name is what counts, so every target tags the same entry points.
-	mut name = f[F_NAME]
-	if f[F_EXTERN] == 0 {
+	mut name = f.name
+	if f.extern_ == 0 {
 		if starts_with(name, cstr("rt_sys_")) == 0 {
 			return 0
 		}
@@ -294,13 +294,13 @@ fn cap_tag(f i64) i64 {
 // cap_final reports a function whose capabilities are its tag alone: an entry point or a
 // sealed function.
 fn cap_final(f i64) i64 {
-	return i64(cap_sealed(f) != 0 || cap_tag(f) != 0)
+	return i64(cap_sealed(cast(Fn, f)) != 0 || cap_tag(cast(Fn, f)) != 0)
 }
 
 // cap_runtime reports a function of the runtime package: its internal file reads (cgroup
 // limits, /proc) are not the program's, so only its tagged entry points carry a capability.
-fn cap_runtime(f i64) i64 {
-	return i64(vec_get(file_trusted, f[F_FILE]) != 0 && i64(load8(vec_get(file_pkgs, f[F_FILE]))) == 0)
+fn cap_runtime(f Fn) i64 {
+	return i64(vec_get(file_trusted, f.file) != 0 && i64(load8(vec_get(file_pkgs, f.file))) == 0)
 }
 
 // ---- the call graph ----
@@ -327,31 +327,31 @@ fn cap_walk_stmt(s i64) {
 	if s == 0 {
 		return
 	}
-	let k = s[N_KIND]
+	let k = cast(Node, s).kind
 	if k == ST_BLOCK {
-		cap_walk_stmts(s[BLK_STMTS])
+		cap_walk_stmts(cast(Block, s).stmts)
 	} else if k == ST_LET {
-		cap_walk_expr(s[LET_INIT])
+		cap_walk_expr(cast(LetStmt, s).init)
 	} else if k == ST_ASSIGN {
-		cap_walk_expr(s[AS_TARGET])
-		cap_walk_expr(s[AS_VALUE])
+		cap_walk_expr(cast(AssignStmt, s).target)
+		cap_walk_expr(cast(AssignStmt, s).value)
 	} else if k == ST_EXPR {
-		cap_walk_expr(s[ES_X])
+		cap_walk_expr(cast(ExprStmt, s).x)
 	} else if k == ST_IF {
-		cap_walk_expr(s[IF_COND])
-		cap_walk_stmt(s[IF_THEN])
-		cap_walk_stmt(s[IF_ELSE])
+		cap_walk_expr(cast(IfStmt, s).cond)
+		cap_walk_stmt(cast(IfStmt, s).then)
+		cap_walk_stmt(cast(IfStmt, s).else_)
 	} else if k == ST_WHILE {
-		cap_walk_expr(s[WH_COND])
-		cap_walk_stmt(s[WH_BODY])
-		cap_walk_stmt(s[WH_POST])
+		cap_walk_expr(cast(WhileStmt, s).cond)
+		cap_walk_stmt(cast(WhileStmt, s).body)
+		cap_walk_stmt(cast(WhileStmt, s).post)
 	} else if k == ST_RETURN {
-		cap_walk_expr(s[RET_VALUE])
-		if s[RET_VALUES] != 0 {
-			cap_walk_exprs(s[RET_VALUES])
+		cap_walk_expr(cast(ReturnStmt, s).value)
+		if cast(ReturnStmt, s).values != 0 {
+			cap_walk_exprs(cast(ReturnStmt, s).values)
 		}
 	} else if k == ST_CALLMULTI {
-		cap_walk_expr(s[CM_CALL])
+		cap_walk_expr(cast(CallMultiStmt, s).call)
 	}
 }
 
@@ -369,67 +369,67 @@ fn cap_walk_expr(e i64) {
 	if e == 0 {
 		return
 	}
-	let k = e[N_KIND]
+	let k = cast(Node, e).kind
 	if k == EX_CALL {
-		cap_edge(e[CALL_FN], e[N_POS])
-		cap_walk_expr(e[CALL_CALLEE])
-		cap_walk_exprs(e[CALL_ARGS])
+		cap_edge(cast(Call, e).fn_, cast(Node, e).pos)
+		cap_walk_expr(cast(Call, e).callee)
+		cap_walk_exprs(cast(Call, e).args)
 	} else if k == EX_FUNCREF {
-		cap_edge(e[FR_FN], e[N_POS])
+		cap_edge(cast(FuncRef, e).fn_, cast(Node, e).pos)
 	} else if k == EX_UNARY {
-		cap_walk_expr(e[UN_X])
+		cap_walk_expr(cast(Unary, e).x)
 	} else if k == EX_BINARY {
-		cap_walk_expr(e[BIN_L])
-		cap_walk_expr(e[BIN_R])
+		cap_walk_expr(cast(Binary, e).l)
+		cap_walk_expr(cast(Binary, e).r)
 	} else if k == EX_INDEX {
-		cap_walk_expr(e[IX_X])
-		cap_walk_expr(e[IX_I])
+		cap_walk_expr(cast(IndexExpr, e).x)
+		cap_walk_expr(cast(IndexExpr, e).i)
 	} else if k == EX_CONV {
-		if e[CV_KIND] == CV_DYN && e[CV_DYN_TABLE] >= 0 && e[CV_DYN_TABLE] < dyn_tables[VEC_LEN] {
-			let rec = vec_get(dyn_tables, e[CV_DYN_TABLE])
-			cap_edge(vec_get(rec, 2), e[N_POS])
+		if cast(Conv, e).kind == CV_DYN && cast(Conv, e).dyn_table >= 0 && cast(Conv, e).dyn_table < dyn_tables[VEC_LEN] {
+			let rec = vec_get(dyn_tables, cast(Conv, e).dyn_table)
+			cap_edge(vec_get(rec, 2), cast(Node, e).pos)
 			let fns = vec_get(rec, 3)
 			mut j = 0
 			for j < fns[VEC_LEN] {
-				cap_edge(vec_get(fns, j), e[N_POS])
+				cap_edge(vec_get(fns, j), cast(Node, e).pos)
 				j = j + 1
 			}
 		}
-		cap_walk_expr(e[CV_X])
+		cap_walk_expr(cast(Conv, e).x)
 	} else if k == EX_SEQ {
-		cap_walk_stmts(e[SEQ_STMTS])
-		cap_walk_expr(e[SEQ_VALUE])
+		cap_walk_stmts(cast(SeqExpr, e).stmts)
+		cap_walk_expr(cast(SeqExpr, e).value)
 	} else if k == EX_MEM {
-		cap_walk_expr(e[MEM_BASE])
-		cap_walk_expr(e[MEM_INDEX])
-		cap_walk_expr(e[MEM_LEN])
+		cap_walk_expr(cast(MemExpr, e).base)
+		cap_walk_expr(cast(MemExpr, e).index)
+		cap_walk_expr(cast(MemExpr, e).len)
 	} else if k == EX_ELEM {
-		cap_walk_expr(e[ELEM_SEQ])
-		cap_walk_expr(e[ELEM_IDX])
+		cap_walk_expr(cast(ElemExpr, e).seq)
+		cap_walk_expr(cast(ElemExpr, e).idx)
 	}
 }
 
 // cap_index is a function's position in prog_fns during the pass, or -1.
-fn cap_index(f i64) i64 {
-	let i = f[F_INDEX]
-	if i >= 0 && i < prog_fns[VEC_LEN] && vec_get(prog_fns, i) == f {
+fn cap_index(f Fn) i64 {
+	let i = f.index
+	if i >= 0 && i < prog_fns[VEC_LEN] && cast(Fn, vec_get(prog_fns, i)) == f {
 		return i
 	}
 	return -1
 }
 
 fn cap_mask_of(f i64) i64 {
-	let i = cap_index(f)
+	let i = cap_index(cast(Fn, f))
 	if i < 0 {
-		return cap_tag(f)
+		return cap_tag(cast(Fn, f))
 	}
 	return vec_get(cap_masks, i)
 }
 
 // cap_pkg_of is the vendored package that declares f, by its position: a function the
 // compiler generates (an encoder, the start code) has no line and belongs to no package.
-fn cap_pkg_of(f i64) i64 {
-	let pos = f[F_POS]
+fn cap_pkg_of(f Fn) i64 {
+	let pos = f.pos
 	if pos <= 0 || ((pos >> 16) & 0xffffffff) == 0 || (pos >> 48) >= file_cap_pkg[VEC_LEN] {
 		return 0
 	}
@@ -438,11 +438,11 @@ fn cap_pkg_of(f i64) i64 {
 
 // cap_own is what a function needs by itself: its tag, or unsafe in a package that declares it.
 fn cap_own(f i64) i64 {
-	let p = cap_pkg_of(f)
-	if p != 0 && (p[CP_CAPS] & CAP_UNSAFE) != 0 {
-		return cap_tag(f) | CAP_UNSAFE
+	let p = cast(CapsRec, cap_pkg_of(cast(Fn, f)))
+	if cast(i64, p) != 0 && (p.caps & CAP_UNSAFE) != 0 {
+		return cap_tag(cast(Fn, f)) | CAP_UNSAFE
 	}
-	return cap_tag(f)
+	return cap_tag(cast(Fn, f))
 }
 
 // cap_graph records every function's calls and computes what each can reach.
@@ -452,14 +452,14 @@ fn cap_graph() {
 	let n = prog_fns[VEC_LEN]
 	mut i = 0
 	for i < n {
-		let f = vec_get(prog_fns, i)
-		f[F_INDEX] = i
+		let f = cast(Fn, vec_get(prog_fns, i))
+		f.index = i
 		cap_cur = vec_new()
-		if f[F_BODY] != 0 && f[F_EXTERN] == 0 && is_template(f) == 0 && cap_final(f) == 0 {
-			cap_walk_stmts(f[F_BODY][BLK_STMTS])
+		if f.body != 0 && f.extern_ == 0 && is_template(f) == 0 && cap_final(cast(i64, f)) == 0 {
+			cap_walk_stmts(cast(Block, f.body).stmts)
 		}
 		vec_push(cap_edges, cap_cur)
-		vec_push(cap_masks, cap_own(f))
+		vec_push(cap_masks, cap_own(cast(i64, f)))
 		i = i + 1
 	}
 	// Reachability to a fixed point; tagged functions and the runtime's own do not inherit.
@@ -468,8 +468,8 @@ fn cap_graph() {
 		changed = 0
 		i = 0
 		for i < n {
-			let f = vec_get(prog_fns, i)
-			if cap_final(f) == 0 && cap_runtime(f) == 0 {
+			let f = cast(Fn, vec_get(prog_fns, i))
+			if cap_final(cast(i64, f)) == 0 && cap_runtime(f) == 0 {
 				mut m = vec_get(cap_masks, i)
 				let es = vec_get(cap_edges, i)
 				mut j = 0
@@ -496,14 +496,14 @@ fn cap_path(b i64, g i64, bit i64) {
 	}
 	mut i = 0
 	for i < path[VEC_LEN] {
-		let f = vec_get(path, i)
+		let f = cast(Fn, vec_get(path, i))
 		if i > 0 {
 			buf_str(b, cstr(" -> "))
 		}
 		if cap_tag(f) != 0 && cap_sealed(f) == 0 {
-			buf_str(b, f[F_NAME])
+			buf_str(b, f.name)
 		} else {
-			buf_str(b, f[F_QNAME])
+			buf_str(b, f.qname)
 		}
 		i = i + 1
 	}
@@ -517,10 +517,10 @@ fn cap_path(b i64, g i64, bit i64) {
 // live call reaching back into its public function, #241): 1 found, 2 cut at 12 steps, 0 none.
 fn cap_find(g i64, bit i64, path i64) i64 {
 	vec_push(path, g)
-	if (cap_own(g) & bit) != 0 || cap_index(g) < 0 || cap_final(g) != 0 {
+	if (cap_own(g) & bit) != 0 || cap_index(cast(Fn, g)) < 0 || cap_final(g) != 0 {
 		return 1
 	}
-	let es = vec_get(cap_edges, cap_index(g))
+	let es = vec_get(cap_edges, cap_index(cast(Fn, g)))
 	mut j = 0
 	for j < es[VEC_LEN] {
 		let c = vec_get(vec_get(es, j), 0)
@@ -539,22 +539,22 @@ fn cap_find(g i64, bit i64, path i64) i64 {
 	return 0
 }
 
-fn cap_violation(pos i64, p i64, g i64, need i64) {
+fn cap_violation(pos i64, p CapsRec, g Fn, need i64) {
 	mut bit = 1
 	for (need & bit) == 0 {
 		bit = bit * 2
 	}
 	let e = err_code(pos, cstr("E804 CAPABILITY"))
-	buf_str(e, g[F_QNAME])
+	buf_str(e, g.qname)
 	buf_str(e, cstr(" needs capability "))
 	buf_str(e, cap_name(bit))
 	buf_str(e, cstr(" ("))
-	cap_path(e, g, bit)
+	cap_path(e, cast(i64, g), bit)
 	buf_str(e, cstr("), which package "))
-	buf_str(e, p[CP_PATH])
+	buf_str(e, p.path)
 	buf_str(e, cstr(" does not declare in its tin.mod (caps: "))
-	if p[CP_CAPS] != 0 {
-		cap_list(e, p[CP_CAPS], cstr(" "))
+	if p.caps != 0 {
+		cap_list(e, p.caps, cstr(" "))
 	} else {
 		buf_str(e, cstr("none"))
 	}
@@ -564,15 +564,15 @@ fn cap_violation(pos i64, p i64, g i64, need i64) {
 
 // cap_check_edges reports each call from package p, at site positions, that leaves the
 // package for code needing a capability p does not declare.
-fn cap_check_edges(p i64, es i64) {
+fn cap_check_edges(p CapsRec, es i64) {
 	mut j = 0
 	for j < es[VEC_LEN] {
 		let rec = vec_get(es, j)
 		let g = vec_get(rec, 0)
 		let m = cap_mask_of(g)
-		let need = m - (m & p[CP_CAPS])
-		if need != 0 && cap_pkg_of(g) != p {
-			cap_violation(vec_get(rec, 1), p, g, need)
+		let need = m - (m & p.caps)
+		if need != 0 && cast(CapsRec, cap_pkg_of(cast(Fn, g))) != p {
+			cap_violation(vec_get(rec, 1), p, cast(Fn, g), need)
 		}
 		j = j + 1
 	}
@@ -583,16 +583,16 @@ fn cap_check_inits(stmts i64) {
 	mut i = 0
 	for i < stmts[VEC_LEN] {
 		let a = vec_get(stmts, i)
-		mut pos = a[N_POS]
-		if a[N_KIND] == ST_ASSIGN && a[AS_VALUE] != 0 {
-			pos = a[AS_VALUE][N_POS]
+		mut pos = cast(Node, a).pos
+		if cast(Node, a).kind == ST_ASSIGN && cast(AssignStmt, a).value != 0 {
+			pos = cast(Node, cast(AssignStmt, a).value).pos
 		}
 		if pos != NO_POS && pos >= 0 {
 			let p = vec_get(file_cap_pkg, pos >> 48)
 			if p != 0 {
 				cap_cur = vec_new()
 				cap_walk_stmt(a)
-				cap_check_edges(p, cap_cur)
+				cap_check_edges(cast(CapsRec, p), cap_cur)
 			}
 		}
 		i = i + 1
@@ -617,9 +617,9 @@ fn check_capabilities() {
 	i = 0
 	for i < prog_fns[VEC_LEN] {
 		let f = vec_get(prog_fns, i)
-		let p = cap_pkg_of(f)
+		let p = cap_pkg_of(cast(Fn, f))
 		if p != 0 {
-			cap_check_edges(p, vec_get(cap_edges, i))
+			cap_check_edges(cast(CapsRec, p), vec_get(cap_edges, i))
 		}
 		i = i + 1
 	}
@@ -629,11 +629,11 @@ fn check_capabilities() {
 
 // cap_exported reports a function others can call: an exported function or method, or any
 // function of the program's own package.
-fn cap_exported(f i64) i64 {
-	if i64(load8(vec_get(file_pkgs, f[F_POS] >> 48))) == 0 {
+fn cap_exported(f Fn) i64 {
+	if i64(load8(vec_get(file_pkgs, f.pos >> 48))) == 0 {
 		return 1
 	}
-	let c = i64(load8(f[F_NAME]))
+	let c = i64(load8(f.name))
 	return i64(c >= 'A' && c <= 'Z')
 }
 
@@ -644,16 +644,16 @@ fn print_capabilities() {
 	let masks = vec_new()
 	mut i = 0
 	for i < prog_fns[VEC_LEN] {
-		let f = vec_get(prog_fns, i)
-		let pos = f[F_POS]
+		let f = cast(Fn, vec_get(prog_fns, i))
+		let pos = f.pos
 		if pos > 0 && ((pos >> 16) & 0xffffffff) != 0 && (pos >> 48) < files[VEC_LEN] && cap_runtime(f) == 0 && cap_exported(f) != 0 {
 			mut name = vec_get(file_pkgs, pos >> 48)
 			if i64(load8(name)) == 0 {
 				name = cstr("main")
 			}
-			let p = cap_pkg_of(f)
-			if p != 0 {
-				name = p[CP_PATH]
+			let p = cast(CapsRec, cap_pkg_of(f))
+			if cast(i64, p) != 0 {
+				name = p.path
 			}
 			mut k = 0
 			for k < names[VEC_LEN] && streq(vec_get(names, k), name) == 0 {

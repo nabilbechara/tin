@@ -125,3 +125,14 @@ cases and a byte-identical `-S` comparison. The seed is not touched until step 6
 - **Compile time and binary size.** Typed code costs more to compile and may produce larger code than
   the hand-tuned words. Measure `make bootstrap` time and the size of `bin/tinc` before and after each
   step and record both in the PR.
+
+## 6. Progress
+
+- **Records (step 1, #384), 2026-10-05.** `selfhost/records.tin` declares the compiler's records as structs
+  (Token, Node and one struct per node kind, Fn, Sym, Ty, Decl, ...) laid over the word arrays at the offsets
+  the constants named. About 6,200 field accesses read `cast(Struct, x).field`, and variables and parameters
+  that hold a record carry its struct type; where an untyped word meets a record the conversion is an explicit
+  `cast`. Measured: `make bootstrap` fixed point, 348 of 348 listings identical to the compiler built from the
+  parent commit, strict suite 203, seed-built Linux flow on arm64 and amd64. The constants still exist for
+  the vectors and for untyped code; removing them follows the vectors (#385).
+
