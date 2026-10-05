@@ -49,10 +49,8 @@ shared mut ck_loops i64
 shared mut ck_breaks i64 // loops plus switches
 shared mut ck_file i64
 shared mut ck_pkg i64
-shared mut ck_legacy i64
 shared mut init_stmts i64 // global initializers run by __start
 shared mut lifted_count i64
-shared mut any_v2 i64
 shared mut start_fn i64
 shared mut core_fn i64 // __core_init: per-core global initializers, run on every core
 shared mut core_stmts i64
@@ -235,15 +233,6 @@ fn resolve_type(tx i64) i64 {
 			if t == 0 {
 				t = find_type(tx[TX_B])
 			}
-			if t == 0 && vec_get(file_v2, ck_file) == 0 {
-				if streq(tx[TX_B], cstr("int")) != 0 {
-					t = ty_int
-				} else if streq(tx[TX_B], cstr("float")) != 0 {
-					t = ty_float
-				} else if streq(tx[TX_B], cstr("string")) != 0 {
-					t = ty_string
-				}
-			}
 		}
 		if t == 0 {
 			err_code_quoted(tx[N_POS], cstr("E103 UNDEFINED"), cstr("undefined type "), tx[TX_B], cstr(""))
@@ -268,11 +257,11 @@ fn resolve_type(tx i64) i64 {
 	if k == TX_MAP {
 		let mkt = resolve_type(tx[TX_A])
 		secret_map_key(tx[N_POS], mkt)
-		if ck_legacy == 0 && key_valid(mkt, vec_new()) == 0 {
+		if key_valid(mkt, vec_new()) == 0 {
 			err_code_type(tx[N_POS], cstr("E201 MAP_KEY"), cstr("a map key must compare by value (str, numbers, bool, or structs and enums of those), not "), mkt, cstr(""))
 		}
 		let mvt = resolve_type(tx[TX_B])
-		if is_dyn_value(mvt) != 0 && ck_legacy == 0 {
+		if is_dyn_value(mvt) != 0 {
 			err_code_at(tx[N_POS], cstr("E530 DYN_NOT_YET"), cstr("a map value of type dyn is the next step: the map stores 16-byte slots with the table (#141)"))
 		}
 		return map_of(mkt, mvt)
@@ -395,7 +384,7 @@ fn bounded_elem(tx i64) i64 {
 // bounded_value handles a value for a bounded type: a str literal within the bound fits;
 // an unbounded value of the same type is reported (reports whether it handled e).
 fn bounded_value(e i64, from i64, to i64) i64 {
-	if ck_legacy != 0 || to == 0 || to[TY_BOUND] == 0 || (from != 0 && from[TY_BOUND] != 0) {
+	if to == 0 || to[TY_BOUND] == 0 || (from != 0 && from[TY_BOUND] != 0) {
 		return 0
 	}
 	if e[N_KIND] == EX_STR && kind_of(to) == K_STRING {
@@ -532,17 +521,10 @@ fn check() {
 	safe_pairs = vec_new()
 	len_aliases = vec_new()
 	dyn_tables = vec_new()
-	mut i = 0
-	for i < file_v2[VEC_LEN] {
-		if vec_get(file_v2, i) != 0 {
-			any_v2 = 1
-		}
-		i = i + 1
-	}
 	generics_init()
 	shapes_init()
 	// Named types: structs first, so fields and aliases can refer to any of them.
-	i = 0
+	mut i = 0
 	for i < prog_types[VEC_LEN] {
 		let d = vec_get(prog_types, i)
 		set_file(d[D_FILE])
@@ -611,7 +593,7 @@ fn check() {
 		let vs = sym_new(SYM_GLOBAL, qual(ck_pkg, v[D_NAME]), v[D_POS])
 		vs[S_INDEX] = i
 		vs[S_TYPE] = 0
-		if vec_get(file_v2, ck_file) != 0 && v[D_SHARED] == 0 {
+		if v[D_SHARED] == 0 {
 			tls_count = tls_count + 1
 			vs[S_TLS] = tls_count
 		} else if v[D_SHARED] != 0 && vec_get(file_trusted, ck_file) == 0 {
@@ -634,7 +616,7 @@ fn check() {
 	core_fn = fn_new(0, cstr("__core_init"))
 	core_fn[F_LOCALS] = vec_new()
 	core_fn[F_QNAME] = cstr("__core_init")
-	core_fn[F_LEGACY] = 1
+	core_fn[F_GENERATED] = 1
 	core_fn[F_TYPE] = func_of(core_fn[F_PTYPES], core_fn[F_RTYPES], 0)
 	core_stmts = vec_new()
 	let pkgs_done = vec_new()
@@ -684,25 +666,21 @@ fn check() {
 		let e2 = err_code(m[S_POS], cstr("E121 MAIN_SIGNATURE"))
 		buf_str(e2, cstr("main cannot be extern"))
 		err_end(e2)
-	} else if m[S_FN][F_PARAMS][VEC_LEN] != 0 && m[S_FN][F_PARAMS][VEC_LEN] != 2 {
+	} else if m[S_FN][F_PARAMS][VEC_LEN] != 0 {
 		let e3 = err_code(m[S_POS], cstr("E121 MAIN_SIGNATURE"))
-		buf_str(e3, cstr("main takes no parameters or (argc, argv)"))
+		buf_str(e3, cstr("main takes no parameters"))
 		err_end(e3)
 	}
-	if any_v2 != 0 {
-		make_start(m[S_FN])
-		mark_reach(start_fn)
-		// Bounds-check traps call it from code the backend generates.
-		mark_reach(find_fn(cstr("rt_bounds_fail")))
-		mark_reach(find_fn(cstr("rt_bounds_fail2")))
-		mark_reach(find_fn(cstr("rt_div_fail")))
-		if compiler_polls != 0 {
-			mark_reach(find_fn(cstr("rt_bnd_poll")))
-		}
-		check_init_order()
-	} else {
-		mark_reach(m[S_FN])
+	make_start(m[S_FN])
+	mark_reach(start_fn)
+	// Bounds-check traps call it from code the backend generates.
+	mark_reach(find_fn(cstr("rt_bounds_fail")))
+	mark_reach(find_fn(cstr("rt_bounds_fail2")))
+	mark_reach(find_fn(cstr("rt_div_fail")))
+	if compiler_polls != 0 {
+		mark_reach(find_fn(cstr("rt_bnd_poll")))
 	}
+	check_init_order()
 }
 
 // declare_template makes a generic function's name callable; instances are declared on use.
@@ -721,8 +699,7 @@ fn declare_template(f i64) {
 
 fn declare_fn(f i64) {
 	set_file(f[F_FILE])
-	ck_legacy = f[F_LEGACY]
-	if f[F_EXTERN] != 0 && vec_get(file_v2, ck_file) != 0 && ck_trusted == 0 {
+	if f[F_EXTERN] != 0 && ck_trusted == 0 {
 		// Legacy files keep their externs. This one is not declared, so it cannot replace
 		// the runtime's C function of the same name.
 		err_code_at(f[F_POS], cstr("E801 TRUSTED_ONLY"), cstr("extern is only allowed in the standard library"))
@@ -732,11 +709,7 @@ fn declare_fn(f i64) {
 	mut ptypes = vec_new()
 	mut i = 0
 	for i < np {
-		if f[F_LEGACY] != 0 {
-			vec_push(ptypes, ty_int)
-		} else {
-			vec_push(ptypes, resolve_type(vec_get(f[F_PTYPES], i)))
-		}
+		vec_push(ptypes, resolve_type(vec_get(f[F_PTYPES], i)))
 		i = i + 1
 	}
 	let rtypes = resolve_types(f[F_RTYPES])
@@ -746,7 +719,7 @@ fn declare_fn(f i64) {
 		sb_forbid(f[F_POS], vec_get(rtypes, sbi), cstr("a function cannot return "))
 		sbi = sbi + 1
 	}
-	if ck_legacy == 0 && f[F_EXTERN] == 0 && f[F_BANG] != 0 {
+	if f[F_EXTERN] == 0 && f[F_BANG] != 0 {
 		mut ri = 0
 		for ri < rtypes[VEC_LEN] {
 			if kind_of(vec_get(rtypes, ri)) == K_DYN {
@@ -755,7 +728,7 @@ fn declare_fn(f i64) {
 			ri = ri + 1
 		}
 	}
-	if ck_legacy == 0 && f[F_EXTERN] == 0 && f[F_BANG] == 0 && rtypes[VEC_LEN] > 0 && kind_of(vec_get(rtypes, rtypes[VEC_LEN] - 1)) == K_ERROR {
+	if f[F_EXTERN] == 0 && f[F_BANG] == 0 && rtypes[VEC_LEN] > 0 && kind_of(vec_get(rtypes, rtypes[VEC_LEN] - 1)) == K_ERROR {
 		err_code_at(f[F_POS], cstr("E402 FAULT_RESULT"), cstr("write a result that can fail as !T (or ! when there is no value), not with a fault result"))
 	}
 	mut name = qual(ck_pkg, f[F_NAME])
@@ -828,7 +801,6 @@ fn declare_fn(f i64) {
 
 fn check_const(c i64) {
 	set_file(c[D_FILE])
-	ck_legacy = i64(vec_get(file_v2, ck_file) == 0)
 	ck_fn = 0
 	check_const_value(c)
 }
@@ -854,19 +826,13 @@ fn check_const_value(c i64) {
 				err_code_type(c[D_POS], cstr("E221 CONST_TYPE"), cstr("cannot use an integer constant as "), want, cstr(""))
 			}
 			s[S_TYPE] = want
-			if ck_legacy == 0 && is_integer_t(want) != 0 {
+			if is_integer_t(want) != 0 {
 				let value = mk_int(c[D_POS], v, 0)
 				value[8] = s[S_BIG]
 				adapt_int(value, want)
 			}
 		}
-		if ck_legacy != 0 {
-			s[S_TYPE] = ty_int
-		}
 	} else {
-		if ck_legacy != 0 {
-			err_code_at(init[N_POS], cstr("E220 NOT_CONSTANT"), cstr("expression is not a constant"))
-		}
 		let copy_ = expr_clone(init)
 		let t = chk(copy_, want)
 		if want != 0 {
@@ -1117,7 +1083,6 @@ shared mut sentinel_seq i64 // numbers sentinel identities (the runtime's own ar
 
 fn check_var(v i64) {
 	set_file(v[D_FILE])
-	ck_legacy = i64(vec_get(file_v2, ck_file) == 0)
 	ck_fn = 0
 	let s = v[D_SYM]
 	if s[S_INDEX] != vec_index(prog_vars, v) {
@@ -1142,12 +1107,12 @@ fn check_var(v i64) {
 		if s[S_TYPE] == 0 {
 			s[S_TYPE] = ty_int
 		}
-		if kind_of(s[S_TYPE]) == K_DYN && ck_legacy == 0 {
+		if kind_of(s[S_TYPE]) == K_DYN {
 			zero_value(v[D_POS], s[S_TYPE])
 		}
 		return
 	}
-	if (ck_legacy != 0 || is_int_const_expr(init) != 0) && s[S_TLS] == 0 {
+	if (is_int_const_expr(init) != 0) && s[S_TLS] == 0 {
 		v[D_VAL] = const_value(init, 0)
 		if s[S_TYPE] == 0 {
 			s[S_TYPE] = ty_int
@@ -1170,13 +1135,9 @@ fn check_var(v i64) {
 		s[S_TYPE] = default_type(t)
 		sb_forbid(v[D_POS], s[S_TYPE], cstr("a global cannot hold "))
 	}
-	if ck_legacy == 0 {
-		check_assignable(init, t, s[S_TYPE])
-		if is_untyped(t) != 0 {
-			reconvert(init, s[S_TYPE])
-		}
-	} else if assignable(t, s[S_TYPE]) == 0 {
-		err_code_types(init[N_POS], cstr("E230 TYPE_MISMATCH"), cstr("cannot use "), t, cstr(" as "), s[S_TYPE])
+	check_assignable(init, t, s[S_TYPE])
+	if is_untyped(t) != 0 {
+		reconvert(init, s[S_TYPE])
 	}
 	let target = node_new(EX_IDENT, v[D_POS])
 	target[ID_NAME] = s[S_NAME]
@@ -1214,7 +1175,7 @@ fn make_start(main_fn i64) {
 	// __start takes the C entry name; the program's own main becomes main.main.
 	f[F_QNAME] = cstr("main")
 	main_fn[F_QNAME] = cstr("main.main")
-	f[F_LEGACY] = 1
+	f[F_GENERATED] = 1
 	vec_push(f[F_PARAMS], cstr("argc"))
 	vec_push(f[F_PARAMS], cstr("argv"))
 	f[F_PTYPES] = vec_new()
@@ -1969,7 +1930,6 @@ fn scan_funclits_in_expr(e i64, outer_names i64, cells i64) {
 
 fn check_fn_closure(f i64) {
 	let saved_file = ck_file
-	let saved_legacy = ck_legacy
 	let saved_fn = ck_fn
 	let saved_tbind = ck_tbind
 	let saved_loops = ck_loops
@@ -1991,7 +1951,6 @@ fn check_fn_closure(f i64) {
 	check_fn(f)
 
 	set_file(saved_file)
-	ck_legacy = saved_legacy
 	ck_fn = saved_fn
 	ck_tbind = saved_tbind
 	ck_loops = saved_loops
@@ -2015,15 +1974,12 @@ fn check_fn(f i64) {
 	}
 	ck_tbind = f[F_TBIND]
 	ck_fn = f
-	ck_legacy = f[F_LEGACY]
 	ck_loops = 0
 	ck_breaks = 0
 	ck_escaping_cells = vec_new()
 	len_aliases = vec_new()
 	if f[F_BODY] != 0 {
-		if ck_legacy == 0 {
-			mark_spawns(f[F_BODY][BLK_STMTS], sb_scope_params(f))
-		}
+		mark_spawns(f[F_BODY][BLK_STMTS], sb_scope_params(f))
 		scan_captures(f, ck_escaping_cells)
 	}
 	start_scope()
@@ -2038,7 +1994,7 @@ fn check_fn(f i64) {
 		secret_lib_param(ps)
 		if f[F_MUTS] != 0 && i < f[F_MUTS][VEC_LEN] {
 			ps[S_MUT] = vec_get(f[F_MUTS], i)
-			if ps[S_MUT] != 0 && ck_legacy == 0 && mut_capable(vec_get(f[F_PTYPES], i)) == 0 {
+			if ps[S_MUT] != 0 && mut_capable(vec_get(f[F_PTYPES], i)) == 0 {
 				err_code_type(f[F_POS], cstr("E702 MUT_VALUE_PARAM"), str_cat3(cstr("parameter '"), vec_get(params, i), cstr("' is mut, but a value of type ")), vec_get(f[F_PTYPES], i), cstr(" is passed by value: only structs, slices and maps can be modified through a parameter, so remove mut"))
 			}
 		}
@@ -2092,7 +2048,7 @@ fn check_fn(f i64) {
 		}
 		f[F_BODY][BLK_STMTS] = new_stmts
 	}
-	if f[F_BANG] != 0 && ck_legacy == 0 && f[F_RTYPES][VEC_LEN] == 1 && ends_in_return(f[F_BODY][BLK_STMTS]) == 0 {
+	if f[F_BANG] != 0 && f[F_RTYPES][VEC_LEN] == 1 && ends_in_return(f[F_BODY][BLK_STMTS]) == 0 {
 		// A ! function that runs off its end succeeds.
 		let r = node_new(ST_RETURN, f[F_POS])
 		r[RET_VALUE] = mk_int(f[F_POS], 0, ty_error)
@@ -2103,20 +2059,18 @@ fn check_fn(f i64) {
 		ck_defers = 0
 		ck_defer_mark = 0
 	}
-	if ck_legacy == 0 && f[F_RTYPES][VEC_LEN] > 0 && ends_in_return(f[F_BODY][BLK_STMTS]) == 0 {
+	if f[F_RTYPES][VEC_LEN] > 0 && ends_in_return(f[F_BODY][BLK_STMTS]) == 0 {
 		err_code_quoted(f[F_POS], cstr("E260 MISSING_RETURN"), cstr("function "), f[F_NAME], cstr(" is missing a return at the end"))
 	}
-	if ck_legacy == 0 {
-		// A fault that is assigned but never looked at is an ignored error.
-		let locals = f[F_LOCALS]
-		i = 0
-		for i < locals[VEC_LEN] {
-			let l = vec_get(locals, i)
-			if kind_of(l[S_TYPE]) == K_ERROR && l[S_READS] == 0 && i64(load8(l[S_NAME])) != '$' {
-				err_code_quoted(l[S_POS], cstr("E410 UNCHECKED_FAULT"), cstr("fault "), l[S_NAME], cstr(" is never checked"))
-			}
-			i = i + 1
+	// A fault that is assigned but never looked at is an ignored error.
+	let locals = f[F_LOCALS]
+	i = 0
+	for i < locals[VEC_LEN] {
+		let l = vec_get(locals, i)
+		if kind_of(l[S_TYPE]) == K_ERROR && l[S_READS] == 0 && i64(load8(l[S_NAME])) != '$' {
+			err_code_quoted(l[S_POS], cstr("E410 UNCHECKED_FAULT"), cstr("fault "), l[S_NAME], cstr(" is never checked"))
 		}
+		i = i + 1
 	}
 }
 
@@ -2552,7 +2506,7 @@ fn mk_load8(pos i64, addr i64) i64 {
 	return intrinsic_call(pos, cstr("load8"), args1(addr), ty_byte)
 }
 
-// rt_call calls a runtime function by name; the runtime is loaded for every v2 program.
+// rt_call calls a runtime function by name; the runtime is loaded for every program.
 fn rt_call(pos i64, name i64, args i64, t i64) i64 {
 	let f = find_fn(name)
 	if f == 0 {
@@ -2630,13 +2584,10 @@ fn zero_value(pos i64, t i64) i64 {
 		return lit_string(pos, cstr(""))
 	}
 	if k == K_SLICE {
-		if ck_legacy != 0 {
-			return intrinsic_call(pos, cstr("__empty"), vec_new(), t)
-		}
 		// A real header, made in the current region, so append never has to pick one.
 		return rt_call(pos, cstr("rt_slice_make"), args3(mk_int(pos, 0, ty_int), mk_int(pos, 0, ty_int), mk_int(pos, elem_size(t), ty_int)), t)
 	}
-	if (k == K_STRUCT || k == K_MAP || k == K_FUNC || k == K_DYN) && ck_legacy == 0 {
+	if (k == K_STRUCT || k == K_MAP || k == K_FUNC || k == K_DYN) {
 		err_code_type(pos, cstr("E203 NO_ZERO_VALUE"), cstr("a variable of type "), t, cstr(" needs an initializer (it cannot be nil; use ?T for an optional)"))
 	}
 	return mk_int(pos, 0, t)
@@ -2677,16 +2628,16 @@ fn check_stmt(s i64) {
 		check_fail(s)
 	} else if k == ST_EXPR {
 		let x = s[ES_X]
-		if (x[N_KIND] == EX_TRY || x[N_KIND] == EX_CATCH || x[N_KIND] == EX_WRAP) && ck_legacy == 0 {
+		if (x[N_KIND] == EX_TRY || x[N_KIND] == EX_CATCH || x[N_KIND] == EX_WRAP) {
 			lower_try_stmt(s, x, 0, 0)
 			return
 		}
-		if x[N_KIND] == EX_MATCH && ck_legacy == 0 {
+		if x[N_KIND] == EX_MATCH {
 			lower_match_stmt(s, x)
 			return
 		}
 		let t = chk(x, 0)
-		if ck_legacy == 0 && (kind_of(t) == K_ERROR || (kind_of(t) == K_TUPLE && kind_of(vec_get(t[TY_FIELDS], t[TY_FIELDS][VEC_LEN] - 1)) == K_ERROR)) {
+		if (kind_of(t) == K_ERROR || (kind_of(t) == K_TUPLE && kind_of(vec_get(t[TY_FIELDS], t[TY_FIELDS][VEC_LEN] - 1)) == K_ERROR)) {
 			err_code_at(s[N_POS], cstr("E410 UNCHECKED_FAULT"), cstr("the fault this call returns is ignored (check it, or use try)"))
 		}
 		if kind_of(t) == K_TUPLE && x[N_KIND] == EX_CALL {
@@ -2749,11 +2700,7 @@ fn check_stmt(s i64) {
 	} else if k == ST_BLOCK {
 		check_scoped(s)
 	} else if k == ST_GO {
-		if ck_legacy == 0 {
-			err_code_at(s[N_POS], cstr("E602 GO"), cstr("go is not allowed: cores share nothing (run work per core with hearth, talk across cores with relay)"))
-		} else {
-			lower_go(s)
-		}
+		err_code_at(s[N_POS], cstr("E602 GO"), cstr("go is not allowed: cores share nothing (run work per core with hearth, talk across cores with relay)"))
 	} else if k == ST_ONCE {
 		lower_once(s)
 	} else if k == ST_SCOPE {
@@ -3162,10 +3109,6 @@ fn check_use_global(v i64, s i64, u i64) {
 	let t = chk(e, 0)
 	mut rt = use_resource(pos, t)
 	s[S_TYPE] = ty_int
-	if s[S_TLS] == 0 {
-		err_code_at(pos, cstr("E092 NEWER_SYNTAX"), cstr("a package-level use is per core: it needs an edition 1 file"))
-		rt = 0
-	}
 	if rt == 0 || use_check_close(pos, rt) == 0 {
 		u[USE_STOP][F_BODY][BLK_STMTS][VEC_LEN] = 0
 		return
@@ -3211,10 +3154,6 @@ fn check_use_global(v i64, s i64, u i64) {
 // lower_use lowers a function-level use x = e (see the section comment).
 fn lower_use(s i64) {
 	let pos = s[N_POS]
-	if ck_legacy != 0 {
-		err_code_at(pos, cstr("E092 NEWER_SYNTAX"), cstr("use needs edition 1"))
-		return
-	}
 	if ck_loops > 0 {
 		err_code_at(pos, cstr("E621 USE_PLACEMENT"), cstr("use inside a loop would close once per function, not per iteration: move the loop body into a function"))
 		return
@@ -3877,7 +3816,7 @@ fn sb_noun(t i64) i64 {
 
 // sb_forbid reports a task handle or scope of type t kept where it could outlive its scope.
 fn sb_forbid(pos i64, t i64, what i64) {
-	if ck_legacy != 0 || ck_trusted != 0 || sb_type(t) == 0 {
+	if ck_trusted != 0 || sb_type(t) == 0 {
 		return
 	}
 	let e = err_code(pos, cstr("E640 SCOPE_ESCAPE"))
@@ -4129,7 +4068,7 @@ fn sb_store(pos i64, s i64, d i64) {
 
 // sb_assign checks target = value (before either is checked).
 fn sb_assign(pos i64, target i64, v i64) {
-	if ck_legacy != 0 || ck_trusted != 0 || v == 0 || v[N_TYPE] != 0 {
+	if ck_trusted != 0 || v == 0 || v[N_TYPE] != 0 {
 		// Checked values are the checker's own temporaries, checked where they were made.
 		return
 	}
@@ -4170,7 +4109,7 @@ fn sb_holder(e i64, a i64, i i64) i64 {
 // sb_call checks a call before it is checked: no argument may hand a holder (sb_holder) a
 // task handle or scope that ends before the holder does.
 fn sb_call(e i64) {
-	if ck_legacy != 0 || ck_trusted != 0 {
+	if ck_trusted != 0 {
 		return
 	}
 	let xs = vec_new()
@@ -4211,7 +4150,7 @@ fn sb_call(e i64) {
 // scope (kept or detached) no task handle or scope at all, and a child spawned on scope s only
 // those of s or of a scope around it.
 fn sb_captures(e i64, f i64) {
-	if ck_legacy != 0 || ck_trusted != 0 {
+	if ck_trusted != 0 {
 		return
 	}
 	mut limit_ = -1
@@ -4261,7 +4200,7 @@ fn sb_captures(e i64, f i64) {
 // sb_defer checks a deferred call (already checked): it runs when the function returns, after
 // every scope inside the function has ended.
 fn sb_defer(pos i64, call i64) {
-	if ck_legacy != 0 || ck_trusted != 0 || ck_scope_depth == ck_fn_base {
+	if ck_trusted != 0 || ck_scope_depth == ck_fn_base {
 		return
 	}
 	mut d = sb_depth(call[CALL_CALLEE])
@@ -4316,10 +4255,6 @@ shared mut ck_defer_mark i64 // the current function's defer chain mark ($m), wh
 // function's mark, and a panic runs it too, so deferred calls also run while a panic unwinds.
 fn lower_defer(s i64) {
 	let pos = s[N_POS]
-	if ck_legacy != 0 {
-		err_code_at(pos, cstr("E092 NEWER_SYNTAX"), cstr("defer needs func syntax"))
-		return
-	}
 	if ck_loops > 0 {
 		err_code_at(pos, cstr("E270 DEFER"), cstr("defer inside a loop would run once per function, not per iteration: move the loop body into a function"))
 		return
@@ -4573,9 +4508,6 @@ fn lower_with_init(s i64, field i64) {
 
 fn check_cond(c i64) {
 	let t = chk(c, ty_bool)
-	if ck_legacy != 0 {
-		return
-	}
 	if is_bool_t(t) == 0 {
 		err_code_type(c[N_POS], cstr("E232 CONDITION"), cstr("condition must be a bool, not "), t, cstr(""))
 	}
@@ -4588,11 +4520,11 @@ fn check_let(s i64) {
 		t = resolve_type(s[LET_TYPE])
 	}
 	let init = s[LET_INIT]
-	if init != 0 && (init[N_KIND] == EX_TRY || init[N_KIND] == EX_CATCH || init[N_KIND] == EX_WRAP) && ck_legacy == 0 {
+	if init != 0 && (init[N_KIND] == EX_TRY || init[N_KIND] == EX_CATCH || init[N_KIND] == EX_WRAP) {
 		lower_try_stmt(s, init, 1, t)
 		return
 	}
-	if init != 0 && init[N_KIND] == EX_MATCH && ck_legacy == 0 {
+	if init != 0 && init[N_KIND] == EX_MATCH {
 		check_match_let(s, init, t)
 		return
 	}
@@ -4613,13 +4545,13 @@ fn check_let(s i64) {
 				reconvert(init, t)
 			}
 		}
-	} else if ck_legacy == 0 && array_len(s[LET_TYPE]) > 0 {
+	} else if array_len(s[LET_TYPE]) > 0 {
 		s[LET_INIT] = array_make(pos, t, array_len(s[LET_TYPE]))
 	} else {
 		s[LET_INIT] = zero_value(pos, t)
 	}
 	if streq(s[LET_NAME], cstr("_")) != 0 {
-		if kind_of(t) == K_ERROR && ck_legacy == 0 {
+		if kind_of(t) == K_ERROR {
 			err_code_at(pos, cstr("E410 UNCHECKED_FAULT"), cstr("a fault cannot be discarded with _"))
 		}
 		replace_node(s, expr_stmt(s[LET_INIT]))
@@ -4659,7 +4591,7 @@ fn check_target(t i64) i64 {
 		} else if s[S_KIND] == SYM_FUNC {
 			err_code_quoted(t[N_POS], cstr("E710 NOT_ASSIGNABLE"), cstr("cannot assign to function "), t[ID_NAME], cstr(""))
 		}
-		if s[S_MUT] != 0 && ck_legacy == 0 {
+		if s[S_MUT] != 0 {
 			// The caller passed the struct, optional or map itself: assigning the parameter
 			// variable would only rebind the callee's copy and be silently lost (as mut on a
 			// str is rejected). Slices stay assignable for `xs = append(xs, v)`.
@@ -4703,17 +4635,17 @@ fn check_assign(s i64) {
 	let target = s[AS_TARGET]
 	let v = s[AS_VALUE]
 	sb_assign(s[N_POS], target, v)
-	if (v[N_KIND] == EX_TRY || v[N_KIND] == EX_CATCH || v[N_KIND] == EX_WRAP) && ck_legacy == 0 {
+	if (v[N_KIND] == EX_TRY || v[N_KIND] == EX_CATCH || v[N_KIND] == EX_WRAP) {
 		lower_try_stmt(s, v, 2, 0)
 		return
 	}
-	if v[N_KIND] == EX_MATCH && ck_legacy == 0 {
+	if v[N_KIND] == EX_MATCH {
 		check_match_assign(s, target, v)
 		return
 	}
 	if target[N_KIND] == EX_IDENT && streq(target[ID_NAME], cstr("_")) != 0 {
 		let vt = chk(v, 0)
-		if (kind_of(vt) == K_ERROR || (kind_of(vt) == K_TUPLE && tuple_has_fault(vt) != 0)) && ck_legacy == 0 {
+		if (kind_of(vt) == K_ERROR || (kind_of(vt) == K_TUPLE && tuple_has_fault(vt) != 0)) {
 			err_code_at(s[N_POS], cstr("E410 UNCHECKED_FAULT"), cstr("a fault cannot be discarded with _"))
 		} else {
 			check_value(s[N_POS], vt)
@@ -4723,7 +4655,7 @@ fn check_assign(s i64) {
 	}
 	// Map stores become runtime calls. x op= v shares the target node with v, so take
 	// the target's parts before checking v.
-	if target[N_KIND] == EX_INDEX && ck_legacy == 0 {
+	if target[N_KIND] == EX_INDEX {
 		let tx = target[IX_X]
 		let ti = target[IX_I]
 		let xt = chk(tx, 0)
@@ -4750,13 +4682,11 @@ fn check_assign(s i64) {
 	}
 	let tt = check_target(target)
 	let vt = chk(v, tt)
-	if ck_legacy == 0 {
-		check_assignable(v, vt, tt)
-		if is_untyped(vt) != 0 {
-			reconvert(v, tt)
-		}
-		narrow_kill(target)
+	check_assignable(v, vt, tt)
+	if is_untyped(vt) != 0 {
+		reconvert(v, tt)
 	}
+	narrow_kill(target)
 	if target[N_KIND] == EX_IDENT {
 		len_alias_invalidate(target[ID_REF])
 	}
@@ -4807,7 +4737,7 @@ fn check_assignable(e i64, from i64, to i64) {
 	if bounded_value(e, from, to) != 0 {
 		return
 	}
-	if assignable(from, to) == 0 && ck_legacy == 0 {
+	if assignable(from, to) == 0 {
 		if is_query_t(to) != 0 && kind_of(from) == K_STRING {
 			err_code_at(e[N_POS], cstr("E280 QUERY"), cstr("a query takes a string literal: put values in {{...}} so they are sent apart from the text, never pasted into it"))
 			return
@@ -4850,7 +4780,7 @@ fn check_multi(s i64) {
 	}
 	if values[VEC_LEN] == 1 && n > 1 {
 		let v = vec_get(values, 0)
-		if (v[N_KIND] == EX_TRY || v[N_KIND] == EX_CATCH || v[N_KIND] == EX_WRAP) && ck_legacy == 0 {
+		if (v[N_KIND] == EX_TRY || v[N_KIND] == EX_CATCH || v[N_KIND] == EX_WRAP) {
 			lower_try_stmt(s, v, 3, 0)
 			return
 		}
@@ -4943,7 +4873,7 @@ fn bind_targets(pos i64, targets i64, temps i64, define i64, stmts i64) {
 		let tg = vec_get(targets, i)
 		let ts = vec_get(temps, i)
 		if tg[N_KIND] == EX_IDENT && streq(tg[ID_NAME], cstr("_")) != 0 {
-			if kind_of(ts[S_TYPE]) == K_ERROR && ck_legacy == 0 {
+			if kind_of(ts[S_TYPE]) == K_ERROR {
 				err_code_at(tg[N_POS], cstr("E410 UNCHECKED_FAULT"), cstr("a fault cannot be discarded with _"))
 			}
 			i = i + 1
@@ -4982,16 +4912,16 @@ fn check_return(s i64) {
 	let f = ck_fn
 	let want = f[F_RTYPES]
 	let pos = s[N_POS]
-	if s[RET_VALUE] != 0 && (s[RET_VALUE][N_KIND] == EX_TRY || s[RET_VALUE][N_KIND] == EX_CATCH || s[RET_VALUE][N_KIND] == EX_WRAP) && ck_legacy == 0 {
+	if s[RET_VALUE] != 0 && (s[RET_VALUE][N_KIND] == EX_TRY || s[RET_VALUE][N_KIND] == EX_CATCH || s[RET_VALUE][N_KIND] == EX_WRAP) {
 		lower_try_stmt(s, s[RET_VALUE], 4, 0)
 		return
 	}
-	if s[RET_VALUE] != 0 && s[RET_VALUE][N_KIND] == EX_MATCH && ck_legacy == 0 {
+	if s[RET_VALUE] != 0 && s[RET_VALUE][N_KIND] == EX_MATCH {
 		// return match ...: each arm returns its value (#225).
 		replace_node(s, lower_match(s[RET_VALUE], MATCH_RETURN, 0))
 		return
 	}
-	if f[F_BANG] != 0 && ck_legacy == 0 {
+	if f[F_BANG] != 0 {
 		// In a !T function, return gives the values; the fault slot is filled with nil.
 		let nw = want[VEC_LEN] - 1
 		if s[RET_VALUES] != 0 {
@@ -5039,7 +4969,7 @@ fn check_return(s i64) {
 	}
 	let v = s[RET_VALUE]
 	if v == 0 {
-		if want[VEC_LEN] > 0 && ck_legacy == 0 {
+		if want[VEC_LEN] > 0 {
 			err_code_at(pos, cstr("E262 RETURN_COUNT"), cstr("missing return value"))
 		}
 		return
@@ -5322,7 +5252,7 @@ fn fault_return(pos i64, body i64, fault i64) i64 {
 		let rk = kind_of(rt)
 		if is_float_t(rt) != 0 {
 			vec_push(rv, zero_value(pos, ty_float))
-		} else if ck_legacy == 0 && (rk == K_STRING || rk == K_SLICE || rk == K_MAP || rk == K_STRUCT) {
+		} else if (rk == K_STRING || rk == K_SLICE || rk == K_MAP || rk == K_STRUCT) {
 			// A str, slice, map or struct is never nil, even next to a fault.
 			vec_push(rv, argo_new(pos, body, rt))
 		} else {
@@ -5612,7 +5542,7 @@ fn lower_switch(s i64) {
 		}
 	}
 	// switch err { case ErrX: } compares each case with fault.Is (design_semantics section 2).
-	let faultsw = i64(s[SW_TAG] != 0 && ck_legacy == 0 && kind_of(chk(s[SW_TAG], 0)) == K_ERROR)
+	let faultsw = i64(s[SW_TAG] != 0 && kind_of(chk(s[SW_TAG], 0)) == K_ERROR)
 	let out = empty_block(pos)
 	if s[SW_INIT] != 0 {
 		vec_push(out[BLK_STMTS], s[SW_INIT])
@@ -6909,71 +6839,6 @@ fn lower_match(m i64, mode i64, rec i64) i64 {
 	return out
 }
 
-// lower_go starts a thread running a call: the arguments are evaluated now and handed
-// to a lifted thunk that unpacks them on the new thread.
-fn lower_go(s i64) {
-	let pos = s[N_POS]
-	let call = s[GO_CALL]
-	chk(call, 0)
-	if call[N_KIND] != EX_CALL || call[CALL_INTRINSIC] != 0 || call[CALL_FN] == 0 {
-		err_code_at(pos, cstr("E602 GO"), cstr("go needs a direct function call"))
-		return
-	}
-	let target = call[CALL_FN]
-	let args = call[CALL_ARGS]
-	let n = args[VEC_LEN]
-	let stmts = vec_new()
-	let blk = temp(pos, rt_call(pos, cstr("rt_alloc"), args1(mk_int(pos, 8 * n + 8, ty_int)), ty_int), ty_int)
-	vec_push(stmts, blk)
-	mut i = 0
-	for i < n {
-		let a = vec_get(args, i)
-		vec_push(stmts, assign_stmt(pos, mk_index(pos, sym_ref_node(pos, blk[LET_SYM]), mk_int(pos, i, ty_int), a[N_TYPE]), a))
-		i = i + 1
-	}
-	// The thunk: fn thunk(blk) { target(blk[0], blk[1], ...); }
-	lifted_count = lifted_count + 1
-	let th = fn_new(pos, cstr("go"))
-	let tb = buf_new()
-	buf_str(tb, cstr("go$"))
-	buf_int(tb, lifted_count)
-	buf_byte(tb, 0)
-	th[F_QNAME] = tb[VEC_DATA]
-	th[F_LEGACY] = 1
-	vec_push(th[F_PARAMS], cstr("blk"))
-	vec_push(th[F_PTYPES], ty_int)
-	vec_push(th[F_RTYPES], ty_int)
-	th[F_TYPE] = func_of(th[F_PTYPES], th[F_RTYPES], 0)
-	th[F_LOCALS] = vec_new()
-	let ps = sym_new(SYM_LOCAL, cstr("blk"), pos)
-	ps[S_TYPE] = ty_int
-	vec_push(th[F_LOCALS], ps)
-	th[F_SLOTS] = 1
-	let inner = node_new(EX_CALL, pos)
-	inner[CALL_NAME] = target[F_QNAME]
-	inner[CALL_FN] = target
-	inner[CALL_ARGS] = vec_new()
-	inner[N_TYPE] = ty_void
-	i = 0
-	for i < n {
-		let pt = vec_get(target[F_PTYPES], i)
-		vec_push(inner[CALL_ARGS], mk_index(pos, sym_ref_node(pos, ps), mk_int(pos, i, ty_int), pt))
-		i = i + 1
-	}
-	th[F_BODY] = empty_block(pos)
-	vec_push(th[F_BODY][BLK_STMTS], expr_stmt(inner))
-	vec_push(th[F_BODY][BLK_STMTS], expr_stmt(rt_call(pos, cstr("rt_thread_exit"), vec_new(), ty_void)))
-	th[F_LIFTED] = 2
-	vec_push(prog_fns, th)
-	let ref_ = node_new(EX_FUNCREF, pos)
-	ref_[FR_FN] = th
-	ref_[N_TYPE] = th[F_TYPE]
-	vec_push(stmts, expr_stmt(rt_call(pos, cstr("rt_go"), args2(ref_, sym_ref_node(pos, blk[LET_SYM])), ty_void)))
-	let b = empty_block(pos)
-	b[BLK_STMTS] = stmts
-	replace_node(s, b)
-}
-
 fn pair(a i64, b i64) i64 {
 	let v = vec_new()
 	vec_push(v, a)
@@ -7343,7 +7208,7 @@ fn lower_for_init(s i64) {
 	check_cond(inner[WH_COND])
 	let saved = safe_pairs[VEC_LEN]
 	let bound = len_bound(inner[WH_COND])
-	if bound != 0 && ck_legacy == 0 && init[N_KIND] == ST_LET && init[LET_SYM] == vec_get(bound, 0) && init[LET_INIT][N_KIND] == EX_INT && init[LET_INIT][INT_VAL] >= 0 && is_increment(inner[WH_POST], init[LET_NAME]) != 0 {
+	if bound != 0 && init[N_KIND] == ST_LET && init[LET_SYM] == vec_get(bound, 0) && init[LET_INIT][N_KIND] == EX_INT && init[LET_INIT][INT_VAL] >= 0 && is_increment(inner[WH_POST], init[LET_NAME]) != 0 {
 		let xs = vec_get(bound, 1)
 		let length = vec_get(bound, 2)
 		mut stable = i64(names_assigned(inner[WH_BODY], init[LET_NAME], xs[S_NAME]) == 0 && stmt_may_change_slice(inner[WH_BODY], xs[S_NAME]) == 0)
@@ -7409,7 +7274,7 @@ fn is_increment(post i64, name i64) i64 {
 // narrow_begin narrows x from ?T to T where the condition proves x != nil (sense 1:
 // the condition holds; sense 0: it failed). It returns what narrow_end restores.
 fn narrow_begin(c i64, sense i64) i64 {
-	if ck_legacy != 0 || c[N_KIND] != EX_BINARY {
+	if c[N_KIND] != EX_BINARY {
 		return 0
 	}
 	let op = c[BIN_OP]

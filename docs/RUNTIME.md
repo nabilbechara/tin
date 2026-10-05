@@ -95,8 +95,7 @@ with status 2. This path creates no context, pool, format frame or heap block.
 Memory leaves use bounded NEON on arm64 and SSE2 on x86-64. Strict x86-64 programs
 cache AVX2 availability in context word 11 after checking CPU support and OS-managed
 XMM/YMM state. Medium forward copies and long comparisons/scans use AVX2 when available;
-small operations and unsupported CPUs retain SSE2. Legacy compiler programs never read
-a Tin context register. `TIN_ALLOC_TEST=1 TIN_MEMORY_SCALAR=1` forces the SSE2 path for
+small operations and unsupported CPUs retain SSE2. `TIN_ALLOC_TEST=1 TIN_MEMORY_SCALAR=1` forces the SSE2 path for
 correctness checks.
 
 `TIN_ALLOC_TEST=1` enables the test-only `TIN_FAIL_ALLOC_AFTER=N` counter, including

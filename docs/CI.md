@@ -37,7 +37,7 @@ Every push to `main` and every pull request runs native Linux arm64 (`ubuntu-24.
 - Harness self-tests ensure expected output cannot disguise crashes/timeouts or unexpectedly accepted negative programs. Benchmark self-tests check alternating medians, output equality on every repetition, matching revision library trees, and failed measurements.
 <!-- docs-check: old-syntax begin -->
 
-- The libc inventory guard (`test_libc_inventory.py`) checks Linux `extern func` and legacy `extern fn` declarations plus ELF startup imports against `notes/libc_inventory.md`; new, reintroduced, unassigned or stale entries fail.
+- The libc inventory guard (`test_libc_inventory.py`) checks Linux `extern fn` declarations plus ELF startup imports against `notes/libc_inventory.md`; new, reintroduced, unassigned or stale entries fail.
 
 <!-- docs-check: old-syntax end -->
 

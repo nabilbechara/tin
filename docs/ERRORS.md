@@ -589,23 +589,6 @@ example.tin:3:5: error E091 ONE_PER_DECLARATION: edition 1 declares one name per
 
 Fix: split the declaration: `let width = 640` and `let height = 480` on their own lines.
 
-### E092 NEWER_SYNTAX
-
-Some statements exist only in the newer syntax: `use` needs an edition 1 file, and `defer`
-needs a file written with `func` (the syntax of LANGUAGE.md).
-
-```tin
-fn main() {
-    defer main();
-}
-```
-
-```text
-example.tin:2:5: error E092 NEWER_SYNTAX: defer needs func syntax
-```
-
-Fix: write the file in the syntax the statement needs (`tin fix -edition 1` converts a file).
-
 ## E1xx Names and declarations
 
 ### E101 REDECLARED
@@ -885,8 +868,7 @@ Fix: add `fn main()` to the program's `package main`.
 
 ### E121 MAIN_SIGNATURE
 
-`main` takes no parameters (the program reads its arguments with `lever`; `(argc, argv)`
-is the legacy form the compiler itself uses), and it is not `extern`.
+`main` takes no parameters (the program reads its arguments with `lever`), and it is not `extern`.
 
 ```tin edition=1
 package main
@@ -896,7 +878,7 @@ fn main(name str) {
 ```
 
 ```text
-example.tin:3:1: error E121 MAIN_SIGNATURE: main takes no parameters or (argc, argv)
+example.tin:3:1: error E121 MAIN_SIGNATURE: main takes no parameters
 ```
 
 Fix: declare `fn main()` and read the command line with the `lever` package.

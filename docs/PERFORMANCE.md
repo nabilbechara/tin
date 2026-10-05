@@ -513,8 +513,7 @@ Only ratios on these shared runners are meaningful.
 
 HTTP head/base throughput was 0.985 for `/json` and 0.962 for `/plaintext` on arm64,
 and 0.952 and 1.028 respectively on amd64.
-Legacy programs without the strict runtime do not acquire safepoints; those CPU rows do
-not measure their cost. Output equality is checked on every timed repetition.
+Output equality is checked on every timed repetition.
 
 The watchdog reads an array of core contexts every millisecond and writes only their
 poll words. The ordinary poll is a context load and a cold branch (x86-64 also tests the

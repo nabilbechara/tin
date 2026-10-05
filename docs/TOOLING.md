@@ -115,7 +115,7 @@ tinc [-o OUT] [-S] [-edition 1] [-target darwin-arm64|linux-arm64|linux-amd64] F
 | `make linux-test` | cross-compile every strict test for linux-arm64 and run it in an arm64 container (`tools/linuxtest.sh`) |
 | `make linux-bootstrap` | cross-compile a Linux compiler, then in the container it must rebuild itself identically; refreshes `seed/tinc-linux-arm64` |
 | `make linux-amd64-bootstrap` | the same for x86-64 in `tin-debian-amd64` (emulated on an arm64 Mac); refreshes `seed/tinc-linux-amd64` |
-| `make bench` | the legacy CPU benchmarks vs Go (`bench/run.py`) |
+| `make bench` | the CPU benchmarks vs Go (`bench/run.py`) |
 | `make install` | link `tin` into `$(PREFIX)/bin` (created if needed; see §1 for the default) |
 | `make dist` | package the native compiler, library and sources in a versioned archive with a SHA-256 checksum |
 | `make print-VAR` | print a Makefile variable (e.g. `make print-SELF`, the compiler's sources) |
@@ -342,7 +342,7 @@ TIN_REPLAY_KEY=<64 hex digits> tin replay spool/00001700000000000000-000-1.tcap 
 ```text
 tin                 the tin command (shell script)
 Makefile            builds, bootstraps, tests
-selfhost/           the compiler, in legacy Tin (COMPILER.md)
+selfhost/           the compiler (COMPILER.md)
 lib/<package>/      the runtime and each standard-library package, one directory each (lib/README.md)
 tests/v2/           strict tests and expected outputs
 seed/               tinc-darwin-arm64, tinc-linux-arm64, tinc-linux-amd64: the compilers that start a build

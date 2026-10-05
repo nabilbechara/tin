@@ -9,7 +9,9 @@ import tempfile
 from suite import ROOT
 
 PT_DYNAMIC, PT_INTERP = 2, 3
-PROBE = 'fn main(argc, argv) { let envp = argv + 8 * (argc + 1); return argc * 10 + load8(envp[0]) - 64; }\n'
+# The exit status is argc * 10 plus the first byte of $X, less 64: it proves that argv and the
+# environment reach a program that links no libc and starts at Tin's own _start.
+PROBE = 'package main\nimport "quarry"\nfn main() {\n\tquarry.Exit(len(quarry.Args()) * 10 + i64(quarry.Getenv("X")[0]) - 64)\n}\n'
 ENV_PROGRAM = """package main
 
 import "quarry"
@@ -123,14 +125,14 @@ def main(programs=()):
         exe = work / ('probe-linux-' + ('arm64' if os.uname().machine in ('aarch64', 'arm64') else 'amd64'))
         env = {'X': '1'}
         result = subprocess.run([str(exe), 'a', 'b'], env=env, timeout=30)
-        assert result.returncode == 30 + ord('X') - 64, result
+        assert result.returncode == 30 + ord('1') - 64, result
         root = work / 'root'
         root.mkdir()
         jailed = run_in(root, exe, ['a'], env)
         if jailed is None:
             print('NOTE no chroot permission here: the empty-root run is skipped')
         else:
-            assert jailed.returncode == 20 + ord('X') - 64, jailed
+            assert jailed.returncode == 20 + ord('1') - 64, jailed
         # A strict program that reads and changes its environment, and the compiler itself,
         # link without libc too (#125): getenv, setenv and getauxval are the runtime's.
         envprog = work / 'env.tin'

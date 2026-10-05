@@ -41,23 +41,19 @@ def generate():
             subprocess.run(['clang', '-target', target, '-c', str(ROOT/f'tools/arch/memory-fast-{arch}.S'), '-o', str(obj)], check=True)
             wanted = NAMES + (('mem_avx2_supported',) if arch == 'amd64' else ())
             table = functions(obj, wanted)
-            vectors = {}
+            vectors = {}  # the AVX2-capable variants (they read the core context in r15): every program has one
             if arch == 'amd64':
                 subprocess.run(['clang', '-target', target, '-DMEMORY_VECTOR', '-c',
                     str(ROOT/f'tools/arch/memory-fast-{arch}.S'), '-o', str(obj)], check=True)
                 vectors = functions(obj, wanted)
             text += ['', f'fn memory_fast_{arch}(name i64) i64 {{', '\tmut hex = cstr("")']
             for name in wanted:
-                data = table[name]
+                data = (vectors[name] if name in ('memcpy', 'memmove', 'memcmp', 'memchr') and vectors else table[name])
                 if arch == 'arm64':
                     data = ''.join(f'{v[0]:08x}' for v in struct.iter_unpack('<I', data))
                 else:
                     data = data.hex()
                 text += [f'\tif streq(name, cstr("{name}")) != 0 {{', f'\t\thex = cstr("{data}")', '\t}']
-            # The compiler's own build has no Tin core context to read from r15 unless asked: any_v2 says whether vector leaves are wanted.
-            if vectors:
-                for name in ('memcpy', 'memmove', 'memcmp', 'memchr'):
-                    text += [f'\tif any_v2 != 0 && streq(name, cstr("{name}")) != 0 {{', f'\t\thex = cstr("{vectors[name].hex()}")', '\t}']
             text += ['\tlet v = vec_new()', '\tmut i = 0', '\tfor i64(load8(hex + i)) != 0 {']
             if arch == 'arm64':
                 text += ['\t\traw(v, hex_word(hex + i))', '\t\ti = i + 8']

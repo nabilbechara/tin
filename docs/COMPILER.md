@@ -1,7 +1,8 @@
 # The Tin compiler (tinc): how it works
 
-`tinc` is about 17,000 lines of Tin in `selfhost/`, written in the legacy syntax
-(LANGUAGE.md §20: untyped 64-bit words, `fn`, `let`, `while`). It compiles itself:
+`tinc` is about 35,000 lines of Tin in `selfhost/`, written in edition 1 as trusted code: its records
+are still arrays of 64-bit words (`t[T_KIND]`) and its strings C strings, moving to typed structs and
+`str` one record at a time (notes/design_typed_compiler.md, #228). It compiles itself:
 `make bootstrap` builds it three times and the last two binaries must be byte-identical.
 It produces finished executables with its own assembler and linker (Mach-O for macOS,
 ELF for Linux); no external toolchain is involved.
@@ -94,7 +95,7 @@ the lowered forms: field accesses are MEM, indexing is ELEM, map operations are 
 
 **Function declarations** (`F_*`, 36 words): name, qualified name (`pkg.Name`,
 `Type.Method`, `Name[T1,T2]` for instances), params, param types (expressions until
-declared, then types), result types, body, locals, slots, flags (extern, legacy,
+declared, then types), result types, body, locals, slots, flags (extern, generated,
 variadic, reachable, leaf, lifted), mut flags per parameter, type parameters and
 bindings, tokens to re-parse (generics), region summary.
 
@@ -245,7 +246,7 @@ machinery), `rt_err_str`. Intrinsics compiled inline: `load8`, `store8`, `__ld`,
 
 ## 11. Changing the compiler
 
-1. Edit `selfhost/` (legacy syntax; comments are one sentence ending with a period).
+1. Edit `selfhost/` (edition 1, trusted; comments are one sentence ending with a period).
 2. `make -s bin/tinc` builds it with the seed; for faster iteration build with the
    current compiler: `bin/tinc -o bin/tincL $(make -s print-SELF)`.
 3. Test with `tools/try.sh bin/tincL tests/v2/x.tin` and `tools/v2test.sh bin/tincL`.
@@ -263,5 +264,5 @@ opt, gen) see only existing lowered forms if possible.
 Common failure modes: a node referenced from two places and rewritten twice (clone
 nodes you reuse), an identifier left unresolved after lowering (`ID_REF` 0 crashes
 `analyze_fn`), a function the backend calls that reachability did not mark (it links to
-address 0 and jumps into the Mach-O header), a legacy file using a name that became a
+address 0 and jumps into the Mach-O header), a file using a name that became a
 keyword.

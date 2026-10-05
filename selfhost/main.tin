@@ -173,9 +173,8 @@ fn load_file_trusted(path i64, trusted_in i64) {
 		// a standard library file is read in the edition it is written in (#226)
 		edition = source_edition(src[VEC_DATA], src[VEC_LEN])
 	}
-	if edition == 0 && compiler_fix == 0 && source_has_word(src[VEC_DATA], src[VEC_LEN], cstr("package")) + source_has_word(src[VEC_DATA], src[VEC_LEN], cstr("func")) > 0 {
-		// edition 0 is retired (#226): only tin fix reads it; the compiler's own legacy dialect
-		// (no package clause, no func) stays until selfhost/ moves to edition 1 (#228)
+	if edition == 0 && compiler_fix == 0 {
+		// edition 0 is retired (#226): only tin fix reads it
 		let e = err_code(NO_POS, cstr("E090 OLD_SYNTAX"))
 		buf_str(e, path)
 		buf_str(e, cstr(" is edition 0, which is retired: translate it with tin fix -edition 1"))
@@ -698,64 +697,50 @@ fn compiler_main(argc i64, argv i64) i64 {
 	if parse_only != 0 {
 		return 0
 	}
-	mut v2 = 0
-	i = 0
-	for i < file_v2[VEC_LEN] {
-		if vec_get(file_v2, i) != 0 {
-			v2 = 1
-		}
-		i = i + 1
+	lib_root = find_root()
+	project_root = dir_of(vec_get(files, 0))
+	project_lock = try_read_file(cat_path(project_root, cstr("/tin.lock")))
+	// The runtime is the package lib/runtime: every file of it for this OS and CPU.
+	let rtfiles = package_files(cat_path(lib_root, cstr("/lib/runtime")))
+	if rtfiles == 0 {
+		let e = err_code(NO_POS, cstr("E903 NO_RUNTIME"))
+		buf_str(e, cstr("the runtime package is missing: no lib/runtime in "))
+		buf_str(e, lib_root)
+		fatal(e)
 	}
-	if v2 != 0 {
-		lib_root = find_root()
-		project_root = dir_of(vec_get(files, 0))
-		project_lock = try_read_file(cat_path(project_root, cstr("/tin.lock")))
-		// The runtime is the package lib/runtime: every file of it for this OS and CPU.
-		let rtfiles = package_files(cat_path(lib_root, cstr("/lib/runtime")))
-		if rtfiles == 0 {
-			let e = err_code(NO_POS, cstr("E903 NO_RUNTIME"))
-			buf_str(e, cstr("the runtime package is missing: no lib/runtime in "))
-			buf_str(e, lib_root)
-			fatal(e)
+	mut rk = 0
+	for rk < rtfiles[VEC_LEN] {
+		let rpath = vec_get(rtfiles, rk)
+		if is_loaded(rpath) == 0 {
+			load_file_trusted(rpath, 1)
 		}
-		mut rk = 0
-		for rk < rtfiles[VEC_LEN] {
-			let rpath = vec_get(rtfiles, rk)
-			if is_loaded(rpath) == 0 {
-				load_file_trusted(rpath, 1)
-			}
-			rk = rk + 1
-		}
-		load_imports()
-		verify_lock()
+		rk = rk + 1
 	}
+	load_imports()
+	verify_lock()
 	check()
 	if error_count > 0 {
 		return 1
 	}
-	if v2 != 0 {
-		check_capabilities()
-		if error_count > 0 {
-			return 1
-		}
-		if caps_report != 0 {
-			print_capabilities()
-			return 0
-		}
+	check_capabilities()
+	if error_count > 0 {
+		return 1
+	}
+	if caps_report != 0 {
+		print_capabilities()
+		return 0
 	}
 	if audit_secrets != 0 {
 		secret_audit_print()
 		return 0
 	}
-	if v2 != 0 {
-		region_check()
-		if error_count > 0 {
-			return 1
-		}
-		rc_mark()
-		if error_count > 0 {
-			return 1
-		}
+	region_check()
+	if error_count > 0 {
+		return 1
+	}
+	rc_mark()
+	if error_count > 0 {
+		return 1
 	}
 	generate()
 	if error_count > 0 {
@@ -817,7 +802,7 @@ fn source_has_word(src i64, n i64, word i64) i64 {
 }
 
 // source_edition is 1 for a file written in edition 1: no `func`, `var`, `:=` or `;` (outside
-// comments and strings), which edition 0 code and the compiler's legacy dialect always have.
+// comments and strings), which edition 0 code always has.
 // A file of only constants and types reads the same in both.
 fn source_edition(src i64, n i64) i64 {
 	mut i = 0

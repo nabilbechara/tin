@@ -21,9 +21,6 @@ fn chk(e i64, want i64) i64 {
 fn chk_kind(e i64, want i64) i64 {
 	let k = e[N_KIND]
 	if k == EX_INT {
-		if ck_legacy != 0 {
-			return ty_int
-		}
 		return adapt_int(e, want)
 	}
 	if k == EX_FLOAT {
@@ -35,9 +32,6 @@ fn chk_kind(e i64, want i64) i64 {
 		return ty_float
 	}
 	if k == EX_STR {
-		if ck_legacy != 0 {
-			return ty_int
-		}
 		if is_query_t(want) != 0 {
 			return chk_query(e, want)
 		}
@@ -49,25 +43,23 @@ fn chk_kind(e i64, want i64) i64 {
 		if nilable(want) != 0 {
 			return want
 		}
-		if ck_legacy == 0 {
-			err_code_at(e[N_POS], cstr("E233 UNTYPED_NIL"), cstr("nil needs an optional (?T) or fault type"))
-		}
+		err_code_at(e[N_POS], cstr("E233 UNTYPED_NIL"), cstr("nil needs an optional (?T) or fault type"))
 		return ty_nil
 	}
 	if k == EX_IDENT {
 		return chk_ident(e, want)
 	}
 	if k == EX_UNARY {
-		if ck_legacy == 0 && fold_const(e) != 0 {
+		if fold_const(e) != 0 {
 			return adapt_int(e, want)
 		}
 		return chk_unary(e, want)
 	}
 	if k == EX_BINARY {
-		if ck_legacy == 0 && fold_const(e) != 0 {
+		if fold_const(e) != 0 {
 			return adapt_int(e, want)
 		}
-		if ck_legacy == 0 && fold_compare(e) != 0 {
+		if fold_compare(e) != 0 {
 			return ty_bool
 		}
 		return chk_binary(e, want)
@@ -324,7 +316,7 @@ fn starts_select(name i64) i64 {
 // runtime_use rejects user code naming a function only the standard library may use: a C
 // extern or one of the runtime's own (the trusted files outside any package).
 fn runtime_use(pos i64, f i64, name i64) {
-	if ck_legacy != 0 || ck_trusted != 0 || streq(name, cstr("rt_pool_used")) != 0 || streq(name, cstr("rt_once")) != 0 || streq(name, cstr("rt_scope_open")) != 0 || streq(name, cstr("rt_scope_close")) != 0 || streq(name, cstr("rt_detach")) != 0 || (i64(load8(name)) == 'r' && starts_select(name) != 0) {
+	if ck_trusted != 0 || streq(name, cstr("rt_pool_used")) != 0 || streq(name, cstr("rt_once")) != 0 || streq(name, cstr("rt_scope_open")) != 0 || streq(name, cstr("rt_scope_close")) != 0 || streq(name, cstr("rt_detach")) != 0 || (i64(load8(name)) == 'r' && starts_select(name) != 0) {
 		return
 	}
 	if f[F_EXTERN] != 0 || (vec_get(file_trusted, f[F_FILE]) != 0 && i64(load8(vec_get(file_pkgs, f[F_FILE]))) == 0) {
@@ -336,10 +328,6 @@ fn runtime_use(pos i64, f i64, name i64) {
 fn use_sym(e i64, s i64, want i64) i64 {
 	let k = s[S_KIND]
 	if k == SYM_FUNC {
-		if ck_legacy != 0 || s[S_FN][F_LEGACY] != 0 {
-			err_code_quoted(e[N_POS], cstr("E235 NOT_A_VALUE"), cstr("function "), e[ID_NAME], cstr(" used as a value"))
-			return ty_int
-		}
 		let f = s[S_FN]
 		runtime_use(e[N_POS], f, e[ID_NAME])
 		e[N_KIND] = EX_FUNCREF
@@ -426,7 +414,7 @@ fn chk_unary(e i64, want i64) i64 {
 			replace_node(e, x)
 			return xt
 		}
-		if ck_legacy == 0 && ck_trusted == 0 {
+		if ck_trusted == 0 {
 			err_code_at(e[N_POS], cstr("E801 TRUSTED_ONLY"), cstr("'&' on a variable is only allowed in the standard library"))
 		}
 		return ty_int
@@ -437,9 +425,6 @@ fn chk_unary(e i64, want i64) i64 {
 	}
 	let t = chk(x, want)
 	if streq(op, cstr("!")) != 0 {
-		if ck_legacy != 0 {
-			return ty_int
-		}
 		if is_bool_t(t) == 0 {
 			err_code_type(e[N_POS], cstr("E236 OPERATOR"), cstr("operator ! needs a bool, not "), t, cstr(""))
 		}
@@ -449,7 +434,7 @@ fn chk_unary(e i64, want i64) i64 {
 		return ty_bool
 	}
 	if streq(op, cstr("-")) != 0 {
-		if is_numeric_t(t) == 0 && ck_legacy == 0 {
+		if is_numeric_t(t) == 0 {
 			err_code_type(e[N_POS], cstr("E236 OPERATOR"), cstr("operator - needs a number, not "), t, cstr(""))
 		}
 		if x[N_KIND] == EX_FLOAT {
@@ -458,13 +443,13 @@ fn chk_unary(e i64, want i64) i64 {
 			e[N_TYPE] = 0
 			return ty_float
 		}
-		if x[N_KIND] == EX_INT && (kind_of(t) == K_UINT || ck_legacy != 0) {
+		if x[N_KIND] == EX_INT && (kind_of(t) == K_UINT) {
 			replace_node(e, mk_int(e[N_POS], -x[INT_VAL], 0))
 			return t
 		}
 		return t
 	}
-	if is_integer_t(t) == 0 && ck_legacy == 0 {
+	if is_integer_t(t) == 0 {
 		err_code_type(e[N_POS], cstr("E236 OPERATOR"), cstr("operator ^ needs an integer, not "), t, cstr(""))
 	}
 	if x[N_KIND] == EX_INT && kind_of(t) == K_UINT {
@@ -518,7 +503,7 @@ fn unify(l i64, r i64, want i64) i64 {
 	if lt != rt && secret_join(lt, rt) != 0 {
 		return secret_join(lt, rt)
 	}
-	if lt != rt && ck_legacy == 0 {
+	if lt != rt {
 		err_code_types(l[N_POS], cstr("E230 TYPE_MISMATCH"), cstr("mismatched types "), lt, cstr(" and "), rt)
 	}
 	return lt
@@ -588,9 +573,6 @@ fn chk_binary(e i64, want i64) i64 {
 		}
 		let b = chk(r, ty_bool)
 		narrow_end(narrowed)
-		if ck_legacy != 0 {
-			return ty_int
-		}
 		if is_bool_t(a) == 0 || is_bool_t(b) == 0 {
 			err_code_at(pos, cstr("E236 OPERATOR"), cstr("operands of && and || must be bool"))
 		}
@@ -599,10 +581,10 @@ fn chk_binary(e i64, want i64) i64 {
 	if streq(op, cstr("<<")) != 0 || streq(op, cstr(">>")) != 0 {
 		let st = chk(l, want)
 		let ct = chk(r, ty_int)
-		if is_integer_t(st) == 0 && ck_legacy == 0 {
+		if is_integer_t(st) == 0 {
 			err_code_type(pos, cstr("E236 OPERATOR"), cstr("cannot shift "), st, cstr(""))
 		}
-		if is_integer_t(ct) == 0 && ck_legacy == 0 {
+		if is_integer_t(ct) == 0 {
 			err_code_type(pos, cstr("E236 OPERATOR"), cstr("shift count must be an integer, not "), ct, cstr(""))
 		}
 		if kind_of(ct) == K_UINT {
@@ -627,25 +609,16 @@ fn chk_binary(e i64, want i64) i64 {
 	}
 	if is_cmp_op(op) != 0 {
 		let ordered = i64(streq(op, cstr("==")) == 0 && streq(op, cstr("!=")) == 0)
-		if ordered == 0 && kind_of(t) == K_STRUCT && t[TY_ENUM] != 0 && ck_legacy == 0 {
+		if ordered == 0 && kind_of(t) == K_STRUCT && t[TY_ENUM] != 0 {
 			return lower_enum_eq(e, op, l, r, t)
 		}
 		if kind_of(t) == K_STRING {
 			lower_str_cmp(e, op, l, r)
-			if ck_legacy != 0 {
-				return ty_int
-			}
 			return ty_bool
 		}
 		if l[N_KIND] == EX_INT && r[N_KIND] == EX_INT && kind_of(t) == K_UINT {
 			replace_node(e, mk_int(pos, eval_binary(op, l[INT_VAL], r[INT_VAL]), 0))
-			if ck_legacy != 0 {
-				return ty_int
-			}
 			return ty_bool
-		}
-		if ck_legacy != 0 {
-			return ty_int
 		}
 		if ordered != 0 && is_numeric_t(t) == 0 {
 			err_code_type(pos, cstr("E236 OPERATOR"), cstr("cannot order values of type "), t, cstr(""))
@@ -667,9 +640,6 @@ fn chk_binary(e i64, want i64) i64 {
 			return t
 		}
 		return ty_string
-	}
-	if ck_legacy != 0 {
-		return ty_int
 	}
 	if is_numeric_t(t) == 0 {
 		err_code_type(pos, cstr("E236 OPERATOR"), cstr("arithmetic on "), t, cstr(""))
@@ -774,9 +744,7 @@ fn enum_eq_fn(t i64) i64 {
 	vec_push(enum_eq_types, t)
 	vec_push(enum_eq_fns, f)
 	let saved_fn = ck_fn
-	let saved_legacy = ck_legacy
 	ck_fn = f
-	ck_legacy = 0
 	let pos = 0
 	let ls = vec_get(f[F_LOCALS], 0)
 	let rs = vec_get(f[F_LOCALS], 1)
@@ -812,7 +780,6 @@ fn enum_eq_fn(t i64) i64 {
 	ret[RET_VALUE] = x
 	vec_push(f[F_BODY][BLK_STMTS], ret)
 	ck_fn = saved_fn
-	ck_legacy = saved_legacy
 	return f
 }
 
@@ -1109,7 +1076,7 @@ fn key_dec_field(pos i64, body i64, s i64, obj i64, t i64, fi i64) {
 fn map_read(pos i64, m i64, k i64, vt i64) i64 {
 	let get = from_bits(rt_call(pos, cstr("rt_map_get"), args2(m, key_in(k, m[N_TYPE][TY_KEY])), ty_int), vt)
 	let vk = kind_of(vt)
-	if ck_legacy != 0 || !(vk == K_STRING || vk == K_SLICE || vk == K_MAP || vk == K_STRUCT) {
+	if !(vk == K_STRING || vk == K_SLICE || vk == K_MAP || vk == K_STRUCT) {
 		return get
 	}
 	let stmts = vec_new()
@@ -1148,8 +1115,8 @@ fn chk_index(e i64) i64 {
 	let x = e[IX_X]
 	let xt = chk(x, 0)
 	let k = kind_of(xt)
-	if ck_legacy != 0 || (k == K_INT && ck_trusted != 0) {
-		// Raw word indexing: legacy code and the runtime's own memory management.
+	if (k == K_INT && ck_trusted != 0) {
+		// Raw word indexing: trusted code (the runtime's own memory management, the compiler's records).
 		chk(e[IX_I], ty_int)
 		reconvert(e[IX_I], ty_int)
 		return ty_int
@@ -1270,9 +1237,6 @@ fn foreign_type(t i64) i64 {
 
 // private_use reports (once) a private name of another package used here.
 fn private_use(pos i64, what i64, name i64, owner i64) {
-	if ck_legacy != 0 {
-		return
-	}
 	let m = err_code(pos, cstr("E104 PRIVATE"))
 	buf_str(m, what)
 	buf_str(m, cstr(" "))
@@ -1757,10 +1721,8 @@ fn chk_funclit(e i64) i64 {
 	}
 
 	let saved_fn = ck_fn
-	let saved_legacy = ck_legacy
 	declare_fn(f)
 	ck_fn = saved_fn
-	ck_legacy = saved_legacy
 
 	check_fn_closure(f)
 	sb_captures(e, f)
@@ -1885,16 +1847,16 @@ fn chk_unit(e i64, want i64) i64 {
 fn chk_boundary(e i64) i64 {
 	let pos = e[N_POS]
 	let kind = e[BOUND_KIND]
-	if ck_legacy == 0 && kind == BOUND_PARALLEL {
+	if kind == BOUND_PARALLEL {
 		return chk_parallel(e)
 	}
-	if ck_legacy == 0 && kind == BOUND_WITH {
+	if kind == BOUND_WITH {
 		return chk_with(e)
 	}
-	if ck_legacy == 0 && kind == BOUND_ARENA {
+	if kind == BOUND_ARENA {
 		return chk_arena(e)
 	}
-	if ck_legacy != 0 || (kind != BOUND_WITHIN && kind != BOUND_GUARD && kind != BOUND_LIMIT) {
+	if (kind != BOUND_WITHIN && kind != BOUND_GUARD && kind != BOUND_LIMIT) {
 		err_code_at(pos, cstr("E650 BOUNDARY"), cstr("this boundary block is not supported yet"))
 		return ty_int
 	}
@@ -2759,7 +2721,7 @@ fn with_adapter(pos i64, w i64, ct i64, bt i64, tt i64, vt i64) i64 {
 // ---- calls ----
 // mask has bit i set when parameter i is mut: its argument must be written `mut x`
 // (a method's receiver, argument 0 of a CALL_METHOD call, is exempt).
-fn chk_args(e i64, ptypes i64, variadic i64, legacy i64, mask i64) {
+fn chk_args(e i64, ptypes i64, variadic i64, mask i64) {
 	let args = e[CALL_ARGS]
 	let n = ptypes[VEC_LEN]
 	if args[VEC_LEN] != n && !(variadic != 0 && args[VEC_LEN] >= n) {
@@ -2779,7 +2741,7 @@ fn chk_args(e i64, ptypes i64, variadic i64, legacy i64, mask i64) {
 	for i < args[VEC_LEN] {
 		let a = vec_get(args, i)
 		let marked = unwrap_mut(a)
-		if legacy == 0 && ck_legacy == 0 && !(i == 0 && e[CALL_METHOD] != 0) {
+		if !(i == 0 && e[CALL_METHOD] != 0) {
 			let pm = i64(i < n && i < 63 && (mask & (1 << i)) != 0)
 			if pm != 0 && marked == 0 {
 				mut_arg_error(e, a, i, cstr("is a mut parameter: write mut before the argument"))
@@ -2793,15 +2755,13 @@ fn chk_args(e i64, ptypes i64, variadic i64, legacy i64, mask i64) {
 		}
 		let adesc = secret_desc(a)
 		let at = chk(a, want)
-		if i < n && legacy == 0 {
+		if i < n {
 			secret_arg(e, i, adesc, at, want)
 			check_assignable(a, at, want)
 			secret_arg_done()
 			if is_untyped(at) != 0 {
 				reconvert(a, want)
 			}
-		} else if i < n && legacy != 0 && is_float_t(at) != 0 {
-			err_code_at(a[N_POS], cstr("E230 TYPE_MISMATCH"), cstr("cannot pass a f64 to an untyped (fn) parameter"))
 		}
 		if i >= n && is_untyped(at) != 0 {
 			reconvert(a, default_type(at))
@@ -2866,7 +2826,7 @@ fn direct_call(e i64, f i64) i64 {
 	}
 	e[CALL_FN] = f
 	e[CALL_CALLEE] = 0
-	chk_args(e, f[F_PTYPES], f[F_VARIADIC], f[F_LEGACY], mut_mask(f[F_MUTS]))
+	chk_args(e, f[F_PTYPES], f[F_VARIADIC], mut_mask(f[F_MUTS]))
 	return result_type(f)
 }
 
@@ -2890,7 +2850,7 @@ fn chk_call(e i64, want i64) i64 {
 		if s == 0 {
 			let n = intrinsic_arity(name)
 			if n >= 0 {
-				if ck_legacy == 0 && ck_trusted == 0 {
+				if ck_trusted == 0 {
 					err_code_quoted(e[N_POS], cstr("E802 RUNTIME_INTERNAL"), cstr(""), name, cstr(" is internal to the runtime"))
 				}
 				e[CALL_INTRINSIC] = 1
@@ -2904,7 +2864,7 @@ fn chk_call(e i64, want i64) i64 {
 					reconvert(a, ty_int)
 					i = i + 1
 				}
-				if streq(name, cstr("load8")) != 0 && ck_legacy == 0 {
+				if streq(name, cstr("load8")) != 0 {
 					return ty_byte
 				}
 				return ty_int
@@ -3062,7 +3022,7 @@ fn lower_dyn_method_call(e i64, receiver i64, dt i64, name i64) i64 {
 		i = i + 1
 	}
 	e[CALL_NAME] = name
-	chk_args(e, ps, variadic, 0, mutmask)
+	chk_args(e, ps, variadic, mutmask)
 
 	// A method receiver may itself be an expression with effects. Store its pair once;
 	// both the object argument and descriptor lookup then read the same value.
@@ -3136,7 +3096,7 @@ fn indirect_call(e i64) i64 {
 		return ty_int
 	}
 	e[CALL_FN] = 0
-	chk_args(e, ft[TY_FIELDS], 0, 0, ft[TY_KEY])
+	chk_args(e, ft[TY_FIELDS], 0, ft[TY_KEY])
 	return func_result(ft)
 }
 
@@ -3247,7 +3207,7 @@ fn chk_builtin(e i64, name i64, want i64) i64 {
 	let pos = e[N_POS]
 	let args = e[CALL_ARGS]
 	let n = args[VEC_LEN]
-	if streq(name, cstr("bound")) != 0 && ck_legacy == 0 {
+	if streq(name, cstr("bound")) != 0 {
 		return chk_bound(e, want)
 	}
 	if streq(name, cstr("len")) != 0 || streq(name, cstr("cap")) != 0 {
@@ -3347,16 +3307,16 @@ fn chk_builtin(e i64, name i64, want i64) i64 {
 			let ek = kind_of(t[TY_ELEM])
 			let len0 = vec_get(args, 1)
 			let zero_len = i64(len0[N_KIND] == EX_INT && len0[INT_VAL] == 0)
-			if ck_legacy == 0 && zero_len == 0 && (ek == K_STRUCT || ek == K_MAP || ek == K_FUNC || ek == K_DYN) {
+			if zero_len == 0 && (ek == K_STRUCT || ek == K_MAP || ek == K_FUNC || ek == K_DYN) {
 				err_code_type(pos, cstr("E203 NO_ZERO_VALUE"), cstr("make with a length would fill the slice with nil "), t[TY_ELEM], cstr(" values: use make([]T, 0, n) and append (or []?T)"))
 				return t
 			}
-			if ck_legacy == 0 && zero_len == 0 && ek == K_STRING {
+			if zero_len == 0 && ek == K_STRING {
 				// Elements start as "" (a str is never nil).
 				replace_node(e, rt_call(pos, cstr("rt_slice_make_str"), args2(vec_get(args, 1), c), t))
 				return t
 			}
-			if ck_legacy == 0 && zero_len == 0 && ek == K_SLICE {
+			if zero_len == 0 && ek == K_SLICE {
 				replace_node(e, rt_call(pos, cstr("rt_slice_make_nest"), args3(vec_get(args, 1), c, mk_int(pos, elem_size(t[TY_ELEM]), ty_int)), t))
 				return t
 			}
@@ -3392,7 +3352,7 @@ fn chk_builtin(e i64, name i64, want i64) i64 {
 		return chk_kind(e, t)
 	}
 	if streq(name, cstr("cast")) != 0 {
-		if ck_legacy == 0 && ck_trusted == 0 {
+		if ck_trusted == 0 {
 			err_code_at(pos, cstr("E802 RUNTIME_INTERNAL"), cstr("cast is internal to the runtime"))
 		}
 		if n != 2 || arg0(e)[N_KIND] != EX_TYPE {
@@ -3491,7 +3451,7 @@ fn chk_builtin(e i64, name i64, want i64) i64 {
 		e[N_TYPE] = 0
 		return ty_error
 	}
-	if streq(name, cstr("fault")) != 0 && ck_legacy == 0 {
+	if streq(name, cstr("fault")) != 0 {
 		// var ErrX = fault("msg") declares a sentinel: one identity per declaration (fault.Is).
 		if n != 1 {
 			err_code_at(pos, cstr("E417 SENTINEL"), cstr("fault needs a message: var ErrX = fault(\"...\")"))
@@ -3519,7 +3479,7 @@ fn chk_builtin(e i64, name i64, want i64) i64 {
 		}
 		return lower_keep(e, want)
 	}
-	if streq(name, cstr("reveal")) != 0 && ck_legacy == 0 {
+	if streq(name, cstr("reveal")) != 0 {
 		return secret_reveal(e)
 	}
 	if streq(name, cstr("print")) != 0 || streq(name, cstr("println")) != 0 {
@@ -3666,7 +3626,7 @@ fn lower_argo_put(e i64) i64 {
 		return ty_void
 	}
 	let b = vec_get(args, 0)
-	if unwrap_mut(b) == 0 && ck_legacy == 0 {
+	if unwrap_mut(b) == 0 {
 		err_code_at(b[N_POS], cstr("E281 ARGO"), cstr("argo.Put appends to its buffer: write mut before it"))
 	}
 	let bt = chk(b, 0)
@@ -3967,7 +3927,7 @@ fn lower_argo_get(e i64) i64 {
 		err_code_at(pos, cstr("E281 ARGO"), cstr("argo.Get takes the JSON text and a struct, slice or map to fill"))
 		return ty_error
 	}
-	if unwrap_mut(vec_get(args, 1)) == 0 && ck_legacy == 0 {
+	if unwrap_mut(vec_get(args, 1)) == 0 {
 		err_code_at(vec_get(args, 1)[N_POS], cstr("E281 ARGO"), cstr("argo.Get fills its target: write mut before it"))
 	}
 	let s = vec_get(args, 0)
@@ -5006,9 +4966,6 @@ shared mut say_temps i64 // hidden locals say_hoist has made, for their names
 // hidden locals before the formatting frame opens: the frame is the core's, so a call that
 // runs other tasks (anvil.Serve in say.Line) must not run while it is open (#347).
 fn say_hoist(pos i64, args i64, first i64, stmts i64) i64 {
-	if ck_legacy != 0 {
-		return 0
-	}
 	mut i = first
 	for i < args[VEC_LEN] {
 		let a = vec_get(args, i)

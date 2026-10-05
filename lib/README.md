@@ -11,7 +11,6 @@ lib/
   postgres/       the PostgreSQL client
     md5/          a nested package, imported as "postgres/md5"
     sasl/         imported as "postgres/sasl"
-  std.tin         legacy helpers for the compiler's own build; not a package
   ...
 ```
 
