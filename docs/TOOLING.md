@@ -378,6 +378,10 @@ one-line comment above every exported declaration.
 `bin/tinc -o /tmp/gencoverage tools/gencoverage.tin && /tmp/gencoverage` rewrites
 `docs/COVERAGE.md` from the maintained inventory in `notes/coverage.md`.
 
+`python3 tools/legacy2tin.py [--analyze FILE]... FILE...` converts files of the compiler's untyped word
+dialect to typed edition 1 written with `i64` words (#228); a one-time migration tool, kept until the
+dialect is gone.
+
 `python3 tools/gen_unicode.py` rewrites `lib/glyph/tables.tin` and `lib/runtime/printable.tin` (the Unicode
 tables) from Go's `unicode/tables.go`; it needs a Go tree only to read that one file.
 
