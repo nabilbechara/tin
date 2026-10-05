@@ -378,6 +378,12 @@ fn use_sym(e i64, s Sym, want i64) i64 {
 	if s.type_ == 0 {
 		return ty_int
 	}
+	if s.unbox != 0 {
+		// A narrowed ?number: the variable holds the box.
+		let base = sym_ref_node(cast(Node, e).pos, s)
+		cast(Node, base).type_ = ty_int
+		replace_node(e, mk_mem(cast(Node, e).pos, base, 0, 0, 0, s.type_))
+	}
 	return s.type_
 }
 
@@ -573,6 +579,9 @@ fn chk_binary(e i64, want i64) i64 {
 		mut narrowed = cast([]i64, 0)
 		if streq(op, cstr("&&")) != 0 {
 			narrowed = narrow_begin(l, 1)
+		} else {
+			// x == nil || x.f: the right side runs only when x != nil.
+			narrowed = narrow_begin(l, 0)
 		}
 		let b = chk(cast(Node, r), ty_bool)
 		narrow_end(cast([]Sym, narrowed))
@@ -614,6 +623,9 @@ fn chk_binary(e i64, want i64) i64 {
 		let ordered = i64(streq(op, cstr("==")) == 0 && streq(op, cstr("!=")) == 0)
 		if ordered == 0 && kind_of(t) == K_STRUCT {
 			return lower_enum_eq(cast(Node, e), op, l, r, cast(i64, t))
+		}
+		if ordered == 0 && kind_of(t) == K_OPT && opt_scalar(t) != 0 && is_nil_lit(l) == 0 && is_nil_lit(r) == 0 {
+			return lower_optnum_eq(cast(Node, e), op, l, r, t)
 		}
 		if kind_of(t) == K_STRING {
 			lower_str_cmp(cast(Node, e), op, l, r)
@@ -706,6 +718,33 @@ fn value_incomparable(t Ty, depth i64) i64 {
 	return 0
 }
 
+// is_nil_lit reports whether the checked expression e is the literal nil (an integer 0).
+fn is_nil_lit(e i64) i64 {
+	return i64(cast(Node, e).kind == EX_INT && cast(IntLit, e).val == 0 && kind_of(cast(Ty, cast(Node, e).type_)) == K_OPT)
+}
+
+// lower_optnum_eq compares two optional numbers by value: both nil, or both set and equal (#353).
+fn lower_optnum_eq(e Node, op i64, l i64, r i64, t Ty) i64 {
+	let pos = e.pos
+	mut stmts = []i64{}
+	let a = temp(pos, l, cast(i64, t))
+	let b = temp(pos, r, cast(i64, t))
+	stmts = append(stmts, cast(i64, a))
+	stmts = append(stmts, cast(i64, b))
+	let ar = sym_ref_node(pos, cast(Sym, a.sym))
+	let br = sym_ref_node(pos, cast(Sym, b.sym))
+	let both_nil = mk_bin(pos, cstr("&&"), mk_bin(pos, cstr("=="), ar, mk_int(pos, 0, cast(i64, t)), ty_bool), mk_bin(pos, cstr("=="), br, mk_int(pos, 0, cast(i64, t)), ty_bool), ty_bool)
+	let sa = mk_mem(pos, sym_ref_node(pos, cast(Sym, a.sym)), 0, 0, 0, opt_scalar(t))
+	let sb = mk_mem(pos, sym_ref_node(pos, cast(Sym, b.sym)), 0, 0, 0, opt_scalar(t))
+	let both_set = mk_bin(pos, cstr("&&"), mk_bin(pos, cstr("!="), sym_ref_node(pos, cast(Sym, a.sym)), mk_int(pos, 0, cast(i64, t)), ty_bool), mk_bin(pos, cstr("&&"), mk_bin(pos, cstr("!="), sym_ref_node(pos, cast(Sym, b.sym)), mk_int(pos, 0, cast(i64, t)), ty_bool), mk_bin(pos, cstr("=="), sa, sb, ty_bool), ty_bool), ty_bool)
+	mut x = mk_seq(pos, cast(i64, stmts), mk_bin(pos, cstr("||"), both_nil, both_set, ty_bool), ty_bool)
+	if streq(op, cstr("!=")) != 0 {
+		x = mk_unot(pos, x)
+	}
+	replace_node(cast(i64, e), x)
+	return ty_bool
+}
+
 shared mut enum_eq_types []i64
 shared mut enum_eq_fns []i64
 
@@ -753,13 +792,13 @@ fn enum_eq_fn(t Ty) i64 {
 		}
 		i = i + 1
 	}
-	let names = []i64{}
+	mut names = []i64{}
 	names = append(names, cstr("a"))
 	names = append(names, cstr("b"))
-	let types = []i64{}
+	mut types = []i64{}
 	types = append(types, cast(i64, t))
 	types = append(types, cast(i64, t))
-	let rts = []i64{}
+	mut rts = []i64{}
 	rts = append(rts, ty_bool)
 	let f = lifted_fn(cstr("eq"), names, cast([]i64, types), cast(i64, rts))
 	mut vs1 = cast([]i64, enum_eq_types)
@@ -888,7 +927,7 @@ fn key_in(e Node, kt i64) i64 {
 		return to_bits(e)
 	}
 	let pos = e.pos
-	let stmts = []i64{}
+	mut stmts = []i64{}
 	let b = temp(pos, rt_call(pos, cstr("rt_kb_new"), cast(i64, []i64{}), ty_int), ty_int)
 	stmts = append(stmts, cast(i64, b))
 	stmts = append(stmts, assign_stmt(pos, sym_ref_node(pos, cast(Sym, b.sym)), cast(i64, call_fn(pos, cast(Fn, key_enc_fn(cast(Ty, kt))), args2(sym_ref_node(pos, cast(Sym, b.sym)), cast(i64, e)), ty_int))))
@@ -901,7 +940,7 @@ fn key_out(e Node, kt i64) i64 {
 		return from_bits(e, kt)
 	}
 	let pos = e.pos
-	let stmts = []i64{}
+	mut stmts = []i64{}
 	stmts = append(stmts, expr_stmt(cast(Node, rt_call(pos, cstr("rt_kd_begin"), cast(i64, []i64{}), ty_void))))
 	return mk_seq(pos, cast(i64, stmts), cast(i64, call_fn(pos, cast(Fn, key_dec_fn(cast(Ty, kt))), args1(mk_conv(pos, cast(i64, e), CV_SAME, ty_string)), kt)), kt)
 }
@@ -972,13 +1011,13 @@ fn key_enc_fn(t Ty) i64 {
 		}
 		i = i + 1
 	}
-	let names = []i64{}
+	mut names = []i64{}
 	names = append(names, cstr("b"))
 	names = append(names, cstr("x"))
-	let types = []i64{}
+	mut types = []i64{}
 	types = append(types, ty_int)
 	types = append(types, cast(i64, t))
-	let rts = []i64{}
+	mut rts = []i64{}
 	rts = append(rts, ty_int)
 	let f = lifted_fn(cstr("keyenc"), names, cast([]i64, types), cast(i64, rts))
 	mut vs1 = cast([]i64, key_enc_types)
@@ -1054,11 +1093,11 @@ fn key_dec_fn(t Ty) i64 {
 		}
 		i = i + 1
 	}
-	let names = []i64{}
+	mut names = []i64{}
 	names = append(names, cstr("s"))
-	let types = []i64{}
+	mut types = []i64{}
 	types = append(types, ty_string)
-	let rts = []i64{}
+	mut rts = []i64{}
 	rts = append(rts, cast(i64, t))
 	let f = lifted_fn(cstr("keydec"), names, cast([]i64, types), cast(i64, rts))
 	mut vs1 = cast([]i64, key_dec_types)
@@ -1128,7 +1167,7 @@ fn map_read(pos i64, m Node, k i64, vt i64) i64 {
 	if !(vk == K_STRING || vk == K_SLICE || vk == K_MAP || vk == K_STRUCT) {
 		return get
 	}
-	let stmts = []i64{}
+	mut stmts = []i64{}
 	let tmp = temp(pos, get, vt)
 	stmts = append(stmts, cast(i64, tmp))
 	let ifs = cast(IfStmt, node_new(ST_IF, pos))
@@ -1390,7 +1429,7 @@ fn enum_construct(e Node, t Ty, name i64, args []i64) i64 {
 		err_end(cast([]u8, u))
 		return cast(i64, t)
 	}
-	let stmts = []i64{}
+	mut stmts = []i64{}
 	let obj = temp(pos, rt_call(pos, cstr("rt_alloc"), args1(mk_int(pos, t.size, ty_int)), cast(i64, t)), cast(i64, t))
 	stmts = append(stmts, cast(i64, obj))
 	stmts = append(stmts, assign_stmt(pos, field_store(pos, sym_ref_node(pos, cast(Sym, obj.sym)), cast(i64, t), 0), mk_int(pos, vi, ty_int)))
@@ -1524,7 +1563,7 @@ fn chk_composite(e i64, want i64) i64 {
 	}
 	let elems = cast(Composite, e).elems
 	let keys = cast(Composite, e).keys
-	let stmts = []i64{}
+	mut stmts = []i64{}
 	let k = kind_of(t)
 	if k == K_STRUCT && cast(i64, t.enum_) != 0 {
 		err_code_type(pos, cstr("E216 COMPOSITE"), cstr("build an enum with one of its variants ("), cast(i64, t), cstr(".Variant(...)), not a composite literal"))
@@ -1793,7 +1832,7 @@ fn chk_funclit(e i64) i64 {
 	cast(FuncRef, fn_ref).raw = 1
 	cast(Node, fn_ref).type_ = ty_int
 
-	let stmts = []i64{}
+	mut stmts = []i64{}
 	mut desc_val = 0
 
 	if cast(FuncLit, e).escape == 0 {
@@ -1968,7 +2007,7 @@ fn chk_boundary(e i64) i64 {
 	let cargs = cast([]i64, args2(cast(i64, lit), arg))
 	cargs = append(cargs, arg2)
 	cast(Call, c).args = cast([]i64, cargs)
-	let results = []i64{}
+	mut results = []i64{}
 	if kind_of(cast(Ty, vt)) != K_VOID {
 		results = append(results, vt)
 	}
@@ -1988,8 +2027,8 @@ fn chk_boundary(e i64) i64 {
 fn chk_parallel(e i64) i64 {
 	let pos = cast(Node, e).pos
 	let stmts = cast(Block, cast(BoundaryStmt, e).body).stmts
-	let lits = []i64{}
-	let vts = []i64{}
+	mut lits = []i64{}
+	mut vts = []i64{}
 	mut i = 0
 	for i < len(stmts) {
 		let st = stmts[i]
@@ -2040,14 +2079,14 @@ fn chk_parallel(e i64) i64 {
 	let c = node_new(EX_CALL, pos)
 	cast(Call, c).name = w.name
 	cast(Call, c).fn_ = cast(i64, w)
-	let args = []i64{}
+	mut args = []i64{}
 	i = 0
 	for i < len(cast([]i64, lits)) {
 		args = append(args, cast([]i64, lits[i])[0])
 		i = i + 1
 	}
 	cast(Call, c).args = cast([]i64, args)
-	let results = []i64{}
+	mut results = []i64{}
 	i = 0
 	for i < len(cast([]i64, vts)) {
 		results = append(results, vts[i])
@@ -2089,7 +2128,7 @@ fn parallel_wrapper(pos i64, lits []i64, vts []i64) i64 {
 	prog_fns = append(prog_fns, cast(Fn, f))
 	let saved_fn = ck_fn
 	ck_fn = cast(Fn, f)
-	let syms = []Sym{}
+	mut syms = []Sym{}
 	i = 0
 	for i < n {
 		let cs = sym_new(SYM_LOCAL, cstr("c"), pos)
@@ -2124,7 +2163,7 @@ fn parallel_wrapper(pos i64, lits []i64, vts []i64) i64 {
 	vs6 = append(vs6, fault_return(pos, cast(Block, ifs.then).stmts, sym_ref_node(pos, cast(Sym, fe.sym))))
 	body = append(body, cast(i64, ifs))
 	let ret = cast(ReturnStmt, node_new(ST_RETURN, pos))
-	let rv = []i64{}
+	mut rv = []i64{}
 	i = 0
 	for i < n {
 		rv = append(rv, mk_mem(pos, sym_ref_node(pos, cast(Sym, r.sym)), 0, 0, 16 * i, vts[i]))
@@ -2181,7 +2220,7 @@ fn bound_leaves(v []i64) {
 }
 
 fn one_elem_slice(x i64) i64 {
-	let v = []i64{}
+	mut v = []i64{}
 	v = append(v, x)
 	return cast(i64, v)
 }
@@ -2263,7 +2302,7 @@ fn boundary_wrapper(pos i64, kind i64, ct i64, vt i64) i64 {
 	if kind_of(cast(Ty, vt)) == K_VOID {
 		ret.value = mk_int(pos, 0, ty_error)
 	} else {
-		let rv = []i64{}
+		mut rv = []i64{}
 		rv = append(rv, mk_mem(pos, sym_ref_node(pos, cast(Sym, r.sym)), 0, 0, 0, vt))
 		rv = append(rv, mk_int(pos, 0, ty_error))
 		ret.values = cast([]i64, rv)
@@ -2330,7 +2369,7 @@ fn chk_arena(e i64) i64 {
 	cast(Call, c).name = w.name
 	cast(Call, c).fn_ = cast(i64, w)
 	cast(Call, c).args = cast([]i64, args1(cast(i64, lit)))
-	let results = []i64{}
+	mut results = []i64{}
 	if kind_of(cast(Ty, vt)) != K_VOID {
 		results = append(results, vt)
 	}
@@ -2429,7 +2468,7 @@ fn arena_wrapper(pos i64, ct i64, vt i64, fails i64) i64 {
 		body = append(body, cast(i64, ifs2))
 	}
 	let ret = cast(ReturnStmt, node_new(ST_RETURN, pos))
-	let rv = []i64{}
+	mut rv = []i64{}
 	if kind_of(cast(Ty, vt)) != K_VOID {
 		rv = append(rv, mk_mem(pos, sym_ref_node(pos, cast(Sym, r.sym)), 0, 0, 0, vt))
 	}
@@ -2551,7 +2590,7 @@ fn chk_with(e i64) i64 {
 	cast(Call, c).args = cast([]i64, args2(cast(i64, lit), cast(i64, pe)))
 	mut rt = ty_error
 	if kind_of(cast(Ty, vt)) != K_VOID {
-		let results = []i64{}
+		mut results = []i64{}
 		results = append(results, vt)
 		results = append(results, ty_error)
 		rt = tuple_of(cast(i64, results))
@@ -2566,7 +2605,7 @@ fn chk_with(e i64) i64 {
 fn with_failed(e Node, vt i64) i64 {
 	mut rt = ty_error
 	if kind_of(cast(Ty, vt)) != K_VOID {
-		let results = []i64{}
+		mut results = []i64{}
 		results = append(results, vt)
 		results = append(results, ty_error)
 		rt = tuple_of(cast(i64, results))
@@ -2714,7 +2753,7 @@ fn with_wrapper(pos i64, ct i64, pt i64, bt i64, tt i64, vt i64) i64 {
 	if kind_of(cast(Ty, vt)) == K_VOID {
 		ret.value = mk_int(pos, 0, ty_error)
 	} else {
-		let rv = []i64{}
+		mut rv = []i64{}
 		rv = append(rv, sym_ref_node(pos, cast(Sym, vs)))
 		rv = append(rv, mk_int(pos, 0, ty_error))
 		ret.values = cast([]i64, rv)
@@ -2770,7 +2809,7 @@ fn with_adapter(pos i64, w Fn, ct i64, bt Ty, tt i64, vt i64) i64 {
 	if kind_of(cast(Ty, tt)) == K_VOID {
 		ret.value = mk_int(pos, 0, ty_error)
 	} else {
-		let rv = []i64{}
+		mut rv = []i64{}
 		if kind_of(cast(Ty, vt)) == K_VOID && is_float_t(tt) != 0 {
 			rv = append(rv, zero_value(pos, tt))
 		} else if kind_of(cast(Ty, vt)) == K_VOID {
@@ -3023,7 +3062,7 @@ fn chk_call(e i64, want i64) i64 {
 				private_use(cast(Node, e).pos, cstr("method"), m, type_pkg(xt))
 			}
 			if cast(i64, mf) != 0 {
-				let args = []i64{}
+				mut args = []i64{}
 				args = append(args, x)
 				mut i = 0
 				for i < len(cast(Call, e).args) {
@@ -3101,7 +3140,7 @@ fn lower_dyn_method_call(e i64, receiver i64, dt Ty, name i64) i64 {
 	let receiver_temp = temp(pos, receiver, cast(i64, dt))
 	let receiver_ref = sym_ref_node(pos, cast(Sym, receiver_temp.sym))
 	let object = mk_conv(pos, receiver_ref, CV_DYN_OBJECT, ty_int)
-	let desc_params = []i64{}
+	mut desc_params = []i64{}
 	desc_params = append(desc_params, ty_int)
 	i = 0
 	for i < len(ps) {
@@ -3133,7 +3172,7 @@ fn lower_dyn_method_call(e i64, receiver i64, dt Ty, name i64) i64 {
 	cast(Call, inner).dyn_shape = cast(i64, dt)
 	cast(Call, inner).dyn_index = info[0]
 	cast(Node, inner).type_ = func_result(cast(Ty, ft))
-	let stmts = []i64{}
+	mut stmts = []i64{}
 	stmts = append(stmts, cast(i64, receiver_temp))
 	replace_node(e, mk_seq(pos, cast(i64, stmts), inner, cast(Node, inner).type_))
 	return cast(Node, inner).type_
@@ -3182,7 +3221,7 @@ fn lower_append_dyn(pos i64, slice i64, value i64, st Ty) i64 {
 	let object = mk_conv(pos, ref_, CV_DYN_OBJECT, ty_int)
 	let table = mk_conv(pos, ref_, CV_DYN_TABLE_WORD, ty_int)
 	let call = rt_call(pos, cstr("rt_append_dyn"), args3(slice, object, table), cast(i64, st))
-	let stmts = []i64{}
+	mut stmts = []i64{}
 	stmts = append(stmts, cast(i64, saved))
 	return mk_seq(pos, cast(i64, stmts), call, cast(i64, st))
 }
@@ -3612,7 +3651,7 @@ fn lower_minmax(e i64, name i64, want i64) i64 {
 		err_code_type(pos, cstr("E237 COMPARE"), cstr("cannot compare "), t, cstr(""))
 	}
 	// acc := a; if b < acc { acc = b }  (compiled to csel)
-	let stmts = []i64{}
+	mut stmts = []i64{}
 	let acc = temp(pos, arg0(cast(Call, e)), t)
 	stmts = append(stmts, cast(i64, acc))
 	mut op = cstr("<")
@@ -3692,6 +3731,21 @@ fn lower_keep(e Node, want i64) i64 {
 		cast(Node, c).region = R_OWNED
 		replace_node(cast(i64, e), c)
 		return t
+	}
+	if is_ref(t) == 0 && kind_of(cast(Ty, want)) == K_OPT && opt_scalar(cast(Ty, want)) != 0 && assignable(cast(Ty, t), cast(Ty, opt_scalar(cast(Ty, want)))) != 0 {
+		// keep(n) where ?number is wanted: the box lives in long-lived memory.
+		let bx = cast(Ty, cast(Ty, want).elem)
+		mut stmts = []i64{}
+		let obj = temp(pos, rt_call(pos, cstr("rt_ingot_alloc"), args1(mk_int(pos, bx.size, ty_int)), cast(i64, bx)), cast(i64, bx))
+		stmts = append(stmts, cast(i64, obj))
+		if is_untyped(t) != 0 {
+			reconvert(cast(Node, x), opt_scalar(cast(Ty, want)))
+		}
+		stmts = append(stmts, assign_stmt(pos, field_store(pos, sym_ref_node(pos, cast(Sym, obj.sym)), cast(i64, bx), 0), x))
+		let seq = mk_seq(pos, cast(i64, stmts), sym_ref_node(pos, cast(Sym, obj.sym)), want)
+		cast(Node, seq).region = R_OWNED
+		replace_node(cast(i64, e), seq)
+		return want
 	}
 	if is_ref(t) == 0 {
 		replace_node(cast(i64, e), x)
@@ -3939,6 +3993,8 @@ fn argo_fn(pos i64, t Ty) i64 {
 		ifs.else_ = cast(i64, els)
 		if k == K_ERROR {
 			argo_emit(pos, els.stmts, cast(i64, b), mk_conv(pos, sym_ref_node(pos, x), CV_SAME, ty_string), cast(Ty, ty_string))
+		} else if opt_scalar(t) != 0 {
+			argo_emit(pos, els.stmts, cast(i64, b), mk_mem(pos, sym_ref_node(pos, x), 0, 0, 0, opt_scalar(t)), cast(Ty, opt_scalar(t)))
 		} else {
 			argo_emit(pos, els.stmts, cast(i64, b), mk_conv(pos, sym_ref_node(pos, x), CV_SAME, t.elem), cast(Ty, t.elem))
 		}
@@ -4050,7 +4106,7 @@ fn lower_argo_get(e i64, strict i64) i64 {
 	if pt == 0 || df == 0 {
 		return ty_error
 	}
-	let stmts = []i64{}
+	mut stmts = []i64{}
 	mut ctor = cstr("argo.parser")
 	if strict != 0 {
 		ctor = cstr("argo.strictly")
@@ -4243,6 +4299,28 @@ fn argo_value(pos i64, body []i64, p i64, t Ty) i64 {
 		}
 		body = append(body, expr_stmt(call_fn(pos, cast(Fn, df), args2(sym_ref_node(pos, cast(Sym, p)), sym_ref_node(pos, cast(Sym, obj.sym))), ty_void)))
 		return sym_ref_node(pos, cast(Sym, obj.sym))
+	}
+	if k == K_OPT && opt_scalar(t) != 0 {
+		// ?number and ?bool: null is nil, else the number goes in a box.
+		let bx = cast(Ty, t.elem)
+		let out = declare_local(pos, cstr("$"), cast(i64, t))
+		body = append(body, let_stmt(pos, cast(Sym, out), mk_int(pos, 0, cast(i64, t))))
+		let ifs = cast(IfStmt, node_new(ST_IF, pos))
+		ifs.cond = mk_unot(pos, argo_rd(pos, p, cstr("argo.rnull"), ty_bool))
+		ifs.then = empty_block(pos)
+		let inner = argo_value(pos, cast(Block, ifs.then).stmts, p, cast(Ty, opt_scalar(t)))
+		if inner == 0 {
+			return 0
+		}
+		let obj = temp(pos, rt_call(pos, cstr("rt_alloc"), args1(mk_int(pos, bx.size, ty_int)), cast(i64, bx)), cast(i64, bx))
+		mut vp1 = cast(Block, ifs.then).stmts
+		vp1 = append(vp1, cast(i64, obj))
+		mut vp2 = cast(Block, ifs.then).stmts
+		vp2 = append(vp2, assign_stmt(pos, field_store(pos, sym_ref_node(pos, cast(Sym, obj.sym)), cast(i64, bx), 0), inner))
+		mut vp3 = cast(Block, ifs.then).stmts
+		vp3 = append(vp3, assign_stmt(pos, sym_ref_node(pos, cast(Sym, out)), mk_conv(pos, sym_ref_node(pos, cast(Sym, obj.sym)), CV_SAME, cast(i64, t))))
+		body = append(body, cast(i64, ifs))
+		return sym_ref_node(pos, cast(Sym, out))
 	}
 	if k == K_OPT {
 		let et = t.elem
@@ -4616,8 +4694,11 @@ fn argo_vval(pos i64, body []i64, p i64, t Ty) {
 		return
 	}
 	if k == K_OPT {
-		let et = t.elem
-		if is_ref(et) == 0 || kind_of(cast(Ty, et)) == K_FUNC {
+		mut et = t.elem
+		if opt_scalar(t) != 0 {
+			et = opt_scalar(t)
+		}
+		if is_ref(et) == 0 && opt_scalar(t) == 0 || kind_of(cast(Ty, et)) == K_FUNC {
 			return
 		}
 		let ifs = cast(IfStmt, node_new(ST_IF, pos))
@@ -4871,6 +4952,8 @@ fn say_arg(a Node, prefix i64) Node {
 			suffix = cstr("slt")
 		} else if ek == K_INT {
 			return cast(Node, rt_call(pos, str_cat3(prefix, cstr("slint"), cstr("")), args3(cast(i64, a), mk_int(pos, type_width(cast(Ty, et)), ty_int), mk_int(pos, cast(Ty, et).signed, ty_int)), ty_void))
+		} else if ek == K_OPT && opt_scalar(cast(Ty, et)) != 0 {
+			return cast(Node, say_optnum_slice(a, t, prefix))
 		} else if ek == K_STRUCT && cast(i64, cast(Ty, et).enum_) != 0 {
 			return cast(Node, say_enum_slice(a, t, prefix))
 		} else if ek == K_STRUCT {
@@ -4878,7 +4961,7 @@ fn say_arg(a Node, prefix i64) Node {
 		} else {
 			suffix = cstr("slp")
 		}
-	} else if k == K_OPT && kind_of(cast(Ty, t.elem)) != K_STRUCT && kind_of(cast(Ty, t.elem)) != K_DYN {
+	} else if k == K_OPT && (opt_scalar(t) != 0 || (kind_of(cast(Ty, t.elem)) != K_STRUCT && kind_of(cast(Ty, t.elem)) != K_DYN)) {
 		return cast(Node, say_opt(a, t, prefix))
 	} else if k == K_STRUCT || k == K_OPT {
 		mut st = t
@@ -4914,7 +4997,7 @@ fn say_arg(a Node, prefix i64) Node {
 // say_opt prints an optional str, slice or map: <nil>, or its value as that type prints.
 fn say_opt(a Node, t Ty, prefix i64) i64 {
 	let pos = a.pos
-	let stmts = []i64{}
+	mut stmts = []i64{}
 	let obj = temp(pos, mk_conv(pos, cast(i64, a), CV_SAME, ty_int), ty_int)
 	stmts = append(stmts, cast(i64, obj))
 	let ifs = cast(IfStmt, node_new(ST_IF, pos))
@@ -4928,7 +5011,11 @@ fn say_opt(a Node, t Ty, prefix i64) i64 {
 	vs3 = append(vs3, expr_stmt(cast(Node, rt_call(pos, str_cat3(prefix, cstr("argend"), cstr("")), cast(i64, []i64{}), ty_void))))
 	ifs.else_ = empty_block(pos)
 	mut vs4 = cast(Block, ifs.else_).stmts
-	vs4 = append(vs4, expr_stmt(say_arg(cast(Node, mk_conv(pos, sym_ref_node(pos, cast(Sym, obj.sym)), CV_SAME, t.elem)), prefix)))
+	if opt_scalar(t) != 0 {
+		vs4 = append(vs4, expr_stmt(say_arg(cast(Node, mk_mem(pos, sym_ref_node(pos, cast(Sym, obj.sym)), 0, 0, 0, opt_scalar(t))), prefix)))
+	} else {
+		vs4 = append(vs4, expr_stmt(say_arg(cast(Node, mk_conv(pos, sym_ref_node(pos, cast(Sym, obj.sym)), CV_SAME, t.elem)), prefix)))
+	}
 	stmts = append(stmts, cast(i64, ifs))
 	return mk_seq(pos, cast(i64, stmts), mk_int(pos, 0, ty_int), ty_void)
 }
@@ -4939,7 +5026,7 @@ fn say_struct(a Node, t Ty, prefix i64) i64 {
 		return say_enum(a, cast(i64, t), prefix)
 	}
 	let pos = a.pos
-	let stmts = []i64{}
+	mut stmts = []i64{}
 	let obj = temp(pos, mk_conv(pos, cast(i64, a), CV_SAME, ty_int), ty_int)
 	stmts = append(stmts, cast(i64, obj))
 	stmts = append(stmts, expr_stmt(cast(Node, rt_call(pos, str_cat3(prefix, cstr("argsep"), cstr("")), cast(i64, []i64{}), ty_void))))
@@ -4983,12 +5070,12 @@ fn say_struct_fn(t Ty, prefix i64) Fn {
 		}
 		i = i + 1
 	}
-	let names = []i64{}
+	mut names = []i64{}
 	names = append(names, cstr("x"))
-	let types = []i64{}
+	mut types = []i64{}
 	types = append(types, cast(i64, t))
 	let f = lifted_fn(cstr("say"), names, cast([]i64, types), cast(i64, []i64{}))
-	let kp2 = []i64{}
+	mut kp2 = []i64{}
 	kp2 = append(kp2, cast(i64, t))
 	kp2 = append(kp2, prefix)
 	mut vs1 = cast([]i64, say_struct_keys)
@@ -5018,7 +5105,7 @@ fn say_struct_fn(t Ty, prefix i64) Fn {
 			body = append(body, expr_stmt(call_fn(pos, say_enum_fn(ft, prefix), args1(fv), ty_void)))
 		} else if kind_of(ft) == K_STRUCT {
 			body = append(body, expr_stmt(call_fn(pos, say_struct_fn(ft, prefix), args1(fv), ty_void)))
-		} else if kind_of(ft) == K_OPT && kind_of(cast(Ty, ft.elem)) != K_STRUCT && kind_of(cast(Ty, ft.elem)) != K_DYN {
+		} else if kind_of(ft) == K_OPT && (opt_scalar(ft) != 0 || (kind_of(cast(Ty, ft.elem)) != K_STRUCT && kind_of(cast(Ty, ft.elem)) != K_DYN)) {
 			body = append(body, expr_stmt(cast(Node, say_opt(cast(Node, fv), ft, prefix))))
 		} else if kind_of(ft) == K_OPT {
 			body = append(body, expr_stmt(cast(Node, rt_call(pos, str_cat3(prefix, cstr("p"), cstr("")), args1(mk_conv(pos, fv, CV_SAME, ty_int)), ty_void))))
@@ -5036,7 +5123,7 @@ fn say_struct_fn(t Ty, prefix i64) Fn {
 fn say_struct_slice(a Node, t Ty, prefix i64) i64 {
 	let pos = a.pos
 	let et = t.elem
-	let stmts = []i64{}
+	mut stmts = []i64{}
 	stmts = append(stmts, expr_stmt(cast(Node, rt_call(pos, str_cat3(prefix, cstr("argsep"), cstr("")), cast(i64, []i64{}), ty_void))))
 	let sl = temp(pos, cast(i64, a), cast(i64, t))
 	stmts = append(stmts, cast(i64, sl))
@@ -5106,7 +5193,7 @@ fn lifted_fn(base i64, names []i64, types []i64, rtypes i64) Fn {
 // forever).
 fn say_enum(a Node, t i64, prefix i64) i64 {
 	let pos = a.pos
-	let stmts = []i64{}
+	mut stmts = []i64{}
 	stmts = append(stmts, expr_stmt(cast(Node, rt_call(pos, str_cat3(prefix, cstr("argsep"), cstr("")), cast(i64, []i64{}), ty_void))))
 	stmts = append(stmts, expr_stmt(call_fn(pos, say_enum_fn(cast(Ty, t), prefix), args1(cast(i64, a)), ty_void)))
 	stmts = append(stmts, expr_stmt(cast(Node, rt_call(pos, str_cat3(prefix, cstr("argend"), cstr("")), cast(i64, []i64{}), ty_void))))
@@ -5135,7 +5222,7 @@ fn map_key_kind(kt i64) i64 {
 fn say_map_sorted(a Node, t Ty, prefix i64) i64 {
 	let pos = a.pos
 	let kt = t.key
-	let stmts = []i64{}
+	mut stmts = []i64{}
 	stmts = append(stmts, expr_stmt(cast(Node, rt_call(pos, str_cat3(prefix, cstr("argsep"), cstr("")), cast(i64, []i64{}), ty_void))))
 	let m = temp(pos, cast(i64, a), cast(i64, t))
 	stmts = append(stmts, cast(i64, m))
@@ -5173,7 +5260,7 @@ fn say_map_sorted(a Node, t Ty, prefix i64) i64 {
 // say_map_keyed prints a map with struct or enum keys as map[k:v ...] in insertion order.
 fn say_map_keyed(a Node, t Ty, prefix i64) i64 {
 	let pos = a.pos
-	let stmts = []i64{}
+	mut stmts = []i64{}
 	stmts = append(stmts, expr_stmt(cast(Node, rt_call(pos, str_cat3(prefix, cstr("argsep"), cstr("")), cast(i64, []i64{}), ty_void))))
 	let m = temp(pos, cast(i64, a), cast(i64, t))
 	stmts = append(stmts, cast(i64, m))
@@ -5221,7 +5308,7 @@ fn say_map_keyed(a Node, t Ty, prefix i64) i64 {
 fn say_enum_slice(a Node, t Ty, prefix i64) i64 {
 	let pos = a.pos
 	let et = t.elem
-	let stmts = []i64{}
+	mut stmts = []i64{}
 	stmts = append(stmts, expr_stmt(cast(Node, rt_call(pos, str_cat3(prefix, cstr("argsep"), cstr("")), cast(i64, []i64{}), ty_void))))
 	let sl = temp(pos, cast(i64, a), cast(i64, t))
 	stmts = append(stmts, cast(i64, sl))
@@ -5250,6 +5337,87 @@ fn say_enum_slice(a Node, t Ty, prefix i64) i64 {
 	return mk_seq(pos, cast(i64, stmts), mk_int(pos, 0, ty_int), ty_void)
 }
 
+// say_optnum_slice prints [1 <nil> 3] for a slice of optional numbers or bools (#353).
+fn say_optnum_slice(a Node, t Ty, prefix i64) i64 {
+	let pos = a.pos
+	let et = t.elem
+	mut stmts = []i64{}
+	stmts = append(stmts, expr_stmt(cast(Node, rt_call(pos, str_cat3(prefix, cstr("argsep"), cstr("")), cast(i64, []i64{}), ty_void))))
+	let sl = temp(pos, cast(i64, a), cast(i64, t))
+	stmts = append(stmts, cast(i64, sl))
+	let n = temp(pos, mk_hdr(pos, sym_ref_node(pos, cast(Sym, sl.sym)), 0), ty_int)
+	stmts = append(stmts, cast(i64, n))
+	stmts = append(stmts, expr_stmt(cast(Node, rt_call(pos, str_cat3(prefix, cstr("raw"), cstr("")), args1(lit_string(pos, cstr("["))), ty_void))))
+	let j = declare_local(pos, cstr("$"), ty_int)
+	stmts = append(stmts, let_stmt(pos, cast(Sym, j), mk_int(pos, 0, ty_int)))
+	let w = cast(WhileStmt, node_new(ST_WHILE, pos))
+	w.cond = mk_bin(pos, cstr("<"), sym_ref_node(pos, cast(Sym, j)), sym_ref_node(pos, cast(Sym, n.sym)), ty_bool)
+	w.post = assign_stmt(pos, sym_ref_node(pos, cast(Sym, j)), mk_bin(pos, cstr("+"), sym_ref_node(pos, cast(Sym, j)), mk_int(pos, 1, ty_int), ty_int))
+	let wb = cast(Block, empty_block(pos))
+	w.body = cast(i64, wb)
+	let sep = cast(IfStmt, node_new(ST_IF, pos))
+	sep.cond = mk_bin(pos, cstr(">"), sym_ref_node(pos, cast(Sym, j)), mk_int(pos, 0, ty_int), ty_bool)
+	sep.then = empty_block(pos)
+	mut vp4 = cast(Block, sep.then).stmts
+	vp4 = append(vp4, expr_stmt(cast(Node, rt_call(pos, str_cat3(prefix, cstr("raw"), cstr("")), args1(lit_string(pos, cstr(" "))), ty_void))))
+	mut vp5 = cast([]i64, wb.stmts)
+	vp5 = append(vp5, cast(i64, sep))
+	let el = mk_elem(pos, sym_ref_node(pos, cast(Sym, sl.sym)), sym_ref_node(pos, cast(Sym, j)), et, 0)
+	el.safe = 1
+	mut vp6 = cast([]i64, wb.stmts)
+	vp6 = append(vp6, expr_stmt(call_fn(pos, say_optnum_fn(cast(Ty, et), prefix), args1(cast(i64, el)), ty_void)))
+	stmts = append(stmts, cast(i64, w))
+	stmts = append(stmts, expr_stmt(cast(Node, rt_call(pos, str_cat3(prefix, cstr("raw"), cstr("")), args1(lit_string(pos, cstr("]"))), ty_void))))
+	stmts = append(stmts, expr_stmt(cast(Node, rt_call(pos, str_cat3(prefix, cstr("argend"), cstr("")), cast(i64, []i64{}), ty_void))))
+	return mk_seq(pos, cast(i64, stmts), mk_int(pos, 0, ty_int), ty_void)
+}
+
+shared mut say_optnum_keys []i64
+shared mut say_optnum_fns []Fn
+
+// say_optnum_fn is say$N(x ?number) prints the number or <nil>, inside a longer line.
+fn say_optnum_fn(t Ty, prefix i64) Fn {
+	if cast(i64, say_optnum_keys) == 0 {
+		say_optnum_keys = []i64{}
+		say_optnum_fns = cast([]Fn, []i64{})
+	}
+	mut i = 0
+	for i < len(say_optnum_keys) {
+		let kp = cast([]i64, (cast([]i64, say_optnum_keys))[i])
+		if cast(i64, cast(Ty, kp[0])) == cast(i64, t) && streq(kp[1], prefix) != 0 {
+			return say_optnum_fns[i]
+		}
+		i = i + 1
+	}
+	mut names = []i64{}
+	names = append(names, cstr("x"))
+	mut types = []i64{}
+	types = append(types, cast(i64, t))
+	let f = lifted_fn(cstr("say"), cast([]i64, names), cast([]i64, types), cast(i64, []i64{}))
+	mut kp2 = []i64{}
+	kp2 = append(kp2, cast(i64, t))
+	kp2 = append(kp2, prefix)
+	mut vp7 = cast([]i64, say_optnum_keys)
+	vp7 = append(vp7, cast(i64, kp2))
+	say_optnum_fns = append(say_optnum_fns, cast(Fn, f))
+	let saved_fn = ck_fn
+	ck_fn = cast(Fn, f)
+	let pos = 0
+	let x = (cast([]i64, f.locals))[0]
+	let body = cast(Block, f.body).stmts
+	let ifs = cast(IfStmt, node_new(ST_IF, pos))
+	ifs.cond = mk_bin(pos, cstr("=="), sym_ref_node(pos, cast(Sym, x)), mk_int(pos, 0, cast(i64, t)), ty_bool)
+	ifs.then = empty_block(pos)
+	mut vp8 = cast(Block, ifs.then).stmts
+	vp8 = append(vp8, expr_stmt(cast(Node, rt_call(pos, str_cat3(prefix, cstr("raw"), cstr("")), args1(lit_string(pos, cstr("<nil>"))), ty_void))))
+	ifs.else_ = empty_block(pos)
+	mut vp9 = cast(Block, ifs.else_).stmts
+	vp9 = append(vp9, expr_stmt(say_arg(cast(Node, mk_mem(pos, sym_ref_node(pos, cast(Sym, x)), 0, 0, 0, opt_scalar(t))), prefix)))
+	body = append(body, cast(i64, ifs))
+	ck_fn = saved_fn
+	return cast(Fn, f)
+}
+
 fn say_enum_fn(t Ty, prefix i64) Fn {
 	if cast(i64, say_enum_keys) == 0 {
 		say_enum_keys = []i64{}
@@ -5263,12 +5431,12 @@ fn say_enum_fn(t Ty, prefix i64) Fn {
 		}
 		i = i + 1
 	}
-	let names = []i64{}
+	mut names = []i64{}
 	names = append(names, cstr("x"))
-	let types = []i64{}
+	mut types = []i64{}
 	types = append(types, cast(i64, t))
 	let f = lifted_fn(cstr("say"), names, cast([]i64, types), cast(i64, []i64{}))
-	let kp2 = []i64{}
+	mut kp2 = []i64{}
 	kp2 = append(kp2, cast(i64, t))
 	kp2 = append(kp2, prefix)
 	mut vs1 = cast([]i64, say_enum_keys)
@@ -5358,7 +5526,7 @@ fn say_hoist(pos i64, args []Node, first i64, stmts []i64) i64 {
 
 // say_text formats args like say.Str (Line spacing when ln) and returns the str.
 fn say_text(pos i64, args []Node, ln i64) i64 {
-	let stmts = []i64{}
+	mut stmts = []i64{}
 	say_hoist(pos, args, 0, cast([]i64, stmts))
 	stmts = append(stmts, expr_stmt(cast(Node, rt_call(pos, cstr("rt_fmt_begin_v"), args1(mk_int(pos, ln, ty_int)), ty_void))))
 	mut i = 0
@@ -5458,7 +5626,7 @@ fn query_arg(a Node, t Ty) i64 {
 fn chk_query(e i64, want i64) i64 {
 	let pos = cast(Node, e).pos
 	mut parts = []i64{}
-	let args = []i64{}
+	mut args = []i64{}
 	mut hidden = 0
 	if cast(Node, e).kind == EX_STR {
 		let s = cast(StrLit, node_new(EX_STR, pos))
@@ -5489,22 +5657,22 @@ fn chk_query(e i64, want i64) i64 {
 			i = i + 1
 		}
 	}
-	let nokeys = []i64{}
+	mut nokeys = []i64{}
 	mut i = 0
 	for i < len(cast([]i64, parts)) {
 		nokeys = append(nokeys, 0)
 		i = i + 1
 	}
-	let akeys = []i64{}
+	mut akeys = []i64{}
 	i = 0
 	for i < len(cast([]i64, args)) {
 		akeys = append(akeys, 0)
 		i = i + 1
 	}
-	let elems = []i64{}
+	mut elems = []i64{}
 	elems = append(elems, composite_of(cast(Node, tx_slice_of(pos, cstr("str"))), cast(i64, parts), cast(i64, nokeys)))
 	elems = append(elems, composite_of(cast(Node, tx_slice_of(pos, cstr("qarg"))), cast(i64, args), cast(i64, akeys)))
-	let keys = []i64{}
+	mut keys = []i64{}
 	keys = append(keys, ident_node(pos, cstr("Parts")))
 	keys = append(keys, ident_node(pos, cstr("Args")))
 	if hidden != 0 {
@@ -5529,7 +5697,7 @@ fn chk_interp(e i64, want i64) i64 {
 	let vals = cast(InterpExpr, e).args
 	let specs = cast(InterpExpr, e).specs
 	let f = buf_new()
-	let args = []i64{}
+	mut args = []i64{}
 	args = append(args, 0)
 	mut i = 0
 	for i < len(parts) {
@@ -5611,7 +5779,7 @@ fn lower_say(e i64, m i64, want i64) i64 {
 	}
 	let printf = i64(streq(m, cstr("Out")) != 0 || streq(m, cstr("Fmt")) != 0 || streq(m, cstr("Fault")) != 0 || streq(m, cstr("To")) != 0)
 	let ln = i64(streq(m, cstr("Line")) != 0 || streq(m, cstr("LineTo")) != 0)
-	let stmts = []i64{}
+	mut stmts = []i64{}
 	secret_say_args(cast([]Node, args), m)
 	if printf != 0 {
 		say_hoist(pos, cast([]Node, args), first + 1, cast([]i64, stmts))
@@ -5705,7 +5873,7 @@ fn chk_bound(e i64, want Ty) i64 {
 			cast(Call, e).fn_ = cast(i64, bb)
 			cast(Call, e).method = 1
 			cast(Call, e).args = cast([]i64, args2(arg0(cast(Call, x)), mk_int(pos, target.max, ty_int)))
-			let brts = []i64{}
+			mut brts = []i64{}
 			brts = append(brts, cast(i64, target))
 			brts = append(brts, ty_error)
 			cast(Node, e).type_ = tuple_of(cast(i64, brts))
@@ -5723,7 +5891,7 @@ fn chk_bound(e i64, want Ty) i64 {
 	let w = cast(Fn, bound_wrapper(pos, target))
 	cast(Call, e).name = w.name
 	cast(Call, e).fn_ = cast(i64, w)
-	let rts = []i64{}
+	mut rts = []i64{}
 	rts = append(rts, cast(i64, target))
 	rts = append(rts, ty_error)
 	let rt = tuple_of(cast(i64, rts))

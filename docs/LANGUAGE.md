@@ -190,7 +190,7 @@ panic, 1 when startup fails, or with the code passed to `quarry.Exit`.
 | `map[K]V` | ref | hash map, insertion-ordered; K is `str`, an integer type, `bool`, `f64`, or a struct or enum of those; never nil |
 | `struct { ... }` | ref | a reference to an object; never nil |
 | `enum { ... }` | ref | one of several variants, each with its own data |
-| `?T` | ref | optional T: a T or `nil` (T a reference type) |
+| `?T` | ref | optional T: a T or `nil` (T a number, `bool` or reference type; a number is boxed) |
 | `!T` | | a result that is a T or a fault (function results only, section 8) |
 | `fault` | ref | an error; `nil` means no error |
 | `(A, B)` | | several results of a function |
@@ -1147,7 +1147,14 @@ fn status(err fault) i64 {
 
 ## 9. Optionals
 
-`?T` holds a `T` or `nil` (T is a reference type: str, slice, map, struct, enum, `dyn S`).
+`?T` holds a `T` or `nil` (T is a number, `bool` or a reference type: str, slice, map, struct,
+enum, `dyn S`). `?i64`, `?f64`, `?bool` and the other number types (#353) are a box holding
+the value, made where a number meets an optional (`let n ?i64 = 5`, `return i`, a field or a
+function argument); nil is no box. A variable checked with `n != nil` (or `if let`, `&&`,
+`||`, the arms of a `match`) reads as the number inside the branch; `==` and `!=` between two
+optional numbers compare by value (both nil, or both set and equal). A global holding one is
+assigned `keep(5)`, as any value stored where it outlives the request. JSON `null` and a
+missing member are nil, a wrong type is a fault (`argo`).
 Inside a branch where the compiler can see the check, the variable has type `T`:
 
 <!-- tin-prelude
@@ -1794,7 +1801,8 @@ is; slices as `[a b c]`; maps as `map[k:v ...]` with sorted keys; structs as `{a
 nested structs, enums (by name) and slices of structs printed in full; `NaN`, `+Inf` and
 `-Inf` for the non-finite floats under every verb; nil optionals and faults as `<nil>`. An
 optional field of a struct prints as an address, as a pointer field does in Go, so that a
-structure that points back at itself prints and ends.
+structure that points back at itself prints and ends; an optional number prints as the number
+or `<nil>`.
 
 `%+v` is not `%v` with a sign: it prints no `+` on numbers and gives structs their field
 names (`{a:1 b:2.5}`). `%+d`, `%+g`, `%+f` and `%+e` do print the sign.

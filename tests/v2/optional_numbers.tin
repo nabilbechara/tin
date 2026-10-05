@@ -1,0 +1,140 @@
+package main
+
+import "argo"
+import "constraints"
+import "hearth"
+import "say"
+
+// #353: ?i64, ?f64, ?bool and the other numbers are optionals too: nil is "no value", a number
+// converts to the optional where one is wanted, and a variable checked with != nil reads as the
+// number inside the branch (the optional is a box holding it).
+
+type Item struct {
+	name  str
+	price ?f64
+	qty   ?i64
+	ok    ?bool
+	tags  []?i64
+	by    map[str]?i64
+}
+
+mut cache ?i64 = nil
+
+fn find(xs []i64, v i64) ?i64 {
+	for i in 0..len(xs) {
+		if xs[i] == v {
+			return i
+		}
+	}
+	return nil
+}
+
+fn show(n ?i64) str {
+	if n != nil {
+		return "got {n}"
+	}
+	return "none"
+}
+
+fn early(n ?i64) i64 {
+	if n == nil {
+		return -1
+	}
+	return n * 2
+}
+
+fn either(n ?i64) bool {
+	return n == nil || n < 3
+}
+
+fn arms(n ?i64) i64 {
+	match n {
+		nil => {
+			return 0
+		}
+		_ => {
+			return n * 10
+		}
+	}
+}
+
+fn first[T constraints.Any](xs []?T) ?T {
+	if len(xs) > 0 {
+		return xs[0]
+	}
+	return nil
+}
+
+fn remember(v i64) {
+	cache = keep(v)
+}
+
+fn main() {
+	let xs = []i64{5, 6, 7}
+	let a = find(xs, 7)
+	let b = find(xs, 9)
+	say.Line(show(a), show(b), a == nil, b == nil)
+	say.Line(early(nil), early(4), either(nil), either(2), either(9), arms(nil), arms(5))
+	// Equality is by value: both nil, or both set and equal.
+	let c1 ?i64 = 3
+	let c2 ?i64 = 3
+	let n ?i64 = nil
+	say.Line(c1 == c2, c1 != c2, c1 == a, n == b, c1 == n)
+	// Narrowing, if let, bool and float.
+	if let v = a {
+		say.Line("a is", v + 1)
+	}
+	let f ?f64 = 2.5
+	if f != nil && f > 2.0 {
+		say.Line("big", f * 2.0)
+	}
+	mut z ?bool = true
+	if z != nil && z {
+		say.Line("yes")
+	}
+	z = nil
+	say.Line(z == nil)
+	let u ?u8 = 200
+	if u != nil {
+		say.Line(u + 1)
+	}
+	// Assigning inside a branch that checked != nil replaces the box: a copy made before is unchanged.
+	mut acc ?i64 = nil
+	for i in 0..3 {
+		if acc != nil {
+			acc = acc + 10
+		} else {
+			acc = 1
+		}
+	}
+	mut w ?i64 = 5
+	let w0 = w
+	if w != nil {
+		w += 1
+		w = w * 2
+	}
+	say.Line(acc, w, w0)
+	// Fields, slices, maps, formatting and generics.
+	let it = Item{name: "pen", price: 1.5, qty: 0, tags: []?i64{1, nil, 3}, by: map[str]?i64{"a": 7, "b": nil}}
+	say.Line(it.qty != nil, it.ok == nil, it.tags, it.by["a"], it.by["zz"])
+	say.Line(it)
+	say.Line(first([]?i64{nil, 2}), first([]?i64{4, 5}))
+	// JSON: null and missing are nil, a number is a value, a wrong type is a fault.
+	let out = make([]u8, 0)
+	argo.Put(mut out, it)
+	say.Line(str(out))
+	let got = Item{name: "", by: map[str]?i64{}}
+	argo.Get(`{"name":"x","price":null,"qty":42,"ok":false,"tags":[null,5],"by":{"k":null,"j":9}}`, mut got) catch err {
+		say.Line(err)
+	}
+	say.Line(got.name, got.price, got.qty, got.ok, got.tags, got.by["k"], got.by["j"])
+	let bad = Item{name: "", by: map[str]?i64{}}
+	say.Line(argo.Get(`{"qty":"x"}`, mut bad), argo.Get(`{"qty":1.5}`, mut bad))
+	// A value stored in a global outlives the request: keep() puts its box in long-lived memory.
+	remember(5)
+	hearth.Reset()
+	let held = cache
+	if held != nil {
+		say.Line("cached", held)
+	}
+}

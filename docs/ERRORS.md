@@ -2537,13 +2537,14 @@ Fix: declare `let ErrNotFound = fault("not found")` and `fail ErrNotFound`, or u
 
 ### E420 OPTIONAL_TYPE
 
-Only references can be optional (`?T`): `str`, slices, maps, structs and `dyn` values. A
-number or a `bool` always has a value.
+Only numbers, `bool` and references can be optional (`?T`): `?i64`, `?f64`, `?bool`, `?str`,
+slices, maps, structs, enums and `dyn` values. A function or a fault already has `nil` of its
+own and cannot be wrapped.
 
 ```tin edition=1
 package main
 
-fn show(n ?i64) {
+fn show(f ?fn()) {
 }
 
 fn main() {
@@ -2551,11 +2552,11 @@ fn main() {
 ```
 
 ```text
-example.tin:3:11: error E420 OPTIONAL_TYPE: only references (str, slices, maps, structs, dyn) can be optional, not i64
+example.tin:3:11: error E420 OPTIONAL_TYPE: only numbers, bool and references (str, slices, maps, structs, dyn) can be optional, not func()
 ```
 
-Fix: use a separate `bool` (or `v, ok`) for a missing number, or keep the number in a
-struct and make the struct optional.
+Fix: use the function or fault itself (`nil` is its missing value), or keep it in a struct and
+make the struct optional.
 
 ### E421 UNCHECKED_OPTIONAL
 

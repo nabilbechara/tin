@@ -98,7 +98,7 @@ fn types_init() {
 }
 
 fn name_type(name i64, t i64) {
-	let rec = []i64{}
+	mut rec = []i64{}
 	rec = append(rec, name)
 	rec = append(rec, t)
 	ty_named = append(ty_named, cast(i64, rec))
@@ -165,7 +165,76 @@ fn chan_of(elem i64) i64 {
 }
 
 fn opt_of(elem i64) i64 {
+	if scalar_optionable(cast(Ty, elem)) != 0 {
+		return interned(K_OPT, box_of(elem), 0, cast([]i64, 0), cast([]i64, 0), 0)
+	}
 	return interned(K_OPT, elem, 0, cast([]i64, 0), cast([]i64, 0), 0)
+}
+
+// ---- optional numbers and bools (#353) ----
+// ?i64, ?f64, ?bool and the like are an optional of a hidden one-field struct, the box that holds
+// the value: nil is no box. A number converts to the optional by making a box (check_assignable),
+// and a variable narrowed by `x != nil` reads the box's field back (Sym.unbox).
+shared mut box_scalars []i64
+shared mut box_structs []i64
+
+// scalar_optionable reports whether ?t is an optional number or bool.
+fn scalar_optionable(t Ty) i64 {
+	let k = kind_of(t)
+	return i64((k == K_INT || k == K_FLOAT || k == K_BOOL) && is_secret(t) == 0 && t.bound == 0)
+}
+
+// box_of is the struct that holds a value of the number or bool type s.
+fn box_of(s i64) i64 {
+	if cast(i64, box_scalars) == 0 {
+		box_scalars = []i64{}
+		box_structs = []i64{}
+	}
+	mut i = 0
+	for i < len(box_scalars) {
+		if box_scalars[i] == s {
+			return box_structs[i]
+		}
+		i = i + 1
+	}
+	let t = cast(Ty, ty_new(K_STRUCT, cast(Ty, s).name))
+	mut fs = []i64{}
+	mut rec = []i64{}
+	rec = append(rec, cstr("v"))
+	rec = append(rec, s)
+	rec = append(rec, 0)
+	rec = append(rec, 0)
+	rec = append(rec, 0)
+	rec = append(rec, 0)
+	fs = append(fs, cast(i64, rec))
+	t.fields = fs
+	layout_struct(t)
+	box_scalars = append(box_scalars, s)
+	box_structs = append(box_structs, cast(i64, t))
+	return cast(i64, t)
+}
+
+// box_scalar is the number or bool type that the struct t boxes, or 0.
+fn box_scalar(t Ty) i64 {
+	if cast(i64, box_structs) == 0 {
+		return 0
+	}
+	mut i = 0
+	for i < len(box_structs) {
+		if box_structs[i] == cast(i64, t) {
+			return box_scalars[i]
+		}
+		i = i + 1
+	}
+	return 0
+}
+
+// opt_scalar is s in the optional ?s of a number or bool, else 0.
+fn opt_scalar(t Ty) i64 {
+	if cast(i64, t) == 0 || kind_of(t) != K_OPT {
+		return 0
+	}
+	return box_scalar(cast(Ty, t.elem))
 }
 
 // dyn_of is the type of a dyn S value: the shape declaration in TY_GDECL and the
@@ -408,6 +477,9 @@ fn assignable(from Ty, to Ty) i64 {
 	if tk == K_OPT && cast(i64, from) == to.elem {
 		return 1
 	}
+	if tk == K_OPT && opt_scalar(to) != 0 && fk != K_OPT && fk != K_NIL {
+		return assignable(from, cast(Ty, opt_scalar(to)))
+	}
 	if fk == K_UFLOAT {
 		return i64(tk == K_FLOAT)
 	}
@@ -462,7 +534,11 @@ fn type_name(b []u8, t Ty) {
 		type_name(b, cast(Ty, t.elem))
 	} else if k == K_OPT {
 		buf_byte(b, '?')
-		type_name(b, cast(Ty, t.elem))
+		if opt_scalar(t) != 0 {
+			type_name(b, cast(Ty, opt_scalar(t)))
+		} else {
+			type_name(b, cast(Ty, t.elem))
+		}
 	} else if k == K_MAP {
 		buf_str(b, cstr("map["))
 		type_name(b, cast(Ty, t.key))
@@ -623,7 +699,7 @@ fn bounded_of(t_in i64, max_ i64) i64 {
 	buf_int(nb, max_)
 	buf_byte(nb, 0)
 	b.name = slice_data(nb)
-	let r = []i64{}
+	mut r = []i64{}
 	r = append(r, cast(i64, t))
 	r = append(r, max_)
 	r = append(r, cast(i64, b))

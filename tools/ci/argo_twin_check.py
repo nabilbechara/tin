@@ -21,7 +21,7 @@ def lines(out):
     result = {}
     for line in out.strip().splitlines():
         name, default, strict = line.split()
-        result[name] = (default.split('=')[1], strict.split('=')[1])
+        result[name] = (default.split('=', 1)[1], strict.split('=', 1)[1])
     return result
 
 
