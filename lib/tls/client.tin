@@ -77,8 +77,26 @@ fn (c mut Conn) handshake(cfg Config, name str, hi hello) ! {
 	mut priv = hi.x25519
 	mut share = try seal.X25519PublicKey(priv)
 	mut ch = hi.raw
+	// A ticket from an earlier connection to this server, if there is one, is offered as a PSK.
+	mut tk = ticket{key: "", ticket: []u8{}, psk: []u8{}, suite: 0, ageAdd: 0, issued: 0, life: 0, alpn: ""}
+	mut psked = false
 	if len(ch) == 0 {
-		ch = client_hello(hi.random, hi.session, offered, name, cfg.ALPN, group, share, []u8{})
+		if name != "" {
+			c.skey = session_key(name, cfg)
+			let (t, ok) = take_ticket(c.skey)
+			if ok {
+				tk = t
+				psked = true
+			}
+		}
+		mut opt = chOptions{cookie: []u8{}, offer: nil}
+		if psked {
+			opt.offer = pskOffer{identity: tk.ticket, age: ticket_age(tk), hlen: seal.Size(suite_hash(tk.suite))}
+		}
+		ch = client_hello(hi.random, hi.session, offered, name, cfg.ALPN, group, share, opt)
+		if psked {
+			ch = try bind_psk(ch, tk, []u8{})
+		}
 	}
 	mut transcript = clone(ch)
 	try c.write_records(ctHandshake, ch)
@@ -107,7 +125,16 @@ fn (c mut Conn) handshake(cfg Config, name str, hi hello) ! {
 		group = groupP256
 		priv = seal.P256NewPrivateKey()
 		share = try seal.P256PublicKey(priv)
-		let ch2 = client_hello(hi.random, hi.session, offered, name, cfg.ALPN, group, share, sh.cookie)
+		// The ticket is offered again only when its hash is the one the server chose.
+		psked = psked && suite_hash(tk.suite) == h
+		mut opt2 = chOptions{cookie: sh.cookie, offer: nil}
+		if psked {
+			opt2.offer = pskOffer{identity: tk.ticket, age: ticket_age(tk), hlen: seal.Size(h)}
+		}
+		mut ch2 = client_hello(hi.random, hi.session, offered, name, cfg.ALPN, group, share, opt2)
+		if psked {
+			ch2 = try bind_psk(ch2, tk, transcript)
+		}
 		transcript = cat(transcript, ch2)
 		try c.write_records(ctHandshake, ch2)
 		retried = true
@@ -134,6 +161,17 @@ fn (c mut Conn) handshake(cfg Config, name str, hi hello) ! {
 	c.suite = sh.suite
 	c.hash = suite_hash(sh.suite)
 	let h = c.hash
+	mut psk = []u8{}
+	if sh.psk {
+		if !psked {
+			fail alert_fault(alertIllegalParameter, "ServerHello accepts a PSK that was not offered")
+		}
+		if suite_hash(tk.suite) != h {
+			fail alert_fault(alertIllegalParameter, "ServerHello resumes with a cipher suite of another hash")
+		}
+		psk = tk.psk
+		c.resumed = true
+	}
 	mut shared_ = []u8{}
 	if group == groupX25519 {
 		shared_ = seal.X25519(priv, sh.share) catch _ {
@@ -150,7 +188,7 @@ fn (c mut Conn) handshake(cfg Config, name str, hi hello) ! {
 	if !hr.empty() {
 		fail alert_fault(alertUnexpectedMessage, "handshake data before a key change")
 	}
-	let sc = try handshake_secrets(h, shared_, transcript_hash(h, transcript))
+	let sc = try handshake_secrets(h, shared_, transcript_hash(h, transcript), psk)
 	try c.set_read_key(sc.shs)
 	try c.set_write_key(sc.chs)
 	// The server's encrypted flight.
@@ -160,36 +198,41 @@ fn (c mut Conn) handshake(cfg Config, name str, hi hello) ! {
 	}
 	c.alpn = try parse_encrypted_extensions(msg[4:], cfg.ALPN, hello_extensions(ch))
 	transcript = cat(transcript, msg)
-	typ, msg = try hr.next(mut c)
 	mut requested = false
 	mut reqctx = []u8{}
-	if typ == hsCertificateRequest {
-		reqctx = try parse_certificate_request(msg[4:])
-		requested = true
+	if c.resumed && c.alpn != tk.alpn {
+		fail alert_fault(alertIllegalParameter, "a resumed connection negotiated another ALPN protocol")
+	}
+	if !c.resumed {
+		typ, msg = try hr.next(mut c)
+		if typ == hsCertificateRequest {
+			reqctx = try parse_certificate_request(msg[4:])
+			requested = true
+			transcript = cat(transcript, msg)
+			typ, msg = try hr.next(mut c)
+		}
+		if typ != hsCertificate {
+			fail alert_fault(alertUnexpectedMessage, "expected Certificate")
+		}
+		let certs = try parse_certificate(msg[4:])
 		transcript = cat(transcript, msg)
 		typ, msg = try hr.next(mut c)
+		if typ != hsCertificateVerify {
+			fail alert_fault(alertUnexpectedMessage, "expected CertificateVerify")
+		}
+		let cv = rdr{b: msg[4:]}
+		let scheme = cv.u16v()
+		let sig = cv.vec16()
+		if cv.bad || !cv.done() {
+			fail alert_fault(alertDecodeError, "malformed CertificateVerify")
+		}
+		if scheme == 0x0401 || scheme == 0x0501 || scheme == 0x0601 || !in_list(sigSchemes, scheme) {
+			fail alert_fault(alertIllegalParameter, "CertificateVerify uses a scheme that was not offered")
+		}
+		try verify_peer(cfg, name, certs, scheme, cv_content(transcript_hash(h, transcript)), sig)
+		c.certs = certs
+		transcript = cat(transcript, msg)
 	}
-	if typ != hsCertificate {
-		fail alert_fault(alertUnexpectedMessage, "expected Certificate")
-	}
-	let certs = try parse_certificate(msg[4:])
-	transcript = cat(transcript, msg)
-	typ, msg = try hr.next(mut c)
-	if typ != hsCertificateVerify {
-		fail alert_fault(alertUnexpectedMessage, "expected CertificateVerify")
-	}
-	let cv = rdr{b: msg[4:]}
-	let scheme = cv.u16v()
-	let sig = cv.vec16()
-	if cv.bad || !cv.done() {
-		fail alert_fault(alertDecodeError, "malformed CertificateVerify")
-	}
-	if scheme == 0x0401 || scheme == 0x0501 || scheme == 0x0601 || !in_list(sigSchemes, scheme) {
-		fail alert_fault(alertIllegalParameter, "CertificateVerify uses a scheme that was not offered")
-	}
-	try verify_peer(cfg, name, certs, scheme, cv_content(transcript_hash(h, transcript)), sig)
-	c.certs = certs
-	transcript = cat(transcript, msg)
 	typ, msg = try hr.next(mut c)
 	if typ != hsFinished {
 		fail alert_fault(alertUnexpectedMessage, "expected Finished")
@@ -219,7 +262,10 @@ fn (c mut Conn) handshake(cfg Config, name str, hi hello) ! {
 		transcript = cat(transcript, cm)
 	}
 	let fin = try finished_mac(h, sc.chs, transcript_hash(h, transcript))
-	flight = cat(flight, handshake_msg(hsFinished, fin))
+	let finmsg = handshake_msg(hsFinished, fin)
+	flight = cat(flight, finmsg)
+	// What tickets the server sends from now on are worth: the resumption secret.
+	c.resumption = try derive_secret(h, sc.master, "res master", transcript_hash(h, cat(transcript, finmsg)))
 	try c.write_records(ctHandshake, flight)
 	try c.set_write_key(cats)
 	c.group = group
@@ -234,4 +280,21 @@ fn in_list(xs []i64, v i64) bool {
 		}
 	}
 	return false
+}
+
+// ticket_age is the obfuscated age the PSK identity carries: milliseconds since the ticket came,
+// plus ticket_age_add, modulo 2^32.
+fn ticket_age(t ticket) i64 {
+	return ((rt_mono_ns()-t.issued)/1000000 + t.ageAdd) & 0xffffffff
+}
+
+// bind_psk fills in the binder of the PSK offered in ClientHello ch, over the handshake bytes
+// before it (prefix) and the message without its binders.
+fn bind_psk(ch []u8, t ticket, prefix []u8) ![]u8 {
+	let h = suite_hash(t.suite)
+	let n = seal.Size(h)
+	let out = clone(ch)
+	let binder = try psk_binder(h, t.psk, prefix, out[:len(out)-binders_len(n)])
+	copy(out[len(out)-n:], binder)
+	return out
 }

@@ -163,6 +163,66 @@ def openssl_matrix(exe, openssl, certs):
     print('PASS ALPN chosen and absent; a TLS 1.2-only server is refused')
 
 
+def resumption(exe, openssl, certs, work):
+    """Session tickets (#348): the second and later connections of one client process resume."""
+    # openssl s_server: every suite, X25519 and P-256 (a HelloRetryRequest with the PSK offered again).
+    count = 0
+    for suite in SUITES:
+        for group in GROUPS:
+            port = free_port()
+            cert = certs['ecdsa']
+            proc = subprocess.Popen([openssl, 's_server', '-tls1_3', '-accept', str(port), '-cert', str(cert[0]), '-key', str(cert[1]),
+                                     '-www', '-quiet', '-ciphersuites', suite, '-groups', group],
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            try:
+                wait_port(port, proc)
+                out = run(exe, 'resume', f'127.0.0.1:{port}', 4).splitlines()
+            finally:
+                proc.kill()
+                proc.wait()
+            want = [f'resumed {flag} {suite} {group} {certs_seen} true' for flag, certs_seen in
+                    (('false', 1), ('true', 0), ('true', 0), ('true', 0))]
+            assert out == want, (suite, group, out)
+            count += 1
+    print(f'PASS resumption: {count} openssl s_server runs (every suite; X25519 and P-256 by HelloRetryRequest): the first connection is full, the next three resume')
+    # A server that forgets its ticket keys after three connections (a restart): the client's old
+    # ticket is not understood, and it falls back to a full handshake and carries on.
+    contexts = [server_ctx(certs['ecdsa']), server_ctx(certs['ecdsa'])]
+    reused = []
+    stop = threading.Event()
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(('127.0.0.1', 0))
+    srv.listen(8)
+    srv.settimeout(.2)
+    port = srv.getsockname()[1]
+
+    def serve():
+        while not stop.is_set():
+            try:
+                raw, _ = srv.accept()
+            except socket.timeout:
+                continue
+            try:
+                conn = contexts[0 if len(reused) < 3 else 1].wrap_socket(raw, server_side=True)
+                reused.append(conn.session_reused)
+                conn.recv(100)
+                conn.sendall(b'HTTP/1.0 200 OK\r\n\r\nok')
+                conn.unwrap().close()  # close_notify, then TCP
+            except (OSError, ssl.SSLError):
+                pass
+    thread = serve_in_thread(serve)
+    try:
+        out = run(exe, 'resume', f'127.0.0.1:{port}', 6).splitlines()
+        assert [l.split()[1] for l in out] == ['false', 'true', 'true', 'false', 'true', 'true'], out
+        assert reused == [False, True, True, False, True, True], reused
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+        srv.close()
+    print('PASS resumption: a server that lost its ticket keys gets a full handshake, then resumption again')
+
+
 def keyupdate(exe, openssl, certs):
     """An interactive s_server sends KeyUpdate with and without request_update; the client
     reads on, answers and keeps writing on its next key."""
@@ -446,6 +506,7 @@ def main():
         request_tasks(compiler, work, certs)
         if openssl:
             openssl_matrix(exe, openssl, certs)
+            resumption(exe, openssl, certs, work)
             keyupdate(exe, openssl, certs)
         else:
             print('SKIP openssl s_server interop: no OpenSSL 3 command line on this runner')

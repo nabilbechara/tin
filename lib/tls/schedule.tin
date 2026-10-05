@@ -76,11 +76,15 @@ type schedule struct {
 }
 
 // handshake_secrets runs the schedule up to the handshake traffic secrets: early secret
-// (no PSK), handshake secret from the shared secret, then the two traffic secrets over the
+// (from the PSK when resuming, else none), handshake secret from the shared secret, then the two traffic secrets over the
 // transcript through ServerHello.
-fn handshake_secrets(h seal.Hash, shared_ []u8, thash []u8) !schedule {
+fn handshake_secrets(h seal.Hash, shared_ []u8, thash []u8, psk []u8) !schedule {
 	let zero = make([]u8, seal.Size(h))
-	let early = seal.HkdfExtract(h, str(zero), str(zero))
+	mut ikm = zero
+	if len(psk) > 0 {
+		ikm = psk // a resumed handshake: the early secret comes from the ticket's key
+	}
+	let early = seal.HkdfExtract(h, str(zero), str(ikm))
 	let derived = try derive_secret(h, early, "derived", seal.Sum(h, ""))
 	let hs = seal.HkdfExtract(h, str(derived), str(shared_))
 	let chs = try derive_secret(h, hs, "c hs traffic", thash)

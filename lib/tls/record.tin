@@ -160,12 +160,18 @@ type Conn struct {
 	group   i64  // the key exchange group used
 	retried bool // the server asked for another key share (HelloRetryRequest)
 	alertCt i64 // records of alerts or empty data in a row (a peer cannot loop us forever)
+	resumption []u8 // the resumption secret: what the tickets the server sends are worth
+	skey    str  // the session_key under which tickets are kept ("": none are)
+	resumed bool // the handshake resumed an earlier session
+	phcollect i64 // bytes of a NewSessionTicket still to collect into phbuf
+	phbuf   []u8
 }
 
 fn new_conn(tcp wire.Conn) Conn {
 	return Conn{tcp: tcp, fd: tcp.Fd(), failure: "", riv: make([]u8, 12), rsecret: make([]u8, 0, 48),
 		wiv: make([]u8, 12), wsecret: make([]u8, 0, 48), in: make([]u8, 5+maxCiphertext+64),
-		plain: make([]u8, maxPlaintext), ph: make([]u8, 5), alpn: "", certs: make([][]u8, 0, 1), hash: seal.Hash.SHA256}
+		plain: make([]u8, maxPlaintext), ph: make([]u8, 5), alpn: "", certs: make([][]u8, 0, 1), hash: seal.Hash.SHA256,
+		resumption: []u8{}, skey: "", phbuf: []u8{}}
 }
 
 // wait blocks the task until the socket is readable (want 1) or writable (2), within the
@@ -431,10 +437,24 @@ fn (c mut Conn) send_key_update(request bool) ! {
 }
 
 // post_handshake handles handshake messages after the handshake: NewSessionTicket is
-// skipped (no resumption), KeyUpdate moves to the next read secret; anything else is fatal.
+// kept for resumption (session.tin), KeyUpdate moves to the next read secret; anything else is fatal.
 fn (c mut Conn) post_handshake(data []u8) ! {
 	mut i = 0
 	for i < len(data) {
+		if c.phcollect > 0 {
+			mut k = len(data) - i
+			if k > c.phcollect {
+				k = c.phcollect
+			}
+			c.phbuf = append(c.phbuf, data[i:i+k]...)
+			c.phcollect -= k
+			i += k
+			if c.phcollect == 0 {
+				c.phn = 0
+				try c.save_ticket(c.phbuf)
+			}
+			continue
+		}
 		if c.phskip > 0 {
 			mut k = len(data) - i
 			if k > c.phskip {
@@ -459,7 +479,12 @@ fn (c mut Conn) post_handshake(data []u8) ! {
 			if n == 0 {
 				fail alert_fault(alertDecodeError, "empty NewSessionTicket")
 			}
-			c.phskip = n
+			if n <= 16384 && c.skey != "" && len(c.resumption) > 0 {
+				c.phcollect = n
+				c.phbuf = make([]u8, 0, n)
+			} else {
+				c.phskip = n
+			}
 			continue
 		}
 		if typ != hsKeyUpdate || n != 1 {
@@ -505,4 +530,25 @@ fn (c mut Conn) abort(desc i64, msg str) str {
 		c.tcp.Close()
 	}
 	return m
+}
+
+// save_ticket keeps the NewSessionTicket whose body is b for a later connection to the same server.
+fn (c mut Conn) save_ticket(b []u8) ! {
+	let r = rdr{b: b}
+	mut life = r.u16v()<<16 | r.u16v()
+	let ageAdd = r.u16v()<<16 | r.u16v()
+	let nonce = r.vec8()
+	let tkt = r.vec16()
+	r.vec16()
+	if r.bad || !r.done() || len(tkt) == 0 {
+		fail alert_fault(alertDecodeError, "malformed NewSessionTicket")
+	}
+	if life == 0 {
+		return
+	}
+	if life > maxTicketLife {
+		life = maxTicketLife
+	}
+	let psk = try seal.HkdfExpandLabel(c.hash, str(c.resumption), "resumption", str(nonce), seal.Size(c.hash))
+	put_ticket(ticket{key: c.skey, ticket: clone(tkt), psk: psk, suite: c.suite, ageAdd: ageAdd, issued: rt_mono_ns(), life: life, alpn: c.alpn})
 }

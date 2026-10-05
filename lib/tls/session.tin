@@ -1,0 +1,100 @@
+package tls
+
+import "seal"
+
+// ---- session resumption (RFC 8446 sections 2.2, 4.2.11 and 4.6.1) ----
+//
+// The server sends NewSessionTicket messages after the handshake; each carries a ticket and,
+// with the connection's resumption secret, gives a pre-shared key. A later connection to the
+// same server offers the ticket in its ClientHello (psk_dhe_ke: a new key exchange still runs),
+// proves it knows the key with a binder, and when the server accepts, both skip the certificate
+// messages. Tickets live per core, are used once, and are offered only to the same server name
+// under the same verification settings (a session whose certificate was not checked must not
+// stand in for one that has to be).
+
+const maxTickets = 32
+const maxTicketLife = 604800 // seconds: the longest lifetime RFC 8446 allows
+
+// ticket is one ticket and the key it stands for.
+type ticket struct {
+	key    str   // server name and verification settings: see session_key
+	ticket []u8  // the opaque identity the server gave
+	psk    []u8  // HKDF-Expand-Label(resumption secret, "resumption", ticket_nonce)
+	suite  i64   // the cipher suite of the connection it came from: its hash decides the PSK's
+	ageAdd i64   // ticket_age_add: hides the ticket's age
+	issued i64   // rt_mono_ns() when received
+	life   i64   // seconds it may be used
+	alpn   str   // the protocol negotiated then
+}
+
+mut tickets []ticket = make([]ticket, 0, 8) // per core, oldest first
+
+// session_key names who a ticket may be offered to.
+fn session_key(name str, cfg Config) str {
+	mut k = name + "|"
+	if cfg.InsecureSkipVerify {
+		k += "insecure|"
+	}
+	k += cfg.RootCAs + "|"
+	for _, a in cfg.ALPN {
+		k += a + ","
+	}
+	return k
+}
+
+// take_ticket removes and returns the newest unexpired ticket for key (ok false: none).
+fn take_ticket(key str) (ticket, bool) {
+	let now = rt_mono_ns()
+	mut keep_ = make([]ticket, 0, len(tickets))
+	mut found = ticket{key: "", ticket: []u8{}, psk: []u8{}}
+	mut ok = false
+	mut i = len(tickets) - 1
+	for i >= 0 {
+		let t = tickets[i]
+		if now-t.issued > t.life*1000000000 {
+			i -= 1
+			continue
+		}
+		if !ok && t.key == key {
+			found = t
+			ok = true
+		} else {
+			keep_ = append(keep_, t)
+		}
+		i -= 1
+	}
+	if ok || len(keep_) != len(tickets) {
+		// keep_ was built newest first: put it back oldest first
+		mut back = make([]ticket, 0, len(keep_))
+		mut j = len(keep_) - 1
+		for j >= 0 {
+			back = append(back, keep_[j])
+			j -= 1
+		}
+		tickets = keep(back)
+	}
+	return found, ok
+}
+
+// put_ticket keeps t for a later connection, forgetting the oldest ticket past maxTickets.
+fn put_ticket(t ticket) {
+	mut all = make([]ticket, 0, len(tickets)+1)
+	mut from = 0
+	if len(tickets) >= maxTickets {
+		from = len(tickets) - maxTickets + 1
+	}
+	for i in from..len(tickets) {
+		all = append(all, tickets[i])
+	}
+	all = append(all, t)
+	tickets = keep(all)
+}
+
+// psk_binder is the binder for a PSK offered in a ClientHello whose bytes before the binders are
+// truncated, after the handshake bytes prefix (empty, or message_hash and the HelloRetryRequest).
+fn psk_binder(h seal.Hash, psk []u8, prefix []u8, truncated []u8) ![]u8 {
+	let zero = make([]u8, seal.Size(h))
+	let early = seal.HkdfExtract(h, str(zero), str(psk))
+	let binder_key = try derive_secret(h, early, "res binder", seal.Sum(h, ""))
+	return try finished_mac(h, binder_key, transcript_hash(h, cat(prefix, truncated)))
+}
