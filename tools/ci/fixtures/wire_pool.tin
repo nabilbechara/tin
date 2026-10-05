@@ -1,0 +1,91 @@
+package main
+
+import "anvil"
+import "mint"
+import "quarry"
+import "say"
+import "tls"
+import "wire"
+
+// #348: a client service for wire_pool_check.py. UPSTREAM is the server it calls (http:// or
+// https://, INSECURE=1 skips the certificate check). Routes:
+//   /seq?n=N&path=P&method=M&idle=I   N calls one after the other; "ok=.. err=.. last=.."
+//   /par?n=N&path=P&idle=I            N calls at once, each in its own task
+// idle is Options.MaxIdle; base, when given, replaces UPSTREAM.
+
+fn num(q anvil.Req, name str, dflt i64) i64 {
+	let v = mint.Atoi(q.Param(name)) catch _ { dflt }
+	return v
+}
+
+fn options(q anvil.Req) wire.Options {
+	let o = wire.Options{Timeout: 5000000000, MaxBody: 0, MaxIdle: num(q, "idle", 0)}
+	if quarry.Getenv("INSECURE") == "1" {
+		o.TLS = tls.Config{ServerName: "", RootCAs: "", ALPN: []str{}, Timeout: 0, InsecureSkipVerify: true}
+	}
+	return o
+}
+
+fn call(q anvil.Req, method str) !str {
+	mut base = q.Param("base")
+	if base == "" {
+		base = quarry.Getenv("UPSTREAM")
+	}
+	let url = base + q.Param("path")
+	let r = try wire.DoWith(method, url, []str{}, "", options(q))
+	return "{r.Status}:{r.Body}"
+}
+
+fn seq(q anvil.Req, w mut anvil.Out) {
+	let n = num(q, "n", 1)
+	mut method = q.Param("method")
+	if method == "" {
+		method = "GET"
+	}
+	mut ok i64 = 0
+	mut bad i64 = 0
+	mut last str = ""
+	for i in 0..n {
+		let got = call(q, method) catch err {
+			bad += 1
+			last = "{err}"
+			continue
+		}
+		ok += 1
+		last = got
+	}
+	w.Text("ok={ok} err={bad} last={last}")
+}
+
+fn run_par(q anvil.Req, n i64) !str {
+	mut ok i64 = 0
+	mut bad i64 = 0
+	scope s {
+		for i in 0..n {
+			s.spawn(fn() ! {
+				call(q, "GET") catch _ {
+					bad += 1
+					return
+				}
+				ok += 1
+			})
+		}
+	}
+	return "ok={ok} err={bad}"
+}
+
+fn par(q anvil.Req, w mut anvil.Out) {
+	let got = run_par(q, num(q, "n", 1)) catch err {
+		w.Status(500)
+		w.Text("{err}")
+		return
+	}
+	w.Text(got)
+}
+
+fn main() {
+	let r = anvil.NewRouter()
+	r.Get("/seq", seq)
+	r.Get("/par", par)
+	say.Line("server:", r.Serve(":" + quarry.Getenv("PORT")))
+}

@@ -275,10 +275,11 @@ let r = try wire.Get("http://127.0.0.1:8080/json")
 - `(l Listener) Accept() !Conn`: Accept waits for the next connection.
 - `(l mut Listener) Close()`: Close stops listening.
 - `type Options struct`: Options configure one client call (DoWith); the zero value is what Do uses.
+- `const DefaultMaxIdle = 8`: DefaultMaxIdle is how many idle connections per host (and core) DoWith keeps when Options.MaxIdle is 0.
 - `const DefaultMaxBody = 67108864`: DefaultMaxBody is the largest response body Do accepts (64 MiB, anvil's request limit): a larger one is a fault rather than memory a broken or hostile server can fill.
 - `Get(url str) !Resp`: Get fetches url.
 - `Post(url str, ctype str, body str) !Resp`: Post sends body with content type ctype to url.
-- `Do(method str, url str, headers []str, body str) !Resp`: Do sends one request: headers is a list of name, value pairs. The method and header names must be tokens, and the URL and header values must not hold CR, LF, NUL or other control bytes (the URL no spaces either), or Do fails instead of sending a request an input could have split. Response bodies over DefaultMaxBody fail; DoWith sets a timeout and the limit.
+- `Do(method str, url str, headers []str, body str) !Resp`: Do sends one request: headers is a list of name, value pairs. The method and header names must be tokens, and the URL and header values must not hold CR, LF, NUL or other control bytes (the URL no spaces either), or Do fails instead of sending a request an input could have split. Response bodies over DefaultMaxBody fail; DoWith sets a timeout and the limit.  Connections are kept alive: after a response that ends cleanly (HTTP/1.1, framed by a length or chunks, no "Connection: close") the connection waits in a per-core pool, by scheme, host and port (and TLS settings), and the next call to that host uses it instead of dialing and, for https, doing a TLS handshake. A kept connection is checked before it is used, dropped after 30 s idle, and at most Options.MaxIdle are kept per host. One the server closed meanwhile is replaced by a new connection without the caller seeing it, for a GET, HEAD, PUT, DELETE, OPTIONS or TRACE; any other method (a POST) fails instead of being sent twice.
 - `DoWith(method str, url str, headers []str, body str, opt Options) !Resp`: DoWith is Do with options: an overall timeout and a response size limit.
 - `(r Resp) Header(name str) str`: Header returns the response header name (any case), or "".
 

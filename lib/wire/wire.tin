@@ -384,7 +384,11 @@ type Options struct {
 	Timeout i64         // ns for the whole call: connect, send and the complete response (0: no limit; a request's deadline still applies)
 	MaxBody i64         // largest response body accepted, in bytes (0: DefaultMaxBody)
 	TLS     ?tls.Config // for https://: roots, ALPN, InsecureSkipVerify (nil: verify against the system's roots); the server name is the URL's host
+	MaxIdle i64         // idle keep-alive connections kept per core and host after a call (0: 8; negative: none, every call dials and sends Connection: close)
 }
+
+// DefaultMaxIdle is how many idle connections per host (and core) DoWith keeps when Options.MaxIdle is 0.
+const DefaultMaxIdle = 8
 
 // DefaultMaxBody is the largest response body Do accepts (64 MiB, anvil's request limit):
 // a larger one is a fault rather than memory a broken or hostile server can fill.
@@ -408,8 +412,16 @@ fn none_resp() Resp {
 // must be tokens, and the URL and header values must not hold CR, LF, NUL or other control
 // bytes (the URL no spaces either), or Do fails instead of sending a request an input could
 // have split. Response bodies over DefaultMaxBody fail; DoWith sets a timeout and the limit.
+//
+// Connections are kept alive: after a response that ends cleanly (HTTP/1.1, framed by a length
+// or chunks, no "Connection: close") the connection waits in a per-core pool, by scheme, host
+// and port (and TLS settings), and the next call to that host uses it instead of dialing and,
+// for https, doing a TLS handshake. A kept connection is checked before it is used, dropped after
+// 30 s idle, and at most Options.MaxIdle are kept per host. One the server closed meanwhile is
+// replaced by a new connection without the caller seeing it, for a GET, HEAD, PUT, DELETE,
+// OPTIONS or TRACE; any other method (a POST) fails instead of being sent twice.
 fn Do(method str, url str, headers []str, body str) !Resp {
-	return try DoWith(method, url, headers, body, Options{Timeout: 0, MaxBody: 0})
+	return try DoWith(method, url, headers, body, Options{Timeout: 0, MaxBody: 0, MaxIdle: 0})
 }
 
 // DoWith is Do with options: an overall timeout and a response size limit.
@@ -494,7 +506,24 @@ fn DoWith(method str, url str, headers []str, body str, opt Options) !Resp {
 	req = append(req, path...)
 	req = append(req, " HTTP/1.1\r\nHost: "...)
 	req = append(req, hostport...)
-	req = append(req, "\r\nUser-Agent: tin-wire\r\nConnection: close\r\n"...)
+	req = append(req, "\r\nUser-Agent: tin-wire\r\n"...)
+	mut maxIdle = opt.MaxIdle
+	if maxIdle == 0 {
+		maxIdle = DefaultMaxIdle
+	}
+	mut closes = maxIdle < 0
+	{
+		mut i = 0
+		for i+1 < len(headers) {
+			if fold_eq(headers[i], "Connection") {
+				closes = true // the caller decides: the connection is not kept
+			}
+			i += 2
+		}
+	}
+	if maxIdle < 0 {
+		req = append(req, "Connection: close\r\n"...)
+	}
 	{
 		mut i = 0
 		for i+1 < len(headers) {
@@ -512,34 +541,325 @@ fn DoWith(method str, url str, headers []str, body str, opt Options) !Resp {
 	}
 	req = append(req, "\r\n"...)
 	req = append(req, body...)
+	if closes {
+		maxIdle = -1
+	}
+	let k = call{addr: addr, hostport: hostport, key: pool_key(secure, hostport, opt), req: req, head: method == "HEAD", limit_: limit_, until: until, timeout: opt.Timeout, maxIdle: maxIdle, idem: method == "GET" || method == "HEAD" || method == "PUT" || method == "DELETE" || method == "OPTIONS" || method == "TRACE"}
+	// A kept connection the server closed meanwhile fails before any response byte: once, for a
+	// request that may be repeated, the call goes to a fresh connection.
+	staleRetry = false
 	if secure {
-		let cfg = tls.Config{ServerName: "", RootCAs: "", ALPN: []str{}, Timeout: opt.Timeout, InsecureSkipVerify: false}
-		let given = opt.TLS
-		if given != nil {
-			cfg.RootCAs = given.RootCAs
-			cfg.ALPN = given.ALPN
-			cfg.InsecureSkipVerify = given.InsecureSkipVerify
+		let (r, err) = attempt_tls(k, opt, true)
+		if err != nil && staleRetry {
+			return try attempt_tls(k, opt, false)
 		}
-		cfg.ServerName = tls_host(hostport)
-		let tc = try tls.Dial(addr, cfg)
-		defer tc.Close()
-		tc.SetDeadline(until)
-		try tc.WriteBytes(req)
-		let (r, err) = read_response(mut tc, method == "HEAD", limit_)
 		if err != nil {
 			fail err
 		}
 		return r
 	}
-	let c = try DialTimeout(addr, opt.Timeout)
-	defer c.Close()
-	c.until = until
-	try c.WriteBytes(req)
-	let (r, err) = read_response(mut c, method == "HEAD", limit_)
+	let (r, err) = attempt_plain(k, true)
+	if err != nil && staleRetry {
+		return try attempt_plain(k, false)
+	}
 	if err != nil {
 		fail err
 	}
 	return r
+}
+
+// call is one DoWith call, ready to send.
+type call struct {
+	addr     str
+	hostport str
+	key      str
+	req      []u8
+	head     bool
+	limit_   i64
+	until    i64
+	timeout  i64
+	maxIdle  i64
+	idem     bool
+}
+
+// attempt_plain makes one http:// exchange, on a kept connection to the key when allowed (usePool)
+// and there is one, else on a new one. A connection is kept again when the response ends cleanly.
+fn attempt_plain(k call, usePool bool) !Resp {
+	mut c = Conn{open: false, fd: -1}
+	mut reused = false
+	if usePool && k.maxIdle >= 0 {
+		let fd = pool_take(k.key, false)
+		if fd >= 0 {
+			c = Conn{open: true, fd: fd, timeout: 0}
+			reused = true
+		}
+	}
+	if !reused {
+		c = try DialTimeout(k.addr, k.timeout)
+	}
+	c.until = k.until
+	respSeen = false
+	respReuse = false
+	let werr = c.WriteBytes(k.req)
+	if werr != nil {
+		c.Close()
+		staleRetry = reused && k.idem
+		fail werr
+	}
+	let (r, err) = read_response(mut c, k.head, k.limit_)
+	if err != nil {
+		c.Close()
+		staleRetry = reused && k.idem && !respSeen
+		fail err
+	}
+	if respReuse && k.maxIdle >= 0 && pool_put(k.key, c.fd, nil, k.maxIdle) {
+		return r
+	}
+	c.Close()
+	return r
+}
+
+// attempt_tls is attempt_plain for https://: a kept connection keeps its TLS session.
+fn attempt_tls(k call, opt Options, usePool bool) !Resp {
+	if usePool && k.maxIdle >= 0 {
+		let kept = pool_take_tls(k.key)
+		if kept != nil {
+			return try exchange_tls(mut kept, k, true)
+		}
+	}
+	let cfg = tls.Config{ServerName: "", RootCAs: "", ALPN: []str{}, Timeout: opt.Timeout, InsecureSkipVerify: false}
+	let given = opt.TLS
+	if given != nil {
+		cfg.RootCAs = given.RootCAs
+		cfg.ALPN = given.ALPN
+		cfg.InsecureSkipVerify = given.InsecureSkipVerify
+	}
+	cfg.ServerName = tls_host(k.hostport)
+	let tc = try tls.Dial(k.addr, cfg)
+	return try exchange_tls(mut tc, k, false)
+}
+
+fn exchange_tls(tc mut tls.Conn, k call, reused bool) !Resp {
+	tc.SetDeadline(k.until)
+	respSeen = false
+	respReuse = false
+	let werr = tc.WriteBytes(k.req)
+	if werr != nil {
+		tc.Close()
+		staleRetry = reused && k.idem
+		fail werr
+	}
+	let (r, err) = read_response(mut tc, k.head, k.limit_)
+	if err != nil {
+		tc.Close()
+		staleRetry = reused && k.idem && !respSeen
+		fail err
+	}
+	if respReuse && k.maxIdle >= 0 && tc.Buffered() == 0 && pool_put(k.key, tc.Fd(), tc, k.maxIdle) {
+		return r
+	}
+	tc.Close()
+	return r
+}
+
+// ---- keep-alive connections (#348) ----
+//
+// DoWith keeps a connection that ended a response cleanly (HTTP/1.1, framed by Content-Length or
+// chunks, no "Connection: close", nothing left in the buffer) in a per-core pool, by scheme, host
+// and TLS settings, and sends the next call to the same host on it: no TCP or TLS handshake, no
+// TIME_WAIT socket per call. A kept connection is checked before it is used (a peek for a closed
+// peer), dropped when idle for idleTimeout, and at most Options.MaxIdle are kept per host.
+
+const idleTimeout = 30000000000
+const maxPooled = 256
+
+// An idle connection's record, in malloc'd words.
+const iKey = 0   // the pool key (malloc'd bytes)
+const iKeyN = 1
+const iFd = 2
+const iTLS = 3   // 1: the TLS layer is in idleTLS, by descriptor
+const iSince = 4 // rt_mono_ns() when the connection went idle
+const idleWords = 5
+
+mut idleRecs i64 // per core: [maxPooled] record pointers, 0 for a free place
+let idleTLS = make(map[i64]?tls.Conn)
+
+mut respReuse bool   // the response read last leaves its connection fit for another call
+mut respSeen bool    // the call in progress has received response bytes
+mut staleRetry bool  // the call failed on a kept connection before any response byte: try a new one
+mut chunkTail i64    // read_chunked: where the message ended in its buffer
+mut chunkExtra i64   // read_chunked: bytes in the buffer after the message
+
+// pool_key names the connections one call may use: scheme, host and port, and for https the
+// settings that decide which servers it trusts.
+fn pool_key(secure bool, hostport str, opt Options) str {
+	if !secure {
+		return "http://" + hostport
+	}
+	mut k = "https://" + hostport + "|"
+	let given = opt.TLS
+	if given != nil {
+		if given.InsecureSkipVerify {
+			k += "insecure|"
+		}
+		k += given.RootCAs + "|"
+		for _, a in given.ALPN {
+			k += a + ","
+		}
+	}
+	return k
+}
+
+fn pool_recs() i64 {
+	if idleRecs == 0 {
+		idleRecs = calloc(maxPooled, 8)
+	}
+	return idleRecs
+}
+
+fn rec_key_is(r i64, key str) bool {
+	return r[iKeyN] == len(key) && rt_str_from_raw(r[iKey], r[iKeyN]) == key
+}
+
+// pool_drop frees idle record i of the table and closes its connection.
+fn pool_drop(recs i64, i i64) {
+	let r = recs[i]
+	recs[i] = 0
+	if r[iTLS] != 0 {
+		let tc = idleTLS[r[iFd]]
+		delete(idleTLS, r[iFd])
+		if tc != nil {
+			tc.Close()
+		}
+	} else {
+		rt_sys_close(r[iFd])
+	}
+	free(r[iKey])
+	free(r)
+}
+
+// pool_alive reports whether a kept connection is still open and quiet: a closed peer, or bytes
+// nobody asked for, make it unusable.
+fn pool_alive(r i64) bool {
+	if r[iTLS] != 0 {
+		let tc = idleTLS[r[iFd]]
+		if tc == nil {
+			return false
+		}
+		let buf = make([]u8, 0, 16)
+		let (got, err) = tc.ReadNow(mut buf, 16)
+		return err == nil && got == 0
+	}
+	let b = calloc(1, 8)
+	let k = rt_sys_recv(r[iFd], b, 1, 2)
+	let e = errno()
+	free(b)
+	return k < 0 && (e == EAGAIN || e == 4)
+}
+
+// pool_find takes the newest kept connection to key off the table, closing the ones that went
+// stale on the way: its record, or 0.
+fn pool_find(key str, secure bool) i64 {
+	let recs = pool_recs()
+	let now = rt_mono_ns()
+	mut best = -1
+	for i in 0..maxPooled {
+		let r = recs[i]
+		if r != 0 && (r[iTLS] != 0) == secure && rec_key_is(r, key) {
+			if now-r[iSince] > idleTimeout || !pool_alive(r) {
+				pool_drop(recs, i)
+			} else if best < 0 || r[iSince] > recs[best][iSince] {
+				best = i
+			}
+		}
+	}
+	if best < 0 {
+		return 0
+	}
+	let r = recs[best]
+	recs[best] = 0
+	return r
+}
+
+// pool_take returns the descriptor of a kept plain connection to key, or -1.
+fn pool_take(key str, secure bool) i64 {
+	let r = pool_find(key, secure)
+	if r == 0 {
+		return -1
+	}
+	let fd = r[iFd]
+	free(r[iKey])
+	free(r)
+	return fd
+}
+
+// pool_take_tls returns a kept https connection to key, or nil.
+fn pool_take_tls(key str) ?tls.Conn {
+	let r = pool_find(key, true)
+	if r == 0 {
+		return nil
+	}
+	let fd = r[iFd]
+	let tc = idleTLS[fd]
+	delete(idleTLS, fd)
+	free(r[iKey])
+	free(r)
+	return tc
+}
+
+// pool_put keeps the connection fd (with its TLS layer tc, for https) for the next call to key,
+// and reports whether it did: not when maxIdle of them are kept already (the caller closes it).
+fn pool_put(key str, fd i64, tc ?tls.Conn, maxIdle i64) bool {
+	let recs = pool_recs()
+	mut n = 0
+	mut free_at = -1
+	mut oldest = -1
+	for i in 0..maxPooled {
+		let r = recs[i]
+		if r == 0 {
+			if free_at < 0 {
+				free_at = i
+			}
+		} else if rec_key_is(r, key) {
+			n += 1
+			if oldest < 0 || r[iSince] < recs[oldest][iSince] {
+				oldest = i
+			}
+		}
+	}
+	if n >= maxIdle {
+		return false
+	}
+	if free_at < 0 {
+		return false
+	}
+	let r = calloc(idleWords, 8)
+	r[iKey] = malloc(len(key) + 1)
+	memcpy(r[iKey], cast(i64, key)+8, len(key))
+	r[iKeyN] = len(key)
+	r[iFd] = fd
+	r[iSince] = rt_mono_ns()
+	if tc != nil {
+		r[iTLS] = 1
+		idleTLS[fd] = keep(tc)
+	}
+	recs[free_at] = r
+	return true
+}
+
+// connection_closes reports whether the response head h asks to close the connection after it.
+fn connection_closes(h str) bool {
+	let r = Resp{Status: 0, Body: "", head: h}
+	let v = r.Header("Connection")
+	let n = len(v)
+	mut i = 0
+	for i+5 <= n {
+		if fold_eq(v[i:i+5], "close") {
+			return true
+		}
+		i += 1
+	}
+	return false
 }
 
 // tls_host is the host of "host[:port]" for SNI and certificate checks ("[v6]" gives v6).
@@ -606,6 +926,9 @@ fn read_head[S stream](c mut S, buf mut []u8) !i64 {
 			fail "wire: response headers too large"
 		}
 		let (_, err) = c.Read(mut buf, 4096)
+		if len(buf) > 0 {
+			respSeen = true
+		}
 		if err != nil {
 			if IsEOF(err) {
 				fail "wire: connection closed before the response headers"
@@ -642,6 +965,7 @@ fn read_response[S stream](c mut S, head bool, limit_ i64) !Resp {
 		}
 		let r = Resp{Status: status, Body: "", head: h}
 		let rest = buf[hend:]
+		let keepable = len(h) >= 8 && h[:8] == "HTTP/1.1" && !connection_closes(h)
 		// A 1xx other than 101 precedes the final response: drop it and keep the bytes after it.
 		if status >= 100 && status < 200 && status != 101 {
 			informational += 1
@@ -655,6 +979,7 @@ fn read_response[S stream](c mut S, head bool, limit_ i64) !Resp {
 		}
 		// wire never asks for an upgrade, so a 101 is returned as the final response without a body.
 		if head || status == 204 || status == 304 || status == 101 {
+			respReuse = keepable && status != 101 && len(rest) == 0
 			return r
 		}
 		let (chunked, err0) = transfer_coding(r)
@@ -672,6 +997,7 @@ fn read_response[S stream](c mut S, head bool, limit_ i64) !Resp {
 		if chunked {
 			let b = try read_chunked(mut c, rest, limit_)
 			r.Body = b
+			respReuse = keepable && chunkExtra == 0
 			return r
 		}
 		if n > limit_ {
@@ -680,6 +1006,7 @@ fn read_response[S stream](c mut S, head bool, limit_ i64) !Resp {
 		if n >= 0 {
 			let b = try read_length(mut c, rest, n)
 			r.Body = b
+			respReuse = keepable && len(rest) <= n
 			return r
 		}
 		mut body2 = make([]u8, 0, 4096)
@@ -938,6 +1265,7 @@ fn chunk_trailers[S stream](c mut S, buf mut []u8, pos i64) ! {
 	for {
 		let end = try chunk_line(mut c, mut buf, pos)
 		if end == pos {
+			chunkTail = end + 2
 			return
 		}
 		mut colon = -1
@@ -969,6 +1297,7 @@ fn read_chunked[S stream](c mut S, pending []u8, limit_ i64) !str {
 		pos = end + 2
 		if size == 0 {
 			try chunk_trailers(mut c, mut buf, pos)
+			chunkExtra = len(buf) - chunkTail
 			return str(out)
 		}
 		if size > limit_-len(out) {
