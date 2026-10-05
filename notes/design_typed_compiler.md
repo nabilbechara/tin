@@ -147,9 +147,12 @@ cases and a byte-identical `-S` comparison. The seed is not touched until step 6
   record field is a counted slot: every store goes through `rt_rc_inc` / `rt_rc_dec` (#176), and
   `rt_rc_unqueue` scans the limbo list linearly. Typing the compiler's vector globals and record fields as
   `Vec[T]` made one bootstrap compile 2.6 times slower (5.5 s against 2.1 s), with `rt_rc_unqueue` at 75 % of
-  the samples. Locals and parameters of struct type are not counted and cost nothing. So until the compiler
-  has an uncounted reference (a trusted-code escape from the counts, or a distinct `ref` type), records keep
-  `i64` for fields that hold records, vectors or strings, and only locals, parameters and results are typed.
+  the samples. Locals and parameters of struct type are not counted and cost nothing. The fix is that the compiler's own files (`selfhost/`, `file_trusted` value 2, set in
+  `load_file`) skip the counting of stores (`rc_assign`): the compiler's records live as long as the process, a
+  slot that is never counted is never dropped, and the runtime leaves a block with no count as it is. With
+  that, the same typed globals and fields compile the compiler in 0.32 s, and records, vectors and strings may
+  be typed in globals and fields. Files outside `selfhost/` (the runtime, the library, tools) are counted as
+  before.
   A heuristic that typed fields from their uses also mistyped `TypeExpr.args` (a bitmask for function
   types) and crashed on `fn(mut T)`: field types must come from the writers, not only the readers.
 
