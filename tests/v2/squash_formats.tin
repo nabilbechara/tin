@@ -1,0 +1,129 @@
+package main
+
+import "fault"
+import "say"
+import "seal"
+import "squash"
+import "stamp"
+
+// Snappy, LZ4 and Zstandard, which Go's standard library does not have: vectors written by the
+// reference tools (zstd 1.5 at levels 19 and 1, lz4 1.10 with independent and linked blocks,
+// github.com/golang/snappy) decode to the inputs (600 bytes, CRC-32 3852358364; 300 bytes,
+// 2700197719, the values Go prints in tests/v2/squash.tin); round trips at every level; damage and
+// limits. That the reference tools read this package's output is checked by hand
+// (notes/stdlib_squash.md).
+
+fn text(n i64) str {
+	mut b = make([]u8, 0, n+64)
+	mut i = 0
+	for len(b) < n {
+		b = append(b, "record {i}: the quick brown fox {i*7%13}; "...)
+		i += 1
+	}
+	return str(b[:n])
+}
+
+fn noise(n i64) str {
+	mut b = make([]u8, 0, n)
+	mut x u64 = 12345
+	for i in 0..n {
+		x = x*6364136223846793005 + 1442695040888963407
+		b = append(b, u8(x >> 56))
+	}
+	return str(b)
+}
+
+fn hx(h str) str {
+	let b = seal.HexDecode(h) catch _ { []u8{} }
+	return str(b)
+}
+
+fn show(label str, s str, err fault) {
+	if err != nil {
+		if fault.Is(err, fault.LimitExceeded) {
+			say.Line(label, "limit")
+			return
+		}
+		say.Line(label, "error:", err)
+		return
+	}
+	say.Line(label, len(s), stamp.Crc32(s))
+}
+
+fn flip(s str, at i64) str {
+	mut b = make([]u8, 0, len(s))
+	b = append(b, s...)
+	b[at] = b[at] ^ 1
+	return str(b)
+}
+
+fn main() {
+	let z19 = hx("28b52ffd046855030012440e11903d0600112394e1ee0cd8e48df0ba0b7a47e6e57c18215efe44d0cf30a90882c6c5395801ec0a01d5f532309bcc16bc88810ac0dddade0d21a811f0ebff1b9033d30e11cc1000b9f033f2f50d58e67ef956e5df968741b043c9d900b98ee1860dda3064fd55e68b06e3")
+	let (a, ea) = squash.Unzstd(z19, 1 << 20)
+	show("zstd -19 vector", a, ea)
+	let (b, eb) = squash.Unzstd(hx("28b52ffd04486109001c43e2d5538fcb64d030fdfb29d37a55a95f615c0716388aa783da414b74f3080ce7c3487c362f11d74a2a0ecc52da0284baebc2378f59037b3553ce2820e9db8bb2829219b5f81fdc4966b1e6d19d2d46176c9aae1b83d6fab0f7f63be9d606b12ac9c39ebfb425c6af2cdff78607064eb3caa1873d55194f23db8c6074e924cec00b7ffdbe4e15897c8f9d97961d883f759b179cf3ac27b3337fb22ae15e88000b963ffabd51234cda8001a5abf651691ead5ef873151ad479a28924f01fcaa37173ff2d467468f9468d0020a81ce23cf9f493fdb81968cb812b0cc8efe9d0485fab715f7a756a282717964880c0c3f745341439e872ab31e01b954dfc391f8daaea459253c99e1b7db48cb153e5d889f3ece5a6328500c686f1e8c5304f7129766ca10845a927c4f0ece8609e9dd5"), 1 << 20)
+	show("zstd -1 vector of noise", b, eb)
+	let (c, ec) = squash.Unlz4(hx("04224d186440a7b9000000f3127265636f726420303a2074686520717569636b2062726f776e20666f7820303b2021001f31210003153721001f32210003153121001f33210003153821001f34210003153221001f35210003153921001f36210003153321001f372100031631e8001f38220003153443001f392100031631e9001f314d0104153544001f314e01041631ec001f31500104163645000f51010406cc001f3152010406b5011f3153010407cd000f54010406b7011c31550150776e20666f00000000a7c9c960"), 1 << 20)
+	show("lz4 vector", c, ec)
+	let (d, ed) = squash.Unlz4(hx("04224d187440bdb9000000f3127265636f726420303a2074686520717569636b2062726f776e20666f7820303b2021001f31210003153721001f32210003153121001f33210003153821001f34210003153221001f35210003153921001f36210003153321001f372100031631e8001f38220003153443001f392100031631e9001f314d0104153544001f314e01041631ec001f31500104163645000f51010406cc001f3152010406b5011f3153010407cd000f54010406b7011c31550150776e20666f9a8f0e7200000000a7c9c960"), 1 << 20)
+	show("lz4 vector with linked blocks and content size", d, ed)
+	let (e, ee) = squash.Unsnappy(hx("d804807265636f726420303a2074686520717569636b2062726f776e20666f7820303b200d210031562100003715210032562100003115210033562100003815210034562100003215210035562100003915210036562100003315210037562100003119e80038562200003415430039562100003119e900315a4d010035154400315a4e01003119ec00315a5001003619455a510119cc00315a520139b500315a53011dcd5a540139b70031525501"), 1 << 20)
+	show("snappy vector", e, ee)
+
+	let names = []str{"text0", "text1", "text600", "text70000", "text300000", "noise300", "noise70000", "zeros200000"}
+	let inputs = []str{text(0), text(1), text(600), text(70000), text(300000), noise(300), noise(70000), str(make([]u8, 200000))}
+	for i, s in inputs {
+		for _, lv in []i64{0, 1, 6, 9} {
+			let (back, err) = squash.Unzstd(squash.Zstd(s, lv), 1 << 30)
+			say.Line("roundtrip zstd", names[i], "level", lv, err == nil && back == s)
+		}
+		let (l, el) = squash.Unlz4(squash.Lz4(s), 1 << 30)
+		say.Line("roundtrip lz4", names[i], el == nil && l == s)
+		let (l2, el2) = squash.Unlz4(squash.Lz4NoChecksum(s), 1 << 30)
+		say.Line("roundtrip lz4 without checksum", names[i], el2 == nil && l2 == s)
+		let (lb, elb) = squash.UnLz4Block(squash.Lz4BlockOf(s), 1 << 30)
+		say.Line("roundtrip lz4 block", names[i], elb == nil && lb == s)
+		let (sn, esn) = squash.Unsnappy(squash.Snappy(s), 1 << 30)
+		say.Line("roundtrip snappy", names[i], esn == nil && sn == s)
+	}
+	let big = text(70000)
+	say.Line("zstd text70000 under a fifth", len(squash.Zstd(big, 6)) < len(big)/5)
+	say.Line("lz4 text70000 under a quarter", len(squash.Lz4(big)) < len(big)/4)
+	say.Line("snappy text70000 under a fifth", len(squash.Snappy(big)) < len(big)/5)
+	let rnd = noise(70000)
+	say.Line("zstd noise grows by at most 64 bytes", len(squash.Zstd(rnd, 9)) <= len(rnd)+64)
+	say.Line("lz4 noise grows by at most 64 bytes", len(squash.Lz4(rnd)) <= len(rnd)+64)
+
+	// Two zstd frames and a skippable frame back to back are one output.
+	let two = squash.Zstd("abc", 6) + hx("502a4d18030000007878780") + squash.Zstd("def", 1)
+	let (t2, et2) = squash.Unzstd(two, 100)
+	say.Line("zstd frames back to back", t2, et2 == nil)
+	let (t3, et3) = squash.Unzstd("", 100)
+	say.Line("zstd of nothing", len(t3), et3 == nil)
+
+	// Damage: a changed checksum, a cut stream, a wrong magic number.
+	let (_, d1) = squash.Unzstd(flip(z19, len(z19)-1), 1 << 20)
+	show("zstd changed checksum", "", d1)
+	let (_, d2) = squash.Unzstd(z19[:len(z19)-6], 1 << 20)
+	show("zstd cut", "", d2)
+	let (_, d3) = squash.Unzstd("not zstd at all", 1 << 20)
+	show("zstd wrong magic", "", d3)
+	let l4 = squash.Lz4(big)
+	let (_, d4) = squash.Unlz4(flip(l4, len(l4)-2), 1 << 20)
+	show("lz4 changed content checksum", "", d4)
+	let (_, d5) = squash.Unlz4(flip(l4, 6), 1 << 20)
+	show("lz4 changed header checksum", "", d5)
+	let sn = squash.Snappy(big)
+	let (_, d6) = squash.Unsnappy(sn[:len(sn)-4], 1 << 20)
+	show("snappy cut", "", d6)
+
+	// Limits.
+	let (_, l1) = squash.Unzstd(squash.Zstd(big, 6), 1000)
+	show("zstd over max", "", l1)
+	let (_, l2) = squash.Unlz4(l4, 1000)
+	show("lz4 over max", "", l2)
+	let (_, l3) = squash.Unsnappy(sn, 1000)
+	show("snappy over max", "", l3)
+	let (_, l5) = squash.Unzstd(squash.Zstd(big, 6), 70000)
+	say.Line("zstd exactly max", l5 == nil)
+}

@@ -1,0 +1,893 @@
+package kafka
+
+import "fault"
+import "sift"
+import "tide"
+
+// Consumer groups (the classic protocol): a member joins, the leader assigns partitions with
+// the range or round-robin assignor, and Poll fetches from the member's partitions, heartbeats,
+// follows rebalances and commits. Members are per core (notes/design_kafka.md, section 3).
+
+// Assignor is how a group's leader spreads partitions over its members.
+type Assignor enum {
+	Range      // per topic, consecutive partitions to each member (Java's default)
+	RoundRobin // all partitions dealt in turn
+}
+
+// Start is where a member starts reading a partition the group has no offset for.
+type Start enum {
+	Latest   // only records written from now on (Java's default)
+	Earliest // everything still in the partition
+}
+
+// GroupOptions describe a member.
+type GroupOptions struct {
+	Group        str
+	Topics       []str
+	InstanceID   str        // static membership: a restart with the same id keeps the assignment without a rebalance
+	Session      i64        // ns the coordinator waits for a heartbeat before removing the member (default 45 s)
+	Rebalance    i64        // ns a rebalance may take (default 60 s)
+	Heartbeat    i64        // ns between heartbeats (default 3 s)
+	Assignor     ?Assignor  // nil: Range (offered with RoundRobin)
+	Start        ?Start     // nil: Latest
+	ManualCommit bool       // commit only on Commit (default: each Poll commits what the previous one returned)
+}
+
+// Group is this core's member of a consumer group.
+type Group struct {
+	c  Client
+	id i64
+}
+
+// TopicPartition names a partition and an offset (a position or a committed offset).
+type TopicPartition struct {
+	Topic     str
+	Partition i64
+	Offset    i64
+}
+
+type position struct {
+	topic     str
+	partition i64
+	offset    i64 // the next offset to fetch, -1 until known
+	committed i64 // the last offset committed for it, -1 for none
+}
+
+type member struct {
+	group       str
+	topics      []str
+	instance    str
+	session     i64
+	rebalance   i64
+	heartbeat   i64
+	assignors   []str
+	earliest    bool
+	autoCommit  bool
+	memberID    str
+	generation  i64
+	joined      bool
+	rejoin      bool
+	lastBeat    i64
+	assigned    []position
+	closed      bool
+}
+
+const maxGroups = 256
+
+// members holds this core's group members, by Group id.
+let members = make([]?member, maxGroups)
+mut nGroups i64
+
+// Group makes this core's member of a consumer group. It joins on the first Poll.
+fn (c Client) Group(o GroupOptions) !Group {
+	if o.Group == "" || len(o.Topics) == 0 {
+		fail "kafka: a group member needs a group and topics"
+	}
+	if nGroups >= maxGroups {
+		fail "kafka: more than {maxGroups} group members on this core"
+	}
+	mut asg = []str{"range", "roundrobin"}
+	let a = o.Assignor
+	if a != nil {
+		match a {
+			RoundRobin => {
+				asg = []str{"roundrobin", "range"}
+			}
+			Range => {
+			}
+		}
+	}
+	mut earliest = false
+	let st = o.Start
+	if st != nil {
+		match st {
+			Earliest => {
+				earliest = true
+			}
+			Latest => {
+			}
+		}
+	}
+	let m = member{group: o.Group, topics: o.Topics, instance: o.InstanceID, session: dflt(o.Session, 45000000000), rebalance: dflt(o.Rebalance, 60000000000), heartbeat: dflt(o.Heartbeat, 3000000000), assignors: asg, earliest: earliest, autoCommit: !o.ManualCommit, memberID: "", generation: -1, joined: false, rejoin: false, lastBeat: 0, assigned: []position{}, closed: false}
+	let id = nGroups
+	nGroups += 1
+	members[id] = keep(m)
+	return Group{c: c, id: id}
+}
+
+fn dflt(v i64, d i64) i64 {
+	if v > 0 {
+		return v
+	}
+	return d
+}
+
+fn (g Group) get() !member {
+	let m = members[g.id]
+	if m == nil {
+		fail "kafka: this group member belongs to another core"
+	}
+	return m
+}
+
+fn (g Group) put(m member) {
+	members[g.id] = keep(m)
+}
+
+// MemberID is the id the coordinator gave this member ("" before it joined).
+fn (g Group) MemberID() str {
+	let m = g.get() catch _ {
+		return ""
+	}
+	return m.memberID
+}
+
+// Generation is the group generation this member is in (-1 before it joined).
+fn (g Group) Generation() i64 {
+	let m = g.get() catch _ {
+		return -1
+	}
+	return m.generation
+}
+
+// Assigned is the member's partitions with the offset each will be read from next (-1 until
+// known).
+fn (g Group) Assigned() []TopicPartition {
+	let m = g.get() catch _ {
+		return []TopicPartition{}
+	}
+	mut out = []TopicPartition{}
+	let ps = m.assigned
+	for _, p in ps {
+		out = append(out, TopicPartition{Topic: p.topic, Partition: p.partition, Offset: p.offset})
+	}
+	return out
+}
+
+// Seek makes the next Poll read the member's partition from offset.
+fn (g Group) Seek(topic str, partition i64, offset i64) ! {
+	mut m = try g.get()
+	mut ps = []position{}
+	mut found = false
+	let as = m.assigned
+	for _, p in as {
+		if p.topic == topic && p.partition == partition {
+			ps = append(ps, position{topic: p.topic, partition: p.partition, offset: offset, committed: p.committed})
+			found = true
+		} else {
+			ps = append(ps, p)
+		}
+	}
+	if !found {
+		fail "kafka: {topic}/{partition} is not assigned to this member"
+	}
+	m.assigned = ps
+	g.put(m)
+}
+
+// ---- protocol helpers ----
+
+fn subscription(topics []str) str {
+	mut b = make([]u8, 0, 64)
+	put16(mut b, 0)
+	putStrs(mut b, topics)
+	put32(mut b, -1) // no user data
+	return str(b)
+}
+
+type assignment struct {
+	member str
+	parts  []TopicPartition
+}
+
+fn encodeAssignment(parts []TopicPartition) str {
+	mut topics = []str{}
+	for _, p in parts {
+		mut seen = false
+		for _, t in topics {
+			if t == p.Topic {
+				seen = true
+			}
+		}
+		if !seen {
+			topics = append(topics, p.Topic)
+		}
+	}
+	mut b = make([]u8, 0, 64)
+	put16(mut b, 0)
+	put32(mut b, len(topics))
+	for _, t in topics {
+		putStr(mut b, t)
+		mut ids = []i64{}
+		for _, p in parts {
+			if p.Topic == t {
+				ids = append(ids, p.Partition)
+			}
+		}
+		putInts(mut b, ids)
+	}
+	put32(mut b, -1)
+	return str(b)
+}
+
+fn decodeAssignment(s str) ![]TopicPartition {
+	mut out = []TopicPartition{}
+	if len(s) == 0 {
+		return out
+	}
+	mut d = newDec(s)
+	d.i16() // version
+	let nt = d.count()
+	for i in 0..nt {
+		let t = d.str()
+		let ps = d.ints()
+		for _, p in ps {
+			out = append(out, TopicPartition{Topic: t, Partition: p, Offset: -1})
+		}
+	}
+	if d.bad {
+		fail damaged("group assignment")
+	}
+	return out
+}
+
+type subscriber struct {
+	id     str // member id, or instance id when the member has one (the order Java sorts by)
+	member str
+	topics []str
+}
+
+fn subscribed(s subscriber, topic str) bool {
+	for _, t in s.topics {
+		if t == topic {
+			return true
+		}
+	}
+	return false
+}
+
+// assign is the leader's assignment for the chosen protocol.
+fn (c Client) assign(protocol str, subs []subscriber) ![]assignment {
+	// Members in order of their (instance or member) id.
+	mut order = make([]subscriber, 0, len(subs))
+	order = append(order, subs...)
+	sift.SortFunc(mut order, fn(a subscriber, b subscriber) i64 {
+		if a.id < b.id {
+			return -1
+		}
+		if a.id > b.id {
+			return 1
+		}
+		return 0
+	})
+	mut topics = []str{}
+	for _, s in order {
+		for _, t in s.topics {
+			mut seen = false
+			for _, x in topics {
+				if x == t {
+					seen = true
+				}
+			}
+			if !seen {
+				topics = append(topics, t)
+			}
+		}
+	}
+	sift.Strs(mut topics)
+	try c.refresh(topics)
+	mut out = make([]assignment, 0, len(order))
+	for _, s in order {
+		out = append(out, assignment{member: s.member, parts: []TopicPartition{}})
+	}
+	if protocol == "roundrobin" {
+		mut next = 0
+		for _, t in topics {
+			let n = c.partsKnown(t)
+			for p in 0..n {
+				// The next member, in turn, that subscribes to t.
+				for k in 0..len(order) {
+					let i = (next + k) % len(order)
+					if subscribed(order[i], t) {
+						out[i].parts = append(out[i].parts, TopicPartition{Topic: t, Partition: p, Offset: -1})
+						next = i + 1
+						break
+					}
+				}
+			}
+		}
+		return out
+	}
+	for _, t in topics {
+		let n = c.partsKnown(t)
+		mut who = []i64{}
+		for i, s in order {
+			if subscribed(s, t) {
+				who = append(who, i)
+			}
+		}
+		if len(who) == 0 || n <= 0 {
+			continue
+		}
+		let per = n / len(who)
+		let extra = n % len(who)
+		for k, i in who {
+			let start = per*k + min(k, extra)
+			mut count = per
+			if k < extra {
+				count += 1
+			}
+			for p in start..start+count {
+				out[i].parts = append(out[i].parts, TopicPartition{Topic: t, Partition: p, Offset: -1})
+			}
+		}
+	}
+	return out
+}
+
+// coordinator is the broker that coordinates group (or, with kind 1, a transactional id).
+fn (c Client) coordinatorOf(key str, kind i64) !str {
+	mut body = make([]u8, 0, 32)
+	putStr(mut body, key)
+	put8(mut body, kind)
+	for attempt in 0..coordAttempts {
+		let (resp, err) = c.anyCall(apiFindCoordinator, body, 0)
+		if err != nil {
+			if !c.retry(err, "", attempt) {
+				fail err
+			}
+			continue
+		}
+		mut d = newDec(resp)
+		d.i32() // throttle
+		let code = d.i16()
+		d.str() // message
+		d.i32() // node id
+		let host = d.str()
+		let port = d.i32()
+		if d.bad {
+			fail damaged("find coordinator")
+		}
+		if code == 0 {
+			return "{host}:{port}"
+		}
+		let kf = kerr(code, "coordinator of {key}")
+		if !fault.Is(kf, ErrCoordinator) || attempt+1 >= coordAttempts || !backoff(attempt) {
+			fail kf
+		}
+	}
+	fail "kafka: no coordinator for {key}"
+}
+
+// coordCall sends a request to key's coordinator, finding it again and retrying while the
+// coordinator is loading or moving. check reads the response's error code (0 for none).
+fn (c Client) coordCall(key str, kind i64, api i64, body []u8, extra i64, check fn(str) i64) !str {
+	for attempt in 0..coordAttempts {
+		let addr = try c.coordinatorOf(key, kind)
+		let (resp, err) = c.call(addr, api, body, extra, false)
+		if err != nil {
+			if fault.Is(err, ErrNetwork) && attempt+1 < coordAttempts && backoff(attempt) {
+				continue
+			}
+			fail err
+		}
+		let code = check(resp)
+		if code == 14 || code == 15 || code == 16 {
+			if attempt+1 < coordAttempts && backoff(attempt) {
+				continue
+			}
+		}
+		return resp
+	}
+	fail "kafka: the coordinator of {key} did not answer"
+}
+
+// ---- joining ----
+
+// join (re)joins the group and takes the assignment the leader made.
+fn (g Group) join() ! {
+	let c = g.c
+	mut m = try g.get()
+	for attempt in 0..coordAttempts {
+		mut body = make([]u8, 0, 128)
+		putStr(mut body, m.group)
+		put32(mut body, m.session / 1000000)
+		put32(mut body, m.rebalance / 1000000)
+		putStr(mut body, m.memberID)
+		putNullStr(mut body, m.instance)
+		putStr(mut body, "consumer")
+		put32(mut body, len(m.assignors))
+		let sub = subscription(m.topics)
+		for _, a in m.assignors {
+			putStr(mut body, a)
+			putBytes(mut body, sub)
+		}
+		let resp = try c.coordCall(m.group, 0, apiJoinGroup, body, m.rebalance, joinCode)
+		mut d = newDec(resp)
+		d.i32() // throttle
+		let code = d.i16()
+		let gen = d.i32()
+		let protocol = d.str()
+		let leader = d.str()
+		let memberID = d.str()
+		mut subs = []subscriber{}
+		let nm = d.count()
+		for i in 0..nm {
+			let mid = d.str()
+			let inst = d.str()
+			let meta = d.bytes()
+			mut md = newDec(meta)
+			md.i16() // subscription version
+			let ts = md.strs()
+			mut key = mid
+			if inst != "" {
+				key = inst
+			}
+			subs = append(subs, subscriber{id: key, member: mid, topics: ts})
+		}
+		if d.bad {
+			fail damaged("join group")
+		}
+		if code == 79 {
+			// MEMBER_ID_REQUIRED: join again with the id the coordinator made for us.
+			m.memberID = memberID
+			continue
+		}
+		if code == 25 {
+			m.memberID = ""
+			continue
+		}
+		if code == 27 {
+			continue
+		}
+		if code != 0 {
+			fail kerr(code, "join group {m.group}")
+		}
+		m.memberID = memberID
+		m.generation = gen
+		// The leader assigns; everyone syncs.
+		mut sync = make([]u8, 0, 128)
+		putStr(mut sync, m.group)
+		put32(mut sync, gen)
+		putStr(mut sync, memberID)
+		putNullStr(mut sync, m.instance)
+		if leader == memberID {
+			let asg = try c.assign(protocol, subs)
+			put32(mut sync, len(asg))
+			for _, a in asg {
+				putStr(mut sync, a.member)
+				putBytes(mut sync, encodeAssignment(a.parts))
+			}
+		} else {
+			put32(mut sync, 0)
+		}
+		let sresp = try c.coordCall(m.group, 0, apiSyncGroup, sync, m.rebalance, syncCode)
+		mut sd = newDec(sresp)
+		sd.i32() // throttle
+		let scode = sd.i16()
+		let mine = sd.bytes()
+		if sd.bad {
+			fail damaged("sync group")
+		}
+		if scode == 27 || scode == 22 {
+			continue
+		}
+		if scode == 25 {
+			m.memberID = ""
+			continue
+		}
+		if scode != 0 {
+			fail kerr(scode, "sync group {m.group}")
+		}
+		let parts = try decodeAssignment(mine)
+		mut ps = []position{}
+		for _, p in parts {
+			ps = append(ps, position{topic: p.Topic, partition: p.Partition, offset: -1, committed: -1})
+		}
+		m.assigned = ps
+		m.joined = true
+		m.rejoin = false
+		m.lastBeat = tide.Now()
+		g.put(m)
+		try g.loadPositions()
+		return
+	}
+	fail fault.Wrap(ErrRebalance, "kafka: could not join group {m.group}")
+}
+
+// The error code of each coordinator response, for coordCall.
+fn joinCode(r str) i64 {
+	mut d = newDec(r)
+	d.i32()
+	return d.i16()
+}
+
+fn syncCode(r str) i64 {
+	mut d = newDec(r)
+	d.i32()
+	return d.i16()
+}
+
+fn noCode(r str) i64 {
+	return 0
+}
+
+// loadPositions sets the offset of each newly assigned partition: the group's committed offset,
+// or the start policy's.
+fn (g Group) loadPositions() ! {
+	let c = g.c
+	mut m = try g.get()
+	if len(m.assigned) == 0 {
+		return
+	}
+	let committed = try c.committedAll(m.group, m.assigned)
+	mut ps = []position{}
+	let as = m.assigned
+	for i, p in as {
+		mut off = committed[i]
+		if off < 0 {
+			if m.earliest {
+				off = try c.listOffset(p.topic, p.partition, -2)
+			} else {
+				off = try c.listOffset(p.topic, p.partition, -1)
+			}
+		}
+		ps = append(ps, position{topic: p.topic, partition: p.partition, offset: off, committed: committed[i]})
+	}
+	m.assigned = ps
+	g.put(m)
+}
+
+// committedAll is group's committed offset of each position's partition (-1 for none).
+fn (c Client) committedAll(group str, ps []position) ![]i64 {
+	mut topics = []str{}
+	for _, p in ps {
+		mut seen = false
+		for _, t in topics {
+			if t == p.topic {
+				seen = true
+			}
+		}
+		if !seen {
+			topics = append(topics, p.topic)
+		}
+	}
+	mut body = make([]u8, 0, 64)
+	putStr(mut body, group)
+	put32(mut body, len(topics))
+	for _, t in topics {
+		putStr(mut body, t)
+		mut ids = []i64{}
+		for _, p in ps {
+			if p.topic == t {
+				ids = append(ids, p.partition)
+			}
+		}
+		putInts(mut body, ids)
+	}
+	let resp = try c.coordCall(group, 0, apiOffsetFetch, body, 0, offsetFetchCode)
+	mut out = make([]i64, len(ps))
+	for i in 0..len(ps) {
+		out[i] = -1
+	}
+	mut d = newDec(resp)
+	d.i32() // throttle
+	let nt = d.count()
+	for i in 0..nt {
+		let t = d.str()
+		let np = d.count()
+		for j in 0..np {
+			let part = d.i32()
+			let off = d.i64()
+			d.i32() // leader epoch
+			d.str() // metadata
+			let code = d.i16()
+			if code != 0 {
+				fail kerr(code, "committed offset of {group} at {t}/{part}")
+			}
+			for k, p in ps {
+				if p.topic == t && p.partition == part {
+					out[k] = off
+				}
+			}
+		}
+	}
+	let top = d.i16()
+	if d.bad {
+		fail damaged("offset fetch")
+	}
+	if top != 0 {
+		fail kerr(top, "committed offsets of {group}")
+	}
+	return out
+}
+
+fn offsetFetchCode(r str) i64 {
+	// The top-level error comes last; a coordinator error there means "find it again".
+	if len(r) >= 2 {
+		return i64(i16(u16(r[len(r)-2])<<8 | u16(r[len(r)-1])))
+	}
+	return 0
+}
+
+// ---- polling ----
+
+// Heartbeat tells the coordinator the member is alive (Poll does it when due). A rebalance makes
+// the next Poll rejoin.
+fn (g Group) Heartbeat() ! {
+	let c = g.c
+	mut m = try g.get()
+	if !m.joined {
+		return
+	}
+	mut body = make([]u8, 0, 64)
+	putStr(mut body, m.group)
+	put32(mut body, m.generation)
+	putStr(mut body, m.memberID)
+	putNullStr(mut body, m.instance)
+	let resp = try c.coordCall(m.group, 0, apiHeartbeat, body, 0, joinCode)
+	mut d = newDec(resp)
+	d.i32()
+	let code = d.i16()
+	m.lastBeat = tide.Now()
+	if code == 27 || code == 22 {
+		m.rejoin = true
+	} else if code == 25 {
+		m.rejoin = true
+		m.memberID = ""
+	} else if code != 0 {
+		g.put(m)
+		fail kerr(code, "heartbeat in group {m.group}")
+	}
+	g.put(m)
+}
+
+// Poll returns the next records of the member's partitions, waiting up to maxWait (less when a
+// heartbeat falls due). It joins the group first, rejoins after a rebalance, heartbeats, and
+// unless ManualCommit is set commits what the previous Poll returned.
+fn (g Group) Poll(maxWait i64) ![]Record {
+	let c = g.c
+	mut m = try g.get()
+	if m.closed {
+		fail "kafka: the group member is closed"
+	}
+	if m.joined && m.autoCommit {
+		let cerr = g.Commit()
+		if cerr != nil && !fault.Is(cerr, ErrRebalance) {
+			fail cerr
+		}
+		m = try g.get()
+	}
+	if m.joined && tide.Now()-m.lastBeat >= m.heartbeat {
+		try g.Heartbeat()
+		m = try g.get()
+	}
+	if !m.joined || m.rejoin {
+		try g.join()
+		m = try g.get()
+	}
+	if len(m.assigned) == 0 {
+		// Nothing assigned: wait (in heartbeat-sized steps) for a rebalance to give us work.
+		let wait = min(maxWait, m.heartbeat)
+		if wait > 0 {
+			try tide.Wait(wait)
+		}
+		return []Record{}
+	}
+	let left = m.heartbeat - (tide.Now() - m.lastBeat)
+	let wait = max(min(maxWait, left), 0)
+	mut wants = []Want{}
+	let as = m.assigned
+	for _, p in as {
+		wants = append(wants, Want{Topic: p.topic, Partition: p.partition, Offset: p.offset})
+	}
+	let f = try c.FetchAll(wants, wait)
+	// Move each position past what came back; an offset out of range restarts by the policy.
+	mut ps = []position{}
+	for _, p in as {
+		mut off = p.offset
+		for _, pt in f.Parts {
+			if pt.Topic != p.topic || pt.Partition != p.partition {
+				continue
+			}
+			if pt.OutOfRange {
+				if m.earliest {
+					off = pt.LogStart
+				} else {
+					off = pt.HighWatermark
+				}
+			} else {
+				off = pt.Next
+			}
+		}
+		ps = append(ps, position{topic: p.topic, partition: p.partition, offset: off, committed: p.committed})
+	}
+	m.assigned = ps
+	g.put(m)
+	return f.Records
+}
+
+// Commit stores the member's positions (the offsets after the records Poll returned) as the
+// group's committed offsets. A rebalance in the meantime fails it with ErrRebalance.
+fn (g Group) Commit() ! {
+	let m = try g.get()
+	mut parts = []TopicPartition{}
+	let as = m.assigned
+	for _, p in as {
+		if p.offset >= 0 && p.offset != p.committed {
+			parts = append(parts, TopicPartition{Topic: p.topic, Partition: p.partition, Offset: p.offset})
+		}
+	}
+	try g.CommitOffsets(parts)
+}
+
+// CommitOffsets stores the given offsets (each the next offset to read) for the group.
+fn (g Group) CommitOffsets(parts []TopicPartition) ! {
+	if len(parts) == 0 {
+		return
+	}
+	let c = g.c
+	mut m = try g.get()
+	let body = commitBody(m.group, m.generation, m.memberID, m.instance, parts)
+	let resp = try c.coordCall(m.group, 0, apiOffsetCommit, body, 0, commitCode)
+	let code = commitCode(resp)
+	if code == 27 || code == 22 || code == 25 {
+		m.rejoin = true
+		if code == 25 {
+			m.memberID = ""
+		}
+		g.put(m)
+		fail kerr(code, "commit in group {m.group}")
+	}
+	if code != 0 {
+		fail kerr(code, "commit in group {m.group}")
+	}
+	mut ps = []position{}
+	let as = m.assigned
+	for _, p in as {
+		mut committed = p.committed
+		for _, q in parts {
+			if q.Topic == p.topic && q.Partition == p.partition {
+				committed = q.Offset
+			}
+		}
+		ps = append(ps, position{topic: p.topic, partition: p.partition, offset: p.offset, committed: committed})
+	}
+	m.assigned = ps
+	g.put(m)
+}
+
+fn commitBody(group str, gen i64, memberID str, instance str, parts []TopicPartition) []u8 {
+	mut topics = []str{}
+	for _, p in parts {
+		mut seen = false
+		for _, t in topics {
+			if t == p.Topic {
+				seen = true
+			}
+		}
+		if !seen {
+			topics = append(topics, p.Topic)
+		}
+	}
+	mut b = make([]u8, 0, 128)
+	putStr(mut b, group)
+	put32(mut b, gen)
+	putStr(mut b, memberID)
+	putNullStr(mut b, instance)
+	put32(mut b, len(topics))
+	for _, t in topics {
+		putStr(mut b, t)
+		mut n = 0
+		for _, p in parts {
+			if p.Topic == t {
+				n += 1
+			}
+		}
+		put32(mut b, n)
+		for _, p in parts {
+			if p.Topic != t {
+				continue
+			}
+			put32(mut b, p.Partition)
+			put64(mut b, p.Offset)
+			put32(mut b, -1)  // leader epoch: unknown
+			putNullStr(mut b, "")
+		}
+	}
+	return b
+}
+
+// commitCode is the first nonzero partition error of an OffsetCommit response.
+fn commitCode(r str) i64 {
+	mut d = newDec(r)
+	d.i32()
+	let nt = d.count()
+	for i in 0..nt {
+		d.str()
+		let np = d.count()
+		for j in 0..np {
+			d.i32()
+			let code = d.i16()
+			if code != 0 {
+				return code
+			}
+		}
+	}
+	return 0
+}
+
+// Close commits (unless ManualCommit) and leaves the group, so its partitions move to the other
+// members at once. A static member (InstanceID) does not leave: its session keeps its partitions
+// for a restart.
+fn (g Group) Close() ! {
+	let c = g.c
+	mut m = try g.get()
+	if m.closed {
+		return
+	}
+	mut first fault = nil
+	if m.joined && m.autoCommit {
+		let err = g.Commit()
+		if err != nil {
+			first = err
+		}
+		m = try g.get()
+	}
+	if m.joined && m.instance == "" {
+		mut body = make([]u8, 0, 64)
+		putStr(mut body, m.group)
+		put32(mut body, 1)
+		putStr(mut body, m.memberID)
+		putNullStr(mut body, "")
+		let (_, err) = c.coordCall(m.group, 0, apiLeaveGroup, body, 0, joinCode)
+		if err != nil && first == nil {
+			first = err
+		}
+	}
+	m.closed = true
+	m.joined = false
+	g.put(m)
+	if first != nil {
+		fail first
+	}
+}
+
+// ---- offsets without membership ----
+
+// Commit stores offset as group's position in the partition, without being a member (the
+// "simple consumer" commit: generation -1). The offset is the next one to read.
+fn (c Client) Commit(group str, topic str, partition i64, offset i64) ! {
+	let body = commitBody(group, -1, "", "", []TopicPartition{TopicPartition{Topic: topic, Partition: partition, Offset: offset}})
+	let resp = try c.coordCall(group, 0, apiOffsetCommit, body, 0, commitCode)
+	let code = commitCode(resp)
+	if code != 0 {
+		fail kerr(code, "commit of group {group} at {topic}/{partition}")
+	}
+}
+
+// Committed is the offset group last committed for the partition, or -1 when it has none.
+fn (c Client) Committed(group str, topic str, partition i64) !i64 {
+	let offs = try c.committedAll(group, []position{position{topic: topic, partition: partition, offset: -1, committed: -1}})
+	return offs[0]
+}

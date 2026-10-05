@@ -1,0 +1,855 @@
+package kafka
+
+import "fault"
+import "say"
+import "tls"
+import "wire"
+
+// Connections. Each core keeps one connection per broker for each Client. The requests a core
+// serves at the same time share a connection: their frames are written together and the
+// responses matched in order (a Kafka broker answers one connection's requests in the order it
+// received them), so a busy service makes few system calls per request. Inside a request task a
+// call waits without blocking the core; outside one it blocks. The design is the one of the
+// redis client, with Kafka's length-prefixed frames in place of RESP.
+//
+// A new connection first asks the broker which request versions it speaks (ApiVersions) and
+// authenticates (SASL PLAIN or SCRAM); the requests already queued go out after that.
+
+const maxClients = 128
+const maxBrokers = 64 // connections one client keeps, per core (two per broker at most)
+const maxFrame = 256 * 1024 * 1024
+
+// The shared record of a Client: its options, copied out of any pool.
+const rClient = 0
+const rClientN = 1
+const rUser = 2
+const rUserN = 3
+const rPass = 4
+const rPassN = 5
+const rTimeout = 6
+const rID = 7
+const rTls = 8      // the kept tls.Config, or 0 for plain TCP
+const rAcks = 9
+const rFetchMax = 10
+const rBoots = 11   // the bootstrap addresses, comma separated
+const rBootsN = 12
+const rMech = 13    // 0 PLAIN, 1 SCRAM-SHA-256, 2 SCRAM-SHA-512
+const rCodec = 14
+const rIdem = 15    // 1: idempotent producer
+const rBatchMax = 16
+const rIsolation = 17
+const rLinger = 18
+const recWords = 19
+
+// A core's connection to one broker.
+const lFd = 0
+const lOut = 1    // frames not yet written
+const lOutN = 2
+const lOutCap = 3
+const lWpos = 4   // how much of lOut is written
+const lIn = 5     // bytes read, from lInS to lInE not yet delivered
+const lInS = 6
+const lInE = 7
+const lInCap = 8
+const lQ = 9      // the slots waiting for responses, in order
+const lQHead = 10
+const lQN = 11
+const lQCap = 12
+const lBusy = 13  // a task is doing the connection's I/O
+const lID = 14    // client id * maxBrokers + broker slot: its TLS connection is tlsLines[lID]
+const lCorr = 15  // the next correlation id
+const lAddr = 16
+const lAddrN = 17
+const lVers = 18  // the broker's version range of each request: min, max (calloc'd), 0 before the handshake
+const lineWords = 19
+
+// A slot: one caller's request and the response it gets.
+const sTask = 0
+const sState = 1    // 0 waiting, 1 done, 2 failed
+const sGone = 2     // the caller gave up; free the slot when its response arrives
+const sOwner = 3    // the caller must take over the connection's I/O
+const sMsg = 4      // the response, without its size
+const sMsgN = 5
+const sErr = 6      // why it failed
+const sErrN = 7
+const sNoReply = 8  // a request the broker does not answer (acks 0): done once written
+const sCorr = 9     // the correlation id the response must carry
+const slotWords = 10
+
+// The start of the message of a failed SASL handshake, which call turns into ErrAuth.
+const authFailed = "kafka: connecting: authentication failed"
+
+shared mut nClients i64
+mut conns i64 // per core: the connection of each (client, broker slot)
+
+// tlsLines holds each TLS connection of this core, by line id. Replacing or clearing one
+// releases the old connection's memory (it is counted long-lived memory, from keep).
+let tlsLines = make([]?tls.Conn, maxClients*maxBrokers+1)
+
+fn keep_raw(s str) i64 {
+	let p = malloc(len(s) + 1)
+	memcpy(p, cast(i64, s)+8, len(s))
+	return p
+}
+
+fn raw_str(p i64, n i64) str {
+	return rt_str_from_raw(p, n)
+}
+
+// A broker answers one request of a connection at a time, so a request it may hold (a fetch
+// waiting for records, a JoinGroup waiting for the other members) would hold up every request
+// behind it. Those go on a second connection to the broker, keyed by the address and this mark.
+const waitLane = "#wait"
+
+fn holds(api i64) bool {
+	return api == apiFetch || api == apiJoinGroup || api == apiSyncGroup
+}
+
+// dialAddr is the address a line connects to (its key without the lane mark).
+fn dialAddr(l i64) str {
+	let key = raw_str(l[lAddr], l[lAddrN])
+	if len(key) > len(waitLane) && key[len(key)-len(waitLane):] == waitLane {
+		return key[:len(key)-len(waitLane)]
+	}
+	return key
+}
+
+// line is the core's connection record for key (a broker address, with waitLane for the
+// broker's second connection), made on first use. It is 0 when the client already keeps
+// maxBrokers connections.
+fn (c Client) line(addr str) i64 {
+	if conns == 0 {
+		conns = calloc(maxClients*maxBrokers, 8)
+	}
+	let id = c.rec[rID]
+	for k in 0..maxBrokers {
+		mut l = conns[id*maxBrokers+k]
+		if l == 0 {
+			l = calloc(lineWords, 8)
+			l[lFd] = -1
+			l[lID] = id*maxBrokers + k
+			l[lAddr] = keep_raw(addr)
+			l[lAddrN] = len(addr)
+			conns[id*maxBrokers+k] = l
+			return l
+		}
+		if l[lAddrN] == len(addr) && raw_str(l[lAddr], l[lAddrN]) == addr {
+			return l
+		}
+	}
+	return 0
+}
+
+// ---- the queue of slots ----
+
+fn new_slot(corr i64) i64 {
+	let s = calloc(slotWords, 8)
+	s[sTask] = rt_task_current()
+	s[sCorr] = corr
+	return s
+}
+
+fn free_slot(s i64) {
+	if s[sMsg] != 0 {
+		free(s[sMsg])
+	}
+	if s[sErr] != 0 {
+		free(s[sErr])
+	}
+	free(s)
+}
+
+fn q_grow(l i64) {
+	if l[lQHead]+l[lQN] < l[lQCap] {
+		return
+	}
+	let q = l[lQ]
+	if l[lQHead] > 0 {
+		memmove(q, q+8*l[lQHead], 8*l[lQN])
+		l[lQHead] = 0
+		return
+	}
+	let cap = l[lQCap]*2 + 32
+	l[lQ] = realloc(q, 8*cap)
+	l[lQCap] = cap
+}
+
+fn q_push(l i64, s i64) {
+	q_grow(l)
+	let q = l[lQ]
+	q[l[lQHead]+l[lQN]] = s
+	l[lQN] += 1
+}
+
+fn q_at(l i64, i i64) i64 {
+	let q = l[lQ]
+	return q[l[lQHead]+i]
+}
+
+fn q_pop(l i64) i64 {
+	let s = q_at(l, 0)
+	l[lQHead] += 1
+	l[lQN] -= 1
+	if l[lQN] == 0 {
+		l[lQHead] = 0
+	}
+	return s
+}
+
+fn wake(s i64) {
+	let t = s[sTask]
+	if t != 0 && t != rt_task_current() {
+		rt_task_wake(t)
+	}
+}
+
+fn set_err(s i64, msg str) {
+	s[sErr] = keep_raw(msg)
+	s[sErrN] = len(msg)
+}
+
+// close_line drops the connection without failing anyone (its queue is empty or about to be failed).
+fn close_line(l i64) {
+	if l[lFd] >= 0 {
+		// A TLS connection is dropped without close_notify: the descriptor goes either way.
+		tlsLines[l[lID]] = nil
+		rt_sys_close(l[lFd])
+		l[lFd] = -1
+	}
+	if l[lVers] != 0 {
+		free(l[lVers])
+		l[lVers] = 0
+	}
+}
+
+// fail_line closes the connection and fails every caller waiting on it.
+fn fail_line(l i64, msg str) {
+	close_line(l)
+	for l[lQN] > 0 {
+		let s = q_pop(l)
+		if s[sGone] != 0 {
+			free_slot(s)
+			continue
+		}
+		set_err(s, msg)
+		s[sState] = 2
+		wake(s)
+	}
+	l[lOutN] = 0
+	l[lWpos] = 0
+	l[lInS] = 0
+	l[lInE] = 0
+}
+
+fn os_msg(what str, e i64) str {
+	let m = rt_sys_strerror(e)
+	return "kafka: {what}: {raw_str(m, strlen(m))}"
+}
+
+// hand_off gives the connection's I/O to the first caller still waiting, if any.
+fn hand_off(l i64) {
+	l[lBusy] = 0
+	for i in 0..l[lQN] {
+		let s = q_at(l, i)
+		if s[sGone] == 0 && s[sTask] != 0 && s[sTask] != rt_task_current() {
+			s[sOwner] = 1
+			l[lBusy] = 1
+			rt_task_wake(s[sTask])
+			return
+		}
+	}
+}
+
+// ---- responses ----
+
+fn be32raw(p i64) i64 {
+	let v = u32(load8(p))<<24 | u32(load8(p+1))<<16 | u32(load8(p+2))<<8 | u32(load8(p+3))
+	return i64(i32(v))
+}
+
+// frame_ready is the size of the complete frame at the start of the read buffer, -1 while it
+// is incomplete (after making room for it), -2 when the size is not believable.
+fn frame_ready(l i64) i64 {
+	let have = l[lInE] - l[lInS]
+	if have < 4 {
+		return -1
+	}
+	let p = l[lIn] + l[lInS]
+	let size = be32raw(p)
+	if size < 4 || size > maxFrame {
+		return -2
+	}
+	if have < 4+size {
+		// Make room for the rest of a large frame in one step.
+		if l[lInS]+4+size > l[lInCap] {
+			if l[lInS] > 0 {
+				memmove(l[lIn], p, have)
+				l[lInE] = have
+				l[lInS] = 0
+			}
+			if 4+size > l[lInCap] {
+				l[lIn] = realloc(l[lIn], 4+size)
+				l[lInCap] = 4 + size
+			}
+		}
+		return -1
+	}
+	return size
+}
+
+// deliver hands each complete response to the slot at the front of the queue.
+fn deliver(l i64) {
+	for l[lQN] > 0 {
+		let size = frame_ready(l)
+		if size == -1 {
+			break
+		}
+		if size == -2 {
+			fail_line(l, "kafka: the broker sent a frame of {be32raw(l[lIn]+l[lInS])} bytes")
+			return
+		}
+		let p = l[lIn] + l[lInS]
+		let s = q_at(l, 0)
+		let corr = be32raw(p + 4)
+		if corr != s[sCorr] {
+			fail_line(l, "kafka: the broker answered request {corr} where {s[sCorr]} was next")
+			return
+		}
+		s[sMsg] = malloc(size + 1)
+		memcpy(s[sMsg], p+4, size)
+		s[sMsgN] = size
+		l[lInS] += 4 + size
+		q_pop(l)
+		if s[sGone] != 0 {
+			free_slot(s)
+		} else {
+			s[sState] = 1
+			wake(s)
+		}
+	}
+	if l[lInS] == l[lInE] {
+		l[lInS] = 0
+		l[lInE] = 0
+	}
+}
+
+// ---- the handshake ----
+
+fn next_corr(l i64) i64 {
+	let n = l[lCorr]
+	l[lCorr] = (n + 1) & 0x7fffffff
+	return n
+}
+
+// write_all writes n bytes at p on the connection, waiting as needed (the handshake's writes).
+fn write_all(l i64, p i64, n i64, timeout i64) ! {
+	let tc = tlsLines[l[lID]]
+	if tc != nil {
+		try tc.Write(raw_str(p, n))
+		return
+	}
+	mut done = 0
+	for done < n {
+		let k = rt_sys_write(l[lFd], p+done, n-done)
+		if k > 0 {
+			done += k
+			continue
+		}
+		let e = rt_errno()
+		if e == EINTR {
+			continue
+		}
+		if e == EAGAIN {
+			let r = rt_task_wait(l[lFd], 2, timeout)
+			if r == waitDeadline {
+				fail cast(fault, rt_wait_fault())
+			}
+			if r != waitReady {
+				fail "kafka: timed out connecting"
+			}
+			continue
+		}
+		fail os_msg("write", e)
+	}
+}
+
+// read_frame reads one whole frame into the read buffer and returns its size; the frame is at
+// lIn+lInS+4 until the caller moves lInS on.
+fn read_frame(l i64, timeout i64) !i64 {
+	for {
+		let size = frame_ready(l)
+		if size == -2 {
+			fail "kafka: the broker sent a frame of {be32raw(l[lIn]+l[lInS])} bytes"
+		}
+		if size >= 0 {
+			return size
+		}
+		if l[lInE] == l[lInCap] {
+			let cap = l[lInCap]*2 + 16384
+			l[lIn] = realloc(l[lIn], cap)
+			l[lInCap] = cap
+		}
+		let tc = tlsLines[l[lID]]
+		if tc != nil {
+			let buf = make([]u8, 0, l[lInCap]-l[lInE])
+			let got = try tc.ReadNow(mut buf, l[lInCap]-l[lInE])
+			if got > 0 {
+				memcpy(l[lIn]+l[lInE], cast(i64, buf)[2], got)
+				l[lInE] += got
+				continue
+			}
+		} else {
+			let k = rt_sys_read(l[lFd], l[lIn]+l[lInE], l[lInCap]-l[lInE])
+			if k > 0 {
+				l[lInE] += k
+				continue
+			}
+			if k == 0 {
+				fail "kafka: the broker closed the connection"
+			}
+			let e = rt_errno()
+			if e == EINTR {
+				continue
+			}
+			if e != EAGAIN {
+				fail os_msg("read", e)
+			}
+		}
+		let r = rt_task_wait(l[lFd], 1, timeout)
+		if r == waitDeadline {
+			fail cast(fault, rt_wait_fault())
+		}
+		if r != waitReady {
+			fail "kafka: timed out connecting"
+		}
+	}
+}
+
+// hs_call sends one handshake request and returns its response after the correlation id.
+fn hs_call(l i64, client str, api i64, body []u8, timeout i64) !str {
+	let corr = next_corr(l)
+	mut req = request(api, version(api), corr, client)
+	req = append(req, body...)
+	finish(mut req)
+	try write_all(l, cast(i64, req)[2], len(req), timeout)
+	let size = try read_frame(l, timeout)
+	let p = l[lIn] + l[lInS]
+	if be32raw(p+4) != corr {
+		fail "kafka: the broker answered request {be32raw(p+4)} where {corr} was next"
+	}
+	let resp = raw_str(p+8, size-4)
+	l[lInS] += 4 + size
+	if l[lInS] == l[lInE] {
+		l[lInS] = 0
+		l[lInE] = 0
+	}
+	return resp
+}
+
+// handshake learns the broker's request versions and authenticates the connection.
+fn handshake(l i64, rec i64, timeout i64) ! {
+	let client = raw_str(rec[rClient], rec[rClientN])
+	let av = try hs_call(l, client, apiApiVersions, make([]u8, 0), timeout)
+	mut d = newDec(av)
+	let code = d.i16()
+	let vers = calloc(apiCount*2, 8)
+	for i in 0..apiCount*2 {
+		vers[i] = -1
+	}
+	let n = d.count()
+	for i in 0..n {
+		let api = d.i16()
+		let lo = d.i16()
+		let hi = d.i16()
+		if api >= 0 && api < apiCount {
+			vers[2*api] = lo
+			vers[2*api+1] = hi
+		}
+	}
+	if d.bad || (code != 0 && n == 0) {
+		free(vers)
+		fail "kafka: connecting: the broker's ApiVersions answer is damaged ({errName(code)})"
+	}
+	l[lVers] = vers
+	let user = raw_str(rec[rUser], rec[rUserN])
+	let pass = raw_str(rec[rPass], rec[rPassN])
+	if user == "" && pass == "" {
+		return
+	}
+	let mech = rec[rMech]
+	mut name = "PLAIN"
+	if mech == 1 {
+		name = "SCRAM-SHA-256"
+	} else if mech == 2 {
+		name = "SCRAM-SHA-512"
+	}
+	mut hb = make([]u8, 0, 32)
+	putStr(mut hb, name)
+	let hr = try hs_call(l, client, apiSaslHandshake, hb, timeout)
+	mut hd = newDec(hr)
+	let hcode = hd.i16()
+	let offered = hd.strs()
+	if hcode != 0 {
+		fail "kafka: connecting: the broker does not accept SASL {name} (it offers {offered}): {errName(hcode)}"
+	}
+	if mech == 0 {
+		_ = try sasl_step(l, client, "\x00" + user + "\x00" + pass, timeout)
+		return
+	}
+	try scram(l, client, mech, user, pass, timeout)
+}
+
+// sasl_step sends one SaslAuthenticate token and returns the broker's.
+fn sasl_step(l i64, client str, token str, timeout i64) !str {
+	mut b = make([]u8, 0, len(token)+8)
+	putBytes(mut b, token)
+	let r = try hs_call(l, client, apiSaslAuthenticate, b, timeout)
+	mut d = newDec(r)
+	let code = d.i16()
+	let msg = d.str()
+	let out = d.bytes()
+	if code != 0 {
+		if msg != "" {
+			fail "{authFailed}: {msg}"
+		}
+		fail "{authFailed}: {errName(code)}"
+	}
+	if d.bad {
+		fail "kafka: connecting: the broker's SaslAuthenticate answer is damaged"
+	}
+	return out
+}
+
+// ---- the connection ----
+
+// connect dials the broker and runs the handshake; the requests already queued wait for it.
+fn connect(l i64, rec i64, timeout i64) ! {
+	let addr = dialAddr(l)
+	if rec[rTls] != 0 {
+		let base = cast(tls.Config, rec[rTls])
+		let cfg = tls.Config{ServerName: base.ServerName, RootCAs: base.RootCAs, ALPN: base.ALPN, Timeout: timeout, InsecureSkipVerify: base.InsecureSkipVerify}
+		let tc = try tls.Dial(addr, cfg)
+		tc.SetTimeout(timeout)
+		l[lFd] = tc.Fd()
+		tlsLines[l[lID]] = keep(tc)
+	} else {
+		let conn = try wire.DialTimeout(addr, timeout)
+		l[lFd] = conn.Fd()
+	}
+	// The read buffer holds no answers yet: anything in it belonged to the closed connection.
+	l[lInS] = 0
+	l[lInE] = 0
+	let err = handshake(l, rec, timeout)
+	if err != nil {
+		close_line(l)
+		fail err
+	}
+}
+
+// give_up ends a wait that ran out of time: the slot stays queued for its response.
+fn give_up(l i64, s i64, r i64) ! {
+	s[sGone] = 1
+	if s[sOwner] != 0 || l[lBusy] == 0 {
+		hand_off(l)
+	}
+	if r == waitDeadline {
+		fail cast(fault, rt_wait_fault())
+	}
+	fail "kafka: timed out"
+}
+
+// drive does the connection's I/O until s has its response (or, for a request the broker does
+// not answer, until it is written): writes what is queued, reads, and hands responses to their
+// slots. Then it passes the I/O on to a caller still waiting.
+fn drive(l i64, s i64, rec i64, timeout i64) ! {
+	if l[lFd] >= 0 && l[lQN] <= 1 && l[lOutN] > 0 && l[lWpos] == 0 && l[lInE] == 0 {
+		// An idle connection the broker may have closed (a restart, an idle timeout): find
+		// out before sending, so the request goes on a new connection instead of failing.
+		let b = calloc(1, 8)
+		let k = rt_sys_recv(l[lFd], b, 1, 2)
+		free(b)
+		if k == 0 || (k < 0 && rt_errno() != EAGAIN && rt_errno() != EINTR) {
+			close_line(l)
+		}
+	}
+	if l[lFd] < 0 {
+		let err = connect(l, rec, timeout)
+		if err != nil {
+			let m = say.Str(err)
+			fail_line(l, m)
+			if s[sNoReply] != 0 {
+				s[sState] = 2
+				set_err(s, m)
+			}
+			hand_off(l)
+			return
+		}
+	}
+	// Let the core run the other requests of this turn first: their frames go out with ours.
+	rt_task_defer()
+	for s[sState] == 0 {
+		let fd = l[lFd]
+		if fd < 0 {
+			// The connection failed under us: its callers have been told.
+			if s[sNoReply] != 0 {
+				s[sState] = 2
+				set_err(s, "kafka: the connection failed")
+			}
+			break
+		}
+		let tc = tlsLines[l[lID]]
+		if tc != nil && l[lWpos] < l[lOutN] {
+			// A TLS write waits inside tls (records cannot be half sent); a fault drops the
+			// connection.
+			let err = tc.Write(raw_str(l[lOut]+l[lWpos], l[lOutN]-l[lWpos]))
+			if err != nil {
+				fail_line(l, say.Str(err))
+				continue
+			}
+			l[lWpos] = 0
+			l[lOutN] = 0
+			continue
+		}
+		if l[lWpos] < l[lOutN] {
+			let k = rt_sys_write(fd, l[lOut]+l[lWpos], l[lOutN]-l[lWpos])
+			if k > 0 {
+				l[lWpos] += k
+				if l[lWpos] == l[lOutN] {
+					l[lWpos] = 0
+					l[lOutN] = 0
+				}
+				continue
+			}
+			let e = rt_errno()
+			if e == EINTR {
+				continue
+			}
+			if e == EAGAIN {
+				let r = rt_task_wait(fd, 2, timeout)
+				if r != waitReady {
+					fail give_up(l, s, r)
+				}
+				continue
+			}
+			fail_line(l, os_msg("write", e))
+			continue
+		}
+		if s[sNoReply] != 0 {
+			s[sState] = 1
+			break
+		}
+		deliver(l)
+		if s[sState] != 0 || l[lOutN] > 0 {
+			continue
+		}
+		if l[lInE] == l[lInCap] {
+			let cap = l[lInCap]*2 + 16384
+			l[lIn] = realloc(l[lIn], cap)
+			l[lInCap] = cap
+		}
+		if tc != nil {
+			let buf = make([]u8, 0, l[lInCap]-l[lInE])
+			let (got, rerr) = tc.ReadNow(mut buf, l[lInCap]-l[lInE])
+			if rerr != nil {
+				fail_line(l, say.Str(rerr))
+				continue
+			}
+			if got > 0 {
+				memcpy(l[lIn]+l[lInE], cast(i64, buf)[2], got)
+				l[lInE] += got
+				continue
+			}
+			let r = rt_task_wait(fd, 1, timeout)
+			if r != waitReady {
+				fail give_up(l, s, r)
+			}
+			continue
+		}
+		let k = rt_sys_read(fd, l[lIn]+l[lInE], l[lInCap]-l[lInE])
+		if k > 0 {
+			l[lInE] += k
+			continue
+		}
+		if k == 0 {
+			fail_line(l, "kafka: the broker closed the connection")
+			continue
+		}
+		let e = rt_errno()
+		if e == EINTR {
+			continue
+		}
+		if e == EAGAIN {
+			let r = rt_task_wait(fd, 1, timeout)
+			if r != waitReady {
+				fail give_up(l, s, r)
+			}
+			continue
+		}
+		fail_line(l, os_msg("read", e))
+	}
+	hand_off(l)
+}
+
+// supports checks the broker at l speaks the version of api this client sends.
+fn supports(l i64, api i64) ! {
+	let v = l[lVers]
+	if v == 0 {
+		return
+	}
+	let lo = v[2*api]
+	let hi = v[2*api+1]
+	let want = version(api)
+	if lo < 0 {
+		fail "kafka: the broker at {dialAddr(l)} does not support {apiName(api)}"
+	}
+	if want < lo || want > hi {
+		fail "kafka: the broker at {dialAddr(l)} supports {apiName(api)} versions {lo} to {hi}, this client sends {want}"
+	}
+}
+
+// call sends one request (its body, after the header) to the broker at addr and returns the
+// response after its correlation id. extra is how long the broker may hold the request on top
+// of the client's timeout (a fetch's max wait). With noReply the broker sends nothing back
+// (Produce with acks 0) and call returns "" once the request is written.
+fn (c Client) call(addr str, api i64, body []u8, extra i64, noReply bool) !str {
+	if !c.open {
+		fail "kafka: the client is not open (too many clients: open one per cluster, not per request)"
+	}
+	let tp = rt_tape()
+	if tp != 0 {
+		return try c.call_taped(tp, addr, api, body, extra, noReply) // recorded for replay (#241)
+	}
+	return try c.call_live(addr, api, body, extra, noReply)
+}
+
+fn (c Client) call_live(addr str, api i64, body []u8, extra i64, noReply bool) !str {
+	mut key = addr
+	if holds(api) {
+		key = addr + waitLane
+	}
+	let l = c.line(key)
+	if l == 0 {
+		fail "kafka: more than {maxBrokers / 2} brokers"
+	}
+	mut timeout = c.rec[rTimeout]
+	if timeout > 0 {
+		timeout += extra
+	}
+	if l[lFd] < 0 && l[lBusy] == 0 {
+		// Connect first, so the broker's versions are known before the request is queued.
+		l[lBusy] = 1
+		let err = connect(l, c.rec, timeout)
+		l[lBusy] = 0
+		if err != nil {
+			fail_line(l, say.Str(err))
+			hand_off(l)
+			if fault.Is(err, fault.DeadlineExceeded) || fault.Is(err, fault.Canceled) {
+				fail err
+			}
+			let m = say.Str(err)
+			if len(m) >= len(authFailed) && m[:len(authFailed)] == authFailed {
+				fail fault.Wrap(ErrAuth, m)
+			}
+			fail fault.Wrap(ErrNetwork, m)
+		}
+		hand_off(l)
+	}
+	try supports(l, api)
+	let corr = next_corr(l)
+	mut req = request(api, version(api), corr, raw_str(c.rec[rClient], c.rec[rClientN]))
+	req = append(req, body...)
+	finish(mut req)
+	let n = len(req)
+	if l[lOutN]+n > l[lOutCap] {
+		let cap = (l[lOutN]+n)*2 + 4096
+		l[lOut] = realloc(l[lOut], cap)
+		l[lOutCap] = cap
+	}
+	memcpy(l[lOut]+l[lOutN], cast(i64, req)[2], n)
+	l[lOutN] += n
+	let s = new_slot(corr)
+	if noReply {
+		s[sNoReply] = 1
+	} else {
+		q_push(l, s)
+	}
+	if l[lBusy] == 0 {
+		l[lBusy] = 1
+		s[sOwner] = 1
+	}
+	for s[sState] == 0 {
+		if s[sOwner] != 0 {
+			try drive(l, s, c.rec, timeout)
+			continue
+		}
+		if noReply {
+			// Someone else is writing: the frame goes out with theirs.
+			s[sState] = 1
+			break
+		}
+		let r = rt_task_park(timeout)
+		if r != waitReady {
+			fail give_up(l, s, r)
+		}
+	}
+	if s[sState] == 2 {
+		let m = raw_str(s[sErr], s[sErrN])
+		free_slot(s)
+		if len(m) >= len(authFailed) && m[:len(authFailed)] == authFailed {
+			fail fault.Wrap(ErrAuth, m)
+		}
+		fail fault.Wrap(ErrNetwork, m)
+	}
+	if noReply {
+		free_slot(s)
+		return ""
+	}
+	let resp = raw_str(s[sMsg]+4, s[sMsgN]-4)
+	free_slot(s)
+	return resp
+}
+
+// ---- recording and replay (notes/interface_replay.md, section 4; #241) ----
+
+// The request an effect body makes (read at its start).
+mut tapedClient i64
+mut tapedAddr i64
+mut tapedApi i64
+mut tapedBody i64
+mut tapedExtra i64
+mut tapedNoReply bool
+
+// call_taped records or replays one request as kafka@1: the key is the request's name, version
+// and body (not the broker or the correlation id), the result the response body.
+fn (c Client) call_taped(tp i64, addr str, api i64, body []u8, extra i64, noReply bool) !str {
+	mut k = make([]u8, 0, len(body)+32)
+	k = append(k, "{apiName(api)} v{version(api)} "...)
+	k = append(k, body...)
+	tapedClient = cast(i64, c)
+	tapedAddr = cast(i64, addr)
+	tapedApi = api
+	tapedBody = cast(i64, body)
+	tapedExtra = extra
+	tapedNoReply = noReply
+	return try rt_effect(tp, "kafka@1", str(k), call_effect)
+}
+
+fn call_effect() !str {
+	let c = cast(Client, tapedClient)
+	return try c.call_live(cast(str, tapedAddr), tapedApi, cast([]u8, tapedBody), tapedExtra, tapedNoReply)
+}
+
+// Close closes this core's connections of the client; the next request connects again. Requests
+// waiting on them fail.
+fn (c Client) Close() {
+	if !c.open || conns == 0 {
+		return
+	}
+	let id = c.rec[rID]
+	for k in 0..maxBrokers {
+		let l = conns[id*maxBrokers+k]
+		if l != 0 && l[lFd] >= 0 {
+			fail_line(l, "kafka: the client was closed")
+		}
+	}
+}

@@ -1,0 +1,153 @@
+package squash
+
+import "fault"
+import "stamp"
+
+// Gzip compresses data as one gzip member (no name, no time, OS unknown) at level.
+fn Gzip(data str, level i64) str {
+	mut xfl = 0
+	if level >= Best {
+		xfl = 2
+	} else if level == Fastest {
+		xfl = 4
+	}
+	mut w = bitWriter{out: make([]u8, 0, len(data)/2+64), acc: 0, n: 0}
+	w.out = append(w.out, 0x1f, 0x8b, 8, 0, 0, 0, 0, 0, u8(xfl), 255)
+	deflateTo(mut w, data, level)
+	w.flush()
+	let crc = i64(stamp.Crc32(data))
+	let size = len(data)
+	w.out = append(w.out, u8(crc), u8(crc>>8), u8(crc>>16), u8(crc>>24))
+	w.out = append(w.out, u8(size), u8(size>>8), u8(size>>16), u8(size>>24))
+	return str(w.out)
+}
+
+// Gunzip decompresses gzip data (one member or several back to back), producing at most max bytes.
+// It checks each member's CRC-32 and length.
+fn Gunzip(data str, max i64) !str {
+	mut out = ""
+	mut at = 0
+	mut members = 0
+	for at < len(data) || members == 0 {
+		if at+10 > len(data) || data[at] != 0x1f || data[at+1] != 0x8b {
+			fail "squash: not gzip data (a member's header is missing or damaged)"
+		}
+		if data[at+2] != 8 {
+			fail "squash: gzip compression method {data[at+2]} is not DEFLATE"
+		}
+		let flags = i64(data[at+3])
+		if flags & 0xe0 != 0 {
+			fail "squash: gzip header has reserved flags set"
+		}
+		mut p = at + 10
+		if flags & 4 != 0 {
+			if p+2 > len(data) {
+				fail "squash: gzip data ends in its header"
+			}
+			p += 2 + (i64(data[p]) | i64(data[p+1])<<8)
+		}
+		if flags & 8 != 0 {
+			p = try skipZero(data, p)
+		}
+		if flags & 16 != 0 {
+			p = try skipZero(data, p)
+		}
+		if flags & 2 != 0 {
+			p += 2
+		}
+		if p > len(data) {
+			fail "squash: gzip data ends in its header"
+		}
+		mut r = bitReader{s: data, pos: p, acc: 0, n: 0, bad: false}
+		let part = try inflateFrom(mut r, max-len(out))
+		let end = trailerAt(mut r)
+		if end+8 > len(data) {
+			fail "squash: gzip data ends before its trailer"
+		}
+		let crc = le32(data, end)
+		let size = le32(data, end+4)
+		if crc != i64(stamp.Crc32(part)) {
+			fail "squash: gzip checksum mismatch"
+		}
+		if size != len(part) & 0xffffffff {
+			fail "squash: gzip length mismatch"
+		}
+		out = out + part
+		at = end + 8
+		members += 1
+	}
+	return out
+}
+
+fn skipZero(data str, from i64) !i64 {
+	mut p = from
+	for p < len(data) && data[p] != 0 {
+		p += 1
+	}
+	if p >= len(data) {
+		fail "squash: gzip data ends in its header"
+	}
+	return p + 1
+}
+
+// trailerAt is the offset of the first whole byte after the DEFLATE stream r read.
+fn trailerAt(r mut bitReader) i64 {
+	r.align()
+	return r.pos - r.n/8
+}
+
+fn le32(s str, at i64) i64 {
+	return i64(s[at]) | i64(s[at+1])<<8 | i64(s[at+2])<<16 | i64(s[at+3])<<24
+}
+
+// Zlib compresses data in the zlib format (RFC 1950) at level.
+fn Zlib(data str, level i64) str {
+	mut lv = 2
+	if level <= Fastest {
+		lv = 0
+	} else if level < Default {
+		lv = 1
+	} else if level > Default {
+		lv = 3
+	}
+	let cmf = 0x78
+	mut flg = lv << 6
+	flg += 31 - (cmf*256+flg) % 31
+	mut w = bitWriter{out: make([]u8, 0, len(data)/2+64), acc: 0, n: 0}
+	w.out = append(w.out, u8(cmf), u8(flg))
+	deflateTo(mut w, data, level)
+	w.flush()
+	let a = i64(stamp.Adler32(data))
+	w.out = append(w.out, u8(a>>24), u8(a>>16), u8(a>>8), u8(a))
+	return str(w.out)
+}
+
+// Unzlib decompresses zlib data, producing at most max bytes, and checks its Adler-32.
+fn Unzlib(data str, max i64) !str {
+	if len(data) < 6 {
+		fail "squash: zlib data is too short"
+	}
+	let cmf = i64(data[0])
+	let flg = i64(data[1])
+	if cmf & 15 != 8 || cmf >> 4 > 7 || (cmf*256+flg) % 31 != 0 {
+		fail "squash: not zlib data (its header is damaged)"
+	}
+	if flg & 32 != 0 {
+		fail "squash: zlib data needs a preset dictionary"
+	}
+	mut r = bitReader{s: data, pos: 2, acc: 0, n: 0, bad: false}
+	let out = try inflateFrom(mut r, max)
+	let end = trailerAt(mut r)
+	if end+4 > len(data) {
+		fail "squash: zlib data ends before its checksum"
+	}
+	let want = i64(data[end])<<24 | i64(data[end+1])<<16 | i64(data[end+2])<<8 | i64(data[end+3])
+	if want != i64(stamp.Adler32(out)) {
+		fail "squash: zlib checksum mismatch"
+	}
+	return out
+}
+
+fn limitFault(max i64) ! {
+	fail fault.Wrap(fault.LimitExceeded, "squash: output over {max} bytes")
+}

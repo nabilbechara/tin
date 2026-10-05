@@ -1,0 +1,281 @@
+package kafka
+
+import "fault"
+
+// Fetching and listing offsets.
+
+// Want names a partition and the offset to read it from.
+type Want struct {
+	Topic     str
+	Partition i64
+	Offset    i64
+}
+
+// Part is what a fetch learned about one partition.
+type Part struct {
+	Topic         str
+	Partition     i64
+	Next          i64  // the offset to fetch next (past every batch read, markers included)
+	HighWatermark i64  // the offset after the last committed record
+	LastStable    i64  // with ReadCommitted: the offset before which every transaction is decided
+	LogStart      i64  // the first offset still in the partition
+	OutOfRange    bool // the offset asked for is not in the partition (Next is unchanged)
+}
+
+// Fetched is the records of a FetchAll, in partition order, and what it learned of each partition.
+type Fetched struct {
+	Records []Record
+	Parts   []Part
+}
+
+// Fetch reads records of topic's partition from offset on. It returns as soon as there are
+// records, or empty after maxWait nanoseconds with none. At most Options.FetchMax bytes of whole
+// record batches come back; a record before offset is skipped. An offset outside the partition
+// fails with ErrOffsetOutOfRange.
+fn (c Client) Fetch(topic str, partition i64, offset i64, maxWait i64) ![]Record {
+	let f = try c.FetchAll([]Want{Want{Topic: topic, Partition: partition, Offset: offset}}, maxWait)
+	if len(f.Parts) == 1 && f.Parts[0].OutOfRange {
+		fail fault.Wrap(ErrOffsetOutOfRange, "kafka: offset {offset} is not in {topic}/{partition} (it holds {f.Parts[0].LogStart} to {f.Parts[0].HighWatermark})")
+	}
+	return f.Records
+}
+
+// FetchAll reads several partitions at once: one request per leader broker, all sent before
+// any is waited for when called inside a task. A partition whose offset is out of range is
+// reported in Parts, not as a fault.
+fn (c Client) FetchAll(wants []Want, maxWait i64) !Fetched {
+	for attempt in 0..maxAttempts {
+		let (f, err) = c.fetchOnce(wants, maxWait)
+		if err == nil {
+			return f
+		}
+		mut topic = ""
+		if len(wants) > 0 {
+			topic = wants[0].Topic
+		}
+		if !c.retry(err, topic, attempt) {
+			fail err
+		}
+		if len(wants) > 1 {
+			mut ts = []str{}
+			for _, w in wants {
+				ts = append(ts, w.Topic)
+			}
+			let rerr = c.refresh(ts)
+			if rerr != nil {
+				// The next attempt finds the leaders it can.
+			}
+		}
+	}
+	fail "kafka: fetch failed"
+}
+
+fn (c Client) fetchOnce(wants []Want, maxWait i64) !Fetched {
+	// Group the partitions by leader.
+	mut addrs = []str{}
+	mut groups = [][]Want{}
+	for _, w in wants {
+		let a = try c.leader(w.Topic, w.Partition)
+		mut found = -1
+		for i, x in addrs {
+			if x == a {
+				found = i
+			}
+		}
+		if found < 0 {
+			addrs = append(addrs, a)
+			groups = append(groups, []Want{w})
+		} else {
+			groups[found] = append(groups[found], w)
+		}
+	}
+	mut out = Fetched{Records: []Record{}, Parts: []Part{}}
+	if len(addrs) == 1 {
+		try c.fetchFrom(addrs[0], groups[0], maxWait, mut out)
+		return out
+	}
+	// Several leaders: ask them all at once, each in its own task.
+	mut results = make([]Fetched, 0, len(addrs))
+	for i in 0..len(addrs) {
+		results = append(results, Fetched{Records: []Record{}, Parts: []Part{}})
+	}
+	scope s {
+		for i in 0..len(addrs) {
+			let k = i
+			s.spawn(fn() ! {
+				try c.fetchFrom(addrs[k], groups[k], maxWait, mut results[k])
+			})
+		}
+	}
+	for _, r in results {
+		out.Records = append(out.Records, r.Records...)
+		out.Parts = append(out.Parts, r.Parts...)
+	}
+	return out
+}
+
+// fetchFrom sends one Fetch request for wants to the broker at addr.
+fn (c Client) fetchFrom(addr str, wants []Want, maxWait i64, out mut Fetched) ! {
+	mut ms = maxWait / 1000000
+	if ms < 0 {
+		ms = 0
+	}
+	let fm = c.rec[rFetchMax]
+	mut body = make([]u8, 0, 64+len(wants)*40)
+	put32(mut body, -1)   // replica id: a consumer
+	put32(mut body, ms)
+	put32(mut body, 1)    // min bytes: answer as soon as there is anything
+	put32(mut body, fm)
+	put8(mut body, c.rec[rIsolation])
+	put32(mut body, 0)    // no fetch session
+	put32(mut body, -1)
+	// Topics, each with its partitions.
+	mut topics = []str{}
+	for _, w in wants {
+		mut seen = false
+		for _, t in topics {
+			if t == w.Topic {
+				seen = true
+			}
+		}
+		if !seen {
+			topics = append(topics, w.Topic)
+		}
+	}
+	put32(mut body, len(topics))
+	for _, t in topics {
+		putStr(mut body, t)
+		mut n = 0
+		for _, w in wants {
+			if w.Topic == t {
+				n += 1
+			}
+		}
+		put32(mut body, n)
+		for _, w in wants {
+			if w.Topic != t {
+				continue
+			}
+			put32(mut body, w.Partition)
+			put32(mut body, -1) // current leader epoch: unchecked
+			put64(mut body, w.Offset)
+			put64(mut body, -1) // log start offset (followers only)
+			put32(mut body, fm)
+		}
+	}
+	put32(mut body, 0) // forgotten topics
+	let resp = try c.call(addr, apiFetch, body, maxWait, false)
+	mut d = newDec(resp)
+	d.i32() // throttle
+	let top = d.i16()
+	d.i32() // session id
+	if top != 0 {
+		fail kerr(top, "fetch")
+	}
+	let nt = d.count()
+	for i in 0..nt {
+		let topic = d.str()
+		let np = d.count()
+		for j in 0..np {
+			let part = d.i32()
+			let code = d.i16()
+			let hw = d.i64()
+			let lso = d.i64()
+			let ls = d.i64()
+			let na = d.count()
+			mut aborted = make([]abortedTxn, 0, na)
+			for k in 0..na {
+				let pid = d.i64()
+				let first = d.i64()
+				aborted = append(aborted, abortedTxn{producerID: pid, firstOffset: first})
+			}
+			let data = d.bytes()
+			if d.bad {
+				fail damaged("fetch")
+			}
+			mut from = 0
+			for _, w in wants {
+				if w.Topic == topic && w.Partition == part {
+					from = w.Offset
+				}
+			}
+			if code == 1 {
+				out.Parts = append(out.Parts, Part{Topic: topic, Partition: part, Next: from, HighWatermark: hw, LastStable: lso, LogStart: ls, OutOfRange: true})
+				continue
+			}
+			if code != 0 {
+				fail kerr(code, "fetch from {topic}/{part} at {from}")
+			}
+			let f = readFilter{from: from, committed: c.rec[rIsolation] == 1, aborted: aborted}
+			let (rs, next) = try decodeBatches(data, topic, part, f, 1 << 30)
+			out.Records = append(out.Records, rs...)
+			out.Parts = append(out.Parts, Part{Topic: topic, Partition: part, Next: next, HighWatermark: hw, LastStable: lso, LogStart: ls, OutOfRange: false})
+		}
+	}
+	if d.bad {
+		fail damaged("fetch")
+	}
+}
+
+// Offsets returns the first offset still in partition and the offset the next record will get.
+fn (c Client) Offsets(topic str, partition i64) !(i64, i64) {
+	let first = try c.listOffset(topic, partition, -2)
+	let next = try c.listOffset(topic, partition, -1)
+	return first, next
+}
+
+// OffsetAt is the first offset whose record's timestamp is at or after ts (ms since the epoch),
+// or -1 when every record is older.
+fn (c Client) OffsetAt(topic str, partition i64, ts i64) !i64 {
+	return try c.listOffset(topic, partition, ts)
+}
+
+fn (c Client) listOffset(topic str, partition i64, ts i64) !i64 {
+	for attempt in 0..maxAttempts {
+		let (off, err) = c.listOnce(topic, partition, ts)
+		if err == nil {
+			return off
+		}
+		if !c.retry(err, topic, attempt) {
+			fail err
+		}
+	}
+	fail "kafka: listing offsets of {topic}/{partition} failed"
+}
+
+fn (c Client) listOnce(topic str, partition i64, ts i64) !i64 {
+	let addr = try c.leader(topic, partition)
+	mut body = make([]u8, 0, 48)
+	put32(mut body, -1)
+	put8(mut body, c.rec[rIsolation])
+	put32(mut body, 1)
+	putStr(mut body, topic)
+	put32(mut body, 1)
+	put32(mut body, partition)
+	put32(mut body, -1) // current leader epoch: unchecked
+	put64(mut body, ts)
+	let resp = try c.call(addr, apiListOffsets, body, 0, false)
+	mut d = newDec(resp)
+	d.i32() // throttle
+	mut code = 0
+	mut off = -1
+	let nt = d.count()
+	for i in 0..nt {
+		d.str()
+		let np = d.count()
+		for j in 0..np {
+			d.i32()
+			code = d.i16()
+			d.i64() // timestamp
+			off = d.i64()
+			d.i32() // leader epoch
+		}
+	}
+	if d.bad {
+		fail damaged("list offsets")
+	}
+	if code != 0 {
+		fail kerr(code, "offsets of {topic}/{partition}")
+	}
+	return off
+}

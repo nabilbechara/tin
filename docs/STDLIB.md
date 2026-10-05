@@ -30,6 +30,7 @@ Generated from the comments in `lib/*/` by `tools/gendoc.py`.
 | [atlas](#atlas) | functions on maps (maps) |
 | [cairn](#cairn) | containers (container/heap, sets, LRU) |
 | [stamp](#stamp) | hashes and checksums (hash/*) |
+| [squash](#squash) | compression: DEFLATE, gzip, zlib, Snappy, LZ4, Zstandard (compress/flate, compress/gzip, compress/zlib) |
 | [seal](#seal) | crypto and encodings (crypto/sha256, hmac, encoding/hex, base64) |
 | [herald](#herald) | logging (log/slog) |
 | [crucible](#crucible) | testing helpers (testing) |
@@ -38,6 +39,7 @@ Generated from the comments in `lib/*/` by `tools/gendoc.py`.
 | [redis](#redis) | Redis client (go-redis) |
 | [mysql](#mysql) | MySQL client (database/sql with go-sql-driver/mysql) |
 | [postgres](#postgres) | PostgreSQL client (database/sql with pgx) |
+| [kafka](#kafka) | Kafka client (franz-go, sarama) |
 | [websocket](#websocket) | WebSocket server and client (gorilla/websocket) |
 
 ## say
@@ -273,6 +275,7 @@ let r = try wire.Get("http://127.0.0.1:8080/json")
 - `Listen(addr str) !Listener`: Listen opens a TCP listener on "host:port" (":0" picks a free port: see Port).
 - `(l Listener) Port() i64`: Port is the port the listener is bound to.
 - `(l Listener) Accept() !Conn`: Accept waits for the next connection.
+- `(l Listener) AcceptTimeout(timeout i64) !Conn`: AcceptTimeout waits at most timeout ns for the next connection (0: no limit), failing with a fault that says "timed out" when none came.
 - `(l mut Listener) Close()`: Close stops listening.
 - `type Options struct`: Options configure one client call (DoWith); the zero value is what Do uses.
 - `const DefaultMaxIdle = 8`: DefaultMaxIdle is how many idle connections per host (and core) DoWith keeps when Options.MaxIdle is 0.
@@ -942,6 +945,35 @@ Package stamp computes non-cryptographic hashes and checksums: FNV-1a, CRC-32 (I
 - `Xxh64(s str, seed u64) u64`: Xxh64 is the xxHash64 of s with seed.
 - `Hash(s str) u64`: Hash is a fast, well-mixed 64-bit hash for hash tables (not stable across versions).
 
+## squash
+
+Package squash compresses and decompresses: DEFLATE (RFC 1951) and its gzip (RFC 1952) and zlib (RFC 1950) wrappers like Go's compress/flate, compress/gzip and compress/zlib, plus Snappy, LZ4 and Zstandard (RFC 8878). Every decoder takes the most bytes it may produce and fails with fault.LimitExceeded past it, so a small input cannot make a huge output.
+
+```tin body
+let z = squash.Gzip("hello, hello, hello", squash.Default)
+let back = try squash.Gunzip(z, 64mb)
+```
+
+- `Deflate(data str, level i64) str`: Deflate compresses data as raw DEFLATE at level (Store to Best).
+- `const Store = 0`: Levels for Deflate, Gzip, Zlib and Zstd: Store writes the data uncompressed (in valid frames), Fastest and Best trade speed against size, Default is between.
+- `const Fastest = 1`
+- `const Default = 6`
+- `const Best = 9`
+- `Inflate(data str, max i64) !str`: Inflate decompresses raw DEFLATE data, producing at most max bytes.
+- `Gzip(data str, level i64) str`: Gzip compresses data as one gzip member (no name, no time, OS unknown) at level.
+- `Gunzip(data str, max i64) !str`: Gunzip decompresses gzip data (one member or several back to back), producing at most max bytes. It checks each member's CRC-32 and length.
+- `Zlib(data str, level i64) str`: Zlib compresses data in the zlib format (RFC 1950) at level.
+- `Unzlib(data str, max i64) !str`: Unzlib decompresses zlib data, producing at most max bytes, and checks its Adler-32.
+- `Lz4(data str) str`: Lz4 compresses data as one LZ4 frame: independent 64 KiB blocks, a stored block where compression does not help, and a content checksum.
+- `Lz4NoChecksum(data str) str`: Lz4NoChecksum is Lz4 without the content checksum (the frame Kafka's Java client writes).
+- `Unlz4(data str, max i64) !str`: Unlz4 decompresses LZ4 frames (one or several, and skippable frames), producing at most max bytes.
+- `Lz4BlockOf(data str) str`: Lz4BlockOf compresses data as one bare LZ4 block (no frame).
+- `UnLz4Block(b str, max i64) !str`: UnLz4Block decompresses one bare LZ4 block, producing at most max bytes.
+- `Snappy(data str) str`: Snappy compresses data as one Snappy block.
+- `Unsnappy(data str, max i64) !str`: Unsnappy decompresses one Snappy block whose length is at most max.
+- `Unzstd(data str, max i64) !str`: Unzstd decompresses Zstandard data (any number of frames, and skippable frames), producing at most max bytes.
+- `Zstd(data str, level i64) str`: Zstd compresses data as one Zstandard frame at level (Store to Best; Store writes raw blocks).
+
 ## seal
 
 Package seal has cryptographic hashes (SHA-256, SHA-384, SHA-512, SHA-1), HMAC over any of the SHA-2 hashes, HKDF, PBKDF2-HMAC-SHA-256, P-256 ECDH, RSA signature verification (PKCS #1 v1.5 and PSS), X.509 certificates with chain and host name verification, constant-time comparison, secure random bytes, the hex, base64 and PEM encodings, and RSA-OAEP encryption with a public key.
@@ -1242,6 +1274,92 @@ let id = rows.Rows[0][0].Int()
 - `(t mut Tx) Exec(q query) !Result`: Exec runs a statement in the transaction and returns its affected count.
 - `(t mut Tx) Commit() !`: Commit makes the transaction's changes permanent. An aborted transaction must be rolled back explicitly; PostgreSQL's implicit COMMIT-to-ROLLBACK is not success.
 - `(t mut Tx) Rollback() !`: Rollback undoes the transaction's changes and releases its connection.
+
+## kafka
+
+Package kafka is an Apache Kafka client: a producer (idempotent by default, with batching and gzip, snappy, lz4 and zstd compression), fetching from partitions (read_committed too), consumer groups with rebalancing, transactions, and administration of topics, partitions, records, groups and configs. It speaks Kafka's binary protocol directly (request versions brokers 2.4 to 4.x accept; run against 3.9 and 4.2), over plain TCP or TLS 1.3, with SASL PLAIN, SCRAM-SHA-256 or SCRAM-SHA-512.
+
+Each core keeps one connection per broker for each Client. The requests a core serves at the same time share a connection, and sends of the same turn to one partition share a record batch, so a busy service makes few requests. Inside a request task a call waits without blocking the core; outside one it blocks.
+
+```tin body
+let bus = kafka.Open(kafka.Options{Brokers: []str{"127.0.0.1:9092"}})
+let ack = try bus.Send("orders", kafka.Message{Key: "7", Value: "paid"})
+let records = try bus.Fetch("orders", ack.Partition, ack.Offset, 1s)
+```
+
+A key picks the partition the way the Java client does (murmur2), so a key lands on the same partition from either. Consumer groups: Group and notes/design_kafka.md (section 3) for where a consumer loop runs. Transactions: Transactional.
+
+- `type TopicSpec struct`: TopicSpec describes a topic to create.
+- `type Config struct`: Config is one configuration entry.
+- `type Resource enum`: Resource is what a config belongs to.
+- `type GroupListing struct`: GroupListing is one group a cluster knows.
+- `type GroupMember struct`: GroupMember is one member of a described group.
+- `type GroupDescription struct`: GroupDescription is the state of a group.
+- `(c Client) CreateTopic(name str, partitions i64, replicas i64) !`: CreateTopic makes a topic. It fails with ErrTopicExists when there already is one.
+- `(c Client) CreateTopics(specs []TopicSpec) !`: CreateTopics makes topics; the first failure fails the call (ErrTopicExists for one that exists).
+- `(c Client) DeleteTopics(names []str) !`: DeleteTopics removes topics.
+- `(c Client) ListTopics() ![]str`: ListTopics is the names of the cluster's topics (internal ones too).
+- `(c Client) CreatePartitions(topic str, total i64) !`: CreatePartitions grows topic to total partitions.
+- `(c Client) DeleteRecords(topic str, partition i64, before i64) !i64`: DeleteRecords deletes the records of the partition before offset; it returns the partition's new first offset.
+- `(c Client) ListGroups() ![]GroupListing`: ListGroups lists the groups of the whole cluster (each broker knows those it coordinates).
+- `(c Client) DescribeGroup(group str) !GroupDescription`: DescribeGroup is the state, protocol and members of group.
+- `(c Client) DeleteGroups(groups []str) !`: DeleteGroups removes empty groups and their committed offsets.
+- `(c Client) DescribeConfigs(kind Resource, name str) ![]Config`: DescribeConfigs is the configuration of a topic or a broker (a broker by its node id).
+- `(c Client) SetConfig(kind Resource, name str, key str, value str) !`: SetConfig sets one config of a topic or a broker (IncrementalAlterConfigs: the others stay).
+- `(c Client) ResetConfig(kind Resource, name str, key str) !`: ResetConfig removes one config of a topic or a broker, back to its default.
+- `(c Client) Close()`: Close closes this core's connections of the client; the next request connects again. Requests waiting on them fail.
+- `type Want struct`: Want names a partition and the offset to read it from.
+- `type Part struct`: Part is what a fetch learned about one partition.
+- `type Fetched struct`: Fetched is the records of a FetchAll, in partition order, and what it learned of each partition.
+- `(c Client) Fetch(topic str, partition i64, offset i64, maxWait i64) ![]Record`: Fetch reads records of topic's partition from offset on. It returns as soon as there are records, or empty after maxWait nanoseconds with none. At most Options.FetchMax bytes of whole record batches come back; a record before offset is skipped. An offset outside the partition fails with ErrOffsetOutOfRange.
+- `(c Client) FetchAll(wants []Want, maxWait i64) !Fetched`: FetchAll reads several partitions at once: one request per leader broker, all sent before any is waited for when called inside a task. A partition whose offset is out of range is reported in Parts, not as a fault.
+- `(c Client) Offsets(topic str, partition i64) !(i64, i64)`: Offsets returns the first offset still in partition and the offset the next record will get.
+- `(c Client) OffsetAt(topic str, partition i64, ts i64) !i64`: OffsetAt is the first offset whose record's timestamp is at or after ts (ms since the epoch), or -1 when every record is older.
+- `type Assignor enum`: Assignor is how a group's leader spreads partitions over its members.
+- `type Start enum`: Start is where a member starts reading a partition the group has no offset for.
+- `type GroupOptions struct`: GroupOptions describe a member.
+- `type Group struct`: Group is this core's member of a consumer group.
+- `type TopicPartition struct`: TopicPartition names a partition and an offset (a position or a committed offset).
+- `(c Client) Group(o GroupOptions) !Group`: Group makes this core's member of a consumer group. It joins on the first Poll.
+- `(g Group) MemberID() str`: MemberID is the id the coordinator gave this member ("" before it joined).
+- `(g Group) Generation() i64`: Generation is the group generation this member is in (-1 before it joined).
+- `(g Group) Assigned() []TopicPartition`: Assigned is the member's partitions with the offset each will be read from next (-1 until known).
+- `(g Group) Seek(topic str, partition i64, offset i64) !`: Seek makes the next Poll read the member's partition from offset.
+- `(g Group) Heartbeat() !`: Heartbeat tells the coordinator the member is alive (Poll does it when due). A rebalance makes the next Poll rejoin.
+- `(g Group) Poll(maxWait i64) ![]Record`: Poll returns the next records of the member's partitions, waiting up to maxWait (less when a heartbeat falls due). It joins the group first, rejoins after a rebalance, heartbeats, and unless ManualCommit is set commits what the previous Poll returned.
+- `(g Group) Commit() !`: Commit stores the member's positions (the offsets after the records Poll returned) as the group's committed offsets. A rebalance in the meantime fails it with ErrRebalance.
+- `(g Group) CommitOffsets(parts []TopicPartition) !`: CommitOffsets stores the given offsets (each the next offset to read) for the group.
+- `(g Group) Close() !`: Close commits (unless ManualCommit) and leaves the group, so its partitions move to the other members at once. A static member (InstanceID) does not leave: its session keeps its partitions for a restart.
+- `(c Client) Commit(group str, topic str, partition i64, offset i64) !`: Commit stores offset as group's position in the partition, without being a member (the "simple consumer" commit: generation -1). The offset is the next one to read.
+- `(c Client) Committed(group str, topic str, partition i64) !i64`: Committed is the offset group last committed for the partition, or -1 when it has none.
+- `type Mechanism enum`: Mechanism is the SASL mechanism used when Options.Username is set.
+- `type Acks enum`: Acks says which replicas must have a record before Send returns.
+- `type Options struct`: Options says where and how to connect, and how to produce and fetch.
+- `type Client struct`: Client talks to one Kafka cluster. Open it in a global's initializer (which runs on every core) or once in main, not per request.
+- `type Ack struct`: Ack says where Send put a record. Offset is -1 with Acks.NoAck, and when an idempotent retry found the batch already written.
+- `Open(o Options) Client`: Open makes a client for the cluster in o. It connects on first use, on each core.
+- `(c Client) Partitions(topic str) !i64`: Partitions is how many partitions topic has (asking the cluster). A topic created a moment ago may not be in every broker's metadata yet, so an unknown topic is asked about again for a little while (about two seconds) before the call fails with ErrUnknownTopic.
+- `(c Client) Ping() !`: Ping checks that a broker answers.
+- `(c Client) Send(topic str, m Message) !Ack`: Send appends one record to topic and returns where it went. A record with a key goes to the partition the key hashes to; one without goes to one partition per call, in turn.
+- `(c Client) SendTo(topic str, partition i64, m Message) !Ack`: SendTo appends one record to a chosen partition of topic.
+- `(c Client) SendBatchTo(topic str, partition i64, ms []Message) ![]Ack`: SendBatchTo appends records to a chosen partition of topic, in one batch with what other tasks of this core send there meanwhile.
+- `(c Client) SendBatch(topic str, ms []Message) ![]Ack`: SendBatch appends records to topic and returns where each went, in order. Records of one partition go in one batch (with what other tasks of this core send meanwhile). A failed batch fails the call; records of other partitions may already be written.
+- `type Message struct`: Message is one record to send.
+- `type Header struct`: Header is a record header.
+- `type Record struct`: Record is a record read from a partition.
+- `type Compression enum`: Compression codecs, as the record batch attributes number them.
+- `Murmur2(data str) i64`: Murmur2 is the hash Kafka's default partitioner uses for keys (Java's Utils.murmur2), so a key lands on the same partition here as from the Java client.
+- `PartitionFor(key str, n i64) i64`: PartitionFor is the partition Kafka's default partitioner picks for key among n partitions.
+- `EncodeBatch(ms []Message, now i64, c Compression) str`: EncodeBatch is ms as one record batch (format 2) compressed with c, the bytes Kafka stores and sends, with offsets counted from 0. A message whose Timestamp is 0 gets now (ms since the epoch).
+- `DecodeBatches(data str) ![]Record`: DecodeBatches reads the record batches in data, as a Fetch response carries them, with any codec. A batch the data ends in the middle of is dropped; a damaged one, a changed byte (CRC-32C) or an old message format fails. Control batches (transaction markers) are skipped.
+- `type Txn struct`: Txn is this core's transactional producer for one transactional id.
+- `(c Client) Transactional(txid str, timeout i64) !Txn`: Transactional makes this core's producer for transactional id txid (timeout: how long the broker lets a transaction stay open, default 60 s). It fences any older producer with the same id, and aborts what that one left open.
+- `(t Txn) Begin() !`: Begin starts a transaction.
+- `(t Txn) Send(topic str, m Message) !Ack`: Send writes one record in the open transaction.
+- `(t Txn) SendBatch(topic str, ms []Message) ![]Ack`: SendBatch writes records in the open transaction, one batch per partition; readers with ReadCommitted see them only once the transaction commits.
+- `(t Txn) SendOffsets(group str, offsets []TopicPartition) !`: SendOffsets commits a consumer group's offsets as part of the open transaction (consume-transform-produce): they become the group's committed offsets only if the transaction commits.
+- `(t Txn) Commit() !`: Commit commits the open transaction: its records become visible to ReadCommitted readers and its offsets the group's.
+- `(t Txn) Abort() !`: Abort discards the open transaction.
 
 ## websocket
 

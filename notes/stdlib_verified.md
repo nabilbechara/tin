@@ -5,6 +5,7 @@
 | mint | strconv | identical on all cases |
 | gauge | math, math/bits | the transcendental functions are Tin ports of Go's algorithms: see "gauge: the corpus check" below |
 | tide | time | identical |
+| squash (Deflate, Inflate, Gzip, Gunzip, Zlib, Unzlib) | compress/flate, compress/gzip, compress/zlib (`bench/ref/squash`) | identical on 117 lines: Go's and Tin's vectors decoded by both, round trips of 7 inputs at 4 levels in 3 formats, damaged, cut and foreign input, limits; one changed constant of the length table changes 18 lines. Snappy, LZ4 and Zstandard have no Go standard package: checked against the reference tools (`notes/stdlib_squash.md`) |
 | dice | same algorithms in Go | identical |
 | sift | slices/sort, Each (`bench/ref/closures/main.go`) | identical |
 | sift (generic: Sort, SortFunc, SortStableFunc, Insert, Delete, Compact, BinarySearch ...) | slices, cmp (`bench/ref/sift/generic.go`) | identical on 149 lines, including the order of equal elements after SortFunc on 119 inputs of 7 shapes up to 20,000 elements; the port is Go's pdqsort, and changing one shift constant in it breaks 16 lines |

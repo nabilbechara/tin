@@ -110,7 +110,7 @@ that code may touch. A vendored package's `tin.mod` declares its capabilities:
 
 | capability | allows |
 |---|---|
-| `net` | opening connections and listening: `wire`, `anvil`, `redis`, `mysql`, `postgres`, `websocket`, DNS |
+| `net` | opening connections and listening: `wire`, `anvil`, `redis`, `mysql`, `postgres`, `kafka`, `websocket`, DNS |
 | `files` | opening, creating, renaming and removing files and directories: `quarry`'s file functions, `flume` files |
 | `spawn` | starting another process |
 | `exec` | replacing the process with another program |

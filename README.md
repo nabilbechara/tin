@@ -123,7 +123,8 @@ CI and the issue-to-regression workflow: [docs/CI.md](docs/CI.md).
 | ore | byte slices | | crucible | test checks, benchmarks |
 | flume | buffered I/O | | redis | Redis client (pipelined) |
 | websocket | WebSocket server and client | | mysql | MySQL client (pooled) |
-| postgres | PostgreSQL client (pooled, SCRAM) | | | |
+| postgres | PostgreSQL client (pooled, SCRAM) | | kafka | Kafka client (producer, groups, transactions) |
+| squash | gzip, zlib, Snappy, LZ4, Zstandard | | | |
 
 Language and library checks live in `tests/v2/`, and protocol client checks in
 `tools/ci/`. Core library behavior is also checked against Go equivalents in

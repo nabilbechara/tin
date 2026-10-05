@@ -15,8 +15,8 @@ The inventory is the 176 packages `go list std` reports for Go 1.26 (without `in
 | design | Go's shape needs something Tin deliberately lacks; the replacement is named or still to be designed |
 | n/a | specific to Go's toolchain or runtime, with no counterpart to build |
 
-**Standard library, 176 packages:** 4 done, 44 partial, 7 design, 97 missing, 24 n/a.
-**Of the 87 packages koussa imports:** 4 done, 40 partial, 6 design, 37 missing, 0 n/a.
+**Standard library, 176 packages:** 4 done, 47 partial, 7 design, 94 missing, 24 n/a.
+**Of the 87 packages koussa imports:** 4 done, 41 partial, 6 design, 36 missing, 0 n/a.
 
 ## The language
 
@@ -71,10 +71,10 @@ Ordered by import path, as `go list std` prints them.
 | `bytes` | 76+28 | partial | ore, twine.Builder | about 20 functions on []u8; no Buffer or Reader type, no Map, Title, FieldsFunc or TrimFunc |
 | `cmp` | 14+5 | partial | sift (Less, Cmp, `Ordered`), builtin min/max | Less and Cmp (NaN first, as Go), and `sift.Ordered` for generic ordering; no cmp.Or |
 | `compress/bzip2` |  | missing |  |  |
-| `compress/flate` |  | missing |  | needed by gzip, zlib and zip |
-| `compress/gzip` | 7+1 | missing |  |  |
+| `compress/flate` |  | partial | squash | Deflate (levels Store to Best) and Inflate on whole strings, verified against Go; no streaming Reader/Writer, no preset dictionaries |
+| `compress/gzip` | 7+1 | partial | squash | Gzip and Gunzip (several members, header fields read) on whole strings, verified against Go; no streaming Reader/Writer, no Header fields written |
 | `compress/lzw` |  | missing |  |  |
-| `compress/zlib` |  | missing |  |  |
+| `compress/zlib` |  | partial | squash | Zlib and Unzlib on whole strings, verified against Go; no streaming, no preset dictionaries |
 | `container/heap` | 2+0 | partial | cairn | IntHeap and IntMaxHeap; no heap over any element type (generics now allow one) |
 | `container/list` | 1+1 | missing | cairn (deque, queue) | no doubly linked list with stable element handles |
 | `container/ring` |  | missing |  |  |
@@ -166,7 +166,7 @@ Ordered by import path, as `go list std` prints them.
 | `io` | 91+20 | partial | `io` declares Reader, Writer, Closer, Seeker, ReaderAt, WriterAt and the compositions; structural satisfaction, generic `Copy[R io.Reader, W io.Writer]`, and explicit `dyn io.Writer` calls are verified. The `io.Copy` package function, ReadAll, Pipe, MultiWriter, LimitReader, TeeReader and EOF as a sentinel fault remain future work (#141) |
 | `io/fs` | 2+0 | missing |  |  |
 | `io/ioutil` |  | n/a | quarry | deprecated in Go; quarry has ReadFile, WriteFile, ReadDir |
-| `iter` |  | missing |  | range over functions; `for range` covers slices, strings, maps and integers |
+| `iter` |  | missing |  | range over functions; `for x in` covers slices, strings, maps and integer ranges |
 | `log` | 7+2 | partial | herald | levels, output, clock; no Logger values |
 | `log/slog` |  | partial | herald | leveled lines with key and value pairs; no Handler, Group or LogValuer |
 | `log/syslog` |  | missing |  |  |
@@ -255,7 +255,7 @@ The order comes from two things: what other work depends on, and what services i
 5. Atomics for cross-core counters; no mutexes.
 6. Compile-time type information and attributes in place of `reflect` and struct tags, extending what `argo` does for JSON.
 
-**High demand:** `time` (zones, layouts, timers), `regexp`, the rest of `encoding/json`, `strconv`, `strings`, `slices`, `maps`, `sort`, `bytes`, `os` file handles, `net/http` client and server completeness, `net/http/httptest`, `encoding/xml`, `crypto/tls` (#124), `database/sql`'s common shape, `image`, `math/big`, `compress/gzip`, `mime/multipart`.
+**High demand:** `time` (zones, layouts, timers), `regexp`, the rest of `encoding/json`, `strconv`, `strings`, `slices`, `maps`, `sort`, `bytes`, `os` file handles, `net/http` client and server completeness, `net/http/httptest`, `encoding/xml`, `crypto/tls` (#124), `database/sql`'s common shape, `image`, `math/big`, `mime/multipart`.
 
 **Performance tooling:** `runtime/pprof`, `net/http/pprof`, `runtime/metrics`: the end goal is performance, and it cannot be improved without a profiler.
 

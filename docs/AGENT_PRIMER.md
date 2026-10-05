@@ -162,9 +162,9 @@ say(fmt) fault(error chains) twine(strings) glyph(utf8) mint(strconv) argo(JSON)
 router) wire(TCP, HTTP(S) client) tls(TLS 1.3 client) hearth(cores) relay(cross-core messages)
 task(deadline, cancellation) lane(queues between tasks) policy(with policies) tide(time)
 quarry(os/files/env) trail(paths) lever(flags/args) sift(sort/search) atlas(maps) cairn(containers)
-gauge(math) dice(random) stamp(non-crypto hashes) seal(SHA-2, HMAC, HKDF, AES-GCM,
+gauge(math) dice(random) stamp(non-crypto hashes) squash(gzip, zlib, snappy, lz4, zstd) seal(SHA-2, HMAC, HKDF, AES-GCM,
 ChaCha20-Poly1305, X25519, P-256, base64, hex, RSA-OAEP, constant-time compare) ore(bytes)
-flume(buffered I/O) herald(logging) crucible(testing) redis(Redis client) mysql(MySQL client)
+flume(buffered I/O) herald(logging) crucible(testing) redis(Redis client) kafka(Kafka client) mysql(MySQL client)
 postgres(PostgreSQL client) websocket(WebSocket server via anvil, and client). Signatures:
 docs/STDLIB.md.
 

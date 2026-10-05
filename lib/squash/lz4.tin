@@ -1,0 +1,366 @@
+package squash
+
+import "fault"
+
+// LZ4: the block format and the frame format (github.com/lz4/lz4, doc/lz4_Block_format.md and
+// doc/lz4_Frame_format.md). Frames are written with independent 64 KiB blocks and a content
+// checksum; every frame option is read.
+
+// ---- xxHash32 (the frame format's checksum) ----
+
+const p32a = 2654435761
+const p32b = 2246822519
+const p32c = 3266489917
+const p32d = 668265263
+const p32e = 374761393
+
+fn rotl32(x u32, r u64) u32 {
+	return (x << r) | (x >> (32 - r))
+}
+
+fn xxRound(acc u32, lane u32) u32 {
+	return rotl32(acc+lane*u32(p32b), 13) * u32(p32a)
+}
+
+// xxh32 is xxHash32 of s with seed.
+fn xxh32(s str, seed u32) u32 {
+	let n = len(s)
+	mut i = 0
+	mut h u32 = 0
+	if n >= 16 {
+		mut v1 = seed + u32(p32a) + u32(p32b)
+		mut v2 = seed + u32(p32b)
+		mut v3 = seed
+		mut v4 = seed - u32(p32a)
+		for i+16 <= n {
+			v1 = xxRound(v1, u32(le32(s, i)))
+			v2 = xxRound(v2, u32(le32(s, i+4)))
+			v3 = xxRound(v3, u32(le32(s, i+8)))
+			v4 = xxRound(v4, u32(le32(s, i+12)))
+			i += 16
+		}
+		h = rotl32(v1, 1) + rotl32(v2, 7) + rotl32(v3, 12) + rotl32(v4, 18)
+	} else {
+		h = seed + u32(p32e)
+	}
+	h = h + u32(n)
+	for i+4 <= n {
+		h = rotl32(h+u32(le32(s, i))*u32(p32c), 17) * u32(p32d)
+		i += 4
+	}
+	for i < n {
+		h = rotl32(h+u32(s[i])*u32(p32e), 11) * u32(p32a)
+		i += 1
+	}
+	h = h ^ (h >> 15)
+	h = h * u32(p32b)
+	h = h ^ (h >> 13)
+	h = h * u32(p32c)
+	h = h ^ (h >> 16)
+	return h
+}
+
+// ---- blocks ----
+
+const lz4MinMatch = 4
+const lz4HashBits = 14
+
+// lz4Block appends s[from:to] compressed as one LZ4 block. Matches may reach back to start.
+fn lz4Block(out mut []u8, s str, start i64, from i64, to i64) {
+	mut table = make([]i64, 1 << lz4HashBits)
+	for i in 0..len(table) {
+		table[i] = -1
+	}
+	// The last match must start 12 bytes before the end, and the last 5 bytes are literals.
+	let mflimit = to - 12
+	mut anchor = from
+	mut i = from
+	for i < mflimit {
+		let key = i64(s[i]) | i64(s[i+1])<<8 | i64(s[i+2])<<16 | i64(s[i+3])<<24
+		let h = ((key * 2654435761) >> (32 - lz4HashBits)) & ((1 << lz4HashBits) - 1)
+		let cand = table[h]
+		table[h] = i
+		if cand < start || i-cand > 65535 || s[cand] != s[i] || s[cand+1] != s[i+1] || s[cand+2] != s[i+2] || s[cand+3] != s[i+3] {
+			i += 1
+			continue
+		}
+		mut l = 4
+		for i+l < to-5 && s[cand+l] == s[i+l] {
+			l += 1
+		}
+		lz4Sequence(mut out, s, anchor, i, i-cand, l)
+		i += l
+		anchor = i
+	}
+	// The last literals.
+	let lits = to - anchor
+	if lits >= 15 {
+		out = append(out, 0xf0)
+		lz4Len(mut out, lits-15)
+	} else {
+		out = append(out, u8(lits<<4))
+	}
+	out = append(out, s[anchor:to]...)
+}
+
+fn lz4Len(out mut []u8, n i64) {
+	mut k = n
+	for k >= 255 {
+		out = append(out, 255)
+		k -= 255
+	}
+	out = append(out, u8(k))
+}
+
+fn lz4Sequence(out mut []u8, s str, from i64, to i64, off i64, length i64) {
+	let lits = to - from
+	let ml = length - lz4MinMatch
+	mut token = min(lits, 15) << 4
+	token = token | min(ml, 15)
+	out = append(out, u8(token))
+	if lits >= 15 {
+		lz4Len(mut out, lits-15)
+	}
+	out = append(out, s[from:to]...)
+	out = append(out, u8(off), u8(off>>8))
+	if ml >= 15 {
+		lz4Len(mut out, ml-15)
+	}
+}
+
+// lz4Decode appends the decompressed LZ4 block to out (whose earlier bytes are the history a
+// dependent block may copy from), producing at most max bytes in all.
+fn lz4Decode(out mut []u8, b str, max i64) ! {
+	mut at = 0
+	for at < len(b) {
+		let token = i64(b[at])
+		at += 1
+		mut lits = token >> 4
+		if lits == 15 {
+			for {
+				if at >= len(b) {
+					fail "squash: lz4 data ends in a length"
+				}
+				let c = i64(b[at])
+				at += 1
+				lits += c
+				if c != 255 {
+					break
+				}
+			}
+		}
+		if at+lits > len(b) {
+			fail "squash: an lz4 literal runs past its block"
+		}
+		if len(out)+lits > max {
+			fail fault.Wrap(fault.LimitExceeded, "squash: output over {max} bytes")
+		}
+		out = append(out, b[at:at+lits]...)
+		at += lits
+		if at == len(b) {
+			return
+		}
+		if at+2 > len(b) {
+			fail "squash: lz4 data ends in an offset"
+		}
+		let off = i64(b[at]) | i64(b[at+1])<<8
+		at += 2
+		mut ml = token & 15
+		if ml == 15 {
+			for {
+				if at >= len(b) {
+					fail "squash: lz4 data ends in a length"
+				}
+				let c = i64(b[at])
+				at += 1
+				ml += c
+				if c != 255 {
+					break
+				}
+			}
+		}
+		ml += lz4MinMatch
+		if off == 0 || off > len(out) {
+			fail "squash: an lz4 offset is out of range"
+		}
+		if len(out)+ml > max {
+			fail fault.Wrap(fault.LimitExceeded, "squash: output over {max} bytes")
+		}
+		let from = len(out) - off
+		for j in 0..ml {
+			out = append(out, out[from+j])
+		}
+	}
+}
+
+// ---- frames ----
+
+const lz4Magic = 0x184d2204
+const lz4Block64k = 65536
+
+// Lz4 compresses data as one LZ4 frame: independent 64 KiB blocks, a stored block where
+// compression does not help, and a content checksum.
+fn Lz4(data str) str {
+	return lz4Frame(data, true)
+}
+
+// Lz4NoChecksum is Lz4 without the content checksum (the frame Kafka's Java client writes).
+fn Lz4NoChecksum(data str) str {
+	return lz4Frame(data, false)
+}
+
+fn lz4Frame(data str, checksum bool) str {
+	mut out = make([]u8, 0, len(data)+64)
+	out = append(out, 0x04, 0x22, 0x4d, 0x18)
+	mut flg = 0x40 | 0x20 // version 01, independent blocks
+	if checksum {
+		flg = flg | 0x04
+	}
+	let bd = 0x40 // 64 KiB blocks
+	out = append(out, u8(flg), u8(bd))
+	let hc = (xxh32(str([]u8{u8(flg), u8(bd)}), 0) >> 8) & 0xff
+	out = append(out, u8(hc))
+	mut at = 0
+	for at < len(data) {
+		let end = min(at+lz4Block64k, len(data))
+		mut blk = make([]u8, 0, end-at+16)
+		lz4Block(mut blk, data, at, at, end)
+		if len(blk) >= end-at {
+			let k = (end - at) | 0x80000000
+			out = append(out, u8(k), u8(k>>8), u8(k>>16), u8(k>>24))
+			out = append(out, data[at:end]...)
+		} else {
+			let k = len(blk)
+			out = append(out, u8(k), u8(k>>8), u8(k>>16), u8(k>>24))
+			out = append(out, blk...)
+		}
+		at = end
+	}
+	out = append(out, 0, 0, 0, 0)
+	if checksum {
+		let c = i64(xxh32(data, 0))
+		out = append(out, u8(c), u8(c>>8), u8(c>>16), u8(c>>24))
+	}
+	return str(out)
+}
+
+// Unlz4 decompresses LZ4 frames (one or several, and skippable frames), producing at most max bytes.
+fn Unlz4(data str, max i64) !str {
+	mut out = make([]u8, 0, min(max, len(data)*3+64))
+	mut at = 0
+	mut frames = 0
+	for at < len(data) || frames == 0 {
+		if at+4 > len(data) {
+			fail "squash: not lz4 data (its magic number is missing)"
+		}
+		let magic = le32(data, at)
+		if magic & 0xfffffff0 == 0x184d2a50 {
+			if at+8 > len(data) {
+				fail "squash: a skippable lz4 frame is cut short"
+			}
+			at += 8 + le32(data, at+4)
+			frames += 1
+			continue
+		}
+		if magic != lz4Magic {
+			fail "squash: not lz4 data (magic number {magic:x})"
+		}
+		if at+7 > len(data) {
+			fail "squash: an lz4 frame header is cut short"
+		}
+		let flg = i64(data[at+4])
+		let bd = i64(data[at+5])
+		if flg >> 6 != 1 {
+			fail "squash: lz4 frame version {flg >> 6} is not 1"
+		}
+		if flg & 0x02 != 0 || bd & 0x8f != 0 {
+			fail "squash: lz4 frame header has reserved bits set"
+		}
+		let blockMax = 1 << (8 + 2*((bd>>4)&7))
+		if (bd>>4)&7 < 4 {
+			fail "squash: lz4 block size code {(bd>>4)&7} is not defined"
+		}
+		mut hdrEnd = at + 6
+		if flg & 0x08 != 0 {
+			hdrEnd += 8
+		}
+		if flg & 0x01 != 0 {
+			fail "squash: lz4 frames with a dictionary are not supported"
+		}
+		if hdrEnd+1 > len(data) {
+			fail "squash: an lz4 frame header is cut short"
+		}
+		let hc = (xxh32(data[at+4:hdrEnd], 0) >> 8) & 0xff
+		if i64(hc) != i64(data[hdrEnd]) {
+			fail "squash: lz4 frame header checksum mismatch"
+		}
+		let frameStart = len(out)
+		at = hdrEnd + 1
+		let independent = flg & 0x20 != 0
+		for {
+			if at+4 > len(data) {
+				fail "squash: lz4 data ends before its end mark"
+			}
+			let word = le32(data, at)
+			at += 4
+			if word == 0 {
+				break
+			}
+			let size = word & 0x7fffffff
+			if size > blockMax || at+size > len(data) {
+				fail "squash: an lz4 block is larger than its data"
+			}
+			let blk = data[at:at+size]
+			at += size
+			if flg & 0x10 != 0 {
+				if at+4 > len(data) || le32(data, at) != i64(xxh32(blk, 0)) {
+					fail "squash: lz4 block checksum mismatch"
+				}
+				at += 4
+			}
+			if word & 0x80000000 != 0 {
+				if len(out)+size > max {
+					fail fault.Wrap(fault.LimitExceeded, "squash: output over {max} bytes")
+				}
+				out = append(out, blk...)
+				continue
+			}
+			if independent {
+				// Copies cannot reach before the block: decode against an empty history.
+				mut part = make([]u8, 0, blockMax)
+				try lz4Decode(mut part, blk, max-len(out))
+				out = append(out, part...)
+			} else {
+				try lz4Decode(mut out, blk, max)
+			}
+		}
+		if flg & 0x04 != 0 {
+			if at+4 > len(data) || le32(data, at) != i64(xxh32(str(out[frameStart:]), 0)) {
+				fail "squash: lz4 content checksum mismatch"
+			}
+			at += 4
+		}
+		if flg & 0x08 != 0 {
+			let size = le32(data, hdrEnd-8) | (le32(data, hdrEnd-4) << 32)
+			if size != len(out)-frameStart {
+				fail "squash: lz4 frame is {len(out)-frameStart} bytes, its header says {size}"
+			}
+		}
+		frames += 1
+	}
+	return str(out)
+}
+
+// Lz4BlockOf compresses data as one bare LZ4 block (no frame).
+fn Lz4BlockOf(data str) str {
+	mut out = make([]u8, 0, len(data)+16)
+	lz4Block(mut out, data, 0, 0, len(data))
+	return str(out)
+}
+
+// UnLz4Block decompresses one bare LZ4 block, producing at most max bytes.
+fn UnLz4Block(b str, max i64) !str {
+	mut out = make([]u8, 0, min(max, len(b)*3+64))
+	try lz4Decode(mut out, b, max)
+	return str(out)
+}
