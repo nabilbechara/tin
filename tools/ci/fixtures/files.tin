@@ -1,0 +1,51 @@
+package main
+
+import "anvil"
+import "mint"
+import "quarry"
+import "say"
+
+// #357: /files?n=N&file=PATH reads PATH in N tasks at once (quarry.ReadFile runs on helper
+// threads) and counts the successes; /ok answers. file_io_check.py runs it.
+
+fn readAll(n i64, path str) !str {
+	mut ok i64 = 0
+	mut bad i64 = 0
+	mut first str = ""
+	scope s {
+		for i in 0..n {
+			s.spawn(fn() ! {
+				quarry.ReadFile(path) catch err {
+					bad += 1
+					if first == "" {
+						first = "{err}"
+					}
+					return
+				}
+				ok += 1
+			})
+		}
+	}
+	return "ok={ok} bad={bad} first={first}"
+}
+
+fn files(q anvil.Req, w mut anvil.Out) {
+	let n = mint.Atoi(q.Param("n")) catch _ { 10 }
+	let got = readAll(n, q.Param("file")) catch err {
+		w.Status(500)
+		w.Text("{err}")
+		return
+	}
+	w.Text(got)
+}
+
+fn ok(q anvil.Req, w mut anvil.Out) {
+	w.Text("ok")
+}
+
+fn main() {
+	let r = anvil.NewRouter()
+	r.Get("/files", files)
+	r.Get("/ok", ok)
+	say.Line(r.Serve(":" + quarry.Getenv("PORT")))
+}

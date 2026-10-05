@@ -5788,8 +5788,34 @@ shared mut helperUp bool
 shared mut helperHead i64
 shared mut helperTail i64
 shared mut helperCount i64
-const helperThreads = 4
-const maxHelperJobs = 4096
+const minHelperThreads = 4
+const maxHelperJobs = 4096 // jobs one core may have out at once: past that its tasks wait for one to finish
+
+// A core's helper jobs in flight, and the tasks waiting to start one (records [task, next, gone]).
+mut helperInflight i64
+mut helperWaitHead i64
+mut helperWaitTail i64
+
+// rt_helper_threads is how many helper threads to start: the number of cores, at least 4,
+// or TIN_HELPERS (1 to 256).
+fn rt_helper_threads() i64 {
+	let env = rt_getenv(cast(i64, "TIN_HELPERS") + 8)
+	if env != 0 {
+		mut n = rt_decimal_integer(env) & 0xffffffff
+		if n < 1 {
+			n = 1
+		}
+		if n > 256 {
+			n = 256
+		}
+		return n
+	}
+	mut n = __atomic_load(&rtCores)
+	if n < minHelperThreads {
+		n = minHelperThreads
+	}
+	return n
+}
 
 const jNext = 0
 const jFn = 1
@@ -5822,16 +5848,34 @@ fn rt_helper_run(f fn(i64), arg i64, drop fn(i64)) ! {
 		helperQ[1] = i64(i32(__ld(fds+4, 2)))
 		rt_sys_fcntl(helperQ[1], F_SETFL, O_NONBLOCK)
 		free(fds)
-		for i in 0..helperThreads {
+		let nh = rt_helper_threads() // before the first: each helper counts in rtCores too
+		for i in 0..nh {
 			rt_spawn_core(rt_helper_main, i)
 		}
 		helperUp = true
 	}
-	if helperCount >= maxHelperJobs {
-		rt_unlock(&helperLock)
-		drop(arg)
-		fail "helper queue is full"
+	rt_unlock(&helperLock)
+	// At most maxHelperJobs jobs of this core are out at once; the next task waits for one to
+	// finish, within its deadline, instead of failing (#357).
+	for helperInflight >= maxHelperJobs {
+		let w = calloc(3, 8)
+		w[0] = t
+		if helperWaitTail == 0 {
+			helperWaitHead = w
+		} else {
+			helperWaitTail[1] = w
+		}
+		helperWaitTail = w
+		let r = rt_task_park(0)
+		if r == waitDeadline {
+			w[2] = 1 // the waker frees the record when it reaches it
+			drop(arg)
+			fail cast(fault, rt_wait_fault())
+		}
+		free(w)
 	}
+	helperInflight += 1
+	rt_lock(&helperLock)
 	let job = calloc(7, 8)
 	job[jFn] = cast(i64, f)
 	job[jArg] = arg
@@ -5864,6 +5908,22 @@ fn rt_helper_done(job i64) i64 {
 	rt_lock(&helperLock)
 	helperCount -= 1
 	rt_unlock(&helperLock)
+	helperInflight -= 1
+	// A task waiting to start a job goes first now that there is room (records of tasks that
+	// gave up are freed on the way).
+	for helperWaitHead != 0 {
+		let w = helperWaitHead
+		helperWaitHead = w[1]
+		if helperWaitHead == 0 {
+			helperWaitTail = 0
+		}
+		if w[2] != 0 {
+			free(w)
+			continue
+		}
+		rt_task_wake(w[0])
+		break
+	}
 	if job[jGone] != 0 {
 		let drop = cast(fn(i64), job[jDrop])
 		drop(job[jArg])

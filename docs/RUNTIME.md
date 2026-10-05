@@ -422,9 +422,11 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   with `wire: read timed out` (or connect/write), past the deadline with `deadline exceeded`.
 - Linux DNS uses nonblocking UDP/TCP sockets and task waits (docs/STDLIB.md, wire contract).
 - Work with no non-blocking form (macOS DNS `getaddrinfo`, file reads and writes in `quarry`)
-  goes to four shared helper threads. `rt_helper_run(f, job, drop)` queues a heap-owned
-  job in a bounded queue (4096 outstanding jobs process-wide), signals a non-blocking
-  wake pipe and parks within the request deadline. A full queue fails immediately.
+  goes to shared helper threads: as many as there are cores, at least 4 (`TIN_HELPERS` sets the
+  number, 1 to 256). `rt_helper_run(f, job, drop)` queues a heap-owned job, signals a
+  non-blocking wake pipe and parks within the request deadline. A core may have 4096 jobs out
+  at once; its next task waits for one to finish (woken by the completion on its own core),
+  within its deadline, instead of failing (#357). Not done: `io_uring` on Linux.
   A helper runs `f(job)` and writes the completion to the owning core's done pipe.
   Inputs and results live outside request pools, so an expired request may return and
   reuse its task safely. A late completion calls `drop(job)` and never resumes the old
