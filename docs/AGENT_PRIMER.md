@@ -114,6 +114,10 @@ the compiler: write a minimal repro to notes/compiler_bugs_NAME.md and work arou
   (sendfile, never read into memory), `w.Closed()` to see a client that left, `w.Abort()` when the data
   source fails half way. A write fails when the client stops reading (TIN_WRITE_TIMEOUT_MS) or the request
   is cancelled: return then. The deadline restarts after each write. See examples/sse.tin.
+- HTTP/2: anvil also serves h2c (prior knowledge, or `Upgrade: h2c`) on the same port; handlers,
+  the Router and streaming are unchanged, each stream in its own task. `w.Trailer(k, v)` adds a
+  trailer (HTTP/2, or after the last chunk of an HTTP/1.1 chunked stream); `q.Proto()` is
+  "HTTP/2.0", "HTTP/1.1" or "HTTP/1.0". A unary gRPC service: examples/grpc.tin.
 - Services route with `let r = anvil.NewRouter()` in main: ``r.Get(`/users/{id}`, user)`` (Post, Put,
   Patch, Delete, Head, Options, Handle(method, ...), Any), `q.PathParam("id")` (%-decoded), a last
   `{path...}` or `*` for the rest; patterns with {...} are raw strings. Static beats {name} beats the
@@ -172,7 +176,7 @@ for a hash, PRNG or constant-time crypto kernel), and write the magnitude of a n
 Keep comments one line, ending with a period.
 
 ## Standard library (import instead of re-implementing)
-say(fmt) fault(error chains) twine(strings) glyph(utf8) mint(strconv) argo(JSON) anvil(HTTP server,
+say(fmt) fault(error chains) twine(strings) glyph(utf8) mint(strconv) argo(JSON) anvil(HTTP/1.1 and HTTP/2 server,
 router, HTTPS) wire(TCP, HTTP(S) client) tls(TLS 1.3 client and server) hearth(cores) relay(cross-core messages)
 task(deadline, cancellation) lane(queues between tasks) policy(with policies) tide(time)
 quarry(os/files/env) trail(paths) lever(flags/args) sift(sort/search) atlas(maps) cairn(containers)

@@ -16,6 +16,9 @@ import measure
 spec = importlib.util.spec_from_file_location('http_benchmark', ROOT / 'bench/http/run_wrk.py')
 http = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(http)
+spec = importlib.util.spec_from_file_location('h2_benchmark', ROOT / 'bench/http/run_h2load.py')
+h2 = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(h2)
 
 
 class BenchmarkTests(unittest.TestCase):
@@ -100,6 +103,19 @@ out.chmod(0o755)
                      valid + 'Non-2xx or 3xx responses: 100\n', valid.replace('100.00', '0.00')):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 http.parse_wrk(text)
+
+    def test_h2load_parser_reads_both_formats_and_rejects_failures(self):
+        head = ('finished in 10.00s, 1000.50 req/s, 1.00MB/s\n'
+                'requests: 10005 total, 10005 started, 10005 done, 10005 succeeded, 0 failed, 0 errored, 0 timeout\n'
+                'status codes: 10007 2xx, 0 3xx, 0 4xx, 0 5xx\n')
+        old = head + 'time for request:       30us      2.39ms       157us        63us    87.68%\n'
+        new = head + 'request     :       30us      2.39ms       150us       234us       306us       1.58ms        63us    87.68%\n'
+        self.assertEqual(h2.parse_h2load(old), {'rps': 1000.5, 'requests': 10005, 'mean_us': 157})
+        self.assertEqual(h2.parse_h2load(new)['mean_us'], 1580)
+        for text in ('', head, old.replace(' 0 failed', ' 3 failed'), old.replace(' 0 errored', ' 1 errored'),
+                     old.replace(' 0 5xx', ' 2 5xx'), old.replace('10005 succeeded', '10004 succeeded')):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                h2.parse_h2load(text)
 
     def test_workflow_pipelines_propagate_harness_failures(self):
         workflow = (ROOT / '.github/workflows/bench-linux.yml').read_text()

@@ -1,0 +1,273 @@
+package main
+
+import "anvil"
+import "herald"
+import "mint"
+import "quarry"
+import "tide"
+
+// #360: HTTP/2. Routes for h2_check.py (the same handlers serve HTTP/1.1):
+//   /                 a fixed body (h2spec's requests)
+//   /echo             the protocol, method, path, query, body length and sum, x-test, cookie and x-trailer
+//   /wait?ms=M        answers after M ms (herald logs "wait canceled" when the wait fails)
+//   /big?n=N          an N-byte body (byte i is i % 251)
+//   /stream?n=N&size=S&ms=M  a streamed body: N writes of S bytes, M ms apart
+//   /length?n=N       a streamed body of N bytes with Length, in pieces
+//   /short            Length 10, then 5 bytes
+//   /file?name=&off=&n=  SendFile of a file in FILES_DIR
+//   /trailers?n=N     an N-byte body, then the trailers x-sum and grpc-status
+//   /streamtrailers   a streamed body, then the trailer x-done
+//   /headers?n=N&size=S  N response headers of S bytes each
+//   /status?code=C    status C with a body
+//   /panic            a panic before the response
+//   /streampanic      one streamed write, then a panic
+//   /abort            one streamed write, then Abort
+//   /endless          writes 16 KiB pieces until one fails (herald logs "endless stopped")
+//   /hijack           Hijack, which an HTTP/2 stream refuses
+// With TLS_CERT and TLS_KEY (paths) it serves HTTPS, where ALPN chooses h2 or HTTP/1.1.
+
+fn num(q anvil.Req, name str, dflt i64) i64 {
+	let v = mint.Atoi(q.Param(name)) catch _ { dflt }
+	return v
+}
+
+fn pattern(size i64, start i64) []u8 {
+	let b = make([]u8, size)
+	for i in 0..size {
+		b[i] = u8((start + i) % 251)
+	}
+	return b
+}
+
+fn root(q anvil.Req, w mut anvil.Out) {
+	w.Text("hello from anvil over {q.Proto()}\n")
+}
+
+fn echo(q anvil.Req, w mut anvil.Out) {
+	let b = q.Body()
+	mut sum = 0
+	for i in 0..len(b) {
+		sum = (sum*31 + i64(b[i])) % 1000000007
+	}
+	w.Text("proto={q.Proto()}\nmethod={q.Method}\npath={q.Path}\nquery={q.Query}\nlen={len(b)}\nsum={sum}\n")
+	let xt = q.Header("x-test")
+	let ck = q.Header("cookie")
+	let host = q.Header("host")
+	let tr = q.Header("x-trailer")
+	w.Text("x-test={xt}\ncookie={ck}\nhost={host}\nx-trailer={tr}\n")
+}
+
+fn wait(q anvil.Req, w mut anvil.Out) {
+	let ms = num(q, "ms", 100)
+	tide.Wait(ms*1000000) catch err {
+		herald.Log(herald.LInfo, "wait canceled", []str{"err", "{err}", "path", q.Path})
+		w.Status(500)
+		w.Text("wait failed: {err}")
+		return
+	}
+	w.Text("waited {ms}")
+}
+
+fn big(q anvil.Req, w mut anvil.Out) {
+	w.Type("application/octet-stream")
+	w.Body = append(w.Body, pattern(num(q, "n", 100000), 0)...)
+}
+
+fn stream(q anvil.Req, w mut anvil.Out) {
+	w.Type("application/octet-stream")
+	w.Stream() catch _ {
+		return
+	}
+	let n = num(q, "n", 4)
+	let size = num(q, "size", 1000)
+	let ms = num(q, "ms", 0)
+	for i in 0..n {
+		w.Write(pattern(size, i*size)) catch _ {
+			return
+		}
+		if ms > 0 {
+			tide.Wait(ms*1000000) catch _ {
+				return
+			}
+		}
+	}
+}
+
+fn length(q anvil.Req, w mut anvil.Out) {
+	w.Type("application/octet-stream")
+	w.Stream() catch _ {
+		return
+	}
+	let n = num(q, "n", 100000)
+	w.Length(n) catch _ {
+		return
+	}
+	mut sent = 0
+	for sent < n {
+		mut k = 7000
+		if n-sent < k {
+			k = n - sent
+		}
+		w.Write(pattern(k, sent)) catch _ {
+			return
+		}
+		sent += k
+	}
+}
+
+fn short(q anvil.Req, w mut anvil.Out) {
+	w.Stream() catch _ {
+		return
+	}
+	w.Length(10) catch _ {
+		return
+	}
+	w.WriteString("12345") catch _ {
+		return
+	}
+}
+
+fn file(q anvil.Req, w mut anvil.Out) {
+	let path = quarry.Getenv("FILES_DIR") + "/" + q.Param("name")
+	w.Type("application/octet-stream")
+	w.SendFile(path, num(q, "off", 0), num(q, "n", -1)) catch err {
+		w.Status(404)
+		w.Text("cannot send: {err}")
+	}
+}
+
+fn trailers(q anvil.Req, w mut anvil.Out) {
+	let n = num(q, "n", 10)
+	let b = pattern(n, 0)
+	mut sum = 0
+	for i in 0..n {
+		sum += i64(b[i])
+	}
+	w.Type("application/octet-stream")
+	w.Body = append(w.Body, b...)
+	w.Trailer("x-sum", "{sum}")
+	w.Trailer("grpc-status", "0")
+}
+
+fn streamtrailers(q anvil.Req, w mut anvil.Out) {
+	w.Stream() catch _ {
+		return
+	}
+	w.WriteString("part one;") catch _ {
+		return
+	}
+	w.WriteString("part two") catch _ {
+		return
+	}
+	w.Trailer("x-done", "yes")
+}
+
+fn headers(q anvil.Req, w mut anvil.Out) {
+	let n = num(q, "n", 4)
+	let size = num(q, "size", 1000)
+	let v = make([]u8, size)
+	for i in 0..size {
+		v[i] = 'v'
+	}
+	for i in 0..n {
+		w.Head("x-big-{i}", str(v))
+	}
+	w.Text("headers {n}")
+}
+
+fn status(q anvil.Req, w mut anvil.Out) {
+	let code = num(q, "code", 200)
+	w.Status(code)
+	w.Text("status {code}")
+}
+
+fn boom(q anvil.Req, w mut anvil.Out) {
+	let xs = make([]i64, 2)
+	let i = num(q, "i", 5)
+	w.Text("unreachable {xs[i]}")
+}
+
+fn streampanic(q anvil.Req, w mut anvil.Out) {
+	w.Stream() catch _ {
+		return
+	}
+	w.WriteString("partial") catch _ {
+		return
+	}
+	let xs = make([]i64, 2)
+	let i = num(q, "i", 5)
+	w.Text("unreachable {xs[i]}")
+}
+
+fn abort(q anvil.Req, w mut anvil.Out) {
+	w.Stream() catch _ {
+		return
+	}
+	w.WriteString("partial") catch _ {
+		return
+	}
+	w.Abort()
+}
+
+fn endless(q anvil.Req, w mut anvil.Out) {
+	w.Stream() catch _ {
+		return
+	}
+	let b = pattern(16384, 0)
+	mut k = 0
+	for {
+		w.Write(b) catch err {
+			herald.Log(herald.LInfo, "endless stopped", []str{"after", "{k}", "err", "{err}"})
+			return
+		}
+		k += 1
+	}
+}
+
+fn hijack(q anvil.Req, w mut anvil.Out) {
+	let fd = q.Hijack() catch err {
+		w.Status(400)
+		w.Text("hijack failed: {err}")
+		return
+	}
+	w.Text("hijacked {fd}")
+}
+
+fn main() {
+	let r = anvil.NewRouter()
+	r.Get("/", root)
+	r.Any("/echo", echo)
+	r.Get("/wait", wait)
+	r.Get("/big", big)
+	r.Get("/stream", stream)
+	r.Get("/length", length)
+	r.Get("/short", short)
+	r.Get("/file", file)
+	r.Get("/trailers", trailers)
+	r.Get("/streamtrailers", streamtrailers)
+	r.Get("/headers", headers)
+	r.Get("/status", status)
+	r.Get("/panic", boom)
+	r.Get("/streampanic", streampanic)
+	r.Get("/abort", abort)
+	r.Get("/endless", endless)
+	r.Get("/hijack", hijack)
+	if quarry.Getenv("TLS_CERT") != "" {
+		// HTTPS: h2 by ALPN, HTTP/1.1 otherwise (#124, #360).
+		let cert = quarry.ReadFile(quarry.Getenv("TLS_CERT")) catch err {
+			herald.Log(herald.LError, "cert", []str{"err", "{err}"})
+			return
+		}
+		let key = quarry.ReadFile(quarry.Getenv("TLS_KEY")) catch err {
+			herald.Log(herald.LError, "key", []str{"err", "{err}"})
+			return
+		}
+		r.ServeTLS(":9360", cert, key) catch err {
+			herald.Log(herald.LError, "server", []str{"err", "{err}"})
+		}
+		return
+	}
+	r.Serve(":9360") catch err {
+		herald.Log(herald.LError, "server", []str{"err", "{err}"})
+	}
+}

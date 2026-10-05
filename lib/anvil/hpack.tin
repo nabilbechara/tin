@@ -1,0 +1,447 @@
+// HPACK (RFC 7541) for the HTTP/2 connections of h2.tin: the decoder, with its dynamic table
+// and the Huffman code, and the encodings responses use. A response is written with
+// static-table names and literals that are neither indexed nor Huffman-coded, so it never adds
+// to the client's dynamic table and the encoder keeps no state but one table size update.
+package anvil
+
+// The static table (RFC 7541 Appendix A): one "name|value" line per entry, entries 1 to 61.
+const hpStaticText = ":authority|\n:method|GET\n:method|POST\n:path|/\n:path|/index.html\n:scheme|http\n:scheme|https\n:status|200\n:status|204\n:status|206\n:status|304\n:status|400\n:status|404\n:status|500\naccept-charset|\naccept-encoding|gzip, deflate\naccept-language|\naccept-ranges|\naccept|\naccess-control-allow-origin|\nage|\nallow|\nauthorization|\ncache-control|\ncontent-disposition|\ncontent-encoding|\ncontent-language|\ncontent-length|\ncontent-location|\ncontent-range|\ncontent-type|\ncookie|\ndate|\netag|\nexpect|\nexpires|\nfrom|\nhost|\nif-match|\nif-modified-since|\nif-none-match|\nif-range|\nif-unmodified-since|\nlast-modified|\nlink|\nlocation|\nmax-forwards|\nproxy-authenticate|\nproxy-authorization|\nrange|\nreferer|\nrefresh|\nretry-after|\nserver|\nset-cookie|\nstrict-transport-security|\ntransfer-encoding|\nuser-agent|\nvary|\nvia|\nwww-authenticate|\n"
+
+// The Huffman code's lengths for symbols 0 to 256 (EOS), two digits each (RFC 7541 Appendix B).
+// The code is canonical: the codes of one length are consecutive, in symbol order, and follow the
+// shorter ones, so the lengths alone rebuild it.
+const hpHuffLens = "1323282828282828282430282830282828282828282830282828282828282828061010121306081110100811080606060505050606060606060607081506121013060707070707070707070707070707070707070707070708070813191314061505060506050606060507070606060506070605050607070707071511141328202220202222222322232323232324232424222324232323232122232223232422212022222323212322222421222323212122212322232320222222232222232626201922232225262626272726242519212627272627242121262628272727202420212221212322222525242426232627262627272727272827272727272630"
+
+const hpTableMax = 4096 // SETTINGS_HEADER_TABLE_SIZE: the decoder's table never grows past the default
+const hpEntries = 128   // entries the dynamic table can hold: each takes at least 32 of its 4096 bytes
+
+mut hpReady bool
+mut hpStatic i64 // per core: 62 x [name, name length, value, value length]
+mut hpKinds i64  // per core: the kind of each static entry's name (h2_kind)
+mut hpSym i64    // the symbols ordered by code length, then value
+mut hpFirst i64  // per code length: its first code, its symbols' count and their offset in hpSym
+mut hpCount i64
+mut hpOff i64
+mut hpFast i64   // per first byte: the symbol of a code of at most 8 bits and its length << 16 (0: a longer code)
+mut hpPos i64    // the decoder's position in the header block
+mut hpScr i64    // Huffman-decoded strings of the field being decoded
+mut hpScrCap i64
+mut hpScrLen i64
+mut hpSp i64     // the string hp_str read last
+mut hpSn i64
+mut hpN i64      // the entry hp_entry found
+mut hpNn i64
+mut hpV i64
+mut hpVn i64
+mut hpVok bool   // hp_entry's value was checked already (a static entry, or a dynamic one checked when added)
+mut hpKind i64   // hp_entry's name, classified (h2_kind)
+
+// hp_init builds this core's static table and Huffman tables the first time a connection needs them.
+fn hp_init() {
+	if hpReady {
+		return
+	}
+	hpReady = true
+	hpStatic = calloc(62*4, 8)
+	let t = cast(i64, hpStaticText) + 8
+	let n = len(hpStaticText)
+	{
+		mut a = 0
+		mut i = 1
+		for a < n {
+			let bar = memchr(t+a, '|', n-a)
+			let nl = memchr(bar, '\n', n-(bar-t))
+			let e = hpStatic + i*32
+			e[0] = t + a
+			e[1] = bar - (t + a)
+			e[2] = bar + 1
+			e[3] = nl - bar - 1
+			a = nl - t + 1
+			i += 1
+		}
+	}
+	hpKinds = calloc(62, 8)
+	for i in 1..62 {
+		let e = hpStatic + i*32
+		hpKinds[i] = h2_kind(e[0], e[1])
+	}
+	hpSym = calloc(257, 8)
+	hpFirst = calloc(32, 8)
+	hpCount = calloc(32, 8)
+	hpOff = calloc(32, 8)
+	let lp = cast(i64, hpHuffLens) + 8
+	for s in 0..257 {
+		hpCount[hp_len(lp, s)] += 1
+	}
+	{
+		mut code = 0
+		mut off = 0
+		for l in 1..31 {
+			hpFirst[l] = code
+			hpOff[l] = off
+			off += hpCount[l]
+			code = (code + hpCount[l]) << 1
+		}
+	}
+	let fill = calloc(32, 8)
+	hpFast = calloc(256, 8)
+	for s in 0..257 {
+		let l = hp_len(lp, s)
+		hpSym[hpOff[l]+fill[l]] = s
+		if l <= 8 {
+			// Every byte that starts with this code decodes to it in one lookup.
+			let code = hpFirst[l] + fill[l]
+			for j in 0..(1 << (8-l)) {
+				hpFast[(code<<(8-l))|j] = s | (l << 16)
+			}
+		}
+		fill[l] += 1
+	}
+	free(fill)
+	hpScrCap = 4096
+	hpScr = malloc(hpScrCap)
+}
+
+// hp_len is symbol s's code length in the two-digit table at lp.
+fn hp_len(lp i64, s i64) i64 {
+	return i64(load8(lp+2*s)-'0')*10 + i64(load8(lp+2*s+1)-'0')
+}
+
+// hp_huff decodes the n Huffman-coded bytes at p into out: the decoded length, or -1 when they are
+// not a valid string (an EOS symbol, or padding longer than 7 bits or not all ones, RFC 7541 5.2).
+// A code of at most 8 bits (every letter, digit and common sign) takes one lookup of the next 8
+// bits; a longer one is decoded bit by bit from its ninth.
+fn hp_huff(p i64, n i64, out i64) i64 {
+	let fast = hpFast
+	mut acc = 0  // the bits not decoded yet: the low nacc bits
+	mut nacc = 0
+	mut i = 0
+	mut o = 0
+	for {
+		for nacc < 8 && i < n {
+			acc = (acc << 8) | i64(load8(p+i))
+			nacc += 8
+			i += 1
+		}
+		if nacc == 0 {
+			break
+		}
+		mut top = 0
+		if nacc >= 8 {
+			top = (acc >> (nacc - 8)) & 255
+		} else {
+			top = ((acc << (8 - nacc)) | ((1 << (8 - nacc)) - 1)) & 255 // the end: padded with ones
+		}
+		let e = fast[top]
+		let l = e >> 16
+		if l > 0 && l <= nacc {
+			store8(out+o, e&255)
+			o += 1
+			nacc -= l
+			acc = acc & ((1 << nacc) - 1)
+			continue
+		}
+		if nacc < 8 {
+			break // what is left must be padding
+		}
+		let r = hp_huff_long(p, n, i, top, acc&((1<<(nacc-8))-1), nacc-8)
+		if r < 0 {
+			return -1
+		}
+		store8(out+o, r&255)
+		o += 1
+		i = hpHi
+		acc = hpHacc
+		nacc = hpHn
+	}
+	if nacc > 7 || acc != (1<<nacc)-1 {
+		return -1
+	}
+	return o
+}
+
+mut hpHi i64   // hp_huff_long's input position and bits left over
+mut hpHacc i64
+mut hpHn i64
+
+// hp_huff_long decodes a code longer than 8 bits whose first 8 are top: the bits after them are
+// the low nacc bits of acc, then the input from p+i. It returns the symbol (-1 for an invalid
+// code or EOS) and leaves the position and the bits left in hpHi, hpHacc and hpHn.
+fn hp_huff_long(p i64, n i64, i i64, top i64, acc i64, nacc i64) i64 {
+	let first = hpFirst
+	let count = hpCount
+	mut code = top
+	mut bits = 8
+	mut a = acc
+	mut na = nacc
+	mut j = i
+	for bits < 30 {
+		if na == 0 {
+			if j >= n {
+				return -1
+			}
+			a = i64(load8(p + j))
+			na = 8
+			j += 1
+		}
+		na -= 1
+		code = (code << 1) | ((a >> na) & 1)
+		a = a & ((1 << na) - 1)
+		bits += 1
+		let x = code - first[bits]
+		if x >= 0 && x < count[bits] {
+			let v = hpSym[hpOff[bits]+x]
+			if v == 256 {
+				return -1
+			}
+			hpHi = j
+			hpHacc = a
+			hpHn = na
+			return v
+		}
+	}
+	return -1
+}
+
+// hp_int reads an integer whose prefix is the bits of mask in the byte at hpPos (RFC 7541 5.1),
+// within the n bytes at p; -1 when it is cut short or past 2^31 - 1.
+fn hp_int(p i64, n i64, mask i64) i64 {
+	if hpPos >= n {
+		return -1
+	}
+	mut v = i64(load8(p+hpPos)) & mask
+	hpPos += 1
+	if v < mask {
+		return v
+	}
+	mut m = 0
+	for hpPos < n {
+		let b = i64(load8(p + hpPos))
+		hpPos += 1
+		v += (b & 127) << m
+		if v > 0x7fffffff {
+			return -1
+		}
+		if b < 128 {
+			return v
+		}
+		m += 7
+		if m > 28 {
+			return -1
+		}
+	}
+	return -1
+}
+
+// hp_str reads the string literal at hpPos (RFC 7541 5.2) into hpSp and hpSn: in place, or decoded
+// into the scratch buffer; false when it is cut short or its Huffman code is invalid.
+fn hp_str(p i64, n i64) bool {
+	if hpPos >= n {
+		return false
+	}
+	let huff = load8(p+hpPos) >= 128
+	let l = hp_int(p, n, 127)
+	if l < 0 || hpPos+l > n {
+		return false
+	}
+	if huff {
+		let out = hpScr + hpScrLen
+		let k = hp_huff(p+hpPos, l, out)
+		if k < 0 {
+			return false
+		}
+		hpSp = out
+		hpSn = k
+		hpScrLen += k
+	} else {
+		hpSp = p + hpPos
+		hpSn = l
+	}
+	hpPos += l
+	return true
+}
+
+// hp_entry points hpN, hpNn, hpV and hpVn at entry idx of the static table (1 to 61) or of h's
+// dynamic table (62 the newest); false when there is no such entry.
+fn hp_entry(h i64, idx i64) bool {
+	if idx <= 0 {
+		return false
+	}
+	if idx <= 61 {
+		let e = hpStatic + idx*32
+		hpN = e[0]
+		hpNn = e[1]
+		hpV = e[2]
+		hpVn = e[3]
+		hpVok = true
+		hpKind = hpKinds[idx]
+		return true
+	}
+	let d = idx - 62
+	if d >= h[hDynCount] {
+		return false
+	}
+	let e = h[hDyn] + ((h[hDynHead]-1-d)&(hpEntries-1))*24
+	hpN = e[0]
+	hpNn = e[1] & 0xffffffff
+	hpV = e[0] + hpNn
+	hpVn = e[2]
+	hpVok = ((e[1] >> 32) & 1) != 0
+	hpKind = e[1] >> 33
+	return true
+}
+
+// hp_insert adds a field to the front of h's dynamic table, evicting the oldest entries to make
+// room (RFC 7541 4.4). The bytes are copied first: the name may be an entry the room is made from.
+// The entry keeps the kind of its name and whether its value passed (hfKind, hfVok from h2_field),
+// so a reference to it is not checked again.
+fn hp_insert(h i64, np i64, nn i64, vp i64, vn i64) {
+	let size = nn + vn + 32
+	mut b = 0
+	if size <= h[hDynMax] {
+		b = malloc(nn + vn + 1)
+		memcpy(b, np, nn)
+		memcpy(b+nn, vp, vn)
+	}
+	for h[hDynCount] > 0 && h[hDynSize]+size > h[hDynMax] {
+		hp_evict(h)
+	}
+	if b == 0 {
+		return
+	}
+	let e = h[hDyn] + (h[hDynHead]&(hpEntries-1))*24
+	e[0] = b
+	e[1] = nn | (i64(hfVok) << 32) | (hfKind << 33)
+	e[2] = vn
+	h[hDynHead] += 1
+	h[hDynCount] += 1
+	h[hDynSize] += size
+}
+
+// hp_evict drops the oldest entry of h's dynamic table.
+fn hp_evict(h i64) {
+	let e = h[hDyn] + ((h[hDynHead]-h[hDynCount])&(hpEntries-1))*24
+	h[hDynSize] -= (e[1] & 0xffffffff) + e[2] + 32
+	free(e[0])
+	e[0] = 0
+	h[hDynCount] -= 1
+}
+
+// hp_decode decodes the header block at p (n bytes) with connection state h, handing each field to
+// h2_field; false on a decoding error, which is a COMPRESSION_ERROR for the whole connection.
+fn hp_decode(h i64, p i64, n i64) bool {
+	if hpScrCap < 2*n+64 {
+		free(hpScr)
+		hpScrCap = 2*n + 64
+		hpScr = malloc(hpScrCap)
+	}
+	hpPos = 0
+	mut fields = false
+	for hpPos < n {
+		hpScrLen = 0
+		let b = i64(load8(p + hpPos))
+		if b >= 128 {
+			// An indexed field (RFC 7541 6.1); index 0 is an error.
+			if !hp_entry(h, hp_int(p, n, 127)) {
+				return false
+			}
+			h2_field(hpN, hpNn, hpV, hpVn, hpVok, hpKind)
+			fields = true
+		} else if b >= 64 || b < 32 {
+			// A literal (6.2): with incremental indexing (01), without (0000) or never indexed (0001).
+			let index = b >= 64
+			mut mask = 15
+			if index {
+				mask = 63
+			}
+			let i = hp_int(p, n, mask)
+			if i < 0 {
+				return false
+			}
+			mut np = 0
+			mut nn = 0
+			mut kind = -1
+			if i == 0 {
+				if !hp_str(p, n) {
+					return false
+				}
+				np = hpSp
+				nn = hpSn
+			} else {
+				if !hp_entry(h, i) {
+					return false
+				}
+				np = hpN
+				nn = hpNn
+				kind = hpKind
+			}
+			if !hp_str(p, n) {
+				return false
+			}
+			h2_field(np, nn, hpSp, hpSn, false, kind)
+			if index {
+				hp_insert(h, np, nn, hpSp, hpSn)
+			}
+			fields = true
+		} else {
+			// A dynamic table size update (6.3): only before the first field, and within the setting.
+			if fields {
+				return false
+			}
+			let v = hp_int(p, n, 31)
+			if v < 0 || v > hpTableMax {
+				return false
+			}
+			h[hDynMax] = v
+			for h[hDynSize] > v {
+				hp_evict(h)
+			}
+		}
+	}
+	return true
+}
+
+// hp_put_int appends an integer to the output batch with a prefix of the bits of mask, first's
+// bits above them (RFC 7541 5.1).
+fn hp_put_int(first i64, mask i64, v i64) {
+	if v < mask {
+		store8(ob+obLen, first|v)
+		obLen += 1
+		return
+	}
+	store8(ob+obLen, first|mask)
+	obLen += 1
+	mut x = v - mask
+	for x >= 128 {
+		store8(ob+obLen, (x&127)|128)
+		obLen += 1
+		x = x >> 7
+	}
+	store8(ob+obLen, x)
+	obLen += 1
+}
+
+// hp_put_str appends the n bytes at p as a string literal without Huffman coding.
+fn hp_put_str(p i64, n i64) {
+	hp_put_int(0, 127, n)
+	memcpy(ob+obLen, p, n)
+	obLen += n
+}
+
+// hp_put_named appends a field without indexing whose name is static entry idx (RFC 7541 6.2.2).
+fn hp_put_named(idx i64, p i64, n i64) {
+	hp_put_int(0, 15, idx)
+	hp_put_str(p, n)
+}
+
+// hp_put_literal appends a field without indexing with a literal name, lowered.
+fn hp_put_literal(np i64, nn i64, vp i64, vn i64) {
+	store8(ob+obLen, 0)
+	obLen += 1
+	hp_put_int(0, 127, nn)
+	for i in 0..nn {
+		store8(ob+obLen+i, lower(load8(np+i)))
+	}
+	obLen += nn
+	hp_put_str(vp, vn)
+}

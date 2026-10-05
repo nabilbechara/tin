@@ -1,4 +1,7 @@
-// Package anvil is an HTTP/1.1 server: one event loop per core (kqueue), share-nothing.
+// Package anvil is an HTTP/1.1 and HTTP/2 server: one event loop per core (epoll, kqueue),
+// share-nothing. HTTP/2 without TLS (h2c) is served on the same port, by prior knowledge or after
+// Upgrade: h2c, and over TLS (ServeTLS) to a client whose ALPN offers h2; handlers are the same
+// for both, each request (or stream) in a task of its own.
 //
 // Core 0 accepts connections and deals them round-robin to every core through a pipe;
 // from then on a connection belongs to one core for its whole life. Each core reads
@@ -98,6 +101,7 @@ type Out struct {
 	ep    i64 // the Router endpoint whose middleware chain is running (an rend)
 	ci    i64 // the next middleware of that chain
 	vals  i64 // SetValue's keys and values: a []str made on first use, or 0
+	tr    i64 // Trailer's field lines: a []u8 made on first use, or 0
 }
 
 const scrSize = 262144
@@ -135,7 +139,8 @@ const cStFlags = 25  // the request: 1 HEAD, 2 HTTP/1.0, 4 keep-alive asked in H
 const cTls = 26      // HTTPS (#124, serve_tls.tin): the connection's tls.Conn (kept in tlsConns), 0 over plain TCP
 const cHs = 27       // its handshake: 1 running in the task in cTask, 2 done (until tls_done), 0 none
 const cProto = 28    // the protocol ALPN chose: its number in the offered list (alpn_offer), 0 none
-const cWords = 29
+const cH2 = 29       // the connection speaks HTTP/2 (#360): its state (h2.tin), 0 for HTTP/1.1
+const cWords = 30
 
 shared mut gListen i64
 shared mut gIP i64
@@ -597,6 +602,7 @@ fn begin_drain() {
 		rt_sys_close(myListen)
 		myListen = -1
 	}
+	h2_drain_all() // HTTP/2 connections get GOAWAY now, and the idle ones close (#360)
 }
 
 // Drain starts the graceful shutdown from code, as SIGTERM does (#238): listeners close, the
@@ -779,6 +785,10 @@ fn close_conn(c i64) {
 	if c[cDead] != 0 {
 		return
 	}
+	if c[cH2] != 0 {
+		h2_close(c) // its streams' tasks are cancelled; it is freed when they end (#360)
+		return
+	}
 	let fd = c[cFD]
 	if c[cTls] != 0 {
 		gTlsBye(c) // close_notify (serve_tls.tin)
@@ -808,6 +818,9 @@ fn free_conn(c i64) {
 	}
 	if c[cStBuf] != 0 {
 		free(c[cStBuf])
+	}
+	if c[cH2] != 0 {
+		h2_free(c)
 	}
 	if c[cTls] != 0 {
 		gTlsFree(c)
@@ -846,6 +859,9 @@ fn on_read_serve(c i64) bool {
 				return false
 			}
 		}
+	}
+	if c[cH2] != 0 {
+		return h2_read(c) // HTTP/2 (#360)
 	}
 	mut buf = scr
 	mut cap = scrSize
@@ -1024,6 +1040,10 @@ fn pend_out(c i64, p i64, n i64) {
 }
 
 fn on_write(c i64) {
+	if c[cH2] != 0 {
+		h2_on_write(c)
+		return
+	}
 	if c[cOut] == 0 {
 		return
 	}
@@ -1156,6 +1176,11 @@ fn serve_one(c i64, p i64, n i64) i64 {
 	}
 	let minor = load8(p + ll - 1)
 	if ctl || nsp != 2 || sp1 <= 0 || sp2 <= sp1+1 || ll-sp2-1 != 8 || !is_http1(p+sp2+1) || minor < '0' || minor > '9' {
+		if ll == 14 && bytes_are(p, 14, "PRI * HTTP/2.0") && c[cTls] == 0 {
+			// The HTTP/2 client preface starts like a request line: h2c with prior knowledge (#360).
+			// Over TLS, HTTP/2 is agreed by ALPN instead (RFC 9113 3.3).
+			return h2_enter(c, p, n)
+		}
 		// Control bytes (a bare CR, NUL, tab) are not allowed anywhere in the request line.
 		bad(c, 400)
 		return -1
@@ -1184,6 +1209,7 @@ fn serve_one(c i64, p i64, n i64) i64 {
 	mut hosts = 0
 	mut expect100 = false
 	mut seenClose = false
+	mut upgrade = false // Connection lists upgrade: maybe Upgrade: h2c (#360)
 	mut pos = le + 1
 	mut cl = 0
 	mut seenCL = false
@@ -1263,6 +1289,8 @@ fn serve_one(c i64, p i64, n i64) i64 {
 					seenClose = true
 				} else if name_is(h+j, e-j, "keep-alive") && !seenClose {
 					alive = true
+				} else if name_is(h+j, e-j, "upgrade") {
+					upgrade = true
 				}
 				j = e
 			}
@@ -1340,6 +1368,14 @@ fn serve_one(c i64, p i64, n i64) i64 {
 	}
 	c[cNeed] = 0
 	c[cSent100] = 0
+	if upgrade && !http10 && !chunked && !draining && c[cTls] == 0 {
+		// Upgrade: h2c is for cleartext only (RFC 9113 3.2).
+		pTs = ts
+		pTn = tn
+		if h2_upgrade(c, p, n, total, sp1, le, hend, cl) {
+			return n // the connection speaks HTTP/2 now; the request is its stream 1 (#360)
+		}
+	}
 	if waiting >= maxWaiting {
 		// Backpressure: too many requests already wait on this core.
 		bad(c, 503)
@@ -1498,6 +1534,10 @@ fn finish_request(c i64, task i64) {
 		gTlsDone(c, task)
 		return
 	}
+	if c[cH2] != 0 {
+		h2_finish(c, task) // a stream's task (#360)
+		return
+	}
 	free(task[tUser+1])
 	mut streamed = false
 	if c[cStream] != 0 {
@@ -1627,6 +1667,8 @@ fn sweep() {
 			let c = conns[fd]
 			if c != 0 && c[cDeadline] != 0 && c[cDeadline] <= loopNow && c[cTask] == 0 && c[cHijack] == 0 {
 				close_conn(c)
+			} else if c != 0 && c[cH2] != 0 {
+				h2_sweep(c) // stream read timeouts, and GOAWAY when draining (#360)
 			}
 			fd += 1
 		}
@@ -1637,6 +1679,10 @@ fn sweep() {
 // arriving (header timeout until its headers are in, then the read timeout, both from its
 // first bytes), or an idle keep-alive connection.
 fn arm(c i64, partial bool) {
+	if c[cH2] != 0 {
+		h2_arm(c)
+		return
+	}
 	if c[cTask] != 0 || c[cHijack] != 0 {
 		c[cDeadline] = 0
 		return
@@ -2244,6 +2290,22 @@ fn (q Req) Header(name str) str {
 	return v
 }
 
+// Proto is the protocol the request came in: "HTTP/2.0" (h2c, or h2 over TLS), "HTTP/1.1" or
+// "HTTP/1.0". A request made with Router.Run is "HTTP/1.1".
+fn (q Req) Proto() str {
+	let c = q.cn
+	if c == 0 {
+		return "HTTP/1.1"
+	}
+	if c[cH2] != 0 {
+		return "HTTP/2.0"
+	}
+	if (c[cStFlags] & 2) != 0 {
+		return "HTTP/1.0"
+	}
+	return "HTTP/1.1"
+}
+
 // header_in is the value of the field name in the n bytes of field lines at hp, or "".
 fn header_in(hp i64, hn i64, name str) str {
 	mut p = hp
@@ -2284,13 +2346,16 @@ fn header_in(hp i64, hn i64, name str) str {
 // websocket package uses it): the responses before this request are written, the core
 // stops reading the connection and the request's deadline no longer applies. It returns
 // the non-blocking descriptor, for the caller's I/O until the handler returns; then anvil
-// closes it. The handler's Out is not sent.
+// closes it. The handler's Out is not sent. An HTTP/2 stream cannot be hijacked: Hijack fails there.
 fn (q Req) Hijack() !i64 {
 	let task = rt_task_current()
 	if task == 0 {
 		fail "anvil: Hijack outside a request"
 	}
 	let c = task[tArg]
+	if c[cH2] != 0 {
+		fail "anvil: an HTTP/2 stream cannot be hijacked"
+	}
 	if c[cHijack] != 0 {
 		fail "anvil: the connection is already hijacked"
 	}
@@ -2346,11 +2411,20 @@ fn (q Req) Hijack() !i64 {
 // an HTTP/1.0 client, which cannot read chunks, gets the body up to the end of the connection.
 // Each write waits for a slow client within the write timeout (TIN_WRITE_TIMEOUT_MS), and the
 // request deadline (TIN_DEADLINE_MS) counts from the last write, so a stream lives as long as it
-// keeps writing. Calling Stream again does nothing.
+// keeps writing. Calling Stream again does nothing. On HTTP/2 the body goes in DATA frames within
+// the client's flow-control windows, and Length sets content-length.
 fn (w mut Out) Stream() ! {
 	let c = stream_conn()
 	if c == 0 {
 		fail "anvil: Stream outside a request"
+	}
+	if c[cH2] != 0 {
+		let s = h2_stream() // an HTTP/2 stream: the body goes in DATA frames (#360)
+		if s[sStream] == 0 {
+			s[sStream] = 1
+			s[sStLen] = -1
+		}
+		return
 	}
 	if c[cHijack] != 0 {
 		fail "anvil: the connection is hijacked"
@@ -2366,6 +2440,17 @@ fn (w mut Out) Stream() ! {
 // and before the first Write or Flush.
 fn (w mut Out) Length(n i64) ! {
 	let c = stream_conn()
+	if c != 0 && c[cH2] != 0 {
+		let s = h2_stream()
+		if s[sStream] != 1 {
+			fail "anvil: Length is set after Stream and before the first Write"
+		}
+		if n < 0 {
+			fail "anvil: negative Length"
+		}
+		s[sStLen] = n
+		return
+	}
 	if c == 0 || c[cStream] != 1 {
 		fail "anvil: Length is set after Stream and before the first Write"
 	}
@@ -2381,6 +2466,16 @@ fn (w mut Out) Length(n i64) ! {
 // the body with Text or argo.Put(mut w.Body, v) is sent by the next Write or Flush.
 fn (w mut Out) Write(b []u8) ! {
 	let c = stream_conn()
+	if c != 0 && c[cH2] != 0 {
+		let s = h2_stream()
+		if s[sStream] == 0 {
+			fail "anvil: Write needs w.Stream() first"
+		}
+		try h2_put_body(c, s, mut w)
+		let bh = cast(i64, b)
+		try h2_put(c, s, w, bh[2], bh[0])
+		return
+	}
 	if c == 0 || c[cStream] == 0 {
 		fail "anvil: Write needs w.Stream() first"
 	}
@@ -2392,6 +2487,15 @@ fn (w mut Out) Write(b []u8) ! {
 // WriteString is Write for a str.
 fn (w mut Out) WriteString(s str) ! {
 	let c = stream_conn()
+	if c != 0 && c[cH2] != 0 {
+		let st = h2_stream()
+		if st[sStream] == 0 {
+			fail "anvil: WriteString needs w.Stream() first"
+		}
+		try h2_put_body(c, st, mut w)
+		try h2_put(c, st, w, cast(i64, s)+8, len(s))
+		return
+	}
 	if c == 0 || c[cStream] == 0 {
 		fail "anvil: WriteString needs w.Stream() first"
 	}
@@ -2403,6 +2507,15 @@ fn (w mut Out) WriteString(s str) ! {
 // as one chunk: with it a handler makes a client see an event now.
 fn (w mut Out) Flush() ! {
 	let c = stream_conn()
+	if c != 0 && c[cH2] != 0 {
+		let s = h2_stream()
+		if s[sStream] == 0 {
+			fail "anvil: Flush needs w.Stream() first"
+		}
+		try h2_put_body(c, s, mut w)
+		try h2_put(c, s, w, 0, 0)
+		return
+	}
 	if c == 0 || c[cStream] == 0 {
 		fail "anvil: Flush needs w.Stream() first"
 	}
@@ -2415,6 +2528,10 @@ fn (w mut Out) Flush() ! {
 // that looks complete. Before the head is sent, the response is an ordinary one again.
 fn (w mut Out) Abort() {
 	let c = stream_conn()
+	if c != 0 && c[cH2] != 0 {
+		h2_abort(c, h2_stream()) // RST_STREAM: the client sees the stream fail (#360)
+		return
+	}
 	if c != 0 && c[cStream] >= 2 && c[cStream] != 5 {
 		c[cStream] = 5
 		c[cClose] = 1
@@ -2427,6 +2544,10 @@ fn (w Out) Closed() bool {
 	let c = stream_conn()
 	if c == 0 {
 		return false
+	}
+	if c[cH2] != 0 {
+		let s = h2_stream()
+		return s[sReset] != 0 || h2_gone(c)
 	}
 	if c[cTls] != 0 {
 		return gTlsClosed(c) // HTTPS: a peek sees only records (serve_tls.tin)
@@ -2444,8 +2565,8 @@ fn (w Out) Closed() bool {
 // stream_conn is the connection of the request the running task serves, 0 outside one.
 fn stream_conn() i64 {
 	let task = rt_task_current()
-	if task == 0 {
-		return 0
+	if task == 0 || rt_task_is_child(task) {
+		return 0 // a scope's child does not own the response
 	}
 	return task[tArg]
 }
@@ -2683,8 +2804,17 @@ fn stream_end(c i64, w Out) {
 	}
 	let ended = c[cStream]
 	if ended == 2 && (fl & 1) == 0 {
-		ob_room(8)
-		ob_str("0\r\n\r\n")
+		let th = w.tr
+		if th != 0 && th[0] > 0 {
+			// The last chunk carries the trailer fields (RFC 9112 7.1.2).
+			ob_room(8 + th[0])
+			ob_str("0\r\n")
+			ob_raw(th[2], th[0])
+			ob_str("\r\n")
+		} else {
+			ob_room(8)
+			ob_str("0\r\n\r\n")
+		}
 	} else if ended == 3 && (fl & 1) == 0 && c[cStSent] != c[cStLen] {
 		c[cClose] = 1 // a short body: the client cannot tell where it ends
 	} else if ended == 4 || ended == 5 {
@@ -2770,6 +2900,10 @@ fn (w mut Out) SendFile(path str, off i64, n i64) ! {
 	}
 	if off + count > size {
 		fail "anvil: SendFile asks for more than the file holds"
+	}
+	if c[cH2] != 0 {
+		try h2_sendfile(c, h2_stream(), mut w, path, off, count) // DATA frames within the windows (#360)
+		return
 	}
 	if c[cStream] == 0 {
 		c[cStream] = 1
@@ -3004,6 +3138,31 @@ fn (w mut Out) Head(k str, v str) {
 		w.extra = append(w.extra, c)
 	}
 	w.extra = append(w.extra, "\r\n"...)
+}
+
+// Trailer adds a trailer field, sent after the body: on HTTP/2 in a HEADERS frame that ends the
+// stream (gRPC's grpc-status and grpc-message), on HTTP/1.1 after the last chunk of a chunked
+// stream (w.Stream() without Length). A response with a Content-Length cannot carry trailers in
+// HTTP/1.1: they are dropped there. Like Head, a name that is not a token and the framing fields
+// are ignored, and CR, LF and NUL in the value become spaces.
+fn (w mut Out) Trailer(k str, v str) {
+	if !is_token(k) || is_framing(k) {
+		return
+	}
+	if w.tr == 0 {
+		w.tr = cast(i64, make([]u8, 0, 64))
+	}
+	mut t = cast([]u8, w.tr)
+	t = append(t, k...)
+	t = append(t, ": "...)
+	for i in 0..len(v) {
+		mut c = v[i]
+		if c == '\r' || c == '\n' || c == 0 {
+			c = ' '
+		}
+		t = append(t, c)
+	}
+	t = append(t, "\r\n"...)
 }
 
 // field_value is s with CR, LF and NUL replaced by spaces (s itself when it has none).

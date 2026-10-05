@@ -150,7 +150,7 @@ def openssl_interop(openssl, exe, certs, work):
             if kind == 'ecdsa':
                 rc, out = s_client(openssl, srv.port, ['-sigalgs', 'rsa_pss_rsae_sha256'], get('/fast'))
                 assert rc != 0 and 'alert number 40' in out, ('RSA-only client against an ECDSA key', out[-1500:])
-                rc, out = s_client(openssl, srv.port, ['-alpn', 'h2'], get('/fast'))
+                rc, out = s_client(openssl, srv.port, ['-alpn', 'spdy/3'], get('/fast'))
                 assert rc != 0 and 'alert number 120' in out, ('no common ALPN protocol', out[-1500:])
                 rc, out = s_client(openssl, srv.port, [], get('/info'))
                 assert 'alpn= suite=' in out, ('no ALPN offered', out[-1500:])
@@ -236,7 +236,9 @@ def python_clients(exe, certs, work):
     cert = certs['ecdsa']
     srv = Server(exe, cert, work)
     try:
-        ctx = py_ctx(cert, alpn=['h2', 'http/1.1'])
+        # http.client speaks HTTP/1.1: of what it offers, the server has only http/1.1 (h2 is
+        # checked by tools/ci/h2_check.py).
+        ctx = py_ctx(cert, alpn=['spdy/3', 'http/1.1'])
         c = http.client.HTTPSConnection('127.0.0.1', srv.port, context=ctx, timeout=30)
         upload = os.urandom(1 << 20)
         fbytes = (work / 'file.bin').read_bytes()
@@ -277,7 +279,7 @@ def python_clients(exe, certs, work):
         # read, no_application_protocol (120) and protocol_version (70). It is taken from the
         # records, because Python's name for an alert depends on the OpenSSL it was built with
         # (Ubuntu 24.04's has none for 120).
-        for ctx2, want in ((py_ctx(cert, alpn=['h2']), 120), (py_ctx(cert, max12=True), 70)):
+        for ctx2, want in ((py_ctx(cert, alpn=['spdy/3']), 120), (py_ctx(cert, max12=True), 70)):
             alerts = []
 
             def seen(conn, direction, version, ctype, mtype, data, alerts=alerts):

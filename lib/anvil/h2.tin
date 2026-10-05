@@ -1,0 +1,2504 @@
+// HTTP/2 (RFC 9113) for anvil (#360): h2c by prior knowledge or by Upgrade: h2c, and the path a
+// TLS connection that agreed on "h2" by ALPN takes (#124). Frames are read on the connection's
+// core, in its event loop; each request stream becomes a request task on that core, as an
+// HTTP/1.1 request does, so handlers, the Router and Req/Out are the same. Flow control holds a
+// response's DATA frames to the client's windows: a task whose window is used up parks until a
+// WINDOW_UPDATE comes (or the write timeout passes) while the connection serves its other streams.
+//
+// Entry points: h2_begin(c) makes connection c an HTTP/2 connection whose client preface is still
+// to come (h2_enter and h2_upgrade for h2c, h2_start for a connection that agreed on h2 by ALPN);
+// h2_read(c) serves what arrives (through conn_read) and h2_feed(c, p, n) bytes already read. The
+// output batch is sealed by conn_seal before it is written, and every write goes through
+// conn_write: those three are where a TLS connection (#124) decrypts and seals.
+package anvil
+
+const h2Preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+
+// Frame types (RFC 9113 6).
+const fData = 0
+const fHeaders = 1
+const fPriority = 2
+const fRst = 3
+const fSettings = 4
+const fPush = 5
+const fPing = 6
+const fGoaway = 7
+const fWindow = 8
+const fCont = 9
+
+// Frame flags.
+const flEnd = 1     // END_STREAM; ACK on SETTINGS and PING
+const flHeaders = 4 // END_HEADERS
+const flPadded = 8
+const flPrio = 32
+
+// Error codes (RFC 9113 7).
+const eNo = 0
+const eProtocol = 1
+const eInternal = 2
+const eFlow = 3
+const eClosed = 5
+const eFrameSize = 6
+const eRefused = 7
+const eCancel = 8
+const eCompression = 9
+const eCalm = 11
+
+// This side's settings and limits.
+const h2MaxStreams = 100    // SETTINGS_MAX_CONCURRENT_STREAMS
+const h2StreamWin = 1048576 // SETTINGS_INITIAL_WINDOW_SIZE: a request body may send this much before a WINDOW_UPDATE
+const h2ConnWin = 4194304   // the connection's receive window, opened by a WINDOW_UPDATE after SETTINGS
+const h2MaxFrame = 16384    // SETTINGS_MAX_FRAME_SIZE (the default): longer frames end the connection
+const h2HeaderList = 65536  // SETTINGS_MAX_HEADER_LIST_SIZE: a larger request gets 431, as in HTTP/1.1
+const h2BlockMax = 262144   // a header block's fragments past this end the connection
+const h2OutMax = 262144     // output a stream leaves pending before it waits for the socket
+const h2WinMax = 2147483647
+
+// Connection state words (c[cH2]).
+const hState = 0     // 0 the client preface is expected, 1 its first SETTINGS, 2 open, 3 closing after an error
+const hIn = 1        // a frame (or the preface) that has not fully arrived (malloc'd)
+const hInLen = 2
+const hInCap = 3
+const hLastId = 4    // the highest stream id the client opened
+const hStr = 5       // the streams that have a record, by id (a malloc'd array)
+const hNStr = 6
+const hCapStr = 7
+const hOpen = 8      // streams open or half-closed: they count toward SETTINGS_MAX_CONCURRENT_STREAMS
+const hTasks = 9     // request tasks of this connection still alive
+const hSendWin = 10  // the connection's send window
+const hRecvWin = 11  // the connection's receive window
+const hRecvAck = 12  // bytes received since the last connection WINDOW_UPDATE
+const hPeerInit = 13 // the client's SETTINGS_INITIAL_WINDOW_SIZE
+const hPeerFrame = 14 // the client's SETTINGS_MAX_FRAME_SIZE
+const hEnc = 15      // 1: the next header block starts with a table size update to 0; 2: it was sent
+const hBlk = 16      // a header block arriving in HEADERS and CONTINUATION frames (malloc'd)
+const hBlkLen = 17
+const hBlkCap = 18
+const hBlkId = 19    // its stream (0: none arriving)
+const hBlkFlags = 20 // the HEADERS frame's flags
+const hBlkKind = 21  // what it is for (bkNew ... below)
+const hBlkN = 22     // CONTINUATION frames so far
+const hDyn = 23      // the HPACK decoder's dynamic table: hpEntries x [bytes, name length, value length]
+const hDynHead = 24
+const hDynCount = 25
+const hDynSize = 26
+const hDynMax = 27
+const hGoaway = 28   // 1 once GOAWAY was sent
+const hParked = 29   // stream tasks parked for a window or for room in the socket
+const hBroken = 30   // the socket failed: nothing more is written
+const hPeerAway = 31 // the client sent GOAWAY
+const hRstPos = 32
+const hRst = 33      // the last 16 streams this side reset: frames already in flight for them are dropped
+const hWords = 49
+
+// What a header block is for.
+const kNew = 1      // a new request
+const kTrailers = 2 // the trailers of an open request
+const kDrop = 3     // nothing: decoded for the dynamic table only
+const kBadNew = 4   // a stream to reset with PROTOCOL_ERROR (it depends on itself)
+const kRefuse = 5   // a stream to refuse (REFUSED_STREAM)
+const kClosed = 6   // a stream to reset with STREAM_CLOSED (its client side had ended)
+const kBadTr = 7    // trailers without END_STREAM: PROTOCOL_ERROR
+
+// Stream record words.
+const sId = 0
+const sRemote = 1   // the client ended its side (END_STREAM)
+const sLocal = 2    // this side ended its side
+const sReset = 3    // reset by either side: closed, its task cancelled
+const sClosed = 4   // counted out of hOpen
+const sTask = 5     // the request task while it lives
+const sHdr = 6      // field lines, then the :method and :path values (malloc'd)
+const sHn = 7       // the field lines' length
+const sMOff = 8
+const sMLen = 9
+const sPOff = 10
+const sPLen = 11
+const sBody = 12    // the request body (malloc'd)
+const sBodyLen = 13
+const sBodyCap = 14
+const sTr = 15      // the request's trailer field lines (malloc'd)
+const sTrLen = 16
+const sCl = 17      // its content-length (-1: none)
+const sSendWin = 18
+const sRecvWin = 19
+const sRecvAck = 20
+const sHeadSent = 21 // the response's HEADERS are out
+const sStream = 22  // Out.Stream: 0 no, 1 asked for, 2 begun
+const sStLen = 23   // the Length of the stream (-1: none)
+const sStSent = 24
+const sFlags = 25   // 1: a HEAD request; 2: a host field is among the lines
+const sParked = 26
+const sWaited = 27  // the task waited (it counts in waiting)
+const sStart = 28   // when its HEADERS came (the read timeout)
+const sBufd = 29    // bytes of bufBytes its body holds while it arrives
+const sWhy = 30     // why a write failed: 1 a cancel or the deadline, 2 the client stopped reading
+const sWords = 31
+
+mut h2Ready bool
+mut h2Hb i64     // the decoded field lines of the header block being decoded
+mut h2HbLen i64
+mut h2Ps i64     // its pseudo-header values
+mut h2PsLen i64
+mut h2Ck i64     // its cookie values, joined with "; " (RFC 9113 8.2.3)
+mut h2CkLen i64
+mut hfTrailers bool
+mut hfBad bool   // the block is malformed: PROTOCOL_ERROR for its stream
+mut hfBig bool   // past SETTINGS_MAX_HEADER_LIST_SIZE: 431
+mut hfRegular bool
+mut hfHost bool
+mut hfExpect bool // expect: 100-continue
+mut hfVok bool    // the last field's value passed (hp_insert keeps it with the entry)
+mut hfKind i64    // the last field's name, classified
+mut hfSize i64
+mut hfCl i64     // content-length: -1 none
+mut hfSeen i64   // pseudo-header fields seen: 1 :method, 2 :scheme, 4 :path, 8 :authority
+mut hfM i64
+mut hfMn i64
+mut hfP i64
+mut hfPn i64
+mut hfA i64
+mut hfAn i64
+mut hbStart i64   // where the HEADERS frame being built starts in the output batch
+mut h2Date i64    // the HPACK-coded server and date fields, for the second h2DateSec
+mut h2DateLen i64
+mut h2DateSec i64
+mut h2RecLen i64
+
+// ---- entering HTTP/2 ----
+
+// h2_begin makes c an HTTP/2 connection whose client preface is still to come, and queues the
+// server's preface: SETTINGS, then a WINDOW_UPDATE that opens the connection's receive window.
+fn h2_begin(c i64) {
+	hp_init()
+	if !h2Ready {
+		h2Ready = true
+		h2Hb = malloc(h2HeaderList + 64)
+		h2Ps = malloc(h2HeaderList + 64)
+		h2Ck = malloc(h2HeaderList + 64)
+		h2Date = malloc(128)
+	}
+	let h = calloc(hWords, 8)
+	h[hCapStr] = 16
+	h[hStr] = malloc(16 * 8)
+	h[hSendWin] = 65535
+	h[hRecvWin] = h2ConnWin
+	h[hPeerInit] = 65535
+	h[hPeerFrame] = 16384
+	h[hDyn] = calloc(hpEntries*3, 8)
+	h[hDynMax] = hpTableMax
+	c[cH2] = h
+	ob_room(64)
+	h2_head(18, fSettings, 0, 0)
+	ob_be16(3)
+	ob_be32(h2MaxStreams)
+	ob_be16(4)
+	ob_be32(h2StreamWin)
+	ob_be16(6)
+	ob_be32(h2HeaderList)
+	h2_head(4, fWindow, 0, 0)
+	ob_be32(h2ConnWin - 65535)
+}
+
+// h2_enter switches c to HTTP/2 with prior knowledge: its n bytes at p start with the client
+// preface (serve_one saw its first line). It takes them all: what is not a whole frame yet waits.
+fn h2_enter(c i64, p i64, n i64) i64 {
+	h2_begin(c)
+	let used = h2_feed(c, p, n)
+	let h = c[cH2]
+	if used < n && h[hState] != 3 {
+		h2_keep(c, p+used, n-used)
+	}
+	h2_flush(c)
+	if h[hBroken] != 0 {
+		c[cClose] = 1
+	}
+	return n
+}
+
+// h2_upgrade switches c to HTTP/2 for the HTTP/1.1 request at p asking for it with Upgrade: h2c
+// and one HTTP2-Settings (RFC 7540 3.2): 101, the server preface, then the request is stream 1.
+// The rest of the n bytes are HTTP/2; the target is at pTs (pTn bytes). False when the request
+// does not ask properly: it is then served as HTTP/1.1.
+fn h2_upgrade(c i64, p i64, n i64, total i64, sp1 i64, le i64, hend i64, cl i64) bool {
+	let ts = pTs
+	let tn = pTn
+	let hp = p + le + 1
+	let hn = hend - le - 1
+	if !has_token(header_in(hp, hn, "upgrade"), "h2c") || count_fields(hp, hn, "http2-settings") != 1 {
+		return false
+	}
+	let sv = header_in(hp, hn, "http2-settings")
+	let set = malloc(len(sv) + 8)
+	let sn = b64url(cast(i64, sv)+8, len(sv), set)
+	if sn < 0 || sn%6 != 0 {
+		free(set)
+		return false
+	}
+	ob_room(128)
+	ob_str("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n")
+	h2_begin(c)
+	let h = c[cH2]
+	h2_apply_settings(c, set, sn)
+	free(set)
+	// Stream 1 is the request itself, already half-closed by the client.
+	mut lines = 0
+	{
+		mut pos = hp
+		let end = hp + hn
+		for pos < end {
+			let e = memchr(pos, '\n', end-pos)
+			if e == 0 {
+				break
+			}
+			let l = e - pos + 1
+			let kn = field_name(pos, l)
+			if kn > 0 && !hop_field(pos, kn) {
+				lines += l
+			}
+			pos = e + 1
+		}
+	}
+	let b = malloc(lines + sp1 + tn + 1)
+	{
+		mut o = 0
+		mut pos = hp
+		let end = hp + hn
+		for pos < end {
+			let e = memchr(pos, '\n', end-pos)
+			if e == 0 {
+				break
+			}
+			let l = e - pos + 1
+			let kn = field_name(pos, l)
+			if kn > 0 && !hop_field(pos, kn) {
+				memcpy(b+o, pos, l)
+				o += l
+			}
+			pos = e + 1
+		}
+	}
+	memcpy(b+lines, p, sp1)
+	memcpy(b+lines+sp1, p+ts, tn)
+	let s = calloc(sWords, 8)
+	s[sId] = 1
+	s[sHdr] = b
+	s[sHn] = lines
+	s[sMOff] = lines
+	s[sMLen] = sp1
+	s[sPOff] = lines + sp1
+	s[sPLen] = tn
+	s[sCl] = cl
+	s[sStLen] = -1
+	s[sSendWin] = h[hPeerInit]
+	s[sRecvWin] = h2StreamWin
+	s[sStart] = loopNow
+	s[sFlags] = 2
+	if sp1 == 4 && bytes_are(p, 4, "HEAD") {
+		s[sFlags] = 3
+	}
+	if cl > 0 {
+		s[sBody] = malloc(cl)
+		memcpy(s[sBody], p+hend, cl)
+		s[sBodyLen] = cl
+		s[sBodyCap] = cl
+	}
+	s[sRemote] = 1
+	h2_add(h, s)
+	h[hOpen] += 1
+	h[hLastId] = 1
+	h2_dispatch(c, s)
+	if h[hState] != 3 && c[cDead] == 0 {
+		let used = h2_feed(c, p+total, n-total)
+		if total+used < n && h[hState] != 3 {
+			h2_keep(c, p+total+used, n-total-used)
+		}
+	}
+	h2_flush(c)
+	if h[hBroken] != 0 {
+		c[cClose] = 1
+	}
+	return true
+}
+
+// hop_field reports whether the field line at p (name length kn) is one an upgraded request
+// leaves behind: the connection-specific fields have no meaning in HTTP/2.
+fn hop_field(p i64, kn i64) bool {
+	return name_is(p, kn, "connection") || name_is(p, kn, "upgrade") || name_is(p, kn, "http2-settings") || name_is(p, kn, "keep-alive") || name_is(p, kn, "proxy-connection") || name_is(p, kn, "transfer-encoding") || name_is(p, kn, "te")
+}
+
+// has_token reports whether the comma-separated list v holds tok, ignoring case.
+fn has_token(v str, tok str) bool {
+	mut i = 0
+	let p = cast(i64, v) + 8
+	for i < len(v) {
+		for i < len(v) && (v[i] == ' ' || v[i] == '\t' || v[i] == ',') {
+			i += 1
+		}
+		mut e = i
+		for e < len(v) && v[e] != ',' && v[e] != ' ' && v[e] != '\t' {
+			e += 1
+		}
+		if e > i && name_is(p+i, e-i, tok) {
+			return true
+		}
+		i = e
+	}
+	return false
+}
+
+// count_fields counts the field lines named name in the n bytes at hp.
+fn count_fields(hp i64, hn i64, name str) i64 {
+	mut k = 0
+	mut pos = hp
+	let end = hp + hn
+	for pos < end {
+		let e = memchr(pos, '\n', end-pos)
+		if e == 0 {
+			break
+		}
+		let kn = field_name(pos, e-pos+1)
+		if name_is(pos, kn, name) {
+			k += 1
+		}
+		pos = e + 1
+	}
+	return k
+}
+
+// b64url decodes the base64url text at p (n bytes, padding optional) into out: its length, or -1.
+fn b64url(p i64, n i64, out i64) i64 {
+	mut acc = 0
+	mut bits = 0
+	mut o = 0
+	for i in 0..n {
+		let ch = load8(p + i)
+		mut v = -1
+		if ch >= 'A' && ch <= 'Z' {
+			v = i64(ch - 'A')
+		} else if ch >= 'a' && ch <= 'z' {
+			v = i64(ch-'a') + 26
+		} else if ch >= '0' && ch <= '9' {
+			v = i64(ch-'0') + 52
+		} else if ch == '-' || ch == '+' {
+			v = 62
+		} else if ch == '_' || ch == '/' {
+			v = 63
+		} else if ch == '=' {
+			break
+		}
+		if v < 0 {
+			return -1
+		}
+		acc = (acc << 6) | v
+		bits += 6
+		if bits >= 8 {
+			bits -= 8
+			store8(out+o, (acc>>bits)&255)
+			o += 1
+		}
+	}
+	return o
+}
+
+// ---- reading ----
+
+// conn_read reads up to n bytes of connection c's input into p: the count (> 0), 0 at its end, -1
+// when nothing more is there now, -2 when the connection is broken (tls_read's contract, so a
+// TLS connection, #124, decrypts here).
+fn conn_read(c i64, p i64, n i64) i64 {
+	if c[cTls] != 0 {
+		return gTlsRead(c, p, n)
+	}
+	let k = rt_sys_read(c[cFD], p, n)
+	if k >= 0 {
+		return k
+	}
+	let e = errno()
+	if e == EAGAIN || e == 4 {
+		return -1
+	}
+	return -2
+}
+
+// conn_seal prepares the output batch (obLen bytes at ob, all for c) to be written; false when it
+// cannot be (the batch is dropped and the connection is broken). Over plain TCP there is nothing
+// to do; a TLS connection (#124) seals the batch into records here.
+fn conn_seal(c i64) bool {
+	if c[cTls] != 0 {
+		return gTlsSeal(c)
+	}
+	return true
+}
+
+// conn_write writes n bytes at p (already sealed) to connection c's socket: the bytes it took, -1
+// when it is full, -2 when the connection is broken.
+fn conn_write(c i64, p i64, n i64) i64 {
+	let k = rt_sys_write(c[cFD], p, n)
+	if k >= 0 {
+		return k
+	}
+	let e = errno()
+	if e == EAGAIN || e == 4 {
+		return -1
+	}
+	return -2
+}
+
+// h2_start is the entry of a connection that agreed on "h2" by ALPN (the start function given to
+// alpn_offer, #124): the server preface goes out, the connection is watched, and input that
+// already arrived is served.
+fn h2_start(c i64) {
+	h2_begin(c)
+	h2_flush(c)
+	ev_conn(c[cFD])
+	h2_arm(c)
+	on_read(c)
+}
+
+// h2_read reads what arrived on HTTP/2 connection c and serves it; true means more may be waiting.
+fn h2_read(c i64) bool {
+	let h = c[cH2]
+	mut have = 0
+	if h[hInLen] > 0 {
+		memcpy(scr, h[hIn], h[hInLen])
+		have = h[hInLen]
+		h2_unkeep(c)
+	}
+	let want = scrSize - have
+	mut n = conn_read(c, scr+have, want)
+	if n == 0 || n == -2 {
+		close_conn(c)
+		return false
+	}
+	if n < 0 {
+		n = 0
+	}
+	let full = n == want && n > 0
+	have += n
+	let used = h2_feed(c, scr, have)
+	if used < have && h[hState] != 3 && c[cDead] == 0 {
+		h2_keep(c, scr+used, have-used)
+	}
+	h2_flush(c)
+	if !h2_after(c) {
+		return false
+	}
+	// Decrypted input TLS still holds is read on the next turn: the socket will not report it.
+	return (full || (c[cTls] != 0 && gTlsPending(c) == 2)) && c[cWriting] == 0 && c[cClose] == 0
+}
+
+// h2_keep holds the n bytes at p, a frame that has not fully arrived, until the next read.
+fn h2_keep(c i64, p i64, n i64) {
+	let h = c[cH2]
+	let b = malloc(n)
+	memcpy(b, p, n)
+	h[hIn] = b
+	h[hInLen] = n
+	h[hInCap] = n
+	bufBytes += n
+}
+
+fn h2_unkeep(c i64) {
+	let h = c[cH2]
+	if h[hIn] != 0 {
+		bufBytes -= h[hInCap]
+		free(h[hIn])
+	}
+	h[hIn] = 0
+	h[hInLen] = 0
+	h[hInCap] = 0
+}
+
+// h2_feed serves the preface and the whole frames among the n bytes at p: the bytes it used.
+fn h2_feed(c i64, p i64, n i64) i64 {
+	let h = c[cH2]
+	mut off = 0
+	for off < n && h[hState] != 3 && c[cDead] == 0 && h[hBroken] == 0 {
+		if h[hState] == 0 {
+			mut k = n - off
+			if k > 24 {
+				k = 24
+			}
+			let pre = cast(i64, h2Preface) + 8
+			for i in 0..k {
+				if load8(p+off+i) != load8(pre+i) {
+					h2_fail(c, eProtocol)
+					return n
+				}
+			}
+			if k < 24 {
+				return off
+			}
+			off += 24
+			h[hState] = 1
+			continue
+		}
+		if n-off < 9 {
+			break
+		}
+		let q = p + off
+		let ln = (i64(load8(q)) << 16) | (i64(load8(q+1)) << 8) | i64(load8(q+2))
+		if ln > h2MaxFrame {
+			h2_fail(c, eFrameSize)
+			return n
+		}
+		if n-off < 9+ln {
+			break
+		}
+		h2_frame_in(c, h, q, ln)
+		off += 9 + ln
+	}
+	if h[hState] == 3 {
+		return n
+	}
+	return off
+}
+
+// h2_frame_in handles one whole frame at q with an n-byte payload.
+fn h2_frame_in(c i64, h i64, q i64, n i64) {
+	let typ = i64(load8(q + 3))
+	let flags = i64(load8(q + 4))
+	let id = be32(q+5) & 0x7fffffff
+	let p = q + 9
+	if h[hState] == 1 {
+		// The client preface ends with a SETTINGS frame (RFC 9113 3.4).
+		if typ != fSettings || (flags&flEnd) != 0 {
+			h2_fail(c, eProtocol)
+			return
+		}
+		h[hState] = 2
+	}
+	if h[hBlkId] != 0 && (typ != fCont || id != h[hBlkId]) {
+		// Nothing may come between a HEADERS frame and its CONTINUATION frames (RFC 9113 6.10).
+		h2_fail(c, eProtocol)
+		return
+	}
+	match typ {
+		0 => {
+			h2_in_data(c, h, id, flags, p, n)
+		}
+		1 => {
+			h2_in_headers(c, h, id, flags, p, n)
+		}
+		2 => {
+			h2_in_priority(c, h, id, p, n)
+		}
+		3 => {
+			h2_in_rst(c, h, id, n)
+		}
+		4 => {
+			h2_in_settings(c, h, id, flags, p, n)
+		}
+		5 => {
+			h2_fail(c, eProtocol) // a client cannot push (RFC 9113 8.4)
+		}
+		6 => {
+			h2_in_ping(c, id, flags, p, n)
+		}
+		7 => {
+			if id != 0 {
+				h2_fail(c, eProtocol)
+			} else if n < 8 {
+				h2_fail(c, eFrameSize)
+			} else {
+				h[hPeerAway] = 1
+			}
+		}
+		8 => {
+			h2_in_window(c, h, id, p, n)
+		}
+		9 => {
+			h2_in_cont(c, h, id, flags, p, n)
+		}
+	}
+	// Frames of other types are ignored (RFC 9113 4.1, 5.5).
+}
+
+// h2_in_data takes a DATA frame: flow control, then the bytes go to the stream's body.
+fn h2_in_data(c i64, h i64, id i64, flags i64, p i64, n i64) {
+	if id == 0 {
+		h2_fail(c, eProtocol)
+		return
+	}
+	mut dp = p
+	mut dn = n
+	if (flags & flPadded) != 0 {
+		if n < 1 || i64(load8(p)) >= n {
+			h2_fail(c, eProtocol)
+			return
+		}
+		dp = p + 1
+		dn = n - 1 - i64(load8(p))
+	}
+	// The whole payload counts against the connection's window, whatever happens to it.
+	if n > h[hRecvWin] {
+		h2_fail(c, eFlow)
+		return
+	}
+	h[hRecvWin] -= n
+	h[hRecvAck] += n
+	if h[hRecvAck] >= h2ConnWin/2 {
+		ob_room(13)
+		h2_head(4, fWindow, 0, 0)
+		ob_be32(h[hRecvAck])
+		h[hRecvWin] += h[hRecvAck]
+		h[hRecvAck] = 0
+	}
+	let s = h2_find(h, id)
+	if s == 0 {
+		if id > h[hLastId] {
+			h2_fail(c, eProtocol) // an idle stream
+		} else if !h2_was_reset(h, id) {
+			h2_fail(c, eClosed)
+		}
+		return
+	}
+	if s[sReset] != 0 {
+		return
+	}
+	if s[sRemote] != 0 {
+		h2_rst(c, s, eClosed)
+		return
+	}
+	if n > s[sRecvWin] {
+		h2_rst(c, s, eFlow)
+		return
+	}
+	s[sRecvWin] -= n
+	let got = s[sBodyLen] + dn
+	if got > gMaxBody {
+		h2_simple(c, s, 413)
+		return
+	}
+	if s[sCl] >= 0 && got > s[sCl] {
+		h2_rst(c, s, eProtocol) // more than its content-length (RFC 9113 8.1.1)
+		return
+	}
+	if got > s[sBodyCap] {
+		mut want = s[sBodyCap] * 2
+		if want < 16384 {
+			want = 16384
+		}
+		if want < got {
+			want = got
+		}
+		if s[sCl] >= got && want > s[sCl] {
+			want = s[sCl]
+		}
+		if gMaxBuffered > 0 && bufBytes+want-s[sBodyCap] > gMaxBuffered {
+			h2_simple(c, s, 503) // this core holds as many bodies still arriving as it may
+			return
+		}
+		bufBytes += want - s[sBodyCap]
+		s[sBufd] += want - s[sBodyCap]
+		s[sBody] = realloc(s[sBody], want)
+		s[sBodyCap] = want
+	}
+	memcpy(s[sBody]+s[sBodyLen], dp, dn)
+	s[sBodyLen] = got
+	if (flags & flEnd) != 0 {
+		s[sRemote] = 1
+		if s[sCl] >= 0 && got != s[sCl] {
+			h2_rst(c, s, eProtocol)
+			return
+		}
+		h2_dispatch(c, s)
+		return
+	}
+	s[sRecvAck] += n
+	if s[sRecvAck] >= h2StreamWin/2 {
+		ob_room(13)
+		h2_head(4, fWindow, 0, id)
+		ob_be32(s[sRecvAck])
+		s[sRecvWin] += s[sRecvAck]
+		s[sRecvAck] = 0
+	}
+}
+
+// h2_in_headers takes a HEADERS frame: a new request, or the trailers of one.
+fn h2_in_headers(c i64, h i64, id i64, flags i64, p i64, n i64) {
+	if id == 0 || (id&1) == 0 {
+		h2_fail(c, eProtocol) // client streams are odd (RFC 9113 5.1.1)
+		return
+	}
+	mut bp = p
+	mut bn = n
+	mut pad = 0
+	if (flags & flPadded) != 0 {
+		if bn < 1 {
+			h2_fail(c, eProtocol)
+			return
+		}
+		pad = i64(load8(bp))
+		bp += 1
+		bn -= 1
+	}
+	mut kind = kNew
+	if (flags & flPrio) != 0 {
+		if bn < 5 {
+			h2_fail(c, eFrameSize)
+			return
+		}
+		if (be32(bp) & 0x7fffffff) == id {
+			kind = kBadNew // a stream cannot depend on itself (RFC 9113 5.3.1)
+		}
+		bp += 5
+		bn -= 5
+	}
+	if pad > bn {
+		h2_fail(c, eProtocol)
+		return
+	}
+	bn -= pad
+	let s = h2_find(h, id)
+	if s != 0 {
+		if s[sReset] != 0 {
+			kind = kDrop
+		} else if s[sRemote] != 0 {
+			kind = kClosed
+		} else if (flags & flEnd) == 0 {
+			kind = kBadTr
+		} else if kind != kBadNew {
+			kind = kTrailers
+		}
+	} else if id <= h[hLastId] {
+		if !h2_was_reset(h, id) {
+			h2_fail(c, eProtocol) // a new stream's id must be above every earlier one
+			return
+		}
+		kind = kDrop
+	} else {
+		h[hLastId] = id
+		if kind == kNew {
+			if h[hGoaway] != 0 {
+				kind = kDrop // after GOAWAY new streams are ignored; the client retries them elsewhere
+			} else if h[hOpen] >= h2MaxStreams || h[hTasks] >= 2*h2MaxStreams {
+				kind = kRefuse
+			}
+		}
+	}
+	if (flags & flHeaders) != 0 {
+		h2_block(c, h, id, flags, kind, bp, bn)
+		return
+	}
+	h[hBlkId] = id
+	h[hBlkFlags] = flags
+	h[hBlkKind] = kind
+	h[hBlkN] = 0
+	h[hBlkLen] = 0
+	h2_blk_add(c, h, bp, bn)
+}
+
+// h2_blk_add appends a fragment to the header block arriving.
+fn h2_blk_add(c i64, h i64, p i64, n i64) {
+	let need = h[hBlkLen] + n
+	if need > h2BlockMax || h[hBlkN] > 512 {
+		h2_fail(c, eCalm)
+		return
+	}
+	if need > h[hBlkCap] {
+		mut cap = h[hBlkCap] * 2
+		if cap < need {
+			cap = need + 1024
+		}
+		h[hBlk] = realloc(h[hBlk], cap)
+		h[hBlkCap] = cap
+	}
+	memcpy(h[hBlk]+h[hBlkLen], p, n)
+	h[hBlkLen] = need
+}
+
+// h2_in_cont takes a CONTINUATION frame of the header block arriving.
+fn h2_in_cont(c i64, h i64, id i64, flags i64, p i64, n i64) {
+	if h[hBlkId] == 0 || id != h[hBlkId] {
+		h2_fail(c, eProtocol)
+		return
+	}
+	h[hBlkN] += 1
+	h2_blk_add(c, h, p, n)
+	if h[hState] == 3 || (flags&flHeaders) == 0 {
+		return
+	}
+	h[hBlkId] = 0
+	h2_block(c, h, id, h[hBlkFlags], h[hBlkKind], h[hBlk], h[hBlkLen])
+	if h[hBlkCap] > 65536 {
+		free(h[hBlk])
+		h[hBlk] = 0
+		h[hBlkCap] = 0
+	}
+	h[hBlkLen] = 0
+}
+
+// h2_block decodes a whole header block (every block is decoded: the dynamic table must follow
+// the client's) and acts on it as its kind says.
+fn h2_block(c i64, h i64, id i64, flags i64, kind i64, p i64, n i64) {
+	hfTrailers = kind == kTrailers
+	hfBad = false
+	hfBig = false
+	hfRegular = false
+	hfHost = false
+	hfExpect = false
+	hfSize = 0
+	hfCl = -1
+	hfSeen = 0
+	hfM = 0
+	hfMn = 0
+	hfP = 0
+	hfPn = 0
+	hfA = 0
+	hfAn = 0
+	h2HbLen = 0
+	h2PsLen = 0
+	h2CkLen = 0
+	if !hp_decode(h, p, n) {
+		h2_fail(c, eCompression)
+		return
+	}
+	if kind == kDrop {
+		return
+	}
+	if kind == kBadNew || kind == kRefuse || kind == kClosed || kind == kBadTr {
+		mut code = eProtocol
+		if kind == kRefuse {
+			code = eRefused
+		} else if kind == kClosed {
+			code = eClosed
+		}
+		let s = h2_find(h, id)
+		if s != 0 {
+			h2_rst(c, s, code)
+		} else {
+			h2_rst_id(c, id, code)
+		}
+		return
+	}
+	if kind == kTrailers {
+		let s = h2_find(h, id)
+		if s == 0 || s[sReset] != 0 {
+			return
+		}
+		if hfBad {
+			h2_rst(c, s, eProtocol)
+			return
+		}
+		if h2HbLen > 0 {
+			s[sTr] = malloc(h2HbLen)
+			memcpy(s[sTr], h2Hb, h2HbLen)
+			s[sTrLen] = h2HbLen
+		}
+		s[sRemote] = 1
+		if s[sCl] >= 0 && s[sBodyLen] != s[sCl] {
+			h2_rst(c, s, eProtocol)
+			return
+		}
+		h2_dispatch(c, s)
+		return
+	}
+	// A new request (RFC 9113 8.3.1): :method, and :scheme with a non-empty :path, or CONNECT
+	// with :authority alone.
+	if !hfBad {
+		let connect = hfMn == 7 && bytes_are(h2Ps+hfM, 7, "CONNECT")
+		if (hfSeen & 1) == 0 {
+			hfBad = true
+		} else if connect {
+			hfBad = (hfSeen&8) == 0 || (hfSeen&6) != 0
+		} else if (hfSeen&6) != 6 || hfPn == 0 {
+			hfBad = true
+		} else if load8(h2Ps+hfP) != '/' && !(hfPn == 1 && load8(h2Ps+hfP) == '*') {
+			hfBad = true
+		}
+	}
+	if hfBad {
+		h2_rst_id(c, id, eProtocol)
+		return
+	}
+	let s = h2_new_stream(c, h, id)
+	if hfBig {
+		h2_simple(c, s, 431)
+		return
+	}
+	if (flags & flEnd) != 0 {
+		s[sRemote] = 1
+		if s[sCl] > 0 {
+			h2_rst(c, s, eProtocol) // a content-length and no body
+			return
+		}
+		h2_dispatch(c, s)
+		return
+	}
+	if hfExpect {
+		// The client waits for this before it sends the body (RFC 9110 10.1.1, RFC 9113 8.1).
+		h2_hb_begin(c, 16)
+		store8(ob+obLen, 8)
+		store8(ob+obLen+1, 3)
+		memcpy(ob+obLen+2, cast(i64, "100")+8, 3)
+		obLen += 5
+		h2_hb_end(c, s, false)
+	}
+}
+
+// h2_new_stream makes the record of request stream id from the block just decoded.
+fn h2_new_stream(c i64, h i64, id i64) i64 {
+	mut lines = h2HbLen
+	if (hfSeen & 8) != 0 {
+		lines += hfAn + 8
+	}
+	if h2CkLen > 0 {
+		lines += h2CkLen + 10
+	}
+	mut pl = hfPn
+	if (hfSeen & 4) == 0 {
+		pl = hfAn // CONNECT: the target is the authority
+	}
+	let b = malloc(lines + hfMn + pl + 1)
+	mut o = 0
+	if (hfSeen & 8) != 0 {
+		o += put_str(b, o, "host: ")
+		memcpy(b+o, h2Ps+hfA, hfAn)
+		o += hfAn
+		store8(b+o, '\r')
+		store8(b+o+1, '\n')
+		o += 2
+	}
+	memcpy(b+o, h2Hb, h2HbLen)
+	o += h2HbLen
+	if h2CkLen > 0 {
+		o += put_str(b, o, "cookie: ")
+		memcpy(b+o, h2Ck, h2CkLen)
+		o += h2CkLen
+		store8(b+o, '\r')
+		store8(b+o+1, '\n')
+		o += 2
+	}
+	memcpy(b+o, h2Ps+hfM, hfMn)
+	if (hfSeen & 4) != 0 {
+		memcpy(b+o+hfMn, h2Ps+hfP, pl)
+	} else {
+		memcpy(b+o+hfMn, h2Ps+hfA, pl)
+	}
+	let s = calloc(sWords, 8)
+	s[sId] = id
+	s[sHdr] = b
+	s[sHn] = o
+	s[sMOff] = o
+	s[sMLen] = hfMn
+	s[sPOff] = o + hfMn
+	s[sPLen] = pl
+	s[sCl] = hfCl
+	s[sStLen] = -1
+	s[sSendWin] = h[hPeerInit]
+	s[sRecvWin] = h2StreamWin
+	s[sStart] = loopNow
+	if hfMn == 4 && bytes_are(h2Ps+hfM, 4, "HEAD") {
+		s[sFlags] = 1
+	}
+	if hfHost || (hfSeen&8) != 0 {
+		s[sFlags] = s[sFlags] | 2
+	}
+	h2_add(h, s)
+	h[hOpen] += 1
+	return s
+}
+
+// Kinds of field names (h2_kind): the pseudo-header fields of a request, and the names a request
+// treats apart.
+const kdMethod = 1
+const kdScheme = 2
+const kdPath = 4
+const kdAuthority = 8
+const kdPseudo = 16  // another pseudo-header field: malformed in a request
+const kdBad = 32     // not a lower case token, or connection-specific (RFC 9113 8.2.1, 8.2.2)
+const kdTe = 64
+const kdLength = 128
+const kdCookie = 256
+const kdHost = 512
+const kdExpect = 1024
+
+// h2_kind classifies the field name at np (nn bytes). Static entries are classified once, and a
+// dynamic entry when it is added, so an indexed field is never compared again.
+fn h2_kind(np i64, nn i64) i64 {
+	if nn == 0 {
+		return kdBad
+	}
+	let f = load8(np)
+	if f == ':' {
+		if bytes_are(np, nn, ":path") {
+			return kdPath
+		}
+		if bytes_are(np, nn, ":method") {
+			return kdMethod
+		}
+		if bytes_are(np, nn, ":scheme") {
+			return kdScheme
+		}
+		if bytes_are(np, nn, ":authority") {
+			return kdAuthority
+		}
+		return kdPseudo
+	}
+	let tok = gTok
+	for i in 0..nn {
+		let b = load8(np + i)
+		if (b >= 'A' && b <= 'Z') || load8(tok+i64(b)) == 0 {
+			return kdBad
+		}
+	}
+	if (f == 'c' && bytes_are(np, nn, "connection")) || (f == 'k' && bytes_are(np, nn, "keep-alive")) || (f == 'p' && bytes_are(np, nn, "proxy-connection")) || (f == 't' && bytes_are(np, nn, "transfer-encoding")) || (f == 'u' && bytes_are(np, nn, "upgrade")) {
+		return kdBad
+	}
+	if f == 't' && bytes_are(np, nn, "te") {
+		return kdTe
+	}
+	if f == 'c' && bytes_are(np, nn, "content-length") {
+		return kdLength
+	}
+	if f == 'c' && bytes_are(np, nn, "cookie") {
+		return kdCookie
+	}
+	if f == 'h' && bytes_are(np, nn, "host") {
+		return kdHost
+	}
+	if f == 'e' && bytes_are(np, nn, "expect") {
+		return kdExpect
+	}
+	return 0
+}
+
+// h2_field takes one decoded field of the block being decoded (RFC 9113 8.2, 8.3): pseudo-header
+// fields go to their slots, the others become field lines "name: value\r\n" for Req.Header. vok
+// says the value was checked already and kind is the name's (h2_kind; -1: not known yet); hfVok
+// and hfKind tell hp_insert what the entry keeps.
+fn h2_field(np i64, nn i64, vp i64, vn i64, vok bool, kind i64) {
+	hfSize += nn + vn + 32
+	if hfSize > h2HeaderList {
+		hfBig = true
+	}
+	mut k = kind
+	if k < 0 {
+		k = h2_kind(np, nn)
+	}
+	hfKind = k
+	hfVok = vok
+	if !vok {
+		// A value holds no NUL, CR or LF (RFC 9113 8.2.1): a line of its own could follow it.
+		for i in 0..vn {
+			let b = load8(vp + i)
+			if b <= 13 && (b == 0 || b == 10 || b == 13) {
+				hfBad = true
+				return
+			}
+		}
+		hfVok = true
+	}
+	if (k & 31) != 0 {
+		if hfTrailers || hfRegular || k == kdPseudo || (hfSeen&k) != 0 {
+			hfBad = true // only a request's own pseudo-header fields, once each, leading its block
+			return
+		}
+		hfSeen = hfSeen | k
+		if hfBig {
+			return
+		}
+		let off = h2PsLen
+		memcpy(h2Ps+off, vp, vn)
+		h2PsLen += vn
+		if k == kdMethod {
+			hfM = off
+			hfMn = vn
+		} else if k == kdPath {
+			hfP = off
+			hfPn = vn
+		} else if k == kdAuthority {
+			hfA = off
+			hfAn = vn
+		}
+		return
+	}
+	hfRegular = true
+	if k != 0 {
+		if k == kdBad || (k == kdTe && !bytes_are(vp, vn, "trailers")) {
+			hfBad = true
+			return
+		}
+		if !hfTrailers {
+			if k == kdLength {
+				let v = parse_cl(vp, vn)
+				if v < 0 || (hfCl >= 0 && v != hfCl) {
+					hfBad = true
+					return
+				}
+				hfCl = v
+			} else if k == kdCookie {
+				if hfBig {
+					return
+				}
+				if h2CkLen > 0 {
+					store8(h2Ck+h2CkLen, ';')
+					store8(h2Ck+h2CkLen+1, ' ')
+					h2CkLen += 2
+				}
+				memcpy(h2Ck+h2CkLen, vp, vn)
+				h2CkLen += vn
+				return
+			} else if k == kdHost {
+				hfHost = true
+			} else if k == kdExpect && name_is(vp, vn, "100-continue") {
+				hfExpect = true
+			}
+		}
+	}
+	if hfBig {
+		return
+	}
+	let d = h2Hb + h2HbLen
+	memcpy(d, np, nn)
+	store8(d+nn, ':')
+	store8(d+nn+1, ' ')
+	memcpy(d+nn+2, vp, vn)
+	store8(d+nn+2+vn, '\r')
+	store8(d+nn+3+vn, '\n')
+	h2HbLen += nn + vn + 4
+}
+
+// h2_in_priority takes a PRIORITY frame: checked, then ignored (RFC 9113 5.3.2).
+fn h2_in_priority(c i64, h i64, id i64, p i64, n i64) {
+	if id == 0 {
+		h2_fail(c, eProtocol)
+		return
+	}
+	if n != 5 {
+		h2_fail(c, eFrameSize)
+		return
+	}
+	if (be32(p) & 0x7fffffff) == id {
+		let s = h2_find(h, id)
+		if s != 0 {
+			h2_rst(c, s, eProtocol)
+		} else {
+			h2_rst_id(c, id, eProtocol)
+		}
+	}
+}
+
+// h2_in_rst takes a RST_STREAM frame: the client gave up the stream; its task is cancelled.
+fn h2_in_rst(c i64, h i64, id i64, n i64) {
+	if id == 0 {
+		h2_fail(c, eProtocol)
+		return
+	}
+	if n != 4 {
+		h2_fail(c, eFrameSize)
+		return
+	}
+	let s = h2_find(h, id)
+	if s == 0 {
+		if id > h[hLastId] {
+			h2_fail(c, eProtocol) // an idle stream
+		}
+		return
+	}
+	if s[sReset] != 0 {
+		return
+	}
+	s[sReset] = 1
+	h2_cancel(s, 0)
+	h2_closed(c, s)
+}
+
+// h2_in_settings takes a SETTINGS frame and acknowledges it.
+fn h2_in_settings(c i64, h i64, id i64, flags i64, p i64, n i64) {
+	if id != 0 {
+		h2_fail(c, eProtocol)
+		return
+	}
+	if (flags & flEnd) != 0 {
+		if n != 0 {
+			h2_fail(c, eFrameSize)
+		}
+		return
+	}
+	if n%6 != 0 {
+		h2_fail(c, eFrameSize)
+		return
+	}
+	if !h2_apply_settings(c, p, n) {
+		return
+	}
+	ob_room(9)
+	h2_head(0, fSettings, flEnd, 0)
+}
+
+// h2_apply_settings applies the n bytes of settings at p (RFC 9113 6.5.2); false after a
+// connection error.
+fn h2_apply_settings(c i64, p i64, n i64) bool {
+	let h = c[cH2]
+	mut i = 0
+	for i+6 <= n {
+		let k = (i64(load8(p+i)) << 8) | i64(load8(p+i+1))
+		let v = be32(p + i + 2)
+		if k == 1 {
+			// The client's table for our blocks shrank: start the next block with a size update. We
+			// never index a response field, so 0 suits every later size too.
+			if v < hpTableMax && h[hEnc] == 0 {
+				h[hEnc] = 1
+			}
+		} else if k == 2 {
+			if v > 1 {
+				h2_fail(c, eProtocol)
+				return false
+			}
+		} else if k == 4 {
+			if v > h2WinMax {
+				h2_fail(c, eFlow)
+				return false
+			}
+			let d = v - h[hPeerInit]
+			h[hPeerInit] = v
+			let a = h[hStr]
+			for j in 0..h[hNStr] {
+				let s = a[j]
+				s[sSendWin] += d
+				if s[sSendWin] > h2WinMax {
+					h2_fail(c, eFlow)
+					return false
+				}
+			}
+			h2_wake_all(c)
+		} else if k == 5 {
+			if v < 16384 || v > 16777215 {
+				h2_fail(c, eProtocol)
+				return false
+			}
+			h[hPeerFrame] = v
+		}
+		i += 6
+	}
+	return true
+}
+
+// h2_in_ping answers a PING.
+fn h2_in_ping(c i64, id i64, flags i64, p i64, n i64) {
+	if id != 0 {
+		h2_fail(c, eProtocol)
+		return
+	}
+	if n != 8 {
+		h2_fail(c, eFrameSize)
+		return
+	}
+	if (flags & flEnd) != 0 {
+		return
+	}
+	ob_room(17)
+	h2_head(8, fPing, flEnd, 0)
+	memcpy(ob+obLen, p, 8)
+	obLen += 8
+}
+
+// h2_in_window takes a WINDOW_UPDATE: the tasks waiting for that window go on.
+fn h2_in_window(c i64, h i64, id i64, p i64, n i64) {
+	if n != 4 {
+		h2_fail(c, eFrameSize)
+		return
+	}
+	let inc = be32(p) & 0x7fffffff
+	if id == 0 {
+		if inc == 0 {
+			h2_fail(c, eProtocol)
+			return
+		}
+		h[hSendWin] += inc
+		if h[hSendWin] > h2WinMax {
+			h2_fail(c, eFlow)
+			return
+		}
+		h2_wake_all(c)
+		return
+	}
+	let s = h2_find(h, id)
+	if s == 0 {
+		if id > h[hLastId] {
+			h2_fail(c, eProtocol) // an idle stream
+		}
+		return
+	}
+	if s[sReset] != 0 {
+		return
+	}
+	if inc == 0 {
+		h2_rst(c, s, eProtocol)
+		return
+	}
+	s[sSendWin] += inc
+	if s[sSendWin] > h2WinMax {
+		h2_rst(c, s, eFlow)
+		return
+	}
+	h2_wake(s)
+}
+
+// ---- streams ----
+
+// h2_find is the record of stream id, or 0. The records are ordered by id and the newest is the
+// usual one asked for.
+fn h2_find(h i64, id i64) i64 {
+	let a = h[hStr]
+	mut hi = h[hNStr]
+	if hi > 0 && a[hi-1][sId] == id {
+		return a[hi-1]
+	}
+	mut lo = 0
+	for lo < hi {
+		let m = (lo + hi) / 2
+		let s = a[m]
+		if s[sId] == id {
+			return s
+		}
+		if s[sId] < id {
+			lo = m + 1
+		} else {
+			hi = m
+		}
+	}
+	return 0
+}
+
+// h2_add appends stream s, whose id is above every other's.
+fn h2_add(h i64, s i64) {
+	if h[hNStr] == h[hCapStr] {
+		h[hCapStr] *= 2
+		h[hStr] = realloc(h[hStr], h[hCapStr]*8)
+	}
+	let a = h[hStr]
+	a[h[hNStr]] = s
+	h[hNStr] += 1
+}
+
+// h2_remove takes stream s out of the records.
+fn h2_remove(h i64, s i64) {
+	let a = h[hStr]
+	let n = h[hNStr]
+	for i in 0..n {
+		if a[i] == s {
+			memmove(a+i*8, a+(i+1)*8, (n-i-1)*8)
+			h[hNStr] = n - 1
+			return
+		}
+	}
+}
+
+fn h2_free_stream(s i64) {
+	if s[sBufd] > 0 {
+		bufBytes -= s[sBufd]
+	}
+	free(s[sHdr])
+	if s[sBody] != 0 {
+		free(s[sBody])
+	}
+	if s[sTr] != 0 {
+		free(s[sTr])
+	}
+	free(s)
+}
+
+// h2_was_reset reports whether this side reset stream id lately: frames the client sent before it
+// knew are dropped (RFC 9113 5.1, closed).
+fn h2_was_reset(h i64, id i64) bool {
+	for i in 0..16 {
+		if h[hRst+i] == id {
+			return true
+		}
+	}
+	return false
+}
+
+// h2_closed counts stream s out of the open streams once both sides ended or it was reset, and
+// frees it when no task runs for it.
+fn h2_closed(c i64, s i64) {
+	let h = c[cH2]
+	if s[sClosed] == 0 && (s[sReset] != 0 || (s[sRemote] != 0 && s[sLocal] != 0)) {
+		s[sClosed] = 1
+		h[hOpen] -= 1
+	}
+	if s[sClosed] != 0 && s[sTask] == 0 {
+		h2_remove(h, s)
+		h2_free_stream(s)
+	}
+}
+
+// h2_rst resets stream s with code: RST_STREAM, and its task is cancelled.
+fn h2_rst(c i64, s i64, code i64) {
+	if s[sReset] != 0 {
+		return
+	}
+	h2_rst_id(c, s[sId], code)
+	s[sReset] = 1
+	h2_cancel(s, 0)
+	h2_closed(c, s)
+}
+
+// h2_rst_id sends RST_STREAM for stream id and remembers it.
+fn h2_rst_id(c i64, id i64, code i64) {
+	let h = c[cH2]
+	ob_room(13)
+	h2_head(4, fRst, 0, id)
+	ob_be32(code)
+	h[hRst+(h[hRstPos]&15)] = id
+	h[hRstPos] += 1
+}
+
+// h2_cancel cancels the task of stream s, if it has one: its waits fail with "canceled: " and why
+// (fault.Canceled).
+fn h2_cancel(s i64, why i64) {
+	let t = s[sTask]
+	if t != 0 && t[tBnd] != 0 {
+		rt_bnd_cancel(rt_bnd_root(t), cast(fault, h2_reason(why)))
+	}
+}
+
+mut h2Reasons i64 // per core: the cancel reasons, made once in the long-lived heap
+
+// h2_reason is a cancel reason with fault.Canceled's identity: 0 the client reset the stream, 1
+// the connection closed. It lives in the ingot heap, as the runtime's own reasons do, since the
+// boundary holds it after the event loop's pool is reset.
+fn h2_reason(why i64) i64 {
+	if h2Reasons == 0 {
+		h2Reasons = calloc(2, 8)
+		h2Reasons[0] = h2_fault("the client reset the stream")
+		h2Reasons[1] = h2_fault("the connection closed")
+	}
+	return h2Reasons[why]
+}
+
+fn h2_fault(msg str) i64 {
+	let n = len(msg)
+	let b = rt_ingot_alloc(faultHead + n + 9)
+	b[fhIdent] = faultCanceled
+	let w = b + faultHead
+	w[0] = n
+	memcpy(w+8, cast(i64, msg)+8, n)
+	return w
+}
+
+// h2_cancel_all closes every stream of c: their tasks are cancelled, and the records without a
+// task are freed.
+fn h2_cancel_all(c i64) {
+	let h = c[cH2]
+	let a = h[hStr]
+	mut i = h[hNStr] - 1
+	for i >= 0 {
+		let s = a[i]
+		if s[sReset] == 0 {
+			s[sReset] = 1
+			h2_cancel(s, 1)
+		}
+		h2_closed(c, s)
+		i -= 1
+	}
+}
+
+// h2_fail ends connection c with a connection error: GOAWAY with code, every stream cancelled,
+// and the connection closes (lingering) once the GOAWAY is out. Later input is dropped.
+fn h2_fail(c i64, code i64) {
+	let h = c[cH2]
+	if h[hState] == 3 {
+		return
+	}
+	h[hState] = 3
+	h[hBlkId] = 0
+	h2_goaway(c, code)
+	h2_cancel_all(c)
+	c[cClose] = 1
+	c[cLinger] = 1
+}
+
+// h2_goaway sends GOAWAY with code, naming the last stream the client opened.
+fn h2_goaway(c i64, code i64) {
+	let h = c[cH2]
+	ob_room(17)
+	h2_head(8, fGoaway, 0, 0)
+	ob_be32(h[hLastId])
+	ob_be32(code)
+	h[hGoaway] = 1
+}
+
+// h2_gone reports whether connection c can no longer carry a response.
+fn h2_gone(c i64) bool {
+	let h = c[cH2]
+	return c[cDead] != 0 || h[hBroken] != 0 || h[hState] == 3
+}
+
+// ---- requests ----
+
+// h2_dispatch starts the request of stream s, complete now, in a task of its own: the admission
+// checks of serve_one first, then the handler runs (perhaps to its end at once).
+fn h2_dispatch(c i64, s i64) {
+	let h = c[cH2]
+	if s[sBufd] > 0 {
+		bufBytes -= s[sBufd] // the body is the request's now, no longer input still arriving
+		s[sBufd] = 0
+	}
+	if h2_gone(c) {
+		return
+	}
+	if waiting >= maxWaiting {
+		h2_simple(c, s, 503)
+		return
+	}
+	if gMemSoft > 0 && rt_mem_held() > gMemSoft {
+		overloaded()
+		shedCount += 1
+		h2_simple(c, s, 503)
+		return
+	}
+	if gAdmit != nil {
+		if !gAdmit(Load{Core: myID, Waiting: waiting, Conns: __atomic_load(gLoad + myID*128), Buffered: bufBytes, Shed: shedCount, Pool: rt_mem_pool(), Ingot: rt_mem_ingot()}) {
+			overloaded()
+			shedCount += 1
+			h2_simple(c, s, 503)
+			return
+		}
+	}
+	if shedAt != 0 && rt_mono_ns()-shedAt >= recoverNs {
+		recovered()
+	}
+	let task = rt_task_new(h2_run_request, c)
+	task[tUser+2] = s
+	if rt_bnd_task(task, rt_bnd_core(), bkRequest) != nil {
+		rt_task_free(task)
+		h2_simple(c, s, 503)
+		return
+	}
+	if gReqMemory > 0 {
+		rt_bnd_set_limit(task[tBnd], gReqMemory, 0)
+	}
+	rt_task_recover(task)
+	if gDeadlineMs > 0 {
+		rt_task_set_deadline(task, rt_mono_ns()+gDeadlineMs*1000000)
+	}
+	if gRecord {
+		let rec = h2_record(s)
+		record_start(task, c, rec, h2RecLen)
+		free(rec)
+	}
+	s[sTask] = task
+	h[hTasks] += 1
+	if rt_task_run(task) {
+		h2_task_done(c, s, task)
+		return
+	}
+	s[sWaited] = 1
+	waiting += 1
+}
+
+// h2_run_request is a stream's request task: build the Req and Out, run the handler, send the
+// response.
+fn h2_run_request(c i64) {
+	let s = rt_task_current()[tUser+2]
+	let b = s[sHdr]
+	mut bp = s[sBody]
+	if bp == 0 {
+		bp = b
+	}
+	let q = Req{Method: method_str(b+s[sMOff], s[sMLen]), Path: "", Query: "", hp: b, hn: s[sHn], bp: bp, bn: s[sBodyLen], tp: s[sTr], tn: s[sTrLen], cn: c}
+	let t = b + s[sPOff]
+	let tn = s[sPLen]
+	let qm = memchr(t, '?', tn)
+	if qm == 0 {
+		q.Path = rt_str_from_raw(t, tn)
+	} else {
+		q.Path = rt_str_from_raw(t, qm-t)
+		q.Query = rt_str_from_raw(qm+1, tn-(qm-t)-1)
+	}
+	let body = make([]u8, 0, 1024)
+	let w = Out{Body: body, code: 200, ctype: "text/plain; charset=utf-8", extra: make([]u8, 0, 256), own: body}
+	rt_task_current()[tUser] = cast(i64, q)
+	if gRoutes != 0 {
+		dispatch(cast(rtable, gRoutes), mut q, mut w)
+	} else {
+		gHandler(q, mut w)
+	}
+	if gRecord {
+		record_status(w.code)
+	}
+	if s[sStream] >= 2 {
+		h2_stream_end(c, s, mut w)
+	} else {
+		h2_respond(c, s, w)
+	}
+}
+
+// h2_task_done finishes stream s after its task ended: a panic's 500 (or a reset when part of
+// the response was sent), the task freed, the stream closed. The caller writes the output.
+fn h2_task_done(c i64, s i64, task i64) {
+	let h = c[cH2]
+	if rt_task_panicked(task) && s[sReset] == 0 && s[sLocal] == 0 && !h2_gone(c) {
+		if s[sHeadSent] == 0 {
+			h2_simple(c, s, rt_task_failure_status(task))
+		} else {
+			h2_rst(c, s, eInternal)
+		}
+	}
+	if gRecord {
+		record_end(task)
+	}
+	rt_task_free(task)
+	s[sTask] = 0
+	h[hTasks] -= 1
+	if s[sWaited] != 0 {
+		waiting -= 1
+		s[sWaited] = 0
+	}
+	if h2_gone(c) {
+		s[sReset] = 1
+	} else if s[sLocal] == 0 && s[sReset] == 0 {
+		// The handler ended without finishing its response (cancelled half way): the client must
+		// not take what came for a whole response.
+		h2_rst(c, s, eCancel)
+		return
+	}
+	h2_closed(c, s)
+}
+
+// h2_finish completes a stream whose task waited and has now ended (from finish_request).
+fn h2_finish(c i64, task i64) {
+	let s = task[tUser+2]
+	h2_task_done(c, s, task)
+	let h = c[cH2]
+	if c[cDead] != 0 {
+		obLen = 0
+		if h[hTasks] == 0 {
+			free_conn(c)
+		}
+		return
+	}
+	h2_flush(c)
+	h2_after(c)
+}
+
+// h2_simple answers stream s with code and its text from the core (a refusal, a limit, a
+// handler's panic): the text goes only when the windows take it at once. A client still sending
+// its body is then told to stop (RST_STREAM NO_ERROR, RFC 9113 8.1).
+fn h2_simple(c i64, s i64, code i64) {
+	if s[sReset] != 0 || s[sLocal] != 0 || h2_gone(c) {
+		return
+	}
+	let h = c[cH2]
+	let text = status_text(code)
+	let n = len(text)
+	let body = (s[sFlags]&1) == 0 && n <= h[hSendWin] && n <= s[sSendWin] && n <= h[hPeerFrame]
+	h2_hb_begin(c, 128)
+	hb_status(code)
+	hb_common()
+	let ct = "text/plain; charset=utf-8"
+	hp_put_named(31, cast(i64, ct)+8, len(ct))
+	if body || (s[sFlags]&1) != 0 {
+		hb_length(n)
+	}
+	if code == 503 {
+		hp_put_named(53, cast(i64, "1")+8, 1)
+	}
+	h2_hb_end(c, s, !body)
+	if body {
+		ob_room(9 + n)
+		h2_head(n, fData, flEnd, s[sId])
+		memcpy(ob+obLen, cast(i64, text)+8, n)
+		obLen += n
+		h[hSendWin] -= n
+		s[sSendWin] -= n
+	}
+	s[sHeadSent] = 1
+	s[sLocal] = 1
+	if s[sRemote] == 0 {
+		h2_rst(c, s, eNo)
+		return
+	}
+	h2_closed(c, s)
+}
+
+// h2_record is stream s's request as HTTP/1.1 bytes (malloc'd, h2RecLen long), the form replay
+// records and sends again (#241): the field lines, a Content-Length for the body, the trailers.
+fn h2_record(s i64) i64 {
+	let b = s[sHdr]
+	let n = s[sMLen] + s[sPLen] + s[sHn] + s[sTrLen] + s[sBodyLen] + 64
+	let r = malloc(n)
+	mut o = 0
+	memcpy(r, b+s[sMOff], s[sMLen])
+	o += s[sMLen]
+	store8(r+o, ' ')
+	o += 1
+	memcpy(r+o, b+s[sPOff], s[sPLen])
+	o += s[sPLen]
+	o += put_str(r, o, " HTTP/1.1\r\n")
+	if (s[sFlags] & 2) == 0 {
+		o += put_str(r, o, "host: \r\n")
+	}
+	memcpy(r+o, b, s[sHn])
+	o += s[sHn]
+	if s[sCl] < 0 && s[sBodyLen] > 0 {
+		o += put_str(r, o, "content-length: ")
+		o += put_dec(r, o, s[sBodyLen])
+		o += put_str(r, o, "\r\n")
+	}
+	if s[sTrLen] > 0 {
+		memcpy(r+o, s[sTr], s[sTrLen])
+		o += s[sTrLen]
+	}
+	o += put_str(r, o, "\r\n")
+	if s[sBodyLen] > 0 {
+		memcpy(r+o, s[sBody], s[sBodyLen])
+		o += s[sBodyLen]
+	}
+	h2RecLen = o
+	return r
+}
+
+// ---- responses ----
+
+// h2_respond sends the response a handler built in w on stream s: HEADERS, the body in DATA
+// frames as the windows allow, then the trailers. It runs in the stream's task, which waits for
+// windows: from here only the write timeout bounds it, as for a response in an HTTP/1.1 buffer.
+fn h2_respond(c i64, s i64, w Out) {
+	if s[sReset] != 0 || s[sLocal] != 0 || h2_gone(c) {
+		return
+	}
+	let code = w.code
+	let nobody = code < 200 || code == 204 || code == 304
+	let bh = cast(i64, w.Body)
+	mut bn = bh[0]
+	if nobody {
+		bn = 0
+	}
+	let hd = (s[sFlags] & 1) != 0
+	let th = w.tr
+	mut tn = 0
+	if th != 0 && !hd {
+		tn = th[0]
+	}
+	let data = bn > 0 && !hd
+	mut clen = -1
+	if !nobody {
+		clen = bn
+	}
+	h2_send_head(c, s, w, clen, !data && tn == 0)
+	if data {
+		rt_task_set_deadline(rt_task_current(), 0)
+		if !h2_data(c, s, bh[2], bn, tn == 0) {
+			return
+		}
+	}
+	if tn > 0 {
+		h2_send_trailers(c, s, th[2], tn)
+	}
+}
+
+// h2_send_head sends the HEADERS of w's response on stream s: the status, server and date, the
+// content type (unless the status allows no body), clen as content-length when >= 0, then the
+// handler's fields; end ends the stream with them.
+fn h2_send_head(c i64, s i64, w Out, clen i64, end bool) {
+	let code = w.code
+	let eh = cast(i64, w.extra)
+	h2_hb_begin(c, 160+len(w.ctype)+2*eh[0])
+	hb_status(code)
+	hb_common()
+	if !(code < 200 || code == 204 || code == 304) {
+		hp_put_named(31, cast(i64, w.ctype)+8, len(w.ctype))
+		if clen >= 0 {
+			hb_length(clen)
+		}
+	}
+	if eh[0] > 0 {
+		hb_lines(eh[2], eh[0])
+	}
+	h2_hb_end(c, s, end)
+	s[sHeadSent] = 1
+	if end {
+		s[sLocal] = 1
+	}
+}
+
+// h2_send_trailers ends stream s with a HEADERS frame of the field lines at p (n bytes).
+fn h2_send_trailers(c i64, s i64, p i64, n i64) {
+	h2_hb_begin(c, 2*n+16)
+	hb_lines(p, n)
+	h2_hb_end(c, s, true)
+	s[sLocal] = 1
+}
+
+// h2_hb_begin starts a header block in the output batch, with room for about n bytes of it.
+fn h2_hb_begin(c i64, n i64) {
+	let h = c[cH2]
+	ob_room(n + 32)
+	hbStart = obLen
+	obLen += 9
+	if h[hEnc] == 1 {
+		store8(ob+obLen, 0x20) // a dynamic table size update to 0 (RFC 7541 6.3)
+		obLen += 1
+		h[hEnc] = 2
+	}
+}
+
+// h2_hb_end frames the header block begun: one HEADERS frame, or HEADERS and CONTINUATION frames
+// when it is longer than the client's largest frame. end sets END_STREAM.
+fn h2_hb_end(c i64, s i64, end bool) {
+	let h = c[cH2]
+	let n = obLen - hbStart - 9
+	let id = s[sId]
+	mut ef = 0
+	if end {
+		ef = flEnd
+	}
+	let max = h[hPeerFrame]
+	if n <= max {
+		h2_head_at(ob+hbStart, n, fHeaders, ef|flHeaders, id)
+		return
+	}
+	let tmp = malloc(n)
+	memcpy(tmp, ob+hbStart+9, n)
+	obLen = hbStart
+	ob_room(n + 9*(n/max+2))
+	mut off = 0
+	for off < n {
+		mut k = n - off
+		if k > max {
+			k = max
+		}
+		mut f = 0
+		if off+k == n {
+			f = flHeaders
+		}
+		if off == 0 {
+			h2_head(k, fHeaders, f|ef, id)
+		} else {
+			h2_head(k, fCont, f, id)
+		}
+		memcpy(ob+obLen, tmp+off, k)
+		obLen += k
+		off += k
+	}
+	free(tmp)
+}
+
+// hb_status appends :status: indexed for the codes in the static table.
+fn hb_status(code i64) {
+	mut idx = 0
+	match code {
+		200 => {
+			idx = 8
+		}
+		204 => {
+			idx = 9
+		}
+		206 => {
+			idx = 10
+		}
+		304 => {
+			idx = 11
+		}
+		400 => {
+			idx = 12
+		}
+		404 => {
+			idx = 13
+		}
+		500 => {
+			idx = 14
+		}
+	}
+	if idx > 0 {
+		store8(ob+obLen, 128|idx)
+		obLen += 1
+		return
+	}
+	mut v = code
+	if v < 100 || v > 999 {
+		v = 500
+	}
+	store8(ob+obLen, 8)
+	store8(ob+obLen+1, 3)
+	store8(ob+obLen+2, '0'+v/100)
+	store8(ob+obLen+3, '0'+(v/10)%10)
+	store8(ob+obLen+4, '0'+v%10)
+	obLen += 5
+}
+
+// hb_common appends server and date, coded once a second per core from the HTTP/1.1 block.
+fn hb_common() {
+	if h2DateSec != lastSec || h2DateLen == 0 {
+		h2DateSec = lastSec
+		mut o = 0
+		let s = "anvil"
+		store8(h2Date, 15)
+		store8(h2Date+1, 54-15)
+		store8(h2Date+2, len(s))
+		memcpy(h2Date+3, cast(i64, s)+8, len(s))
+		o = 3 + len(s)
+		// common is "Server: anvil\r\nDate: <date>\r\n".
+		let dp = common + 15 + 6
+		let dn = commonLen - 15 - 6 - 2
+		store8(h2Date+o, 15)
+		store8(h2Date+o+1, 33-15)
+		store8(h2Date+o+2, dn)
+		memcpy(h2Date+o+3, dp, dn)
+		h2DateLen = o + 3 + dn
+	}
+	memcpy(ob+obLen, h2Date, h2DateLen)
+	obLen += h2DateLen
+}
+
+// hb_length appends content-length.
+fn hb_length(n i64) {
+	store8(ob+obLen, 15)
+	store8(ob+obLen+1, 28-15)
+	let d = put_dec(ob, obLen+3, n)
+	store8(ob+obLen+2, d)
+	obLen += 3 + d
+}
+
+// hb_lines appends the field lines "Name: value\r\n" at p (n bytes) as literal fields with lower
+// case names; connection-specific fields, which HTTP/2 does not carry, are left out.
+fn hb_lines(p i64, n i64) {
+	mut pos = p
+	let end = p + n
+	for pos < end {
+		let e = memchr(pos, '\n', end-pos)
+		if e == 0 {
+			return
+		}
+		let k = memchr(pos, ':', e-pos)
+		if k != 0 {
+			let kn = k - pos
+			mut v = k + 1
+			for v < e && load8(v) == ' ' {
+				v += 1
+			}
+			mut ve = e
+			if ve > v && load8(ve-1) == '\r' {
+				ve -= 1
+			}
+			if !(name_is(pos, kn, "keep-alive") || name_is(pos, kn, "proxy-connection") || name_is(pos, kn, "upgrade") || name_is(pos, kn, "te") || name_is(pos, kn, "connection") || name_is(pos, kn, "content-length") || name_is(pos, kn, "transfer-encoding")) {
+				hp_put_literal(pos, kn, v, ve-v)
+			}
+		}
+		pos = e + 1
+	}
+}
+
+// h2_data sends n bytes at p on stream s as DATA frames within the client's windows and frame
+// size, waiting in the stream's task when a window is used up; end sets END_STREAM on the last.
+// False when the stream or the connection ended first.
+fn h2_data(c i64, s i64, p i64, n i64, end bool) bool {
+	let h = c[cH2]
+	mut off = 0
+	for {
+		if s[sReset] != 0 || h2_gone(c) {
+			return false
+		}
+		let left = n - off
+		mut k = left
+		if k > h[hPeerFrame] {
+			k = h[hPeerFrame]
+		}
+		if k > 65536 {
+			k = 65536
+		}
+		if k > h[hSendWin] {
+			k = h[hSendWin]
+		}
+		if k > s[sSendWin] {
+			k = s[sSendWin]
+		}
+		if left > 0 && k <= 0 {
+			if !h2_wait(c, s) {
+				return false
+			}
+			continue
+		}
+		if k < 0 {
+			k = 0
+		}
+		let last = end && k == left
+		if k > 0 || last {
+			ob_room(9 + k)
+			mut fl = 0
+			if last {
+				fl = flEnd
+			}
+			h2_head(k, fData, fl, s[sId])
+			memcpy(ob+obLen, p+off, k)
+			obLen += k
+			h[hSendWin] -= k
+			s[sSendWin] -= k
+			off += k
+		}
+		if last {
+			s[sLocal] = 1
+			return true
+		}
+		if off == n {
+			return true
+		}
+		if obLen >= h2OutMax {
+			h2_flush(c)
+			if c[cOut] != 0 && c[cOutLen]-c[cOutOff] >= h2OutMax {
+				if !h2_wait(c, s) {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+// h2_wait parks stream s's task until a window opens, the socket drains or the stream ends; the
+// output so far goes first. False when the client did not make room within the write timeout,
+// or the request was cancelled (the stream is then reset).
+fn h2_wait(c i64, s i64) bool {
+	h2_flush(c)
+	if s[sReset] != 0 || h2_gone(c) {
+		return false
+	}
+	let h = c[cH2]
+	s[sParked] = 1
+	h[hParked] += 1
+	mut ns = 0
+	if gWriteMs > 0 {
+		ns = gWriteMs * 1000000
+	}
+	let r = rt_task_park(ns)
+	s[sParked] = 0
+	h[hParked] -= 1
+	if r == waitReady {
+		return true
+	}
+	s[sWhy] = 1
+	if r == waitTimeout {
+		s[sWhy] = 2
+	}
+	if s[sReset] == 0 && !h2_gone(c) {
+		h2_rst(c, s, eCancel)
+		h2_flush(c)
+	}
+	return false
+}
+
+// h2_wake resumes stream s's task if it waits for a window.
+fn h2_wake(s i64) {
+	if s[sParked] != 0 && s[sTask] != 0 {
+		rt_task_wake(s[sTask])
+	}
+}
+
+// h2_wake_all resumes every task of c waiting for a window or for the socket.
+fn h2_wake_all(c i64) {
+	let h = c[cH2]
+	if h[hParked] == 0 {
+		return
+	}
+	let a = h[hStr]
+	for i in 0..h[hNStr] {
+		h2_wake(a[i])
+	}
+}
+
+// h2_flush writes the output batch to c; what the socket does not take waits in c's pending
+// output, and reading stops until it is written (as flush does for HTTP/1.1).
+fn h2_flush(c i64) {
+	if obLen == 0 {
+		return
+	}
+	let h = c[cH2]
+	if c[cDead] != 0 || h[hBroken] != 0 {
+		obLen = 0
+		return
+	}
+	if !conn_seal(c) {
+		obLen = 0
+		h[hBroken] = 1
+		return
+	}
+	if c[cOut] != 0 {
+		pend_out(c, ob, obLen)
+		obLen = 0
+		return
+	}
+	mut w = conn_write(c, ob, obLen)
+	if w == -2 {
+		obLen = 0
+		h[hBroken] = 1
+		return
+	}
+	if w < 0 {
+		w = 0
+	}
+	if w < obLen {
+		pend_out(c, ob+w, obLen-w)
+		ev_conn_write(c[cFD])
+		c[cWriting] = 1
+		write_deadline(c)
+	}
+	obLen = 0
+}
+
+// h2_on_write writes c's pending output when the socket has room; once it is all out, reading
+// resumes and the tasks waiting for room go on.
+fn h2_on_write(c i64) {
+	if c[cOut] == 0 {
+		return
+	}
+	let w = conn_write(c, c[cOut]+c[cOutOff], c[cOutLen]-c[cOutOff])
+	if w == -2 {
+		close_conn(c)
+		return
+	}
+	if w < 0 {
+		return
+	}
+	c[cOutOff] += w
+	if c[cOutOff] < c[cOutLen] {
+		write_deadline(c)
+		return
+	}
+	free(c[cOut])
+	c[cOut] = 0
+	c[cOutLen] = 0
+	c[cOutOff] = 0
+	c[cWriting] = 0
+	if c[cClose] != 0 {
+		close_or_linger(c)
+		return
+	}
+	ev_conn_read(c[cFD])
+	h2_wake_all(c)
+	if h2_after(c) {
+		on_read(c)
+	}
+}
+
+// h2_after settles connection c after its input, a stream's end or a write: a broken socket
+// closes it; draining, or after the client's GOAWAY, it closes once no stream is left (GOAWAY
+// first); else its deadline is set. False when c was closed.
+fn h2_after(c i64) bool {
+	if c[cDead] != 0 {
+		return false
+	}
+	let h = c[cH2]
+	if h[hBroken] != 0 {
+		close_conn(c)
+		return false
+	}
+	if h[hState] != 3 && (draining || h[hPeerAway] != 0) {
+		if h[hGoaway] == 0 {
+			h2_goaway(c, eNo)
+			h2_flush(c)
+		}
+		if h[hOpen] == 0 && h[hTasks] == 0 && h[hBlkId] == 0 {
+			c[cClose] = 1
+		}
+	}
+	if c[cClose] != 0 && c[cOut] == 0 && obLen == 0 {
+		close_or_linger(c)
+		return false
+	}
+	h2_arm(c)
+	return true
+}
+
+// h2_arm sets c's deadline: none while a stream is open or a task runs (the request deadline and
+// h2_sweep's read timeout bound those), else the idle timeout. Pending output keeps the write
+// timeout.
+fn h2_arm(c i64) {
+	if c[cWriting] != 0 {
+		return
+	}
+	let h = c[cH2]
+	c[cDeadline] = 0
+	if h[hOpen] > 0 || h[hTasks] > 0 {
+		return
+	}
+	if gIdleMs > 0 {
+		c[cDeadline] = loopNow + gIdleMs*1000000
+	}
+}
+
+// h2_sweep (once a second) resets the streams whose request did not arrive within the read
+// timeout, and starts the shutdown of a draining connection.
+fn h2_sweep(c i64) {
+	if c[cLinger] != 0 || c[cDead] != 0 {
+		return
+	}
+	let h = c[cH2]
+	if gReadMs > 0 && h[hState] != 3 {
+		let a = h[hStr]
+		mut i = h[hNStr] - 1
+		for i >= 0 {
+			let s = a[i]
+			if s[sRemote] == 0 && s[sReset] == 0 && s[sTask] == 0 && loopNow-s[sStart] > gReadMs*1000000 {
+				h2_rst(c, s, eCancel)
+			}
+			i -= 1
+		}
+	}
+	h2_flush(c)
+	h2_after(c)
+}
+
+// h2_drain_all (when this core starts draining) sends GOAWAY on every HTTP/2 connection of the
+// core, and closes the ones with no stream left.
+fn h2_drain_all() {
+	mut fd = 0
+	for fd <= hiFd {
+		let c = conns[fd]
+		if c != 0 && c[cH2] != 0 && c[cLinger] == 0 {
+			h2_flush(c)
+			h2_after(c)
+		}
+		fd += 1
+	}
+}
+
+// h2_close closes HTTP/2 connection c (from close_conn): its streams are cancelled, and it is
+// freed once their tasks have ended.
+fn h2_close(c i64) {
+	let fd = c[cFD]
+	if c[cTls] != 0 {
+		gTlsBye(c) // close_notify (serve_tls.tin)
+	}
+	rt_sys_close(fd)
+	conns[fd] = 0
+	h2_cancel_all(c)
+	let h = c[cH2]
+	if h[hTasks] > 0 {
+		c[cDead] = 1
+		return
+	}
+	free_conn(c)
+}
+
+// h2_free releases connection c's HTTP/2 state (from free_conn).
+fn h2_free(c i64) {
+	let h = c[cH2]
+	c[cH2] = 0
+	let a = h[hStr]
+	for i in 0..h[hNStr] {
+		h2_free_stream(a[i])
+	}
+	free(a)
+	for h[hDynCount] > 0 {
+		hp_evict(h)
+	}
+	free(h[hDyn])
+	if h[hIn] != 0 {
+		bufBytes -= h[hInCap]
+		free(h[hIn])
+	}
+	if h[hBlk] != 0 {
+		free(h[hBlk])
+	}
+	free(h)
+}
+
+// ---- streaming responses, trailers ----
+
+// h2_stream is the stream of the request the running task serves.
+fn h2_stream() i64 {
+	return rt_task_current()[tUser+2]
+}
+
+// h2_put sends n bytes at p as part of stream s's streamed body (n may be 0: the head only, if it
+// is not out), after the head; the output is written before it returns.
+fn h2_put(c i64, s i64, w Out, p i64, n i64) ! {
+	if s[sReset] != 0 || s[sLocal] != 0 || h2_gone(c) {
+		try h2_write_err(s)
+	}
+	if s[sStream] == 1 {
+		if w.code < 200 || w.code == 204 || w.code == 304 {
+			fail "anvil: a response with this status has no body to stream"
+		}
+		s[sStream] = 2
+		h2_send_head(c, s, w, s[sStLen], (s[sFlags]&1) != 0)
+	}
+	if (s[sFlags] & 1) == 0 && n > 0 {
+		if s[sStLen] >= 0 && s[sStSent]+n > s[sStLen] {
+			fail "anvil: more bytes written than the Content-Length"
+		}
+		if !h2_data(c, s, p, n, false) {
+			try h2_write_err(s)
+		}
+		s[sStSent] += n
+	}
+	h2_flush(c)
+	if gDeadlineMs > 0 {
+		rt_task_set_deadline(rt_task_current(), rt_mono_ns()+gDeadlineMs*1000000)
+	}
+}
+
+// h2_write_err fails with the reason a streamed write on s could not go out.
+fn h2_write_err(s i64) ! {
+	if s[sWhy] == 1 {
+		fail cast(fault, rt_wait_fault())
+	}
+	if s[sWhy] == 2 {
+		fail "anvil: the client stopped reading"
+	}
+	fail "anvil: the client reset the stream or closed the connection"
+}
+
+// h2_put_body sends what Text or argo.Put left in w.Body, and empties it.
+fn h2_put_body(c i64, s i64, w mut Out) ! {
+	let bh = cast(i64, w.Body)
+	if bh[0] > 0 {
+		let n = bh[0]
+		bh[0] = 0
+		try h2_put(c, s, w, bh[2], n)
+	}
+}
+
+// h2_stream_end ends a streamed response when its handler returns: the body still in w, then
+// END_STREAM (or the trailers). A cancelled request, or a body shorter than its Length, is reset
+// instead, so the client never takes it for a whole one.
+fn h2_stream_end(c i64, s i64, w mut Out) {
+	if s[sReset] != 0 || s[sLocal] != 0 || h2_gone(c) {
+		return
+	}
+	h2_put_body(c, s, mut w) catch _ {
+		return
+	}
+	if rt_bnd_stopped() {
+		h2_rst(c, s, eCancel)
+		return
+	}
+	if (s[sFlags]&1) == 0 && s[sStLen] >= 0 && s[sStSent] != s[sStLen] {
+		h2_rst(c, s, eInternal) // shorter than its Length
+		return
+	}
+	if (s[sFlags] & 1) != 0 {
+		return // HEAD: the head ended the stream
+	}
+	let th = w.tr
+	if th != 0 && th[0] > 0 {
+		h2_send_trailers(c, s, th[2], th[0])
+		return
+	}
+	h2_data(c, s, 0, 0, true)
+}
+
+// h2_abort resets a streamed response whose head is out (Out.Abort).
+fn h2_abort(c i64, s i64) {
+	if s[sHeadSent] != 0 && s[sLocal] == 0 && s[sReset] == 0 && !h2_gone(c) {
+		h2_rst(c, s, eInternal)
+		h2_flush(c)
+	}
+}
+
+// h2_sendfile sends count bytes of the file at path, from off, on stream s: pieces read on a
+// helper thread, each sent as DATA frames within the windows.
+fn h2_sendfile(c i64, s i64, w mut Out, path str, off i64, count i64) ! {
+	if s[sStream] == 0 {
+		s[sStream] = 1
+		s[sStLen] = -1
+	}
+	if s[sStream] == 1 && s[sStLen] < 0 && len(w.Body) == 0 {
+		s[sStLen] = count
+	}
+	try h2_put_body(c, s, mut w)
+	try h2_put(c, s, w, 0, 0)
+	if (s[sFlags] & 1) != 0 {
+		return
+	}
+	if s[sStLen] >= 0 && s[sStSent]+count > s[sStLen] {
+		fail "anvil: more bytes written than the Content-Length"
+	}
+	let fd = c32(rt_sys_open(rt_cstr(path), 0, 0))
+	if fd < 0 {
+		fail "anvil: SendFile cannot open the file"
+	}
+	mut left = count
+	mut at = off
+	for left > 0 {
+		mut piece = left
+		if piece > h2OutMax {
+			piece = h2OutMax
+		}
+		let job = calloc(6, 8)
+		job[0] = fd
+		job[1] = malloc(piece)
+		job[2] = at
+		job[3] = piece
+		rt_helper_run(h2_pread_job, job, h2_pread_drop) catch err {
+			rt_sys_close(fd) // the helper's job frees itself when it ends
+			fail err
+		}
+		let k = job[4]
+		if k <= 0 {
+			h2_pread_drop(job)
+			rt_sys_close(fd)
+			h2_rst(c, s, eInternal)
+			h2_flush(c)
+			fail "anvil: the file is shorter than it was when SendFile started"
+		}
+		let ok = h2_data(c, s, job[1], k, false)
+		h2_pread_drop(job)
+		h2_flush(c)
+		if !ok {
+			rt_sys_close(fd)
+			try h2_write_err(s)
+		}
+		s[sStSent] += k
+		at += k
+		left -= k
+		if gDeadlineMs > 0 {
+			rt_task_set_deadline(rt_task_current(), rt_mono_ns()+gDeadlineMs*1000000)
+		}
+	}
+	rt_sys_close(fd)
+}
+
+fn h2_pread_job(job i64) {
+	job[4] = os_pread(job[0], job[1], job[3], job[2])
+}
+
+// h2_pread_drop frees a read job (also one whose request ended before the helper did).
+fn h2_pread_drop(job i64) {
+	free(job[1])
+	free(job)
+}
+
+// ---- frame helpers ----
+
+// h2_head appends a frame header to the output batch (the caller made room).
+fn h2_head(n i64, typ i64, flags i64, id i64) {
+	h2_head_at(ob+obLen, n, typ, flags, id)
+	obLen += 9
+}
+
+fn h2_head_at(p i64, n i64, typ i64, flags i64, id i64) {
+	store8(p, (n>>16)&255)
+	store8(p+1, (n>>8)&255)
+	store8(p+2, n&255)
+	store8(p+3, typ)
+	store8(p+4, flags)
+	put_be32(p+5, id)
+}
+
+fn put_be32(p i64, v i64) {
+	store8(p, (v>>24)&255)
+	store8(p+1, (v>>16)&255)
+	store8(p+2, (v>>8)&255)
+	store8(p+3, v&255)
+}
+
+fn be32(p i64) i64 {
+	return (i64(load8(p)) << 24) | (i64(load8(p+1)) << 16) | (i64(load8(p+2)) << 8) | i64(load8(p+3))
+}
+
+fn ob_be32(v i64) {
+	put_be32(ob+obLen, v)
+	obLen += 4
+}
+
+fn ob_be16(v i64) {
+	store8(ob+obLen, (v>>8)&255)
+	store8(ob+obLen+1, v&255)
+	obLen += 2
+}

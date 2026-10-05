@@ -1,0 +1,200 @@
+package main
+
+import "anvil"
+import "herald"
+import "say"
+import "twine"
+
+// A unary gRPC service over anvil's HTTP/2 (#360): helloworld.Greeter, the service of gRPC's own
+// examples, so any gRPC client can call it (grpcurl, or a client generated from helloworld.proto).
+//
+//	service Greeter { rpc SayHello (HelloRequest) returns (HelloReply) {} }
+//	message HelloRequest { string name = 1; }
+//	message HelloReply { string message = 1; }
+//
+// gRPC needs HTTP/2: clients speak it without TLS by prior knowledge (h2c), which anvil detects on
+// every port. A call is a POST to /helloworld.Greeter/SayHello with content-type application/grpc;
+// its body is one length-prefixed message (a compressed flag byte and a 4-byte big-endian length,
+// then the protobuf bytes), and the reply is the same framing with the status in the trailers
+// grpc-status and grpc-message, which w.Trailer sends in a HEADERS frame after the body. The two
+// messages here have one string field each, so the protobuf encoding is written out below; a
+// larger service would generate it. PORT is the port (default 50051).
+
+// gRPC status codes (google.golang.org/grpc/codes).
+const codeOK = 0
+const codeInvalidArgument = 3
+const codeUnimplemented = 12
+const codeInternal = 13
+
+fn main() {
+	let r = anvil.NewRouter()
+	r.Post("/helloworld.Greeter/SayHello", sayHello)
+	r.NotFound(unimplemented)
+	r.MethodNotAllowed(unimplemented)
+	r.Serve(":50051") catch err {
+		say.Line("server:", err)
+	}
+}
+
+// sayHello answers HelloRequest{name} with HelloReply{message: "Hello <name>"}.
+fn sayHello(q anvil.Req, w mut anvil.Out) {
+	let (msg, ok) = grpcRequest(q, mut w)
+	if !ok {
+		return
+	}
+	let (name, err) = stringField(msg, 1)
+	if err != "" {
+		grpcStatus(mut w, codeInvalidArgument, "HelloRequest: " + err)
+		return
+	}
+	if name == "" {
+		grpcStatus(mut w, codeInvalidArgument, "name is required")
+		return
+	}
+	herald.Log(herald.LInfo, "SayHello", []str{"name_bytes", say.Str(len(name))})
+	grpcReply(mut w, stringMessage(1, "Hello " + name))
+}
+
+// unimplemented is every other path: gRPC's UNIMPLEMENTED.
+fn unimplemented(q anvil.Req, w mut anvil.Out) {
+	w.Status(200)
+	w.Type("application/grpc")
+	grpcStatus(mut w, codeUnimplemented, "unknown method " + q.Path)
+}
+
+// grpcRequest checks the call's framing and returns its one message; false when it answered the
+// call itself. (q.Proto() is "HTTP/2.0" for a real call; it is not checked, so that a call recorded
+// for replay, which replays over HTTP/1.1, gets the same answer.)
+fn grpcRequest(q anvil.Req, w mut anvil.Out) (str, bool) {
+	let ct = q.Header("content-type")
+	if ct != "application/grpc" && !twine.HasPrefix(ct, "application/grpc+") && !twine.HasPrefix(ct, "application/grpc;") {
+		w.Status(415)
+		w.Text("content-type must be application/grpc")
+		return "", false
+	}
+	w.Type("application/grpc")
+	let b = q.Body()
+	if len(b) < 5 {
+		grpcStatus(mut w, codeInternal, "the request has no message")
+		return "", false
+	}
+	if b[0] != 0 {
+		grpcStatus(mut w, codeUnimplemented, "compressed messages are not supported")
+		return "", false
+	}
+	let n = i64(b[1])<<24 | i64(b[2])<<16 | i64(b[3])<<8 | i64(b[4])
+	if n != len(b)-5 {
+		grpcStatus(mut w, codeInternal, "a unary call carries exactly one message")
+		return "", false
+	}
+	return b[5:], true
+}
+
+// grpcReply sends one message and status OK.
+fn grpcReply(w mut anvil.Out, msg str) {
+	let n = len(msg)
+	w.Body = append(w.Body, 0, u8(n>>24), u8(n>>16), u8(n>>8), u8(n))
+	w.Body = append(w.Body, msg...)
+	grpcStatus(mut w, codeOK, "")
+}
+
+// grpcStatus ends the call with a status code and message (percent-encoded, as gRPC requires).
+fn grpcStatus(w mut anvil.Out, code i64, message str) {
+	w.Trailer("grpc-status", say.Str(code))
+	if message != "" {
+		w.Trailer("grpc-message", percentEncode(message))
+	}
+}
+
+fn percentEncode(s str) str {
+	let hex = "0123456789ABCDEF"
+	mut b = make([]u8, 0, len(s))
+	for i in 0..len(s) {
+		let c = s[i]
+		if c < ' ' || c > '~' || c == '%' {
+			b = append(b, '%', hex[c>>4], hex[c&15])
+		} else {
+			b = append(b, c)
+		}
+	}
+	return str(b)
+}
+
+// ---- protobuf: a string field, and skipping the others ----
+
+// stringMessage encodes a message whose only field is string field number f.
+fn stringMessage(f i64, v str) str {
+	return putVarint(f<<3|2) + putVarint(len(v)) + v
+}
+
+// putVarint is v as a protobuf varint.
+fn putVarint(v i64) str {
+	mut b = make([]u8, 0, 10)
+	mut x = v
+	for x >= 128 {
+		b = append(b, u8(x&127|128))
+		x = x >> 7
+	}
+	b = append(b, u8(x))
+	return str(b)
+}
+
+// varint reads a varint at m[i:]: its value and the index after it, or -1 when it is cut short.
+fn varint(m str, i i64) (i64, i64) {
+	mut v = 0
+	mut shift = 0
+	mut j = i
+	for j < len(m) && shift < 64 {
+		let c = m[j]
+		v = v | i64(c&127)<<shift
+		j += 1
+		if c < 128 {
+			return v, j
+		}
+		shift += 7
+	}
+	return 0, -1
+}
+
+// stringField returns string field f of message m ("" when absent; the last one when repeated),
+// skipping the fields of other numbers whatever their wire type; the error is "" or why m is
+// not a valid message.
+fn stringField(m str, f i64) (str, str) {
+	mut out = ""
+	mut i = 0
+	for i < len(m) {
+		let (key, j) = varint(m, i)
+		if j < 0 {
+			return "", "a field key is cut short"
+		}
+		let wire = key & 7
+		mut k = j
+		if wire == 0 {
+			let (x, e) = varint(m, j)
+			if e < 0 || x < 0 {
+				return "", "a varint is cut short"
+			}
+			k = e
+		} else if wire == 1 {
+			k = j + 8
+		} else if wire == 5 {
+			k = j + 4
+		} else if wire == 2 {
+			let (n, e) = varint(m, j)
+			if e < 0 || n < 0 || n > len(m)-e {
+				return "", "a length-delimited field is cut short"
+			}
+			k = e + n
+			if key>>3 == f {
+				out = m[e:k]
+			}
+		} else {
+			return "", "unknown wire type " + say.Str(wire)
+		}
+		if k > len(m) {
+			return "", "a field is cut short"
+		}
+		i = k
+	}
+	return out, ""
+}

@@ -667,6 +667,102 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   retain all messages must manage their pool lifetime explicitly; `Each` is the stream
   API that supplies a safe per-message lifetime.
 
+### HTTP/2: h2c, and the path for h2 over TLS (#360)
+
+`lib/anvil/h2.tin` (frames, streams, flow control) and `lib/anvil/hpack.tin` (RFC 7541). An HTTP/2
+connection is an ordinary connection record whose word `cH2` points at its HTTP/2 state; HTTP/1.1
+connections leave it 0, and the HTTP/1.1 path reads it once per read, never per request.
+
+**Entering HTTP/2.**
+- Prior knowledge: the client preface starts like a request line, so `serve_one` sees
+  `PRI * HTTP/2.0` only where it would answer 400, and hands the connection to `h2_enter`.
+- `Upgrade: h2c` (RFC 7540 3.2): `Connection` must list `upgrade` (the token loop notes it), `Upgrade`
+  must list `h2c` and there must be exactly one `HTTP2-Settings` (base64url, applied like a SETTINGS
+  frame). anvil writes `101 Switching Protocols`, the server preface, and serves the request as
+  stream 1 (half-closed by the client), its connection-specific fields left out. HTTP/1.0, a
+  chunked request, an unusable `HTTP2-Settings` or a draining core keep the request on HTTP/1.1.
+- h2 over TLS (#124): once the TLS server lands, a connection whose ALPN is `h2` enters at
+  `h2_start(c)`, the `start` given to `alpn_offer("h2", ...)`. TLS then goes in three places:
+  `conn_read` (decrypted input, with `tls_read`'s results: bytes, 0 at the end, -1 nothing now,
+  -2 broken), `conn_seal` (the output batch made into records before `h2_flush` writes it) and
+  `conn_write` (the socket write, also of pending output). Until then HTTP/2 is h2c only.
+
+**Reading.** In the core's event loop, as for HTTP/1.1: a read into the core's scratch buffer,
+whole frames served in order (`h2_feed`), a frame not fully arrived kept in the connection (at
+most 16 KiB and its header: larger frames are a FRAME_SIZE_ERROR). Responses produced while a read
+is served go out in one write; while the socket does not take them, reading stops (backpressure).
+
+**Settings and limits.** SETTINGS_MAX_CONCURRENT_STREAMS 100 (a stream past it is refused with
+REFUSED_STREAM), SETTINGS_INITIAL_WINDOW_SIZE 1 MiB, a 4 MiB connection window (one WINDOW_UPDATE
+after SETTINGS), frames up to 16 KiB, SETTINGS_MAX_HEADER_LIST_SIZE 64 KiB (past it 431, as for
+HTTP/1.1). A header block's fragments are limited to 256 KiB and 512 CONTINUATION frames
+(ENHANCE_YOUR_CALM). A connection with 200 request tasks still alive refuses new streams, so
+streams opened and reset at once ("rapid reset") cannot pile up tasks.
+
+**HPACK.** The decoder keeps the client's dynamic table (4096 bytes, a ring of 128 entries); a
+Huffman string decodes with one lookup of the next 8 bits per symbol of up to 8 bits (letters,
+digits, common signs) and bit by bit past that, rejecting EOS and padding that is longer than 7 bits
+or not all ones. A field name is classified once (pseudo-header, connection-specific, `te`,
+`content-length`, `cookie`, `host`, `expect`): the static entries at startup, a dynamic entry when
+it is added, with whether its value was checked, so an indexed field is copied and not checked
+again. Every header block is decoded, also one the stream then refuses, so the table stays in step.
+Responses are written with static-table names and literals that are not indexed and not
+Huffman-coded, so the encoder keeps no table: when the client lowers SETTINGS_HEADER_TABLE_SIZE,
+the next block starts with a size update to 0. `server` and `date` are coded once a second per core.
+
+**Requests.** A request's fields are checked as RFC 9113 8.2 and 8.3 ask (lower-case token names,
+no NUL, CR or LF in a value, pseudo-header fields first and once each, no connection-specific
+field, `te` only `trailers`, `:method`, `:scheme` and a non-empty `:path` that starts with `/` or is
+`*`, or CONNECT with `:authority` alone); a malformed one is reset with PROTOCOL_ERROR. The fields
+become field lines `name: value\r\n` (`:authority` as `host`, `cookie` fields joined with `; `),
+so `Req.Header` reads them as it reads HTTP/1.1's, and trailers come after them as a chunked
+request's do. The body is buffered (counted in `TIN_MAX_BUFFERED` until the request starts; past
+`TIN_MAX_BODY` 413, then RST_STREAM NO_ERROR to stop the client), a `content-length` must match it,
+and `expect: 100-continue` gets an interim `:status 100`. The stream and connection receive
+windows are opened again once half is used. When the client ends its side the request goes
+through the admission checks of `serve_one` and runs in its own task on the connection's core
+(`tArg` the connection, `tUser+2` the stream), with the request deadline and memory budget.
+Many streams of one connection run at once: one that waits does not hold the others.
+
+**Responses.** HEADERS (`:status`, `server`, `date`, `content-type` and `content-length` unless
+the status has no body, then the handler's fields with lower-case names; connection-specific
+fields are left out), split into CONTINUATION frames past the client's frame size, then DATA
+frames of at most the smaller window, the client's frame size and 64 KiB, END_STREAM on the last
+(or on HEADERS for an empty body or HEAD). A task whose window is used up writes what it has and
+parks (`rt_task_park`); a WINDOW_UPDATE, a larger SETTINGS_INITIAL_WINDOW_SIZE or a drained socket
+wakes it, and when none comes within the write timeout the stream is reset (CANCEL). Once the
+handler returned the request deadline no longer applies, as for a response in an HTTP/1.1
+connection's buffer. Pending output past 256 KiB parks a writer too, so a client that does not
+read cannot make the server buffer a response. `Out.Trailer` fields are a last HEADERS frame with
+END_STREAM. Streamed responses (#350) are DATA frames: `Length` sets `content-length`, `SendFile`
+reads 256 KiB pieces with `pread` on a helper thread and sends them as DATA, `Closed` is true once
+the stream was reset or the connection closed. A short `Length` body, `Abort` or a panic after the head reset
+the stream (INTERNAL_ERROR), a cancel or a deadline (CANCEL); a panic before the head is a 500 on
+its stream. The connection goes on in every case.
+
+**Cancels, errors and timeouts.** RST_STREAM from the client cancels the stream's task (its waits
+fail with `canceled: the client reset the stream`), a closed connection cancels all of them
+(`canceled: the connection closed`); the connection is freed when the last task ends. A connection
+error sends GOAWAY with its code and closes by lingering; frames still in flight for a stream this
+side reset are dropped. With no stream open the idle timeout applies; a stream whose request does
+not arrive within `TIN_READ_TIMEOUT_MS` is reset. `Req.Hijack` fails on a stream (WebSocket over
+HTTP/2, RFC 8441, is not supported). PRIORITY is checked and ignored (RFC 9113 5.3.2); the server
+never pushes.
+
+**Drain.** When a core starts draining, every HTTP/2 connection gets GOAWAY (NO_ERROR, the last
+stream the client opened) at once; idle ones close, the streams in flight finish, and new streams
+are ignored (the client retries them on another connection).
+
+**Replay.** An HTTP/2 request is recorded in its HTTP/1.1 form (#241): the request line, the field
+lines, a `content-length` for the body, the trailers. Replayed, it comes in over HTTP/1.1, so
+`Req.Proto` says `HTTP/1.1` there.
+
+**Conformance.** `tools/ci/h2_check.py` runs h2spec's generic, http2 and hpack cases but one:
+http2/3.5/2 sends `INVALID CONNECTION PREFACE` to a port that also speaks HTTP/1.1, where it is a
+malformed request line and gets 400, as any HTTP/1.1 server answers it. RFC 9113 3.4 makes an
+invalid preface a connection error on a connection known to be HTTP/2: after `PRI * HTTP/2.0`, and
+over TLS with ALPN `h2`.
+
 ### TLS connections: tls (#124)
 
 - `tls.Dial` connects with `wire` and runs the TLS 1.3 handshake on the socket; `tls.Client`

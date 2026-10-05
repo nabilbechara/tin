@@ -14,7 +14,8 @@ shared mutable state between threads.
 - **No GC, no pauses**: request-scoped bump pools plus a long-lived per-core heap, with a
   compile-time check that request memory never escapes without `keep()`.
 - **Thread per core, share nothing**: per-core globals, `hearth` cores, `relay` messages,
-  and an HTTP server (`anvil`) with one kqueue/epoll event loop per core and a router.
+  and an HTTP server (`anvil`: HTTP/1.1 and h2c HTTP/2, gRPC-ready trailers) with one
+  kqueue/epoll event loop per core and a router.
 - **Strict**: sized integers with no implicit conversions, non-nil references, `?T`
   optionals, faults that must be handled (`try`), mandatory bounds checks (removed when
   proven safe), `defer`, generics by monomorphization.
@@ -112,7 +113,7 @@ CI and the issue-to-regression workflow: [docs/CI.md](docs/CI.md).
 |---|---|---|---|---|
 | say | formatting, printing | | quarry | files, env, process |
 | argo | JSON (generated per type) | | trail | paths |
-| anvil | HTTP/1.1 server, router | | lever | flags |
+| anvil | HTTP/1.1 and HTTP/2 server, router | | lever | flags |
 | hearth | cores | | tide | time |
 | relay | messages between cores | | dice | random numbers |
 | wire | TCP, HTTP client | | sift | sorting, searching |
