@@ -1442,9 +1442,10 @@ Fix: compare to get a `bool` (`n != 0`), or convert the operand.
 
 ### E237 COMPARE
 
-`==` and `!=` compare values of one type that have equality: numbers, `bool`, `str`,
-structs (by identity), and enums whose variants hold such values. `dyn` values and
-functions do not compare.
+`==` and `!=` compare values of one type that have equality: numbers, `bool`, `str`, and
+structs and enums whose fields hold such values (compared field by field). Slices, maps,
+functions, `dyn` values and optionals have none, alone or inside a struct or enum;
+`same(a, b)` asks whether two structs, slices or maps are one object.
 
 ```tin edition=1
 package main

@@ -799,9 +799,14 @@ angle brackets, so a comparison never depends on what its operands are.
   and then truncate to their width (`u8(1) << 9` is 0). Keep counts below the width.
 - `&&` and `||` short-circuit and take `bool` operands.
 - Strings support `+` and comparisons; `bool` supports `==`, `!=`, `!`, `&&`, `||`.
-- Comparing references: optionals and faults compare with `nil`; `==` on structs, slices
-  and maps compares identity (the same object), not contents: compare fields or
-  elements for equality of contents.
+- Comparing references: optionals and faults compare with `nil`. `==` and `!=` on structs
+  and enums compare **by value** (#352): field by field, so `P{x: 1} == P{x: 1}` is true
+  (a struct holding a slice, map, function, `dyn` value or optional has no value equality:
+  E237). `same(a, b)` is identity, whether two names are one object; it takes two structs,
+  slices or maps of one type. `==` on slices and maps compares identity (compare elements
+  with `sift.Equal` and friends). A slice or map assigned to a second name is one object
+  (`mut ys = xs` then `ys = append(ys, 2)` grows `xs` as well, the example in section 3):
+  copy with `copy` or `ore.Clone` when two independent values are meant.
 
 ### Conditions
 

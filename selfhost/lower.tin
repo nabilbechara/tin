@@ -609,7 +609,7 @@ fn chk_binary(e i64, want i64) i64 {
 	}
 	if is_cmp_op(op) != 0 {
 		let ordered = i64(streq(op, cstr("==")) == 0 && streq(op, cstr("!=")) == 0)
-		if ordered == 0 && kind_of(t) == K_STRUCT && t.enum_ != 0 {
+		if ordered == 0 && kind_of(t) == K_STRUCT {
 			return lower_enum_eq(cast(Node, e), op, l, r, cast(i64, t))
 		}
 		if kind_of(t) == K_STRING {
@@ -670,14 +670,27 @@ fn chk_binary(e i64, want i64) i64 {
 // enum_incomparable returns a payload type of enum t without value equality (slices, maps,
 // structs, funcs, optionals), or 0 when every variant compares by value.
 fn enum_incomparable(t Ty) i64 {
+	return value_incomparable(t, 0)
+}
+
+// value_incomparable is the first type inside the struct or enum t that has no value equality
+// (a slice, map, function, dyn value, optional), or 0. Numbers, bool, str and faults compare;
+// structs and enums compare field by field (depth bounds a recursive enum).
+fn value_incomparable(t Ty, depth i64) i64 {
+	if depth > 6 {
+		return 0
+	}
 	let fs = cast(Vec[i64], t.fields)
-	mut i = 1
+	mut i = 0
+	if t.enum_ != 0 {
+		i = 1
+	}
 	for i < fs.len {
 		let ft = cast(Ty, field_type(t, i))
 		let k = kind_of(ft)
-		if k == K_STRUCT && ft.enum_ != 0 {
-			if ft != t {
-				let inner = enum_incomparable(ft)
+		if k == K_STRUCT {
+			if cast(i64, ft) != cast(i64, t) {
+				let inner = value_incomparable(ft, depth + 1)
 				if inner != 0 {
 					return inner
 				}
@@ -693,16 +706,21 @@ fn enum_incomparable(t Ty) i64 {
 shared mut enum_eq_types Vec[i64]
 shared mut enum_eq_fns Vec[i64]
 
-// lower_enum_eq compares two enum values by value (same variant, equal fields) through a
-// generated eq function per enum, so recursive enums compare without expanding forever.
+// lower_enum_eq compares two enum or struct values by value (same variant and equal fields, or
+// equal fields) through a generated eq function per type, so recursive enums compare without
+// expanding forever.
 fn lower_enum_eq(e Node, op i64, l i64, r i64, t i64) i64 {
 	let pos = e.pos
-	let bad = enum_incomparable(cast(Ty, t))
+	let bad = value_incomparable(cast(Ty, t), 0)
 	if bad != 0 {
 		let u = err_code(pos, cstr("E237 COMPARE"))
 		buf_str(u, cstr("cannot compare "))
 		type_name(cast(Buf, u), cast(Ty, t))
-		buf_str(u, cstr(" values: a variant holds "))
+		if cast(Ty, t).enum_ != 0 {
+			buf_str(u, cstr(" values: a variant holds "))
+		} else {
+			buf_str(u, cstr(" values: a field holds "))
+		}
 		type_name(cast(Buf, u), cast(Ty, bad))
 		buf_str(u, cstr(", which has no value equality"))
 		err_end(cast(Buf, u))
@@ -727,7 +745,7 @@ fn enum_eq_fn(t Ty) i64 {
 	}
 	mut i = 0
 	for i < enum_eq_types.len {
-		if cast(Ty, vec_get(cast(Vec[i64], enum_eq_types), i)) == t {
+		if cast(i64, cast(Ty, vec_get(cast(Vec[i64], enum_eq_types), i))) == cast(i64, t) {
 			return vec_get(enum_eq_fns, i)
 		}
 		i = i + 1
@@ -749,6 +767,29 @@ fn enum_eq_fn(t Ty) i64 {
 	let ls = vec_get(cast(Vec[i64], f.locals), 0)
 	let rs = vec_get(cast(Vec[i64], f.locals), 1)
 	let tag0 = field_offset(t, 0)
+	if t.enum_ == 0 {
+		// A struct is equal when every field is.
+		mut sx = mk_int(pos, 1, ty_bool)
+		mut sf = 0
+		for sf < cast(Vec[i64], t.fields).len {
+			let sft = field_type(t, sf)
+			let sa = mk_mem(pos, sym_ref_node(pos, cast(Sym, ls)), 0, 0, field_offset(t, sf), sft)
+			let sb = mk_mem(pos, sym_ref_node(pos, cast(Sym, rs)), 0, 0, field_offset(t, sf), sft)
+			let sc = binary_new(pos, cstr("=="), sa, sb)
+			chk(cast(Node, sc), ty_bool)
+			if sf == 0 {
+				sx = sc
+			} else {
+				sx = mk_bin(pos, cstr("&&"), sx, sc, ty_bool)
+			}
+			sf = sf + 1
+		}
+		let sret = cast(ReturnStmt, node_new(ST_RETURN, pos))
+		sret.value = sx
+		vec_push(cast(Block, f.body).stmts, cast(i64, sret))
+		ck_fn = saved_fn
+		return cast(i64, f)
+	}
 	mut x = mk_bin(pos, cstr("=="), mk_mem(pos, sym_ref_node(pos, cast(Sym, ls)), 0, 0, tag0, ty_int), mk_mem(pos, sym_ref_node(pos, cast(Sym, rs)), 0, 0, tag0, ty_int), ty_bool)
 	let vs = cast(Vec[i64], t.enum_)
 	mut vi = 0
@@ -891,7 +932,7 @@ fn key_valid(t Ty, path Vec[Ty]) i64 {
 	}
 	mut i = 0
 	for i < path.len {
-		if vec_get(path, i) == t {
+		if cast(i64, vec_get(path, i)) == cast(i64, t) {
 			return i64(t.enum_ != 0)
 		}
 		i = i + 1
@@ -920,7 +961,7 @@ fn key_enc_fn(t Ty) i64 {
 	}
 	mut i = 0
 	for i < key_enc_types.len {
-		if cast(Ty, vec_get(cast(Vec[i64], key_enc_types), i)) == t {
+		if cast(i64, cast(Ty, vec_get(cast(Vec[i64], key_enc_types), i))) == cast(i64, t) {
 			return vec_get(key_enc_fns, i)
 		}
 		i = i + 1
@@ -1001,7 +1042,7 @@ fn key_dec_fn(t Ty) i64 {
 	}
 	mut i = 0
 	for i < key_dec_types.len {
-		if cast(Ty, vec_get(cast(Vec[i64], key_dec_types), i)) == t {
+		if cast(i64, cast(Ty, vec_get(cast(Vec[i64], key_dec_types), i))) == cast(i64, t) {
 			return vec_get(key_dec_fns, i)
 		}
 		i = i + 1
@@ -3145,7 +3186,7 @@ fn chk_conversion(e i64, to Ty) i64 {
 	}
 	let fk = kind_of(from)
 	let tk = kind_of(to)
-	if from == to || (is_untyped(cast(i64, from)) != 0 && assignable(from, to) != 0) {
+	if cast(i64, from) == cast(i64, to) || (is_untyped(cast(i64, from)) != 0 && assignable(from, to) != 0) {
 		if is_untyped(cast(i64, from)) != 0 {
 			reconvert(cast(Node, x), cast(i64, to))
 		}
@@ -3475,6 +3516,21 @@ fn chk_builtin(e i64, name i64, want i64) i64 {
 		cast(Node, e).type_ = 0
 		return ty_error
 	}
+	if streq(name, cstr("same")) != 0 {
+		if n != 2 {
+			err_code_at(pos, cstr("E217 BUILTIN_ARGS"), cstr("same needs two values"))
+			return ty_bool
+		}
+		let sa = chk(cast(Node, arg0(cast(Call, e))), 0)
+		let sb = chk(cast(Node, vec_get(args, 1)), sa)
+		let sk = kind_of(cast(Ty, sa))
+		if (sk != K_STRUCT && sk != K_SLICE && sk != K_MAP) || cast(i64, sa) != sb {
+			err_code_at(pos, cstr("E217 BUILTIN_ARGS"), cstr("same compares two structs, slices or maps of one type for identity (the same object)"))
+			return ty_bool
+		}
+		replace_node(e, mk_bin(pos, cstr("=="), mk_conv(pos, arg0(cast(Call, e)), CV_SAME, ty_int), mk_conv(pos, vec_get(args, 1), CV_SAME, ty_int), ty_bool))
+		return ty_bool
+	}
 	if streq(name, cstr("keep")) != 0 {
 		if n != 1 {
 			err_code_at(pos, cstr("E217 BUILTIN_ARGS"), cstr("keep needs one value"))
@@ -3711,7 +3767,7 @@ fn argo_fn(pos i64, t Ty) i64 {
 	}
 	mut i = 0
 	for i < argo_types.len {
-		if cast(Ty, vec_get(cast(Vec[i64], argo_types), i)) == t {
+		if cast(i64, cast(Ty, vec_get(cast(Vec[i64], argo_types), i))) == cast(i64, t) {
 			return vec_get(argo_fns, i)
 		}
 		i = i + 1
@@ -4078,7 +4134,7 @@ fn enum_zero(pos i64, body Vec[i64], t Ty) i64 {
 	let v = cast(Vec[i64], vec_get(vs, vi))
 	mut i = 0
 	for i < enum_zeroing.len {
-		if cast(Ty, vec_get(cast(Vec[i64], enum_zeroing), i)) == t {
+		if cast(i64, cast(Ty, vec_get(cast(Vec[i64], enum_zeroing), i))) == cast(i64, t) {
 			err_code_type(pos, cstr("E281 ARGO"), cstr("enum "), cast(i64, t), cstr(" has no zero value: give it a variant without data"))
 			return sym_ref_node(pos, cast(Sym, obj.sym))
 		}
@@ -4332,7 +4388,7 @@ fn argo_dfn(pos i64, t Ty) i64 {
 	}
 	mut i = 0
 	for i < argo_dtypes.len {
-		if cast(Ty, vec_get(cast(Vec[i64], argo_dtypes), i)) == t {
+		if cast(i64, cast(Ty, vec_get(cast(Vec[i64], argo_dtypes), i))) == cast(i64, t) {
 			return vec_get(argo_dfns, i)
 		}
 		i = i + 1
@@ -4550,7 +4606,7 @@ fn argo_vfn(pos i64, t Ty) i64 {
 	}
 	mut i = 0
 	for i < argo_vtypes.len {
-		if cast(Ty, vec_get(argo_vtypes, i)) == t {
+		if cast(i64, cast(Ty, vec_get(argo_vtypes, i))) == cast(i64, t) {
 			return vec_get(argo_vfns, i)
 		}
 		i = i + 1
@@ -4853,7 +4909,7 @@ fn say_struct_fn(t Ty, prefix i64) Fn {
 	mut i = 0
 	for i < say_struct_keys.len {
 		let kp = cast(Vec[i64], vec_get(cast(Vec[i64], say_struct_keys), i))
-		if cast(Ty, vec_get(kp, 0)) == t && streq(vec_get(kp, 1), prefix) != 0 {
+		if cast(i64, cast(Ty, vec_get(kp, 0))) == cast(i64, t) && streq(vec_get(kp, 1), prefix) != 0 {
 			return vec_get(say_struct_fns, i)
 		}
 		i = i + 1
@@ -5126,7 +5182,7 @@ fn say_enum_fn(t Ty, prefix i64) Fn {
 	mut i = 0
 	for i < say_enum_keys.len {
 		let kp = cast(Vec[i64], vec_get(cast(Vec[i64], say_enum_keys), i))
-		if cast(Ty, vec_get(kp, 0)) == t && streq(vec_get(kp, 1), prefix) != 0 {
+		if cast(i64, cast(Ty, vec_get(kp, 0))) == cast(i64, t) && streq(vec_get(kp, 1), prefix) != 0 {
 			return vec_get(say_enum_fns, i)
 		}
 		i = i + 1
