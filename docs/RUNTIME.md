@@ -317,6 +317,18 @@ reading resumes and buffered input is served.
 - **Memory and connections:** the partial requests one core buffers are limited to 256 MiB
   (`TIN_MAX_BUFFERED`): a new partial request past it gets 503 and close. Each core takes at
   most 16384 connections (`TIN_MAX_CONNS`); more are closed at accept.
+- **Memory bounds by default (#356):** every request has a memory budget (see Budgets below):
+  `TIN_REQUEST_MEMORY` bytes, or when it is unset a quarter of the memory limit per core (the
+  cgroup's `memory.max`, else the machine's physical memory), at least 64 MiB; 256 MiB on one
+  core gives 64 MiB, 16 GiB on four cores 1 GiB. A request past it ends with 500 and the
+  server goes on. `TIN_MEMORY_SOFT` (bytes; by default 90% of the cgroup limit, none without
+  one) bounds the whole process: while the pool and ingot bytes of every core are past it,
+  new requests get 503 with `Retry-After: 1` before their handler runs (as an admission
+  refusal: `on server.overload` runs), and the requests already running go on. The bytes
+  counted are what the heaps have mapped (slabs and large blocks, an atomic count kept at
+  each mapping) less the pools' first chunks, which requests mostly never touch; reading
+  them costs the admission two loads. `TIN_REQUEST_MEMORY=0` and `TIN_MEMORY_SOFT=0` turn
+  the bounds off.
 - HTTP/1.0 closes unless keep-alive is asked for, and a kept HTTP/1.0 connection gets
   `Connection: keep-alive` in every response. `Connection` is read as a token list:
   `close` anywhere closes the connection after the response.
@@ -438,7 +450,8 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   inside it (the bump fast path is not touched) and tasks started in it. Passing the memory
   budget leaves the block with `fault.LimitExceeded` at once (its defers and cleanups run).
   `TIN_REQUEST_MEMORY` (bytes, beyond a request's first pool chunk) bounds every request the
-  same way; a request past it ends with 500 and the server goes on.
+  same way; a request past it ends with 500 and the server goes on. Unset, it is a quarter of
+  the memory limit per core, at least 64 MiB (#356; 0 turns it off).
 - Scopes (Tin 1 #232, edition 1): `scope s { s.spawn(fn() ! { ... }) }`. A child is a task
   on the same core with a root boundary under the scope's; it runs when its parent waits,
   allocates in its parent's pool (children share the parent's region) and may store request
@@ -493,7 +506,9 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
 - Admission (#238, design_semantics §11). `anvil.Admit(p)` (before `Serve`) sets a policy that
   decides each new request after the built-in limits and before its handler runs, on the core
   it arrived on: `p(anvil.Load)` sees that core's waiting request tasks, live connections, bytes
-  buffered for requests still arriving, and the requests it refused so far. `false` answers 503
+  buffered for requests still arriving, the requests refused so far, the request-pool bytes its
+  requests hold beyond their first chunks (`Pool`) and the bytes its ingot heap holds (`Ingot`,
+  #356). `false` answers 503
   with `Retry-After: 1` from static bytes (no allocation, no handler) and keeps the connection
   when the client does. The first refusal on any core makes the server OVERLOADED and runs the
   `on server.overload` handlers; once every shedding core has admitted a request at least a

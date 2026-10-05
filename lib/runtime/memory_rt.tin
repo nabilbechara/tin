@@ -4,12 +4,35 @@ shared mut memoryBootLock i64
 shared mut memoryFailAfter i64 = -1
 shared mut memoryAllocCount i64
 shared mut memoryVectorScalar i64
+shared mut memoryMapped i64 // bytes every heap has mapped: slabs and large blocks (#356)
 mut memoryHeap i64
 
 fn mem_failpoint(n i64) {
     if memoryFailAfter >= 0 && __atomic_add(&memoryAllocCount,1) >= memoryFailAfter {
         mem_oom(n)
     }
+}
+
+// mem_mapped counts n bytes heap mapped (negative: unmapped) in its total and the process's;
+// a large block may be unmapped by another core, so both are atomic.
+fn mem_mapped(heap i64, n i64) {
+    __atomic_add(heap+176,n)
+    __atomic_add(&memoryMapped,n)
+}
+
+// rt_memory_mapped is the bytes block p maps of its own (a large block, page-rounded), else 0.
+fn rt_memory_mapped(p i64) i64 {
+    if p == 0 { return 0 }
+    let heap = (p-16)[0]
+    let n = ((p-8)[0]&140737488355327)+16
+    if mem_class(n) >= 0 { return 0 }
+    return (n+heap[1]-1)&-heap[1]
+}
+
+// rt_memory_heap_mapped is the bytes this core's heap has mapped (#356).
+fn rt_memory_heap_mapped() i64 {
+    if memoryHeap == 0 { return 0 }
+    return __atomic_load(memoryHeap+176)
 }
 
 fn rt_memory_test_setup() {

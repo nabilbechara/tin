@@ -638,6 +638,7 @@ fn rt_alloc_slow(n i64) i64 {
 	}
 	if c[ctxPoolBase] == 0 {
 		let chunk = calloc(1, rt_chunk())
+		rt_pool_took(chunk, true)
 		// The pool's first object starts at this heap block's payload: pin the chunk so
 		// the long-lived counts never treat pool memory as theirs (#176).
 		(chunk - 8)[0] = (chunk-8)[0] | rcPin
@@ -658,6 +659,7 @@ fn rt_alloc_slow(n i64) i64 {
 		if b == 0 {
 			rt_panic("out of memory")
 		}
+		rt_pool_took(b, false)
 		b[0] = c[ctxPoolExtra]
 		c[ctxPoolExtra] = b
 		return b + 16
@@ -666,6 +668,7 @@ fn rt_alloc_slow(n i64) i64 {
 		c[ctxPoolMark] = c[ctxBump]
 	}
 	let chunk = calloc(1, rt_chunk())
+	rt_pool_took(chunk, false)
 	chunk[0] = c[ctxPoolExtra]
 	c[ctxPoolExtra] = chunk
 	c[ctxBump] = chunk + 16 + n
@@ -698,6 +701,7 @@ fn rt_pool_clear() {
 			mut p = c[ctxPoolExtra]
 			for p != 0 {
 				let next = p[0]
+				rt_pool_gave(p, false)
 				free(p)
 				p = next
 			}
@@ -709,6 +713,7 @@ fn rt_pool_clear() {
 			mut p = c[ctxPoolExtra]
 			for p != 0 {
 				let next = p[0]
+				rt_pool_gave(p, false)
 				free(p)
 				p = next
 			}
@@ -727,6 +732,50 @@ fn rt_pool_used() i64 {
 		return c[ctxPoolMark] - c[ctxPoolBase] + rt_chunk()
 	}
 	return c[ctxBump] - c[ctxPoolBase]
+}
+
+mut rtPoolFirst i64             // bytes of this core's pools' first chunks (mapped, mostly never touched) (#356)
+mut rtPoolMore i64              // bytes of this core's pools beyond their first chunks: later chunks, big blocks
+shared mut rtPoolFirstAll i64   // rtPoolFirst summed over the cores
+
+// rt_pool_took counts pool block p (a pool's first chunk when first) in the memory signals
+// anvil's admission reads (#356); rt_pool_gave takes it back before p is freed.
+fn rt_pool_took(p i64, first bool) {
+	let n = rt_memory_mapped(p)
+	if first {
+		rtPoolFirst += n
+		__atomic_add(&rtPoolFirstAll, n)
+	} else {
+		rtPoolMore += n
+	}
+}
+
+fn rt_pool_gave(p i64, first bool) {
+	let n = rt_memory_mapped(p)
+	if first {
+		rtPoolFirst -= n
+		__atomic_add(&rtPoolFirstAll, 0-n)
+	} else {
+		rtPoolMore -= n
+	}
+}
+
+// rt_mem_held is the bytes every core's pools and long-lived heap hold from the OS, leaving
+// out the pools' first chunks, which requests mostly never touch: what TIN_MEMORY_SOFT bounds.
+fn rt_mem_held() i64 {
+	return __atomic_load(&memoryMapped) - __atomic_load(&rtPoolFirstAll)
+}
+
+// rt_mem_pool is this core's request-pool bytes beyond each pool's first chunk (what
+// TIN_REQUEST_MEMORY and limit blocks count).
+fn rt_mem_pool() i64 {
+	return rtPoolMore
+}
+
+// rt_mem_ingot is the bytes this core's long-lived heap holds: its slabs and large blocks,
+// less the pools' chunks taken from it.
+fn rt_mem_ingot() i64 {
+	return rt_memory_heap_mapped() - rtPoolFirst - rtPoolMore
 }
 
 // rt_ingot_alloc returns zeroed memory from the owning core's mmap size-class heap. A
@@ -3916,6 +3965,7 @@ fn rt_task_free(t i64) {
 	// A task that never ran is still on the live list (#176).
 	rt_rc_live_del(t)
     if freeTaskCount >= maxFreeTasks {
+        rt_pool_gave(t[tPool+2], true)
         free(t[tPool+2])
         rt_sys_munmap(t[tStack],taskStack+taskGuard)
         // Stale timer entries still read this record; the last one to pop frees it.
@@ -4306,11 +4356,13 @@ fn rt_arena_free(b i64, a i64) {
 		mut p = a[aExtra]
 		for p != 0 {
 			let next = p[0]
+			rt_pool_gave(p, false)
 			free(p)
 			p = next
 		}
 	}
 	if a[aBase] != 0 {
+		rt_pool_gave(a[aBase], true)
 		free(a[aBase])
 	}
 	if a[aCharged] != 0 {
@@ -4425,6 +4477,7 @@ fn rt_pool_scope_reset(s i64) {
 fn rt_pool_leave(s i64) {
 	rt_pool_scope_reset(s)
 	let c = __ctx()
+	rt_pool_gave(c[ctxPoolBase], true)
 	free(c[ctxPoolBase])
 	c[ctxBump] = s[0]
 	c[ctxEnd] = s[1]

@@ -225,7 +225,8 @@ fn mem_class_size(k i64) i64 {
 	return s * 2
 }
 
-// Heap words: flags, page size, return lock/head, slab bump/end, 16 local free lists.
+// Heap words: flags, page size, return lock/head, slab bump/end, 16 local free lists, then
+// (word 22) the bytes of slabs and large blocks it has mapped (#356).
 fn mem_heap_new(flags i64, page i64) i64 {
 	let p = mem_map(page, flags)
 	p[0] = flags
@@ -278,6 +279,7 @@ fn mem_alloc(heap i64, n_in i64, zero i64) i64 {
 	if k < 0 {
 		let size = (n + 16 + heap[1] - 1) & -heap[1]
 		b = mem_map(size, heap[0])
+		mem_mapped(heap, size)
 	} else {
 		mem_drain(heap)
 		let p = heap[6 + k]
@@ -292,6 +294,7 @@ fn mem_alloc(heap i64, n_in i64, zero i64) i64 {
 		let bs = mem_class_size(k)
 		if heap[4] + bs > heap[5] {
 			let slab = mem_map(1048576, heap[0])
+			mem_mapped(heap, 1048576)
 			heap[4] = slab
 			heap[5] = slab + 1048576
 		}
@@ -312,6 +315,7 @@ fn mem_free(p i64, current i64) {
 	let n = b[1] & 140737488355327
 	let k = mem_class(n + 16)
 	if k < 0 {
+		mem_mapped(heap, 0 - ((n + 16 + heap[1] - 1) & -heap[1]))
 		rt_sys_munmap(b, (n + 16 + heap[1] - 1) & -heap[1])
 		return
 	}

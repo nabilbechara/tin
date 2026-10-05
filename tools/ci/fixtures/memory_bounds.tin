@@ -1,0 +1,90 @@
+package main
+
+import "anvil"
+import "mint"
+import "quarry"
+import "say"
+import "tide"
+
+// Memory bounds by default (#356). /hog allocates without bound and must end at the request
+// budget with 500 (TIN_REQUEST_MEMORY, by default a quarter of the memory limit per core);
+// /keep/{mb} keeps mb MiB in a global and /hold/{mb} holds mb MiB of request pool for a second,
+// so the pool and ingot bytes pass TIN_MEMORY_SOFT (by default 90% of the cgroup limit) and new
+// requests get 503 while the server keeps running. /load answers what the admission policy saw.
+
+on server.overload {
+	say.Line("overload")
+}
+
+on server.recovered {
+	say.Line("recovered")
+}
+
+mut kept = make([][]u8, 0, 0)
+mut seenPool i64 = 0
+mut seenIngot i64 = 0
+
+fn admit(l anvil.Load) bool {
+	seenPool = l.Pool
+	seenIngot = l.Ingot
+	return true
+}
+
+fn mib(q anvil.Req) i64 {
+	return mint.Atoi(q.PathParam("mb")) catch _ { 0 }
+}
+
+// hog fills 8 MB slices, every page of them, until the request budget ends it (8 GB if nothing
+// does: the cgroup's OOM killer ends the process first).
+fn hog(q anvil.Req, w mut anvil.Out) {
+	mut total = 0
+	for i in 0..1000 {
+		let xs = make([]i64, 1000000)
+		for j in (0..len(xs)).step(512) {
+			xs[j] = i
+		}
+		total += len(xs)
+	}
+	w.Text("hogged {total}")
+}
+
+fn keepMB(q anvil.Req, w mut anvil.Out) {
+	let xs = make([]u8, mib(q) << 20)
+	for i in (0..len(xs)).step(4096) {
+		xs[i] = 1
+	}
+	kept = append(kept, keep(xs))
+	w.Text("kept {len(kept)}")
+}
+
+fn hold(q anvil.Req, w mut anvil.Out) {
+	let xs = make([]u8, mib(q) << 20)
+	for i in (0..len(xs)).step(4096) {
+		xs[i] = 1
+	}
+	tide.Wait(1s) catch err {
+		w.Text("fault: {err}")
+		return
+	}
+	w.Text("held {len(xs)}")
+}
+
+fn load(q anvil.Req, w mut anvil.Out) {
+	w.Text("pool {seenPool} ingot {seenIngot}")
+}
+
+fn plain(q anvil.Req, w mut anvil.Out) {
+	w.Text("ok")
+}
+
+fn main() {
+	anvil.Admit(admit)
+	mut r = anvil.NewRouter()
+	r.Get("/hog", hog)
+	r.Get(`/keep/{mb}`, keepMB)
+	r.Get(`/hold/{mb}`, hold)
+	r.Get("/load", load)
+	r.Get("/plain", plain)
+	let err = r.Serve(":" + quarry.Getenv("PORT"))
+	say.Line(err)
+}
