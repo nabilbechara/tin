@@ -31,6 +31,10 @@ ELF for Linux); no external toolchain is involved.
 | `main.tin` | the driver: arguments, targets, file loading, package resolution |
 | `host_darwin.tin`, `host_linux.tin` | the compiler's own OS calls (the build picks the host's) |
 
+Files under `selfhost/` are read as trusted code, like the runtime and the standard library: they may
+use `cast` and raw words (E802 otherwise). That is what lets a typed edition 1 file in `selfhost/` take
+the records the untyped files allocate (notes/design_typed_compiler.md, #228).
+
 `lib/std.tin` (legacy helpers: `strlen`, `streq`, `calloc` externs...) is part of every
 compiler build.
 
