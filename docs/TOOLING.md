@@ -109,7 +109,7 @@ tinc [-o OUT] [-S] [-edition 1] [-target darwin-arm64|linux-arm64|linux-amd64] F
 | target | does |
 |---|---|
 | `make` / `make bin/tinc` | build the compiler from the host's seed (`seed/tinc-<os>-<arch>`) |
-| `make bootstrap` | `bin/tinc` builds `bin/s2/tinc`, which builds `bin/s3/tinc`; they must be byte-identical |
+| `make bootstrap` | `bin/tinc` builds `bin/s2/tinc`, which builds `bin/s3/tinc` (with `TIN_ROOT` set to the tree, because the compiler is a strict program that loads `lib/runtime`); they must be byte-identical |
 | `make seed` | bootstrap, then refresh the host's seed from `bin/s3/tinc` |
 | `make test` | the strict suite |
 | `make linux-test` | cross-compile every strict test for linux-arm64 and run it in an arm64 container (`tools/linuxtest.sh`) |

@@ -42,12 +42,11 @@ def main():
         (work/'file').write_text('x')
         probe=work/'path-probe'
         osname='linux' if platform.system()=='Linux' else 'darwin'
-        sources=['lib/std.tin','lib/runtime/memory.tin','lib/runtime/number.tin',
-                 'selfhost/host_'+osname+'.tin','tools/ci/fixtures/path_probe.tin']
-        if osname=='linux':
-            arch='amd64' if platform.machine()=='x86_64' else 'arm64'
-            sources+=['lib/runtime/syscalls_linux.tin','lib/runtime/syscalls_linux_'+arch+'.tin']
-        subprocess.run([str(compiler),'-o',str(probe)]+sources,cwd=ROOT,env=dict(env,TIN_ROOT=str(ROOT)),check=True,timeout=60)
+        # The probe is a strict program whose files sit in the tree's selfhost/, which is read trusted.
+        shutil.copytree(ROOT/'selfhost',tree/'selfhost')
+        shutil.copy(ROOT/'tools/ci/fixtures/path_probe.tin',tree/'selfhost/path_probe.tin')
+        sources=[str(tree/'selfhost'/('host_'+osname+'.tin')),str(tree/'selfhost/path_probe.tin')]
+        subprocess.run([str(compiler),'-o',str(probe)]+sources,cwd=ROOT,env=dict(env,TIN_ROOT=str(tree)),check=True,timeout=60)
         paths=[str(tree/'bin/tinc'),str(work/'tree link/../file'),str(work/'tree link/bin/../../file'),
                '.',str(work/'launcher chain'),str(work/'loop'),str(work/'broken'),str(work/'file')+'/',
                str(work/'missing'),'',str(work/'file/../file')]

@@ -31,6 +31,11 @@ ELF for Linux); no external toolchain is involved.
 | `main.tin` | the driver: arguments, targets, file loading, package resolution |
 | `host_darwin.tin`, `host_linux.tin` | the compiler's own OS calls (the build picks the host's) |
 
+The compiler is itself a strict program: `selfhost/entry.tin` is its `main`, the real runtime
+(`lib/runtime`) starts it, and its untyped driver (`compiler_main` in `main.tin`) runs on the
+runtime's allocator and system calls, so it needs the Tin tree to find `lib/runtime` when it compiles
+itself: `make bootstrap` sets `TIN_ROOT` for the stage 2 and stage 3 compilers.
+
 Files under `selfhost/` are read as trusted code, like the runtime and the standard library: they may
 use `cast` and raw words (E802 otherwise). That is what lets a typed edition 1 file in `selfhost/` take
 the records the untyped files allocate (notes/design_typed_compiler.md, #228).
