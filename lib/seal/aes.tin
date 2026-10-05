@@ -418,6 +418,65 @@ fn gcm_tag_hw(a AEAD, nonce []u8, aad []u8, ct i64, n i64) []u8 {
 	return st
 }
 
+// gcm_seal_hw_to is AEAD.SealTo on the CPU's instructions, with its blocks in a.tmp (counter,
+// J0, GHASH state, lengths, a partial block): it allocates nothing. dst may be src.
+fn gcm_seal_hw_to(a AEAD, nonce []u8, src i64, n i64, aad []u8, dst i64) {
+	let t = cast(i64, a.tmp)[2]
+	let rkp = cast(i64, a.rkb)[2]
+	let hp = cast(i64, a.hb)[2]
+	let np = cast(i64, nonce)[2]
+	let j = t
+	let j0 = t + 16
+	let st = t + 32
+	let lens = t + 48
+	let blk = t + 64
+	memcpy(j, np, 12)
+	memcpy(j0, np, 12)
+	for i in 12..15 {
+		store8(j+i, 0)
+		store8(j0+i, 0)
+	}
+	store8(j+15, 2)
+	store8(j0+15, 1)
+	let full = n / 16
+	if full > 0 {
+		aes_hw_ctr(rkp, a.nr, j, src, dst, full)
+	}
+	let rest = n - 16*full
+	if rest > 0 {
+		__st(blk, 0, 3)
+		__st(blk+8, 0, 3)
+		memcpy(blk, src+16*full, rest)
+		aes_hw_ctr(rkp, a.nr, j, blk, blk, 1)
+		memcpy(dst+16*full, blk, rest)
+	}
+	__st(st, 0, 3)
+	__st(st+8, 0, 3)
+	ghash_hw_raw(st, hp, cast(i64, aad)[2], len(aad), blk)
+	ghash_hw_raw(st, hp, dst, n, blk)
+	for i in 0..8 {
+		store8(lens+7-i, u8(u64(len(aad)) * 8 >> u64(8*i)))
+		store8(lens+15-i, u8(u64(n) * 8 >> u64(8*i)))
+	}
+	ghash_hw(st, hp, lens, 1)
+	aes_hw_ctr(rkp, a.nr, j0, st, st, 1)
+	memcpy(dst+n, st, 16)
+}
+
+// ghash_hw_raw is ghash_hw_bytes with the zero-padded last block built at pad (16 bytes).
+fn ghash_hw_raw(sp i64, hp i64, p i64, n i64, pad i64) {
+	let full = n / 16
+	if full > 0 {
+		ghash_hw(sp, hp, p, full)
+	}
+	if n > 16*full {
+		__st(pad, 0, 3)
+		__st(pad+8, 0, 3)
+		memcpy(pad, p+16*full, n-16*full)
+		ghash_hw(sp, hp, pad, 1)
+	}
+}
+
 // gcm_counter is J0 + 1: the counter block of the first data block.
 fn gcm_counter(nonce []u8) []u8 {
 	let j = make([]u8, 16)
@@ -472,7 +531,7 @@ fn NewAESGCM(key secret []u8) !AEAD {
 		let h = make([]u8, 16)
 		let ctr = make([]u8, 16)
 		aes_hw_ctr(cast(i64, rkb)[2], nr, cast(i64, ctr)[2], cast(i64, h)[2], cast(i64, h)[2], 1)
-		return AEAD{kind: aeadAESGCM, rkb: rkb, nr: nr, hw: true, hb: h}
+		return AEAD{kind: aeadAESGCM, rkb: rkb, nr: nr, hw: true, hb: h, tmp: make([]u8, 80)}
 	}
 	let a = AEAD{kind: aeadAESGCM, rk: aes_bitslice_keys(rkb), nr: nr}
 	// H = E(0^128), kept with its bits reversed.

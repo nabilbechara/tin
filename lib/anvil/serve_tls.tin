@@ -1,0 +1,467 @@
+package anvil
+
+import "quarry"
+import "tls"
+
+// ---- HTTPS: ServeTLS (#124) ----
+//
+// A connection accepted by a TLS server starts in a handshake task of its own (tls_accept):
+// tls.ServerOnFd runs the server side of TLS 1.3 on the socket, and each of its waits lets the
+// core serve other connections. When it finishes, the tls.Conn is copied into long-lived memory
+// (tlsConns, per core, by connection record: deleting the entry releases it through the
+// long-lived reference counts, #176), c[cTls] holds its address, c[cProto] the protocol ALPN
+// chose, and the connection enters that protocol at one place, tls_start. HTTP/1.1 then runs
+// on the event loop plain connections use: a read decrypts the records that arrived into the
+// read buffer serve_one parses (tls.Conn.ReadRaw), the batch of responses is sealed into records
+// before it is written (SealRawTo), streams and SendFile seal what they write, and a close sends
+// close_notify. Nothing here waits outside a task.
+//
+// anvil.tin reaches this file only through the hooks below, which ServeTLS sets: a server that
+// never calls it links no TLS code.
+
+shared mut gTlsOn bool
+shared mut gTlsCert i64 // the certificate chain's PEM text (kept in core 0's heap; each core parses its own copy)
+shared mut gTlsKey i64  // the private key's PEM text
+shared mut gTlsMs i64   // a handshake must finish within this (TIN_HANDSHAKE_TIMEOUT_MS; -1: the header timeout)
+
+shared mut gTlsAccept fn(i64)                  // tls_accept: start the handshake of a new connection
+shared mut gTlsDone fn(i64, i64)               // tls_done: a handshake task ended
+shared mut gTlsRead fn(i64, i64, i64) i64      // tls_read: decrypted input, as ReadRaw counts it
+shared mut gTlsPending fn(i64) i64             // tls_pending: input TLS holds that the socket will not report again
+shared mut gTlsClosed fn(i64) bool             // tls_closed: Out.Closed for a TLS connection
+shared mut gTlsSeal fn(i64) bool               // tls_seal: the output batch, sealed in place
+shared mut gTlsWrite fn(i64, i64, i64) !()     // tls_write_all: a stream's bytes, sealed and written (!(): a bare ! ends no line here, notes/compiler_bugs_tls.md)
+shared mut gTlsFile fn(i64, i64, i64, i64) !i64 // tls_file_step: a piece of SendFile's file, read and sealed
+shared mut gTlsBye fn(i64)                     // tls_bye: close_notify before a close
+shared mut gTlsFree fn(i64)                    // tls_free: release the connection's TLS state
+
+mut tlsCfg ?tls.ServerConfig // this core's copy: an RSA key holds scratch space its signing writes
+mut tlsCfgBad bool           // the copy could not be made (reported once)
+let tlsConns = make(map[i64]?tls.Conn)
+mut tlsHandshakes i64 // handshake tasks running on this core
+mut tlsOb i64         // the sealed output batch is built here, then swapped with ob
+mut tlsObCap i64
+
+// ServeTLS is Serve over TLS 1.3 (HTTPS): certPEM is the certificate chain (leaf first) and
+// keyPEM the leaf's private key (RSA, or ECDSA P-256 or P-384), as PEM text. The pair is
+// checked before listening. ALPN offers "http/1.1". Each handshake runs in a task, so slow
+// clients never hold a core; it must finish within TIN_HANDSHAKE_TIMEOUT_MS (default: the
+// header timeout, 10 s). Clients without TLS 1.3 are refused with a protocol_version alert.
+fn ServeTLS(addr str, certPEM str, keyPEM str, h fn(Req, mut Out)) ! {
+	try tls_setup(certPEM, keyPEM)
+	gHandler = h
+	gRoutes = 0
+	return try serve_on(addr, serve_cores())
+}
+
+// ServeTLS is Serve over TLS 1.3, as anvil.ServeTLS: the routes are checked first, then the
+// certificate and key.
+fn (r Router) ServeTLS(addr str, certPEM str, keyPEM str) ! {
+	let t = try compile(r)
+	try tls_setup(certPEM, keyPEM)
+	gRoutes = cast(i64, keep(t))
+	return try serve_on(addr, serve_cores())
+}
+
+// TLSConn is the TLS connection the request arrived on, or nil over plain TCP: for its
+// ALPN(), CipherSuite() and Group(). After Hijack every byte must go through it (Read, Write,
+// Close), since the descriptor carries records.
+fn (q Req) TLSConn() ?tls.Conn {
+	if q.cn == 0 || q.cn[cTls] == 0 {
+		return nil
+	}
+	return cast(tls.Conn, q.cn[cTls])
+}
+
+// tls_setup checks the certificate and key, keeps their PEM text for every core and turns
+// the server's TLS on.
+fn tls_setup(certPEM str, keyPEM str) ! {
+	try tls.LoadServerConfig(certPEM, keyPEM)
+	gTlsCert = cast(i64, keep(certPEM))
+	gTlsKey = cast(i64, keep(keyPEM))
+	gTlsMs = -1
+	let ms = quarry.Getenv("TIN_HANDSHAKE_TIMEOUT_MS")
+	if ms != "" {
+		gTlsMs = env_int("TIN_HANDSHAKE_TIMEOUT_MS", 0)
+	}
+	tls_protocols()
+	gTlsAccept = tls_accept
+	gTlsDone = tls_done
+	gTlsRead = tls_read
+	gTlsPending = tls_pending
+	gTlsClosed = tls_closed
+	gTlsSeal = tls_seal
+	gTlsWrite = tls_write_all
+	gTlsFile = tls_file_step
+	gTlsBye = tls_bye
+	gTlsFree = tls_free
+	gTlsOn = true
+}
+
+// ---- ALPN: the protocols ServeTLS offers, and where each one starts ----
+//
+// alpn_offer registers a protocol, most preferred first, before the cores start. After a
+// handshake c[cProto] is the protocol's number (its position + 1; 0 when the client offered no
+// ALPN) and tls_start is the one place a connection enters it: start(c) is called once, on the
+// event loop, with c in conns and its handshake done, and from then on owns c. It reads
+// decrypted bytes with tls_read(c, p, n) (or through on_read for HTTP/1.1) and writes by
+// appending to ob and calling flush(c), which seals the batch.
+
+const maxProtos = 4
+
+shared mut gProtoN i64
+shared mut gProtoName i64  // maxProtos words: each name, a str kept in core 0's heap
+shared mut gProtoStart i64 // maxProtos words: each start, a fn(i64)
+
+// alpn_offer adds protocol name, after those already offered, with start as its entry.
+fn alpn_offer(name str, start fn(i64)) {
+	if gProtoName == 0 {
+		gProtoName = calloc(maxProtos, 8)
+		gProtoStart = calloc(maxProtos, 8)
+	}
+	if gProtoN == maxProtos {
+		return
+	}
+	gProtoName[gProtoN] = cast(i64, keep(name))
+	gProtoStart[gProtoN] = cast(i64, start)
+	gProtoN += 1
+}
+
+// tls_protocols registers what ServeTLS offers, in the server's order of preference. HTTP/2
+// (#360) adds alpn_offer("h2", its entry) here, before http/1.1.
+fn tls_protocols() {
+	if gProtoN == 0 {
+		alpn_offer("http/1.1", tls_http1)
+	}
+}
+
+// tls_alpn is the list of protocol names this server offers.
+fn tls_alpn() []str {
+	mut out = make([]str, 0, gProtoN)
+	for i in 0..gProtoN {
+		out = append(out, cast(str, gProtoName[i]))
+	}
+	return out
+}
+
+// tls_proto is the number of the protocol ALPN chose (0: none).
+fn tls_proto(name str) i64 {
+	if name == "" {
+		return 0
+	}
+	for i in 0..gProtoN {
+		if cast(str, gProtoName[i]) == name {
+			return i + 1
+		}
+	}
+	return 0
+}
+
+// tls_start is where a connection whose handshake finished enters its protocol: the one ALPN
+// chose, or HTTP/1.1 when the client offered no ALPN.
+fn tls_start(c i64) {
+	let p = c[cProto]
+	if p > 0 {
+		let start = cast(fn(i64), gProtoStart[p-1])
+		start(c)
+		return
+	}
+	tls_http1(c)
+}
+
+// tls_http1 serves HTTP/1.1 on c from the event loop. Its first request has the header timeout
+// from now on, and input that arrived with the client's Finished is read at once (the socket
+// will not report it again).
+fn tls_http1(c i64) {
+	c[cStart] = loopNow
+	c[cDeadline] = 0
+	if gHeaderMs > 0 {
+		c[cDeadline] = loopNow + gHeaderMs*1000000
+	}
+	ev_conn(c[cFD])
+	if tls_pending(c) != 0 {
+		on_read(c)
+	}
+}
+
+// ---- the handshake ----
+
+// tls_core_config makes this core's copy of the server configuration the first time; false
+// when that fails (the pair was checked by ServeTLS, so only memory can make it fail).
+fn tls_core_config() bool {
+	if tlsCfg != nil {
+		return true
+	}
+	if tlsCfgBad {
+		return false
+	}
+	let cfg = tls.LoadServerConfig(cast(str, gTlsCert), cast(str, gTlsKey)) catch err {
+		tlsCfgBad = true
+		quarry.Eprintln("anvil: TLS configuration: {err}")
+		return false
+	}
+	cfg.ALPN = tls_alpn()
+	tlsCfg = keep(cfg)
+	return true
+}
+
+// tls_accept runs the handshake of the new connection c in a task, with the request deadline
+// machinery: the handshake timeout ends a client that stalls, and a drain cancels it.
+fn tls_accept(c i64) {
+	if !tls_core_config() || tlsHandshakes >= maxWaiting {
+		close_conn(c)
+		return
+	}
+	let task = rt_task_new(tls_handshake, c)
+	if rt_bnd_task(task, rt_bnd_core(), bkRequest) != nil {
+		rt_task_free(task)
+		close_conn(c)
+		return
+	}
+	rt_task_recover(task)
+	mut ms = gTlsMs
+	if ms < 0 {
+		ms = gHeaderMs
+	}
+	if ms > 0 {
+		rt_task_set_deadline(task, rt_mono_ns()+ms*1000000)
+	}
+	c[cTask] = task
+	c[cHs] = 1
+	c[cDeadline] = 0
+	tlsHandshakes += 1
+	if rt_task_run(task) {
+		tls_done(c, task)
+	}
+}
+
+// tls_handshake is the handshake task's body: on success the tls.Conn is kept and c records it.
+fn tls_handshake(c i64) {
+	let cfg = tlsCfg
+	if cfg == nil {
+		return
+	}
+	let tc = tls.ServerOnFd(c[cFD], cfg) catch _ {
+		return
+	}
+	let k = keep(tc)
+	tlsConns[c] = k
+	c[cTls] = cast(i64, k)
+	c[cProto] = tls_proto(k.ALPN())
+	c[cHs] = 2
+}
+
+// tls_done finishes c after its handshake task ended (finish_request sends it here).
+fn tls_done(c i64, task i64) {
+	let ok = c[cHs] == 2 && !rt_task_panicked(task)
+	rt_task_free(task)
+	tlsHandshakes -= 1
+	c[cTask] = 0
+	c[cHs] = 0
+	if c[cDead] != 0 {
+		// Closed while the handshake waited: the descriptor is closed already.
+		free_conn(c)
+		return
+	}
+	if !ok {
+		close_conn(c)
+		return
+	}
+	tls_start(c)
+}
+
+// ---- records on the event loop ----
+
+// tls_read decrypts what arrived for c into the n bytes at p: the bytes (> 0), 0 after the
+// client's close_notify, -1 when no whole record is in yet, -2 when the connection is broken.
+// A KeyUpdate answer, or the alert that ends the connection, is sent first.
+fn tls_read(c i64, p i64, n i64) i64 {
+	let tc = cast(tls.Conn, c[cTls])
+	let (k, out) = tc.ReadRaw(p, n)
+	if len(out) > 0 {
+		tls_send(c, cast(i64, out)[2], len(out))
+	}
+	return k
+}
+
+// tls_pending tells what input of c TLS holds that the socket will not report again: 2
+// decrypted data (a read returns it at once), 1 only part of a record, 0 nothing.
+fn tls_pending(c i64) i64 {
+	if c[cTls] == 0 {
+		return 0
+	}
+	let tc = cast(tls.Conn, c[cTls])
+	if tc.Buffered() > 0 {
+		return 2
+	}
+	if tc.PendingRaw() {
+		return 1
+	}
+	return 0
+}
+
+// tls_closed is Out.Closed for a TLS connection (in its stream's task): whether the client
+// sent close_notify or an alert, or closed the socket. Records read on the way stay buffered.
+fn tls_closed(c i64) bool {
+	let tc = cast(tls.Conn, c[cTls])
+	let (gone, out) = tc.ClosedRaw()
+	if len(out) > 0 {
+		let p = cast(i64, out)[2]
+		if conns[c[cFD]] == c {
+			// The event loop owns the socket: after the output already pending.
+			tls_send(c, p, len(out))
+		} else if rt_sys_write(c[cFD], p, len(out)) != len(out) {
+			// A stream owns it and the answer (a KeyUpdate's) does not fit: the stream ends.
+			if c[cStream] >= 2 {
+				c[cStream] = 5
+			}
+			c[cClose] = 1
+			return true
+		}
+	}
+	return gone
+}
+
+// tls_send writes the n sealed bytes at p after c's pending output, keeping what the socket
+// does not take for on_write.
+fn tls_send(c i64, p i64, n i64) {
+	if c[cOut] != 0 {
+		pend_out(c, p, n)
+		return
+	}
+	mut w = rt_sys_write(c[cFD], p, n)
+	if w < 0 {
+		w = 0
+	}
+	if w < n {
+		pend_out(c, p+w, n-w)
+		ev_conn_write(c[cFD])
+		c[cWriting] = 1
+		write_deadline(c)
+	}
+}
+
+// tls_seal turns the output batch (obLen bytes at ob, all for c) into records: they are sealed
+// into tlsOb, which then becomes ob. False when sealing failed (the batch is dropped).
+fn tls_seal(c i64) bool {
+	if obLen == 0 {
+		return true
+	}
+	let need = tls.SealRawSize(obLen)
+	if need > tlsObCap {
+		if tlsOb != 0 {
+			free(tlsOb)
+		}
+		tlsObCap = need
+		if tlsObCap < obCap {
+			tlsObCap = obCap
+		}
+		tlsOb = malloc(tlsObCap)
+	}
+	let tc = cast(tls.Conn, c[cTls])
+	let k = tc.SealRawTo(ob, obLen, tlsOb) catch _ {
+		obLen = 0
+		return false
+	}
+	let p = ob
+	let pc = obCap
+	ob = tlsOb
+	obCap = tlsObCap
+	tlsOb = p
+	tlsObCap = pc
+	obLen = k
+	return true
+}
+
+// tls_bye sends close_notify before c closes, unless output is still pending (it would go out
+// of order) or the connection already ended.
+fn tls_bye(c i64) {
+	if c[cOut] != 0 {
+		return
+	}
+	let tc = cast(tls.Conn, c[cTls])
+	let b = tc.CloseNotifyRaw()
+	if len(b) > 0 {
+		rt_sys_write(c[cFD], cast(i64, b)[2], len(b))
+	}
+}
+
+// tls_free releases c's TLS state when its record is freed.
+fn tls_free(c i64) {
+	let tc = cast(tls.Conn, c[cTls])
+	tc.ReleaseRaw()
+	c[cTls] = 0
+	delete(tlsConns, c)
+}
+
+// ---- streams and SendFile over TLS (in the request's task) ----
+
+// tls_write_all seals the n bytes at p into records and writes them, waiting while the client
+// does not read, as stream_write_all does for plain bytes. The records are built in a buffer
+// freed afterwards, so a long stream does not grow the request's pool.
+fn tls_write_all(c i64, p i64, n i64) ! {
+	let tc = cast(tls.Conn, c[cTls])
+	let buf = malloc(tls.SealRawSize(n))
+	let k = tc.SealRawTo(p, n, buf) catch err {
+		free(buf)
+		c[cStream] = 5
+		c[cClose] = 1
+		fail err
+	}
+	mut done = 0
+	for done < k {
+		let w = rt_sys_write(c[cFD], buf+done, k-done)
+		if w > 0 {
+			done += w
+			continue
+		}
+		stream_wait(c, w, errno()) catch err {
+			free(buf)
+			fail err
+		}
+	}
+	free(buf)
+}
+
+const tlsFilePiece = 262144
+
+// tls_file_step sends up to n bytes of file fd from off for SendFile over TLS: a helper thread
+// reads them (a slow disk does not stop the core), then they are sealed and written. It returns
+// how many went.
+fn tls_file_step(c i64, fd i64, off i64, n i64) !i64 {
+	let piece = min(n, tlsFilePiece)
+	let job = calloc(6, 8)
+	job[0] = fd
+	job[1] = malloc(piece)
+	job[2] = off
+	job[3] = piece
+	try rt_helper_run(tls_pread_job, job, tls_pread_drop)
+	let k = job[4]
+	let buf = job[1]
+	free(job)
+	if k <= 0 {
+		free(buf)
+		c[cStream] = 5
+		c[cClose] = 1
+		if k == 0 {
+			fail "anvil: the file is shorter than it was when SendFile started"
+		}
+		fail "anvil: reading the file failed"
+	}
+	tls_write_all(c, buf, k) catch err {
+		free(buf)
+		fail err
+	}
+	free(buf)
+	return k
+}
+
+fn tls_pread_job(job i64) {
+	job[4] = os_pread(job[0], job[1], job[3], job[2])
+}
+
+// tls_pread_drop frees a job whose request ended before the helper did.
+fn tls_pread_drop(job i64) {
+	free(job[1])
+	free(job)
+}

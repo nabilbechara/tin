@@ -687,8 +687,11 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   2^24 records under one key the client sends KeyUpdate itself. Alerts are sent encrypted
   once the handshake keys exist; a fatal alert or fault closes the socket and every later
   call returns the same fault.
-- Verification is on by default and cannot be turned off by accident: until X.509 lands
-  (phase 2), `verify_peer` refuses every server unless `InsecureSkipVerify` is set.
+- Verification is on by default and cannot be turned off by accident: `verify_peer` builds the
+  chain to the system's roots plus `Config.RootCAs` (`Certificate.Verify`, section 12), checks the
+  host name, then the CertificateVerify signature (`CheckTLSSignature`); a failure is a
+  `tls: x509: ...` fault after a bad_certificate (or decrypt_error) alert. Only
+  `InsecureSkipVerify` skips it.
 - The database clients keep each connection's `tls.Conn` in a per-core global (`tlsLines` by
   client in redis, `tlsConns` by connection record in mysql and postgres) as a `keep()` copy:
   replacing or deleting the entry when a connection is dropped releases its memory through the
@@ -701,6 +704,67 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   is generic over a private `stream` shape, so the same code reads a `wire.Conn` and a
   `tls.Conn`. `websocket.Dial` takes `wss://` (`DialTLS` with a `tls.Config`): the
   connection's `fill` and `write_raw` go through the `tls.Conn` held in its state.
+
+### HTTPS: anvil.ServeTLS (#124)
+
+`anvil.ServeTLS(addr, certPEM, keyPEM, h)` and `Router.ServeTLS(addr, certPEM, keyPEM)` serve
+HTTP/1.1 over TLS 1.3 on the same per-core event loops (`lib/anvil/serve_tls.tin`).
+
+- **Configuration.** The certificate chain (leaf first) and the private key (RSA, ECDSA P-256 or
+  P-384; PKCS #8, PKCS #1 or SEC 1 PEM) are checked to belong together before anything listens,
+  and a bad pair fails `ServeTLS`. Every core parses its own copy of the key on its first
+  connection: an RSA key holds the Montgomery scratch space its signing writes.
+- **Handshake.** An accepted connection is not added to the poller: its handshake runs in a task
+  of its own (`tls.ServerOnFd`), with the request machinery around it (a boundary, so a drain
+  cancels it; a recovered panic only closes the connection). Each wait for the client is
+  `rt_task_wait`, so a slow or silent client holds no core: the task must finish within
+  `TIN_HANDSHAKE_TIMEOUT_MS` (default: the header timeout, 10 s), and a core runs at most 4096
+  handshakes at once (more connections are closed at accept). The CPU work (the key share, the
+  key schedule and the CertificateVerify signature) runs on the core.
+- **After the handshake** the `tls.Conn` is copied into long-lived memory: the per-core map
+  `tlsConns` holds it by connection record (deleting the entry when the record is freed releases
+  it through the long-lived reference counts, #176) and the record's `cTls` word its address.
+  `ReadRaw` and `SealRawTo` change it only in place (KeyUpdate rewrites keys, IVs and secrets in
+  their slices; failure texts are constants), so it never points into a pool. An idle HTTPS
+  connection holds about 43 KiB (its 16 KiB record buffers and the two AEADs) against a plain
+  connection's 232-byte record.
+- **ALPN and the protocol.** The record's `cProto` word is the protocol ALPN chose: its number in
+  the list `alpn_offer(name, start)` registers before the cores start (`tls_protocols` registers
+  `http/1.1`), or 0 when the client offered none. `tls_start` is the one place a connection
+  enters its protocol: it calls `start(c)` on the event loop. HTTP/1.1 (`tls_http1`) adds the
+  socket to the poller with the header timeout counted from the end of the handshake, and reads
+  at once what arrived with the client's Finished. HTTP/2 (#360) puts `alpn_offer("h2", ...)`
+  before `http/1.1` in `tls_protocols`; its entry reads decrypted bytes with `tls_read(c, p, n)`
+  and writes through `ob` and `flush(c)` like HTTP/1.1.
+- **Reads.** `on_read_serve` reads through `tls_read` instead of `read`: `ReadRaw` reads what
+  the socket has, decrypts whole records into the read buffer serve_one parses, answers a
+  KeyUpdate (its record joins the pending output) and returns 0 at the client's close_notify.
+  Part of a record already read counts as a request still arriving (the header and read
+  timeouts apply from its first byte). When writing blocked reading, `on_write` reads again if
+  TLS holds input (`PendingRaw`): the socket would not report it twice.
+- **Writes.** `flush` seals the batch of responses (`SealRawTo`, 16 KiB records) into a second
+  per-core buffer and swaps it with `ob`, then writes as before: pending output is ciphertext, so
+  `on_write` is unchanged. A stream's writes are sealed into a buffer freed after each write;
+  `SendFile` reads its file in 256 KiB pieces on a helper thread (`pread`) and seals them (no
+  `sendfile` over TLS). `seal.AEAD.SealTo` on the CPU's AES-GCM instructions allocates nothing, so
+  256 MiB streamed over TLS leaves the server's RSS flat (`tls_server_check.py`).
+- **`Out.Closed`** decrypts what has arrived (`ClosedRaw`, without waiting) instead of peeking
+  at the socket, which would see only a record: it reports the client's close_notify or alert,
+  or end of input. Application data it reads ahead stays in TLS, and the loop keeps reading
+  while TLS holds decrypted data (`tls_pending` 2).
+- **Close.** Every close with no output pending sends close_notify first: the end of a
+  `Connection: close` or HTTP/1.0 exchange, the idle and header timeouts, a drain, a lingering
+  close after an error response, and the end of a hijacked connection.
+- **Hijack.** `Req.TLSConn()` is the request's `tls.Conn` (also for its `ALPN()`,
+  `CipherSuite()` and `Group()`). After `Hijack`, every byte must go through it;
+  `websocket.Accept` does that, so `wss://` works on a TLS server, and its reads wait outside the
+  reclamation epochs as a plain WebSocket's do.
+- **Linking.** `anvil.tin` reaches `serve_tls.tin` only through function hooks (`gTlsRead`,
+  `gTlsSeal`, ...) that `ServeTLS` sets, each behind a test of `cTls`: a server that never calls
+  `ServeTLS` links no TLS code (`examples/api.tin` grew by 335 bytes) and its loop is unchanged.
+- **Not supported:** session tickets and resumption on the server, 0-RTT, client certificates,
+  certificate selection by SNI (one chain per server), Ed25519 server keys, and TLS 1.2. A
+  `TIN_REPLAY_CAPSULE` replay sends plain HTTP and cannot replay into a TLS server.
 
 ### Pooled clients: mysql (v0.4)
 
@@ -943,13 +1007,14 @@ functions keep that rule, and grows as phase 1 lands.
 | function | constant-time in | not constant-time in |
 |---|---|---|
 | `Sha256`, `Sha384`, `Sha512`, `Sum` | the message bytes | its length |
-| `tls`: record protection, the Finished check (`ConstantTimeEq`), the key schedule | keys, secrets, data and MACs | lengths, and the padding length of a received record |
+| `tls`: record protection (`SealRawTo` too), the Finished checks (`ConstantTimeEq`), the key schedule, on both sides | keys, secrets, data and MACs | lengths, and the padding length of a received record |
+| `tls` server: its key share (`X25519` or `P256ECDH` below) and its CertificateVerify, signed by `PrivateKey.SignTLS` (below: RFC 6979 ECDSA, blinded RSA CRT for PSS) with each core's own copy of the key | the private key, the ephemeral key and the shared secret | which scheme and group the client offered, which are public |
 | `Hmac`, `HmacSha256` | the key and message bytes | their lengths |
 | `HkdfExtract`, `HkdfExpand`, `HkdfExpandLabel` | the key material | lengths, `info`, labels |
 | `ConstantTimeEq`, `Equal` | the bytes | the lengths |
 | `X25519`, `X25519PublicKey` | the scalar and the point (ladder with masked swaps; ten-limb field) | the final all-zero check, whose result is public |
-| `ChaCha20`, `AEAD.Seal` and `AEAD.Open` for ChaCha20-Poly1305 | the key, the data and the tag (the tag is compared with `ConstantTimeEq`) | the lengths |
-| `NewAESGCM`, `AEAD.Seal` and `AEAD.Open` for AES-GCM: on the CPU's AES-NI/PCLMULQDQ or ARMv8 AESE/AESMC/PMULL instructions when it has them (`selfhost/aes_hw.tin`), else bitsliced AES with the S-box as GF(2^8) inversion and GHASH by multiplication with holes | the key, the data and the tag | the lengths, and which path the CPU allows |
+| `ChaCha20`, `AEAD.Seal`, `AEAD.SealTo` and `AEAD.Open` for ChaCha20-Poly1305 | the key, the data and the tag (the tag is compared with `ConstantTimeEq`) | the lengths |
+| `NewAESGCM`, `AEAD.Seal`, `AEAD.SealTo` and `AEAD.Open` for AES-GCM: on the CPU's AES-NI/PCLMULQDQ or ARMv8 AESE/AESMC/PMULL instructions when it has them (`selfhost/aes_hw.tin`), else bitsliced AES with the S-box as GF(2^8) inversion and GHASH by multiplication with holes | the key, the data and the tag | the lengths, and which path the CPU allows |
 | `P256PublicKey`, `P256ECDH` and the field and point code under them (`field.tin`, `p256.tin`) | the private key and every coordinate | the validity checks of the key and the peer's point, whose results are public |
 
 | `monty_new` (`bignum.tin`: Montgomery constants for a modulus given at run time) | the modulus's value | its limb count and bit length |

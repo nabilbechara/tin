@@ -47,7 +47,7 @@ const sTimeout = 7 // ns a read or write may wait (0: no limit)
 const sWriting = 8 // a task is writing a frame: others wait their turn
 const sOwnFd = 9   // Close closes the descriptor (Dial); anvil closes Accept's
 const sMax = 10    // the largest message accepted
-const sTls = 11    // a wss:// client: the tls.Conn (in the same pool) that every byte goes through
+const sTls = 11    // wss://: the tls.Conn every byte goes through (a client's, in the same pool, or anvil's for Accept)
 const sTn = 12     // its number in a recorded or replayed request (websocket.dial@1, #241); 0: accepted
 const stWords = 13
 
@@ -108,6 +108,11 @@ fn Accept(q anvil.Req, w mut anvil.Out) !Conn {
 	}
 	let fd = try q.Hijack()
 	let st = new_state(fd, false)
+	if let tc = q.TLSConn() {
+		// wss:// on anvil.ServeTLS: the descriptor carries records, so every byte goes through
+		// the request's tls.Conn (Close sends its close_notify; anvil closes the descriptor).
+		st[sTls] = cast(i64, tc)
+	}
 	let c = Conn{open: true, st: st}
 	let err = c.write_all("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept_key(key)}\r\n\r\n")
 	if err != nil {
@@ -335,11 +340,24 @@ fn (c Conn) fill() ! {
 	if st[sTls] != 0 {
 		let tc = cast(tls.Conn, st[sTls])
 		let tmp = make([]u8, 0, st[sCap]-st[sE])
-		tc.Read(mut tmp, st[sCap]-st[sE]) catch e {
-			if wire.IsEOF(e) {
-				fail "websocket: closed (the peer went away)"
+		for {
+			// ReadNow never waits: the wait for the socket is here, outside the reclamation
+			// epochs, as for a plain connection below.
+			let k = tc.ReadNow(mut tmp, st[sCap]-st[sE]) catch e {
+				if wire.IsEOF(e) {
+					fail "websocket: closed (the peer went away)"
+				}
+				fail e
 			}
-			fail e
+			if k > 0 {
+				break
+			}
+			rt_epoch_park()
+			let r = rt_task_wait(st[sFd], 1, st[sTimeout])
+			rt_epoch_unpark()
+			if r != waitReady {
+				fail wait_fail(r)
+			}
 		}
 		memcpy(st[sBuf]+st[sE], cast(i64, tmp)[2], len(tmp))
 		st[sE] += len(tmp)

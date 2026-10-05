@@ -1,0 +1,716 @@
+package tls
+
+import "say"
+import "seal"
+import "wire"
+
+// ---- the server handshake (RFC 8446 section 2, full handshake without PSK) and the
+// non-waiting record calls anvil's event loop uses after it ----
+
+// ServerConfig configures a TLS server: its certificate chain and private key, and the
+// application protocols it speaks.
+type ServerConfig struct {
+	Certificates [][]u8  // the chain to send, DER, leaf first
+	Key seal.PrivateKey  // the leaf's private key (RSA, ECDSA P-256 or P-384)
+	ALPN []str           // protocols spoken, most preferred first (empty: no ALPN)
+	Timeout i64          // ns the handshake may take (0: no limit; a request's deadline still applies)
+}
+
+// LoadServerConfig reads a PEM certificate chain (leaf first) and the leaf's PEM private key
+// and checks that they belong together.
+fn LoadServerConfig(certPEM str, keyPEM str) !ServerConfig {
+	let certs = try seal.ParseCertificatesPEM(certPEM)
+	let key = try seal.ParsePrivateKeyPEM(keyPEM)
+	if !key.MatchesCertificate(certs[0]) {
+		fail "tls: the private key does not belong to the first certificate"
+	}
+	mut chain = make([][]u8, 0, len(certs))
+	for _, c in certs {
+		chain = append(chain, c.Raw)
+	}
+	return ServerConfig{Certificates: chain, Key: key, ALPN: []str{}}
+}
+
+// clientHello is what the server takes from a ClientHello.
+type clientHello struct {
+	random  []u8
+	session []u8
+	suites  []i64
+	groups  []i64
+	shares  [][]u8 // key_share entries: group (2 bytes) then key
+	schemes []i64
+	alpn    []str
+	tls13   bool
+	name    str
+	cookie  []u8
+}
+
+// parse_client_hello reads a ClientHello body.
+fn parse_client_hello(body []u8) !clientHello {
+	let ch = clientHello{random: []u8{}, session: []u8{}, name: "", cookie: []u8{}}
+	let r = rdr{b: body}
+	r.u16v()
+	ch.random = r.bytes(32)
+	ch.session = r.vec8()
+	let cs = rdr{b: r.vec16()}
+	let comp = r.vec8()
+	let exts = rdr{b: r.vec16()}
+	if r.bad || !r.done() || len(ch.session) > 32 || len(cs.b)%2 != 0 || len(cs.b) == 0 {
+		fail alert_fault(alertDecodeError, "malformed ClientHello")
+	}
+	if len(comp) != 1 || comp[0] != 0 {
+		fail alert_fault(alertIllegalParameter, "ClientHello offers compression")
+	}
+	for !cs.done() {
+		ch.suites = append(ch.suites, cs.u16v())
+	}
+	mut seen = []i64{}
+	for !exts.done() && !exts.bad {
+		let typ = exts.u16v()
+		let data = exts.vec16()
+		if in_list(seen, typ) {
+			fail alert_fault(alertIllegalParameter, say.Fmt("duplicate extension %d in ClientHello", typ))
+		}
+		seen = append(seen, typ)
+		let e = rdr{b: data}
+		if typ == extSupportedVersions {
+			let v = rdr{b: e.vec8()}
+			for !v.done() && !v.bad {
+				if v.u16v() == 0x0304 {
+					ch.tls13 = true
+				}
+			}
+			if v.bad {
+				fail alert_fault(alertDecodeError, "malformed supported_versions")
+			}
+		} else if typ == extSupportedGroups {
+			let g = rdr{b: e.vec16()}
+			for !g.done() && !g.bad {
+				ch.groups = append(ch.groups, g.u16v())
+			}
+		} else if typ == extKeyShare {
+			let k = rdr{b: e.vec16()}
+			for !k.done() && !k.bad {
+				let grp = k.u16v()
+				let key = k.vec16()
+				mut entry = make([]u8, 0, 2+len(key))
+				entry = append(entry, u8(grp>>8), u8(grp))
+				entry = append(entry, key...)
+				ch.shares = append(ch.shares, entry)
+			}
+			if k.bad {
+				fail alert_fault(alertDecodeError, "malformed key_share")
+			}
+		} else if typ == extSignatureAlgorithms {
+			let s = rdr{b: e.vec16()}
+			for !s.done() && !s.bad {
+				ch.schemes = append(ch.schemes, s.u16v())
+			}
+		} else if typ == extALPN {
+			let a = rdr{b: e.vec16()}
+			for !a.done() && !a.bad {
+				let p = a.vec8()
+				if len(p) == 0 {
+					fail alert_fault(alertDecodeError, "empty ALPN protocol name")
+				}
+				ch.alpn = append(ch.alpn, str(p))
+			}
+			if a.bad || len(ch.alpn) == 0 {
+				fail alert_fault(alertDecodeError, "malformed ALPN")
+			}
+		} else if typ == extServerName {
+			let l = rdr{b: e.vec16()}
+			if l.u8v() == 0 {
+				ch.name = str(l.vec16())
+			}
+		} else if typ == extCookie {
+			ch.cookie = e.vec16()
+		} else if typ == 41 && !exts.done() {
+			// pre_shared_key must be the last extension (RFC 8446 4.2.11).
+			fail alert_fault(alertIllegalParameter, "pre_shared_key is not the last extension")
+		}
+	}
+	if exts.bad {
+		fail alert_fault(alertDecodeError, "malformed ClientHello extensions")
+	}
+	return ch
+}
+
+// share_for returns the client's key share for group, or an empty slice.
+fn share_for(ch clientHello, group i64) []u8 {
+	for _, e in ch.shares {
+		if (i64(e[0])<<8 | i64(e[1])) == group {
+			return e[2:]
+		}
+	}
+	return []u8{}
+}
+
+// server_hello encodes a ServerHello (or, with random = hrrRandom and no share, a
+// HelloRetryRequest naming group).
+fn server_hello(random []u8, session []u8, suite i64, group i64, share []u8) []u8 {
+	mut b = make([]u8, 0, 160)
+	b = append(b, hsServerHello)
+	let body = open_len(mut b, 3)
+	b = append(b, 3, 3)
+	b = append(b, random...)
+	b = append(b, u8(len(session)))
+	b = append(b, session...)
+	put16(mut b, suite)
+	b = append(b, 0)
+	let exts = open_len(mut b, 2)
+	put16(mut b, extSupportedVersions)
+	put16(mut b, 2)
+	put16(mut b, 0x0304)
+	put16(mut b, extKeyShare)
+	if len(share) == 0 {
+		put16(mut b, 2)
+		put16(mut b, group)
+	} else {
+		put16(mut b, 4+len(share))
+		put16(mut b, group)
+		put16(mut b, len(share))
+		b = append(b, share...)
+	}
+	close_len(mut b, exts, 2)
+	close_len(mut b, body, 3)
+	return b
+}
+
+// pick_scheme chooses the CertificateVerify scheme for key among the client's schemes.
+fn pick_scheme(key seal.PrivateKey, schemes []i64) i64 {
+	let r = key.RSA
+	if r != nil {
+		for _, s in []i64{0x0804, 0x0805, 0x0806} {
+			if in_list(schemes, s) {
+				return s
+			}
+		}
+		return 0
+	}
+	let e = key.EC
+	if e != nil {
+		mut want = 0x0403
+		if e.Curve == "P-384" {
+			want = 0x0503
+		}
+		if in_list(schemes, want) {
+			return want
+		}
+	}
+	return 0
+}
+
+// server_handshake runs the server side on c (a fresh connection).
+fn (c mut Conn) server_handshake(cfg ServerConfig) ! {
+	let hr = hsReader{buf: []u8{}}
+	mut (typ, msg) = try hr.next(mut c)
+	if typ != hsClientHello {
+		fail alert_fault(alertUnexpectedMessage, "expected ClientHello")
+	}
+	let ch = try parse_client_hello(msg[4:])
+	if !ch.tls13 {
+		fail alert_fault(alertProtocolVersion, "the client does not offer TLS 1.3")
+	}
+	mut suite = 0
+	for _, s in suites() {
+		if in_list(ch.suites, s) {
+			suite = s
+			break
+		}
+	}
+	if suite == 0 {
+		fail alert_fault(alertHandshakeFailure, "no cipher suite in common")
+	}
+	let scheme = pick_scheme(cfg.Key, ch.schemes)
+	if scheme == 0 {
+		fail alert_fault(alertHandshakeFailure, "no signature scheme in common for the certificate's key")
+	}
+	let h = suite_hash(suite)
+	mut transcript = clone(msg)
+	mut group = 0
+	mut share = share_for(ch, groupX25519)
+	if len(share) > 0 {
+		group = groupX25519
+	} else {
+		share = share_for(ch, groupP256)
+		if len(share) > 0 {
+			group = groupP256
+		}
+	}
+	if group == 0 {
+		// No usable key share: ask once for one of ours (HelloRetryRequest).
+		mut want = 0
+		if in_list(ch.groups, groupX25519) {
+			want = groupX25519
+		} else if in_list(ch.groups, groupP256) {
+			want = groupP256
+		}
+		if want == 0 {
+			fail alert_fault(alertHandshakeFailure, "no key exchange group in common")
+		}
+		if !hr.empty() {
+			fail alert_fault(alertUnexpectedMessage, "handshake data after the ClientHello")
+		}
+		let first = handshake_msg(hsMessageHash, transcript_hash(h, transcript))
+		let hrr = server_hello([]u8(hrrRandom), ch.session, suite, want, []u8{})
+		transcript = cat(first, hrr)
+		try c.write_records(ctHandshake, hrr)
+		typ, msg = try hr.next(mut c)
+		if typ != hsClientHello {
+			fail alert_fault(alertUnexpectedMessage, "expected a second ClientHello")
+		}
+		let ch2 = try parse_client_hello(msg[4:])
+		if !in_list(ch2.suites, suite) || !ch2.tls13 || !nat_same(ch2.session, ch.session) {
+			fail alert_fault(alertIllegalParameter, "the second ClientHello changed its offer")
+		}
+		share = share_for(ch2, want)
+		if len(share) == 0 || len(ch2.shares) != 1 {
+			fail alert_fault(alertIllegalParameter, "the second ClientHello does not send the key share asked for")
+		}
+		group = want
+		ch.alpn = ch2.alpn
+		transcript = cat(transcript, msg)
+		c.retried = true
+	}
+	mut shared_ = []u8{}
+	mut mine = []u8{}
+	if group == groupX25519 {
+		let priv = seal.X25519NewPrivateKey()
+		mine = try seal.X25519PublicKey(priv)
+		shared_ = seal.X25519(priv, share) catch _ {
+			fail alert_fault(alertIllegalParameter, "invalid X25519 key share")
+		}
+	} else {
+		if len(share) != 65 || share[0] != 4 {
+			fail alert_fault(alertIllegalParameter, "invalid P-256 key share")
+		}
+		let priv = seal.P256NewPrivateKey()
+		mine = try seal.P256PublicKey(priv)
+		shared_ = seal.P256ECDH(priv, share) catch _ {
+			fail alert_fault(alertIllegalParameter, "invalid P-256 key share")
+		}
+	}
+	if !hr.empty() {
+		fail alert_fault(alertUnexpectedMessage, "handshake data before a key change")
+	}
+	let sh = server_hello(seal.RandomBytes(32), ch.session, suite, group, mine)
+	transcript = cat(transcript, sh)
+	try c.write_records(ctHandshake, sh)
+	c.suite = suite
+	c.hash = h
+	let sc = try handshake_secrets(h, shared_, transcript_hash(h, transcript), []u8{})
+	try c.set_write_key(sc.shs)
+	try c.set_read_key(sc.chs)
+	// EncryptedExtensions: the protocol chosen, if both sides speak ALPN.
+	mut alpn = ""
+	if len(ch.alpn) > 0 && len(cfg.ALPN) > 0 {
+		for _, p in cfg.ALPN {
+			if alpn == "" && in_str_list(ch.alpn, p) {
+				alpn = p
+			}
+		}
+		if alpn == "" {
+			fail alert_fault(120, "no application protocol in common")
+		}
+	}
+	mut ee = make([]u8, 0, 32)
+	let exts = open_len(mut ee, 2)
+	if alpn != "" {
+		put16(mut ee, extALPN)
+		put16(mut ee, 3+len(alpn))
+		put16(mut ee, 1+len(alpn))
+		ee = append(ee, u8(len(alpn)))
+		ee = append(ee, alpn...)
+	}
+	close_len(mut ee, exts, 2)
+	mut flight = handshake_msg(hsEncryptedExtensions, ee)
+	mut cm = make([]u8, 0, 4096)
+	cm = append(cm, 0)
+	let list = open_len(mut cm, 3)
+	for _, der in cfg.Certificates {
+		put24(mut cm, len(der))
+		cm = append(cm, der...)
+		put16(mut cm, 0)
+	}
+	close_len(mut cm, list, 3)
+	flight = cat(flight, handshake_msg(hsCertificate, cm))
+	transcript = cat(transcript, flight)
+	let sig = try cfg.Key.SignTLS(scheme, cv_content(transcript_hash(h, transcript)))
+	mut cv = make([]u8, 0, 8+len(sig))
+	put16(mut cv, scheme)
+	put16(mut cv, len(sig))
+	cv = append(cv, sig...)
+	let cvm = handshake_msg(hsCertificateVerify, cv)
+	transcript = cat(transcript, cvm)
+	let fin = try finished_mac(h, sc.shs, transcript_hash(h, transcript))
+	let finm = handshake_msg(hsFinished, fin)
+	transcript = cat(transcript, finm)
+	flight = cat(flight, cvm)
+	flight = cat(flight, finm)
+	try c.write_records(ctHandshake, flight)
+	let thash = transcript_hash(h, transcript)
+	let cats = try derive_secret(h, sc.master, "c ap traffic", thash)
+	let sats = try derive_secret(h, sc.master, "s ap traffic", thash)
+	try c.set_write_key(sats)
+	// The client's Finished, under its handshake key.
+	typ, msg = try hr.next(mut c)
+	if typ != hsFinished {
+		fail alert_fault(alertUnexpectedMessage, "expected the client's Finished")
+	}
+	let want = try finished_mac(h, sc.chs, thash)
+	if !seal.ConstantTimeEq(want, msg[4:]) {
+		fail alert_fault(alertDecryptError, "client Finished does not verify")
+	}
+	if !hr.empty() {
+		fail alert_fault(alertUnexpectedMessage, "handshake data after the client Finished")
+	}
+	try c.set_read_key(cats)
+	c.alpn = alpn
+	c.group = group
+	c.ready = true
+}
+
+fn nat_same(a []u8, b []u8) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i in 0..len(a) {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+fn in_str_list(xs []str, v str) bool {
+	for _, x in xs {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
+
+// Server runs the server side of the handshake over an accepted connection. The Conn owns
+// conn from then on: its Close closes conn. Every wait lets the core serve other tasks.
+fn Server(conn wire.Conn, cfg ServerConfig) !Conn {
+	let c = new_conn(conn)
+	return try server_start(mut c, cfg)
+}
+
+// ServerOnFd runs the server handshake on a socket another package owns (anvil): the Conn
+// never closes fd. Used with ReadRaw and SealRaw.
+fn ServerOnFd(fd i64, cfg ServerConfig) !Conn {
+	let c = new_conn(wire.Conn{})
+	c.fd = fd
+	return try server_start(mut c, cfg)
+}
+
+fn server_start(c mut Conn, cfg ServerConfig) !Conn {
+	if cfg.Timeout > 0 {
+		c.until = rt_mono_ns() + cfg.Timeout
+	}
+	pendingAlert = 0
+	let err = c.server_handshake(cfg)
+	if err != nil {
+		mut desc = pendingAlert
+		if desc == 0 {
+			desc = alertInternalError
+		}
+		// Handshakes on one core interleave at their waits: leave no alert for the next one.
+		pendingAlert = 0
+		c.fault_close(err, desc)
+		fail err
+	}
+	c.until = 0
+	return c
+}
+
+// ---- non-waiting record I/O for an event loop (anvil) ----
+
+// ReadRaw reads what the socket has without waiting, decrypts whole records and copies up to
+// cap bytes of application data to the raw buffer at p. It returns the bytes copied (more
+// than 0; -1 when nothing is available yet; 0 once the peer closed with close_notify or end
+// of input; -2 when the connection is broken) and ciphertext the caller must send next: a
+// KeyUpdate answer, or for -2 the alert to send before closing. It never waits.
+fn (c mut Conn) ReadRaw(p i64, cap i64) (i64, []u8) {
+	mut out = []u8{}
+	mut got = 0
+	if c.closed {
+		return -2, out
+	}
+	for got < cap {
+		if c.pe > c.ps {
+			mut n = c.pe - c.ps
+			if n > cap-got {
+				n = cap - got
+			}
+			memcpy(p+got, cast(i64, c.plain)[2]+c.ps, n)
+			c.ps += n
+			got += n
+			continue
+		}
+		if c.eof {
+			break
+		}
+		let r = c.raw_step(mut out)
+		if r == 0 {
+			break
+		}
+		if r == -2 {
+			return -2, out
+		}
+	}
+	if got > 0 {
+		return got, out
+	}
+	if c.eof {
+		return 0, out
+	}
+	return -1, out
+}
+
+// ClosedRaw reports, without waiting, whether the peer has ended the connection: its
+// close_notify or another alert arrived, the socket reached end of input, or it failed. It
+// decrypts what the socket has, record by record, and stops at the first one of application
+// data, which stays buffered for ReadRaw; a KeyUpdate answer (or the alert to send) is returned
+// for the caller to send. For a stream that asks whether its client went away: a peek at the
+// socket sees only ciphertext.
+fn (c mut Conn) ClosedRaw() (bool, []u8) {
+	mut out = []u8{}
+	for {
+		if c.closed || c.eof {
+			return true, out
+		}
+		if c.pe > c.ps {
+			return false, out
+		}
+		let r = c.raw_step(mut out)
+		if r == 0 {
+			return false, out
+		}
+		if r == -2 {
+			return true, out
+		}
+	}
+	return false, out
+}
+
+// raw_step reads and handles one record without waiting: 1 when it handled one (application
+// data is then in plain), 0 when no whole record can be had yet, 2 at the peer's close_notify,
+// -2 when the connection is broken. A KeyUpdate answer, or the alert to send before closing,
+// is appended to out. The failure texts are constants: this Conn may be kept in long-lived
+// memory (anvil), where a string made in a request's pool must not be stored.
+fn (c mut Conn) raw_step(out mut []u8) i64 {
+	for {
+		// A whole record buffered? Otherwise read more without waiting.
+		let have = c.ine - c.ins
+		mut need = 5
+		if have >= 5 {
+			need = 5 + (i64(c.in[c.ins+3])<<8 | i64(c.in[c.ins+4]))
+		}
+		if have >= need || need > len(c.in) {
+			break
+		}
+		if c.ins > 0 {
+			copy(c.in, c.in[c.ins:c.ine])
+			c.ine -= c.ins
+			c.ins = 0
+		}
+		let base = cast(i64, c.in)[2]
+		let k = rt_sys_read(c.fd, base+c.ine, len(c.in)-c.ine)
+		if k > 0 {
+			c.ine += k
+			continue
+		}
+		if k == 0 {
+			// End of input without close_notify: a truncation, not a clean end.
+			c.failure = "tls: connection closed by the peer without close_notify"
+			c.closed = true
+			return -2
+		}
+		let e = rt_errno()
+		if e == EINTR {
+			continue
+		}
+		if e == EAGAIN {
+			return 0
+		}
+		c.failure = "tls: read failed"
+		c.closed = true
+		return -2
+	}
+	pendingAlert = 0
+	let (typ, data, err) = c.read_record()
+	if err != nil {
+		out = append(out, c.raw_alert(err)...)
+		return -2
+	}
+	if typ == ctApplicationData {
+		if len(data) == 0 {
+			c.alertCt += 1
+			if c.alertCt > 32 {
+				pendingAlert = alertUnexpectedMessage
+				out = append(out, c.raw_alert(fail("tls: too many empty records"))...)
+				return -2
+			}
+			return 1
+		}
+		c.alertCt = 0
+		copy(c.plain, data)
+		c.ps = 0
+		c.pe = len(data)
+		return 1
+	}
+	if typ == ctAlert {
+		let e3 = handle_alert(data)
+		if e3 != nil {
+			c.failure = "tls: the peer sent a fatal alert"
+			c.closed = true
+			return -2
+		}
+		c.eof = true
+		return 2
+	}
+	if typ == ctHandshake {
+		let (ku, e4) = c.raw_key_update(data)
+		if e4 != nil {
+			out = append(out, c.raw_alert(e4)...)
+			return -2
+		}
+		out = append(out, ku...)
+		return 1
+	}
+	pendingAlert = alertUnexpectedMessage
+	out = append(out, c.raw_alert(fail("tls: unexpected record"))...)
+	return -2
+}
+
+// raw_alert ends the connection after err and returns the alert record (the one pendingAlert
+// names) to send before closing. The failure text is a constant, as in ReadRaw.
+fn (c mut Conn) raw_alert(err fault) []u8 {
+	mut desc = pendingAlert
+	if desc == 0 {
+		desc = alertInternalError
+	}
+	pendingAlert = 0
+	let out = make([]u8, 0, 32)
+	c.seal_record(mut out, ctAlert, []u8{2, u8(desc)}) catch _ {}
+	if err != nil {
+		c.failure = "tls: the connection failed"
+	}
+	c.closed = true
+	return out
+}
+
+// raw_key_update handles a KeyUpdate from the client (the only handshake message allowed
+// after the handshake) and returns the answer to send when it asks for one.
+fn (c mut Conn) raw_key_update(data []u8) ![]u8 {
+	if len(data) != 5 || data[0] != hsKeyUpdate || data[1] != 0 || data[2] != 0 || data[3] != 1 || data[4] > 1 {
+		fail alert_fault(alertUnexpectedMessage, "unexpected post-handshake message from the client")
+	}
+	let next = try seal.HkdfExpandLabel(c.hash, str(c.rsecret), "traffic upd", "", seal.Size(c.hash))
+	try c.set_read_key(next)
+	let out = make([]u8, 0, 32)
+	if data[4] == 1 {
+		try c.seal_record(mut out, ctHandshake, handshake_msg(hsKeyUpdate, []u8{0}))
+		let wnext = try seal.HkdfExpandLabel(c.hash, str(c.wsecret), "traffic upd", "", seal.Size(c.hash))
+		try c.set_write_key(wnext)
+	}
+	return out
+}
+
+// SealRawSize is the most bytes SealRawTo writes for n bytes of application data.
+fn SealRawSize(n i64) i64 {
+	return n + (n/maxPlaintext+1)*22 + 64
+}
+
+// SealRaw encrypts n bytes of application data at the raw address p into records (16 KiB
+// each, a KeyUpdate first when the write key is worn out) for the caller to send.
+fn (c mut Conn) SealRaw(p i64, n i64) ![]u8 {
+	let out = make([]u8, SealRawSize(n))
+	let k = try c.SealRawTo(p, n, cast(i64, out)[2])
+	return out[:k]
+}
+
+// SealRawTo is SealRaw into raw memory at dst, which holds SealRawSize(n) bytes; it returns the
+// bytes written. Each record is built and sealed in place there, so nothing it allocates grows
+// with n: an event loop seals into a buffer it reuses.
+fn (c mut Conn) SealRawTo(p i64, n i64, dst i64) !i64 {
+	mut o = 0
+	if c.wseq >= rekeyAfter {
+		let ku = make([]u8, 0, 32)
+		try c.seal_record(mut ku, ctHandshake, handshake_msg(hsKeyUpdate, []u8{0}))
+		memcpy(dst, cast(i64, ku)[2], len(ku))
+		o = len(ku)
+		let next = try seal.HkdfExpandLabel(c.hash, str(c.wsecret), "traffic upd", "", seal.Size(c.hash))
+		try c.set_write_key(next)
+	}
+	let a = c.wr
+	if a == nil {
+		fail "tls: no write key yet"
+	}
+	for off in (0..n).step(maxPlaintext) {
+		mut m = n - off
+		if m > maxPlaintext {
+			m = maxPlaintext
+		}
+		// header, data, content type, tag (RFC 8446 5.2); the nonce and the header (the
+		// additional data) are rewritten in the Conn's own slices: nothing is allocated.
+		let rec = dst + o
+		let ln = m + 17
+		let h = c.whdr
+		h[0] = ctApplicationData
+		h[1] = 3
+		h[2] = 3
+		h[3] = u8(ln >> 8)
+		h[4] = u8(ln)
+		memcpy(rec, cast(i64, h)[2], 5)
+		memcpy(rec+5, p+off, m)
+		store8(rec+5+m, ctApplicationData)
+		let nc = c.wnonce
+		copy(nc, c.wiv)
+		for i in 0..8 {
+			nc[11-i] ^= u8(c.wseq >> u64(8*i))
+		}
+		try a.SealTo(nc, rec+5, m+1, h, rec+5)
+		c.wseq += 1
+		o += 5 + ln
+	}
+	return o
+}
+
+// CloseNotifyRaw is the close_notify alert record to send before closing.
+fn (c mut Conn) CloseNotifyRaw() []u8 {
+	let out = make([]u8, 0, 32)
+	if c.ready && !c.closed {
+		c.seal_record(mut out, ctAlert, []u8{1, alertCloseNotify}) catch _ {}
+	}
+	c.closed = true
+	return out
+}
+
+// PendingRaw reports whether the Conn holds input ReadRaw has not returned yet: decrypted data,
+// or bytes of a record read from the socket. An event loop that stopped reading (its output was
+// blocked) calls ReadRaw again when this is true, since the socket will not report that input.
+fn (c Conn) PendingRaw() bool {
+	return c.pe > c.ps || c.ine > c.ins
+}
+
+// ReleaseRaw ends a Conn kept in long-lived memory before its owner drops it: it marks it
+// closed and resets the failure text, which a failed Read or Write made in a request's pool, so
+// releasing the Conn never follows a pointer into a pool that is gone. Nothing is sent.
+fn (c mut Conn) ReleaseRaw() {
+	c.failure = ""
+	c.closed = true
+}
+
+// raw_bytes copies n raw bytes at p into a new slice.
+fn raw_bytes(p i64, n i64) []u8 {
+	let b = make([]u8, n)
+	if n > 0 {
+		memcpy(cast(i64, b)[2], p, n)
+	}
+	return b
+}

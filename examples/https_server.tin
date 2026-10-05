@@ -1,0 +1,54 @@
+package main
+
+import "anvil"
+import "quarry"
+import "say"
+import "websocket"
+
+// An HTTPS server: anvil over TLS 1.3, with a WebSocket echo at /echo (wss://).
+//   openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 30 \
+//     -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
+//     -keyout key.pem -out cert.pem
+//   TLS_CERT=cert.pem TLS_KEY=key.pem tin examples/https_server.tin
+//   curl --cacert cert.pem https://localhost:8443/
+// The certificate file holds the chain, leaf first; the key may be RSA or ECDSA (P-256, P-384).
+fn hello(q anvil.Req, w mut anvil.Out) {
+	let tc = q.TLSConn()
+	if tc != nil {
+		w.Text("hello over TLS 1.3 ({tc.ALPN()}, group {tc.Group()})\n")
+	}
+}
+
+fn echo(ws websocket.Conn, m websocket.Message) ! {
+	try ws.WriteText("echo: {m.Data}")
+}
+
+fn chat(q anvil.Req, w mut anvil.Out) {
+	let ws = websocket.Accept(q, mut w) catch _ { return }
+	ws.Each(echo) catch _ {}
+}
+
+fn env(name str, dflt str) str {
+	let v = quarry.Getenv(name)
+	if v == "" {
+		return dflt
+	}
+	return v
+}
+
+fn main() {
+	let cert = quarry.ReadFile(env("TLS_CERT", "cert.pem")) catch err {
+		say.Line("certificate:", err)
+		return
+	}
+	let key = quarry.ReadFile(env("TLS_KEY", "key.pem")) catch err {
+		say.Line("key:", err)
+		return
+	}
+	let r = anvil.NewRouter()
+	r.Get("/", hello)
+	r.Get("/echo", chat)
+	r.ServeTLS(":8443", cert, key) catch err {
+		say.Line("server:", err)
+	}
+}

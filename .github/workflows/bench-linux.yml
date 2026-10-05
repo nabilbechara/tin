@@ -92,6 +92,7 @@ jobs:
             wrk --version || true
             echo '```'
             echo 'CPU: 7 alternating runs per side; medians. HTTP: 1 server core, wrk -t2 -c100, 10 s, 5 alternating rounds; load generator on the same runner.'
+            echo 'HTTPS: 1 server core each (anvil.ServeTLS, Go crypto/tls), TLS 1.3, wrk -t2, 5 s, 5 alternating rounds: handshakes/s (Connection: close), keep-alive req/s, MiB/s of 1 MiB bodies.'
             echo 'CPU head/base is elapsed time (lower is faster); HTTP head/base is req/s (higher is faster). >5% regressions require a rerun and profile/maintainer review; timing is not an automatic merge gate.'
           } | tee bin/bench-machine.txt
           cat bin/bench-machine.txt >> "$GITHUB_STEP_SUMMARY"
@@ -110,6 +111,12 @@ jobs:
           go -C bench/http build -o "$GITHUB_WORKSPACE/bin/gonet" ./gonet
           bench/http/run_wrk.sh 1 2 100 10 5 --json bin/bench-http-reference.json | tee bin/bench-http-reference.txt
           { echo '### HTTP reference'; cat bin/bench-http-reference.txt; } >> "$GITHUB_STEP_SUMMARY"
+      - name: HTTPS reference (anvil.ServeTLS versus Go crypto/tls)
+        run: |
+          ./tin build bench/http/https.tin -o bin/https_bench
+          go -C bench/http build -o "$GITHUB_WORKSPACE/bin/gotls" ./gotls
+          python3 bench/http/run_https.py 5 5 --json bin/bench-https-reference.json | tee bin/bench-https-reference.txt
+          { echo '### HTTPS reference (anvil.ServeTLS versus Go crypto/tls)'; cat bin/bench-https-reference.txt; } >> "$GITHUB_STEP_SUMMARY"
       - name: HTTP base versus head
         run: |
           python3 bench/compare.py --suite http --base-root bin/bench-base --json bin/bench-http-compare.json | tee bin/bench-http-compare.txt

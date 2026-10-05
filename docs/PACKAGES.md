@@ -153,8 +153,11 @@ $ tin caps main.tin
 example.com/peek net
 main net files
 quarry files
-wire net
+wire net files
 ```
+
+`wire` reaches `files` because an `https://` request verifies the server against the system's
+CA bundle (`/etc/ssl/certs/ca-certificates.crt` and the other usual paths).
 
 The pass runs only when a vendored package is loaded. On Linux x86-64 (Xeon 2.1 GHz,
 4 cores, kernel 6.18), it adds about 13.5 ms of checking to a 650 ms build of a program

@@ -195,7 +195,10 @@ def response_headers(port, failures):
     print('response header names:', names)
     if b'set-cookie' in names or b'x-evil' in names or b'bad name' in names:
         failures.append('a header line was injected: %r' % got)
-    if names.count(b'content-length') != 1 or names.count(b'connection') != 0 or body != b'echoed':
+    # The handler's "connection: close" is dropped; the one Connection line is anvil's, which
+    # says the connection closes because the request asked it to (RFC 9112 9.6).
+    if names.count(b'content-length') != 1 or names.count(b'connection') != 1 or b'Connection: close' not in lines or \
+            body != b'echoed':
         failures.append('framing headers from the handler were sent: %r' % got)
     if b'X-Echo: a  Set-Cookie: x=1    INJECTED' not in lines or b'Content-Type: text/x  X-Evil: 1' not in lines:
         failures.append('CR/LF in values were not replaced by spaces: %r' % got)

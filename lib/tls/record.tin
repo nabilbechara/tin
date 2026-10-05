@@ -165,13 +165,15 @@ type Conn struct {
 	resumed bool // the handshake resumed an earlier session
 	phcollect i64 // bytes of a NewSessionTicket still to collect into phbuf
 	phbuf   []u8
+	wnonce  []u8 // SealRawTo's nonce and record header, rewritten in place for each record
+	whdr    []u8
 }
 
 fn new_conn(tcp wire.Conn) Conn {
 	return Conn{tcp: tcp, fd: tcp.Fd(), failure: "", riv: make([]u8, 12), rsecret: make([]u8, 0, 48),
 		wiv: make([]u8, 12), wsecret: make([]u8, 0, 48), in: make([]u8, 5+maxCiphertext+64),
 		plain: make([]u8, maxPlaintext), ph: make([]u8, 5), alpn: "", certs: make([][]u8, 0, 1), hash: seal.Hash.SHA256,
-		resumption: []u8{}, skey: "", phbuf: []u8{}}
+		resumption: []u8{}, skey: "", phbuf: []u8{}, wnonce: make([]u8, 12), whdr: make([]u8, 5)}
 }
 
 // wait blocks the task until the socket is readable (want 1) or writable (2), within the
@@ -407,8 +409,14 @@ fn (c mut Conn) set_read_key(secret_ []u8) ! {
 	}
 	copy(c.riv, iv)
 	c.rseq = 0
-	c.rsecret = c.rsecret[:0]
-	c.rsecret = append(c.rsecret, secret_...)
+	if len(c.rsecret) == len(secret_) {
+		// In place after the first key: a Conn kept in long-lived memory (anvil's) must not
+		// point into a request's pool after a KeyUpdate.
+		copy(c.rsecret, secret_)
+	} else {
+		c.rsecret = c.rsecret[:0]
+		c.rsecret = append(c.rsecret, secret_...)
+	}
 }
 
 fn (c mut Conn) set_write_key(secret_ []u8) ! {
@@ -421,8 +429,12 @@ fn (c mut Conn) set_write_key(secret_ []u8) ! {
 	}
 	copy(c.wiv, iv)
 	c.wseq = 0
-	c.wsecret = c.wsecret[:0]
-	c.wsecret = append(c.wsecret, secret_...)
+	if len(c.wsecret) == len(secret_) {
+		copy(c.wsecret, secret_) // in place, as in set_read_key
+	} else {
+		c.wsecret = c.wsecret[:0]
+		c.wsecret = append(c.wsecret, secret_...)
+	}
 }
 
 // send_key_update sends KeyUpdate and moves to the next write secret (RFC 8446 4.6.3).

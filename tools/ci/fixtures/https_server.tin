@@ -1,0 +1,149 @@
+// The server of tools/ci/tls_server_check.py: anvil.ServeTLS (#124 phase 5) with the
+// certificate and key in TLS_CERT and TLS_KEY (paths). Routes:
+//   GET  /             "hello over tls"
+//   GET  /info         "alpn=P suite=S group=G" of the request's TLS connection
+//   POST /echo, POST /  the body back
+//   GET  /big?n=N      N bytes (byte i is i % 251)
+//   GET  /stream?n=N&size=S   N chunks of S bytes, streamed (byte i of the stream is i % 251)
+//   GET  /file?n=N     SendFile of the first N bytes of FILE (an environment path)
+//   GET  /slow?ms=M    waits M ms, then "slow done"
+//   GET  /fast         "fast"
+//   GET  /ws           a WebSocket echo: each message back, prefixed "echo: "
+//   GET  /watch        streams its head, then waits until w.Closed() and prints "watch saw closed"
+package main
+
+import "anvil"
+import "mint"
+import "quarry"
+import "say"
+import "tide"
+import "websocket"
+
+fn num(q anvil.Req, name str, dflt i64) i64 {
+	let v = mint.Atoi(q.Param(name)) catch _ { dflt }
+	return v
+}
+
+fn pattern(size i64, start i64) []u8 {
+	let b = make([]u8, size)
+	for i in 0..size {
+		b[i] = u8((start + i) % 251)
+	}
+	return b
+}
+
+fn root(q anvil.Req, w mut anvil.Out) {
+	w.Text("hello over tls")
+}
+
+fn info(q anvil.Req, w mut anvil.Out) {
+	let tc = q.TLSConn()
+	if tc == nil {
+		w.Text("plain")
+		return
+	}
+	w.Text("alpn={tc.ALPN()} suite={tc.CipherSuite():x} group={tc.Group()}")
+}
+
+fn echo(q anvil.Req, w mut anvil.Out) {
+	w.Text(q.Body())
+}
+
+fn big(q anvil.Req, w mut anvil.Out) {
+	w.Type("application/octet-stream")
+	w.Body = append(w.Body, pattern(num(q, "n", 1000), 0)...)
+}
+
+fn stream(q anvil.Req, w mut anvil.Out) {
+	w.Type("application/octet-stream")
+	w.Stream() catch _ {
+		return
+	}
+	let n = num(q, "n", 4)
+	let size = num(q, "size", 1000)
+	let buf = pattern(size, 0)
+	mut at = 0
+	for i in 0..n {
+		// buf is the pattern from 0; send it shifted by rewriting in place.
+		for j in 0..size {
+			buf[j] = u8((at + j) % 251)
+		}
+		w.Write(buf) catch _ {
+			return
+		}
+		at += size
+	}
+}
+
+fn file(q anvil.Req, w mut anvil.Out) {
+	w.Type("application/octet-stream")
+	w.SendFile(quarry.Getenv("FILE"), 0, num(q, "n", -1)) catch err {
+		w.Status(404)
+		w.Text("cannot send: {err}")
+	}
+}
+
+fn slow(q anvil.Req, w mut anvil.Out) {
+	tide.Wait(num(q, "ms", 500)*1000000) catch _ {}
+	w.Text("slow done")
+}
+
+fn fast(q anvil.Req, w mut anvil.Out) {
+	w.Text("fast")
+}
+
+fn watch(q anvil.Req, w mut anvil.Out) {
+	w.Stream() catch _ {
+		return
+	}
+	w.Flush() catch _ {
+		return
+	}
+	for i in 0..400 {
+		if w.Closed() {
+			quarry.Eprintln("watch saw closed")
+			return
+		}
+		tide.Wait(25ms) catch _ {
+			return
+		}
+	}
+	quarry.Eprintln("watch timed out")
+}
+
+fn wsEcho(ws websocket.Conn, m websocket.Message) ! {
+	try ws.WriteText("echo: {m.Data}")
+}
+
+fn ws(q anvil.Req, w mut anvil.Out) {
+	let c = websocket.Accept(q, mut w) catch _ {
+		return
+	}
+	c.Each(wsEcho) catch _ {}
+}
+
+fn main() {
+	let cert = quarry.ReadFile(quarry.Getenv("TLS_CERT")) catch err {
+		say.Line("cert:", err)
+		return
+	}
+	let key = quarry.ReadFile(quarry.Getenv("TLS_KEY")) catch err {
+		say.Line("key:", err)
+		return
+	}
+	let r = anvil.NewRouter()
+	r.Get("/", root)
+	r.Get("/info", info)
+	r.Post("/echo", echo)
+	r.Post("/", echo)
+	r.Get("/big", big)
+	r.Get("/stream", stream)
+	r.Get("/file", file)
+	r.Get("/slow", slow)
+	r.Get("/fast", fast)
+	r.Get("/ws", ws)
+	r.Get("/watch", watch)
+	r.ServeTLS(":8443", cert, key) catch err {
+		say.Line("server:", err)
+	}
+}

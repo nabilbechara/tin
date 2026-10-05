@@ -125,7 +125,9 @@ the compiler: write a minimal repro to notes/compiler_bugs_NAME.md and work arou
   `r.NotFound(h)`, `r.MethodNotAllowed(h)`. `try r.Serve(":8080")` fails first on a bad or
   conflicting pattern (`r.Check()`). Test without a server: `let w = r.Run("GET", "/users/7", "")`
   then `w.Code()`, `w.Header("Allow")`, `str(w.Body)`; `r.Match(method, path)` is the pattern that
-  would serve.
+  would serve. HTTPS: `try r.ServeTLS(":8443", certPEM, keyPEM)` (or `anvil.ServeTLS(addr, certPEM,
+  keyPEM, h)`): PEM text, chain leaf first, RSA or ECDSA key; `q.TLSConn()` is the request's TLS
+  connection; `websocket.Accept` works on it (wss://). examples/https_server.tin.
 - Memory: no GC. Allocations during a request go to the core's request pool (wiped per request);
   globals live in the long-lived ingot heap. Storing request memory into a global (or anything a global
   holds) without `keep(x)` is a compile error. keep() deep-copies into the ingot heap.
@@ -171,7 +173,7 @@ Keep comments one line, ending with a period.
 
 ## Standard library (import instead of re-implementing)
 say(fmt) fault(error chains) twine(strings) glyph(utf8) mint(strconv) argo(JSON) anvil(HTTP server,
-router) wire(TCP, HTTP(S) client) tls(TLS 1.3 client) hearth(cores) relay(cross-core messages)
+router, HTTPS) wire(TCP, HTTP(S) client) tls(TLS 1.3 client and server) hearth(cores) relay(cross-core messages)
 task(deadline, cancellation) lane(queues between tasks) policy(with policies) tide(time)
 quarry(os/files/env) trail(paths) lever(flags/args) sift(sort/search) atlas(maps) cairn(containers)
 gauge(math) dice(random) stamp(non-crypto hashes) squash(gzip, zlib, snappy, lz4, zstd) seal(SHA-2, HMAC, HKDF, AES-GCM,

@@ -8,11 +8,12 @@ Generated from the comments in `lib/*/` by `tools/gendoc.py`.
 | [fault](#fault) | fault chains and standard sentinels (errors) |
 | [argo](#argo) | JSON (encoding/json) |
 | [io](#io) | streaming shapes (io) |
-| [anvil](#anvil) | HTTP/1.1 server (net/http) |
+| [anvil](#anvil) | HTTP/1.1 server, HTTPS with ServeTLS (net/http) |
 | [hearth](#hearth) | cores and threads (runtime) |
 | [relay](#relay) | messages between cores (channels) |
 | [task](#task) | deadline and cancellation of the running code (context) |
 | [wire](#wire) | TCP and HTTP client (net) |
+| [tls](#tls) | TLS 1.3 client and server (crypto/tls) |
 | [twine](#twine) | strings (strings) |
 | [glyph](#glyph) | UTF-8 and Unicode (unicode/utf8, unicode) |
 | [mint](#mint) | number and string conversion (strconv) |
@@ -146,6 +147,8 @@ The middleware writes one herald line per request, with the client's address as 
 
 q.ClientIP() is the connection's peer unless the peer is one of the TrustedProxies: behind a proxy of yours, call TrustedProxies first, or every line carries the proxy's address.
 
+ServeTLS (and Router.ServeTLS) serve HTTPS: TLS 1.3 with a PEM certificate chain and key, each handshake in a task of its own, then the same event loop with records decrypted before parsing and sealed before writing (docs/RUNTIME.md). examples/https_server.tin.
+
 - `TrustedProxies(cidrs []str) !`: TrustedProxies sets the proxies whose X-Forwarded-For and Forwarded headers ClientIP believes, as networks ("10.0.0.0/8", "fd00::/8") or single addresses. Call it before Serve. With none (the default) ClientIP is the connection's peer: the headers are written by the client and prove nothing unless a proxy you run replaced them.
 - `(q Req) RemoteAddr() str`: RemoteAddr is the address the request's connection comes from, "ip:port" ("[ip]:port" for IPv6, and an IPv4 client of an IPv6 listener as IPv4), or "" for a request made in the process. It is read once per connection. A request replayed from a capsule (#242) gets the address it was recorded with, "" when the capsule is older than that (schema 1).
 - `(q Req) ClientIP() str`: ClientIP is the client's IP address: the connection's peer, or, when the peer is one of the TrustedProxies, the rightmost address of X-Forwarded-For (else Forwarded's for=) that is not a trusted proxy. A malformed entry ends the walk at the peer. "" for a request made in the process.
@@ -208,6 +211,9 @@ q.ClientIP() is the connection's peer unless the peer is one of the TrustedProxi
 - `(r Router) Match(method str, path str) str`: Match returns the pattern of the route that would serve method and path ("/users/{id}"), or "" when the request would get 404 or 405. Like Run, it panics if r has an error (see Check).
 - `StuckCores() i64`: StuckCores is how many cores have not turned their event loop for 1.5 seconds: each is running something that does not wait (a handler stuck in a loop, say). 0 while no server runs.
 - `StuckFor() i64`: StuckFor is how long, in milliseconds, the most stuck core's event loop has not turned (0: every core turns). A service can export it and alert before a stuck core is an outage.
+- `ServeTLS(addr str, certPEM str, keyPEM str, h fn(Req, mut Out)) !`: ServeTLS is Serve over TLS 1.3 (HTTPS): certPEM is the certificate chain (leaf first) and keyPEM the leaf's private key (RSA, or ECDSA P-256 or P-384), as PEM text. The pair is checked before listening. ALPN offers "http/1.1". Each handshake runs in a task, so slow clients never hold a core; it must finish within TIN_HANDSHAKE_TIMEOUT_MS (default: the header timeout, 10 s). Clients without TLS 1.3 are refused with a protocol_version alert.
+- `(r Router) ServeTLS(addr str, certPEM str, keyPEM str) !`: ServeTLS is Serve over TLS 1.3, as anvil.ServeTLS: the routes are checked first, then the certificate and key.
+- `(q Req) TLSConn() ?tls.Conn`: TLSConn is the TLS connection the request arrived on, or nil over plain TCP: for its ALPN(), CipherSuite() and Group(). After Hijack every byte must go through it (Read, Write, Close), since the descriptor carries records.
 
 ## hearth
 
@@ -290,6 +296,50 @@ let r = try wire.Get("http://127.0.0.1:8080/json")
 - `Do(method str, url str, headers []str, body str) !Resp`: Do sends one request: headers is a list of name, value pairs. The method and header names must be tokens, and the URL and header values must not hold CR, LF, NUL or other control bytes (the URL no spaces either), or Do fails instead of sending a request an input could have split. Response bodies over DefaultMaxBody fail; DoWith sets a timeout and the limit.  Connections are kept alive: after a response that ends cleanly (HTTP/1.1, framed by a length or chunks, no "Connection: close") the connection waits in a per-core pool, by scheme, host and port (and TLS settings), and the next call to that host uses it instead of dialing and, for https, doing a TLS handshake. A kept connection is checked before it is used, dropped after 30 s idle, and at most Options.MaxIdle are kept per host. One the server closed meanwhile is replaced by a new connection without the caller seeing it, for a GET, HEAD, PUT, DELETE, OPTIONS or TRACE; any other method (a POST) fails instead of being sent twice.
 - `DoWith(method str, url str, headers []str, body str, opt Options) !Resp`: DoWith is Do with options: an overall timeout and a response size limit.
 - `(r Resp) Header(name str) str`: Header returns the response header name (any case), or "".
+
+## tls
+
+Package tls is TLS 1.3 (RFC 8446). Clients: tls.Dial connects and handshakes, and Conn reads and writes like wire.Conn; the server's certificate is verified by default against the system's roots (plus Config.RootCAs). A server's NewSessionTicket is kept (per core, for the same name and settings) and offered on the next connection to it, which then resumes without the certificate messages (Conn.Resumed). Servers: anvil.ServeTLS serves HTTPS with this package; LoadServerConfig reads a certificate chain and its key (RSA, ECDSA P-256 or P-384), and Server runs the server side over an accepted wire.Conn. Cipher suites: TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256; key exchange X25519, or P-256 by HelloRetryRequest. No 0-RTT, no renegotiation and no TLS 1.2. Every wait lets the core serve other tasks and honours Config.Timeout during the handshake, SetTimeout afterwards and a request's deadline.
+
+```tin body
+let c = try tls.Dial("example.com:443", tls.Config{ALPN: []str{"http/1.1"}})
+try c.Write("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+```
+
+- `type Conn struct`: Conn is a TLS 1.3 connection over a wire.Conn. After the handshake its memory only changes in place (record buffers made once, keys rewritten by seal.AEAD.Rekey), so a Conn stays valid wherever it lives: a request's pool, or keep()'s long-lived heap for a client that holds connections across requests.
+- `const TLS_AES_128_GCM_SHA256 = 0x1301`: TLS_AES_128_GCM_SHA256 is cipher suite 0x1301 (Conn.CipherSuite).
+- `const TLS_AES_256_GCM_SHA384 = 0x1302`: TLS_AES_256_GCM_SHA384 is cipher suite 0x1302.
+- `const TLS_CHACHA20_POLY1305_SHA256 = 0x1303`: TLS_CHACHA20_POLY1305_SHA256 is cipher suite 0x1303.
+- `type ServerConfig struct`: ServerConfig configures a TLS server: its certificate chain and private key, and the application protocols it speaks.
+- `LoadServerConfig(certPEM str, keyPEM str) !ServerConfig`: LoadServerConfig reads a PEM certificate chain (leaf first) and the leaf's PEM private key and checks that they belong together.
+- `Server(conn wire.Conn, cfg ServerConfig) !Conn`: Server runs the server side of the handshake over an accepted connection. The Conn owns conn from then on: its Close closes conn. Every wait lets the core serve other tasks.
+- `ServerOnFd(fd i64, cfg ServerConfig) !Conn`: ServerOnFd runs the server handshake on a socket another package owns (anvil): the Conn never closes fd. Used with ReadRaw and SealRaw.
+- `(c mut Conn) ReadRaw(p i64, cap i64) (i64, []u8)`: ReadRaw reads what the socket has without waiting, decrypts whole records and copies up to cap bytes of application data to the raw buffer at p. It returns the bytes copied (more than 0; -1 when nothing is available yet; 0 once the peer closed with close_notify or end of input; -2 when the connection is broken) and ciphertext the caller must send next: a KeyUpdate answer, or for -2 the alert to send before closing. It never waits.
+- `(c mut Conn) ClosedRaw() (bool, []u8)`: ClosedRaw reports, without waiting, whether the peer has ended the connection: its close_notify or another alert arrived, the socket reached end of input, or it failed. It decrypts what the socket has, record by record, and stops at the first one of application data, which stays buffered for ReadRaw; a KeyUpdate answer (or the alert to send) is returned for the caller to send. For a stream that asks whether its client went away: a peek at the socket sees only ciphertext.
+- `SealRawSize(n i64) i64`: SealRawSize is the most bytes SealRawTo writes for n bytes of application data.
+- `(c mut Conn) SealRaw(p i64, n i64) ![]u8`: SealRaw encrypts n bytes of application data at the raw address p into records (16 KiB each, a KeyUpdate first when the write key is worn out) for the caller to send.
+- `(c mut Conn) SealRawTo(p i64, n i64, dst i64) !i64`: SealRawTo is SealRaw into raw memory at dst, which holds SealRawSize(n) bytes; it returns the bytes written. Each record is built and sealed in place there, so nothing it allocates grows with n: an event loop seals into a buffer it reuses.
+- `(c mut Conn) CloseNotifyRaw() []u8`: CloseNotifyRaw is the close_notify alert record to send before closing.
+- `(c Conn) PendingRaw() bool`: PendingRaw reports whether the Conn holds input ReadRaw has not returned yet: decrypted data, or bytes of a record read from the socket. An event loop that stopped reading (its output was blocked) calls ReadRaw again when this is true, since the socket will not report that input.
+- `(c mut Conn) ReleaseRaw()`: ReleaseRaw ends a Conn kept in long-lived memory before its owner drops it: it marks it closed and resets the failure text, which a failed Read or Write made in a request's pool, so releasing the Conn never follows a pointer into a pool that is gone. Nothing is sent.
+- `type Config struct`: Config configures a client connection; the zero value verifies the server against the system's roots for the name in the address.
+- `Dial(addr str, cfg Config) !Conn`: Dial connects to "host:port" and runs the handshake. ServerName defaults to host.
+- `Client(conn wire.Conn, cfg Config) !Conn`: Client runs the handshake over an established connection, for protocols that switch to TLS mid-stream (MySQL, PostgreSQL). cfg.ServerName is required unless InsecureSkipVerify is set. The Conn owns conn from then on: its Close closes conn.
+- `(c mut Conn) SetTimeout(ns i64)`: SetTimeout limits every later read and write to ns nanoseconds (0: no limit).
+- `(c mut Conn) SetDeadline(at i64)`: SetDeadline makes every later wait fail once the monotonic clock (tide.Now) passes at (0: no deadline), whatever the per-call timeout: wire uses it for a whole HTTP call.
+- `(c Conn) ALPN() str`: ALPN is the application protocol the server chose ("" when none).
+- `(c Conn) CipherSuite() i64`: CipherSuite is the negotiated cipher suite (TLS_AES_128_GCM_SHA256 and so on).
+- `(c Conn) Group() str`: Group is the key exchange: "X25519", or "P-256" when the server asked for it.
+- `(c Conn) Resumed() bool`: Resumed reports whether the handshake resumed an earlier session with a ticket: the server's certificate was checked on that session, and PeerCertificates is empty.
+- `(c Conn) PeerCertificates() [][]u8`: PeerCertificates is the server's certificate chain as sent (DER, leaf first).
+- `(c Conn) Fd() i64`: Fd is the connection's descriptor (for waiting on it; never read or write it directly).
+- `(c Conn) Buffered() i64`: Buffered is how many decrypted bytes a Read returns without waiting.
+- `(c mut Conn) Read(buf mut []u8, max i64) !i64`: Read appends up to max bytes of application data to buf and returns how many; after the server's close_notify it fails with EOF (wire.IsEOF), and a connection the server drops without close_notify is a fault, not EOF (a truncation would otherwise look complete).
+- `(c mut Conn) ReadNow(buf mut []u8, max i64) !i64`: ReadNow is Read without waiting: it returns 0 when no application data can be had without waiting for the socket (then wait until Fd is readable and call it again). For clients that run their own non-blocking loop; data TLS has already buffered is always returned first.
+- `(c mut Conn) ReadFull(n i64) !str`: ReadFull reads exactly n bytes.
+- `(c mut Conn) WriteBytes(b []u8) !`: WriteBytes sends all of b.
+- `(c mut Conn) Write(s str) !`: Write sends all of s.
+- `(c mut Conn) Close()`: Close sends close_notify and closes the connection; closing twice does nothing.
 
 ## twine
 
@@ -988,6 +1038,7 @@ Package seal has cryptographic hashes (SHA-256, SHA-384, SHA-512, SHA-1), HMAC o
 - `(a AEAD) NonceSize() i64`: NonceSize is the nonce length in bytes (12).
 - `(a AEAD) Overhead() i64`: Overhead is the tag length in bytes (16).
 - `(a AEAD) Seal(nonce []u8, plaintext secret []u8, aad []u8) ![]u8`: Seal encrypts plaintext and authenticates it with aad under a 12-byte nonce, returning the ciphertext followed by the tag. A nonce must never be used twice with one key.
+- `(a AEAD) SealTo(nonce []u8, src i64, n i64, aad []u8, dst i64) !`: SealTo is Seal into raw memory: it encrypts the n bytes at src into dst and writes the 16-byte tag after them (dst may be src, to seal in place). Nothing it allocates grows with n, so a connection that streams can seal into a buffer of its own instead of its request's pool; AES-GCM on the CPU's instructions allocates nothing at all.
 - `(a AEAD) Open(nonce []u8, sealed []u8, aad []u8) ![]u8`: Open checks the tag of sealed (ciphertext then tag) against aad and the nonce and returns the plaintext; it fails, revealing nothing else, when anything was changed.
 - `(a mut AEAD) Rekey(key secret []u8) !`: Rekey replaces a's key with key, of the same algorithm and length, reusing a's memory: an AEAD kept in long-lived memory (a connection's state) can change keys without allocating there.
 - `AESHardware() bool`: AESHardware reports whether AES-GCM runs on the CPU's AES instructions here (AES-NI and PCLMULQDQ, or ARMv8 AES and PMULL); without them it runs a slower constant-time software path and ChaCha20-Poly1305 is the faster choice.

@@ -1,0 +1,49 @@
+// The HTTPS benchmark server (bench/http/run_https.py): anvil.ServeTLS with /plaintext and
+// /big?n=N (up to 1 MiB, byte i is i % 251), the certificate and key in TLS_CERT and TLS_KEY.
+// Its twin is bench/http/gotls (Go's crypto/tls).
+package main
+
+import "anvil"
+import "mint"
+import "quarry"
+import "say"
+
+shared let big = pattern(1 << 20)
+
+fn pattern(n i64) []u8 {
+	let b = make([]u8, n)
+	for i in 0..n {
+		b[i] = u8(i % 251)
+	}
+	return b
+}
+
+fn plaintext(q anvil.Req, w mut anvil.Out) {
+	w.Text("Hello, World!")
+}
+
+fn bigBody(q anvil.Req, w mut anvil.Out) {
+	mut n = mint.Atoi(q.Param("n")) catch _ { len(big) }
+	if n < 0 || n > len(big) {
+		n = len(big)
+	}
+	w.Type("application/octet-stream")
+	w.Body = append(w.Body, big[:n]...)
+}
+
+fn main() {
+	let cert = quarry.ReadFile(quarry.Getenv("TLS_CERT")) catch err {
+		say.Line("cert:", err)
+		return
+	}
+	let key = quarry.ReadFile(quarry.Getenv("TLS_KEY")) catch err {
+		say.Line("key:", err)
+		return
+	}
+	let r = anvil.NewRouter()
+	r.Get("/plaintext", plaintext)
+	r.Get("/big", bigBody)
+	r.ServeTLS(":9190", cert, key) catch err {
+		say.Line("server:", err)
+	}
+}

@@ -51,8 +51,9 @@ Session B's `notes/interface_tls.md` (#304) defines the certificate API the clie
 `NewCertPool`/`AddPEM`/`SystemRoots` and `Certificate.CheckTLSSignature(scheme, signed, sig)`.
 The client calls them from one place, `verify_peer` in `lib/tls/verify.tin`, with the chain as
 received (DER, leaf first), the server name, the SignatureScheme and the CertificateVerify
-content (64 spaces, the context string, a zero byte, the transcript hash). Until that API is on
-main, `verify_peer` refuses every server unless `InsecureSkipVerify` is set.
+content (64 spaces, the context string, a zero byte, the transcript hash). It verifies the chain
+against the system's roots plus `Config.RootCAs` (that pool is cached per core for the last
+RootCAs given), then the CertificateVerify signature; only `InsecureSkipVerify` skips both.
 
 Phase 2's files: `der.tin` (strict DER reader), `bignum.tin` (`monty_new`: Montgomery constants
 computed at run time, so `field.tin`'s `monty` serves RSA moduli), `rsa.tin` (PKCS #1 v1.5 and
@@ -70,6 +71,7 @@ PSS verification), `x509.tin` (PEM, certificates, pools, chains, host names),
 | `messages.tin` | wire-format reader/writer, ClientHello, parsers of the server's messages | the reader/writer |
 | `client.tin` | the client handshake | no |
 | `verify.tin` | the bridge to X.509 | no |
+| `server.tin` | the server handshake, `ServerConfig`, `Server`, and the non-waiting `ReadRaw` / `SealRawTo` / `CloseNotifyRaw` / `PendingRaw` / `ReleaseRaw` for an event loop | (phase 5) |
 
 Decisions:
 - A Conn changes only in place after the handshake (`seal.AEAD.Rekey`, copies into its own
@@ -111,3 +113,20 @@ certificate's key is on the scheme's curve, and 0x0807 Ed25519). Faults start
 with "x509: " and name the reason: expired or not yet valid, the names the certificate is
 valid for, unknown authority, not a CA, bad signature, SHA-1, chain too long, path length,
 key usage, name constraints, unhandled critical extension.
+
+## Phase 5: the server and HTTPS in anvil
+
+- `lib/tls/server.tin` (from draft #336, translated to edition 1): ClientHello parsing (duplicate
+  extensions, compression, pre_shared_key placement checked), X25519 or P-256 with one
+  HelloRetryRequest, the three suites in the server's order (AES-GCM first on AES hardware),
+  ALPN (alert 120 when nothing is in common), the CertificateVerify scheme picked for the key
+  (RSA-PSS SHA-256/384/512, ECDSA P-256/P-384) and signed by `PrivateKey.SignTLS`. A PSK the
+  client offers is ignored: every handshake is full, and the server sends no tickets.
+- `lib/anvil/serve_tls.tin`: `ServeTLS`, `Router.ServeTLS`, `Req.TLSConn`, the handshake task,
+  the ALPN registry (`alpn_offer`, dispatch in `tls_start`) and the hooks anvil.tin calls
+  (docs/RUNTIME.md, "HTTPS: anvil.ServeTLS"). HTTP/2 (#360) plugs in with
+  `alpn_offer("h2", start)` in `tls_protocols`.
+- Records are sealed with `SealRawTo` into the caller's memory; `seal.AEAD.SealTo` seals raw
+  memory in place (no allocation on the CPU's AES-GCM instructions), so streams stay flat.
+- Tests: `tools/ci/tls_server_check.py`; numbers: `bench/http/run_https.py` (docs/PERFORMANCE.md).
+

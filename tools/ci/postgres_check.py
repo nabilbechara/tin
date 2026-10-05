@@ -744,10 +744,10 @@ def main():
             print('-- over TLS 1.3 (sslmode=require)', flush=True)
             shared(exe, tenv, tfake)
             if tfake:
-                # verify-full checks the certificate: refused until X.509 verification lands.
+                # verify-full checks the certificate: the test PKI's is not among the system's roots.
                 srv = Server(exe, dict(tenv, POSTGRES_SSLMODE='verify-full'))
                 try:
-                    expect(srv, '/count', 502, contains=b'certificate verification')
+                    expect(srv, '/count', 502, contains=b'x509: certificate signed by unknown authority')
                 finally:
                     srv.stop()
                 # A client without TLS against a TLS-only server gets the hint.

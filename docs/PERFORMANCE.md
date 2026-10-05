@@ -573,6 +573,31 @@ within 3% on arm64. The same with 12 bytes of padding after `main`
 memory_16 by 1.197 on arm64 and aesgcm by 1.113 on amd64. A ratio of a few percent on one
 benchmark can be code placement.
 
+## HTTPS: anvil.ServeTLS against Go's crypto/tls (Linux)
+
+`bench/http/run_https.py` (a step of `.github/workflows/bench-linux.yml`) serves the same routes
+with `anvil.ServeTLS` (`bench/http/https.tin`) and with Go's net/http on crypto/tls
+(`bench/http/gotls`). Each server gets one core (TIN_CORES=1, GOMAXPROCS=1); wrk `-t2` runs on
+the same runner over TLS 1.3. The figures are medians of five alternating 5-second rounds. Full
+handshakes send `Connection: close` on every request, and neither server issues session tickets.
+[Run 37377650528](https://github.com/yasserreslan/tin/actions/runs/37377650528) used head
+`5efe54a` (#466) on Linux 6.17.0-1022-azure (AMD EPYC 9V74 on amd64, Neoverse-N2 on arm64),
+Go 1.26.8. Only ratios on these shared runners are meaningful.
+
+| scenario | amd64 anvil | amd64 Go | anvil/Go | arm64 anvil | arm64 Go | anvil/Go |
+|---|---:|---:|---:|---:|---:|---:|
+| full handshakes, ECDSA P-256 | 327/s | 2929/s | 0.11 | 480/s | 2679/s | 0.18 |
+| full handshakes, RSA-2048 | 29/s | 599/s | 0.05 | 42/s | 586/s | 0.07 |
+| keep-alive `/plaintext` | 101701 req/s | 59313 req/s | 1.71 | 135577 req/s | 60810 req/s | 2.23 |
+| 1 MiB bodies | 745 MiB/s | 1167 MiB/s | 0.64 | 743 MiB/s | 1587 MiB/s | 0.47 |
+
+Established connections are faster than Go's for small responses, since one batch of
+responses is sealed into records and written at once. Large bodies run at half to two thirds
+of Go's speed. Full handshakes are the gap.
+Their cost is seal's P-256 and RSA arithmetic (32-bit limbs, no fixed-base table), which #474
+replaces. In the same run, plain HTTP/1.1 against main was 1.023 (`/json`) and 1.018
+(`/plaintext`) on amd64 and 0.983 and 1.012 on arm64, and every CPU benchmark stayed within 5%.
+
 ## Long-lived blocks above 4 KiB (Linux)
 
 The ingot heap served only blocks up to 4 KiB from slabs: a bigger kept value had a

@@ -143,7 +143,7 @@ def main():
         expect(ran.stdout == 'area 60000 false\n', f'the program printed {ran.stdout!r}')
         result = run(['sh', tin, 'caps', 'main.tin'], app, env)
         expect(result.returncode == 0 and 'example.com/geo\nexample.com/peek net\nexample.com/units\n' in result.stdout
-               and 'main net\n' in result.stdout and 'wire net\n' in result.stdout, 'tin caps', result)
+               and 'main net\n' in result.stdout and 'wire net files\n' in result.stdout, 'tin caps', result)
 
         # A lock whose caps line disagrees with the vendored manifest is refused.
         (app / 'tin.lock').write_text(after.replace('caps example.com/peek net\n', 'caps example.com/peek\n'))

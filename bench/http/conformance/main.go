@@ -474,7 +474,10 @@ func caseConnectionClose() {
 	}
 	defer c.Close()
 	closed, why := closedSoon(c, r, time.Second)
-	result("http11-connection-close", rs.status == 200 && closed, "status %d, %s", rs.status, why)
+	// The response says it is the last one (RFC 9112 9.6), or a client such as wrk sends its
+	// next request on the connection.
+	conn := rs.headers["connection"]
+	result("http11-connection-close", rs.status == 200 && closed && conn == "close", "status %d, Connection %q, %s", rs.status, conn, why)
 }
 
 func caseHEAD() {

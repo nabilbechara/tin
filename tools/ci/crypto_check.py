@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 import random
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -89,6 +90,7 @@ def aead(cases, file, kind):
             name = f"{file} {t['tcId']}"
             if t['result'] == 'valid':
                 cases.append((f"seal {args} {hx(bytes.fromhex(t['msg']))}", lambda out, want=sealed: out == want, name + ' seal'))
+                cases.append((f"sealto {args} {hx(bytes.fromhex(t['msg']))}", lambda out, want=sealed: out == want, name + ' sealto'))
                 cases.append((f"open {args} {hx(bytes.fromhex(sealed))}", lambda out, want=t['msg']: out == want, name + ' open'))
             else:
                 cases.append((f"open {args} {hx(bytes.fromhex(sealed))}", lambda out: out == 'fault', name + ' open'))
@@ -130,8 +132,12 @@ def main():
     random_cases(cases)
     with tempfile.TemporaryDirectory(prefix='crypto-', dir=out) as tmp:
         exe = Path(tmp) / 'crypto_vectors'
+        # A private lib with seal_to_probe.tin in lib/seal: the fixture checks AEAD.SealTo through it.
+        root = Path(tmp) / 'probe-root'
+        shutil.copytree(ROOT / 'lib', root / 'lib')
+        shutil.copy(ROOT / 'tools/ci/fixtures/seal_to_probe.tin', root / 'lib/seal/probe_seal_to.tin')
         subprocess.run([str(compiler), '-o', str(exe), 'tools/ci/fixtures/crypto_vectors.tin'], check=True, cwd=ROOT,
-                       env=dict(os.environ, TIN_ROOT=str(ROOT)), timeout=120)
+                       env=dict(os.environ, TIN_ROOT=str(root)), timeout=120)
         data = ''.join(line + '\n' for line, _, _ in cases).encode()
         # Once on the CPU's instructions where it has them, once on the software path.
         for path, extra in (('default', {}), ('software', {'TIN_SEAL_SOFT': '1'})):
