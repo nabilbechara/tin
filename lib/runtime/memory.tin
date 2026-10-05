@@ -1,223 +1,389 @@
-// Shared, seed-compatible memory operations and mmap heap; no libc allocation calls.
-
-// Seed-compatible bodies; the backends substitute bounded vector leaves.
-fn mem_avx2_supported() { return 0; }
-fn memcpy(dst, src, n) {
-    let result = dst;
-    if n >= 64 {
-        let chunks=n>>6;
-        mem_copy64(dst,src,chunks);
-        let bytes=chunks<<6;
-        dst=dst+bytes; src=src+bytes; n=n-bytes;
-    }
-    while n >= 8 { dst[0]=src[0]; dst=dst+8; src=src+8; n=n-8; }
-    while n > 0 { store8(dst,load8(src)); dst=dst+1; src=src+1; n=n-1; }
-    return result;
+// Memory operations and the mmap heap shared by every program and by the compiler; no libc allocation calls.
+// The bodies of the bulk operations are the portable versions; the backends substitute bounded vector leaves.
+// The backends replace this body on x86-64; it has two statements so that no compiler, the seeds
+// included, inlines the placeholder.
+fn mem_avx2_supported() i64 {
+	let none = 0
+	return none
 }
 
-fn memmove(dst, src, n) {
-    if dst <= src || dst-src >= n { return memcpy(dst,src,n); }
-    let result=dst;
-    dst=dst+n; src=src+n;
-    while n >= 8 { dst=dst-8; src=src-8; dst[0]=src[0]; n=n-8; }
-    while n > 0 { dst=dst-1; src=src-1; store8(dst,load8(src)); n=n-1; }
-    return result;
+fn memcpy(dst_in i64, src_in i64, n_in i64) i64 {
+	mut dst = dst_in
+	mut src = src_in
+	mut n = n_in
+	let result = dst
+	if n >= 64 {
+		let chunks = n >> 6
+		mem_copy64(dst, src, chunks)
+		let bytes = chunks << 6
+		dst = dst + bytes
+		src = src + bytes
+		n = n - bytes
+	}
+	for n >= 8 {
+		dst[0] = src[0]
+		dst = dst + 8
+		src = src + 8
+		n = n - 8
+	}
+	for n > 0 {
+		store8(dst, i64(load8(src)))
+		dst = dst + 1
+		src = src + 1
+		n = n - 1
+	}
+	return result
 }
 
-fn memset(p, c, n) {
-    let result=p;
-    c=c & 255;
-    let word=c*0x0101010101010101;
-    if n >= 64 {
-        let chunks=n>>6;
-        mem_fill64(p,word,chunks);
-        let bytes=chunks<<6;
-        p=p+bytes; n=n-bytes;
-    }
-    while n >= 8 { p[0]=word; p=p+8; n=n-8; }
-    while n > 0 { store8(p,c); p=p+1; n=n-1; }
-    return result;
+fn memmove(dst_in i64, src_in i64, n_in i64) i64 {
+	mut dst = dst_in
+	mut src = src_in
+	mut n = n_in
+	if dst <= src || dst - src >= n {
+		return memcpy(dst, src, n)
+	}
+	let result = dst
+	dst = dst + n
+	src = src + n
+	for n >= 8 {
+		dst = dst - 8
+		src = src - 8
+		dst[0] = src[0]
+		n = n - 8
+	}
+	for n > 0 {
+		dst = dst - 1
+		src = src - 1
+		store8(dst, i64(load8(src)))
+		n = n - 1
+	}
+	return result
 }
 
-fn memcmp(a, b, n) {
-    while n >= 8 && a[0] == b[0] { a=a+8; b=b+8; n=n-8; }
-    while n > 0 {
-        let d=load8(a)-load8(b);
-        if d { return d; }
-        a=a+1; b=b+1; n=n-1;
-    }
-    return 0;
+fn memset(p_in i64, c_in i64, n_in i64) i64 {
+	mut p = p_in
+	mut c = c_in
+	mut n = n_in
+	let result = p
+	c = c & 255
+	let word = c * 0x0101010101010101
+	if n >= 64 {
+		let chunks = n >> 6
+		mem_fill64(p, word, chunks)
+		let bytes = chunks << 6
+		p = p + bytes
+		n = n - bytes
+	}
+	for n >= 8 {
+		p[0] = word
+		p = p + 8
+		n = n - 8
+	}
+	for n > 0 {
+		store8(p, c)
+		p = p + 1
+		n = n - 1
+	}
+	return result
+}
+
+fn memcmp(a_in i64, b_in i64, n_in i64) i64 {
+	mut a = a_in
+	mut b = b_in
+	mut n = n_in
+	for n >= 8 && a[0] == b[0] {
+		a = a + 8
+		b = b + 8
+		n = n - 8
+	}
+	for n > 0 {
+		let d = i64(load8(a)) - i64(load8(b))
+		if d != 0 {
+			return d
+		}
+		a = a + 1
+		b = b + 1
+		n = n - 1
+	}
+	return 0
 }
 
 // Zero-byte detection handles eight bytes without reading past the supplied length.
-fn memchr(p, c, n) {
-    c=c & 255;
-    let word=c*0x0101010101010101;
-    while n >= 8 {
-        let v=p[0]^word;
-        if ((v-0x0101010101010101) & ~v & 0x8080808080808080) != 0 { break; }
-        p=p+8; n=n-8;
-    }
-    while n > 0 {
-        if load8(p) == c { return p; }
-        p=p+1; n=n-1;
-    }
-    return 0;
+fn memchr(p_in i64, c_in i64, n_in i64) i64 {
+	mut p = p_in
+	mut c = c_in
+	mut n = n_in
+	c = c & 255
+	let word = c * 0x0101010101010101
+	for n >= 8 {
+		let v = p[0] ^ word
+		if ((v - 0x0101010101010101) & ~v & (-9187201950435737472)) != 0 {
+			break
+		}
+		p = p + 8
+		n = n - 8
+	}
+	for n > 0 {
+		if i64(load8(p)) == c {
+			return p
+		}
+		p = p + 1
+		n = n - 1
+	}
+	return 0
 }
 
-fn strlen(p) {
-    let start=p;
-    while (p & 7) != 0 {
-        if load8(p) == 0 { return p-start; }
-        p=p+1;
-    }
-    while 1 {
-        let v=p[0];
-        if ((v-0x0101010101010101) & ~v & 0x8080808080808080) != 0 { break; }
-        p=p+8;
-    }
-    while load8(p) != 0 { p=p+1; }
-    return p-start;
+fn strlen(p_in i64) i64 {
+	mut p = p_in
+	let start = p
+	for (p & 7) != 0 {
+		if i64(load8(p)) == 0 {
+			return p - start
+		}
+		p = p + 1
+	}
+	for {
+		let v = p[0]
+		if ((v - 0x0101010101010101) & ~v & (-9187201950435737472)) != 0 {
+			break
+		}
+		p = p + 8
+	}
+	for i64(load8(p)) != 0 {
+		p = p + 1
+	}
+	return p - start
 }
 
-fn strcmp(a, b) {
-    while load8(a) == load8(b) {
-        if load8(a) == 0 { return 0; }
-        a=a+1; b=b+1;
-    }
-    return load8(a)-load8(b);
+fn strcmp(a_in i64, b_in i64) i64 {
+	mut a = a_in
+	mut b = b_in
+	for i64(load8(a)) == i64(load8(b)) {
+		if i64(load8(a)) == 0 {
+			return 0
+		}
+		a = a + 1
+		b = b + 1
+	}
+	return i64(load8(a)) - i64(load8(b))
 }
 
 // The failure report uses static bytes and stack words, even before a context exists.
-fn mem_oom_digits(n) {
-    if n >= 10 { mem_oom_digits(n/10); }
-    let c='0'+n%10;
-    rt_sys_write(2,&c,1);
+fn mem_oom_digits(n i64) {
+	if n >= 10 {
+		mem_oom_digits(n / 10)
+	}
+	mut c = '0' + n % 10
+	rt_sys_write(2, &c, 1)
 }
 
-fn mem_oom(n) {
-    rt_sys_write(2,"tin: out of memory (",20);
-    mem_oom_digits(n);
-    rt_sys_write(2," bytes)\n",8);
-    rt_sys__exit(2);
-    return 0;
+fn mem_oom(n i64) i64 {
+	rt_sys_write(2, (cast(i64, "tin: out of memory (") + 8), 20)
+	mem_oom_digits(n)
+	rt_sys_write(2, (cast(i64, " bytes)\n") + 8), 8)
+	rt_sys__exit(2)
+	return 0
 }
 
-fn mem_map(n, flags) {
-    mem_failpoint(n);
-    let p=rt_sys_mmap(0,n,3,flags,-1,0);
-    if p == -1 || p == 0 { return mem_oom(n); }
-    return p;
+fn mem_map(n i64, flags i64) i64 {
+	mem_failpoint(n)
+	let p = rt_sys_mmap(0, n, 3, flags, -1, 0)
+	if p == -1 || p == 0 {
+		return mem_oom(n)
+	}
+	return p
 }
 
-fn mem_class(sz) {
-    if sz <= 64 { return ((sz+15)>>4)-1; }
-    let s=64; let k=4;
-    while k < 16 {
-        if sz <= s+(s>>1) { return k; }
-        if sz <= 2*s { return k+1; }
-        s=s*2; k=k+2;
-    }
-    return -1;
+fn mem_class(sz i64) i64 {
+	if sz <= 64 {
+		return ((sz + 15) >> 4) - 1
+	}
+	mut s = 64
+	mut k = 4
+	for k < 16 {
+		if sz <= s + (s >> 1) {
+			return k
+		}
+		if sz <= 2 * s {
+			return k + 1
+		}
+		s = s * 2
+		k = k + 2
+	}
+	return -1
 }
 
-fn mem_class_size(k) {
-    if k < 4 { return 16*(k+1); }
-    let j=k-4;
-    let s=64<<(j>>1);
-    if (j & 1) == 0 { return s+(s>>1); }
-    return s*2;
+fn mem_class_size(k i64) i64 {
+	if k < 4 {
+		return 16 * (k + 1)
+	}
+	let j = k - 4
+	let s = 64 << (j >> 1)
+	if (j & 1) == 0 {
+		return s + (s >> 1)
+	}
+	return s * 2
 }
 
 // Heap words: flags, page size, return lock/head, slab bump/end, 16 local free lists.
-fn mem_heap_new(flags, page) {
-    let p=mem_map(page,flags);
-    p[0]=flags; p[1]=page;
-    return p;
+fn mem_heap_new(flags i64, page i64) i64 {
+	let p = mem_map(page, flags)
+	p[0] = flags
+	p[1] = page
+	return p
 }
 
-fn mem_lock(p) { while __atomic_swap(p,1) != 0 { __yield(); } }
-fn mem_unlock(p) { __atomic_store(p,0); }
+fn mem_lock(p i64) {
+	for __atomic_swap(p, 1) != 0 {
+		__yield()
+	}
+}
 
-fn mem_drain(heap) {
-    if __atomic_load(heap+24) == 0 { return; }
-    mem_lock(heap+16);
-    let p=heap[3]; heap[3]=0;
-    mem_unlock(heap+16);
-    while p != 0 {
-        let next=p[0];
-        let k=mem_class(((p-8)[0] & 140737488355327)+16);
-        p[0]=heap[6+k]; heap[6+k]=p;
-        p=next;
-    }
+fn mem_unlock(p i64) {
+	__atomic_store(p, 0)
+}
+
+fn mem_drain(heap i64) {
+	if __atomic_load(heap + 24) == 0 {
+		return
+	}
+	mem_lock(heap + 16)
+	mut p = heap[3]
+	heap[3] = 0
+	mem_unlock(heap + 16)
+	for p != 0 {
+		let next = p[0]
+		let k = mem_class(((p - 8)[0] & 140737488355327) + 16)
+		p[0] = heap[6 + k]
+		heap[6 + k] = p
+		p = next
+	}
 }
 
 // Every block has [owning heap, size word] before its 16-byte-aligned payload. The size
 // word's bits 0-46 are the requested size; bits 47-62 belong to the long-lived reference
 // count (#176, notes/interface_mem.md), so every reader masks with 2^47-1. A fresh block
 // and a freelist reuse both start with a count of 0.
-fn mem_alloc(heap, n, zero) {
-    mem_failpoint(n);
-    if n < 0 || n > 70368744177664 { return mem_oom(n); }
-    if n == 0 { n=1; }
-    let k=mem_class(n+16);
-    let b=0;
-    if k < 0 {
-        let size=(n+16+heap[1]-1) & -heap[1];
-        b=mem_map(size,heap[0]);
-    } else {
-        mem_drain(heap);
-        let p=heap[6+k];
-        if p != 0 { heap[6+k]=p[0]; (p-8)[0]=n; if zero { memset(p,0,n); } return p; }
-        let bs=mem_class_size(k);
-        if heap[4]+bs > heap[5] {
-            let slab=mem_map(1048576,heap[0]);
-            heap[4]=slab; heap[5]=slab+1048576;
-        }
-        b=heap[4]; heap[4]=b+bs;
-    }
-    b[0]=heap; b[1]=n;
-    return b+16;
+fn mem_alloc(heap i64, n_in i64, zero i64) i64 {
+	mut n = n_in
+	mem_failpoint(n)
+	if n < 0 || n > 70368744177664 {
+		return mem_oom(n)
+	}
+	if n == 0 {
+		n = 1
+	}
+	let k = mem_class(n + 16)
+	mut b = 0
+	if k < 0 {
+		let size = (n + 16 + heap[1] - 1) & -heap[1]
+		b = mem_map(size, heap[0])
+	} else {
+		mem_drain(heap)
+		let p = heap[6 + k]
+		if p != 0 {
+			heap[6 + k] = p[0]
+			(p - 8)[0] = n
+			if zero != 0 {
+				memset(p, 0, n)
+			}
+			return p
+		}
+		let bs = mem_class_size(k)
+		if heap[4] + bs > heap[5] {
+			let slab = mem_map(1048576, heap[0])
+			heap[4] = slab
+			heap[5] = slab + 1048576
+		}
+		b = heap[4]
+		heap[4] = b + bs
+	}
+	b[0] = heap
+	b[1] = n
+	return b + 16
 }
 
-fn mem_free(p, current) {
-    if p == 0 { return; }
-    let b=p-16;
-    let heap=b[0]; let n=b[1] & 140737488355327;
-    let k=mem_class(n+16);
-    if k < 0 { rt_sys_munmap(b,(n+16+heap[1]-1) & -heap[1]); return; }
-    if heap == current { p[0]=heap[6+k]; heap[6+k]=p; return; }
-    mem_lock(heap+16);
-    p[0]=heap[3]; __atomic_store(heap+24,p);
-    mem_unlock(heap+16);
+fn mem_free(p i64, current i64) {
+	if p == 0 {
+		return
+	}
+	let b = p - 16
+	let heap = b[0]
+	let n = b[1] & 140737488355327
+	let k = mem_class(n + 16)
+	if k < 0 {
+		rt_sys_munmap(b, (n + 16 + heap[1] - 1) & -heap[1])
+		return
+	}
+	if heap == current {
+		p[0] = heap[6 + k]
+		heap[6 + k] = p
+		return
+	}
+	mem_lock(heap + 16)
+	p[0] = heap[3]
+	__atomic_store(heap + 24, p)
+	mem_unlock(heap + 16)
 }
 
-fn mem_realloc(heap, p, n) {
-    if p == 0 { return mem_alloc(heap,n,0); }
-    if n == 0 { mem_free(p,heap); return 0; }
-    let old=(p-8)[0] & 140737488355327;
-    // Keep the recorded class stable; growing within it needs no mapping or copy.
-    if n > old && mem_class(old+16) >= 0 && n+16 <= mem_class_size(mem_class(old+16)) {
-        mem_failpoint(n); (p-8)[0]=(p-8)[0]-old+n; return p;
-    }
-    let q=mem_alloc(heap,n,0);
-    let copy=old; if n < copy { copy=n; }
-    memcpy(q,p,copy); mem_free(p,heap);
-    return q;
+fn mem_realloc(heap i64, p i64, n i64) i64 {
+	if p == 0 {
+		return mem_alloc(heap, n, 0)
+	}
+	if n == 0 {
+		mem_free(p, heap)
+		return 0
+	}
+	let old = (p - 8)[0] & 140737488355327
+	// Keep the recorded class stable; growing within it needs no mapping or copy.
+	if n > old && mem_class(old + 16) >= 0 && n + 16 <= mem_class_size(mem_class(old + 16)) {
+		mem_failpoint(n)
+		(p - 8)[0] = (p - 8)[0] - old + n
+		return p
+	}
+	let q = mem_alloc(heap, n, 0)
+	mut copy_ = old
+	if n < copy_ {
+		copy_ = n
+	}
+	memcpy(q, p, copy_)
+	mem_free(p, heap)
+	return q
 }
 
 // Bootstrap fallbacks; both backends emit the leaf routines in tools/arch/memory-*.S.
-fn mem_copy64(dst,src,chunks) {
-    while chunks > 0 {
-        dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2]; dst[3]=src[3];
-        dst[4]=src[4]; dst[5]=src[5]; dst[6]=src[6]; dst[7]=src[7];
-        dst=dst+64; src=src+64; chunks=chunks-1;
-    }
+fn mem_copy64(dst_in i64, src_in i64, chunks_in i64) {
+	mut dst = dst_in
+	mut src = src_in
+	mut chunks = chunks_in
+	for chunks > 0 {
+		dst[0] = src[0]
+		dst[1] = src[1]
+		dst[2] = src[2]
+		dst[3] = src[3]
+		dst[4] = src[4]
+		dst[5] = src[5]
+		dst[6] = src[6]
+		dst[7] = src[7]
+		dst = dst + 64
+		src = src + 64
+		chunks = chunks - 1
+	}
 }
-fn mem_fill64(p,word,chunks) {
-    while chunks > 0 {
-        p[0]=word; p[1]=word; p[2]=word; p[3]=word;
-        p[4]=word; p[5]=word; p[6]=word; p[7]=word;
-        p=p+64; chunks=chunks-1;
-    }
+
+fn mem_fill64(p_in i64, word i64, chunks_in i64) {
+	mut p = p_in
+	mut chunks = chunks_in
+	for chunks > 0 {
+		p[0] = word
+		p[1] = word
+		p[2] = word
+		p[3] = word
+		p[4] = word
+		p[5] = word
+		p[6] = word
+		p[7] = word
+		p = p + 64
+		chunks = chunks - 1
+	}
 }

@@ -488,8 +488,25 @@ fn il_inlinable(f i64) i64 {
 	if r[N_KIND] != ST_RETURN || r[RET_VALUE] == 0 || r[RET_VALUES] != 0 {
 		return 0
 	}
+	if il_substituted(f) != 0 {
+		return 0
+	}
 	il_callee = f
 	return i64(il_size(r[RET_VALUE]) <= 40)
+}
+
+// il_substituted reports a function whose body the back end replaces by hand-written code (linux_raw,
+// the vector and syscall leaves, the AES and SHA-256 leaves, the task switch): its source body is only
+// a placeholder, so inlining it would run the placeholder.
+fn il_substituted(f i64) i64 {
+	let n = f[F_QNAME]
+	if streq(n, cstr("linux_raw")) != 0 || streq(n, cstr("linux_restorer")) != 0 || streq(n, cstr("mem_avx2_supported")) != 0 || streq(n, cstr("mem_copy64")) != 0 || streq(n, cstr("mem_fill64")) != 0 || streq(n, cstr("rt_task_swap")) != 0 || streq(n, cstr("seal.hw_blocks")) != 0 {
+		return 1
+	}
+	if streq(n, cstr("memcpy")) != 0 || streq(n, cstr("memmove")) != 0 || streq(n, cstr("memset")) != 0 || streq(n, cstr("memcmp")) != 0 || streq(n, cstr("memchr")) != 0 {
+		return 1
+	}
+	return i64(syscall_fast_arm64(n) != 0 || syscall_fast_amd64(n) != 0 || aes_hw_arm64(n) != 0 || aes_hw_amd64(n) != 0)
 }
 
 // il_size counts nodes, or returns a huge number for anything that cannot be copied.

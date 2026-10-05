@@ -27,7 +27,7 @@ def main():
     args = parser.parse_args()
     source = ROOT / 'lib/runtime/number.tin'
     text = source.read_text()
-    pattern = r'(fn num_power\(exp\) \{\n    let p = ")[^"\n]*(";)'
+    pattern = r'(fn num_power\(exp i64\) i64 \{\n\tlet p = \(cast\(i64, ")[^"\n]*("\) \+ 8\))'
     match = re.search(pattern, text)
     if not match:
         raise ValueError('packed power table not found')
