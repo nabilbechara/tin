@@ -2003,3 +2003,203 @@ fn rc_append_into(v i64, target IdentExpr) i64 {
 	let a0 = vec_get(cast(Call, v).args, 0)
 	return i64(cast(Node, a0).kind == EX_IDENT && cast(IdentExpr, a0).ref == target.ref)
 }
+
+// ---- globals set on core 0 only (#343) ----
+//
+// Globals are per core and main runs on core 0, so a global that main (or a function main calls)
+// assigns holds the new value on core 0 alone: the handlers of the other cores read their own
+// copy, still the initializer's. In a program that starts cores (anvil.Serve, hearth.Run) that is
+// an error. A global that only main's own code reads is fine: nothing else looks at it.
+//
+// cg_seen are the user functions main reaches by direct calls (a function used as a value, such
+// as a handler, is not among them: it may run on any core). cg_stores are the [global, position]
+// stores they make, cg_refs the per-core globals every other reachable function names.
+shared mut cg_seen i64
+shared mut cg_stores i64
+shared mut cg_refs i64
+shared mut cg_in_main i64 // 1 while walking main's tree (record stores, follow calls), 0 while collecting names
+
+fn core_global_check() {
+	let run = find_fn(cstr("hearth.Run"))
+	let m = find_fn(cstr("main"))
+	if run == 0 || run[F_REACH] == 0 || m == 0 || m[F_BODY] == 0 {
+		return
+	}
+	cg_seen = vec_new()
+	cg_stores = vec_new()
+	cg_refs = vec_new()
+	cg_in_main = 1
+	cg_visit(m)
+	if cg_stores[VEC_LEN] == 0 {
+		return
+	}
+	cg_in_main = 0
+	mut i = 0
+	for i < prog_fns[VEC_LEN] {
+		let f = vec_get(prog_fns, i)
+		if f[F_REACH] != 0 && f[F_EXTERN] == 0 && f[F_BODY] != 0 && f[F_GENERATED] == 0 && vec_has(cg_seen, f) == 0 {
+			cg_stmts(f[F_BODY][BLK_STMTS])
+		}
+		i = i + 1
+	}
+	i = 0
+	for i < cg_stores[VEC_LEN] {
+		let g = vec_get(cg_stores, i)
+		if vec_has(cg_refs, g) != 0 {
+			err_code_quoted(vec_get(cg_stores, i + 1), cstr("E131 CORE_GLOBAL"), cstr("global "), g[S_NAME], cstr(" is assigned here, in code that runs on core 0 only (main and what it calls): the other cores keep the initializer's value. Assign it in its initializer, in `on core.start` or in `once`"))
+		}
+		i = i + 2
+	}
+}
+
+// cg_visit walks f (main, or a user function reached from it) once. Library functions are
+// trusted code: their own per-core state is theirs to manage, so they are not entered.
+fn cg_visit(f i64) {
+	if f == 0 || f[F_EXTERN] != 0 || f[F_BODY] == 0 || f[F_GENERATED] != 0 || vec_has(cg_seen, f) != 0 || vec_get(file_trusted, f[F_FILE]) != 0 {
+		return
+	}
+	vec_push(cg_seen, f)
+	cg_stmts(f[F_BODY][BLK_STMTS])
+}
+
+// cg_root is the per-core global a store into e lands in (the ident itself, or the base of a
+// field, element or index chain), or 0.
+fn cg_root(e i64) i64 {
+	for e != 0 {
+		let k = e[N_KIND]
+		if k == EX_IDENT {
+			let s = e[ID_REF]
+			if s != 0 && s[S_KIND] == SYM_GLOBAL && s[S_TLS] != 0 {
+				return s
+			}
+			return 0
+		}
+		if k == EX_MEM {
+			e = e[MEM_BASE]
+		} else if k == EX_ELEM {
+			e = e[ELEM_SEQ]
+		} else if k == EX_INDEX {
+			e = e[IX_X]
+		} else if k == EX_CONV {
+			e = e[CV_X]
+		} else {
+			return 0
+		}
+	}
+	return 0
+}
+
+fn cg_store(target i64, pos i64) {
+	let g = cg_root(target)
+	if g != 0 {
+		vec_push(cg_stores, g)
+		vec_push(cg_stores, pos)
+	}
+}
+
+fn cg_stmts(v i64) {
+	mut i = 0
+	for i < v[VEC_LEN] {
+		cg_stmt(vec_get(v, i))
+		i = i + 1
+	}
+}
+
+fn cg_stmt(s i64) {
+	if s == 0 {
+		return
+	}
+	let k = s[N_KIND]
+	if k == ST_BLOCK {
+		cg_stmts(s[BLK_STMTS])
+	} else if k == ST_LET {
+		cg_expr(s[LET_INIT])
+	} else if k == ST_ASSIGN {
+		if cg_in_main != 0 {
+			cg_store(s[AS_TARGET], s[N_POS])
+		}
+		cg_expr(s[AS_TARGET])
+		cg_expr(s[AS_VALUE])
+	} else if k == ST_EXPR {
+		cg_expr(s[ES_X])
+	} else if k == ST_IF {
+		cg_expr(s[IF_COND])
+		cg_stmt(s[IF_THEN])
+		cg_stmt(s[IF_ELSE])
+	} else if k == ST_WHILE {
+		cg_expr(s[WH_COND])
+		cg_stmt(s[WH_BODY])
+		cg_stmt(s[WH_POST])
+	} else if k == ST_RETURN {
+		cg_expr(s[RET_VALUE])
+		if s[RET_VALUES] != 0 {
+			cg_exprs(s[RET_VALUES])
+		}
+	} else if k == ST_CALLMULTI {
+		if cg_in_main != 0 {
+			let syms = s[CM_SYMS]
+			mut i = 0
+			for i < syms[VEC_LEN] {
+				let t = vec_get(syms, i)
+				if t != 0 && t[S_KIND] == SYM_GLOBAL && t[S_TLS] != 0 {
+					vec_push(cg_stores, t)
+					vec_push(cg_stores, s[N_POS])
+				}
+				i = i + 1
+			}
+		}
+		cg_expr(s[CM_CALL])
+	}
+}
+
+fn cg_exprs(v i64) {
+	mut i = 0
+	for i < v[VEC_LEN] {
+		cg_expr(vec_get(v, i))
+		i = i + 1
+	}
+}
+
+fn cg_expr(e i64) {
+	if e == 0 {
+		return
+	}
+	let k = e[N_KIND]
+	if k == EX_CALL {
+		if cg_in_main != 0 {
+			// A runtime call that stores into its first argument (a map insert, an in-place
+			// append) writes the global that argument names.
+			if e[CALL_STORE] != 0 && e[CALL_ARGS] != 0 && e[CALL_ARGS][VEC_LEN] > 0 {
+				cg_store(vec_get(e[CALL_ARGS], 0), e[N_POS])
+			}
+			cg_visit(e[CALL_FN])
+		}
+		cg_expr(e[CALL_CALLEE])
+		cg_exprs(e[CALL_ARGS])
+	} else if k == EX_IDENT {
+		let s = e[ID_REF]
+		if cg_in_main == 0 && s != 0 && s[S_KIND] == SYM_GLOBAL && s[S_TLS] != 0 && vec_has(cg_refs, s) == 0 {
+			vec_push(cg_refs, s)
+		}
+	} else if k == EX_UNARY {
+		cg_expr(e[UN_X])
+	} else if k == EX_BINARY {
+		cg_expr(e[BIN_L])
+		cg_expr(e[BIN_R])
+	} else if k == EX_INDEX {
+		cg_expr(e[IX_X])
+		cg_expr(e[IX_I])
+	} else if k == EX_CONV {
+		cg_expr(e[CV_X])
+	} else if k == EX_SEQ {
+		cg_stmts(e[SEQ_STMTS])
+		cg_expr(e[SEQ_VALUE])
+	} else if k == EX_MEM {
+		cg_expr(e[MEM_BASE])
+		cg_expr(e[MEM_INDEX])
+		cg_expr(e[MEM_LEN])
+	} else if k == EX_ELEM {
+		cg_expr(e[ELEM_SEQ])
+		cg_expr(e[ELEM_IDX])
+	}
+}

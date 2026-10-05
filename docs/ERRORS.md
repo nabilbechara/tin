@@ -907,6 +907,39 @@ example.tin:5:17: error E130 INIT_ORDER: the initializer of 'total' uses 'base' 
 
 Fix: move the declaration that is used above the one that uses it.
 
+### E131 CORE_GLOBAL
+
+Globals are per core, and `main` runs on core 0 only. In a program that starts cores
+(`anvil` `Serve`, `hearth.Run`), a global that `main` or a function it calls assigns holds the
+new value on core 0 alone: the other cores read their own copy, still the initializer's. It
+works with one core and answers wrongly with more, so it is refused. A global that only
+`main`'s own code reads is fine, and so is one a handler assigns (its own core's copy).
+
+```tin edition=1
+package main
+
+import "hearth"
+import "say"
+
+mut table []str
+
+fn work(id i64) {
+	say.Line(id, len(table))
+}
+
+fn main() {
+	table = keep(make([]str, 3))
+	hearth.Run(2, work)
+}
+```
+
+```text
+example.tin:13:2: error E131 CORE_GLOBAL: global 'table' is assigned here, in code that runs on core 0 only (main and what it calls): the other cores keep the initializer's value. Assign it in its initializer, in `on core.start` or in `once`
+```
+
+Fix: assign the global where every core runs: in its initializer, in an `on core.start`
+handler, or in a `once` block of code the cores run (`examples/percore.tin`).
+
 ### E140 RECEIVER
 
 A method belongs to a struct (or enum) type declared in the same package.

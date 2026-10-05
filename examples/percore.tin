@@ -1,0 +1,39 @@
+package main
+
+import "anvil"
+import "hearth"
+import "quarry"
+import "say"
+import "twine"
+
+// Data every core needs: a file of names, read and indexed by each core.
+//   GET /count    how many names this core holds, how many its index has, and which core answered
+//
+// Globals are per core, and main runs on core 0 only: a global that main assigns would reach
+// core 0 and leave every other core with the initializer's value, which works with one core and
+// answers wrongly with more (the compiler refuses it, E131). Build per-core data where every
+// core runs: in the global's initializer, in `on core.start` (before the core serves its first
+// request, a fault there ends startup), or in `once` the first time a core reaches it.
+//
+// ROWS_FILE names the file, one name per line; PORT the port.
+mut rows []str = make([]str, 0, 0)
+mut index map[str]i64 = make(map[str]i64)
+
+on core.start {
+	let text = try quarry.ReadFile(quarry.Getenv("ROWS_FILE"))
+	rows = keep(twine.Split(text, "\n"))
+	for i, name in rows {
+		index[name] = i
+	}
+}
+
+fn count(q anvil.Req, w mut anvil.Out) {
+	w.Text("{len(rows)} {len(index)} core {hearth.ID()}")
+}
+
+fn main() {
+	let r = anvil.NewRouter()
+	r.Get("/count", count)
+	let err = r.Serve(":" + quarry.Getenv("PORT"))
+	say.Line("server:", err)
+}

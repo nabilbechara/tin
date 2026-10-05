@@ -626,6 +626,33 @@ run once on every core. Values stored into globals live in the long-lived heap
 (`mut hits i64`). A global's initializer may fail only through `try`, which aborts
 startup.
 
+Globals are per core, and `main` runs on core 0 only: a global that `main` (or a function it
+calls) assigns holds the new value on core 0 alone, while the handlers of the other cores read
+their own copy, still the initializer's. With one core that goes unnoticed; with several it
+answers wrongly. In a program that starts cores (`anvil.Serve`, `hearth.Run`) it is a compile
+error (E131). A global that only `main`'s own code reads may be assigned there.
+
+```tin error=E131
+import "anvil"
+import "say"
+
+mut table []str
+
+fn h(q anvil.Req, w mut anvil.Out) {
+	w.Text("{len(table)}")
+}
+
+fn main() {
+	table = keep(make([]str, 3))      // E131: only core 0 would have it
+	say.Line(anvil.Serve(":8080", h))
+}
+```
+
+Assign it where every core runs: in the initializer (`let table = load()`), in `on core.start`
+(before the core serves; section "`use`, `on`, `once`") or in `once`. Data built from work done
+once in `on app.start`, such as a file, is read and parsed by each core in `on core.start`
+(`examples/percore.tin`).
+
 An initializer may use imported packages and the globals declared before it. Using a
 later global of its package (or itself), directly or through a function it calls or refers
 to, is a compile error: that global's initializer has not run yet.

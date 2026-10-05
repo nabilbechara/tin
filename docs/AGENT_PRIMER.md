@@ -79,6 +79,9 @@ the compiler: write a minimal repro to notes/compiler_bugs_NAME.md and work arou
   two-word object/table value and one indirect method call; conversion allocates nothing.
 - No threads and no shared mutable globals: every global is per core (each core thread has its own
   copy, initialized on every core). Concurrency is thread-per-core via hearth; messages via relay.
+  `main` runs on core 0 only, so assigning a global in `main` (or in a function it calls) in a program
+  that starts cores (`anvil.Serve`, `hearth.Run`) is a compile error (E131): assign it in its
+  initializer, in `on core.start` or in `once` (examples/percore.tin).
   Clients a handler uses are package-level `use` resources (per core, opened at core start, closed at
   stop): `use cache = redis.Open(redis.Options{Addr: quarry.Getenv("REDIS_ADDR")})`.
 - Tasks: `scope s { ... s.spawn(fn() ! { ... }) ... }` waits for every child (spawned in a loop,

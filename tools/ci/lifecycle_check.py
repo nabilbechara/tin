@@ -253,6 +253,39 @@ def client_addr(out):
           'RFC 5952 IPv6, mapped IPv4, malformed entries and a bad network refused (#355)')
 
 
+def per_core_data(out):
+    # #343: a global every core needs is built where every core runs. examples/percore.tin reads a
+    # file in on core.start; with 2 and 4 cores every core answers with the same table, and the
+    # requests on fresh connections reach every core.
+    exe = out / 'percore'
+    subprocess.run([str(ROOT / 'bin/tinc'), '-o', str(exe), 'examples/percore.tin'],
+                   cwd=ROOT, env=dict(os.environ, TIN_ROOT=str(ROOT)), check=True)
+    rows = out / 'rows.txt'
+    rows.write_text('\n'.join('name%d' % i for i in range(1000)))
+    for cores in (2, 4):
+        port = ws.free_port()
+        server = subprocess.Popen([str(exe)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                  env=dict(os.environ, PORT=str(port), TIN_CORES=str(cores), ROWS_FILE=str(rows)))
+        counts, seen = set(), set()
+        try:
+            eventually(lambda: server_ready(port, server))
+            for _ in range(8 * cores):
+                s = socket.create_connection(('127.0.0.1', port), timeout=10)
+                s.sendall(b'GET /count HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n')
+                status, _, body = answer(s)
+                s.close()
+                assert status == 200, (status, body)
+                table, _, core = body.decode().partition(' core ')
+                counts.add(table)
+                seen.add(int(core))
+        finally:
+            server.terminate()
+            server.wait(timeout=15)
+        assert counts == {'1000 1000'}, ('every core holds the table', cores, sorted(counts))
+        assert seen == set(range(cores)), ('the requests reach every core', cores, sorted(seen))
+    print('per-core data: examples/percore.tin builds its table in on core.start; 2 and 4 cores all answer 1000 1000 (#343)')
+
+
 def main():
     out = ROOT / 'bin/ci/lifecycle'
     out.mkdir(parents=True, exist_ok=True)
@@ -266,6 +299,7 @@ def main():
     admission(out)
     serve_in_say(out)
     client_addr(out)
+    per_core_data(out)
 
 
 if __name__ == '__main__':
