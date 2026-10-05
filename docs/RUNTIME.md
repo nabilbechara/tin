@@ -309,6 +309,19 @@ close-after-write flag, writing flag, bytes needed. Idle connections hold no buf
   client never takes a cut-off stream for a complete one. `w.Closed()` peeks at the socket to
   see a client that left between two writes.
 
+**The monitor thread** (#341). A handler that never waits holds its core until it ends, and core 0
+reads SIGTERM from its event loop, so a spinning handler on core 0 once made the process ignore
+SIGTERM for as long as it ran. `Serve` therefore starts one thread that is never a request core
+(`lib/anvil/monitor.tin`). Every 50 ms it (a) reads each core's heartbeat, a counter the core's loop
+bumps at every turn (at least once a second, idle or not), and publishes how long a loop has not
+turned once that passes 1.5 s: `anvil.StuckCores()` and `anvil.StuckFor()`; (b) ends the process
+with status 0 when a shutdown (SIGTERM, SIGINT, `anvil.Drain`) was asked for and the cores have
+not finished it two seconds after the grace period (core 0 does that itself when it is healthy);
+(c) on Linux, where the signal is a descriptor, does the same when the signal has waited unread
+for 300 ms, which is what happens when core 0 is the held one. Not done: safepoints on by
+default (a spinning handler still holds its core until it ends, for the deadline to cancel it
+needs `-polls`).
+
 **Backpressure.** If the socket does not take everything, the remainder is kept in the
 connection, reading is disabled, and write readiness is awaited; when the output drains,
 reading resumes and buffered input is served.

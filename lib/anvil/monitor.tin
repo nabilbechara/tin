@@ -1,0 +1,123 @@
+// The monitor thread (#341): a thread that is never a request core. A core runs a handler to
+// its end unless the handler waits, so one that spins holds its core, and core 0 reads SIGTERM
+// from its event loop. The monitor
+//
+//   - ends the process when a shutdown has been asked for and the cores have not finished it
+//     two seconds after the grace period (core 0 does that itself when it is healthy), and
+//     starts that clock itself when SIGTERM or SIGINT has waited unread for 300 ms (core 0 is
+//     busy: Linux, where the signal is a descriptor it can look at);
+//   - watches each core's heartbeat, which its event loop bumps every turn (at least once a
+//     second, even when idle), and publishes for how long a core's loop has not turned
+//     (StuckCores, StuckFor).
+package anvil
+
+shared mut gBeats i64   // [core*16]: the loop's turn counter, bumped by the core alone
+shared mut gStuckMs i64 // [core*16]: how long the monitor has seen it unchanged, 0 below stuckMin
+shared mut gHardAt i64  // monotonic ns: end the process then if it is still running (0: no shutdown)
+
+// A loop that turns at least once a second is not stuck; one that does not for stuckMin ms is.
+const stuckMin = 1500
+const unreadSignalMs = 300
+
+// monitor_start allocates the heartbeat tables and starts the monitor thread.
+fn monitor_start(n i64) {
+	gBeats = rt_aligned_alloc(n * 128)
+	gStuckMs = rt_aligned_alloc(n * 128)
+	if !rt_thread_start(cast(i64, monitor_main), 0) {
+		rt_panic("cannot start the anvil monitor thread")
+	}
+}
+
+// beat is called by a core at every turn of its event loop.
+fn beat() {
+	let p = gBeats + myID*128
+	p[0] = p[0] + 1
+}
+
+// arm_hard_stop notes that the process must be gone at ns (the earliest wish wins).
+fn arm_hard_stop(ns i64) {
+	let cur = __atomic_load(&gHardAt)
+	if cur == 0 || ns < cur {
+		__atomic_store(&gHardAt, ns)
+	}
+}
+
+// monitor_main has no safepoint polls (@nopoll): this thread is not a core, and until it sets its
+// own context below, a poll would read through a null context.
+@nopoll fn monitor_main(arg i64) i64 {
+	__set_ctx(rt_aligned_alloc((ctxWords + rtTLS)*8))
+	rt_sig_block_term()
+	let ts = calloc(2, 8)
+	ts[1] = 50000000
+	let seen = calloc(2*gCores, 8) // per core: the last beat seen, and when it changed
+	let pfd = calloc(1, 8)
+	mut unreadSince = i64(0)
+	for {
+		rt_sys_nanosleep(ts, 0)
+		let now = rt_mono_ns()
+		for i in 0..gCores {
+			let b = (gBeats + i*128)[0]
+			if b != seen[2*i] || seen[2*i+1] == 0 {
+				seen[2*i] = b
+				seen[2*i+1] = now
+			}
+			mut ms = (now - seen[2*i+1]) / 1000000
+			if ms < stuckMin {
+				ms = 0
+			}
+			(gStuckMs + i*128)[0] = ms
+		}
+		// SIGTERM or SIGINT that core 0 has not read for a while: core 0 is busy.
+		if rtWatchSignal > 0 && __atomic_load(&gStop) == 0 {
+			__st(pfd, rtWatchSignal, 2)
+			__st(pfd+4, 1, 1)
+			if rt_sys_poll(pfd, 1, 0)&0xffffffff == 1 {
+				if unreadSince == 0 {
+					unreadSince = now
+				} else if now-unreadSince >= unreadSignalMs*1000000 {
+					arm_hard_stop(now + gGrace*1000000000 + 2000000000)
+				}
+			} else {
+				unreadSince = 0
+			}
+		}
+		let at = __atomic_load(&gHardAt)
+		if at != 0 && now >= at {
+			rt_flush_core()
+			rt_sys_exit(0)
+		}
+	}
+	return 0
+}
+
+// StuckCores is how many cores have not turned their event loop for 1.5 seconds: each is
+// running something that does not wait (a handler stuck in a loop, say). 0 while no
+// server runs.
+fn StuckCores() i64 {
+	mut n = 0
+	if gStuckMs == 0 {
+		return 0
+	}
+	for i in 0..gCores {
+		if (gStuckMs + i*128)[0] > 0 {
+			n += 1
+		}
+	}
+	return n
+}
+
+// StuckFor is how long, in milliseconds, the most stuck core's event loop has not turned (0:
+// every core turns). A service can export it and alert before a stuck core is an outage.
+fn StuckFor() i64 {
+	mut most = 0
+	if gStuckMs == 0 {
+		return 0
+	}
+	for i in 0..gCores {
+		let ms = (gStuckMs + i*128)[0]
+		if ms > most {
+			most = ms
+		}
+	}
+	return most
+}

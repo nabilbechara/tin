@@ -205,6 +205,8 @@ q.ClientIP() is the connection's peer unless the peer is one of the TrustedProxi
 - `(r Router) ServeN(addr str, n i64) !`: ServeN is Serve on exactly n cores.
 - `(r Router) Run(method str, target str, body str) Out`: Run sends one request through r on this thread, as Serve would (middleware, 404, 405), and returns the response: for tests. target is the path and query ("/users/7?full=1"), the request has no headers, and a HEAD response keeps its body. Run panics if r has an error (see Check).
 - `(r Router) Match(method str, path str) str`: Match returns the pattern of the route that would serve method and path ("/users/{id}"), or "" when the request would get 404 or 405. Like Run, it panics if r has an error (see Check).
+- `StuckCores() i64`: StuckCores is how many cores have not turned their event loop for 1.5 seconds: each is running something that does not wait (a handler stuck in a loop, say). 0 while no server runs.
+- `StuckFor() i64`: StuckFor is how long, in milliseconds, the most stuck core's event loop has not turned (0: every core turns). A service can export it and alert before a stuck core is an outage.
 
 ## hearth
 

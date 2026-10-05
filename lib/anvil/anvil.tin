@@ -367,6 +367,7 @@ fn serve_on(addr str, n i64) ! {
 	// SIGTERM and SIGINT are blocked in every thread (cores inherit this mask) and taken by
 	// core 0's event loop instead: a handler could run on any thread and no Tin code may.
 	rt_sig_block_term()
+	monitor_start(n) // after the mask is set: the monitor thread inherits it (#341)
 	record_setup(n) // TIN_REPLAY_DIR: requests are recorded for replay (#241)
 	hearth.Run(n, core)
 }
@@ -464,6 +465,7 @@ fn core(id i64) {
 			relay.Arm()
 		}
 		let n = ev_wait(wait_ms())
+		beat()
 		loopNow = rt_mono_ns()
 		if loopNow >= nextSweep {
 			sweep()
@@ -561,6 +563,7 @@ fn on_signal() {
 	}
 	gStop = 1
 	deadline = rt_mono_ns() + gGrace*1000000000
+	arm_hard_stop(deadline + 2000000000)
 	if rtWatchDrainAt == 0 || deadline < rtWatchDrainAt { rtWatchDrainAt = deadline }
 	word[3] = -1
 	for j in 1..gCores {
@@ -608,6 +611,7 @@ fn drain_asked() {
 	}
 	gStop = 1
 	deadline = rt_mono_ns() + __atomic_load(&gDrainNs)
+	arm_hard_stop(deadline + 2000000000)
 	if rtWatchDrainAt == 0 || deadline < rtWatchDrainAt { rtWatchDrainAt = deadline }
 	word[3] = -1
 	for j in 1..gCores {
