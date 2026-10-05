@@ -113,6 +113,12 @@ const I_FCVTSD = 108 // a=dd b=dn: s(a) = single(d(b))
 const I_FCVTDS = 109 // a=dd b=dn: d(a) = double(s(b))
 const I_FMOVWS = 110 // a=xd b=dn: w(a) = bits of s(b)
 const I_CINC = 111 // a=rd b=rn c=cond: rd = cond ? rn + 1 : rn
+const I_ADDS = 112 // a=rd b=rn c=rm d=shift: add, setting the flags (overflow checks, #362)
+const I_SUBS = 113 // a=rd b=rn c=rm d=shift: sub, setting the flags (rd or rn may be ZR)
+const I_ADDSI = 114 // a=rd b=rn c=imm12: adds
+const I_SUBSI = 115 // a=rd b=rn c=imm12: subs
+const I_SMULH = 116 // a=rd b=rn c=rm: the high 64 bits of the signed 128-bit product
+const I_UMULH = 117 // a=rd b=rn c=rm: the high 64 bits of the unsigned product
 const MK_SIGNED = 4
 const MK_FLOAT = 8
 const MK_SCALED = 16
@@ -135,6 +141,9 @@ const C_NE = 1
 const C_HS = 2
 const C_LO = 3
 const C_MI = 4
+const C_PL = 5
+const C_VS = 6 // signed overflow
+const C_VC = 7
 const C_HI = 8
 const C_LS = 9
 const C_GE = 10
@@ -619,6 +628,24 @@ fn print_ins(b []u8, ins i64) {
 		pr_reg(b, cast(i64, x))
 		buf_str(b, cstr(", "))
 		pr_wreg(b, y)
+	} else if op == I_ADDS || op == I_SUBS {
+		if op == I_ADDS {
+			pr_regs(b, cstr("adds"), cast(i64, x), y, z)
+		} else {
+			pr_regs(b, cstr("subs"), cast(i64, x), y, z)
+		}
+		pr_shift(b, w)
+	} else if op == I_ADDSI || op == I_SUBSI {
+		if op == I_ADDSI {
+			pr_regs(b, cstr("adds"), cast(i64, x), y, -1)
+		} else {
+			pr_regs(b, cstr("subs"), cast(i64, x), y, -1)
+		}
+		pr_imm(b, z)
+	} else if op == I_SMULH {
+		pr_regs(b, cstr("smulh"), cast(i64, x), y, z)
+	} else if op == I_UMULH {
+		pr_regs(b, cstr("umulh"), cast(i64, x), y, z)
 	} else if op == I_UDIV {
 		pr_regs(b, cstr("udiv"), cast(i64, x), y, z)
 	} else if op == I_LSRV {
@@ -852,6 +879,24 @@ fn encode(ins i64, pc i64) i64 {
 	}
 	if op == I_CINC {
 		return enc_rrr(0x9A800400, x, y, y) | ((z ^ 1) << 12)
+	}
+	if op == I_ADDS {
+		return enc_shift(0xAB000000, x, y, z, w)
+	}
+	if op == I_SUBS {
+		return enc_shift(0xEB000000, x, y, z, w)
+	}
+	if op == I_ADDSI {
+		return 0xB1000000 | (z << 10) | (rn(y) << 5) | rn(x)
+	}
+	if op == I_SUBSI {
+		return 0xF1000000 | (z << 10) | (rn(y) << 5) | rn(x)
+	}
+	if op == I_SMULH {
+		return enc_rrr(0x9B407C00, x, y, z)
+	}
+	if op == I_UMULH {
+		return enc_rrr(0x9BC07C00, x, y, z)
 	}
 	if op == I_PRFM {
 		return enc_rrr(0xF8A07800, x, y, z)

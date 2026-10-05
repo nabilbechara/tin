@@ -1,0 +1,136 @@
+package main
+
+// The wrapping forms and @wrap (#362): +% -% *% and their assignments wrap one operation, a
+// @wrap function (with its closures, generic instances and methods) keeps the machine's
+// arithmetic, loop counters that cannot pass their bound are not checked, and a counter
+// that can (a step past the end of the range) panics instead of wrapping.
+
+import "fault"
+import "say"
+
+// fnv is FNV-1a: a hash computed modulo 2^64 with one wrapping operator.
+fn fnv(s str) u64 {
+	mut h = u64(14695981039346656037)
+	for i in 0..len(s) {
+		h ^= u64(s[i])
+		h *%= 1099511628211
+	}
+	return h
+}
+
+// mix is splitmix64, written as a @wrap kernel.
+@wrap fn mix(z0 u64) u64 {
+	mut z = z0 + 0x9e3779b97f4a7c15
+	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
+	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+	return z ^ (z >> 31)
+}
+
+// machine shows a @wrap function's arithmetic: wrapping sums, the most negative value / -1,
+// and shift counts taken modulo 64.
+@wrap fn machine(a i64, n i64) str {
+	let f = fn(x i64) i64 {
+		return x + 1
+	}
+	return say.Fmt("%d %d %d %d %d", a + 1, f(a), (a + 1) / -1, i64(1) << n, -(a + 1))
+}
+
+// twice is a generic @wrap function: every instance wraps.
+@wrap fn twice[T u8 | i32 | u64](x T) T {
+	return x + x
+}
+
+type Counter struct {
+	n u8
+}
+
+// bump is a @wrap method.
+@wrap fn (c mut Counter) bump() {
+	c.n += 1
+}
+
+fn show(name str, f fn() str) {
+	let v = guard {
+		f()
+	} catch err {
+		if fault.Is(err, fault.Panic) {
+			say.Line(name, "panic")
+		} else {
+			say.Line(name, "fault", err)
+		}
+		return
+	}
+	say.Line(name, "=", v)
+}
+
+fn main() {
+	say.Line("fnv", fnv(""), fnv("a"), fnv("hello"))
+	say.Line("mix", mix(0), mix(1), mix(18446744073709551615))
+	say.Line("machine", machine(9223372036854775807, 65))
+	say.Line("twice", twice(u8(200)), twice(i32(2147483647)), twice(u64(18446744073709551615)))
+	let c = Counter{n: 255}
+	c.bump()
+	say.Line("bump", c.n)
+	mut w8 = u8(250)
+	w8 +%= 10
+	mut w16 = i16(-32768)
+	w16 -%= 1
+	mut w32 = u32(65536)
+	w32 *%= 65536
+	mut w64 = i64(-9223372036854775807)
+	w64 -%= 2
+	say.Line("assign", w8, w16, w32, w64)
+	say.Line("ops", u8(255) +% u8(1), i8(-128) -% i8(1), i32(65536) *% i32(65536), u64(0) -% u64(1))
+	// A counter below its bound cannot overflow: 0..n up to the largest i64 and u8.
+	mut last = i64(0)
+	for i in (9223372036854775807 - 3)..9223372036854775807 {
+		last = i
+	}
+	mut small = u8(0)
+	for k in u8(250)..u8(255) {
+		small = k
+	}
+	say.Line("counters", last, small)
+	// A step that would carry the counter past the largest value panics instead of wrapping.
+	show("step", fn() str {
+		mut seen = 0
+		for i in (9223372036854775800..9223372036854775807).step(5) {
+			seen += 1
+		}
+		return say.Str(seen)
+	})
+	// The conditional increment stays checked.
+	show("cinc", fn() str {
+		mut x = i64(9223372036854775806)
+		for i in 0..3 {
+			if i >= 0 {
+				x += 1
+			}
+		}
+		return say.Str(x)
+	})
+	show("cinc ok", fn() str {
+		mut x = i64(0)
+		for i in 0..10 {
+			if i % 2 == 0 {
+				x += 1
+			}
+		}
+		return say.Str(x)
+	})
+	// Compound assignment through fields and elements is checked like any other + - *.
+	show("field", fn() str {
+		let k = Counter{n: 255}
+		k.n += 1
+		return say.Str(k.n)
+	})
+	show("elem", fn() str {
+		let xs = []i32{2147483647}
+		xs[0] *= 2
+		return say.Str(xs[0])
+	})
+	show("u64 sub", fn() str {
+		let xs = []u64{3, 5}
+		return say.Str(xs[0] - xs[1])
+	})
+}

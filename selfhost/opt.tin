@@ -142,6 +142,542 @@ fn an_expr(e i64) {
 	}
 }
 
+// ---- overflow-check elision (#362) ----
+//
+// Runs after inlining and before loop-invariant code motion. A checked + - * /, negation or
+// shift whose operand ranges prove the result fits its type needs no check (and, unchecked, may
+// be hoisted). Ranges come from constants, len and cap (below 2^56: no allocation reaches the
+// limit of the address space), narrow types, locals defined once and never assigned, and
+// `while i < b` loops whose counter only steps up by a positive constant.
+const VR_LEN = 72057594037927935
+
+shared mut vr_syms []i64 // locals with a known range, innermost last
+shared mut vr_los []i64
+shared mut vr_his []i64
+shared mut vr_lo i64 // the last vrange result
+shared mut vr_hi i64
+
+fn ovf_elide_fn(f Fn) {
+	analyze_fn(f)
+	let locals = cast([]i64, f.locals)
+	mut i = 0
+	for i < len(locals) {
+		cast(Sym, locals[i]).defs = 0
+		i = i + 1
+	}
+	ve_count_stmts(cast(Block, f.body).stmts)
+	vr_syms = []i64{}
+	vr_los = []i64{}
+	vr_his = []i64{}
+	ve_stmts(cast(Block, f.body).stmts)
+}
+
+// ve_count_stmts counts every definition and assignment of a local, also inside expressions.
+fn ve_count_stmts(stmts []i64) {
+	mut i = 0
+	for i < len(stmts) {
+		ve_count_stmt(stmts[i])
+		i = i + 1
+	}
+}
+
+fn ve_def(s i64) {
+	if s != 0 {
+		cast(Sym, s).defs = cast(Sym, s).defs + 1
+	}
+}
+
+fn ve_count_stmt(s i64) {
+	if s == 0 {
+		return
+	}
+	let k = cast(Node, s).kind
+	if k == ST_BLOCK {
+		ve_count_stmts(cast(Block, s).stmts)
+	} else if k == ST_LET {
+		ve_def(cast(LetStmt, s).sym)
+		ve_count_expr(cast(LetStmt, s).init)
+	} else if k == ST_ASSIGN {
+		let t = cast(AssignStmt, s).target
+		if cast(Node, t).kind == EX_IDENT {
+			ve_def(cast(IdentExpr, t).ref)
+		} else {
+			ve_count_expr(t)
+		}
+		ve_count_expr(cast(AssignStmt, s).value)
+	} else if k == ST_EXPR {
+		ve_count_expr(cast(ExprStmt, s).x)
+	} else if k == ST_IF {
+		ve_count_expr(cast(IfStmt, s).cond)
+		ve_count_stmt(cast(IfStmt, s).then)
+		ve_count_stmt(cast(IfStmt, s).else_)
+	} else if k == ST_WHILE {
+		ve_count_expr(cast(WhileStmt, s).cond)
+		ve_count_stmt(cast(WhileStmt, s).body)
+		ve_count_stmt(cast(WhileStmt, s).post)
+	} else if k == ST_RETURN {
+		ve_count_expr(cast(ReturnStmt, s).value)
+		if cast(i64, cast(ReturnStmt, s).values) != 0 {
+			mut i = 0
+			for i < len(cast(ReturnStmt, s).values) {
+				ve_count_expr(cast(ReturnStmt, s).values[i])
+				i = i + 1
+			}
+		}
+	} else if k == ST_CALLMULTI {
+		ve_count_expr(cast(CallMultiStmt, s).call)
+		mut i = 0
+		for i < len(cast(CallMultiStmt, s).syms) {
+			ve_def(cast(i64, cast(CallMultiStmt, s).syms[i]))
+			i = i + 1
+		}
+	}
+}
+
+fn ve_count_expr(e i64) {
+	if e == 0 {
+		return
+	}
+	let k = cast(Node, e).kind
+	if k == EX_UNARY {
+		ve_count_expr(cast(Unary, e).x)
+	} else if k == EX_BINARY {
+		ve_count_expr(cast(Binary, e).l)
+		ve_count_expr(cast(Binary, e).r)
+	} else if k == EX_INDEX {
+		ve_count_expr(cast(IndexExpr, e).x)
+		ve_count_expr(cast(IndexExpr, e).i)
+	} else if k == EX_CONV {
+		ve_count_expr(cast(Conv, e).x)
+	} else if k == EX_MEM {
+		ve_count_expr(cast(MemExpr, e).base)
+		ve_count_expr(cast(MemExpr, e).index)
+		ve_count_expr(cast(MemExpr, e).len)
+	} else if k == EX_ELEM {
+		ve_count_expr(cast(ElemExpr, e).seq)
+		ve_count_expr(cast(ElemExpr, e).idx)
+	} else if k == EX_SEQ {
+		ve_count_stmts(cast(SeqExpr, e).stmts)
+		ve_count_expr(cast(SeqExpr, e).value)
+	} else if k == EX_CALL {
+		ve_count_expr(cast(Call, e).callee)
+		let args = cast(Call, e).args
+		mut i = 0
+		for cast(i64, args) != 0 && i < len(args) {
+			ve_count_expr(args[i])
+			i = i + 1
+		}
+	}
+}
+
+// ve_local is the local symbol e names when its range may be tracked, else 0.
+fn ve_local(e i64) i64 {
+	if cast(Node, e).kind != EX_IDENT || cast(IdentExpr, e).ref == 0 || ve_sym_ok(cast(Sym, cast(IdentExpr, e).ref)) == 0 {
+		return 0
+	}
+	return cast(IdentExpr, e).ref
+}
+
+// ve_sym_ok reports an integer local held in a register or slot, never through an address or cell.
+fn ve_sym_ok(s Sym) i64 {
+	return i64(s.kind == SYM_LOCAL && s.addr == 0 && s.cell == 0 && s.captured == 0 && is_integer_t(s.type_) != 0)
+}
+
+fn ve_push(s i64, lo i64, hi i64) {
+	vr_syms = append(vr_syms, s)
+	vr_los = append(vr_los, lo)
+	vr_his = append(vr_his, hi)
+}
+
+fn ve_pop(n i64) {
+	slice_truncate(vr_syms, n)
+	slice_truncate(vr_los, n)
+	slice_truncate(vr_his, n)
+}
+
+fn ve_stmts(stmts []i64) {
+	mut i = 0
+	for i < len(stmts) {
+		let s = stmts[i]
+		if cast(Node, s).kind == ST_WHILE && i > 0 {
+			ve_while(cast(WhileStmt, s), stmts[i - 1])
+		} else {
+			ve_stmt(s)
+		}
+		i = i + 1
+	}
+}
+
+fn ve_stmt(s i64) {
+	if s == 0 {
+		return
+	}
+	let k = cast(Node, s).kind
+	if k == ST_BLOCK {
+		ve_stmts(cast(Block, s).stmts)
+	} else if k == ST_LET {
+		let init = cast(LetStmt, s).init
+		ve_expr(init)
+		let sym = cast(LetStmt, s).sym
+		// A local defined once and never assigned holds its initializer's range everywhere.
+		if sym != 0 && cast(Sym, sym).defs == 1 && init != 0 && ve_sym_ok(cast(Sym, sym)) != 0 && vrange(init) != 0 {
+			ve_push(sym, vr_lo, vr_hi)
+		}
+	} else if k == ST_ASSIGN {
+		ve_expr(cast(AssignStmt, s).target)
+		ve_expr(cast(AssignStmt, s).value)
+	} else if k == ST_EXPR {
+		ve_expr(cast(ExprStmt, s).x)
+	} else if k == ST_IF {
+		ve_expr(cast(IfStmt, s).cond)
+		ve_stmt(cast(IfStmt, s).then)
+		ve_stmt(cast(IfStmt, s).else_)
+	} else if k == ST_WHILE {
+		ve_while(cast(WhileStmt, s), 0)
+	} else if k == ST_RETURN {
+		ve_expr(cast(ReturnStmt, s).value)
+		if cast(i64, cast(ReturnStmt, s).values) != 0 {
+			mut i = 0
+			for i < len(cast(ReturnStmt, s).values) {
+				ve_expr(cast(ReturnStmt, s).values[i])
+				i = i + 1
+			}
+		}
+	} else if k == ST_CALLMULTI {
+		ve_expr(cast(CallMultiStmt, s).call)
+	}
+}
+
+// ve_while handles a loop; prev is the statement before it. For `let i = a` then
+// `while i < b { ... } post i = i + c` (c > 0) where nothing else assigns i, i is in
+// [lo(a), hi(b) - 1] in the body and the post statement.
+fn ve_while(w WhileStmt, prev i64) {
+	ve_expr(w.cond)
+	let mark = len(vr_syms)
+	let c = w.cond
+	let post = w.post
+	if w.once_ == 0 && prev != 0 && cast(Node, prev).kind == ST_LET && post != 0 && cast(Node, post).kind == ST_ASSIGN && cast(Node, c).kind == EX_BINARY && streq(cast(Binary, c).op, cstr("<")) != 0 {
+		let s = ve_local(cast(Binary, c).l)
+		let pv = cast(AssignStmt, post).value
+		let pt = cast(AssignStmt, post).target
+		if s != 0 && s == cast(LetStmt, prev).sym && cast(Sym, s).defs == 2 && cast(Node, pt).kind == EX_IDENT && cast(IdentExpr, pt).ref == s && cast(Node, pv).kind == EX_BINARY && streq(cast(Binary, pv).op, cstr("+")) != 0 && cast(Node, cast(Binary, pv).l).kind == EX_IDENT && cast(IdentExpr, cast(Binary, pv).l).ref == s && is_const(cast(Binary, pv).r) != 0 && const_val(cast(Binary, pv).r) > 0 && (const_val(cast(Binary, pv).r) == 1 || cast(Binary, pv).ovf == OVF_CHECK) {
+			// A step of 1 below b cannot wrap; a larger one is checked, so i never wraps negative.
+			mut lo = -9223372036854775807 - 1
+			if vrange(cast(LetStmt, prev).init) != 0 {
+				lo = vr_lo
+			}
+			if vrange(cast(Binary, c).r) != 0 && vr_hi > -9223372036854775807 - 1 {
+				ve_push(s, lo, vr_hi - 1)
+			}
+		}
+	}
+	ve_stmt(w.body)
+	ve_stmt(w.post)
+	ve_pop(mark)
+}
+
+fn ve_expr(e i64) {
+	if e == 0 {
+		return
+	}
+	let k = cast(Node, e).kind
+	if k == EX_UNARY {
+		ve_expr(cast(Unary, e).x)
+		if cast(Unary, e).ovf == OVF_CHECK && vrange(cast(Unary, e).x) != 0 {
+			let t = cast(Ty, cast(Node, e).type_)
+			if (t.signed != 0 && vr_lo > type_min(t)) || (t.signed == 0 && vr_lo == 0 && vr_hi == 0) {
+				cast(Unary, e).ovf = OVF_NONE
+			}
+		}
+	} else if k == EX_BINARY {
+		ve_expr(cast(Binary, e).l)
+		ve_expr(cast(Binary, e).r)
+		if cast(Binary, e).ovf == OVF_CHECK && e_fp(cast(Node, e)) == 0 && ve_fits(cast(Binary, e)) != 0 {
+			cast(Binary, e).ovf = OVF_NONE
+		}
+	} else if k == EX_INDEX {
+		ve_expr(cast(IndexExpr, e).x)
+		ve_expr(cast(IndexExpr, e).i)
+	} else if k == EX_CONV {
+		ve_expr(cast(Conv, e).x)
+	} else if k == EX_MEM {
+		ve_expr(cast(MemExpr, e).base)
+		ve_expr(cast(MemExpr, e).index)
+		ve_expr(cast(MemExpr, e).len)
+	} else if k == EX_ELEM {
+		ve_expr(cast(ElemExpr, e).seq)
+		ve_expr(cast(ElemExpr, e).idx)
+	} else if k == EX_SEQ {
+		ve_stmts(cast(SeqExpr, e).stmts)
+		ve_expr(cast(SeqExpr, e).value)
+	} else if k == EX_CALL {
+		ve_expr(cast(Call, e).callee)
+		let args = cast(Call, e).args
+		mut i = 0
+		for cast(i64, args) != 0 && i < len(args) {
+			ve_expr(args[i])
+			i = i + 1
+		}
+	}
+}
+
+// ve_fits reports whether checked operation e cannot overflow, given its operands' ranges.
+fn ve_fits(e Binary) i64 {
+	let t = cast(Ty, cast(Node, e).type_)
+	let op = e.op
+	if vrange(e.l) == 0 {
+		return 0
+	}
+	let llo = vr_lo
+	let lhi = vr_hi
+	if vrange(e.r) == 0 {
+		return 0
+	}
+	let rlo = vr_lo
+	let rhi = vr_hi
+	if streq(op, cstr("<<")) != 0 || streq(op, cstr(">>")) != 0 {
+		return i64(rlo >= 0 && rhi < 8 * int_width(t))
+	}
+	if streq(op, cstr("/")) != 0 {
+		return i64(rhi < -1 || rlo > -1 || llo > type_min(t))
+	}
+	if vr_arith(op, llo, lhi, rlo, rhi) == 0 {
+		return 0
+	}
+	return i64(vr_lo >= type_min(t) && vr_hi <= type_max(t))
+}
+
+// vr_arith sets vr_lo..vr_hi to the range of l op r (+ - *) and returns 1, or returns 0 when a
+// bound leaves i64.
+fn vr_arith(op i64, llo i64, lhi i64, rlo i64, rhi i64) i64 {
+	if streq(op, cstr("+")) != 0 {
+		return vr_set2(vr_exact(op, llo, rlo), vr_exact(op, lhi, rhi))
+	}
+	if streq(op, cstr("-")) != 0 {
+		return vr_set2(vr_exact(op, llo, rhi), vr_exact(op, lhi, rlo))
+	}
+	let a = vr_exact(op, llo, rlo)
+	let b = vr_exact(op, llo, rhi)
+	let c = vr_exact(op, lhi, rlo)
+	let d = vr_exact(op, lhi, rhi)
+	if vr_bad != 0 {
+		vr_bad = 0
+		return 0
+	}
+	vr_lo = min(min(a, b), min(c, d))
+	vr_hi = max(max(a, b), max(c, d))
+	return 1
+}
+
+shared mut vr_bad i64 // a vr_exact since the last vr_set2 or vr_arith left i64
+
+// vr_exact is a op b when it fits i64, else it sets vr_bad.
+fn vr_exact(op i64, a i64, b i64) i64 {
+	let v = const_exact(op, a, 0, b, 0)
+	if cx_ovf != 0 || cx_big != 0 {
+		vr_bad = 1
+	}
+	return v
+}
+
+fn vr_set2(lo i64, hi i64) i64 {
+	if vr_bad != 0 {
+		vr_bad = 0
+		return 0
+	}
+	vr_lo = lo
+	vr_hi = hi
+	return 1
+}
+
+// type_min and type_max bound integer type t (u64 above 2^63-1 is outside the analysis).
+fn type_min(t Ty) i64 {
+	if cast(i64, t) == 0 || t.kind != K_INT || t.width == 8 {
+		if cast(i64, t) != 0 && t.kind == K_INT && t.signed == 0 {
+			return 0
+		}
+		return -9223372036854775807 - 1
+	}
+	if t.signed == 0 {
+		return 0
+	}
+	return 0 - (1 << (8 * t.width - 1))
+}
+
+fn type_max(t Ty) i64 {
+	if cast(i64, t) == 0 || t.kind != K_INT || t.width == 8 {
+		return 9223372036854775807
+	}
+	if t.signed == 0 {
+		return (1 << (8 * t.width)) - 1
+	}
+	return (1 << (8 * t.width - 1)) - 1
+}
+
+// vrange sets vr_lo..vr_hi to a range every value of e lies in and returns 1, or returns 0
+// when none is known (a u64 that may pass 2^63-1).
+fn vrange(e i64) i64 {
+	vr_bad = 0
+	let r = vrange_of(e)
+	vr_bad = 0
+	return r
+}
+
+fn vr_type(t Ty) i64 {
+	if cast(i64, t) == 0 || t.kind != K_INT {
+		if cast(i64, t) != 0 && t.kind == K_BOOL {
+			vr_lo = 0
+			vr_hi = 1
+			return 1
+		}
+		vr_lo = -9223372036854775807 - 1
+		vr_hi = 9223372036854775807
+		return i64(cast(i64, t) == 0)
+	}
+	if t.width == 8 && t.signed == 0 {
+		return 0
+	}
+	vr_lo = type_min(t)
+	vr_hi = type_max(t)
+	return 1
+}
+
+fn vrange_of(e i64) i64 {
+	let k = cast(Node, e).kind
+	let t = cast(Ty, cast(Node, e).type_)
+	if is_const(e) != 0 && fold_safe(cast(Node, e)) != 0 {
+		vr_lo = const_val(e)
+		vr_hi = vr_lo
+		return 1
+	}
+	if k == EX_INT {
+		if cast(IntLit, e).val < 0 && cast(i64, t) != 0 && t.kind == K_INT && t.signed == 0 {
+			return 0
+		}
+		vr_lo = cast(IntLit, e).val
+		vr_hi = vr_lo
+		return 1
+	}
+	if k == EX_IDENT {
+		let s = ve_local(e)
+		mut i = len(vr_syms) - 1
+		for s != 0 && i >= 0 {
+			if vr_syms[i] == s {
+				vr_lo = vr_los[i]
+				vr_hi = vr_his[i]
+				return 1
+			}
+			i = i - 1
+		}
+		return vr_type(t)
+	}
+	if k == EX_CONV {
+		let ck = cast(Conv, e).kind
+		if ck == CV_LEN || ck == CV_CAP {
+			vr_lo = 0
+			vr_hi = VR_LEN
+			return 1
+		}
+		if ck == CV_INT {
+			if vr_type(t) == 0 {
+				// To u64: a known non-negative source keeps its range.
+				if vrange_of(cast(Conv, e).x) != 0 && vr_lo >= 0 {
+					return 1
+				}
+				return 0
+			}
+			let tlo = vr_lo
+			let thi = vr_hi
+			if vrange_of(cast(Conv, e).x) != 0 && vr_lo >= tlo && vr_hi <= thi {
+				return 1
+			}
+			vr_lo = tlo
+			vr_hi = thi
+			return 1
+		}
+		return vr_type(t)
+	}
+	if k == EX_MEM && cast(MemExpr, e).hdr != 0 && (cast(MemExpr, e).off == 0 || cast(MemExpr, e).off == 8) {
+		vr_lo = 0
+		vr_hi = VR_LEN
+		return 1
+	}
+	if k == EX_BINARY && is_integer_t(cast(i64, t)) != 0 && cast(Binary, e).ovf != OVF_WRAP {
+		let op = cast(Binary, e).op
+		if is_ovf_op(op) != 0 {
+			if vrange_of(cast(Binary, e).l) != 0 {
+				let llo = vr_lo
+				let lhi = vr_hi
+				if vrange_of(cast(Binary, e).r) != 0 && vr_arith(op, llo, lhi, vr_lo, vr_hi) != 0 {
+					let alo = vr_lo
+					let ahi = vr_hi
+					if vr_type(t) != 0 && alo >= vr_lo && ahi <= vr_hi {
+						vr_lo = alo
+						vr_hi = ahi
+						return 1
+					}
+					if vr_type(t) == 0 && alo >= 0 {
+						vr_lo = alo
+						vr_hi = ahi
+						return 1
+					}
+				}
+			}
+			vr_bad = 0
+			return vr_type(t)
+		}
+		if (streq(op, cstr("/")) != 0 || streq(op, cstr(">>")) != 0) && is_const(cast(Binary, e).r) != 0 {
+			let c = const_val(cast(Binary, e).r)
+			if vrange_of(cast(Binary, e).l) != 0 && (vr_lo >= 0 || t.signed != 0) {
+				if streq(op, cstr("/")) != 0 && c > 0 {
+					vr_lo = vr_lo / c
+					vr_hi = vr_hi / c
+					return 1
+				}
+				if streq(op, cstr(">>")) != 0 && c >= 0 && c < 64 {
+					vr_lo = vr_lo >> c
+					vr_hi = vr_hi >> c
+					return 1
+				}
+			}
+			return vr_type(t)
+		}
+		if streq(op, cstr("%")) != 0 && is_const(cast(Binary, e).r) != 0 && const_val(cast(Binary, e).r) > 0 {
+			let m = const_val(cast(Binary, e).r) - 1
+			if vrange_of(cast(Binary, e).l) != 0 && vr_lo >= 0 {
+				vr_lo = 0
+				vr_hi = min(vr_hi, m)
+				return 1
+			}
+			if t.signed != 0 {
+				vr_lo = 0 - m
+				vr_hi = m
+				return 1
+			}
+			vr_lo = 0
+			vr_hi = m
+			return 1
+		}
+		if streq(op, cstr("&")) != 0 {
+			if vrange_of(cast(Binary, e).r) != 0 && vr_lo >= 0 {
+				vr_lo = 0
+				return 1
+			}
+			if vrange_of(cast(Binary, e).l) != 0 && vr_lo >= 0 {
+				vr_lo = 0
+				return 1
+			}
+			return vr_type(t)
+		}
+	}
+	if cast(i64, t) != 0 && t.kind == K_BOOL {
+		vr_lo = 0
+		vr_hi = 1
+		return 1
+	}
+	return vr_type(t)
+}
+
 // ---- loop-invariant code motion ----
 //
 // Runs on the AST before analysis. An expression is invariant in a loop when it only
@@ -609,7 +1145,7 @@ fn binary_node(pos i64, op i64, l i64, r i64) i64 {
 // index_rewrite turns x[a + b] into (x + (a << 3))[b] when x and a are invariant and b is not.
 fn index_rewrite(e i64) {
 	let ix = cast(IndexExpr, e).i
-	if cast(Node, ix).kind != EX_BINARY || streq(cast(Binary, ix).op, cstr("+")) == 0 || invariant(cast(IndexExpr, e).x) == 0 {
+	if cast(Node, ix).kind != EX_BINARY || streq(cast(Binary, ix).op, cstr("+")) == 0 || cast(Binary, ix).ovf == OVF_CHECK || invariant(cast(IndexExpr, e).x) == 0 {
 		return
 	}
 	mut a = cast(Binary, ix).l
@@ -701,7 +1237,7 @@ fn int_node(pos i64, v i64) i64 {
 // (base + a*scale)[b], so the row address is computed once per loop.
 fn mem_rewrite(e i64) {
 	let ix = cast(MemExpr, e).index
-	if ix == 0 || cast(MemExpr, e).len != 0 || cast(Node, ix).kind != EX_BINARY || streq(cast(Binary, ix).op, cstr("+")) == 0 || invariant(cast(MemExpr, e).base) == 0 {
+	if ix == 0 || cast(MemExpr, e).len != 0 || cast(Node, ix).kind != EX_BINARY || streq(cast(Binary, ix).op, cstr("+")) == 0 || cast(Binary, ix).ovf == OVF_CHECK || invariant(cast(MemExpr, e).base) == 0 {
 		return
 	}
 	mut a = cast(Binary, ix).l

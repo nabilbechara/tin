@@ -476,3 +476,61 @@ does not take an `io.Reader` or a callback with state.
   implementation to measure.
 - The standard library's names for the shapes beyond `Reader` and `Writer` follow Tin's naming
   (short words), chosen when each package is written.
+
+## 11. Integer overflow: checked by default (added 2026-10-06, #362)
+
+`i64` arithmetic used to wrap silently, shift counts were taken modulo 64 and `i64(1e300)`
+saturated. A size, an offset or an amount computed from request data could wrap into a
+negative number that passed the checks after it. Tin already pays for bounds checks to turn
+that kind of mistake into a panic; overflow is the same kind of mistake.
+
+**Decision.** Arithmetic is checked by default in user code, library packages and tools:
+`+`, `-`, `*` and negation panic with `integer overflow` when the exact result does not fit
+the type (`i8` through `u64`), and so does signed `/` of the most negative value by -1. A shift
+count must be below the width, and a float to integer conversion panics out of range or on NaN.
+In a handler the panic is that request's 500, and the core goes on serving (section 3). Wrapping
+is written where it is meant, per operation (`+% -% *%`) or for a whole function (`@wrap fn`),
+which keeps the machine's arithmetic for kernels that are modular throughout: hashes, PRNGs and
+constant-time field arithmetic. `lib/runtime/` and `selfhost/` keep machine arithmetic, because
+the runtime has no panic path below it and the compiler's hashes and encodings wrap on purpose.
+Constant expressions are exact: a constant that overflows is E223, a constant shift count out
+of range is E224. The rules are in docs/LANGUAGE.md section 6.
+
+A check is a flag test and a branch to one cold stub per kind per function: `adds`/`subs` with
+`b.vs` (`b.hs`/`b.lo` unsigned), `smulh`/`umulh` against the product on arm64, and `jo`/`jb`
+after the operation on x86-64. The compiler removes a check that cannot fire, and never moves
+a checked operation out of a loop or ahead of a branch. It knows the counter of `for i in a..b`,
+and after inlining it knows ranges from constants, `len` and `cap` (below 2^56), narrow types,
+locals defined once and loop counters.
+
+**Measured before deciding.** The Linux benchmarks (`.github/workflows/bench-linux.yml`, GitHub's
+shared runners, so ratios only) ran head against main on the same runner at three levels: checks
+off, user code only, and user code and libraries.
+
+- Checks off, with all other changes in place ([run 37344888270](https://github.com/yasserreslan/tin/actions/runs/37344888270)),
+  was within 3% of main on arm64. A 12-byte layout probe with checks off
+  ([run 37350044953](https://github.com/yasserreslan/tin/actions/runs/37350044953)) moved
+  memory_16 by 20% on arm64 and aesgcm by 11% on amd64. A few percent either way on one
+  benchmark is code placement, not the checks.
+- The first checked build cost 1.5x on arm64 x25519 and tls13keys and 1.2 to 1.3x on spectral,
+  sieve and p256ecdh. That led to the range-based elision, `@wrap` on the crypto kernels and a
+  branchless checked `if c { x += 1 }`.
+- The final form ([run 37350166526](https://github.com/yasserreslan/tin/actions/runs/37350166526))
+  is within 5% of main on every amd64 benchmark, with HTTP at 0.997 and 0.994. On arm64 it is
+  within 4% except indexsum (1.06), ordered_less (1.07) and spectral (1.35), with HTTP at 0.979
+  and 0.994. spectral's inner loop multiplies `(i+j)*(i+j+1)`, whose operands are bounded only
+  by a slice length, so the check stays. On arm64 it is a `smulh` and a compare in a loop that
+  takes 0.73 ns an iteration; on x86-64 `imul` sets the flag for free. docs/PERFORMANCE.md has the table.
+
+**Rejected:**
+
+- *Wrap by default with `checked_add` builtins and a lint.* The safe form would be the longer
+  one, and a lint is advice: code generated in bulk takes the short form.
+- *Checks only in debug builds.* Production is where the request data is, and two semantics
+  for one program make a test pass where production wraps.
+- *Saturating arithmetic.* A clamped size is still wrong, only quieter.
+- *A checked integer type beside an unchecked one.* That is two `i64`s in every signature, and
+  a conversion at every boundary, to get what one default and an operator give.
+
+A program whose hot loop multiplies unbounded values and has measured the check can write `*%`
+there. That is visible in the source, like every other cost (principle 1).

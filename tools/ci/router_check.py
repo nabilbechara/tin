@@ -510,7 +510,8 @@ def overflow_guards(out, failures):
 def panics(exe, failures):
     """#142: a handler that panics, at once or after a wait, answers 500 and closes its
     connection; the panic and its backtrace go to stderr; other requests, including one
-    waiting on the same core at the time, are served and the server keeps running."""
+    waiting on the same core at the time, are served and the server keeps running. An integer
+    overflow on request data (#362) is such a panic."""
     port = ws.free_port()
     server = subprocess.Popen([str(exe)], env=dict(os.environ, PORT=str(port), TIN_CORES='1'),
                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -530,6 +531,12 @@ def panics(exe, failures):
         print('panicking handlers and others:', got, 'waiting request:', slow.get('r', (0,))[0])
         if got != [500, 500, 200, 500, 200] or slow.get('r', (0,))[0] != 200:
             failures.append('panics: %r, waiting request %r' % (got, slow.get('r')))
+        # #362: an integer overflow on request data is that request's panic.
+        sums = [request(port, 'GET', p) for p in ('/add?a=2&b=3', '/add?a=9223372036854775807&b=1',
+                                                   '/add?a=-9223372036854775808&b=-1', '/add?a=40&b=2')]
+        print('sums:', [(s[0], s[-1]) for s in sums])
+        if [s[0] for s in sums] != [200, 500, 500, 200] or sums[0][-1] != b'sum 5' or sums[3][-1] != b'sum 42':
+            failures.append('overflow in a handler: %r' % [(s[0], s[-1]) for s in sums])
         if server.poll() is not None:
             failures.append('the server exited after a handler panicked')
         # #230: each panic ran the deferred calls of the frames it left, innermost first.
@@ -562,6 +569,8 @@ def panics(exe, failures):
             failures.append('panic messages on stderr: %r' % err[:2000])
         if 'panic: first' not in err or 'panic: second' not in err:
             failures.append('a panic during unwinding must print both messages: %r' % err[-2000:])
+        if err.count('panic: integer overflow: +') != 2:
+            failures.append('overflow panics on stderr: %r' % err[:2000])
 
 
 def implicit_guards(out, failures):

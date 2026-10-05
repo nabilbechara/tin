@@ -47,7 +47,8 @@ def scaled(name, k, pre, lines):
 
 def mul():
     lines = ['// fe_mul sets h = f*g; h may alias f or g. Limbs of f and g up to 2^27 in magnitude.',
-             'fn fe_mul(h mut []i64, f []i64, g []i64) {']
+             '// The limb bounds keep every sum in i64; @wrap keeps the code free of value-dependent branches.',
+             '@wrap fn fe_mul(h mut []i64, f []i64, g []i64) {']
     lines += [f'\tlet f{i} = f[{i}]' for i in range(10)] + [f'\tlet g{i} = g[{i}]' for i in range(10)]
     pre = set()
     body = []
@@ -67,7 +68,7 @@ def mul():
 
 def sq():
     lines = ['// fe_sq sets h = f*f (each cross product once, doubled); h may alias f.',
-             'fn fe_sq(h mut []i64, f []i64) {']
+             '@wrap fn fe_sq(h mut []i64, f []i64) {']
     lines += [f'\tlet f{i} = f[{i}]' for i in range(10)]
     pre = set()
     body = []

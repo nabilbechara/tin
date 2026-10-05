@@ -1279,6 +1279,32 @@ example.tin:4:13: error E223 CONST_OVERFLOW: constant 300 overflows u8
 
 Fix: use a wider type, or a value in range.
 
+Constant arithmetic is exact (#362): `9223372036854775807 + 1` is 2^63, which no signed type
+holds, and an expression whose exact value is outside -2^63 .. 2^64-1 has no type at all.
+Write `+%`, `-%` or `*%` where wrapping is meant.
+
+### E224 SHIFT_COUNT
+
+A constant shift count is between 0 and the width of the shifted value less one (#362): a
+`u8` shifts by 0 to 7, an `i64` by 0 to 63. A count outside that range is a compile error; at
+run time it panics (`shift count out of range`).
+
+```tin edition=1
+package main
+
+fn main() {
+	let x u8 = 1
+	let y = x << 8
+	_ = y
+}
+```
+
+```text
+example.tin:5:12: error E224 SHIFT_COUNT: shift count 8 is out of range for u8: counts are 0 to 7
+```
+
+Fix: shift a wider type (`u16(x) << 8`), or a count below the width.
+
 ### E230 TYPE_MISMATCH
 
 A value is used where its type is expected: there are no implicit conversions, so an `i64`

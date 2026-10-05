@@ -529,6 +529,50 @@ loaded word). Cold stubs preserve registers, including leaf-function homes. The 
 keeps existing allocation and register-home decisions; the poll check stays inside loops.
 The watchdog is started only for an opted-in executable.
 
+## Integer overflow checks (Linux)
+
+`+`, `-`, `*`, negation, signed `/`, shifts and float to integer conversions are checked in
+user code and library packages (#362; `lib/runtime/` and the compiler are not). Each check is a
+flag test and a branch to a cold stub. The compiler drops the checks it can prove cannot fire
+(loop counters, and after inlining, constants, lengths, narrow types and locals defined once),
+and the crypto kernels are `@wrap`.
+
+[Run 37350166526](https://github.com/yasserreslan/tin/actions/runs/37350166526) measured head
+`1d07ed3` against main `c0145f2` on the same runners: Linux 6.17.0-1022-azure, AMD EPYC 9V45 on
+amd64, Neoverse-V3 on arm64, Go 1.26.8. CPU figures are medians of seven alternating runs per
+side; HTTP uses one server core and wrk `-t2 -c100` on the same runner. Only ratios on these
+shared runners are meaningful.
+
+| architecture, workload | main ms | checked ms | checked/main time |
+|---|---:|---:|---:|
+| arm64 spectral | 889.20 | 1201.88 | 1.352 |
+| arm64 ordered_less | 25.48 | 27.35 | 1.074 |
+| arm64 indexsum | 33.30 | 35.31 | 1.060 |
+| arm64 json | 1294.42 | 1344.69 | 1.039 |
+| arm64 sieve | 367.14 | 380.61 | 1.037 |
+| amd64 sha512 | 310.23 | 322.68 | 1.040 |
+| amd64 spectral | 6162.75 | 6138.30 | 0.996 |
+
+The other 41 benchmark and architecture pairs were within 3.5% (0.978 to 1.034). HTTP
+checked/main throughput was 0.997 (`/json`) and 0.994 (`/plaintext`) on amd64, and 0.979
+and 0.994 on arm64. Output equality is checked on every timed repetition.
+
+spectral is the one real cost. Its inner loop computes `(i+j)*(i+j+1)`, where `i` and `j` are
+bounded only by a slice length, so the multiply keeps its check. On arm64 that is an `smulh`
+and a compare in a loop of 0.73 ns an iteration. On x86-64 `imul` sets the overflow flag
+itself, so the check is free there. A program that has measured such a loop can write `*%`
+in it.
+
+Before the elision pass and `@wrap` on the crypto kernels, the same comparison
+([run 37344878578](https://github.com/yasserreslan/tin/actions/runs/37344878578), main
+`8b4e916`) cost 1.58 on arm64 x25519, 1.52 on tls13keys and 1.22 on p256ecdh. Those three are
+now 1.000, 1.002 and 1.006. Two probes with the checks off measure noise. All changes with the
+checks off ([run 37344888270](https://github.com/yasserreslan/tin/actions/runs/37344888270)) was
+within 3% on arm64. The same with 12 bytes of padding after `main`
+([run 37350044953](https://github.com/yasserreslan/tin/actions/runs/37350044953)) moved
+memory_16 by 1.197 on arm64 and aesgcm by 1.113 on amd64. A ratio of a few percent on one
+benchmark can be code placement.
+
 ## Long-lived blocks above 4 KiB (Linux)
 
 The ingot heap served only blocks up to 4 KiB from slabs: a bigger kept value had a

@@ -141,16 +141,41 @@ fn is_const(e i64) i64 {
 		return i64(cast(IdentExpr, e).ref != 0 && cast(Sym, cast(IdentExpr, e).ref).kind == SYM_CONST)
 	}
 	if k == EX_UNARY {
-		return i64(streq(cast(Unary, e).op, cstr("&")) == 0 && e_fp(cast(Node, e)) == 0 && fold_safe(cast(Node, e)) != 0 && is_const(cast(Unary, e).x) != 0)
+		if streq(cast(Unary, e).op, cstr("&")) == 0 && e_fp(cast(Node, e)) == 0 && fold_safe(cast(Node, e)) != 0 && is_const(cast(Unary, e).x) != 0 {
+			// A checked negation of the most negative value is left to panic at run time (#362).
+			return i64(cast(Unary, e).ovf != OVF_CHECK || streq(cast(Unary, e).op, cstr("-")) == 0 || const_val(cast(Unary, e).x) != -9223372036854775807 - 1)
+		}
+		return 0
 	}
 	if k == EX_BINARY {
 		// A zero divisor (left by inlining) is not folded, so strict code reaches the panic.
 		if (streq(cast(Binary, e).op, cstr("/")) != 0 || streq(cast(Binary, e).op, cstr("%")) != 0) && is_const(cast(Binary, e).r) != 0 && const_val(cast(Binary, e).r) == 0 {
 			return 0
 		}
-		return i64(e_fp(cast(Node, cast(Binary, e).l)) == 0 && fold_safe(cast(Node, e)) != 0 && fold_safe(cast(Node, cast(Binary, e).l)) != 0 && is_const(cast(Binary, e).l) != 0 && is_const(cast(Binary, e).r) != 0)
+		return i64(e_fp(cast(Node, cast(Binary, e).l)) == 0 && fold_safe(cast(Node, e)) != 0 && fold_safe(cast(Node, cast(Binary, e).l)) != 0 && is_const(cast(Binary, e).l) != 0 && is_const(cast(Binary, e).r) != 0 && ovf_folds(cast(Binary, e)) != 0)
 	}
 	return 0
+}
+
+// ovf_folds reports whether constant operation e may be folded: a checked one only when its
+// result fits (inlining can leave MAX + 1 behind, which must still panic, #362).
+fn ovf_folds(e Binary) i64 {
+	if e.ovf != OVF_CHECK {
+		return 1
+	}
+	let a = const_val(e.l)
+	let b = const_val(e.r)
+	if is_ovf_op(e.op) != 0 {
+		const_exact(e.op, a, 0, b, 0)
+		return i64(cx_ovf == 0 && cx_big == 0)
+	}
+	if streq(e.op, cstr("/")) != 0 {
+		return i64(a != -9223372036854775807 - 1 || b != -1)
+	}
+	if streq(e.op, cstr("<<")) != 0 || streq(e.op, cstr(">>")) != 0 {
+		return i64(b >= 0 && b < 64)
+	}
+	return 1
 }
 
 // fold_safe: signed 64-bit (or untyped) arithmetic folds like the machine does it.
@@ -186,6 +211,10 @@ fn const_val(e i64) i64 {
 // may_panic reports whether binary e can panic by itself: integer / and % do unless the
 // divisor is a nonzero constant, so moving them past their guards is unsafe.
 fn may_panic(e Binary) i64 {
+	if e.ovf == OVF_CHECK && e_fp(cast(Node, e)) == 0 {
+		// A checked + - * / or shift panics on overflow (#362).
+		return 1
+	}
 	if e_fp(cast(Node, e)) != 0 || (streq(e.op, cstr("/")) == 0 && streq(e.op, cstr("%")) == 0) {
 		return 0
 	}
@@ -869,6 +898,10 @@ fn gen_unary(e Unary, dst i64, d i64) {
 		emit2(I_FNEG, dst, x)
 		return
 	}
+	if streq(op, cstr("-")) != 0 && e.ovf == OVF_CHECK {
+		gen_checked_neg(cast(Ty, cast(Node, e).type_), dst, x)
+		return
+	}
 	if streq(op, cstr("-")) != 0 {
 		emit2(I_NEG, dst, x)
 	} else if streq(op, cstr("~")) != 0 {
@@ -926,6 +959,10 @@ fn gen_binary(e Binary, dst i64, d i64) {
 	}
 	if is_fp(dst) != 0 {
 		gen_fbinary(e, dst, d)
+		return
+	}
+	if e.ovf == OVF_CHECK {
+		gen_checked_binary(e, dst, d)
 		return
 	}
 	mut l = e.l
@@ -1042,6 +1079,302 @@ fn div_check(b i64) {
 		div_label = new_label()
 	}
 	emit2(I_CBZ, b, div_label)
+}
+
+// ---- checked integer arithmetic (#362) ----
+// Each kind of failed check jumps to one cold stub per function that calls rt_overflow_fail(kind).
+const OVK_ADD = 0
+const OVK_SUB = 1
+const OVK_MUL = 2
+const OVK_NEG = 3
+const OVK_DIV = 4
+const OVK_SHIFT = 5
+const OVK_CONV = 6
+const OVK_COUNT = 7
+
+shared mut ovf_labels []i64 // the current function's stub label per OVK_* kind, 0 until used
+
+// ovf_stub is the label of the current function's cold stub for check kind k.
+fn ovf_stub(k i64) i64 {
+	if ovf_labels[k] == 0 {
+		ovf_labels[k] = new_label()
+	}
+	return ovf_labels[k]
+}
+
+// ovf_kind is the OVK_* kind of operator op.
+fn ovf_kind(op i64) i64 {
+	if streq(op, cstr("+")) != 0 {
+		return OVK_ADD
+	}
+	if streq(op, cstr("-")) != 0 {
+		return OVK_SUB
+	}
+	if streq(op, cstr("*")) != 0 {
+		return OVK_MUL
+	}
+	if streq(op, cstr("/")) != 0 {
+		return OVK_DIV
+	}
+	return OVK_SHIFT
+}
+
+// int_width is the byte width of integer type t (8 when t is untyped).
+fn int_width(t Ty) i64 {
+	if cast(i64, t) == 0 || t.kind != K_INT {
+		return 8
+	}
+	return t.width
+}
+
+// narrow_check branches to the stub of kind k unless r, the exact 64-bit result of an operation
+// on a narrow type, fits t; a result that fits is already canonical.
+fn narrow_check(t Ty, r i64, k i64) {
+	if t.signed != 0 {
+		emit3(I_SXT, X16, r, width_log2(t.width))
+		emit2(I_CMP, X16, r)
+		emit2(I_BCOND, C_NE, ovf_stub(k))
+	} else {
+		emit3(I_LSRI, X16, r, 8 * t.width)
+		emit2(I_CBNZ, X16, ovf_stub(k))
+	}
+}
+
+// gen_checked_neg is dst = -x, panicking when the negation does not fit t.
+fn gen_checked_neg(t Ty, dst i64, x i64) {
+	if int_width(t) != 8 {
+		emit2(I_NEG, dst, x)
+		narrow_check(t, dst, OVK_NEG)
+		return
+	}
+	emit4(I_SUBS, dst, ZR, x, 0)
+	if t.signed != 0 {
+		emit2(I_BCOND, C_VS, ovf_stub(OVK_NEG))
+	} else {
+		// 0 - x borrows for every x but 0.
+		emit2(I_BCOND, C_LO, ovf_stub(OVK_NEG))
+	}
+}
+
+// checked_rr is dst = a op b for + - * on registers, panicking on overflow of type t.
+fn checked_rr(op i64, dst i64, a i64, b i64, t Ty) {
+	let k = ovf_kind(op)
+	if int_width(t) != 8 {
+		// Narrow operands are canonical, so the 64-bit result is exact: check its range.
+		emit_arith(op, dst, a, b)
+		narrow_check(t, dst, k)
+		return
+	}
+	let signed = i64(cast(i64, t) == 0 || t.signed != 0)
+	if k == OVK_MUL {
+		if signed != 0 {
+			emit3(I_SMULH, X16, a, b)
+			emit3(I_MUL, dst, a, b)
+			// The product fits when its high half is the sign of its low half.
+			emit4(I_SUBS, ZR, X16, dst, SH_ASR + 63)
+			emit2(I_BCOND, C_NE, ovf_stub(k))
+		} else {
+			emit3(I_UMULH, X16, a, b)
+			emit3(I_MUL, dst, a, b)
+			emit2(I_CBNZ, X16, ovf_stub(k))
+		}
+		return
+	}
+	if k == OVK_ADD {
+		emit4(I_ADDS, dst, a, b, 0)
+	} else {
+		emit4(I_SUBS, dst, a, b, 0)
+	}
+	checked_flags(k, signed)
+}
+
+// checked_flags branches to the stub after adds/subs: on V for signed, on carry (add) or
+// borrow (sub) for unsigned.
+fn checked_flags(k i64, signed i64) {
+	if signed != 0 {
+		emit2(I_BCOND, C_VS, ovf_stub(k))
+	} else if k == OVK_ADD {
+		emit2(I_BCOND, C_HS, ovf_stub(k))
+	} else {
+		emit2(I_BCOND, C_LO, ovf_stub(k))
+	}
+}
+
+// checked_const is dst = l op c for + - * with a constant, panicking on overflow of type t.
+fn checked_const(op i64, dst i64, l i64, c i64, t Ty) {
+	let k = ovf_kind(op)
+	if int_width(t) != 8 {
+		gen_binary_const(op, dst, l, c)
+		narrow_check(t, dst, k)
+		return
+	}
+	let signed = i64(cast(i64, t) == 0 || t.signed != 0)
+	if k == OVK_MUL {
+		let p = pow2_log(c)
+		if c == 0 {
+			emit3(I_MOVZ, dst, 0, 0)
+		} else if c == 1 {
+			mov(dst, l)
+		} else if c == -1 && signed != 0 {
+			gen_checked_neg(t, dst, l)
+		} else if p > 0 && c > 0 && signed != 0 {
+			// l << p keeps every bit when shifting back gives l again.
+			emit3(I_LSLI, X16, l, p)
+			emit3(I_ASRI, X17, X16, p)
+			emit2(I_CMP, X17, l)
+			emit2(I_BCOND, C_NE, ovf_stub(k))
+			mov(dst, X16)
+		} else if p > 0 && c > 0 {
+			emit3(I_LSRI, X16, l, 64 - p)
+			emit2(I_CBNZ, X16, ovf_stub(k))
+			emit3(I_LSLI, dst, l, p)
+		} else {
+			load_imm(X17, c)
+			checked_rr(op, dst, l, X17, t)
+		}
+		return
+	}
+	if c == 0 {
+		mov(dst, l)
+		return
+	}
+	mut ins = I_ADDSI
+	mut m = c
+	if k == OVK_SUB {
+		ins = I_SUBSI
+	}
+	if signed != 0 && c < 0 && c > -4096 {
+		// x + (-5) is x - 5 and sets V the same way.
+		m = -c
+		if ins == I_ADDSI {
+			ins = I_SUBSI
+		} else {
+			ins = I_ADDSI
+		}
+	}
+	if m > 0 && m < 4096 {
+		emit3(ins, dst, l, m)
+		checked_flags(k, signed)
+		return
+	}
+	load_imm(X17, c)
+	checked_rr(op, dst, l, X17, t)
+}
+
+// gen_checked_binary generates a binary operation the checker marked OVF_CHECK: + - * that
+// panic on overflow, signed / that panics on the most negative value / -1, and shifts whose
+// count must be below the width.
+fn gen_checked_binary(e Binary, dst i64, d i64) {
+	let op = e.op
+	let t = cast(Ty, cast(Node, e).type_)
+	mut l = e.l
+	mut r = e.r
+	arith_unsigned = e_unsigned(cast(Node, e))
+	if streq(op, cstr("<<")) != 0 || streq(op, cstr(">>")) != 0 {
+		let bits = 8 * int_width(t)
+		if is_const(r) != 0 {
+			let c = const_val(r)
+			if c < 0 || c >= bits {
+				let lv = gen_val(l, d)
+				emit1(I_B, ovf_stub(OVK_SHIFT))
+				mov(dst, lv)
+				return
+			}
+			let lv = gen_val(l, d)
+			if arith_unsigned != 0 && gen_uconst(op, dst, lv, c) != 0 {
+				mask_byte(cast(Node, e), dst)
+				return
+			}
+			gen_binary_const(op, dst, lv, c)
+			mask_byte(cast(Node, e), dst)
+			return
+		}
+		gen_pair(l, r, d)
+		arith_unsigned = e_unsigned(cast(Node, e))
+		// One unsigned compare rejects negative counts too.
+		emit2(I_CMPI, pr, bits)
+		emit2(I_BCOND, C_HS, ovf_stub(OVK_SHIFT))
+		emit_arith(op, dst, pl, pr)
+		mask_byte(cast(Node, e), dst)
+		return
+	}
+	if streq(op, cstr("/")) != 0 {
+		if is_const(r) != 0 && const_val(r) != -1 {
+			let lv = gen_val(l, d)
+			gen_binary_const(op, dst, lv, const_val(r))
+			mask_byte(cast(Node, e), dst)
+			return
+		}
+		gen_pair(l, r, d)
+		arith_unsigned = e_unsigned(cast(Node, e))
+		if int_width(t) == 8 {
+			// Only the most negative value / -1 overflows: -l overflows exactly for that l.
+			let ok = new_label()
+			emit2(I_CMNI, pr, 1)
+			emit2(I_BCOND, C_NE, ok)
+			emit4(I_SUBS, ZR, ZR, pl, 0)
+			emit2(I_BCOND, C_VS, ovf_stub(OVK_DIV))
+			label(ok)
+			emit_arith(op, dst, pl, pr)
+			return
+		}
+		emit_arith(op, dst, pl, pr)
+		narrow_check(t, dst, OVK_DIV)
+		return
+	}
+	if (streq(op, cstr("+")) != 0 || streq(op, cstr("*")) != 0) && is_const(l) != 0 {
+		let tmp = l
+		l = r
+		r = tmp
+	}
+	if is_const(r) != 0 {
+		let lv = gen_val(l, d)
+		checked_const(op, dst, lv, const_val(r), t)
+		return
+	}
+	gen_pair(l, r, d)
+	checked_rr(op, dst, pl, pr, t)
+}
+
+// f2i_check branches to the conversion stub unless float v truncates to a value of 64-bit range
+// (-2^63 .. 2^63 for signed t, -1 .. 2^64 exclusive for unsigned t); NaN fails both compares.
+fn f2i_check(t Ty, v i64) {
+	if is_unsigned_t(t) != 0 {
+		emit3(I_MOVZ, X17, 0x43f0, 48)
+		emit2(I_FMOVDX, FSCR, X17)
+		emit2(I_FCMP, v, FSCR)
+		emit2(I_BCOND, C_PL, ovf_stub(OVK_CONV))
+		emit3(I_MOVZ, X17, 0xbff0, 48)
+		emit2(I_FMOVDX, FSCR, X17)
+		emit2(I_FCMP, v, FSCR)
+		emit2(I_BCOND, C_LE, ovf_stub(OVK_CONV))
+		return
+	}
+	emit3(I_MOVZ, X17, 0x43e0, 48)
+	emit2(I_FMOVDX, FSCR, X17)
+	emit2(I_FCMP, v, FSCR)
+	emit2(I_BCOND, C_PL, ovf_stub(OVK_CONV))
+	emit3(I_MOVZ, X17, 0xc3e0, 48)
+	emit2(I_FMOVDX, FSCR, X17)
+	emit2(I_FCMP, v, FSCR)
+	emit2(I_BCOND, C_MI, ovf_stub(OVK_CONV))
+}
+
+// gen_ovf_stubs emits the current function's cold overflow stubs: rt_overflow_fail(kind).
+fn gen_ovf_stubs() {
+	let of = find_fn(cstr("rt_overflow_fail"))
+	mut k = 0
+	for k < OVK_COUNT {
+		if ovf_labels[k] != 0 {
+			label(ovf_labels[k])
+			emit3(I_MOVZ, 0, k, 0)
+			if cast(i64, of) != 0 {
+				emit1(I_BL, cast(i64, of))
+				of.used = 1
+			}
+		}
+		k = k + 1
+	}
 }
 
 fn emit_arith(op i64, dst i64, a i64, b i64) {
@@ -1275,12 +1608,20 @@ fn gen_conv(e i64, dst i64, d i64) {
 			emit2(I_SCVTF, dst, v)
 		}
 	} else if k == CV_F2I {
-		if is_unsigned_t(cast(Ty, cast(Node, e).type_)) != 0 {
+		let ft = cast(Ty, cast(Node, e).type_)
+		if cast(Conv, e).ovf == OVF_CHECK {
+			f2i_check(ft, v)
+		}
+		if is_unsigned_t(ft) != 0 {
 			emit2(I_FCVTZU, dst, v)
 		} else {
 			emit2(I_FCVTZS, dst, v)
 		}
-		canon(cast(Ty, cast(Node, e).type_), dst)
+		if cast(Conv, e).ovf == OVF_CHECK && int_width(ft) != 8 {
+			narrow_check(ft, dst, OVK_CONV)
+		} else {
+			canon(ft, dst)
+		}
 	} else if k == CV_TOBYTE {
 		emit3(I_ANDI, dst, v, 8)
 	} else if k == CV_INT {
@@ -2850,13 +3191,13 @@ fn speculable(e i64) i64 {
 		return i64(cast(Sym, cast(IdentExpr, e).ref).kind != SYM_GLOBAL)
 	}
 	if k == EX_UNARY {
-		return speculable(cast(Unary, e).x)
+		return i64(cast(Unary, e).ovf != OVF_CHECK && speculable(cast(Unary, e).x) != 0)
 	}
 	if k == EX_BINARY {
 		return i64(streq(cast(Binary, e).op, cstr("&&")) == 0 && streq(cast(Binary, e).op, cstr("||")) == 0 && may_panic(cast(Binary, e)) == 0 && speculable(cast(Binary, e).l) != 0 && speculable(cast(Binary, e).r) != 0)
 	}
 	if k == EX_CONV {
-		return i64(cast(Conv, e).kind != CV_LEN && cast(Conv, e).kind != CV_CAP && speculable(cast(Conv, e).x) != 0)
+		return i64(cast(Conv, e).kind != CV_LEN && cast(Conv, e).kind != CV_CAP && cast(Conv, e).ovf != OVF_CHECK && speculable(cast(Conv, e).x) != 0)
 	}
 	if k == EX_CALL && cast(Call, e).intrinsic != 0 && streq(cast(Call, e).name, cstr("__empty")) != 0 {
 		return 1
@@ -2955,6 +3296,13 @@ fn try_if_increment(s IfStmt) i64 {
 	}
 	let x = cast(Sym, cast(IdentExpr, a.target).ref)
 	let cc = gen_flags(s.cond, 0)
+	if cast(Binary, a.value).ovf == OVF_CHECK {
+		// Checked (#362): add the condition (0 or 1) with adds, still without a branch on it.
+		emit2(I_CSET, X16, cc)
+		emit4(I_ADDS, x.reg, x.reg, X16, 0)
+		checked_flags(OVK_ADD, i64(is_unsigned_t(cast(Ty, x.type_)) == 0))
+		return 1
+	}
 	emit3(I_CINC, x.reg, x.reg, cc)
 	return 1
 }
@@ -3746,6 +4094,7 @@ fn gen_fn(f Fn) {
 	trap_label = 0
 	div_label = 0
 	trap_sites = []i64{}
+	ovf_labels = make([]i64, OVK_COUNT)
 	poll_sites = []i64{}
 	if host_getenv(cstr("TINC_TRACE")) != 0 {
 		let tb = buf_new()
@@ -3755,6 +4104,7 @@ fn gen_fn(f Fn) {
 		write_all(2, cast([]u8, cast([]i64, tb)))
 	}
 	inline_appends(f)
+	ovf_elide_fn(f)
 	licm_fn(f)
 	analyze_fn(f)
 	used_regs = 0
@@ -3878,6 +4228,7 @@ fn gen_fn(f Fn) {
 			df.used = 1
 		}
 	}
+	gen_ovf_stubs()
 	// Per-site stubs: the index and length go through the stack into x0/x1 (any registers).
 	mut ts = 0
 	let bf2 = find_fn(cstr("rt_bounds_fail2"))

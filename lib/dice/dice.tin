@@ -14,15 +14,15 @@ type Rand struct {
 	s3 u64
 }
 
-// mix is the splitmix64 output function, used to expand seeds.
-fn mix(z u64) u64 {
+// mix is the splitmix64 output function, used to expand seeds (modulo 2^64, #362).
+@wrap fn mix(z u64) u64 {
 	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
 	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
 	return z ^ (z >> 31)
 }
 
 // Seed resets r to the sequence for seed s (expanded with splitmix64, so every seed gives a good state).
-fn (r mut Rand) Seed(s u64) {
+@wrap fn (r mut Rand) Seed(s u64) {
 	mut z = s + 0x9e3779b97f4a7c15
 	r.s0 = mix(z)
 	z += 0x9e3779b97f4a7c15
@@ -59,7 +59,7 @@ fn rotl(x u64, k i64) u64 {
 }
 
 // U64 returns the next uniformly distributed 64-bit value.
-fn (r mut Rand) U64() u64 {
+@wrap fn (r mut Rand) U64() u64 {
 	let s0 = r.s0
 	let s1 = r.s1
 	let s2 = r.s2 ^ s0
@@ -93,8 +93,9 @@ fn mul64(a u64, b u64) (u64, u64) {
 
 // U64n returns a uniform value in [0, n) without bias (Lemire's method); n == 0 means the full 64-bit range.
 fn (r mut Rand) U64n(n u64) u64 {
-	if n&(n-1) == 0 {
-		return r.U64() & (n - 1)
+	if n&(n-%1) == 0 {
+		// n == 0 is the full range: n - 1 wraps to all ones.
+		return r.U64() & (n -% 1)
 	}
 	if n <= 0xffffffff {
 		mut v = r.U64() >> 32
@@ -112,7 +113,7 @@ fn (r mut Rand) U64n(n u64) u64 {
 	}
 	mut (hi, lo) = mul64(r.U64(), n)
 	if lo < n {
-		let thresh = (0 - n) % n
+		let thresh = (0 -% n) % n
 		for lo < thresh {
 			hi, lo = mul64(r.U64(), n)
 		}
@@ -138,7 +139,8 @@ fn (r mut Rand) Range(lo i64, hi i64) i64 {
 	if hi <= lo {
 		panic("dice: Range with hi <= lo")
 	}
-	return lo + i64(r.U64n(u64(hi)-u64(lo)))
+	// The width and the sum are computed modulo 2^64: exact for every lo < hi.
+	return lo +% i64(r.U64n(u64(hi)-%u64(lo)))
 }
 
 // F64 returns a uniform float in [0, 1) built from 53 random bits.
@@ -276,7 +278,7 @@ mut gSeeded bool
 // seedCore seeds this core's generator from the wall clock, the monotonic clock and the core id.
 fn seedCore() {
 	gSeeded = true
-	g.Seed(u64(rt_wall_ns()) ^ mix(u64(rt_mono_ns())+u64(rt_core_id())*0x9e3779b97f4a7c15))
+	g.Seed(u64(rt_wall_ns()) ^ mix(u64(rt_mono_ns())+%u64(rt_core_id())*%0x9e3779b97f4a7c15))
 }
 
 // taped is the generator of the request whose tape is tp: seeded at its first draw from this

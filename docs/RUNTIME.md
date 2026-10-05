@@ -221,7 +221,9 @@ fires. Messages are copied into the receiver's request pool.
 - The walk skips `rt_` frames and stops at the program entry.
 - On Linux the linker emits a read-only Tin table of function start/end/name records.
   Backtrace lookup uses image-relative ranges, including under ASLR; printed names stay unchanged.
-- `rt_bounds_fail2(i, n)` and `rt_div_fail()` are the cold paths of failed checks.
+- `rt_bounds_fail2(i, n)`, `rt_div_fail()` and `rt_overflow_fail(kind)` (integer overflow,
+  shift count or float conversion out of range, #362) are the cold paths of failed checks.
+  The runtime's own code is not overflow-checked: it computes with the machine's arithmetic.
 
 ## 8. The OS layer
 
@@ -423,7 +425,7 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
 - Deadlines: each request's waits give up at `anvil.Deadline(ms)` / `TIN_DEADLINE_MS`
   (default 30 s) after it started: `tide.Wait` then fails with `deadline exceeded`.
 - Backpressure: at 4096 waiting requests on a core, new requests get 503.
-- A panic in a handler (an index out of range, a division by zero, `panic`) ends only its
+- A panic in a handler (an index out of range, a division by zero, an integer overflow, `panic`) ends only its
   request: `panic: ...` and the backtrace go to stderr, the task's cleanups run and its pool
   is reset, its stack is abandoned and reused, and the request gets 500 and its connection
   closes. Other requests, waiting ones on the same core included, go on. Before the cleanups,

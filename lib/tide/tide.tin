@@ -140,7 +140,7 @@ fn FormatDuration(d i64) str {
 	mut u = u64(d)
 	let neg = d < 0
 	if neg {
-		u = 0 - u
+		u = 0 -% u
 	}
 	if u < Second {
 		mut prec = 0
@@ -345,7 +345,7 @@ fn ParseDuration(s str) !i64 {
 		}
 	}
 	if neg {
-		return 0 - i64(d)
+		return 0 -% i64(d)
 	}
 	if d > top-1 {
 		fail say.Fault("time: invalid duration %s", quote(s))
@@ -500,15 +500,24 @@ fn UTC(ns i64) Civil {
 	return c
 }
 
-// Date returns the Unix nanoseconds of the UTC civil time; out-of-range fields carry like Go's time.Date (month 13 is January of the next year).
+// Date returns the Unix nanoseconds of the UTC civil time; out-of-range fields carry like Go's time.Date (month 13 is January of the next year), and a time outside the years 1677..2262 that i64 nanoseconds hold panics (integer overflow).
 fn Date(year i64, month i64, day i64, hour i64, min i64, sec i64, nano i64) i64 {
 	mut m = month - 1
 	let q = floorDiv(m, 12)
 	year += q
 	m -= q * 12
 	let days = DaysFromCivil(year, m+1, 1) + day - 1
-	let total = days*86400 + hour*3600 + min*60 + sec
-	return total*Second + nano
+	mut total = days*86400 + hour*3600 + min*60 + sec
+	// Carry whole seconds out of nano, and for a negative time borrow one back, so that every
+	// time i64 nanoseconds can hold is computed without an intermediate overflow (#362).
+	let carry = floorDiv(nano, Second)
+	total += carry
+	mut ns = nano - carry*Second
+	if total < 0 && ns > 0 {
+		total += 1
+		ns -= Second
+	}
+	return total*Second + ns
 }
 
 // Unix returns the Unix nanoseconds of c (the inverse of UTC; Weekday and YearDay are ignored, other fields carry).

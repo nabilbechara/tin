@@ -1,0 +1,110 @@
+package main
+
+// The compiler drops an overflow check only when the operands' ranges prove the result fits
+// (#362): loop counters below their bound, locals defined once, lengths. These cases are at
+// the edge of what it may prove; each one that can overflow must still panic.
+
+import "fault"
+import "say"
+
+fn show(name str, f fn() str) {
+	let v = guard {
+		f()
+	} catch err {
+		if fault.Is(err, fault.Panic) {
+			say.Line(name, "panic")
+		} else {
+			say.Line(name, "fault", err)
+		}
+		return
+	}
+	say.Line(name, "=", v)
+}
+
+// scaled multiplies loop counters bounded by an unknown n: i + 1 fits, i * k may not.
+fn scaled(n i64, k i64) i64 {
+	mut s = i64(0)
+	for i in 0..n {
+		s = i * k + (i + 1)
+	}
+	return s
+}
+
+fn main() {
+	// A counter the body reassigns has no range.
+	show("reassigned", fn() str {
+		mut out = i64(0)
+		for i in 0..3 {
+			if i == 1 {
+				i = 9223372036854775807 - 1
+			}
+			out = i * 2
+		}
+		return say.Str(out)
+	})
+	// Locals defined once carry their value's range.
+	show("let fits", fn() str {
+		let a = i64(3000000000)
+		let b = a * a
+		return say.Str(b)
+	})
+	show("let overflows", fn() str {
+		let a = i64(3000000000)
+		let b = a * a
+		let c = b + a * a
+		return say.Str(c)
+	})
+	// A local assigned twice has no range.
+	show("assigned twice", fn() str {
+		mut a = i64(3)
+		a = 9223372036854775807
+		return say.Str(a + 1)
+	})
+	// A u8 counter below 255 still overflows u8 when 10 is added.
+	show("u8 counter", fn() str {
+		mut last = u8(0)
+		for k in u8(250)..u8(255) {
+			last = k + 10
+		}
+		return say.Str(last)
+	})
+	show("u8 counter fits", fn() str {
+		mut last = u8(0)
+		for k in u8(240)..u8(245) {
+			last = k + 10
+		}
+		return say.Str(last)
+	})
+	// An unknown bound: the counter's + 1 is safe, its product is not.
+	show("scaled small", fn() str {
+		return say.Str(scaled(10, 1000))
+	})
+	show("scaled big", fn() str {
+		return say.Str(scaled(10, 4611686018427387904))
+	})
+	// Lengths are below 2^56, so index arithmetic on them fits; a large factor does not.
+	show("length", fn() str {
+		let xs = []i64{1, 2, 3, 4}
+		mut t = i64(0)
+		for i in 0..len(xs) {
+			t += i * 31 + xs[i]
+		}
+		return say.Str(t)
+	})
+	show("length big factor", fn() str {
+		let xs = []i64{1, 2, 3, 4}
+		mut t = i64(0)
+		for i in 0..len(xs) {
+			t = i * 4611686018427387904
+		}
+		return say.Str(t)
+	})
+	// A step past the end of the range panics instead of wrapping.
+	show("step", fn() str {
+		mut n = 0
+		for i in (9223372036854775800..9223372036854775807).step(4) {
+			n += 1
+		}
+		return say.Str(n)
+	})
+}

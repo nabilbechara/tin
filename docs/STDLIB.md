@@ -744,7 +744,7 @@ Package tide is clocks, durations and civil (calendar) time in UTC, like Go's ti
 - `CivilFromDays(z i64) (i64, i64, i64)`: CivilFromDays returns the (year, month, day) that is z days after 1970-01-01.
 - `UTCSec(sec i64) Civil`: UTCSec breaks Unix seconds into UTC calendar fields (Nano is 0); it covers every i64 second.
 - `UTC(ns i64) Civil`: UTC breaks the Unix-nanosecond instant ns into its UTC calendar fields.
-- `Date(year i64, month i64, day i64, hour i64, min i64, sec i64, nano i64) i64`: Date returns the Unix nanoseconds of the UTC civil time; out-of-range fields carry like Go's time.Date (month 13 is January of the next year).
+- `Date(year i64, month i64, day i64, hour i64, min i64, sec i64, nano i64) i64`: Date returns the Unix nanoseconds of the UTC civil time; out-of-range fields carry like Go's time.Date (month 13 is January of the next year), and a time outside the years 1677..2262 that i64 nanoseconds hold panics (integer overflow).
 - `Unix(c Civil) i64`: Unix returns the Unix nanoseconds of c (the inverse of UTC; Weekday and YearDay are ignored, other fields carry).
 - `UnixSec(c Civil) i64`: UnixSec returns the Unix seconds of c, rounded toward negative infinity.
 - `WeekdayName(d i64) str`: WeekdayName returns the English name of weekday d (0 = Sunday), or "%!Weekday(d)" with d unsigned like Go.
@@ -814,7 +814,7 @@ Package sift sorts and searches slices and has the generic functions on them (li
 - `UniqInts(xs mut []i64) i64`: UniqInts compacts runs of equal values in sorted xs to one element and returns the new length (xs[0:k] is the result).
 - `MinInts(xs []i64) !i64`: MinInts returns the smallest element of xs, or a fault when xs is empty.
 - `MaxInts(xs []i64) !i64`: MaxInts returns the largest element of xs, or a fault when xs is empty.
-- `SumInts(xs []i64) i64`: SumInts returns the sum of xs (wrapping on overflow, 0 for an empty slice).
+- `SumInts(xs []i64) i64`: SumInts returns the sum of xs (0 for an empty slice); it panics when the sum overflows i64.
 - `IndexInts(xs []i64, x i64) i64`: IndexInts returns the index of the first x in xs, or -1.
 - `ContainsStr(xs []str, x str) bool`: ContainsStr reports whether x occurs in xs.
 - `EqualInts(a []i64, b []i64) bool`: EqualInts reports whether a and b have the same length and elements.

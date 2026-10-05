@@ -486,6 +486,10 @@ fn line_end(p i64, at i64) i64 {
 	return at
 }
 
+// raw_int is the decimal number at the start of the bytes [from, to) at p. It stops at the
+// first byte that is not a digit, so the text of a '+' or '-' line reads as 0, and a number
+// beyond the i64 range is clamped to it. It counts down from 0 so that the most negative
+// i64 parses.
 fn raw_int(p i64, from i64, to i64) i64 {
 	mut neg = false
 	if from < to && load8(p+from) == '-' {
@@ -494,13 +498,24 @@ fn raw_int(p i64, from i64, to i64) i64 {
 	}
 	mut v = 0
 	for from < to {
-		v = v*10 + i64(load8(p+from)) - '0'
+		let d = i64(load8(p+from)) - '0'
+		if d < 0 || d > 9 {
+			break
+		}
+		if v < (-9223372036854775807 - 1 + d) / 10 {
+			v = -9223372036854775807 - 1
+			break
+		}
+		v = v*10 - d
 		from += 1
 	}
 	if neg {
-		return -v
+		return v
 	}
-	return v
+	if v == -9223372036854775807 - 1 {
+		return 9223372036854775807
+	}
+	return -v
 }
 
 // resp_len is the length of the first complete reply in the n bytes at p: -1 while it

@@ -28,6 +28,7 @@ shared mut x_syms []i64 // symbol table: id -> sym_ref word (memory operands onl
 shared mut x_fn_labels []i64 // function index -> entry label
 shared mut x_nstack i64 // stack parameters of the current function
 shared mut x_div_label i64 // the current function's divide-by-zero stub, once used
+shared mut x_ovf_labels []i64 // the current function's overflow stub per OVK_* kind, 0 until used (#362)
 
 fn x_label(l i64) {
 	emit1(X_LABEL, l)
@@ -375,6 +376,229 @@ fn x_divide(dst i64, a i64, b_in i64, unsigned i64, rem i64) {
 		}
 	}
 	x_label(done_l)
+}
+
+// ---- checked integer arithmetic (#362), mirroring gen.tin ----
+// x_ovf_stub is the label of the current function's cold stub for check kind k.
+fn x_ovf_stub(k i64) i64 {
+	if x_ovf_labels[k] == 0 {
+		x_ovf_labels[k] = new_label()
+	}
+	return x_ovf_labels[k]
+}
+
+// x_narrow_check jumps to the stub of kind k unless r, the exact 64-bit result of an operation
+// on a narrow type, fits t.
+fn x_narrow_check(t Ty, r i64, k i64) {
+	if t.signed != 0 {
+		emit3(X_SXT, XSCR, r, width_log2(t.width))
+		emit2(X_CMP, XSCR, r)
+	} else {
+		x_mov(XSCR, r)
+		emit2(X_SHRI, XSCR, 8 * t.width)
+	}
+	emit2(X_JCC, XC_NE, x_ovf_stub(k))
+}
+
+// x_checked_flags jumps to the stub after add/sub/imul: on OF for signed, CF for unsigned.
+fn x_checked_flags(k i64, signed i64) {
+	if signed != 0 {
+		emit2(X_JCC, XC_O, x_ovf_stub(k))
+	} else {
+		emit2(X_JCC, XC_B, x_ovf_stub(k))
+	}
+}
+
+// x_checked_neg is dst = -x, panicking when the negation does not fit t.
+fn x_checked_neg(t Ty, dst i64, x i64) {
+	x_mov(dst, x)
+	emit1(X_NEG, dst)
+	if int_width(t) != 8 {
+		x_narrow_check(t, dst, OVK_NEG)
+		return
+	}
+	// neg sets OF for the most negative value and CF for every value but 0.
+	x_checked_flags(OVK_NEG, t.signed)
+}
+
+// x_checked_rr is dst = a op b for + - * on registers, panicking on overflow of type t.
+fn x_checked_rr(op i64, dst i64, a i64, b i64, t Ty) {
+	let k = ovf_kind(op)
+	if int_width(t) != 8 {
+		x_arith(op, dst, a, b)
+		x_narrow_check(t, dst, k)
+		return
+	}
+	let signed = i64(cast(i64, t) == 0 || t.signed != 0)
+	if k == OVK_MUL && signed == 0 {
+		// mul leaves the high half in rdx and sets CF when it is not zero.
+		x_mov(RAX, a)
+		emit1(X_MULU, b)
+		emit2(X_JCC, XC_B, x_ovf_stub(k))
+		x_mov(dst, RAX)
+		return
+	}
+	x_arith(op, dst, a, b)
+	x_checked_flags(k, signed)
+}
+
+// x_checked_const is dst = l op c for + - * with a constant, panicking on overflow of type t.
+fn x_checked_const(op i64, dst i64, l i64, c i64, t Ty) {
+	let k = ovf_kind(op)
+	if int_width(t) != 8 {
+		x_binary_const(op, dst, l, c)
+		x_narrow_check(t, dst, k)
+		return
+	}
+	let signed = i64(cast(i64, t) == 0 || t.signed != 0)
+	if k == OVK_MUL {
+		if c == 0 {
+			x_load_imm(dst, 0)
+		} else if c == 1 {
+			x_mov(dst, l)
+		} else if c == -1 && signed != 0 {
+			x_checked_neg(t, dst, l)
+		} else if signed != 0 && x64_fits32(c) != 0 {
+			emit3(X_IMUL_RRI, dst, l, c)
+			x_checked_flags(k, signed)
+		} else {
+			x_load_imm(XSCR, c)
+			x_checked_rr(op, dst, l, XSCR, t)
+		}
+		return
+	}
+	if c == 0 {
+		x_mov(dst, l)
+		return
+	}
+	if x64_fits32(c) != 0 && (c > 0 || signed != 0) && c != -2147483648 {
+		x_mov(dst, l)
+		if k == OVK_ADD {
+			emit2(X_ADDI, dst, c)
+		} else {
+			emit2(X_SUBI, dst, c)
+		}
+		x_checked_flags(k, signed)
+		return
+	}
+	x_load_imm(XSCR, c)
+	x_checked_rr(op, dst, l, XSCR, t)
+}
+
+// x_gen_checked_binary generates a binary operation the checker marked OVF_CHECK (see gen.tin).
+fn x_gen_checked_binary(e Binary, dst i64, d i64) {
+	let op = e.op
+	let t = cast(Ty, cast(Node, e).type_)
+	mut l = e.l
+	mut r = e.r
+	arith_unsigned = e_unsigned(cast(Node, e))
+	if streq(op, cstr("<<")) != 0 || streq(op, cstr(">>")) != 0 {
+		let bits = 8 * int_width(t)
+		if is_const(r) != 0 {
+			let c = const_val(r)
+			let lv = x_gen_val(l, d)
+			if c < 0 || c >= bits {
+				emit1(X_JMP, x_ovf_stub(OVK_SHIFT))
+				x_mov(dst, lv)
+				return
+			}
+			arith_unsigned = e_unsigned(cast(Node, e))
+			if arith_unsigned != 0 && x_uconst(op, dst, lv, c) != 0 {
+				x_mask(cast(Node, e), dst)
+				return
+			}
+			x_binary_const(op, dst, lv, c)
+			x_mask(cast(Node, e), dst)
+			return
+		}
+		x_gen_pair(l, r, d)
+		arith_unsigned = e_unsigned(cast(Node, e))
+		// One unsigned compare rejects negative counts too.
+		emit2(X_CMPI, pr, bits)
+		emit2(X_JCC, XC_AE, x_ovf_stub(OVK_SHIFT))
+		x_arith(op, dst, pl, pr)
+		x_mask(cast(Node, e), dst)
+		return
+	}
+	if streq(op, cstr("/")) != 0 {
+		if is_const(r) != 0 && const_val(r) != -1 {
+			let lv = x_gen_val(l, d)
+			arith_unsigned = e_unsigned(cast(Node, e))
+			x_binary_const(op, dst, lv, const_val(r))
+			x_mask(cast(Node, e), dst)
+			return
+		}
+		x_gen_pair(l, r, d)
+		arith_unsigned = e_unsigned(cast(Node, e))
+		if int_width(t) == 8 {
+			// Only the most negative value / -1 overflows: negating it sets OF.
+			let ok = new_label()
+			emit2(X_CMPI, pr, -1)
+			emit2(X_JCC, XC_NE, ok)
+			x_mov(XSCR, pl)
+			emit1(X_NEG, XSCR)
+			emit2(X_JCC, XC_O, x_ovf_stub(OVK_DIV))
+			x_label(ok)
+			x_arith(op, dst, pl, pr)
+			return
+		}
+		x_arith(op, dst, pl, pr)
+		x_narrow_check(t, dst, OVK_DIV)
+		return
+	}
+	if (streq(op, cstr("+")) != 0 || streq(op, cstr("*")) != 0) && is_const(l) != 0 {
+		let tmp = l
+		l = r
+		r = tmp
+	}
+	if is_const(r) != 0 {
+		let lv = x_gen_val(l, d)
+		x_checked_const(op, dst, lv, const_val(r), t)
+		return
+	}
+	x_gen_pair(l, r, d)
+	x_checked_rr(op, dst, pl, pr, t)
+}
+
+// x_f2i_check jumps to the conversion stub unless float v truncates into the 64-bit range of t
+// (see f2i_check in gen.tin); ucomisd marks NaN with PF.
+fn x_f2i_check(t Ty, v i64) {
+	mut hi = 0x43e0000000000000
+	mut lo = 0xc3e0000000000000
+	mut below = XC_B
+	if is_unsigned_t(t) != 0 {
+		hi = 0x43f0000000000000
+		lo = 0xbff0000000000000
+		below = XC_BE
+	}
+	x_load_imm(XSCR, hi)
+	emit2(X_MOVQ, XFSCR, XSCR)
+	emit2(X_UCOMISD, v, XFSCR)
+	emit2(X_JCC, XC_P, x_ovf_stub(OVK_CONV))
+	emit2(X_JCC, XC_AE, x_ovf_stub(OVK_CONV))
+	x_load_imm(XSCR, lo)
+	emit2(X_MOVQ, XFSCR, XSCR)
+	emit2(X_UCOMISD, v, XFSCR)
+	emit2(X_JCC, below, x_ovf_stub(OVK_CONV))
+}
+
+// x_gen_ovf_stubs emits the current function's cold overflow stubs (stack realigned, since a
+// frameless leaf may jump here): rt_overflow_fail(kind).
+fn x_gen_ovf_stubs() {
+	let of = find_fn(cstr("rt_overflow_fail"))
+	mut k = 0
+	for k < OVK_COUNT {
+		if x_ovf_labels[k] != 0 {
+			x_label(x_ovf_labels[k])
+			emit2(X_ANDI, RSP, -16)
+			x_load_imm(RDI, k)
+			if cast(i64, of) != 0 {
+				emit1(X_CALL, x_sym(SK_FN, of.index))
+				of.used = 1
+			}
+		}
+		k = k + 1
+	}
 }
 
 // x_arith emits dst = a op b for integer registers (arith_unsigned picks the unsigned forms).
@@ -875,6 +1099,10 @@ fn x_gen_unary(e Unary, dst i64, d i64) {
 		emit2(X_XORPD, dst, XFSCR)
 		return
 	}
+	if streq(op, cstr("-")) != 0 && e.ovf == OVF_CHECK {
+		x_checked_neg(cast(Ty, cast(Node, e).type_), dst, x)
+		return
+	}
 	if streq(op, cstr("-")) != 0 {
 		x_mov(dst, x)
 		emit1(X_NEG, dst)
@@ -913,6 +1141,10 @@ fn x_gen_binary(e Binary, dst i64, d i64) {
 	}
 	if is_fp(dst) != 0 {
 		x_gen_fbinary(e, dst, d)
+		return
+	}
+	if e.ovf == OVF_CHECK {
+		x_gen_checked_binary(e, dst, d)
 		return
 	}
 	mut l = e.l
@@ -1048,12 +1280,20 @@ fn x_gen_conv(e i64, dst i64, d i64) {
 			emit2(X_CVTSI2SD, dst, v)
 		}
 	} else if k == CV_F2I {
-		if is_unsigned_t(cast(Ty, cast(Node, e).type_)) != 0 && cast(Ty, cast(Node, e).type_).width == 8 {
+		let ft = cast(Ty, cast(Node, e).type_)
+		if cast(Conv, e).ovf == OVF_CHECK {
+			x_f2i_check(ft, v)
+		}
+		if is_unsigned_t(ft) != 0 && ft.width == 8 {
 			x_cvt_f2u(dst, v)
 		} else {
 			emit2(X_CVTTSD2SI, dst, v)
 		}
-		x_canon(cast(Ty, cast(Node, e).type_), dst)
+		if cast(Conv, e).ovf == OVF_CHECK && int_width(ft) != 8 {
+			x_narrow_check(ft, dst, OVK_CONV)
+		} else {
+			x_canon(ft, dst)
+		}
 	} else if k == CV_TOBYTE {
 		emit3(X_ZXT, dst, v, 0)
 	} else if k == CV_INT {
@@ -2373,6 +2613,13 @@ fn x_try_if_increment(s IfStmt) i64 {
 	let cc = x_gen_flags(s.cond, 0)
 	// LEA preserves the flags set by the condition and avoids spilling x + 1 while
 	// compiler-created condition sequences are evaluated.
+	if cast(Binary, a.value).ovf == OVF_CHECK {
+		// Checked (#362): add the condition (0 or 1) with add, which sets OF and CF.
+		x_setcc(XSCR, cc, 0)
+		emit2(X_ADD, x.reg, XSCR)
+		x_checked_flags(OVK_ADD, i64(is_unsigned_t(cast(Ty, x.type_)) == 0))
+		return 1
+	}
 	emit2(X_LEA, XSCR, x_mem1(x.reg, 1))
 	emit3(X_CMOVCC, x.reg, XSCR, cc)
 	return 1
@@ -2906,6 +3153,7 @@ fn x_gen_fn(f Fn) {
 	trap_label = 0
 	x_div_label = 0
 	trap_sites = []i64{}
+	x_ovf_labels = make([]i64, OVK_COUNT)
 	poll_sites = []i64{}
 	if host_getenv(cstr("TINC_TRACE")) != 0 {
 		let tb = buf_new()
@@ -2915,6 +3163,7 @@ fn x_gen_fn(f Fn) {
 		write_all(2, cast([]u8, cast([]i64, tb)))
 	}
 	inline_appends(f)
+	ovf_elide_fn(f)
 	licm_fn(f)
 	analyze_fn(f)
 	used_regs = 0
@@ -2965,6 +3214,7 @@ fn x_gen_fn(f Fn) {
 			df.used = 1
 		}
 	}
+	x_gen_ovf_stubs()
 	// Per-site stubs: the index and length go through the stack into rdi/rsi (any registers),
 	// and the stack is realigned since a frameless leaf may jump here.
 	mut ts = 0

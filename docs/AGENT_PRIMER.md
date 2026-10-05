@@ -34,9 +34,13 @@ the compiler: write a minimal repro to notes/compiler_bugs_NAME.md and work arou
   it, so `mut ys = xs` is one slice under two names: copy for a snapshot, sift.Clone; reading ys after append grew xs is E641), map[K]V (K = str, ints, bool, f64, or structs/enums of those, by value; insertion-ordered),
   struct (reference, never nil; == compares fields by value, same(a, b) is identity; a struct with a slice/map/func field cannot be compared, E237), ?T optional (may be nil; T a number, bool or reference: ?i64 is a boxed value, narrow it with != nil, store it in a global as keep(5)), fault (error;
   nil = ok), fn(A) R function values (top-level functions or literals, which may capture).
-- No implicit conversions: i64(x), u8(x), f64(x), str(c) for a rune/byte, str(bytes []u8). Untyped
-  constants adapt and must fit. Conditions must be bool. Integer overflow wraps; division by zero
-  panics; shift counts are taken mod 64. Literals: 0x, 0b, 0o, 1_000; units `200ms` `5s` `1h`
+- No implicit conversions: i64(x), u8(x) (truncates: the low byte), f64(x), str(c) for a rune/byte,
+  str(bytes []u8). Untyped constants adapt and must fit; constant arithmetic is exact (E223).
+  Conditions must be bool. Integer + - * and negation panic on overflow (`integer overflow: +`; in a
+  handler: 500, the core goes on), signed / panics on MIN / -1, division by zero panics, a shift
+  count must be below the width, i64(f) panics out of range or on NaN. Where wrapping is the intent
+  (hashes, checksums, PRNGs) write `h *%= prime`, `a +% b`, `a -% b`, or a whole `@wrap fn` kernel;
+  never rely on wrap otherwise. Literals: 0x, 0b, 0o, 1_000; units `200ms` `5s` `1h`
   (nanoseconds, for tide and `within`) and `64kb` `4mb` (bytes).
 - Structs: `type User struct {` one `name Type` per line `}`; literals always name fields:
   `User{id: 1, name: "a"}`. `@json("id") id i64` sets a JSON key. Methods:
@@ -160,6 +164,9 @@ differences go in NAME_darwin.tin / NAME_linux.tin (see docs/PORTING.md); never 
 flag value in shared code. Runtime helpers you may call: rt_str_from_raw(p, n) str, rt_str_new(n) i64
 (len set, bytes at +8), rt_append_str(cast(i64, b), s), rt_slice_grow(h, need, esz), rt_alloc(n),
 rt_ingot_alloc(n), rt_core_id(), rt_errno(). Prefer plain Tin over raw tricks unless speed demands it.
+Library packages are overflow-checked like user code: mark intended wraps (`+%`, `-%`, `*%`, or `@wrap fn`
+for a hash, PRNG or constant-time crypto kernel), and write the magnitude of a negative i64 as
+`u64(0 -% v)` (0 - v panics for the most negative value). Only lib/runtime/ keeps machine arithmetic.
 Keep comments one line, ending with a period.
 
 ## Standard library (import instead of re-implementing)

@@ -103,6 +103,10 @@ const IF_INIT = 5
 const TX_A = 2
 const TX_B = 3
 const ELEM_SAFE = 7 // index proven in range: no bounds check
+// Binary.ovf and Unary.ovf (#362): wrapping by default for compiler-made nodes, checked when the checker says so.
+const OVF_WRAP = -1 // written +%, -% or *%: arithmetic modulo 2^width
+const OVF_NONE = 0 // no run-time check (compiler-made, @wrap, or proven in range)
+const OVF_CHECK = 1 // panics when the result does not fit the type (or a shift count the width)
 const ARM_POS = 0
 const ARM_PATTERNS = 1
 const ARM_GUARD = 2
@@ -1820,7 +1824,7 @@ fn parse_simple_stmt(xs []i64) i64 {
 		let t = cast(Token, p_next()).text
 		let a = cast(AssignStmt, node_new(ST_ASSIGN, pos))
 		a.target = x
-		a.value = binary_new(pos, str_slice(t, strlen(t) - 1), x, parse_expr(1))
+		a.value = op_binary_new(pos, str_slice(t, strlen(t) - 1), x, parse_expr(1))
 		return cast(i64, a)
 	}
 	if p_is(cstr("++")) != 0 || p_is(cstr("--")) != 0 {
@@ -2277,7 +2281,24 @@ fn bin_prec(t Token) i64 {
 	if streq(s, cstr("*")) != 0 || streq(s, cstr("/")) != 0 || streq(s, cstr("%")) != 0 || streq(s, cstr("<<")) != 0 || streq(s, cstr(">>")) != 0 || streq(s, cstr("&")) != 0 {
 		return 5
 	}
+	if p_edition1 != 0 && (streq(s, cstr("+%")) != 0 || streq(s, cstr("-%")) != 0) {
+		return 4
+	}
+	if p_edition1 != 0 && streq(s, cstr("*%")) != 0 {
+		return 5
+	}
 	return 0
+}
+
+// op_binary_new makes the binary node for operator text op: the wrapping forms +%, -% and *%
+// are + - * marked OVF_WRAP (#362).
+fn op_binary_new(pos i64, op i64, l i64, r i64) i64 {
+	if strlen(op) == 2 && i64(load8(op + 1)) == '%' {
+		let b = cast(Binary, binary_new(pos, str_slice(op, 1), l, r))
+		b.ovf = OVF_WRAP
+		return cast(i64, b)
+	}
+	return binary_new(pos, op, l, r)
 }
 
 // parse_expr is a precedence-climbing parser for left-associative binary operators.
@@ -2291,7 +2312,7 @@ fn parse_expr(min_prec i64) i64 {
 		}
 		p_next()
 		let right = parse_expr(prec + 1)
-		left = binary_new(t.pos, t.text, left, right)
+		left = op_binary_new(t.pos, t.text, left, right)
 	}
 }
 

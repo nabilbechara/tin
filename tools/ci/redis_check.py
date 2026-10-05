@@ -127,6 +127,8 @@ class Fake:
                 return b':%d\r\n' % (1 if self.data.pop(cmd[1], None) is not None else 0)
             if name == b'INCR':
                 v = int(self.data.get(cmd[1], b'0')) + 1
+                if v >= 1 << 63:
+                    return b'-ERR increment or decrement would overflow\r\n'
                 self.data[cmd[1]] = b'%d' % v
                 return b':%d\r\n' % v
             if name == b'PEXPIRE':
@@ -297,6 +299,14 @@ def check(exe, ctx):
         print('MULTI/EXEC: %r' % body)
         if code != 200 or b'Int(7)' not in body:
             failures.append('MULTI/EXEC: %d %r' % (code, body))
+        # Integer replies at the edge of i64, then the error line Redis sends past it: a reply
+        # is parsed without overflowing (#362).
+        get(srv.port, '/set?key=%s-big&value=9223372036854775806' % key)
+        top = get(srv.port, '/incr?key=%s-big' % key)
+        past = get(srv.port, '/incr?key=%s-big' % key)
+        print('INCR to the i64 maximum: %d %r; past it: %d %r' % (top[0], top[1], past[0], past[1]))
+        if top[:2] != (200, b'9223372036854775807') or past[0] != 502 or b'would overflow' not in past[1]:
+            failures.append('INCR at the i64 maximum: %r then %r' % (top[:2], past[:2]))
     finally:
         srv.stop()
 

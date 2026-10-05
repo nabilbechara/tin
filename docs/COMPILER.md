@@ -113,8 +113,18 @@ structure), so type identity is pointer equality.
 ## 4. Checking and lowering (strict files)
 
 - Untyped constants adapt to the expected type and must fit (`adapt_int`); integer
-  constant expressions are folded exactly (`fold_const`, `fold_compare`), with values
-  above 2^63-1 treated as unsigned.
+  constant expressions are folded exactly (`fold_const`, `fold_compare`, `const_value`):
+  `+ - *` and negation through `const_exact` (128-bit, E223 outside -2^63 .. 2^64-1; a
+  result above 2^63-1 is `big` 2 and fits only unsigned 64-bit types, a literal's `big` 1
+  keeps its bits as an `i64`), with values above 2^63-1 treated as unsigned.
+- Overflow checks (#362): `chk_binary` and `chk_unary` set `Binary.ovf` / `Unary.ovf` to
+  `OVF_CHECK` on integer `+ - *`, negation, signed `/` and shifts with a non-constant count
+  (`ovf_mode`: user code, library packages and tools; not `lib/runtime/`, `selfhost/`,
+  compiler-made helpers or `@wrap` functions, whose closures and generic instances follow
+  them); `+% -% *%` parse to `+ - *` with `OVF_WRAP`. Constant operands that overflow are
+  E223, constant shift counts out of range E224. `CV_F2I` conversions carry `Conv.ovf`
+  (`range_mode`, also in `@wrap`). Compiler-made nodes are unchecked by default (ovf 0).
+  `TINC_OVERFLOW=0..3` selects the scope for measurements (default 2).
 - Binary operators require identical operand types; `&&` narrows optionals for its right
   side; conditions must be `bool`.
 - Calls: argument types must be assignable; untyped arguments are converted; variadic C
@@ -187,6 +197,16 @@ Registers:
 - Bounds checks: `cmp idx, len; b.hs stub`, where each site's cold stub passes index and
   length to `rt_bounds_fail2`. Division checks the divisor with `cbz` to a stub calling
   `rt_div_fail`.
+- Overflow checks (`gen_checked_binary`): 64-bit `adds`/`subs` then `b.vs` (signed) or
+  `b.hs`/`b.lo` (unsigned); `*` computes `smulh`/`umulh` beside `mul` and compares the high
+  half with the sign of the low (or with zero); narrow types do the 64-bit operation, which
+  is exact, and compare the result with its own sign or zero extension (`narrow_check`).
+  A failed check jumps to one cold stub per kind per function, `rt_overflow_fail(kind)`.
+  Variable shift counts are compared unsigned with the width; `CV_F2I` compares the float
+  with ±2^63 (0..2^64 unsigned) before converting. The amd64 back end uses `jo`/`jb` after
+  `add`/`sub`/`imul`, `mul` for u64 products and `ucomisd` + `jp` for conversions.
+  `may_panic` and `speculable` treat checked operations like divisions: never hoisted or
+  speculated. `if c { x += 1 }` checked is `cset` + `adds` + `b.vs` (`setcc` + `add` + `jo`).
 - Optimizations here: leaf functions without frames, early-exit base cases of recursive
   functions inlined at call sites, rotated loops, `csel`/`fcsel` if-conversion, `madd`,
   branch inversion, constant materialization, shift-and-add strength reduction, signed
@@ -201,6 +221,7 @@ Registers:
 | `inline_small_calls` | inline.tin | inlines functions whose body is one `return expr` (≤ 40 nodes), substituting simple arguments (and pure single-use ones when the whole call is pure), temps in order otherwise |
 | float intrinsics | inline.tin | `sqrt`, `fabs`, `floor`, `ceil`, `trunc`, `round`, `rint` externs become single instructions |
 | `inline_appends` | inline.tin | `append(s, v)` and `append(b, str...)` get an inline capacity check and store; short literal appends become constant stores |
+| `ovf_elide_fn` | opt.tin | drops overflow checks that cannot fire, from operand ranges: constants, `len`/`cap` (below 2^56), narrow types, locals defined once (`Sym.defs`), and counters of `let i = a; while i < b; i = i + c` loops (#362) |
 | `licm_fn` | opt.tin | hoists loop-invariant expressions (including slice headers when the loop makes no calls) and rewrites `x[a+b]` row addressing |
 | prefetch | opt.tin | strided prefetch ahead of indexed loads in loops |
 | `analyze_fn` | opt.tin | leaf detection, loop-weighted use counts, address-taken locals |
@@ -235,7 +256,7 @@ underscore only in Mach-O.
 
 The compiler emits calls to these `lib/runtime/` functions (others are reached from
 them): `rt_init`, `rt_main_begin`, `rt_exit`, `rt_alloc`, `rt_panic`, `rt_bounds_fail`,
-`rt_bounds_fail2`, `rt_div_fail`, `rt_fail`, `rt_str_*` (cat, eq, cmp, sub, from_bytes,
+`rt_bounds_fail2`, `rt_div_fail`, `rt_overflow_fail`, `rt_fail`, `rt_str_*` (cat, eq, cmp, sub, from_bytes,
 from_rune), `rt_utf8`, `rt_bytes_from_str`, `rt_copy_str`, `rt_slice_make`,
 `rt_slice_make_str`, `rt_slice_make_nest`, `rt_slice_make_grid`, `rt_slice_sub`,
 `rt_slice_copy`, `rt_append`, `rt_slice_appendn`, `rt_append_str`, `rt_map_*` (make,

@@ -708,6 +708,7 @@ fn check() {
 	// Bounds-check traps call it from code the backend generates.
 	mark_reach(find_fn(cstr("rt_bounds_fail")))
 	mark_reach(find_fn(cstr("rt_bounds_fail2")))
+	mark_reach(find_fn(cstr("rt_overflow_fail")))
 	mark_reach(find_fn(cstr("rt_div_fail")))
 	polls_for_cores()
 	if compiler_polls != 0 {
@@ -1009,17 +1010,32 @@ fn const_value_b(e i64, iota i64) i64 {
 		cv_big = s.big
 		return s.val
 	}
-	if k == EX_UNARY && streq(cast(Unary, e).op, cstr("&")) == 0 {
+	if k == EX_UNARY && streq(cast(Unary, e).op, cstr("-")) == 0 && streq(cast(Unary, e).op, cstr("&")) == 0 {
 		let uv = eval_unary(cast(Unary, e).op, const_value_b(cast(Unary, e).x, iota))
-		cv_big = i64(cv_big != 0 && uv < 0 && streq(cast(Unary, e).op, cstr("-")) == 0)
+		cv_big = i64(cv_big != 0 && uv < 0)
 		return uv
+	}
+	if k == EX_UNARY && streq(cast(Unary, e).op, cstr("-")) != 0 {
+		// Negation is exact (#362).
+		let before = error_count
+		let x = const_value_b(cast(Unary, e).x, iota)
+		if error_count != before {
+			return 0
+		}
+		let nv = const_neg(x, cv_big)
+		if cx_ovf != 0 {
+			const_overflow(cast(Node, e).pos)
+		}
+		cv_big = 2 * cx_big
+		return nv
 	}
 	if k == EX_BINARY {
 		let before = error_count
 		let l = const_value_b(cast(Binary, e).l, iota)
 		let lb = cv_big
 		let r = const_value_b(cast(Binary, e).r, iota)
-		let ub = i64(lb != 0 || cv_big != 0)
+		let rb = cv_big
+		let ub = i64(lb != 0 || rb != 0)
 		cv_big = 0
 		if error_count != before {
 			return 0
@@ -1030,6 +1046,28 @@ fn const_value_b(e i64, iota i64) i64 {
 			return 0
 		}
 		mut res = 0
+		if (streq(op, cstr("<<")) != 0 || streq(op, cstr(">>")) != 0) && (r < 0 || r >= 64) {
+			shift_count_error(cast(Node, e).pos, r, 64, 0)
+			return 0
+		}
+		if is_ovf_op(op) != 0 && cast(Binary, e).ovf != OVF_WRAP {
+			// + - * are exact (#362); a result above 2^63-1 fits only unsigned 64-bit types.
+			res = const_exact(op, l, lb, r, rb)
+			if cx_ovf != 0 {
+				const_overflow(cast(Node, e).pos)
+			}
+			cv_big = 2 * cx_big
+			return res
+		}
+		if streq(op, cstr("<<")) != 0 {
+			// A shift keeps the bits it moves, but losing one is an error (#362).
+			res = const_exact(cstr("*"), l, lb, 1 << r, i64(r == 63))
+			if cx_ovf != 0 {
+				const_overflow(cast(Node, e).pos)
+			}
+			cv_big = cx_big
+			return res
+		}
 		if ub != 0 && (streq(op, cstr(">>")) != 0 || streq(op, cstr("/")) != 0 || streq(op, cstr("%")) != 0) {
 			res = eval_unsigned(op, l, r)
 		} else if ub != 0 && (streq(op, cstr("<")) != 0 || streq(op, cstr("<=")) != 0 || streq(op, cstr(">")) != 0 || streq(op, cstr(">=")) != 0) {
@@ -1043,6 +1081,77 @@ fn const_value_b(e i64, iota i64) i64 {
 	}
 	err_code_at(cast(Node, e).pos, cstr("E220 NOT_CONSTANT"), cstr("expression is not a constant"))
 	return 0
+}
+
+// ---- exact constant arithmetic (#362) ----
+// A constant is an integer in -2^63 .. 2^64-1: its 64 bits, read as unsigned when it is big.
+shared mut cx_big i64 // the last const_exact result is above 2^63-1
+shared mut cx_ovf i64 // the last const_exact result is outside -2^63 .. 2^64-1
+
+// ult is the unsigned a < b.
+fn ult(a i64, b i64) i64 {
+	return i64((a ^ (1 << 63)) < (b ^ (1 << 63)))
+}
+
+// const_exact is a + b, a - b or a * b computed exactly (abig and bbig: the operand is above
+// 2^63-1), as 64 bits with cx_big and cx_ovf saying where the true result lies.
+@wrap fn const_exact(op i64, a i64, abig i64, b i64, bbig i64) i64 {
+	mut ahi = a >> 63
+	if abig != 0 {
+		ahi = 0
+	}
+	mut bhi = b >> 63
+	if bbig != 0 {
+		bhi = 0
+	}
+	mut lo = 0
+	mut hi = 0
+	if streq(op, cstr("+")) != 0 {
+		lo = a + b
+		hi = ahi + bhi + ult(lo, a)
+	} else if streq(op, cstr("-")) != 0 {
+		lo = a - b
+		hi = ahi - bhi - ult(a, b)
+	} else {
+		// The magnitudes multiply as 32-bit halves into 128 bits; the sign is applied after.
+		mut ma = a
+		if ahi != 0 {
+			ma = 0 - a
+		}
+		mut mb = b
+		if bhi != 0 {
+			mb = 0 - b
+		}
+		let m32 = 0xffffffff
+		let a0 = ma & m32
+		let a1 = (ma >> 32) & m32
+		let b0 = mb & m32
+		let b1 = (mb >> 32) & m32
+		let p00 = a0 * b0
+		let p01 = a0 * b1
+		let p10 = a1 * b0
+		let p11 = a1 * b1
+		let mid = ((p00 >> 32) & m32) + (p01 & m32) + (p10 & m32)
+		lo = (p00 & m32) | (mid << 32)
+		hi = p11 + ((p01 >> 32) & m32) + ((p10 >> 32) & m32) + ((mid >> 32) & m32)
+		if (ahi != 0) != (bhi != 0) {
+			lo = ~lo + 1
+			hi = ~hi + i64(lo == 0)
+		}
+	}
+	cx_ovf = i64(!(hi == 0 || (hi == -1 && lo < 0)))
+	cx_big = i64(hi == 0 && lo < 0)
+	return lo
+}
+
+// const_neg is -v computed exactly (big: v is above 2^63-1), with cx_big and cx_ovf set.
+fn const_neg(v i64, big i64) i64 {
+	return const_exact(cstr("-"), 0, 0, v, big)
+}
+
+// is_ovf_op reports + - and *: the operators whose result can leave the range of their type.
+fn is_ovf_op(op i64) i64 {
+	return i64(streq(op, cstr("+")) != 0 || streq(op, cstr("-")) != 0 || streq(op, cstr("*")) != 0)
 }
 
 fn eval_unary(op i64, v i64) i64 {
@@ -7545,6 +7654,13 @@ fn lower_for_init(s i64) {
 		push_scope()
 		check_stmt(inner.post)
 		pop_scope()
+		// i = i + 1 after a true `i < E` cannot overflow while the body leaves i alone (#362).
+		if cast(Node, init).kind == ST_LET && init_name != 0 && is_increment(inner.post, init_name) != 0 && cast(IntLit, cast(Binary, cast(AssignStmt, inner.post).value).r).val == 1 && cond_below(inner.cond, init_name) != 0 && names_assigned(inner.body, init_name, init_name) == 0 {
+			let lvs = lookup_name_local(init_name)
+			if lvs != 0 && cast(Sym, lvs).captured == 0 && cast(Sym, lvs).cell == 0 {
+				cast(Binary, cast(AssignStmt, inner.post).value).ovf = OVF_NONE
+			}
+		}
 		// A loop variable a closure captures is a fresh variable in each iteration: before the post
 		// statement, move its current value into a new cell, so closures made earlier keep the old one.
 		if cast(Node, init).kind == ST_BLOCK || cast(Node, init).kind == ST_LET {
@@ -7572,6 +7688,11 @@ fn lower_for_init(s i64) {
 	ck_loops = ck_loops - 1
 	ck_breaks = ck_breaks - 1
 	pop_scope()
+}
+
+// cond_below reports whether loop condition c is `name < E`.
+fn cond_below(c i64, name i64) i64 {
+	return i64(cast(Node, c).kind == EX_BINARY && streq(cast(Binary, c).op, cstr("<")) != 0 && cast(Node, cast(Binary, c).l).kind == EX_IDENT && streq(cast(IdentExpr, cast(Binary, c).l).name, name) != 0)
 }
 
 // is_increment matches the unchecked post statement `i = i + c` (i++, i += c) with c > 0.

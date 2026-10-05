@@ -167,9 +167,9 @@ panic, 1 when startup fails, or with the code passed to `quarry.Exit`.
 ### Operators and punctuation
 
 ```text
-+  -  *  /  %  &  |  ^  <<  >>  &&  ||  !  ~
++  -  *  /  %  &  |  ^  <<  >>  &&  ||  !  ~  +%  -%  *%
 ==  !=  <  <=  >  >=
-=  +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=
+=  +=  -=  *=  /=  %=  &=  |=  ^=  <<=  >>=  +%=  -%=  *%=
 (  )  [  ]  {  }  ,  .  :  ..  ...  ?  ??  !  =>  @
 ```
 
@@ -449,9 +449,9 @@ There are no implicit conversions between types. A conversion is a call of the t
 
 | conversion | meaning |
 |---|---|
-| `i64(x)`, `u8(x)`, `i32(x)` ... | integer to integer: truncates to the width, then sign- or zero-extends |
+| `i64(x)`, `u8(x)`, `i32(x)` ... | integer to integer: truncates to the width, then sign- or zero-extends (`u8(x)` is how code asks for the low byte) |
 | `f64(n)` | integer to float |
-| `i64(f)` | float to integer, truncating toward zero |
+| `i64(f)` | float to integer, truncating toward zero; panics when the result does not fit the type or `f` is NaN (section 18) |
 | `str(b)` | `[]u8` to `str` (copies) |
 | `[]u8(s)` | `str` to `[]u8` (copies) |
 | `str(c)` | integer code point to a one-character `str` (UTF-8) |
@@ -569,8 +569,13 @@ const Timeout = 200ms          // a unit literal is an integer constant
   no runtime storage.
 - Untyped constants take the type the context needs and must fit it: `let b u8 = 300` and
   `i8(200)` are compile errors.
-- Constant expressions are folded exactly in 64 bits; values above 2^63-1 are treated as
-  unsigned for `>>`, `/`, `%` and comparisons.
+- Constant arithmetic is exact (#362): `+`, `-`, `*` and negation compute the true value,
+  which must lie in -2^63 .. 2^64-1 and fit the type the constant takes (E223).
+  `9223372036854775807 + 1` is 2^63: a `u64`, but no `i64`. A literal above 2^63-1, or the
+  result of a bit operation (`&`, `|`, `^`, `~`, `<<`, `>>`) on one, keeps its bit pattern
+  as an `i64` (`0xffffffffffffffff` is -1 there); a shift may not lose a set bit. Values above
+  2^63-1 are treated as unsigned for `>>`, `/`, `%` and comparisons. A constant shift count
+  is between 0 and the width less one (E224). `+%`, `-%` and `*%` fold modulo 2^64.
 - A constant used where no type is known becomes an `i64` (integers) or `f64` (floats).
 
 ---
@@ -780,8 +785,8 @@ From the tightest to the loosest; binary operators of one level associate to the
 |---|---|
 | postfix | calls `f(x)`, indexing `s[i]`, slicing `s[lo:hi]`, selectors `x.f`, type arguments `f[T]`, composite literals `T{...}`, `opt ?? fallback` |
 | unary | `-x`, `!x`, `~x` and `^x` (bitwise not), `try e` |
-| 5 | `*`, `/`, `%`, `<<`, `>>`, `&` |
-| 4 | `+`, `-`, `\|`, `^` |
+| 5 | `*`, `/`, `%`, `<<`, `>>`, `&`, `*%` |
+| 4 | `+`, `-`, `\|`, `^`, `+%`, `-%` |
 | 3 | `==`, `!=`, `<`, `<=`, `>`, `>=`; `..` (a range, only after `for ... in`) |
 | 2 | `&&` |
 | 1 | `\|\|` |
@@ -795,11 +800,27 @@ angle brackets, so a comparison never depends on what its operands are.
 
 - Both operands of a binary operator have the same type (after untyped constants adapt):
   `i32 + i64` is an error; convert one side.
-- Integer arithmetic wraps on overflow. Division by zero panics. `/` truncates toward
-  zero; `%` has the sign of the dividend.
-- `>>` is arithmetic for signed types and logical for unsigned types. A shift count is
-  taken modulo 64, the hardware rule (`1 << 64` is 1); narrower types shift in 64 bits
-  and then truncate to their width (`u8(1) << 9` is 0). Keep counts below the width.
+- Integer arithmetic is checked (#362): `+`, `-`, `*` and negation panic with `integer
+  overflow` when the exact result does not fit the operand type (`i8` through `u64`), and
+  signed `/` panics on the most negative value divided by -1. `%` cannot overflow
+  (`-9223372036854775808 % -1` is 0). Division by zero panics. `/` truncates toward zero;
+  `%` has the sign of the dividend. In a request handler the panic is that request's 500
+  and the core goes on serving (section 18).
+- Wrapping is written out: `a +% b`, `a -% b` and `a *% b` (and `+%=`, `-%=`, `*%=`)
+  compute modulo 2^width, for hashes, checksums and random number generators:
+  `h = (h ^ b) *% 1099511628211`. A function declared `@wrap` (section 19) keeps the
+  machine's arithmetic throughout: `+ - *` and negation wrap, the most negative value / -1
+  is itself, and shift counts are taken modulo 64; it is for kernels whose arithmetic is
+  modular everywhere (cipher rounds, constant-time field arithmetic). Its closures, generic
+  instances and methods are `@wrap` too.
+- `>>` is arithmetic for signed types and logical for unsigned types. A shift count must
+  be between 0 and the width of the shifted value less one: `u8(1) << 8` panics (a constant
+  count out of range is E224), and so does a negative count. Bits shifted out are dropped:
+  a shift is a bit operation, so `u8(0x81) << 1` is 2.
+- The compiler removes a check that cannot fire: the counter of `for i in 0..n` steps up
+  below its bound, and after inlining, ranges known from constants, lengths, narrow types,
+  locals assigned once and loop counters prove that `i * 31` or `i + j + 1` on such values
+  fits.
 - `&&` and `||` short-circuit and take `bool` operands.
 - Strings support `+` and comparisons; `bool` supports `==`, `!=`, `!`, `&&`, `||`.
 - Comparing references: optionals and faults compare with `nil`. `==` and `!=` on structs
@@ -1924,7 +1945,14 @@ fn main() {
 - **Nil**: str, slice, map and struct values are never nil. Optionals must be checked
   before use (section 9). Missing map keys read as zero values; `try` returns real zero
   values.
-- **Integer overflow** wraps (it does not trap). Division by zero panics.
+- **Integer overflow** panics (#362): `+`, `-`, `*`, negation and signed `/` whose result
+  does not fit the type, a shift count outside 0 .. width-1, and a float to integer
+  conversion out of range or of NaN (`panic: integer overflow: +`, `shift count out of
+  range`, `float to integer conversion out of range`, with a backtrace). Integer conversions
+  truncate on purpose (`u8(x)`). Wrapping is explicit: `+%`, `-%`, `*%` and `@wrap`
+  functions (section 6). Constant arithmetic that overflows is a compile error (E223, E224).
+  The runtime (`lib/runtime/`) and the compiler keep the machine's arithmetic. Division by
+  zero panics.
 - **Uninitialized memory** cannot be read: every variable, field and element starts as a
   zero value or is required to be set.
 - **Memory lifetime**: the region check (section 12).
@@ -1988,6 +2016,7 @@ them yet.
 |---|---|---|
 | `@json("name")` | a struct field | the JSON member name `argo` writes and reads |
 | `@nopoll` | a function | no safepoint polls in its loops, for short hot kernels ([TOOLING.md](TOOLING.md)) |
+| `@wrap` | a function | the machine's integer arithmetic: `+ - *` and negation wrap, shift counts modulo 64 (section 6); for hashes, ciphers and constant-time field arithmetic |
 
 ```tin
 type User struct {
@@ -2001,6 +2030,13 @@ type User struct {
 		t += x
 	}
 	return t
+}
+
+// splitmix64's output step computes modulo 2^64.
+@wrap fn mix(z0 u64) u64 {
+	mut z = (z0 ^ (z0 >> 30)) * 0xbf58476d1ce4e5b9
+	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
+	return z ^ (z >> 31)
 }
 ```
 
@@ -2078,7 +2114,8 @@ Stmt        = LetStmt | Assign | ExprStmt | If | For | Match | Return | Break | 
             | Defer | Fail | Block | Boundary | Select | Scope | Detach | Once | UseDecl .
 LetStmt     = ( "let" | "mut" ) ( Name [ Type ] | "(" Name { "," Name } ")" ) "=" Expr .
 Assign      = Expr { "," Expr } AssignOp Expr { "," Expr } .
-AssignOp    = "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "<<=" | ">>=" .
+AssignOp    = "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "<<=" | ">>="
+            | "+%=" | "-%=" | "*%=" .
 ExprStmt    = Expr .
 If          = "if" ( Expr | "let" Name "=" Expr ) Block [ "else" ( If | Block ) ] .
 For         = [ Name ":" ] "for" [ Name [ "," Name ] "in" Iterable | Expr ] Block .
@@ -2102,7 +2139,7 @@ Once        = "once" Block .
 
 Expr        = Unary { BinaryOp Unary } [ "wrap" Expr ] [ "catch" ( Name | "_" ) Block ] .
 BinaryOp    = "||" | "&&" | "==" | "!=" | "<" | "<=" | ">" | ">=" | "+" | "-" | "|" | "^"
-            | "*" | "/" | "%" | "<<" | ">>" | "&" .
+            | "*" | "/" | "%" | "<<" | ">>" | "&" | "+%" | "-%" | "*%" .
 Unary       = ( "-" | "!" | "~" | "^" | "try" ) Unary | Postfix .
 Postfix     = Primary { "." Name | "[" Expr "]" | "[" [ Expr ] ":" [ Expr ] "]" | TypeArgs
             | Args | "??" Unary | Composite } .
@@ -2185,5 +2222,6 @@ OLD_SYNTAX, E091 ONE_PER_DECLARATION in [ERRORS.md](ERRORS.md)).
 | `f(&x)` to let a callee modify x | `f(mut x)` for a `mut` parameter |
 | `time.Millisecond * 200` | `200ms` |
 | `goto`, `fallthrough` | not available |
+| integer arithmetic wraps; shift counts of any size; `int64(1e300)` is implementation-defined | `+ - *` panic on overflow, `+% -% *%` and `@wrap` wrap; shift counts below the width; float to integer panics out of range |
 
 <!-- docs-check: old-syntax end -->

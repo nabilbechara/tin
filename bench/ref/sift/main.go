@@ -86,6 +86,18 @@ func sumInts(xs []int64) int64 {
 	return s
 }
 
+// sumIntsChecked is Tin's SumInts under its overflow rule (#362): a sum past int64 panics.
+func sumIntsChecked(xs []int64) string {
+	var s int64
+	for _, v := range xs {
+		if (v > 0 && s > math.MaxInt64-v) || (v < 0 && s < math.MinInt64-v) {
+			return "overflow true"
+		}
+		s += v
+	}
+	return fmt.Sprint(s)
+}
+
 func minInts(xs []int64) (int64, string) {
 	if len(xs) == 0 {
 		return 0, "sift: MinInts of empty slice"
@@ -341,7 +353,7 @@ func main() {
 	fmt.Println("minmax ext", mn3, errMn3, mx3, errMx3)
 	mn4, errMn4 := minInts([]int64{4})
 	fmt.Println("min one", mn4, errMn4)
-	fmt.Println("sum", sumInts([]int64{}), sumInts([]int64{1, 2, 3}), sumInts([]int64{9223372036854775807, 1}), sumInts([]int64{-5}))
+	fmt.Println("sum", sumInts([]int64{}), sumInts([]int64{1, 2, 3}), sumIntsChecked([]int64{9223372036854775807, 1}), sumInts([]int64{-5}))
 	fmt.Println("index", slices.Index([]int64{4, 5, 6}, 5), slices.Index([]int64{4, 5, 6}, 7), slices.Index([]int64{}, 1), slices.Index([]int64{1, 2, 1}, 1), slices.Index([]int64{1, 2, 1}, 2))
 	fmt.Println("contains", slices.Contains([]string{"a", "b"}, "b"), slices.Contains([]string{"a", "b"}, "c"), slices.Contains([]string{"a", "b"}, ""), slices.Contains([]string{}, "a"), slices.Contains([]string{"", "x"}, ""), slices.Contains([]string{"héllo"}, "héllo"))
 	fmt.Println("equal", slices.Equal([]int64{1, 2}, []int64{1, 2}), slices.Equal([]int64{1, 2}, []int64{1, 2, 3}), slices.Equal([]int64{1, 2}, []int64{1, 3}), slices.Equal([]int64{}, []int64{}), slices.Equal([]int64{}, []int64{0}), slices.Equal(ext, ext))

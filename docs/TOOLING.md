@@ -388,6 +388,17 @@ dialect is gone.
 `python3 tools/gen_unicode.py` rewrites `lib/glyph/tables.tin` and `lib/runtime/printable.tin` (the Unicode
 tables) from Go's `unicode/tables.go`; it needs a Go tree only to read that one file.
 
+## Integer overflow checks
+
+Integer `+ - *`, negation and signed `/` are checked in user code, library packages and
+tools (#362, LANGUAGE.md section 6): an overflow panics, in a handler that request's 500.
+`+% -% *%` and `@wrap fn` wrap where that is the intent. The runtime (`lib/runtime/`) and
+the compiler keep the machine's arithmetic. `TINC_OVERFLOW` sets the scope at compile time,
+for measurements and audits only: `0` no checks, `1` user code, `2` also library packages
+and tools (the default), `3` also the runtime and the compiler (they do not run that way
+yet: their intended wraps are not marked). The cost is in
+[PERFORMANCE.md](PERFORMANCE.md#integer-overflow-checks-linux).
+
 ## CPU cancellation safepoints
 
 **A program that starts cores** (`anvil.Serve`, `hearth.Run`) gets CPU cancellation
