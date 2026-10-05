@@ -414,8 +414,59 @@ def limits(exe, failures):
 
 
 def overflow(exe, failures):
-    """#175: a handler that overflows its task stack ends the process with a panic line on
-    stderr and status 2, not a silent SIGBUS/SIGSEGV."""
+    """#175, #342: a handler that overflows its task stack is a panic of that request: it
+    answers 500 with the panic and a backtrace on stderr, and the server, its other requests
+    and the next overflow are unaffected."""
+    for stack, depth in (('', 1000), ('1048576', 20000)):
+        port = ws.free_port()
+        env = dict(os.environ, PORT=str(port), TIN_CORES='2')
+        if stack:
+            env['TIN_TASK_STACK'] = stack
+        server = subprocess.Popen([str(exe)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            for _ in range(100):
+                try:
+                    socket.create_connection(('127.0.0.1', port), timeout=0.1).close()
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            status, _, body = request(port, 'GET', '/recurse?n=%d' % depth)
+            if status != 200 or body != b'depth %d' % depth:
+                failures.append('shallow recursion (stack %r): %r %r' % (stack, status, body))
+            if not stack:
+                # 20000 levels do not fit 256 KiB, but fit TIN_TASK_STACK=1 MiB
+                status, _, _ = request(port, 'GET', '/recurse?n=20000')
+                if status != 500:
+                    failures.append('20000 levels in the default stack: %r' % status)
+            statuses = []
+            for _ in range(6):
+                statuses.append(request(port, 'GET', '/recurse?n=100000000')[0])
+                ok = request(port, 'GET', '/recurse?n=10')
+                if ok[0] != 200:
+                    failures.append('a request after an overflow: %r' % (ok,))
+            alive = server.poll() is None
+        finally:
+            server.terminate()
+            try:
+                code = server.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                server.kill()
+                code = server.wait()
+        err = server.stderr.read().decode(errors='replace')
+        panics = err.count('panic: stack overflow')
+        print('stack overflow in a handler (stack %s): statuses %s, %d panics logged, server alive %s, exit %s' %
+              (stack or 'default', statuses, panics, alive, code))
+        want_panics = 6 if stack else 7  # the default stack also overflowed on the 20000-level request
+        if statuses != [500] * 6 or panics != want_panics or not alive or code != 0:
+            failures.append('stack overflow (stack %r): %r panics %d alive %s exit %r' % (stack, statuses, panics, alive, code))
+        if '\tdeep\n' not in err:
+            failures.append('the backtrace of an overflow names deep: %r' % err[:400])
+
+
+def overflow_guards(out, failures):
+    """#342: a stack overflow in a detached task, a spawned child, an explicit guard, a tick and
+    a relay handler is that one's panic, as in a request."""
+    exe = out / 'guards'
     port = ws.free_port()
     server = subprocess.Popen([str(exe)], env=dict(os.environ, PORT=str(port), TIN_CORES='1'),
                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -426,22 +477,34 @@ def overflow(exe, failures):
                 break
             except OSError:
                 time.sleep(0.05)
-        status, _, body = request(port, 'GET', '/recurse?n=1000')
-        if status != 200 or body != b'depth 1000':
-            failures.append('shallow recursion: %r %r' % (status, body))
-        try:
-            request(port, 'GET', '/recurse?n=100000000')
-        except (EOFError, OSError):
-            pass
-        code = server.wait(timeout=10)
-        err = server.stderr.read().decode(errors='replace')
-        print('stack overflow in a handler: status %d, stderr %r' % (code, err.strip()))
-        if code != 2 or 'panic: stack overflow in a request handler' not in err:
-            failures.append('stack overflow: status %d, stderr %r' % (code, err))
+        child = request(port, 'GET', '/childdeep')[-1]
+        guarded = request(port, 'GET', '/guarded')[-1]
+        request(port, 'GET', '/laterdeep')
+        request(port, 'GET', '/ticknext')
+        request(port, 'GET', '/send?m=deep')
+        body = b''
+        for _ in range(100):
+            body = request(port, 'GET', '/overflows')[-1]
+            if body == b'tick 1 relay 1 detach 1':
+                break
+            time.sleep(0.02)
+        print('stack overflows in a child, a guard, a detached task, a tick and a relay handler:', child[:60], guarded[:60], body)
+        if not child.startswith(b'child fault: panic: stack overflow') or not guarded.startswith(b'guard: panic: stack overflow'):
+            failures.append('overflow faults: %r %r' % (child, guarded))
+        if body != b'tick 1 relay 1 detach 1':
+            failures.append('overflow in a tick, relay handler or detached task: %r' % body)
+        if server.poll() is not None:
+            failures.append('the server exited after an overflow in a guarded context')
     finally:
-        if server.poll() is None:
+        server.terminate()
+        try:
+            code = server.wait(timeout=10)
+        except subprocess.TimeoutExpired:
             server.kill()
-            server.wait()
+            code = server.wait()
+        err = server.stderr.read().decode(errors='replace')
+        if err.count('panic: stack overflow') != 5 or code != 0:
+            failures.append('overflow panics on stderr %d, exit %r: %r' % (err.count('panic: stack overflow'), code, err[-600:]))
 
 
 def panics(exe, failures):
@@ -578,6 +641,8 @@ def main():
     overflow(exe, failures)
     print('-- implicit guards')
     implicit_guards(out, failures)
+    print('-- stack overflow in guarded contexts')
+    overflow_guards(out, failures)
     if failures:
         sys.exit('\n'.join(failures))
 

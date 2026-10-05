@@ -65,13 +65,14 @@ The rest of this document is these rules applied to each feature.
 |---|---|---|---|
 | **Fault** (expected) | not found, connection refused, timeout, bad input | a value: `!T` results, `try`, `catch`, `fail` | the caller, explicitly |
 | **Panic** (a bug) | index out of range, divide by zero, `panic(...)`, broken invariant | an unwind | the nearest `guard`, the request boundary, or a task root |
-| **Process failure** | SIGKILL, kernel OOM, machine loss, stack overflow (for now) | none | infrastructure (restart, replay of the last capsules) |
+| **Process failure** | SIGKILL, kernel OOM, machine loss, a stack overflow outside a task or a guard | none | infrastructure (restart, replay of the last capsules) |
 
 - A fault is never discardable (as today). A panic is never a fault until a `guard` converts it,
   and ordinary code cannot catch one: the control flow of non-boundary code stays visible.
-- **Stack overflow** stays a process failure in this version: the fault handler runs on a
-  signal stack and cannot safely unwind a task stack. It prints a panic line (done, #175). A
-  later step may switch to the core's stack from the handler and treat it as a panic.
+- **Stack overflow** in a task or a guard block is a panic (#342): the fault handler redirects
+  the interrupted context to a function on the signal stack that panics, which unwinds as any
+  panic does. Outside them (`main`, the core's own stack) it is a process failure that prints a
+  panic line and exits 2 (#175).
 - **Out of memory.** Exceeding a `limit`'s memory budget or the request's budget is a
   cancellation (`fault.LimitExceeded`), contained like any other. The operating system refusing
   memory is a process failure.

@@ -7,6 +7,18 @@ import "twine"
 
 // Ticks, relay handlers and detached tasks are guarded implicitly (#230): a panic in one runs
 // its deferred calls, is logged, and the core goes on. router_check.py runs this on one core.
+// deep recurses far past any task stack (#342).
+fn deep(n i64) i64 {
+	if n == 0 {
+		return 0
+	}
+	return deep(n-1) + 1
+}
+
+mut overflowTick bool = false
+mut overflowTicks i64 = 0
+mut overflowRelay i64 = 0
+mut overflowDetach i64 = 0
 mut ticks i64 = 0
 mut tickDefers i64 = 0
 mut handled str = ""
@@ -18,6 +30,13 @@ fn tick_done() {
 
 // tick panics on its first three runs, after deferring tick_done.
 fn tick(core i64) {
+	if overflowTick {
+		overflowTick = false
+		overflowTicks += 1
+		defer tick_done()
+		deep(100000000)
+		return
+	}
 	ticks += 1
 	defer tick_done()
 	if ticks <= 3 {
@@ -32,6 +51,11 @@ fn relay_done() {
 // message records msg and panics for a message starting with "boom".
 fn message(from i64, msg str) {
 	defer relay_done()
+	if msg == "deep" {
+		overflowRelay += 1
+		deep(100000000)
+		return
+	}
 	handled = keep(handled + msg + ";")
 	if twine.HasPrefix(msg, "boom") {
 		panic("relay {msg}")
@@ -53,6 +77,50 @@ fn later(q anvil.Req, w mut anvil.Out) {
 	w.Text("detached")
 }
 
+// laterdeep detaches work that overflows its stack.
+fn laterdeep(q anvil.Req, w mut anvil.Out) {
+	detach {
+		overflowDetach += 1
+		deep(100000000)
+	}
+	w.Text("detached")
+}
+
+// childdeep spawns a child that overflows its stack: the scope fails with the panic.
+fn childdeep(q anvil.Req, w mut anvil.Out) {
+	let r = run_child() catch err {
+		w.Text("child fault: {err}")
+		return
+	}
+	w.Text("no fault {r}")
+}
+
+fn run_child() !i64 {
+	mut r i64 = 0
+	scope s {
+		s.spawn(fn() ! {
+			r = deep(100000000)
+		})
+	}
+	return r
+}
+
+// guarded runs an explicit guard block that overflows: its fault.
+fn guarded(q anvil.Req, w mut anvil.Out) {
+	let (_, err) = guard deep(100000000)
+	w.Text("guard: {err}")
+}
+
+// ticknext makes the next tick overflow its stack.
+fn ticknext(q anvil.Req, w mut anvil.Out) {
+	overflowTick = true
+	w.Text("armed")
+}
+
+fn overflows(q anvil.Req, w mut anvil.Out) {
+	w.Text("tick {overflowTicks} relay {overflowRelay} detach {overflowDetach}")
+}
+
 // send relays each comma-separated message of ?m to this core.
 fn send(q anvil.Req, w mut anvil.Out) {
 	for m in twine.Split(q.Param("m"), ",") {
@@ -70,6 +138,11 @@ fn main() {
 	r.Get("/send", send)
 	r.Get("/state", state)
 	r.Get("/later", later)
+	r.Get("/laterdeep", laterdeep)
+	r.Get("/childdeep", childdeep)
+	r.Get("/guarded", guarded)
+	r.Get("/ticknext", ticknext)
+	r.Get("/overflows", overflows)
 	anvil.OnTick(10, tick)
 	anvil.OnRelay(message)
 	let err = r.Serve(":0")

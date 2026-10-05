@@ -1884,10 +1884,14 @@ fn main() {
   zero value or is required to be set.
 - **Memory lifetime**: the region check (section 12).
 - **Data races**: impossible by construction (section 11).
-- **Stack overflow**: deep recursion ends the process with `panic: stack overflow in a
-  request handler` (or `panic: segmentation fault ...` outside a request) on stderr and
-  status 2, after flushing the output printed before it. Threads have 8 MiB stacks; a
-  request handler runs on its task's 256 KiB stack.
+- **Stack overflow**: deep recursion in a request handler, a spawned child, a detached task,
+  a tick, a relay handler or a `guard` block is a panic of that one (#342): `panic: stack
+  overflow (...)` and a backtrace go to stderr, its deferred calls and cleanups run, a request
+  gets 500, a `guard`'s fault holds the message, and the core goes on. `main` and the `on`
+  handlers outside a task still end the process with `panic: segmentation fault ...` on stderr
+  and status 2, after flushing the output printed before it. Threads have 8 MiB stacks; a task
+  runs on a 256 KiB stack, or `TIN_TASK_STACK` bytes (64 KiB to 256 MiB): a lazily committed
+  mapping, so a bigger one costs address space, and memory only for tasks that recurse deeply.
 - **Secrets** (design_semantics §9): `secret T` qualifies a number, bool, str, slice or
   map (`token secret str` in a struct, `fn sign(key secret []u8)`). The compiler tracks it
   and the runtime never sees it: a secret computes exactly like its plain type. A plain

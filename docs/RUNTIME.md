@@ -358,8 +358,8 @@ is more than one above it. Graceful shutdown on SIGTERM/SIGINT: see PORTING.md �
 
 ### Request tasks (v0.4)
 
-Every request's handler runs in a **task**: its own 256 KiB stack (mmap'd, with a 16 KiB
-`PROT_NONE` guard region below it, so an overflow faults instead of corrupting memory) and
+Every request's handler runs in a **task**: its own 256 KiB stack (`TIN_TASK_STACK` bytes; mmap'd,
+with a 16 KiB `PROT_NONE` guard region below it, so an overflow faults instead of corrupting memory) and
 its own request pool. `rt_task_run` switches into a task from the core's stack;
 `rt_task_swap`, hand-assembled per CPU, saves and loads only what a call preserves (arm64:
 x19–x27, x29, x30, sp, d8–d15; x86-64: rbx, rbp, r12–r14, rsp and the return address), about
@@ -390,7 +390,17 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   `rt_guard_call` on a guard stack, so a panic in one logs `panic: ...` and its backtrace, runs
   the deferred calls it registered, ends that tick or that message's handler, and the core goes
   on (the remaining messages are handled at once). A panic in `main` outside a `guard`, or a
-  stack overflow, still ends the process.
+  stack overflow there, still ends the process.
+- **Stack overflow** (#342) in a task that recovers (request, child, detached task) or in a guard
+  block (also a tick's or a relay handler's implicit one) is such a panic. The fault handler runs
+  on the thread's 256 KiB signal stack, finds the faulting address in the task's or the guard's
+  guard region, and does not unwind there: it rewrites the interrupted context (`rt_uctx_redirect`,
+  per OS and CPU: arm64 and x86-64 Linux, arm64 macOS) to resume in `rt_overflow_resume` with
+  the stack pointer at the top of the signal stack, and returns, so the kernel leaves the
+  signal normally (macOS keeps a thread "on the signal stack" until the handler returns, and a
+  second overflow would find no signal stack). `rt_overflow_resume` calls `rt_panic`, which runs
+  the deferred calls and cleanups and switches to the core as for any panic; the overflowed
+  stack is abandoned and reused.
 - `guard { ... }` (#230, edition 1) is a boundary that turns a panic inside it into a fault:
   the panic's message goes to stderr with its backtrace, the deferred calls and the
   resource-cleanup callbacks registered inside the guard run, and the guard's value is a
