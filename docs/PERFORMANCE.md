@@ -521,45 +521,46 @@ loaded word). Cold stubs preserve registers, including leaf-function homes. The 
 keeps existing allocation and register-home decisions; the poll check stays inside loops.
 The watchdog is started only for an opted-in executable.
 
-## Long-lived blocks above 4 KiB (Linux arm64)
+## Long-lived blocks above 4 KiB (Linux)
 
 The ingot heap served only blocks up to 4 KiB from slabs: a bigger kept value had a
 page-rounded mapping of its own, unmapped when dropped (#345). The classes now continue to
-256 KiB about 25% apart, and the mappings of blocks up to 4 MiB are kept for reuse
-(`tools/ci/heap_check.py`, fixture `blocks.tin`; docker `debian:bookworm` on Apple silicon,
-arm64, one core; "base" is main at `baae526`).
+256 KiB about 25% apart, and the mappings of blocks up to 4 MiB are kept for reuse.
 
-| workload | base | now |
+`tools/ci/heap_check.py` (fixture `blocks.tin`) runs on every CI build. From the run of
+2026-10-05 on GitHub-hosted runners (run 37315794425), after the change:
+
+| workload | ubuntu-24.04 (x86-64) | ubuntu-24.04-arm |
 |---|---:|---:|
-| 200000 keep + overwrite of one 5000-byte value (less 2.5 s to build it) | 499 ms | about 100 ms |
-| 60000 distinct 5000-byte values kept, RSS | 497 MB | 317 MB |
-| the same after deleting every other one, mappings in /proc/self/maps | 30008 | 11 |
-| the same, kept again: RSS | 505 MB | 323 MB |
-| 20000 times a 300000-byte block made and dropped | 802 ms | 289 ms |
-| 5000 times a 1000000-byte block made and dropped | 697 ms | 273 ms |
-| 300 times an 8000000-byte block made and dropped (above 4 MiB: unchanged) | 163 ms | 180 ms |
+| 100000 keeps + overwrites of one 5000-byte value | 2257 ms, 3 mappings | 1213 ms, 3 mappings |
+| 60000 distinct 5000-byte values kept: resident | 299 MiB | 299 MiB |
+| the same after deleting every other one: lines in /proc/self/maps | 10 | 9 |
+| the same, kept again: resident | 308 MiB | 308 MiB |
+| 20000 times a 300000-byte block made and dropped | 352 ms, 6 mappings | 242 ms, 6 mappings |
 
-The 5000-byte values take 5120 bytes of a slab each instead of a page-rounded 8192, and the
-memory of deleted values is reused instead of unmapped, which is what left 30008 mappings
-(the default `vm.max_map_count` is 65530) after half of them were deleted.
+The first row includes building the 5000-byte value in request memory each time, which is most
+of its time. For comparison, the issue (#345, a Linux arm64 probe of 2026-10-04 before the
+change) recorded 490 MB for the 60000 values and 30018 mappings after deleting half of them,
+and 1141 ms for 200000 keeps and overwrites of one 5 KB value. The 5000-byte values take 5120
+bytes of a slab each instead of a page-rounded 8192, and the memory of deleted values is
+reused instead of unmapped. These are not same-machine before and after figures: run
+`.github/workflows/bench-linux.yml` for those.
 
-## Map growth without stalls (Linux arm64)
+## Map growth without stalls (Linux)
 
-A map rebuilt its entries and index when full, so inserting into a map of 2^21 entries took
-50 to 100 ms (#346). Past 4096 entries a map now keeps its entries in chunks and moves its
-index into a bigger one 16 entries per operation (`tools/ci/map_growth_check.py`, fixture
-`mapgrow.tin`; docker `debian:bookworm` on Apple silicon, arm64; the slowest insert of a run
-includes scheduler noise, the best of five runs is what the check bounds; "base" is main at
-`dc254db`).
+A map rebuilt its entries and index when full, so inserting into a map of 2^21 entries stalled
+the core (the issue, #346, recorded 94 ms on Linux arm64 before the change). Past 4096 entries
+a map now keeps its entries in chunks and moves its index into a bigger one 16 entries per
+set or delete. `tools/ci/map_growth_check.py` (fixture `mapgrow.tin`) bounds the slowest
+insert of 4 million integer keys and of a million str keys to under a millisecond (best of
+five runs: one descheduled thread can make a single run slower). From the same CI run, after
+the change:
 
-| workload | base | now |
+| workload | ubuntu-24.04 (x86-64) | ubuntu-24.04-arm |
 |---|---:|---:|
-| 4000000 integer keys inserted: slowest insert | 77 to 103 ms (at 2^21 entries) | 150 to 270 us (best of runs) |
-| the same: total insert time | 663 to 791 ms | 661 to 719 ms |
-| the same: 4000000 lookups | 155 to 180 ms | 205 to 245 ms |
-| 1000000 str keys inserted: slowest insert | 20 ms | 220 to 270 us |
-| the same: total insert time, 1000000 lookups | 267 ms, 382 ms | 202 to 263 ms, 140 to 202 ms |
+| 4000000 integer keys: slowest insert (best of 5 runs) | 232 us | 282 us |
+| the same: total time for the inserts, then for 4000000 lookups | 1037 ms, 522 ms | 1213 ms, 601 ms |
+| 1000000 str keys: slowest insert (best of 5 runs) | 185 us | 278 us |
 
-Lookups in a big integer-keyed map cost about a third more (the entry address goes through a
-directory); inserting costs the same. On macOS arm64 the slowest of 4000000 inserts went from
-54 ms to 0.15 to 0.4 ms.
+Lookups in a big map read an entry through a chunk directory; their cost against the old flat
+layout has not been measured on Linux, so no claim is made about it.

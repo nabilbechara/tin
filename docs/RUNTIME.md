@@ -83,7 +83,7 @@ a full map adds a chunk instead of copying anything, and when the entries outgro
 index a new one twice the size is made and the entries are moved into it 16 per set or
 delete (lookups try the new index, then the old one, and move nothing, so cores may read one
 map at once; a delete clears an entry's slot in both). Inserting 4 million integer keys therefore never stalls a core for more than a
-fraction of a millisecond (it stalled 50 to 100 ms at 2^21 entries). A big old index gives
+fraction of a millisecond (the issue, #346, measured 94 ms at 2^21 entries before). A big old index gives
 its memory back a megabyte per operation. Maps never shrink: the entries of deleted keys
 stay until the map is full and more than half of its entries are dead, when it is rebuilt
 compactly in one O(n) pause (as every growth was before); a flat map is rebuilt on every
@@ -158,7 +158,8 @@ A long-lived task avoids this by waiting outside the epochs (#358): `hearth.Quie
 from long-lived memory across the wait: `let u = cache[k]` before it must not be used after it
 (read `cache[k]` again). With one WebSocket connection parked on the only core, 10 million
 overwrites of a cache entry leave 80 counted blocks and an empty limbo
-(`tools/ci/limbo_check.py`); before, 9.5 million blocks (360 MB) were pinned. A request that
+(`tools/ci/limbo_check.py`); a detached loop that waits plainly in the same check pins 1.5
+million blocks and fills the limbo. A request that
 a client closes after its response (`Connection: close`, HTTP/1.0) now also ends at a
 quiescent point; before, a core serving only such clients never released anything.
 `hearth.RcStats()` reports the counted blocks (pinned ones included), their bytes and the
