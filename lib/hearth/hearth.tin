@@ -90,6 +90,19 @@ fn HeapStats() (i64, i64, i64) {
 	return rt_heap_stats()
 }
 
+// Quiet runs wait (a tide.Wait, a receive from a channel) with the calling task taken out of the
+// runtime's reclamation epochs (#358). A task that lives for hours, such as a detach loop, holds
+// back the release of every long-lived value dropped on its core while it lives, and past a
+// million waiting blocks the core stops releasing them (RcStats shows the limbo). A task that
+// waits inside Quiet holds back nothing, on the condition that it holds no value it borrowed from
+// long-lived memory across the call: `let u = cache[k]` before Quiet is not safe to use after it, so
+// read it again. websocket.Conn's reads work this way.
+fn Quiet(wait fn()) {
+	rt_epoch_park()
+	wait()
+	rt_epoch_unpark()
+}
+
 // RcStats reports what long-lived memory this core still counts (#176): the number of
 // counted blocks, their bytes and how many dropped blocks wait in the limbo.
 fn RcStats() (i64, i64, i64) {

@@ -798,8 +798,18 @@ fn on_read(c i64) {
 	}
 }
 
-// on_read_once reads and serves what one read returns; true means more may be waiting.
+// on_read_once reads and serves what one read returns; true means more may be waiting. However
+// it ends, the core's own stack is at a quiescent point of the long-lived memory afterwards: a
+// connection that closes after its response (Connection: close, HTTP/1.0) left through paths
+// that reset no pool, so a core serving only such clients never freed what its requests dropped
+// (#358).
 fn on_read_once(c i64) bool {
+	let more = on_read_serve(c)
+	rt_pool_reset()
+	return more
+}
+
+fn on_read_serve(c i64) bool {
 	let fd = c[cFD]
 	if c[cLinger] == 2 {
 		for {

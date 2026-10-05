@@ -220,6 +220,7 @@ Package hearth runs a program on every core: one thread per core, each with its 
 - `PoolCapacity() i64`: PoolCapacity is the usable size in bytes of this core's current base pool chunk (0 before its first request allocation).
 - `Reset()`: Reset ends the current request: the core's pool is emptied for the next one.
 - `HeapStats() (i64, i64, i64)`: HeapStats reports what this core's long-lived heap has from the system (#345): the bytes of its slabs (blocks up to 256 KiB), the bytes of the mappings of its larger blocks (those in use and those kept for reuse) and the number of mappings in all.
+- `Quiet(wait fn())`: Quiet runs wait (a tide.Wait, a receive from a channel) with the calling task taken out of the runtime's reclamation epochs (#358). A task that lives for hours, such as a detach loop, holds back the release of every long-lived value dropped on its core while it lives, and past a million waiting blocks the core stops releasing them (RcStats shows the limbo). A task that waits inside Quiet holds back nothing, on the condition that it holds no value it borrowed from long-lived memory across the call: `let u = cache[k]` before Quiet is not safe to use after it, so read it again. websocket.Conn's reads work this way.
 - `RcStats() (i64, i64, i64)`: RcStats reports what long-lived memory this core still counts (#176): the number of counted blocks, their bytes and how many dropped blocks wait in the limbo.
 
 ## relay

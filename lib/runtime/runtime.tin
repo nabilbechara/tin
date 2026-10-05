@@ -1096,6 +1096,27 @@ fn rt_rc_live_del(t i64) {
 	t[tEpPrev] = 0
 }
 
+// rt_epoch_park takes the running task out of the epochs while it waits, and rt_epoch_unpark puts
+// it back (#358): a task that lives for a long time (a WebSocket connection, a detach loop) would
+// otherwise hold back the release of everything dropped meanwhile. It promises to hold no value
+// borrowed from long-lived memory (a map entry, a kept value) across the wait, and to read again
+// after waking what it needs. It comes back at a new epoch, so what was dropped while it waited
+// is freed without waiting for it.
+fn rt_epoch_park() {
+	let t = curTask
+	if t != 0 {
+		rt_rc_live_del(t)
+	}
+}
+
+fn rt_epoch_unpark() {
+	let t = curTask
+	if t != 0 && t[tEpPrev] == 0 && epLive != t {
+		epochNext = epochNext + 1
+		rt_rc_live_add(t, epochNext)
+	}
+}
+
 // rt_epoch_quiescent marks a quiescent point of the core's own stack: it holds no
 // borrowed value from before this point, so what was queued until now waits only for
 // the live tasks.

@@ -138,6 +138,15 @@ its globals, and values stored where the compiler cannot count (through a parame
 pinned: they are never freed. A task that lives for a long time (a WebSocket, a `detach`
 loop) holds back releases on its core; past 2^20 queued blocks a core pins what it drops
 instead, so such a core leaks as before reclamation but its limbo stays bounded.
+A long-lived task avoids this by waiting outside the epochs (#358): `hearth.Quiet(wait)` runs
+`wait` (a `tide.Wait`, a channel receive) with the task taken out of them, and
+`websocket.Conn`'s reads wait that way. The rule is that the task holds no value it borrowed
+from long-lived memory across the wait: `let u = cache[k]` before it must not be used after it
+(read `cache[k]` again). With one WebSocket connection parked on the only core, 10 million
+overwrites of a cache entry leave 80 counted blocks and an empty limbo
+(`tools/ci/limbo_check.py`); before, 9.5 million blocks (360 MB) were pinned. A request that
+a client closes after its response (`Connection: close`, HTTP/1.0) now also ends at a
+quiescent point; before, a core serving only such clients never released anything.
 `hearth.RcStats()` reports the counted blocks (pinned ones included), their bytes and the
 limbo length.
 

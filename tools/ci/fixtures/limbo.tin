@@ -1,0 +1,68 @@
+package main
+
+import "anvil"
+import "hearth"
+import "mint"
+import "quarry"
+import "say"
+import "tide"
+import "websocket"
+
+// #358: /ws parks a WebSocket task on the core; /put?n=N overwrites a cache entry with a kept
+// value N times; /stats answers hearth.RcStats (counted blocks, their bytes, the limbo).
+// limbo_check.py runs it on one core.
+
+mut cache = map[str]str{}
+mut round i64 = 0
+
+fn ws(q anvil.Req, w mut anvil.Out) {
+	let c = websocket.Accept(q, mut w) catch _ { return }
+	c.Each(fn(c websocket.Conn, m websocket.Message) ! {
+		try c.WriteText("echo: {m.Data}")
+	}) catch _ {}
+}
+
+fn put(q anvil.Req, w mut anvil.Out) {
+	let n = mint.Atoi(q.Param("n")) catch _ { 1000 }
+	for i in 0..n {
+		round += 1
+		cache[keep("k")] = keep("value-{round}-padding-padding")
+	}
+	w.Text("ok {round}")
+}
+
+// /spawn starts a detached loop that waits inside hearth.Quiet; /spawnloud one that does not.
+fn spawn(q anvil.Req, w mut anvil.Out) {
+	detach {
+		for {
+			hearth.Quiet(fn() {
+				tide.Wait(1 * tide.Second) catch _ {}
+			})
+		}
+	}
+	w.Text("ok")
+}
+
+fn spawnLoud(q anvil.Req, w mut anvil.Out) {
+	detach {
+		for {
+			tide.Wait(1 * tide.Second) catch _ {}
+		}
+	}
+	w.Text("ok")
+}
+
+fn stats(q anvil.Req, w mut anvil.Out) {
+	let (blocks, bytes, limbo) = hearth.RcStats()
+	w.Text("blocks {blocks} bytes {bytes} limbo {limbo}")
+}
+
+fn main() {
+	let r = anvil.NewRouter()
+	r.Get("/ws", ws)
+	r.Get("/put", put)
+	r.Get("/spawn", spawn)
+	r.Get("/spawnloud", spawnLoud)
+	r.Get("/stats", stats)
+	say.Line(r.Serve(":" + quarry.Getenv("PORT")))
+}

@@ -309,7 +309,10 @@ fn (c Conn) write_all(s str) ! {
 	return try c.write_raw(cast(i64, s)+8, len(s))
 }
 
-// fill reads more bytes into the buffer.
+// fill reads more bytes into the buffer. A connection's task lives as long as the connection
+// and spends it waiting here, so the wait is outside the runtime's reclamation epochs (#358): a
+// handler must not use a value it borrowed from long-lived memory (a map entry) before a read
+// after the read returns, which is the rule for any wait (hearth.Quiet).
 fn (c Conn) fill() ! {
 	let st = c.st
 	if st[sBuf] == 0 {
@@ -358,7 +361,9 @@ fn (c Conn) fill() ! {
 		if e != EAGAIN {
 			fail os_msg("read", e)
 		}
+		rt_epoch_park()
 		let r = rt_task_wait(st[sFd], 1, st[sTimeout])
+		rt_epoch_unpark()
 		if r != waitReady {
 			fail wait_fail(r)
 		}
