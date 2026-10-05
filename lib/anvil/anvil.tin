@@ -132,6 +132,7 @@ shared mut gStop i64    // 1 once SIGTERM or SIGINT started the graceful shutdow
 shared mut gDrained i64 // cores that stopped and have no connection left
 shared mut gGrace i64   // seconds the shutdown waits for connections to finish (TIN_GRACE, default 25)
 shared mut gReqMemory i64 // pool bytes a request may take beyond its first chunk (TIN_REQUEST_MEMORY, 0: no bound)
+shared mut gMemSoft i64   // pool and ingot bytes past which new requests get 503 (TIN_MEMORY_SOFT, 0: no bound)
 shared mut gTok i64     // 256 bytes: 1 for each byte a token (a field name) may hold (RFC 9110 5.6.2)
 shared mut gHeaderMs i64   // a request's line and headers must arrive within this (0: no limit)
 shared mut gReadMs i64     // the whole request, body included (0: no limit)
@@ -339,7 +340,8 @@ fn serve_on(addr str, n i64) ! {
 	gMaxBody = env_int("TIN_MAX_BODY", gMaxBody)
 	gMaxBuffered = env_int("TIN_MAX_BUFFERED", gMaxBuffered)
 	gMaxConns = env_int("TIN_MAX_CONNS", gMaxConns)
-	gReqMemory = env_int("TIN_REQUEST_MEMORY", gReqMemory)
+	gReqMemory = env_int("TIN_REQUEST_MEMORY", request_budget(n))
+	gMemSoft = env_int("TIN_MEMORY_SOFT", rt_mem_limit()/10*9)
 	let genv = rt_getenv(cast(i64, "TIN_GRACE") + 8)
 	if genv != 0 && rt_decimal_integer(genv)&0xffffffff > 0 {
 		gGrace = rt_decimal_integer(genv) & 0xffffffff
@@ -1269,8 +1271,18 @@ fn serve_one(c i64, p i64, n i64) i64 {
 		bad(c, 503)
 		return total
 	}
+	if gMemSoft > 0 && rt_mem_held() > gMemSoft {
+		// Past the soft memory limit (TIN_MEMORY_SOFT, #356): refuse new requests rather than
+		// let the container's limit end the process; the requests already running go on.
+		overloaded()
+		shed(c, sp1 == 4 && load8(p) == 'H' && bytes_are(p, 4, "HEAD"), http10 && alive)
+		if !alive {
+			c[cClose] = 1
+		}
+		return total
+	}
 	if gAdmit != nil {
-		if !gAdmit(Load{Core: myID, Waiting: waiting, Conns: __atomic_load(gLoad + myID*128), Buffered: bufBytes, Shed: shedCount}) {
+		if !gAdmit(Load{Core: myID, Waiting: waiting, Conns: __atomic_load(gLoad + myID*128), Buffered: bufBytes, Shed: shedCount, Pool: rt_mem_pool(), Ingot: rt_mem_ingot()}) {
 			overloaded()
 			shed(c, sp1 == 4 && load8(p) == 'H' && bytes_are(p, 4, "HEAD"), http10 && alive)
 			if !alive {
@@ -1278,9 +1290,9 @@ fn serve_one(c i64, p i64, n i64) i64 {
 			}
 			return total
 		}
-		if shedAt != 0 && rt_mono_ns()-shedAt >= recoverNs {
-			recovered()
-		}
+	}
+	if shedAt != 0 && rt_mono_ns()-shedAt >= recoverNs {
+		recovered()
 	}
 	// The handler runs in a task: when it waits (tide.Wait, a client call) the core serves
 	// other connections, and this one's later requests queue until it finishes.
@@ -1572,6 +1584,24 @@ fn env_int(name str, def i64) i64 {
 	return v
 }
 
+// request_budget is the default TIN_REQUEST_MEMORY for n cores (#356): a quarter of the memory
+// limit (the container's, else the machine's) per core, at least 64 MiB; 0 (no bound) when
+// neither is known.
+fn request_budget(n i64) i64 {
+	mut limit_ = rt_mem_limit()
+	if limit_ <= 0 {
+		limit_ = rt_mem_total()
+	}
+	if limit_ <= 0 {
+		return 0
+	}
+	let b = limit_ / n / 4
+	if b < 67108864 {
+		return 67108864
+	}
+	return b
+}
+
 // Timeouts sets the connection timeouts in milliseconds; 0 turns one off. header: a
 // request's line and headers must arrive within it (slowloris); read: the whole request,
 // body included; idle: a keep-alive connection with no request in progress; write: a
@@ -1588,14 +1618,18 @@ fn Timeouts(header i64, read i64, idle i64, write i64) {
 }
 
 // Load is what an admission policy sees of the core a new request arrived on: its waiting
-// request tasks, live connections, bytes buffered for requests still arriving, and how many
-// requests the policy refused so far (design_semantics §11).
+// request tasks, live connections, bytes buffered for requests still arriving, how many
+// requests were refused so far, the request-pool bytes its requests hold beyond each one's
+// first chunk (what TIN_REQUEST_MEMORY counts), and the bytes its long-lived (ingot) heap
+// holds (design_semantics §11).
 type Load struct {
 	Core     i64
 	Waiting  i64
 	Conns    i64
 	Buffered i64
 	Shed     i64
+	Pool     i64
+	Ingot    i64
 }
 
 // Admit sets the admission policy (call before Serve): after the built-in limits, p decides
