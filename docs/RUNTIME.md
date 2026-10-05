@@ -80,9 +80,9 @@ insertion order and finds them through an open-addressing index of entry numbers
 half full. Up to 4096 entries the arrays are flat and a full map is rebuilt into bigger
 ones. Past that (#346) the entries live in chunks of 4096 reached through directories, so
 a full map adds a chunk instead of copying anything, and when the entries outgrow the
-index a new one twice the size is made and the entries are moved into it 16 per map
-operation (lookups try the new index, then the old one; a delete clears an entry's slot
-in both). Inserting 4 million integer keys therefore never stalls a core for more than a
+index a new one twice the size is made and the entries are moved into it 16 per set or
+delete (lookups try the new index, then the old one, and move nothing, so cores may read one
+map at once; a delete clears an entry's slot in both). Inserting 4 million integer keys therefore never stalls a core for more than a
 fraction of a millisecond (it stalled 50 to 100 ms at 2^21 entries). A big old index gives
 its memory back a megabyte per operation. Maps never shrink: the entries of deleted keys
 stay until the map is full and more than half of its entries are dead, when it is rebuilt

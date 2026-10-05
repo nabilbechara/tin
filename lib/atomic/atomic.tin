@@ -1,0 +1,90 @@
+// Package atomic has counters and flags that every core may change at once. Keep one in a
+// `shared let` (a value every core reads, built once before the cores start), as in
+// `shared let hits = atomic.NewInt(0)`, and call `hits.Add(1)` from any core; the operations are
+// indivisible and ordered (sequentially consistent) across the whole process. A value made
+// anywhere else (in a handler, in a per-core global) lives in one core's memory and must not be
+// shared. Integers and flags only: build anything bigger with relay messages or per-core state.
+package atomic
+
+// Int is an integer that cores read and change with indivisible operations.
+type Int struct {
+	v i64
+}
+
+// NewInt returns an Int holding v.
+fn NewInt(v i64) Int {
+	return Int{v: v}
+}
+
+// Load returns the value.
+fn (c Int) Load() i64 {
+	return __atomic_load(cast(i64, c))
+}
+
+// Store sets the value to v.
+fn (c Int) Store(v i64) {
+	__atomic_store(cast(i64, c), v)
+}
+
+// Add adds n (negative to subtract) and returns the new value.
+fn (c Int) Add(n i64) i64 {
+	return __atomic_add(cast(i64, c), n) + n
+}
+
+// Swap sets the value to v and returns the one it replaced.
+fn (c Int) Swap(v i64) i64 {
+	return __atomic_swap(cast(i64, c), v)
+}
+
+// CompareSwap sets the value to next if it is old, and reports whether it did.
+fn (c Int) CompareSwap(old i64, next i64) bool {
+	return __atomic_cas(cast(i64, c), old, next) == old
+}
+
+// Bool is a flag that cores read and change with indivisible operations.
+type Bool struct {
+	v i64
+}
+
+// NewBool returns a Bool holding v.
+fn NewBool(v bool) Bool {
+	if v {
+		return Bool{v: 1}
+	}
+	return Bool{v: 0}
+}
+
+// Load returns the flag.
+fn (c Bool) Load() bool {
+	return __atomic_load(cast(i64, c)) != 0
+}
+
+// Store sets the flag to v.
+fn (c Bool) Store(v bool) {
+	if v {
+		__atomic_store(cast(i64, c), 1)
+	} else {
+		__atomic_store(cast(i64, c), 0)
+	}
+}
+
+// Swap sets the flag to v and returns the value it replaced.
+fn (c Bool) Swap(v bool) bool {
+	if v {
+		return __atomic_swap(cast(i64, c), 1) != 0
+	}
+	return __atomic_swap(cast(i64, c), 0) != 0
+}
+
+// CompareSwap sets the flag to next if it is old, and reports whether it did.
+fn (c Bool) CompareSwap(old bool, next bool) bool {
+	mut o = 0
+	mut n = 0
+	if old {
+		o = 1
+	}
+	if next {
+		n = 1
+	}
+	return __atomic_cas(cast(i64, c), o, n) == o
+}

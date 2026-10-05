@@ -625,8 +625,8 @@ fn check() {
 		if v.shared_ == 0 {
 			tls_count = tls_count + 1
 			vs.tls = tls_count
-		} else if v.shared_ != 0 && vec_get(file_trusted, ck_file) == 0 {
-			err_code_at(v.pos, cstr("E601 SHARED_GLOBAL"), cstr("shared mutable state across cores is not allowed: globals are per core (use const, or relay messages)"))
+		} else if v.shared_ != 0 && v.mut_ != 0 && vec_get(file_trusted, ck_file) == 0 {
+			err_code_at(v.pos, cstr("E601 SHARED_GLOBAL"), cstr("shared mutable state across cores is not allowed: globals are per core (use const, `shared let` for a value built once and only read, or relay messages)"))
 		}
 		if v.type_ != 0 {
 			vs.type_ = resolve_type(v.type_)
@@ -1107,6 +1107,82 @@ fn check_pkg_vars(pkg i64, done Vec[i64]) {
 	}
 }
 
+// shared_bad_type is the first type inside t that a shared let cannot hold (a function, dyn
+// value, fault or task handle: they are per core or cannot be copied), or 0.
+fn shared_bad_type(t Ty, depth i64) i64 {
+	if depth > 8 {
+		return 0
+	}
+	let k = kind_of(t)
+	if k == K_FUNC || k == K_DYN || k == K_ERROR || sb_type(t) != 0 {
+		return cast(i64, t)
+	}
+	if k == K_OPT || k == K_SLICE {
+		return shared_bad_type(cast(Ty, t.elem), depth + 1)
+	}
+	if k == K_MAP {
+		let kb = shared_bad_type(cast(Ty, t.key), depth + 1)
+		if kb != 0 {
+			return kb
+		}
+		return shared_bad_type(cast(Ty, t.elem), depth + 1)
+	}
+	if k == K_STRUCT && t.fields != 0 {
+		mut i = 0
+		for i < cast(Vec[i64], t.fields).len {
+			let b = shared_bad_type(cast(Ty, field_type(t, i)), depth + 1)
+			if b != 0 {
+				return b
+			}
+			i = i + 1
+		}
+	}
+	return 0
+}
+
+fn shared_let_type(pos i64, t i64) {
+	if t == 0 {
+		return
+	}
+	let b = shared_bad_type(cast(Ty, t), 0)
+	if b == 0 {
+		return
+	}
+	let u = err_code(pos, cstr("E604 SHARED_LET_TYPE"))
+	buf_str(u, cstr("a shared let cannot hold "))
+	type_name(cast(Buf, u), cast(Ty, b))
+	buf_str(u, cstr(": every core reads it, so it holds plain data (numbers, str, slices, maps, structs, enums)"))
+	err_end(cast(Buf, u))
+}
+
+// shared_let_write reports a write to the shared let that e names or is part of (x = v,
+// x[i] = v, x.f = v, append(x, v), delete(x, k), a mut argument): every core reads it.
+fn shared_let_write(pos i64, e i64) {
+	if ck_trusted != 0 {
+		return
+	}
+	mut root = sb_root(e)
+	if cast(i64, root) == 0 {
+		// Not a local: a global of this package, if the expression is rooted in a name.
+		mut leaf = e
+		for leaf != 0 && (cast(Node, leaf).kind == EX_INDEX || cast(Node, leaf).kind == EX_SELECT || cast(Node, leaf).kind == EX_MUTARG) {
+			if cast(Node, leaf).kind == EX_INDEX {
+				leaf = cast(IndexExpr, leaf).x
+			} else if cast(Node, leaf).kind == EX_SELECT {
+				leaf = cast(SelectExpr, leaf).x
+			} else {
+				leaf = cast(MutArg, leaf).x
+			}
+		}
+		if leaf != 0 && cast(Node, leaf).kind == EX_IDENT {
+			root = lookup_global(qual(ck_pkg, cast(IdentExpr, leaf).name))
+		}
+	}
+	if cast(i64, root) != 0 && root.kind == SYM_GLOBAL && root.tls == 0 && vec_get(prog_vars, root.index).mut_ == 0 {
+		err_code_quoted(pos, cstr("E603 SHARED_LET_WRITE"), cstr("cannot modify shared let "), root.name, cstr(": every core reads it; build a changed copy in a local value instead"))
+	}
+}
+
 shared mut ck_sentinel i64 // the initializer of the package-level var being checked: fault("...") there is a sentinel
 shared mut sentinel_seq i64 // numbers sentinel identities (the runtime's own are below 64)
 
@@ -1152,6 +1228,9 @@ fn check_var(v Decl) {
 		return
 	}
 	// Anything else runs at startup, in the order checked, inside __start.
+	if v.shared_ != 0 && vec_get(file_trusted, ck_file) == 0 && v.type_ != 0 {
+		shared_let_type(v.pos, s.type_)
+	}
 	start_scope()
 	ck_fn = cast(Fn, start_fn)
 	if s.tls != 0 {
@@ -1167,6 +1246,9 @@ fn check_var(v Decl) {
 	check_assignable(cast(Node, init), t, cast(Ty, s.type_))
 	if is_untyped(t) != 0 {
 		reconvert(cast(Node, init), s.type_)
+	}
+	if v.shared_ != 0 && vec_get(file_trusted, ck_file) == 0 && v.type_ == 0 {
+		shared_let_type(v.pos, s.type_)
 	}
 	let target = node_new(EX_IDENT, v.pos)
 	cast(IdentExpr, target).name = s.name
@@ -4669,6 +4751,7 @@ fn check_target(t i64) i64 {
 fn check_assign(s i64) {
 	let target = cast(AssignStmt, s).target
 	let v = cast(Node, cast(AssignStmt, s).value)
+	shared_let_write(cast(Node, s).pos, target)
 	sb_assign(cast(Node, s).pos, target, cast(i64, v))
 	if (v.kind == EX_TRY || v.kind == EX_CATCH || v.kind == EX_WRAP) {
 		lower_try_stmt(s, cast(i64, v), 2, 0)

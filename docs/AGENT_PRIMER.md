@@ -79,6 +79,10 @@ the compiler: write a minimal repro to notes/compiler_bugs_NAME.md and work arou
   two-word object/table value and one indirect method call; conversion allocates nothing.
 - No threads and no shared mutable globals: every global is per core (each core thread has its own
   copy, initialized on every core). Concurrency is thread-per-core via hearth; messages via relay.
+  Data every core only reads (a big lookup table) goes in `shared let t = build()`: one copy, built on
+  core 0 before the cores start, immutable (E603 on any write through its name, E604 for a func/dyn/
+  fault type); counters and flags every core changes are `shared let n = atomic.NewInt(0)` with
+  `n.Add(1)`, `Load`, `Store`, `CompareSwap`.
   `main` runs on core 0 only, so assigning a global in `main` (or in a function it calls) in a program
   that starts cores (`anvil.Serve`, `hearth.Run`) is a compile error (E131): assign it in its
   initializer, in `on core.start` or in `once` (examples/percore.tin).

@@ -56,12 +56,12 @@ def main():
     try:
         assert get(port, '/stuck') == b'0 0', 'no core is stuck at first'
         threading.Thread(target=lambda: get(port, '/spin', 60), daemon=True).start()
-        deadline = time.monotonic() + 8
+        deadline = time.monotonic() + 25  # half the connections land on the held core and time out
         seen = None
         while time.monotonic() < deadline and seen is None:
             time.sleep(.3)
             try:
-                body = get(port, '/stuck', 1).split()
+                body = get(port, '/stuck', .7).split()
             except OSError:
                 continue  # that connection went to the held core
             if body and int(body[0]) == 1 and int(body[1]) >= 1500:

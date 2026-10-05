@@ -658,8 +658,7 @@ later global of its package (or itself), directly or through a function it calls
 to, is a compile error: that global's initializer has not run yet.
 
 `use name = expr` at package level is a per-core resource opened with the globals and
-closed when the core stops (section 11). `shared let` (one process-wide value) is for the
-standard library (section 20).
+closed when the core stops (section 11). A `shared let` is one process-wide value (section 11).
 
 ### Functions
 
@@ -1308,7 +1307,23 @@ fn main() {
 There are no threads in user code and no shared mutable state.
 
 - **Globals are per core.** Each core thread has its own copy of every global,
-  initialized on that core. Two cores never see each other's globals.
+  initialized on that core. Two cores never see each other's globals, so a 100 MB table in
+  a plain global takes 100 MB on every core.
+- **`shared let`** (#344) is the exception for data that every core only reads: it is
+  evaluated once, on core 0, before the cores start, and lives in memory every core reads,
+  so the table above costs 100 MB for any number of cores. `shared let table = build()`
+  holds numbers, `bool`, `str`, slices, maps, structs, enums and optionals of them (E604
+  for a function, `dyn` value or fault). It is immutable afterwards: assigning it, storing
+  into its elements, fields or entries, `append`, `delete` and `copy` into it, and passing
+  it as a `mut` argument are compile errors (E603). The check follows the name it is
+  written with: a local alias (`let ys = table`) is not tracked, so never change the
+  elements of one (a slice, map or struct taken from a `shared let` is the shared data, not
+  a copy; `copy` it into a new slice first). `shared mut` stays library-only (E601).
+- **`atomic`** has `atomic.Int` and `atomic.Bool`, counters and flags that every core may
+  change: `shared let hits = atomic.NewInt(0)`, then `hits.Add(1)`, `Load`, `Store`,
+  `Swap` and `CompareSwap` from any core. The operations are indivisible and sequentially
+  consistent across the process. Make them in a `shared let`: one made in a handler or a
+  per-core global lives in one core's memory.
 - `hearth.Run(n, f)` runs `f(core)` on n core threads (the calling thread is core 0) and
   returns when all have returned. `hearth.Cores()` is the number of CPUs the process may
   use (on Linux it respects the container's CPU limit and affinity), `hearth.ID()` the

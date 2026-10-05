@@ -41,6 +41,7 @@ Generated from the comments in `lib/*/` by `tools/gendoc.py`.
 | [postgres](#postgres) | PostgreSQL client (database/sql with pgx) |
 | [kafka](#kafka) | Kafka client (franz-go, sarama) |
 | [websocket](#websocket) | WebSocket server and client (gorilla/websocket) |
+| [atomic](#atomic) | counters and flags every core may change (sync/atomic) |
 
 ## say
 
@@ -1395,3 +1396,21 @@ fn echo(ws websocket.Conn, m websocket.Message) ! {
 - `IsClosed(err fault) bool`: IsClosed reports whether err is the normal end of a connection: the peer closed it.
 - `(c Conn) Read() !Message`: Read returns the next message; it answers pings and joins fragments on the way. When the peer closes, it answers the close and fails with "websocket: closed (code)". The returned message lives in the caller's pool. For a long-lived stream, use Each to reset message allocations after every callback without invalidating the Conn.
 - `(c Conn) Each(h fn(Conn, Message) !) !`: Each reads messages and calls h until a read or callback fails. Every callback has a reusable message pool: use keep() to retain its data after the callback returns. The Conn and all objects allocated before Each remain valid. Callbacks may wait. A closed peer returns the same IsClosed fault as Read; callback faults propagate.
+
+## atomic
+
+Package atomic has counters and flags that every core may change at once. Keep one in a `shared let` (a value every core reads, built once before the cores start), as in `shared let hits = atomic.NewInt(0)`, and call `hits.Add(1)` from any core; the operations are indivisible and ordered (sequentially consistent) across the whole process. A value made anywhere else (in a handler, in a per-core global) lives in one core's memory and must not be shared. Integers and flags only: build anything bigger with relay messages or per-core state.
+
+- `type Int struct`: Int is an integer that cores read and change with indivisible operations.
+- `NewInt(v i64) Int`: NewInt returns an Int holding v.
+- `(c Int) Load() i64`: Load returns the value.
+- `(c Int) Store(v i64)`: Store sets the value to v.
+- `(c Int) Add(n i64) i64`: Add adds n (negative to subtract) and returns the new value.
+- `(c Int) Swap(v i64) i64`: Swap sets the value to v and returns the one it replaced.
+- `(c Int) CompareSwap(old i64, next i64) bool`: CompareSwap sets the value to next if it is old, and reports whether it did.
+- `type Bool struct`: Bool is a flag that cores read and change with indivisible operations.
+- `NewBool(v bool) Bool`: NewBool returns a Bool holding v.
+- `(c Bool) Load() bool`: Load returns the flag.
+- `(c Bool) Store(v bool)`: Store sets the flag to v.
+- `(c Bool) Swap(v bool) bool`: Swap sets the flag to v and returns the value it replaced.
+- `(c Bool) CompareSwap(old bool, next bool) bool`: CompareSwap sets the flag to next if it is old, and reports whether it did.

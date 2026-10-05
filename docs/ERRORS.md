@@ -3106,24 +3106,26 @@ until the feature lands.
 
 ### E601 SHARED_GLOBAL
 
-Globals are per core: each core thread has its own copy. A `shared` variable, which every
-core would see, is limited to the runtime's own state in the standard library.
+Globals are per core: each core thread has its own copy. A `shared mut` variable, which every
+core would see and change, is limited to the runtime's own state in the standard library. A
+value that every core only reads is a `shared let` (below).
 
 ```tin edition=1
 package main
 
-shared let hits i64 = 0
+shared mut hits i64 = 0
 
 fn main() {
 }
 ```
 
 ```text
-example.tin:3:12: error E601 SHARED_GLOBAL: shared mutable state across cores is not allowed: globals are per core (use const, or relay messages)
+example.tin:3:12: error E601 SHARED_GLOBAL: shared mutable state across cores is not allowed: globals are per core (use const, `shared let` for a value built once and only read, or relay messages)
 ```
 
-Fix: use a per-core global (`mut hits i64`), a `const`, or send the data to the core that
-owns it with `relay`.
+Fix: use a per-core global (`mut hits i64`), a `const`, a `shared let` holding an
+`atomic.Int` for a counter every core bumps, or send the data to the core that owns it with
+`relay`.
 
 ### E602 GO
 
@@ -3134,6 +3136,55 @@ No example: `go` is edition 0 syntax, which is retired (#226); edition 1 reports
 OLD_SYNTAX for it and runs concurrent work in a `scope` or with `detach`.
 
 Fix: spawn the work as a child of a scope, or run it per core with `hearth`.
+
+### E603 SHARED_LET_WRITE
+
+A `shared let` is built once, before the cores start, and read by every core, so nothing may
+change it afterwards: not assigning it, not storing into its elements, fields or entries,
+not `append`, `delete` or `copy` into it, not passing it as a `mut` argument.
+
+```tin edition=1
+package main
+
+shared let table = []i64{1, 2, 3}
+
+fn main() {
+	table[0] = 9
+}
+```
+
+```text
+example.tin:6:7: error E603 SHARED_LET_WRITE: cannot modify shared let 'table': every core reads it; build a changed copy in a local value instead
+```
+
+Fix: copy what you need into a local value and change that, keep a per-core copy in a
+`mut` global, or use an `atomic.Int` or `atomic.Bool` for a counter or flag every core
+changes.
+
+### E604 SHARED_LET_TYPE
+
+A `shared let` holds plain data that any core can read: numbers, `bool`, `str`, slices, maps,
+structs, enums and optionals of them. Functions, `dyn` values, faults and task handles belong
+to one core or one scope.
+
+```tin edition=1
+package main
+
+shared let handler = fn(x i64) i64 {
+	return x + 1
+}
+
+fn main() {
+	_ = handler(1)
+}
+```
+
+```text
+example.tin:3:12: error E604 SHARED_LET_TYPE: a shared let cannot hold func(i64) i64: every core reads it, so it holds plain data (numbers, str, slices, maps, structs, enums)
+```
+
+Fix: declare the function with `fn` (functions are code, not values to share) or keep the
+value in a per-core global.
 
 ### E610 UNKNOWN_EVENT
 

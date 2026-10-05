@@ -1,0 +1,68 @@
+package main
+
+import "anvil"
+import "atomic"
+import "mint"
+import "quarry"
+import "say"
+
+// #344: a 100 MB table in a shared let (one copy for every core) and an atomic counter that
+// every core bumps. /sum answers a checksum of the table, /hit bumps the counter, /count reads it.
+// shared_check.py runs it with 1 and with 8 cores.
+
+shared let table = build(12500000)
+shared let hits = atomic.NewInt(0)
+shared let index = buildIndex(30000)
+
+// buildIndex makes a map big enough to be chunked (past 4096 entries).
+fn buildIndex(n i64) map[i64]i64 {
+	let m = map[i64]i64{}
+	for i in 0..n {
+		m[i * 7] = i
+	}
+	return m
+}
+
+fn build(n i64) []i64 {
+	let xs = make([]i64, n)
+	for i in 0..n {
+		xs[i] = i * 3
+	}
+	return xs
+}
+
+fn sum(q anvil.Req, w mut anvil.Out) {
+	mut s = 0
+	mut i = 0
+	for i < len(table) {
+		s += table[i]
+		i += 997
+	}
+	w.Text("{len(table)} {s}")
+}
+
+// /lookup reads every key of the shared map: the sum must be the same on every core.
+fn lookup(q anvil.Req, w mut anvil.Out) {
+	mut s = 0
+	for i in 0..30000 {
+		s += index[i * 7]
+	}
+	w.Text("{len(index)} {s}")
+}
+
+fn hit(q anvil.Req, w mut anvil.Out) {
+	w.Text("{hits.Add(1)}")
+}
+
+fn count(q anvil.Req, w mut anvil.Out) {
+	w.Text("{hits.Load()}")
+}
+
+fn main() {
+	let r = anvil.NewRouter()
+	r.Get("/sum", sum)
+	r.Get("/lookup", lookup)
+	r.Get("/hit", hit)
+	r.Get("/count", count)
+	say.Line(r.Serve(":" + quarry.Getenv("PORT")))
+}
