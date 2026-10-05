@@ -37,8 +37,8 @@ def name_bytes(name):
     return b''.join(bytes([len(p)])+p.encode() for p in name.split('.'))+b'\0'
 
 
-def record(owner, kind, data):
-    return owner+struct.pack('!HHIH',kind,1,60,len(data))+data
+def record(owner, kind, data, ttl=60):
+    return owner+struct.pack('!HHIH',kind,1,ttl,len(data))+data
 
 
 class DNS:
@@ -71,7 +71,7 @@ class DNS:
         flags = 0x8180
         answers = []
         success = {'ok.test','canonical.test','trunc.test','short.first.test',
-                   'dots.name','many.dots.name.first.test','rotate.test','retry.test','fallback.second.test','wrongid.test'}
+                   'dots.name','many.dots.name.first.test','rotate.test','retry.test','fallback.second.test','wrongid.test','ttl1.test'}
         if name == 'trunc.test' and not tcp:
             flags |= 0x200
         elif name == 'bad.test':
@@ -88,7 +88,7 @@ class DNS:
                 answers = [record(b'\xc0\x0c',28,ipaddress.IPv6Address('::1').packed)]
         elif name in success:
             if typ == 1:
-                answers = [record(b'\xc0\x0c',1,b'\x7f\0\0\1')]
+                answers = [record(b'\xc0\x0c',1,b'\x7f\0\0\1',1 if name == 'ttl1.test' else 60)]
         else:
             flags = 0x8183
         return data[:2]+struct.pack('!HHHHH',flags,1,len(answers),0,0)+data[12:end]+b''.join(answers)
@@ -169,7 +169,7 @@ def main():
                 check=True,cwd=ROOT,env=dict(os.environ,TIN_ROOT=str(work)),timeout=60)
             port = free_port()
             env = dict(os.environ,PORT=str(port),TIN_CORES='1',TIN_DEADLINE_MS='1500',
-                TIN_DNS_TEST='1',TIN_DNS_HOSTS=str(hosts),TIN_DNS_RESOLV_CONF=str(resolv),TIN_DNS_PORT=str(dns.port))
+                TIN_DNS_TEST='1',TIN_DNS_CACHE='0',TIN_DNS_HOSTS=str(hosts),TIN_DNS_RESOLV_CONF=str(resolv),TIN_DNS_PORT=str(dns.port))
             with (out/'server.log').open('wb') as log:
                 server = subprocess.Popen([str(exe)],env=env,stdout=log,stderr=log)
                 try:

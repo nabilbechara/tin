@@ -17,11 +17,13 @@ type dnsConfig struct { servers []str
  port i64 }
 type dnsAnswer struct { code i64
  address dnsAddress
- alias str }
+ alias str
+ ttl i64 }
 type dnsRecord struct { name str
  kind i64
  address dnsAddress
- alias str }
+ alias str
+ ttl i64 }
 mut dnsRotation i64
 
 fn dns_decimal(s str) i64 {
@@ -126,17 +128,30 @@ fn dns_sockaddr(sa i64, a dnsAddress, port i64) {
     for i, b in a.bytes { store8(sa+offset+i,i64(b)) }
 }
 
+// dnsFiles keeps the text of /etc/hosts and /etc/resolv.conf as long as the file's size and
+// modification time stay the same (and it was last changed more than 2 s ago, so a rewrite in
+// the second the file was read is not missed): a lookup then costs a stat, not a read.
+type dnsFileCache struct { mtime i64
+ size i64
+ text str }
+let dnsFiles = make(map[str]?dnsFileCache)
+
 fn dns_file(defaultPath str, override str) !str {
     mut path = defaultPath
     if quarry.Getenv("TIN_DNS_TEST") == "1" {
         let testPath = quarry.Getenv(override)
         if testPath != "" { path=testPath }
     }
+    let mtime = quarry.ModTime(path) catch _ { -1 }
+    let size = quarry.Size(path) catch _ { -1 }
+    let hit = dnsFiles[path]
+    if hit != nil && mtime >= 0 && hit.mtime == mtime && hit.size == size && rt_wall_seconds()-mtime > 2 { return hit.text }
     let (s, err) = quarry.ReadFile(path)
     if err != nil {
         if rt_fault_ident(cast(i64, err)) == faultDeadline || rt_bnd_stopped() { fail err }
         return ""
     }
+    if mtime >= 0 && size >= 0 { dnsFiles[keep(path)]=keep(dnsFileCache{mtime:mtime,size:size,text:s}) }
     return s
 }
 
@@ -288,6 +303,7 @@ fn dns_response(b []u8, name str, kind i64, id i64) dnsAnswer {
         let typ = dns_u16(b,at)
         let cls = dns_u16(b,at+2)
         let n = dns_u16(b,at+8)
+        let rttl = dns_u16(b,at+4)<<16 | dns_u16(b,at+6)
         let data = at+10
         pos=data+n
         if pos > len(b) { return bad }
@@ -297,27 +313,34 @@ fn dns_response(b []u8, name str, kind i64, id i64) dnsAnswer {
             if typ == 28 { fam=10 }
             mut bytes = make([]u8,0,n)
             bytes=append(bytes,b[data:pos]...)
-            records=append(records,dnsRecord{name:owner,kind:typ,address:dnsAddress{family:fam,bytes:bytes}})
+            records=append(records,dnsRecord{name:owner,kind:typ,address:dnsAddress{family:fam,bytes:bytes},ttl:rttl})
         }
         if typ == 5 {
             let (alias, end, err3) = dns_decode_name(b,data)
             if err3 != nil || end != pos || len(alias) == 0 { return bad }
-            records=append(records,dnsRecord{name:owner,kind:5,alias:alias,address:dnsAddress{}})
+            records=append(records,dnsRecord{name:owner,kind:5,alias:alias,address:dnsAddress{},ttl:rttl})
         }
     }
     mut current = dns_name(name)
+    mut ttl = i64(-1) // the smallest TTL on the way: how long the answer may be kept
     for hop in 0..8 {
         for _, rr in records {
-            if rr.kind == kind && fold_eq(rr.name,current) { return dnsAnswer{address:rr.address} }
+            if rr.kind == kind && fold_eq(rr.name,current) {
+                if ttl < 0 || rr.ttl < ttl { ttl=rr.ttl }
+                return dnsAnswer{address:rr.address,ttl:ttl}
+            }
         }
         mut alias = ""
         for _, rr in records {
-            if rr.kind == 5 && fold_eq(rr.name,current) { alias=rr.alias
- break }
+            if rr.kind == 5 && fold_eq(rr.name,current) {
+                alias=rr.alias
+                if ttl < 0 || rr.ttl < ttl { ttl=rr.ttl }
+                break
+            }
         }
         if alias == "" {
             if fold_eq(current,dns_name(name)) { return dnsAnswer{address:dnsAddress{}} }
-            return dnsAnswer{alias:current,address:dnsAddress{}}
+            return dnsAnswer{alias:current,address:dnsAddress{},ttl:ttl}
         }
         if fold_eq(alias,current) { return bad }
         current=alias
@@ -432,6 +455,7 @@ fn dns_exchange(server str, port i64, query []u8, name str, kind i64, id i64, un
 
 fn dns_lookup(name str, kind i64, config dnsConfig, start i64, limit_ i64) !dnsAnswer {
     mut current = name
+    mut ttl = i64(-1)
     for hop in 0..8 {
         mut id = i64(0)
         rt_random(&id,2)
@@ -464,11 +488,92 @@ fn dns_lookup(name str, kind i64, config dnsConfig, start i64, limit_ i64) !dnsA
         }
         // Code 5: no server replied at all; glibc ends the search there instead of trying other names.
         if !done && !answered { return dnsAnswer{code:5,address:dnsAddress{}} }
-        if answer.alias == "" { return answer }
+        if answer.ttl >= 0 && (ttl < 0 || answer.ttl < ttl) { ttl=answer.ttl }
+        if answer.alias == "" {
+            answer.ttl=ttl
+            return answer
+        }
         if fold_eq(answer.alias,current) { return dnsAnswer{code:2,address:dnsAddress{}} }
         current=answer.alias
     }
     return dnsAnswer{code:2,address:dnsAddress{}}
+}
+
+// ---- the answer cache (#348) ----
+//
+// A name that resolved is kept per core for the smallest TTL of the records that gave its
+// address (at most dnsMaxTTL), one that did not exist for dnsNegativeTTL seconds, so a service
+// calling one host a few hundred times a second asks the DNS server once per TTL. /etc/hosts is
+// not cached here: dns_file already re-reads it only when it changes.
+
+const dnsMaxTTL = 3600
+const dnsNegativeTTL = 5
+const dnsCacheMax = 512
+
+type dnsCached struct { found bool
+ family i64
+ scope i64
+ hi i64
+ lo i64
+ expires i64 }
+let dnsCache = make(map[str]?dnsCached)
+
+// dns_cached answers from the cache: 1 with sa filled, 0 for a name not known to exist (a
+// fault to raise), -1 when the name is not cached or its entry ran out.
+fn dns_cached(name str, port i64, sa i64) i64 {
+    if quarry.Getenv("TIN_DNS_TEST") == "1" && quarry.Getenv("TIN_DNS_CACHE") == "0" { return -1 }
+    let e = dnsCache[name]
+    if e == nil { return -1 }
+    if rt_mono_ns() >= e.expires {
+        delete(dnsCache,name)
+        return -1
+    }
+    if !e.found { return 0 }
+    mut n = i64(4)
+    if e.family == 10 { n=16 }
+    mut bytes = make([]u8,n)
+    mut word = e.lo
+    mut i = n-1
+    for i >= 0 {
+        if i == 7 { word=e.hi }
+        bytes[i]=u8(word&255)
+        word>>=8
+        i -= 1
+    }
+    dns_sockaddr(sa,dnsAddress{family:e.family,bytes:bytes,scope:e.scope},port)
+    return 1
+}
+
+// dns_remember keeps the address of name for ttl seconds (ttl <= 0: not at all); found false
+// keeps that the name does not exist.
+fn dns_remember(name str, found bool, a dnsAddress, ttl i64) {
+    if ttl <= 0 { return }
+    if quarry.Getenv("TIN_DNS_TEST") == "1" && quarry.Getenv("TIN_DNS_CACHE") == "0" { return }
+    if ttl > dnsMaxTTL { ttl=dnsMaxTTL }
+    if len(dnsCache) >= dnsCacheMax {
+        let now = rt_mono_ns()
+        mut stale = make([]str,0)
+        for k, v in dnsCache {
+            if v == nil {
+                stale=append(stale,k)
+            } else if now >= v.expires {
+                stale=append(stale,k)
+            }
+        }
+        for _, k in stale { delete(dnsCache,k) }
+        if len(dnsCache) >= dnsCacheMax {
+            // still full: forget everything rather than grow
+            mut all = make([]str,0)
+            for k, _ in dnsCache { all=append(all,k) }
+            for _, k in all { delete(dnsCache,k) }
+        }
+    }
+    mut hi = i64(0)
+    mut lo = i64(0)
+    for i, b in a.bytes {
+        if i < 8 && len(a.bytes) > 8 { hi=hi<<8|i64(b) } else { lo=lo<<8|i64(b) }
+    }
+    dnsCache[keep(name)]=keep(dnsCached{found:found,family:a.family,scope:a.scope,hi:hi,lo:lo,expires:rt_mono_ns()+ttl*1000000000})
 }
 
 fn resolve(host str, port i64, sa i64, until i64) ! {
@@ -481,6 +586,9 @@ fn resolve(host str, port i64, sa i64, until i64) ! {
     let fromHosts = try dns_hosts(name)
     if fromHosts.family != 0 { dns_sockaddr(sa,fromHosts,port)
  return }
+    let known = dns_cached(name,port,sa)
+    if known > 0 { return }
+    if known == 0 { fail say.Fault("wire: cannot resolve %q",host) }
     let config = try dns_config()
     mut limit_ = until
     let task = rt_task_current()
@@ -500,11 +608,15 @@ fn resolve(host str, port i64, sa i64, until i64) ! {
     for _, candidate in candidates {
         for _, kind in []i64{1,28} {
             let answer = try dns_lookup(candidate,kind,config,start,limit_)
-            if answer.address.family != 0 { dns_sockaddr(sa,answer.address,port)
- return }
+            if answer.address.family != 0 {
+                dns_remember(name,true,answer.address,answer.ttl)
+                dns_sockaddr(sa,answer.address,port)
+                return
+            }
             if answer.code == 5 { fail say.Fault("wire: cannot resolve %q: no DNS server answered",host) }
             if answer.code == 3 { break }
         }
     }
+    dns_remember(name,false,dnsAddress{},dnsNegativeTTL)
     fail say.Fault("wire: cannot resolve %q",host)
 }
