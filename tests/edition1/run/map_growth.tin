@@ -1,0 +1,143 @@
+package main
+
+import "say"
+
+// #346: maps past 4096 entries keep their entries in chunks and grow their index a few entries
+// per operation. Random sets, gets and deletes over a key space much bigger than a chunk, with a
+// heavy-delete phase that makes a full map rebuild, are checked against arrays; iteration is in
+// insertion order throughout.
+
+const space = 300000
+
+mut m = map[i64]i64{}
+mut names = map[str]i64{}
+mut present = make([]bool, space)
+mut seq = make([]i64, space)
+mut value = make([]i64, space)
+mut clock i64 = 0
+mut seed i64 = 987654321
+
+fn next(n i64) i64 {
+	seed = (seed * 6364136223846793005 + 1442695040888963407) & 0x7fffffffffffffff
+	return (seed >> 20) % n
+}
+
+fn set(k i64, v i64) {
+	if !present[k] {
+		present[k] = true
+		clock += 1
+		seq[k] = clock
+	}
+	value[k] = v
+	m[k] = v
+}
+
+fn del(k i64) {
+	present[k] = false
+	delete(m, k)
+}
+
+fn verify(label str) i64 {
+	mut bad = 0
+	mut live = 0
+	for k in 0..space {
+		let v = m[k]
+		if present[k] {
+			live += 1
+			if v != value[k] {
+				bad += 1
+			}
+		} else if v != 0 {
+			bad += 1
+		}
+	}
+	mut count = 0
+	mut lastSeq = -1
+	mut ordered = true
+	for k, v in m {
+		count += 1
+		if !present[k] || v != value[k] || seq[k] <= lastSeq {
+			ordered = false
+		}
+		lastSeq = seq[k]
+	}
+	if len(m) != live || count != live || !ordered {
+		bad += 1
+	}
+	say.Line(label, "live", live, "len", len(m), "bad", bad, "ordered", ordered)
+	return bad
+}
+
+fn main() {
+	// Inserts only: the entries fill chunk after chunk and the index doubles under way.
+	for k in 0..space {
+		if k % 7 != 0 {
+			set(k, k + 1)
+		}
+	}
+	verify("grown")
+	// A mix of sets, gets and deletes.
+	mut wrong = 0
+	for i in 0..900000 {
+		let k = next(space)
+		let r = next(100)
+		if r < 50 {
+			set(k, i)
+		} else if r < 85 {
+			let v = m[k]
+			if present[k] && v != value[k] || !present[k] && v != 0 {
+				wrong += 1
+			}
+		} else {
+			del(k)
+		}
+	}
+	say.Line("mixed wrong", wrong)
+	verify("mixed")
+	// Delete nine in ten, then insert until the map is full again: it is rebuilt.
+	for k in 0..space {
+		if k % 10 != 3 {
+			del(k)
+		}
+	}
+	verify("thinned")
+	for round in 0..4 {
+		for k in 0..space {
+			if k % 10 == round {
+				set(k, round * 1000000 + k)
+			}
+		}
+		verify("refilled")
+	}
+	// A map with str keys.
+	for i in 0..120000 {
+		names[keep("n{i}")] = i
+	}
+	for i in 0..120000 {
+		if i % 4 != 0 {
+			delete(names, "n{i}")
+		}
+	}
+	for i in 120000..180000 {
+		names[keep("n{i}")] = i
+	}
+	mut sbad = 0
+	for i in 0..180000 {
+		let want = i % 4 == 0 || i >= 120000
+		let v = names["n{i}"]
+		if want && v != i || !want && v != 0 {
+			sbad += 1
+		}
+	}
+	mut prev = -1
+	mut sordered = true
+	mut n = 0
+	for k, v in names {
+		n += 1
+		if v <= prev {
+			sordered = false
+		}
+		prev = v
+	}
+	say.Line("names", len(names), n, "bad", sbad, "ordered", sordered)
+}

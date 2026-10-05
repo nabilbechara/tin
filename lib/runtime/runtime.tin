@@ -1802,11 +1802,12 @@ fn rt_copy_str(dst i64, s str) i64 {
 // -1 deleted, else entry+1) with a keyed hash (rt_map_hash) and linear probing. The index has twice
 // as many slots as there are entries, so it is never more than half full. Header words:
 // count, index slots, keys, values, index, str keys?, shift, index tombstones, hashes,
-// ingot, entries used, entry capacity, live bytes, value drop, counted sides (#176).
+// ingot, entries used, entry capacity, live bytes, value drop, counted sides (#176), then the
+// words of a chunked map (see below).
 
 fn rt_map_make(isstr i64) i64 {
 	let ingot = __ctx()[ctxIngot]
-	let m = rt_region_alloc(ingot, 120)
+	let m = rt_region_alloc(ingot, mapHdr)
 	m[5] = isstr
 	m[9] = ingot
 	rt_map_init(m, 8)
@@ -1819,7 +1820,7 @@ fn rt_map_make(isstr i64) i64 {
 // uncounted side passes the runtime's own no-op drop; the gates skip it.
 fn rt_map_make_rc(isstr i64, drop fn(i64), counted i64) i64 {
 	let ingot = __ctx()[ctxIngot]
-	let m = rt_region_alloc(ingot, 120)
+	let m = rt_region_alloc(ingot, mapHdr)
 	m[5] = isstr
 	m[9] = ingot
 	m[13] = cast(i64, drop)
@@ -1972,6 +1973,9 @@ fn rt_map_slot(m i64, k i64, h i64) i64 {
 
 // rt_map_find returns the entry holding key k, or -1.
 fn rt_map_find(m i64, k i64) i64 {
+	if m[15] != 0 {
+		return rt_cmap_find(m, k, rt_map_hash(m, k))
+	}
 	let s = rt_map_slot(m, k, rt_map_hash(m, k))
 	if s < 0 {
 		return -1
@@ -1984,6 +1988,9 @@ fn rt_map_get(m i64, k i64) i64 {
 	if m == 0 {
 		c[ctxFound] = 0
 		return 0
+	}
+	if m[15] != 0 {
+		return rt_cmap_get(m, k)
 	}
 	let sl = rt_map_slot(m, k, rt_map_hash(m, k))
 	if sl < 0 {
@@ -2014,6 +2021,14 @@ fn rt_map_index(m i64, e i64, h i64) {
 
 // rt_map_grow rebuilds m with room for twice its live entries, keeping their order.
 fn rt_map_grow(m i64) {
+	mut need = 8
+	for need < (m[0]+1)*2 {
+		need *= 2
+	}
+	if need > mapChunk {
+		rt_cmap_convert(m)
+		return
+	}
 	let okeys = m[2]
 	let ovals = m[3]
 	let oidx = m[4]
@@ -2063,8 +2078,16 @@ fn rt_map_set(m i64, k i64, v i64, dup i64) {
 	if m == 0 {
 		rt_panic("assignment to entry in nil map")
 	}
+	if m[15] != 0 {
+		rt_cmap_set(m, k, v, dup)
+		return
+	}
 	if m[10] == m[11] {
 		rt_map_grow(m)
+		if m[15] != 0 {
+			rt_cmap_set(m, k, v, dup)
+			return
+		}
 	}
 	let h = rt_map_hash(m, k)
 	let fp = rt_map_fp(h)
@@ -2142,6 +2165,537 @@ fn rt_map_setk(m i64, k str, v i64) {
 	rt_map_set(m, cast(i64, k), v, 0)
 }
 
+// ---- big maps: chunked entries and an index that grows a few entries at a time (#346) ----
+//
+// A map of up to mapChunk (4096) entries is flat, as above. Past that its entries live in
+// chunks of mapChunk entries each, reached through directories (the header's keys, values,
+// hashes and live words then point at arrays of chunk addresses; word 15 is the directory's
+// size in chunks), so a full map adds a chunk (a few allocations, no copy) instead of
+// rebuilding. The index doubles when the entries outgrow it, but the old index stays until
+// every entry made before the doubling is in the new one: each operation moves mapMigrate
+// of them (words 16 to 20: the old index, its slots and shift, the next entry to move and
+// the entry count when the doubling began; words 21 to 23 drain the old index's memory).
+// Lookups try the new index, then the old; an
+// entry deleted from one index leaves a stale slot in the other, which the live byte
+// rules out. Entries are never renumbered while the map grows, so insertion order holds.
+// A full map whose entries are more than half dead is rebuilt instead (one O(n) pause, as
+// before): that is when the memory of deleted entries is returned. A map never shrinks.
+
+const mapHdr = 208
+const mapChunkBits = 12
+const mapChunk = 4096
+const mapMigrate = 16
+
+mut mapSlot i64 // where rt_cmap_find found the entry: its slot
+mut mapOld i64  // and whether that slot is in the old index
+mut mapFree i64 // after a miss: the slot in the index a new entry takes
+
+// rt_map_shift is the hash shift for an index of slots slots.
+fn rt_map_shift(slots i64) i64 {
+	mut shift = 64
+	mut x = slots
+	for x > 1 {
+		shift -= 1
+		x >>= 1
+	}
+	return shift
+}
+
+fn rt_cmap_kw(m i64, e i64) i64 {
+	return (m[2] + (e>>mapChunkBits)*8)[0] + (e&(mapChunk-1))*8
+}
+
+fn rt_cmap_vw(m i64, e i64) i64 {
+	return (m[3] + (e>>mapChunkBits)*8)[0] + (e&(mapChunk-1))*8
+}
+
+fn rt_cmap_hw(m i64, e i64) i64 {
+	return (m[8] + (e>>mapChunkBits)*8)[0] + (e&(mapChunk-1))*8
+}
+
+fn rt_cmap_lw(m i64, e i64) i64 {
+	return (m[12] + (e>>mapChunkBits)*8)[0] + (e&(mapChunk-1))
+}
+
+// rt_cmap_addchunk makes room for mapChunk more entries.
+fn rt_cmap_addchunk(m i64) {
+	let c = m[11] >> mapChunkBits
+	if c == m[15] {
+		let dc = m[15] * 2
+		let okeys = m[2]
+		let ovals = m[3]
+		let ohashes = m[8]
+		let olive = m[12]
+		m[2] = rt_region_alloc(m[9], dc*8)
+		m[3] = rt_region_alloc(m[9], dc*8)
+		m[12] = rt_region_alloc(m[9], dc*8)
+		memcpy(m[2], okeys, c*8)
+		memcpy(m[3], ovals, c*8)
+		memcpy(m[12], olive, c*8)
+		if m[5] != 0 {
+			m[8] = rt_region_alloc(m[9], dc*8)
+			memcpy(m[8], ohashes, c*8)
+		}
+		m[15] = dc
+		if m[9] != 0 {
+			rt_ingot_free(okeys)
+			rt_ingot_free(ovals)
+			rt_ingot_free(olive)
+			if ohashes != 0 {
+				rt_ingot_free(ohashes)
+			}
+		}
+	}
+	(m[2] + c*8)[0] = rt_region_alloc(m[9], mapChunk*8)
+	(m[3] + c*8)[0] = rt_region_alloc(m[9], mapChunk*8)
+	(m[12] + c*8)[0] = rt_region_alloc(m[9], mapChunk)
+	if m[5] != 0 {
+		(m[8] + c*8)[0] = rt_region_alloc(m[9], mapChunk*8)
+	}
+	m[11] += mapChunk
+}
+
+// rt_cmap_index puts entry e (hash h) into the first free or deleted slot of the index.
+fn rt_cmap_index(m i64, e i64, h i64) {
+	let mask = m[1] - 1
+	let idx = m[4]
+	mut i = lsr(h, m[6])
+	for idx[i] > 0 {
+		i = (i + 1) & mask
+	}
+	if idx[i] < 0 {
+		m[7] -= 1
+	}
+	idx[i] = rt_map_fp(h) | (e + 1)
+}
+
+// rt_cmap_append stores a new entry with its hash and indexes it; the count is the caller's.
+fn rt_cmap_append(m i64, k i64, v i64, h i64) {
+	let e = m[10]
+	rt_cmap_kw(m, e)[0] = k
+	rt_cmap_vw(m, e)[0] = v
+	store8(rt_cmap_lw(m, e), 1)
+	if m[5] != 0 {
+		rt_cmap_hw(m, e)[0] = h
+	}
+	rt_cmap_index(m, e, h)
+	m[10] = e + 1
+}
+
+// rt_cmap_setup gives m (its entries gone) a directory of dirs chunks, room for entries
+// entries and an empty index sized for them.
+fn rt_cmap_setup(m i64, dirs i64, entries i64) {
+	m[15] = dirs
+	m[2] = rt_region_alloc(m[9], dirs*8)
+	m[3] = rt_region_alloc(m[9], dirs*8)
+	m[12] = rt_region_alloc(m[9], dirs*8)
+	m[8] = 0
+	if m[5] != 0 {
+		m[8] = rt_region_alloc(m[9], dirs*8)
+	}
+	m[11] = 0
+	for m[11] < entries {
+		rt_cmap_addchunk(m)
+	}
+	mut t = mapChunk
+	for t < m[11] {
+		t *= 2
+	}
+	m[1] = t * 2
+	m[4] = rt_region_alloc(m[9], m[1]*8)
+	m[6] = rt_map_shift(m[1])
+	m[7] = 0
+	m[10] = 0
+	m[16] = 0
+	m[17] = 0
+	m[18] = 0
+	m[19] = 0
+	m[20] = 0
+	m[21] = 0
+	m[22] = 0
+	m[23] = 0
+	m[24] = 0
+}
+
+// rt_cmap_free frees the arrays and chunks of a chunked map (not its header).
+fn rt_cmap_free(keys i64, vals i64, hashes i64, live i64, dirs i64, idx i64, old i64, ingot i64) {
+	if ingot == 0 {
+		return
+	}
+	for c in 0..dirs {
+		if (keys + c*8)[0] == 0 {
+			break
+		}
+		rt_ingot_free((keys + c*8)[0])
+		rt_ingot_free((vals + c*8)[0])
+		rt_ingot_free((live + c*8)[0])
+		if hashes != 0 {
+			rt_ingot_free((hashes + c*8)[0])
+		}
+	}
+	rt_ingot_free(keys)
+	rt_ingot_free(vals)
+	rt_ingot_free(live)
+	if hashes != 0 {
+		rt_ingot_free(hashes)
+	}
+	rt_ingot_free(idx)
+	if old != 0 {
+		rt_ingot_free(old)
+	}
+}
+
+// rt_cmap_convert turns the flat map m, full at its capacity, into a chunked one (at most
+// mapChunk entries are moved and indexed).
+fn rt_cmap_convert(m i64) {
+	let okeys = m[2]
+	let ovals = m[3]
+	let oidx = m[4]
+	let ohashes = m[8]
+	let olive = m[12]
+	let used = m[10]
+	let n = m[0]
+	rt_cmap_setup(m, 8, mapChunk)
+	for j in 0..used {
+		if load8(olive+j) == 1 {
+			mut h = 0
+			if m[5] != 0 {
+				h = ohashes[j]
+			} else {
+				h = rt_map_hash(m, okeys[j])
+			}
+			rt_cmap_append(m, okeys[j], ovals[j], h)
+		}
+	}
+	m[0] = n
+	if m[9] != 0 {
+		rt_ingot_free(okeys)
+		rt_ingot_free(ovals)
+		rt_ingot_free(oidx)
+		rt_ingot_free(olive)
+		if ohashes != 0 {
+			rt_ingot_free(ohashes)
+		}
+	}
+}
+
+// rt_cmap_rebuild compacts a chunked map whose entries are mostly dead.
+fn rt_cmap_rebuild(m i64) {
+	let okeys = m[2]
+	let ovals = m[3]
+	let ohashes = m[8]
+	let olive = m[12]
+	let odirs = m[15]
+	let oidx = m[4]
+	let oold = m[16]
+	let odrain = m[21]
+	let used = m[10]
+	let n = m[0]
+	mut entries = mapChunk
+	for entries < n*2 {
+		entries += mapChunk
+	}
+	mut dirs = 8
+	for dirs < entries >> mapChunkBits {
+		dirs *= 2
+	}
+	// The old directories are read through temporary headers while m gets new ones.
+	let tmp = rt_region_alloc(0, mapHdr)
+	tmp[2] = okeys
+	tmp[3] = ovals
+	tmp[8] = ohashes
+	tmp[12] = olive
+	tmp[5] = m[5]
+	rt_cmap_setup(m, dirs, entries)
+	for j in 0..used {
+		if load8(rt_cmap_lw(tmp, j)) == 1 {
+			let k = rt_cmap_kw(tmp, j)[0]
+			mut h = 0
+			if m[5] != 0 {
+				h = rt_cmap_hw(tmp, j)[0]
+			} else {
+				h = rt_map_hash(m, k)
+			}
+			rt_cmap_append(m, k, rt_cmap_vw(tmp, j)[0], h)
+		}
+	}
+	m[0] = n
+	rt_cmap_free(okeys, ovals, ohashes, olive, odirs, oidx, oold, m[9])
+	if odrain != 0 && m[9] != 0 {
+		rt_ingot_free(odrain)
+	}
+}
+
+// rt_cmap_step moves a few entries into the new index while a doubling is under way, and
+// then, if the old index was big, gives its memory back a megabyte per call (freeing it at
+// once would take a call a long time).
+fn rt_cmap_step(m i64) {
+	if m[16] != 0 {
+		// First touch the new index, one 2 MiB stride per call: where the kernel backs memory
+		// with huge pages, the first write to each costs the zeroing of 2 MiB, and entries
+		// moved into untouched memory would pay for sixteen of them in one call.
+		if m[24] < m[1]*8 {
+			(m[4] + m[24])[0] = 0
+			m[24] += 2097152
+			return
+		}
+		let end = m[20]
+		mut moved = 0
+		for moved < mapMigrate && m[19] < end {
+			let e = m[19]
+			if load8(rt_cmap_lw(m, e)) == 1 {
+				mut h = 0
+				if m[5] != 0 {
+					h = rt_cmap_hw(m, e)[0]
+				} else {
+					h = rt_map_hash(m, rt_cmap_kw(m, e)[0])
+				}
+				rt_cmap_index(m, e, h)
+			}
+			m[19] = e + 1
+			moved += 1
+		}
+		if m[19] >= end {
+			if m[9] != 0 {
+				if m[17]*8 > 4194304 && m[21] == 0 {
+					m[21] = m[16]
+					m[22] = m[17] * 8
+					m[23] = 0
+				} else {
+					rt_ingot_free(m[16])
+				}
+			}
+			m[16] = 0
+			m[17] = 0
+			m[18] = 0
+		}
+		return
+	}
+	if m[21] != 0 {
+		let page = rt_page_size()
+		mut at = m[23]
+		if at == 0 {
+			at = (m[21] + page - 1) & -page
+		}
+		if at + 1048576 >= ((m[21] + m[22]) & -page) {
+			rt_ingot_free(m[21])
+			m[21] = 0
+			m[22] = 0
+			m[23] = 0
+		} else {
+			rt_sys_madvise(at, 1048576, MEM_DONTNEED)
+			m[23] = at + 1048576
+		}
+	}
+}
+
+// rt_cmap_grow makes room in a chunked map that has used all its entries.
+fn rt_cmap_grow(m i64) {
+	let used = m[10]
+	if (used - m[0]) * 2 >= used {
+		rt_cmap_rebuild(m)
+		return
+	}
+	rt_cmap_addchunk(m)
+	let t = m[1] / 2
+	if m[11] > t {
+		// The entries outgrew the index: start a new, twice as big, and move into it a few
+		// entries per operation (finish an unfinished doubling first; that is rare).
+		for m[16] != 0 || m[21] != 0 {
+			rt_cmap_step(m)
+		}
+		m[16] = m[4]
+		m[17] = m[1]
+		m[18] = m[6]
+		m[1] = t * 4
+		m[4] = rt_region_alloc(m[9], m[1]*8)
+		m[6] = rt_map_shift(m[1])
+		m[7] = 0
+		m[19] = 0
+		m[20] = used
+		m[24] = 0
+	}
+}
+
+// rt_cmap_probe returns the entry holding key k (hash h) that the index idx names, or -1;
+// mapSlot is its slot. Every slot of an index names a live entry (a delete clears the entry's
+// slot in both indexes), so a match needs no look at the live byte. With rec set, a miss leaves in mapFree the slot a new entry
+// would take: the first deleted one met, else the empty one that ended the probe.
+fn rt_cmap_probe(m i64, idx i64, mask i64, shift i64, k i64, h i64, rec i64) i64 {
+	let fp = rt_map_fp(h)
+	let str_keys = m[5] != 0
+	let keys = m[2]
+	mut i = lsr(h, shift)
+	mut tomb = -1
+	for {
+		let v = idx[i]
+		if v == 0 {
+			if rec != 0 {
+				if tomb >= 0 {
+					mapFree = tomb
+				} else {
+					mapFree = i
+				}
+			}
+			return -1
+		}
+		if v < 0 {
+			if tomb < 0 {
+				tomb = i
+			}
+		} else if v&-4294967296 == fp {
+			let e = (v & 0xffffffff) - 1
+			let kw = ((keys + (e >> mapChunkBits)*8)[0] + (e & (mapChunk - 1))*8)[0]
+			if (str_keys && rt_str_eq(cast(str, kw), cast(str, k))) || (!str_keys && kw == k) {
+				mapSlot = i
+				return e
+			}
+		}
+		i = (i + 1) & mask
+	}
+}
+
+// rt_cmap_find returns the entry holding key k (hash h) or -1; mapSlot and mapOld say where
+// its slot is, and after a miss mapFree is where a new entry goes in the index.
+fn rt_cmap_find(m i64, k i64, h i64) i64 {
+	let e = rt_cmap_probe(m, m[4], m[1]-1, m[6], k, h, 1)
+	if e >= 0 {
+		mapOld = 0
+		return e
+	}
+	if m[16] != 0 {
+		let e2 = rt_cmap_probe(m, m[16], m[17]-1, m[18], k, h, 0)
+		if e2 >= 0 {
+			mapOld = 1
+			return e2
+		}
+	}
+	return -1
+}
+
+fn rt_cmap_get(m i64, k i64) i64 {
+	let c = __ctx()
+	if m[16] != 0 || m[21] != 0 {
+		rt_cmap_step(m)
+	}
+	let e = rt_cmap_find(m, k, rt_map_hash(m, k))
+	if e < 0 {
+		c[ctxFound] = 0
+		return 0
+	}
+	c[ctxFound] = 1
+	return rt_cmap_vw(m, e)[0]
+}
+
+fn rt_cmap_set(m i64, k i64, v i64, dup i64) {
+	if m[16] != 0 || m[21] != 0 {
+		rt_cmap_step(m)
+	}
+	if m[10] == m[11] {
+		rt_cmap_grow(m)
+	}
+	let h = rt_map_hash(m, k)
+	let e0 = rt_cmap_find(m, k, h)
+	if e0 >= 0 {
+		if m[9] != 0 {
+			if (m[14] & 2) != 0 {
+				// The old value's count leaves with the slot; the new one takes it.
+				rt_rc_inc(v)
+				rt_rc_dec(rt_cmap_vw(m, e0)[0], cast(fn(i64), m[13]))
+			}
+			if dup != 0 && (m[14] & 1) != 0 {
+				rt_rc_drop_fresh(k)
+			}
+		}
+		rt_cmap_vw(m, e0)[0] = v
+		return
+	}
+	if m[9] != 0 {
+		if (m[14] & 1) != 0 {
+			rt_rc_inc(k)
+		}
+		if (m[14] & 2) != 0 {
+			rt_rc_inc(v)
+		}
+	}
+	// A new entry takes the slot the probe ended at.
+	let e = m[10]
+	let c = (e >> mapChunkBits) * 8
+	let o = e & (mapChunk - 1)
+	((m[2] + c)[0] + o*8)[0] = k
+	((m[3] + c)[0] + o*8)[0] = v
+	store8((m[12] + c)[0] + o, 1)
+	if m[5] != 0 {
+		((m[8] + c)[0] + o*8)[0] = h
+	}
+	let idx = m[4]
+	if idx[mapFree] < 0 {
+		m[7] -= 1
+	}
+	idx[mapFree] = rt_map_fp(h) | (e + 1)
+	m[10] = e + 1
+	m[0] += 1
+}
+
+// rt_cmap_unlink deletes the slot of entry e (hash h) from the index idx.
+fn rt_cmap_unlink(idx i64, mask i64, shift i64, e i64, h i64) {
+	mut i = lsr(h, shift)
+	for {
+		let v = idx[i]
+		if v == 0 {
+			return
+		}
+		if v > 0 && (v & 0xffffffff) == e + 1 {
+			idx[i] = -1
+			return
+		}
+		i = (i + 1) & mask
+	}
+}
+
+fn rt_cmap_del(m i64, k i64) {
+	if m[16] != 0 || m[21] != 0 {
+		rt_cmap_step(m)
+	}
+	let h = rt_map_hash(m, k)
+	let e = rt_cmap_find(m, k, h)
+	if e < 0 {
+		return
+	}
+	let slot = mapSlot
+	let found_old = mapOld
+	if m[9] != 0 {
+		// The slot's counts leave with it (#176); encoded keys are plain blocks.
+		if (m[14] & 1) != 0 {
+			rt_rc_dec(rt_cmap_kw(m, e)[0], rt_rc_drop_none)
+		}
+		if (m[14] & 2) != 0 {
+			rt_rc_dec(rt_cmap_vw(m, e)[0], cast(fn(i64), m[13]))
+		}
+	}
+	store8(rt_cmap_lw(m, e), 0)
+	// During a doubling an entry made before it is named by the old index, and by the new one
+	// once moved; one made since by the new index alone. Both slots go.
+	let in_old = m[16] != 0 && e < m[20]
+	let in_new = !in_old || e < m[19]
+	if in_old {
+		if found_old != 0 {
+			m[16][slot] = -1
+		} else {
+			rt_cmap_unlink(m[16], m[17]-1, m[18], e, h)
+		}
+	}
+	if in_new {
+		if found_old == 0 {
+			m[4][slot] = -1
+		} else {
+			rt_cmap_unlink(m[4], m[1]-1, m[6], e, h)
+		}
+		m[7] += 1
+	}
+	m[0] -= 1
+}
+
 // ---- map keys encoded as bytes (struct and enum keys compare by value) ----
 
 // query is what an interpolated literal becomes where a query is wanted: the text pieces
@@ -2215,6 +2769,10 @@ fn rt_map_del(m i64, k i64) {
 	if m == 0 {
 		return
 	}
+	if m[15] != 0 {
+		rt_cmap_del(m, k)
+		return
+	}
 	let s = rt_map_slot(m, k, rt_map_hash(m, k))
 	if s >= 0 {
 		let e = (m[4][s] & 0xffffffff) - 1
@@ -2237,6 +2795,13 @@ fn rt_map_del(m i64, k i64) {
 // rt_map_release frees the auxiliary tables after a long-lived map's entries are dropped.
 fn rt_map_release(m i64) {
 	if m == 0 || m[9] == 0 { return }
+	if m[15] != 0 {
+		rt_cmap_free(m[2], m[3], m[8], m[12], m[15], m[4], m[16], m[9])
+		if m[21] != 0 {
+			rt_ingot_free(m[21])
+		}
+		return
+	}
 	rt_ingot_free(m[2])
  rt_ingot_free(m[3])
  rt_ingot_free(m[4])
@@ -2253,14 +2818,23 @@ fn rt_map_slots(m i64) i64 {
 }
 
 fn rt_map_live(m i64, i i64) bool {
+	if m[15] != 0 {
+		return load8(rt_cmap_lw(m, i)) == 1
+	}
 	return load8(m[12]+i) == 1
 }
 
 fn rt_map_key(m i64, i i64) i64 {
+	if m[15] != 0 {
+		return rt_cmap_kw(m, i)[0]
+	}
 	return m[2][i]
 }
 
 fn rt_map_val(m i64, i i64) i64 {
+	if m[15] != 0 {
+		return rt_cmap_vw(m, i)[0]
+	}
 	return m[3][i]
 }
 
@@ -3389,7 +3963,7 @@ fn rt_keep_slice(s i64, esz i64) i64 {
 }
 
 fn rt_keep_map_new(m i64, drop fn(i64), counted i64) i64 {
-	let k = rt_ingot_alloc(120)
+	let k = rt_ingot_alloc(mapHdr)
 	k[5] = m[5]
 	k[9] = 1
 	k[13] = cast(i64, drop)

@@ -542,3 +542,24 @@ arm64, one core; "base" is main at `baae526`).
 The 5000-byte values take 5120 bytes of a slab each instead of a page-rounded 8192, and the
 memory of deleted values is reused instead of unmapped, which is what left 30008 mappings
 (the default `vm.max_map_count` is 65530) after half of them were deleted.
+
+## Map growth without stalls (Linux arm64)
+
+A map rebuilt its entries and index when full, so inserting into a map of 2^21 entries took
+50 to 100 ms (#346). Past 4096 entries a map now keeps its entries in chunks and moves its
+index into a bigger one 16 entries per operation (`tools/ci/map_growth_check.py`, fixture
+`mapgrow.tin`; docker `debian:bookworm` on Apple silicon, arm64; the slowest insert of a run
+includes scheduler noise, the best of five runs is what the check bounds; "base" is main at
+`dc254db`).
+
+| workload | base | now |
+|---|---:|---:|
+| 4000000 integer keys inserted: slowest insert | 77 to 103 ms (at 2^21 entries) | 150 to 270 us (best of runs) |
+| the same: total insert time | 663 to 791 ms | 661 to 719 ms |
+| the same: 4000000 lookups | 155 to 180 ms | 205 to 245 ms |
+| 1000000 str keys inserted: slowest insert | 20 ms | 220 to 270 us |
+| the same: total insert time, 1000000 lookups | 267 ms, 382 ms | 202 to 263 ms, 140 to 202 ms |
+
+Lookups in a big integer-keyed map cost about a third more (the entry address goes through a
+directory); inserting costs the same. On macOS arm64 the slowest of 4000000 inserts went from
+54 ms to 0.15 to 0.4 ms.
