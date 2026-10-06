@@ -1,0 +1,470 @@
+package seal
+
+// ---- ML-KEM-768 (FIPS 203), for TLS's X25519MLKEM768 (#479) ----
+// A lattice key-encapsulation mechanism: polynomials of 256 coefficients mod q = 3329, vectors
+// of k = 3 of them, the number-theoretic transform for products, centered binomial noise with
+// eta = 2, and ciphertexts compressed to 10 and 4 bits per coefficient. Every operation on a
+// secret (the seed, s, the message, the comparison in decapsulation) is constant time: reductions
+// are Barrett multiplications with branch-free corrections, and rounding divides by
+// multiplication. Rejection sampling of the public matrix A depends only on public data.
+//
+// The decapsulation key is FIPS 203's expanded form: s encoded (1152 bytes), the encapsulation
+// key (1184), its SHA3-256 hash and the implicit-rejection secret z (32 each), 2400 bytes in all.
+
+const mlq = 3329
+const mlk = 3
+const mlBarrett = 330282856 // floor(2^40 / q)
+const mlRound = 330282857  // ceil(2^40 / q): exact division by q for numerators below 2^28
+
+// MLKEM768EncapsulationKeySize, MLKEM768DecapsulationKeySize and MLKEM768CiphertextSize are
+// ML-KEM-768's sizes in bytes; the shared key is 32 bytes.
+const MLKEM768EncapsulationKeySize = 1184
+const MLKEM768DecapsulationKeySize = 2400
+const MLKEM768CiphertextSize = 1088
+
+// mlZetas[i] is 17^BitRev7(i) mod q, and mlGammas[i] is 17^(2 BitRev7(i) + 1): the NTT's
+// twiddles and the base-case multiplication's factors.
+let mlZetas = ml_powers(0)
+let mlGammas = ml_powers(1)
+
+fn ml_powers(gamma i64) []i64 {
+	mut out = make([]i64, 128)
+	for i in 0..128 {
+		mut r = 0
+		for b in 0..7 {
+			r = r | ((i >> b) & 1) << (6 - b)
+		}
+		mut e = r
+		if gamma != 0 {
+			e = 2*r + 1
+		}
+		mut v = 1
+		for k in 0..e {
+			v = v * 17 % mlq
+		}
+		out[i] = v
+	}
+	return out
+}
+
+// ml_red is x mod q for 0 <= x < 2^32, without a branch.
+// The Barrett quotient is exact or one short, so x - (t+1)q is in [-q, q) and ml_fix corrects it.
+// Each helper is one expression, so calls are expanded in place (the NTT's inner loops).
+@wrap fn ml_red(x i64) i64 {
+	return ml_fix(x - ((x*mlBarrett)>>40)*mlq - mlq)
+}
+
+// ml_fix adds q to r in [-q, q) when r is negative, without a branch.
+@wrap fn ml_fix(r i64) i64 {
+	return r + (mlq & (r >> 63))
+}
+
+// ml_csub maps [0, 2q) to [0, q).
+@wrap fn ml_csub(x i64) i64 {
+	return ml_fix(x - mlq)
+}
+
+@wrap fn ml_add(a i64, b i64) i64 {
+	return ml_csub(a + b)
+}
+
+@wrap fn ml_sub(a i64, b i64) i64 {
+	return ml_csub(a - b + mlq)
+}
+
+// ml_ntt transforms f in place (FIPS 203 Algorithm 9). The reductions of ml_red, ml_add and
+// ml_sub are written out in the butterflies, the hot loop of every ML-KEM operation.
+@wrap fn ml_ntt(f mut []i64) {
+	mut i = 1
+	mut n = 128
+	for n >= 2 {
+		for start in (0..256).step(2*n) {
+			let zeta = mlZetas[i]
+			i += 1
+			for j in start..start+n {
+				let p = zeta * f[j+n]
+				let r = p - ((p*mlBarrett)>>40)*mlq - mlq
+				let t = r + (mlq & (r >> 63))
+				let fj = f[j]
+				let d = fj - t
+				f[j+n] = d + (mlq & (d >> 63))
+				let e = fj + t - mlq
+				f[j] = e + (mlq & (e >> 63))
+			}
+		}
+		n = n / 2
+	}
+}
+
+// ml_intt is the inverse transform (Algorithm 10), including the factor 128^-1 = 3303.
+@wrap fn ml_intt(f mut []i64) {
+	mut i = 127
+	mut n = 2
+	for n <= 128 {
+		for start in (0..256).step(2*n) {
+			let zeta = mlZetas[i]
+			i -= 1
+			for j in start..start+n {
+				let t = f[j]
+				let u = f[j+n]
+				let e = t + u - mlq
+				f[j] = e + (mlq & (e >> 63))
+				let d = u - t
+				let p = zeta * (d + (mlq & (d >> 63)))
+				let r = p - ((p*mlBarrett)>>40)*mlq - mlq
+				f[j+n] = r + (mlq & (r >> 63))
+			}
+		}
+		n = n * 2
+	}
+	for j in 0..256 {
+		let p = f[j] * 3303
+		let r = p - ((p*mlBarrett)>>40)*mlq - mlq
+		f[j] = r + (mlq & (r >> 63))
+	}
+}
+
+// ml_mul_acc adds the NTT-domain product of f and g to acc (Algorithms 11 and 12), with the
+// reductions written out as in ml_ntt.
+@wrap fn ml_mul_acc(acc mut []i64, f []i64, g []i64) {
+	for i in 0..128 {
+		let a0 = f[2*i]
+		let a1 = f[2*i+1]
+		let b0 = g[2*i]
+		let b1 = g[2*i+1]
+		let p1 = a1 * b1
+		let r1 = p1 - ((p1*mlBarrett)>>40)*mlq - mlq
+		let p0 = a0*b0 + (r1+(mlq&(r1>>63)))*mlGammas[i]
+		let r0 = p0 - ((p0*mlBarrett)>>40)*mlq - mlq
+		let p2 = a0*b1 + a1*b0
+		let r2 = p2 - ((p2*mlBarrett)>>40)*mlq - mlq
+		let s0 = acc[2*i] + r0 + (mlq & (r0 >> 63)) - mlq
+		acc[2*i] = s0 + (mlq & (s0 >> 63))
+		let s1 = acc[2*i+1] + r2 + (mlq & (r2 >> 63)) - mlq
+		acc[2*i+1] = s1 + (mlq & (s1 >> 63))
+	}
+}
+
+// ml_sample_ntt is the matrix entry of seed rho and indices j, i (Algorithm 7), from SHAKE128;
+// it reads public data only.
+fn ml_sample_ntt(rho []u8, j i64, i i64) []i64 {
+	mut in = make([]u8, 0, 34)
+	in = append(in, rho...)
+	in = append(in, u8(j), u8(i))
+	mut x = sponge_new(168, in, 0x1f)
+	mut a = make([]i64, 256)
+	mut n = 0
+	// Three bytes give two candidates; a block of 168 bytes holds 56 such triples.
+	for {
+		let c = x.out
+		mut p = 0
+		for p < 168 && n < 256 {
+			let d1 = i64(c[p]) | (i64(c[p+1])&15)<<8
+			let d2 = i64(c[p+1])>>4 | i64(c[p+2])<<4
+			if d1 < mlq {
+				a[n] = d1
+				n += 1
+			}
+			if d2 < mlq && n < 256 {
+				a[n] = d2
+				n += 1
+			}
+			p += 3
+		}
+		if n == 256 {
+			return a
+		}
+		keccak_f(mut x.a)
+		x.lanes_out()
+	}
+	return a
+}
+
+// ml_cbd is SamplePolyCBD with eta = 2 (Algorithm 8) from PRF(s, b) = SHAKE256(s || b, 128).
+@wrap fn ml_cbd(s []u8, b i64) []i64 {
+	mut in = make([]u8, 0, 33)
+	in = append(in, s...)
+	in = append(in, u8(b))
+	let buf = sponge_sum(136, in, 0x1f, 128)
+	mut f = make([]i64, 256)
+	for i in 0..32 {
+		let t = u64(buf[4*i]) | u64(buf[4*i+1])<<8 | u64(buf[4*i+2])<<16 | u64(buf[4*i+3])<<24
+		let d = (t & 0x55555555) + ((t >> 1) & 0x55555555)
+		for j in 0..8 {
+			let a = i64((d >> u64(4*j)) & 3)
+			let bb = i64((d >> u64(4*j+2)) & 3)
+			let v = a - bb
+			f[8*i+j] = v + (mlq & (v >> 63))
+		}
+	}
+	return f
+}
+
+// ml_encode12 appends the 12-bit encoding of f (384 bytes) to out.
+fn ml_encode12(out mut []u8, f []i64) {
+	for i in 0..128 {
+		let a = f[2*i]
+		let b = f[2*i+1]
+		out = append(out, u8(a&255), u8((a>>8)|((b&15)<<4)), u8(b>>4))
+	}
+}
+
+// ml_decode12 reads 256 12-bit values (384 bytes from at); ok is false when one is q or more.
+fn ml_decode12(b []u8, at i64) ([]i64, bool) {
+	mut f = make([]i64, 256)
+	mut bad = 0
+	for i in 0..128 {
+		let x0 = i64(b[at+3*i])
+		let x1 = i64(b[at+3*i+1])
+		let x2 = i64(b[at+3*i+2])
+		f[2*i] = x0 | (x1&15)<<8
+		f[2*i+1] = x1>>4 | x2<<4
+		bad = bad | ((mlq - 1 - f[2*i]) >> 63) | ((mlq - 1 - f[2*i+1]) >> 63)
+	}
+	return f, bad == 0
+}
+
+// ml_compress is Compress_d: round(2^d x / q) mod 2^d, dividing by multiplication.
+@wrap fn ml_compress(x i64, d i64) i64 {
+	return ((((x << d) + 1664) * mlRound) >> 40) & ((1 << d) - 1)
+}
+
+@wrap fn ml_decompress(y i64, d i64) i64 {
+	return (mlq*y + (1 << (d - 1))) >> d
+}
+
+// ml_pack appends the d-bit values of f, compressed, little-endian (ByteEncode_d of Compress_d).
+@wrap fn ml_pack(out mut []u8, f []i64, d i64) {
+	mut acc = u64(0)
+	mut bits = 0
+	for i in 0..256 {
+		acc = acc | u64(ml_compress(f[i], d))<<u64(bits)
+		bits += d
+		for bits >= 8 {
+			out = append(out, u8(acc & 255))
+			acc = acc >> 8
+			bits -= 8
+		}
+	}
+}
+
+// ml_unpack reads 256 d-bit values from b at at and decompresses them.
+@wrap fn ml_unpack(b []u8, at i64, d i64) []i64 {
+	mut f = make([]i64, 256)
+	mut acc = u64(0)
+	mut bits = 0
+	mut p = at
+	let mask = u64((1 << d) - 1)
+	for i in 0..256 {
+		for bits < d {
+			acc = acc | u64(b[p])<<u64(bits)
+			p += 1
+			bits += 8
+		}
+		f[i] = ml_decompress(i64(acc & mask), d)
+		acc = acc >> u64(d)
+		bits -= d
+	}
+	return f
+}
+
+// ml_matrix is A from rho, entry (i, j) at 3i + j.
+fn ml_matrix(rho []u8) [][]i64 {
+	mut a = make([][]i64, 0, 9)
+	for i in 0..mlk {
+		for j in 0..mlk {
+			a = append(a, ml_sample_ntt(rho, j, i))
+		}
+	}
+	return a
+}
+
+// ml_keygen is ML-KEM.KeyGen_internal(d, z): the decapsulation and encapsulation keys.
+fn ml_keygen(d []u8, z []u8) ([]u8, []u8) {
+	mut gin = make([]u8, 0, 33)
+	gin = append(gin, d...)
+	gin = append(gin, u8(mlk))
+	let g = Sha3_512(str(gin))
+	let rho = g[0:32]
+	let sigma = g[32:64]
+	let a = ml_matrix(rho)
+	mut s = make([][]i64, 0, mlk)
+	mut e = make([][]i64, 0, mlk)
+	for i in 0..mlk {
+		mut p = ml_cbd(sigma, i)
+		ml_ntt(mut p)
+		s = append(s, p)
+	}
+	for i in 0..mlk {
+		mut p = ml_cbd(sigma, mlk+i)
+		ml_ntt(mut p)
+		e = append(e, p)
+	}
+	mut ek = make([]u8, 0, MLKEM768EncapsulationKeySize)
+	mut dk = make([]u8, 0, MLKEM768DecapsulationKeySize)
+	for i in 0..mlk {
+		mut t = e[i]
+		for j in 0..mlk {
+			ml_mul_acc(mut t, a[3*i+j], s[j])
+		}
+		ml_encode12(mut ek, t)
+		ml_encode12(mut dk, s[i])
+	}
+	ek = append(ek, rho...)
+	dk = append(dk, ek...)
+	dk = append(dk, Sha3_256(str(ek))...)
+	dk = append(dk, z...)
+	return dk, ek
+}
+
+// ml_encrypt is K-PKE.Encrypt(ek, m, r); ok is false when ek does not decode (a value >= q).
+fn ml_encrypt(ek []u8, m []u8, r []u8) ([]u8, bool) {
+	mut t = make([][]i64, 0, mlk)
+	mut ok = true
+	for i in 0..mlk {
+		let (p, good) = ml_decode12(ek, 384*i)
+		ok = ok && good
+		t = append(t, p)
+	}
+	let a = ml_matrix(ek[384*mlk : 384*mlk+32])
+	mut y = make([][]i64, 0, mlk)
+	for i in 0..mlk {
+		mut p = ml_cbd(r, i)
+		ml_ntt(mut p)
+		y = append(y, p)
+	}
+	mut c = make([]u8, 0, MLKEM768CiphertextSize)
+	for i in 0..mlk {
+		mut u = make([]i64, 256)
+		for j in 0..mlk {
+			ml_mul_acc(mut u, a[3*j+i], y[j])
+		}
+		ml_intt(mut u)
+		let e1 = ml_cbd(r, mlk+i)
+		for n in 0..256 {
+			u[n] = ml_add(u[n], e1[n])
+		}
+		ml_pack(mut c, u, 10)
+	}
+	mut v = make([]i64, 256)
+	for i in 0..mlk {
+		ml_mul_acc(mut v, t[i], y[i])
+	}
+	ml_intt(mut v)
+	let e2 = ml_cbd(r, 2*mlk)
+	for n in 0..256 {
+		// Decompress_1 of m's bit n: 0 or round(q / 2) = 1665, without a branch.
+		let bit = i64((m[n/8] >> u8(n%8)) & 1)
+		v[n] = ml_add(ml_add(v[n], e2[n]), 1665 & (0 - bit))
+	}
+	ml_pack(mut c, v, 4)
+	return c, ok
+}
+
+// ml_decrypt is K-PKE.Decrypt(dk_pke, c): the 32-byte message.
+fn ml_decrypt(dk []u8, c []u8) []u8 {
+	mut w = make([]i64, 256)
+	for i in 0..mlk {
+		let (s, _) = ml_decode12(dk, 384*i)
+		mut u = ml_unpack(c, 320*i, 10)
+		ml_ntt(mut u)
+		ml_mul_acc(mut w, s, u)
+	}
+	ml_intt(mut w)
+	let v = ml_unpack(c, 320*mlk, 4)
+	mut m = make([]u8, 32)
+	for n in 0..256 {
+		let x = ml_sub(v[n], w[n])
+		m[n/8] = m[n/8] | u8(ml_compress(x, 1)<<(n%8))
+	}
+	return m
+}
+
+// ml_encaps is ML-KEM.Encaps_internal(ek, m): the shared key and the ciphertext.
+fn ml_encaps(ek []u8, m []u8) !([]u8, []u8) {
+	if len(ek) != MLKEM768EncapsulationKeySize {
+		fail "seal: an ML-KEM-768 encapsulation key is 1184 bytes"
+	}
+	if len(m) != 32 {
+		fail "seal: ML-KEM-768 encapsulation takes 32 random bytes"
+	}
+	mut gin = make([]u8, 0, 64)
+	gin = append(gin, m...)
+	gin = append(gin, Sha3_256(str(ek))...)
+	let g = Sha3_512(str(gin))
+	let (c, ok) = ml_encrypt(ek, m, g[32:64])
+	if !ok {
+		fail "seal: the ML-KEM-768 encapsulation key holds a value not below q"
+	}
+	return g[0:32], c
+}
+
+// MLKEM768KeyFromSeed is the key pair of a 64-byte seed d || z (FIPS 203's ML-KEM.KeyGen_internal,
+// the seed form Go and BoringSSL keep): the decapsulation key (2400 bytes) and the encapsulation
+// key (1184 bytes).
+fn MLKEM768KeyFromSeed(seed secret []u8) !([]u8, []u8) {
+	if len(seed) != 64 {
+		fail "seal: an ML-KEM-768 seed is 64 bytes"
+	}
+	let (dk, ek) = ml_keygen(seed[0:32], seed[32:64])
+	return dk, ek
+}
+
+// MLKEM768GenerateKey makes a key pair from fresh randomness: the decapsulation key (2400
+// bytes) and the encapsulation key (1184 bytes).
+fn MLKEM768GenerateKey() ([]u8, []u8) {
+	let seed = RandomBytes(64)
+	let (dk, ek) = ml_keygen(seed[0:32], seed[32:64])
+	return dk, ek
+}
+
+// MLKEM768Encapsulate makes a shared key for the holder of encapsulation key ek: the shared
+// key (32 bytes) and the ciphertext to send (1088 bytes). A key of the wrong size or with a
+// value not below q is refused (FIPS 203's input check).
+fn MLKEM768Encapsulate(ek []u8) !([]u8, []u8) {
+	let (k, c) = try ml_encaps(ek, RandomBytes(32))
+	return k, c
+}
+
+// MLKEM768EncapsulateDerand is MLKEM768Encapsulate with its 32 random bytes given (FIPS 203's
+// ML-KEM.Encaps_internal): for known-answer tests only.
+fn MLKEM768EncapsulateDerand(ek []u8, m secret []u8) !([]u8, []u8) {
+	let (k, c) = try ml_encaps(ek, m)
+	return k, c
+}
+
+// MLKEM768Decapsulate is the shared key in ciphertext c for decapsulation key dk. A ciphertext
+// that was not made for dk gives a key derived from dk's secret z and c (implicit rejection),
+// in the same time; only wrong sizes fail.
+fn MLKEM768Decapsulate(dk secret []u8, c []u8) ![]u8 {
+	if len(dk) != MLKEM768DecapsulationKeySize {
+		fail "seal: an ML-KEM-768 decapsulation key is 2400 bytes"
+	}
+	if len(c) != MLKEM768CiphertextSize {
+		fail "seal: an ML-KEM-768 ciphertext is 1088 bytes"
+	}
+	let ek = dk[384*mlk : 768*mlk+32]
+	let h = dk[768*mlk+32 : 768*mlk+64]
+	let z = dk[768*mlk+64 : 768*mlk+96]
+	let m = ml_decrypt(dk, c)
+	mut gin = make([]u8, 0, 64)
+	gin = append(gin, m...)
+	gin = append(gin, h...)
+	let g = Sha3_512(str(gin))
+	mut jin = make([]u8, 0, 32+len(c))
+	jin = append(jin, z...)
+	jin = append(jin, c...)
+	let reject = sponge_sum(136, jin, 0x1f, 32)
+	let (c2, _) = ml_encrypt(ek, m, g[32:64])
+	mut diff = 0
+	for i in 0..len(c) {
+		diff = diff | i64(c[i]^c2[i])
+	}
+	// same is all ones when the ciphertexts are equal, else zero.
+	let same = u8(((diff - 1) >> 63) & 255)
+	mut k = make([]u8, 32)
+	for i in 0..32 {
+		k[i] = reject[i] ^ (same & (g[i] ^ reject[i]))
+	}
+	return k
+}

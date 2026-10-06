@@ -12,10 +12,14 @@ type hello struct {
 	session []u8
 	x25519  []u8 // X25519 private key
 	raw     []u8 // a ClientHello to send as is (tests only; empty: build one)
+	mlkemDK []u8 // the ML-KEM-768 key pair of the X25519MLKEM768 share (#479); empty: none
+	mlkemEK []u8
 }
 
 fn new_hello() hello {
-	return hello{random: seal.RandomBytes(32), session: seal.RandomBytes(32), x25519: seal.X25519NewPrivateKey(), raw: []u8{}}
+	let (dk, ek) = seal.MLKEM768GenerateKey()
+	return hello{random: seal.RandomBytes(32), session: seal.RandomBytes(32), x25519: seal.X25519NewPrivateKey(), raw: []u8{},
+		mlkemDK: dk, mlkemEK: ek}
 }
 
 // hsReader collects handshake messages from records.
@@ -89,9 +93,14 @@ fn (c mut Conn) handshake(cfg Config, name str, hi hello) ! {
 				psked = true
 			}
 		}
-		mut opt = chOptions{cookie: []u8{}, offer: nil, tls12: cfg.MinVersion != VersionTLS13}
+		mut opt = chOptions{cookie: []u8{}, offer: nil, hybrid: []u8{}, pq: false, tls12: cfg.MinVersion != VersionTLS13}
 		if psked {
 			opt.offer = pskOffer{identity: tk.ticket, age: ticket_age(tk), hlen: seal.Size(suite_hash(tk.suite))}
+		}
+		if len(hi.mlkemEK) > 0 {
+			// X25519MLKEM768 first, with the same X25519 key as the plain X25519 share.
+			opt.hybrid = cat(hi.mlkemEK, share)
+			opt.pq = true
 		}
 		ch = client_hello(hi.random, hi.session, offered, name, cfg.ALPN, group, share, opt)
 		if psked {
@@ -139,7 +148,7 @@ fn (c mut Conn) handshake(cfg Config, name str, hi hello) ! {
 		share = try seal.P256PublicKey(priv)
 		// The ticket is offered again only when its hash is the one the server chose.
 		psked = psked && suite_hash(tk.suite) == h
-		mut opt2 = chOptions{cookie: sh.cookie, offer: nil, tls12: cfg.MinVersion != VersionTLS13}
+		mut opt2 = chOptions{cookie: sh.cookie, offer: nil, hybrid: []u8{}, pq: len(hi.mlkemEK) > 0, tls12: cfg.MinVersion != VersionTLS13}
 		if psked {
 			opt2.offer = pskOffer{identity: tk.ticket, age: ticket_age(tk), hlen: seal.Size(h)}
 		}
@@ -166,6 +175,9 @@ fn (c mut Conn) handshake(cfg Config, name str, hi hello) ! {
 	if !in_list(offered, sh.suite) {
 		fail alert_fault(alertIllegalParameter, "server chose a cipher suite that was not offered")
 	}
+	if !retried && sh.group == groupX25519MLKEM768 && len(hi.mlkemEK) > 0 && len(hi.raw) == 0 {
+		group = groupX25519MLKEM768
+	}
 	if sh.group != group || len(sh.share) == 0 {
 		fail alert_fault(alertIllegalParameter, "ServerHello key share is not for the group offered")
 	}
@@ -185,7 +197,19 @@ fn (c mut Conn) handshake(cfg Config, name str, hi hello) ! {
 		c.resumed = true
 	}
 	mut shared_ = []u8{}
-	if group == groupX25519 {
+	if group == groupX25519MLKEM768 {
+		// The ML-KEM-768 ciphertext, then the server's X25519 key; the secret is both keys.
+		if len(sh.share) != hybridServerShare {
+			fail alert_fault(alertIllegalParameter, "invalid X25519MLKEM768 key share")
+		}
+		let k = seal.MLKEM768Decapsulate(hi.mlkemDK, sh.share[:seal.MLKEM768CiphertextSize]) catch _ {
+			fail alert_fault(alertIllegalParameter, "invalid X25519MLKEM768 key share")
+		}
+		let xs = seal.X25519(priv, sh.share[seal.MLKEM768CiphertextSize:]) catch _ {
+			fail alert_fault(alertIllegalParameter, "invalid X25519MLKEM768 key share")
+		}
+		shared_ = cat(k, xs)
+	} else if group == groupX25519 {
 		shared_ = seal.X25519(priv, sh.share) catch _ {
 			fail alert_fault(alertIllegalParameter, "invalid X25519 key share")
 		}

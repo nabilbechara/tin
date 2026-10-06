@@ -243,8 +243,16 @@ def tls12_client(exe, openssl, certs, work):
           'X25519 and P-256, verified against RootCAs), ALPN, SSLKEYLOGFILE, a Python server; MinVersion 1.3 refuses')
 
 
+def openssl_pq(openssl):
+    """Whether this OpenSSL has the X25519MLKEM768 group (3.5 and later): its s_server and
+    s_client then offer it by default."""
+    r = subprocess.run([openssl, 'list', '-kem-algorithms'], capture_output=True, text=True)
+    return 'X25519MLKEM768' in r.stdout
+
+
 def verified(exe, openssl, certs):
     """Verification on (the default) with the server's certificate in RootCAs: each key type."""
+    group = 'X25519MLKEM768' if openssl_pq(openssl) else 'X25519'
     for kind, cert in certs.items():
         port = free_port()
         proc = subprocess.Popen([openssl, 's_server', '-tls1_3', '-accept', str(port), '-cert', str(cert[0]), '-key', str(cert[1]),
@@ -256,7 +264,7 @@ def verified(exe, openssl, certs):
         finally:
             proc.kill()
             proc.wait()
-        assert out == 'resumed false TLS_AES_128_GCM_SHA256 X25519 1 true\n', (kind, out)
+        assert out == f'resumed false TLS_AES_128_GCM_SHA256 {group} 1 true\n', (kind, out)
     print(f'PASS verification against RootCAs: certificates {", ".join(certs)} (chain, name, CertificateVerify)')
 
 
@@ -359,6 +367,45 @@ def client_certificate(exe, openssl, certs, work):
 
 KEYLOG_LABELS = ('CLIENT_HANDSHAKE_TRAFFIC_SECRET', 'SERVER_HANDSHAKE_TRAFFIC_SECRET', 'CLIENT_TRAFFIC_SECRET_0',
                  'SERVER_TRAFFIC_SECRET_0', 'CLIENT_RANDOM')
+
+
+def post_quantum(exe, openssl, certs, work):
+    """X25519MLKEM768 (#479) against Go's crypto/tls (tools/ci/fixtures/tls_pq.go): offered first,
+    taken by a server that prefers it or knows only it; a server without it gets X25519, or
+    P-256 by HelloRetryRequest. And against OpenSSL 3.5's, where the runner has it."""
+    go = shutil.which('go')
+    if not go:
+        print('SKIP post-quantum key exchange against Go: no go command')
+        return
+    gopq = work / 'tls_pq'
+    subprocess.run([go, 'build', '-o', str(gopq), 'tools/ci/fixtures/tls_pq.go'], cwd=ROOT, check=True, timeout=300)
+    cert = certs['ecdsa']
+    for prefs, want in (('X25519MLKEM768,X25519', 'X25519MLKEM768'), ('X25519MLKEM768', 'X25519MLKEM768'),
+                        ('X25519', 'X25519'), ('P-256', 'P-256')):
+        port = free_port()
+        proc = subprocess.Popen([str(gopq), 'server', str(port), str(cert[0]), str(cert[1]), prefs],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            wait_port(port, proc)
+            out = run(exe, 'resume', f'127.0.0.1:{port}', 1, cert[0])
+            assert out.startswith('resumed false TLS_') and f' {want} 1 true' in out, (prefs, out)
+        finally:
+            proc.kill()
+            proc.wait()
+    tried = 'Go'
+    if openssl_pq(openssl):
+        port = free_port()
+        proc = subprocess.Popen([openssl, 's_server', '-tls1_3', '-accept', str(port), '-cert', str(cert[0]), '-key', str(cert[1]),
+                                 '-www', '-quiet', '-groups', 'X25519MLKEM768'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            wait_port(port, proc)
+            out = run(exe, 'get', f'127.0.0.1:{port}')
+            assert out.startswith('ok ') and ' X25519MLKEM768 ' in out, out
+        finally:
+            proc.kill()
+            proc.wait()
+        tried = 'Go and OpenSSL'
+    print(f'PASS X25519MLKEM768 against {tried}: chosen when the server has it, X25519 or P-256 (HelloRetryRequest) when it does not')
 
 
 def keylog_lines(path):
@@ -681,6 +728,7 @@ def main():
         if openssl:
             openssl_matrix(exe, openssl, certs)
             verified(exe, openssl, certs)
+            post_quantum(exe, openssl, certs, work)
             tls12_client(exe, openssl, certs, work)
             resumption(exe, openssl, certs, work)
             keylog(exe, openssl, certs, work)

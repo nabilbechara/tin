@@ -1,0 +1,62 @@
+package main
+
+import "say"
+import "seal"
+
+// ML-KEM-768 (FIPS 203, #479) against Go's crypto/mlkem. For n seeds and messages read from
+// SHAKE128(""), the SHAKE128 hash of every encapsulation key, ciphertext and shared key, and of
+// the implicit-rejection key of a random ciphertext: tools/ci/fixtures/mlkem_twin.go prints the
+// same values with Go (`go run mlkem_twin.go 100`).
+
+fn accumulated(n i64) !str {
+	let stream = seal.Shake128("", n*(64+32+seal.MLKEM768CiphertextSize))
+	mut acc = make([]u8, 0, n*(seal.MLKEM768EncapsulationKeySize+seal.MLKEM768CiphertextSize+64))
+	mut at = 0
+	for i in 0..n {
+		let (dk, ek) = try seal.MLKEM768KeyFromSeed(stream[at : at+64])
+		at += 64
+		acc = append(acc, ek...)
+		let (k, ct) = try seal.MLKEM768EncapsulateDerand(ek, stream[at:at+32])
+		at += 32
+		acc = append(acc, ct...)
+		acc = append(acc, k...)
+		let kk = try seal.MLKEM768Decapsulate(dk, ct)
+		if seal.Hex(kk) != seal.Hex(k) {
+			fail "decapsulation does not give the shared key"
+		}
+		let k1 = try seal.MLKEM768Decapsulate(dk, stream[at:at+seal.MLKEM768CiphertextSize])
+		at += seal.MLKEM768CiphertextSize
+		acc = append(acc, k1...)
+	}
+	return seal.Hex(seal.Shake128(str(acc), 32))
+}
+
+fn main() {
+	for _, n in []i64{3, 100} {
+		let h = accumulated(n) catch e {
+			"fault {e}"
+		}
+		say.Line("accumulated", n, h)
+	}
+	let (dk, ek) = seal.MLKEM768GenerateKey()
+	let (k, ct) = seal.MLKEM768Encapsulate(ek) catch e {
+		say.Line("encapsulate:", e)
+		return
+	}
+	let k2 = seal.MLKEM768Decapsulate(dk, ct) catch e {
+		say.Line("decapsulate:", e)
+		return
+	}
+	say.Line("a fresh key pair agrees:", seal.Hex(k) == seal.Hex(k2), len(dk), len(ek), len(ct))
+	// FIPS 203's input check: a 12-bit value of q or more in the key is refused.
+	mut bad = make([]u8, 0, len(ek))
+	bad = append(bad, ek...)
+	bad[0] = 0xff
+	bad[1] = bad[1] | 0x0f
+	let (_, _, berr) = seal.MLKEM768Encapsulate(bad)
+	say.Line("a key value not below q is refused:", berr != nil)
+	let (_, _, serr) = seal.MLKEM768Encapsulate(ek[:100])
+	let (_, cerr) = seal.MLKEM768Decapsulate(dk, ct[:100])
+	let (_, _, seed) = seal.MLKEM768KeyFromSeed(ek[:32])
+	say.Line("wrong sizes are refused:", serr != nil, cerr != nil, seed != nil)
+}

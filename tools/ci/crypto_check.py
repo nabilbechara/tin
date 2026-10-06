@@ -116,6 +116,23 @@ def random_cases(cases):
             cases.append((f'hkdf {name} {hx(ikm)} {hx(salt)} {hx(info)} {size}', lambda out, want=want: out == want, f'hkdf_{name} random'))
 
 
+def sha3_cases(cases):
+    """SHA3-256, SHA3-512, SHAKE128 and SHAKE256 (#479) against hashlib: every length across one
+    and two blocks of each rate (72, 136, 168 bytes), longer inputs, and outputs of many blocks."""
+    rng = random.Random(479)
+    for name in ('sha3_256', 'sha3_512'):
+        for n in list(range(0, 340)) + [rng.randrange(340, 5000) for _ in range(20)]:
+            msg = rng.randbytes(n)
+            want = hashlib.new(name, msg).hexdigest()
+            cases.append((f'sha3 {name} {hx(msg)}', lambda out, want=want: out == want, f'{name} len {n}'))
+    for name in ('shake128', 'shake256'):
+        for n in list(range(0, 340, 7)) + [rng.randrange(340, 3000) for _ in range(10)]:
+            msg = rng.randbytes(n)
+            size = rng.choice([1, 32, 64, 135, 136, 137, 167, 168, 169, 500, 1000])
+            want = hashlib.new(name.replace('shake', 'shake_'), msg).hexdigest(size)
+            cases.append((f'sha3 {name} {hx(msg)} {size}', lambda out, want=want: out == want, f'{name} len {n} out {size}'))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--compiler', default='bin/tinc')
@@ -130,6 +147,7 @@ def main():
     aead(cases, 'chacha20_poly1305_test.json', 'chacha')
     aead(cases, 'aes_gcm_test.json', 'aes')
     random_cases(cases)
+    sha3_cases(cases)
     with tempfile.TemporaryDirectory(prefix='crypto-', dir=out) as tmp:
         exe = Path(tmp) / 'crypto_vectors'
         # A private lib with seal_to_probe.tin in lib/seal: the fixture checks AEAD.SealTo through it.

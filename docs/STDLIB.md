@@ -312,7 +312,7 @@ let r = try wire.Get("http://127.0.0.1:8080/json")
 
 ## tls
 
-Package tls is TLS 1.3 (RFC 8446) and TLS 1.2 (RFC 5246). Clients: tls.Dial connects and handshakes, and Conn reads and writes like wire.Conn; the server's certificate is verified by default against the system's roots (plus Config.RootCAs). A server's NewSessionTicket is kept (per core, for the same name and settings) and offered on the next connection to it, which then resumes without the certificate messages (Conn.Resumed). Servers: anvil.ServeTLS serves HTTPS with this package; LoadServerConfig reads a certificate chain and its key (RSA, ECDSA P-256 or P-384), and Server runs the server side over an accepted wire.Conn. Cipher suites: TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256; key exchange X25519, or P-256 by HelloRetryRequest. TLS 1.2, for peers that stop there, has the six ECDHE suites with AES-GCM or ChaCha20-Poly1305 and the extended master secret; 1.3 is preferred, and Config.MinVersion (ServerConfig.MinVersion) VersionTLS13 turns 1.2 off. No 0-RTT, no renegotiation, no 1.2 session resumption and nothing older than 1.2. Every wait lets the core serve other tasks and honours Config.Timeout during the handshake, SetTimeout afterwards and a request's deadline.
+Package tls is TLS 1.3 (RFC 8446) and TLS 1.2 (RFC 5246). Clients: tls.Dial connects and handshakes, and Conn reads and writes like wire.Conn; the server's certificate is verified by default against the system's roots (plus Config.RootCAs). A server's NewSessionTicket is kept (per core, for the same name and settings) and offered on the next connection to it, which then resumes without the certificate messages (Conn.Resumed). Servers: anvil.ServeTLS serves HTTPS with this package; LoadServerConfig reads a certificate chain and its key (RSA, ECDSA P-256 or P-384), and Server runs the server side over an accepted wire.Conn. Cipher suites: TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256; key exchange X25519MLKEM768 (post-quantum hybrid, ML-KEM-768 with X25519) or X25519, or P-256 by HelloRetryRequest. TLS 1.2, for peers that stop there, has the six ECDHE suites with AES-GCM or ChaCha20-Poly1305 and the extended master secret; 1.3 is preferred, and Config.MinVersion (ServerConfig.MinVersion) VersionTLS13 turns 1.2 off. No 0-RTT, no renegotiation, no 1.2 session resumption and nothing older than 1.2. Every wait lets the core serve other tasks and honours Config.Timeout during the handshake, SetTimeout afterwards and a request's deadline.
 
 ```tin body
 let c = try tls.Dial("example.com:443", tls.Config{ALPN: []str{"http/1.1"}})
@@ -349,7 +349,7 @@ try c.Write("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
 - `(c mut Conn) SetDeadline(at i64)`: SetDeadline makes every later wait fail once the monotonic clock (tide.Now) passes at (0: no deadline), whatever the per-call timeout: wire uses it for a whole HTTP call.
 - `(c Conn) ALPN() str`: ALPN is the application protocol the server chose ("" when none).
 - `(c Conn) CipherSuite() i64`: CipherSuite is the negotiated cipher suite (TLS_AES_128_GCM_SHA256 and so on).
-- `(c Conn) Group() str`: Group is the key exchange: "X25519", or "P-256" when the server asked for it.
+- `(c Conn) Group() str`: Group is the key exchange: "X25519MLKEM768" (post-quantum hybrid, #479), "X25519", or "P-256" when the server asked for it.
 - `const VersionTLS13 = 0x0304`: VersionTLS13 is TLS 1.3's protocol version (Conn.Version).
 - `(c Conn) Version() i64`: Version is the negotiated protocol version: VersionTLS13 or VersionTLS12.
 - `(c Conn) Resumed() bool`: Resumed reports whether the handshake resumed an earlier session with a ticket: the server's certificate was checked on that session, and PeerCertificates is empty.
@@ -1079,7 +1079,7 @@ let back = try squash.Gunzip(z, 64mb)
 
 ## seal
 
-Package seal has cryptographic hashes (SHA-256, SHA-384, SHA-512, SHA-1), HMAC over any of the SHA-2 hashes, HKDF, PBKDF2-HMAC-SHA-256, P-256 ECDH, RSA signature verification (PKCS #1 v1.5 and PSS), X.509 certificates with chain and host name verification, constant-time comparison, secure random bytes, the hex, base64 and PEM encodings, and RSA-OAEP encryption with a public key.
+Package seal has cryptographic hashes (SHA-256, SHA-384, SHA-512, SHA-1, SHA3-256, SHA3-512, and SHAKE128 and SHAKE256), HMAC over any of the SHA-2 hashes, HKDF, PBKDF2-HMAC-SHA-256, P-256 ECDH, ML-KEM-768 (FIPS 203), RSA signature verification (PKCS #1 v1.5 and PSS), X.509 certificates with chain and host name verification, constant-time comparison, secure random bytes, the hex, base64 and PEM encodings, and RSA-OAEP encryption with a public key.
 
 - `type AEAD struct`: AEAD is an authenticated cipher with its key (AES-GCM or ChaCha20-Poly1305): Seal encrypts and appends a 16-byte tag, Open checks the tag in constant time and decrypts.
 - `NewChaCha20Poly1305(key secret []u8) !AEAD`: NewChaCha20Poly1305 is the RFC 8439 AEAD with a 32-byte key.
@@ -1115,6 +1115,14 @@ Package seal has cryptographic hashes (SHA-256, SHA-384, SHA-512, SHA-1), HMAC o
 - `ParsePrivateKeyDER(der []u8) !PrivateKey`: ParsePrivateKeyDER reads a PKCS #8 PrivateKeyInfo, a PKCS #1 RSAPrivateKey or a SEC 1 ECPrivateKey.
 - `ParsePrivateKeyPEM(pem str) !PrivateKey`: ParsePrivateKeyPEM reads the first "PRIVATE KEY", "RSA PRIVATE KEY" or "EC PRIVATE KEY" block of pem.
 - `(k PrivateKey) MatchesCertificate(c Certificate) bool`: MatchesCertificate reports whether k is the private key of c's public key.
+- `const MLKEM768EncapsulationKeySize = 1184`: MLKEM768EncapsulationKeySize, MLKEM768DecapsulationKeySize and MLKEM768CiphertextSize are ML-KEM-768's sizes in bytes; the shared key is 32 bytes.
+- `const MLKEM768DecapsulationKeySize = 2400`
+- `const MLKEM768CiphertextSize = 1088`
+- `MLKEM768KeyFromSeed(seed secret []u8) !([]u8, []u8)`: MLKEM768KeyFromSeed is the key pair of a 64-byte seed d || z (FIPS 203's ML-KEM.KeyGen_internal, the seed form Go and BoringSSL keep): the decapsulation key (2400 bytes) and the encapsulation key (1184 bytes).
+- `MLKEM768GenerateKey() ([]u8, []u8)`: MLKEM768GenerateKey makes a key pair from fresh randomness: the decapsulation key (2400 bytes) and the encapsulation key (1184 bytes).
+- `MLKEM768Encapsulate(ek []u8) !([]u8, []u8)`: MLKEM768Encapsulate makes a shared key for the holder of encapsulation key ek: the shared key (32 bytes) and the ciphertext to send (1088 bytes). A key of the wrong size or with a value not below q is refused (FIPS 203's input check).
+- `MLKEM768EncapsulateDerand(ek []u8, m secret []u8) !([]u8, []u8)`: MLKEM768EncapsulateDerand is MLKEM768Encapsulate with its 32 random bytes given (FIPS 203's ML-KEM.Encaps_internal): for known-answer tests only.
+- `MLKEM768Decapsulate(dk secret []u8, c []u8) ![]u8`: MLKEM768Decapsulate is the shared key in ciphertext c for decapsulation key dk. A ciphertext that was not made for dk gives a key derived from dk's secret z and c (implicit rejection), in the same time; only wrong sizes fail.
 - `P256NewPrivateKey() []u8`: P256NewPrivateKey returns a random P-256 private key: 32 big-endian bytes in [1, n-1].
 - `P256PublicKey(priv secret []u8) ![]u8`: P256PublicKey is the uncompressed public key (65 bytes) of a P-256 private key; it fails unless priv is 32 bytes in [1, n-1]. Constant-time in priv.
 - `P256ECDH(priv secret []u8, peer []u8) ![]u8`: P256ECDH is the P-256 Diffie-Hellman shared secret (the 32-byte x coordinate of priv*peer). peer is an uncompressed or compressed public key; it fails for an invalid private key, a point not on the curve, or a result at infinity. Constant-time in priv.
@@ -1142,6 +1150,10 @@ Package seal has cryptographic hashes (SHA-256, SHA-384, SHA-512, SHA-1), HMAC o
 - `type RSAPublicKey struct`: RSAPublicKey is an RSA public key: modulus N and exponent E, as big-endian bytes.
 - `ParseRSAPublicKeyPEM(pem str) !RSAPublicKey`: ParseRSAPublicKeyPEM reads a PEM "PUBLIC KEY" (SubjectPublicKeyInfo) or "RSA PUBLIC KEY" (PKCS #1) block.
 - `EncryptOAEPSha1(key RSAPublicKey, msg []u8) ![]u8`: EncryptOAEPSha1 encrypts msg for key with RSA-OAEP (SHA-1, MGF1-SHA-1, empty label), as MySQL's caching_sha2_password and sha256_password expect.
+- `Sha3_256(s secret str) []u8`: Sha3_256 is the SHA3-256 digest of s (32 bytes); s may be secret.
+- `Sha3_512(s secret str) []u8`: Sha3_512 is the SHA3-512 digest of s (64 bytes); s may be secret.
+- `Shake128(s secret str, n i64) []u8`: Shake128 is the first n bytes of SHAKE128 of s; s may be secret.
+- `Shake256(s secret str, n i64) []u8`: Shake256 is the first n bytes of SHAKE256 of s; s may be secret.
 - `Sha512(s secret str) []u8`: Sha512 is the SHA-512 digest of s (64 bytes); s may be secret.
 - `Sha384(s secret str) []u8`: Sha384 is the SHA-384 digest of s (48 bytes); s may be secret.
 - `X25519(scalar secret []u8, point []u8) ![]u8`: X25519 is the RFC 7748 function: the shared secret of a 32-byte private scalar and a peer's 32-byte public key. It fails for wrong lengths and when the result is all zeros (a low-order peer key), as TLS 1.3 requires. Constant-time in the scalar and the point.

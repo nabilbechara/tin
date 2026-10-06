@@ -40,7 +40,7 @@ import time
 from pathlib import Path
 
 from suite import ROOT
-from tls_check import free_port, openssl3, wait_port
+from tls_check import free_port, openssl3, openssl_pq, wait_port
 
 SUITES = {'TLS_AES_128_GCM_SHA256': '1301', 'TLS_AES_256_GCM_SHA384': '1302', 'TLS_CHACHA20_POLY1305_SHA256': '1303'}
 # groups offered by the client -> the group the server must use (P-384 first forces a HelloRetryRequest)
@@ -348,11 +348,11 @@ def tin_clients(exe, client, certs, work):
             assert r.returncode == 0, (args, r.stdout, r.stderr[-2000:])
             return r.stdout
         out = run('get', srv.addr())
-        assert re.fullmatch(r'ok TLS_\w+ X25519 alpn= 1 true\n', out), out
+        assert re.fullmatch(r'ok TLS_\w+ X25519MLKEM768 alpn= 1 true\n', out), out
         out = run('get', srv.addr(), 'http/1.1')
-        assert re.fullmatch(r'ok TLS_\w+ X25519 alpn=http/1.1 1 true\n', out), out
+        assert re.fullmatch(r'ok TLS_\w+ X25519MLKEM768 alpn=http/1.1 1 true\n', out), out
         out = run('resume', srv.addr(), 2, cert[0])
-        assert re.fullmatch(r'resumed false TLS_\w+ X25519 1 true\nresumed true TLS_\w+ X25519 [01] true\n', out), out
+        assert re.fullmatch(r'resumed false TLS_\w+ X25519MLKEM768 1 true\nresumed true TLS_\w+ X25519MLKEM768 [01] true\n', out), out
         # The system's roots (here an unrelated root, so the result does not depend on the runner's
         # bundle) do not include the server's certificate: refused.
         out = run('verify', srv.addr(), 'localhost', env={'SSL_CERT_FILE': str(certs['unrelated'][0])})
@@ -367,7 +367,7 @@ def tin_clients(exe, client, certs, work):
     srv = Server(exe, certs['rsa'], work)
     try:
         r = subprocess.run([str(client), 'resume', srv.addr(), '1', str(certs['rsa'][0])], capture_output=True, text=True, timeout=60)
-        assert re.fullmatch(r'resumed false TLS_\w+ X25519 1 true\n', r.stdout), r.stdout
+        assert re.fullmatch(r'resumed false TLS_\w+ X25519MLKEM768 1 true\n', r.stdout), r.stdout
     finally:
         srv.stop()
     print('PASS Tin client: tls.Dial with and without ALPN, verified through RootCAs (ECDSA and RSA keys) and refused by default; '
@@ -431,7 +431,7 @@ def resumption(openssl, exe, client, certs, work):
         tamper_ticket(openssl, sess, bad)
         assert not resumed_get(openssl, srv.port, cert[0], sess_in=bad)
         r = subprocess.run([str(client), 'resume', srv.addr(), '3', str(cert[0])], capture_output=True, text=True, timeout=60)
-        assert re.fullmatch(r'resumed false TLS_\w+ X25519 1 true\n(resumed true TLS_\w+ X25519 [01] true\n){2}', r.stdout), r.stdout
+        assert re.fullmatch(r'resumed false TLS_\w+ X25519MLKEM768 1 true\n(resumed true TLS_\w+ X25519MLKEM768 [01] true\n){2}', r.stdout), r.stdout
         if PY_TLS13:
             ctx = py_ctx(cert)
             s = py_connect(srv, ctx)
@@ -979,13 +979,41 @@ def shutdown(exe, certs, work):
 
 # ---- the example and configuration errors ----
 
+def post_quantum(openssl, exe, certs, work):
+    """X25519MLKEM768 (#479): Go's crypto/tls (tools/ci/fixtures/tls_pq.go) gets the hybrid group
+    when it offers it, alone or first, and X25519 or P-256 when it offers only those; so does
+    OpenSSL 3.5's s_client where the runner has it."""
+    go = shutil.which('go')
+    if not go:
+        print('SKIP post-quantum key exchange against Go: no go command')
+        return
+    gopq = work / 'tls_pq'
+    subprocess.run([go, 'build', '-o', str(gopq), 'tools/ci/fixtures/tls_pq.go'], cwd=ROOT, check=True, timeout=300)
+    cert = certs['ecdsa']
+    srv = Server(exe, cert, work)
+    try:
+        for prefs, want in (('X25519MLKEM768,X25519', 'X25519MLKEM768'), ('X25519MLKEM768', 'X25519MLKEM768'),
+                            ('X25519', 'X25519'), ('P-256', 'CurveP256')):
+            r = subprocess.run([str(gopq), 'client', srv.addr(), str(cert[0]), prefs], capture_output=True, text=True, timeout=60)
+            assert r.stdout == f'group {want} true\n', (prefs, r.stdout, r.stderr[-500:])
+        tried = 'Go'
+        if openssl_pq(openssl):
+            rc, out = s_client(openssl, srv.port, ['-groups', 'X25519MLKEM768'], get('/fast'), cafile=cert[0])
+            assert 'Negotiated TLS1.3 group: X25519MLKEM768' in out and '\r\n\r\nfast' in out, out[-1500:]
+            tried = 'Go and OpenSSL'
+    finally:
+        srv.stop()
+    print(f'PASS X25519MLKEM768 from {tried} clients: chosen when offered, X25519 or P-256 otherwise')
+
+
 def example(openssl, compiler, client, certs, work):
     exe = work / 'https_example'
     build(compiler, 'examples/https_server.tin', exe)
     srv = Server(exe, certs['rsa'], work)
     try:
         rc, out = s_client(openssl, srv.port, ['-alpn', 'http/1.1'], get('/'), cafile=certs['rsa'][0])
-        assert 'hello over TLS 1.3 (http/1.1, group X25519)' in out and 'Verify return code: 0 (ok)' in out, out[-1500:]
+        group = 'X25519MLKEM768' if openssl_pq(openssl) else 'X25519'
+        assert f'hello over TLS 1.3 (http/1.1, group {group})' in out and 'Verify return code: 0 (ok)' in out, out[-1500:]
         r = subprocess.run([str(client), 'wss', f'wss://127.0.0.1:{srv.port}/echo'], capture_output=True, text=True, timeout=30)
         assert r.stdout == 'wss true echo: hello wss\n', r.stdout
     finally:
@@ -1033,7 +1061,7 @@ def ed25519_server(openssl, exe, client, certs, work):
         rc, out = s_client(openssl, srv.port, [], get('/fast'), cafile=cert[0])
         assert rc == 0 and '\r\n\r\nfast' in out and 'peer signature type: ed25519' in out.lower(), out[-1500:]
         r = subprocess.run([str(client), 'resume', srv.addr(), '1', str(cert[0])], capture_output=True, text=True, timeout=60)
-        assert re.fullmatch(r'resumed false TLS_\w+ X25519 1 true\n', r.stdout), r.stdout
+        assert re.fullmatch(r'resumed false TLS_\w+ X25519MLKEM768 1 true\n', r.stdout), r.stdout
     finally:
         srv.stop()
     print('PASS Ed25519 certificate: OpenSSL and the Tin client verify the chain and the Ed25519 CertificateVerify')
@@ -1072,6 +1100,7 @@ def main():
         malformed(exe, client, certs, work)
         one_core(exe, client, certs, work)
         memory(openssl, exe, certs, work)
+        post_quantum(openssl, exe, certs, work)
         example(openssl, compiler, client, certs, work)
         bad_config(exe, certs, work)
         ed25519_server(openssl, exe, client, certs, work)

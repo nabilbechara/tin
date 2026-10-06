@@ -20,8 +20,17 @@ def cpu(base, head, suite, names, runs, work):
         commands = {}
         for label, root in (('base', base), ('head', head)):
             exe = work / (name + '_' + label)
-            run_checked(**tin_command(root, suite / (name + '.tin'), exe))
+            try:
+                run_checked(**tin_command(root, suite / (name + '.tin'), exe))
+            except subprocess.CalledProcessError:
+                if label != 'base':
+                    raise
+                break  # a benchmark of something base does not have yet
             commands[label] = {'command': [str(exe)], 'env': dict(os.environ, LC_ALL='C')}
+        if 'base' not in commands:
+            print(f'| {name} | - | - | - | new: base cannot build it |', flush=True)
+            records.append({'benchmark': name, 'new_in_head': True})
+            continue
         timing, samples = interleaved(commands, runs)
         ratio = timing['head'] / timing['base']
         review = ratio > 1.05

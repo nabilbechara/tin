@@ -320,10 +320,16 @@ fn (c mut Conn) server_handshake(cfg ServerConfig) ! {
 	mut finalMsg = msg
 	mut prefix = []u8{} // the handshake bytes before finalMsg (message_hash and the retry)
 	mut group = 0
-	mut share = share_for(ch, groupX25519)
+	// The post-quantum hybrid first (#479), when the client sent its share.
+	mut share = share_for(ch, groupX25519MLKEM768)
 	if len(share) > 0 {
-		group = groupX25519
+		group = groupX25519MLKEM768
 	} else {
+		share = share_for(ch, groupX25519)
+	}
+	if group == 0 && len(share) > 0 {
+		group = groupX25519
+	} else if group == 0 {
 		share = share_for(ch, groupP256)
 		if len(share) > 0 {
 			group = groupP256
@@ -332,7 +338,9 @@ fn (c mut Conn) server_handshake(cfg ServerConfig) ! {
 	if group == 0 {
 		// No usable key share: ask once for one of ours (HelloRetryRequest).
 		mut want = 0
-		if in_list(ch.groups, groupX25519) {
+		if in_list(ch.groups, groupX25519MLKEM768) {
+			want = groupX25519MLKEM768
+		} else if in_list(ch.groups, groupX25519) {
 			want = groupX25519
 		} else if in_list(ch.groups, groupP256) {
 			want = groupP256
@@ -398,7 +406,22 @@ fn (c mut Conn) server_handshake(cfg ServerConfig) ! {
 	let resumed = len(psk) > 0
 	mut shared_ = []u8{}
 	mut mine = []u8{}
-	if group == groupX25519 {
+	if group == groupX25519MLKEM768 {
+		// Encapsulate to the client's ML-KEM-768 key; send the ciphertext and an X25519 key.
+		if len(share) != hybridClientShare {
+			fail alert_fault(alertIllegalParameter, "invalid X25519MLKEM768 key share")
+		}
+		let (k, ct) = seal.MLKEM768Encapsulate(share[:seal.MLKEM768EncapsulationKeySize]) catch _ {
+			fail alert_fault(alertIllegalParameter, "invalid X25519MLKEM768 key share")
+		}
+		let priv = seal.X25519NewPrivateKey()
+		let xpub = try seal.X25519PublicKey(priv)
+		let xs = seal.X25519(priv, share[seal.MLKEM768EncapsulationKeySize:]) catch _ {
+			fail alert_fault(alertIllegalParameter, "invalid X25519MLKEM768 key share")
+		}
+		mine = cat(ct, xpub)
+		shared_ = cat(k, xs)
+	} else if group == groupX25519 {
 		let priv = seal.X25519NewPrivateKey()
 		mine = try seal.X25519PublicKey(priv)
 		shared_ = seal.X25519(priv, share) catch _ {

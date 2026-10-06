@@ -134,6 +134,14 @@ const extRecordSizeLimit = 28
 const groupX25519 = 0x001d
 const groupP256 = 0x0017
 
+// groupX25519MLKEM768 is the hybrid post-quantum group (draft-ietf-tls-ecdhe-mlkem; #479): a
+// client's share is an ML-KEM-768 encapsulation key then an X25519 key (1216 bytes), a server's
+// an ML-KEM-768 ciphertext then an X25519 key (1120 bytes), and the shared secret the ML-KEM
+// key then the X25519 secret.
+const groupX25519MLKEM768 = 0x11ec
+const hybridClientShare = 1216
+const hybridServerShare = 1120
+
 // The SignatureSchemes offered: ECDSA, RSA-PSS and Ed25519 for CertificateVerify, and
 // PKCS #1 v1.5 for certificate signatures only.
 let sigSchemes = []i64{0x0403, 0x0503, 0x0804, 0x0805, 0x0806, 0x0807, 0x0401, 0x0501, 0x0601}
@@ -171,6 +179,8 @@ type pskOffer struct {
 type chOptions struct {
 	cookie []u8
 	offer  ?pskOffer
+	hybrid []u8 // an X25519MLKEM768 key share, sent before the other one (#479); empty: none
+	pq     bool // supported_groups lists X25519MLKEM768 (both ClientHellos, as RFC 8446 4.1.2 asks)
 	tls12  bool // also offer TLS 1.2 (#473): its suites, ec_point_formats, extended_master_secret, renegotiation_info
 }
 
@@ -209,8 +219,14 @@ fn client_hello(random []u8, session []u8, suites []i64, name str, alpn []str, g
 		close_len(mut b, e, 2)
 	}
 	put16(mut b, extSupportedGroups)
-	put16(mut b, 6)
-	put16(mut b, 4)
+	if opt.pq {
+		put16(mut b, 8)
+		put16(mut b, 6)
+		put16(mut b, groupX25519MLKEM768)
+	} else {
+		put16(mut b, 6)
+		put16(mut b, 4)
+	}
 	put16(mut b, groupX25519)
 	put16(mut b, groupP256)
 	put16(mut b, extSignatureAlgorithms)
@@ -253,11 +269,18 @@ fn client_hello(random []u8, session []u8, suites []i64, name str, alpn []str, g
 		b = append(b, cookie...)
 	}
 	put16(mut b, extKeyShare)
-	put16(mut b, 2+4+len(share))
-	put16(mut b, 4+len(share))
+	let ks = open_len(mut b, 2)
+	let entries = open_len(mut b, 2)
+	if len(opt.hybrid) > 0 {
+		put16(mut b, groupX25519MLKEM768)
+		put16(mut b, len(opt.hybrid))
+		b = append(b, opt.hybrid...)
+	}
 	put16(mut b, group)
 	put16(mut b, len(share))
 	b = append(b, share...)
+	close_len(mut b, entries, 2)
+	close_len(mut b, ks, 2)
 	let offer = opt.offer
 	if offer != nil {
 		put16(mut b, extPSKModes)
