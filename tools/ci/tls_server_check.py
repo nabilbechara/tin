@@ -493,7 +493,7 @@ def mtls(openssl, exe, client, certs, work):
     sess = work / 'mtls-sess.pem'
     srv = Server(exe, cert, work, env={'TLS_CLIENT_AUTH': '2', 'TLS_CLIENT_CAS': str(pki / 'ca.pem')}, cores=2)
     try:
-        for name, cn in (('alice', 'alice'), ('rsa', 'rsa-client')):
+        for name, cn in (('alice', 'alice'), ('dave', 'dave'), ('rsa', 'rsa-client')):
             rc, out = s_client(openssl, srv.port, who(name) + ['-sess_out', str(sess)], get('/whoami'), cafile=cert[0])
             assert rc == 0 and f'cn={cn} chain=1 resumed=false' in out, (name, out[-1500:])
         # A resumed session keeps the client's identity (the ticket carries the chain).
@@ -541,7 +541,7 @@ def mtls(openssl, exe, client, certs, work):
                                             TLS_CLIENT_AUTH='2', TLS_CLIENT_CAS=str(cert[1])),
                        capture_output=True, text=True, timeout=30)
     assert p.returncode == 0 and 'server:' in p.stdout and 'ClientCAs' in p.stdout, p.stdout + p.stderr
-    print('PASS client certificates: openssl (ECDSA and RSA keys), Python and the Tin client verified; a resumed session keeps '
+    print('PASS client certificates: openssl (ECDSA, Ed25519 and RSA keys), Python and the Tin client verified; a resumed session keeps '
           'the identity; certificate_required, bad_certificate (server-only usage), certificate_expired and unknown_ca '
           'refusals; RequestClientCert serves a client without one; ClientCAs without a certificate fail at start')
 
@@ -776,8 +776,7 @@ def server_keylog(openssl, exe, certs, work):
 
 
 def bad_config(exe, certs, work):
-    for name, pair, want in (('a key of another certificate', (certs['ecdsa'][0], certs['rsa'][1]), 'does not belong'),
-                             ('an Ed25519 key', certs['ed25519'], 'server: ')):
+    for name, pair, want in (('a key of another certificate', (certs['ecdsa'][0], certs['rsa'][1]), 'does not belong'),):
         srv = Server(exe, pair, work, wait=False)
         try:
             code = srv.p.wait(timeout=20)
@@ -785,7 +784,22 @@ def bad_config(exe, certs, work):
             assert code == 0 and out.startswith('server: ') and want in out, (name, code, out)
         finally:
             srv.stop()
-    print('PASS configuration: a key that does not match the certificate, and an Ed25519 key, fail ServeTLS before it listens')
+    print('PASS configuration: a key that does not match the certificate fails ServeTLS before it listens')
+
+
+def ed25519_server(openssl, exe, client, certs, work):
+    """An Ed25519 certificate (#477): OpenSSL verifies the chain and the Ed25519 CertificateVerify,
+    and so does the Tin client."""
+    cert = certs['ed25519']
+    srv = Server(exe, cert, work)
+    try:
+        rc, out = s_client(openssl, srv.port, [], get('/fast'), cafile=cert[0])
+        assert rc == 0 and '\r\n\r\nfast' in out and 'peer signature type: ed25519' in out.lower(), out[-1500:]
+        r = subprocess.run([str(client), 'resume', srv.addr(), '1', str(cert[0])], capture_output=True, text=True, timeout=60)
+        assert re.fullmatch(r'resumed false TLS_\w+ X25519 1 true\n', r.stdout), r.stdout
+    finally:
+        srv.stop()
+    print('PASS Ed25519 certificate: OpenSSL and the Tin client verify the chain and the Ed25519 CertificateVerify')
 
 
 def main():
@@ -821,6 +835,7 @@ def main():
         memory(openssl, exe, certs, work)
         example(openssl, compiler, client, certs, work)
         bad_config(exe, certs, work)
+        ed25519_server(openssl, exe, client, certs, work)
         server_keylog(openssl, exe, certs, work)
         if PY_TLS13:
             python_clients(exe, certs, work)

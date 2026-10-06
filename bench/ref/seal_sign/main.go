@@ -36,10 +36,10 @@ import (
 )
 
 // Good keys, in the order both programs print them.
-var good = []string{"rsa2048-pkcs1", "rsa2048-pkcs8", "rsa3072-pkcs8", "rsa4096-pkcs1", "ec256-sec1", "ec256-pkcs8", "ec384-sec1", "ec384-pkcs8"}
+var good = []string{"rsa2048-pkcs1", "rsa2048-pkcs8", "rsa3072-pkcs8", "rsa4096-pkcs1", "ec256-sec1", "ec256-pkcs8", "ec384-sec1", "ec384-pkcs8", "ed25519-pkcs8"}
 
 // Bad keys: each must fail to parse.
-var bad = []string{"rsa1024-pkcs1", "ec521-pkcs8", "ed25519-pkcs8", "ec256-wrong-public", "rsa2048-wrong-crt", "rsa2048-wrong-n", "rsa2048-truncated", "encrypted"}
+var bad = []string{"rsa1024-pkcs1", "ec521-pkcs8", "ec256-wrong-public", "rsa2048-wrong-crt", "rsa2048-wrong-n", "rsa2048-truncated", "encrypted"}
 
 var message = []byte("Tin signing test message")
 
@@ -162,8 +162,10 @@ func load(dir, name string) (crypto.Signer, error) {
 				return nil, fmt.Errorf("Tin signs on P-256 and P-384 only")
 			}
 			return k, nil
+		case ed25519.PrivateKey:
+			return k, nil
 		}
-		return nil, fmt.Errorf("Tin signs with RSA and ECDSA keys only")
+		return nil, fmt.Errorf("Tin signs with RSA, ECDSA and Ed25519 keys only")
 	}
 	return nil, fmt.Errorf("unsupported PEM block %s", blk.Type)
 }
@@ -234,10 +236,13 @@ func main() {
 				check(err)
 				fmt.Println(name, "ecdsa", h, hex.EncodeToString(sig))
 			}
+		case ed25519.PrivateKey:
+			fmt.Println(name, "Ed25519")
+			fmt.Println(name, "ed25519", hex.EncodeToString(ed25519.Sign(k, message)))
 		}
 	}
 	// SignTLS: which schemes each kind of key may sign (TLS 1.3 binds ECDSA curves to schemes).
-	for _, name := range []string{"rsa2048-pkcs8", "ec256-sec1", "ec384-pkcs8"} {
+	for _, name := range []string{"rsa2048-pkcs8", "ec256-sec1", "ec384-pkcs8", "ed25519-pkcs8"} {
 		for _, scheme := range []int{0x0401, 0x0804, 0x0805, 0x0806, 0x0809, 0x0403, 0x0503, 0x0603, 0x0807} {
 			ok := false
 			switch {
@@ -247,6 +252,8 @@ func main() {
 				ok = scheme == 0x0403
 			case strings.HasPrefix(name, "ec384"):
 				ok = scheme == 0x0503
+			case strings.HasPrefix(name, "ed25519"):
+				ok = scheme == 0x0807
 			}
 			fmt.Println("signtls", name, scheme, ok)
 		}
@@ -278,6 +285,8 @@ func verify(dir string) {
 			ok = rsa.VerifyPSS(&k.PublicKey, h, digest(h, msg), sig, &rsa.PSSOptions{SaltLength: h.Size()}) == nil
 		case *ecdsa.PrivateKey:
 			ok = ecdsa.VerifyASN1(&k.PublicKey, digest(h, msg), sig)
+		case ed25519.PrivateKey:
+			ok = ed25519.Verify(k.Public().(ed25519.PublicKey), msg, sig)
 		}
 		res := "bad"
 		if ok {

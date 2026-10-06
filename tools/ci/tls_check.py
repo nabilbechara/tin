@@ -261,7 +261,7 @@ def client_certificate(exe, openssl, certs, work):
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
         wait_port(port, proc)
-        for name in ('alice', 'rsa'):
+        for name in ('alice', 'rsa', 'dave'):
             out = run(exe, 'mtls', f'127.0.0.1:{port}', 1, cert[0], pki / f'{name}.pem', pki / f'{name}.key')
             assert out.startswith('mtls false <HTML>') and 'TLSv1.3' in out, (name, out[:500])
         out = run(exe, 'mtls', f'127.0.0.1:{port}', 1, cert[0])
@@ -269,8 +269,8 @@ def client_certificate(exe, openssl, certs, work):
     finally:
         proc.kill()
         proc.wait()
-    print('PASS client certificates: openssl s_server -Verify accepts the Tin client\'s ECDSA and RSA certificates and '
-          'refuses a client without one')
+    print('PASS client certificates: openssl s_server -Verify accepts the Tin client\'s ECDSA, RSA and Ed25519 certificates '
+          'and refuses a client without one')
 
 
 KEYLOG_LABELS = ('CLIENT_HANDSHAKE_TRAFFIC_SECRET', 'SERVER_HANDSHAKE_TRAFFIC_SECRET', 'CLIENT_TRAFFIC_SECRET_0',

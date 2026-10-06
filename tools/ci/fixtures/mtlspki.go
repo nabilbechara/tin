@@ -3,6 +3,7 @@
 //	ca.pem                     the client CA (ECDSA P-256)
 //	alice.pem, alice.key       a client certificate from it (ECDSA P-256, extended key usage clientAuth)
 //	rsa.pem, rsa.key           a client certificate from it (RSA-2048, clientAuth)
+//	dave.pem, dave.key         a client certificate from it (Ed25519, clientAuth; #477)
 //	bob.pem, bob.key           a certificate from it for servers only (serverAuth)
 //	carol.pem, carol.key       an expired client certificate from it
 //	mallory.pem, mallory.key   a client certificate from another CA (other-ca.pem)
@@ -13,6 +14,7 @@ package main
 import (
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
@@ -107,6 +109,13 @@ func main() {
 	}
 	write("rsa.pem", "CERTIFICATE", issue("rsa-client", rk.Public(), ca, caKey, false, client, from, to).Raw)
 	writeKey("rsa.key", rk)
+
+	_, dk, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	write("dave.pem", "CERTIFICATE", issue("dave", dk.Public(), ca, caKey, false, client, from, to).Raw)
+	writeKey("dave.key", dk)
 
 	bk := ecKey()
 	write("bob.pem", "CERTIFICATE", issue("bob", bk.Public(), ca, caKey, false, []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, from, to).Raw)

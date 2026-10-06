@@ -31,11 +31,12 @@ type ECPrivateKey struct {
 	d secret []u8
 }
 
-// PrivateKey is an RSA or ECDSA private key, as ParsePrivateKeyPEM reads it.
+// PrivateKey is an RSA, ECDSA or Ed25519 private key, as ParsePrivateKeyPEM reads it.
 type PrivateKey struct {
 	Algorithm PublicKeyAlgorithm
 	RSA ?RSAPrivateKey
 	EC ?ECPrivateKey
+	Ed ?Ed25519PrivateKey
 }
 
 // keys_rsa_pkcs1 parses an RSAPrivateKey (PKCS #1): two primes only.
@@ -196,6 +197,16 @@ fn ParsePrivateKeyDER(der []u8) !PrivateKey {
 			let k = try keys_ec(der, kf, kt, c)
 			return PrivateKey{Algorithm: PublicKeyAlgorithm.ECDSA, EC: k}
 		}
+		if oid == oidEd25519 {
+			// RFC 8410: the key is an OCTET STRING holding the 32-byte seed.
+			let (sf2, st2) = try der_expect(der, kf, kt, derOctetString, "an Ed25519 private key")
+			if st2 != kt || st2-sf2 != 32 {
+				fail "seal: an Ed25519 private key is a 32-byte seed"
+			}
+			let seed = der[sf2:st2]
+			let pub = try Ed25519PublicKey(seed)
+			return PrivateKey{Algorithm: PublicKeyAlgorithm.Ed25519, Ed: Ed25519PrivateKey{Public: pub, seed: seed}}
+		}
 		fail "seal: unsupported private key algorithm " + oid
 	}
 	if tag == derOctetString {
@@ -229,6 +240,10 @@ fn (k PrivateKey) MatchesCertificate(c Certificate) bool {
 	let e = k.EC
 	if e != nil {
 		return c.PublicKeyAlgorithm == PublicKeyAlgorithm.ECDSA && c.Curve == e.Curve && nat_bytes_eq(e.Public, c.PublicKey)
+	}
+	let ed = k.Ed
+	if ed != nil {
+		return c.PublicKeyAlgorithm == PublicKeyAlgorithm.Ed25519 && nat_bytes_eq(ed.Public, c.PublicKey)
 	}
 	return false
 }

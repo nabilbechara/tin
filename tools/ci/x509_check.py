@@ -139,7 +139,7 @@ def check_signatures(signer):
     bad = [l for l in out if not l.endswith(' ok')]
     want = len([l for l in lines.splitlines() if l.strip()])
     assert not bad and len(out) == want, f'Go rejected Tin signatures: {bad} ({len(out)} of {want} checked)'
-    print(f'PASS signatures: Go verifies all {want} TLS signatures Tin made (RSA-PSS and ECDSA)')
+    print(f'PASS signatures: Go verifies all {want} TLS signatures Tin made (RSA-PSS, ECDSA and Ed25519)')
 
 
 def check_system_roots(roots):

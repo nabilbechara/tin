@@ -896,8 +896,10 @@ HTTP/1.1 over TLS 1.3 on the same per-core event loops (`lib/anvil/serve_tls.tin
   are sent when a server asks, with a CertificateVerify in a scheme the server accepts, or an
   empty Certificate when there is none. The database clients pass them through `Options.TLS`
   (PostgreSQL `clientcert=verify-full`, MySQL `REQUIRE X509`, Redis `tls-auth-clients`).
-- **Not supported:** 0-RTT, certificate selection by SNI (one chain per server, #476), Ed25519
-  server keys (#477), and TLS 1.2 (#473). A
+- **Keys.** RSA (PSS), ECDSA P-256 and P-384, and Ed25519 (#477; RFC 8410 PKCS #8 keys), for the
+  server's certificate and for a client's.
+- **Not supported:** 0-RTT, certificate selection by SNI (one chain per server, #476), and TLS 1.2
+  (#473). A
   `TIN_REPLAY_CAPSULE` replay sends plain HTTP and cannot replay into a TLS server.
 
 ### Pooled clients: mysql (v0.4)
@@ -1154,6 +1156,7 @@ functions keep that rule, and grows as phase 1 lands.
 | `monty_new` (`bignum.tin`: Montgomery constants for a modulus given at run time) | the modulus's value | its limb count and bit length |
 | `SignPKCS1v15`, `SignPSS` (`rsa_sign.tin`: CRT; base blinding by a pair (r^e, r^-1) kept with the key, squared after each signature and made fresh every 32, r^-1 by Fermat inversion in each prime; a public-key check of every signature) and `monty_exp_ct`, `monty_reduce`, `nat_mul_ct` under them | the private key, the message representative and r | the key's size; PSS's salt is random and public |
 | `SignECDSA`, `PrivateKey.SignTLS` (`ecdsa_sign.tin`: RFC 6979 nonces by `Hmac`, k·G by `p256_mul_base` or `ec_mul_ct`, k^-1 as k^(n-2) with the public exponent) | the private scalar and the nonce | the digest, and the (negligibly rare, public) retry when a nonce candidate is not below n |
+| `SignEd25519`, `Ed25519PublicKey`, `PrivateKey.SignTLS` with scheme 0x0807 (`ed25519_sign.tin`, #477: the clamped scalar and the nonce from SHA-512 of the seed, r·B and a·B from a per-core table of j·16^i·B read by copying every entry and swapping with a mask, S = r + k·a mod L in Montgomery arithmetic) | the seed, the scalar and the nonce | the message and its length |
 | `ParsePrivateKeyPEM`, `ParsePrivateKeyDER` | nothing: the key's encoding (lengths, tags) is parsed with ordinary branches | |
 
 `Sha1`, `Pbkdf2Sha256`, the hex and base64 codecs and the RSA-OAEP code are not

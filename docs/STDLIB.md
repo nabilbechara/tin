@@ -1061,6 +1061,9 @@ Package seal has cryptographic hashes (SHA-256, SHA-384, SHA-512, SHA-1), HMAC o
 - `SignECDSA(k ECPrivateKey, h Hash, digest []u8) ![]u8`: SignECDSA signs digest (a hash of the message, made with h) with k and returns a DER ECDSA-Sig-Value. The nonce is RFC 6979's, derived with HMAC over h, so equal inputs give equal signatures.
 - `(k PrivateKey) SignTLS(scheme i64, msg []u8) ![]u8`: SignTLS signs msg (the bytes a TLS 1.3 CertificateVerify covers) with k under scheme: RSA-PSS 0x0804-0x0806 for RSA keys, 0x0403 for P-256 and 0x0503 for P-384.
 - `VerifyEd25519(pub []u8, msg []u8, sig []u8) !`: VerifyEd25519 checks an Ed25519 signature (64 bytes) of msg by the public key pub (32 bytes).
+- `type Ed25519PrivateKey struct`: Ed25519PrivateKey is an Ed25519 key: the 32-byte seed and the public key it gives.
+- `Ed25519PublicKey(seed secret []u8) ![]u8`: Ed25519PublicKey is the 32-byte public key of a 32-byte Ed25519 seed.
+- `SignEd25519(seed secret []u8, msg []u8) ![]u8`: SignEd25519 is the 64-byte Ed25519 signature of msg by the key with the 32-byte seed (pure Ed25519: msg is not hashed first).
 - `type Hash enum { SHA256, SHA384, SHA512 }`: Hash names a SHA-2 function for Hmac and HKDF.
 - `Sum(h Hash, s secret str) []u8`: Sum is the digest of s under h; s may be secret.
 - `Size(h Hash) i64`: Size is the length in bytes of h's digest.
@@ -1071,7 +1074,7 @@ Package seal has cryptographic hashes (SHA-256, SHA-384, SHA-512, SHA-1), HMAC o
 - `HkdfExpandLabel(h Hash, key secret str, label str, context str, n i64) ![]u8`: HkdfExpandLabel is TLS 1.3's HKDF-Expand-Label(secret, label, context, n) (RFC 8446 section 7.1); label is given without the "tls13 " prefix. key may be secret.
 - `type RSAPrivateKey struct`: RSAPrivateKey is an RSA key with its CRT values; the private parts can only be read by seal.
 - `type ECPrivateKey struct`: ECPrivateKey is an ECDSA key on P-256 or P-384: the curve, the scalar and the uncompressed public point.
-- `type PrivateKey struct`: PrivateKey is an RSA or ECDSA private key, as ParsePrivateKeyPEM reads it.
+- `type PrivateKey struct`: PrivateKey is an RSA, ECDSA or Ed25519 private key, as ParsePrivateKeyPEM reads it.
 - `ParsePrivateKeyDER(der []u8) !PrivateKey`: ParsePrivateKeyDER reads a PKCS #8 PrivateKeyInfo, a PKCS #1 RSAPrivateKey or a SEC 1 ECPrivateKey.
 - `ParsePrivateKeyPEM(pem str) !PrivateKey`: ParsePrivateKeyPEM reads the first "PRIVATE KEY", "RSA PRIVATE KEY" or "EC PRIVATE KEY" block of pem.
 - `(k PrivateKey) MatchesCertificate(c Certificate) bool`: MatchesCertificate reports whether k is the private key of c's public key.

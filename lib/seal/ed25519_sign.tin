@@ -1,0 +1,155 @@
+package seal
+
+// ---- Ed25519 signing (RFC 8032 section 5.1.6; #477) ----
+// The private key is a 32-byte seed. SHA-512 of it gives the secret scalar a (clamped) and a
+// prefix; a signature of M is R = r*B with r = SHA-512(prefix || M) mod L (deterministic, no
+// randomness to get wrong), and S = r + SHA-512(R || A || M)*a mod L. Constant time in the seed
+// and the nonce: r*B and a*B read a per-core table of j*16^i*B by touching every entry and add
+// with the unified formula, which has no branch; the scalar arithmetic mod L is field.tin's
+// Montgomery code (monty_reduce, mul, add).
+
+// Ed25519PrivateKey is an Ed25519 key: the 32-byte seed and the public key it gives.
+type Ed25519PrivateKey struct {
+	Public []u8
+	seed   secret []u8
+}
+
+// edGTable holds j*16^i*B for i in 0..64 and j in 1..16 (at 15i+j-1), built on each core when
+// first needed; edL is arithmetic mod the group order L.
+mut edGTable []edpt
+mut edLCache ?monty
+
+fn ed_order() monty {
+	let cached = edLCache
+	if cached != nil {
+		return cached
+	}
+	let lb = HexDecode(edOrder) catch _ { []u8{} }
+	let l = monty_new(lb) catch err {
+		rt_panic("seal: Ed25519 order: " + say_str(err))
+		monty{m: []u64{}, rr: []u64{}, one: []u64{}, minv: 0, n: 0, t: []u64{}, u: []u64{}}
+	}
+	edLCache = keep(l)
+	return l
+}
+
+fn say_str(e fault) str {
+	return "{e}"
+}
+
+fn ed_base_table() []edpt {
+	if len(edGTable) == 0 {
+		let bb = HexDecode(ed_base_enc) catch _ { []u8{} }
+		let base = ed_decode(bb) catch err {
+			rt_panic("seal: Ed25519 base point: " + say_str(err))
+			ed_identity()
+		}
+		mut t = make([]edpt, 0, 64*15)
+		for i in 0..64 {
+			let first = ed_identity()
+			ed_copy(mut first, base)
+			t = append(t, first)
+			for j in 2..16 {
+				let e = ed_identity()
+				ed_add(mut e, t[len(t)-1], base)
+				t = append(t, e)
+			}
+			for d in 0..4 {
+				ed_add(mut base, base, base)
+			}
+		}
+		edGTable = keep(t)
+	}
+	return edGTable
+}
+
+fn ed_copy(r mut edpt, p edpt) {
+	fe_copy(mut r.x, p.x)
+	fe_copy(mut r.y, p.y)
+	fe_copy(mut r.z, p.z)
+	fe_copy(mut r.t, p.t)
+}
+
+// ed_mul_base is k*B for a 32-byte little-endian scalar k, in time that does not depend on k: each
+// table entry is copied and swapped in with fe_cswap's mask (whatever the field's limbs are).
+@wrap fn ed_mul_base(k []u8) edpt {
+	let table = ed_base_table()
+	let ident = ed_identity()
+	let acc = ed_identity()
+	let sel = ed_identity()
+	let tmp = ed_identity()
+	for i in 0..64 {
+		let w = i64((u64(k[i/2]) >> u64(4*(i%2))) & 15)
+		ed_copy(mut sel, ident)
+		for j in 1..16 {
+			let d = j ^ w
+			let bit = 1 ^ i64((u64(d) | (u64(0) -% u64(d))) >> 63)
+			ed_copy(mut tmp, table[15*i+j-1])
+			fe_cswap(mut sel.x, mut tmp.x, bit)
+			fe_cswap(mut sel.y, mut tmp.y, bit)
+			fe_cswap(mut sel.z, mut tmp.z, bit)
+			fe_cswap(mut sel.t, mut tmp.t, bit)
+		}
+		ed_add(mut acc, acc, sel)
+	}
+	return acc
+}
+
+// ed_expand is the clamped secret scalar (little-endian) and the nonce prefix of a seed.
+fn ed_expand(seed secret []u8) ([]u8, []u8) {
+	let h = Sha512(str(seed))
+	let a = make([]u8, 32)
+	for i in 0..32 {
+		a[i] = h[i]
+	}
+	a[0] &= 248
+	a[31] &= 127
+	a[31] |= 64
+	return a, h[32:64]
+}
+
+// ed_scalar is the 64-byte little-endian hash b reduced mod L, in Montgomery form.
+fn ed_scalar(l mut monty, b []u8) []u64 {
+	let z = l.elem()
+	monty_reduce(mut l, mut z, ed_le_to_be(b))
+	return z
+}
+
+// Ed25519PublicKey is the 32-byte public key of a 32-byte Ed25519 seed.
+fn Ed25519PublicKey(seed secret []u8) ![]u8 {
+	if len(seed) != 32 {
+		fail "seal: an Ed25519 seed is 32 bytes"
+	}
+	let (a, _) = ed_expand(seed)
+	return ed_encode(ed_mul_base(a))
+}
+
+// SignEd25519 is the 64-byte Ed25519 signature of msg by the key with the 32-byte seed
+// (pure Ed25519: msg is not hashed first).
+fn SignEd25519(seed secret []u8, msg []u8) ![]u8 {
+	if len(seed) != 32 {
+		fail "seal: an Ed25519 seed is 32 bytes"
+	}
+	let (a, prefix) = ed_expand(seed)
+	let pub = ed_encode(ed_mul_base(a))
+	mut l = ed_order()
+	mut rin = make([]u8, 0, 32+len(msg))
+	rin = append(rin, prefix...)
+	rin = append(rin, msg...)
+	let rm = ed_scalar(mut l, Sha512(str(rin)))
+	let rb = ed_le_to_be(l.to_bytes(rm))
+	let renc = ed_encode(ed_mul_base(rb))
+	mut kin = make([]u8, 0, 64+len(msg))
+	kin = append(kin, renc...)
+	kin = append(kin, pub...)
+	kin = append(kin, msg...)
+	let km = ed_scalar(mut l, Sha512(str(kin)))
+	let am = ed_scalar(mut l, a)
+	let s = l.elem()
+	l.mul(mut s, km, am)
+	l.add(mut s, s, rm)
+	mut sig = make([]u8, 0, 64)
+	sig = append(sig, renc...)
+	sig = append(sig, ed_le_to_be(l.to_bytes(s))...)
+	return sig
+}
