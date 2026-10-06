@@ -1,0 +1,79 @@
+package main
+
+import "say"
+import "tide"
+
+// A variable bound by `let x = try f()` or `let x = f() catch ...` that a closure captures lives
+// in a cell, which the binding must allocate and fill (#494): it used to read an unset cell
+// pointer, so the closure printed garbage or crashed.
+
+type Box struct {
+	fd   i64
+	name str
+}
+
+fn mk(i i64) !Box {
+	if i < 0 {
+		fail "negative"
+	}
+	return Box{fd: 100 + i, name: "box{i}"}
+}
+
+fn mki(i i64) !i64 {
+	if i < 0 {
+		fail "negative"
+	}
+	return 100 + i
+}
+
+fn called() ! {
+	let n = try mki(1)
+	let g = fn() {
+		say.Line("try int in a closure:", n)
+	}
+	g()
+	let b = try mk(2)
+	let h = fn() {
+		say.Line("try struct in a closure:", b.fd, b.name)
+	}
+	h()
+	say.Line("and in the function:", n, b.fd)
+	let c = mk(-1) catch _ {
+		Box{fd: 7, name: "caught"}
+	}
+	let k = fn() {
+		say.Line("catch struct in a closure:", c.fd, c.name)
+	}
+	k()
+	let m = mki(-1) catch _ {
+		9
+	}
+	let p = fn() {
+		say.Line("catch int in a closure:", m)
+	}
+	p()
+}
+
+fn spawned() ! {
+	mut sum = 0
+	scope s {
+		for i in 0..3 {
+			let b = try mk(i)
+			s.spawn(fn() ! {
+				try tide.Wait(1ms)
+				say.Line("a task got", b.fd, b.name)
+				sum += b.fd
+			})
+		}
+	}
+	say.Line("tasks summed", sum)
+}
+
+fn main() {
+	called() catch e {
+		say.Line("called:", e)
+	}
+	spawned() catch e {
+		say.Line("spawned:", e)
+	}
+}
