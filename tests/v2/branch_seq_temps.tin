@@ -1,0 +1,77 @@
+package main
+
+import "fault"
+import "say"
+
+// A call inlined into a branch condition runs its statements from temp depth 0: the temps of
+// the expression around it must survive them (#492). A store to a captured variable holds the
+// cell's address in a temp while its value, here a short-circuit condition with an inlined call
+// that reads a global, is computed; the store used to land in the global instead.
+
+mut table = []i64{5, 6}
+
+let ErrX = fault("the client was closed")
+
+fn check(x i64) bool {
+	return x > 3
+}
+
+fn small(x i64) bool {
+	return x < 3
+}
+
+fn f(n i64) ![]str {
+	if n > 0 {
+		fail ErrX
+	}
+	return []str{}
+}
+
+fn and_store(x i64) {
+	mut ok = false
+	let set = fn() {
+		ok = x != 0 && check(table[0])
+	}
+	set()
+	say.Line("&& into a captured variable:", ok, len(table), table[1])
+}
+
+fn or_store(x i64) {
+	mut ok = false
+	let set = fn() {
+		ok = x == 0 || check(table[1])
+	}
+	set()
+	say.Line("|| into a captured variable:", ok, len(table), table[1])
+}
+
+fn not_store(x i64) {
+	mut ok = true
+	let set = fn() {
+		ok = x != 0 && !small(table[0])
+	}
+	set()
+	say.Line("&& ! into a captured variable:", ok, len(table), table[1])
+}
+
+fn fault_store() ! {
+	mut closed = false
+	mut txt = ""
+	scope s {
+		s.spawn(fn() ! {
+			let (_, e) = f(1)
+			closed = e != nil && fault.Is(e, ErrX)
+			txt = "{e}"
+		})
+	}
+	say.Line("a fault tested in a task:", closed, txt, "{ErrX}")
+}
+
+fn main() {
+	and_store(1)
+	or_store(1)
+	not_store(1)
+	fault_store() catch e {
+		say.Line("fault_store:", e)
+	}
+}
