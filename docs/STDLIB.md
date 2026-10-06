@@ -312,7 +312,7 @@ let r = try wire.Get("http://127.0.0.1:8080/json")
 
 ## tls
 
-Package tls is TLS 1.3 (RFC 8446). Clients: tls.Dial connects and handshakes, and Conn reads and writes like wire.Conn; the server's certificate is verified by default against the system's roots (plus Config.RootCAs). A server's NewSessionTicket is kept (per core, for the same name and settings) and offered on the next connection to it, which then resumes without the certificate messages (Conn.Resumed). Servers: anvil.ServeTLS serves HTTPS with this package; LoadServerConfig reads a certificate chain and its key (RSA, ECDSA P-256 or P-384), and Server runs the server side over an accepted wire.Conn. Cipher suites: TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256; key exchange X25519, or P-256 by HelloRetryRequest. No 0-RTT, no renegotiation and no TLS 1.2. Every wait lets the core serve other tasks and honours Config.Timeout during the handshake, SetTimeout afterwards and a request's deadline.
+Package tls is TLS 1.3 (RFC 8446) and TLS 1.2 (RFC 5246). Clients: tls.Dial connects and handshakes, and Conn reads and writes like wire.Conn; the server's certificate is verified by default against the system's roots (plus Config.RootCAs). A server's NewSessionTicket is kept (per core, for the same name and settings) and offered on the next connection to it, which then resumes without the certificate messages (Conn.Resumed). Servers: anvil.ServeTLS serves HTTPS with this package; LoadServerConfig reads a certificate chain and its key (RSA, ECDSA P-256 or P-384), and Server runs the server side over an accepted wire.Conn. Cipher suites: TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256; key exchange X25519, or P-256 by HelloRetryRequest. TLS 1.2, for peers that stop there, has the six ECDHE suites with AES-GCM or ChaCha20-Poly1305 and the extended master secret; 1.3 is preferred, and Config.MinVersion (ServerConfig.MinVersion) VersionTLS13 turns 1.2 off. No 0-RTT, no renegotiation, no 1.2 session resumption and nothing older than 1.2. Every wait lets the core serve other tasks and honours Config.Timeout during the handshake, SetTimeout afterwards and a request's deadline.
 
 ```tin body
 let c = try tls.Dial("example.com:443", tls.Config{ALPN: []str{"http/1.1"}})
@@ -351,7 +351,7 @@ try c.Write("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
 - `(c Conn) CipherSuite() i64`: CipherSuite is the negotiated cipher suite (TLS_AES_128_GCM_SHA256 and so on).
 - `(c Conn) Group() str`: Group is the key exchange: "X25519", or "P-256" when the server asked for it.
 - `const VersionTLS13 = 0x0304`: VersionTLS13 is TLS 1.3's protocol version (Conn.Version).
-- `(c Conn) Version() i64`: Version is the negotiated protocol version: VersionTLS13.
+- `(c Conn) Version() i64`: Version is the negotiated protocol version: VersionTLS13 or VersionTLS12.
 - `(c Conn) Resumed() bool`: Resumed reports whether the handshake resumed an earlier session with a ticket: the server's certificate was checked on that session, and PeerCertificates is empty.
 - `(c Conn) PeerCertificates() [][]u8`: PeerCertificates is the peer's certificate chain as sent (DER, leaf first): on a client the server's, on a server the client's when it sent one (mutual TLS, #475).
 - `(c Conn) Fd() i64`: Fd is the connection's descriptor (for waiting on it; never read or write it directly).
@@ -363,6 +363,13 @@ try c.Write("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
 - `(c mut Conn) WriteBytes(b []u8) !`: WriteBytes sends all of b.
 - `(c mut Conn) Write(s str) !`: Write sends all of s.
 - `(c mut Conn) Close()`: Close sends close_notify and closes the connection; closing twice does nothing.
+- `const VersionTLS12 = 0x0303`: VersionTLS12 is TLS 1.2's protocol version (Conn.Version, Config.MinVersion).
+- `const TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 = 0xc02b`: The TLS 1.2 cipher suites (all ECDHE with an AEAD).
+- `const TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 = 0xc02c`
+- `const TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 = 0xc02f`
+- `const TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 = 0xc030`
+- `const TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 = 0xcca8`
+- `const TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 = 0xcca9`
 
 ## hpack
 
@@ -1088,6 +1095,7 @@ Package seal has cryptographic hashes (SHA-256, SHA-384, SHA-512, SHA-1), HMAC o
 - `ParseRSAPublicKeyDER(der []u8) !RSAPublicKey`: ParseRSAPublicKeyDER reads a DER RSAPublicKey (PKCS #1) or SubjectPublicKeyInfo holding one.
 - `VerifyECDSA(curve str, pub []u8, digest []u8, sig []u8) !`: VerifyECDSA checks a DER-encoded ECDSA signature over digest (a hash of the message) by the public key pub, an uncompressed point on curve ("P-256" or "P-384"). A digest longer than the curve's order is truncated to its leftmost bytes, as FIPS 186-5 says.
 - `SignECDSA(k ECPrivateKey, h Hash, digest []u8) ![]u8`: SignECDSA signs digest (a hash of the message, made with h) with k and returns a DER ECDSA-Sig-Value. The nonce is RFC 6979's, derived with HMAC over h, so equal inputs give equal signatures.
+- `(k PrivateKey) SignTLS12(scheme i64, msg []u8) ![]u8`: SignTLS12 signs msg for TLS 1.2 (ServerKeyExchange, CertificateVerify; #473) with scheme: also RSA PKCS #1 v1.5 (0x0401, 0x0501, 0x0601) and ECDSA with the scheme's hash on either curve.
 - `(k PrivateKey) SignTLS(scheme i64, msg []u8) ![]u8`: SignTLS signs msg (the bytes a TLS 1.3 CertificateVerify covers) with k under scheme: RSA-PSS 0x0804-0x0806 for RSA keys, 0x0403 for P-256 and 0x0503 for P-384.
 - `VerifyEd25519(pub []u8, msg []u8, sig []u8) !`: VerifyEd25519 checks an Ed25519 signature (64 bytes) of msg by the public key pub (32 bytes).
 - `type Ed25519PrivateKey struct`: Ed25519PrivateKey is an Ed25519 key: the 32-byte seed and the public key it gives.
@@ -1163,6 +1171,7 @@ Package seal has cryptographic hashes (SHA-256, SHA-384, SHA-512, SHA-1), HMAC o
 - `(c Certificate) CheckSignature(alg SignatureAlgorithm, signed []u8, sig []u8) !`: CheckSignature checks that sig is c's key's signature of signed under alg. SHA-1 is refused.
 - `(c Certificate) CheckSignatureFrom(parent Certificate) !`: CheckSignatureFrom checks that parent signed c. It does not check that parent may sign.
 - `(c Certificate) CheckTLSSignature(scheme i64, signed []u8, sig []u8) !`: CheckTLSSignature checks a TLS 1.3 CertificateVerify signature by c's key: scheme is the SignatureScheme code and signed the bytes the peer signed (padding, context and transcript hash).
+- `(c Certificate) CheckTLS12Signature(scheme i64, signed []u8, sig []u8) !`: CheckTLS12Signature verifies a TLS 1.2 signature (ServerKeyExchange, a client's CertificateVerify; #473) by c's key over signed. TLS 1.2 also allows RSA PKCS #1 v1.5 (0x0401, 0x0501, 0x0601), and its ECDSA schemes name only the hash, not the curve.
 - `type CertPool struct`: CertPool is a set of certificates indexed by subject, used for roots and intermediates.
 - `NewCertPool() CertPool`: NewCertPool returns an empty pool.
 - `(p mut CertPool) Add(c Certificate)`: Add adds c to the pool unless it is already there.

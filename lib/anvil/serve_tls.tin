@@ -30,6 +30,7 @@ shared mut gTlsCheckNs i64  // how often core 0 looks at those files (TIN_TLS_RE
 shared mut gTlsNextCheck i64
 shared mut gTlsWatch fn()   // tls_watch: core 0's sweep looks at the files
 shared mut gTlsClientAuth i64 // TLSConfig.ClientAuth (#475)
+shared mut gTlsMinVersion i64 // TLSConfig.MinVersion (#473)
 shared mut gTlsClientCAs i64  // TLSConfig.ClientCAs's PEM text, 0 for none
 
 shared mut gTlsAccept fn(i64)                  // tls_accept: start the handshake of a new connection
@@ -83,6 +84,7 @@ type TLSConfig struct {
 	Certificates []TLSCert // more certificates; the default is CertPEM's, else the first of these
 	ClientAuth   i64       // tls.NoClientCert (the default), tls.RequestClientCert or tls.RequireClientCert
 	ClientCAs    str       // with ClientAuth: the PEM roots a client certificate must chain to (the system's are not used)
+	MinVersion   i64       // tls.VersionTLS12 (the default, 0 too) or tls.VersionTLS13 to refuse TLS 1.2 clients (#473)
 }
 
 // TLSCert is one certificate chain (leaf first) and its private key: PEM text, or the paths of
@@ -162,6 +164,10 @@ fn tls_setup_config(tc TLSConfig) ! {
 		gTlsClientCAs = cast(i64, keep(tc.ClientCAs))
 	}
 	gTlsClientAuth = tc.ClientAuth
+	if tc.MinVersion != 0 && tc.MinVersion != tls.VersionTLS12 && tc.MinVersion != tls.VersionTLS13 {
+		fail "anvil: TLSConfig.MinVersion must be tls.VersionTLS12 or tls.VersionTLS13"
+	}
+	gTlsMinVersion = tc.MinVersion
 	tls_publish(pems)
 	tls_files(tc.Certificates)
 	gTlsMs = -1
@@ -299,6 +305,7 @@ fn tls_core_config() bool {
 	cfg.Others = others
 	cfg.ALPN = tls_alpn()
 	cfg.ClientAuth = gTlsClientAuth
+	cfg.MinVersion = gTlsMinVersion
 	if gTlsClientCAs != 0 {
 		cfg.ClientCAs = cast(str, gTlsClientCAs)
 	}

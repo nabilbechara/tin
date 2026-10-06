@@ -171,6 +171,7 @@ type pskOffer struct {
 type chOptions struct {
 	cookie []u8
 	offer  ?pskOffer
+	tls12  bool // also offer TLS 1.2 (#473): its suites, ec_point_formats, extended_master_secret, renegotiation_info
 }
 
 // client_hello encodes a ClientHello. share is the key_share entry (group, key). With a PSK
@@ -185,8 +186,14 @@ fn client_hello(random []u8, session []u8, suites []i64, name str, alpn []str, g
 	b = append(b, random...)
 	b = append(b, u8(len(session)))
 	b = append(b, session...)
-	put16(mut b, 2*len(suites))
-	for _, s in suites {
+	mut all = suites
+	if opt.tls12 {
+		all = make([]i64, 0, len(suites)+6)
+		all = append(all, suites...)
+		all = append(all, suites12()...)
+	}
+	put16(mut b, 2*len(all))
+	for _, s in all {
 		put16(mut b, s)
 	}
 	b = append(b, 1, 0)
@@ -224,8 +231,21 @@ fn client_hello(random []u8, session []u8, suites []i64, name str, alpn []str, g
 		close_len(mut b, e, 2)
 	}
 	put16(mut b, extSupportedVersions)
-	put16(mut b, 3)
-	b = append(b, 2, 3, 4)
+	if opt.tls12 {
+		put16(mut b, 5)
+		b = append(b, 4, 3, 4, 3, 3)
+		put16(mut b, extECPointFormats)
+		put16(mut b, 2)
+		b = append(b, 1, 0)
+		put16(mut b, extExtendedMasterSecret)
+		put16(mut b, 0)
+		put16(mut b, extRenegotiationInfo)
+		put16(mut b, 1)
+		b = append(b, 0)
+	} else {
+		put16(mut b, 3)
+		b = append(b, 2, 3, 4)
+	}
 	if len(cookie) > 0 {
 		put16(mut b, extCookie)
 		put16(mut b, 2+len(cookie))
@@ -275,15 +295,18 @@ type serverHello struct {
 	group   i64  // the key_share group (HelloRetryRequest: the group asked for)
 	share   []u8 // the server's key share (ServerHello)
 	cookie  []u8 // HelloRetryRequest
-	version i64  // supported_versions, 0 when absent
+	version i64  // supported_versions, 0 when absent; VersionTLS12 for a TLS 1.2 ServerHello
 	psk     bool // the server accepted the PSK offered (pre_shared_key with identity 0)
+	random  []u8 // the server random (TLS 1.2 signs it, and carries the downgrade sentinel)
+	alpn    str  // TLS 1.2: the protocol ALPN chose (TLS 1.3 sends it in EncryptedExtensions)
+	ems     bool // TLS 1.2: extended_master_secret
 }
 
 // parse_server_hello reads a ServerHello body; alert is set when it is malformed or not
 // what was offered.
 fn parse_server_hello(body []u8, session []u8) !serverHello {
 	let r = rdr{b: body}
-	let sh = serverHello{share: []u8{}, cookie: []u8{}}
+	let sh = serverHello{share: []u8{}, cookie: []u8{}, random: []u8{}, alpn: ""}
 	let legacy = r.u16v()
 	let random = r.bytes(32)
 	let echo = r.vec8()
@@ -294,8 +317,13 @@ fn parse_server_hello(body []u8, session []u8) !serverHello {
 		fail alert_fault(alertDecodeError, "malformed ServerHello")
 	}
 	sh.retry = str(random) == hrrRandom
+	sh.random = clone(random)
 	if legacy != 0x0303 || comp != 0 {
 		fail alert_fault(alertIllegalParameter, "ServerHello has a bad legacy version or compression")
+	}
+	if !has_extension(exts, extSupportedVersions) {
+		// TLS 1.2 (#473): the client offered it; tls12.tin checks the rest.
+		return try parse_server_hello12(sh, exts)
 	}
 	if !seal.ConstantTimeEq(echo, session) {
 		fail alert_fault(alertIllegalParameter, "ServerHello does not echo the session id")
@@ -341,6 +369,69 @@ fn parse_server_hello(body []u8, session []u8) !serverHello {
 	}
 	if sh.version != 0x0304 {
 		fail alert_fault(alertProtocolVersion, "server does not support TLS 1.3")
+	}
+	return sh
+}
+
+// has_extension reports whether the extension block exts (a vec16's contents) holds typ.
+fn has_extension(exts []u8, typ i64) bool {
+	let r = rdr{b: exts}
+	for !r.bad && !r.done() {
+		if r.u16v() == typ {
+			return true
+		}
+		r.vec16()
+	}
+	return false
+}
+
+// parse_server_hello12 reads a TLS 1.2 ServerHello's extensions into sh: renegotiation_info (it
+// must be empty), extended_master_secret, ec_point_formats (with uncompressed points) and ALPN.
+fn parse_server_hello12(sh serverHello, exts []u8) !serverHello {
+	sh.version = VersionTLS12
+	mut seen = make([]i64, 0, 8)
+	let er = rdr{b: exts}
+	for !er.bad && !er.done() {
+		let typ = er.u16v()
+		let data = er.vec16()
+		if in_list(seen, typ) {
+			fail alert_fault(alertIllegalParameter, "ServerHello repeats an extension")
+		}
+		seen = append(seen, typ)
+		let x = rdr{b: data}
+		if typ == extRenegotiationInfo {
+			if len(x.vec8()) != 0 {
+				fail alert_fault(alertHandshakeFailure, "the server renegotiates")
+			}
+		} else if typ == extExtendedMasterSecret {
+		} else if typ == extECPointFormats {
+			mut ok = false
+			for _, f in x.vec8() {
+				if f == 0 {
+					ok = true
+				}
+			}
+			if !ok {
+				fail alert_fault(alertIllegalParameter, "the server takes no uncompressed points")
+			}
+		} else if typ == extALPN {
+			let l = rdr{b: x.vec16()}
+			sh.alpn = str(l.vec8())
+			if l.bad || !l.done() || sh.alpn == "" {
+				fail alert_fault(alertDecodeError, "malformed ALPN in ServerHello")
+			}
+		} else {
+			fail alert_fault(alertUnsupportedExtension, "ServerHello has an extension that was not offered")
+		}
+		if typ == extExtendedMasterSecret {
+			sh.ems = true
+		}
+		if x.bad || !x.done() {
+			fail alert_fault(alertDecodeError, "malformed ServerHello extension")
+		}
+	}
+	if er.bad {
+		fail alert_fault(alertDecodeError, "malformed ServerHello extensions")
 	}
 	return sh
 }

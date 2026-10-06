@@ -960,8 +960,21 @@ HTTP/1.1 over TLS 1.3 on the same per-core event loops (`lib/anvil/serve_tls.tin
   (`TLSCert.CertFile`, `KeyFile`) is read again by core 0 every `TIN_TLS_RELOAD_S` seconds
   (default 60), and reloaded when the contents changed. A renewal on disk, from Let's Encrypt or
   cert-manager, needs no restart; a broken pair is reported and the set in use stays.
-- **Not supported:** 0-RTT, and TLS 1.2 (#473). A
-  `TIN_REPLAY_CAPSULE` replay sends plain HTTP and cannot replay into a TLS server.
+- **TLS 1.2 (#473)**, for clients and servers that stop there: the six ECDHE suites of
+  Mozilla's "intermediate" profile (ECDSA or RSA certificates, and Ed25519 by RFC 8422; X25519
+  or P-256; AES-128-GCM, AES-256-GCM or ChaCha20-Poly1305), with the extended master secret
+  (RFC 7627) whenever the peer offers it. Both sides prefer 1.3. A server answering a client
+  that offered 1.3 puts the downgrade sentinel in its random, and the client refuses it, so a
+  man in the middle cannot force 1.2 on two peers that speak 1.3. An ECDSA certificate is chosen
+  only when its curve is in the client's supported_groups. Client certificates, ALPN (h2
+  included), SNI selection, SSLKEYLOGFILE (`CLIENT_RANDOM`) and `Conn.Version()` work as in
+  1.3. Left out: RSA key exchange and CBC (no forward secrecy, padding oracles),
+  renegotiation (a ClientHello after the handshake gets no_renegotiation; a client ignores a
+  HelloRequest), session resumption (a 1.2 client gets a full handshake each time), and
+  anything older than 1.2. `TLSConfig.MinVersion` and `tls.Config.MinVersion` set to
+  `tls.VersionTLS13` turn 1.2 off (protocol_version).
+- **Not supported:** 0-RTT. A `TIN_REPLAY_CAPSULE` replay sends plain HTTP and cannot replay
+  into a TLS server.
 
 ### Pooled clients: mysql (v0.4)
 

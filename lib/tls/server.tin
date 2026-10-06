@@ -17,6 +17,7 @@ type ServerConfig struct {
 	ClientAuth i64       // NoClientCert, RequestClientCert or RequireClientCert (#475)
 	ClientCAs str        // PEM roots client certificates must chain to (with ClientAuth; the system's roots are not used)
 	Others []Credential  // more certificates, chosen by the client's server_name (#476; sni.tin)
+	MinVersion i64       // VersionTLS12 (the default, 0 too) or VersionTLS13 (#473)
 	names []str          // what the default certificate covers (LoadServerConfig)
 }
 
@@ -48,6 +49,11 @@ type clientHello struct {
 	tls13   bool
 	name    str
 	cookie  []u8
+	tls12   bool   // TLS 1.2 is offered: in supported_versions, or by legacy_version without it (#473)
+	ems     bool   // extended_master_secret is offered
+	renego  bool   // renegotiation_info (empty) or its signaling suite is offered
+	pointFormats bool // ec_point_formats is sent
+	uncompressed bool // ...and accepts uncompressed points (true when absent)
 	pskDHE  bool   // psk_key_exchange_modes offers psk_dhe_ke
 	pskIDs  [][]u8 // pre_shared_key identities, in order
 	binders [][]u8 // and their binders
@@ -56,9 +62,10 @@ type clientHello struct {
 
 // parse_client_hello reads a ClientHello body.
 fn parse_client_hello(body []u8) !clientHello {
-	let ch = clientHello{random: []u8{}, session: []u8{}, name: "", cookie: []u8{}, pskIDs: [][]u8{}, binders: [][]u8{}}
+	let ch = clientHello{random: []u8{}, session: []u8{}, name: "", cookie: []u8{}, pskIDs: [][]u8{}, binders: [][]u8{},
+		uncompressed: true}
 	let r = rdr{b: body}
-	r.u16v()
+	let legacy = r.u16v()
 	ch.random = r.bytes(32)
 	ch.session = r.vec8()
 	let cs = rdr{b: r.vec16()}
@@ -71,9 +78,14 @@ fn parse_client_hello(body []u8) !clientHello {
 		fail alert_fault(alertIllegalParameter, "ClientHello offers compression")
 	}
 	for !cs.done() {
-		ch.suites = append(ch.suites, cs.u16v())
+		let s = cs.u16v()
+		ch.suites = append(ch.suites, s)
+		if s == scsvRenegotiation {
+			ch.renego = true
+		}
 	}
 	mut seen = []i64{}
+	mut versions = false
 	for !exts.done() && !exts.bad {
 		let typ = exts.u16v()
 		let data = exts.vec16()
@@ -83,10 +95,14 @@ fn parse_client_hello(body []u8) !clientHello {
 		seen = append(seen, typ)
 		let e = rdr{b: data}
 		if typ == extSupportedVersions {
+			versions = true
 			let v = rdr{b: e.vec8()}
 			for !v.done() && !v.bad {
-				if v.u16v() == 0x0304 {
+				let ver = v.u16v()
+				if ver == 0x0304 {
 					ch.tls13 = true
+				} else if ver == VersionTLS12 {
+					ch.tls12 = true
 				}
 			}
 			if v.bad {
@@ -134,6 +150,22 @@ fn parse_client_hello(body []u8) !clientHello {
 			}
 		} else if typ == extCookie {
 			ch.cookie = e.vec16()
+		} else if typ == extExtendedMasterSecret {
+			ch.ems = true
+		} else if typ == extRenegotiationInfo {
+			let ri = e.vec8()
+			if len(ri) != 0 {
+				fail alert_fault(alertHandshakeFailure, "renegotiation is not supported")
+			}
+			ch.renego = true
+		} else if typ == extECPointFormats {
+			ch.pointFormats = true
+			ch.uncompressed = false
+			for _, f in e.vec8() {
+				if f == 0 {
+					ch.uncompressed = true
+				}
+			}
 		} else if typ == extPSKModes {
 			let m = e.vec8()
 			for _, mode in m {
@@ -164,6 +196,9 @@ fn parse_client_hello(body []u8) !clientHello {
 	}
 	if exts.bad {
 		fail alert_fault(alertDecodeError, "malformed ClientHello extensions")
+	}
+	if !versions && legacy >= VersionTLS12 {
+		ch.tls12 = true
 	}
 	return ch
 }
@@ -251,7 +286,11 @@ fn (c mut Conn) server_handshake(cfg ServerConfig) ! {
 	}
 	let ch = try parse_client_hello(msg[4:])
 	if !ch.tls13 {
-		fail alert_fault(alertProtocolVersion, "the client does not offer TLS 1.3")
+		// A TLS 1.2 client (#473), unless this server requires 1.3.
+		if !ch.tls12 || cfg.MinVersion == VersionTLS13 {
+			fail alert_fault(alertProtocolVersion, "the client offers neither TLS 1.3 nor TLS 1.2")
+		}
+		return try c.server12(cfg, ch, msg, mut hr)
 	}
 	mut suite = 0
 	for _, s in suites() {
@@ -266,7 +305,7 @@ fn (c mut Conn) server_handshake(cfg ServerConfig) ! {
 	// The certificate: the default, or the one of Others the server name chooses (sni.tin).
 	mut chain = cfg.Certificates
 	mut key = cfg.Key
-	let which = credential_for(cfg, ch.name, ch.schemes)
+	let which = credential_for(cfg, ch.name, ch.schemes, pick_scheme)
 	if which >= 0 {
 		chain = cfg.Others[which].Chain
 		key = cfg.Others[which].Key
@@ -715,6 +754,10 @@ fn (c mut Conn) raw_alert(err fault) []u8 {
 // raw_key_update handles a KeyUpdate from the client (the only handshake message allowed
 // after the handshake) and returns the answer to send when it asks for one.
 fn (c mut Conn) raw_key_update(data []u8) ![]u8 {
+	if c.version == VersionTLS12 {
+		try refuse_renegotiation(data, false)
+		return []u8{}
+	}
 	if len(data) != 5 || data[0] != hsKeyUpdate || data[1] != 0 || data[2] != 0 || data[3] != 1 || data[4] > 1 {
 		fail alert_fault(alertUnexpectedMessage, "unexpected post-handshake message from the client")
 	}
@@ -731,7 +774,7 @@ fn (c mut Conn) raw_key_update(data []u8) ![]u8 {
 
 // SealRawSize is the most bytes SealRawTo writes for n bytes of application data.
 fn SealRawSize(n i64) i64 {
-	return n + (n/maxPlaintext+1)*22 + 64
+	return n + (n/maxPlaintext+1)*29 + 64 // 29: a TLS 1.2 GCM record's header, explicit nonce and tag
 }
 
 // SealRaw encrypts n bytes of application data at the raw address p into records (16 KiB
@@ -747,7 +790,7 @@ fn (c mut Conn) SealRaw(p i64, n i64) ![]u8 {
 // with n: an event loop seals into a buffer it reuses.
 fn (c mut Conn) SealRawTo(p i64, n i64, dst i64) !i64 {
 	mut o = 0
-	if c.wseq >= rekeyAfter {
+	if c.wseq >= rekeyAfter && c.version == VersionTLS13 {
 		let ku = make([]u8, 0, 32)
 		try c.seal_record(mut ku, ctHandshake, handshake_msg(hsKeyUpdate, []u8{0}))
 		memcpy(dst, cast(i64, ku)[2], len(ku))
@@ -758,6 +801,9 @@ fn (c mut Conn) SealRawTo(p i64, n i64, dst i64) !i64 {
 	let a = c.wr
 	if a == nil {
 		fail "tls: no write key yet"
+	}
+	if c.version == VersionTLS12 {
+		return try c.seal_raw12(a, p, n, dst)
 	}
 	for off in (0..n).step(maxPlaintext) {
 		mut m = n - off

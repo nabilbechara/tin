@@ -1151,6 +1151,38 @@ fn (c Certificate) CheckTLSSignature(scheme i64, signed []u8, sig []u8) ! {
 	fail say.Fault("x509: TLS signature scheme 0x%04x is not allowed in TLS 1.3", scheme)
 }
 
+// CheckTLS12Signature verifies a TLS 1.2 signature (ServerKeyExchange, a client's
+// CertificateVerify; #473) by c's key over signed. TLS 1.2 also allows RSA PKCS #1 v1.5
+// (0x0401, 0x0501, 0x0601), and its ECDSA schemes name only the hash, not the curve.
+fn (c Certificate) CheckTLS12Signature(scheme i64, signed []u8, sig []u8) ! {
+	mut h = Hash.SHA256
+	let hb = scheme >> 8
+	if scheme == 0x0805 || hb == 5 {
+		h = Hash.SHA384
+	} else if scheme == 0x0806 || hb == 6 {
+		h = Hash.SHA512
+	}
+	if scheme == 0x0401 || scheme == 0x0501 || scheme == 0x0601 {
+		if c.PublicKeyAlgorithm != PublicKeyAlgorithm.RSA {
+			fail "x509: TLS signature scheme does not match the certificate's key"
+		}
+		VerifyPKCS1v15(c.RSAKey, h, Sum(h, str(signed)), sig) catch err {
+			fail say.Fault("x509: bad TLS signature: %s", err)
+		}
+		return
+	}
+	if scheme == 0x0403 || scheme == 0x0503 || scheme == 0x0603 {
+		if c.PublicKeyAlgorithm != PublicKeyAlgorithm.ECDSA || (c.Curve != "P-256" && c.Curve != "P-384") {
+			fail "x509: TLS signature scheme does not match the certificate's key"
+		}
+		VerifyECDSA(c.Curve, c.PublicKey, Sum(h, str(signed)), sig) catch err {
+			fail say.Fault("x509: bad TLS signature: %s", err)
+		}
+		return
+	}
+	return try c.CheckTLSSignature(scheme, signed, sig)
+}
+
 // ---- Pools ----
 
 // CertPool is a set of certificates indexed by subject, used for roots and intermediates.

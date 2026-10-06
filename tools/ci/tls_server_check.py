@@ -156,16 +156,13 @@ def openssl_interop(openssl, exe, certs, work):
                 assert rc != 0 and 'alert number 120' in out, ('no common ALPN protocol', out[-1500:])
                 rc, out = s_client(openssl, srv.port, [], get('/info'))
                 assert 'alpn= suite=' in out, ('no ALPN offered', out[-1500:])
-                r = subprocess.run([openssl, 's_client', '-tls1_2', '-connect', srv.addr()], input=b'', capture_output=True, timeout=30)
-                out = (r.stdout + r.stderr).decode('latin1')
-                assert r.returncode != 0 and 'alert number 70' in out, ('TLS 1.2 only', out[-1500:])
                 keyupdate(openssl, srv)
                 watch_closed(openssl, srv)
         finally:
             srv.stop()
     print(f'PASS openssl s_client: {runs} handshakes (ECDSA P-256, ECDSA P-384 and RSA certificates verified by OpenSSL; '
           'every suite; X25519, P-256 and P-256 by HelloRetryRequest), RSA-PSS SHA-256/384/512, '
-          'handshake_failure, no_application_protocol and protocol_version refusals, client KeyUpdate, '
+          'handshake_failure and no_application_protocol refusals, client KeyUpdate, '
           'a stream sees the client\'s close_notify (Out.Closed)')
 
 
@@ -281,7 +278,7 @@ def python_clients(exe, certs, work):
         # read, no_application_protocol (120) and protocol_version (70). It is taken from the
         # records, because Python's name for an alert depends on the OpenSSL it was built with
         # (Ubuntu 24.04's has none for 120).
-        for ctx2, want in ((py_ctx(cert, alpn=['spdy/3']), 120), (py_ctx(cert, max12=True), 70)):
+        for ctx2, want in ((py_ctx(cert, alpn=['spdy/3']), 120),):
             alerts = []
 
             def seen(conn, direction, version, ctype, mtype, data, alerts=alerts):
@@ -298,7 +295,7 @@ def python_clients(exe, certs, work):
     finally:
         srv.stop()
     print('PASS Python ssl: GET, POST (1 MiB and chunked), 3 MB body, streamed and SendFile bodies on one keep-alive connection; '
-          'pipelining ended by close_notify; ALPN; no common protocol and a TLS 1.2 client refused; a ClientHello in 40-byte records')
+          'pipelining ended by close_notify; ALPN; no common protocol refused; a ClientHello in 40-byte records')
 
 
 def fragmented_hello(srv, cert):
@@ -509,6 +506,8 @@ def mtls(openssl, exe, client, certs, work):
         assert r.stdout == 'mtls false cn=alice chain=1 resumed=false\nmtls true cn=alice chain=1 resumed=true\n', r.stdout
         r = subprocess.run([str(client), 'mtls', srv.addr(), '1', str(cert[0])], capture_output=True, text=True, timeout=60)
         assert r.stdout == 'fault tls: remote error: certificate required\n', r.stdout
+        rc, out = s_client12(openssl, srv.port, [], get('/whoami'), cafile=cert[0])
+        assert 'alert number 40' in out and 'cn=' not in out, ('TLS 1.2 without a certificate', out[-1500:])
         # wire with client certificates: alice, then dave, then alice again; a kept connection is
         # never lent to the other identity.
         r = subprocess.run([str(client), 'wiremtls', f'https://localhost:{srv.port}/whoami', str(cert[0]),
@@ -535,6 +534,11 @@ def mtls(openssl, exe, client, certs, work):
         assert rc == 0 and 'cn=alice' in out, out[-1500:]
         rc, out = s_client(openssl, srv.port, who('mallory'), get('/whoami'), cafile=cert[0])
         assert 'alert number 48' in out and 'cn=' not in out, out[-1500:]
+        # Client certificates over TLS 1.2 (#473).
+        rc, out = s_client12(openssl, srv.port, who('alice'), get('/whoami'), cafile=cert[0])
+        assert 'New, TLSv1.2' in out and 'cn=alice' in out, out[-1500:]
+        rc, out = s_client12(openssl, srv.port, who('rsa'), get('/whoami'), cafile=cert[0])
+        assert 'New, TLSv1.2' in out and 'cn=rsa-client' in out, out[-1500:]
     finally:
         srv.stop()
     # A server without ClientCAs does not start.
@@ -542,7 +546,7 @@ def mtls(openssl, exe, client, certs, work):
                                             TLS_CLIENT_AUTH='2', TLS_CLIENT_CAS=str(cert[1])),
                        capture_output=True, text=True, timeout=30)
     assert p.returncode == 0 and 'server:' in p.stdout and 'ClientCAs' in p.stdout, p.stdout + p.stderr
-    print('PASS client certificates: openssl (ECDSA, Ed25519 and RSA keys), Python and the Tin client verified; a resumed session keeps '
+    print('PASS client certificates: openssl (ECDSA, Ed25519 and RSA keys; TLS 1.3 and 1.2), Python and the Tin client verified; a resumed session keeps '
           'the identity; certificate_required, bad_certificate (server-only usage), certificate_expired and unknown_ca '
           'refusals; RequestClientCert serves a client without one; ClientCAs without a certificate fail at start')
 
@@ -651,6 +655,129 @@ def sni_reload(openssl, exe, certs, work):
     print('PASS server names: exact, wildcard, unknown and no SNI choose their certificate, an RSA-only client gets the RSA '
           'one; three reloads under handshake load fail none and switch the set, a mismatched pair is refused; a renewed '
           'certificate file is served within the check interval and a broken one is refused')
+
+
+# ---- TLS 1.2 (#473) ----
+
+SUITES12 = {'ecdsa': ['ECDHE-ECDSA-AES128-GCM-SHA256', 'ECDHE-ECDSA-AES256-GCM-SHA384', 'ECDHE-ECDSA-CHACHA20-POLY1305'],
+            'rsa': ['ECDHE-RSA-AES128-GCM-SHA256', 'ECDHE-RSA-AES256-GCM-SHA384', 'ECDHE-RSA-CHACHA20-POLY1305']}
+
+
+def s_client12(openssl, port, args, request, cafile=None, timeout=30):
+    """s_client with TLS 1.2 only: (exit code, output)."""
+    cmd = [openssl, 's_client', '-tls1_2', '-connect', f'127.0.0.1:{port}', '-servername', 'localhost', '-ign_eof', *args]
+    if cafile:
+        cmd += ['-CAfile', str(cafile), '-verify_hostname', 'localhost', '-verify_return_error']
+    r = subprocess.run(cmd, input=request, capture_output=True, timeout=timeout)
+    return r.returncode, r.stdout.decode('latin1') + r.stderr.decode('latin1')
+
+
+def strip13_proxy(target):
+    """A TCP proxy that rewrites the first ClientHello's supported_versions from (1.3, 1.2) to
+    (1.2, 1.2), as an attacker forcing TLS 1.2 would: returns its port."""
+    ls = socket.socket()
+    ls.bind(('127.0.0.1', 0))
+    ls.listen(4)
+
+    def pump(a, b):
+        try:
+            while True:
+                d = a.recv(65536)
+                if not d:
+                    break
+                b.sendall(d)
+        except OSError:
+            pass
+        for s in (a, b):
+            try:
+                s.close()
+            except OSError:
+                pass
+
+    def serve():
+        c, _ = ls.accept()
+        u = socket.create_connection(('127.0.0.1', target))
+        hello = c.recv(65536)
+        u.sendall(hello.replace(bytes.fromhex('002b0005040304 0303'.replace(' ', '')), bytes.fromhex('002b00050403030303')))
+        threading.Thread(target=pump, args=(u, c), daemon=True).start()
+        pump(c, u)
+
+    threading.Thread(target=serve, daemon=True).start()
+    return ls.getsockname()[1]
+
+
+def tls12_server(openssl, exe, client, certs, work):
+    runs = 0
+    for kind in ('ecdsa', 'ecdsa384', 'rsa'):
+        cert = certs[kind]
+        srv = Server(exe, cert, work)
+        try:
+            for cipher in SUITES12['rsa' if kind == 'rsa' else 'ecdsa']:
+                # TLS 1.2 also needs the certificate's curve among the groups (RFC 8422).
+                for groups, temp in (('X25519:P-256:P-384', r'X25519'), ('P-256:P-384', r'ECDH, (?:prime256v1|P-256)')):
+                    rc, out = s_client12(openssl, srv.port, ['-cipher', cipher, '-groups', groups], get('/fast'), cafile=cert[0])
+                    # OpenSSL 3.0 labels the line "Server Temp Key", 3.2 and later "Peer Temp Key".
+                    assert f'New, TLSv1.2, Cipher is {cipher}' in out and '\r\n\r\nfast' in out and \
+                        'Verify return code: 0 (ok)' in out and re.search(rf'(?:Peer|Server) Temp Key: {temp}\b', out), (kind, cipher, groups, out[-1500:])
+                    runs += 1
+            if kind == 'rsa':
+                rc, out = s_client12(openssl, srv.port, ['-sigalgs', 'RSA+SHA256'], get('/fast'), cafile=cert[0])
+                # OpenSSL 3.0 names PKCS #1 v1.5 "RSA" (RSA-PSS is "RSA-PSS"), 3.2 and later "rsa_pkcs1_sha256".
+                assert '\r\n\r\nfast' in out and re.search(r'Peer signature type: (?:rsa_pkcs1_sha256|RSA)\s*$', out, re.M), ('PKCS #1 v1.5', out[-1500:])
+            if kind == 'ecdsa':
+                r = subprocess.run([openssl, 's_client', '-tls1_2', '-connect', f'127.0.0.1:{srv.port}', '-alpn', 'h2'],
+                                   input=b'', capture_output=True, timeout=30)
+                out = (r.stdout + r.stderr).decode('latin1')
+                assert 'ALPN protocol: h2' in out and re.search(r'Protocol\s*: TLSv1.2', out), ('h2 over TLS 1.2', out[-1500:])
+                for cipher in ('ECDHE-ECDSA-AES128-SHA256', 'AES128-GCM-SHA256'):
+                    rc, out = s_client12(openssl, srv.port, ['-cipher', cipher], get('/fast'))
+                    assert rc != 0 and 'alert number 40' in out, (cipher, out[-1500:])
+                if PY_TLS13:
+                    s = py_connect(srv, py_ctx(cert, max12=True))
+                    assert s.version() == 'TLSv1.2', s.version()
+                    s.sendall(get('/fast'))
+                    assert read_to_close(s).endswith(b'fast'), 'Python over TLS 1.2'
+                    s.close()
+                # A client's renegotiation (s_client's R command) is refused with no_renegotiation.
+                p = subprocess.Popen([openssl, 's_client', '-tls1_2', '-connect', f'127.0.0.1:{srv.port}'],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                p.stdin.write(b'R\n')
+                p.stdin.flush()
+                time.sleep(1)
+                p.stdin.close()
+                p.wait(timeout=30)
+                out = p.stdout.read().decode('latin1')
+                assert 'RENEGOTIATING' in out and 'alert number 100' in out, ('renegotiation', out[-1500:])
+                # The Tin client, offering 1.3, through a proxy that strips it: the server's
+                # downgrade sentinel ends the handshake.
+                port = strip13_proxy(srv.port)
+                r = subprocess.run([str(client), 'get', f'127.0.0.1:{port}'], capture_output=True, text=True, timeout=30)
+                assert r.stdout.startswith('fault tls: downgrade to TLS 1.2 detected'), r.stdout
+        finally:
+            srv.stop()
+    # An Ed25519 certificate in TLS 1.2 (ECDHE-ECDSA suites, RFC 8422).
+    srv = Server(exe, certs['ed25519'], work)
+    try:
+        rc, out = s_client12(openssl, srv.port, [], get('/fast'), cafile=certs['ed25519'][0])
+        assert 'New, TLSv1.2' in out and '\r\n\r\nfast' in out and 'peer signature type: ed25519' in out.lower(), out[-1500:]
+    finally:
+        srv.stop()
+    # A server that requires TLS 1.3 refuses a TLS 1.2 client with protocol_version.
+    srv = Server(exe, certs['ecdsa'], work, env={'TLS_MIN13': '1'})
+    try:
+        rc, out = s_client12(openssl, srv.port, [], get('/fast'))
+        assert rc != 0 and 'alert number 70' in out, out[-1500:]
+        if PY_TLS13:
+            try:
+                py_connect(srv, py_ctx(certs['ecdsa'], max12=True)).close()
+                raise AssertionError('a TLS 1.2 client was served by a 1.3-only server')
+            except ssl.SSLError:
+                pass
+    finally:
+        srv.stop()
+    print(f'PASS TLS 1.2: {runs} openssl -tls1_2 handshakes (every suite on ECDSA P-256, P-384 and RSA certificates, '
+          'X25519 and P-256), RSA PKCS #1 v1.5 and Ed25519 signatures, h2 by ALPN, CBC and RSA key exchange refused, '
+          'Python, renegotiation refused, the downgrade sentinel stops a stripped ClientHello, MinVersion 1.3 refuses 1.2')
 
 
 # ---- malformed handshakes and timeouts ----
@@ -875,11 +1002,14 @@ def server_keylog(openssl, exe, certs, work):
     try:
         rc, out = s_client(openssl, srv.port, ['-keylogfile', str(theirs)], get('/fast'))
         assert rc == 0 and '\r\n\r\nfast' in out, out[-1500:]
+        # TLS 1.2 (#473): one CLIENT_RANDOM line with the master secret.
+        rc, out = s_client12(openssl, srv.port, ['-keylogfile', str(theirs)], get('/fast'))
+        assert rc == 0 and '\r\n\r\nfast' in out, out[-1500:]
     finally:
         srv.stop()
     a, b = keylog_lines(mine), keylog_lines(theirs)
-    assert len(a) == 4 and a == b, (a, b)
-    print('PASS SSLKEYLOGFILE: anvil logs the four TLS 1.3 traffic secrets openssl s_client logs for the connection')
+    assert len(a) == 5 and a == b, (a, b)
+    print('PASS SSLKEYLOGFILE: anvil logs the four TLS 1.3 traffic secrets and the TLS 1.2 CLIENT_RANDOM line openssl s_client logs')
 
 
 def bad_config(exe, certs, work):
@@ -937,6 +1067,7 @@ def main():
         tin_clients(exe, client, certs, work)
         resumption(openssl, exe, client, certs, work)
         mtls(openssl, exe, client, certs, work)
+        tls12_server(openssl, exe, client, certs, work)
         sni_reload(openssl, exe, certs, work)
         malformed(exe, client, certs, work)
         one_core(exe, client, certs, work)
