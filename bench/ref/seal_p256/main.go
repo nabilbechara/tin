@@ -1,4 +1,4 @@
-// Go twin of tests/v2/seal_p256.tin.
+// Go twin of toolchain/tests/v2/seal_p256.tin.
 package main
 
 import (

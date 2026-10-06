@@ -1,4 +1,4 @@
-// Go reference for tests/v2/bits.tin: prints the same lines through math/bits. Generated with that file.
+// Go reference for toolchain/tests/v2/bits.tin: prints the same lines through math/bits. Generated with that file.
 package main
 
 import (

@@ -1,0 +1,1066 @@
+package main
+
+import "fault"
+import "hearth"
+import "kafka"
+import "mint"
+import "quarry"
+import "relay"
+import "say"
+import "stamp"
+import "wire"
+
+// The Kafka client against a fake cluster in the same process, so CI needs no Kafka: brokers 1
+// to 4 run on cores 1 to 4 (each a server written here from the protocol's schemas, not from the
+// client's code), the client on core 0. The fakes inject what a real cluster does now
+// and then: a leader that has moved (broker 2), an acknowledgement lost after the write (broker
+// 3: the idempotent retry must not duplicate the batch), a broker too old for a request (broker
+// 4), a member id the coordinator makes the member come back with, a rebalance, a wrong
+// password. The same client is checked against real brokers in toolchain/tests/kafka/.
+
+// ---- encoding ----
+
+fn p8(b mut []u8, v i64) {
+	b = append(b, u8(v))
+}
+
+fn p16(b mut []u8, v i64) {
+	b = append(b, u8(v>>8), u8(v))
+}
+
+fn p32(b mut []u8, v i64) {
+	b = append(b, u8(v>>24), u8(v>>16), u8(v>>8), u8(v))
+}
+
+fn p64(b mut []u8, v i64) {
+	p32(mut b, v>>32)
+	p32(mut b, v)
+}
+
+fn pstr(b mut []u8, s str) {
+	p16(mut b, len(s))
+	b = append(b, s...)
+}
+
+fn pnull(b mut []u8) {
+	p16(mut b, -1)
+}
+
+fn pbytes(b mut []u8, s str) {
+	p32(mut b, len(s))
+	b = append(b, s...)
+}
+
+// ---- decoding ----
+
+type rd struct {
+	s   str
+	pos i64
+}
+
+fn (r mut rd) u(n i64) i64 {
+	mut v = 0
+	for k in 0..n {
+		v = (v << 8) | i64(r.s[r.pos+k])
+	}
+	r.pos += n
+	return v
+}
+
+fn (r mut rd) i8() i64 {
+	let v = r.u(1)
+	if v >= 128 {
+		return v - 256
+	}
+	return v
+}
+
+fn (r mut rd) i16() i64 {
+	let v = r.u(2)
+	if v >= 32768 {
+		return v - 65536
+	}
+	return v
+}
+
+fn (r mut rd) i32() i64 {
+	let v = r.u(4)
+	if v >= 2147483648 {
+		return v - 4294967296
+	}
+	return v
+}
+
+fn (r mut rd) i64() i64 {
+	let hi = r.i32()
+	let lo = r.u(4)
+	return (hi << 32) | lo
+}
+
+fn (r mut rd) str() str {
+	let n = r.i16()
+	if n < 0 {
+		return ""
+	}
+	let s = r.s[r.pos : r.pos+n]
+	r.pos += n
+	return s
+}
+
+fn (r mut rd) bytes() str {
+	let n = r.i32()
+	if n < 0 {
+		return ""
+	}
+	let s = r.s[r.pos : r.pos+n]
+	r.pos += n
+	return s
+}
+
+fn be32(s str, at i64) i64 {
+	mut r = rd{s: s, pos: at}
+	return r.i32()
+}
+
+fn be64(s str, at i64) i64 {
+	mut r = rd{s: s, pos: at}
+	return r.i64()
+}
+
+// ---- the cluster ----
+
+// Topics and their leaders (the same on every broker): t has partitions led by brokers 1, 2
+// and 3, old is led by broker 4, tx and the group's topic g by brokers 1 and 2.
+fn layout() []str {
+	return []str{"t", "old", "tx", "g"}
+}
+
+fn leaders(topic str) []i64 {
+	if topic == "t" {
+		return []i64{1, 2, 3}
+	}
+	if topic == "old" {
+		return []i64{4}
+	}
+	if topic == "tx" {
+		return []i64{1}
+	}
+	if topic == "g" {
+		return []i64{1, 2}
+	}
+	return []i64{}
+}
+
+type partLog struct {
+	topic   str
+	part    i64
+	batches []str // stored batches, base offsets rewritten
+	next    i64
+	start   i64
+	aborted []i64 // pid, first offset, pid, first offset, ...
+}
+
+type broker struct {
+	id         i64
+	ports      []i64
+	logs       []partLog
+	seqs       []i64 // pid, partition key index, next sequence, ...
+	produces   i64
+	groupGen   i64
+	beats      i64
+	member     str
+	assignment str
+	commits    []str // "topic/partition" ...
+	commitOffs []i64
+	nextPid    i64
+	txFirst    i64 // first offset of the open transaction in tx/0, -1 for none
+	txPid      i64
+	authed     bool
+}
+
+fn (b mut broker) logIndex(topic str, part i64) i64 {
+	for i, l in b.logs {
+		if l.topic == topic && l.part == part {
+			return i
+		}
+	}
+	b.logs = append(b.logs, partLog{topic: topic, part: part, batches: []str{}, next: 0, start: 0, aborted: []i64{}})
+	return len(b.logs) - 1
+}
+
+// append stores a batch at the end of a partition's log and returns its base offset.
+fn (b mut broker) store(i i64, batch str) i64 {
+	let base = b.logs[i].next
+	let n = be32(batch, 57) // record count
+	mut out = make([]u8, 0, len(batch))
+	p64(mut out, base)
+	out = append(out, batch[8:]...)
+	b.logs[i].batches = append(b.logs[i].batches, str(out))
+	b.logs[i].next = base + n
+	return base
+}
+
+// controlBatch is a transaction marker (commit or abort) of pid at offset.
+fn controlBatch(pid i64, commit bool) str {
+	mut rec = make([]u8, 0, 32)
+	// One record: key = version 0 + type (0 abort, 1 commit), value = version 0 + coordinator epoch 0.
+	mut key = make([]u8, 0, 4)
+	p16(mut key, 0)
+	if commit {
+		p16(mut key, 1)
+	} else {
+		p16(mut key, 0)
+	}
+	mut val = make([]u8, 0, 6)
+	p16(mut val, 0)
+	p32(mut val, 0)
+	mut body = make([]u8, 0, 32)
+	body = append(body, 0, 0, 0) // attributes, timestamp delta 0, offset delta 0 (varints)
+	body = append(body, u8(len(key)*2))
+	body = append(body, key...)
+	body = append(body, u8(len(val)*2))
+	body = append(body, val...)
+	body = append(body, 0) // no headers
+	rec = append(rec, u8(len(body)*2))
+	rec = append(rec, body...)
+	mut after = make([]u8, 0, 64)
+	p16(mut after, 0x30) // transactional, control
+	p32(mut after, 0)
+	p64(mut after, 0)
+	p64(mut after, 0)
+	p64(mut after, pid)
+	p16(mut after, 0)
+	p32(mut after, -1)
+	p32(mut after, 1)
+	after = append(after, rec...)
+	mut b = make([]u8, 0, 80)
+	p64(mut b, 0)
+	p32(mut b, len(after)+9)
+	p32(mut b, 0)
+	p8(mut b, 2)
+	p32(mut b, i64(stamp.Crc32C(str(after))))
+	b = append(b, after...)
+	return str(b)
+}
+
+// ---- serving ----
+
+fn serve(id i64) ! {
+	let ln = try wire.Listen("127.0.0.1:0")
+	relay.Send(0, "{id} {ln.Port()}")
+	let (_, all) = relay.Recv()
+	mut ports = []i64{0}
+	mut cur = 0
+	for k in 0..len(all) {
+		if all[k] == ' ' {
+			ports = append(ports, cur)
+			cur = 0
+		} else {
+			cur = cur*10 + i64(all[k]-'0')
+		}
+	}
+	ports = append(ports, cur)
+	mut b = broker{id: id, ports: ports, logs: []partLog{}, seqs: []i64{}, produces: 0, groupGen: 0, beats: 0, member: "", assignment: "", commits: []str{}, commitOffs: []i64{}, nextPid: 1000 + 100*id, txFirst: -1, txPid: -1, authed: false}
+	// The client keeps two connections to a broker (one for requests a broker may hold), so a
+	// broker serves several: it polls each with a short timeout and takes new ones in between.
+	mut conns = []wire.Conn{}
+	mut pending = []str{}
+	mut authed = []bool{}
+	for {
+		let (nc, aerr) = ln.AcceptTimeout(1ms)
+		if aerr == nil {
+			mut c2 = nc
+			c2.SetTimeout(1ms)
+			conns = append(conns, c2)
+			pending = append(pending, "")
+			authed = append(authed, false)
+		}
+		mut live = make([]bool, len(conns))
+		for i in 0..len(conns) {
+			live[i] = true
+			mut cn = conns[i]
+			mut buf = make([]u8, 0, 65536)
+			let (k, rerr) = cn.Read(mut buf, 65536)
+			if rerr != nil {
+				if !contains("{rerr}", "timed out") {
+					live[i] = false
+				}
+				continue
+			}
+			pending[i] = pending[i] + str(buf)
+			for live[i] && len(pending[i]) >= 4 && len(pending[i]) >= 4+be32(pending[i], 0) {
+				let n = be32(pending[i], 0)
+				let frame = pending[i][4 : 4+n]
+				pending[i] = pending[i][4+n:]
+				b.authed = authed[i]
+				let (resp, keepOpen) = handle(mut b, frame)
+				authed[i] = b.authed
+				if len(resp) > 0 {
+					mut out = make([]u8, 0, len(resp)+4)
+					p32(mut out, len(resp))
+					out = append(out, resp...)
+					cn.SetTimeout(5s)
+					let werr = cn.Write(str(out))
+					cn.SetTimeout(1ms)
+					if werr != nil {
+						live[i] = false
+					}
+				}
+				if !keepOpen {
+					live[i] = false
+				}
+			}
+		}
+		mut keepC = []wire.Conn{}
+		mut keepP = []str{}
+		mut keepA = []bool{}
+		for i in 0..len(conns) {
+			if live[i] {
+				keepC = append(keepC, conns[i])
+				keepP = append(keepP, pending[i])
+				keepA = append(keepA, authed[i])
+			} else {
+				mut dead = conns[i]
+				dead.Close()
+			}
+		}
+		conns = keepC
+		pending = keepP
+		authed = keepA
+	}
+}
+
+// handle answers one request; it returns the response (empty for none) and whether the
+// connection stays open.
+fn handle(b mut broker, frame str) (str, bool) {
+	mut r = rd{s: frame, pos: 0}
+	let api = r.i16()
+	let ver = r.i16()
+	let corr = r.i32()
+	r.str() // client id
+	mut out = make([]u8, 0, 256)
+	p32(mut out, corr)
+	if api == 18 {
+		// ApiVersions: broker 4 is "old" and speaks Produce only up to version 5.
+		p16(mut out, 0)
+		let apis = []i64{0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 24, 25, 26, 28, 32, 36, 37, 42, 44}
+		p32(mut out, len(apis))
+		for _, a in apis {
+			p16(mut out, a)
+			p16(mut out, 0)
+			if a == 0 && b.id == 4 {
+				p16(mut out, 5)
+			} else {
+				p16(mut out, 12)
+			}
+		}
+		p32(mut out, 0)
+		return str(out), true
+	}
+	if api == 17 {
+		let mech = r.str()
+		if mech == "PLAIN" {
+			p16(mut out, 0)
+		} else {
+			p16(mut out, 33)
+		}
+		p32(mut out, 1)
+		pstr(mut out, "PLAIN")
+		return str(out), true
+	}
+	if api == 36 {
+		let tok = r.bytes()
+		if tok == "\x00tin\x00secret" {
+			b.authed = true
+			p16(mut out, 0)
+			pnull(mut out)
+			pbytes(mut out, "")
+			p64(mut out, 0)
+			return str(out), true
+		}
+		p16(mut out, 58)
+		pstr(mut out, "Authentication failed: Invalid username or password")
+		pbytes(mut out, "")
+		p64(mut out, 0)
+		return str(out), false
+	}
+	if !b.authed {
+		// Kafka closes a connection that sends anything else before authenticating.
+		return "", false
+	}
+	if api == 3 {
+		return metadata(mut b, mut r, out), true
+	}
+	if api == 0 {
+		return produce(mut b, mut r, out)
+	}
+	if api == 1 {
+		return fetch(mut b, mut r, out), true
+	}
+	if api == 2 {
+		return listOffsets(mut b, mut r, out), true
+	}
+	if api == 10 {
+		r.str()
+		r.i8()
+		p32(mut out, 0)
+		p16(mut out, 0)
+		pnull(mut out)
+		p32(mut out, 1)
+		pstr(mut out, "127.0.0.1")
+		p32(mut out, b.ports[1])
+		return str(out), true
+	}
+	if api == 11 || api == 14 || api == 12 || api == 13 || api == 8 || api == 9 {
+		return group(mut b, api, mut r, out), true
+	}
+	if api == 22 || api == 24 || api == 26 {
+		return txn(mut b, api, mut r, out), true
+	}
+	if api == 19 {
+		p32(mut out, 0)
+		let n = r.i32()
+		p32(mut out, n)
+		for i in 0..n {
+			let name = r.str()
+			r.i32()
+			r.i16()
+			let na = r.i32()
+			for k in 0..na {
+				r.i32()
+				let nb = r.i32()
+				r.pos += 4 * nb
+			}
+			let nc = r.i32()
+			for k in 0..nc {
+				r.str()
+				r.str()
+			}
+			pstr(mut out, name)
+			if len(leaders(name)) > 0 {
+				p16(mut out, 36)
+				pstr(mut out, "Topic '{name}' already exists.")
+			} else {
+				p16(mut out, 0)
+				pnull(mut out)
+			}
+		}
+		return str(out), true
+	}
+	// Anything else: an error the client reports.
+	p32(mut out, 0)
+	p16(mut out, 35)
+	return str(out), true
+}
+
+fn metadata(b mut broker, r mut rd, head []u8) str {
+	mut out = make([]u8, 0, 256)
+	out = append(out, head...)
+	let n = r.i32()
+	mut asked = []str{}
+	if n < 0 {
+		asked = layout()
+	} else {
+		for i in 0..n {
+			asked = append(asked, r.str())
+		}
+	}
+	p32(mut out, 0)
+	p32(mut out, 4)
+	for i in 1..5 {
+		p32(mut out, i)
+		pstr(mut out, "127.0.0.1")
+		p32(mut out, b.ports[i])
+		pnull(mut out)
+	}
+	pnull(mut out)
+	p32(mut out, 1)
+	p32(mut out, len(asked))
+	for _, t in asked {
+		let ls = leaders(t)
+		if len(ls) == 0 {
+			p16(mut out, 3)
+		} else {
+			p16(mut out, 0)
+		}
+		pstr(mut out, t)
+		p8(mut out, 0)
+		p32(mut out, len(ls))
+		for i, l in ls {
+			p16(mut out, 0)
+			p32(mut out, i)
+			p32(mut out, l)
+			p32(mut out, 0)
+			p32(mut out, 1)
+			p32(mut out, l)
+			p32(mut out, 1)
+			p32(mut out, l)
+			p32(mut out, 0)
+		}
+	}
+	return str(out)
+}
+
+fn produce(b mut broker, r mut rd, head []u8) (str, bool) {
+	mut out = make([]u8, 0, 256)
+	out = append(out, head...)
+	r.str() // transactional id
+	let acks = r.i16()
+	r.i32()
+	let nt = r.i32()
+	mut lostAck = false
+	p32(mut out, nt)
+	for i in 0..nt {
+		let topic = r.str()
+		let np = r.i32()
+		pstr(mut out, topic)
+		p32(mut out, np)
+		for j in 0..np {
+			let part = r.i32()
+			let batch = r.bytes()
+			p32(mut out, part)
+			b.produces += 1
+			// Broker 2 refuses the first produce: its leadership "moved" (the metadata still
+			// names it, as a real cluster's does once the election settles).
+			if b.id == 2 && b.produces == 1 {
+				p16(mut out, 6)
+				p64(mut out, -1)
+				p64(mut out, -1)
+				p64(mut out, 0)
+				continue
+			}
+			// The batch's producer id, sequence and record count.
+			let pid = be64(batch, 43)
+			let seq = be32(batch, 53)
+			let count = be32(batch, 57)
+			let li = b.logIndex(topic, part)
+			if pid >= 0 {
+				mut expect = 0
+				mut at = -1
+				for k in 0..len(b.seqs)/3 {
+					if b.seqs[3*k] == pid && b.seqs[3*k+1] == li {
+						expect = b.seqs[3*k+2]
+						at = k
+					}
+				}
+				if seq < expect {
+					p16(mut out, 46)
+					p64(mut out, -1)
+					p64(mut out, -1)
+					p64(mut out, 0)
+					continue
+				}
+				if seq > expect {
+					p16(mut out, 45)
+					p64(mut out, -1)
+					p64(mut out, -1)
+					p64(mut out, 0)
+					continue
+				}
+				if at < 0 {
+					b.seqs = append(b.seqs, pid, li, seq+count)
+				} else {
+					b.seqs[3*at+2] = seq + count
+				}
+			}
+			let attrs = be32(batch, 21) >> 16
+			if topic == "tx" && attrs & 0x10 != 0 && b.txFirst < 0 {
+				b.txFirst = b.logs[li].next
+				b.txPid = pid
+			}
+			let base = b.store(li, batch)
+			p16(mut out, 0)
+			p64(mut out, base)
+			p64(mut out, -1)
+			p64(mut out, 0)
+			// Broker 3 writes its second batch and loses the acknowledgement.
+			if b.id == 3 && b.produces == 2 {
+				lostAck = true
+			}
+		}
+	}
+	p32(mut out, 0)
+	if lostAck {
+		return "", false
+	}
+	if acks == 0 {
+		return "", true
+	}
+	return str(out), true
+}
+
+fn fetch(b mut broker, r mut rd, head []u8) str {
+	mut out = make([]u8, 0, 256)
+	out = append(out, head...)
+	r.i32()
+	r.i32()
+	r.i32()
+	r.i32()
+	r.i8()
+	r.i32()
+	r.i32()
+	p32(mut out, 0)
+	p16(mut out, 0)
+	p32(mut out, 0)
+	let nt = r.i32()
+	p32(mut out, nt)
+	for i in 0..nt {
+		let topic = r.str()
+		let np = r.i32()
+		pstr(mut out, topic)
+		p32(mut out, np)
+		for j in 0..np {
+			let part = r.i32()
+			r.i32()
+			let off = r.i64()
+			r.i64()
+			r.i32()
+			let li = b.logIndex(topic, part)
+			let l = b.logs[li]
+			p32(mut out, part)
+			if off < l.start || off > l.next {
+				p16(mut out, 1)
+			} else {
+				p16(mut out, 0)
+			}
+			p64(mut out, l.next)
+			p64(mut out, l.next)
+			p64(mut out, l.start)
+			p32(mut out, len(l.aborted)/2)
+			for k in 0..len(l.aborted)/2 {
+				p64(mut out, l.aborted[2*k])
+				p64(mut out, l.aborted[2*k+1])
+			}
+			mut data = make([]u8, 0, 256)
+			if off >= l.start && off <= l.next {
+				for _, bt in l.batches {
+					let base = be64(bt, 0)
+					let last = base + be32(bt, 23)
+					if last >= off {
+						data = append(data, bt...)
+					}
+				}
+			}
+			pbytes(mut out, str(data))
+		}
+	}
+	return str(out)
+}
+
+fn listOffsets(b mut broker, r mut rd, head []u8) str {
+	mut out = make([]u8, 0, 256)
+	out = append(out, head...)
+	r.i32()
+	r.i8()
+	p32(mut out, 0)
+	let nt = r.i32()
+	p32(mut out, nt)
+	for i in 0..nt {
+		let topic = r.str()
+		let np = r.i32()
+		pstr(mut out, topic)
+		p32(mut out, np)
+		for j in 0..np {
+			let part = r.i32()
+			r.i32()
+			let ts = r.i64()
+			let l = b.logs[b.logIndex(topic, part)]
+			mut off = -1
+			if ts == -2 {
+				off = l.start
+			} else if ts == -1 {
+				off = l.next
+			} else {
+				for _, bt in l.batches {
+					if off < 0 && be64(bt, 35) >= ts {
+						off = be64(bt, 0)
+					}
+				}
+			}
+			p32(mut out, part)
+			p16(mut out, 0)
+			p64(mut out, -1)
+			p64(mut out, off)
+			p32(mut out, 0)
+		}
+	}
+	return str(out)
+}
+
+// group serves the one group of the test, coordinated by broker 1.
+fn group(b mut broker, api i64, r mut rd, head []u8) str {
+	mut out = make([]u8, 0, 256)
+	out = append(out, head...)
+	if api == 11 {
+		r.str()
+		r.i32()
+		r.i32()
+		let member = r.str()
+		r.str()
+		r.str()
+		let np = r.i32()
+		mut proto = ""
+		mut meta = ""
+		for i in 0..np {
+			let name = r.str()
+			let m = r.bytes()
+			if i == 0 {
+				proto = name
+				meta = m
+			}
+		}
+		p32(mut out, 0)
+		if member == "" {
+			// The coordinator makes the member come back with an id.
+			p16(mut out, 79)
+			p32(mut out, -1)
+			pstr(mut out, "")
+			pstr(mut out, "")
+			pstr(mut out, "member-1")
+			p32(mut out, 0)
+			return str(out)
+		}
+		b.groupGen += 1
+		b.member = member
+		p16(mut out, 0)
+		p32(mut out, b.groupGen)
+		pstr(mut out, proto)
+		pstr(mut out, member)
+		pstr(mut out, member)
+		p32(mut out, 1)
+		pstr(mut out, member)
+		pnull(mut out)
+		pbytes(mut out, meta)
+		return str(out)
+	}
+	if api == 14 {
+		r.str()
+		let gen = r.i32()
+		r.str()
+		r.str()
+		let na = r.i32()
+		for i in 0..na {
+			r.str()
+			let a = r.bytes()
+			b.assignment = a
+		}
+		p32(mut out, 0)
+		if gen != b.groupGen {
+			p16(mut out, 22)
+		} else {
+			p16(mut out, 0)
+		}
+		pbytes(mut out, b.assignment)
+		return str(out)
+	}
+	if api == 12 {
+		r.str()
+		let gen = r.i32()
+		b.beats += 1
+		p32(mut out, 0)
+		// The second heartbeat finds the group rebalancing.
+		if b.beats == 2 {
+			p16(mut out, 27)
+		} else if gen != b.groupGen {
+			p16(mut out, 22)
+		} else {
+			p16(mut out, 0)
+		}
+		return str(out)
+	}
+	if api == 13 {
+		r.str()
+		let n = r.i32()
+		p32(mut out, 0)
+		p16(mut out, 0)
+		p32(mut out, n)
+		for i in 0..n {
+			let m = r.str()
+			r.str()
+			pstr(mut out, m)
+			pnull(mut out)
+			p16(mut out, 0)
+		}
+		b.member = ""
+		return str(out)
+	}
+	if api == 8 {
+		r.str()
+		let gen = r.i32()
+		r.str()
+		r.str()
+		p32(mut out, 0)
+		let nt = r.i32()
+		p32(mut out, nt)
+		for i in 0..nt {
+			let topic = r.str()
+			let np = r.i32()
+			pstr(mut out, topic)
+			p32(mut out, np)
+			for j in 0..np {
+				let part = r.i32()
+				let off = r.i64()
+				r.i32()
+				r.str()
+				p32(mut out, part)
+				if gen != -1 && gen != b.groupGen {
+					p16(mut out, 22)
+					continue
+				}
+				let key = "{topic}/{part}"
+				mut found = false
+				for k, c in b.commits {
+					if c == key {
+						b.commitOffs[k] = off
+						found = true
+					}
+				}
+				if !found {
+					b.commits = append(b.commits, key)
+					b.commitOffs = append(b.commitOffs, off)
+				}
+				p16(mut out, 0)
+			}
+		}
+		return str(out)
+	}
+	// OffsetFetch.
+	r.str()
+	p32(mut out, 0)
+	let nt = r.i32()
+	p32(mut out, nt)
+	for i in 0..nt {
+		let topic = r.str()
+		let np = r.i32()
+		pstr(mut out, topic)
+		p32(mut out, np)
+		for j in 0..np {
+			let part = r.i32()
+			mut off = -1
+			for k, c in b.commits {
+				if c == "{topic}/{part}" {
+					off = b.commitOffs[k]
+				}
+			}
+			p32(mut out, part)
+			p64(mut out, off)
+			p32(mut out, -1)
+			pnull(mut out)
+			p16(mut out, 0)
+		}
+	}
+	p16(mut out, 0)
+	return str(out)
+}
+
+// txn serves transactions of tx/0 (broker 1 is both coordinator and leader).
+fn txn(b mut broker, api i64, r mut rd, head []u8) str {
+	mut out = make([]u8, 0, 256)
+	out = append(out, head...)
+	p32(mut out, 0)
+	if api == 22 {
+		r.str()
+		r.i32()
+		b.nextPid += 1
+		p16(mut out, 0)
+		p64(mut out, b.nextPid)
+		p16(mut out, 0)
+		return str(out)
+	}
+	if api == 24 {
+		r.str()
+		r.i64()
+		r.i16()
+		let nt = r.i32()
+		p32(mut out, nt)
+		for i in 0..nt {
+			let topic = r.str()
+			let ps = r.i32()
+			pstr(mut out, topic)
+			p32(mut out, ps)
+			for k in 0..ps {
+				p32(mut out, r.i32())
+				p16(mut out, 0)
+			}
+		}
+		return str(out)
+	}
+	// EndTxn: write the marker; an abort lists the transaction as aborted.
+	r.str()
+	let pid = r.i64()
+	r.i16()
+	let commit = r.i8() != 0
+	let li = b.logIndex("tx", 0)
+	if b.txFirst >= 0 && !commit {
+		b.logs[li].aborted = append(b.logs[li].aborted, pid, b.txFirst)
+	}
+	b.store(li, controlBatch(pid, commit))
+	b.txFirst = -1
+	p16(mut out, 0)
+	return str(out)
+}
+
+// ---- the client's side ----
+
+fn check(label str, cond bool) {
+	if cond {
+		say.Line("ok", label)
+	} else {
+		say.Line("FAIL", label)
+	}
+}
+
+fn msg(v str) kafka.Message {
+	return kafka.Message{Key: "", Value: v, Headers: []kafka.Header{}, Timestamp: 0}
+}
+
+fn run(ports str) ! {
+	let boot = "127.0.0.1:" + ports[:index(ports, ' ')]
+	// A wrong password is ErrAuth.
+	let wrong = kafka.Open(kafka.Options{Brokers: []str{boot}, Username: "tin", Password: "nope", Timeout: 5s})
+	let werr = wrong.Ping()
+	check("a wrong password is ErrAuth", werr != nil && fault.Is(werr, kafka.ErrAuth))
+	wrong.Close()
+
+	let c = kafka.Open(kafka.Options{Brokers: []str{boot}, Username: "tin", Password: "secret", Timeout: 5s})
+	try c.Ping()
+	let n = try c.Partitions("t")
+	check("t has three partitions", n == 3)
+	let (_, unknown) = c.Partitions("nope")
+	check("an unknown topic is ErrUnknownTopic", unknown != nil && fault.Is(unknown, kafka.ErrUnknownTopic))
+
+	// A moved leader: the first produce to t/1 fails NOT_LEADER, the client asks again.
+	let a1 = try c.SendTo("t", 1, msg("one"))
+	check("a send retried after NOT_LEADER_OR_FOLLOWER lands at offset 0", a1.Offset == 0)
+	let r1 = try c.Fetch("t", 1, 0, 0)
+	check("and is written once", len(r1) == 1 && r1[0].Value == "one")
+
+	// A lost acknowledgement: broker 3 writes the second batch and drops the connection. The
+	// idempotent retry carries the same sequence, so the broker does not write it again.
+	let b1 = try c.SendTo("t", 2, msg("first"))
+	let b2 = try c.SendTo("t", 2, msg("second"))
+	let b3 = try c.SendTo("t", 2, msg("third"))
+	check("the batch whose acknowledgement was lost is not written twice", b1.Offset == 0 && b3.Offset == 2)
+	check("its retry reports no offset (DUPLICATE_SEQUENCE_NUMBER)", b2.Offset == -1)
+	let r2 = try c.Fetch("t", 2, 0, 0)
+	check("t/2 holds the three records once each", len(r2) == 3 && r2[1].Value == "second" && r2[2].Value == "third")
+
+	// Codecs through the broker.
+	let names = []str{"gzip", "snappy", "lz4", "zstd"}
+	let codecs = []kafka.Compression{kafka.Compression.Gzip, kafka.Compression.Snappy, kafka.Compression.Lz4, kafka.Compression.Zstd}
+	c.Close()
+	for i, cd in codecs {
+		let cc = kafka.Open(kafka.Options{Brokers: []str{boot}, Username: "tin", Password: "secret", Timeout: 5s, Compression: cd})
+		mut ms = []kafka.Message{}
+		for k in 0..50 {
+			ms = append(ms, msg("{names[i]} {k} {k} {k}"))
+		}
+		let acks = try cc.SendBatchTo("t", 0, ms)
+		let back = try cc.Fetch("t", 0, acks[0].Offset, 0)
+		mut good = len(back) == 50
+		for k in 0..min(len(back), 50) {
+			if back[k].Value != ms[k].Value {
+				good = false
+			}
+		}
+		check("{names[i]} batches go through the broker and back", good)
+		cc.Close()
+	}
+
+	// A broker too old for the request's version.
+	let (_, old) = c.SendTo("old", 0, msg("x"))
+	check("a broker that lacks Produce v7 is named in the fault", old != nil && contains("{old}", "supports Produce versions 0 to 5, this client sends 7"))
+
+	// Several partitions at once, and offsets.
+	let f = try c.FetchAll([]kafka.Want{kafka.Want{Topic: "t", Partition: 1, Offset: 0}, kafka.Want{Topic: "t", Partition: 2, Offset: 0}}, 0)
+	check("FetchAll reads two leaders", len(f.Records) == 4 && len(f.Parts) == 2)
+	let (first, next) = try c.Offsets("t", 2)
+	check("Offsets of t/2", first == 0 && next == 3)
+	let (_, oor) = c.Fetch("t", 2, 9, 0)
+	check("an offset past the end is ErrOffsetOutOfRange", oor != nil && fault.Is(oor, kafka.ErrOffsetOutOfRange))
+	let exists = c.CreateTopic("t", 3, 1)
+	check("creating an existing topic is ErrTopicExists", exists != nil && fault.Is(exists, kafka.ErrTopicExists))
+	try c.CreateTopic("fresh", 1, 1)
+	say.Line("ok creating a new topic")
+
+	// Transactions on tx/0: an aborted one, then a committed one.
+	let tx = try c.Transactional("tx-1", 0)
+	try tx.Begin()
+	_ = try tx.Send("tx", msg("aborted a"))
+	_ = try tx.Send("tx", msg("aborted b"))
+	try tx.Abort()
+	try tx.Begin()
+	_ = try tx.Send("tx", msg("committed"))
+	try tx.Commit()
+	let all = try c.Fetch("tx", 0, 0, 0)
+	check("read_uncommitted sees all three records", len(all) == 3)
+	c.Close()
+	let rc = kafka.Open(kafka.Options{Brokers: []str{boot}, Username: "tin", Password: "secret", Timeout: 5s, ReadCommitted: true})
+	let cr = try rc.Fetch("tx", 0, 0, 0)
+	check("read_committed sees only the committed record", len(cr) == 1 && cr[0].Value == "committed")
+	rc.Close()
+
+	// A group: the coordinator asks for a member id first, then a rebalance comes.
+	for k in 0..6 {
+		_ = try c.SendTo("g", k % 2, msg("g{k}"))
+	}
+	let g = try c.Group(kafka.GroupOptions{Group: "grp", Topics: []str{"g"}, Heartbeat: 1ms, Start: kafka.Start.Earliest})
+	mut got = 0
+	for k in 0..6 {
+		let rs = try g.Poll(0)
+		got += len(rs)
+	}
+	check("the member joined with the id the coordinator gave", g.MemberID() == "member-1")
+	check("the rebalance made it join again", g.Generation() == 2)
+	check("it was assigned both partitions", len(g.Assigned()) == 2)
+	check("it read the six records", got == 6)
+	try g.Commit()
+	let com = try c.Committed("grp", "g", 0)
+	check("it committed its positions", com == 3)
+	try g.Close()
+	say.Line("ok the member left the group")
+}
+
+fn index(s str, c u8) i64 {
+	for i in 0..len(s) {
+		if s[i] == c {
+			return i
+		}
+	}
+	return len(s)
+}
+
+fn contains(s str, sub str) bool {
+	for i in 0..len(s)-len(sub)+1 {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
+fn main() {
+	hearth.Run(5, fn(core i64) {
+		if core > 0 {
+			serve(core) catch err {
+				say.Line("FAIL broker", core, err)
+			}
+			return
+		}
+		// Collect the brokers' ports, then tell every broker all of them.
+		mut ports = make([]i64, 5)
+		for i in 0..4 {
+			let (_, m) = relay.Recv()
+			let sp = index(m, ' ')
+			let id = mint.Atoi(m[:sp]) catch _ { 0 }
+			let port = mint.Atoi(m[sp+1:]) catch _ { 0 }
+			ports[id] = port
+		}
+		let list = "{ports[1]} {ports[2]} {ports[3]} {ports[4]}"
+		relay.Broadcast(list)
+		run(list) catch err {
+			say.Line("FAIL", err)
+		}
+		quarry.Exit(0)
+	})
+}

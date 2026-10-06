@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Boundary cancellation (#231): a cancel wakes a task parked in each client, and flows down only.
 
-Private probes are appended to a temporary copy of lib/tide, never to the production API.
+Private probes are appended to a temporary copy of toolchain/std/tide, never to the production API.
 The drain phase checks that the end of the grace period cancels waiting requests.
 The budget phases check TIN_REQUEST_MEMORY and a limit block inside a handler (#235).
 Every client points at a server that accepts connections and never answers, so each request
@@ -21,6 +21,7 @@ import time
 from suite import ROOT
 from lifetime_check import request, response, eventually, server_ready
 import websocket_check as ws
+from treeutil import copy_tree
 
 
 class Hole:
@@ -272,9 +273,9 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='cancel-', dir=out) as tmp:
         directory = Path(tmp)
-        shutil.copytree(ROOT / 'lib', directory / 'lib')
+        copy_tree(ROOT, directory)
         fixtures = ROOT / 'tools/ci/fixtures'
-        with (directory / 'lib/tide/tide.tin').open('a') as f:
+        with (directory / 'toolchain/std/tide/tide.tin').open('a') as f:
             f.write('\n' + (fixtures / 'cancel_probe.tin').read_text())
         exe = directory / 'server'
         subprocess.run([str(ROOT / 'bin/tinc'), '-polls', '-o', str(exe), str(fixtures / 'cancel.tin')],

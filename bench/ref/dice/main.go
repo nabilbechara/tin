@@ -1,4 +1,4 @@
-// Reference for tests/v2/dice.tin: the same xoshiro256** / splitmix64 / Lemire algorithms in Go.
+// Reference for toolchain/tests/v2/dice.tin: the same xoshiro256** / splitmix64 / Lemire algorithms in Go.
 package main
 
 import (

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Converts the compiler's untyped word dialect (fn/let/while, untyped parameters, C-string literals) into
-typed edition 1 written with i64 words, for trusted files (selfhost/, the runtime).
+typed edition 1 written with i64 words, for trusted files (toolchain/compiler/, the runtime).
 
     python3 tools/dev/legacy2tin.py [--analyze FILE]... FILE...
 

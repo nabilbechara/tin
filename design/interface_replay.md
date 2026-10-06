@@ -59,7 +59,7 @@ charged to a `limit`), owned by the request.
 | 15 | `tpSched` | reserved for #243 (scheduling state) |
 | 16 | `tpPeer` | the request's peer as `q.RemoteAddr()` gives it (`ip:port`, `[ip6]:port`), a malloc'd str, 0: none (#355) |
 
-`tpWords = 17`. Functions (all in `lib/runtime/replay.tin`, a new file of the runtime package):
+`tpWords = 17`. Functions (all in `toolchain/runtime/replay.tin`, a new file of the runtime package):
 
 | function | does |
 |---|---|
@@ -175,7 +175,7 @@ func rt_secret_key(s str) str
 
 returns `tin-secret:` followed by 32 lower-case hex digits: the first 16 bytes of
 HMAC-SHA256(*K*s, s), where *K*s = HMAC-SHA256(`TIN_REPLAY_KEY`, "tin replay secret"). The
-hash is computed by `lib/replay` (which imports `seal`) through the shared hook
+hash is computed by `toolchain/std/replay` (which imports `seal`) through the shared hook
 `rtSecretHash func(str) str` it installs before the cores start; the runtime holds no key.
 A string that already is a handle is returned unchanged, so on replay the **stand-in** (the
 handle itself) hashes to the recorded handle: the same keys compare equal.
@@ -199,7 +199,7 @@ of a value that the program had typed `secret`.
 set when the value written in `{...}` for `Args[i]` (i < 64) has a secret type; the compiler sets
 it, and a query literal may then take a secret value where a `query` is wanted (the client opts in
 by taking a `query`). Clients write an argument with its bit set as `rt_secret_key(text)`. Until
-this lands (a later #241 slice, in `selfhost/secret.tin` and `lower.tin`, approved by #239),
+this lands (a later #241 slice, in `toolchain/compiler/secret.tin` and `lower.tin`, approved by #239),
 a secret cannot reach a query at all (the #239 sink rule), so none reaches a key.
 
 Key layout of a query (redis words, SQL text): the parts and arguments in order, each argument
@@ -208,7 +208,7 @@ as `I` decimal, `F` the shortest float text, `S` string, `B` `true`/`false`, `X`
 
 ## 6. Capsules and the spool
 
-**Capture.** When a request task ends, anvil asks `lib/replay` to keep its tape if the status is
+**Capture.** When a request task ends, anvil asks `toolchain/std/replay` to keep its tape if the status is
 500 or more, or it panicked, or it is in the sample; otherwise the tape is dropped. Writing
 happens on the core after the task ended (no tape is active then), so it is never recorded.
 
@@ -301,7 +301,7 @@ no scheduling.
 
 `tin replay CAPSULE [--against BUILD] [--live KIND]...` runs BUILD (a binary, or a program
 compiled from FILE.tin) with `TIN_REPLAY_CAPSULE` and `TIN_REPLAY_KEY` set. anvil's `Serve`
-then, instead of listening, decodes the capsule (`lib/replay`), runs its request once through
+then, instead of listening, decodes the capsule (`toolchain/std/replay`), runs its request once through
 the program's handler or router on a task whose tape replays (`tpMode = 2`), and prints:
 
 ```
@@ -320,8 +320,8 @@ is #242's.
 
 | part | issue |
 |---|---|
-| `tTape`, `lib/runtime/replay.tin` (sections 2, 3, `rt_secret_key`), the copy at spawn, the panic message into `tpPanic` | #241 |
-| `lib/replay`: switches, keys, `rtSecretHash`, capsule body and envelope, spool and bound | #241 |
+| `tTape`, `toolchain/runtime/replay.tin` (sections 2, 3, `rt_secret_key`), the copy at spawn, the panic message into `tpPanic` | #241 |
+| `toolchain/std/replay`: switches, keys, `rtSecretHash`, capsule body and envelope, spool and bound | #241 |
 | anvil: tape per request, `tpStatus`, capture at the end of a request | #241 |
 | recording in `tide`, `dice`, `seal`, `wire`, `redis`, `mysql`, `postgres`, `websocket`, `quarry` (section 4) | #241, one slice per group |
 | `query.Hidden` and secret query arguments (5.3) | #241, with #239's approval |

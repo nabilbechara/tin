@@ -1,4 +1,4 @@
-// Reference for tests/v2/tide.tin: the same cases through Go's time package.
+// Reference for toolchain/tests/v2/tide.tin: the same cases through Go's time package.
 package main
 
 import (

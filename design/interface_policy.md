@@ -14,7 +14,7 @@ This file fixes only names, layout and who calls what. It changes no rule of the
 
 ## 1. The shape
 
-Package `policy` (`lib/policy/`) declares
+Package `policy` (`toolchain/std/policy/`) declares
 
 ```
 shape Policy[T constraints.Any] { Run(body func() !T) !T }
@@ -124,11 +124,11 @@ pool. The admission policy `anvil.Admit(func(anvil.Load) bool)` is a function, n
 
 | piece | where | issue |
 |---|---|---|
-| `with` checking (section 2), inference fill, `dyn` and control-flow errors | `selfhost/lower.tin` (next to `chk_boundary`), `selfhost/generics.tin` (fill) | #237 |
-| wrapper `with$N(c, p)` and adapter: `rt_bnd_enter(bkWith)`, `p.Run(adapter)`, `rt_bnd_leave` | `selfhost/lower.tin` | #237 |
-| body rule (section 3) | `selfhost/region.tin` | #237 |
-| `rt_slot_bind`, `rt_slot_find` | `lib/runtime/runtime.tin` (next to `rt_bnd_new`) | #237 (the slot storage #231 left) |
-| `policy`: `Policy[T]`, `Slot[T]`, `NewSlot`, `Get`, `Bind`, `Retry`, `Trace`, `Cached` | `lib/policy/` | #237 |
+| `with` checking (section 2), inference fill, `dyn` and control-flow errors | `toolchain/compiler/lower.tin` (next to `chk_boundary`), `toolchain/compiler/generics.tin` (fill) | #237 |
+| wrapper `with$N(c, p)` and adapter: `rt_bnd_enter(bkWith)`, `p.Run(adapter)`, `rt_bnd_leave` | `toolchain/compiler/lower.tin` | #237 |
+| body rule (section 3) | `toolchain/compiler/region.tin` | #237 |
+| `rt_slot_bind`, `rt_slot_find` | `toolchain/runtime/runtime.tin` (next to `rt_bnd_new`) | #237 (the slot storage #231 left) |
+| `policy`: `Policy[T]`, `Slot[T]`, `NewSlot`, `Get`, `Bind`, `Retry`, `Trace`, `Cached` | `toolchain/std/policy/` | #237 |
 | slot inheritance by children; `detach` without bindings | runtime (already) | #232 |
 | `on` handlers without bindings; request-root bindings in anvil | anvil, runtime | #238 |
 

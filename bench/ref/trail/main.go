@@ -1,4 +1,4 @@
-// Reference for tests/v2/trail.tin: prints the same lines with Go's path/filepath.
+// Reference for toolchain/tests/v2/trail.tin: prints the same lines with Go's path/filepath.
 package main
 
 import (

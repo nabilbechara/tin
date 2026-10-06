@@ -1,4 +1,4 @@
-// Go twin of tests/v2/seal_hkdf.tin.
+// Go twin of toolchain/tests/v2/seal_hkdf.tin.
 package main
 
 import (

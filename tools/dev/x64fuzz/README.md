@@ -2,7 +2,7 @@
 
 `tools/dev/x64fuzz/run.sh [COUNT] [SEED]` (default 20000 instructions, seed 1) builds `fuzz.tin`
 with `bin/tinc`, generates COUNT random x86-64 instructions over every op in
-`selfhost/asm_x64.tin` (all 16 integer and xmm registers, every load/store size and
+`toolchain/compiler/asm_x64.tin` (all 16 integer and xmm registers, every load/store size and
 extension, immediates at the imm8/imm32/imm64 boundaries, memory operands with every base,
 index and scale, 0/8/32-bit displacements and rip-relative labels and symbols, long and
 relaxed short branches), writes the encoded bytes to `out.bin` and our Intel-syntax listing to

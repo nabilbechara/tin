@@ -23,7 +23,7 @@ p+8   bytes     > a plain str: the FULL message, "outer: inner" for a wrapped fa
   `say.Line(err)`, `{err}`, `say.Str(err)`, `err.Error()`, `panic(err)`, argo, and library
   code such as `say.Str(err) == "deadline exceeded"`. Messages of existing faults are
   unchanged.
-- Every fault comes from `rt_fault_raw(data, n, cause, ident)` (lib/runtime/runtime.tin):
+- Every fault comes from `rt_fault_raw(data, n, cause, ident)` (toolchain/runtime/runtime.tin):
   `fail "msg"`, `fail("msg")`, `say.Fault(...)`, `fault("...")` and the `fault` package all
   go through it. **Never make a fault by casting a str** (`cast(fault, s)`): it has no
   record, and `fault.Is`/`Cause` would read the words before it.
@@ -59,7 +59,7 @@ p+8   bytes     > a plain str: the FULL message, "outer: inner" for a wrapped fa
   `fault.Is` matches both `Canceled` and the reason; `DeadlineExceeded` when nothing
   cancelled the boundary. `rt_bnd_check` cancels a passed deadline with
   `rt_fault_deadline()`, and a boundary out of task budget fails with `rt_fault_limit()`.
-  Reasons are compared by identity, never by message. So every deadline wait in lib/
+  Reasons are compared by identity, never by message. So every deadline wait in the library 
   (tide, wire, DNS, seal, redis, mysql, postgres, websocket, the runtime's helper jobs)
   fails with `fault.DeadlineExceeded`. A drain should cancel with `rt_fault_draining()`.
 - **Package-level sentinels**: `var ErrNotFound = fault("not found")`. The checker numbers
@@ -73,7 +73,7 @@ p+8   bytes     > a plain str: the FULL message, "outer: inner" for a wrapped fa
   program at once). They are not stable across builds: do not persist them; persist
   messages (replay, #241, records the message and, for runtime sentinels, the ident 1-6).
 
-## 3. The `fault` package (lib/fault/fault.tin)
+## 3. The `fault` package (toolchain/std/fault/fault.tin)
 
 | function | meaning | Go |
 |---|---|---|
@@ -100,7 +100,7 @@ lower syntax to them without importing `fault`.
 ## 4. `switch` over a fault
 
 `switch err { case A, B: ... case nil: ... default: ... }`, where the tag has type `fault`,
-compares each case with `rt_fault_is($sw, case)` instead of `==` (selfhost/check.tin
+compares each case with `rt_fault_is($sw, case)` instead of `==` (toolchain/compiler/check.tin
 `lower_switch` marks the comparison `$is`; `chk_binary` lowers it). Cases must be faults
 (or `nil`). Cases are tried in order, so a fault that matches several cases (a Join) takes
 the first.
@@ -123,12 +123,12 @@ path returns `rt_fault_wrap(err, msg)`: it is `E catch err { fail fault.Wrap(err
 the message reads `msg: cause`, and `msg` is checked as a `str` and evaluated only on
 failure. It works wherever `try` does (statement, `let`, assignment, multiple assignment,
 `return`). `wrap` on anything but a `try` is a compile error. Tests:
-tests/edition1/run/fault_wrap.tin and tests/edition1/fault_wrap_bad.tin, run by
-tests/edition1.sh.
+toolchain/tests/edition1/run/fault_wrap.tin and toolchain/tests/edition1/fault_wrap_bad.tin, run by
+toolchain/tests/edition1.sh.
 
 ## 7. Follow-ups
 
 - `match` over faults (#252's `EX_MATCH`) lowers like `switch` (section 4): each arm compares
-  with `rt_fault_is` (#225, tests/edition1/run/match.tin).
+  with `rt_fault_is` (#225, toolchain/tests/edition1/run/match.tin).
 - Producing `fault.Overloaded` and `fault.Draining` belongs to admission and drain (#238);
   they call the constructors in section 2.

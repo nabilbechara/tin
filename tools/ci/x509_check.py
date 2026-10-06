@@ -2,16 +2,16 @@
 """Certificates and signatures in seal (#124 phase 2), against Go's crypto/x509 and crypto/rsa.
 
 1. A fresh test PKI (bench/ref/x509_pki: a root, intermediates, leaves and every bad case) is
-   generated for this run; tests/v2/seal_x509.tin and its Go twin bench/ref/seal_x509 verify every
+   generated for this run; toolchain/tests/v2/seal_x509.tin and its Go twin bench/ref/seal_x509 verify every
    case, and both must give the outcome cases.txt expects.
-2. The checked-in PKI (tests/data/x509: chains and parsed fields) and the Wycheproof vectors
-   (tests/wycheproof/rsa, ecdsa and ed25519) give the same results in Go as the strict suite's expected Tin output.
-3. Every byte of every certificate in the fresh PKI, in tests/data/x509_real (public roots that
+2. The checked-in PKI (toolchain/tests/data/x509: chains and parsed fields) and the Wycheproof vectors
+   (toolchain/tests/wycheproof/rsa, ecdsa and ed25519) give the same results in Go as the strict suite's expected Tin output.
+3. Every byte of every certificate in the fresh PKI, in toolchain/tests/data/x509_real (public roots that
    found differences before) and in the system bundle is flipped three ways;
    Tin must reject every mutant Go rejects (Tin may reject more: Go ignores trailing bytes in a
    few places).
-4. Private keys and signing (tests/data/keys): signatures Tin makes for TLS (RSA-PSS with random
-   salts, RFC 6979 ECDSA) verify in Go; deterministic ones equal Go's (tests/v2/seal_sign.tin).
+4. Private keys and signing (toolchain/tests/data/keys): signatures Tin makes for TLS (RSA-PSS with random
+   salts, RFC 6979 ECDSA) verify in Go; deterministic ones equal Go's (toolchain/tests/v2/seal_sign.tin).
 5. SystemRoots reads the operating system's bundle and parses the same certificates Go does.
 Needs Go (as http_check.py does)."""
 import os
@@ -79,22 +79,22 @@ def check_pki(tin, pki):
 
 
 def check_checked_in():
-    tin = outcomes((ROOT / 'tests/v2/seal_x509.out').read_text())
+    tin = outcomes((ROOT / 'toolchain/tests/v2/seal_x509.out').read_text())
     go = outcomes(run(['go', 'run', './bench/ref/seal_x509']))
     assert tin == go, f'checked-in PKI: Tin {tin} != Go {go}'
-    want = sorted((ROOT / 'tests/v2/seal_wycheproof.out').read_text().splitlines() +
-                  (ROOT / 'tests/v2/seal_wycheproof_ecdsa.out').read_text().splitlines() +
-                  (ROOT / 'tests/v2/seal_wycheproof_ed25519.out').read_text().splitlines())
+    want = sorted((ROOT / 'toolchain/tests/v2/seal_wycheproof.out').read_text().splitlines() +
+                  (ROOT / 'toolchain/tests/v2/seal_wycheproof_ecdsa.out').read_text().splitlines() +
+                  (ROOT / 'toolchain/tests/v2/seal_wycheproof_ed25519.out').read_text().splitlines())
     got = sorted(run(['go', 'run', './bench/ref/seal_wycheproof']).splitlines())
-    assert got == want, 'Wycheproof: Go output differs from tests/v2/seal_wycheproof*.out:\n' + \
+    assert got == want, 'Wycheproof: Go output differs from toolchain/tests/v2/seal_wycheproof*.out:\n' + \
         '\n'.join(set(got) ^ set(want))
-    want_sign = (ROOT / 'tests/v2/seal_sign.out').read_text().splitlines()
+    want_sign = (ROOT / 'toolchain/tests/v2/seal_sign.out').read_text().splitlines()
     got_sign = sorted(run(['go', 'run', './bench/ref/seal_sign']).splitlines())
-    assert got_sign == want_sign, 'signing: Go output differs from tests/v2/seal_sign.out:\n' + \
+    assert got_sign == want_sign, 'signing: Go output differs from toolchain/tests/v2/seal_sign.out:\n' + \
         '\n'.join(sorted(set(got_sign) ^ set(want_sign))[:40])
-    want_info = (ROOT / 'tests/v2/seal_certinfo.out').read_text().splitlines()
+    want_info = (ROOT / 'toolchain/tests/v2/seal_certinfo.out').read_text().splitlines()
     got_info = sorted(run(['go', 'run', './bench/ref/seal_certinfo']).splitlines())
-    assert got_info == want_info, 'certificate fields: Go output differs from tests/v2/seal_certinfo.out:\n' + \
+    assert got_info == want_info, 'certificate fields: Go output differs from toolchain/tests/v2/seal_certinfo.out:\n' + \
         '\n'.join(sorted(set(got_info) ^ set(want_info))[:40])
     print(f'PASS checked-in PKI ({len(tin)} cases), certificate fields ({len(want_info)} lines) and '
           f'Wycheproof ({len(want)} files) agree with Go')
@@ -132,7 +132,7 @@ def check_signatures(signer):
     """Signatures Tin makes with the test keys (random PSS salts included) verify in Go."""
     lines = run([str(signer)])
     assert 'error' not in lines, lines
-    proc = subprocess.run(['go', 'run', './bench/ref/seal_sign', 'verify', 'tests/data/keys'], cwd=ROOT,
+    proc = subprocess.run(['go', 'run', './bench/ref/seal_sign', 'verify', 'toolchain/tests/data/keys'], cwd=ROOT,
                           input=lines.encode(), capture_output=True, timeout=300)
     assert proc.returncode == 0, proc.stderr.decode(errors='replace')
     out = proc.stdout.decode().splitlines()
@@ -159,7 +159,7 @@ def main():
     directory.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='x509-', dir=directory) as tmp:
         tmp = Path(tmp)
-        tin = build('tests/v2/seal_x509.tin', tmp / 'seal_x509')
+        tin = build('toolchain/tests/v2/seal_x509.tin', tmp / 'seal_x509')
         mutate = build('tools/ci/fixtures/x509_mutate.tin', tmp / 'x509_mutate')
         gomutate = tmp / 'x509_mutate_go'
         run(['go', 'build', '-o', str(gomutate), './bench/ref/x509_mutate'])
@@ -170,7 +170,7 @@ def main():
         check_pki(tin, pki)
         check_checked_in()
         files = sorted(str(p) for p in (pki / 'certs').glob('*.pem'))
-        files += sorted(str(p) for p in (ROOT / 'tests/data/x509_real').glob('*.pem'))
+        files += sorted(str(p) for p in (ROOT / 'toolchain/tests/data/x509_real').glob('*.pem'))
         if system_bundle():
             files.append(system_bundle())
         check_mutants(mutate, gomutate, files)

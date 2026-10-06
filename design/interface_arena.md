@@ -14,7 +14,7 @@ limbo, `design/interface_mem.md` in #260).
 ## 1. What an arena's memory is
 
 An arena is a **fresh request pool**: the same bump chunks, extra chunks and big blocks as
-the pool of a request (docs/RUNTIME.md §3), made when the block is entered and freed when it
+the pool of a request (toolchain/docs/RUNTIME.md §3), made when the block is entered and freed when it
 is left. It is pool memory, never ingot memory, so:
 
 - pool memory is never counted (#176), so nothing in #176's interface changes.
@@ -60,7 +60,7 @@ to its root; else `rt_pool_words(t)`) and, after the task switches back, saves t
 stack's own words go to `rt_pool_home(0)` (the same walk from `bndCur`, else `schedPool`).
 With no arena open before or after the run this is `rt_pool_words(t)` and `schedPool`.
 
-## 4. Functions (lib/runtime/runtime.tin)
+## 4. Functions (toolchain/runtime/runtime.tin)
 
 | function | does |
 |---|---|
@@ -111,7 +111,7 @@ or a cancellation that passes through it is handled where boundaries are left on
   task, innermost first, so `rt_task_abort` resets the task's own pool, not an arena's. A
   scope child's `spFault`, made in the pool it was using, is copied the same way.
 
-## 7. The region rule (selfhost/region.tin)
+## 7. The region rule (toolchain/compiler/region.tin)
 
 Inside an arena's closure, and closures inside it:
 

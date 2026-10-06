@@ -1,6 +1,6 @@
 # Design: the foundations (written 2026-10-02)
 
-docs/COVERAGE.md lists what Tin lacks. Most of the long tail (`context`, `io`, `sort`,
+toolchain/docs/COVERAGE.md lists what Tin lacks. Most of the long tail (`context`, `io`, `sort`,
 `database/sql/driver`, `errors`, `sync`, `reflect`, `encoding/json`) is blocked by six missing
 foundations. This document decides each of them. Decisions are final unless a prototype proves
 one wrong; each section says what it replaces in Go, why, and what builds on it.
@@ -13,7 +13,7 @@ Principles that decide every choice below:
 4. **Regions are the memory model.** A value lives in the request or scope that made it, or is `keep`-copied out. Every feature below is a region rule, not a new kind of memory.
 5. **One way to do it.** Where Go has three spellings, Tin has one.
 
-What already exists and is built on, not replaced (docs/RUNTIME.md): request tasks with their own
+What already exists and is built on, not replaced (toolchain/docs/RUNTIME.md): request tasks with their own
 stack and pool, `rt_task_park`/`wake`/`defer`, a per-core ready queue and timer heap, per-request
 deadlines (`anvil.Deadline`), cleanup callbacks that run before a pool resets, `shared var`,
 `relay` messages between cores, `?T`, faults with `try`/`catch`/`fail`, `keep()`, monomorphized
@@ -119,7 +119,7 @@ driver contract, `fmt.Stringer` and `Formatter`, `net.Conn`/`Listener`, `testing
 ### 2.1 Syntax and rules (refined during implementation)
 
 The implementation fixes the surface syntax the decision above left open (section 10). Section 2.1
-is the rule the compiler enforces; the grammar is in docs/LANGUAGE.md section 19.
+is the rule the compiler enforces; the grammar is in toolchain/docs/LANGUAGE.md section 19.
 
 ```
 shape Reader { Read(buf mut []u8) !i64 }          // a method set
@@ -150,7 +150,7 @@ shape Seq[T constraints.Any] { Next() ?T; Close() !i64 } // type parameters
   they are recognized only where the grammar wants them, so a program may keep using them as
   names (`shape := 1`, `type dyn = i64`, `var x dyn`). `shape` opens a declaration only at the
   top level; `dyn` is a fat reference only when a shape name follows it in type position.
-- The streaming shapes live in `lib/io`, not in `flume` as the roadmap first assumed:
+- The streaming shapes live in `toolchain/std/io`, not in `flume` as the roadmap first assumed:
   `flume.Reader` and `flume.Writer` are concrete types, and a type and a shape cannot share a
   name. `flume` keeps the buffered reader and writer and gains the `io` methods at the port.
 - `dyn S` is written in type position; `?dyn S` is the optional. A `dyn S` is never nil.
@@ -327,7 +327,7 @@ func fetchAll(urls []str) ![]Page {
   with `fault.Canceled`) and becomes the scope's fault; `s.cancel(reason)` does the same by hand.
 - **Children run on the parent's core**, cooperatively: they switch only where they park (a wait,
   `defer()` or `s.yield()`), so **tasks on one core cannot race**: no mutex is needed or offered.
-  This is what the runtime already does for requests (docs/RUNTIME.md, "Request tasks").
+  This is what the runtime already does for requests (toolchain/docs/RUNTIME.md, "Request tasks").
 - **They share the parent's region.** A child may read and write what its parent made, because the
   scope guarantees the parent outlives it. This is what makes the capturing closure in the example
   legal under the region checker, and it is why there is no detached `go`: a task that outlives its
@@ -371,7 +371,7 @@ several cores read.
   `sync.Map` is `atlas` on a core plus `relay`.
 - **The pattern for shared state is one owner per core and messages:** a cache that every core
   shares is N per-core caches, or one core that owns it and answers `relay` requests; data that
-  is built once and only read afterwards (as `anvil`'s router table is) needs neither. docs/RUNTIME.md will say so with an example.
+  is built once and only read afterwards (as `anvil`'s router table is) needs neither. toolchain/docs/RUNTIME.md will say so with an example.
 
 **Replaces:** `sync`, `sync/atomic`. **Rejected:** mutexes (they invite the shared mutable state the
 whole design avoids, and a lock held across a park would be a deadlock the type system cannot see).
@@ -451,7 +451,7 @@ unnecessary).
 
 Each step is one or more PRs with tests; a step starts when what it depends on is merged.
 
-| # | work | depends on | what it adds to docs/COVERAGE.md |
+| # | work | depends on | what it adds to toolchain/docs/COVERAGE.md |
 |---|---|---|---|
 | 1 | Closures: capture, region cells, `keep` copies them, frame-local cells for non-escaping closures | none | `closures`, method values; callback APIs |
 | 2 | Shapes: declaration, structural satisfaction, `[T Shape]`, named unions, then `dyn` | none | unblocks `io`, `sort`, `hash`, `database/sql/driver`, `Stringer` |
@@ -491,10 +491,10 @@ count must be below the width, and a float to integer conversion panics out of r
 In a handler the panic is that request's 500, and the core goes on serving (section 3). Wrapping
 is written where it is meant, per operation (`+% -% *%`) or for a whole function (`@wrap fn`),
 which keeps the machine's arithmetic for kernels that are modular throughout: hashes, PRNGs and
-constant-time field arithmetic. `lib/runtime/` and `selfhost/` keep machine arithmetic, because
+constant-time field arithmetic. `toolchain/runtime/` and `toolchain/compiler/` keep machine arithmetic, because
 the runtime has no panic path below it and the compiler's hashes and encodings wrap on purpose.
 Constant expressions are exact: a constant that overflows is E223, a constant shift count out
-of range is E224. The rules are in docs/LANGUAGE.md section 6.
+of range is E224. The rules are in toolchain/docs/LANGUAGE.md section 6.
 
 A check is a flag test and a branch to one cold stub per kind per function: `adds`/`subs` with
 `b.vs` (`b.hs`/`b.lo` unsigned), `smulh`/`umulh` against the product on arm64, and `jo`/`jb`
@@ -520,7 +520,7 @@ off, user code only, and user code and libraries.
   within 4% except indexsum (1.06), ordered_less (1.07) and spectral (1.35), with HTTP at 0.979
   and 0.994. spectral's inner loop multiplies `(i+j)*(i+j+1)`, whose operands are bounded only
   by a slice length, so the check stays. On arm64 it is a `smulh` and a compare in a loop that
-  takes 0.73 ns an iteration; on x86-64 `imul` sets the flag for free. docs/PERFORMANCE.md has the table.
+  takes 0.73 ns an iteration; on x86-64 `imul` sets the flag for free. toolchain/docs/PERFORMANCE.md has the table.
 
 **Rejected:**
 

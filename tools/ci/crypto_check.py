@@ -11,8 +11,9 @@ import subprocess
 import tempfile
 from pathlib import Path
 from suite import ROOT
+from treeutil import copy_tree
 
-VECTORS = ROOT / 'tests/wycheproof'
+VECTORS = ROOT / 'toolchain/tests/wycheproof'
 
 
 def hx(b):
@@ -150,10 +151,10 @@ def main():
     sha3_cases(cases)
     with tempfile.TemporaryDirectory(prefix='crypto-', dir=out) as tmp:
         exe = Path(tmp) / 'crypto_vectors'
-        # A private lib with seal_to_probe.tin in lib/seal: the fixture checks AEAD.SealTo through it.
+        # A private lib with seal_to_probe.tin in toolchain/std/seal: the fixture checks AEAD.SealTo through it.
         root = Path(tmp) / 'probe-root'
-        shutil.copytree(ROOT / 'lib', root / 'lib')
-        shutil.copy(ROOT / 'tools/ci/fixtures/seal_to_probe.tin', root / 'lib/seal/probe_seal_to.tin')
+        copy_tree(ROOT, root)
+        shutil.copy(ROOT / 'tools/ci/fixtures/seal_to_probe.tin', root / 'toolchain/std/seal/probe_seal_to.tin')
         subprocess.run([str(compiler), '-o', str(exe), 'tools/ci/fixtures/crypto_vectors.tin'], check=True, cwd=ROOT,
                        env=dict(os.environ, TIN_ROOT=str(root)), timeout=120)
         data = ''.join(line + '\n' for line, _, _ in cases).encode()

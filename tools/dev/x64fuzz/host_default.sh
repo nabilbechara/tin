@@ -18,9 +18,9 @@ for arch in amd64 arm64; do
     set -e
     em() { od -An -tu2 -j18 -N2 "$1" | tr -d " "; }
     t=/w/tinc-'$arch'
-    $t -o /w/hello-'$arch' tests/v2/hello.tin
+    $t -o /w/hello-'$arch' toolchain/tests/v2/hello.tin
     [ "$(em /w/hello-'$arch')" = '$machine' ] || { echo "strict e_machine $(em /w/hello-'$arch')"; exit 1; }
-    /w/hello-'$arch' | LC_ALL=C sort | cmp - tests/v2/hello.out
+    /w/hello-'$arch' | LC_ALL=C sort | cmp - toolchain/tests/v2/hello.out
     $t -o /w/s2-'$arch' '"$self"'
     /w/s2-'$arch' -o /w/s3-'$arch' '"$self"'
     cmp /w/s2-'$arch' /w/s3-'$arch'

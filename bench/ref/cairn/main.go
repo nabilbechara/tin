@@ -1,4 +1,4 @@
-// Go reference for tests/v2/cairn.tin: prints the same lines for the same inputs.
+// Go reference for toolchain/tests/v2/cairn.tin: prints the same lines for the same inputs.
 package main
 
 import (

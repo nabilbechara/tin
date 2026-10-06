@@ -9,7 +9,7 @@
 #include <dlfcn.h>
 
 static const char *names[] = {
-    // --- Tin externs (lib/*.tin, selfhost/*.tin) ---
+    // --- Tin externs (lib/*.tin, toolchain/compiler/*.tin) ---
     "_NSGetExecutablePath", "__error", "accept", "acos", "arc4random_buf", "asin", "atan", "atan2", "atoi",
     "bind", "calloc", "cbrt", "ceil", "chdir", "clock_gettime_nsec_np", "close", "closedir", "connect", "cos",
     "cosh", "creat", "dladdr", "exit", "exp", "exp2", "fcntl", "floor", "fmod", "free", "freeaddrinfo", "fstat",

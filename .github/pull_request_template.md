@@ -6,7 +6,7 @@ Spec (Tin 1 work): `design/design_____.md §__`
 
 ## Touches hot files
 
-List any of `selfhost/check.tin`, `lower.tin`, `region.tin`, `parse.tin`, `gen.tin`, `gen_x64.tin`, `inline.tin`, `lib/runtime/runtime*.tin`, `lib/anvil/anvil*.tin`, or write "none".
+List any of `toolchain/compiler/check.tin`, `lower.tin`, `region.tin`, `parse.tin`, `gen.tin`, `gen_x64.tin`, `inline.tin`, `toolchain/runtime/runtime*.tin`, `packages/anvil/anvil*.tin`, or write "none".
 
 ## Depends on / unblocks
 
@@ -14,7 +14,7 @@ Needs #__ (merged, or stacked on #__). Unblocks #__.
 
 ## Regression coverage
 
-- [ ] Added a reproducer to `tests/regressions/` and its contract to `cases.json`, or named the existing automated test below.
+- [ ] Added a reproducer to `toolchain/tests/regressions/` and its contract to `cases.json`, or named the existing automated test below.
 - [ ] For a known-failure fix: kept the reproducer, removed `known_failure`, and verified PASS on every affected supported target.
 - [ ] Memory/runtime changes cover allocation boundaries, pool reset/ownership and relevant Linux behavior.
 

@@ -14,6 +14,7 @@ import time
 
 from suite import ROOT
 import websocket_check as ws
+from treeutil import copy_lib
 
 
 def request(port, path, timeout=3):
@@ -157,7 +158,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='lifetime-', dir=out) as tmp:
         directory = Path(tmp)
-        shutil.copytree(ROOT / 'lib', directory / 'lib')
+        copy_lib(ROOT, directory / 'lib')
         fixtures = ROOT / 'tools/ci/fixtures'
         for library, probe in [('runtime', 'helper_probe'), ('websocket', 'websocket_probe')]:
             with (directory / 'lib' / library / (library + '.tin')).open('a') as f:

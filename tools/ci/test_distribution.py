@@ -31,8 +31,8 @@ class DistributionTests(unittest.TestCase):
         self.root.mkdir()
         for name in ('tin', 'Makefile', 'README.md', 'go.mod', 'install.sh'):
             shutil.copy2(ROOT / name, self.root / name)
-        (self.root / 'lib').mkdir()
-        (self.root / 'lib/runtime.tin').write_text('// library\n')
+        (self.root / 'toolchain').mkdir()
+        (self.root / 'toolchain/runtime.tin').write_text('// library\n')
         self.compiler = self.base / 'compiler'
         self.compiler.write_text(FAKE_COMPILER)
         self.compiler.chmod(0o755)
@@ -64,8 +64,8 @@ class DistributionTests(unittest.TestCase):
             self.assertEqual(archive.extractfile(root + 'VERSION').read(), b'0.4.0\n')
             self.assertEqual(archive.extractfile(root + 'TARGET').read().decode().strip(), self.target)
             self.assertEqual(archive.getmember(root + 'bin/tinc').mode, 0o755)
-            self.assertEqual(archive.extractfile(root + 'seed/tinc-' + self.target).read(), self.compiler.read_bytes())
-            self.assertIn(root + 'lib/runtime.tin', archive.getnames())
+            self.assertEqual(archive.extractfile(root + 'toolchain/seed/tinc-' + self.target).read(), self.compiler.read_bytes())
+            self.assertIn(root + 'toolchain/runtime.tin', archive.getnames())
 
     def test_install_upgrade_preserves_old_version(self):
         self.release()

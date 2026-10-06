@@ -6,7 +6,7 @@ files (SIZE bytes each, in the page cache after a warm-up pass) one after anothe
 core count, the io_uring path (the default on Linux) and the helper threads (TIN_IO_URING=0)
 run in alternating rounds; each run keeps 4 connections per core busy for a fixed time and
 counts the files read in verified responses. Reported: median files/s, the server's CPU time
-per 1000 files, and the ratios. Numbers count only on Linux (docs/PERFORMANCE.md).
+per 1000 files, and the ratios. Numbers count only on Linux (toolchain/docs/PERFORMANCE.md).
 """
 import argparse
 import http.client

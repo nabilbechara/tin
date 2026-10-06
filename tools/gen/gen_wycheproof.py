@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Convert Wycheproof signature vectors to the compact files under tests/wycheproof/rsa/,
-tests/wycheproof/ecdsa/ and tests/wycheproof/ed25519/.
+"""Convert Wycheproof signature vectors to the compact files under toolchain/tests/wycheproof/rsa/,
+toolchain/tests/wycheproof/ecdsa/ and toolchain/tests/wycheproof/ed25519/.
 
 Usage: tools/gen/gen_wycheproof.py PATH/TO/wycheproof   (a checkout of github.com/C2SP/wycheproof)
 
@@ -12,7 +12,7 @@ per test:
     group ed25519 - - KEYHEX                  (KEYHEX: 32-byte public key; MSG is the message itself)
     TCID valid|invalid|acceptable MSGHEX SIGHEX   ("-" for an empty field)
 Only groups whose hashes seal implements are kept (HASHES below). Standard library only;
-the output is deterministic. The vectors are Apache-2.0; tests/wycheproof/README.md names the
+the output is deterministic. The vectors are Apache-2.0; toolchain/tests/wycheproof/README.md names the
 commit they come from.
 """
 import json
@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-OUT = ROOT / 'tests/wycheproof'
+OUT = ROOT / 'toolchain/tests/wycheproof'
 CURVES = {'secp256r1': 'P-256', 'secp384r1': 'P-384'}
 HASHES = {'SHA-256', 'SHA-384', 'SHA-512'}
 FILES = [

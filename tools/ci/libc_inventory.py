@@ -30,7 +30,9 @@ def discover(root=ROOT, target='linux-arm64'):
     if target not in TARGETS:
         raise ValueError('unsupported inventory target: ' + target)
     symbols = {}
-    for folder in ('lib', 'selfhost'):
+    for folder in ('toolchain/runtime', 'toolchain/std', 'packages', 'toolchain/compiler'):
+        if not (root / folder).is_dir():
+            continue
         for path in sorted((root / folder).rglob('*.tin')):
             if not linux_file(path, target):
                 continue

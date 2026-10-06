@@ -56,8 +56,8 @@ class BenchmarkTests(unittest.TestCase):
             for side in ('base', 'head'):
                 root = tmp / side
                 (root / 'bin').mkdir(parents=True)
-                (root / 'lib').mkdir()
-                (root / 'lib/version').write_text(side)
+                (root / 'toolchain/runtime').mkdir(parents=True)
+                (root / 'toolchain/runtime/version').write_text(side)
                 compiler = root / 'bin/tinc'
                 compiler.write_text(f'''#!{sys.executable}
 import os
@@ -66,7 +66,7 @@ import sys
 root = Path(os.environ['TIN_ROOT'])
 assert root == Path.cwd()
 assert root == Path(__file__).resolve().parents[1]
-assert (root/'lib/version').read_text() == {side!r}
+assert (root/'toolchain/runtime/version').read_text() == {side!r}
 source = Path(sys.argv[-1])
 (root/'compiled-source').write_text(str(source))
 out = Path(sys.argv[sys.argv.index('-o')+1])

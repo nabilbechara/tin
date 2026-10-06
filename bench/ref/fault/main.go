@@ -1,6 +1,6 @@
-// Reference for tests/v2/fault_chains.tin: Wrap, Is, Cause and Join through Go's errors
+// Reference for toolchain/tests/v2/fault_chains.tin: Wrap, Is, Cause and Join through Go's errors
 // package (Wrap is fmt.Errorf("%s: %w"), Cause is errors.Unwrap). Run with go run; the
-// sorted output must equal tests/v2/fault_chains.out.
+// sorted output must equal toolchain/tests/v2/fault_chains.out.
 package main
 
 import (

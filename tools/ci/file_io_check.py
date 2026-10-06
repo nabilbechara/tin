@@ -23,6 +23,7 @@ import time
 
 from suite import ROOT
 import websocket_check as ws
+from treeutil import copy_lib
 
 
 def get(port, path, timeout=60):
@@ -308,7 +309,7 @@ def mounts(compiler, out):
     mount points from mountinfo, octal escapes undone, matched by whole path components."""
     with tempfile.TemporaryDirectory(prefix='mounts-', dir=out) as tmp:
         lib = Path(tmp) / 'lib'
-        shutil.copytree(ROOT / 'lib', lib)
+        copy_lib(ROOT, lib)
         with (lib / 'quarry/quarry.tin').open('a') as f:
             f.write('\n' + (ROOT / 'tools/ci/fixtures/mounts_probe.tin').read_text())
         exe = Path(tmp) / 'mounts'

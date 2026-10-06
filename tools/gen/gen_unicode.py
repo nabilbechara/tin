@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate lib/glyph/tables.tin and lib/runtime/printable.tin from Go's unicode/tables.go (run from the
+"""Generate toolchain/std/glyph/tables.tin and toolchain/runtime/printable.tin from Go's unicode/tables.go (run from the
 repo root).
 
     python3 tools/gen/gen_unicode.py [GOROOT/src/unicode/tables.go]
@@ -15,8 +15,8 @@ import re
 import subprocess
 import sys
 
-OUT = "lib/glyph/tables.tin"
-OUT_PRINT = "lib/runtime/printable.tin"
+OUT = "toolchain/std/glyph/tables.tin"
+OUT_PRINT = "toolchain/runtime/printable.tin"
 
 
 def default_source():

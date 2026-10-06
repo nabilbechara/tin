@@ -11,6 +11,7 @@ import tempfile
 import time
 from suite import ROOT
 from task_check import free_port
+from treeutil import copy_lib
 
 
 def fetch(port, path):
@@ -35,7 +36,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='burst-', dir=out) as tmp:
         work = Path(tmp)
-        shutil.copytree(ROOT / 'lib', work / 'lib')
+        copy_lib(ROOT, work / 'lib')
         probe = work / 'lib/memoryprobe'
         probe.mkdir()
         shutil.copy(ROOT / 'tools/ci/fixtures/memory_probe.tin', probe / 'probe.tin')

@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".github/assets/tin-mascot.svg" width="200" alt="Tin, the tin-can mascot, waving">
+</p>
+
 # Tin
 
 Tin is a compiled language for servers and tools, with Go's packages and blocks and a syntax
@@ -82,7 +86,7 @@ Or compile in Docker:
 docker run --rm -v "$PWD:/src" ghcr.io/yasserreslan/tin:latest build app.tin -o app
 ```
 
-See [distribution and containers](docs/DISTRIBUTION.md) for checksums, upgrades and
+See [distribution and containers](toolchain/docs/DISTRIBUTION.md) for checksums, upgrades and
 multi-stage Dockerfiles. To build and test from a source checkout:
 
 ```sh
@@ -91,21 +95,21 @@ tin examples/api.tin          # compile and run
 tin build app.tin -o app      # native executable
 tin test ./mypkg              # run mypkg's *_test.tin tests (Go style)
 tin fix -edition 1 old.tin    # rewrite edition-0 (Go-like) code to edition 1
-tin suite                     # the compiler's strict test suite (tests/v2)
+tin suite                     # the compiler's strict test suite (toolchain/tests/v2)
 make test                     # the strict suite
 make bootstrap                # tinc rebuilds itself twice; the binaries must be identical
 ```
 
-Documentation: [docs/README.md](docs/README.md), the index. The language reference is
-[docs/LANGUAGE.md](docs/LANGUAGE.md) (agents start with the short
-[docs/AGENT_PRIMER.md](docs/AGENT_PRIMER.md)), the standard library [docs/STDLIB.md](docs/STDLIB.md)
+Documentation: [toolchain/docs/README.md](toolchain/docs/README.md), the index. The language reference is
+[toolchain/docs/LANGUAGE.md](toolchain/docs/LANGUAGE.md) (agents start with the short
+[toolchain/docs/AGENT_PRIMER.md](toolchain/docs/AGENT_PRIMER.md)), the standard library [toolchain/docs/STDLIB.md](toolchain/docs/STDLIB.md)
 (generated from the sources by `tools/gen/gendoc.py`), commands and builds
-[docs/TOOLING.md](docs/TOOLING.md), targets and containers [docs/PORTING.md](docs/PORTING.md),
-the runtime [docs/RUNTIME.md](docs/RUNTIME.md), the compiler
-[docs/COMPILER.md](docs/COMPILER.md), and full benchmark results
-[docs/PERFORMANCE.md](docs/PERFORMANCE.md).
+[toolchain/docs/TOOLING.md](toolchain/docs/TOOLING.md), targets and containers [toolchain/docs/PORTING.md](toolchain/docs/PORTING.md),
+the runtime [toolchain/docs/RUNTIME.md](toolchain/docs/RUNTIME.md), the compiler
+[toolchain/docs/COMPILER.md](toolchain/docs/COMPILER.md), and full benchmark results
+[toolchain/docs/PERFORMANCE.md](toolchain/docs/PERFORMANCE.md).
 
-CI and the issue-to-regression workflow: [docs/CI.md](docs/CI.md).
+CI and the issue-to-regression workflow: [toolchain/docs/CI.md](toolchain/docs/CI.md).
 
 ## Standard library
 
@@ -127,7 +131,7 @@ CI and the issue-to-regression workflow: [docs/CI.md](docs/CI.md).
 | postgres | PostgreSQL client (pooled, SCRAM) | | kafka | Kafka client (producer, groups, transactions) |
 | squash | gzip, zlib, Snappy, LZ4, Zstandard | | | |
 
-Language and library checks live in `tests/v2/`, and protocol client checks in
+Language and library checks live in `toolchain/tests/v2/`, and protocol client checks in
 `tools/ci/`. Core library behavior is also checked against Go equivalents in
 `bench/ref/`; see [design/stdlib_verified.md](design/stdlib_verified.md).
 
@@ -135,7 +139,7 @@ Language and library checks live in `tests/v2/`, and protocol client checks in
 
 **Policy:** reference benchmarks are measured on Linux; macOS is a development platform
 and its numbers are not reference results (see
-[docs/PERFORMANCE.md](docs/PERFORMANCE.md#benchmark-policy)). The tables after the v0.4
+[toolchain/docs/PERFORMANCE.md](toolchain/docs/PERFORMANCE.md#benchmark-policy)). The tables after the v0.4
 service benchmark were measured on the macOS development machine before this policy and
 are kept until Linux reference runs replace them; the Linux workflow `.github/workflows/bench-linux.yml`
 tracks Tin/Go ratios on GitHub's Linux runners meanwhile.
@@ -156,7 +160,7 @@ only the Tin/Go ratios are meaningful (throughput above 1 and latency below 1 fa
 The db p99 swings between runs (0.42 in the previous run): MySQL dominates it, so it is
 not a win either way. Tin uses more memory here (about 50 MB against 25 MB RSS). The mixed p99 is equal because
 wrk2's requests wait behind `/slow` on their own connection; details and absolute numbers
-are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md#v04-service-benchmark-linux).
+are in [toolchain/docs/PERFORMANCE.md](toolchain/docs/PERFORMANCE.md#v04-service-benchmark-linux).
 
 Apple M3 Pro (5 performance + 6 efficiency cores), Go 1.26, fasthttp 1.74, wrk 4.2, the
 load generator on the same machine. Run with `bench/http/run_wrk.sh` and
@@ -220,22 +224,23 @@ binary-trees uses 917 MB against Go's 37 MB: a plain program never resets its po
 ## Layout
 
 ```text
-selfhost/    the compiler: lex, parse, check, lower, generics, region, inline, opt,
-             gen + asm (arm64), gen_x64 + asm_x64, macho, elf, elf_x64
-lib/         the runtime and the standard library, one directory per package (see lib/README.md)
-tests/v2/    strict tests with expected outputs (*_bad.tin: expected compile errors)
-bench/       CPU benchmarks vs Go (v2/), HTTP benchmarks (http/), Go reference programs (ref/)
-seed/        tinc-darwin-arm64, tinc-linux-arm64: the compilers that start a build
-tools/       test runners (v2test.sh, linuxtest.sh), debugging helpers, gendoc.py
-docs/        the documentation (index: docs/README.md)
-design/      design decisions, interfaces, verification, roadmap
+toolchain/     the language: compiler/ (lex, parse, check, lower, generics, region, inline, opt, gen + asm
+               for arm64, gen_x64 + asm_x64, macho, elf, elf_x64), runtime/, std/ (the standard library, one
+               directory per package, see std/README.md), seed/ (the compilers that start a build),
+               tests/ (v2: strict tests with expected outputs, *_bad.tin: expected compile errors), docs/
+packages/      the ecosystem: anvil, postgres, mysql, redis, kafka, tls, wire, websocket, ...
+products/      tinland (the editor tooling; the IDE and tinos follow)
+bench/         CPU benchmarks vs Go (v2/), HTTP benchmarks (http/), Go reference programs (ref/)
+examples/      programs to read and run
+tools/         ci/ (CI checks), gen/ (generators), dev/ (test runners, debugging helpers)
+design/        design decisions, interfaces, verification, roadmap
 ```
 
 ## Status and next steps
 
 Targets: linux-arm64 and linux-amd64 (production and benchmarks) and darwin-arm64
 (development only), each tested natively in CI, and the compiler self-hosts on all three;
-see [docs/PORTING.md](docs/PORTING.md).
+see [toolchain/docs/PORTING.md](toolchain/docs/PORTING.md).
 
 v0.4: each anvil request runs in its own task with its own stack and pool, so a handler
 that waits (`tide.Wait`, `wire`, `quarry` files, `redis`, `mysql`, `postgres`, `websocket`) lets its
@@ -243,4 +248,4 @@ core serve other requests meanwhile. Sockets are non-blocking; file I/O goes thr
 core's io_uring on Linux (helper threads elsewhere and for FIFOs and FUSE mounts), macOS DNS
 to helper threads; every request has a deadline. Statements and commands are `query`
 values, so a value is always sent apart from the text. See
-[docs/RUNTIME.md](docs/RUNTIME.md) and [design/roadmap.md](design/roadmap.md).
+[toolchain/docs/RUNTIME.md](toolchain/docs/RUNTIME.md) and [design/roadmap.md](design/roadmap.md).

@@ -1,0 +1,360 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/../.." || exit 1
+compiler=${1:-bin/tinc}
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+
+"$compiler" -edition 1 -parse-only toolchain/tests/edition1/accepted.tin
+# Without -edition the file says which edition it is written in (#226).
+"$compiler" -parse-only toolchain/tests/edition1/accepted.tin
+
+for name in legacy_func explicit_semicolon positional_literal short_declaration legacy_var block_comment unknown_unit unknown_integer_unit legacy_switch legacy_go legacy_increment legacy_channel legacy_pointer legacy_while legacy_c_loop grouped_import import_alias no_package grouped_const grouped_type import_after_decl grouped_global multiple_global_names multiple_const_names local_const missing_newline reserved_keyword invalid_match_expression invalid_match_range field_attr_bad
+do
+	if "$compiler" -edition 1 -parse-only "toolchain/tests/edition1/$name.tin" >"$tmp/$name.out" 2>"$tmp/$name.err"; then
+		echo "FAIL edition1/$name: unexpectedly accepted"
+		exit 1
+	fi
+	if ! cmp -s "toolchain/tests/edition1/$name.err" "$tmp/$name.err"; then
+		echo "FAIL edition1/$name: diagnostic mismatch"
+		diff -u "toolchain/tests/edition1/$name.err" "$tmp/$name.err" || true
+		exit 1
+	fi
+done
+
+# Edition 0 is retired (#226): its C loops reach the compiler through tin fix, as range loops
+# that compile exactly like the ones written in edition 1.
+"$compiler" -fix -edition 1 toolchain/tests/edition1/paired_edition0.tin >"$tmp/paired_fixed.tin"
+"$compiler" -edition 1 -S -o "$tmp/edition0.out" "$tmp/paired_fixed.tin" >"$tmp/edition0.s"
+"$compiler" -edition 1 -S -o "$tmp/edition1.out" toolchain/tests/edition1/paired_edition1.tin >"$tmp/edition1.s"
+if ! cmp -s "$tmp/edition0.s" "$tmp/edition1.s"; then
+	echo "FAIL edition 1 parser: translated edition 0 and edition 1 range-loop assembly differs"
+	diff -u "$tmp/edition0.s" "$tmp/edition1.s" || true
+	exit 1
+fi
+
+# Boundary blocks run: guard turns a panic into a fault after the defers run; within
+# deadlines stop waits, nest, and leave the enclosing block alone (#230, #233); try E wrap
+# "msg" passes fault.Wrap(err, msg) upward (#229).
+# deadlines stop waits, nest, and leave the enclosing block alone (#230, #233); try E wrap
+# "msg" passes fault.Wrap(err, msg) upward (#229).
+# task.Deadline and task.Canceled read the innermost boundary; nested within takes the
+# earlier deadline (#233).
+# A value main borrowed from a long-lived map stays valid while a spawned child replaces
+# the entry and ends: the core's own stack is an epoch participant (#176). A detached task
+# that never ends holds back releases; past the limbo's cap drops are pinned (#176).
+# guard CALL is the guard block on one call, and a panic's fault carries its backtrace (#142).
+# A labeled break or continue acts on the loop its label names, through every loop form.
+for name in boundaries fault_wrap once polls deadlines borrows guard_call limbo_cap labels
+do
+	polls=
+	[ "$name" != polls ] || polls=-polls
+	"$compiler" $polls -edition 1 -o "$tmp/$name" "toolchain/tests/edition1/run/$name.tin"
+	"$tmp/$name" >"$tmp/$name.out" 2>/dev/null
+	if ! cmp -s "toolchain/tests/edition1/run/$name.out" "$tmp/$name.out"; then
+		echo "FAIL edition1/run/$name: output differs"
+		diff -u "toolchain/tests/edition1/run/$name.out" "$tmp/$name.out" || true
+		exit 1
+	fi
+done
+
+# guard takes a block or a call (#142).
+if "$compiler" -edition 1 -o "$tmp/guard_call_bad" toolchain/tests/edition1/guard_call_bad.tin >"$tmp/guard_call_bad.out" 2>"$tmp/guard_call_bad.err"; then
+	echo "FAIL edition1/guard_call_bad: unexpectedly accepted"
+	exit 1
+fi
+if ! cmp -s toolchain/tests/edition1/guard_call_bad.err "$tmp/guard_call_bad.err"; then
+	echo "FAIL edition1/guard_call_bad: diagnostic mismatch"
+	diff -u toolchain/tests/edition1/guard_call_bad.err "$tmp/guard_call_bad.err" || true
+	exit 1
+fi
+
+# A label that names no enclosing loop of the function is rejected.
+if "$compiler" -edition 1 -o "$tmp/labels_bad" toolchain/tests/edition1/labels_bad.tin >"$tmp/labels_bad.out" 2>"$tmp/labels_bad.err"; then
+	echo "FAIL edition1/labels_bad: unexpectedly accepted"
+	exit 1
+fi
+if ! cmp -s toolchain/tests/edition1/labels_bad.err "$tmp/labels_bad.err"; then
+	echo "FAIL edition1/labels_bad: diagnostic mismatch"
+	diff -u toolchain/tests/edition1/labels_bad.err "$tmp/labels_bad.err" || true
+	exit 1
+fi
+
+# wrap without try is rejected (#229).
+if "$compiler" -edition 1 -o "$tmp/fault_wrap_bad" toolchain/tests/edition1/fault_wrap_bad.tin >"$tmp/fault_wrap_bad.out" 2>"$tmp/fault_wrap_bad.err"; then
+	echo "FAIL edition1/fault_wrap_bad: unexpectedly accepted"
+	exit 1
+fi
+if ! cmp -s toolchain/tests/edition1/fault_wrap_bad.err "$tmp/fault_wrap_bad.err"; then
+	echo "FAIL edition1/fault_wrap_bad: diagnostic mismatch"
+	diff -u toolchain/tests/edition1/fault_wrap_bad.err "$tmp/fault_wrap_bad.err" || true
+	exit 1
+fi
+
+# A call that can fail as a boundary block's last expression needs try or catch (#233).
+if "$compiler" -edition 1 -o "$tmp/boundary_fault_bad" toolchain/tests/edition1/boundary_fault_bad.tin >"$tmp/boundary_fault_bad.out" 2>"$tmp/boundary_fault_bad.err"; then
+	echo "FAIL edition1/boundary_fault_bad: unexpectedly accepted"
+	exit 1
+fi
+if ! cmp -s toolchain/tests/edition1/boundary_fault_bad.err "$tmp/boundary_fault_bad.err"; then
+	echo "FAIL edition1/boundary_fault_bad: diagnostic mismatch"
+	diff -u toolchain/tests/edition1/boundary_fault_bad.err "$tmp/boundary_fault_bad.err" || true
+	exit 1
+fi
+
+# match (#225): literal, range, constant, sentinel, variant, nested, binding and guarded arms;
+# values in let, assignment, return, catch blocks and expressions; break and continue in arms.
+"$compiler" -edition 1 -o "$tmp/match" toolchain/tests/edition1/run/match.tin
+"$tmp/match" >"$tmp/match.out" 2>/dev/null
+if ! cmp -s toolchain/tests/edition1/run/match.out "$tmp/match.out"; then
+	echo "FAIL edition1/run/match: output differs"
+	diff -u toolchain/tests/edition1/run/match.out "$tmp/match.out" || true
+	exit 1
+fi
+if "$compiler" -edition 1 -o "$tmp/match_bad" toolchain/tests/edition1/match_bad.tin >"$tmp/match_bad.out" 2>"$tmp/match_bad.err"; then
+	echo "FAIL edition1/match_bad: unexpectedly accepted"
+	exit 1
+fi
+if ! cmp -s toolchain/tests/edition1/match_bad.err "$tmp/match_bad.err"; then
+	echo "FAIL edition1/match_bad: diagnostic mismatch"
+	diff -u toolchain/tests/edition1/match_bad.err "$tmp/match_bad.err" || true
+	exit 1
+fi
+# Bounded values (#240): argo stops at a bound with fault.LimitExceeded, bound(x) checks a
+# length, and an unbounded value never becomes bounded without it.
+"$compiler" -edition 1 -o "$tmp/bounded" toolchain/tests/edition1/run/bounded.tin
+"$tmp/bounded" >"$tmp/bounded.out" 2>/dev/null
+if ! cmp -s toolchain/tests/edition1/run/bounded.out "$tmp/bounded.out"; then
+	echo "FAIL edition1/run/bounded: output differs"
+	diff -u toolchain/tests/edition1/run/bounded.out "$tmp/bounded.out" || true
+	exit 1
+fi
+if "$compiler" -edition 1 -o "$tmp/bounded_bad" toolchain/tests/edition1/bounded_bad.tin >"$tmp/bounded_bad.out" 2>"$tmp/bounded_bad.err"; then
+	echo "FAIL edition1/bounded_bad: unexpectedly accepted"
+	exit 1
+fi
+if ! cmp -s toolchain/tests/edition1/bounded_bad.err "$tmp/bounded_bad.err"; then
+	echo "FAIL edition1/bounded_bad: diagnostic mismatch"
+	diff -u toolchain/tests/edition1/bounded_bad.err "$tmp/bounded_bad.err" || true
+	exit 1
+fi
+# use and on (#238): package-level use opens per core and closes after main, function-level
+# use closes at return and joins Close's fault, and handlers run in lifecycle order.
+"$compiler" -edition 1 -o "$tmp/lifecycle" toolchain/tests/edition1/run/lifecycle.tin
+"$tmp/lifecycle" >"$tmp/lifecycle.out" 2>"$tmp/lifecycle.err"
+if ! cmp -s toolchain/tests/edition1/run/lifecycle.out "$tmp/lifecycle.out"; then
+	echo "FAIL edition1/run/lifecycle: output differs"
+	diff -u toolchain/tests/edition1/run/lifecycle.out "$tmp/lifecycle.out" || true
+	exit 1
+fi
+if [ "$(tail -n 1 "$tmp/lifecycle.err")" != "on app.stop: second app.stop handler failed" ]; then
+	echo "FAIL edition1/run/lifecycle: a failing app.stop handler is not logged"
+	cat "$tmp/lifecycle.err"
+	exit 1
+fi
+# A fault while starting (a package-level use, on app.start, a panic in on core.start) ends
+# the process with status 1 and the message, before main runs.
+"$compiler" -edition 1 -o "$tmp/startup_fail" toolchain/tests/edition1/run/startup_fail.tin
+startup_fails() {
+	status=0
+	env "$@" "$tmp/startup_fail" >"$tmp/startup.out" 2>"$tmp/startup.err" || status=$?
+	if [ "$status" != 1 ] || grep -q main "$tmp/startup.out"; then
+		echo "FAIL edition1/run/startup_fail ($*): exit $status, want 1 before main"
+		cat "$tmp/startup.out" "$tmp/startup.err"
+		exit 1
+	fi
+}
+startup_fails CONN_NAME=
+grep -qx 'startup failed: use conn: no address' "$tmp/startup.err" || { echo "FAIL startup_fail: use"; cat "$tmp/startup.err"; exit 1; }
+startup_fails CONN_NAME=db START_FAIL=1
+grep -qx 'startup failed: on app.start: migration refused' "$tmp/startup.err" || { echo "FAIL startup_fail: app.start"; cat "$tmp/startup.err"; exit 1; }
+startup_fails CONN_NAME=db CORE_PANIC=1
+grep -q '^startup failed: on core.start: panic: index out of range' "$tmp/startup.err" || { echo "FAIL startup_fail: core.start"; cat "$tmp/startup.err"; exit 1; }
+CONN_NAME=db "$tmp/startup_fail" >"$tmp/startup.out"
+if [ "$(cat "$tmp/startup.out")" != "$(printf 'open db\napp.start\nmain db\nclose db')" ]; then
+	echo "FAIL edition1/run/startup_fail: a clean start and stop differs"
+	cat "$tmp/startup.out"
+	exit 1
+fi
+if "$compiler" -edition 1 -o "$tmp/use_bad" toolchain/tests/edition1/use_bad.tin >"$tmp/use_bad.out" 2>"$tmp/use_bad.err"; then
+	echo "FAIL edition1/use_bad: unexpectedly accepted"
+	exit 1
+fi
+if ! cmp -s toolchain/tests/edition1/use_bad.err "$tmp/use_bad.err"; then
+	echo "FAIL edition1/use_bad: diagnostic mismatch"
+	diff -u toolchain/tests/edition1/use_bad.err "$tmp/use_bad.err" || true
+	exit 1
+fi
+
+# Structured concurrency (#232): scopes, spawn, wait, cancel, first-fault cancellation;
+# s.cancel(reason) and s.yield() (#143).
+for name in scopes lanes selects guards handles spawn_values scope_cancel
+do
+	"$compiler" -edition 1 -o "$tmp/$name" "toolchain/tests/edition1/run/$name.tin"
+	"$tmp/$name" >"$tmp/$name.out" 2>/dev/null
+	if ! cmp -s "toolchain/tests/edition1/run/$name.out" "$tmp/$name.out"; then
+		echo "FAIL edition1/run/$name: output differs"
+		diff -u "toolchain/tests/edition1/run/$name.out" "$tmp/$name.out" || true
+		exit 1
+	fi
+done
+
+# secret T (#239): a secret computes like its plain type and reveal gives it back; every sink
+# rejects it at compile time; tinc -audit-secrets lists every reveal and every secret passed to
+# a library parameter declared secret.
+"$compiler" -edition 1 -o "$tmp/secrets" toolchain/tests/edition1/run/secrets.tin
+"$tmp/secrets" >"$tmp/secrets.out" 2>/dev/null
+if ! cmp -s toolchain/tests/edition1/run/secrets.out "$tmp/secrets.out"; then
+	echo "FAIL edition1/run/secrets: output differs"
+	diff -u toolchain/tests/edition1/run/secrets.out "$tmp/secrets.out" || true
+	exit 1
+fi
+"$compiler" -edition 1 -audit-secrets toolchain/tests/edition1/run/secrets.tin >"$tmp/secrets.audit"
+if ! cmp -s toolchain/tests/edition1/run/secrets.audit "$tmp/secrets.audit"; then
+	echo "FAIL edition1/run/secrets: audit differs"
+	diff -u toolchain/tests/edition1/run/secrets.audit "$tmp/secrets.audit" || true
+	exit 1
+fi
+# A secret value written into a query literal is sent as itself; query.Hidden marks it so a
+# replay key holds its handle (#241), and the audit lists it.
+"$compiler" -edition 1 -o "$tmp/secret_query" toolchain/tests/edition1/run/secret_query.tin
+"$tmp/secret_query" >"$tmp/secret_query.out" 2>/dev/null
+"$compiler" -edition 1 -audit-secrets toolchain/tests/edition1/run/secret_query.tin >"$tmp/secret_query.audit"
+if ! cmp -s toolchain/tests/edition1/run/secret_query.out "$tmp/secret_query.out" || ! cmp -s toolchain/tests/edition1/run/secret_query.audit "$tmp/secret_query.audit"; then
+	echo "FAIL edition1/run/secret_query: output or audit differs"
+	diff -u toolchain/tests/edition1/run/secret_query.out "$tmp/secret_query.out" || true
+	diff -u toolchain/tests/edition1/run/secret_query.audit "$tmp/secret_query.audit" || true
+	exit 1
+fi
+for name in secret_sinks secret_rules
+do
+	if "$compiler" -edition 1 -o "$tmp/$name" "toolchain/tests/edition1/$name.tin" >"$tmp/$name.out" 2>"$tmp/$name.err"; then
+		echo "FAIL edition1/$name: unexpectedly accepted"
+		exit 1
+	fi
+	if ! cmp -s "toolchain/tests/edition1/$name.err" "$tmp/$name.err"; then
+		echo "FAIL edition1/$name: diagnostic mismatch"
+		diff -u "toolchain/tests/edition1/$name.err" "$tmp/$name.err" || true
+		exit 1
+	fi
+	if "$compiler" -edition 1 -audit-secrets "toolchain/tests/edition1/$name.tin" >/dev/null 2>&1; then
+		echo "FAIL edition1/$name: audit accepted a rejected program"
+		exit 1
+	fi
+done
+# with policies and bind (#237): retry, trace, cached, slots seen by spawned children and
+# parallel lines; a policy that keeps its body is a compile error.
+"$compiler" -edition 1 -o "$tmp/policies" toolchain/tests/edition1/run/policies.tin
+"$tmp/policies" >"$tmp/policies.out" 2>/dev/null
+if ! cmp -s toolchain/tests/edition1/run/policies.out "$tmp/policies.out"; then
+	echo "FAIL edition1/run/policies: output differs"
+	diff -u toolchain/tests/edition1/run/policies.out "$tmp/policies.out" || true
+	exit 1
+fi
+if "$compiler" -edition 1 -o "$tmp/policy_keeps_body" toolchain/tests/edition1/policy_keeps_body.tin >"$tmp/policy_keeps_body.out" 2>"$tmp/policy_keeps_body.err"; then
+	echo "FAIL edition1/policy_keeps_body: unexpectedly accepted"
+	exit 1
+fi
+if ! cmp -s toolchain/tests/edition1/policy_keeps_body.err "$tmp/policy_keeps_body.err"; then
+	echo "FAIL edition1/policy_keeps_body: diagnostic mismatch"
+	diff -u toolchain/tests/edition1/policy_keeps_body.err "$tmp/policy_keeps_body.err" || true
+	exit 1
+fi
+
+# A task handle cannot outlive its scope, and detach captures only long-lived memory (#232):
+# each is a compile error.
+for name in scope_escape_bad detach_capture_bad spawn_value_bad
+do
+	if "$compiler" -edition 1 -o "$tmp/$name" "toolchain/tests/edition1/$name.tin" >"$tmp/$name.out" 2>"$tmp/$name.err"; then
+		echo "FAIL edition1/$name: unexpectedly accepted"
+		exit 1
+	fi
+	if ! cmp -s "toolchain/tests/edition1/$name.err" "$tmp/$name.err"; then
+		echo "FAIL edition1/$name: diagnostic mismatch"
+		diff -u "toolchain/tests/edition1/$name.err" "$tmp/$name.err" || true
+		exit 1
+	fi
+done
+
+# arena { } (#236): values of every kind are copied out, faults pass with try and catch,
+# panics and limits discard the arena, and scope children that share a pool keep it while an
+# arena body waits. Memory made in an arena cannot leave it any other way (E315), and its
+# value must be a type the copy can follow (E316).
+"$compiler" -edition 1 -o "$tmp/arenas" toolchain/tests/edition1/run/arenas.tin
+"$tmp/arenas" >"$tmp/arenas.out" 2>/dev/null
+if ! cmp -s toolchain/tests/edition1/run/arenas.out "$tmp/arenas.out"; then
+	echo "FAIL edition1/run/arenas: output differs"
+	diff -u toolchain/tests/edition1/run/arenas.out "$tmp/arenas.out" || true
+	exit 1
+fi
+for name in arena_bad arena_value_bad shared_mut_bad legacy_extern
+do
+	if "$compiler" -edition 1 -o "$tmp/$name" "toolchain/tests/edition1/$name.tin" >"$tmp/$name.out" 2>"$tmp/$name.err"; then
+		echo "FAIL edition1/$name: unexpectedly accepted"
+		exit 1
+	fi
+	if ! cmp -s "toolchain/tests/edition1/$name.err" "$tmp/$name.err"; then
+		echo "FAIL edition1/$name: diagnostic mismatch"
+		diff -u "toolchain/tests/edition1/$name.err" "$tmp/$name.err" || true
+		exit 1
+	fi
+done
+# Packages (#146): an edition 1 program imports a vendored edition 1 package by path, and a
+# vendored edition 1 package that reaches a capability its tin.mod does not grant is refused.
+"$compiler" -edition 1 -o "$tmp/caps" toolchain/tests/edition1/run/caps.tin
+"$tmp/caps" >"$tmp/caps.out" 2>/dev/null
+if ! cmp -s toolchain/tests/edition1/run/caps.out "$tmp/caps.out"; then
+	echo "FAIL edition1/run/caps: output differs"
+	diff -u toolchain/tests/edition1/run/caps.out "$tmp/caps.out" || true
+	exit 1
+fi
+if "$compiler" -edition 1 -o "$tmp/caps_bad" toolchain/tests/edition1/caps_bad.tin >"$tmp/caps_bad.out" 2>"$tmp/caps_bad.err"; then
+	echo "FAIL edition1/caps_bad: unexpectedly accepted"
+	exit 1
+fi
+if ! cmp -s toolchain/tests/edition1/caps_bad.err "$tmp/caps_bad.err"; then
+	echo "FAIL edition1/caps_bad: diagnostic mismatch"
+	diff -u toolchain/tests/edition1/caps_bad.err "$tmp/caps_bad.err" || true
+	exit 1
+fi
+
+# tin fix -edition 1 (#225): an edition 0 program translates to the checked-in edition 1 file,
+# that file translates to itself, and both print the same lines.
+"$compiler" -fix -edition 1 toolchain/tests/edition1/fix/translate.tin >"$tmp/translate_ed1.tin"
+if ! cmp -s toolchain/tests/edition1/fix/translate_ed1.tin "$tmp/translate_ed1.tin"; then
+	echo "FAIL edition1/fix/translate: translation differs"
+	diff -u toolchain/tests/edition1/fix/translate_ed1.tin "$tmp/translate_ed1.tin" || true
+	exit 1
+fi
+"$compiler" -fix -edition 1 toolchain/tests/edition1/fix/translate_ed1.tin >"$tmp/translate_again.tin"
+if ! cmp -s toolchain/tests/edition1/fix/translate_ed1.tin "$tmp/translate_again.tin"; then
+	echo "FAIL edition1/fix/translate: translating the edition 1 file changes it"
+	diff -u toolchain/tests/edition1/fix/translate_ed1.tin "$tmp/translate_again.tin" || true
+	exit 1
+fi
+# translate.out is what the edition 0 program printed before edition 0 was retired (#226).
+"$compiler" -edition 1 -o "$tmp/translate1" toolchain/tests/edition1/fix/translate_ed1.tin
+"$tmp/translate1" >"$tmp/translate1.out"
+for side in translate1
+do
+	if ! cmp -s toolchain/tests/edition1/fix/translate.out "$tmp/$side.out"; then
+		echo "FAIL edition1/fix/translate: $side output differs"
+		diff -u toolchain/tests/edition1/fix/translate.out "$tmp/$side.out" || true
+		exit 1
+	fi
+done
+
+# Edition 0 is retired (#226): the compiler refuses it and names tin fix; tin fix still reads it.
+if "$compiler" -o "$tmp/retired" toolchain/tests/edition1/edition0_retired.tin >"$tmp/retired.out" 2>"$tmp/retired.err"; then
+	echo "FAIL edition1/edition0_retired: unexpectedly accepted"
+	exit 1
+fi
+if ! cmp -s toolchain/tests/edition1/edition0_retired.err "$tmp/retired.err"; then
+	echo "FAIL edition1/edition0_retired: diagnostic mismatch"
+	diff -u toolchain/tests/edition1/edition0_retired.err "$tmp/retired.err" || true
+	exit 1
+fi
+"$compiler" -fix -edition 1 toolchain/tests/edition1/edition0_retired.tin >"$tmp/retired_fixed.tin"
+"$compiler" -edition 1 -parse-only "$tmp/retired_fixed.tin"
+
+echo "PASS edition 1 parser"

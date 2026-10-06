@@ -1,4 +1,4 @@
-// Go twin of tests/v2/seal_aes.tin.
+// Go twin of toolchain/tests/v2/seal_aes.tin.
 package main
 
 import (

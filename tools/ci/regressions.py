@@ -12,7 +12,7 @@ import tempfile
 import urllib.request
 from suite import ROOT, execute
 
-MANIFEST = ROOT / 'tests/regressions/cases.json'
+MANIFEST = ROOT / 'toolchain/tests/regressions/cases.json'
 
 
 def load_cases():
@@ -63,7 +63,7 @@ def run_case(case, compiler, work, cross=None, docker=None):
     target = case.get('target') or cross
     exe = work / Path(case['source']).stem
     command = [str(compiler)] + (['-target', target] if target else [])
-    command += ['-o', str(exe), 'tests/regressions/' + case['source']]
+    command += ['-o', str(exe), 'toolchain/tests/regressions/' + case['source']]
     code, stdout, stderr = execute(command, env=dict(os.environ, TIN_ROOT=str(ROOT)))
     actual = {'phase': 'compile', 'exit': code, 'stdout': stdout.decode(errors='replace'), 'stderr': stderr.decode(errors='replace')}
     if code != 0 or case['expected']['phase'] == 'compile':

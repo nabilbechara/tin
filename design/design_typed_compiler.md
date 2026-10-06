@@ -6,7 +6,7 @@ compiler's own source moves from the untyped internal dialect to typed edition 1
 
 ## 1. What the dialect is, and what "done" means
 
-`selfhost/`, `lib/std.tin` and the shared runtime files (`lib/runtime/memory.tin`, `number.tin`,
+`toolchain/compiler/`, `lib/std.tin` and the shared runtime files (`toolchain/runtime/memory.tin`, `number.tin`,
 `*_fast.tin`) are written in an untyped dialect: every value is a 64-bit word, records are word
 arrays indexed by constants (`t[T_KIND]`, `s[LET_NAME]`), strings are C strings, parameters have no
 types, and `ck_legacy` / `F_LEGACY` switch typing off in `check.tin` and change code generation in
@@ -23,7 +23,7 @@ typed and untyped code in the same program until the last step.
 ## 2. The fact that makes it incremental (measured)
 
 A typed struct whose fields are all 8 bytes wide has exactly the layout of an untyped word record:
-`layout_struct` (selfhost/types.tin) orders fields by width, widest first, and by declaration order
+`layout_struct` (toolchain/compiler/types.tin) orders fields by width, widest first, and by declaration order
 within a width, so a struct of 8-byte fields keeps its declaration order at offsets 0, 8, 16, ...
 A slice header is `[len, cap, data]`, which is the layout of the untyped vectors (`VEC_LEN`,
 `VEC_CAP`, `VEC_DATA`).
@@ -56,8 +56,8 @@ using word indices on the same object.
    `node_new` and friends, which `malloc`; typed code receives them. Replacing the constructors with
    struct literals comes after every reader of the record is typed.
 6. **Typed compiler files are trusted.** A typed file needs `cast` and raw words to receive untyped
-   records, which only trusted files may use (E802). Files under `selfhost/` are read trusted, like the
-   runtime and the standard library (`load_file` in `selfhost/main.tin`). This is the one compiler
+   records, which only trusted files may use (E802). Files under `toolchain/compiler/` are read trusted, like the
+   runtime and the standard library (`load_file` in `toolchain/compiler/main.tin`). This is the one compiler
    change before the first typed file; it affects no user program.
 7. **No behavior changes.** Each step must leave `tinc -S` output of a fixed corpus identical, in
    addition to the bootstrap fixed point. That is the proof a conversion did not change the compiler.
@@ -68,25 +68,25 @@ Every step is a small PR (`Part of #228`) with `make bootstrap`, the strict suit
 cases and a byte-identical `-S` comparison. The seed is not touched until step 6.
 
 0. **Trust and the seed.** The checked-in seeds predate edition 1: they cannot read a typed file, and
-   they would have to read `selfhost/` files as trusted to allow `cast` in them (rule 6). So before any
-   typed file: (a) the trust rule lands in `selfhost/main.tin` (a small PR, no user-visible change); (b)
+   they would have to read `toolchain/compiler/` files as trusted to allow `cast` in them (rule 6). So before any
+   typed file: (a) the trust rule lands in `toolchain/compiler/main.tin` (a small PR, no user-visible change); (b)
    the seeds are refreshed from that commit for darwin-arm64, linux-arm64 and linux-amd64, announced in
    the milestone and merged alone (AGENTS.md rule 8); (c) a script, `tools/dev/compare_compilers.sh`, compiles
    a fixed corpus with two compilers and compares the `-S` listings, the proof for rule 7. Measured
    2026-10-05: the current seed stops at the first `mut` of an edition 1 file.
 0d. **The compiler becomes a strict program.** Measured 2026-10-05 with the new compiler: adding a
    single typed file to the compiler build fails with about sixty E101 REDECLARED errors, because any
-   strict file makes the driver load the real runtime (`lib/runtime`), and the compiler's own build
+   strict file makes the driver load the real runtime (`toolchain/runtime`), and the compiler's own build
    already carries its private copies of the same things: `lib/std.tin` (`malloc`, `free`, `calloc`,
-   `realloc`, `mem_failpoint`, `print*`), `lib/runtime/memory.tin` and `number.tin`, and the
-   `rt_sys_*` wrappers in `selfhost/host_*.tin`. A typed compiler therefore means the compiler runs on
+   `realloc`, `mem_failpoint`, `print*`), `toolchain/runtime/memory.tin` and `number.tin`, and the
+   `rt_sys_*` wrappers in `toolchain/compiler/host_*.tin`. A typed compiler therefore means the compiler runs on
    the real runtime like every other Tin program: the duplicates go (the runtime's allocator, syscalls
    and number code serve the compiler, `host_*.tin` keeps only what the runtime lacks: `realpath`,
    `getenv`, `uname`, `dirent`, the executable path), `std.tin` shrinks to the helpers the untyped files
    still call, and the entry point and start-up sequence become the strict program's. This is its own PR
    (the compiler still untyped, built as a strict program), measured for compile time, binary size and
    memory use before and after, and it is the real gate for every typed file.
-   Measured as a feasibility probe (2026-10-05, darwin-arm64, not committed): drop `lib/runtime/memory.tin`
+   Measured as a feasibility probe (2026-10-05, darwin-arm64, not committed): drop `toolchain/runtime/memory.tin`
    and `number.tin` from the compiler's file list, drop the heap and `rt_sys_*` duplicates from `std.tin`
    and `host_darwin.tin` (keeping `opendir`, `readdir`, `closedir`, `creat`, `unlink`, `uname`), rename the
    untyped `main` to `compiler_main(argc, argv)` and add one typed `fn main() { compiler_main(rtArgc,
@@ -128,7 +128,7 @@ cases and a byte-identical `-S` comparison. The seed is not touched until step 6
 
 ## 6. Progress
 
-- **Records (step 1, #384), 2026-10-05.** `selfhost/records.tin` declares the compiler's records as structs
+- **Records (step 1, #384), 2026-10-05.** `toolchain/compiler/records.tin` declares the compiler's records as structs
   (Token, Node and one struct per node kind, Fn, Sym, Ty, Decl, ...) laid over the word arrays at the offsets
   the constants named. About 6,200 field accesses read `cast(Struct, x).field`, and variables and parameters
   that hold a record carry its struct type; where an untyped word meets a record the conversion is an explicit
@@ -141,23 +141,23 @@ cases and a byte-identical `-S` comparison. The seed is not touched until step 6
   profile was one function: `lookup_global`, a linear scan with a string compare per global, reached from
   `lookup_name` in every expression the checker visits (`expr_may_change_slice` re-resolves names on each
   walk, and the `cast(...)` calls the typed records need deepen those walks). The scan is now a hash index
-  (`gtab`, open addressing): 0.28 s, and a user program such as `tests/v2/router.tin` compiles in 0.10 s
+  (`gtab`, open addressing): 0.28 s, and a user program such as `toolchain/tests/v2/router.tin` compiles in 0.10 s
   instead of 0.25 s. `tools/dev/compare_compilers.sh` still reports 357 of 357 listings identical.
 - **Rule for steps 2 to 4 (a finding from the vector attempt).** A struct-typed or slice-typed global or
   record field is a counted slot: every store goes through `rt_rc_inc` / `rt_rc_dec` (#176), and
   `rt_rc_unqueue` scans the limbo list linearly. Typing the compiler's vector globals and record fields as
   `Vec[T]` made one bootstrap compile 2.6 times slower (5.5 s against 2.1 s), with `rt_rc_unqueue` at 75 % of
-  the samples. Locals and parameters of struct type are not counted and cost nothing. The fix is that the compiler's own files (`selfhost/`, `file_trusted` value 2, set in
+  the samples. Locals and parameters of struct type are not counted and cost nothing. The fix is that the compiler's own files (`toolchain/compiler/`, `file_trusted` value 2, set in
   `load_file`) skip the counting of stores (`rc_assign`): the compiler's records live as long as the process, a
   slot that is never counted is never dropped, and the runtime leaves a block with no count as it is. With
   that, the same typed globals and fields compile the compiler in 0.32 s, and records, vectors and strings may
-  be typed in globals and fields. Files outside `selfhost/` (the runtime, the library, tools) are counted as
+  be typed in globals and fields. Files outside `toolchain/compiler/` (the runtime, the library, tools) are counted as
   before.
   A heuristic that typed fields from their uses also mistyped `TypeExpr.args` (a bitmask for function
   types) and crashed on `fn(mut T)`: field types must come from the writers, not only the readers.
 
 - **Vectors and buffers (step 2, #385), 2026-10-05.** `Vec[T]` (a generic struct over the `[len, cap, data]`
-  header, `shape Any {}` as its constraint) and `Buf` are declared in `selfhost/records.tin`; `vec_new[T]`,
+  header, `shape Any {}` as its constraint) and `Buf` are declared in `toolchain/compiler/records.tin`; `vec_new[T]`,
   `vec_push`, `vec_get` are generic over the element type and `buf_*` take a `Buf`. About 180 vectors have a
   record element type (`Vec[Sym]`, `Vec[Decl]`, ...), the rest are `Vec[i64]` (words). Slices stay out of it on
   purpose: a slice holds its elements inline, the compiler's vectors hold pointers to records, so `[]Node`
@@ -172,7 +172,7 @@ cases and a byte-identical `-S` comparison. The seed is not touched until step 6
   objects (measured with a probe), exactly the layout of the compiler's vectors, and a slice header is shared
   by reference (`append` grows it in place). So `vec_new/vec_get/vec_push` and `Vec[T]` are gone: vectors are
   `[]T` (`[]i64` where the elements are words, `[]Sym`, `[]Decl`, ... where known), indexed and appended with
-  the language's own operations, and byte buffers are `[]u8` grown with `append`. `selfhost/util.tin` keeps
+  the language's own operations, and byte buffers are `[]u8` grown with `append`. `toolchain/compiler/util.tin` keeps
   the helpers a slice does not have (`slice_truncate`, `slice_data`, `slice_filled`, `slice_clone`,
   `buf_reserve`); `SliceHdr` is the typed view the few places that build or resize a slice by hand use.
   Bounds-checked indexing found two latent bugs: field entries of enum payloads were one word short (read one
@@ -181,7 +181,7 @@ cases and a byte-identical `-S` comparison. The seed is not touched until step 6
 
 
 - **Strings (step 3, #386), 2026-10-06.** Every name, path, token text, message, label, unit and format spec
-  in selfhost/ is a `str` (or `?str` where the empty string is a value of its own: the interpolation spec, the
+  in toolchain/compiler/ is a `str` (or `?str` where the empty string is a value of its own: the interpolation spec, the
   hoisted-constant text, a rewrite's replacement). `cstr`, `str_of`, `streq`, `strlen`, `str_slice`,
   `buf_cstring`, `mem_eq`, `str_cat3` and `load8` on a string are gone. Raw byte addresses (kernel and C
   calls, copying string tables into the object file) go through the runtime's `rt_cstr`; C strings the

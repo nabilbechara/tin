@@ -10,7 +10,7 @@ import tarfile
 
 ROOT = Path(__file__).resolve().parents[2]
 TARGETS = ('darwin-arm64', 'linux-arm64', 'linux-amd64')
-TREES = ('lib', 'selfhost', 'tools', 'tests', 'docs', 'examples', 'bench')
+TREES = ('toolchain', 'packages', 'tools', 'examples', 'bench')
 
 
 def version_name(value):
@@ -39,7 +39,7 @@ def package(version, target, compiler, output, root=ROOT):
     for filename in ('tin', 'Makefile', 'README.md', 'go.mod', 'install.sh'):
         files[filename] = root / filename
     files['bin/tinc'] = compiler
-    files['seed/tinc-' + target] = compiler
+    files['toolchain/seed/tinc-' + target] = compiler
     # Normalize metadata and gzip timestamps so identical inputs produce identical archives.
     with archive.open('wb') as stream, gzip.GzipFile(fileobj=stream, mode='wb', filename='', mtime=0) as zipped:
         with tarfile.open(fileobj=zipped, mode='w', format=tarfile.PAX_FORMAT) as tar:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A guard runs resource-cleanup callbacks on a panic (#142, design_semantics section 3).
 
-A probe appended to a temporary copy of lib/tide registers rt_task_cleanup callbacks. Inside a
+A probe appended to a temporary copy of toolchain/std/tide registers rt_task_cleanup callbacks. Inside a
 spawned task, the guard's callee registers one and panics: the guard runs the callee's defer and
 that callback before its value is the fault.Panic fault; a callback the task registered before
 the guard stays until the task ends.
@@ -13,6 +13,7 @@ import tempfile
 from pathlib import Path
 
 from suite import ROOT
+from treeutil import copy_tree
 
 WANT = 'defer;fault true;cleaned 2;after 0; task end cleaned 21\n'
 
@@ -22,9 +23,9 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='guard-', dir=out) as tmp:
         directory = Path(tmp)
-        shutil.copytree(ROOT / 'lib', directory / 'lib')
+        copy_tree(ROOT, directory)
         fixtures = ROOT / 'tools/ci/fixtures'
-        with (directory / 'lib/tide/tide.tin').open('a') as f:
+        with (directory / 'toolchain/std/tide/tide.tin').open('a') as f:
             f.write('\n' + (fixtures / 'guard_probe.tin').read_text())
         exe = directory / 'guard'
         subprocess.run([str(ROOT / 'bin/tinc'), '-edition', '1', '-o', str(exe), str(fixtures / 'guard_cleanup.tin')],

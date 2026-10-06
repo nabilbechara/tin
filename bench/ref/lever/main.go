@@ -1,4 +1,4 @@
-// Reference for tests/v2/lever.tin: prints the same lines with Go's flag package.
+// Reference for toolchain/tests/v2/lever.tin: prints the same lines with Go's flag package.
 package main
 
 import (

@@ -18,6 +18,7 @@ from urllib.parse import quote
 from suite import ROOT
 from task_check import free_port
 from lifetime_check import request, response
+from treeutil import copy_tree
 
 
 def question(data):
@@ -155,8 +156,8 @@ def main():
     try:
         with tempfile.TemporaryDirectory(prefix='dns-',dir=out) as tmp:
             work = Path(tmp)
-            shutil.copytree(ROOT/'lib',work/'lib')
-            shutil.copy(ROOT/'tools/ci/fixtures/dns_probe.tin',work/'lib/wire/probe.tin')
+            copy_tree(ROOT, work)
+            shutil.copy(ROOT/'tools/ci/fixtures/dns_probe.tin',work/'packages/wire/probe.tin')
             hosts = work/'hosts'
             resolv = work/'resolv.conf'
             hosts.write_text('127.0.0.7 hosts.test Alias.Test\n::1 hosts6.test\n')

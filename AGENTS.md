@@ -1,7 +1,7 @@
 # Agent instructions
 
-Read [docs/AGENT_PRIMER.md](docs/AGENT_PRIMER.md) first: the language, the build commands
-and the files you must not touch. The CI and regression policy is in [docs/CI.md](docs/CI.md).
+Read [toolchain/docs/AGENT_PRIMER.md](toolchain/docs/AGENT_PRIMER.md) first: the language, the build commands
+and the files you must not touch. The CI and regression policy is in [toolchain/docs/CI.md](toolchain/docs/CI.md).
 
 ## Platforms: Linux is production, macOS is development
 
@@ -18,7 +18,7 @@ and the files you must not touch. The CI and regression policy is in [docs/CI.md
 
 - **Never quote macOS numbers as results.** That covers Linux containers on a Mac (Docker
   Desktop runs a VM) and emulated CPUs. This applies to PR descriptions, README,
-  docs/PERFORMANCE.md and release notes.
+  toolchain/docs/PERFORMANCE.md and release notes.
 - **"No regression" or "faster" claims need Linux numbers:** Tin and Go (or before and
   after) on the same Linux machine in the same run, interleaved, as medians with the
   ratio. State the machine, CPU, kernel and Go version.
@@ -26,7 +26,7 @@ and the files you must not touch. The CI and regression policy is in [docs/CI.md
   (Actions, Run workflow, on the PR branch with `base_ref` set to its base; it does not
   run on PRs automatically) and cite its summary. On GitHub's shared runners only the
   ratios are meaningful.
-- The full rules are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md#benchmark-policy).
+- The full rules are in [toolchain/docs/PERFORMANCE.md](toolchain/docs/PERFORMANCE.md#benchmark-policy).
 
 ## Tin 1: rules for parallel work (strict)
 
@@ -46,8 +46,8 @@ its wave, dependencies, interface partners and hot files. These rules are not op
    (each lists its partners) begin with one small PR that fixes the names and data layout
    (a `design/` section or stub functions), agreed by every partner, before any of them builds on
    it. Do not change an agreed interface without the partners' approval in that PR.
-6. **Hot files** (`selfhost/check.tin`, `lower.tin`, `region.tin`, `parse.tin`, `gen*.tin`,
-   `inline.tin`, `lib/runtime/runtime*.tin`, `lib/anvil/anvil*.tin`): add code next to related
+6. **Hot files** (`toolchain/compiler/check.tin`, `lower.tin`, `region.tin`, `parse.tin`, `gen*.tin`,
+   `inline.tin`, `toolchain/runtime/runtime*.tin`, `packages/anvil/anvil*.tin`): add code next to related
    code; never move, rename or reformat existing code; no drive-by cleanups.
 7. **Small PRs, rebased often.** `main` requires an up-to-date branch; update and merge within a
    day of green CI. A PR that waits more than two days gets rebased or split.
@@ -57,6 +57,6 @@ its wave, dependencies, interface partners and hot files. These rules are not op
    PRs in the old syntax, and after the conversion commit run `tin fix -edition 1` on every open
    branch before continuing.
 10. **Never weaken or delete a test to get green**, and never add a `known_failure` to pass CI
-    (docs/CI.md). Benchmarks follow the rules above.
+    (toolchain/docs/CI.md). Benchmarks follow the rules above.
 11. **Report blockers in the issue**, naming the issue or PR you are waiting for, instead of
     working around another agent's area.

@@ -1,4 +1,4 @@
-// Go reference for tests/v2/squash.tin: prints the same lines for the same inputs, with Go's
+// Go reference for toolchain/tests/v2/squash.tin: prints the same lines for the same inputs, with Go's
 // compress/flate, compress/gzip and compress/zlib.
 package main
 

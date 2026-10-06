@@ -10,7 +10,7 @@ new=$2
 [ -x "$old" ] && [ -x "$new" ] || { echo "usage: $0 OLD_TINC NEW_TINC [FILE.tin...]" >&2; exit 2; }
 shift 2
 if [ $# -eq 0 ]; then
-	set -- $(ls tests/v2/*.tin examples/*.tin 2>/dev/null | grep -v '_bad\.tin$')
+	set -- $(ls toolchain/tests/v2/*.tin examples/*.tin 2>/dev/null | grep -v '_bad\.tin$')
 fi
 tmp=$(mktemp -d) || exit 1
 trap 'rm -rf "$tmp"' EXIT

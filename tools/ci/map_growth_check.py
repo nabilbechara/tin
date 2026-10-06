@@ -3,7 +3,7 @@
 keys, into a long-lived map never makes one insert take a millisecond (before, the rehash at 2^21
 entries took 50 to 100 ms). The slowest insert of a run is noise-prone on a shared runner (a
 descheduled thread), so the best of five runs is checked (a real stall repeats in every run, at the same insert). Fixture mapgrow.tin; the semantics
-(order, deletes, rebuilds) are tests/edition1/run/map_growth.tin."""
+(order, deletes, rebuilds) are toolchain/tests/edition1/run/map_growth.tin."""
 import os
 import subprocess
 

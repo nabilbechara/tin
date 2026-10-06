@@ -42,7 +42,7 @@ cc -o /tmp/consts consts.c && /tmp/consts > out/darwin-arm64/consts.txt         
    `st_mode@16` (arm64) vs `st_mode@24` (amd64), 4 bytes; `sizeof` 128 (arm64) vs 144 (amd64). `st_dev` is 8 bytes.
 4. **`struct dirent` has no `d_namlen` on Linux.** darwin `d_namlen@18, d_type@20, d_name@21`;
    Linux `d_reclen@16, d_type@18, d_name@19` (`sizeof` 280, `d_name[256]`). Name length = `strlen(d_name)`
-   (probed; `d_reclen` is padded to 8 so it is not the length). `selfhost/main.tin` uses `ent + 21` too.
+   (probed; `d_reclen` is padded to 8 so it is not the length). `toolchain/compiler/main.tin` uses `ent + 21` too.
 5. **Every socket option number changes**: `SOL_SOCKET` 0xffff -> **1**, `SO_REUSEADDR` 4 -> **2**, `SO_ERROR`
    0x1007 -> **4**, `SO_RCVTIMEO` 0x1006 -> **20**, `SO_SNDTIMEO` 0x1005 -> **21**, `SO_KEEPALIVE` 8 -> **9**,
    `SO_REUSEPORT` 0x200 -> **15**. `SO_NOSIGPIPE` (0x1022) does not exist: use `send(..., MSG_NOSIGNAL=0x4000)`
@@ -101,7 +101,7 @@ cc -o /tmp/consts consts.c && /tmp/consts > out/darwin-arm64/consts.txt         
 
 ## 1. Extern functions Tin uses
 
-Source list: `grep -h "^extern func\|^extern fn" lib/*.tin selfhost/*.tin`. Presence and defining object were taken at
+Source list: `grep -h "^extern func\|^extern fn" lib/*.tin toolchain/compiler/*.tin`. Presence and defining object were taken at
 run time with `dlsym(RTLD_DEFAULT)` + `dladdr` (`funcs.c` -> `out/*/funcs.txt`); versions from
 `readelf --dyn-syms libc.so.6 libm.so.6` (`out/*/symbol_versions.txt`, `libc_dynsyms.txt`, `libm_dynsyms.txt`).
 "base" = `GLIBC_2.17` on arm64, `GLIBC_2.2.5` on amd64 (the oldest version; what an unversioned reference binds to).

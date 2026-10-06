@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 from suite import ROOT
+from treeutil import copy_lib
 
 
 def main():
@@ -13,7 +14,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='thread-', dir=out) as tmp:
         work = Path(tmp)
-        shutil.copytree(ROOT/'lib', work/'lib')
+        copy_lib(ROOT, work/'lib')
         (work/'lib/threadprobe').mkdir()
         shutil.copy(ROOT/'tools/ci/fixtures/thread_probe.tin', work/'lib/threadprobe/probe.tin')
         exe = work/'threads'

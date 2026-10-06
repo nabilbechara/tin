@@ -1,4 +1,4 @@
-# Design: a complete Kafka client (`lib/kafka`) and the codecs it needs (`lib/squash`)
+# Design: a complete Kafka client (`packages/kafka`) and the codecs it needs (`toolchain/std/squash`)
 
 Status: decided for the first complete version. The roadmap box is "Queue and stream clients"
 (design/roadmap.md).
@@ -91,7 +91,7 @@ per core, because a producer id cannot be shared between threads that never sync
 several cores gives each core its own id (for example `"{name}-{core}"`). `Begin`, `Send`,
 `SendOffsets` (consume-transform-produce), `Commit` and `Abort` map one to one onto the protocol.
 
-## 6. Codecs: `lib/squash`
+## 6. Codecs: `toolchain/std/squash`
 
 Kafka needs four codecs and the standard library had none. `squash` is a standard package (Go's
 `compress/flate`, `compress/gzip`, `compress/zlib`, plus snappy, LZ4 and Zstandard), so other code can use
@@ -118,13 +118,13 @@ deterministic; they belong in `detach` tasks and `on` handlers, which have no ta
 
 ## 9. Tests
 
-- `tests/v2/squash.tin` (+ Go twin `bench/ref/squash`) for the codecs.
-- `tests/v2/kafka.tin` needs nothing: protocol encoding, record batches with every codec, the partitioner.
-- `tests/v2/kafka_broker.tin` runs a fake cluster in the same process: four brokers on cores 1–4
+- `toolchain/tests/v2/squash.tin` (+ Go twin `bench/ref/squash`) for the codecs.
+- `toolchain/tests/v2/kafka.tin` needs nothing: protocol encoding, record batches with every codec, the partitioner.
+- `toolchain/tests/v2/kafka_broker.tin` runs a fake cluster in the same process: four brokers on cores 1–4
   (cores do not share memory: they answer from a fixed layout), the client on core 0. It covers
   metadata, a moved leader, a lost acknowledgement with an idempotent retry, an unsupported request
   version, every codec, transactions read both ways, a group with a rebalance, admin requests and a
   wrong password. This is the CI check the roadmap asks for, without Python (`tools/ci` takes no new
   Python files) and without a Kafka install.
-- `tests/kafka/integration.tin` against real brokers (Apache Kafka 3.9 and Confluent 8.2, which is Kafka
-  4.2), and Java interop in both directions for every codec, by hand (tests/kafka/README.md).
+- `toolchain/tests/kafka/integration.tin` against real brokers (Apache Kafka 3.9 and Confluent 8.2, which is Kafka
+  4.2), and Java interop in both directions for every codec, by hand (toolchain/tests/kafka/README.md).

@@ -57,8 +57,8 @@ def main():
         parser.error('require at least 7 CPU runs, 5 HTTP rounds and positive duration')
     base, head = args.base_root.resolve(), args.head_root.resolve()
     for root in (base, head):
-        if not (root / 'bin/tinc').is_file() or not (root / 'lib').is_dir():
-            parser.error(f'build {root} with make bootstrap first (compiler and lib/ required)')
+        if not (root / 'bin/tinc').is_file() or not ((root / 'toolchain/runtime').is_dir() or (root / 'lib').is_dir()):
+            parser.error(f'build {root} with make bootstrap first (compiler and library required)')
     output = ROOT / 'bin/bench'
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='compare-', dir=output) as tmp:

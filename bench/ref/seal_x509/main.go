@@ -1,7 +1,7 @@
-// Go twin of tests/v2/seal_x509.tin: verifies every case of a test PKI made by bench/ref/x509_pki
+// Go twin of toolchain/tests/v2/seal_x509.tin: verifies every case of a test PKI made by bench/ref/x509_pki
 // with crypto/x509 and prints "NAME OK n" or "NAME FAIL class", one line per case.
 //
-//	go run ./bench/ref/seal_x509 [DIR]   (default tests/data/x509)
+//	go run ./bench/ref/seal_x509 [DIR]   (default toolchain/tests/data/x509)
 //
 // Tin is stricter than Go in two places, applied here explicitly so the outputs agree: a chain
 // may hold at most 8 certificates, and RSA keys need at least 2048 bits.
@@ -20,7 +20,7 @@ import (
 	"time"
 )
 
-var dir = "tests/data/x509"
+var dir = "toolchain/tests/data/x509"
 
 func load(name string) *x509.Certificate {
 	b, err := os.ReadFile(filepath.Join(dir, "certs", name+".pem"))

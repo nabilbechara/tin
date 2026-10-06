@@ -424,7 +424,7 @@ An **effect** is anything whose result does not follow from the program and its 
 | the request | method, path, headers, body (secrets and policy-excluded headers replaced) |
 
 **Why this is complete without an `external` keyword:** user code cannot reach the operating
-system except through the standard library (C calls are limited to `lib/`, and package
+system except through the standard library (C calls are limited to the library (`toolchain/std/`, `packages/`, `toolchain/runtime/`), and package
 capabilities (#146) make that a checked rule). Every effect therefore passes through a library
 function that records it. A package with the `unsafe` capability is marked *not replay-safe*.
 

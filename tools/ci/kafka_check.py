@@ -5,7 +5,7 @@ client's waits to overlap with other tasks: Close from another task ends a held 
 (ErrClosed, not retried), one group's held JoinGroup holds up no fetch, and a caller whose own
 deadline ends a handshake leaves the callers queued behind it their requests. The rest of #445
 (request timeouts, reused connections, more clients, TLS reads, KIP-368) is in the strict suite:
-tests/v2/kafka_conn.tin."""
+toolchain/tests/v2/kafka_conn.tin."""
 import os
 import subprocess
 import time

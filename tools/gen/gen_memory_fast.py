@@ -67,7 +67,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
-    path = ROOT/'selfhost/memory_fast.tin'
+    path = ROOT/'toolchain/compiler/memory_fast.tin'
     result = generate()
     if args.check:
         assert path.read_text() == result, 'memory machine code is stale'

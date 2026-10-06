@@ -151,7 +151,7 @@ def main(programs=()):
             # The compiler is static at every stage: the checked-in seed, the bin/tinc it builds
             # and the compiler that compiled itself (make bootstrap).
             machine = 'arm64' if os.uname().machine in ('aarch64', 'arm64') else 'amd64'
-            for compiler in (ROOT / f'seed/tinc-linux-{machine}', ROOT / 'bin/tinc', ROOT / 'bin/s3/tinc'):
+            for compiler in (ROOT / f'toolchain/seed/tinc-linux-{machine}', ROOT / 'bin/tinc', ROOT / 'bin/s3/tinc'):
                 assert compiler.exists(), f'{compiler} is missing: run make bootstrap first'
                 assert_static(compiler)
             contained = run_in_containers(work, exe)

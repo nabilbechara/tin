@@ -13,6 +13,7 @@ import socket
 import subprocess
 import tempfile
 from suite import ROOT
+from treeutil import copy_lib
 
 
 class TM(ctypes.Structure):
@@ -30,7 +31,7 @@ def main():
     compiler=(ROOT/args.compiler).resolve()
     out=ROOT/'bin/ci/helpers';out.mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='helpers-',dir=out) as tmp:
-        work=Path(tmp);shutil.copytree(ROOT/'lib',work/'lib')
+        work=Path(tmp);copy_lib(ROOT, work/'lib')
         probe=work/'lib/helperprobe';probe.mkdir()
         shutil.copy(ROOT/'tools/ci/fixtures/helpers_probe.tin',probe/'probe.tin')
         linux=platform.system()=='Linux'

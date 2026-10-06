@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The TLS 1.3 client (lib/tls, #124): the RFC 8448 trace, interop with openssl s_server and
+"""The TLS 1.3 client (packages/tls, #124): the RFC 8448 trace, interop with openssl s_server and
 Python's ssl module, KeyUpdate, timeouts, truncation, https:// in wire and wss:// in websocket.
 
 Certificates are generated here with the runner's openssl, so no key is checked in. The interop
@@ -22,6 +22,7 @@ import threading
 import time
 from pathlib import Path
 from suite import ROOT
+from treeutil import copy_tree
 
 SUITES = ['TLS_AES_128_GCM_SHA256', 'TLS_AES_256_GCM_SHA384', 'TLS_CHACHA20_POLY1305_SHA256']
 GROUPS = {'X25519': 'X25519', 'P-256': 'P-256'}
@@ -114,10 +115,10 @@ def serve_in_thread(target):
 
 
 def rfc8448(compiler, work):
-    """Build the client with the probe in a private copy of lib/tls and run the trace."""
+    """Build the client with the probe in a private copy of packages/tls and run the trace."""
     root = work / 'probe-root'
-    shutil.copytree(ROOT / 'lib', root / 'lib')
-    shutil.copy(ROOT / 'tools/ci/fixtures/tls_rfc8448_probe.tin', root / 'lib/tls/probe_rfc8448.tin')
+    copy_tree(ROOT, root)
+    shutil.copy(ROOT / 'tools/ci/fixtures/tls_rfc8448_probe.tin', root / 'packages/tls/probe_rfc8448.tin')
     exe = work / 'rfc8448'
     subprocess.run([str(compiler), '-o', str(exe), 'tools/ci/fixtures/tls_rfc8448.tin'], check=True, cwd=ROOT,
                    env=dict(os.environ, TIN_ROOT=str(root)), timeout=120)

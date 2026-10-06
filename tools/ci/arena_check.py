@@ -5,7 +5,7 @@ in request handlers that wait inside them interleave on one core with correct an
 The fixture (tools/ci/fixtures/arenas.tin, edition 1) writes every page of about 8 MB per
 step. Without arenas the steps pile up in the pool, which the check uses as a control: the
 measurement must see that growth, so a flat arena run is not a measurement that sees nothing.
-Peak RSS is Linux acceptance (docs/CI.md); macOS runs everything and reports the numbers.
+Peak RSS is Linux acceptance (toolchain/docs/CI.md); macOS runs everything and reports the numbers.
 """
 import os
 import subprocess

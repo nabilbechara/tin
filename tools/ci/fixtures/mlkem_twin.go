@@ -1,4 +1,4 @@
-// mlkem_twin prints the reference value of tests/v2/seal_mlkem.tin with Go's crypto/mlkem (#479):
+// mlkem_twin prints the reference value of toolchain/tests/v2/seal_mlkem.tin with Go's crypto/mlkem (#479):
 // for n seeds and messages read from SHAKE128(""), the hash (SHAKE128, 32 bytes) of every
 // encapsulation key, ciphertext and shared key, and the implicit-rejection key of a random
 // ciphertext. It is the accumulated test of Go's and BoringSSL's ML-KEM suites.

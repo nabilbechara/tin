@@ -1,4 +1,4 @@
-// Reference for tests/v2/quarry.tin: prints the same lines with Go's os package.
+// Reference for toolchain/tests/v2/quarry.tin: prints the same lines with Go's os package.
 package main
 
 import (

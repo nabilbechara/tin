@@ -25,7 +25,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
-    source = ROOT / 'lib/runtime/number.tin'
+    source = ROOT / 'toolchain/runtime/number.tin'
     text = source.read_text()
     pattern = r'(fn num_power\(exp i64\) i64 \{\n\tlet p = \(cast\(i64, ")[^"\n]*("\) \+ 8\))'
     match = re.search(pattern, text)

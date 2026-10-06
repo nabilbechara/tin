@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regenerate selfhost/aes_hw.tin, seal's AES-CTR, GHASH and CPU-check leaves, from
+"""Regenerate toolchain/compiler/aes_hw.tin, seal's AES-CTR, GHASH and CPU-check leaves, from
 tools/gen/arch/aes-gcm-*.S (needs clang). The code generators emit these bytes for the
 seal.aes_hw_ctr, seal.aes_hw_subword, seal.ghash_hw and seal.aes_hw_cpu placeholders."""
 import argparse
@@ -55,7 +55,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
-    path = ROOT/'selfhost/aes_hw.tin'
+    path = ROOT/'toolchain/compiler/aes_hw.tin'
     result = generate()
     if args.check:
         assert path.read_text() == result, 'AES machine code is stale'

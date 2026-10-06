@@ -2,12 +2,12 @@
 """Docs are edition 1 (#227): no edition-0 syntax in the docs or examples, and every docs code
 block compiles.
 
-Without a compiler it checks the text only. Every fenced block in README.md and docs/*.md names
+Without a compiler it checks the text only. Every fenced block in README.md and toolchain/docs/*.md names
 its language, Tin code is fenced ```tin (never ```go), and no Tin code (a ```tin block, an
 inline `code` span, or a file under examples/) uses a form edition 1 removed: func,
 var, :=, switch/case/default, the three-clause for, range, ++/--, go, chan, extern.
-Given a compiler, it also compiles every ```tin block of README.md and docs/ with -edition 1.
-docs/ERRORS.md is checked for syntax only: diagnostics_check.py compiles its examples.
+Given a compiler, it also compiles every ```tin block of README.md and toolchain/docs/ with -edition 1.
+toolchain/docs/ERRORS.md is checked for syntax only: diagnostics_check.py compiles its examples.
 
 A ```tin block is a program, or a package that a generated program imports. Missing parts are
 added: `package main` when there is no package clause, an import for each standard package it
@@ -123,7 +123,7 @@ def parse_markdown(text):
 
 
 def doc_pages(root):
-    return [root / 'README.md'] + sorted((root / 'docs').glob('*.md'))
+    return [root / 'README.md'] + sorted((root / 'toolchain/docs').glob('*.md'))
 
 
 def check_page(path, root, problems):
@@ -190,7 +190,7 @@ USE = re.compile(r'(?<![\w.])([a-z]\w*)\.[A-Za-z_]')
 
 
 def library_packages(root):
-    return {p.name for p in (root / 'lib').iterdir() if p.is_dir() and p.name not in ('runtime', 'std')}
+    return {p.name for part in ('toolchain/std', 'packages') for p in (root / part).iterdir() if p.is_dir()}
 
 
 def program(block, packages):

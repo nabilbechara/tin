@@ -37,8 +37,8 @@ class MakefileTests(unittest.TestCase):
         for host in ('linux', 'darwin'):
             with self.subTest(host=host):
                 sources = make_var('SELF_LINUX', f'HOST_OS={host}')
-                self.assertEqual(sources.count('selfhost/host_linux.tin'), 1)
-                self.assertNotIn('selfhost/host_darwin.tin', sources)
+                self.assertEqual(sources.count('toolchain/compiler/host_linux.tin'), 1)
+                self.assertNotIn('toolchain/compiler/host_darwin.tin', sources)
                 self.assertEqual(len(sources), len(set(sources)))
 
     def test_linux_install_prefix_defaults_to_usr_local(self):

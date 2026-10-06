@@ -2,7 +2,7 @@
 """Compare Tin and Go with alternating runs, output equality and medians.
 
 BENCH_DIR selects the suite (default bench/); RUNS defaults to seven.
-Reference performance numbers come from native Linux (docs/PERFORMANCE.md).
+Reference performance numbers come from native Linux (toolchain/docs/PERFORMANCE.md).
 """
 import argparse
 import json

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Replay tapes (#241): rt_effect records results and faults, and a replay serves them without
 running the live call, keeps fault identity, and stops at the first divergence. Capsules (#241):
-lib/replay writes a kept tape as an encrypted capsule into the bounded spool. Replay mode
+toolchain/std/replay writes a kept tape as an encrypted capsule into the bounded spool. Replay mode
 (#242): a server given TIN_REPLAY_CAPSULE runs the capsule's request with its effects served from
 the capsule, reports, and exits 0, 3 (diverged) or 4 (unreadable capsule)."""
 import base64
@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 from suite import ROOT
+from treeutil import copy_lib
 
 EXPECTED = '''\
 record first: one true ran 1
@@ -252,7 +253,7 @@ def secret_handle(text, key=CAPSULE_KEY):
 
 
 def capsules(work, env):
-    """Capsules end to end: tapes recorded by a fixture are written by lib/replay, opened here."""
+    """Capsules end to end: tapes recorded by a fixture are written by toolchain/std/replay, opened here."""
     lib = work / 'lib/replaycapsule'
     lib.mkdir()
     shutil.copy(ROOT / 'tools/ci/fixtures/replay_capsule_probe.tin', lib / 'probe.tin')
@@ -904,7 +905,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='replay-', dir=out) as tmp:
         work = Path(tmp)
-        shutil.copytree(ROOT / 'lib', work / 'lib')
+        copy_lib(ROOT, work / 'lib')
         probe = work / 'lib/replayprobe'
         probe.mkdir()
         shutil.copy(ROOT / 'tools/ci/fixtures/replay_probe.tin', probe / 'probe.tin')

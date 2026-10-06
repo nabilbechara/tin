@@ -99,7 +99,7 @@ def compare(name, expected, actual):
 
 
 def run(compiler, target=None, docker=None, root=ROOT):
-    discovered = sorted((root / 'tests/v2').glob('*.tin'))
+    discovered = sorted((root / 'toolchain/tests/v2').glob('*.tin'))
     # An _asm.tin file is a program for the assembly checker, not a program to run.
     cases = [c for c in discovered if not c.stem.endswith('_asm')]
     if not cases:
@@ -143,7 +143,7 @@ def run(compiler, target=None, docker=None, root=ROOT):
                 print('PASS', name)
             results.append({'name': name, 'passed': passed, 'exit': code})
         arch = asm_arch(target)
-        asm_cases = sorted((root / 'tests/v2').glob('*_asm.tin'))
+        asm_cases = sorted((root / 'toolchain/tests/v2').glob('*_asm.tin'))
         for source in asm_cases:
             name = source.stem
             check = source.with_suffix('.check')
@@ -173,7 +173,7 @@ def run(compiler, target=None, docker=None, root=ROOT):
             results.append({'name': name, 'passed': passed, 'exit': code})
         # A check file whose test is missing (a typo in the name) would check nothing.
         asm_stems = {source.stem for source in asm_cases}
-        for check in sorted((root / 'tests/v2').glob('*_asm.check')):
+        for check in sorted((root / 'toolchain/tests/v2').glob('*_asm.check')):
             if check.stem not in asm_stems:
                 print('FAIL', check.stem, 'check file without a test:', check)
                 results.append({'name': check.stem, 'passed': False, 'exit': None})

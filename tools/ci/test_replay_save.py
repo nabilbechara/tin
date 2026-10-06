@@ -44,10 +44,10 @@ class ReplaySaveTest(unittest.TestCase):
     def test_saves_the_program_the_rekeyed_capsule_and_the_case(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / 'tests/regressions').mkdir(parents=True)
-            (root / 'tests/regressions/cases.json').write_text('[]\n')
+            (root / 'toolchain/tests/regressions').mkdir(parents=True)
+            (root / 'toolchain/tests/regressions/cases.json').write_text('[]\n')
             self.save(root, 'replay-x')
-            dest = root / 'tests/regressions'
+            dest = root / 'toolchain/tests/regressions'
             self.assertEqual((dest / 'replay-x.tin').read_text(), 'package main\n')
             case = json.loads((dest / 'cases.json').read_text())[0]
             self.assertEqual(case['replay']['key'], replay_save.TEST_KEY)

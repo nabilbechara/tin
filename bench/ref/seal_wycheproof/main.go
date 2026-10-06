@@ -1,4 +1,4 @@
-// Go twin of tests/v2/seal_wycheproof.tin: run from the repository root, `go run ./bench/ref/seal_wycheproof | sort`.
+// Go twin of toolchain/tests/v2/seal_wycheproof.tin: run from the repository root, `go run ./bench/ref/seal_wycheproof | sort`.
 package main
 
 import (
@@ -78,7 +78,7 @@ func pssSaltLen(key *rsa.PublicKey, h crypto.Hash, sig []byte) int {
 }
 
 func run(name string) {
-	text, err := os.ReadFile("tests/wycheproof/" + name + ".txt")
+	text, err := os.ReadFile("toolchain/tests/wycheproof/" + name + ".txt")
 	if err != nil {
 		fmt.Println(name, "unreadable:", err)
 		return

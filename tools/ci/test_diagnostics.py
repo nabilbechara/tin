@@ -24,12 +24,12 @@ class DiagnosticsTests(unittest.TestCase):
     def problems(self, doc, source='err_code(pos, "E501 NOT_GENERIC");\n', err=''):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / 'docs').mkdir()
-            (root / 'docs/ERRORS.md').write_text('# Compiler diagnostics\n\n' + doc)
-            (root / 'selfhost').mkdir()
-            (root / 'selfhost/x.tin').write_text(source)
-            (root / 'tests/v2').mkdir(parents=True)
-            (root / 'tests/v2/a_bad.err').write_text(err)
+            (root / 'toolchain/docs').mkdir(parents=True)
+            (root / 'toolchain/docs/ERRORS.md').write_text('# Compiler diagnostics\n\n' + doc)
+            (root / 'toolchain/compiler').mkdir(parents=True)
+            (root / 'toolchain/compiler/x.tin').write_text(source)
+            (root / 'toolchain/tests/v2').mkdir(parents=True)
+            (root / 'toolchain/tests/v2/a_bad.err').write_text(err)
             problems, _, coded, uncoded = dc.check_static(root)
             return problems, coded, uncoded
 

@@ -405,13 +405,13 @@ so the change is mechanical everywhere except the parser:
    again), `switch`→`match`, C-style `for`→ range forms where the shape allows (others become
    `for cond { } ` loops with the step written out), `++`→`+= 1`, positional→keyed literals,
    `tide.Millisecond*n`→`nms` where constant, and exported names unchanged.
-3. **One commit converts the repository:** `lib/` (~29k lines), `tests/` (~9.5k), `examples/`,
+3. **One commit converts the repository:** the library (`toolchain/std/`, `packages/`, `toolchain/runtime/`) (~29k lines), `toolchain/tests/` (~9.5k), `examples/`,
    `bench/`, `tools/` fixtures; the strict suite, regressions, bootstrap and Linux benchmarks
    must be unchanged by it (the same syntax tree, so the same binaries — checked by comparing
    `tinc -S` output before and after for every file).
 4. **The old parser is deleted** in the next PR. There is no third-party Tin code yet (packages
    are #146), so there is no long transition to support.
-5. **The compiler's own source** (`selfhost/`, written in the internal legacy dialect) moves last,
+5. **The compiler's own source** (`toolchain/compiler/`, written in the internal legacy dialect) moves last,
    with the same translator extended to the dialect; until then the dialect is accepted only for
    files the build marks as the compiler's.
    **The standard library in edition 1** (#226): its files may also use three forms other code
@@ -481,7 +481,7 @@ The next milestone is the two documents of this PR, implemented:
 | 2 | `tin fix -edition 1` translator; repository conversion commit; old parser removed | §12.2–4 |
 | 3 | LANGUAGE.md, AGENT_PRIMER.md, README, examples rewritten | §12.6 |
 | 4 | The semantic steps 1–15 of design_semantics section 16, written in the new syntax | design_semantics |
-| 5 | `selfhost/` moved to the new syntax | §12.5 |
+| 5 | `toolchain/compiler/` moved to the new syntax | §12.5 |
 
 Steps 1–3 come first (about 4 PRs) so that every semantic feature is written once, in the new
 syntax. Step 4 is the bulk (about 30 PRs). Step 5 can come at the end.

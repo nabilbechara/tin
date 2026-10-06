@@ -1,0 +1,589 @@
+// Production replay (design/interface_replay.md, #241): the effect tape of one request and the
+// hook every library effect goes through. Recording, an effect's outcome is appended to the
+// tape; replaying, the recorded outcome is returned and the effect is not performed.
+
+const tpMode = 0
+const tpBuf = 1      // the effect records, malloc'd bytes
+const tpLen = 2
+const tpCap = 3
+const tpSeq = 4      // effects so far
+const tpPos = 5      // replaying: offset of the next record
+const tpDiverged = 6 // replaying: the first divergence (malloc'd str), 0: none
+const tpRand = 7     // dice: this request's generator, 0 until first use
+const tpReq = 8      // the request bytes as received (malloc'd)
+const tpReqLen = 9
+const tpStatus = 10
+const tpPanic = 11   // the panic message (malloc'd), 0: none
+const tpPanicLen = 12
+const tpWall = 13
+const tpLive = 14    // replaying: ",kind,kind," served by real calls (malloc'd str), 0: none
+const tpSched = 15   // reserved for #243
+const tpPeer = 16    // the request's peer, "ip:port" as RemoteAddr gives it (malloc'd str), 0: none (#355)
+const tpWords = 17
+
+const tapeRecord = 1
+const tapeReplay = 2
+
+const secretPrefix = "tin-secret:"
+const secretLen = 43 // the prefix and 32 hex digits
+
+shared mut rtSecretHash fn(str) str // installed by toolchain/std/replay before the cores start
+shared mut rtSecretHeaders str        // ",name,name," lower case: header values stored as handles
+
+// rt_tape is the running task's tape, 0 when it records and replays nothing. A task inside a
+// live effect call (rt_effect's body) has its tape suspended: the low bit is set.
+fn rt_tape() i64 {
+	let t = curTask
+	if t == 0 {
+		return 0
+	}
+	let tp = t[tTape]
+	if tp&1 != 0 {
+		return 0
+	}
+	return tp
+}
+
+// rt_tape_of is task t's tape whether or not it is suspended (anvil reads it when t ended).
+fn rt_tape_of(t i64) i64 {
+	return t[tTape] & -2
+}
+
+// rt_tape_set gives task t the tape tp (anvil, before a request task first runs).
+fn rt_tape_set(t i64, tp i64) {
+	t[tTape] = tp
+}
+
+fn rt_tape_new(mode i64) i64 {
+	let tp = calloc(tpWords, 8)
+	tp[tpMode] = mode
+	return tp
+}
+
+fn rt_tape_free(tp i64) {
+	if tp == 0 {
+		return
+	}
+	free(tp[tpBuf])
+	free(tp[tpDiverged])
+	free(tp[tpReq])
+	free(tp[tpPanic])
+	free(tp[tpLive])
+	free(tp[tpPeer])
+	rt_sched_free(tp)
+	free(tp)
+}
+
+// rt_tape_req keeps a copy of the request bytes p[0:n].
+fn rt_tape_req(tp i64, p i64, n i64) {
+	let b = malloc(n + 1)
+	memcpy(b, p, n)
+	tp[tpReq] = b
+	tp[tpReqLen] = n
+}
+
+// rt_tape_peer_set keeps the address the request's connection came from ("ip:port", "[ip]:port"):
+// recorded, it goes into the capsule; replaying, RemoteAddr and ClientIP answer with it (#355).
+fn rt_tape_peer_set(tp i64, peer str) {
+	free(tp[tpPeer])
+	tp[tpPeer] = 0
+	if peer != "" {
+		tp[tpPeer] = rt_raw_str(peer)
+	}
+}
+
+// rt_tape_peer is the peer rt_tape_peer_set kept, "" if none.
+fn rt_tape_peer(tp i64) str {
+	if tp[tpPeer] == 0 {
+		return ""
+	}
+	return cast(str, tp[tpPeer])
+}
+
+// rt_tape_panic keeps the first panic message of a request.
+fn rt_tape_panic(tp i64, msg str) {
+	if tp[tpPanic] != 0 {
+		return
+	}
+	let n = len(msg)
+	let b = malloc(n + 1)
+	memcpy(b, cast(i64, msg)+8, n)
+	tp[tpPanic] = b
+	tp[tpPanicLen] = n
+}
+
+// rt_tape_load makes the effect records p[0:n] of a capsule the ones a replaying tape serves.
+fn rt_tape_load(tp i64, p i64, n i64) {
+	free(tp[tpBuf])
+	let b = malloc(n + 1)
+	memcpy(b, p, n)
+	tp[tpBuf] = b
+	tp[tpLen] = n
+	tp[tpCap] = n
+	tp[tpPos] = 0
+	tp[tpSeq] = 0
+}
+
+// rt_tape_live sets the effect kinds (",name,name,", without versions) a replay calls for real.
+fn rt_tape_live(tp i64, kinds str) {
+	tp[tpLive] = rt_raw_str(kinds)
+}
+
+// rt_tape_diverged is the first divergence of a replay, "" if none.
+fn rt_tape_diverged(tp i64) str {
+	if tp[tpDiverged] == 0 {
+		return ""
+	}
+	return cast(str, tp[tpDiverged])
+}
+
+// rt_tape_left is how many recorded effects a replay has not served.
+fn rt_tape_left(tp i64) i64 {
+	mut k = 0
+	mut pos = tp[tpPos]
+	for pos < tp[tpLen] {
+		pos = tape_skip(tp, pos)
+		k += 1
+	}
+	return k
+}
+
+// rt_tape_kinds is how many records of kind a recording tape holds (wire numbers a request's
+// connections with it).
+fn rt_tape_kinds(tp i64, kind str) i64 {
+	mut k = 0
+	mut pos = 0
+	for pos < tp[tpLen] {
+		if rt_str_eq(tape_field(tp[tpBuf], pos+8), kind) {
+			k += 1
+		}
+		pos = tape_skip(tp, pos)
+	}
+	return k
+}
+
+// rt_raw_str is a malloc'd copy of s, laid out as a str.
+fn rt_raw_str(s str) i64 {
+	let n = len(s)
+	let b = malloc(n + 9)
+	b[0] = n
+	memcpy(b+8, cast(i64, s)+8, n)
+	store8(b+8+n, 0)
+	return b
+}
+
+// ---- the record bytes: words are 8 bytes little-endian, a string is its length then its bytes ----
+
+fn tape_room(tp i64, n i64) {
+	let need = tp[tpLen] + n
+	if need <= tp[tpCap] {
+		return
+	}
+	mut c = tp[tpCap] * 2
+	if c < 1024 {
+		c = 1024
+	}
+	for c < need {
+		c *= 2
+	}
+	let b = malloc(c)
+	if tp[tpBuf] != 0 {
+		memcpy(b, tp[tpBuf], tp[tpLen])
+		free(tp[tpBuf])
+	}
+	tp[tpBuf] = b
+	tp[tpCap] = c
+}
+
+fn tape_word(tp i64, v i64) {
+	tape_room(tp, 8)
+	(tp[tpBuf] + tp[tpLen])[0] = v
+	tp[tpLen] += 8
+}
+
+fn tape_bytes(tp i64, p i64, n i64) {
+	tape_word(tp, n)
+	tape_room(tp, n)
+	memcpy(tp[tpBuf]+tp[tpLen], p, n)
+	tp[tpLen] += n
+}
+
+// tape_add appends one effect record (design/interface_replay.md, 3.3).
+fn tape_add(tp i64, kind str, key str, outcome i64, ident i64, p i64, n i64) {
+	tape_word(tp, tp[tpSeq])
+	tape_bytes(tp, cast(i64, kind)+8, len(kind))
+	tape_bytes(tp, cast(i64, key)+8, len(key))
+	tape_word(tp, outcome)
+	tape_word(tp, ident)
+	tape_bytes(tp, p, n)
+	tp[tpSeq] += 1
+}
+
+// tape_skip is the offset of the record after the one at pos.
+fn tape_skip(tp i64, pos i64) i64 {
+	let b = tp[tpBuf]
+	pos += 8
+	pos += 8 + (b + pos)[0]
+	pos += 8 + (b + pos)[0]
+	pos += 16
+	pos += 8 + (b + pos)[0]
+	return pos
+}
+
+// tape_field is the string at b+pos (its length word, then its bytes).
+fn tape_field(b i64, pos i64) str {
+	return rt_str_from_raw(b+pos+8, (b + pos)[0])
+}
+
+// ---- faults ----
+
+// fault_sentinel is the runtime sentinel (faultCanceled ... faultPanic) in err's chain, or 0.
+fn fault_sentinel(err i64) i64 {
+	{
+		mut id = faultCanceled
+		for id <= faultPanic {
+			if rt_fault_is(err, rt_fault_std(id, fault_std_msg(id))) {
+				return id
+			}
+			id += 1
+		}
+	}
+	return 0
+}
+
+fn fault_std_msg(id i64) str {
+	if id == faultCanceled {
+		return "canceled"
+	}
+	if id == faultDeadline {
+		return "deadline exceeded"
+	}
+	if id == faultLimit {
+		return "limit exceeded"
+	}
+	if id == faultOverloaded {
+		return "overloaded"
+	}
+	if id == faultDraining {
+		return "draining"
+	}
+	return "panic"
+}
+
+// fault_rebuilt is a recorded fault: its message, with the runtime sentinel as its cause, or
+// the sentinel itself when the message is the sentinel's.
+fn fault_rebuilt(msg str, ident i64) i64 {
+	if ident <= 0 || ident > faultPanic {
+		return rt_fault_new(msg, 0, 0)
+	}
+	let std = rt_fault_std(ident, fault_std_msg(ident))
+	if rt_str_eq(msg, cast(str, std)) {
+		return std
+	}
+	return rt_fault_raw(cast(i64, msg)+8, len(msg), std, 0)
+}
+
+// ---- the hook ----
+
+// rt_effect records or replays one effect that can fail. Recording, body runs (with this
+// task's tape suspended, so the live call inside is not recorded again) and its result or
+// fault is appended; replaying, the next record must have this kind and key, and its outcome
+// is returned without running body.
+fn rt_effect(tp i64, kind str, key str, body fn() !str) !str {
+	if tp[tpMode] == tapeReplay {
+		mut pos = try tape_next(tp, kind, key)
+		if !tape_is_live(tp, kind) {
+			let b = tp[tpBuf]
+			pos = pos + 8
+			pos += 8 + (b + pos)[0]
+			pos += 8 + (b + pos)[0]
+			let outcome = (b + pos)[0]
+			let ident = (b + pos + 8)[0]
+			let data = tape_field(b, pos+16)
+			if outcome != 0 {
+				fail cast(fault, fault_rebuilt(data, ident))
+			}
+			return data
+		}
+	}
+	// Suspend the tape while the live call runs; code on a core's own stack has no task.
+	let t = curTask
+	if t != 0 {
+		t[tTape] = tp | 1
+	}
+	let (v, err) = body()
+	if t != 0 {
+		t[tTape] = tp
+	}
+	if tp[tpMode] == tapeReplay {
+		if err != nil {
+			fail err
+		}
+		return v
+	}
+	if err != nil {
+		let e = cast(i64, err)
+		tape_add(tp, kind, key, 1, fault_sentinel(e), e+8, e[0])
+		fail err
+	}
+	tape_add(tp, kind, key, 0, 0, cast(i64, v)+8, len(v))
+	return v
+}
+
+// rt_effect_word records or replays a value that cannot fail (a clock reading, a seed): the
+// caller computes live; replaying returns the recorded value. A divergence panics.
+fn rt_effect_word(tp i64, kind str, key str, live i64) i64 {
+	if tp[tpMode] == tapeReplay {
+		let data = tape_value(tp, kind, key)
+		if len(data) != 8 {
+			rt_panic("replay: effect " + kind + " recorded " + rt_i64str(len(data)) + " bytes, not a word")
+		}
+		return (cast(i64, data) + 8)[0]
+	}
+	let w = rt_alloc(8)
+	w[0] = live
+	tape_add(tp, kind, key, 0, 0, w, 8)
+	return live
+}
+
+// rt_effect_bytes is rt_effect_word for a string value (random bytes).
+fn rt_effect_bytes(tp i64, kind str, key str, live str) str {
+	if tp[tpMode] == tapeReplay {
+		return tape_value(tp, kind, key)
+	}
+	tape_add(tp, kind, key, 0, 0, cast(i64, live)+8, len(live))
+	return live
+}
+
+// tape_value is the recorded result of an effect that cannot fail; a divergence panics.
+fn tape_value(tp i64, kind str, key str) str {
+	mut pos = tape_next(tp, kind, key) catch err {
+		rt_panic(cast(str, cast(i64, err)))
+		0
+	}
+	let b = tp[tpBuf]
+	pos = pos + 8
+	pos += 8 + (b + pos)[0]
+	pos += 8 + (b + pos)[0]
+	return tape_field(b, pos+16)
+}
+
+// tape_next takes the next record of a replaying tape: its offset, when it has this kind and
+// key. Otherwise the replay diverged: the first divergence is kept and every later effect
+// fails with it, so a replay never falls through to a live call.
+fn tape_next(tp i64, kind str, key str) !i64 {
+	for {
+		if tp[tpDiverged] != 0 {
+			fail cast(str, tp[tpDiverged])
+		}
+		let n = tp[tpSeq]
+		let pos = tp[tpPos]
+		if pos >= tp[tpLen] {
+			tape_diverge(tp, "replay: divergence at effect " + rt_i64str(n) + ": got " + kind + " " + tape_quote(key) + ", recorded nothing more")
+			fail cast(str, tp[tpDiverged])
+		}
+		let b = tp[tpBuf]
+		let rkind = tape_field(b, pos+8)
+		let rkey = tape_field(b, pos+16+len(rkind))
+		if !rt_str_eq(rkind, kind) || !rt_str_eq(rkey, key) {
+			// The next record may be another task's of the request: wait for this one's turn (#243).
+			if rt_sched_wait_turn(tp) {
+				continue
+			}
+			tape_diverge(tp, "replay: divergence at effect " + rt_i64str(n) + ": got " + kind + " " + tape_quote(key) + ", recorded " + rkind + " " + tape_quote(rkey))
+			fail cast(str, tp[tpDiverged])
+		}
+		tp[tpPos] = tape_skip(tp, pos)
+		tp[tpSeq] += 1
+		rt_sched_took(tp)
+		return pos
+	}
+	return 0
+}
+
+fn tape_diverge(tp i64, msg str) {
+	if tp[tpDiverged] == 0 {
+		tp[tpDiverged] = rt_raw_str(msg)
+		rt_sched_release(tp) // tasks waiting for their turn go on, and fail with it (#243)
+	}
+}
+
+// tape_is_live reports whether kind (before its @version) is served by real calls.
+fn tape_is_live(tp i64, kind str) bool {
+	if tp[tpLive] == 0 {
+		return false
+	}
+	mut at = len(kind)
+	for i in 0..len(kind) {
+		if kind[i] == '@' {
+			at = i
+			break
+		}
+	}
+	return rt_has_word(cast(str, tp[tpLive]), kind[:at])
+}
+
+// rt_has_word reports whether list (",a,b,") holds name, compared without case.
+fn rt_has_word(list str, name str) bool {
+	let n = len(name)
+	{
+		mut i = 0
+		for i+n+1 < len(list) {
+			if list[i] != ',' || list[i+n+1] != ',' {
+				i += 1
+				continue
+			}
+			mut same = true
+			for k in 0..n {
+				let a = list[i+1+k]
+				mut c = name[k]
+				if c >= 'A' && c <= 'Z' {
+					c += 32
+				}
+				if a != c {
+					same = false
+					break
+				}
+			}
+			if same {
+				return true
+			}
+			i += 1
+		}
+	}
+	return false
+}
+
+// tape_quote is s in double quotes with control bytes escaped, shortened to 200 bytes.
+fn tape_quote(s str) str {
+	mut b = make([]u8, 0, len(s)+8)
+	b = append(b, '"')
+	mut n = len(s)
+	if n > 200 {
+		n = 200
+	}
+	let hex = "0123456789abcdef"
+	for i in 0..n {
+		let c = s[i]
+		if c == '\n' {
+			b = append(b, '\\', 'n')
+		} else if c == '"' || c == '\\' {
+			b = append(b, '\\', c)
+		} else if c < ' ' || c >= 0x7f {
+			b = append(b, '\\', 'x', hex[c>>4], hex[c&15])
+		} else {
+			b = append(b, c)
+		}
+	}
+	b = append(b, '"')
+	if n < len(s) {
+		b = append(b, "..."...)
+	}
+	return str(b)
+}
+
+// ---- secrets ----
+
+// rt_secret_key is what an effect key holds instead of a secret: its handle, "tin-secret:" and
+// 32 hex digits of a keyed hash. A handle is returned unchanged, so a replay's stand-in (the
+// handle itself) gives the recorded key.
+fn rt_secret_key(s str) str {
+	if len(s) == secretLen && s[:11] == secretPrefix {
+		return s
+	}
+	if rtSecretHash == nil {
+		return "tin-secret:unkeyed"
+	}
+	return rtSecretHash(s)
+}
+
+// rt_query_key is a query in an effect key (section 5.3): the parts and arguments in order,
+// each argument as I decimal, F float, S string, B true/false, X hex bytes, or H and its
+// handle when it was written with a secret value (query.Hidden), each part and argument
+// followed by a newline.
+fn rt_query_key(prefix str, q query) str {
+	mut b = make([]u8, 0, 64)
+	b = append(b, prefix...)
+	let hex = "0123456789abcdef"
+	for i, part in q.Parts {
+		b = append(b, part...)
+		b = append(b, '\n')
+		if i >= len(q.Args) {
+			continue
+		}
+		if i < 64 && (q.Hidden>>u64(i))&1 != 0 {
+			b = append(b, 'H')
+			b = append(b, rt_secret_key(rt_qarg_text(q.Args[i]))...)
+			b = append(b, '\n')
+			continue
+		}
+		match q.Args[i] {
+			Int(v) => {
+				b = append(b, 'I')
+				b = append(b, rt_i64str(v)...)
+			}
+			Float(v) => {
+				b = append(b, 'F')
+				b = append(b, rt_float_json(v)...)
+			}
+			Str(v) => {
+				b = append(b, 'S')
+				b = append(b, v...)
+			}
+			Bool(v) => {
+				b = append(b, 'B')
+				if v {
+					b = append(b, "true"...)
+				} else {
+					b = append(b, "false"...)
+				}
+			}
+			Bytes(v) => {
+				b = append(b, 'X')
+				for _, c in v {
+					b = append(b, hex[c>>4], hex[c&15])
+				}
+			}
+		}
+		b = append(b, '\n')
+	}
+	return str(b)
+}
+
+// rt_qarg_text is a query value as text, as its handle is computed from it.
+fn rt_qarg_text(a qarg) str {
+	match a {
+		Int(v) => {
+			return rt_i64str(v)
+		}
+		Float(v) => {
+			return rt_float_json(v)
+		}
+		Str(v) => {
+			return v
+		}
+		Bool(v) => {
+			if v {
+				return "true"
+			}
+			return "false"
+		}
+		Bytes(v) => {
+			return str(v)
+		}
+	}
+}
+
+// rt_secret_header reports whether a header's value is stored as a handle.
+fn rt_secret_header(name str) bool {
+	if cast(i64, rtSecretHeaders) == 0 {
+		return false // no recording or replay set the list up
+	}
+	return rt_has_word(rtSecretHeaders, name)
+}
+
+// rt_replay_setup installs the keyed hash of secrets and the secret header list (",a,b,").
+fn rt_replay_setup(hash fn(str) str, headers str) {
+	rtSecretHash = hash
+	rtSecretHeaders = cast(str, rt_raw_str(headers))
+}

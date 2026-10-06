@@ -1,4 +1,4 @@
-// Go reference twin for tests/v2/closures.tin
+// Go reference twin for toolchain/tests/v2/closures.tin
 package main
 
 import "fmt"

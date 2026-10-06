@@ -24,7 +24,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     check([str(ROOT / 'bin/tinc'), '-o', str(out / 'api'), 'examples/api.tin'])
     check(['go', 'build', '-o', str(out / 'conformance'), './bench/http/conformance/main.go'])
-    check(['go', 'build', '-o', str(out / 'graceful'), './tests/graceful/graceful.go'])
+    check(['go', 'build', '-o', str(out / 'graceful'), './toolchain/tests/graceful/graceful.go'])
     number = port()
     with (out / 'server.log').open('w') as log:
         server = subprocess.Popen([str(out / 'api')], cwd=ROOT, stdout=log, stderr=log,

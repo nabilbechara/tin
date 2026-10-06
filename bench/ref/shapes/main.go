@@ -1,4 +1,4 @@
-// Go reference twin for tests/v2/shapes_dispatch.tin
+// Go reference twin for toolchain/tests/v2/shapes_dispatch.tin
 //
 // The Tin test and this program are one description: the same Buf, the same Stack, the
 // same generic functions over a Reader, a Writer, their composition, an ordered union

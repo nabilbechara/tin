@@ -1,5 +1,5 @@
-// Go twin of tests/v2/seal_sign.tin: private key parsing and signing with the test keys in
-// tests/data/keys. Run from the repository root:
+// Go twin of toolchain/tests/v2/seal_sign.tin: private key parsing and signing with the test keys in
+// toolchain/tests/data/keys. Run from the repository root:
 //
 //	go run ./bench/ref/seal_sign | sort        the twin's lines
 //	go run ./bench/ref/seal_sign gen DIR       writes a fresh set of test keys (good and bad)
@@ -202,7 +202,7 @@ func digest(h crypto.Hash, msg []byte) []byte {
 }
 
 func main() {
-	dir := "tests/data/keys"
+	dir := "toolchain/tests/data/keys"
 	if len(os.Args) > 2 && os.Args[1] == "gen" {
 		gen(os.Args[2])
 		return

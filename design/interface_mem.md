@@ -6,8 +6,8 @@ PR #214 (adopted).
 
 ## Ingot block header
 
-Every block of the per-core mmap heap (lib/runtime/memory.tin) keeps its 16-byte header,
-so payloads stay 16-byte aligned (docs/RUNTIME.md):
+Every block of the per-core mmap heap (toolchain/runtime/memory.tin) keeps its 16-byte header,
+so payloads stay 16-byte aligned (toolchain/docs/RUNTIME.md):
 
 | word | at    | meaning                                                              |
 |------|-------|----------------------------------------------------------------------|
@@ -27,7 +27,7 @@ and other cores' blocks are never counted, so no static data needs a header. A p
 chunk is a heap block whose payload is the pool's first object, so `rt_alloc_slow` pins
 it when it makes it: every rc operation on pool memory is then a no-op.
 
-## rc operations (lib/runtime/runtime.tin)
+## rc operations (toolchain/runtime/runtime.tin)
 
 ```
 rt_rc_inc(p)                    // p gains one long-lived reference (dequeues a queued p)
@@ -105,7 +105,7 @@ rt_rc_stats() (blocks, bytes, limbo)  // per-core diagnostics (roadmap 14.1), he
 
 - `keep$N` incs every reference it stores (a kept composite owns its fields, elements
   and entries), so a whole kept graph is consistently counted.
-- After `region_check()`, `rc_mark` (selfhost/region.tin) visits every analyzable,
+- After `region_check()`, `rc_mark` (toolchain/compiler/region.tin) visits every analyzable,
   reachable function except lifted ones and `__core_init`:
   - a store whose destination is provably long-lived (a global; a field or element whose
     base ident is a global or a local at exactly `RG_INGOT`) binds its value, reads the

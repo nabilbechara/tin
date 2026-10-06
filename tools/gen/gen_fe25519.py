@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate lib/seal/fe25519.tin: multiplication and squaring mod 2^255 - 19 on five unsigned
+"""Generate toolchain/std/seal/fe25519.tin: multiplication and squaring mod 2^255 - 19 on five unsigned
 limbs in radix 2^51 (#474), as straight-line code: no loop, branch or bounds check past the
 operand loads.
 

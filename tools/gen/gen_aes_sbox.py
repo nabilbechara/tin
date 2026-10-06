@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate lib/seal/aes_sbox.tin: the AES S-box on eight bit planes, as straight-line code.
+"""Generate toolchain/std/seal/aes_sbox.tin: the AES S-box on eight bit planes, as straight-line code.
 
 Plane i holds bit i of up to 64 bytes. The S-box is the inverse in GF(2^8) (x^254, mod
 x^8 + x^4 + x^3 + x + 1) followed by the affine map with 0x63, computed with ANDs and XORs

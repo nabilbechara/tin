@@ -11,10 +11,10 @@ def page(text, examples=None):
     """The problems of a tree with one docs page (and example files)."""
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        (root / 'docs').mkdir()
+        (root / 'toolchain/docs').mkdir(parents=True)
         (root / 'examples').mkdir()
         (root / 'README.md').write_text('# Tin\n')
-        (root / 'docs/PAGE.md').write_text(text)
+        (root / 'toolchain/docs/PAGE.md').write_text(text)
         for name, body in (examples or {}).items():
             (root / 'examples' / name).write_text(body)
         problems, programs, _ = dc.check_static(root)
@@ -63,9 +63,9 @@ class SyntaxTests(unittest.TestCase):
     def test_errors_page_is_not_compiled_here(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / 'docs').mkdir()
+            (root / 'toolchain/docs').mkdir(parents=True)
             (root / 'examples').mkdir()
-            (root / 'docs/ERRORS.md').write_text('```tin\nfn main() {}\n```\n')
+            (root / 'toolchain/docs/ERRORS.md').write_text('```tin\nfn main() {}\n```\n')
             problems, programs, _ = dc.check_static(root)
             self.assertEqual(problems, [])
             self.assertEqual(programs, {})

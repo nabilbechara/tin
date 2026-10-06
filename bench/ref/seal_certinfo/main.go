@@ -1,4 +1,4 @@
-// Go twin of tests/v2/seal_certinfo.tin: parsed certificate fields, IP parsing, PEM decoding and
+// Go twin of toolchain/tests/v2/seal_certinfo.tin: parsed certificate fields, IP parsing, PEM decoding and
 // host name matching. Run from the repository root: `go run ./bench/ref/seal_certinfo | sort`.
 //
 // Differences from Go handled here: seal.ParseIP accepts brackets and keeps IPv4 in 4 bytes, a
@@ -47,7 +47,7 @@ var ekuOIDs = map[x509.ExtKeyUsage]string{
 }
 
 func show(name string) {
-	text, err := os.ReadFile("tests/data/x509/certs/" + name + ".pem")
+	text, err := os.ReadFile("toolchain/tests/data/x509/certs/" + name + ".pem")
 	if err != nil {
 		panic(err)
 	}
@@ -98,10 +98,10 @@ func show(name string) {
 }
 
 func tlsSigs() {
-	lines, _ := os.ReadFile("tests/data/x509/tls_sigs.txt")
+	lines, _ := os.ReadFile("toolchain/tests/data/x509/tls_sigs.txt")
 	for _, ln := range strings.Split(strings.TrimSpace(string(lines)), "\n") {
 		f := strings.Fields(ln)
-		text, _ := os.ReadFile("tests/data/x509/certs/" + f[0] + ".pem")
+		text, _ := os.ReadFile("toolchain/tests/data/x509/certs/" + f[0] + ".pem")
 		blk, _ := pem.Decode(text)
 		c, err := x509.ParseCertificate(blk.Bytes)
 		if err != nil {

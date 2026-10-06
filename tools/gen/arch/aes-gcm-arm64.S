@@ -1,5 +1,5 @@
 // AES-CTR and GHASH leaves for seal (ARMv8 Crypto Extensions: AESE/AESMC and PMULL).
-// tools/gen/gen_aes_hw.py turns them into selfhost/aes_hw.tin. Relocation-free; they use only
+// tools/gen/gen_aes_hw.py turns them into toolchain/compiler/aes_hw.tin. Relocation-free; they use only
 // caller-saved registers (x0-x9, v0-v7, v16-v21) and keep x28 (the core context).
 // Constant-time: no branch or address depends on keys, data or the hash state.
 	.text

@@ -1,0 +1,76 @@
+package main
+
+import "say"
+import "seal"
+import "quarry"
+import "twine"
+
+// Private keys and signing with the test keys in toolchain/tests/data/keys (made by bench/ref/seal_sign
+// gen; "TESTING KEY" stands for "PRIVATE KEY" so secret scanners leave them alone). PKCS #1 v1.5
+// and RFC 6979 ECDSA signatures are deterministic and must equal Go's; PSS signatures are random
+// and are checked by verifying them. bench/ref/seal_sign is the Go twin.
+
+let good = []str{"rsa2048-pkcs1", "rsa2048-pkcs8", "rsa3072-pkcs8", "rsa4096-pkcs1", "ec256-sec1", "ec256-pkcs8", "ec384-sec1", "ec384-pkcs8", "ed25519-pkcs8"}
+let bad = []str{"rsa1024-pkcs1", "ec521-pkcs8", "ec256-wrong-public", "rsa2048-wrong-crt", "rsa2048-wrong-n", "rsa2048-truncated", "encrypted"}
+let message = "Tin signing test message"
+
+fn load(name str) !seal.PrivateKey {
+	let text = try quarry.ReadFile("toolchain/tests/data/keys/" + name + ".pem")
+	return try seal.ParsePrivateKeyPEM(twine.ReplaceAll(text, "TESTING KEY", "PRIVATE KEY"))
+}
+
+fn show(name str) ! {
+	let k = try load(name)
+	let hashes = []seal.Hash{seal.Hash.SHA256, seal.Hash.SHA384, seal.Hash.SHA512}
+	let names = []str{"SHA-256", "SHA-384", "SHA-512"}
+	let r = k.RSA
+	if r != nil {
+		say.Line(name, "RSA", seal.RSAKeyBits(r.Public))
+		for i, h in hashes {
+			let d = seal.Sum(h, message)
+			let sig = try seal.SignPKCS1v15(mut r, h, d)
+			say.Line(name, "pkcs1", names[i], seal.Hex(sig))
+			let pss = try seal.SignPSS(mut r, h, d)
+			let err = seal.VerifyPSS(r.Public, h, d, pss, seal.Size(h))
+			say.Line(name, "pss", names[i], err == nil)
+		}
+	}
+	let e = k.EC
+	if e != nil {
+		say.Line(name, "ECDSA", e.Curve)
+		for i, h in hashes {
+			let sig = try seal.SignECDSA(e, h, seal.Sum(h, message))
+			say.Line(name, "ecdsa", names[i], seal.Hex(sig))
+		}
+	}
+	if k.Ed != nil {
+		// Ed25519 (#477) is deterministic too: the signature must equal Go's.
+		say.Line(name, "Ed25519")
+		let sig = try k.SignTLS(0x0807, []u8(message))
+		say.Line(name, "ed25519", seal.Hex(sig))
+	}
+}
+
+fn main() {
+	for _, n in good {
+		show(n) catch err {
+			say.Line(n, "ERROR", err)
+		}
+	}
+	// SignTLS: RSA keys sign 0x0804-0x0806, P-256 keys 0x0403, P-384 keys 0x0503 and Ed25519
+	// keys 0x0807 only.
+	for _, n in []str{"rsa2048-pkcs8", "ec256-sec1", "ec384-pkcs8", "ed25519-pkcs8"} {
+		let k = load(n) catch err {
+			say.Line(n, "ERROR", err)
+			continue
+		}
+		for _, scheme in []i64{0x0401, 0x0804, 0x0805, 0x0806, 0x0809, 0x0403, 0x0503, 0x0603, 0x0807} {
+			let (_, err) = k.SignTLS(scheme, []u8(message))
+			say.Line("signtls", n, scheme, err == nil)
+		}
+	}
+	for _, n in bad {
+		let (_, err) = load(n)
+		say.Line(n, "rejected", err != nil)
+	}
+}

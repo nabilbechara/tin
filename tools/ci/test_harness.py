@@ -15,7 +15,7 @@ class SuiteTests(unittest.TestCase):
     def scenario(self, *, negative=False, golden=True, outcomes=()):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            tests = root / 'tests/v2'
+            tests = root / 'toolchain/tests/v2'
             tests.mkdir(parents=True)
             source = tests / ('sample_bad.tin' if negative else 'sample.tin')
             source.write_text('package main\n')
@@ -105,7 +105,7 @@ class AsmSuiteTests(unittest.TestCase):
     def scenario(self, *, check='[arm64]\nCHECK: bl X\n[amd64]\nCHECK: bl X\n', tin=True):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            tests = root / 'tests/v2'
+            tests = root / 'toolchain/tests/v2'
             tests.mkdir(parents=True)
             # run() insists on finding the ordinary suite too; one tiny passing case.
             (tests / 'sample.tin').write_text('package main\n')

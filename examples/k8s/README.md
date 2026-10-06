@@ -17,7 +17,7 @@ until a release includes it, pass a builder made from this tree with
 `tools/ci/distribution_check.py` does). Docker selects arm64 or amd64 for the build. Use
 `docker buildx build --platform linux/amd64` to select a different destination, or
 `--platform linux/amd64,linux/arm64 --push -t YOUR_IMAGE` for both. The compiler stays
-in the build stage. See [distribution](../../docs/DISTRIBUTION.md) for local builder overrides.
+in the build stage. See [distribution](../../toolchain/docs/DISTRIBUTION.md) for local builder overrides.
 
 The binary is a glibc executable (`libc.so.6` + `libm.so.6`), so the final image is
 `debian:bookworm-slim` plus one file; it runs as uid 10001.
@@ -72,10 +72,10 @@ curl -s localhost:8080/healthz
    seconds (default 25; set it below `terminationGracePeriodSeconds`). A second signal exits
    immediately.
 
-`tests/graceful/graceful.go` exercises all of this against a server binary:
+`toolchain/tests/graceful/graceful.go` exercises all of this against a server binary:
 
 ```sh
-go run tests/graceful/graceful.go bin/api 9381                                   # macOS
-GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/linux/graceful tests/graceful/graceful.go
+go run toolchain/tests/graceful/graceful.go bin/api 9381                                   # macOS
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o bin/linux/graceful toolchain/tests/graceful/graceful.go
 docker run --rm -v $PWD/bin/linux:/w tin-debian-arm64 /w/graceful /w/api 9381     # Linux
 ```

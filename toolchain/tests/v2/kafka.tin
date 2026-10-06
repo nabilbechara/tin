@@ -1,0 +1,81 @@
+package main
+
+import "kafka"
+import "say"
+
+// The parts of the Kafka client that need no broker: the key partitioner (Kafka's murmur2, with
+// the six vectors of Kafka's own UtilsTest plus the empty key), and the record batch format with
+// every codec. A fake cluster is in toolchain/tests/v2/kafka_broker.tin, real brokers in toolchain/tests/kafka/.
+
+fn check(label str, got i64, want i64) {
+	if got == want {
+		say.Line("ok", label)
+	} else {
+		say.Line("FAIL", label, got, want)
+	}
+}
+
+fn main() {
+	check("murmur2 21", kafka.Murmur2("21"), -973932308)
+	check("murmur2 foobar", kafka.Murmur2("foobar"), -790332482)
+	check("murmur2 long string", kafka.Murmur2("a-little-bit-long-string"), -985981536)
+	check("murmur2 longer string", kafka.Murmur2("a-little-bit-longer-string"), -1486304829)
+	check("murmur2 long key", kafka.Murmur2("lkjh234lh9fiuh90y23oiuhsafujhadof229phr9h19h89h8"), -58897971)
+	check("murmur2 abc", kafka.Murmur2("abc"), 479470107)
+	check("murmur2 empty", kafka.Murmur2(""), 275646681)
+	for _, n in []i64{1, 2, 3, 7, 50} {
+		let p = kafka.PartitionFor("foobar", n)
+		if p >= 0 && p < n {
+			say.Line("ok partition in range", n)
+		} else {
+			say.Line("FAIL partition", n, p)
+		}
+	}
+
+	let ms = []kafka.Message{
+		kafka.Message{Key: "k1", Value: "v1", Headers: []kafka.Header{kafka.Header{Key: "h", Value: "x"}}, Timestamp: 1700000000123},
+		kafka.Message{Key: "", Value: "", Headers: []kafka.Header{}, Timestamp: 0},
+		kafka.Message{Key: "k3", Value: "a longer value with ünïcode, repeated, repeated, repeated", Headers: []kafka.Header{}, Timestamp: 1700000005000},
+	}
+	let names = []str{"none", "gzip", "snappy", "lz4", "zstd"}
+	let codecs = []kafka.Compression{kafka.Compression.None, kafka.Compression.Gzip, kafka.Compression.Snappy, kafka.Compression.Lz4, kafka.Compression.Zstd}
+	for i, cd in codecs {
+		let raw = kafka.EncodeBatch(ms, 1700000009999, cd)
+		let rs = kafka.DecodeBatches(raw) catch err {
+			say.Line("FAIL decode", names[i], err)
+			continue
+		}
+		say.Line(names[i], "records", len(rs))
+		for _, r in rs {
+			say.Line(names[i], "record", r.Offset, r.Timestamp, r.Key, r.Value, len(r.Headers))
+		}
+		// Two batches back to back, then a cut-off third: the third is dropped.
+		let more = kafka.DecodeBatches(raw + raw + raw[:len(raw)-3]) catch err {
+			say.Line("FAIL decode two", names[i], err)
+			continue
+		}
+		say.Line(names[i], "records in two and a half batches", len(more))
+		// One changed byte in the checked part fails the CRC.
+		mut bad = []u8{}
+		for k in 0..len(raw) {
+			bad = append(bad, raw[k])
+		}
+		bad[len(bad)-1] = bad[len(bad)-1] ^ 1
+		let (_, err) = kafka.DecodeBatches(str(bad))
+		say.Line(names[i], "changed byte:", err)
+	}
+	// A large batch compresses (the payload repeats).
+	mut big = []kafka.Message{}
+	for k in 0..500 {
+		big = append(big, kafka.Message{Key: "", Value: "the same value, again and again", Headers: []kafka.Header{}, Timestamp: 1})
+	}
+	let plain = kafka.EncodeBatch(big, 1, kafka.Compression.None)
+	for i, cd in codecs {
+		if i == 0 {
+			continue
+		}
+		let z = kafka.EncodeBatch(big, 1, cd)
+		let back = kafka.DecodeBatches(z) catch _ { []kafka.Record{} }
+		say.Line(names[i], "500 records under a quarter of their size", len(z) < len(plain)/4, len(back) == 500)
+	}
+}

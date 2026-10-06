@@ -1,7 +1,7 @@
-SELF = selfhost/entry.tin selfhost/records.tin selfhost/util.tin selfhost/lex.tin selfhost/types.tin selfhost/secret.tin selfhost/parse.tin \
-       selfhost/check.tin selfhost/lower.tin selfhost/generics.tin selfhost/region.tin selfhost/inline.tin selfhost/opt.tin selfhost/asm.tin selfhost/gen.tin selfhost/asm_x64.tin selfhost/gen_x64.tin \
-       selfhost/memory_fast.tin selfhost/syscall_fast.tin selfhost/sha256.tin selfhost/aes_hw.tin selfhost/macho.tin selfhost/elf.tin selfhost/elf_x64.tin selfhost/caps.tin selfhost/main.tin \
-       selfhost/host_$(HOST_OS).tin
+SELF = toolchain/compiler/entry.tin toolchain/compiler/records.tin toolchain/compiler/util.tin toolchain/compiler/lex.tin toolchain/compiler/types.tin toolchain/compiler/secret.tin toolchain/compiler/parse.tin \
+       toolchain/compiler/check.tin toolchain/compiler/lower.tin toolchain/compiler/generics.tin toolchain/compiler/region.tin toolchain/compiler/inline.tin toolchain/compiler/opt.tin toolchain/compiler/asm.tin toolchain/compiler/gen.tin toolchain/compiler/asm_x64.tin toolchain/compiler/gen_x64.tin \
+       toolchain/compiler/memory_fast.tin toolchain/compiler/syscall_fast.tin toolchain/compiler/sha256.tin toolchain/compiler/aes_hw.tin toolchain/compiler/macho.tin toolchain/compiler/elf.tin toolchain/compiler/elf_x64.tin toolchain/compiler/caps.tin toolchain/compiler/main.tin \
+       toolchain/compiler/host_$(HOST_OS).tin
 
 .PHONY: all bootstrap seed test bench clean install dist linux-bootstrap linux-amd64-bootstrap linux-test
 
@@ -9,9 +9,9 @@ HOST_OS := $(shell uname -s | tr A-Z a-z)
 HOST_ARCH := $(shell uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
 # Where `make install` links tin: Homebrew's prefix on a Mac that has one, /usr/local elsewhere.
 PREFIX ?= $(if $(and $(filter darwin,$(HOST_OS)),$(wildcard /opt/homebrew/bin)),/opt/homebrew,/usr/local)
-SEED := seed/tinc-$(HOST_OS)-$(shell uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
+SEED := toolchain/seed/tinc-$(HOST_OS)-$(shell uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
 # Sources of a compiler for the other OS (cross builds).
-SELF_LINUX_COMMON = $(filter-out selfhost/host_darwin.tin selfhost/host_linux.tin,$(SELF)) selfhost/host_linux.tin
+SELF_LINUX_COMMON = $(filter-out toolchain/compiler/host_darwin.tin toolchain/compiler/host_linux.tin,$(SELF)) toolchain/compiler/host_linux.tin
 SELF_LINUX = $(SELF_LINUX_COMMON)
 SELF_LINUX_AMD64 = $(SELF_LINUX_COMMON)
 
@@ -25,7 +25,7 @@ dist: bin/tinc
 # The compiler, built by the checked-in seed compiler: no Go, no cc.
 bin/tinc: $(SEED) $(SELF)
 	@mkdir -p bin
-	$(SEED) -o $@ $(SELF)
+	TIN_ROOT=$(CURDIR) $(SEED) -o $@ $(SELF)
 
 # Rebuild tinc with itself twice; the two binaries must be byte-identical.
 bootstrap: bin/tinc
@@ -60,10 +60,10 @@ bin/linux/tinc: bin/tinc $(SELF_LINUX)
 linux-bootstrap: bin/linux/tinc
 	docker run --rm -e TIN_ROOT=/src -v $(CURDIR):/src -w /src $${TIN_LINUX_IMAGE:-tin-debian-arm64} sh -c '\
 	  bin/linux/tinc -o /tmp/s2 $(SELF_LINUX) && /tmp/s2 -o /tmp/s3 $(SELF_LINUX) && cmp /tmp/s2 /tmp/s3 && \
-	  cp /tmp/s3 seed/tinc-linux-arm64 && echo "linux fixed point: tinc compiles itself to an identical binary"'
+	  cp /tmp/s3 toolchain/seed/tinc-linux-arm64 && echo "linux fixed point: tinc compiles itself to an identical binary"'
 
 # The same for linux-amd64, run in an (emulated on arm64 hosts) amd64 container; refreshes
-# seed/tinc-linux-amd64.
+# toolchain/seed/tinc-linux-amd64.
 bin/linux-amd64/tinc: bin/tinc $(SELF_LINUX_AMD64)
 	@mkdir -p bin/linux-amd64
 	bin/tinc -target linux-amd64 -o $@ $(SELF_LINUX_AMD64)
@@ -71,7 +71,7 @@ bin/linux-amd64/tinc: bin/tinc $(SELF_LINUX_AMD64)
 linux-amd64-bootstrap: bin/linux-amd64/tinc
 	docker run --rm --platform linux/amd64 -e TIN_ROOT=/src -v $(CURDIR):/src -w /src $${TIN_LINUX_AMD64_IMAGE:-tin-debian-amd64} sh -c '\
 	  bin/linux-amd64/tinc -o /tmp/s2 $(SELF_LINUX_AMD64) && /tmp/s2 -o /tmp/s3 $(SELF_LINUX_AMD64) && cmp /tmp/s2 /tmp/s3 && \
-	  cp /tmp/s3 seed/tinc-linux-amd64 && echo "linux-amd64 fixed point: tinc compiles itself to an identical binary"'
+	  cp /tmp/s3 toolchain/seed/tinc-linux-amd64 && echo "linux-amd64 fixed point: tinc compiles itself to an identical binary"'
 
 linux-test: bin/tinc
 	tools/dev/linuxtest.sh bin/tinc

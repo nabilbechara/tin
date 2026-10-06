@@ -1,5 +1,5 @@
 // AES-CTR and GHASH leaves for seal (AES-NI and PCLMULQDQ), and their CPUID check.
-// tools/gen/gen_aes_hw.py turns them into selfhost/aes_hw.tin. Relocation-free; they use only
+// tools/gen/gen_aes_hw.py turns them into toolchain/compiler/aes_hw.tin. Relocation-free; they use only
 // caller-saved registers (rbx is saved by aes_hw_cpu) and never touch r15 (the core context).
 // Constant-time: no branch or address depends on keys, data or the hash state (PSHUFB
 // shuffles registers, it does not read memory).

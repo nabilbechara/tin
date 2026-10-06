@@ -1,0 +1,110 @@
+// Package wycheproofpkg runs the compact Wycheproof signature files for toolchain/tests/v2/seal_wycheproof*.tin.
+package wycheproofpkg
+
+import "say"
+import "seal"
+import "quarry"
+import "twine"
+
+fn hexOrEmpty(s str) []u8 {
+	if s == "-" {
+		return []u8{}
+	}
+	let (b, err) = seal.HexDecode(s)
+	if err != nil {
+		return []u8{}
+	}
+	return b
+}
+
+fn hashOf(name str) seal.Hash {
+	if name == "SHA-384" {
+		return seal.Hash.SHA384
+	}
+	if name == "SHA-512" {
+		return seal.Hash.SHA512
+	}
+	return seal.Hash.SHA256
+}
+
+// Run checks every test of toolchain/tests/wycheproof/NAME.txt and prints a summary line and any mismatch.
+fn Run(name str) {
+	let text = quarry.ReadFile("toolchain/tests/wycheproof/" + name + ".txt") catch err {
+		say.Line(name, "unreadable:", err)
+		return
+	}
+	mut kind = ""
+	mut h = seal.Hash.SHA256
+	mut salt = -1
+	mut keyOk = false
+	mut key = seal.RSAPublicKey{N: []u8{}, E: []u8{}}
+	mut curve = ""
+	mut point = []u8{}
+	let counts = map[str]i64{}
+	let passed = map[str]i64{}
+	for _, ln in twine.Split(text, "\n") {
+		if ln == "" || ln[0] == '#' {
+			continue
+		}
+		let f = twine.Fields(ln)
+		if f[0] == "group" {
+			kind = f[1]
+			h = hashOf(f[2])
+			salt = -1
+			if kind == "ecdsa" || kind == "ed25519" {
+				curve = f[3]
+				point = hexOrEmpty(f[4])
+				keyOk = true
+				continue
+			}
+			if f[3] != "-" {
+				salt = mint_atoi(f[3])
+			}
+			let (k, err) = seal.ParseRSAPublicKeyDER(hexOrEmpty(f[4]))
+			keyOk = err == nil
+			if keyOk {
+				key = k
+			}
+			continue
+		}
+		let result = f[1]
+		let msg = hexOrEmpty(f[2])
+		let sig = hexOrEmpty(f[3])
+		mut digest = []u8{}
+		if kind != "ed25519" {
+			digest = seal.Sum(h, str(msg))
+		}
+		mut ok = false
+		if keyOk {
+			if kind == "rsa-pkcs1" {
+				let err = seal.VerifyPKCS1v15(key, h, digest, sig)
+				ok = err == nil
+			} else if kind == "ed25519" {
+				let err = seal.VerifyEd25519(point, msg, sig)
+				ok = err == nil
+			} else if kind == "ecdsa" {
+				let err = seal.VerifyECDSA(curve, point, digest, sig)
+				ok = err == nil
+			} else {
+				let err = seal.VerifyPSS(key, h, digest, sig, salt)
+				ok = err == nil
+			}
+		}
+		counts[result] += 1
+		if ok {
+			passed[result] += 1
+		}
+		if (result == "valid" && !ok) || (result == "invalid" && ok) {
+			say.Line(name, "MISMATCH tcId", f[0], result, ok)
+		}
+	}
+	say.Line(name, "valid", passed["valid"], "/", counts["valid"], "invalid-accepted", passed["invalid"], "/", counts["invalid"], "acceptable-accepted", passed["acceptable"], "/", counts["acceptable"])
+}
+
+fn mint_atoi(s str) i64 {
+	mut v = 0
+	for i in 0..len(s) {
+		v = v*10 + i64(s[i]-'0')
+	}
+	return v
+}

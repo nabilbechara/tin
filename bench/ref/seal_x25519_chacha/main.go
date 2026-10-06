@@ -1,4 +1,4 @@
-// Go twin of tests/v2/seal_x25519_chacha.tin. Go's standard library has X25519 (crypto/ecdh)
+// Go twin of toolchain/tests/v2/seal_x25519_chacha.tin. Go's standard library has X25519 (crypto/ecdh)
 // but no exported ChaCha20-Poly1305, so that part is RFC 8439 written out with math/big.
 package main
 

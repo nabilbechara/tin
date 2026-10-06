@@ -680,7 +680,7 @@ def main():
     source = source.replace('\tw.Status(404)\n\tw.Text("no route', '\tif extra(q, mut w) { return }\n\tw.Status(404)\n\tw.Text("no route')
     (out/'service.tin').write_text(source)
     exe = out/'service'
-    subprocess.run([str(ROOT/'bin/tinc'), '-o', str(exe), str(out/'service.tin'), 'tests/fixtures/postgres_routes.tin'], cwd=ROOT, check=True, env=dict(os.environ, TIN_ROOT=str(ROOT)))
+    subprocess.run([str(ROOT/'bin/tinc'), '-o', str(exe), str(out/'service.tin'), 'toolchain/tests/fixtures/postgres_routes.tin'], cwd=ROOT, check=True, env=dict(os.environ, TIN_ROOT=str(ROOT)))
     real = os.environ.get('POSTGRES_ADDR')
     fake = None if real else Fake()
     env = {} if real else {'POSTGRES_ADDR': '127.0.0.1:%d' % fake.port, 'POSTGRES_USER': 'tin', 'POSTGRES_PASSWORD': 'tinpass', 'POSTGRES_DATABASE': 'tin'}

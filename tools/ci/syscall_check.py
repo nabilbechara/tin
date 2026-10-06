@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 from suite import ROOT
 from libc_inventory import read_inventory
+from treeutil import copy_lib
 
 
 def undefined_symbols(path):
@@ -39,7 +40,7 @@ def main():
     out.mkdir(parents=True,exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='syscall-',dir=out) as tmp:
         work = Path(tmp)
-        shutil.copytree(ROOT/'lib',work/'lib')
+        copy_lib(ROOT, work/'lib')
         probe = work/'lib/syscallprobe'
         probe.mkdir()
         shutil.copy(ROOT/'tools/ci/fixtures/syscall_probe.tin',probe/'probe.tin')

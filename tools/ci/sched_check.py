@@ -16,6 +16,7 @@ import tempfile
 import time
 from suite import ROOT
 from replay_check import CAPSULE_KEY, decode_body, free_port, open_capsule
+from treeutil import copy_lib
 
 EXPECTED = '''\
 no tape: lane
@@ -140,7 +141,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='sched-', dir=out) as tmp:
         work = Path(tmp)
-        shutil.copytree(ROOT / 'lib', work / 'lib')
+        copy_lib(ROOT, work / 'lib')
         probe = work / 'lib/schedprobe'
         probe.mkdir()
         shutil.copy(ROOT / 'tools/ci/fixtures/sched_probe.tin', probe / 'probe.tin')

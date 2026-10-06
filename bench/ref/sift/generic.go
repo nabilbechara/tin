@@ -1,6 +1,6 @@
 package main
 
-// The Go twin of tests/v2/sift_generic.tin: `go run ./bench/ref/sift generic` prints the lines that
+// The Go twin of toolchain/tests/v2/sift_generic.tin: `go run ./bench/ref/sift generic` prints the lines that
 // test must print (the strict runner sorts them before comparing). It is Go's slices and cmp, so a
 // difference is a difference from Go, including in the order of equal elements after SortFunc.
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Diagnostic codes (#244): the compiler, docs/ERRORS.md and the expected diagnostics agree.
+"""Diagnostic codes (#244): the compiler, toolchain/docs/ERRORS.md and the expected diagnostics agree.
 
 Without a compiler it checks the codes only: every code the compiler prints (a string such as
-"E502 TYPE_ARG_COUNT" in selfhost/*.tin) is documented under that name, every documented code
+"E502 TYPE_ARG_COUNT" in toolchain/compiler/*.tin) is documented under that name, every documented code
 is printed by the compiler or retired, a number and a name each belong to one code, the
 compiler prints no error without a code, and every line of the tests' expected diagnostics
 carries a documented code. Given a compiler, it also compiles each documented example and
@@ -19,8 +19,8 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
-DOC = Path('docs/ERRORS.md')
-# Examples use the syntax docs/LANGUAGE.md describes; a ```tin edition=1 block uses edition 1.
+DOC = Path('toolchain/docs/ERRORS.md')
+# Examples use the syntax toolchain/docs/LANGUAGE.md describes; a ```tin edition=1 block uses edition 1.
 EDITION = '0'
 
 SOURCE_CODE = re.compile(r'"(E\d{3}) ([A-Z][A-Z0-9_]*)"')
@@ -137,7 +137,7 @@ def check_doc(entries, problems):
 def source_codes(root):
     """{(code, name): [file:line, ...]} for every code string in the compiler's sources."""
     used = {}
-    for path in sorted((root / 'selfhost').glob('*.tin')):
+    for path in sorted((root / 'toolchain/compiler').glob('*.tin')):
         for number, line in enumerate(path.read_text().splitlines(), 1):
             for code, name in SOURCE_CODE.findall(line):
                 used.setdefault((code, name), []).append(f'{path.relative_to(root)}:{number}')
@@ -148,11 +148,11 @@ def expected_diagnostics(root):
     """(where, text, whole) for every expected compiler diagnostic in the tests; whole is
     False for a stderr_contains contract, which is part of a line."""
     found = []
-    for pattern in ('tests/v2/*.err', 'tests/edition1/*.err'):
+    for pattern in ('toolchain/tests/v2/*.err', 'toolchain/tests/edition1/*.err'):
         for path in sorted(root.glob(pattern)):
             for number, line in enumerate(path.read_text().splitlines(), 1):
                 found.append((f'{path.relative_to(root)}:{number}', line, True))
-    cases = root / 'tests/regressions/cases.json'
+    cases = root / 'toolchain/tests/regressions/cases.json'
     for case in json.loads(cases.read_text()) if cases.exists() else []:
         expected = case.get('expected', {})
         if expected.get('phase') != 'compile':
@@ -191,11 +191,11 @@ def check_static(root=ROOT):
         if not e['retired'] and e['code'] not in printed:
             problems.append(f"{DOC}:{e['line']}: {e['code']} {e['name']} is not printed by the compiler "
                             '(mark it retired; never delete or reuse a code)')
-    for path in sorted((root / 'selfhost').glob('*.tin')):
+    for path in sorted((root / 'toolchain/compiler').glob('*.tin')):
         for number, line in enumerate(path.read_text().splitlines(), 1):
             if SOURCE_UNCODED.search(line):
                 problems.append(f'{path.relative_to(root)}:{number}: prints an error without a code '
-                                '(use err_code and a code from docs/ERRORS.md)')
+                                '(use err_code and a code from toolchain/docs/ERRORS.md)')
     coded = uncoded = 0
     for where, line, whole in expected_diagnostics(root):
         found = PRINTED.findall(line)

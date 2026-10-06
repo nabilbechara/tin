@@ -1,6 +1,6 @@
 package main
 
-// The edge cases of tests/v2/gauge_math.tin, run through Go's math package. `go run ./bench/ref/gauge cases`
+// The edge cases of toolchain/tests/v2/gauge_math.tin, run through Go's math package. `go run ./bench/ref/gauge cases`
 // prints the lines that test must print (the strict runner sorts them before comparing). Exp, Exp2, Sinh,
 // Cosh, Tanh and Pow are Go's pure algorithms from corpus.go: math.Exp is assembly on arm64 and amd64, and
 // returns 0 for Exp(-745) where the true value rounds to the smallest subnormal.
