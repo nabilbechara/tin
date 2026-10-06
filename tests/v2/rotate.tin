@@ -1,0 +1,79 @@
+package main
+
+import "say"
+
+// Rotations (#488): x << c | x >> (64-c) on an unsigned 64-bit x is one ror on arm64 and one rol
+// on x86-64, in either order and with | ^ or + between the shifts. Each form is checked against a
+// rotation made of doublings, which no matcher takes. A signed x is not a rotation: its >> keeps
+// the sign, and the result must stay the shifts' own.
+
+@wrap fn slow(x u64, c i64) u64 {
+	mut v = x
+	for i in 0..c {
+		v = v*2 + v/9223372036854775808
+	}
+	return v
+}
+
+@wrap fn forms(x u64) i64 {
+	mut bad = 0
+	if x<<1|x>>63 != slow(x, 1) {
+		bad += 1
+	}
+	if x<<7|x>>57 != slow(x, 7) {
+		bad += 1
+	}
+	if x>>51|x<<13 != slow(x, 13) {
+		bad += 1
+	}
+	if x<<32^x>>32 != slow(x, 32) {
+		bad += 1
+	}
+	if x<<51+x>>13 != slow(x, 51) {
+		bad += 1
+	}
+	if x<<63|x>>1 != slow(x, 63) {
+		bad += 1
+	}
+	let y = x ^ 0x5555555555555555
+	if (y<<44|y>>20)^x != slow(y, 44)^x {
+		bad += 1
+	}
+	return bad
+}
+
+@wrap fn signed(x i64) i64 {
+	let a = x << 3
+	let b = x >> 61
+	return x<<3|x>>61 - (a | b)
+}
+
+@wrap fn next(v u64) u64 {
+	mut x = v
+	x ^= x << 13
+	x ^= x >> 7
+	x ^= x << 17
+	return x
+}
+
+fn main() {
+	mut bad = 0
+	mut n = 0
+	for x in []u64{0, 1, 0x8000000000000000, 0xffffffffffffffff, 0x0123456789abcdef} {
+		bad += forms(x)
+		n += 1
+	}
+	mut v = u64(0x9e3779b97f4a7c15)
+	for i in 0..5000 {
+		v = next(v)
+		bad += forms(v)
+		n += 1
+	}
+	mut sbad = 0
+	for x in []i64{-1, -8, -9223372036854775807, 5, 0x7fffffffffffffff} {
+		if signed(x) != 0 {
+			sbad += 1
+		}
+	}
+	say.Line(n, "words,", bad, "wrong;", sbad, "signed wrong")
+}

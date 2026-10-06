@@ -107,6 +107,7 @@ fn treg(d i64) i64 {
 	return r
 }
 
+
 fn freg(d i64) i64 {
 	let r = f_regs[d]
 	used_fregs = used_fregs | (1 << (r - FPR))
@@ -385,6 +386,240 @@ fn opt_equal(a i64, b i64) i64 {
 		return i64(a == b)
 	}
 	return expr_equal(a, b)
+}
+
+// ---- multi-word arithmetic: a product's two halves and an add's carry (#488) ----
+//
+// Montgomery multiplication (lib/seal/field.tin) is written as pairs of statements that each
+// target can do in fewer instructions than the two would take apart:
+//	lo = a * b; hi = __mulhu(a, b)       one mul on x86-64 leaves both halves in rdx:rax
+//	s = x + y; h = k + lt(s, y)          lt(s, y) is the add's carry: adc on x86-64, cinc on arm64
+// The matchers take locals and constants only, so both statements read the same values.
+
+shared mut mw_lo i64 // the matched pair: the locals set (Sym) and the operands (stripped)
+shared mut mw_hi i64
+shared mut mw_a i64
+shared mut mw_b i64
+shared mut mw_k i64
+
+fn word_int(t Ty) i64 {
+	return i64(cast(i64, t) != 0 && t.kind == K_INT && t.width == 8)
+}
+
+// strip_same is e without the conversions between 64-bit integers, which keep its bits.
+fn strip_same(e i64) i64 {
+	mut x = e
+	for cast(Node, x).kind == EX_CONV && cast(Conv, x).ovf != OVF_CHECK && (cast(Conv, x).kind == CV_SAME || cast(Conv, x).kind == CV_INT) && word_int(cast(Ty, cast(Node, x).type_)) != 0 && word_int(cast(Ty, cast(Node, cast(Conv, x).x).type_)) != 0 {
+		x = cast(Conv, x).x
+	}
+	return x
+}
+
+// word_local is the Sym of a 64-bit integer local that lives in a register or frame slot.
+fn word_local(s i64) i64 {
+	if s == 0 {
+		return 0
+	}
+	let sym = cast(Sym, s)
+	if sym.kind != SYM_LOCAL || sym.captured != 0 || sym.cell != 0 || word_int(cast(Ty, sym.type_)) == 0 || (sym.reg < 0 && sym.reg != REG_SLOT) {
+		return 0
+	}
+	return s
+}
+
+// word_operand is e stripped when it is such a local or a constant, else 0.
+fn word_operand(e i64) i64 {
+	let x = strip_same(e)
+	if cast(Node, x).kind == EX_INT && word_int(cast(Ty, cast(Node, x).type_)) != 0 {
+		return x
+	}
+	if cast(Node, x).kind == EX_IDENT && word_local(cast(IdentExpr, x).ref) != 0 {
+		return x
+	}
+	return 0
+}
+
+fn operand_is(e i64, sym i64) i64 {
+	return i64(cast(Node, e).kind == EX_IDENT && cast(IdentExpr, e).ref == sym)
+}
+
+// set_local is the local a let or an assignment statement sets (its Sym), and set_value its value.
+fn set_local(s i64) i64 {
+	let k = cast(Node, s).kind
+	if k == ST_LET && cast(LetStmt, s).init != 0 {
+		return word_local(cast(LetStmt, s).sym)
+	}
+	if k == ST_ASSIGN && cast(Node, cast(AssignStmt, s).target).kind == EX_IDENT {
+		return word_local(cast(IdentExpr, cast(AssignStmt, s).target).ref)
+	}
+	return 0
+}
+
+fn set_value(s i64) i64 {
+	if cast(Node, s).kind == ST_LET {
+		return cast(LetStmt, s).init
+	}
+	return cast(AssignStmt, s).value
+}
+
+// wrap_op reports e as a 64-bit integer binary op without an overflow check.
+fn wrap_op(e i64, op str) i64 {
+	return i64(cast(Node, e).kind == EX_BINARY && cast(Binary, e).op == op && cast(Binary, e).ovf != OVF_CHECK && word_int(cast(Ty, cast(Node, e).type_)) != 0)
+}
+
+// mul_pair matches s1, s2 as lo = a * b; hi = __mulhu(a, b) (the operands in either order),
+// lo another local than hi and not an operand.
+fn mul_pair(s1 i64, s2 i64) i64 {
+	let lo = set_local(s1)
+	let hi = set_local(s2)
+	if lo == 0 || hi == 0 || lo == hi {
+		return 0
+	}
+	let v1 = strip_same(set_value(s1))
+	let v2 = strip_same(set_value(s2))
+	if wrap_op(v1, "*") == 0 || cast(Node, v2).kind != EX_CALL || cast(Call, v2).name != "__mulhu" {
+		return 0
+	}
+	let a = word_operand(cast(Binary, v1).l)
+	let b = word_operand(cast(Binary, v1).r)
+	let args = cast(Call, v2).args
+	if a == 0 || b == 0 || len(args) != 2 || operand_is(a, lo) != 0 || operand_is(b, lo) != 0 {
+		return 0
+	}
+	let a2 = strip_same(args[0])
+	let b2 = strip_same(args[1])
+	if !((expr_equal(a, a2) != 0 && expr_equal(b, b2) != 0) || (expr_equal(a, b2) != 0 && expr_equal(b, a2) != 0)) {
+		return 0
+	}
+	mw_lo = lo
+	mw_hi = hi
+	mw_a = a
+	mw_b = b
+	return 1
+}
+
+// carry_of reports e as lt(s, y) for the sum s = x + y: an unsigned s < x or s < y, as a 0 or 1
+// of any integer type. The compare must not be with s itself.
+fn carry_of(e i64, s i64, x i64, y i64) i64 {
+	mut c = e
+	for cast(Node, c).kind == EX_CONV && cast(Conv, c).ovf != OVF_CHECK && (cast(Conv, c).kind == CV_SAME || cast(Conv, c).kind == CV_INT) {
+		c = cast(Conv, c).x
+	}
+	if cast(Node, c).kind != EX_BINARY || cast(Binary, c).op != "<" {
+		return 0
+	}
+	let l = strip_same(cast(Binary, c).l)
+	let r = word_operand(cast(Binary, c).r)
+	if operand_is(l, s) == 0 || r == 0 || operand_is(r, s) != 0 || is_unsigned_t(cast(Ty, cast(Node, l).type_)) == 0 {
+		return 0
+	}
+	return i64(expr_equal(r, x) != 0 || expr_equal(r, y) != 0)
+}
+
+// add_carry matches s1, s2 as s = x + y; h = k + lt(s, y) (or lt(s, x), or the carry first),
+// with h another local than s and k a local: the add's carry flag is the lt.
+fn add_carry(s1 i64, s2 i64) i64 {
+	let s = set_local(s1)
+	let h = set_local(s2)
+	if s == 0 || h == 0 || s == h {
+		return 0
+	}
+	let v1 = strip_same(set_value(s1))
+	let v2 = strip_same(set_value(s2))
+	if wrap_op(v1, "+") == 0 || wrap_op(v2, "+") == 0 {
+		return 0
+	}
+	let x = word_operand(cast(Binary, v1).l)
+	let y = word_operand(cast(Binary, v1).r)
+	if x == 0 || y == 0 {
+		return 0
+	}
+	mut k = word_operand(cast(Binary, v2).l)
+	if k == 0 || cast(Node, k).kind != EX_IDENT || carry_of(cast(Binary, v2).r, s, x, y) == 0 {
+		k = word_operand(cast(Binary, v2).r)
+		if k == 0 || cast(Node, k).kind != EX_IDENT || carry_of(cast(Binary, v2).l, s, x, y) == 0 {
+			return 0
+		}
+	}
+	mw_lo = s
+	mw_hi = h
+	mw_a = x
+	mw_b = y
+	mw_k = k
+	return 1
+}
+
+// rot_left matches e as x << c | x >> (64-c), in either order and with | ^ or + between them,
+// for an unsigned 64-bit x without effects and 0 < c < 64: a rotation, ror on arm64 and rol on
+// x86-64 (#488). It returns c (0 for no match) and leaves x in rot_x.
+shared mut rot_x i64
+
+fn rot_left(e Binary) i64 {
+	let op = e.op
+	if (op != "|" && op != "^" && op != "+") || cast(Node, e.l).kind != EX_BINARY || cast(Node, e.r).kind != EX_BINARY {
+		return 0
+	}
+	mut shl = cast(Binary, e.l)
+	mut shr = cast(Binary, e.r)
+	if shl.op == ">>" {
+		shl = cast(Binary, e.r)
+		shr = cast(Binary, e.l)
+	}
+	if shl.op != "<<" || shr.op != ">>" || is_const(shl.r) == 0 || is_const(shr.r) == 0 {
+		return 0
+	}
+	let c = const_val(shl.r)
+	if c <= 0 || c >= 64 || const_val(shr.r) != 64-c || expr_equal(shl.l, shr.l) == 0 || has_effects(shl.l) != 0 {
+		return 0
+	}
+	let t = cast(Ty, cast(Node, shl.l).type_)
+	if word_int(t) == 0 || is_unsigned_t(t) == 0 {
+		return 0
+	}
+	rot_x = shl.l
+	return c
+}
+
+// addr_split splits the address of a raw load or store (__ld, __st) as base + off (a constant)
+// or base + index*scale, the addressing modes of both CPUs (#488); as_base is the address itself
+// when it is neither. An add with an overflow check stays as it is.
+shared mut as_base i64
+shared mut as_off i64
+shared mut as_index i64
+shared mut as_scale i64
+
+fn addr_split(e i64) {
+	as_base = e
+	as_off = 0
+	as_index = 0
+	as_scale = 1
+	if cast(Node, e).kind != EX_BINARY || cast(Binary, e).op != "+" || cast(Binary, e).ovf == OVF_CHECK {
+		return
+	}
+	let l = cast(Binary, e).l
+	let r = cast(Binary, e).r
+	if is_const(r) != 0 {
+		as_base = l
+		as_off = const_val(r)
+		return
+	}
+	if cast(Node, r).kind != EX_BINARY || cast(Binary, r).ovf == OVF_CHECK {
+		return
+	}
+	let rop = cast(Binary, r).op
+	if rop == "*" && is_const(cast(Binary, r).r) != 0 {
+		as_base = l
+		as_index = cast(Binary, r).l
+		as_scale = const_val(cast(Binary, r).r)
+	} else if rop == "*" && is_const(cast(Binary, r).l) != 0 {
+		as_base = l
+		as_index = cast(Binary, r).r
+		as_scale = const_val(cast(Binary, r).l)
+	} else if rop == "<<" && is_const(cast(Binary, r).r) != 0 && const_val(cast(Binary, r).r) >= 0 && const_val(cast(Binary, r).r) <= 3 {
+		as_base = l
+		as_index = cast(Binary, r).l
+		as_scale = 1 << const_val(cast(Binary, r).r)
+	}
 }
 
 // log2 of a positive power of two, else -1.
@@ -959,6 +1194,13 @@ fn gen_binary(e Binary, dst i64, d i64) {
 	}
 	if is_fp(dst) != 0 {
 		gen_fbinary(e, dst, d)
+		return
+	}
+	let rc = rot_left(e)
+	if rc > 0 {
+		// x << c | x >> (64-c): one ror (#488).
+		let x = gen_val(rot_x, d)
+		emit4(I_EXTR, dst, x, x, 64-rc)
 		return
 	}
 	if e.ovf == OVF_CHECK {
@@ -1938,14 +2180,45 @@ fn gen_runtime_intrinsic(e Call, dst i64, d i64) i64 {
 		return 1
 	}
 	if name == "__st" {
-		// __st(p, v, sizelog2): a raw sized store for the runtime.
+		// __st(p, v, sizelog2): a raw sized store for the runtime. A constant offset or a scaled
+		// index in p goes into the address (#488).
+		let size = const_val(args[2]) & 3
+		addr_split(args[0])
+		if as_index == 0 && as_base != args[0] && as_off >= 0 && (as_off & ((1 << size) - 1)) == 0 && (as_off >> size) < 4096 {
+			gen_pair(as_base, args[1], d)
+			emit4(I_ST, pr, pl, as_off, const_val(args[2]))
+			return 1
+		}
+		if as_index != 0 && as_scale == (1 << size) && contains_call(args[1]) == 0 && d+3 <= t_count {
+			let b = gen_val(as_base, d)
+			let d2 = next_depth(b, d)
+			let ix = gen_val(as_index, d2)
+			let v = gen_val(args[1], next_depth(ix, d2))
+			emit4(I_STX, v, b, ix, const_val(args[2]) | MK_SCALED)
+			return 1
+		}
 		gen_pair(args[0], args[1], d)
 		emit4(I_ST, pr, pl, 0, const_val(args[2]))
 		return 1
 	}
 	if name == "__ld" {
-		let p = gen_val(args[0], d)
 		let k = args[1]
+		mut kind = 3
+		if is_const(k) != 0 {
+			kind = const_val(k)
+		}
+		let size = kind & 3
+		addr_split(args[0])
+		if as_index == 0 && as_base != args[0] && as_off >= 0 && (as_off & ((1 << size) - 1)) == 0 && (as_off >> size) < 4096 {
+			emit4(I_LD, dst, gen_val(as_base, d), as_off, kind)
+			return 1
+		}
+		if as_index != 0 && as_scale == (1 << size) {
+			gen_pair(as_base, as_index, d)
+			emit4(I_LDX, dst, pl, pr, kind | MK_SCALED)
+			return 1
+		}
+		let p = gen_val(args[0], d)
 		if is_const(k) != 0 {
 			emit4(I_LD, dst, p, 0, const_val(k))
 		} else {
@@ -3077,9 +3350,84 @@ fn gen_while(s WhileStmt) {
 fn gen_stmts(stmts []i64) {
 	mut i = 0
 	for i < len(stmts) {
+		if i+1 < len(stmts) && gen_word_pair(stmts[i], stmts[i+1]) != 0 {
+			i = i + 2
+			continue
+		}
 		gen_stmt(stmts[i])
 		i = i + 1
 	}
+}
+
+// gen_word_pair emits two statements of multi-word arithmetic together (#488): a product's
+// halves by mul and umulh from operands read once, and an add's carry by adds and cinc. 0 when
+// s1, s2 are not such a pair.
+fn gen_word_pair(s1 i64, s2 i64) i64 {
+	if mul_pair(s1, s2) != 0 {
+		gen_pair(mw_a, mw_b, 0)
+		let a = pl
+		let b = pr
+		let lo = cast(Sym, mw_lo)
+		let hi = cast(Sym, mw_hi)
+		// lo is not an operand, so its home is neither a nor b; umulh, the last reader, may
+		// overwrite one of them (hi = a).
+		mut rl = lo.reg
+		if rl < 0 {
+			rl = X16
+			if a == X16 || b == X16 {
+				rl = X17
+			}
+		}
+		emit3(I_MUL, rl, a, b)
+		if lo.reg < 0 {
+			emit3(I_STR, rl, FP, lo.off)
+		}
+		mut rh = hi.reg
+		if rh < 0 {
+			rh = X16
+		}
+		emit3(I_UMULH, rh, a, b)
+		if hi.reg < 0 {
+			emit3(I_STR, rh, FP, hi.off)
+		}
+		return 1
+	}
+	if add_carry(s1, s2) == 0 {
+		return 0
+	}
+	let s = cast(Sym, mw_lo)
+	let h = cast(Sym, mw_hi)
+	mut dst = s.reg
+	if dst < 0 {
+		dst = X16
+	}
+	let rx = gen_val(mw_a, 0)
+	let y = mw_b
+	if cast(Node, y).kind == EX_INT && cast(IntLit, y).val >= 0 && cast(IntLit, y).val < 4096 {
+		emit3(I_ADDSI, dst, rx, cast(IntLit, y).val)
+	} else {
+		let ry = gen_val(y, next_depth(rx, 0))
+		emit4(I_ADDS, dst, rx, ry, 0)
+	}
+	// Stores and loads keep the carry flag until cinc reads it.
+	if s.reg < 0 {
+		emit3(I_STR, dst, FP, s.off)
+	}
+	let k = cast(Sym, cast(IdentExpr, mw_k).ref)
+	mut rk = k.reg
+	if rk < 0 {
+		rk = X17
+		emit3(I_LDR, rk, FP, k.off)
+	}
+	mut rh = h.reg
+	if rh < 0 {
+		rh = X17
+	}
+	emit3(I_CINC, rh, rk, C_HS)
+	if h.reg < 0 {
+		emit3(I_STR, rh, FP, h.off)
+	}
+	return 1
 }
 
 fn result_reg(f Fn, i i64) i64 {
@@ -4235,6 +4583,10 @@ fn gen_fn(f Fn) {
 	gen_poll()
 	i = early
 	for i < len(stmts) {
+		if i+1 < len(stmts) && gen_word_pair(stmts[i], stmts[i+1]) != 0 {
+			i = i + 2
+			continue
+		}
 		gen_stmt(stmts[i])
 		i = i + 1
 	}

@@ -17,11 +17,12 @@ type monty struct {
 	n    i64   // limbs
 	t    []u64 // n+2 words of scratch
 	u    []u64 // n words of scratch
+	w    []u64 // 2n words of scratch (sqr)
 }
 
 fn new_monty(m []u64, rr []u64, one []u64, minv u64) monty {
 	let n = len(m)
-	return monty{m: m, rr: rr, one: one, minv: minv, n: n, t: make([]u64, n+2), u: make([]u64, n)}
+	return monty{m: m, rr: rr, one: one, minv: minv, n: n, t: make([]u64, n+2), u: make([]u64, n), w: make([]u64, 2*n)}
 }
 
 // elem returns a new zero element of f.
@@ -117,6 +118,106 @@ fn (f monty) size() i64 {
 		__st(tp+8*n, i64(k1+k2), 3)
 	}
 	f.reduce(mut z, t, t[n])
+}
+
+// sqr sets z = x*x/R mod m, as mul(z, x, x) does, in about three quarters of its
+// multiplications (#488); z may alias x. The square adds each cross product x[i]*x[j] (i < j)
+// once, doubles the sum and adds the squares x[i]*x[i]: n(n+1)/2 products where mul takes n*n.
+// A Montgomery reduction of the 2n-word square (n*n more) then divides it by R. RSA's
+// exponentiations square in four of every five multiplications.
+@wrap fn (f mut monty) sqr(z mut []u64, x []u64) {
+	let n = f.n
+	if n == 4 {
+		m4_mul(mut z, x, x, f.m, f.minv)
+		return
+	}
+	let w = f.w
+	let t = f.t
+	if len(x) != n || len(z) != n || len(f.m) != n || len(w) != 2*n || len(t) != n+2 {
+		rt_panic("seal: a field element has the wrong number of limbs")
+	}
+	let xp = cast(i64, x)[2]
+	let mp = cast(i64, f.m)[2]
+	let wp = cast(i64, w)[2]
+	let tp = cast(i64, t)[2]
+	for i in 0..2*n {
+		__st(wp+8*i, 0, 3)
+	}
+	// The cross products, each once. Row i adds x[i]*x[j] at words i+j and leaves its carry at
+	// word i+n, which no earlier row reached.
+	for i in 0..n-1 {
+		let xi = u64(__ld(xp+8*i, 3))
+		mut c = u64(0)
+		for j in i+1..n {
+			let xj = u64(__ld(xp+8*j, 3))
+			let wk = u64(__ld(wp+8*(i+j), 3))
+			mut lo = xi * xj
+			mut hi = mulhi(xi, xj)
+			lo += wk
+			hi += lt(lo, wk)
+			lo += c
+			hi += lt(lo, c)
+			c = hi
+			__st(wp+8*(i+j), i64(lo), 3)
+		}
+		__st(wp+8*(i+n), i64(c), 3)
+	}
+	// Doubled: one bit to the left across the 2n words (the cross sum is below 2^(128n-1)).
+	mut top = u64(0)
+	for k in 0..2*n {
+		let v = u64(__ld(wp+8*k, 3))
+		__st(wp+8*k, i64(v<<1|top), 3)
+		top = v >> 63
+	}
+	// The squares at words 2i and 2i+1. A square's high word is at most 2^64-2, so adding two
+	// carries to it cannot wrap; the last carry out is 0 since x*x < 2^(128n).
+	mut c = u64(0)
+	for i in 0..n {
+		let xi = u64(__ld(xp+8*i, 3))
+		let w0 = u64(__ld(wp+16*i, 3))
+		let w1 = u64(__ld(wp+16*i+8, 3))
+		mut lo = xi * xi
+		mut hi = mulhi(xi, xi)
+		lo += w0
+		hi += lt(lo, w0)
+		lo += c
+		hi += lt(lo, c)
+		let s = w1 + hi
+		c = lt(s, hi)
+		__st(wp+16*i, i64(lo), 3)
+		__st(wp+16*i+8, i64(s), 3)
+	}
+	// Montgomery reduction: round i adds mm*m at word i, mm chosen to clear that word, and its
+	// carry at word i+n; top carries past it into the next round. The high half is then below 2m.
+	let minv = f.minv
+	top = 0
+	for i in 0..n {
+		let mm = u64(__ld(wp+8*i, 3)) * minv
+		mut c2 = u64(0)
+		for j in 0..n {
+			let mj = u64(__ld(mp+8*j, 3))
+			let wk = u64(__ld(wp+8*(i+j), 3))
+			mut lo = mm * mj
+			mut hi = mulhi(mm, mj)
+			lo += wk
+			hi += lt(lo, wk)
+			lo += c2
+			hi += lt(lo, c2)
+			c2 = hi
+			__st(wp+8*(i+j), i64(lo), 3)
+		}
+		let wn = u64(__ld(wp+8*(i+n), 3))
+		let s1 = wn + c2
+		let k1 = lt(s1, c2)
+		let s2 = s1 + top
+		let k2 = lt(s2, top)
+		__st(wp+8*(i+n), i64(s2), 3)
+		top = k1 + k2
+	}
+	for j in 0..n {
+		__st(tp+8*j, __ld(wp+8*(n+j), 3), 3)
+	}
+	f.reduce(mut z, t, top)
 }
 
 // m4_mul is mul for four limbs (256-bit moduli: P-256's field and order, Ed25519's order),
@@ -338,7 +439,7 @@ fn (f monty) set(z mut []u64, x []u64) {
 		let w = i64(e[i/2] >> u8(4-4*(i%2))) & 15
 		if started {
 			for s in 0..4 {
-				f.mul(mut acc, acc, acc)
+				f.sqr(mut acc, acc)
 			}
 		}
 		if w != 0 {

@@ -1143,6 +1143,13 @@ fn x_gen_binary(e Binary, dst i64, d i64) {
 		x_gen_fbinary(e, dst, d)
 		return
 	}
+	let rc = rot_left(e)
+	if rc > 0 {
+		// x << c | x >> (64-c): one rol (#488).
+		x_gen_to(rot_x, dst, d)
+		emit2(X_ROLI, dst, rc)
+		return
+	}
 	if e.ovf == OVF_CHECK {
 		x_gen_checked_binary(e, dst, d)
 		return
@@ -1641,14 +1648,43 @@ fn x_gen_runtime_intrinsic(e Call, dst i64, d i64) i64 {
 		return 1
 	}
 	if name == "__st" {
-		// __st(p, v, sizelog2): a raw sized store for the runtime.
+		// __st(p, v, sizelog2): a raw sized store for the runtime. A constant offset or a scaled
+		// index in p goes into the address (#488).
+		addr_split(args[0])
+		if as_index == 0 && as_base != args[0] && x64_fits32(as_off) != 0 {
+			x_gen_pair(as_base, args[1], d)
+			emit3(X_STORE, pr, x_mem1(pl, as_off), const_val(args[2]))
+			return 1
+		}
+		if as_index != 0 && x_scale_ok(as_scale) != 0 && contains_call(args[1]) == 0 && d+3 <= t_count {
+			let b = x_gen_val(as_base, d)
+			let d2 = next_depth(b, d)
+			let ix = x_gen_val(as_index, d2)
+			let v = x_gen_val(args[1], next_depth(ix, d2))
+			emit3(X_STORE, v, x64_mem(b, ix, as_scale, 0), const_val(args[2]))
+			return 1
+		}
 		x_gen_pair(args[0], args[1], d)
 		emit3(X_STORE, pr, x_mem1(pl, 0), const_val(args[2]))
 		return 1
 	}
 	if name == "__ld" {
-		let p = x_gen_val(args[0], d)
 		let k = args[1]
+		mut kind = 3
+		if is_const(k) != 0 {
+			kind = const_val(k)
+		}
+		addr_split(args[0])
+		if as_index == 0 && as_base != args[0] && x64_fits32(as_off) != 0 {
+			emit3(X_LOAD, dst, x_mem1(x_gen_val(as_base, d), as_off), kind)
+			return 1
+		}
+		if as_index != 0 && x_scale_ok(as_scale) != 0 {
+			x_gen_pair(as_base, as_index, d)
+			emit3(X_LOAD, dst, x64_mem(pl, pr, as_scale, 0), kind)
+			return 1
+		}
+		let p = x_gen_val(args[0], d)
 		if is_const(k) != 0 {
 			emit3(X_LOAD, dst, x_mem1(p, 0), const_val(k))
 		} else {
@@ -2470,8 +2506,99 @@ fn x_gen_while(s WhileStmt) {
 fn x_gen_stmts(stmts []i64) {
 	mut i = 0
 	for i < len(stmts) {
+		if i+1 < len(stmts) && x_gen_word_pair(stmts[i], stmts[i+1]) != 0 {
+			i = i + 2
+			continue
+		}
 		x_gen_stmt(stmts[i])
 		i = i + 1
+	}
+}
+
+// x_gen_word_pair emits two statements of multi-word arithmetic together (#488, gen.tin): a
+// product's halves from one mul, and an add's carry with adc. 0 when s1, s2 are not such a pair.
+fn x_gen_word_pair(s1 i64, s2 i64) i64 {
+	if mul_pair(s1, s2) != 0 {
+		// mul's register operand is one that lives in a register; the other goes to rax.
+		let ra = x_word_reg(mw_a)
+		let rb = x_word_reg(mw_b)
+		if rb >= 0 {
+			x_gen_to(mw_a, RAX, 0)
+			emit1(X_MULU, rb)
+		} else if ra >= 0 {
+			x_gen_to(mw_b, RAX, 0)
+			emit1(X_MULU, ra)
+		} else {
+			x_gen_to(mw_a, RAX, 0)
+			x_gen_to(mw_b, RCX, 0)
+			emit1(X_MULU, RCX)
+		}
+		x_set_word(cast(Sym, mw_lo), RAX)
+		x_set_word(cast(Sym, mw_hi), RDX)
+		return 1
+	}
+	if add_carry(s1, s2) == 0 {
+		return 0
+	}
+	let s = cast(Sym, mw_lo)
+	let h = cast(Sym, mw_hi)
+	mut x = mw_a
+	mut y = mw_b
+	mut dst = s.reg
+	if dst < 0 {
+		dst = treg(0)
+	}
+	// y must outlive x's move into dst: add the other way round when y lives there.
+	if cast(Node, y).kind == EX_IDENT && cast(Sym, cast(IdentExpr, y).ref).reg == dst {
+		x = mw_b
+		y = mw_a
+	}
+	x_gen_to(x, dst, 1)
+	if cast(Node, y).kind == EX_INT && x64_fits32(cast(IntLit, y).val) != 0 {
+		emit2(X_ADDI, dst, cast(IntLit, y).val)
+	} else if cast(Node, y).kind == EX_INT {
+		x_load_imm(XSCR, cast(IntLit, y).val)
+		emit2(X_ADD, dst, XSCR)
+	} else if cast(Sym, cast(IdentExpr, y).ref).reg >= 0 {
+		emit2(X_ADD, dst, cast(Sym, cast(IdentExpr, y).ref).reg)
+	} else {
+		emit2(X_ADDM, dst, x_mem1(RBP, cast(Sym, cast(IdentExpr, y).ref).off))
+	}
+	// From here on only moves, which keep the carry flag, until adc reads it.
+	if s.reg < 0 {
+		x_slot_store(dst, s.off)
+	}
+	let k = cast(Sym, cast(IdentExpr, mw_k).ref)
+	mut hr = h.reg
+	if hr < 0 {
+		hr = XSCR
+	}
+	if k.reg >= 0 {
+		x_mov(hr, k.reg)
+	} else {
+		x_slot_load(hr, k.off)
+	}
+	emit2(X_ADCI, hr, 0)
+	if h.reg < 0 {
+		x_slot_store(hr, h.off)
+	}
+	return 1
+}
+
+// x_word_reg is the register home of a matched word operand, or -1 (a frame slot or a constant).
+fn x_word_reg(e i64) i64 {
+	if cast(Node, e).kind == EX_IDENT {
+		return cast(Sym, cast(IdentExpr, e).ref).reg
+	}
+	return -1
+}
+
+// x_set_word stores r into a word local (a register home or a frame slot).
+fn x_set_word(s Sym, r i64) {
+	if s.reg >= 0 {
+		x_mov(s.reg, r)
+	} else {
+		x_slot_store(r, s.off)
 	}
 }
 
@@ -3227,6 +3354,10 @@ fn x_gen_fn(f Fn) {
 	let stmts = cast(Block, f.body).stmts
 	mut i = 0
 	for i < len(stmts) {
+		if i+1 < len(stmts) && x_gen_word_pair(stmts[i], stmts[i+1]) != 0 {
+			i = i + 2
+			continue
+		}
 		x_gen_stmt(stmts[i])
 		i = i + 1
 	}

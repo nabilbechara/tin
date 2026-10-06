@@ -81,6 +81,9 @@ const X_MOVD_RX = 79 // a=rd b=xs: r32 = low 32 bits of xs
 const X_RAWB = 80 // a=one byte of hand-assembled code
 const X_IMULH = 81 // a=rs: signed rdx:rax = rax * rs
 const X_MULU = 82 // a=rs: unsigned rdx:rax = rax * rs, CF and OF set when rdx is not zero (#362)
+const X_ADC = 83 // a=rd b=rs: rd += rs + CF (an add's carry, #488)
+const X_ADCI = 84 // a=rd b=imm32: rd += imm + CF
+const X_ROLI = 85 // a=rd b=imm8: rotate left (#488)
 
 const XK_SIGNED = 4
 
@@ -440,6 +443,12 @@ fn x64_print(b []u8, ins i64, pc i64) {
 		x64_pr_rr(cast([]u8, b), "imul", x, y, 3)
 		buf_byte(cast([]u8, b), ',')
 		x64_pr_hex(cast([]u8, b), z)
+	} else if op == X_ADC {
+		x64_pr_rr(cast([]u8, b), "adc", x, y, 3)
+	} else if op == X_ADCI {
+		x64_pr_ri(cast([]u8, b), "adc", x, y, 3)
+	} else if op == X_ROLI {
+		x64_pr_ri(cast([]u8, b), "rol", x, y & 0xff, 3)
 	} else if op == X_IDIV || op == X_DIV || op == X_IMULH || op == X_MULU || op == X_NEG || op == X_NOT || op == X_CALL_R || op == X_PUSH || op == X_POP {
 		buf_str(cast([]u8, b), x64_unary_name(op))
 		buf_byte(cast([]u8, b), ' ')
@@ -846,6 +855,19 @@ fn x64_encode(ins i64, pc i64, out []u8) i64 {
 		x64_rr(cast([]u8, out), 0, 1, 0xF7, 5, x, 0)
 	} else if op == X_MULU {
 		x64_rr(cast([]u8, out), 0, 1, 0xF7, 4, x, 0)
+	} else if op == X_ADC {
+		x64_rr(cast([]u8, out), 0, 1, 0x11, y, x, 0)
+	} else if op == X_ROLI {
+		x64_rr(cast([]u8, out), 0, 1, 0xC1, 0, x, 0)
+		buf_byte(cast([]u8, out), y)
+	} else if op == X_ADCI {
+		if x64_fits8(y) != 0 {
+			x64_rr(cast([]u8, out), 0, 1, 0x83, 2, x, 0)
+			buf_byte(cast([]u8, out), y)
+		} else {
+			x64_rr(cast([]u8, out), 0, 1, 0x81, 2, x, 0)
+			x64_imm32(cast([]u8, out), y)
+		}
 	} else if op == X_DIV {
 		x64_rr(cast([]u8, out), 0, 1, 0xF7, 6, x, 0)
 	} else if op == X_CQO {
