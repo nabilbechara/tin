@@ -17,6 +17,11 @@ type RSAPrivateKey struct {
 	fp monty
 	fq monty
 	fnm monty
+	// The blinding pair (#474): r^e and r^-1 mod n in Montgomery form, both squared after each
+	// signature and replaced by a fresh random r every rsaBlindUses signatures.
+	bl []u64
+	unbl []u64
+	blUses i64
 }
 
 // ECPrivateKey is an ECDSA key on P-256 or P-384: the curve, the scalar and the uncompressed public point.
@@ -61,17 +66,17 @@ fn keys_rsa_pkcs1(der []u8, from i64, to i64) !RSAPrivateKey {
 	let fq = try monty_new(vals[4])
 	let fnm = try monty_new(vals[0])
 	let k = RSAPrivateKey{Public: key, p: vals[3], q: vals[4], dp: monty_bytes(fp, vals[5]), dq: monty_bytes(fq, vals[6]),
-		qinv: vals[7], fp: fp, fq: fq, fnm: fnm}
+		qinv: vals[7], fp: fp, fq: fq, fnm: fnm, bl: fnm.elem(), unbl: fnm.elem(), blUses: 0}
 	try rsa_check_private(mut k)
 	return k
 }
 
 // rsa_check_private checks that p*q = n and that a test signature verifies.
 fn rsa_check_private(k mut RSAPrivateKey) ! {
-	let pl = nat_from_be(k.p, k.fp.n)
-	let ql = nat_from_be(k.q, k.fq.n)
+	let pl = limbs_from_be(k.p, k.fp.n)
+	let ql = limbs_from_be(k.q, k.fq.n)
 	let prod = nat_mul_ct(pl, ql)
-	let nl = nat_from_be(k.Public.N, len(prod))
+	let nl = limbs_from_be(k.Public.N, len(prod))
 	if !nat_eq(prod, nl) {
 		fail "seal: RSA private key: p*q is not n"
 	}
@@ -80,18 +85,6 @@ fn rsa_check_private(k mut RSAPrivateKey) ! {
 	VerifyPKCS1v15(k.Public, Hash.SHA256, digest, sig) catch err {
 		fail say.Fault("seal: RSA private key does not match its public key (%s)", err)
 	}
-}
-
-// nat_from_be reads big-endian b into n little-endian 32-bit limbs (b must fit).
-fn nat_from_be(b secret []u8, n i64) []u64 {
-	let out = make([]u64, n)
-	for i in 0..len(b) {
-		let k = len(b) - 1 - i
-		if k/4 < n {
-			out[k/4] |= u64(b[i]) << u64(8*(k%4))
-		}
-	}
-	return out
 }
 
 // keys_ec parses an ECPrivateKey (SEC 1); curve is the curve the PKCS #8 wrapper named, or "".

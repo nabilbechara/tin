@@ -1,138 +1,130 @@
 package seal
 
 // ---- X25519 (RFC 7748) ----
-// Field elements mod p = 2^255 - 19 are ten signed limbs in radix 2^25.5 (26, 25, 26, ... bits),
-// so every product fits in 64 bits; fe_mul and fe_sq are generated (fe25519.tin). The ladder swaps with masks, never branches on the
-// scalar, and every field operation runs the same instructions whatever the values: X25519
-// is constant-time in the scalar and the point. The field and ladder functions are @wrap (#362):
-// their limb bounds keep values in i64, and a checked operation would branch on secret data.
+// Field elements mod p = 2^255 - 19 are five unsigned limbs in radix 2^51, each below 2^52
+// between operations (#474): fe_mul and fe_sq (generated, fe25519.tin) accumulate 128-bit
+// products with mulhi, and every other operation ends with a carry. The ladder swaps with
+// masks, never branches on the scalar, and every field operation runs the same instructions
+// whatever the values: X25519 is constant-time in the scalar and the point. The field and
+// ladder functions are @wrap (#362): the limb bounds keep every sum in u64, and a checked
+// operation would branch on secret data.
 
-// fe_t is the multiplication scratch (per core; nothing here waits).
-let fe_t = make([]i64, 20)
+const mask51 = 0x7ffffffffffff // the low 51 bits
 
-fn fe_new() []i64 {
-	return make([]i64, 10)
+fn fe_new() []u64 {
+	return make([]u64, 5)
 }
 
-// fe_width is the bit width of limb i: 26 for even i, 25 for odd.
-fn fe_width(i i64) i64 {
-	return 26 - (i & 1)
+// fe_carry stores in h the limbs l0..l4, each below 2^63, carried back below 2^52.
+@wrap fn fe_carry(h mut []u64, l0 u64, l1 u64, l2 u64, l3 u64, l4 u64) {
+	h[0] = (l0 & mask51) + (l4>>51)*19
+	h[1] = (l1 & mask51) + (l0 >> 51)
+	h[2] = (l2 & mask51) + (l1 >> 51)
+	h[3] = (l3 & mask51) + (l2 >> 51)
+	h[4] = (l4 & mask51) + (l3 >> 51)
 }
 
-// fe_carry brings limbs t[0..9] back to about +-2^25 (+-2^24 for odd limbs) and stores h.
-@wrap fn fe_carry(h mut []i64, t mut []i64) {
-	for i in 0..9 {
-		let w = 26 - (i & 1)
-		let c = (t[i] + (1 << (w - 1))) >> w
-		t[i] -= c << w
-		t[i+1] += c
-	}
-	mut c = (t[9] + (1 << 24)) >> 25
-	t[9] -= c << 25
-	t[0] += 19 * c
-	c = (t[0] + (1 << 25)) >> 26
-	t[0] -= c << 26
-	t[1] += c
-	for i in 0..10 {
-		h[i] = t[i]
-	}
+// fe_mul121665 sets h = 121665*f; each limb's product has 69 bits, so its high part is carried
+// from the 128-bit product.
+@wrap fn fe_mul121665(h mut []u64, f []u64) {
+	let k = u64(121665)
+	let p0 = f[0] * k
+	let p1 = f[1] * k
+	let p2 = f[2] * k
+	let p3 = f[3] * k
+	let p4 = f[4] * k
+	let c0 = (mulhi(f[0], k) << 13) | (p0 >> 51)
+	let c1 = (mulhi(f[1], k) << 13) | (p1 >> 51)
+	let c2 = (mulhi(f[2], k) << 13) | (p2 >> 51)
+	let c3 = (mulhi(f[3], k) << 13) | (p3 >> 51)
+	let c4 = (mulhi(f[4], k) << 13) | (p4 >> 51)
+	h[0] = (p0 & mask51) + c4*19
+	h[1] = (p1 & mask51) + c0
+	h[2] = (p2 & mask51) + c1
+	h[3] = (p3 & mask51) + c2
+	h[4] = (p4 & mask51) + c3
 }
 
-// fe_mul121665 sets h = 121665*f.
-@wrap fn fe_mul121665(h mut []i64, f []i64) {
-	let t = fe_t
-	for i in 0..10 {
-		t[i] = f[i] * 121665
-	}
-	fe_carry(mut h, mut t)
+@wrap fn fe_add(h mut []u64, f []u64, g []u64) {
+	fe_carry(mut h, f[0]+g[0], f[1]+g[1], f[2]+g[2], f[3]+g[3], f[4]+g[4])
 }
 
-@wrap fn fe_add(h mut []i64, f []i64, g []i64) {
-	for i in 0..10 {
-		h[i] = f[i] + g[i]
-	}
+// fe_sub sets h = f - g, computed as (f + 2p) - g so that no limb goes below zero.
+@wrap fn fe_sub(h mut []u64, f []u64, g []u64) {
+	fe_carry(mut h, (f[0]+0xfffffffffffda)-g[0], (f[1]+0xffffffffffffe)-g[1], (f[2]+0xffffffffffffe)-g[2],
+		(f[3]+0xffffffffffffe)-g[3], (f[4]+0xffffffffffffe)-g[4])
 }
 
-@wrap fn fe_sub(h mut []i64, f []i64, g []i64) {
-	for i in 0..10 {
-		h[i] = f[i] - g[i]
-	}
-}
-
-fn fe_copy(h mut []i64, f []i64) {
-	for i in 0..10 {
+fn fe_copy(h mut []u64, f []u64) {
+	for i in 0..5 {
 		h[i] = f[i]
 	}
 }
 
 // fe_cswap swaps f and g when b is 1, in constant time.
-@wrap fn fe_cswap(f mut []i64, g mut []i64, b i64) {
-	let mask = 0 - b
-	for i in 0..10 {
+@wrap fn fe_cswap(f mut []u64, g mut []u64, b i64) {
+	let mask = u64(0) - u64(b)
+	for i in 0..5 {
 		let x = (f[i] ^ g[i]) & mask
 		f[i] ^= x
 		g[i] ^= x
 	}
 }
 
-// fe_frombytes reads 32 little-endian bytes, ignoring the top bit.
-@wrap fn fe_frombytes(h mut []i64, s []u8) {
-	mut off = 0
-	for i in 0..10 {
-		let w = fe_width(i)
-		mut v = u64(0)
-		for j in 0..5 {
-			let b = off/8 + j
-			if b < 32 {
-				v |= u64(s[b]) << u64(8*j)
-			}
-		}
-		h[i] = i64((v >> u64(off%8)) & ((u64(1) << u64(w)) - 1))
-		off += w
+// le64 is the little-endian 64-bit word at s[at:at+8].
+fn le64(s []u8, at i64) u64 {
+	mut v = u64(0)
+	for j in 0..8 {
+		v |= u64(s[at+j]) << u64(8*j)
 	}
-	h[9] &= (1 << 25) - 1
+	return v
 }
 
-// fe_tobytes is h reduced mod p, as 32 little-endian bytes.
-@wrap fn fe_tobytes(f []i64) []u8 {
+// fe_frombytes reads 32 little-endian bytes, ignoring the top bit.
+@wrap fn fe_frombytes(h mut []u64, s []u8) {
+	h[0] = le64(s, 0) & mask51
+	h[1] = (le64(s, 6) >> 3) & mask51
+	h[2] = (le64(s, 12) >> 6) & mask51
+	h[3] = (le64(s, 19) >> 1) & mask51
+	h[4] = (le64(s, 24) >> 12) & mask51
+}
+
+// fe_tobytes is f reduced mod p, as 32 little-endian bytes.
+@wrap fn fe_tobytes(f []u64) []u8 {
 	let h = fe_new()
-	let t = fe_t
-	for i in 0..10 {
-		t[i] = f[i]
-	}
-	fe_carry(mut h, mut t)
-	// q is 1 when h >= p, else 0.
-	mut q = (19*h[9] + (1 << 24)) >> 25
-	for i in 0..10 {
-		q = (h[i] + q) >> fe_width(i)
-	}
+	fe_carry(mut h, f[0], f[1], f[2], f[3], f[4])
+	// Now h < 2^255 + 2^13*19. q is 1 when h >= p, that is when h + 19 reaches 2^255.
+	mut q = (h[0] + 19) >> 51
+	q = (h[1] + q) >> 51
+	q = (h[2] + q) >> 51
+	q = (h[3] + q) >> 51
+	q = (h[4] + q) >> 51
 	h[0] += 19 * q
-	for i in 0..9 {
-		let w = fe_width(i)
-		let c = h[i] >> w
-		h[i+1] += c
-		h[i] -= c << w
-	}
-	h[9] &= (1 << 25) - 1
+	h[1] += h[0] >> 51
+	h[0] &= mask51
+	h[2] += h[1] >> 51
+	h[1] &= mask51
+	h[3] += h[2] >> 51
+	h[2] &= mask51
+	h[4] += h[3] >> 51
+	h[3] &= mask51
+	h[4] &= mask51
 	let out = make([]u8, 32)
-	mut off = 0
-	for i in 0..10 {
-		let v = u64(h[i])
-		{
-			mut k = 0
-			for k < fe_width(i) {
-				let bit = off + k
-				out[bit/8] |= u8(((v >> u64(k)) & 1) << u64(bit%8))
-				k += 1
+	for i in 0..5 {
+		let off = 51 * i
+		let w = h[i] << u64(off%8)
+		for j in 0..8 {
+			let at = off/8 + j
+			if at < 32 {
+				out[at] |= u8(w >> u64(8*j))
 			}
 		}
-		off += fe_width(i)
 	}
 	return out
 }
 
 // fe_invert sets out = z^(p-2) with the usual chain of 254 squarings and 11 multiplications.
-@wrap fn fe_invert(out mut []i64, z []i64) {
+@wrap fn fe_invert(out mut []u64, z []u64) {
 	let t0 = fe_new()
 	let t1 = fe_new()
 	let t2 = fe_new()

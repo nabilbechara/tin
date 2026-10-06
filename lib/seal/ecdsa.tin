@@ -19,19 +19,18 @@ fn ecdsa_der(sig []u8) !([]u8, []u8) {
 	return r, s
 }
 
-// ecdsa_reduce returns the 4n-byte big-endian b minus m if b >= m (b < 2m), as limbs; public data.
+// ecdsa_reduce returns the n.size()-byte big-endian b minus m if b >= m (b < 2m), as limbs;
+// public data.
 fn ecdsa_reduce(n monty, b []u8) []u64 {
-	let x = make([]u64, n.n)
-	for j in 0..n.n {
-		let k = 4*n.n - 4*j
-		x[j] = u64(b[k-1]) | u64(b[k-2])<<8 | u64(b[k-3])<<16 | u64(b[k-4])<<24
-	}
+	let x = limbs_from_be(b, n.n)
 	let d = make([]u64, n.n)
 	mut bw = u64(0)
 	for j in 0..n.n {
-		let s = x[j] -% n.m[j] -% bw
-		d[j] = s & 0xffffffff
-		bw = (s >> 32) & 1
+		let xj = x[j]
+		let mj = n.m[j]
+		let e = xj -% mj
+		d[j] = e -% bw
+		bw = lt(xj, mj) | lt(e, bw)
 	}
 	if bw == 0 {
 		return d
@@ -39,12 +38,12 @@ fn ecdsa_reduce(n monty, b []u8) []u64 {
 	return x
 }
 
-// ecdsa_scalars checks 1 <= r, s < n and returns u1 = e/s and u2 = r/s mod n as 4n-byte
+// ecdsa_scalars checks 1 <= r, s < n and returns u1 = e/s and u2 = r/s mod n as n.size()-byte
 // big-endian numbers, e being the digest's leftmost size bytes.
 fn ecdsa_scalars(n mut monty, size i64, digest []u8, r []u8, s []u8) !([]u8, []u8) {
 	let rm = n.elem()
 	let sm = n.elem()
-	if len(r) > 4*n.n || len(s) > 4*n.n || n.from_bytes(mut rm, monty_bytes(n, r)) == 0 || n.from_bytes(mut sm, monty_bytes(n, s)) == 0 ||
+	if len(r) > n.size() || len(s) > n.size() || n.from_bytes(mut rm, monty_bytes(n, r)) == 0 || n.from_bytes(mut sm, monty_bytes(n, s)) == 0 ||
 		n.is_zero(rm) == 1 || n.is_zero(sm) == 1 {
 		fail "seal: ECDSA signature out of range"
 	}

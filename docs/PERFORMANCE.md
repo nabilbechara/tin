@@ -594,8 +594,45 @@ Go 1.26.8. Only ratios on these shared runners are meaningful.
 Established connections are faster than Go's for small responses, since one batch of
 responses is sealed into records and written at once. Large bodies run at half to two thirds
 of Go's speed. Full handshakes are the gap.
-Their cost is seal's P-256 and RSA arithmetic (32-bit limbs, no fixed-base table), which #474
-replaces. In the same run, plain HTTP/1.1 against main was 1.023 (`/json`) and 1.018
+Their cost was seal's P-256 and RSA arithmetic (32-bit limbs, no fixed-base table).
+
+### Handshakes after the arithmetic work (#474)
+
+#474 changed four things in seal:
+- the high word of a 64×64 product is now an intrinsic (`umulh`, `mul`), so Montgomery arithmetic
+  runs on 64-bit limbs, with an unrolled four-limb multiplication for P-256 and one fused pass per
+  limb for RSA;
+- k·G reads a per-core table, so it needs no doubling;
+- RSA keeps its blinding pair, which removes two exponentiations per signature;
+- X25519 uses 51-bit limbs.
+
+[Run 37388993368](https://github.com/yasserreslan/tin/actions/runs/37388993368) measured them on
+Linux 6.17.0-1022-azure (AMD EPYC 7763 on amd64, Neoverse-N2 on arm64), with the same harness as
+above. These servers issue no session tickets, so every handshake is full.
+
+| full handshakes per second | before: anvil (anvil/Go) | after: anvil (anvil/Go) |
+|---|---:|---:|
+| arm64 ECDSA P-256 | 480 (0.18) | 1951 (0.65) |
+| arm64 RSA-2048 | 42 (0.07) | 255 (0.43) |
+| amd64 ECDSA P-256 | 327 (0.11) | 754 (0.34) |
+| amd64 RSA-2048 | 29 (0.05) | 100 (0.21) |
+
+The "before" figures are from run 37377650528 above, on another amd64 CPU (EPYC 9V74), so compare
+the ratios. In the same run, the CPU benchmarks against main (time, lower is faster) were:
+
+| benchmark | amd64 | arm64 |
+|---|---:|---:|
+| p256ecdh | 0.411 | 0.369 |
+| x25519 | 0.862 | 0.658 |
+| tls13keys | 0.893 | 0.686 |
+
+All the other benchmarks stayed within 5%. Plain HTTP was 1.078 and 0.981 (amd64) and 1.015 and
+0.995 (arm64).
+
+The remaining gap on amd64 comes from code generation: the x86-64 backend keeps the multiplication's
+limbs and carries on the stack (it has fewer temporaries than arm64's), and it computes the low half
+of a product with `imul` beside the `mul` that already gives both halves. #488 tracks that, and
+squaring for RSA. In the same run, plain HTTP/1.1 against main was 1.023 (`/json`) and 1.018
 (`/plaintext`) on amd64 and 0.983 and 1.012 on arm64, and every CPU benchmark stayed within 5%.
 
 ## Long-lived blocks above 4 KiB (Linux)

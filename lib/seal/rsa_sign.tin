@@ -6,12 +6,17 @@ import "say"
 // Constant time in the private key and the message representative: the exponentiations use
 // monty_exp_ct with exponents padded to the primes' length, reductions use monty_reduce, and
 // the input is blinded by r^e for a random r, removed with r^-1 computed by Fermat inversion in
-// each prime (also monty_exp_ct). Every signature is checked with the public key before it is
-// returned, so a fault in the arithmetic cannot leak a factor of n.
+// each prime (also monty_exp_ct). The pair (r^e, r^-1) is kept with the key and squared after
+// each signature, which keeps it a valid pair at the cost of two multiplications instead of two
+// inversions; a fresh r replaces it every rsaBlindUses signatures (#474). Every signature is
+// checked with the public key before it is returned, so a fault in the arithmetic cannot leak
+// a factor of n.
+
+const rsaBlindUses = 32
 
 // rsa_inv_prime sets z = x^-1 mod the prime of f (x^(p-2)), in constant time.
 fn rsa_inv_prime(f mut monty, z mut []u64, x []u64, p secret []u8) {
-	let e = make([]u8, 4*f.n)
+	let e = make([]u8, f.size())
 	let pb = monty_bytes(f, p)
 	mut borrow = 2
 	{
@@ -35,14 +40,14 @@ fn rsa_inv_prime(f mut monty, z mut []u64, x []u64, p secret []u8) {
 fn rsa_crt_join(k mut RSAPrivateKey, m1 []u64, m2 []u64) []u64 {
 	let m2plain = monty_plain(mut k.fq, m2)
 	let m2p = k.fp.elem()
-	monty_reduce(mut k.fp, mut m2p, nat_to_be(m2plain))
+	monty_reduce(mut k.fp, mut m2p, limbs_to_be(m2plain))
 	let h = k.fp.elem()
 	k.fp.sub(mut h, m1, m2p)
 	let qi = k.fp.elem()
 	monty_reduce(mut k.fp, mut qi, k.qinv)
 	k.fp.mul(mut h, h, qi)
 	let hplain = monty_plain(mut k.fp, h)
-	let m = nat_mul_ct(nat_from_be(k.q, k.fq.n), hplain)
+	let m = nat_mul_ct(limbs_from_be(k.q, k.fq.n), hplain)
 	nat_add_ct(mut m, m2plain)
 	let out = make([]u64, k.fnm.n)
 	{
@@ -55,17 +60,33 @@ fn rsa_crt_join(k mut RSAPrivateKey, m1 []u64, m2 []u64) []u64 {
 	return out
 }
 
-// nat_to_be writes little-endian 32-bit limbs as big-endian bytes (4 per limb).
-fn nat_to_be(x []u64) []u8 {
-	let out = make([]u8, 4*len(x))
-	for j in 0..len(x) {
-		let k = 4*len(x) - 4*j
-		out[k-1] = u8(x[j])
-		out[k-2] = u8(x[j] >> 8)
-		out[k-3] = u8(x[j] >> 16)
-		out[k-4] = u8(x[j] >> 24)
+// rsa_blind_new sets k's blinding pair from a fresh random r in [1, n): r^e, and r^-1 joined
+// from r^-1 mod p and mod q (Fermat inversions, monty_exp_ct).
+fn rsa_blind_new(k mut RSAPrivateKey) {
+	let fnm = k.fnm
+	let r = fnm.elem()
+	for {
+		monty_reduce(mut fnm, mut r, RandomBytes(fnm.size()+16))
+		if fnm.is_zero(r) == 0 {
+			break
+		}
 	}
-	return out
+	mut at = 0
+	for at < len(k.Public.E) && k.Public.E[at] == 0 {
+		at += 1
+	}
+	fnm.set(mut k.bl, r)
+	rsa_exp_pub(mut fnm, mut k.bl, k.Public.E[at:])
+	let rb = fnm.to_bytes(r)
+	let rp = k.fp.elem()
+	let rq = k.fq.elem()
+	monty_reduce(mut k.fp, mut rp, rb)
+	monty_reduce(mut k.fq, mut rq, rb)
+	rsa_inv_prime(mut k.fp, mut rp, rp, k.p)
+	rsa_inv_prime(mut k.fq, mut rq, rq, k.q)
+	let rinv = rsa_crt_join(mut k, rp, rq)
+	fnm.mul(mut k.unbl, rinv, fnm.rr)
+	k.blUses = 0
 }
 
 // rsa_private is em^d mod n, k bytes, for em < n.
@@ -76,22 +97,11 @@ fn rsa_private(k mut RSAPrivateKey, em secret []u8) ![]u8 {
 	if fnm.from_bytes(mut c, monty_bytes(fnm, em)) == 0 {
 		fail "seal: RSA message representative out of range"
 	}
-	// Blind: c' = c * r^e for a random r in [1, n).
-	let r = fnm.elem()
-	for {
-		monty_reduce(mut fnm, mut r, RandomBytes(4*fnm.n+16))
-		if fnm.is_zero(r) == 0 {
-			break
-		}
+	if k.blUses == 0 || k.blUses >= rsaBlindUses {
+		rsa_blind_new(mut k)
 	}
-	mut at = 0
-	for at < len(k.Public.E) && k.Public.E[at] == 0 {
-		at += 1
-	}
-	let re = fnm.elem()
-	fnm.set(mut re, r)
-	rsa_exp_pub(mut fnm, mut re, k.Public.E[at:])
-	fnm.mul(mut c, c, re)
+	// Blind: c' = c * r^e.
+	fnm.mul(mut c, c, k.bl)
 	let cb = fnm.to_bytes(c)
 	// CRT: m1 = c'^dp mod p, m2 = c'^dq mod q.
 	let cp = k.fp.elem()
@@ -103,20 +113,13 @@ fn rsa_private(k mut RSAPrivateKey, em secret []u8) ![]u8 {
 	monty_exp_ct(mut k.fp, mut m1, cp, k.dp)
 	monty_exp_ct(mut k.fq, mut m2, cq, k.dq)
 	let mb = rsa_crt_join(mut k, m1, m2)
-	// Unblind with r^-1 mod n, joined from r^-1 mod p and mod q.
-	let rb = fnm.to_bytes(r)
-	let rp = k.fp.elem()
-	let rq = k.fq.elem()
-	monty_reduce(mut k.fp, mut rp, rb)
-	monty_reduce(mut k.fq, mut rq, rb)
-	rsa_inv_prime(mut k.fp, mut rp, rp, k.p)
-	rsa_inv_prime(mut k.fq, mut rq, rq, k.q)
-	let rinv = rsa_crt_join(mut k, rp, rq)
+	// Unblind with r^-1, then square the pair for the next signature.
 	let mm = fnm.elem()
-	let ri = fnm.elem()
 	fnm.mul(mut mm, mb, fnm.rr)
-	fnm.mul(mut ri, rinv, fnm.rr)
-	fnm.mul(mut mm, mm, ri)
+	fnm.mul(mut mm, mm, k.unbl)
+	fnm.mul(mut k.bl, k.bl, k.bl)
+	fnm.mul(mut k.unbl, k.unbl, k.unbl)
+	k.blUses += 1
 	mut sig = fnm.to_bytes(mm)
 	sig = sig[len(sig)-size:]
 	// Check with the public key before releasing anything.

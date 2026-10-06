@@ -8,22 +8,22 @@ package seal
 // the scalar. Phase 2 (ECDSA) uses p256_mul, p256_add, p256_affine and the scalar field p256n.
 
 let p256f = new_monty(
-	[]u64{0xffffffff, 0xffffffff, 0xffffffff, 0x00000000, 0x00000000, 0x00000000, 0x00000001, 0xffffffff},
-	[]u64{0x00000003, 0x00000000, 0xffffffff, 0xfffffffb, 0xfffffffe, 0xffffffff, 0xfffffffd, 0x00000004},
-	[]u64{0x00000001, 0x00000000, 0x00000000, 0xffffffff, 0xffffffff, 0xffffffff, 0xfffffffe, 0x00000000},
+	[]u64{0xffffffffffffffff, 0x00000000ffffffff, 0x0000000000000000, 0xffffffff00000001},
+	[]u64{0x0000000000000003, 0xfffffffbffffffff, 0xfffffffffffffffe, 0x00000004fffffffd},
+	[]u64{0x0000000000000001, 0xffffffff00000000, 0xffffffffffffffff, 0x00000000fffffffe},
 	1)
 
 // p256n is arithmetic modulo the group order n.
 let p256n = new_monty(
-	[]u64{0xfc632551, 0xf3b9cac2, 0xa7179e84, 0xbce6faad, 0xffffffff, 0xffffffff, 0x00000000, 0xffffffff},
-	[]u64{0xbe79eea2, 0x83244c95, 0x49bd6fa6, 0x4699799c, 0x2b6bec59, 0x2845b239, 0xf3d95620, 0x66e12d94},
-	[]u64{0x039cdaaf, 0x0c46353d, 0x58e8617b, 0x43190552, 0x00000000, 0x00000000, 0xffffffff, 0x00000000},
-	0xee00bc4f)
+	[]u64{0xf3b9cac2fc632551, 0xbce6faada7179e84, 0xffffffffffffffff, 0xffffffff00000000},
+	[]u64{0x83244c95be79eea2, 0x4699799c49bd6fa6, 0x2845b2392b6bec59, 0x66e12d94f3d95620},
+	[]u64{0x0c46353d039cdaaf, 0x4319055258e8617b, 0x0000000000000000, 0x00000000ffffffff},
+	0xccd1c8aaee00bc4f)
 
 // The curve constant b and the base point, in Montgomery form.
-let p256b = []u64{0x29c4bddf, 0xd89cdf62, 0x78843090, 0xacf005cd, 0xf7212ed6, 0xe5a220ab, 0x04874834, 0xdc30061d}
-let p256gx = []u64{0x18a9143c, 0x79e730d4, 0x5fedb601, 0x75ba95fc, 0x77622510, 0x79fb732b, 0xa53755c6, 0x18905f76}
-let p256gy = []u64{0xce95560a, 0xddf25357, 0xba19e45c, 0x8b4ab8e4, 0xdd21f325, 0xd2e88688, 0x25885d85, 0x8571ff18}
+let p256b = []u64{0xd89cdf6229c4bddf, 0xacf005cd78843090, 0xe5a220abf7212ed6, 0xdc30061d04874834}
+let p256gx = []u64{0x79e730d418a9143c, 0x75ba95fc5fedb601, 0x79fb732b77622510, 0x18905f76a53755c6}
+let p256gy = []u64{0xddf25357ce95560a, 0x8b4ab8e4ba19e45c, 0xd2e88688dd21f325, 0x8571ff1825885d85}
 
 // p256pt is a point in projective coordinates (Montgomery form).
 type p256pt struct {
@@ -33,10 +33,10 @@ type p256pt struct {
 }
 
 // Scratch elements for the point formulas (per core; nothing here waits).
-let p256t = [][]u64{make([]u64, 8), make([]u64, 8), make([]u64, 8), make([]u64, 8), make([]u64, 8), make([]u64, 8), make([]u64, 8), make([]u64, 8)}
+let p256t = [][]u64{make([]u64, 4), make([]u64, 4), make([]u64, 4), make([]u64, 4), make([]u64, 4), make([]u64, 4), make([]u64, 4), make([]u64, 4)}
 
 fn p256_identity() p256pt {
-	let p = p256pt{x: make([]u64, 8), y: make([]u64, 8), z: make([]u64, 8)}
+	let p = p256pt{x: make([]u64, 4), y: make([]u64, 4), z: make([]u64, 4)}
 	p256f.set(mut p.y, p256f.one)
 	return p
 }
@@ -200,6 +200,59 @@ fn p256_double(r mut p256pt, p p256pt) {
 	p256_copy(mut r, acc)
 }
 
+// p256gTable holds j*16^i*G for i in 0..64 and j in 1..16 (projective, at index 15i+j-1), built
+// on each core the first time it is needed (#474): k*G then takes 64 additions and no doubling.
+mut p256gTable []p256pt
+
+fn p256_base_table() []p256pt {
+	if len(p256gTable) == 0 {
+		mut t = make([]p256pt, 0, 64*15)
+		let base = p256_generator()
+		for i in 0..64 {
+			let first = p256_identity()
+			p256_copy(mut first, base)
+			t = append(t, first)
+			for j in 2..16 {
+				let e = p256_identity()
+				p256_add(mut e, t[len(t)-1], base)
+				t = append(t, e)
+			}
+			for d in 0..4 {
+				p256_double(mut base, base)
+			}
+		}
+		p256gTable = keep(t)
+	}
+	return p256gTable
+}
+
+// p256_mul_base sets r = k*G for a 32-byte big-endian scalar k (any value), in time that does
+// not depend on k: each 4-bit digit of k reads its row of the table by touching every entry
+// and adds the point it selected (the identity for a zero digit).
+@wrap fn p256_mul_base(r mut p256pt, k []u8) {
+	let table = p256_base_table()
+	let acc = p256_identity()
+	let sel = p256_identity()
+	for i in 0..64 {
+		let w = (u64(k[31-i/2]) >> u64(4*(i%2))) & 15
+		for j in 0..4 {
+			sel.x[j] = 0
+			sel.y[j] = p256f.one[j]
+			sel.z[j] = 0
+		}
+		for j in 1..16 {
+			let d = u64(j) ^ w
+			let bit = 1 ^ ((d | (u64(0) -% d)) >> 63)
+			let e = table[15*i+j-1]
+			p256f.sel(mut sel.x, e.x, sel.x, bit)
+			p256f.sel(mut sel.y, e.y, sel.y, bit)
+			p256f.sel(mut sel.z, e.z, sel.z, bit)
+		}
+		p256_add(mut acc, acc, sel)
+	}
+	p256_copy(mut r, acc)
+}
+
 // p256_affine returns p's affine coordinates as 32-byte big-endian x and y, and 0 for the
 // identity (then x and y are zero), else 1.
 fn p256_affine(p p256pt) ([]u8, []u8, u64) {
@@ -306,7 +359,7 @@ fn P256PublicKey(priv secret []u8) ![]u8 {
 		fail "seal: invalid P-256 private key"
 	}
 	let r = p256_identity()
-	p256_mul(mut r, p256_generator(), priv)
+	p256_mul_base(mut r, priv)
 	return try p256_encode(r)
 }
 

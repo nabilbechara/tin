@@ -1,95 +1,72 @@
 #!/usr/bin/env python3
-"""Generate lib/seal/fe25519.tin: multiplication and squaring mod 2^255 - 19 on ten signed limbs
-in radix 2^25.5 (limb i holds bits from ceil(25.5 i)), as straight-line code: no loop, branch or
-bounds check, and every product fits in 64 bits for limbs up to 2^27 in magnitude.
+"""Generate lib/seal/fe25519.tin: multiplication and squaring mod 2^255 - 19 on five unsigned
+limbs in radix 2^51 (#474), as straight-line code: no loop, branch or bounds check past the
+operand loads.
 
-Limb offsets add up to one more bit when both limbs are odd (factor 2), and a product past
-limb 9 wraps around with factor 19 (2^255 = 19 mod p)."""
+Each coefficient of the product is a sum of 64x64-bit products accumulated in 128 bits (lo, hi):
+mulhi is the high word (umulh, mul), lt the carry of the low word (cset). A product past limb 4
+wraps around with factor 19 (2^255 = 19 mod p), folded into one operand. With limbs below 2^52
+every coefficient is below 2^111 (Go's crypto/internal/fips140/edwards25519/field has the
+bounds); the carries then bring the limbs back below 2^52."""
 import sys
 
 
-def factor(i, j):
-    f = 1
-    if i % 2 == 1 and j % 2 == 1:
-        f *= 2
-    if i + j >= 10:
-        f *= 19
-    return f
+def acc(lines, name, terms):
+    """Accumulate the products in terms into (name_lo, name_hi)."""
+    a, b = terms[0]
+    lines.append(f'\tmut {name}lo = {a} * {b}')
+    lines.append(f'\tmut {name}hi = mulhi({a}, {b})')
+    for a, b in terms[1:]:
+        lines.append(f'\tlet {name}{a}{b} = {a} * {b}')
+        lines.append(f'\t{name}hi += mulhi({a}, {b})')
+        lines.append(f'\t{name}lo += {name}{a}{b}')
+        lines.append(f'\t{name}hi += lt({name}lo, {name}{a}{b})')
 
 
-def carry(lines):
-    """Bring h0..h9 back to about 2^25 (2^24 for odd limbs), rounding, then store."""
-    first = True
-    for i in list(range(10)) + [0]:
-        w = 26 if i % 2 == 0 else 25
-        decl = 'mut c =' if first else 'c ='
-        first = False
-        lines.append(f'\t{decl} (h{i} + (1 << {w - 1})) >> {w}')
-        if i == 9:
-            lines.append('\th0 += 19 * c')
-        else:
-            lines.append(f'\th{i + 1} += c')
-        lines.append(f'\th{i} -= c << {w}')
-    for i in range(10):
-        lines.append(f'\th[{i}] = h{i}')
-
-
-def scaled(name, k, pre, lines):
-    """The name of k*name, defined once."""
-    if k == 1:
-        return name
-    key = f'{name}_{k}'
-    if key not in pre:
-        pre.add(key)
-        lines.append(f'\tlet {key} = {k} * {name}')
-    return key
+def reduce(lines):
+    """Carry the five 128-bit coefficients into limbs below 2^52 and store them in h."""
+    for i in range(5):
+        lines.append(f'\tlet c{i} = (r{i}hi << 13) | (r{i}lo >> 51)')
+    lines.append('\tlet s0 = (r0lo & mask51) + c4*19')
+    for i in range(1, 5):
+        lines.append(f'\tlet s{i} = (r{i}lo & mask51) + c{i - 1}')
+    lines.append('\th[0] = (s0 & mask51) + (s4>>51)*19')
+    for i in range(1, 5):
+        lines.append(f'\th[{i}] = (s{i} & mask51) + (s{i - 1} >> 51)')
 
 
 def mul():
-    lines = ['// fe_mul sets h = f*g; h may alias f or g. Limbs of f and g up to 2^27 in magnitude.',
-             '// The limb bounds keep every sum in i64; @wrap keeps the code free of value-dependent branches.',
-             '@wrap fn fe_mul(h mut []i64, f []i64, g []i64) {']
-    lines += [f'\tlet f{i} = f[{i}]' for i in range(10)] + [f'\tlet g{i} = g[{i}]' for i in range(10)]
-    pre = set()
-    body = []
-    for k in range(10):
+    lines = ['// fe_mul sets h = f*g; h may alias f or g. Limbs of f and g below 2^52.',
+             '@wrap fn fe_mul(h mut []u64, f []u64, g []u64) {']
+    lines += [f'\tlet f{i} = f[{i}]' for i in range(5)] + [f'\tlet g{i} = g[{i}]' for i in range(5)]
+    lines += [f'\tlet f{i}x19 = f{i} * 19' for i in range(1, 5)]
+    for k in range(5):
         terms = []
-        for i in range(10):
-            j = (k - i) % 10
-            a = scaled(f'f{i}', 2 if (i % 2 and j % 2) else 1, pre, lines)
-            b = scaled(f'g{j}', 19 if i + j >= 10 else 1, pre, lines)
-            terms.append(f'{a}*{b}')
-        body.append(f'\tmut h{k} = ' + ' + '.join(terms))
-    lines += body
-    carry(lines)
+        for i in range(5):
+            j = (k - i) % 5
+            terms.append((f'f{i}x19' if i + j >= 5 else f'f{i}', f'g{j}'))
+        acc(lines, f'r{k}', terms)
+    reduce(lines)
     lines.append('}')
     return lines
 
 
 def sq():
     lines = ['// fe_sq sets h = f*f (each cross product once, doubled); h may alias f.',
-             '@wrap fn fe_sq(h mut []i64, f []i64) {']
-    lines += [f'\tlet f{i} = f[{i}]' for i in range(10)]
-    pre = set()
-    body = []
-    for k in range(10):
-        terms = []
-        for i in range(10):
-            j = (k - i) % 10
-            if j < i:
-                continue
-            m = factor(i, j) * (1 if i == j else 2)
-            # Split the constant between the operands to keep both scalings small.
-            a_k = 2 if m % 2 == 0 and m != 38 and m != 19 else 1
-            if m in (38, 76):
-                a_k = m // 19
-            b_k = m // a_k
-            a = scaled(f'f{i}', a_k, pre, lines)
-            b = scaled(f'f{j}', b_k, pre, lines)
-            terms.append(f'{a}*{b}')
-        body.append(f'\tmut h{k} = ' + ' + '.join(terms))
-    lines += body
-    carry(lines)
+             '@wrap fn fe_sq(h mut []u64, f []u64) {']
+    lines += [f'\tlet f{i} = f[{i}]' for i in range(5)]
+    lines += ['\tlet f0x2 = f0 * 2', '\tlet f1x2 = f1 * 2', '\tlet f1x38 = f1 * 38', '\tlet f2x38 = f2 * 38',
+              '\tlet f3x38 = f3 * 38', '\tlet f3x19 = f3 * 19', '\tlet f4x19 = f4 * 19']
+    rows = [
+        [('f0', 'f0'), ('f1x38', 'f4'), ('f2x38', 'f3')],
+        [('f0x2', 'f1'), ('f2x38', 'f4'), ('f3x19', 'f3')],
+        [('f0x2', 'f2'), ('f1', 'f1'), ('f3x38', 'f4')],
+        [('f0x2', 'f3'), ('f1x2', 'f2'), ('f4x19', 'f4')],
+        [('f0x2', 'f4'), ('f1x2', 'f3'), ('f2', 'f2')],
+    ]
+    for k, terms in enumerate(rows):
+        acc(lines, f'r{k}', terms)
+    reduce(lines)
     lines.append('}')
     return lines
 

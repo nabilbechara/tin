@@ -1,17 +1,19 @@
 package seal
 
-// ---- constant-time arithmetic modulo an odd prime, in Montgomery form ----
-// An element is a []u64 of n 32-bit limbs, least significant first, holding x*R mod m with
-// R = 2^(32n). Every function here runs in time that depends only on n and on public
-// exponents: no branch or index depends on an element's value. P-256 (p256.tin) uses it for
-// its field and its scalars; P-384 and other prime fields can reuse it with their constants.
+// ---- constant-time arithmetic modulo an odd number, in Montgomery form ----
+// An element is a []u64 of n 64-bit limbs, least significant first, holding x*R mod m with
+// R = 2^(64n). Every function here runs in time that depends only on n and on public
+// exponents: no branch or index depends on an element's value. A carry or borrow is a
+// comparison turned into 0 or 1 (cmp and cset on arm64, cmp and setb on x86-64, no branch), and
+// the high word of a product is __mulhu (umulh, mul: #474). P-256 (p256.tin) uses it for its
+// field and its scalars, P-384 and RSA through monty_new (bignum.tin).
 
-// monty is a prime modulus with its Montgomery constants and scratch space.
+// monty is a modulus with its Montgomery constants and scratch space.
 type monty struct {
 	m    []u64 // the modulus
 	rr   []u64 // R^2 mod m
 	one  []u64 // R mod m (1 in Montgomery form)
-	minv u64   // -m^-1 mod 2^32
+	minv u64   // -m^-1 mod 2^64
 	n    i64   // limbs
 	t    []u64 // n+2 words of scratch
 	u    []u64 // n words of scratch
@@ -27,41 +29,202 @@ fn (f monty) elem() []u64 {
 	return make([]u64, f.n)
 }
 
-// mul sets z = x*y/R mod m (CIOS Montgomery multiplication); z may alias x or y.
+// size is the length in bytes of f's elements as from_bytes and to_bytes take them: 8 per limb.
+fn (f monty) size() i64 {
+	return 8 * f.n
+}
+
+// The arithmetic below is @wrap (#362): sums and differences wrap modulo 2^64 by design, their
+// carries and borrows are computed from the operands, and constant-time code takes no
+// value-dependent branch.
+
+// mulhi is the high 64 bits of the 128-bit product of a and b.
+@wrap fn mulhi(a u64, b u64) u64 {
+	return u64(__mulhu(i64(a), i64(b)))
+}
+
+// lt is 1 when a < b, else 0, as cset (no branch): the carry of s = a + b (wrapped) is lt(s, a),
+// and a - b borrows when lt(a, b).
+@wrap fn lt(a u64, b u64) u64 {
+	return u64(i64(a < b))
+}
+
+// mul sets z = x*y/R mod m; z may alias x or y. Each round adds x*y[i] and mm*m (mm chosen so
+// that the low limb becomes zero) to t in one pass with two carries (FIOS), then drops the low
+// limb. The limbs are read and written by address (#474): every element is checked to have n
+// limbs first, so no index can leave its slice.
 @wrap fn (f mut monty) mul(z mut []u64, x []u64, y []u64) {
 	let n = f.n
-	let t = f.t
-	for i in 0..n+2 {
-		t[i] = 0
+	if n == 4 {
+		m4_mul(mut z, x, y, f.m, f.minv)
+		return
 	}
+	let t = f.t
+	if len(x) != n || len(y) != n || len(z) != n || len(f.m) != n || len(t) != n+2 {
+		rt_panic("seal: a field element has the wrong number of limbs")
+	}
+	let xp = cast(i64, x)[2]
+	let yp = cast(i64, y)[2]
+	let mp = cast(i64, f.m)[2]
+	let tp = cast(i64, t)[2]
+	for i in 0..n+1 {
+		__st(tp+8*i, 0, 3)
+	}
+	let minv = f.minv
+	let m0 = u64(__ld(mp, 3))
+	let x0 = u64(__ld(xp, 3))
 	for i in 0..n {
-		let yi = y[i]
-		mut c = u64(0)
-		for j in 0..n {
-			let s = t[j] + x[j]*yi + c
-			t[j] = s & 0xffffffff
-			c = s >> 32
-		}
-		mut s = t[n] + c
-		t[n] = s & 0xffffffff
-		t[n+1] = s >> 32
-		let mm = (t[0] * f.minv) & 0xffffffff
-		s = t[0] + mm*f.m[0]
-		c = s >> 32
+		let yi = u64(__ld(yp+8*i, 3))
+		let t0 = u64(__ld(tp, 3))
+		// Limb 0: t0 + x0*yi, then mm*m0 makes it zero.
+		mut lo = x0 * yi
+		mut hi = mulhi(x0, yi)
+		lo += t0
+		hi += lt(lo, t0)
+		mut c1 = hi
+		let mm = lo * minv
+		mut lo2 = mm * m0
+		mut hi2 = mulhi(mm, m0)
+		lo2 += lo
+		hi2 += lt(lo2, lo)
+		mut c2 = hi2
 		for j in 1..n {
-			s = t[j] + mm*f.m[j] + c
-			t[j-1] = s & 0xffffffff
-			c = s >> 32
+			let xj = u64(__ld(xp+8*j, 3))
+			let tj = u64(__ld(tp+8*j, 3))
+			let mj = u64(__ld(mp+8*j, 3))
+			lo = xj * yi
+			hi = mulhi(xj, yi)
+			lo += tj
+			hi += lt(lo, tj)
+			lo += c1
+			hi += lt(lo, c1)
+			c1 = hi
+			lo2 = mj * mm
+			hi2 = mulhi(mj, mm)
+			lo2 += lo
+			hi2 += lt(lo2, lo)
+			lo2 += c2
+			hi2 += lt(lo2, c2)
+			c2 = hi2
+			__st(tp+8*(j-1), i64(lo2), 3)
 		}
-		s = t[n] + c
-		t[n-1] = s & 0xffffffff
-		t[n] = t[n+1] + (s >> 32)
+		let tn = u64(__ld(tp+8*n, 3))
+		let s1 = tn + c1
+		let k1 = lt(s1, c1)
+		let s2 = s1 + c2
+		let k2 = lt(s2, c2)
+		__st(tp+8*(n-1), i64(s2), 3)
+		__st(tp+8*n, i64(k1+k2), 3)
 	}
 	f.reduce(mut z, t, t[n])
 }
 
-// The arithmetic below is @wrap (#362): the borrows and masks wrap modulo 2^64 by design, the
-// 32-bit limbs keep products and carries in u64, and constant-time code takes no value-dependent branch.
+// m4_mul is mul for four limbs (256-bit moduli: P-256's field and order, Ed25519's order),
+// unrolled into registers.
+@wrap fn m4_mul(z mut []u64, x []u64, y []u64, m []u64, minv u64) {
+	let x0 = x[0]
+	let x1 = x[1]
+	let x2 = x[2]
+	let x3 = x[3]
+	let m0 = m[0]
+	let m1 = m[1]
+	let m2 = m[2]
+	let m3 = m[3]
+	mut t0 = u64(0)
+	mut t1 = u64(0)
+	mut t2 = u64(0)
+	mut t3 = u64(0)
+	mut t4 = u64(0)
+	for i in 0..4 {
+		let yi = y[i]
+		// t += x*yi
+		mut lo = x0 * yi
+		mut hi = mulhi(x0, yi)
+		lo += t0
+		hi += lt(lo, t0)
+		t0 = lo
+		mut c = hi
+		lo = x1 * yi
+		hi = mulhi(x1, yi)
+		lo += t1
+		hi += lt(lo, t1)
+		lo += c
+		hi += lt(lo, c)
+		t1 = lo
+		c = hi
+		lo = x2 * yi
+		hi = mulhi(x2, yi)
+		lo += t2
+		hi += lt(lo, t2)
+		lo += c
+		hi += lt(lo, c)
+		t2 = lo
+		c = hi
+		lo = x3 * yi
+		hi = mulhi(x3, yi)
+		lo += t3
+		hi += lt(lo, t3)
+		lo += c
+		hi += lt(lo, c)
+		t3 = lo
+		c = hi
+		let s = t4 + c
+		let t5 = lt(s, c)
+		t4 = s
+		// t = (t + mm*m) / 2^64
+		let mm = t0 * minv
+		lo = mm * m0
+		hi = mulhi(mm, m0)
+		lo += t0
+		hi += lt(lo, t0)
+		c = hi
+		lo = mm * m1
+		hi = mulhi(mm, m1)
+		lo += t1
+		hi += lt(lo, t1)
+		lo += c
+		hi += lt(lo, c)
+		t0 = lo
+		c = hi
+		lo = mm * m2
+		hi = mulhi(mm, m2)
+		lo += t2
+		hi += lt(lo, t2)
+		lo += c
+		hi += lt(lo, c)
+		t1 = lo
+		c = hi
+		lo = mm * m3
+		hi = mulhi(mm, m3)
+		lo += t3
+		hi += lt(lo, t3)
+		lo += c
+		hi += lt(lo, c)
+		t2 = lo
+		c = hi
+		let s2 = t4 + c
+		t3 = s2
+		t4 = t5 + lt(s2, c)
+	}
+	// t < 2m: subtract m once unless that borrows past the top word.
+	let d0 = t0 - m0
+	mut b = lt(t0, m0)
+	let e1 = t1 - m1
+	let d1 = e1 - b
+	b = lt(t1, m1) | lt(e1, b)
+	let e2 = t2 - m2
+	let d2 = e2 - b
+	b = lt(t2, m2) | lt(e2, b)
+	let e3 = t3 - m3
+	let d3 = e3 - b
+	b = lt(t3, m3) | lt(e3, b)
+	let mask = u64(0) - (b & (1 ^ t4))
+	z[0] = (t0 & mask) | (d0 & ^mask)
+	z[1] = (t1 & mask) | (d1 & ^mask)
+	z[2] = (t2 & mask) | (d2 & ^mask)
+	z[3] = (t3 & mask) | (d3 & ^mask)
+}
+
 // reduce sets z = t - m if the n+1-word value (t[:n], top) is at least m, else t, in constant
 // time; t < 2m.
 @wrap fn (f mut monty) reduce(z mut []u64, t []u64, top u64) {
@@ -69,9 +232,11 @@ fn (f monty) elem() []u64 {
 	let d = f.u
 	mut b = u64(0)
 	for j in 0..n {
-		let s = t[j] - f.m[j] - b
-		d[j] = s & 0xffffffff
-		b = (s >> 32) & 1
+		let tj = t[j]
+		let mj = f.m[j]
+		let e = tj - mj
+		d[j] = e - b
+		b = lt(tj, mj) | lt(e, b)
 	}
 	// Keep t only when the subtraction borrowed past the top word.
 	let keep_ = b & (1 ^ top)
@@ -87,9 +252,11 @@ fn (f monty) elem() []u64 {
 	let t = f.t
 	mut c = u64(0)
 	for j in 0..n {
-		let s = x[j] + y[j] + c
-		t[j] = s & 0xffffffff
-		c = s >> 32
+		let a = x[j]
+		let s = a + y[j]
+		let s2 = s + c
+		c = lt(s, a) | lt(s2, s)
+		t[j] = s2
 	}
 	f.reduce(mut z, t, c)
 }
@@ -100,17 +267,21 @@ fn (f monty) elem() []u64 {
 	let t = f.t
 	mut b = u64(0)
 	for j in 0..n {
-		let s = x[j] - y[j] - b
-		t[j] = s & 0xffffffff
-		b = (s >> 32) & 1
+		let a = x[j]
+		let yj = y[j]
+		let e = a - yj
+		t[j] = e - b
+		b = lt(a, yj) | lt(e, b)
 	}
 	// Add m back when it borrowed.
 	let mask = u64(0) - b
 	mut c = u64(0)
 	for j in 0..n {
-		let s = t[j] + (f.m[j] & mask) + c
-		z[j] = s & 0xffffffff
-		c = s >> 32
+		let a = t[j]
+		let s = a + (f.m[j] & mask)
+		let s2 = s + c
+		c = lt(s, a) | lt(s2, s)
+		z[j] = s2
 	}
 }
 
@@ -147,21 +318,35 @@ fn (f monty) set(z mut []u64, x []u64) {
 	return 1 ^ ((v | (u64(0) - v)) >> 63)
 }
 
-// exp sets z = x^e (e big-endian and public) in Montgomery form; z may alias x.
+// exp sets z = x^e (e big-endian and public) in Montgomery form; z may alias x. It uses 4-bit
+// windows: x^1..x^15 first, then per digit four squarings and one multiplication, skipped for a
+// zero digit (e is public, so branching on it reveals nothing): an inversion mod a 256-bit
+// prime takes about 64 multiplications instead of one per set bit (#474).
 @wrap fn (f mut monty) exp(z mut []u64, x []u64, e []u8) {
+	mut table = make([][]u64, 0, 16)
+	table = append(table, f.elem())
+	f.set(mut table[0], f.one)
+	for k in 1..16 {
+		let t = f.elem()
+		f.mul(mut t, table[k-1], x)
+		table = append(table, t)
+	}
 	let acc = f.elem()
-	let base = f.elem()
-	f.set(mut base, x)
 	f.set(mut acc, f.one)
-	for i in 0..len(e) {
-		{
-			mut bit = 7
-			for bit >= 0 {
+	mut started = false
+	for i in 0..2*len(e) {
+		let w = i64(e[i/2] >> u8(4-4*(i%2))) & 15
+		if started {
+			for s in 0..4 {
 				f.mul(mut acc, acc, acc)
-				if (e[i]>>u8(bit))&1 == 1 {
-					f.mul(mut acc, acc, base)
-				}
-				bit -= 1
+			}
+		}
+		if w != 0 {
+			if started {
+				f.mul(mut acc, acc, table[w])
+			} else {
+				f.set(mut acc, table[w])
+				started = true
 			}
 		}
 	}
@@ -170,38 +355,57 @@ fn (f monty) set(z mut []u64, x []u64) {
 
 // inv sets z = x^-1 (x^(m-2), m prime; 0 for x = 0); z may alias x.
 @wrap fn (f mut monty) inv(z mut []u64, x []u64) {
-	let e = make([]u8, 4*f.n)
+	let e = f.elem()
 	mut b = u64(2)
 	for j in 0..f.n {
-		let s = f.m[j] - b
-		b = (s >> 32) & 1
-		let w = s & 0xffffffff
-		let k = 4*f.n - 4*j
-		e[k-1] = u8(w)
-		e[k-2] = u8(w >> 8)
-		e[k-3] = u8(w >> 16)
-		e[k-4] = u8(w >> 24)
+		let mj = f.m[j]
+		e[j] = mj - b
+		b = lt(mj, b)
 	}
-	f.exp(mut z, x, e)
+	f.exp(mut z, x, limbs_to_be(e))
+}
+
+// limbs_from_be reads big-endian b into n little-endian 64-bit limbs; the bytes past 8n (on the
+// left) are dropped, so b must fit.
+@wrap fn limbs_from_be(b secret []u8, n i64) []u64 {
+	let out = make([]u64, n)
+	for i in 0..len(b) {
+		let k = len(b) - 1 - i
+		if k/8 < n {
+			out[k/8] |= u64(b[i]) << u64(8*(k%8))
+		}
+	}
+	return out
+}
+
+// limbs_to_be writes little-endian 64-bit limbs as big-endian bytes, 8 per limb.
+@wrap fn limbs_to_be(x []u64) []u8 {
+	let n = len(x)
+	let out = make([]u8, 8*n)
+	for j in 0..n {
+		let w = x[j]
+		let k = 8*n - 8*j
+		for b in 0..8 {
+			out[k-1-b] = u8(w >> u64(8*b))
+		}
+	}
+	return out
 }
 
 // from_bytes sets z to the big-endian value b in Montgomery form and returns 1, or returns 0
-// (z unchanged) when b is not 4n bytes or not below m. Only the result is public.
+// (z unchanged) when b is not f.size() bytes or not below m. Only the result is public.
 @wrap fn (f mut monty) from_bytes(z mut []u64, b []u8) u64 {
 	let n = f.n
-	if len(b) != 4*n {
+	if len(b) != 8*n {
 		return 0
 	}
-	let x = f.elem()
-	for j in 0..n {
-		let k = 4*n - 4*j
-		x[j] = u64(b[k-1]) | u64(b[k-2])<<8 | u64(b[k-3])<<16 | u64(b[k-4])<<24
-	}
+	let x = limbs_from_be(b, n)
 	// x < m exactly when x - m borrows.
 	mut bw = u64(0)
 	for j in 0..n {
-		let s = x[j] - f.m[j] - bw
-		bw = (s >> 32) & 1
+		let xj = x[j]
+		let mj = f.m[j]
+		bw = lt(xj, mj) | lt(xj - mj, bw)
 	}
 	if bw == 0 {
 		return 0
@@ -210,20 +414,11 @@ fn (f monty) set(z mut []u64, x []u64) {
 	return 1
 }
 
-// to_bytes is x (in Montgomery form) as 4n big-endian bytes.
+// to_bytes is x (in Montgomery form) as f.size() big-endian bytes.
 fn (f mut monty) to_bytes(x []u64) []u8 {
-	let n = f.n
 	let one = f.elem()
 	one[0] = 1
 	let y = f.elem()
 	f.mul(mut y, x, one)
-	let out = make([]u8, 4*n)
-	for j in 0..n {
-		let k = 4*n - 4*j
-		out[k-1] = u8(y[j])
-		out[k-2] = u8(y[j] >> 8)
-		out[k-3] = u8(y[j] >> 16)
-		out[k-4] = u8(y[j] >> 24)
-	}
-	return out
+	return limbs_to_be(y)
 }

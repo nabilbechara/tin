@@ -21,11 +21,13 @@ and hashlib on every length from 0 to 299 bytes).
 API: `P256NewPrivateKey`, `P256PublicKey`, `P256ECDH`; internal field and point functions for
 ECDSA are listed in notes/tls.md.
 
-- `field.tin` is generic Montgomery arithmetic over 32-bit limbs (no 64x64->128 multiply is
-  needed), constant-time; `p256.tin` uses the complete formulas of Renes-Costello-Batina and a
-  4-bit fixed window with a full-table scan.
-- Performance gap: about 3.4 ms per ECDH on Linux x86-64 against Go's 70 us (assembly). The
-  next step is a P-256-specific unrolled multiplication; the internal API does not change.
+- `field.tin` is Montgomery arithmetic over 64-bit limbs (#474). The high word of a product is
+  the `__mulhu` intrinsic (umulh, mul), and a carry is a comparison turned into 0 or 1 (cset,
+  setb), so it is constant-time without a branch. Four-limb moduli (P-256's p and n,
+  Ed25519's order) take an unrolled multiplication. Longer ones (RSA, P-384) take one fused
+  pass per limb (FIOS), reading the limbs by address after one size check.
+- `p256.tin` uses the complete formulas of Renes-Costello-Batina. k*P uses a 4-bit fixed window
+  with a full-table scan; k*G uses a per-core table of j*16^i*G (64 additions, no doubling).
 
 Tests: `tests/v2/seal_p256.tin` (Go twin `bench/ref/seal_p256`), and Wycheproof
 `ecdh_secp256r1_ecpoint` in `tools/ci/crypto_check.py`.
@@ -66,10 +68,10 @@ with a Go twin, and `tools/ci/x509_check.py` (fresh PKI, mutated certificates, s
 API: `X25519`, `X25519PublicKey`, `X25519NewPrivateKey`, `ChaCha20`, `type AEAD` with
 `NewChaCha20Poly1305`, `Seal`, `Open`, `NonceSize`, `Overhead`.
 
-- X25519 uses ten signed limbs in radix 2^25.5 so products fit in 64 bits; it fails on an
-  all-zero result (RFC 8446 7.4.2 requires the check). `fe_mul` and `fe_sq` are straight-line
-  code from `tools/gen_fe25519.py` (no loop, branch or bounds check; squaring computes each
-  cross product once), about 3.5 times faster than the first looped version.
+- X25519 uses five unsigned limbs in radix 2^51 (#474), and products are accumulated in 128
+  bits with `__mulhu`. It fails on an all-zero result (RFC 8446 7.4.2 requires the check).
+  `fe_mul` and `fe_sq` are straight-line code from `tools/gen_fe25519.py`: no loop, branch or
+  bounds check past the loads, and squaring computes each cross product once.
 - ChaCha20 keeps the state in locals and xors eight bytes at a time; Poly1305 is the 26-bit
   limb form (poly1305-donna). AES-GCM joins `AEAD` as another kind.
 
