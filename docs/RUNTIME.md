@@ -818,10 +818,42 @@ over TLS with ALPN `h2`.
   is generic over a private `stream` shape, so the same code reads a `wire.Conn` and a
   `tls.Conn`. `websocket.Dial` takes `wss://` (`DialTLS` with a `tls.Config`): the
   connection's `fill` and `write_raw` go through the `tls.Conn` held in its state.
-- ALPN (#478): `wire` offers `http/1.1` unless `Options.TLS` names other protocols, and fails a
-  connection on which the server chose a protocol other than HTTP/1.1. `websocket` always offers
-  `http/1.1` alone, since its upgrade is an HTTP/1.1 request. Some gateways refuse a client
-  that offers no ALPN.
+- ALPN (#478, #480): `wire` offers `h2` and `http/1.1` unless `Options.NoH2` (then `http/1.1`
+  alone) or `Options.TLS` names other protocols, and fails a connection on which the server
+  chose another protocol. `websocket` always offers `http/1.1` alone, since its upgrade is an
+  HTTP/1.1 request. Some gateways refuse a client that offers no ALPN.
+- HTTP/2 client (#480, `lib/wire/h2.tin`). `wire` speaks HTTP/2 to an https:// origin whose
+  server chooses h2, and over cleartext when `Options.H2C` asks (prior knowledge, as gRPC
+  servers expect).
+  - Connections: each core keeps one connection per origin (the pool key: scheme, host and TLS
+    settings), and every concurrent call to it is a stream, up to the server's
+    SETTINGS_MAX_CONCURRENT_STREAMS. Past that, a new connection takes the new calls, and the
+    full one closes when its streams end. An idle connection is checked before it is used (what
+    the server sent meanwhile is handled) and closed after 30 s.
+  - Sharing: the calls of a core share the socket the way the redis and kafka clients do. One
+    task at a time drives it: it writes the queued frames, reads, and hands each frame to its
+    stream. The others wait on their stream, and a call whose stream ends passes the driving to
+    one still waiting. Connection and stream state are malloc'd records, so a connection
+    outlives the requests that used it. The HPACK decoder (package `hpack`) keeps its dynamic
+    table in malloc'd memory too.
+  - Requests: header blocks use static-table names and plain literals, never indexed, so the
+    encoder keeps no state; header names are lowercased, and the connection-specific ones
+    (Connection, Keep-Alive, Transfer-Encoding, Upgrade, Host; TE except `trailers`) are left
+    out. A block larger than the server's frame size goes in CONTINUATION frames.
+  - Flow control: this client announces 4 MiB per stream and raises the connection's window to
+    16 MiB; each is given back by WINDOW_UPDATE once half is read. A request body is sent as the
+    server's windows allow, and SETTINGS_INITIAL_WINDOW_SIZE changes move the open streams'
+    windows.
+  - Responses are read whole, up to `Options.MaxBody` (past it the stream is reset with CANCEL),
+    with their trailers (`Resp.Trailer`). 1xx responses are skipped.
+  - Failures: a call that runs out of time (its deadline, `Options.Timeout`, cancellation)
+    resets its stream with RST_STREAM CANCEL and leaves the connection to the other calls. A call
+    the server did not process (past a GOAWAY's last stream id, or REFUSED_STREAM) is sent again
+    on a new connection, as is one whose connection failed before any answer when its method can
+    be repeated. A protocol error from the server (a frame too large, bad padding, a broken header
+    block, PUSH_PROMISE although push is off) ends the connection with a GOAWAY.
+  - Not done: streaming a response body as it arrives (a whole body is returned), PRIORITY, and
+    server push (refused with SETTINGS_ENABLE_PUSH 0).
 - `SSLKEYLOGFILE` (#478): when it names a file, every handshake, client or server, appends its
   four traffic secrets in the NSS key log format (`CLIENT_HANDSHAKE_TRAFFIC_SECRET`,
   `SERVER_HANDSHAKE_TRAFFIC_SECRET`, `CLIENT_TRAFFIC_SECRET_0`, `SERVER_TRAFFIC_SECRET_0`), which

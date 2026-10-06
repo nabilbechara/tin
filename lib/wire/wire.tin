@@ -1,5 +1,6 @@
-// Package wire is TCP networking and a small HTTP/1.1 client. Calls block the calling
-// core (servers should use anvil); every connection can carry a read/write timeout.
+// Package wire is TCP networking and an HTTP client: HTTP/1.1, and HTTP/2 to servers that choose
+// it by ALPN or with Options.H2C (#480). Calls inside a request wait without blocking the core;
+// every connection can carry a read/write timeout.
 //
 //	let c = try wire.Dial("127.0.0.1:6379")
 //	try c.Write("PING\r\n")
@@ -32,6 +33,7 @@ type Resp struct {
 	Status i64
 	Body   str
 	head   str
+	trail  str // the trailers of an HTTP/2 response (#480), as header lines
 }
 
 fn errno() i64 {
@@ -420,8 +422,10 @@ fn (l mut Listener) Close() {
 type Options struct {
 	Timeout i64         // ns for the whole call: connect, send and the complete response (0: no limit; a request's deadline still applies)
 	MaxBody i64         // largest response body accepted, in bytes (0: DefaultMaxBody)
-	TLS     ?tls.Config // for https://: roots, ALPN (default http/1.1; a server that picks another protocol is refused), InsecureSkipVerify (nil: verify against the system's roots); the server name is the URL's host
+	TLS     ?tls.Config // for https://: roots, ALPN (default h2 then http/1.1; a server that picks another protocol is refused), InsecureSkipVerify (nil: verify against the system's roots); the server name is the URL's host
 	MaxIdle i64         // idle keep-alive connections kept per core and host after a call (0: 8; negative: none, every call dials and sends Connection: close)
+	NoH2    bool        // speak HTTP/1.1 only: https:// offers no h2 (#480)
+	H2C     bool        // http:// speaks HTTP/2 by prior knowledge (h2c), as gRPC servers expect (#480)
 }
 
 // DefaultMaxIdle is how many idle connections per host (and core) DoWith keeps when Options.MaxIdle is 0.
@@ -442,7 +446,7 @@ fn Post(url str, ctype str, body str) !Resp {
 }
 
 fn none_resp() Resp {
-	return Resp{Body: "", head: ""}
+	return Resp{Body: "", head: "", trail: ""}
 }
 
 // Do sends one request: headers is a list of name, value pairs. The method and header names
@@ -581,7 +585,12 @@ fn DoWith(method str, url str, headers []str, body str, opt Options) !Resp {
 	if closes {
 		maxIdle = -1
 	}
-	let k = call{addr: addr, hostport: hostport, key: pool_key(secure, hostport, opt), req: req, head: method == "HEAD", limit_: limit_, until: until, timeout: opt.Timeout, maxIdle: maxIdle, idem: method == "GET" || method == "HEAD" || method == "PUT" || method == "DELETE" || method == "OPTIONS" || method == "TRACE"}
+	mut scheme = "http"
+	if secure {
+		scheme = "https"
+	}
+	let k = call{addr: addr, hostport: hostport, key: pool_key(secure, hostport, opt), req: req, head: method == "HEAD", limit_: limit_, until: until, timeout: opt.Timeout, maxIdle: maxIdle, idem: method == "GET" || method == "HEAD" || method == "PUT" || method == "DELETE" || method == "OPTIONS" || method == "TRACE",
+		method: method, scheme: scheme, path: path, headers: headers, body: body, noH2: opt.NoH2, h2c: opt.H2C}
 	// A kept connection the server closed meanwhile fails before any response byte: once, for a
 	// request that may be repeated, the call goes to a fresh connection.
 	staleRetry = false
@@ -605,7 +614,7 @@ fn DoWith(method str, url str, headers []str, body str, opt Options) !Resp {
 	return r
 }
 
-// call is one DoWith call, ready to send.
+// call is one DoWith call, ready to send: as HTTP/1.1 bytes (req), and in parts for HTTP/2.
 type call struct {
 	addr     str
 	hostport str
@@ -617,11 +626,29 @@ type call struct {
 	timeout  i64
 	maxIdle  i64
 	idem     bool
+	method   str
+	scheme   str
+	path     str
+	headers  []str
+	body     str
+	noH2     bool
+	h2c      bool
 }
 
 // attempt_plain makes one http:// exchange, on a kept connection to the key when allowed (usePool)
 // and there is one, else on a new one. A connection is kept again when the response ends cleanly.
 fn attempt_plain(k call, usePool bool) !Resp {
+	if k.h2c {
+		// HTTP/2 by prior knowledge (#480).
+		if usePool {
+			let g = h2_usable(k.key)
+			if g != 0 {
+				return try h2_attempt(g, k)
+			}
+		}
+		let nc = try DialTimeout(k.addr, k.timeout)
+		return try h2_attempt(h2_new(k.key, nc.fd, nil), k)
+	}
 	mut c = Conn{open: false, fd: -1}
 	mut reused = false
 	if usePool && k.maxIdle >= 0 {
@@ -658,14 +685,26 @@ fn attempt_plain(k call, usePool bool) !Resp {
 
 // attempt_tls is attempt_plain for https://: a kept connection keeps its TLS session.
 fn attempt_tls(k call, opt Options, usePool bool) !Resp {
+	if usePool && !k.noH2 {
+		// A connection that speaks HTTP/2 to this origin takes the call as a stream (#480).
+		let g = h2_usable(k.key)
+		if g != 0 {
+			return try h2_attempt(g, k)
+		}
+	}
 	if usePool && k.maxIdle >= 0 {
 		let kept = pool_take_tls(k.key)
 		if kept != nil {
 			return try exchange_tls(mut kept, k, true)
 		}
 	}
-	// ALPN offers http/1.1 (#478): some servers and gateways refuse a client that offers none.
-	let cfg = tls.Config{ServerName: "", RootCAs: "", ALPN: []str{"http/1.1"}, Timeout: opt.Timeout, InsecureSkipVerify: false}
+	// ALPN offers h2 (#480), then http/1.1 (#478): some servers and gateways refuse a client that
+	// offers none.
+	mut alpn = []str{"h2", "http/1.1"}
+	if k.noH2 {
+		alpn = []str{"http/1.1"}
+	}
+	let cfg = tls.Config{ServerName: "", RootCAs: "", ALPN: alpn, Timeout: opt.Timeout, InsecureSkipVerify: false}
 	let given = opt.TLS
 	if given != nil {
 		cfg.RootCAs = given.RootCAs
@@ -678,9 +717,12 @@ fn attempt_tls(k call, opt Options, usePool bool) !Resp {
 	}
 	cfg.ServerName = tls_host(k.hostport)
 	let tc = try tls.Dial(k.addr, cfg)
+	if tc.ALPN() == "h2" && !k.noH2 {
+		return try h2_attempt(h2_new(k.key, tc.Fd(), tc), k)
+	}
 	if tc.ALPN() != "" && tc.ALPN() != "http/1.1" {
 		tc.Close()
-		fail say.Fault("wire: the server chose %q by ALPN; wire speaks HTTP/1.1", tc.ALPN())
+		fail say.Fault("wire: the server chose %q by ALPN; wire speaks HTTP/1.1 and h2", tc.ALPN())
 	}
 	return try exchange_tls(mut tc, k, false)
 }
@@ -1374,7 +1416,17 @@ fn read_chunked[S stream](c mut S, pending []u8, limit_ i64) !str {
 
 // Header returns the response header name (any case), or "".
 fn (r Resp) Header(name str) str {
-	let h = r.head
+	return field_of(r.head, name)
+}
+
+// Trailer returns the response trailer name (any case), or "": HTTP/2 responses carry trailers
+// (gRPC's grpc-status, for one; #480).
+fn (r Resp) Trailer(name str) str {
+	return field_of(r.trail, name)
+}
+
+// field_of is field name's value in header lines h, or "".
+fn field_of(h str, name str) str {
 	mut i = 0
 	for i < len(h) {
 		mut j = i

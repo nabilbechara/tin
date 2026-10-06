@@ -1,0 +1,1062 @@
+package wire
+
+import "fault"
+import "hpack"
+import "say"
+import "tls"
+
+// ---- the HTTP/2 client (RFC 9113; #480) ----
+//
+// DoWith speaks HTTP/2 to an https:// origin whose server chooses h2 by ALPN (it offers h2, then
+// http/1.1, unless Options.NoH2), and over cleartext with prior knowledge when Options.H2C asks.
+// Each core keeps one connection per origin (pool key) and every concurrent call to the origin is
+// a stream on it, up to the server's SETTINGS_MAX_CONCURRENT_STREAMS; past that, a new connection
+// takes the new calls and the old one closes when its streams end.
+//
+// The calls of a core share the socket the way the redis and kafka clients do: one task at a time
+// drives it (writes what is queued, reads frames and hands each to its stream), and the others
+// wait on their stream; a call whose stream ends passes the driving on to a call still waiting.
+// The state lives in malloc'd records, so a connection outlives the requests that used it.
+//
+// Flow control: each stream may receive h2RecvWindow bytes and the connection h2ConnWindow before
+// a WINDOW_UPDATE, which is sent once half is read; a request body is sent as the server's windows
+// allow. Responses are read whole (up to Options.MaxBody), with their trailers. A call that runs
+// out of time resets its stream (RST_STREAM CANCEL), not the connection. A call the server did
+// not process (past a GOAWAY's last stream, or REFUSED_STREAM) is sent again on a new connection.
+
+const fData = 0
+const fHeaders = 1
+const fPriority = 2
+const fRst = 3
+const fSettings = 4
+const fPush = 5
+const fPing = 6
+const fGoaway = 7
+const fWindow = 8
+const fCont = 9
+
+const flEnd = 1     // END_STREAM; ACK on SETTINGS and PING
+const flHeaders = 4 // END_HEADERS
+const flPadded = 8
+const flPrio = 32
+
+const eProtocol = 1
+const eFlow = 3
+const eFrameSize = 6
+const eRefused = 7
+const eCancel = 8
+const eCompression = 9
+
+const h2Preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+const h2RecvWindow = 4194304  // SETTINGS_INITIAL_WINDOW_SIZE this client sends
+const h2ConnWindow = 16777216 // the connection's receive window, after a WINDOW_UPDATE on stream 0
+const h2MaxFrame = 16384      // the largest frame this client takes (the default)
+const h2HeaderList = 262144   // the largest response header list taken
+const h2Idle = 30000000000    // ns a connection may stay idle before it is closed
+
+// A connection's record, in malloc'd words.
+const gFd = 0
+const gKey = 1      // the pool key (malloc'd)
+const gKeyN = 2
+const gOut = 3      // frames to write
+const gOutN = 4
+const gOutCap = 5
+const gIn = 6       // bytes read, from gInS to gInE not yet taken as frames
+const gInS = 7
+const gInE = 8
+const gInCap = 9
+const gBusy = 10    // a task drives the connection
+const gNextID = 11
+const gStreams = 12 // the open streams' records
+const gNStreams = 13
+const gStreamCap = 14
+const gPeerMax = 15    // the server's SETTINGS_MAX_CONCURRENT_STREAMS
+const gPeerWin = 16    // the server's SETTINGS_INITIAL_WINDOW_SIZE
+const gPeerFrame = 17  // the server's SETTINGS_MAX_FRAME_SIZE
+const gSendWin = 18    // the connection's send window
+const gRecvUsed = 19   // connection bytes received and not yet given back by a WINDOW_UPDATE
+const gGoaway = 20     // the last stream id of a GOAWAY, -1 for none
+const gDead = 21       // why the connection failed (malloc'd), 0 while it works
+const gDeadN = 22
+const gDec = 23        // unused (the decoder is h2Dec[record])
+const gContID = 24     // a HEADERS without END_HEADERS: its stream; CONTINUATIONs follow
+const gBlock = 25      // the header block being collected
+const gBlockN = 26
+const gBlockCap = 27
+const gBlockEnd = 28   // the HEADERS frame had END_STREAM
+const gTLS = 29        // 1: its tls.Conn is h2TLS[record]
+const gIdleSince = 30  // rt_mono_ns() when its last stream ended
+const gMapped = 31     // 1 while h2Conns names it (new calls may use it)
+const gWords = 32
+
+// A stream's record, in malloc'd words.
+const sID = 0
+const sTask = 1
+const sState = 2    // 0 waiting, 1 done, 2 failed
+const sOwner = 3    // its caller must drive the connection
+const sStatus = 4
+const sHead = 5     // the response's header lines, "name: value\r\n" (malloc'd)
+const sHeadN = 6
+const sHeadCap = 7
+const sBody = 8
+const sBodyN = 9
+const sBodyCap = 10
+const sTrail = 11
+const sTrailN = 12
+const sTrailCap = 13
+const sErr = 14     // why it failed (malloc'd)
+const sErrN = 15
+const sRetry = 16   // 1: the server did not process it; 2: its connection failed before an answer
+const sSendWin = 17
+const sPend = 18    // request body bytes not yet sent (malloc'd), END_STREAM after them
+const sPendN = 19
+const sPendAt = 20
+const sRecvUsed = 21
+const sLimit = 22   // the largest body taken
+const sFinal = 23   // 1: the final response headers came
+const sHeadReq = 24 // 1: a HEAD request (no body comes)
+const sGot = 25     // 1: a frame came for it
+const sWords = 26
+
+// The connections of this core by pool key, and the TLS layer and HPACK decoder of each by record.
+let h2Conns = make(map[str]i64)
+let h2TLS = make(map[i64]?tls.Conn)
+let h2Dec = make(map[i64]?hpack.Decoder)
+
+// h2RetryLevel is set when h2_call fails: 1 when the server did not process the call, 2 when its
+// connection failed before an answer came for it, 0 otherwise.
+mut h2RetryLevel i64
+
+fn put24(b mut []u8, v i64) {
+	b = append(b, u8(v>>16), u8(v>>8), u8(v))
+}
+
+fn put32(b mut []u8, v i64) {
+	b = append(b, u8(v>>24), u8(v>>16), u8(v>>8), u8(v))
+}
+
+// h2_frame appends a frame header and payload to the connection's output.
+fn h2_frame(g i64, typ i64, flags i64, id i64, p i64, n i64) {
+	if g[gOutN]+9+n > g[gOutCap] {
+		let cap = (g[gOutN]+9+n)*2 + 4096
+		g[gOut] = realloc(g[gOut], cap)
+		g[gOutCap] = cap
+	}
+	let o = g[gOut] + g[gOutN]
+	store8(o, n>>16)
+	store8(o+1, n>>8)
+	store8(o+2, n)
+	store8(o+3, typ)
+	store8(o+4, flags)
+	store8(o+5, (id>>24)&0x7f)
+	store8(o+6, id>>16)
+	store8(o+7, id>>8)
+	store8(o+8, id)
+	if n > 0 {
+		memcpy(o+9, p, n)
+	}
+	g[gOutN] += 9 + n
+}
+
+fn h2_frame_bytes(g i64, typ i64, flags i64, id i64, b []u8) {
+	h2_frame(g, typ, flags, id, cast(i64, b)[2], len(b))
+}
+
+fn h2_word_frame(g i64, typ i64, flags i64, id i64, v i64) {
+	mut b = make([]u8, 0, 4)
+	put32(mut b, v)
+	h2_frame_bytes(g, typ, flags, id, b)
+}
+
+fn rd32(p i64) i64 {
+	return i64(load8(p))<<24 | i64(load8(p+1))<<16 | i64(load8(p+2))<<8 | i64(load8(p+3))
+}
+
+fn keep_bytes(s str) i64 {
+	let p = malloc(len(s) + 1)
+	memcpy(p, cast(i64, s)+8, len(s))
+	return p
+}
+
+// grow makes room for n more bytes in the buffer whose pointer, length and capacity are at
+// words at, at+1 and at+2 of record r.
+fn grow(r i64, at i64, n i64) {
+	if r[at+1]+n > r[at+2] {
+		let cap = (r[at+1]+n)*2 + 1024
+		r[at] = realloc(r[at], cap)
+		r[at+2] = cap
+	}
+}
+
+fn append_raw(r i64, at i64, p i64, n i64) {
+	grow(r, at, n)
+	memcpy(r[at]+r[at+1], p, n)
+	r[at+1] += n
+}
+
+fn append_str(r i64, at i64, s str) {
+	append_raw(r, at, cast(i64, s)+8, len(s))
+}
+
+// ---- connections ----
+
+// h2_new sets up a connection on fd (with its tls.Conn, or none for h2c): the preface, this
+// client's settings and the connection window. The server's settings come with its first frames.
+fn h2_new(key str, fd i64, tc ?tls.Conn) i64 {
+	let g = calloc(gWords, 8)
+	g[gFd] = fd
+	g[gKey] = keep_bytes(key)
+	g[gKeyN] = len(key)
+	g[gNextID] = 1
+	g[gPeerMax] = 100
+	g[gPeerWin] = 65535
+	g[gPeerFrame] = 16384
+	g[gSendWin] = 65535
+	g[gGoaway] = -1
+	g[gStreamCap] = 16
+	g[gStreams] = calloc(16, 8)
+	h2Dec[g] = keep(hpack.NewDecoder(4096, h2HeaderList))
+	if tc != nil {
+		g[gTLS] = 1
+		h2TLS[g] = keep(tc)
+	}
+	append_str(g, gOut, h2Preface)
+	mut s = make([]u8, 0, 18)
+	// ENABLE_PUSH 0, INITIAL_WINDOW_SIZE, MAX_HEADER_LIST_SIZE.
+	s = append(s, 0, 2)
+	put32(mut s, 0)
+	s = append(s, 0, 4)
+	put32(mut s, h2RecvWindow)
+	s = append(s, 0, 6)
+	put32(mut s, h2HeaderList)
+	h2_frame_bytes(g, fSettings, 0, 0, s)
+	h2_word_frame(g, fWindow, 0, 0, h2ConnWindow-65535)
+	h2Conns[keep(key)] = g
+	g[gMapped] = 1
+	return g
+}
+
+// h2_unmap stops new calls from using g; it closes once its streams end.
+fn h2_unmap(g i64) {
+	if g[gMapped] != 0 {
+		let key = rt_str_from_raw(g[gKey], g[gKeyN])
+		if h2Conns[key] == g {
+			delete(h2Conns, key)
+		}
+		g[gMapped] = 0
+	}
+}
+
+// h2_close closes g's socket and frees it; its streams must have been failed or ended.
+fn h2_close(g i64) {
+	h2_unmap(g)
+	if g[gTLS] != 0 {
+		let tc = h2TLS[g]
+		if tc != nil {
+			tc.Close()
+		}
+		delete(h2TLS, g)
+	} else if g[gFd] >= 0 {
+		rt_sys_close(g[gFd])
+	}
+	g[gFd] = -1
+	let dec = h2Dec[g]
+	if dec != nil {
+		dec.Free()
+	}
+	delete(h2Dec, g)
+	free(g[gKey])
+	free(g[gOut])
+	free(g[gIn])
+	free(g[gBlock])
+	free(g[gStreams])
+	if g[gDead] != 0 {
+		free(g[gDead])
+	}
+	free(g)
+}
+
+// h2_usable is the mapped connection for key that can take another stream, 0 for none. An idle
+// one is checked first: what the server sent meanwhile (a GOAWAY, a PING, its end) is handled.
+fn h2_usable(key str) i64 {
+	let g = h2Conns[key]
+	if g == 0 {
+		return 0
+	}
+	if g[gBusy] == 0 && g[gNStreams] == 0 {
+		if rt_mono_ns()-g[gIdleSince] > h2Idle {
+			h2_close(g)
+			return 0
+		}
+		h2_pump(g)
+		if g[gDead] != 0 || g[gGoaway] >= 0 {
+			h2_close(g)
+			return 0
+		}
+	}
+	if g[gDead] != 0 || g[gGoaway] >= 0 || g[gNextID] > 0x7ffffff0 {
+		h2_unmap(g)
+		return 0
+	}
+	if g[gNStreams] >= g[gPeerMax] {
+		// Full: a new connection takes the new calls; this one ends with its streams.
+		h2_unmap(g)
+		return 0
+	}
+	return g
+}
+
+// h2_pump reads and handles what has arrived on an idle connection, without waiting.
+fn h2_pump(g i64) {
+	g[gBusy] = 1
+	h2_flush(g, false, 0) catch err {
+		h2_fail(g, say.Str(err), false)
+	}
+	if g[gDead] == 0 {
+		h2_read(g, false, 0) catch err {
+			h2_fail(g, say.Str(err), false)
+		}
+	}
+	g[gBusy] = 0
+}
+
+// ---- streams ----
+
+fn h2_add_stream(g i64, s i64) {
+	if g[gNStreams] == g[gStreamCap] {
+		let cap = g[gStreamCap] * 2
+		g[gStreams] = realloc(g[gStreams], cap*8)
+		g[gStreamCap] = cap
+	}
+	let a = g[gStreams]
+	a[g[gNStreams]] = s
+	g[gNStreams] += 1
+}
+
+fn h2_remove_stream(g i64, s i64) {
+	let a = g[gStreams]
+	for i in 0..g[gNStreams] {
+		if a[i] == s {
+			a[i] = a[g[gNStreams]-1]
+			g[gNStreams] -= 1
+			if g[gNStreams] == 0 {
+				g[gIdleSince] = rt_mono_ns()
+			}
+			return
+		}
+	}
+}
+
+fn h2_stream(g i64, id i64) i64 {
+	let a = g[gStreams]
+	for i in 0..g[gNStreams] {
+		if a[i][sID] == id {
+			return a[i]
+		}
+	}
+	return 0
+}
+
+fn free_stream(s i64) {
+	free(s[sHead])
+	free(s[sBody])
+	free(s[sTrail])
+	free(s[sPend])
+	if s[sErr] != 0 {
+		free(s[sErr])
+	}
+	free(s)
+}
+
+fn h2_wake(s i64) {
+	let t = s[sTask]
+	if t != 0 && t != rt_task_current() {
+		rt_task_wake(t)
+	}
+}
+
+// h2_end_stream marks s done (state 1) or failed (2, with msg) and wakes its caller.
+fn h2_end_stream(g i64, s i64, state i64, msg str) {
+	if s[sState] != 0 {
+		return
+	}
+	if state == 2 {
+		s[sErr] = keep_bytes(msg)
+		s[sErrN] = len(msg)
+	}
+	s[sState] = state
+	h2_wake(s)
+}
+
+// h2_fail ends the connection: every stream fails (those the server never answered may be sent
+// again when retry is set), and a GOAWAY is queued when the connection is still writable.
+fn h2_fail(g i64, msg str, retry bool) {
+	if g[gDead] == 0 {
+		g[gDead] = keep_bytes(msg)
+		g[gDeadN] = len(msg)
+	}
+	h2_unmap(g)
+	let a = g[gStreams]
+	for i in 0..g[gNStreams] {
+		let s = a[i]
+		if retry && s[sGot] == 0 && s[sRetry] == 0 {
+			s[sRetry] = 2
+		}
+		h2_end_stream(g, s, 2, msg)
+	}
+}
+
+// hand_off gives the driving to the first caller still waiting, if any.
+fn h2_hand_off(g i64) {
+	g[gBusy] = 0
+	let a = g[gStreams]
+	for i in 0..g[gNStreams] {
+		let s = a[i]
+		if s[sState] == 0 && s[sTask] != 0 && s[sTask] != rt_task_current() {
+			s[sOwner] = 1
+			g[gBusy] = 1
+			rt_task_wake(s[sTask])
+			return
+		}
+	}
+}
+
+// ---- writing ----
+
+// h2_send_body sends as much of s's pending body as the windows allow, END_STREAM with the last.
+fn h2_send_body(g i64, s i64) {
+	for s[sPendAt] < s[sPendN] {
+		mut n = s[sPendN] - s[sPendAt]
+		n = min(n, g[gSendWin])
+		n = min(n, s[sSendWin])
+		n = min(n, g[gPeerFrame])
+		if n <= 0 {
+			return
+		}
+		mut flags = 0
+		if s[sPendAt]+n == s[sPendN] {
+			flags = flEnd
+		}
+		h2_frame(g, fData, flags, s[sID], s[sPend]+s[sPendAt], n)
+		s[sPendAt] += n
+		g[gSendWin] -= n
+		s[sSendWin] -= n
+	}
+}
+
+// h2_send_bodies sends what the windows now allow of every stream's body.
+fn h2_send_bodies(g i64) {
+	let a = g[gStreams]
+	for i in 0..g[gNStreams] {
+		h2_send_body(g, a[i])
+	}
+}
+
+// h2_flush writes the queued frames: all of them when wait (waiting as needed until the call's
+// deadline until), or what the socket takes now.
+fn h2_flush(g i64, wait bool, until i64) ! {
+	if g[gOutN] == 0 || g[gDead] != 0 {
+		return
+	}
+	if g[gTLS] != 0 {
+		let tc = h2TLS[g]
+		if tc != nil {
+			tc.SetDeadline(until)
+			try tc.WriteBytes(raw_bytes(g[gOut], g[gOutN]))
+		}
+		g[gOutN] = 0
+		return
+	}
+	mut done = 0
+	for done < g[gOutN] {
+		let k = rt_sys_write(g[gFd], g[gOut]+done, g[gOutN]-done)
+		if k > 0 {
+			done += k
+			continue
+		}
+		let e = errno()
+		if e == EINTR {
+			continue
+		}
+		if e != EAGAIN {
+			fail say.Fault("wire: write: %s", say.Str(e))
+		}
+		if !wait {
+			break
+		}
+		try wait_until(g[gFd], 2, until)
+	}
+	memmove(g[gOut], g[gOut]+done, g[gOutN]-done)
+	g[gOutN] -= done
+}
+
+// raw_bytes is n bytes at p as a slice of the current pool.
+fn raw_bytes(p i64, n i64) []u8 {
+	let b = make([]u8, n)
+	if n > 0 {
+		memcpy(cast(i64, b)[2], p, n)
+	}
+	return b
+}
+
+// wait_until waits for fd (want 1 readable, 2 writable) until the mono time until (0: no limit).
+fn wait_until(fd i64, want i64, until i64) ! {
+	mut timeout = 0
+	if until > 0 {
+		timeout = until - rt_mono_ns()
+		if timeout <= 0 {
+			fail "wire: timed out"
+		}
+	}
+	let r = rt_task_wait(fd, want, timeout)
+	if r == waitDeadline {
+		fail cast(fault, rt_wait_fault())
+	}
+	if r != waitReady {
+		fail "wire: timed out"
+	}
+}
+
+// ---- reading ----
+
+// h2_read reads what has arrived and handles each whole frame. With wait it waits for bytes when
+// none have come (until the deadline until); it returns after one batch.
+fn h2_read(g i64, wait bool, until i64) ! {
+	if g[gInE]-g[gInS] < 9 || g[gInE]-g[gInS] < 9+(i64(load8(g[gIn]+g[gInS]))<<16|i64(load8(g[gIn]+g[gInS]+1))<<8|i64(load8(g[gIn]+g[gInS]+2))) {
+		// Make room, then read.
+		if g[gInS] > 0 {
+			memmove(g[gIn], g[gIn]+g[gInS], g[gInE]-g[gInS])
+			g[gInE] -= g[gInS]
+			g[gInS] = 0
+		}
+		if g[gInCap]-g[gInE] < 16384+9 {
+			let cap = g[gInCap]*2 + 32768
+			g[gIn] = realloc(g[gIn], cap)
+			g[gInCap] = cap
+		}
+		mut got = 0
+		for {
+			if g[gTLS] != 0 {
+				let tc = h2TLS[g]
+				if tc == nil {
+					fail "wire: the connection is gone"
+				}
+				got = try tc.ReadNowTo(g[gIn]+g[gInE], g[gInCap]-g[gInE])
+			} else {
+				got = rt_sys_read(g[gFd], g[gIn]+g[gInE], g[gInCap]-g[gInE])
+				if got == 0 {
+					fail "EOF"
+				}
+				if got < 0 {
+					let e = errno()
+					if e == EINTR {
+						continue
+					}
+					if e != EAGAIN {
+						fail say.Fault("wire: read: %s", say.Str(e))
+					}
+					got = 0
+				}
+			}
+			if got > 0 || !wait {
+				break
+			}
+			try wait_until(g[gFd], 1, until)
+		}
+		g[gInE] += got
+	}
+	for g[gDead] == 0 && g[gInE]-g[gInS] >= 9 {
+		let p = g[gIn] + g[gInS]
+		let n = i64(load8(p))<<16 | i64(load8(p+1))<<8 | i64(load8(p+2))
+		if n > h2MaxFrame {
+			h2_goaway(g, eFrameSize, "wire: the server sent a frame larger than SETTINGS_MAX_FRAME_SIZE")
+			return
+		}
+		if g[gInE]-g[gInS] < 9+n {
+			break
+		}
+		let typ = i64(load8(p+3))
+		let flags = i64(load8(p+4))
+		let id = rd32(p+5) & 0x7fffffff
+		g[gInS] += 9 + n
+		h2_handle(g, typ, flags, id, p+9, n)
+	}
+}
+
+// h2_goaway ends the connection for a protocol error of the server's.
+fn h2_goaway(g i64, code i64, msg str) {
+	mut b = make([]u8, 0, 8)
+	put32(mut b, 0)
+	put32(mut b, code)
+	h2_frame_bytes(g, fGoaway, 0, 0, b)
+	h2_flush(g, false, 0) catch _ {}
+	h2_fail(g, msg, false)
+}
+
+// h2_handle acts on one frame.
+fn h2_handle(g i64, typ i64, flags i64, id i64, p i64, n i64) {
+	if g[gContID] != 0 && typ != fCont {
+		h2_goaway(g, eProtocol, "wire: the server interrupted a header block")
+		return
+	}
+	if typ == fData {
+		h2_data(g, flags, id, p, n)
+	} else if typ == fHeaders || typ == fCont {
+		h2_headers(g, typ, flags, id, p, n)
+	} else if typ == fSettings {
+		if id != 0 || (flags&flEnd != 0 && n != 0) || n%6 != 0 {
+			h2_goaway(g, eProtocol, "wire: a malformed SETTINGS frame")
+			return
+		}
+		if flags&flEnd != 0 {
+			return
+		}
+		for at in (0..n).step(6) {
+			let k = i64(load8(p+at))<<8 | i64(load8(p+at+1))
+			let v = rd32(p + at + 2)
+			if k == 3 {
+				g[gPeerMax] = v
+			} else if k == 4 {
+				if v > 0x7fffffff {
+					h2_goaway(g, eFlow, "wire: SETTINGS_INITIAL_WINDOW_SIZE too large")
+					return
+				}
+				let delta = v - g[gPeerWin]
+				g[gPeerWin] = v
+				let a = g[gStreams]
+				for i in 0..g[gNStreams] {
+					a[i][sSendWin] += delta
+				}
+			} else if k == 5 {
+				if v < 16384 || v > 16777215 {
+					h2_goaway(g, eProtocol, "wire: SETTINGS_MAX_FRAME_SIZE out of range")
+					return
+				}
+				g[gPeerFrame] = v
+			}
+		}
+		h2_frame(g, fSettings, flEnd, 0, 0, 0)
+		h2_send_bodies(g)
+	} else if typ == fPing {
+		if n != 8 || id != 0 {
+			h2_goaway(g, eFrameSize, "wire: a malformed PING")
+			return
+		}
+		if flags&flEnd == 0 {
+			h2_frame(g, fPing, flEnd, 0, p, 8)
+		}
+	} else if typ == fGoaway {
+		if n < 8 {
+			h2_goaway(g, eFrameSize, "wire: a malformed GOAWAY")
+			return
+		}
+		let last = rd32(p) & 0x7fffffff
+		let code = rd32(p + 4)
+		g[gGoaway] = last
+		h2_unmap(g)
+		// Streams past the last one were not processed: they may be sent again.
+		let a = g[gStreams]
+		mut i = 0
+		for i < g[gNStreams] {
+			let s = a[i]
+			if s[sID] > last {
+				s[sRetry] = 1
+				h2_end_stream(g, s, 2, say.Fmt("wire: the server is going away (GOAWAY %d)", code))
+			}
+			i += 1
+		}
+	} else if typ == fWindow {
+		if n != 4 {
+			h2_goaway(g, eFrameSize, "wire: a malformed WINDOW_UPDATE")
+			return
+		}
+		let inc = rd32(p) & 0x7fffffff
+		if id == 0 {
+			if inc == 0 || g[gSendWin]+inc > 0x7fffffff {
+				h2_goaway(g, eFlow, "wire: a bad connection WINDOW_UPDATE")
+				return
+			}
+			g[gSendWin] += inc
+			h2_send_bodies(g)
+		} else {
+			let s = h2_stream(g, id)
+			if s != 0 {
+				s[sSendWin] += inc
+				h2_send_body(g, s)
+			}
+		}
+	} else if typ == fRst {
+		if n != 4 {
+			h2_goaway(g, eFrameSize, "wire: a malformed RST_STREAM")
+			return
+		}
+		let s = h2_stream(g, id)
+		if s != 0 {
+			let code = rd32(p)
+			if code == eRefused {
+				s[sRetry] = 1
+			}
+			if s[sFinal] != 0 && s[sPendAt] < s[sPendN] && code == 0 {
+				// NO_ERROR after a whole response: the server needs no more of the body.
+				h2_end_stream(g, s, 1, "")
+			} else {
+				h2_end_stream(g, s, 2, say.Fmt("wire: the server reset the stream (error %d)", code))
+			}
+		}
+	} else if typ == fPush {
+		h2_goaway(g, eProtocol, "wire: PUSH_PROMISE although push is off")
+	}
+	// PRIORITY and unknown frame types are ignored.
+}
+
+// h2_data takes a DATA frame: its bytes go to the stream's body, and the windows are given back
+// once half used.
+fn h2_data(g i64, flags i64, id i64, p i64, n i64) {
+	mut q = p
+	mut m = n
+	if flags&flPadded != 0 {
+		if n < 1 || i64(load8(p)) >= n {
+			h2_goaway(g, eProtocol, "wire: bad DATA padding")
+			return
+		}
+		q = p + 1
+		m = n - 1 - i64(load8(p))
+	}
+	g[gRecvUsed] += n
+	if g[gRecvUsed] >= h2ConnWindow/2 {
+		h2_word_frame(g, fWindow, 0, 0, g[gRecvUsed])
+		g[gRecvUsed] = 0
+	}
+	let s = h2_stream(g, id)
+	if s == 0 || s[sState] != 0 {
+		return
+	}
+	s[sGot] = 1
+	if s[sFinal] == 0 {
+		h2_rst(g, s, eProtocol)
+		h2_end_stream(g, s, 2, "wire: DATA before the response headers")
+		return
+	}
+	if s[sBodyN]+m > s[sLimit] {
+		h2_rst(g, s, eCancel)
+		h2_end_stream(g, s, 2, say.Fmt("wire: response body larger than %d bytes", s[sLimit]))
+		return
+	}
+	append_raw(s, sBody, q, m)
+	s[sRecvUsed] += n
+	if flags&flEnd != 0 {
+		h2_end_stream(g, s, 1, "")
+		return
+	}
+	if s[sRecvUsed] >= h2RecvWindow/2 {
+		h2_word_frame(g, fWindow, 0, s[sID], s[sRecvUsed])
+		s[sRecvUsed] = 0
+	}
+}
+
+fn h2_rst(g i64, s i64, code i64) {
+	h2_word_frame(g, fRst, 0, s[sID], code)
+}
+
+// h2_headers collects a header block (HEADERS, then CONTINUATIONs) and decodes it whole: the
+// decoder's table must see every block, even of a stream no longer wanted.
+fn h2_headers(g i64, typ i64, flags i64, id i64, p i64, n i64) {
+	mut q = p
+	mut m = n
+	if typ == fHeaders {
+		if id == 0 || id%2 == 0 {
+			h2_goaway(g, eProtocol, "wire: HEADERS on a stream this client did not open")
+			return
+		}
+		if flags&flPadded != 0 {
+			if m < 1 || i64(load8(q)) >= m {
+				h2_goaway(g, eProtocol, "wire: bad HEADERS padding")
+				return
+			}
+			m = m - 1 - i64(load8(q))
+			q += 1
+		}
+		if flags&flPrio != 0 {
+			if m < 5 {
+				h2_goaway(g, eProtocol, "wire: a malformed HEADERS frame")
+				return
+			}
+			q += 5
+			m -= 5
+		}
+		g[gBlockN] = 0
+		g[gBlockEnd] = flags & flEnd
+	} else if g[gContID] != id {
+		h2_goaway(g, eProtocol, "wire: an unexpected CONTINUATION")
+		return
+	}
+	if g[gBlockN]+m > h2HeaderList {
+		h2_goaway(g, eProtocol, "wire: a header block too large")
+		return
+	}
+	append_raw(g, gBlock, q, m)
+	if flags&flHeaders == 0 {
+		g[gContID] = id
+		return
+	}
+	g[gContID] = 0
+	let dec = h2Dec[g]
+	if dec == nil {
+		h2_goaway(g, eCompression, "wire: the connection has no header decoder")
+		return
+	}
+	let fields = dec.Decode(raw_bytes(g[gBlock], g[gBlockN])) catch err {
+		h2_goaway(g, eCompression, "wire: " + say.Str(err))
+		return
+	}
+	let s = h2_stream(g, id)
+	if s == 0 || s[sState] != 0 {
+		return
+	}
+	s[sGot] = 1
+	let end = g[gBlockEnd] != 0
+	if s[sFinal] != 0 {
+		// Trailers: they end the stream.
+		if !end {
+			h2_rst(g, s, eProtocol)
+			h2_end_stream(g, s, 2, "wire: trailers without END_STREAM")
+			return
+		}
+		for _, f in fields {
+			if len(f.Name) > 0 && f.Name[0] != ':' {
+				append_str(s, sTrail, f.Name + ": " + f.Value + "\r\n")
+			}
+		}
+		h2_end_stream(g, s, 1, "")
+		return
+	}
+	mut status = -1
+	for _, f in fields {
+		if f.Name == ":status" {
+			status = 0
+			for i in 0..len(f.Value) {
+				let c = f.Value[i]
+				if c < '0' || c > '9' || i >= 3 {
+					status = -1
+					break
+				}
+				status = status*10 + i64(c-'0')
+			}
+		} else if len(f.Name) > 0 && f.Name[0] != ':' {
+			if status >= 200 || status < 0 {
+				append_str(s, sHead, f.Name + ": " + f.Value + "\r\n")
+			}
+		}
+	}
+	if status < 100 || status > 999 {
+		h2_rst(g, s, eProtocol)
+		h2_end_stream(g, s, 2, "wire: a response without a valid :status")
+		return
+	}
+	if status < 200 {
+		// An informational response (100 Continue, 103): the final one follows.
+		s[sHeadN] = 0
+		return
+	}
+	s[sStatus] = status
+	s[sFinal] = 1
+	if end {
+		h2_end_stream(g, s, 1, "")
+	}
+}
+
+// ---- a call ----
+
+// h2_drive runs the connection for s's caller until s ends: it writes, reads and hands frames on.
+fn h2_drive(g i64, s i64, until i64) ! {
+	for s[sState] == 0 && g[gDead] == 0 {
+		try h2_flush(g, true, until)
+		if s[sState] != 0 {
+			break
+		}
+		try h2_read(g, true, until)
+	}
+}
+
+// h2_call sends one request on g and returns its response; when it fails, h2RetryLevel says
+// whether it may be sent again.
+fn h2_call(g i64, k call) !Resp {
+	h2RetryLevel = 0
+	let s = calloc(sWords, 8)
+	s[sTask] = rt_task_current()
+	s[sID] = g[gNextID]
+	g[gNextID] += 2
+	s[sSendWin] = g[gPeerWin]
+	s[sLimit] = k.limit_
+	if k.head {
+		s[sHeadReq] = 1
+	}
+	// The header block: pseudo-headers first, then the caller's fields, lowercased, without the
+	// ones HTTP/2 forbids (RFC 9113 8.2.2).
+	mut fields = make([]hpack.Field, 0, 8+len(k.headers)/2)
+	fields = append(fields, hpack.Field{Name: ":method", Value: k.method})
+	fields = append(fields, hpack.Field{Name: ":scheme", Value: k.scheme})
+	fields = append(fields, hpack.Field{Name: ":authority", Value: k.hostport})
+	fields = append(fields, hpack.Field{Name: ":path", Value: k.path})
+	fields = append(fields, hpack.Field{Name: "user-agent", Value: "tin-wire"})
+	{
+		mut i = 0
+		for i+1 < len(k.headers) {
+			let name = lower_str(k.headers[i])
+			let v = k.headers[i+1]
+			if name != "connection" && name != "keep-alive" && name != "proxy-connection" && name != "transfer-encoding" &&
+				name != "upgrade" && name != "host" && (name != "te" || v == "trailers") && name != "content-length" {
+				fields = append(fields, hpack.Field{Name: name, Value: v})
+			}
+			i += 2
+		}
+	}
+	if len(k.body) > 0 || k.method == "POST" || k.method == "PUT" {
+		fields = append(fields, hpack.Field{Name: "content-length", Value: say.Str(len(k.body))})
+	}
+	mut block = make([]u8, 0, 256)
+	hpack.Encode(mut block, fields)
+	mut flags = flHeaders
+	if len(k.body) == 0 {
+		flags = flHeaders | flEnd
+	}
+	// HEADERS, and CONTINUATIONs when the block is larger than the server's frame size.
+	let fsz = g[gPeerFrame]
+	if len(block) <= fsz {
+		h2_frame_bytes(g, fHeaders, flags, s[sID], block)
+	} else {
+		h2_frame(g, fHeaders, flags&flEnd, s[sID], cast(i64, block)[2], fsz)
+		mut at = fsz
+		for at < len(block) {
+			let m = min(fsz, len(block)-at)
+			mut cf = 0
+			if at+m == len(block) {
+				cf = flHeaders
+			}
+			h2_frame(g, fCont, cf, s[sID], cast(i64, block)[2]+at, m)
+			at += m
+		}
+	}
+	if len(k.body) > 0 {
+		s[sPend] = keep_bytes(k.body)
+		s[sPendN] = len(k.body)
+	}
+	h2_add_stream(g, s)
+	h2_send_body(g, s)
+	if g[gBusy] == 0 {
+		g[gBusy] = 1
+		s[sOwner] = 1
+	}
+	mut err fault = nil
+	for s[sState] == 0 {
+		if s[sOwner] != 0 {
+			let derr = h2_drive(g, s, k.until)
+			if derr != nil && s[sState] == 0 {
+				if fault_is_deadline(derr) {
+					err = derr
+					break
+				}
+				h2_fail(g, say.Str(derr), true)
+			}
+			if g[gDead] != 0 && s[sState] == 0 {
+				h2_end_stream(g, s, 2, rt_str_from_raw(g[gDead], g[gDeadN]))
+			}
+			continue
+		}
+		mut timeout = 0
+		if k.until > 0 {
+			timeout = k.until - rt_mono_ns()
+			if timeout <= 0 {
+				err = say.Fault("wire: timed out")
+				break
+			}
+		}
+		let r = rt_task_park(timeout)
+		if r == waitDeadline {
+			err = cast(fault, rt_wait_fault())
+			break
+		}
+		if r == waitTimeout && s[sState] == 0 && s[sOwner] == 0 {
+			err = say.Fault("wire: timed out")
+			break
+		}
+	}
+	if err != nil {
+		// The call gave up: the stream is reset, the connection goes on for the others.
+		if s[sState] == 0 {
+			h2_rst(g, s, eCancel)
+		}
+		h2_remove_stream(g, s)
+		let owner = s[sOwner] != 0
+		free_stream(s)
+		if owner {
+			h2_flush(g, false, 0) catch _ {}
+			h2_hand_off(g)
+		} else if g[gBusy] == 0 {
+			h2_flush(g, false, 0) catch _ {}
+		}
+		h2_after(g)
+		fail err
+	}
+	h2_remove_stream(g, s)
+	if s[sOwner] != 0 {
+		h2_hand_off(g)
+	}
+	if s[sState] == 2 {
+		let msg = rt_str_from_raw(s[sErr], s[sErrN])
+		h2RetryLevel = s[sRetry]
+		free_stream(s)
+		h2_after(g)
+		fail say.Fault("%s", msg)
+	}
+	mut body = rt_str_from_raw(s[sBody], s[sBodyN])
+	if s[sHeadReq] != 0 {
+		body = ""
+	}
+	let r = Resp{Status: s[sStatus], Body: body, head: rt_str_from_raw(s[sHead], s[sHeadN]), trail: rt_str_from_raw(s[sTrail], s[sTrailN])}
+	free_stream(s)
+	h2_after(g)
+	return r
+}
+
+// h2_attempt makes call k on g. A call the server did not process (past a GOAWAY's last stream,
+// or refused) may go to a new connection, as may one whose connection failed before any answer
+// when its method can be repeated: DoWith then calls again without the pools (staleRetry).
+fn h2_attempt(g i64, k call) !Resp {
+	let (r, err) = h2_call(g, k)
+	let retry = h2RetryLevel
+	if err == nil {
+		if k.maxIdle < 0 {
+			h2_unmap(g)
+			h2_after(g)
+		}
+		return r
+	}
+	if retry == 1 || (retry == 2 && k.idem) {
+		staleRetry = true
+	}
+	fail err
+}
+
+// h2_after closes a connection no call can use once its last stream ended.
+fn h2_after(g i64) {
+	if g[gNStreams] == 0 && g[gBusy] == 0 && (g[gMapped] == 0 || g[gDead] != 0) {
+		h2_close(g)
+	}
+}
+
+fn fault_is_deadline(err fault) bool {
+	return fault.Is(err, fault.DeadlineExceeded) || fault.Is(err, fault.Canceled)
+}
+
+fn lower_str(s str) str {
+	mut b = make([]u8, len(s))
+	for i in 0..len(s) {
+		mut c = s[i]
+		if c >= 'A' && c <= 'Z' {
+			c = c + 32
+		}
+		b[i] = c
+	}
+	return str(b)
+}

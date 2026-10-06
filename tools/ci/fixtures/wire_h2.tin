@@ -1,0 +1,206 @@
+package main
+
+import "anvil"
+import "fault"
+import "mint"
+import "quarry"
+import "say"
+import "tide"
+import "tls"
+import "wire"
+
+// wire's HTTP/2 client (#480) against an upstream, from request handlers so that calls overlap
+// on the core. GET /go?base=URL[&h2c=1] runs the checks for Go's net/http upstream
+// (tools/ci/fixtures/h2upstream.go), /anvil?base=URL[&h2c=1] those for anvil's h2 fixture, and
+// /goaway?base=URL those for the GOAWAY server of wire_h2_check.py. Each answers one "ok" or
+// "FAIL" line per check. CA (a path) is the upstreams' certificate.
+
+fn opts(q anvil.Req) wire.Options {
+	mut o = wire.Options{Timeout: 20000000000}
+	if q.Param("h2c") == "1" {
+		o.H2C = true
+	}
+	let ca = quarry.ReadFile(quarry.Getenv("CA")) catch _ {
+		""
+	}
+	o.TLS = tls.Config{RootCAs: ca}
+	return o
+}
+
+fn line(label str, good bool, detail str) str {
+	if good {
+		return "ok {label}\n"
+	}
+	return "FAIL {label}: {detail}\n"
+}
+
+fn get(url str, o wire.Options) (i64, str, str) {
+	let r = wire.DoWith("GET", url, []str{}, "", o) catch e {
+		return -1, "{e}", ""
+	}
+	return r.Status, r.Body, r.Trailer("grpc-status")
+}
+
+fn conns(base str, o wire.Options) i64 {
+	let (_, b, _) = get(base + "/conns", o)
+	return mint.Atoi(b) catch _ {
+		-1
+	}
+}
+
+fn go_checks(q anvil.Req) !str {
+	let base = q.Param("base")
+	let o = opts(q)
+	mut out = ""
+	let (s0, b0, _) = get(base + "/", o)
+	out = out + line("HTTP/2 to Go's net/http", s0 == 200 && b0 == "hello from go over HTTP/2.0", "{s0} {b0}")
+	let c0 = conns(base, o)
+	mut good = 0
+	for i in 0..100 {
+		let (s, _, _) = get(base + "/", o)
+		if s == 200 {
+			good += 1
+		}
+	}
+	let c1 = conns(base, o)
+	out = out + line("100 calls in a row on one connection", good == 100 && c1 == c0, "{good} ok, connections {c0} then {c1}")
+	// 50 calls at once that each wait 200 ms: streams of one connection, answered together.
+	mut together = 0
+	let t0 = tide.Now()
+	scope s {
+		for i in 0..50 {
+			s.spawn(fn() ! {
+				let (st, b, _) = get(base + "/wait?ms=200", o)
+				if st == 200 && b == "waited 200" {
+					together += 1
+				}
+			})
+		}
+	}
+	let took = tide.Since(t0)
+	let c2 = conns(base, o)
+	out = out + line("50 concurrent calls share the connection", together == 50 && took < 2s && c2 == c0, "{together} ok in {took / 1000000} ms, connections {c0} then {c2}")
+	// Large bodies both ways, through the flow-control windows.
+	mut big = make([]u8, 0, 5000000)
+	for i in 0..5000000 {
+		big = append(big, u8('a' + i%26))
+	}
+	let r = try wire.DoWith("POST", base + "/echo", []str{"Content-Type", "application/x-test", "X-Thing", "yes"}, str(big), o)
+	let xgot = r.Header("x-got")
+	out = out + line("a 5 MB request body comes back", r.Status == 200 && r.Body == str(big) && xgot == "yes" && r.Header("content-type") == "application/x-test",
+		"{r.Status} {len(r.Body)} {xgot}")
+	let (sb, bb, _) = get(base + "/big?n=12000000", wire.Options{Timeout: o.Timeout, H2C: o.H2C, TLS: o.TLS, MaxBody: 16000000})
+	out = out + line("a 12 MB response body", sb == 200 && len(bb) == 12000000, "{sb} {len(bb)}")
+	let (st, bt, tr) = get(base + "/trailers", o)
+	out = out + line("trailers", st == 200 && bt == "payload" && tr == "0", "{st} {bt} {tr}")
+	// A call that runs out of time resets its stream; the connection serves the next one.
+	let c3 = conns(base, o)
+	let t1 = tide.Now()
+	let deadlined = within 300ms {
+		let (sd, bd, _) = get(base + "/wait?ms=3000", o)
+		"{sd} {bd}"
+	} catch _ {
+		"the block failed"
+	}
+	let waited = tide.Since(t1)
+	let (sa, _, _) = get(base + "/", o)
+	let c4 = conns(base, o)
+	out = out + line("a deadline resets its stream, not the connection", contains(deadlined, "-1 deadline") && waited < 1s && sa == 200 && c4 == c3,
+		"{deadlined} after {waited / 1000000} ms, then {sa}, connections {c3} then {c4}")
+	// The response body limit.
+	let (sl, bl, _) = get(base + "/big?n=100000", wire.Options{Timeout: o.Timeout, H2C: o.H2C, TLS: o.TLS, MaxBody: 1000})
+	out = out + line("a body over MaxBody fails", sl == -1 && contains(bl, "larger than"), "{sl} {bl}")
+	// HTTP/1.1 when asked.
+	let (s1, b1, _) = get(base + "/", wire.Options{Timeout: o.Timeout, H2C: false, TLS: o.TLS, NoH2: true})
+	out = out + line("NoH2 speaks HTTP/1.1", s1 == 200 && b1 == "hello from go over HTTP/1.1", "{s1} {b1}")
+	return out
+}
+
+fn anvil_checks(q anvil.Req) !str {
+	let base = q.Param("base")
+	let o = opts(q)
+	mut out = ""
+	let (s0, b0, _) = get(base + "/", o)
+	out = out + line("HTTP/2 to anvil", s0 == 200 && b0 == "hello from anvil over HTTP/2.0\n", "{s0} {b0}")
+	mut big = make([]u8, 0, 3000000)
+	for i in 0..3000000 {
+		big = append(big, u8('a' + i%26))
+	}
+	let r = try wire.DoWith("POST", base + "/echo?k=v", []str{"Content-Type", "text/plain"}, str(big), o)
+	out = out + line("a 3 MB request body to anvil", r.Status == 200 && contains(r.Body, "len=3000000\n") && contains(r.Body, "query=k=v"), "{r.Status} {r.Body}")
+	let (st, _, tr) = get(base + "/trailers", o)
+	out = out + line("anvil's trailers", st == 200 && tr == "0", "{st} {tr}")
+	mut together = 0
+	scope s {
+		for i in 0..20 {
+			s.spawn(fn() ! {
+				let (sw, _, _) = get(base + "/", o)
+				if sw == 200 {
+					together += 1
+				}
+			})
+		}
+	}
+	out = out + line("20 concurrent calls to anvil", together == 20, "{together}")
+	return out
+}
+
+fn goaway_checks(q anvil.Req) !str {
+	let base = q.Param("base")
+	let o = wire.Options{Timeout: 10000000000, H2C: true}
+	mut out = ""
+	// The server answers a stream and then sends GOAWAY: the next call takes a new connection.
+	let (s1, b1, _) = get(base + "/a", o)
+	let (s2, b2, _) = get(base + "/b", o)
+	out = out + line("after a GOAWAY the next call takes a new connection", s1 == 200 && b1 == "/a on 1" && s2 == 200 && b2 == "/b on 2", "{s1} {b1} | {s2} {b2}")
+	// Two calls at once on one connection (made by /warm, which gets no GOAWAY): the server
+	// answers the first stream and sends a GOAWAY that leaves out the second, which is sent again
+	// on a new connection.
+	let (s3, b3, _) = get(base + "/warm", o)
+	mut got = []str{"", ""}
+	scope s {
+		for i in 0..2 {
+			let k = i
+			s.spawn(fn() ! {
+				let (sx, bx, _) = get(base + "/c", o)
+				got[k] = "{sx} {bx}"
+			})
+		}
+	}
+	let both = (got[0] == "200 /c on 3" && got[1] == "200 /c on 4") || (got[1] == "200 /c on 3" && got[0] == "200 /c on 4")
+	out = out + line("a stream past the GOAWAY's last one is sent again", s3 == 200 && b3 == "/warm on 3" && both, "{b3} | {got[0]} | {got[1]}")
+	return out
+}
+
+fn contains(s str, sub str) bool {
+	for i in 0..len(s)-len(sub)+1 {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
+fn handle(q anvil.Req, w mut anvil.Out) {
+	mut out = ""
+	if q.Path == "/go" {
+		out = go_checks(q) catch e {
+			"FAIL {e}\n"
+		}
+	} else if q.Path == "/anvil" {
+		out = anvil_checks(q) catch e {
+			"FAIL {e}\n"
+		}
+	} else if q.Path == "/goaway" {
+		out = goaway_checks(q) catch e {
+			"FAIL {e}\n"
+		}
+	} else {
+		out = "FAIL unknown path\n"
+	}
+	w.Text(out)
+}
+
+fn main() {
+	say.Line(anvil.Serve(":8080", handle))
+}

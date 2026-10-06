@@ -1,0 +1,50 @@
+package main
+
+import "anvil"
+import "mint"
+import "say"
+import "tide"
+import "wire"
+
+// The HTTP client load of bench/http/run_wire.py (#480): GET /load?url=URL&n=N&c=C&mode=h2c|h1
+// makes N GETs of URL from C tasks at once (N/C each, one after another) on this server's one
+// core, through wire: HTTP/2 by prior knowledge (one connection, C streams) or HTTP/1.1 (C kept
+// connections). It answers "N ERRORS NANOSECONDS".
+
+fn load(q anvil.Req) !str {
+	let url = q.Param("url")
+	let n = try mint.Atoi(q.Param("n"))
+	let c = try mint.Atoi(q.Param("c"))
+	mut o = wire.Options{Timeout: 30s, MaxIdle: c}
+	if q.Param("mode") == "h2c" {
+		o.H2C = true
+	} else {
+		o.NoH2 = true
+	}
+	mut errors = 0
+	let t0 = tide.Now()
+	scope s {
+		for i in 0..c {
+			s.spawn(fn() ! {
+				for k in 0..n/c {
+					let (r, err) = wire.DoWith("GET", url, []str{}, "", o)
+					if err != nil || r.Status != 200 || r.Body != "Hello, World!" {
+						errors += 1
+					}
+				}
+			})
+		}
+	}
+	return "{n/c*c} {errors} {tide.Since(t0)}"
+}
+
+fn handle(q anvil.Req, w mut anvil.Out) {
+	let out = load(q) catch e {
+		"fault {e}"
+	}
+	w.Text(out)
+}
+
+fn main() {
+	say.Line(anvil.Serve(":9190", handle))
+}

@@ -142,13 +142,35 @@ def check_grpc(out):
                    env=dict(os.environ, TIN_ROOT=str(ROOT)), check=True)
     client = out / 'grpcclient'
     subprocess.run(['go', 'build', '-o', str(client), '.'], cwd=ROOT / 'tools/ci/grpc', check=True)
+    # The Tin client (#480, examples/grpc_client.tin) over wire's h2c, and a grpc-go server.
+    tin_client = out / 'grpc_client'
+    subprocess.run([str(ROOT / 'bin/tinc'), '-o', str(tin_client), 'examples/grpc_client.tin'], cwd=ROOT,
+                   env=dict(os.environ, TIN_ROOT=str(ROOT)), check=True)
+    go_server = out / 'grpcserver'
+    subprocess.run(['go', 'build', '-o', str(go_server), './server'], cwd=ROOT / 'tools/ci/grpc', check=True)
+
+    def tin_calls(addr, who):
+        for name, want in (('tin', 'Hello tin\n'), ('', 'grpc: InvalidArgument: name is required\n')):
+            r = subprocess.run([str(tin_client), name], capture_output=True, text=True, timeout=60, env=dict(os.environ, ADDR=addr))
+            assert r.stdout == want, (who, name, r.stdout, r.stderr[-1000:])
+        print(f'grpc: PASS the Tin client (wire, h2c) calls {who}: a reply, and InvalidArgument from the status')
+
     srv = Server(exe, out / 'grpc.log')
     try:
         r = subprocess.run([str(client), '-addr', '127.0.0.1:%d' % srv.port], capture_output=True, text=True, timeout=120)
         sys.stdout.write(''.join('grpc: ' + l + '\n' for l in r.stdout.splitlines()))
         assert r.returncode == 0, 'the gRPC client failed:\n' + r.stdout + r.stderr
+        tin_calls('127.0.0.1:%d' % srv.port, 'examples/grpc.tin')
     finally:
         srv.stop()
+    port = free_port()
+    gs = subprocess.Popen([str(go_server), '-addr', '127.0.0.1:%d' % port], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        assert gs.stdout.readline().strip() == 'listening'
+        tin_calls('127.0.0.1:%d' % port, 'a grpc-go server')
+    finally:
+        gs.kill()
+        gs.wait()
 
 
 # ---- raw frames ----
