@@ -1,0 +1,215 @@
+package tls
+
+import "seal"
+
+// ---- session tickets on the server (RFC 8446 section 4.6.1), stateless (#472) ----
+//
+// After a full handshake the server sends one NewSessionTicket. The ticket is the connection's
+// resumption PSK and what it was negotiated with, sealed with AES-256-GCM under the key of the
+// day it was issued. Every day's key is derived from one secret per process, so a ticket made
+// on one core resumes on any other with no state kept and nothing written between cores: each
+// core derives a day's key the first time it needs it. A ticket is accepted for
+// TIN_TLS_TICKET_LIFETIME_S seconds (default and most: 7 days, RFC 8446's limit). Resumption is
+// psk_dhe_ke only, so a new key exchange still runs and a resumed session keeps forward secrecy.
+// There is no 0-RTT: a ticket offered twice gives two ordinary resumed handshakes.
+//
+// The ticket: day (4 bytes, big-endian) | nonce (12) | AES-256-GCM(version 1 | cipher suite (2) |
+// issued, ms since the epoch (8) | ticket_age_add (4) | ALPN (1 + n) | PSK (1 + n)), the day as
+// additional data.
+
+shared mut gTicketSecret i64   // 32 bytes (malloc'd), 0 until init_tickets
+shared mut gTicketsOff bool    // TIN_TLS_TICKETS=0
+shared mut gTicketLifeS i64    // seconds a ticket is accepted (and the lifetime it announces)
+
+const ticketDayMs = 86400000
+const ticketVersion = 1
+
+mut ticketDays []i64 = make([]i64, 0, 8)            // per core: the days whose keys are derived
+mut ticketKeys []seal.AEAD = make([]seal.AEAD, 0, 8) // and their keys, oldest first
+
+// SetTicketSecret sets the 32-byte secret the server's session-ticket keys are derived from.
+// Servers that share it (several processes behind one load balancer) resume each other's
+// sessions. Call it before the server starts; the default is a random secret per process, or
+// the 64 hex digits of TIN_TLS_TICKET_SECRET.
+fn SetTicketSecret(key secret []u8) ! {
+	if len(key) != 32 {
+		fail "tls: the ticket secret must be 32 bytes"
+	}
+	let p = calloc(32, 1)
+	for i in 0..32 {
+		store8(p+i, key[i])
+	}
+	gTicketSecret = p
+}
+
+// init_tickets reads the ticket settings once per process (from LoadServerConfig, which runs
+// before a server's cores start).
+fn init_tickets() {
+	if gTicketSecret != 0 {
+		return
+	}
+	gTicketsOff = env_str("TIN_TLS_TICKETS") == "0"
+	gTicketLifeS = maxTicketLife
+	let life = env_str("TIN_TLS_TICKET_LIFETIME_S")
+	if life != "" {
+		mut v = 0
+		mut ok = len(life) <= 7
+		for i in 0..len(life) {
+			if life[i] < '0' || life[i] > '9' {
+				ok = false
+			} else if ok {
+				v = v*10 + i64(life[i]-'0')
+			}
+		}
+		if ok && v < maxTicketLife {
+			gTicketLifeS = v
+		}
+	}
+	let hex = env_str("TIN_TLS_TICKET_SECRET")
+	if hex != "" {
+		let b = seal.HexDecode(hex) catch _ { []u8{} }
+		if len(b) == 32 {
+			SetTicketSecret(b) catch _ {}
+			return
+		}
+		rt_panic("tls: TIN_TLS_TICKET_SECRET must be 64 hex digits")
+	}
+	SetTicketSecret(seal.RandomBytes(32)) catch _ {}
+}
+
+// env_str is the environment variable name, or "".
+fn env_str(name str) str {
+	let p = rt_getenv(cast(i64, name) + 8)
+	if p == 0 {
+		return ""
+	}
+	mut n = 0
+	for load8(p+n) != 0 {
+		n += 1
+	}
+	return rt_str_from_raw(p, n)
+}
+
+// tickets_on reports whether this server sends and accepts tickets.
+fn tickets_on() bool {
+	return gTicketSecret != 0 && !gTicketsOff && gTicketLifeS > 0
+}
+
+fn be32(b []u8, at i64) i64 {
+	return i64(b[at])<<24 | i64(b[at+1])<<16 | i64(b[at+2])<<8 | i64(b[at+3])
+}
+
+// ticket_key is the AEAD of a day's tickets, derived on this core the first time it is needed.
+fn ticket_key(day i64) !seal.AEAD {
+	for i in 0..len(ticketDays) {
+		if ticketDays[i] == day {
+			return ticketKeys[i]
+		}
+	}
+	let info = []u8{u8(day >> 24), u8(day >> 16), u8(day >> 8), u8(day)}
+	let key = try seal.HkdfExpandLabel(seal.Hash.SHA256, str(raw_bytes(gTicketSecret, 32)), "tin ticket key", str(info), 32)
+	let a = try seal.NewAESGCM(key)
+	// Keep the last eight days' keys (a ticket lives at most seven).
+	mut days = make([]i64, 0, 8)
+	mut keys = make([]seal.AEAD, 0, 8)
+	mut from = 0
+	if len(ticketDays) >= 8 {
+		from = len(ticketDays) - 7
+	}
+	for i in from..len(ticketDays) {
+		days = append(days, ticketDays[i])
+		keys = append(keys, ticketKeys[i])
+	}
+	days = append(days, day)
+	keys = append(keys, a)
+	ticketDays = keep(days)
+	ticketKeys = keep(keys)
+	return a
+}
+
+// make_ticket seals a ticket for a session negotiated with suite and alpn whose PSK is psk.
+fn make_ticket(suite i64, alpn str, psk []u8, ageAdd i64) ![]u8 {
+	let now = rt_wall_ns() / 1000000
+	let day = now / ticketDayMs
+	let a = try ticket_key(day)
+	mut plain = make([]u8, 0, 18+len(alpn)+len(psk))
+	plain = append(plain, ticketVersion)
+	put16(mut plain, suite)
+	for k in 0..8 {
+		plain = append(plain, u8(now >> u64(56-8*k)))
+	}
+	plain = append(plain, u8(ageAdd>>24), u8(ageAdd>>16), u8(ageAdd>>8), u8(ageAdd))
+	plain = append(plain, u8(len(alpn)))
+	plain = append(plain, alpn...)
+	plain = append(plain, u8(len(psk)))
+	plain = append(plain, psk...)
+	let ad = []u8{u8(day >> 24), u8(day >> 16), u8(day >> 8), u8(day)}
+	let nonce = seal.RandomBytes(12)
+	let sealed = try a.Seal(nonce, plain, ad)
+	mut out = make([]u8, 0, 16+len(sealed))
+	out = append(out, ad...)
+	out = append(out, nonce...)
+	out = append(out, sealed...)
+	return out
+}
+
+// sessionState is what a ticket opens to.
+type sessionState struct {
+	suite i64
+	alpn  str
+	psk   []u8
+}
+
+// open_ticket reads a ticket this server issued; ok is false for anything else: another
+// server's or a forged ticket, one too old, or one from a day whose key has passed.
+fn open_ticket(t []u8) (sessionState, bool) {
+	let none = sessionState{suite: 0, alpn: "", psk: []u8{}}
+	if !tickets_on() || len(t) < 4+12+16+18 {
+		return none, false
+	}
+	let now = rt_wall_ns() / 1000000
+	let day = be32(t, 0)
+	if day > now/ticketDayMs || now/ticketDayMs-day > 7 {
+		return none, false
+	}
+	let a = ticket_key(day) catch _ {
+		return none, false
+	}
+	let plain = a.Open(t[4:16], t[16:], t[:4]) catch _ {
+		return none, false
+	}
+	let r = rdr{b: plain}
+	if r.u8v() != ticketVersion {
+		return none, false
+	}
+	let suite = r.u16v()
+	mut issued = 0
+	for k in 0..8 {
+		issued = issued<<8 | r.u8v()
+	}
+	r.bytes(4) // ticket_age_add: only 0-RTT needs the client's view of the age
+	let alpn = str(r.vec8())
+	let psk = r.vec8()
+	if r.bad || !r.done() || now-issued < 0 || now-issued >= gTicketLifeS*1000 {
+		return none, false
+	}
+	return sessionState{suite: suite, alpn: alpn, psk: clone(psk)}, true
+}
+
+// send_ticket sends one NewSessionTicket after the handshake: lifetime, ticket_age_add, an
+// empty nonce (one ticket per connection), the ticket, no extensions.
+fn (c mut Conn) send_ticket(h seal.Hash, suite i64, alpn str, resumption []u8) ! {
+	let ra = seal.RandomBytes(4)
+	let ageAdd = be32(ra, 0)
+	let psk = try seal.HkdfExpandLabel(h, str(resumption), "resumption", "", seal.Size(h))
+	let tkt = try make_ticket(suite, alpn, psk, ageAdd)
+	mut b = make([]u8, 0, 16+len(tkt))
+	let life = gTicketLifeS
+	b = append(b, u8(life>>24), u8(life>>16), u8(life>>8), u8(life))
+	b = append(b, ra...)
+	b = append(b, 0)
+	put16(mut b, len(tkt))
+	b = append(b, tkt...)
+	put16(mut b, 0)
+	try c.write_records(ctHandshake, handshake_msg(hsNewSessionTicket, b))
+}

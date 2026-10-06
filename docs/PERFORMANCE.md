@@ -635,6 +635,27 @@ of a product with `imul` beside the `mul` that already gives both halves. #488 t
 squaring for RSA. In the same run, plain HTTP/1.1 against main was 1.023 (`/json`) and 1.018
 (`/plaintext`) on amd64 and 0.983 and 1.012 on arm64, and every CPU benchmark stayed within 5%.
 
+### Resumed handshakes (session tickets, #472)
+
+With #472, `anvil.ServeTLS` issues a stateless session ticket after each full handshake, and the
+Go server keeps its tickets on. wrk resumes sessions once a server issues tickets, so
+`bench/http/tlsload` (Go) now measures both kinds. Each full handshake starts with a fresh client.
+Each resumed one offers the ticket of the previous connection and still runs X25519 (psk_dhe_ke),
+but it sends no certificate and makes no signature.
+[Run 37399178539](https://github.com/yasserreslan/tin/actions/runs/37399178539) used head `ea8b04b`,
+before the arithmetic work above was merged, on Linux 6.17.0-1022-azure (AMD EPYC 7763 on amd64,
+Neoverse-N2 on arm64), Go 1.26.8:
+
+| handshakes per second | amd64 anvil | amd64 Go | anvil/Go | arm64 anvil | arm64 Go | anvil/Go |
+|---|---:|---:|---:|---:|---:|---:|
+| full, ECDSA P-256 | 285 | 1952 | 0.15 | 492 | 3178 | 0.15 |
+| full, RSA-2048 | 35 | 614 | 0.06 | 57 | 570 | 0.10 |
+| resumed, ECDSA P-256 | 868 | 2095 | 0.41 | 2116 | 3575 | 0.59 |
+
+On anvil, a resumed handshake is 3.0 times as fast as a full one on amd64 and 4.3 times on arm64.
+On Go, the gain is 1.1 times: its signature costs little next to the rest. In the same run, every
+CPU benchmark against main stayed within 5%.
+
 ## Long-lived blocks above 4 KiB (Linux)
 
 The ingot heap served only blocks up to 4 KiB from slabs: a bigger kept value had a

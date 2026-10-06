@@ -23,6 +23,7 @@
 The Python parts need an ssl module with TLS 1.3 (OpenSSL 1.1.1 or later): they are skipped
 on a Mac whose Python links LibreSSL, and required on Linux. openssl s_client must be OpenSSL 3."""
 import argparse
+import base64
 import hashlib
 import os
 import re
@@ -353,7 +354,7 @@ def tin_clients(exe, client, certs, work):
         out = run('get', srv.addr(), 'http/1.1')
         assert re.fullmatch(r'ok TLS_\w+ X25519 alpn=http/1.1 1 true\n', out), out
         out = run('resume', srv.addr(), 2, cert[0])
-        assert re.fullmatch(r'(resumed false TLS_\w+ X25519 1 true\n){2}', out), out
+        assert re.fullmatch(r'resumed false TLS_\w+ X25519 1 true\nresumed true TLS_\w+ X25519 [01] true\n', out), out
         # The system's roots (here an unrelated root, so the result does not depend on the runner's
         # bundle) do not include the server's certificate: refused.
         out = run('verify', srv.addr(), 'localhost', env={'SSL_CERT_FILE': str(certs['unrelated'][0])})
@@ -373,6 +374,102 @@ def tin_clients(exe, client, certs, work):
         srv.stop()
     print('PASS Tin client: tls.Dial with and without ALPN, verified through RootCAs (ECDSA and RSA keys) and refused by default; '
           'wire https:// GET and POST; websocket wss:// through websocket.Accept')
+
+
+# ---- session resumption (#472) ----
+
+def resumed_get(openssl, port, cafile=None, sess_in=None, sess_out=None, extra=()):
+    """One s_client GET /fast: True when it resumed a session, False for a full handshake."""
+    args = list(extra)
+    if sess_in:
+        args += ['-sess_in', str(sess_in)]
+    if sess_out:
+        args += ['-sess_out', str(sess_out)]
+    rc, out = s_client(openssl, port, args, get('/fast'), cafile=cafile)
+    assert rc == 0 and '\r\n\r\nfast' in out, out[-1500:]
+    assert ('Reused, TLSv1.3' in out) != ('New, TLSv1.3' in out), out[-1500:]
+    return 'Reused, TLSv1.3' in out
+
+
+def tamper_ticket(openssl, sess, out):
+    """Write to out the session sess with the last byte of its ticket flipped."""
+    text = subprocess.run([openssl, 'sess_id', '-in', str(sess), '-noout', '-text'], capture_output=True, text=True,
+                          check=True).stdout
+    lines = text.splitlines()
+    start = next(i for i, l in enumerate(lines) if l.strip() == 'TLS session ticket:')
+    hexes = []
+    for l in lines[start + 1:]:
+        m = re.match(r'\s*[0-9a-f]{4} - ((?:[0-9a-f]{2}[ -]?)+)', l)
+        if not m:
+            break
+        hexes += re.findall(r'[0-9a-f]{2}', m.group(1))
+    ticket = bytes(int(h, 16) for h in hexes)
+    pem = sess.read_text()
+    body = ''.join(l for l in pem.splitlines() if not l.startswith('-----'))
+    der = base64.b64decode(body)
+    at = der.find(ticket)
+    assert len(ticket) > 32 and at >= 0, (len(ticket), at)
+    der = der[:at + len(ticket) - 1] + bytes([der[at + len(ticket) - 1] ^ 1]) + der[at + len(ticket):]
+    b64 = base64.b64encode(der).decode()
+    out.write_text('-----BEGIN SSL SESSION PARAMETERS-----\n' +
+                   '\n'.join(b64[i:i + 64] for i in range(0, len(b64), 64)) +
+                   '\n-----END SSL SESSION PARAMETERS-----\n')
+
+
+def resumption(openssl, exe, client, certs, work):
+    cert = certs['ecdsa']
+    sess, bad = work / 'sess.pem', work / 'sess-tampered.pem'
+    # Four cores: the accepting core deals connections round-robin, so the resumptions below
+    # land on cores that never saw the ticket.
+    srv = Server(exe, cert, work, cores=4)
+    try:
+        assert not resumed_get(openssl, srv.port, cert[0], sess_out=sess)
+        reused = [resumed_get(openssl, srv.port, cert[0], sess_in=sess) for _ in range(8)]
+        assert all(reused), reused
+        # A key share the server does not take: HelloRetryRequest, then the PSK binder over it.
+        rc, out = s_client(openssl, srv.port, ['-sess_in', str(sess), '-groups', 'P-384:X25519', '-msg'], get('/fast'),
+                           cafile=cert[0])
+        assert rc == 0 and 'Reused, TLSv1.3' in out and out.count('ClientHello') == 2, out[-1500:]
+        tamper_ticket(openssl, sess, bad)
+        assert not resumed_get(openssl, srv.port, cert[0], sess_in=bad)
+        r = subprocess.run([str(client), 'resume', srv.addr(), '3', str(cert[0])], capture_output=True, text=True, timeout=60)
+        assert re.fullmatch(r'resumed false TLS_\w+ X25519 1 true\n(resumed true TLS_\w+ X25519 [01] true\n){2}', r.stdout), r.stdout
+        if PY_TLS13:
+            ctx = py_ctx(cert)
+            s = py_connect(srv, ctx)
+            s.sendall(get('/fast'))
+            read_to_close(s)
+            session = s.session
+            s.close()
+            raw = socket.create_connection(('127.0.0.1', srv.port), timeout=20)
+            s = ctx.wrap_socket(raw, server_hostname='127.0.0.1', session=session)
+            s.sendall(get('/fast'))
+            assert read_to_close(s).endswith(b'fast') and s.session_reused, 'Python did not resume'
+            s.close()
+    finally:
+        srv.stop()
+    # Processes that share TIN_TLS_TICKET_SECRET resume each other's sessions; another secret,
+    # a lifetime past, or tickets turned off give a full handshake.
+    key = os.urandom(32).hex()
+    srv = Server(exe, cert, work, env={'TIN_TLS_TICKET_SECRET': key})
+    try:
+        assert not resumed_get(openssl, srv.port, cert[0], sess_out=sess)
+        issued = time.monotonic()
+    finally:
+        srv.stop()
+    for env, want in (({'TIN_TLS_TICKET_SECRET': key}, True), ({'TIN_TLS_TICKET_SECRET': os.urandom(32).hex()}, False),
+                      ({'TIN_TLS_TICKET_SECRET': key, 'TIN_TLS_TICKETS': '0'}, False),
+                      ({'TIN_TLS_TICKET_SECRET': key, 'TIN_TLS_TICKET_LIFETIME_S': '1'}, False)):
+        if 'TIN_TLS_TICKET_LIFETIME_S' in env:
+            time.sleep(max(0.0, issued + 2.2 - time.monotonic()))
+        srv = Server(exe, cert, work, env=env)
+        try:
+            assert resumed_get(openssl, srv.port, cert[0], sess_in=sess) == want, env
+        finally:
+            srv.stop()
+    print('PASS resumption: OpenSSL resumes on four cores (8 of 8) and after a HelloRetryRequest, a tampered ticket gets '
+          'a full handshake, the Tin and Python clients resume; a shared TIN_TLS_TICKET_SECRET resumes across processes, another secret, '
+          'TIN_TLS_TICKETS=0 and a ticket past TIN_TLS_TICKET_LIFETIME_S do not')
 
 
 # ---- malformed handshakes and timeouts ----
@@ -643,6 +740,7 @@ def main():
         certs = make_certs(openssl, work)
         openssl_interop(openssl, exe, certs, work)
         tin_clients(exe, client, certs, work)
+        resumption(openssl, exe, client, certs, work)
         malformed(exe, client, certs, work)
         one_core(exe, client, certs, work)
         memory(openssl, exe, certs, work)

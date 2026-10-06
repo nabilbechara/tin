@@ -4,8 +4,8 @@ import "say"
 import "seal"
 import "wire"
 
-// ---- the server handshake (RFC 8446 section 2, full handshake without PSK) and the
-// non-waiting record calls anvil's event loop uses after it ----
+// ---- the server handshake (RFC 8446 section 2; resumption with this server's tickets,
+// server_ticket.tin) and the non-waiting record calls anvil's event loop uses after it ----
 
 // ServerConfig configures a TLS server: its certificate chain and private key, and the
 // application protocols it speaks.
@@ -24,6 +24,7 @@ fn LoadServerConfig(certPEM str, keyPEM str) !ServerConfig {
 	if !key.MatchesCertificate(certs[0]) {
 		fail "tls: the private key does not belong to the first certificate"
 	}
+	init_tickets()
 	mut chain = make([][]u8, 0, len(certs))
 	for _, c in certs {
 		chain = append(chain, c.Raw)
@@ -43,11 +44,15 @@ type clientHello struct {
 	tls13   bool
 	name    str
 	cookie  []u8
+	pskDHE  bool   // psk_key_exchange_modes offers psk_dhe_ke
+	pskIDs  [][]u8 // pre_shared_key identities, in order
+	binders [][]u8 // and their binders
+	bindLen i64    // the bytes the binders list takes at the end of the ClientHello
 }
 
 // parse_client_hello reads a ClientHello body.
 fn parse_client_hello(body []u8) !clientHello {
-	let ch = clientHello{random: []u8{}, session: []u8{}, name: "", cookie: []u8{}}
+	let ch = clientHello{random: []u8{}, session: []u8{}, name: "", cookie: []u8{}, pskIDs: [][]u8{}, binders: [][]u8{}}
 	let r = rdr{b: body}
 	r.u16v()
 	ch.random = r.bytes(32)
@@ -125,9 +130,32 @@ fn parse_client_hello(body []u8) !clientHello {
 			}
 		} else if typ == extCookie {
 			ch.cookie = e.vec16()
-		} else if typ == 41 && !exts.done() {
-			// pre_shared_key must be the last extension (RFC 8446 4.2.11).
-			fail alert_fault(alertIllegalParameter, "pre_shared_key is not the last extension")
+		} else if typ == extPSKModes {
+			let m = e.vec8()
+			for _, mode in m {
+				if mode == 1 {
+					ch.pskDHE = true
+				}
+			}
+		} else if typ == extPreSharedKey {
+			if !exts.done() {
+				// pre_shared_key must be the last extension (RFC 8446 4.2.11).
+				fail alert_fault(alertIllegalParameter, "pre_shared_key is not the last extension")
+			}
+			let ids = rdr{b: e.vec16()}
+			for !ids.done() && !ids.bad {
+				ch.pskIDs = append(ch.pskIDs, ids.vec16())
+				ids.bytes(4) // obfuscated_ticket_age: only 0-RTT needs it
+			}
+			let bl = e.vec16()
+			ch.bindLen = 2 + len(bl)
+			let bs = rdr{b: bl}
+			for !bs.done() && !bs.bad {
+				ch.binders = append(ch.binders, bs.vec8())
+			}
+			if ids.bad || bs.bad || !e.done() || len(ch.pskIDs) == 0 || len(ch.pskIDs) != len(ch.binders) {
+				fail alert_fault(alertDecodeError, "malformed pre_shared_key")
+			}
 		}
 	}
 	if exts.bad {
@@ -148,7 +176,7 @@ fn share_for(ch clientHello, group i64) []u8 {
 
 // server_hello encodes a ServerHello (or, with random = hrrRandom and no share, a
 // HelloRetryRequest naming group).
-fn server_hello(random []u8, session []u8, suite i64, group i64, share []u8) []u8 {
+fn server_hello(random []u8, session []u8, suite i64, group i64, share []u8, psk bool) []u8 {
 	mut b = make([]u8, 0, 160)
 	b = append(b, hsServerHello)
 	let body = open_len(mut b, 3)
@@ -171,6 +199,12 @@ fn server_hello(random []u8, session []u8, suite i64, group i64, share []u8) []u
 		put16(mut b, group)
 		put16(mut b, len(share))
 		b = append(b, share...)
+	}
+	if psk {
+		// The first PSK identity offered (server_handshake only ever accepts that one).
+		put16(mut b, extPreSharedKey)
+		put16(mut b, 2)
+		put16(mut b, 0)
 	}
 	close_len(mut b, exts, 2)
 	close_len(mut b, body, 3)
@@ -228,6 +262,9 @@ fn (c mut Conn) server_handshake(cfg ServerConfig) ! {
 	}
 	let h = suite_hash(suite)
 	mut transcript = clone(msg)
+	mut final = ch     // the ClientHello the handshake goes on with: the second after a retry
+	mut finalMsg = msg
+	mut prefix = []u8{} // the handshake bytes before finalMsg (message_hash and the retry)
 	mut group = 0
 	mut share = share_for(ch, groupX25519)
 	if len(share) > 0 {
@@ -253,7 +290,7 @@ fn (c mut Conn) server_handshake(cfg ServerConfig) ! {
 			fail alert_fault(alertUnexpectedMessage, "handshake data after the ClientHello")
 		}
 		let first = handshake_msg(hsMessageHash, transcript_hash(h, transcript))
-		let hrr = server_hello([]u8(hrrRandom), ch.session, suite, want, []u8{})
+		let hrr = server_hello([]u8(hrrRandom), ch.session, suite, want, []u8{}, false)
 		transcript = cat(first, hrr)
 		try c.write_records(ctHandshake, hrr)
 		typ, msg = try hr.next(mut c)
@@ -270,9 +307,40 @@ fn (c mut Conn) server_handshake(cfg ServerConfig) ! {
 		}
 		group = want
 		ch.alpn = ch2.alpn
+		prefix = transcript
+		final = ch2
+		finalMsg = msg
 		transcript = cat(transcript, msg)
 		c.retried = true
 	}
+	// The application protocol: also what a ticket must have been issued for.
+	mut alpn = ""
+	if len(ch.alpn) > 0 && len(cfg.ALPN) > 0 {
+		for _, p in cfg.ALPN {
+			if alpn == "" && in_str_list(ch.alpn, p) {
+				alpn = p
+			}
+		}
+		if alpn == "" {
+			fail alert_fault(120, "no application protocol in common")
+		}
+	}
+	// Resumption: the first identity, if it is one of this server's tickets for this hash and
+	// protocol, and the client allows a new key exchange with it. A ticket that does not open
+	// is ignored (full handshake); a binder that does not verify ends the handshake.
+	mut psk = []u8{}
+	if len(final.pskIDs) > 0 && final.pskDHE {
+		let (st, ok) = open_ticket(final.pskIDs[0])
+		if ok && suite_hash(st.suite) == h && st.alpn == alpn {
+			let truncated = finalMsg[:len(finalMsg)-final.bindLen]
+			let want = try psk_binder(h, st.psk, prefix, truncated)
+			if !seal.ConstantTimeEq(want, final.binders[0]) {
+				fail alert_fault(alertDecryptError, "PSK binder does not verify")
+			}
+			psk = st.psk
+		}
+	}
+	let resumed = len(psk) > 0
 	mut shared_ = []u8{}
 	mut mine = []u8{}
 	if group == groupX25519 {
@@ -294,26 +362,15 @@ fn (c mut Conn) server_handshake(cfg ServerConfig) ! {
 	if !hr.empty() {
 		fail alert_fault(alertUnexpectedMessage, "handshake data before a key change")
 	}
-	let sh = server_hello(seal.RandomBytes(32), ch.session, suite, group, mine)
+	let sh = server_hello(seal.RandomBytes(32), ch.session, suite, group, mine, resumed)
 	transcript = cat(transcript, sh)
 	try c.write_records(ctHandshake, sh)
 	c.suite = suite
 	c.hash = h
-	let sc = try handshake_secrets(h, shared_, transcript_hash(h, transcript), []u8{})
+	let sc = try handshake_secrets(h, shared_, transcript_hash(h, transcript), psk)
 	try c.set_write_key(sc.shs)
 	try c.set_read_key(sc.chs)
 	// EncryptedExtensions: the protocol chosen, if both sides speak ALPN.
-	mut alpn = ""
-	if len(ch.alpn) > 0 && len(cfg.ALPN) > 0 {
-		for _, p in cfg.ALPN {
-			if alpn == "" && in_str_list(ch.alpn, p) {
-				alpn = p
-			}
-		}
-		if alpn == "" {
-			fail alert_fault(120, "no application protocol in common")
-		}
-	}
 	mut ee = make([]u8, 0, 32)
 	let exts = open_len(mut ee, 2)
 	if alpn != "" {
@@ -325,28 +382,32 @@ fn (c mut Conn) server_handshake(cfg ServerConfig) ! {
 	}
 	close_len(mut ee, exts, 2)
 	mut flight = handshake_msg(hsEncryptedExtensions, ee)
-	mut cm = make([]u8, 0, 4096)
-	cm = append(cm, 0)
-	let list = open_len(mut cm, 3)
-	for _, der in cfg.Certificates {
-		put24(mut cm, len(der))
-		cm = append(cm, der...)
-		put16(mut cm, 0)
+	if !resumed {
+		mut cm = make([]u8, 0, 4096)
+		cm = append(cm, 0)
+		let list = open_len(mut cm, 3)
+		for _, der in cfg.Certificates {
+			put24(mut cm, len(der))
+			cm = append(cm, der...)
+			put16(mut cm, 0)
+		}
+		close_len(mut cm, list, 3)
+		flight = cat(flight, handshake_msg(hsCertificate, cm))
 	}
-	close_len(mut cm, list, 3)
-	flight = cat(flight, handshake_msg(hsCertificate, cm))
 	transcript = cat(transcript, flight)
-	let sig = try cfg.Key.SignTLS(scheme, cv_content(transcript_hash(h, transcript)))
-	mut cv = make([]u8, 0, 8+len(sig))
-	put16(mut cv, scheme)
-	put16(mut cv, len(sig))
-	cv = append(cv, sig...)
-	let cvm = handshake_msg(hsCertificateVerify, cv)
-	transcript = cat(transcript, cvm)
+	if !resumed {
+		let sig = try cfg.Key.SignTLS(scheme, cv_content(transcript_hash(h, transcript)))
+		mut cv = make([]u8, 0, 8+len(sig))
+		put16(mut cv, scheme)
+		put16(mut cv, len(sig))
+		cv = append(cv, sig...)
+		let cvm = handshake_msg(hsCertificateVerify, cv)
+		transcript = cat(transcript, cvm)
+		flight = cat(flight, cvm)
+	}
 	let fin = try finished_mac(h, sc.shs, transcript_hash(h, transcript))
 	let finm = handshake_msg(hsFinished, fin)
 	transcript = cat(transcript, finm)
-	flight = cat(flight, cvm)
 	flight = cat(flight, finm)
 	try c.write_records(ctHandshake, flight)
 	let thash = transcript_hash(h, transcript)
@@ -369,6 +430,11 @@ fn (c mut Conn) server_handshake(cfg ServerConfig) ! {
 	try c.set_read_key(cats)
 	c.alpn = alpn
 	c.group = group
+	c.resumed = resumed
+	if tickets_on() {
+		let res = try derive_secret(h, sc.master, "res master", transcript_hash(h, cat(transcript, msg)))
+		try c.send_ticket(h, suite, alpn, res)
+	}
 	c.ready = true
 }
 

@@ -826,6 +826,20 @@ HTTP/1.1 over TLS 1.3 on the same per-core event loops (`lib/anvil/serve_tls.tin
   `TIN_HANDSHAKE_TIMEOUT_MS` (default: the header timeout, 10 s), and a core runs at most 4096
   handshakes at once (more connections are closed at accept). The CPU work (the key share, the
   key schedule and the CertificateVerify signature) runs on the core.
+- **Resumption (#472).** After a full handshake the server sends one NewSessionTicket. The ticket
+  is stateless: it holds the resumption PSK, the cipher suite, the ALPN protocol and the issue
+  time, sealed with AES-256-GCM under the key of its issue day. Each day's key is derived (HKDF)
+  from one 32-byte secret per process, so any core opens any core's ticket. A core derives a
+  day's key the first time it needs it, and nothing is shared or written between cores. A
+  returning client's first PSK identity is accepted when it opens, is younger than
+  `TIN_TLS_TICKET_LIFETIME_S` (default and most: 7 days), names a cipher suite with the
+  negotiated hash and the protocol ALPN chose now, and its binder verifies (a bad binder ends
+  the handshake with decrypt_error). The resumed handshake skips Certificate and
+  CertificateVerify, so it needs no signature. Only psk_dhe_ke is accepted, so a new key
+  exchange still gives forward secrecy, and there is no 0-RTT. The secret is random per process
+  unless `TIN_TLS_TICKET_SECRET` (64 hex digits) or `tls.SetTicketSecret` sets it, which lets
+  processes behind one load balancer resume each other's sessions. `TIN_TLS_TICKETS=0` turns
+  tickets off.
 - **After the handshake** the `tls.Conn` is copied into long-lived memory: the per-core map
   `tlsConns` holds it by connection record (deleting the entry when the record is freed releases
   it through the long-lived reference counts, #176) and the record's `cTls` word its address.
@@ -867,8 +881,8 @@ HTTP/1.1 over TLS 1.3 on the same per-core event loops (`lib/anvil/serve_tls.tin
 - **Linking.** `anvil.tin` reaches `serve_tls.tin` only through function hooks (`gTlsRead`,
   `gTlsSeal`, ...) that `ServeTLS` sets, each behind a test of `cTls`: a server that never calls
   `ServeTLS` links no TLS code (`examples/api.tin` grew by 335 bytes) and its loop is unchanged.
-- **Not supported:** session tickets and resumption on the server, 0-RTT, client certificates,
-  certificate selection by SNI (one chain per server), Ed25519 server keys, and TLS 1.2. A
+- **Not supported:** 0-RTT, client certificates (#475), certificate selection by SNI (one chain
+  per server, #476), Ed25519 server keys (#477), and TLS 1.2 (#473). A
   `TIN_REPLAY_CAPSULE` replay sends plain HTTP and cannot replay into a TLS server.
 
 ### Pooled clients: mysql (v0.4)

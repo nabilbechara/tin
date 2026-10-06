@@ -1,6 +1,6 @@
 // The Go crypto/tls baseline for bench/http/https.tin: net/http over TLS 1.3 only, HTTP/1.1
-// only (no h2), no session tickets (the Tin server issues none, so every new connection is a
-// full handshake on both sides), with the same /plaintext and /big?n=N endpoints.
+// only (no h2), session tickets on (crypto/tls's default; anvil issues them too, #472), with the
+// same /plaintext and /big?n=N endpoints.
 // Usage: gotls ADDR CERT KEY
 package main
 
@@ -36,7 +36,7 @@ func main() {
 	srv := &http.Server{
 		Addr:         addr,
 		Handler:      mux,
-		TLSConfig:    &tls.Config{MinVersion: tls.VersionTLS13, SessionTicketsDisabled: true, NextProtos: []string{"http/1.1"}},
+		TLSConfig:    &tls.Config{MinVersion: tls.VersionTLS13, NextProtos: []string{"http/1.1"}},
 		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
 	}
 	if err := srv.ListenAndServeTLS(cert, key); err != nil {
