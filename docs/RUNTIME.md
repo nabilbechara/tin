@@ -703,7 +703,14 @@ connections leave it 0, and the HTTP/1.1 path reads it once per read, never per 
 **Reading.** In the core's event loop, as for HTTP/1.1: a read into the core's scratch buffer,
 whole frames served in order (`h2_feed`), a frame not fully arrived kept in the connection (at
 most 16 KiB and its header: larger frames are a FRAME_SIZE_ERROR). Responses produced while a read
-is served go out in one write; while the socket does not take them, reading stops (backpressure).
+is served go out in one write; what the socket does not take waits in the connection (`cOut`), and
+the connection goes on reading meanwhile (#506): a client may be unable to read until the server
+takes what it writes (Go's HTTP/2 client: its reader needs the lock its writer holds), so a server
+that stopped reading would wait for it, and it for the server, until the write timeout. Streams
+that produce output wait for room themselves (past 256 KiB pending); past `h2PendMax` (8 MiB) of
+pending output reading stops too, until it is written (backpressure, so a client that never reads
+cannot make the server queue answers to its PINGs without bound). The event loop writes before it
+reads when one epoll event reports both.
 
 **Settings and limits.** SETTINGS_MAX_CONCURRENT_STREAMS 100 (a stream past it is refused with
 REFUSED_STREAM), SETTINGS_INITIAL_WINDOW_SIZE 1 MiB, a 4 MiB connection window (one WINDOW_UPDATE

@@ -52,6 +52,7 @@ const h2MaxFrame = 16384    // SETTINGS_MAX_FRAME_SIZE (the default): longer fra
 const h2HeaderList = 65536  // SETTINGS_MAX_HEADER_LIST_SIZE: a larger request gets 431, as in HTTP/1.1
 const h2BlockMax = 262144   // a header block's fragments past this end the connection
 const h2OutMax = 262144     // output a stream leaves pending before it waits for the socket
+const h2PendMax = 8388608   // pending output past which reading stops too, until it is written
 const h2WinMax = 2147483647
 
 // Connection state words (c[cH2]).
@@ -487,7 +488,7 @@ fn h2_read(c i64) bool {
 		return false
 	}
 	// Decrypted input TLS still holds is read on the next turn: the socket will not report it.
-	return (full || (c[cTls] != 0 && gTlsPending(c) == 2)) && c[cWriting] == 0 && c[cClose] == 0
+	return (full || (c[cTls] != 0 && gTlsPending(c) == 2)) && c[cWriting] != 1 && c[cClose] == 0
 }
 
 // h2_keep holds the n bytes at p, a frame that has not fully arrived, until the next read.
@@ -2149,6 +2150,7 @@ fn h2_flush(c i64) {
 	if c[cOut] != 0 {
 		pend_out(c, ob, obLen)
 		obLen = 0
+		h2_stop_reading(c)
 		return
 	}
 	mut w = conn_write(c, ob, obLen)
@@ -2162,11 +2164,26 @@ fn h2_flush(c i64) {
 	}
 	if w < obLen {
 		pend_out(c, ob+w, obLen-w)
-		ev_conn_write(c[cFD])
-		c[cWriting] = 1
+		// Reading goes on while output waits (cWriting 2): a client that cannot read before
+		// the server takes what it is writing (Go's, whose reader needs the lock its writer
+		// holds) would otherwise wait for the server, and the server for it, until the write
+		// timeout. Past h2PendMax of pending output reading stops (cWriting 1).
+		ev_conn_rw(c[cFD])
+		c[cWriting] = 2
+		h2_stop_reading(c)
 		write_deadline(c)
 	}
 	obLen = 0
+}
+
+// h2_stop_reading stops reading c's input once its pending output passes h2PendMax, so a client
+// that never reads cannot make the server buffer without bound; it resumes when the output is
+// written (h2_on_write).
+fn h2_stop_reading(c i64) {
+	if c[cWriting] == 2 && c[cOutLen]-c[cOutOff] > h2PendMax {
+		ev_conn_write(c[cFD])
+		c[cWriting] = 1
+	}
 }
 
 // h2_on_write writes c's pending output when the socket has room; once it is all out, reading
