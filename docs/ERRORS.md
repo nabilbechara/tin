@@ -3610,6 +3610,12 @@ example.tin:8:2: error E704 MUT_PARAM_REBIND: cannot assign to mut parameter 'b'
 
 Fix: change the fields (`b.n = 0`), or return the new value.
 
+A `mut` slice parameter is the same: only `p = append(p, ...)` reaches the caller, because
+append grows the shared header in place. A reslice (`p = p[2:]`), another slice, or an append
+to anything but `p` itself makes a new header that only this function would see, so
+`fn drop2(p mut []u8) { p = p[2:] }` reports E704 too. Fix: return the new slice
+(`fn drop2(p []u8) []u8 { return p[2:] }`, called as `a = drop2(a)`), or keep an offset beside it.
+
 ### E705 MUT_ARG
 
 A call writes `mut` before an argument exactly when the parameter is `mut`, so every
