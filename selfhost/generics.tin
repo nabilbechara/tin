@@ -162,7 +162,7 @@ fn check_constraints(pos i64, names []str, cons []i64, targs []i64, file i64) {
 		let c = cast([]i64, cons[i])
 		if cast(i64, c) != 0 {
 			let t = targs[i]
-			mut inst = cast([]i64, 0)
+			mut inst = cast(Pair, 0)
 			mut handled = 0
 			let cx = cast(Node, c[0])
 			if len(c) == 1 && cx.kind == TX_DYN {
@@ -177,7 +177,7 @@ fn check_constraints(pos i64, names []str, cons []i64, targs []i64, file i64) {
 				handled = i64(cast(i64, shape_ref_name(cast(TypeExpr, cx))) != 0)
 			}
 			if cast(i64, inst) != 0 {
-				check_shape(pos, cast(Ty, t), cast(Decl, inst[0]), cast([]i64, inst[1]))
+				check_shape(pos, cast(Ty, t), cast(Decl, inst.a), cast([]i64, inst.b))
 			} else if handled != 0 {
 			} else {
 				mut ok = 0
@@ -210,9 +210,9 @@ fn instantiate_type(d Decl, targs []i64, pos i64) i64 {
 	sb_targs(pos, targs)
 	mut i = 0
 	for i < len(d.insts) {
-		let inst = cast([]i64, d.insts[i])
-		if same_types(cast([]i64, inst[0]), targs) != 0 {
-			return inst[1]
+		let inst = cast(Pair, d.insts[i])
+		if same_types(cast([]i64, inst.a), targs) != 0 {
+			return inst.b
 		}
 		i = i + 1
 	}
@@ -257,8 +257,8 @@ fn generics_declared() {
 	ck_decl_done = 1
 	mut i = 0
 	for i < len(gen_pending) {
-		let p = cast([]i64, gen_pending[i])
-		instantiate_fn(cast(Fn, p[0]), cast([]Ty, cast([]i64, p[1])), 0)
+		let p = cast(Pair, gen_pending[i])
+		instantiate_fn(cast(Fn, p.a), cast([]Ty, cast([]i64, p.b)), 0)
 		i = i + 1
 	}
 }
@@ -304,9 +304,9 @@ fn instantiate_fn(g Fn, targs []Ty, pos i64) Fn {
 	}
 	mut i = 0
 	for i < len(g.insts) {
-		let inst = cast([]i64, g.insts[i])
-		if same_types(cast([]i64, inst[0]), cast([]i64, targs)) != 0 {
-			return cast(Fn, inst[1])
+		let inst = cast(Pair, g.insts[i])
+		if same_types(cast([]i64, inst.a), cast([]i64, targs)) != 0 {
+			return cast(Fn, inst.b)
 		}
 		i = i + 1
 	}
@@ -520,7 +520,7 @@ fn generic_call(e i64, g Fn) i64 {
 fn expr_to_tx(e i64) i64 {
 	let k = cast(Node, e).kind
 	if k == EX_TYPE {
-		return e[TYX]
+		return cast(TypeNode, e).ty
 	}
 	if k == EX_IDENT {
 		let n = cast(TypeExpr, node_new(TX_NAME, cast(Node, e).pos))
@@ -755,17 +755,17 @@ fn shape_ref_name(tx TypeExpr) Decl {
 // [decl, bindings]; bindings is 0 for a non-generic shape. Type arguments are resolved
 // and the shape's own parameter constraints are checked, so `Seq[i64]` is an instance
 // and `Seq` alone is an error. Returns 0 when the name is not a shape.
-fn shape_inst(tx i64) []i64 {
+fn shape_inst(tx i64) Pair {
 	let d = shape_ref_name(cast(TypeExpr, tx))
 	if cast(i64, d) == 0 {
-		return cast([]i64, 0)
+		return cast(Pair, 0)
 	}
 	if cast(i64, d.tparams) == 0 {
 		if cast(TypeExpr, tx).args != 0 {
 			err_code_quoted(cast(Node, tx).pos, "E501 NOT_GENERIC", "shape ", cast(TypeName, tx).name, " takes no type arguments")
-			return cast([]i64, 0)
+			return cast(Pair, 0)
 		}
-		return cast([]i64, pair(cast(i64, d), 0))
+		return cast(Pair, pair(cast(i64, d), 0))
 	}
 	if cast(TypeExpr, tx).args == 0 {
 		let e = err_code(cast(Node, tx).pos, "E502 TYPE_ARG_COUNT")
@@ -775,7 +775,7 @@ fn shape_inst(tx i64) []i64 {
 		buf_str(e, cast(TypeName, tx).name)
 		buf_str(e, "[...]")
 		err_end(cast([]u8, e))
-		return cast([]i64, 0)
+		return cast(Pair, 0)
 	}
 	if len(cast([]i64, cast(TypeExpr, tx).args)) != len(d.tparams) {
 		let e = err_code(cast(Node, tx).pos, "E502 TYPE_ARG_COUNT")
@@ -784,23 +784,23 @@ fn shape_inst(tx i64) []i64 {
 		buf_str(e, ": it takes ")
 		buf_int(e, len(d.tparams))
 		err_end(cast([]u8, e))
-		return cast([]i64, 0)
+		return cast(Pair, 0)
 	}
 	let before = error_count
 	let targs = resolve_types(cast([]i64, cast(TypeExpr, tx).args))
 	if error_count != before {
 		// A type argument that did not resolve was reported; bindings built from the
 		// fallback types would only add misleading errors.
-		return cast([]i64, 0)
+		return cast(Pair, 0)
 	}
 	let before_cons = error_count
 	check_constraints(cast(Node, tx).pos, cast([]str, d.tparams), cast([]i64, d.tcons), targs, d.file)
 	if error_count != before_cons {
 		// The arguments were reported; a pair built from them would only cause the same
 		// error again at use.
-		return cast([]i64, 0)
+		return cast(Pair, 0)
 	}
-	return cast([]i64, pair(cast(i64, d), tbind_pairs(cast([]str, d.tparams), targs)))
+	return cast(Pair, pair(cast(i64, d), tbind_pairs(cast([]str, d.tparams), targs)))
 }
 
 // shape_inst_decl is shape_inst for declaration validation: it checks the name and the
@@ -904,7 +904,7 @@ fn shape_tx_mentions(tx i64, names []str) i64 {
 		return 0
 	}
 	if k == TX_SLICE || k == TX_ARRAY {
-		return shape_tx_mentions(tx[TX_A + i64((k == TX_ARRAY))], names)
+		return shape_tx_mentions(slice_or_array_elem(tx), names)
 	}
 	if k == TX_MAP {
 		return i64(shape_tx_mentions(cast(TypeExpr, tx).a, names) != 0 || shape_tx_mentions(cast(TypeExpr, tx).b, names) != 0)
@@ -1009,8 +1009,8 @@ fn shape_inst_soft(tx i64) i64 {
 fn shape_collect_visited(sd i64, bind_ []i64) i64 {
 	mut i = 0
 	for i < len(shape_collecting) {
-		let p = cast([]i64, shape_collecting[i])
-		if p[0] == sd && shape_bind_same(cast([]i64, p[1]), bind_) != 0 {
+		let p = cast(Pair, shape_collecting[i])
+		if p.a == sd && shape_bind_same(cast([]i64, p.b), bind_) != 0 {
 			return 1
 		}
 		i = i + 1
@@ -1066,14 +1066,14 @@ fn shape_collect(sd Decl, bind_ []i64, methods []i64, owner Decl, own []str) {
 			// Under symbolic arguments the constraints cannot be checked here; with real
 			// arguments (even inside a generic body) they can, and an error is sd's.
 			let before_inst = error_count
-			mut inst = cast([]i64, 0)
+			mut inst = cast(Pair, 0)
 			if shape_member_symbolic(cast(TypeExpr, m), sd, bind_) != 0 {
-				inst = cast([]i64, shape_inst_soft(cast(i64, m)))
+				inst = cast(Pair, shape_inst_soft(cast(i64, m)))
 			} else {
 				inst = shape_inst(cast(i64, m))
 			}
 			if cast(i64, inst) != 0 {
-				shape_collect(cast(Decl, inst[0]), cast([]i64, inst[1]), methods, owner, []str{})
+				shape_collect(cast(Decl, inst.a), cast([]i64, inst.b), methods, owner, []str{})
 			} else if error_count != before_inst && shape_on_path(shape_bad, cast(i64, sd)) == 0 {
 				shape_bad = append(shape_bad, cast(i64, sd))
 			}
@@ -1115,7 +1115,7 @@ fn shape_collect(sd Decl, bind_ []i64, methods []i64, owner Decl, own []str) {
 		mut j = 0
 		for j < len(methods) {
 			let prev = cast(ShapeMethod, methods[j])
-			if prev.name == f.name && shape_sig_same(cast([]i64, prev.sig), sig) == 0 {
+			if prev.name == f.name && shape_sig_same(cast(ShapeSig, prev.sig), sig) == 0 {
 				let e = err_code(f.pos, "E525 SHAPE_METHOD_CONFLICT")
 				buf_str(e, "shape ")
 				buf_str(e, owner.name)
@@ -1144,8 +1144,8 @@ fn shape_collect(sd Decl, bind_ []i64, methods []i64, owner Decl, own []str) {
 fn dyn_table_add(t Ty, dt Ty, pos i64) i64 {
 	mut i = 0
 	for i < len(dyn_tables) {
-		let old = cast([]i64, dyn_tables[i])
-		if cast(i64, cast(Ty, old[0])) == cast(i64, t) && cast(i64, cast(Ty, old[1])) == cast(i64, dt) {
+		let old = cast(DynTable, dyn_tables[i])
+		if old.ty == cast(i64, t) && old.dyn_ == cast(i64, dt) {
 			return i
 		}
 		i = i + 1
@@ -1173,12 +1173,12 @@ fn dyn_table_add(t Ty, dt Ty, pos i64) i64 {
 		}
 		i = i + 1
 	}
-	mut rec = []i64{}
-	rec = append(rec, cast(i64, t))
-	rec = append(rec, cast(i64, dt))
-	rec = append(rec, cast(i64, keep_fn(t)))
-	rec = append(rec, cast(i64, fns))
-	rec = append(rec, -1)
+	let rec = cast(DynTable, calloc(5, 8))
+	rec.ty = cast(i64, t)
+	rec.dyn_ = cast(i64, dt)
+	rec.keep_ = cast(i64, keep_fn(t))
+	rec.fns = fns
+	rec.slot = -1
 	dyn_tables = append(dyn_tables, cast(i64, rec))
 	return len(dyn_tables) - 1
 }
@@ -1211,9 +1211,9 @@ fn dyn_table_mark(i i64) {
 	if i < 0 || i >= len(dyn_tables) {
 		return
 	}
-	let rec = cast([]i64, dyn_tables[i])
-	mark_reach(cast(Fn, rec[2]))
-	let fns = cast([]i64, rec[3])
+	let rec = cast(DynTable, dyn_tables[i])
+	mark_reach(cast(Fn, rec.keep_))
+	let fns = rec.fns
 	mut j = 0
 	for j < len(fns) {
 		mark_reach(cast(Fn, fns[j]))
@@ -1343,8 +1343,8 @@ fn shape_on_path(path []i64, d i64) i64 {
 fn shape_seen(v []i64, sd i64, t i64, bind_ []i64) i64 {
 	mut i = 0
 	for i < len(v) {
-		let p = cast([]i64, v[i])
-		if p[0] == sd && p[1] == t && shape_bind_same(cast([]i64, p[2]), bind_) != 0 {
+		let p = cast(Pair, v[i])
+		if p.a == sd && p.b == t && shape_bind_same(cast([]i64, p.c), bind_) != 0 {
 			return 1
 		}
 		i = i + 1
@@ -1357,8 +1357,8 @@ fn shape_seen(v []i64, sd i64, t i64, bind_ []i64) i64 {
 fn shape_seen_type(v []i64, sd i64, t i64) i64 {
 	mut i = 0
 	for i < len(v) {
-		let p = cast([]i64, v[i])
-		if p[0] == sd && p[1] == t {
+		let p = cast(Pair, v[i])
+		if p.a == sd && p.b == t {
 			return 1
 		}
 		i = i + 1
@@ -1438,11 +1438,10 @@ fn shape_sig_type(x Node, bind_ []i64) i64 {
 	return t
 }
 
-// shape_sig_of returns [param names, param types, param muts, result types, variadic,
-// mut result, fault] for a method. A declared method's parameter zero is its receiver,
+// shape_sig_of returns the signature of a method. A declared method's parameter zero is its receiver,
 // which a shape's signature does not carry, so it is skipped; receiver mutability is
 // not part of satisfaction, only the call site's `mut` mark is.
-fn shape_sig_of(f Fn, declared i64, bind_ []i64) []i64 {
+fn shape_sig_of(f Fn, declared i64, bind_ []i64) ShapeSig {
 	mut ns = []str{}
 	mut ps = []i64{}
 	mut ms = []i64{}
@@ -1462,34 +1461,33 @@ fn shape_sig_of(f Fn, declared i64, bind_ []i64) []i64 {
 		rs = append(rs, shape_sig_type(cast(Node, f.rtypes[i]), bind_))
 		i = i + 1
 	}
-	mut sig = []i64{}
-	sig = append(sig, cast(i64, ns))
-	sig = append(sig, cast(i64, ps))
-	sig = append(sig, cast(i64, ms))
-	sig = append(sig, cast(i64, rs))
-	sig = append(sig, f.variadic)
-	sig = append(sig, f.mutres)
-	sig = append(sig, f.bang)
-	return cast([]i64, sig)
+	let sig = cast(ShapeSig, calloc(7, 8))
+	sig.names = ns
+	sig.types = ps
+	sig.muts = ms
+	sig.results = rs
+	sig.variadic = f.variadic
+	sig.mutres = f.mutres
+	sig.bang = f.bang
+	return sig
 }
 
-// A signature is a vec of [param names, param types, param muts, result types,
-// variadic, mut result, fault], read by index like every other slice.
-fn shape_sig_same(a []i64, b []i64) i64 {
-	let aps = cast([]i64, a[1])
-	let bps = cast([]i64, b[1])
-	if len(aps) != len(bps) || a[4] != b[4] || a[5] != b[5] || a[6] != b[6] {
+// shape_sig_same reports whether two signatures are the same.
+fn shape_sig_same(a ShapeSig, b ShapeSig) i64 {
+	let aps = a.types
+	let bps = b.types
+	if len(aps) != len(bps) || a.variadic != b.variadic || a.mutres != b.mutres || a.bang != b.bang {
 		return 0
 	}
 	mut i = 0
 	for i < len(aps) {
-		if aps[i] != bps[i] || cast([]i64, a[2])[i] != cast([]i64, b[2])[i] {
+		if aps[i] != bps[i] || a.muts[i] != b.muts[i] {
 			return 0
 		}
 		i = i + 1
 	}
-	let ars = cast([]i64, a[3])
-	let brs = cast([]i64, b[3])
+	let ars = a.results
+	let brs = b.results
 	if len(ars) != len(brs) {
 		return 0
 	}
@@ -1505,12 +1503,12 @@ fn shape_sig_same(a []i64, b []i64) i64 {
 
 // shape_sig_str writes a method signature the way it would be declared, so the error
 // can show both sides: `Read(buf mut []u8) !i64`.
-fn shape_sig_str(b []u8, name str, sig []i64) {
-	let ns = cast([]str, sig[0])
-	let ps = cast([]i64, sig[1])
-	let ms = cast([]i64, sig[2])
-	let rs = cast([]i64, sig[3])
-	let variadic = sig[4]
+fn shape_sig_str(b []u8, name str, sig ShapeSig) {
+	let ns = sig.names
+	let ps = sig.types
+	let ms = sig.muts
+	let rs = sig.results
+	let variadic = sig.variadic
 	buf_str(b, name)
 	buf_byte(b, '(')
 	mut i = 0
@@ -1533,7 +1531,7 @@ fn shape_sig_str(b []u8, name str, sig []i64) {
 	}
 	buf_byte(b, ')')
 	mut n = len(rs)
-	if sig[6] != 0 {
+	if sig.bang != 0 {
 		buf_str(b, " !")
 		n = n - 1
 		if n == 1 {
@@ -1543,7 +1541,7 @@ fn shape_sig_str(b []u8, name str, sig []i64) {
 		}
 	} else if n == 1 {
 		buf_byte(b, ' ')
-		if sig[5] != 0 {
+		if sig.mutres != 0 {
 			buf_str(b, "mut ")
 		}
 		type_name(b, cast(Ty, rs[0]))
@@ -1647,7 +1645,7 @@ fn check_shape(pos i64, t Ty, sd Decl, bind_ []i64) {
 	for j < len(sd.union) {
 		let inst = shape_inst(sd.union[j])
 		if cast(i64, inst) != 0 {
-			check_shape(pos, t, cast(Decl, inst[0]), cast([]i64, inst[1]))
+			check_shape(pos, t, cast(Decl, inst.a), cast([]i64, inst.b))
 		}
 		j = j + 1
 	}
@@ -1665,10 +1663,10 @@ fn check_shape(pos i64, t Ty, sd Decl, bind_ []i64) {
 
 // shape_key is the (shape, type, bindings) triple a satisfaction tree is memoized on.
 fn shape_key(sd i64, t i64, bind_ i64) i64 {
-	mut k = []i64{}
-	k = append(k, sd)
-	k = append(k, t)
-	k = append(k, bind_)
+	let k = cast(Pair, calloc(3, 8))
+	k.a = sd
+	k.b = t
+	k.c = bind_
 	return cast(i64, k)
 }
 

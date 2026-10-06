@@ -7,8 +7,6 @@ const SYM_CONST = 2
 const SYM_FUNC = 3
 
 // Symbol layout.
-const S_REGION = 18
-const S_SCOPE_AT = 30 // how many scope blocks enclose its declaration (#232): task handles stay inside theirs
 
 const MAX_PARAMS = 8
 
@@ -258,7 +256,7 @@ fn resolve_type(tx i64) i64 {
 		return bounded_type(bounded_elem(cast(Node, tx)))
 	}
 	if k == TX_SLICE || k == TX_ARRAY {
-		let et = resolve_type(tx[TX_A + i64((k == TX_ARRAY))])
+		let et = resolve_type(slice_or_array_elem(tx))
 		if k == TX_ARRAY && kind_of(cast(Ty, et)) == K_DYN {
 			let e = err_code(cast(Node, tx).pos, "E203 NO_ZERO_VALUE")
 			buf_str(e, "an array of ")
@@ -330,7 +328,7 @@ fn resolve_type(tx i64) i64 {
 		if saw_dyn == 0 {
 			saw_dyn_pos = cast(Node, tx).pos
 		}
-		return dyn_of(inst[0], cast([]i64, inst[1]))
+		return dyn_of(inst.a, cast([]i64, inst.b))
 	}
 	if k == TX_SECRET {
 		return secret_type(tx)
@@ -374,21 +372,33 @@ fn bounded_type(tx i64) i64 {
 	return bounded_of(cast(i64, t), n)
 }
 
+// slice_or_array_elem is the element type expression of []T (its first operand) or [N]T (its second,
+// after the length).
+fn slice_or_array_elem(tx i64) i64 {
+	if cast(Node, tx).kind == TX_ARRAY {
+		return cast(TypeExpr, tx).b
+	}
+	return cast(TypeExpr, tx).a
+}
+
 // bounded_elem reads []T max n and map[K]V max n, whose max the parser gave the element, as
 // the bounded slice or map (design_syntax: Type "max" Expr); 0 when the element has none.
 // A slice of bounded values is written with a named element type ([]Name).
 fn bounded_elem(tx Node) i64 {
-	mut ei = TX_B
+	mut el = cast(TypeExpr, tx).b
 	if tx.kind == TX_SLICE {
-		ei = TX_A
+		el = cast(TypeExpr, tx).a
 	}
-	let el = cast(i64, tx)[ei]
 	if el == 0 || cast(Node, el).kind != TX_MAX {
 		return 0
 	}
 	let inner = node_new(tx.kind, tx.pos)
 	replace_node(inner, cast(i64, tx))
-	inner[ei] = cast(TypeExpr, el).a
+	if tx.kind == TX_SLICE {
+		cast(TypeExpr, inner).a = cast(TypeExpr, el).a
+	} else {
+		cast(TypeExpr, inner).b = cast(TypeExpr, el).a
+	}
 	let outer = cast(TypeExpr, node_new(TX_MAX, tx.pos))
 	outer.a = inner
 	outer.b = cast(TypeExpr, el).b
@@ -1724,8 +1734,8 @@ fn collect_local_decls(stmts []i64, names []str) {
 			if cast(i64, cases) != 0 {
 				mut ci = 0
 				for ci < len(cases) {
-					let c = cast([]i64, cases[ci])
-					let body = cast(Block, c[1])
+					let c = cast(Pair, cases[ci])
+					let body = cast(Block, c.b)
 					if cast(i64, body) != 0 {
 						collect_local_decls(body.stmts, names)
 					}
@@ -1814,8 +1824,8 @@ fn scan_idents_in_stmt(s i64, inner_params []str, outer_names []str, cells []str
 		if cast(i64, cases) != 0 {
 			mut ci = 0
 			for ci < len(cases) {
-				let c = cast([]i64, cases[ci])
-				let exprs = cast([]i64, c[0])
+				let c = cast(Pair, cases[ci])
+				let exprs = cast([]i64, c.a)
 				if cast(i64, exprs) != 0 {
 					mut j = 0
 					for j < len(exprs) {
@@ -1823,7 +1833,7 @@ fn scan_idents_in_stmt(s i64, inner_params []str, outer_names []str, cells []str
 						j = j + 1
 					}
 				}
-				let body = c[1]
+				let body = c.b
 				if body != 0 {
 					scan_idents_in_block(cast(Block, body), inner_params, outer_names, cells)
 				}
@@ -2036,8 +2046,8 @@ fn scan_funclits_in_stmt(s i64, outer_names []str, cells []str) {
 		if cast(i64, cases) != 0 {
 			mut ci = 0
 			for ci < len(cases) {
-				let c = cast([]i64, cases[ci])
-				let exprs = cast([]i64, c[0])
+				let c = cast(Pair, cases[ci])
+				let exprs = cast([]i64, c.a)
 				if cast(i64, exprs) != 0 {
 					mut j = 0
 					for j < len(exprs) {
@@ -2045,7 +2055,7 @@ fn scan_funclits_in_stmt(s i64, outer_names []str, cells []str) {
 						j = j + 1
 					}
 				}
-				let body = c[1]
+				let body = c.b
 				if body != 0 {
 					scan_funclits_in_block(cast(Block, body), outer_names, cells)
 				}
@@ -2595,7 +2605,7 @@ fn check_stmts(stmts []i64) {
 	}
 	i = len(narrowed) - 1
 	for i >= 0 {
-		narrow_end(cast([]Sym, cast([]i64, narrowed[i])))
+		narrow_end(cast(Pair, narrowed[i]))
 		i = i - 1
 	}
 }
@@ -2888,7 +2898,7 @@ fn check_stmt(s i64) {
 		}
 	} else if k == ST_IF {
 		if cast(IfStmt, s).init != 0 {
-			lower_with_init(cast(Node, s), IF_INIT)
+			lower_with_init(cast(IfStmt, s))
 			return
 		}
 		check_cond(cast(Node, cast(IfStmt, s).cond))
@@ -2897,7 +2907,7 @@ fn check_stmt(s i64) {
 		add_len_fact(cast(IfStmt, s).cond, cast(IfStmt, s).then)
 		check_scoped(cast(Block, cast(IfStmt, s).then))
 		slice_truncate(safe_pairs, saved)
-		narrow_end(cast([]Sym, narrowed))
+		narrow_end(narrowed)
 		let els = cast(Node, cast(IfStmt, s).else_)
 		if cast(i64, els) != 0 {
 			let narrowed2 = narrow_begin(cast(IfStmt, s).cond, 0)
@@ -2906,7 +2916,7 @@ fn check_stmt(s i64) {
 			} else {
 				check_stmt(cast(i64, els))
 			}
-			narrow_end(cast([]Sym, narrowed2))
+			narrow_end(narrowed2)
 		}
 	} else if k == ST_WHILE {
 		if cast(WhileStmt, s).init != 0 {
@@ -3526,9 +3536,9 @@ fn use_cell_of(f i64) i64 {
 	}
 	mut i = 0
 	for i < len(use_cells) {
-		let p = cast([]i64, cast([]i64, use_cells)[i])
-		if p[0] == f {
-			return p[1]
+		let p = cast(Pair, cast([]i64, use_cells)[i])
+		if p.a == f {
+			return p.b
 		}
 		i = i + 1
 	}
@@ -4013,7 +4023,7 @@ fn is_stmt_kind(k i64) i64 {
 // the scope itself may be reachable after the scope block. They are second-class values: they
 // live in local variables and parameters (and local slices, maps and optionals of them), never
 // in a global, a struct field, a result, a type argument or a dyn value. Every local remembers
-// how many scope blocks enclose its declaration (S_SCOPE_AT); a value is as deep as the deepest
+// how many scope blocks enclose its declaration (Sym.scope_at); a value is as deep as the deepest
 // such variable it reads, and may only be stored where it lives no longer: by an assignment,
 // through an argument for a mut parameter or a scope parameter (the callee may spawn children
 // that capture the other arguments), and by append and copy. A closure that may outlive the
@@ -4651,8 +4661,8 @@ fn defer_calls(pos i64, stmts []i64) {
 	}
 	mut j = len(ck_defers) - 1
 	for j >= 0 {
-		let d = cast([]i64, ck_defers[j])
-		let call = cast(Call, d[1])
+		let d = cast(Pair, ck_defers[j])
+		let call = cast(Call, d.b)
 		let c = cast(Call, node_new(EX_CALL, pos))
 		replace_node(cast(i64, c), cast(i64, call))
 		mut args = []i64{}
@@ -4666,7 +4676,7 @@ fn defer_calls(pos i64, stmts []i64) {
 			c.callee = sym_ref_node(pos, cast(Sym, cast(IdentExpr, cast(Call, call).callee).ref))
 		}
 		let ifs = cast(IfStmt, node_new(ST_IF, pos))
-		ifs.cond = sym_ref_node(pos, cast(Sym, d[0]))
+		ifs.cond = sym_ref_node(pos, cast(Sym, d.a))
 		ifs.then = empty_block(pos)
 		mut vs1 = cast(Block, ifs.then).stmts
 		vs1 = append(vs1, expr_stmt(cast(Node, c)))
@@ -4682,7 +4692,7 @@ fn finish_defers(f Fn) {
 	mut init = []i64{}
 	mut i = 0
 	for i < len(ck_defers) {
-		init = append(init, let_stmt(pos, cast(Sym, cast([]i64, ck_defers[i])[0]), mk_int(pos, 0, ty_bool)))
+		init = append(init, let_stmt(pos, cast(Sym, cast(Pair, ck_defers[i]).a), mk_int(pos, 0, ty_bool)))
 		i = i + 1
 	}
 	if ck_defer_mark != 0 {
@@ -4757,12 +4767,12 @@ fn slice_len_of(v []i64) i64 {
 }
 
 // lower_with_init turns `if init; c {}` / `for init; c; post {}` into { init; stmt }.
-fn lower_with_init(s Node, field i64) {
-	let init = cast(i64, s)[field]
-	let inner = node_new(s.kind, s.pos)
+fn lower_with_init(s IfStmt) {
+	let init = s.init
+	let inner = node_new(cast(Node, s).kind, cast(Node, s).pos)
 	replace_node(inner, cast(i64, s))
-	inner[field] = 0
-	let b = cast(Block, empty_block(s.pos))
+	cast(IfStmt, inner).init = 0
+	let b = cast(Block, empty_block(cast(Node, s).pos))
 	b.stmts = append(b.stmts, init)
 	b.stmts = append(b.stmts, inner)
 	replace_node(cast(i64, s), cast(i64, b))
@@ -5983,9 +5993,9 @@ fn lower_switch(s i64) {
 	let cases = cast(SwitchStmt, s).cases
 	mut i = 0
 	for i < len(cases) {
-		let c = cast([]i64, cases[i])
-		let exprs = cast([]i64, c[0])
-		let blk = c[1]
+		let c = cast(Pair, cases[i])
+		let exprs = cast([]i64, c.a)
+		let blk = c.b
 		if cast(i64, exprs) == 0 {
 			deflt = blk
 		} else {
@@ -6101,9 +6111,9 @@ fn lower_enum_switch(s i64, t Ty) {
 	let cases = cast(SwitchStmt, s).cases
 	mut i = 0
 	for i < len(cases) {
-		let c = cast([]i64, cases[i])
-		let exprs = cast([]i64, c[0])
-		let blk = c[1]
+		let c = cast(Pair, cases[i])
+		let exprs = cast([]i64, c.a)
+		let blk = c.b
 		if cast(i64, exprs) == 0 {
 			deflt = blk
 		} else {
@@ -6226,7 +6236,7 @@ fn lower_enum_switch(s i64, t Ty) {
 	mut all_return = i64(first != 0)
 	mut ci = 0
 	for ci < len(cases) {
-		if ends_in_return(cast(Block, cast([]i64, cases[ci])[1]).stmts) == 0 {
+		if ends_in_return(cast(Block, cast(Pair, cases[ci]).b).stmts) == 0 {
 			all_return = 0
 		}
 		ci = ci + 1
@@ -6501,7 +6511,7 @@ fn match_as_switch(s i64, m MatchExpr) i64 {
 	mut all_return = i64(deflt != 0 && cast(i64, seen) == 0)
 	i = 0
 	for i < len(cast([]i64, cases)) {
-		if ends_in_return(cast(Block, cast([]i64, cases[i])[1]).stmts) == 0 {
+		if ends_in_return(cast(Block, cast(Pair, cases[i]).b).stmts) == 0 {
 			all_return = 0
 		}
 		i = i + 1
@@ -6873,8 +6883,8 @@ fn mt_node(pos i64, path MtPath) i64 {
 	}
 	mut i = 0
 	for i < len(path.steps) {
-		let st = cast([]i64, path.steps[i])
-		n = cast(IdentExpr, mk_mem(pos, cast(i64, n), 0, 0, st[0], st[1]))
+		let st = cast(Pair, path.steps[i])
+		n = cast(IdentExpr, mk_mem(pos, cast(i64, n), 0, 0, st.a, st.b))
 		i = i + 1
 	}
 	return cast(i64, n)
@@ -7255,10 +7265,10 @@ fn lower_match(m i64, mode i64, rec []Sym) i64 {
 }
 
 fn pair(a i64, b i64) i64 {
-	mut v = []i64{}
-	v = append(v, a)
-	v = append(v, b)
-	return cast(i64, v)
+	let p = cast(Pair, calloc(3, 8))
+	p.a = a
+	p.b = b
+	return cast(i64, p)
 }
 
 fn len_alias_remember(sym Sym, init i64) {
@@ -7279,9 +7289,9 @@ fn len_alias_remember(sym Sym, init i64) {
 fn len_alias_source(sym i64) i64 {
 	mut i = len(len_aliases) - 1
 	for i >= 0 {
-		let p = cast([]i64, len_aliases[i])
-		if p[0] == sym {
-			return p[1]
+		let p = cast(Pair, len_aliases[i])
+		if p.a == sym {
+			return p.b
 		}
 		i = i - 1
 	}
@@ -7295,9 +7305,9 @@ fn len_alias_invalidate(sym i64) {
 	let n = len(len_aliases)
 	mut i = 0
 	for i < n {
-		let p = cast([]i64, len_aliases[i])
-		let alias = p[0]
-		if alias == sym || p[1] == sym {
+		let p = cast(Pair, len_aliases[i])
+		let alias = p.a
+		if alias == sym || p.b == sym {
 			len_aliases = append(len_aliases, pair(alias, 0))
 		}
 		i = i + 1
@@ -7514,7 +7524,7 @@ fn names_assigned(s i64, a str, b str) i64 {
 		let cs = cast(SwitchStmt, s).cases
 		mut i = 0
 		for i < len(cs) {
-			if names_assigned(cast([]i64, cs[i])[1], a, b) != 0 {
+			if names_assigned(cast(Pair, cs[i]).b, a, b) != 0 {
 				return 1
 			}
 			i = i + 1
@@ -7533,8 +7543,8 @@ fn mark_safe_index(e ElemExpr) {
 	}
 	mut j = 0
 	for j < len(safe_pairs) {
-		let p = cast([]i64, safe_pairs[j])
-		if p[0] == cast(IdentExpr, i).ref && p[1] == cast(IdentExpr, x).ref {
+		let p = cast(Pair, safe_pairs[j])
+		if p.a == cast(IdentExpr, i).ref && p.b == cast(IdentExpr, x).ref {
 			e.safe = 1
 			return
 		}
@@ -7544,14 +7554,14 @@ fn mark_safe_index(e ElemExpr) {
 
 // len_bound matches `i < len(x)` or `i < n` where n remembers len(x), and
 // returns [i sym, x sym, remembered length sym], or 0.
-fn len_bound(c i64) []i64 {
+fn len_bound(c i64) Pair {
 	if cast(Node, c).kind != EX_BINARY || cast(Binary, c).op != "<" {
-		return cast([]i64, 0)
+		return cast(Pair, 0)
 	}
 	let l = cast(Binary, c).l
 	let r = cast(Binary, c).r
 	if cast(Node, l).kind != EX_IDENT {
-		return cast([]i64, 0)
+		return cast(Pair, 0)
 	}
 	let is = cast(Sym, cast(IdentExpr, l).ref)
 	mut xs = cast(Sym, 0)
@@ -7565,10 +7575,10 @@ fn len_bound(c i64) []i64 {
 		}
 	}
 	if cast(i64, is) == 0 || cast(i64, xs) == 0 || is.kind != SYM_LOCAL || xs.kind != SYM_LOCAL {
-		return cast([]i64, 0)
+		return cast(Pair, 0)
 	}
-	let b = cast([]i64, pair(cast(i64, is), cast(i64, xs)))
-	b = append(b, length)
+	let b = cast(Pair, pair(cast(i64, is), cast(i64, xs)))
+	b.c = cast(i64, length)
 	return b
 }
 
@@ -7580,19 +7590,19 @@ fn add_len_fact(c i64, then i64) {
 	if cast(i64, b) == 0 && cast(Node, c).kind == EX_BINARY && cast(Binary, c).op == "&&" {
 		let lo = cast(Binary, c).l
 		b = len_bound(cast(Binary, c).r)
-		if cast(i64, b) != 0 && cast(Node, lo).kind == EX_BINARY && cast(Binary, lo).op == ">=" && cast(Node, cast(Binary, lo).l).kind == EX_IDENT && cast(IdentExpr, cast(Binary, lo).l).ref == b[0] && is_const_zero(cast(Binary, lo).r) != 0 {
+		if cast(i64, b) != 0 && cast(Node, lo).kind == EX_BINARY && cast(Binary, lo).op == ">=" && cast(Node, cast(Binary, lo).l).kind == EX_IDENT && cast(IdentExpr, cast(Binary, lo).l).ref == b.a && is_const_zero(cast(Binary, lo).r) != 0 {
 			nonneg = 1
 		}
 	}
 	if cast(i64, b) == 0 {
 		return
 	}
-	let is = cast(Sym, b[0])
+	let is = cast(Sym, b.a)
 	if is_unsigned_t(cast(Ty, is.type_)) != 0 {
 		nonneg = 1
 	}
-	let xs = cast(Sym, b[1])
-	let length = cast(Sym, b[2])
+	let xs = cast(Sym, b.b)
+	let length = cast(Sym, b.c)
 	mut stable = i64(names_assigned(then, is.name, xs.name) == 0 && stmt_may_change_slice(then, xs.name) == 0)
 	if cast(i64, length) != 0 && names_assigned(then, length.name, "") != 0 {
 		stable = 0
@@ -7623,9 +7633,9 @@ fn lower_for_init(s i64) {
 	check_cond(cast(Node, inner.cond))
 	let saved = len(safe_pairs)
 	let bound = len_bound(inner.cond)
-	if cast(i64, bound) != 0 && cast(Node, init).kind == ST_LET && cast(LetStmt, init).sym == bound[0] && cast(Node, cast(LetStmt, init).init).kind == EX_INT && cast(IntLit, cast(LetStmt, init).init).val >= 0 && is_increment(inner.post, cast(LetStmt, init).name) != 0 {
-		let xs = cast(Sym, bound[1])
-		let length = cast(Sym, bound[2])
+	if cast(i64, bound) != 0 && cast(Node, init).kind == ST_LET && cast(LetStmt, init).sym == bound.a && cast(Node, cast(LetStmt, init).init).kind == EX_INT && cast(IntLit, cast(LetStmt, init).init).val >= 0 && is_increment(inner.post, cast(LetStmt, init).name) != 0 {
+		let xs = cast(Sym, bound.b)
+		let length = cast(Sym, bound.c)
 		mut stable = i64(names_assigned(inner.body, cast(LetStmt, init).name, xs.name) == 0 && stmt_may_change_slice(inner.body, xs.name) == 0)
 		if cast(i64, length) != 0 {
 			if names_assigned(inner.body, length.name, xs.name) != 0 || names_assigned(inner.post, length.name, xs.name) != 0 || names_assigned(inner.post, xs.name, "") != 0 || stmt_may_change_slice(inner.post, xs.name) != 0 {
@@ -7633,7 +7643,7 @@ fn lower_for_init(s i64) {
 			}
 		}
 		if stable != 0 {
-			safe_pairs = append(safe_pairs, pair(bound[0], cast(i64, xs)))
+			safe_pairs = append(safe_pairs, pair(bound.a, cast(i64, xs)))
 		}
 	}
 	ck_loops = ck_loops + 1
@@ -7702,9 +7712,9 @@ fn is_increment(post i64, name str) i64 {
 // ---- optional narrowing ----
 // narrow_begin narrows x from ?T to T where the condition proves x != nil (sense 1:
 // the condition holds; sense 0: it failed). It returns what narrow_end restores.
-fn narrow_begin(c i64, sense i64) []i64 {
+fn narrow_begin(c i64, sense i64) Pair {
 	if cast(Node, c).kind != EX_BINARY {
-		return cast([]i64, 0)
+		return cast(Pair, 0)
 	}
 	let op = cast(Binary, c).op
 	// a != nil && b != nil holds, or a == nil || b == nil failed: both are narrowed.
@@ -7717,11 +7727,10 @@ fn narrow_begin(c i64, sense i64) []i64 {
 		if cast(i64, rb) == 0 {
 			return ra
 		}
-		mut both = []i64{}
-		both = append(both, 0)
-		both = append(both, cast(i64, ra))
-		both = append(both, cast(i64, rb))
-		return cast([]i64, both)
+		let both = cast(Pair, calloc(3, 8))
+		both.b = cast(i64, ra)
+		both.c = cast(i64, rb)
+		return both
 	}
 	mut x = cast(Binary, c).l
 	mut other = cast(Binary, c).r
@@ -7730,37 +7739,37 @@ fn narrow_begin(c i64, sense i64) []i64 {
 		other = cast(Binary, c).l
 	}
 	if cast(Node, x).kind != EX_IDENT || cast(IdentExpr, x).ref == 0 || cast(Node, other).kind != EX_INT || cast(IntLit, other).val != 0 {
-		return cast([]i64, 0)
+		return cast(Pair, 0)
 	}
 	let s = cast(Sym, cast(IdentExpr, x).ref)
 	if s.kind != SYM_LOCAL || kind_of(cast(Ty, s.type_)) != K_OPT {
-		return cast([]i64, 0)
+		return cast(Pair, 0)
 	}
 	let nonnil = i64((op == "!=" && sense != 0) || (op == "==" && sense == 0))
 	if nonnil == 0 {
-		return cast([]i64, 0)
+		return cast(Pair, 0)
 	}
-	let rec = pair(cast(i64, s), s.type_)
+	let rec = cast(Pair, pair(cast(i64, s), s.type_))
 	if opt_scalar(cast(Ty, s.type_)) != 0 {
 		// The variable keeps holding the box; the narrowed name reads the number inside it.
 		if s.captured != 0 || s.cell != 0 {
-			return cast([]i64, 0)
+			return cast(Pair, 0)
 		}
 		s.type_ = opt_scalar(cast(Ty, s.type_))
 		s.unbox = 1
-		return cast([]i64, rec)
+		return rec
 	}
 	s.type_ = cast(Ty, s.type_).elem
-	return cast([]i64, rec)
+	return rec
 }
 
-fn narrow_end(rec []Sym) {
-	if cast(i64, rec) != 0 && cast(i64, rec[0]) == 0 {
-		narrow_end(cast([]Sym, cast([]i64, rec[2])))
-		narrow_end(cast([]Sym, cast([]i64, rec[1])))
+fn narrow_end(rec Pair) {
+	if cast(i64, rec) != 0 && rec.a == 0 {
+		narrow_end(cast(Pair, rec.c))
+		narrow_end(cast(Pair, rec.b))
 	} else if cast(i64, rec) != 0 {
-		rec[0].type_ = cast(i64, rec[1])
-		rec[0].unbox = 0
+		cast(Sym, rec.a).type_ = rec.b
+		cast(Sym, rec.a).unbox = 0
 	}
 }
 

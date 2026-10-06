@@ -40,7 +40,7 @@ shared mut mm_base i64 // gen_mem_addr results
 shared mut mm_index i64
 shared mut mm_off i64
 shared mut trap_label i64 // the current function's bounds-failure stub, once used
-shared mut trap_sites []i64 // per failed-check site: [label, index reg (or -1), length reg, constant index]
+shared mut trap_sites []i64 // per failed-check site
 shared mut incoming_stack_loads []i64 // pairs: instruction index in cg, incoming argument byte offset
 
 fn emit4(op i64, a i64, b i64, c i64, d i64) {
@@ -650,8 +650,8 @@ fn gen_dyn_pair(e i64, obj i64, tab i64, d i64) {
 	}
 	if k == EX_CONV && cast(Conv, e).kind == CV_DYN {
 		gen_to(cast(Conv, e).x, obj, d)
-		let rec = cast([]i64, dyn_tables[cast(Conv, e).dyn_table])
-		let sym = sym_ref(SK_VAR, rec[4])
+		let rec = cast(DynTable, dyn_tables[cast(Conv, e).dyn_table])
+		let sym = sym_ref(SK_VAR, rec.slot)
 		emit2(I_ADRP, tab, sym)
 		emit3(I_ADDLO, tab, tab, sym)
 		return
@@ -1747,11 +1747,11 @@ fn get_trap() i64 {
 // trap_at is a cold stub for one bounds check that reports its index and length.
 fn trap_at(idx i64, len_ i64, cidx i64) i64 {
 	let l = new_label()
-	let site = []i64{}
-	site = append(site, l)
-	site = append(site, idx)
-	site = append(site, len_)
-	site = append(site, cidx)
+	let site = cast(TrapSite, calloc(4, 8))
+	site.label = l
+	site.index_reg = idx
+	site.len_reg = len_
+	site.const_index = cidx
 	trap_sites = append(trap_sites, cast(i64, site))
 	return l
 }
@@ -3874,10 +3874,10 @@ fn gen_raw_fn(f i64, words []i64) {
 fn gen_dyn_table_init() {
 	mut i = 0
 	for i < len(dyn_tables) {
-		let rec = cast([]i64, dyn_tables[i])
-		let keep_ = rec[2]
-		let methods = cast([]i64, rec[3])
-		let start = rec[4]
+		let rec = cast(DynTable, dyn_tables[i])
+		let keep_ = rec.keep_
+		let methods = rec.fns
+		let start = rec.slot
 		mut j = 0
 		for j <= len(methods) {
 			mut f = cast(Fn, keep_)
@@ -4262,14 +4262,14 @@ fn gen_fn(f Fn) {
 	mut ts = 0
 	let bf2 = find_fn("rt_bounds_fail2")
 	for ts < len(trap_sites) {
-		let site = cast([]i64, trap_sites[ts])
-		label(site[0])
-		mut ireg = site[1]
+		let site = cast(TrapSite, trap_sites[ts])
+		label(site.label)
+		mut ireg = site.index_reg
 		if ireg < 0 {
-			load_imm(X16, site[3])
+			load_imm(X16, site.const_index)
 			ireg = X16
 		}
-		emit3(I_STPPRE, ireg, site[2], -16)
+		emit3(I_STPPRE, ireg, site.len_reg, -16)
 		emit3(I_LDR, 0, SP, 0)
 		emit3(I_LDR, 1, SP, 8)
 		if cast(i64, bf2) != 0 {
@@ -4497,13 +4497,13 @@ fn dyn_layout() {
 	}
 	i = 0
 	for i < len(dyn_tables) {
-		let rec = cast([]i64, dyn_tables[i])
+		let rec = cast(DynTable, dyn_tables[i])
 		mut b = buf_new()
 		buf_str(b, "__dyn_table_")
 		buf_int(b, i)
-		rec[4] = len(prog_vars)
+		rec.slot = len(prog_vars)
 		append_dyn_slot(str(b))
-		let fs = cast([]i64, rec[3])
+		let fs = rec.fns
 		mut j = 0
 		for j < len(fs) {
 			b = buf_new()

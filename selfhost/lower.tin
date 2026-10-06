@@ -1,6 +1,6 @@
 // Expression checking and lowering. chk(e, want) types e and rewrites it in place into
 // core nodes; want is the type the context expects (it settles untyped constants and
-// elided composite types). A node is checked once: N_TYPE marks it done.
+// elided composite types). A node is checked once: Node.type_ marks it done.
 //
 // Strict rules for package code: operands must have identical types (constants adapt
 // and must fit), conditions are bool, references are never nil (?T may be), faults must
@@ -781,7 +781,7 @@ fn chk_binary(e i64, want i64) i64 {
 	if op == "&&" || op == "||" {
 		let a = chk(cast(Node, l), ty_bool)
 		// x != nil && x.f: the right side sees x narrowed.
-		mut narrowed = cast([]i64, 0)
+		mut narrowed = cast(Pair, 0)
 		if op == "&&" {
 			narrowed = narrow_begin(l, 1)
 		} else {
@@ -789,7 +789,7 @@ fn chk_binary(e i64, want i64) i64 {
 			narrowed = narrow_begin(l, 0)
 		}
 		let b = chk(cast(Node, r), ty_bool)
-		narrow_end(cast([]Sym, narrowed))
+		narrow_end(narrowed)
 		if is_bool_t(a) == 0 || is_bool_t(b) == 0 {
 			err_code_at(pos, "E236 OPERATOR", "operands of && and || must be bool")
 		}
@@ -1429,7 +1429,7 @@ fn map_read(pos i64, m Node, k i64, vt i64) i64 {
 }
 
 // mk_elem indexes a slice or string; the backend checks the index against the length
-// unless ELEM_SAFE is set (the checker proved it in range).
+// unless the index's safe flag is set (the checker proved it in range).
 fn mk_elem(pos i64, seq i64, index i64, t i64, isstr i64) ElemExpr {
 	let n = node_new(EX_ELEM, pos)
 	cast(ElemExpr, n).seq = seq
@@ -1774,8 +1774,8 @@ fn chk_composite(e i64, want i64) i64 {
 	if kind_of(t) == K_OPT {
 		t = cast(Ty, t.elem)
 	}
-	if cast(Node, tx).kind == EX_TYPE && tx[TYX] != 0 {
-		t = cast(Ty, resolve_type(tx[TYX]))
+	if cast(Node, tx).kind == EX_TYPE && cast(TypeNode, tx).ty != 0 {
+		t = cast(Ty, resolve_type(cast(TypeNode, tx).ty))
 	} else if cast(Node, tx).kind == EX_INDEX {
 		let gtx = expr_to_tx(tx)
 		if gtx != 0 {
@@ -2314,7 +2314,7 @@ fn chk_parallel(e i64) i64 {
 	mut args = []i64{}
 	i = 0
 	for i < len(cast([]i64, lits)) {
-		args = append(args, cast([]i64, lits[i])[0])
+		args = append(args, cast(Pair, lits[i]).a)
 		i = i + 1
 	}
 	cast(Call, c).args = cast([]i64, args)
@@ -2348,7 +2348,7 @@ fn parallel_wrapper(pos i64, lits []i64, vts []i64) i64 {
 	mut i = 0
 	for i < n {
 		f.params = append(f.params, "c")
-		f.ptypes = append(f.ptypes, cast([]i64, lits[i])[1])
+		f.ptypes = append(f.ptypes, cast(Pair, lits[i]).b)
 		f.rtypes = append(f.rtypes, vts[i])
 		i = i + 1
 	}
@@ -2363,7 +2363,7 @@ fn parallel_wrapper(pos i64, lits []i64, vts []i64) i64 {
 	i = 0
 	for i < n {
 		let cs = sym_new(SYM_LOCAL, "c", pos)
-		cs.type_ = cast([]i64, lits[i])[1]
+		cs.type_ = cast(Pair, lits[i]).b
 		cs.slot = i
 		mut vs5 = cast([]i64, f.locals)
 		vs5 = append(vs5, cast(i64, cs))
@@ -3325,7 +3325,7 @@ fn chk_call(e i64, want i64) i64 {
 		return ty_int
 	}
 	if cast(Node, callee).kind == EX_TYPE {
-		return chk_conversion(e, cast(Ty, resolve_type(callee[TYX])))
+		return chk_conversion(e, cast(Ty, resolve_type(cast(TypeNode, callee).ty)))
 	}
 	return indirect_call(e)
 }
@@ -3335,7 +3335,7 @@ fn chk_call(e i64, want i64) i64 {
 // object word and whose callee is the method descriptor loaded from the table.
 fn lower_dyn_method_call(e i64, receiver i64, dt Ty, name str) i64 {
 	let pos = cast(Node, e).pos
-	let info = cast([]i64, dyn_shape_method(dt, name))
+	let info = cast(Pair, dyn_shape_method(dt, name))
 	if cast(i64, info) == 0 {
 		let m = err_code(pos, "E214 METHOD")
 		buf_str(m, "dyn shape ")
@@ -3345,12 +3345,12 @@ fn lower_dyn_method_call(e i64, receiver i64, dt Ty, name str) i64 {
 		err_end(cast([]u8, m))
 		return ty_int
 	}
-	let sig = cast([]i64, info[1])
-	let names = sig[0]
-	let ps = cast([]i64, sig[1])
-	let ms = cast([]i64, sig[2])
-	let rs = cast([]i64, sig[3])
-	let variadic = sig[4]
+	let sig = cast(ShapeSig, info.b)
+	let names = sig.names
+	let ps = sig.types
+	let ms = sig.muts
+	let rs = sig.results
+	let variadic = sig.variadic
 	mut mutmask = 0
 	mut i = 0
 	for i < len(ms) && i < 63 {
@@ -3384,7 +3384,7 @@ fn lower_dyn_method_call(e i64, receiver i64, dt Ty, name str) i64 {
 	}
 	let ft = func_of_m(cast([]i64, desc_params), rs, variadic, desc_mask)
 	let desc = cast(Conv, mk_conv(pos, receiver_ref, CV_DYN_DESC, ft))
-	desc.dyn_index = info[0]
+	desc.dyn_index = info.a
 
 	let inner = node_new(EX_CALL, pos)
 	cast(Call, inner).name = name
@@ -3397,7 +3397,7 @@ fn lower_dyn_method_call(e i64, receiver i64, dt Ty, name str) i64 {
 	cast(Call, inner).callee = cast(i64, desc)
 	cast(Call, inner).method = 1
 	cast(Call, inner).dyn_shape = cast(i64, dt)
-	cast(Call, inner).dyn_index = info[0]
+	cast(Call, inner).dyn_index = info.a
 	cast(Node, inner).type_ = func_result(cast(Ty, ft))
 	mut stmts = []i64{}
 	stmts = append(stmts, cast(i64, receiver_temp))
@@ -3630,7 +3630,7 @@ fn chk_builtin(e i64, name str, want i64) i64 {
 			err_code_at(pos, "E217 BUILTIN_ARGS", "make needs a slice or map type: make([]T, n), make([]T, n, capacity) or make(map[K]V)")
 			return ty_int
 		}
-		let t = cast(Ty, resolve_type(arg0(cast(Call, e))[TYX]))
+		let t = cast(Ty, resolve_type(cast(TypeNode, arg0(cast(Call, e))).ty))
 		let k = kind_of(t)
 		if k == K_SLICE {
 			if n < 2 {
@@ -3678,7 +3678,7 @@ fn chk_builtin(e i64, name str, want i64) i64 {
 			err_code_at(pos, "E217 BUILTIN_ARGS", "new needs one struct type: new(T)")
 			return ty_int
 		}
-		let t = cast(Ty, resolve_type(arg0(cast(Call, e))[TYX]))
+		let t = cast(Ty, resolve_type(cast(TypeNode, arg0(cast(Call, e))).ty))
 		if kind_of(t) != K_STRUCT {
 			err_code_type(pos, "E217 BUILTIN_ARGS", "new needs a struct type, not ", cast(i64, t), "")
 			return cast(i64, t)
@@ -3686,7 +3686,7 @@ fn chk_builtin(e i64, name str, want i64) i64 {
 		// new(T) is T{}: fields that cannot be nil must still be set.
 		let lit = cast(Composite, node_new(EX_COMPOSITE, pos))
 		let tyx = node_new(EX_TYPE, pos)
-		tyx[TYX] = arg0(cast(Call, e))[TYX]
+		cast(TypeNode, tyx).ty = cast(TypeNode, arg0(cast(Call, e))).ty
 		lit.type_ = tyx
 		lit.elems = []i64{}
 		lit.keys = []i64{}
@@ -3702,7 +3702,7 @@ fn chk_builtin(e i64, name str, want i64) i64 {
 			err_code_at(pos, "E217 BUILTIN_ARGS", "cast needs a type and a value")
 			return ty_int
 		}
-		let t = cast(Ty, resolve_type(arg0(cast(Call, e))[TYX]))
+		let t = cast(Ty, resolve_type(cast(TypeNode, arg0(cast(Call, e))).ty))
 		let x = args[1]
 		let from = chk(cast(Node, x), 0)
 		if is_untyped(from) != 0 {

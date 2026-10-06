@@ -15,16 +15,15 @@ shared mut file_tokens []i64 // token vectors paired with file_sources
 shared mut cur_file i64
 
 // Function declaration layout.
-const F_INDEX = 22 // position in prog_fns (set by codegen)
-const F_SIZE = 44
 
 // Const, var and type declaration layout.
-const D_SIZE = 18
 
 shared mut p_shared i64
 
 // Every AST node starts with its kind and position; expressions carry their type.
-const N_TYPE = 6
+// The sizes of the records that are allocated zeroed (a nil slice field is 0, which new(T) would not leave).
+const F_SIZE = 44
+const D_SIZE = 18
 const N_SIZE = 12
 
 const EX_INT = 1
@@ -97,12 +96,7 @@ const TX_MAX = 63 // edition 1 bounded type wrapper
 const TX_TUPLE = 64 // edition 1 tuple type
 
 // Node fields by kind.
-const TYX = 2
 const ES_X = 2
-const IF_INIT = 5
-const TX_A = 2
-const TX_B = 3
-const ELEM_SAFE = 7 // index proven in range: no bounds check
 // Binary.ovf and Unary.ovf (#362): wrapping by default for compiler-made nodes, checked when the checker says so.
 const OVF_WRAP = -1 // written +%, -% or *%: arithmetic modulo 2^width
 const OVF_NONE = 0 // no run-time check (compiler-made, @wrap, or proven in range)
@@ -137,7 +131,6 @@ const SELECT_ARM_BLOCK = 4
 const CALL_METHOD = 9 // argument 0 is a method receiver (no call-site mut)
 // Regions of reference values, for the ember/ingot rules.
 const R_OWNED = 3 // a fresh keep() copy, only storable into ingot memory
-const F_MUTS = 23 // vec: 1 for each mut parameter
 
 shared mut p_toks []Token
 shared mut p_i i64
@@ -2248,14 +2241,13 @@ fn parse_switch() i64 {
 			p_next()
 			continue
 		}
-		let c = []i64{}
+		let c = cast(Pair, calloc(3, 8))
 		let cpos = p_peek().pos
 		if p_is("case") != 0 {
 			p_next()
-			c = append(c, cast(i64, parse_expr_list()))
+			c.a = cast(i64, parse_expr_list())
 		} else {
 			p_expect("default")
-			c = append(c, 0)
 		}
 		p_expect(":")
 		let body = cast(Block, empty_block(cpos))
@@ -2271,7 +2263,7 @@ fn parse_switch() i64 {
 				body.stmts = append(body.stmts, st)
 			}
 		}
-		c = append(c, cast(i64, body))
+		c.b = cast(i64, body)
 		cases = append(cases, cast(i64, c))
 	}
 	p_next()
@@ -2387,7 +2379,7 @@ fn parse_postfix() i64 {
 			p_nolit = 0
 			if p_is(")") == 0 && cast(Node, x).kind == EX_IDENT && type_operand(cast(IdentExpr, x).name) != 0 {
 				let tx = node_new(EX_TYPE, p_peek().pos)
-				tx[TYX] = parse_type()
+				cast(TypeNode, tx).ty = parse_type()
 				call.args = append(call.args, tx)
 				if p_is(",") != 0 {
 					p_next()
@@ -2443,7 +2435,7 @@ fn parse_postfix() i64 {
 				targs = []i64{}
 				for p_is("]") == 0 {
 					let tn = node_new(EX_TYPE, p_peek().pos)
-					tn[TYX] = parse_type()
+					cast(TypeNode, tn).ty = parse_type()
 					targs = append(targs, tn)
 					if p_is(",") == 0 {
 						break
@@ -2459,7 +2451,7 @@ fn parse_postfix() i64 {
 			} else {
 				if p_is("[") != 0 || p_is("map") != 0 || p_is("?") != 0 || p_is("func") != 0 || p_word("dyn") != 0 {
 					lo = node_new(EX_TYPE, p_peek().pos)
-					lo[TYX] = parse_type()
+					cast(TypeNode, lo).ty = parse_type()
 					targs = []i64{}
 					targs = append(targs, lo)
 				} else if p_is(":") == 0 {
@@ -2474,7 +2466,7 @@ fn parse_postfix() i64 {
 						p_next()
 						if p_is("[") != 0 || p_is("map") != 0 || p_is("?") != 0 || p_is("func") != 0 || p_word("dyn") != 0 || (p_edition1 != 0 && p_is("fn") != 0) {
 							let tn = node_new(EX_TYPE, p_peek().pos)
-							tn[TYX] = parse_type()
+							cast(TypeNode, tn).ty = parse_type()
 							targs = append(targs, tn)
 						} else {
 							targs = append(targs, parse_expr(1))
@@ -2589,7 +2581,7 @@ fn composite_requires_keys(tyexpr Node) i64 {
 	if tyexpr.kind != EX_TYPE {
 		return 1
 	}
-	let t = cast(Node, cast(i64, tyexpr)[TYX])
+	let t = cast(Node, cast(TypeNode, tyexpr).ty)
 	// A bare {...} element takes its type from the composite around it: unknown here.
 	return i64(cast(i64, t) != 0 && t.kind == TX_STRUCT)
 }
@@ -2883,7 +2875,7 @@ fn parse_primary() i64 {
 	}
 	if p_is("[") != 0 || p_is("map") != 0 || p_is("struct") != 0 {
 		let ty = node_new(EX_TYPE, pos)
-		ty[TYX] = parse_type()
+		cast(TypeNode, ty).ty = parse_type()
 		return ty
 	}
 	p_next()

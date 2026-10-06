@@ -12,7 +12,7 @@ const CAP_UNSAFE = 16
 
 shared mut file_cap_pkg []CapsRec // per loaded file: its vendored package record, or 0 (not restricted)
 shared mut cap_pkgs []CapsRec // the vendored package records, one per import path
-shared mut cap_edges []i64 // per function (by F_INDEX during the pass): vec of [callee, position]
+shared mut cap_edges []i64 // per function (by Fn.index during the pass): vec of [callee, position]
 shared mut cap_masks []i64 // per function: the capabilities it can reach
 shared mut cap_cur []i64 // the edge list being filled by cap_walk_*
 shared mut caps_report i64 // tinc -caps: print each package's capabilities instead of building
@@ -283,10 +283,7 @@ fn cap_edge(g i64, pos i64) {
 	if g == 0 {
 		return
 	}
-	let rec = []i64{}
-	rec = append(rec, g)
-	rec = append(rec, pos)
-	cap_cur = append(cap_cur, cast(i64, rec))
+	cap_cur = append(cap_cur, pair(g, pos))
 }
 
 fn cap_walk_stmts(v []i64) {
@@ -361,9 +358,9 @@ fn cap_walk_expr(e i64) {
 		cap_walk_expr(cast(IndexExpr, e).i)
 	} else if k == EX_CONV {
 		if cast(Conv, e).kind == CV_DYN && cast(Conv, e).dyn_table >= 0 && cast(Conv, e).dyn_table < len(dyn_tables) {
-			let rec = cast([]i64, dyn_tables[cast(Conv, e).dyn_table])
-			cap_edge(rec[2], cast(Node, e).pos)
-			let fns = cast([]i64, rec[3])
+			let rec = cast(DynTable, dyn_tables[cast(Conv, e).dyn_table])
+			cap_edge(rec.keep_, cast(Node, e).pos)
+			let fns = rec.fns
 			mut j = 0
 			for j < len(fns) {
 				cap_edge(fns[j], cast(Node, e).pos)
@@ -449,7 +446,7 @@ fn cap_graph() {
 				let es = cast([]i64, cap_edges[i])
 				mut j = 0
 				for j < len(es) {
-					m = m | cap_mask_of(cast([]i64, es[j])[0])
+					m = m | cap_mask_of(cast(Pair, es[j]).a)
 					j = j + 1
 				}
 				if m != cap_masks[i] {
@@ -498,7 +495,7 @@ fn cap_find(g i64, bit i64, path []i64) i64 {
 	let es = cast([]i64, cap_edges[cap_index(cast(Fn, g))])
 	mut j = 0
 	for j < len(es) {
-		let c = cast([]i64, es[j])[0]
+		let c = cast(Pair, es[j]).a
 		if c != g && (cap_mask_of(c) & bit) != 0 && slice_has(path, c) == 0 {
 			if len(path) >= 12 {
 				return 2
@@ -542,12 +539,12 @@ fn cap_violation(pos i64, p CapsRec, g Fn, need i64) {
 fn cap_check_edges(p CapsRec, es []i64) {
 	mut j = 0
 	for j < len(es) {
-		let rec = cast([]i64, es[j])
-		let g = rec[0]
+		let rec = cast(Pair, es[j])
+		let g = rec.a
 		let m = cap_mask_of(g)
 		let need = m - (m & p.caps)
 		if need != 0 && cast(i64, cap_pkg_of(cast(Fn, g))) != cast(i64, p) {
-			cap_violation(rec[1], p, cast(Fn, g), need)
+			cap_violation(rec.b, p, cast(Fn, g), need)
 		}
 		j = j + 1
 	}

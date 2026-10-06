@@ -2,10 +2,6 @@
 // static type decides which instructions and runtime calls the compiler uses on them.
 // Reference types (string, struct, slice, map, func, error, chan) are pointers, and 0 is
 // their nil.
-const TY_TARGS = 10 // generic instance: its type arguments
-const TY_GDECL = 11 // generic instance: its declaration
-const TY_SECRET = 13 // secret T: the plain T this twin qualifies (selfhost/secret.tin)
-const TY_MAX = 15 // bounded type: the largest length a value may have
 
 const K_INT = 1
 const K_BOOL = 2
@@ -52,7 +48,7 @@ shared mut saw_dyn_pos i64 // where the first dyn type was written, for the back
 shared mut ty_secrets []i64 // secret twins, one per plain type (secret_of)
 
 fn ty_new(kind i64, name str) i64 {
-	let t = cast(Ty, calloc(TY_MAX + 1, 8))
+	let t = cast(Ty, calloc(TY_WORDS, 8))
 	t.kind = kind
 	t.name = name
 	t.width = 8
@@ -231,8 +227,8 @@ fn opt_scalar(t Ty) i64 {
 	return box_scalar(cast(Ty, t.elem))
 }
 
-// dyn_of is the type of a dyn S value: the shape declaration in TY_GDECL and the
-// instance's bindings in TY_TARGS (0 for a non-generic shape). It is two words, and
+// dyn_of is the type of a dyn S value: the shape declaration in gdecl and the
+// instance's bindings in targs (0 for a non-generic shape). It is two words, and
 // saw_dyn makes the back ends refuse the program until size-16 values are generated
 // (notes/design_dyn.md, staging step 2).
 fn dyn_of(sd i64, bind_ []i64) i64 {
@@ -261,7 +257,7 @@ fn func_of_m(params []i64, results []i64, variadic i64, mask i64) i64 {
 	return interned(K_FUNC, 0, mask, params, results, variadic)
 }
 
-// mut_mask turns a function's F_MUTS flags into a func type's mut mask.
+// mut_mask turns a function's muts flags into a func type's mut mask.
 fn mut_mask(muts []i64) i64 {
 	mut m = 0
 	mut i = 0
@@ -670,18 +666,14 @@ fn bounded_of(t_in i64, max_ i64) i64 {
 	}
 	mut i = 0
 	for i < len(ty_bounds) {
-		let r = cast([]i64, ty_bounds)[i]
-		if cast(i64, cast(Ty, cast([]i64, r)[0])) == cast(i64, t) && cast([]i64, r)[1] == max_ {
-			return cast([]i64, r)[2]
+		let r = cast(Pair, cast([]i64, ty_bounds)[i])
+		if r.a == cast(i64, t) && r.b == max_ {
+			return r.c
 		}
 		i = i + 1
 	}
 	let b = cast(Ty, ty_new(t.kind, ""))
-	mut w = 0
-	for w < TY_SECRET {
-		cast(i64, b)[w] = cast(i64, t)[w]
-		w = w + 1
-	}
+	ty_copy(b, t)
 	b.bound = cast(i64, t)
 	b.max = max_
 	let nb = buf_new()
@@ -689,10 +681,10 @@ fn bounded_of(t_in i64, max_ i64) i64 {
 	buf_str(nb, " max ")
 	buf_int(nb, max_)
 	b.name = str(nb)
-	mut r = []i64{}
-	r = append(r, cast(i64, t))
-	r = append(r, max_)
-	r = append(r, cast(i64, b))
+	let r = cast(Pair, calloc(3, 8))
+	r.a = cast(i64, t)
+	r.b = max_
+	r.c = cast(i64, b)
 	mut vs1 = cast([]i64, ty_bounds)
 	vs1 = append(vs1, cast(i64, r))
 	return cast(i64, b)
@@ -716,4 +708,23 @@ fn bounded_assignable(from Ty, to Ty) i64 {
 		return assignable(cast(Ty, from.bound), cast(Ty, to.bound))
 	}
 	return 0
+}
+
+const TY_WORDS = 16 // the words of a Ty record, bounded types and secret twins included
+
+// ty_copy copies the words that describe a type (everything before secret_, bound and max) from src into dst.
+fn ty_copy(dst Ty, src Ty) {
+	dst.kind = src.kind
+	dst.elem = src.elem
+	dst.key = src.key
+	dst.fields = src.fields
+	dst.results = src.results
+	dst.name = src.name
+	dst.variadic = src.variadic
+	dst.width = src.width
+	dst.signed = src.signed
+	dst.size = src.size
+	dst.targs = src.targs
+	dst.gdecl = src.gdecl
+	dst.enum_ = src.enum_
 }
