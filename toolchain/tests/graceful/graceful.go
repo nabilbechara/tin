@@ -15,6 +15,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -55,6 +56,7 @@ func start(bin string, port int, grace string) *server {
 		c, err := net.DialTimeout("tcp", s.addr, 200*time.Millisecond)
 		if err == nil {
 			c.Close()
+			s.checkMask()
 			return s
 		}
 		time.Sleep(20 * time.Millisecond)
@@ -62,6 +64,31 @@ func start(bin string, port int, grace string) *server {
 	fmt.Println("server never became ready")
 	os.Exit(2)
 	return nil
+}
+
+// checkMask (Linux) reads the server's main thread's blocked signals the moment a connection
+// succeeds: SIGTERM and SIGINT must already be blocked there, or a signal sent now kills the
+// process with the default action instead of starting the shutdown (#512). This is the
+// deterministic form of the race: the mask is either set before the listener opens or not.
+func (s *server) checkMask() {
+	if runtime.GOOS != "linux" {
+		return
+	}
+	status, err := os.ReadFile("/proc/" + strconv.Itoa(s.cmd.Process.Pid) + "/status")
+	if err != nil {
+		check(false, "signal mask: cannot read the server's status: %v", err)
+		return
+	}
+	for _, line := range strings.Split(string(status), "\n") {
+		if !strings.HasPrefix(line, "SigBlk:") {
+			continue
+		}
+		mask, perr := strconv.ParseUint(strings.TrimSpace(strings.TrimPrefix(line, "SigBlk:")), 16, 64)
+		const term, intr = 1 << (syscall.SIGTERM - 1), 1 << (syscall.SIGINT - 1)
+		check(perr == nil && mask&term != 0 && mask&intr != 0, "signal mask: SIGTERM and SIGINT blocked when the listener accepts (SigBlk %s)", strings.TrimSpace(strings.TrimPrefix(line, "SigBlk:")))
+		return
+	}
+	check(false, "signal mask: no SigBlk line in the server's status")
 }
 
 // term sends SIGTERM and records the moment.

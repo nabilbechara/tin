@@ -317,7 +317,15 @@ fn serve_on(addr str, n i64) ! {
 	}
 	gIP = ip
 	gPort = port
+	// SIGTERM and SIGINT are blocked in every thread (cores inherit this mask) and taken by
+	// core 0's event loop instead: a handler could run on any thread and no Tin code may. The
+	// mask is set before the listener opens: a signal sent as soon as a connection succeeds
+	// must start the shutdown, not kill the process (#512).
+	rt_sig_block_term()
 	let fd = open_listener(ip, port)
+	if fd < 0 {
+		rt_sig_unblock_term()
+	}
 	if fd == -1 {
 		fail "anvil: socket failed"
 	}
@@ -380,9 +388,6 @@ fn serve_on(addr str, n i64) ! {
 	if genv != 0 && rt_decimal_integer(genv)&0xffffffff > 0 {
 		gGrace = rt_decimal_integer(genv) & 0xffffffff
 	}
-	// SIGTERM and SIGINT are blocked in every thread (cores inherit this mask) and taken by
-	// core 0's event loop instead: a handler could run on any thread and no Tin code may.
-	rt_sig_block_term()
 	monitor_start(n) // after the mask is set: the monitor thread inherits it (#341)
 	record_setup(n) // TIN_REPLAY_DIR: requests are recorded for replay (#241)
 	hearth.Run(n, core)
