@@ -284,11 +284,12 @@ fn Zstd(data str, level i64) str {
 	let lv = min(max(level, 0), 9)
 	mut m = zMatcher{head: make([]i64, 0), prev: make([]i64, 0), chain: chainOf[lv], nice: niceOf[lv]}
 	if lv > 0 {
-		m.head = make([]i64, 1 << zHashBits)
+		// Sized to the input (#440); the hash keeps its low bits below full size.
+		m.head = make([]i64, tableSize(n, zHashBits))
 		for i in 0..len(m.head) {
 			m.head[i] = -1
 		}
-		m.prev = make([]i64, zMatchWindow)
+		m.prev = make([]i64, tableSize(n, 20))
 	}
 	mut at = 0
 	for {
@@ -331,8 +332,8 @@ fn zInsert(s str, i i64, head mut []i64, prev mut []i64) {
 	if i+4 > len(s) {
 		return
 	}
-	let h = zHash(s, i)
-	prev[i & (zMatchWindow - 1)] = head[h]
+	let h = zHash(s, i) & (len(head) - 1)
+	prev[i&(len(prev)-1)] = head[h]
 	head[h] = i
 }
 
@@ -344,7 +345,7 @@ fn zFind(s str, i i64, end i64, head []i64, prev []i64, chain i64, nice i64) i64
 	let room = end - i
 	mut best = 0
 	mut bestOff = 0
-	mut cand = head[zHash(s, i)]
+	mut cand = head[zHash(s, i)&(len(head)-1)]
 	mut left = chain
 	for cand >= 0 && i-cand < zMatchWindow && left > 0 && best < room {
 		if s[cand+best] == s[i+best] {
@@ -360,7 +361,7 @@ fn zFind(s str, i i64, end i64, head []i64, prev []i64, chain i64, nice i64) i64
 				}
 			}
 		}
-		let p = prev[cand & (zMatchWindow - 1)]
+		let p = prev[cand&(len(prev)-1)]
 		if p >= cand {
 			break
 		}

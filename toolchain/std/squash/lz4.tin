@@ -68,7 +68,8 @@ const lz4HashBits = 14
 
 // lz4Block appends s[from:to] compressed as one LZ4 block. Matches may reach back to start.
 fn lz4Block(out mut []u8, s str, start i64, from i64, to i64) {
-	mut table = make([]i64, 1 << lz4HashBits)
+	// Sized to the block (#440); the hash keeps its low bits below full size.
+	mut table = make([]i64, tableSize(to-from, lz4HashBits))
 	for i in 0..len(table) {
 		table[i] = -1
 	}
@@ -78,7 +79,7 @@ fn lz4Block(out mut []u8, s str, start i64, from i64, to i64) {
 	mut i = from
 	for i < mflimit {
 		let key = i64(s[i]) | i64(s[i+1])<<8 | i64(s[i+2])<<16 | i64(s[i+3])<<24
-		let h = ((key *% 2654435761) >> (32 - lz4HashBits)) & ((1 << lz4HashBits) - 1)
+		let h = ((key *% 2654435761) >> (32 - lz4HashBits)) & (len(table) - 1)
 		let cand = table[h]
 		table[h] = i
 		if cand < start || i-cand > 65535 || s[cand] != s[i] || s[cand+1] != s[i+1] || s[cand+2] != s[i+2] || s[cand+3] != s[i+3] {
@@ -129,9 +130,10 @@ fn lz4Sequence(out mut []u8, s str, from i64, to i64, off i64, length i64) {
 	}
 }
 
-// lz4Decode appends the decompressed LZ4 block to out (whose earlier bytes are the history a
-// dependent block may copy from), producing at most max bytes in all.
-fn lz4Decode(out mut []u8, b str, max i64) ! {
+// lz4Decode appends the decompressed LZ4 block to out, producing at most max bytes in all.
+// Copies may reach back to out[floor:]: the block's own start for an independent block, the
+// frame's start for a linked one.
+fn lz4Decode(out mut []u8, b str, max i64, floor i64) ! {
 	mut at = 0
 	for at < len(b) {
 		let token = i64(b[at])
@@ -181,7 +183,7 @@ fn lz4Decode(out mut []u8, b str, max i64) ! {
 			}
 		}
 		ml += lz4MinMatch
-		if off == 0 || off > len(out) {
+		if off == 0 || off > len(out)-floor {
 			fail "squash: an lz4 offset is out of range"
 		}
 		if len(out)+ml > max {
@@ -260,6 +262,9 @@ fn Unlz4(data str, max i64) !str {
 				fail "squash: a skippable lz4 frame is cut short"
 			}
 			at += 8 + le32(data, at+4)
+			if at > len(data) {
+				fail "squash: a skippable lz4 frame is cut short"
+			}
 			frames += 1
 			continue
 		}
@@ -326,13 +331,12 @@ fn Unlz4(data str, max i64) !str {
 				out = append(out, blk...)
 				continue
 			}
+			// Straight into out, with no buffer per block (#440): an independent block's copies
+			// cannot reach before it, a linked block's not before its frame.
 			if independent {
-				// Copies cannot reach before the block: decode against an empty history.
-				mut part = make([]u8, 0, blockMax)
-				try lz4Decode(mut part, blk, max-len(out))
-				out = append(out, part...)
+				try lz4Decode(mut out, blk, max, len(out))
 			} else {
-				try lz4Decode(mut out, blk, max)
+				try lz4Decode(mut out, blk, max, frameStart)
 			}
 		}
 		if flg & 0x04 != 0 {
@@ -362,6 +366,6 @@ fn Lz4BlockOf(data str) str {
 // UnLz4Block decompresses one bare LZ4 block, producing at most max bytes.
 fn UnLz4Block(b str, max i64) !str {
 	mut out = make([]u8, 0, min(max, len(b)*3+64))
-	try lz4Decode(mut out, b, max)
+	try lz4Decode(mut out, b, max, 0)
 	return str(out)
 }

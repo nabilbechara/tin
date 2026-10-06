@@ -200,7 +200,7 @@ fn longest(s str, i i64, head []i64, prev []i64, chain i64, nice i64) i64 {
 	let room = min(maxMatch, n-i)
 	mut best = 0
 	mut bestD = 0
-	mut cand = head[hash3(s, i)]
+	mut cand = head[hash3(s, i)&(len(head)-1)]
 	mut left = chain
 	for cand >= 0 && i-cand <= windowSize && left > 0 && best < room {
 		if s[cand+best] == s[i+best] || best == 0 {
@@ -216,7 +216,7 @@ fn longest(s str, i i64, head []i64, prev []i64, chain i64, nice i64) i64 {
 				}
 			}
 		}
-		let p = prev[cand & (windowSize - 1)]
+		let p = prev[cand&(len(prev)-1)]
 		if p >= cand {
 			break
 		}
@@ -233,8 +233,8 @@ fn insert(s str, i i64, head mut []i64, prev mut []i64) {
 	if i+minMatch > len(s) {
 		return
 	}
-	let h = hash3(s, i)
-	prev[i & (windowSize - 1)] = head[h]
+	let h = hash3(s, i) & (len(head) - 1)
+	prev[i&(len(prev)-1)] = head[h]
 	head[h] = i
 }
 
@@ -485,6 +485,16 @@ fn Deflate(data str, level i64) str {
 
 const blockTokens = 16384
 
+// tableSize is the power of two at least n (and at least 256), at most 1 << maxBits: the size of
+// an encoder's table for an input of n bytes.
+fn tableSize(n i64, maxBits i64) i64 {
+	mut size = 256
+	for size < n && size < (1 << maxBits) {
+		size = size << 1
+	}
+	return min(size, 1 << maxBits)
+}
+
 fn deflateTo(w mut bitWriter, s str, level0 i64) {
 	let level = min(max(level0, 0), 9)
 	if level == 0 || len(s) == 0 {
@@ -494,12 +504,14 @@ fn deflateTo(w mut bitWriter, s str, level0 i64) {
 	let chain = chainOf[level]
 	let nice = niceOf[level]
 	let lazy = lazyOf[level]
-	mut head = make([]i64, 1 << hashBits)
+	// Tables sized to the input (#440): a short input does not pay for the whole window. Below
+	// full size the hash keeps its low bits, and prev covers every position there is.
+	mut head = make([]i64, tableSize(len(s), hashBits))
 	for i in 0..len(head) {
 		head[i] = -1
 	}
-	mut prev = make([]i64, windowSize)
-	mut tokens = make([]i64, 0, blockTokens)
+	mut prev = make([]i64, tableSize(len(s), 15))
+	mut tokens = make([]i64, 0, min(blockTokens, len(s)+1))
 	mut blockStart = 0
 	mut i = 0
 	let n = len(s)

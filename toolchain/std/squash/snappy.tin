@@ -16,7 +16,8 @@ fn Snappy(data str) str {
 		v = v >> 7
 	}
 	out = append(out, u8(v))
-	mut table = make([]i64, 1 << 14)
+	// Sized to the input (#440); the hash keeps its low bits below full size.
+	mut table = make([]i64, tableSize(n, 14))
 	mut frag = 0
 	for frag < n {
 		let end = min(frag+65536, n)
@@ -27,7 +28,7 @@ fn Snappy(data str) str {
 		mut i = frag
 		for i+4 <= end {
 			let key = i64(data[i]) | i64(data[i+1])<<8 | i64(data[i+2])<<16 | i64(data[i+3])<<24
-			let h = ((key * 0x1e35a7bd) >> 18) & ((1 << 14) - 1)
+			let h = ((key * 0x1e35a7bd) >> 18) & (len(table) - 1)
 			let cand = table[h]
 			table[h] = i
 			if cand < 0 || data[cand] != data[i] || data[cand+1] != data[i+1] || data[cand+2] != data[i+2] || data[cand+3] != data[i+3] {
@@ -107,7 +108,9 @@ fn Unsnappy(data str, max i64) !str {
 	if n > max {
 		fail fault.Wrap(fault.LimitExceeded, "squash: output over {max} bytes")
 	}
-	mut out = make([]u8, 0, n)
+	// A header can declare up to max with no data behind it: reserve no more than the data could
+	// make (a 3-byte copy gives 64 bytes, so about 22 per input byte), and grow past it if needed (#440).
+	mut out = make([]u8, 0, min(n, 22*len(data)))
 	for at < len(data) {
 		let tag = i64(data[at])
 		at += 1

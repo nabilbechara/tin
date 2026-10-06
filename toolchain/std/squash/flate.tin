@@ -70,42 +70,59 @@ type huff struct {
 	count []i64 // codes of each length, 0..15
 	sym   []i64 // symbols ordered by code
 	fast  []i64 // by the next fastBits bits (reversed): symbol<<4 | length, or 0
+	offs  []i64 // scratch for build
 }
 
 // newHuff builds the code for lengths (one per symbol, 0: unused). ok is false for an
 // over-subscribed set; an incomplete one is allowed (RFC 1951 permits one-code distance trees).
 fn newHuff(lengths []i64) (huff, bool) {
-	mut count = make([]i64, 16)
-	for _, l in lengths {
-		count[l] += 1
+	mut h = emptyHuff(len(lengths))
+	let ok = h.build(lengths)
+	return h, ok
+}
+
+// emptyHuff has room for a code of up to n symbols, for build to fill again and again: a
+// decoder builds its dynamic codes into the same tables for every block (#440).
+fn emptyHuff(n i64) huff {
+	return huff{count: make([]i64, 16), sym: make([]i64, n), fast: make([]i64, 1 << fastBits), offs: make([]i64, 16)}
+}
+
+// build makes h the code for lengths (at most len(h.sym) of them); false for an over-subscribed set.
+fn (h mut huff) build(lengths []i64) bool {
+	for l in 0..16 {
+		h.count[l] = 0
 	}
-	count[0] = 0
+	for _, l in lengths {
+		h.count[l] += 1
+	}
+	h.count[0] = 0
 	mut left = 1
 	for l in 1..16 {
-		left = left * 2 - count[l]
+		left = left * 2 - h.count[l]
 		if left < 0 {
-			return huff{count: count, sym: []i64{}, fast: []i64{}}, false
+			return false
 		}
 	}
-	mut offs = make([]i64, 16)
+	h.offs[1] = 0
 	for l in 1..15 {
-		offs[l+1] = offs[l] + count[l]
+		h.offs[l+1] = h.offs[l] + h.count[l]
 	}
-	mut sym = make([]i64, len(lengths))
 	for s, l in lengths {
 		if l != 0 {
-			sym[offs[l]] = s
-			offs[l] += 1
+			h.sym[h.offs[l]] = s
+			h.offs[l] += 1
 		}
 	}
 	// The table: walk the codes in canonical order, writing each short one at its reversed bits.
-	mut fast = make([]i64, 1 << fastBits)
+	for i in 0..len(h.fast) {
+		h.fast[i] = 0
+	}
 	mut code = 0
 	mut index = 0
 	for l in 1..fastBits+1 {
-		let c = count[l]
+		let c = h.count[l]
 		for i in 0..c {
-			let s = sym[index+i]
+			let s = h.sym[index+i]
 			let cd = code + i
 			// Reverse the l bits of cd.
 			mut rev = 0
@@ -114,14 +131,14 @@ fn newHuff(lengths []i64) (huff, bool) {
 			}
 			mut fill = rev
 			for fill < (1 << fastBits) {
-				fast[fill] = (s << 4) | l
+				h.fast[fill] = (s << 4) | l
 				fill += 1 << l
 			}
 		}
 		index += c
 		code = (code + c) << 1
 	}
-	return huff{count: count, sym: sym, fast: fast}, true
+	return true
 }
 
 // decode reads one symbol, or -1 for a code that is not in h.
@@ -172,14 +189,30 @@ let clOrder = []i64{16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1
 // Inflate decompresses raw DEFLATE data, producing at most max bytes.
 fn Inflate(data str, max i64) !str {
 	mut r = bitReader{s: data, pos: 0, acc: 0, n: 0, bad: false}
-	let out = try inflateFrom(mut r, max)
-	return out
+	mut out = make([]u8, 0, min(max, len(data)*4+64))
+	mut z = newInflater()
+	try inflateInto(mut r, mut out, max, mut z)
+	return str(out)
 }
 
-// inflateFrom decompresses the DEFLATE stream at r; r ends after the final block (byte-aligned
-// by the caller for a trailer).
-fn inflateFrom(r mut bitReader, max i64) !str {
-	mut out = make([]u8, 0, min(max, len(r.s)*4+64))
+// inflater holds the tables one call builds its dynamic blocks' codes into, so that blocks
+// cost no memory of their own (#440).
+type inflater struct {
+	cl   huff
+	lit  huff
+	dist huff
+	cls  []i64 // code-length code lengths
+	lens []i64 // literal/length and distance code lengths
+}
+
+fn newInflater() inflater {
+	return inflater{cl: emptyHuff(19), lit: emptyHuff(286), dist: emptyHuff(30), cls: make([]i64, 19), lens: make([]i64, 286+30)}
+}
+
+// inflateInto appends the DEFLATE stream at r to out, which may hold at most max bytes in all;
+// r ends after the final block (byte-aligned by the caller for a trailer).
+fn inflateInto(r mut bitReader, out mut []u8, max i64, z mut inflater) ! {
+	let start = len(out)
 	mut last = 0
 	for last == 0 {
 		last = r.bits(1)
@@ -214,66 +247,65 @@ fn inflateFrom(r mut bitReader, max i64) !str {
 		if kind == 3 {
 			fail "squash: a block of the reserved kind 3"
 		}
-		mut lit = huff{count: []i64{}, sym: []i64{}, fast: []i64{}}
-		mut dist = huff{count: []i64{}, sym: []i64{}, fast: []i64{}}
-		if kind == 1 {
-			lit = fixedLit
-			dist = fixedDist
-		} else {
+		mut lit = fixedLit
+		mut dist = fixedDist
+		if kind == 2 {
 			let hlit = r.bits(5) + 257
 			let hdist = r.bits(5) + 1
 			let hclen = r.bits(4) + 4
 			if r.bad || hlit > 286 || hdist > 30 {
 				fail "squash: a dynamic block's header is damaged"
 			}
-			mut cl = make([]i64, 19)
-			for i in 0..hclen {
-				cl[clOrder[i]] = r.bits(3)
+			for i in 0..19 {
+				z.cls[i] = 0
 			}
-			let (clh, clok) = newHuff(cl)
-			if !clok {
+			for i in 0..hclen {
+				z.cls[clOrder[i]] = r.bits(3)
+			}
+			if !z.cl.build(z.cls) {
 				fail "squash: a dynamic block's code-length code is damaged"
 			}
-			mut lens = make([]i64, 0, hlit+hdist)
-			for len(lens) < hlit+hdist {
-				let s = r.decode(clh)
+			let total = hlit + hdist
+			mut nl = 0
+			for nl < total {
+				let s = r.decode(z.cl)
 				if s < 0 {
 					fail "squash: a dynamic block's code lengths are damaged"
 				}
 				if s < 16 {
-					lens = append(lens, s)
+					z.lens[nl] = s
+					nl += 1
 					continue
 				}
 				mut rep = 0
 				mut v = 0
 				if s == 16 {
-					if len(lens) == 0 {
+					if nl == 0 {
 						fail "squash: a repeat with nothing to repeat"
 					}
-					v = lens[len(lens)-1]
+					v = z.lens[nl-1]
 					rep = 3 + r.bits(2)
 				} else if s == 17 {
 					rep = 3 + r.bits(3)
 				} else {
 					rep = 11 + r.bits(7)
 				}
-				if len(lens)+rep > hlit+hdist {
+				if nl+rep > total {
 					fail "squash: code lengths run past their count"
 				}
 				for i in 0..rep {
-					lens = append(lens, v)
+					z.lens[nl] = v
+					nl += 1
 				}
 			}
-			if lens[256] == 0 {
+			if z.lens[256] == 0 {
 				fail "squash: a dynamic block has no end-of-block code"
 			}
-			let (lh, lok) = newHuff(lens[:hlit])
-			let (dh, dok) = newHuff(lens[hlit:])
-			if !lok || !dok {
+			if !z.lit.build(z.lens[:hlit]) || !z.dist.build(z.lens[hlit:total]) {
 				fail "squash: a dynamic block's codes are damaged"
 			}
-			lit = lh
-			dist = dh
+			lit = z.lit
+			dist = z.dist
 		}
 		for {
 			let s = r.decode(lit)
@@ -303,7 +335,7 @@ fn inflateFrom(r mut bitReader, max i64) !str {
 			if r.bad {
 				fail "squash: deflate data ends early"
 			}
-			if d > len(out) {
+			if d > len(out)-start {
 				fail "squash: a distance before the start of the data"
 			}
 			if len(out)+length > max {
@@ -315,7 +347,6 @@ fn inflateFrom(r mut bitReader, max i64) !str {
 			}
 		}
 	}
-	return str(out)
 }
 
 let fixedLit = fixed_lit()

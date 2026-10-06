@@ -54,8 +54,14 @@ type fseTable struct {
 // fseSpread places each symbol's cells in the table the way the format requires (shared by the
 // encoder). Symbols of probability -1 take one cell each from the end.
 fn fseSpread(norm []i64, log i64) []i64 {
+	mut table = make([]i64, 1 << log)
+	fseSpreadInto(mut table, norm, log)
+	return table
+}
+
+// fseSpreadInto is fseSpread into table (at least 1 << log long).
+fn fseSpreadInto(table mut []i64, norm []i64, log i64) {
 	let size = 1 << log
-	mut table = make([]i64, size)
 	mut high = size - 1
 	for s, p in norm {
 		if p == -1 {
@@ -78,13 +84,26 @@ fn fseSpread(norm []i64, log i64) []i64 {
 			}
 		}
 	}
-	return table
 }
 
 fn fseBuild(norm []i64, log i64) fseTable {
-	let size = 1 << log
-	let spread = fseSpread(norm, log)
+	mut t = emptyFse(log)
 	mut next = make([]i64, len(norm))
+	t.build(norm, log, mut next)
+	return t
+}
+
+// emptyFse has room for a table of accuracy up to maxLog, for build to fill again and again: a
+// decoder builds every block's tables into the same ones (#440).
+fn emptyFse(maxLog i64) fseTable {
+	let size = 1 << maxLog
+	return fseTable{log: -1, sym: make([]i64, size), nbBits: make([]i64, size), base: make([]i64, size)}
+}
+
+// build makes t the table for norm at accuracy log; next has room for one entry per symbol.
+fn (t mut fseTable) build(norm []i64, log i64, next mut []i64) {
+	let size = 1 << log
+	fseSpreadInto(mut t.sym, norm, log)
 	for s, p in norm {
 		if p == -1 {
 			next[s] = 1
@@ -92,26 +111,35 @@ fn fseBuild(norm []i64, log i64) fseTable {
 			next[s] = p
 		}
 	}
-	mut nb = make([]i64, size)
-	mut base = make([]i64, size)
 	for u in 0..size {
-		let s = spread[u]
+		let s = t.sym[u]
 		let x = next[s]
 		next[s] += 1
 		let b = log - highbit(x)
-		nb[u] = b
-		base[u] = (x << b) - size
+		t.nbBits[u] = b
+		t.base[u] = (x << b) - size
 	}
-	return fseTable{log: log, sym: spread, nbBits: nb, base: base}
+	t.log = log
 }
 
-fn fseRle(sym i64) fseTable {
-	return fseTable{log: 0, sym: []i64{sym}, nbBits: []i64{0}, base: []i64{0}}
+// rle makes t the one-state table of sym.
+fn (t mut fseTable) rle(sym i64) {
+	t.log = 0
+	t.sym[0] = sym
+	t.nbBits[0] = 0
+	t.base[0] = 0
 }
+
+// The predefined tables, built once (they were built three times for every frame, #440).
+let llPredef = fseBuild(llDefault, 6)
+let ofPredef = fseBuild(ofDefault, 5)
+let mlPredef = fseBuild(mlDefault, 6)
+let noFse = fseTable{log: -1, sym: []i64{}, nbBits: []i64{}, base: []i64{}}
 
 // readNorm reads an FSE table description at s[at:] (RFC 8878 section 4.1.1): the normalized
 // probabilities, the accuracy log, and the bytes it took.
-fn readNorm(s str, at i64, maxSym i64, maxLog i64) !([]i64, i64, i64) {
+// The probabilities go into z.norm, which is reused.
+fn readNorm(s str, at i64, maxSym i64, maxLog i64, z mut zstdState) !(i64, i64) {
 	mut pos = at * 8 // bit position, little-endian bit order
 	let end = len(s) * 8
 	if pos+4 > end {
@@ -125,10 +153,10 @@ fn readNorm(s str, at i64, maxSym i64, maxLog i64) !([]i64, i64, i64) {
 	mut remaining = (1 << log) + 1
 	mut threshold = 1 << log
 	mut nbits = log + 1
-	mut norm = make([]i64, 0, maxSym+1)
+	z.norm = z.norm[:0]
 	mut prev0 = false
 	for remaining > 1 {
-		if len(norm) > maxSym {
+		if len(z.norm) > maxSym {
 			fail "squash: zstd FSE table has too many symbols"
 		}
 		if prev0 {
@@ -145,10 +173,10 @@ fn readNorm(s str, at i64, maxSym i64, maxLog i64) !([]i64, i64, i64) {
 				}
 			}
 			for k in 0..n0 {
-				norm = append(norm, 0)
+				z.norm = append(z.norm, 0)
 			}
 			prev0 = false
-			if len(norm) > maxSym {
+			if len(z.norm) > maxSym {
 				fail "squash: zstd FSE table has too many symbols"
 			}
 			continue
@@ -175,7 +203,7 @@ fn readNorm(s str, at i64, maxSym i64, maxLog i64) !([]i64, i64, i64) {
 		} else {
 			remaining -= count
 		}
-		norm = append(norm, count)
+		z.norm = append(z.norm, count)
 		prev0 = count == 0
 		for remaining < threshold && threshold > 1 {
 			nbits -= 1
@@ -185,7 +213,7 @@ fn readNorm(s str, at i64, maxSym i64, maxLog i64) !([]i64, i64, i64) {
 	if remaining != 1 || pos > end {
 		fail "squash: a zstd FSE table's probabilities do not add up"
 	}
-	return norm, log, (pos+7)/8 - at
+	return log, (pos+7)/8 - at
 }
 
 // getBits reads n bits (n <= 56) at bit position pos of s, little-endian; bits past the end are 0.
@@ -211,7 +239,8 @@ type backBits struct {
 	pos i64
 }
 
-fn newBackBits(s str) !backBits {
+// start makes b read s from its end mark. A decoder keeps one reader for all its streams (#440).
+fn (b mut backBits) start(s str) ! {
 	if len(s) == 0 {
 		fail "squash: an empty zstd bit stream"
 	}
@@ -219,7 +248,8 @@ fn newBackBits(s str) !backBits {
 	if last == 0 {
 		fail "squash: a zstd bit stream has no end mark"
 	}
-	return backBits{s: s, pos: (len(s)-1)*8 + highbit(last)}
+	b.s = s
+	b.pos = (len(s)-1)*8 + highbit(last)
 }
 
 // read takes n bits; bits before the start of the stream read as zero (pos goes negative).
@@ -258,13 +288,14 @@ type zHuff struct {
 	nb      []i64
 }
 
-// readHuffTree reads a Huffman tree description at s[at:]; it returns the table and its size.
-fn readHuffTree(s str, at i64) !(zHuff, i64) {
+// readHuffTree reads a Huffman tree description at s[at:] into z.huf, reusing its tables and
+// z's scratch; it returns the bytes it took.
+fn readHuffTree(s str, at i64, z mut zstdState) !i64 {
 	if at >= len(s) {
 		fail "squash: zstd data ends in a Huffman tree"
 	}
 	let hb = i64(s[at])
-	mut weights = make([]i64, 0, 256)
+	z.nw = 0
 	mut used = 0
 	if hb < 128 {
 		// Weights compressed with FSE (accuracy at most 6), two interleaved states.
@@ -272,29 +303,35 @@ fn readHuffTree(s str, at i64) !(zHuff, i64) {
 			fail "squash: zstd data ends in a Huffman tree"
 		}
 		let body = s[at+1 : at+1+hb]
-		let (norm, log, n) = try readNorm(body, 0, 255, 6)
-		let t = fseBuild(norm, log)
-		mut bb = try newBackBits(body[n:])
+		let (log, n) = try readNorm(body, 0, 255, 6, mut z)
+		z.wfse.build(z.norm, log, mut z.next)
+		let t = z.wfse
+		mut bb = z.bb
+		try bb.start(body[n:])
 		mut s1 = bb.read(log)
 		mut s2 = bb.read(log)
 		// As the reference decoder: each symbol reads its state's next bits; the stream ends when a
 		// read goes past its start, and the other state gives one last symbol.
 		for {
-			weights = append(weights, t.sym[s1])
+			z.addWeight(t.sym[s1])
 			s1 = t.base[s1] + bb.read(t.nbBits[s1])
 			if bb.pos < 0 {
-				weights = append(weights, t.sym[s2])
+				z.addWeight(t.sym[s2])
 				break
 			}
-			weights = append(weights, t.sym[s2])
+			z.addWeight(t.sym[s2])
 			s2 = t.base[s2] + bb.read(t.nbBits[s2])
 			if bb.pos < 0 {
-				weights = append(weights, t.sym[s1])
+				z.addWeight(t.sym[s1])
 				break
 			}
-			if len(weights) > 255 {
+			if z.nw > 255 {
 				fail "squash: a zstd Huffman tree has too many weights"
 			}
+		}
+		// The check in the loop runs after two weights, and a last one follows: 257 can get here.
+		if z.nw > 255 {
+			fail "squash: a zstd Huffman tree has too many weights"
 		}
 		used = 1 + hb
 	} else {
@@ -306,15 +343,16 @@ fn readHuffTree(s str, at i64) !(zHuff, i64) {
 		for i in 0..n {
 			let b = i64(s[at+1+i/2])
 			if i % 2 == 0 {
-				weights = append(weights, b >> 4)
+				z.addWeight(b >> 4)
 			} else {
-				weights = append(weights, b & 15)
+				z.addWeight(b & 15)
 			}
 		}
 	}
 	// The last weight is implied: it completes the total to a power of two.
 	mut total = 0
-	for _, w in weights {
+	for i in 0..z.nw {
+		let w = z.weights[i]
 		if w > 12 {
 			fail "squash: a zstd Huffman weight is above 12"
 		}
@@ -330,33 +368,38 @@ fn readHuffTree(s str, at i64) !(zHuff, i64) {
 	if rest & (rest - 1) != 0 {
 		fail "squash: a zstd Huffman tree is not complete"
 	}
-	weights = append(weights, highbit(rest)+1)
+	z.addWeight(highbit(rest) + 1)
 	if maxBits > 11 {
 		fail "squash: a zstd Huffman code is longer than 11 bits"
 	}
 	// Lowest weights (longest codes) first, symbols in order within a weight.
-	let size = 1 << maxBits
-	mut sym = make([]i64, size)
-	mut nb = make([]i64, size)
 	mut pos = 0
 	for w in 1..maxBits+1 {
-		for s2, ws in weights {
+		for s2 in 0..z.nw {
+			let ws = z.weights[s2]
 			if ws != w {
 				continue
 			}
 			let span = 1 << (w - 1)
 			for k in 0..span {
-				sym[pos+k] = s2
-				nb[pos+k] = maxBits + 1 - w
+				z.huf.sym[pos+k] = s2
+				z.huf.nb[pos+k] = maxBits + 1 - w
 			}
 			pos += span
 		}
 	}
-	return zHuff{maxBits: maxBits, sym: sym, nb: nb}, used
+	z.huf.maxBits = maxBits
+	return used
 }
 
-fn huffStream(h zHuff, s str, n i64, out mut []u8) ! {
-	mut bb = try newBackBits(s)
+// addWeight adds a Huffman weight; the tree reader stops at 256 of them, before any can pass the room.
+fn (z mut zstdState) addWeight(w i64) {
+	z.weights[z.nw] = w
+	z.nw += 1
+}
+
+fn huffStream(h zHuff, s str, n i64, out mut []u8, bb mut backBits) ! {
+	try bb.start(s)
 	for i in 0..n {
 		let v = bb.peek(h.maxBits)
 		out = append(out, u8(h.sym[v]))
@@ -369,19 +412,36 @@ fn huffStream(h zHuff, s str, n i64, out mut []u8) ! {
 
 // ---- the decoder ----
 
+// zstdState is one call's decoder: the tables in use and the room to build them, made once per
+// call and reused by every frame and block (#440).
 type zstdState struct {
-	huf    zHuff
-	hasHuf bool
-	ll     fseTable
-	of     fseTable
-	ml     fseTable
-	rep    []i64
+	huf     zHuff
+	hasHuf  bool
+	ll      fseTable // in use: a predefined table, one of the three below, or noFse
+	of      fseTable
+	ml      fseTable
+	llT     fseTable
+	ofT     fseTable
+	mlT     fseTable
+	wfse    fseTable // the Huffman weights' table
+	norm    []i64
+	next    []i64
+	weights []i64 // the Huffman weights: z.nw of them
+	nw      i64
+	lits    []u8
+	bb      backBits
+	rep     []i64
+}
+
+fn newZstdState() zstdState {
+	return zstdState{huf: zHuff{maxBits: 0, sym: make([]i64, 2048), nb: make([]i64, 2048)}, hasHuf: false, ll: noFse, of: noFse, ml: noFse, llT: emptyFse(9), ofT: emptyFse(8), mlT: emptyFse(9), wfse: emptyFse(6), norm: make([]i64, 0, 256), next: make([]i64, 256), weights: make([]i64, 260), nw: 0, lits: make([]u8, 0, 256), bb: backBits{s: "", pos: 0}, rep: make([]i64, 3)}
 }
 
 // Unzstd decompresses Zstandard data (any number of frames, and skippable frames), producing at
 // most max bytes.
 fn Unzstd(data str, max i64) !str {
 	mut out = make([]u8, 0, min(max, len(data)*4+64))
+	mut st = newZstdState()
 	mut at = 0
 	// No frames at all is no data, as Go's klauspost/compress writes and reads it.
 	for at < len(data) {
@@ -402,12 +462,12 @@ fn Unzstd(data str, max i64) !str {
 		if magic != zstdMagic {
 			fail "squash: not zstd data (magic number {magic:x})"
 		}
-		at = try zstdFrame(data, at+4, mut out, max)
+		at = try zstdFrame(data, at+4, mut out, max, mut st)
 	}
 	return str(out)
 }
 
-fn zstdFrame(s str, from i64, out mut []u8, max i64) !i64 {
+fn zstdFrame(s str, from i64, out mut []u8, max i64, st mut zstdState) !i64 {
 	mut at = from
 	if at >= len(s) {
 		fail "squash: a zstd frame header is cut short"
@@ -461,11 +521,19 @@ fn zstdFrame(s str, from i64, out mut []u8, max i64) !i64 {
 		}
 	}
 	at += fcsSize
-	if fcs > max-len(out) {
+	// An 8-byte size of 2^63 or more reads negative here: no output can be that large (#440).
+	if fcs > max-len(out) || (fcsSize == 8 && fcs < 0) {
 		fail fault.Wrap(fault.LimitExceeded, "squash: output over {max} bytes")
 	}
 	let start = len(out)
-	mut st = zstdState{huf: zHuff{maxBits: 0, sym: []i64{}, nb: []i64{}}, hasHuf: false, ll: fseBuild(llDefault, 6), of: fseBuild(ofDefault, 5), ml: fseBuild(mlDefault, 6), rep: []i64{1, 4, 8}}
+	// A frame starts with no tables: the first block's repeat mode has nothing to repeat.
+	st.hasHuf = false
+	st.ll = noFse
+	st.of = noFse
+	st.ml = noFse
+	st.rep[0] = 1
+	st.rep[1] = 4
+	st.rep[2] = 8
 	for {
 		if at+3 > len(s) {
 			fail "squash: zstd data ends in a block header"
@@ -503,7 +571,11 @@ fn zstdFrame(s str, from i64, out mut []u8, max i64) !i64 {
 				}
 				out = append(out, s[at:at+size]...)
 			} else {
+				let before = len(out)
 				try zstdBlock(s[at:at+size], mut st, mut out, start, max)
+				if len(out)-before > zstdBlockMax {
+					fail "squash: a zstd block decompresses to more than 128 KiB"
+				}
 			}
 			at += size
 		}
@@ -536,7 +608,7 @@ fn zstdBlock(b str, st mut zstdState, out mut []u8, frameStart i64, max i64) ! {
 	let ltype = b0 & 3
 	let sf = (b0 >> 2) & 3
 	mut at = 0
-	mut lits = make([]u8, 0, 256)
+	st.lits = st.lits[:0]
 	if ltype <= 1 {
 		mut size = 0
 		if sf == 0 || sf == 2 {
@@ -559,14 +631,14 @@ fn zstdBlock(b str, st mut zstdState, out mut []u8, frameStart i64, max i64) ! {
 			if at+size > len(b) {
 				fail "squash: zstd raw literals run past their block"
 			}
-			lits = append(lits, b[at:at+size]...)
+			st.lits = append(st.lits, b[at:at+size]...)
 			at += size
 		} else {
 			if at >= len(b) {
 				fail "squash: zstd data ends in RLE literals"
 			}
 			for k in 0..size {
-				lits = append(lits, b[at])
+				st.lits = append(st.lits, b[at])
 			}
 			at += 1
 		}
@@ -609,16 +681,14 @@ fn zstdBlock(b str, st mut zstdState, out mut []u8, frameStart i64, max i64) ! {
 		at += comp
 		mut used = 0
 		if ltype == 2 {
-			let (h, n) = try readHuffTree(lb, 0)
-			st.huf = h
+			used = try readHuffTree(lb, 0, mut st)
 			st.hasHuf = true
-			used = n
 		} else if !st.hasHuf {
 			fail "squash: zstd treeless literals with no earlier Huffman tree"
 		}
 		let body = lb[used:]
 		if streams == 1 {
-			try huffStream(st.huf, body, regen, mut lits)
+			try huffStream(st.huf, body, regen, mut st.lits, mut st.bb)
 		} else {
 			if len(body) < 6 {
 				fail "squash: zstd data ends in a jump table"
@@ -634,10 +704,10 @@ fn zstdBlock(b str, st mut zstdState, out mut []u8, frameStart i64, max i64) ! {
 			if seg*3 > regen {
 				fail "squash: zstd literals are too few for four streams"
 			}
-			try huffStream(st.huf, body[6:6+s1], seg, mut lits)
-			try huffStream(st.huf, body[6+s1:6+s1+s2], seg, mut lits)
-			try huffStream(st.huf, body[6+s1+s2:total], seg, mut lits)
-			try huffStream(st.huf, body[total:], regen-3*seg, mut lits)
+			try huffStream(st.huf, body[6:6+s1], seg, mut st.lits, mut st.bb)
+			try huffStream(st.huf, body[6+s1:6+s1+s2], seg, mut st.lits, mut st.bb)
+			try huffStream(st.huf, body[6+s1+s2:total], seg, mut st.lits, mut st.bb)
+			try huffStream(st.huf, body[total:], regen-3*seg, mut st.lits, mut st.bb)
 		}
 	}
 	// Sequences.
@@ -662,10 +732,10 @@ fn zstdBlock(b str, st mut zstdState, out mut []u8, frameStart i64, max i64) ! {
 		}
 	}
 	if nseq == 0 {
-		if len(out)+len(lits) > max {
+		if len(out)+len(st.lits) > max {
 			fail fault.Wrap(fault.LimitExceeded, "squash: output over {max} bytes")
 		}
-		out = append(out, lits...)
+		out = append(out, st.lits...)
 		return
 	}
 	if at >= len(b) {
@@ -676,14 +746,11 @@ fn zstdBlock(b str, st mut zstdState, out mut []u8, frameStart i64, max i64) ! {
 	if modes & 3 != 0 {
 		fail "squash: zstd compression modes have reserved bits set"
 	}
-	let (ll, a1) = try fseMode(b, at, (modes >> 6) & 3, st.ll, llDefault, 6, 35, 9)
-	let (of, a2) = try fseMode(b, a1, (modes >> 4) & 3, st.of, ofDefault, 5, 31, 8)
-	let (mlt, a3) = try fseMode(b, a2, (modes >> 2) & 3, st.ml, mlDefault, 6, 52, 9)
-	st.ll = ll
-	st.of = of
-	st.ml = mlt
-	at = a3
-	mut bb = try newBackBits(b[at:])
+	let a1 = try fseMode(b, at, (modes >> 6) & 3, 0, mut st)
+	let a2 = try fseMode(b, a1, (modes >> 4) & 3, 1, mut st)
+	at = try fseMode(b, a2, (modes >> 2) & 3, 2, mut st)
+	mut bb = st.bb
+	try bb.start(b[at:])
 	mut sll = bb.read(st.ll.log)
 	mut sof = bb.read(st.of.log)
 	mut sml = bb.read(st.ml.log)
@@ -729,13 +796,13 @@ fn zstdBlock(b str, st mut zstdState, out mut []u8, frameStart i64, max i64) ! {
 			sml = st.ml.base[sml] + bb.read(st.ml.nbBits[sml])
 			sof = st.of.base[sof] + bb.read(st.of.nbBits[sof])
 		}
-		if lp+ll > len(lits) {
+		if lp+ll > len(st.lits) {
 			fail "squash: a zstd sequence takes more literals than there are"
 		}
 		if len(out)+ll+ml > max {
 			fail fault.Wrap(fault.LimitExceeded, "squash: output over {max} bytes")
 		}
-		out = append(out, lits[lp:lp+ll]...)
+		out = append(out, st.lits[lp:lp+ll]...)
 		lp += ll
 		if off <= 0 || off > len(out)-frameStart {
 			fail "squash: a zstd offset is out of range"
@@ -748,19 +815,38 @@ fn zstdBlock(b str, st mut zstdState, out mut []u8, frameStart i64, max i64) ! {
 	if bb.pos != 0 {
 		fail "squash: a zstd sequence stream does not end where it should"
 	}
-	if len(out)+len(lits)-lp > max {
+	if len(out)+len(st.lits)-lp > max {
 		fail fault.Wrap(fault.LimitExceeded, "squash: output over {max} bytes")
 	}
-	out = append(out, lits[lp:]...)
+	out = append(out, st.lits[lp:]...)
 }
 
-// fseMode reads one table's compression mode (predefined, RLE, FSE-described or repeated) at
-// b[at:]; it returns the table and where the next field starts.
-fn fseMode(b str, at i64, mode i64, prev fseTable, def []i64, defLog i64, maxSym i64, maxLog i64) !(fseTable, i64) {
-	if mode == 0 {
-		return fseBuild(def, defLog), at
+// fseMode reads the compression mode (predefined, RLE, FSE-described or repeated) of table which
+// (0 literal lengths, 1 offsets, 2 match lengths) at b[at:] and makes it st's table in use,
+// built into st's own; it returns where the next field starts.
+fn fseMode(b str, at i64, mode i64, which i64, st mut zstdState) !i64 {
+	mut maxSym = 35
+	mut maxLog = 9
+	mut t = st.llT
+	mut prev = st.ll
+	mut predef = llPredef
+	if which == 1 {
+		maxSym = 31
+		maxLog = 8
+		t = st.ofT
+		prev = st.of
+		predef = ofPredef
+	} else if which == 2 {
+		maxSym = 52
+		t = st.mlT
+		prev = st.ml
+		predef = mlPredef
 	}
-	if mode == 1 {
+	mut use = prev
+	mut next = at
+	if mode == 0 {
+		use = predef
+	} else if mode == 1 {
 		if at >= len(b) {
 			fail "squash: zstd data ends in an RLE table"
 		}
@@ -768,14 +854,23 @@ fn fseMode(b str, at i64, mode i64, prev fseTable, def []i64, defLog i64, maxSym
 		if sym > maxSym {
 			fail "squash: a zstd RLE symbol is out of range"
 		}
-		return fseRle(sym), at + 1
-	}
-	if mode == 2 {
-		let (norm, log, n) = try readNorm(b, at, maxSym, maxLog)
-		return fseBuild(norm, log), at + n
-	}
-	if len(prev.sym) == 0 {
+		t.rle(sym)
+		use = t
+		next = at + 1
+	} else if mode == 2 {
+		let (log, n) = try readNorm(b, at, maxSym, maxLog, mut st)
+		t.build(st.norm, log, mut st.next)
+		use = t
+		next = at + n
+	} else if prev.log < 0 {
 		fail "squash: a zstd table repeats one there is none of"
 	}
-	return prev, at
+	if which == 0 {
+		st.ll = use
+	} else if which == 1 {
+		st.of = use
+	} else {
+		st.ml = use
+	}
+	return next
 }
