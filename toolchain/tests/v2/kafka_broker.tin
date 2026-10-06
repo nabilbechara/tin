@@ -7,6 +7,7 @@ import "mint"
 import "quarry"
 import "relay"
 import "say"
+import "seal"
 import "stamp"
 import "wire"
 
@@ -16,7 +17,7 @@ import "wire"
 // and then: a leader that has moved (broker 2), an acknowledgement lost after the write (broker
 // 3: the idempotent retry must not duplicate the batch), a broker too old for a request (broker
 // 4), a member id the coordinator makes the member come back with, a rebalance, a wrong
-// password. The same client is checked against real brokers in toolchain/tests/kafka/.
+// password, SCRAM-SHA-256 (and an iteration count too low to accept). The same client is checked against real brokers in toolchain/tests/kafka/.
 
 // ---- encoding ----
 
@@ -176,6 +177,7 @@ type broker struct {
 	txFirst    i64 // first offset of the open transaction in tx/0, -1 for none
 	txPid      i64
 	authed     bool
+	scram      str // a SCRAM exchange in progress: client-first-bare,server-first
 }
 
 fn (b mut broker) logIndex(topic str, part i64) i64 {
@@ -260,12 +262,13 @@ fn serve(id i64) ! {
 		}
 	}
 	ports = append(ports, cur)
-	mut b = broker{id: id, ports: ports, logs: []partLog{}, seqs: []i64{}, produces: 0, groupGen: 0, beats: 0, member: "", assignment: "", commits: []str{}, commitOffs: []i64{}, nextPid: 1000 + 100*id, txFirst: -1, txPid: -1, authed: false}
+	mut b = broker{id: id, ports: ports, logs: []partLog{}, seqs: []i64{}, produces: 0, groupGen: 0, beats: 0, member: "", assignment: "", commits: []str{}, commitOffs: []i64{}, nextPid: 1000 + 100*id, txFirst: -1, txPid: -1, authed: false, scram: ""}
 	// The client keeps two connections to a broker (one for requests a broker may hold), so a
 	// broker serves several: it polls each with a short timeout and takes new ones in between.
 	mut conns = []wire.Conn{}
 	mut pending = []str{}
 	mut authed = []bool{}
+	mut scrams = []str{}
 	for {
 		let (nc, aerr) = ln.AcceptTimeout(1ms)
 		if aerr == nil {
@@ -274,6 +277,7 @@ fn serve(id i64) ! {
 			conns = append(conns, c2)
 			pending = append(pending, "")
 			authed = append(authed, false)
+			scrams = append(scrams, "")
 		}
 		mut live = make([]bool, len(conns))
 		for i in 0..len(conns) {
@@ -293,8 +297,10 @@ fn serve(id i64) ! {
 				let frame = pending[i][4 : 4+n]
 				pending[i] = pending[i][4+n:]
 				b.authed = authed[i]
+				b.scram = scrams[i]
 				let (resp, keepOpen) = handle(mut b, frame)
 				authed[i] = b.authed
+				scrams[i] = b.scram
 				if len(resp) > 0 {
 					mut out = make([]u8, 0, len(resp)+4)
 					p32(mut out, len(resp))
@@ -314,11 +320,13 @@ fn serve(id i64) ! {
 		mut keepC = []wire.Conn{}
 		mut keepP = []str{}
 		mut keepA = []bool{}
+		mut keepS = []str{}
 		for i in 0..len(conns) {
 			if live[i] {
 				keepC = append(keepC, conns[i])
 				keepP = append(keepP, pending[i])
 				keepA = append(keepA, authed[i])
+				keepS = append(keepS, scrams[i])
 			} else {
 				mut dead = conns[i]
 				dead.Close()
@@ -327,6 +335,7 @@ fn serve(id i64) ! {
 		conns = keepC
 		pending = keepP
 		authed = keepA
+		scrams = keepS
 	}
 }
 
@@ -359,17 +368,21 @@ fn handle(b mut broker, frame str) (str, bool) {
 	}
 	if api == 17 {
 		let mech = r.str()
-		if mech == "PLAIN" {
+		if mech == "PLAIN" || mech == "SCRAM-SHA-256" {
 			p16(mut out, 0)
 		} else {
 			p16(mut out, 33)
 		}
-		p32(mut out, 1)
+		p32(mut out, 2)
 		pstr(mut out, "PLAIN")
+		pstr(mut out, "SCRAM-SHA-256")
 		return str(out), true
 	}
 	if api == 36 {
 		let tok = r.bytes()
+		if b.scram != "" || (len(tok) > 3 && tok[:3] == "n,,") {
+			return scram(mut b, tok, out)
+		}
 		if tok == "\x00tin\x00secret" {
 			b.authed = true
 			p16(mut out, 0)
@@ -451,6 +464,79 @@ fn handle(b mut broker, frame str) (str, bool) {
 	p32(mut out, 0)
 	p16(mut out, 35)
 	return str(out), true
+}
+
+// scram answers one SaslAuthenticate step of SCRAM-SHA-256 (RFC 5802) for the user "tin" with
+// the password "secret", as Kafka's ScramSaslServer does. The user "weak" is offered 4095
+// iterations, one fewer than RFC 7677 asks for, which the client must refuse.
+fn scram(b mut broker, tok str, head []u8) (str, bool) {
+	mut out = make([]u8, 0, 256)
+	out = append(out, head...)
+	let salt = "fake-broker-salt"
+	if b.scram == "" {
+		let bare = tok[3:]
+		let user = attr(bare, 'n')
+		mut it = 4096
+		if user == "weak" {
+			it = 4095
+		}
+		mut sb = []u8{}
+		sb = append(sb, salt...)
+		let first = "r={attr(bare, 'r')}fake,s={seal.B64(sb)},i={it}"
+		b.scram = "{bare},{first}"
+		p16(mut out, 0)
+		pnull(mut out)
+		pbytes(mut out, first)
+		p64(mut out, 0)
+		return str(out), true
+	}
+	let prefix = b.scram
+	b.scram = ""
+	// The client-final message without its proof.
+	mut at = len(tok)
+	for i in 0..len(tok)-2 {
+		if tok[i] == ',' && tok[i+1] == 'p' && tok[i+2] == '=' {
+			at = i
+		}
+	}
+	let message = "{prefix},{tok[:at]}"
+	let salted = seal.Pbkdf2Sha256("secret", salt, 4096, 32) catch _ { []u8{} }
+	let clientKey = seal.Hmac(seal.Hash.SHA256, str(salted), "Client Key")
+	let sig = seal.Hmac(seal.Hash.SHA256, str(seal.Sum(seal.Hash.SHA256, str(clientKey))), message)
+	mut proof = make([]u8, len(clientKey))
+	for i in 0..len(clientKey) {
+		proof[i] = clientKey[i] ^ sig[i]
+	}
+	if attr(prefix, 'n') != "tin" || attr(tok, 'p') != seal.B64(proof) {
+		p16(mut out, 58)
+		pstr(mut out, "Authentication failed during authentication due to invalid credentials with SASL mechanism SCRAM-SHA-256")
+		pbytes(mut out, "")
+		p64(mut out, 0)
+		return str(out), false
+	}
+	b.authed = true
+	let serverSig = seal.Hmac(seal.Hash.SHA256, str(seal.Hmac(seal.Hash.SHA256, str(salted), "Server Key")), message)
+	p16(mut out, 0)
+	pnull(mut out)
+	pbytes(mut out, "v={seal.B64(serverSig)}")
+	p64(mut out, 0)
+	return str(out), true
+}
+
+// attr is the value of attribute a in a SCRAM message ("" when absent).
+fn attr(msg str, a u8) str {
+	mut at = 0
+	for at < len(msg) {
+		mut end = at
+		for end < len(msg) && msg[end] != ',' {
+			end += 1
+		}
+		if end-at >= 2 && msg[at] == a && msg[at+1] == '=' {
+			return msg[at+2 : end]
+		}
+		at = end + 1
+	}
+	return ""
 }
 
 fn metadata(b mut broker, r mut rd, head []u8) str {
@@ -922,6 +1008,16 @@ fn run(ports str) ! {
 	check("a wrong password is ErrAuth", werr != nil && fault.Is(werr, kafka.ErrAuth))
 	wrong.Close()
 
+	// SCRAM-SHA-256: an iteration count under 4096 (RFC 7677) is refused before a proof is sent,
+	// and 4096 is accepted, with the broker checking the client's proof.
+	let weak = kafka.Open(kafka.Options{Brokers: []str{boot}, Username: "weak", Password: "secret", Mechanism: kafka.Mechanism.ScramSha256, Timeout: 5s})
+	let weakErr = weak.Ping()
+	check("a SCRAM iteration count of 4095 is ErrAuth", weakErr != nil && fault.Is(weakErr, kafka.ErrAuth) && contains("{weakErr}", "iteration count 4095"))
+	weak.Close()
+	let sc = kafka.Open(kafka.Options{Brokers: []str{boot}, Username: "tin", Password: "secret", Mechanism: kafka.Mechanism.ScramSha256, Timeout: 5s})
+	check("SCRAM-SHA-256 with 4096 iterations signs in", sc.Ping() == nil)
+	sc.Close()
+
 	let c = kafka.Open(kafka.Options{Brokers: []str{boot}, Username: "tin", Password: "secret", Timeout: 5s})
 	try c.Ping()
 	let n = try c.Partitions("t")
@@ -966,6 +1062,29 @@ fn run(ports str) ! {
 		check("{names[i]} batches go through the broker and back", good)
 		cc.Close()
 	}
+
+	// One fetch decompresses at most 64 times the larger of FetchMax and the bytes fetched (#441):
+	// with FetchMax 1 KiB (a budget of 64 KiB here), batches past it wait for the next fetch, and a
+	// batch larger than the whole budget fails.
+	let zc = kafka.Open(kafka.Options{Brokers: []str{boot}, Username: "tin", Password: "secret", Timeout: 5s, Compression: kafka.Compression.Zstd, FetchMax: 1024})
+	mut big = make([]u8, 0, 70000)
+	for k in 0..30000 {
+		big = append(big, 'x')
+	}
+	let z1 = try zc.SendTo("t", 0, msg(str(big)))
+	_ = try zc.SendTo("t", 0, msg(str(big)))
+	let z3 = try zc.SendTo("t", 0, msg(str(big)))
+	let firstPart = try zc.Fetch("t", 0, z1.Offset, 0)
+	check("a fetch stops decompressing at its budget", len(firstPart) == 2 && len(firstPart[1].Value) == 30000)
+	let rest = try zc.Fetch("t", 0, z1.Offset+2, 0)
+	check("and the next fetch reads the batch left", len(rest) == 1 && rest[0].Offset == z3.Offset)
+	for k in 0..40000 {
+		big = append(big, 'x')
+	}
+	let z4 = try zc.SendTo("t", 0, msg(str(big)))
+	let (_, bomb) = zc.Fetch("t", 0, z4.Offset, 0)
+	check("a batch larger than the whole budget fails", bomb != nil && contains("{bomb}", "decompresses to more than"))
+	zc.Close()
 
 	// A broker too old for the request's version.
 	let (_, old) = c.SendTo("old", 0, msg("x"))
