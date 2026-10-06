@@ -132,7 +132,10 @@ const sWaited = 27  // the task waited (it counts in waiting)
 const sStart = 28   // when its HEADERS came (the read timeout)
 const sBufd = 29    // bytes of bufBytes its body holds while it arrives
 const sWhy = 30     // why a write failed: 1 a cancel or the deadline, 2 the client stopped reading
-const sWords = 31
+const sStreamIn = 31 // a Router.Stream route (#481): its task runs while the body arrives, which it reads from sBody
+const sBodyOff = 32  // how much of sBody that task has read
+const sGot = 33      // the body bytes received in all (its content-length is checked against them)
+const sWords = 34
 
 mut h2Ready bool
 mut h2Hb i64     // the decoded field lines of the header block being decoded
@@ -665,6 +668,10 @@ fn h2_in_data(c i64, h i64, id i64, flags i64, p i64, n i64) {
 		return
 	}
 	s[sRecvWin] -= n
+	if s[sStreamIn] != 0 {
+		h2_stream_data(c, s, flags, n, dp, dn)
+		return
+	}
 	let got = s[sBodyLen] + dn
 	if got > gMaxBody {
 		h2_simple(c, s, 413)
@@ -887,6 +894,15 @@ fn h2_block(c i64, h i64, id i64, flags i64, kind i64, p i64, n i64) {
 			s[sTrLen] = h2HbLen
 		}
 		s[sRemote] = 1
+		if s[sStreamIn] != 0 {
+			// Its task runs already and reads the body (#481): the trailers end it.
+			if s[sCl] >= 0 && s[sGot] != s[sCl] {
+				h2_rst(c, s, eProtocol)
+				return
+			}
+			h2_wake(s)
+			return
+		}
 		if s[sCl] >= 0 && s[sBodyLen] != s[sCl] {
 			h2_rst(c, s, eProtocol)
 			return
@@ -934,6 +950,11 @@ fn h2_block(c i64, h i64, id i64, flags i64, kind i64, p i64, n i64) {
 		memcpy(ob+obLen+2, cast(i64, "100")+8, 3)
 		obLen += 5
 		h2_hb_end(c, s, false)
+	}
+	if route_streams(s[sHdr]+s[sMOff], s[sMLen], s[sHdr]+s[sPOff], s[sPLen]) {
+		// A Router.Stream route (#481): the handler runs now and reads the DATA as it comes.
+		s[sStreamIn] = 1
+		h2_dispatch(c, s)
 	}
 }
 
@@ -1600,7 +1621,11 @@ fn h2_run_request(c i64) {
 	if bp == 0 {
 		bp = b
 	}
-	let q = Req{Method: method_str(b+s[sMOff], s[sMLen]), Path: "", Query: "", hp: b, hn: s[sHn], bp: bp, bn: s[sBodyLen], tp: s[sTr], tn: s[sTrLen], cn: c}
+	mut bn = s[sBodyLen]
+	if s[sStreamIn] != 0 {
+		bn = 0 // the body is read as it arrives: q.BodyStream() (#481)
+	}
+	let q = Req{Method: method_str(b+s[sMOff], s[sMLen]), Path: "", Query: "", hp: b, hn: s[sHn], bp: bp, bn: bn, tp: s[sTr], tn: s[sTrLen], cn: c}
 	let t = b + s[sPOff]
 	let tn = s[sPLen]
 	let qm = memchr(t, '?', tn)
@@ -1655,6 +1680,10 @@ fn h2_task_done(c i64, s i64, task i64) {
 		// The handler ended without finishing its response (cancelled half way): the client must
 		// not take what came for a whole response.
 		h2_rst(c, s, eCancel)
+		return
+	} else if s[sStreamIn] != 0 && s[sRemote] == 0 && s[sReset] == 0 {
+		// The response is whole and the client still sends a body nobody reads (RFC 9113 8.1).
+		h2_rst(c, s, 0)
 		return
 	}
 	h2_closed(c, s)

@@ -367,6 +367,19 @@ reading resumes and buffered input is served.
   query; an empty path is `/`.
 - Bodies are limited to 64 MiB by default (413), a chunked body by its decoded length (and
   its chunk framing by the limit plus 64 KiB); `anvil.Limits` or `TIN_MAX_BODY` changes it.
+- **Bodies read as they arrive (#481):** a route registered with `Router.Stream(method, pattern,
+  h)` runs its handler as soon as the request's headers are in, and `q.BodyStream().Read(mut buf)`
+  waits in the request's task for the next bytes, so an upload is processed in the memory of one
+  read buffer and a gRPC client or bidirectional stream gets each message as it comes. The task
+  takes the socket out of the event loop (as a streamed response does) and reads it directly: a
+  Content-Length body up to its length (at most 1 TiB), a chunked one through a decoder of its
+  framing, with bytes read past its end (a pipelined request) given back to the connection. A
+  slow handler reads slowly, so TCP holds the client back. `100 Continue` goes out at the first
+  read that needs the socket. A handler that ends before the body does closes the connection
+  after its response, since what is left cannot be told from a next request. `TIN_MAX_BODY` does
+  not bound such a body (the handler decides what it keeps); each read waits at most the read
+  timeout, and the request deadline applies. On other routes the body has arrived whole when the
+  handler runs, and `BodyStream` reads it from memory.
 - **Timeouts** (`anvil.Timeouts`, or the environment): a request's line and headers must
   arrive within 10 s of its first byte (`TIN_HEADER_TIMEOUT_MS`), and the whole request
   within 60 s (`TIN_READ_TIMEOUT_MS`); a keep-alive connection with no request in progress
@@ -722,7 +735,12 @@ and `expect: 100-continue` gets an interim `:status 100`. The stream and connect
 windows are opened again once half is used. When the client ends its side the request goes
 through the admission checks of `serve_one` and runs in its own task on the connection's core
 (`tArg` the connection, `tUser+2` the stream), with the request deadline and memory budget.
-Many streams of one connection run at once: one that waits does not hold the others.
+Many streams of one connection run at once: one that waits does not hold the others. On a `Router.Stream` route
+(#481) the handler starts at the request's HEADERS instead, and the stream's DATA waits in a buffer
+of at most one stream window (1 MiB) that `BodyStream` reads from: its WINDOW_UPDATE goes out as
+the handler reads, so a slow handler slows its client and not the connection's other streams. A
+handler that ends before the client's END_STREAM resets the stream with NO_ERROR after its
+response.
 
 **Responses.** HEADERS (`:status`, `server`, `date`, `content-type` and `content-length` unless
 the status has no body, then the handler's fields with lower-case names; connection-specific

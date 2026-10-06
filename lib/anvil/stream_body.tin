@@ -1,0 +1,533 @@
+package anvil
+
+// ---- request bodies read as they arrive (#481) ----
+//
+// A route registered with Router.Stream runs its handler as soon as the request's headers are
+// in, without waiting for the body; the handler reads it with q.BodyStream(), whose Read waits in
+// the request's task for the next bytes. A large upload is then processed as it comes, in the
+// memory of one read buffer, and a gRPC client stream or bidirectional stream gets each message
+// as it arrives. On any other route the body has arrived whole, and BodyStream reads it.
+//
+// HTTP/1.1: the handler's task takes the connection's socket out of the event loop (as a
+// streamed response does) and reads it directly: a Content-Length body up to its length, a
+// chunked one through a decoder of its framing. A slow handler reads slowly, so TCP holds the
+// client back. "100 Continue" goes out on the first read that needs the socket. When the handler
+// ends without reading the whole body, the connection closes after the response: what is left
+// cannot be told from the next request. Bytes read past the end of a chunked body (a pipelined
+// request) go back to the connection.
+//
+// HTTP/2 (h2.tin): the stream's DATA frames wait in its buffer, and its window opens (a
+// WINDOW_UPDATE) only as the handler reads, so a slow handler slows its client and the buffer
+// holds at most one window (h2StreamWin). A handler that ends before the client's END_STREAM
+// resets the stream with NO_ERROR after its response.
+//
+// TIN_MAX_BODY does not bound a streamed body: the handler decides what it keeps. Each read waits
+// at most the read timeout (TIN_READ_TIMEOUT_MS) for bytes, and the request's deadline applies.
+
+// BodyReader reads a request body: Read fills buf with the next bytes. It is q.BodyStream().
+type BodyReader struct {
+	c  i64   // the connection record (0: a request made in-process)
+	s  i64   // the HTTP/2 stream record, 0 for HTTP/1.1
+	st []i64 // a body that arrived whole: [its bytes, its length, how much is read]
+}
+
+// The HTTP/1.1 reader's record (c[cBody]), in malloc'd words.
+const bMode = 0  // 1 Content-Length, 2 chunked
+const bLeft = 1  // Content-Length: body bytes not yet read; chunked: bytes left in the current chunk
+const bBuf = 2   // bytes read ahead: the start of the body that came with the headers, chunked input
+const bOff = 3
+const bLen = 4
+const bCap = 5
+const bState = 6 // chunked: 0 a chunk-size line, 1 chunk data, 2 the CRLF after it, 3 trailers
+const bDone = 7  // the whole body was read
+const bOwned = 8 // the socket is the reader's (out of the event loop)
+const b100 = 9   // 1: send 100 Continue before the first read from the socket; 2: sent
+const bFail = 10 // the body failed: the connection closes after the response
+const bTask = 11 // the request task that reads it
+const bWords = 12
+
+const maxChunkLine = 4096
+
+mut bodyRest bool // body_end gave bytes read past a body back to the connection: serve them
+
+// BodyStream is the request body as a stream: on a route registered with Router.Stream it arrives
+// as the handler reads it; elsewhere it has arrived whole (and Body has it too). Read the body
+// either with Body or with BodyStream, not with both.
+fn (q Req) BodyStream() BodyReader {
+	let c = q.cn
+	if c != 0 && c[cH2] != 0 {
+		let s = rt_task_current()[tUser+2]
+		if s != 0 && s[sStreamIn] != 0 {
+			return BodyReader{c: c, s: s, st: []i64{}}
+		}
+	} else if c != 0 && c[cBody] != 0 {
+		let b = c[cBody]
+		if b[bTask] == rt_task_current() {
+			return BodyReader{c: c, s: 0, st: []i64{}}
+		}
+	}
+	return BodyReader{c: 0, s: 0, st: []i64{q.bp, q.bn, 0}}
+}
+
+// Read fills buf with the body's next bytes, waiting for them, and returns how many it wrote: 0
+// at the end of the body. It fails when the client ends the connection or resets the stream
+// before the end of the body, when no byte comes within the read timeout, and at the request's
+// deadline.
+fn (r BodyReader) Read(buf mut []u8) !i64 {
+	let max = len(buf)
+	if max == 0 {
+		return 0
+	}
+	let dst = cast(i64, buf)[2]
+	if len(r.st) == 3 {
+		let st = r.st
+		let k = min(max, st[1]-st[2])
+		if k > 0 {
+			memcpy(dst, st[0]+st[2], k)
+			st[2] += k
+		}
+		return k
+	}
+	if r.s != 0 {
+		return try h2_body_read(r.c, r.s, dst, max)
+	}
+	let c = r.c
+	let b = c[cBody]
+	if b == 0 || b[bDone] != 0 {
+		return 0
+	}
+	if b[bFail] != 0 {
+		fail "anvil: the request body failed"
+	}
+	if b[bMode] == 1 {
+		let want = min(max, b[bLeft])
+		mut k = 0
+		if b[bOff] < b[bLen] {
+			k = min(want, b[bLen]-b[bOff])
+			memcpy(dst, b[bBuf]+b[bOff], k)
+			b[bOff] += k
+		} else {
+			k = try body_fill(c, b, dst, want)
+		}
+		b[bLeft] -= k
+		if b[bLeft] == 0 {
+			b[bDone] = 1
+		}
+		return k
+	}
+	return try body_chunked(c, b, dst, max)
+}
+
+// body_begin starts a streamed HTTP/1.1 body for the request about to run on c: mode 1 with a
+// Content-Length of left bytes (the n bytes at p among them), or 2 chunked (the n bytes at p
+// are its first framed bytes); they came with the headers. The
+// socket leaves the event loop for the request's task (the output batch waits in c's pending
+// output, which the reader writes first).
+fn body_begin(c i64, mode i64, left i64, p i64, n i64, expect100 bool) {
+	let b = calloc(bWords, 8)
+	b[bMode] = mode
+	b[bLeft] = left
+	if n > 0 {
+		b[bBuf] = malloc(n)
+		memcpy(b[bBuf], p, n)
+		b[bLen] = n
+		b[bCap] = n
+	}
+	if expect100 {
+		b[b100] = 1
+	}
+	if obLen > 0 {
+		if c[cTls] != 0 {
+			gTlsSeal(c) // HTTPS: the responses before this one, as records
+		}
+		pend_out(c, ob, obLen)
+		obLen = 0
+	}
+	let fd = c[cFD]
+	ev_task_del(fd)
+	conns[fd] = 0
+	c[cWriting] = 0
+	b[bOwned] = 1
+	c[cBody] = b
+}
+
+// body_bind records the task that reads the body (run_request calls it first).
+fn body_bind(c i64) {
+	let b = c[cBody]
+	if b != 0 {
+		b[bTask] = rt_task_current()
+	}
+}
+
+// body_write_all writes n bytes at p to c's socket from the reader's task, waiting as needed.
+fn body_write_all(c i64, p i64, n i64) ! {
+	if c[cTls] != 0 {
+		return try gTlsWrite(c, p, n)
+	}
+	mut done = 0
+	for done < n {
+		let k = rt_sys_write(c[cFD], p+done, n-done)
+		if k > 0 {
+			done += k
+			continue
+		}
+		if k < 0 && errno() == 4 {
+			continue
+		}
+		if k < 0 && errno() == EAGAIN {
+			try body_wait(c, 2)
+			continue
+		}
+		fail "anvil: the client closed the connection"
+	}
+}
+
+// body_wait waits for c's socket (want 1 readable, 2 writable) within the read timeout.
+fn body_wait(c i64, want i64) ! {
+	mut ns = 0
+	if gReadMs > 0 {
+		ns = gReadMs * 1000000
+	}
+	let r = rt_task_wait(c[cFD], want, ns)
+	if r == waitDeadline {
+		fail cast(fault, rt_wait_fault())
+	}
+	if r == waitTimeout {
+		fail "anvil: the request body stopped arriving"
+	}
+}
+
+// body_fill reads up to n bytes of c's socket into p, waiting for at least one. The output the
+// event loop left pending and 100 Continue go first.
+fn body_fill(c i64, b i64, p i64, n i64) !i64 {
+	if c[cOut] != 0 {
+		let werr = body_write_all(c, c[cOut]+c[cOutOff], c[cOutLen]-c[cOutOff])
+		free(c[cOut])
+		c[cOut] = 0
+		c[cOutLen] = 0
+		c[cOutOff] = 0
+		if werr != nil {
+			b[bFail] = 1
+			fail werr
+		}
+	}
+	if b[b100] == 1 {
+		b[b100] = 2
+		let msg = "HTTP/1.1 100 Continue\r\n\r\n"
+		body_write_all(c, cast(i64, msg)+8, len(msg)) catch err {
+			b[bFail] = 1
+			fail err
+		}
+	}
+	for {
+		mut k = 0
+		if c[cTls] != 0 {
+			// Records that arrived, decrypted: 0 after close_notify, -1 none complete yet, -2 broken.
+			k = gTlsRead(c, p, n)
+			if k == -1 {
+				body_wait(c, 1) catch err {
+					b[bFail] = 1
+					fail err
+				}
+				continue
+			}
+		} else {
+			k = rt_sys_read(c[cFD], p, n)
+			if k < 0 && errno() == 4 {
+				continue
+			}
+			if k < 0 && errno() == EAGAIN {
+				body_wait(c, 1) catch err {
+					b[bFail] = 1
+					fail err
+				}
+				continue
+			}
+		}
+		if k > 0 {
+			return k
+		}
+		b[bFail] = 1
+		fail "anvil: the client closed the connection before the end of the body"
+	}
+	return 0
+}
+
+// body_line is the length of the line at the reader's buffer position (with its LF), reading
+// more as needed; it fails past maxChunkLine.
+fn body_line(c i64, b i64) !i64 {
+	for {
+		let avail = b[bLen] - b[bOff]
+		if avail > 0 {
+			let nl = memchr(b[bBuf]+b[bOff], '\n', avail)
+			if nl != 0 {
+				return nl - (b[bBuf] + b[bOff]) + 1
+			}
+		}
+		if avail >= maxChunkLine {
+			b[bFail] = 1
+			fail "anvil: a chunk line too long"
+		}
+		if b[bOff] > 0 {
+			memmove(b[bBuf], b[bBuf]+b[bOff], avail)
+			b[bLen] = avail
+			b[bOff] = 0
+		}
+		if b[bCap]-b[bLen] < 4096 {
+			let cap = b[bLen] + 16384
+			b[bBuf] = realloc(b[bBuf], cap)
+			b[bCap] = cap
+		}
+		let k = try body_fill(c, b, b[bBuf]+b[bLen], b[bCap]-b[bLen])
+		b[bLen] += k
+	}
+	return 0
+}
+
+// body_chunked reads up to max bytes of a chunked body into p (RFC 9112 7.1): the chunks' data,
+// with their size lines, the CRLFs after them and the trailer section consumed.
+fn body_chunked(c i64, b i64, p i64, max i64) !i64 {
+	for {
+		let st = b[bState]
+		if st == 1 {
+			let want = min(max, b[bLeft])
+			mut k = 0
+			if b[bOff] < b[bLen] {
+				k = min(want, b[bLen]-b[bOff])
+				memcpy(p, b[bBuf]+b[bOff], k)
+				b[bOff] += k
+			} else {
+				k = try body_fill(c, b, p, want)
+			}
+			b[bLeft] -= k
+			if b[bLeft] == 0 {
+				b[bState] = 2
+			}
+			return k
+		}
+		let l = try body_line(c, b)
+		let at = b[bBuf] + b[bOff]
+		b[bOff] += l
+		mut e = l - 1
+		if e > 0 && load8(at+e-1) == '\r' {
+			e -= 1
+		}
+		if st == 2 {
+			// The CRLF that ends a chunk's data.
+			if e != 0 {
+				b[bFail] = 1
+				fail "anvil: a chunk is longer than its size"
+			}
+			b[bState] = 0
+			continue
+		}
+		if st == 3 {
+			// Trailer fields until an empty line (they are not kept: a streamed body has no
+			// trailers in q.Header).
+			if e == 0 {
+				b[bDone] = 1
+				return 0
+			}
+			continue
+		}
+		// A chunk-size line: hex digits, then extensions after ';' (ignored).
+		mut size = 0
+		mut digits = 0
+		mut i = 0
+		for i < e {
+			let v = hexval(load8(at + i))
+			if v < 0 {
+				break
+			}
+			size = size*16 + v
+			digits += 1
+			if digits > 15 {
+				b[bFail] = 1
+				fail "anvil: a chunk size too large"
+			}
+			i += 1
+		}
+		for i < e && (load8(at+i) == ' ' || load8(at+i) == '\t') {
+			i += 1
+		}
+		if digits == 0 || (i < e && load8(at+i) != ';') {
+			b[bFail] = 1
+			fail "anvil: a malformed chunk size"
+		}
+		if size == 0 {
+			b[bState] = 3
+			continue
+		}
+		b[bLeft] = size
+		b[bState] = 1
+	}
+	return 0
+}
+
+// body_end ends the streamed body of c's request when its handler returns: the socket goes back
+// to the event loop, bytes read past the body go back to the connection, and true means the
+// connection closes after the response, since the body was not read to its end.
+fn body_end(c i64) bool {
+	let b = c[cBody]
+	if b == 0 {
+		return false
+	}
+	c[cBody] = 0
+	mut closes = b[bDone] == 0 || b[bFail] != 0
+	if b[bOwned] != 0 && c[cDead] == 0 && c[cStream] < 2 {
+		// (A streamed response gives the socket back when it ends: stream_release.)
+		let fd = c[cFD]
+		conns[fd] = c
+		ev_conn(fd)
+		if c[cOut] != 0 {
+			ev_conn_write(fd)
+			c[cWriting] = 1
+			write_deadline(c)
+		}
+	}
+	if !closes && b[bOff] < b[bLen] && c[cIn] != 0 {
+		closes = true // (not expected: the event loop does not read while the reader has the socket)
+	}
+	if !closes && b[bOff] < b[bLen] {
+		// A pipelined request that came after a chunked body.
+		let n = b[bLen] - b[bOff]
+		{
+			c[cIn] = malloc(n)
+			memcpy(c[cIn], b[bBuf]+b[bOff], n)
+			c[cInLen] = n
+			c[cInCap] = n
+			bufBytes += n
+			bodyRest = true
+		}
+	}
+	if b[bBuf] != 0 {
+		free(b[bBuf])
+	}
+	free(b)
+	if closes {
+		c[cClose] = 1
+	}
+	return closes
+}
+
+// h2_body_read reads up to n bytes of HTTP/2 stream s's body into p, waiting for DATA frames: 0
+// after the client's END_STREAM. The stream's window opens as the bytes are read.
+fn h2_body_read(c i64, s i64, p i64, n i64) !i64 {
+	let h = c[cH2]
+	for {
+		let avail = s[sBodyLen] - s[sBodyOff]
+		if avail > 0 {
+			let k = min(n, avail)
+			memcpy(p, s[sBody]+s[sBodyOff], k)
+			s[sBodyOff] += k
+			if s[sBodyOff] == s[sBodyLen] {
+				s[sBodyOff] = 0
+				s[sBodyLen] = 0
+			}
+			s[sRecvAck] += k
+			if s[sRecvAck] >= h2StreamWin/2 && s[sRemote] == 0 && s[sReset] == 0 && !h2_gone(c) {
+				ob_room(13)
+				h2_head(4, fWindow, 0, s[sId])
+				ob_be32(s[sRecvAck])
+				s[sRecvWin] += s[sRecvAck]
+				s[sRecvAck] = 0
+				h2_flush(c)
+			}
+			return k
+		}
+		if s[sReset] != 0 {
+			fail "anvil: the client reset the stream before the end of the body"
+		}
+		if s[sRemote] != 0 {
+			return 0
+		}
+		if h2_gone(c) {
+			fail "anvil: the connection ended before the end of the body"
+		}
+		s[sParked] = 1
+		h[hParked] += 1
+		mut ns = 0
+		if gReadMs > 0 {
+			ns = gReadMs * 1000000
+		}
+		let r = rt_task_park(ns)
+		s[sParked] = 0
+		h[hParked] -= 1
+		if r == waitDeadline {
+			fail cast(fault, rt_wait_fault())
+		}
+		if r == waitTimeout && s[sBodyLen] == s[sBodyOff] && s[sRemote] == 0 && s[sReset] == 0 {
+			fail "anvil: the request body stopped arriving"
+		}
+	}
+	return 0
+}
+
+// route_streams reports whether the request with the method (mn bytes at mp) and target (tn
+// bytes at tp, the path then any query) goes to a Router.Stream route.
+fn route_streams(mp i64, mn i64, tp i64, tn i64) bool {
+	if gRoutes == 0 {
+		return false
+	}
+	let t = cast(rtable, gRoutes)
+	mut pn = tn
+	let qm = memchr(tp, '?', tn)
+	if qm != 0 {
+		pn = qm - tp
+	}
+	let e = find(t, rt_str_from_raw(mp, mn), rt_str_from_raw(tp, pn))
+	return e >= 0 && t.ends[e].stream
+}
+
+// body_drop frees c's body reader without giving the socket back (the connection is going away).
+fn body_drop(c i64) {
+	let b = c[cBody]
+	if b == 0 {
+		return
+	}
+	c[cBody] = 0
+	if b[bBuf] != 0 {
+		free(b[bBuf])
+	}
+	free(b)
+}
+
+// h2_stream_data takes a DATA frame of a stream whose task reads the body (h2_in_data): its
+// bytes join the stream's buffer, and the reader is woken. The stream's window opens as the
+// reader takes them (h2_body_read), so the buffer holds at most one window.
+fn h2_stream_data(c i64, s i64, flags i64, n i64, dp i64, dn i64) {
+	let got = s[sGot] + dn
+	if s[sCl] >= 0 && got > s[sCl] {
+		h2_rst(c, s, eProtocol) // more than its content-length (RFC 9113 8.1.1)
+		return
+	}
+	s[sGot] = got
+	// Padding is not the reader's: its share of the window is given back with what it reads.
+	s[sRecvAck] += n - dn
+	if s[sBodyOff] > 0 {
+		memmove(s[sBody], s[sBody]+s[sBodyOff], s[sBodyLen]-s[sBodyOff])
+		s[sBodyLen] -= s[sBodyOff]
+		s[sBodyOff] = 0
+	}
+	if s[sBodyLen]+dn > s[sBodyCap] {
+		mut want = s[sBodyCap] * 2
+		if want < 16384 {
+			want = 16384
+		}
+		if want < s[sBodyLen]+dn {
+			want = s[sBodyLen] + dn
+		}
+		s[sBody] = realloc(s[sBody], want)
+		s[sBodyCap] = want
+	}
+	memcpy(s[sBody]+s[sBodyLen], dp, dn)
+	s[sBodyLen] += dn
+	if (flags & flEnd) != 0 {
+		s[sRemote] = 1
+		if s[sCl] >= 0 && got != s[sCl] {
+			h2_rst(c, s, eProtocol)
+			return
+		}
+	}
+	h2_wake(s)
+}

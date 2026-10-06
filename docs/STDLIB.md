@@ -200,6 +200,7 @@ ServeTLS (and Router.ServeTLS) serve HTTPS: TLS 1.3 with a PEM certificate chain
 - `(r mut Router) Head(pattern str, h fn(Req, mut Out))`: Head routes HEAD requests for pattern to h (without it, they go to the GET route).
 - `(r mut Router) Options(pattern str, h fn(Req, mut Out))`: Options routes OPTIONS requests for pattern to h.
 - `(r mut Router) Handle(method str, pattern str, h fn(Req, mut Out))`: Handle routes requests with method (any HTTP method name, like "PROPFIND") for pattern to h.
+- `(r mut Router) Stream(method str, pattern str, h fn(Req, mut Out))`: Stream routes method requests for pattern to h, which runs as soon as the request's headers are in and reads the body as it arrives with q.BodyStream() (#481): large uploads in bounded memory, gRPC client and bidirectional streams. TIN_MAX_BODY does not bound such a body.
 - `(r mut Router) Any(pattern str, h fn(Req, mut Out))`: Any routes requests for pattern with every method to h; a route for the request's own method on the same pattern wins over it.
 - `(r mut Router) Use(mw fn(Req, mut Out, fn(Req, mut Out)))`: Use adds middleware mw to r. Middleware run in the order added, around every route of r and of the routers mounted in it, and around their 404 and 405 answers. Each gets next, the rest of the chain, and decides whether and when to call it.
 - `(r mut Router) Route(prefix str, build fn(mut Router))`: Route groups routes under prefix ("/api"): build adds them to a new router mounted there.
@@ -221,6 +222,9 @@ ServeTLS (and Router.ServeTLS) serve HTTPS: TLS 1.3 with a PEM certificate chain
 - `ServeTLSConfig(addr str, cfg TLSConfig, h fn(Req, mut Out)) !`: ServeTLSConfig is ServeTLS with a TLSConfig. With ClientAuth set, every full handshake asks for a client certificate: RequireClientCert refuses a client without one (certificate_required), and both refuse one that does not chain to ClientCAs for client authentication. A handler finds the verified chain in q.TLSConn().PeerCertificates().
 - `(r Router) ServeTLSConfig(addr str, cfg TLSConfig) !`: ServeTLSConfig is Serve over TLS with a TLSConfig, as anvil.ServeTLSConfig.
 - `(q Req) TLSConn() ?tls.Conn`: TLSConn is the TLS connection the request arrived on, or nil over plain TCP: for its ALPN(), CipherSuite() and Group(). After Hijack every byte must go through it (Read, Write, Close), since the descriptor carries records.
+- `type BodyReader struct`: BodyReader reads a request body: Read fills buf with the next bytes. It is q.BodyStream().
+- `(q Req) BodyStream() BodyReader`: BodyStream is the request body as a stream: on a route registered with Router.Stream it arrives as the handler reads it; elsewhere it has arrived whole (and Body has it too). Read the body either with Body or with BodyStream, not with both.
+- `(r BodyReader) Read(buf mut []u8) !i64`: Read fills buf with the body's next bytes, waiting for them, and returns how many it wrote: 0 at the end of the body. It fails when the client ends the connection or resets the stream before the end of the body, when no byte comes within the read timeout, and at the request's deadline.
 
 ## hearth
 

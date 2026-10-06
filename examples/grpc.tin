@@ -5,10 +5,15 @@ import "herald"
 import "say"
 import "twine"
 
-// A unary gRPC service over anvil's HTTP/2 (#360): helloworld.Greeter, the service of gRPC's own
-// examples, so any gRPC client can call it (grpcurl, or a client generated from helloworld.proto).
+// A gRPC service over anvil's HTTP/2 (#360): helloworld.Greeter, the service of gRPC's own
+// examples, so any gRPC client can call it (grpcurl, or a client generated from helloworld.proto),
+// with a client-streaming and a bidirectional method beside it (#481).
 //
-//	service Greeter { rpc SayHello (HelloRequest) returns (HelloReply) {} }
+//	service Greeter {
+//	  rpc SayHello (HelloRequest) returns (HelloReply) {}
+//	  rpc SayHelloAll (stream HelloRequest) returns (HelloReply) {}    // "Hello a, b, c"
+//	  rpc Chat (stream HelloRequest) returns (stream HelloReply) {}   // a reply to each, as it comes
+//	}
 //	message HelloRequest { string name = 1; }
 //	message HelloReply { string message = 1; }
 //
@@ -29,6 +34,9 @@ const codeInternal = 13
 fn main() {
 	let r = anvil.NewRouter()
 	r.Post("/helloworld.Greeter/SayHello", sayHello)
+	// Streaming methods read the call's messages as they arrive (Router.Stream, q.BodyStream).
+	r.Stream("POST", "/helloworld.Greeter/SayHelloAll", sayHelloAll)
+	r.Stream("POST", "/helloworld.Greeter/Chat", chat)
 	r.NotFound(unimplemented)
 	r.MethodNotAllowed(unimplemented)
 	r.Serve(":50051") catch err {
@@ -53,6 +61,159 @@ fn sayHello(q anvil.Req, w mut anvil.Out) {
 	}
 	herald.Log(herald.LInfo, "SayHello", []str{"name_bytes", say.Str(len(name))})
 	grpcReply(mut w, stringMessage(1, "Hello " + name))
+}
+
+// sayHelloAll answers a stream of HelloRequests with one HelloReply that greets every name.
+fn sayHelloAll(q anvil.Req, w mut anvil.Out) {
+	if !grpcContentType(q, mut w) {
+		return
+	}
+	mut ms = newMessages(q)
+	mut names = make([]u8, 0, 256)
+	for {
+		let (n, err) = ms.next()
+		if err != "" {
+			grpcStatus(mut w, codeInternal, err)
+			return
+		}
+		if n < 0 {
+			break
+		}
+		let (name, perr) = stringField(str(ms.buf[ms.lo-n : ms.lo]), 1)
+		if perr != "" {
+			grpcStatus(mut w, codeInvalidArgument, "HelloRequest: " + perr)
+			return
+		}
+		if len(names) > 0 {
+			names = append(names, ", "...)
+		}
+		names = append(names, name...)
+	}
+	grpcReply(mut w, stringMessage(1, "Hello " + str(names)))
+}
+
+// chat answers each HelloRequest as it arrives, before the next one: the reply streams while the
+// client's stream is still open. Each message is handled in an arena, so a long call runs in the
+// memory of one message however many it has.
+fn chat(q anvil.Req, w mut anvil.Out) {
+	if !grpcContentType(q, mut w) {
+		return
+	}
+	mut ms = newMessages(q)
+	w.Stream() catch _ {
+		return
+	}
+	mut out = w // an arena cannot capture the mut parameter itself
+	for {
+		let (n, err) = ms.next()
+		if err != "" {
+			grpcStatus(mut w, codeInternal, err)
+			return
+		}
+		if n < 0 {
+			break
+		}
+		let failed = arena {
+			mut res = ""
+			let (name, perr) = stringField(str(ms.buf[ms.lo-n : ms.lo]), 1)
+			if perr != "" {
+				res = "HelloRequest: " + perr
+			} else {
+				let reply = stringMessage(1, "Hello " + name)
+				let rn = len(reply)
+				mut frame = make([]u8, 0, 5+rn)
+				frame = append(frame, 0, u8(rn>>24), u8(rn>>16), u8(rn>>8), u8(rn))
+				frame = append(frame, reply...)
+				out.Write(frame) catch _ {
+					res = "!"
+				}
+			}
+			res
+		}
+		if failed == "!" {
+			return
+		}
+		if failed != "" {
+			grpcStatus(mut w, codeInvalidArgument, failed)
+			return
+		}
+		w.Flush() catch _ {
+			return
+		}
+	}
+	grpcStatus(mut w, codeOK, "")
+}
+
+// grpcContentType checks a streaming call's content type; false when it answered the call itself.
+fn grpcContentType(q anvil.Req, w mut anvil.Out) bool {
+	let ct = q.Header("content-type")
+	if ct != "application/grpc" && !twine.HasPrefix(ct, "application/grpc+") && !twine.HasPrefix(ct, "application/grpc;") {
+		w.Status(415)
+		w.Text("content-type must be application/grpc")
+		return false
+	}
+	w.Type("application/grpc")
+	return true
+}
+
+// messages reads a call's length-prefixed messages from its body as they arrive, in one buffer
+// that grows only for a message larger than it.
+type messages struct {
+	r anvil.BodyReader
+	rbuf []u8
+	buf []u8
+	lo i64 // buf[lo:hi] has arrived and is not taken yet
+	hi i64
+}
+
+fn newMessages(q anvil.Req) messages {
+	return messages{r: q.BodyStream(), rbuf: make([]u8, 16384), buf: make([]u8, 65536)}
+}
+
+// next reads the call's next message, which is then ms.buf[ms.lo-n : ms.lo] until the next call;
+// n is -1 at the end of the client's stream, and err says why the call is malformed.
+fn (m mut messages) next() (i64, str) {
+	for {
+		let have = m.hi - m.lo
+		if have >= 5 {
+			let b = m.buf
+			let lo = m.lo
+			if b[lo] != 0 {
+				return -1, "compressed messages are not supported"
+			}
+			let n = i64(b[lo+1])<<24 | i64(b[lo+2])<<16 | i64(b[lo+3])<<8 | i64(b[lo+4])
+			if n > 4194304 {
+				return -1, "a message larger than 4 MiB"
+			}
+			if have >= 5+n {
+				m.lo = lo + 5 + n
+				return n, ""
+			}
+		}
+		let k = m.r.Read(mut m.rbuf) catch e {
+			return -1, "reading the call: {e}"
+		}
+		if k == 0 {
+			if have > 0 {
+				return -1, "the client's stream ended inside a message"
+			}
+			return -1, ""
+		}
+		// Move what is left to the front, then make room for k more bytes.
+		if m.lo > 0 {
+			copy(m.buf, m.buf[m.lo:m.hi])
+			m.hi = have
+			m.lo = 0
+		}
+		if m.hi+k > len(m.buf) {
+			mut nb = make([]u8, 2*(m.hi+k))
+			copy(nb, m.buf[:m.hi])
+			m.buf = nb
+		}
+		copy(m.buf[m.hi:], m.rbuf[:k])
+		m.hi += k
+	}
+	return -1, ""
 }
 
 // unimplemented is every other path: gRPC's UNIMPLEMENTED.

@@ -7,6 +7,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -91,4 +92,80 @@ func main() {
 		fail("concurrent calls: %v", err)
 	}
 	fmt.Println("PASS 200 concurrent calls on one connection")
+
+	// Client streaming (#481): the server reads the names as they arrive and answers once.
+	cs, err := conn.NewStream(ctx, &grpc.StreamDesc{ClientStreams: true}, "/helloworld.Greeter/SayHelloAll")
+	if err != nil {
+		fail("SayHelloAll: %v", err)
+	}
+	for _, n := range []string{"a", "b", "c"} {
+		if err := cs.SendMsg(wrapperspb.String(n)); err != nil {
+			fail("SayHelloAll send: %v", err)
+		}
+	}
+	if err := cs.CloseSend(); err != nil {
+		fail("SayHelloAll close: %v", err)
+	}
+	all := new(wrapperspb.StringValue)
+	if err := cs.RecvMsg(all); err != nil || all.GetValue() != "Hello a, b, c" {
+		fail("SayHelloAll replied %q: %v", all.GetValue(), err)
+	}
+	fmt.Println("PASS client streaming: three names, one reply")
+
+	// Bidirectional (#481): each name is answered before the next is sent.
+	bs, err := conn.NewStream(ctx, &grpc.StreamDesc{ClientStreams: true, ServerStreams: true}, "/helloworld.Greeter/Chat")
+	if err != nil {
+		fail("Chat: %v", err)
+	}
+	for _, n := range []string{"one", "two", "three"} {
+		if err := bs.SendMsg(wrapperspb.String(n)); err != nil {
+			fail("Chat send: %v", err)
+		}
+		reply := new(wrapperspb.StringValue)
+		if err := bs.RecvMsg(reply); err != nil || reply.GetValue() != "Hello "+n {
+			fail("Chat replied %q to %s: %v", reply.GetValue(), n, err)
+		}
+	}
+	bs.CloseSend()
+	if err := bs.RecvMsg(new(wrapperspb.StringValue)); err != io.EOF {
+		fail("Chat end: %v", err)
+	}
+	fmt.Println("PASS bidirectional streaming: each name answered before the next is sent")
+
+	// A long bidirectional stream: 2000 messages of 32 KiB each way (62 MiB), sent while the
+	// replies are read, so both directions move through their flow-control windows.
+	ls, err := conn.NewStream(ctx, &grpc.StreamDesc{ClientStreams: true, ServerStreams: true}, "/helloworld.Greeter/Chat")
+	if err != nil {
+		fail("long Chat: %v", err)
+	}
+	piece := strings.Repeat("x", 32<<10)
+	got := make(chan error, 1)
+	go func() {
+		for i := 0; i < 2000; i++ {
+			reply := new(wrapperspb.StringValue)
+			if err := ls.RecvMsg(reply); err != nil {
+				got <- fmt.Errorf("reply %d: %v", i, err)
+				return
+			}
+			if reply.GetValue() != "Hello "+piece {
+				got <- fmt.Errorf("reply %d has %d bytes", i, len(reply.GetValue()))
+				return
+			}
+		}
+		if err := ls.RecvMsg(new(wrapperspb.StringValue)); err != io.EOF {
+			got <- fmt.Errorf("end: %v", err)
+			return
+		}
+		got <- nil
+	}()
+	for i := 0; i < 2000; i++ {
+		if err := ls.SendMsg(wrapperspb.String(piece)); err != nil {
+			fail("long Chat send %d: %v", i, err)
+		}
+	}
+	ls.CloseSend()
+	if err := <-got; err != nil {
+		fail("long Chat: %v", err)
+	}
+	fmt.Println("PASS bidirectional streaming: 2000 messages of 32 KiB each way")
 }

@@ -106,6 +106,7 @@ type Out struct {
 
 const scrSize = 262144
 const maxRequest = 67108864
+const maxStreamBody = 1099511627776 // the largest Content-Length a Router.Stream route takes (#481)
 const maxLine = 65536   // request line and header block limit: 414 / 431 past it
 const maxEvents = 256
 
@@ -140,7 +141,8 @@ const cTls = 26      // HTTPS (#124, serve_tls.tin): the connection's tls.Conn (
 const cHs = 27       // its handshake: 1 running in the task in cTask, 2 done (until tls_done), 0 none
 const cProto = 28    // the protocol ALPN chose: its number in the offered list (alpn_offer), 0 none
 const cH2 = 29       // the connection speaks HTTP/2 (#360): its state (h2.tin), 0 for HTTP/1.1
-const cWords = 30
+const cBody = 30     // a request body its handler reads as it arrives (#481): the reader's record (stream_body.tin), 0 none
+const cWords = 31
 
 shared mut gListen i64
 shared mut gIP i64
@@ -822,6 +824,9 @@ fn free_conn(c i64) {
 	if c[cStBuf] != 0 {
 		free(c[cStBuf])
 	}
+	if c[cBody] != 0 {
+		body_drop(c)
+	}
 	if c[cH2] != 0 {
 		h2_free(c)
 	}
@@ -865,6 +870,9 @@ fn on_read_serve(c i64) bool {
 	}
 	if c[cH2] != 0 {
 		return h2_read(c) // HTTP/2 (#360)
+	}
+	if c[cBody] != 0 {
+		return false // the request's handler reads the body from the socket (#481)
 	}
 	mut buf = scr
 	mut cap = scrSize
@@ -972,15 +980,20 @@ fn on_read_serve(c i64) bool {
 	} else if big {
 		bufBytes -= cap
 		free(buf)
-		c[cIn] = 0
-		c[cInLen] = 0
-		c[cInCap] = 0
+		if c[cIn] == buf {
+			c[cIn] = 0
+			c[cInLen] = 0
+			c[cInCap] = 0
+		}
 	}
 	// Part of a TLS record buffered counts as a request still arriving; decrypted data TLS holds
 	// (Out.Closed reads ahead) is read on the next turn, since the socket will not report it.
 	arm(c, (rem > 0 || (c[cTls] != 0 && gTlsPending(c) != 0)) && c[cClose] == 0)
 	rt_pool_reset()
-	return (full || (c[cTls] != 0 && gTlsPending(c) == 2)) && c[cClose] == 0 && c[cWriting] == 0 && c[cTask] == 0
+	// A request after a streamed chunked body (#481) waits in c's input: serve it now.
+	let rest = bodyRest && c[cIn] != 0
+	bodyRest = false
+	return (full || rest || (c[cTls] != 0 && gTlsPending(c) == 2)) && c[cClose] == 0 && c[cWriting] == 0 && c[cTask] == 0
 }
 
 // flush writes the batch's responses; false means the connection is gone. While the
@@ -1328,6 +1341,7 @@ fn serve_one(c i64, p i64, n i64) i64 {
 	mut total = hend + cl
 	pTr = 0
 	pTrLen = 0
+	mut streamMode = 0 // a Router.Stream route whose body is still arriving (#481): 1 by length, 2 chunked
 	if chunked {
 		// Both framings at once is how requests are smuggled past a proxy (RFC 9112 6.3).
 		if seenCL {
@@ -1339,7 +1353,10 @@ fn serve_one(c i64, p i64, n i64) i64 {
 			bad(c, -r)
 			return -1
 		}
-		if r == 0 {
+		if r == 0 && route_streams(p, sp1, p+ts, tn) {
+			streamMode = 2
+		}
+		if r == 0 && streamMode == 0 {
 			c[cNeed] = 0
 			if expect100 && !http10 && c[cSent100] == 0 {
 				ob_room(32)
@@ -1348,17 +1365,31 @@ fn serve_one(c i64, p i64, n i64) i64 {
 			}
 			return 0
 		}
-		chunk_decode(p, hend)
-		cl = ckLen
-		total = ckEnd
-		pTr = ckTr
-		pTrLen = ckTrEnd - ckTr
+		if streamMode == 0 {
+			chunk_decode(p, hend)
+			cl = ckLen
+			total = ckEnd
+			pTr = ckTr
+			pTrLen = ckTrEnd - ckTr
+		}
 	}
-	if cl > gMaxBody {
+	if !chunked && n < total && cl <= maxStreamBody && route_streams(p, sp1, p+ts, tn) {
+		streamMode = 1
+	}
+	mut streamLeft = 0
+	if streamMode != 0 {
+		// The rest of the body is read by the handler, or not at all: a refusal below closes.
+		if streamMode == 1 {
+			streamLeft = cl // the whole body: what came with the headers is read from it first
+		}
+		cl = 0
+		total = n
+	}
+	if cl > gMaxBody && streamMode == 0 {
 		bad(c, 413)
 		return -1
 	}
-	if n < total {
+	if n < total && streamMode == 0 {
 		c[cNeed] = total
 		if expect100 && !http10 && c[cSent100] == 0 {
 			// The client waits for this before sending its body (RFC 9110 10.1.1): without it,
@@ -1371,7 +1402,7 @@ fn serve_one(c i64, p i64, n i64) i64 {
 	}
 	c[cNeed] = 0
 	c[cSent100] = 0
-	if upgrade && !http10 && !chunked && !draining && c[cTls] == 0 {
+	if upgrade && !http10 && !chunked && !draining && c[cTls] == 0 && streamMode == 0 {
 		// Upgrade: h2c is for cleartext only (RFC 9113 3.2).
 		pTs = ts
 		pTn = tn
@@ -1388,8 +1419,8 @@ fn serve_one(c i64, p i64, n i64) i64 {
 		// Past the soft memory limit (TIN_MEMORY_SOFT, #356): refuse new requests rather than
 		// let the container's limit end the process; the requests already running go on.
 		overloaded()
-		shed(c, sp1 == 4 && load8(p) == 'H' && bytes_are(p, 4, "HEAD"), http10 && alive, !alive)
-		if !alive {
+		shed(c, sp1 == 4 && load8(p) == 'H' && bytes_are(p, 4, "HEAD"), http10 && alive, !alive || streamMode != 0)
+		if !alive || streamMode != 0 {
 			c[cClose] = 1
 		}
 		return total
@@ -1397,8 +1428,8 @@ fn serve_one(c i64, p i64, n i64) i64 {
 	if gAdmit != nil {
 		if !gAdmit(Load{Core: myID, Waiting: waiting, Conns: __atomic_load(gLoad + myID*128), Buffered: bufBytes, Shed: shedCount, Pool: rt_mem_pool(), Ingot: rt_mem_ingot()}) {
 			overloaded()
-			shed(c, sp1 == 4 && load8(p) == 'H' && bytes_are(p, 4, "HEAD"), http10 && alive, !alive)
-			if !alive {
+			shed(c, sp1 == 4 && load8(p) == 'H' && bytes_are(p, 4, "HEAD"), http10 && alive, !alive || streamMode != 0)
+			if !alive || streamMode != 0 {
 				c[cClose] = 1
 			}
 			return total
@@ -1440,7 +1471,7 @@ fn serve_one(c i64, p i64, n i64) i64 {
 	if gDeadlineMs > 0 {
 		rt_task_set_deadline(task, rt_mono_ns()+gDeadlineMs*1000000)
 	}
-	if gRecord {
+	if gRecord && streamMode == 0 {
 		if chunked {
 			// replay frames the recorded bytes again: keep the decoded form (#349)
 			let rec = chunked_record(p)
@@ -1450,6 +1481,11 @@ fn serve_one(c i64, p i64, n i64) i64 {
 			record_start(task, c, p, total)
 		}
 	}
+	if streamMode != 0 {
+		// The handler reads the body as it arrives: what came with the headers is the reader's,
+		// and the socket is the handler's task's until it returns (stream_body.tin).
+		body_begin(c, streamMode, streamLeft, p+hend, n-hend, expect100 && !http10 && c[cSent100] == 0)
+	}
 	if rt_task_run(task) {
 		mut streamed = false
 		if c[cStream] != 0 {
@@ -1457,6 +1493,9 @@ fn serve_one(c i64, p i64, n i64) i64 {
 		}
 		if rt_task_panicked(task) && !streamed {
 			panicked(c, task)
+		}
+		if c[cBody] != 0 {
+			body_end(c) // the handler panicked before it was done with the body (#481)
 		}
 		if gRecord {
 			record_end(task)
@@ -1499,8 +1538,9 @@ fn run_request(c i64) {
 	}
 	let hd = pHead
 	let keep10 = pKeep10
-	let closes = pClose
+	mut closes = pClose
 	c[cStFlags] = i64(hd) | i64(pHttp10)<<1 | i64(keep10)<<2 | i64(closes)<<3
+	body_bind(c)
 	let body = make([]u8, 0, 1024)
 	let w = Out{Body: body, code: 200, ctype: "text/plain; charset=utf-8", extra: make([]u8, 0, 256), own: body}
 	rt_task_current()[tUser] = cast(i64, q)
@@ -1508,6 +1548,9 @@ fn run_request(c i64) {
 		dispatch(cast(rtable, gRoutes), mut q, mut w)
 	} else {
 		gHandler(q, mut w)
+	}
+	if c[cBody] != 0 && body_end(c) {
+		closes = true // the body was not read to its end: what is left is not a request (#481)
 	}
 	if c[cHijack] == 0 {
 		if gRecord {
@@ -1550,6 +1593,9 @@ fn finish_request(c i64, task i64) {
 	}
 	if rt_task_panicked(task) && c[cHijack] == 0 && c[cDead] == 0 && !streamed {
 		panicked(c, task)
+	}
+	if c[cBody] != 0 {
+		body_end(c) // the handler panicked or was cancelled before it was done with the body (#481)
 	}
 	if gRecord {
 		record_end(task)
@@ -2040,8 +2086,8 @@ fn parse_cl(p i64, n i64) i64 {
 		if d < '0' || d > '9' {
 			break
 		}
-		if v <= maxRequest {
-			v = v*10 + i64(d-'0')
+		if v <= maxStreamBody {
+			v = v*10 + i64(d-'0') // exact up to a streamed body's limit (#481), larger past it
 		}
 		nd += 1
 		i += 1
@@ -3338,6 +3384,7 @@ type route struct {
 	all     bool
 	pattern str
 	h       fn(Req, mut Out)
+	stream  bool // Router.Stream: the handler reads the body as it arrives (#481)
 }
 
 // A router mounted at prefix.
@@ -3377,6 +3424,7 @@ type rend struct {
 	names   []str // parameter names, in order
 	segs    []i64 // the path segment each one reads
 	rest    bool  // the last parameter reads the rest of the path
+	stream  bool  // a Router.Stream route: it runs before its body has arrived (#481)
 }
 
 // A router's prefix and its 404 and 405 answers; a miss gets the deepest scope over its path.
@@ -3455,6 +3503,14 @@ fn (r mut Router) Options(pattern str, h fn(Req, mut Out)) {
 fn (r mut Router) Handle(method str, pattern str, h fn(Req, mut Out)) {
 	routerGen += 1
 	r.routes = append(r.routes, route{method: method, all: false, pattern: pattern, h: h})
+}
+
+// Stream routes method requests for pattern to h, which runs as soon as the request's headers
+// are in and reads the body as it arrives with q.BodyStream() (#481): large uploads in bounded
+// memory, gRPC client and bidirectional streams. TIN_MAX_BODY does not bound such a body.
+fn (r mut Router) Stream(method str, pattern str, h fn(Req, mut Out)) {
+	routerGen += 1
+	r.routes = append(r.routes, route{method: method, all: false, pattern: pattern, h: h, stream: true})
 }
 
 // Any routes requests for pattern with every method to h; a route for the request's own
@@ -4071,7 +4127,9 @@ fn add_route(t mut rtable, rt route, prefix str, chain []fn(Req, mut Out, fn(Req
 		nd.eps = append(nd.eps, e)
 		nd.mask |= 1 << m
 	}
-	t.ends = append(t.ends, endpoint(rt.h, chain, full, pp))
+	let ep = endpoint(rt.h, chain, full, pp)
+	ep.stream = rt.stream
+	t.ends = append(t.ends, ep)
 }
 
 // add_method returns method m's code in t, giving a method no route used before the next one.

@@ -1,0 +1,146 @@
+package main
+
+import "anvil"
+import "mint"
+import "quarry"
+import "say"
+import "tide"
+
+// Request bodies read as they arrive (#481), for tools/ci/stream_body_check.py:
+//
+//	POST /upload[?slow=MS]  (Router.Stream) reads the body in 64 KiB pieces, sleeping MS between
+//	                        them, and answers "len=N sum=S first=MS" (S a checksum; first the ms
+//	                        from the request's start to its first byte)
+//	POST /partial           (Router.Stream) reads 10 bytes and answers
+//	POST /whole             (Router.Post) reads the whole body through BodyStream
+//	POST /count             (Router.Stream) counts the bytes, for uploads of a GiB
+//	POST /echo              (Router.Stream) streams each piece back as it is read
+//
+// With TLS_CERT and TLS_KEY it serves HTTPS too (h2 by ALPN).
+
+fn digest(q anvil.Req, slow i64) !str {
+	let r = q.BodyStream()
+	let t0 = tide.Now()
+	mut first = -1
+	mut buf = make([]u8, 65536)
+	mut n = 0
+	mut sum = 0
+	for {
+		let k = try r.Read(mut buf)
+		if k == 0 {
+			break
+		}
+		if first < 0 {
+			first = tide.Since(t0) / 1000000
+		}
+		for i in 0..k {
+			sum = (sum*31 + i64(buf[i])) % 1000000007
+		}
+		n += k
+		if slow > 0 {
+			try tide.Wait(slow * 1000000)
+		}
+	}
+	return "len={n} sum={sum} first={first}"
+}
+
+fn upload(q anvil.Req, w mut anvil.Out) {
+	let slow = mint.Atoi(q.Param("slow")) catch _ {
+		0
+	}
+	let out = digest(q, slow) catch e {
+		w.Status(400)
+		"fault {e}"
+	}
+	w.Text(out)
+}
+
+fn whole(q anvil.Req, w mut anvil.Out) {
+	let out = digest(q, 0) catch e {
+		w.Status(400)
+		"fault {e}"
+	}
+	w.Text("whole " + out)
+}
+
+fn count(q anvil.Req, w mut anvil.Out) {
+	let r = q.BodyStream()
+	mut buf = make([]u8, 262144)
+	mut n = 0
+	for {
+		let k = r.Read(mut buf) catch e {
+			w.Status(400)
+			w.Text("fault {e}")
+			return
+		}
+		if k == 0 {
+			break
+		}
+		n += k
+	}
+	w.Text("count={n}")
+}
+
+fn partial(q anvil.Req, w mut anvil.Out) {
+	let r = q.BodyStream()
+	mut buf = make([]u8, 10)
+	let k = r.Read(mut buf) catch e {
+		w.Status(400)
+		w.Text("fault {e}")
+		return
+	}
+	w.Text("read {k}")
+}
+
+fn echo(q anvil.Req, w mut anvil.Out) {
+	let r = q.BodyStream()
+	w.Type("application/octet-stream")
+	w.Stream() catch _ {
+		return
+	}
+	mut buf = make([]u8, 16384)
+	for {
+		let k = r.Read(mut buf) catch _ {
+			w.Abort()
+			return
+		}
+		if k == 0 {
+			break
+		}
+		w.Write(buf[:k]) catch _ {
+			return
+		}
+		w.Flush() catch _ {
+			return
+		}
+	}
+}
+
+fn main() {
+	let r = anvil.NewRouter()
+	r.Stream("POST", "/upload", upload)
+	r.Stream("POST", "/partial", partial)
+	r.Stream("POST", "/count", count)
+	r.Stream("POST", "/echo", echo)
+	r.Post("/whole", whole)
+	r.Get("/", fn(q anvil.Req, w mut anvil.Out) {
+		w.Text("ok {q.Proto()}")
+	})
+	if quarry.Getenv("TLS_CERT") != "" {
+		let cert = quarry.ReadFile(quarry.Getenv("TLS_CERT")) catch err {
+			say.Line(err)
+			return
+		}
+		let key = quarry.ReadFile(quarry.Getenv("TLS_KEY")) catch err {
+			say.Line(err)
+			return
+		}
+		r.ServeTLS(":8080", cert, key) catch err {
+			say.Line(err)
+		}
+		return
+	}
+	r.Serve(":8080") catch err {
+		say.Line(err)
+	}
+}
