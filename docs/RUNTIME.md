@@ -898,8 +898,19 @@ HTTP/1.1 over TLS 1.3 on the same per-core event loops (`lib/anvil/serve_tls.tin
   (PostgreSQL `clientcert=verify-full`, MySQL `REQUIRE X509`, Redis `tls-auth-clients`).
 - **Keys.** RSA (PSS), ECDSA P-256 and P-384, and Ed25519 (#477; RFC 8410 PKCS #8 keys), for the
   server's certificate and for a client's.
-- **Not supported:** 0-RTT, certificate selection by SNI (one chain per server, #476), and TLS 1.2
-  (#473). A
+- **Several certificates, and reloads (#476).** `TLSConfig.Certificates` adds certificates to
+  the default. A ClientHello's server_name chooses the first one whose leaf names it (exactly, or
+  by a one-label wildcard) and whose key signs a scheme the client accepts: an ECDSA and an RSA
+  certificate for one name serve both kinds of client. No SNI, or an unknown name, gets the
+  default. `anvil.ReloadCertificates` replaces the set from any core: every pair is checked
+  first, the set is published to the cores through a generation counter, and each core parses
+  its copy at its next handshake. The configuration a core replaces stays alive while handshakes
+  that use it run (the reclamation limbo), and the published PEM text is never freed, because
+  another core may still be reading an older set. A set given entirely as files
+  (`TLSCert.CertFile`, `KeyFile`) is read again by core 0 every `TIN_TLS_RELOAD_S` seconds
+  (default 60), and reloaded when the contents changed. A renewal on disk, from Let's Encrypt or
+  cert-manager, needs no restart; a broken pair is reported and the set in use stays.
+- **Not supported:** 0-RTT, and TLS 1.2 (#473). A
   `TIN_REPLAY_CAPSULE` replay sends plain HTTP and cannot replay into a TLS server.
 
 ### Pooled clients: mysql (v0.4)

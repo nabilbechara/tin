@@ -16,6 +16,8 @@ type ServerConfig struct {
 	Timeout i64          // ns the handshake may take (0: no limit; a request's deadline still applies)
 	ClientAuth i64       // NoClientCert, RequestClientCert or RequireClientCert (#475)
 	ClientCAs str        // PEM roots client certificates must chain to (with ClientAuth; the system's roots are not used)
+	Others []Credential  // more certificates, chosen by the client's server_name (#476; sni.tin)
+	names []str          // what the default certificate covers (LoadServerConfig)
 }
 
 // LoadServerConfig reads a PEM certificate chain (leaf first) and the leaf's PEM private key
@@ -31,7 +33,7 @@ fn LoadServerConfig(certPEM str, keyPEM str) !ServerConfig {
 	for _, c in certs {
 		chain = append(chain, c.Raw)
 	}
-	return ServerConfig{Certificates: chain, Key: key, ALPN: []str{}}
+	return ServerConfig{Certificates: chain, Key: key, ALPN: []str{}, Others: []Credential{}, names: cert_names(certs[0])}
 }
 
 // clientHello is what the server takes from a ClientHello.
@@ -261,7 +263,15 @@ fn (c mut Conn) server_handshake(cfg ServerConfig) ! {
 	if suite == 0 {
 		fail alert_fault(alertHandshakeFailure, "no cipher suite in common")
 	}
-	let scheme = pick_scheme(cfg.Key, ch.schemes)
+	// The certificate: the default, or the one of Others the server name chooses (sni.tin).
+	mut chain = cfg.Certificates
+	mut key = cfg.Key
+	let which = credential_for(cfg, ch.name, ch.schemes)
+	if which >= 0 {
+		chain = cfg.Others[which].Chain
+		key = cfg.Others[which].Key
+	}
+	let scheme = pick_scheme(key, ch.schemes)
 	if scheme == 0 {
 		fail alert_fault(alertHandshakeFailure, "no signature scheme in common for the certificate's key")
 	}
@@ -395,11 +405,11 @@ fn (c mut Conn) server_handshake(cfg ServerConfig) ! {
 		flight = cat(flight, crm)
 	}
 	if !resumed {
-		flight = cat(flight, certificate_msg([]u8{}, cfg.Certificates))
+		flight = cat(flight, certificate_msg([]u8{}, chain))
 	}
 	transcript = cat(transcript, flight)
 	if !resumed {
-		let sig = try cfg.Key.SignTLS(scheme, cv_content(transcript_hash(h, transcript)))
+		let sig = try key.SignTLS(scheme, cv_content(transcript_hash(h, transcript)))
 		mut cv = make([]u8, 0, 8+len(sig))
 		put16(mut cv, scheme)
 		put16(mut cv, len(sig))

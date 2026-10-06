@@ -1,0 +1,130 @@
+package tls
+
+import "seal"
+
+// ---- several certificates, chosen by the client's server_name (SNI; #476) ----
+//
+// ServerConfig's own Certificates and Key are the default; Others are more credentials. A
+// ClientHello's server_name selects the first credential, the default first, whose certificate
+// names it (exactly, or by a wildcard "*.example.com" for one label) and whose key signs with a
+// scheme the client accepts; then the first that names it at all; a client without SNI or with
+// an unknown name gets the default (or, failing its scheme, the first credential whose key the
+// client can verify).
+
+// Credential is a certificate chain (DER, leaf first), its private key, and the names its leaf
+// covers (its DNS names and IP addresses, lower case), for ServerConfig.Others.
+type Credential struct {
+	Chain [][]u8
+	Key   seal.PrivateKey
+	Names []str
+}
+
+// LoadCredential reads a PEM certificate chain (leaf first) and the leaf's PEM private key and
+// checks that they belong together.
+fn LoadCredential(certPEM str, keyPEM str) !Credential {
+	let certs = try seal.ParseCertificatesPEM(certPEM)
+	let key = try seal.ParsePrivateKeyPEM(keyPEM)
+	if !key.MatchesCertificate(certs[0]) {
+		fail "tls: the private key does not belong to the first certificate"
+	}
+	mut chain = make([][]u8, 0, len(certs))
+	for _, c in certs {
+		chain = append(chain, c.Raw)
+	}
+	return Credential{Chain: chain, Key: key, Names: cert_names(certs[0])}
+}
+
+// cert_names is what SNI is matched against for a leaf: its DNS names and IP addresses.
+fn cert_names(c seal.Certificate) []str {
+	mut names = make([]str, 0, len(c.DNSNames)+len(c.IPAddresses))
+	for _, d in c.DNSNames {
+		names = append(names, lower(d))
+	}
+	for _, ip in c.IPAddresses {
+		names = append(names, ip_text(ip))
+	}
+	return names
+}
+
+fn lower(s str) str {
+	mut b = make([]u8, len(s))
+	for i in 0..len(s) {
+		mut c = s[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 32
+		}
+		b[i] = c
+	}
+	return str(b)
+}
+
+// ip_text writes a 4-byte address in dotted form (16-byte addresses are not matched by SNI,
+// which carries host names only).
+fn ip_text(ip []u8) str {
+	if len(ip) != 4 {
+		return ""
+	}
+	return "{ip[0]}.{ip[1]}.{ip[2]}.{ip[3]}"
+}
+
+// names_cover reports whether one of names covers host: equal, or a wildcard "*.rest" with
+// host's first label replaced.
+fn names_cover(names []str, host str) bool {
+	let h = lower(host)
+	for _, n in names {
+		if n == h {
+			return true
+		}
+		if len(n) > 2 && n[0] == '*' && n[1] == '.' {
+			let dot = index_byte(h, '.')
+			if dot > 0 && h[dot:] == n[1:] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+fn index_byte(s str, b u8) i64 {
+	for i in 0..len(s) {
+		if s[i] == b {
+			return i
+		}
+	}
+	return -1
+}
+
+// credential_for chooses the chain and key for a ClientHello with server name name that accepts
+// the signature schemes schemes; -1 is the default, else the index in cfg.Others.
+fn credential_for(cfg ServerConfig, name str, schemes []i64) i64 {
+	if len(cfg.Others) == 0 {
+		return -1
+	}
+	if name != "" {
+		if names_cover(cfg.names, name) && pick_scheme(cfg.Key, schemes) != 0 {
+			return -1
+		}
+		for i, o in cfg.Others {
+			if names_cover(o.Names, name) && pick_scheme(o.Key, schemes) != 0 {
+				return i
+			}
+		}
+		if names_cover(cfg.names, name) {
+			return -1
+		}
+		for i, o in cfg.Others {
+			if names_cover(o.Names, name) {
+				return i
+			}
+		}
+	}
+	if pick_scheme(cfg.Key, schemes) != 0 {
+		return -1
+	}
+	for i, o in cfg.Others {
+		if pick_scheme(o.Key, schemes) != 0 {
+			return i
+		}
+	}
+	return -1
+}

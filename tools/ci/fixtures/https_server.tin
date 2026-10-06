@@ -11,8 +11,10 @@
 //   GET  /ws           a WebSocket echo: each message back, prefixed "echo: "
 //   GET  /watch        streams its head, then waits until w.Closed() and prints "watch saw closed"
 //   GET  /whoami       the common name of the client's certificate, or "none" (#475)
+//   GET  /reload?set=C,K;C,K  anvil.ReloadCertificates with those certificate and key files (#476)
 // With TLS_CLIENT_AUTH (1 request, 2 require) and TLS_CLIENT_CAS (a path) it serves through
-// ServeTLSConfig and asks clients for certificates.
+// ServeTLSConfig and asks clients for certificates. With TLS_CERTS ("C,K;C,K", paths) it serves
+// those certificates instead, chosen by server name, and reads them again when they change.
 package main
 
 import "anvil"
@@ -21,6 +23,7 @@ import "quarry"
 import "say"
 import "seal"
 import "tide"
+import "twine"
 import "websocket"
 
 fn num(q anvil.Req, name str, dflt i64) i64 {
@@ -51,6 +54,26 @@ fn whoami(q anvil.Req, w mut anvil.Out) {
 		return
 	}
 	w.Text("cn={c.Subject.CommonName} chain={len(tc.PeerCertificates())} resumed={tc.Resumed()}")
+}
+
+// cert_set reads "C,K;C,K" (certificate and key paths) as TLSCerts.
+fn cert_set(spec str) []anvil.TLSCert {
+	mut out = make([]anvil.TLSCert, 0, 4)
+	for _, pair in twine.Split(spec, ";") {
+		let parts = twine.Split(pair, ",")
+		if len(parts) == 2 {
+			out = append(out, anvil.TLSCert{CertPEM: "", KeyPEM: "", CertFile: parts[0], KeyFile: parts[1]})
+		}
+	}
+	return out
+}
+
+fn reload(q anvil.Req, w mut anvil.Out) {
+	anvil.ReloadCertificates(cert_set(q.Param("set"))) catch err {
+		w.Text("refused: {err}")
+		return
+	}
+	w.Text("reloaded")
 }
 
 fn info(q anvil.Req, w mut anvil.Out) {
@@ -161,7 +184,15 @@ fn main() {
 	r.Get("/ws", ws)
 	r.Get("/watch", watch)
 	r.Get("/whoami", whoami)
+	r.Get("/reload", reload)
 	let auth = mint.Atoi(quarry.Getenv("TLS_CLIENT_AUTH")) catch _ { 0 }
+	if quarry.Getenv("TLS_CERTS") != "" {
+		r.ServeTLSConfig(":8443", anvil.TLSConfig{CertPEM: "", KeyPEM: "", Certificates: cert_set(quarry.Getenv("TLS_CERTS")),
+			ClientAuth: 0, ClientCAs: ""}) catch err {
+			say.Line("server:", err)
+		}
+		return
+	}
 	if auth != 0 {
 		let cas = quarry.ReadFile(quarry.Getenv("TLS_CLIENT_CAS")) catch err {
 			say.Line("client CAs:", err)

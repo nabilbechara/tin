@@ -27,6 +27,7 @@ import base64
 import hashlib
 import os
 import re
+import shutil
 import signal
 import socket
 import ssl
@@ -546,6 +547,112 @@ def mtls(openssl, exe, client, certs, work):
           'refusals; RequestClientCert serves a client without one; ClientCAs without a certificate fail at start')
 
 
+# ---- certificates chosen by server name, and reloads (#476) ----
+
+def named_cert(openssl, work, name, sans, kind='ecdsa', org='tin tests'):
+    """A self-signed certificate for sans (DNS names) with common name name: (cert, key)."""
+    args = {'ecdsa': ['-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256'], 'rsa': ['-newkey', 'rsa:2048']}[kind]
+    cert, key = work / f'{name}-{kind}.pem', work / f'{name}-{kind}.key'
+    r = subprocess.run([openssl, 'req', '-x509', *args, '-keyout', str(key), '-out', str(cert), '-days', '30', '-nodes',
+                        '-subj', f'/CN={name}/O={org}', '-addext', 'subjectAltName=' + ','.join('DNS:' + n for n in sans)],
+                       capture_output=True)
+    assert r.returncode == 0, r.stderr
+    return cert, key
+
+
+def served_cert(openssl, port, servername=None, extra=()):
+    """The subject line and peer signature type s_client reports for one handshake."""
+    args = list(extra) + (['-servername', servername] if servername else ['-noservername'])
+    cmd = [openssl, 's_client', '-tls1_3', '-connect', f'127.0.0.1:{port}', '-ign_eof', *args]
+    r = subprocess.run(cmd, input=get('/fast'), capture_output=True, timeout=30)
+    out = r.stdout.decode('latin1') + r.stderr.decode('latin1')
+    assert '\r\n\r\nfast' in out, out[-1500:]
+    subj = re.search(r'^subject=(.*)$', out, re.M).group(1).replace(' ', '')
+    sig = re.search(r'Peer signature type: (\S+)', out).group(1)
+    return subj, sig
+
+
+def sni_reload(openssl, exe, certs, work):
+    d = work / 'sni'
+    d.mkdir(exist_ok=True)
+    default = named_cert(openssl, d, 'default', ['localhost'])
+    a = named_cert(openssl, d, 'a.test', ['a.test'])
+    a_rsa = named_cert(openssl, d, 'a.test', ['a.test'], kind='rsa')
+    wild = named_cert(openssl, d, 'wild', ['*.c.test'])
+    spec = ';'.join(f'{c},{k}' for c, k in (default, a, wild, a_rsa))
+    srv = Server(exe, certs['ecdsa'], work, env={'TLS_CERTS': spec, 'TIN_TLS_RELOAD_S': '1'}, cores=2)
+    try:
+        for name, cn in (('a.test', 'a.test'), ('x.c.test', 'wild'), ('c.test', 'default'), ('nobody.test', 'default'),
+                         (None, 'default'), ('A.TEST', 'a.test')):
+            subj, sig = served_cert(openssl, srv.port, name)
+            assert subj.startswith(f'CN={cn},'), (name, subj)
+        # A client that verifies only RSA-PSS gets a.test's RSA certificate.
+        subj, sig = served_cert(openssl, srv.port, 'a.test', ['-sigalgs', 'rsa_pss_rsae_sha256'])
+        assert subj.startswith('CN=a.test,') and sig.lower().replace('-', '_').startswith('rsa_pss'), (subj, sig)
+        # A reload while handshakes run: none fails, and new connections get the new set.
+        b = named_cert(openssl, d, 'b.test', ['b.test', 'localhost'])
+        stop, errors, done = threading.Event(), [], [0]
+
+        def hammer():
+            while not stop.is_set():
+                try:
+                    served_cert(openssl, srv.port, 'localhost')
+                    done[0] += 1
+                except Exception as e:
+                    errors.append(e)
+
+        threads = [threading.Thread(target=hammer) for _ in range(4)]
+        for t in threads:
+            t.start()
+        time.sleep(0.5)
+        for spec2 in (f'{b[0]},{b[1]};{a[0]},{a[1]}', spec, f'{b[0]},{b[1]};{a[0]},{a[1]}'):
+            rc, out = s_client(openssl, srv.port, [], get('/reload?set=' + spec2), cafile=None)
+            assert 'reloaded' in out, out[-800:]
+            time.sleep(0.3)
+        stop.set()
+        for t in threads:
+            t.join()
+        assert not errors and done[0] > 10, (errors[:3], done[0])
+        subj, _ = served_cert(openssl, srv.port, 'localhost')
+        assert subj.startswith('CN=b.test,'), subj
+        # A pair whose key belongs to another certificate is refused; the set in use stays.
+        rc, out = s_client(openssl, srv.port, [], get(f'/reload?set={a[0]},{b[1]}'))
+        assert 'refused: anvil: certificate 1:' in out, out[-800:]
+        subj, _ = served_cert(openssl, srv.port, 'localhost')
+        assert subj.startswith('CN=b.test,'), subj
+    finally:
+        srv.stop()
+    # Certificates served from files: a renewal written to disk is picked up within the check
+    # interval (TIN_TLS_RELOAD_S=1), and a broken pair on disk is refused.
+    live_c, live_k = d / 'live.pem', d / 'live.key'
+    shutil.copy(a[0], live_c)
+    shutil.copy(a[1], live_k)
+    srv = Server(exe, certs['ecdsa'], work, env={'TLS_CERTS': f'{live_c},{live_k}', 'TIN_TLS_RELOAD_S': '1'})
+    try:
+        subj, _ = served_cert(openssl, srv.port, 'a.test')
+        assert 'O=tintests' in subj, subj
+        renewed = named_cert(openssl, d, 'a.test', ['a.test'], org='renewed')
+        os.replace(renewed[1], live_k)
+        os.replace(renewed[0], live_c)
+        until = time.monotonic() + 10
+        while time.monotonic() < until:
+            subj, _ = served_cert(openssl, srv.port, 'a.test')
+            if 'O=renewed' in subj:
+                break
+            time.sleep(0.3)
+        assert 'O=renewed' in subj, subj
+        shutil.copy(b[1], live_k)  # a key that is not the certificate's
+        time.sleep(2.5)
+        subj, _ = served_cert(openssl, srv.port, 'a.test')
+        assert 'O=renewed' in subj, subj
+        assert 'certificate reload refused' in srv.output(), srv.output()[-800:]
+    finally:
+        srv.stop()
+    print('PASS server names: exact, wildcard, unknown and no SNI choose their certificate, an RSA-only client gets the RSA '
+          'one; three reloads under handshake load fail none and switch the set, a mismatched pair is refused; a renewed '
+          'certificate file is served within the check interval and a broken one is refused')
+
+
 # ---- malformed handshakes and timeouts ----
 
 def exchange(port, data, wait=5.0):
@@ -830,6 +937,7 @@ def main():
         tin_clients(exe, client, certs, work)
         resumption(openssl, exe, client, certs, work)
         mtls(openssl, exe, client, certs, work)
+        sni_reload(openssl, exe, certs, work)
         malformed(exe, client, certs, work)
         one_core(exe, client, certs, work)
         memory(openssl, exe, certs, work)

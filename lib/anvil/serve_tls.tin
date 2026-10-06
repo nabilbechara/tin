@@ -1,6 +1,8 @@
 package anvil
 
 import "quarry"
+import "say"
+import "seal"
 import "tls"
 
 // ---- HTTPS: ServeTLS (#124) ----
@@ -20,9 +22,13 @@ import "tls"
 // never calls it links no TLS code.
 
 shared mut gTlsOn bool
-shared mut gTlsCert i64 // the certificate chain's PEM text (kept in core 0's heap; each core parses its own copy)
-shared mut gTlsKey i64  // the private key's PEM text
 shared mut gTlsMs i64   // a handshake must finish within this (TIN_HANDSHAKE_TIMEOUT_MS; -1: the header timeout)
+shared mut gTlsSet i64      // the certificates in effect (#476): malloc'd words [n, cert 1, key 1, ...] of heap strs, never freed (a core may still be reading an older set)
+shared mut gTlsGen i64      // the set's generation: each reload adds 1, and a core rebuilds its configuration when it sees a new one
+shared mut gTlsFiles i64    // malloc'd words [n, cert path, key path, contents' hash, ...] when certificates come from files, else 0
+shared mut gTlsCheckNs i64  // how often core 0 looks at those files (TIN_TLS_RELOAD_S, default 60 s)
+shared mut gTlsNextCheck i64
+shared mut gTlsWatch fn()   // tls_watch: core 0's sweep looks at the files
 shared mut gTlsClientAuth i64 // TLSConfig.ClientAuth (#475)
 shared mut gTlsClientCAs i64  // TLSConfig.ClientCAs's PEM text, 0 for none
 
@@ -39,6 +45,7 @@ shared mut gTlsFree fn(i64)                    // tls_free: release the connecti
 
 mut tlsCfg ?tls.ServerConfig // this core's copy: an RSA key holds scratch space its signing writes
 mut tlsCfgBad bool           // the copy could not be made (reported once)
+mut tlsGen i64               // the generation of the certificate set tlsCfg was made from
 let tlsConns = make(map[i64]?tls.Conn)
 mut tlsHandshakes i64 // handshake tasks running on this core
 mut tlsOb i64         // the sealed output batch is built here, then swapped with ob
@@ -68,12 +75,38 @@ fn (r Router) ServeTLS(addr str, certPEM str, keyPEM str) ! {
 }
 
 // TLSConfig configures ServeTLSConfig: the certificate chain and private key, as ServeTLS takes
-// them, and client certificates (mutual TLS, #475).
+// them, more certificates chosen by the client's server name (#476), and client certificates
+// (mutual TLS, #475).
 type TLSConfig struct {
-	CertPEM    str // the certificate chain (leaf first), PEM
-	KeyPEM     str // the leaf's private key (RSA, ECDSA P-256 or P-384), PEM
-	ClientAuth i64 // tls.NoClientCert (the default), tls.RequestClientCert or tls.RequireClientCert
-	ClientCAs  str // with ClientAuth: the PEM roots a client certificate must chain to (the system's are not used)
+	CertPEM      str       // the certificate chain (leaf first), PEM ("" when Certificates gives them all)
+	KeyPEM       str       // the leaf's private key (RSA, ECDSA P-256 or P-384, Ed25519), PEM
+	Certificates []TLSCert // more certificates; the default is CertPEM's, else the first of these
+	ClientAuth   i64       // tls.NoClientCert (the default), tls.RequestClientCert or tls.RequireClientCert
+	ClientCAs    str       // with ClientAuth: the PEM roots a client certificate must chain to (the system's are not used)
+}
+
+// TLSCert is one certificate chain (leaf first) and its private key: PEM text, or the paths of
+// PEM files, which the server reads again when they change (#476).
+type TLSCert struct {
+	CertPEM  str
+	KeyPEM   str
+	CertFile str
+	KeyFile  str
+}
+
+// ReloadCertificates replaces the server's certificates, from any core while it serves: the
+// first is the default, the others are chosen by the client's server name. Every pair is checked
+// first, and a bad one fails the call and changes nothing. Each core switches at its next
+// handshake; connections already up keep their own. Pairs given as files are read now, and when
+// the whole set was given as files, core 0 reads them again every TIN_TLS_RELOAD_S seconds
+// (default 60) and reloads when they changed, so a renewal written to disk needs no call.
+fn ReloadCertificates(certs []TLSCert) ! {
+	if !gTlsOn {
+		fail "anvil: ReloadCertificates on a server without TLS"
+	}
+	let pems = try tls_read_pems("", "", certs)
+	try tls_check_pems(pems)
+	tls_publish(pems)
 }
 
 // ServeTLSConfig is ServeTLS with a TLSConfig. With ClientAuth set, every full handshake asks
@@ -113,9 +146,9 @@ fn tls_setup(certPEM str, keyPEM str) ! {
 
 // tls_setup_config is tls_setup for a TLSConfig: the client CAs are checked too.
 fn tls_setup_config(tc TLSConfig) ! {
-	let certPEM = tc.CertPEM
-	let keyPEM = tc.KeyPEM
-	let probe = try tls.LoadServerConfig(certPEM, keyPEM)
+	let pems = try tls_read_pems(tc.CertPEM, tc.KeyPEM, tc.Certificates)
+	try tls_check_pems(pems)
+	let probe = try tls.LoadServerConfig(pems[0], pems[1])
 	if tc.ClientAuth != tls.NoClientCert {
 		if tc.ClientAuth != tls.RequestClientCert && tc.ClientAuth != tls.RequireClientCert {
 			fail "anvil: TLSConfig.ClientAuth must be tls.NoClientCert, tls.RequestClientCert or tls.RequireClientCert"
@@ -129,8 +162,8 @@ fn tls_setup_config(tc TLSConfig) ! {
 		gTlsClientCAs = cast(i64, keep(tc.ClientCAs))
 	}
 	gTlsClientAuth = tc.ClientAuth
-	gTlsCert = cast(i64, keep(certPEM))
-	gTlsKey = cast(i64, keep(keyPEM))
+	tls_publish(pems)
+	tls_files(tc.Certificates)
 	gTlsMs = -1
 	let ms = quarry.Getenv("TIN_HANDSHAKE_TIMEOUT_MS")
 	if ms != "" {
@@ -242,24 +275,150 @@ fn tls_http1(c i64) {
 // tls_core_config makes this core's copy of the server configuration the first time; false
 // when that fails (the pair was checked by ServeTLS, so only memory can make it fail).
 fn tls_core_config() bool {
-	if tlsCfg != nil {
-		return true
+	let gen = __atomic_load(&gTlsGen)
+	if tlsGen == gen && (tlsCfg != nil || tlsCfgBad) {
+		return tlsCfg != nil
 	}
-	if tlsCfgBad {
-		return false
-	}
-	let cfg = tls.LoadServerConfig(cast(str, gTlsCert), cast(str, gTlsKey)) catch err {
-		tlsCfgBad = true
+	// A new certificate set (ServeTLS, or a reload): parse this core's copy. The configuration it
+	// replaces stays alive while handshakes that use it run (the reclamation limbo).
+	tlsGen = gen
+	let set = __atomic_load(&gTlsSet)
+	let cfg = tls.LoadServerConfig(cast(str, set[1]), cast(str, set[2])) catch err {
+		tlsCfgBad = tlsCfg == nil
 		quarry.Eprintln("anvil: TLS configuration: {err}")
-		return false
+		return tlsCfg != nil
 	}
+	mut others = make([]tls.Credential, 0, set[0])
+	for i in 1..set[0] {
+		let o = tls.LoadCredential(cast(str, set[1+2*i]), cast(str, set[2+2*i])) catch err {
+			quarry.Eprintln("anvil: TLS configuration: {err}")
+			continue
+		}
+		others = append(others, o)
+	}
+	cfg.Others = others
 	cfg.ALPN = tls_alpn()
 	cfg.ClientAuth = gTlsClientAuth
 	if gTlsClientCAs != 0 {
 		cfg.ClientCAs = cast(str, gTlsClientCAs)
 	}
 	tlsCfg = keep(cfg)
+	tlsCfgBad = false
 	return true
+}
+
+// ---- the certificate set, its reloads and its files (#476) ----
+
+// tls_read_pems is the certificate set as alternating chain and key PEM texts: certPEM's pair
+// first when it is given, then each TLSCert's, read from its files when it names them.
+fn tls_read_pems(certPEM str, keyPEM str, certs []TLSCert) ![]str {
+	mut pems = make([]str, 0, 2+2*len(certs))
+	if certPEM != "" {
+		pems = append(pems, certPEM, keyPEM)
+	}
+	for _, c in certs {
+		if c.CertFile != "" {
+			let cert = quarry.ReadFile(c.CertFile) catch err {
+				fail say.Fault("anvil: certificate file: %v", err)
+			}
+			let key = quarry.ReadFile(c.KeyFile) catch err {
+				fail say.Fault("anvil: key file: %v", err)
+			}
+			pems = append(pems, cert, key)
+		} else {
+			pems = append(pems, c.CertPEM, c.KeyPEM)
+		}
+	}
+	if len(pems) == 0 {
+		fail "anvil: no certificate (TLSConfig.CertPEM or TLSConfig.Certificates)"
+	}
+	return pems
+}
+
+// tls_check_pems checks every pair of a certificate set.
+fn tls_check_pems(pems []str) ! {
+	for i in (0..len(pems)).step(2) {
+		tls.LoadCredential(pems[i], pems[i+1]) catch err {
+			fail say.Fault("anvil: certificate %d: %v", i/2+1, err)
+		}
+	}
+}
+
+// tls_publish makes pems the certificate set every core uses from its next handshake on. The set
+// is copied to memory that is never freed: another core may still be reading the previous one.
+fn tls_publish(pems []str) {
+	let set = calloc(1+len(pems), 8)
+	set[0] = len(pems) / 2
+	for i, p in pems {
+		set[1+i] = rt_heap_str(p)
+	}
+	__atomic_store(&gTlsSet, set)
+	__atomic_add(&gTlsGen, 1)
+}
+
+// tls_files remembers the certificate files and a hash of their contents, for tls_watch.
+fn tls_files(certs []TLSCert) {
+	mut n = 0
+	for _, c in certs {
+		if c.CertFile != "" {
+			n += 1
+		}
+	}
+	if n == 0 || n != len(certs) {
+		// Only a set given entirely as files is watched: a reload must not drop PEM pairs.
+		return
+	}
+	let w = calloc(1+3*n, 8)
+	w[0] = n
+	for i, c in certs {
+		w[1+3*i] = rt_heap_str(c.CertFile)
+		w[2+3*i] = rt_heap_str(c.KeyFile)
+		w[3+3*i] = rt_heap_str(tls_digest(c.CertFile, c.KeyFile))
+	}
+	gTlsFiles = w
+	gTlsCheckNs = env_int("TIN_TLS_RELOAD_S", 60) * 1000000000
+	gTlsNextCheck = rt_mono_ns() + gTlsCheckNs
+	gTlsWatch = tls_watch
+}
+
+// tls_digest is a hash of a certificate file and its key file ("" when one cannot be read). The
+// contents are compared, not modification times, whose one-second steps can hide a renewal.
+fn tls_digest(certFile str, keyFile str) str {
+	let c = quarry.ReadFile(certFile) catch _ { "" }
+	let k = quarry.ReadFile(keyFile) catch _ { "" }
+	return seal.Sha256Hex(c + "\n" + k)
+}
+
+// tls_watch (core 0's sweep, once a second) reads the certificate files again every
+// TIN_TLS_RELOAD_S seconds and, when one changed since the last look, checks the new set and
+// publishes it; a bad set is reported and the certificates in use stay.
+fn tls_watch() {
+	let now = rt_mono_ns()
+	if now < gTlsNextCheck {
+		return
+	}
+	gTlsNextCheck = now + gTlsCheckNs
+	let w = gTlsFiles
+	mut changed = false
+	mut certs = make([]TLSCert, 0, w[0])
+	for i in 0..w[0] {
+		let cf = cast(str, w[1+3*i])
+		let kf = cast(str, w[2+3*i])
+		let m = tls_digest(cf, kf)
+		if m != cast(str, w[3+3*i]) {
+			w[3+3*i] = rt_heap_str(m)
+			changed = true
+		}
+		certs = append(certs, TLSCert{CertPEM: "", KeyPEM: "", CertFile: cf, KeyFile: kf})
+	}
+	if !changed {
+		return
+	}
+	ReloadCertificates(certs) catch err {
+		quarry.Eprintln("anvil: certificate reload refused, the certificates in use stay: {err}")
+		return
+	}
+	quarry.Eprintln("anvil: certificates reloaded from their files")
 }
 
 // tls_accept runs the handshake of the new connection c in a task, with the request deadline
