@@ -552,13 +552,16 @@ fn (c Client) leader(topic str, p i64) !str {
 
 // Partitions is how many partitions topic has (asking the cluster). A topic created a moment ago
 // may not be in every broker's metadata yet, so an unknown topic is asked about again for a
-// little while (about two seconds) before the call fails with ErrUnknownTopic.
+// little while (about two seconds) before the call fails with ErrUnknownTopic; so is one still
+// being created, which has no partitions yet.
 fn (c Client) Partitions(topic str) !i64 {
 	for attempt in 0..maxAttempts {
 		let err = c.refresh([]str{topic})
 		if err == nil {
+			// 0 is a topic being created (LEADER_NOT_AVAILABLE, no partitions yet): ask again
+			// (#442: callers divided by it). Every topic has at least one partition.
 			let n = c.partsKnown(topic)
-			if n >= 0 {
+			if n > 0 {
 				return n
 			}
 		} else if !c.retry(err, "", attempt) {
@@ -570,7 +573,7 @@ fn (c Client) Partitions(topic str) !i64 {
 			break
 		}
 	}
-	fail fault.Wrap(ErrUnknownTopic, "kafka: topic {topic} has no metadata")
+	fail fault.Wrap(ErrUnknownTopic, "kafka: topic {topic} has no metadata or no partitions")
 }
 
 // partitions is the cached partition count, asking the cluster when unknown (always, in a

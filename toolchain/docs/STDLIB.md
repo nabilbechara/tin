@@ -1461,7 +1461,7 @@ A key picks the partition the way the Java client does (murmur2), so a key lands
 - `type Client struct`: Client talks to one Kafka cluster. Open it in a global's initializer (which runs on every core) or once in main, not per request.
 - `type Ack struct`: Ack says where Send put a record. Offset is -1 with Acks.NoAck, and when an idempotent retry found the batch already written.
 - `Open(o Options) Client`: Open makes a client for the cluster in o. It connects on first use, on each core.
-- `(c Client) Partitions(topic str) !i64`: Partitions is how many partitions topic has (asking the cluster). A topic created a moment ago may not be in every broker's metadata yet, so an unknown topic is asked about again for a little while (about two seconds) before the call fails with ErrUnknownTopic.
+- `(c Client) Partitions(topic str) !i64`: Partitions is how many partitions topic has (asking the cluster). A topic created a moment ago may not be in every broker's metadata yet, so an unknown topic is asked about again for a little while (about two seconds) before the call fails with ErrUnknownTopic; so is one still being created, which has no partitions yet.
 - `(c Client) Ping() !`: Ping checks that a broker answers.
 - `(c Client) Send(topic str, m Message) !Ack`: Send appends one record to topic and returns where it went. A record with a key goes to the partition the key hashes to; one without goes to one partition per call, in turn.
 - `(c Client) SendTo(topic str, partition i64, m Message) !Ack`: SendTo appends one record to a chosen partition of topic.
@@ -1472,17 +1472,18 @@ A key picks the partition the way the Java client does (murmur2), so a key lands
 - `type Record struct`: Record is a record read from a partition.
 - `type Compression enum`: Compression codecs, as the record batch attributes number them.
 - `Murmur2(data str) i64`: Murmur2 is the hash Kafka's default partitioner uses for keys (Java's Utils.murmur2), so a key lands on the same partition here as from the Java client.
-- `PartitionFor(key str, n i64) i64`: PartitionFor is the partition Kafka's default partitioner picks for key among n partitions.
+- `PartitionFor(key str, n i64) i64`: PartitionFor is the partition Kafka's default partitioner picks for key among n partitions; -1 when n is below 1.
 - `EncodeBatch(ms []Message, now i64, c Compression) str`: EncodeBatch is ms as one record batch (format 2) compressed with c, the bytes Kafka stores and sends, with offsets counted from 0. A message whose Timestamp is 0 gets now (ms since the epoch).
 - `DecodeBatches(data str) ![]Record`: DecodeBatches reads the record batches in data, as a Fetch response carries them, with any codec. A batch the data ends in the middle of is dropped; a damaged one, a changed byte (CRC-32C) or an old message format fails. Control batches (transaction markers) are skipped. All the batches together may decompress to at most 64 times the larger of 1 MiB and len(data).
-- `type Txn struct`: Txn is this core's transactional producer for one transactional id.
-- `(c Client) Transactional(txid str, timeout i64) !Txn`: Transactional makes this core's producer for transactional id txid (timeout: how long the broker lets a transaction stay open, default 60 s). It fences any older producer with the same id, and aborts what that one left open.
+- `type Txn struct`: Txn is this core's transactional producer for one transactional id. It serves one task at a time: a call made while another task's call is in progress fails with ErrTransaction (two sends to one partition at once would share a sequence, and the broker would drop one as a duplicate). After a send fails the transaction can only be aborted, since the broker may have written that send's records; Abort then starts the producer again with a new epoch.
+- `(c Client) Transactional(txid str, timeout i64) !Txn`: Transactional makes this core's producer for transactional id txid (timeout: how long the broker lets a transaction stay open, default 60 s). It fences any older producer with the same id, and aborts what that one left open. Making it again for the same id (after fencing or a transaction timeout) replaces this core's producer of that id: older Txn values of it fail. A core holds at most 64; Close frees one.
+- `(t Txn) Close()`: Close frees this core's slot of the producer. A transaction still open is left to the broker, which aborts it at its timeout or when the id is used again.
 - `(t Txn) Begin() !`: Begin starts a transaction.
 - `(t Txn) Send(topic str, m Message) !Ack`: Send writes one record in the open transaction.
 - `(t Txn) SendBatch(topic str, ms []Message) ![]Ack`: SendBatch writes records in the open transaction, one batch per partition; readers with ReadCommitted see them only once the transaction commits.
 - `(t Txn) SendOffsets(group str, offsets []TopicPartition) !`: SendOffsets commits a consumer group's offsets as part of the open transaction (consume-transform-produce): they become the group's committed offsets only if the transaction commits.
-- `(t Txn) Commit() !`: Commit commits the open transaction: its records become visible to ReadCommitted readers and its offsets the group's.
-- `(t Txn) Abort() !`: Abort discards the open transaction.
+- `(t Txn) Commit() !`: Commit commits the open transaction: its records become visible to ReadCommitted readers and its offsets the group's. After a failed send it fails: only Abort is left.
+- `(t Txn) Abort() !`: Abort discards the open transaction. After a failed send it starts the producer again (InitProducerId: the coordinator aborts the transaction and gives a new epoch, and every partition's sequence starts over), as Java does (KIP-360): records the broker may have written for the failed send cannot make a later send look like their duplicate.
 
 ## websocket
 

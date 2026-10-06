@@ -131,10 +131,13 @@ fn be64(s str, at i64) i64 {
 // ---- the cluster ----
 
 // Topics and their leaders (the same on every broker): t has partitions led by brokers 1, 2
-// and 3, old is led by broker 4, tx and the group's topic g by brokers 1 and 2. t/1's leader
-// moves from broker 2 to broker 1 at the first produce to it (see leaderOf).
+// and 3, old is led by broker 4, tx and the group's topic g by brokers 1 and 2, txl (the
+// transactional producer's failures, #442) by broker 1. t/1's leader moves from broker 2 to
+// broker 1 at the first produce to it (see leaderOf). late is being created: each broker's
+// first answer about it has no partitions (LEADER_NOT_AVAILABLE), later ones one, led by broker
+// 1; never stays without partitions.
 fn layout() []str {
-	return []str{"t", "old", "tx", "g"}
+	return []str{"t", "old", "tx", "g", "txl"}
 }
 
 // leaderOf is the leader of topic's partition part as broker b sees it: once broker 2 has told
@@ -145,6 +148,8 @@ fn leaderOf(b broker, topic str, part i64, l i64) i64 {
 	}
 	return l
 }
+
+mut lateAsked i64
 
 fn leaders(topic str) []i64 {
 	if topic == "t" {
@@ -158,6 +163,9 @@ fn leaders(topic str) []i64 {
 	}
 	if topic == "g" {
 		return []i64{1, 2}
+	}
+	if topic == "txl" || topic == "late" {
+		return []i64{1}
 	}
 	return []i64{}
 }
@@ -578,8 +586,18 @@ fn metadata(b mut broker, r mut rd, head []u8) str {
 	p32(mut out, 1)
 	p32(mut out, len(asked))
 	for _, t in asked {
-		let ls = leaders(t)
-		if len(ls) == 0 {
+		mut ls = leaders(t)
+		mut creating = t == "never"
+		if t == "late" {
+			lateAsked += 1
+			if lateAsked == 1 {
+				creating = true
+			}
+		}
+		if creating {
+			ls = []i64{}
+			p16(mut out, 5)
+		} else if len(ls) == 0 {
 			p16(mut out, 3)
 		} else {
 			p16(mut out, 0)
@@ -652,6 +670,9 @@ fn produce(b mut broker, r mut rd, head []u8) (str, bool) {
 					}
 				}
 				if seq < expect {
+					if contains(batch, "ack-lost") {
+						lostAck = true
+					}
 					p16(mut out, 46)
 					p64(mut out, -1)
 					p64(mut out, -1)
@@ -681,8 +702,10 @@ fn produce(b mut broker, r mut rd, head []u8) (str, bool) {
 			p64(mut out, base)
 			p64(mut out, -1)
 			p64(mut out, 0)
-			// Broker 3 writes its second batch and loses the acknowledgement.
-			if b.id == 3 && b.produces == 2 {
+			// Broker 3 writes its second batch and loses the acknowledgement. A record "ack-lost"
+			// is written and its acknowledgement always lost: retries too, so the send fails
+			// after the broker wrote it.
+			if (b.id == 3 && b.produces == 2) || contains(batch, "ack-lost") {
 				lostAck = true
 			}
 		}
@@ -1028,6 +1051,19 @@ fn check(label str, cond bool) {
 	}
 }
 
+// sendTo sends one record in tx's open transaction: 0 when it is written, 1 when it fails with
+// ErrTransaction, 2 for another fault.
+fn sendTo(tx kafka.Txn, v str) i64 {
+	let (_, err) = tx.Send("txl", msg(v))
+	if err == nil {
+		return 0
+	}
+	if fault.Is(err, kafka.ErrTransaction) {
+		return 1
+	}
+	return 2
+}
+
 fn msg(v str) kafka.Message {
 	return kafka.Message{Key: "", Value: v, Headers: []kafka.Header{}, Timestamp: 0}
 }
@@ -1151,6 +1187,62 @@ fn run(ports str) ! {
 	let cr = try rc.Fetch("tx", 0, 0, 0)
 	check("read_committed sees only the committed record", len(cr) == 1 && cr[0].Value == "committed")
 	rc.Close()
+
+	// A send that fails after the broker wrote it (#442): the transaction can only abort, and
+	// Abort gives the producer a new epoch, so the next send is not taken for its duplicate.
+	let tl = try c.Transactional("txl-1", 0)
+	try tl.Begin()
+	let (_, lostErr) = tl.Send("txl", msg("ack-lost"))
+	check("a send whose answers are lost fails", lostErr != nil)
+	let (_, onlyAbort) = tl.Send("txl", msg("too soon"))
+	check("then the transaction can only abort", onlyAbort != nil && fault.Is(onlyAbort, kafka.ErrTransaction))
+	let noCommit = tl.Commit()
+	check("and does not commit", noCommit != nil && fault.Is(noCommit, kafka.ErrTransaction))
+	try tl.Abort()
+	try tl.Begin()
+	let second = try tl.Send("txl", msg("second"))
+	try tl.Commit()
+	let txl = try c.Fetch("txl", 0, 0, 0)
+	mut written = false
+	for _, rec in txl {
+		if rec.Value == "second" && rec.Offset == second.Offset {
+			written = true
+		}
+	}
+	check("after Abort the next send is written, not taken for a duplicate", written)
+
+	// One Txn serves one task at a time: a second task's call fails clearly.
+	try tl.Begin()
+	let (u1, u2) = try parallel {
+		sendTo(tl, "p1")
+		sendTo(tl, "p2")
+	}
+	check("a Txn used by two tasks at once fails one of them with ErrTransaction", (u1 == 0 && u2 == 1) || (u1 == 1 && u2 == 0))
+	try tl.Commit()
+
+	// A topic with no partitions yet is asked about again, not divided by (#442).
+	try tl.Begin()
+	let late = try tl.Send("late", msg("late"))
+	check("a transactional send to a topic being created waits for its partitions", late.Partition == 0)
+	let (_, never) = tl.Send("never", msg("never"))
+	check("a topic that never gets partitions is ErrUnknownTopic", never != nil && fault.Is(never, kafka.ErrUnknownTopic))
+	try tl.Abort()
+	check("PartitionFor of 0 partitions is -1", kafka.PartitionFor("k", 0) == -1)
+
+	// Slots: Close frees one, and making the producer of an id again reuses its slot.
+	for k in 0..70 {
+		let x = try c.Transactional("many-{k}", 0)
+		x.Close()
+	}
+	for k in 0..70 {
+		_ = try c.Transactional("again", 0)
+	}
+	let again = try c.Transactional("again", 0)
+	let stale = tl
+	tl.Close()
+	let closed = stale.Begin()
+	check("70 producers made and closed, and one id made 71 times, fit in 64 slots", closed != nil)
+	again.Close()
 
 	// A group: the coordinator asks for a member id first, then a rebalance comes.
 	for k in 0..6 {

@@ -7,10 +7,15 @@ import "tide"
 // offsets) all or nothing. Its transactional id is the caller's; producers are per core, so a
 // service with several cores gives each its own id (design/design_kafka.md, section 5).
 
-// Txn is this core's transactional producer for one transactional id.
+// Txn is this core's transactional producer for one transactional id. It serves one task at a
+// time: a call made while another task's call is in progress fails with ErrTransaction (two
+// sends to one partition at once would share a sequence, and the broker would drop one as a
+// duplicate). After a send fails the transaction can only be aborted, since the broker may have
+// written that send's records; Abort then starts the producer again with a new epoch.
 type Txn struct {
-	c  Client
-	id i64
+	c   Client
+	id  i64
+	gen i64 // which producer the slot holds: a slot reused for a new one fails the old handle
 }
 
 type txnPart struct {
@@ -28,38 +33,96 @@ type txnState struct {
 	seqs    []txnPart // every partition written by this producer id, with its next sequence
 	added   []txnPart // the partitions added to the open transaction
 	group   str       // the group whose offsets the open transaction commits ("" for none)
+	gen     i64
+	busy    bool // a task's call is in progress
+	failed  bool // a send failed: the transaction can only abort (#442)
 }
 
 const maxTxns = 64
 
 let txns = make([]?txnState, maxTxns)
-mut nTxns i64
+mut txnGen i64
 
 // Transactional makes this core's producer for transactional id txid (timeout: how long the
 // broker lets a transaction stay open, default 60 s). It fences any older producer with the
-// same id, and aborts what that one left open.
+// same id, and aborts what that one left open. Making it again for the same id (after fencing
+// or a transaction timeout) replaces this core's producer of that id: older Txn values of it
+// fail. A core holds at most 64; Close frees one.
 fn (c Client) Transactional(txid str, timeout i64) !Txn {
 	if txid == "" {
 		fail "kafka: a transactional producer needs an id"
 	}
-	if nTxns >= maxTxns {
-		fail "kafka: more than {maxTxns} transactional producers on this core"
+	// The slot of this id if there is one, else a free one (#442: slots used to be kept forever).
+	mut id = -1
+	for i in 0..maxTxns {
+		let s = txns[i]
+		if s != nil && s.txid == txid {
+			id = i
+		}
+	}
+	if id < 0 {
+		for i in 0..maxTxns {
+			if id < 0 && txns[i] == nil {
+				id = i
+			}
+		}
+	}
+	if id < 0 {
+		fail "kafka: more than {maxTxns} transactional producers on this core (Close the ones no longer used)"
 	}
 	let ms = dflt(timeout, 60000000000) / 1000000
-	let id = nTxns
-	nTxns += 1
-	txns[id] = keep(txnState{txid: txid, timeout: ms, pid: -1, epoch: -1, open: false, seqs: []txnPart{}, added: []txnPart{}, group: ""})
-	let t = Txn{c: c, id: id}
-	try t.initID()
+	txnGen += 1
+	txns[id] = keep(txnState{txid: txid, timeout: ms, pid: -1, epoch: -1, open: false, seqs: []txnPart{}, added: []txnPart{}, group: "", gen: txnGen, busy: false, failed: false})
+	let t = Txn{c: c, id: id, gen: txnGen}
+	t.initID() catch err {
+		txns[id] = nil
+		fail err
+	}
 	return t
+}
+
+// Close frees this core's slot of the producer. A transaction still open is left to the broker,
+// which aborts it at its timeout or when the id is used again.
+fn (t Txn) Close() {
+	let s = txns[t.id]
+	if s != nil && s.gen == t.gen {
+		txns[t.id] = nil
+	}
 }
 
 fn (t Txn) get() !txnState {
 	let s = txns[t.id]
-	if s == nil {
-		fail "kafka: this transactional producer belongs to another core"
+	if s == nil || s.gen != t.gen {
+		fail "kafka: this transactional producer is closed, replaced, or belongs to another core"
 	}
 	return s
+}
+
+// claim starts one call: it fails while another task's call on this producer is in progress
+// (#442: their state updates overwrote each other). release ends it.
+fn (t Txn) claim() ! {
+	mut s = try t.get()
+	if s.busy {
+		fail fault.Wrap(ErrTransaction, "kafka: this transactional producer is in use by another task (a Txn serves one task at a time)")
+	}
+	s.busy = true
+	t.put(s)
+}
+
+fn (t Txn) release() {
+	let (s0, err) = t.get()
+	if err == nil {
+		mut s = s0
+		s.busy = false
+		t.put(s)
+	}
+}
+
+// abortOnly fails a call that needs the transaction to be able to commit.
+fn abortOnly(s txnState) ! {
+	if s.failed {
+		fail fault.Wrap(ErrTransaction, "kafka: a send in this transaction failed and its records may have been written: Abort it")
+	}
 }
 
 fn (t Txn) put(s txnState) {
@@ -100,6 +163,7 @@ fn (t Txn) initID() ! {
 		s.seqs = []txnPart{}
 		s.added = []txnPart{}
 		s.open = false
+		s.failed = false
 		t.put(s)
 		return
 	}
@@ -108,6 +172,8 @@ fn (t Txn) initID() ! {
 
 // Begin starts a transaction.
 fn (t Txn) Begin() ! {
+	try t.claim()
+	defer t.release()
 	mut s = try t.get()
 	if s.open {
 		fail fault.Wrap(ErrTransaction, "kafka: a transaction is already open")
@@ -128,11 +194,17 @@ fn (t Txn) Send(topic str, m Message) !Ack {
 // ReadCommitted see them only once the transaction commits.
 fn (t Txn) SendBatch(topic str, ms []Message) ![]Ack {
 	let c = t.c
+	try t.claim()
+	defer t.release()
 	let s0 = try t.get()
 	if !s0.open {
 		fail fault.Wrap(ErrTransaction, "kafka: no transaction is open (call Begin)")
 	}
+	try abortOnly(s0)
 	let n = try c.partitions(topic)
+	if n < 1 {
+		fail fault.Wrap(ErrUnknownTopic, "kafka: topic {topic} has no partitions")
+	}
 	rr = (rr + 1) % n
 	mut parts = make([]i64, 0, len(ms))
 	for _, m in ms {
@@ -184,7 +256,18 @@ fn (t Txn) SendBatch(topic str, ms []Message) ![]Ack {
 				done[j] = true
 			}
 		}
-		let base = try t.produce(topic, p, group, now)
+		let (base, perr) = t.produce(topic, p, group, now)
+		if perr != nil {
+			// The request may have been written (a deadline, a cancel, a lost answer): the
+			// partition's sequence is unknown now, so the transaction can only abort (#442).
+			let (s1, gerr) = t.get()
+			if gerr == nil {
+				mut s = s1
+				s.failed = true
+				t.put(s)
+			}
+			fail perr
+		}
 		for k, j in at {
 			mut off = -1
 			if base >= 0 {
@@ -286,10 +369,13 @@ fn (t Txn) produce(topic str, p i64, ms []Message, now i64) !i64 {
 // transaction commits.
 fn (t Txn) SendOffsets(group str, offsets []TopicPartition) ! {
 	let c = t.c
+	try t.claim()
+	defer t.release()
 	mut s = try t.get()
 	if !s.open {
 		fail fault.Wrap(ErrTransaction, "kafka: no transaction is open (call Begin)")
 	}
+	try abortOnly(s)
 	if s.group != group {
 		mut body = make([]u8, 0, 64)
 		putStr(mut body, s.txid)
@@ -368,13 +454,27 @@ fn (t Txn) SendOffsets(group str, offsets []TopicPartition) ! {
 }
 
 // Commit commits the open transaction: its records become visible to ReadCommitted readers and
-// its offsets the group's.
+// its offsets the group's. After a failed send it fails: only Abort is left.
 fn (t Txn) Commit() ! {
+	try t.claim()
+	defer t.release()
+	let s = try t.get()
+	try abortOnly(s)
 	try t.end(true)
 }
 
-// Abort discards the open transaction.
+// Abort discards the open transaction. After a failed send it starts the producer again
+// (InitProducerId: the coordinator aborts the transaction and gives a new epoch, and every
+// partition's sequence starts over), as Java does (KIP-360): records the broker may have
+// written for the failed send cannot make a later send look like their duplicate.
 fn (t Txn) Abort() ! {
+	try t.claim()
+	defer t.release()
+	let s = try t.get()
+	if s.failed {
+		try t.initID()
+		return
+	}
 	try t.end(false)
 }
 

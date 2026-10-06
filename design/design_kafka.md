@@ -91,6 +91,20 @@ per core, because a producer id cannot be shared between threads that never sync
 several cores gives each core its own id (for example `"{name}-{core}"`). `Begin`, `Send`,
 `SendOffsets` (consume-transform-produce), `Commit` and `Abort` map one to one onto the protocol.
 
+Three rules keep a transactional producer from losing records it reported as written (#442):
+
+- **A failed send makes the transaction abort-only.** The request may have been written before
+  its deadline, cancel or lost answer, so the partition's sequence is unknown: `Send`,
+  `SendOffsets` and `Commit` then fail with `ErrTransaction`, and `Abort` runs InitProducerId
+  again (the coordinator aborts the transaction and bumps the epoch; every sequence starts at 0),
+  as Java does (KIP-360). Otherwise the next send would reuse the failed one's sequence and the
+  broker would take it for a duplicate.
+- **One task at a time.** A call made while another task's call on the same `Txn` waits on the
+  network fails with `ErrTransaction`: two concurrent sends to one partition would share a
+  sequence.
+- **Slots.** A core holds 64 producers. Making one again for the same id reuses its slot (and
+  makes older values of it fail); `Close` frees one.
+
 ## 6. Codecs: `toolchain/std/squash`
 
 Kafka needs four codecs and the standard library had none. `squash` is a standard package (Go's
