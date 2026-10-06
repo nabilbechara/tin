@@ -45,7 +45,7 @@ type Options struct {
 	Username      str         // turns on SASL with Mechanism (use TLS so a PLAIN password is not sent in the clear)
 	Password      str
 	Mechanism     ?Mechanism  // nil: Plain
-	Timeout       i64         // ns a request may wait (0: no limit; a request's deadline still applies)
+	Timeout       i64         // ns a request may wait for its answer (0: 30 s, as Java's request.timeout.ms; negative: no limit). Past it the connection is dropped. A request's deadline still applies
 	Acks          ?Acks       // nil: All
 	NoIdempotence bool        // turn off the idempotent producer (it is on by default with Acks.All)
 	Compression   ?Compression // codec of produced batches (nil: none)
@@ -82,6 +82,7 @@ let ErrTopicExists = fault("kafka: topic already exists")
 let ErrAuth = fault("kafka: authentication failed")
 let ErrCoordinator = fault("kafka: group coordinator not available")
 let ErrNetwork = fault("kafka: the connection to a broker failed")
+let ErrClosed = fault("kafka: the client was closed") // a request Close ended (not retried)
 let ErrRebalance = fault("kafka: the group is rebalancing")
 let ErrFenced = fault("kafka: fenced by a newer producer or group member")
 let ErrNotEnoughReplicas = fault("kafka: not enough in-sync replicas")
@@ -122,6 +123,11 @@ fn Open(o Options) Client {
 	rec[rPass] = keep_raw(o.Password)
 	rec[rPassN] = len(o.Password)
 	rec[rTimeout] = o.Timeout
+	if o.Timeout == 0 {
+		rec[rTimeout] = defaultTimeout
+	} else if o.Timeout < 0 {
+		rec[rTimeout] = 0
+	}
 	rec[rID] = id
 	rec[rBoots] = keep_raw(boots)
 	rec[rBootsN] = len(boots)
@@ -317,7 +323,7 @@ type view struct {
 
 // views holds each client's view of the cluster on this core, by client id. A replaced view is
 // released (it is long-lived memory, from keep).
-let views = make([]?view, maxClients+1)
+let views = make(map[i64]?view)
 
 fn (c Client) bootstrap() []str {
 	let all = raw_str(c.rec[rBoots], c.rec[rBootsN])

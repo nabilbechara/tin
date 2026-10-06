@@ -348,6 +348,7 @@ try c.Write("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
 - `(c Conn) Buffered() i64`: Buffered is how many decrypted bytes a Read returns without waiting.
 - `(c mut Conn) Read(buf mut []u8, max i64) !i64`: Read appends up to max bytes of application data to buf and returns how many; after the server's close_notify it fails with EOF (wire.IsEOF), and a connection the server drops without close_notify is a fault, not EOF (a truncation would otherwise look complete).
 - `(c mut Conn) ReadNow(buf mut []u8, max i64) !i64`: ReadNow is Read without waiting: it returns 0 when no application data can be had without waiting for the socket (then wait until Fd is readable and call it again). For clients that run their own non-blocking loop; data TLS has already buffered is always returned first.
+- `(c mut Conn) ReadNowTo(p i64, max i64) !i64`: ReadNowTo is ReadNow into the raw buffer at p, at most max bytes: for trusted code that keeps its own buffers (the kafka client reads frames of many megabytes this way, with no copy per record).
 - `(c mut Conn) ReadFull(n i64) !str`: ReadFull reads exactly n bytes.
 - `(c mut Conn) WriteBytes(b []u8) !`: WriteBytes sends all of b.
 - `(c mut Conn) Write(s str) !`: Write sends all of s.
@@ -1378,7 +1379,7 @@ A key picks the partition the way the Java client does (murmur2), so a key lands
 - `(c Client) DescribeConfigs(kind Resource, name str) ![]Config`: DescribeConfigs is the configuration of a topic or a broker (a broker by its node id).
 - `(c Client) SetConfig(kind Resource, name str, key str, value str) !`: SetConfig sets one config of a topic or a broker (IncrementalAlterConfigs: the others stay).
 - `(c Client) ResetConfig(kind Resource, name str, key str) !`: ResetConfig removes one config of a topic or a broker, back to its default.
-- `(c Client) Close()`: Close closes this core's connections of the client; the next request connects again. Requests waiting on them fail.
+- `(c Client) Close()`: Close closes this core's connections of the client; the next request connects again. Requests waiting on them fail, including one another task is waiting on (a held fetch).
 - `type Want struct`: Want names a partition and the offset to read it from.
 - `type Part struct`: Part is what a fetch learned about one partition.
 - `type Fetched struct`: Fetched is the records of a FetchAll, in partition order, and what it learned of each partition.

@@ -174,6 +174,29 @@ fn (c mut Conn) ReadNow(buf mut []u8, max i64) !i64 {
 	return c.take(mut buf, max)
 }
 
+// ReadNowTo is ReadNow into the raw buffer at p, at most max bytes: for trusted code that keeps
+// its own buffers (the kafka client reads frames of many megabytes this way, with no copy per
+// record).
+fn (c mut Conn) ReadNowTo(p i64, max i64) !i64 {
+	try c.usable()
+	for c.pe == c.ps {
+		if c.eof {
+			fail "EOF"
+		}
+		let more = try c.pump(false)
+		if !more {
+			return 0
+		}
+	}
+	mut n = c.pe - c.ps
+	if n > max {
+		n = max
+	}
+	memcpy(p, cast(i64, c.plain)[2]+c.ps, n)
+	c.ps += n
+	return n
+}
+
 fn (c Conn) usable() ! {
 	if c.failure != "" {
 		fail say.Fault("%s", c.failure)

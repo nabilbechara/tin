@@ -1,0 +1,291 @@
+package main
+
+import "anvil"
+import "fault"
+import "kafka"
+import "say"
+import "tide"
+import "wire"
+
+// The kafka client's connections inside an event loop (#445), where a client's waits let other
+// tasks of the core run: Close from another task, a group's held JoinGroup beside a fetch, and
+// a caller whose deadline ends a handshake others queued behind. A fake broker runs as tasks on
+// the same core (a detach, and one per connection). Like a real broker it answers one request
+// of a connection at a time, in order. It never answers a Fetch of topic hold or the
+// handshake of client id "stall", and holds group slow's JoinGroup for a second, then refuses it.
+// GET /run runs the checks and answers one "ok" or "FAIL" line each.
+
+mut fakePort = 0
+
+fn p16(b mut []u8, v i64) {
+	b = append(b, u8(v>>8), u8(v))
+}
+
+fn p32(b mut []u8, v i64) {
+	b = append(b, u8(v>>24), u8(v>>16), u8(v>>8), u8(v))
+}
+
+fn p64(b mut []u8, v i64) {
+	p32(mut b, v>>32)
+	p32(mut b, v)
+}
+
+fn pstr(b mut []u8, s str) {
+	p16(mut b, len(s))
+	b = append(b, s...)
+}
+
+fn be16(s str, at i64) i64 {
+	return i64(s[at])<<8 | i64(s[at+1])
+}
+
+fn be32(s str, at i64) i64 {
+	return i64(s[at])<<24 | i64(s[at+1])<<16 | i64(s[at+2])<<8 | i64(s[at+3])
+}
+
+// field reads a 16-bit-length string at at: the string and the offset after it.
+fn field(s str, at i64) (str, i64) {
+	let n = be16(s, at)
+	return s[at+2 : at+2+n], at + 2 + n
+}
+
+fn fake() ! {
+	let ln = try wire.Listen("127.0.0.1:0")
+	fakePort = ln.Port()
+	for {
+		let c = try ln.Accept()
+		let kc = keep(c)
+		detach {
+			serve(kc) catch _ {}
+		}
+	}
+}
+
+fn serve(c wire.Conn) ! {
+	mut cn = c
+	defer cn.Close()
+	for {
+		let head = try cn.ReadFull(4)
+		let frame = try cn.ReadFull(be32(head, 0))
+		let resp = try answer(frame)
+		mut out = make([]u8, 0, len(resp)+4)
+		p32(mut out, len(resp))
+		out = append(out, resp...)
+		try cn.Write(str(out))
+	}
+}
+
+fn answer(frame str) !str {
+	let api = be16(frame, 0)
+	let corr = be32(frame, 4)
+	let (client, at) = field(frame, 8)
+	mut out = make([]u8, 0, 256)
+	p32(mut out, corr)
+	if api == 18 {
+		if client == "stall" {
+			try tide.Wait(1h)
+		}
+		p16(mut out, 0)
+		let apis = []i64{1, 3, 10, 11}
+		p32(mut out, len(apis))
+		for _, a in apis {
+			p16(mut out, a)
+			p16(mut out, 0)
+			p16(mut out, 12)
+		}
+		p32(mut out, 0)
+		return str(out)
+	}
+	if api == 3 {
+		// This broker alone, leading partition 0 of t and hold.
+		p32(mut out, 0)
+		p32(mut out, 1)
+		p32(mut out, 1)
+		pstr(mut out, "127.0.0.1")
+		p32(mut out, fakePort)
+		p16(mut out, -1)
+		p16(mut out, -1)
+		p32(mut out, 1)
+		let topics = []str{"t", "hold"}
+		p32(mut out, len(topics))
+		for _, t in topics {
+			p16(mut out, 0)
+			pstr(mut out, t)
+			out = append(out, 0)
+			p32(mut out, 1)
+			p16(mut out, 0)
+			p32(mut out, 0)
+			p32(mut out, 1)
+			p32(mut out, 0)
+			p32(mut out, 1)
+			p32(mut out, 1)
+			p32(mut out, 1)
+			p32(mut out, 1)
+			p32(mut out, 0)
+		}
+		return str(out)
+	}
+	if api == 1 {
+		// replica, max wait, min bytes, max bytes, isolation, session id and epoch, topic count
+		let (topic, _) = field(frame, at+4*3+1+4*3+4)
+		if topic == "hold" {
+			try tide.Wait(1h)
+		}
+		p32(mut out, 0)
+		p16(mut out, 0)
+		p32(mut out, 0)
+		p32(mut out, 1)
+		pstr(mut out, topic)
+		p32(mut out, 1)
+		p32(mut out, 0)
+		p16(mut out, 0)
+		p64(mut out, 0)
+		p64(mut out, 0)
+		p64(mut out, 0)
+		p32(mut out, 0)
+		p32(mut out, 0)
+		return str(out)
+	}
+	if api == 10 {
+		p32(mut out, 0)
+		p16(mut out, 0)
+		p16(mut out, -1)
+		p32(mut out, 1)
+		pstr(mut out, "127.0.0.1")
+		p32(mut out, fakePort)
+		return str(out)
+	}
+	if api == 11 {
+		let (group, _) = field(frame, at)
+		if group == "slow" {
+			try tide.Wait(1s)
+		}
+		// GROUP_AUTHORIZATION_FAILED: the member's Poll fails.
+		p32(mut out, 0)
+		p16(mut out, 30)
+		p32(mut out, -1)
+		pstr(mut out, "")
+		pstr(mut out, "")
+		pstr(mut out, "")
+		p32(mut out, 0)
+		return str(out)
+	}
+	p32(mut out, 0)
+	p16(mut out, 35)
+	return str(out)
+}
+
+fn contains(s str, sub str) bool {
+	for i in 0..len(s)-len(sub)+1 {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
+fn line(label str, good bool, detail str) str {
+	if good {
+		return "ok {label}\n"
+	}
+	return "FAIL {label}: {detail}\n"
+}
+
+fn run(addr str) !str {
+	mut out = ""
+
+	// Close from another task ends a fetch the broker holds, at once, and it is not retried.
+	let c1 = kafka.Open(kafka.Options{Brokers: []str{addr}, Timeout: 10s})
+	try c1.Ping()
+	mut fetchErr = ""
+	mut closed = false
+	mut took1 = 0
+	scope s1 {
+		s1.spawn(fn() ! {
+			let t0 = tide.Now()
+			let (_, e) = c1.Fetch("hold", 0, 0, 5s)
+			took1 = tide.Since(t0)
+			closed = e != nil && fault.Is(e, kafka.ErrClosed)
+			fetchErr = "{e}"
+		})
+		s1.spawn(fn() ! {
+			try tide.Wait(200ms)
+			c1.Close()
+		})
+	}
+	out = out + line("Close from another task ends a held fetch with ErrClosed", closed && took1 < 2s, "{fetchErr} after {took1 / 1000000} ms")
+	let again = c1.Ping()
+	out = out + line("the client connects again after Close", again == nil, "{again}")
+
+	// One group's JoinGroup, held for its rebalance, holds up no fetch.
+	let c2 = kafka.Open(kafka.Options{Brokers: []str{addr}, Timeout: 5s})
+	try c2.Ping()
+	mut joinFailed = false
+	mut took2 = 0
+	scope s2 {
+		s2.spawn(fn() ! {
+			let g = try c2.Group(kafka.GroupOptions{Group: "slow", Topics: []str{"t"}, Rebalance: 3s})
+			let (_, e) = g.Poll(0)
+			joinFailed = e != nil
+		})
+		s2.spawn(fn() ! {
+			try tide.Wait(100ms)
+			let t0 = tide.Now()
+			_ = try c2.Fetch("t", 0, 0, 0)
+			took2 = tide.Since(t0)
+		})
+	}
+	out = out + line("a fetch is not held up by another group's JoinGroup", joinFailed && took2 < 500ms, "fetch took {took2 / 1000000} ms")
+
+	// A caller whose own deadline ends the handshake gets DeadlineExceeded; a caller queued
+	// behind it keeps its request and fails on its own timeout.
+	let c3 = kafka.Open(kafka.Options{Brokers: []str{addr}, ClientID: "stall", Timeout: 300ms})
+	mut first = ""
+	mut second = ""
+	scope s3 {
+		s3.spawn(fn() ! {
+			let n = within 100ms {
+				try c3.Ping()
+				1
+			} catch e {
+				if fault.Is(e, fault.DeadlineExceeded) {
+					first = "deadline"
+				} else {
+					first = "{e}"
+				}
+				0
+			}
+		})
+		s3.spawn(fn() ! {
+			let e = c3.Ping()
+			if e != nil && fault.Is(e, kafka.ErrNetwork) {
+				second = "network: {e}"
+			} else {
+				second = "{e}"
+			}
+		})
+	}
+	out = out + line("a deadline in the handshake is the caller's DeadlineExceeded", first == "deadline", first)
+	out = out + line("a caller queued behind it fails on its own timeout, not the other's deadline",
+		contains(second, "network") && !contains(second, "deadline"), second)
+	return out
+}
+
+fn handle(q anvil.Req, w mut anvil.Out) {
+	if fakePort == 0 {
+		detach {
+			fake() catch _ {}
+		}
+		for fakePort == 0 {
+			tide.Wait(1ms) catch _ {}
+		}
+	}
+	let out = run("127.0.0.1:{fakePort}") catch err {
+		"FAIL {err}\n"
+	}
+	w.Text(out)
+}
+
+fn main() {
+	say.Line(anvil.Serve(":8080", handle))
+}

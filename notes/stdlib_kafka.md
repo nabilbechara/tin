@@ -9,7 +9,7 @@ like `lib/redis`: per-core connections shared by the core's request tasks, waits
 | File | Holds |
 |---|---|
 | `kafka.tin` | `Options`, `Client`, `Open`, the sentinels and error names, the per-core cluster view (metadata, leaders, controller), retries |
-| `conn.tin` | connections: frames, the slot queue, the handshake (ApiVersions, SASL), TLS, reconnects, a second connection per broker for requests a broker holds, `call`, `Close`, replay (`kafka@1`) |
+| `conn.tin` | connections: frames, the slot queue, the handshake (ApiVersions, SASL, KIP-368 session renewal), TLS, reconnects, timeouts, lanes for requests a broker holds, reuse of idle connections, `call`, `Close`, replay (`kafka@1`) |
 | `scram.tin` | SCRAM-SHA-256 and SCRAM-SHA-512 |
 | `proto.tin` | request versions, the wire format, record batches (codecs, producer ids, transactional and control batches, aborted-transaction filtering), murmur2 |
 | `produce.tin` | per-partition accumulators: batching, one batch in flight per partition, idempotent sequences, `Send`, `SendTo`, `SendBatch`, `SendBatchTo` |
@@ -17,14 +17,42 @@ like `lib/redis`: per-core connections shared by the core's request tasks, waits
 | `group.tin` | `Group`: JoinGroup, SyncGroup, Heartbeat, LeaveGroup, range and round-robin assignors, `Poll`, commits; `Commit` and `Committed` without membership |
 | `txn.tin` | `Transactional`: `Begin`, `Send`, `SendBatch`, `SendOffsets`, `Commit`, `Abort` |
 | `admin.tin` | topics, partitions, records, groups, configs |
-| `syscalls_darwin.tin` | the two libSystem calls the connection layer needs on macOS |
+| `syscalls_darwin.tin` | the libSystem calls the connection layer needs on macOS |
 
 ## Design notes beyond notes/design_kafka.md
 
 - A broker answers one request of a connection at a time, so a request it may hold (Fetch with a wait,
   JoinGroup, SyncGroup) goes on a second connection to the broker: produce, commit and heartbeat
   traffic never waits behind a long poll or a rebalance. Found by the anvil example: a member's
-  JoinGroup held by a rebalance stalled every send of its core.
+  JoinGroup held by a rebalance stalled every send of its core. A group's JoinGroup and SyncGroup go
+  on a connection of the group's own (#445), so one group's rebalance holds up neither the fetches
+  nor another group of the core, whose member would otherwise miss its session timeout and set off
+  a cascade of rebalances.
+- Requests wait at most `Options.Timeout` (30 s by default, Java's `request.timeout.ms`; negative for
+  no limit) plus what the broker may hold them for (#445). At the timeout the broker is taken to be
+  gone: the connection is dropped, every request on it fails with `ErrNetwork` (retried as any
+  dropped connection), and the next request connects again. Before, a request without a timeout
+  could wait forever on a broker that vanished without a reset, and with one, the requests behind
+  the unanswered one queued on the same connection. A caller's own deadline or cancellation leaves
+  its request on the connection for the others (its answer is read and dropped), also during a
+  handshake other callers queued behind.
+- `Close` from another task while a request is in flight (a held fetch) shuts the socket down
+  instead of closing it: the task doing the connection's I/O wakes, fails the line's requests with
+  `ErrClosed` (not retried) and closes the descriptor itself. A descriptor closed under a task's
+  wait would leave the task asleep, and its number could be reused for another connection while
+  the task's timer still referred to it.
+- TLS reads go straight into the connection's frame buffer (`tls.Conn.ReadNowTo`): a 16 MiB fetch
+  used to allocate a fresh copy of the frame's remainder for each 16 KiB record, about 8 GiB of
+  request memory.
+- A client keeps at most 64 connections per core; when they are all taken, the one no task has used
+  for longest is closed and reused (a broker gone from the cluster, a group's lane), so brokers whose
+  addresses change no longer use the slots up. Up to 65536 clients may be opened in a process (128
+  before), a bound against opening one per request.
+- A SASL session the broker limits (KIP-368, `connections.max.reauth.ms`: `session_lifetime_ms` in
+  SaslAuthenticate) is renewed at 85% of its lifetime: an idle connection is closed and made again
+  (authenticating anew), and one with requests in flight is retired: they finish there while new
+  requests go on a new connection, which closes the retired one once it is drained. The broker
+  closes a connection that sends a request after its session ended.
 - A new connection is opened before the first request is queued on it, so the broker's versions are
   known and an unsupported request fails with a message naming it and both version ranges.
 - Records without a key go to one partition per call, the next call to the next partition.
@@ -47,6 +75,15 @@ like `lib/redis`: per-core connections shared by the core's request tasks, waits
 
 - `tests/v2/kafka.tin` (35 lines, no broker): murmur2 against the six vectors of Kafka's `UtilsTest`
   and the empty key, record batches with every codec, cut batches, a changed byte.
+- `tests/v2/kafka_conn.tin` and `tools/ci/kafka_check.py` (#445, fake brokers): a request the broker
+  never answers ends at the timeout and the next connects again; 70 dead brokers before a live one;
+  200 more clients; a 6 MiB fetch over TLS inside `limit memory 64mb`; one-second SASL sessions
+  renewed for 5 s by sequential and concurrent requests with no connection ended by the broker. In an
+  event loop (anvil, one core, the fake broker as tasks): Close from another task ends a held fetch
+  with ErrClosed at once; a fetch beside another group's held JoinGroup takes milliseconds; a
+  caller's deadline in a handshake is its own DeadlineExceeded, and a caller queued behind it fails
+  on its own timeout. Against the client before #445 these fail (three time out, the 200 clients
+  crash).
 - `tests/v2/kafka_broker.tin` (26 checks, no Kafka needed, so it runs in CI): a fake four-broker
   cluster on cores 1 to 4 written from the protocol's schemas. A moved leader (the send lands once), an
   acknowledgement lost after the write (the idempotent retry is answered DUPLICATE_SEQUENCE_NUMBER and

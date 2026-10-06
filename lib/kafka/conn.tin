@@ -15,9 +15,11 @@ import "wire"
 // A new connection first asks the broker which request versions it speaks (ApiVersions) and
 // authenticates (SASL PLAIN or SCRAM); the requests already queued go out after that.
 
-const maxClients = 128
-const maxBrokers = 64 // connections one client keeps, per core (two per broker at most)
+// maxClients guards against opening a client per request: each Open keeps its record.
+const maxClients = 65536
+const maxBrokers = 64 // connections one client keeps at once, per core (an idle one is reused)
 const maxFrame = 256 * 1024 * 1024
+const defaultTimeout = 30000000000 // ns a request may wait when Options.Timeout is 0 (Java's request.timeout.ms)
 
 // The shared record of a Client: its options, copied out of any pool.
 const rClient = 0
@@ -55,13 +57,17 @@ const lQ = 9      // the slots waiting for responses, in order
 const lQHead = 10
 const lQN = 11
 const lQCap = 12
-const lBusy = 13  // a task is doing the connection's I/O
-const lID = 14    // client id * maxBrokers + broker slot: its TLS connection is tlsLines[lID]
+const lBusy = 13  // a task is doing the connection's I/O (no task waits on the line while it is 0)
+const lUsed = 14  // when the line was last asked for (a per-core count): the least recent is reused first
 const lCorr = 15  // the next correlation id
-const lAddr = 16
+const lAddr = 16  // the line's key: the broker's address, and a lane mark for requests it may hold
 const lAddrN = 17
 const lVers = 18  // the broker's version range of each request: min, max (calloc'd), 0 before the handshake
-const lineWords = 19
+const lRetired = 19 // 1: takes no new requests (its SASL session ends, KIP-368); closed once drained
+const lReauth = 20  // mono ns past which the connection must authenticate again (KIP-368), 0 for never
+const lAbort = 21   // why another task ended the connection (Close, a timeout): the task doing its I/O fails it
+const lAbortN = 22
+const lineWords = 23
 
 // A slot: one caller's request and the response it gets.
 const sTask = 0
@@ -79,12 +85,19 @@ const slotWords = 10
 // The start of the message of a failed SASL handshake, which call turns into ErrAuth.
 const authFailed = "kafka: connecting: authentication failed"
 
-shared mut nClients i64
-mut conns i64 // per core: the connection of each (client, broker slot)
+// The reason Close gives the requests it ends, which call turns into ErrClosed.
+const closedMsg = "kafka: the client was closed"
 
-// tlsLines holds each TLS connection of this core, by line id. Replacing or clearing one
+shared mut nClients i64
+
+// lineTables holds this core's connections of each client, by client id: maxBrokers words
+// (calloc'd on first use), each a line or 0.
+let lineTables = make(map[i64]i64)
+mut lineTick i64
+
+// tlsLines holds the TLS layer of this core's connections, by line. Replacing or removing one
 // releases the old connection's memory (it is counted long-lived memory, from keep).
-let tlsLines = make([]?tls.Conn, maxClients*maxBrokers+1)
+let tlsLines = make(map[i64]?tls.Conn)
 
 fn keep_raw(s str) i64 {
 	let p = malloc(len(s) + 1)
@@ -98,46 +111,85 @@ fn raw_str(p i64, n i64) str {
 
 // A broker answers one request of a connection at a time, so a request it may hold (a fetch
 // waiting for records, a JoinGroup waiting for the other members) would hold up every request
-// behind it. Those go on a second connection to the broker, keyed by the address and this mark.
+// behind it. Those go on a second connection to the broker, keyed by the address and this mark;
+// a group's JoinGroup and SyncGroup on one of the group's own, so that one group's rebalance
+// holds up neither another group's nor the fetches.
 const waitLane = "#wait"
 
 fn holds(api i64) bool {
 	return api == apiFetch || api == apiJoinGroup || api == apiSyncGroup
 }
 
+// laneKey is the key of the line a request goes on: the broker's address, with a lane mark for
+// a request the broker may hold.
+fn laneKey(addr str, group str, api i64) str {
+	if !holds(api) {
+		return addr
+	}
+	if group != "" && api != apiFetch {
+		return addr + waitLane + ":" + group
+	}
+	return addr + waitLane
+}
+
 // dialAddr is the address a line connects to (its key without the lane mark).
 fn dialAddr(l i64) str {
 	let key = raw_str(l[lAddr], l[lAddrN])
-	if len(key) > len(waitLane) && key[len(key)-len(waitLane):] == waitLane {
-		return key[:len(key)-len(waitLane)]
+	for i in 0..len(key) {
+		if key[i] == '#' {
+			return key[:i]
+		}
 	}
 	return key
 }
 
-// line is the core's connection record for key (a broker address, with waitLane for the
-// broker's second connection), made on first use. It is 0 when the client already keeps
-// maxBrokers connections.
-fn (c Client) line(addr str) i64 {
-	if conns == 0 {
-		conns = calloc(maxClients*maxBrokers, 8)
-	}
+// line is the core's connection record for key, made on first use. When the client keeps
+// maxBrokers connections already, the one no task has used for longest is closed and reused (a
+// broker no longer in the cluster, a lane no longer used); it is 0 when every one is in use.
+fn (c Client) line(key str) i64 {
 	let id = c.rec[rID]
+	mut t = lineTables[id]
+	if t == 0 {
+		t = calloc(maxBrokers, 8)
+		lineTables[id] = t
+	}
+	lineTick += 1
+	mut spare = -1
 	for k in 0..maxBrokers {
-		mut l = conns[id*maxBrokers+k]
+		let l = t[k]
 		if l == 0 {
-			l = calloc(lineWords, 8)
-			l[lFd] = -1
-			l[lID] = id*maxBrokers + k
-			l[lAddr] = keep_raw(addr)
-			l[lAddrN] = len(addr)
-			conns[id*maxBrokers+k] = l
+			if spare < 0 || t[spare] != 0 {
+				spare = k
+			}
+			continue
+		}
+		if l[lRetired] == 0 && l[lAddrN] == len(key) && raw_str(l[lAddr], l[lAddrN]) == key {
+			l[lUsed] = lineTick
 			return l
 		}
-		if l[lAddrN] == len(addr) && raw_str(l[lAddr], l[lAddrN]) == addr {
-			return l
+		// No task waits on a line that is not busy (its queue holds only slots whose callers
+		// left), so it can be closed.
+		if l[lBusy] == 0 && (spare < 0 || (t[spare] != 0 && l[lUsed] < t[spare][lUsed])) {
+			spare = k
 		}
 	}
-	return 0
+	if spare < 0 {
+		return 0
+	}
+	mut l = t[spare]
+	if l == 0 {
+		l = calloc(lineWords, 8)
+		l[lFd] = -1
+		t[spare] = l
+	} else {
+		fail_line(l, "kafka: the connection was closed")
+		free(l[lAddr])
+		l[lRetired] = 0
+	}
+	l[lAddr] = keep_raw(key)
+	l[lAddrN] = len(key)
+	l[lUsed] = lineTick
+	return l
 }
 
 // ---- the queue of slots ----
@@ -208,11 +260,13 @@ fn set_err(s i64, msg str) {
 	s[sErrN] = len(msg)
 }
 
-// close_line drops the connection without failing anyone (its queue is empty or about to be failed).
+// close_line drops the connection without failing anyone (its queue is empty or about to be
+// failed). Only the task doing the line's I/O, or any task while none does, may close it: a
+// descriptor closed under another task's wait would leave that task asleep.
 fn close_line(l i64) {
 	if l[lFd] >= 0 {
 		// A TLS connection is dropped without close_notify: the descriptor goes either way.
-		tlsLines[l[lID]] = nil
+		delete(tlsLines, l)
 		rt_sys_close(l[lFd])
 		l[lFd] = -1
 	}
@@ -220,20 +274,30 @@ fn close_line(l i64) {
 		free(l[lVers])
 		l[lVers] = 0
 	}
+	l[lReauth] = 0
 }
 
-// fail_line closes the connection and fails every caller waiting on it.
+// fail_line closes the connection and fails every caller waiting on it, with the reason another
+// task gave (drop_line) when there is one.
 fn fail_line(l i64, msg str) {
 	close_line(l)
+	mut why = msg
+	if l[lAbort] != 0 {
+		why = raw_str(l[lAbort], l[lAbortN])
+	}
 	for l[lQN] > 0 {
 		let s = q_pop(l)
 		if s[sGone] != 0 {
 			free_slot(s)
 			continue
 		}
-		set_err(s, msg)
+		set_err(s, why)
 		s[sState] = 2
 		wake(s)
+	}
+	if l[lAbort] != 0 {
+		free(l[lAbort])
+		l[lAbort] = 0
 	}
 	l[lOutN] = 0
 	l[lWpos] = 0
@@ -241,13 +305,34 @@ fn fail_line(l i64, msg str) {
 	l[lInE] = 0
 }
 
+// drop_line ends the connection and fails its callers with msg. When another task is doing its
+// I/O (owner false and the line busy), the socket is shut down instead of closed: that task's
+// wait ends, and it fails the line itself with msg (closing the descriptor under its wait would
+// leave it asleep, and the number could be reused for another connection under it).
+fn drop_line(l i64, owner bool, msg str) {
+	if owner || l[lBusy] == 0 {
+		fail_line(l, msg)
+		return
+	}
+	if l[lFd] >= 0 && l[lAbort] == 0 {
+		l[lAbort] = keep_raw(msg)
+		l[lAbortN] = len(msg)
+		rt_sys_shutdown(l[lFd], 2)
+	}
+}
+
 fn os_msg(what str, e i64) str {
 	let m = rt_sys_strerror(e)
 	return "kafka: {what}: {raw_str(m, strlen(m))}"
 }
 
-// hand_off gives the connection's I/O to the first caller still waiting, if any.
+// hand_off gives the connection's I/O to the first caller still waiting, if any. It runs in the
+// task that did the I/O (or when none did), so a drop another task asked for happens here; a
+// retired line whose requests are done is closed.
 fn hand_off(l i64) {
+	if l[lAbort] != 0 {
+		fail_line(l, "")
+	}
 	l[lBusy] = 0
 	for i in 0..l[lQN] {
 		let s = q_at(l, i)
@@ -257,6 +342,9 @@ fn hand_off(l i64) {
 			rt_task_wake(s[sTask])
 			return
 		}
+	}
+	if l[lRetired] != 0 && l[lQN] == 0 && l[lOutN] == 0 {
+		close_line(l)
 	}
 }
 
@@ -343,7 +431,7 @@ fn next_corr(l i64) i64 {
 
 // write_all writes n bytes at p on the connection, waiting as needed (the handshake's writes).
 fn write_all(l i64, p i64, n i64, timeout i64) ! {
-	let tc = tlsLines[l[lID]]
+	let tc = tlsLines[l]
 	if tc != nil {
 		try tc.Write(raw_str(p, n))
 		return
@@ -389,12 +477,10 @@ fn read_frame(l i64, timeout i64) !i64 {
 			l[lIn] = realloc(l[lIn], cap)
 			l[lInCap] = cap
 		}
-		let tc = tlsLines[l[lID]]
+		let tc = tlsLines[l]
 		if tc != nil {
-			let buf = make([]u8, 0, l[lInCap]-l[lInE])
-			let got = try tc.ReadNow(mut buf, l[lInCap]-l[lInE])
+			let got = try tc.ReadNowTo(l[lIn]+l[lInE], l[lInCap]-l[lInE])
 			if got > 0 {
-				memcpy(l[lIn]+l[lInE], cast(i64, buf)[2], got)
 				l[lInE] += got
 				continue
 			}
@@ -508,6 +594,7 @@ fn sasl_step(l i64, client str, token str, timeout i64) !str {
 	let code = d.i16()
 	let msg = d.str()
 	let out = d.bytes()
+	let life = d.i64() // session_lifetime_ms (KIP-368), 0 for none
 	if code != 0 {
 		if msg != "" {
 			fail "{authFailed}: {msg}"
@@ -516,6 +603,11 @@ fn sasl_step(l i64, client str, token str, timeout i64) !str {
 	}
 	if d.bad {
 		fail "kafka: connecting: the broker's SaslAuthenticate answer is damaged"
+	}
+	if life > 0 {
+		// The broker closes the connection at the next request after the session ends: renew
+		// it at 85% of its lifetime (call_live), as Java does between 85% and 95%.
+		l[lReauth] = rt_mono_ns() + life*850000
 	}
 	return out
 }
@@ -532,7 +624,7 @@ fn connect(l i64, rec i64, timeout i64) ! {
 		let tc = try tls.Dial(addr, cfg)
 		tc.SetTimeout(timeout)
 		l[lFd] = tc.Fd()
-		tlsLines[l[lID]] = keep(tc)
+		tlsLines[l] = keep(tc)
 	} else {
 		let conn = try wire.DialTimeout(addr, timeout)
 		l[lFd] = conn.Fd()
@@ -547,23 +639,44 @@ fn connect(l i64, rec i64, timeout i64) ! {
 	}
 }
 
-// give_up ends a wait that ran out of time: the slot stays queued for its response.
+// give_up ends a wait that did not end in a response. At the caller's own deadline or
+// cancellation the slot stays queued for its response, and the connection stays in step for
+// the others. At the client's timeout the broker is taken to be gone, as Java's
+// request.timeout.ms does: the connection is dropped and every request on it fails, so the next
+// one connects again instead of queueing behind an answer that will not come.
 fn give_up(l i64, s i64, r i64) ! {
-	s[sGone] = 1
-	if s[sOwner] != 0 || l[lBusy] == 0 {
-		hand_off(l)
-	}
+	let queued = s[sNoReply] == 0
 	if r == waitDeadline {
+		s[sGone] = 1
+		if s[sOwner] != 0 || l[lBusy] == 0 {
+			hand_off(l)
+		}
+		if !queued {
+			free_slot(s)
+		}
 		fail cast(fault, rt_wait_fault())
 	}
-	fail "kafka: timed out"
+	let owner = s[sOwner] != 0
+	s[sGone] = 1
+	drop_line(l, owner, "kafka: the broker did not answer within the timeout; the connection was dropped")
+	if owner || l[lBusy] == 0 {
+		hand_off(l)
+	}
+	if !queued {
+		free_slot(s)
+	}
+	fail fault.Wrap(ErrNetwork, "kafka: the broker did not answer within the timeout; the connection was dropped")
 }
 
 // drive does the connection's I/O until s has its response (or, for a request the broker does
 // not answer, until it is written): writes what is queued, reads, and hands responses to their
 // slots. Then it passes the I/O on to a caller still waiting.
 fn drive(l i64, s i64, rec i64, timeout i64) ! {
-	if l[lFd] >= 0 && l[lQN] <= 1 && l[lOutN] > 0 && l[lWpos] == 0 && l[lInE] == 0 {
+	mut mine = 1 // the slots of this call in the queue (a request without a reply is not queued)
+	if s[sNoReply] != 0 {
+		mine = 0
+	}
+	if l[lFd] >= 0 && l[lQN] == mine && l[lOutN] > 0 && l[lWpos] == 0 && l[lInE] == 0 {
 		// An idle connection the broker may have closed (a restart, an idle timeout): find
 		// out before sending, so the request goes on a new connection instead of failing.
 		let b = calloc(1, 8)
@@ -576,6 +689,16 @@ fn drive(l i64, s i64, rec i64, timeout i64) ! {
 	if l[lFd] < 0 {
 		let err = connect(l, rec, timeout)
 		if err != nil {
+			if fault.Is(err, fault.DeadlineExceeded) || fault.Is(err, fault.Canceled) {
+				// This caller's own deadline: the others keep their requests, and the next of
+				// them connects again.
+				s[sGone] = 1
+				hand_off(l)
+				if mine == 0 {
+					free_slot(s)
+				}
+				fail err
+			}
 			let m = say.Str(err)
 			fail_line(l, m)
 			if s[sNoReply] != 0 {
@@ -598,7 +721,7 @@ fn drive(l i64, s i64, rec i64, timeout i64) ! {
 			}
 			break
 		}
-		let tc = tlsLines[l[lID]]
+		let tc = tlsLines[l]
 		if tc != nil && l[lWpos] < l[lOutN] {
 			// A TLS write waits inside tls (records cannot be half sent); a fault drops the
 			// connection.
@@ -649,14 +772,13 @@ fn drive(l i64, s i64, rec i64, timeout i64) ! {
 			l[lInCap] = cap
 		}
 		if tc != nil {
-			let buf = make([]u8, 0, l[lInCap]-l[lInE])
-			let (got, rerr) = tc.ReadNow(mut buf, l[lInCap]-l[lInE])
+			// Straight into the read buffer: a frame of many records costs no copies.
+			let (got, rerr) = tc.ReadNowTo(l[lIn]+l[lInE], l[lInCap]-l[lInE])
 			if rerr != nil {
 				fail_line(l, say.Str(rerr))
 				continue
 			}
 			if got > 0 {
-				memcpy(l[lIn]+l[lInE], cast(i64, buf)[2], got)
 				l[lInE] += got
 				continue
 			}
@@ -713,24 +835,37 @@ fn supports(l i64, api i64) ! {
 // of the client's timeout (a fetch's max wait). With noReply the broker sends nothing back
 // (Produce with acks 0) and call returns "" once the request is written.
 fn (c Client) call(addr str, api i64, body []u8, extra i64, noReply bool) !str {
+	return try c.call_in(addr, "", api, body, extra, noReply)
+}
+
+// call_in is call for a group's request: a JoinGroup or SyncGroup goes on the group's own lane.
+fn (c Client) call_in(addr str, group str, api i64, body []u8, extra i64, noReply bool) !str {
 	if !c.open {
 		fail "kafka: the client is not open (too many clients: open one per cluster, not per request)"
 	}
 	let tp = rt_tape()
 	if tp != 0 {
-		return try c.call_taped(tp, addr, api, body, extra, noReply) // recorded for replay (#241)
+		return try c.call_taped(tp, addr, group, api, body, extra, noReply) // recorded for replay (#241)
 	}
-	return try c.call_live(addr, api, body, extra, noReply)
+	return try c.call_live(addr, group, api, body, extra, noReply)
 }
 
-fn (c Client) call_live(addr str, api i64, body []u8, extra i64, noReply bool) !str {
-	mut key = addr
-	if holds(api) {
-		key = addr + waitLane
+fn (c Client) call_live(addr str, group str, api i64, body []u8, extra i64, noReply bool) !str {
+	let key = laneKey(addr, group, api)
+	mut l = c.line(key)
+	if l != 0 && l[lReauth] != 0 && rt_mono_ns() >= l[lReauth] {
+		// The SASL session is ending (KIP-368). A connection no task waits on is closed and made
+		// again, which authenticates anew; one with requests in flight lets them finish there,
+		// and new ones go on a new connection.
+		if l[lBusy] == 0 {
+			fail_line(l, "kafka: the connection was closed")
+		} else {
+			l[lRetired] = 1
+			l = c.line(key)
+		}
 	}
-	let l = c.line(key)
 	if l == 0 {
-		fail "kafka: more than {maxBrokers / 2} brokers"
+		fail "kafka: more than {maxBrokers} connections in use at once"
 	}
 	mut timeout = c.rec[rTimeout]
 	if timeout > 0 {
@@ -742,11 +877,14 @@ fn (c Client) call_live(addr str, api i64, body []u8, extra i64, noReply bool) !
 		let err = connect(l, c.rec, timeout)
 		l[lBusy] = 0
 		if err != nil {
-			fail_line(l, say.Str(err))
-			hand_off(l)
 			if fault.Is(err, fault.DeadlineExceeded) || fault.Is(err, fault.Canceled) {
+				// This caller's own deadline: the callers that queued meanwhile keep their
+				// requests, and the first of them connects again.
+				hand_off(l)
 				fail err
 			}
+			fail_line(l, say.Str(err))
+			hand_off(l)
 			let m = say.Str(err)
 			if len(m) >= len(authFailed) && m[:len(authFailed)] == authFailed {
 				fail fault.Wrap(ErrAuth, m)
@@ -799,6 +937,9 @@ fn (c Client) call_live(addr str, api i64, body []u8, extra i64, noReply bool) !
 		if len(m) >= len(authFailed) && m[:len(authFailed)] == authFailed {
 			fail fault.Wrap(ErrAuth, m)
 		}
+		if m == closedMsg {
+			fail ErrClosed
+		}
 		fail fault.Wrap(ErrNetwork, m)
 	}
 	if noReply {
@@ -815,6 +956,7 @@ fn (c Client) call_live(addr str, api i64, body []u8, extra i64, noReply bool) !
 // The request an effect body makes (read at its start).
 mut tapedClient i64
 mut tapedAddr i64
+mut tapedGroup i64
 mut tapedApi i64
 mut tapedBody i64
 mut tapedExtra i64
@@ -822,12 +964,13 @@ mut tapedNoReply bool
 
 // call_taped records or replays one request as kafka@1: the key is the request's name, version
 // and body (not the broker or the correlation id), the result the response body.
-fn (c Client) call_taped(tp i64, addr str, api i64, body []u8, extra i64, noReply bool) !str {
+fn (c Client) call_taped(tp i64, addr str, group str, api i64, body []u8, extra i64, noReply bool) !str {
 	mut k = make([]u8, 0, len(body)+32)
 	k = append(k, "{apiName(api)} v{version(api)} "...)
 	k = append(k, body...)
 	tapedClient = cast(i64, c)
 	tapedAddr = cast(i64, addr)
+	tapedGroup = cast(i64, group)
 	tapedApi = api
 	tapedBody = cast(i64, body)
 	tapedExtra = extra
@@ -837,20 +980,23 @@ fn (c Client) call_taped(tp i64, addr str, api i64, body []u8, extra i64, noRepl
 
 fn call_effect() !str {
 	let c = cast(Client, tapedClient)
-	return try c.call_live(cast(str, tapedAddr), tapedApi, cast([]u8, tapedBody), tapedExtra, tapedNoReply)
+	return try c.call_live(cast(str, tapedAddr), cast(str, tapedGroup), tapedApi, cast([]u8, tapedBody), tapedExtra, tapedNoReply)
 }
 
 // Close closes this core's connections of the client; the next request connects again. Requests
-// waiting on them fail.
+// waiting on them fail, including one another task is waiting on (a held fetch).
 fn (c Client) Close() {
-	if !c.open || conns == 0 {
+	if !c.open {
 		return
 	}
-	let id = c.rec[rID]
+	let t = lineTables[c.rec[rID]]
+	if t == 0 {
+		return
+	}
 	for k in 0..maxBrokers {
-		let l = conns[id*maxBrokers+k]
+		let l = t[k]
 		if l != 0 && l[lFd] >= 0 {
-			fail_line(l, "kafka: the client was closed")
+			drop_line(l, false, closedMsg)
 		}
 	}
 }

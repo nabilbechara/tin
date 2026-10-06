@@ -1,0 +1,597 @@
+package main
+
+import "fault"
+import "hearth"
+import "kafka"
+import "mint"
+import "relay"
+import "say"
+import "stamp"
+import "tide"
+import "tls"
+import "wire"
+import "quarry"
+
+// The kafka client's connections (#445) against two fake brokers in the same process: broker 1
+// (core 1) over plain TCP, broker 2 (core 2) over TLS with SASL sessions that end (KIP-368). Like
+// a real broker, a fake answers a connection's requests one at a time and in order, so a request
+// it never answers holds up everything behind it on that connection: broker 1 never answers
+// ListOffsets for topic s. Broker 2 serves a fetch of 6 MiB and ends each SASL session after a
+// second, closing a connection that sends a request after its session ended. The checks that need
+// tasks overlapping their waits (Close from another task, group lanes, a deadline in a shared
+// handshake) run in an event loop: tools/ci/kafka_check.py.
+
+// A test certificate for localhost and 127.0.0.1, valid until 2126.
+const certPEM = `-----BEGIN CERTIFICATE-----
+MIIBmzCCAUGgAwIBAgIUcUfvY3dUX3NrfxQDXxfda22SiU4wCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTAwNjAyMDgyNVoYDzIxMjYwOTEy
+MDIwODI1WjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAASz8boMbJMCDmJrxF1xbshASydjDLQMBtHsLjk+79Fi2NaP8TRD8NSw
+5pAw2erS/2nrvvTD6dYewxabOagmmv/Go28wbTAdBgNVHQ4EFgQUZRWphQ7hSVT3
+KNsTM0MBAA8EQlYwHwYDVR0jBBgwFoAUZRWphQ7hSVT3KNsTM0MBAA8EQlYwDwYD
+VR0TAQH/BAUwAwEB/zAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwCgYIKoZI
+zj0EAwIDSAAwRQIgG4339mk2C8s/F3JIlD1HnZgvsJO29Qsp91Pl9UOipu4CIQDa
+bW9H0vyD7MlISOgkL1yM2pIElP29KaZMSiqz95Sr3Q==
+-----END CERTIFICATE-----
+`
+
+const keyPEM = `-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgPacZZN7PquAycvM0
+41ZpUwk/5AvAASHucfW4oxGszhGhRANCAASz8boMbJMCDmJrxF1xbshASydjDLQM
+BtHsLjk+79Fi2NaP8TRD8NSw5pAw2erS/2nrvvTD6dYewxabOagmmv/G
+-----END PRIVATE KEY-----
+`
+
+const bigRecords = 96
+const bigValue = 65536
+const sessionMs = 1000
+
+// ---- encoding ----
+
+fn p8(b mut []u8, v i64) {
+	b = append(b, u8(v))
+}
+
+fn p16(b mut []u8, v i64) {
+	b = append(b, u8(v>>8), u8(v))
+}
+
+fn p32(b mut []u8, v i64) {
+	b = append(b, u8(v>>24), u8(v>>16), u8(v>>8), u8(v))
+}
+
+fn p64(b mut []u8, v i64) {
+	p32(mut b, v>>32)
+	p32(mut b, v)
+}
+
+fn pstr(b mut []u8, s str) {
+	p16(mut b, len(s))
+	b = append(b, s...)
+}
+
+fn pnull(b mut []u8) {
+	p16(mut b, -1)
+}
+
+fn pbytes(b mut []u8, s str) {
+	p32(mut b, len(s))
+	b = append(b, s...)
+}
+
+fn pvar(b mut []u8, v i64) {
+	mut u = u64((v << 1) ^ (v >> 63))
+	for u >= 0x80 {
+		b = append(b, u8(u&0x7f|0x80))
+		u = u >> 7
+	}
+	b = append(b, u8(u))
+}
+
+// ---- decoding ----
+
+type rd struct {
+	s   str
+	pos i64
+}
+
+fn (r mut rd) u(n i64) i64 {
+	mut v = 0
+	for i in 0..n {
+		v = v<<8 | i64(r.s[r.pos+i])
+	}
+	r.pos += n
+	return v
+}
+
+fn (r mut rd) i8() i64 {
+	return r.u(1)
+}
+
+fn (r mut rd) i16() i64 {
+	let v = r.u(2)
+	if v >= 32768 {
+		return v - 65536
+	}
+	return v
+}
+
+fn (r mut rd) i32() i64 {
+	let v = r.u(4)
+	if v >= 2147483648 {
+		return v - 4294967296
+	}
+	return v
+}
+
+fn (r mut rd) str() str {
+	let n = r.i16()
+	if n < 0 {
+		return ""
+	}
+	let s = r.s[r.pos : r.pos+n]
+	r.pos += n
+	return s
+}
+
+fn (r mut rd) bytes() str {
+	let n = r.i32()
+	if n < 0 {
+		return ""
+	}
+	let s = r.s[r.pos : r.pos+n]
+	r.pos += n
+	return s
+}
+
+fn be32(s str, at i64) i64 {
+	return i64(s[at])<<24 | i64(s[at+1])<<16 | i64(s[at+2])<<8 | i64(s[at+3])
+}
+
+// ---- a broker ----
+
+// bigBatch is one record batch of bigRecords records of bigValue bytes each ("rec<i> " and
+// filler), at offset 0.
+fn bigBatch() str {
+	mut recs = make([]u8, 0, bigRecords*(bigValue+16))
+	for i in 0..bigRecords {
+		mut v = make([]u8, 0, bigValue)
+		v = append(v, "rec{i} "...)
+		for len(v) < bigValue {
+			v = append(v, u8('a' + len(v)%26))
+		}
+		mut body = make([]u8, 0, bigValue+16)
+		body = append(body, 0) // attributes
+		pvar(mut body, 0)      // timestamp delta
+		pvar(mut body, i)      // offset delta
+		pvar(mut body, -1)     // no key
+		pvar(mut body, len(v))
+		body = append(body, v...)
+		pvar(mut body, 0) // no headers
+		pvar(mut recs, len(body))
+		recs = append(recs, body...)
+	}
+	mut after = make([]u8, 0, len(recs)+64)
+	p16(mut after, 0)            // attributes
+	p32(mut after, bigRecords-1) // last offset delta
+	p64(mut after, 0)            // first timestamp
+	p64(mut after, 0)            // max timestamp
+	p64(mut after, -1)           // producer id
+	p16(mut after, -1)
+	p32(mut after, -1)
+	p32(mut after, bigRecords)
+	after = append(after, recs...)
+	mut b = make([]u8, 0, len(after)+32)
+	p64(mut b, 0)
+	p32(mut b, len(after)+9)
+	p32(mut b, 0)
+	p8(mut b, 2)
+	p32(mut b, i64(stamp.Crc32C(str(after))))
+	b = append(b, after...)
+	return str(b)
+}
+
+// A connection to the broker: its bytes not yet read as frames, and its SASL session.
+type peer struct {
+	conn    wire.Conn
+	tc      ?tls.Conn
+	pending str
+	authed  i64  // mono ns the session began, 0 before
+	stuck   bool // a request is never answered, nor anything after it
+	dead    bool
+}
+
+type broker struct {
+	id      i64
+	port    i64
+	secure  bool
+	accepts i64
+	auths   i64
+	expired i64
+	big     str
+}
+
+fn serve(id i64) ! {
+	let ln = try wire.Listen("127.0.0.1:0")
+	mut b = broker{id: id, port: ln.Port(), secure: id == 2, accepts: 0, auths: 0, expired: 0, big: ""}
+	if b.secure {
+		b.big = bigBatch()
+	}
+	let cfg = try tls.LoadServerConfig(certPEM, keyPEM)
+	relay.Send(0, "{id} {ln.Port()}")
+	mut peers = []peer{}
+	for {
+		let (nc, aerr) = ln.AcceptTimeout(1ms)
+		if aerr == nil {
+			b.accepts += 1
+			mut c2 = nc
+			if b.secure {
+				c2.SetTimeout(5s)
+				let tc = tls.Server(c2, cfg) catch _ {
+					c2.Close()
+					continue
+				}
+				peers = append(peers, peer{conn: c2, tc: tc, pending: "", authed: 0, stuck: false, dead: false})
+			} else {
+				c2.SetTimeout(1ms)
+				peers = append(peers, peer{conn: c2, tc: nil, pending: "", authed: 0, stuck: false, dead: false})
+			}
+		}
+		for i in 0..len(peers) {
+			mut p = peers[i]
+			if p.dead || p.stuck {
+				continue
+			}
+			read_some(mut p)
+			for !p.dead && !p.stuck && len(p.pending) >= 4 && len(p.pending) >= 4+be32(p.pending, 0) {
+				let n = be32(p.pending, 0)
+				let frame = p.pending[4 : 4+n]
+				p.pending = p.pending[4+n:]
+				let (resp, never) = handle(mut b, mut p, frame)
+				if never {
+					p.stuck = true
+				} else if resp == "" {
+					p.dead = true
+				} else {
+					send(mut p, resp)
+				}
+			}
+			peers[i] = p
+		}
+		mut live = []peer{}
+		for _, p in peers {
+			if p.dead {
+				mut c3 = p.conn
+				c3.Close()
+			} else {
+				live = append(live, p)
+			}
+		}
+		peers = live
+		let (_, m, ok) = relay.TryRecv()
+		if ok && m == "stats" {
+			relay.Send(0, "{b.accepts} {b.auths} {b.expired}")
+		}
+	}
+}
+
+fn read_some(p mut peer) {
+	let tc = p.tc
+	mut buf = make([]u8, 0, 65536)
+	if tc != nil {
+		let (k, err) = tc.ReadNow(mut buf, 65536)
+		if err != nil {
+			p.dead = true
+			return
+		}
+		if k > 0 {
+			p.pending = p.pending + str(buf)
+		}
+		return
+	}
+	let (k, err) = p.conn.Read(mut buf, 65536)
+	if err != nil {
+		if !contains("{err}", "timed out") {
+			p.dead = true
+		}
+		return
+	}
+	if k > 0 {
+		p.pending = p.pending + str(buf)
+	}
+}
+
+fn send(p mut peer, resp str) {
+	mut out = make([]u8, 0, len(resp)+4)
+	p32(mut out, len(resp))
+	out = append(out, resp...)
+	let tc = p.tc
+	if tc != nil {
+		tc.Write(str(out)) catch _ {
+			p.dead = true
+		}
+		return
+	}
+	p.conn.SetTimeout(5s)
+	p.conn.Write(str(out)) catch _ {
+		p.dead = true
+	}
+	p.conn.SetTimeout(1ms)
+}
+
+// handle answers one request: the response, and whether it is never sent. An empty response
+// closes the connection.
+fn handle(b mut broker, p mut peer, frame str) (str, bool) {
+	mut r = rd{s: frame, pos: 0}
+	let api = r.i16()
+	r.i16()
+	let corr = r.i32()
+	r.str() // client id
+	mut out = make([]u8, 0, 256)
+	p32(mut out, corr)
+	if api == 18 {
+		p16(mut out, 0)
+		let apis = []i64{0, 1, 2, 3, 8, 9, 10, 11, 12, 13, 14, 17, 18, 36}
+		p32(mut out, len(apis))
+		for _, a in apis {
+			p16(mut out, a)
+			p16(mut out, 0)
+			p16(mut out, 12)
+		}
+		p32(mut out, 0)
+		return str(out), false
+	}
+	if api == 17 {
+		p16(mut out, 0)
+		p32(mut out, 1)
+		pstr(mut out, "PLAIN")
+		return str(out), false
+	}
+	if api == 36 {
+		if r.bytes() != "\x00tin\x00secret" {
+			return "", false
+		}
+		b.auths += 1
+		p.authed = tide.Now()
+		p16(mut out, 0)
+		pnull(mut out)
+		pbytes(mut out, "")
+		p64(mut out, sessionMs)
+		return str(out), false
+	}
+	if b.secure {
+		// Kafka closes a connection that sends a request before authenticating, or after its
+		// session ended without authenticating again.
+		if p.authed == 0 {
+			return "", false
+		}
+		if tide.Now()-p.authed > sessionMs*1000000 {
+			b.expired += 1
+			return "", false
+		}
+	}
+	if api == 3 {
+		return metadata(b, out), false
+	}
+	if api == 2 {
+		r.i32()
+		r.i8()
+		r.i32()
+		let topic = r.str()
+		if topic == "s" {
+			return "", true
+		}
+		p32(mut out, 0)
+		p32(mut out, 1)
+		pstr(mut out, topic)
+		p32(mut out, 1)
+		p32(mut out, 0)
+		p16(mut out, 0)
+		p64(mut out, -1)
+		p64(mut out, 0)
+		p32(mut out, 0)
+		return str(out), false
+	}
+	if api == 1 {
+		for k in 0..7 {
+			if k == 4 {
+				r.i8()
+			} else {
+				r.i32()
+			}
+		}
+		r.i32()
+		let topic = r.str()
+		r.i32()
+		r.i32()
+		r.i32()
+		let off = r.u(8)
+		p32(mut out, 0)
+		p16(mut out, 0)
+		p32(mut out, 0)
+		p32(mut out, 1)
+		pstr(mut out, topic)
+		p32(mut out, 1)
+		p32(mut out, 0)
+		p16(mut out, 0)
+		mut data = ""
+		mut hw = 0
+		if topic == "big" {
+			hw = bigRecords
+			if off == 0 {
+				data = b.big
+			}
+		}
+		p64(mut out, hw)
+		p64(mut out, hw)
+		p64(mut out, 0)
+		p32(mut out, 0)
+		pbytes(mut out, data)
+		return str(out), false
+	}
+	p32(mut out, 0)
+	p16(mut out, 35)
+	return str(out), false
+}
+
+// metadata lists this broker alone, leading partition 0 of every topic asked about.
+fn metadata(b broker, head []u8) str {
+	mut out = make([]u8, 0, 256)
+	out = append(out, head...)
+	p32(mut out, 0)
+	p32(mut out, 1)
+	p32(mut out, b.id)
+	pstr(mut out, "127.0.0.1")
+	p32(mut out, b.port)
+	pnull(mut out)
+	pnull(mut out)
+	p32(mut out, b.id)
+	let topics = []str{"t", "s", "big"}
+	p32(mut out, len(topics))
+	for _, t in topics {
+		p16(mut out, 0)
+		pstr(mut out, t)
+		p8(mut out, 0)
+		p32(mut out, 1)
+		p16(mut out, 0)
+		p32(mut out, 0)
+		p32(mut out, b.id)
+		p32(mut out, 0)
+		p32(mut out, 1)
+		p32(mut out, b.id)
+		p32(mut out, 1)
+		p32(mut out, b.id)
+		p32(mut out, 0)
+	}
+	return str(out)
+}
+
+// ---- the client's side ----
+
+fn check(label str, cond bool) {
+	if cond {
+		say.Line("ok", label)
+	} else {
+		say.Line("FAIL", label)
+	}
+}
+
+// stats asks broker id for its counts: connections accepted, authentications, sessions it ended.
+fn stats(id i64) []i64 {
+	relay.Send(id, "stats")
+	let (_, m) = relay.Recv()
+	mut out = []i64{}
+	mut cur = 0
+	for k in 0..len(m) {
+		if m[k] == ' ' {
+			out = append(out, cur)
+			cur = 0
+		} else {
+			cur = cur*10 + i64(m[k]-'0')
+		}
+	}
+	return append(out, cur)
+}
+
+fn run(a str, b str) ! {
+	// A request the broker never answers ends at the client's timeout and drops the connection,
+	// so the next request connects again instead of queueing behind it.
+	let c1 = kafka.Open(kafka.Options{Brokers: []str{a}, Timeout: 200ms})
+	try c1.Ping()
+	let before = stats(1)[0]
+	let (_, _, terr) = c1.Offsets("s", 0)
+	check("a request the broker does not answer fails at the timeout", terr != nil && fault.Is(terr, kafka.ErrNetwork))
+	let perr = c1.Ping()
+	check("the next request connects again and is answered", perr == nil && stats(1)[0] > before)
+
+	// Connections to brokers that went away are reused: 70 dead addresses, then a live one.
+	mut boots = []str{}
+	for i in 0..70 {
+		let ln = try wire.Listen("127.0.0.1:0")
+		boots = append(boots, "127.0.0.1:{ln.Port()}")
+		ln.Close()
+	}
+	boots = append(boots, a)
+	let c5 = kafka.Open(kafka.Options{Brokers: boots, Timeout: 2s})
+	let derr = c5.Ping()
+	check("a client that tried 70 dead brokers reaches a live one", derr == nil)
+
+	// More clients than the old limit of 128.
+	mut last = c5
+	for i in 0..200 {
+		last = kafka.Open(kafka.Options{Brokers: []str{a}, Timeout: 2s})
+	}
+	check("200 more clients open", last.Ping() == nil)
+
+	// TLS: a 6 MiB fetch read straight into the client's buffer, within a 64 MiB budget.
+	let sec = kafka.Open(kafka.Options{Brokers: []str{b}, Username: "tin", Password: "secret", Timeout: 10s,
+		FetchMax: 16777216, TLS: tls.Config{ServerName: "localhost", RootCAs: certPEM}})
+	let got = limit memory 64mb {
+		let recs = try sec.Fetch("big", 0, 0, 0)
+		mut total = 0
+		for _, rec in recs {
+			total += len(rec.Value)
+		}
+		mut good = len(recs) == bigRecords && total == bigRecords*bigValue
+		if good {
+			good = recs[bigRecords-1].Value[:6] == "rec95 "
+		}
+		good
+	} catch e {
+		say.Line("big fetch:", e)
+		false
+	}
+	check("a 6 MiB fetch over TLS stays within a 64 MiB budget", got)
+
+	// KIP-368: sessions of one second are renewed before they end, by requests one at a time
+	// and by four tasks at once.
+	let t0 = tide.Now()
+	for tide.Since(t0) < 2500ms {
+		try sec.Ping()
+		try tide.Wait(50ms)
+	}
+	scope s6 {
+		for k in 0..4 {
+			s6.spawn(fn() ! {
+				let t1 = tide.Now()
+				for tide.Since(t1) < 2500ms {
+					try sec.Ping()
+					try tide.Wait(10ms)
+				}
+			})
+		}
+	}
+	let st = stats(2)
+	check("SASL sessions are renewed before the broker ends them (KIP-368)", st[1] >= 5 && st[2] == 0)
+}
+
+fn contains(s str, sub str) bool {
+	for i in 0..len(s)-len(sub)+1 {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}
+
+fn main() {
+	hearth.Run(3, fn(core i64) {
+		if core > 0 {
+			serve(core) catch err {
+				say.Line("FAIL broker", core, err)
+			}
+			return
+		}
+		mut ports = make([]i64, 3)
+		for i in 0..2 {
+			let (_, m) = relay.Recv()
+			let id = mint.Atoi(m[:1]) catch _ { 0 }
+			let port = mint.Atoi(m[2:]) catch _ { 0 }
+			ports[id] = port
+		}
+		run("127.0.0.1:{ports[1]}", "127.0.0.1:{ports[2]}") catch err {
+			say.Line("FAIL", err)
+		}
+		quarry.Exit(0)
+	})
+}
