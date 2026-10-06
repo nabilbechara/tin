@@ -298,7 +298,7 @@ let r = try wire.Get("http://127.0.0.1:8080/json")
 - `Listen(addr str) !Listener`: Listen opens a TCP listener on "host:port" (":0" picks a free port: see Port).
 - `(l Listener) Port() i64`: Port is the port the listener is bound to.
 - `(l Listener) Accept() !Conn`: Accept waits for the next connection.
-- `(l Listener) AcceptTimeout(timeout i64) !Conn`: AcceptTimeout waits at most timeout ns for the next connection (0: no limit), failing with a fault that says "timed out" when none came.
+- `(l Listener) AcceptTimeout(timeout i64) !Conn`: AcceptTimeout waits at most timeout ns for the next connection (0: no limit), failing with a fault that says "timed out" when none came. A negative timeout is refused.
 - `(l mut Listener) Close()`: Close stops listening.
 - `type Options struct`: Options configure one client call (DoWith); the zero value is what Do uses.
 - `const DefaultMaxIdle = 8`: DefaultMaxIdle is how many idle connections per host (and core) DoWith keeps when Options.MaxIdle is 0.

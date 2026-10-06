@@ -1,0 +1,84 @@
+package main
+
+import "quarry"
+import "say"
+import "squash"
+import "stamp"
+
+// The Tin side of squash_twin_check.py (#448). `enc DIR` writes DIR/input.bin, an input that
+// makes DEFLATE use every length code (both ends of each one's range) and every distance code,
+// and DIR/tin1.deflate, tin6 and tin9, Tin's raw DEFLATE of it at those levels, for Go to
+// inflate. `dec DIR` inflates Go's DIR/go1.deflate, go6 and go9 and compares them with the input.
+// Tin's encoder and decoder share their length and distance tables, so only the other
+// implementation can catch a wrong entry.
+
+let lenBase = []i64{3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258}
+let lenExtra = []i64{0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0}
+let distBase = []i64{1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577}
+let distExtra = []i64{0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13}
+
+// rng is a 64-bit LCG; its top byte is the noise, which DEFLATE cannot compress.
+type rng struct {
+	x u64
+}
+
+fn (r mut rng) next() u8 {
+	r.x = r.x *% 6364136223846793005 +% 1442695040888963407
+	return u8(r.x >> 56)
+}
+
+// unit appends d bytes of fresh noise, then l bytes copied from d bytes back: the one match
+// there, at distance d with length l (overlapping when l > d, as DEFLATE copies).
+fn unit(b mut []u8, r mut rng, d i64, l i64) {
+	for i in 0..d {
+		b = append(b, r.next())
+	}
+	for i in 0..l {
+		b = append(b, b[len(b)-d])
+	}
+}
+
+fn input() str {
+	mut r = rng{x: 12345}
+	mut b = make([]u8, 0, 300000)
+	for j in 0..29 {
+		unit(mut b, mut r, 300, lenBase[j])
+		unit(mut b, mut r, 300, lenBase[j]+(1<<lenExtra[j])-1)
+	}
+	for k in 0..30 {
+		unit(mut b, mut r, distBase[k], 10)
+		unit(mut b, mut r, distBase[k]+(1<<distExtra[k])-1, 10)
+	}
+	return str(b)
+}
+
+fn main() {
+	let args = quarry.Args()
+	if len(args) != 3 {
+		say.Line("usage: squash_twin enc|dec DIR")
+		quarry.Exit(2)
+	}
+	let dir = args[2]
+	let levels = []i64{1, 6, 9}
+	if args[1] == "enc" {
+		let data = input()
+		quarry.WriteFile(dir+"/input.bin", data) catch err { panic(err) }
+		for _, lv in levels {
+			quarry.WriteFile("{dir}/tin{lv}.deflate", squash.Deflate(data, lv)) catch err { panic(err) }
+		}
+		say.Line("input", len(data), stamp.Crc32(data))
+		return
+	}
+	let data = quarry.ReadFile(dir+"/input.bin") catch err { panic(err) }
+	for _, lv in levels {
+		let z = quarry.ReadFile("{dir}/go{lv}.deflate") catch err { panic(err) }
+		let (out, err) = squash.Inflate(z, 1 << 30)
+		if err != nil {
+			say.Line("tin inflates go level", lv, "FAIL", err)
+		} else if out != data {
+			say.Line("tin inflates go level", lv, "FAIL", len(out), stamp.Crc32(out), "want", len(data), stamp.Crc32(data))
+		} else {
+			say.Line("tin inflates go level", lv, "ok", len(out), stamp.Crc32(out))
+		}
+	}
+}
