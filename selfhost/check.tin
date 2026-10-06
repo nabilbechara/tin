@@ -5007,6 +5007,23 @@ fn check_assign(s i64) {
 			}
 		}
 	}
+	// A mut slice parameter reaches the caller only through `p = append(p, ...)`, which grows the
+	// shared header in place; any other value (a reslice, another slice) rebinds only the callee's
+	// copy and is silently lost, as for the struct, optional, map and dyn parameters in check_target.
+	if cast(Node, target).kind == EX_IDENT {
+		let ps = lookup_name(cast(IdentExpr, target).name)
+		if cast(i64, ps) != 0 && ps.kind == SYM_LOCAL && ps.mut_ != 0 && kind_of(cast(Ty, ps.type_)) == K_SLICE && !(v.kind == EX_CALL && len(cast(Call, v).name) != 0 && cast(Call, v).name == "append" && len(cast(Call, v).args) > 0 && cast(Node, cast(Call, v).args[0]).kind == EX_IDENT && cast(IdentExpr, cast(Call, v).args[0]).name == cast(IdentExpr, target).name) {
+			let u = err_code(cast(Node, target).pos, "E704 MUT_PARAM_REBIND")
+			buf_str(u, "cannot assign to mut parameter '")
+			buf_str(u, cast(IdentExpr, target).name)
+			buf_str(u, "': it would rebind only this function's copy, and the caller would not see it; only ")
+			buf_str(u, cast(IdentExpr, target).name)
+			buf_str(u, " = append(")
+			buf_str(u, cast(IdentExpr, target).name)
+			buf_str(u, ", ...) reaches the caller, so modify its elements or return the new slice")
+			err_end(cast([]u8, u))
+		}
+	}
 	sb_assign(cast(Node, s).pos, target, cast(i64, v))
 	if (v.kind == EX_TRY || v.kind == EX_CATCH || v.kind == EX_WRAP) {
 		lower_try_stmt(s, cast(i64, v), 2, 0)
