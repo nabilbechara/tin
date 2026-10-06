@@ -6,6 +6,8 @@ import "seal"
 // SCRAM-SHA-256 and SCRAM-SHA-512 (RFC 5802, RFC 7677) as Kafka speaks them: no channel binding,
 // the password used as its UTF-8 bytes (Kafka's ScramFormatter does no SASLprep).
 
+const minScramIterations = 4096
+
 fn scramHash(mech i64) seal.Hash {
 	if mech == 2 {
 		return seal.Hash.SHA512
@@ -74,8 +76,10 @@ fn scramProof(h seal.Hash, bare str, serverFirst str, nonce str, pass str) !(str
 		fail "{authFailed}: the server's nonce does not extend ours"
 	}
 	let iterations = mint.Atoi(it) catch _ { 0 }
-	if iterations < 1 || iterations > 1000000 {
-		fail "{authFailed}: SCRAM iteration count {it} is outside 1..1000000"
+	// RFC 7677 asks for at least 4096, and Java's ScramSaslClient refuses fewer: a man in the
+	// middle could otherwise force 1 iteration and crack the captured proof cheaply.
+	if iterations < minScramIterations || iterations > 1000000 {
+		fail "{authFailed}: SCRAM iteration count {it} is outside {minScramIterations}..1000000"
 	}
 	let salt = seal.B64Decode(s) catch _ {
 		fail "{authFailed}: the SCRAM salt is not base64"

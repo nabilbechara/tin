@@ -30,8 +30,10 @@ type Fetched struct {
 
 // Fetch reads records of topic's partition from offset on. It returns as soon as there are
 // records, or empty after maxWait nanoseconds with none. At most Options.FetchMax bytes of whole
-// record batches come back; a record before offset is skipped. An offset outside the partition
-// fails with ErrOffsetOutOfRange.
+// record batches come back; a record before offset is skipped. They decompress to at most 64
+// times the larger of FetchMax and the bytes fetched: batches past that come in the next fetch, and
+// one batch larger than it fails (raise FetchMax). An offset outside the partition fails with
+// ErrOffsetOutOfRange.
 fn (c Client) Fetch(topic str, partition i64, offset i64, maxWait i64) ![]Record {
 	let f = try c.FetchAll([]Want{Want{Topic: topic, Partition: partition, Offset: offset}}, maxWait)
 	if len(f.Parts) == 1 && f.Parts[0].OutOfRange {
@@ -166,6 +168,7 @@ fn (c Client) fetchFrom(addr str, wants []Want, maxWait i64, out mut Fetched) ! 
 	put32(mut body, 0) // forgotten topics
 	let resp = try c.call(addr, apiFetch, body, maxWait, false)
 	mut d = newDec(resp)
+	mut budget = newInflateBudget(fm, len(resp), true)
 	d.i32() // throttle
 	let top = d.i16()
 	d.i32() // session id
@@ -207,7 +210,7 @@ fn (c Client) fetchFrom(addr str, wants []Want, maxWait i64, out mut Fetched) ! 
 				fail kerr(code, "fetch from {topic}/{part} at {from}")
 			}
 			let f = readFilter{from: from, committed: c.rec[rIsolation] == 1, aborted: aborted}
-			let (rs, next) = try decodeBatches(data, topic, part, f, 1 << 30)
+			let (rs, next) = try decodeBatches(data, topic, part, f, mut budget)
 			out.Records = append(out.Records, rs...)
 			out.Parts = append(out.Parts, Part{Topic: topic, Partition: part, Next: next, HighWatermark: hw, LastStable: lso, LogStart: ls, OutOfRange: false})
 		}

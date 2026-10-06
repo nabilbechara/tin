@@ -2,6 +2,7 @@ package main
 
 import "kafka"
 import "say"
+import "stamp"
 
 // The parts of the Kafka client that need no broker: the key partitioner (Kafka's murmur2, with
 // the six vectors of Kafka's own UtilsTest plus the empty key), and the record batch format with
@@ -13,6 +14,33 @@ fn check(label str, got i64, want i64) {
 	} else {
 		say.Line("FAIL", label, got, want)
 	}
+}
+
+fn be32(v i64) str {
+	mut b = make([]u8, 4, 4)
+	b[0] = u8((v >> 24) & 255)
+	b[1] = u8((v >> 16) & 255)
+	b[2] = u8((v >> 8) & 255)
+	b[3] = u8(v & 255)
+	return str(b)
+}
+
+// forge replaces the byte at in the one-batch data raw with repl, then fixes the batch's length
+// and CRC-32C, as whoever crafts a batch can (#441).
+fn forge(raw str, at i64, repl str) str {
+	let body = raw[21:at] + repl + raw[at+1:]
+	return raw[0:8] + be32(9 + len(body)) + raw[12:17] + be32(i64(stamp.Crc32C(body))) + body
+}
+
+// varintMax is zig-zag(2^63-1), the largest length a varint can claim.
+fn varintMax() str {
+	mut b = make([]u8, 10, 10)
+	b[0] = 254
+	for i in 1..9 {
+		b[i] = 255
+	}
+	b[9] = 1
+	return str(b)
 }
 
 fn main() {
@@ -78,4 +106,35 @@ fn main() {
 		let back = kafka.DecodeBatches(z) catch _ { []kafka.Record{} }
 		say.Line(names[i], "500 records under a quarter of their size", len(z) < len(plain)/4, len(back) == 500)
 	}
+
+	// Untrusted lengths and deltas (#441): each is an error, never a panic or a huge allocation.
+	// The batch is 12 bytes of offset and length, a 49-byte header, then the record: its size at
+	// 61, attributes, timestamp delta, offset delta at 64, the key's length at 65.
+	let one = kafka.EncodeBatch([]kafka.Message{kafka.Message{Key: "k", Value: "v", Headers: []kafka.Header{}, Timestamp: 1}}, 1, kafka.Compression.None)
+	let (_, keyErr) = kafka.DecodeBatches(forge(one, 65, varintMax()))
+	say.Line("a key length of 2^63-1:", keyErr)
+	let (_, sizeErr) = kafka.DecodeBatches(forge(one, 61, varintMax()))
+	say.Line("a record size of 2^63-1:", sizeErr)
+	// The offset delta grows the record by 9 bytes, so its size (zig-zag, one byte) grows too.
+	mut sized = []u8{}
+	sized = append(sized, one...)
+	sized[61] = sized[61] + 18
+	let (_, deltaErr) = kafka.DecodeBatches(forge(str(sized), 64, varintMax()))
+	say.Line("an offset delta of 2^63-1:", deltaErr)
+	// The old message format (magic 1): offset, size, CRC, magic, attributes, then a timestamp
+	// whose bytes, read as format 2's attributes, look like a control batch.
+	mut v1 = []u8{}
+	v1 = append(v1, 1)
+	v1 = append(v1, 0)
+	for k in 0..8 {
+		v1 = append(v1, 0x30)
+	}
+	v1 = append(v1, "\xff\xff\xff\xff"...)
+	v1 = append(v1, be32(40)...)
+	for k in 0..40 {
+		v1 = append(v1, 'v')
+	}
+	let old = "\x00\x00\x00\x00\x00\x00\x00\x00" + be32(4 + len(v1)) + be32(i64(stamp.Crc32(str(v1)))) + str(v1)
+	let (oldRs, oldErr) = kafka.DecodeBatches(old)
+	say.Line("an old-format message set:", len(oldRs), oldErr)
 }

@@ -1,5 +1,6 @@
 package kafka
 
+import "fault"
 import "squash"
 import "stamp"
 
@@ -199,7 +200,8 @@ fn newDec(s str) dec {
 }
 
 fn (d mut dec) need(n i64) bool {
-	if d.bad || n < 0 || d.pos+n > len(d.s) {
+	// n > len-pos, not pos+n > len: a length near 2^63 from the wire would overflow the sum.
+	if d.bad || n < 0 || n > len(d.s)-d.pos {
 		d.bad = true
 		return false
 	}
@@ -535,11 +537,30 @@ type readFilter struct {
 	aborted   []abortedTxn
 }
 
+// inflateRatio bounds what one fetch may decompress to: this many times the larger of FetchMax and
+// the bytes that arrived. A batch is checked by CRC, but whoever crafts it can compute that, so a
+// small fetch of zstd or gzip batches must not be able to expand to gigabytes.
+const inflateRatio = 64
+
+// inflateBudget is what is left to decompress in one fetch (every partition in it shares it).
+// With partial, batches past the budget are left for the next fetch, which starts at the first
+// one left; only a batch larger than the whole budget fails, since no fetch could read it.
+type inflateBudget struct {
+	left    i64
+	full    i64
+	partial bool
+}
+
+fn newInflateBudget(fetchMax i64, got i64, partial bool) inflateBudget {
+	let n = inflateRatio * max(fetchMax, got)
+	return inflateBudget{left: n, full: n, partial: partial}
+}
+
 // decodeBatches reads the record batches of one fetched partition into records. The broker may
 // end the data in the middle of a batch (it cuts at the byte limit): that last, partial batch is
 // dropped and the next fetch starts at it. next is the offset after the last batch read (control
 // batches and skipped ones count), so a fetch that returns only markers still moves on.
-fn decodeBatches(data str, topic str, partition i64, f readFilter, max i64) !([]Record, i64) {
+fn decodeBatches(data str, topic str, partition i64, f readFilter, budget mut inflateBudget) !([]Record, i64) {
 	mut out = []Record{}
 	mut next = f.from
 	mut at = 0
@@ -551,18 +572,30 @@ fn decodeBatches(data str, topic str, partition i64, f readFilter, max i64) !([]
 		if batchLen < 0 {
 			fail "kafka: a record batch has length {batchLen}"
 		}
-		if at+12+batchLen > len(data) {
+		if batchLen > len(data)-at-12 {
 			break
 		}
 		let batch = data[at+12 : at+12+batchLen]
 		at += 12 + batchLen
+		// The magic byte and the CRC come before any other field is used: in the old message
+		// format (magic 0 and 1) the bytes where format 2 keeps its attributes are a timestamp.
+		if len(batch) < 5 {
+			fail "kafka: a record batch is {len(batch)} bytes, shorter than its header"
+		}
+		let magic = i64(batch[4])
+		if magic != 2 {
+			fail "kafka: record batch magic {magic} is not supported (the broker sent a message format older than 0.11)"
+		}
 		if len(batch) < 49 {
 			fail "kafka: a record batch is {len(batch)} bytes, shorter than its header"
 		}
-		let lastOffset = baseOffset + be32(batch, 11)
-		if lastOffset+1 > next {
-			next = lastOffset + 1
+		if stamp.Crc32C(batch[9:]) != u32(be32(batch, 5)) {
+			fail "kafka: a record batch failed its CRC-32C check"
 		}
+		if baseOffset < 0 || baseOffset > 1 << 62 {
+			fail "kafka: a record batch has base offset {baseOffset}"
+		}
+		let lastOffset = baseOffset + be32(batch, 11)
 		let attrs = be32(batch, 9) >> 16 & 0xffff
 		let pid = be64(batch, 31)
 		if f.committed {
@@ -577,6 +610,7 @@ fn decodeBatches(data str, topic str, partition i64, f readFilter, max i64) !([]
 			}
 			pending = rest
 		}
+		mut skip = false
 		if attrs&0x20 != 0 {
 			// A control batch: a commit or abort marker closes its producer's transaction.
 			if f.committed && attrs&0x10 != 0 {
@@ -588,56 +622,62 @@ fn decodeBatches(data str, topic str, partition i64, f readFilter, max i64) !([]
 				}
 				aborting = stay
 			}
-			continue
-		}
-		if f.committed && attrs&0x10 != 0 {
-			mut skip = false
+			skip = true
+		} else if f.committed && attrs&0x10 != 0 {
 			for _, p in aborting {
 				if p == pid {
 					skip = true
 				}
 			}
-			if skip {
-				continue
-			}
 		}
-		try decodeBatch(batch, baseOffset, topic, partition, f.from, max, mut out)
+		if !skip {
+			mut recs = batch[49:]
+			let codec = attrs & 7
+			if codec != 0 {
+				let (z, zerr) = decompress(codec, recs, budget.left)
+				if zerr != nil {
+					if !fault.Is(zerr, fault.LimitExceeded) {
+						fail zerr
+					}
+					if !budget.partial || budget.left == budget.full {
+						fail "kafka: the record batch at offset {baseOffset} decompresses to more than {budget.full} bytes ({inflateRatio} times FetchMax or the fetched bytes)"
+					}
+					// Out of budget: this batch and the rest wait for the next fetch.
+					budget.left = 0
+					break
+				}
+				budget.left -= len(z)
+				recs = z
+			}
+			try decodeBatch(batch, recs, baseOffset, topic, partition, f.from, mut out)
+		}
+		if lastOffset+1 > next {
+			next = lastOffset + 1
+		}
 	}
 	return out, next
 }
 
-// decodeBatch decodes one batch (the bytes after its length field) onto out.
-fn decodeBatch(batch str, baseOffset i64, topic str, partition i64, from i64, max i64, out mut []Record) ! {
-	let magic = i64(batch[4])
-	if magic != 2 {
-		fail "kafka: record batch magic {magic} is not supported (the broker sent a message format older than 0.11)"
-	}
-	let crc = u32(be32(batch, 5))
-	let body = batch[9:]
-	if stamp.Crc32C(body) != crc {
-		fail "kafka: a record batch failed its CRC-32C check"
-	}
+// decodeBatch decodes the records recs (decompressed) of one batch (the bytes after its length
+// field, already checked by decodeBatches) onto out.
+fn decodeBatch(batch str, recs str, baseOffset i64, topic str, partition i64, from i64, out mut []Record) ! {
 	let epoch = be32(batch, 0)
 	let attrs = be32(batch, 9) >> 16 & 0xffff
-	let codec = attrs & 7
+	let lastDelta = be32(batch, 11)
 	let firstTs = be64(batch, 15)
 	let maxTs = be64(batch, 23)
 	let logAppend = attrs & 8 != 0
 	let n = be32(batch, 45)
-	mut recs = batch[49:]
-	if codec != 0 {
-		recs = try decompress(codec, recs, max)
-	}
 	if n < 0 || n > len(recs) {
 		fail "kafka: a record batch claims {n} records"
 	}
 	mut d = newDec(recs)
 	for r in 0..n {
 		let size = d.varint()
-		let end = d.pos + size
-		if d.bad || size < 0 || end > len(d.s) {
+		if d.bad || size < 0 || size > len(d.s)-d.pos {
 			fail "kafka: a record is cut short"
 		}
+		let end = d.pos + size
 		d.i8() // attributes
 		let tsDelta = d.varint()
 		let offDelta = d.varint()
@@ -655,11 +695,15 @@ fn decodeBatch(batch str, baseOffset i64, topic str, partition i64, from i64, ma
 		if d.bad || d.pos != end {
 			fail "kafka: a record does not match its length"
 		}
+		if offDelta < 0 || offDelta > lastDelta {
+			fail "kafka: a record's offset delta {offDelta} is outside its batch (0 to {lastDelta})"
+		}
 		let off = baseOffset + offDelta
 		if off < from {
 			continue
 		}
-		mut ts = firstTs + tsDelta
+		// Timestamps are only reported, so a crafted delta wraps instead of panicking.
+		mut ts = firstTs +% tsDelta
 		if logAppend {
 			ts = maxTs
 		}
@@ -718,8 +762,10 @@ fn EncodeBatch(ms []Message, now i64, c Compression) str {
 // DecodeBatches reads the record batches in data, as a Fetch response carries them, with any
 // codec. A batch the data ends in the middle of is dropped; a damaged one, a changed byte
 // (CRC-32C) or an old message format fails. Control batches (transaction markers) are skipped.
+// All the batches together may decompress to at most 64 times the larger of 1 MiB and len(data).
 fn DecodeBatches(data str) ![]Record {
-	let (rs, _) = try decodeBatches(data, "", 0, readFilter{from: 0, committed: false, aborted: []abortedTxn{}}, 1 << 30)
+	mut budget = newInflateBudget(defaultFetchMax, len(data), false)
+	let (rs, _) = try decodeBatches(data, "", 0, readFilter{from: 0, committed: false, aborted: []abortedTxn{}}, mut budget)
 	return rs
 }
 
