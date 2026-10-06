@@ -1,0 +1,157 @@
+package main
+
+import "fault"
+import "say"
+import "squash"
+import "stamp"
+
+// Small hostile inputs must not make squash allocate far more than they and their output take
+// (#440). Each input of the issue is decoded inside `limit memory` of a small multiple of its size
+// plus its output (before the fix each took from 136 MB to 33 GB), and encoders called many times
+// on small inputs stay inside a fixed budget. Then the stricter checks of the same issue.
+
+fn unhex(h str) str {
+	mut b = make([]u8, 0, len(h)/2)
+	for i in 0..len(h)/2 {
+		b = append(b, u8(nib(h[2*i])<<4 | nib(h[2*i+1])))
+	}
+	return str(b)
+}
+
+fn nib(c u8) i64 {
+	if c >= 'a' {
+		return i64(c-'a') + 10
+	}
+	return i64(c - '0')
+}
+
+fn repeat(s str, n i64) str {
+	mut b = make([]u8, 0, len(s)*n)
+	for i in 0..n {
+		b = append(b, s...)
+	}
+	return str(b)
+}
+
+// bounded decodes in a pool budget of 12 times the input, 6 times the output and 4 MiB. The input
+// term covers a few small objects per block (a hostile zstd block is 10 bytes); the output term
+// the buffer's growth and the final str.
+fn bounded(label str, input str, output i64, decode fn(str) !i64) {
+	let budget = 12*len(input) + 6*output + 4194304
+	// budget * 1: a bare name before { would read as a struct literal.
+	let got = limit memory budget * 1 {
+		try decode(input)
+	} catch err {
+		if fault.Is(err, fault.LimitExceeded) {
+			say.Line("FAIL", label, "goes past", budget, "bytes")
+		} else {
+			say.Line("FAIL", label, err)
+		}
+		-1
+	}
+	if got >= 0 {
+		say.Line("ok", label, "decodes to", got, "bytes")
+	}
+}
+
+fn main() {
+	// gzip: 4000 members of 4 KiB of zeros (each member used to reserve from the whole input).
+	mut zeros = make([]u8, 4096)
+	let members = repeat(squash.Gzip(str(zeros), squash.Default), 4000)
+	bounded("gzip, 4000 members", members, 4000*4096, fn(s str) !i64 {
+		let out = try squash.Gunzip(s, 1 << 30)
+		return len(out)
+	})
+	// gzip: 40000 empty members.
+	bounded("gzip, 40000 empty members", repeat(squash.Gzip("", squash.Default), 40000), 0, fn(s str) !i64 {
+		let out = try squash.Gunzip(s, 1 << 30)
+		return len(out)
+	})
+	// LZ4: 64 KiB blocks, 100000 independent blocks of one literal.
+	let lz = unhex("04224d18604082") + repeat(unhex("020000001041"), 100000) + unhex("00000000")
+	bounded("lz4, 100000 one-literal blocks", lz, 100000, fn(s str) !i64 {
+		let out = try squash.Unlz4(s, 1 << 30)
+		return len(out)
+	})
+	// zstd: 100000 blocks, each with a fresh Huffman tree and no literals.
+	let zs = unhex("28b52ffd0000") + repeat(unhex("3c000002c00080b00100"), 100000) + unhex("010000")
+	bounded("zstd, 100000 Huffman trees", zs, 0, fn(s str) !i64 {
+		let out = try squash.Unzstd(s, 1 << 30)
+		return len(out)
+	})
+	// zstd: 100000 empty frames (the predefined tables used to be built for each).
+	bounded("zstd, 100000 empty frames", repeat(unhex("28b52ffd2000010000"), 100000), 0, fn(s str) !i64 {
+		let out = try squash.Unzstd(s, 1 << 30)
+		return len(out)
+	})
+	// DEFLATE: 47000 dynamic blocks holding only end-of-block, each followed by an empty stored
+	// block so the unit is whole bytes.
+	let df = repeat(unhex("04c0810800000000207feb070000ffff"), 47000) + unhex("010000ffff")
+	bounded("deflate, 47000 empty dynamic blocks", df, 0, fn(s str) !i64 {
+		let out = try squash.Inflate(s, 1 << 30)
+		return len(out)
+	})
+	// Snappy: a header that declares 1 GiB, with no data.
+	let (_, snErr) = limit memory 4mb {
+		let out = try squash.Unsnappy(unhex("ffffffff03"), 1 << 30)
+		len(out)
+	}
+	say.Line("snappy, a 1 GiB header and no data:", snErr != nil && !fault.Is(snErr, fault.LimitExceeded), snErr)
+
+	// Encoders: 1000 calls on 1 KiB each (a producer's batches) within 64 MiB (they took 136 MB to
+	// 1.1 GB with tables of the window's size).
+	mut kib = make([]u8, 0, 1024)
+	for i in 0..1024 {
+		kib = append(kib, u8('a' + i%7))
+	}
+	let one = str(kib)
+	let names = []str{"zstd", "gzip", "lz4", "snappy"}
+	for _, name in names {
+		let total = limit memory 64mb {
+			mut n = 0
+			for i in 0..1000 {
+				if name == "zstd" {
+					n += len(squash.Zstd(one, squash.Default))
+				} else if name == "gzip" {
+					n += len(squash.Gzip(one, squash.Default))
+				} else if name == "lz4" {
+					n += len(squash.Lz4(one))
+				} else {
+					n += len(squash.Snappy(one))
+				}
+			}
+			n
+		} catch err {
+			say.Line("FAIL", name, "1000 calls on 1 KiB:", err)
+			-1
+		}
+		if total > 0 {
+			say.Line("ok", name, "1000 calls on 1 KiB within 64 MiB")
+		}
+	}
+
+	// Stricter checks.
+	let (_, skipErr) = squash.Unlz4(squash.Lz4("abc") + unhex("502a4d18ffffff00"), 1 << 20)
+	say.Line("lz4, a skippable frame cut short:", skipErr)
+	// A second frame with linked blocks whose first copy reaches into the first frame.
+	let (_, linkErr) = squash.Unlz4(squash.Lz4("abcd") + unhex("04224d184040c003000000000100") + unhex("00000000"), 1 << 20)
+	say.Line("lz4, a linked block copying from an earlier frame:", linkErr)
+	let (_, fcsErr) = squash.Unzstd(unhex("28b52ffde0ffffffffffffffff190000616263"), 1 << 20)
+	say.Line("zstd, a content size of 2^64-1:", fault.Is(fcsErr, fault.LimitExceeded), fcsErr)
+	// The first block's sequences repeat tables (modes 0xfc) there are none of yet.
+	let (_, repErr) = squash.Unzstd(unhex("28b52ffd2000250000") + unhex("0001fc01"), 1 << 20)
+	say.Line("zstd, repeat mode in a frame's first block:", repErr)
+	// RLE literals of 131073 bytes in one block.
+	let (_, bigErr) = squash.Unzstd(unhex("28b52ffd00002d00001d002061") + unhex("00"), 1 << 20)
+	say.Line("zstd, a block of 128 KiB and one byte:", bigErr)
+	// The gzip header's CRC-16 (FHCRC): right is accepted, wrong is not.
+	let g = squash.Gzip("hello", squash.Default)
+	let head = g[0:3] + str([]u8{g[3] | 2}) + g[4:10]
+	let hc = i64(stamp.Crc32(head)) & 0xffff
+	let good = head + str([]u8{u8(hc & 255), u8(hc >> 8)}) + g[10:]
+	let bad = head + str([]u8{u8((hc ^ 1) & 255), u8(hc >> 8)}) + g[10:]
+	let (gv, gerr) = squash.Gunzip(good, 1 << 20)
+	say.Line("gzip, a right header CRC:", gv, gerr)
+	let (_, berr) = squash.Gunzip(bad, 1 << 20)
+	say.Line("gzip, a wrong header CRC:", berr)
+}

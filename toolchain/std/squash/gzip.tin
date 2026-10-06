@@ -23,9 +23,13 @@ fn Gzip(data str, level i64) str {
 }
 
 // Gunzip decompresses gzip data (one member or several back to back), producing at most max bytes.
-// It checks each member's CRC-32 and length.
+// It checks each member's CRC-32 and length, and the header's CRC-16 when there is one.
 fn Gunzip(data str, max i64) !str {
-	mut out = ""
+	// Every member decodes into one buffer with one set of tables, so memory is linear in the
+	// input and the output whatever the number of members (#440).
+	mut out = make([]u8, 0, min(max, len(data)*4+64))
+	mut z = newInflater()
+	mut crcs = make([]i64, 0, 16) // per member: start in out, end, CRC-32 from its trailer
 	mut at = 0
 	mut members = 0
 	for at < len(data) || members == 0 {
@@ -53,30 +57,41 @@ fn Gunzip(data str, max i64) !str {
 			p = try skipZero(data, p)
 		}
 		if flags & 2 != 0 {
+			if p+2 > len(data) {
+				fail "squash: gzip data ends in its header"
+			}
+			let hcrc = i64(data[p]) | i64(data[p+1])<<8
+			if hcrc != i64(stamp.Crc32(data[at:p])) & 0xffff {
+				fail "squash: gzip header checksum mismatch"
+			}
 			p += 2
 		}
 		if p > len(data) {
 			fail "squash: gzip data ends in its header"
 		}
 		mut r = bitReader{s: data, pos: p, acc: 0, n: 0, bad: false}
-		let part = try inflateFrom(mut r, max-len(out))
+		let start = len(out)
+		try inflateInto(mut r, mut out, max, mut z)
 		let end = trailerAt(mut r)
 		if end+8 > len(data) {
 			fail "squash: gzip data ends before its trailer"
 		}
-		let crc = le32(data, end)
 		let size = le32(data, end+4)
-		if crc != i64(stamp.Crc32(part)) {
-			fail "squash: gzip checksum mismatch"
-		}
-		if size != len(part) & 0xffffffff {
+		if size != (len(out)-start) & 0xffffffff {
 			fail "squash: gzip length mismatch"
 		}
-		out = out + part
+		crcs = append(crcs, start, len(out), le32(data, end))
 		at = end + 8
 		members += 1
 	}
-	return out
+	// The CRCs are checked on the result: a slice of a str is a view, not a copy.
+	let res = str(out)
+	for k in 0..len(crcs)/3 {
+		if crcs[3*k+2] != i64(stamp.Crc32(res[crcs[3*k]:crcs[3*k+1]])) {
+			fail "squash: gzip checksum mismatch"
+		}
+	}
+	return res
 }
 
 fn skipZero(data str, from i64) !i64 {
@@ -136,7 +151,10 @@ fn Unzlib(data str, max i64) !str {
 		fail "squash: zlib data needs a preset dictionary"
 	}
 	mut r = bitReader{s: data, pos: 2, acc: 0, n: 0, bad: false}
-	let out = try inflateFrom(mut r, max)
+	mut buf = make([]u8, 0, min(max, len(data)*4+64))
+	mut z = newInflater()
+	try inflateInto(mut r, mut buf, max, mut z)
+	let out = str(buf)
 	let end = trailerAt(mut r)
 	if end+4 > len(data) {
 		fail "squash: zlib data ends before its checksum"
