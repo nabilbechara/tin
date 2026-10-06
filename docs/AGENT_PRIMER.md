@@ -14,10 +14,10 @@ docs/RUNTIME.md (memory, layouts, trusted code), docs/ERRORS.md (every diagnosti
     tin fix -edition 1 FILE.tin                    rewrite edition-0 (Go-like) code to edition 1
     docker run --rm -v "$PWD/bin/linux":/w tin-debian-arm64 /w/prog
 When several agents work at once, each uses a frozen compiler (for example bin/tinc_agents, with
-TIN_ROOT set to the root) and its own output dir bin/agent_NAME/. Never run tools/v2test.sh,
+TIN_ROOT set to the root) and its own output dir bin/agent_NAME/. Never run tools/dev/v2test.sh,
 never write bin/t, and never touch selfhost/, lib/runtime/, lib/anvil/, lib/argo/,
 lib/hearth/, Makefile or seed/ unless your task says so. If you hit a compiler bug, do NOT fix
-the compiler: write a minimal repro to notes/compiler_bugs_NAME.md and work around it.
+the compiler: write a minimal repro as a test, open an issue and work around it.
 
 ## Language (strict, edition 1)
 - Files start `package main` (programs) or `package NAME` (lib/NAME/, imported with
@@ -204,4 +204,4 @@ Anything that touches the OS must also run on Linux (cross-compile and run in ti
   say.Line (deterministic output; temporary files under /tmp/tin-test-*). Then save the expected
   output: run it, sort the output, and write it to tests/v2/NAME.out
   (`bin/agent_X/prog | sort > tests/v2/NAME.out`) only after verifying every line by hand is correct.
-- A short section appended to notes/stdlib_NAME.md: API list, design notes, known gaps.
+- The package's README: API list, design notes, known gaps.

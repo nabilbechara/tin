@@ -49,7 +49,7 @@ handled in `gen.tin` by `tgt_linux`.
 
 ## 3. Linux amd64
 
-The plan (`notes/plan_linux.md`) and the work log (`notes/x64_progress.md`):
+The Linux amd64 port:
 - System V ABI (rdi, rsi, rdx, rcx, r8, r9; xmm0–7; `al` = vector registers for variadic
   calls). Core context in r15; rbp kept as the frame pointer.
 - A static PIE like arm64's: `_start` passes argc, argv and envp to main (rbp cleared, rsp
@@ -59,7 +59,7 @@ The plan (`notes/plan_linux.md`) and the work log (`notes/x64_progress.md`):
 - `seal.Sha256` uses the portable code until SHA-NI is added (also on arm64 CPUs without
   the SHA-2 instructions, detected through `AT_HWCAP`).
 - Correctness and self-hosting run natively on GitHub's `ubuntu-24.04` x86-64 runner.
-  `tools/x64fuzz/linuxtest_amd64.sh` also checks the strict and regression suites in a
+  `tools/dev/x64fuzz/linuxtest_amd64.sh` also checks the strict and regression suites in a
   container, emulated when the host is arm64. Dedicated x86-64 performance benchmarks
   remain pending.
 
@@ -107,7 +107,7 @@ The plan (`notes/plan_linux.md`) and the work log (`notes/x64_progress.md`):
    `ev_hangup`, `ownListener`, and for shutdown `ev_signals`, `ev_signal`, `ev_signal_ack`,
    `ev_drain_timer`), and the compiler's own `host_<os>.tin`.
 5. Verify constants and layouts by compiling C probes on the target, as in
-   `notes/linux_probe/`, and record them like `notes/linux_abi.md`.
+   `tools/dev/linux_probe/`, and record them like `design/linux_abi.md`.
 6. Tests: every `tests/v2` program must produce the same output on every target; the
    compiler must self-host there.
 

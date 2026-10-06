@@ -99,7 +99,7 @@ make bootstrap                # tinc rebuilds itself twice; the binaries must be
 Documentation: [docs/README.md](docs/README.md), the index. The language reference is
 [docs/LANGUAGE.md](docs/LANGUAGE.md) (agents start with the short
 [docs/AGENT_PRIMER.md](docs/AGENT_PRIMER.md)), the standard library [docs/STDLIB.md](docs/STDLIB.md)
-(generated from the sources by `tools/gendoc.py`), commands and builds
+(generated from the sources by `tools/gen/gendoc.py`), commands and builds
 [docs/TOOLING.md](docs/TOOLING.md), targets and containers [docs/PORTING.md](docs/PORTING.md),
 the runtime [docs/RUNTIME.md](docs/RUNTIME.md), the compiler
 [docs/COMPILER.md](docs/COMPILER.md), and full benchmark results
@@ -129,7 +129,7 @@ CI and the issue-to-regression workflow: [docs/CI.md](docs/CI.md).
 
 Language and library checks live in `tests/v2/`, and protocol client checks in
 `tools/ci/`. Core library behavior is also checked against Go equivalents in
-`bench/ref/`; see [notes/stdlib_verified.md](notes/stdlib_verified.md).
+`bench/ref/`; see [design/stdlib_verified.md](design/stdlib_verified.md).
 
 ## Performance
 
@@ -228,7 +228,7 @@ bench/       CPU benchmarks vs Go (v2/), HTTP benchmarks (http/), Go reference p
 seed/        tinc-darwin-arm64, tinc-linux-arm64: the compilers that start a build
 tools/       test runners (v2test.sh, linuxtest.sh), debugging helpers, gendoc.py
 docs/        the documentation (index: docs/README.md)
-notes/       verification notes, benchmark analyses, roadmap
+design/      design decisions, interfaces, verification, roadmap
 ```
 
 ## Status and next steps
@@ -243,4 +243,4 @@ core serve other requests meanwhile. Sockets are non-blocking; file I/O goes thr
 core's io_uring on Linux (helper threads elsewhere and for FIFOs and FUSE mounts), macOS DNS
 to helper threads; every request has a deadline. Statements and commands are `query`
 values, so a value is always sent apart from the text. See
-[docs/RUNTIME.md](docs/RUNTIME.md) and [notes/roadmap.md](notes/roadmap.md).
+[docs/RUNTIME.md](docs/RUNTIME.md) and [design/roadmap.md](design/roadmap.md).

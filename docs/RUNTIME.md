@@ -17,7 +17,7 @@ JSON (`argo`) are ordinary library packages built on it.
 | map | pointer to a 192-byte header (count, index slots, keys, values, index, string keys?, shift, tombstones, hashes, region, entries used, entry capacity, live bytes, ...); entries in insertion order found through an open-addressing index, in chunks of 4096 past that many entries (see Maps) |
 | struct | pointer to its fields, laid out widest first with natural alignment, size rounded to 8 |
 | `?T` | the T pointer, or 0 for nil |
-| fault | a pointer to a str holding the full message (`outer: inner` when wrapped), or 0 for nil; four words before the str hold the record `[trace, joined, identity, cause]` (notes/interface_faults.md) |
+| fault | a pointer to a str holding the full message (`outer: inner` when wrapped), or 0 for nil; four words before the str hold the record `[trace, joined, identity, cause]` (design/interface_faults.md) |
 | func value | the code address |
 
 A fault is still one word. `fail`, `fail(...)`, `say.Fault` and the `fault` package make it
@@ -31,7 +31,7 @@ backtrace. `keep(err)` deep-copies the chain (`rt_keep_fault`). Runtime code mak
 standard sentinels with `rt_fault_deadline()`, `rt_fault_canceled()`, `rt_fault_limit()`,
 `rt_fault_overloaded()`, `rt_fault_draining()` and `rt_fault_panic(msg, trace)` (each an
 i64 fault word: `fail cast(fault, rt_fault_deadline())`). The interface is
-notes/interface_faults.md.
+design/interface_faults.md.
 
 Map hashing is keyed with 128 random bits drawn once per process in `rt_init` (one key for
 every core, so a map built on one core is found on another): strings (and struct or enum
@@ -139,7 +139,7 @@ reclaimed by the ingot heap's machinery. See section 9, "Arenas".
 (`rt_keep_slice`, then elements) and maps (a new ingot map, entry by entry) into the
 ingot heap.
 
-**Reclaiming long-lived memory (#176, notes/interface_mem.md).** Each block of a core's
+**Reclaiming long-lived memory (#176, design/interface_mem.md).** Each block of a core's
 heap counts the long-lived references to it in its size word. `keep$N` counts what its
 copy holds; stores into globals and provably long-lived containers count the new value and
 drop the old one; maps and long-lived slices count their own entries and elements. A
@@ -246,7 +246,7 @@ names in both OS files:
 Constants with the same names in both files: `EINTR EAGAIN EINPROGRESS ENOENT EEXIST
 ENOTDIR EINVAL EMFILE ENFILE O_WRITE_CREATE O_APPEND_CREATE O_NONBLOCK F_GETFL F_SETFL
 SOL_SOCKET SO_REUSEADDR SO_REUSEPORT SO_ERROR SO_RCVTIMEO SO_SNDTIMEO TARGET_LINUX`.
-`notes/linux_abi.md` holds every verified value and layout. Linux's `rt_sys_*`
+`design/linux_abi.md` holds every verified value and layout. Linux's `rt_sys_*`
 wrappers invoke a compiler-emitted leaf (`svc #0` / `syscall`) and turn kernel
 -4095..-1 results into -1 plus the calling thread's error word. No syscall reads libc
 errno. Directory handles own a 32 KiB getdents64 buffer, validate each record before
@@ -255,7 +255,7 @@ set is 8 bytes; signal handlers return through Tin's frame-free rt_sigreturn lea
 Cores are `clone` threads, and the environment and auxiliary vector come from the initial
 stack (`rt_getenv`, `rt_getauxval`). Clock lookup reads the kernel vDSO from AT_SYSINFO_EHDR,
 with the raw syscall as fallback. Linux programs import nothing: the ELF writers emit only
-static executables, and notes/libc_inventory.md has no active Linux entry left (#125).
+static executables, and design/libc_inventory.md has no active Linux entry left (#125).
 Externs remain only in the macOS runtime files.
 
 UTC calendar/Date formatting, errno messages and Linux backtrace lookup are Tin code.
@@ -535,14 +535,14 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   each read and fail with `rt_wait_fault()`; a flume reader's wait fault is cleared by its next
   read. Regular files, other devices and code outside a task read directly, as before.
   `relay.Next` is the receive that waits the same way (§5).
-- Boundaries (Tin 1, notes/interface_boundaries.md): each request task has a root boundary
+- Boundaries (Tin 1, design/interface_boundaries.md): each request task has a root boundary
   record under its core's root, holding its deadline and cancel state; block boundaries nest
   under it. `rt_bnd_cancel(b, reason)` cancels `b` and everything inside it (never its parent
   or siblings) and ends the waits of the tasks inside: `rt_task_wait` returns `waitDeadline`,
   and a wait in a boundary that is already cancelled returns it at once. Clients then fail
   with `rt_wait_fault()`: the reason itself when it is `fault.DeadlineExceeded` or
   `fault.LimitExceeded` (by identity), otherwise a `fault.Canceled` fault reading
-  `canceled: <reason>` whose cause is the reason (notes/interface_faults.md).
+  `canceled: <reason>` whose cause is the reason (design/interface_faults.md).
   `tools/ci/cancel_check.py` checks every client.
 - Deadlines (#233, edition 1): `within d { }` enters a `bkWithin` boundary whose deadline is
   the earlier of `now + d` and the enclosing one (the request's `TIN_DEADLINE_MS`, an outer
@@ -552,7 +552,7 @@ another task. Resource cleanup callbacks run before the owning pool is reset.
   while it may go on), for code that does not wait or wants to stop at a point of its own.
 - `once { ... }` (#236) runs its block the first time each core reaches it (globals are per
   core, so this is the unit; process-wide one-time work belongs in `on app.start`).
-- Arenas (#236, edition 1, notes/interface_arena.md): `arena { }` is `arena$N(c)`, which
+- Arenas (#236, edition 1, design/interface_arena.md): `arena { }` is `arena$N(c)`, which
   opens a `bkArena` boundary with a fresh pool (`rt_arena_open`), runs the block's closure
   (`rt_arena_run`), gives the context the parent pool back (`rt_arena_out`), copies the fault
   (`rt_arena_fault`) and the value (a generated `arenacopy$N`, the pool twin of `keep$N`)
@@ -1146,7 +1146,7 @@ try r.Serve(":8080")                           // fails first if a pattern is ba
 - Authentication supports SCRAM-SHA-256, legacy MD5 and cleartext. SCRAM checks the nonce,
   iteration bounds and server verifier, and applies Unicode 3.2 SASLprep with PostgreSQL's
   fallback to original password bytes on invalid UTF-8/prohibited input. The fixed tables
-  in `lib/postgres/sasl/sasl.tin` are regenerated by `tools/gen_saslprep.py` using Python's
+  in `lib/postgres/sasl/sasl.tin` are regenerated by `tools/gen/gen_saslprep.py` using Python's
   built-in Unicode 3.2 database. `seal.Pbkdf2Sha256` and its Timeout form reuse a nested allocation pool across
   rounds, yielding between batches and honoring request/operation deadlines.
 - TLS (#124): `Options.SSLMode` "require" sends SSLRequest and runs TLS 1.3 without checking
@@ -1162,8 +1162,8 @@ try r.Serve(":8080")                           // fails first if a pattern is ba
 ### Recording requests for replay (#241)
 
 A server records requests so that a failure seen in production can be replayed later with
-`tin replay` (#242). The design is `notes/design_semantics.md` §12, and the names and byte
-layouts are in `notes/interface_replay.md`.
+`tin replay` (#242). The design is `design/design_semantics.md` §12, and the names and byte
+layouts are in `design/interface_replay.md`.
 
 - **Switches**, read once before the cores start. Recording is on when `TIN_REPLAY_DIR`
   (the spool directory) and `TIN_REPLAY_KEY` (64 hex digits) are both set. A malformed key
@@ -1232,7 +1232,7 @@ functions keep that rule, and grows as phase 1 lands.
 
 | function | constant-time in | not constant-time in |
 |---|---|---|
-| `Sha256`, `Sha384`, `Sha512`, `Sum` (`Sha256` on the arm64 SHA-256 instructions, or on x86-64 the SHA extensions when CPUID has them, #488: `tools/arch/sha256-amd64.S`, generated by `tools/gen_sha256_amd64.py`) | the message bytes | its length |
+| `Sha256`, `Sha384`, `Sha512`, `Sum` (`Sha256` on the arm64 SHA-256 instructions, or on x86-64 the SHA extensions when CPUID has them, #488: `tools/gen/arch/sha256-amd64.S`, generated by `tools/gen/gen_sha256_amd64.py`) | the message bytes | its length |
 | `Sha3_256`, `Sha3_512`, `Shake128`, `Shake256` (`sha3.tin`, #479: Keccak-f[1600] on 25 lanes in locals) | the message bytes | its length and the output length |
 | `MLKEM768KeyFromSeed`, `MLKEM768GenerateKey`, `MLKEM768Encapsulate`, `MLKEM768Decapsulate` (`mlkem.tin`, #479: Barrett reductions with branch-free corrections, rounding by multiplication, the re-encryption compared and the key chosen by masks) | the seed, s, the message and the shared key, and whether a ciphertext was valid (implicit rejection) | the public matrix's rejection sampling, which reads only the public seed rho; the encapsulation key's validity check |
 | `tls`: record protection (`SealRawTo` too), the Finished checks (`ConstantTimeEq`), the key schedule, on both sides | keys, secrets, data and MACs | lengths, and the padding length of a received record |

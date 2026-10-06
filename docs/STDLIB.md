@@ -1,6 +1,6 @@
 # Tin standard library
 
-Generated from the comments in `lib/*/` by `tools/gendoc.py`.
+Generated from the comments in `lib/*/` by `tools/gen/gendoc.py`.
 
 | package | role (Go equivalent) |
 |---|---|
@@ -51,7 +51,7 @@ Built into the compiler (formatting by static type, no reflection): `say.Line(a,
 
 ## fault
 
-Package fault is fault chains and the standard sentinels, like Go's errors package: Wrap adds context and keeps the cause, Is walks the chain comparing identity, Join keeps several faults reachable. The runtime's sentinels are the variables Canceled, DeadlineExceeded, LimitExceeded, Overloaded, Draining and Panic; a package declares its own as `let ErrX = fault("msg")`. A function that makes a fault is declared ! here: its fault is the value (fail it, keep it in a variable, or test it). Layout and identities: notes/interface_faults.md.
+Package fault is fault chains and the standard sentinels, like Go's errors package: Wrap adds context and keeps the cause, Is walks the chain comparing identity, Join keeps several faults reachable. The runtime's sentinels are the variables Canceled, DeadlineExceeded, LimitExceeded, Overloaded, Draining and Panic; a package declares its own as `let ErrX = fault("msg")`. A function that makes a fault is declared ! here: its fault is the value (fail it, keep it in a variable, or test it). Layout and identities: design/interface_faults.md.
 
 - `Wrap(err fault, msg str) !`: Wrap is err with msg in front ("msg: cause"), err reachable as its cause; nil when err is nil.
 - `Is(err fault, target fault) bool`: Is reports whether err or a fault in its chain (causes and joined faults) is target: the same sentinel, or the same fault.
@@ -1266,7 +1266,7 @@ Package constraints contains the named generic constraints used by the standard 
 
 ## policy
 
-Package policy is the with policies (design_semantics §7.1, notes/interface_policy.md): with p { body } calls p.Run(body) inside a boundary of its own, with the block as body. Slots are typed ambient values that Bind binds for a block and the tasks it spawns; Retry, Trace and Cached are the library policies.
+Package policy is the with policies (design_semantics §7.1, design/interface_policy.md): with p { body } calls p.Run(body) inside a boundary of its own, with the block as body. Slots are typed ambient values that Bind binds for a block and the tasks it spawns; Retry, Trace and Cached are the library policies.
 
 - `shape Policy[T constraints.Any] { Run(body fn() !T) !T }`: Policy is what with p { body } needs of p: Run runs body (any number of times) and gives the block's value. Run may only call body, or pass it to a function that only calls it.
 - `type Slot[T constraints.Any] struct`: Slot is a typed ambient value: with policy.Bind(s, v) { } binds it for the block and the tasks the block spawns.
@@ -1408,7 +1408,7 @@ let ack = try bus.Send("orders", kafka.Message{Key: "7", Value: "paid"})
 let records = try bus.Fetch("orders", ack.Partition, ack.Offset, 1s)
 ```
 
-A key picks the partition the way the Java client does (murmur2), so a key lands on the same partition from either. Consumer groups: Group and notes/design_kafka.md (section 3) for where a consumer loop runs. Transactions: Transactional.
+A key picks the partition the way the Java client does (murmur2), so a key lands on the same partition from either. Consumer groups: Group and design/design_kafka.md (section 3) for where a consumer loop runs. Transactions: Transactional.
 
 - `type TopicSpec struct`: TopicSpec describes a topic to create.
 - `type Config struct`: Config is one configuration entry.

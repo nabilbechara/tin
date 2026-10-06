@@ -2,7 +2,7 @@
 
 Describe the problem and resulting behavior. Link the issue: `Fixes #N` when this PR completes it and targets `main`; `Part of #N` otherwise (stacked PRs, partial steps).
 
-Spec (Tin 1 work): `notes/design_____.md §__`
+Spec (Tin 1 work): `design/design_____.md §__`
 
 ## Touches hot files
 

@@ -29,7 +29,7 @@ lib/
   tests; see docs/TOOLING.md). The suites for the standard library are in `tests/v2/`.
 - **Nested packages** are subdirectories: `lib/postgres/sasl/` is imported as
   `"postgres/sasl"`. The parent package does not include them.
-- **Documentation comes from the code.** `tools/gendoc.py` writes `docs/STDLIB.md` from the doc
+- **Documentation comes from the code.** `tools/gen/gendoc.py` writes `docs/STDLIB.md` from the doc
   comments of every file of each package; the comment on the `package` clause is the package's
   description.
 - A package may import any package that does not import it back. The runtime imports nothing.
@@ -37,4 +37,4 @@ lib/
 ## Adding a package
 
 Create `lib/NAME/NAME.tin` starting with `package NAME`, add the name and a one-line role to
-`ORDER` and `ROLE` in `tools/gendoc.py`, run it, and add a test under `tests/v2/`.
+`ORDER` and `ROLE` in `tools/gen/gendoc.py`, run it, and add a test under `tests/v2/`.

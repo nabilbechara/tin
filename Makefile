@@ -20,7 +20,7 @@ all: bin/tinc
 # Native release archive. Build on each supported host; releases.yml collects all three.
 DIST_TARGET ?= $(HOST_OS)-$(shell uname -m | sed 's/x86_64/amd64/; s/aarch64/arm64/')
 dist: bin/tinc
-	python3 tools/dist.py --target $(DIST_TARGET)
+	python3 tools/dev/dist.py --target $(DIST_TARGET)
 
 # The compiler, built by the checked-in seed compiler: no Go, no cc.
 bin/tinc: $(SEED) $(SELF)
@@ -40,7 +40,7 @@ seed: bootstrap
 	cp bin/s3/tinc $(SEED)
 
 test: bin/tinc
-	tools/v2test.sh bin/tinc
+	tools/dev/v2test.sh bin/tinc
 
 bench: bin/tinc
 	bench/run.py
@@ -74,7 +74,7 @@ linux-amd64-bootstrap: bin/linux-amd64/tinc
 	  cp /tmp/s3 seed/tinc-linux-amd64 && echo "linux-amd64 fixed point: tinc compiles itself to an identical binary"'
 
 linux-test: bin/tinc
-	tools/linuxtest.sh bin/tinc
+	tools/dev/linuxtest.sh bin/tinc
 
 clean:
 	rm -rf bin

@@ -29,7 +29,7 @@ development platform (docs/PORTING.md, "Platform roles").
 
 ## Comparing revisions
 
-For libc-removal work ([phase plan](../notes/libc_removal.md)), use both native Linux
+For libc-removal work (the libc removal), use both native Linux
 jobs in `bench-linux.yml`. Each job retains Tin-versus-Go measurements and adds a
 base-versus-head comparison with identical benchmark source. Each compiler loads its
 own revision's `lib/` through an explicit `TIN_ROOT`; copying two compiler binaries
@@ -288,7 +288,7 @@ architectures. HTTP head/base throughput ratios were 1.011 (`/json`) and 1.001
 
 ## 3. Where Go still wins, and why
 
-From `notes/bench_v2.md`, which has the assembly analysis:
+From the assembly analysis of the benchmarks:
 - **fannkuch, n-body:**
   - whole-function register allocation runs out of registers in large loops, so some
     loop variables live in stack slots;

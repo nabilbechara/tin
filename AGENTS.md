@@ -44,7 +44,7 @@ its wave, dependencies, interface partners and hot files. These rules are not op
    agrees, and say "Part of #N" until the PR targets `main`. Only a PR into `main` says `Fixes #N`.
 5. **Interface first for paired issues.** Issues that share a runtime or compiler interface
    (each lists its partners) begin with one small PR that fixes the names and data layout
-   (a `notes/` section or stub functions), agreed by every partner, before any of them builds on
+   (a `design/` section or stub functions), agreed by every partner, before any of them builds on
    it. Do not change an agreed interface without the partners' approval in that PR.
 6. **Hot files** (`selfhost/check.tin`, `lower.tin`, `region.tin`, `parse.tin`, `gen*.tin`,
    `inline.tin`, `lib/runtime/runtime*.tin`, `lib/anvil/anvil*.tin`): add code next to related

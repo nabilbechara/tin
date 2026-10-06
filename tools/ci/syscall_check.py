@@ -56,7 +56,7 @@ def main():
         if args.target: cmd+=['-target',args.target]
         subprocess.run(cmd+['tools/ci/fixtures/syscall.tin'],check=True,cwd=ROOT,
                        env=dict(os.environ,TIN_ROOT=str(work)),timeout=60)
-        forbidden={name for name,row in read_inventory(ROOT/'notes/libc_inventory.md').items()
+        forbidden={name for name,row in read_inventory(ROOT/'design/libc_inventory.md').items()
                    if row['phase']=='3'} | {'syscall'}
         assert not (undefined_symbols(exe)&forbidden),undefined_symbols(exe)&forbidden
         cmd=[str(exe),str(directory)]

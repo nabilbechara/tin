@@ -16,9 +16,9 @@ rejects whole classes of bugs instead of leaving them to tests:
 This document describes **edition 1**, the syntax every Tin program uses: `fn`, `let` and
 `mut`, `match`, `for x in xs`, keyed struct literals, unit literals, and blocks for
 deadlines, budgets and tasks (`within`, `limit`, `guard`, `scope`, `select`). It is written
-from [notes/design_syntax.md](../notes/design_syntax.md); the semantics are in
-[notes/design_semantics.md](../notes/design_semantics.md). The Go-like syntax before it,
-edition 0, is history ([notes/syntax_v05.md](../notes/syntax_v05.md)); section 22 maps each
+from [design/design_syntax.md](../design/design_syntax.md); the semantics are in
+[design/design_semantics.md](../design/design_semantics.md). The Go-like syntax before it,
+edition 0, is history (`design/design_syntax.md` replaces it); section 22 maps each
 old form to its replacement.
 
 [STDLIB.md](STDLIB.md) lists the standard library, [TOOLING.md](TOOLING.md) the commands,
@@ -128,7 +128,7 @@ panic, 1 when startup fails, or with the code passed to `quarry.Exit`.
 
 - **Encoding**: source is UTF-8.
 - **Comments**: `// to end of line` only. A comment directly above a declaration is its
-  documentation (`tools/gendoc.py` builds [STDLIB.md](STDLIB.md) from them).
+  documentation (`tools/gen/gendoc.py` builds [STDLIB.md](STDLIB.md) from them).
 - **Statements end at a newline.** There are no semicolons in source. A line whose last
   token is an operator, `,`, `(`, `[` or `{` continues on the next line; so does a call or
   literal whose brackets are still open. Write the opening brace of a block on the same
@@ -546,7 +546,7 @@ instances. Calls through shaped type parameters are direct calls on concrete typ
 uses a two-word object/table pair; the checker verifies conversions, and method calls
 dispatch through the table without allocating. `?dyn S`, `[]dyn S`, `keep` of a dynamic
 value or container, and region checks are implemented. Map values and `!dyn` results
-remain deferred; see [the representation and staging note](../notes/design_dyn.md). The
+remain deferred; see [the representation and staging note](../design/design_dyn.md). The
 `io` shapes live in `lib/io`. `constraints.Any`, `constraints.Comparable` and
 `sift.Ordered` are ordinary library shapes, not language keywords; import their packages
 where used.
@@ -1121,7 +1121,7 @@ closeIt() catch err { herald.Warn(say.Str(err)) }
 
 - `try` and `catch` cannot be nested inside another expression: bind the inner result
   first.
-- **Chains and sentinels** (package `fault`, notes/interface_faults.md). A package-level
+- **Chains and sentinels** (package `fault`, design/interface_faults.md). A package-level
   `let ErrNotFound = fault("not found")` is a sentinel: each such declaration has its own
   identity (`fault("...")` anywhere else is a compile error; use `fail("msg")`).
   `fault.Wrap(err, "loading user {id}")` is a fault reading `loading user 7: not found`
@@ -2157,7 +2157,7 @@ Literal     = Int | Float | Unit | Char | String | RawString | "true" | "false" 
 
 ## 22. From edition 0
 
-Edition 0 was Tin's Go-like syntax (notes/syntax_v05.md). `tin fix -edition 1 FILES`
+Edition 0 was Tin's Go-like syntax (see `design/design_syntax.md`). `tin fix -edition 1 FILES`
 rewrites it; the compiler names the edition 1 form for each one it meets (E090
 OLD_SYNTAX, E091 ONE_PER_DECLARATION in [ERRORS.md](ERRORS.md)).
 

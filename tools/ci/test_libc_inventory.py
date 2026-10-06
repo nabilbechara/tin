@@ -37,10 +37,10 @@ el_import("startup")
     def test_unassigned_and_removed_symbols_fail(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / 'notes').mkdir()
+            (root / 'design').mkdir()
             (root / 'lib').mkdir()
             (root / 'selfhost').mkdir()
-            (root / 'notes/libc_inventory.md').write_text(
+            (root / 'design/libc_inventory.md').write_text(
                 '| `old` | `lib/x.tin` | 2 | removed | Tin allocator | OOM check |\n')
             (root / 'lib/x.tin').write_text('extern fn old();\nextern func surprise() i64\n')
             self.assertEqual(audit(root), ['unassigned Linux symbol: surprise',
@@ -49,10 +49,10 @@ el_import("startup")
     def test_stale_sources_and_missing_plan_fail(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / 'notes').mkdir()
+            (root / 'design').mkdir()
             (root / 'lib').mkdir()
             (root / 'lib/x.tin').write_text('extern fn old();\n')
-            inventory = root / 'notes/libc_inventory.md'
+            inventory = root / 'design/libc_inventory.md'
             inventory.write_text('| `old` | `lib/stale.tin` | 2 | active | allocator | OOM |\n')
             self.assertEqual(audit(root), ['update call-site files for old: lib/x.tin'])
             inventory.write_text('| `old` | `lib/x.tin` | ? | active | allocator | OOM |\n')

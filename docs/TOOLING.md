@@ -41,7 +41,7 @@ moving or deleting the tree breaks it.
 | `tin fix -edition 1 FILE.tin...` | translate each file to edition 1 in place. A file whose translation does not parse as edition 1, or changes when translated again, is left unchanged with the reason (for example a `const` in a nested block, which has to move by hand); exit status 1 when any file was left unchanged |
 | `tin vendor [DIR]` | copy every package `DIR/tin.mod` requires (transitively, from local source directories) into `DIR/vendor/<path>` and write `DIR/tin.lock` with each vendored file's SHA-256 (see §2.1) |
 | `tin caps FILE.tin...` | check the program and print, per package, the capabilities (`net`, `files`, `spawn`, `exec`, `unsafe`) its exported functions can reach |
-| `tin suite` | run the compiler's strict test suite (`tools/v2test.sh`) |
+| `tin suite` | run the compiler's strict test suite (`tools/dev/v2test.sh`) |
 | `tin bootstrap` | rebuild the compiler with itself; the binaries must be identical |
 | `tin version` | version and compiler checksum |
 
@@ -112,7 +112,7 @@ tinc [-o OUT] [-S] [-edition 1] [-target darwin-arm64|linux-arm64|linux-amd64] F
 | `make bootstrap` | `bin/tinc` builds `bin/s2/tinc`, which builds `bin/s3/tinc` (with `TIN_ROOT` set to the tree, because the compiler is a strict program that loads `lib/runtime`); they must be byte-identical |
 | `make seed` | bootstrap, then refresh the host's seed from `bin/s3/tinc` |
 | `make test` | the strict suite |
-| `make linux-test` | cross-compile every strict test for linux-arm64 and run it in an arm64 container (`tools/linuxtest.sh`) |
+| `make linux-test` | cross-compile every strict test for linux-arm64 and run it in an arm64 container (`tools/dev/linuxtest.sh`) |
 | `make linux-bootstrap` | cross-compile a Linux compiler, then in the container it must rebuild itself identically; refreshes `seed/tinc-linux-arm64` |
 | `make linux-amd64-bootstrap` | the same for x86-64 in `tin-debian-amd64` (emulated on an arm64 Mac); refreshes `seed/tinc-linux-amd64` |
 | `make bench` | the CPU benchmarks vs Go (`bench/run.py`) |
@@ -129,13 +129,13 @@ passes.
 
 | suite | where | how it checks |
 |---|---|---|
-| strict tests | `tests/v2/*.tin` | `tools/v2test.sh`: compiles and runs each, sorts the output and compares it with `NAME.out`; `NAME_bad.tin` must fail to compile with exactly `NAME_bad.err` |
-| diagnostic codes | `docs/ERRORS.md` | `tools/v2test.sh` runs `tools/ci/diagnostics_check.py`: the compiler's codes, the page and the `.err` files agree, and every example on the page compiles to exactly the output it shows |
-| assembly checks | `tests/v2/*_asm.tin` + `*_asm.check` | `tools/v2test.sh`: compiles with `-S` and matches the listing against ordered `CHECK:`/`CHECK-NOT:` lines, lit-style; a `[arm64]`/`[amd64]` line selects a section, lines before any section apply to every CPU |
-| Linux | same files | `tools/linuxtest.sh`: cross-compiles for linux-arm64, runs in `tin-debian-arm64`, compares with the same `.out` files |
+| strict tests | `tests/v2/*.tin` | `tools/dev/v2test.sh`: compiles and runs each, sorts the output and compares it with `NAME.out`; `NAME_bad.tin` must fail to compile with exactly `NAME_bad.err` |
+| diagnostic codes | `docs/ERRORS.md` | `tools/dev/v2test.sh` runs `tools/ci/diagnostics_check.py`: the compiler's codes, the page and the `.err` files agree, and every example on the page compiles to exactly the output it shows |
+| assembly checks | `tests/v2/*_asm.tin` + `*_asm.check` | `tools/dev/v2test.sh`: compiles with `-S` and matches the listing against ordered `CHECK:`/`CHECK-NOT:` lines, lit-style; a `[arm64]`/`[amd64]` line selects a section, lines before any section apply to every CPU |
+| Linux | same files | `tools/dev/linuxtest.sh`: cross-compiles for linux-arm64, runs in `tin-debian-arm64`, compares with the same `.out` files |
 | HTTP conformance | `bench/http/conformance` | 26 edge cases against a running server: `bin/conformance -addr 127.0.0.1:9180 -pid PID` |
-| x86-64 encoder | `tools/x64fuzz` | `tools/x64fuzz/run.sh [COUNT] [SEED]`: random instructions vs `x86_64-linux-gnu-objdump` |
-| stdlib vs Go | `bench/ref/NAME/main.go` | the same cases written with Go's library; outputs diffed (see notes/stdlib_verified.md) |
+| x86-64 encoder | `tools/dev/x64fuzz` | `tools/dev/x64fuzz/run.sh [COUNT] [SEED]`: random instructions vs `x86_64-linux-gnu-objdump` |
+| stdlib vs Go | `bench/ref/NAME/main.go` | the same cases written with Go's library; outputs diffed (see design/stdlib_verified.md) |
 
 ### 5.1 Testing your own code: `*_test.tin`
 
@@ -257,8 +257,8 @@ Servers used: `examples/api.tin` (port 9180, `TIN_CORES=n`), `bench/http/fast` (
 | tool | use |
 |---|---|
 | `tin asm file.tin` / `tinc -S` | read the generated code |
-| `tools/try.sh COMPILER FILE.tin` | compile and run; if the compiler crashes, print its backtrace under lldb |
-| `tools/crash.sh PROGRAM ARGS` | run under lldb and print a Tin backtrace on a crash (`tools/tinbt.py` walks frame pointers) |
+| `tools/dev/try.sh COMPILER FILE.tin` | compile and run; if the compiler crashes, print its backtrace under lldb |
+| `tools/dev/crash.sh PROGRAM ARGS` | run under lldb and print a Tin backtrace on a crash (`tools/dev/tinbt.py` walks frame pointers) |
 | `TINC_TRACE=1 tinc ...` | which function the backend was generating |
 | panics | print the message and a backtrace (inlined frames are missing) |
 | `lldb bin/t` | symbols are present (function names as `pkg.Name`, `Type.Method`) |
@@ -285,7 +285,7 @@ Frames are walked with the frame pointers Tin always keeps (`perf record -g`, or
 ### 8.1 Replaying a recorded request: `tin replay`
 
 A server records a request's effects in a capsule when it runs with `TIN_REPLAY_DIR` and
-`TIN_REPLAY_KEY` set (the switches are listed in `notes/interface_replay.md` §1). `tin replay` runs that request again:
+`TIN_REPLAY_KEY` set (the switches are listed in `design/interface_replay.md` §1). `tin replay` runs that request again:
 
 ```sh
 TIN_REPLAY_KEY=<64 hex digits> tin replay spool/00001700000000000000-000-1.tcap --against server.tin
@@ -353,15 +353,15 @@ examples/           api.tin (HTTP server), tasks.tin, redis.tin, mysql.tin, webs
 bench/              v2/ CPU benchmarks, http/ HTTP benchmarks and tools, v04/ the service benchmark, ref/ Go references
 tools/              test runners, debugging helpers, gendoc.py, gencoverage.tin, x64fuzz/
 docs/               this documentation
-notes/              design notes, plans, verification records, roadmap
+design/             design decisions, interfaces, verification, roadmap
 bin/                build output (ignored)
 ```
 
 ## 10. Version control
 
 The tree is ready to become a git repository: `.gitignore` excludes `bin/` and scratch
-output, every generated file can be regenerated (`make`, `tools/gendoc.py`,
-`tools/gencoverage.tin`), seeds are
+output, every generated file can be regenerated (`make`, `tools/gen/gendoc.py`,
+`tools/gen/gencoverage.tin`), seeds are
 plain files, and no script depends on a machine-specific path.
 
 ```sh
@@ -374,18 +374,18 @@ where the bootstrap passed, together with the compiler change that needed them.
 
 ## 11. Regenerating the docs
 
-`python3 tools/gendoc.py` rewrites `docs/STDLIB.md` from the comments in `lib/*.tin`
+`python3 tools/gen/gendoc.py` rewrites `docs/STDLIB.md` from the comments in `lib/*.tin`
 (package comment, then one line per exported function, type and constant). Write a
 one-line comment above every exported declaration.
 
-`bin/tinc -o /tmp/gencoverage tools/gencoverage.tin && /tmp/gencoverage` rewrites
-`docs/COVERAGE.md` from the maintained inventory in `notes/coverage.md`.
+`bin/tinc -o /tmp/gencoverage tools/gen/gencoverage.tin && /tmp/gencoverage` rewrites
+`docs/COVERAGE.md` from the maintained inventory in `design/coverage.md`.
 
-`python3 tools/legacy2tin.py [--analyze FILE]... FILE...` converts files of the compiler's untyped word
+`python3 tools/dev/legacy2tin.py [--analyze FILE]... FILE...` converts files of the compiler's untyped word
 dialect to typed edition 1 written with `i64` words (#228); a one-time migration tool, kept until the
 dialect is gone.
 
-`python3 tools/gen_unicode.py` rewrites `lib/glyph/tables.tin` and `lib/runtime/printable.tin` (the Unicode
+`python3 tools/gen/gen_unicode.py` rewrites `lib/glyph/tables.tin` and `lib/runtime/printable.tin` (the Unicode
 tables) from Go's `unicode/tables.go`; it needs a Go tree only to read that one file.
 
 ## Integer overflow checks

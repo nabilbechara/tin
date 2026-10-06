@@ -64,7 +64,7 @@ Add `.tin-build/` to your project's `.gitignore`.
 
 ## Language status
 
-The grammar covers the vision in `notes/design_syntax.md`, including `with`, `within`,
+The grammar covers the vision in `design/design_syntax.md`, including `with`, `within`,
 unit literals, `secret`, bounded types and interpolation. The installed compiler decides
 which features compile. For example, a `with` snippet requires policy support and an
 actual policy supplied by your program/library. Highlighting does not imply implementation.

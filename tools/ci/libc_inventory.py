@@ -69,7 +69,7 @@ def read_inventory(path):
 
 
 def audit(root=ROOT):
-    rows = read_inventory(root / 'notes/libc_inventory.md')
+    rows = read_inventory(root / 'design/libc_inventory.md')
     found = {}
     for target in TARGETS:
         for name, sources in discover(root, target).items():

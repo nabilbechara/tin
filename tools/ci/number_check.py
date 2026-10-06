@@ -35,7 +35,7 @@ def main():
     directory = ROOT / 'bin/ci/number'
     directory.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, TIN_ROOT=str(ROOT))
-    subprocess.run(['python3', str(ROOT / 'tools/gen_number_powers.py'), '--check'],
+    subprocess.run(['python3', str(ROOT / 'tools/gen/gen_number_powers.py'), '--check'],
                    check=True, cwd=ROOT, timeout=10)
     with tempfile.TemporaryDirectory(prefix='number-', dir=directory) as tmp:
         work = Path(tmp)

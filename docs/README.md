@@ -14,12 +14,10 @@
 | [COVERAGE.md](COVERAGE.md) | every Go standard package and language feature with Tin's status (done, partial, missing, design, n/a) and the order to build the rest in |
 | [AGENT_PRIMER.md](AGENT_PRIMER.md) | a one-page brief to give an AI agent before it writes Tin code |
 
-Design notes and records live in [`../notes/`](../notes): the roadmap (`roadmap.md`), the
-v0.4 async-I/O design (`design_v04.md`), the decisions for the foundations the missing
-standard library waits on (`design_foundations.md`), the next milestone, Tin 1: its semantic
-model (`design_semantics.md`) and its syntax (`design_syntax.md`, replacing `syntax_v05.md`), the Linux plan and ABI reference (`plan_linux.md`,
-`linux_abi.md`), stdlib verification against Go (`stdlib_verified.md`), benchmark analyses
-(`bench_v2.md`) and the HTTP edge-case work (`anvil_hardening.md`).
+Design decisions, interfaces and the roadmap live in [`../design/`](../design): the roadmap (`roadmap.md`), the
+decisions for the foundations (`design_foundations.md`), the semantics and syntax of Tin 1 (`design_semantics.md`,
+`design_syntax.md`), the interfaces between the parts (`interface_*.md`), the Linux ABI reference (`linux_abi.md`)
+and the stdlib verification against Go (`stdlib_verified.md`).
 
 ## Where to start
 

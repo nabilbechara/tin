@@ -1,4 +1,4 @@
-"""Tests for tin replay --save-test (tools/replay_save.py, #242) and replay cases in regressions.py."""
+"""Tests for tin replay --save-test (tools/dev/replay_save.py, #242) and replay cases in regressions.py."""
 import json
 import os
 from pathlib import Path
@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / 'tools'))
+sys.path.insert(0, str(ROOT / 'tools/dev'))
 import replay_save  # noqa: E402
 import regressions  # noqa: E402
 

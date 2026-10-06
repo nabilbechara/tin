@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scheduling replay (#243, notes/interface_replay.md section 7): a recording select appends
+"""Scheduling replay (#243, design/interface_replay.md section 7): a recording select appends
 its winning arm as sched.select@1 keyed by its site; a replaying select checks, watches and
 waits for the recorded arm only, so a select that raced a timer takes the recorded branch
 under any live timing. A request's tasks resume in the recorded order (sched.resume@1), and

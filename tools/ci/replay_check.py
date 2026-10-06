@@ -57,7 +57,7 @@ def string(b):
 
 
 def capsule_body(effects, status=500, request=REQUEST, schema=1, peer=''):
-    """A capsule body (notes/interface_replay.md, section 6) with these (kind, key, outcome,
+    """A capsule body (design/interface_replay.md, section 6) with these (kind, key, outcome,
     ident, data) effect records (section 3.3). Schema 2 adds the peer after the panic (#355);
     schema 1 capsules, which have none, are still read."""
     out = word(schema) + string('dev') + string('replay_serve') + word(1700000000000000000) + word(0)
@@ -202,7 +202,7 @@ SECRETS = [b's3cr3t-token', b'c00k1e', b'k-123-secret', b'alice@example.com']
 
 
 def open_capsule(data, key=CAPSULE_KEY):
-    """The body of a capsule (notes/interface_replay.md, section 6), checked with the standard
+    """The body of a capsule (design/interface_replay.md, section 6), checked with the standard
     library's hmac; None when the tag does not match (a wrong key or a changed byte)."""
     km = hmac.new(key, b'tin replay mac', hashlib.sha256).digest()
     ke = hmac.new(key, b'tin replay enc', hashlib.sha256).digest()

@@ -3,7 +3,7 @@
 A Tin dependency is source code, imported by path, copied into the project's `vendor/`
 directory and pinned by content hash in `tin.lock`. There is no registry, no semantic
 version resolution and no binary package format, and the build never uses the network
-(notes/design_foundations.md §8).
+(design/design_foundations.md §8).
 
 ## Imports
 

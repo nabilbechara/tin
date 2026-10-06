@@ -2,7 +2,7 @@
 
 `tinc` is about 35,000 lines of Tin in `selfhost/`, written in edition 1 as trusted code: its records
 are still arrays of 64-bit words (`t[T_KIND]`) and its strings C strings, moving to typed structs and
-`str` one record at a time (notes/design_typed_compiler.md, #228). It compiles itself:
+`str` one record at a time (design/design_typed_compiler.md, #228). It compiles itself:
 `make bootstrap` builds it three times and the last two binaries must be byte-identical.
 It produces finished executables with its own assembler and linker (Mach-O for macOS,
 ELF for Linux); no external toolchain is involved.
@@ -39,7 +39,7 @@ itself: `make bootstrap` sets `TIN_ROOT` for the stage 2 and stage 3 compilers.
 
 Files under `selfhost/` are read as trusted code, like the runtime and the standard library: they may
 use `cast` and raw words (E802 otherwise). That is what lets a typed edition 1 file in `selfhost/` take
-the records the untyped files allocate (notes/design_typed_compiler.md, #228).
+the records the untyped files allocate (design/design_typed_compiler.md, #228).
 
 The helpers the compiler's own sources share (`streq`, `cstr` for string literals) are in `util.tin`.
 
@@ -270,7 +270,7 @@ machinery), `rt_err_str`. Intrinsics compiled inline: `load8`, `store8`, `__ld`,
 1. Edit `selfhost/` (edition 1, trusted; comments are one sentence ending with a period).
 2. `make -s bin/tinc` builds it with the seed; for faster iteration build with the
    current compiler: `bin/tinc -o bin/tincL $(make -s print-SELF)`.
-3. Test with `tools/try.sh bin/tincL tests/v2/x.tin` and `tools/v2test.sh bin/tincL`.
+3. Test with `tools/dev/try.sh bin/tincL tests/v2/x.tin` and `tools/dev/v2test.sh bin/tincL`.
 4. `make bootstrap` must reach the fixed point; then `make test`, `make linux-test`, and
    `make linux-bootstrap` if the ELF writer or Linux codegen changed.
 5. `make seed` (and `make linux-bootstrap`) refresh the seeds once everything passes.
