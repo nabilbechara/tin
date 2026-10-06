@@ -159,7 +159,7 @@ the compiler: write a minimal repro as a test, open an issue and work around it.
   unchanged; invalid UTF-8 and lone surrogates are faults); `argo.GetStrict` also rejects unknown and
   duplicate members. Field names are the struct field names, or their `@json("...")`.
 
-## Trusted code (lib/*.tin only)
+## Trusted code (toolchain/std/, packages/ and toolchain/runtime/ only)
 Standard-library files may use cast(T, x) between i64 and refs, raw word indexing on an i64 pointer p[i]
 (8-byte words), load8(p)/store8(p, v), __ld(p, sizelog2), __st(p, v, sizelog2), `shared let` (one
 process-wide value, not per core: the runtime's own state, set before cores start or synchronized by

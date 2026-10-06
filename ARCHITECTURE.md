@@ -36,8 +36,8 @@ Generated files are never edited by hand: `toolchain/docs/STDLIB.md`, `toolchain
 Design (design/design_foundations.md is authoritative):
 1. No garbage collector: request-scoped bump pools, `keep` for long-lived data, checked at compile time.
 2. Thread-per-core, share-nothing: no mutexes, no work stealing that moves a running task, no preemption. Cross-core communication is `relay` messages and atomics.
-3. No interfaces, no reflection, no struct tags: generics (monomorphized), enums with exhaustive `switch`, shapes (when built) and compile-time derivation.
-4. Errors are faults (`!T`, `try`, `catch`, `fail`); ignoring one is a compile error. Panics end the request or process; `guard` is the planned recovery.
+3. No interfaces, no reflection, no struct tags: generics (monomorphized), enums with exhaustive `match`, shapes and compile-time derivation.
+4. Errors are faults (`!T`, `try`, `catch`, `fail`); ignoring one is a compile error. Panics end the request or process; a `guard` block turns one into `fault.Panic` at a task boundary.
 5. Everything is written in Tin. No C, no new Go in the product, no `cgo`.
 6. Tin is not a Go clone: where Go's design conflicts with the rules above, replace it (the roadmap marks those `[-]` with the replacement named) rather than copying it.
 
@@ -77,7 +77,7 @@ Run long commands (benchmarks, watches) in the background. The PR description us
 ## 6. Limits for fast or parallel agents
 
 - Work in a branch per roadmap item; one item per PR unless items are inseparable.
-- Do not touch `seed/`, `Makefile`, `.github/`, `VERSION` or the generated files listed above except as their own task says.
+- Do not touch `toolchain/seed/`, `Makefile`, `.github/`, `VERSION` or the generated files listed above except as their own task says.
 - Do not edit `toolchain/compiler/` or `toolchain/runtime/` unless the task is a compiler or runtime item; if you hit a compiler bug while doing library work, write a minimal reproducer, open an issue, and either fix it in a separate commit with its regression case or work around it and say so in the PR.
 - Scratch files go in the session scratchpad, never in the repository.
 - When two items conflict (same file), do them in roadmap order, not in parallel.

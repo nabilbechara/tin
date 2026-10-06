@@ -15,7 +15,8 @@ Tin resolves an import in this order:
    source file. If that directory is missing, the build fails with
    `E112 NOT_VENDORED`. A path import never falls back to the standard library or the
    program's directory.
-3. Any other path: `vendor/<path>`, then the standard library under `TIN_ROOT/lib/`, then
+3. Any other path: `vendor/<path>`, then the standard library under `TIN_ROOT/toolchain/std/` and the packages under
+   `TIN_ROOT/packages/`, then
    a package next to the program's first source file.
 
 A package is a `name.tin` file or a directory of `.tin` files (LANGUAGE.md §1). Its name

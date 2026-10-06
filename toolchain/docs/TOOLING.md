@@ -346,13 +346,16 @@ TIN_REPLAY_KEY=<64 hex digits> tin replay spool/00001700000000000000-000-1.tcap 
 tin                 the tin command (shell script)
 Makefile            builds, bootstraps, tests
 toolchain/compiler/           the compiler (COMPILER.md)
-lib/<package>/      the runtime and each standard-library package, one directory each (toolchain/std/README.md)
+toolchain/runtime/            the runtime (RUNTIME.md)
+toolchain/std/<package>/      each standard-library package, one directory each (toolchain/std/README.md)
+packages/<package>/           servers, clients and protocols (anvil, wire, tls, redis, mysql, postgres, kafka, websocket, ...)
 toolchain/tests/v2/           strict tests and expected outputs
-seed/               tinc-darwin-arm64, tinc-linux-arm64, tinc-linux-amd64: the compilers that start a build
+toolchain/seed/               tinc-darwin-arm64, tinc-linux-arm64, tinc-linux-amd64: the compilers that start a build
 examples/           api.tin (HTTP server), tasks.tin, redis.tin, mysql.tin, websocket.tin, demo.tin, demo_go/
 bench/              v2/ CPU benchmarks, http/ HTTP benchmarks and tools, v04/ the service benchmark, ref/ Go references
-tools/              test runners, debugging helpers, gendoc.py, gencoverage.tin, x64fuzz/
+tools/              ci/ (the CI checks), dev/ (v2test.sh, dist.py, debugging helpers, x64fuzz/), gen/ (gendoc.py, gencoverage.tin, table generators)
 toolchain/docs/               this documentation
+products/           programs built with Tin (tinland/: editor tooling)
 design/             design decisions, interfaces, verification, roadmap
 bin/                build output (ignored)
 ```
