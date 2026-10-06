@@ -18,6 +18,10 @@ class GeneratedCrypto(unittest.TestCase):
         got = subprocess.run([sys.executable, str(ROOT/'tools/gen_fe25519.py')], capture_output=True, check=True).stdout
         self.assertEqual(got, (ROOT/'lib/seal/fe25519.tin').read_bytes(), 'run tools/gen_fe25519.py > lib/seal/fe25519.tin')
 
+    def test_sha256_amd64(self):
+        # Runs the instruction list on a model of the SHA extensions against hashlib, then compares the text.
+        subprocess.run([sys.executable, 'gen_sha256_amd64.py', '--check'], cwd=ROOT/'tools', check=True)
+
     @unittest.skipUnless(shutil.which('clang') and platform.system() == 'Linux', 'needs clang on Linux')
     def test_aes_hw(self):
         subprocess.run([sys.executable, 'gen_aes_hw.py', '--check'], cwd=ROOT/'tools', check=True)

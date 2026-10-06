@@ -1,0 +1,61 @@
+name: Profile (Linux)
+
+# Where a TLS handshake spends its time in anvil, by perf, on both CPUs (#488). By hand only (a
+# workflow file must be on the default branch for "Run workflow"; to profile a branch before it
+# merges, add a temporary `push:` trigger for that branch).
+on:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds to sample per certificate
+        type: string
+        default: '10'
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Install perf
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q "linux-tools-$(uname -r)" || sudo apt-get install -y -q linux-tools-generic linux-tools-azure || true
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0 || true
+          perf --version
+      - name: Build
+        run: |
+          make bootstrap
+          ./tin build bench/http/https.tin -o bin/https_bench
+          go -C bench/http build -o "$GITHUB_WORKSPACE/bin/tlsload" ./tlsload
+      - name: Profile
+        env:
+          SECONDS_TO_SAMPLE: ${{ inputs.seconds || '10' }}
+        run: |
+          {
+            echo "## Linux ${{ matrix.arch }} handshake profile"
+            echo '```'; uname -srm; lscpu | grep -E '^(Model name|CPU\(s\)):' || true; echo '```'
+            python3 bench/http/profile_https.py "$SECONDS_TO_SAMPLE"
+          } | tee bin/profile.txt | tee -a "$GITHUB_STEP_SUMMARY"

@@ -5,6 +5,7 @@
 // bytes, the hex, base64 and PEM encodings, and RSA-OAEP encryption with a public key.
 package seal
 
+import "quarry"
 import "say"
 
 
@@ -114,10 +115,22 @@ fn hw_blocks(state i64, data i64, n i64, k i64) {
 	rt_panic("seal: hardware SHA-256 is not available for this target")
 }
 
+// sha_hw_cpu is 1 when an x86-64 CPU has the SHA extensions, SSSE3 and SSE4.1 (CPUID); the x86-64
+// compiler replaces this body (selfhost/aes_hw.tin, generated from tools/arch/sha256-amd64.S).
+fn sha_hw_cpu() i64 {
+	rt_panic("seal: CPUID is only available on x86-64")
+	return 0
+}
+
+// sha_hw is true when Sha256 uses the CPU's SHA-256 instructions (decided once; CPUID traps in a
+// virtual machine, so it is not asked per hash). TIN_SEAL_SOFT=1 forces the portable code.
+let sha_hw = hw_sha256() && quarry.Getenv("TIN_SEAL_SOFT") != "1"
+
 // Sha256 is the SHA-256 digest of s (32 bytes); s may be secret.
 fn Sha256(s secret str) []u8 {
-	// The hardware path exists only on arm64 CPUs with the SHA-256 instructions (seal_<os>.tin).
-	if !hw_sha256() {
+	// The hardware path exists on arm64 CPUs with the SHA-256 instructions and on x86-64 CPUs with
+	// the SHA extensions (seal_<os>.tin).
+	if !sha_hw {
 		return Sha256Soft(s)
 	}
 	let h = []u32{0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19}
