@@ -1,18 +1,32 @@
-// cstr is the address of a string literal's bytes: the untyped C-string word the compiler's records hold.
-fn cstr(s str) i64 {
-	return cast(i64, s) + 8
+// str_has_at reports whether hay holds needle at offset off.
+fn str_has_at(hay str, off i64, needle str) bool {
+	if off + len(needle) > len(hay) {
+		return false
+	}
+	mut k = 0
+	for k < len(needle) {
+		if hay[off + k] != needle[k] {
+			return false
+		}
+		k = k + 1
+	}
+	return true
 }
 
-// streq reports whether two C strings are equal (1 or 0).
-fn streq(a i64, b i64) i64 {
-	mut i = 0
-	for i64(load8(a + i)) == i64(load8(b + i)) {
-		if i64(load8(a + i)) == 0 {
-			return 1
-		}
-		i = i + 1
+// byte_at is byte i of s, or 0 past its end (the NUL a C string ended with).
+fn byte_at(s str, i i64) i64 {
+	if i < len(s) {
+		return i64(s[i])
 	}
 	return 0
+}
+
+// or_empty is s, or the empty string when it is nil.
+fn or_empty(s ?str) str {
+	if let v = s {
+		return v
+	}
+	return ""
 }
 
 // Data structures for the self-hosted compiler: word vectors, byte buffers, positions, errors.
@@ -86,8 +100,8 @@ fn buf_bytes(b []u8, s i64, n i64) {
 	}
 }
 
-fn buf_str(b []u8, s i64) {
-	buf_bytes(b, s, strlen(s))
+fn buf_str(b []u8, s str) {
+	buf_bytes(b, rt_cstr(s), len(s))
 }
 
 fn buf_int(b []u8, n i64) {
@@ -105,36 +119,6 @@ fn buf_int(b []u8, n i64) {
 	buf_byte(b, '0' + n % 10)
 }
 
-// str_slice copies n bytes into a new string: the block is a runtime str ([length][bytes][NUL]) and
-// the word returned is the address of its bytes, so every string the compiler makes can be read
-// as a str (cast(str, p - 8)) as well as a C string.
-fn str_slice(s i64, n i64) i64 {
-	let r = rt_str_new(n)
-	memcpy(r + 8, s, n)
-	store8(r + 8 + n, 0)
-	return r + 8
-}
-
-// buf_cstring is the bytes of b as a string, without the NUL a buffer may end with.
-fn buf_cstring(b []u8) i64 {
-	mut n = len(b)
-	if n > 0 && b[n - 1] == 0 {
-		n = n - 1
-	}
-	return str_slice(slice_data(b), n)
-}
-
-fn mem_eq(a i64, b i64, n i64) i64 {
-	mut i = 0
-	for i < n {
-		if i64(load8(a + i)) != i64(load8(b + i)) {
-			return 0
-		}
-		i = i + 1
-	}
-	return 1
-}
-
 fn write_all(fd i64, b []u8) {
 	mut done = 0
 	for done < len(b) {
@@ -149,7 +133,7 @@ fn write_all(fd i64, b []u8) {
 // A position packs file index, line and column into one word.
 const NO_POS = -1
 
-shared mut files []i64
+shared mut files []str
 shared mut tgt_linux i64 // the target OS is Linux (else macOS)
 shared mut tgt_x64 i64 // the target CPU is x86-64 (else arm64)
 shared mut error_count i64
@@ -179,27 +163,27 @@ fn fatal(b []u8) {
 
 // err_code starts an error with its code and name from docs/ERRORS.md, such as
 // "E502 TYPE_ARG_COUNT"; finish it with err_end (keep going) or fatal (stop).
-fn err_code(pos i64, code i64) []u8 {
+fn err_code(pos i64, code str) []u8 {
 	let b = buf_new()
 	if pos != NO_POS {
 		buf_pos(b, pos)
-		buf_str(b, cstr(": "))
+		buf_str(b, ": ")
 	}
-	buf_str(b, cstr("error "))
+	buf_str(b, "error ")
 	buf_str(b, code)
-	buf_str(b, cstr(": "))
+	buf_str(b, ": ")
 	return cast([]u8, b)
 }
 
 // err_code_at reports a coded error whose whole message is MSG.
-fn err_code_at(pos i64, code i64, msg i64) {
+fn err_code_at(pos i64, code str, msg str) {
 	let e = err_code(pos, code)
 	buf_str(e, msg)
 	err_end(cast([]u8, e))
 }
 
 // err_code_quoted reports a coded PREFIX 'NAME' SUFFIX.
-fn err_code_quoted(pos i64, code i64, prefix i64, name i64, suffix i64) {
+fn err_code_quoted(pos i64, code str, prefix str, name str, suffix str) {
 	let e = err_code(pos, code)
 	buf_str(e, prefix)
 	buf_byte(e, '\'')
@@ -240,4 +224,11 @@ fn put64be(p i64, v i64) {
 
 fn align_up(n i64, a i64) i64 {
 	return (n + a - 1) & ~(a - 1)
+}
+
+fn name_bind(name str, val i64) i64 {
+	let b = cast(NameBind, calloc(2, 8))
+	b.name = name
+	b.val = val
+	return cast(i64, b)
 }

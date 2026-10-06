@@ -21,9 +21,9 @@ shared mut lk_got i64
 shared mut lk_data i64
 shared mut mo i64 // the output file image
 
-fn link_fail(msg i64) {
-	let e = cast([]i64, err_code(NO_POS, cstr("E990 INTERNAL")))
-	buf_str(cast([]u8, e), cstr("link: "))
+fn link_fail(msg str) {
+	let e = cast([]i64, err_code(NO_POS, "E990 INTERNAL"))
+	buf_str(cast([]u8, e), "link: ")
 	buf_str(cast([]u8, e), msg)
 	fatal(cast([]u8, e))
 }
@@ -69,16 +69,16 @@ fn sym_addr(sym i64) i64 {
 	return lk_got + 8 * i
 }
 
-fn w_name16(p i64, s i64) {
+fn w_name16(p i64, s str) {
 	mut i = 0
-	for i64(load8(s + i)) != 0 {
-		store8(p + i, i64(load8(s + i)))
+	for i < len(s) {
+		store8(p + i, i64(s[i]))
 		i = i + 1
 	}
 }
 
 // w_segment writes an LC_SEGMENT_64 header and returns where its sections go.
-fn w_segment(p i64, name i64, vmaddr i64, vmsize i64, fileoff i64, filesize i64, prot i64, nsects i64) i64 {
+fn w_segment(p i64, name str, vmaddr i64, vmsize i64, fileoff i64, filesize i64, prot i64, nsects i64) i64 {
 	put32(p, 0x19)
 	put32(p + 4, 72 + 80 * nsects)
 	w_name16(p + 8, name)
@@ -92,7 +92,7 @@ fn w_segment(p i64, name i64, vmaddr i64, vmsize i64, fileoff i64, filesize i64,
 	return p + 72
 }
 
-fn w_section(p i64, name i64, seg i64, addr i64, size i64, align i64, flags i64) i64 {
+fn w_section(p i64, name str, seg str, addr i64, size i64, align i64, flags i64) i64 {
 	w_name16(p, name)
 	w_name16(p + 16, seg)
 	put64(p + 32, addr)
@@ -117,16 +117,16 @@ fn entry_fn() Fn {
 	mut i = 0
 	for i < len(prog_fns) {
 		let f = prog_fns[i]
-		if streq(f.qname, cstr("main")) != 0 && f.extern_ == 0 {
+		if f.qname == "main" && f.extern_ == 0 {
 			return cast(Fn, f)
 		}
 		i = i + 1
 	}
-	link_fail(cstr("no entry point"))
+	link_fail("no entry point")
 	return cast(Fn, 0)
 }
 
-fn write_executable(path i64) {
+fn write_executable(path str) {
 	let nvars = len(prog_vars)
 	lk_imports = cast([]Fn, []i64{})
 	mut i = 0
@@ -236,14 +236,14 @@ fn write_executable(path i64) {
 	let sig_off = align_up(str_off + str_size, 16)
 	mut ident = path
 	i = 0
-	for i64(load8(path + i)) != 0 {
-		if i64(load8(path + i)) == '/' {
-			ident = path + i + 1
+	for i < len(path) {
+		if i64(path[i]) == '/' {
+			ident = path[i + 1:]
 		}
 		i = i + 1
 	}
 	let npages = (sig_off + SIG_PAGE - 1) / SIG_PAGE
-	let cd_size = 88 + strlen(ident) + 1 + 32 * npages
+	let cd_size = 88 + len(ident) + 1 + 32 * npages
 	let sig_size = 20 + cd_size
 	let file_size = sig_off + sig_size
 	let link_size = file_size - link_off
@@ -259,15 +259,15 @@ fn write_executable(path i64) {
 	put32(mo + 20, CMDS_SIZE)
 	put32(mo + 24, 0x00200085)
 	mut p = mo + 32
-	p = w_segment(p, cstr("__PAGEZERO"), 0, TEXT_BASE, 0, 0, 0, 0)
-	p = w_segment(p, cstr("__TEXT"), TEXT_BASE, text_size, 0, text_size, 5, 3)
-	p = w_section(p, cstr("__text"), cstr("__TEXT"), text_addr, text_end - text_addr, 2, 0x80000400)
-	p = w_section(p, cstr("__cstring"), cstr("__TEXT"), text_end, cstr_end - text_end, 0, 2)
-	p = w_section(p, cstr("__const"), cstr("__TEXT"), const_start, const_end - const_start, 3, 0)
-	p = w_segment(p, cstr("__DATA"), data_vm, data_size, text_size, data_size, 3, 2)
-	p = w_section(p, cstr("__got"), cstr("__DATA"), lk_got, 8 * nimp, 3, 0)
-	p = w_section(p, cstr("__data"), cstr("__DATA"), lk_data, 8 * nvars + 16 * len(prog_fns), 3, 0)
-	p = w_segment(p, cstr("__LINKEDIT"), data_vm + data_size, align_up(link_size, PAGE), link_off, link_size, 1, 0)
+	p = w_segment(p, "__PAGEZERO", 0, TEXT_BASE, 0, 0, 0, 0)
+	p = w_segment(p, "__TEXT", TEXT_BASE, text_size, 0, text_size, 5, 3)
+	p = w_section(p, "__text", "__TEXT", text_addr, text_end - text_addr, 2, 0x80000400)
+	p = w_section(p, "__cstring", "__TEXT", text_end, cstr_end - text_end, 0, 2)
+	p = w_section(p, "__const", "__TEXT", const_start, const_end - const_start, 3, 0)
+	p = w_segment(p, "__DATA", data_vm, data_size, text_size, data_size, 3, 2)
+	p = w_section(p, "__got", "__DATA", lk_got, 8 * nimp, 3, 0)
+	p = w_section(p, "__data", "__DATA", lk_data, 8 * nvars + 16 * len(prog_fns), 3, 0)
+	p = w_segment(p, "__LINKEDIT", data_vm + data_size, align_up(link_size, PAGE), link_off, link_size, 1, 0)
 	put32(p, 0x80000022)
 	put32(p + 4, 48)
 	put32(p + 16, link_off)
@@ -289,7 +289,7 @@ fn write_executable(path i64) {
 	put32(p, 0xe)
 	put32(p + 4, 32)
 	put32(p + 8, 12)
-	w_name16(p + 12, cstr("/usr/lib/dyld"))
+	w_name16(p + 12, "/usr/lib/dyld")
 	p = p + 32
 	put32(p, 0x1b)
 	put32(p + 4, 24)
@@ -311,7 +311,7 @@ fn write_executable(path i64) {
 	put32(p + 12, 2)
 	put32(p + 16, 0x10000)
 	put32(p + 20, 0x10000)
-	w_name16(p + 24, cstr("/usr/lib/libSystem.B.dylib"))
+	w_name16(p + 24, "/usr/lib/libSystem.B.dylib")
 	p = p + 56
 	put32(p, 0x1d)
 	put32(p + 4, 16)
@@ -355,14 +355,14 @@ fn write_executable(path i64) {
 	}
 	i = 0
 	for i < len(g_str_ptrs) {
-		memcpy(mo + lk_strs[i] - TEXT_BASE, g_str_ptrs[i], g_str_lens[i])
+		memcpy(mo + lk_strs[i] - TEXT_BASE, rt_cstr(g_str_ptrs[i]), g_str_lens[i])
 		i = i + 1
 	}
 	i = 0
 	for i < len(g_tstr_ptrs) {
 		let at = mo + lk_tstrs[i] - TEXT_BASE
 		put64(at, g_tstr_lens[i])
-		memcpy(at + 8, g_tstr_ptrs[i], g_tstr_lens[i])
+		memcpy(at + 8, rt_cstr(g_tstr_ptrs[i]), g_tstr_lens[i])
 		i = i + 1
 	}
 	i = 0
@@ -389,7 +389,7 @@ fn write_executable(path i64) {
 	put32be(sig + 12, 0)
 	put32be(sig + 16, 20)
 	let cd = sig + 20
-	let hash_off = 88 + strlen(ident) + 1
+	let hash_off = 88 + len(ident) + 1
 	put32be(cd, 0xfade0c02)
 	put32be(cd + 4, cd_size)
 	put32be(cd + 8, 0x20400)
@@ -406,7 +406,7 @@ fn write_executable(path i64) {
 	put64be(cd + 64, 0)
 	put64be(cd + 72, text_size)
 	put64be(cd + 80, 1)
-	memcpy(cd + 88, ident, strlen(ident))
+	memcpy(cd + 88, rt_cstr(ident), len(ident))
 	i = 0
 	for i < npages {
 		mut n = SIG_PAGE
@@ -418,11 +418,11 @@ fn write_executable(path i64) {
 	}
 
 	// A fresh inode keeps the kernel from reusing a stale cached signature.
-	rt_sys_unlink(path)
-	let fd = rt_sys_creat(path, 493)
+	host_unlink(path)
+	let fd = host_creat(path, 493)
 	if (fd & 0x80000000) != 0 {
-		let e = cast([]i64, err_code(NO_POS, cstr("E904 CANNOT_CREATE")))
-		buf_str(cast([]u8, e), cstr("cannot create "))
+		let e = cast([]i64, err_code(NO_POS, "E904 CANNOT_CREATE"))
+		buf_str(cast([]u8, e), "cannot create ")
 		buf_str(cast([]u8, e), path)
 		fatal(cast([]u8, e))
 	}

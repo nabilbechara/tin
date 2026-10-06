@@ -51,7 +51,7 @@ shared mut saw_dyn i64 // a dyn type was built: the back ends refuse it until st
 shared mut saw_dyn_pos i64 // where the first dyn type was written, for the back ends' message
 shared mut ty_secrets []i64 // secret twins, one per plain type (secret_of)
 
-fn ty_new(kind i64, name i64) i64 {
+fn ty_new(kind i64, name str) i64 {
 	let t = cast(Ty, calloc(TY_MAX + 1, 8))
 	t.kind = kind
 	t.name = name
@@ -59,7 +59,7 @@ fn ty_new(kind i64, name i64) i64 {
 	return cast(i64, t)
 }
 
-fn int_type(name i64, width i64, signed i64) i64 {
+fn int_type(name str, width i64, signed i64) i64 {
 	let t = cast(Ty, ty_new(K_INT, name))
 	t.width = width
 	t.signed = signed
@@ -70,46 +70,43 @@ fn int_type(name i64, width i64, signed i64) i64 {
 fn types_init() {
 	ty_named = []i64{}
 	ty_interned = cast([]Ty, []i64{})
-	ty_int = int_type(cstr("i64"), 8, 1)
-	ty_i8 = int_type(cstr("i8"), 1, 1)
-	ty_i16 = int_type(cstr("i16"), 2, 1)
-	ty_i32 = int_type(cstr("i32"), 4, 1)
-	ty_byte = int_type(cstr("u8"), 1, 0)
-	ty_u16 = int_type(cstr("u16"), 2, 0)
-	ty_u32 = int_type(cstr("u32"), 4, 0)
-	ty_u64 = int_type(cstr("u64"), 8, 0)
-	ty_bool = ty_new(K_BOOL, cstr("bool"))
+	ty_int = int_type("i64", 8, 1)
+	ty_i8 = int_type("i8", 1, 1)
+	ty_i16 = int_type("i16", 2, 1)
+	ty_i32 = int_type("i32", 4, 1)
+	ty_byte = int_type("u8", 1, 0)
+	ty_u16 = int_type("u16", 2, 0)
+	ty_u32 = int_type("u32", 4, 0)
+	ty_u64 = int_type("u64", 8, 0)
+	ty_bool = ty_new(K_BOOL, "bool")
 	cast(Ty, ty_bool).width = 1
-	ty_float = ty_new(K_FLOAT, cstr("f64"))
-	ty_f32 = ty_new(K_FLOAT, cstr("f32"))
+	ty_float = ty_new(K_FLOAT, "f64")
+	ty_f32 = ty_new(K_FLOAT, "f32")
 	cast(Ty, ty_f32).width = 4
-	ty_string = ty_new(K_STRING, cstr("str"))
-	ty_void = ty_new(K_VOID, cstr("void"))
-	ty_nil = ty_new(K_NIL, cstr("nil"))
-	ty_uint = ty_new(K_UINT, cstr("untyped int"))
-	ty_ufloat = ty_new(K_UFLOAT, cstr("untyped float"))
-	ty_ubool = ty_new(K_UBOOL, cstr("untyped bool"))
-	ty_error = ty_new(K_ERROR, cstr("fault"))
-	name_type(cstr("bool"), ty_bool)
-	name_type(cstr("f64"), ty_float)
-	name_type(cstr("f32"), ty_f32)
-	name_type(cstr("str"), ty_string)
-	name_type(cstr("fault"), ty_error)
+	ty_string = ty_new(K_STRING, "str")
+	ty_void = ty_new(K_VOID, "void")
+	ty_nil = ty_new(K_NIL, "nil")
+	ty_uint = ty_new(K_UINT, "untyped int")
+	ty_ufloat = ty_new(K_UFLOAT, "untyped float")
+	ty_ubool = ty_new(K_UBOOL, "untyped bool")
+	ty_error = ty_new(K_ERROR, "fault")
+	name_type("bool", ty_bool)
+	name_type("f64", ty_float)
+	name_type("f32", ty_f32)
+	name_type("str", ty_string)
+	name_type("fault", ty_error)
 }
 
-fn name_type(name i64, t i64) {
-	mut rec = []i64{}
-	rec = append(rec, name)
-	rec = append(rec, t)
-	ty_named = append(ty_named, cast(i64, rec))
+fn name_type(name str, t i64) {
+	ty_named = append(ty_named, name_bind(name, t))
 }
 
-fn find_type(name i64) i64 {
+fn find_type(name str) i64 {
 	mut i = len(ty_named) - 1
 	for i >= 0 {
-		let rec = cast([]i64, ty_named[i])
-		if streq(rec[0], name) != 0 {
-			return rec[1]
+		let rec = cast(NameBind, ty_named[i])
+		if rec.name == name {
+			return rec.val
 		}
 		i = i - 1
 	}
@@ -142,7 +139,7 @@ fn interned(kind i64, elem i64, key i64, params []i64, results []i64, variadic i
 		}
 		i = i + 1
 	}
-	let n = cast(Ty, ty_new(kind, 0))
+	let n = cast(Ty, ty_new(kind, ""))
 	n.elem = elem
 	n.key = key
 	n.fields = cast([]i64, cast(i64, params))
@@ -199,13 +196,10 @@ fn box_of(s i64) i64 {
 	}
 	let t = cast(Ty, ty_new(K_STRUCT, cast(Ty, s).name))
 	mut fs = []i64{}
-	mut rec = []i64{}
-	rec = append(rec, cstr("v"))
-	rec = append(rec, s)
-	rec = append(rec, 0)
-	rec = append(rec, 0)
-	rec = append(rec, 0)
-	rec = append(rec, 0)
+	let rec = cast(Field, calloc(6, 8))
+	rec.name = "v"
+	rec.ty = s
+	rec.json = ""
 	fs = append(fs, cast(i64, rec))
 	t.fields = fs
 	layout_struct(t)
@@ -250,7 +244,7 @@ fn dyn_of(sd i64, bind_ []i64) i64 {
 		}
 		i = i + 1
 	}
-	let n = cast(Ty, ty_new(K_DYN, 0))
+	let n = cast(Ty, ty_new(K_DYN, ""))
 	n.gdecl = sd
 	n.targs = cast([]i64, cast(i64, bind_))
 	ty_interned = append(ty_interned, cast(Ty, n))
@@ -281,7 +275,7 @@ fn mut_mask(muts []i64) i64 {
 }
 
 fn tuple_of(types i64) i64 {
-	let t = cast(Ty, ty_new(K_TUPLE, 0))
+	let t = cast(Ty, ty_new(K_TUPLE, ""))
 	t.fields = cast([]i64, types)
 	return cast(i64, t)
 }
@@ -494,17 +488,17 @@ fn assignable(from Ty, to Ty) i64 {
 
 fn type_name(b []u8, t Ty) {
 	if cast(i64, t) == 0 {
-		buf_str(b, cstr("int"))
+		buf_str(b, "int")
 		return
 	}
 	if t.secret_ != 0 {
-		buf_str(b, cstr("secret "))
+		buf_str(b, "secret ")
 		type_name(b, cast(Ty, t.secret_))
 		return
 	}
 	let k = t.kind
 	if k == K_DYN {
-		buf_str(b, cstr("dyn "))
+		buf_str(b, "dyn ")
 		let sd = cast(Decl, t.gdecl)
 		if cast(i64, sd) != 0 {
 			buf_str(b, sd.name)
@@ -517,20 +511,20 @@ fn type_name(b []u8, t Ty) {
 				if i > 0 {
 					buf_byte(b, ',')
 				}
-				type_name(b, cast(Ty, cast([]i64, bind_[i])[1]))
+				type_name(b, cast(Ty, cast(NameBind, bind_[i]).val))
 				i = i + 1
 			}
 			buf_byte(b, ']')
 		}
 		return
 	}
-	if t.name != 0 {
+	if len(t.name) != 0 {
 		buf_str(b, t.name)
 	} else if k == K_SLICE {
-		buf_str(b, cstr("[]"))
+		buf_str(b, "[]")
 		type_name(b, cast(Ty, t.elem))
 	} else if k == K_CHAN {
-		buf_str(b, cstr("chan "))
+		buf_str(b, "chan ")
 		type_name(b, cast(Ty, t.elem))
 	} else if k == K_OPT {
 		buf_byte(b, '?')
@@ -540,23 +534,23 @@ fn type_name(b []u8, t Ty) {
 			type_name(b, cast(Ty, t.elem))
 		}
 	} else if k == K_MAP {
-		buf_str(b, cstr("map["))
+		buf_str(b, "map[")
 		type_name(b, cast(Ty, t.key))
 		buf_byte(b, ']')
 		type_name(b, cast(Ty, t.elem))
 	} else if k == K_FUNC || k == K_TUPLE {
 		if k == K_FUNC {
-			buf_str(b, cstr("func"))
+			buf_str(b, "func")
 		}
 		buf_byte(b, '(')
 		let ps = t.fields
 		mut i = 0
 		for i < len(ps) {
 			if i > 0 {
-				buf_str(b, cstr(", "))
+				buf_str(b, ", ")
 			}
 			if k == K_FUNC && i < 63 && (t.key & (1 << i)) != 0 {
-				buf_str(b, cstr("mut "))
+				buf_str(b, "mut ")
 			}
 			type_name(b, cast(Ty, ps[i]))
 			i = i + 1
@@ -570,16 +564,16 @@ fn type_name(b []u8, t Ty) {
 			type_name(b, cast(Ty, tuple_of(cast(i64, t.results))))
 		}
 	} else {
-		buf_str(b, cstr("?"))
+		buf_str(b, "?")
 	}
 }
 
 // struct_field returns the index of field name in struct type t, or -1.
-fn struct_field(t Ty, name i64) i64 {
+fn struct_field(t Ty, name str) i64 {
 	let fs = t.fields
 	mut i = 0
 	for i < len(fs) {
-		if streq(cast([]i64, fs[i])[0], name) != 0 {
+		if cast(Field, fs[i]).name == name {
 			return i
 		}
 		i = i + 1
@@ -588,11 +582,11 @@ fn struct_field(t Ty, name i64) i64 {
 }
 
 fn field_type(t Ty, i i64) i64 {
-	return cast([]i64, t.fields[i])[1]
+	return cast(Field, t.fields[i]).ty
 }
 
 fn field_offset(t Ty, i i64) i64 {
-	return cast([]i64, t.fields[i])[2]
+	return cast(Field, t.fields[i]).off
 }
 
 // layout_struct assigns field offsets: widest fields first, each naturally aligned, so
@@ -604,12 +598,9 @@ fn layout_struct(t Ty) {
 	for w >= 1 {
 		mut i = 0
 		for i < len(fs) {
-			let f = cast([]i64, fs[i])
-			if type_width(cast(Ty, f[1])) == w {
-				for len(f) < 3 {
-					f = append(f, 0)
-				}
-				f[2] = off
+			let f = cast(Field, fs[i])
+			if type_width(cast(Ty, f.ty)) == w {
+				f.off = off
 				off = off + w
 			}
 			i = i + 1
@@ -685,7 +676,7 @@ fn bounded_of(t_in i64, max_ i64) i64 {
 		}
 		i = i + 1
 	}
-	let b = cast(Ty, ty_new(t.kind, 0))
+	let b = cast(Ty, ty_new(t.kind, ""))
 	mut w = 0
 	for w < TY_SECRET {
 		cast(i64, b)[w] = cast(i64, t)[w]
@@ -695,10 +686,9 @@ fn bounded_of(t_in i64, max_ i64) i64 {
 	b.max = max_
 	let nb = buf_new()
 	type_name(cast([]u8, nb), t)
-	buf_str(nb, cstr(" max "))
+	buf_str(nb, " max ")
 	buf_int(nb, max_)
-	buf_byte(nb, 0)
-	b.name = buf_cstring(nb)
+	b.name = str(nb)
 	mut r = []i64{}
 	r = append(r, cast(i64, t))
 	r = append(r, max_)
