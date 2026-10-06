@@ -1,6 +1,6 @@
 // The compiler's own Linux host calls (see host_darwin.tin).
 fn host_exe_path(buf i64, n i64) {
-	mut k = rt_sys_readlink(cstr("/proc/self/exe"), buf, n - 1)
+	mut k = rt_sys_readlink(rt_cstr("/proc/self/exe"), buf, n - 1)
 	if (k & 0x80000000) != 0 {
 		k = 0
 	}
@@ -28,7 +28,7 @@ fn host_start(argc i64, argv i64) {
 }
 
 // host_getenv is the value of the C string name as a C string, or 0 when it is unset.
-fn host_getenv(name i64) i64 {
+fn host_getenv(name str) i64 {
 	if host_envp == 0 {
 		return 0
 	}
@@ -36,10 +36,10 @@ fn host_getenv(name i64) i64 {
 	for host_envp[i] != 0 {
 		let e = host_envp[i]
 		mut k = 0
-		for i64(load8(name + k)) != 0 && i64(load8(e + k)) == i64(load8(name + k)) {
+		for k < len(name) && i64(load8(e + k)) == i64(name[k]) {
 			k = k + 1
 		}
-		if i64(load8(name + k)) == 0 && i64(load8(e + k)) == '=' {
+		if k == len(name) && i64(load8(e + k)) == '=' {
 			return e + k + 1
 		}
 		i = i + 1
@@ -64,7 +64,7 @@ fn host_auxval(key i64) i64 {
 
 // Canonicalization follows Linux symlinks before reducing .., with PATH_MAX and hop bounds.
 fn host_realpath_work(path i64, resolved i64, pending i64, target i64, merged i64, st i64) i64 {
-	let n = strlen(path)
+	let n = host_c_len(path)
 	if n == 0 || n >= 4096 {
 		return 0
 	}
@@ -74,7 +74,7 @@ fn host_realpath_work(path i64, resolved i64, pending i64, target i64, merged i6
 		if rt_sys_getcwd(target, 4096) == 0 {
 			return 0
 		}
-		let cwd = strlen(target)
+		let cwd = host_c_len(target)
 		if cwd + n + 1 >= 4096 {
 			return 0
 		}
@@ -137,7 +137,7 @@ fn host_realpath_work(path i64, resolved i64, pending i64, target i64, merged i6
 				return 0
 			}
 			store8(target + k, 0)
-			let rest = strlen(pending + cursor)
+			let rest = host_c_len(pending + cursor)
 			if k + rest >= 4096 {
 				return 0
 			}
@@ -157,15 +157,42 @@ fn host_realpath_work(path i64, resolved i64, pending i64, target i64, merged i6
 	return 0
 }
 
-fn host_realpath(path i64, resolved i64) i64 {
+fn host_realpath(path str, resolved i64) i64 {
 	let pending = calloc(4096, 1)
 	let target = calloc(4096, 1)
 	let merged = calloc(4096, 1)
 	let st = calloc(256, 1)
-	let result = host_realpath_work(path, resolved, pending, target, merged, st)
+	let result = host_realpath_work(rt_cstr(path), resolved, pending, target, merged, st)
 	free(pending)
 	free(target)
 	free(merged)
 	free(st)
 	return result
+}
+
+// host_str is the compiler string for the C string at p, which the operating system or the C library
+// handed back (an argument, an environment value, a directory entry name, a resolved path).
+fn host_str(p i64) str {
+	return rt_str_from_raw(p, host_c_len(p))
+}
+
+// host_c_len is the length of the C string at p.
+fn host_c_len(p i64) i64 {
+	mut n = 0
+	for i64(load8(p + n)) != 0 {
+		n = n + 1
+	}
+	return n
+}
+
+fn host_creat(path str, mode i64) i64 {
+	return rt_sys_creat(rt_cstr(path), mode)
+}
+
+fn host_unlink(path str) i64 {
+	return rt_sys_unlink(rt_cstr(path))
+}
+
+fn host_opendir(path str) i64 {
+	return rt_sys_opendir(rt_cstr(path))
 }

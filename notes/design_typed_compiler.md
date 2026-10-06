@@ -179,3 +179,27 @@ cases and a byte-identical `-S` comparison. The seed is not touched until step 6
   past the end as 0) and the amd64 back end asks for a temporary past the end of its pool (#460). Measured:
   378 of 378 listings identical, suite 211, compile of the compiler 0.33 s (0.32 s before).
 
+
+- **Strings (step 3, #386), 2026-10-06.** Every name, path, token text, message, label, unit and format spec
+  in selfhost/ is a `str` (or `?str` where the empty string is a value of its own: the interpolation spec, the
+  hoisted-constant text, a rewrite's replacement). `cstr`, `str_of`, `streq`, `strlen`, `str_slice`,
+  `buf_cstring`, `mem_eq`, `str_cat3` and `load8` on a string are gone. Raw byte addresses (kernel and C
+  calls, copying string tables into the object file) go through the runtime's `rt_cstr`; C strings the
+  operating system hands back (argv, an environment value, a directory entry, a resolved path) enter through
+  `host_str` in `host_darwin.tin` and `host_linux.tin`. The tuples that mixed strings with words are typed
+  records: `NameBind` (a name and the type or declaration bound to it), `ShapeMethod`, `ParsedField` and
+  `Field`, `Attr`, `Hoisted`, `MtPath`. What went wrong on the way, so the next conversion knows: a `str` field
+  of a record that is allocated zeroed is not valid until it is set (`len(0)` faults), so `node_init_strs`
+  sets the string fields of each node kind and the other records set theirs; an i64 slot and a `str` slot hold
+  different words (the address of the bytes against the address of the length word), and a `cast` between
+  them corrupts silently; a NUL-terminated scan (`for s[i] != 0`) traps once `s` is bounds-checked.
+  `load8` accepts a `str` and reads its length word. Measured: 429 of 429 listings identical to the compiler
+  built from main, suite 233, `make bootstrap` fixed point, seed-built Linux flow on arm64 and amd64.
+- **Positional tuples (#384 leftover), 2026-10-06.** The word tuples that remained after the records are
+  structs too: `Pair` (two words, a third where one grows: the safe-index facts, switch cases, narrowing
+  records, instances, defers), `ShapeSig`, `DynTable`, `TrapSite`, `TypeNode` (the type of a conversion or a
+  make/new call). `X[TYX]`, `tx[TX_A]`, `lower_with_init`'s field index and the copy loops over a type's words
+  are field accesses or `ty_copy`. What remains of the size constants is `F_SIZE`, `D_SIZE`, `N_SIZE` and
+  `TY_WORDS`: these records are allocated zeroed on purpose (`new(T)` would give a nil slice field an empty
+  slice, and the checker tests `cast(i64, f.tparams) != 0`), and `N_SIZE` is the size of the overlay every
+  node kind shares, which `replace_node` and `expr_clone` copy whole.

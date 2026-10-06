@@ -167,13 +167,18 @@ type Conn struct {
 	phbuf   []u8
 	wnonce  []u8 // SealRawTo's nonce and record header, rewritten in place for each record
 	whdr    []u8
+	version i64  // the protocol version: VersionTLS13, or VersionTLS12 (#473; tls12.tin)
+	gcm12   bool // TLS 1.2 with AES-GCM: a 4-byte salt and an 8-byte explicit nonce per record
+	wantCCS bool // TLS 1.2: the peer's ChangeCipherSpec must come before its next record
+	waad    []u8 // SealRawTo's TLS 1.2 additional data, rewritten in place
 }
 
 fn new_conn(tcp wire.Conn) Conn {
 	return Conn{tcp: tcp, fd: tcp.Fd(), failure: "", riv: make([]u8, 12), rsecret: make([]u8, 0, 48),
 		wiv: make([]u8, 12), wsecret: make([]u8, 0, 48), in: make([]u8, 5+maxCiphertext+64),
 		plain: make([]u8, maxPlaintext), ph: make([]u8, 5), alpn: "", certs: make([][]u8, 0, 1), hash: seal.Hash.SHA256,
-		resumption: []u8{}, skey: "", phbuf: []u8{}, wnonce: make([]u8, 12), whdr: make([]u8, 5)}
+		resumption: []u8{}, skey: "", phbuf: []u8{}, wnonce: make([]u8, 12), whdr: make([]u8, 5), version: VersionTLS13,
+		waad: make([]u8, 13)}
 }
 
 // wait blocks the task until the socket is readable (want 1) or writable (2), within the
@@ -281,6 +286,22 @@ fn (c mut Conn) seal_record(out mut []u8, typ i64, data []u8) ! {
 		out = append(out, data...)
 		return
 	}
+	if c.version == VersionTLS12 {
+		// TLS 1.2: the record's own type, no padding; GCM sends its explicit nonce first.
+		let n12 = c.nonce12(c.wiv, c.wseq)
+		let sealed = try a.Seal(n12, data, aad12(c.wseq, typ, len(data)))
+		c.wseq += 1
+		mut ln = len(sealed)
+		if c.gcm12 {
+			ln += 8
+		}
+		out = append(out, u8(typ), 3, 3, u8(ln >> 8), u8(ln))
+		if c.gcm12 {
+			out = append(out, n12[4:]...)
+		}
+		out = append(out, sealed...)
+		return
+	}
 	mut inner = make([]u8, 0, len(data)+1)
 	inner = append(inner, data...)
 	inner = append(inner, u8(typ))
@@ -359,10 +380,26 @@ fn (c mut Conn) next_record(wait bool) !(i64, []u8, bool) {
 		let body = c.in[c.ins+5 : c.ins+5+n]
 		c.ins += 5 + n
 		if typ == ctChangeCipherSpec {
+			if c.version == VersionTLS12 {
+				// TLS 1.2: it turns the peer's new read key on.
+				if !c.wantCCS || n != 1 || body[0] != 1 {
+					fail alert_fault(alertUnexpectedMessage, "unexpected change_cipher_spec")
+				}
+				c.wantCCS = false
+				continue
+			}
 			if c.ready || n != 1 || body[0] != 1 {
 				fail alert_fault(alertUnexpectedMessage, "unexpected change_cipher_spec")
 			}
 			continue
+		}
+		if c.wantCCS {
+			// An alert before the peer's ChangeCipherSpec is still plaintext: a server that
+			// refuses the client's certificate, say.
+			if typ == ctAlert && n <= maxPlaintext {
+				return typ, clone(body), true
+			}
+			fail alert_fault(alertUnexpectedMessage, "expected change_cipher_spec")
 		}
 		let a = c.rd
 		if a == nil {
@@ -373,6 +410,25 @@ fn (c mut Conn) next_record(wait bool) !(i64, []u8, bool) {
 				fail alert_fault(alertRecordOverflow, "record too large")
 			}
 			return typ, clone(body), true
+		}
+		if c.version == VersionTLS12 {
+			mut ct = body
+			mut n12 = c.nonce12(c.riv, c.rseq)
+			if c.gcm12 {
+				if len(body) < 8+16 {
+					fail alert_fault(alertBadRecordMAC, "record too short")
+				}
+				copy(n12[4:], body[:8])
+				ct = body[8:]
+			}
+			if len(ct) < 16 || len(ct)-16 > maxPlaintext {
+				fail alert_fault(alertRecordOverflow, "record of a bad length")
+			}
+			let pt12 = a.Open(n12, ct, aad12(c.rseq, typ, len(ct)-16)) catch _ {
+				fail alert_fault(alertBadRecordMAC, "record authentication failed")
+			}
+			c.rseq += 1
+			return typ, pt12, true
 		}
 		if typ != ctApplicationData {
 			fail alert_fault(alertUnexpectedMessage, say.Fmt("unexpected record type %d", typ))
@@ -451,6 +507,9 @@ fn (c mut Conn) send_key_update(request bool) ! {
 // post_handshake handles handshake messages after the handshake: NewSessionTicket is
 // kept for resumption (session.tin), KeyUpdate moves to the next read secret; anything else is fatal.
 fn (c mut Conn) post_handshake(data []u8) ! {
+	if c.version == VersionTLS12 {
+		return try refuse_renegotiation(data, true)
+	}
 	mut i = 0
 	for i < len(data) {
 		if c.phcollect > 0 {

@@ -1,14 +1,17 @@
-// Package tls is TLS 1.3 (RFC 8446). Clients: tls.Dial connects and handshakes, and Conn reads
-// and writes like wire.Conn; the server's certificate is verified by default against the
-// system's roots (plus Config.RootCAs). A server's NewSessionTicket is kept (per core, for the
-// same name and settings) and offered on the next connection to it, which then resumes without
-// the certificate messages (Conn.Resumed). Servers: anvil.ServeTLS serves HTTPS with this
-// package; LoadServerConfig reads a certificate chain and its key (RSA, ECDSA P-256 or P-384),
-// and Server runs the server side over an accepted wire.Conn. Cipher suites:
+// Package tls is TLS 1.3 (RFC 8446) and TLS 1.2 (RFC 5246). Clients: tls.Dial connects and
+// handshakes, and Conn reads and writes like wire.Conn; the server's certificate is verified by
+// default against the system's roots (plus Config.RootCAs). A server's NewSessionTicket is kept
+// (per core, for the same name and settings) and offered on the next connection to it, which
+// then resumes without the certificate messages (Conn.Resumed). Servers: anvil.ServeTLS serves
+// HTTPS with this package; LoadServerConfig reads a certificate chain and its key (RSA, ECDSA
+// P-256 or P-384), and Server runs the server side over an accepted wire.Conn. Cipher suites:
 // TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384 and TLS_CHACHA20_POLY1305_SHA256; key exchange
-// X25519, or P-256 by HelloRetryRequest. No 0-RTT, no renegotiation and no TLS 1.2. Every wait
-// lets the core serve other tasks and honours Config.Timeout during the handshake, SetTimeout
-// afterwards and a request's deadline.
+// X25519MLKEM768 (post-quantum hybrid, ML-KEM-768 with X25519) or X25519, or P-256 by
+// HelloRetryRequest. TLS 1.2, for peers that stop there, has the six ECDHE suites with AES-GCM
+// or ChaCha20-Poly1305 and the extended master secret; 1.3 is preferred, and Config.MinVersion
+// (ServerConfig.MinVersion) VersionTLS13 turns 1.2 off. No 0-RTT, no renegotiation, no 1.2
+// session resumption and nothing older than 1.2. Every wait lets the core serve other tasks and
+// honours Config.Timeout during the handshake, SetTimeout afterwards and a request's deadline.
 //
 //	let c = try tls.Dial("example.com:443", tls.Config{ALPN: []str{"http/1.1"}})
 //	try c.Write("GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
@@ -27,6 +30,7 @@ type Config struct {
 	InsecureSkipVerify bool  // FOR TESTS ONLY: accept any certificate for any name, which lets anyone in the path read and change the traffic
 	Certificate        str   // PEM certificate chain (leaf first) to present when a server asks for one (mutual TLS, #475; "": none)
 	Key                str   // the PEM private key of Certificate's leaf (RSA, ECDSA P-256 or P-384)
+	MinVersion         i64   // VersionTLS12 (the default, 0 too) or VersionTLS13 (#473)
 }
 
 // Dial connects to "host:port" and runs the handshake. ServerName defaults to host.
@@ -105,10 +109,14 @@ fn (c Conn) CipherSuite() i64 {
 	return c.suite
 }
 
-// Group is the key exchange: "X25519", or "P-256" when the server asked for it.
+// Group is the key exchange: "X25519MLKEM768" (post-quantum hybrid, #479), "X25519", or
+// "P-256" when the server asked for it.
 fn (c Conn) Group() str {
 	if c.group == groupP256 {
 		return "P-256"
+	}
+	if c.group == groupX25519MLKEM768 {
+		return "X25519MLKEM768"
 	}
 	return "X25519"
 }
@@ -116,9 +124,9 @@ fn (c Conn) Group() str {
 // VersionTLS13 is TLS 1.3's protocol version (Conn.Version).
 const VersionTLS13 = 0x0304
 
-// Version is the negotiated protocol version: VersionTLS13.
+// Version is the negotiated protocol version: VersionTLS13 or VersionTLS12.
 fn (c Conn) Version() i64 {
-	return VersionTLS13
+	return c.version
 }
 
 // Resumed reports whether the handshake resumed an earlier session with a ticket: the server's

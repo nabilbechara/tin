@@ -1,0 +1,181 @@
+package main
+
+import "quarry"
+import "say"
+import "twine"
+import "wire"
+
+// A gRPC client over wire's HTTP/2 (#480): calls helloworld.Greeter/SayHello, the service of
+// gRPC's own examples, as served by examples/grpc.tin or a grpc-go server, and prints the reply.
+//
+//	service Greeter { rpc SayHello (HelloRequest) returns (HelloReply) {} }
+//	message HelloRequest { string name = 1; }
+//	message HelloReply { string message = 1; }
+//
+// A call is a POST to /helloworld.Greeter/SayHello with content-type application/grpc over
+// HTTP/2: cleartext by prior knowledge (wire.Options.H2C), as gRPC servers expect, or an https://
+// URL where ALPN chooses h2. The body is one length-prefixed message (a compressed flag byte and a
+// 4-byte big-endian length, then the protobuf bytes), and the reply comes the same way, with the
+// status in the trailers grpc-status and grpc-message (or in the headers of a call that fails
+// without a reply). ADDR is the server (default 127.0.0.1:50051); the name is the first argument.
+
+// codeNames names the gRPC status codes (google.golang.org/grpc/codes).
+let codeNames = []str{"OK", "Canceled", "Unknown", "InvalidArgument", "DeadlineExceeded", "NotFound", "AlreadyExists",
+	"PermissionDenied", "ResourceExhausted", "FailedPrecondition", "Aborted", "OutOfRange", "Unimplemented", "Internal",
+	"Unavailable", "DataLoss", "Unauthenticated"}
+
+fn main() {
+	mut addr = quarry.Getenv("ADDR")
+	if addr == "" {
+		addr = "127.0.0.1:50051"
+	}
+	let args = quarry.Args()
+	mut name = "tin"
+	if len(args) > 1 {
+		name = args[1]
+	}
+	let reply = sayHello(addr, name) catch err {
+		say.Line(err)
+		return
+	}
+	say.Line(reply)
+}
+
+// sayHello calls SayHello(HelloRequest{name}) and returns HelloReply.message.
+fn sayHello(addr str, name str) !str {
+	let msg = stringMessage(1, name)
+	let n = len(msg)
+	mut body = make([]u8, 0, 5+n)
+	body = append(body, 0, u8(n>>24), u8(n>>16), u8(n>>8), u8(n))
+	body = append(body, msg...)
+	let r = try wire.DoWith("POST", "http://" + addr + "/helloworld.Greeter/SayHello",
+		[]str{"Content-Type", "application/grpc", "TE", "trailers"}, str(body), wire.Options{H2C: true, Timeout: 10s})
+	if r.Status != 200 {
+		fail "grpc: HTTP status {r.Status}"
+	}
+	// The status: in the trailers after a reply, or in the headers when there is none.
+	mut code = r.Trailer("grpc-status")
+	mut text = r.Trailer("grpc-message")
+	if code == "" {
+		code = r.Header("grpc-status")
+		text = r.Header("grpc-message")
+	}
+	if code != "0" {
+		mut cname = code
+		for i, c in codeNames {
+			if say.Str(i) == code {
+				cname = c
+			}
+		}
+		fail "grpc: {cname}: {percentDecode(text)}"
+	}
+	let b = r.Body
+	if len(b) < 5 || b[0] != 0 {
+		fail "grpc: the reply is not one uncompressed message"
+	}
+	let m = i64(b[1])<<24 | i64(b[2])<<16 | i64(b[3])<<8 | i64(b[4])
+	if m != len(b)-5 {
+		fail "grpc: the reply's length does not match"
+	}
+	let (v, err) = stringField(b[5:], 1)
+	if err != "" {
+		fail "grpc: HelloReply: {err}"
+	}
+	return v
+}
+
+fn percentDecode(s str) str {
+	mut b = make([]u8, 0, len(s))
+	mut i = 0
+	for i < len(s) {
+		if s[i] == '%' && i+2 < len(s) {
+			let h = twine.Index("0123456789ABCDEF", s[i+1:i+2])
+			let l = twine.Index("0123456789ABCDEF", s[i+2:i+3])
+			if h >= 0 && l >= 0 {
+				b = append(b, u8(h*16+l))
+				i += 3
+				continue
+			}
+		}
+		b = append(b, s[i])
+		i += 1
+	}
+	return str(b)
+}
+
+// ---- protobuf: a string field, and skipping the others (as in examples/grpc.tin) ----
+
+// stringMessage encodes a message whose only field is string field number f.
+fn stringMessage(f i64, v str) str {
+	return putVarint(f<<3|2) + putVarint(len(v)) + v
+}
+
+// putVarint is v as a protobuf varint.
+fn putVarint(v i64) str {
+	mut b = make([]u8, 0, 10)
+	mut x = v
+	for x >= 128 {
+		b = append(b, u8(x&127|128))
+		x = x >> 7
+	}
+	b = append(b, u8(x))
+	return str(b)
+}
+
+// varint reads a varint at pos: its value and the next position, or -1 when malformed.
+fn varint(b str, pos i64) (i64, i64) {
+	mut v = 0
+	mut shift = 0
+	mut p = pos
+	for p < len(b) && shift < 64 {
+		let c = b[p]
+		v = v | (i64(c&127) << shift)
+		p += 1
+		if c < 128 {
+			return v, p
+		}
+		shift += 7
+	}
+	return 0, -1
+}
+
+// stringField returns the last string (length-delimited) field number f of message b, skipping
+// the other fields; err is non-empty when b is malformed.
+fn stringField(b str, f i64) (str, str) {
+	mut out = ""
+	mut p = 0
+	for p < len(b) {
+		let (key, p2) = varint(b, p)
+		if p2 < 0 {
+			return "", "malformed tag"
+		}
+		p = p2
+		let wire_ = key & 7
+		if wire_ == 0 {
+			let (_, p3) = varint(b, p)
+			if p3 < 0 {
+				return "", "malformed varint"
+			}
+			p = p3
+		} else if wire_ == 1 {
+			p += 8
+		} else if wire_ == 5 {
+			p += 4
+		} else if wire_ == 2 {
+			let (n, p3) = varint(b, p)
+			if p3 < 0 || n < 0 || p3+n > len(b) {
+				return "", "malformed length"
+			}
+			if key>>3 == f {
+				out = b[p3 : p3+n]
+			}
+			p = p3 + n
+		} else {
+			return "", "unsupported wire type"
+		}
+		if p > len(b) {
+			return "", "truncated field"
+		}
+	}
+	return out, ""
+}

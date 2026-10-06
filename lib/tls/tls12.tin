@@ -1,0 +1,738 @@
+package tls
+
+import "quarry"
+import "say"
+import "seal"
+
+// ---- TLS 1.2 (RFC 5246, with RFC 5288, 5289, 7627, 7905, 8422 and 5746; #473) ----
+//
+// For peers that stop at TLS 1.2, with forward secrecy and AEAD only: ECDHE (X25519 or P-256)
+// signed by the certificate's ECDSA, Ed25519 or RSA key, and AES-128-GCM, AES-256-GCM or
+// ChaCha20-Poly1305: the six suites of Mozilla's "intermediate" profile. Left out: RSA key
+// exchange, CBC and every other non-AEAD suite, compression, renegotiation (refused; an empty
+// renegotiation_info is sent), session resumption, and SSL 3.0 to TLS 1.1. The extended master
+// secret (RFC 7627) is used whenever the peer offers it.
+//
+// Both sides prefer TLS 1.3. A server that answers a client offering 1.3 with 1.2 writes the
+// downgrade sentinel into its random (RFC 8446 4.1.3), and a client that offered 1.3 refuses a
+// 1.2 ServerHello carrying it, so an attacker cannot force 1.2 on two peers that speak 1.3.
+
+// VersionTLS12 is TLS 1.2's protocol version (Conn.Version, Config.MinVersion).
+const VersionTLS12 = 0x0303
+
+// The TLS 1.2 cipher suites (all ECDHE with an AEAD).
+const TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 = 0xc02b
+const TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 = 0xc02c
+const TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 = 0xc02f
+const TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 = 0xc030
+const TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 = 0xcca8
+const TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 = 0xcca9
+
+const extECPointFormats = 11
+const extExtendedMasterSecret = 23
+const extRenegotiationInfo = 0xff01
+const scsvRenegotiation = 0x00ff
+const alertNoRenegotiation = 100
+
+const hsServerKeyExchange = 12
+const hsServerHelloDone = 14
+const hsClientKeyExchange = 16
+
+// downgrade12 is the last 8 bytes of a server random that answers 1.2 to a client offering 1.3.
+const downgrade12 = "DOWNGRD\x01"
+
+// suites12 lists the TLS 1.2 suites, most preferred first (AES-GCM first with AES instructions).
+fn suites12() []i64 {
+	if seal.AESHardware() {
+		return []i64{TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256}
+	}
+	return []i64{TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256, TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+		TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384}
+}
+
+fn suite12_rsa(s i64) bool {
+	return s == TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 || s == TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 ||
+		s == TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+}
+
+fn suite12_chacha(s i64) bool {
+	return s == TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 || s == TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+}
+
+fn suite12_hash(s i64) seal.Hash {
+	if s == TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 || s == TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 {
+		return seal.Hash.SHA384
+	}
+	return seal.Hash.SHA256
+}
+
+fn suite12_key_len(s i64) i64 {
+	if s == TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 || s == TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 {
+		return 16
+	}
+	return 32
+}
+
+// ---- records ----
+
+// aad12 is a TLS 1.2 AEAD record's additional data: sequence number, type, version, length.
+fn aad12(seq u64, typ i64, n i64) []u8 {
+	let a = make([]u8, 13)
+	for i in 0..8 {
+		a[7-i] = u8(seq >> u64(8*i))
+	}
+	a[8] = u8(typ)
+	a[9] = 3
+	a[10] = 3
+	a[11] = u8(n >> 8)
+	a[12] = u8(n)
+	return a
+}
+
+// nonce12 is a TLS 1.2 record's nonce: AES-GCM's 4-byte salt and the explicit nonce (this side's
+// sequence number), or ChaCha20-Poly1305's IV xor the sequence number (RFC 7905).
+fn (c Conn) nonce12(iv []u8, seq u64) []u8 {
+	if !c.gcm12 {
+		return nonce(iv, seq)
+	}
+	let n = make([]u8, 12)
+	for i in 0..4 {
+		n[i] = iv[i]
+	}
+	for i in 0..8 {
+		n[11-i] = u8(seq >> u64(8*i))
+	}
+	return n
+}
+
+// seal_raw12 is SealRawTo for TLS 1.2: header, explicit nonce (GCM), data and tag, sealed in
+// place with the Conn's own nonce and additional-data slices.
+fn (c mut Conn) seal_raw12(a seal.AEAD, p i64, n i64, dst i64) !i64 {
+	mut o = 0
+	mut explicit = 0
+	if c.gcm12 {
+		explicit = 8
+	}
+	for off in (0..n).step(maxPlaintext) {
+		mut m = n - off
+		if m > maxPlaintext {
+			m = maxPlaintext
+		}
+		let rec = dst + o
+		let ln = explicit + m + 16
+		let h = c.whdr
+		h[0] = ctApplicationData
+		h[1] = 3
+		h[2] = 3
+		h[3] = u8(ln >> 8)
+		h[4] = u8(ln)
+		memcpy(rec, cast(i64, h)[2], 5)
+		let nc = c.wnonce
+		if c.gcm12 {
+			for i in 0..4 {
+				nc[i] = c.wiv[i]
+			}
+			for i in 0..8 {
+				nc[11-i] = u8(c.wseq >> u64(8*i))
+			}
+			memcpy(rec+5, cast(i64, nc)[2]+4, 8)
+		} else {
+			copy(nc, c.wiv)
+			for i in 0..8 {
+				nc[11-i] ^= u8(c.wseq >> u64(8*i))
+			}
+		}
+		memcpy(rec+5+explicit, p+off, m)
+		let ad = c.waad
+		for i in 0..8 {
+			ad[7-i] = u8(c.wseq >> u64(8*i))
+		}
+		ad[8] = ctApplicationData
+		ad[9] = 3
+		ad[10] = 3
+		ad[11] = u8(m >> 8)
+		ad[12] = u8(m)
+		try a.SealTo(nc, rec+5+explicit, m, ad, rec+5+explicit)
+		c.wseq += 1
+		o += 5 + ln
+	}
+	return o
+}
+
+// refuse_renegotiation handles a handshake record after a TLS 1.2 handshake: a client ignores a
+// server's HelloRequest (RFC 5246 7.4.1.1); anything else is a renegotiation, which is refused.
+fn refuse_renegotiation(data []u8, client bool) ! {
+	if client && len(data)%4 == 0 {
+		mut hello = true
+		for i in (0..len(data)).step(4) {
+			if data[i] != 0 || data[i+1] != 0 || data[i+2] != 0 || data[i+3] != 0 {
+				hello = false
+			}
+		}
+		if hello {
+			return
+		}
+	}
+	fail alert_fault(alertNoRenegotiation, "renegotiation is not supported")
+}
+
+// ---- the key schedule (RFC 5246 5 and 8.1, RFC 7627) ----
+
+// prf12 is TLS 1.2's PRF: P_hash(key, label + seed), n bytes.
+fn prf12(h seal.Hash, key []u8, label str, seed []u8, n i64) []u8 {
+	mut ls = make([]u8, 0, len(label)+len(seed))
+	ls = append(ls, label...)
+	ls = append(ls, seed...)
+	mut a = seal.Hmac(h, str(key), str(ls))
+	mut out = make([]u8, 0, n+64)
+	for len(out) < n {
+		out = append(out, seal.Hmac(h, str(key), str(cat(a, ls)))...)
+		a = seal.Hmac(h, str(key), str(a))
+	}
+	return out[:n]
+}
+
+// master12 is the master secret of a pre-master secret: from the session hash with the
+// extended master secret, else from the two randoms.
+fn master12(h seal.Hash, pms []u8, ems bool, transcript []u8, cr []u8, sr []u8) []u8 {
+	if ems {
+		return prf12(h, pms, "extended master secret", transcript_hash(h, transcript), 48)
+	}
+	return prf12(h, pms, "master secret", cat(cr, sr), 48)
+}
+
+// keys12 installs the record keys of a TLS 1.2 session: the write keys now, the read keys once
+// the peer's ChangeCipherSpec arrives (next_record).
+fn (c mut Conn) keys12(suite i64, master []u8, cr []u8, sr []u8, server bool) ! {
+	let kl = suite12_key_len(suite)
+	mut ivl = 4
+	if suite12_chacha(suite) {
+		ivl = 12
+	}
+	let kb = prf12(suite12_hash(suite), master, "key expansion", cat(sr, cr), 2*kl+2*ivl)
+	let ck = kb[:kl]
+	let sk = kb[kl : 2*kl]
+	let civ = kb[2*kl : 2*kl+ivl]
+	let siv = kb[2*kl+ivl : 2*kl+2*ivl]
+	c.version = VersionTLS12
+	c.suite = suite
+	c.hash = suite12_hash(suite)
+	c.gcm12 = !suite12_chacha(suite)
+	mut wk = ck
+	mut rk = sk
+	mut wiv = civ
+	mut riv = siv
+	if server {
+		wk = sk
+		rk = ck
+		wiv = siv
+		riv = civ
+	}
+	c.wr = try aead12(suite, wk)
+	c.rd = try aead12(suite, rk)
+	for i in 0..ivl {
+		c.wiv[i] = wiv[i]
+		c.riv[i] = riv[i]
+	}
+	c.wseq = 0
+	c.rseq = 0
+	c.wantCCS = true
+}
+
+fn aead12(suite i64, key []u8) !seal.AEAD {
+	if suite12_chacha(suite) {
+		return try seal.NewChaCha20Poly1305(key)
+	}
+	return try seal.NewAESGCM(key)
+}
+
+// finished12 is a TLS 1.2 Finished message's verify_data.
+fn finished12(h seal.Hash, master []u8, label str, transcript []u8) []u8 {
+	return prf12(h, master, label, transcript_hash(h, transcript), 12)
+}
+
+// keylog12 appends the session's master secret to SSLKEYLOGFILE ("CLIENT_RANDOM" line).
+fn keylog12(cr []u8, master []u8) {
+	let path = keylog_file()
+	if path == "" {
+		return
+	}
+	quarry.AppendFile(path, "CLIENT_RANDOM " + seal.Hex(cr) + " " + seal.Hex(master) + "\n") catch _ {}
+}
+
+// pick_scheme12 chooses the signature scheme for key among a TLS 1.2 peer's schemes: RSA-PSS
+// before PKCS #1 v1.5, ECDSA with the curve's hash first.
+fn pick_scheme12(key seal.PrivateKey, schemes []i64) i64 {
+	let r = key.RSA
+	if r != nil {
+		for _, s in []i64{0x0804, 0x0805, 0x0806, 0x0401, 0x0501, 0x0601} {
+			if in_list(schemes, s) {
+				return s
+			}
+		}
+		return 0
+	}
+	let e = key.EC
+	if e != nil {
+		mut order = []i64{0x0403, 0x0503, 0x0603}
+		if e.Curve == "P-384" {
+			order = []i64{0x0503, 0x0603, 0x0403}
+		}
+		for _, s in order {
+			if in_list(schemes, s) {
+				return s
+			}
+		}
+		return 0
+	}
+	if key.Ed != nil && in_list(schemes, 0x0807) {
+		return 0x0807
+	}
+	return 0
+}
+
+// ---- handshake messages ----
+
+// certificate12 is a TLS 1.2 Certificate message (no request context, no extensions).
+fn certificate12(chain [][]u8) []u8 {
+	mut b = make([]u8, 0, 4096)
+	let list = open_len(mut b, 3)
+	for _, der in chain {
+		put24(mut b, len(der))
+		b = append(b, der...)
+	}
+	close_len(mut b, list, 3)
+	return handshake_msg(hsCertificate, b)
+}
+
+// parse_certificate12 reads a TLS 1.2 Certificate body (may be empty, for a client's).
+fn parse_certificate12(body []u8) ![][]u8 {
+	let r = rdr{b: body}
+	let list = r.vec24()
+	if r.bad || !r.done() {
+		fail alert_fault(alertDecodeError, "malformed Certificate")
+	}
+	mut certs = make([][]u8, 0, 4)
+	let lr = rdr{b: list}
+	for !lr.bad && !lr.done() {
+		let der = lr.vec24()
+		if len(der) == 0 {
+			lr.bad = true
+		}
+		certs = append(certs, der)
+	}
+	if lr.bad {
+		fail alert_fault(alertDecodeError, "malformed certificate list")
+	}
+	return certs
+}
+
+// ---- the server ----
+
+// server12 runs a TLS 1.2 handshake for ClientHello ch (its message msg), whose client does not
+// offer TLS 1.3.
+fn (c mut Conn) server12(cfg ServerConfig, ch clientHello, msg []u8, hr mut hsReader) ! {
+	// The certificate (by server name and the schemes the client accepts in TLS 1.2), the suite for
+	// its key type, the group.
+	mut chain = cfg.Certificates
+	mut key = cfg.Key
+	let which = credential_for(cfg, ch.name, ch.schemes, pick_scheme12)
+	if which >= 0 {
+		chain = cfg.Others[which].Chain
+		key = cfg.Others[which].Key
+	}
+	let scheme = pick_scheme12(key, ch.schemes)
+	if scheme == 0 {
+		fail alert_fault(alertHandshakeFailure, "no signature scheme in common for the certificate's key")
+	}
+	// RFC 8422 5.1: an ECDSA certificate's curve must be one the client lists.
+	let ec = key.EC
+	if ec != nil && len(ch.groups) > 0 {
+		mut curve = groupP256
+		if ec.Curve == "P-384" {
+			curve = 24
+		}
+		if !in_list(ch.groups, curve) {
+			fail alert_fault(alertHandshakeFailure, "the client does not accept the certificate's curve")
+		}
+	}
+	let rsa = key.RSA != nil
+	mut suite = 0
+	for _, s in suites12() {
+		if suite == 0 && suite12_rsa(s) == rsa && in_list(ch.suites, s) {
+			suite = s
+		}
+	}
+	if suite == 0 {
+		fail alert_fault(alertHandshakeFailure, "no cipher suite in common")
+	}
+	mut group = 0
+	if in_list(ch.groups, groupX25519) {
+		group = groupX25519
+	} else if in_list(ch.groups, groupP256) || len(ch.groups) == 0 {
+		group = groupP256
+	}
+	if group == 0 {
+		fail alert_fault(alertHandshakeFailure, "no key exchange group in common")
+	}
+	if !ch.uncompressed {
+		fail alert_fault(alertIllegalParameter, "the client accepts no uncompressed points")
+	}
+	mut alpn = ""
+	if len(ch.alpn) > 0 && len(cfg.ALPN) > 0 {
+		for _, p in cfg.ALPN {
+			if alpn == "" && in_str_list(ch.alpn, p) {
+				alpn = p
+			}
+		}
+		if alpn == "" {
+			fail alert_fault(120, "no application protocol in common")
+		}
+	}
+	let h = suite12_hash(suite)
+	// ServerHello, with the downgrade sentinel: this server speaks TLS 1.3.
+	let sr = seal.RandomBytes(32)
+	for i in 0..8 {
+		sr[24+i] = downgrade12[i]
+	}
+	mut sh = make([]u8, 0, 128)
+	sh = append(sh, 3, 3)
+	sh = append(sh, sr...)
+	sh = append(sh, 0)
+	put16(mut sh, suite)
+	sh = append(sh, 0)
+	let exts = open_len(mut sh, 2)
+	if ch.renego {
+		put16(mut sh, extRenegotiationInfo)
+		put16(mut sh, 1)
+		sh = append(sh, 0)
+	}
+	if ch.ems {
+		put16(mut sh, extExtendedMasterSecret)
+		put16(mut sh, 0)
+	}
+	if ch.pointFormats {
+		put16(mut sh, extECPointFormats)
+		put16(mut sh, 2)
+		sh = append(sh, 1, 0)
+	}
+	if alpn != "" {
+		put16(mut sh, extALPN)
+		put16(mut sh, 3+len(alpn))
+		put16(mut sh, 1+len(alpn))
+		sh = append(sh, u8(len(alpn)))
+		sh = append(sh, alpn...)
+	}
+	close_len(mut sh, exts, 2)
+	mut flight = handshake_msg(hsServerHello, sh)
+	flight = cat(flight, certificate12(chain))
+	// ServerKeyExchange: the ECDHE parameters, signed with the randoms.
+	let ephemeral = make_share12(group)
+	mut params = make([]u8, 0, 72)
+	params = append(params, 3)
+	put16(mut params, group)
+	params = append(params, u8(len(ephemeral.pub)))
+	params = append(params, ephemeral.pub...)
+	let sig = try key.SignTLS12(scheme, cat(cat(ch.random, sr), params))
+	mut ske = clone(params)
+	put16(mut ske, scheme)
+	put16(mut ske, len(sig))
+	ske = append(ske, sig...)
+	flight = cat(flight, handshake_msg(hsServerKeyExchange, ske))
+	let askCert = cfg.ClientAuth != NoClientCert
+	if askCert {
+		let crm = try certificate_request12(cfg)
+		flight = cat(flight, crm)
+	}
+	flight = cat(flight, handshake_msg(hsServerHelloDone, []u8{}))
+	mut transcript = cat(msg, flight)
+	try c.write_records(ctHandshake, flight)
+	// The client's Certificate (when asked), ClientKeyExchange and CertificateVerify.
+	mut typ = 0
+	mut m = []u8{}
+	mut certs = [][]u8{}
+	if askCert {
+		typ, m = try hr.next(mut c)
+		if typ != hsCertificate {
+			fail alert_fault(alertUnexpectedMessage, "expected the client's Certificate")
+		}
+		certs = try parse_certificate12(m[4:])
+		transcript = cat(transcript, m)
+		if len(certs) == 0 && cfg.ClientAuth == RequireClientCert {
+			// TLS 1.2 has no certificate_required alert (RFC 5246 7.4.6).
+			fail alert_fault(alertHandshakeFailure, "the client sent no certificate")
+		}
+	}
+	typ, m = try hr.next(mut c)
+	if typ != hsClientKeyExchange {
+		fail alert_fault(alertUnexpectedMessage, "expected ClientKeyExchange")
+	}
+	let ck = rdr{b: m[4:]}
+	let peer = ck.vec8()
+	if ck.bad || !ck.done() {
+		fail alert_fault(alertDecodeError, "malformed ClientKeyExchange")
+	}
+	let pms = try ephemeral.agree(peer)
+	transcript = cat(transcript, m)
+	let master = master12(h, pms, ch.ems, transcript, ch.random, sr)
+	if len(certs) > 0 {
+		typ, m = try hr.next(mut c)
+		if typ != hsCertificateVerify {
+			fail alert_fault(alertUnexpectedMessage, "expected the client's CertificateVerify")
+		}
+		let cv = rdr{b: m[4:]}
+		let cscheme = cv.u16v()
+		let csig = cv.vec16()
+		if cv.bad || !cv.done() {
+			fail alert_fault(alertDecodeError, "malformed client CertificateVerify")
+		}
+		try verify_client_chain(cfg, certs)
+		if !in_list(clientSchemes12, cscheme) {
+			fail alert_fault(alertIllegalParameter, "client CertificateVerify uses a scheme that was not offered")
+		}
+		let leaf = seal.ParseCertificate(certs[0]) catch err {
+			fail alert_fault(alertBadCertificate, say.Str(err))
+		}
+		leaf.CheckTLS12Signature(cscheme, transcript, csig) catch err {
+			fail alert_fault(alertDecryptError, "client CertificateVerify: " + say.Str(err))
+		}
+		transcript = cat(transcript, m)
+		c.certs = certs
+	}
+	keylog12(ch.random, master)
+	try c.keys12(suite, master, ch.random, sr, true)
+	// The client's ChangeCipherSpec and Finished, under the new read key.
+	typ, m = try hr.next(mut c)
+	if typ != hsFinished {
+		fail alert_fault(alertUnexpectedMessage, "expected the client's Finished")
+	}
+	let want = finished12(h, master, "client finished", transcript)
+	if !seal.ConstantTimeEq(want, m[4:]) {
+		fail alert_fault(alertDecryptError, "client Finished does not verify")
+	}
+	if !hr.empty() {
+		fail alert_fault(alertUnexpectedMessage, "handshake data after the client Finished")
+	}
+	transcript = cat(transcript, m)
+	// This side's ChangeCipherSpec (in the clear, before the write key) and Finished.
+	let fin = handshake_msg(hsFinished, finished12(h, master, "server finished", transcript))
+	let a = c.wr
+	c.wr = nil
+	mut out = make([]u8, 0, 64)
+	try c.seal_record(mut out, ctChangeCipherSpec, []u8{1})
+	c.wr = a
+	try c.seal_record(mut out, ctHandshake, fin)
+	try c.send(out)
+	c.alpn = alpn
+	c.group = group
+	c.ready = true
+}
+
+// share12 is an ECDHE key pair made for one TLS 1.2 handshake.
+type share12 struct {
+	group i64
+	priv  []u8
+	pub   []u8
+}
+
+fn make_share12(group i64) share12 {
+	if group == groupX25519 {
+		let priv = seal.X25519NewPrivateKey()
+		let pub = seal.X25519PublicKey(priv) catch _ { []u8{} }
+		return share12{group: group, priv: priv, pub: pub}
+	}
+	let priv = seal.P256NewPrivateKey()
+	let pub = seal.P256PublicKey(priv) catch _ { []u8{} }
+	return share12{group: group, priv: priv, pub: pub}
+}
+
+// agree is the pre-master secret with the peer's point.
+fn (s share12) agree(peer []u8) ![]u8 {
+	if s.group == groupX25519 {
+		if len(peer) != 32 {
+			fail alert_fault(alertIllegalParameter, "invalid X25519 key share")
+		}
+		return seal.X25519(s.priv, peer) catch _ {
+			fail alert_fault(alertIllegalParameter, "invalid X25519 key share")
+		}
+	}
+	if len(peer) != 65 || peer[0] != 4 {
+		fail alert_fault(alertIllegalParameter, "invalid P-256 key share")
+	}
+	return seal.P256ECDH(s.priv, peer) catch _ {
+		fail alert_fault(alertIllegalParameter, "invalid P-256 key share")
+	}
+}
+
+// clientSchemes12 are the CertificateVerify schemes a TLS 1.2 server accepts from a client.
+let clientSchemes12 = []i64{0x0403, 0x0503, 0x0603, 0x0804, 0x0805, 0x0806, 0x0807, 0x0401, 0x0501, 0x0601}
+
+// certificate_request12 is a TLS 1.2 CertificateRequest: certificate types, signature schemes,
+// and the subjects of ClientCAs.
+fn certificate_request12(cfg ServerConfig) ![]u8 {
+	let pool = try client_ca_pool(cfg.ClientCAs)
+	mut b = make([]u8, 0, 512)
+	b = append(b, 2, 1, 64) // rsa_sign, ecdsa_sign
+	put16(mut b, 2*len(clientSchemes12))
+	for _, s in clientSchemes12 {
+		put16(mut b, s)
+	}
+	let names = open_len(mut b, 2)
+	for _, c in pool.Certificates() {
+		put16(mut b, len(c.Subject.Raw))
+		b = append(b, c.Subject.Raw...)
+	}
+	close_len(mut b, names, 2)
+	return handshake_msg(hsCertificateRequest, b)
+}
+
+// ---- the client ----
+
+// client12 continues a client handshake whose ServerHello (sh, message shm) chose TLS 1.2.
+fn (c mut Conn) client12(cfg Config, name str, hi hello, chm []u8, shm []u8, sh serverHello, hr mut hsReader) ! {
+	if !in_list(suites12(), sh.suite) {
+		fail alert_fault(alertIllegalParameter, "ServerHello chose a cipher suite that was not offered")
+	}
+	let h = suite12_hash(sh.suite)
+	mut transcript = cat(chm, shm)
+	if sh.alpn != "" && !in_str_list(cfg.ALPN, sh.alpn) {
+		fail alert_fault(alertIllegalParameter, "the server chose an application protocol that was not offered")
+	}
+	mut typ = 0
+	mut m = []u8{}
+	typ, m = try hr.next(mut c)
+	if typ != hsCertificate {
+		fail alert_fault(alertUnexpectedMessage, "expected Certificate")
+	}
+	let certs = try parse_certificate12(m[4:])
+	if len(certs) == 0 {
+		fail alert_fault(alertDecodeError, "server sent no certificate")
+	}
+	transcript = cat(transcript, m)
+	typ, m = try hr.next(mut c)
+	if typ != hsServerKeyExchange {
+		fail alert_fault(alertUnexpectedMessage, "expected ServerKeyExchange")
+	}
+	let sk = rdr{b: m[4:]}
+	let curveType = sk.u8v()
+	let group = sk.u16v()
+	let point = sk.vec8()
+	let plen = 4 + len(point)
+	let scheme = sk.u16v()
+	let sig = sk.vec16()
+	if sk.bad || !sk.done() || curveType != 3 {
+		fail alert_fault(alertDecodeError, "malformed ServerKeyExchange")
+	}
+	if group != groupX25519 && group != groupP256 {
+		fail alert_fault(alertIllegalParameter, "ServerKeyExchange uses a group that was not offered")
+	}
+	if !in_list(sigSchemes, scheme) {
+		fail alert_fault(alertIllegalParameter, "ServerKeyExchange uses a scheme that was not offered")
+	}
+	try verify_peer12(cfg, name, certs, scheme, cat(cat(hi.random, sh.random), m[4:4+plen]), sig, sh.suite)
+	c.certs = certs
+	transcript = cat(transcript, m)
+	typ, m = try hr.next(mut c)
+	mut requested = false
+	mut reqSchemes = []i64{}
+	if typ == hsCertificateRequest {
+		let cr = rdr{b: m[4:]}
+		cr.vec8()
+		let sr = rdr{b: cr.vec16()}
+		for !sr.done() && !sr.bad {
+			reqSchemes = append(reqSchemes, sr.u16v())
+		}
+		cr.vec16()
+		if cr.bad || sr.bad || !cr.done() {
+			fail alert_fault(alertDecodeError, "malformed CertificateRequest")
+		}
+		requested = true
+		transcript = cat(transcript, m)
+		typ, m = try hr.next(mut c)
+	}
+	if typ != hsServerHelloDone || len(m) != 4 {
+		fail alert_fault(alertUnexpectedMessage, "expected ServerHelloDone")
+	}
+	if !hr.empty() {
+		fail alert_fault(alertUnexpectedMessage, "handshake data after ServerHelloDone")
+	}
+	transcript = cat(transcript, m)
+	// This side's flight: Certificate (when asked), ClientKeyExchange, CertificateVerify, then
+	// ChangeCipherSpec and Finished.
+	mut flight = []u8{}
+	mut signer = 0
+	mut cred = credential{chain: [][]u8{}, key: seal.PrivateKey{Algorithm: seal.PublicKeyAlgorithm.UnknownKey}}
+	if requested {
+		if cfg.Certificate != "" {
+			cred = try client_credential(cfg.Certificate, cfg.Key)
+			signer = pick_scheme12(cred.key, reqSchemes)
+		}
+		mut chain = [][]u8{}
+		if signer != 0 {
+			chain = cred.chain
+		}
+		let cm = certificate12(chain)
+		flight = cat(flight, cm)
+		transcript = cat(transcript, cm)
+	}
+	let share = make_share12(group)
+	let pms = try share.agree(point)
+	mut cke = make([]u8, 0, 72)
+	cke = append(cke, u8(len(share.pub)))
+	cke = append(cke, share.pub...)
+	let ckm = handshake_msg(hsClientKeyExchange, cke)
+	flight = cat(flight, ckm)
+	transcript = cat(transcript, ckm)
+	let master = master12(h, pms, sh.ems, transcript, hi.random, sh.random)
+	if signer != 0 {
+		let csig = try cred.key.SignTLS12(signer, transcript)
+		let cvm = certificate_verify_msg(signer, csig)
+		flight = cat(flight, cvm)
+		transcript = cat(transcript, cvm)
+	}
+	keylog12(hi.random, master)
+	let fin = handshake_msg(hsFinished, finished12(h, master, "client finished", transcript))
+	transcript = cat(transcript, fin)
+	let out = make([]u8, 0, len(flight)+128)
+	try c.seal_record(mut out, ctHandshake, flight)
+	try c.seal_record(mut out, ctChangeCipherSpec, []u8{1})
+	try c.keys12(sh.suite, master, hi.random, sh.random, false)
+	try c.seal_record(mut out, ctHandshake, fin)
+	try c.send(out)
+	// The server's ChangeCipherSpec and Finished.
+	typ, m = try hr.next(mut c)
+	if typ != hsFinished {
+		fail alert_fault(alertUnexpectedMessage, "expected the server's Finished")
+	}
+	let want = finished12(h, master, "server finished", transcript)
+	if !seal.ConstantTimeEq(want, m[4:]) {
+		fail alert_fault(alertDecryptError, "server Finished does not verify")
+	}
+	if !hr.empty() {
+		fail alert_fault(alertUnexpectedMessage, "handshake data after the server Finished")
+	}
+	c.alpn = sh.alpn
+	c.group = group
+	c.ready = true
+}
+
+// verify_peer12 checks the server's chain for name and its ServerKeyExchange signature (scheme,
+// sig over signed), whose key must suit the suite; only InsecureSkipVerify skips the chain.
+fn verify_peer12(cfg Config, name str, certs [][]u8, scheme i64, signed []u8, sig []u8, suite i64) ! {
+	let leaf = seal.ParseCertificate(certs[0]) catch err {
+		fail alert_fault(alertBadCertificate, say.Str(err))
+	}
+	let rsa = leaf.PublicKeyAlgorithm == seal.PublicKeyAlgorithm.RSA
+	if rsa != suite12_rsa(suite) {
+		fail alert_fault(alertIllegalParameter, "the server's key does not suit the cipher suite")
+	}
+	if !cfg.InsecureSkipVerify {
+		try verify_chain(cfg, name, certs)
+	}
+	leaf.CheckTLS12Signature(scheme, signed, sig) catch err {
+		fail alert_fault(alertDecryptError, say.Str(err))
+	}
+}

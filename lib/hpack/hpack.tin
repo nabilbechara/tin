@@ -1,0 +1,372 @@
+// Package hpack is HPACK (RFC 7541), HTTP/2's header compression, for HTTP/2 clients (wire,
+// #480): a Decoder that keeps one connection's dynamic table and decodes Huffman-coded strings,
+// and Encode, which writes a header list with static-table names and plain literals that are
+// never indexed, so it keeps no state and adds nothing to the peer's table. anvil's server has
+// its own decoder, which hands fields over without copying them.
+//
+//	mut block = make([]u8, 0, 64)
+//	hpack.Encode(mut block, []hpack.Field{hpack.Field{Name: ":status", Value: "200"}})
+//	let d = hpack.NewDecoder(4096, 65536)
+//	let fields = try d.Decode(block)
+package hpack
+
+// Field is one header field.
+type Field struct {
+	Name  str
+	Value str
+}
+
+// The static table (RFC 7541 Appendix A): one "name|value" line per entry, entries 1 to 61.
+const staticText = ":authority|\n:method|GET\n:method|POST\n:path|/\n:path|/index.html\n:scheme|http\n:scheme|https\n:status|200\n:status|204\n:status|206\n:status|304\n:status|400\n:status|404\n:status|500\naccept-charset|\naccept-encoding|gzip, deflate\naccept-language|\naccept-ranges|\naccept|\naccess-control-allow-origin|\nage|\nallow|\nauthorization|\ncache-control|\ncontent-disposition|\ncontent-encoding|\ncontent-language|\ncontent-length|\ncontent-location|\ncontent-range|\ncontent-type|\ncookie|\ndate|\netag|\nexpect|\nexpires|\nfrom|\nhost|\nif-match|\nif-modified-since|\nif-none-match|\nif-range|\nif-unmodified-since|\nlast-modified|\nlink|\nlocation|\nmax-forwards|\nproxy-authenticate|\nproxy-authorization|\nrange|\nreferer|\nrefresh|\nretry-after|\nserver|\nset-cookie|\nstrict-transport-security|\ntransfer-encoding|\nuser-agent|\nvary|\nvia|\nwww-authenticate|\n"
+
+// The Huffman code's lengths for symbols 0 to 256 (EOS), two digits each (RFC 7541 Appendix B).
+// The code is canonical: the codes of one length are consecutive, in symbol order, and follow the
+// shorter ones, so the lengths alone rebuild it.
+const huffLens = "1323282828282828282430282830282828282828282830282828282828282828061010121306081110100811080606060505050606060606060607081506121013060707070707070707070707070707070707070707070708070813191314061505060506050606060507070606060506070605050607070707071511141328202220202222222322232323232324232424222324232323232122232223232422212022222323212322222421222323212122212322232320222222232222232626201922232225262626272726242519212627272627242121262628272727202420212221212322222525242426232627262627272727272827272727272630"
+
+// The static table and the Huffman tables, built on first use on each core.
+let statics = build_static()
+let huff = build_huff()
+
+fn build_static() []Field {
+	mut out = make([]Field, 0, 62)
+	out = append(out, Field{Name: "", Value: ""})
+	mut a = 0
+	for a < len(staticText) {
+		mut bar = a
+		for staticText[bar] != '|' {
+			bar += 1
+		}
+		mut nl = bar
+		for staticText[nl] != '\n' {
+			nl += 1
+		}
+		out = append(out, Field{Name: staticText[a:bar], Value: staticText[bar+1 : nl]})
+		a = nl + 1
+	}
+	return out
+}
+
+// huffTables holds the canonical code: per length, its first code, its symbols' count and their
+// offset in syms (the symbols by code length, then value).
+type huffTables struct {
+	first []i64
+	count []i64
+	off   []i64
+	syms  []i64
+}
+
+fn code_len(s i64) i64 {
+	return i64(huffLens[2*s]-'0')*10 + i64(huffLens[2*s+1]-'0')
+}
+
+fn build_huff() huffTables {
+	mut t = huffTables{first: make([]i64, 32), count: make([]i64, 32), off: make([]i64, 32), syms: make([]i64, 257)}
+	for s in 0..257 {
+		t.count[code_len(s)] += 1
+	}
+	mut code = 0
+	mut off = 0
+	for l in 1..31 {
+		t.first[l] = code
+		t.off[l] = off
+		off += t.count[l]
+		code = (code + t.count[l]) << 1
+	}
+	mut fill = make([]i64, 32)
+	for s in 0..257 {
+		let l = code_len(s)
+		t.syms[t.off[l]+fill[l]] = s
+		fill[l] += 1
+	}
+	return t
+}
+
+// huff_decode decodes Huffman-coded bytes (RFC 7541 5.2): the padding must be at most 7 bits of
+// ones, and EOS must not appear.
+fn huff_decode(b []u8) !str {
+	mut out = make([]u8, 0, len(b)*8/5+1)
+	mut code = 0
+	mut l = 0
+	mut ones = true
+	for _, byte in b {
+		for k in 0..8 {
+			let bit = i64((byte >> u8(7-k)) & 1)
+			code = code<<1 | bit
+			l += 1
+			ones = ones && bit == 1
+			if l > 30 {
+				fail "hpack: invalid Huffman code"
+			}
+			let i = code - huff.first[l]
+			if i >= 0 && i < huff.count[l] {
+				let s = huff.syms[huff.off[l]+i]
+				if s == 256 {
+					fail "hpack: EOS in a Huffman-coded string"
+				}
+				out = append(out, u8(s))
+				code = 0
+				l = 0
+				ones = true
+			}
+		}
+	}
+	if l > 7 || !ones {
+		fail "hpack: invalid Huffman padding"
+	}
+	return str(out)
+}
+
+// Decoder decodes the header blocks one peer sends on a connection, in order: its dynamic table
+// carries from block to block. The table is in malloc'd memory, so a decoder kept with a
+// connection outlives the requests that used it; Free releases it.
+type Decoder struct {
+	h i64
+}
+
+// The decoder's record, in words.
+const dRing = 0    // maxEntries x [bytes (name then value, malloc'd), name length, value length]
+const dHead = 1    // where the next entry goes
+const dCount = 2
+const dSize = 3    // the table's size (RFC 7541 4.1: 32 + name + value per entry)
+const dMax = 4     // the size the peer set by its last update
+const dSetting = 5 // SETTINGS_HEADER_TABLE_SIZE this side announced: the most the peer may set
+const dListMax = 6 // the largest header list accepted (names + values + 32 per field)
+const dWords = 7
+
+const maxEntries = 256 // a 4096-byte table holds at most 128 entries of 32 bytes
+
+// NewDecoder is a decoder for a peer allowed a table of tableSize bytes (4096 unless the
+// connection's settings say otherwise, at most 8192) whose header lists stay within listMax bytes.
+fn NewDecoder(tableSize i64, listMax i64) Decoder {
+	let h = calloc(dWords, 8)
+	h[dRing] = calloc(maxEntries*3, 8)
+	h[dMax] = min(tableSize, 8192)
+	h[dSetting] = min(tableSize, 8192)
+	h[dListMax] = listMax
+	return Decoder{h: h}
+}
+
+// Free releases the decoder's table; the decoder must not be used again.
+fn (d Decoder) Free() {
+	let h = d.h
+	if h == 0 {
+		return
+	}
+	for h[dCount] > 0 {
+		evict_one(h)
+	}
+	free(h[dRing])
+	free(h)
+}
+
+// reader walks one header block.
+type reader struct {
+	b   []u8
+	pos i64
+}
+
+// int reads an integer with a prefix of the bits of mask (RFC 7541 5.1).
+fn (r mut reader) int(mask i64) !i64 {
+	if r.pos >= len(r.b) {
+		fail "hpack: header block cut short"
+	}
+	mut v = i64(r.b[r.pos]) & mask
+	r.pos += 1
+	if v < mask {
+		return v
+	}
+	mut m = 0
+	for r.pos < len(r.b) {
+		let x = i64(r.b[r.pos])
+		r.pos += 1
+		v += (x & 127) << m
+		if v > 0x7fffffff {
+			fail "hpack: integer too large"
+		}
+		if x < 128 {
+			return v
+		}
+		m += 7
+	}
+	fail "hpack: header block cut short"
+}
+
+// string reads a string literal (RFC 7541 5.2).
+fn (r mut reader) string() !str {
+	if r.pos >= len(r.b) {
+		fail "hpack: header block cut short"
+	}
+	let h = r.b[r.pos] >= 128
+	let n = try r.int(127)
+	if r.pos+n > len(r.b) {
+		fail "hpack: header block cut short"
+	}
+	let raw = r.b[r.pos : r.pos+n]
+	r.pos += n
+	if h {
+		return try huff_decode(raw)
+	}
+	return str(raw)
+}
+
+// entry is entry i of the static table (1 to 61) or of the dynamic one (62 the newest).
+fn (d Decoder) entry(i i64) !Field {
+	if i >= 1 && i <= 61 {
+		return statics[i]
+	}
+	let h = d.h
+	let k = i - 62
+	if i < 1 || k >= h[dCount] {
+		fail "hpack: index out of the tables"
+	}
+	let e = h[dRing] + ((h[dHead]-1-k)&(maxEntries-1))*24
+	return Field{Name: rt_str_from_raw(e[0], e[1]), Value: rt_str_from_raw(e[0]+e[1], e[2])}
+}
+
+// insert adds a field at the front of the dynamic table, evicting the oldest to make room.
+fn (d Decoder) insert(f Field) {
+	let h = d.h
+	let n = len(f.Name) + len(f.Value) + 32
+	if n > h[dMax] {
+		for h[dCount] > 0 {
+			evict_one(h)
+		}
+		return
+	}
+	for h[dCount] > 0 && (h[dSize]+n > h[dMax] || h[dCount] == maxEntries) {
+		evict_one(h)
+	}
+	let b = malloc(len(f.Name) + len(f.Value) + 1)
+	memcpy(b, cast(i64, f.Name)+8, len(f.Name))
+	memcpy(b+len(f.Name), cast(i64, f.Value)+8, len(f.Value))
+	let e = h[dRing] + (h[dHead]&(maxEntries-1))*24
+	e[0] = b
+	e[1] = len(f.Name)
+	e[2] = len(f.Value)
+	h[dHead] += 1
+	h[dCount] += 1
+	h[dSize] += n
+}
+
+// evict_one drops the oldest entry of the table h.
+fn evict_one(h i64) {
+	let e = h[dRing] + ((h[dHead]-h[dCount])&(maxEntries-1))*24
+	h[dSize] -= e[1] + e[2] + 32
+	free(e[0])
+	e[0] = 0
+	h[dCount] -= 1
+}
+
+// Decode decodes one header block (the fragments of a HEADERS frame and its CONTINUATIONs,
+// joined). An error is a COMPRESSION_ERROR: the connection must end, since the table is no longer
+// the peer's.
+fn (d Decoder) Decode(block []u8) ![]Field {
+	let h = d.h
+	mut r = reader{b: block, pos: 0}
+	mut out = make([]Field, 0, 16)
+	mut total = 0
+	for r.pos < len(block) {
+		let b = block[r.pos]
+		mut f = Field{Name: "", Value: ""}
+		if b >= 128 {
+			// An indexed field (6.1).
+			let i = try r.int(127)
+			f = try d.entry(i)
+		} else if b >= 64 || b < 32 {
+			// A literal (6.2): with incremental indexing (01), without (0000) or never (0001).
+			let index = b >= 64
+			mut mask = 15
+			if index {
+				mask = 63
+			}
+			let i = try r.int(mask)
+			if i == 0 {
+				f.Name = try r.string()
+			} else {
+				let named = try d.entry(i)
+				f.Name = named.Name
+			}
+			f.Value = try r.string()
+			if index {
+				d.insert(f)
+			}
+		} else {
+			// A dynamic table size update (6.3): before the first field, within the setting.
+			if len(out) > 0 {
+				fail "hpack: a table size update after a field"
+			}
+			let v = try r.int(31)
+			if v > h[dSetting] {
+				fail "hpack: a table size update past the setting"
+			}
+			h[dMax] = v
+			for h[dSize] > v {
+				evict_one(h)
+			}
+			continue
+		}
+		total += len(f.Name) + len(f.Value) + 32
+		if total > h[dListMax] {
+			fail "hpack: header list too large"
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
+// put_int appends an integer with a prefix of the bits of mask, first's bits above them.
+fn put_int(b mut []u8, first i64, mask i64, v i64) {
+	if v < mask {
+		b = append(b, u8(first|v))
+		return
+	}
+	b = append(b, u8(first|mask))
+	mut x = v - mask
+	for x >= 128 {
+		b = append(b, u8((x&127)|128))
+		x = x >> 7
+	}
+	b = append(b, u8(x))
+}
+
+fn put_str(b mut []u8, s str) {
+	put_int(mut b, 0, 127, len(s))
+	b = append(b, s...)
+}
+
+// static_name is the first static entry named name, 0 for none.
+fn static_name(name str) i64 {
+	for i in 1..62 {
+		if statics[i].Name == name {
+			return i
+		}
+	}
+	return 0
+}
+
+// Encode appends the header block of fields to b: a static entry where one matches name and
+// value exactly, else a literal without indexing (with a static name where there is one). Names
+// must be lowercase, as HTTP/2 requires.
+fn Encode(b mut []u8, fields []Field) {
+	for _, f in fields {
+		mut exact = 0
+		for i in 1..62 {
+			if exact == 0 && statics[i].Name == f.Name && statics[i].Value == f.Value && len(f.Value) > 0 {
+				exact = i
+			}
+		}
+		if exact > 0 {
+			put_int(mut b, 128, 127, exact)
+			continue
+		}
+		let n = static_name(f.Name)
+		if n > 0 {
+			put_int(mut b, 0, 15, n)
+		} else {
+			b = append(b, 0)
+			put_str(mut b, f.Name)
+		}
+		put_str(mut b, f.Value)
+	}
+}

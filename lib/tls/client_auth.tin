@@ -217,6 +217,20 @@ fn certificate_request_msg(cfg ServerConfig) ![]u8 {
 // CertificateVerify (scheme, sig) over signed. The alert says why: unknown_ca, certificate_expired,
 // bad_certificate, or decrypt_error for the signature.
 fn verify_client(cfg ServerConfig, certs [][]u8, scheme i64, signed []u8, sig []u8) ! {
+	try verify_client_chain(cfg, certs)
+	let leaf = seal.ParseCertificate(certs[0]) catch err {
+		fail alert_fault(alertBadCertificate, say.Str(err))
+	}
+	if !in_list(clientSchemes, scheme) {
+		fail alert_fault(alertIllegalParameter, "client CertificateVerify uses a scheme that was not offered")
+	}
+	leaf.CheckTLSSignature(scheme, signed, sig) catch err {
+		fail alert_fault(alertDecryptError, "client CertificateVerify: " + say.Str(err))
+	}
+}
+
+// verify_client_chain checks the client's chain against ClientCAs for client authentication.
+fn verify_client_chain(cfg ServerConfig, certs [][]u8) ! {
 	let leaf = seal.ParseCertificate(certs[0]) catch err {
 		fail alert_fault(alertBadCertificate, say.Str(err))
 	}
@@ -238,12 +252,6 @@ fn verify_client(cfg ServerConfig, certs [][]u8, scheme i64, signed []u8, sig []
 			desc = alertCertificateExpired
 		}
 		fail alert_fault(desc, "client certificate: " + text)
-	}
-	if !in_list(clientSchemes, scheme) {
-		fail alert_fault(alertIllegalParameter, "client CertificateVerify uses a scheme that was not offered")
-	}
-	leaf.CheckTLSSignature(scheme, signed, sig) catch err {
-		fail alert_fault(alertDecryptError, "client CertificateVerify: " + say.Str(err))
 	}
 }
 

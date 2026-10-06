@@ -158,21 +158,101 @@ def openssl_matrix(exe, openssl, certs):
     finally:
         proc.kill()
         proc.wait()
+    print('PASS ALPN chosen and absent')
+
+
+# The TLS 1.2 suites (#473) by the key type of the server's certificate: OpenSSL's name and the
+# tls_client fixture's.
+SUITES12 = {
+    'ecdsa': [('ECDHE-ECDSA-AES128-GCM-SHA256', 'TLS12_ECDHE_ECDSA_AES_128_GCM'),
+              ('ECDHE-ECDSA-AES256-GCM-SHA384', 'TLS12_ECDHE_ECDSA_AES_256_GCM'),
+              ('ECDHE-ECDSA-CHACHA20-POLY1305', 'TLS12_ECDHE_ECDSA_CHACHA20')],
+    'rsa': [('ECDHE-RSA-AES128-GCM-SHA256', 'TLS12_ECDHE_RSA_AES_128_GCM'),
+            ('ECDHE-RSA-AES256-GCM-SHA384', 'TLS12_ECDHE_RSA_AES_256_GCM'),
+            ('ECDHE-RSA-CHACHA20-POLY1305', 'TLS12_ECDHE_RSA_CHACHA20')],
+    'ed25519': [('ECDHE-ECDSA-AES128-GCM-SHA256', 'TLS12_ECDHE_ECDSA_AES_128_GCM')],
+}
+
+
+def s_server12(openssl, cert, *args):
+    """openssl s_server -tls1_2 -www on a free port: (port, process)."""
     port = free_port()
-    proc = subprocess.Popen([openssl, 's_server', '-tls1_2', '-accept', str(port), '-cert', str(certs['ecdsa'][0]), '-key', str(certs['ecdsa'][1]),
-                             '-www', '-quiet'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    proc = subprocess.Popen([openssl, 's_server', '-tls1_2', '-accept', str(port), '-cert', str(cert[0]), '-key', str(cert[1]),
+                             '-www', '-quiet', *map(str, args)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     try:
         wait_port(port, proc)
-        out = run(exe, 'get', f'127.0.0.1:{port}')
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+    return port, proc
+
+
+def tls12_client(exe, openssl, certs, work):
+    """The client against TLS 1.2-only servers (#473): every suite on each certificate type with
+    X25519 and P-256, verified against RootCAs; ALPN; SSLKEYLOGFILE's CLIENT_RANDOM line; a
+    Python server; MinVersion 1.3 refuses."""
+    count = 0
+    for kind, cert in certs.items():
+        for cipher, name in SUITES12[kind]:
+            for group in GROUPS:
+                port, proc = s_server12(openssl, cert, '-cipher', cipher, '-groups', group)
+                try:
+                    out = run(exe, 'get', f'127.0.0.1:{port}')
+                    assert out == f'ok {name} {group} alpn= 1 true\n', (kind, cipher, group, out)
+                    out = run(exe, 'resume', f'127.0.0.1:{port}', 1, cert[0])
+                    assert out == f'resumed false {name} {group} 1 true\n', (kind, cipher, group, out)
+                finally:
+                    proc.kill()
+                    proc.wait()
+                count += 1
+    mine, theirs = work / 'keylog12-client.txt', work / 'keylog12-s_server.txt'
+    port, proc = s_server12(openssl, certs['ecdsa'], '-alpn', 'http/1.1', '-keylogfile', theirs)
+    try:
+        out = run(exe, 'get', f'127.0.0.1:{port}', 'http/1.1', env={'SSLKEYLOGFILE': str(mine)})
+        assert out.startswith('ok TLS12_') and ' alpn=http/1.1 ' in out, out
+        out = run(exe, 'get', f'127.0.0.1:{port}', env={'TLS_MIN13': '1'})
         assert out.startswith('fault tls: ') and 'protocol version' in out, out
     finally:
         proc.kill()
         proc.wait()
-    print('PASS ALPN chosen and absent; a TLS 1.2-only server is refused')
+    a, b = keylog_lines(mine), keylog_lines(theirs)
+    assert len(a) == 1 and a[0].startswith('CLIENT_RANDOM ') and a == b, (a, b)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.maximum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(str(certs['rsa'][0]), str(certs['rsa'][1]))
+    srv = socket.socket()
+    srv.bind(('127.0.0.1', 0))
+    srv.listen(4)
+
+    def serve():
+        c, _ = srv.accept()
+        try:
+            conn = ctx.wrap_socket(c, server_side=True)
+            conn.recv(4096)
+            conn.sendall(b'HTTP/1.0 200 OK\r\n\r\n' + conn.version().encode())
+            conn.unwrap().close()
+        except (OSError, ssl.SSLError):
+            c.close()
+    thread = serve_in_thread(serve)
+    out = run(exe, 'get', f'127.0.0.1:{srv.getsockname()[1]}')
+    thread.join(timeout=5)
+    srv.close()
+    assert out.startswith('ok TLS12_ECDHE_RSA_') and out.endswith(' 1 true\n'), out
+    print(f'PASS TLS 1.2: {count} openssl s_server -tls1_2 runs (every ECDHE suite on ECDSA, RSA and Ed25519 certificates, '
+          'X25519 and P-256, verified against RootCAs), ALPN, SSLKEYLOGFILE, a Python server; MinVersion 1.3 refuses')
+
+
+def openssl_pq(openssl):
+    """Whether this OpenSSL has the X25519MLKEM768 group (3.5 and later): its s_server and
+    s_client then offer it by default."""
+    r = subprocess.run([openssl, 'list', '-kem-algorithms'], capture_output=True, text=True)
+    return 'X25519MLKEM768' in r.stdout
 
 
 def verified(exe, openssl, certs):
     """Verification on (the default) with the server's certificate in RootCAs: each key type."""
+    group = 'X25519MLKEM768' if openssl_pq(openssl) else 'X25519'
     for kind, cert in certs.items():
         port = free_port()
         proc = subprocess.Popen([openssl, 's_server', '-tls1_3', '-accept', str(port), '-cert', str(cert[0]), '-key', str(cert[1]),
@@ -184,7 +264,7 @@ def verified(exe, openssl, certs):
         finally:
             proc.kill()
             proc.wait()
-        assert out == 'resumed false TLS_AES_128_GCM_SHA256 X25519 1 true\n', (kind, out)
+        assert out == f'resumed false TLS_AES_128_GCM_SHA256 {group} 1 true\n', (kind, out)
     print(f'PASS verification against RootCAs: certificates {", ".join(certs)} (chain, name, CertificateVerify)')
 
 
@@ -269,16 +349,68 @@ def client_certificate(exe, openssl, certs, work):
     finally:
         proc.kill()
         proc.wait()
+    # The same over TLS 1.2 (#473): CertificateRequest, Certificate and CertificateVerify.
+    port, proc = s_server12(openssl, cert, '-Verify', 1, '-CAfile', pki / 'ca.pem', '-verify_return_error')
+    try:
+        for name in ('alice', 'rsa', 'dave'):
+            out = run(exe, 'mtls', f'127.0.0.1:{port}', 1, cert[0], pki / f'{name}.pem', pki / f'{name}.key')
+            assert out.startswith('mtls false <HTML>') and 'TLSv1.2' in out, (name, out[:500])
+        # TLS 1.2 has no certificate_required: OpenSSL refuses with handshake_failure.
+        out = run(exe, 'mtls', f'127.0.0.1:{port}', 1, cert[0])
+        assert out.startswith('fault tls: remote error: handshake failure'), out
+    finally:
+        proc.kill()
+        proc.wait()
     print('PASS client certificates: openssl s_server -Verify accepts the Tin client\'s ECDSA, RSA and Ed25519 certificates '
-          'and refuses a client without one')
+          'over TLS 1.3 and 1.2, and refuses a client without one')
 
 
 KEYLOG_LABELS = ('CLIENT_HANDSHAKE_TRAFFIC_SECRET', 'SERVER_HANDSHAKE_TRAFFIC_SECRET', 'CLIENT_TRAFFIC_SECRET_0',
-                 'SERVER_TRAFFIC_SECRET_0')
+                 'SERVER_TRAFFIC_SECRET_0', 'CLIENT_RANDOM')
+
+
+def post_quantum(exe, openssl, certs, work):
+    """X25519MLKEM768 (#479) against Go's crypto/tls (tools/ci/fixtures/tls_pq.go): offered first,
+    taken by a server that prefers it or knows only it; a server without it gets X25519, or
+    P-256 by HelloRetryRequest. And against OpenSSL 3.5's, where the runner has it."""
+    go = shutil.which('go')
+    if not go:
+        print('SKIP post-quantum key exchange against Go: no go command')
+        return
+    gopq = work / 'tls_pq'
+    subprocess.run([go, 'build', '-o', str(gopq), 'tools/ci/fixtures/tls_pq.go'], cwd=ROOT, check=True, timeout=300)
+    cert = certs['ecdsa']
+    for prefs, want in (('X25519MLKEM768,X25519', 'X25519MLKEM768'), ('X25519MLKEM768', 'X25519MLKEM768'),
+                        ('X25519', 'X25519'), ('P-256', 'P-256')):
+        port = free_port()
+        proc = subprocess.Popen([str(gopq), 'server', str(port), str(cert[0]), str(cert[1]), prefs],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            wait_port(port, proc)
+            out = run(exe, 'resume', f'127.0.0.1:{port}', 1, cert[0])
+            assert out.startswith('resumed false TLS_') and f' {want} 1 true' in out, (prefs, out)
+        finally:
+            proc.kill()
+            proc.wait()
+    tried = 'Go'
+    if openssl_pq(openssl):
+        port = free_port()
+        proc = subprocess.Popen([openssl, 's_server', '-tls1_3', '-accept', str(port), '-cert', str(cert[0]), '-key', str(cert[1]),
+                                 '-www', '-quiet', '-groups', 'X25519MLKEM768'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        try:
+            wait_port(port, proc)
+            out = run(exe, 'get', f'127.0.0.1:{port}')
+            assert out.startswith('ok ') and ' X25519MLKEM768 ' in out, out
+        finally:
+            proc.kill()
+            proc.wait()
+        tried = 'Go and OpenSSL'
+    print(f'PASS X25519MLKEM768 against {tried}: chosen when the server has it, X25519 or P-256 (HelloRetryRequest) when it does not')
 
 
 def keylog_lines(path):
-    """The TLS 1.3 traffic-secret lines of an NSS key log, sorted (OpenSSL also writes EXPORTER_SECRET)."""
+    """The traffic-secret lines of an NSS key log (TLS 1.3) and its CLIENT_RANDOM lines (TLS 1.2),
+    sorted (OpenSSL also writes EXPORTER_SECRET)."""
     return sorted(l for l in path.read_text().splitlines() if l.split(' ', 1)[0] in KEYLOG_LABELS)
 
 
@@ -596,6 +728,8 @@ def main():
         if openssl:
             openssl_matrix(exe, openssl, certs)
             verified(exe, openssl, certs)
+            post_quantum(exe, openssl, certs, work)
+            tls12_client(exe, openssl, certs, work)
             resumption(exe, openssl, certs, work)
             keylog(exe, openssl, certs, work)
             client_certificate(exe, openssl, certs, work)

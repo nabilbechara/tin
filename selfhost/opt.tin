@@ -100,7 +100,7 @@ fn an_expr(e i64) {
 		an_use(cast(Sym, cast(IdentExpr, e).ref))
 	} else if k == EX_UNARY {
 		let x = cast(IdentExpr, cast(Unary, e).x)
-		if streq(cast(Unary, e).op, cstr("&")) != 0 && cast(Sym, x.ref).kind == SYM_LOCAL {
+		if cast(Unary, e).op == "&" && cast(Sym, x.ref).kind == SYM_LOCAL {
 			cast(Sym, x.ref).addr = 1
 		}
 		an_expr(cast(i64, x))
@@ -356,11 +356,11 @@ fn ve_while(w WhileStmt, prev i64) {
 	let mark = len(vr_syms)
 	let c = w.cond
 	let post = w.post
-	if w.once_ == 0 && prev != 0 && cast(Node, prev).kind == ST_LET && post != 0 && cast(Node, post).kind == ST_ASSIGN && cast(Node, c).kind == EX_BINARY && streq(cast(Binary, c).op, cstr("<")) != 0 {
+	if w.once_ == 0 && prev != 0 && cast(Node, prev).kind == ST_LET && post != 0 && cast(Node, post).kind == ST_ASSIGN && cast(Node, c).kind == EX_BINARY && cast(Binary, c).op == "<" {
 		let s = ve_local(cast(Binary, c).l)
 		let pv = cast(AssignStmt, post).value
 		let pt = cast(AssignStmt, post).target
-		if s != 0 && s == cast(LetStmt, prev).sym && cast(Sym, s).defs == 2 && cast(Node, pt).kind == EX_IDENT && cast(IdentExpr, pt).ref == s && cast(Node, pv).kind == EX_BINARY && streq(cast(Binary, pv).op, cstr("+")) != 0 && cast(Node, cast(Binary, pv).l).kind == EX_IDENT && cast(IdentExpr, cast(Binary, pv).l).ref == s && is_const(cast(Binary, pv).r) != 0 && const_val(cast(Binary, pv).r) > 0 && (const_val(cast(Binary, pv).r) == 1 || cast(Binary, pv).ovf == OVF_CHECK) {
+		if s != 0 && s == cast(LetStmt, prev).sym && cast(Sym, s).defs == 2 && cast(Node, pt).kind == EX_IDENT && cast(IdentExpr, pt).ref == s && cast(Node, pv).kind == EX_BINARY && cast(Binary, pv).op == "+" && cast(Node, cast(Binary, pv).l).kind == EX_IDENT && cast(IdentExpr, cast(Binary, pv).l).ref == s && is_const(cast(Binary, pv).r) != 0 && const_val(cast(Binary, pv).r) > 0 && (const_val(cast(Binary, pv).r) == 1 || cast(Binary, pv).ovf == OVF_CHECK) {
 			// A step of 1 below b cannot wrap; a larger one is checked, so i never wraps negative.
 			mut lo = -9223372036854775807 - 1
 			if vrange(cast(LetStmt, prev).init) != 0 {
@@ -435,10 +435,10 @@ fn ve_fits(e Binary) i64 {
 	}
 	let rlo = vr_lo
 	let rhi = vr_hi
-	if streq(op, cstr("<<")) != 0 || streq(op, cstr(">>")) != 0 {
+	if op == "<<" || op == ">>" {
 		return i64(rlo >= 0 && rhi < 8 * int_width(t))
 	}
-	if streq(op, cstr("/")) != 0 {
+	if op == "/" {
 		return i64(rhi < -1 || rlo > -1 || llo > type_min(t))
 	}
 	if vr_arith(op, llo, lhi, rlo, rhi) == 0 {
@@ -449,11 +449,11 @@ fn ve_fits(e Binary) i64 {
 
 // vr_arith sets vr_lo..vr_hi to the range of l op r (+ - *) and returns 1, or returns 0 when a
 // bound leaves i64.
-fn vr_arith(op i64, llo i64, lhi i64, rlo i64, rhi i64) i64 {
-	if streq(op, cstr("+")) != 0 {
+fn vr_arith(op str, llo i64, lhi i64, rlo i64, rhi i64) i64 {
+	if op == "+" {
 		return vr_set2(vr_exact(op, llo, rlo), vr_exact(op, lhi, rhi))
 	}
-	if streq(op, cstr("-")) != 0 {
+	if op == "-" {
 		return vr_set2(vr_exact(op, llo, rhi), vr_exact(op, lhi, rlo))
 	}
 	let a = vr_exact(op, llo, rlo)
@@ -472,7 +472,7 @@ fn vr_arith(op i64, llo i64, lhi i64, rlo i64, rhi i64) i64 {
 shared mut vr_bad i64 // a vr_exact since the last vr_set2 or vr_arith left i64
 
 // vr_exact is a op b when it fits i64, else it sets vr_bad.
-fn vr_exact(op i64, a i64, b i64) i64 {
+fn vr_exact(op str, a i64, b i64) i64 {
 	let v = const_exact(op, a, 0, b, 0)
 	if cx_ovf != 0 || cx_big != 0 {
 		vr_bad = 1
@@ -626,15 +626,15 @@ fn vrange_of(e i64) i64 {
 			vr_bad = 0
 			return vr_type(t)
 		}
-		if (streq(op, cstr("/")) != 0 || streq(op, cstr(">>")) != 0) && is_const(cast(Binary, e).r) != 0 {
+		if (op == "/" || op == ">>") && is_const(cast(Binary, e).r) != 0 {
 			let c = const_val(cast(Binary, e).r)
 			if vrange_of(cast(Binary, e).l) != 0 && (vr_lo >= 0 || t.signed != 0) {
-				if streq(op, cstr("/")) != 0 && c > 0 {
+				if op == "/" && c > 0 {
 					vr_lo = vr_lo / c
 					vr_hi = vr_hi / c
 					return 1
 				}
-				if streq(op, cstr(">>")) != 0 && c >= 0 && c < 64 {
+				if op == ">>" && c >= 0 && c < 64 {
 					vr_lo = vr_lo >> c
 					vr_hi = vr_hi >> c
 					return 1
@@ -642,7 +642,7 @@ fn vrange_of(e i64) i64 {
 			}
 			return vr_type(t)
 		}
-		if streq(op, cstr("%")) != 0 && is_const(cast(Binary, e).r) != 0 && const_val(cast(Binary, e).r) > 0 {
+		if op == "%" && is_const(cast(Binary, e).r) != 0 && const_val(cast(Binary, e).r) > 0 {
 			let m = const_val(cast(Binary, e).r) - 1
 			if vrange_of(cast(Binary, e).l) != 0 && vr_lo >= 0 {
 				vr_lo = 0
@@ -658,7 +658,7 @@ fn vrange_of(e i64) i64 {
 			vr_hi = m
 			return 1
 		}
-		if streq(op, cstr("&")) != 0 {
+		if op == "&" {
 			if vrange_of(cast(Binary, e).r) != 0 && vr_lo >= 0 {
 				vr_lo = 0
 				return 1
@@ -799,7 +799,7 @@ fn prefetch_loop(w i64) {
 		if cast(Node, s).kind == ST_ASSIGN && is_reg_local(cast(AssignStmt, s).target) != 0 {
 			let v = cast(AssignStmt, s).value
 			let t = cast(IdentExpr, cast(AssignStmt, s).target).ref
-			if cast(Node, v).kind == EX_BINARY && streq(cast(Binary, v).op, cstr("+")) != 0 && cast(Node, cast(Binary, v).l).kind == EX_IDENT && cast(IdentExpr, cast(Binary, v).l).ref == t && invariant(cast(Binary, v).r) != 0 {
+			if cast(Node, v).kind == EX_BINARY && cast(Binary, v).op == "+" && cast(Node, cast(Binary, v).l).kind == EX_IDENT && cast(IdentExpr, cast(Binary, v).l).ref == t && invariant(cast(Binary, v).r) != 0 {
 				j = cast(Sym, t)
 				step = cast(Binary, v).r
 			}
@@ -841,7 +841,7 @@ fn prefetch_loop(w i64) {
 	jref.name = j.name
 	jref.ref = cast(i64, j)
 	let call = cast(Call, node_new(EX_CALL, pos))
-	call.name = cstr("__prefetchw")
+	call.name = "__prefetchw"
 	call.args = []i64{}
 	call.intrinsic = 1
 	if cast(Node, target).kind == EX_ELEM {
@@ -849,7 +849,7 @@ fn prefetch_loop(w i64) {
 	} else {
 		call.args = append(call.args, node_copy(cast(IndexExpr, target).x))
 	}
-	call.args = append(call.args, binary_node(pos, cstr("+"), cast(i64, jref), binary_node(pos, cstr("*"), node_copy(step), cast(i64, ahead))))
+	call.args = append(call.args, binary_node(pos, "+", cast(i64, jref), binary_node(pos, "*", node_copy(step), cast(i64, ahead))))
 	let st = cast(ExprStmt, node_new(ST_EXPR, pos))
 	st.x = cast(i64, call)
 	let nb = []i64{}
@@ -995,10 +995,10 @@ fn invariant(e i64) i64 {
 		return i64(s.kind == SYM_LOCAL && s.addr == 0 && is_assigned(cast(i64, s)) == 0)
 	}
 	if k == EX_UNARY {
-		return i64(streq(cast(Unary, e).op, cstr("&")) == 0 && invariant(cast(Unary, e).x) != 0)
+		return i64(cast(Unary, e).op != "&" && invariant(cast(Unary, e).x) != 0)
 	}
 	if k == EX_BINARY {
-		return i64(streq(cast(Binary, e).op, cstr("&&")) == 0 && streq(cast(Binary, e).op, cstr("||")) == 0 && may_panic(cast(Binary, e)) == 0 && invariant(cast(Binary, e).l) != 0 && invariant(cast(Binary, e).r) != 0)
+		return i64(cast(Binary, e).op != "&&" && cast(Binary, e).op != "||" && may_panic(cast(Binary, e)) == 0 && invariant(cast(Binary, e).l) != 0 && invariant(cast(Binary, e).r) != 0)
 	}
 	if k == EX_FLOAT {
 		return 1
@@ -1025,7 +1025,7 @@ fn op_cost(e i64) i64 {
 	if k == EX_BINARY {
 		let op = cast(Binary, e).op
 		mut c = 1
-		if streq(op, cstr("*")) != 0 || streq(op, cstr("/")) != 0 || streq(op, cstr("%")) != 0 {
+		if op == "*" || op == "/" || op == "%" {
 			c = 3
 		}
 		return c + op_cost(cast(Binary, e).l) + op_cost(cast(Binary, e).r)
@@ -1134,7 +1134,7 @@ fn hoist_expr(e i64) {
 	}
 }
 
-fn binary_node(pos i64, op i64, l i64, r i64) i64 {
+fn binary_node(pos i64, op str, l i64, r i64) i64 {
 	let b = cast(Binary, node_new(EX_BINARY, pos))
 	b.op = op
 	b.l = l
@@ -1145,7 +1145,7 @@ fn binary_node(pos i64, op i64, l i64, r i64) i64 {
 // index_rewrite turns x[a + b] into (x + (a << 3))[b] when x and a are invariant and b is not.
 fn index_rewrite(e i64) {
 	let ix = cast(IndexExpr, e).i
-	if cast(Node, ix).kind != EX_BINARY || streq(cast(Binary, ix).op, cstr("+")) == 0 || cast(Binary, ix).ovf == OVF_CHECK || invariant(cast(IndexExpr, e).x) == 0 {
+	if cast(Node, ix).kind != EX_BINARY || cast(Binary, ix).op != "+" || cast(Binary, ix).ovf == OVF_CHECK || invariant(cast(IndexExpr, e).x) == 0 {
 		return
 	}
 	mut a = cast(Binary, ix).l
@@ -1159,7 +1159,7 @@ fn index_rewrite(e i64) {
 	}
 	let three = cast(IntLit, node_new(EX_INT, cast(Node, e).pos))
 	three.val = 3
-	cast(IndexExpr, e).x = binary_node(cast(Node, e).pos, cstr("+"), cast(IndexExpr, e).x, binary_node(cast(Node, e).pos, cstr("<<"), a, cast(i64, three)))
+	cast(IndexExpr, e).x = binary_node(cast(Node, e).pos, "+", cast(IndexExpr, e).x, binary_node(cast(Node, e).pos, "<<", a, cast(i64, three)))
 	cast(IndexExpr, e).i = b
 }
 
@@ -1176,13 +1176,13 @@ fn replace_with_temp(e i64) {
 	}
 	if cast(i64, s) == 0 {
 		let moved = node_copy(e)
-		s = sym_new(SYM_LOCAL, cstr("licm"), cast(Node, e).pos)
+		s = sym_new(SYM_LOCAL, "licm", cast(Node, e).pos)
 		s.type_ = cast(Node, e).type_
 		s.slot = cast(Fn, lc_fn).slots
 		cast(Fn, lc_fn).slots = cast(Fn, lc_fn).slots + 1
 		cast(Fn, lc_fn).locals = append(cast(Fn, lc_fn).locals, cast(Sym, s))
 		let l = cast(LetStmt, node_new(ST_LET, cast(Node, e).pos))
-		l.name = cstr("licm")
+		l.name = "licm"
 		l.init = moved
 		l.sym = cast(i64, s)
 		lc_pre = append(lc_pre, cast(i64, l))
@@ -1209,7 +1209,7 @@ fn elem_specialize(e i64) {
 	let pos = cast(Node, e).pos
 	mut data = cast(Node, 0)
 	if cast(ElemExpr, e).str != 0 {
-		data = cast(Node, binary_node(pos, cstr("+"), node_copy(x), int_node(pos, 8)))
+		data = cast(Node, binary_node(pos, "+", node_copy(x), int_node(pos, 8)))
 		data.type_ = ty_int
 	} else {
 		data = cast(Node, mk_hdr(pos, node_copy(x), 2))
@@ -1237,7 +1237,7 @@ fn int_node(pos i64, v i64) i64 {
 // (base + a*scale)[b], so the row address is computed once per loop.
 fn mem_rewrite(e i64) {
 	let ix = cast(MemExpr, e).index
-	if ix == 0 || cast(MemExpr, e).len != 0 || cast(Node, ix).kind != EX_BINARY || streq(cast(Binary, ix).op, cstr("+")) == 0 || cast(Binary, ix).ovf == OVF_CHECK || invariant(cast(MemExpr, e).base) == 0 {
+	if ix == 0 || cast(MemExpr, e).len != 0 || cast(Node, ix).kind != EX_BINARY || cast(Binary, ix).op != "+" || cast(Binary, ix).ovf == OVF_CHECK || invariant(cast(MemExpr, e).base) == 0 {
 		return
 	}
 	mut a = cast(Binary, ix).l
@@ -1250,6 +1250,6 @@ fn mem_rewrite(e i64) {
 		return
 	}
 	let sh = int_node(cast(Node, e).pos, width_log2(cast(MemExpr, e).scale))
-	cast(MemExpr, e).base = binary_node(cast(Node, e).pos, cstr("+"), cast(MemExpr, e).base, binary_node(cast(Node, e).pos, cstr("<<"), a, sh))
+	cast(MemExpr, e).base = binary_node(cast(Node, e).pos, "+", cast(MemExpr, e).base, binary_node(cast(Node, e).pos, "<<", a, sh))
 	cast(MemExpr, e).index = b
 }

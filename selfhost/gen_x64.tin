@@ -43,23 +43,23 @@ fn x_sym(kind i64, index i64) i64 {
 // x64_fn_name returns the name of the function a direct call's symbol id refers to, for
 // the -S listing; 0 for any other symbol kind or an unset table. x_syms is owned here,
 // so asm_x64.tin (which the encoder fuzzer builds alone) only sees the wrapper.
-fn x64_fn_name(id i64) i64 {
+fn x64_fn_name(id i64) str {
 	if cast(i64, x_syms) == 0 || id < 0 || id >= len(x_syms) {
-		return 0
+		return ""
 	}
 	let sym = cast([]i64, x_syms)[id]
 	if sym >> 32 != SK_FN {
-		return 0
+		return ""
 	}
 	let index = sym & 0xffffffff
 	if index >= len(prog_fns) {
-		return 0
+		return ""
 	}
 	let f = prog_fns[index]
-	if f.qname != 0 {
+	if len(f.qname) != 0 {
 		return f.qname
 	}
-	return 0
+	return ""
 }
 
 fn x_mem1(base i64, off i64) i64 {
@@ -137,39 +137,39 @@ fn x_slot_store(r i64, off i64) {
 }
 
 // ---- conditions ----
-fn x_cond(op i64) i64 {
-	if streq(op, cstr("==")) != 0 {
+fn x_cond(op str) i64 {
+	if op == "==" {
 		return XC_E
 	}
-	if streq(op, cstr("!=")) != 0 {
+	if op == "!=" {
 		return XC_NE
 	}
-	if streq(op, cstr("<")) != 0 {
+	if op == "<" {
 		return XC_L
 	}
-	if streq(op, cstr("<=")) != 0 {
+	if op == "<=" {
 		return XC_LE
 	}
-	if streq(op, cstr(">")) != 0 {
+	if op == ">" {
 		return XC_G
 	}
-	if streq(op, cstr(">=")) != 0 {
+	if op == ">=" {
 		return XC_GE
 	}
 	return -1
 }
 
-fn x_ucond(op i64) i64 {
-	if streq(op, cstr("<")) != 0 {
+fn x_ucond(op str) i64 {
+	if op == "<" {
 		return XC_B
 	}
-	if streq(op, cstr("<=")) != 0 {
+	if op == "<=" {
 		return XC_BE
 	}
-	if streq(op, cstr(">")) != 0 {
+	if op == ">" {
 		return XC_A
 	}
-	if streq(op, cstr(">=")) != 0 {
+	if op == ">=" {
 		return XC_AE
 	}
 	return x_cond(op)
@@ -422,7 +422,7 @@ fn x_checked_neg(t Ty, dst i64, x i64) {
 }
 
 // x_checked_rr is dst = a op b for + - * on registers, panicking on overflow of type t.
-fn x_checked_rr(op i64, dst i64, a i64, b i64, t Ty) {
+fn x_checked_rr(op str, dst i64, a i64, b i64, t Ty) {
 	let k = ovf_kind(op)
 	if int_width(t) != 8 {
 		x_arith(op, dst, a, b)
@@ -443,7 +443,7 @@ fn x_checked_rr(op i64, dst i64, a i64, b i64, t Ty) {
 }
 
 // x_checked_const is dst = l op c for + - * with a constant, panicking on overflow of type t.
-fn x_checked_const(op i64, dst i64, l i64, c i64, t Ty) {
+fn x_checked_const(op str, dst i64, l i64, c i64, t Ty) {
 	let k = ovf_kind(op)
 	if int_width(t) != 8 {
 		x_binary_const(op, dst, l, c)
@@ -492,7 +492,7 @@ fn x_gen_checked_binary(e Binary, dst i64, d i64) {
 	mut l = e.l
 	mut r = e.r
 	arith_unsigned = e_unsigned(cast(Node, e))
-	if streq(op, cstr("<<")) != 0 || streq(op, cstr(">>")) != 0 {
+	if op == "<<" || op == ">>" {
 		let bits = 8 * int_width(t)
 		if is_const(r) != 0 {
 			let c = const_val(r)
@@ -520,7 +520,7 @@ fn x_gen_checked_binary(e Binary, dst i64, d i64) {
 		x_mask(cast(Node, e), dst)
 		return
 	}
-	if streq(op, cstr("/")) != 0 {
+	if op == "/" {
 		if is_const(r) != 0 && const_val(r) != -1 {
 			let lv = x_gen_val(l, d)
 			arith_unsigned = e_unsigned(cast(Node, e))
@@ -546,7 +546,7 @@ fn x_gen_checked_binary(e Binary, dst i64, d i64) {
 		x_narrow_check(t, dst, OVK_DIV)
 		return
 	}
-	if (streq(op, cstr("+")) != 0 || streq(op, cstr("*")) != 0) && is_const(l) != 0 {
+	if (op == "+" || op == "*") && is_const(l) != 0 {
 		let tmp = l
 		l = r
 		r = tmp
@@ -585,7 +585,7 @@ fn x_f2i_check(t Ty, v i64) {
 // x_gen_ovf_stubs emits the current function's cold overflow stubs (stack realigned, since a
 // frameless leaf may jump here): rt_overflow_fail(kind).
 fn x_gen_ovf_stubs() {
-	let of = find_fn(cstr("rt_overflow_fail"))
+	let of = find_fn("rt_overflow_fail")
 	mut k = 0
 	for k < OVK_COUNT {
 		if x_ovf_labels[k] != 0 {
@@ -602,24 +602,24 @@ fn x_gen_ovf_stubs() {
 }
 
 // x_arith emits dst = a op b for integer registers (arith_unsigned picks the unsigned forms).
-fn x_arith(op i64, dst i64, a i64, b i64) {
-	if streq(op, cstr("+")) != 0 {
+fn x_arith(op str, dst i64, a i64, b i64) {
+	if op == "+" {
 		x_binop(X_ADD, dst, a, b, 1)
-	} else if streq(op, cstr("-")) != 0 {
+	} else if op == "-" {
 		x_binop(X_SUB, dst, a, b, 0)
-	} else if streq(op, cstr("*")) != 0 {
+	} else if op == "*" {
 		x_binop(X_IMUL_RR, dst, a, b, 1)
-	} else if streq(op, cstr("/")) != 0 {
+	} else if op == "/" {
 		x_divide(dst, a, b, arith_unsigned, 0)
-	} else if streq(op, cstr("%")) != 0 {
+	} else if op == "%" {
 		x_divide(dst, a, b, arith_unsigned, 1)
-	} else if streq(op, cstr("&")) != 0 {
+	} else if op == "&" {
 		x_binop(X_AND, dst, a, b, 1)
-	} else if streq(op, cstr("|")) != 0 {
+	} else if op == "|" {
 		x_binop(X_OR, dst, a, b, 1)
-	} else if streq(op, cstr("^")) != 0 {
+	} else if op == "^" {
 		x_binop(X_XOR, dst, a, b, 1)
-	} else if streq(op, cstr("<<")) != 0 {
+	} else if op == "<<" {
 		x_shift(X_SHL, dst, a, b)
 	} else if arith_unsigned != 0 {
 		x_shift(X_SHR, dst, a, b)
@@ -659,7 +659,7 @@ fn x_shift_imm(op i64, dst i64, l i64, k i64) {
 }
 
 // x_signed_div10 mirrors the exact signed multiply-high sequence used by Go.
-fn x_signed_div10(op i64, dst i64, l i64, c i64) {
+fn x_signed_div10(op str, dst i64, l i64, c i64) {
 	x_mov(RAX, l)
 	x_load_imm(XSCR, -3689348814741910323)
 	emit1(X_IMULH, XSCR)
@@ -668,7 +668,7 @@ fn x_signed_div10(op i64, dst i64, l i64, c i64) {
 	x_mov(XSCR, l)
 	emit2(X_SARI, XSCR, 63)
 	emit2(X_SUB, RDX, XSCR)
-	if streq(op, cstr("/")) != 0 {
+	if op == "/" {
 		x_mov(dst, RDX)
 		if c < 0 {
 			emit1(X_NEG, dst)
@@ -684,14 +684,14 @@ fn x_signed_div10(op i64, dst i64, l i64, c i64) {
 	}
 }
 
-fn x_binary_const(op i64, dst i64, l i64, c i64) {
-	if arith_unsigned == 0 && (streq(op, cstr("/")) != 0 || streq(op, cstr("%")) != 0) && (c == 10 || c == -10) {
+fn x_binary_const(op str, dst i64, l i64, c i64) {
+	if arith_unsigned == 0 && (op == "/" || op == "%") && (c == 10 || c == -10) {
 		x_signed_div10(op, dst, l, c)
-	} else if streq(op, cstr("+")) != 0 {
+	} else if op == "+" {
 		x_add_imm(dst, l, c)
-	} else if streq(op, cstr("-")) != 0 && c != -9223372036854775807 - 1 {
+	} else if op == "-" && c != -9223372036854775807 - 1 {
 		x_add_imm(dst, l, -c)
-	} else if streq(op, cstr("*")) != 0 {
+	} else if op == "*" {
 		let k = pow2_log(c)
 		if c == 0 {
 			x_load_imm(dst, 0)
@@ -708,7 +708,7 @@ fn x_binary_const(op i64, dst i64, l i64, c i64) {
 			x_load_imm(XSCR, c)
 			x_binop(X_IMUL_RR, dst, l, XSCR, 1)
 		}
-	} else if streq(op, cstr("/")) != 0 {
+	} else if op == "/" {
 		let k = pow2_log(c)
 		if c == 1 {
 			x_mov(dst, l)
@@ -727,7 +727,7 @@ fn x_binary_const(op i64, dst i64, l i64, c i64) {
 			x_load_imm(XSCR2, c)
 			x_divide(dst, l, XSCR2, 0, 0)
 		}
-	} else if streq(op, cstr("%")) != 0 {
+	} else if op == "%" {
 		mut m = c
 		if m < 0 && m != -9223372036854775807 - 1 {
 			m = -m
@@ -749,18 +749,18 @@ fn x_binary_const(op i64, dst i64, l i64, c i64) {
 			x_load_imm(XSCR2, c)
 			x_divide(dst, l, XSCR2, 0, 1)
 		}
-	} else if streq(op, cstr("<<")) != 0 {
+	} else if op == "<<" {
 		x_shift_imm(X_SHLI, dst, l, c & 63)
-	} else if streq(op, cstr(">>")) != 0 {
+	} else if op == ">>" {
 		x_shift_imm(X_SARI, dst, l, c & 63)
-	} else if streq(op, cstr("&")) != 0 && x64_fits32(c) != 0 {
+	} else if op == "&" && x64_fits32(c) != 0 {
 		x_mov(dst, l)
 		emit2(X_ANDI, dst, c)
-	} else if (streq(op, cstr("|")) != 0 || streq(op, cstr("^")) != 0) && c == 0 {
+	} else if (op == "|" || op == "^") && c == 0 {
 		x_mov(dst, l)
-	} else if (streq(op, cstr("|")) != 0 || streq(op, cstr("^")) != 0) && x64_fits32(c) != 0 {
+	} else if (op == "|" || op == "^") && x64_fits32(c) != 0 {
 		x_mov(dst, l)
-		if streq(op, cstr("|")) != 0 {
+		if op == "|" {
 			emit2(X_ORI, dst, c)
 		} else {
 			emit2(X_XORI, dst, c)
@@ -772,13 +772,13 @@ fn x_binary_const(op i64, dst i64, l i64, c i64) {
 }
 
 // x_uconst handles unsigned division, modulo and right shift by constants.
-fn x_uconst(op i64, dst i64, l i64, c i64) i64 {
+fn x_uconst(op str, dst i64, l i64, c i64) i64 {
 	let k = pow2_log(c)
-	if streq(op, cstr("/")) != 0 && k >= 0 {
+	if op == "/" && k >= 0 {
 		x_shift_imm(X_SHRI, dst, l, k)
 		return 1
 	}
-	if streq(op, cstr("%")) != 0 && k > 0 {
+	if op == "%" && k > 0 {
 		x_mov(dst, l)
 		if k <= 31 {
 			emit2(X_ANDI, dst, (1 << k) - 1)
@@ -788,11 +788,11 @@ fn x_uconst(op i64, dst i64, l i64, c i64) i64 {
 		}
 		return 1
 	}
-	if streq(op, cstr(">>")) != 0 {
+	if op == ">>" {
 		x_shift_imm(X_SHRI, dst, l, c & 63)
 		return 1
 	}
-	if streq(op, cstr("/")) != 0 || streq(op, cstr("%")) != 0 {
+	if op == "/" || op == "%" {
 		x_load_imm(XSCR2, c)
 		x_arith(op, dst, l, XSCR2)
 		return 1
@@ -959,8 +959,8 @@ fn x_gen_dyn_pair(e i64, obj i64, tab i64, d i64) {
 	}
 	if k == EX_CONV && cast(Conv, e).kind == CV_DYN {
 		x_gen_to(cast(Conv, e).x, obj, d)
-		let rec = cast([]i64, dyn_tables[cast(Conv, e).dyn_table])
-		emit2(X_LEA, tab, x64_mem_sym(x_sym(SK_VAR, rec[4])))
+		let rec = cast(DynTable, dyn_tables[cast(Conv, e).dyn_table])
+		emit2(X_LEA, tab, x64_mem_sym(x_sym(SK_VAR, rec.slot)))
 		return
 	}
 	if k == EX_CONV && cast(Conv, e).kind == CV_DYN_KEEP {
@@ -1020,7 +1020,7 @@ fn x_gen_dyn_pair(e i64, obj i64, tab i64, d i64) {
 		x_load_imm(tab, 0)
 		return
 	}
-	err_code_at(cast(Node, e).pos, cstr("E990 INTERNAL"), cstr("unsupported dyn value location in amd64 code generation"))
+	err_code_at(cast(Node, e).pos, "E990 INTERNAL", "unsupported dyn value location in amd64 code generation")
 }
 
 fn x_gen_ident(e IdentExpr, dst i64) {
@@ -1075,7 +1075,7 @@ fn x_gen_pair(lexp i64, rexp i64, d i64) {
 
 fn x_gen_unary(e Unary, dst i64, d i64) {
 	let op = e.op
-	if streq(op, cstr("&")) != 0 {
+	if op == "&" {
 		let s = cast(Sym, cast(IdentExpr, e.x).ref)
 		if s.kind == SYM_LOCAL {
 			emit2(X_LEA, dst, x_mem1(RBP, s.off))
@@ -1099,14 +1099,14 @@ fn x_gen_unary(e Unary, dst i64, d i64) {
 		emit2(X_XORPD, dst, XFSCR)
 		return
 	}
-	if streq(op, cstr("-")) != 0 && e.ovf == OVF_CHECK {
+	if op == "-" && e.ovf == OVF_CHECK {
 		x_checked_neg(cast(Ty, cast(Node, e).type_), dst, x)
 		return
 	}
-	if streq(op, cstr("-")) != 0 {
+	if op == "-" {
 		x_mov(dst, x)
 		emit1(X_NEG, dst)
-	} else if streq(op, cstr("~")) != 0 {
+	} else if op == "~" {
 		x_mov(dst, x)
 		emit1(X_NOT, dst)
 	} else {
@@ -1123,7 +1123,7 @@ fn x_gen_binary(e Binary, dst i64, d i64) {
 		return
 	}
 	let op = e.op
-	if streq(op, cstr("&&")) != 0 || streq(op, cstr("||")) != 0 {
+	if op == "&&" || op == "||" {
 		let f = new_label()
 		let end = new_label()
 		x_gen_cond(cast(i64, e), f, d)
@@ -1143,13 +1143,20 @@ fn x_gen_binary(e Binary, dst i64, d i64) {
 		x_gen_fbinary(e, dst, d)
 		return
 	}
+	let rc = rot_left(e)
+	if rc > 0 {
+		// x << c | x >> (64-c): one rol (#488).
+		x_gen_to(rot_x, dst, d)
+		emit2(X_ROLI, dst, rc)
+		return
+	}
 	if e.ovf == OVF_CHECK {
 		x_gen_checked_binary(e, dst, d)
 		return
 	}
 	mut l = e.l
 	mut r = e.r
-	let comm = i64(streq(op, cstr("+")) != 0 || streq(op, cstr("*")) != 0 || streq(op, cstr("&")) != 0 || streq(op, cstr("|")) != 0 || streq(op, cstr("^")) != 0)
+	let comm = i64(op == "+" || op == "*" || op == "&" || op == "|" || op == "^")
 	if comm != 0 && is_const(l) != 0 {
 		let t = l
 		l = r
@@ -1176,11 +1183,11 @@ fn x_gen_binary(e Binary, dst i64, d i64) {
 fn x_gen_fbinary(e Binary, dst i64, d i64) {
 	let op = e.op
 	x_gen_pair(e.l, e.r, d)
-	if streq(op, cstr("+")) != 0 {
+	if op == "+" {
 		x_binop(X_ADDSD, dst, pl, pr, 1)
-	} else if streq(op, cstr("-")) != 0 {
+	} else if op == "-" {
 		x_binop(X_SUBSD, dst, pl, pr, 0)
-	} else if streq(op, cstr("*")) != 0 {
+	} else if op == "*" {
 		x_binop(X_MULSD, dst, pl, pr, 1)
 	} else {
 		x_binop(X_DIVSD, dst, pl, pr, 0)
@@ -1198,16 +1205,16 @@ fn x_gen_compare(e Binary, d i64) {
 		x_gen_pair(l, r, d)
 		// Set after the operands, which may contain comparisons of their own.
 		cmp_unord = 0
-		if streq(op, cstr("<")) != 0 || streq(op, cstr("<=")) != 0 {
+		if op == "<" || op == "<=" {
 			emit2(X_UCOMISD, pr, pl)
 		} else {
 			emit2(X_UCOMISD, pl, pr)
 		}
-		if streq(op, cstr("<")) != 0 || streq(op, cstr(">")) != 0 {
+		if op == "<" || op == ">" {
 			cmp_cc = XC_A
-		} else if streq(op, cstr("<=")) != 0 || streq(op, cstr(">=")) != 0 {
+		} else if op == "<=" || op == ">=" {
 			cmp_cc = XC_AE
-		} else if streq(op, cstr("==")) != 0 {
+		} else if op == "==" {
 			cmp_cc = XC_E
 			cmp_unord = 1
 		} else {
@@ -1508,7 +1515,7 @@ fn x_gen_seq(e i64, dst i64, d i64) {
 
 // x_gen_addr8 picks a byte address for p: am_base plus am_index, or plus am_off.
 fn x_gen_addr8(p i64, d i64) {
-	if cast(Node, p).kind == EX_BINARY && streq(cast(Binary, p).op, cstr("+")) != 0 {
+	if cast(Node, p).kind == EX_BINARY && cast(Binary, p).op == "+" {
 		let r = cast(Binary, p).r
 		if is_const(r) != 0 && x64_fits32(const_val(r)) != 0 {
 			am_base = x_gen_val(cast(Binary, p).l, d)
@@ -1535,12 +1542,12 @@ fn x_am_operand() i64 {
 
 fn x_gen_intrinsic(e Call, dst i64, d i64) {
 	let name = e.name
-	if streq(name, cstr("__prefetchw")) != 0 {
+	if name == "__prefetchw" {
 		x_gen_pair(e.args[0], e.args[1], d)
 		emit1(X_PREFETCHW, x64_mem(pl, pr, 8, 0))
 		return
 	}
-	if streq(name, cstr("load8")) != 0 {
+	if name == "load8" {
 		x_gen_addr8(e.args[0], d)
 		emit3(X_LOAD, dst, x_am_operand(), 0)
 		return
@@ -1554,35 +1561,35 @@ fn x_gen_intrinsic(e Call, dst i64, d i64) {
 // x_float_intrinsic emits the float intrinsics: sqrtsd, andpd with the sign mask for
 // __fabs, roundsd for the rounding modes it has, and a trunc-and-adjust sequence for
 // __frinta (round half away from zero).
-fn x_float_intrinsic(name i64, dst i64, x i64) i64 {
-	if streq(name, cstr("__fsqrt")) != 0 {
+fn x_float_intrinsic(name str, dst i64, x i64) i64 {
+	if name == "__fsqrt" {
 		emit2(X_SQRTSD, dst, x)
 		return 1
 	}
-	if streq(name, cstr("__fabs")) != 0 {
+	if name == "__fabs" {
 		x_load_imm(XSCR, 0x7fffffffffffffff)
 		emit2(X_MOVQ, XFSCR, XSCR)
 		x_mov(dst, x)
 		emit2(X_ANDPD, dst, XFSCR)
 		return 1
 	}
-	if streq(name, cstr("__frintm")) != 0 {
+	if name == "__frintm" {
 		emit3(X_ROUNDSD, dst, x, XR_FLOOR)
 		return 1
 	}
-	if streq(name, cstr("__frintp")) != 0 {
+	if name == "__frintp" {
 		emit3(X_ROUNDSD, dst, x, XR_CEIL)
 		return 1
 	}
-	if streq(name, cstr("__frintz")) != 0 {
+	if name == "__frintz" {
 		emit3(X_ROUNDSD, dst, x, XR_TRUNC)
 		return 1
 	}
-	if streq(name, cstr("__frintn")) != 0 {
+	if name == "__frintn" {
 		emit3(X_ROUNDSD, dst, x, XR_NEAREST)
 		return 1
 	}
-	if streq(name, cstr("__frinta")) != 0 {
+	if name == "__frinta" {
 		// t = trunc(x); if |x - t| >= 0.5 then t += sign(x) * 1.0.
 		let done_l = new_label()
 		x_mov(XFSCR, x)
@@ -1610,21 +1617,21 @@ fn x_float_intrinsic(name i64, dst i64, x i64) i64 {
 fn x_gen_runtime_intrinsic(e Call, dst i64, d i64) i64 {
 	let name = e.name
 	let args = e.args
-	if streq(name, cstr("__ctx")) != 0 {
+	if name == "__ctx" {
 		x_mov(dst, XCTX)
 		return 1
 	}
-	if streq(name, cstr("__fp")) != 0 {
+	if name == "__fp" {
 		x_mov(dst, RBP)
 		return 1
 	}
-	if i64(load8(name)) == '_' && i64(load8(name + 1)) == '_' && i64(load8(name + 2)) == 'f' {
+	if i64(byte_at(name, 0)) == '_' && i64(name[1]) == '_' && i64(name[2]) == 'f' {
 		let fx = x_gen_val(args[0], d)
 		if x_float_intrinsic(name, dst, fx) != 0 {
 			return 1
 		}
 	}
-	if streq(name, cstr("__mulhu")) != 0 {
+	if name == "__mulhu" {
 		// __mulhu(a, b): the high 64 bits of the unsigned 128-bit product, which mul leaves in
 		// rdx (bits.Mul64, #474).
 		x_gen_pair(args[0], args[1], d)
@@ -1640,15 +1647,44 @@ fn x_gen_runtime_intrinsic(e Call, dst i64, d i64) i64 {
 		}
 		return 1
 	}
-	if streq(name, cstr("__st")) != 0 {
-		// __st(p, v, sizelog2): a raw sized store for the runtime.
+	if name == "__st" {
+		// __st(p, v, sizelog2): a raw sized store for the runtime. A constant offset or a scaled
+		// index in p goes into the address (#488).
+		addr_split(args[0])
+		if as_index == 0 && as_base != args[0] && x64_fits32(as_off) != 0 {
+			x_gen_pair(as_base, args[1], d)
+			emit3(X_STORE, pr, x_mem1(pl, as_off), const_val(args[2]))
+			return 1
+		}
+		if as_index != 0 && x_scale_ok(as_scale) != 0 && contains_call(args[1]) == 0 && d+3 <= t_count {
+			let b = x_gen_val(as_base, d)
+			let d2 = next_depth(b, d)
+			let ix = x_gen_val(as_index, d2)
+			let v = x_gen_val(args[1], next_depth(ix, d2))
+			emit3(X_STORE, v, x64_mem(b, ix, as_scale, 0), const_val(args[2]))
+			return 1
+		}
 		x_gen_pair(args[0], args[1], d)
 		emit3(X_STORE, pr, x_mem1(pl, 0), const_val(args[2]))
 		return 1
 	}
-	if streq(name, cstr("__ld")) != 0 {
-		let p = x_gen_val(args[0], d)
+	if name == "__ld" {
 		let k = args[1]
+		mut kind = 3
+		if is_const(k) != 0 {
+			kind = const_val(k)
+		}
+		addr_split(args[0])
+		if as_index == 0 && as_base != args[0] && x64_fits32(as_off) != 0 {
+			emit3(X_LOAD, dst, x_mem1(x_gen_val(as_base, d), as_off), kind)
+			return 1
+		}
+		if as_index != 0 && x_scale_ok(as_scale) != 0 {
+			x_gen_pair(as_base, as_index, d)
+			emit3(X_LOAD, dst, x64_mem(pl, pr, as_scale, 0), kind)
+			return 1
+		}
+		let p = x_gen_val(args[0], d)
 		if is_const(k) != 0 {
 			emit3(X_LOAD, dst, x_mem1(p, 0), const_val(k))
 		} else {
@@ -1656,23 +1692,23 @@ fn x_gen_runtime_intrinsic(e Call, dst i64, d i64) i64 {
 		}
 		return 1
 	}
-	if streq(name, cstr("__tin_symbols")) != 0 || streq(name, cstr("__image_base")) != 0 {
+	if name == "__tin_symbols" || name == "__image_base" {
 		mut kind = SK_BTRACE
-		if streq(name, cstr("__image_base")) != 0 {
+		if name == "__image_base" {
 			kind = SK_IMAGE
 		}
 		emit2(X_LEA, dst, x64_mem_sym(x_sym(kind, 0)))
 		return 1
 	}
-	if streq(name, cstr("__empty")) != 0 {
+	if name == "__empty" {
 		emit2(X_LEA, dst, x64_mem_sym(x_sym(SK_ZERO, 0)))
 		return 1
 	}
-	if streq(name, cstr("__set_ctx")) != 0 {
+	if name == "__set_ctx" {
 		x_gen_to(args[0], XCTX, d)
 		return 1
 	}
-	if streq(name, cstr("__atomic_add")) != 0 {
+	if name == "__atomic_add" {
 		// Returns the old value: lock xadd adds r11 to [p] and leaves the old value in r11.
 		x_gen_pair(args[0], args[1], d)
 		x_mov(XSCR, pr)
@@ -1682,7 +1718,7 @@ fn x_gen_runtime_intrinsic(e Call, dst i64, d i64) i64 {
 		}
 		return 1
 	}
-	if streq(name, cstr("__atomic_cas")) != 0 {
+	if name == "__atomic_cas" {
 		// __atomic_cas(p, old, new) returns the value found at p.
 		let p = x_gen_val(args[0], d)
 		let d1 = next_depth(p, d)
@@ -1700,7 +1736,7 @@ fn x_gen_runtime_intrinsic(e Call, dst i64, d i64) i64 {
 		}
 		return 1
 	}
-	if streq(name, cstr("__atomic_swap")) != 0 {
+	if name == "__atomic_swap" {
 		x_gen_pair(args[0], args[1], d)
 		x_mov(XSCR, pr)
 		emit2(X_XCHG, XSCR, x_mem1(pl, 0))
@@ -1709,19 +1745,19 @@ fn x_gen_runtime_intrinsic(e Call, dst i64, d i64) i64 {
 		}
 		return 1
 	}
-	if streq(name, cstr("__atomic_load")) != 0 {
+	if name == "__atomic_load" {
 		let p = x_gen_val(args[0], d)
 		emit3(X_LOAD, dst, x_mem1(p, 0), 3)
 		return 1
 	}
-	if streq(name, cstr("__atomic_store")) != 0 {
+	if name == "__atomic_store" {
 		// xchg is a full barrier, like stlr.
 		x_gen_pair(args[0], args[1], d)
 		x_mov(XSCR, pr)
 		emit2(X_XCHG, XSCR, x_mem1(pl, 0))
 		return 1
 	}
-	if streq(name, cstr("__yield")) != 0 {
+	if name == "__yield" {
 		emit1(X_PAUSE, 0)
 		return 1
 	}
@@ -1736,11 +1772,11 @@ fn x_gen_store8(e Call, dst i64, d i64) {
 	mut index = -1
 	mut off = 0
 	mut dv = d
-	if cast(Node, p).kind == EX_BINARY && streq(cast(Binary, p).op, cstr("+")) != 0 && is_const(cast(Binary, p).r) != 0 && x64_fits32(const_val(cast(Binary, p).r)) != 0 {
+	if cast(Node, p).kind == EX_BINARY && cast(Binary, p).op == "+" && is_const(cast(Binary, p).r) != 0 && x64_fits32(const_val(cast(Binary, p).r)) != 0 {
 		off = const_val(cast(Binary, p).r)
 		base = x_gen_val(cast(Binary, p).l, d)
 		dv = next_depth(base, d)
-	} else if cast(Node, p).kind == EX_BINARY && streq(cast(Binary, p).op, cstr("+")) != 0 && d + 3 <= t_count {
+	} else if cast(Node, p).kind == EX_BINARY && cast(Binary, p).op == "+" && d + 3 <= t_count {
 		base = x_gen_val(cast(Binary, p).l, d)
 		index = x_gen_val(cast(Binary, p).r, next_depth(base, d))
 		dv = next_depth(index, next_depth(base, d))
@@ -1773,12 +1809,12 @@ fn x_gen_store8(e Call, dst i64, d i64) {
 
 // ---- calls ----
 fn x_int_arg(i i64) i64 {
-	return i64(load8(cstr("\x07\x06\x02\x01\x08\x09") + i))
+	return i64("\x07\x06\x02\x01\x08\x09"[i])
 }
 
 // x_res_reg is where result i of a call with several results travels.
 fn x_res_reg(i i64) i64 {
-	return i64(load8(cstr("\x00\x02\x01\x06\x07\x08\x09\x0a") + i))
+	return i64("\x00\x02\x01\x06\x07\x08\x09\x0a"[i])
 }
 
 // x_arg_regs gives each argument its register: rdi, rsi, rdx, rcx, r8, r9 and xmm0-xmm7
@@ -2128,14 +2164,14 @@ fn x_gen_branch(e i64, target i64, d i64, when_true i64) {
 		x_gen_branch(cast(SeqExpr, e).value, target, d, when_true)
 		return
 	}
-	if k == EX_UNARY && streq(cast(Unary, e).op, cstr("!")) != 0 {
+	if k == EX_UNARY && cast(Unary, e).op == "!" {
 		x_gen_branch(cast(Unary, e).x, target, d, i64(when_true == 0))
 		return
 	}
 	if k == EX_BINARY {
 		let op = cast(Binary, e).op
-		let is_and = streq(op, cstr("&&"))
-		if is_and != 0 || streq(op, cstr("||")) != 0 {
+		let is_and = i64(op == "&&")
+		if is_and != 0 || op == "||" {
 			// Branching on the operator's own sense chains; the other sense skips ahead.
 			if is_and != when_true {
 				x_gen_branch(cast(Binary, e).l, target, d, when_true)
@@ -2152,7 +2188,7 @@ fn x_gen_branch(e i64, target i64, d i64, when_true i64) {
 			x_gen_cmp_branch(cast(Binary, e), target, d, when_true)
 			return
 		}
-		if streq(op, cstr("&")) != 0 && is_const(cast(Binary, e).r) != 0 && pow2_log(const_val(cast(Binary, e).r)) >= 0 {
+		if op == "&" && is_const(cast(Binary, e).r) != 0 && pow2_log(const_val(cast(Binary, e).r)) >= 0 {
 			x_test_imm(x_gen_val(cast(Binary, e).l, d), const_val(cast(Binary, e).r))
 			if when_true != 0 {
 				emit2(X_JCC, XC_NE, target)
@@ -2185,7 +2221,7 @@ fn x_gen_effect(e i64) {
 		x_gen_call(e, 0)
 	} else if cast(Node, e).kind == EX_SEQ {
 		x_gen_seq(e, -1, 0)
-	} else if cast(Node, e).kind == EX_CALL && (streq(cast(Call, e).name, cstr("__prefetchw")) != 0 || streq(cast(Call, e).name, cstr("store8")) != 0) {
+	} else if cast(Node, e).kind == EX_CALL && (cast(Call, e).name == "__prefetchw" || cast(Call, e).name == "store8") {
 		x_gen_intrinsic(cast(Call, e), -1, 0)
 	} else if cast(Node, e).kind == EX_CALL && cast(Call, e).intrinsic != 0 {
 		mut r = 0
@@ -2209,7 +2245,7 @@ fn x_assign_local(s Sym, v i64) {
 			x_slot_store(r0, s.off)
 			x_slot_store(r1, s.off + 8)
 		} else {
-			err_code_at(s.pos, cstr("E990 INTERNAL"), cstr("dyn local is not in a two-word frame slot"))
+			err_code_at(s.pos, "E990 INTERNAL", "dyn local is not in a two-word frame slot")
 		}
 		return
 	}
@@ -2425,7 +2461,7 @@ fn x_gen_while(s WhileStmt) {
 		}
 		g_loops = append(g_loops, cont)
 		g_loops = append(g_loops, end_l)
-		g_loop_labels = append(g_loop_labels, 0)
+		g_loop_labels = append(g_loop_labels, "")
 		x_gen_stmts(cast(Block, s.body).stmts)
 		slice_truncate(g_loops, len(g_loops) - 2)
 		slice_truncate(g_loop_labels, len(g_loop_labels) - 1)
@@ -2470,8 +2506,99 @@ fn x_gen_while(s WhileStmt) {
 fn x_gen_stmts(stmts []i64) {
 	mut i = 0
 	for i < len(stmts) {
+		if i+1 < len(stmts) && x_gen_word_pair(stmts[i], stmts[i+1]) != 0 {
+			i = i + 2
+			continue
+		}
 		x_gen_stmt(stmts[i])
 		i = i + 1
+	}
+}
+
+// x_gen_word_pair emits two statements of multi-word arithmetic together (#488, gen.tin): a
+// product's halves from one mul, and an add's carry with adc. 0 when s1, s2 are not such a pair.
+fn x_gen_word_pair(s1 i64, s2 i64) i64 {
+	if mul_pair(s1, s2) != 0 {
+		// mul's register operand is one that lives in a register; the other goes to rax.
+		let ra = x_word_reg(mw_a)
+		let rb = x_word_reg(mw_b)
+		if rb >= 0 {
+			x_gen_to(mw_a, RAX, 0)
+			emit1(X_MULU, rb)
+		} else if ra >= 0 {
+			x_gen_to(mw_b, RAX, 0)
+			emit1(X_MULU, ra)
+		} else {
+			x_gen_to(mw_a, RAX, 0)
+			x_gen_to(mw_b, RCX, 0)
+			emit1(X_MULU, RCX)
+		}
+		x_set_word(cast(Sym, mw_lo), RAX)
+		x_set_word(cast(Sym, mw_hi), RDX)
+		return 1
+	}
+	if add_carry(s1, s2) == 0 {
+		return 0
+	}
+	let s = cast(Sym, mw_lo)
+	let h = cast(Sym, mw_hi)
+	mut x = mw_a
+	mut y = mw_b
+	mut dst = s.reg
+	if dst < 0 {
+		dst = treg(0)
+	}
+	// y must outlive x's move into dst: add the other way round when y lives there.
+	if cast(Node, y).kind == EX_IDENT && cast(Sym, cast(IdentExpr, y).ref).reg == dst {
+		x = mw_b
+		y = mw_a
+	}
+	x_gen_to(x, dst, 1)
+	if cast(Node, y).kind == EX_INT && x64_fits32(cast(IntLit, y).val) != 0 {
+		emit2(X_ADDI, dst, cast(IntLit, y).val)
+	} else if cast(Node, y).kind == EX_INT {
+		x_load_imm(XSCR, cast(IntLit, y).val)
+		emit2(X_ADD, dst, XSCR)
+	} else if cast(Sym, cast(IdentExpr, y).ref).reg >= 0 {
+		emit2(X_ADD, dst, cast(Sym, cast(IdentExpr, y).ref).reg)
+	} else {
+		emit2(X_ADDM, dst, x_mem1(RBP, cast(Sym, cast(IdentExpr, y).ref).off))
+	}
+	// From here on only moves, which keep the carry flag, until adc reads it.
+	if s.reg < 0 {
+		x_slot_store(dst, s.off)
+	}
+	let k = cast(Sym, cast(IdentExpr, mw_k).ref)
+	mut hr = h.reg
+	if hr < 0 {
+		hr = XSCR
+	}
+	if k.reg >= 0 {
+		x_mov(hr, k.reg)
+	} else {
+		x_slot_load(hr, k.off)
+	}
+	emit2(X_ADCI, hr, 0)
+	if h.reg < 0 {
+		x_slot_store(hr, h.off)
+	}
+	return 1
+}
+
+// x_word_reg is the register home of a matched word operand, or -1 (a frame slot or a constant).
+fn x_word_reg(e i64) i64 {
+	if cast(Node, e).kind == EX_IDENT {
+		return cast(Sym, cast(IdentExpr, e).ref).reg
+	}
+	return -1
+}
+
+// x_set_word stores r into a word local (a register home or a frame slot).
+fn x_set_word(s Sym, r i64) {
+	if s.reg >= 0 {
+		x_mov(s.reg, r)
+	} else {
+		x_slot_store(r, s.off)
 	}
 }
 
@@ -2513,9 +2640,9 @@ fn x_gen_stmt(s i64) {
 		x_gen_while(cast(WhileStmt, s))
 	} else if k == ST_RETURN {
 		x_gen_return(cast(ReturnStmt, s))
-	} else if k == ST_BREAK && cast(BreakStmt, s).label != 0 {
+	} else if k == ST_BREAK && len(cast(BreakStmt, s).label) != 0 {
 		emit1(X_JMP, g_loops[2 * loop_with_label(cast(BreakStmt, s).label) + 1])
-	} else if k == ST_CONTINUE && cast(ContinueStmt, s).label != 0 {
+	} else if k == ST_CONTINUE && len(cast(ContinueStmt, s).label) != 0 {
 		emit1(X_JMP, g_loops[2 * loop_with_label(cast(ContinueStmt, s).label)])
 	} else if k == ST_BREAK {
 		emit1(X_JMP, g_loops[len(g_loops) - 1])
@@ -2594,7 +2721,7 @@ fn x_gen_return(s ReturnStmt) {
 // ---- if-conversion ----
 // x_gen_flags sets the flags for condition e and returns the condition code meaning true.
 fn x_gen_flags(e i64, d i64) i64 {
-	if cast(Node, e).kind == EX_UNARY && streq(cast(Unary, e).op, cstr("!")) != 0 {
+	if cast(Node, e).kind == EX_UNARY && cast(Unary, e).op == "!" {
 		return x_gen_flags(cast(Unary, e).x, d) ^ 1
 	}
 	if cast(Node, e).kind == EX_SEQ {
@@ -2666,7 +2793,7 @@ fn x_try_if_increment(s IfStmt) i64 {
 // select on because of the unordered case.
 fn x_float_cmp(c_in i64) i64 {
 	mut c = c_in
-	for cast(Node, c).kind == EX_UNARY && streq(cast(Unary, c).op, cstr("!")) != 0 {
+	for cast(Node, c).kind == EX_UNARY && cast(Unary, c).op == "!" {
 		c = cast(Unary, c).x
 	}
 	if cast(Node, c).kind == EX_SEQ {
@@ -2682,7 +2809,7 @@ fn x_try_select(s IfStmt) i64 {
 	if has_effects(c) != 0 || contains_call(c) != 0 || is_const(c) != 0 || e_fp(cast(Node, c)) != 0 {
 		return 0
 	}
-	if cast(Node, c).kind == EX_BINARY && (streq(cast(Binary, c).op, cstr("&&")) != 0 || streq(cast(Binary, c).op, cstr("||")) != 0) {
+	if cast(Node, c).kind == EX_BINARY && (cast(Binary, c).op == "&&" || cast(Binary, c).op == "||") {
 		return 0
 	}
 	if x_float_cmp(c) != 0 {
@@ -2947,7 +3074,7 @@ fn x_entry_moves(f Fn) {
 					x_slot_store(r0, s.off)
 					x_slot_store(r1, s.off + 8)
 				} else {
-					err_code_at(s.pos, cstr("E990 INTERNAL"), cstr("dyn parameter is not in a two-word frame slot"))
+					err_code_at(s.pos, "E990 INTERNAL", "dyn parameter is not in a two-word frame slot")
 				}
 			} else {
 				ni = 6
@@ -2958,7 +3085,7 @@ fn x_entry_moves(f Fn) {
 					x_slot_store(XSCR, s.off)
 					x_slot_store(XSCR2, s.off + 8)
 				} else {
-					err_code_at(s.pos, cstr("E990 INTERNAL"), cstr("dyn parameter is not in a two-word frame slot"))
+					err_code_at(s.pos, "E990 INTERNAL", "dyn parameter is not in a two-word frame slot")
 				}
 				x_nstack = x_nstack + 2
 			}
@@ -3015,17 +3142,17 @@ fn x_entry_moves(f Fn) {
 // rt_task_swap(from rdi, to rsi): store rbx, rbp, r12-r14 and rsp at from, load them from
 // to, and return on the other stack (r15, the core context, is the same on both).
 fn x_task_swap_bytes() i64 {
-	let hex = cstr("48891f48896f084c8967104c896f184c89772048896728488b1e488b6e084c8b66104c8b6e184c8b7620488b6628c3")
+	let hex = "48891f48896f084c8967104c896f184c89772048896728488b1e488b6e084c8b66104c8b6e184c8b7620488b6628c3"
 	let v = []i64{}
 	mut i = 0
-	for i64(load8(hex + i)) != 0 {
-		mut hi = i64(load8(hex + i)) - '0'
-		if i64(load8(hex + i)) >= 'a' {
-			hi = i64(load8(hex + i)) - 'a' + 10
+	for i < len(hex) {
+		mut hi = i64(hex[i]) - '0'
+		if i64(hex[i]) >= 'a' {
+			hi = i64(hex[i]) - 'a' + 10
 		}
-		mut lo = i64(load8(hex + i + 1)) - '0'
-		if i64(load8(hex + i + 1)) >= 'a' {
-			lo = i64(load8(hex + i + 1)) - 'a' + 10
+		mut lo = i64(hex[i + 1]) - '0'
+		if i64(hex[i + 1]) >= 'a' {
+			lo = i64(hex[i + 1]) - 'a' + 10
 		}
 		v = append(v, hi * 16 + lo)
 		i = i + 2
@@ -3035,28 +3162,28 @@ fn x_task_swap_bytes() i64 {
 
 // REP bulk memory loops preserve all callee-saved registers and r15.
 fn x_memory_bytes(fill i64) i64 {
-	mut hex = cstr("4889d148c1e106f3a4c3")
+	mut hex = "4889d148c1e106f3a4c3"
 	if fill != 0 {
-		hex = cstr("4889f04889d148c1e106f3aac3")
+		hex = "4889f04889d148c1e106f3aac3"
 	}
 	let v = []i64{}
 	mut i = 0
-	for i64(load8(hex + i)) != 0 {
-		v = append(v, num_digit(i64(load8(hex + i))) * 16 + num_digit(i64(load8(hex + i + 1))))
+	for i < len(hex) {
+		v = append(v, num_digit(i64(hex[i])) * 16 + num_digit(i64(hex[i + 1])))
 		i = i + 2
 	}
 	return cast(i64, v)
 }
 
 fn x_syscall_bytes(restorer i64) i64 {
-	mut hex = cstr("4889f84889f74889d64889ca4d89c24d89c84c8b4c24080f05c3")
+	mut hex = "4889f84889f74889d64889ca4d89c24d89c84c8b4c24080f05c3"
 	if restorer != 0 {
-		hex = cstr("48c7c00f0000000f05")
+		hex = "48c7c00f0000000f05"
 	}
 	let v = []i64{}
 	mut i = 0
-	for i64(load8(hex + i)) != 0 {
-		v = append(v, num_digit(i64(load8(hex + i))) * 16 + num_digit(i64(load8(hex + i + 1))))
+	for i < len(hex) {
+		v = append(v, num_digit(i64(hex[i])) * 16 + num_digit(i64(hex[i + 1])))
 		i = i + 2
 	}
 	return cast(i64, v)
@@ -3079,7 +3206,7 @@ fn x_gen_poll() {
 
 // x_gen_poll_stubs realigns even frameless leaves and preserves their register homes.
 fn x_gen_poll_stubs() {
-	let f = find_fn(cstr("rt_bnd_poll"))
+	let f = find_fn("rt_bnd_poll")
 	mut i = 0
 	for i < len(poll_sites) {
 		x_label(poll_sites[i])
@@ -3123,8 +3250,8 @@ fn x_gen_fn(f Fn) {
 		let bytes = cast([]i64, syscall_fast_amd64(f.qname))
 		if cast(i64, bytes) != 0 {
 			x_out4(X_LABEL, x_fn_labels[f.index], 0, 0, 0)
-			if streq(f.qname, cstr("rt_sys_clock_gettime")) != 0 {
-				let s = lookup_global(cstr("rtVdsoClock"))
+			if f.qname == "rt_sys_clock_gettime" {
+				let s = lookup_global("rtVdsoClock")
 				x_out4(X_LOAD, RDX, x64_mem_sym(x_sym(SK_VAR, s.index)), 3, 0)
 			}
 			mut i = 0
@@ -3135,7 +3262,7 @@ fn x_gen_fn(f Fn) {
 			return
 		}
 	}
-	if streq(f.qname, cstr("memcpy")) != 0 || streq(f.qname, cstr("memmove")) != 0 || streq(f.qname, cstr("memset")) != 0 || streq(f.qname, cstr("memcmp")) != 0 || streq(f.qname, cstr("memchr")) != 0 || streq(f.qname, cstr("mem_avx2_supported")) != 0 {
+	if f.qname == "memcpy" || f.qname == "memmove" || f.qname == "memset" || f.qname == "memcmp" || f.qname == "memchr" || f.qname == "mem_avx2_supported" {
 		x_out4(X_LABEL, x_fn_labels[f.index], 0, 0, 0)
 		let bs = cast([]i64, memory_fast_amd64(f.qname))
 		mut i = 0
@@ -3146,9 +3273,9 @@ fn x_gen_fn(f Fn) {
 		return
 	}
 
-	if tgt_linux != 0 && (streq(f.qname, cstr("linux_raw")) != 0 || streq(f.qname, cstr("linux_restorer")) != 0) {
+	if tgt_linux != 0 && (f.qname == "linux_raw" || f.qname == "linux_restorer") {
 		x_out4(X_LABEL, x_fn_labels[f.index], 0, 0, 0)
-		let bs = cast([]i64, x_syscall_bytes(streq(f.qname, cstr("linux_restorer"))))
+		let bs = cast([]i64, x_syscall_bytes(i64(f.qname == "linux_restorer")))
 		mut i = 0
 		for i < len(bs) {
 			x_out4(X_RAWB, bs[i], 0, 0, 0)
@@ -3156,9 +3283,9 @@ fn x_gen_fn(f Fn) {
 		}
 		return
 	}
-	if streq(f.qname, cstr("mem_copy64")) != 0 || streq(f.qname, cstr("mem_fill64")) != 0 {
+	if f.qname == "mem_copy64" || f.qname == "mem_fill64" {
 		x_out4(X_LABEL, x_fn_labels[f.index], 0, 0, 0)
-		let bs = cast([]i64, x_memory_bytes(streq(f.qname, cstr("mem_fill64"))))
+		let bs = cast([]i64, x_memory_bytes(i64(f.qname == "mem_fill64")))
 		mut i = 0
 		for i < len(bs) {
 			x_out4(X_RAWB, bs[i], 0, 0, 0)
@@ -3176,7 +3303,7 @@ fn x_gen_fn(f Fn) {
 		}
 		return
 	}
-	if streq(f.qname, cstr("rt_task_swap")) != 0 {
+	if f.qname == "rt_task_swap" {
 		x_out4(X_LABEL, x_fn_labels[f.index], 0, 0, 0)
 		let bs = cast([]i64, x_task_swap_bytes())
 		mut i = 0
@@ -3192,9 +3319,9 @@ fn x_gen_fn(f Fn) {
 	trap_sites = []i64{}
 	x_ovf_labels = make([]i64, OVK_COUNT)
 	poll_sites = []i64{}
-	if host_getenv(cstr("TINC_TRACE")) != 0 {
+	if host_getenv("TINC_TRACE") != 0 {
 		let tb = buf_new()
-		buf_str(tb, cstr("gen "))
+		buf_str(tb, "gen ")
 		buf_str(tb, f.qname)
 		buf_byte(tb, '\n')
 		write_all(2, cast([]u8, cast([]i64, tb)))
@@ -3227,6 +3354,10 @@ fn x_gen_fn(f Fn) {
 	let stmts = cast(Block, f.body).stmts
 	mut i = 0
 	for i < len(stmts) {
+		if i+1 < len(stmts) && x_gen_word_pair(stmts[i], stmts[i+1]) != 0 {
+			i = i + 2
+			continue
+		}
 		x_gen_stmt(stmts[i])
 		i = i + 1
 	}
@@ -3235,7 +3366,7 @@ fn x_gen_fn(f Fn) {
 	if trap_label != 0 {
 		// The cold path every failed bounds check jumps to.
 		x_label(trap_label)
-		let bf = find_fn(cstr("rt_bounds_fail"))
+		let bf = find_fn("rt_bounds_fail")
 		if cast(i64, bf) != 0 {
 			emit1(X_CALL, x_sym(SK_FN, bf.index))
 			bf.used = 1
@@ -3245,7 +3376,7 @@ fn x_gen_fn(f Fn) {
 		// The cold path every zero divisor in strict code jumps to (realigned like the stubs below).
 		x_label(x_div_label)
 		emit2(X_ANDI, RSP, -16)
-		let df = find_fn(cstr("rt_div_fail"))
+		let df = find_fn("rt_div_fail")
 		if cast(i64, df) != 0 {
 			emit1(X_CALL, x_sym(SK_FN, df.index))
 			df.used = 1
@@ -3255,18 +3386,18 @@ fn x_gen_fn(f Fn) {
 	// Per-site stubs: the index and length go through the stack into rdi/rsi (any registers),
 	// and the stack is realigned since a frameless leaf may jump here.
 	mut ts = 0
-	let bf2 = find_fn(cstr("rt_bounds_fail2"))
+	let bf2 = find_fn("rt_bounds_fail2")
 	for ts < len(trap_sites) {
-		let site = cast([]i64, trap_sites[ts])
-		x_label(site[0])
-		mut ireg = site[1]
+		let site = cast(TrapSite, trap_sites[ts])
+		x_label(site.label)
+		mut ireg = site.index_reg
 		if ireg < 0 {
-			x_load_imm(XSCR, site[3])
+			x_load_imm(XSCR, site.const_index)
 			ireg = XSCR
 		}
 		emit2(X_SUBI, RSP, 16)
 		x_st(ireg, x_mem1(RSP, 0), 3)
-		x_st(site[2], x_mem1(RSP, 8), 3)
+		x_st(site.len_reg, x_mem1(RSP, 8), 3)
 		x_ld(RDI, x_mem1(RSP, 0), 3)
 		x_ld(RSI, x_mem1(RSP, 8), 3)
 		emit2(X_ANDI, RSP, -16)
@@ -3283,11 +3414,11 @@ fn x_gen_fn(f Fn) {
 fn x_gen_dyn_table_init() {
 	mut i = 0
 	for i < len(dyn_tables) {
-		let rec = cast([]i64, dyn_tables[i])
-		let base = rec[4]
+		let rec = cast(DynTable, dyn_tables[i])
+		let base = rec.slot
 		let fns = []Fn{}
-		fns = append(fns, cast(Fn, rec[2]))
-		let methods = cast([]i64, rec[3])
+		fns = append(fns, cast(Fn, rec.keep_))
+		let methods = rec.fns
 		mut j = 0
 		for j < len(methods) {
 			fns = append(fns, cast(Fn, methods[j]))
@@ -3408,12 +3539,12 @@ fn x_finish_fn(f Fn, nslots i64) {
 fn generate_x64() {
 	code = cast([]Fn, []i64{})
 	g_labels = 0
-	g_str_ptrs = []i64{}
+	g_str_ptrs = []str{}
 	g_str_lens = []i64{}
-	g_tstr_ptrs = []i64{}
+	g_tstr_ptrs = []str{}
 	g_tstr_lens = []i64{}
 	g_loops = []i64{}
-	g_loop_labels = []i64{}
+	g_loop_labels = []str{}
 	x_syms = []i64{}
 	x_fn_labels = []i64{}
 	mut i = 0
@@ -3440,9 +3571,9 @@ fn print_asm_x64() i64 {
 	for i < len(prog_fns) {
 		let f = prog_fns[i]
 		if f.extern_ == 0 && f.reach != 0 {
-			buf_str(b, cstr("# L"))
+			buf_str(b, "# L")
 			buf_int(b, x_fn_labels[i])
-			buf_str(b, cstr(": "))
+			buf_str(b, ": ")
 			buf_str(b, f.qname)
 			buf_byte(b, '\n')
 		}

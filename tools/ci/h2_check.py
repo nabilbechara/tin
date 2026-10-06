@@ -26,6 +26,7 @@ import ssl
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 from suite import ROOT
@@ -142,13 +143,35 @@ def check_grpc(out):
                    env=dict(os.environ, TIN_ROOT=str(ROOT)), check=True)
     client = out / 'grpcclient'
     subprocess.run(['go', 'build', '-o', str(client), '.'], cwd=ROOT / 'tools/ci/grpc', check=True)
+    # The Tin client (#480, examples/grpc_client.tin) over wire's h2c, and a grpc-go server.
+    tin_client = out / 'grpc_client'
+    subprocess.run([str(ROOT / 'bin/tinc'), '-o', str(tin_client), 'examples/grpc_client.tin'], cwd=ROOT,
+                   env=dict(os.environ, TIN_ROOT=str(ROOT)), check=True)
+    go_server = out / 'grpcserver'
+    subprocess.run(['go', 'build', '-o', str(go_server), './server'], cwd=ROOT / 'tools/ci/grpc', check=True)
+
+    def tin_calls(addr, who):
+        for name, want in (('tin', 'Hello tin\n'), ('', 'grpc: InvalidArgument: name is required\n')):
+            r = subprocess.run([str(tin_client), name], capture_output=True, text=True, timeout=60, env=dict(os.environ, ADDR=addr))
+            assert r.stdout == want, (who, name, r.stdout, r.stderr[-1000:])
+        print(f'grpc: PASS the Tin client (wire, h2c) calls {who}: a reply, and InvalidArgument from the status')
+
     srv = Server(exe, out / 'grpc.log')
     try:
         r = subprocess.run([str(client), '-addr', '127.0.0.1:%d' % srv.port], capture_output=True, text=True, timeout=120)
         sys.stdout.write(''.join('grpc: ' + l + '\n' for l in r.stdout.splitlines()))
         assert r.returncode == 0, 'the gRPC client failed:\n' + r.stdout + r.stderr
+        tin_calls('127.0.0.1:%d' % srv.port, 'examples/grpc.tin')
     finally:
         srv.stop()
+    port = free_port()
+    gs = subprocess.Popen([str(go_server), '-addr', '127.0.0.1:%d' % port], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        assert gs.stdout.readline().strip() == 'listening'
+        tin_calls('127.0.0.1:%d' % port, 'a grpc-go server')
+    finally:
+        gs.kill()
+        gs.wait()
 
 
 # ---- raw frames ----
@@ -258,6 +281,57 @@ def check_flow_control(port):
     c.close()
     c2.close()
     print('PASS flow control: never past either window (first frame 10 bytes, then 99 per update); 64 KiB frames when allowed')
+
+
+def check_read_while_writing(exe, out):
+    """#506: a client that cannot read until the server takes what it writes (Go's: its reader needs
+    the lock its writer holds) must not wait for a server that stopped reading because its own
+    output waits. The client's buffers are small and it reads none of 8 MB of responses while it
+    sends 4 MB of requests: the server must keep reading, or both wait for the write timeout."""
+    srv = Server(exe, out / 'h2rw.log', TIN_WRITE_TIMEOUT_MS='20000', TIN_MAX_BODY='2000000')
+    try:
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16384)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 16384)
+        s.settimeout(20)
+        s.connect(('127.0.0.1', srv.port))
+        c = w.Conn.__new__(w.Conn)
+        c.sock, c.buf, c.dec, c.port = s, b'', w.Decoder(), srv.port
+        c.send(w.PREFACE + w.settings((4, 1 << 24)) + w.frame(w.WINDOW_UPDATE, 0, 0, struct.pack('>I', 1 << 28)))
+        gets = list(range(1, 16, 2))
+        for sid in gets:
+            c.request(sid, 'GET', '/big?n=1000000')
+        time.sleep(1)  # the server's output has filled the sockets
+        body = pattern(100000)
+        posts = list(range(17, 17 + 2 * 40, 2))
+        failed = []
+
+        def write():
+            try:
+                for sid in posts:
+                    c.request(sid, 'POST', '/echo', end=False)
+                    for i in range(0, len(body), 16384):
+                        last = i + 16384 >= len(body)
+                        c.send(w.frame(w.DATA, w.END_STREAM if last else 0, sid, body[i:i + 16384]))
+            except OSError as e:
+                failed.append(e)
+
+        t = threading.Thread(target=write, daemon=True)
+        t0 = time.monotonic()
+        t.start()
+        t.join(15)
+        assert not t.is_alive() and not failed, ('the server stopped reading while its output waited', failed)
+        sent = time.monotonic() - t0
+        r = c.responses(gets + posts, window_updates=False)
+        for sid in gets:
+            assert r[sid]['body'] == pattern(1000000), sid
+        for sid in posts:
+            assert w.status(r[sid]) == '200' and b'len=100000\n' in r[sid]['body'], (sid, r[sid]['body'][:80])
+        c.close()
+        assert srv.p.poll() is None, 'the server died'
+    finally:
+        srv.stop()
+    print('PASS reading goes on while output waits: 4 MB written to a server whose 8 MB of responses the client had not read (%.1fs)' % sent)
 
 
 def check_cancels(srv):
@@ -646,6 +720,7 @@ def main():
     finally:
         srv.stop()
     check_drain(exe, out)
+    check_read_while_writing(exe, out)
     check_tls(exe, out, files)
     check_grpc(out)
 

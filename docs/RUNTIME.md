@@ -703,7 +703,14 @@ connections leave it 0, and the HTTP/1.1 path reads it once per read, never per 
 **Reading.** In the core's event loop, as for HTTP/1.1: a read into the core's scratch buffer,
 whole frames served in order (`h2_feed`), a frame not fully arrived kept in the connection (at
 most 16 KiB and its header: larger frames are a FRAME_SIZE_ERROR). Responses produced while a read
-is served go out in one write; while the socket does not take them, reading stops (backpressure).
+is served go out in one write; what the socket does not take waits in the connection (`cOut`), and
+the connection goes on reading meanwhile (#506): a client may be unable to read until the server
+takes what it writes (Go's HTTP/2 client: its reader needs the lock its writer holds), so a server
+that stopped reading would wait for it, and it for the server, until the write timeout. Streams
+that produce output wait for room themselves (past 256 KiB pending); past `h2PendMax` (8 MiB) of
+pending output reading stops too, until it is written (backpressure, so a client that never reads
+cannot make the server queue answers to its PINGs without bound). The event loop writes before it
+reads when one epoll event reports both.
 
 **Settings and limits.** SETTINGS_MAX_CONCURRENT_STREAMS 100 (a stream past it is refused with
 REFUSED_STREAM), SETTINGS_INITIAL_WINDOW_SIZE 1 MiB, a 4 MiB connection window (one WINDOW_UPDATE
@@ -788,8 +795,17 @@ over TLS with ALPN `h2`.
   `read`/`write` with `rt_task_wait` on `EAGAIN`, as for `wire`, so a handshake or a read waits
   without holding the core; `Config.Timeout` bounds connect plus handshake, `SetTimeout` each
   later wait, `SetDeadline` all of them, and a request's deadline or cancellation ends any of
-  them with `rt_wait_fault()`. The CPU work of a handshake (one X25519 or P-256 operation,
-  key derivation) runs on the core.
+  them with `rt_wait_fault()`. The CPU work of a handshake (an ML-KEM-768 key pair and
+  decapsulation with X25519 for X25519MLKEM768, or one X25519 or P-256 operation; key
+  derivation) runs on the core.
+- Key exchange (#479): the client offers X25519MLKEM768 (draft-ietf-tls-ecdhe-mlkem: an
+  ML-KEM-768 encapsulation key and an X25519 key, 1216 bytes) and X25519 with the same X25519
+  key, and lists P-256 for a HelloRetryRequest. A server that has the hybrid group takes it,
+  so a recorded session stays secret against a future quantum computer ("harvest now, decrypt
+  later"); one that does not takes X25519. The server side (anvil.ServeTLS) takes the hybrid
+  group whenever the client sent its share, then X25519, then P-256, and asks by
+  HelloRetryRequest for the first of those the client lists when it sent none. Chrome,
+  Firefox, Safari, Go 1.24+ and OpenSSL 3.5+ offer it first. `Conn.Group()` names the group.
 - Memory: a `Conn` makes its record buffers (16 KiB + 256 bytes in, 16 KiB of decrypted data)
   at the handshake and afterwards changes only in place: KeyUpdate rewrites the AEAD's keys
   with `seal.AEAD.Rekey`, IVs and secrets are copied into the slices it has. So a `Conn` is
@@ -818,10 +834,42 @@ over TLS with ALPN `h2`.
   is generic over a private `stream` shape, so the same code reads a `wire.Conn` and a
   `tls.Conn`. `websocket.Dial` takes `wss://` (`DialTLS` with a `tls.Config`): the
   connection's `fill` and `write_raw` go through the `tls.Conn` held in its state.
-- ALPN (#478): `wire` offers `http/1.1` unless `Options.TLS` names other protocols, and fails a
-  connection on which the server chose a protocol other than HTTP/1.1. `websocket` always offers
-  `http/1.1` alone, since its upgrade is an HTTP/1.1 request. Some gateways refuse a client
-  that offers no ALPN.
+- ALPN (#478, #480): `wire` offers `h2` and `http/1.1` unless `Options.NoH2` (then `http/1.1`
+  alone) or `Options.TLS` names other protocols, and fails a connection on which the server
+  chose another protocol. `websocket` always offers `http/1.1` alone, since its upgrade is an
+  HTTP/1.1 request. Some gateways refuse a client that offers no ALPN.
+- HTTP/2 client (#480, `lib/wire/h2.tin`). `wire` speaks HTTP/2 to an https:// origin whose
+  server chooses h2, and over cleartext when `Options.H2C` asks (prior knowledge, as gRPC
+  servers expect).
+  - Connections: each core keeps one connection per origin (the pool key: scheme, host and TLS
+    settings), and every concurrent call to it is a stream, up to the server's
+    SETTINGS_MAX_CONCURRENT_STREAMS. Past that, a new connection takes the new calls, and the
+    full one closes when its streams end. An idle connection is checked before it is used (what
+    the server sent meanwhile is handled) and closed after 30 s.
+  - Sharing: the calls of a core share the socket the way the redis and kafka clients do. One
+    task at a time drives it: it writes the queued frames, reads, and hands each frame to its
+    stream. The others wait on their stream, and a call whose stream ends passes the driving to
+    one still waiting. Connection and stream state are malloc'd records, so a connection
+    outlives the requests that used it. The HPACK decoder (package `hpack`) keeps its dynamic
+    table in malloc'd memory too.
+  - Requests: header blocks use static-table names and plain literals, never indexed, so the
+    encoder keeps no state; header names are lowercased, and the connection-specific ones
+    (Connection, Keep-Alive, Transfer-Encoding, Upgrade, Host; TE except `trailers`) are left
+    out. A block larger than the server's frame size goes in CONTINUATION frames.
+  - Flow control: this client announces 4 MiB per stream and raises the connection's window to
+    16 MiB; each is given back by WINDOW_UPDATE once half is read. A request body is sent as the
+    server's windows allow, and SETTINGS_INITIAL_WINDOW_SIZE changes move the open streams'
+    windows.
+  - Responses are read whole, up to `Options.MaxBody` (past it the stream is reset with CANCEL),
+    with their trailers (`Resp.Trailer`). 1xx responses are skipped.
+  - Failures: a call that runs out of time (its deadline, `Options.Timeout`, cancellation)
+    resets its stream with RST_STREAM CANCEL and leaves the connection to the other calls. A call
+    the server did not process (past a GOAWAY's last stream id, or REFUSED_STREAM) is sent again
+    on a new connection, as is one whose connection failed before any answer when its method can
+    be repeated. A protocol error from the server (a frame too large, bad padding, a broken header
+    block, PUSH_PROMISE although push is off) ends the connection with a GOAWAY.
+  - Not done: streaming a response body as it arrives (a whole body is returned), PRIORITY, and
+    server push (refused with SETTINGS_ENABLE_PUSH 0).
 - `SSLKEYLOGFILE` (#478): when it names a file, every handshake, client or server, appends its
   four traffic secrets in the NSS key log format (`CLIENT_HANDSHAKE_TRAFFIC_SECRET`,
   `SERVER_HANDSHAKE_TRAFFIC_SECRET`, `CLIENT_TRAFFIC_SECRET_0`, `SERVER_TRAFFIC_SECRET_0`), which
@@ -928,8 +976,21 @@ HTTP/1.1 over TLS 1.3 on the same per-core event loops (`lib/anvil/serve_tls.tin
   (`TLSCert.CertFile`, `KeyFile`) is read again by core 0 every `TIN_TLS_RELOAD_S` seconds
   (default 60), and reloaded when the contents changed. A renewal on disk, from Let's Encrypt or
   cert-manager, needs no restart; a broken pair is reported and the set in use stays.
-- **Not supported:** 0-RTT, and TLS 1.2 (#473). A
-  `TIN_REPLAY_CAPSULE` replay sends plain HTTP and cannot replay into a TLS server.
+- **TLS 1.2 (#473)**, for clients and servers that stop there: the six ECDHE suites of
+  Mozilla's "intermediate" profile (ECDSA or RSA certificates, and Ed25519 by RFC 8422; X25519
+  or P-256; AES-128-GCM, AES-256-GCM or ChaCha20-Poly1305), with the extended master secret
+  (RFC 7627) whenever the peer offers it. Both sides prefer 1.3. A server answering a client
+  that offered 1.3 puts the downgrade sentinel in its random, and the client refuses it, so a
+  man in the middle cannot force 1.2 on two peers that speak 1.3. An ECDSA certificate is chosen
+  only when its curve is in the client's supported_groups. Client certificates, ALPN (h2
+  included), SNI selection, SSLKEYLOGFILE (`CLIENT_RANDOM`) and `Conn.Version()` work as in
+  1.3. Left out: RSA key exchange and CBC (no forward secrecy, padding oracles),
+  renegotiation (a ClientHello after the handshake gets no_renegotiation; a client ignores a
+  HelloRequest), session resumption (a 1.2 client gets a full handshake each time), and
+  anything older than 1.2. `TLSConfig.MinVersion` and `tls.Config.MinVersion` set to
+  `tls.VersionTLS13` turn 1.2 off (protocol_version).
+- **Not supported:** 0-RTT. A `TIN_REPLAY_CAPSULE` replay sends plain HTTP and cannot replay
+  into a TLS server.
 
 ### Pooled clients: mysql (v0.4)
 
@@ -1172,8 +1233,10 @@ functions keep that rule, and grows as phase 1 lands.
 | function | constant-time in | not constant-time in |
 |---|---|---|
 | `Sha256`, `Sha384`, `Sha512`, `Sum` | the message bytes | its length |
+| `Sha3_256`, `Sha3_512`, `Shake128`, `Shake256` (`sha3.tin`, #479: Keccak-f[1600] on 25 lanes in locals) | the message bytes | its length and the output length |
+| `MLKEM768KeyFromSeed`, `MLKEM768GenerateKey`, `MLKEM768Encapsulate`, `MLKEM768Decapsulate` (`mlkem.tin`, #479: Barrett reductions with branch-free corrections, rounding by multiplication, the re-encryption compared and the key chosen by masks) | the seed, s, the message and the shared key, and whether a ciphertext was valid (implicit rejection) | the public matrix's rejection sampling, which reads only the public seed rho; the encapsulation key's validity check |
 | `tls`: record protection (`SealRawTo` too), the Finished checks (`ConstantTimeEq`), the key schedule, on both sides | keys, secrets, data and MACs | lengths, and the padding length of a received record |
-| `tls` server: its key share (`X25519` or `P256ECDH` below) and its CertificateVerify, signed by `PrivateKey.SignTLS` (below: RFC 6979 ECDSA, blinded RSA CRT for PSS) with each core's own copy of the key | the private key, the ephemeral key and the shared secret | which scheme and group the client offered, which are public |
+| `tls` server: its key share (`MLKEM768Encapsulate` and `X25519` for X25519MLKEM768, or `X25519` or `P256ECDH` below) and its CertificateVerify, signed by `PrivateKey.SignTLS` (below: RFC 6979 ECDSA, blinded RSA CRT for PSS) with each core's own copy of the key | the private key, the ephemeral key and the shared secret | which scheme and group the client offered, which are public |
 | `Hmac`, `HmacSha256` | the key and message bytes | their lengths |
 | `HkdfExtract`, `HkdfExpand`, `HkdfExpandLabel` | the key material | lengths, `info`, labels |
 | `ConstantTimeEq`, `Equal` | the bytes | the lengths |

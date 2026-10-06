@@ -11,7 +11,7 @@ fn inline_appends(f Fn) {
 }
 
 fn ia_local(t i64) i64 {
-	let s = sym_new(SYM_LOCAL, cstr("$"), 0)
+	let s = sym_new(SYM_LOCAL, "$", 0)
 	s.type_ = t
 	s.slot = cast(Fn, ia_fn).slots
 	cast(Fn, ia_fn).slots = cast(Fn, ia_fn).slots + 1
@@ -103,10 +103,10 @@ fn ia_expr(e i64) {
 		ia_expr(cast(Call, e).callee)
 		ia_exprs(cast(Call, e).args)
 		let name = cast(Call, e).name
-		if cast(Call, e).intrinsic == 0 && name != 0 && cast(Fn, ia_fn).generated == 0 {
-			if (streq(name, cstr("rt_append")) != 0 || streq(name, cstr("rt_append_rc")) != 0) && len(cast(Call, e).args) == 3 && cast(Node, cast(Call, e).args[2]).kind == EX_INT {
+		if cast(Call, e).intrinsic == 0 && len(name) != 0 && cast(Fn, ia_fn).generated == 0 {
+			if (name == "rt_append" || name == "rt_append_rc") && len(cast(Call, e).args) == 3 && cast(Node, cast(Call, e).args[2]).kind == EX_INT {
 				ia_append(e)
-			} else if streq(name, cstr("rt_append_str")) != 0 && len(cast(Call, e).args) == 2 {
+			} else if name == "rt_append_str" && len(cast(Call, e).args) == 2 {
 				ia_append_str(e)
 			}
 		}
@@ -158,21 +158,21 @@ fn ia_append(e i64) {
 	cast(Call, slow).args = cast([]i64, args3(ia_ref(h), ia_ref(v), mk_int(pos, esz, ty_int)))
 	cast(Node, slow).type_ = st
 	let ifs = cast(IfStmt, node_new(ST_IF, pos))
-	ifs.cond = mk_bin(pos, cstr(">="), ia_ref(n), ia_hdr(h, 1), ty_bool)
+	ifs.cond = mk_bin(pos, ">=", ia_ref(n), ia_hdr(h, 1), ty_bool)
 	ifs.then = empty_block(pos)
 	mut vs1 = cast(Block, ifs.then).stmts
 	vs1 = append(vs1, assign_stmt(pos, ia_ref(h), slow))
 	let els = cast(Block, empty_block(pos))
 	let slot = mk_mem(pos, ia_hdr(h, 2), ia_ref(n), esz, 0, elem_type_of_size(esz))
 	els.stmts = append(els.stmts, assign_stmt(pos, slot, ia_ref(v)))
-	els.stmts = append(els.stmts, assign_stmt(pos, ia_hdr(h, 0), mk_bin(pos, cstr("+"), ia_ref(n), mk_int(pos, 1, ty_int), ty_int)))
-	if streq(cast(Call, e).name, cstr("rt_append_rc")) != 0 {
+	els.stmts = append(els.stmts, assign_stmt(pos, ia_hdr(h, 0), mk_bin(pos, "+", ia_ref(n), mk_int(pos, 1, ty_int), ty_int)))
+	if cast(Call, e).name == "rt_append_rc" {
 		// A counted element in a long-lived slice gains its slot's count (#176).
 		let lived = cast(IfStmt, node_new(ST_IF, pos))
-		lived.cond = mk_bin(pos, cstr("!="), ia_hdr(h, 3), mk_int(pos, 0, ty_int), ty_bool)
+		lived.cond = mk_bin(pos, "!=", ia_hdr(h, 3), mk_int(pos, 0, ty_int), ty_bool)
 		lived.then = empty_block(pos)
 		mut vs4 = cast(Block, lived.then).stmts
-		vs4 = append(vs4, expr_stmt(cast(Node, rt_call(pos, cstr("rt_rc_inc"), args1(ia_ref(v)), ty_void))))
+		vs4 = append(vs4, expr_stmt(cast(Node, rt_call(pos, "rt_rc_inc", args1(ia_ref(v)), ty_void))))
 		els.stmts = append(els.stmts, cast(i64, lived))
 	}
 	ifs.else_ = cast(i64, els)
@@ -185,11 +185,11 @@ fn ia_copy_str_chunk(pos i64, stmts []i64, dst i64, src i64, off i64, lg i64) {
 	mut dst_at = dst
 	mut src_at = src
 	if off != 0 {
-		dst_at = mk_bin(pos, cstr("+"), dst, mk_int(pos, off, ty_int), ty_int)
-		src_at = mk_bin(pos, cstr("+"), src, mk_int(pos, off, ty_int), ty_int)
+		dst_at = mk_bin(pos, "+", dst, mk_int(pos, off, ty_int), ty_int)
+		src_at = mk_bin(pos, "+", src, mk_int(pos, off, ty_int), ty_int)
 	}
-	stmts = append(stmts, let_stmt(pos, cast(Sym, word), intrinsic_call(pos, cstr("__ld"), args2(src_at, mk_int(pos, lg, ty_int)), ty_int)))
-	stmts = append(stmts, expr_stmt(cast(Node, intrinsic_call(pos, cstr("__st"), args3(dst_at, ia_ref(word), mk_int(pos, lg, ty_int)), ty_void))))
+	stmts = append(stmts, let_stmt(pos, cast(Sym, word), intrinsic_call(pos, "__ld", args2(src_at, mk_int(pos, lg, ty_int)), ty_int)))
+	stmts = append(stmts, expr_stmt(cast(Node, intrinsic_call(pos, "__st", args3(dst_at, ia_ref(word), mk_int(pos, lg, ty_int)), ty_void))))
 }
 
 // ia_append_str: copy a one-byte string directly, and use memcpy for the rest.
@@ -206,7 +206,7 @@ fn ia_append_str(e i64) {
 		ia_append_lit(e, cast(StrLit, lit))
 		return
 	}
-	let memcpy_fn = find_fn(cstr("memcpy"))
+	let memcpy_fn = find_fn("memcpy")
 	if cast(i64, memcpy_fn) == 0 {
 		return
 	}
@@ -229,7 +229,7 @@ fn ia_append_str(e i64) {
 	cast(Call, slow).args = cast([]i64, args2(ia_ref(h), ia_ref(t)))
 	cast(Node, slow).type_ = st
 	let ifs = cast(IfStmt, node_new(ST_IF, pos))
-	ifs.cond = mk_bin(pos, cstr(">"), mk_bin(pos, cstr("+"), ia_ref(n), ia_ref(m), ty_int), ia_hdr(h, 1), ty_bool)
+	ifs.cond = mk_bin(pos, ">", mk_bin(pos, "+", ia_ref(n), ia_ref(m), ty_int), ia_hdr(h, 1), ty_bool)
 	ifs.then = empty_block(pos)
 	mut vs1 = cast(Block, ifs.then).stmts
 	vs1 = append(vs1, assign_stmt(pos, ia_ref(h), slow))
@@ -237,35 +237,35 @@ fn ia_append_str(e i64) {
 
 	let fallback = cast(Block, empty_block(pos))
 	let cp = node_new(EX_CALL, pos)
-	cast(Call, cp).name = cstr("memcpy")
+	cast(Call, cp).name = "memcpy"
 	cast(Call, cp).fn_ = cast(i64, memcpy_fn)
-	cast(Call, cp).args = cast([]i64, args3(mk_bin(pos, cstr("+"), ia_hdr(h, 2), ia_ref(n), ty_int), mk_bin(pos, cstr("+"), mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int), ia_ref(m)))
+	cast(Call, cp).args = cast([]i64, args3(mk_bin(pos, "+", ia_hdr(h, 2), ia_ref(n), ty_int), mk_bin(pos, "+", mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int), ia_ref(m)))
 	cast(Node, cp).type_ = ty_int
 	fallback.stmts = append(fallback.stmts, expr_stmt(cast(Node, cp)))
 	// These lengths are common in builders. Avoid a libc call while keeping the
 	// general copy path unchanged and limiting every raw access to its exact width.
 	let short = cast(IfStmt, node_new(ST_IF, pos))
-	short.cond = mk_bin(pos, cstr("=="), ia_ref(m), mk_int(pos, 1, ty_int), ty_bool)
+	short.cond = mk_bin(pos, "==", ia_ref(m), mk_int(pos, 1, ty_int), ty_bool)
 	short.then = empty_block(pos)
 	let sb = cast(Block, short.then).stmts
-	sb = append(sb, let_stmt(pos, cast(Sym, dst), mk_bin(pos, cstr("+"), ia_hdr(h, 2), ia_ref(n), ty_int)))
-	sb = append(sb, let_stmt(pos, cast(Sym, src), mk_bin(pos, cstr("+"), mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int)))
-	sb = append(sb, let_stmt(pos, cast(Sym, word), intrinsic_call(pos, cstr("__ld"), args2(ia_ref(src), mk_int(pos, 0, ty_int)), ty_int)))
-	sb = append(sb, expr_stmt(cast(Node, intrinsic_call(pos, cstr("__st"), args3(ia_ref(dst), ia_ref(word), mk_int(pos, 0, ty_int)), ty_void))))
+	sb = append(sb, let_stmt(pos, cast(Sym, dst), mk_bin(pos, "+", ia_hdr(h, 2), ia_ref(n), ty_int)))
+	sb = append(sb, let_stmt(pos, cast(Sym, src), mk_bin(pos, "+", mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int)))
+	sb = append(sb, let_stmt(pos, cast(Sym, word), intrinsic_call(pos, "__ld", args2(ia_ref(src), mk_int(pos, 0, ty_int)), ty_int)))
+	sb = append(sb, expr_stmt(cast(Node, intrinsic_call(pos, "__st", args3(ia_ref(dst), ia_ref(word), mk_int(pos, 0, ty_int)), ty_void))))
 	let two = cast(IfStmt, node_new(ST_IF, pos))
-	two.cond = mk_bin(pos, cstr("=="), ia_ref(m), mk_int(pos, 2, ty_int), ty_bool)
+	two.cond = mk_bin(pos, "==", ia_ref(m), mk_int(pos, 2, ty_int), ty_bool)
 	two.then = empty_block(pos)
-	let two_dst = mk_bin(pos, cstr("+"), ia_hdr(h, 2), ia_ref(n), ty_int)
-	let two_src = mk_bin(pos, cstr("+"), mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int)
+	let two_dst = mk_bin(pos, "+", ia_hdr(h, 2), ia_ref(n), ty_int)
+	let two_src = mk_bin(pos, "+", mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int)
 	ia_copy_str_chunk(pos, cast(Block, two.then).stmts, two_dst, two_src, 0, 1)
 	let six = cast(IfStmt, node_new(ST_IF, pos))
-	six.cond = mk_bin(pos, cstr("=="), ia_ref(m), mk_int(pos, 6, ty_int), ty_bool)
+	six.cond = mk_bin(pos, "==", ia_ref(m), mk_int(pos, 6, ty_int), ty_bool)
 	six.then = empty_block(pos)
-	let six_dst = mk_bin(pos, cstr("+"), ia_hdr(h, 2), ia_ref(n), ty_int)
-	let six_src = mk_bin(pos, cstr("+"), mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int)
+	let six_dst = mk_bin(pos, "+", ia_hdr(h, 2), ia_ref(n), ty_int)
+	let six_src = mk_bin(pos, "+", mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int)
 	ia_copy_str_chunk(pos, cast(Block, six.then).stmts, six_dst, six_src, 0, 2)
-	let tail_dst = mk_bin(pos, cstr("+"), ia_hdr(h, 2), ia_ref(n), ty_int)
-	let tail_src = mk_bin(pos, cstr("+"), mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int)
+	let tail_dst = mk_bin(pos, "+", ia_hdr(h, 2), ia_ref(n), ty_int)
+	let tail_src = mk_bin(pos, "+", mk_conv(pos, ia_ref(t), CV_SAME, ty_int), mk_int(pos, 8, ty_int), ty_int)
 	ia_copy_str_chunk(pos, cast(Block, six.then).stmts, tail_dst, tail_src, 4, 1)
 	six.else_ = cast(i64, fallback)
 	two.else_ = empty_block(pos)
@@ -275,7 +275,7 @@ fn ia_append_str(e i64) {
 	mut vs4 = cast(Block, short.else_).stmts
 	vs4 = append(vs4, cast(i64, two))
 	els.stmts = append(els.stmts, cast(i64, short))
-	els.stmts = append(els.stmts, assign_stmt(pos, ia_hdr(h, 0), mk_bin(pos, cstr("+"), ia_ref(n), ia_ref(m), ty_int)))
+	els.stmts = append(els.stmts, assign_stmt(pos, ia_hdr(h, 0), mk_bin(pos, "+", ia_ref(n), ia_ref(m), ty_int)))
 	ifs.else_ = cast(i64, els)
 	stmts = append(stmts, cast(i64, ifs))
 	replace_node(e, mk_seq(pos, cast(i64, stmts), ia_ref(h), st))
@@ -405,7 +405,7 @@ fn il_expr(e i64) {
 // For a non-float value x is always equal to itself. After generic inlining this removes
 // the NaN checks from ordered comparisons specialized for integers and strings.
 fn il_fold_reflexive_cmp(e i64) {
-	if e == 0 || cast(Node, e).kind != EX_BINARY || (streq(cast(Binary, e).op, cstr("==")) == 0 && streq(cast(Binary, e).op, cstr("!=")) == 0) {
+	if e == 0 || cast(Node, e).kind != EX_BINARY || (cast(Binary, e).op != "==" && cast(Binary, e).op != "!=") {
 		return
 	}
 	let l = cast(Binary, e).l
@@ -413,7 +413,7 @@ fn il_fold_reflexive_cmp(e i64) {
 	if cast(Node, l).kind != EX_IDENT || cast(Node, r).kind != EX_IDENT || cast(IdentExpr, l).ref == 0 || cast(IdentExpr, l).ref != cast(IdentExpr, r).ref || cast(Sym, cast(IdentExpr, l).ref).kind != SYM_LOCAL || is_float_t(cast(Node, l).type_) != 0 {
 		return
 	}
-	let value = streq(cast(Binary, e).op, cstr("=="))
+	let value = i64(cast(Binary, e).op == "==")
 	replace_node(e, mk_int(cast(Node, e).pos, value, ty_bool))
 }
 
@@ -426,7 +426,7 @@ fn il_fold_boolean(e i64) {
 	let op = cast(Binary, e).op
 	let l = cast(Binary, e).l
 	let r = cast(Binary, e).r
-	if streq(op, cstr("&&")) != 0 {
+	if op == "&&" {
 		if is_const(l) != 0 {
 			if const_val(l) == 0 {
 				replace_node(e, mk_int(cast(Node, e).pos, 0, ty_bool))
@@ -436,7 +436,7 @@ fn il_fold_boolean(e i64) {
 		} else if is_const(r) != 0 && const_val(r) != 0 {
 			replace_node(e, l)
 		}
-	} else if streq(op, cstr("||")) != 0 {
+	} else if op == "||" {
 		if is_const(l) != 0 {
 			if const_val(l) != 0 {
 				replace_node(e, mk_int(cast(Node, e).pos, 1, ty_bool))
@@ -455,23 +455,23 @@ fn il_float_intrinsic(e i64, f Fn) {
 		return
 	}
 	let name = f.name
-	mut op = 0
-	if streq(name, cstr("sqrt")) != 0 {
-		op = cstr("__fsqrt")
-	} else if streq(name, cstr("fabs")) != 0 {
-		op = cstr("__fabs")
-	} else if streq(name, cstr("floor")) != 0 {
-		op = cstr("__frintm")
-	} else if streq(name, cstr("ceil")) != 0 {
-		op = cstr("__frintp")
-	} else if streq(name, cstr("trunc")) != 0 {
-		op = cstr("__frintz")
-	} else if streq(name, cstr("round")) != 0 {
-		op = cstr("__frinta")
-	} else if streq(name, cstr("rint")) != 0 || streq(name, cstr("nearbyint")) != 0 {
-		op = cstr("__frintn")
+	mut op = ""
+	if name == "sqrt" {
+		op = "__fsqrt"
+	} else if name == "fabs" {
+		op = "__fabs"
+	} else if name == "floor" {
+		op = "__frintm"
+	} else if name == "ceil" {
+		op = "__frintp"
+	} else if name == "trunc" {
+		op = "__frintz"
+	} else if name == "round" {
+		op = "__frinta"
+	} else if name == "rint" || name == "nearbyint" {
+		op = "__frintn"
 	}
-	if op != 0 {
+	if len(op) != 0 {
 		cast(Call, e).name = op
 		cast(Call, e).intrinsic = 1
 		cast(Call, e).fn_ = 0
@@ -505,10 +505,10 @@ fn il_inlinable(f Fn) i64 {
 // a placeholder, so inlining it would run the placeholder.
 fn il_substituted(f Fn) i64 {
 	let n = f.qname
-	if streq(n, cstr("linux_raw")) != 0 || streq(n, cstr("linux_restorer")) != 0 || streq(n, cstr("mem_avx2_supported")) != 0 || streq(n, cstr("mem_copy64")) != 0 || streq(n, cstr("mem_fill64")) != 0 || streq(n, cstr("rt_task_swap")) != 0 || streq(n, cstr("seal.hw_blocks")) != 0 {
+	if n == "linux_raw" || n == "linux_restorer" || n == "mem_avx2_supported" || n == "mem_copy64" || n == "mem_fill64" || n == "rt_task_swap" || n == "seal.hw_blocks" {
 		return 1
 	}
-	if streq(n, cstr("memcpy")) != 0 || streq(n, cstr("memmove")) != 0 || streq(n, cstr("memset")) != 0 || streq(n, cstr("memcmp")) != 0 || streq(n, cstr("memchr")) != 0 {
+	if n == "memcpy" || n == "memmove" || n == "memset" || n == "memcmp" || n == "memchr" {
 		return 1
 	}
 	return i64(syscall_fast_arm64(n) != 0 || syscall_fast_amd64(n) != 0 || aes_hw_arm64(n) != 0 || aes_hw_amd64(n) != 0)
@@ -534,7 +534,7 @@ fn il_size(e i64) i64 {
 		return 1
 	}
 	if k == EX_UNARY {
-		if streq(cast(Unary, e).op, cstr("&")) != 0 {
+		if cast(Unary, e).op == "&" {
 			return 1000
 		}
 		return 1 + il_size(cast(Unary, e).x)
@@ -626,7 +626,7 @@ fn il_pure(e i64) i64 {
 		return i64(cast(IdentExpr, e).ref != 0 && cast(Sym, cast(IdentExpr, e).ref).kind != SYM_GLOBAL)
 	}
 	if k == EX_UNARY {
-		return i64(streq(cast(Unary, e).op, cstr("&")) == 0 && il_pure(cast(Unary, e).x) != 0)
+		return i64(cast(Unary, e).op != "&" && il_pure(cast(Unary, e).x) != 0)
 	}
 	if k == EX_BINARY {
 		return i64(may_panic(cast(Binary, e)) == 0 && il_pure(cast(Binary, e).l) != 0 && il_pure(cast(Binary, e).r) != 0)
@@ -694,7 +694,7 @@ fn il_expand(e i64, f Fn) {
 }
 
 fn ia_local_in(f Fn, t i64) i64 {
-	let s = sym_new(SYM_LOCAL, cstr("$"), 0)
+	let s = sym_new(SYM_LOCAL, "$", 0)
 	s.type_ = t
 	s.slot = f.slots
 	f.slots = f.slots + 1
@@ -785,7 +785,7 @@ fn lit_word(lit StrLit, off i64, size i64) i64 {
 	mut v = 0
 	mut i = size - 1
 	for i >= 0 {
-		v = (v << 8) | i64(load8(lit.ptr + off + i))
+		v = (v << 8) | i64(lit.ptr[off + i])
 		i = i - 1
 	}
 	return v
@@ -813,13 +813,13 @@ fn ia_append_lit(e i64, lit StrLit) {
 	cast(Call, slow).args = cast([]i64, args2(ia_ref(h), cast(i64, lit)))
 	cast(Node, slow).type_ = st
 	let ifs = cast(IfStmt, node_new(ST_IF, pos))
-	ifs.cond = mk_bin(pos, cstr(">"), mk_bin(pos, cstr("+"), ia_ref(n), mk_int(pos, len_, ty_int), ty_int), ia_hdr(h, 1), ty_bool)
+	ifs.cond = mk_bin(pos, ">", mk_bin(pos, "+", ia_ref(n), mk_int(pos, len_, ty_int), ty_int), ia_hdr(h, 1), ty_bool)
 	ifs.then = empty_block(pos)
 	mut vs1 = cast(Block, ifs.then).stmts
 	vs1 = append(vs1, assign_stmt(pos, ia_ref(h), slow))
 	let els = cast(Block, empty_block(pos))
 	let eb = els.stmts
-	eb = append(eb, let_stmt(pos, cast(Sym, p), mk_bin(pos, cstr("+"), ia_hdr(h, 2), ia_ref(n), ty_int)))
+	eb = append(eb, let_stmt(pos, cast(Sym, p), mk_bin(pos, "+", ia_hdr(h, 2), ia_ref(n), ty_int)))
 	mut off = 0
 	for off < len_ {
 		mut size = 8
@@ -834,12 +834,12 @@ fn ia_append_lit(e i64, lit StrLit) {
 			size = 1
 			lg = 0
 		}
-		let addr = mk_bin(pos, cstr("+"), ia_ref(p), mk_int(pos, off, ty_int), ty_int)
-		let st3 = intrinsic_call(pos, cstr("__st"), args3(addr, mk_int(pos, lit_word(lit, off, size), ty_int), mk_int(pos, lg, ty_int)), ty_void)
+		let addr = mk_bin(pos, "+", ia_ref(p), mk_int(pos, off, ty_int), ty_int)
+		let st3 = intrinsic_call(pos, "__st", args3(addr, mk_int(pos, lit_word(lit, off, size), ty_int), mk_int(pos, lg, ty_int)), ty_void)
 		eb = append(eb, expr_stmt(cast(Node, st3)))
 		off = off + size
 	}
-	eb = append(eb, assign_stmt(pos, ia_hdr(h, 0), mk_bin(pos, cstr("+"), ia_ref(n), mk_int(pos, len_, ty_int), ty_int)))
+	eb = append(eb, assign_stmt(pos, ia_hdr(h, 0), mk_bin(pos, "+", ia_ref(n), mk_int(pos, len_, ty_int), ty_int)))
 	ifs.else_ = cast(i64, els)
 	stmts = append(stmts, cast(i64, ifs))
 	replace_node(e, mk_seq(pos, cast(i64, stmts), ia_ref(h), st))

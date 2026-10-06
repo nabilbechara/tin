@@ -26,17 +26,17 @@ def generate():
                 *[f'-DNR_{n.upper()}={numbers[n]}' for n in DEFINES], '-c',
                 str(ROOT/f'tools/arch/syscall-fast-{arch}.S'), '-o', str(obj)], check=True)
             table = functions(obj, NAMES)
-            result += ['', f'fn syscall_fast_{arch}(name i64) i64 {{', '\tmut hex = cstr("")']
+            result += ['', f'fn syscall_fast_{arch}(name str) i64 {{', '\tmut hex = ""']
             for name in NAMES:
                 data = table[name]
                 code = ''.join(f'{v[0]:08x}' for v in struct.iter_unpack('<I',data)) if arch=='arm64' else data.hex()
-                result += [f'\tif streq(name, cstr("{name}")) != 0 {{', f'\t\thex = cstr("{code}")', '\t}']
-            result += ['\tif i64(load8(hex)) == 0 {', '\t\treturn 0', '\t}', '\tlet v = []i64{}', '\tmut i = 0',
-                       '\tfor i64(load8(hex + i)) != 0 {']
+                result += [f'\tif name == "{name}" {{', f'\t\thex = "{code}"', '\t}']
+            result += ['\tif i64(byte_at(hex, 0)) == 0 {', '\t\treturn 0', '\t}', '\tlet v = []i64{}', '\tmut i = 0',
+                       '\tfor i < len(hex) {']
             if arch == 'arm64':
-                result += ['\t\traw(cast([]i64, v), hex_word(hex + i))', '\t\ti = i + 8']
+                result += ['\t\traw(cast([]i64, v), hex_word(hex, i))', '\t\ti = i + 8']
             else:
-                result += ['\t\tv = append(v, num_digit(i64(load8(hex + i))) * 16 + num_digit(i64(load8(hex + i + 1))))', '\t\ti = i + 2']
+                result += ['\t\tv = append(v, num_digit(i64(hex[i])) * 16 + num_digit(i64(hex[i + 1])))', '\t\ti = i + 2']
             result += ['\t}', '\treturn cast(i64, v)', '}']
     return '\n'.join(result)+'\n'
 

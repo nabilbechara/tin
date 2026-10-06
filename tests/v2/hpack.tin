@@ -1,0 +1,51 @@
+package main
+
+import "hpack"
+import "say"
+import "seal"
+
+// HPACK (RFC 7541, #480): the request and response examples of Appendix C with Huffman coding
+// (C.4 on one connection, C.6 with a 256-byte table, so entries are evicted), errors, and
+// Encode's blocks decoded back.
+
+fn show(label str, d hpack.Decoder, hex str) {
+	let b = seal.HexDecode(hex) catch e {
+		say.Line(label, "hex:", e)
+		return
+	}
+	let fs = d.Decode(b) catch e {
+		say.Line(label, "fault:", e)
+		return
+	}
+	mut parts = []str{}
+	for _, f in fs {
+		parts = append(parts, f.Name + "=" + f.Value)
+	}
+	say.Line(label, parts)
+}
+
+fn main() {
+	let d = hpack.NewDecoder(4096, 65536)
+	show("C.4.1", d, "828684418cf1e3c2e5f23a6ba0ab90f4ff")
+	show("C.4.2", d, "828684be5886a8eb10649cbf")
+	show("C.4.3", d, "828785bf408825a849e95ba97d7f8925a849e95bb8e8b4bf")
+	d.Free()
+	let r = hpack.NewDecoder(256, 65536)
+	show("C.6.1", r, "488264025885aec3771a4b6196d07abe941054d444a8200595040b8166e082a62d1bff6e919d29ad171863c78f0b97c8e9ae82ae43d3")
+	show("C.6.2", r, "4883640effc1c0bf")
+	show("C.6.3", r, "88c16196d07abe941054d444a8200595040b8166e084a62d1bffc05a839bd9ab77ad94e7821dd7f2e6c7b335dfdfcd5b3960d5af27087f3672c1ab270fb5291f9587316065c003ed4ee5b1063d5007")
+	r.Free()
+	let e = hpack.NewDecoder(4096, 100)
+	show("index 0", e, "80")
+	show("index past the tables", e, "be")
+	show("a list over its limit", e, "400a637573746f6d2d6b65790d637573746f6d2d686561646572400a637573746f6d2d6b65790d637573746f6d2d686561646572400a637573746f6d2d6b65790d637573746f6d2d686561646572")
+	show("cut short", e, "0f")
+	show("a table size past the setting", e, "3fe21f")
+	show("EOS in a string", e, "0085ffffffffff")
+	mut block = make([]u8, 0, 128)
+	hpack.Encode(mut block, []hpack.Field{hpack.Field{Name: ":method", Value: "POST"}, hpack.Field{Name: ":scheme", Value: "https"},
+		hpack.Field{Name: ":path", Value: "/helloworld.Greeter/SayHello"}, hpack.Field{Name: "content-type", Value: "application/grpc"},
+		hpack.Field{Name: "te", Value: "trailers"}})
+	say.Line("encoded", seal.Hex(block))
+	show("round trip", hpack.NewDecoder(4096, 65536), seal.Hex(block))
+}
