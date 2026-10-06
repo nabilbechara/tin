@@ -14,8 +14,8 @@ import "seal"
 // There is no 0-RTT: a ticket offered twice gives two ordinary resumed handshakes.
 //
 // The ticket: day (4 bytes, big-endian) | nonce (12) | AES-256-GCM(version 1 | cipher suite (2) |
-// issued, ms since the epoch (8) | ticket_age_add (4) | ALPN (1 + n) | PSK (1 + n)), the day as
-// additional data.
+// issued, ms since the epoch (8) | ticket_age_add (4) | ALPN (1 + n) | PSK (1 + n) | the client's
+// certificate chain (1 byte count, then 3 + n each; #475)), the day as additional data.
 
 shared mut gTicketSecret i64   // 32 bytes (malloc'd), 0 until init_tickets
 shared mut gTicketsOff bool    // TIN_TLS_TICKETS=0
@@ -127,8 +127,9 @@ fn ticket_key(day i64) !seal.AEAD {
 	return a
 }
 
-// make_ticket seals a ticket for a session negotiated with suite and alpn whose PSK is psk.
-fn make_ticket(suite i64, alpn str, psk []u8, ageAdd i64) ![]u8 {
+// make_ticket seals a ticket for a session negotiated with suite and alpn whose PSK is psk, with
+// the client's certificate chain when it sent one.
+fn make_ticket(suite i64, alpn str, psk []u8, ageAdd i64, certs [][]u8) ![]u8 {
 	let now = rt_wall_ns() / 1000000
 	let day = now / ticketDayMs
 	let a = try ticket_key(day)
@@ -143,6 +144,11 @@ fn make_ticket(suite i64, alpn str, psk []u8, ageAdd i64) ![]u8 {
 	plain = append(plain, alpn...)
 	plain = append(plain, u8(len(psk)))
 	plain = append(plain, psk...)
+	plain = append(plain, u8(len(certs)))
+	for _, der in certs {
+		put24(mut plain, len(der))
+		plain = append(plain, der...)
+	}
 	let ad = []u8{u8(day >> 24), u8(day >> 16), u8(day >> 8), u8(day)}
 	let nonce = seal.RandomBytes(12)
 	let sealed = try a.Seal(nonce, plain, ad)
@@ -158,12 +164,13 @@ type sessionState struct {
 	suite i64
 	alpn  str
 	psk   []u8
+	certs [][]u8 // the client's certificate chain (empty: none)
 }
 
 // open_ticket reads a ticket this server issued; ok is false for anything else: another
 // server's or a forged ticket, one too old, or one from a day whose key has passed.
 fn open_ticket(t []u8) (sessionState, bool) {
-	let none = sessionState{suite: 0, alpn: "", psk: []u8{}}
+	let none = sessionState{suite: 0, alpn: "", psk: []u8{}, certs: [][]u8{}}
 	if !tickets_on() || len(t) < 4+12+16+18 {
 		return none, false
 	}
@@ -190,19 +197,24 @@ fn open_ticket(t []u8) (sessionState, bool) {
 	r.bytes(4) // ticket_age_add: only 0-RTT needs the client's view of the age
 	let alpn = str(r.vec8())
 	let psk = r.vec8()
+	let n = r.u8v()
+	mut certs = make([][]u8, 0, n)
+	for i in 0..n {
+		certs = append(certs, clone(r.vec24()))
+	}
 	if r.bad || !r.done() || now-issued < 0 || now-issued >= gTicketLifeS*1000 {
 		return none, false
 	}
-	return sessionState{suite: suite, alpn: alpn, psk: clone(psk)}, true
+	return sessionState{suite: suite, alpn: alpn, psk: clone(psk), certs: certs}, true
 }
 
 // send_ticket sends one NewSessionTicket after the handshake: lifetime, ticket_age_add, an
 // empty nonce (one ticket per connection), the ticket, no extensions.
-fn (c mut Conn) send_ticket(h seal.Hash, suite i64, alpn str, resumption []u8) ! {
+fn (c mut Conn) send_ticket(h seal.Hash, suite i64, alpn str, resumption []u8, certs [][]u8) ! {
 	let ra = seal.RandomBytes(4)
 	let ageAdd = be32(ra, 0)
 	let psk = try seal.HkdfExpandLabel(h, str(resumption), "resumption", "", seal.Size(h))
-	let tkt = try make_ticket(suite, alpn, psk, ageAdd)
+	let tkt = try make_ticket(suite, alpn, psk, ageAdd, certs)
 	mut b = make([]u8, 0, 16+len(tkt))
 	let life = gTicketLifeS
 	b = append(b, u8(life>>24), u8(life>>16), u8(life>>8), u8(life))

@@ -14,6 +14,8 @@ type ServerConfig struct {
 	Key seal.PrivateKey  // the leaf's private key (RSA, ECDSA P-256 or P-384)
 	ALPN []str           // protocols spoken, most preferred first (empty: no ALPN)
 	Timeout i64          // ns the handshake may take (0: no limit; a request's deadline still applies)
+	ClientAuth i64       // NoClientCert, RequestClientCert or RequireClientCert (#475)
+	ClientCAs str        // PEM roots client certificates must chain to (with ClientAuth; the system's roots are not used)
 }
 
 // LoadServerConfig reads a PEM certificate chain (leaf first) and the leaf's PEM private key
@@ -331,13 +333,14 @@ fn (c mut Conn) server_handshake(cfg ServerConfig) ! {
 	mut psk = []u8{}
 	if len(final.pskIDs) > 0 && final.pskDHE {
 		let (st, ok) = open_ticket(final.pskIDs[0])
-		if ok && suite_hash(st.suite) == h && st.alpn == alpn {
+		if ok && suite_hash(st.suite) == h && st.alpn == alpn && client_ticket_ok(cfg, st) {
 			let truncated = finalMsg[:len(finalMsg)-final.bindLen]
 			let want = try psk_binder(h, st.psk, prefix, truncated)
 			if !seal.ConstantTimeEq(want, final.binders[0]) {
 				fail alert_fault(alertDecryptError, "PSK binder does not verify")
 			}
 			psk = st.psk
+			c.certs = st.certs
 		}
 	}
 	let resumed = len(psk) > 0
@@ -382,17 +385,14 @@ fn (c mut Conn) server_handshake(cfg ServerConfig) ! {
 	}
 	close_len(mut ee, exts, 2)
 	mut flight = handshake_msg(hsEncryptedExtensions, ee)
+	// A client certificate is asked for on a full handshake (a resumed one has the ticket's).
+	let askCert = !resumed && cfg.ClientAuth != NoClientCert
+	if askCert {
+		let crm = try certificate_request_msg(cfg)
+		flight = cat(flight, crm)
+	}
 	if !resumed {
-		mut cm = make([]u8, 0, 4096)
-		cm = append(cm, 0)
-		let list = open_len(mut cm, 3)
-		for _, der in cfg.Certificates {
-			put24(mut cm, len(der))
-			cm = append(cm, der...)
-			put16(mut cm, 0)
-		}
-		close_len(mut cm, list, 3)
-		flight = cat(flight, handshake_msg(hsCertificate, cm))
+		flight = cat(flight, certificate_msg([]u8{}, cfg.Certificates))
 	}
 	transcript = cat(transcript, flight)
 	if !resumed {
@@ -415,12 +415,40 @@ fn (c mut Conn) server_handshake(cfg ServerConfig) ! {
 	let sats = try derive_secret(h, sc.master, "s ap traffic", thash)
 	keylog(ch.random, sc.chs, sc.shs, cats, sats)
 	try c.set_write_key(sats)
-	// The client's Finished, under its handshake key.
+	// The client's certificate and CertificateVerify when one was asked for, then its Finished,
+	// under its handshake key.
+	if askCert {
+		typ, msg = try hr.next(mut c)
+		if typ != hsCertificate {
+			fail alert_fault(alertUnexpectedMessage, "expected the client's Certificate")
+		}
+		let certs = try parse_client_certificate(msg[4:])
+		transcript = cat(transcript, msg)
+		if len(certs) == 0 {
+			if cfg.ClientAuth == RequireClientCert {
+				fail alert_fault(alertCertificateRequired, "the client sent no certificate")
+			}
+		} else {
+			typ, msg = try hr.next(mut c)
+			if typ != hsCertificateVerify {
+				fail alert_fault(alertUnexpectedMessage, "expected the client's CertificateVerify")
+			}
+			let cv = rdr{b: msg[4:]}
+			let cscheme = cv.u16v()
+			let csig = cv.vec16()
+			if cv.bad || !cv.done() {
+				fail alert_fault(alertDecodeError, "malformed client CertificateVerify")
+			}
+			try verify_client(cfg, certs, cscheme, cv_content_client(transcript_hash(h, transcript)), csig)
+			transcript = cat(transcript, msg)
+			c.certs = certs
+		}
+	}
 	typ, msg = try hr.next(mut c)
 	if typ != hsFinished {
 		fail alert_fault(alertUnexpectedMessage, "expected the client's Finished")
 	}
-	let want = try finished_mac(h, sc.chs, thash)
+	let want = try finished_mac(h, sc.chs, transcript_hash(h, transcript))
 	if !seal.ConstantTimeEq(want, msg[4:]) {
 		fail alert_fault(alertDecryptError, "client Finished does not verify")
 	}
@@ -433,7 +461,7 @@ fn (c mut Conn) server_handshake(cfg ServerConfig) ! {
 	c.resumed = resumed
 	if tickets_on() {
 		let res = try derive_secret(h, sc.master, "res master", transcript_hash(h, cat(transcript, msg)))
-		try c.send_ticket(h, suite, alpn, res)
+		try c.send_ticket(h, suite, alpn, res, c.certs)
 	}
 	c.ready = true
 }

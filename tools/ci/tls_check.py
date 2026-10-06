@@ -248,6 +248,31 @@ def resumption(exe, openssl, certs, work):
     print('PASS resumption: a server that lost its ticket keys gets a full handshake, then resumption again')
 
 
+def client_certificate(exe, openssl, certs, work):
+    """Mutual TLS from the client (#475): openssl s_server requiring a certificate from the test
+    PKI's CA accepts the Tin client's (ECDSA and RSA keys) and refuses a client without one."""
+    pki = work / 'pki'
+    pki.mkdir(exist_ok=True)
+    subprocess.run(['go', 'run', str(ROOT / 'tools/ci/fixtures/mtlspki.go'), str(pki)], cwd=ROOT, check=True, timeout=300)
+    cert = certs['ecdsa']
+    port = free_port()
+    proc = subprocess.Popen([openssl, 's_server', '-tls1_3', '-accept', str(port), '-cert', str(cert[0]), '-key', str(cert[1]),
+                             '-www', '-quiet', '-Verify', '1', '-CAfile', str(pki / 'ca.pem'), '-verify_return_error'],
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        wait_port(port, proc)
+        for name in ('alice', 'rsa'):
+            out = run(exe, 'mtls', f'127.0.0.1:{port}', 1, cert[0], pki / f'{name}.pem', pki / f'{name}.key')
+            assert out.startswith('mtls false <HTML>') and 'TLSv1.3' in out, (name, out[:500])
+        out = run(exe, 'mtls', f'127.0.0.1:{port}', 1, cert[0])
+        assert out.startswith('fault tls: remote error: certificate required'), out
+    finally:
+        proc.kill()
+        proc.wait()
+    print('PASS client certificates: openssl s_server -Verify accepts the Tin client\'s ECDSA and RSA certificates and '
+          'refuses a client without one')
+
+
 KEYLOG_LABELS = ('CLIENT_HANDSHAKE_TRAFFIC_SECRET', 'SERVER_HANDSHAKE_TRAFFIC_SECRET', 'CLIENT_TRAFFIC_SECRET_0',
                  'SERVER_TRAFFIC_SECRET_0')
 
@@ -573,6 +598,7 @@ def main():
             verified(exe, openssl, certs)
             resumption(exe, openssl, certs, work)
             keylog(exe, openssl, certs, work)
+            client_certificate(exe, openssl, certs, work)
             keyupdate(exe, openssl, certs)
         else:
             print('SKIP openssl s_server interop: no OpenSSL 3 command line on this runner')

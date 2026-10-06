@@ -881,8 +881,23 @@ HTTP/1.1 over TLS 1.3 on the same per-core event loops (`lib/anvil/serve_tls.tin
 - **Linking.** `anvil.tin` reaches `serve_tls.tin` only through function hooks (`gTlsRead`,
   `gTlsSeal`, ...) that `ServeTLS` sets, each behind a test of `cTls`: a server that never calls
   `ServeTLS` links no TLS code (`examples/api.tin` grew by 335 bytes) and its loop is unchanged.
-- **Not supported:** 0-RTT, client certificates (#475), certificate selection by SNI (one chain
-  per server, #476), Ed25519 server keys (#477), and TLS 1.2 (#473). A
+- **Client certificates (#475).** `ServeTLSConfig` with `TLSConfig.ClientAuth`
+  (`tls.RequestClientCert` or `tls.RequireClientCert`) and `ClientCAs` makes every full
+  handshake send a CertificateRequest. It lists the schemes the server verifies (ECDSA and
+  RSA-PSS; TLS 1.3 forbids PKCS #1 v1.5 there) and the subjects of the CAs
+  (certificate_authorities). The client's chain is verified against `ClientCAs` alone (not the
+  system's roots) for the clientAuth extended key usage, then its CertificateVerify. Refusals
+  have their own alerts: certificate_required for none when required, unknown_ca, and
+  certificate_expired; bad_certificate for anything else, such as a certificate for servers
+  only. A handler reads the verified chain in `q.TLSConn().PeerCertificates()`. A session
+  ticket carries the client's chain, so a resumed session keeps its identity. A server that
+  requires a certificate resumes only a session that had one, and only while the certificate is
+  still valid. The client side: `tls.Config.Certificate` and `Key` (PEM, parsed once per core)
+  are sent when a server asks, with a CertificateVerify in a scheme the server accepts, or an
+  empty Certificate when there is none. The database clients pass them through `Options.TLS`
+  (PostgreSQL `clientcert=verify-full`, MySQL `REQUIRE X509`, Redis `tls-auth-clients`).
+- **Not supported:** 0-RTT, certificate selection by SNI (one chain per server, #476), Ed25519
+  server keys (#477), and TLS 1.2 (#473). A
   `TIN_REPLAY_CAPSULE` replay sends plain HTTP and cannot replay into a TLS server.
 
 ### Pooled clients: mysql (v0.4)

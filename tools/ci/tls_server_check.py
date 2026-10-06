@@ -472,6 +472,80 @@ def resumption(openssl, exe, client, certs, work):
           'TIN_TLS_TICKETS=0 and a ticket past TIN_TLS_TICKET_LIFETIME_S do not')
 
 
+# ---- client certificates (mutual TLS, #475) ----
+
+def make_pki(work):
+    """The client-certificate test PKI (tools/ci/fixtures/mtlspki.go): CA, alice, rsa, bob (server
+    only), carol (expired), mallory (another CA)."""
+    pki = work / 'pki'
+    pki.mkdir(exist_ok=True)
+    subprocess.run(['go', 'run', str(ROOT / 'tools/ci/fixtures/mtlspki.go'), str(pki)], cwd=ROOT, check=True, timeout=300)
+    return pki
+
+
+def mtls(openssl, exe, client, certs, work):
+    pki = make_pki(work)
+    cert = certs['ecdsa']
+
+    def who(name):
+        return ['-cert', str(pki / f'{name}.pem'), '-key', str(pki / f'{name}.key')]
+
+    sess = work / 'mtls-sess.pem'
+    srv = Server(exe, cert, work, env={'TLS_CLIENT_AUTH': '2', 'TLS_CLIENT_CAS': str(pki / 'ca.pem')}, cores=2)
+    try:
+        for name, cn in (('alice', 'alice'), ('rsa', 'rsa-client')):
+            rc, out = s_client(openssl, srv.port, who(name) + ['-sess_out', str(sess)], get('/whoami'), cafile=cert[0])
+            assert rc == 0 and f'cn={cn} chain=1 resumed=false' in out, (name, out[-1500:])
+        # A resumed session keeps the client's identity (the ticket carries the chain).
+        rc, out = s_client(openssl, srv.port, ['-sess_in', str(sess)], get('/whoami'), cafile=cert[0])
+        assert rc == 0 and 'Reused, TLSv1.3' in out and 'cn=rsa-client chain=1 resumed=true' in out, out[-1500:]
+        for name, alert in ((None, 116), ('bob', 42), ('carol', 45), ('mallory', 48)):
+            args = who(name) if name else []
+            rc, out = s_client(openssl, srv.port, args, get('/whoami'), cafile=cert[0])
+            assert f'alert number {alert}' in out and 'cn=' not in out, (name, alert, out[-1500:])
+        r = subprocess.run([str(client), 'mtls', srv.addr(), '2', str(cert[0]), str(pki / 'alice.pem'), str(pki / 'alice.key')],
+                           capture_output=True, text=True, timeout=60)
+        assert r.stdout == 'mtls false cn=alice chain=1 resumed=false\nmtls true cn=alice chain=1 resumed=true\n', r.stdout
+        r = subprocess.run([str(client), 'mtls', srv.addr(), '1', str(cert[0])], capture_output=True, text=True, timeout=60)
+        assert r.stdout == 'fault tls: remote error: certificate required\n', r.stdout
+        # wire with client certificates: alice, then dave, then alice again; a kept connection is
+        # never lent to the other identity.
+        r = subprocess.run([str(client), 'wiremtls', f'https://localhost:{srv.port}/whoami', str(cert[0]),
+                            str(pki / 'alice.pem'), str(pki / 'alice.key'), str(pki / 'rsa.pem'), str(pki / 'rsa.key')],
+                           capture_output=True, text=True, timeout=60)
+        lines = r.stdout.splitlines()
+        assert len(lines) == 3 and lines[0].startswith('wire 200 cn=alice ') and lines[1].startswith('wire 200 cn=rsa-client ') \
+            and lines[2].startswith('wire 200 cn=alice '), r.stdout
+        if PY_TLS13:
+            ctx = py_ctx(cert)
+            ctx.load_cert_chain(str(pki / 'alice.pem'), str(pki / 'alice.key'))
+            s = py_connect(srv, ctx)
+            s.sendall(get('/whoami'))
+            assert read_to_close(s).endswith(b'cn=alice chain=1 resumed=false'), 'Python client certificate'
+            s.close()
+    finally:
+        srv.stop()
+    # RequestClientCert: a client without a certificate is served; one that sends a bad one is not.
+    srv = Server(exe, cert, work, env={'TLS_CLIENT_AUTH': '1', 'TLS_CLIENT_CAS': str(pki / 'ca.pem')})
+    try:
+        rc, out = s_client(openssl, srv.port, [], get('/whoami'), cafile=cert[0])
+        assert rc == 0 and '\r\n\r\nnone' in out, out[-1500:]
+        rc, out = s_client(openssl, srv.port, who('alice'), get('/whoami'), cafile=cert[0])
+        assert rc == 0 and 'cn=alice' in out, out[-1500:]
+        rc, out = s_client(openssl, srv.port, who('mallory'), get('/whoami'), cafile=cert[0])
+        assert 'alert number 48' in out and 'cn=' not in out, out[-1500:]
+    finally:
+        srv.stop()
+    # A server without ClientCAs does not start.
+    p = subprocess.run([str(exe)], env=dict(os.environ, PORT=str(free_port()), TLS_CERT=str(cert[0]), TLS_KEY=str(cert[1]),
+                                            TLS_CLIENT_AUTH='2', TLS_CLIENT_CAS=str(cert[1])),
+                       capture_output=True, text=True, timeout=30)
+    assert p.returncode == 0 and 'server:' in p.stdout and 'ClientCAs' in p.stdout, p.stdout + p.stderr
+    print('PASS client certificates: openssl (ECDSA and RSA keys), Python and the Tin client verified; a resumed session keeps '
+          'the identity; certificate_required, bad_certificate (server-only usage), certificate_expired and unknown_ca '
+          'refusals; RequestClientCert serves a client without one; ClientCAs without a certificate fail at start')
+
+
 # ---- malformed handshakes and timeouts ----
 
 def exchange(port, data, wait=5.0):
@@ -741,6 +815,7 @@ def main():
         openssl_interop(openssl, exe, certs, work)
         tin_clients(exe, client, certs, work)
         resumption(openssl, exe, client, certs, work)
+        mtls(openssl, exe, client, certs, work)
         malformed(exe, client, certs, work)
         one_core(exe, client, certs, work)
         memory(openssl, exe, certs, work)

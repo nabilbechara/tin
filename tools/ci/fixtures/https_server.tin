@@ -10,12 +10,16 @@
 //   GET  /fast         "fast"
 //   GET  /ws           a WebSocket echo: each message back, prefixed "echo: "
 //   GET  /watch        streams its head, then waits until w.Closed() and prints "watch saw closed"
+//   GET  /whoami       the common name of the client's certificate, or "none" (#475)
+// With TLS_CLIENT_AUTH (1 request, 2 require) and TLS_CLIENT_CAS (a path) it serves through
+// ServeTLSConfig and asks clients for certificates.
 package main
 
 import "anvil"
 import "mint"
 import "quarry"
 import "say"
+import "seal"
 import "tide"
 import "websocket"
 
@@ -34,6 +38,19 @@ fn pattern(size i64, start i64) []u8 {
 
 fn root(q anvil.Req, w mut anvil.Out) {
 	w.Text("hello over tls")
+}
+
+fn whoami(q anvil.Req, w mut anvil.Out) {
+	let tc = q.TLSConn()
+	if tc == nil || len(tc.PeerCertificates()) == 0 {
+		w.Text("none")
+		return
+	}
+	let c = seal.ParseCertificate(tc.PeerCertificates()[0]) catch err {
+		w.Text("bad: {err}")
+		return
+	}
+	w.Text("cn={c.Subject.CommonName} chain={len(tc.PeerCertificates())} resumed={tc.Resumed()}")
 }
 
 fn info(q anvil.Req, w mut anvil.Out) {
@@ -143,6 +160,18 @@ fn main() {
 	r.Get("/fast", fast)
 	r.Get("/ws", ws)
 	r.Get("/watch", watch)
+	r.Get("/whoami", whoami)
+	let auth = mint.Atoi(quarry.Getenv("TLS_CLIENT_AUTH")) catch _ { 0 }
+	if auth != 0 {
+		let cas = quarry.ReadFile(quarry.Getenv("TLS_CLIENT_CAS")) catch err {
+			say.Line("client CAs:", err)
+			return
+		}
+		r.ServeTLSConfig(":8443", anvil.TLSConfig{CertPEM: cert, KeyPEM: key, ClientAuth: auth, ClientCAs: cas}) catch err {
+			say.Line("server:", err)
+		}
+		return
+	}
 	r.ServeTLS(":8443", cert, key) catch err {
 		say.Line("server:", err)
 	}

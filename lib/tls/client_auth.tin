@@ -1,0 +1,287 @@
+package tls
+
+import "say"
+import "seal"
+
+// ---- client certificates: mutual TLS (RFC 8446 sections 4.3.2, 4.4.2 and 4.4.3; #475) ----
+//
+// A server whose ServerConfig.ClientAuth is RequestClientCert or RequireClientCert sends a
+// CertificateRequest after EncryptedExtensions: the signature schemes it verifies, and the
+// names of the CAs in ClientCAs (certificate_authorities). The client answers with its
+// certificate chain and a CertificateVerify signed with the context string "TLS 1.3, client
+// CertificateVerify" (or an empty Certificate when it has none). The server verifies the chain
+// against ClientCAs alone (not the system's roots) for client authentication (extended key
+// usage clientAuth, or none), then the signature. A session resumed from a ticket keeps the
+// client's chain, which the ticket carries.
+
+// NoClientCert, RequestClientCert and RequireClientCert are ServerConfig.ClientAuth: ask for no
+// client certificate; ask for one and verify it when the client sends one; require a verified one.
+const NoClientCert = 0
+const RequestClientCert = 1
+const RequireClientCert = 2
+
+const extCertificateAuthorities = 47
+
+const alertCertificateExpired = 45
+const alertUnknownCA = 48
+const alertCertificateRequired = 116
+
+// clientSchemes are the CertificateVerify schemes a server accepts from a client: TLS 1.3 forbids
+// RSA PKCS #1 v1.5 there.
+let clientSchemes = []i64{0x0403, 0x0503, 0x0804, 0x0805, 0x0806, 0x0807}
+
+// credential is a certificate chain (DER, leaf first) and its private key.
+type credential struct {
+	chain [][]u8
+	key   seal.PrivateKey
+}
+
+// The client credential of the last Config.Certificate and Config.Key, per core (parsing an RSA
+// key is costly: it is done once).
+mut credPEM str
+mut credCache ?credential
+
+// client_credential is the parsed Config.Certificate and Config.Key.
+fn client_credential(certPEM str, keyPEM str) !credential {
+	let cached = credCache
+	if cached != nil && credPEM == certPEM+keyPEM {
+		return cached
+	}
+	let certs = seal.ParseCertificatesPEM(certPEM) catch err {
+		fail say.Fault("tls: Config.Certificate: %v", err)
+	}
+	let key = seal.ParsePrivateKeyPEM(keyPEM) catch err {
+		fail say.Fault("tls: Config.Key: %v", err)
+	}
+	if !key.MatchesCertificate(certs[0]) {
+		fail "tls: Config.Key does not belong to the first certificate of Config.Certificate"
+	}
+	mut chain = make([][]u8, 0, len(certs))
+	for _, c in certs {
+		chain = append(chain, c.Raw)
+	}
+	let cr = credential{chain: chain, key: key}
+	credPEM = keep(certPEM + keyPEM)
+	credCache = keep(cr)
+	return cr
+}
+
+// cv_content_client is what a client's CertificateVerify signs.
+fn cv_content_client(transcript []u8) []u8 {
+	mut b = make([]u8, 0, 64+34+len(transcript))
+	for i in 0..64 {
+		b = append(b, 0x20)
+	}
+	b = append(b, "TLS 1.3, client CertificateVerify"...)
+	b = append(b, 0)
+	b = append(b, transcript...)
+	return b
+}
+
+// certificate_msg is a Certificate message with the request context ctx and chain.
+fn certificate_msg(ctx []u8, chain [][]u8) []u8 {
+	mut cm = make([]u8, 0, 4096)
+	cm = append(cm, u8(len(ctx)))
+	cm = append(cm, ctx...)
+	let list = open_len(mut cm, 3)
+	for _, der in chain {
+		put24(mut cm, len(der))
+		cm = append(cm, der...)
+		put16(mut cm, 0)
+	}
+	close_len(mut cm, list, 3)
+	return handshake_msg(hsCertificate, cm)
+}
+
+// certificate_verify_msg is a CertificateVerify message.
+fn certificate_verify_msg(scheme i64, sig []u8) []u8 {
+	mut cv = make([]u8, 0, 8+len(sig))
+	put16(mut cv, scheme)
+	put16(mut cv, len(sig))
+	cv = append(cv, sig...)
+	return handshake_msg(hsCertificateVerify, cv)
+}
+
+// certRequest is what a client takes from a CertificateRequest.
+type certRequest struct {
+	ctx     []u8
+	schemes []i64
+}
+
+// parse_cert_request reads a CertificateRequest body: its context and the signature schemes the
+// server accepts (signature_algorithms is required, RFC 8446 4.3.2).
+fn parse_cert_request(body []u8) !certRequest {
+	let r = rdr{b: body}
+	let ctx = r.vec8()
+	let exts = rdr{b: r.vec16()}
+	if r.bad || !r.done() {
+		fail alert_fault(alertDecodeError, "malformed CertificateRequest")
+	}
+	mut schemes = []i64{}
+	for !exts.done() && !exts.bad {
+		let typ = exts.u16v()
+		let data = exts.vec16()
+		if typ == extSignatureAlgorithms {
+			let e = rdr{b: data}
+			let s = rdr{b: e.vec16()}
+			for !s.done() && !s.bad {
+				schemes = append(schemes, s.u16v())
+			}
+			if s.bad {
+				fail alert_fault(alertDecodeError, "malformed signature_algorithms in CertificateRequest")
+			}
+		}
+	}
+	if exts.bad || len(schemes) == 0 {
+		fail alert_fault(alertMissingExtension, "CertificateRequest without signature_algorithms")
+	}
+	return certRequest{ctx: ctx, schemes: schemes}
+}
+
+// parse_client_certificate reads the client's Certificate: its chain, empty when it has none.
+fn parse_client_certificate(body []u8) ![][]u8 {
+	let r = rdr{b: body}
+	let ctx = r.vec8()
+	let list = r.vec24()
+	if r.bad || !r.done() {
+		fail alert_fault(alertDecodeError, "malformed client Certificate")
+	}
+	if len(ctx) != 0 {
+		fail alert_fault(alertIllegalParameter, "the client Certificate has a request context this server did not send")
+	}
+	mut certs = make([][]u8, 0, 4)
+	let lr = rdr{b: list}
+	for !lr.bad && !lr.done() {
+		let der = lr.vec24()
+		lr.vec16()
+		if len(der) == 0 {
+			lr.bad = true
+		}
+		certs = append(certs, der)
+	}
+	if lr.bad {
+		fail alert_fault(alertDecodeError, "malformed client certificate list")
+	}
+	return certs
+}
+
+// The pool of the last ClientCAs, per core.
+mut clientCAsPEM str
+mut clientCAsPool ?seal.CertPool
+
+// client_ca_pool is the CertPool of ServerConfig.ClientCAs.
+fn client_ca_pool(pem str) !seal.CertPool {
+	let cached = clientCAsPool
+	if cached != nil && clientCAsPEM == pem {
+		return cached
+	}
+	let pool = seal.NewCertPool()
+	let n = pool.AddPEM(pem) catch e {
+		fail say.Fault("tls: ServerConfig.ClientCAs: %v", e)
+	}
+	if n == 0 {
+		fail "tls: ServerConfig.ClientCAs holds no certificate"
+	}
+	clientCAsPEM = keep(pem)
+	clientCAsPool = keep(pool)
+	return pool
+}
+
+// certificate_request_msg is the server's CertificateRequest: an empty context, the schemes it
+// verifies, and the subjects of ClientCAs.
+fn certificate_request_msg(cfg ServerConfig) ![]u8 {
+	let pool = try client_ca_pool(cfg.ClientCAs)
+	mut b = make([]u8, 0, 512)
+	b = append(b, 0)
+	let exts = open_len(mut b, 2)
+	put16(mut b, extSignatureAlgorithms)
+	put16(mut b, 2+2*len(clientSchemes))
+	put16(mut b, 2*len(clientSchemes))
+	for _, s in clientSchemes {
+		put16(mut b, s)
+	}
+	put16(mut b, extCertificateAuthorities)
+	let ca = open_len(mut b, 2)
+	let names = open_len(mut b, 2)
+	for _, c in pool.Certificates() {
+		put16(mut b, len(c.Subject.Raw))
+		b = append(b, c.Subject.Raw...)
+	}
+	close_len(mut b, names, 2)
+	close_len(mut b, ca, 2)
+	close_len(mut b, exts, 2)
+	return handshake_msg(hsCertificateRequest, b)
+}
+
+// verify_client checks the client's chain against ClientCAs for client authentication, and its
+// CertificateVerify (scheme, sig) over signed. The alert says why: unknown_ca, certificate_expired,
+// bad_certificate, or decrypt_error for the signature.
+fn verify_client(cfg ServerConfig, certs [][]u8, scheme i64, signed []u8, sig []u8) ! {
+	let leaf = seal.ParseCertificate(certs[0]) catch err {
+		fail alert_fault(alertBadCertificate, say.Str(err))
+	}
+	let inter = seal.NewCertPool()
+	for i in 1..len(certs) {
+		let c = seal.ParseCertificate(certs[i]) catch err {
+			fail alert_fault(alertBadCertificate, say.Str(err))
+		}
+		inter.Add(c)
+	}
+	let roots = try client_ca_pool(cfg.ClientCAs)
+	let opts = seal.VerifyOptions{DNSName: "", Roots: roots, Intermediates: inter, KeyUsages: []str{seal.ExtKeyUsageClientAuth}}
+	leaf.Verify(opts) catch err {
+		let text = say.Str(err)
+		mut desc = alertBadCertificate
+		if contains(text, "unknown authority") {
+			desc = alertUnknownCA
+		} else if contains(text, "expired") || contains(text, "not yet valid") {
+			desc = alertCertificateExpired
+		}
+		fail alert_fault(desc, "client certificate: " + text)
+	}
+	if !in_list(clientSchemes, scheme) {
+		fail alert_fault(alertIllegalParameter, "client CertificateVerify uses a scheme that was not offered")
+	}
+	leaf.CheckTLSSignature(scheme, signed, sig) catch err {
+		fail alert_fault(alertDecryptError, "client CertificateVerify: " + say.Str(err))
+	}
+}
+
+// CheckServerConfig checks the client-certificate settings of cfg before a server starts: a
+// known ClientAuth, and ClientCAs that hold certificates when it asks for any.
+fn CheckServerConfig(cfg ServerConfig) ! {
+	if cfg.ClientAuth == NoClientCert {
+		return
+	}
+	if cfg.ClientAuth != RequestClientCert && cfg.ClientAuth != RequireClientCert {
+		fail "tls: unknown ServerConfig.ClientAuth"
+	}
+	try client_ca_pool(cfg.ClientCAs)
+}
+
+// client_ticket_ok reports whether a ticket's session meets cfg's client authentication: a
+// server that requires a certificate resumes only a session that had one, and only while that
+// certificate is still valid; otherwise the handshake is a full one, which asks again.
+fn client_ticket_ok(cfg ServerConfig, st sessionState) bool {
+	if len(st.certs) == 0 {
+		return cfg.ClientAuth != RequireClientCert
+	}
+	let leaf = seal.ParseCertificate(st.certs[0]) catch _ {
+		return false
+	}
+	let now = rt_wall_ns() / 1000000000
+	return leaf.NotBefore <= now && now <= leaf.NotAfter
+}
+
+// contains reports whether s holds sub.
+fn contains(s str, sub str) bool {
+	if len(sub) == 0 {
+		return true
+	}
+	for i in 0..len(s)-len(sub)+1 {
+		if s[i:i+len(sub)] == sub {
+			return true
+		}
+	}
+	return false
+}

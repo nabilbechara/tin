@@ -23,6 +23,8 @@ shared mut gTlsOn bool
 shared mut gTlsCert i64 // the certificate chain's PEM text (kept in core 0's heap; each core parses its own copy)
 shared mut gTlsKey i64  // the private key's PEM text
 shared mut gTlsMs i64   // a handshake must finish within this (TIN_HANDSHAKE_TIMEOUT_MS; -1: the header timeout)
+shared mut gTlsClientAuth i64 // TLSConfig.ClientAuth (#475)
+shared mut gTlsClientCAs i64  // TLSConfig.ClientCAs's PEM text, 0 for none
 
 shared mut gTlsAccept fn(i64)                  // tls_accept: start the handshake of a new connection
 shared mut gTlsDone fn(i64, i64)               // tls_done: a handshake task ended
@@ -65,6 +67,34 @@ fn (r Router) ServeTLS(addr str, certPEM str, keyPEM str) ! {
 	return try serve_on(addr, serve_cores())
 }
 
+// TLSConfig configures ServeTLSConfig: the certificate chain and private key, as ServeTLS takes
+// them, and client certificates (mutual TLS, #475).
+type TLSConfig struct {
+	CertPEM    str // the certificate chain (leaf first), PEM
+	KeyPEM     str // the leaf's private key (RSA, ECDSA P-256 or P-384), PEM
+	ClientAuth i64 // tls.NoClientCert (the default), tls.RequestClientCert or tls.RequireClientCert
+	ClientCAs  str // with ClientAuth: the PEM roots a client certificate must chain to (the system's are not used)
+}
+
+// ServeTLSConfig is ServeTLS with a TLSConfig. With ClientAuth set, every full handshake asks
+// for a client certificate: RequireClientCert refuses a client without one
+// (certificate_required), and both refuse one that does not chain to ClientCAs for client
+// authentication. A handler finds the verified chain in q.TLSConn().PeerCertificates().
+fn ServeTLSConfig(addr str, cfg TLSConfig, h fn(Req, mut Out)) ! {
+	try tls_setup_config(cfg)
+	gHandler = h
+	gRoutes = 0
+	return try serve_on(addr, serve_cores())
+}
+
+// ServeTLSConfig is Serve over TLS with a TLSConfig, as anvil.ServeTLSConfig.
+fn (r Router) ServeTLSConfig(addr str, cfg TLSConfig) ! {
+	let t = try compile(r)
+	try tls_setup_config(cfg)
+	gRoutes = cast(i64, keep(t))
+	return try serve_on(addr, serve_cores())
+}
+
 // TLSConn is the TLS connection the request arrived on, or nil over plain TCP: for its
 // ALPN(), CipherSuite() and Group(). After Hijack every byte must go through it (Read, Write,
 // Close), since the descriptor carries records.
@@ -78,7 +108,27 @@ fn (q Req) TLSConn() ?tls.Conn {
 // tls_setup checks the certificate and key, keeps their PEM text for every core and turns
 // the server's TLS on.
 fn tls_setup(certPEM str, keyPEM str) ! {
-	try tls.LoadServerConfig(certPEM, keyPEM)
+	return try tls_setup_config(TLSConfig{CertPEM: certPEM, KeyPEM: keyPEM, ClientAuth: tls.NoClientCert, ClientCAs: ""})
+}
+
+// tls_setup_config is tls_setup for a TLSConfig: the client CAs are checked too.
+fn tls_setup_config(tc TLSConfig) ! {
+	let certPEM = tc.CertPEM
+	let keyPEM = tc.KeyPEM
+	let probe = try tls.LoadServerConfig(certPEM, keyPEM)
+	if tc.ClientAuth != tls.NoClientCert {
+		if tc.ClientAuth != tls.RequestClientCert && tc.ClientAuth != tls.RequireClientCert {
+			fail "anvil: TLSConfig.ClientAuth must be tls.NoClientCert, tls.RequestClientCert or tls.RequireClientCert"
+		}
+		if tc.ClientCAs == "" {
+			fail "anvil: TLSConfig.ClientAuth needs TLSConfig.ClientCAs"
+		}
+		probe.ClientAuth = tc.ClientAuth
+		probe.ClientCAs = tc.ClientCAs
+		try tls.CheckServerConfig(probe)
+		gTlsClientCAs = cast(i64, keep(tc.ClientCAs))
+	}
+	gTlsClientAuth = tc.ClientAuth
 	gTlsCert = cast(i64, keep(certPEM))
 	gTlsKey = cast(i64, keep(keyPEM))
 	gTlsMs = -1
@@ -204,6 +254,10 @@ fn tls_core_config() bool {
 		return false
 	}
 	cfg.ALPN = tls_alpn()
+	cfg.ClientAuth = gTlsClientAuth
+	if gTlsClientCAs != 0 {
+		cfg.ClientCAs = cast(str, gTlsClientCAs)
+	}
 	tlsCfg = keep(cfg)
 	return true
 }

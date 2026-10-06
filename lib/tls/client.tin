@@ -199,14 +199,14 @@ fn (c mut Conn) handshake(cfg Config, name str, hi hello) ! {
 	c.alpn = try parse_encrypted_extensions(msg[4:], cfg.ALPN, hello_extensions(ch))
 	transcript = cat(transcript, msg)
 	mut requested = false
-	mut reqctx = []u8{}
+	mut req = certRequest{ctx: []u8{}, schemes: []i64{}}
 	if c.resumed && c.alpn != tk.alpn {
 		fail alert_fault(alertIllegalParameter, "a resumed connection negotiated another ALPN protocol")
 	}
 	if !c.resumed {
 		typ, msg = try hr.next(mut c)
 		if typ == hsCertificateRequest {
-			reqctx = try parse_certificate_request(msg[4:])
+			req = try parse_cert_request(msg[4:])
 			requested = true
 			transcript = cat(transcript, msg)
 			typ, msg = try hr.next(mut c)
@@ -250,17 +250,31 @@ fn (c mut Conn) handshake(cfg Config, name str, hi hello) ! {
 	let sap = try derive_secret(h, sc.master, "s ap traffic", thash)
 	keylog(hi.random, sc.chs, sc.shs, cats, sap)
 	try c.set_read_key(sap)
-	// The client's flight under its handshake keys: an empty Certificate if one was asked
-	// for (this client has none), then Finished.
+	// The client's flight under its handshake keys: when a certificate was asked for, the
+	// configured chain and a CertificateVerify, or an empty Certificate when there is none (or
+	// no scheme the server accepts fits its key); then Finished.
 	mut flight = []u8{}
 	if requested {
-		mut body = make([]u8, 0, 8)
-		body = append(body, u8(len(reqctx)))
-		body = append(body, reqctx...)
-		body = append(body, 0, 0, 0)
-		let cm = handshake_msg(hsCertificate, body)
-		flight = cat(flight, cm)
-		transcript = cat(transcript, cm)
+		mut sent = false
+		if cfg.Certificate != "" {
+			let cr = try client_credential(cfg.Certificate, cfg.Key)
+			let scheme = pick_scheme(cr.key, req.schemes)
+			if scheme != 0 {
+				let cm = certificate_msg(req.ctx, cr.chain)
+				flight = cat(flight, cm)
+				transcript = cat(transcript, cm)
+				let sig = try cr.key.SignTLS(scheme, cv_content_client(transcript_hash(h, transcript)))
+				let cvm = certificate_verify_msg(scheme, sig)
+				flight = cat(flight, cvm)
+				transcript = cat(transcript, cvm)
+				sent = true
+			}
+		}
+		if !sent {
+			let cm = certificate_msg(req.ctx, [][]u8{})
+			flight = cat(flight, cm)
+			transcript = cat(transcript, cm)
+		}
 	}
 	let fin = try finished_mac(h, sc.chs, transcript_hash(h, transcript))
 	let finmsg = handshake_msg(hsFinished, fin)
