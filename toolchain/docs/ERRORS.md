@@ -3963,14 +3963,15 @@ Fix: use `tin fix -edition 1 FILES...`, or pass `-edition 1` and one file to `ti
 
 ### E907 TOO_MANY_PARAMS
 
-A function takes at most 8 parameters of each register kind (integers and references, and
-floats) and returns at most 8 results.
+A function returns at most 8 results, and takes at most 64 parameters of each register kind
+(integers and references, and floats); parameters past the argument registers travel on the
+stack (#533).
 
 ```tin edition=1
 package main
 
-fn sum(a i64, b i64, c i64, d i64, e i64, f i64, g i64, h i64, i i64) i64 {
-	return a + b + c + d + e + f + g + h + i
+fn nine() (i64, i64, i64, i64, i64, i64, i64, i64, i64) {
+	return 1, 2, 3, 4, 5, 6, 7, 8, 9
 }
 
 fn main() {
@@ -3978,10 +3979,11 @@ fn main() {
 ```
 
 ```text
-example.tin:3:1: error E907 TOO_MANY_PARAMS: function 'sum' has 9 parameters, the limit is 8
+example.tin:3:1: error E907 TOO_MANY_PARAMS: too many results
 ```
 
-Fix: pass a struct (or a slice) that holds the values.
+Fix: return a struct (or a slice) that holds the values; pass a struct for very long
+parameter lists.
 
 ### E990 INTERNAL
 

@@ -3051,6 +3051,29 @@ fn x_assign_homes(f Fn) i64 {
 	return nslots
 }
 
+// x_has_stack_params reports a parameter the caller passes on the stack (past rdi..r9 or
+// xmm0..xmm7, or a dyn pair that does not fit), as x_arg_regs places them.
+fn x_has_stack_params(f Fn) i64 {
+	mut ni = 0
+	mut nf = 0
+	mut i = 0
+	for i < len(f.ptypes) {
+		let pt = f.ptypes[i]
+		if is_dyn_value(cast(Ty, pt)) != 0 {
+			if ni + 1 >= 6 {
+				return 1
+			}
+			ni = ni + 2
+		} else if is_float_t(pt) != 0 {
+			nf = nf + 1
+		} else {
+			ni = ni + 1
+		}
+		i = i + 1
+	}
+	return i64(ni > 6 || nf > 8)
+}
+
 // x_entry_moves moves the parameters from their argument registers (or stack slots at
 // [rbp + 16 + 8k]) into their homes; register moves run in parallel.
 fn x_entry_moves(f Fn) {
@@ -3061,6 +3084,12 @@ fn x_entry_moves(f Fn) {
 	mut ni = 0
 	mut nf = 0
 	x_nstack = 0
+	// A closure's descriptor arrives in r11, which is also XSCR, the register stack parameters
+	// are loaded through: keep it on the stack until they are in (#533).
+	let keep_env = i64(f.env_sym != 0 && x_has_stack_params(f) != 0)
+	if keep_env != 0 {
+		x_push(R11)
+	}
 	mut i = 0
 	for i < len(f.params) {
 		let s = cast(Sym, locals[i])
@@ -3128,6 +3157,9 @@ fn x_entry_moves(f Fn) {
 			x_slot_store(XSCR, s.off)
 		}
 		i = i + 2
+	}
+	if keep_env != 0 {
+		x_pop(R11)
 	}
 	if f.env_sym != 0 {
 		let es = cast(Sym, f.env_sym)
