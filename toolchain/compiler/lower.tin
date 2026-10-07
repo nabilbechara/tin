@@ -5215,6 +5215,9 @@ fn say_arg(a Node, prefix str) Node {
 			return cast(Node, say_enum_slice(a, t, prefix))
 		} else if ek == K_STRUCT {
 			return cast(Node, say_struct_slice(a, t, prefix))
+		} else if ek == K_SLICE || ek == K_MAP || ek == K_ERROR || (ek == K_OPT && kind_of(cast(Ty, cast(Ty, et).elem)) != K_STRUCT) {
+			// Element by element, each as its own type prints (#524).
+			return cast(Node, say_struct_slice(a, t, prefix))
 		} else {
 			suffix = "slp"
 		}
@@ -5374,7 +5377,8 @@ fn say_struct_fn(t Ty, prefix str) Fn {
 	return cast(Fn, f)
 }
 
-// say_struct_slice prints [{...} {...}] with each element through its struct's printer.
+// say_struct_slice prints [{...} {...}] with each element through its struct's printer; a
+// slice of slices, maps, faults or optionals prints each element as that type prints (#524).
 fn say_struct_slice(a Node, t Ty, prefix str) i64 {
 	let pos = a.pos
 	let et = t.elem
@@ -5400,7 +5404,11 @@ fn say_struct_slice(a Node, t Ty, prefix str) i64 {
 	wb.stmts = append(wb.stmts, cast(i64, sep))
 	let el = mk_elem(pos, sym_ref_node(pos, cast(Sym, sl.sym)), sym_ref_node(pos, cast(Sym, j)), et, 0)
 	el.safe = 1
-	wb.stmts = append(wb.stmts, expr_stmt(call_fn(pos, say_struct_fn(cast(Ty, et), prefix), args1(cast(i64, el)), ty_void)))
+	if kind_of(cast(Ty, et)) == K_STRUCT {
+		wb.stmts = append(wb.stmts, expr_stmt(call_fn(pos, say_struct_fn(cast(Ty, et), prefix), args1(cast(i64, el)), ty_void)))
+	} else {
+		wb.stmts = append(wb.stmts, expr_stmt(say_arg(cast(Node, el), prefix)))
+	}
 	stmts = append(stmts, cast(i64, w))
 	stmts = append(stmts, expr_stmt(cast(Node, rt_call(pos, prefix + "raw", args1(lit_string(pos, "]")), ty_void))))
 	stmts = append(stmts, expr_stmt(cast(Node, rt_call(pos, prefix + "argend", cast(i64, []i64{}), ty_void))))

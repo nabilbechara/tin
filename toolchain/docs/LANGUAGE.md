@@ -1823,7 +1823,7 @@ align), `+` (sign), `0` (zero pad), `#` (alternate), space.
 
 Default formats: integers in decimal; floats in the shortest form that reads back
 exactly, with an exponent below 1e-4 or from 1e21 (Go's `%v`); `true`/`false`; strings as
-is; slices as `[a b c]`; maps as `map[k:v ...]` with sorted keys; structs as `{a b}`, with
+is; slices as `[a b c]` (of slices, maps and faults too: `[[1 2] [3]]`); maps as `map[k:v ...]` with sorted keys; structs as `{a b}`, with
 nested structs, enums (by name) and slices of structs printed in full; `NaN`, `+Inf` and
 `-Inf` for the non-finite floats under every verb; nil optionals and faults as `<nil>`. An
 optional field of a struct prints as an address, as a pointer field does in Go, so that a
