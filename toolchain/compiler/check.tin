@@ -7353,6 +7353,14 @@ fn pair(a i64, b i64) i64 {
 }
 
 fn len_alias_remember(sym Sym, init i64) {
+	// let m = n, where n remembers len(x): m does too (a range's hidden bound, #528).
+	if cast(i64, sym) != 0 && sym.kind == SYM_LOCAL && sym.cell == 0 && init != 0 && cast(Node, init).kind == EX_IDENT && cast(IdentExpr, init).ref != 0 {
+		let from = len_alias_source(cast(IdentExpr, init).ref)
+		if from != 0 {
+			len_aliases = append(len_aliases, pair(cast(i64, sym), from))
+		}
+		return
+	}
 	if cast(i64, sym) == 0 || sym.kind != SYM_LOCAL || sym.cell != 0 || init == 0 || cast(Node, init).kind != EX_MEM || cast(MemExpr, init).hdr == 0 || cast(MemExpr, init).off != 0 {
 		return
 	}
@@ -7706,10 +7714,24 @@ fn lower_for_init(s i64) {
 	replace_node(cast(i64, inner), s)
 	inner.init = 0
 	let b = cast(Block, empty_block(cast(Node, s).pos))
+	mut pre = []i64{}
+	if inner.range_ != 0 {
+		pre = range_hoist(inner, init)
+	}
+	mut pi = 0
+	for pi < len(pre) {
+		b.stmts = append(b.stmts, pre[pi])
+		pi = pi + 1
+	}
 	b.stmts = append(b.stmts, init)
 	b.stmts = append(b.stmts, cast(i64, inner))
 	replace_node(s, cast(i64, b))
 	push_scope()
+	pi = 0
+	for pi < len(pre) {
+		check_stmt(pre[pi])
+		pi = pi + 1
+	}
 	check_stmt(init)
 	// for i in a..b: the body reads i, and only the loop's own step sets it (#526).
 	mut counter = cast(Sym, 0)
@@ -7779,6 +7801,121 @@ fn lower_for_init(s i64) {
 	ck_loops = ck_loops - 1
 	ck_breaks = ck_breaks - 1
 	pop_scope()
+}
+
+// range_hoist evaluates the bounds and step of `for i in (lo..hi).step(s)` once, before the
+// loop, in source order (#528): a bound or step that is not a constant becomes a hidden let, and
+// the loop reads that. A constant step must be positive; another step is checked when the loop
+// starts. A hidden let of len(x) remembers x, so `0..len(xs)` keeps its bounds proof.
+fn range_hoist(w WhileStmt, init i64) []i64 {
+	mut pre = []i64{}
+	if cast(Node, init).kind != ST_LET || cast(Node, w.cond).kind != EX_BINARY {
+		return pre
+	}
+	let pos = cast(Node, w).pos
+	let lo = cast(LetStmt, init).init
+	// lo is evaluated once anyway; it moves before hi only when it may have side effects.
+	if range_simple(lo) == 0 {
+		pre = append(pre, range_let(pos, "$range_lo", lo))
+		cast(LetStmt, init).init = range_ident(pos, "$range_lo")
+	}
+	let cond = cast(Binary, w.cond)
+	if is_int_const_expr(cond.r) == 0 && (range_fixed_local(cond.r, w.body) == 0 || cast(IdentExpr, cond.r).name == cast(LetStmt, init).name) {
+		pre = append(pre, range_let(pos, "$range_hi", cond.r))
+		cond.r = range_ident(pos, "$range_hi")
+	}
+	let step = w.step
+	if step == 0 {
+		return pre
+	}
+	if is_int_const_expr(step) != 0 {
+		let v = const_value(step, 0)
+		if cv_big == 0 && v <= 0 {
+			err_code_at(cast(Node, step).pos, "E052 RANGE_LOOP", "a range step must be positive: count up and compute the value (hi - 1 - i) to go down")
+		}
+		return pre
+	}
+	// A local step the body never assigns is read where it is (no copy: one register fewer for
+	// the loop); any other step is evaluated once into $range_step.
+	mut sname = "$range_step"
+	if range_fixed_local(step, w.body) != 0 && cast(IdentExpr, step).name != cast(LetStmt, init).name {
+		sname = cast(IdentExpr, step).name
+	} else {
+		pre = append(pre, range_let(pos, "$range_step", step))
+		let post = cast(AssignStmt, w.post)
+		cast(Binary, post.value).r = range_ident(pos, "$range_step")
+	}
+	// if step <= 0 { panic("...") }
+	let check = cast(IfStmt, node_new(ST_IF, pos))
+	let zero = cast(IntLit, node_new(EX_INT, pos))
+	zero.val = 0
+	check.cond = binary_new(pos, "<=", range_ident(pos, sname), cast(i64, zero))
+	let msg = cast(StrLit, node_new(EX_STR, pos))
+	msg.ptr = "range step must be positive"
+	msg.len = len(msg.ptr)
+	let call = cast(Call, node_new(EX_CALL, pos))
+	call.name = "panic"
+	call.args = []i64{cast(i64, msg)}
+	let then = cast(Block, empty_block(pos))
+	then.stmts = append(then.stmts, expr_stmt(cast(Node, call)))
+	check.then = cast(i64, then)
+	pre = append(pre, cast(i64, check))
+	return pre
+}
+
+// range_simple reports a bound that calls nothing but conversions, len and cap: evaluating it
+// later, or more than once, gives the same value and does nothing else.
+fn range_simple(e i64) i64 {
+	if e == 0 {
+		return 1
+	}
+	let k = cast(Node, e).kind
+	if k == EX_INT || k == EX_IDENT {
+		return 1
+	}
+	if k == EX_SELECT {
+		return range_simple(cast(SelectExpr, e).x)
+	}
+	if k == EX_UNARY {
+		return range_simple(cast(Unary, e).x)
+	}
+	if k == EX_BINARY {
+		return i64(range_simple(cast(Binary, e).l) != 0 && range_simple(cast(Binary, e).r) != 0)
+	}
+	if k == EX_CALL && cast(Call, e).callee == 0 && len(cast(Call, e).args) == 1 {
+		let n = cast(Call, e).name
+		if n == "len" || n == "cap" || n == "i64" || n == "i32" || n == "i16" || n == "i8" || n == "u64" || n == "u32" || n == "u16" || n == "u8" {
+			return range_simple(cast(Call, e).args[0])
+		}
+	}
+	return 0
+}
+
+// range_fixed_local reports a bound that is a local the loop body never assigns and no closure
+// shares: reading it on every pass gives the value it had when the loop started.
+fn range_fixed_local(e i64, body i64) i64 {
+	if cast(Node, e).kind != EX_IDENT {
+		return 0
+	}
+	let name = cast(IdentExpr, e).name
+	let s = lookup_name_local(name)
+	if s == 0 || cast(Sym, s).cell != 0 || cast(Sym, s).captured != 0 {
+		return 0
+	}
+	return i64(names_assigned(body, name, name) == 0)
+}
+
+fn range_let(pos i64, name str, init i64) i64 {
+	let l = cast(LetStmt, node_new(ST_LET, pos))
+	l.name = name
+	l.init = init
+	return cast(i64, l)
+}
+
+fn range_ident(pos i64, name str) i64 {
+	let id = cast(IdentExpr, node_new(EX_IDENT, pos))
+	id.name = name
+	return cast(i64, id)
 }
 
 // cond_below reports whether loop condition c is `name < E`.

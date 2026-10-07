@@ -449,7 +449,9 @@ Fix: add the arms to wait on, or remove the `select`.
 ### E052 RANGE_LOOP
 
 A loop over an integer range binds one name (`for i in 0..n`); a stepped range binds one
-name and takes one step (`for i in (0..n).step(2)`).
+name and takes one step (`for i in (0..n).step(2)`), which must be positive: a constant step
+of 0 or less is this error, and a step computed at run time that is 0 or less panics with
+`range step must be positive` when the loop starts.
 
 ```tin edition=1
 package main
@@ -468,6 +470,7 @@ example.tin:6:2: error E052 RANGE_LOOP: an integer range loop has one binding
 ```
 
 Fix: bind one name. To number the elements of a slice, range over the slice: `for i, x in xs`.
+To count down, count up and compute the value: `for i in 0..n { let j = n - 1 - i }`.
 
 ### E053 EMPTY_MATCH
 

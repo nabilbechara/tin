@@ -935,8 +935,11 @@ for {                             // forever
 }
 ```
 
-- `lo..hi` counts from `lo` up to `hi - 1`; there is no `..=`. The bounds are evaluated
-  once. The bounds prover reads this form directly: `for i in 0..len(xs) { xs[i] }` has no
+- `lo..hi` counts from `lo` up to `hi - 1`; there is no `..=`. The bounds (and the step)
+  are evaluated once, before the loop, left to right: changing a variable of `hi` inside the
+  loop does not change how often it runs. A step must be positive (a constant step of 0 or
+  less is E052; a computed one panics when the loop starts); to count down, count up and use
+  `hi - 1 - i`. The bounds prover reads this form directly: `for i in 0..len(xs) { xs[i] }` has no
   bounds check.
 - `for x in xs` gives a copy of each element (a reference for reference types); `for i, x`
   gives the index too. To change elements, assign `xs[i]`.

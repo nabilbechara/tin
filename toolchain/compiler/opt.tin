@@ -788,7 +788,7 @@ fn prefetch_loop(w i64) {
 		body = append(body, cast(WhileStmt, w).post)
 	}
 	lc_assigned = []i64{}
-	lc_calls = stmts_have_call(cast([]i64, body))
+	lc_calls = loop_stmts_have_call(cast([]i64, body))
 	collect_assigned(cast([]i64, body))
 	// The induction step: a top-level `j = j + step` with step invariant.
 	mut j = cast(Sym, 0)
@@ -910,12 +910,59 @@ fn licm_nested(s i64) {
 }
 
 // licm_loop rewrites loop w in place and returns the lets to run before it.
+// loop_stmts_have_call is stmts_have_call for a loop body, except that a call of rt_panic does
+// not count: it never returns to the loop, so it cannot change a header the loop goes on to read.
+// A computed range step's check (`if step <= 0 { panic(...) }`, #528) then keeps the headers of an
+// enclosing loop hoisted.
+fn loop_stmts_have_call(stmts []i64) i64 {
+	mut i = 0
+	for i < len(stmts) {
+		if loop_stmt_has_call(stmts[i]) != 0 {
+			return 1
+		}
+		i = i + 1
+	}
+	return 0
+}
+
+fn loop_stmt_has_call(s i64) i64 {
+	if s == 0 {
+		return 0
+	}
+	let k = cast(Node, s).kind
+	if k == ST_BLOCK {
+		return loop_stmts_have_call(cast(Block, s).stmts)
+	}
+	if k == ST_EXPR {
+		let x = cast(ExprStmt, s).x
+		if x != 0 && cast(Node, x).kind == EX_CALL && cast(Call, x).callee == 0 && cast(Call, x).name == "rt_panic" {
+			let args = cast(Call, x).args
+			mut i = 0
+			for i < len(args) {
+				if contains_call(args[i]) != 0 {
+					return 1
+				}
+				i = i + 1
+			}
+			return 0
+		}
+		return contains_call(x)
+	}
+	if k == ST_IF {
+		return i64(contains_call(cast(IfStmt, s).cond) != 0 || loop_stmt_has_call(cast(IfStmt, s).then) != 0 || loop_stmt_has_call(cast(IfStmt, s).else_) != 0)
+	}
+	if k == ST_WHILE {
+		return i64(contains_call(cast(WhileStmt, s).cond) != 0 || loop_stmt_has_call(cast(WhileStmt, s).body) != 0 || stmt_has_call(cast(WhileStmt, s).post) != 0)
+	}
+	return stmt_has_call(s)
+}
+
 fn licm_loop(w WhileStmt) i64 {
 	lc_assigned = []i64{}
 	lc_exprs = []i64{}
 	lc_syms = cast([]Sym, []i64{})
 	lc_pre = []i64{}
-	lc_calls = i64(stmts_have_call(cast(Block, w.body).stmts) != 0 || contains_call(w.cond) != 0 || stmt_has_call(w.post) != 0)
+	lc_calls = i64(loop_stmts_have_call(cast(Block, w.body).stmts) != 0 || contains_call(w.cond) != 0 || stmt_has_call(w.post) != 0)
 	collect_assigned(cast(Block, w.body).stmts)
 	if w.post != 0 {
 		mut one = []i64{}
