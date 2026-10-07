@@ -169,12 +169,22 @@ fn rt_fault(sig i64, info i64, uctx i64) {
 			return
 		}
 		rt_fault_say("\npanic: stack overflow in a request handler (a request task's stack is " + rt_i64str(taskStack/1024) + " KiB, TIN_TASK_STACK: deep or unbounded recursion?)\n")
+	} else if rt_fault_near_sp(addr, rt_uctx_sp(uctx)) {
+		// A fault just below the interrupted stack pointer is a frame pushed past the end of
+		// this thread's stack: main's, a core's or a helper's (#531).
+		rt_fault_say("\npanic: stack overflow (a thread's stack ran out: deep or unbounded recursion? the main thread's stack is the process's stack limit, ulimit -s)\n")
 	} else if sig == rt_sigbus() {
 		rt_fault_say("\npanic: bus error (invalid memory access, or a thread stack overflow)\n")
 	} else {
 		rt_fault_say("\npanic: segmentation fault (invalid memory access, or a thread stack overflow)\n")
 	}
 	rt_sys__exit(2)
+}
+
+// rt_fault_near_sp reports a fault address at most 1 MiB below, or 4 KiB above, stack pointer sp:
+// a function's frame (or a stack probe) reaching past the end of the stack.
+fn rt_fault_near_sp(addr i64, sp i64) bool {
+	return sp != 0 && addr != 0 && addr < sp+4096 && addr > sp-1048576
 }
 
 // rt_overflow_resume is where a task that overflowed its stack resumes, on the signal stack:

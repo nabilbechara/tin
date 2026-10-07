@@ -2265,6 +2265,7 @@ fn check_fn_closure(f i64) {
 
 fn check_fn(f Fn) {
 	set_file(f.file)
+	let unreachable0 = unreachable_count
 	if f.parent == 0 {
 		ck_scope_depth = 0
 		ck_fn_base = 0
@@ -2358,7 +2359,8 @@ fn check_fn(f Fn) {
 		ck_defers = cast([]i64, 0)
 		ck_defer_mark = 0
 	}
-	if len(f.rtypes) > 0 && ends_in_return(cast(Block, f.body).stmts) == 0 {
+	// Code after a return already reported (E264) is why the end is not a return.
+	if len(f.rtypes) > 0 && ends_in_return(cast(Block, f.body).stmts) == 0 && unreachable_count == unreachable0 {
 		err_code_quoted(f.pos, "E260 MISSING_RETURN", "function ", f.name, " is missing a return at the end")
 	}
 	// A fault that is assigned but never looked at is an ignored error.
@@ -2644,6 +2646,16 @@ fn check_stmts(stmts []i64) {
 	mut i = 0
 	for i < len(stmts) {
 		let s = stmts[i]
+		let sk = cast(Node, s).kind
+		// A statement after one that always leaves never runs (#531).
+		if i + 1 < len(stmts) && (sk == ST_RETURN || sk == ST_BREAK || sk == ST_CONTINUE || sk == ST_FAIL || is_panic_stmt(s) != 0) && cast(Node, stmts[i + 1]).pos != 0 {
+			let m = err_code(stmt_start(stmts[i + 1]), "E264 UNREACHABLE")
+			buf_str(m, "this statement never runs: the ")
+			buf_str(m, stmt_leave_word(s))
+			buf_str(m, " before it always leaves the block")
+			err_end(cast([]u8, m))
+			unreachable_count = unreachable_count + 1
+		}
 		check_stmt(s)
 		// if x == nil { return } narrows x to non-nil for the rest of the block.
 		if cast(Node, s).kind == ST_IF && cast(IfStmt, s).else_ == 0 && ends_in_jump(cast([]Node, cast(Block, cast(IfStmt, s).then).stmts)) != 0 {
@@ -2659,6 +2671,57 @@ fn check_stmts(stmts []i64) {
 		narrow_end(cast(Pair, narrowed[i]))
 		i = i - 1
 	}
+}
+
+shared mut unreachable_count i64 // E264 reports so far (#531)
+
+// is_panic_stmt reports a statement that is a call of panic.
+fn is_panic_stmt(s i64) i64 {
+	if cast(Node, s).kind != ST_EXPR {
+		return 0
+	}
+	let x = cast(ExprStmt, s).x
+	return i64(x != 0 && cast(Node, x).kind == EX_CALL && cast(Call, x).callee == 0 && cast(Call, x).name == "panic" && len(cast(Call, x).args) == 1)
+}
+
+// stmt_start is where statement s starts in the source: an expression statement's leftmost
+// operand (say in say.Line(x)), else its own position.
+fn stmt_start(s i64) i64 {
+	if cast(Node, s).kind != ST_EXPR || cast(ExprStmt, s).x == 0 {
+		return cast(Node, s).pos
+	}
+	mut e = cast(ExprStmt, s).x
+	for {
+		let k = cast(Node, e).kind
+		if k == EX_CALL && cast(Call, e).callee != 0 {
+			e = cast(Call, e).callee
+		} else if k == EX_SELECT && cast(SelectExpr, e).x != 0 {
+			e = cast(SelectExpr, e).x
+		} else if k == EX_INDEX && cast(IndexExpr, e).x != 0 {
+			e = cast(IndexExpr, e).x
+		} else {
+			return cast(Node, e).pos
+		}
+	}
+	return cast(Node, s).pos
+}
+
+// stmt_leave_word names the statement that leaves, for E264.
+fn stmt_leave_word(s i64) str {
+	let k = cast(Node, s).kind
+	if k == ST_RETURN {
+		return "return"
+	}
+	if k == ST_BREAK {
+		return "break"
+	}
+	if k == ST_CONTINUE {
+		return "continue"
+	}
+	if k == ST_FAIL {
+		return "fail"
+	}
+	return "panic"
 }
 
 // ends_in_jump reports whether a block always leaves: return, break, continue, panic.

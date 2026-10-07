@@ -26,7 +26,8 @@ def main():
         assert result.returncode == 0 and result.stdout == want, result
         fault = subprocess.run([str(exe), 'overflow'], capture_output=True, timeout=60)
         (out/'overflow.log').write_bytes(fault.stdout+fault.stderr)
-        assert fault.returncode == 2 and b'panic: segmentation fault' in fault.stderr, fault
+        # Reported as what it is since #531 (it was "segmentation fault").
+        assert fault.returncode == 2 and b'panic: stack overflow' in fault.stderr, fault
     print('PASS 208 returning clone cores: own signal stacks, inherited mask, own errors, '
           'stacks reaped after the kernel clears the tid; a core stack overflow is reported')
 

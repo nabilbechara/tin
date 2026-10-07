@@ -1848,6 +1848,33 @@ example.tin:10:2: error E263 RANGE: cannot range over Point
 Fix: range over a slice, map or `str` field of the value, or give the type a method that
 returns one.
 
+### E264 UNREACHABLE
+
+A statement after a `return`, `fail`, `break`, `continue` or `panic(...)` in the same block
+never runs.
+
+```tin edition=1
+package main
+
+import "say"
+
+fn answer() i64 {
+	return 42
+	say.Line("computed")
+}
+
+fn main() {
+	say.Line(answer())
+}
+```
+
+```text
+example.tin:7:2: error E264 UNREACHABLE: this statement never runs: the return before it always leaves the block
+```
+
+Fix: move the statement before the one that leaves, or delete it; to leave only sometimes,
+put the leaving statement in an `if`.
+
 ### E270 DEFER
 
 A deferred call runs once, when the function returns: so `defer` is not used in a loop,
