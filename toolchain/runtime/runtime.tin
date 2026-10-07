@@ -727,11 +727,17 @@ fn rt_alloc_slow(n i64) i64 {
 		}
 	}
 	if c[ctxPoolBase] == 0 {
-		let chunk = calloc(1, rt_chunk())
-		rt_pool_took(chunk, true)
-		// The pool's first object starts at this heap block's payload: pin the chunk so
-		// the long-lived counts never treat pool memory as theirs (#176).
-		(chunk - 8)[0] = (chunk-8)[0] | rcPin
+		mut chunk = arenaChunk
+		if chunk != 0 {
+			// The zeroed, pinned base chunk of an arena that ended (#530).
+			arenaChunk = 0
+		} else {
+			chunk = calloc(1, rt_chunk())
+			rt_pool_took(chunk, true)
+			// The pool's first object starts at this heap block's payload: pin the chunk so
+			// the long-lived counts never treat pool memory as theirs (#176).
+			(chunk - 8)[0] = (chunk-8)[0] | rcPin
+		}
 		c[ctxPoolBase] = chunk
 		c[ctxBump] = chunk
 		c[ctxEnd] = chunk + rt_chunk()
@@ -825,6 +831,7 @@ fn rt_pool_used() i64 {
 }
 
 mut rtPoolFirst i64             // bytes of this core's pools' first chunks (mapped, mostly never touched) (#356)
+mut arenaChunk i64              // an ended arena's base chunk, zeroed, for the next pool's first allocation (#530)
 mut rtPoolMore i64              // bytes of this core's pools beyond their first chunks: later chunks, big blocks
 shared mut rtPoolFirstAll i64   // rtPoolFirst summed over the cores
 
@@ -5069,8 +5076,20 @@ fn rt_arena_free(b i64, a i64) {
 		}
 	}
 	if a[aBase] != 0 {
-		rt_pool_gave(a[aBase], true)
-		free(a[aBase])
+		if arenaChunk == 0 {
+			// Kept for the next pool that starts (#530): zero what this arena used, as
+			// rt_pool_clear does, so the chunk reads as fresh; it stays counted as a first chunk.
+			let base = a[aBase]
+			mut top = a[aBump]
+			if a[aBump+3] != 0 {
+				top = a[aBump+3]
+			}
+			memset(base, 0, top-base)
+			arenaChunk = base
+		} else {
+			rt_pool_gave(a[aBase], true)
+			free(a[aBase])
+		}
 	}
 	if a[aCharged] != 0 {
 		{

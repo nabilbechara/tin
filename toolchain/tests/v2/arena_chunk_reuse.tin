@@ -1,0 +1,86 @@
+package main
+
+// #530: an ended arena's base chunk is kept, zeroed, for the next pool, instead of a fresh 4 MiB
+// calloc per arena. Memory a new arena allocates must read as zero whatever the last one wrote.
+
+import "fault"
+import "say"
+
+fn fill(n i64, v i64) i64 {
+	mut xs = make([]i64, n)
+	for i in 0..n {
+		xs[i] = v
+	}
+	return xs[n - 1]
+}
+
+fn zeros(n i64) i64 {
+	let xs = make([]i64, n)
+	mut nonzero = 0
+	for x in xs {
+		if x != 0 {
+			nonzero += 1
+		}
+	}
+	return nonzero
+}
+
+fn big(n i64) !i64 {
+	let xs = make([]i64, n)
+	return len(xs)
+}
+
+fn main() {
+	mut total = 0
+	mut dirty = 0
+	for step in 0..2000 {
+		total += arena {
+			fill(1000 + step % 7, step + 1)
+		}
+		dirty += arena {
+			zeros(2000)
+		}
+	}
+	say.Line("total", total, "nonzero after reuse", dirty)
+
+	// past the first chunk: extra chunks and a big block, then a small arena again
+	let wide = arena {
+		fill(600000, 3)
+	}
+	let after = arena {
+		zeros(400000)
+	}
+	say.Line(wide, after)
+
+	// nested arenas: the inner one ends first and gives its chunk back while the outer runs
+	let nested = arena {
+		let inner = arena {
+			fill(5000, 9)
+		}
+		inner + zeros(5000)
+	}
+	say.Line("nested", nested)
+
+	// a panic through an arena frees it on the way to the guard
+	let g = guard {
+		arena {
+			let xs = make([]i64, 3)
+			let i = 7
+			xs[i]
+		}
+	} catch err {
+		say.Line("guarded:", fault.Is(err, fault.Panic))
+		-1
+	}
+	say.Line(g, arena {
+		zeros(3000)
+	})
+
+	// a limit around arenas still charges what they take beyond the first chunk
+	let (n, err) = limit memory 1mb {
+		try arena {
+			try big(1000000)
+		}
+	}
+	say.Line(n, fault.Is(err, fault.LimitExceeded))
+}
