@@ -54,7 +54,7 @@ def generate():
                 else:
                     data = data.hex()
                 text += [f'\tif name == "{name}" {{', f'\t\thex = "{data}"', '\t}']
-            text += ['\tlet v = []i64{}', '\tmut i = 0', '\tfor i < len(hex) {']
+            text += ['\tmut v = []i64{}', '\tmut i = 0', '\tfor i < len(hex) {']
             if arch == 'arm64':
                 text += ['\t\traw(cast([]i64, v), hex_word(hex, i))', '\t\ti = i + 8']
             else:

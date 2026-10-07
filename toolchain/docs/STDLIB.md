@@ -249,7 +249,7 @@ Package relay carries messages between cores, which share no memory. A message i
 ```tin body
 relay.Send(2, "hello")              // from any core
 let (from, msg) = relay.Recv()      // on core 2: blocks until a message arrives
-let (from, msg) = try relay.Next()  // the same, but fails on a deadline or cancel
+let (src, text) = try relay.Next()  // the same, but fails on a deadline or cancel
 ```
 
 - `Send(to i64, msg str)`: Send copies msg into core to's inbox; it never blocks.

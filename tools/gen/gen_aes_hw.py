@@ -42,7 +42,7 @@ def generate():
                 else:
                     data = data.hex()
                 text += [f'\tif name == "seal.{name}" {{', f'\t\thex = "{data}"', '\t}']
-            text += ['\tif len(hex) == 0 {', '\t\treturn 0', '\t}', '\tlet v = []i64{}', '\tmut i = 0', '\tfor i < len(hex) {']
+            text += ['\tif len(hex) == 0 {', '\t\treturn 0', '\t}', '\tmut v = []i64{}', '\tmut i = 0', '\tfor i < len(hex) {']
             if arch == 'arm64':
                 text += ['\t\traw(cast([]i64, v), hex_word(hex, i))', '\t\ti = i + 8']
             else:

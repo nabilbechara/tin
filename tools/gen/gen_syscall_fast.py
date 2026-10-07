@@ -31,7 +31,7 @@ def generate():
                 data = table[name]
                 code = ''.join(f'{v[0]:08x}' for v in struct.iter_unpack('<I',data)) if arch=='arm64' else data.hex()
                 result += [f'\tif name == "{name}" {{', f'\t\thex = "{code}"', '\t}']
-            result += ['\tif i64(byte_at(hex, 0)) == 0 {', '\t\treturn 0', '\t}', '\tlet v = []i64{}', '\tmut i = 0',
+            result += ['\tif i64(byte_at(hex, 0)) == 0 {', '\t\treturn 0', '\t}', '\tmut v = []i64{}', '\tmut i = 0',
                        '\tfor i < len(hex) {']
             if arch == 'arm64':
                 result += ['\t\traw(cast([]i64, v), hex_word(hex, i))', '\t\ti = i + 8']

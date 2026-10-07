@@ -332,6 +332,17 @@ if ! cmp -s toolchain/tests/edition1/fix/translate_ed1.tin "$tmp/translate_again
 	diff -u toolchain/tests/edition1/fix/translate_ed1.tin "$tmp/translate_again.tin" || true
 	exit 1
 fi
+# tin fix declares mut every let the program reassigns (E711, #526), and the result checks.
+"$compiler" -fix-let toolchain/tests/edition1/fix/let_mut.tin >"$tmp/let_mut_fixed.tin" 2>/dev/null
+if ! cmp -s toolchain/tests/edition1/fix/let_mut_fixed.tin "$tmp/let_mut_fixed.tin"; then
+	echo "FAIL edition1/fix/let_mut: -fix-let differs"
+	diff -u toolchain/tests/edition1/fix/let_mut_fixed.tin "$tmp/let_mut_fixed.tin" || true
+	exit 1
+fi
+if ! "$compiler" -edition 1 -o "$tmp/let_mut" toolchain/tests/edition1/fix/let_mut_fixed.tin; then
+	echo "FAIL edition1/fix/let_mut: the fixed file does not compile"
+	exit 1
+fi
 # translate.out is what the edition 0 program printed before edition 0 was retired (#226).
 "$compiler" -edition 1 -o "$tmp/translate1" toolchain/tests/edition1/fix/translate_ed1.tin
 "$tmp/translate1" >"$tmp/translate1.out"

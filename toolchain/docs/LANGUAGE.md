@@ -605,7 +605,9 @@ _ = ok
 
 - **`let`** binds a name that is not reassigned; **`mut`** binds one that is. Both infer
   the type from the value or take one: `let n i64 = 0`. Every local has an initializer.
-  (The checker does not yet reject reassigning a `let` name.)
+  Assigning a `let` name (`=`, `+=`, a tuple assignment, from a closure; a package-level
+  `let` too) is a compile error (E711); `tin fix -edition 1` declares such names `mut`. So is
+  assigning a loop's variable (`for i in 0..n`, `for x in xs`), which the loop sets.
 - `let` fixes the name, not the object: what a binding refers to can still change through
   it (a struct field, a slice element). Changes through parameters are governed by `mut`
   parameters and the call-site `mut` below.

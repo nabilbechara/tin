@@ -33,7 +33,7 @@ shared mut dyn_tables []i64 // [concrete type, dyn type, keep function, methods,
 shared mut ck_escaping_cells []str // variable names that must be allocated in heap cells
 
 fn sym_new(kind i64, name str, pos i64) Sym {
-	let s = cast(Sym, calloc(36, 8))
+	let s = cast(Sym, calloc(37, 8))
 	s.kind = kind
 	s.name = name
 	s.pos = pos
@@ -2499,7 +2499,7 @@ fn lookup_outer(f Fn, name str) i64 {
 }
 
 fn capture_sym(f Fn, os Sym) i64 {
-	let caps = cast([]i64, f.captures)
+	mut caps = cast([]i64, f.captures)
 	mut ci = -1
 	mut i = 0
 	for i < len(caps) {
@@ -2534,6 +2534,7 @@ fn capture_sym(f Fn, os Sym) i64 {
 		cs.type_ = os.type_
 		cs.captured = 1
 		cs.cap_idx = ci
+		cs.fixed = os.fixed
 		cs.reads = 1
 		cs.scope_at = os.scope_at
 		sc_syms = append(sc_syms, cast(Sym, cs))
@@ -2545,6 +2546,7 @@ fn capture_sym(f Fn, os Sym) i64 {
 	cs.cap_idx = ci
 	cs.reads = 1
 	cs.scope_at = os.scope_at
+	cs.fixed = os.fixed
 	return cast(i64, cs)
 }
 
@@ -2732,25 +2734,25 @@ fn args1(a i64) i64 {
 }
 
 fn args2(a i64, b i64) i64 {
-	let v = cast([]i64, args1(a))
+	mut v = cast([]i64, args1(a))
 	v = append(v, b)
 	return cast(i64, v)
 }
 
 fn args3(a i64, b i64, c i64) i64 {
-	let v = cast([]i64, args2(a, b))
+	mut v = cast([]i64, args2(a, b))
 	v = append(v, c)
 	return cast(i64, v)
 }
 
 fn args4(a i64, b i64, c i64, d i64) i64 {
-	let v = cast([]i64, args3(a, b, c))
+	mut v = cast([]i64, args3(a, b, c))
 	v = append(v, d)
 	return cast(i64, v)
 }
 
 fn args5(a i64, b i64, c i64, d i64, f i64) i64 {
-	let v = cast([]i64, args4(a, b, c, d))
+	mut v = cast([]i64, args4(a, b, c, d))
 	v = append(v, f)
 	return cast(i64, v)
 }
@@ -3624,7 +3626,7 @@ fn mark_spawns(v []i64, names []str) {
 		let s = v[i]
 		let k = cast(Node, s).kind
 		if k == ST_SCOPE {
-			let inner = slice_clone(names)
+			mut inner = slice_clone(names)
 			inner = append(inner, cast(ScopeStmt, s).name)
 			mark_spawns(cast(Block, cast(ScopeStmt, s).body).stmts, inner)
 		} else if k == ST_BLOCK {
@@ -3798,7 +3800,7 @@ fn lower_select(s i64) {
 	let arms = cast(SelectStmt, s).arms
 	let n = len(arms)
 	let out = cast(Block, empty_block(pos))
-	let st = out.stmts
+	mut st = out.stmts
 	mut kinds = []i64{} // 1 lane, 2 handle, 3 after, 4 canceled
 	mut srcs = []str{}
 	let armv = sel_name(pos, "$sel", 0 - 1)
@@ -3868,7 +3870,7 @@ fn lower_select(s i64) {
 	let loop_ = cast(WhileStmt, node_new(ST_WHILE, pos))
 	loop_.cond = sel_cmp(pos, armv, "<", 0)
 	loop_.body = empty_block(pos)
-	let lb = cast(Block, loop_.body).stmts
+	mut lb = cast(Block, loop_.body).stmts
 	let dl = sel_name(pos, "$seld", 0)
 	lb = append(lb, sel_let(pos, dl, node_new(EX_INT, pos)))
 	mut chain = 0
@@ -3916,7 +3918,7 @@ fn lower_select(s i64) {
 	let wait = cast(IfStmt, node_new(ST_IF, pos))
 	wait.cond = sel_cmp(pos, armv, "<", 0)
 	wait.then = empty_block(pos)
-	let wb = cast(Block, wait.then).stmts
+	mut wb = cast(Block, wait.then).stmts
 	i = 0
 	for i < n {
 		let k = kinds[i]
@@ -3967,7 +3969,7 @@ fn lower_select(s i64) {
 		let ifs = cast(IfStmt, node_new(ST_IF, pos))
 		ifs.cond = sel_cmp(pos, armv, "==", i)
 		ifs.then = empty_block(pos)
-		let tb = cast(Block, ifs.then).stmts
+		mut tb = cast(Block, ifs.then).stmts
 		if i == n {
 			let tr = cast(TryExpr, node_new(EX_TRY, pos))
 			tr.x = sel_call(pos, "rt_select_fail", cast(i64, []i64{}))
@@ -4898,6 +4900,10 @@ fn check_let(s i64) {
 		return
 	}
 	cast(LetStmt, s).sym = declare_local(pos, cast(LetStmt, s).name, t)
+	// Names starting with $ are the compiler's own (desugared select, ranges...), which it may set.
+	if cast(LetStmt, s).mut_ == 0 && byte_at(cast(LetStmt, s).name, 0) != '$' {
+		cast(Sym, cast(LetStmt, s).sym).fixed = 1
+	}
 	if cast(i64, init) != 0 && init.kind == EX_IDENT && ck_trusted == 0 {
 		alias_link(cast(Sym, cast(LetStmt, s).sym), lookup_name(cast(IdentExpr, init).name))
 	}
@@ -4981,6 +4987,7 @@ fn check_target(t i64) i64 {
 fn check_assign(s i64) {
 	mut target = cast(AssignStmt, s).target
 	let v = cast(Node, cast(AssignStmt, s).value)
+	let_assign_check(target)
 	// Assigning to a variable narrowed from ?number: the value is boxed and the box replaces the
 	// old one. x op= v shares the target node with v, and reading x there loads the number from
 	// the box, so the store gets a node of its own.
@@ -5170,6 +5177,7 @@ fn check_value(pos i64, t i64) {
 }
 
 fn check_multi(s i64) {
+	bind_fixed = i64(cast(MultiStmt, s).define != 0 && cast(MultiStmt, s).mut_ == 0)
 	// Multi-assignment lowers through generated temporaries and can rebind either a
 	// remembered length or its source slice. Drop these local facts conservatively.
 	len_aliases = []i64{}
@@ -5180,7 +5188,7 @@ fn check_multi(s i64) {
 	let out = cast(Block, node_new(ST_BLOCK, pos))
 	out.stmts = []i64{}
 	out.flat = 1
-	let stmts = out.stmts
+	mut stmts = out.stmts
 	let n = len(targets)
 	mut temps = []i64{}
 	if define == 0 && len(values) == n {
@@ -5281,6 +5289,50 @@ fn splice_list(s Node, block i64) {
 }
 
 // bind_targets assigns (or, for :=, declares) each target from its temp.
+shared mut bind_fixed i64 // the names bind_targets declares are a let's (#526)
+
+// let_assign_check reports an assignment to a name declared with let: a local, a tuple binding,
+// a variable a closure captured, or a package-level let (E711, #526). Fields, elements and map
+// entries reached through the name stay assignable.
+fn let_assign_check(target i64) {
+	if cast(Node, target).kind != EX_IDENT {
+		return
+	}
+	let name = cast(IdentExpr, target).name
+	let sym = lookup_name(name)
+	if cast(i64, sym) == 0 {
+		return
+	}
+	mut fixed = sym.fixed
+	if sym.kind == SYM_GLOBAL && sym.index >= 0 && sym.index < len(prog_vars) {
+		let v = prog_vars[sym.index]
+		// A shared let is E603's; a per-core let is set once, by its initializer.
+		fixed = i64(v.mut_ == 0 && v.shared_ == 0)
+	}
+	if fixed == 0 {
+		return
+	}
+	if let_fix != 0 {
+		if cast(i64, let_fix_decls) == 0 {
+			let_fix_decls = []i64{}
+		}
+		let_fix_decls = append(let_fix_decls, sym.pos)
+		return
+	}
+	let m = err_code(cast(Node, target).pos, "E711 LET_ASSIGN")
+	buf_str(m, "cannot assign to ")
+	buf_str(m, name)
+	if fixed == 2 {
+		buf_str(m, ": it is a loop's variable, which the loop sets (copy it into a mut local to change it, or loop with for cond {{ }})")
+		err_end(cast([]u8, m))
+		return
+	}
+	buf_str(m, ": it is declared with let, which is not reassigned (declare it with mut to change it; declared at ")
+	buf_pos(m, sym.pos)
+	buf_str(m, ")")
+	err_end(cast([]u8, m))
+}
+
 fn bind_targets(pos i64, targets []i64, temps []Sym, define i64, stmts []i64) {
 	mut i = 0
 	for i < len(targets) {
@@ -5302,6 +5354,7 @@ fn bind_targets(pos i64, targets []i64, temps []Sym, define i64, stmts []i64) {
 				l.init = sym_ref_node(pos, ts)
 				let sym = cast(Sym, declare_local(pos, cast(IdentExpr, tg).name, ts.type_))
 				l.sym = cast(i64, sym)
+				sym.fixed = bind_fixed
 				if sym.cell != 0 {
 					let csym = sym.cell_sym
 					let alloc_call = rt_call(pos, "rt_alloc", args1(mk_int(pos, 8, ty_int)), ty_int)
@@ -5494,7 +5547,7 @@ fn lower_try_stmt(s i64, tr_in i64, mode i64, declared i64) {
 	}
 	let out = cast(Block, empty_block(pos))
 	out.flat = 1
-	let stmts = out.stmts
+	mut stmts = out.stmts
 	mut temps = []Sym{}
 	if len(results) == 1 {
 		let tl = temp(pos, cast(i64, call), ty_error)
@@ -5609,6 +5662,7 @@ fn lower_try_stmt(s i64, tr_in i64, mode i64, declared i64) {
 			vals = append(vals, cast(i64, temps[i]))
 			i = i + 1
 		}
+		bind_fixed = i64(cast(MultiStmt, s).define != 0 && cast(MultiStmt, s).mut_ == 0)
 		bind_targets(pos, targets, cast([]Sym, cast([]i64, vals)), cast(MultiStmt, s).define, stmts)
 	} else if mode == 4 && hasf == 0 {
 		// return f() catch ... in a function that cannot fail: return just the values.
@@ -5776,7 +5830,7 @@ fn lower_range(s i64) {
 	let xt = cast(Ty, chk(cast(Node, x), 0))
 	let k = kind_of(xt)
 	let out = cast(Block, empty_block(pos))
-	let stmts = out.stmts
+	mut stmts = out.stmts
 	push_scope()
 	let src = temp(pos, x, cast(i64, xt))
 	stmts = append(stmts, cast(i64, src))
@@ -5931,6 +5985,8 @@ fn range_bind(pos i64, target i64, value i64, t i64, define i64) i64 {
 		l.init = value
 		l.sym = cast(i64, sym_new(SYM_LOCAL, cast(IdentExpr, target).name, pos))
 		cast(Sym, l.sym).type_ = t
+		// for x in xs: x is each element in turn, not a variable to set (#526).
+		cast(Sym, l.sym).fixed = 2
 		cast(Sym, l.sym).slot = cast(Fn, ck_fn).slots
 		cast(Fn, ck_fn).slots = cast(Fn, ck_fn).slots + 1
 		cast(Fn, ck_fn).locals = append(cast(Fn, ck_fn).locals, cast(Sym, l.sym))
@@ -6656,7 +6712,7 @@ fn flat_block(pos i64, stmts i64) i64 {
 fn check_match_let(s i64, m Node, t i64) {
 	let pos = cast(Node, s).pos
 	let vs = cast(Sym, declare_local(pos, mt_name("$match"), t))
-	let stmts = match_valued(pos, cast(i64, m), vs, MATCH_VALUE, 0)
+	mut stmts = match_valued(pos, cast(i64, m), vs, MATCH_VALUE, 0)
 	let l = cast(LetStmt, node_new(ST_LET, pos))
 	l.name = cast(LetStmt, s).name
 	l.type_ = cast(LetStmt, s).type_
@@ -6686,7 +6742,7 @@ fn check_match_assign(s Node, target i64, m i64) {
 		}
 	}
 	let vs = cast(Sym, declare_local(pos, mt_name("$match"), t))
-	let stmts = match_valued(pos, m, vs, MATCH_VALUE, 0)
+	mut stmts = match_valued(pos, m, vs, MATCH_VALUE, 0)
 	if vs.type_ != 0 {
 		let a = assign_stmt(pos, target, sym_ref_node(pos, vs))
 		stmts = append(stmts, a)
@@ -6699,7 +6755,7 @@ fn check_match_assign(s Node, target i64, m i64) {
 fn check_match_tail(s Node, m i64) {
 	let pos = s.pos
 	let vs = cast(Sym, declare_local(pos, mt_name("$match"), 0))
-	let stmts = match_valued(pos, m, vs, MATCH_TAIL, 0)
+	mut stmts = match_valued(pos, m, vs, MATCH_TAIL, 0)
 	let t = vs.type_
 	bound_t = ty_void
 	if t != 0 && kind_of(cast(Ty, t)) != K_VOID {
@@ -7647,6 +7703,12 @@ fn lower_for_init(s i64) {
 	replace_node(s, cast(i64, b))
 	push_scope()
 	check_stmt(init)
+	// for i in a..b: the body reads i, and only the loop's own step sets it (#526).
+	mut counter = cast(Sym, 0)
+	if cast(Node, init).kind == ST_LET && cast(LetStmt, init).sym != 0 && byte_at(cast(LetStmt, init).name, 0) != '$' {
+		counter = cast(Sym, cast(LetStmt, init).sym)
+		counter.fixed = 2
+	}
 	check_cond(cast(Node, inner.cond))
 	let saved = len(safe_pairs)
 	let bound = len_bound(inner.cond)
@@ -7668,6 +7730,9 @@ fn lower_for_init(s i64) {
 	ck_labels = append(ck_labels, inner.label)
 	check_scoped(cast(Block, inner.body))
 	slice_truncate(safe_pairs, saved)
+	if cast(i64, counter) != 0 {
+		counter.fixed = 0
+	}
 	if inner.post != 0 {
 		push_scope()
 		check_stmt(inner.post)
@@ -7844,7 +7909,7 @@ fn keep_fn(t Ty) Fn {
 	f.slots = 1
 	mut vs5 = cast([]i64, f.locals)
 	vs5 = append(vs5, cast(i64, x))
-	let body = cast(Block, f.body).stmts
+	mut body = cast(Block, f.body).stmts
 	let k = kind_of(t)
 	let ret = cast(ReturnStmt, node_new(ST_RETURN, pos))
 	if k == K_DYN {
@@ -8205,7 +8270,7 @@ fn arrdrop_fn(et i64) i64 {
 	ck_fn = cast(Fn, f)
 	let pos = 0
 	let p = cast([]i64, f.locals)[0]
-	let body = cast(Block, f.body).stmts
+	mut body = cast(Block, f.body).stmts
 	let n = temp(pos, rt_call(pos, "rt_rc_arr_n", args2(sym_ref_node(pos, cast(Sym, p)), mk_int(pos, type_width(cast(Ty, et)), ty_int)), ty_int), ty_int)
 	body = append(body, cast(i64, n))
 	let j = declare_local(pos, "$", ty_int)
@@ -8321,7 +8386,7 @@ fn arenacopy_fn(t Ty) Fn {
 	f.slots = 1
 	mut vs5 = cast([]i64, f.locals)
 	vs5 = append(vs5, cast(i64, x))
-	let body = cast(Block, f.body).stmts
+	mut body = cast(Block, f.body).stmts
 	let k = kind_of(t)
 	let ret = cast(ReturnStmt, node_new(ST_RETURN, pos))
 	if k == K_ERROR {

@@ -3661,6 +3661,35 @@ example.tin:6:2: error E710 NOT_ASSIGNABLE: cannot assign to constant 'maxSize'
 
 Fix: use a variable for a value that changes; build a new `str` instead of changing one.
 
+### E711 LET_ASSIGN
+
+A name declared with `let` is not reassigned: a local, a tuple binding `let (a, b) = f()`, a
+variable a closure captured, or a package-level `let`; nor is a loop's variable (`for i in
+0..n`, `for x in xs`), which the loop sets. Fields, elements and map entries reached through it
+can still change.
+
+```tin edition=1
+package main
+
+import "say"
+
+fn main() {
+	let total = 0
+	for i in 0..3 {
+		total += i
+	}
+	say.Line(total)
+}
+```
+
+```text
+example.tin:8:3: error E711 LET_ASSIGN: cannot assign to total: it is declared with let, which is not reassigned (declare it with mut to change it; declared at example.tin:6:2)
+```
+
+Fix: declare it with `mut` (`mut total = 0`); `tin fix -edition 1 FILE.tin` makes that change
+for every `let` the program reassigns. For a loop's variable, change a `mut` copy, or count
+with `for cond { }` and a `mut` counter.
+
 ## E8xx Trusted code
 
 ### E801 TRUSTED_ONLY
