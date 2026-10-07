@@ -1585,6 +1585,13 @@ What the checker tracks:
 Plain programs (no server) never reset their pool: memory is released when the program
 exits. Tasks of a scope share their parent's pool; a `detach` task has its own.
 
+Building a `str` in a loop with `s += piece` (or `s = s + a + b`) costs memory linear in the
+result when `s` is a local the loop only appends to: other uses of `s` in the loop are `len(s)`,
+`s[i]` and comparisons, and no closure captures it. The compiler then grows `s` in place, with
+doubling room (#520). When the loop also hands `s` on (prints it, stores it, passes it to a
+function), every pass keeps a copy until the pool is reset: build with `twine.Builder`, or move
+the use after the loop.
+
 **Arenas** (edition 1, #236). `arena { body }` runs its body in a sub-region of its own: a
 fresh pool, dropped when the block ends. The block's value (its last expression) is copied
 into the enclosing region, so it is all that leaves; a batch loop whose steps run in arenas

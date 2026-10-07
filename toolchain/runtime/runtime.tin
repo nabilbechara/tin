@@ -1419,6 +1419,39 @@ fn rt_str_cat(a str, b str) str {
 	return cast(str, p)
 }
 
+// rt_str_grow is s + e for a loop that only appends to s (#520): sb is the loop's record, the
+// string it owns and that string's room. An owned s with room is extended in place (nothing else
+// can hold it: the compiler checked the loop reads s only to append, len, index and compare);
+// otherwise the result is a new string with twice the room, which the loop then owns.
+fn rt_str_grow(s str, e str, sb i64) str {
+	let ls = len(s)
+	let le = len(e)
+	if le == 0 {
+		return s
+	}
+	let p = cast(i64, s)
+	let n = ls + le
+	if p == sb[0] && n + 9 <= sb[1] {
+		memcpy(p+8+ls, cast(i64, e)+8, le)
+		p[0] = n
+		return s
+	}
+	if n > maxAlloc/2 {
+		rt_panic("allocation size out of range")
+	}
+	mut room = 2 * n
+	if room < 56 {
+		room = 56
+	}
+	let q = rt_alloc(room + 9)
+	q[0] = n
+	memcpy(q+8, p+8, ls)
+	memcpy(q+8+ls, cast(i64, e)+8, le)
+	sb[0] = q
+	sb[1] = room + 9
+	return cast(str, q)
+}
+
 fn rt_str_eq(a str, b str) bool {
 	let pa = cast(i64, a)
 	let pb = cast(i64, b)
