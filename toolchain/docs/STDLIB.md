@@ -44,6 +44,8 @@ Generated from the comments in `toolchain/std/*/` and `packages/*/` by `tools/ge
 | [kafka](#kafka) | Kafka client (franz-go, sarama) |
 | [websocket](#websocket) | WebSocket server and client (gorilla/websocket) |
 | [atomic](#atomic) | counters and flags every core may change (sync/atomic) |
+| [lane](#lane) | a bounded queue between the tasks of one core (buffered channels) |
+| [replay](#replay) | recording and reading request capsules for tin replay |
 
 ## say
 
@@ -1530,3 +1532,39 @@ Package atomic has counters and flags that every core may change at once. Keep o
 - `(c Bool) Store(v bool)`: Store sets the flag to v.
 - `(c Bool) Swap(v bool) bool`: Swap sets the flag to v and returns the value it replaced.
 - `(c Bool) CompareSwap(old bool, next bool) bool`: CompareSwap sets the flag to next if it is old, and reports whether it did.
+
+## lane
+
+Package lane is a bounded queue between the tasks of one core (Go's buffered channel): lane.New[T](n) makes one that holds n values, Send waits while it is full and Recv while it is empty, and both take the task's deadline and cancellation like any other wait. Close ends it: senders fail at once and receivers drain what is left, then fail with "lane closed". In main (outside a task) a wait runs the core's other tasks until it can go on. Ready, Watch and Unwatch are what select uses. A lane never crosses cores: relay does that.
+
+- `type Lane[T constraints.Any] struct`: Lane is a bounded queue between tasks on one core (design_semantics §6, #232). Send waits while it is full and Recv while it is empty; Close wakes every waiter. Waits take the task's deadline and cancellation like any other wait. A lane never crosses cores (relay does).
+- `New[T constraints.Any](capacity i64) Lane[T]`: New makes a lane that holds at most capacity values (at least one).
+- `(l mut Lane[T]) Send(v T) !`: Send puts v at the back, waiting while the lane is full; it fails once the lane is closed.
+- `(l mut Lane[T]) TrySend(v T) bool`: TrySend puts v at the back if there is room and reports whether it did.
+- `(l mut Lane[T]) Recv() !T`: Recv takes the value at the front, waiting while the lane is empty; it fails with "lane closed" once the lane is closed and empty.
+- `(l mut Lane[T]) Close()`: Close ends the lane: senders fail, receivers drain what is left and then fail.
+- `(l Lane[T]) Ready() bool`: Ready reports whether Recv would not wait: a value is there or the lane is closed (select).
+- `(l mut Lane[T]) Watch()`: Watch makes the next value or Close wake the running task without taking a value (select).
+- `(l mut Lane[T]) Unwatch()`: Unwatch withdraws Watch.
+- `(l Lane[T]) Len() i64`: Len is how many values wait in the lane.
+
+## replay
+
+Package replay records a request's effects into a sealed capsule and reads capsules back, for `tin replay` (design/interface_replay.md). Reading replay capsules (section 6; #242): the envelope's tag and keystream, the body, and the effect kinds this build can replay. Writing capsules, the spool and the keys of secrets are #241's, in write.tin.
+
+- `type Capsule struct`: Capsule is a decoded capsule: one recorded request and its effect records.
+- `const Kinds = ",sched.select@1,sched.resume@1,sched.cancel@1,tide.now@1,tide.wall@1,dice.seed@1,seal.random@1,wire.http@1,wire.dial@1,wire.read@1,wire.write@1,redis@1,kafka@1,mysql@1,mysql.tx@1,postgres@1,postgres.tx@1,websocket.dial@1,websocket.read@1,websocket.write@1,quarry.read@1,quarry.write@1,quarry.stat@1,quarry.dir@1,quarry.fs@1,"`: Kinds lists the effect kinds (name@version) this build replays (section 4); a capsule with any other kind is refused. The sched.* kinds are the request's scheduling (section 7, #243).
+- `Open(path str, keyHex str) !Capsule`: Open reads the capsule at path, encrypted under keyHex (the 64 hex digits of TIN_REPLAY_KEY).
+- `Key(keyHex str) !str`: Key is the 32 bytes a TIN_REPLAY_KEY value (64 hex digits) stands for.
+- `Unseal(data str, key str) !str`: Unseal checks a capsule envelope's tag under key and returns its decrypted body.
+- `Decode(body str) !Capsule`: Decode reads a capsule body (schema 1 or 2) and checks every effect record and its kind.
+- `Supported(kind str) bool`: Supported reports whether this build replays effect kind (name@version).
+- `Setup(cores i64) bool`: Setup reads the switches (TIN_REPLAY_DIR, TIN_REPLAY_KEY, TIN_REPLAY_SAMPLE, TIN_REPLAY_MAX_MB, TIN_REPLAY_SECRET_HEADERS, TIN_REPLAY_DROP_HEADERS) for a server on n cores, trims the spool and installs the keyed hash of secrets; it reports whether recording is on (never while TIN_REPLAY_CAPSULE replays a capsule). Call it before the cores start. A missing or malformed key, or a spool that cannot be made, prints one line on stderr and leaves recording off.
+- `On() bool`: On reports whether Setup turned recording on.
+- `Secret(s str) str`: Secret is the handle an effect key or a stored header holds instead of a secret's text: "tin-secret:" and the first 16 bytes of HMAC-SHA256(Ks, s) in hex (section 5.1).
+- `Wanted(status i64, panicked bool) i64`: Wanted is the flags a capsule of a request that ended with status is kept with (1 panicked, 2 sampled), or -1 when it is dropped: kept when the status is 500 or more, or it panicked, or it is in the TIN_REPLAY_SAMPLE fraction.
+- `Done(tp i64, core i64)`: Done ends the recording tape tp of a request served on core: its capsule is written when the request is kept (Wanted), and the tape is freed. A capsule that cannot be written prints one line on stderr; the server goes on.
+- `Write(tp i64, core i64, flags i64) !str`: Write writes the capsule of tape tp (recorded on core, with flags) into the spool, deleting the core's oldest capsules past its share of TIN_REPLAY_MAX_MB; it returns the capsule's path.
+- `Encode(tp i64, core i64, flags i64) str`: Encode is the capsule body of tape tp (section 6): the request with its secret headers as handles and its dropped headers empty, the panic, the peer, and the effect records.
+- `Seal(body str) str`: Seal is the envelope of a capsule body (section 6): the magic, a random nonce, the body under the HMAC-SHA256 keystream, and the tag over all of it.
+- `Scrub(req str) str`: Scrub is a request as a capsule stores it: the values of secret headers (section 1) become their handles and the values of dropped headers become empty; everything else is kept.
