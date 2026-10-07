@@ -35,8 +35,7 @@ Contents: 1 Programs and packages · 2 Lexical elements · 3 Types · 4 Constant
 **Status.** A few edition 1 forms are read by the parser but not yet accepted by the
 checker, and are marked *not yet implemented* where they appear: `opt ?? fallback`, `arena`
 blocks (#236), tuple type aliases (`type Pair = (i64, i64)`) and variadic parameters
-(`xs ...i64`). The checker also does not yet reject reassigning a `let` name or an unknown
-attribute.
+(`xs ...i64`). The checker also does not yet reject reassigning a `let` name.
 
 ---
 
@@ -2032,9 +2031,8 @@ fn main() {
 ## 19. Attributes
 
 An attribute is `@name(arguments)` before what it annotates. Attributes are checked at
-compile time; they add no runtime metadata and do not change layouts. Invalid arguments are
-compile errors (E042); unknown attribute names should be too, but edition 1 does not reject
-them yet.
+compile time; they add no runtime metadata and do not change layouts. Unknown attribute
+names (E041) and invalid arguments (E042) are compile errors.
 
 | attribute | on | meaning |
 |---|---|---|

@@ -308,7 +308,10 @@ Fix: put the attribute on the function it is meant for, or remove it.
 
 ### E041 UNKNOWN_ATTRIBUTE
 
-A struct field takes only the attributes the language defines: `@json("name")`.
+Only the attributes the language defines are accepted: `@json("name")` on a struct field,
+and `@nopoll` and `@wrap` on a function (LANGUAGE.md section 19). A misspelt function
+attribute is reported as `unknown function attribute @wrapp; supported attributes are @nopoll
+and @wrap`.
 
 ```tin edition=1
 package main
@@ -329,7 +332,8 @@ Fix: correct the spelling (`@json("id")`), or remove the attribute.
 
 ### E042 ATTRIBUTE_ARGS
 
-`@json` takes one string literal: the field's name in JSON.
+`@json` takes one string literal: the field's name in JSON. `@nopoll` and `@wrap` take no
+arguments (`@wrap takes no arguments`).
 
 ```tin edition=1
 package main
