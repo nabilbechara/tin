@@ -1,0 +1,95 @@
+package main
+
+// #525: an enum variant may hold an instance of a generic type.
+
+import "argo"
+import "constraints"
+import "say"
+import "sift"
+
+type Box[T constraints.Any] struct {
+	v T
+}
+
+type Tree[T sift.Ordered] enum {
+	Leaf
+	Node(Tree[T], T, Tree[T])
+}
+
+type Held enum {
+	Nothing
+	One(Box[i64])
+	Two(Box[str], Box[i64])
+	Named(name str, cells [3]i64)
+	Listed(xs []i64)
+}
+
+type Result[T constraints.Any, E constraints.Any] enum {
+	Ok(T)
+	Err(E)
+}
+
+fn insert[T sift.Ordered](t Tree[T], v T) Tree[T] {
+	return match t {
+		Leaf => Tree[T].Node(Tree[T].Leaf, v, Tree[T].Leaf)
+		Node(l, x, r) => {
+			if v < x {
+				return Tree[T].Node(insert(l, v), x, r)
+			}
+			return Tree[T].Node(l, x, insert(r, v))
+		}
+	}
+}
+
+fn walk[T sift.Ordered](t Tree[T], out mut []T) {
+	match t {
+		Leaf => {}
+		Node(l, x, r) => {
+			walk(l, mut out)
+			out = append(out, x)
+			walk(r, mut out)
+		}
+	}
+}
+
+fn depth[T sift.Ordered](t Tree[T]) i64 {
+	return match t {
+		Leaf => 0
+		Node(l, _, r) => 1 + max(depth(l), depth(r))
+	}
+}
+
+fn main() {
+	mut t = Tree[i64].Leaf
+	for v in []i64{5, 3, 8, 1, 4, 9, 7} {
+		t = insert(t, v)
+	}
+	mut out = []i64{}
+	walk(t, mut out)
+	say.Line(out, depth(t))
+	mut ts = Tree[str].Leaf
+	for w in []str{"m", "c", "x"} {
+		ts = insert(ts, w)
+	}
+	mut words = []str{}
+	walk(ts, mut words)
+	say.Line(words)
+	let h = Held.Two(Box[str]{v: "a"}, Box[i64]{v: 2})
+	say.Line(h, Held.One(Box[i64]{v: 7}))
+	match h {
+		Two(a, b) => say.Line(a.v, b.v)
+		_ => say.Line("other")
+	}
+	let n = Held.Named("n", [3]i64{1, 2, 3})
+	say.Line(n, Held.Listed([]i64{4}))
+	let r = Result[Box[i64], str].Ok(Box[i64]{v: 1})
+	say.Line(r, Result[Box[i64], str].Err("bad"))
+	mut b = []u8{}
+	argo.Put(mut b, Held.Two(Box[str]{v: "a"}, Box[i64]{v: 2}))
+	say.Line(str(b))
+	mut back = Held.Nothing
+	argo.Get(str(b), mut back) catch err {
+		say.Line("decode:", err)
+	}
+	say.Line(back)
+}

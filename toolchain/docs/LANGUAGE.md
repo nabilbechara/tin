@@ -340,7 +340,8 @@ fn main() {
 }
 ```
 
-- A variant lists the types of its data. The data is read only through `match`
+- A variant lists the types of its data, generic instances included (`Node(Tree[T], T,
+  Tree[T])`, `One(Box[i64])`). The data is read only through `match`
   (section 7): there is no `s.r`, and no struct literal `Shape{...}`. An arm binds every
   value of one variant, or lists several variants that bind nothing (`Green, Blue =>`).
   A `match` that misses a variant without `_` is a compile error naming the missing ones.
