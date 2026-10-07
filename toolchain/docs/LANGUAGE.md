@@ -242,7 +242,9 @@ name is E641 (`ys` would have changed under you). Take `sift.Clone(xs)` for a sn
 - Slice literals: `[]i64{1, 2, 3}`, `[]Point{{x: 1}, {x: 2}}` (the element type may be
   left out of struct elements).
 - `[N]T` is a slice that starts with N zero elements: a struct field `cells [16]i64`. It
-  is not a value type: assigning it shares it.
+  is not a value type: assigning it shares it. A literal lists at most N values and the rest
+  are zero values: `[3]i64{1, 2}` is `[1 2 0]`, `[2][3]i64{{1}}` is `[[1 0 0] [0 0 0]]`, and
+  `[2]i64{1, 2, 3}` is an error (E202).
 
 ### Maps
 

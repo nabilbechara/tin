@@ -1859,7 +1859,43 @@ fn chk_composite(e i64, want i64) i64 {
 	if k == K_SLICE {
 		let n = len(elems)
 		let et = t.elem
-		let sl = temp(pos, rt_call(pos, "rt_slice_make", args3(mk_int(pos, n, ty_int), mk_int(pos, n, ty_int), mk_int(pos, elem_size(t), ty_int)), cast(i64, t)), cast(i64, t))
+		// [N]T{...} has N elements: the listed ones, then zero values (#518).
+		mut alen = -1
+		mut ainner = 0
+		if cast(Node, tx).kind == EX_TYPE && cast(TypeNode, tx).ty != 0 && cast(Node, cast(TypeNode, tx).ty).kind == TX_ARRAY {
+			let atx = cast(TypeNode, tx).ty
+			alen = array_len(atx)
+			ainner = array_inner
+			array_inner = 0
+			if n > alen {
+				let m = err_code(pos, "E202 ARRAY_TYPE")
+				buf_str(m, "too many values in an array literal: ")
+				buf_int(m, n)
+				buf_str(m, " for ")
+				buf_int(m, alen)
+				buf_str(m, " elements")
+				err_end(cast([]u8, m))
+				return cast(i64, t)
+			}
+			// A row written {...} in [N][M]T{...} is an [M]T itself.
+			let row = cast(TypeExpr, atx).b
+			if row != 0 && cast(Node, row).kind == TX_ARRAY {
+				mut ri = 0
+				for ri < n {
+					let rv = elems[ri]
+					if cast(Node, rv).kind == EX_COMPOSITE && cast(Node, cast(Composite, rv).type_).kind == EX_TYPE && cast(TypeNode, cast(Composite, rv).type_).ty == 0 {
+						cast(TypeNode, cast(Composite, rv).type_).ty = row
+					}
+					ri = ri + 1
+				}
+			}
+		}
+		mut made = rt_call(pos, "rt_slice_make", args3(mk_int(pos, n, ty_int), mk_int(pos, n, ty_int), mk_int(pos, elem_size(t), ty_int)), cast(i64, t))
+		if alen > n {
+			array_inner = ainner
+			made = array_make(pos, t, alen)
+		}
+		let sl = temp(pos, made, cast(i64, t))
 		stmts = append(stmts, cast(i64, sl))
 		let data = temp(pos, mk_hdr(pos, sym_ref_node(pos, cast(Sym, sl.sym)), 2), ty_int)
 		stmts = append(stmts, cast(i64, data))

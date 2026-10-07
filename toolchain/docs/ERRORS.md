@@ -987,8 +987,8 @@ struct of its fields.
 
 ### E202 ARRAY_TYPE
 
-An array `[N]T` has a constant length of zero or more, and its rows of arrays hold numbers,
-`bool`s and `str`s.
+An array `[N]T` has a constant length of zero or more, a literal `[N]T{...}` lists at most N
+values, and its rows of arrays hold numbers, `bool`s and `str`s.
 
 ```tin edition=1
 package main
