@@ -1,0 +1,84 @@
+package main
+
+// #527: tide.Sleep cut short by a deadline leaves its within block with the deadline's fault,
+// instead of returning as if the whole time had passed.
+
+import "fault"
+import "say"
+import "tide"
+
+fn slow(ms i64) !i64 {
+	tide.Sleep(ms * 1000000)
+	return ms
+}
+
+fn children() !i64 {
+	mut done = 0
+	scope s {
+		for i in 0..3 {
+			s.spawn(fn() ! {
+				tide.Sleep(500 * 1000000)
+				done += 1
+			})
+		}
+	}
+	return done
+}
+
+fn main() {
+	let t0 = tide.Now()
+	let a = within 20ms {
+		try slow(500)
+	} catch err {
+		say.Line("a:", err, fault.Is(err, fault.DeadlineExceeded))
+		-1
+	}
+	say.Line("a =", a, "cut short:", tide.Since(t0) < 400 * 1000000)
+
+	// a sleep that ends before the deadline is a plain sleep
+	let b = within 500ms {
+		try slow(5)
+	} catch _ {
+		-1
+	}
+	say.Line("b =", b)
+
+	// the inner deadline is the one that cuts
+	let c = within 1s {
+		let inner = within 10ms {
+			try slow(300)
+		} catch err {
+			say.Line("c inner:", err)
+			-2
+		}
+		inner + 100
+	} catch _ {
+		-1
+	}
+	say.Line("c =", c)
+
+	// scope children sleeping past the block's deadline
+	let d = within 20ms {
+		try children()
+	} catch err {
+		say.Line("d:", err)
+		-1
+	}
+	say.Line("d =", d)
+
+	// a body that handles the deadline of a failing wait itself keeps its value
+	let e = within 10ms {
+		tide.Wait(300 * 1000000) catch _ {
+			say.Line("e: waited past the deadline")
+		}
+		7
+	} catch _ {
+		-1
+	}
+	say.Line("e =", e)
+
+	// no deadline: the whole sleep
+	let t1 = tide.Now()
+	tide.Sleep(30 * 1000000)
+	say.Line("full sleep:", tide.Since(t1) >= 30 * 1000000)
+}

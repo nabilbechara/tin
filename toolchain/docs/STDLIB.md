@@ -828,7 +828,7 @@ Package tide is clocks, durations and civil (calendar) time in UTC, like Go's ti
 - `Now() i64`: Now returns monotonic nanoseconds since boot (CLOCK_UPTIME_RAW): use it to measure intervals.
 - `Wall() i64`: Wall returns the wall clock as nanoseconds since the Unix epoch, 1970-01-01T00:00:00Z.
 - `Since(t i64) i64`: Since returns the nanoseconds elapsed since the Now() reading t.
-- `Sleep(ns i64)`: Sleep pauses the current core for ns nanoseconds (nothing happens when ns <= 0).
+- `Sleep(ns i64)`: Sleep pauses the running code for ns nanoseconds (nothing happens when ns <= 0); in a task, the core serves others meanwhile. A deadline or cancellation that comes first ends the sleep and leaves the way a safepoint does: the `within`, `limit` or `guard` block that owns it fails with its fault (fault.DeadlineExceeded), and a request past its deadline gets 504 (#527).
 - `Wait(ns i64) !`: Wait pauses for ns like Sleep, but inside a request with a deadline it fails with "deadline exceeded" once the deadline comes first. On a server core, other requests run while one waits.
 - `Seconds(d i64) f64`: Seconds returns d as floating-point seconds, like Go's Duration.Seconds.
 - `Minutes(d i64) f64`: Minutes returns d as floating-point minutes.
