@@ -1,0 +1,72 @@
+package main
+
+// #523: a function literal that calls a captured function value by its plain name, when the
+// call is the only use of that name inside the literal, crashed the compiler.
+
+import "say"
+import "sift"
+
+fn compose(f fn(i64) i64, g fn(i64) i64) (fn(i64) i64) {
+	return fn(x i64) i64 { return g(f(x)) }
+}
+
+fn twice(f fn(i64) i64) (fn(i64) i64) {
+	return fn(x i64) i64 {
+		let y = f(x)
+		return f(y)
+	}
+}
+
+// never called: the compiler crashed on the declaration alone
+fn unused(f fn() i64) (fn() i64) {
+	return fn() i64 { return f() }
+}
+
+fn adders(base fn(i64) i64) []fn(i64) i64 {
+	mut fs = []fn(i64) i64{}
+	for i in 0..3 {
+		fs = append(fs, fn(x i64) i64 { return base(x) + i })
+	}
+	return fs
+}
+
+fn curry(f fn(i64, i64) i64) (fn(i64) (fn(i64) i64)) {
+	return fn(a i64) (fn(i64) i64) {
+		return fn(b i64) i64 { return f(a, b) }
+	}
+}
+
+fn main() {
+	let inc = fn(x i64) i64 { return x + 1 }
+	let dbl = fn(x i64) i64 { return x * 2 }
+	say.Line(compose(inc, dbl)(5), compose(dbl, inc)(5), twice(dbl)(3))
+
+	let one = fn() i64 { return 1 }
+	let two = fn() i64 { return one() + 1 }
+	say.Line(two())
+
+	let log = fn(s str) { say.Line("log:", s) }
+	let run = fn() { log("ran") }
+	run()
+
+	// the closure shares the variable: it sees a later assignment
+	mut pick = fn() str { return "first" }
+	let show = fn() str { return pick() }
+	say.Line(show())
+	pick = fn() str { return "second" }
+	say.Line(show())
+
+	for f in adders(dbl) {
+		say.Text(f(10), " ")
+	}
+	say.Line()
+
+	let add = fn(a i64, b i64) i64 { return a + b }
+	say.Line(curry(add)(3)(4))
+
+	// a literal that is only called (not kept)
+	mut total = 0
+	sift.Each([]i64{1, 2, 3}, fn(x i64) { total += dbl(x) })
+	say.Line(total)
+	say.Line(unused(one)())
+}
