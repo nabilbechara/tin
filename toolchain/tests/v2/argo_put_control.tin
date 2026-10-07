@@ -1,0 +1,73 @@
+package main
+
+import "argo"
+import "dice"
+import "say"
+
+// argo.Put copies 8 bytes at a time while none needs escaping; the test for that wraps
+// (#552), so a chunk holding a control byte, '"' or '\\' must reach the escaping loop
+// instead of failing with an integer overflow.
+
+type Box struct {
+	s str
+}
+
+fn roundtrip(s str) bool {
+	mut b = []u8{}
+	argo.Put(mut b, Box{s: s})
+	mut back = Box{s: ""}
+	argo.Get(str(b), mut back) catch err {
+		say.Line("get failed:", err)
+		return false
+	}
+	return back.s == s
+}
+
+fn main() {
+	mut b = []u8{}
+	argo.Put(mut b, "1234567\n")
+	say.Line("put:", str(b))
+
+	let specials = []str{"\"", "\\", "\n", "\x01", "\x1f", "\x7f", "é", "\x00"}
+	let fills = []str{"a", "\"", "\x1f"}
+	mut checked = 0
+	mut bad = 0
+	for n in 0..25 {
+		for fill in fills {
+			for sp in specials {
+				for at in 0..n {
+					mut s = ""
+					for i in 0..n {
+						if i == at {
+							s += sp
+						} else {
+							s += fill
+						}
+					}
+					checked += 1
+					if !roundtrip(s) {
+						bad += 1
+					}
+				}
+			}
+		}
+	}
+	say.Line("positions checked:", checked, "bad:", bad)
+
+	let alphabet = []str{"a", "Z", "0", " ", "\"", "\\", "\n", "\t", "\x01", "\x1f", "\x7f", "é", "€", "😀", "/", "<"}
+	mut r = dice.New(552)
+	mut fuzzed = 0
+	mut fbad = 0
+	for k in 0..20000 {
+		let n = r.Intn(40)
+		mut s = ""
+		for i in 0..n {
+			s += alphabet[r.Intn(len(alphabet))]
+		}
+		fuzzed += 1
+		if !roundtrip(s) {
+			fbad += 1
+		}
+	}
+	say.Line("fuzzed:", fuzzed, "bad:", fbad)
+}
