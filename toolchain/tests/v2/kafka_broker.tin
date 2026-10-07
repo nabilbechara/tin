@@ -131,9 +131,19 @@ fn be64(s str, at i64) i64 {
 // ---- the cluster ----
 
 // Topics and their leaders (the same on every broker): t has partitions led by brokers 1, 2
-// and 3, old is led by broker 4, tx and the group's topic g by brokers 1 and 2.
+// and 3, old is led by broker 4, tx and the group's topic g by brokers 1 and 2. t/1's leader
+// moves from broker 2 to broker 1 at the first produce to it (see leaderOf).
 fn layout() []str {
 	return []str{"t", "old", "tx", "g"}
+}
+
+// leaderOf is the leader of topic's partition part as broker b sees it: once broker 2 has told
+// the others (relay) that t/1 moved, broker 1 leads it.
+fn leaderOf(b broker, topic str, part i64, l i64) i64 {
+	if b.moved && topic == "t" && part == 1 {
+		return 1
+	}
+	return l
 }
 
 fn leaders(topic str) []i64 {
@@ -178,6 +188,7 @@ type broker struct {
 	txPid      i64
 	authed     bool
 	scram      str // a SCRAM exchange in progress: client-first-bare,server-first
+	moved      bool // t/1's leader has moved from broker 2 to broker 1
 }
 
 fn (b mut broker) logIndex(topic str, part i64) i64 {
@@ -262,7 +273,7 @@ fn serve(id i64) ! {
 		}
 	}
 	ports = append(ports, cur)
-	mut b = broker{id: id, ports: ports, logs: []partLog{}, seqs: []i64{}, produces: 0, groupGen: 0, beats: 0, member: "", assignment: "", commits: []str{}, commitOffs: []i64{}, nextPid: 1000 + 100*id, txFirst: -1, txPid: -1, authed: false, scram: ""}
+	mut b = broker{id: id, ports: ports, logs: []partLog{}, seqs: []i64{}, produces: 0, groupGen: 0, beats: 0, member: "", assignment: "", commits: []str{}, commitOffs: []i64{}, nextPid: 1000 + 100*id, txFirst: -1, txPid: -1, authed: false, scram: "", moved: false}
 	// The client keeps two connections to a broker (one for requests a broker may hold), so a
 	// broker serves several: it polls each with a short timeout and takes new ones in between.
 	mut conns = []wire.Conn{}
@@ -270,6 +281,10 @@ fn serve(id i64) ! {
 	mut authed = []bool{}
 	mut scrams = []str{}
 	for {
+		let (_, note, noted) = relay.TryRecv()
+		if noted && note == "moved t/1" {
+			b.moved = true
+		}
 		let (nc, aerr) = ln.AcceptTimeout(1ms)
 		if aerr == nil {
 			mut c2 = nc
@@ -572,7 +587,8 @@ fn metadata(b mut broker, r mut rd, head []u8) str {
 		pstr(mut out, t)
 		p8(mut out, 0)
 		p32(mut out, len(ls))
-		for i, l in ls {
+		for i, l0 in ls {
+			let l = leaderOf(b, t, i, l0)
 			p16(mut out, 0)
 			p32(mut out, i)
 			p32(mut out, l)
@@ -606,9 +622,15 @@ fn produce(b mut broker, r mut rd, head []u8) (str, bool) {
 			let batch = r.bytes()
 			p32(mut out, part)
 			b.produces += 1
-			// Broker 2 refuses the first produce: its leadership "moved" (the metadata still
-			// names it, as a real cluster's does once the election settles).
-			if b.id == 2 && b.produces == 1 {
+			// A moved leader: broker 2 refuses t/1 and tells the others that broker 1 leads it
+			// now, so only a client that asks for metadata again finds the new leader (#448).
+			if b.id == 2 && topic == "t" && part == 1 {
+				if !b.moved {
+					b.moved = true
+					for _, k in []i64{1, 3, 4} {
+						relay.Send(k, "moved t/1")
+					}
+				}
 				p16(mut out, 6)
 				p64(mut out, -1)
 				p64(mut out, -1)
@@ -704,6 +726,16 @@ fn fetch(b mut broker, r mut rd, head []u8) str {
 			let li = b.logIndex(topic, part)
 			let l = b.logs[li]
 			p32(mut out, part)
+			if b.id == 2 && b.moved && topic == "t" && part == 1 {
+				// NOT_LEADER_OR_FOLLOWER, and no records.
+				p16(mut out, 6)
+				p64(mut out, -1)
+				p64(mut out, -1)
+				p64(mut out, -1)
+				p32(mut out, 0)
+				pbytes(mut out, "")
+				continue
+			}
 			if off < l.start || off > l.next {
 				p16(mut out, 1)
 			} else {
@@ -1025,7 +1057,8 @@ fn run(ports str) ! {
 	let (_, unknown) = c.Partitions("nope")
 	check("an unknown topic is ErrUnknownTopic", unknown != nil && fault.Is(unknown, kafka.ErrUnknownTopic))
 
-	// A moved leader: the first produce to t/1 fails NOT_LEADER, the client asks again.
+	// A moved leader: the first produce to t/1 fails NOT_LEADER_OR_FOLLOWER and broker 1 leads
+	// it from then on; the client must ask for metadata again to find it.
 	let a1 = try c.SendTo("t", 1, msg("one"))
 	check("a send retried after NOT_LEADER_OR_FOLLOWER lands at offset 0", a1.Offset == 0)
 	let r1 = try c.Fetch("t", 1, 0, 0)

@@ -347,36 +347,17 @@ fn (l Listener) Port() i64 {
 
 // Accept waits for the next connection.
 fn (l Listener) Accept() !Conn {
-	if !l.open {
-		fail "wire: accept on a closed listener"
-	}
-	for {
-		let fd = i64(i32(rt_sys_accept(l.fd, 0, 0)))
-		if fd >= 0 {
-			let one = calloc(1, 8)
-			one[0] = 1
-			rt_nosigpipe(fd)
-			rt_sys_setsockopt(fd, 6, 1, one, 4)
-			free(one)
-			nonblocking(fd)
-			return Conn{open: true, fd: fd, timeout: 0}
-		}
-		let e = errno()
-		if e == EAGAIN {
-			try wait_io(l.fd, 1, 0, "accept")
-			continue
-		}
-		if e != 4 {
-			fail os_fault("accept")
-		}
-	}
+	return try l.AcceptTimeout(0)
 }
 
 // AcceptTimeout waits at most timeout ns for the next connection (0: no limit), failing with a
-// fault that says "timed out" when none came.
+// fault that says "timed out" when none came. A negative timeout is refused.
 fn (l Listener) AcceptTimeout(timeout i64) !Conn {
 	if !l.open {
 		fail "wire: accept on a closed listener"
+	}
+	if timeout < 0 {
+		fail "wire: accept timeout {timeout} is negative (0 waits with no limit)"
 	}
 	let until = rt_mono_ns() + timeout
 	for {
