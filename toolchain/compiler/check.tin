@@ -161,6 +161,28 @@ fn declare_global(s Sym) {
 		return
 	}
 	let prev = lookup_global(s.name)
+	if cast(i64, prev) != 0 && sym_in_runtime(s) != sym_in_runtime(prev) && (sym_in_user_main(s) != 0 || sym_in_user_main(prev) != 0) {
+		// The runtime and a program's package main share the unqualified names (#519): the runtime
+		// keeps the name, which generated code and the libraries call, and the program's
+		// declaration becomes main.NAME, which lookups from the program's files try first.
+		mut user = s
+		if sym_in_runtime(s) != 0 {
+			user = prev
+			gtab[gtab_slot(s.name)] = cast(i64, s)
+			globals = append(globals, cast(Sym, s))
+		}
+		let qn = "main." + user.name
+		user.name = qn
+		if user.kind == SYM_FUNC && user.fn_ != 0 {
+			cast(Fn, user.fn_).qname = qn
+		}
+		main_shadows = main_shadows + 1
+		if cast(i64, user) == cast(i64, s) {
+			globals = append(globals, cast(Sym, s))
+		}
+		gtab_add(cast(i64, user))
+		return
+	}
 	if cast(i64, prev) != 0 {
 		let e = err_code(s.pos, "E101 REDECLARED")
 		buf_byte(e, '\'')
@@ -173,6 +195,20 @@ fn declare_global(s Sym) {
 	}
 	globals = append(globals, cast(Sym, s))
 	gtab_add(cast(i64, s))
+}
+
+shared mut main_shadows i64 // declarations of package main renamed main.NAME beside the runtime's NAME (#519)
+
+// sym_in_runtime reports a declaration in a runtime file (trusted, no package name).
+fn sym_in_runtime(s Sym) i64 {
+	let f = s.pos >> 48
+	return i64(f < len(file_pkgs) && len(file_pkgs[f]) == 0 && file_trusted[f] != 0)
+}
+
+// sym_in_user_main reports a declaration in a program's own package main.
+fn sym_in_user_main(s Sym) i64 {
+	let f = s.pos >> 48
+	return i64(f < len(file_pkgs) && len(file_pkgs[f]) == 0 && file_trusted[f] == 0)
 }
 
 fn set_file(f i64) {
@@ -2576,6 +2612,11 @@ fn lookup_name(name str) Sym {
 	}
 	if len(ck_pkg) != 0 {
 		let q = lookup_global(qual(ck_pkg, name))
+		if cast(i64, q) != 0 {
+			return q
+		}
+	} else if main_shadows != 0 && ck_trusted == 0 {
+		let q = lookup_global("main." + name)
 		if cast(i64, q) != 0 {
 			return q
 		}
