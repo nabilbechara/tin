@@ -1754,7 +1754,9 @@ fn report(u User, items []str, price f64, id i64, name str, n i64) ! {
   `"hits={m["hits"]}"` is an error).
 - A spec after the last top-level `:` uses printf flags, width, precision and verb:
   `{x:5}`, `{x:-8}`, `{x:05}`, `{x:x}`, `{x:q}`, `{x:.3e}`. Without a verb the value is
-  printed as `%v`, and a precision on a float means decimal places (`{pi:.2}` is `3.14`).
+  printed as `%v`, and a precision on a float means decimal places (`{pi:.2}` is `3.14`). A spec
+  that is not `[flags][width][.precision][verb]`, or a verb that cannot format the value's type
+  (`{name:d}` on a `str`), is a compile error (E282).
 - A lone `}` is an error (write `}}`), and so is an unclosed `{`.
 - Text with braces of its own, like an anvil route pattern, is a raw string:
   ``r.Get(`/users/{id}`, user)``. In `"/users/{id}"` the `{id}` would be a value; when no
@@ -1774,7 +1776,7 @@ import "redis"
 ```tin body
 let c = redis.Open(redis.Options{Addr: "127.0.0.1:6379"})
 let id = 42
-let body = "{\"name\":\"ana\"}"
+let body = `{"name":"ana"}`
 try c.Do("SET user:{id} {body}")     // SET, user:42 and body are three arguments
 ```
 

@@ -5984,6 +5984,7 @@ fn chk_interp(e i64, want i64) i64 {
 			let t = chk(cast(Node, a), 0)
 			buf_byte(f, '%')
 			if let spec = specs[i] {
+				interp_spec_check(cast(Node, a).pos, spec, t)
 				buf_str(f, spec)
 				let sl = len(spec)
 				mut last = 0
@@ -6015,12 +6016,188 @@ fn chk_interp(e i64, want i64) i64 {
 	let fs = cast(StrLit, node_new(EX_STR, pos))
 	fs.len = len(f)
 	fs.ptr = str(f)
+	interp_format = cast(i64, fs)
 	cast([]i64, args)[0] = cast(i64, fs)
 	let call = cast(Call, node_new(EX_CALL, pos))
 	call.args = cast([]i64, args)
 	replace_node(e, cast(i64, call))
 	cast(Node, e).type_ = 0
 	return secret_interp_result(e, cast([]Node, cast([]i64, args)), want)
+}
+
+shared mut interp_format i64 // the format chk_interp built: its specs were checked there (#529)
+
+// fmt_verbs are the verbs say's printf knows (LANGUAGE.md §16).
+const fmt_verbs = "vdbcoOqxXUeEfFgGstp"
+
+// fmt_verb_fits reports whether verb can format a value of type t, as go vet's printf check
+// decides for Go's types (#529): integers take d b c o O q x X U, floats b e E f F g G x X, strs
+// and faults s q x X, bools t, and %v anything. A slice, map or optional takes what its elements
+// take (and %p); structs, enums, functions and dyn values print through their own printers.
+fn fmt_verb_fits(verb i64, t Ty) i64 {
+	if verb == 'v' || cast(i64, t) == 0 {
+		return 1
+	}
+	let k = kind_of(t)
+	if k == K_INT || k == K_UINT || k == K_BYTE {
+		return i64(byte_index("dbcoOqxXU", verb) >= 0)
+	}
+	if k == K_FLOAT || k == K_UFLOAT {
+		return i64(byte_index("beEfFgGxX", verb) >= 0)
+	}
+	if k == K_STRING || k == K_ERROR {
+		return i64(byte_index("sqxX", verb) >= 0)
+	}
+	if k == K_BOOL || k == K_UBOOL {
+		return i64(verb == 't')
+	}
+	if k == K_SLICE || k == K_OPT {
+		return i64(verb == 'p' || fmt_verb_fits(verb, cast(Ty, t.elem)) != 0)
+	}
+	if k == K_MAP {
+		return i64(verb == 'p' || (fmt_verb_fits(verb, cast(Ty, t.key)) != 0 && fmt_verb_fits(verb, cast(Ty, t.elem)) != 0))
+	}
+	return 1
+}
+
+fn byte_index(s str, c i64) i64 {
+	mut i = 0
+	for i < len(s) {
+		if i64(s[i]) == c {
+			return i
+		}
+		i = i + 1
+	}
+	return -1
+}
+
+// interp_spec_check reports a {value:spec} whose spec is not [flags][width][.precision][verb]
+// with a verb that formats the value's type (#529).
+fn interp_spec_check(pos i64, spec str, t i64) {
+	let n = len(spec)
+	mut i = 0
+	for i < n && byte_index("-+0# ", i64(spec[i])) >= 0 {
+		i = i + 1
+	}
+	for i < n && spec[i] >= '0' && spec[i] <= '9' {
+		i = i + 1
+	}
+	if i < n && spec[i] == '.' {
+		i = i + 1
+		for i < n && spec[i] >= '0' && spec[i] <= '9' {
+			i = i + 1
+		}
+	}
+	mut verb = 0
+	if i < n {
+		verb = i64(spec[i])
+		i = i + 1
+	}
+	if i < n || (verb != 0 && byte_index(fmt_verbs, verb) < 0) {
+		let m = err_code(pos, "E282 FORMAT")
+		buf_str(m, "bad format spec {{...:")
+		buf_str(m, spec)
+		buf_str(m, "}}: a spec is [flags][width][.precision][verb], flags from - + 0 # and space, a verb from ")
+		buf_str(m, fmt_verbs)
+		err_end(cast([]u8, m))
+		return
+	}
+	if verb != 0 && fmt_verb_fits(verb, cast(Ty, default_type(t))) == 0 {
+		let m = err_code(pos, "E282 FORMAT")
+		buf_str(m, "{{...:")
+		buf_str(m, spec)
+		buf_str(m, "}}: verb %")
+		buf_byte(m, verb)
+		buf_str(m, " cannot format a value of type ")
+		type_name(cast([]u8, m), cast(Ty, default_type(t)))
+		buf_str(m, " (%v formats any value)")
+		err_end(cast([]u8, m))
+	}
+}
+
+fn fmt_verb_mismatch(pos i64, verb i64, t i64) {
+	let m = err_code(pos, "E282 FORMAT")
+	buf_str(m, "verb %")
+	buf_byte(m, verb)
+	buf_str(m, " cannot format a value of type ")
+	type_name(cast([]u8, m), cast(Ty, default_type(t)))
+	buf_str(m, " (%v formats any value)")
+	err_end(cast([]u8, m))
+}
+
+// fmt_check_format checks a printf format written as a literal against the values after it, as
+// go vet does (#529): each verb is known and formats its value's type, and every verb has a
+// value and every value a verb. types[i] is the type of value i; poss[i] its position.
+fn fmt_check_format(fpos i64, format str, types []i64, poss []i64) {
+	let n = len(format)
+	mut i = 0
+	mut arg = 0
+	for i < n {
+		if format[i] != '%' {
+			i = i + 1
+			continue
+		}
+		if i + 1 < n && format[i + 1] == '%' {
+			i = i + 2
+			continue
+		}
+		i = i + 1
+		for i < n && byte_index("-+0# ", i64(format[i])) >= 0 {
+			i = i + 1
+		}
+		for i < n && format[i] >= '0' && format[i] <= '9' {
+			i = i + 1
+		}
+		if i < n && format[i] == '.' {
+			i = i + 1
+			for i < n && format[i] >= '0' && format[i] <= '9' {
+				i = i + 1
+			}
+		}
+		if i >= n {
+			err_code_at(fpos, "E282 FORMAT", "the format ends in the middle of a verb: write %% for a percent sign")
+			return
+		}
+		let verb = i64(format[i])
+		i = i + 1
+		if !((verb >= 'a' && verb <= 'z') || (verb >= 'A' && verb <= 'Z')) {
+			err_code_at(fpos, "E282 FORMAT", "a % in the format starts a verb (like %d or %v): write %% for a percent sign")
+			return
+		}
+		if byte_index(fmt_verbs, verb) < 0 {
+			let m = err_code(fpos, "E282 FORMAT")
+			buf_str(m, "unknown verb %")
+			buf_byte(m, verb)
+			buf_str(m, " in the format: the verbs are ")
+			buf_str(m, fmt_verbs)
+			buf_str(m, ", and %% is a percent sign")
+			err_end(cast([]u8, m))
+			return
+		}
+		if arg >= len(types) {
+			let m = err_code(fpos, "E282 FORMAT")
+			buf_str(m, "verb %")
+			buf_byte(m, verb)
+			buf_str(m, " has no value: the format has more verbs than the ")
+			buf_int(m, len(types))
+			buf_str(m, " values after it")
+			err_end(cast([]u8, m))
+			return
+		}
+		if fmt_verb_fits(verb, cast(Ty, default_type(types[arg]))) == 0 {
+			fmt_verb_mismatch(poss[arg], verb, types[arg])
+		}
+		arg = arg + 1
+	}
+	if arg < len(types) {
+		let m = err_code(poss[arg], "E282 FORMAT")
+		buf_str(m, "this value has no verb in the format: ")
+		buf_int(m, len(types))
+		buf_str(m, " values for ")
+		buf_int(m, arg)
+		buf_str(m, " verbs")
+		err_end(cast([]u8, m))
+	}
 }
 
 fn lower_say(e i64, m str, want i64) i64 {
@@ -6056,10 +6233,22 @@ fn lower_say(e i64, m str, want i64) i64 {
 	} else {
 		stmts = append(stmts, expr_stmt(cast(Node, rt_call(pos, "rt_fmt_begin_v", args1(mk_int(pos, ln, ty_int)), ty_void))))
 	}
+	mut types = []i64{}
+	mut poss = []i64{}
 	mut i = first
 	for i < len(args) {
 		stmts = append(stmts, expr_stmt(say_arg(cast(Node, args[i]), "rt_fmt_")))
+		types = append(types, cast(Node, args[i]).type_)
+		poss = append(poss, cast(Node, args[i]).pos)
 		i = i + 1
+	}
+	// A format written as a literal is checked against its values (#529); interpolation's own
+	// format was checked spec by spec.
+	if printf != 0 {
+		let fl = cast(Node, args[first - 1])
+		if fl.kind == EX_STR && cast(i64, fl) != interp_format {
+			fmt_check_format(fl.pos, cast(StrLit, fl).ptr, cast([]i64, types), cast([]i64, poss))
+		}
 	}
 	mut tail = 0
 	mut t = ty_void

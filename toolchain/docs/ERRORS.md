@@ -1925,7 +1925,13 @@ enums of those).
 
 ### E282 FORMAT
 
-`say.Out`, `say.Fmt` and the other printf-style calls take a format string first.
+`say.Out`, `say.Fmt` and the other printf-style calls take a format string first. A format
+written as a literal is checked against the values after it, as `go vet` does: each verb is
+one of `vdbcoOqxXUeEfFgGstp` (`%%` is a percent sign), formats its value's type (`%d` an
+integer, `%s` a `str` or fault, `%f` a float, `%t` a bool, `%v` anything), and every verb has a
+value and every value a verb. The spec of an interpolated value (`"{x:5.2f}"`) is checked the
+same way: `[flags][width][.precision][verb]`. A format that is not a literal is checked when it
+runs, which prints Go's `%!d(MISSING)` and `%!(EXTRA ...)` markers.
 
 ```tin edition=1
 package main
@@ -1942,7 +1948,8 @@ fn main() {
 example.tin:7:10: error E282 FORMAT: format must be a str
 ```
 
-Fix: pass the format first (`say.Out("%d\n", n)`), or use `say.Line(n)`.
+Fix: pass the format first (`say.Out("%d\n", n)`), or use `say.Line(n)`; give each verb a
+value of its type, or use `%v`.
 
 ### E290 MATCH_PATTERN
 
