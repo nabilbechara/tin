@@ -84,6 +84,7 @@ const X_MULU = 82 // a=rs: unsigned rdx:rax = rax * rs, CF and OF set when rdx i
 const X_ADC = 83 // a=rd b=rs: rd += rs + CF (an add's carry, #488)
 const X_ADCI = 84 // a=rd b=imm32: rd += imm + CF
 const X_ROLI = 85 // a=rd b=imm8: rotate left (#488)
+const X_ALIGN = 86 // a=boundary (a power of two) b=fill (0 int3, 1 nops): pads pc up to the boundary
 
 const XK_SIGNED = 4
 
@@ -174,12 +175,20 @@ shared mut x64_relocs []i64
 shared mut x64_base i64 // address of byte 0 of the buffer being encoded into
 shared mut x64_scratch []i64 // buffer used to measure instructions
 shared mut x64_passes i64 // relaxation passes the last x64_layout took
+shared mut x64_label_pads []i64 // per label: the most padding the X_ALIGN directives before it can hold
 
 fn x64_label_addr(l i64) i64 {
 	if cast(i64, x64_labels) == 0 || l >= len(x64_labels) {
 		return 0
 	}
 	return cast([]i64, x64_labels)[l]
+}
+
+fn x64_label_pad(l i64) i64 {
+	if cast(i64, x64_label_pads) == 0 || l >= len(x64_label_pads) {
+		return 0
+	}
+	return cast([]i64, x64_label_pads)[l]
 }
 
 fn x64_sym_addr(s i64) i64 {
@@ -553,6 +562,12 @@ fn x64_print(b []u8, ins i64, pc i64) {
 	} else if op == X_RAWB {
 		buf_str(cast([]u8, b), ".byte ")
 		x64_pr_hex(cast([]u8, b), x)
+	} else if op == X_ALIGN {
+		buf_str(cast([]u8, b), ".align ")
+		buf_int(cast([]u8, b), x)
+		if y == 0 {
+			buf_str(cast([]u8, b), ", 0xcc")
+		}
 	} else if op == X_MOVD_RX {
 		buf_str(cast([]u8, b), "movd ")
 		x64_pr_reg(cast([]u8, b), x, 2)
@@ -995,10 +1010,42 @@ fn x64_encode(ins i64, pc i64, out []u8) i64 {
 		x64_rr(cast([]u8, out), 0x66, 0, 0x0F7E, y, x, 0)
 	} else if op == X_RAWB {
 		buf_byte(cast([]u8, out), x)
+	} else if op == X_ALIGN {
+		let n = (0 - pc) & (x - 1)
+		if y == 0 {
+			mut i = 0
+			for i < n {
+				buf_byte(cast([]u8, out), 0xCC)
+				i = i + 1
+			}
+		} else {
+			x64_nops(out, n)
+		}
 	} else {
 		x64_fail("cannot encode instruction")
 	}
 	return len(out) - start
+}
+
+// x64_nops appends n bytes of the recommended multi-byte NOPs (nop DWORD PTR [rax+rax*1+0] and kin),
+// at most 9 bytes each, so a padding of up to 15 bytes takes two instructions.
+fn x64_nops(out []u8, n_in i64) {
+	let forms = "\x90\x66\x90\x0F\x1F\x00\x0F\x1F\x40\x00\x0F\x1F\x44\x00\x00\x66\x0F\x1F\x44\x00\x00\x0F\x1F\x80\x00\x00\x00\x00\x0F\x1F\x84\x00\x00\x00\x00\x00\x66\x0F\x1F\x84\x00\x00\x00\x00\x00"
+	mut n = n_in
+	for n > 0 {
+		mut k = n
+		if k > 9 {
+			k = 9
+		}
+		// The form of length k starts after the forms of lengths 1 to k-1.
+		let at = k * (k - 1) / 2
+		mut i = 0
+		for i < k {
+			buf_byte(cast([]u8, out), i64(forms[at + i]))
+			i = i + 1
+		}
+		n = n - k
+	}
 }
 
 fn x64_shift_digit(i i64) i64 {
@@ -1044,12 +1091,17 @@ fn x64_enc_alu_imm(out []u8, i i64, rd i64, imm i64) {
 // x64_place assigns every label its address with the current branch forms and returns the code size.
 fn x64_place(code []i64, base i64) i64 {
 	mut pc = base
+	mut pads = 0
 	mut i = 0
 	for i < len(code) {
 		let ins = slice_data(code) + 8 * i
 		if ins[0] == X_LABEL {
 			x64_labels[ins[1]] = pc
+			x64_label_pads[ins[1]] = pads
 		} else {
+			if ins[0] == X_ALIGN {
+				pads = pads + ins[1] - 1
+			}
 			pc = pc + x64_size(ins, pc)
 		}
 		i = i + 5
@@ -1060,27 +1112,37 @@ fn x64_place(code []i64, base i64) i64 {
 // x64_relax shrinks every rel32 branch whose target is within rel8 range and returns whether any
 // changed; distances all come from the placement before this pass (sizes are measured before a
 // branch is flipped), and since shrinking only moves targets closer a branch that fits keeps fitting.
+// Shrinking can grow an X_ALIGN padding, though, so a branch across X_ALIGN directives must fit with
+// each of them at its largest padding.
 fn x64_relax(code []i64, base i64) i64 {
 	mut changed = 0
 	mut pc = base
+	mut pads = 0
 	mut i = 0
 	for i < len(code) {
 		let ins = slice_data(code) + 8 * i
 		let op = ins[0]
 		let len_ = x64_size(ins, pc)
+		if op == X_ALIGN {
+			pads = pads + ins[1] - 1
+		}
 		if (op == X_JMP || op == X_JCC) && ins[4] == 0 {
 			mut target = 0
 			mut long = 5
+			mut label = ins[1]
 			if op == X_JMP {
 				target = x64_label_addr(ins[1])
 			} else {
+				label = ins[2]
 				target = x64_label_addr(ins[2])
 				long = 6
 			}
 			// A forward target moves back with the branch, so measure it from the long form's end.
 			mut d = target - (pc + 2)
 			if target > pc {
-				d = target - (pc + long)
+				d = target - (pc + long) + (x64_label_pad(label) - pads)
+			} else {
+				d = d - (pads - x64_label_pad(label))
 			}
 			if x64_fits8(d) != 0 {
 				ins[4] = 1
@@ -1106,6 +1168,7 @@ fn x64_layout(code []i64, base i64) i64 {
 		i = i + 5
 	}
 	x64_labels = slice_filled(n, 0)
+	x64_label_pads = slice_filled(n, 0)
 	x64_passes = 0
 	mut size = x64_place(code, base)
 	for x64_relax(code, base) != 0 {

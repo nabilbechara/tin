@@ -2482,6 +2482,9 @@ fn x_gen_while(s WhileStmt) {
 	if forever == 0 {
 		emit1(X_JMP, cond_l)
 	}
+	// The loop head, the back edge's target, starts on a 16-byte boundary (nops: a forever loop
+	// falls into it).
+	emit2(X_ALIGN, 16, 1)
 	x_label(body_l)
 	x_gen_poll()
 	g_loops = append(g_loops, cont_l)
@@ -3535,7 +3538,8 @@ fn x_finish_fn(f Fn, nslots i64) {
 		if op == X_LABEL {
 			dead = 0
 		}
-		if dead != 0 || (op == X_JMP && x_branch_to_next(i, n) != 0) {
+		// An X_ALIGN belongs to the label after it, so it survives the dead code before that label.
+		if (dead != 0 && op != X_ALIGN) || (op == X_JMP && x_branch_to_next(i, n) != 0) {
 			i = i + 1
 			continue
 		}
@@ -3590,6 +3594,9 @@ fn generate_x64() {
 	for i < len(prog_fns) {
 		let f = prog_fns[i]
 		if f.extern_ == 0 && f.reach != 0 {
+			// Every function starts on a 16-byte boundary (int3 between functions), so code added
+			// before it shifts it by whole fetch blocks and its loops keep their alignment.
+			x_out4(X_ALIGN, 16, 0, 0, 0)
 			x_gen_fn(f)
 		}
 		i = i + 1
