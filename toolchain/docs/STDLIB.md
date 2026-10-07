@@ -504,7 +504,7 @@ Package glyph is UTF-8 (like Go's unicode/utf8) and Unicode: general categories,
 
 ## mint
 
-Package mint converts numbers and quoted strings to and from text (like Go's strconv), with Go's error texts.
+Package mint converts numbers and quoted strings to and from text (like Go's strconv), with Go's error texts under mint's own names: mint.Atoi: parsing "x": invalid syntax. A parse fault's cause is the sentinel ErrSyntax or ErrRange (fault.Is(err, mint.ErrRange)); like every fault it comes with 0.
 
 - `const MaxI64 = 9223372036854775807`: MaxI64 is the largest i64.
 - `const MinI64 = -9223372036854775807 - 1`: MinI64 is the smallest i64.
@@ -512,11 +512,11 @@ Package mint converts numbers and quoted strings to and from text (like Go's str
 - `FormatInt(v i64, base i64) str`: FormatInt returns v in base 2..36 with lower-case digits (panics on any other base).
 - `FormatUint(v u64, base i64) str`: FormatUint returns v in base 2..36 with lower-case digits (panics on any other base).
 - `AppendInt(b mut []u8, v i64) []u8`: AppendInt appends v in decimal to b and returns b (use it as b = AppendInt(b, v)).
-- `Atoi(s str) !i64`: Atoi parses a decimal i64 like Go's Atoi; out of range is a fault (with 0, where Go returns the clamped value).
+- `Atoi(s str) !i64`: Atoi parses a decimal i64 like Go's Atoi; out of range is a fault caused by ErrRange (with 0, where Go returns the clamped value).
 - `ParseInt(s str, base i64) !i64`: ParseInt parses a signed integer in base 2..36, or base 0 for 0x/0o/0b prefixes and underscores.
 - `ParseUint(s str, base i64) !u64`: ParseUint parses an unsigned integer in base 2..36, or base 0 for 0x/0o/0b prefixes and underscores.
 - `ParseBool(s str) !bool`: ParseBool parses 1 t T TRUE true True and 0 f F FALSE false False.
-- `ParseFloat(s str) !f64`: ParseFloat parses a Go float literal (decimal or 0x hex with p exponent, underscores, inf/infinity/nan) with exact nearest-even rounding.
+- `ParseFloat(s str) !f64`: ParseFloat parses a Go float literal (decimal or 0x hex with p exponent, underscores, inf/infinity/nan) with exact nearest-even rounding; a finite literal beyond the largest f64 is a fault caused by ErrRange (with 0, where Go returns ±Inf).
 - `F64frombits(b u64) f64`: F64frombits returns the f64 with bit pattern b.
 - `FormatFloat(f f64, fmt u8, prec i64) str`: FormatFloat formats f as 'f' (ddd.ddd), 'e' (d.ddde±dd) or 'g' (shortest of the two); prec -1 is the shortest text that reads back exactly.
 - `Quote(s str) str`: Quote returns s as a Go double-quoted literal with \n-style, \x, \u and \U escapes.

@@ -1,8 +1,20 @@
-// Package mint converts numbers and quoted strings to and from text (like Go's strconv), with Go's error texts.
+// Package mint converts numbers and quoted strings to and from text (like Go's strconv), with Go's
+// error texts under mint's own names: mint.Atoi: parsing "x": invalid syntax. A parse fault's cause
+// is the sentinel ErrSyntax or ErrRange (fault.Is(err, mint.ErrRange)); like every fault it comes with 0.
 package mint
 
+import "fault"
 import "say"
 import "glyph"
+
+// ErrSyntax is the cause of a parse fault for text that is not a number of the kind asked for:
+// fault.Is(err, mint.ErrSyntax).
+let ErrSyntax = fault("invalid syntax")
+
+// ErrRange is the cause of a parse fault for a number that does not fit its type:
+// fault.Is(err, mint.ErrRange). As every fault, it comes with 0 where Go returns the clamped value
+// or ±Inf: a caller that wants those tests for ErrRange and picks the limit by the text's sign.
+let ErrRange = fault("value out of range")
 
 const digits = "0123456789abcdefghijklmnopqrstuvwxyz"
 const smalls = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899"
@@ -128,19 +140,19 @@ fn writeUint(end i64, u u64, base i64) {
 	}
 }
 
-// numErr builds Go's text: strconv.FN: parsing "s": what.
+// numErr builds Go's text under mint's name: mint.FN: parsing "s": what.
 fn numErr(fname str, s str, what str) ! {
-	fail say.Fault("strconv.%s: parsing %s: %s", fname, Quote(s), what)
+	fail say.Fault("mint.%s: parsing %s: %s", fname, Quote(s), what)
 }
 
-// syntaxErr is the invalid-syntax fault of fn for input s.
+// syntaxErr is the invalid-syntax fault of fn for input s, caused by ErrSyntax.
 fn syntaxErr(fname str, s str) ! {
-	fail numErr(fname, s, "invalid syntax")
+	fail fault.Wrap(ErrSyntax, say.Fmt("mint.%s: parsing %s", fname, Quote(s)))
 }
 
-// rangeErr is the out-of-range fault of fn for input s.
+// rangeErr is the out-of-range fault of fn for input s, caused by ErrRange.
 fn rangeErr(fname str, s str) ! {
-	fail numErr(fname, s, "value out of range")
+	fail fault.Wrap(ErrRange, say.Fmt("mint.%s: parsing %s", fname, Quote(s)))
 }
 
 // lower folds an ASCII letter to lower case.
@@ -148,7 +160,7 @@ fn lower(c u8) u8 {
 	return c | 0x20
 }
 
-// Atoi parses a decimal i64 like Go's Atoi; out of range is a fault (with 0, where Go returns the clamped value).
+// Atoi parses a decimal i64 like Go's Atoi; out of range is a fault caused by ErrRange (with 0, where Go returns the clamped value).
 fn Atoi(s str) !i64 {
 	return try parseInt("Atoi", s, 10)
 }
@@ -335,7 +347,8 @@ fn prefixFold(s str, word str) i64 {
 	return n
 }
 
-// ParseFloat parses a Go float literal (decimal or 0x hex with p exponent, underscores, inf/infinity/nan) with exact nearest-even rounding.
+// ParseFloat parses a Go float literal (decimal or 0x hex with p exponent, underscores, inf/infinity/nan) with exact nearest-even rounding;
+// a finite literal beyond the largest f64 is a fault caused by ErrRange (with 0, where Go returns ±Inf).
 fn ParseFloat(s str) !f64 {
 	let n = len(s)
 	if n == 0 {

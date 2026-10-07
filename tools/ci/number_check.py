@@ -45,9 +45,11 @@ def main():
                        timeout=60)
         subprocess.run(['go', 'run', './bench/ref/number', str(work)], check=True,
                        cwd=ROOT, timeout=60)
+        # mint's faults read like strconv's under mint's own name (#521).
+        expected_go = [line.replace(b'ERR strconv.', b'ERR mint.', 1)
+                       for line in (work / 'expected.txt').read_bytes().splitlines(keepends=True)]
         compare(exe, (work / 'input.txt').read_bytes().splitlines(keepends=True),
-                (work / 'expected.txt').read_bytes().splitlines(keepends=True),
-                directory, 'Go-strconv-fmt')
+                expected_go, directory, 'Go-strconv-fmt')
         rows = gzip.decompress((ROOT / 'tools/ci/data/parse-number-f64.txt.gz').read_bytes())
         inputs, expected = [], []
         for row in rows.splitlines():
