@@ -1230,9 +1230,12 @@ if a != nil && b != nil {       // both narrowed inside
 ```
 
 - Narrowing works on local variables in `if x != nil {...}`, `if x == nil {...} else
-  {...}`, `if x == nil { return }` (narrowed after), `&&` / `||` combinations of these,
-  and the arms after a `nil` arm of a `match`. Assigning `nil` to a narrowed variable is a
-  type error. Store a field in a local first to narrow it (`let l = n.left`).
+  {...}`, `if x == nil { return }` (narrowed after), `for x != nil {...}` (in the body: each
+  pass starts with the check), `&&` / `||` combinations of these, and the arms after a `nil`
+  arm of a `match`. Assigning `nil` or another `?T` to a narrowed variable ends its narrowing
+  from there on (in the branch that assigns, and after the `if` when either branch did), so a
+  linked-list walk reads `for cur != nil { total += cur.val; cur = cur.next }`. Store a field
+  in a local first to narrow it (`let l = n.left`).
 - `if let v = opt { ... }` binds `v` (a `T`) when `opt` is not nil.
 - Using a `?T` without narrowing is a compile error. Map reads of missing keys return the
   zero value, not an optional; use `let (v, ok) = m[k]` to tell.

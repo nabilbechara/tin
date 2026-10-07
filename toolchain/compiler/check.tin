@@ -3016,12 +3016,17 @@ fn check_stmt(s i64) {
 			return
 		}
 		check_cond(cast(Node, cast(IfStmt, s).cond))
+		// An assignment that ends a narrowing in one branch does not end it in the other; after
+		// the if, it has ended if it ended in either (#522).
+		let snap = narrow_snapshot()
 		let narrowed = narrow_begin(cast(IfStmt, s).cond, 1)
 		let saved = slice_len_of(safe_pairs)
 		add_len_fact(cast(IfStmt, s).cond, cast(IfStmt, s).then)
 		check_scoped(cast(Block, cast(IfStmt, s).then))
 		slice_truncate(safe_pairs, saved)
 		narrow_end(narrowed)
+		let killed = narrow_killed(snap)
+		narrow_restore(snap)
 		let els = cast(Node, cast(IfStmt, s).else_)
 		if cast(i64, els) != 0 {
 			let narrowed2 = narrow_begin(cast(IfStmt, s).cond, 0)
@@ -3032,6 +3037,7 @@ fn check_stmt(s i64) {
 			}
 			narrow_end(narrowed2)
 		}
+		narrow_kill_syms(killed)
 	} else if k == ST_WHILE {
 		if cast(WhileStmt, s).init != 0 {
 			lower_for_init(s)
@@ -3041,7 +3047,11 @@ fn check_stmt(s i64) {
 		ck_loops = ck_loops + 1
 		ck_breaks = ck_breaks + 1
 		ck_labels = append(ck_labels, cast(WhileStmt, s).label)
+		// for x != nil { ... }: each pass starts with the condition true, so x is narrowed in
+		// the body until the body assigns it (#522).
+		let wnarrow = narrow_begin(cast(WhileStmt, s).cond, 1)
 		check_scoped(cast(Block, cast(WhileStmt, s).body))
+		narrow_end(wnarrow)
 		if cast(WhileStmt, s).post != 0 {
 			push_scope()
 			check_stmt(cast(WhileStmt, s).post)
@@ -5112,6 +5122,22 @@ fn check_assign(s i64) {
 			cast(AssignStmt, s).target = t2
 			target = t2
 			unbox_target = 1
+		}
+	}
+	// Assigning a ?T (or nil) to a variable narrowed to T ends the narrowing from here on:
+	// `cur = cur.next` in `for cur != nil` (#522). The value is checked after the target got a
+	// node of its own (x op= v shares it), and a ?number value replaces the box as it is.
+	if cast(Node, target).kind == EX_IDENT {
+		let ns = lookup_name(cast(IdentExpr, target).name)
+		let orig = narrow_orig(ns)
+		if orig != 0 {
+			let vt0 = chk(v, orig)
+			let vk = kind_of(cast(Ty, vt0))
+			if vk == K_OPT || vk == K_NIL {
+				ns.type_ = orig
+				ns.unbox = 0
+				unbox_target = 0
+			}
 		}
 	}
 	shared_let_write(cast(Node, s).pos, target)
@@ -8088,10 +8114,99 @@ fn narrow_begin(c i64, sense i64) Pair {
 		}
 		s.type_ = opt_scalar(cast(Ty, s.type_))
 		s.unbox = 1
+		narrow_track(rec)
 		return rec
 	}
 	s.type_ = cast(Ty, s.type_).elem
+	narrow_track(rec)
 	return rec
+}
+
+fn narrow_track(rec Pair) {
+	if cast(i64, narrow_live) == 0 {
+		narrow_live = []i64{}
+	}
+	narrow_live = append(narrow_live, cast(i64, rec))
+}
+
+shared mut narrow_live []i64 // narrowings in force: Pair(sym, its optional type), innermost last
+
+// narrow_orig is the optional type local s had before a narrowing still in force made it T, or 0.
+fn narrow_orig(s Sym) i64 {
+	if cast(i64, s) == 0 || s.kind != SYM_LOCAL || cast(i64, narrow_live) == 0 {
+		return 0
+	}
+	mut i = len(narrow_live) - 1
+	for i >= 0 {
+		let r = cast(Pair, narrow_live[i])
+		if r.a == cast(i64, s) {
+			if kind_of(cast(Ty, s.type_)) == K_OPT {
+				return 0
+			}
+			return r.b
+		}
+		i = i - 1
+	}
+	return 0
+}
+
+// narrow_snapshot records the type of every narrowed variable: [sym, type, unbox]...
+fn narrow_snapshot() []i64 {
+	mut out = []i64{}
+	if cast(i64, narrow_live) == 0 {
+		return out
+	}
+	mut i = 0
+	for i < len(narrow_live) {
+		let s = cast(Sym, cast(Pair, narrow_live[i]).a)
+		out = append(out, cast(i64, s))
+		out = append(out, s.type_)
+		out = append(out, s.unbox)
+		i = i + 1
+	}
+	return out
+}
+
+// narrow_killed lists the variables of snap that an assignment made optional again since.
+fn narrow_killed(snap []i64) []i64 {
+	mut out = []i64{}
+	mut i = 0
+	for i < len(snap) {
+		let s = cast(Sym, snap[i])
+		if kind_of(cast(Ty, s.type_)) == K_OPT && kind_of(cast(Ty, snap[i + 1])) != K_OPT {
+			out = append(out, cast(i64, s))
+		}
+		i = i + 3
+	}
+	return out
+}
+
+fn narrow_restore(snap []i64) {
+	mut i = 0
+	for i < len(snap) {
+		cast(Sym, snap[i]).type_ = snap[i + 1]
+		cast(Sym, snap[i]).unbox = snap[i + 2]
+		i = i + 3
+	}
+}
+
+// narrow_kill_syms ends the narrowing of each variable in syms: it is optional again.
+fn narrow_kill_syms(syms []i64) {
+	mut i = 0
+	for i < len(syms) {
+		let s = cast(Sym, syms[i])
+		mut j = len(narrow_live) - 1
+		for j >= 0 {
+			let r = cast(Pair, narrow_live[j])
+			if r.a == cast(i64, s) {
+				s.type_ = r.b
+				s.unbox = 0
+				break
+			}
+			j = j - 1
+		}
+		i = i + 1
+	}
 }
 
 fn narrow_end(rec Pair) {
@@ -8101,6 +8216,22 @@ fn narrow_end(rec Pair) {
 	} else if cast(i64, rec) != 0 {
 		cast(Sym, rec.a).type_ = rec.b
 		cast(Sym, rec.a).unbox = 0
+		if cast(i64, narrow_live) == 0 {
+			return
+		}
+		mut i = len(narrow_live) - 1
+		for i >= 0 {
+			if narrow_live[i] == cast(i64, rec) {
+				mut j = i
+				for j + 1 < len(narrow_live) {
+					narrow_live[j] = narrow_live[j + 1]
+					j = j + 1
+				}
+				slice_truncate(narrow_live, len(narrow_live) - 1)
+				break
+			}
+			i = i - 1
+		}
 	}
 }
 
