@@ -2674,6 +2674,11 @@ example.tin:7:11: error E501 NOT_GENERIC: 'Point' is not a generic type
 Fix: remove the type arguments (`p Point`), or give the declaration type parameters
 (`type Point[T constraints.Any] struct { x T }`).
 
+A call reports it too: `plain[i64](1)` or `cairn.NewLRU[str, i64](2)` on a function without
+type parameters, or `c.get[i64]()` on a method, says `'plain' is not a generic function`, and
+the call is then checked without the type arguments. `fs[k](x)`, with `fs` a slice or map of
+functions and `k` a value, is an index and then a call.
+
 ### E502 TYPE_ARG_COUNT
 
 A generic type, function or shape gets one type argument per type parameter. A generic
@@ -2782,7 +2787,9 @@ Fix: put a type in the brackets (`Zero[i64]()`), and pass values in the parenthe
 ### E506 RECEIVER_TYPE_PARAMS
 
 A method of a generic type names the type's parameters in its receiver, one plain name each:
-`fn (s mut Stack[T]) Push(x T)`. A method cannot be specialized for one type argument.
+`fn (s mut Stack[T]) Push(x T)`. A method cannot be specialized for one type argument, and it
+cannot declare type parameters of its own: `fn (c C) conv[T](x T) T` is reported as
+`a method cannot declare type parameters`; write a generic function `fn conv[T](c C, x T) T`.
 
 ```tin edition=1
 package main

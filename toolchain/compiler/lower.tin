@@ -1451,6 +1451,10 @@ fn mk_elem(pos i64, seq i64, index i64, t i64, isstr i64) ElemExpr {
 fn chk_index(e i64) i64 {
 	let pos = cast(Node, e).pos
 	let x = cast(IndexExpr, e).x
+	if cast(IndexExpr, e).i == 0 && index_from_targs(e) == 0 {
+		err_code_at(pos, "E501 NOT_GENERIC", "type arguments go only to a generic function or type")
+		return ty_int
+	}
 	let xt = cast(Ty, chk(cast(Node, x), 0))
 	let k = kind_of(xt)
 	if (k == K_INT && ck_trusted != 0) {
@@ -3214,6 +3218,24 @@ fn direct_call(e Call, f Fn) i64 {
 	return result_type(f)
 }
 
+// method_with_targs returns "x.m" for a callee x.m[T] where x is a variable whose struct type
+// has a method m: methods have no type parameters of their own (#554).
+fn method_with_targs(callee i64) str {
+	let x = cast(IndexExpr, callee).x
+	if cast(Node, x).kind != EX_SELECT || cast(Node, cast(SelectExpr, x).x).kind != EX_IDENT {
+		return ""
+	}
+	let s = lookup_name(cast(IdentExpr, cast(SelectExpr, x).x).name)
+	if cast(i64, s) == 0 || (s.kind != SYM_LOCAL && s.kind != SYM_GLOBAL) || s.type_ == 0 {
+		return ""
+	}
+	let t = cast(Ty, s.type_)
+	if kind_of(t) != K_STRUCT || cast(i64, find_fn(t.name + "." + cast(SelectExpr, x).name)) == 0 {
+		return ""
+	}
+	return cast(IdentExpr, cast(SelectExpr, x).x).name + "." + cast(SelectExpr, x).name
+}
+
 fn chk_call(e i64, want i64) i64 {
 	sb_call(cast(Call, e))
 	let name = cast(Call, e).name
@@ -3275,6 +3297,34 @@ fn chk_call(e i64, want i64) i64 {
 		let inst = instantiate_fn(cast(Fn, gx), cast([]Ty, resolve_types(cast([]i64, index_targs(callee)))), cast(Node, e).pos)
 		cast(Call, e).name = inst.qname
 		return direct_call(cast(Call, e), inst)
+	}
+	if cast(Node, callee).kind == EX_INDEX && cast(IndexExpr, callee).i == 0 {
+		// Type arguments on a function or method that has none (#554): say so, then check the
+		// call without them.
+		mut ng = not_generic_func(callee)
+		if len(ng) == 0 {
+			ng = method_with_targs(callee)
+		}
+		if len(ng) != 0 {
+			err_code_quoted(cast(Node, callee).pos, "E501 NOT_GENERIC", "", ng, " is not a generic function")
+			let x = cast(IndexExpr, callee).x
+			if cast(Node, x).kind == EX_IDENT {
+				cast(Call, e).name = cast(IdentExpr, x).name
+				cast(Call, e).callee = 0
+			} else {
+				cast(Call, e).callee = x
+			}
+			return chk_call(e, want)
+		}
+		if index_from_targs(callee) == 0 {
+			err_code_at(cast(Node, callee).pos, "E501 NOT_GENERIC", "type arguments go only to a generic function or type")
+			mut ai = 0
+			for ai < len(cast(Call, e).args) {
+				chk(cast(Node, cast(Call, e).args[ai]), 0)
+				ai = ai + 1
+			}
+			return ty_int
+		}
 	}
 	if cast(Node, callee).kind == EX_SELECT {
 		let x = cast(SelectExpr, callee).x

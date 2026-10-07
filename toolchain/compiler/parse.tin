@@ -1232,6 +1232,10 @@ fn parse_fn(is_extern i64) i64 {
 		p_expect(")")
 	}
 	f.name = p_expect_ident().text
+	if p_is("[") != 0 && f.recv != 0 {
+		// Only a function declares type parameters; a method has its type's (#554).
+		p_fail_code(p_peek().pos, "E506 RECEIVER_TYPE_PARAMS", "a method cannot declare type parameters: make it a generic function that takes the receiver as a parameter")
+	}
 	if p_is("[") != 0 {
 		f.tparams = cast([]str, cast(i64, []i64{}))
 		f.tcons = cast([]i64, cast(i64, []i64{}))
@@ -2563,10 +2567,31 @@ fn bracket_followed_by_call() i64 {
 			if depth == 0 {
 				return i64(i + 1 < len(p_toks) && tok_is(p_toks[i + 1], "(") != 0)
 			}
+		} else if depth == 1 && index_only_token(i) != 0 {
+			// An operator, a literal or a call between the brackets makes them an index:
+			// fs[k-1](x), byName[key(x)](y) (#554).
+			return 0
 		}
 		i = i + 1
 	}
 	return 0
+}
+
+// index_only_token is 1 when token i cannot be part of a type argument list: a literal, an
+// operator, or a parenthesis that does not follow fn (a call).
+fn index_only_token(i i64) i64 {
+	let t = cast(Token, p_toks[i])
+	if t.kind == TK_STRING || t.kind == TK_INT || t.kind == TK_FLOAT {
+		return 1
+	}
+	if t.kind != TK_PUNCT {
+		return 0
+	}
+	let x = t.text
+	if x == "(" {
+		return i64(i == 0 || (tok_is(p_toks[i - 1], "fn") == 0 && tok_is(p_toks[i - 1], "func") == 0))
+	}
+	return i64(x == "+" || x == "-" || x == "*" || x == "/" || x == "%" || x == "==" || x == "!=" || x == "<" || x == ">" || x == "<=" || x == ">=" || x == "&&" || x == "||" || x == "<<" || x == ">>" || x == "&" || x == "^" || x == "+%" || x == "-%" || x == "*%")
 }
 
 // parse_composite reads T{...} with positional or key: value elements.

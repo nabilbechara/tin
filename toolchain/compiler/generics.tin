@@ -594,6 +594,77 @@ fn explicit_generic(callee i64) i64 {
 	return 0
 }
 
+// not_generic_func returns the name a callee F[T] or pkg.F[T] gives a function that has no
+// type parameters, or "" (#554).
+fn not_generic_func(callee i64) str {
+	if cast(Node, callee).kind != EX_INDEX {
+		return ""
+	}
+	let x = cast(IndexExpr, callee).x
+	if cast(Node, x).kind == EX_IDENT {
+		let name = cast(IdentExpr, x).name
+		if lookup_name_local(name) != 0 {
+			return ""
+		}
+		let s = lookup_name(name)
+		if cast(i64, s) != 0 && s.kind == SYM_FUNC && is_template(cast(Fn, s.fn_)) == 0 {
+			return name
+		}
+		return ""
+	}
+	if cast(Node, x).kind == EX_SELECT && cast(Node, cast(SelectExpr, x).x).kind == EX_IDENT && lookup_name_local(cast(IdentExpr, cast(SelectExpr, x).x).name) == 0 {
+		let pkg = import_pkg(cast(IdentExpr, cast(SelectExpr, x).x).name)
+		if len(pkg) != 0 {
+			let s2 = cast(Sym, pkg_member(pkg, cast(SelectExpr, x).name))
+			if cast(i64, s2) != 0 && s2.kind == SYM_FUNC && is_template(cast(Fn, s2.fn_)) == 0 {
+				return cast(IdentExpr, cast(SelectExpr, x).x).name + "." + cast(SelectExpr, x).name
+			}
+		}
+	}
+	return ""
+}
+
+// index_from_targs turns X[a](...), which the parser read as a type argument list because it
+// cannot tell fs[k](x) from F[T](x), back into an index when X is not a generic function
+// (#554). It returns 0 when the list is not a single name.
+fn index_from_targs(e i64) i64 {
+	if cast(IndexExpr, e).i != 0 {
+		return 1
+	}
+	let list = cast([]i64, cast(IndexExpr, e).args)
+	if cast(i64, list) == 0 || len(list) != 1 {
+		return 0
+	}
+	let a = list[0]
+	if cast(Node, a).kind != EX_TYPE {
+		cast(IndexExpr, e).i = a
+		cast(IndexExpr, e).args = 0
+		return 1
+	}
+	let tx = cast(TypeNode, a).ty
+	if tx == 0 || cast(Node, tx).kind != TX_NAME || cast(TypeName, tx).args != 0 {
+		return 0
+	}
+	if len(cast(TypeName, tx).pkg) == 0 && cast(i64, lookup_name(cast(TypeName, tx).name)) == 0 && find_type_name(cast(TypeName, tx).name) != 0 {
+		return 0 // a type, so these were meant as type arguments
+	}
+	let pos = cast(Node, a).pos
+	let id = cast(IdentExpr, node_new(EX_IDENT, pos))
+	mut ix = cast(i64, id)
+	if len(cast(TypeName, tx).pkg) != 0 {
+		id.name = cast(TypeName, tx).pkg
+		let sel = cast(SelectExpr, node_new(EX_SELECT, pos))
+		sel.x = cast(i64, id)
+		sel.name = cast(TypeName, tx).name
+		ix = cast(i64, sel)
+	} else {
+		id.name = cast(TypeName, tx).name
+	}
+	cast(IndexExpr, e).i = ix
+	cast(IndexExpr, e).args = 0
+	return 1
+}
+
 // ---- shapes (#141) ----
 //
 // A shape is a set of method signatures. A type satisfies it structurally (no impl

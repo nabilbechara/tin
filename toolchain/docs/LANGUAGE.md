@@ -1699,7 +1699,11 @@ fn main() {
   (the type argument must be one of them), or another shape name (`[R Reader]`,
   section 3). Ordering constraints use `[T sift.Ordered]`.
 - Type arguments are inferred from the call's arguments (untyped constants default to
-  `i64`/`f64`), or given explicitly: `f[T](...)`, `pkg.F[T](...)`.
+  `i64`/`f64`), or given explicitly: `f[T](...)`, `pkg.F[T](...)`. Type arguments on a
+  function that has no type parameters are an error (E501); `fs[k](x)`, with `fs` a slice
+  or map of functions, is an index and then a call.
+- A method has its type's type parameters and no others of its own (E506): write a generic
+  function that takes the receiver as a parameter.
 - Every instantiation is compiled separately and fully specialized: there is no boxing
   and no runtime dispatch. Methods of a generic type are instantiated with it.
 - A generic function gets T's zero value from a fault (`fail` gives zero values for every
